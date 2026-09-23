@@ -46,6 +46,25 @@ pub(crate) fn process_state_test_lock() -> ProcessStateTestGuard {
 
 /// A `Config` rooted in `cache_dir` with every optional feature off, for
 /// tests that need a store without reading the developer's configuration.
+/// Start `command` without a controlling terminal, so a child that shows
+/// `[kache]` lines ([`crate::notice`]) writes them to the stderr the test
+/// reads even when the suite runs in a developer's terminal.
+pub(crate) fn without_terminal(command: &mut std::process::Command) -> &mut std::process::Command {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        // SAFETY: runs in the forked child before exec; `setsid` is
+        // async-signal-safe and touches no memory of the parent.
+        unsafe {
+            command.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+    }
+    command
+}
+
 pub(crate) fn test_config(cache_dir: PathBuf) -> crate::config::Config {
     crate::config::Config {
         fallback: None,

@@ -182,18 +182,20 @@ fn completion_replays_diagnostics_and_progress_only_after_success() {
         ("daemon", "local hit"),
         ("failure", ""),
     ] {
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "wrapper::tests::rustc_hit::completion_child",
-                "--ignored",
-                "--nocapture",
-            ])
-            .env("KACHE_TEST_RUSTC_HIT", mode)
-            .env("KACHE_PROGRESS", "1")
-            .env_remove("CARGO_MANIFEST_DIR")
-            .output()
-            .unwrap();
+        let output = crate::test_support::without_terminal(&mut std::process::Command::new(
+            std::env::current_exe().unwrap(),
+        ))
+        .args([
+            "--exact",
+            "wrapper::tests::rustc_hit::completion_child",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("KACHE_TEST_RUSTC_HIT", mode)
+        .env("KACHE_PROGRESS", "1")
+        .env_remove("CARGO_MANIFEST_DIR")
+        .output()
+        .unwrap();
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(output.status.success(), "{mode}: {stdout}\n{stderr}");

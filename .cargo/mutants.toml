@@ -249,7 +249,16 @@ gitignore = true
 # Its decision logic lives in src/fallback/sandbox.rs and stays in this Linux
 # lane. Test (macOS) covers the native adapter with allowed/denied subprocesses.
 exclude_globs = ["crates/kache-fs/src/apfs.rs", "src/fallback/macos.rs"]
+# `notice::show`, `notice::show_requested` and `notice::terminal` open the
+# controlling terminal, and the lane has none: `terminal` already returns
+# None (and Windows never compiles a terminal at all), `show` already logs and
+# `show_requested` already writes to the test's own stderr, so replacing any
+# of them, with any value, changes nothing a test can see.
+# `notice::deliver`, which picks terminal, stderr or log, stays in scope and
+# is tested with in-memory writers, refused writes and no terminal.
 exclude_re = [
+    "src/notice.rs:.*replace show(_requested)? with \\(\\)",
+    "src/notice.rs:.*replace terminal -> ",
     # `session_lock` and `advertised_login` compare an elapsed time against a
     # bound with `<`; `<` versus `<=` differs only when the elapsed time equals
     # the bound to the nanosecond, which no test can arrange. Both sides of

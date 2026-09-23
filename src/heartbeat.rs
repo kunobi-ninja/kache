@@ -49,9 +49,9 @@ struct HeartbeatCtx {
     socket: PathBuf,
     /// Build tree/root, same value the wrapper stamps on `BuildEvent`s.
     root: String,
-    /// Whether to also write progress to wrapper stderr. Cargo caches that
-    /// stream as compiler diagnostics, so this is opt-in only.
-    stderr_enabled: bool,
+    /// Whether to also show a person the heartbeat line
+    /// ([`crate::notice`]). Opt-in only.
+    show_lines: bool,
 }
 
 static CTX: OnceLock<HeartbeatCtx> = OnceLock::new();
@@ -64,7 +64,7 @@ pub fn set_heartbeat_ctx(
     event_log: PathBuf,
     socket: PathBuf,
     root: String,
-    stderr_enabled: bool,
+    show_lines: bool,
 ) {
     if cadence_secs == 0 {
         return;
@@ -74,7 +74,7 @@ pub fn set_heartbeat_ctx(
         event_log,
         socket,
         root,
-        stderr_enabled,
+        show_lines,
     });
 }
 
@@ -212,14 +212,11 @@ fn run_ticks(
         }
         let eta = typical.map(|t| t.saturating_sub(elapsed.as_secs()));
 
-        write_stderr_heartbeat(
-            ctx.stderr_enabled,
-            std::io::stderr(),
-            crate_name,
-            elapsed.as_secs(),
-            typical,
-            eta,
-        );
+        if let Some(line) =
+            heartbeat_line(ctx.show_lines, crate_name, elapsed.as_secs(), typical, eta)
+        {
+            crate::notice::show_requested(&line);
+        }
 
         let hb = HeartbeatEvent {
             event: HEARTBEAT_EVENT_TAG.to_string(),
@@ -256,12 +253,12 @@ fn run_ticks(
                             wall.as_secs(),
                             pid
                         );
-                        eprintln!(
+                        crate::notice::show(&format!(
                             "[kache] WARN: rustc for {} appears stuck (<1% CPU for {}s, PID {})",
                             crate_name,
                             wall.as_secs(),
                             pid
-                        );
+                        ));
                         stuck_warned = true;
                     }
                 }
@@ -270,19 +267,17 @@ fn run_ticks(
     }
 }
 
-/// Write the human-facing heartbeat when verbose progress is enabled. Kept
-/// injectable so the default-silent contract is regression-tested without
-/// capturing process stderr.
-fn write_stderr_heartbeat(
+/// The human-facing heartbeat line, when verbose progress asked for one.
+/// Pure so the default-silent contract is tested without a terminal.
+fn heartbeat_line(
     enabled: bool,
-    mut err: impl std::io::Write,
     crate_name: &str,
     elapsed_s: u64,
     typical_s: Option<u64>,
     eta_s: Option<u64>,
-) {
+) -> Option<String> {
     if !enabled {
-        return;
+        return None;
     }
     let suffix = match (typical_s, eta_s) {
         (Some(t), Some(e)) => format!(
@@ -292,13 +287,12 @@ fn write_stderr_heartbeat(
         ),
         _ => String::new(),
     };
-    let _ = writeln!(
-        err,
+    Some(format!(
         "[kache] still compiling {} — {} elapsed{}",
         crate_name,
         format_secs(elapsed_s),
         suffix
-    );
+    ))
 }
 
 /// `4m20s` / `51s` / `2h05m` — compact duration for heartbeat lines.
@@ -386,16 +380,14 @@ mod tests {
     }
 
     #[test]
-    fn stderr_heartbeat_is_opt_in_and_writes_verbatim() {
-        let mut silent = Vec::new();
-        write_stderr_heartbeat(false, &mut silent, "arrow_array", 30, Some(18), Some(0));
-        assert!(silent.is_empty());
-
-        let mut verbose = Vec::new();
-        write_stderr_heartbeat(true, &mut verbose, "arrow_array", 30, Some(18), Some(0));
+    fn heartbeat_line_is_opt_in_and_verbatim() {
         assert_eq!(
-            verbose,
-            "[kache] still compiling arrow_array — 30s elapsed (typical: 18s, ETA 1s)\n".as_bytes()
+            heartbeat_line(false, "arrow_array", 30, Some(18), Some(0)),
+            None
+        );
+        assert_eq!(
+            heartbeat_line(true, "arrow_array", 30, Some(18), Some(0)).as_deref(),
+            Some("[kache] still compiling arrow_array — 30s elapsed (typical: 18s, ETA 1s)")
         );
     }
 

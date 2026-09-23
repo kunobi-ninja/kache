@@ -9,7 +9,7 @@
 use anyhow::{Context, Result, bail};
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 const ENCODED_SEPARATOR: char = '\x1f';
 const WORKTREE_BUILD_DIR_CONFIG: &str = "build.build-dir=\"{workspace-root}/target\"";
@@ -18,9 +18,35 @@ const WORKTREE_BUILD_DIR_CONFIG: &str = "build.build-dir=\"{workspace-root}/targ
 /// Cargo uses matching `target.*.rustflags` instead of `build.rustflags`, and
 /// `cfg(all())` matches every target. No plan is made when target rustflags or
 /// a rustflags environment variable exist, so nothing else is shadowed.
-/// Cargo's first target-info probe runs before `cfg` keys match and still sees
-/// the duplicate; compiled units do not.
+/// Cargo's first target-info probe runs before `cfg` keys match, so it still
+/// passes the duplicated flags to rustc. Only flags rustc accepts twice take
+/// this route; see [`rustflags_repeat_safely`].
 const ALL_TARGETS_RUSTFLAGS_KEY: &str = "target.\"cfg(all())\".rustflags";
+
+/// Cargo `major.minor`.
+type CargoVersion = (u64, u64);
+/// Older Cargo rejects `--config` on stable.
+const CONFIG_ARGUMENT_CARGO: CargoVersion = (1, 63);
+/// Older Cargo has no stable `build.build-dir`. Some versions warn about the
+/// unknown key, and none of them isolate anything with it.
+const BUILD_DIR_CARGO: CargoVersion = (1, 91);
+
+/// rustc options that may be given more than once, checked against rustc 1.85
+/// and 1.98. Single-use options such as `--sysroot`, `--color` or `--target`
+/// make rustc fail when repeated.
+const REPEATABLE_RUSTC_FLAGS: &[&str] = &["-O", "-g"];
+const REPEATABLE_RUSTC_SHORT_OPTIONS: &[char] = &['A', 'C', 'D', 'F', 'L', 'W', 'Z', 'l'];
+const REPEATABLE_RUSTC_LONG_OPTIONS: &[&str] = &[
+    "allow",
+    "cfg",
+    "check-cfg",
+    "codegen",
+    "deny",
+    "forbid",
+    "force-warn",
+    "remap-path-prefix",
+    "warn",
+];
 
 #[derive(Debug, Clone)]
 struct ConfigSource {
@@ -64,10 +90,6 @@ enum PlanDecision {
 pub(crate) fn run(cargo_args: Vec<OsString>) -> Result<()> {
     let cwd = std::env::current_dir().context("resolving the Cargo working directory")?;
     let cargo = real_cargo_program()?;
-    // Overrides reach Cargo as `--config` arguments, which only this Cargo
-    // process reads. Exported variables would also reach rustc, build scripts,
-    // and any nested Cargo they start.
-    let mut config_overrides = Vec::new();
 
     // Cargo owns freshness before RUSTC_WRAPPER runs. Sharing its intermediate
     // fingerprint directory across worktrees can therefore declare the wrong
@@ -90,6 +112,7 @@ pub(crate) fn run(cargo_args: Vec<OsString>) -> Result<()> {
         }
     };
 
+    let mut rustflags = None;
     match normalization_plan(&cwd, &cargo_args) {
         PlanDecision::Apply(plan) => {
             if !plan_is_current(&plan) {
@@ -102,7 +125,7 @@ pub(crate) fn run(cargo_args: Vec<OsString>) -> Result<()> {
                     aliases = ?plan.duplicate_paths,
                     "collapsing canonical duplicate Cargo rustflags source"
                 );
-                config_overrides.push(rustflags_config_override(&plan.rustflags));
+                rustflags = Some(plan.rustflags);
             }
         }
         PlanDecision::Refused(reason) => {
@@ -117,9 +140,10 @@ pub(crate) fn run(cargo_args: Vec<OsString>) -> Result<()> {
     // Revalidate immediately before launch. If a config file or candidate set
     // changed after inspection, leave Cargo's layout untouched rather than
     // override a newly configured build-dir policy with stale information.
+    let mut isolate_build_dir = false;
     if let Some(plan) = build_dir_plan {
         if build_dir_plan_is_current(&plan) {
-            config_overrides.push(WORKTREE_BUILD_DIR_CONFIG.to_string());
+            isolate_build_dir = true;
         } else {
             eprintln!(
                 "kache: Cargo config changed while build-dir isolation was being inspected; \
@@ -128,10 +152,16 @@ pub(crate) fn run(cargo_args: Vec<OsString>) -> Result<()> {
         }
     }
 
+    let overrides = cargo_overrides(rustflags.as_deref(), isolate_build_dir, || {
+        cargo_version(&cargo, &cargo_args, &cwd)
+    });
     let mut command = Command::new(&cargo);
     command
-        .args(cargo_invocation_args(&cargo_args, &config_overrides))
+        .args(cargo_invocation_args(&cargo_args, &overrides.config))
         .current_dir(&cwd);
+    if let Some(flags) = &overrides.encoded_rustflags {
+        command.env("CARGO_ENCODED_RUSTFLAGS", flags);
+    }
 
     #[cfg(unix)]
     {
@@ -313,11 +343,17 @@ fn is_toolchain_selector(arg: &OsStr) -> bool {
     arg.to_str().is_some_and(|arg| arg.starts_with('+'))
 }
 
+/// Split Cargo's arguments into a leading `+toolchain` selector, if any, and
+/// the rest.
+fn split_toolchain_selector(args: &[OsString]) -> (&[OsString], &[OsString]) {
+    let selector = args.first().is_some_and(|arg| is_toolchain_selector(arg));
+    args.split_at(usize::from(selector))
+}
+
 /// Insert `--config` overrides ahead of the Cargo command, after any
 /// toolchain selector.
 fn cargo_invocation_args(args: &[OsString], overrides: &[String]) -> Vec<OsString> {
-    let selector = args.first().is_some_and(|arg| is_toolchain_selector(arg));
-    let (selector, rest) = args.split_at(usize::from(selector));
+    let (selector, rest) = split_toolchain_selector(args);
     let mut invocation = selector.to_vec();
     for value in overrides {
         invocation.push("--config".into());
@@ -330,6 +366,109 @@ fn cargo_invocation_args(args: &[OsString], overrides: &[String]) -> Vec<OsStrin
 fn rustflags_config_override(flags: &[String]) -> String {
     let flags = toml::Value::Array(flags.iter().cloned().map(toml::Value::String).collect());
     format!("{ALL_TARGETS_RUSTFLAGS_KEY}={flags}")
+}
+
+/// What the launched Cargo receives on top of the caller's arguments.
+#[derive(Debug, Default, PartialEq)]
+struct CargoOverrides {
+    /// `--config` values. Only the launched Cargo reads them.
+    config: Vec<String>,
+    /// `CARGO_ENCODED_RUSTFLAGS`, for collapsed flags `--config` cannot carry.
+    /// Every process Cargo starts inherits it, nested Cargo builds included.
+    encoded_rustflags: Option<String>,
+}
+
+/// Choose how each applicable plan reaches Cargo. `cargo_version` runs only
+/// when a plan applies.
+fn cargo_overrides(
+    rustflags: Option<&[String]>,
+    isolate_build_dir: bool,
+    cargo_version: impl FnOnce() -> Option<CargoVersion>,
+) -> CargoOverrides {
+    let mut overrides = CargoOverrides::default();
+    if rustflags.is_none() && !isolate_build_dir {
+        return overrides;
+    }
+    let version = cargo_version();
+    if let Some(flags) = rustflags {
+        if cargo_at_least(version, CONFIG_ARGUMENT_CARGO) && rustflags_repeat_safely(flags) {
+            overrides.config.push(rustflags_config_override(flags));
+        } else {
+            overrides.encoded_rustflags = Some(flags.join("\x1f"));
+        }
+    }
+    if isolate_build_dir && cargo_at_least(version, BUILD_DIR_CARGO) {
+        overrides.config.push(WORKTREE_BUILD_DIR_CONFIG.to_string());
+    }
+    overrides
+}
+
+fn cargo_at_least(version: Option<CargoVersion>, minimum: CargoVersion) -> bool {
+    version.is_some_and(|version| version >= minimum)
+}
+
+/// Ask the Cargo that will run the build for its version, through the same
+/// launcher and toolchain selector.
+fn cargo_version(cargo: &Path, cargo_args: &[OsString], cwd: &Path) -> Option<CargoVersion> {
+    let (selector, _) = split_toolchain_selector(cargo_args);
+    let output = Command::new(cargo)
+        .args(selector)
+        .arg("-V")
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_cargo_version(std::str::from_utf8(&output.stdout).ok()?)
+}
+
+/// Read `major.minor` from `cargo -V` output such as
+/// `cargo 1.91.0 (ea2d97820 2025-10-10)`.
+fn parse_cargo_version(output: &str) -> Option<CargoVersion> {
+    let version = output.strip_prefix("cargo ")?.split_whitespace().next()?;
+    let mut parts = version.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    Some((major, minor))
+}
+
+/// Whether rustc accepts every option in `flags` twice, as Cargo's first
+/// target-info probe passes them. Unknown options count as single-use.
+fn rustflags_repeat_safely(flags: &[String]) -> bool {
+    let mut flags = flags.iter();
+    while let Some(flag) = flags.next() {
+        match repeatable_rustc_option(flag) {
+            Some(true) => {
+                // The option's value.
+                flags.next();
+            }
+            Some(false) => {}
+            None => return false,
+        }
+    }
+    true
+}
+
+/// `Some(true)` for a repeatable option whose value is the next argument,
+/// `Some(false)` for one that is complete on its own, `None` otherwise.
+fn repeatable_rustc_option(arg: &str) -> Option<bool> {
+    if REPEATABLE_RUSTC_FLAGS.contains(&arg) {
+        return Some(false);
+    }
+    if let Some(long) = arg.strip_prefix("--") {
+        let name = long.split_once('=').map_or(long, |(name, _)| name);
+        return REPEATABLE_RUSTC_LONG_OPTIONS
+            .contains(&name)
+            .then_some(name.len() == long.len());
+    }
+    let mut short = arg.strip_prefix('-')?.chars();
+    let option = short.next()?;
+    REPEATABLE_RUSTC_SHORT_OPTIONS
+        .contains(&option)
+        .then_some(short.as_str().is_empty())
 }
 
 fn worktree_build_dir_isolation_plan(
@@ -669,6 +808,161 @@ mod tests {
             parsed["build"]["build-dir"].as_str(),
             Some("{workspace-root}/target")
         );
+    }
+
+    #[test]
+    fn overrides_follow_the_cargo_version_and_the_collapsed_flags() {
+        let safe = ["--cfg".to_string(), "kache".to_string()];
+        let single_use = ["--sysroot".to_string(), "/opt/sysroot".to_string()];
+        let rustflags_config = || rustflags_config_override(&safe);
+        let build_dir = || WORKTREE_BUILD_DIR_CONFIG.to_string();
+        let modern = || Some((1, 91));
+        let expect = |config: Vec<String>, encoded: Option<&str>| CargoOverrides {
+            config,
+            encoded_rustflags: encoded.map(str::to_string),
+        };
+
+        assert_eq!(
+            cargo_overrides(None, false, || unreachable!("probed Cargo without a plan")),
+            expect(Vec::new(), None)
+        );
+        assert_eq!(
+            cargo_overrides(Some(&safe), false, modern),
+            expect(vec![rustflags_config()], None)
+        );
+        assert_eq!(
+            cargo_overrides(None, true, modern),
+            expect(vec![build_dir()], None)
+        );
+        assert_eq!(
+            cargo_overrides(Some(&safe), true, modern),
+            expect(vec![rustflags_config(), build_dir()], None)
+        );
+        // Cargo's first target-info probe would pass `--sysroot` twice.
+        assert_eq!(
+            cargo_overrides(Some(&single_use), true, modern),
+            expect(vec![build_dir()], Some("--sysroot\x1f/opt/sysroot"))
+        );
+        // Cargo 1.62 rejects `--config`, and 1.90 has no build-dir.
+        assert_eq!(
+            cargo_overrides(Some(&safe), true, || Some((1, 62))),
+            expect(Vec::new(), Some("--cfg\x1fkache"))
+        );
+        assert_eq!(
+            cargo_overrides(Some(&safe), true, || Some((1, 90))),
+            expect(vec![rustflags_config()], None)
+        );
+        assert_eq!(
+            cargo_overrides(Some(&safe), true, || None),
+            expect(Vec::new(), Some("--cfg\x1fkache"))
+        );
+    }
+
+    #[test]
+    fn cargo_version_thresholds_include_the_first_supporting_release() {
+        assert!(cargo_at_least(Some((1, 63)), CONFIG_ARGUMENT_CARGO));
+        assert!(!cargo_at_least(Some((1, 62)), CONFIG_ARGUMENT_CARGO));
+        assert!(cargo_at_least(Some((1, 91)), BUILD_DIR_CARGO));
+        assert!(!cargo_at_least(Some((1, 90)), BUILD_DIR_CARGO));
+        assert!(cargo_at_least(Some((2, 0)), BUILD_DIR_CARGO));
+        assert!(!cargo_at_least(None, (0, 0)));
+    }
+
+    #[test]
+    fn cargo_version_output_yields_major_and_minor() {
+        assert_eq!(
+            parse_cargo_version("cargo 1.98.0 (797e8a9bc 2026-08-05)\n"),
+            Some((1, 98))
+        );
+        assert_eq!(
+            parse_cargo_version("cargo 1.93.0-nightly (1d8c8b5f7 2025-11-20)\n"),
+            Some((1, 93))
+        );
+        assert_eq!(parse_cargo_version("cargo 2.3"), Some((2, 3)));
+        for output in [
+            "",
+            "rustup 1.28.2",
+            "cargo unknown",
+            "cargo 1",
+            "cargo 1.x.0",
+        ] {
+            assert_eq!(parse_cargo_version(output), None, "output: {output:?}");
+        }
+    }
+
+    #[test]
+    fn only_options_rustc_accepts_twice_repeat_safely() {
+        let flags = |flags: &[&str]| {
+            flags
+                .iter()
+                .map(|flag| flag.to_string())
+                .collect::<Vec<_>>()
+        };
+        for safe in [
+            &[
+                "--cfg",
+                "kache",
+                "--cfg=other",
+                "-C",
+                "opt-level=2",
+                "-Ctarget-cpu=native",
+            ][..],
+            &[
+                "-O",
+                "-g",
+                "-D",
+                "warnings",
+                "-Wunused",
+                "--remap-path-prefix",
+                "/a=/b",
+            ],
+            &[
+                "-L",
+                "native=/lib",
+                "-lfoo",
+                "-Z",
+                "share-generics",
+                "--check-cfg",
+                "cfg(a)",
+            ],
+            &[],
+        ] {
+            assert!(rustflags_repeat_safely(&flags(safe)), "flags: {safe:?}");
+        }
+        for single_use in [
+            &["--sysroot", "/opt/sysroot"][..],
+            &["--cfg", "kache", "--color=never"],
+            &["--target", "x86_64-unknown-linux-gnu"],
+            &["-o", "out"],
+            &["stray"],
+        ] {
+            assert!(
+                !rustflags_repeat_safely(&flags(single_use)),
+                "flags: {single_use:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn repeatable_options_know_whether_the_next_argument_is_their_value() {
+        for (arg, expected) in [
+            ("-O", Some(false)),
+            ("-g", Some(false)),
+            ("--cfg", Some(true)),
+            ("--cfg=kache", Some(false)),
+            ("--codegen=opt-level=2", Some(false)),
+            ("-C", Some(true)),
+            ("-Copt-level=2", Some(false)),
+            ("--sysroot", None),
+            ("--sysroot=/opt", None),
+            ("-Ofast", None),
+            ("-o", None),
+            ("-", None),
+            ("--", None),
+            ("value", None),
+        ] {
+            assert_eq!(repeatable_rustc_option(arg), expected, "arg: {arg}");
+        }
     }
 
     #[test]

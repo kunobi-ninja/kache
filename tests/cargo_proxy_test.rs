@@ -28,7 +28,9 @@ fn proxied_cargo(home: &Path, cache: &Path, target: &Path) -> Command {
         .env("KACHE_LOG", "off")
         .env_remove("RUSTFLAGS")
         .env_remove("CARGO_ENCODED_RUSTFLAGS")
-        .env_remove("CARGO_BUILD_RUSTFLAGS");
+        .env_remove("CARGO_BUILD_RUSTFLAGS")
+        // An inherited build-dir turns the proxy's worktree isolation off.
+        .env_remove("CARGO_BUILD_BUILD_DIR");
     command
 }
 
@@ -219,8 +221,7 @@ fn worktree_build_dir_stays_out_of_nested_cargo_builds() {
         .args(["cargo", "--", "build", "--quiet"])
         .current_dir(&host)
         .env("KACHE_REAL_CARGO", env!("CARGO"))
-        .env_remove("RUSTC_WRAPPER")
-        .env_remove("CARGO_BUILD_BUILD_DIR");
+        .env_remove("RUSTC_WRAPPER");
     let output = command.output().unwrap();
     assert!(
         output.status.success(),
@@ -240,6 +241,108 @@ fn worktree_build_dir_stays_out_of_nested_cargo_builds() {
         !guest.join("target").exists(),
         "the proxy's build-dir redirected a nested Cargo build into its source tree"
     );
+}
+
+#[test]
+fn collapsed_single_use_rustc_option_passes_cargo_target_probe() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let home = root.join("home");
+    let cargo_home = home.join(".cargo");
+    let cache = root.join("cache");
+    let project = home.join("work/project");
+    std::fs::create_dir_all(&cargo_home).unwrap();
+    std::fs::create_dir_all(&cache).unwrap();
+    // rustc rejects a repeated `--diagnostic-width`, as it does `--sysroot`.
+    // Cargo's first target-info probe runs before `cfg` keys match, so a
+    // `cfg(all())` override would leave it with the duplicated source.
+    std::fs::write(
+        cargo_home.join("config.toml"),
+        "[build]\nrustflags = [\"--diagnostic-width\", \"80\", \"--cfg\", \"kache_proxy_fixture\"]\n",
+    )
+    .unwrap();
+    write_key_fixture(&project);
+    std::os::unix::fs::symlink(&cargo_home, home.join("work/.cargo")).unwrap();
+
+    let mut command = proxied_cargo(&home, &cache, &root.join("target"));
+    command
+        .args(["cargo", "--", "check", "--quiet"])
+        .current_dir(&project)
+        .env("KACHE_REAL_CARGO", env!("CARGO"));
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "proxied cargo failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// A stand-in Cargo that reports 1.91.0 under the `+new` selector and
+/// `version` otherwise, and records the arguments of any other command.
+fn versioned_fake_cargo(path: &Path, version: &str) {
+    kache_fs::testutil::write_executable(
+        path,
+        format!(
+            "#!/bin/sh\ncase \"$*\" in\n  \
+                 '+new -V') echo 'cargo 1.91.0 (0000000 2025-10-10)' ;;\n  \
+                 *-V) echo 'cargo {version} (0000000 2020-01-01)' ;;\n  \
+                 *) printf '%s' \"$*\" > \"$KACHE_TEST_CAPTURE\" ;;\n\
+             esac\n"
+        ),
+    );
+}
+
+#[test]
+fn build_dir_override_needs_a_cargo_that_knows_the_key() {
+    let isolated = "--config build.build-dir=\"{workspace-root}/target\"";
+    for (args, version, expected) in [
+        // Before 1.63 Cargo rejects `--config`; before 1.91 it warns about the
+        // unknown key. Both ignored the exported variable this replaced.
+        (&["build"][..], "1.62.1", "build".to_string()),
+        (&["build"], "1.90.0", "build".to_string()),
+        (&["build"], "1.91.0", format!("{isolated} build")),
+        (
+            &["+new", "check"],
+            "1.62.1",
+            format!("+new {isolated} check"),
+        ),
+        (&["build"], "unknown", "build".to_string()),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let project = dir.path().join("project");
+        let fake_cargo = dir.path().join("cargo");
+        let capture = dir.path().join("captured-args");
+        std::fs::create_dir_all(home.join(".cargo")).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        versioned_fake_cargo(&fake_cargo, version);
+
+        let output = Command::new(KACHE_BIN)
+            .arg("cargo")
+            .arg("--")
+            .args(args)
+            .current_dir(&project)
+            .env("HOME", &home)
+            .env("CARGO_HOME", home.join(".cargo"))
+            .env("KACHE_REAL_CARGO", &fake_cargo)
+            .env("KACHE_TEST_CAPTURE", &capture)
+            .env_remove("CARGO_BUILD_BUILD_DIR")
+            .env_remove("RUSTFLAGS")
+            .env_remove("CARGO_ENCODED_RUSTFLAGS")
+            .env_remove("CARGO_BUILD_RUSTFLAGS")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "proxy failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&capture).unwrap(),
+            expected,
+            "args {args:?} on Cargo {version}"
+        );
+    }
 }
 
 #[test]

@@ -943,17 +943,38 @@ impl RustcArgs {
             .any(|(k, _)| k == "instrument-coverage")
     }
 
+    /// Whether trybuild is driving this compile.
+    ///
+    /// trybuild sets `--cfg trybuild` for every crate it builds under
+    /// `target/tests/trybuild/`, then compares rustc's rendered diagnostics
+    /// against the checked-in `.stderr` snapshots after textually replacing
+    /// the real crate directory (`$DIR`), workspace (`$WORKSPACE`), and Cargo
+    /// registry (`$CARGO`) paths. A path kache remapped defeats that
+    /// substitution. The UI test source lives outside the generated package
+    /// rustc runs in, so it falls to the `$HOME` rule and renders as
+    /// `/kache/home/...`; a note into the crate under test renders as
+    /// `/proc/self/cwd/...`. The snapshot then never matches, and `kache
+    /// purge` cannot help because nothing was replayed: a failed compile is
+    /// never stored.
+    pub fn is_trybuild_unit(&self) -> bool {
+        self.cfgs.iter().any(|cfg| cfg == "trybuild")
+    }
+
     /// Whether kache should skip injecting its own `--remap-path-prefix` flags
-    /// for this compile — either because coverage instrumentation needs real
-    /// paths in the profraw, or because the user opted out via
-    /// `KACHE_RUSTC_PATH_NORMALIZE=0` (kunobi-ninja/kache#480).
+    /// for this compile — because coverage instrumentation needs real paths in
+    /// the profraw, because the user opted out via
+    /// `KACHE_RUSTC_PATH_NORMALIZE=0` (kunobi-ninja/kache#480), or because
+    /// trybuild compares the rendered diagnostics against snapshots that
+    /// expect real paths ([`Self::is_trybuild_unit`]).
     ///
     /// Single source of truth for the injection decision
     /// ([`crate::compiler::rustc`]) and the cache-key `remap:` fold
     /// ([`crate::cache_key`]) — both MUST agree, or the key would claim one
     /// remap state while the binary was built with the other.
     pub fn skip_path_remap(&self) -> bool {
-        self.has_coverage_instrumentation() || self.path_normalize_disabled
+        self.has_coverage_instrumentation()
+            || self.path_normalize_disabled
+            || self.is_trybuild_unit()
     }
 
     /// Get a codegen option value by key.
@@ -2205,6 +2226,80 @@ mod tests {
         .collect();
         let parsed = RustcArgs::parse(&args).unwrap();
         assert!(!parsed.has_coverage_instrumentation());
+    }
+
+    /// A lib compile with `extra` appended, and the process-wide
+    /// `KACHE_RUSTC_PATH_NORMALIZE` snapshot pinned to "enabled" so the
+    /// assertions below do not depend on what the rest of the suite sets.
+    fn parsed_lib_with(extra: &[&str]) -> RustcArgs {
+        let mut args = vec![
+            "rustc",
+            "--crate-name",
+            "foo",
+            "src/lib.rs",
+            "--crate-type",
+            "lib",
+        ];
+        args.extend_from_slice(extra);
+        let args: Vec<String> = args.into_iter().map(String::from).collect();
+        let mut parsed = RustcArgs::parse(&args).unwrap();
+        parsed.path_normalize_disabled = false;
+        parsed
+    }
+
+    #[test]
+    fn trybuild_cfg_marks_the_unit_and_skips_path_remap() {
+        // trybuild passes `--cfg trybuild` through `build.rustflags`, so it
+        // arrives in the two-argument form; the joined spelling is what a
+        // hand-written config produces.
+        for spelling in [vec!["--cfg", "trybuild"], vec!["--cfg=trybuild"]] {
+            let parsed = parsed_lib_with(&spelling);
+            assert!(parsed.is_trybuild_unit(), "{spelling:?}");
+            assert!(parsed.skip_path_remap(), "{spelling:?}");
+        }
+    }
+
+    #[test]
+    fn trybuild_cfg_is_found_among_other_cfgs() {
+        let parsed = parsed_lib_with(&[
+            "--cfg",
+            "docsrs",
+            "--cfg",
+            "trybuild",
+            "--cfg",
+            "feature=\"std\"",
+        ]);
+        assert!(parsed.is_trybuild_unit());
+        assert!(parsed.skip_path_remap());
+    }
+
+    #[test]
+    fn other_cfgs_do_not_mark_a_trybuild_unit() {
+        // A feature or cfg merely named like trybuild is not the marker
+        // trybuild sets, and a unit without cfgs keeps kache's remap.
+        for cfgs in [
+            vec![],
+            vec!["--cfg", "feature=\"trybuild\""],
+            vec!["--cfg", "trybuild_no_target"],
+            vec!["--cfg", "docsrs"],
+        ] {
+            let parsed = parsed_lib_with(&cfgs);
+            assert!(!parsed.is_trybuild_unit(), "{cfgs:?}");
+            assert!(!parsed.skip_path_remap(), "{cfgs:?}");
+        }
+    }
+
+    #[test]
+    fn each_skip_path_remap_reason_stands_alone() {
+        let coverage = parsed_lib_with(&["-C", "instrument-coverage"]);
+        assert!(!coverage.is_trybuild_unit());
+        assert!(coverage.skip_path_remap());
+
+        let mut opted_out = parsed_lib_with(&[]);
+        opted_out.path_normalize_disabled = true;
+        assert!(!opted_out.has_coverage_instrumentation());
+        assert!(!opted_out.is_trybuild_unit());
+        assert!(opted_out.skip_path_remap());
     }
 
     #[test]

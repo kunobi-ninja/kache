@@ -81,6 +81,8 @@ That puts real paths in debug information and makes the key local to those path 
 
 Coverage-instrumented Rust builds use real paths and a separate, path-local key namespace so coverage tools can find source files.
 
+Crates that trybuild builds under `target/tests/trybuild/` get the same treatment. trybuild passes `--cfg trybuild` to every one of them and compares rustc's rendered diagnostics against the checked-in `.stderr` snapshots after substituting the real crate, workspace, and registry directories, so a remapped path such as `/kache/home/...` or `/proc/self/cwd/...` would fail every snapshot. Those units still cache, keyed by their trybuild target directory.
+
 ## Debugger source maps
 
 On macOS and Windows, map the stable workspace prefix back to your checkout:

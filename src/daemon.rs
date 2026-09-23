@@ -692,6 +692,17 @@ enum GcDriver {
     Periodic,
 }
 
+impl GcDriver {
+    /// A sweep the user asked for may evict fresh imports; the timer keeps
+    /// them (#1008).
+    fn sweep_origin(self) -> crate::store::SweepOrigin {
+        match self {
+            GcDriver::Requested => crate::store::SweepOrigin::Requested,
+            GcDriver::Periodic => crate::store::SweepOrigin::Automatic,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 enum GcPolicy {
     Automatic { max_age_hours: u64 },
@@ -6594,7 +6605,7 @@ impl Daemon {
             self.config.max_size
         );
         let started = Instant::now();
-        let mut stats = store.evict()?;
+        let mut stats = store.evict_for(crate::store::SweepOrigin::Automatic)?;
         stats.duration_ms = started.elapsed().as_millis() as u64;
         if let Ok(after) = store.physical_size() {
             crate::wrapper::record_auto_gc_outcome(&self.config, after);
@@ -6721,7 +6732,9 @@ impl Daemon {
                         } else {
                             crate::store::GcStats::default()
                         };
-                        let duplicate_stats = store.evict_duplicate_entries().unwrap_or_default();
+                        let duplicate_stats = store
+                            .evict_duplicate_entries_for(driver.sweep_origin())
+                            .unwrap_or_default();
                         let size_stats = self.size_pass(driver, store)?;
                         (duplicate_stats, age_stats, size_stats)
                     }
@@ -6847,6 +6860,9 @@ impl Daemon {
             entries_recent_prefiltered: dedup_stats.entries_recent_prefiltered
                 + evict_stats.entries_recent_prefiltered
                 + age_evict_stats.entries_recent_prefiltered,
+            entries_import_pinned: dedup_stats.entries_import_pinned
+                + evict_stats.entries_import_pinned
+                + age_evict_stats.entries_import_pinned,
             evict_write_ms: dedup_stats.evict_write_ms
                 + evict_stats.evict_write_ms
                 + age_evict_stats.evict_write_ms,

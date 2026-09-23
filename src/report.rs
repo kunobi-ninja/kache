@@ -40,6 +40,9 @@ pub struct GcStatsPersisted {
     pub entries_busy_snapshot: usize,
     #[serde(default)]
     pub entries_recent_prefiltered: usize,
+    /// Kept because the remote delivered them within the import pin (#1008).
+    #[serde(default)]
+    pub entries_import_pinned: usize,
     /// Time the run spent in its eviction writes, busy waits included.
     #[serde(default)]
     pub evict_write_ms: u64,
@@ -100,6 +103,9 @@ pub struct GcRunRecord {
     /// Recent candidates skipped before reading metadata or opening a txn.
     #[serde(default)]
     pub entries_recent_prefiltered: usize,
+    /// Kept because the remote delivered them within the import pin (#1008).
+    #[serde(default)]
+    pub entries_import_pinned: usize,
     pub entries_pinned: usize,
     pub entries_unreclaimable: usize,
     pub duration_ms: u64,
@@ -129,6 +135,7 @@ impl GcRunRecord {
             entries_locked: stats.entries_locked,
             entries_busy_snapshot: stats.entries_busy_snapshot,
             entries_recent_prefiltered: stats.entries_recent_prefiltered,
+            entries_import_pinned: stats.entries_import_pinned,
             entries_pinned: stats.entries_pinned,
             entries_unreclaimable: stats.entries_unreclaimable,
             duration_ms: stats.duration_ms,
@@ -182,6 +189,7 @@ pub(crate) fn write_last_gc_run(
         entries_locked: stats.entries_locked,
         entries_busy_snapshot: stats.entries_busy_snapshot,
         entries_recent_prefiltered: stats.entries_recent_prefiltered,
+        entries_import_pinned: stats.entries_import_pinned,
         evict_write_ms: stats.evict_write_ms,
         key_locks_removed: stats.housekeeping.map(|h| h.key_locks_removed),
         key_locks_remaining: stats.housekeeping.map(|h| h.key_locks_remaining),
@@ -3962,6 +3970,7 @@ mod tests {
             entries_locked: 3,
             entries_busy_snapshot: 2,
             entries_recent_prefiltered: 4,
+            entries_import_pinned: 7,
             evict_write_ms: 11,
             housekeeping: Some(crate::store::HousekeepingStats {
                 key_locks_removed: 6,
@@ -4003,6 +4012,7 @@ mod tests {
                 entries_locked: 3,
                 entries_busy_snapshot: 2,
                 entries_recent_prefiltered: 4,
+                entries_import_pinned: 7,
                 entries_pinned: 4,
                 entries_unreclaimable: 1,
                 duration_ms: 9,

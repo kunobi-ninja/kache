@@ -107,6 +107,10 @@ pub fn run_fixture(fixture: &Fixture, kache_path: &Path) -> Result<FixtureResult
     // Defensive: stop any inherited daemon from a previous fixture's
     // run before we start measuring.
     daemon::stop(kache_path, cache_dir.path());
+    if fixture.daemon {
+        daemon::start_for_fixture(kache_path, cache_dir.path())
+            .with_context(|| fixture.name.clone())?;
+    }
 
     // Per-phase report deltas: snapshot the cumulative kache report
     // before each phase, subtract afterwards. Without this, `kache
@@ -702,6 +706,10 @@ fn run_phase(
     )?;
     let build_wall_s = started.elapsed().as_secs();
     let build_exit_code = build.exit.code().unwrap_or(1);
+    if fixture.daemon {
+        // The report below must see what the wrappers handed off.
+        daemon::restart_after_build(kache_path, cache_dir).with_context(|| fixture.name.clone())?;
+    }
 
     if !build.exit.success() {
         return Ok((
@@ -1586,6 +1594,7 @@ mod tests {
             check_depinfo: false,
             requires: Vec::new(),
             compiler_shims,
+            daemon: false,
             os: Vec::new(),
             windows: None,
             dir: PathBuf::new(),

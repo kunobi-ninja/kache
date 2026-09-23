@@ -387,6 +387,17 @@ pub struct Config {
     /// `KACHE_DEFERRED_DURABILITY=0` or `[cache] deferred_durability = false`
     /// flushes every entry inside the compile that stored it.
     pub deferred_durability: bool,
+    /// Hand a finished cc compile's store put to the daemon so the wrapper
+    /// returns as soon as the object is written (see `daemon_publish`). On
+    /// by default; `KACHE_DAEMON_PUBLISH=0` or `[cache] daemon_publish =
+    /// false` keeps every put in the wrapper. Without a reachable daemon the
+    /// wrapper stores on its own either way.
+    pub daemon_publish: bool,
+    /// The project's `[cache] exclude` and `bypass_*` rule lists, read once
+    /// with the rest of the file. Every wrapper invocation consults them
+    /// before any key work; re-reading the file for each list cost a C
+    /// compile four config parses.
+    pub(crate) project_rules: ProjectRules,
     /// Opportunistic size-pressure GC (kunobi-ninja/kache#497): when on (the
     /// default), the compiler wrapper — after storing a new entry — performs a
     /// cheap, throttled store-size check and, if the store has grown past
@@ -715,6 +726,8 @@ pub(crate) struct CacheFileConfig {
     pub(crate) deferred_discovery: Option<bool>,
     /// Deferred store flush toggle. See [`Config::deferred_durability`].
     pub(crate) deferred_durability: Option<bool>,
+    /// Daemon hand-off toggle. See [`Config::daemon_publish`].
+    pub(crate) daemon_publish: Option<bool>,
     /// Opportunistic size-pressure GC toggle. See [`Config::auto_gc`].
     pub(crate) auto_gc: Option<bool>,
     /// Daemon index compaction toggle. See [`Config::index_auto_compact`].
@@ -1135,6 +1148,7 @@ const IGNORE_ENV_GATED_VARS: &[&str] = &[
     "KACHE_WINDOWS_HARDLINK",
     "KACHE_SHARED_HARDLINK_RESTORES",
     "KACHE_DEFERRED_DISCOVERY",
+    "KACHE_DAEMON_PUBLISH",
     "KACHE_DEFERRED_DURABILITY",
     "KACHE_AUTO_GC",
     "KACHE_INDEX_AUTO_COMPACT",
@@ -1222,6 +1236,7 @@ const ENV_FILE_KEYS: &[(&str, &str)] = &[
     ),
     ("KACHE_DEFERRED_DISCOVERY", "cache.deferred_discovery"),
     ("KACHE_DEFERRED_DURABILITY", "cache.deferred_durability"),
+    ("KACHE_DAEMON_PUBLISH", "cache.daemon_publish"),
     ("KACHE_AUTO_GC", "cache.auto_gc"),
     ("KACHE_INDEX_AUTO_COMPACT", "cache.index_auto_compact"),
     ("KACHE_STORAGE_LAYOUT_ADVICE", "cache.storage_layout_advice"),
@@ -1749,6 +1764,8 @@ impl Config {
         let shared_hardlink_restores = Self::shared_hardlink_restores_enabled(&file_config);
         let deferred_discovery = Self::deferred_discovery_enabled(&file_config);
         let deferred_durability = Self::deferred_durability_enabled(&file_config);
+        let daemon_publish = Self::daemon_publish_enabled(&file_config);
+        let project_rules = ProjectRules::from_file_config(&file_config);
         let auto_gc = Self::auto_gc_enabled(&file_config);
         let index_auto_compact = Self::index_auto_compact_enabled(&file_config);
         let gc_evict_shared = Self::gc_evict_shared_enabled(&file_config);
@@ -1808,6 +1825,8 @@ impl Config {
             shared_hardlink_restores,
             deferred_discovery,
             deferred_durability,
+            daemon_publish,
+            project_rules,
             auto_gc,
             index_auto_compact,
             gc_evict_shared,
@@ -2253,6 +2272,19 @@ impl Config {
             .unwrap_or(true)
     }
 
+    fn daemon_publish_enabled(file_config: &Result<FileConfig>) -> bool {
+        let ignore_env = Self::ignore_env_enabled(file_config);
+        if let Ok(v) = env_or_ignored("KACHE_DAEMON_PUBLISH", ignore_env) {
+            return !(v == "0" || v.eq_ignore_ascii_case("false"));
+        }
+        file_config
+            .as_ref()
+            .ok()
+            .and_then(|c| c.cache.as_ref())
+            .and_then(|c| c.daemon_publish)
+            .unwrap_or(true)
+    }
+
     fn deferred_durability_enabled(file_config: &Result<FileConfig>) -> bool {
         let ignore_env = Self::ignore_env_enabled(file_config);
         if let Ok(v) = env_or_ignored("KACHE_DEFERRED_DURABILITY", ignore_env) {
@@ -2611,27 +2643,8 @@ impl Config {
     /// Return true when `source_path` matches one of `[cache].exclude`'s glob
     /// patterns from the active config file.
     pub fn source_excluded(source_path: &Path, roots: &[PathBuf]) -> bool {
-        let patterns = Self::load_exclude_patterns();
-        source_excluded_by_patterns(&patterns, source_path, roots)
-    }
-
-    fn load_exclude_patterns() -> Vec<String> {
-        Self::load_rule_list(|c| c.exclude)
-    }
-
-    /// Shared loader for the project-local rule lists: read the active config
-    /// file, take one list, trim, and drop empties so a stray blank entry can
-    /// never become a match-everything rule.
-    fn load_rule_list(pick: impl FnOnce(CacheFileConfig) -> Option<Vec<String>>) -> Vec<String> {
-        Self::load_file_config()
-            .ok()
-            .and_then(|c| c.cache)
-            .and_then(pick)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|p| p.trim().to_string())
-            .filter(|p| !p.is_empty())
-            .collect()
+        ProjectRules::from_file_config(&Self::load_file_config())
+            .source_excluded(source_path, roots)
     }
 
     /// First matching user bypass rule for this invocation, or `None`.
@@ -2646,14 +2659,8 @@ impl Config {
     /// any single argument; `env` entries are `NAME=VALUE` for an exact value
     /// or a bare `NAME` for presence alone.
     pub fn user_bypass_reason(crate_name: &str, argv: &[String]) -> Option<String> {
-        Self::user_bypass_reason_with(
-            crate_name,
-            argv,
-            &Self::load_rule_list(|c| c.bypass_crates),
-            &Self::load_rule_list(|c| c.bypass_argv),
-            &Self::load_rule_list(|c| c.bypass_env),
-            |name| std::env::var(name).ok(),
-        )
+        ProjectRules::from_file_config(&Self::load_file_config())
+            .user_bypass_reason(crate_name, argv)
     }
 
     /// Pure core of [`Self::user_bypass_reason`], with the rule lists and env
@@ -2696,6 +2703,63 @@ impl Config {
             }
         }
         None
+    }
+}
+
+/// The per-project rule lists a wrapper checks before keying anything: glob
+/// patterns for sources that are never cached, and the user bypass rules
+/// (kunobi-ninja/kache#222) by crate name, argv substring and environment.
+/// All fail closed: a rule only ever declines caching.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct ProjectRules {
+    pub(crate) exclude: Vec<String>,
+    pub(crate) bypass_crates: Vec<String>,
+    pub(crate) bypass_argv: Vec<String>,
+    pub(crate) bypass_env: Vec<String>,
+}
+
+impl ProjectRules {
+    /// Take the four lists from a parsed config file, trimmed, with empties
+    /// dropped: an empty argv rule substring-matches EVERY argument, so one
+    /// blank line in a config would silently disable the whole cache.
+    fn from_file_config(file_config: &Result<FileConfig>) -> Self {
+        let cache = file_config.as_ref().ok().and_then(|c| c.cache.as_ref());
+        let list = |pick: fn(&CacheFileConfig) -> Option<&Vec<String>>| -> Vec<String> {
+            cache
+                .and_then(pick)
+                .map(|rules| {
+                    rules
+                        .iter()
+                        .map(|p| p.trim().to_string())
+                        .filter(|p| !p.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        Self {
+            exclude: list(|c| c.exclude.as_ref()),
+            bypass_crates: list(|c| c.bypass_crates.as_ref()),
+            bypass_argv: list(|c| c.bypass_argv.as_ref()),
+            bypass_env: list(|c| c.bypass_env.as_ref()),
+        }
+    }
+
+    /// Return true when `source_path` matches one of the `exclude` globs.
+    pub(crate) fn source_excluded(&self, source_path: &Path, roots: &[PathBuf]) -> bool {
+        source_excluded_by_patterns(&self.exclude, source_path, roots)
+    }
+
+    /// First matching user bypass rule for this invocation, or `None`. See
+    /// [`Config::user_bypass_reason`].
+    pub(crate) fn user_bypass_reason(&self, crate_name: &str, argv: &[String]) -> Option<String> {
+        Config::user_bypass_reason_with(
+            crate_name,
+            argv,
+            &self.bypass_crates,
+            &self.bypass_argv,
+            &self.bypass_env,
+            |name| std::env::var(name).ok(),
+        )
     }
 }
 
@@ -5513,6 +5577,39 @@ remote_key_cache_refresh_secs = 900
     }
 
     #[test]
+    fn daemon_publish_is_on_unless_switched_off() {
+        let _lock = config_path_lock();
+        let none: Result<FileConfig> = Err(anyhow::anyhow!("no file"));
+        let off: Result<FileConfig> =
+            Ok(toml::from_str("[cache]\ndaemon_publish = false\n").unwrap());
+        let on: Result<FileConfig> =
+            Ok(toml::from_str("[cache]\ndaemon_publish = true\n").unwrap());
+        // SAFETY: the process-state lock serialises environment edits.
+        unsafe { std::env::remove_var("KACHE_DAEMON_PUBLISH") };
+        assert!(Config::daemon_publish_enabled(&none));
+        assert!(!Config::daemon_publish_enabled(&off));
+        assert!(Config::daemon_publish_enabled(&on));
+        for (value, expected) in [
+            ("0", false),
+            ("false", false),
+            ("FALSE", false),
+            ("1", true),
+            ("true", true),
+            ("yes", true),
+            ("", true),
+        ] {
+            unsafe { std::env::set_var("KACHE_DAEMON_PUBLISH", value) };
+            assert_eq!(Config::daemon_publish_enabled(&on), expected, "{value:?}");
+            assert_eq!(
+                Config::daemon_publish_enabled(&off),
+                expected,
+                "{value:?} overrides the file"
+            );
+        }
+        unsafe { std::env::remove_var("KACHE_DAEMON_PUBLISH") };
+    }
+
+    #[test]
     fn shared_hardlink_restores_are_off_unless_switched_on() {
         let _lock = config_path_lock();
         let none: Result<FileConfig> = Err(anyhow::anyhow!("no file"));
@@ -5584,6 +5681,7 @@ remote_key_cache_refresh_secs = 900
                 shared_hardlink_restores: None,
                 deferred_discovery: None,
                 deferred_durability: None,
+                daemon_publish: None,
                 auto_gc: None,
                 index_auto_compact: None,
                 gc_evict_shared: None,
@@ -6114,6 +6212,8 @@ remote_key_cache_refresh_secs = 900
             shared_hardlink_restores: false,
             deferred_discovery: true,
             deferred_durability: false,
+            daemon_publish: false,
+            project_rules: ProjectRules::default(),
             auto_gc: true,
             index_auto_compact: true,
             gc_evict_shared: false,
@@ -6179,6 +6279,8 @@ remote_key_cache_refresh_secs = 900
             shared_hardlink_restores: false,
             deferred_discovery: true,
             deferred_durability: false,
+            daemon_publish: false,
+            project_rules: ProjectRules::default(),
             auto_gc: true,
             index_auto_compact: true,
             gc_evict_shared: false,
@@ -6240,6 +6342,8 @@ remote_key_cache_refresh_secs = 900
             shared_hardlink_restores: false,
             deferred_discovery: true,
             deferred_durability: false,
+            daemon_publish: false,
+            project_rules: ProjectRules::default(),
             auto_gc: true,
             index_auto_compact: true,
             gc_evict_shared: false,
@@ -6320,6 +6424,8 @@ remote_key_cache_refresh_secs = 900
             shared_hardlink_restores: false,
             deferred_discovery: true,
             deferred_durability: false,
+            daemon_publish: false,
+            project_rules: ProjectRules::default(),
             auto_gc: true,
             index_auto_compact: true,
             gc_evict_shared: false,
@@ -6985,6 +7091,7 @@ exclude = ["src/generated/**", "vendor/problem/**"]
                 shared_hardlink_restores: None,
                 deferred_discovery: None,
                 deferred_durability: None,
+                daemon_publish: None,
                 auto_gc: None,
                 index_auto_compact: None,
                 gc_evict_shared: None,

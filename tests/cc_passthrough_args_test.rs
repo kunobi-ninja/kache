@@ -83,3 +83,195 @@ fn refused_double_dash_invocation_is_exact_passthrough() {
         "refused passthrough must preserve the original argv without cache-only flags"
     );
 }
+
+/// Compile-first misses retain their initial store and parsed policy through
+/// publication. Exercise the read-set memo, then invalidate it with an edit.
+#[test]
+fn deferred_cc_reuses_setup_and_still_invalidates_changed_headers() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let cache = root.join("cache");
+    let config = root.join("kache.toml");
+    fs::write(&config, "").unwrap();
+    fs::write(
+        root.join("unit.c"),
+        "#include \"value.h\"\nint value(void) { return VALUE; }\n",
+    )
+    .unwrap();
+    fs::write(root.join("value.h"), "#define VALUE 42\n").unwrap();
+    fs::write(
+        root.join("main.c"),
+        "int value(void); int main(void) { return value(); }\n",
+    )
+    .unwrap();
+
+    for (phase, expected, hit) in [
+        ("cold", 42, false),
+        ("warm", 42, true),
+        ("edited", 17, false),
+    ] {
+        if phase == "edited" {
+            fs::write(root.join("value.h"), "#define VALUE 17\n").unwrap();
+        }
+        let trace = root.join(phase);
+        let _ = fs::remove_file(root.join("unit.o"));
+        let output = cacheable_cc_command(&root)
+            .args(["cc", "-c", "unit.c", "-o", "unit.o"])
+            .env("KACHE_PHASE_TRACE_DIR", &trace)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{phase}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let events = fs::read_to_string(cache.join("events.jsonl")).unwrap();
+        let event: serde_json::Value =
+            serde_json::from_str(events.lines().last().unwrap()).unwrap();
+        assert_eq!(event["result"] == "local_hit", hit, "{phase}: {event}");
+        assert_eq!(event["compiler_runs"], u32::from(!hit), "{phase}: {event}");
+        assert!(
+            event
+                .get("store_error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .is_empty(),
+            "{phase}: {event}"
+        );
+        let spans: Vec<serde_json::Value> = fs::read_dir(&trace)
+            .unwrap()
+            .flat_map(|entry| {
+                let value: serde_json::Value =
+                    serde_json::from_slice(&fs::read(entry.unwrap().path()).unwrap()).unwrap();
+                value["traceEvents"].as_array().unwrap().clone()
+            })
+            .collect();
+        for name in ["cc_parse", "store_open"] {
+            assert_eq!(
+                spans.iter().filter(|span| span["name"] == name).count(),
+                1,
+                "{phase}: {name}"
+            );
+        }
+        assert!(
+            !spans.iter().any(|span| matches!(
+                span["name"].as_str(),
+                Some("handoff_snapshot" | "handoff_event")
+            )),
+            "a missing daemon must not add handoff staging work"
+        );
+        assert!(!cache.join("store/staging/handoff").exists());
+        if phase == "cold" {
+            assert!(
+                spans.iter().any(|span| span["name"] == "cc_capture"),
+                "the test must exercise compile-first discovery"
+            );
+            assert_eq!(event["preprocessor_runs"], 0);
+        }
+        assert!(
+            Command::new("cc")
+                .args(["main.c", "unit.o", "-o", "check-value"])
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert_eq!(
+            Command::new(root.join("check-value"))
+                .status()
+                .unwrap()
+                .code(),
+            Some(expected)
+        );
+    }
+}
+
+fn cacheable_cc_command(root: &std::path::Path) -> Command {
+    let mut command = Command::new(kache_binary());
+    command
+        .current_dir(root)
+        .env("KACHE_CACHE_DIR", root.join("cache"))
+        .env("KACHE_RUNTIME_DIR", root.join("cache"))
+        .env("KACHE_CONFIG", root.join("kache.toml"))
+        .env("KACHE_HOST_CONFIG", "")
+        .env("KACHE_BASE_DIR", root)
+        .env("KACHE_LOCAL_ONLY", "1")
+        .env("KACHE_DEFERRED_DISCOVERY", "1")
+        .env("KACHE_DAEMON_PUBLISH", "1")
+        .env_remove("OUT_DIR")
+        .env_remove("KACHE_ACTIVE")
+        .env_remove("KACHE_SOCKET_PATH");
+    command
+}
+
+#[test]
+fn deferred_cc_does_not_publish_inputs_changed_during_the_compile() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    fs::write(root.join("kache.toml"), "").unwrap();
+    fs::write(
+        root.join("unit.c"),
+        "#include \"value.h\"\nint value(void) { return VALUE; }\n",
+    )
+    .unwrap();
+    fs::write(root.join("value.h"), "#define VALUE 42\n").unwrap();
+    fs::write(
+        root.join("main.c"),
+        "int value(void); int main(void) { return value(); }\n",
+    )
+    .unwrap();
+    let compiler = root.join("cc");
+    kache_fs::testutil::write_executable(
+        &compiler,
+        r#"#!/bin/sh
+for argument in "$@"; do
+    case "$argument" in -###|--version|-E) exec /usr/bin/cc "$@" ;; esac
+done
+/usr/bin/cc "$@"
+status=$?
+if [ "$status" = 0 ]; then
+    case " $* " in *" unit.c "*) printf '#define VALUE 17\n' > value.h ;; esac
+fi
+exit "$status"
+"#,
+    );
+    let output = cacheable_cc_command(&root)
+        .arg(&compiler)
+        .args(["-c", "unit.c", "-o", "unit.o"])
+        .env("KACHE_LOG", "kache=debug")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("value.h")).unwrap(),
+        "#define VALUE 17\n"
+    );
+    assert!(
+        Command::new("cc")
+            .args(["main.c", "unit.o", "-o", "check-value"])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert_eq!(
+        Command::new(root.join("check-value"))
+            .status()
+            .unwrap()
+            .code(),
+        Some(42)
+    );
+    let db = rusqlite::Connection::open(root.join("cache/index.db")).unwrap();
+    for table in ["entries", "cc_preprocess_memos"] {
+        let count: i64 = db
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0, "a changed input must not populate {table}");
+    }
+}

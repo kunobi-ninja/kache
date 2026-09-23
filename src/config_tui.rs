@@ -1937,6 +1937,7 @@ mod tests {
                 shared_hardlink_restores: None,
                 deferred_discovery: None,
                 deferred_durability: None,
+                daemon_publish: None,
                 auto_gc: None,
                 index_auto_compact: None,
                 gc_evict_shared: Some(true),

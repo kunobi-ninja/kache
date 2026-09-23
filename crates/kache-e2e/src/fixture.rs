@@ -93,6 +93,12 @@ pub struct Fixture {
     #[serde(default)]
     pub negative_control_exempt: bool,
 
+    /// Run every phase with a kache daemon bound to the fixture's cache
+    /// directory, so the paths that hand work to it (`daemon_publish`) are
+    /// the ones exercised. Without this the wrapper does everything itself.
+    #[serde(default)]
+    pub daemon: bool,
+
     /// Assert that restored dep-info (`.d`) files are path-expanded.
     ///
     /// kache relativizes `.d` files on store (`<target>/...` → `./...`)
@@ -354,6 +360,8 @@ pub struct MetricAssertions {
     /// fully hits must not spawn the compiler at all. Deterministic
     /// (a count, not a timing), so it is safe to gate CI on.
     pub max_compiler_runs: Option<u32>,
+    /// Completed stores published by the daemon during this phase.
+    pub min_daemon_stores: Option<u64>,
     /// Upper bound on the preprocessor spawns (`cc -E`) summed across
     /// this phase's events. Documents the per-compile C/C++ key
     /// overhead and guards against a regression that runs the

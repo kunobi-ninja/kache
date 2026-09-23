@@ -381,6 +381,23 @@ impl Client {
         serde_json::from_slice(&output.stdout).expect("report should be valid json")
     }
 
+    /// The report once it holds an event for `crate_name`. A C miss with a
+    /// daemon running is published in the background, and the daemon logs
+    /// its event only after the store put, so an immediate report can miss it.
+    fn report_with_event(&self, crate_name: &str) -> serde_json::Value {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let report = self.report();
+            let logged = report["all_events"]
+                .as_array()
+                .is_some_and(|events| events.iter().any(|e| e["crate_name"] == crate_name));
+            if logged || Instant::now() >= deadline {
+                return report;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
     /// Per-result event counts from `kache report` over this client's cache.
     fn results(&self) -> Vec<String> {
         self.report()["all_events"]
@@ -715,7 +732,7 @@ fn daemon_upload_reaches_an_independent_client_for_a_c_object() {
     let alpha = Client::new(shared.path());
     alpha.start_daemon();
     alpha.compile_cc_checkout(producer_source.path(), "foo.c", "foo.o");
-    let alpha_report = alpha.report();
+    let alpha_report = alpha.report_with_event("foo.c");
     let alpha_event = crate_event(&alpha_report, "foo.c");
     assert!(
         alpha_event["result"] == "miss" || alpha_event["result"] == "dup",

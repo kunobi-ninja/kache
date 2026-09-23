@@ -20,10 +20,13 @@ use crate::events::{self, BuildEvent, EventResult};
 use crate::incremental_policy::{AdaptiveUnit, Lease};
 use crate::link;
 use crate::scheduler::{self, FlightIdentity, MissGuard};
-use crate::store::{BuildClaim, EntryMeta, Store, StorePutResult};
+use crate::store::{BuildClaim, EntryMeta, KeyLock, Store, StorePutResult};
 
 mod remote;
-use remote::{NegativeReply, acquire_entry, compiler_remote_enabled, maybe_enqueue_upload};
+use remote::{
+    NegativeReply, acquire_entry, compiler_remote_enabled, compiler_upload_enabled,
+    maybe_enqueue_upload,
+};
 
 mod hit;
 use hit::HitCompletion;
@@ -511,7 +514,7 @@ fn auto_gc_wanted(config: &Config, store: &Store) -> bool {
 
 /// After a store: if [`auto_gc_wanted`] says so, get a sweep started without
 /// waiting for it.
-fn maybe_spawn_auto_gc(config: &Config, store: &Store) {
+pub(crate) fn maybe_spawn_auto_gc(config: &Config, store: &Store) {
     let _trace = crate::phase_trace::phase("auto_gc_check");
     run_auto_gc_check(
         config,
@@ -958,7 +961,10 @@ pub fn run_nvcc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     // User bypass rules (#222): declared per project, evaluated before any key
     // work, same fail-closed contract as `exclude` below — a match only ever
     // means "do not cache".
-    if let Some(reason) = Config::user_bypass_reason(&crate_name, &parsed.rest) {
+    if let Some(reason) = config
+        .project_rules
+        .user_bypass_reason(&crate_name, &parsed.rest)
+    {
         tracing::debug!("nvcc invocation bypassed by user rule: {reason}");
         return nvcc_passthrough_with_event(
             config,
@@ -973,7 +979,7 @@ pub fn run_nvcc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     let current_dir = std::env::current_dir().ok();
     let exclude_roots: Vec<_> = current_dir.iter().cloned().collect();
     if let Some(source) = parsed.sources.first()
-        && Config::source_excluded(source, &exclude_roots)
+        && config.project_rules.source_excluded(source, &exclude_roots)
     {
         tracing::debug!("nvcc source excluded from cache: {}", source.display());
         return nvcc_passthrough_with_event(
@@ -1557,7 +1563,7 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_nanos() as i64)
         .unwrap_or(0);
-    run_cc_inner(config, wrapper_args, start, invocation_start_ns, None)
+    run_cc_inner(config, wrapper_args, start, invocation_start_ns)
 }
 
 /// A C compile that already ran because its key was deferred: the key is
@@ -1583,7 +1589,6 @@ fn run_cc_inner(
     wrapper_args: &[String],
     start: std::time::Instant,
     invocation_start_ns: i64,
-    mut precompiled: Option<CcPrecompiled>,
 ) -> Result<i32> {
     crate::link::set_windows_hardlink_restore(config.windows_hardlink);
     crate::link::set_shared_hardlink_restores(config.shared_hardlink_restores);
@@ -1629,6 +1634,7 @@ fn run_cc_inner(
     // Refuse-to-cache check: non-empty = this invocation isn't a
     // cacheable single-source `-c` compile (link mode, multi-arch,
     // PCH, modules, etc. — see CcArgs::refuse_reasons). Passthrough.
+    let trace_preflight = crate::phase_trace::phase("cc_preflight");
     let refuse = compiler.refuse_reasons(&parsed);
     if !refuse.is_empty() {
         let reasons: Vec<&str> = refuse.iter().map(|r| r.description()).collect();
@@ -1655,7 +1661,10 @@ fn run_cc_inner(
     // User bypass rules (#222): declared per project, evaluated before any key
     // work, same fail-closed contract as `exclude` below — a match only ever
     // means "do not cache".
-    if let Some(reason) = Config::user_bypass_reason(&crate_name, &parsed.rest) {
+    if let Some(reason) = config
+        .project_rules
+        .user_bypass_reason(&crate_name, &parsed.rest)
+    {
         tracing::debug!("cc invocation bypassed by user rule: {reason}");
         return cc_passthrough_with_event(config, &parsed, &crate_name, &event_root, start, reason);
     }
@@ -1663,7 +1672,7 @@ fn run_cc_inner(
     let current_dir = std::env::current_dir().ok();
     let exclude_roots: Vec<_> = current_dir.iter().cloned().collect();
     if let Some(source) = parsed.sources.first()
-        && Config::source_excluded(source, &exclude_roots)
+        && config.project_rules.source_excluded(source, &exclude_roots)
     {
         tracing::debug!("cc source excluded from cache: {}", source.display());
         return cc_passthrough_with_event(
@@ -1675,6 +1684,7 @@ fn run_cc_inner(
             format!("source excluded: {}", source.display()),
         );
     }
+    drop(trace_preflight);
 
     let trace_store_open = crate::phase_trace::phase("store_open");
     let (store, fallback_store) =
@@ -1696,6 +1706,49 @@ fn run_cc_inner(
             }
         };
 
+    let invocation = CcStoreInvocation {
+        compiler,
+        parsed,
+        store,
+        fallback_store,
+        crate_name,
+        event_root,
+        start,
+        invocation_start_ns,
+    };
+    run_cc_with_store(config, &invocation, None)
+}
+
+/// Reused after a compile-first miss, including the store connection and
+/// compiler policy that admitted the invocation before it ran.
+struct CcStoreInvocation {
+    compiler: CcCompiler,
+    parsed: crate::compiler::cc::CcArgs,
+    store: Store,
+    fallback_store: Option<Store>,
+    crate_name: String,
+    event_root: String,
+    start: std::time::Instant,
+    invocation_start_ns: i64,
+}
+
+fn run_cc_with_store(
+    config: &Config,
+    invocation: &CcStoreInvocation,
+    mut precompiled: Option<CcPrecompiled>,
+) -> Result<i32> {
+    let CcStoreInvocation {
+        compiler,
+        parsed,
+        store,
+        fallback_store,
+        crate_name,
+        event_root,
+        start,
+        invocation_start_ns,
+    } = invocation;
+    let start = *start;
+    let invocation_start_ns = *invocation_start_ns;
     // Compute the cache key (runs `cc -E -P` for the preprocessor
     // hash). On any failure — preprocessor error, missing compiler —
     // fall back to passthrough, which runs the real compiler and
@@ -1714,8 +1767,12 @@ fn run_cc_inner(
         key_env_vars: &config.key_env_vars,
         extra_inputs_digest: None,
     };
+    let mut captured_inputs_changed = false;
     let discovery = match precompiled.as_mut().and_then(|pre| pre.inputs.take()) {
-        Some(inputs) => crate::compiler::cc::CcKeyDiscovery::Captured(inputs),
+        Some(inputs) => {
+            captured_inputs_changed = inputs.inputs_changed();
+            crate::compiler::cc::CcKeyDiscovery::Captured(inputs)
+        }
         // Compiling first forgoes the lookup a key would have allowed, so it
         // is only for a certain miss: nowhere but this store could hold the
         // entry, and no fallback wrapper is waiting to be asked.
@@ -1723,40 +1780,37 @@ fn run_cc_inner(
             && config.deferred_discovery
             && config.remote.is_none()
             && config.fallback.is_none()
-            && crate::compiler::cc::cc_direct_key_eligible(&parsed) =>
+            && crate::compiler::cc::cc_direct_key_eligible(parsed) =>
         {
             crate::compiler::cc::CcKeyDiscovery::Deferrable
         }
         None => crate::compiler::cc::CcKeyDiscovery::Expansion,
     };
-    let keyed = compiler.cache_key_with(&parsed, &key_ctx, discovery);
+    let keyed = compiler.cache_key_with(parsed, &key_ctx, discovery);
     let keyed = match keyed {
         Ok(crate::compiler::cc::CcKeyOutcome::Deferred(deferred)) => {
             // No memo describes this unit's read set. Hold the discovery
             // flight so peers wait for the memo this compile leaves, then
             // ask once more: the previous owner may have published it.
-            let flight = crate::scheduler::join_discovery(
+            let flight = crate::scheduler::join_discovery_flight(
                 &config.cache_dir,
                 &format!("cc:{}", deferred.memo_key),
             );
-            match compiler.cache_key_with(
-                &parsed,
-                &key_ctx,
-                crate::compiler::cc::CcKeyDiscovery::Deferrable,
-            ) {
+            // Only a wait can have let a previous owner publish; a flight
+            // taken at once keeps the answer already in hand.
+            let keyed = if flight.waited {
+                compiler.cache_key_with(
+                    parsed,
+                    &key_ctx,
+                    crate::compiler::cc::CcKeyDiscovery::Deferrable,
+                )
+            } else {
+                Ok(crate::compiler::cc::CcKeyOutcome::Deferred(deferred))
+            };
+            let flight = flight.lock;
+            match keyed {
                 Ok(crate::compiler::cc::CcKeyOutcome::Deferred(_)) => {
-                    return cc_compile_before_key(
-                        config,
-                        wrapper_args,
-                        &compiler,
-                        &parsed,
-                        &file_hasher,
-                        &crate_name,
-                        &event_root,
-                        start,
-                        invocation_start_ns,
-                        flight,
-                    );
+                    return cc_compile_before_key(config, invocation, &file_hasher, flight);
                 }
                 other => other,
             }
@@ -1777,15 +1831,10 @@ fn run_cc_inner(
             let reason = format!("uncacheable|{e}");
             return if cc_key_error_skips_fallback(&e) {
                 cc_direct_passthrough_with_event(
-                    config,
-                    &parsed,
-                    &crate_name,
-                    &event_root,
-                    start,
-                    reason,
+                    config, parsed, crate_name, event_root, start, reason,
                 )
             } else {
-                cc_passthrough_with_event(config, &parsed, &crate_name, &event_root, start, reason)
+                cc_passthrough_with_event(config, parsed, crate_name, event_root, start, reason)
             };
         }
     };
@@ -1800,7 +1849,7 @@ fn run_cc_inner(
     let lookup = if precompiled.is_some() {
         None
     } else {
-        match lookup_local_entry(&store, fallback_store.as_ref(), &cache_key) {
+        match lookup_local_entry(store, fallback_store.as_ref(), &cache_key) {
             Ok(lookup) => {
                 drop(trace_lookup);
                 lookup
@@ -1813,9 +1862,9 @@ fn run_cc_inner(
                 );
                 return cc_passthrough_with_event(
                     config,
-                    &parsed,
-                    &crate_name,
-                    &event_root,
+                    parsed,
+                    crate_name,
+                    event_root,
                     start,
                     format!("store lookup failed: {e}"),
                 );
@@ -1830,7 +1879,7 @@ fn run_cc_inner(
             tracing::warn!("cc cache entry for {} has no files, evicting", crate_name);
             lookup_rejection = "matching entry has no cached artifacts".to_string();
             let _ = hit_store.remove_entry(&cache_key);
-        } else if let Some(reason) = cc_cache_entry_rejection_reason(&parsed, &meta) {
+        } else if let Some(reason) = cc_cache_entry_rejection_reason(parsed, &meta) {
             tracing::warn!(
                 "cc cache entry for {} lacks artifacts required by this invocation ({reason}), evicting",
                 crate_name,
@@ -1840,7 +1889,7 @@ fn run_cc_inner(
         } else {
             let restore_start = std::time::Instant::now();
             let trace_restore = crate::phase_trace::phase("restore");
-            let restored = restore_cc_from_cache(hit_store, &parsed, &meta);
+            let restored = restore_cc_from_cache(hit_store, parsed, &meta);
             drop(trace_restore);
             if let Err(e) = restored {
                 if e.downcast_ref::<PartialCcRestore>().is_some() {
@@ -1853,9 +1902,9 @@ fn run_cc_inner(
                 );
                 return cc_passthrough_with_event(
                     config,
-                    &parsed,
-                    &crate_name,
-                    &event_root,
+                    parsed,
+                    crate_name,
+                    event_root,
                     start,
                     format!("restore failed: {e}"),
                 );
@@ -1868,8 +1917,8 @@ fn run_cc_inner(
             );
             let trace_report = crate::phase_trace::phase("event_report");
             HitCompletion {
-                event_root: &event_root,
-                crate_name: &crate_name,
+                event_root,
+                crate_name,
                 result: EventResult::LocalHit,
                 cache_key: &cache_key,
                 start,
@@ -1891,13 +1940,13 @@ fn run_cc_inner(
     if precompiled.is_none()
         && let Some(exit) = cc_try_remote_hit(
             config,
-            &store,
-            &compiler,
-            &parsed,
+            store,
+            compiler,
+            parsed,
             &file_hasher,
             &cache_key,
-            &crate_name,
-            &event_root,
+            crate_name,
+            event_root,
             start,
             key_ms,
             lookup_ms,
@@ -1913,9 +1962,9 @@ fn run_cc_inner(
     if precompiled.is_none() && parsed.requires_compiler_output_semantics() {
         return cc_direct_passthrough_with_event(
             config,
-            &parsed,
-            &crate_name,
-            &event_root,
+            parsed,
+            crate_name,
+            event_root,
             start,
             "output appeared before compiler execution",
         );
@@ -1924,12 +1973,12 @@ fn run_cc_inner(
     let (miss_guard, scheduled_hit) = if precompiled.is_none() {
         admit_scheduler_miss(
             config,
-            &store,
+            store,
             &cache_key,
-            FlightIdentity::cc(&crate_name),
-            &crate_name,
+            FlightIdentity::cc(crate_name),
+            crate_name,
             false,
-            |meta| cc_scheduled_hit_ok(&parsed, meta),
+            |meta| cc_scheduled_hit_ok(parsed, meta),
         )
     } else {
         (MissGuard::empty(), None)
@@ -1951,7 +2000,7 @@ fn run_cc_inner(
                     .unwrap_or(false)
                     .then(|| store.get(&cache_key).ok().flatten())
                     .flatten()
-                    .filter(|meta| cc_scheduled_hit_ok(&parsed, meta));
+                    .filter(|meta| cc_scheduled_hit_ok(parsed, meta));
             }
             Err(e) => {
                 tracing::debug!("cc claim_build failed ({e:#}); compiling without a key lock");
@@ -1964,10 +2013,10 @@ fn run_cc_inner(
     // is stored.
     let peer_committed = cc_peer_committed_precompile(precompiled.is_some(), committed.is_some());
     if let Some(meta) = committed.filter(|meta| {
-        cc_restore_committed(precompiled.is_some(), cc_scheduled_hit_ok(&parsed, meta))
+        cc_restore_committed(precompiled.is_some(), cc_scheduled_hit_ok(parsed, meta))
     }) {
         let restore_start = std::time::Instant::now();
-        if let Err(e) = restore_cc_from_cache(&store, &parsed, &meta) {
+        if let Err(e) = restore_cc_from_cache(store, parsed, &meta) {
             if e.downcast_ref::<PartialCcRestore>().is_some() {
                 return Err(e);
             }
@@ -1978,17 +2027,17 @@ fn run_cc_inner(
             );
             return cc_passthrough_with_event(
                 config,
-                &parsed,
-                &crate_name,
-                &event_root,
+                parsed,
+                crate_name,
+                event_root,
                 start,
                 format!("restore failed: {e}"),
             );
         }
         let restore_ms = restore_start.elapsed().as_millis() as u64;
         HitCompletion {
-            event_root: &event_root,
-            crate_name: &crate_name,
+            event_root,
+            crate_name,
             result: EventResult::LocalHit,
             cache_key: &cache_key,
             start,
@@ -2007,8 +2056,10 @@ fn run_cc_inner(
         Some(pre) => {
             // Inputs are fingerprinted after a deferred compile; one written
             // since this invocation started may not be what the compiler
-            // read, so neither the entry nor the memo may describe it.
-            let changed = file_hasher.too_new();
+            // read, so neither the entry nor the memo may describe it. The
+            // capture ran on the outer hasher; this one saw only what the
+            // key hashed afterwards, so both verdicts count.
+            let changed = captured_inputs_changed || file_hasher.too_new();
             if changed {
                 tracing::debug!(
                     "cc: {} read an input modified during the build; not storing it",
@@ -2019,7 +2070,7 @@ fn run_cc_inner(
         }
         None => {
             let compile_start = std::time::Instant::now();
-            let result = match compiler.execute(&parsed) {
+            let result = match compiler.execute(parsed) {
                 Ok(r) => r,
                 // A spawn-level failure (missing binary, ENOMEM, fork pressure
                 // under load) must not abort the build: fall back to
@@ -2029,15 +2080,15 @@ fn run_cc_inner(
                 Err(e) => {
                     return cc_passthrough_with_event(
                         config,
-                        &parsed,
-                        &crate_name,
-                        &event_root,
+                        parsed,
+                        crate_name,
+                        event_root,
                         start,
                         format!("compiler spawn failed: {e}"),
                     );
                 }
             };
-            miss_guard.record_compile_rss(&crate_name);
+            miss_guard.record_compile_rss(crate_name);
             let compile_time_ms = compile_start.elapsed().as_millis() as u64;
             replay_diagnostics(
                 &result.stdout,
@@ -2061,10 +2112,21 @@ fn run_cc_inner(
         inputs_changed,
         peer_committed,
     );
-    if store_candidate {
+    // Without a live daemon, keep the ordinary staging and memo path.
+    // The lifetime lock works for both Unix sockets and Windows pipes.
+    let daemon_publish = config.daemon_publish
+        && crate::daemon::existing_daemon_run_lock_is_held(&config.socket_path()).unwrap_or(false);
+    // A deferred compile's memo goes to the daemon with the entry; the
+    // wrapper records it only if the hand-off does not happen (below). Only
+    // a deferred compile captures one, and a compile that is no store
+    // candidate neither hands it off nor records it.
+    let handoff_memo = daemon_publish
+        .then(|| compiler.captured_preprocess_memo())
+        .flatten();
+    if store_candidate && handoff_memo.is_none() {
         compiler.commit_preprocess_memo(&file_hasher);
     }
-    let publishes_to_remote = cc_publishes_to_remote(&parsed);
+    let publishes_to_remote = cc_publishes_to_remote(parsed);
     let admitted = store_admits_compile(config, compile_time_ms, publishes_to_remote);
     let store_decision = cc_store_decision(store_candidate, admitted);
     if store_decision.admission_skipped {
@@ -2077,7 +2139,7 @@ fn run_cc_inner(
     }
     if store_decision.should_store
         && cc_store_revalidates_include_dirs(parsed.mode)
-        && !compiler.include_dir_names_still_match(&parsed)
+        && !compiler.include_dir_names_still_match(parsed)
     {
         tracing::debug!(
             crate_name = %crate_name,
@@ -2085,48 +2147,92 @@ fn run_cc_inner(
         );
     } else if store_decision.should_store {
         let _trace = crate::phase_trace::phase("store");
-        let depinfo_anchor = cc_depinfo_rewrite_root(&parsed);
+        let depinfo_anchor = cc_depinfo_rewrite_root(parsed);
         let target = parsed.cache_target_arch();
-        match prepare_cc_store_files(&result.artifacts, depinfo_anchor.as_deref()) {
-            Ok(prepared) => match store.put_with_compile_time_independent(
-                &cache_key,
-                &crate_name,
-                &[], // crate_types: n/a for cc objects
-                &[], // features: n/a
-                &target,
-                "", // profile: n/a (opt level is in the key)
-                &prepared.files,
-                if crate::compiler::cc::cc_expansion_is_stdout(&parsed) {
+        let staging_dir = daemon_publish.then(|| crate::daemon_publish::handoff_dir(config));
+        match prepare_cc_store_files_in(
+            &result.artifacts,
+            depinfo_anchor.as_deref(),
+            staging_dir.as_deref(),
+        ) {
+            Ok(prepared) => {
+                let stdout = if crate::compiler::cc::cc_expansion_is_stdout(parsed) {
                     ""
                 } else {
                     &result.stdout
-                },
-                &result.stderr,
-                compile_time_ms,
-            ) {
-                Ok(result) => {
-                    store_put = result;
-                    // Store grew — throttled size check + detached background GC if over
-                    // budget (kunobi-ninja/kache#497). Never blocks the compile path.
-                    maybe_spawn_auto_gc(config, &store);
-                    flush_or_hand_off_durability(config, &store, &cache_key);
-                    maybe_enqueue_upload(
-                        config,
-                        &store,
-                        &cache_key,
-                        &crate_name,
-                        publishes_to_remote,
-                    );
-                }
-                Err(e) => {
-                    store_error = store_error_for_event(&e);
-                    tracing::warn!(
-                        "failed to store cc cache entry for {}: {}",
+                };
+                // The put and everything after it are wall-clock time on a
+                // build script's serial C compiles. Hand them to the daemon
+                // when it will take them; it holds the key from then on.
+                if daemon_publish {
+                    let handoff = CcHandoff {
+                        cache_key: &cache_key,
                         crate_name,
-                        store_error
-                    );
+                        target: &target,
+                        files: &prepared.files,
+                        stdout,
+                        stderr: &result.stderr,
+                        compile_time_ms,
+                        publishes_to_remote,
+                        event_root,
+                        start,
+                        size: result.artifacts.total_size(),
+                        key_ms,
+                        lookup_ms,
+                        lookup_rejection: &lookup_rejection,
+                        store_start,
+                        memo: handoff_memo,
+                    };
+                    match hand_off_cc_store(config, store, &mut _build_lock, handoff) {
+                        CcHandoffOutcome::Accepted => {
+                            compiler.discard_preprocess_memo();
+                            return Ok(result.exit_code);
+                        }
+                        CcHandoffOutcome::Done => {
+                            compiler.commit_preprocess_memo(&file_hasher);
+                            return Ok(result.exit_code);
+                        }
+                        CcHandoffOutcome::Publish => {
+                            compiler.commit_preprocess_memo(&file_hasher);
+                        }
+                    }
                 }
-            },
+                match store.put_with_compile_time_independent(
+                    &cache_key,
+                    crate_name,
+                    &[], // crate_types: n/a for cc objects
+                    &[], // features: n/a
+                    &target,
+                    "", // profile: n/a (opt level is in the key)
+                    &prepared.files,
+                    stdout,
+                    &result.stderr,
+                    compile_time_ms,
+                ) {
+                    Ok(result) => {
+                        store_put = result;
+                        // Store grew — throttled size check + detached background GC if over
+                        // budget (kunobi-ninja/kache#497). Never blocks the compile path.
+                        maybe_spawn_auto_gc(config, store);
+                        flush_or_hand_off_durability(config, store, &cache_key);
+                        maybe_enqueue_upload(
+                            config,
+                            store,
+                            &cache_key,
+                            crate_name,
+                            publishes_to_remote,
+                        );
+                    }
+                    Err(e) => {
+                        store_error = store_error_for_event(&e);
+                        tracing::warn!(
+                            "failed to store cc cache entry for {}: {}",
+                            crate_name,
+                            store_error
+                        );
+                    }
+                }
+            }
             Err(e) => {
                 store_error = store_error_for_event(&e);
                 tracing::warn!(
@@ -2137,6 +2243,11 @@ fn run_cc_inner(
             }
         }
     }
+    // A skipped admission or failed snapshot never transfers the memo.
+    // Keep it for the next invocation even when no artifact was stored.
+    if store_candidate {
+        compiler.commit_preprocess_memo(&file_hasher);
+    }
     let store_ms = store_start.elapsed().as_millis() as u64;
 
     let elapsed = start.elapsed().as_millis() as u64;
@@ -2144,8 +2255,8 @@ fn run_cc_inner(
     let event_result = event_result_for_store_admission(store_candidate, admitted, store_put);
     log_event_with_store_and_lookup_outcome(
         config,
-        &event_root,
-        &crate_name,
+        event_root,
+        crate_name,
         event_result,
         elapsed,
         compile_time_ms,
@@ -2160,7 +2271,7 @@ fn run_cc_inner(
         store_error,
         lookup_rejection,
     );
-    print_progress(&crate_name, event_result, elapsed, size);
+    print_progress(crate_name, event_result, elapsed, size);
     Ok(result.exit_code)
 }
 
@@ -3150,11 +3261,13 @@ fn run_parsed_rustc(
     let excluded_source = args
         .source_file
         .as_ref()
-        .filter(|source| Config::source_excluded(source, &exclude_roots));
+        .filter(|source| config.project_rules.source_excluded(source, &exclude_roots));
     // User bypass rules (#222). Same fail-closed contract as `exclude`, and
     // gating the incremental fast path on it too: a bypassed unit must not
     // slip back into caching through the managed-incremental route.
-    let user_bypass = Config::user_bypass_reason(crate_name, &args.all_args);
+    let user_bypass = config
+        .project_rules
+        .user_bypass_reason(crate_name, &args.all_args);
     let skip_user_facing = args.is_user_facing_executable() && !config.cache_executables;
 
     if incremental_fast_path_allowed(
@@ -4236,19 +4349,174 @@ struct PreparedCcStoreFiles {
 /// hashes it. This keeps a concurrent replacement of a compiler output from
 /// publishing different bytes under the hash chosen for the original path.
 /// Dep-info normalization happens while creating that private snapshot.
+/// What the daemon needs to store a finished cc compile and log its event.
+struct CcHandoff<'a> {
+    cache_key: &'a str,
+    crate_name: &'a str,
+    target: &'a str,
+    /// `(staged path, store name)`: the wrapper's private snapshots.
+    files: &'a [(PathBuf, String)],
+    stdout: &'a str,
+    stderr: &'a str,
+    compile_time_ms: u64,
+    publishes_to_remote: bool,
+    event_root: &'a str,
+    start: std::time::Instant,
+    size: u64,
+    key_ms: u64,
+    lookup_ms: u64,
+    lookup_rejection: &'a str,
+    store_start: std::time::Instant,
+    /// The read-set memo for the daemon to record with the entry.
+    memo: Option<crate::daemon_publish::CcMemoHandoff>,
+}
+
+enum CcHandoffOutcome {
+    /// The daemon holds the key and will store the entry and its memo; the
+    /// event is its.
+    Accepted,
+    /// A peer took the key while the daemon was declining; its entry
+    /// counts and the event is written. Nothing more to store here.
+    Done,
+    /// Store here, with the key lock back in the caller's hands.
+    Publish,
+}
+
+/// Offer the compile to the daemon. On acceptance the wrapper is done: the
+/// daemon owns the snapshots, the key lock and the event. On any refusal
+/// the caller stores as before, with its lock re-taken; if a peer took the
+/// key in the meantime, that peer's entry is the one that counts and only
+/// the event is written here.
+fn hand_off_cc_store(
+    config: &Config,
+    store: &Store,
+    build_lock: &mut Option<KeyLock>,
+    handoff: CcHandoff<'_>,
+) -> CcHandoffOutcome {
+    use crate::daemon_publish::{Handoff, PublishCcRequest};
+    // Keep volume-local publication on the wrapper until the daemon can
+    // claim and write that same shard.
+    if !volume_cache_dirs_match(store.cache_dir(), &config.cache_dir) {
+        return CcHandoffOutcome::Publish;
+    }
+    let snapshots = match crate::daemon_publish::snapshot_for_handoff(config, handoff.files) {
+        Ok(snapshots) => snapshots,
+        Err(error) => {
+            tracing::debug!("cc hand-off: could not snapshot outputs: {error:#}");
+            return CcHandoffOutcome::Publish;
+        }
+    };
+    let elapsed = handoff.start.elapsed().as_millis() as u64;
+    let trace_event = crate::phase_trace::phase("handoff_event");
+    let event = build_event_details(
+        config,
+        handoff.event_root,
+        handoff.crate_name,
+        EventResult::Miss,
+        elapsed,
+        handoff.compile_time_ms,
+        handoff.size,
+        handoff.cache_key,
+        handoff.key_ms,
+        FileHashStats::default(),
+        handoff.lookup_ms,
+        0,
+        handoff.store_start.elapsed().as_millis() as u64,
+        StorePutResult::default(),
+        String::new(),
+        String::new(),
+        handoff.lookup_rejection.to_string(),
+        false,
+        None,
+        None,
+    );
+    drop(trace_event);
+    let request = PublishCcRequest {
+        client_epoch: crate::daemon::build_epoch(),
+        cache_key: handoff.cache_key.to_string(),
+        crate_name: handoff.crate_name.to_string(),
+        target: handoff.target.to_string(),
+        files: snapshots,
+        stdout: handoff.stdout.to_string(),
+        stderr: handoff.stderr.to_string(),
+        compile_time_ms: handoff.compile_time_ms,
+        publishes_to_remote: compiler_upload_enabled(config, handoff.publishes_to_remote),
+        event,
+        memo: handoff.memo,
+    };
+    // The daemon takes the key itself before it answers; ours must be gone
+    // first, since a file lock cannot be shared across processes.
+    *build_lock = None;
+    match crate::daemon_publish::hand_off_cc_publish(config, &request) {
+        Handoff::Accepted => {
+            print_progress(handoff.crate_name, EventResult::Miss, elapsed, handoff.size);
+            CcHandoffOutcome::Accepted
+        }
+        Handoff::Declined(reason) => {
+            tracing::debug!("cc hand-off declined for {}: {reason}", handoff.crate_name);
+            crate::daemon_publish::remove_handoff_files(&request.files);
+            match store.claim_build(handoff.cache_key) {
+                Ok(BuildClaim::Acquired(lock)) => {
+                    *build_lock = Some(lock);
+                    CcHandoffOutcome::Publish
+                }
+                Ok(BuildClaim::Committed(_)) | Ok(BuildClaim::Contended) => {
+                    // A peer holds or stored the key in the gap; it publishes.
+                    let mut event = request.event;
+                    event.elapsed_ms = handoff.start.elapsed().as_millis() as u64;
+                    // An independent peer won the key. That is ordinary
+                    // contention, not a failed store. An accepted daemon job
+                    // is resolved by its receipt before reaching this branch.
+                    write_event(config, &event);
+                    print_progress(
+                        handoff.crate_name,
+                        EventResult::Miss,
+                        event.elapsed_ms,
+                        handoff.size,
+                    );
+                    CcHandoffOutcome::Done
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        "reclaiming {} after a declined hand-off failed: {error:#}; storing without a lock",
+                        handoff.crate_name
+                    );
+                    CcHandoffOutcome::Publish
+                }
+            }
+        }
+    }
+}
+
 fn prepare_cc_store_files(
     artifacts: &ArtifactSet,
     depinfo_anchor: Option<&Path>,
 ) -> Result<PreparedCcStoreFiles> {
+    prepare_cc_store_files_in(artifacts, depinfo_anchor, None)
+}
+
+/// [`prepare_cc_store_files`] with the snapshots in `staging_dir` when one
+/// is given: a hand-off then links them into place instead of copying the
+/// object a second time. An unusable directory falls back to the system
+/// temporary directory.
+fn prepare_cc_store_files_in(
+    artifacts: &ArtifactSet,
+    depinfo_anchor: Option<&Path>,
+    staging_dir: Option<&Path>,
+) -> Result<PreparedCcStoreFiles> {
     use std::io::{Read, Write};
 
+    let staging_dir = staging_dir.filter(|dir| std::fs::create_dir_all(dir).is_ok());
     let mut files = Vec::with_capacity(artifacts.outputs().len());
     let mut temporary_files = Vec::with_capacity(artifacts.outputs().len());
     for artifact in artifacts.outputs() {
-        let staged = tempfile::Builder::new()
-            .prefix("kache-cc-artifact-")
-            .tempfile()
-            .context("cc store: creating private artifact staging file")?;
+        let mut builder = tempfile::Builder::new();
+        builder.prefix("kache-cc-artifact-");
+        let staged = match staging_dir {
+            Some(dir) => builder.tempfile_in(dir).or_else(|_| builder.tempfile()),
+            None => builder.tempfile(),
+        }
+        .context("cc store: creating private artifact staging file")?;
         let staged = staged.into_temp_path();
 
         if artifact.kind == ArtifactKind::DepInfo {
@@ -6227,19 +6495,21 @@ fn preserved_incremental_with_event(
 
 /// A deferred C compile: run the compiler with dependency capture, then key
 /// and store through the ordinary path with the result in hand.
-#[allow(clippy::too_many_arguments)]
 fn cc_compile_before_key(
     config: &Config,
-    wrapper_args: &[String],
-    compiler: &CcCompiler,
-    parsed: &crate::compiler::cc::CcArgs,
+    invocation: &CcStoreInvocation,
     file_hasher: &crate::cache_key::FileHasher<'_>,
-    crate_name: &str,
-    event_root: &str,
-    start: std::time::Instant,
-    invocation_start_ns: i64,
     flight: Option<crate::store::StoreLock>,
 ) -> Result<i32> {
+    let CcStoreInvocation {
+        compiler,
+        parsed,
+        crate_name,
+        event_root,
+        start,
+        ..
+    } = invocation;
+    let start = *start;
     tracing::debug!("no read-set memo for {crate_name}; compiling before keying");
     let compile_start = std::time::Instant::now();
     let (result, inputs) = match compiler.execute_capturing_inputs(parsed, file_hasher) {
@@ -6294,11 +6564,9 @@ fn cc_compile_before_key(
         );
     }
     CC_PRECOMPILED_EXIT.with(|cell| cell.set(Some(exit_code)));
-    let stored = run_cc_inner(
+    let stored = run_cc_with_store(
         config,
-        wrapper_args,
-        start,
-        invocation_start_ns,
+        invocation,
         Some(CcPrecompiled {
             result,
             compile_time_ms,
@@ -6434,7 +6702,7 @@ fn log_event_with_hash_stats(
 /// Hardening for shape, not secrecy: it does not redact. The reason is derived
 /// from filesystem and SQLite errors, so it can carry absolute paths, and a
 /// report shared outside the machine carries them too.
-fn store_error_for_event(error: &anyhow::Error) -> String {
+pub(crate) fn store_error_for_event(error: &anyhow::Error) -> String {
     const MAX_CHARS: usize = 2048;
 
     let rendered = format!("{error:#}");
@@ -6628,6 +6896,74 @@ fn log_event_details(
     exit_code: Option<i32>,
     fallback_attempt: Option<crate::fallback::Attempt>,
 ) {
+    let event = build_event_details(
+        config,
+        root,
+        crate_name,
+        result,
+        elapsed_ms,
+        compile_time_ms,
+        size,
+        cache_key,
+        key_ms,
+        key_hash_stats,
+        lookup_ms,
+        restore_ms,
+        store_ms,
+        store_put,
+        passthrough_reason,
+        store_error,
+        lookup_rejection,
+        fallback,
+        exit_code,
+        fallback_attempt,
+    );
+    write_event(config, &event);
+}
+
+/// Append `event` to the event log and rotate the logs. Best-effort: nothing
+/// here may fail a build.
+pub(crate) fn write_event(config: &Config, event: &BuildEvent) {
+    let _trace = crate::phase_trace::phase("event_log");
+    let _ = events::log_event(&config.event_log_path(), event);
+    let _ = events::rotate_if_needed(
+        &config.event_log_path(),
+        config.event_log_max_size,
+        config.event_log_keep_lines,
+    );
+    let _ = events::rotate_transfers_if_needed(
+        &config.transfer_log_path(),
+        config.event_log_max_size,
+        config.event_log_keep_lines,
+    );
+}
+
+/// The event for one invocation, built from its measurements and this
+/// process's counters. Written by [`write_event`], here or, for a compile
+/// handed to the daemon, there.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_event_details(
+    config: &Config,
+    root: &str,
+    crate_name: &str,
+    result: EventResult,
+    elapsed_ms: u64,
+    compile_time_ms: u64,
+    size: u64,
+    cache_key: &str,
+    key_ms: u64,
+    key_hash_stats: FileHashStats,
+    lookup_ms: u64,
+    restore_ms: u64,
+    store_ms: u64,
+    store_put: StorePutResult,
+    passthrough_reason: String,
+    store_error: String,
+    lookup_rejection: String,
+    fallback: bool,
+    exit_code: Option<i32>,
+    fallback_attempt: Option<crate::fallback::Attempt>,
+) -> BuildEvent {
     // Session attribution (#583 P0.5): join or open the root's build session
     // and refresh the marker so the 5-minute window measures inactivity. Both
     // are best-effort; an empty id only means the marker was unusable.
@@ -6673,7 +7009,7 @@ fn log_event_details(
         (String::new(), Default::default())
     };
     let key_diff = explain_miss_diff(config, root, crate_name, result, cache_key, &key_fields);
-    let event = BuildEvent {
+    BuildEvent {
         ts: Utc::now(),
         crate_name: crate_name.to_string(),
         root: root.to_string(),
@@ -6683,7 +7019,7 @@ fn log_event_details(
         compile_time_ms,
         size,
         cache_key: cache_key.to_string(),
-        schema: 20,
+        schema: 21,
         demands: crate::demand::take(),
         session_id,
         key_ms,
@@ -6726,6 +7062,8 @@ fn log_event_details(
         restore_copy_other_bytes: crate::opcounts::restore_copy_other_bytes(),
         passthrough_reason,
         store_error,
+        store_handed_off: false,
+        daemon_store_ms: 0,
         lookup_rejection,
         verify_compare: crate::verify_compare::take_last_report(),
         fallback,
@@ -6737,19 +7075,7 @@ fn log_event_details(
         key_externs_recorded,
         unit_id,
         extern_units,
-    };
-    let _trace = crate::phase_trace::phase("event_log");
-    let _ = events::log_event(&config.event_log_path(), &event);
-    let _ = events::rotate_if_needed(
-        &config.event_log_path(),
-        config.event_log_max_size,
-        config.event_log_keep_lines,
-    );
-    let _ = events::rotate_transfers_if_needed(
-        &config.transfer_log_path(),
-        config.event_log_max_size,
-        config.event_log_keep_lines,
-    );
+    }
 }
 
 /// `[cache] explain_miss` (kunobi-ninja/kache#131): on a miss for a crate
@@ -11449,6 +11775,17 @@ exit 0
     }
 
     #[test]
+    fn daemon_handoff_preserves_the_wrappers_upload_policy() {
+        let mut config = test_config(PathBuf::from("cache"));
+        assert!(!compiler_upload_enabled(&config, true));
+        config.remote = Some(crate::config::RemoteConfig::test_s3("bucket", "artifacts"));
+        assert!(compiler_upload_enabled(&config, true));
+        assert!(!compiler_upload_enabled(&config, false));
+        config.remote_readonly = true;
+        assert!(!compiler_upload_enabled(&config, true));
+    }
+
+    #[test]
     fn cc_try_remote_hit_skips_the_daemon_when_enqueue_is_false() {
         let dir = tempfile::tempdir().unwrap();
         let config = test_config(dir.path().join("cache"));
@@ -11503,6 +11840,53 @@ exit 0
             !output.exists(),
             "found=false must not restore even when the local store already has the entry"
         );
+    }
+
+    /// A declined hand-off from the main store re-claims the key; a peer
+    /// that took it in the gap publishes, and the wrapper only logs its
+    /// event.
+    #[test]
+    fn a_declined_hand_off_yields_to_a_peer_that_took_the_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path().join("cache"));
+        let store = Store::open(&config).unwrap();
+        let key = blake3::hash(b"cc-handoff-peer").to_hex().to_string();
+        let BuildClaim::Acquired(_peer) = store.claim_build(&key).unwrap() else {
+            panic!("fresh key");
+        };
+        let object = dir.path().join("foo.o");
+        std::fs::write(&object, b"object bytes").unwrap();
+        let files = vec![(object, "foo.o".to_string())];
+        let now = std::time::Instant::now();
+        let handoff = CcHandoff {
+            cache_key: &key,
+            crate_name: "foo.c",
+            target: "x86_64",
+            files: &files,
+            stdout: "",
+            stderr: "",
+            compile_time_ms: 5,
+            publishes_to_remote: false,
+            event_root: "",
+            start: now,
+            size: 12,
+            key_ms: 0,
+            lookup_ms: 0,
+            lookup_rejection: "",
+            store_start: now,
+            memo: None,
+        };
+
+        // No daemon: the offer is declined and the key is the peer's.
+        let mut lock = None;
+        let outcome = hand_off_cc_store(&config, &store, &mut lock, handoff);
+
+        assert!(matches!(outcome, CcHandoffOutcome::Done));
+        assert!(lock.is_none());
+        let events = crate::events::read_events(&config.event_log_path()).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].result, EventResult::Miss);
+        assert!(!events[0].store_handed_off);
     }
 
     #[test]
@@ -12810,7 +13194,7 @@ exit 0
         );
         let events = crate::events::read_events(&config.event_log_path()).unwrap();
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].schema, 20);
+        assert_eq!(events[0].schema, 21);
         let demands = &events[0].demands;
         assert_eq!(demands.len(), 1);
         assert_eq!(demands[0].cache_key, "local-demand-key");
@@ -12864,7 +13248,7 @@ exit 0
         assert_eq!(event.compile_time_ms, 20);
         assert_eq!(event.size, 30);
         assert_eq!(event.cache_key, "cache-key");
-        assert_eq!(event.schema, 20);
+        assert_eq!(event.schema, 21);
         assert_eq!(event.key_ms, 40);
         assert_eq!(event.key_hash_hits, 4);
         assert_eq!(event.key_hash_misses, 5);
@@ -12930,7 +13314,7 @@ exit 0
 
         let events = crate::events::read_events(&config.event_log_path()).unwrap();
         let event = &events[0];
-        assert_eq!(event.schema, 20);
+        assert_eq!(event.schema, 21);
         // Whatever other tests add is real time, far under the next band.
         for (name, value, floor, fed) in [
             ("startup_ms", event.startup_ms, before[0], STARTUP_MS),
@@ -13069,7 +13453,7 @@ exit 0
         let event = &events[0];
         assert_eq!(event.result, EventResult::Miss);
         assert_eq!(event.cache_key, "same-key");
-        assert_eq!(event.schema, 20);
+        assert_eq!(event.schema, 21);
         assert_eq!(
             event.lookup_rejection,
             "matching entry lacks dep-info required by this invocation"
@@ -13105,7 +13489,7 @@ exit 0
             0,
         );
         let events = crate::events::read_events(&config.event_log_path()).unwrap();
-        assert_eq!(events[0].schema, 20);
+        assert_eq!(events[0].schema, 21);
         assert_eq!(events[0].result, EventResult::LocalHit);
         assert!(
             events[0].verify_compare.is_empty(),
@@ -13130,7 +13514,7 @@ exit 0
         );
         let events = crate::events::read_events(&config.event_log_path()).unwrap();
         assert_eq!(events.len(), 2);
-        assert_eq!(events[1].schema, 20);
+        assert_eq!(events[1].schema, 21);
         assert_eq!(
             events[1].verify_compare,
             "content: libfoo.rlib (byte mismatch)"

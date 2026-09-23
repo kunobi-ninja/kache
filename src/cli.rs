@@ -6620,6 +6620,12 @@ pub fn verify(config: &Config, checksums: bool, repair: bool) -> Result<VerifyOu
             swept_staging.removed,
             ByteSize(swept_staging.bytes_reclaimed)
         );
+        let handoffs = crate::daemon_publish::sweep_orphaned_handoffs(config, STAGING_SWEEP_GRACE);
+        println!(
+            "Repairing: reclaimed {} abandoned cc handoffs ({})",
+            handoffs.removed,
+            ByteSize(handoffs.bytes_reclaimed)
+        );
         let memos = store.file_hash_cache();
         match memos.prune_cc_preprocess_memos() {
             Ok((removed, inputs)) if removed + inputs > 0 => println!(
@@ -9234,6 +9240,8 @@ mod tests {
             shared_hardlink_restores: false,
             deferred_discovery: true,
             deferred_durability: false,
+            daemon_publish: false,
+            project_rules: crate::config::ProjectRules::default(),
             auto_gc: true,
             index_auto_compact: true,
             gc_evict_shared: false,
@@ -10787,6 +10795,8 @@ mod tests {
             root: String::new(),
             passthrough_reason: String::new(),
             store_error: String::new(),
+            store_handed_off: false,
+            daemon_store_ms: 0,
             lookup_rejection: String::new(),
             verify_compare: String::new(),
             fallback: false,

@@ -62,6 +62,8 @@ pub(crate) fn test_config(cache_dir: PathBuf) -> crate::config::Config {
         shared_hardlink_restores: false,
         deferred_discovery: true,
         deferred_durability: false,
+        daemon_publish: true,
+        project_rules: crate::config::ProjectRules::default(),
         auto_gc: true,
         index_auto_compact: true,
         gc_evict_shared: false,

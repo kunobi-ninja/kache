@@ -1511,11 +1511,14 @@ fn resolve_key_inputs(
             && let Some(cache_dir) = &file_hasher.prediction_flight_dir
             && let Some(identity) = discovery_flight_identity(args, file_hasher)
         {
-            let flight = crate::scheduler::join_discovery(cache_dir, &identity);
-            owns_flight = flight.is_some();
-            *file_hasher.discovery_flight.borrow_mut() = flight;
-            // The previous owner may have published while this process waited.
-            prediction = predicted_key_inputs(args, file_hasher);
+            let flight = crate::scheduler::join_discovery_flight(cache_dir, &identity);
+            owns_flight = flight.lock.is_some();
+            *file_hasher.discovery_flight.borrow_mut() = flight.lock;
+            // The previous owner may have published while this process
+            // waited; a flight taken at once had no owner to publish.
+            if flight.waited {
+                prediction = predicted_key_inputs(args, file_hasher);
+            }
         }
         match prediction {
             Ok(dep_info) => {
@@ -5224,6 +5227,7 @@ impl<'db> FileHasher<'db> {
         // the compile's own header work did on macOS.
         let mut stamped: Vec<(&String, &PathBuf, FileFingerprint)> =
             Vec::with_capacity(paths.len());
+        let _probe_loop = crate::phase_trace::phase("fp_stat_and_hash_loop");
         for (name, path) in paths {
             let fingerprint = match FileFingerprint::from_path(path) {
                 Ok(fingerprint) => fingerprint,
@@ -5254,6 +5258,8 @@ impl<'db> FileHasher<'db> {
             };
             pending.push((name.clone(), fingerprint, content, path.clone()));
         }
+        drop(_probe_loop);
+        let _probe_mapped = crate::phase_trace::phase("fp_mapped_query");
         let memo = self.cache.as_ref().filter(|_| !maps_key.is_empty());
         let known = match memo {
             Some(cache) => {
@@ -15218,12 +15224,13 @@ pub fn g(_: &'static str) {}"#,
         let pp_hash = "b".repeat(64);
         hasher.cc_preprocess_memo_record_if_unchanged("memo-key", &pp_hash, &inputs, &no_mapping);
 
-        // Rewrite both files with identical bytes. Remove first, so the
-        // replacement gets a new inode as well as a new mtime — the shape a
-        // second checkout produces.
+        // Rewrite identical bytes with different metadata. Filesystems can
+        // reuse the inode and timestamp on an immediate rewrite, so set the
+        // mtime explicitly to exercise content-based memo validation.
         for (path, bytes) in [(&source, source_bytes), (&header, header_bytes)] {
             std::fs::remove_file(path).unwrap();
             std::fs::write(path, bytes).unwrap();
+            filetime::set_file_mtime(path, filetime::FileTime::from_unix_time(1, 0)).unwrap();
         }
         let rewritten = FileFingerprint::from_path(&header).unwrap();
         assert_ne!(
@@ -15243,6 +15250,7 @@ pub fn g(_: &'static str) {}"#,
 
         // One byte of difference is still a miss, whatever the metadata says.
         std::fs::write(&header, "#define VALUE 2\n").unwrap();
+        filetime::set_file_mtime(&header, filetime::FileTime::from_unix_time(2, 0)).unwrap();
         assert_eq!(
             FileHasher::persistent(&db).cc_preprocess_memo_lookup(
                 "memo-key",

@@ -4,6 +4,7 @@
 import importlib.util
 import os
 import stat
+import subprocess
 import sys
 import tempfile
 import threading
@@ -20,6 +21,28 @@ spec.loader.exec_module(bench)
 
 
 class ContentionTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == "posix", "contention runner requires Linux")
+    def test_daemon_drain_waits_for_process_lock_without_a_socket(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "daemon.run.lock"
+            bench.wait_for_daemon_lock(path, 0)
+            with subprocess.Popen(
+                [sys.executable, "-c",
+                 "import fcntl,sys; f=open(sys.argv[1], 'w'); "
+                 "fcntl.flock(f, fcntl.LOCK_EX); print('ready', flush=True); "
+                 "sys.stdin.readline()", str(path)],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+            ) as child:
+                try:
+                    self.assertEqual(child.stdout.readline().strip(), "ready")
+                    with self.assertRaisesRegex(ValueError, "did not drain"):
+                        bench.wait_for_daemon_lock(path, 0)
+                finally:
+                    child.communicate("release\n", timeout=5)
+                self.assertEqual(child.returncode, 0)
+            bench.wait_for_daemon_lock(path, 0)
+            bench.wait_for_daemon_lock(path, 0)
+
     def test_storage_counts_hardlinks_once_and_does_not_follow_symlinks(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -119,15 +142,34 @@ runtime.mkdir(parents=True, exist_ok=True)
 result = os.environ["TEST_RESULT"]
 event = {"crate_name": pathlib.Path.cwd().name, "cache_key": pathlib.Path.cwd().name,
          "result": result, "compiler_runs": int(result == "miss")}
-with (runtime / "events.jsonl").open("a") as stream:
-    stream.write(json.dumps(event) + "\\n")
+if os.environ.get("TEST_DAEMON"):
+    assert (runtime / "daemon.sock").exists(), "daemon was not started"
+    event["store_handed_off"] = True
+    (runtime / (pathlib.Path.cwd().name + ".pending")).write_text(json.dumps(event) + "\\n")
+else:
+    with (runtime / "events.jsonl").open("a") as stream:
+        stream.write(json.dumps(event) + "\\n")
 print("ran", *sys.argv[1:])
 sys.exit(int(os.environ.get("TEST_FAIL", "0")))
 """
             )
             cargo.chmod(0o755)
             kache = bindir / "kache"
-            kache.write_text("#!/bin/sh\nexit 0\n")
+            kache.write_text(
+                f"#!{sys.executable}\n"
+                + """import os, pathlib, sys
+runtime = pathlib.Path(os.environ["KACHE_RUNTIME_DIR"])
+socket = runtime / "daemon.sock"
+if sys.argv[1:] == ["daemon", "start"]:
+    socket.touch()
+else:
+    with (runtime / "events.jsonl").open("a") as stream:
+        for pending in sorted(runtime.glob("*.pending")):
+            stream.write(pending.read_text())
+            pending.unlink()
+    socket.unlink(missing_ok=True)
+"""
+            )
             kache.chmod(0o755)
             repos = []
             for name, _ in bench.JOBS:
@@ -161,6 +203,16 @@ sys.exit(int(os.environ.get("TEST_FAIL", "0")))
                 )
                 self.assertEqual(cold["events"]["compiler_runs"], 6)
                 self.assertEqual(len(cold["jobs"]), 6)
+                args.daemon = True
+                with patch.dict(os.environ, {"TEST_DAEMON": "1"}):
+                    queued = bench.run_phase(
+                        args, kache, repos, root / "cache", root / "runtime",
+                        1, "cold", root / "queued",
+                    )
+                args.daemon = False
+                self.assertEqual(queued["events"]["results"], {"miss": 6})
+                self.assertEqual(queued["events"]["daemon_stores"], 6)
+                self.assertFalse((root / "runtime" / "daemon.sock").exists())
                 with patch.dict(os.environ, {"TEST_RESULT": "local_hit"}):
                     warm = bench.run_phase(
                         args,

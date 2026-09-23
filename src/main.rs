@@ -15,6 +15,7 @@ mod config;
 mod config_tui;
 mod daemon;
 mod daemon_local;
+mod daemon_publish;
 mod demand;
 mod events;
 mod extra_inputs;

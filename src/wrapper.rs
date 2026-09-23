@@ -3210,6 +3210,9 @@ fn run_parsed_rustc(
         event_root.clone(),
         heartbeat_lines_enabled(progress_level()),
     );
+    // A fresh machine has no prediction rows; let the key ask the remote for
+    // a portable one before paying the pre-pass (kunobi-ninja/kache#1011).
+    crate::cache_key::set_remote_rows(remote_prediction_rows(config));
     // Mutation testing repeatedly changes a local crate while keeping its
     // dependencies stable. Exact artifact keys necessarily miss for each new
     // mutant, while rustc's incremental state is designed for this workload.
@@ -5235,6 +5238,18 @@ fn deferral_allowed(
         && extra_inputs.is_none()
 }
 
+/// Where the key may fetch a portable prediction row this machine lacks: the
+/// daemon's remote, when predictions are on and a remote is configured.
+fn remote_prediction_rows(config: &Config) -> Option<crate::cache_key::RemoteRows> {
+    if !config.input_predictions || config.remote.is_none() {
+        return None;
+    }
+    let config = config.clone();
+    Some(Box::new(move |identity: &str| {
+        crate::daemon::send_prediction_fetch(&config, identity)
+    }))
+}
+
 /// Remember the input closure this invocation discovered, so a later build of
 /// the same unit can derive its key without spawning the pre-pass again.
 ///
@@ -5271,6 +5286,7 @@ fn record_input_prediction(config: &Config, store: Option<&Store>, args: &RustcA
     // Present exactly when the key was computed under the tree guard; the
     // record must carry it or the guard will never accept the record.
     let tree = crate::cache_key::take_last_tree_digest();
+    let registry = crate::cache_key::registry_src_of(&std::env::vars_os().collect::<Vec<_>>());
     // A workspace or path unit gets a row another checkout of the workspace
     // can use, when the guard was taken before rustc ran (kunobi-ninja/kache#1005).
     let workspace = crate::cache_key::workspace_record(args, &dep_info, tree.as_deref());
@@ -5286,6 +5302,11 @@ fn record_input_prediction(config: &Config, store: Option<&Store>, args: &RustcA
     );
     if let Some((identity, record)) = workspace {
         file_hasher.record_portable_prediction(&identity, args.crate_name.as_deref(), &record);
+        publish_prediction(
+            config,
+            &identity,
+            crate::prediction_share::for_remote_portable(&record, registry.as_deref()),
+        );
     }
     // A source under target keeps the shared row out. A registry unit whose
     // only such sources are its own OUT_DIR gets a relocated row instead.
@@ -5295,13 +5316,39 @@ fn record_input_prediction(config: &Config, store: Option<&Store>, args: &RustcA
                 &identity,
                 args.crate_name.as_deref(),
                 &dep_info,
-                tree,
+                tree.clone(),
             );
+            // A registry unit's row serves any machine whose Cargo home has
+            // the same path.
+            if let Some(registry) = &registry {
+                let row = crate::cache_key::InputPrediction::from_dep_info(&dep_info, tree);
+                publish_prediction(
+                    config,
+                    &identity,
+                    crate::prediction_share::for_remote_plain(&row, registry),
+                );
+            }
         }
     } else if let Some((identity, record)) =
         crate::cache_key::relocatable_record(args, &dep_info, tree.as_deref())
     {
         file_hasher.record_portable_prediction(&identity, args.crate_name.as_deref(), &record);
+        publish_prediction(
+            config,
+            &identity,
+            crate::prediction_share::for_remote_portable(&record, registry.as_deref()),
+        );
+    }
+}
+
+/// Hand a row to the daemon for the remote, when it can travel at all.
+fn publish_prediction(
+    config: &Config,
+    identity: &str,
+    row: Option<crate::prediction_share::SharedPrediction>,
+) {
+    if let Some(row) = row {
+        crate::daemon::send_prediction_publish(config, identity, row);
     }
 }
 

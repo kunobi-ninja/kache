@@ -1642,9 +1642,19 @@ fn predicted_key_inputs(
         Some(digest)
     };
     let identity = rustc_prediction_identity(args).ok_or(Rejection::Disabled)?;
+    let shared = rustc_shared_prediction_identity(args);
+    // Filled when the record came from the remote, so a record that checks
+    // out is kept here and not asked for again.
+    let mut from_remote = None;
     let Some(record) = file_hasher
         .input_prediction(&identity)
-        .or_else(|| file_hasher.input_prediction(&rustc_shared_prediction_identity(args)?))
+        .or_else(|| file_hasher.input_prediction(shared.as_deref()?))
+        .or_else(|| {
+            let shared = shared.as_deref()?;
+            let record = remote_plain_row(shared, &registry_src_of(&vars)?)?;
+            from_remote = Some(shared);
+            Some(record)
+        })
     else {
         return match &workspace {
             Some(workspace) => workspace_key_inputs(args, file_hasher, workspace, vars, tree),
@@ -1658,12 +1668,39 @@ fn predicted_key_inputs(
             None => return Err(Rejection::NoRecord),
         }
     }
-    validate_prediction(
+    let validated = validate_prediction(
         &record,
         |path| std::fs::metadata(path).ok(),
         |path| path.exists(),
         |var| std::env::var(var).ok(),
-    )
+    );
+    if let Some(shared) = from_remote {
+        keep_remote_plain_row(file_hasher, shared, args, &record, &validated);
+    }
+    validated
+}
+
+/// Keep a registry unit's shared row that came from the remote and checked
+/// out, so the next build finds it locally.
+fn keep_remote_plain_row(
+    file_hasher: &FileHasher<'_>,
+    identity: &str,
+    args: &RustcArgs,
+    record: &InputPrediction,
+    validated: &std::result::Result<DepInfo, Rejection>,
+) {
+    crate::phase_trace::decision(
+        "remote_prediction",
+        if validated.is_ok() { "used" } else { "refused" },
+    );
+    if let Ok(dep_info) = validated {
+        file_hasher.record_input_prediction(
+            identity,
+            args.crate_name.as_deref(),
+            dep_info,
+            record.tree.clone(),
+        );
+    }
 }
 
 /// The third lookup, after this checkout's row and the shared one both
@@ -1683,6 +1720,7 @@ fn relocated_key_inputs(
     let out_dir = env_var_in(&vars, "OUT_DIR")
         .and_then(std::ffi::OsStr::to_str)
         .map(str::to_string);
+    let registry = registry_src_of(&vars);
     let identity = relocatable_prediction_identity(args, vars).ok_or(Rejection::NoRecord)?;
     let out_dir = out_dir.ok_or(Rejection::NoRecord)?;
     let guard = match tree {
@@ -1693,20 +1731,110 @@ fn relocated_key_inputs(
         }
     };
     let _ = LAST_KEY_TREE_DIGEST.try_with(|stash| *stash.borrow_mut() = Some(guard.clone()));
-    let record = file_hasher
-        .portable_prediction(&identity)
-        .ok_or(Rejection::NoRecord)?;
-    validate_portable_prediction(
-        &record,
-        &guard,
-        &Places {
-            out_dir: Some(&out_dir),
-            workspace: None,
-        },
-        |path| std::fs::metadata(path).ok(),
-        |path| path.exists(),
-        |var| std::env::var(var).ok(),
-    )
+    let places = Places {
+        out_dir: Some(&out_dir),
+        workspace: None,
+        registry: registry.as_deref().and_then(Path::to_str),
+    };
+    portable_key_inputs(file_hasher, &identity, args, &guard, &places)
+}
+
+/// Use this machine's row for `identity`, or failing that the remote's
+/// ([`set_remote_rows`]), checked the same way. A remote row that passes is
+/// kept locally, so the next build does not ask again.
+fn portable_key_inputs(
+    file_hasher: &FileHasher<'_>,
+    identity: &str,
+    args: &RustcArgs,
+    guard: &str,
+    places: &Places<'_>,
+) -> std::result::Result<DepInfo, Rejection> {
+    let validate = |record: &PortablePrediction| {
+        validate_portable_prediction(
+            record,
+            guard,
+            places,
+            |path| std::fs::metadata(path).ok(),
+            |path| path.exists(),
+            |var| std::env::var(var).ok(),
+        )
+    };
+    if let Some(record) = file_hasher.portable_prediction(identity) {
+        return validate(&record);
+    }
+    let record = remote_portable_row(identity).ok_or(Rejection::NoRecord)?;
+    let validated = validate(&record);
+    crate::phase_trace::decision(
+        "remote_prediction",
+        if validated.is_ok() { "used" } else { "refused" },
+    );
+    if validated.is_ok() {
+        file_hasher.record_portable_prediction(identity, args.crate_name.as_deref(), &record);
+    }
+    validated
+}
+
+thread_local! {
+    /// Where a portable row comes from when this machine has none: the
+    /// daemon's remote, installed by the wrapper when a remote is configured.
+    static REMOTE_ROWS: std::cell::RefCell<Option<RemoteRows>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Asks the remote for the row filed under an identity.
+pub(crate) type RemoteRows = Box<dyn Fn(&str) -> Option<crate::prediction_share::SharedPrediction>>;
+
+/// Let the key ask `rows` for a portable row this machine lacks, or stop
+/// asking with `None` (kunobi-ninja/kache#1011).
+pub(crate) fn set_remote_rows(rows: Option<RemoteRows>) {
+    REMOTE_ROWS.with(|slot| *slot.borrow_mut() = rows);
+}
+
+fn remote_row(identity: &str) -> Option<crate::prediction_share::SharedPrediction> {
+    REMOTE_ROWS.with(|slot| slot.borrow().as_ref().and_then(|rows| rows(identity)))
+}
+
+fn remote_portable_row(identity: &str) -> Option<PortablePrediction> {
+    match remote_row(identity)? {
+        crate::prediction_share::SharedPrediction::Portable(row) => Some(row),
+        crate::prediction_share::SharedPrediction::Plain(_) => None,
+    }
+}
+
+fn remote_plain_row(identity: &str, registry: &Path) -> Option<InputPrediction> {
+    match remote_row(identity)? {
+        crate::prediction_share::SharedPrediction::Plain(row) => {
+            crate::prediction_share::plain_from_remote(&row, registry)
+        }
+        crate::prediction_share::SharedPrediction::Portable(_) => None,
+    }
+}
+
+/// The bytes of `value` after `registry`, for a path inside one package under
+/// it ([`under_registry_src`]), or `None`.
+pub(crate) fn registry_suffix(value: &str, registry: &Path) -> Option<String> {
+    suffix_within(std::ffi::OsStr::new(value), registry, 2).filter(|suffix| !suffix.is_empty())
+}
+
+/// Is a shared row filed under `identity`? A registry unit's may travel
+/// (see [`crate::prediction_share`]).
+pub(crate) fn is_shared_target_identity(identity: &str) -> bool {
+    identity.starts_with(SHARED_PREDICTION_PREFIX)
+}
+
+/// `<CARGO_HOME>/registry/src` for a registry unit, from its
+/// `CARGO_MANIFEST_DIR`.
+pub(crate) fn registry_src_of(
+    vars: &[(std::ffi::OsString, std::ffi::OsString)],
+) -> Option<PathBuf> {
+    registry_src_root(Path::new(env_var_in(vars, "CARGO_MANIFEST_DIR")?)).map(Path::to_path_buf)
+}
+
+/// Is a row filed under `identity` free of machine-specific paths, so that it
+/// may travel through the remote? The workspace and relocated `OUT_DIR` rows.
+pub(crate) fn is_portable_identity(identity: &str) -> bool {
+    identity.starts_with(WORKSPACE_PREDICTION_PREFIX)
+        || identity.starts_with(RELOCATABLE_PREDICTION_PREFIX)
 }
 
 /// The fourth lookup, for a workspace or path unit (kunobi-ninja/kache#1005):
@@ -1735,17 +1863,8 @@ fn workspace_key_inputs(
         }
     };
     let _ = LAST_KEY_TREE_DIGEST.try_with(|stash| *stash.borrow_mut() = Some(guard.clone()));
-    let record = file_hasher
-        .portable_prediction(&identity)
-        .ok_or(Rejection::NoRecord)?;
-    validate_portable_prediction(
-        &record,
-        &guard,
-        &workspace.places().ok_or(Rejection::NoRecord)?,
-        |path| std::fs::metadata(path).ok(),
-        |path| path.exists(),
-        |var| std::env::var(var).ok(),
-    )
+    let places = workspace.places().ok_or(Rejection::NoRecord)?;
+    portable_key_inputs(file_hasher, &identity, args, &guard, &places)
 }
 
 /// The directories a workspace unit's record is relocated against.
@@ -1770,6 +1889,7 @@ impl WorkspaceRoots {
                 None => None,
             },
             workspace: Some(self.root.to_str()?),
+            registry: None,
         })
     }
 }
@@ -4857,7 +4977,7 @@ pub(crate) struct InputPrediction {
 }
 
 impl InputPrediction {
-    fn from_dep_info(dep_info: &DepInfo, tree: Option<String>) -> Self {
+    pub(crate) fn from_dep_info(dep_info: &DepInfo, tree: Option<String>) -> Self {
         Self {
             schema: PREDICTION_SCHEMA,
             sources: dep_info.source_files.clone(),
@@ -4893,6 +5013,10 @@ pub(crate) enum Portable {
     Literal(String),
     OutDir(String),
     Workspace(String),
+    /// The bytes after `<CARGO_HOME>/registry/src`. Written only for a row
+    /// that travels through the remote ([`crate::prediction_share`]), so it
+    /// carries no local path.
+    Registry(String),
 }
 
 /// Where a portable record's relative entries land for this invocation. A
@@ -4901,6 +5025,7 @@ pub(crate) enum Portable {
 pub(crate) struct Places<'a> {
     pub(crate) out_dir: Option<&'a str>,
     pub(crate) workspace: Option<&'a str>,
+    pub(crate) registry: Option<&'a str>,
 }
 
 /// The directories a portable record is written against.
@@ -4987,6 +5112,7 @@ impl PortablePrediction {
             Portable::Literal(value) => Some(value.clone()),
             Portable::OutDir(suffix) => Some(format!("{}{suffix}", places.out_dir?)),
             Portable::Workspace(suffix) => Some(format!("{}{suffix}", places.workspace?)),
+            Portable::Registry(suffix) => Some(format!("{}{suffix}", places.registry?)),
         };
         Some(InputPrediction {
             schema: PREDICTION_SCHEMA,
@@ -11071,7 +11197,11 @@ mod tests {
             env_deps: vec![],
             tree: "t".to_string(),
         };
-        let places = |out_dir, workspace| Places { out_dir, workspace };
+        let places = |out_dir, workspace| Places {
+            out_dir,
+            workspace,
+            registry: None,
+        };
         assert_eq!(record.resolve(&places(Some("/o"), None)), None);
         assert_eq!(
             record
@@ -11282,6 +11412,7 @@ mod tests {
             portable_test_record().resolve(&Places {
                 out_dir: Some("/u/debug/build/kt-1/out"),
                 workspace: None,
+                registry: None,
             }),
             Some(InputPrediction {
                 schema: PREDICTION_SCHEMA,
@@ -11317,6 +11448,7 @@ mod tests {
                 &Places {
                     out_dir: Some("/u/out"),
                     workspace: None,
+                    registry: None,
                 },
                 |_| std::fs::metadata(file.path()).ok(),
                 |_| false,

@@ -14,6 +14,7 @@ use crate::store::{EntryMeta, VerifiedRestoredEntry};
 const V3_ROOT: &str = "v3";
 const V3_MANIFESTS: &str = "manifests";
 const V3_PACKS: &str = "packs";
+const V3_PREDICTIONS: &str = "predictions";
 const V3_MANIFEST_VERSION: u32 = 3;
 
 /// Cap on total bytes written while extracting one downloaded entry pack.
@@ -90,6 +91,38 @@ struct ExpectedEntryBinding<'a> {
 impl<'a> RemoteLayout<'a> {
     pub fn new(backend: &'a dyn RemoteBackend, remote: &'a RemoteConfig) -> Self {
         Self { backend, remote }
+    }
+
+    /// The input prediction row the remote holds for `identity`
+    /// (kunobi-ninja/kache#1011). A missing or malformed object is no row; a
+    /// failed transfer or an object past the size cap is an error.
+    pub async fn download_prediction(
+        &self,
+        identity: &str,
+    ) -> Result<Option<crate::prediction_share::SharedPrediction>> {
+        let key = v3_prediction_key(&self.remote.prefix, identity);
+        let Some(object) = self
+            .backend
+            .get(&key, Some(crate::prediction_share::SHARED_ROW_MAX_BYTES))
+            .await?
+        else {
+            return Ok(None);
+        };
+        Ok(crate::prediction_share::decode(&object.body, identity))
+    }
+
+    /// Store `row` as the remote's answer for `identity`. A row that may not
+    /// travel is skipped.
+    pub async fn upload_prediction(
+        &self,
+        identity: &str,
+        row: &crate::prediction_share::SharedPrediction,
+    ) -> Result<()> {
+        let Some(body) = crate::prediction_share::encode(identity, row) else {
+            return Ok(());
+        };
+        let key = v3_prediction_key(&self.remote.prefix, identity);
+        self.backend.put(&key, body, Some("application/json")).await
     }
 
     pub async fn exists_entry(&self, cache_key: &str, crate_name: &str) -> Result<bool> {
@@ -400,6 +433,16 @@ fn v3_manifest_key(prefix: &str, cache_key: &str, crate_name: &str) -> String {
     crate::config::join_remote_key(
         prefix,
         &format!("{V3_ROOT}/{V3_MANIFESTS}/{crate_name}/{cache_key}.json"),
+    )
+}
+
+fn v3_prediction_key(prefix: &str, identity: &str) -> String {
+    crate::config::join_remote_key(
+        prefix,
+        &format!(
+            "{V3_ROOT}/{V3_PREDICTIONS}/{}",
+            crate::prediction_share::object_name(identity)
+        ),
     )
 }
 

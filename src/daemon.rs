@@ -369,7 +369,25 @@ pub(crate) enum Request {
     /// of allowing an ambiguous timeout to publish and log twice.
     #[serde(rename = "publish_cc_v2")]
     PublishCc(Box<crate::daemon_publish::PublishCcRequest>),
+    /// A wrapper with no local input prediction row asks for the remote's
+    /// (kunobi-ninja/kache#1011). Older daemons reject the unknown variant,
+    /// which the wrapper reads as no row.
+    PredictionFetch(PredictionFetchRequest),
+    /// A wrapper recorded a portable row; the daemon stores it on a writable
+    /// remote in the background.
+    PredictionPublish(PredictionPublishRequest),
     Shutdown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PredictionFetchRequest {
+    pub identity: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PredictionPublishRequest {
+    pub identity: String,
+    pub row: crate::prediction_share::SharedPrediction,
 }
 
 impl Request {
@@ -396,6 +414,20 @@ pub struct UploadJob {
     /// Client binary mtime — lets the daemon detect when it's running stale code.
     #[serde(default)]
     pub client_epoch: u64,
+}
+
+/// How long the daemon spends fetching one prediction row. A row saves one
+/// pre-pass, so waiting longer than a pre-pass takes would be a loss.
+const PREDICTION_FETCH_BUDGET: Duration = Duration::from_secs(2);
+
+/// Longest identity accepted over the socket: a prefix and a 64-hex hash.
+const PREDICTION_IDENTITY_MAX_LEN: usize = 128;
+
+/// Is `identity` one a shared row may answer, and short enough to be one?
+fn prediction_identity_is_acceptable(identity: &str) -> bool {
+    identity.len() <= PREDICTION_IDENTITY_MAX_LEN
+        && (crate::cache_key::is_portable_identity(identity)
+            || crate::cache_key::is_shared_target_identity(identity))
 }
 
 fn upload_spool_path(config: &Config, key: &str) -> PathBuf {
@@ -1497,6 +1529,9 @@ pub(crate) struct Response {
     /// Reply payload for `Request::LocalLookup` (kunobi-ninja/kache#565).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_lookup: Option<LocalLookupReply>,
+    /// Reply payload for `Request::PredictionFetch` (kunobi-ninja/kache#1011).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prediction: Option<crate::prediction_share::SharedPrediction>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -1519,6 +1554,7 @@ impl Response {
             batch_results: None,
             hash_results: None,
             local_lookup: None,
+            prediction: None,
             error: None,
         }
     }
@@ -1537,6 +1573,7 @@ impl Response {
             batch_results: None,
             hash_results: None,
             local_lookup: None,
+            prediction: None,
             error: None,
         }
     }
@@ -1562,6 +1599,7 @@ impl Response {
             batch_results: None,
             hash_results: None,
             local_lookup: None,
+            prediction: None,
             error: None,
         }
     }
@@ -1579,6 +1617,7 @@ impl Response {
             batch_results: None,
             hash_results: None,
             local_lookup: None,
+            prediction: None,
             error: None,
         }
     }
@@ -1596,6 +1635,7 @@ impl Response {
             batch_results: Some(results),
             hash_results: None,
             local_lookup: None,
+            prediction: None,
             error: None,
         }
     }
@@ -1613,6 +1653,7 @@ impl Response {
             batch_results: None,
             hash_results: Some(results),
             local_lookup: None,
+            prediction: None,
             error: None,
         }
     }
@@ -1630,6 +1671,7 @@ impl Response {
             batch_results: None,
             hash_results: None,
             local_lookup: None,
+            prediction: None,
             error: None,
         }
     }
@@ -1647,6 +1689,7 @@ impl Response {
             batch_results: None,
             hash_results: None,
             local_lookup: None,
+            prediction: None,
             error: None,
         }
     }
@@ -1654,6 +1697,7 @@ impl Response {
     fn ok_local_lookup(reply: LocalLookupReply) -> Self {
         Self {
             local_lookup: Some(reply),
+            prediction: None,
             ..Self::ok()
         }
     }
@@ -1671,6 +1715,7 @@ impl Response {
             batch_results: None,
             hash_results: None,
             local_lookup: None,
+            prediction: None,
             error: Some(msg.into()),
         }
     }
@@ -3418,6 +3463,8 @@ impl Daemon {
             | Request::LocalLookup(_)
             | Request::Prefetch(_)
             | Request::PublishCc(_)
+            | Request::PredictionFetch(_)
+            | Request::PredictionPublish(_)
             | Request::BuildStarted(_) => {
                 // These require async — caller must use their async handlers
                 Response::err(
@@ -4257,6 +4304,60 @@ impl Daemon {
     pub async fn handle_remote_check(&self, req: &RemoteCheckRequest) -> Response {
         self.handle_remote_check_started_at(req, Instant::now())
             .await
+    }
+
+    /// The remote's input prediction row for a unit the wrapper has no row
+    /// for (kunobi-ninja/kache#1011). No remote, a portable identity the row
+    /// may not answer, a missing object and a failed or slow transfer all
+    /// answer "no row": the wrapper then runs the pre-pass as before.
+    async fn handle_prediction_fetch(&self, req: &PredictionFetchRequest) -> Response {
+        let mut response = Response::ok();
+        let Some(remote) = self.config.remote.as_ref() else {
+            return response;
+        };
+        if !prediction_identity_is_acceptable(&req.identity) {
+            return Response::err("invalid prediction identity");
+        }
+        let fetch = async {
+            let backend = self.get_remote_backend().await?;
+            crate::remote_layout::RemoteLayout::new(backend.as_ref(), remote)
+                .download_prediction(&req.identity)
+                .await
+        };
+        match tokio::time::timeout(PREDICTION_FETCH_BUDGET, fetch).await {
+            Ok(Ok(row)) => response.prediction = row,
+            Ok(Err(error)) => tracing::debug!("prediction row fetch failed: {error:#}"),
+            Err(_) => tracing::debug!("prediction row fetch timed out"),
+        }
+        response
+    }
+
+    /// Store a portable row on the remote in the background. Acknowledged at
+    /// once: the wrapper does not wait for the upload. Skipped with no remote
+    /// or a read-only one, the same gate artifact uploads use.
+    fn handle_prediction_publish(self: &Arc<Self>, req: PredictionPublishRequest) -> Response {
+        if self.config.remote.is_none() || self.config.remote_readonly {
+            return Response::ok();
+        }
+        if !prediction_identity_is_acceptable(&req.identity) {
+            return Response::err("invalid prediction identity");
+        }
+        let daemon = Arc::clone(self);
+        tokio::spawn(async move {
+            let Some(remote) = daemon.config.remote.as_ref() else {
+                return;
+            };
+            let upload = async {
+                let backend = daemon.get_remote_backend().await?;
+                crate::remote_layout::RemoteLayout::new(backend.as_ref(), remote)
+                    .upload_prediction(&req.identity, &req.row)
+                    .await
+            };
+            if let Err(error) = upload.await {
+                tracing::debug!("prediction row upload failed: {error:#}");
+            }
+        });
+        Response::ok()
     }
 
     async fn handle_remote_check_started_at(
@@ -8451,6 +8552,8 @@ async fn handle_connection_started_at(
             Ok(Request::CompileStarted(req)) => daemon.handle_compile_started(req),
             Ok(Request::CompileFinished(req)) => daemon.handle_compile_finished(&req),
             Ok(Request::PublishCc(req)) => daemon.handle_publish_cc(*req).await,
+            Ok(Request::PredictionFetch(req)) => daemon.handle_prediction_fetch(&req).await,
+            Ok(Request::PredictionPublish(req)) => daemon.handle_prediction_publish(req),
             Ok(Request::Shutdown) => {
                 lifecycle.start_drain();
                 // Wake the accept loop so it breaks now rather than on the next
@@ -8843,6 +8946,50 @@ pub fn send_local_lookup(
             tracing::debug!("local lookup: daemon unreachable ({e})");
             None
         }
+    }
+}
+
+/// Ask the daemon for the remote's input prediction row for `identity`
+/// (kunobi-ninja/kache#1011). `None` for no row, no remote, no daemon, or a
+/// daemon too old to know the request.
+pub fn send_prediction_fetch(
+    config: &Config,
+    identity: &str,
+) -> Option<crate::prediction_share::SharedPrediction> {
+    config.remote.as_ref()?;
+    let socket_path = config.socket_path();
+    if !crate::transport::is_reachable(&socket_path) {
+        return None;
+    }
+    let req = Request::PredictionFetch(PredictionFetchRequest {
+        identity: identity.to_string(),
+    });
+    // The daemon's own budget plus the socket round trip.
+    let timeout = PREDICTION_FETCH_BUDGET + Duration::from_millis(500);
+    let reply = send_request_with_timeout(&socket_path, &req, timeout).ok()?;
+    serde_json::from_str::<Response>(&reply)
+        .ok()
+        .filter(|response| response.ok)?
+        .prediction
+}
+
+/// Hand a portable row to the daemon to store on the remote. Fire and forget:
+/// a lost row costs another machine one pre-pass. Nothing is sent without a
+/// writable remote.
+pub fn send_prediction_publish(
+    config: &Config,
+    identity: &str,
+    row: crate::prediction_share::SharedPrediction,
+) {
+    if config.remote.is_none() || config.remote_readonly {
+        return;
+    }
+    let req = Request::PredictionPublish(PredictionPublishRequest {
+        identity: identity.to_string(),
+        row,
+    });
+    if let Err(error) = send_request_fire_and_forget(&config.socket_path(), &req) {
+        tracing::debug!("prediction row publish not sent: {error}");
     }
 }
 
@@ -14506,6 +14653,154 @@ mod tests {
 
     fn test_remote_backend() -> Arc<dyn crate::remote_backend::RemoteBackend> {
         Arc::new(crate::remote_backend::memory_backend())
+    }
+
+    const ROW_IDENTITY: &str = "shared-workspace-v1:0123";
+
+    fn test_prediction_row() -> crate::prediction_share::SharedPrediction {
+        crate::prediction_share::SharedPrediction::Portable(crate::cache_key::PortablePrediction {
+            schema: crate::cache_key::PORTABLE_PREDICTION_SCHEMA,
+            sources: vec![crate::cache_key::Portable::Literal("kt/src/lib.rs".into())],
+            env_deps: vec![],
+            tree: "tree".to_string(),
+        })
+    }
+
+    /// A daemon on `config` whose remote is the in-memory `backend`.
+    fn daemon_on(
+        config: Config,
+        backend: &Arc<dyn crate::remote_backend::RemoteBackend>,
+    ) -> Arc<Daemon> {
+        let daemon = Arc::new(Daemon::new(config));
+        daemon.set_remote_backend_for_test(Arc::clone(backend));
+        daemon
+    }
+
+    fn fetch_request(identity: &str) -> PredictionFetchRequest {
+        PredictionFetchRequest {
+            identity: identity.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_prediction_row_published_by_one_daemon_is_fetched_by_another() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.remote = Some(test_remote_config());
+        let backend = test_remote_backend();
+        let writer = daemon_on(config.clone(), &backend);
+        let reply = writer.handle_prediction_publish(PredictionPublishRequest {
+            identity: ROW_IDENTITY.to_string(),
+            row: test_prediction_row(),
+        });
+        assert!(reply.ok);
+
+        let reader = daemon_on(config, &backend);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let fetched = reader
+                .handle_prediction_fetch(&fetch_request(ROW_IDENTITY))
+                .await;
+            assert!(fetched.ok);
+            if let Some(row) = fetched.prediction {
+                assert_eq!(row, test_prediction_row());
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the row never reached the remote"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let other = reader
+            .handle_prediction_fetch(&fetch_request("shared-workspace-v1:0124"))
+            .await;
+        assert!(other.ok);
+        assert_eq!(other.prediction, None, "no row for another identity");
+    }
+
+    #[tokio::test]
+    async fn a_read_only_or_absent_remote_takes_no_prediction_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = test_remote_backend();
+        let mut read_only = test_config(dir.path());
+        read_only.remote = Some(test_remote_config());
+        read_only.remote_readonly = true;
+        let daemon = daemon_on(read_only.clone(), &backend);
+        assert!(
+            daemon
+                .handle_prediction_publish(PredictionPublishRequest {
+                    identity: ROW_IDENTITY.to_string(),
+                    row: test_prediction_row(),
+                })
+                .ok
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            backend.list("").await.unwrap().is_empty(),
+            "a read-only remote gets nothing"
+        );
+
+        let mut absent = test_config(dir.path());
+        absent.remote = None;
+        let daemon = Arc::new(Daemon::new(absent));
+        let reply = daemon
+            .handle_prediction_fetch(&fetch_request(ROW_IDENTITY))
+            .await;
+        assert!(reply.ok);
+        assert_eq!(reply.prediction, None);
+    }
+
+    #[tokio::test]
+    async fn a_malformed_prediction_row_or_identity_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.remote = Some(test_remote_config());
+        let backend = test_remote_backend();
+        let daemon = daemon_on(config, &backend);
+        let refused = daemon.handle_prediction_fetch(&fetch_request("0123")).await;
+        assert!(
+            !refused.ok,
+            "only identities a shared row answers are asked for"
+        );
+        assert!(
+            !daemon
+                .handle_prediction_publish(PredictionPublishRequest {
+                    identity: "0123".to_string(),
+                    row: test_prediction_row(),
+                })
+                .ok
+        );
+
+        let key = crate::config::join_remote_key(
+            &test_remote_config().prefix,
+            &format!(
+                "v3/predictions/{}",
+                crate::prediction_share::object_name(ROW_IDENTITY)
+            ),
+        );
+        backend
+            .put(&key, b"{ not json".to_vec(), Some("application/json"))
+            .await
+            .unwrap();
+        let reply = daemon
+            .handle_prediction_fetch(&fetch_request(ROW_IDENTITY))
+            .await;
+        assert!(reply.ok);
+        assert_eq!(reply.prediction, None);
+    }
+
+    #[test]
+    fn a_prediction_identity_is_portable_and_bounded() {
+        let at_cap = format!(
+            "shared-workspace-v1:{}",
+            "a".repeat(PREDICTION_IDENTITY_MAX_LEN - "shared-workspace-v1:".len())
+        );
+        assert!(prediction_identity_is_acceptable(&at_cap));
+        assert!(!prediction_identity_is_acceptable(&format!("{at_cap}a")));
+        assert!(prediction_identity_is_acceptable("shared-target-v2:0123"));
+        assert!(prediction_identity_is_acceptable("shared-out-dir-v1:0123"));
+        assert!(!prediction_identity_is_acceptable("0123"));
     }
 
     #[tokio::test]

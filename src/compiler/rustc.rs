@@ -403,7 +403,10 @@ fn macos_oso_prefix_flag_inner(
     if !enabled {
         return None;
     }
-    if !parsed.debuginfo_enabled() || !parsed.is_executable_output() || !parsed.emits_link() {
+    // Not gated on Rust debuginfo: native objects bundled into an rlib (C or
+    // assembly built with `-g`) put `N_OSO` entries in the link either way,
+    // and a link with none is unchanged by the flag (kunobi-ninja/kache#1026).
+    if !parsed.is_executable_output() || !parsed.emits_link() {
         return None;
     }
     if all_args.iter().any(|arg| arg.contains("-oso_prefix,")) {
@@ -1250,9 +1253,15 @@ mod tests {
                 "src/main.rs",
             ]))
             .unwrap();
-        assert!(
-            macos_oso_prefix_flag_inner(&release, &release.all_args, true).is_none(),
-            "no debuginfo means no oso_prefix"
+        assert_eq!(
+            macos_oso_prefix_flag_inner(&release, &release.all_args, true),
+            Some(expected(&profile)),
+            "a link without Rust debuginfo can still carry native DWARF from rlibs"
+        );
+        assert_eq!(
+            oso_prefix_root_for_key_inner(&release),
+            Some(profile.clone()),
+            "so its key treats archives under the profile as prefixed"
         );
 
         let library = RustcCompiler::new()

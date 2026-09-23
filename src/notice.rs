@@ -8,6 +8,10 @@
 //! an IDE, a detached build) a line the person asked for with
 //! `KACHE_PROGRESS` still goes to stderr, where they expect it, and anything
 //! else goes to the log.
+//!
+//! Only Unix has a terminal here. Windows' `CONOUT$` opens whenever the
+//! process has a console, including the hidden one a CI runner attaches, so
+//! it cannot tell a person watching from nobody; Windows keeps the fallback.
 
 use std::io::Write;
 
@@ -47,14 +51,18 @@ fn deliver(terminal: Option<impl Write>, stderr: Option<impl Write>, line: &str)
 }
 
 /// The controlling terminal, if this process has one.
+#[cfg(unix)]
 fn terminal() -> Option<std::fs::File> {
-    std::fs::OpenOptions::new().write(true).open(TERMINAL).ok()
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/tty")
+        .ok()
 }
 
-#[cfg(unix)]
-const TERMINAL: &str = "/dev/tty";
-#[cfg(windows)]
-const TERMINAL: &str = "CONOUT$";
+#[cfg(not(unix))]
+fn terminal() -> Option<std::fs::File> {
+    None
+}
 
 #[cfg(test)]
 mod tests {

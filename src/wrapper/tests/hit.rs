@@ -168,19 +168,21 @@ fn cc_and_nvcc_complete_remote_hits_once_and_fall_back_without_false_hits() {
     let _lock = crate::test_support::process_state_test_lock();
     for family in ["cc", "nvcc"] {
         for mode in ["remote", "prefetch", "failure"] {
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "wrapper::tests::hit::remote_completion_child",
-                    "--ignored",
-                    "--nocapture",
-                ])
-                .env("KACHE_TEST_HIT_FAMILY", family)
-                .env("KACHE_TEST_HIT_MODE", mode)
-                .env("KACHE_PROGRESS", "1")
-                .env_remove("CARGO_MANIFEST_DIR")
-                .output()
-                .unwrap();
+            let output = crate::test_support::without_terminal(&mut std::process::Command::new(
+                std::env::current_exe().unwrap(),
+            ))
+            .args([
+                "--exact",
+                "wrapper::tests::hit::remote_completion_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("KACHE_TEST_HIT_FAMILY", family)
+            .env("KACHE_TEST_HIT_MODE", mode)
+            .env("KACHE_PROGRESS", "1")
+            .env_remove("CARGO_MANIFEST_DIR")
+            .output()
+            .unwrap();
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
             assert!(

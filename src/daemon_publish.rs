@@ -684,8 +684,10 @@ mod tests {
         let now = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
         let grace = Duration::from_secs(3600);
         assert!(!handoff_is_abandoned(now, now, grace));
+        // One millisecond, not one nanosecond: Windows keeps SystemTime in
+        // 100 ns steps and would round a nanosecond away.
         assert!(!handoff_is_abandoned(
-            now - grace + Duration::from_nanos(1),
+            now - grace + Duration::from_millis(1),
             now,
             grace
         ));

@@ -272,8 +272,8 @@ pub(crate) fn warn_hardlink_fallback_once(
 
 /// Strategy for restoring a cached file to a build output path.
 ///
-/// `Hardlink` and `Copy` first try reflink (CoW: zero-copy *with* an
-/// independent inode), then use the strategy-specific fallback:
+/// Every strategy first tries reflink (CoW: zero-copy *with* an independent
+/// inode), then uses its own fallback:
 ///
 /// - `Hardlink`: on Unix, fall back to a hardlink (zero-copy via shared inode)
 ///   only while the blob has no existing consumer. Later restores use private
@@ -283,16 +283,34 @@ pub(crate) fn warn_hardlink_fallback_once(
 /// - `Copy`: fall back to a plain byte copy (independent file). For
 ///   executables, dylibs, and proc-macros that may be mutated post-build
 ///   (codesigning, stripping, etc.).
+/// - `ExecutableHardlink`: an executable or loadable library that nothing
+///   rewrites in place after the restore. On Unix it falls back like
+///   `Hardlink`, but only when the blob is read-only and already carries every
+///   execute bit, because the shared inode cannot be chmod'ed. Any other blob,
+///   and every Windows restore, is copied as `Copy` would. The caller decides
+///   which artifacts qualify.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum LinkStrategy {
     Hardlink,
     Copy,
+    ExecutableHardlink,
 }
 
 /// Link a cached file to the target output path.
 ///
-/// Both strategies try reflink first, then use their strategy-specific fallback.
+/// Every strategy tries reflink first, then uses its own fallback.
 pub fn link_to_target(store_path: &Path, target_path: &Path, strategy: LinkStrategy) -> Result<()> {
+    link_to_target_via(store_path, target_path, strategy, try_reflink)
+}
+
+/// [`link_to_target`] with the reflink attempt passed in, so tests can run the
+/// no-CoW fallbacks on a filesystem that clones.
+fn link_to_target_via(
+    store_path: &Path,
+    target_path: &Path,
+    strategy: LinkStrategy,
+    reflink: fn(&Path, &Path) -> Result<()>,
+) -> Result<()> {
     let do_link = || -> Result<()> {
         // Remove existing file at target (link/clone calls fail if dst exists).
         clear_target(target_path)?;
@@ -307,12 +325,14 @@ pub fn link_to_target(store_path: &Path, target_path: &Path, strategy: LinkStrat
         // available (APFS, btrfs, XFS-with-reflink).
         // Keep the failure reason: on Windows it separates "this volume can't
         // block-clone" from "this one file couldn't be cloned" (#508).
-        let reflink_err = match try_reflink(store_path, target_path) {
+        let reflink_err = match reflink(store_path, target_path) {
             Ok(()) => {
                 match strategy {
                     LinkStrategy::Hardlink => set_owner_write_permission(target_path)?,
                     // Executables and loadable libraries also need execute bits.
-                    LinkStrategy::Copy => set_executable_permissions(target_path)?,
+                    LinkStrategy::Copy | LinkStrategy::ExecutableHardlink => {
+                        set_executable_permissions(target_path)?
+                    }
                 }
                 tracing::debug!(
                     "reflinked {} -> {}",
@@ -359,7 +379,15 @@ pub fn link_to_target(store_path: &Path, target_path: &Path, strategy: LinkStrat
             }
             #[cfg(not(windows))]
             LinkStrategy::Hardlink => hardlink_or_copy(store_path, target_path, bytes),
-            LinkStrategy::Copy => {
+            // Share the inode only when the blob can already run as it is: a
+            // chmod on the link would change the blob too.
+            #[cfg(unix)]
+            LinkStrategy::ExecutableHardlink
+                if executable_blob_is_shareable(blob_mode(store_path)) =>
+            {
+                executable_hardlink_or_copy(store_path, target_path, bytes)
+            }
+            LinkStrategy::Copy | LinkStrategy::ExecutableHardlink => {
                 // Copying here is by design (executables/dylibs may be mutated after
                 // the build), so no storage-layout advice — but a large artifact that
                 // failed to block-clone on a CoW volume is still a real fault and is
@@ -407,13 +435,40 @@ pub fn link_to_target(store_path: &Path, target_path: &Path, strategy: LinkStrat
 /// unsafe for concurrent builds sharing a store as well as for consumers that
 /// delete or rewrite restored outputs (#429, #794). The default copies.
 fn hardlink_or_copy(store_path: &Path, target_path: &Path, bytes: u64) -> Result<()> {
-    hardlink_or_copy_with_prelink_hook(store_path, target_path, bytes, || {})
+    hardlink_or_copy_with_prelink_hook(store_path, target_path, bytes, false, || {})
+}
+
+/// [`hardlink_or_copy`] for an executable blob: the same one-consumer rule and
+/// post-link check, with a copy fallback that stays runnable (`0o755`).
+#[cfg(unix)]
+fn executable_hardlink_or_copy(store_path: &Path, target_path: &Path, bytes: u64) -> Result<()> {
+    hardlink_or_copy_with_prelink_hook(store_path, target_path, bytes, true, || {})
+}
+
+/// Whether an `ExecutableHardlink` restore may share the blob's inode. The
+/// blob must be read-only, so a writer that opens the restored file fails
+/// instead of reaching the store, and must carry every execute bit, because
+/// the link cannot be chmod'ed on its own. A remote import lands at `0o444`
+/// and would not run from a link.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn executable_blob_is_shareable(blob_mode: Option<u32>) -> bool {
+    blob_mode.is_some_and(|mode| mode & 0o111 == 0o111 && mode & 0o222 == 0)
+}
+
+/// Permission bits of a store blob, or `None` when it cannot be read.
+#[cfg(unix)]
+fn blob_mode(store_path: &Path) -> Option<u32> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::metadata(store_path)
+        .ok()
+        .map(|meta| meta.permissions().mode())
 }
 
 fn hardlink_or_copy_with_prelink_hook(
     store_path: &Path,
     target_path: &Path,
     bytes: u64,
+    executable: bool,
     prelink_hook: impl FnOnce(),
 ) -> Result<()> {
     // A restore is stamped after this function returns. On Unix that stamp is
@@ -423,6 +478,9 @@ fn hardlink_or_copy_with_prelink_hook(
     // source failure.
     #[cfg_attr(not(unix), allow(unused_variables))]
     let shared = SHARED_HARDLINK_RESTORES.load(Ordering::Relaxed);
+    // Every fallback below copies the same way, so an executable stays
+    // runnable whichever check sends it there.
+    let copy_instead = || copy_hardlink_fallback(store_path, target_path, bytes, executable);
     #[cfg(unix)]
     match fs::metadata(store_path) {
         Ok(meta) => {
@@ -435,7 +493,7 @@ fn hardlink_or_copy_with_prelink_hook(
                     target_path.display()
                 );
                 crate::opcounts::record_restore_copy_exclusive(bytes);
-                return copy_hardlink_fallback(store_path, target_path, bytes);
+                return copy_instead();
             }
         }
         Err(error) => {
@@ -446,7 +504,7 @@ fn hardlink_or_copy_with_prelink_hook(
                 target_path.display()
             );
             crate::opcounts::record_restore_copy_other(bytes);
-            return copy_hardlink_fallback(store_path, target_path, bytes);
+            return copy_instead();
         }
     }
 
@@ -473,7 +531,7 @@ fn hardlink_or_copy_with_prelink_hook(
         // EXDEV/EPERM also emit the once-per-session layout advisory.
         // What gets linked is unchanged — this still falls back to a copy.
         warn_hardlink_fallback_once(store_path, target_path, reason, &e);
-        return copy_hardlink_fallback(store_path, target_path, bytes);
+        return copy_instead();
     }
 
     // Two restorers may both observe nlink == 1 before either creates its
@@ -499,7 +557,7 @@ fn hardlink_or_copy_with_prelink_hook(
                     )
                 })?;
                 crate::opcounts::record_restore_copy_exclusive(bytes);
-                return copy_hardlink_fallback(store_path, target_path, bytes);
+                return copy_instead();
             }
             Err(source_error) => {
                 verify_orphaned_hardlink(target_path, fs::metadata(target_path), source_error)?
@@ -516,8 +574,13 @@ fn hardlink_or_copy_with_prelink_hook(
     Ok(())
 }
 
-fn copy_hardlink_fallback(store_path: &Path, target_path: &Path, bytes: u64) -> Result<()> {
-    copy_file(store_path, target_path, false)?;
+fn copy_hardlink_fallback(
+    store_path: &Path,
+    target_path: &Path,
+    bytes: u64,
+    executable: bool,
+) -> Result<()> {
+    copy_file(store_path, target_path, executable)?;
     crate::opcounts::record_copied(bytes);
     Ok(())
 }
@@ -1061,11 +1124,11 @@ fn clear_target(target_path: &Path) -> Result<()> {
 /// materialize" path, as opposed to linking the blob and patching it in
 /// place (which fails on a read-only or inode-shared restore).
 ///
-/// `strategy` mirrors [`link_to_target`]: `Copy` is the OS-loadable set
-/// (executables, dylibs) and yields `0o755` so cargo / the OS can run or
-/// load the result; `Hardlink` (dep-info `.d` and other immutable kinds)
-/// yields `0o644`. Keeping the same `Copy ⟺ executable` proxy in both
-/// restore primitives means the "executables stay executable" contract
+/// `strategy` mirrors [`link_to_target`]: `Copy` and `ExecutableHardlink` are
+/// the OS-loadable set (executables, dylibs) and yield `0o755` so cargo / the
+/// OS can run or load the result; `Hardlink` (dep-info `.d` and other
+/// immutable kinds) yields `0o644`. Keeping the same strategy ⟺ executable
+/// proxy in both restore primitives means the "executables stay executable" contract
 /// holds no matter which path materializes the file — including a future
 /// content transform applied to an executable artifact (issue #298).
 pub fn write_restored(target_path: &Path, content: &[u8], strategy: LinkStrategy) -> Result<()> {
@@ -1076,7 +1139,10 @@ pub fn write_restored(target_path: &Path, content: &[u8], strategy: LinkStrategy
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = if matches!(strategy, LinkStrategy::Copy) {
+            let mode = if matches!(
+                strategy,
+                LinkStrategy::Copy | LinkStrategy::ExecutableHardlink
+            ) {
                 0o755
             } else {
                 0o644
@@ -2209,7 +2275,7 @@ mod tests {
             let blob_a = &blob;
             let target_a = &tree_a;
             let first = scope.spawn(move || {
-                hardlink_or_copy_with_prelink_hook(blob_a, target_a, bytes, || {
+                hardlink_or_copy_with_prelink_hook(blob_a, target_a, bytes, false, || {
                     barrier_a.wait();
                 })
             });
@@ -2217,7 +2283,7 @@ mod tests {
             let blob_b = &blob;
             let target_b = &tree_b;
             let second = scope.spawn(move || {
-                hardlink_or_copy_with_prelink_hook(blob_b, target_b, bytes, || {
+                hardlink_or_copy_with_prelink_hook(blob_b, target_b, bytes, false, || {
                     barrier_b.wait();
                 })
             });
@@ -3952,5 +4018,257 @@ Unified_mm_ettings-WrongChannel0.o: Unified_mm_ettings-WrongChannel0.mm \\
             crate::opcounts::restore_copy_other_bytes() >= before,
             "unverifiable blob must record the other reason"
         );
+    }
+
+    // ── ExecutableHardlink: proc-macros and build scripts ──────────────────
+
+    /// Stands in for a filesystem without reflink, so the no-CoW fallbacks run
+    /// on APFS too.
+    #[cfg(unix)]
+    fn no_reflink(_: &Path, _: &Path) -> Result<()> {
+        anyhow::bail!("reflink disabled for this test")
+    }
+
+    #[cfg(unix)]
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[cfg(unix)]
+    fn ino_of(path: &Path) -> u64 {
+        use std::os::unix::fs::MetadataExt;
+        fs::metadata(path).unwrap().ino()
+    }
+
+    #[cfg(unix)]
+    fn running_as_root() -> bool {
+        unsafe { libc::geteuid() == 0 }
+    }
+
+    #[test]
+    fn executable_blob_is_shareable_only_when_runnable_and_read_only() {
+        // A local blob of a linked output: 0o755 made read-only.
+        assert!(executable_blob_is_shareable(Some(0o555)));
+        assert!(executable_blob_is_shareable(Some(0o100555)));
+        // Remote imports land at 0o444 and would not run from a link.
+        assert!(!executable_blob_is_shareable(Some(0o444)));
+        assert!(!executable_blob_is_shareable(Some(0o554)));
+        assert!(!executable_blob_is_shareable(Some(0o455)));
+        // A writable blob would let a writer in one tree reach the store.
+        assert!(!executable_blob_is_shareable(Some(0o755)));
+        assert!(!executable_blob_is_shareable(Some(0o557)));
+        assert!(!executable_blob_is_shareable(None));
+    }
+
+    /// Without CoW, a runnable read-only blob is shared like an rlib. The link
+    /// keeps the blob's mode: making it writable or chmod'ing it would change
+    /// the store blob as well.
+    #[cfg(unix)]
+    #[test]
+    fn executable_hardlink_without_reflink_shares_a_runnable_blob_read_only() {
+        let _guard = SHARED_TEST_LOCK.lock().unwrap();
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let blob = dir.path().join("blob");
+        let target = dir.path().join("deps/libserde_derive-1.so");
+        fs::write(&blob, b"proc-macro dylib").unwrap();
+        fs::set_permissions(&blob, fs::Permissions::from_mode(0o555)).unwrap();
+
+        link_to_target_via(&blob, &target, LinkStrategy::ExecutableHardlink, no_reflink).unwrap();
+
+        assert_eq!(ino_of(&target), ino_of(&blob), "expected a shared inode");
+        assert_eq!(mode_of(&target), 0o555);
+        assert_eq!(mode_of(&blob), 0o555, "the restore must not chmod the blob");
+        assert_eq!(fs::read(&target).unwrap(), b"proc-macro dylib");
+        if !running_as_root() {
+            let error = fs::OpenOptions::new()
+                .write(true)
+                .open(&target)
+                .unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        }
+    }
+
+    /// A blob that cannot run as it is, or that is writable, is copied to a
+    /// private runnable file, exactly as the `Copy` strategy would.
+    #[cfg(unix)]
+    #[test]
+    fn executable_hardlink_without_reflink_copies_a_blob_it_cannot_share() {
+        let _guard = SHARED_TEST_LOCK.lock().unwrap();
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        for blob_mode in [0o444, 0o755] {
+            let blob = dir.path().join(format!("blob-{blob_mode:o}"));
+            let target = dir.path().join(format!("build_script_build-{blob_mode:o}"));
+            fs::write(&blob, b"build script").unwrap();
+            fs::set_permissions(&blob, fs::Permissions::from_mode(blob_mode)).unwrap();
+
+            link_to_target_via(&blob, &target, LinkStrategy::ExecutableHardlink, no_reflink)
+                .unwrap();
+
+            assert_ne!(ino_of(&target), ino_of(&blob), "{blob_mode:o}");
+            assert_eq!(mode_of(&target), 0o755, "{blob_mode:o}");
+            assert_eq!(mode_of(&blob), blob_mode);
+            fs::write(&target, b"rebuilt").unwrap();
+            assert_eq!(fs::read(&blob).unwrap(), b"build script");
+        }
+    }
+
+    /// With reflink the restore is a private clone, runnable and writable
+    /// even when the blob itself carries no execute bit.
+    #[cfg(unix)]
+    #[test]
+    fn executable_hardlink_reflink_restore_is_a_private_runnable_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let blob = dir.path().join("blob");
+        let probe = dir.path().join("probe");
+        let target = dir.path().join("libfoo_macros-1.so");
+        fs::write(&blob, b"proc-macro dylib").unwrap();
+        fs::set_permissions(&blob, fs::Permissions::from_mode(0o444)).unwrap();
+        if let Err(error) = try_reflink(&blob, &probe) {
+            eprintln!("reflink unavailable on test filesystem: {error}");
+            return;
+        }
+
+        link_to_target(&blob, &target, LinkStrategy::ExecutableHardlink).unwrap();
+
+        assert_ne!(ino_of(&target), ino_of(&blob));
+        assert_eq!(mode_of(&target), 0o755);
+        fs::write(&target, b"rebuilt").unwrap();
+        assert_eq!(fs::read(&blob).unwrap(), b"proc-macro dylib");
+        assert_eq!(mode_of(&blob), 0o444);
+    }
+
+    /// kunobi-ninja/kache#677 and #794 for shared executables. Tree A holds
+    /// the one link to the blob. Restoring the same blob into tree B must not
+    /// re-date or rewrite what cargo sees in tree A, tree B must still get a
+    /// runnable file, and a compile in either tree must not write through
+    /// into the store or the other tree.
+    #[cfg(unix)]
+    #[test]
+    fn executable_hardlink_restore_into_tree_b_leaves_tree_a_untouched() {
+        let _guard = SHARED_TEST_LOCK.lock().unwrap();
+        use std::fs::File;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let blob = dir.path().join("blob");
+        let tree_a = dir.path().join("a/build/pkg-1/build_script_build-1");
+        let tree_b = dir.path().join("b/build/pkg-1/build_script_build-1");
+        fs::write(&blob, b"build script").unwrap();
+        fs::set_permissions(&blob, fs::Permissions::from_mode(0o555)).unwrap();
+
+        link_to_target_via(&blob, &tree_a, LinkStrategy::ExecutableHardlink, no_reflink).unwrap();
+        touch_mtime_write_clock(&tree_a).unwrap();
+        assert_eq!(
+            ino_of(&tree_a),
+            ino_of(&blob),
+            "fixture must engage the hardlink fallback"
+        );
+        let observed = filetime::FileTime::from_unix_time(1_000_000_000, 0);
+        filetime::set_file_mtime(&tree_a, observed).unwrap();
+        let reader = File::open(&tree_a).unwrap();
+
+        link_to_target_via(&blob, &tree_b, LinkStrategy::ExecutableHardlink, no_reflink).unwrap();
+        touch_mtime_write_clock(&tree_b).unwrap();
+
+        let seen = filetime::FileTime::from_last_modification_time(&reader.metadata().unwrap());
+        assert_eq!(seen, observed, "restoring tree B re-dated tree A");
+        assert_eq!(fs::read(&tree_a).unwrap(), b"build script");
+        assert_ne!(ino_of(&tree_b), ino_of(&tree_a), "trees must not share");
+        assert_eq!(mode_of(&tree_b), 0o755, "tree B must still be runnable");
+
+        // A compile in tree B rewrites its private copy in place.
+        fs::write(&tree_b, b"rebuilt in b").unwrap();
+        assert_eq!(fs::read(&blob).unwrap(), b"build script");
+        assert_eq!(fs::read(&tree_a).unwrap(), b"build script");
+
+        // Tree A's shared inode refuses an in-place write. A compile there
+        // replaces the read-only output (the wrapper's pre-clean, or the
+        // linker's own unlink) and never reaches the blob.
+        if !running_as_root() {
+            assert!(fs::OpenOptions::new().write(true).open(&tree_a).is_err());
+        }
+        fs::remove_file(&tree_a).unwrap();
+        fs::write(&tree_a, b"rebuilt in a").unwrap();
+        assert_eq!(fs::read(&blob).unwrap(), b"build script");
+        assert_eq!(fs::read(&tree_b).unwrap(), b"rebuilt in b");
+        assert_eq!(mode_of(&blob), 0o555);
+    }
+
+    /// A shareable blob whose `link(2)` fails, for example with the store on
+    /// another filesystem, is copied to a private file that still runs.
+    #[cfg(unix)]
+    #[test]
+    fn executable_hardlink_link_failure_copies_a_runnable_file() {
+        let _guard = SHARED_TEST_LOCK.lock().unwrap();
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        for kind in [
+            std::io::ErrorKind::CrossesDevices,
+            std::io::ErrorKind::PermissionDenied,
+        ] {
+            let blob = dir.path().join(format!("blob-{kind:?}"));
+            let target = dir.path().join(format!("build_script_build-{kind:?}"));
+            fs::write(&blob, b"build script").unwrap();
+            fs::set_permissions(&blob, fs::Permissions::from_mode(0o555)).unwrap();
+            let _inject = InjectRestoreHardlinkError::enable(kind);
+
+            link_to_target_via(&blob, &target, LinkStrategy::ExecutableHardlink, no_reflink)
+                .unwrap();
+
+            assert_ne!(ino_of(&target), ino_of(&blob), "{kind:?}");
+            assert_eq!(mode_of(&target), 0o755, "{kind:?}");
+            assert_eq!(mode_of(&blob), 0o555, "{kind:?}");
+        }
+    }
+
+    /// A restorer that another link beats between its precheck and its own
+    /// link drops the link and gets a private file that still runs.
+    #[cfg(unix)]
+    #[test]
+    fn executable_hardlink_that_loses_the_link_race_copies_a_runnable_file() {
+        let _guard = SHARED_TEST_LOCK.lock().unwrap();
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let blob = dir.path().join("blob");
+        let other = dir.path().join("other/build_script_build-1");
+        let target = dir.path().join("build_script_build-1");
+        fs::create_dir_all(other.parent().unwrap()).unwrap();
+        fs::write(&blob, b"build script").unwrap();
+        fs::set_permissions(&blob, fs::Permissions::from_mode(0o555)).unwrap();
+        let bytes = fs::metadata(&blob).unwrap().len();
+
+        hardlink_or_copy_with_prelink_hook(&blob, &target, bytes, true, || {
+            fs::hard_link(&blob, &other).unwrap();
+        })
+        .unwrap();
+
+        assert_ne!(ino_of(&target), ino_of(&blob));
+        assert_eq!(mode_of(&target), 0o755);
+        assert_eq!(ino_of(&other), ino_of(&blob), "the winner keeps its link");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_restored_executable_hardlink_strategy_sets_executable() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("deps/libfoo_macros-1.so");
+
+        write_restored(
+            &target,
+            b"proc-macro dylib",
+            LinkStrategy::ExecutableHardlink,
+        )
+        .unwrap();
+
+        assert_eq!(mode_of(&target), 0o755);
     }
 }

@@ -92,6 +92,15 @@ pub trait Platform: Send + Sync {
     /// binary (see [`MacOsPlatform`]), so the producing build and a
     /// restoring build converge on the same on-disk shape.
     fn package_debug_bundle(&self, binary: &Path, staging_dir: &Path) -> Result<Option<PathBuf>>;
+
+    /// Whether a restored executable or dynamic library may share its inode
+    /// with the store blob when nothing else rewrites it in place. True only
+    /// where [`Self::ensure_binary_loadable`] never writes to the file and a
+    /// link can keep the blob's read-only mode. The default keeps every
+    /// restored loadable a private copy.
+    fn may_share_restored_loadables(&self) -> bool {
+        false
+    }
 }
 
 /// Detect the current host platform.
@@ -390,6 +399,13 @@ impl Platform for LinuxPlatform {
         // (kunobi-ninja/kache#319) — nothing to package.
         Ok(None)
     }
+
+    // Nothing here signs a restored file. macOS keeps the default because
+    // codesign may rewrite one in place; Windows keeps it because an NTFS
+    // hardlink shares the blob's read-only attribute (#429).
+    fn may_share_restored_loadables(&self) -> bool {
+        true
+    }
 }
 
 /// Windows implementation. Authenticode signing is not enforced for
@@ -531,6 +547,15 @@ pub(crate) mod tests {
         platform.ensure_binary_loadable(Path::new("/x")).unwrap();
         platform.ensure_binary_loadable(Path::new("/y")).unwrap();
         assert_eq!(platform.ensure_calls(), 2);
+    }
+
+    #[test]
+    fn only_linux_lets_restored_loadables_share_the_blob_inode() {
+        assert!(LinuxPlatform.may_share_restored_loadables());
+        // codesign may rewrite a restored file in place.
+        assert!(!MacOsPlatform.may_share_restored_loadables());
+        // An NTFS link shares the blob's read-only attribute (#429).
+        assert!(!WindowsPlatform.may_share_restored_loadables());
     }
 
     // ── package_debug_bundle (kunobi-ninja/kache#319) ────────────────

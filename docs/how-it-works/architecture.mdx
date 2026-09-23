@@ -41,7 +41,7 @@ The store contains:
 - `store/blobs/<prefix>/<hash>`, the content-addressed output files
 - entry metadata under `store/<cache-key>/`
 
-Identical output bytes share one blob. Restores first try copy-on-write cloning. Unix can use a restricted hardlink fallback for immutable artifacts; other cases copy. Executables and loadable libraries are never hardlinked because later tools may mutate them.
+Identical output bytes share one blob. Restores first try copy-on-write cloning. Unix can use a restricted hardlink fallback for immutable artifacts, and Linux also for proc-macro libraries and build-script binaries; other cases copy. Other executables and loadable libraries are never hardlinked because later tools may mutate them.
 
 See [Deduplication](/docs/deduplication) for platform details.
 

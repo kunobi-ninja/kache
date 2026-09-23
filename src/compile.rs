@@ -1077,6 +1077,38 @@ mod tests {
         );
     }
 
+    /// A proc-macro dylib or build-script binary restored as a link to a
+    /// `0o555` blob is removed before the compiler writes a new one, so a
+    /// rebuild in that tree never writes through into the store. This pins
+    /// existing pre-clean behavior that shared executable restores rely on.
+    #[cfg(unix)]
+    #[test]
+    fn pre_clean_removes_shared_executable_links_without_touching_the_blob() {
+        let dir = tempfile::tempdir().unwrap();
+        for (crate_name, output) in [
+            ("foo_macros", "libfoo_macros-1.so"),
+            ("build_script_build", "build_script_build-1"),
+        ] {
+            let blob = dir.path().join(format!("blob-{crate_name}"));
+            let out_dir = dir.path().join(crate_name);
+            let output = out_dir.join(output);
+            fs::create_dir_all(&out_dir).unwrap();
+            fs::write(&blob, b"cached loadable").unwrap();
+            fs::set_permissions(&blob, fs::Permissions::from_mode(0o555)).unwrap();
+            fs::hard_link(&blob, &output).unwrap();
+
+            pre_clean_outputs(None, Some(&out_dir), Some(crate_name), Some("-1"), &[]);
+            assert!(!output.exists(), "{crate_name}: the shared link must go");
+            fs::write(&output, b"rebuilt").unwrap();
+
+            assert_eq!(fs::read(&blob).unwrap(), b"cached loadable");
+            assert_eq!(
+                fs::metadata(&blob).unwrap().permissions().mode() & 0o777,
+                0o555
+            );
+        }
+    }
+
     #[test]
     fn rustc_response_file_round_trips_verbatim_arguments() {
         let args = ["first", "", "  spaced  ", "@nested.args", ""];

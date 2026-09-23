@@ -1622,15 +1622,22 @@ fn predicted_key_inputs(
     if !file_hasher.uses_input_predictions() {
         return Err(Rejection::Disabled);
     }
+    let vars: Vec<_> = std::env::vars_os().collect();
+    let workspace = workspace_roots(args, &vars);
     // A unit with a proc-macro dependency is only predictable under the tree
-    // guard: the record must carry the crate tree digest and it must still
-    // match. Computed once here and stashed, because the same digest is what
-    // a record made from this invocation has to carry.
+    // guard: the record must carry the tree digest and it must still match.
+    // The tree is the package for a registry unit and the whole workspace for
+    // a workspace one. Computed once here and stashed, because the same digest
+    // is what a record made from this invocation has to carry.
     let tree = if prediction_applies(&args.externs) {
         None
     } else {
         let _trace = crate::phase_trace::phase("crate_tree");
-        let digest = crate_tree_digest(file_hasher).ok_or(Rejection::NotEligible)?;
+        let digest = match &workspace {
+            Some(workspace) => workspace_tree_digest(workspace, file_hasher),
+            None => crate_tree_digest(file_hasher),
+        }
+        .ok_or(Rejection::NotEligible)?;
         let _ = LAST_KEY_TREE_DIGEST.try_with(|stash| *stash.borrow_mut() = Some(digest.clone()));
         Some(digest)
     };
@@ -1639,7 +1646,10 @@ fn predicted_key_inputs(
         .input_prediction(&identity)
         .or_else(|| file_hasher.input_prediction(&rustc_shared_prediction_identity(args)?))
     else {
-        return relocated_key_inputs(args, file_hasher, tree);
+        return match &workspace {
+            Some(workspace) => workspace_key_inputs(args, file_hasher, workspace, vars, tree),
+            None => relocated_key_inputs(args, file_hasher, tree),
+        };
     };
     if let Some(tree) = &tree {
         match &record.tree {
@@ -1689,11 +1699,200 @@ fn relocated_key_inputs(
     validate_portable_prediction(
         &record,
         &guard,
-        &out_dir,
+        &Places {
+            out_dir: Some(&out_dir),
+            workspace: None,
+        },
         |path| std::fs::metadata(path).ok(),
         |path| path.exists(),
         |var| std::env::var(var).ok(),
     )
+}
+
+/// The fourth lookup, for a workspace or path unit (kunobi-ninja/kache#1005):
+/// a record made in another checkout of the same workspace, with its sources
+/// written relative to the workspace root and `OUT_DIR`.
+///
+/// The guard is a digest of the whole workspace (less the target directory
+/// and `.git`) and of `OUT_DIR`, taken before rustc runs. A record is used
+/// only when both are byte for byte what the recorder had, so a macro that
+/// scans the workspace, even one reached through an rlib rather than a
+/// direct proc-macro dependency, finds the same files here.
+fn workspace_key_inputs(
+    args: &RustcArgs,
+    file_hasher: &FileHasher<'_>,
+    workspace: &WorkspaceRoots,
+    vars: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+    tree: Option<String>,
+) -> std::result::Result<DepInfo, Rejection> {
+    let identity =
+        workspace_prediction_identity(args, vars, workspace).ok_or(Rejection::NoRecord)?;
+    let guard = match tree {
+        Some(tree) => tree,
+        None => {
+            let _trace = crate::phase_trace::phase("workspace_tree");
+            workspace_tree_digest(workspace, file_hasher).ok_or(Rejection::NoRecord)?
+        }
+    };
+    let _ = LAST_KEY_TREE_DIGEST.try_with(|stash| *stash.borrow_mut() = Some(guard.clone()));
+    let record = file_hasher
+        .portable_prediction(&identity)
+        .ok_or(Rejection::NoRecord)?;
+    validate_portable_prediction(
+        &record,
+        &guard,
+        &workspace.places().ok_or(Rejection::NoRecord)?,
+        |path| std::fs::metadata(path).ok(),
+        |path| path.exists(),
+        |var| std::env::var(var).ok(),
+    )
+}
+
+/// The directories a workspace unit's record is relocated against.
+#[derive(Debug, Clone)]
+pub(crate) struct WorkspaceRoots {
+    pub(crate) root: PathBuf,
+    /// The working directory rustc resolves relative paths against, as the
+    /// bytes after `root` (`""` at the root itself).
+    pub(crate) cwd: String,
+    pub(crate) canonical_root: PathBuf,
+    pub(crate) target: PathBuf,
+    pub(crate) canonical_target: PathBuf,
+    pub(crate) out_dir: Option<PathBuf>,
+}
+
+impl WorkspaceRoots {
+    /// Where this invocation puts a record's relative entries.
+    fn places(&self) -> Option<Places<'_>> {
+        Some(Places {
+            out_dir: match &self.out_dir {
+                Some(out_dir) => Some(out_dir.to_str()?),
+                None => None,
+            },
+            workspace: Some(self.root.to_str()?),
+        })
+    }
+}
+
+/// This invocation's workspace, when its package is a workspace or path
+/// package inside the workspace Cargo builds and the target directory is
+/// that workspace's own.
+///
+/// `None` for a registry package (see [`relocated_key_inputs`]), a package
+/// outside the workspace, a target directory elsewhere, and any root that
+/// cannot be canonicalized: those units keep checkout-local records.
+fn workspace_roots(
+    args: &RustcArgs,
+    vars: &[(std::ffi::OsString, std::ffi::OsString)],
+) -> Option<WorkspaceRoots> {
+    let manifest_dir = Path::new(env_var_in(vars, "CARGO_MANIFEST_DIR")?);
+    if is_registry_package(manifest_dir) {
+        return None;
+    }
+    let current_dir = std::env::current_dir().ok()?;
+    let root = args.verified_workspace_root(&current_dir)?;
+    let target = args.target_dir()?;
+    if !root.is_absolute()
+        || suffix_within(manifest_dir.as_os_str(), &root, 0).is_none()
+        || suffix_within(target.as_os_str(), &root, 0).is_none_or(|suffix| suffix.is_empty())
+    {
+        return None;
+    }
+    let canonical_root = std::fs::canonicalize(&root).ok()?;
+    // The working directory may be spelled through either root: on macOS
+    // `current_dir` reports `/private/var/...` for a root Cargo spells
+    // `/var/...`.
+    let cwd = suffix_within(current_dir.as_os_str(), &root, 0)
+        .or_else(|| suffix_within(current_dir.as_os_str(), &canonical_root, 0))?;
+    Some(WorkspaceRoots {
+        cwd,
+        canonical_root,
+        canonical_target: std::fs::canonicalize(&target).ok()?,
+        out_dir: env_var_in(vars, "OUT_DIR").map(PathBuf::from),
+        root,
+        target,
+    })
+}
+
+/// Rows of workspace and path units, filed under an identity with the
+/// checkout taken out ([`workspace_prediction_identity`]).
+const WORKSPACE_PREDICTION_PREFIX: &str = "shared-workspace-v1:";
+
+/// The identity of a workspace unit's relocated record: the ordinary
+/// identity with the working directory, the crate root and
+/// `CARGO_MANIFEST_DIR` written relative to the workspace root, and target
+/// paths relative to the target directory as the shared identity writes
+/// them. Everything else stays as spelled, so an argument or variable that
+/// still names the checkout only keeps two checkouts apart.
+fn workspace_prediction_identity(
+    args: &RustcArgs,
+    vars: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+    workspace: &WorkspaceRoots,
+) -> Option<String> {
+    let source = args.source_file.as_ref()?;
+    let root = &workspace.root;
+    let within = |path: &Path| suffix_within(path.as_os_str(), root, 0);
+    let source_spelling = if source.is_absolute() {
+        format!("kache-workspace:{}", within(source)?)
+    } else {
+        format!("kache-cwd:{}", source.to_str()?)
+    };
+    let current_dir = format!("kache-workspace:{}", workspace.cwd);
+    let mut closure_args = shared_prediction_args(
+        &closure_shaping_args(source, &args.all_args),
+        &workspace.target,
+    );
+    // The crate root leads the closure arguments; spell it as above.
+    *closure_args.first_mut()? =
+        serde_json::to_string(&("source", "", "", source_spelling.as_str())).ok()?;
+    let vars = shared_prediction_vars(vars.into_iter(), &workspace.target)
+        .into_iter()
+        .map(|(name, value)| {
+            if name != "CARGO_MANIFEST_DIR" {
+                return Some((name, value));
+            }
+            let relative = within(Path::new(&value))?;
+            Some((name, format!("kache-workspace:{relative}").into()))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let rustc_version = get_rustc_version(&args.rustc).ok()?;
+    let identity = prediction_identity_in_env(
+        &PredictionIdentityParts {
+            rustc_version: &rustc_version,
+            inner_rustc: args.inner_rustc.as_deref(),
+            current_dir: Some(Path::new(&current_dir)),
+            source_file: Path::new(&source_spelling),
+            closure_args: &closure_args,
+            skip_path_remap: args.skip_path_remap(),
+        },
+        vars,
+    );
+    Some(format!("{WORKSPACE_PREDICTION_PREFIX}{identity}"))
+}
+
+/// A content digest of the workspace, less its target directory and `.git`,
+/// and of `OUT_DIR`: the guard for a workspace unit's records.
+fn workspace_tree_digest(
+    workspace: &WorkspaceRoots,
+    file_hasher: &FileHasher<'_>,
+) -> Option<String> {
+    workspace_tree_digest_within(workspace, file_hasher, CRATE_TREE_MAX_ENTRIES)
+}
+
+/// [`workspace_tree_digest`] with its entry budget supplied.
+fn workspace_tree_digest_within(
+    workspace: &WorkspaceRoots,
+    file_hasher: &FileHasher<'_>,
+    max_entries: usize,
+) -> Option<String> {
+    let target = suffix_within(workspace.target.as_os_str(), &workspace.root, 0)?;
+    let target = target.trim_start_matches(['/', '\\']);
+    let skipped = [target, ".git"];
+    let mut roots = vec![(workspace.root.clone(), &b"workspace"[..], &skipped[..])];
+    if let Some(out_dir) = &workspace.out_dir {
+        roots.push((out_dir.clone(), &b"out_dir"[..], &[][..]));
+    }
+    tree_digest(roots, file_hasher, max_entries)
 }
 
 /// Join only when an eligible unit needs discovery. A peer holds the lock
@@ -4683,11 +4882,20 @@ pub(crate) struct PortablePrediction {
 }
 
 /// One recorded path or env value: as spelled, or as the bytes after
-/// `OUT_DIR` ([`out_dir_suffix`]).
+/// `OUT_DIR` ([`out_dir_suffix`]) or after the workspace root.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum Portable {
     Literal(String),
     OutDir(String),
+    Workspace(String),
+}
+
+/// Where a portable record's relative entries land for this invocation. A
+/// record with an entry whose place this invocation lacks is not used.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Places<'a> {
+    pub(crate) out_dir: Option<&'a str>,
+    pub(crate) workspace: Option<&'a str>,
 }
 
 /// The directories a portable record is written against.
@@ -4766,27 +4974,29 @@ fn portable_env_value(value: &str, roots: &PortableRoots) -> Option<Portable> {
 
 impl PortablePrediction {
     /// The record this invocation would have made: each relocated entry gets
-    /// `out_dir`'s bytes in front of its suffix. The result is then checked
-    /// like any other record, raw env values included.
-    pub(crate) fn resolve(&self, out_dir: &str) -> InputPrediction {
+    /// its root's bytes in front of its suffix. The result is then checked
+    /// like any other record, raw env values included. `None` when an entry
+    /// is relative to a root `places` does not have.
+    pub(crate) fn resolve(&self, places: &Places<'_>) -> Option<InputPrediction> {
         let place = |portable: &Portable| match portable {
-            Portable::Literal(value) => value.clone(),
-            Portable::OutDir(suffix) => format!("{out_dir}{suffix}"),
+            Portable::Literal(value) => Some(value.clone()),
+            Portable::OutDir(suffix) => Some(format!("{}{suffix}", places.out_dir?)),
+            Portable::Workspace(suffix) => Some(format!("{}{suffix}", places.workspace?)),
         };
-        InputPrediction {
+        Some(InputPrediction {
             schema: PREDICTION_SCHEMA,
             sources: self
                 .sources
                 .iter()
-                .map(|source| PathBuf::from(place(source)))
-                .collect(),
+                .map(|source| place(source).map(PathBuf::from))
+                .collect::<Option<_>>()?,
             env_deps: self
                 .env_deps
                 .iter()
-                .map(|(name, value)| (name.clone(), place(value)))
-                .collect(),
+                .map(|(name, value)| Some((name.clone(), place(value)?)))
+                .collect::<Option<_>>()?,
             tree: Some(self.tree.clone()),
-        }
+        })
     }
 }
 
@@ -4795,7 +5005,7 @@ impl PortablePrediction {
 fn validate_portable_prediction(
     record: &PortablePrediction,
     guard: &str,
-    out_dir: &str,
+    places: &Places<'_>,
     stat: impl Fn(&Path) -> Option<std::fs::Metadata>,
     exists: impl Fn(&Path) -> bool,
     env_value: impl Fn(&str) -> Option<String>,
@@ -4803,7 +5013,8 @@ fn validate_portable_prediction(
     if record.tree != guard {
         return Err(Rejection::TreeChanged);
     }
-    validate_prediction(&record.resolve(out_dir), stat, exists, env_value)
+    let resolved = record.resolve(places).ok_or(Rejection::NoRecord)?;
+    validate_prediction(&resolved, stat, exists, env_value)
 }
 
 /// Does `content` spell any of `roots`, as-is or with each `\` doubled the
@@ -4877,6 +5088,130 @@ fn relocatable_record_in(
     let record = portable_prediction(dep_info, &roots, tree)?;
     out_dir_spells_no_root(&roots.out_dir, &[&roots.target, &roots.canonical_target])
         .then_some((identity, record))
+}
+
+/// Is this invocation a workspace or path unit whose records the workspace
+/// guard covers ([`workspace_roots`])?
+pub(crate) fn is_workspace_unit(args: &RustcArgs) -> bool {
+    workspace_roots(args, &std::env::vars_os().collect::<Vec<_>>()).is_some()
+}
+
+/// The guard this checkout's own row carries. A workspace unit whose closure
+/// reaches past the workspace (`relocatable` false) keeps none: the guard
+/// covers the workspace only, so a macro that scans a directory outside it
+/// could find a new file there with the guard unchanged. Without a guard, a
+/// row of a unit with a proc-macro dependency is never used, and that unit
+/// keeps the pre-pass.
+pub(crate) fn same_tree_guard(
+    tree: Option<String>,
+    workspace_unit: bool,
+    relocatable: bool,
+) -> Option<String> {
+    if workspace_unit && !relocatable {
+        None
+    } else {
+        tree
+    }
+}
+
+/// A workspace unit's record for another checkout and the identity to file it
+/// under (kunobi-ninja/kache#1005), or `None` when the unit or its closure is
+/// not relocatable. `tree` is the workspace guard taken before rustc ran.
+pub(crate) fn workspace_record(
+    args: &RustcArgs,
+    dep_info: &DepInfo,
+    tree: Option<&str>,
+) -> Option<(String, PortablePrediction)> {
+    let vars: Vec<_> = std::env::vars_os().collect();
+    let workspace = workspace_roots(args, &vars)?;
+    let record = workspace_portable_prediction(dep_info, &workspace, tree)?;
+    let identity = workspace_prediction_identity(args, vars, &workspace)?;
+    let named = [
+        workspace.root.as_path(),
+        &workspace.canonical_root,
+        &workspace.target,
+        &workspace.canonical_target,
+    ];
+    if let Some(out_dir) = &workspace.out_dir
+        && !out_dir_spells_no_root(out_dir, &named)
+    {
+        return None;
+    }
+    Some((identity, record))
+}
+
+/// The closure with every source written relative to `OUT_DIR` or the
+/// workspace root, or `None` when any part could name a different file in
+/// another checkout: a file outside the workspace, another unit's output
+/// under the target directory, a `..` that leaves the workspace.
+fn workspace_portable_prediction(
+    dep_info: &DepInfo,
+    workspace: &WorkspaceRoots,
+    tree: Option<&str>,
+) -> Option<PortablePrediction> {
+    let tree = tree?;
+    let sources = dep_info
+        .source_files
+        .iter()
+        .map(|source| {
+            if source.is_relative() {
+                return workspace_relative_source(source, workspace);
+            }
+            let relocated = workspace_portable_value(source.as_os_str(), workspace)?;
+            (!matches!(relocated, Portable::Literal(_))).then_some(relocated)
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let env_deps = dep_info
+        .env_deps
+        .iter()
+        .map(|(name, value)| {
+            let value = workspace_portable_value(std::ffi::OsStr::new(value), workspace)?;
+            Some((name.clone(), value))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(PortablePrediction {
+        schema: PORTABLE_PREDICTION_SCHEMA,
+        sources,
+        env_deps,
+        tree: tree.to_string(),
+    })
+}
+
+/// A source rustc reported relative to its working directory, as Cargo does
+/// for a workspace member: kept as spelled, because the identity pins that
+/// directory relative to the workspace root, when a lexical walk from it
+/// never leaves the workspace.
+fn workspace_relative_source(source: &Path, workspace: &WorkspaceRoots) -> Option<Portable> {
+    let spelled = source.to_str()?;
+    let from_root = format!("{}/{spelled}", workspace.cwd);
+    let components = from_root.strip_prefix(['/', '\\'])?;
+    (stays_below(components.split(['/', '\\']), 0) && stays_below(components.split('/'), 0))
+        .then(|| Portable::Literal(spelled.to_string()))
+}
+
+/// One path or env value of a workspace unit: under `OUT_DIR`, under the
+/// workspace (either spelling of its root), refused when it names the target
+/// directory any other way, and otherwise kept as spelled.
+fn workspace_portable_value(
+    value: &std::ffi::OsStr,
+    workspace: &WorkspaceRoots,
+) -> Option<Portable> {
+    if let Some(out_dir) = &workspace.out_dir
+        && let Some(suffix) = out_dir_suffix(value, out_dir)
+    {
+        return Some(Portable::OutDir(suffix));
+    }
+    let bytes = value.as_encoded_bytes();
+    let spells = |root: &Path| bytes.starts_with(root.as_os_str().as_encoded_bytes());
+    if spells(&workspace.target) || spells(&workspace.canonical_target) {
+        return None;
+    }
+    if let Some(suffix) = suffix_within(value, &workspace.root, 0)
+        .or_else(|| suffix_within(value, &workspace.canonical_root, 0))
+    {
+        return Some(Portable::Workspace(suffix));
+    }
+    Some(Portable::Literal(value.to_str()?.to_string()))
 }
 
 /// This invocation's roots: its `OUT_DIR`, a target directory that exists,
@@ -10526,6 +10861,214 @@ mod tests {
         }
     }
 
+    /// A workspace at `/w`, reached through `/private/w` as macOS spells
+    /// temporary directories, with its target inside.
+    fn workspace_test_roots() -> WorkspaceRoots {
+        WorkspaceRoots {
+            root: PathBuf::from("/w"),
+            cwd: String::new(),
+            canonical_root: PathBuf::from("/private/w"),
+            target: PathBuf::from("/w/target"),
+            canonical_target: PathBuf::from("/private/w/target"),
+            out_dir: Some(PathBuf::from("/w/target/debug/build/kt-1/out")),
+        }
+    }
+
+    #[test]
+    fn a_workspace_row_keeps_its_guard_only_while_the_closure_stays_inside() {
+        let tree = || Some("tree".to_string());
+        assert_eq!(same_tree_guard(tree(), true, true), tree());
+        assert_eq!(same_tree_guard(tree(), true, false), None);
+        assert_eq!(
+            same_tree_guard(tree(), false, false),
+            tree(),
+            "registry and other units"
+        );
+        assert_eq!(same_tree_guard(tree(), false, true), tree());
+        assert_eq!(same_tree_guard(None, true, true), None);
+    }
+
+    #[test]
+    fn a_workspace_value_is_relocated_refused_or_kept() {
+        let roots = workspace_test_roots();
+        let value = |value: &str| workspace_portable_value(std::ffi::OsStr::new(value), &roots);
+        assert_eq!(
+            value("/w/target/debug/build/kt-1/out/gen.rs"),
+            Some(Portable::OutDir("/gen.rs".to_string()))
+        );
+        assert_eq!(
+            value("/w/target/debug/deps/libx.rlib"),
+            None,
+            "another unit's output"
+        );
+        assert_eq!(value("/private/w/target/debug/deps/libx.rlib"), None);
+        assert_eq!(
+            value("/w/kt/src/lib.rs"),
+            Some(Portable::Workspace("/kt/src/lib.rs".to_string()))
+        );
+        assert_eq!(
+            value("/private/w/assets/a.txt"),
+            Some(Portable::Workspace("/assets/a.txt".to_string()))
+        );
+        assert_eq!(value("/w"), Some(Portable::Workspace(String::new())));
+        assert_eq!(
+            value("/w2/x"),
+            Some(Portable::Literal("/w2/x".to_string())),
+            "a sibling that merely starts the same is not the workspace"
+        );
+        assert_eq!(value("kt"), Some(Portable::Literal("kt".to_string())));
+    }
+
+    #[test]
+    fn a_relative_source_must_stay_in_the_workspace() {
+        let mut roots = workspace_test_roots();
+        let source = |spelled: &str, roots: &WorkspaceRoots| {
+            workspace_relative_source(Path::new(spelled), roots)
+        };
+        let kept = |spelled: &str| Some(Portable::Literal(spelled.to_string()));
+        assert_eq!(source("kt/src/lib.rs", &roots), kept("kt/src/lib.rs"));
+        assert_eq!(
+            source("kt/src/../../assets/a.txt", &roots),
+            kept("kt/src/../../assets/a.txt")
+        );
+        assert_eq!(source("../outside.txt", &roots), None);
+        assert_eq!(source("kt//lib.rs", &roots), None);
+        roots.cwd = "/kt".to_string();
+        assert_eq!(source("../assets/a.txt", &roots), kept("../assets/a.txt"));
+        assert_eq!(source("../../outside.txt", &roots), None);
+    }
+
+    #[test]
+    fn a_workspace_record_needs_the_guard_and_every_source_inside() {
+        let roots = workspace_test_roots();
+        let dep_info = |sources: &[&str]| DepInfo {
+            source_files: sources.iter().map(PathBuf::from).collect(),
+            env_deps: vec![("CARGO_MANIFEST_DIR".to_string(), "/w/kt".to_string())],
+        };
+        let inside = dep_info(&["kt/src/lib.rs", "/w/target/debug/build/kt-1/out/gen.rs"]);
+        assert_eq!(
+            workspace_portable_prediction(&inside, &roots, Some("tree-1")),
+            Some(PortablePrediction {
+                schema: PORTABLE_PREDICTION_SCHEMA,
+                sources: vec![
+                    Portable::Literal("kt/src/lib.rs".to_string()),
+                    Portable::OutDir("/gen.rs".to_string()),
+                ],
+                env_deps: vec![(
+                    "CARGO_MANIFEST_DIR".to_string(),
+                    Portable::Workspace("/kt".to_string())
+                )],
+                tree: "tree-1".to_string(),
+            })
+        );
+        assert_eq!(workspace_portable_prediction(&inside, &roots, None), None);
+        for outside in ["/elsewhere/x.rs", "../x.rs", "/w/target/debug/deps/x.rs"] {
+            let closure = dep_info(&["kt/src/lib.rs", outside]);
+            assert_eq!(
+                workspace_portable_prediction(&closure, &roots, Some("t")),
+                None,
+                "{outside}"
+            );
+        }
+        let mut env_in_target = dep_info(&["kt/src/lib.rs"]);
+        env_in_target.env_deps = vec![("X".to_string(), "/w/target/debug/x".to_string())];
+        assert_eq!(
+            workspace_portable_prediction(&env_in_target, &roots, Some("t")),
+            None
+        );
+    }
+
+    #[test]
+    fn a_workspace_entry_resolves_only_where_this_invocation_has_a_workspace() {
+        let record = PortablePrediction {
+            schema: PORTABLE_PREDICTION_SCHEMA,
+            sources: vec![Portable::Workspace("/kt/src/lib.rs".to_string())],
+            env_deps: vec![],
+            tree: "t".to_string(),
+        };
+        let places = |out_dir, workspace| Places { out_dir, workspace };
+        assert_eq!(record.resolve(&places(Some("/o"), None)), None);
+        assert_eq!(
+            record
+                .resolve(&places(None, Some("/v")))
+                .map(|resolved| resolved.sources),
+            Some(vec![PathBuf::from("/v/kt/src/lib.rs")])
+        );
+        assert_eq!(
+            portable_test_record().resolve(&places(None, Some("/v"))),
+            None,
+            "an OUT_DIR entry needs an OUT_DIR"
+        );
+    }
+
+    #[test]
+    fn the_workspace_guard_covers_everything_but_target_and_git() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("w");
+        let write = |path: &str, content: &str| {
+            let path = root.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, content).unwrap();
+        };
+        write("Cargo.toml", "[workspace]\n");
+        write("kt/src/lib.rs", "pub fn a() {}\n");
+        write("assets/a.txt", "a\n");
+        write("target/debug/build/kt-1/out/gen.rs", "// gen\n");
+        let roots = WorkspaceRoots {
+            root: root.clone(),
+            cwd: String::new(),
+            canonical_root: root.canonicalize().unwrap(),
+            target: root.join("target"),
+            canonical_target: root.join("target").canonicalize().unwrap(),
+            out_dir: Some(root.join("target/debug/build/kt-1/out")),
+        };
+        let hasher = FileHasher::new();
+        let digest = || workspace_tree_digest(&roots, &hasher).unwrap();
+        let baseline = digest();
+
+        write("target/debug/deps/libx.rlib", "x");
+        write(".git/HEAD", "ref");
+        assert_eq!(
+            digest(),
+            baseline,
+            "target and .git are not what a macro reads"
+        );
+
+        write("docs/new.md", "new");
+        assert_ne!(digest(), baseline, "a new file anywhere in the workspace");
+        std::fs::remove_file(root.join("docs/new.md")).unwrap();
+        std::fs::remove_dir(root.join("docs")).unwrap();
+        assert_eq!(digest(), baseline);
+
+        write("assets/a.txt", "changed");
+        assert_ne!(digest(), baseline, "content");
+        write("assets/a.txt", "a\n");
+        write("target/debug/build/kt-1/out/gen.rs", "// other\n");
+        assert_ne!(digest(), baseline, "OUT_DIR, though it lies under target");
+    }
+
+    #[test]
+    fn the_workspace_guard_gives_up_past_its_entry_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("w");
+        std::fs::create_dir_all(root.join("target")).unwrap();
+        for name in ["a", "b", "c"] {
+            std::fs::write(root.join(name), name).unwrap();
+        }
+        let roots = WorkspaceRoots {
+            root: root.clone(),
+            cwd: String::new(),
+            canonical_root: root.clone(),
+            target: root.join("target"),
+            canonical_target: root.join("target"),
+            out_dir: None,
+        };
+        let hasher = FileHasher::new();
+        // Three files; `target` is skipped before it is counted.
+        assert!(workspace_tree_digest_within(&roots, &hasher, 3).is_some());
+        assert!(workspace_tree_digest_within(&roots, &hasher, 2).is_none());
+    }
+
     #[test]
     fn a_portable_record_relocates_out_dir_and_keeps_registry_paths() {
         let dep_info = DepInfo {
@@ -10651,8 +11194,11 @@ mod tests {
     #[test]
     fn a_portable_record_resolves_to_this_out_dir_byte_for_byte() {
         assert_eq!(
-            portable_test_record().resolve("/u/debug/build/kt-1/out"),
-            InputPrediction {
+            portable_test_record().resolve(&Places {
+                out_dir: Some("/u/debug/build/kt-1/out"),
+                workspace: None,
+            }),
+            Some(InputPrediction {
                 schema: PREDICTION_SCHEMA,
                 sources: vec![
                     PathBuf::from("/h/registry/src/index-1/kt-1.0.0/src/lib.rs"),
@@ -10664,7 +11210,7 @@ mod tests {
                     ("CARGO_PKG_NAME".to_string(), "kt".to_string()),
                 ],
                 tree: Some("tree-1".to_string()),
-            }
+            })
         );
     }
 
@@ -10683,7 +11229,10 @@ mod tests {
             validate_portable_prediction(
                 &record,
                 guard,
-                "/u/out",
+                &Places {
+                    out_dir: Some("/u/out"),
+                    workspace: None,
+                },
                 |_| std::fs::metadata(file.path()).ok(),
                 |_| false,
                 |var| (var == "OUT_DIR").then(|| env_out_dir.to_string()),

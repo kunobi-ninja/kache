@@ -4022,6 +4022,19 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn the_event_log_rotates_at_64_mib_by_default() {
+        let _lock = config_path_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let _config = set_kache_config_for_test(&config_path);
+
+        assert_eq!(Config::load().unwrap().event_log_max_size, 67_108_864);
+
+        std::fs::write(&config_path, "[cache]\nevent_log_max_size = \"8MiB\"\n").unwrap();
+        assert_eq!(Config::load().unwrap().event_log_max_size, 8 * 1024 * 1024);
+    }
+
+    #[test]
     fn gc_max_age_is_opt_in_and_obeys_env_precedence() {
         let _lock = config_path_lock();
         let dir = tempfile::tempdir().unwrap();

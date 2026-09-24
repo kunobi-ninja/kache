@@ -997,10 +997,13 @@ fn retained_suffix(lines: &[&str], keep_lines: usize, max_size: u64) -> Retained
         suffix[i] = suffix[i + 1] + line.len() as u64;
     }
     let bytes_from = |start: usize| suffix[start];
-    let mut start = lines.len().saturating_sub(keep_lines);
-    while start + 1 < lines.len() && bytes_from(start) > max_size {
-        start += 1;
-    }
+    // The last `keep_lines` lines, trimmed from the front to fit; the newest
+    // line stays even when it alone is over the size.
+    let by_count = lines.len().saturating_sub(keep_lines);
+    let newest = lines.len().saturating_sub(1);
+    let mut start = (by_count..newest)
+        .find(|&from| bytes_from(from) <= max_size)
+        .unwrap_or(newest.max(by_count));
     let session = lines.last().and_then(|line| line_session(line));
     let session_start = session.as_deref().and_then(|session| {
         let needle = session_needle(session);

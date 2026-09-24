@@ -932,7 +932,7 @@ pub(crate) mod tests {
         let object = dir.join("hello.o");
         let binary = dir.join("hello-bin");
         let compiled = run_host_tool(|| {
-            let mut command = Command::new(cc);
+            let mut command = cc.command();
             command
                 .args(["-g", "-c"])
                 .arg(&source)
@@ -951,7 +951,7 @@ pub(crate) mod tests {
     fn relink_c_binary(object: &Path, extra: &str, binary: &Path) -> Option<std::path::PathBuf> {
         let cc = host_c_compiler()?;
         let linked = run_host_tool(|| {
-            let mut command = Command::new(cc);
+            let mut command = cc.command();
             command.arg(object);
             if !extra.is_empty() {
                 command.arg(extra);
@@ -965,34 +965,60 @@ pub(crate) mod tests {
         }
     }
 
-    /// The host's real C compiler, found once per test process through
-    /// `xcrun`. Resolving it that way keeps a `cc` shim on `PATH` (a kache
-    /// install, mise) out of these tests, and asks `xcrun` once instead of
-    /// on every compile (kunobi-ninja/kache#1208). None off macOS.
-    fn host_c_compiler() -> Option<&'static Path> {
-        static COMPILER: std::sync::OnceLock<Option<std::path::PathBuf>> =
-            std::sync::OnceLock::new();
+    /// The host's real C compiler and the SDK it compiles against, found
+    /// once per test process through `xcrun`. Resolving them that way keeps
+    /// a `cc` shim on `PATH` (a kache install, mise) out of these tests, and
+    /// asks `xcrun` once instead of on every compile
+    /// (kunobi-ninja/kache#1208). The toolchain's `clang` does not know the
+    /// SDK on its own (`/usr/bin/cc` is what supplies it), so every compile
+    /// passes `-isysroot`. None off macOS.
+    fn host_c_compiler() -> Option<&'static HostCompiler> {
+        static COMPILER: std::sync::OnceLock<Option<HostCompiler>> = std::sync::OnceLock::new();
         COMPILER
             .get_or_init(|| {
                 if std::env::consts::OS != "macos" {
                     return None;
                 }
-                let found = run_host_tool(|| {
-                    let mut command = Command::new("xcrun");
-                    command.args(["--find", "clang"]);
-                    command
-                });
-                match found {
-                    Ok(output) => {
-                        let path = std::path::PathBuf::from(
-                            String::from_utf8_lossy(&output.stdout).trim(),
-                        );
-                        path.is_file().then_some(path)
-                    }
-                    Err(error) => host_tool_unavailable("xcrun --find clang", &error),
-                }
+                let clang = xcrun_path(&["--find", "clang"])?;
+                let sdk = xcrun_path(&["--show-sdk-path"])?;
+                Some(HostCompiler { clang, sdk })
             })
-            .as_deref()
+            .as_ref()
+    }
+
+    /// A compiler [`host_c_compiler`] found.
+    struct HostCompiler {
+        clang: std::path::PathBuf,
+        sdk: std::path::PathBuf,
+    }
+
+    impl HostCompiler {
+        /// `clang -isysroot <sdk>`, ready for arguments.
+        fn command(&self) -> Command {
+            let mut command = Command::new(&self.clang);
+            command.arg("-isysroot").arg(&self.sdk);
+            command
+        }
+    }
+
+    /// The path `xcrun <args>` prints, when it names something that exists.
+    fn xcrun_path(args: &[&str]) -> Option<std::path::PathBuf> {
+        let what = format!("xcrun {}", args.join(" "));
+        match run_host_tool(|| {
+            let mut command = Command::new("xcrun");
+            command.args(args);
+            command
+        }) {
+            Ok(output) => {
+                let path = std::path::PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+                if path.exists() {
+                    Some(path)
+                } else {
+                    host_tool_unavailable(&what, &format!("{} does not exist", path.display()))
+                }
+            }
+            Err(error) => host_tool_unavailable(&what, &error),
+        }
     }
 
     /// How many times a host tool is started before giving up. A full

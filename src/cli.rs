@@ -3252,10 +3252,12 @@ pub fn run_gc_local(config: &Config, mode: GcMode) -> Result<crate::store::GcSta
     combined.housekeeping = Some(housekeeping);
     if verbose {
         println!(
-            "Housekeeping: removed {} stale key locks ({} remain), {} unused input predictions.",
+            "Housekeeping: removed {} stale key locks ({} remain), {} unused input predictions, \
+             {} old file hashes.",
             housekeeping.key_locks_removed,
             housekeeping.key_locks_remaining,
             housekeeping.predictions_pruned,
+            housekeeping.file_hashes_pruned,
         );
     }
 
@@ -6652,6 +6654,10 @@ pub fn verify(config: &Config, checksums: bool, repair: bool) -> Result<VerifyOu
             Ok(removed) => println!("Repairing: removed {removed} unused input predictions"),
             Err(error) => println!("Warning: could not prune input predictions: {error}"),
         }
+        match memos.prune_file_hashes() {
+            Ok(removed) => println!("Repairing: removed {removed} old file hashes"),
+            Err(error) => println!("Warning: could not prune file hashes: {error}"),
+        }
         match memos.compact_sparse_index() {
             Ok(Some((before, after))) => println!(
                 "Repairing: compacted index file from {} to {}",
@@ -7472,6 +7478,7 @@ mod tests {
                 key_locks_removed: 2,
                 key_locks_remaining: 1,
                 predictions_pruned: 0,
+                file_hashes_pruned: 0,
             })
         );
         assert!(!lock_path(1).exists());
@@ -7481,6 +7488,7 @@ mod tests {
         assert_eq!(recorded.key_locks_removed, Some(2));
         assert_eq!(recorded.key_locks_remaining, Some(1));
         assert_eq!(recorded.predictions_pruned, Some(0));
+        assert_eq!(recorded.file_hashes_pruned, Some(0));
     }
 
     #[test]

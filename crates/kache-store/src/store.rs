@@ -1033,6 +1033,8 @@ pub struct HousekeepingStats {
     /// whatever the per-sweep cap deferred.
     pub key_locks_remaining: usize,
     pub predictions_pruned: usize,
+    /// File hash memo rows deleted as not written for a month (#1206).
+    pub file_hashes_pruned: usize,
 }
 
 /// Whether `err` carries SQLite write contention (`SQLITE_BUSY` or
@@ -3927,8 +3929,8 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         Ok(stats)
     }
 
-    /// The per-key structures nothing else bounds: stale key lock files and
-    /// unused input predictions. The caller holds `gc.lock`. A pass that fails
+    /// The per-key structures nothing else bounds: stale key lock files,
+    /// unused input predictions and old file hash rows. The caller holds `gc.lock`. A pass that fails
     /// is logged and counts as zero; the next sweep tries again.
     pub fn sweep_housekeeping(&self) -> HousekeepingStats {
         let locks = self
@@ -3944,10 +3946,18 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                 tracing::warn!("gc: input prediction pruning failed: {error}");
                 0
             });
+        let file_hashes_pruned =
+            self.file_hash_cache()
+                .prune_file_hashes()
+                .unwrap_or_else(|error| {
+                    tracing::warn!("gc: file hash pruning failed: {error}");
+                    0
+                });
         HousekeepingStats {
             key_locks_removed: locks.removed,
             key_locks_remaining: locks.remaining(),
             predictions_pruned,
+            file_hashes_pruned,
         }
     }
 
@@ -15032,6 +15042,19 @@ mod tests {
                 [],
             )
             .unwrap();
+        for (path, written) in [
+            ("/old", "2000-01-01 00:00:00"),
+            ("/new", "9999-01-01 00:00:00"),
+        ] {
+            store
+                .db
+                .execute(
+                    "INSERT INTO file_hashes (path, size, mtime_ns, hash, updated_at)
+                     VALUES (?1, 1, 1, 'h', ?2)",
+                    rusqlite::params![path, written],
+                )
+                .unwrap();
+        }
 
         assert_eq!(
             store.sweep_housekeeping(),
@@ -15039,6 +15062,7 @@ mod tests {
                 key_locks_removed: 2,
                 key_locks_remaining: 1,
                 predictions_pruned: 1,
+                file_hashes_pruned: 1,
             }
         );
         assert!(!stale.exists());

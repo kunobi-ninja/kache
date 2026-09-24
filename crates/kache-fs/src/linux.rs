@@ -166,6 +166,7 @@ impl SizeProbe for LinuxProbe {
             // FIEMAP says an extent is shared, not which group it belongs to;
             // pairing directories needs owner resolution this probe does not do.
             clone_id: None,
+            clone_refcount: None,
         })
     }
 

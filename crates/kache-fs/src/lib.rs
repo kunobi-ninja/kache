@@ -102,12 +102,27 @@ pub struct FileSizing {
     /// platform reports one. IDs are scoped to `inode.dev` and to the observation;
     /// they are not durable content identities.
     pub clone_id: Option<u64>,
+    /// Live inodes in this file's clone group, itself included, when the
+    /// platform reports it (APFS `ATTR_CMNEXT_CLONE_REFCNT`). At most one
+    /// means no other file shares these blocks: whatever is not private is
+    /// held by filesystem snapshots, and is freed once those snapshots go.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub clone_refcount: Option<u32>,
 }
 
 impl FileSizing {
     /// Blocks shared with other inodes, when known.
     pub fn shared(&self) -> Option<u64> {
         self.unique.map(|u| self.allocated.saturating_sub(u))
+    }
+
+    /// Shared bytes that no other live file holds, only snapshots. `None`
+    /// when the platform does not report the clone group's size.
+    pub fn snapshot_held(&self) -> Option<u64> {
+        match self.clone_refcount? {
+            0 | 1 => self.shared(),
+            _ => Some(0),
+        }
     }
 
     /// True when deleting this file alone reclaims nothing.
@@ -1004,6 +1019,7 @@ mod tests {
             inode: InodeId { dev: 3, ino: 1 },
             nlink: 1,
             clone_id: Some(7),
+            clone_refcount: None,
         };
         let mut probe = FixtureProbe(vec![
             partial,
@@ -1078,9 +1094,41 @@ mod tests {
             inode: InodeId { dev: 1, ino: 1 },
             nlink: 1,
             clone_id: None,
+            clone_refcount: None,
         };
         assert_eq!(full.shared(), Some(4096));
         assert!(full.frees_nothing());
+        assert_eq!(full.snapshot_held(), None, "no refcount, no verdict");
+        assert_eq!(
+            FileSizing {
+                clone_refcount: Some(2),
+                ..full
+            }
+            .snapshot_held(),
+            Some(0),
+            "another live clone holds the blocks"
+        );
+        for alone in [0, 1] {
+            assert_eq!(
+                FileSizing {
+                    clone_refcount: Some(alone),
+                    ..full
+                }
+                .snapshot_held(),
+                Some(4096),
+                "no other live clone: only snapshots hold the shared blocks"
+            );
+        }
+        assert_eq!(
+            FileSizing {
+                unique: None,
+                clone_refcount: Some(1),
+                ..full
+            }
+            .snapshot_held(),
+            None,
+            "unknown private bytes leave the snapshot share unknown"
+        );
 
         let unknown = FileSizing {
             unique: None,

@@ -420,6 +420,18 @@ pub struct UploadJob {
 /// pre-pass, so waiting longer than a pre-pass takes would be a loss.
 const PREDICTION_FETCH_BUDGET: Duration = Duration::from_secs(2);
 
+/// How long a wrapper waits for a prediction row: the daemon's own budget
+/// plus the socket round trip.
+fn prediction_fetch_wait() -> Duration {
+    PREDICTION_FETCH_BUDGET + Duration::from_millis(500)
+}
+
+/// Rows go to the remote only when there is one and it is writable: the gate
+/// artifact uploads use.
+fn publishes_predictions(config: &Config) -> bool {
+    config.remote.is_some() && !config.remote_readonly
+}
+
 /// Longest identity accepted over the socket: a prefix and a 64-hex hash.
 const PREDICTION_IDENTITY_MAX_LEN: usize = 128;
 
@@ -1697,7 +1709,6 @@ impl Response {
     fn ok_local_lookup(reply: LocalLookupReply) -> Self {
         Self {
             local_lookup: Some(reply),
-            prediction: None,
             ..Self::ok()
         }
     }
@@ -4336,7 +4347,7 @@ impl Daemon {
     /// once: the wrapper does not wait for the upload. Skipped with no remote
     /// or a read-only one, the same gate artifact uploads use.
     fn handle_prediction_publish(self: &Arc<Self>, req: PredictionPublishRequest) -> Response {
-        if self.config.remote.is_none() || self.config.remote_readonly {
+        if !publishes_predictions(&self.config) {
             return Response::ok();
         }
         if !prediction_identity_is_acceptable(&req.identity) {
@@ -8964,9 +8975,7 @@ pub fn send_prediction_fetch(
     let req = Request::PredictionFetch(PredictionFetchRequest {
         identity: identity.to_string(),
     });
-    // The daemon's own budget plus the socket round trip.
-    let timeout = PREDICTION_FETCH_BUDGET + Duration::from_millis(500);
-    let reply = send_request_with_timeout(&socket_path, &req, timeout).ok()?;
+    let reply = send_request_with_timeout(&socket_path, &req, prediction_fetch_wait()).ok()?;
     serde_json::from_str::<Response>(&reply)
         .ok()
         .filter(|response| response.ok)?
@@ -8981,7 +8990,7 @@ pub fn send_prediction_publish(
     identity: &str,
     row: crate::prediction_share::SharedPrediction,
 ) {
-    if config.remote.is_none() || config.remote_readonly {
+    if !publishes_predictions(config) {
         return;
     }
     let req = Request::PredictionPublish(PredictionPublishRequest {
@@ -14788,6 +14797,24 @@ mod tests {
             .await;
         assert!(reply.ok);
         assert_eq!(reply.prediction, None);
+    }
+
+    #[test]
+    fn rows_are_published_only_to_a_writable_remote() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.remote = None;
+        assert!(!publishes_predictions(&config));
+        config.remote = Some(test_remote_config());
+        assert!(publishes_predictions(&config));
+        config.remote_readonly = true;
+        assert!(!publishes_predictions(&config));
+    }
+
+    #[test]
+    fn a_wrapper_waits_longer_for_a_row_than_the_daemon_spends_fetching_it() {
+        assert_eq!(prediction_fetch_wait(), Duration::from_millis(2_500));
+        assert_eq!(PREDICTION_FETCH_BUDGET, Duration::from_secs(2));
     }
 
     #[test]

@@ -11095,6 +11095,37 @@ mod tests {
     }
 
     #[test]
+    fn a_remote_row_is_kept_only_once_it_checks_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("index.db");
+        let hasher = FileHasher::persistent(&db);
+        let args = RustcArgs::parse(&[
+            "rustc".to_string(),
+            "--crate-name".to_string(),
+            "kt".to_string(),
+            "src/lib.rs".to_string(),
+        ])
+        .unwrap();
+        let record = InputPrediction {
+            schema: PREDICTION_SCHEMA,
+            sources: vec![PathBuf::from("/r/i/kt-1.0.0/src/lib.rs")],
+            env_deps: vec![],
+            tree: None,
+        };
+        let dep_info = DepInfo {
+            source_files: record.sources.clone(),
+            env_deps: vec![],
+        };
+        keep_remote_plain_row(&hasher, "refused", &args, &record, &Err(Rejection::Missing));
+        assert_eq!(hasher.input_prediction("refused"), None);
+        keep_remote_plain_row(&hasher, "kept", &args, &record, &Ok(dep_info));
+        assert_eq!(
+            hasher.input_prediction("kept").map(|kept| kept.sources),
+            Some(record.sources.clone())
+        );
+    }
+
+    #[test]
     fn a_workspace_value_is_relocated_refused_or_kept() {
         let roots = workspace_test_roots();
         let value = |value: &str| workspace_portable_value(std::ffi::OsStr::new(value), &roots);

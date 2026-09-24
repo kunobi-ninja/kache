@@ -421,6 +421,11 @@ mod tests {
     }
 
     #[test]
+    fn the_row_cap_is_a_quarter_mebibyte() {
+        assert_eq!(SHARED_ROW_MAX_BYTES, 262_144);
+    }
+
+    #[test]
     fn the_object_name_is_the_identity_hash() {
         let name = object_name(IDENTITY);
         assert!(name.ends_with(".json"));

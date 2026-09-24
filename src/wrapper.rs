@@ -5241,13 +5241,18 @@ fn deferral_allowed(
 /// Where the key may fetch a portable prediction row this machine lacks: the
 /// daemon's remote, when predictions are on and a remote is configured.
 fn remote_prediction_rows(config: &Config) -> Option<crate::cache_key::RemoteRows> {
-    if !config.input_predictions || config.remote.is_none() {
+    if !fetches_remote_predictions(config) {
         return None;
     }
     let config = config.clone();
     Some(Box::new(move |identity: &str| {
         crate::daemon::send_prediction_fetch(&config, identity)
     }))
+}
+
+/// A row is asked of the remote only with predictions on and a remote set.
+fn fetches_remote_predictions(config: &Config) -> bool {
+    config.input_predictions && config.remote.is_some()
 }
 
 /// Remember the input closure this invocation discovered, so a later build of
@@ -8755,6 +8760,27 @@ mod tests {
 
     fn test_config(cache_dir: PathBuf) -> Config {
         crate::test_support::test_config(cache_dir)
+    }
+
+    #[test]
+    fn rows_are_asked_of_the_remote_only_with_predictions_and_a_remote() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path().to_path_buf());
+        config.remote = None;
+        config.input_predictions = true;
+        assert!(!fetches_remote_predictions(&config));
+        config.remote = Some(crate::config::RemoteConfig {
+            prefix: "artifacts".to_string(),
+            backend: crate::config::RemoteBackendConfig::Filesystem(
+                crate::config::FilesystemRemoteConfig {
+                    root: dir.path().join("remote"),
+                    atomic_write_dir: dir.path().join("staging"),
+                },
+            ),
+        });
+        assert!(fetches_remote_predictions(&config));
+        config.input_predictions = false;
+        assert!(!fetches_remote_predictions(&config));
     }
 
     #[test]

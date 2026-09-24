@@ -35,7 +35,7 @@ exclude = ["tmp"]
 resolver = "3"
 
 [dependencies]
-kunobi-daemon = { version = "0.4.2", features = ["wire-async", "local-async", "launch"] }
+kunobi-daemon = { version = "0.5.0", features = ["wire-async", "local-async", "launch"] }
 kache-format = { version = "0.27.0", path = "crates/kache-format" }
 kache-store = { version = "0.27.0", path = "crates/kache-store" }
 blake3 = "1"
@@ -180,7 +180,3 @@ warnings = "deny"
 [lints.clippy]
 permissions_set_readonly_false = "allow"
 too_many_arguments = "allow"
-
-# Draft: the detached spawn from kunobi-daemon#21, until it ships as 0.5.0.
-[patch.crates-io]
-kunobi-daemon = { git = "https://github.com/kunobi-ninja/kunobi-daemon", rev = "f6f67e366c178354c48855c9646ba55abbb5e995" }

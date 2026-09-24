@@ -52,7 +52,7 @@ pub fn socket_path_problem(path: &Path) -> Option<String> {
 }
 
 /// Bind through shared ownership and disable the transport's unchecked unlink.
-pub fn bind_daemon_listener(path: &Path) -> Result<Option<TokioListener>> {
+pub async fn bind_daemon_listener(path: &Path) -> Result<Option<TokioListener>> {
     use interprocess::local_socket::traits::tokio::Listener as _;
     if let Some(problem) = socket_path_problem(path) {
         anyhow::bail!(problem);
@@ -72,6 +72,7 @@ pub fn bind_daemon_listener(path: &Path) -> Result<Option<TokioListener>> {
     let mut listener = {
         use kunobi_daemon::local::windows_socket::{self, Bound};
         let bound = windows_socket::acquire_tokio(Path::new(&*daemon_endpoint(path)))
+            .await
             .map_err(|error| anyhow::anyhow!("acquiring daemon pipe: {error:?}"))?;
         let Bound::Won(listener) = bound else {
             return Ok(None);
@@ -236,7 +237,7 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        let Err(error) = runtime.block_on(async { bind_daemon_listener(Path::new(&path)) }) else {
+        let Err(error) = runtime.block_on(bind_daemon_listener(Path::new(&path))) else {
             panic!("an overlong path cannot bind");
         };
         assert!(error.to_string().contains("KACHE_SOCKET_PATH"), "{error:#}");

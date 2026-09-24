@@ -35,7 +35,8 @@ exclude = ["tmp"]
 resolver = "3"
 
 [dependencies]
-kunobi-daemon = { version = "0.4.2", features = ["wire-async", "local-async"] }
+# Draft: the detached spawn from kunobi-daemon#21, until it ships as 0.5.0.
+kunobi-daemon = { git = "https://github.com/kunobi-ninja/kunobi-daemon", rev = "d5bb5df481d59185bb138f3117ccb786712a5399", features = ["wire-async", "local-async", "launch"] }
 kache-format = { version = "0.27.0", path = "crates/kache-format" }
 kache-store = { version = "0.27.0", path = "crates/kache-store" }
 blake3 = "1"

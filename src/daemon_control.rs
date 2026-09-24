@@ -72,8 +72,9 @@ impl Drop for Server {
 
 pub(super) async fn serve(config: &Config, lifecycle: Arc<Lifecycle>) -> Result<Server> {
     let path = endpoint(config);
-    let listener =
-        crate::transport::bind_daemon_listener(&path)?.context("control endpoint already owned")?;
+    let listener = crate::transport::bind_daemon_listener(&path)
+        .await?
+        .context("control endpoint already owned")?;
     let socket = SocketCleanupGuard::new(&path)?;
     let service = Arc::new(ControlService::new(
         lifecycle,

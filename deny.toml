@@ -69,4 +69,6 @@ allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 # First-party dependencies.
 allow-git = [
     "https://github.com/kunobi-ninja/kunobi-ha.git",
+    # Draft only: the detached spawn from kunobi-daemon#21, until 0.5.0 ships.
+    "https://github.com/kunobi-ninja/kunobi-daemon",
 ]

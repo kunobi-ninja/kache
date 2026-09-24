@@ -126,7 +126,7 @@ pub(super) fn current_socket(socket: &Path, deadline: Instant) -> Result<Option<
 struct KacheReplacement<'a> {
     config: &'a Config,
     force: bool,
-    child: Option<std::process::Child>,
+    child: Option<kunobi_daemon::launch::DaemonChild>,
     executable: Option<PathBuf>,
     stopping: bool,
     retiring_pid: Option<u32>,
@@ -210,8 +210,8 @@ impl Driver for KacheReplacement<'_> {
                         .create(true)
                         .append(true)
                         .open(log)
-                        .map(std::process::Stdio::from)
-                        .unwrap_or_else(|_| std::process::Stdio::null());
+                        .map(kunobi_daemon::launch::DaemonOutput::File)
+                        .unwrap_or(kunobi_daemon::launch::DaemonOutput::Null);
                     warn_if_remote_is_env_only(config);
                     self.child = Some(spawn_detached_daemon(
                         self.executable.as_ref().unwrap(),
@@ -422,23 +422,20 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn abandoned_startup_reaps_the_child_without_terminating_it() {
-        use std::io::Write;
         let root = tempfile::tempdir().unwrap();
         let config = super::super::tests::test_config(root.path());
-        let mut child = std::process::Command::new("sh")
-            .args(["-c", "read release"])
-            .stdin(std::process::Stdio::piped())
-            .spawn()
-            .unwrap();
+        let release = root.path().join("release");
+        let mut command = kunobi_daemon::launch::DaemonCommand::new("sh");
+        command.args(["-c", "while [ ! -e \"$1\" ]; do sleep 0.05; done", "sh"]);
+        command.arg(&release);
+        let child = command.spawn().unwrap();
         let pid = child.id() as libc::pid_t;
-        let mut input = child.stdin.take().unwrap();
         let mut replacement = driver(&config);
         replacement.child = Some(child);
         drop(replacement);
         // Signal zero observes this owned child without signalling it.
         assert_eq!(unsafe { libc::kill(pid, 0) }, 0);
-        input.write_all(b"release\n").unwrap();
-        drop(input);
+        std::fs::write(&release, "").unwrap();
         let reaped =
             kunobi_daemon::readiness::wait_until(Instant::now() + Duration::from_secs(3), |_| {
                 Ok::<_, std::io::Error>((unsafe { libc::kill(pid, 0) } != 0).then_some(()))

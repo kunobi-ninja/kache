@@ -18,7 +18,27 @@ static PROCESS_STATE_TEST_LOCK: Mutex<()> = Mutex::new(());
 /// caught, because the failing test was one of the two that change directory.
 pub(crate) struct ProcessStateTestGuard {
     original_dir: Option<PathBuf>,
+    // Declared before the lock: fields drop in order, after `Drop::drop` has
+    // put the directory back.
+    entered_dir: Option<tempfile::TempDir>,
     _lock: MutexGuard<'static, ()>,
+}
+
+impl ProcessStateTestGuard {
+    /// Make `dir` the current directory until the guard drops, and keep it
+    /// alive until then.
+    ///
+    /// A `TempDir` the test declares after the guard drops before it, so the
+    /// directory would be deleted while the process still stands in it. Tests
+    /// that read `current_dir()` without the lock, such as those deriving an
+    /// event root from it, then get an error for that window and fail at
+    /// random.
+    pub(crate) fn enter(&mut self, dir: tempfile::TempDir) -> PathBuf {
+        let path = dir.path().to_path_buf();
+        std::env::set_current_dir(&path).unwrap();
+        self.entered_dir = Some(dir);
+        path
+    }
 }
 
 impl Drop for ProcessStateTestGuard {
@@ -40,6 +60,7 @@ pub(crate) fn process_state_test_lock() -> ProcessStateTestGuard {
         .unwrap_or_else(|error| error.into_inner());
     ProcessStateTestGuard {
         original_dir: std::env::current_dir().ok(),
+        entered_dir: None,
         _lock: lock,
     }
 }
@@ -158,5 +179,24 @@ mod tests {
             original,
             "the guard must restore the directory even when the test body never does"
         );
+    }
+
+    #[test]
+    fn an_entered_dir_lives_until_the_guard_has_restored_the_directory() {
+        let (original, entered) = {
+            let mut lock = process_state_test_lock();
+            let original = std::env::current_dir().unwrap();
+            let entered = lock.enter(tempfile::tempdir().unwrap());
+            assert!(entered.is_dir(), "the guard keeps the entered dir alive");
+            assert_eq!(
+                std::env::current_dir().unwrap().canonicalize().unwrap(),
+                entered.canonicalize().unwrap()
+            );
+            (original, entered)
+        };
+
+        let _lock = process_state_test_lock();
+        assert_eq!(std::env::current_dir().unwrap(), original);
+        assert!(!entered.exists(), "the entered dir goes with the guard");
     }
 }

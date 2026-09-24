@@ -465,6 +465,7 @@ mod tests {
             windows_hardlink: false,
             shared_hardlink_restores: false,
             deferred_discovery: true,
+            out_dir_alias: true,
             deferred_durability: false,
             daemon_publish: false,
             project_rules: crate::config::ProjectRules::default(),

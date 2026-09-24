@@ -24,6 +24,7 @@ came from the second pass.
 | Cargo workspaces / proc-macro member | `e2e-rust-workspace`, `e2e-manifest-dir-runtime-workspace` |
 | Cross-path key stability / relocation | `e2e-rust-dep-cascade`, `e2e-rust-out-of-tree-target`, `e2e-rust-symlinked-target` |
 | Runtime path env deps must miss after relocate (`OUT_DIR`) | `e2e-out-dir-runtime`, `e2e-out-dir-dual-pattern` |
+| Shared read-only `OUT_DIR` for registry units that bake an empty one: cross-checkout hits, the tripwire, the write hint | `tests/out_dir_alias_test.rs` (six checkouts against one cache, two of them at once) |
 | Runtime `CARGO_MANIFEST_DIR` must miss after relocate | `e2e-manifest-dir-runtime-workspace` |
 | `extra_inputs` (#220) | `e2e-rust-extra-inputs` |
 | User `--remap-path-prefix` | `e2e-rust-remap-prefix` |

@@ -2123,14 +2123,14 @@ mod tests {
     /// contributes its spelling only.
     #[test]
     fn dep_paths_are_keyed_by_content_only_when_absolute_and_present() {
-        let _lock = crate::test_support::process_state_test_lock();
-        let dir = tempfile::tempdir().unwrap();
-        let config = crate::test_support::test_config(dir.path().join("cache"));
+        let mut lock = crate::test_support::process_state_test_lock();
+        let dir = lock.enter(tempfile::tempdir().unwrap());
+        let config = crate::test_support::test_config(dir.as_path().join("cache"));
         let run = Run {
             store: Store::open(&config).unwrap(),
             config: config.clone(),
             binary_hash: "aaaa".to_string(),
-            environment: environment(&dir.path().join("out"), &dir.path().join("pkg")),
+            environment: environment(&dir.as_path().join("out"), &dir.as_path().join("pkg")),
             start: std::time::Instant::now(),
         };
         let prediction = Prediction {
@@ -2140,10 +2140,9 @@ mod tests {
             default_package: false,
             portable_out_dir: true,
         };
-        let absolute = dir.path().join("include.h");
+        let absolute = dir.as_path().join("include.h");
         std::fs::write(&absolute, "one").unwrap();
-        std::fs::write(dir.path().join("relative.h"), "one").unwrap();
-        std::env::set_current_dir(dir.path()).unwrap();
+        std::fs::write(dir.as_path().join("relative.h"), "one").unwrap();
         // SAFETY: the process-state lock serialises environment edits.
         unsafe { std::env::set_var("DEP_KT_INCLUDE", &absolute) };
         let before = run.action_key(&prediction).unwrap();
@@ -2156,7 +2155,7 @@ mod tests {
 
         unsafe { std::env::set_var("DEP_KT_INCLUDE", "relative.h") };
         let before = run.action_key(&prediction).unwrap();
-        std::fs::write(dir.path().join("relative.h"), "two").unwrap();
+        std::fs::write(dir.as_path().join("relative.h"), "two").unwrap();
         let after = run.action_key(&prediction).unwrap();
         assert_eq!(before, after, "a relative value is only a spelling");
         unsafe { std::env::remove_var("DEP_KT_INCLUDE") };

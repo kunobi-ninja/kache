@@ -15583,6 +15583,10 @@ exit 0
 
     #[test]
     fn a_failed_discovery_backs_off_and_a_success_clears_it() {
+        // Each call re-derives the event root, which can fall back to the
+        // current directory: hold the lock so no other test moves it between
+        // calls and the marker stays the same file.
+        let _lock = crate::test_support::process_state_test_lock();
         let dir = tempfile::TempDir::new().unwrap();
         let mut config = test_config(dir.path().to_path_buf());
         config.remote = Some(crate::config::RemoteConfig::test_s3("bucket", "kache/"));

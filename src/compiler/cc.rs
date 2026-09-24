@@ -14966,12 +14966,11 @@ mod tests {
     /// roots twice leaves one map per root.
     #[test]
     fn out_dir_and_sdk_maps_follow_the_environment_and_the_normalize_switch() {
-        let _lock = crate::test_support::process_state_test_lock();
-        let dir = tempfile::tempdir().unwrap();
-        let out = dir.path().join("target/debug/build/pkg-1/out");
+        let mut lock = crate::test_support::process_state_test_lock();
+        let dir = lock.enter(tempfile::tempdir().unwrap());
+        let out = dir.as_path().join("target/debug/build/pkg-1/out");
         std::fs::create_dir_all(&out).unwrap();
-        std::fs::write(dir.path().join("a.c"), "int a;\n").unwrap();
-        std::env::set_current_dir(dir.path()).unwrap();
+        std::fs::write(dir.as_path().join("a.c"), "int a;\n").unwrap();
         let parsed = CcArgs::parse(&s(&["cc", "-c", "a.c", "-o", "a.o"])).unwrap();
         let has = |maps: &[CcPrefixMap], to: &str| maps.iter().any(|m| m.to == to);
         let saved: Vec<(&str, Option<std::ffi::OsString>)> = [
@@ -15000,7 +14999,7 @@ mod tests {
         let froms: std::collections::HashSet<&str> = maps.iter().map(|m| m.from.as_str()).collect();
         assert_eq!(froms.len(), maps.len(), "one map per root: {maps:?}");
 
-        unsafe { std::env::set_var("SDKROOT", dir.path().join("sdk")) };
+        unsafe { std::env::set_var("SDKROOT", dir.as_path().join("sdk")) };
         assert!(has(&cc_prefix_maps(&parsed, &[]), CC_SDKROOT_SENTINEL));
 
         unsafe { std::env::set_var("OUT_DIR", "") };
@@ -15021,9 +15020,9 @@ mod tests {
         );
 
         let mut twice = Vec::new();
-        push_cargo_out_dir_maps(&mut twice, dir.path(), &out);
+        push_cargo_out_dir_maps(&mut twice, dir.as_path(), &out);
         let once = twice.len();
-        push_cargo_out_dir_maps(&mut twice, dir.path(), &out);
+        push_cargo_out_dir_maps(&mut twice, dir.as_path(), &out);
         assert_eq!(
             twice.len(),
             once,
@@ -15055,10 +15054,9 @@ mod tests {
     /// configured base dirs: a change there recomputes them.
     #[test]
     fn remembered_prefix_maps_follow_the_configured_base_dirs() {
-        let _lock = crate::test_support::process_state_test_lock();
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("a.c"), "int a;\n").unwrap();
-        std::env::set_current_dir(dir.path()).unwrap();
+        let mut lock = crate::test_support::process_state_test_lock();
+        let dir = lock.enter(tempfile::tempdir().unwrap());
+        std::fs::write(dir.as_path().join("a.c"), "int a;\n").unwrap();
         let saved: Vec<(&str, Option<std::ffi::OsString>)> = [
             "OUT_DIR",
             "SDKROOT",

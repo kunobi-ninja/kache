@@ -1,4 +1,6 @@
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use crate::args::RustcArgs;
 use crate::identity;
@@ -8,6 +10,32 @@ struct WorkspaceDiscovery {
     crate_names: Vec<String>,
     workspace_root: Option<PathBuf>,
     lock_path: Option<PathBuf>,
+}
+
+/// How long discovery may spend in `cargo metadata`, across every candidate
+/// manifest. The wrapper that holds the prefetch lock runs discovery before
+/// its own compile, so Cargo waits on it (kunobi-ninja/kache#698).
+const METADATA_BUDGET: Duration = Duration::from_secs(3);
+
+/// The most `cargo metadata --no-deps` output kept. A workspace lists its
+/// own members only, so real output is far smaller; past this the run fails.
+const METADATA_OUTPUT_CAP: usize = 8 << 20;
+
+/// Why workspace discovery produced nothing.
+#[derive(Debug, PartialEq, Eq)]
+enum DiscoveryFailure {
+    /// A `Cargo.lock` was found but lists no packages or cannot be parsed.
+    UnusableLock,
+    /// `cargo` could not be started.
+    Spawn,
+    /// The budget ran out; the child's process group was killed.
+    Timeout,
+    /// `cargo metadata` exited unsuccessfully.
+    Exit,
+    /// The output passed [`METADATA_OUTPUT_CAP`].
+    TooLarge,
+    /// The output was not the expected JSON, or named no packages.
+    Parse,
 }
 
 pub fn discover(args: Option<&RustcArgs>) -> Option<BuildIntent> {
@@ -21,7 +49,19 @@ fn discover_with_context(
     manifest_dir: Option<&Path>,
     cwd: Option<&Path>,
 ) -> Option<BuildIntent> {
-    let discovery = discover_workspace(args, manifest_dir, cwd)?;
+    let discovery = match discover_workspace(
+        OsStr::new("cargo"),
+        Instant::now() + METADATA_BUDGET,
+        args,
+        manifest_dir,
+        cwd,
+    ) {
+        Ok(discovery) => discovery,
+        Err(failure) => {
+            tracing::debug!("build intent: workspace discovery failed: {failure:?}");
+            return None;
+        }
+    };
     let crate_names = discovery.crate_names;
     if crate_names.is_empty() {
         return None;
@@ -85,16 +125,21 @@ fn load_cargo_lock_deps(lock_path: &Path) -> Option<Vec<(String, String)>> {
         .ok()
 }
 
+/// The workspace this compile belongs to: from `Cargo.lock` when one is
+/// found, else from `cargo` (the program named by `cargo`) run against each
+/// candidate manifest in turn, all before `deadline`.
 fn discover_workspace(
+    cargo: &OsStr,
+    deadline: Instant,
     args: Option<&RustcArgs>,
     manifest_dir: Option<&Path>,
     cwd: Option<&Path>,
-) -> Option<WorkspaceDiscovery> {
+) -> Result<WorkspaceDiscovery, DiscoveryFailure> {
     let lock_path = find_lock_path(args, manifest_dir, cwd);
     if let Some(lock_path) = lock_path.as_ref() {
-        let crate_names = crate_names_from_lock(lock_path)?;
+        let crate_names = crate_names_from_lock(lock_path).ok_or(DiscoveryFailure::UnusableLock)?;
         let workspace_root = lock_path.parent().map(Path::to_path_buf);
-        return Some(WorkspaceDiscovery {
+        return Ok(WorkspaceDiscovery {
             crate_names,
             workspace_root,
             lock_path: Some(lock_path.clone()),
@@ -102,12 +147,15 @@ fn discover_workspace(
     }
 
     for manifest_path in candidate_manifest_paths(args, manifest_dir, cwd) {
-        if let Some(discovery) = run_cargo_metadata(Some(&manifest_path)) {
-            return Some(discovery);
+        match run_cargo_metadata(cargo, Some(&manifest_path), deadline) {
+            Ok(discovery) => return Ok(discovery),
+            // The budget is shared: nothing is left for the next candidate.
+            Err(DiscoveryFailure::Timeout) => return Err(DiscoveryFailure::Timeout),
+            Err(_) => {}
         }
     }
 
-    run_cargo_metadata(None)
+    run_cargo_metadata(cargo, None, deadline)
 }
 
 fn crate_names_from_lock(lock_path: &Path) -> Option<Vec<String>> {
@@ -178,12 +226,17 @@ fn candidate_manifest_paths(
     candidates
 }
 
-fn run_cargo_metadata(manifest_path: Option<&Path>) -> Option<WorkspaceDiscovery> {
-    let mut command = std::process::Command::new("cargo");
+fn run_cargo_metadata(
+    cargo: &OsStr,
+    manifest_path: Option<&Path>,
+    deadline: Instant,
+) -> Result<WorkspaceDiscovery, DiscoveryFailure> {
+    let mut command = std::process::Command::new(cargo);
     command
         .args(["metadata", "--format-version", "1", "--no-deps"])
         .env_remove("RUSTC_WRAPPER")
         .env_remove("RUSTC_WORKSPACE_WRAPPER")
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null());
 
@@ -191,13 +244,83 @@ fn run_cargo_metadata(manifest_path: Option<&Path>) -> Option<WorkspaceDiscovery
         command.arg("--manifest-path").arg(path);
     }
 
-    let output = command.output().ok()?;
+    let stdout = run_bounded(command, deadline, METADATA_OUTPUT_CAP)?;
+    parse_metadata_packages(&stdout).ok_or(DiscoveryFailure::Parse)
+}
 
-    if !output.status.success() {
-        return None;
+/// What the two watcher threads of [`run_bounded`] report.
+enum ChildEvent {
+    /// All of stdout, and whether it passed the cap.
+    Output(Vec<u8>, bool),
+    Exit(Option<std::process::ExitStatus>),
+}
+
+/// Whether `more` bytes still fit after `kept` under `cap`.
+fn fits_output_cap(kept: usize, more: usize, cap: usize) -> bool {
+    kept.checked_add(more).is_some_and(|total| total <= cap)
+}
+
+/// Run `command` in its own process group and return its stdout, or kill the
+/// group once `deadline` passes. Stdout is read to the end even past `cap`,
+/// so the child never blocks on a full pipe; only the first `cap` bytes are
+/// kept, and a run that passed it fails.
+fn run_bounded(
+    mut command: std::process::Command,
+    deadline: Instant,
+    cap: usize,
+) -> Result<Vec<u8>, DiscoveryFailure> {
+    use std::io::Read;
+
+    crate::platform::configure_process_group(&mut command);
+    let mut child = command.spawn().map_err(|_| DiscoveryFailure::Spawn)?;
+    let pid = child.id();
+    let Some(mut stdout) = child.stdout.take() else {
+        crate::platform::kill_process_group(pid);
+        let _ = child.wait();
+        return Err(DiscoveryFailure::Spawn);
+    };
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let tx_output = tx.clone();
+    std::thread::spawn(move || {
+        let mut kept = Vec::new();
+        let mut overflowed = false;
+        let mut chunk = [0u8; 8192];
+        loop {
+            match stdout.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) if fits_output_cap(kept.len(), n, cap) => {
+                    kept.extend_from_slice(&chunk[..n]);
+                }
+                Ok(_) => overflowed = true,
+            }
+        }
+        let _ = tx_output.send(ChildEvent::Output(kept, overflowed));
+    });
+    std::thread::spawn(move || {
+        let _ = tx.send(ChildEvent::Exit(child.wait().ok()));
+    });
+
+    let mut output = None;
+    let mut exit = None;
+    while output.is_none() || exit.is_none() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match rx.recv_timeout(remaining) {
+            Ok(ChildEvent::Output(kept, overflowed)) => output = Some((kept, overflowed)),
+            Ok(ChildEvent::Exit(status)) => exit = Some(status),
+            Err(_) => break,
+        }
     }
 
-    parse_metadata_packages(&output.stdout)
+    match (output, exit) {
+        (Some((_, true)), Some(_)) => Err(DiscoveryFailure::TooLarge),
+        (Some((kept, false)), Some(Some(status))) if status.success() => Ok(kept),
+        (Some(_), Some(_)) => Err(DiscoveryFailure::Exit),
+        _ => {
+            crate::platform::kill_process_group(pid);
+            Err(DiscoveryFailure::Timeout)
+        }
+    }
 }
 
 fn parse_metadata_packages(metadata_json: &[u8]) -> Option<WorkspaceDiscovery> {
@@ -457,8 +580,12 @@ mod tests {
     #[test]
     fn cargo_metadata_discovers_a_workspace_without_a_lockfile() {
         let ws = scaffold_workspace();
-        let discovery = run_cargo_metadata(Some(&ws.path().join("Cargo.toml")))
-            .expect("metadata should resolve the workspace");
+        let discovery = run_cargo_metadata(
+            OsStr::new("cargo"),
+            Some(&ws.path().join("Cargo.toml")),
+            Instant::now() + Duration::from_secs(60),
+        )
+        .expect("metadata should resolve the workspace");
         assert!(discovery.crate_names.contains(&"app".to_string()));
         assert!(discovery.crate_names.contains(&"dep".to_string()));
         assert_eq!(discovery.workspace_root.as_deref(), Some(ws.path()));
@@ -497,5 +624,204 @@ mod tests {
             Some("id/abcd/x86_64-unknown-linux-gnu/release")
         );
         assert_eq!(req.client_epoch, 42);
+    }
+
+    #[test]
+    fn output_fits_the_cap_up_to_the_last_byte() {
+        assert!(fits_output_cap(5, 5, 10));
+        assert!(!fits_output_cap(5, 6, 10));
+        assert!(fits_output_cap(0, 0, 0));
+        assert!(!fits_output_cap(usize::MAX, 1, usize::MAX));
+    }
+
+    /// A `cargo` stand-in: a shell script, so these run on Unix only. The
+    /// budget and backoff decisions they exercise are covered on every host
+    /// by the pure-function tests.
+    #[cfg(unix)]
+    fn fake_cargo(dir: &Path, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("fake-cargo");
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    fn soon(millis: u64) -> Instant {
+        Instant::now() + Duration::from_millis(millis)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_hanging_cargo_is_killed_at_the_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("pid");
+        let cargo = fake_cargo(
+            dir.path(),
+            &format!("echo $$ > '{}'\nexec sleep 30", pid_file.display()),
+        );
+
+        let started = Instant::now();
+        // Long enough for the script to start and record its pid: the
+        // first exec of a freshly written file can be slow on macOS.
+        let result = run_cargo_metadata(cargo.as_os_str(), None, soon(2000));
+        assert_eq!(result.err(), Some(DiscoveryFailure::Timeout));
+        assert!(
+            started.elapsed() < Duration::from_secs(6),
+            "{:?}",
+            started.elapsed()
+        );
+
+        // The whole process group is gone, not just abandoned.
+        let pid: i32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let gone = (0..50).any(|_| {
+            // SAFETY: signal 0 only checks that the pid exists.
+            let alive = unsafe { libc::kill(pid, 0) } == 0;
+            if alive {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            !alive
+        });
+        assert!(gone, "fake cargo {pid} outlived its deadline");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_or_garbled_cargo_run_is_reported_not_parsed() {
+        let dir = tempfile::tempdir().unwrap();
+        let failing = fake_cargo(dir.path(), "exit 1");
+        assert_eq!(
+            run_cargo_metadata(failing.as_os_str(), None, soon(10_000)).err(),
+            Some(DiscoveryFailure::Exit)
+        );
+
+        let garbled = tempfile::tempdir().unwrap();
+        let garbled = fake_cargo(garbled.path(), "echo not-json");
+        assert_eq!(
+            run_cargo_metadata(garbled.as_os_str(), None, soon(10_000)).err(),
+            Some(DiscoveryFailure::Parse)
+        );
+
+        let missing = dir.path().join("no-such-cargo");
+        assert_eq!(
+            run_cargo_metadata(missing.as_os_str(), None, soon(10_000)).err(),
+            Some(DiscoveryFailure::Spawn)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_working_cargo_names_the_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let cargo = fake_cargo(
+            dir.path(),
+            r#"echo '{"workspace_root":"/ws","packages":[{"name":"app"},{"name":"dep"}]}'"#,
+        );
+        let discovery = run_cargo_metadata(cargo.as_os_str(), None, soon(10_000)).unwrap();
+        assert_eq!(discovery.crate_names, vec!["app", "dep"]);
+        assert_eq!(discovery.workspace_root.as_deref(), Some(Path::new("/ws")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_past_the_cap_fails_after_draining() {
+        let dir = tempfile::tempdir().unwrap();
+        // Enough to fill a pipe several times: the child must not block.
+        let cargo = fake_cargo(dir.path(), "head -c 300000 /dev/zero");
+        let mut command = std::process::Command::new(&cargo);
+        command.stdout(std::process::Stdio::piped());
+        assert_eq!(
+            run_bounded(command, soon(10_000), 1000).err(),
+            Some(DiscoveryFailure::TooLarge)
+        );
+
+        let mut command = std::process::Command::new(&cargo);
+        command.stdout(std::process::Stdio::piped());
+        assert_eq!(
+            run_bounded(command, soon(10_000), 300_000).unwrap().len(),
+            300_000
+        );
+    }
+
+    /// Two workspaces with a `Cargo.toml` and no lockfile anywhere above.
+    #[cfg(unix)]
+    fn two_manifest_dirs() -> (tempfile::TempDir, tempfile::TempDir) {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        for dir in [&first, &second] {
+            std::fs::write(dir.path().join("Cargo.toml"), "[workspace]\n").unwrap();
+        }
+        (first, second)
+    }
+
+    #[cfg(unix)]
+    fn calls(log: &Path) -> usize {
+        std::fs::read_to_string(log).map_or(0, |log| log.lines().count())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_timeout_ends_discovery_without_trying_other_manifests() {
+        let (first, second) = two_manifest_dirs();
+        let bin = tempfile::tempdir().unwrap();
+        let log = bin.path().join("calls");
+        let cargo = fake_cargo(
+            bin.path(),
+            &format!("echo x >> '{}'\nexec sleep 30", log.display()),
+        );
+
+        let result = discover_workspace(
+            cargo.as_os_str(),
+            soon(2000),
+            None,
+            Some(first.path()),
+            Some(second.path()),
+        );
+        assert_eq!(result.err(), Some(DiscoveryFailure::Timeout));
+        assert_eq!(
+            calls(&log),
+            1,
+            "the shared budget was spent on the first manifest"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn other_failures_try_every_manifest_then_the_bare_command() {
+        let (first, second) = two_manifest_dirs();
+        let bin = tempfile::tempdir().unwrap();
+        let log = bin.path().join("calls");
+        let cargo = fake_cargo(
+            bin.path(),
+            &format!("echo x >> '{}'\nexit 1", log.display()),
+        );
+
+        let result = discover_workspace(
+            cargo.as_os_str(),
+            soon(10_000),
+            None,
+            Some(first.path()),
+            Some(second.path()),
+        );
+        assert_eq!(result.err(), Some(DiscoveryFailure::Exit));
+        assert_eq!(calls(&log), 3);
+    }
+
+    #[test]
+    fn an_unusable_lockfile_is_a_failure_not_a_metadata_run() {
+        let dir = tempfile::tempdir().unwrap();
+        write_lock(dir.path(), &[]);
+        let result = discover_workspace(
+            OsStr::new("no-such-cargo-should-not-run"),
+            Instant::now() + Duration::from_secs(10),
+            None,
+            Some(dir.path()),
+            Some(dir.path()),
+        );
+        assert_eq!(result.err(), Some(DiscoveryFailure::UnusableLock));
     }
 }

@@ -743,6 +743,11 @@ struct RotationMarker {
     prev_len: u64,
     /// Byte length of the retained tail the rotated log was replaced with.
     retained_len: u64,
+    /// The build session this rotation had to cut into because the session
+    /// alone outgrew the retention cap; reports on it are incomplete
+    /// (kunobi-ninja/kache#1209). Absent when the whole session was kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cut_session: Option<String>,
 }
 
 fn rotation_marker_path(log_path: &Path) -> PathBuf {
@@ -958,8 +963,94 @@ impl EventTailer {
     }
 }
 
-/// Rotate the event log if it exceeds the max size.
-/// Keeps the last `keep_lines` lines.
+/// Where a rotated log's retained suffix starts, and the build session it
+/// had to cut into, if any.
+#[derive(Debug, PartialEq, Eq)]
+struct RetainedSuffix {
+    start: usize,
+    cut_session: Option<String>,
+}
+
+/// The most a rotation keeps for the build in progress beyond its usual
+/// `keep_lines`: half the size that triggers rotation. Keeping less than
+/// the trigger means the next writes append instead of rotating again, so a
+/// large build does not reread and rewrite the whole log on every event.
+fn retention_cap(max_size: u64) -> u64 {
+    max_size / 2
+}
+
+/// Choose the suffix of `lines` a rotation keeps (kunobi-ninja/kache#1209).
+///
+/// The usual rule first: the last `keep_lines` lines, trimmed from the
+/// front until they fit in `max_size`. Then, if the newest line's build
+/// session started earlier than that, the suffix reaches back to its first
+/// line, as far as [`retention_cap`] allows, so a report on the build in
+/// progress sees all of it. It is always a suffix: the tailer maps its
+/// cursor onto the rotated file assuming the kept bytes are the old file's
+/// last bytes (#528). When the cap stops it short of the session's start,
+/// the session is named so the report can say it is incomplete.
+fn retained_suffix(lines: &[&str], keep_lines: usize, max_size: u64) -> RetainedSuffix {
+    // `suffix[i]` is the byte length of `lines[i..]`, computed once so both
+    // searches below stay linear in the size of the log.
+    let mut suffix = vec![0u64; lines.len() + 1];
+    for (i, line) in lines.iter().enumerate().rev() {
+        suffix[i] = suffix[i + 1] + line.len() as u64;
+    }
+    let bytes_from = |start: usize| suffix[start];
+    // The last `keep_lines` lines, trimmed from the front to fit; the newest
+    // line stays even when it alone is over the size.
+    let by_count = lines.len().saturating_sub(keep_lines);
+    let newest = lines.len().saturating_sub(1);
+    let mut start = (by_count..newest)
+        .find(|&from| bytes_from(from) <= max_size)
+        .unwrap_or(newest.max(by_count));
+    let session = lines.last().and_then(|line| line_session(line));
+    let session_start = session.as_deref().and_then(|session| {
+        let needle = session_needle(session);
+        lines.iter().position(|line| line.contains(&needle))
+    });
+    if let Some(first) = session_start {
+        // The earliest line from the session's start that keeps the suffix
+        // within the cap; an empty range (session already inside) keeps it.
+        let cap = retention_cap(max_size);
+        start = (first..start)
+            .find(|&from| bytes_from(from) <= cap)
+            .unwrap_or(start);
+    }
+    let cut_session = match (session, session_start) {
+        (Some(session), Some(first)) if first < start => Some(session),
+        _ => None,
+    };
+    RetainedSuffix { start, cut_session }
+}
+
+/// The build session an event log line belongs to, when it names one.
+fn line_session(line: &str) -> Option<String> {
+    #[derive(Deserialize)]
+    struct SessionOnly {
+        #[serde(default)]
+        session_id: String,
+    }
+    let parsed: SessionOnly = serde_json::from_str(line.trim_end()).ok()?;
+    (!parsed.session_id.is_empty()).then_some(parsed.session_id)
+}
+
+/// The exact JSON text of a `session_id` field, for a substring scan that
+/// skips parsing every line of a large log.
+fn session_needle(session: &str) -> String {
+    format!(
+        "\"session_id\":{}",
+        serde_json::to_string(session).unwrap_or_default()
+    )
+}
+
+/// The build session the log's last rotation cut into, if it did.
+pub fn session_cut_by_rotation(event_log_path: &Path) -> Option<String> {
+    read_rotation_marker(event_log_path)?.cut_session
+}
+
+/// Rotate the event log if it exceeds the max size, keeping the build in
+/// progress (see [`retained_suffix`]).
 fn rotate_log_impl(
     log_path: &Path,
     max_size: u64,
@@ -1008,16 +1099,8 @@ fn rotate_log_impl(
         // and must not perturb the offsets of complete records.
         let complete_len = content.rfind('\n').map_or(0, |i| i + 1);
         let lines: Vec<&str> = content[..complete_len].split_inclusive('\n').collect();
-        let keep_from = lines.len().saturating_sub(keep_lines);
-        let mut kept: Vec<&str> = lines[keep_from..].to_vec();
-
-        // Size-cap re-check: trim additional lines from the beginning if total
-        // size still exceeds max_size (line lengths include their newline).
-        let mut total_bytes: u64 = kept.iter().map(|line| line.len() as u64).sum();
-        while total_bytes > max_size && kept.len() > 1 {
-            let removed = kept.remove(0);
-            total_bytes -= removed.len() as u64;
-        }
+        let retained = retained_suffix(&lines, keep_lines, max_size);
+        let kept = &lines[retained.start..];
 
         let output = kept.concat();
         crate::atomic::atomic_replace(log_path, output.as_bytes())
@@ -1036,6 +1119,7 @@ fn rotate_log_impl(
                 + 1,
             prev_len: complete_len as u64,
             retained_len: output.len() as u64,
+            cut_session: retained.cut_session,
         };
         if let Ok(json) = serde_json::to_string(&marker) {
             let _ = crate::atomic::atomic_replace(&rotation_marker_path(log_path), json.as_bytes());
@@ -1054,8 +1138,8 @@ fn rotate_log_impl(
     res
 }
 
-/// Rotate the event log if it exceeds the max size.
-/// Keeps the last `keep_lines` lines.
+/// Rotate the event log if it exceeds the max size, keeping at least the
+/// last `keep_lines` lines and the build session in progress.
 pub fn rotate_if_needed(event_log_path: &Path, max_size: u64, keep_lines: usize) -> Result<()> {
     rotate_log_impl(event_log_path, max_size, keep_lines, "event log")
 }
@@ -2246,6 +2330,147 @@ mod tests {
         rotate_if_needed(&log_path, 1_000_000, 10).unwrap();
         let size_after = fs::metadata(&log_path).unwrap().len();
         assert_eq!(size_before, size_after);
+    }
+
+    /// One event log line in `session`, padded to `bytes`.
+    fn session_line(session: &str, bytes: usize) -> String {
+        let head = format!("{{\"session_id\":\"{session}\",\"pad\":\"");
+        let tail = "\"}\n";
+        let pad = bytes.saturating_sub(head.len() + tail.len());
+        format!("{head}{}{tail}", "x".repeat(pad))
+    }
+
+    #[test]
+    fn rotation_keeps_the_whole_build_in_progress() {
+        // Five lines of an old build, then eight of the current one: more
+        // than `keep_lines` (3), all under the cap.
+        let owned: Vec<String> = (0..5)
+            .map(|_| session_line("old", 50))
+            .chain((0..8).map(|_| session_line("now", 50)))
+            .collect();
+        let lines: Vec<&str> = owned.iter().map(String::as_str).collect();
+        assert_eq!(
+            retained_suffix(&lines, 3, 10_000),
+            RetainedSuffix {
+                start: 5,
+                cut_session: None
+            }
+        );
+        // `keep_lines` still wins when it reaches further back.
+        assert_eq!(retained_suffix(&lines, 10, 10_000).start, 3);
+    }
+
+    #[test]
+    fn a_build_larger_than_the_cap_is_cut_and_named() {
+        let owned: Vec<String> = (0..2)
+            .map(|_| session_line("old", 100))
+            .chain((0..6).map(|_| session_line("now", 100)))
+            .collect();
+        let lines: Vec<&str> = owned.iter().map(String::as_str).collect();
+        // Half of max_size holds four 100-byte lines: two of the build go.
+        assert_eq!(
+            retained_suffix(&lines, 1, 800),
+            RetainedSuffix {
+                start: 4,
+                cut_session: Some("now".to_string())
+            }
+        );
+        // Exactly the whole build fits in half of max_size: nothing is cut.
+        assert_eq!(
+            retained_suffix(&lines, 1, 1200),
+            RetainedSuffix {
+                start: 2,
+                cut_session: None
+            }
+        );
+        // The newest line always stays, even over the cap.
+        assert_eq!(retained_suffix(&lines, 1, 20).start, 7);
+    }
+
+    #[test]
+    fn lines_without_a_session_rotate_by_count() {
+        let lines = ["a\n", "b\n", "c\n", "d\n"];
+        assert_eq!(
+            retained_suffix(&lines, 2, 1_000),
+            RetainedSuffix {
+                start: 2,
+                cut_session: None
+            }
+        );
+        let unnamed = session_line("", 20);
+        assert_eq!(line_session(&unnamed), None);
+        assert_eq!(
+            line_session(&session_line("s1", 40)),
+            Some("s1".to_string())
+        );
+    }
+
+    #[test]
+    fn choosing_what_to_keep_stays_linear_in_the_log() {
+        // A 64 MiB log of short events is about 46,000 lines. Summing the
+        // tail afresh for every candidate start took seconds here.
+        let owned: Vec<String> = (0..50_000)
+            .map(|i| session_line(if i < 25_000 { "old" } else { "now" }, 60))
+            .collect();
+        let lines: Vec<&str> = owned.iter().map(String::as_str).collect();
+        let started = std::time::Instant::now();
+        let kept = retained_suffix(&lines, 10, 60 * 1_000);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(kept.start, 50_000 - 500);
+        assert_eq!(kept.cut_session.as_deref(), Some("now"));
+    }
+
+    #[test]
+    fn rotation_keeps_half_the_size_that_triggers_it() {
+        assert_eq!(retention_cap(64), 32);
+        assert_eq!(retention_cap(65), 32);
+    }
+
+    #[test]
+    fn a_rotated_log_still_holds_every_event_of_the_build_in_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("events.jsonl");
+        let mut event = test_event("old", EventResult::Miss, 100, 80, 1024, "key");
+        event.session_id = "earlier".to_string();
+        for _ in 0..60 {
+            log_event(&log_path, &event).unwrap();
+        }
+        event.session_id = "current".to_string();
+        for _ in 0..30 {
+            log_event(&log_path, &event).unwrap();
+        }
+        let line_len = fs::read_to_string(&log_path)
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap()
+            .len() as u64
+            + 1;
+        // 90 lines against a 64-line trigger; the 30-line build fits in half
+        // of it, and keep_lines is far smaller than the build.
+        rotate_if_needed(&log_path, line_len * 64, 5).unwrap();
+
+        let kept = read_events(&log_path).unwrap();
+        assert_eq!(
+            kept.iter().filter(|e| e.session_id == "current").count(),
+            30
+        );
+        assert!(kept.iter().all(|e| e.session_id == "current"));
+        assert_eq!(session_cut_by_rotation(&log_path), None);
+
+        // A build too large for the cap is cut, and the log says which.
+        for _ in 0..40 {
+            log_event(&log_path, &event).unwrap();
+        }
+        rotate_if_needed(&log_path, line_len * 20, 5).unwrap();
+        assert_eq!(
+            session_cut_by_rotation(&log_path).as_deref(),
+            Some("current")
+        );
     }
 
     #[test]

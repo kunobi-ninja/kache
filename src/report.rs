@@ -1136,7 +1136,7 @@ pub fn generate_report_with_filter(
     };
 
     // Suggestions
-    let suggestions = generate_suggestions(
+    let mut suggestions = generate_suggestions(
         &stats,
         &prefetch,
         &network,
@@ -1145,6 +1145,11 @@ pub fn generate_report_with_filter(
         total_cacheable,
         total_hits,
     );
+    if let Some(cut) = events::session_cut_by_rotation(&config.event_log_path())
+        && build_events.iter().any(|event| event.session_id == cut)
+    {
+        suggestions.insert(0, rotation_cut_notice(config.event_log_max_size));
+    }
 
     // Storage: restore side — how cache-hit restores landed on disk
     // (reflink / hardlink / copy). Store side — content-addressed dedup,
@@ -2158,6 +2163,16 @@ fn build_network_analysis(transfers: &[TransferEvent], top: usize) -> NetworkAna
         unknown_format_downloads,
         slowest_downloads: download_details.into_iter().take(top).collect(),
     }
+}
+
+/// The report covers a build whose early events the event log rotated
+/// away (kunobi-ninja/kache#1209).
+fn rotation_cut_notice(max_size: u64) -> String {
+    format!(
+        "this build outgrew the event log ({}), so its earliest events were rotated away and \
+         the counts above are incomplete; raise [cache] event_log_max_size",
+        bytesize::ByteSize(max_size)
+    )
 }
 
 fn generate_suggestions(
@@ -5465,6 +5480,44 @@ mod tests {
             events::log_event(&config.event_log_path(), &e).unwrap();
         }
         config
+    }
+
+    #[test]
+    fn a_report_says_when_rotation_cut_its_build_short() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = write_test_events(dir.path());
+        let log = config.event_log_path();
+        events::clear_events(&log).unwrap();
+        let mut event = test_event("c", EventResult::LocalHit, 40, 250, 10, "k-c");
+        event.session_id = "big-build".to_string();
+        for _ in 0..40 {
+            events::log_event(&log, &event).unwrap();
+        }
+        let line = std::fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap()
+            .len() as u64
+            + 1;
+        config.event_log_max_size = line * 20;
+        let notice = |config: &Config| {
+            generate_report(config, SinceWindow::DEFAULT, 10)
+                .unwrap()
+                .suggestions
+                .iter()
+                .any(|s| s.contains("outgrew the event log"))
+        };
+        assert!(!notice(&config), "nothing rotated yet");
+
+        events::rotate_if_needed(&log, config.event_log_max_size, 5).unwrap();
+        assert!(notice(&config), "the build lost its earliest events");
+
+        // A later build that fits leaves no notice for itself.
+        events::clear_events(&log).unwrap();
+        event.session_id = "small-build".to_string();
+        events::log_event(&log, &event).unwrap();
+        assert!(!notice(&config), "the cut build is no longer in the report");
     }
 
     #[test]

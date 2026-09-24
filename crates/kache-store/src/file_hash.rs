@@ -282,6 +282,28 @@ impl<'db> FileHashCache<'db> {
         self.prune_input_predictions_at(unix_now())
     }
 
+    /// Delete file hash rows not written for [`FILE_HASH_RETENTION_SECS`].
+    /// Run from the GC sweep and `doctor --repair`, like
+    /// [`Self::prune_input_predictions`]. A lookup never refreshes a row, so
+    /// that the hit path stays read-only; the price is one re-hash a month
+    /// for a file read that whole time without changing.
+    pub fn prune_file_hashes(&self) -> rusqlite::Result<usize> {
+        self.prune_file_hashes_at(unix_now())
+    }
+
+    fn prune_file_hashes_at(&self, now: i64) -> rusqlite::Result<usize> {
+        // Built here, not when a wrapper opens the index, for the reason
+        // given in `prune_input_predictions_at`.
+        self.db().execute_batch(
+            "CREATE INDEX IF NOT EXISTS file_hashes_updated_at
+             ON file_hashes(updated_at)",
+        )?;
+        self.db().execute(
+            "DELETE FROM file_hashes WHERE updated_at < datetime(?1, 'unixepoch')",
+            params![now.saturating_sub(FILE_HASH_RETENTION_SECS)],
+        )
+    }
+
     fn prune_input_predictions_at(&self, now: i64) -> rusqlite::Result<usize> {
         // Built here, not when a wrapper upgrades the table: indexing a large
         // table takes the write lock for seconds, and this runs off the build.
@@ -295,6 +317,13 @@ impl<'db> FileHashCache<'db> {
         )
     }
 }
+
+/// How long a file hash row is kept after it was last written. The memo is
+/// only a saving: a row pruned while its file is still in use costs one
+/// re-read of that file, at most once per retention window. Without a bound
+/// the table kept every path any build ever hashed, so worktrees and
+/// checkouts deleted long ago stayed in it for good (kunobi-ninja/kache#1206).
+pub const FILE_HASH_RETENTION_SECS: i64 = 30 * 86_400;
 
 /// A prediction hit refreshes `last_used` only when the stamp is this old.
 pub const INPUT_PREDICTION_TOUCH_INTERVAL_SECS: i64 = 86_400;
@@ -581,6 +610,47 @@ impl FileHashCache<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_hash_rows_are_pruned_a_month_after_they_were_written() {
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        ensure_file_hash_cache_schema(&db).unwrap();
+        let cache = FileHashCache::Borrowed(&db);
+        // November 2023: the rows are years old by the real clock.
+        let now = 1_700_000_000_i64;
+        for (path, age) in [
+            ("/kept", FILE_HASH_RETENTION_SECS - 60),
+            ("/boundary", FILE_HASH_RETENTION_SECS),
+            ("/old", FILE_HASH_RETENTION_SECS + 60),
+        ] {
+            db.execute(
+                "INSERT INTO file_hashes (path, size, mtime_ns, hash, updated_at)
+                 VALUES (?1, 1, 1, 'h', datetime(?2, 'unixepoch'))",
+                rusqlite::params![path, now - age],
+            )
+            .unwrap();
+        }
+        assert_eq!(cache.prune_file_hashes_at(now).unwrap(), 1);
+        let mut left: Vec<String> = db
+            .prepare("SELECT path FROM file_hashes ORDER BY path")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            ["/boundary", "/kept"],
+            "a row exactly a month old stays"
+        );
+        // A write refreshes the row: `put` stamps it now.
+        assert_eq!(
+            cache.prune_file_hashes().unwrap(),
+            2,
+            "real clock: both are years old"
+        );
+    }
 
     fn stamp(path: &str, mtime_ns: i64, ctime_ns: i64) -> FileFingerprint {
         FileFingerprint {

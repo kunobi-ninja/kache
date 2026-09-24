@@ -56,6 +56,9 @@ pub struct GcStatsPersisted {
     /// Input predictions deleted as unused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub predictions_pruned: Option<usize>,
+    /// File hash memo rows deleted as not written for a month.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_hashes_pruned: Option<usize>,
 }
 
 pub(crate) const GC_STATS_FILE: &str = "gc_stats.json";
@@ -119,6 +122,8 @@ pub struct GcRunRecord {
     pub key_locks_remaining: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub predictions_pruned: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_hashes_pruned: Option<usize>,
 }
 
 impl GcRunRecord {
@@ -143,6 +148,7 @@ impl GcRunRecord {
             key_locks_removed: stats.housekeeping.map(|h| h.key_locks_removed),
             key_locks_remaining: stats.housekeeping.map(|h| h.key_locks_remaining),
             predictions_pruned: stats.housekeeping.map(|h| h.predictions_pruned),
+            file_hashes_pruned: stats.housekeeping.map(|h| h.file_hashes_pruned),
         }
     }
 }
@@ -194,6 +200,7 @@ pub(crate) fn write_last_gc_run(
         key_locks_removed: stats.housekeeping.map(|h| h.key_locks_removed),
         key_locks_remaining: stats.housekeeping.map(|h| h.key_locks_remaining),
         predictions_pruned: stats.housekeeping.map(|h| h.predictions_pruned),
+        file_hashes_pruned: stats.housekeeping.map(|h| h.file_hashes_pruned),
     };
     let json = serde_json::to_string_pretty(&persisted)?;
     kache_store::atomic::atomic_replace(&cache_dir.join(GC_STATS_FILE), json.as_bytes())
@@ -3976,6 +3983,7 @@ mod tests {
                 key_locks_removed: 6,
                 key_locks_remaining: 7,
                 predictions_pruned: 8,
+                file_hashes_pruned: 9,
             }),
             ..Default::default()
         };
@@ -4020,6 +4028,7 @@ mod tests {
                 key_locks_removed: Some(6),
                 key_locks_remaining: Some(7),
                 predictions_pruned: Some(8),
+                file_hashes_pruned: Some(9),
             }
         );
         assert_eq!(records[1].source, "manual");
@@ -4085,6 +4094,7 @@ mod tests {
                 key_locks_removed: 20,
                 key_locks_remaining: 30,
                 predictions_pruned: 40,
+                file_hashes_pruned: 50,
             }),
             ..Default::default()
         };
@@ -4094,9 +4104,10 @@ mod tests {
             (
                 without.key_locks_removed,
                 without.key_locks_remaining,
-                without.predictions_pruned
+                without.predictions_pruned,
+                without.file_hashes_pruned
             ),
-            (None, None, None)
+            (None, None, None, None)
         );
         write_last_gc_run(dir.path(), "auto", &second).unwrap();
 
@@ -4120,9 +4131,10 @@ mod tests {
             (
                 stats.key_locks_removed,
                 stats.key_locks_remaining,
-                stats.predictions_pruned
+                stats.predictions_pruned,
+                stats.file_hashes_pruned
             ),
-            (Some(20), Some(30), Some(40))
+            (Some(20), Some(30), Some(40), Some(50))
         );
         let raw: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(dir.path().join(GC_STATS_FILE)).unwrap())

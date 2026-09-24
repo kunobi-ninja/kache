@@ -582,6 +582,11 @@ fn gc_metrics(gc: &crate::report::GcStatsPersisted, now: &str) -> Vec<Value> {
             "{row}",
             gc.predictions_pruned,
         ),
+        (
+            "kache.cache.gc.last_run.file_hashes_pruned",
+            "{row}",
+            gc.file_hashes_pruned,
+        ),
     ] {
         if let Some(value) = value {
             metrics.push(gauge(name, unit, vec![as_int(value as u64, now, &[])]));
@@ -920,6 +925,7 @@ mod tests {
         gc.key_locks_removed = Some(20_000);
         gc.key_locks_remaining = Some(64_496);
         gc.predictions_pruned = Some(0);
+        gc.file_hashes_pruned = Some(1_234);
         let body = with_machine(&machine);
         let got: Vec<(String, String, String)> =
             body["resourceMetrics"][0]["scopeMetrics"][0]["metrics"]
@@ -928,7 +934,7 @@ mod tests {
                 .iter()
                 .filter(|m| {
                     let name = m["name"].as_str().unwrap();
-                    name.contains("key_locks") || name.contains("predictions_pruned")
+                    name.contains("key_locks") || name.contains("_pruned")
                 })
                 .map(|m| {
                     (
@@ -953,6 +959,11 @@ mod tests {
                 "64496",
             ),
             ("kache.cache.gc.last_run.predictions_pruned", "{row}", "0"),
+            (
+                "kache.cache.gc.last_run.file_hashes_pruned",
+                "{row}",
+                "1234",
+            ),
         ]
         .into_iter()
         .map(|(name, unit, value)| (name.to_string(), unit.to_string(), value.to_string()))

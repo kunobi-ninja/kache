@@ -6926,6 +6926,7 @@ impl Daemon {
             key_locks_removed = housekeeping.key_locks_removed,
             key_locks_remaining = housekeeping.key_locks_remaining,
             predictions_pruned = housekeeping.predictions_pruned,
+            file_hashes_pruned = housekeeping.file_hashes_pruned,
             "gc: housekeeping"
         );
 
@@ -12131,6 +12132,7 @@ mod tests {
                 key_locks_removed: 2,
                 key_locks_remaining: 1,
                 predictions_pruned: 0,
+                file_hashes_pruned: 0,
             })
         );
         assert!(!lock_path(1).exists());
@@ -12140,6 +12142,7 @@ mod tests {
         assert_eq!(recorded.key_locks_removed, Some(2));
         assert_eq!(recorded.key_locks_remaining, Some(1));
         assert_eq!(recorded.predictions_pruned, Some(0));
+        assert_eq!(recorded.file_hashes_pruned, Some(0));
     }
 
     /// kunobi-ninja/kache#711: automatic GC applies configured age retention

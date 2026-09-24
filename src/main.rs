@@ -44,6 +44,7 @@ mod planner_auth;
 mod planner_client;
 mod platform;
 mod policy;
+mod prediction_share;
 mod probe;
 mod probe_memo;
 mod remote;

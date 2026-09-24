@@ -153,6 +153,17 @@ impl Client {
     ///   naming the exact command, instead of burning the job's whole budget
     ///   and reporting only "timed out".
     fn run_within_at(&self, cwd: Option<&Path>, args: &[&str], deadline: Duration) -> Output {
+        self.run_within_at_env(cwd, args, &[], deadline)
+    }
+
+    /// [`Self::run_within_at`] with extra environment variables.
+    fn run_within_at_env(
+        &self,
+        cwd: Option<&Path>,
+        args: &[&str],
+        envs: &[(&str, &Path)],
+        deadline: Duration,
+    ) -> Output {
         // Counter, not the args: an argv carries paths and slashes, which do
         // not belong in a file name.
         let seq = self.command_seq.fetch_add(1, Ordering::Relaxed);
@@ -165,6 +176,7 @@ impl Client {
         if let Some(cwd) = cwd {
             command.current_dir(cwd);
         }
+        command.envs(envs.iter().copied());
         let mut child = command
             .args(args)
             .stdin(std::process::Stdio::null())
@@ -268,6 +280,56 @@ impl Client {
                 &out_dir,
                 "lib.rs",
             ],
+            Duration::from_secs(90),
+        );
+        assert!(
+            output.status.success(),
+            "kache rustc failed.\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    /// Compile the member `kt` of the workspace at `checkout` the way Cargo
+    /// does: from the workspace root, with a relative crate root and a target
+    /// directory inside the workspace (kunobi-ninja/kache#1011).
+    fn compile_workspace_member(&self, checkout: &Path) {
+        self.compile_unit(
+            checkout,
+            "kt/src/lib.rs",
+            &checkout.join("target"),
+            &checkout.join("kt"),
+        );
+    }
+
+    /// Compile the crate `kt` rooted at `source`, from `cwd`, into `target`,
+    /// as the package at `manifest_dir`.
+    fn compile_unit(&self, cwd: &Path, source: &str, target: &Path, manifest_dir: &Path) {
+        let deps = target.join("debug/deps");
+        std::fs::create_dir_all(&deps).unwrap();
+        let out_dir = deps.display().to_string();
+        let search = format!("dependency={out_dir}");
+        let rustc = rustc_path();
+        let output = self.run_within_at_env(
+            Some(cwd),
+            &[
+                &rustc,
+                "--crate-name",
+                "kt",
+                "--edition=2021",
+                source,
+                "--crate-type",
+                "lib",
+                "--emit=dep-info,metadata,link",
+                "-C",
+                "metadata=fedcba9876543210",
+                "-C",
+                "extra-filename=-fedcba9876543210",
+                "--out-dir",
+                &out_dir,
+                "-L",
+                &search,
+            ],
+            &[("CARGO_MANIFEST_DIR", manifest_dir)],
             Duration::from_secs(90),
         );
         assert!(
@@ -1150,5 +1212,155 @@ fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) {
         } else {
             out.push(path);
         }
+    }
+}
+
+/// A checkout of a one-member workspace whose member reads a file elsewhere
+/// in the workspace.
+fn workspace_checkout(root: &Path, name: &str) -> PathBuf {
+    let checkout = root.join(name);
+    for (path, content) in [
+        ("Cargo.toml", "[workspace]\nmembers = [\"kt\"]\n"),
+        ("kt/Cargo.toml", "[package]\nname = \"kt\"\n"),
+        (
+            "kt/src/lib.rs",
+            "pub const SHARED: &str = include_str!(\"../../assets/shared.txt\");\n",
+        ),
+        ("assets/shared.txt", "shared\n"),
+    ] {
+        let path = checkout.join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, content).unwrap();
+    }
+    checkout
+}
+
+/// The prediction rows on the shared folder.
+fn remote_prediction_rows(shared: &Path) -> Vec<PathBuf> {
+    let directory = shared.join("artifacts/v3/predictions");
+    std::fs::read_dir(directory)
+        .map(|entries| entries.flatten().map(|entry| entry.path()).collect())
+        .unwrap_or_default()
+}
+
+/// Wait until `shared` holds at least `count` prediction rows.
+fn wait_for_prediction_rows(shared: &Path, count: usize) {
+    let deadline = Instant::now() + Duration::from_secs(45);
+    while remote_prediction_rows(shared).len() < count {
+        assert!(
+            Instant::now() < deadline,
+            "the prediction rows never arrived"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// A registry package's shared row names its sources under the Cargo home, so
+/// a fresh client whose Cargo home has the same path, as a CI runner built
+/// from the same image does, uses it from the remote.
+#[test]
+fn a_fresh_client_uses_the_remote_row_of_a_registry_unit() {
+    build_kache();
+    let shared = TempDir::new().unwrap();
+    let home = TempDir::new().unwrap();
+    let package = home.path().join("registry/src/index-test/kt-1.0.0");
+    std::fs::create_dir_all(package.join("src")).unwrap();
+    std::fs::write(package.join("Cargo.toml"), "[package]\nname = \"kt\"\n").unwrap();
+    std::fs::write(
+        package.join("src/lib.rs"),
+        "#![doc = include_str!(\"../README.md\")]\npub fn f() {}\n",
+    )
+    .unwrap();
+    std::fs::write(package.join("README.md"), "Docs.\n").unwrap();
+    let source = package.join("src/lib.rs").display().to_string();
+    let targets = TempDir::new().unwrap();
+
+    let alpha = Client::with_predictions(shared.path());
+    alpha.start_daemon();
+    alpha.compile_unit(&package, &source, &targets.path().join("a"), &package);
+    let cold = crate_event(&alpha.report_with_event("kt"), "kt").clone();
+    assert_eq!(cold["result"], "miss", "{cold}");
+    let cache_key = cold["cache_key"].as_str().unwrap().to_owned();
+    wait_for_remote_entry(shared.path(), "kt", &cache_key);
+    wait_for_prediction_rows(shared.path(), 1);
+    alpha.stop_daemon_and_wait();
+    let home_path = home.path().display().to_string();
+    for row in remote_prediction_rows(shared.path()) {
+        let bytes = std::fs::read_to_string(&row).unwrap();
+        assert!(
+            !bytes.contains(&home_path),
+            "a published row names no local path: {bytes}"
+        );
+    }
+
+    let beta = Client::with_predictions(shared.path());
+    beta.start_daemon();
+    beta.compile_unit(&package, &source, &targets.path().join("b"), &package);
+    let event = crate_event(&beta.report(), "kt").clone();
+    assert_eq!(event["cache_key"], cache_key.as_str(), "{event}");
+    assert_eq!(event["dep_info_runs"], 0, "{event}");
+}
+
+/// Build the member in checkout A on client alpha, wait until both its entry
+/// and its prediction row are on the remote, let `tamper` edit the row, and
+/// return client beta's event for a first build of checkout B on an empty
+/// cache (kunobi-ninja/kache#1011).
+fn fresh_client_builds_after_a_published_row(tamper: impl FnOnce(&Path)) -> serde_json::Value {
+    build_kache();
+    let shared = TempDir::new().unwrap();
+    let checkouts = TempDir::new().unwrap();
+    let a = workspace_checkout(checkouts.path(), "a");
+    let b = workspace_checkout(checkouts.path(), "b");
+
+    let alpha = Client::with_predictions(shared.path());
+    alpha.start_daemon();
+    alpha.compile_workspace_member(&a);
+    let cold = crate_event(&alpha.report_with_event("kt"), "kt").clone();
+    assert_eq!(cold["result"], "miss", "{cold}");
+    let cache_key = cold["cache_key"].as_str().unwrap().to_owned();
+    wait_for_remote_entry(shared.path(), "kt", &cache_key);
+    wait_for_prediction_rows(shared.path(), 1);
+    alpha.stop_daemon_and_wait();
+    let rows = remote_prediction_rows(shared.path());
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    tamper(&rows[0]);
+
+    let beta = Client::with_predictions(shared.path());
+    beta.start_daemon();
+    beta.compile_workspace_member(&b);
+    let event = crate_event(&beta.report(), "kt").clone();
+    assert_eq!(event["cache_key"], cache_key.as_str(), "{event}");
+    assert!(
+        event["result"] == "remote_hit" || event["result"] == "prefetch_hit",
+        "the remote must serve it: {event}"
+    );
+    event
+}
+
+#[test]
+fn a_fresh_client_uses_the_remote_prediction_row_instead_of_the_pre_pass() {
+    let event = fresh_client_builds_after_a_published_row(|_| {});
+    assert_eq!(event["dep_info_runs"], 0, "{event}");
+}
+
+#[test]
+fn a_tampered_prediction_row_is_ignored() {
+    for tamper in [
+        |row: &Path| std::fs::write(row, b"{ not json").unwrap(),
+        |row: &Path| {
+            let mut shared: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(row).unwrap()).unwrap();
+            shared["identity"] = "shared-workspace-v1:someone-else".into();
+            std::fs::write(row, serde_json::to_vec(&shared).unwrap()).unwrap();
+        },
+        |row: &Path| {
+            let mut shared: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(row).unwrap()).unwrap();
+            shared["row"]["tree"] = "a guard nobody computed".into();
+            std::fs::write(row, serde_json::to_vec(&shared).unwrap()).unwrap();
+        },
+    ] {
+        let event = fresh_client_builds_after_a_published_row(tamper);
+        assert_eq!(event["dep_info_runs"], 1, "the pre-pass runs: {event}");
     }
 }

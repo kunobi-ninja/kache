@@ -512,6 +512,54 @@ pub(crate) fn manages_instance(config: &crate::config::Config) -> Result<bool> {
     )
 }
 
+/// Where a daemon started for this instance writes the error that stops it
+/// from starting (kunobi-ninja/kache#1218). The tracing log is opened only
+/// once the daemon is up, so it never holds that error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StartupLog {
+    File(PathBuf),
+    /// The systemd journal of the user unit.
+    Journal,
+    /// The Task Scheduler task runs headless and keeps no stderr.
+    Discarded,
+}
+
+impl std::fmt::Display for StartupLog {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::File(path) => write!(f, "{}", path.display()),
+            Self::Journal => write!(f, "journalctl --user -u {UNIT_NAME}"),
+            Self::Discarded => write!(
+                f,
+                "not kept by the scheduled task; run `kache daemon run` to see it"
+            ),
+        }
+    }
+}
+
+pub(crate) fn startup_log(config: &crate::config::Config) -> StartupLog {
+    startup_log_for(
+        manages_instance(config).unwrap_or(false),
+        config.socket_path().with_extension("log"),
+    )
+}
+
+/// The installed service starts a daemon it manages, with its own stderr;
+/// anything else starts it through `daemon start` or auto-start, which send
+/// stderr to `runtime_log`.
+fn startup_log_for(managed: bool, runtime_log: PathBuf) -> StartupLog {
+    if !managed {
+        return StartupLog::File(runtime_log);
+    }
+    if cfg!(target_os = "macos") {
+        StartupLog::File(log_dir().join("err.log"))
+    } else if cfg!(windows) {
+        StartupLog::Discarded
+    } else {
+        StartupLog::Journal
+    }
+}
+
 fn configured_instance_matches(
     requested_socket: &Path,
     mut store: PathBuf,
@@ -878,6 +926,7 @@ pub fn status(json: bool) -> Result<()> {
             daemon_version: Option<String>,
             daemon_epoch: Option<u64>,
             daemon_config_path: Option<String>,
+            startup_log: Option<String>,
             service_executable_mismatch: bool,
         }
         return crate::machine::emit(
@@ -899,6 +948,7 @@ pub fn status(json: bool) -> Result<()> {
                     .as_ref()
                     .and_then(|stats| stats.effective_config.as_ref())
                     .map(|config| config.config_path.clone()),
+                startup_log: config.as_ref().map(|cfg| startup_log(cfg).to_string()),
                 service_executable_mismatch: exe_mismatch.is_some(),
             },
             if running {
@@ -931,6 +981,12 @@ pub fn status(json: bool) -> Result<()> {
         println!("  Logs:     {}", log_dir().join("err.log").display());
     } else if cfg!(target_os = "linux") {
         println!("  Logs:     journalctl --user -u {UNIT_NAME}");
+    }
+    if let Some(ref cfg) = config {
+        println!(
+            "  Startup:  {} (why a daemon failed to start)",
+            startup_log(cfg)
+        );
     }
 
     // 5. Daemon version check
@@ -1150,6 +1206,36 @@ mod tests {
         } else if cfg!(target_os = "linux") {
             fs::write(path, format!("ExecStart={} daemon run\n", exe.display())).unwrap();
         }
+    }
+
+    #[test]
+    fn a_startup_failure_is_looked_for_where_the_starter_sent_stderr() {
+        let runtime_log = PathBuf::from("/run/kache/daemon.log");
+        assert_eq!(
+            startup_log_for(false, runtime_log.clone()),
+            StartupLog::File(runtime_log.clone())
+        );
+        let managed = startup_log_for(true, runtime_log.clone());
+        if cfg!(target_os = "macos") {
+            assert_eq!(managed, StartupLog::File(log_dir().join("err.log")));
+        } else if cfg!(windows) {
+            assert_eq!(managed, StartupLog::Discarded);
+        } else {
+            assert_eq!(managed, StartupLog::Journal);
+        }
+        assert_eq!(
+            StartupLog::File(runtime_log.clone()).to_string(),
+            runtime_log.display().to_string()
+        );
+        assert_eq!(
+            StartupLog::Journal.to_string(),
+            "journalctl --user -u kache.service"
+        );
+        assert!(
+            StartupLog::Discarded
+                .to_string()
+                .contains("kache daemon run")
+        );
     }
 
     #[cfg(unix)]

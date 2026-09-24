@@ -80,6 +80,12 @@ fn absolutize_volume_path(path: &Path) -> PathBuf {
         .unwrap_or_else(|_| path.to_path_buf())
 }
 
+/// Default `[cache] event_log_max_size`. Rotation keeps the build in
+/// progress up to half of this, which covers about 1,700 events of the
+/// largest events seen (about 19 KB each, in a substrate build) and over
+/// 20,000 of the usual 1.4 KB (kunobi-ninja/kache#1209).
+pub(crate) const DEFAULT_EVENT_LOG_MAX_SIZE: u64 = 64 * 1024 * 1024;
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub cache_dir: PathBuf,
@@ -1468,7 +1474,7 @@ impl Config {
             .and_then(|c| c.cache.as_ref())
             .and_then(|c| c.event_log_max_size.as_ref())
             .and_then(|s| parse_size_checked(s, "[cache] event_log_max_size"))
-            .unwrap_or(10 * 1024 * 1024); // 10 MiB
+            .unwrap_or(DEFAULT_EVENT_LOG_MAX_SIZE);
 
         let event_log_keep_lines = file_config
             .as_ref()

@@ -404,7 +404,7 @@ fn build_fields(file_config: &FileConfig, env: &EnvOverrides) -> Vec<FormField> 
                 .unwrap_or_default(),
             env_var: "",
             env_value: None,
-            default_hint: "(default: 10MiB)",
+            default_hint: "(default: 64MiB)",
             validation_error: None,
             env_locked: false,
         },

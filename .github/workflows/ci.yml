@@ -1125,6 +1125,22 @@ jobs:
             attempt=$((attempt + 1))
             sleep 15
           done
+      - name: Diagnose #686 (Windows relocate fingerprints, do not merge)
+        # Temporary: runs the one fixture whose relocate-noop phase
+        # re-dispatches on Windows, with cargo's fingerprint log on, and keeps
+        # the log with the e2e artifact. Never fails the job.
+        if: env.RUN_E2E == 'true' && runner.os == 'Windows' && (always() && hashFiles(format('target/release/kache-scenario{0}', matrix.exe_suffix)) != '')
+        continue-on-error: true
+        env:
+          CARGO_LOG: cargo::core::compiler::fingerprint=debug
+        run: |
+          mkdir -p tmp/e2e
+          ./target/release/kache-scenario${{ matrix.exe_suffix }} \
+            --kache ./target/release/kache${{ matrix.exe_suffix }} \
+            --scenarios ./scenarios \
+            --select name:e2e-multi-dep \
+            --out tmp/e2e/diagnose-686.json > tmp/e2e/diagnose-686.log 2>&1 || true
+          grep -nE "dirty|stale|fingerprint (error|mismatch)|MissingFile|StaleItem|StaleDep" tmp/e2e/diagnose-686.log | head -200 || true
       - name: Run e2e negative-control (falsifiability check)
         # Reruns every fixture with kache disabled (KACHE_DISABLED=1)
         # and asserts each non-exempt result FLIPS to a failure — a

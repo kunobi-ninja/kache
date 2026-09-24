@@ -66,6 +66,10 @@ logLevel: "kache_service=info"
 service:
   type: ClusterIP
   port: 8080
+  # Protocol an Ingress uses to reach the pod. Build sessions are one HTTP/2
+  # stream per build, so behind an Ingress set `kubernetes.io/h2c`; the
+  # service speaks HTTP/1.1 and HTTP/2 on the same port.
+  appProtocol: ""
   annotations: {}
 
 # Expose the service through an Ingress. Set `host` when enabled. Add

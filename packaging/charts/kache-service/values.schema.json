@@ -141,11 +141,14 @@
           "minimum": 1,
           "maximum": 65535
         },
+        "appProtocol": {
+          "type": "string"
+        },
         "annotations": {
           "type": "object"
         }
       },
-      "required": ["type", "port", "annotations"]
+      "required": ["type", "port", "appProtocol", "annotations"]
     },
     "ingress": {
       "type": "object",

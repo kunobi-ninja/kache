@@ -836,18 +836,14 @@ pub(crate) mod tests {
         }
         let dir = tempfile::tempdir().unwrap();
         let dir = dir.path().canonicalize().unwrap();
-        let binary = compile_debug_c_binary(&dir).expect("macOS C compiler must work");
+        let Some(binary) = compile_debug_c_binary(&dir) else {
+            return;
+        };
         // Relink with the same OSO prefix kache injects for Rust executables.
-        assert!(
-            Command::new("cc")
-                .arg(dir.join("hello.o"))
-                .arg(format!("-Wl,-oso_prefix,{}/", dir.display()))
-                .arg("-o")
-                .arg(&binary)
-                .status()
-                .unwrap()
-                .success()
-        );
+        let prefix = format!("-Wl,-oso_prefix,{}/", dir.display());
+        if relink_c_binary(&dir.join("hello.o"), &prefix, &binary).is_none() {
+            return;
+        }
         let staging = tempfile::tempdir().unwrap();
         MacOsPlatform
             .package_debug_bundle(&binary, staging.path())
@@ -891,17 +887,13 @@ pub(crate) mod tests {
         let profile = dir.path().canonicalize().unwrap().join("debug");
         let deps = profile.join("deps");
         std::fs::create_dir_all(&deps).unwrap();
-        let binary = compile_debug_c_binary(&deps).expect("macOS C compiler must work");
-        assert!(
-            Command::new("cc")
-                .arg(deps.join("hello.o"))
-                .arg(format!("-Wl,-oso_prefix,{}/", profile.display()))
-                .arg("-o")
-                .arg(&binary)
-                .status()
-                .unwrap()
-                .success()
-        );
+        let Some(binary) = compile_debug_c_binary(&deps) else {
+            return;
+        };
+        let prefix = format!("-Wl,-oso_prefix,{}/", profile.display());
+        if relink_c_binary(&deps.join("hello.o"), &prefix, &binary).is_none() {
+            return;
+        }
         let bundle = deps.join("hello-bin.dSYM");
         let output = debug_bundle_command(&binary, &bundle)
             .unwrap()
@@ -921,13 +913,12 @@ pub(crate) mod tests {
         assert!(String::from_utf8_lossy(&dump.stdout).contains("DW_TAG_subprogram"));
     }
 
-    /// Compile a tiny real `-g` binary with the system `cc` (fast: three
-    /// lines of C) so the macOS leg exercises real `dsymutil` output.
-    /// Returns None when the host can't run this leg (non-macOS, no cc).
+    /// Compile a tiny real `-g` binary with the host's C compiler (fast:
+    /// three lines of C) so the macOS leg exercises real `dsymutil` output.
+    /// Returns None when the host can't run this leg: not macOS, or the
+    /// compiler would not start or failed (see [`host_tool_unavailable`]).
     fn compile_debug_c_binary(dir: &Path) -> Option<std::path::PathBuf> {
-        if std::env::consts::OS != "macos" {
-            return None;
-        }
+        let cc = host_c_compiler()?;
         let source = dir.join("hello.c");
         std::fs::write(
             &source,
@@ -940,23 +931,108 @@ pub(crate) mod tests {
         // `cc -g` deletes its temp `.o`, leaving dsymutil nothing to bake.
         let object = dir.join("hello.o");
         let binary = dir.join("hello-bin");
-        let compile = Command::new("cc")
-            .args(["-g", "-c"])
-            .arg(&source)
-            .arg("-o")
-            .arg(&object)
-            .status()
-            .ok()?;
-        if !compile.success() {
-            return None;
+        let compiled = run_host_tool(|| {
+            let mut command = Command::new(cc);
+            command
+                .args(["-g", "-c"])
+                .arg(&source)
+                .arg("-o")
+                .arg(&object);
+            command
+        });
+        if let Err(error) = compiled {
+            return host_tool_unavailable("compiling hello.c", &error);
         }
-        let link = Command::new("cc")
-            .arg(&object)
-            .arg("-o")
-            .arg(&binary)
-            .status()
-            .ok()?;
-        link.success().then_some(binary)
+        relink_c_binary(&object, "", &binary)
+    }
+
+    /// Link `object` into `binary` with the host's C compiler, adding
+    /// `extra` (such as an `-oso_prefix`) when it is not empty.
+    fn relink_c_binary(object: &Path, extra: &str, binary: &Path) -> Option<std::path::PathBuf> {
+        let cc = host_c_compiler()?;
+        let linked = run_host_tool(|| {
+            let mut command = Command::new(cc);
+            command.arg(object);
+            if !extra.is_empty() {
+                command.arg(extra);
+            }
+            command.arg("-o").arg(binary);
+            command
+        });
+        match linked {
+            Ok(_) => Some(binary.to_path_buf()),
+            Err(error) => host_tool_unavailable("linking hello-bin", &error),
+        }
+    }
+
+    /// The host's real C compiler, found once per test process through
+    /// `xcrun`. Resolving it that way keeps a `cc` shim on `PATH` (a kache
+    /// install, mise) out of these tests, and asks `xcrun` once instead of
+    /// on every compile (kunobi-ninja/kache#1208). None off macOS.
+    fn host_c_compiler() -> Option<&'static Path> {
+        static COMPILER: std::sync::OnceLock<Option<std::path::PathBuf>> =
+            std::sync::OnceLock::new();
+        COMPILER
+            .get_or_init(|| {
+                if std::env::consts::OS != "macos" {
+                    return None;
+                }
+                let found = run_host_tool(|| {
+                    let mut command = Command::new("xcrun");
+                    command.args(["--find", "clang"]);
+                    command
+                });
+                match found {
+                    Ok(output) => {
+                        let path = std::path::PathBuf::from(
+                            String::from_utf8_lossy(&output.stdout).trim(),
+                        );
+                        path.is_file().then_some(path)
+                    }
+                    Err(error) => host_tool_unavailable("xcrun --find clang", &error),
+                }
+            })
+            .as_deref()
+    }
+
+    /// How many times a host tool is started before giving up. A full
+    /// parallel `cargo test` run on macOS sometimes fails to start or run
+    /// the toolchain once, then succeeds (kunobi-ninja/kache#1208).
+    const HOST_TOOL_ATTEMPTS: u32 = 3;
+
+    /// Run the command `make` builds until it succeeds or
+    /// [`HOST_TOOL_ATTEMPTS`] runs out. The error names the last failure,
+    /// with the tool's stderr.
+    fn run_host_tool(mut make: impl FnMut() -> Command) -> Result<std::process::Output, String> {
+        let mut last = String::new();
+        for attempt in 0..HOST_TOOL_ATTEMPTS {
+            if attempt > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(250 << attempt));
+            }
+            match make().output() {
+                Ok(output) if output.status.success() => return Ok(output),
+                Ok(output) => {
+                    last = format!(
+                        "{}: {}",
+                        output.status,
+                        String::from_utf8_lossy(&output.stderr).trim()
+                    )
+                }
+                Err(error) => last = error.to_string(),
+            }
+        }
+        Err(last)
+    }
+
+    /// A host tool these tests need did not work. Locally that skips the
+    /// test; in CI (`CI` set) it fails, so the macOS lane keeps real
+    /// coverage instead of passing on a broken toolchain.
+    fn host_tool_unavailable<T>(what: &str, error: &str) -> Option<T> {
+        if std::env::var_os("CI").is_some() {
+            panic!("{what} failed after {HOST_TOOL_ATTEMPTS} attempts: {error}");
+        }
+        eprintln!("skipping: {what} failed after {HOST_TOOL_ATTEMPTS} attempts: {error}");
+        None
     }
 
     #[test]

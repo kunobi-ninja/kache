@@ -62,7 +62,7 @@ A bare run enforces configured size and age policies. `--max-age` runs the reque
 
 GC affects only the local store.
 
-GC reports store bytes removed separately from bytes reclaimed on disk. It keeps an entry when its last store blob is still cloned into a build output, because unlinking that blob would free no disk and destroy a usable hit. This can leave the registered store size above `cache.local_max_size`; remove stale targets to reclaim the blocks.
+GC reports store bytes removed separately from bytes reclaimed on disk. It keeps an entry when its last store blob is still cloned into a build output, because unlinking that blob would free no disk and destroy a usable hit. This can leave the registered store size above `cache.local_max_size`; remove stale targets to reclaim the blocks. A size sweep leaves those held bytes out of its budget instead of evicting other entries to make up for them.
 
 Set `cache.gc_evict_shared = true` or `KACHE_GC_EVICT_SHARED=1` to restore the older namespace-first policy. That lowers the registered store size but does not reclaim blocks retained by target directories, and the discarded entry becomes a future miss. See [Configuration: GC and shared build outputs](/docs/getting-started/configuration#gc-and-shared-build-outputs).
 
@@ -212,7 +212,7 @@ kache telemetry write ./cache-otlp --scenario bench-firefox --phase warm
 
 Writes `metrics.otlp.json` and `schema_version` for Kartero. Metric names are `kache.cache.*` / `kache.prefetch.*` (scope `kache.cache`), never `kache.bench.*`. `--scenario` must match `kache.bench.project`. `--phase` is `cold`, `warm`, or `pull` so dumps from the same scenario do not collide. The rustc wrapper does not write these files.
 
-The payload also carries this host's shared cache: registered blob bytes (`kache.cache.store.physical_size`), index and WAL size, and a rowid high-water mark per table (`kache.cache.index.*`; it is not a row count). `kache.cache.store.size` counts logical entry bytes; GC compares the physical blob figure with `kache.cache.store.max`. Last-run GC gauges include duration, pinned and unreclaimable entries, failed evictions, stale WAL snapshot failures, and recently accessed entries skipped before reading their metadata. The read-only index probe has a 25 ms lock timeout; unavailable figures are omitted.
+The payload also carries this host's shared cache: registered blob bytes (`kache.cache.store.physical_size`), index and WAL size, and a rowid high-water mark per table (`kache.cache.index.*`; it is not a row count). `kache.cache.store.size` counts logical entry bytes; GC compares the physical blob figure with `kache.cache.store.max`. Last-run GC gauges include duration, pinned and unreclaimable entries, bytes held by target directories, failed evictions, stale WAL snapshot failures, and recently accessed entries skipped before reading their metadata. The read-only index probe has a 25 ms lock timeout; unavailable figures are omitted.
 
 ## `kache why-miss`
 

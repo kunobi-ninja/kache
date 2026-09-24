@@ -327,7 +327,24 @@ pub(crate) fn client_epoch_is_newer(client_epoch: u64, daemon_epoch: u64) -> boo
     client_epoch > 0 && daemon_epoch > 0 && client_epoch > daemon_epoch
 }
 
-use crate::platform::is_process_alive as process_is_alive;
+/// Whether `pid` may still be running (see [`alive_from_state`]).
+fn process_is_alive(pid: u32) -> bool {
+    alive_from_state(pid, || kunobi_daemon::local::process_state(pid))
+}
+
+/// Whether a process the OS reports as `state` may still be running. A state
+/// the OS could not establish (access denied on Windows, say) counts as
+/// running: both callers wait or report rather than act on it, and waiting
+/// is the safe error. PIDs 0 and 1 and values past `i32::MAX` never name a
+/// daemon (the first is the kernel's, the second init's, the last read as
+/// broadcasts), so a corrupt record naming one is not waited on.
+fn alive_from_state(pid: u32, state: impl FnOnce() -> kunobi_daemon::local::ProcessState) -> bool {
+    use kunobi_daemon::local::ProcessState;
+    if pid <= 1 || i32::try_from(pid).is_err() {
+        return false;
+    }
+    !matches!(state(), ProcessState::Exited)
+}
 
 fn wait_for_run_lock_release(socket_path: &Path, timeout: Duration) -> Result<bool> {
     Ok(
@@ -7145,7 +7162,7 @@ async fn server_main(
     let socket_path = config.socket_path();
     std::fs::create_dir_all(socket_path.parent().unwrap())?;
 
-    let Some(listener) = crate::transport::bind_daemon_listener(&socket_path)? else {
+    let Some(listener) = crate::transport::bind_daemon_listener(&socket_path).await? else {
         tracing::info!("another daemon owns the endpoint");
         return Ok(());
     };
@@ -9077,9 +9094,8 @@ fn prune_in_flight(map: &mut HashMap<u32, CompileStartedRequest>) {
 /// Is a process with this PID alive? `kill(pid, 0)` probes without signaling:
 /// success or EPERM (alive, not ours) both mean alive; ESRCH means gone.
 ///
-/// Deliberately does not use [`crate::platform::is_process_alive`]: this runs
-/// inside a `retain` over every in-flight compile, and that helper shells out
-/// to `ps` for a zombie check. It does share the helper's pid guard, because
+/// This runs inside a `retain` over every in-flight compile, so it stays a
+/// bare probe rather than [`process_is_alive`]. It refuses PIDs 0 and 1, because
 /// `kill(-1, 0)` succeeds whenever anything is signalable and would keep
 /// bogus entries alive in the map forever.
 #[cfg(unix)]
@@ -9653,34 +9669,55 @@ fn daemon_run_command(exe: &Path) -> std::process::Command {
     command
 }
 
+/// Start `kache daemon run` detached from this process, with stderr going to
+/// `stderr_target`.
+///
+/// kunobi-daemon does the detaching. On Unix the daemon leads a new session,
+/// so Ctrl-C and the hangup of the terminal a build runs in do not reach it
+/// (kunobi-ninja/kache#1205), and it holds no descriptor of ours beyond its
+/// standard streams. On Windows it inherits only its three standard handles,
+/// so a caller's pipe cannot stay open because of it and keep cargo waiting
+/// for end of file (kunobi-ninja/kache#704, #1001), and it leaves the caller's
+/// job object when the job allows it. Cargo's job does not: a daemon started
+/// under cargo stays in cargo's job and stops when the build is interrupted.
+/// `kache daemon install` starts it from a scheduled task instead.
 fn spawn_detached_daemon(
     exe: &Path,
-    stderr_target: std::process::Stdio,
-) -> Result<std::process::Child> {
+    stderr_target: kunobi_daemon::launch::DaemonOutput,
+) -> Result<kunobi_daemon::launch::DaemonChild> {
     let mut command = daemon_run_command(exe);
-    command
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(stderr_target);
-
     strip_ambient_remote_env(&mut command);
+    let mut daemon = detached_command(&command);
+    daemon.stderr(stderr_target);
+    let child = daemon.spawn().context("spawning daemon process")?;
+    if child.in_callers_job() {
+        tracing::debug!(
+            "the daemon (PID {}) shares the build's job object and stops if the build is \
+             interrupted; `kache daemon install` starts it outside any build",
+            child.id()
+        );
+    }
+    Ok(child)
+}
 
-    // On Windows, clear the inherit flag on our own std handles across the
-    // spawn and restore it after. The daemon's stdio is passed explicitly
-    // above and is marked inheritable by the standard library itself, so it
-    // is unaffected; what this removes is the *incidental* inheritance of the
-    // caller's pipes, which otherwise stay open in a long-lived daemon and keep
-    // cargo waiting for EOF (kunobi-ninja/kache#704). Restoring matters because
-    // later children (rustc) legitimately inherit these handles.
-    #[cfg(windows)]
-    let spawned = {
-        let _guard = kunobi_daemon::local::windows::StdioInheritGuard::suppress();
-        command.spawn()
-    };
-    #[cfg(not(windows))]
-    let spawned = command.spawn();
-
-    spawned.context("spawning daemon process")
+/// The daemon command `command` describes, as kunobi-daemon's detached
+/// spawn: the same program, arguments and environment changes. Its standard
+/// streams start as the null device.
+///
+/// argv[0] is not carried over: kunobi-daemon cannot set it. That is safe
+/// because [`crate::platform::SELF_SPAWN_ENV`] and the `daemon` argument
+/// already route the child as a self-spawn before any compiler-shim name is
+/// considered, which is how Windows has always worked.
+fn detached_command(command: &std::process::Command) -> kunobi_daemon::launch::DaemonCommand {
+    let mut daemon = kunobi_daemon::launch::DaemonCommand::new(command.get_program());
+    daemon.args(command.get_args());
+    for (name, value) in command.get_envs() {
+        match value {
+            Some(value) => daemon.env(name, value),
+            None => daemon.env_remove(name),
+        };
+    }
+    daemon
 }
 
 // ── Tests ────────────────────────────────────────────────────────
@@ -9841,6 +9878,160 @@ mod tests {
             .find(|(name, _)| *name == crate::platform::SELF_SPAWN_ENV)
             .and_then(|(_, value)| value);
         assert!(crate::platform::is_self_spawn(&argv, marker));
+    }
+
+    /// Env var naming the fixture directory for
+    /// `detached_daemon_caller_fixture`; unset, the fixture does nothing.
+    #[cfg(unix)]
+    const DETACH_FIXTURE_DIR: &str = "KACHE_TEST_DETACH_FIXTURE_DIR";
+
+    /// Plays the build that auto-starts the daemon: it spawns a stand-in
+    /// daemon through `spawn_detached_daemon`, records its PID, then waits to
+    /// be interrupted. Run only by
+    /// `detached_daemon_survives_sigint_to_the_callers_group`.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "fixture for detached_daemon_survives_sigint_to_the_callers_group"]
+    fn detached_daemon_caller_fixture() {
+        let Some(dir) = std::env::var_os(DETACH_FIXTURE_DIR).map(PathBuf::from) else {
+            return;
+        };
+        // This process runs this one test, so nothing else reads the env.
+        for name in AMBIENT_REMOTE_ENV_VARS {
+            unsafe { std::env::set_var(name, "ambient") };
+        }
+        let log = std::fs::File::create(dir.join("daemon.log")).unwrap();
+        let child = spawn_detached_daemon(
+            &dir.join("kache"),
+            kunobi_daemon::launch::DaemonOutput::File(log),
+        )
+        .unwrap();
+        std::fs::write(dir.join("pid.tmp"), child.id().to_string()).unwrap();
+        std::fs::rename(dir.join("pid.tmp"), dir.join("pid")).unwrap();
+        std::thread::sleep(Duration::from_secs(60));
+    }
+
+    /// kunobi-ninja/kache#1205: Ctrl-C in the terminal signals the whole
+    /// foreground process group, and an auto-started daemon used to be part of
+    /// it. A caller in its own group starts a stand-in daemon through the real
+    /// spawn path; interrupting that group must leave the daemon running, with
+    /// the arguments, environment and stderr the daemon is meant to get.
+    #[cfg(unix)]
+    #[test]
+    fn detached_daemon_survives_sigint_to_the_callers_group() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::process::CommandExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let script = root.join("kache");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{0}/args'\nenv > '{0}/env'\n\
+                 echo daemon-stderr >&2\ntouch '{0}/ready'\nexec sleep 30\n",
+                root.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut caller = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "daemon::tests::detached_daemon_caller_fixture",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env(DETACH_FIXTURE_DIR, root)
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        // The caller is a second copy of this debug test binary; on a loaded
+        // machine its start alone can take seconds.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !(root.join("pid").exists() && root.join("ready").exists()) {
+            assert!(
+                caller.try_wait().unwrap().is_none(),
+                "the caller exited before starting the daemon"
+            );
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the daemon never started"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let daemon: i32 = std::fs::read_to_string(root.join("pid"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        let caller_group = caller.id() as i32;
+
+        assert_eq!(unsafe { libc::kill(-caller_group, libc::SIGINT) }, 0);
+        let status = caller.wait().unwrap();
+        // Give a daemon that shared the group time to die, then look.
+        std::thread::sleep(Duration::from_millis(300));
+        let survived = unsafe { libc::kill(daemon, 0) } == 0;
+        let session = unsafe { libc::getsid(daemon) };
+        unsafe { libc::kill(daemon, libc::SIGKILL) };
+
+        assert!(!status.success(), "SIGINT never reached the caller's group");
+        assert!(survived, "the daemon died with its caller's process group");
+        assert_eq!(session, daemon, "the daemon must lead its own session");
+
+        let args = std::fs::read_to_string(root.join("args")).unwrap();
+        assert_eq!(args, "daemon\nrun\n");
+        let env = std::fs::read_to_string(root.join("env")).unwrap();
+        let marker = format!("{}=", crate::platform::SELF_SPAWN_ENV);
+        assert!(
+            env.lines().any(|line| line.starts_with(&marker)),
+            "the daemon must be marked as a self-spawn: {env}"
+        );
+        for name in AMBIENT_REMOTE_ENV_VARS {
+            let prefix = format!("{name}=");
+            assert!(
+                !env.lines().any(|line| line.starts_with(&prefix)),
+                "{name} leaked into the daemon's environment"
+            );
+        }
+        let log = std::fs::read_to_string(root.join("daemon.log")).unwrap();
+        assert_eq!(log, "daemon-stderr\n", "stderr must go to the daemon log");
+    }
+
+    /// Only an OS that proves the process gone makes it dead; PIDs that can
+    /// never name a daemon are dead without asking.
+    #[test]
+    fn process_liveness_maps_states_conservatively() {
+        use kunobi_daemon::local::ProcessState;
+        assert!(alive_from_state(2, || ProcessState::Alive));
+        assert!(alive_from_state(2, || ProcessState::Unknown));
+        assert!(!alive_from_state(2, || ProcessState::Exited));
+        assert!(alive_from_state(i32::MAX as u32, || ProcessState::Alive));
+        for pid in [0, 1, i32::MAX as u32 + 1, u32::MAX] {
+            assert!(
+                !alive_from_state(pid, || ProcessState::Alive),
+                "PID {pid} must never read as a live daemon"
+            );
+        }
+    }
+
+    #[test]
+    fn current_process_is_alive() {
+        assert!(process_is_alive(std::process::id()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reaped_child_is_not_alive() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        assert!(process_is_alive(pid));
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(!process_is_alive(pid), "a reaped child must read as exited");
     }
 
     /// Set/remove an env var for one test and restore it on drop. Local to

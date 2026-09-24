@@ -114,58 +114,6 @@ fn assert_test_owns_process(pid: u32, what: &str) -> bool {
     );
 }
 
-#[cfg(unix)]
-pub fn is_process_alive(pid: u32) -> bool {
-    // Probing with signal 0 is harmless per se, but `kill(-1, 0)` succeeds
-    // whenever *any* signalable process exists, so a broadcast PID would
-    // report "alive" and send callers straight into the terminate path.
-    if !is_single_process_pid(pid) {
-        return false;
-    }
-    // kill(pid, 0) returns 0 if the process exists; EPERM also means it
-    // exists but is owned by another user.
-    let rc = unsafe { libc::kill(pid as i32, 0) };
-    (rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM))
-        && !is_process_zombie(pid)
-}
-
-#[cfg(unix)]
-pub fn is_process_zombie(pid: u32) -> bool {
-    let pid = pid.to_string();
-    let output = std::process::Command::new("ps")
-        .args(["-o", "stat=", "-p", pid.as_str()])
-        .output();
-
-    match output {
-        Ok(output) if output.status.success() => {
-            process_stat_indicates_zombie(&String::from_utf8_lossy(&output.stdout))
-        }
-        _ => false,
-    }
-}
-
-#[cfg(unix)]
-fn process_stat_indicates_zombie(stat: &str) -> bool {
-    stat.trim_start().starts_with('Z')
-}
-
-#[cfg(windows)]
-pub fn is_process_alive(pid: u32) -> bool {
-    use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
-    use windows_sys::Win32::System::Threading::{
-        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
-    };
-
-    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
-    if handle.is_null() {
-        return false;
-    }
-    let mut code: u32 = 0;
-    let ok = unsafe { GetExitCodeProcess(handle, &mut code) };
-    unsafe { CloseHandle(handle) };
-    ok != 0 && code as i32 == STILL_ACTIVE
-}
-
 /// Forcefully kill a process and all its descendants (process group on Unix, process tree on Windows).
 pub fn kill_process_group(pid: u32) {
     #[cfg(unix)]
@@ -325,23 +273,6 @@ mod tests {
             .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join("ps").is_file()))
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn process_stat_zombie_detection_uses_leading_state() {
-        assert!(super::process_stat_indicates_zombie("Z"));
-        assert!(super::process_stat_indicates_zombie("Z+"));
-        assert!(super::process_stat_indicates_zombie("  ZN"));
-        assert!(!super::process_stat_indicates_zombie("S"));
-        assert!(!super::process_stat_indicates_zombie("Ss"));
-        assert!(!super::process_stat_indicates_zombie("R+"));
-    }
-
-    #[test]
-    fn current_process_is_alive() {
-        // The test process itself is, by definition, running.
-        assert!(super::is_process_alive(std::process::id()));
-    }
-
     /// The program stays the path kache was started through; only argv
     /// changes, so the child is the same binary under the name `kache`.
     #[test]
@@ -416,35 +347,6 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn current_process_is_not_a_zombie() {
-        // A live, running process is in state R/S, never Z.
-        assert!(!super::is_process_zombie(std::process::id()));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn reaped_child_is_not_alive() {
-        // Spawn a child, confirm it's alive, then kill + reap it. After the
-        // PID is reaped `kill(pid, 0)` returns ESRCH, so `is_process_alive`
-        // must report false.
-        let mut child = std::process::Command::new("sleep")
-            .arg("30")
-            .spawn()
-            .expect("spawn sleep");
-        let pid = child.id();
-        assert!(super::is_process_alive(pid), "child should be alive");
-
-        child.kill().expect("kill child");
-        child.wait().expect("reap child");
-
-        assert!(
-            !super::is_process_alive(pid),
-            "reaped child should no longer be alive"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
     fn broadcast_pids_are_not_single_process_targets() {
         // The kill(2) broadcast selectors. `u32::MAX` is the dangerous one:
         // it casts to -1, which signals the user's entire session.
@@ -455,20 +357,6 @@ mod tests {
             );
         }
         assert!(super::is_single_process_pid(std::process::id()));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn broadcast_pids_are_never_reported_alive() {
-        // `kill(-1, 0)` succeeds whenever anything is signalable, so an
-        // unguarded liveness probe would call u32::MAX "alive" and send
-        // callers into terminate_process with it.
-        for pid in [0, 1, u32::MAX] {
-            assert!(
-                !super::is_process_alive(pid),
-                "pid {pid} must not be reported alive"
-            );
-        }
     }
 
     #[cfg(unix)]

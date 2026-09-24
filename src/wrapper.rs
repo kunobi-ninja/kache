@@ -7365,22 +7365,36 @@ fn explain_miss_diff(
 /// The session itself comes from [`session_id_for_event`], so it exists with
 /// or without a remote. A separate `.prefetch` marker records which session
 /// the hint went out for, and a flock on it keeps N parallel rustc
-/// invocations from all sending one. The marker is written only after a
-/// successful discovery, so a failed attempt (cargo metadata hanging on a git
-/// dependency, say) is retried by the next compile of the same build.
+/// invocations from all sending one. A failed discovery (cargo metadata
+/// hanging on a git dependency, say) is recorded too, and later compiles wait
+/// out a backoff before trying again, since the wrapper that tries holds up
+/// its own compile (kunobi-ninja/kache#698).
 fn maybe_trigger_prefetch(config: &Config, args: &RustcArgs) {
+    maybe_trigger_prefetch_with(config, args, now_epoch_secs(), || {
+        crate::build_intent::discover(Some(args))
+    });
+}
+
+/// [`maybe_trigger_prefetch`] with the clock and the discovery supplied.
+fn maybe_trigger_prefetch_with(
+    config: &Config,
+    args: &RustcArgs,
+    now: u64,
+    discover: impl FnOnce() -> Option<kache_core::BuildIntent>,
+) {
     if config.remote.is_none() {
         return;
     }
     let root = rustc_event_root(args);
-    let session_id = session_id_for_event(config, &root, now_epoch_secs());
+    let session_id = session_id_for_event(config, &root, now);
     if session_id.is_empty() {
         return;
     }
     let marker = prefetch_marker_path(config, &root);
-    if prefetch_marker_names(
-        &std::fs::read_to_string(&marker).unwrap_or_default(),
+    if !prefetch_due(
+        &parse_prefetch_marker(&std::fs::read_to_string(&marker).unwrap_or_default()),
         &session_id,
+        now,
     ) {
         return;
     }
@@ -7395,16 +7409,20 @@ fn maybe_trigger_prefetch(config: &Config, args: &RustcArgs) {
     // Re-check through the locked handle: another process may have sent the
     // hint between our first read and acquiring the lock, and on Windows the
     // lock blocks reads from any other handle (#348).
-    if prefetch_marker_names(&read_locked_marker(&lock_file), &session_id) {
+    let locked = read_locked_marker(&lock_file);
+    let state = parse_prefetch_marker(&locked);
+    if !prefetch_due(&state, &session_id, now) {
         return;
     }
 
     // Gather ALL dependency crate names in compilation order (leaves first).
     // This gives the daemon a comprehensive prefetch list that works even on
     // cold CI runners where the local SQLite store is empty.
-    let build_intent = match crate::build_intent::discover(Some(args)) {
-        Some(intent) => intent,
-        _ => return,
+    let Some(build_intent) = discover() else {
+        let record = failed_prefetch_marker(&session_id, now, &state);
+        tracing::debug!("prefetch hint skipped, discovery failed; marker now {record}");
+        write_locked_marker(&lock_file, &record);
+        return;
     };
 
     let shard_prefetch_enabled =
@@ -7436,8 +7454,68 @@ fn prefetch_marker_path(config: &Config, root: &str) -> PathBuf {
     session_marker_path(config, root).with_extension("prefetch")
 }
 
-fn prefetch_marker_names(content: &str, session_id: &str) -> bool {
-    content.trim() == session_id
+/// First wait after a failed discovery; each further failure doubles it.
+const PREFETCH_RETRY_MIN_SECS: u64 = 30;
+/// Longest wait between discovery attempts.
+const PREFETCH_RETRY_MAX_SECS: u64 = 600;
+
+/// What the `.prefetch` marker records for a build root.
+#[derive(Debug, PartialEq, Eq)]
+enum PrefetchMarker<'a> {
+    /// Nothing usable: never written, or unreadable.
+    Unset,
+    /// The hint went out for this session.
+    Sent(&'a str),
+    /// Discovery failed `attempts` times in a row; wait until `until`.
+    Failed { until: u64, attempts: u32 },
+}
+
+/// Read a marker: a session id after a hint, or
+/// `fail:<session>:<until>:<attempts>` after failed discoveries.
+fn parse_prefetch_marker(content: &str) -> PrefetchMarker<'_> {
+    let content = content.trim();
+    if content.is_empty() {
+        return PrefetchMarker::Unset;
+    }
+    let Some(record) = content.strip_prefix("fail:") else {
+        return PrefetchMarker::Sent(content);
+    };
+    // The session id comes first, so split from the right.
+    let mut fields = record.rsplitn(3, ':');
+    let attempts = fields.next().and_then(|field| field.parse().ok());
+    let until = fields.next().and_then(|field| field.parse().ok());
+    match (until, attempts) {
+        (Some(until), Some(attempts)) => PrefetchMarker::Failed { until, attempts },
+        _ => PrefetchMarker::Unset,
+    }
+}
+
+/// Whether this compile should try to send the hint.
+fn prefetch_due(marker: &PrefetchMarker<'_>, session_id: &str, now: u64) -> bool {
+    match marker {
+        PrefetchMarker::Unset => true,
+        PrefetchMarker::Sent(sent) => *sent != session_id,
+        PrefetchMarker::Failed { until, .. } => now >= *until,
+    }
+}
+
+/// Wait after the `attempts`-th failure in a row: 30 s, 60 s, 120 s, ...,
+/// never more than ten minutes.
+fn prefetch_retry_secs(attempts: u32) -> u64 {
+    let doublings = attempts.saturating_sub(1).min(16);
+    (PREFETCH_RETRY_MIN_SECS << doublings).min(PREFETCH_RETRY_MAX_SECS)
+}
+
+/// The marker to write after a discovery that failed at `now`, following
+/// `previous`. A failure run carries across sessions: a workspace whose
+/// discovery hangs does not stop hanging when the next build starts.
+fn failed_prefetch_marker(session_id: &str, now: u64, previous: &PrefetchMarker<'_>) -> String {
+    let attempts = match previous {
+        PrefetchMarker::Failed { attempts, .. } => attempts.saturating_add(1),
+        _ => 1,
+    };
+    let until = now.saturating_add(prefetch_retry_secs(attempts));
+    format!("fail:{session_id}:{until}:{attempts}")
 }
 
 fn read_locked_marker(mut file: &std::fs::File) -> String {
@@ -15433,6 +15511,136 @@ exit 0
     }
 
     #[test]
+    fn prefetch_markers_parse_and_reject_malformed_failure_records() {
+        assert_eq!(parse_prefetch_marker("  \n"), PrefetchMarker::Unset);
+        assert_eq!(
+            parse_prefetch_marker("abcd\n"),
+            PrefetchMarker::Sent("abcd")
+        );
+        assert_eq!(
+            parse_prefetch_marker("fail:abcd:100:2\n"),
+            PrefetchMarker::Failed {
+                until: 100,
+                attempts: 2
+            }
+        );
+        for malformed in [
+            "fail:",
+            "fail:abcd:100",
+            "fail:abcd:soon:2",
+            "fail:abcd:100:x",
+        ] {
+            assert_eq!(
+                parse_prefetch_marker(malformed),
+                PrefetchMarker::Unset,
+                "{malformed}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_failed_discovery_is_retried_only_once_its_wait_is_over() {
+        let failed = PrefetchMarker::Failed {
+            until: 100,
+            attempts: 1,
+        };
+        assert!(!prefetch_due(&failed, "abcd", 99));
+        assert!(prefetch_due(&failed, "abcd", 100));
+        assert!(!prefetch_due(&PrefetchMarker::Sent("abcd"), "abcd", 100));
+        assert!(prefetch_due(&PrefetchMarker::Sent("abcd"), "efgh", 100));
+        assert!(prefetch_due(&PrefetchMarker::Unset, "abcd", 0));
+    }
+
+    #[test]
+    fn the_retry_wait_doubles_from_thirty_seconds_to_ten_minutes() {
+        let waits: Vec<u64> = (0..=7).map(prefetch_retry_secs).collect();
+        assert_eq!(waits, [30, 30, 60, 120, 240, 480, 600, 600]);
+        assert_eq!(prefetch_retry_secs(u32::MAX), 600);
+    }
+
+    #[test]
+    fn a_failure_run_carries_across_sessions() {
+        assert_eq!(
+            failed_prefetch_marker("abcd", 1000, &PrefetchMarker::Unset),
+            "fail:abcd:1030:1"
+        );
+        assert_eq!(
+            failed_prefetch_marker("abcd", 1000, &PrefetchMarker::Sent("abcd")),
+            "fail:abcd:1030:1"
+        );
+        assert_eq!(
+            failed_prefetch_marker(
+                "efgh",
+                1000,
+                &PrefetchMarker::Failed {
+                    until: 900,
+                    attempts: 3
+                }
+            ),
+            "fail:efgh:1240:4"
+        );
+    }
+
+    #[test]
+    fn a_failed_discovery_backs_off_and_a_success_clears_it() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut config = test_config(dir.path().to_path_buf());
+        config.remote = Some(crate::config::RemoteConfig::test_s3("bucket", "kache/"));
+        let mut args = rustc_args(&["rustc", "foo.rs"]);
+        args.out_dir = Some(dir.path().join("target/debug/deps"));
+        let root = rustc_event_root(&args);
+        let marker = prefetch_marker_path(&config, &root);
+        let intent = || kache_core::BuildIntent {
+            crate_names: vec!["serde".to_string()],
+            namespace: None,
+            cargo_lock_deps: Vec::new(),
+            identity_key: None,
+        };
+
+        let attempts = std::cell::Cell::new(0);
+        let failing = || {
+            attempts.set(attempts.get() + 1);
+            None
+        };
+        let start = now_epoch_secs();
+        maybe_trigger_prefetch_with(&config, &args, start, failing);
+        assert_eq!(attempts.get(), 1);
+        assert!(std::fs::read_to_string(&marker).unwrap().ends_with(":1"));
+
+        // Inside the 30 s wait: no second attempt.
+        maybe_trigger_prefetch_with(&config, &args, start + 29, failing);
+        assert_eq!(attempts.get(), 1);
+
+        // After it: a second failure doubles the wait.
+        maybe_trigger_prefetch_with(&config, &args, start + 30, failing);
+        assert_eq!(attempts.get(), 2);
+        assert!(prefetch_due(
+            &parse_prefetch_marker(&std::fs::read_to_string(&marker).unwrap()),
+            "any",
+            start + 90
+        ));
+        maybe_trigger_prefetch_with(&config, &args, start + 89, failing);
+        assert_eq!(attempts.get(), 2);
+
+        // A success replaces the failure record with the session it sent for,
+        // and later compiles of that session do not discover again.
+        let sent = std::cell::Cell::new(0);
+        let working = || {
+            sent.set(sent.get() + 1);
+            Some(intent())
+        };
+        maybe_trigger_prefetch_with(&config, &args, start + 90, working);
+        assert_eq!(sent.get(), 1);
+        let recorded = std::fs::read_to_string(&marker).unwrap();
+        assert!(matches!(
+            parse_prefetch_marker(&recorded),
+            PrefetchMarker::Sent(_)
+        ));
+        maybe_trigger_prefetch_with(&config, &args, start + 91, working);
+        assert_eq!(sent.get(), 1);
+    }
+
+    #[test]
     fn prefetch_marker_is_per_root_and_names_one_session() {
         let dir = tempfile::TempDir::new().unwrap();
         let config = test_config(dir.path().to_path_buf());
@@ -15444,9 +15652,9 @@ exit 0
         assert_ne!(path, session_marker_path(&config, "/repo"));
         assert_ne!(path, prefetch_marker_path(&config, "/other"));
 
-        assert!(prefetch_marker_names("abc\n", "abc"));
-        assert!(!prefetch_marker_names("abd", "abc"));
-        assert!(!prefetch_marker_names("", "abc"));
+        assert!(!prefetch_due(&parse_prefetch_marker("abc\n"), "abc", 0));
+        assert!(prefetch_due(&parse_prefetch_marker("abd"), "abc", 0));
+        assert!(prefetch_due(&parse_prefetch_marker(""), "abc", 0));
     }
 
     /// Cargo's target directory, tagged the way Cargo tags it.

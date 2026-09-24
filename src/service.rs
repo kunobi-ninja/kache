@@ -616,7 +616,7 @@ pub fn kickstart(deadline: std::time::Instant) -> Result<bool> {
 
 /// `launchctl kickstart` exits with this when launchd has no job by that
 /// label: "Could not find service".
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", all(test, unix)))]
 const LAUNCHCTL_NO_SUCH_SERVICE: i32 = 113;
 
 /// Start the installed launchd job, loading it first when launchd does not
@@ -626,7 +626,7 @@ const LAUNCHCTL_NO_SUCH_SERVICE: i32 = 113;
 /// out since then (`launchctl bootout`, an interrupted reinstall) stays
 /// unknown to launchd until the next login, and `kickstart` refuses it.
 /// Bootstrapping the plist loads it, and `RunAtLoad` starts it.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", all(test, unix)))]
 fn start_launchd_job(
     target: &str,
     kickstart: impl FnOnce() -> Result<std::process::Output>,

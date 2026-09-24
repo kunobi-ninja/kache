@@ -550,14 +550,14 @@ fn send_handoff(socket: &Path, request: &PublishCcRequest, budget: Duration) -> 
         .connect_sync()?;
     let mut pending = line.as_slice();
     while !pending.is_empty() {
-        stream.set_send_timeout(Some(remaining()?))?;
+        peer_may_have_closed(stream.set_send_timeout(Some(remaining()?)))?;
         let written = stream.write(pending)?;
         anyhow::ensure!(written != 0, "daemon closed during handoff write");
         pending = &pending[written..];
     }
     let mut response = Vec::new();
     loop {
-        stream.set_recv_timeout(Some(remaining()?))?;
+        peer_may_have_closed(stream.set_recv_timeout(Some(remaining()?)))?;
         let mut buffer = [0; 1024];
         let read = stream.read(&mut buffer)?;
         anyhow::ensure!(read != 0, "daemon closed before handoff reply");
@@ -566,6 +566,19 @@ fn send_handoff(socket: &Path, request: &PublishCcRequest, budget: Duration) -> 
         if response.contains(&b'\n') {
             return Ok(String::from_utf8(response)?);
         }
+    }
+}
+
+/// A socket timeout that could not be set because the daemon already closed
+/// its end. macOS reports that as EINVAL from `setsockopt`; the write or
+/// read that follows then reports the close as what it is, instead of the
+/// handoff failing with "Invalid argument". The timeouts passed here are
+/// never zero, so EINVAL has no other cause.
+#[cfg(unix)]
+fn peer_may_have_closed(result: std::io::Result<()>) -> std::io::Result<()> {
+    match result {
+        Err(error) if error.raw_os_error() == Some(libc::EINVAL) => Ok(()),
+        other => other,
     }
 }
 
@@ -1326,6 +1339,19 @@ mod tests {
             server.join().unwrap();
             std::fs::remove_file(socket).unwrap();
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_timeout_refused_by_a_closed_peer_leaves_the_close_to_the_next_read() {
+        let einval = std::io::Error::from_raw_os_error(libc::EINVAL);
+        assert!(peer_may_have_closed(Err(einval)).is_ok());
+        let other = std::io::Error::from_raw_os_error(libc::EBADF);
+        assert_eq!(
+            peer_may_have_closed(Err(other)).unwrap_err().raw_os_error(),
+            Some(libc::EBADF)
+        );
+        assert!(peer_may_have_closed(Ok(())).is_ok());
     }
 
     #[cfg(unix)]

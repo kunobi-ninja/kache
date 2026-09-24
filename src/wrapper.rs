@@ -450,28 +450,28 @@ pub(crate) fn record_auto_gc_outcome(config: &Config, size_after: u64, held: u64
         let _ = std::fs::remove_file(&path);
         return;
     };
-    if next.interval_secs > 0 {
-        tracing::info!(
-            "auto-gc: store still at {} after the sweep, {} of it held by target directories \
-             (max {}); next automatic sweep in {}s at the earliest",
-            size_after,
-            held,
-            config.max_size,
-            next.interval_secs
-        );
-    } else {
-        tracing::info!(
-            "auto-gc: store at {} after the sweep, {} of it held by target directories \
-             that no sweep can free (max {})",
-            size_after,
-            held,
-            config.max_size
-        );
-    }
+    tracing::info!("{}", auto_gc_outcome_line(&next, config.max_size));
     if let Ok(json) = serde_json::to_vec(&next)
         && let Err(e) = crate::atomic::atomic_replace(&path, &json)
     {
         tracing::debug!("auto-gc: could not write {}: {e:#}", path.display());
+    }
+}
+
+/// What a recorded sweep outcome says in the log.
+fn auto_gc_outcome_line(outcome: &AutoGcBackoff, max_size: u64) -> String {
+    if outcome.interval_secs > 0 {
+        format!(
+            "auto-gc: store still at {} after the sweep, {} of it held by target directories \
+             (max {max_size}); next automatic sweep in {}s at the earliest",
+            outcome.size_after, outcome.held, outcome.interval_secs
+        )
+    } else {
+        format!(
+            "auto-gc: store at {} after the sweep, {} of it held by target directories \
+             that no sweep can free (max {max_size})",
+            outcome.size_after, outcome.held
+        )
     }
 }
 
@@ -8541,6 +8541,28 @@ mod tests {
         // Start above 110% of max_size, stop at 90%.
         assert_eq!(auto_gc_threshold(1000), 1100);
         assert_eq!(kache_store::eviction::eviction_target(1000), 900);
+    }
+
+    #[test]
+    fn the_outcome_line_mentions_a_wait_only_when_there_is_one() {
+        let held_only = AutoGcBackoff {
+            since: 1,
+            interval_secs: 0,
+            size_after: 5000,
+            held: 3900,
+        };
+        let line = auto_gc_outcome_line(&held_only, 1000);
+        assert!(
+            line.contains("3900 of it held") && line.contains("no sweep can free"),
+            "{line}"
+        );
+        assert!(!line.contains("next automatic sweep"), "{line}");
+        let backoff = AutoGcBackoff {
+            interval_secs: 1,
+            ..held_only
+        };
+        let line = auto_gc_outcome_line(&backoff, 1000);
+        assert!(line.contains("next automatic sweep in 1s"), "{line}");
     }
 
     /// max 1000, so the trigger is 1100.

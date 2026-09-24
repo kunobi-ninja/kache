@@ -17352,6 +17352,45 @@ mod tests {
         assert!(!store.contains("held"));
     }
 
+    /// A blob two entries share is not either one's last reference, so
+    /// evicting either would unlink nothing: neither counts as held, even
+    /// when a target directory holds the blob too.
+    #[test]
+    fn a_shared_blob_held_outside_is_no_entrys_held_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.max_size = 100;
+        let store = Store::open(&config).unwrap();
+        for key in ["first", "second"] {
+            let output = dir.path().join(format!("{key}.rlib"));
+            std::fs::write(&output, vec![7u8; 300]).unwrap();
+            store
+                .put(
+                    key,
+                    key,
+                    &["lib".to_string()],
+                    &[],
+                    "x86_64-unknown-linux-gnu",
+                    "dev",
+                    &[(output.clone(), "libshared.rlib".to_string())],
+                    "",
+                    "",
+                )
+                .unwrap();
+            std::fs::remove_file(&output).unwrap();
+        }
+        let meta = store.get("first").unwrap().unwrap();
+        std::fs::hard_link(
+            store.blob_path(&meta.files[0].hash),
+            dir.path().join("target-copy.rlib"),
+        )
+        .unwrap();
+        let candidates = store
+            .eviction_candidates_for(SweepOrigin::Requested)
+            .unwrap();
+        assert!(store.held_by_live_files(&candidates).unwrap().is_empty());
+    }
+
     /// Only a sweep with a byte budget probes: the others remove what their
     /// policy selects whatever it holds.
     #[test]

@@ -151,8 +151,7 @@ impl Driver for KacheReplacement<'_> {
                 }
             }
             Step::Prepare => {
-                self.executable =
-                    Some(std::env::current_exe().context("locating replacement executable")?);
+                self.executable = Some(replacement_executable()?);
                 std::fs::metadata(self.executable.as_ref().unwrap())
                     .context("reading replacement executable")?;
             }
@@ -257,6 +256,19 @@ impl Drop for KacheReplacement<'_> {
     }
 }
 
+/// The binary a new daemon runs: this one.
+///
+/// Not in unit tests. There this is the libtest harness, which takes
+/// `daemon run` as test name filters: the "daemon" ran every test matching
+/// them in the background, detached, and one that never finished kept it
+/// alive for good.
+fn replacement_executable() -> Result<PathBuf> {
+    if cfg!(test) {
+        anyhow::bail!("unit tests never start the test binary as a daemon");
+    }
+    std::env::current_exe().context("locating replacement executable")
+}
+
 fn transient(error: &anyhow::Error) -> bool {
     error.chain().any(|error| {
         matches!(
@@ -323,6 +335,12 @@ fn written_since(path: &Path, start: u64) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unit_tests_never_start_the_test_binary_as_a_daemon() {
+        let error = replacement_executable().unwrap_err().to_string();
+        assert!(error.contains("test binary"), "{error}");
+    }
 
     fn driver(config: &Config) -> KacheReplacement<'_> {
         KacheReplacement {

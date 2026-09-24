@@ -612,6 +612,11 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_file_hash_window_is_thirty_days() {
+        assert_eq!(FILE_HASH_RETENTION_SECS, 2_592_000);
+    }
+
+    #[test]
     fn file_hash_rows_are_pruned_a_month_after_they_were_written() {
         let db = rusqlite::Connection::open_in_memory().unwrap();
         ensure_file_hash_cache_schema(&db).unwrap();

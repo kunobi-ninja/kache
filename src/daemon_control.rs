@@ -18,8 +18,20 @@ const SERVICE_ID: [u8; 16] = [
     0xa1, 0x94, 0xcb, 0xee, 0x70, 0x11, 0x43, 0x9c, 0xb6, 0x7e, 0x62, 0x96, 0x2a, 0x3a, 0xd8, 0x51,
 ];
 
+/// The control endpoint, a sibling of the daemon socket.
+///
+/// Its name is part of the daemon's path budget: a Unix socket address holds
+/// 103 bytes of path on macOS and 107 on Linux, and both sockets have to fit.
+/// `daemon.ctl` is shorter than the `daemon.sock` it is derived from, so any
+/// runtime directory that could hold a daemon socket before this endpoint
+/// existed still can. The first name for it, `daemon.control.v2.sock`, cost
+/// 11 bytes more and took CI runtime directories that had always worked over
+/// the macOS limit (kunobi-ninja/kache#1216).
+///
+/// Clients and the daemon must derive the same name, so this is the only
+/// place that spells it.
 pub(super) fn endpoint(config: &Config) -> PathBuf {
-    config.socket_path().with_extension("control.v2.sock")
+    config.socket_path().with_extension("ctl")
 }
 
 fn offer(config: &Config) -> Result<wire::Hello> {
@@ -205,6 +217,25 @@ pub(super) fn legacy_request(path: &Path, request: &Request, deadline: Instant) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Both endpoints are Unix sockets in the same directory, so they share one
+    /// path budget. A control name that cost more than `daemon.sock` refuses a
+    /// runtime directory that has always held a daemon (kunobi-ninja/kache#1216).
+    #[test]
+    fn the_control_endpoint_is_no_longer_than_the_socket_it_belongs_to() {
+        let root = tempfile::tempdir().unwrap();
+        let config = super::super::tests::test_config(root.path());
+        let socket = config.socket_path();
+        let control = endpoint(&config);
+        assert_eq!(control.parent(), socket.parent());
+        assert_ne!(control, socket);
+        assert!(
+            control.as_os_str().len() <= socket.as_os_str().len(),
+            "{} needs more path than {}",
+            control.display(),
+            socket.display()
+        );
+    }
 
     #[test]
     fn control_negotiation_requires_typed_health_and_advertises_drain() {

@@ -160,6 +160,11 @@ mod tests {
             "clamped to the blob's size"
         );
         assert_eq!(
+            from_measurement(S::Partial, Some(1024), Some(4096), 4096).snapshot_bytes,
+            3072,
+            "clamped to the bytes that are not private"
+        );
+        assert_eq!(
             from_measurement(S::Full, Some(0), Some(0), 4096),
             Sharing {
                 shared: true,

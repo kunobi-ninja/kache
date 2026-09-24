@@ -48,6 +48,7 @@ buildRustPackage {
     lockFile = ../../Cargo.lock;
     outputHashes = {
       "kunobi-ha-0.5.0" = "sha256-ktNEEIHAWDsZFqg1cl87U9xB03+YUELqocwURk18IO0=";
+      "kunobi-daemon-0.4.2" = "sha256-De8h6FlAf8zZJgSTERNzK/Zm3GGvfA0D4IMlqRei15s=";
     };
   };
 

@@ -7384,6 +7384,58 @@ fn write_tool_version_cache(binary: &Path, prefix: &str, version: &str) {
 /// when the toolchain is updated, plus the rustup toolchain-selection state
 /// (see [`toolchain_selector_fingerprint`]).
 fn tool_version_cache_path(binary: &Path, prefix: &str) -> Option<std::path::PathBuf> {
+    let digest = tool_version_digest(binary)?;
+    Some(crate::config::default_cache_dir().join(format!("{prefix}-{digest}.txt")))
+}
+
+/// What [`tool_version_digest_uncached`] reads that can differ between two
+/// calls in one process: the binary as named and the file behind it, the
+/// toolchain override and the working directory.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct ToolDigestKey {
+    binary: PathBuf,
+    modified: Option<std::time::SystemTime>,
+    len: u64,
+    #[cfg(unix)]
+    inode: u64,
+    rustup_toolchain: Option<std::ffi::OsString>,
+    cwd: Option<PathBuf>,
+}
+
+/// [`tool_version_digest_uncached`], once per binary per process. A wrapper
+/// reads a compiler's version, sysroot and linker several times per
+/// invocation, and each read canonicalized the binary and walked from the
+/// working directory to the root looking for toolchain files: 80 failed
+/// opens and ~180 readlinks per rustc cache hit on hk. A wrapper process
+/// lives for one invocation, so nothing it keys on can change underneath it.
+/// A long-lived process must not key compilers through this memo: an edited
+/// toolchain file would go unseen.
+fn tool_version_digest(binary: &Path) -> Option<String> {
+    static MEMO: std::sync::LazyLock<
+        std::sync::Mutex<std::collections::HashMap<ToolDigestKey, Option<String>>>,
+    > = std::sync::LazyLock::new(Default::default);
+    let metadata = std::fs::metadata(binary).ok()?;
+    let key = ToolDigestKey {
+        binary: binary.to_path_buf(),
+        modified: metadata.modified().ok(),
+        len: metadata.len(),
+        #[cfg(unix)]
+        inode: std::os::unix::fs::MetadataExt::ino(&metadata),
+        rustup_toolchain: std::env::var_os("RUSTUP_TOOLCHAIN"),
+        cwd: std::env::current_dir().ok(),
+    };
+    if let Some(digest) = MEMO.lock().ok()?.get(&key) {
+        return digest.clone();
+    }
+    let digest = tool_version_digest_uncached(binary);
+    if let Ok(mut memo) = MEMO.lock() {
+        memo.insert(key, digest.clone());
+    }
+    digest
+}
+
+/// The digest part of a tool-version cache file name.
+fn tool_version_digest_uncached(binary: &Path) -> Option<String> {
     let canon = std::fs::canonicalize(binary).ok()?;
     let mtime = std::fs::metadata(&canon)
         .ok()?
@@ -7403,7 +7455,7 @@ fn tool_version_cache_path(binary: &Path, prefix: &str) -> Option<std::path::Pat
         )
     );
     let hash = blake3::hash(key.as_bytes()).to_hex();
-    Some(crate::config::default_cache_dir().join(format!("{}-{}.txt", prefix, &hash[..16])))
+    Some(hash[..16].to_string())
 }
 
 /// The rustup toolchain-selection state that can redirect an unchanged shim
@@ -12482,6 +12534,37 @@ mod tests {
         let with_args = clippy_identity_in(&driver, env(with_conf_dir), None).unwrap();
         assert_ne!(with_args, redirected);
         assert!(with_args.contains("CLIPPY_ARGS=-Dclippy::all"));
+    }
+
+    /// The per-process memo still keys on what can change within a process:
+    /// a rewritten binary and a different toolchain override each get their
+    /// own digest.
+    #[test]
+    fn tool_version_digest_follows_the_binary_and_the_override() {
+        let _lock = key_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("rustc");
+        std::fs::write(&binary, b"rustc one").unwrap();
+        let first = tool_version_digest(&binary).unwrap();
+        assert_eq!(tool_version_digest(&binary).unwrap(), first, "memoised");
+        assert_eq!(tool_version_digest_uncached(&binary).unwrap(), first);
+
+        std::fs::write(&binary, b"rustc two, longer").unwrap();
+        let rewritten = tool_version_digest(&binary).unwrap();
+        assert_eq!(rewritten, tool_version_digest_uncached(&binary).unwrap());
+
+        let previous = std::env::var_os("RUSTUP_TOOLCHAIN");
+        // SAFETY: key_test_lock serialises environment edits.
+        unsafe { std::env::set_var("RUSTUP_TOOLCHAIN", "kache-test-override") };
+        let overridden = tool_version_digest(&binary).unwrap();
+        let expected = tool_version_digest_uncached(&binary).unwrap();
+        match previous {
+            Some(value) => unsafe { std::env::set_var("RUSTUP_TOOLCHAIN", value) },
+            None => unsafe { std::env::remove_var("RUSTUP_TOOLCHAIN") },
+        }
+        assert_eq!(overridden, expected);
+        assert_ne!(overridden, rewritten, "the override is part of the digest");
+        assert!(tool_version_digest(&dir.path().join("absent")).is_none());
     }
 
     #[test]

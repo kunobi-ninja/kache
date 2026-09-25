@@ -4307,6 +4307,186 @@ pub(crate) struct TargetEntry {
     pub stale: bool,
 }
 
+/// Whether the worktree a tracked target was built from is still there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum TargetState {
+    Live,
+    WorktreeDeleted,
+}
+
+/// One tracked target directory, as `kache targets` reports it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct TargetRow {
+    path: String,
+    workspace: String,
+    state: TargetState,
+    /// Seconds since a build last used it.
+    idle_seconds: u64,
+    profiles: Vec<String>,
+    /// Bytes its files add up to, counting shared blocks in full.
+    apparent_bytes: u64,
+    /// Estimated bytes deleting it would give back: its private extents,
+    /// with hardlinks and blocks shared with the store left out.
+    reclaimable_bytes: u64,
+    /// Bytes restored from kache's store.
+    cached_bytes: u64,
+}
+
+/// Every tracked target directory that still exists, the most freeable
+/// first. Missing ones are left for `kache clean --tracked` to forget.
+fn target_rows(config: &Config, now: i64) -> Result<Vec<TargetRow>> {
+    let store = Store::open(config)?;
+    let tracked: Vec<_> = store
+        .tracked_target_roots(0)?
+        .into_iter()
+        .filter(|tracked| tracked.path.is_dir())
+        .collect();
+    // Each scan walks a whole target and probes extents; they are independent
+    // and bound by the filesystem, so run several at once.
+    let workers = std::thread::available_parallelism()
+        .map_or(4, std::num::NonZeroUsize::get)
+        .clamp(1, 8);
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let scanned = std::sync::Mutex::new(Vec::with_capacity(tracked.len()));
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| {
+                loop {
+                    let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(root) = tracked.get(index) else {
+                        break;
+                    };
+                    let stats = compute_project_stats(&root.path).0;
+                    let profiles = detect_profiles(&root.path);
+                    if let Ok(mut scanned) = scanned.lock() {
+                        scanned.push((index, stats, profiles));
+                    }
+                }
+            });
+        }
+    });
+    let scanned = scanned
+        .into_inner()
+        .unwrap_or_else(|error| error.into_inner());
+    let mut rows = Vec::with_capacity(scanned.len());
+    for (index, stats, profiles) in scanned {
+        let tracked = &tracked[index];
+        rows.push(TargetRow {
+            path: tracked.path.display().to_string(),
+            workspace: tracked.workspace_root.display().to_string(),
+            state: if workspace_is_gone(&tracked.workspace_root) {
+                TargetState::WorktreeDeleted
+            } else {
+                TargetState::Live
+            },
+            idle_seconds: now.saturating_sub(tracked.last_seen).max(0) as u64,
+            profiles,
+            apparent_bytes: stats.total_bytes,
+            reclaimable_bytes: stats.estimated_reclaimable_bytes,
+            cached_bytes: stats.cached_bytes,
+        });
+    }
+    rows.sort_by_key(|row| std::cmp::Reverse(row.reclaimable_bytes));
+    Ok(rows)
+}
+
+/// `3d`, `5h`, `12m`, `40s`: the largest whole unit.
+fn format_idle(seconds: u64) -> String {
+    match seconds {
+        s if s >= 86_400 => format!("{}d", s / 86_400),
+        s if s >= 3_600 => format!("{}h", s / 3_600),
+        s if s >= 60 => format!("{}m", s / 60),
+        s => format!("{s}s"),
+    }
+}
+
+fn render_targets(rows: &[TargetRow]) -> Vec<String> {
+    let apparent: u64 = rows.iter().map(|row| row.apparent_bytes).sum();
+    let reclaimable: u64 = rows.iter().map(|row| row.reclaimable_bytes).sum();
+    let mut lines = vec![format!(
+        "{} tracked target director{}: {} on disk, {} freeable\n",
+        rows.len(),
+        if rows.len() == 1 { "y" } else { "ies" },
+        ByteSize(apparent),
+        ByteSize(reclaimable)
+    )];
+    lines.push(format!(
+        "  {:>10}  {:>10}  {:>5}  WORKSPACE",
+        "FREEABLE", "ON DISK", "IDLE"
+    ));
+    for row in rows {
+        let deleted = if row.state == TargetState::WorktreeDeleted {
+            "  (worktree deleted)"
+        } else {
+            ""
+        };
+        lines.push(format!(
+            "  {:>10}  {:>10}  {:>5}  {}{deleted}",
+            ByteSize(row.reclaimable_bytes).to_string(),
+            ByteSize(row.apparent_bytes).to_string(),
+            format_idle(row.idle_seconds),
+            row.workspace
+        ));
+    }
+    let orphans = rows
+        .iter()
+        .filter(|row| row.state == TargetState::WorktreeDeleted)
+        .count();
+    if orphans > 0 {
+        lines.push(format!(
+            "\nRemove the {orphans} deleted worktree{}' targets: kache clean --orphans --yes",
+            if orphans == 1 { "" } else { "s" }
+        ));
+    }
+    lines
+}
+
+/// Show every tracked target directory with what deleting it would free
+/// and whether its worktree still exists.
+pub fn targets(config: &Config, json: bool) -> Result<()> {
+    let rows = target_rows(config, kache_store::markers::now_epoch_secs() as i64)?;
+    let orphans = rows
+        .iter()
+        .filter(|row| row.state == TargetState::WorktreeDeleted)
+        .count();
+    if json {
+        #[derive(serde::Serialize)]
+        struct Body {
+            targets: Vec<TargetRow>,
+            apparent_bytes: u64,
+            reclaimable_bytes: u64,
+        }
+        let next = if orphans > 0 {
+            vec![crate::machine::NextAction {
+                argv: ["kache", "clean", "--orphans", "--yes"]
+                    .map(String::from)
+                    .to_vec(),
+                why: format!("{orphans} target(s) belong to deleted worktrees"),
+            }]
+        } else {
+            Vec::new()
+        };
+        return crate::machine::emit(
+            "targets",
+            Body {
+                apparent_bytes: rows.iter().map(|row| row.apparent_bytes).sum(),
+                reclaimable_bytes: rows.iter().map(|row| row.reclaimable_bytes).sum(),
+                targets: rows,
+            },
+            next,
+        );
+    }
+    if rows.is_empty() {
+        println!("No tracked target directories. Builds through kache register theirs.");
+        return Ok(());
+    }
+    for line in render_targets(&rows) {
+        println!("{line}");
+    }
+    Ok(())
+}
+
 /// Which tracked targets a clean considers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TrackedSelection {
@@ -12578,6 +12758,109 @@ mod tests {
         assert_eq!(skipped.len(), 1);
         assert_eq!(skipped[0].path, busy.display().to_string());
         assert_eq!(skipped[0].reason, TARGET_IN_USE);
+    }
+
+    #[test]
+    fn idle_times_use_the_largest_whole_unit() {
+        assert_eq!(format_idle(59), "59s");
+        assert_eq!(format_idle(60), "1m");
+        assert_eq!(format_idle(3_599), "59m");
+        assert_eq!(format_idle(3_600), "1h");
+        assert_eq!(format_idle(86_399), "23h");
+        assert_eq!(format_idle(86_400), "1d");
+    }
+
+    const CARGO_CACHEDIR_TAG: &str = "Signature: 8a477f597d28d172789f06886806bc55";
+
+    fn row(workspace: &str, state: TargetState, reclaimable: u64) -> TargetRow {
+        TargetRow {
+            path: format!("{workspace}/target"),
+            workspace: workspace.to_string(),
+            state,
+            idle_seconds: 3 * 86_400,
+            profiles: vec!["debug".to_string()],
+            apparent_bytes: reclaimable * 2,
+            reclaimable_bytes: reclaimable,
+            cached_bytes: reclaimable,
+        }
+    }
+
+    #[test]
+    fn the_targets_table_totals_and_points_at_deleted_worktrees() {
+        let one = render_targets(&[row("/wt/a", TargetState::Live, 1024)]).join("\n");
+        assert!(
+            one.starts_with("1 tracked target directory: 2.0 KiB on disk, 1.0 KiB freeable"),
+            "{one}"
+        );
+        assert!(one.contains("3d  /wt/a"), "{one}");
+        assert!(!one.contains("deleted"), "{one}");
+
+        let rows = [
+            row("/wt/a", TargetState::Live, 1024),
+            row("/wt/b", TargetState::WorktreeDeleted, 2048),
+        ];
+        let many = render_targets(&rows).join("\n");
+        assert!(
+            many.starts_with("2 tracked target directories: 6.0 KiB on disk, 3.0 KiB freeable"),
+            "{many}"
+        );
+        assert_eq!(many.matches("(worktree deleted)").count(), 1, "{many}");
+        assert!(
+            many.contains("Remove the 1 deleted worktree' targets: kache clean --orphans --yes"),
+            "{many}"
+        );
+        let two = render_targets(&[
+            row("/wt/b", TargetState::WorktreeDeleted, 1),
+            row("/wt/c", TargetState::WorktreeDeleted, 1),
+        ])
+        .join("\n");
+        assert!(
+            two.contains("Remove the 2 deleted worktrees' targets"),
+            "{two}"
+        );
+    }
+
+    #[test]
+    fn target_rows_report_each_worktree_and_sort_by_what_frees_most() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::test_support::test_config(dir.path().join("cache"));
+        let store = Store::open(&config).unwrap();
+        let mut targets = Vec::new();
+        for (name, bytes) in [("small", 4096usize), ("large", 64 * 1024)] {
+            let workspace = dir.path().join("wt").join(name);
+            let target = dir.path().join("targets").join(name);
+            std::fs::create_dir_all(&workspace).unwrap();
+            std::fs::create_dir_all(target.join("debug/deps")).unwrap();
+            std::fs::write(target.join("debug/deps/libx.rlib"), vec![1u8; bytes]).unwrap();
+            std::fs::write(target.join("CACHEDIR.TAG"), CARGO_CACHEDIR_TAG).unwrap();
+            store.remember_target_root(&target, &workspace).unwrap();
+            targets.push((workspace, target));
+        }
+        std::fs::remove_dir_all(&targets[1].0).unwrap();
+        std::fs::create_dir_all(dir.path().join("targets/gone")).unwrap();
+        std::fs::write(
+            dir.path().join("targets/gone/CACHEDIR.TAG"),
+            CARGO_CACHEDIR_TAG,
+        )
+        .unwrap();
+        store
+            .remember_target_root(&dir.path().join("targets/gone"), &targets[0].0)
+            .unwrap();
+        std::fs::remove_dir_all(dir.path().join("targets/gone")).unwrap();
+
+        let now = kache_store::markers::now_epoch_secs() as i64 + 120;
+        let rows = target_rows(&config, now).unwrap();
+        assert_eq!(rows.len(), 2, "a vanished target is not listed: {rows:?}");
+        assert!(rows[0].path.ends_with("large") && rows[1].path.ends_with("small"));
+        assert_eq!(rows[0].state, TargetState::WorktreeDeleted);
+        assert_eq!(rows[1].state, TargetState::Live);
+        assert!(rows[0].reclaimable_bytes >= 64 * 1024, "{rows:?}");
+        assert!(
+            rows.iter()
+                .all(|row| (120..=125).contains(&row.idle_seconds)),
+            "{rows:?}"
+        );
+        assert_eq!(rows[1].profiles, ["debug"]);
     }
 
     #[test]

@@ -14,6 +14,7 @@ Run `kache <command> --help` for the exact syntax in your installed version.
 | `gc` | Evict local entries |
 | `purge` | Remove local cache entries |
 | `clean` | Remove Cargo target directories below cwd or from the local tracked-root registry |
+| `targets` | Show tracked target directories: size, what deleting each frees, and whether its worktree still exists |
 | `init` | Configure Cargo, optional C/C++ shims, and the daemon service |
 | `doctor` | Diagnose setup and store integrity |
 | `sync` | Pull from and push to a remote |
@@ -93,6 +94,15 @@ kache clean --orphans --yes
 `--tracked` uses the bounded machine-local target registry populated by normal builds and restores. `--stale` filters by last use. A target whose worktree or workspace has been deleted qualifies however recently it was built; `--orphans` selects only those. A workspace counts as deleted only while the directory that held it still exists, so an unmounted volume does not.
 
 Cleanup rechecks each directory identity and removes only the derived target directory; missing, moved, replaced, current-workspace, and unsafe paths are skipped. A target a running build holds (its `.cargo-lock`) is skipped with `in use by a running build`, in every mode.
+
+## `kache targets`
+
+```bash
+kache targets
+kache targets --json
+```
+
+`targets` lists every target directory builds through kache have used: its workspace, how long since a build last used it, the bytes it holds, and an estimate of what deleting it frees. The estimate leaves out blocks the target shares with the store or with other hardlinks, so it is what `kache clean` would give back. A target whose worktree has been deleted is marked, and the last line gives the command to remove those.
 
 ## `kache init`
 

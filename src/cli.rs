@@ -12426,6 +12426,8 @@ mod tests {
         for dir in [&debug, &cross, &too_deep] {
             std::fs::create_dir_all(dir).unwrap();
             std::fs::write(dir.join(".cargo-lock"), b"").unwrap();
+            // Build output beside the lock is not a lock.
+            std::fs::write(dir.join("libfoo.rlib"), b"rlib").unwrap();
         }
         let mut found = cargo_lock_files(&target, 3);
         found.sort();

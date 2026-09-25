@@ -30,9 +30,9 @@
 //! `KACHE_BUILD_SCRIPT_HERMETIC=1`.
 
 use super::{
-    MAX_INPUT_FILES, Prediction, Run, ZERO_AR_DATE_ENV, detach_out_dir, fold, input_state,
-    input_state_as, modified_since, package_exclusions, parse_declarations, real_command, replay,
-    target_dir, zero_ar_date,
+    MAX_INPUT_FILES, Prediction, Run, ZERO_AR_DATE_ENV, fold, input_state, input_state_as,
+    modified_since, package_exclusions, parse_declarations, real_command, replay, target_dir,
+    zero_ar_date,
 };
 use crate::compiler_store::StoreHashExt as _;
 use crate::events::EventResult;
@@ -87,6 +87,13 @@ impl Sandbox {
     }
 }
 
+/// Whether this key is not to be run hermetically: it was refused before,
+/// or a kache that writes another record sealed it and whoever links it
+/// still needs it.
+fn not_to_attempt(sandbox: &Sandbox) -> bool {
+    sandbox.refused_path().exists() || sandbox.root.join(SEALED).exists()
+}
+
 /// Run or restore hermetically. `None` when this run cannot be hermetic
 /// (a root user, an `OUT_DIR` outside Cargo's layout) or the attempt could
 /// not be sealed: the caller then runs the script as usual.
@@ -113,9 +120,7 @@ pub(super) fn run(
         restore(run, &sandbox, &record, &key, key_ms)?;
         return Ok(Some(0));
     }
-    if sandbox.refused_path().exists() || sandbox.root.join(SEALED).exists() {
-        // Refused before, or sealed by a kache that wrote another record:
-        // leave it to whoever links it.
+    if not_to_attempt(&sandbox) {
         return Ok(None);
     }
     // `out-dirs` also holds the shared empty `OUT_DIR`s, which need it private.
@@ -417,23 +422,25 @@ fn seal(sandbox: &Sandbox, record: &Record) -> Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
 fn read_only(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let metadata = std::fs::symlink_metadata(path)?;
-    if metadata.is_dir() {
-        for entry in std::fs::read_dir(path)? {
-            read_only(&entry?.path())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let metadata = std::fs::symlink_metadata(path)?;
+        if metadata.is_dir() {
+            for entry in std::fs::read_dir(path)? {
+                read_only(&entry?.path())?;
+            }
         }
+        let mode = metadata.permissions().mode();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode & !0o222))?;
+        Ok(())
     }
-    let mode = metadata.permissions().mode();
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode & !0o222))?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn read_only(_path: &Path) -> Result<()> {
-    anyhow::bail!("hermetic build-script runs are Unix only")
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        anyhow::bail!("hermetic build-script runs are Unix only")
+    }
 }
 
 /// Remove an unfinished sandbox, read-only parts included.
@@ -446,52 +453,50 @@ fn remove_sandbox(root: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
 fn writable(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let metadata = std::fs::symlink_metadata(path)?;
-    if metadata.file_type().is_symlink() {
-        return Ok(());
-    }
-    let mode = metadata.permissions().mode();
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode | 0o200))?;
-    if metadata.is_dir() {
-        for entry in std::fs::read_dir(path)? {
-            writable(&entry?.path())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let metadata = std::fs::symlink_metadata(path)?;
+        if metadata.file_type().is_symlink() {
+            return Ok(());
+        }
+        let mode = metadata.permissions().mode();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode | 0o200))?;
+        if metadata.is_dir() {
+            for entry in std::fs::read_dir(path)? {
+                writable(&entry?.path())?;
+            }
         }
     }
+    #[cfg(not(unix))]
+    let _ = path;
     Ok(())
 }
 
-#[cfg(not(unix))]
-fn writable(_path: &Path) -> Result<()> {
-    Ok(())
-}
-
-/// Point Cargo's `OUT_DIR` at the sealed one, replacing whatever is there.
+/// Point Cargo's `OUT_DIR` at the sealed one, replacing whatever is there:
+/// its own directory, a file, or an earlier link.
 fn link_out_dir(cargo_out_dir: &Path, shared: &Path) -> Result<()> {
-    detach_out_dir(cargo_out_dir)?;
-    match std::fs::symlink_metadata(cargo_out_dir) {
-        Ok(metadata) if metadata.is_dir() => std::fs::remove_dir_all(cargo_out_dir)?,
-        Ok(_) => std::fs::remove_file(cargo_out_dir)?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
+    if let Ok(metadata) = std::fs::symlink_metadata(cargo_out_dir) {
+        if metadata.is_dir() {
+            std::fs::remove_dir_all(cargo_out_dir)?;
+        } else {
+            std::fs::remove_file(cargo_out_dir)?;
+        }
     }
     if let Some(parent) = cargo_out_dir.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    symlink_dir(shared, cargo_out_dir)
-}
-
-#[cfg(unix)]
-fn symlink_dir(target: &Path, link: &Path) -> Result<()> {
-    std::os::unix::fs::symlink(target, link)?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn symlink_dir(_target: &Path, _link: &Path) -> Result<()> {
-    anyhow::bail!("hermetic build-script runs are Unix only")
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(shared, cargo_out_dir)?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = shared;
+        anyhow::bail!("hermetic build-script runs are Unix only")
+    }
 }
 
 /// `stdout` with each `rustc-link-search` path under `shared` spelled under
@@ -660,16 +665,22 @@ mod tests {
         link_out_dir(&cargo, &shared).unwrap();
         assert_eq!(std::fs::read_link(&cargo).unwrap(), shared);
 
-        detach_out_dir(&cargo).unwrap();
+        super::super::detach_out_dir(&cargo).unwrap();
         assert!(std::fs::symlink_metadata(&cargo).unwrap().is_dir());
         assert!(super::super::directory_is_empty(&cargo));
         assert_eq!(std::fs::read(shared.join("gen.rs")).unwrap(), b"shared");
-        detach_out_dir(&cargo).unwrap();
+        super::super::detach_out_dir(&cargo).unwrap();
         assert!(std::fs::symlink_metadata(&cargo).unwrap().is_dir());
 
         let missing = dir.path().join("target/debug/build/y-1/out");
         link_out_dir(&missing, &shared).unwrap();
         assert_eq!(std::fs::read_link(&missing).unwrap(), shared);
+
+        let file = dir.path().join("target/debug/build/x-1/out");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, b"not a directory").unwrap();
+        link_out_dir(&file, &shared).unwrap();
+        assert_eq!(std::fs::read_link(&file).unwrap(), shared);
     }
 
     #[test]
@@ -692,6 +703,28 @@ mod tests {
             !in_sealed_out_dir(&elsewhere.join("libz.a")),
             "a record outside out-dirs/v2"
         );
+    }
+
+    #[test]
+    fn a_refused_or_foreign_sealed_key_is_not_attempted() {
+        let dir = tempfile::tempdir().unwrap();
+        let sandbox = Sandbox::new(dir.path(), &"ab".repeat(32), Path::new("out"));
+        std::fs::create_dir_all(sandbox.root.parent().unwrap()).unwrap();
+        assert!(!not_to_attempt(&sandbox));
+        std::fs::write(sandbox.refused_path(), b"").unwrap();
+        assert!(not_to_attempt(&sandbox), "refused");
+        std::fs::remove_file(sandbox.refused_path()).unwrap();
+        std::fs::create_dir_all(&sandbox.root).unwrap();
+        std::fs::write(sandbox.root.join(SEALED), b"{}").unwrap();
+        assert!(not_to_attempt(&sandbox), "sealed by another record version");
+    }
+
+    #[test]
+    fn an_unreadable_record_is_an_error_not_an_absence() {
+        let dir = tempfile::tempdir().unwrap();
+        let sandbox = sandbox_in(dir.path());
+        std::fs::create_dir(sandbox.root.join(SEALED)).unwrap();
+        assert!(sealed(&sandbox).is_err());
     }
 
     #[test]

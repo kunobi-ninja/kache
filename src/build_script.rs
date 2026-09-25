@@ -605,10 +605,15 @@ impl Environment {
             .collect()
     }
 
-    /// `contents` with the mapped roots as placeholders, when it is text that
-    /// spells one of them. Binary formats hold offsets and lengths a rewrite
-    /// would break, so only UTF-8 without NUL qualifies, and text that already
-    /// holds a placeholder is left alone: writing it back would change it.
+    /// `contents` with the roots as placeholders, when it is text that spells
+    /// one of them and names no other path. Binary formats hold offsets and
+    /// lengths a rewrite would break, so only UTF-8 without NUL qualifies.
+    /// Text that already holds a placeholder is left alone: writing it back
+    /// would change it. A root is replaced only as a whole path (`/t/out` is
+    /// not replaced inside `/t/out2`), and only as Cargo spelled it. Any path
+    /// left that does not start at a placeholder (`/usr/include`, a sibling
+    /// of the checkout) would come back unchanged in another checkout, so
+    /// such text is not rewritten and stays bound to its roots.
     fn rewrite_text(&self, contents: &[u8]) -> Option<Vec<u8>> {
         if contents.contains(&0)
             || std::str::from_utf8(contents).is_err()
@@ -616,8 +621,17 @@ impl Environment {
         {
             return None;
         }
-        let normalized = self.normalize(contents);
-        (normalized != contents).then_some(normalized)
+        let mut spellings = self.spellings.clone();
+        spellings.sort_by_key(|(root, _)| std::cmp::Reverse(root.as_os_str().len()));
+        let mut normalized = contents.to_vec();
+        for (root, placeholder) in &spellings {
+            normalized = replace_whole_paths(
+                &normalized,
+                root.as_os_str().as_encoded_bytes(),
+                placeholder.as_bytes(),
+            );
+        }
+        (normalized != contents && only_placeholder_paths(&normalized)).then_some(normalized)
     }
 
     /// Sort the recorded files by how they name machine-local roots. A text
@@ -747,6 +761,53 @@ pub(crate) fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack
         .windows(needle.len())
         .position(|window| window == needle)
+}
+
+/// A byte that can continue a file name, so a root followed or preceded by
+/// one is part of a longer path.
+fn is_name_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b'+' | b'~' | b'@')
+}
+
+/// [`replace_all`], only where `needle` is a whole path: not preceded by a
+/// name byte or `/`, and not followed by a name byte.
+fn replace_whole_paths(haystack: &[u8], needle: &[u8], replacement: &[u8]) -> Vec<u8> {
+    if needle.is_empty() {
+        return haystack.to_vec();
+    }
+    let mut out = Vec::with_capacity(haystack.len());
+    let mut index = 0;
+    while index < haystack.len() {
+        if haystack[index..].starts_with(needle) {
+            let before = index.checked_sub(1).map(|at| haystack[at]);
+            let after = haystack.get(index + needle.len()).copied();
+            if !before.is_some_and(|byte| is_name_byte(byte) || byte == b'/')
+                && !after.is_some_and(is_name_byte)
+            {
+                out.extend_from_slice(replacement);
+                index += needle.len();
+                continue;
+            }
+        }
+        out.push(haystack[index]);
+        index += 1;
+    }
+    out
+}
+
+/// Whether every path in `text` starts at a placeholder or a `${var}`
+/// reference: each `/` belongs to a word that begins with `${`.
+fn only_placeholder_paths(text: &[u8]) -> bool {
+    let delimiter = |byte: u8| byte.is_ascii_whitespace() || b"\"'`=:;,()<>[]|".contains(&byte);
+    let mut word_start = 0;
+    for (index, &byte) in text.iter().enumerate() {
+        if delimiter(byte) {
+            word_start = index + 1;
+        } else if byte == b'/' && !text[word_start..].starts_with(b"${") {
+            return false;
+        }
+    }
+    true
 }
 
 fn replace_all(haystack: &[u8], needle: &[u8], replacement: &[u8]) -> Vec<u8> {
@@ -1024,6 +1085,7 @@ impl Run {
             std::fs::create_dir_all(out_dir.join(checked_relative(directory)?))?;
         }
         let mut prepared = Vec::new();
+        let mut texts = Vec::new();
         let mut size = 0;
         for cached in &meta.files {
             let Some(relative) = cached.name.strip_prefix(OUT_PREFIX) else {
@@ -1041,9 +1103,7 @@ impl Run {
             );
             size += cached.size;
             if rewritten.contains(cached.name.as_str()) {
-                let text = self.environment.denormalize(&std::fs::read(&blob)?);
-                std::fs::write(&target, text)?;
-                set_executable(&target, cached.executable)?;
+                texts.push((blob, target, cached.executable));
                 continue;
             }
             prepared.push((
@@ -1054,6 +1114,13 @@ impl Run {
         for (artifact, executable) in prepared {
             let target = artifact.target().to_path_buf();
             artifact.publish_replacing()?;
+            set_executable(&target, executable)?;
+        }
+        for (blob, target, executable) in texts {
+            std::fs::write(
+                &target,
+                self.environment.denormalize(&std::fs::read(&blob)?),
+            )?;
             set_executable(&target, executable)?;
         }
         for empty in &manifest.empty_files {
@@ -2167,6 +2234,24 @@ mod tests {
     }
 
     #[test]
+    fn whole_paths_and_placeholder_paths() {
+        assert_eq!(
+            replace_whole_paths(b"/t/out /t/out2 /t/out/x", b"/t/out", b"$"),
+            b"$ /t/out2 $/x"
+        );
+        assert_eq!(replace_whole_paths(b"/usr/src", b"/src", b"$"), b"/usr/src");
+        assert_eq!(replace_whole_paths(b"a=/src\n", b"/src", b"$"), b"a=$\n");
+        assert_eq!(replace_whole_paths(b"x", b"", b"$"), b"x");
+        assert!(only_placeholder_paths(
+            b"prefix=${KACHE_OUT_DIR}\nlibdir=${prefix}/lib\n"
+        ));
+        assert!(only_placeholder_paths(b"Cflags: -I${includedir}"));
+        assert!(!only_placeholder_paths(b"Cflags: -I/usr/include"));
+        assert!(!only_placeholder_paths(b"url https://example.com"));
+        assert!(!only_placeholder_paths(b"${KACHE_OUT_DIR} /opt"));
+    }
+
+    #[test]
     fn outputs_are_rewritten_as_text_or_bound_to_the_roots_they_spell() {
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("out");
@@ -2201,6 +2286,25 @@ mod tests {
         let object = [b"\0".as_slice(), out.as_os_str().as_encoded_bytes()].concat();
         let (roots, _) = classify_one(&env, "b.o", &object);
         assert_eq!(roots.embedded, vec!["${KACHE_OUT_DIR}".to_string()]);
+
+        // A root inside a longer path is not that root.
+        let sibling = format!("prefix={}2/lib\n", out.display());
+        let (roots, stored) = classify_one(&env, "sibling.pc", sibling.as_bytes());
+        assert!(
+            roots.rewritten.is_empty(),
+            "{}",
+            String::from_utf8_lossy(&stored)
+        );
+        assert_eq!(roots.embedded, vec!["${KACHE_OUT_DIR}".to_string()]);
+        let (roots, _) = classify_one(&env, "usr.txt", b"see /usr/src/pkg/x.h");
+        assert!(roots.rewritten.is_empty());
+
+        // A path no placeholder covers would come back unchanged elsewhere.
+        let mixed = format!("prefix={}\nextra=/opt/vendor/include\n", out.display());
+        let (roots, stored) = classify_one(&env, "mixed.pc", mixed.as_bytes());
+        assert!(roots.rewritten.is_empty());
+        assert_eq!(roots.embedded, vec!["${KACHE_OUT_DIR}".to_string()]);
+        assert_eq!(stored, mixed.as_bytes());
 
         // Text already holding a placeholder would change on the way back.
         let text = format!("{} and ${{KACHE_OUT_DIR}}", out.display());

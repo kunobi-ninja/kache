@@ -72,17 +72,10 @@ that seed and clears its build artifacts before starting.
 
 ## Reading a PR result
 
-The pull-request comment opens with one table per subject: this PR, the base
-branch, the change between them, then every other tool, for isolated and
-contended builds. The change column names a change only when the paired test
-below confirms it, and shows its 95% interval; with fewer than five pairs it
-reads "no verdict". Every PR gets six paired runs of this PR and its base,
-which is enough for a verdict on the warm builds, while cold builds get two
-and other tools and contention one. The bench label measures everything six
-times. Contention counters, disk use and the paired test sit in folded
-sections below; with more than one sample, each time shows its range. The
-comment names this PR and the base branch; the data calls them `head` and
-`base`.
+The pull-request comment opens with one table: Kache base and head for each
+subject, as median times per build with the paired change. Timings for every
+tool, contention counters, disk use and the paired test sit in folded sections
+below it; with more than one sample, each time shows its range.
 `summary.json` carries the statistics; `samples.json` retains raw measurements,
 source/tool versions, arm order, and the head/base/instrument identities.
 Build logs and engine reports are retained for each sample.
@@ -91,8 +84,10 @@ Only Kache head versus base decides the PR verdict. Increased misses or
 passthroughs fail independently of elapsed time. A timing regression needs at
 least five paired samples, a paired-median bootstrap 95% interval entirely
 above +5%, and a median increase above 250 ms. A corresponding reduction is
-reported as an improvement. Other timing results carry **no verdict**. The short suite applies these rules to both warm
-phases; its two cold samples are reported without a timing verdict.
+reported as an improvement. Other timing results are **inconclusive**. Every PR
+runs head and base six times, so both warm phases get a timing verdict; the two
+cold samples are reported without one. sccache and mbx run once, since they
+never decide the verdict. The bench label runs every tool six times.
 
 Intervals describe these samples on this runner. Shared-host load and samples
 reusing a cold seed can remain correlated. Confirm a candidate improvement in
@@ -209,7 +204,7 @@ cold seeds and six warm batches, matching the isolated-build sample counts.
 Every warm batch restores its cold snapshot and clears all targets. A new
 cold seed is measured every third sample, and arm order alternates.
 The six warm pairs use the same timing gate as isolated builds; two cold
-samples carry no verdict. More duplicate Kache key compilations, or more
+samples remain inconclusive. More duplicate Kache key compilations, or more
 warm misses or passthroughs than the base, fail independently of elapsed time.
 
 Use `--contention-samples 12` with `bench-short` for a longer local comparison,

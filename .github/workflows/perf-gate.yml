@@ -461,7 +461,6 @@ jobs:
           REPO: ${{ github.repository }}
           PR: ${{ needs.authorize.outputs.pr }}
           HEAD_SHA: ${{ needs.authorize.outputs.head_sha }}
-          BASE_REF: ${{ needs.authorize.outputs.base_ref }}
           MEASURE_RESULT: ${{ needs.measure.result }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
@@ -488,7 +487,6 @@ jobs:
             # other table folded. If the renderer breaks, post the per-subject
             # reports rather than no comment at all.
             if ! python3 renderer/scripts/perf-gate-report.py --verdict "$verdict" \
-                --base-label "${BASE_REF:-main}" \
                 --output perf-gate/report/perf-gate.md perf-gate/hk perf-gate/eza; then
               {
                 echo "## Perf gate: $verdict (hk, eza)"

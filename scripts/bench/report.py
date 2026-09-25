@@ -2,9 +2,7 @@
 """Render the perf-gate pull-request comment from bench-short output directories.
 
 Each directory is one subject's `--output` from bench-short.py. The comment puts
-this PR against the branch it merges into first, and folds every other table
-away. Readers see "this PR" and the base branch's name; `head` and `base` stay
-the arm names in the data.
+Kache head against its merge base first, and folds every other table away.
 """
 
 import argparse
@@ -24,12 +22,6 @@ COMPARISONS = PHASES + tuple(
 )
 ARM_ORDER = ("head", "kache", "base", "mbx", "sccache")
 MIN_PAIRS = 5
-# How each arm is named in the comment. `base` is set to the base branch.
-LABELS = {"head": "this PR", "base": "main"}
-
-
-def label(arm):
-    return LABELS.get(arm, arm)
 
 
 def number(ms):
@@ -58,35 +50,13 @@ def timing(row):
     return f"{seconds(row['median_ms'])} <sub>{number(row['min_ms'])}–{number(row['max_ms'])}</sub>"
 
 
-def outcome(comparison):
-    """The paired test's outcome in the words the tables use."""
-    if comparison["outcome"] == "regression":
-        return "slower"
-    if comparison["outcome"] == "improvement":
-        return "faster"
-    return "no verdict" if comparison["n"] < MIN_PAIRS else "no clear change"
-
-
 def change(comparison):
-    """The paired verdict in words, with its 95% interval once there are
-    enough pairs to have one."""
     if comparison is None:
         return "—"
-    n = comparison["n"]
-    if n < MIN_PAIRS:
-        return f"no verdict, {n} {'run' if n == 1 else 'runs'}"
-    pct = comparison["median_pct"]
-    interval = comparison.get("interval_95_pct")
-    bounds = (
-        ""
-        if interval is None
-        else f" <sub>{interval[0]:+.0f}% to {interval[1]:+.0f}%</sub>"
-    )
-    if comparison["outcome"] == "inconclusive":
-        return f"no clear change{bounds}"
-    size = abs(pct)
-    amount = f"{size:.0f}%" if size >= 10 else f"{size:.1f}%"
-    return f"**{amount} {'slower' if pct > 0 else 'faster'}**{bounds}"
+    text = f"{comparison['median_pct']:+.1f}%"
+    if comparison["outcome"] != "inconclusive":
+        text = f"**{text} {comparison['outcome']}**"
+    return text
 
 
 def arms(rows):
@@ -112,12 +82,6 @@ def load(directory):
             for r in payload.get("records", [])
             if r.get("result", {}).get("cache_tool_version")
         }
-        identity = payload.get("identity") or {}
-        project["commits"] = {
-            arm: identity[key]
-            for arm, key in (("head", "BENCH_HEAD_SHA"), ("base", "BENCH_BASE_SHA"))
-            if identity.get(key)
-        }
     summary = directory / "summary.json"
     if not summary.exists():
         report = directory / "perf-gate.md"
@@ -133,9 +97,25 @@ def load(directory):
     return project
 
 
-def details(summary, body):
+def pivot(title, phases, rows):
+    columns = arms(rows)
+    by_key = {(row["arm"], row["phase"]): row for row in rows}
+    lines = [
+        f"| {title} | " + " | ".join(columns) + " |",
+        "| --- |" + " ---: |" * len(columns),
+    ]
+    for phase, label in phases:
+        cells = [
+            timing(by_key[(arm, phase)]) if (arm, phase) in by_key else "—"
+            for arm in columns
+        ]
+        lines.append(f"| {label} | " + " | ".join(cells) + " |")
+    return lines
+
+
+def details(summary, body, open_=False):
     return [
-        "<details>",
+        "<details open>" if open_ else "<details>",
         f"<summary>{summary}</summary>",
         "",
         *body,
@@ -145,72 +125,108 @@ def details(summary, body):
     ]
 
 
-def overview(projects):
-    """One open table per subject: this PR against its base branch with the
-    change, then every other tool, for isolated and contended builds."""
-    lines = []
+def head_vs_base(projects):
     compared = [p for p in projects if p["summary"]["comparisons"]]
-    for p in projects:
-        summary = p["summary"]
-        contended = summary.get("contention", {}).get("statistics", [])
-        columns = arms(summary["statistics"] + contended)
-        paired = p in compared and {"head", "base"} <= set(columns)
-        if paired:
-            others = [arm for arm in columns if arm not in ("head", "base")]
-            columns = ["head", "base"] + others
-        header = [p["name"]] + [label(arm) for arm in columns]
-        align = ["---"] + ["---:"] * len(columns)
-        if paired:
-            header.insert(3, "Change")
-            align.insert(3, "---")
-        lines += ["| " + " | ".join(header) + " |", "| " + " | ".join(align) + " |"]
-        rows = [(phase, name, summary["statistics"], phase) for phase, name in PHASES]
-        if contended:
-            rows += [
-                (phase, f"Contention, {name.lower()}", contended, f"contention_{phase}")
-                for phase, name in CONTENTION_PHASES
-            ]
-        for phase, name, stats, key in rows:
-            by_arm = {row["arm"]: row for row in stats if row["phase"] == phase}
-            cells = [name] + [
-                timing(by_arm[arm]) if arm in by_arm else "—" for arm in columns
-            ]
-            if paired:
-                comparison = next(
-                    (c for c in summary["comparisons"] if c["phase"] == key), None
-                )
-                cells.insert(3, change(comparison))
-            lines.append("| " + " | ".join(cells) + " |")
-        lines.append("")
-    if compared:
-        counts = [c["n"] for p in compared for c in p["summary"]["comparisons"]]
-        pairs, fewest = max(counts), min(counts)
-        runs = (
-            "1 run"
-            if pairs == 1
-            else f"{pairs} runs" if fewest == pairs else f"{fewest} to {pairs} runs"
-        )
-        lines.append(
-            f"Times are medians of {runs} of each. Change is this PR against {label('base')} over paired runs: named only when the 95% interval of the paired difference clears 5% and 250 ms, and only with {MIN_PAIRS} or more pairs. With fewer there is no verdict, and the gate decides on cache misses alone."
-        )
-        lines.append("")
-    notes = [
-        "Times exclude setup. Each warm build starts from the cold cache snapshot and an empty build directory. Only this PR against its base decides the verdict; other tools are context."
+    if not compared:
+        return []
+    header = ["Build"]
+    for p in compared:
+        header += [f"{p['name']} base", f"{p['name']} head", f"{p['name']} change"]
+    lines = [
+        "| " + " | ".join(header) + " |",
+        "| --- |" + " ---: |" * (len(header) - 1),
     ]
-    first = next((p.get("contention", {}) for p in projects if "contention" in p), {})
-    if "parallelism" in first:
-        notes.append(
-            f"Contention runs six Cargo builds, {first['parallelism']} at once, each with {first['jobs_per_build']} jobs and its own empty target directory, and each tool shares one store across them."
+    rows = [(phase, label, "statistics") for phase, label in PHASES]
+    if any("contention" in p["summary"] for p in compared):
+        rows += [
+            (phase, f"Contention, {label.lower()}", "contention")
+            for phase, label in CONTENTION_PHASES
+        ]
+    for phase, label, source in rows:
+        cells = [label]
+        for p in compared:
+            summary = p["summary"]
+            stats = (
+                summary["statistics"]
+                if source == "statistics"
+                else summary.get("contention", {}).get("statistics", [])
+            )
+            by_arm = {row["arm"]: row for row in stats if row["phase"] == phase}
+            key = phase if source == "statistics" else f"contention_{phase}"
+            comparison = next(
+                (c for c in summary["comparisons"] if c["phase"] == key), None
+            )
+            cells += [
+                seconds(by_arm["base"]["median_ms"]) if "base" in by_arm else "—",
+                seconds(by_arm["head"]["median_ms"]) if "head" in by_arm else "—",
+                change(comparison),
+            ]
+        lines.append("| " + " | ".join(cells) + " |")
+    pairs = [c["n"] for p in compared for c in p["summary"]["comparisons"]]
+    lines.append("")
+    if max(pairs) < MIN_PAIRS:
+        noun = "pair" if max(pairs) == 1 else "pairs"
+        lines.append(
+            f"Times are medians. With {max(pairs)} {noun} per build and {MIN_PAIRS} needed for a timing verdict, every change is inconclusive."
         )
-    return lines + [" ".join(notes), ""]
+    else:
+        lines.append(
+            f"Times are medians; positive changes are slower. A change is marked only when it clears the paired test below, so builds with fewer than {MIN_PAIRS} pairs stay inconclusive."
+        )
+    return lines
 
 
-def contention_counters(projects):
-    counters = []
+def tool_versions(projects):
+    """Each arm's `--version`, per subject only where the subjects disagree."""
+    per_arm = {}
     for p in projects:
+        for arm, version in p.get("versions", {}).items():
+            per_arm.setdefault(arm, {}).setdefault(version, []).append(p["name"])
+    if not per_arm:
+        return []
+    parts = []
+    for arm in arms([{"arm": arm} for arm in per_arm]):
+        versions = per_arm[arm]
+        if len(versions) == 1:
+            parts.append(f"{arm} `{next(iter(versions))}`")
+        else:
+            parts += [
+                f"{arm} `{version}` ({', '.join(names)})"
+                for version, names in versions.items()
+            ]
+    return ["Versions: " + ", ".join(parts) + ".", ""]
+
+
+def all_tools(projects, open_):
+    body = []
+    for p in projects:
+        body += pivot(p["name"], PHASES, p["summary"]["statistics"]) + [""]
+    body.append(
+        "Times exclude setup. Each warm build starts from the cold cache snapshot and an empty build directory. Other tools are context and never decide the verdict."
+    )
+    return details("All tools, isolated builds", body, open_)
+
+
+def contention(projects):
+    measured = [p for p in projects if "contention" in p["summary"]]
+    if not measured:
+        return []
+    body = []
+    for p in measured:
+        if p["summary"]["contention"]["statistics"]:
+            body += pivot(
+                p["name"], CONTENTION_PHASES, p["summary"]["contention"]["statistics"]
+            ) + [""]
+    first = measured[0].get("contention", {})
+    if "parallelism" in first:
+        body.append(
+            f"Six Cargo jobs, {first['parallelism']} at once, each with {first['jobs_per_build']} Cargo jobs and its own empty target directory. Each tool shares one store across the six jobs. Every warm batch starts from its cold seed, and a new seed is measured every {first['cold_every']} samples."
+        )
+    counters = []
+    for p in measured:
         rows = [
             row
-            for row in p["summary"].get("contention", {}).get("statistics", [])
+            for row in p["summary"]["contention"]["statistics"]
             if row.get("compiler_runs") is not None
         ]
         if not rows:
@@ -219,52 +235,22 @@ def contention_counters(projects):
             f"| {p['name']} | Compiler runs | Duplicate keys | Flight wait | Permit wait |",
             "| --- | ---: | ---: | ---: | ---: |",
         ]
-        for phase, name in CONTENTION_PHASES:
+        for phase, label in CONTENTION_PHASES:
             by_arm = {row["arm"]: row for row in rows if row["phase"] == phase}
             for arm in arms(by_arm.values()):
                 row = by_arm[arm]
                 counters.append(
-                    f"| {label(arm)}, {name.lower()} | {count(row['compiler_runs'])} | {count(row['duplicate_key_compiles'])} | "
+                    f"| {arm}, {label.lower()} | {count(row['compiler_runs'])} | {count(row['duplicate_key_compiles'])} | "
                     f"{seconds(row['flight_wait_ms'])} | {seconds(row['permit_wait_ms'])} |"
                 )
         counters.append("")
-    if not counters:
-        return []
-    first = next((p.get("contention", {}) for p in projects if "contention" in p), {})
-    reseed = (
-        f" Every warm batch starts from its cold seed, and a new seed is measured every {first['cold_every']} samples."
-        if "cold_every" in first
-        else ""
-    )
-    counters.append(
-        "Medians per batch. Waits add up overlapping events across jobs, so they are not wall-clock savings."
-        + reseed
-    )
-    return details("Contention counters", counters)
-
-
-def tool_versions(projects):
-    """This PR and its base by commit, every other tool by `--version`, per
-    subject only where the subjects disagree."""
-    per_arm = {}
-    for p in projects:
-        commits = p.get("commits", {})
-        for arm, version in p.get("versions", {}).items():
-            shown = commits[arm][:8] if arm in commits else version.removeprefix(f"{arm} ")
-            per_arm.setdefault(arm, {}).setdefault(shown, []).append(p["name"])
-    if not per_arm:
-        return []
-    parts = []
-    for arm in arms([{"arm": arm} for arm in per_arm]):
-        versions = per_arm[arm]
-        if len(versions) == 1:
-            parts.append(f"{label(arm)} `{next(iter(versions))}`")
-        else:
-            parts += [
-                f"{label(arm)} `{version}` ({', '.join(names)})"
-                for version, names in versions.items()
-            ]
-    return ["Measured: " + ", ".join(parts) + ".", ""]
+    if counters:
+        body += [
+            "",
+            *counters,
+            "Medians per batch. Waits add up overlapping events across jobs, so they are not wall-clock savings.",
+        ]
+    return details("All tools, contention", body)
 
 
 def disk_use(projects):
@@ -275,10 +261,10 @@ def disk_use(projects):
             continue
         columns = arms(records)
         storage += [
-            f"| {p['name']} (GiB) | " + " | ".join(label(arm) for arm in columns) + " |",
+            f"| {p['name']} (GiB) | " + " | ".join(columns) + " |",
             "| --- |" + " ---: |" * len(columns),
         ]
-        for phase, name in CONTENTION_PHASES:
+        for phase, label in CONTENTION_PHASES:
             for scope, scope_label in (
                 ("cache", "cache"),
                 ("targets", "targets"),
@@ -295,7 +281,7 @@ def disk_use(projects):
                         f"{sum(sizes) / len(sizes) / 2**30:.2f}" if sizes else "—"
                     )
                 storage.append(
-                    f"| After {name.lower()}, {scope_label} | " + " | ".join(cells) + " |"
+                    f"| After {label.lower()}, {scope_label} | " + " | ".join(cells) + " |"
                 )
         storage.append("")
     if not storage:
@@ -314,7 +300,7 @@ def comparison_detail(projects):
         "| Build | " + " | ".join(p["name"] for p in compared) + " |",
         "| --- |" + " --- |" * len(compared),
     ]
-    for phase, name in COMPARISONS:
+    for phase, label in COMPARISONS:
         cells = []
         for p in compared:
             c = next((c for c in p["summary"]["comparisons"] if c["phase"] == phase), None)
@@ -329,18 +315,17 @@ def comparison_detail(projects):
             )
             noun = "pair" if c["n"] == 1 else "pairs"
             cells.append(
-                f"{c['median_pct']:+.1f}%{bounds}, {c['n']} {noun}, {outcome(c)}"
+                f"{c['median_pct']:+.1f}%{bounds}, {c['n']} {noun}, {c['outcome']}"
             )
-        body.append(f"| {name} | " + " | ".join(cells) + " |")
+        body.append(f"| {label} | " + " | ".join(cells) + " |")
     body += [
         "",
-        f"This PR and {label('base')} run as paired samples; positive changes are slower. Parentheses hold the 95% bootstrap interval. A regression needs at least {MIN_PAIRS} pairs, an interval entirely above +5% and a median change above 250 ms; an improvement is the mirror image. More Kache misses or passthroughs than {label('base')} fail the gate whatever the timing. `samples.json` in the run artifacts has source and tool versions, run order and raw reports.",
+        f"Head and base run as paired samples; positive changes are slower. Parentheses hold the 95% bootstrap interval. A regression needs at least {MIN_PAIRS} pairs, an interval entirely above +5% and a median change above 250 ms; an improvement is the mirror image. More Kache misses or passthroughs than base fail the gate whatever the timing. `samples.json` in the run artifacts has source and tool versions, run order and raw reports.",
     ]
     return details("Paired comparison", body)
 
 
-def render(directories, verdict=None, base_label="main"):
-    LABELS["base"] = base_label
+def render(directories, verdict=None):
     projects = [load(d) for d in directories]
     valid = [p for p in projects if "summary" in p]
     invalid = [p for p in projects if "error" in p]
@@ -356,11 +341,13 @@ def render(directories, verdict=None, base_label="main"):
         lines += [f"- {name}: {failure}" for name, failure in failures]
         lines.append("")
     elif valid and any(p["summary"]["comparisons"] for p in valid):
-        lines += [f"This PR adds no cache misses or passthroughs over {label('base')}.", ""]
+        lines += ["Kache misses and passthroughs did not rise against base.", ""]
     if valid:
-        lines += overview(valid)
+        table = head_vs_base(valid)
+        lines += table + ([""] if table else [])
         lines += tool_versions(valid)
-        lines += contention_counters(valid)
+        lines += all_tools(valid, open_=not table)
+        lines += contention(valid)
         lines += disk_use([p for p in valid if "contention" in p])
         lines += comparison_detail(valid)
     return "\n".join(lines).rstrip() + "\n"
@@ -372,12 +359,9 @@ def main():
     parser.add_argument(
         "--verdict", help="headline verdict; derived from the data when omitted"
     )
-    parser.add_argument(
-        "--base-label", default="main", help="the base branch, as readers know it"
-    )
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
-    text = render(args.directories, args.verdict, args.base_label)
+    text = render(args.directories, args.verdict)
     if args.output:
         args.output.write_text(text)
     else:

@@ -804,10 +804,29 @@ pub(crate) fn is_kache_subcommand_or_flag(s: &str) -> bool {
     if s.starts_with('-') {
         return true;
     }
-    use clap::CommandFactory;
-    let mut cmd = crate::Cli::command();
-    cmd.build();
-    cmd.find_subcommand(s).is_some()
+    // A compiler path, which is what a wrapper invocation carries, is never a
+    // subcommand name. Building the command tree to find that out costs a
+    // fifth of a cache hit.
+    if s.contains(['/', '\\']) {
+        return false;
+    }
+    kache_subcommands().iter().any(|name| name == s)
+}
+
+/// Every subcommand name and alias, from the command tree built once.
+fn kache_subcommands() -> &'static [String] {
+    static NAMES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    NAMES.get_or_init(|| {
+        use clap::CommandFactory;
+        let mut cmd = crate::Cli::command();
+        cmd.build();
+        cmd.get_subcommands()
+            .flat_map(|sub| {
+                std::iter::once(sub.get_name().to_string())
+                    .chain(sub.get_all_aliases().map(str::to_string))
+            })
+            .collect()
+    })
 }
 
 /// Do these compiler args (argv after the program) form a pure version/info
@@ -1021,6 +1040,29 @@ mod tests {
         assert!(is_kache_subcommand_or_flag("gc"));
         assert!(is_kache_subcommand_or_flag("list"));
         assert!(!is_kache_subcommand_or_flag("not-a-subcommand"));
+        // A compiler path never names a subcommand, even one ending in one.
+        assert!(!is_kache_subcommand_or_flag("/usr/bin/rustc"));
+        assert!(!is_kache_subcommand_or_flag("./gc"));
+        assert!(!is_kache_subcommand_or_flag("C:\\tools\\list"));
+    }
+
+    /// The names come from the command tree itself, so a new subcommand is
+    /// recognized without touching this module.
+    #[test]
+    fn subcommand_names_match_the_command_tree() {
+        use clap::CommandFactory;
+        let mut cmd = crate::Cli::command();
+        cmd.build();
+        for sub in cmd.get_subcommands() {
+            assert!(
+                is_kache_subcommand_or_flag(sub.get_name()),
+                "{}",
+                sub.get_name()
+            );
+            for alias in sub.get_all_aliases() {
+                assert!(is_kache_subcommand_or_flag(alias), "{alias}");
+            }
+        }
     }
 
     fn s(args: &[&str]) -> Vec<String> {

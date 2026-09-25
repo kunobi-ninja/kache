@@ -315,23 +315,10 @@ pub(crate) fn debug_bundle_command(binary: &Path, bundle_dir: &Path) -> Result<C
 }
 
 /// `out_dir`'s ancestor that is Cargo's profile directory, or `None` when
-/// this is not one of Cargo's link output directories.
-///
-/// Anchored on the directory names Cargo itself uses rather than on the
-/// depth below the target directory, because those differ: a binary and an
-/// example land in `<profile>/deps` and `<profile>/examples`, a build
-/// script in `<profile>/build/<pkg>-<hash>`. Only those two levels are
-/// examined, so a project that happens to live under a directory called
-/// `deps` cannot drag the prefix up to it.
+/// this is not one of Cargo's link output directories. See
+/// [`crate::cargo_layout::profile_dir`].
 pub(crate) fn cargo_profile_dir(out_dir: &Path) -> Option<PathBuf> {
-    let parent = out_dir.parent();
-    for cursor in [Some(out_dir), parent].into_iter().flatten() {
-        let name = cursor.file_name()?;
-        if name == "deps" || name == "examples" || name == "build" {
-            return cursor.parent().map(Path::to_path_buf);
-        }
-    }
-    None
+    crate::cargo_layout::profile_dir(out_dir)
 }
 
 /// Tar `bundle_dir`'s contents (paths relative to the bundle root, e.g.

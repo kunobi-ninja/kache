@@ -4429,7 +4429,8 @@ fn cc_prefix_maps_uncached(parsed: &CcArgs, configured_base_dirs: &[String]) -> 
 }
 
 /// Map the build-script output directories of the other crates this compile
-/// includes from (`-I<target>/debug/build/libz-sys-<hash>/out/include`) to
+/// includes from (`-I<target>/debug/build/libz-sys-<hash>/out/include`, or
+/// `.../build/libz-sys/<hash>/out/include` from Cargo 1.100) to
 /// [`CC_DEP_OUT_DIR_SENTINEL`] plus the crate name, dropping Cargo's
 /// metadata hash. The compile's own `OUT_DIR` keeps its map. A crate name
 /// that resolves to two units in one compile keeps the hash: the sentinel
@@ -4447,7 +4448,7 @@ fn push_cargo_dep_out_dir_maps(
     let mut units: std::collections::BTreeMap<String, Vec<PathBuf>> =
         std::collections::BTreeMap::new();
     for dir in include_dirs {
-        let Some((unit_out, name)) = cargo_unit_out_dir(&target, dir) else {
+        let Some((unit_out, name)) = crate::cargo_layout::unit_out_dir_under(&target, dir) else {
             continue;
         };
         if unit_out == own {
@@ -4473,31 +4474,6 @@ fn push_cargo_dep_out_dir_maps(
             }
         }
     }
-}
-
-/// The `<target>/[<triple>/]<profile>/build/<name>-<hash>/out` directory an
-/// include directory sits in, with the crate name, when it has that shape.
-fn cargo_unit_out_dir(target: &Path, dir: &Path) -> Option<(PathBuf, String)> {
-    let rel = dir.strip_prefix(target).ok()?;
-    let components: Vec<&OsStr> = rel.iter().collect();
-    // `<profile>/build/<unit>/out` or `<triple>/<profile>/build/<unit>/out`.
-    let build = components
-        .iter()
-        .position(|component| *component == "build")
-        .filter(|index| (1..=2).contains(index))?;
-    let unit = components.get(build + 1)?.to_str()?;
-    if *components.get(build + 2)? != "out" {
-        return None;
-    }
-    let (name, hash) = unit.rsplit_once('-')?;
-    if name.is_empty() || hash.len() != 16 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return None;
-    }
-    // The directory as spelled, not rejoined: separators must match the
-    // argv this map is applied to.
-    let below_out = components.len() - (build + 3);
-    let unit_out = dir.ancestors().nth(below_out)?.to_path_buf();
-    Some((unit_out, name.to_string()))
 }
 
 /// Map a build script's `OUT_DIR`, and the target directory it sits in, to
@@ -14735,6 +14711,45 @@ mod tests {
             cc_prefix_maps_key(&[map("", "/kache/root")]),
             cc_prefix_maps_key(&[]),
             "an empty source maps nothing and does not key"
+        );
+    }
+
+    /// From Cargo 1.100 a build script's OUT_DIR is `build/<pkg>/<hash>/out`.
+    /// The compile still maps its own OUT_DIR and the target directory, and a
+    /// dependency's include maps to the name it has in the legacy layout.
+    #[test]
+    fn per_unit_out_dirs_map_like_the_legacy_layout() {
+        let _lock = crate::test_support::process_state_test_lock();
+        // SAFETY: the process-state lock serialises environment edits.
+        unsafe { std::env::remove_var("TARGET") };
+        let cwd = Path::new("/registry/src/index/libfoo-sys-1.0.0");
+        let target = "/work/new/target";
+        let out = PathBuf::from(format!(
+            "{target}/debug/build/libfoo-sys/0123456789abcdef/out"
+        ));
+        let dep = format!("{target}/debug/build/libz-sys/fedcba9876543210/out/include");
+        let mut maps = Vec::new();
+        push_cargo_out_dir_maps(&mut maps, cwd, &out);
+        push_cargo_dep_out_dir_maps(&mut maps, cwd, &out, &[PathBuf::from(&dep)]);
+        maps.sort_by_key(|m| std::cmp::Reverse(m.from.len()));
+        let mapped = |arg: &str| {
+            String::from_utf8(apply_cc_prefix_maps_to_bytes(
+                arg.as_bytes().to_vec(),
+                &maps,
+            ))
+            .unwrap()
+        };
+        assert_eq!(
+            mapped(&format!("-I{dep}")),
+            format!("-I{CC_DEP_OUT_DIR_SENTINEL}/libz-sys/include")
+        );
+        assert_eq!(
+            mapped(&format!("{}/gen.h", out.display())),
+            format!("{CC_OUT_DIR_SENTINEL}/gen.h")
+        );
+        assert_eq!(
+            mapped(&format!("{target}/debug/libother.a")),
+            format!("{CC_TARGET_SENTINEL}/debug/libother.a")
         );
     }
 

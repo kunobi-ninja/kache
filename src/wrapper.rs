@@ -3260,6 +3260,7 @@ fn run_parsed_rustc(
         event_root.clone(),
         heartbeat_lines_enabled(progress_level()),
     );
+    maybe_notice_unknown_layout(config, args, &event_root, now_epoch_secs());
     // A fresh machine has no prediction rows; let the key ask the remote for
     // a portable one before paying the pre-pass (kunobi-ninja/kache#1011).
     crate::cache_key::set_remote_rows(remote_prediction_rows(config));
@@ -7513,6 +7514,64 @@ fn maybe_trigger_prefetch_with(
     );
     write_locked_marker(&lock_file, &session_id);
     PrefetchTrigger::Sent
+}
+
+/// The output directory of a compile Cargo drove into a directory no layout
+/// in [`crate::cargo_layout`] knows, or `None`.
+///
+/// `cargo_crate_name` is `CARGO_CRATE_NAME`, which Cargo sets to the crate it
+/// compiles. A rustc that a build script runs to probe the compiler inherits
+/// the script's environment but compiles a crate of its own name, so it does
+/// not count, and neither does a compile no Cargo drove.
+fn unrecognized_cargo_layout<'a>(
+    args: &'a RustcArgs,
+    cargo_crate_name: Option<&std::ffi::OsStr>,
+) -> Option<&'a Path> {
+    let out_dir = args.out_dir.as_deref()?;
+    let crate_name = args.crate_name.as_deref()?;
+    (cargo_crate_name == Some(std::ffi::OsStr::new(crate_name))
+        && !crate::cargo_layout::is_cargo_unit_dir(out_dir))
+    .then_some(out_dir)
+}
+
+/// Tell the person once per build session when Cargo writes somewhere kache
+/// does not recognize. The compile still runs and caches, but build-script
+/// caching, the shared `OUT_DIR` and the cross-checkout path mapping that
+/// depend on the layout are off, and a newer Cargo is the likely cause.
+/// Only a directory under Cargo's own `CACHEDIR.TAG` counts: another build
+/// system can set Cargo's variables for rustc without using its layout.
+/// Returns whether the line was shown.
+fn maybe_notice_unknown_layout(config: &Config, args: &RustcArgs, root: &str, now: u64) -> bool {
+    let cargo_crate_name = std::env::var_os("CARGO_CRATE_NAME");
+    let Some(out_dir) = unrecognized_cargo_layout(args, cargo_crate_name.as_deref()) else {
+        return false;
+    };
+    if cargo_workspace_of(out_dir).is_none() {
+        return false;
+    }
+    tracing::debug!("unrecognized Cargo layout: {}", out_dir.display());
+    let session_id = session_id_for_event(config, root, now);
+    if session_id.is_empty() {
+        return false;
+    }
+    let marker = session_marker_path(config, root).with_extension("layout");
+    if std::fs::read_to_string(&marker).is_ok_and(|seen| seen == session_id) {
+        return false;
+    }
+    let Some(lock_file) = open_marker_for_lock(&marker) else {
+        return false;
+    };
+    if lock_file.try_lock().is_err() || read_locked_marker(&lock_file) == session_id {
+        return false;
+    }
+    write_locked_marker(&lock_file, &session_id);
+    crate::notice::show(&format!(
+        "[kache] Cargo is writing to a directory layout kache does not recognize ({}). \
+         Builds still work, but build-script caching and cross-checkout reuse are reduced. \
+         Please report your `cargo -V` at https://github.com/kunobi-ninja/kache/issues",
+        out_dir.display()
+    ));
+    true
 }
 
 /// Where [`maybe_trigger_prefetch`] records the session it sent a hint for.
@@ -15567,6 +15626,82 @@ exit 0
         // The hint is recorded against the session it was sent for.
         let sent = prefetch_marker_path(&config, root.to_str().unwrap());
         assert_eq!(std::fs::read_to_string(sent).unwrap(), session_id);
+    }
+
+    #[test]
+    fn only_a_cargo_compile_outside_every_layout_is_unrecognized() {
+        let args = |out_dir: &str| {
+            let mut args = RustcArgs::default();
+            args.crate_name = Some("demo".into());
+            args.out_dir = Some(PathBuf::from(out_dir));
+            args
+        };
+        let cargo = Some(std::ffi::OsStr::new("demo"));
+        let unknown = args("/w/target/debug/units/demo/out");
+        assert_eq!(
+            unrecognized_cargo_layout(&unknown, cargo),
+            Some(Path::new("/w/target/debug/units/demo/out"))
+        );
+        for known in [
+            "/w/target/debug/deps",
+            "/w/target/debug/build/demo/0123456789abcdef/out",
+        ] {
+            assert_eq!(
+                unrecognized_cargo_layout(&args(known), cargo),
+                None,
+                "{known}"
+            );
+        }
+        assert_eq!(
+            unrecognized_cargo_layout(&unknown, Some(std::ffi::OsStr::new("probe"))),
+            None,
+            "a build script's probe compiles another crate"
+        );
+        assert_eq!(unrecognized_cargo_layout(&unknown, None), None, "no Cargo");
+        let mut no_crate = unknown.clone();
+        no_crate.crate_name = None;
+        assert_eq!(unrecognized_cargo_layout(&no_crate, cargo), None);
+    }
+
+    #[test]
+    fn the_unknown_layout_notice_shows_once_per_session() {
+        let _lock = crate::test_support::process_state_test_lock();
+        let dir = tempfile::TempDir::new().unwrap();
+        let config = test_config(dir.path().to_path_buf());
+        let root = "/some/workspace";
+        let target = tagged_target(&dir.path().join("w"));
+        let mut unknown = RustcArgs::default();
+        unknown.crate_name = Some("demo".into());
+        unknown.out_dir = Some(target.join("debug/units/demo/out"));
+        let mut known = unknown.clone();
+        known.out_dir = Some(target.join("debug/deps"));
+        let mut untagged = unknown.clone();
+        untagged.out_dir = Some(dir.path().join("bazel-out/units/demo/out"));
+        let previous = std::env::var_os("CARGO_CRATE_NAME");
+        // SAFETY: the process-state lock serialises environment edits.
+        unsafe { std::env::set_var("CARGO_CRATE_NAME", "demo") };
+        // A minted session records the real clock, so the test runs on it.
+        let now = now_epoch_secs();
+        let shown = [
+            maybe_notice_unknown_layout(&config, &untagged, root, now),
+            maybe_notice_unknown_layout(&config, &known, root, now),
+            maybe_notice_unknown_layout(&config, &unknown, root, now),
+            maybe_notice_unknown_layout(&config, &unknown, root, now + 1),
+            maybe_notice_unknown_layout(&config, &unknown, root, now + BUILD_SESSION_SECS + 2),
+        ];
+        // Another wrapper holding the marker is showing the line itself.
+        let later = now + 3 * BUILD_SESSION_SECS;
+        let marker = session_marker_path(&config, root).with_extension("layout");
+        let held = open_marker_for_lock(&marker).unwrap();
+        held.lock().unwrap();
+        let while_held = maybe_notice_unknown_layout(&config, &unknown, root, later);
+        drop(held);
+        match previous {
+            Some(value) => unsafe { std::env::set_var("CARGO_CRATE_NAME", value) },
+            None => unsafe { std::env::remove_var("CARGO_CRATE_NAME") },
+        }
+        assert_eq!(shown, [false, false, true, false, true]);
+        assert!(!while_held);
     }
 
     #[test]

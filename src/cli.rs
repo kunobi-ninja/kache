@@ -2668,6 +2668,146 @@ fn walk_project_dir(
     }
 }
 
+/// Count a profile's `build` directory. Before Cargo 1.100 it holds build
+/// scripts and their `OUT_DIR`s. From 1.100 it holds every unit as
+/// `<pkg>/<hash>/`, with the unit's `fingerprint/`, the `out/` rustc or a
+/// build script wrote, and a build-script run's `run/`. Anything else counts
+/// as build scripts, as the whole directory did before.
+fn walk_build_dir(
+    dir: &std::path::Path,
+    stats: &mut ProjectStats,
+    breakdown: &mut CategoryBreakdown,
+    reclaim: &mut ReclaimEstimator,
+    cache_candidates: &mut Vec<CacheCandidate>,
+) {
+    for (package, is_dir) in real_entries(dir) {
+        let name = package.file_name().unwrap_or_default().to_string_lossy();
+        if !is_dir || crate::cargo_layout::legacy_unit_package(&name).is_some() {
+            count_path(
+                &package,
+                is_dir,
+                ProjectBucket::BuildScripts,
+                false,
+                stats,
+                breakdown,
+                reclaim,
+                cache_candidates,
+            );
+            continue;
+        }
+        for (unit, is_dir) in real_entries(&package) {
+            let name = unit.file_name().unwrap_or_default().to_string_lossy();
+            if !is_dir || !crate::cargo_layout::is_unit_hash(&name) {
+                count_path(
+                    &unit,
+                    is_dir,
+                    ProjectBucket::BuildScripts,
+                    false,
+                    stats,
+                    breakdown,
+                    reclaim,
+                    cache_candidates,
+                );
+                continue;
+            }
+            let out_bucket = per_unit_out_bucket(&unit);
+            for (part, is_dir) in real_entries(&unit) {
+                let (bucket, cache_eligible) = match part.file_name().and_then(|name| name.to_str())
+                {
+                    Some("fingerprint") => (ProjectBucket::Fingerprints, false),
+                    Some("out") => out_bucket,
+                    _ => (ProjectBucket::BuildScripts, false),
+                };
+                count_path(
+                    &part,
+                    is_dir,
+                    bucket,
+                    cache_eligible,
+                    stats,
+                    breakdown,
+                    reclaim,
+                    cache_candidates,
+                );
+            }
+        }
+    }
+}
+
+/// `dir`'s entries that are regular files or real directories, with whether
+/// each is a directory. Symlinks are skipped, as [`walk_project_dir`] skips
+/// them.
+fn real_entries(dir: &std::path::Path) -> Vec<(std::path::PathBuf, bool)> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let kind = entry.file_type().ok()?;
+            (kind.is_dir() || kind.is_file()).then(|| (entry.path(), kind.is_dir()))
+        })
+        .collect()
+}
+
+/// Count one file, or everything below one directory, in `bucket`.
+#[allow(clippy::too_many_arguments)]
+fn count_path(
+    path: &std::path::Path,
+    is_dir: bool,
+    bucket: ProjectBucket,
+    cache_eligible: bool,
+    stats: &mut ProjectStats,
+    breakdown: &mut CategoryBreakdown,
+    reclaim: &mut ReclaimEstimator,
+    cache_candidates: &mut Vec<CacheCandidate>,
+) {
+    if is_dir {
+        walk_project_dir(
+            path,
+            bucket,
+            cache_eligible,
+            stats,
+            breakdown,
+            reclaim,
+            cache_candidates,
+        );
+        return;
+    }
+    let Ok(meta) = std::fs::metadata(path) else {
+        return;
+    };
+    let observation = observe_storage(path, &meta);
+    record_scanned_file(
+        stats,
+        breakdown,
+        reclaim,
+        cache_candidates,
+        meta.len(),
+        bucket,
+        cache_eligible,
+        observation,
+    );
+}
+
+/// The bucket a per-unit `out` counts in. A build script's binary and a
+/// run's `OUT_DIR` count as build scripts, as they do in the legacy layout;
+/// every other unit's outputs count as deps.
+fn per_unit_out_bucket(unit_dir: &std::path::Path) -> (ProjectBucket, bool) {
+    let compiled_build_script = std::fs::read_dir(unit_dir.join("out")).is_ok_and(|entries| {
+        entries.flatten().any(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("build_script_")
+        })
+    });
+    if unit_dir.join("run").is_dir() || compiled_build_script {
+        (ProjectBucket::BuildScripts, false)
+    } else {
+        (ProjectBucket::Deps, true)
+    }
+}
+
 /// Analyze a project's target/ directory: which files share storage with kache's
 /// store (reflinked or hardlinked) vs local-only, with per-category breakdown.
 fn compute_project_stats(target_dir: &std::path::Path) -> (ProjectStats, CategoryBreakdown) {
@@ -2724,10 +2864,8 @@ fn compute_project_stats(target_dir: &std::path::Path) -> (ProjectStats, Categor
                         );
                     }
                     "build" => {
-                        walk_project_dir(
+                        walk_build_dir(
                             &path,
-                            ProjectBucket::BuildScripts,
-                            false,
                             &mut stats,
                             &mut breakdown,
                             &mut reclaim,
@@ -9295,6 +9433,39 @@ mod tests {
         assert_eq!(stats.total_bytes, 0);
         assert_eq!(stats.estimated_reclaimable_bytes, 0);
         assert!(detect_profiles(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn compute_project_stats_reads_cargos_per_unit_build_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        let build = dir.path().join("debug/build");
+        let write = |path: &str, len: usize| {
+            let path = build.join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, vec![0u8; len]).unwrap();
+        };
+        write("foo/0123456789abcdef/fingerprint/lib-foo", 5);
+        write("foo/0123456789abcdef/out/libfoo-0123456789abcdef.rlib", 7);
+        write("foo/1111111111111111/out/build_script_build", 11);
+        write("foo/2222222222222222/out/gen.rs", 13);
+        write("foo/2222222222222222/run/stdout", 17);
+        write("bar-0123456789abcdef/output", 19);
+        write("loose", 23);
+        write("foo/0123456789abcdef/extra", 29);
+        write("foo/not-a-unit/out/libfoo.rlib", 31);
+        write("foo/fedcba9876543210", 37);
+
+        let (stats, breakdown) = compute_project_stats(dir.path());
+        assert_eq!(stats.total_bytes, 95 + 29 + 31 + 37);
+        assert_eq!(breakdown.fingerprints, 5);
+        assert_eq!(breakdown.deps_local, 7, "a compiled unit's out is deps");
+        assert_eq!(
+            breakdown.build_scripts,
+            11 + 13 + 17 + 19 + 23 + 29 + 31 + 37,
+            "a build script's binary, a run, the legacy layout, and anything \
+             unrecognized, as the whole directory used to"
+        );
+        assert_eq!(breakdown.other, 0);
     }
 
     #[test]

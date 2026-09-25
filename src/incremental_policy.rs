@@ -11,7 +11,6 @@
 use crate::args::RustcArgs;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -137,7 +136,9 @@ impl AdaptiveUnit {
     /// `cargo_primary` should be a snapshot of Cargo's primary-package marker;
     /// passing it in keeps policy tests independent of process-global env.
     /// Eligible invocations must have a stable Cargo unit id and exactly:
-    /// `<profile>/deps` plus `<profile>/incremental`, both absolute.
+    /// `<profile>/deps` (or the unit's own `out` in Cargo's per-unit layout)
+    /// plus `<profile>/incremental`, both absolute. A build script is not:
+    /// Cargo gives it no extra filename, so it has no unit id.
     pub(crate) fn eligible(
         args: &RustcArgs,
         cargo_primary: bool,
@@ -158,10 +159,7 @@ impl AdaptiveUnit {
         if !safe_absolute_path(out_dir) {
             return None;
         }
-        if out_dir.file_name() != Some(OsStr::new("deps")) {
-            return None;
-        }
-        let profile = out_dir.parent()?;
+        let profile = crate::cargo_layout::deps_profile(out_dir)?;
         if original_incremental != &profile.join("incremental") {
             return None;
         }
@@ -921,6 +919,43 @@ mod tests {
             drop(next);
             drop(inherited);
         }
+    }
+
+    #[test]
+    fn a_per_unit_out_dir_is_eligible_but_its_build_script_is_not() {
+        let temp = tempfile::tempdir().unwrap();
+        let profile = temp.path().join("target/debug");
+        let out = profile.join("build/sample/1234abcd1234abcd/out");
+        let incremental = profile.join("incremental");
+        fs::create_dir_all(&out).unwrap();
+        fs::create_dir(&incremental).unwrap();
+        let argv = |crate_name: &str, extra: &[&str]| {
+            let mut argv: Vec<String> = vec![
+                "/toolchain/bin/rustc".into(),
+                "--crate-name".into(),
+                crate_name.into(),
+                "src/lib.rs".into(),
+                "--out-dir".into(),
+                out.to_string_lossy().into_owned(),
+                "-C".into(),
+                format!("incremental={}", incremental.display()),
+            ];
+            argv.extend(extra.iter().map(|arg| arg.to_string()));
+            RustcArgs::parse(&argv).unwrap()
+        };
+        let unit =
+            AdaptiveUnit::eligible(&argv("sample", &["-Cextra-filename=-1234abcd"]), true, b"")
+                .unwrap();
+        assert!(
+            unit.unit_dir
+                .starts_with(profile.join("incremental.kache-auto")),
+            "{}",
+            unit.unit_dir.display()
+        );
+        assert!(
+            AdaptiveUnit::eligible(&argv("build_script_build", &[]), true, b"").is_none(),
+            "Cargo 1.100 compiles a build script with no extra filename"
+        );
     }
 
     #[test]

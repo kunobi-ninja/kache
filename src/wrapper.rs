@@ -7425,20 +7425,35 @@ fn maybe_trigger_prefetch(config: &Config, args: &RustcArgs) {
     });
 }
 
+/// What [`maybe_trigger_prefetch_with`] did, so a test can tell which of its
+/// early returns it took.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrefetchTrigger {
+    NoRemote,
+    NoSession,
+    NotDue,
+    /// The marker cannot be opened as a regular file.
+    NoMarker,
+    /// Another process holds the marker's lock: it is sending the hint.
+    Busy,
+    DiscoveryFailed,
+    Sent,
+}
+
 /// [`maybe_trigger_prefetch`] with the clock and the discovery supplied.
 fn maybe_trigger_prefetch_with(
     config: &Config,
     args: &RustcArgs,
     now: u64,
     discover: impl FnOnce() -> Option<kache_core::BuildIntent>,
-) {
+) -> PrefetchTrigger {
     if config.remote.is_none() {
-        return;
+        return PrefetchTrigger::NoRemote;
     }
     let root = rustc_event_root(args);
     let session_id = session_id_for_event(config, &root, now);
     if session_id.is_empty() {
-        return;
+        return PrefetchTrigger::NoSession;
     }
     let marker = prefetch_marker_path(config, &root);
     if !prefetch_due(
@@ -7446,15 +7461,15 @@ fn maybe_trigger_prefetch_with(
         &session_id,
         now,
     ) {
-        return;
+        return PrefetchTrigger::NotDue;
     }
     let Some(lock_file) = open_marker_for_lock(&marker) else {
-        return;
+        return PrefetchTrigger::NoMarker;
     };
     // std::fs::File::try_lock (1.89+) is cross-platform: flock(2) on Unix,
     // LockFileEx on Windows. Lock auto-releases when `lock_file` is dropped.
     if lock_file.try_lock().is_err() {
-        return; // Another wrapper is already sending the prefetch hint
+        return PrefetchTrigger::Busy; // Another wrapper is already sending the prefetch hint
     }
     // Re-check through the locked handle: another process may have sent the
     // hint between our first read and acquiring the lock, and on Windows the
@@ -7462,7 +7477,7 @@ fn maybe_trigger_prefetch_with(
     let locked = read_locked_marker(&lock_file);
     let state = parse_prefetch_marker(&locked);
     if !prefetch_due(&state, &session_id, now) {
-        return;
+        return PrefetchTrigger::NotDue;
     }
 
     // Gather ALL dependency crate names in compilation order (leaves first).
@@ -7472,7 +7487,7 @@ fn maybe_trigger_prefetch_with(
         let record = failed_prefetch_marker(&session_id, now, &state);
         tracing::debug!("prefetch hint skipped, discovery failed; marker now {record}");
         write_locked_marker(&lock_file, &record);
-        return;
+        return PrefetchTrigger::DiscoveryFailed;
     };
 
     let shard_prefetch_enabled =
@@ -7497,6 +7512,7 @@ fn maybe_trigger_prefetch_with(
         ),
     );
     write_locked_marker(&lock_file, &session_id);
+    PrefetchTrigger::Sent
 }
 
 /// Where [`maybe_trigger_prefetch`] records the session it sent a hint for.
@@ -15756,15 +15772,18 @@ exit 0
 
     #[test]
     fn a_failed_discovery_backs_off_and_a_success_clears_it() {
-        // Each call re-derives the event root, which can fall back to the
-        // current directory: hold the lock so no other test moves it between
-        // calls and the marker stays the same file.
+        // `KACHE_EVENT_ROOT` would move the event root, and with it the
+        // marker, between calls.
         let _lock = crate::test_support::process_state_test_lock();
         let dir = tempfile::TempDir::new().unwrap();
         let mut config = test_config(dir.path().to_path_buf());
-        config.remote = Some(crate::config::RemoteConfig::test_s3("bucket", "kache/"));
         let mut args = rustc_args(&["rustc", "foo.rs"]);
         args.out_dir = Some(dir.path().join("target/debug/deps"));
+        assert_eq!(
+            maybe_trigger_prefetch_with(&config, &args, 0, || unreachable!()),
+            PrefetchTrigger::NoRemote
+        );
+        config.remote = Some(crate::config::RemoteConfig::test_s3("bucket", "kache/"));
         let root = rustc_event_root(&args);
         let marker = prefetch_marker_path(&config, &root);
         let intent = || kache_core::BuildIntent {
@@ -15773,6 +15792,20 @@ exit 0
             cargo_lock_deps: Vec::new(),
             identity_key: None,
         };
+        // The marker's lock is shared with every process that inherited its
+        // descriptor, and a test elsewhere in this binary can spawn a child
+        // while one of these calls holds it. That is another wrapper sending
+        // the hint as far as the code can tell, so wait it out.
+        let trigger = |now: u64, discover: &dyn Fn() -> Option<kache_core::BuildIntent>| {
+            for _ in 0..200 {
+                let outcome = maybe_trigger_prefetch_with(&config, &args, now, discover);
+                if outcome != PrefetchTrigger::Busy {
+                    return outcome;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            PrefetchTrigger::Busy
+        };
 
         let attempts = std::cell::Cell::new(0);
         let failing = || {
@@ -15780,24 +15813,36 @@ exit 0
             None
         };
         let start = now_epoch_secs();
-        maybe_trigger_prefetch_with(&config, &args, start, failing);
+        assert_eq!(trigger(start, &failing), PrefetchTrigger::DiscoveryFailed);
         assert_eq!(attempts.get(), 1);
         assert!(std::fs::read_to_string(&marker).unwrap().ends_with(":1"));
 
         // Inside the 30 s wait: no second attempt.
-        maybe_trigger_prefetch_with(&config, &args, start + 29, failing);
+        assert_eq!(trigger(start + 29, &failing), PrefetchTrigger::NotDue);
         assert_eq!(attempts.get(), 1);
 
         // After it: a second failure doubles the wait.
-        maybe_trigger_prefetch_with(&config, &args, start + 30, failing);
+        assert_eq!(
+            trigger(start + 30, &failing),
+            PrefetchTrigger::DiscoveryFailed
+        );
         assert_eq!(attempts.get(), 2);
         assert!(prefetch_due(
             &parse_prefetch_marker(&std::fs::read_to_string(&marker).unwrap()),
             "any",
             start + 90
         ));
-        maybe_trigger_prefetch_with(&config, &args, start + 89, failing);
+        assert_eq!(trigger(start + 89, &failing), PrefetchTrigger::NotDue);
         assert_eq!(attempts.get(), 2);
+
+        // While another process holds the marker's lock, nothing is sent.
+        let held = open_marker_for_lock(&marker).unwrap();
+        held.try_lock().unwrap();
+        assert_eq!(
+            maybe_trigger_prefetch_with(&config, &args, start + 90, || unreachable!()),
+            PrefetchTrigger::Busy
+        );
+        drop(held);
 
         // A success replaces the failure record with the session it sent for,
         // and later compiles of that session do not discover again.
@@ -15806,14 +15851,14 @@ exit 0
             sent.set(sent.get() + 1);
             Some(intent())
         };
-        maybe_trigger_prefetch_with(&config, &args, start + 90, working);
+        assert_eq!(trigger(start + 90, &working), PrefetchTrigger::Sent);
         assert_eq!(sent.get(), 1);
         let recorded = std::fs::read_to_string(&marker).unwrap();
         assert!(matches!(
             parse_prefetch_marker(&recorded),
             PrefetchMarker::Sent(_)
         ));
-        maybe_trigger_prefetch_with(&config, &args, start + 91, working);
+        assert_eq!(trigger(start + 91, &working), PrefetchTrigger::NotDue);
         assert_eq!(sent.get(), 1);
     }
 

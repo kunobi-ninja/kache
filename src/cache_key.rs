@@ -15542,7 +15542,9 @@ mod tests {
     /// `<target>/<profile>/build/<pkg>/<hash>/out`. The target directory
     /// derived from the dependent's own `--out-dir` must cover it, or the
     /// checkout path stays in the key and the dependent misses in every other
-    /// checkout.
+    /// checkout. The unit is an rlib, as such dependents usually are: a linked
+    /// output would run the native Windows MSVC link probe, which fails closed
+    /// on the made-up search directories.
     #[test]
     fn link_search_into_new_layout_out_dir_is_the_same_in_every_checkout() {
         let _lock = key_test_lock();
@@ -15554,9 +15556,22 @@ mod tests {
             let target = checkout_target(checkout);
             let out_dir = format!("{target}/debug/build/mylib/0123456789abcdef/out");
             let native = format!("native={target}/debug/build/foo-sys/fedcba9876543210/out");
-            let args =
-                RustcArgs::parse(&flag_base(&source, &["--out-dir", &out_dir, "-L", &native]))
-                    .unwrap();
+            let argv: Vec<String> = [
+                "rustc",
+                "--crate-name",
+                "mylib",
+                &source.to_string_lossy(),
+                "--crate-type",
+                "lib",
+                "--out-dir",
+                &out_dir,
+                "-L",
+                &native,
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+            let args = RustcArgs::parse(&argv).unwrap();
             let pn = PathNormalizer::empty().with_target_dir(args.target_dir().as_deref());
             compute_cache_key(&args, &FileHasher::new(), &pn).unwrap()
         };

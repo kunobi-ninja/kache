@@ -1565,6 +1565,12 @@ fn hash_windows_runtime_libraries(
     // One member from each group is selected by the CRT model (/MD vs /MT)
     // and must be present. Hash every candidate that is present so switching
     // debug/static CRT modes cannot accidentally retain one key.
+    //
+    // For each name the linker takes the first file along `directories`,
+    // which is its own search order (working directory, /LIBPATH, LIB); a
+    // copy further along is never read, so it does not enter the key. A
+    // host with two toolsets, such as Firefox's mozbuild toolchain on LIB
+    // beside the machine's Visual Studio, has several copies that differ.
     const MSVC_RUNTIME: &[&str] = &["libcmt.lib", "libcmtd.lib", "msvcrt.lib", "msvcrtd.lib"];
     const VCRUNTIME: &[&str] = &[
         "vcruntime.lib",
@@ -1575,25 +1581,13 @@ fn hash_windows_runtime_libraries(
     const UCRT: &[&str] = &["ucrt.lib", "ucrtd.lib", "libucrt.lib", "libucrtd.lib"];
     let mut libraries = BTreeMap::new();
     for name in MSVC_RUNTIME.iter().chain(VCRUNTIME).chain(UCRT) {
-        let paths = directories
+        let found = directories
             .iter()
             .map(|directory| directory.join(name))
-            .filter(|path| path.is_file())
-            .collect::<Vec<_>>();
-        if let Some(path) = paths.first() {
-            let digest = hash_placed(path)
+            .find(|path| path.is_file());
+        if let Some(path) = found {
+            let digest = hash_placed(&path)
                 .with_context(|| format!("hashing MSVC runtime library {}", path.display()))?;
-            for duplicate in paths.iter().skip(1) {
-                let duplicate_digest = hash_placed(duplicate).with_context(|| {
-                    format!(
-                        "hashing duplicate MSVC runtime library {}",
-                        duplicate.display()
-                    )
-                })?;
-                if duplicate_digest != digest {
-                    bail!("MSVC runtime library {name} resolves to conflicting files");
-                }
-            }
             libraries.insert((*name).to_string(), digest);
         }
     }
@@ -2876,7 +2870,7 @@ mod tests {
     }
 
     #[test]
-    fn windows_runtime_libraries_require_each_family_and_consistent_duplicates() {
+    fn windows_runtime_libraries_require_each_family_and_take_the_first_copy() {
         let root = tempfile::tempdir().unwrap();
         let first = root.path().join("first");
         let second = root.path().join("second");
@@ -2911,19 +2905,29 @@ mod tests {
             ["libcmtd.lib", "libucrtd.lib", "vcruntimed.lib"]
         );
 
+        // The /LIBPATH copy comes first in the linker's search order, so a
+        // different copy on LIB is never read and leaves the key alone...
         std::fs::write(second.join("vcruntimed.lib"), b"different").unwrap();
-        assert!(
-            hash_windows_runtime_libraries(
-                &environment,
-                "x64",
-                "10.0.26100.0",
-                "10.0.26100.0",
-                std::slice::from_ref(&first),
-            )
-            .unwrap_err()
-            .to_string()
-            .contains("conflicting files")
-        );
+        let shadowed = hash_windows_runtime_libraries(
+            &environment,
+            "x64",
+            "10.0.26100.0",
+            "10.0.26100.0",
+            std::slice::from_ref(&first),
+        )
+        .unwrap();
+        assert_eq!(shadowed, libraries);
+        // ...while the copy the linker does read changes it.
+        std::fs::write(first.join("vcruntimed.lib"), b"rebuilt").unwrap();
+        let rebuilt = hash_windows_runtime_libraries(
+            &environment,
+            "x64",
+            "10.0.26100.0",
+            "10.0.26100.0",
+            std::slice::from_ref(&first),
+        )
+        .unwrap();
+        assert_ne!(rebuilt["vcruntimed.lib"], libraries["vcruntimed.lib"]);
 
         for (names, expected) in [
             (

@@ -27,6 +27,10 @@ on:
         type: choice
         default: both
         options: [both, cross-clone, daily-pull]
+      trace_keys:
+        description: "Log every cache-key input and report which diverged across clones (cross-clone arm)"
+        type: boolean
+        default: false
 
 concurrency:
   # One at a time per ref, and never cancel: these are multi-hour builds on a
@@ -211,7 +215,9 @@ jobs:
           work="$(printf '%s' "$RUNNER_TEMP" | tr '\\' '/')/f"
           mkdir -p "$work"
           echo "[bench] work dir: $work"
-          just bench firefox-windows --work-dir "$work"
+          trace=()
+          [ "${{ inputs.trace_keys }}" = true ] && trace=(--trace-keys)
+          just bench firefox-windows --work-dir "$work" "${trace[@]}"
         env:
           # Shared mach toolchain pre-provisioned (elevated) by ans-runners
           # (tag: firefox-toolchain). Pointing MOZBUILD_STATE_PATH here makes the

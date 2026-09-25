@@ -553,7 +553,7 @@ impl Environment {
             (manifest_dir.clone(), "${KACHE_MANIFEST_DIR}"),
         ];
         if let Some(target) = target_dir(&out_dir) {
-            mappings.push((target, "${KACHE_TARGET_DIR}"));
+            mappings.push((target, TARGET_DIR_PLACEHOLDER));
         }
         let cargo_home = std::env::var_os("CARGO_HOME")
             .map(PathBuf::from)
@@ -630,6 +630,13 @@ impl Environment {
 
     fn denormalize_str(&self, text: &str) -> String {
         String::from_utf8_lossy(&self.denormalize(text.as_bytes())).into_owned()
+    }
+
+    /// Whether `path` is inside this run's target directory, in any spelling.
+    fn within_target_dir(&self, path: &Path) -> bool {
+        self.mappings.iter().any(|(root, placeholder)| {
+            *placeholder == TARGET_DIR_PLACEHOLDER && path.starts_with(root)
+        })
     }
 
     /// Every root with its placeholder, `KACHE_BASE_DIR` included.
@@ -744,6 +751,7 @@ impl Environment {
 }
 
 const BASE_DIR_PLACEHOLDER: &str = "${KACHE_BASE_DIR}";
+const TARGET_DIR_PLACEHOLDER: &str = "${KACHE_TARGET_DIR}";
 
 /// Every placeholder starts with this.
 const PLACEHOLDER_PREFIX: &[u8] = b"${KACHE_";
@@ -1049,14 +1057,15 @@ impl Run {
             {
                 let path = PathBuf::from(raw);
                 if path.is_absolute() && path.exists() {
-                    let state = input_state_as(
-                        &path,
-                        &[],
-                        &file_hasher,
-                        &mut budget,
-                        0,
-                        Some(&self.environment),
-                    )?;
+                    // Only another script's output, under this target
+                    // directory, can name the checkout; a system directory
+                    // such as `/usr/include` hashes as it always did, and
+                    // keeps its path-keyed memo in every checkout.
+                    let text = self
+                        .environment
+                        .within_target_dir(&path)
+                        .then_some(&self.environment);
+                    let state = input_state_as(&path, &[], &file_hasher, &mut budget, 0, text)?;
                     fold(&mut hasher, "cargo_env_path_state", state.as_bytes());
                 }
             }
@@ -1477,7 +1486,7 @@ fn is_executable(metadata: &std::fs::Metadata) -> bool {
 fn package_exclusions(package: &Path, environment: &Environment) -> Vec<PathBuf> {
     let mut excluded = vec![package.join(".git"), package.join("target")];
     for (root, placeholder) in &environment.mappings {
-        if *placeholder == "${KACHE_TARGET_DIR}" && root.starts_with(package) {
+        if *placeholder == TARGET_DIR_PLACEHOLDER && root.starts_with(package) {
             excluded.push(root.clone());
         }
     }
@@ -2788,6 +2797,51 @@ mod tests {
             pc(out)
         );
         assert_eq!(std::fs::read(out.join("lib/adler32.o")).unwrap(), object);
+    }
+
+    /// A `links` dependency that exports a directory outside the target
+    /// (libz-sys with the system zlib hands down `/usr/include`) is hashed
+    /// as bytes, as before #1238: its path-keyed memo then serves every
+    /// checkout, where a memo salted by the target directory would miss and
+    /// re-read the whole tree.
+    #[test]
+    fn a_links_dependency_outside_the_target_is_keyed_by_its_bytes() {
+        let mut lock = crate::test_support::process_state_test_lock();
+        let dir = lock.enter(tempfile::tempdir().unwrap());
+        let config = crate::test_support::test_config(dir.as_path().join("cache"));
+        let prediction = prediction_with(Some(Vec::new()), true);
+        let system = dir.as_path().join("usr/include");
+        std::fs::create_dir_all(&system).unwrap();
+        let a_target = dir.as_path().join("a/target");
+        std::fs::write(
+            system.join("zlib.pc"),
+            format!("prefix={}/debug\n", a_target.display()),
+        )
+        .unwrap();
+        let key_in = |target: &Path| {
+            let run = Run {
+                store: Store::open(&config).unwrap(),
+                config: config.clone(),
+                binary_hash: "aaaa".to_string(),
+                environment: checkout_environment(target, &dir.as_path().join("cargo")),
+                start: std::time::Instant::now(),
+            };
+            assert!(!run.environment.within_target_dir(&system));
+            assert!(
+                run.environment
+                    .within_target_dir(&target.join("debug/build/z-1/out"))
+            );
+            // SAFETY: the process-state lock serialises environment edits.
+            unsafe { std::env::set_var("DEP_KT_INCLUDE", &system) };
+            let key = run.action_key(&prediction).unwrap();
+            unsafe { std::env::remove_var("DEP_KT_INCLUDE") };
+            key
+        };
+        assert_eq!(
+            key_in(&a_target),
+            key_in(&dir.as_path().join("b/target")),
+            "the same bytes key the same from any checkout"
+        );
     }
 
     /// 0.23.0 started kache through a `/bin/sh` launcher, and dash drops a

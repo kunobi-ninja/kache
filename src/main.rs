@@ -185,9 +185,15 @@ enum Commands {
         #[arg(long)]
         tracked: bool,
 
-        /// Only tracked targets not seen for this long (for example 14d)
+        /// Only tracked targets not seen for this long (for example 14d).
+        /// Targets whose workspace no longer exists qualify either way.
         #[arg(long, requires = "tracked")]
         stale: Option<String>,
+
+        /// Only tracked targets whose worktree or workspace no longer exists,
+        /// however recently they were built. Implies --tracked.
+        #[arg(long, conflicts_with = "stale")]
+        orphans: bool,
     },
 
     /// Set up caching for Cargo and C/C++ builds
@@ -821,16 +827,21 @@ fn main() -> Result<()> {
             yes,
             tracked,
             stale,
+            orphans,
         }) => {
-            let stale_hours = if tracked {
-                Some(
-                    parse_duration_hours(stale.as_deref().unwrap_or("14d"))
+            let selection = if orphans {
+                Some(cli::TrackedSelection::Orphaned)
+            } else if tracked {
+                let hours = match stale.as_deref() {
+                    Some(stale) => parse_duration_hours(stale)
                         .ok_or_else(|| anyhow::anyhow!("invalid --stale duration"))?,
-                )
+                    None => cli::DEFAULT_TRACKED_STALE_HOURS,
+                };
+                Some(cli::TrackedSelection::StaleOrOrphaned(hours))
             } else {
                 None
             };
-            cli::clean(&config, dry_run, yes, json, tracked, stale_hours)
+            cli::clean(&config, dry_run, yes, json, selection)
         }
         Some(Commands::Init {
             yes,

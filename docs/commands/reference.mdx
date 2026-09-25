@@ -85,11 +85,14 @@ kache clean --dry-run
 kache clean --yes
 kache clean --tracked --stale 14d --dry-run
 kache clean --tracked --stale 14d --yes
+kache clean --orphans --yes
 ```
 
 `clean` recursively finds `target/` directories below the current directory. The default opens a selector. Use `--dry-run` before a scripted `--yes` run.
 
-`--tracked` uses the bounded machine-local target registry populated by normal builds and restores. `--stale` filters by last use. Cleanup rechecks each directory identity and removes only the derived target directory; missing, moved, replaced, current-workspace, and unsafe paths are skipped.
+`--tracked` uses the bounded machine-local target registry populated by normal builds and restores. `--stale` filters by last use. A target whose worktree or workspace has been deleted qualifies however recently it was built; `--orphans` selects only those. A workspace counts as deleted only while the directory that held it still exists, so an unmounted volume does not.
+
+Cleanup rechecks each directory identity and removes only the derived target directory; missing, moved, replaced, current-workspace, and unsafe paths are skipped. A target a running build holds (its `.cargo-lock`) is skipped with `in use by a running build`, in every mode.
 
 ## `kache init`
 

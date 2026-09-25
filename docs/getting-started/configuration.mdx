@@ -142,6 +142,8 @@ kache clean --tracked --stale 14d --dry-run
 kache clean --tracked --stale 14d --yes
 ```
 
+Targets of deleted worktrees are offered at any age. `kache clean --orphans --yes` removes only those, which suits a hook that runs after `git worktree remove`.
+
 If enforcing the store namespace limit matters more than retaining hits, restore the older policy:
 
 ```toml title="~/.config/kache/config.toml"

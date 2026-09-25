@@ -3890,7 +3890,7 @@ struct CleanSkipped {
     reason: String,
 }
 
-const DEFAULT_TRACKED_STALE_HOURS: u64 = 336;
+pub(crate) const DEFAULT_TRACKED_STALE_HOURS: u64 = 336;
 
 fn path_was_removed(path: &std::path::Path) -> bool {
     !path.exists()
@@ -3903,21 +3903,21 @@ pub fn clean(
     dry_run: bool,
     yes: bool,
     json: bool,
-    tracked: bool,
-    stale_hours: Option<u64>,
+    tracked: Option<TrackedSelection>,
 ) -> Result<()> {
     use crossterm::event;
     use ratatui::prelude::*;
     use std::io::stdout;
 
     let root = std::env::current_dir()?;
-    let (mut targets, skipped) = if tracked {
-        tracked_target_entries(config, stale_hours.unwrap_or(DEFAULT_TRACKED_STALE_HOURS))?
+    let (mut targets, skipped, orphans) = if let Some(selection) = tracked {
+        tracked_target_entries(config, selection)?
     } else {
         let mut targets = Vec::new();
         find_target_dirs(&root, &mut targets);
-        (targets, Vec::new())
+        (targets, Vec::new(), std::collections::HashSet::new())
     };
+    let tracked = tracked.is_some();
 
     if targets.is_empty() {
         if json {
@@ -3955,13 +3955,18 @@ pub fn clean(
     // Sort by size descending
     targets.sort_by_key(|entry| std::cmp::Reverse(entry.size));
 
-    let emit_clean_json = |targets: &[TargetEntry], removed_paths: Vec<String>, reclaimed: u64| {
+    let emit_clean_json = |targets: &[TargetEntry],
+                           skipped: &[CleanSkipped],
+                           removed_paths: Vec<String>,
+                           reclaimed: u64| {
         #[derive(serde::Serialize)]
         struct TargetBody {
             path: String,
             apparent_bytes: u64,
             cached_bytes: u64,
             estimated_reclaimable_bytes: u64,
+            /// The workspace this target was built from no longer exists.
+            orphaned: bool,
         }
         #[derive(serde::Serialize)]
         struct Body {
@@ -3979,9 +3984,10 @@ pub fn clean(
                     apparent_bytes: t.size,
                     cached_bytes: t.cached_bytes,
                     estimated_reclaimable_bytes: t.estimated_reclaimable_bytes,
+                    orphaned: orphans.contains(&t.path),
                 })
                 .collect(),
-            skipped: skipped.clone(),
+            skipped: skipped.to_vec(),
             changed: !removed_paths.is_empty(),
             removed_paths,
             estimated_reclaimed_bytes: reclaimed,
@@ -3991,12 +3997,12 @@ pub fn clean(
 
     // `--json` without `--yes` is a dry-run. Agents should not enter the TUI.
     if json && !yes {
-        return emit_clean_json(&targets, Vec::new(), 0);
+        return emit_clean_json(&targets, &skipped, Vec::new(), 0);
     }
 
     // `--dry-run` takes precedence over `--yes`: preview only, never delete.
     if dry_run {
-        for line in render_clean_dry_run(&targets, &root) {
+        for line in render_clean_dry_run(&targets, &root, &orphans) {
             println!("{line}");
         }
         for item in &skipped {
@@ -4009,7 +4015,9 @@ pub fn clean(
     // scripts and cron where the interactive selector cannot run.
     if yes {
         let to_remove: Vec<_> = targets.iter().map(RemovalTarget::from_entry).collect();
-        let (removed, estimated_reclaimed, apparent_gap) = remove_targets(&to_remove, &root, json);
+        let mut skipped = skipped.clone();
+        let (removed, estimated_reclaimed, apparent_gap) =
+            remove_targets(&to_remove, &root, json, &mut skipped);
         let removed_paths: Vec<String> = to_remove
             .iter()
             .filter(|target| path_was_removed(&target.path))
@@ -4024,7 +4032,7 @@ pub fn clean(
             }
         }
         if json {
-            return emit_clean_json(&targets, removed_paths, estimated_reclaimed);
+            return emit_clean_json(&targets, &skipped, removed_paths, estimated_reclaimed);
         }
         println!(
             "\nRemoved {removed} target/ dirs; estimated reclaimed {}{}",
@@ -4083,7 +4091,7 @@ pub fn clean(
         }
         Some(to_remove) => {
             let (removed, estimated_reclaimed, apparent_gap) =
-                remove_targets(&to_remove, &root, false);
+                remove_targets(&to_remove, &root, false, &mut Vec::new());
             if tracked {
                 let store = Store::open(config)?;
                 for target in &to_remove {
@@ -4132,6 +4140,7 @@ fn remove_targets(
     to_remove: &[RemovalTarget],
     root: &std::path::Path,
     quiet: bool,
+    skipped: &mut Vec<CleanSkipped>,
 ) -> (usize, u64, u64) {
     let mut estimated_reclaimed = 0u64;
     let mut apparent_gap = 0u64;
@@ -4146,6 +4155,16 @@ fn remove_targets(
                     rel.display()
                 );
             }
+            continue;
+        }
+        if target_in_use(&target.path) {
+            if human_clean_output(quiet) {
+                println!("  skipped {} — {TARGET_IN_USE}", rel.display());
+            }
+            skipped.push(CleanSkipped {
+                path: target.path.display().to_string(),
+                reason: TARGET_IN_USE.to_string(),
+            });
             continue;
         }
         match std::fs::remove_dir_all(&target.path) {
@@ -4172,6 +4191,39 @@ fn human_clean_output(quiet: bool) -> bool {
     !quiet
 }
 
+const TARGET_IN_USE: &str = "in use by a running build";
+
+/// Whether a Cargo process holds one of `target`'s build locks. Cargo takes
+/// an exclusive lock on `<profile>/.cargo-lock` (and
+/// `<triple>/<profile>/.cargo-lock`) for the length of a build, so failing to
+/// take it here means a build is writing into this directory now.
+fn target_in_use(target: &std::path::Path) -> bool {
+    cargo_lock_files(target, 3).iter().any(|lock| {
+        std::fs::File::open(lock)
+            .is_ok_and(|file| matches!(file.try_lock(), Err(std::fs::TryLockError::WouldBlock)))
+    })
+}
+
+/// `.cargo-lock` files at most `depth` directories below `dir`. Symlinks
+/// are not followed.
+fn cargo_lock_files(dir: &std::path::Path, depth: usize) -> Vec<std::path::PathBuf> {
+    let mut locks = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return locks;
+    };
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_file() && entry.file_name() == ".cargo-lock" {
+            locks.push(entry.path());
+        } else if file_type.is_dir() && depth > 0 {
+            locks.extend(cargo_lock_files(&entry.path(), depth - 1));
+        }
+    }
+    locks
+}
+
 /// Explain the gap between apparent size and estimated physical reclaim without
 /// pretending every shared extent belongs to kache or survives the selected
 /// deletion set. The gap can also contain sparse holes and duplicate hardlinks.
@@ -4186,7 +4238,11 @@ fn estimate_context_note(apparent_gap: u64) -> String {
     }
 }
 
-fn render_clean_dry_run(targets: &[TargetEntry], root: &std::path::Path) -> Vec<String> {
+fn render_clean_dry_run(
+    targets: &[TargetEntry],
+    root: &std::path::Path,
+    orphans: &std::collections::HashSet<std::path::PathBuf>,
+) -> Vec<String> {
     let total_size: u64 = targets.iter().map(|t| t.size).sum();
     let total_cached: u64 = targets.iter().map(|t| t.cached_bytes).sum();
     let mut lines = vec![format!(
@@ -4213,8 +4269,13 @@ fn render_clean_dry_run(targets: &[TargetEntry], root: &std::path::Path) -> Vec<
         } else {
             format!("  [{}]", t.profiles.join(", "))
         };
+        let orphan_str = if orphans.contains(&t.path) {
+            "  (worktree deleted)"
+        } else {
+            ""
+        };
         lines.push(format!(
-            "  {:<w$}  {:>10}  cached: {:>10}{profile_str}",
+            "  {:<w$}  {:>10}  cached: {:>10}{profile_str}{orphan_str}",
             rel.display(),
             ByteSize(t.size),
             ByteSize(t.cached_bytes)
@@ -4251,17 +4312,56 @@ pub(crate) struct TargetEntry {
     pub stale: bool,
 }
 
+/// Which tracked targets a clean considers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TrackedSelection {
+    /// Not seen for this many hours, or orphaned.
+    StaleOrOrphaned(u64),
+    /// Only targets whose workspace is gone.
+    Orphaned,
+}
+
+impl TrackedSelection {
+    fn includes(self, orphaned: bool, idle_seconds: i64) -> bool {
+        match self {
+            Self::Orphaned => orphaned,
+            Self::StaleOrOrphaned(hours) => {
+                orphaned || idle_seconds >= hours.saturating_mul(3600).min(i64::MAX as u64) as i64
+            }
+        }
+    }
+}
+
+/// A workspace is gone when its directory no longer exists while the
+/// directory holding it still does. The parent check keeps an unmounted
+/// volume or a network share that is offline from reading as a deleted
+/// worktree.
+fn workspace_is_gone(workspace_root: &std::path::Path) -> bool {
+    !workspace_root.exists() && workspace_root.parent().is_some_and(std::path::Path::is_dir)
+}
+
 fn tracked_target_entries(
     config: &Config,
-    stale_hours: u64,
-) -> Result<(Vec<TargetEntry>, Vec<CleanSkipped>)> {
+    selection: TrackedSelection,
+) -> Result<(
+    Vec<TargetEntry>,
+    Vec<CleanSkipped>,
+    std::collections::HashSet<std::path::PathBuf>,
+)> {
     let store = Store::open(config)?;
-    let tracked = store.tracked_target_roots(stale_hours)?;
+    // Every tracked root: an orphan qualifies however recently it was seen.
+    let tracked = store.tracked_target_roots(0)?;
+    let now = kache_store::markers::now_epoch_secs() as i64;
     let cwd = std::env::current_dir()?;
     let mut targets = Vec::new();
     let mut skipped = Vec::new();
+    let mut orphans = std::collections::HashSet::new();
 
     for tracked in tracked {
+        let orphaned = workspace_is_gone(&tracked.workspace_root);
+        if !selection.includes(orphaned, now.saturating_sub(tracked.last_seen)) {
+            continue;
+        }
         let display = tracked.path.display().to_string();
         let skip = |reason: &str| CleanSkipped {
             path: display.clone(),
@@ -4297,6 +4397,9 @@ fn tracked_target_entries(
             continue;
         }
         let profiles = detect_profiles(&tracked.path);
+        if orphaned {
+            orphans.insert(tracked.path.clone());
+        }
         targets.push(TargetEntry {
             path: tracked.path,
             size: stats.total_bytes,
@@ -4309,7 +4412,7 @@ fn tracked_target_entries(
         });
     }
 
-    Ok((targets, skipped))
+    Ok((targets, skipped, orphans))
 }
 
 /// Returns true if `path` is under a macOS directory that would trigger a TCC
@@ -12147,7 +12250,8 @@ mod tests {
             breakdown: CategoryBreakdown::default(),
             stale: false,
         }];
-        let single_out = render_clean_dry_run(&single, root).join("\n");
+        let none = std::collections::HashSet::new();
+        let single_out = render_clean_dry_run(&single, root, &none).join("\n");
         assert!(single_out.contains("Found 1 target/ directory"));
         assert!(single_out.contains("proj/target"));
         assert!(single_out.contains("[debug]"));
@@ -12176,7 +12280,11 @@ mod tests {
                 stale: false,
             },
         ];
-        let many_out = render_clean_dry_run(&many, root).join("\n");
+        let many_out = render_clean_dry_run(&many, root, &none).join("\n");
+        assert!(!many_out.contains("worktree deleted"));
+        let orphaned = [std::path::PathBuf::from("/outside/proj-b/target")].into();
+        let marked = render_clean_dry_run(&many, root, &orphaned).join("\n");
+        assert_eq!(marked.matches("(worktree deleted)").count(), 1, "{marked}");
         assert!(many_out.contains("Found 2 target/ directories"));
         assert!(many_out.contains("/outside/proj-b/target"));
         assert!(many_out.contains("Dry run: estimated to free 25 B"));
@@ -12265,7 +12373,7 @@ mod tests {
             },
         ];
         let (removed, estimated_reclaimed, apparent_gap) =
-            remove_targets(&to_remove, root.path(), false);
+            remove_targets(&to_remove, root.path(), false, &mut Vec::new());
 
         assert_eq!(removed, 2, "both target/ dirs removed");
         assert_eq!(estimated_reclaimed, 260);
@@ -12297,7 +12405,7 @@ mod tests {
             },
         ];
         let (removed, estimated_reclaimed, apparent_gap) =
-            remove_targets(&to_remove, root.path(), false);
+            remove_targets(&to_remove, root.path(), false, &mut Vec::new());
 
         assert_eq!(removed, 1, "only the existing dir counts as removed");
         assert_eq!(
@@ -12306,6 +12414,117 @@ mod tests {
         );
         assert_eq!(apparent_gap, 50, "failed dir's gap is not counted");
         assert!(!real.exists(), "the reachable dir was still removed");
+    }
+
+    #[test]
+    fn a_target_whose_build_lock_is_held_is_in_use() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("target");
+        let debug = target.join("debug");
+        let cross = target.join("x86_64-unknown-linux-gnu/release");
+        let too_deep = target.join("a/b/c/d");
+        for dir in [&debug, &cross, &too_deep] {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join(".cargo-lock"), b"").unwrap();
+            // Build output beside the lock is not a lock.
+            std::fs::write(dir.join("libfoo.rlib"), b"rlib").unwrap();
+        }
+        let mut found = cargo_lock_files(&target, 3);
+        found.sort();
+        let mut expected = vec![debug.join(".cargo-lock"), cross.join(".cargo-lock")];
+        expected.sort();
+        assert_eq!(found, expected, "profiles and triple profiles, not deeper");
+        assert!(!target_in_use(&target));
+
+        let held = std::fs::File::open(cross.join(".cargo-lock")).unwrap();
+        held.lock().unwrap();
+        assert!(target_in_use(&target));
+        drop(held);
+        assert!(!target_in_use(&target));
+    }
+
+    #[test]
+    fn remove_targets_leaves_a_target_a_build_is_writing() {
+        let root = tempfile::tempdir().unwrap();
+        let busy = root.path().join("busy/target");
+        let idle = root.path().join("idle/target");
+        for target in [&busy, &idle] {
+            std::fs::create_dir_all(target.join("debug")).unwrap();
+            std::fs::write(target.join("debug/.cargo-lock"), b"").unwrap();
+        }
+        let held = std::fs::File::open(busy.join("debug/.cargo-lock")).unwrap();
+        held.lock().unwrap();
+
+        let to_remove = [&busy, &idle].map(|path| RemovalTarget {
+            path: path.clone(),
+            scanned_identity: directory_identity(path),
+            estimated_reclaimable: 10,
+            apparent_gap: 0,
+        });
+        let mut skipped = Vec::new();
+        let (removed, reclaimed, _) = remove_targets(&to_remove, root.path(), true, &mut skipped);
+        assert_eq!((removed, reclaimed), (1, 10));
+        assert!(busy.exists() && !idle.exists());
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0].path, busy.display().to_string());
+        assert_eq!(skipped[0].reason, TARGET_IN_USE);
+    }
+
+    #[test]
+    fn a_workspace_is_gone_only_when_its_parent_is_still_there() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("wt");
+        std::fs::create_dir(&workspace).unwrap();
+        assert!(!workspace_is_gone(&workspace));
+        std::fs::remove_dir(&workspace).unwrap();
+        assert!(workspace_is_gone(&workspace));
+        // An unmounted volume looks like a missing parent, not a deletion.
+        assert!(!workspace_is_gone(&root.path().join("offline/wt")));
+    }
+
+    #[test]
+    fn tracked_selection_takes_orphans_at_any_age() {
+        let stale = TrackedSelection::StaleOrOrphaned(1);
+        assert!(!stale.includes(false, 3599));
+        assert!(stale.includes(false, 3600));
+        assert!(stale.includes(true, 0));
+        assert!(!TrackedSelection::Orphaned.includes(false, i64::MAX));
+        assert!(TrackedSelection::Orphaned.includes(true, 0));
+    }
+
+    #[test]
+    fn a_freshly_built_target_is_offered_once_its_worktree_is_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::test_support::test_config(dir.path().join("cache"));
+        let store = Store::open(&config).unwrap();
+        let workspace = dir.path().join("worktrees/feature");
+        let target = dir.path().join("targets/feature");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(target.join("debug")).unwrap();
+        std::fs::write(
+            target.join("CACHEDIR.TAG"),
+            "Signature: 8a477f597d28d172789f06886806bc55",
+        )
+        .unwrap();
+        store.remember_target_root(&target, &workspace).unwrap();
+        let target = std::path::absolute(&target).unwrap();
+
+        let (live, _, _) =
+            tracked_target_entries(&config, TrackedSelection::StaleOrOrphaned(24)).unwrap();
+        assert!(live.is_empty(), "seen just now and the worktree is there");
+
+        std::fs::remove_dir_all(&workspace).unwrap();
+        for selection in [
+            TrackedSelection::StaleOrOrphaned(24),
+            TrackedSelection::Orphaned,
+        ] {
+            let (targets, _, orphans) = tracked_target_entries(&config, selection).unwrap();
+            assert_eq!(
+                targets.iter().map(|t| t.path.clone()).collect::<Vec<_>>(),
+                std::slice::from_ref(&target)
+            );
+            assert!(orphans.contains(&target));
+        }
     }
 
     #[test]
@@ -12325,7 +12544,7 @@ mod tests {
             apparent_gap: 0,
         }];
         let (removed, estimated_reclaimed, apparent_gap) =
-            remove_targets(&to_remove, root.path(), false);
+            remove_targets(&to_remove, root.path(), false, &mut Vec::new());
 
         assert_eq!((removed, estimated_reclaimed, apparent_gap), (0, 0, 0));
         assert!(

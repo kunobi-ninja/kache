@@ -282,14 +282,12 @@ fn run(cmd: &mut Command) -> Result<()> {
 /// Clone a directory tree via the filesystem's CoW reflink mechanism when
 /// supported; fall back to a plain recursive copy.
 pub fn snapshot_dir(src: &Path, dst: &Path) -> Result<()> {
-    if dst.exists() {
-        let _ = std::fs::remove_dir_all(dst);
-    }
+    remove_tree(dst).with_context(|| format!("clearing {} for a snapshot", dst.display()))?;
     #[cfg(unix)]
     {
         let try_cp = |args: &[&str]| -> bool {
-            if dst.exists() {
-                let _ = std::fs::remove_dir_all(dst);
+            if remove_tree(dst).is_err() {
+                return false;
             }
             Command::new("cp")
                 .args(args)
@@ -304,12 +302,55 @@ pub fn snapshot_dir(src: &Path, dst: &Path) -> Result<()> {
         if try_cp(&["-cR"]) || try_cp(&["-R", "--reflink=auto"]) || try_cp(&["-R"]) {
             return Ok(());
         }
-        if dst.exists() {
-            let _ = std::fs::remove_dir_all(dst);
-        }
+        remove_tree(dst).with_context(|| format!("clearing {} for a snapshot", dst.display()))?;
     }
     copy_dir_recursive(src, dst)
         .with_context(|| format!("snapshotting {} -> {}", src.display(), dst.display()))
+}
+
+/// Remove `path` and everything under it, if it exists.
+///
+/// A cache can leave read-only files in read-only directories (mbx marks
+/// what it stores read-only), and a directory without write permission
+/// refuses to have its entries removed. Such a tree is made writable first.
+/// A removal that still fails is an error: the copy that follows would
+/// otherwise land on the leftovers.
+pub fn remove_tree(path: &Path) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+        Ok(_) => {}
+    }
+    if std::fs::remove_dir_all(path).is_ok() {
+        return Ok(());
+    }
+    make_writable(path)?;
+    std::fs::remove_dir_all(path)
+}
+
+/// Give the owner write permission on `path` and, for a directory, on
+/// everything below it. Symlinks are left alone.
+fn make_writable(path: &Path) -> std::io::Result<()> {
+    let meta = std::fs::symlink_metadata(path)?;
+    if meta.file_type().is_symlink() {
+        return Ok(());
+    }
+    let mut permissions = meta.permissions();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        permissions.set_mode(permissions.mode() | 0o200);
+    }
+    #[cfg(not(unix))]
+    #[allow(clippy::permissions_set_readonly_false)]
+    permissions.set_readonly(false);
+    std::fs::set_permissions(path, permissions)?;
+    if meta.is_dir() {
+        for entry in std::fs::read_dir(path)? {
+            make_writable(&entry?.path())?;
+        }
+    }
+    Ok(())
 }
 
 /// Recursively copy `src` into `dst` with plain byte copies, preserving
@@ -350,6 +391,51 @@ fn copy_symlink(from: &Path, to: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The nightly bench restores the mbx cache dir from a snapshot on every
+    /// sample. mbx stores read-only files in read-only directories, the old
+    /// copy could not be removed, and the restore failed with EACCES.
+    #[test]
+    fn a_snapshot_replaces_a_read_only_tree() {
+        let base = TempDir::new().unwrap();
+        let src = base.path().join("src");
+        std::fs::create_dir_all(src.join("blobs")).unwrap();
+        std::fs::write(src.join("blobs").join("fresh"), b"fresh").unwrap();
+
+        let dst = base.path().join("dst");
+        let locked = dst.join("blobs");
+        std::fs::create_dir_all(&locked).unwrap();
+        std::fs::write(locked.join("stale"), b"stale").unwrap();
+        for path in [locked.join("stale"), locked.clone()] {
+            let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+            permissions.set_readonly(true);
+            std::fs::set_permissions(&path, permissions).unwrap();
+        }
+
+        snapshot_dir(&src, &dst).unwrap();
+        assert_eq!(
+            std::fs::read(dst.join("blobs").join("fresh")).unwrap(),
+            b"fresh"
+        );
+        assert!(!dst.join("blobs").join("stale").exists());
+    }
+
+    #[test]
+    fn remove_tree_accepts_a_missing_path() {
+        let base = TempDir::new().unwrap();
+        remove_tree(&base.path().join("absent")).unwrap();
+    }
+
+    /// Only a missing path counts as removed; any other lookup failure is
+    /// reported rather than taken for success.
+    #[cfg(unix)]
+    #[test]
+    fn remove_tree_reports_a_path_it_cannot_look_up() {
+        let base = TempDir::new().unwrap();
+        let file = base.path().join("file");
+        std::fs::write(&file, b"").unwrap();
+        assert!(remove_tree(&file.join("below")).is_err());
+    }
 
     #[test]
     fn clone_ref_path_is_a_sibling_not_a_child_of_work_dir() {

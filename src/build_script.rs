@@ -532,7 +532,7 @@ struct Environment {
     /// Longest first, so nested roots map before their parents.
     mappings: Vec<(PathBuf, &'static str)>,
     /// Each root as Cargo spelled it, without the canonical spellings
-    /// `mappings` adds: what a placeholder is written back as.
+    /// `mappings` adds: what a placeholder is written back as. Longest first.
     spellings: Vec<(PathBuf, &'static str)>,
     /// `KACHE_BASE_DIR`, in both spellings when it is reached through a
     /// symlink. See [`remap_flag_base_dirs`].
@@ -561,7 +561,9 @@ impl Environment {
         if let Some(cargo_home) = cargo_home {
             mappings.push((cargo_home, "${KACHE_CARGO_HOME}"));
         }
-        let spellings = mappings.clone();
+        let mut spellings = mappings.clone();
+        // Longest first, so a root inside another is replaced before it.
+        spellings.sort_by_key(|(root, _)| std::cmp::Reverse(root.as_os_str().len()));
         // A checkout reached through a symlink is spelled both ways by tools
         // that canonicalize; both spellings map to the same placeholder.
         let canonical: Vec<(PathBuf, &'static str)> = mappings
@@ -666,10 +668,17 @@ impl Environment {
         {
             return None;
         }
-        let mut spellings = self.spellings.clone();
-        spellings.sort_by_key(|(root, _)| std::cmp::Reverse(root.as_os_str().len()));
+        // Most text (a C header under a `links` dependency's OUT_DIR) names
+        // no root; finding that out costs one search per root.
+        if !self
+            .spellings
+            .iter()
+            .any(|(root, _)| find_bytes(contents, root.as_os_str().as_encoded_bytes()).is_some())
+        {
+            return None;
+        }
         let mut normalized = contents.to_vec();
-        for (root, placeholder) in &spellings {
+        for (root, placeholder) in &self.spellings {
             normalized = replace_whole_paths(
                 &normalized,
                 root.as_os_str().as_encoded_bytes(),
@@ -799,9 +808,10 @@ pub(crate) fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() {
         return None;
     }
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
+    // A build script's outputs run to tens of megabytes (aws-lc-sys, libgit2)
+    // and are searched once per root: a byte-by-byte window scan put seconds
+    // on the build.
+    memchr::memmem::find(haystack, needle)
 }
 
 /// A byte that can continue a file name, so a root followed or preceded by
@@ -816,25 +826,30 @@ fn replace_whole_paths(haystack: &[u8], needle: &[u8], replacement: &[u8]) -> Ve
     if needle.is_empty() {
         return haystack.to_vec();
     }
+    let finder = memchr::memmem::Finder::new(needle);
     let mut out = Vec::with_capacity(haystack.len());
-    let mut index = 0;
-    while index < haystack.len() {
-        let before = index.checked_sub(1).map(|at| haystack[at]);
-        let after = haystack.get(index + needle.len()).copied();
-        let next = if haystack[index..].starts_with(needle)
-            && !before.is_some_and(|byte| is_name_byte(byte) || byte == b'/')
+    let mut copied = 0;
+    let mut from = 0;
+    while let Some(offset) = finder.find(&haystack[from..]) {
+        let start = from + offset;
+        let end = start + needle.len();
+        let before = start.checked_sub(1).map(|at| haystack[at]);
+        let after = haystack.get(end).copied();
+        let next = if !before.is_some_and(|byte| is_name_byte(byte) || byte == b'/')
             && !after.is_some_and(is_name_byte)
         {
+            out.extend_from_slice(&haystack[copied..start]);
             out.extend_from_slice(replacement);
-            index + needle.len()
+            copied = end;
+            end
         } else {
-            out.push(haystack[index]);
-            index + 1
+            start + 1
         };
-        // A loop that stopped advancing would grow `out` without bound.
-        debug_assert!(next > index, "replace_whole_paths must advance");
-        index = next;
+        // A search that stopped advancing would never end.
+        debug_assert!(next > from, "replace_whole_paths must advance");
+        from = next;
     }
+    out.extend_from_slice(&haystack[copied..]);
     out
 }
 

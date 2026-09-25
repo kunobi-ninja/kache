@@ -4435,21 +4435,34 @@ fn render_targets(rows: &[TargetRow]) -> Vec<String> {
         .count();
     if orphans > 0 {
         lines.push(format!(
-            "\nRemove the {orphans} deleted worktree{}' targets: kache clean --orphans --yes",
-            if orphans == 1 { "" } else { "s" }
+            "\nRemove the {orphans} deleted worktree{} targets: kache clean --orphans --yes",
+            if orphans == 1 { "'s" } else { "s'" }
         ));
     }
     lines
+}
+
+/// The clean that removes deleted worktrees' targets, when there are any.
+fn targets_next_actions(rows: &[TargetRow]) -> Vec<crate::machine::NextAction> {
+    let orphans = rows
+        .iter()
+        .filter(|row| row.state == TargetState::WorktreeDeleted)
+        .count();
+    if orphans == 0 {
+        return Vec::new();
+    }
+    vec![crate::machine::NextAction {
+        argv: ["kache", "clean", "--orphans", "--yes"]
+            .map(String::from)
+            .to_vec(),
+        why: format!("{orphans} target(s) belong to deleted worktrees"),
+    }]
 }
 
 /// Show every tracked target directory with what deleting it would free
 /// and whether its worktree still exists.
 pub fn targets(config: &Config, json: bool) -> Result<()> {
     let rows = target_rows(config, kache_store::markers::now_epoch_secs() as i64)?;
-    let orphans = rows
-        .iter()
-        .filter(|row| row.state == TargetState::WorktreeDeleted)
-        .count();
     if json {
         #[derive(serde::Serialize)]
         struct Body {
@@ -4457,16 +4470,7 @@ pub fn targets(config: &Config, json: bool) -> Result<()> {
             apparent_bytes: u64,
             reclaimable_bytes: u64,
         }
-        let next = if orphans > 0 {
-            vec![crate::machine::NextAction {
-                argv: ["kache", "clean", "--orphans", "--yes"]
-                    .map(String::from)
-                    .to_vec(),
-                why: format!("{orphans} target(s) belong to deleted worktrees"),
-            }]
-        } else {
-            Vec::new()
-        };
+        let next = targets_next_actions(&rows);
         return crate::machine::emit(
             "targets",
             Body {
@@ -12786,6 +12790,20 @@ mod tests {
     }
 
     #[test]
+    fn json_targets_suggest_the_orphan_clean_only_when_a_worktree_is_gone() {
+        let live = [row("/wt/a", TargetState::Live, 1)];
+        assert!(targets_next_actions(&live).is_empty());
+        let one = [
+            row("/wt/a", TargetState::Live, 1),
+            row("/wt/b", TargetState::WorktreeDeleted, 1),
+        ];
+        let next = targets_next_actions(&one);
+        assert_eq!(next.len(), 1);
+        assert_eq!(next[0].argv, ["kache", "clean", "--orphans", "--yes"]);
+        assert_eq!(next[0].why, "1 target(s) belong to deleted worktrees");
+    }
+
+    #[test]
     fn the_targets_table_totals_and_points_at_deleted_worktrees() {
         let one = render_targets(&[row("/wt/a", TargetState::Live, 1024)]).join("\n");
         assert!(
@@ -12806,7 +12824,7 @@ mod tests {
         );
         assert_eq!(many.matches("(worktree deleted)").count(), 1, "{many}");
         assert!(
-            many.contains("Remove the 1 deleted worktree' targets: kache clean --orphans --yes"),
+            many.contains("Remove the 1 deleted worktree's targets: kache clean --orphans --yes"),
             "{many}"
         );
         let two = render_targets(&[

@@ -2683,12 +2683,7 @@ fn compute_project_stats(target_dir: &std::path::Path) -> (ProjectStats, Categor
     let mut reclaim = ReclaimEstimator::default();
     let mut cache_candidates = Vec::new();
 
-    let profiles = ["debug", "release", "profiling", "coverage"];
-    for profile in &profiles {
-        let profile_dir = target_dir.join(profile);
-        if !std::fs::symlink_metadata(&profile_dir).is_ok_and(|meta| meta.file_type().is_dir()) {
-            continue;
-        }
+    for (_, profile_dir) in profile_dirs(target_dir) {
         let Ok(entries) = std::fs::read_dir(&profile_dir) else {
             continue;
         };
@@ -4360,6 +4355,9 @@ fn is_macos_protected(_path: &std::path::Path) -> bool {
 }
 
 /// Walk directories to find Cargo.toml + target/ pairs.
+/// Hidden directories that hold worktrees, scanned for targets anyway.
+const WORKTREE_CONTAINERS: [&str; 2] = [".worktrees", ".claude"];
+
 pub(crate) fn find_target_dirs(dir: &std::path::Path, results: &mut Vec<TargetEntry>) {
     // Check *before* read_dir to avoid triggering macOS TCC permission prompts.
     if is_macos_protected(dir) {
@@ -4377,8 +4375,11 @@ pub(crate) fn find_target_dirs(dir: &std::path::Path, results: &mut Vec<TargetEn
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
 
-        // Skip hidden dirs, node_modules, .git
-        if name_str.starts_with('.') || name_str == "node_modules" {
+        // Skip hidden dirs, node_modules, .git. `.worktrees` and `.claude`
+        // are where worktree tools and coding agents put their checkouts.
+        if (name_str.starts_with('.') && !WORKTREE_CONTAINERS.contains(&name_str.as_ref()))
+            || name_str == "node_modules"
+        {
             continue;
         }
 
@@ -4426,19 +4427,66 @@ pub(crate) fn find_target_dirs(dir: &std::path::Path, results: &mut Vec<TargetEn
 
 /// Detect which build profiles exist in a target/ directory.
 fn detect_profiles(target_dir: &std::path::Path) -> Vec<String> {
-    let known = [
-        ("debug", "debug"),
-        ("release", "release"),
-        ("profiling", "profiling"),
-        ("coverage", "coverage"),
-    ];
+    profile_dirs(target_dir)
+        .into_iter()
+        .map(|(label, _)| label)
+        .collect()
+}
+
+/// Profile names every Cargo target directory can hold, recognised even
+/// before Cargo has written into them.
+const KNOWN_PROFILES: [&str; 4] = ["debug", "release", "profiling", "coverage"];
+
+/// The profile directories of a target directory, labelled by their path
+/// below it: a known profile name, any directory Cargo has built a profile
+/// into (custom `[profile.ci]`), and `<triple>/<profile>` when `--target`
+/// was given. Symlinks are never followed.
+fn profile_dirs(target_dir: &std::path::Path) -> Vec<(String, std::path::PathBuf)> {
+    fn real_dirs(dir: &std::path::Path) -> Vec<(String, std::path::PathBuf)> {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return Vec::new();
+        };
+        let mut dirs: Vec<_> = entries
+            .flatten()
+            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+            .map(|entry| {
+                (
+                    entry.file_name().to_string_lossy().into_owned(),
+                    entry.path(),
+                )
+            })
+            .collect();
+        dirs.sort();
+        dirs
+    }
+    fn is_profile(name: &str, dir: &std::path::Path) -> bool {
+        KNOWN_PROFILES.contains(&name)
+            || [".cargo-lock", ".fingerprint", "deps"]
+                .iter()
+                .any(|marker| std::fs::symlink_metadata(dir.join(marker)).is_ok())
+    }
     let mut profiles = Vec::new();
-    for (dir_name, label) in &known {
-        let p = target_dir.join(dir_name);
-        if std::fs::symlink_metadata(&p).is_ok_and(|meta| meta.file_type().is_dir()) {
-            profiles.push(label.to_string());
+    for (name, path) in real_dirs(target_dir) {
+        if is_profile(&name, &path) {
+            profiles.push((name, path));
+            continue;
+        }
+        for (inner, inner_path) in real_dirs(&path) {
+            if is_profile(&inner, &inner_path) {
+                profiles.push((format!("{name}/{inner}"), inner_path));
+            }
         }
     }
+    // Known profiles first, in their usual order, then the rest by name.
+    profiles.sort_by_key(|(label, _)| {
+        (
+            KNOWN_PROFILES
+                .iter()
+                .position(|known| known == label)
+                .unwrap_or(KNOWN_PROFILES.len()),
+            label.clone(),
+        )
+    });
     profiles
 }
 
@@ -8447,6 +8495,68 @@ mod tests {
 
         let profiles = detect_profiles(dir.path());
         assert_eq!(profiles.len(), 4);
+    }
+
+    #[test]
+    fn profiles_are_found_by_what_cargo_wrote_into_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path();
+        fs::create_dir_all(target.join("release")).unwrap();
+        fs::create_dir_all(target.join("ci/.fingerprint")).unwrap();
+        fs::create_dir_all(target.join("x86_64-unknown-linux-gnu/release/deps")).unwrap();
+        fs::create_dir_all(target.join("aarch64-apple-darwin/debug")).unwrap();
+        fs::create_dir_all(target.join("doc/some_crate")).unwrap();
+        fs::create_dir_all(target.join("tmp")).unwrap();
+
+        assert_eq!(
+            detect_profiles(target),
+            [
+                "release",
+                "aarch64-apple-darwin/debug",
+                "ci",
+                "x86_64-unknown-linux-gnu/release",
+            ]
+        );
+
+        fs::write(
+            target.join("x86_64-unknown-linux-gnu/release/deps/libfoo.rlib"),
+            vec![0u8; 4096],
+        )
+        .unwrap();
+        let (stats, _) = compute_project_stats(target);
+        assert!(
+            stats.total_bytes >= 4096,
+            "cross-compiled output is counted"
+        );
+    }
+
+    #[test]
+    fn targets_inside_worktree_containers_are_found() {
+        let dir = tempfile::tempdir().unwrap();
+        for workspace in [
+            ".worktrees/feature",
+            ".claude/worktrees/agent-1",
+            ".cache/other",
+        ] {
+            let root = dir.path().join(workspace);
+            fs::create_dir_all(root.join("target/debug")).unwrap();
+            fs::write(root.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+            fs::write(root.join("target/debug/out.rlib"), vec![0u8; 1024]).unwrap();
+        }
+        let mut results = Vec::new();
+        find_target_dirs(dir.path(), &mut results);
+        let mut found: Vec<_> = results
+            .iter()
+            .map(|entry| entry.path.strip_prefix(dir.path()).unwrap().to_path_buf())
+            .collect();
+        found.sort();
+        assert_eq!(
+            found,
+            [
+                std::path::PathBuf::from(".claude/worktrees/agent-1/target"),
+                std::path::PathBuf::from(".worktrees/feature/target"),
+            ]
+        );
     }
 
     #[test]

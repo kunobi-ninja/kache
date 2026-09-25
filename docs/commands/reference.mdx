@@ -87,7 +87,7 @@ kache clean --tracked --stale 14d --dry-run
 kache clean --tracked --stale 14d --yes
 ```
 
-`clean` recursively finds `target/` directories below the current directory. The default opens a selector. Use `--dry-run` before a scripted `--yes` run.
+`clean` recursively finds `target/` directories below the current directory, including worktrees under `.worktrees/` and `.claude/`; other hidden directories are skipped. Sizes cover every profile, custom profiles and `<triple>/<profile>` directories included. The default opens a selector. Use `--dry-run` before a scripted `--yes` run.
 
 `--tracked` uses the bounded machine-local target registry populated by normal builds and restores. `--stale` filters by last use. Cleanup rechecks each directory identity and removes only the derived target directory; missing, moved, replaced, current-workspace, and unsafe paths are skipped.
 

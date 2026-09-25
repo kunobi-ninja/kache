@@ -72,10 +72,13 @@ that seed and clears its build artifacts before starting.
 
 ## Reading a PR result
 
-The pull-request comment opens with one table: Kache base and head for each
-subject, as median times per build with the paired change. Timings for every
-tool, contention counters, disk use and the paired test sit in folded sections
-below it; with more than one sample, each time shows its range.
+The pull-request comment opens with one table: for each subject, the base
+branch and this PR as median times per build, and the change in words, such as
+"17% slower, unconfirmed". A change is confirmed only when the paired test
+below clears it. Timings for every tool, contention counters, disk use and the
+paired test sit in folded sections below it; with more than one sample, each
+time shows its range. The comment names this PR and the base branch; the data
+calls them `head` and `base`.
 `summary.json` carries the statistics; `samples.json` retains raw measurements,
 source/tool versions, arm order, and the head/base/instrument identities.
 Build logs and engine reports are retained for each sample.
@@ -84,7 +87,7 @@ Only Kache head versus base decides the PR verdict. Increased misses or
 passthroughs fail independently of elapsed time. A timing regression needs at
 least five paired samples, a paired-median bootstrap 95% interval entirely
 above +5%, and a median increase above 250 ms. A corresponding reduction is
-reported as an improvement. Other timing results are **inconclusive**, including
+reported as an improvement. Other timing results are **unconfirmed**, including
 the single-sample default run. The short suite applies these rules to both warm
 phases; its two cold samples are reported without a timing verdict.
 
@@ -203,7 +206,7 @@ cold seeds and six warm batches, matching the isolated-build sample counts.
 Every warm batch restores its cold snapshot and clears all targets. A new
 cold seed is measured every third sample, and arm order alternates.
 The six warm pairs use the same timing gate as isolated builds; two cold
-samples remain inconclusive. More duplicate Kache key compilations, or more
+samples remain unconfirmed. More duplicate Kache key compilations, or more
 warm misses or passthroughs than the base, fail independently of elapsed time.
 
 Use `--contention-samples 12` with `bench-short` for a longer local comparison,

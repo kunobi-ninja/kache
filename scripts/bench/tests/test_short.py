@@ -260,7 +260,8 @@ class BenchTests(unittest.TestCase):
             self.assertEqual(payload["contention_samples"], "contention/samples.json")
             text = (args.output / "perf-gate.md").read_text()
             self.assertTrue(text.startswith("## Perf gate: pass (hk)\n"))
-            self.assertIn("| Build | hk base | hk head | hk change |", text)
+            self.assertIn("| Build | main | this PR | Change |", text)
+            self.assertIn("medians of 2 to 6 runs of each", text)
             self.assertIn("<summary>All tools, isolated builds</summary>", text)
             self.assertFalse((args.output / "scratch").exists())
             metrics = json.loads((args.output / "metrics.otlp.json").read_text())
@@ -277,7 +278,7 @@ class BenchTests(unittest.TestCase):
                 if point["attributes"][0]["value"]["stringValue"] == "cold"
             ]
             self.assertEqual(len(cold), 8)
-            self.assertIn("inconclusive", (args.output / "perf-gate.md").read_text())
+            self.assertIn("unconfirmed", (args.output / "perf-gate.md").read_text())
             for phase, expected in (("cold", 4), ("warm", 12)):
                 cached = json.loads(
                     (
@@ -480,21 +481,22 @@ class ReportTests(unittest.TestCase):
             text = self.render([hk, eza])
 
         self.assertTrue(text.startswith("## Perf gate: pass (hk, eza)\n"))
-        self.assertIn("did not rise against base", text)
-        self.assertIn(
-            "| Build | hk base | hk head | hk change | eza base | eza head | eza change |",
-            text,
-        )
-        self.assertIn("| Cold | 84.6 s | 97.3 s | +15.0% | 1.87 s | 2.88 s | +54.4% |", text)
-        self.assertIn("| Contention, warm | 9.00 s | 9.00 s | -10.2% | — | — | — |", text)
-        self.assertIn("every change is inconclusive", text)
+        self.assertIn("This PR adds no cache misses or passthroughs over main.", text)
+        # A row per build under each subject, this PR against the base branch.
+        self.assertIn("| Build | main | this PR | Change |", text)
+        self.assertIn("| **hk** | | | |\n| Cold | 84.6 s | 97.3 s | 15% slower, unconfirmed |", text)
+        self.assertIn("| Contention, warm | 9.00 s | 9.00 s | 10% faster, unconfirmed |", text)
+        self.assertIn("| **eza** | | | |\n| Cold | 1.87 s | 2.88 s | 54% slower, unconfirmed |", text)
+        self.assertIn("Times are medians of 1 run of each.", text)
+        self.assertIn("every change here is unconfirmed", text)
+        self.assertNotIn("head", text.split("<details>")[0])
         self.assertEqual(text.count("<details>"), 3)
         self.assertEqual(text.count("<details>"), text.count("</details>"))
-        self.assertIn("| head, warm | 3 | 0 | 0.00 s | — |", text)
+        self.assertIn("| this PR, warm | 3 | 0 | 0.00 s | — |", text)
         self.assertNotIn("<details open>", text)
         # One table per subject inside a fold, never a row per tool and phase.
-        self.assertIn("| hk | head | base |", text)
-        self.assertIn("Versions: head `kache 1.0`, base `kache 1.0`.", text)
+        self.assertIn("| hk | this PR | main |", text)
+        self.assertIn("Measured: this PR `kache 1.0`, main `kache 1.0`.", text)
 
     def test_versions_name_each_tool_and_split_only_where_subjects_differ(self):
         def run(arm, version):
@@ -509,8 +511,8 @@ class ReportTests(unittest.TestCase):
             eza = subject(root, "eza", [run("kache", "kache 0.24.0"), run("mbx", "mbx 1.11.0")])
             text = self.render([hk, eza])
         self.assertIn(
-            "Versions: kache `kache 0.24.0`, mbx `mbx 1.10.1` (hk), "
-            "mbx `mbx 1.11.0` (eza), sccache `sccache 0.10.0`.",
+            "Measured: kache `0.24.0`, mbx `1.10.1` (hk), "
+            "mbx `1.11.0` (eza), sccache `0.10.0`.",
             text,
         )
 
@@ -524,10 +526,11 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(headline, "## Perf gate: FAIL (hk)")
         self.assertEqual(failed, "**Failed checks**")
         self.assertIn("misses rose 0 → 2", first)
-        self.assertIn("**+20.0% regression**", text)
-        self.assertIn("fewer than 5 pairs stay inconclusive", text)
+        self.assertIn("| Warm, same path | 10.0 s | 12.0 s | **20% slower** |", text)
+        self.assertIn("| Cold | 10.0 s | 12.0 s | 20% slower, unconfirmed |", text)
+        self.assertIn("fewer than 5 runs stay unconfirmed", text)
         self.assertIn("<sub>10.0–10.0</sub>", text)
-        self.assertIn("(+20.0% to +20.0%), 6 pairs, regression", text)
+        self.assertIn("(+20.0% to +20.0%), 6 pairs, slower", text)
 
     def test_invalid_subject_is_named_and_the_valid_one_still_reports(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -541,7 +544,7 @@ class ReportTests(unittest.TestCase):
             self.assertIn("**gone: invalid measurement.** no disk", self.render([missing]))
         self.assertTrue(text.startswith("## Perf gate: INVALID MEASUREMENT (hk, eza)\n"))
         self.assertIn("**hk: invalid measurement.** warm: restored nothing", text)
-        self.assertIn("| Build | eza base | eza head | eza change |", text)
+        self.assertIn("| **eza** | | | |", text)
 
     def test_single_kache_run_opens_the_tool_table(self):
         with tempfile.TemporaryDirectory() as tmp:

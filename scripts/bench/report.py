@@ -2,7 +2,9 @@
 """Render the perf-gate pull-request comment from bench-short output directories.
 
 Each directory is one subject's `--output` from bench-short.py. The comment puts
-Kache head against its merge base first, and folds every other table away.
+this PR against the branch it merges into first, and folds every other table
+away. Readers see "this PR" and the base branch's name; `head` and `base` stay
+the arm names in the data.
 """
 
 import argparse
@@ -22,6 +24,14 @@ COMPARISONS = PHASES + tuple(
 )
 ARM_ORDER = ("head", "kache", "base", "mbx", "sccache")
 MIN_PAIRS = 5
+# The paired test's outcomes, in the words the top table uses.
+OUTCOMES = {"inconclusive": "unconfirmed", "regression": "slower", "improvement": "faster"}
+# How each arm is named in the comment. `base` is set to the base branch.
+LABELS = {"head": "this PR", "base": "main"}
+
+
+def label(arm):
+    return LABELS.get(arm, arm)
 
 
 def number(ms):
@@ -51,12 +61,16 @@ def timing(row):
 
 
 def change(comparison):
+    """The change in words: which way, how much, and whether it is confirmed."""
     if comparison is None:
         return "—"
-    text = f"{comparison['median_pct']:+.1f}%"
-    if comparison["outcome"] != "inconclusive":
-        text = f"**{text} {comparison['outcome']}**"
-    return text
+    pct = comparison["median_pct"]
+    size = abs(pct)
+    amount = f"{size:.0f}%" if size >= 10 else f"{size:.1f}%"
+    text = "no change" if amount in ("0%", "0.0%") else f"{amount} {'slower' if pct > 0 else 'faster'}"
+    if comparison["outcome"] == "inconclusive":
+        return f"{text}, unconfirmed"
+    return f"**{text}**"
 
 
 def arms(rows):
@@ -82,6 +96,12 @@ def load(directory):
             for r in payload.get("records", [])
             if r.get("result", {}).get("cache_tool_version")
         }
+        identity = payload.get("identity") or {}
+        project["commits"] = {
+            arm: identity[key]
+            for arm, key in (("head", "BENCH_HEAD_SHA"), ("base", "BENCH_BASE_SHA"))
+            if identity.get(key)
+        }
     summary = directory / "summary.json"
     if not summary.exists():
         report = directory / "perf-gate.md"
@@ -101,15 +121,15 @@ def pivot(title, phases, rows):
     columns = arms(rows)
     by_key = {(row["arm"], row["phase"]): row for row in rows}
     lines = [
-        f"| {title} | " + " | ".join(columns) + " |",
+        f"| {title} | " + " | ".join(label(arm) for arm in columns) + " |",
         "| --- |" + " ---: |" * len(columns),
     ]
-    for phase, label in phases:
+    for phase, name in phases:
         cells = [
             timing(by_key[(arm, phase)]) if (arm, phase) in by_key else "—"
             for arm in columns
         ]
-        lines.append(f"| {label} | " + " | ".join(cells) + " |")
+        lines.append(f"| {name} | " + " | ".join(cells) + " |")
     return lines
 
 
@@ -126,26 +146,24 @@ def details(summary, body, open_=False):
 
 
 def head_vs_base(projects):
+    """This PR against its base branch: a row per build, grouped by subject."""
     compared = [p for p in projects if p["summary"]["comparisons"]]
     if not compared:
         return []
-    header = ["Build"]
-    for p in compared:
-        header += [f"{p['name']} base", f"{p['name']} head", f"{p['name']} change"]
     lines = [
-        "| " + " | ".join(header) + " |",
-        "| --- |" + " ---: |" * (len(header) - 1),
+        f"| Build | {label('base')} | {label('head')} | Change |",
+        "| --- | ---: | ---: | --- |",
     ]
-    rows = [(phase, label, "statistics") for phase, label in PHASES]
-    if any("contention" in p["summary"] for p in compared):
-        rows += [
-            (phase, f"Contention, {label.lower()}", "contention")
-            for phase, label in CONTENTION_PHASES
-        ]
-    for phase, label, source in rows:
-        cells = [label]
-        for p in compared:
-            summary = p["summary"]
+    for p in compared:
+        summary = p["summary"]
+        rows = [(phase, name, "statistics") for phase, name in PHASES]
+        if "contention" in summary:
+            rows += [
+                (phase, f"Contention, {name.lower()}", "contention")
+                for phase, name in CONTENTION_PHASES
+            ]
+        lines.append(f"| **{p['name']}** | | | |")
+        for phase, name, source in rows:
             stats = (
                 summary["statistics"]
                 if source == "statistics"
@@ -156,45 +174,55 @@ def head_vs_base(projects):
             comparison = next(
                 (c for c in summary["comparisons"] if c["phase"] == key), None
             )
-            cells += [
+            cells = [
+                name,
                 seconds(by_arm["base"]["median_ms"]) if "base" in by_arm else "—",
                 seconds(by_arm["head"]["median_ms"]) if "head" in by_arm else "—",
                 change(comparison),
             ]
-        lines.append("| " + " | ".join(cells) + " |")
-    pairs = [c["n"] for p in compared for c in p["summary"]["comparisons"]]
+            lines.append("| " + " | ".join(cells) + " |")
+    counts = [c["n"] for p in compared for c in p["summary"]["comparisons"]]
+    pairs = max(counts)
+    fewest = min(counts)
+    runs = (
+        "1 run"
+        if pairs == 1
+        else f"{pairs} runs" if fewest == pairs else f"{fewest} to {pairs} runs"
+    )
     lines.append("")
-    if max(pairs) < MIN_PAIRS:
-        noun = "pair" if max(pairs) == 1 else "pairs"
+    if pairs < MIN_PAIRS:
         lines.append(
-            f"Times are medians. With {max(pairs)} {noun} per build and {MIN_PAIRS} needed for a timing verdict, every change is inconclusive."
+            f"Times are medians of {runs} of each. That cannot tell a change from runner noise, so every change here is unconfirmed and the gate ignores it. Confirming one takes {MIN_PAIRS} runs."
         )
     else:
         lines.append(
-            f"Times are medians; positive changes are slower. A change is marked only when it clears the paired test below, so builds with fewer than {MIN_PAIRS} pairs stay inconclusive."
+            f"Times are medians of {runs} of each. A change is confirmed when the paired test below clears it; unconfirmed ones do not decide the verdict. Builds with fewer than {MIN_PAIRS} runs stay unconfirmed."
         )
     return lines
 
 
 def tool_versions(projects):
-    """Each arm's `--version`, per subject only where the subjects disagree."""
+    """This PR and its base by commit, every other tool by `--version`, per
+    subject only where the subjects disagree."""
     per_arm = {}
     for p in projects:
+        commits = p.get("commits", {})
         for arm, version in p.get("versions", {}).items():
-            per_arm.setdefault(arm, {}).setdefault(version, []).append(p["name"])
+            shown = commits[arm][:8] if arm in commits else version.removeprefix(f"{arm} ")
+            per_arm.setdefault(arm, {}).setdefault(shown, []).append(p["name"])
     if not per_arm:
         return []
     parts = []
     for arm in arms([{"arm": arm} for arm in per_arm]):
         versions = per_arm[arm]
         if len(versions) == 1:
-            parts.append(f"{arm} `{next(iter(versions))}`")
+            parts.append(f"{label(arm)} `{next(iter(versions))}`")
         else:
             parts += [
-                f"{arm} `{version}` ({', '.join(names)})"
+                f"{label(arm)} `{version}` ({', '.join(names)})"
                 for version, names in versions.items()
             ]
-    return ["Versions: " + ", ".join(parts) + ".", ""]
+    return ["Measured: " + ", ".join(parts) + ".", ""]
 
 
 def all_tools(projects, open_):
@@ -235,12 +263,12 @@ def contention(projects):
             f"| {p['name']} | Compiler runs | Duplicate keys | Flight wait | Permit wait |",
             "| --- | ---: | ---: | ---: | ---: |",
         ]
-        for phase, label in CONTENTION_PHASES:
+        for phase, name in CONTENTION_PHASES:
             by_arm = {row["arm"]: row for row in rows if row["phase"] == phase}
             for arm in arms(by_arm.values()):
                 row = by_arm[arm]
                 counters.append(
-                    f"| {arm}, {label.lower()} | {count(row['compiler_runs'])} | {count(row['duplicate_key_compiles'])} | "
+                    f"| {label(arm)}, {name.lower()} | {count(row['compiler_runs'])} | {count(row['duplicate_key_compiles'])} | "
                     f"{seconds(row['flight_wait_ms'])} | {seconds(row['permit_wait_ms'])} |"
                 )
         counters.append("")
@@ -261,10 +289,10 @@ def disk_use(projects):
             continue
         columns = arms(records)
         storage += [
-            f"| {p['name']} (GiB) | " + " | ".join(columns) + " |",
+            f"| {p['name']} (GiB) | " + " | ".join(label(arm) for arm in columns) + " |",
             "| --- |" + " ---: |" * len(columns),
         ]
-        for phase, label in CONTENTION_PHASES:
+        for phase, name in CONTENTION_PHASES:
             for scope, scope_label in (
                 ("cache", "cache"),
                 ("targets", "targets"),
@@ -281,7 +309,7 @@ def disk_use(projects):
                         f"{sum(sizes) / len(sizes) / 2**30:.2f}" if sizes else "—"
                     )
                 storage.append(
-                    f"| After {label.lower()}, {scope_label} | " + " | ".join(cells) + " |"
+                    f"| After {name.lower()}, {scope_label} | " + " | ".join(cells) + " |"
                 )
         storage.append("")
     if not storage:
@@ -300,7 +328,7 @@ def comparison_detail(projects):
         "| Build | " + " | ".join(p["name"] for p in compared) + " |",
         "| --- |" + " --- |" * len(compared),
     ]
-    for phase, label in COMPARISONS:
+    for phase, name in COMPARISONS:
         cells = []
         for p in compared:
             c = next((c for c in p["summary"]["comparisons"] if c["phase"] == phase), None)
@@ -315,17 +343,18 @@ def comparison_detail(projects):
             )
             noun = "pair" if c["n"] == 1 else "pairs"
             cells.append(
-                f"{c['median_pct']:+.1f}%{bounds}, {c['n']} {noun}, {c['outcome']}"
+                f"{c['median_pct']:+.1f}%{bounds}, {c['n']} {noun}, {OUTCOMES.get(c['outcome'], c['outcome'])}"
             )
-        body.append(f"| {label} | " + " | ".join(cells) + " |")
+        body.append(f"| {name} | " + " | ".join(cells) + " |")
     body += [
         "",
-        f"Head and base run as paired samples; positive changes are slower. Parentheses hold the 95% bootstrap interval. A regression needs at least {MIN_PAIRS} pairs, an interval entirely above +5% and a median change above 250 ms; an improvement is the mirror image. More Kache misses or passthroughs than base fail the gate whatever the timing. `samples.json` in the run artifacts has source and tool versions, run order and raw reports.",
+        f"This PR and {label('base')} run as paired samples; positive changes are slower. Parentheses hold the 95% bootstrap interval. A regression needs at least {MIN_PAIRS} pairs, an interval entirely above +5% and a median change above 250 ms; an improvement is the mirror image. More Kache misses or passthroughs than {label('base')} fail the gate whatever the timing. `samples.json` in the run artifacts has source and tool versions, run order and raw reports.",
     ]
     return details("Paired comparison", body)
 
 
-def render(directories, verdict=None):
+def render(directories, verdict=None, base_label="main"):
+    LABELS["base"] = base_label
     projects = [load(d) for d in directories]
     valid = [p for p in projects if "summary" in p]
     invalid = [p for p in projects if "error" in p]
@@ -341,7 +370,7 @@ def render(directories, verdict=None):
         lines += [f"- {name}: {failure}" for name, failure in failures]
         lines.append("")
     elif valid and any(p["summary"]["comparisons"] for p in valid):
-        lines += ["Kache misses and passthroughs did not rise against base.", ""]
+        lines += [f"This PR adds no cache misses or passthroughs over {label('base')}.", ""]
     if valid:
         table = head_vs_base(valid)
         lines += table + ([""] if table else [])
@@ -359,9 +388,12 @@ def main():
     parser.add_argument(
         "--verdict", help="headline verdict; derived from the data when omitted"
     )
+    parser.add_argument(
+        "--base-label", default="main", help="the base branch, as readers know it"
+    )
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
-    text = render(args.directories, args.verdict)
+    text = render(args.directories, args.verdict, args.base_label)
     if args.output:
         args.output.write_text(text)
     else:

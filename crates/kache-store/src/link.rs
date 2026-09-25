@@ -1732,6 +1732,21 @@ fn rewrite_depinfo_content_with_prefixes_and_sentinel(
     sentinel: &str,
     mode: DepInfoMode,
 ) -> String {
+    // Expanding replaces the sentinel, case-sensitively, and nothing else: a
+    // file without it comes back unchanged. Restoring a hit expands once per
+    // root, and most roots are absent from a given file.
+    if matches!(mode, DepInfoMode::Expand) && !content.contains(sentinel) {
+        return content.to_string();
+    }
+    // The expanded spellings, built once rather than once per line.
+    let (expanded_env, expanded_path) = if matches!(mode, DepInfoMode::Expand) {
+        (
+            escape_depinfo_env_value(&prefixes[0]),
+            escape_depinfo_make_path(&prefixes[0]),
+        )
+    } else {
+        Default::default()
+    };
     content
         .split_inclusive('\n')
         .map(|line| {
@@ -1752,7 +1767,7 @@ fn rewrite_depinfo_content_with_prefixes_and_sentinel(
                     DepInfoMode::Expand => replace_depinfo_text(
                         value,
                         sentinel,
-                        &escape_depinfo_env_value(&prefixes[0]),
+                        &expanded_env,
                         false,
                         DepInfoTextContext::EnvValue,
                     ),
@@ -1780,7 +1795,7 @@ fn rewrite_depinfo_content_with_prefixes_and_sentinel(
                     DepInfoMode::Expand => replace_depinfo_text(
                         line,
                         sentinel,
-                        &escape_depinfo_make_path(&prefixes[0]),
+                        &expanded_path,
                         false,
                         DepInfoTextContext::MakeLine,
                     ),

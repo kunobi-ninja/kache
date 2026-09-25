@@ -426,6 +426,17 @@ mod tests {
         remove_tree(&base.path().join("absent")).unwrap();
     }
 
+    /// Only a missing path counts as removed; any other lookup failure is
+    /// reported rather than taken for success.
+    #[cfg(unix)]
+    #[test]
+    fn remove_tree_reports_a_path_it_cannot_look_up() {
+        let base = TempDir::new().unwrap();
+        let file = base.path().join("file");
+        std::fs::write(&file, b"").unwrap();
+        assert!(remove_tree(&file.join("below")).is_err());
+    }
+
     #[test]
     fn clone_ref_path_is_a_sibling_not_a_child_of_work_dir() {
         assert_eq!(

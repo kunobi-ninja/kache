@@ -33,7 +33,7 @@ use crate::config::Config;
 use crate::events::EventResult;
 use crate::store::{EntryMeta, Store, StorePutResult, link};
 use anyhow::{Context, Result};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -456,6 +456,48 @@ struct Prediction {
     /// Nothing under `OUT_DIR` spelled a machine-local root, so the result
     /// can be restored under another `OUT_DIR`.
     portable_out_dir: bool,
+    /// The roots, as placeholders, that recorded outputs spell and that could
+    /// not be rewritten. The result is restored only where each has the value
+    /// it had. `None` in a prediction written before this field: such a
+    /// result is keyed on its `OUT_DIR` unless `portable_out_dir`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    embedded_roots: Option<Vec<String>>,
+    /// Some recorded text files were stored with their roots as placeholders
+    /// and are written back with this run's roots.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    rewrites_text: bool,
+}
+
+/// The prediction a run records, given where its outputs name roots.
+fn recorded_prediction(
+    inputs: Vec<String>,
+    env: Vec<String>,
+    default_package: bool,
+    embedded: Vec<String>,
+    rewrites_text: bool,
+) -> Prediction {
+    Prediction {
+        version: PREDICTION_SCHEMA,
+        inputs,
+        env,
+        default_package,
+        // Read by kache versions that predate `embedded_roots`: they bind
+        // anything but a result they could restore anywhere.
+        portable_out_dir: embedded.is_empty() && !rewrites_text,
+        embedded_roots: Some(embedded),
+        rewrites_text,
+    }
+}
+
+/// Where the recorded outputs name machine-local roots. See
+/// [`Environment::classify_outputs`].
+struct OutputRoots {
+    /// What to store: the files as they are, or a rewritten copy.
+    files: Vec<(PathBuf, String)>,
+    /// Names of the files stored rewritten.
+    rewritten: Vec<String>,
+    /// Placeholders of the roots left in stored files, sorted.
+    embedded: Vec<String>,
 }
 
 /// Roots that appear in paths and outputs and differ between checkouts.
@@ -465,6 +507,9 @@ struct Environment {
     manifest_dir: PathBuf,
     /// Longest first, so nested roots map before their parents.
     mappings: Vec<(PathBuf, &'static str)>,
+    /// Each root as Cargo spelled it, without the canonical spellings
+    /// `mappings` adds: what a placeholder is written back as.
+    spellings: Vec<(PathBuf, &'static str)>,
     /// `KACHE_BASE_DIR`, in both spellings when it is reached through a
     /// symlink. See [`remap_flag_base_dirs`].
     base_dirs: Vec<PathBuf>,
@@ -492,6 +537,7 @@ impl Environment {
         if let Some(cargo_home) = cargo_home {
             mappings.push((cargo_home, "${KACHE_CARGO_HOME}"));
         }
+        let spellings = mappings.clone();
         // A checkout reached through a symlink is spelled both ways by tools
         // that canonicalize; both spellings map to the same placeholder.
         let canonical: Vec<(PathBuf, &'static str)> = mappings
@@ -517,6 +563,7 @@ impl Environment {
             out_dir,
             manifest_dir,
             mappings,
+            spellings,
             base_dirs,
         })
     }
@@ -541,7 +588,7 @@ impl Environment {
 
     fn denormalize(&self, text: &[u8]) -> Vec<u8> {
         let mut text = text.to_vec();
-        for (root, placeholder) in &self.mappings {
+        for (root, placeholder) in &self.spellings {
             text = replace_all(
                 &text,
                 placeholder.as_bytes(),
@@ -559,27 +606,114 @@ impl Environment {
         String::from_utf8_lossy(&self.denormalize(text.as_bytes())).into_owned()
     }
 
-    /// Whether any file under `OUT_DIR` spells one of the roots.
-    fn out_dir_is_portable(&self, files: &[(PathBuf, String)]) -> Result<bool> {
-        let needles: Vec<&[u8]> = self
-            .mappings
+    /// Every root with its placeholder, `KACHE_BASE_DIR` included.
+    fn roots(&self) -> impl Iterator<Item = (&Path, &'static str)> {
+        self.mappings
             .iter()
-            .map(|(root, _)| root.as_os_str())
-            .chain(self.base_dirs.iter().map(|base| base.as_os_str()))
-            .map(std::ffi::OsStr::as_encoded_bytes)
-            .collect();
-        for (path, _) in files {
-            let contents = std::fs::read(path)?;
-            if needles
-                .iter()
-                .any(|needle| find_bytes(&contents, needle).is_some())
-            {
-                return Ok(false);
+            .map(|(root, placeholder)| (root.as_path(), *placeholder))
+            .chain(
+                self.base_dirs
+                    .iter()
+                    .map(|base| (base.as_path(), BASE_DIR_PLACEHOLDER)),
+            )
+    }
+
+    /// The placeholders of the roots `contents` spells.
+    fn spelled_roots(&self, contents: &[u8]) -> BTreeSet<&'static str> {
+        self.roots()
+            .filter(|(root, _)| find_bytes(contents, root.as_os_str().as_encoded_bytes()).is_some())
+            .map(|(_, placeholder)| placeholder)
+            .collect()
+    }
+
+    /// `contents` with the roots as placeholders, when it is text that spells
+    /// one of them and names no other path. Binary formats hold offsets and
+    /// lengths a rewrite would break, so only UTF-8 without NUL qualifies.
+    /// Text that already holds a placeholder is left alone: writing it back
+    /// would change it. A root is replaced only as a whole path (`/t/out` is
+    /// not replaced inside `/t/out2`), and only as Cargo spelled it. Any path
+    /// left that does not start at a placeholder (`/usr/include`, a sibling
+    /// of the checkout) would come back unchanged in another checkout, so
+    /// such text is not rewritten and stays bound to its roots.
+    fn rewrite_text(&self, contents: &[u8]) -> Option<Vec<u8>> {
+        if contents.contains(&0)
+            || std::str::from_utf8(contents).is_err()
+            || find_bytes(contents, PLACEHOLDER_PREFIX).is_some()
+        {
+            return None;
+        }
+        let mut spellings = self.spellings.clone();
+        spellings.sort_by_key(|(root, _)| std::cmp::Reverse(root.as_os_str().len()));
+        let mut normalized = contents.to_vec();
+        for (root, placeholder) in &spellings {
+            normalized = replace_whole_paths(
+                &normalized,
+                root.as_os_str().as_encoded_bytes(),
+                placeholder.as_bytes(),
+            );
+        }
+        (normalized != contents && only_placeholder_paths(&normalized)).then_some(normalized)
+    }
+
+    /// Sort the recorded files by how they name machine-local roots. A text
+    /// file that names one (a pkg-config file's `prefix=`) is stored with
+    /// placeholders and written back with the restoring run's roots. Any
+    /// other file keeps its bytes, and the roots it spells are recorded: a
+    /// result whose objects name `~/.cargo/registry` sources restores in any
+    /// checkout that shares that Cargo home, and one that names its own
+    /// `OUT_DIR` only where the `OUT_DIR` is the same.
+    fn classify_outputs(
+        &self,
+        files: Vec<(PathBuf, String)>,
+        staging: &Path,
+    ) -> Result<OutputRoots> {
+        let mut stored = Vec::with_capacity(files.len());
+        let mut rewritten = Vec::new();
+        let mut embedded = BTreeSet::new();
+        for (index, (path, name)) in files.into_iter().enumerate() {
+            let contents = std::fs::read(&path)?;
+            let spelled = self.spelled_roots(&contents);
+            if spelled.is_empty() {
+                stored.push((path, name));
+                continue;
+            }
+            if let Some(normalized) = self.rewrite_text(&contents) {
+                // What the mappings do not cover (a base dir outside them)
+                // still binds the result.
+                embedded.extend(self.spelled_roots(&normalized));
+                let copy = staging.join(format!("rewritten-{index}"));
+                std::fs::write(&copy, &normalized)?;
+                std::fs::set_permissions(&copy, std::fs::metadata(&path)?.permissions())?;
+                rewritten.push(name.clone());
+                stored.push((copy, name));
+            } else {
+                embedded.extend(spelled);
+                stored.push((path, name));
             }
         }
-        Ok(true)
+        Ok(OutputRoots {
+            files: stored,
+            rewritten,
+            embedded: embedded.into_iter().map(str::to_string).collect(),
+        })
+    }
+
+    /// The values of a root, every spelling, in a stable order.
+    fn root_values(&self, placeholder: &str) -> Vec<&[u8]> {
+        let mut values: Vec<&[u8]> = self
+            .roots()
+            .filter(|(_, candidate)| *candidate == placeholder)
+            .map(|(root, _)| root.as_os_str().as_encoded_bytes())
+            .collect();
+        values.sort_unstable();
+        values
     }
 }
+
+const BASE_DIR_PLACEHOLDER: &str = "${KACHE_BASE_DIR}";
+
+/// Every placeholder starts with this.
+const PLACEHOLDER_PREFIX: &[u8] = b"${KACHE_";
 
 /// The checkout root declared relocatable with `KACHE_BASE_DIR`. A relative
 /// value or `/` is ignored: neither names a checkout.
@@ -648,6 +782,55 @@ pub(crate) fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack
         .windows(needle.len())
         .position(|window| window == needle)
+}
+
+/// A byte that can continue a file name, so a root followed or preceded by
+/// one is part of a longer path.
+fn is_name_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b'+' | b'~' | b'@')
+}
+
+/// [`replace_all`], only where `needle` is a whole path: not preceded by a
+/// name byte or `/`, and not followed by a name byte.
+fn replace_whole_paths(haystack: &[u8], needle: &[u8], replacement: &[u8]) -> Vec<u8> {
+    if needle.is_empty() {
+        return haystack.to_vec();
+    }
+    let mut out = Vec::with_capacity(haystack.len());
+    let mut index = 0;
+    while index < haystack.len() {
+        let before = index.checked_sub(1).map(|at| haystack[at]);
+        let after = haystack.get(index + needle.len()).copied();
+        let next = if haystack[index..].starts_with(needle)
+            && !before.is_some_and(|byte| is_name_byte(byte) || byte == b'/')
+            && !after.is_some_and(is_name_byte)
+        {
+            out.extend_from_slice(replacement);
+            index + needle.len()
+        } else {
+            out.push(haystack[index]);
+            index + 1
+        };
+        // A loop that stopped advancing would grow `out` without bound.
+        debug_assert!(next > index, "replace_whole_paths must advance");
+        index = next;
+    }
+    out
+}
+
+/// Whether every path in `text` starts at a placeholder or a `${var}`
+/// reference: each `/` belongs to a word that begins with `${`.
+fn only_placeholder_paths(text: &[u8]) -> bool {
+    let delimiter = |byte: u8| byte.is_ascii_whitespace() || b"\"'`=:;,()<>[]|".contains(&byte);
+    let mut word_start = 0;
+    for (index, &byte) in text.iter().enumerate() {
+        if delimiter(byte) {
+            word_start = index + 1;
+        } else if byte == b'/' && !text[word_start..].starts_with(b"${") {
+            return false;
+        }
+    }
+    true
 }
 
 fn replace_all(haystack: &[u8], needle: &[u8], replacement: &[u8]) -> Vec<u8> {
@@ -831,7 +1014,14 @@ impl Run {
             {
                 let path = PathBuf::from(raw);
                 if path.is_absolute() && path.exists() {
-                    let state = input_state(&path, &[], &file_hasher, &mut budget, 0)?;
+                    let state = input_state_as(
+                        &path,
+                        &[],
+                        &file_hasher,
+                        &mut budget,
+                        0,
+                        Some(&self.environment),
+                    )?;
                     fold(&mut hasher, "cargo_env_path_state", state.as_bytes());
                 }
             }
@@ -865,12 +1055,31 @@ impl Run {
         {
             fold(&mut hasher, "zero_ar_date", value.as_encoded_bytes());
         }
-        if !prediction.portable_out_dir {
-            fold(
-                &mut hasher,
-                "out_dir",
-                self.environment.out_dir.as_os_str().as_encoded_bytes(),
-            );
+        match &prediction.embedded_roots {
+            // A prediction recorded before the roots were: its non-portable
+            // results bind to their `OUT_DIR`, as they always did.
+            None => {
+                if !prediction.portable_out_dir {
+                    fold(
+                        &mut hasher,
+                        "out_dir",
+                        self.environment.out_dir.as_os_str().as_encoded_bytes(),
+                    );
+                }
+            }
+            Some(embedded) => {
+                for placeholder in embedded {
+                    fold(&mut hasher, "embedded_root", placeholder.as_bytes());
+                    for value in self.environment.root_values(placeholder) {
+                        fold(&mut hasher, "embedded_root_value", value);
+                    }
+                }
+                // Kache versions that cannot write the files back never
+                // compute this key.
+                if prediction.rewrites_text {
+                    fold(&mut hasher, "rewrites_text", b"");
+                }
+            }
         }
         if let Some(salt) = &self.config.key_salt {
             fold(&mut hasher, "salt", salt.as_bytes());
@@ -886,7 +1095,11 @@ impl Run {
             .context("recorded run has no manifest")?;
         let manifest: Manifest =
             serde_json::from_slice(&std::fs::read(self.store.blob_path(&manifest.hash))?)?;
-        anyhow::ensure!(manifest.version == 1, "unsupported build-script manifest");
+        anyhow::ensure!(
+            matches!(manifest.version, 1 | 2),
+            "unsupported build-script manifest"
+        );
+        let rewritten: BTreeSet<&str> = manifest.rewritten.iter().map(String::as_str).collect();
         let out_dir = &self.environment.out_dir;
         // The recorded run started from an empty OUT_DIR (see `record`), so
         // the restored state is exact only if this one does too.
@@ -895,6 +1108,7 @@ impl Run {
             std::fs::create_dir_all(out_dir.join(checked_relative(directory)?))?;
         }
         let mut prepared = Vec::new();
+        let mut texts = Vec::new();
         let mut size = 0;
         for cached in &meta.files {
             let Some(relative) = cached.name.strip_prefix(OUT_PREFIX) else {
@@ -910,15 +1124,26 @@ impl Run {
                 "blob for {} was evicted before restore",
                 cached.name
             );
+            size += cached.size;
+            if rewritten.contains(cached.name.as_str()) {
+                texts.push((blob, target, cached.executable));
+                continue;
+            }
             prepared.push((
                 link::prepare_writable_target_from_file(&blob, &target)?,
                 cached.executable,
             ));
-            size += cached.size;
         }
         for (artifact, executable) in prepared {
             let target = artifact.target().to_path_buf();
             artifact.publish_replacing()?;
+            set_executable(&target, executable)?;
+        }
+        for (blob, target, executable) in texts {
+            std::fs::write(
+                &target,
+                self.environment.denormalize(&std::fs::read(&blob)?),
+            )?;
             set_executable(&target, executable)?;
         }
         for empty in &manifest.empty_files {
@@ -971,27 +1196,33 @@ impl Run {
             directories: manifest_dirs,
             empty_files,
         } = collect_out_dir(&self.environment.out_dir)?;
-        let portable_out_dir = self.environment.out_dir_is_portable(&files)?;
-        let prediction = Prediction {
-            version: PREDICTION_SCHEMA,
+        let staging = tempfile::Builder::new()
+            .prefix("kache-build-script-")
+            .tempdir()?;
+        let OutputRoots {
+            files,
+            rewritten,
+            embedded,
+        } = self.environment.classify_outputs(files, staging.path())?;
+        let prediction = recorded_prediction(
             inputs,
             env,
             default_package,
-            portable_out_dir,
-        };
+            embedded,
+            !rewritten.is_empty(),
+        );
         let key_start = std::time::Instant::now();
         let key = self.action_key(&prediction)?;
         let key_ms = key_start.elapsed().as_millis() as u64;
         let manifest = Manifest {
-            version: 1,
+            // Version 1 readers would restore the placeholders verbatim.
+            version: if rewritten.is_empty() { 1 } else { 2 },
             directories: manifest_dirs,
             empty_files,
             stdout: String::from_utf8_lossy(&self.environment.normalize(stdout)).into_owned(),
             stderr: String::from_utf8_lossy(&self.environment.normalize(stderr)).into_owned(),
+            rewritten,
         };
-        let staging = tempfile::Builder::new()
-            .prefix("kache-build-script-")
-            .tempdir()?;
         let manifest_path = staging.path().join(MANIFEST_NAME);
         std::fs::write(&manifest_path, serde_json::to_vec(&manifest)?)?;
         let mut output_files = files;
@@ -1060,6 +1291,9 @@ struct Manifest {
     empty_files: Vec<EmptyFile>,
     stdout: String,
     stderr: String,
+    /// Files stored with their roots as placeholders (version 2).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    rewritten: Vec<String>,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -1225,6 +1459,23 @@ fn input_state(
     budget: &mut usize,
     symlink_depth: usize,
 ) -> Result<String> {
+    input_state_as(path, excluded, file_hasher, budget, symlink_depth, None)
+}
+
+/// [`input_state`], reading text files that spell one of `text`'s roots with
+/// the roots as placeholders. A `links` dependency's `OUT_DIR` sits under
+/// the same target directory as the dependent's, and a pkg-config file in it
+/// names that directory: read raw, every checkout would key the dependent
+/// differently. What the dependent writes from such a file is caught by its
+/// own outputs' roots.
+fn input_state_as(
+    path: &Path,
+    excluded: &[PathBuf],
+    file_hasher: &crate::cache_key::FileHasher<'_>,
+    budget: &mut usize,
+    symlink_depth: usize,
+    text: Option<&Environment>,
+) -> Result<String> {
     anyhow::ensure!(
         *budget > 0,
         "declared build-script inputs are too many to digest"
@@ -1248,10 +1499,24 @@ fn input_state(
         } else {
             path.parent().unwrap_or(Path::new("")).join(&target)
         };
-        let referent = input_state(&resolved, excluded, file_hasher, budget, symlink_depth + 1)?;
+        let referent = input_state_as(
+            &resolved,
+            excluded,
+            file_hasher,
+            budget,
+            symlink_depth + 1,
+            text,
+        )?;
         return Ok(format!("symlink:{}:{referent}", target.to_string_lossy()));
     }
     if metadata.is_file() {
+        if let Some(environment) = text
+            && let Some(normalized) = read_text(path)?
+                .as_deref()
+                .and_then(|contents| environment.rewrite_text(contents))
+        {
+            return Ok(format!("text:{}", blake3::hash(&normalized).to_hex()));
+        }
         return Ok(format!("file:{}", file_hasher.hash(path)?));
     }
     if metadata.is_dir() {
@@ -1266,11 +1531,11 @@ fn input_state(
             None
         };
         if let Some(stamp) = &stamp
-            && let Some(digest) = tree_digest_memo(path, &stamp.digest)
+            && let Some(digest) = tree_digest_memo(path, text, &stamp.digest)
         {
             return Ok(digest);
         }
-        let digest = hash_directory(path, excluded, file_hasher, budget, symlink_depth)?;
+        let digest = hash_directory(path, excluded, file_hasher, budget, symlink_depth, text)?;
         // Filesystem timestamps are coarse (a kernel tick on Linux), so a
         // same-size rewrite within the tick of the last write would keep the
         // stamp. A tree touched in the last seconds is hashed again next time
@@ -1278,7 +1543,7 @@ fn input_state(
         if let Some(stamp) = &stamp
             && stamp.settled_at(std::time::SystemTime::now())
         {
-            record_tree_digest_memo(path, &stamp.digest, &digest);
+            record_tree_digest_memo(path, text, &stamp.digest, &digest);
         }
         return Ok(digest);
     }
@@ -1294,6 +1559,7 @@ fn hash_directory(
     file_hasher: &crate::cache_key::FileHasher<'_>,
     budget: &mut usize,
     symlink_depth: usize,
+    text: Option<&Environment>,
 ) -> Result<String> {
     let mut entries: Vec<_> = std::fs::read_dir(path)?.collect::<std::io::Result<_>>()?;
     entries.sort_by_key(std::fs::DirEntry::file_name);
@@ -1307,7 +1573,7 @@ fn hash_directory(
         fold(
             &mut hasher,
             "state",
-            input_state(&child, excluded, file_hasher, budget, symlink_depth)?.as_bytes(),
+            input_state_as(&child, excluded, file_hasher, budget, symlink_depth, text)?.as_bytes(),
         );
     }
     Ok(format!("dir:{}", hasher.finalize().to_hex()))
@@ -1409,8 +1675,35 @@ fn fold_metadata_stamp(hasher: &mut blake3::Hasher, metadata: &std::fs::Metadata
     }
 }
 
-fn tree_memo_path(path: &Path) -> PathBuf {
-    let name = blake3::hash(path.as_os_str().as_encoded_bytes()).to_hex();
+/// A file's bytes when it may be text: `None` once its first block holds a
+/// NUL, so object files and archives are not read in full.
+fn read_text(path: &Path) -> Result<Option<Vec<u8>>> {
+    use std::io::Read as _;
+    let mut file = std::fs::File::open(path)?;
+    let mut contents = Vec::new();
+    (&mut file).take(8192).read_to_end(&mut contents)?;
+    if contents.contains(&0) {
+        return Ok(None);
+    }
+    file.read_to_end(&mut contents)?;
+    Ok(Some(contents))
+}
+
+/// A digest read with roots as placeholders depends on the roots, so it is
+/// memoised apart from the raw one and per set of roots.
+fn tree_memo_path(path: &Path, text: Option<&Environment>) -> PathBuf {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(path.as_os_str().as_encoded_bytes());
+    if let Some(environment) = text {
+        for (root, placeholder) in environment.roots() {
+            fold(
+                &mut hasher,
+                placeholder,
+                root.as_os_str().as_encoded_bytes(),
+            );
+        }
+    }
+    let name = hasher.finalize().to_hex();
     TREE_MEMO_DIR
         .get()
         .map(|cache_dir| cache_dir.join("probes"))
@@ -1418,14 +1711,14 @@ fn tree_memo_path(path: &Path) -> PathBuf {
         .join(format!("tree-{}.txt", &name[..24]))
 }
 
-fn tree_digest_memo(path: &Path, stamp: &str) -> Option<String> {
-    let memo = std::fs::read_to_string(tree_memo_path(path)).ok()?;
+fn tree_digest_memo(path: &Path, text: Option<&Environment>, stamp: &str) -> Option<String> {
+    let memo = std::fs::read_to_string(tree_memo_path(path, text)).ok()?;
     let (recorded_stamp, digest) = memo.trim_end().split_once('\n')?;
     (recorded_stamp == stamp && digest.starts_with("dir:")).then(|| digest.to_string())
 }
 
-fn record_tree_digest_memo(path: &Path, stamp: &str, digest: &str) {
-    crate::probe_memo::write_atomic(&tree_memo_path(path), &format!("{stamp}\n{digest}"));
+fn record_tree_digest_memo(path: &Path, text: Option<&Environment>, stamp: &str, digest: &str) {
+    crate::probe_memo::write_atomic(&tree_memo_path(path, text), &format!("{stamp}\n{digest}"));
 }
 
 #[cfg(test)]
@@ -1441,6 +1734,7 @@ mod tests {
         Environment {
             out_dir: out_dir.to_path_buf(),
             manifest_dir: manifest_dir.to_path_buf(),
+            spellings: mappings.clone(),
             mappings,
             base_dirs: Vec::new(),
         }
@@ -1487,6 +1781,7 @@ mod tests {
                     "${KACHE_TARGET_DIR}",
                 ),
             ],
+            spellings: Vec::new(),
             base_dirs: Vec::new(),
         };
         let excluded = package_exclusions(package, &environment);
@@ -1930,11 +2225,12 @@ mod tests {
             // An output that spells the checkout cannot move to another one.
             let spelled = out.join("paths.txt");
             std::fs::write(&spelled, format!("src={}/vendor", checkout.display())).unwrap();
-            assert!(
-                !environment
-                    .out_dir_is_portable(&[(spelled, "paths.txt".into())])
-                    .unwrap()
-            );
+            let staging = tempfile::tempdir().unwrap();
+            let roots = environment
+                .classify_outputs(vec![(spelled, "paths.txt".into())], staging.path())
+                .unwrap();
+            assert_eq!(roots.embedded, vec![BASE_DIR_PLACEHOLDER.to_string()]);
+            assert!(roots.rewritten.is_empty(), "no mapped root to rewrite");
         }
         assert_eq!(remapped[0], "-ffile-prefix-map=${KACHE_BASE_DIR}=.");
         assert_eq!(remapped[0], remapped[1]);
@@ -1944,30 +2240,121 @@ mod tests {
         );
     }
 
+    /// One output of a run, sorted by how it names the run's roots.
+    fn classify_one(env: &Environment, name: &str, contents: &[u8]) -> (OutputRoots, Vec<u8>) {
+        let file = env.out_dir.join(name);
+        std::fs::write(&file, contents).unwrap();
+        let staging = tempfile::tempdir().unwrap();
+        let roots = env
+            .classify_outputs(vec![(file, name.into())], staging.path())
+            .unwrap();
+        let stored = std::fs::read(&roots.files[0].0).unwrap();
+        (roots, stored)
+    }
+
+    /// Older kache reads `portable_out_dir` alone: it must be true only for
+    /// a result it could restore verbatim anywhere.
     #[test]
-    fn out_dir_portability_depends_on_spelled_roots() {
+    fn a_recorded_prediction_tells_older_readers_what_they_can_restore() {
+        let recorded = |embedded: &[&str], rewrites_text: bool| {
+            let embedded = embedded.iter().map(|root| root.to_string()).collect();
+            recorded_prediction(Vec::new(), Vec::new(), true, embedded, rewrites_text)
+        };
+        let plain = recorded(&[], false);
+        assert!(plain.portable_out_dir && !plain.rewrites_text);
+        assert_eq!(plain.embedded_roots, Some(Vec::new()));
+        let rewritten = recorded(&[], true);
+        assert!(!rewritten.portable_out_dir && rewritten.rewrites_text);
+        let bound = recorded(&["${KACHE_CARGO_HOME}"], false);
+        assert!(!bound.portable_out_dir && !bound.rewrites_text);
+        assert_eq!(
+            bound.embedded_roots,
+            Some(vec!["${KACHE_CARGO_HOME}".to_string()])
+        );
+    }
+
+    #[test]
+    fn whole_paths_and_placeholder_paths() {
+        assert_eq!(
+            replace_whole_paths(b"/t/out /t/out2 /t/out/x", b"/t/out", b"$"),
+            b"$ /t/out2 $/x"
+        );
+        assert_eq!(replace_whole_paths(b"/usr/src", b"/src", b"$"), b"/usr/src");
+        assert_eq!(
+            replace_whole_paths(b"/usr//src", b"/src", b"$"),
+            b"/usr//src"
+        );
+        assert_eq!(replace_whole_paths(b"a=/src\n", b"/src", b"$"), b"a=$\n");
+        assert_eq!(replace_whole_paths(b"x", b"", b"$"), b"x");
+        assert!(only_placeholder_paths(
+            b"prefix=${KACHE_OUT_DIR}\nlibdir=${prefix}/lib\n"
+        ));
+        assert!(only_placeholder_paths(b"Cflags: -I${includedir}"));
+        assert!(!only_placeholder_paths(b"Cflags: -I/usr/include"));
+        assert!(!only_placeholder_paths(b"url https://example.com"));
+        assert!(!only_placeholder_paths(b"${KACHE_OUT_DIR} /opt"));
+    }
+
+    #[test]
+    fn outputs_are_rewritten_as_text_or_bound_to_the_roots_they_spell() {
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("out");
         std::fs::create_dir(&out).unwrap();
         let env = environment(&out, Path::new("/src/pkg"));
-        let plain = out.join("plain.h");
-        std::fs::write(&plain, "#define X 1").unwrap();
-        assert!(
-            env.out_dir_is_portable(&[(plain.clone(), "plain.h".into())])
-                .unwrap()
+
+        let (roots, stored) = classify_one(&env, "plain.h", b"#define X 1");
+        assert!(roots.embedded.is_empty() && roots.rewritten.is_empty());
+        assert_eq!(stored, b"#define X 1");
+
+        // A pkg-config file names its own OUT_DIR: stored with placeholders.
+        let pc = format!("prefix={}\nlibdir=${{prefix}}/lib\n", out.display());
+        let (roots, stored) = classify_one(&env, "z.pc", pc.as_bytes());
+        assert!(roots.embedded.is_empty());
+        assert_eq!(roots.rewritten, vec!["z.pc".to_string()]);
+        assert_eq!(stored, b"prefix=${KACHE_OUT_DIR}\nlibdir=${prefix}/lib\n");
+        assert_eq!(
+            env.denormalize(&stored),
+            pc.as_bytes(),
+            "written back as it was"
         );
-        let spelled = out.join("paths.txt");
-        std::fs::write(&spelled, format!("root={}", out.display())).unwrap();
+
+        let (roots, _) = classify_one(&env, "manifest.txt", b"at /src/pkg/src");
+        assert_eq!(roots.rewritten, vec!["manifest.txt".to_string()]);
+
+        // An object names its roots in binary: kept, and bound to each root.
+        let object = [b"\x7fELF\0".as_slice(), b"/src/pkg/src/a.c\0"].concat();
+        let (roots, stored) = classify_one(&env, "a.o", &object);
+        assert_eq!(roots.embedded, vec!["${KACHE_MANIFEST_DIR}".to_string()]);
+        assert!(roots.rewritten.is_empty());
+        assert_eq!(stored, object);
+        let object = [b"\0".as_slice(), out.as_os_str().as_encoded_bytes()].concat();
+        let (roots, _) = classify_one(&env, "b.o", &object);
+        assert_eq!(roots.embedded, vec!["${KACHE_OUT_DIR}".to_string()]);
+
+        // A root inside a longer path is not that root.
+        let sibling = format!("prefix={}2/lib\n", out.display());
+        let (roots, stored) = classify_one(&env, "sibling.pc", sibling.as_bytes());
         assert!(
-            !env.out_dir_is_portable(&[(spelled, "paths.txt".into())])
-                .unwrap()
+            roots.rewritten.is_empty(),
+            "{}",
+            String::from_utf8_lossy(&stored)
         );
-        let manifest = out.join("manifest.txt");
-        std::fs::write(&manifest, "at /src/pkg/src").unwrap();
-        assert!(
-            !env.out_dir_is_portable(&[(manifest, "manifest.txt".into())])
-                .unwrap()
-        );
+        assert_eq!(roots.embedded, vec!["${KACHE_OUT_DIR}".to_string()]);
+        let (roots, _) = classify_one(&env, "usr.txt", b"see /usr/src/pkg/x.h");
+        assert!(roots.rewritten.is_empty());
+
+        // A path no placeholder covers would come back unchanged elsewhere.
+        let mixed = format!("prefix={}\nextra=/opt/vendor/include\n", out.display());
+        let (roots, stored) = classify_one(&env, "mixed.pc", mixed.as_bytes());
+        assert!(roots.rewritten.is_empty());
+        assert_eq!(roots.embedded, vec!["${KACHE_OUT_DIR}".to_string()]);
+        assert_eq!(stored, mixed.as_bytes());
+
+        // Text already holding a placeholder would change on the way back.
+        let text = format!("{} and ${{KACHE_OUT_DIR}}", out.display());
+        let (roots, stored) = classify_one(&env, "odd.txt", text.as_bytes());
+        assert_eq!(roots.embedded, vec!["${KACHE_OUT_DIR}".to_string()]);
+        assert_eq!(stored, text.as_bytes());
     }
 
     #[test]
@@ -2139,6 +2526,8 @@ mod tests {
             env: Vec::new(),
             default_package: false,
             portable_out_dir: true,
+            embedded_roots: None,
+            rewrites_text: false,
         };
         let absolute = dir.as_path().join("include.h");
         std::fs::write(&absolute, "one").unwrap();
@@ -2159,6 +2548,189 @@ mod tests {
         let after = run.action_key(&prediction).unwrap();
         assert_eq!(before, after, "a relative value is only a spelling");
         unsafe { std::env::remove_var("DEP_KT_INCLUDE") };
+    }
+
+    /// A run's roots in one target directory: `<target>/debug/build/x/out`,
+    /// a registry package under `cargo_home`.
+    fn checkout_environment(target: &Path, cargo_home: &Path) -> Environment {
+        let out_dir = target.join("debug/build/x-1/out");
+        let manifest_dir = cargo_home.join("registry/src/x-1.0.0");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        let mut mappings = vec![
+            (out_dir.clone(), "${KACHE_OUT_DIR}"),
+            (manifest_dir.clone(), "${KACHE_MANIFEST_DIR}"),
+            (target.to_path_buf(), "${KACHE_TARGET_DIR}"),
+            (cargo_home.to_path_buf(), "${KACHE_CARGO_HOME}"),
+        ];
+        mappings.sort_by_key(|(root, _)| std::cmp::Reverse(root.as_os_str().len()));
+        Environment {
+            out_dir,
+            manifest_dir,
+            spellings: mappings.clone(),
+            mappings,
+            base_dirs: Vec::new(),
+        }
+    }
+
+    fn prediction_with(embedded_roots: Option<Vec<String>>, portable_out_dir: bool) -> Prediction {
+        Prediction {
+            version: PREDICTION_SCHEMA,
+            inputs: Vec::new(),
+            env: Vec::new(),
+            default_package: false,
+            portable_out_dir,
+            embedded_roots,
+            rewrites_text: false,
+        }
+    }
+
+    /// A result whose objects name registry sources restores in another
+    /// target directory that shares the Cargo home, and only there. One that
+    /// names its `OUT_DIR`, or was recorded before the roots were, stays put.
+    #[test]
+    fn a_result_is_bound_to_the_roots_its_outputs_spell() {
+        let _lock = crate::test_support::process_state_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::test_support::test_config(dir.path().join("cache"));
+        let run = |target: &str, cargo_home: &str| Run {
+            store: Store::open(&config).unwrap(),
+            config: config.clone(),
+            binary_hash: "aaaa".to_string(),
+            environment: checkout_environment(
+                &dir.path().join(target),
+                &dir.path().join(cargo_home),
+            ),
+            start: std::time::Instant::now(),
+        };
+        let key = |run: &Run, prediction: &Prediction| run.action_key(prediction).unwrap();
+        let (a, b, elsewhere) = (
+            run("a/target", "cargo"),
+            run("b/target", "cargo"),
+            run("b/target", "other-cargo"),
+        );
+
+        let cargo_home = prediction_with(Some(vec!["${KACHE_CARGO_HOME}".into()]), false);
+        assert_eq!(key(&a, &cargo_home), key(&b, &cargo_home));
+        assert_ne!(key(&b, &cargo_home), key(&elsewhere, &cargo_home));
+
+        let out_dir = prediction_with(Some(vec!["${KACHE_OUT_DIR}".into()]), false);
+        assert_ne!(key(&a, &out_dir), key(&b, &out_dir));
+
+        let recorded_before = prediction_with(None, false);
+        assert_ne!(key(&a, &recorded_before), key(&b, &recorded_before));
+
+        // Nothing spelled: the key an older kache computes for the same run.
+        assert_eq!(
+            key(&a, &prediction_with(Some(Vec::new()), true)),
+            key(&a, &prediction_with(None, true))
+        );
+        let mut rewritten = prediction_with(Some(Vec::new()), false);
+        rewritten.rewrites_text = true;
+        assert_ne!(
+            key(&a, &rewritten),
+            key(&a, &prediction_with(None, true)),
+            "a result older kache would restore verbatim is out of its reach"
+        );
+    }
+
+    /// libgit2-sys reads libz-sys's `OUT_DIR` through `DEP_Z_ROOT`, and
+    /// zlib's pkg-config file there names that directory. The same file in
+    /// two target directories keys the dependent the same; other content
+    /// does not.
+    #[test]
+    fn a_links_dependency_is_keyed_by_its_text_with_the_roots_mapped() {
+        let mut lock = crate::test_support::process_state_test_lock();
+        let dir = lock.enter(tempfile::tempdir().unwrap());
+        let config = crate::test_support::test_config(dir.as_path().join("cache"));
+        let prediction = prediction_with(Some(Vec::new()), true);
+        let key_in = |target: &str, content: &dyn Fn(&Path) -> String| {
+            let target = dir.as_path().join(target);
+            let root = target.join("debug/build/z-1/out");
+            std::fs::create_dir_all(root.join("lib")).unwrap();
+            std::fs::write(root.join("lib/z.pc"), content(&root)).unwrap();
+            std::fs::write(root.join("lib/libz.a"), b"!<arch>\n\0object").unwrap();
+            let run = Run {
+                store: Store::open(&config).unwrap(),
+                config: config.clone(),
+                binary_hash: "aaaa".to_string(),
+                environment: checkout_environment(&target, &dir.as_path().join("cargo")),
+                start: std::time::Instant::now(),
+            };
+            // SAFETY: the process-state lock serialises environment edits.
+            unsafe { std::env::set_var("DEP_KT_ROOT", &root) };
+            let key = run.action_key(&prediction).unwrap();
+            unsafe { std::env::remove_var("DEP_KT_ROOT") };
+            key
+        };
+        let pc = |root: &Path| format!("prefix={}\n", root.display());
+        let a = key_in("a/target", &pc);
+        assert_eq!(a, key_in("b/target", &pc));
+        let other = |root: &Path| format!("prefix={}\nextra=1\n", root.display());
+        assert_ne!(a, key_in("c/target", &other));
+    }
+
+    /// A run recorded in one target directory restores in another that
+    /// shares the Cargo home: its pkg-config file names the new `OUT_DIR`,
+    /// and its object keeps the bytes that name registry sources.
+    #[test]
+    fn a_recorded_run_restores_under_another_out_dir() {
+        let mut lock = crate::test_support::process_state_test_lock();
+        let dir = lock.enter(tempfile::tempdir().unwrap());
+        let config = crate::test_support::test_config(dir.as_path().join("cache"));
+        let run_in = |target: &str| {
+            let environment =
+                checkout_environment(&dir.as_path().join(target), &dir.as_path().join("cargo"));
+            std::fs::create_dir_all(&environment.manifest_dir).unwrap();
+            std::fs::write(environment.manifest_dir.join("build.rs"), "fn main() {}").unwrap();
+            Run {
+                store: Store::open(&config).unwrap(),
+                config: config.clone(),
+                binary_hash: "aaaa".to_string(),
+                environment,
+                start: std::time::Instant::now(),
+            }
+        };
+        let pc = |out: &Path| format!("prefix={}\nlibdir=${{prefix}}/lib\n", out.display());
+        let object = [
+            b"\x7fELF\0".as_slice(),
+            dir.as_path()
+                .join("cargo/registry/src/z-1.0.0/adler32.c")
+                .as_os_str()
+                .as_encoded_bytes(),
+        ]
+        .concat();
+
+        let a = run_in("a/target");
+        let out = &a.environment.out_dir;
+        std::fs::create_dir_all(out.join("lib/pkgconfig")).unwrap();
+        std::fs::write(out.join("lib/pkgconfig/z.pc"), pc(out)).unwrap();
+        std::fs::write(out.join("lib/adler32.o"), &object).unwrap();
+        let after_the_run = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+        a.record(b"cargo:rerun-if-changed=build.rs\n", b"", 5, after_the_run)
+            .unwrap();
+
+        let b = run_in("b/target");
+        let prediction = b
+            .prediction()
+            .unwrap()
+            .expect("the run recorded its declarations");
+        assert!(prediction.rewrites_text);
+        assert_eq!(
+            prediction.embedded_roots,
+            Some(vec!["${KACHE_CARGO_HOME}".to_string()])
+        );
+        let meta = b
+            .store
+            .get(&b.action_key(&prediction).unwrap())
+            .unwrap()
+            .expect("the same key in another target directory");
+        b.restore(&meta).unwrap();
+        let out = &b.environment.out_dir;
+        assert_eq!(
+            std::fs::read_to_string(out.join("lib/pkgconfig/z.pc")).unwrap(),
+            pc(out)
+        );
+        assert_eq!(std::fs::read(out.join("lib/adler32.o")).unwrap(), object);
     }
 
     /// 0.23.0 started kache through a `/bin/sh` launcher, and dash drops a
@@ -2183,6 +2755,8 @@ mod tests {
             env: Vec::new(),
             default_package: false,
             portable_out_dir: true,
+            embedded_roots: None,
+            rewrites_text: false,
         };
         const NAME: &str = "DEP_KT_CORE:WINDOW__CORE_PLUGIN___PERMISSION_FILES_PATH";
         // SAFETY: the process-state lock serialises environment edits.
@@ -2219,6 +2793,8 @@ mod tests {
             env: Vec::new(),
             default_package: false,
             portable_out_dir: true,
+            embedded_roots: None,
+            rewrites_text: false,
         };
         values.map(|value| {
             run.action_key_with(&prediction, value.map(Into::into))
@@ -2402,7 +2978,7 @@ mod tests {
         // Just written: the tree has not settled, so nothing is memoised.
         let stamp = tree_stamp(&root, &[], 100).unwrap();
         let digest = input_state(&root, &[], &hasher, &mut budget, 0).unwrap();
-        assert!(tree_digest_memo(&root, &stamp.digest).is_none());
+        assert!(tree_digest_memo(&root, None, &stamp.digest).is_none());
         assert!(!stamp.settled_at(std::time::SystemTime::now()));
         assert!(stamp.settled_at(std::time::SystemTime::now() + TreeStamp::SETTLE));
 
@@ -2418,7 +2994,7 @@ mod tests {
             digest
         );
         assert_eq!(
-            tree_digest_memo(&root, &settled.digest).as_deref(),
+            tree_digest_memo(&root, None, &settled.digest).as_deref(),
             Some(digest.as_str())
         );
 
@@ -2427,7 +3003,7 @@ mod tests {
         std::fs::write(root.join("src/a.c"), "int a;").unwrap();
         let restamped = tree_stamp(&root, &[], 100).unwrap();
         assert_ne!(restamped.digest, settled.digest);
-        assert!(tree_digest_memo(&root, &restamped.digest).is_none());
+        assert!(tree_digest_memo(&root, None, &restamped.digest).is_none());
         assert_eq!(
             input_state(&root, &[], &hasher, &mut budget, 0).unwrap(),
             digest

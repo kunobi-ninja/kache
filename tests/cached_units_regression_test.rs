@@ -622,6 +622,106 @@ fn links_metadata_reaches_dependent_build_scripts_whatever_its_spelling() {
     }
 }
 
+/// A `links` crate that builds a bundled C library the way libz-sys does:
+/// a pkg-config file naming its `OUT_DIR`, and objects whose debug info names
+/// sources under the Cargo home. A dependent reads the pkg-config file
+/// through `DEP_*`, as libgit2-sys does. Another target directory must hit
+/// both scripts, and the restored file must name the new `OUT_DIR`.
+#[test]
+fn bundled_c_library_scripts_hit_in_another_target_directory() {
+    let fx = fixture_from(|root| {
+        let write = |relative: &str, content: &str| {
+            let path = root.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, content).unwrap();
+        };
+        write(
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"bundled\", \"consumer\"]\nresolver = \"2\"\n",
+        );
+        write(
+            "bundled/Cargo.toml",
+            "[package]\nname = \"bundled\"\nversion = \"0.1.0\"\nedition = \"2021\"\nlinks = \"bundled\"\n",
+        );
+        write("bundled/src/lib.rs", "");
+        write(
+            "bundled/build.rs",
+            r#"fn main() {
+    println!("cargo:rerun-if-changed=build.rs");
+    let out = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    let pkgconfig = out.join("lib/pkgconfig");
+    std::fs::create_dir_all(&pkgconfig).unwrap();
+    std::fs::write(
+        pkgconfig.join("bundled.pc"),
+        format!("prefix={}\nlibdir=${{prefix}}/lib\n", out.display()),
+    )
+    .unwrap();
+    let source = format!("{}/registry/src/bundled/adler32.c", std::env::var("CARGO_HOME").unwrap());
+    let mut object = b"\x7fELF\0\0".to_vec();
+    object.extend_from_slice(source.as_bytes());
+    object.push(0);
+    std::fs::write(out.join("lib/adler32.o"), object).unwrap();
+    println!("cargo:root={}", out.display());
+}
+"#,
+        );
+        write(
+            "consumer/Cargo.toml",
+            "[package]\nname = \"consumer\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nbundled = { path = \"../bundled\" }\n",
+        );
+        write("consumer/src/lib.rs", "");
+        write(
+            "consumer/build.rs",
+            r#"fn main() {
+    println!("cargo:rerun-if-changed=build.rs");
+    let root = std::env::var("DEP_BUNDLED_ROOT").unwrap();
+    let pc = std::fs::read_to_string(format!("{root}/lib/pkgconfig/bundled.pc")).unwrap();
+    assert_eq!(pc.lines().next().unwrap(), format!("prefix={root}"), "{pc}");
+    println!("cargo:warning=consumer read prefix={root}");
+}
+"#,
+        );
+        let old = filetime::FileTime::from_unix_time(1_600_000_000, 0);
+        for entry in walkdir(root) {
+            let _ = filetime::set_file_mtime(&entry, old);
+        }
+    });
+
+    for (name, expected) in [("cold", "miss"), ("warm", "local_hit")] {
+        let target = target(&fx, name);
+        let mark = event_count(&fx.cache);
+        let output = run(&mut cargo(
+            "check",
+            &fx.workspace,
+            &fx.home,
+            &fx.cache,
+            &target,
+            &[],
+        ));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let build = target.join("debug/build");
+        let out_dir = std::fs::read_dir(&build)
+            .unwrap()
+            .map(|entry| entry.unwrap().path().join("out"))
+            .find(|out| out.join("lib/pkgconfig/bundled.pc").is_file())
+            .expect("the bundled OUT_DIR");
+        assert!(
+            stderr.contains(&format!("consumer read prefix={}", out_dir.display())),
+            "{name}: {stderr}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(out_dir.join("lib/pkgconfig/bundled.pc")).unwrap(),
+            format!("prefix={}\nlibdir=${{prefix}}/lib\n", out_dir.display()),
+            "{name}: the pkg-config file names this OUT_DIR"
+        );
+        assert_eq!(
+            results_for(&events_since(&fx.cache, mark), "build_script_run"),
+            vec![expected, expected],
+            "{name}"
+        );
+    }
+}
+
 /// `cargo clippy` units are served from the store with their diagnostics,
 /// and a change to the lint arguments is a different key.
 #[test]

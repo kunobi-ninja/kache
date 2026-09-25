@@ -84,7 +84,13 @@ across worktrees. A workspace member's manifest directory is part of its key,
 so it shares only between target directories of the same checkout.
 
 Shared directories are not collected yet, and they are read-only: make them
-writable (`chmod -R u+w`) before deleting the cache directory by hand.
+writable (`chmod -R u+w`) before deleting the cache directory by hand. Target
+directories keep their links, so run `cargo clean` in them afterwards, and
+also before building without kache: Cargo considers the linked runs fresh
+and would run a script directly against a read-only `OUT_DIR`.
+
+A run that cannot be kept is remembered per key, so its script runs once, as
+usual, on later builds instead of twice.
 
 ## Limits
 

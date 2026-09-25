@@ -2762,6 +2762,39 @@ mod tests {
         };
         let (hermetic_a, regular_a) = spelled(&a, "a/target");
         let (hermetic_b, regular_b) = spelled(&b, "b/target");
+
+        // What the script declared: an env var's value, an input's content,
+        // and what sits behind a `DEP_*` path.
+        let input = dir.path().join("input.txt");
+        std::fs::write(&input, b"one").unwrap();
+        let mut declared = prediction.clone();
+        declared.env = vec!["KACHE_TEST_HERMETIC_VAR".into()];
+        declared.inputs = vec![input.to_string_lossy().into_owned()];
+        let declared_key = || {
+            unsafe { std::env::set_var("CARGO_MANIFEST_DIR", &a.environment.manifest_dir) };
+            hermetic::key(&a, &declared, below).unwrap()
+        };
+        unsafe { std::env::set_var("KACHE_TEST_HERMETIC_VAR", "x") };
+        let base = declared_key();
+        unsafe { std::env::set_var("KACHE_TEST_HERMETIC_VAR", "y") };
+        assert_ne!(declared_key(), base, "a declared variable's value");
+        unsafe { std::env::set_var("KACHE_TEST_HERMETIC_VAR", "x") };
+        std::fs::write(&input, b"two").unwrap();
+        assert_ne!(declared_key(), base, "a declared input's content");
+        std::fs::write(&input, b"one").unwrap();
+        assert_eq!(declared_key(), base);
+        let dep = dir.path().join("dep-out");
+        std::fs::create_dir(&dep).unwrap();
+        std::fs::write(dep.join("z.h"), b"1").unwrap();
+        unsafe { std::env::set_var("DEP_Y_ROOT", &dep) };
+        let with_dep = declared_key();
+        std::fs::write(dep.join("z.h"), b"2").unwrap();
+        assert_ne!(declared_key(), with_dep, "what a DEP_ path holds");
+        unsafe {
+            std::env::remove_var("DEP_Y_ROOT");
+            std::env::remove_var("KACHE_TEST_HERMETIC_VAR");
+        }
+
         match saved {
             Some(value) => unsafe { std::env::set_var("CARGO_MANIFEST_DIR", value) },
             None => unsafe { std::env::remove_var("CARGO_MANIFEST_DIR") },

@@ -79,6 +79,12 @@ impl Sandbox {
     fn lock_path(&self) -> PathBuf {
         self.root.with_extension("lock")
     }
+
+    /// Beside the sandbox: this key's run could not be shared. Its script
+    /// then runs as usual without a second, hermetic attempt first.
+    fn refused_path(&self) -> PathBuf {
+        self.root.with_extension("refused")
+    }
 }
 
 /// Run or restore hermetically. `None` when this run cannot be hermetic
@@ -107,6 +113,14 @@ pub(super) fn run(
         restore(run, &sandbox, &record, &key, key_ms)?;
         return Ok(Some(0));
     }
+    if sandbox.refused_path().exists() || sandbox.root.join(SEALED).exists() {
+        // Refused before, or sealed by a kache that wrote another record:
+        // leave it to whoever links it.
+        return Ok(None);
+    }
+    // `out-dirs` also holds the shared empty `OUT_DIR`s, which need it private.
+    let shared_roots = run.config.cache_dir.join(ROOT);
+    crate::out_dir_alias::create_private_dir_all(shared_roots.parent().context("no out-dirs")?)?;
     std::fs::create_dir_all(sandbox.root.parent().context("sandbox has no parent")?)?;
     let lock = std::fs::OpenOptions::new()
         .create(true)
@@ -119,9 +133,17 @@ pub(super) fn run(
         restore(run, &sandbox, &record, &key, key_ms)?;
         return Ok(Some(0));
     }
-    let Some(record) = attempt(run, real, argv, prediction, &sandbox)? else {
-        remove_sandbox(&sandbox.root)?;
-        return Ok(None);
+    let record = match attempt(run, real, argv, prediction, &sandbox, &key, &below_target) {
+        Ok(Some(record)) => record,
+        Ok(None) => {
+            remove_sandbox(&sandbox.root)?;
+            std::fs::write(sandbox.refused_path(), b"")?;
+            return Ok(None);
+        }
+        Err(error) => {
+            let _ = remove_sandbox(&sandbox.root);
+            return Err(error);
+        }
     };
     seal(&sandbox, &record)?;
     drop(lock);
@@ -260,6 +282,8 @@ fn attempt(
     argv: &[OsString],
     prediction: &Prediction,
     sandbox: &Sandbox,
+    expected_key: &str,
+    below_target: &Path,
 ) -> Result<Option<Record>> {
     remove_sandbox(&sandbox.root)?;
     std::fs::create_dir_all(&sandbox.out_dir)?;
@@ -269,19 +293,36 @@ fn attempt(
     std::fs::copy(real, &script)?;
 
     let started = std::time::SystemTime::now();
-    let output = real_command(&script, argv)
+    let target = target_dir(&run.environment.out_dir).context("no target directory")?;
+    let mut command = real_command(&script, argv);
+    command
         .env("OUT_DIR", &sandbox.out_dir)
         .env("CARGO_TARGET_DIR", &sandbox.root)
         .env_remove("PWD")
-        .env_remove("OLDPWD")
+        .env_remove("OLDPWD");
+    for name in LIBRARY_PATHS {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, without_dirs_under(&value, &target));
+        }
+    }
+    let output = command
         .output()
         .with_context(|| format!("running {}", script.display()))?;
+    std::fs::remove_dir_all(&bin)?;
     if !output.status.success() {
         tracing::debug!("hermetic build script failed; running it as usual");
         return Ok(None);
     }
-    let stdout = String::from_utf8(output.stdout).context("build-script stdout is not UTF-8")?;
+    let Ok(stdout) = String::from_utf8(output.stdout) else {
+        return Ok(None);
+    };
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    // The key was computed before the run, maybe before waiting for the
+    // lock; an input edited meanwhile is older than `started`.
+    if key(run, prediction, below_target)? != expected_key {
+        tracing::debug!("a declared input changed before the hermetic script ran");
+        return Ok(None);
+    }
 
     let mut seen = run.environment.clone();
     seen.out_dir = sandbox.out_dir.clone();
@@ -322,18 +363,31 @@ fn attempt(
     }))
 }
 
-/// The first thing in the sandbox that is neither `OUT_DIR`, a directory on
-/// the way to it, nor the script binary, or a symlink inside `OUT_DIR`.
+/// The variables Cargo puts the target directory's library dirs in for a
+/// build script. The sandbox has none of them, and their spelling differs
+/// between target directories.
+const LIBRARY_PATHS: &[&str] = &[
+    "LD_LIBRARY_PATH",
+    "DYLD_LIBRARY_PATH",
+    "DYLD_FALLBACK_LIBRARY_PATH",
+];
+
+/// `value`, a search path, without its entries under `root`.
+fn without_dirs_under(value: &std::ffi::OsStr, root: &Path) -> OsString {
+    let kept: Vec<PathBuf> = std::env::split_paths(value)
+        .filter(|dir| !dir.starts_with(root))
+        .collect();
+    std::env::join_paths(kept).unwrap_or_default()
+}
+
+/// The first thing in the sandbox that is neither `OUT_DIR` nor a directory
+/// on the way to it, or a symlink inside `OUT_DIR`.
 fn escape(sandbox: &Sandbox) -> Result<Option<PathBuf>> {
-    let bin = sandbox.root.join(BIN);
     let mut pending = vec![sandbox.root.clone()];
     while let Some(directory) = pending.pop() {
         for entry in std::fs::read_dir(&directory)? {
             let path = entry?.path();
             let kind = std::fs::symlink_metadata(&path)?.file_type();
-            if path == bin {
-                continue;
-            }
             if path.starts_with(&sandbox.out_dir) {
                 if kind.is_symlink() {
                     return Ok(Some(path));
@@ -527,8 +581,6 @@ mod tests {
             root,
         };
         std::fs::create_dir_all(&sandbox.out_dir).unwrap();
-        std::fs::create_dir(sandbox.root.join(BIN)).unwrap();
-        std::fs::write(sandbox.root.join(BIN).join("build_script_build"), b"").unwrap();
         sandbox
     }
 
@@ -549,6 +601,15 @@ mod tests {
         std::fs::write(&up, b"x").unwrap();
         assert_eq!(escape(&sandbox).unwrap(), Some(up.clone()));
         std::fs::remove_file(&up).unwrap();
+
+        let empty = sandbox.root.join("debug/cxxbridge");
+        std::fs::create_dir(&empty).unwrap();
+        assert_eq!(
+            escape(&sandbox).unwrap(),
+            Some(empty.clone()),
+            "an empty directory beside the way to OUT_DIR"
+        );
+        std::fs::remove_dir(&empty).unwrap();
 
         let link = sandbox.out_dir.join("lib/link");
         std::os::unix::fs::symlink("/etc", &link).unwrap();
@@ -631,6 +692,35 @@ mod tests {
             !in_sealed_out_dir(&elsewhere.join("libz.a")),
             "a record outside out-dirs/v2"
         );
+    }
+
+    #[test]
+    fn library_paths_lose_only_the_target_directory() {
+        let value = std::env::join_paths([
+            Path::new("/w/target/debug/deps"),
+            Path::new("/usr/lib"),
+            Path::new("/w/target/debug"),
+            Path::new("/w/target2/lib"),
+        ])
+        .unwrap();
+        assert_eq!(
+            without_dirs_under(&value, Path::new("/w/target")),
+            std::env::join_paths([Path::new("/usr/lib"), Path::new("/w/target2/lib")]).unwrap()
+        );
+        assert_eq!(
+            without_dirs_under(std::ffi::OsStr::new(""), Path::new("/w/target")),
+            OsString::new()
+        );
+    }
+
+    #[test]
+    fn a_refusal_and_a_lock_sit_beside_the_sandbox() {
+        let sandbox = Sandbox::new(Path::new("/cache"), &"ab".repeat(32), Path::new("out"));
+        assert_eq!(
+            sandbox.refused_path(),
+            PathBuf::from(format!("/cache/out-dirs/v2/{}.refused", "ab".repeat(16)))
+        );
+        assert_ne!(sandbox.refused_path(), sandbox.lock_path());
     }
 
     #[test]

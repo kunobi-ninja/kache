@@ -1284,6 +1284,69 @@ fn main() {
             out_dir.display()
         );
     }
+
+    // The script reruns in a target directory whose OUT_DIR is a link. A
+    // hermetic rerun links the same shared run again. A regular one gets a
+    // directory of its own instead of writing through the link into the
+    // read-only shared one.
+    let second = target(&fx, "second");
+    let out_dir_of = |target: &Path| {
+        walkdir(&target.join("debug/build"))
+            .into_iter()
+            .find(|path| {
+                path.file_name().is_some_and(|name| name == "out")
+                    && path.join("derived.rs").exists()
+            })
+            .expect("the OUT_DIR holding derived.rs")
+    };
+    run(&mut cargo(
+        "run",
+        &fx.workspace,
+        &fx.home,
+        &fx.cache,
+        &second,
+        &hermetic,
+    ));
+    let shared = std::fs::read_link(out_dir_of(&second)).unwrap();
+    let sealed = std::fs::read(shared.join("derived.rs")).unwrap();
+    let touch_build_rs = || {
+        let build_rs = fx.workspace.join("build.rs");
+        std::fs::write(&build_rs, std::fs::read(&build_rs).unwrap()).unwrap();
+    };
+
+    touch_build_rs();
+    let mark = event_count(&fx.cache);
+    let output = run(&mut cargo(
+        "run",
+        &fx.workspace,
+        &fx.home,
+        &fx.cache,
+        &second,
+        &hermetic,
+    ));
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "consistent");
+    assert_eq!(
+        results_for(&events_since(&fx.cache, mark), "build_script_run"),
+        vec!["local_hit"]
+    );
+    assert_eq!(std::fs::read_link(out_dir_of(&second)).unwrap(), shared);
+
+    touch_build_rs();
+    run(&mut cargo(
+        "build",
+        &fx.workspace,
+        &fx.home,
+        &fx.cache,
+        &second,
+        &[],
+    ));
+    let out_dir = out_dir_of(&second);
+    assert!(
+        std::fs::symlink_metadata(&out_dir).unwrap().is_dir(),
+        "a regular run detaches the link: {}",
+        out_dir.display()
+    );
+    assert_eq!(std::fs::read(shared.join("derived.rs")).unwrap(), sealed);
     make_writable(&fx.cache);
 }
 

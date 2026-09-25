@@ -587,6 +587,24 @@ mod tests {
     }
 
     #[test]
+    fn aligned_new_modes_remain_distinct_in_resolved_tokens() {
+        let base = r#" "clang" "-cc1" "-std=c++17" "-o" "foo.o" "foo.cpp""#;
+        let enabled =
+            r#" "clang" "-cc1" "-std=c++17" "-faligned-allocation" "-o" "foo.o" "foo.cpp""#;
+        let disabled =
+            r#" "clang" "-cc1" "-std=c++17" "-fno-aligned-allocation" "-o" "foo.o" "foo.cpp""#;
+
+        let base = semantic_tokens(base, false, &[]);
+        let enabled = semantic_tokens(enabled, false, &[]);
+        let disabled = semantic_tokens(disabled, false, &[]);
+        assert_ne!(base, enabled);
+        assert_ne!(base, disabled);
+        assert_ne!(enabled, disabled);
+        assert!(enabled.contains(&"-faligned-allocation".to_string()));
+        assert!(disabled.contains(&"-fno-aligned-allocation".to_string()));
+    }
+
+    #[test]
     fn semantic_tokens_strips_every_host_local_path() {
         let toks = resolved_semantic_tokens(O2, true, &[]).expect("fixture resolves");
         // No token may be a bare absolute path after sentinelling.

@@ -764,6 +764,7 @@ fn machine_readable_commands_emit_one_json_document() {
         &["--json", "stats"],
         &["--json", "gc"],
         &["--json", "clean"],
+        &["--json", "targets"],
         &["--json", "doctor"],
         &["--json", "why-miss", "serde"],
         &["--json", "daemon", "status"],
@@ -838,6 +839,58 @@ fn tracked_clean_previews_and_removes_only_the_remembered_target() {
     assert!(after.status.success());
     let after: serde_json::Value = serde_json::from_slice(&after.stdout).unwrap();
     assert_eq!(after["targets"].as_array().unwrap().len(), 0);
+}
+
+#[test]
+fn targets_lists_a_tracked_target_and_flags_its_deleted_worktree() {
+    let e = env();
+    let project = scaffold_lib("ledger", "pub fn value() -> u8 { 1 }\n");
+    let external = TempDir::new().unwrap();
+    let target = external.path().join("cargo-output");
+    let build = e.wrapper_build(project.path(), &target);
+    assert!(
+        build.status.success(),
+        "wrapper build failed: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let elsewhere = TempDir::new().unwrap();
+    let targets = || {
+        let output = e
+            .cmd()
+            .current_dir(elsewhere.path())
+            .args(["--json", "targets"])
+            .output()
+            .expect("run kache targets");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+    };
+
+    let live = targets();
+    assert_eq!(live["command"], "targets");
+    assert_eq!(live["targets"][0]["path"], target.display().to_string());
+    assert_eq!(live["targets"][0]["state"], "live");
+    assert!(live["apparent_bytes"].as_u64().unwrap() > 0, "{live}");
+    assert!(live.get("next").is_none(), "{live}");
+    let text = e
+        .cmd()
+        .current_dir(elsewhere.path())
+        .arg("targets")
+        .output()
+        .expect("run kache targets");
+    assert!(
+        String::from_utf8_lossy(&text.stdout).contains("1 tracked target directory"),
+        "{}",
+        String::from_utf8_lossy(&text.stdout)
+    );
+
+    std::fs::remove_dir_all(project.path()).unwrap();
+    let orphaned = targets();
+    assert_eq!(orphaned["targets"][0]["state"], "worktree_deleted");
+    assert_eq!(orphaned["next"][0]["argv"][2], "--orphans", "{orphaned}");
 }
 
 #[test]

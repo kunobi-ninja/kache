@@ -196,6 +196,10 @@ enum Commands {
         orphans: bool,
     },
 
+    /// Show tracked target directories: what each holds on disk, what
+    /// deleting it frees, and whether its worktree still exists
+    Targets,
+
     /// Set up caching for Cargo and C/C++ builds
     Init {
         /// Accept all default answers (non-interactive)
@@ -463,6 +467,7 @@ fn command_supports_json(command: &Option<Commands>) -> bool {
             Commands::List { .. }
                 | Commands::Gc { .. }
                 | Commands::Clean { .. }
+                | Commands::Targets
                 | Commands::Doctor { .. }
                 | Commands::Stats { .. }
                 | Commands::WhyMiss { .. }
@@ -843,6 +848,7 @@ fn main() -> Result<()> {
             };
             cli::clean(&config, dry_run, yes, json, selection)
         }
+        Some(Commands::Targets) => cli::targets(&config, json),
         Some(Commands::Init {
             yes,
             no_service,

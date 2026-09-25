@@ -76,6 +76,7 @@ pub(crate) fn is_build_script_dir(dir: &Path) -> bool {
 
 /// The profile directory above the directory holding a build script's
 /// binary, when [`is_build_script_dir`] accepts it.
+#[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) fn build_script_dir_profile(dir: &Path) -> Option<&Path> {
     if let Some(unit) = per_unit_out_dir(dir) {
         return Some(unit.profile);

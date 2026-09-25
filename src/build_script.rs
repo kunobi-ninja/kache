@@ -468,6 +468,27 @@ struct Prediction {
     rewrites_text: bool,
 }
 
+/// The prediction a run records, given where its outputs name roots.
+fn recorded_prediction(
+    inputs: Vec<String>,
+    env: Vec<String>,
+    default_package: bool,
+    embedded: Vec<String>,
+    rewrites_text: bool,
+) -> Prediction {
+    Prediction {
+        version: PREDICTION_SCHEMA,
+        inputs,
+        env,
+        default_package,
+        // Read by kache versions that predate `embedded_roots`: they bind
+        // anything but a result they could restore anywhere.
+        portable_out_dir: embedded.is_empty() && !rewrites_text,
+        embedded_roots: Some(embedded),
+        rewrites_text,
+    }
+}
+
 /// Where the recorded outputs name machine-local roots. See
 /// [`Environment::classify_outputs`].
 struct OutputRoots {
@@ -778,19 +799,21 @@ fn replace_whole_paths(haystack: &[u8], needle: &[u8], replacement: &[u8]) -> Ve
     let mut out = Vec::with_capacity(haystack.len());
     let mut index = 0;
     while index < haystack.len() {
-        if haystack[index..].starts_with(needle) {
-            let before = index.checked_sub(1).map(|at| haystack[at]);
-            let after = haystack.get(index + needle.len()).copied();
-            if !before.is_some_and(|byte| is_name_byte(byte) || byte == b'/')
-                && !after.is_some_and(is_name_byte)
-            {
-                out.extend_from_slice(replacement);
-                index += needle.len();
-                continue;
-            }
-        }
-        out.push(haystack[index]);
-        index += 1;
+        let before = index.checked_sub(1).map(|at| haystack[at]);
+        let after = haystack.get(index + needle.len()).copied();
+        let next = if haystack[index..].starts_with(needle)
+            && !before.is_some_and(|byte| is_name_byte(byte) || byte == b'/')
+            && !after.is_some_and(is_name_byte)
+        {
+            out.extend_from_slice(replacement);
+            index + needle.len()
+        } else {
+            out.push(haystack[index]);
+            index + 1
+        };
+        // A loop that stopped advancing would grow `out` without bound.
+        debug_assert!(next > index, "replace_whole_paths must advance");
+        index = next;
     }
     out
 }
@@ -1181,17 +1204,13 @@ impl Run {
             rewritten,
             embedded,
         } = self.environment.classify_outputs(files, staging.path())?;
-        let prediction = Prediction {
-            version: PREDICTION_SCHEMA,
+        let prediction = recorded_prediction(
             inputs,
             env,
             default_package,
-            // Read by kache versions that predate `embedded_roots`: they bind
-            // anything but a result they could restore anywhere.
-            portable_out_dir: embedded.is_empty() && rewritten.is_empty(),
-            rewrites_text: !rewritten.is_empty(),
-            embedded_roots: Some(embedded),
-        };
+            embedded,
+            !rewritten.is_empty(),
+        );
         let key_start = std::time::Instant::now();
         let key = self.action_key(&prediction)?;
         let key_ms = key_start.elapsed().as_millis() as u64;
@@ -2233,6 +2252,27 @@ mod tests {
         (roots, stored)
     }
 
+    /// Older kache reads `portable_out_dir` alone: it must be true only for
+    /// a result it could restore verbatim anywhere.
+    #[test]
+    fn a_recorded_prediction_tells_older_readers_what_they_can_restore() {
+        let recorded = |embedded: &[&str], rewrites_text: bool| {
+            let embedded = embedded.iter().map(|root| root.to_string()).collect();
+            recorded_prediction(Vec::new(), Vec::new(), true, embedded, rewrites_text)
+        };
+        let plain = recorded(&[], false);
+        assert!(plain.portable_out_dir && !plain.rewrites_text);
+        assert_eq!(plain.embedded_roots, Some(Vec::new()));
+        let rewritten = recorded(&[], true);
+        assert!(!rewritten.portable_out_dir && rewritten.rewrites_text);
+        let bound = recorded(&["${KACHE_CARGO_HOME}"], false);
+        assert!(!bound.portable_out_dir && !bound.rewrites_text);
+        assert_eq!(
+            bound.embedded_roots,
+            Some(vec!["${KACHE_CARGO_HOME}".to_string()])
+        );
+    }
+
     #[test]
     fn whole_paths_and_placeholder_paths() {
         assert_eq!(
@@ -2240,6 +2280,10 @@ mod tests {
             b"$ /t/out2 $/x"
         );
         assert_eq!(replace_whole_paths(b"/usr/src", b"/src", b"$"), b"/usr/src");
+        assert_eq!(
+            replace_whole_paths(b"/usr//src", b"/src", b"$"),
+            b"/usr//src"
+        );
         assert_eq!(replace_whole_paths(b"a=/src\n", b"/src", b"$"), b"a=$\n");
         assert_eq!(replace_whole_paths(b"x", b"", b"$"), b"x");
         assert!(only_placeholder_paths(
@@ -2623,6 +2667,70 @@ mod tests {
         assert_eq!(a, key_in("b/target", &pc));
         let other = |root: &Path| format!("prefix={}\nextra=1\n", root.display());
         assert_ne!(a, key_in("c/target", &other));
+    }
+
+    /// A run recorded in one target directory restores in another that
+    /// shares the Cargo home: its pkg-config file names the new `OUT_DIR`,
+    /// and its object keeps the bytes that name registry sources.
+    #[test]
+    fn a_recorded_run_restores_under_another_out_dir() {
+        let mut lock = crate::test_support::process_state_test_lock();
+        let dir = lock.enter(tempfile::tempdir().unwrap());
+        let config = crate::test_support::test_config(dir.as_path().join("cache"));
+        let run_in = |target: &str| {
+            let environment =
+                checkout_environment(&dir.as_path().join(target), &dir.as_path().join("cargo"));
+            std::fs::create_dir_all(&environment.manifest_dir).unwrap();
+            std::fs::write(environment.manifest_dir.join("build.rs"), "fn main() {}").unwrap();
+            Run {
+                store: Store::open(&config).unwrap(),
+                config: config.clone(),
+                binary_hash: "aaaa".to_string(),
+                environment,
+                start: std::time::Instant::now(),
+            }
+        };
+        let pc = |out: &Path| format!("prefix={}\nlibdir=${{prefix}}/lib\n", out.display());
+        let object = [
+            b"\x7fELF\0".as_slice(),
+            dir.as_path()
+                .join("cargo/registry/src/z-1.0.0/adler32.c")
+                .as_os_str()
+                .as_encoded_bytes(),
+        ]
+        .concat();
+
+        let a = run_in("a/target");
+        let out = &a.environment.out_dir;
+        std::fs::create_dir_all(out.join("lib/pkgconfig")).unwrap();
+        std::fs::write(out.join("lib/pkgconfig/z.pc"), pc(out)).unwrap();
+        std::fs::write(out.join("lib/adler32.o"), &object).unwrap();
+        let after_the_run = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+        a.record(b"cargo:rerun-if-changed=build.rs\n", b"", 5, after_the_run)
+            .unwrap();
+
+        let b = run_in("b/target");
+        let prediction = b
+            .prediction()
+            .unwrap()
+            .expect("the run recorded its declarations");
+        assert!(prediction.rewrites_text);
+        assert_eq!(
+            prediction.embedded_roots,
+            Some(vec!["${KACHE_CARGO_HOME}".to_string()])
+        );
+        let meta = b
+            .store
+            .get(&b.action_key(&prediction).unwrap())
+            .unwrap()
+            .expect("the same key in another target directory");
+        b.restore(&meta).unwrap();
+        let out = &b.environment.out_dir;
+        assert_eq!(
+            std::fs::read_to_string(out.join("lib/pkgconfig/z.pc")).unwrap(),
+            pc(out)
+        );
+        assert_eq!(std::fs::read(out.join("lib/adler32.o")).unwrap(), object);
     }
 
     /// 0.23.0 started kache through a `/bin/sh` launcher, and dash drops a

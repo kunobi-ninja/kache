@@ -43,6 +43,52 @@ def record(arm, sample, ms=10000):
     }
 
 
+def fake_engine(calls):
+    """An engine that records each command and writes a passing result."""
+
+    def invoke(command, **kwargs):
+        calls.append(command)
+        work = Path(command[command.index("--work-dir") + 1])
+        work.mkdir(parents=True, exist_ok=True)
+        scenario = command[command.index("--profile") + 1]
+        backend = command[command.index("--cache-backend") + 1]
+        (work / f"{scenario}.json").write_text(json.dumps(result(backend)))
+        points = [
+            {
+                "attributes": [
+                    {
+                        "key": "kache.bench.phase",
+                        "value": {"stringValue": phase},
+                    }
+                ]
+            }
+            for phase in ("cold", "warm")
+        ]
+        (work / "metrics.otlp.json").write_text(
+            json.dumps(
+                {
+                    "resourceMetrics": [
+                        {
+                            "scopeMetrics": [
+                                {"metrics": [{"gauge": {"dataPoints": points}}]}
+                            ]
+                        }
+                    ]
+                }
+            )
+        )
+    
+        if backend == "kache":
+            for phase in ("cold", "warm-same-tree", "warm"):
+                dest = work / f"cache-otlp-{phase}"
+                dest.mkdir(exist_ok=True)
+                (dest / "metrics.otlp.json").write_text(
+                    (work / "metrics.otlp.json").read_text()
+                )
+
+    return invoke
+
+
 class BenchTests(unittest.TestCase):
     def test_process_exit_and_timeout_cleanup(self):
         engine.run_measurement([sys.executable, "-c", "pass"])
@@ -187,45 +233,7 @@ class BenchTests(unittest.TestCase):
             )
             calls = []
 
-            def invoke(command, **kwargs):
-                calls.append(command)
-                work = Path(command[command.index("--work-dir") + 1])
-                work.mkdir(parents=True, exist_ok=True)
-                scenario = command[command.index("--profile") + 1]
-                backend = command[command.index("--cache-backend") + 1]
-                (work / f"{scenario}.json").write_text(json.dumps(result(backend)))
-                points = [
-                    {
-                        "attributes": [
-                            {
-                                "key": "kache.bench.phase",
-                                "value": {"stringValue": phase},
-                            }
-                        ]
-                    }
-                    for phase in ("cold", "warm")
-                ]
-                (work / "metrics.otlp.json").write_text(
-                    json.dumps(
-                        {
-                            "resourceMetrics": [
-                                {
-                                    "scopeMetrics": [
-                                        {"metrics": [{"gauge": {"dataPoints": points}}]}
-                                    ]
-                                }
-                            ]
-                        }
-                    )
-                )
-
-                if backend == "kache":
-                    for phase in ("cold", "warm-same-tree", "warm"):
-                        dest = work / f"cache-otlp-{phase}"
-                        dest.mkdir(exist_ok=True)
-                        (dest / "metrics.otlp.json").write_text(
-                            (work / "metrics.otlp.json").read_text()
-                        )
+            invoke = fake_engine(calls)
 
             def contention(args, arms):
                 self.assertFalse((args.output / "scratch").exists())
@@ -278,7 +286,7 @@ class BenchTests(unittest.TestCase):
                 if point["attributes"][0]["value"]["stringValue"] == "cold"
             ]
             self.assertEqual(len(cold), 8)
-            self.assertIn("unconfirmed", (args.output / "perf-gate.md").read_text())
+            self.assertIn("no clear change", (args.output / "perf-gate.md").read_text())
             for phase, expected in (("cold", 4), ("warm", 12)):
                 cached = json.loads(
                     (
@@ -379,6 +387,41 @@ class BenchTests(unittest.TestCase):
 
         with patch.object(engine.shutil, "which", return_value="/usr/bin/sccache"):
             self.assertTrue(short.wanted_arm(("sccache", "sccache", "sccache"), args))
+
+    def test_context_tools_run_only_in_their_samples(self):
+        """sccache and mbx never decide the verdict: the gate measures them
+        once and repeats only the Kache arms."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            args = argparse.Namespace(
+                output=root / "output",
+                project="hk",
+                engine=root / "engine",
+                scenarios=root / "scenarios",
+                kache="/kache",
+                base="/base",
+                sccache="/sccache",
+                mbx="/mbx",
+                samples=3,
+                context_samples=1,
+                order_seed=0,
+                cold_every=3,
+                skip_contention=True,
+            )
+            calls = []
+            with patch.object(short, "run_measurement", fake_engine(calls)):
+                self.assertEqual(short.run(args), 0)
+            backends = [
+                (call[call.index("--cache-backend") + 1], call[call.index("--kache") + 1] if "--kache" in call else "")
+                for call in calls
+            ]
+            self.assertEqual(len(calls), 4 + 2 + 2)
+            self.assertEqual(sum(1 for b, _ in backends if b != "kache"), 2)
+            payload = json.loads((args.output / "samples.json").read_text())
+            arms = [(r["sample"], r["arm"]) for r in payload["records"]]
+            self.assertIn((0, "mbx"), arms)
+            self.assertNotIn((1, "mbx"), arms)
+            self.assertEqual(sorted(a for s_, a in arms if s_ == 2), ["base", "head"])
 
     def test_cold_every_one_measures_every_cold_build(self):
         """A change aimed at cold needs more than one cold measurement.
@@ -485,10 +528,11 @@ class ReportTests(unittest.TestCase):
         # One open table per subject: this PR, its base, the change, then
         # every other tool, isolated and contended.
         self.assertIn("| hk | this PR | main | Change |\n| --- | ---: | ---: | --- |", text)
-        # One run: a change inside runner noise says so, a larger one is shown.
-        self.assertIn("| Cold | 97.3 s | 84.6 s | within noise |", text)
-        self.assertIn("| Contention, warm | 9.00 s | 9.00 s | within noise |", text)
-        self.assertIn("| Cold | 2.88 s | 1.87 s | 54% slower |", text)
+        # One run is no verdict, however large the difference.
+        self.assertIn("| Cold | 97.3 s | 84.6 s | no verdict, 1 run |", text)
+        self.assertIn("| Contention, warm | 9.00 s | 9.00 s | no verdict, 1 run |", text)
+        self.assertIn("| Cold | 2.88 s | 1.87 s | no verdict, 1 run |", text)
+        self.assertIn("+54.4%, 1 pair, no verdict", text)
         self.assertIn("Times are medians of 1 run of each.", text)
         self.assertNotIn("head", text.split("<details>")[0])
         self.assertEqual(text.count("<details>"), 2)
@@ -525,11 +569,22 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(headline, "## Perf gate: FAIL (hk)")
         self.assertEqual(failed, "**Failed checks**")
         self.assertIn("misses rose 0 → 2", first)
-        self.assertIn("| Warm, same path | 12.0 s <sub>12.0–12.0</sub> | 10.0 s <sub>10.0–10.0</sub> | **20% slower** |", text)
-        self.assertIn("| Cold | 12.0 s <sub>12.0–12.0</sub> | 10.0 s <sub>10.0–10.0</sub> | within noise |", text)
-        self.assertIn("only in bold", text)
+        self.assertIn(
+            "| Warm, same path | 12.0 s <sub>12.0–12.0</sub> | 10.0 s <sub>10.0–10.0</sub> | **20% slower** <sub>+20% to +20%</sub> |",
+            text,
+        )
+        self.assertIn("| Cold | 12.0 s <sub>12.0–12.0</sub> | 10.0 s <sub>10.0–10.0</sub> | no verdict, 2 runs |", text)
+        self.assertIn("only with 5 or more pairs", text)
         self.assertIn("<sub>10.0–10.0</sub>", text)
         self.assertIn("(+20.0% to +20.0%), 6 pairs, slower", text)
+
+    def test_enough_pairs_without_a_clear_change_says_so(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            records = paired(10000, 10000, samples=6)
+            text = self.render([subject(root, "hk", records)])
+        self.assertIn("| Warm, same path | 10.0 s <sub>10.0–10.0</sub> | 10.0 s <sub>10.0–10.0</sub> | no clear change <sub>+0% to +0%</sub> |", text)
+        self.assertIn("6 pairs, no clear change", text)
 
     def test_invalid_subject_is_named_and_the_valid_one_still_reports(self):
         with tempfile.TemporaryDirectory() as tmp:

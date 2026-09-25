@@ -24,12 +24,6 @@ COMPARISONS = PHASES + tuple(
 )
 ARM_ORDER = ("head", "kache", "base", "mbx", "sccache")
 MIN_PAIRS = 5
-# How far one run of identical builds moves on a CI runner. PRs that did not
-# touch the build path swung by up to 22% (eza's sub-second warm build, hk's
-# cold build), so a smaller unconfirmed change is shown as noise.
-RUNNER_NOISE_PCT = 30
-# The paired test's outcomes, in the words the top table uses.
-OUTCOMES = {"inconclusive": "unconfirmed", "regression": "slower", "improvement": "faster"}
 # How each arm is named in the comment. `base` is set to the base branch.
 LABELS = {"head": "this PR", "base": "main"}
 
@@ -64,21 +58,35 @@ def timing(row):
     return f"{seconds(row['median_ms'])} <sub>{number(row['min_ms'])}–{number(row['max_ms'])}</sub>"
 
 
+def outcome(comparison):
+    """The paired test's outcome in the words the tables use."""
+    if comparison["outcome"] == "regression":
+        return "slower"
+    if comparison["outcome"] == "improvement":
+        return "faster"
+    return "no verdict" if comparison["n"] < MIN_PAIRS else "no clear change"
+
+
 def change(comparison):
-    """The change in words. Bold when the paired test confirms it; plain when
-    it is larger than CI runners vary between identical builds; otherwise
-    "within noise"."""
+    """The paired verdict in words, with its 95% interval once there are
+    enough pairs to have one."""
     if comparison is None:
         return "—"
+    n = comparison["n"]
+    if n < MIN_PAIRS:
+        return f"no verdict, {n} {'run' if n == 1 else 'runs'}"
     pct = comparison["median_pct"]
+    interval = comparison.get("interval_95_pct")
+    bounds = (
+        ""
+        if interval is None
+        else f" <sub>{interval[0]:+.0f}% to {interval[1]:+.0f}%</sub>"
+    )
+    if comparison["outcome"] == "inconclusive":
+        return f"no clear change{bounds}"
     size = abs(pct)
     amount = f"{size:.0f}%" if size >= 10 else f"{size:.1f}%"
-    text = f"{amount} {'slower' if pct > 0 else 'faster'}"
-    if comparison["outcome"] != "inconclusive":
-        return f"**{text}**"
-    if size < RUNNER_NOISE_PCT:
-        return "within noise"
-    return text
+    return f"**{amount} {'slower' if pct > 0 else 'faster'}**{bounds}"
 
 
 def arms(rows):
@@ -183,8 +191,7 @@ def overview(projects):
             else f"{pairs} runs" if fewest == pairs else f"{fewest} to {pairs} runs"
         )
         lines.append(
-            f"Times are medians of {runs} of each. Identical builds vary by up to {RUNNER_NOISE_PCT}% between runs on CI, so a smaller change is shown as within noise. "
-            f"Timing decides the verdict only in bold, where the paired test over {MIN_PAIRS} or more runs confirms it; with fewer, the gate decides on cache misses alone."
+            f"Times are medians of {runs} of each. Change is this PR against {label('base')} over paired runs: named only when the 95% interval of the paired difference clears 5% and 250 ms, and only with {MIN_PAIRS} or more pairs. With fewer there is no verdict, and the gate decides on cache misses alone."
         )
         lines.append("")
     notes = [
@@ -322,7 +329,7 @@ def comparison_detail(projects):
             )
             noun = "pair" if c["n"] == 1 else "pairs"
             cells.append(
-                f"{c['median_pct']:+.1f}%{bounds}, {c['n']} {noun}, {OUTCOMES.get(c['outcome'], c['outcome'])}"
+                f"{c['median_pct']:+.1f}%{bounds}, {c['n']} {noun}, {outcome(c)}"
             )
         body.append(f"| {name} | " + " | ".join(cells) + " |")
     body += [

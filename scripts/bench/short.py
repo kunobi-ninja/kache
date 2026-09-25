@@ -106,6 +106,10 @@ def wanted_arm(arm, args):
     return False
 
 
+# The arms whose timings the gate compares; every other tool is context.
+VERDICT_ARMS = ("head", "base", "kache")
+
+
 def run(args):
     root = args.output.resolve()
     if (root / "samples.json").exists() or (root / "scratch").exists():
@@ -145,6 +149,8 @@ def run(args):
             order = (
                 arms if (sample + args.order_seed) % 2 == 0 else list(reversed(arms))
             )
+            if sample >= (getattr(args, "context_samples", None) or args.samples):
+                order = [a for a in order if a[0] in VERDICT_ARMS]
             for position, (arm, backend, binary) in enumerate(order):
                 scratch = root / "scratch" / arm
                 scenario = f"bench-{args.project}" + (
@@ -324,6 +330,12 @@ def main():
         type=int,
         choices=range(1, 21),
         help="warm batches per arm; defaults to --samples, with a fresh cold seed every third sample",
+    )
+    parser.add_argument(
+        "--context-samples",
+        type=int,
+        choices=range(1, 21),
+        help="samples of the other tools (sccache, mbx); defaults to --samples. They never decide the verdict, so the gate measures them once and repeats only the kache arms",
     )
     parser.add_argument(
         "--skip-contention",

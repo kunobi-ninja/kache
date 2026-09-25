@@ -548,6 +548,7 @@ mod tests {
         let cargo = Path::new("/w/target/debug/build/z-1/out");
         let stdout = "cargo:rustc-link-search=native=/cache/out-dirs/v2/k/debug/build/z-1/out/lib\n\
                       cargo::rustc-link-search=/cache/out-dirs/v2/k/debug/build/z-1/out\n\
+                      cargo:rustc-link-search=/cache/out-dirs/v2/k/debug/build/z-1/out/a=b\n\
                       cargo:rustc-link-search=native=/usr/lib\n\
                       cargo:rustc-link-search=native=/cache/out-dirs/v2/k/debug/build/z-1/out2\n\
                       cargo:root=/cache/out-dirs/v2/k/debug/build/z-1/out\n\
@@ -556,6 +557,7 @@ mod tests {
             link_search_in(stdout, shared, cargo),
             "cargo:rustc-link-search=native=/w/target/debug/build/z-1/out/lib\n\
              cargo::rustc-link-search=/w/target/debug/build/z-1/out\n\
+             cargo:rustc-link-search=/w/target/debug/build/z-1/out/a=b\n\
              cargo:rustc-link-search=native=/usr/lib\n\
              cargo:rustc-link-search=native=/cache/out-dirs/v2/k/debug/build/z-1/out2\n\
              cargo:root=/cache/out-dirs/v2/k/debug/build/z-1/out\n\

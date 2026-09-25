@@ -3328,9 +3328,9 @@ fn run_mbx_cold_phase(
     work_dir: &Path,
     sh: &Path,
 ) -> Result<MbxPhaseMetrics> {
-    if cache_dir.exists() {
-        std::fs::remove_dir_all(cache_dir).context("clearing mbx cache dir")?;
-    }
+    // mbx leaves read-only directories in its cache, which `remove_dir_all`
+    // cannot empty.
+    source::remove_tree(cache_dir).context("clearing mbx cache dir")?;
     std::fs::create_dir_all(cache_dir)?;
     let cold_metrics = measure_mbx_phase(
         profile,

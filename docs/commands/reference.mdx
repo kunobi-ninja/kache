@@ -88,7 +88,7 @@ kache clean --tracked --stale 14d --yes
 kache clean --orphans --yes
 ```
 
-`clean` recursively finds `target/` directories below the current directory. The default opens a selector. Use `--dry-run` before a scripted `--yes` run.
+`clean` recursively finds `target/` directories below the current directory, including worktrees under `.worktrees/` and `.claude/`; other hidden directories are skipped. Sizes cover every profile, custom profiles and `<triple>/<profile>` directories included. The default opens a selector. Use `--dry-run` before a scripted `--yes` run.
 
 `--tracked` uses the bounded machine-local target registry populated by normal builds and restores. `--stale` filters by last use. A target whose worktree or workspace has been deleted qualifies however recently it was built; `--orphans` selects only those. A workspace counts as deleted only while the directory that held it still exists, so an unmounted volume does not.
 

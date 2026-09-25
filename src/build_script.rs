@@ -46,9 +46,11 @@ pub const SHIM_PATH_ENV: &str = "KACHE_BUILD_SCRIPT_PATH";
 const ENABLE_ENV: &str = "KACHE_BUILD_SCRIPT_CACHE";
 const REAL_SUFFIX: &str = ".kache-real";
 const ACTION_SUFFIX: &str = ".kache-real.action";
-/// Beside the launcher: the preserved script's file name and the pinned
-/// kache relative to the profile directory, each NUL-terminated. The launcher
-/// reads it instead of listing the directory.
+/// Beside the launcher: the preserved script's file name, the pinned kache
+/// relative to the profile directory, and the launcher's own directory's way
+/// up to the profile directory (`../../`, or `../../../../` in Cargo's
+/// per-unit layout), each NUL-terminated. The launcher reads it instead of
+/// listing the directory.
 #[cfg_attr(not(unix), allow(dead_code))]
 const LAUNCH_RECORD: &str = ".kache-launch";
 #[cfg_attr(not(unix), allow(dead_code))]
@@ -79,8 +81,9 @@ pub fn is_shim_invocation() -> bool {
 /// The binary a build-script compilation produced, when `args` compiled one.
 ///
 /// Cargo compiles `build.rs` as `--crate-name build_script_build --crate-type
-/// bin` into `<profile>/build/<pkg>-<hash>/build_script_build-<hash>`, then
-/// hardlinks that to `build-script-build` and runs it.
+/// bin`. Before 1.100 it writes `<profile>/build/<pkg>-<hash>/build_script_build-<hash>`,
+/// then hardlinks that to `build-script-build` and runs it. From 1.100 it
+/// writes and runs `<profile>/build/<pkg>/<hash>/out/build_script_build`.
 pub fn compiled_build_script(args: &RustcArgs) -> Option<PathBuf> {
     build_script_output(args).filter(|path| path.is_file())
 }
@@ -93,7 +96,7 @@ pub fn build_script_output(args: &RustcArgs) -> Option<PathBuf> {
         return None;
     }
     let out_dir = args.out_dir.as_deref()?;
-    if out_dir.parent()?.file_name()? != "build" {
+    if !crate::cargo_layout::is_build_script_dir(out_dir) {
         return None;
     }
     let stem = crate::args::format_crate_output_stem(
@@ -137,12 +140,15 @@ fn install(executable: &Path) -> Result<()> {
         .join(LAUNCH_RECORD);
     let binary_hash = kache_store::file_hash::hash_file(executable)?;
 
-    // <profile>/build/<pkg>-<hash>/<exe>: the profile directory is what the
-    // launcher can reach relatively when the target directory moves.
-    let profile = executable
-        .ancestors()
-        .nth(3)
+    // The profile directory is what the launcher can reach relatively when
+    // the target directory moves.
+    let directory = executable
+        .parent()
+        .context("build script has no parent directory")?;
+    let profile = crate::cargo_layout::build_script_dir_profile(directory)
         .context("build script is not under a Cargo profile directory")?;
+    let to_profile = relative_to_ancestor(directory, profile)
+        .context("build script is not below its profile directory")?;
     let kache = std::env::current_exe().context("locating the kache executable")?;
     let pinned = pin_kache(&kache, profile)?;
     let relative = pinned
@@ -160,6 +166,8 @@ fn install(executable: &Path) -> Result<()> {
                 real_name.as_bytes(),
                 b"\0",
                 relative.as_os_str().as_bytes(),
+                b"\0",
+                to_profile.as_bytes(),
                 b"\0",
             ]
             .concat(),
@@ -188,6 +196,13 @@ fn install(executable: &Path) -> Result<()> {
 #[cfg(not(unix))]
 fn install(_executable: &Path) -> Result<()> {
     anyhow::bail!("build-script launchers are only installed on Unix")
+}
+
+/// `../` once for each level `ancestor` sits above `directory`.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn relative_to_ancestor(directory: &Path, ancestor: &Path) -> Option<String> {
+    let depth = directory.strip_prefix(ancestor).ok()?.components().count();
+    Some("../".repeat(depth))
 }
 
 /// One copy of the running kache per profile directory, addressed by the
@@ -236,8 +251,9 @@ fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(name)
 }
 
-/// The preserved binary for the path Cargo invoked. Cargo runs the un-hashed
-/// `build-script-build` hardlink; the wrapper preserved the hashed original.
+/// The preserved binary for the path Cargo invoked. Before 1.100 Cargo runs
+/// the un-hashed `build-script-build` hardlink and the wrapper preserved the
+/// hashed original; from 1.100 it runs the compiled binary itself.
 fn find_real(invoked: &Path) -> Option<PathBuf> {
     let direct = with_suffix(invoked, REAL_SUFFIX);
     if direct.is_file() {
@@ -757,14 +773,10 @@ fn remap_flag_base_dirs(text: &[u8], base_dirs: &[PathBuf]) -> Vec<u8> {
     text
 }
 
-/// `<target>/[<triple>/]<profile>/build/<pkg>-<hash>/out` back to `<target>`.
+/// `<target>/[<triple>/]<profile>/build/<pkg>-<hash>/out`, or
+/// `.../build/<pkg>/<hash>/out`, back to `<target>`.
 pub(crate) fn target_dir(out_dir: &Path) -> Option<PathBuf> {
-    let unit = out_dir.parent()?;
-    let build = unit.parent()?;
-    if build.file_name()? != "build" {
-        return None;
-    }
-    let profile = build.parent()?;
+    let profile = crate::cargo_layout::out_dir_profile(out_dir)?;
     let mut target = profile.parent()?;
     if let Some(triple) = std::env::var_os("TARGET")
         && target.file_name() == Some(triple.as_os_str())
@@ -2047,6 +2059,23 @@ mod tests {
             Some(unit.join("build_script_build-1"))
         );
         assert_eq!(compiled_build_script(&args), None);
+
+        // Cargo 1.100 passes no extra filename and writes into the unit's `out`.
+        let out = Path::new("/nowhere/debug/build/pkg/0123456789abcdef/out");
+        let args = parse(&[
+            "rustc",
+            "--crate-name",
+            "build_script_build",
+            "--crate-type",
+            "bin",
+            "build.rs",
+            "--out-dir",
+            out.to_str().unwrap(),
+        ]);
+        assert_eq!(
+            build_script_output(&args),
+            Some(out.join("build_script_build"))
+        );
     }
 
     #[test]
@@ -2898,6 +2927,11 @@ mod tests {
             target_dir(Path::new("/w/target/debug/build/pkg-1/out")),
             Some(PathBuf::from("/w/target"))
         );
+        assert_eq!(
+            target_dir(Path::new("/w/target/debug/build/pkg/0123456789abcdef/out")),
+            Some(PathBuf::from("/w/target")),
+            "Cargo 1.100's per-unit layout"
+        );
         assert_eq!(target_dir(Path::new("/w/other/pkg-1/out")), None);
     }
 
@@ -3205,6 +3239,77 @@ mod tests {
         );
     }
 
+    /// The launcher reaches the pinned kache from a per-unit `out` four levels
+    /// below the profile, and from a legacy record that does not say how far.
+    #[cfg(unix)]
+    #[test]
+    fn the_launcher_finds_the_pinned_kache_in_either_layout() {
+        let printer = std::env::current_exe().unwrap();
+        let invoked_through_kache = |executable: &Path| {
+            let output = std::process::Command::new(executable)
+                .args([ENV_PRINTER, "--exact", "--nocapture", "--test-threads=1"])
+                .env(ENV_PRINTER, "1")
+                .env_remove(SHIM_PATH_ENV)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout)
+                .unwrap()
+                .lines()
+                .any(|line| line == format!("{SHIM_PATH_ENV}={}", executable.display()))
+        };
+        let install_printer = |unit: &Path, name: &str| {
+            std::fs::create_dir_all(unit).unwrap();
+            let executable = unit.join(name);
+            std::os::unix::fs::symlink(&printer, &executable).unwrap();
+            install(&executable).unwrap();
+            let (_, pinned) = launch_record(unit);
+            std::fs::remove_file(&pinned).unwrap();
+            std::os::unix::fs::symlink(&printer, &pinned).unwrap();
+            executable
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let per_unit = dir.path().join("debug/build/pkg/0123456789abcdef/out");
+        let executable = install_printer(&per_unit, "build_script_build");
+        let record = std::fs::read_to_string(per_unit.join(LAUNCH_RECORD)).unwrap();
+        assert!(record.ends_with("\0../../../../\0"), "{record:?}");
+        assert!(
+            launch_record(&per_unit)
+                .1
+                .starts_with(dir.path().join("debug").join(SHIM_DIR)),
+            "one pinned kache per profile, not per package"
+        );
+        assert!(invoked_through_kache(&executable));
+
+        let legacy = dir.path().join("release/build/pkg-1");
+        let executable = install_printer(&legacy, "build_script_build-1");
+        let record = std::fs::read_to_string(legacy.join(LAUNCH_RECORD)).unwrap();
+        let old_record = record.strip_suffix("../../\0").unwrap();
+        std::fs::write(legacy.join(LAUNCH_RECORD), old_record).unwrap();
+        assert!(invoked_through_kache(&executable), "{old_record:?}");
+    }
+
+    #[test]
+    fn relative_to_ancestor_climbs_one_level_per_component() {
+        assert_eq!(
+            relative_to_ancestor(Path::new("/t/debug/build/pkg-1"), Path::new("/t/debug")),
+            Some("../../".to_string())
+        );
+        assert_eq!(
+            relative_to_ancestor(Path::new("/t/debug"), Path::new("/t/debug")),
+            Some(String::new())
+        );
+        assert_eq!(
+            relative_to_ancestor(Path::new("/t/debug"), Path::new("/other")),
+            None
+        );
+    }
+
     #[cfg(unix)]
     const ENV_PRINTER: &str = "build_script::tests::env_printer";
 
@@ -3228,13 +3333,17 @@ mod tests {
         }
     }
 
-    /// The preserved script's name and the pinned kache from `.kache-launch`.
+    /// The preserved script's name and the pinned kache from `.kache-launch`,
+    /// found the way the launcher finds it.
     #[cfg(unix)]
     fn launch_record(unit: &Path) -> (String, PathBuf) {
         let record = std::fs::read_to_string(unit.join(LAUNCH_RECORD)).unwrap();
         let fields: Vec<&str> = record.split('\0').collect();
-        assert_eq!(fields.len(), 3, "two NUL-terminated fields: {record:?}");
-        let profile = unit.ancestors().nth(2).unwrap();
+        assert_eq!(fields.len(), 4, "three NUL-terminated fields: {record:?}");
+        let profile = unit
+            .ancestors()
+            .nth(fields[2].matches("../").count())
+            .unwrap();
         (fields[0].to_string(), profile.join(fields[1]))
     }
 }

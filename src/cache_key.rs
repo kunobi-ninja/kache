@@ -253,6 +253,10 @@ use std::path::{Path, PathBuf};
 // missed other packages' OUT_DIR paths in `-L native=` and dep-info was
 // anchored one package deep. The path remapping prefix and dep-info anchor
 // change for every new-layout unit, as they did for cross builds in v22.
+// Unreleased with it, the rest of kache learned the same layout: a cc
+// compile maps its own and other units' OUT_DIRs, a macOS link strips the
+// profile directory from N_OSO paths, and native archives under the target
+// dir are keyed by their portable digest. Each changes new-layout keys only.
 pub(crate) use kache_format::CACHE_KEY_VERSION;
 
 /// Collapse runs of ASCII whitespace into single spaces and trim
@@ -14449,6 +14453,15 @@ mod tests {
         assert_eq!(
             build_tree_roots_of(Some(Path::new("/w/target/debug/build/s-1")), None, None),
             [PathBuf::from("/w/target")]
+        );
+        assert_eq!(
+            build_tree_roots_of(
+                Some(Path::new("/w/target/debug/build/s/0123456789abcdef/out")),
+                None,
+                None
+            ),
+            [PathBuf::from("/w/target")],
+            "Cargo 1.100's per-unit layout"
         );
         assert_eq!(
             build_tree_roots_of(Some(Path::new("/tmp/out")), None, Some(workspace)),

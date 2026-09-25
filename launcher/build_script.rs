@@ -11,8 +11,10 @@
 //!
 //! It is `no_std` and calls libc directly so that each copy stays small. It
 //! reads `.kache-launch` beside itself, written by kache at install time:
-//! the preserved script's file name and the pinned kache's path relative to
-//! the profile directory, each NUL-terminated. It execs that kache with the
+//! the preserved script's file name, the pinned kache's path relative to the
+//! profile directory, and the way up from this directory to the profile
+//! directory, each NUL-terminated. A record without the third field comes
+//! from a kache that only knew Cargo's legacy layout. It execs that kache with the
 //! path Cargo invoked in `KACHE_BUILD_SCRIPT_PATH`. When that kache is gone (a
 //! pruned or partially restored target directory) it execs the preserved
 //! script directly: uncached is always acceptable.
@@ -41,8 +43,9 @@ const X_OK: c_int = 1;
 const PATH_CAPACITY: usize = 4096;
 const SHIM_PATH_ENV: &[u8] = b"KACHE_BUILD_SCRIPT_PATH=";
 const LAUNCH_RECORD: &[u8] = b".kache-launch";
-/// `<profile>/build/<pkg>-<hash>/`: the profile is two levels above.
-const TO_PROFILE: &[u8] = b"../../";
+/// `<profile>/build/<pkg>-<hash>/`: the profile is two levels above. Used
+/// when the record does not say.
+const LEGACY_TO_PROFILE: &[u8] = b"../../";
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
@@ -86,7 +89,11 @@ pub unsafe extern "C" fn main(
             fail(b"kache: build-script launcher found no .kache-launch record\n");
         };
 
-        let kache = join(&[directory, TO_PROFILE, kache_relative]);
+        let to_profile = match fields.next() {
+            Some(field) if !field.is_empty() => field,
+            _ => LEGACY_TO_PROFILE,
+        };
+        let kache = join(&[directory, to_profile, kache_relative]);
         if !kache_relative.is_empty() && access(kache.as_ptr().cast(), X_OK) == 0 {
             let arguments = replace_first(argv, argc, kache.as_ptr().cast());
             let environment = with_invoked_path(envp, invoked);

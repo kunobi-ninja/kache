@@ -8,21 +8,24 @@
 # `<bin>.dsym.tar`.
 #
 # For every bundle kache baked (the bin and its unit-test harness and the
-# integration test in deps/, the example in examples/):
+# integration test in deps/, the example in examples/; from Cargo 1.100 each
+# in its own build/<pkg>/<hash>/out/):
 #   1. its DWARF UUID equals the binary's — UUID identity is the exact
 #      criterion lldb uses to adopt an adjacent bundle over the binary's
 #      stale N_OSO debug map, so a mismatch means broken debugging;
 #   2. it holds the target's own compile unit AND itoa's. dsymutil still
 #      writes a UUID-matched bundle when it cannot open a single object,
 #      so the UUID alone passed while every bundle was empty
-#      (kunobi-ninja/kache#1161). itoa's objects live in deps/ as rlib
-#      members, which is where that bug looked in the wrong directory.
+#      (kunobi-ninja/kache#1161). itoa's objects are rlib members in deps/
+#      (or itoa's own unit directory), which is where that bug looked in the
+#      wrong directory.
 set -eu
 
 ./target/debug/rust-dsym
 
 count=0
-for bundle in target/debug/deps/*.dSYM target/debug/examples/*.dSYM; do
+for bundle in target/debug/deps/*.dSYM target/debug/examples/*.dSYM \
+    target/debug/build/*/*/out/*.dSYM; do
     [ -d "$bundle" ] || continue
     count=$((count + 1))
     binary="${bundle%.dSYM}"

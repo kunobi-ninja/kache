@@ -814,9 +814,9 @@ impl RustcArgs {
     /// stable enough to infer the target dir from the args instead:
     ///
     /// - `--out-dir` is `<target>/<profile>/deps` for libs/bins → walk up 2.
-    /// - With Cargo's new build-dir layout, `--out-dir` is
-    ///   `<target>/<profile>/build/<pkg>/<hash>/out` for every unit; start
-    ///   from that `build` directory, then walk up 2 as for `deps`.
+    /// - From Cargo 1.100, `--out-dir` is
+    ///   `<target>/<profile>/build/<pkg>/<hash>/out` for every unit; take the
+    ///   profile's parent (see [`crate::cargo_layout`]).
     /// - `-o` for a build script is
     ///   `<target>/<profile>/build/<pkg>/build_script_build-<hash>`; walk up
     ///   to the ancestor named `deps` or `build`, then take its grandparent.
@@ -834,16 +834,11 @@ impl RustcArgs {
     pub fn target_dir(&self) -> Option<PathBuf> {
         let is_cross = self.target.is_some();
         if let Some(od) = &self.out_dir {
-            let layout_dir = od
-                .ancestors()
-                .nth(3)
-                .filter(|build| {
-                    od.file_name() == Some("out".as_ref())
-                        && build.file_name() == Some("build".as_ref())
-                })
-                .unwrap_or(od);
-            let mut p = layout_dir.parent()?;
-            p = p.parent()?;
+            let profile = match crate::cargo_layout::per_unit_out_dir(od) {
+                Some(unit) => unit.profile,
+                None => od.parent()?,
+            };
+            let mut p = profile.parent()?;
             if is_cross {
                 p = p.parent()?;
             }

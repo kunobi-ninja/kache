@@ -127,7 +127,7 @@ impl SkipReason {
             Self::CrateType => "crate type",
             Self::Refused => "not a cacheable compile",
             Self::NotRegistry => "not a registry package",
-            Self::OutDirShape => "OUT_DIR is not Cargo's build/<pkg>-<hash>/out",
+            Self::OutDirShape => "OUT_DIR is not a Cargo build-script OUT_DIR",
             Self::OutDirNotEmpty => "OUT_DIR is not empty",
             Self::BuildOutput => "build script output exports or links",
             Self::EnvConflict => "OUT_DIR appears in another value",
@@ -217,19 +217,14 @@ pub(crate) fn is_candidate(decision: Result<Tier, SkipReason>) -> bool {
     matches!(decision, Ok(Tier::Lib) | Err(SkipReason::LibEvidence(_)))
 }
 
-/// `<pkg>-<hash>` when `out_dir` is Cargo's `.../build/<pkg>-<16 hex>/out`
-/// for package `pkg`.
+/// `<pkg>-<hash>` when `out_dir` is Cargo's `.../build/<pkg>-<16 hex>/out`,
+/// or `.../build/<pkg>/<16 hex>/out` from Cargo 1.100, for package `pkg`.
+/// Both layouts name the alias the same way.
 pub(crate) fn unit_dir_name(out_dir: &Path, pkg: &str) -> Option<String> {
-    if !out_dir.is_absolute() || out_dir.file_name()? != "out" {
+    if !out_dir.is_absolute() {
         return None;
     }
-    let unit = out_dir.parent()?;
-    if unit.parent()?.file_name()? != "build" {
-        return None;
-    }
-    let name = unit.file_name()?.to_str()?;
-    let hash = name.strip_prefix(pkg)?.strip_prefix('-')?;
-    is_unit_hash(hash).then(|| name.to_string())
+    crate::cargo_layout::out_dir_unit_name(out_dir, pkg)
 }
 
 /// Whether every `cargo:` / `cargo::` line of a build script's output is one
@@ -359,15 +354,9 @@ fn alias_unit_of<'a>(path: &'a Path, root: &Path) -> Option<&'a str> {
     relative.components().next()?.as_os_str().to_str()
 }
 
-/// Is `hash` the 16 hex digits Cargo puts after a unit's package name?
-fn is_unit_hash(hash: &str) -> bool {
-    hash.len() == 16 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
-}
-
 /// The package of a `<pkg>-<16 hex>` unit dir.
 fn unit_package(unit: &str) -> Option<&str> {
-    let (package, hash) = unit.rsplit_once('-')?;
-    (!package.is_empty() && is_unit_hash(hash)).then_some(package)
+    crate::cargo_layout::legacy_unit_package(unit)
 }
 
 /// Every `<pkg>-<hash>` whose alias `bytes` spells a path in.
@@ -565,12 +554,12 @@ fn dir_has_no_entries(dir: &Path) -> bool {
     std::fs::read_dir(dir).is_ok_and(|mut entries| entries.next().is_none())
 }
 
-/// Rule 3 against `<build dir>/output`.
-fn build_output_allows_alias(build_dir: &Path) -> bool {
-    let path = build_dir.join("output");
-    let small = std::fs::metadata(&path).is_ok_and(|meta| meta.len() <= MAX_BUILD_OUTPUT_BYTES);
+/// Rule 3 against the build script's stdout, which Cargo keeps in
+/// `<unit>/output`, or `<unit>/run/stdout` from Cargo 1.100.
+fn build_output_allows_alias(path: &Path) -> bool {
+    let small = std::fs::metadata(path).is_ok_and(|meta| meta.len() <= MAX_BUILD_OUTPUT_BYTES);
     small
-        && std::fs::read(&path)
+        && std::fs::read(path)
             .is_ok_and(|bytes| directives_allow_alias(&String::from_utf8_lossy(&bytes)))
 }
 
@@ -795,8 +784,8 @@ impl UnitFacts {
             registry,
             out_dir_empty: checked.is_some_and(|(_, dir)| dir_has_no_entries(dir)),
             directives_ok: checked
-                .and_then(|(_, dir)| dir.parent())
-                .is_some_and(build_output_allows_alias),
+                .and_then(|(_, dir)| crate::cargo_layout::build_script_stdout(dir))
+                .is_some_and(|stdout| build_output_allows_alias(&stdout)),
             env_ok: rewrites.is_some(),
             forced: rewrites.as_deref().is_some_and(|rewrites| {
                 forced_by_user(
@@ -1187,6 +1176,23 @@ mod tests {
         assert_eq!(
             unit_dir_name(ok, "dmac").as_deref(),
             Some("dmac-0123456789abcdef")
+        );
+        assert_eq!(
+            unit_dir_name(
+                Path::new("/t/target/debug/build/dmac/0123456789abcdef/out"),
+                "dmac"
+            )
+            .as_deref(),
+            Some("dmac-0123456789abcdef"),
+            "Cargo 1.100's per-unit layout"
+        );
+        assert_eq!(
+            unit_dir_name(
+                Path::new("t/target/debug/build/dmac/0123456789abcdef/out"),
+                "dmac"
+            ),
+            None,
+            "relative"
         );
         let dashed = Path::new("/t/target/debug/build/my-mac-0123456789ABCDEF/out");
         assert_eq!(
@@ -1939,20 +1945,21 @@ mod tests {
             let tmp = tempfile::tempdir().unwrap();
             let build = tmp.path().join("dmac-0123456789abcdef");
             let out = build.join("out");
+            let output = build.join("output");
             std::fs::create_dir_all(&out).unwrap();
             assert!(dir_has_no_entries(&out));
             assert!(!dir_has_no_entries(&tmp.path().join("missing")));
-            assert!(!build_output_allows_alias(&build));
-            std::fs::write(build.join("output"), "cargo:rustc-env=A=B\n").unwrap();
-            assert!(build_output_allows_alias(&build));
-            std::fs::write(build.join("output"), "cargo:KEY=V\n").unwrap();
-            assert!(!build_output_allows_alias(&build));
+            assert!(!build_output_allows_alias(&output));
+            std::fs::write(&output, "cargo:rustc-env=A=B\n").unwrap();
+            assert!(build_output_allows_alias(&output));
+            std::fs::write(&output, "cargo:KEY=V\n").unwrap();
+            assert!(!build_output_allows_alias(&output));
             // An independent literal, so a change to the constant fails here.
             let limit: usize = 64 << 10;
-            std::fs::write(build.join("output"), "x".repeat(limit)).unwrap();
-            assert!(build_output_allows_alias(&build));
-            std::fs::write(build.join("output"), "x".repeat(limit + 1)).unwrap();
-            assert!(!build_output_allows_alias(&build));
+            std::fs::write(&output, "x".repeat(limit)).unwrap();
+            assert!(build_output_allows_alias(&output));
+            std::fs::write(&output, "x".repeat(limit + 1)).unwrap();
+            assert!(!build_output_allows_alias(&output));
             std::fs::write(out.join("gen.rs"), b"").unwrap();
             assert!(!dir_has_no_entries(&out));
         }
@@ -1967,16 +1974,32 @@ mod tests {
         }
 
         fn layout(crate_type: &str) -> Layout {
+            layout_in(crate_type, false)
+        }
+
+        /// [`layout`] in Cargo's legacy layout, or with `per_unit` in the
+        /// layout Cargo 1.100 gives every unit.
+        fn layout_in(crate_type: &str, per_unit: bool) -> Layout {
             let tmp = tempfile::tempdir().unwrap();
             let base = std::fs::canonicalize(tmp.path()).unwrap();
             let manifest = base.join("registry/src/index/dmac");
             let target = base.join("w/target");
-            let build = target.join("debug/build/dmac-0123456789abcdef");
+            let (build, stdout, rustc_out) = if per_unit {
+                let build = target.join("debug/build/dmac/0123456789abcdef");
+                let stdout = build.join("run/stdout");
+                let rustc_out = target.join("debug/build/dmac/fedcba9876543210/out");
+                (build, stdout, rustc_out)
+            } else {
+                let build = target.join("debug/build/dmac-0123456789abcdef");
+                let stdout = build.join("output");
+                (build, stdout, target.join("debug/deps"))
+            };
             let out_dir = build.join("out");
             std::fs::create_dir_all(&manifest).unwrap();
             std::fs::create_dir_all(&out_dir).unwrap();
-            std::fs::create_dir_all(target.join("debug/deps")).unwrap();
-            std::fs::write(build.join("output"), "cargo:rustc-env=DEBUG_OUTPUT_DIR=x\n").unwrap();
+            std::fs::create_dir_all(stdout.parent().unwrap()).unwrap();
+            std::fs::create_dir_all(&rustc_out).unwrap();
+            std::fs::write(&stdout, "cargo:rustc-env=DEBUG_OUTPUT_DIR=x\n").unwrap();
             let env = vec![
                 (
                     OsString::from("CARGO_MANIFEST_DIR"),
@@ -1995,7 +2018,7 @@ mod tests {
                     crate_type,
                     manifest.join("src/lib.rs").to_str().unwrap(),
                     "--out-dir",
-                    target.join("debug/deps").to_str().unwrap(),
+                    rustc_out.to_str().unwrap(),
                     "-C",
                     "extra-filename=-fedcba9876543210",
                 ]))
@@ -2043,6 +2066,27 @@ mod tests {
             assert_eq!(detected.alias, AliasState::Absent);
             assert_eq!(detected.verdict, LibVerdict::Unseen);
             assert!(is_private_dir(&layout.root, effective_uid()));
+        }
+
+        #[test]
+        fn gather_reads_the_same_unit_in_cargos_per_unit_layout() {
+            let layout = layout_in("proc-macro", true);
+            let detected = gather(&layout, &[]);
+            assert_eq!(
+                detected.facts,
+                UnitFacts {
+                    crate_types: strings(&["proc-macro"]),
+                    ..passing_facts(&[])
+                },
+                "the alias is named as in the legacy layout, and the directives \
+                 come from run/stdout"
+            );
+            std::fs::write(
+                layout.out_dir.parent().unwrap().join("run/stdout"),
+                "cargo:KEY=V\n",
+            )
+            .unwrap();
+            assert!(!gather(&layout, &[]).facts.directives_ok);
         }
 
         #[test]

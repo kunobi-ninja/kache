@@ -6,6 +6,7 @@ mod build_intent;
 mod cache_fs;
 mod cache_key;
 mod cargo_env;
+mod cargo_layout;
 mod cargo_proxy;
 mod checked_regions;
 mod cli;

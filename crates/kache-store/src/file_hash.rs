@@ -291,6 +291,31 @@ impl<'db> FileHashCache<'db> {
         self.prune_file_hashes_at(unix_now())
     }
 
+    /// Rebuild an older store's `file_hashes` as a `WITHOUT ROWID` table,
+    /// which keeps each path once instead of in the table and again in its
+    /// primary key index: 27% smaller on a real 1.3-million-row table
+    /// (kunobi-ninja/kache#1206). Copying takes the write lock for about a
+    /// second per million rows, so it runs from the GC sweep after the prune,
+    /// never when a build opens the index. Returns whether it rebuilt.
+    pub fn rebuild_file_hashes_without_rowid(&self) -> rusqlite::Result<bool> {
+        let tx = Transaction::new_unchecked(self.db(), TransactionBehavior::Immediate)?;
+        if !file_hashes_has_rowid(&tx)? {
+            return Ok(false);
+        }
+        tx.execute_batch(&format!(
+            "CREATE TABLE file_hashes_rebuilt ({FILE_HASHES_COLUMNS}) WITHOUT ROWID;
+             INSERT INTO file_hashes_rebuilt
+                 (path, size, mtime_ns, ctime_ns, inode, hash, updated_at)
+                 SELECT path, size, mtime_ns, ctime_ns, inode, hash, updated_at
+                 FROM file_hashes;
+             DROP TABLE file_hashes;
+             ALTER TABLE file_hashes_rebuilt RENAME TO file_hashes;
+             CREATE INDEX IF NOT EXISTS file_hashes_updated_at ON file_hashes(updated_at);"
+        ))?;
+        tx.commit()?;
+        Ok(true)
+    }
+
     fn prune_file_hashes_at(&self, now: i64) -> rusqlite::Result<usize> {
         // Built here, not when a wrapper opens the index, for the reason
         // given in `prune_input_predictions_at`.
@@ -380,20 +405,41 @@ fn ensure_input_predictions_last_used(db: &Connection, now: i64) -> rusqlite::Re
     tx.commit()
 }
 
+/// The columns of `file_hashes`, for the table a new store creates and for
+/// the rebuild of an older one.
+const FILE_HASHES_COLUMNS: &str = "
+    path       TEXT PRIMARY KEY,
+    size       INTEGER NOT NULL,
+    mtime_ns   INTEGER NOT NULL,
+    ctime_ns   INTEGER NOT NULL DEFAULT 0,
+    inode      INTEGER NOT NULL DEFAULT 0,
+    hash       TEXT NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))";
+
+/// Whether `file_hashes` is still the rowid table older stores created. A
+/// rowid table keys its rows by a hidden integer, so `path` sits in the table
+/// and again in the automatic index that enforces its primary key.
+fn file_hashes_has_rowid(db: &Connection) -> rusqlite::Result<bool> {
+    let sql: Option<String> = db
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'file_hashes'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(sql.is_some_and(|sql| !sql.to_ascii_uppercase().contains("WITHOUT ROWID")))
+}
+
 pub fn ensure_file_hash_cache_schema(db: &Connection) -> rusqlite::Result<()> {
     crate::cc_memo::ensure_schema(db)?;
     crate::cc_memo::ensure_mapped_hash_schema(db)?;
+    // An existing rowid table stays until GC housekeeping rebuilds it, off
+    // the build path (`FileHashCache::rebuild_file_hashes_without_rowid`).
+    db.execute_batch(&format!(
+        "CREATE TABLE IF NOT EXISTS file_hashes ({FILE_HASHES_COLUMNS}) WITHOUT ROWID;"
+    ))?;
     db.execute_batch(
-        "CREATE TABLE IF NOT EXISTS file_hashes (
-            path       TEXT PRIMARY KEY,
-            size       INTEGER NOT NULL,
-            mtime_ns   INTEGER NOT NULL,
-            ctime_ns   INTEGER NOT NULL DEFAULT 0,
-            inode      INTEGER NOT NULL DEFAULT 0,
-            hash       TEXT NOT NULL,
-            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-        );
-        CREATE TABLE IF NOT EXISTS input_predictions (
+        "CREATE TABLE IF NOT EXISTS input_predictions (
             identity        TEXT PRIMARY KEY,
             schema          INTEGER NOT NULL,
             crate_name      TEXT,
@@ -610,6 +656,86 @@ impl FileHashCache<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The table as stores before #1206 created it.
+    const ROWID_FILE_HASHES: &str = "CREATE TABLE file_hashes (
+        path       TEXT PRIMARY KEY,
+        size       INTEGER NOT NULL,
+        mtime_ns   INTEGER NOT NULL,
+        ctime_ns   INTEGER NOT NULL DEFAULT 0,
+        inode      INTEGER NOT NULL DEFAULT 0,
+        hash       TEXT NOT NULL,
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    )";
+
+    #[test]
+    fn a_new_store_keeps_file_hashes_without_rowid() {
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        ensure_file_hash_cache_schema(&db).unwrap();
+        assert!(!file_hashes_has_rowid(&db).unwrap());
+        let cache = FileHashCache::Borrowed(&db);
+        assert!(!cache.rebuild_file_hashes_without_rowid().unwrap());
+    }
+
+    #[test]
+    fn an_older_file_hashes_table_is_rebuilt_once_with_its_rows() {
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        db.execute_batch(ROWID_FILE_HASHES).unwrap();
+        ensure_file_hash_cache_schema(&db).unwrap();
+        assert!(
+            file_hashes_has_rowid(&db).unwrap(),
+            "opening does not rebuild"
+        );
+        db.execute(
+            "INSERT INTO file_hashes (path, size, mtime_ns, ctime_ns, inode, hash, updated_at)
+             VALUES ('/a', 1, 2, 3, 4, 'h', '2026-09-01 00:00:00')",
+            [],
+        )
+        .unwrap();
+
+        let cache = FileHashCache::Borrowed(&db);
+        assert!(cache.rebuild_file_hashes_without_rowid().unwrap());
+        assert!(!file_hashes_has_rowid(&db).unwrap());
+        let row: (String, i64, i64, i64, i64, String, String) = db
+            .query_row(
+                "SELECT path, size, mtime_ns, ctime_ns, inode, hash, updated_at FROM file_hashes",
+                [],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            row,
+            (
+                "/a".into(),
+                1,
+                2,
+                3,
+                4,
+                "h".into(),
+                "2026-09-01 00:00:00".into()
+            )
+        );
+        let indexed: bool = db
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master
+                 WHERE type = 'index' AND name = 'file_hashes_updated_at')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(indexed, "the prune's index comes back");
+        assert!(!cache.rebuild_file_hashes_without_rowid().unwrap(), "once");
+    }
 
     #[test]
     fn the_file_hash_window_is_thirty_days() {

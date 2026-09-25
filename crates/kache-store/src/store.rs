@@ -3959,6 +3959,12 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                     tracing::warn!("gc: file hash pruning failed: {error}");
                     0
                 });
+        // After the prune, so the one-time copy is as small as it gets.
+        match self.file_hash_cache().rebuild_file_hashes_without_rowid() {
+            Ok(true) => tracing::info!("gc: rebuilt file_hashes without rowid"),
+            Ok(false) => {}
+            Err(error) => tracing::warn!("gc: file hash table rebuild failed: {error}"),
+        }
         HousekeepingStats {
             key_locks_removed: locks.removed,
             key_locks_remaining: locks.remaining(),
@@ -15143,6 +15149,51 @@ mod tests {
         assert!(young.exists());
         assert!(predictions.get_input_prediction("live").unwrap().is_some());
         assert_eq!(predictions.get_input_prediction("unused").unwrap(), None);
+    }
+
+    /// A store from before #1206 has a rowid `file_hashes`; the sweep
+    /// rebuilds it after pruning, keeping the rows the prune kept.
+    #[test]
+    fn housekeeping_rebuilds_an_older_file_hashes_table_without_rowid() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+        store
+            .db
+            .execute_batch(
+                "DROP TABLE file_hashes;
+                 CREATE TABLE file_hashes (
+                     path TEXT PRIMARY KEY, size INTEGER NOT NULL, mtime_ns INTEGER NOT NULL,
+                     ctime_ns INTEGER NOT NULL DEFAULT 0, inode INTEGER NOT NULL DEFAULT 0,
+                     hash TEXT NOT NULL, updated_at TEXT NOT NULL DEFAULT (datetime('now')));
+                 INSERT INTO file_hashes (path, size, mtime_ns, hash, updated_at)
+                     VALUES ('/old', 1, 1, 'h', '2000-01-01 00:00:00'),
+                            ('/new', 1, 1, 'h', '9999-01-01 00:00:00');",
+            )
+            .unwrap();
+        let table_sql = || -> String {
+            store
+                .db
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'file_hashes'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        assert!(!table_sql().contains("WITHOUT ROWID"));
+
+        assert_eq!(store.sweep_housekeeping().file_hashes_pruned, 1);
+        assert!(table_sql().contains("WITHOUT ROWID"), "{}", table_sql());
+        let paths: Vec<String> = store
+            .db
+            .prepare("SELECT path FROM file_hashes")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(paths, ["/new"]);
     }
 
     #[test]

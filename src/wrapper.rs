@@ -15836,8 +15836,15 @@ exit 0
         assert_eq!(attempts.get(), 2);
 
         // While another process holds the marker's lock, nothing is sent.
+        // Taking it here can itself find it busy, for the same reason as
+        // `trigger`: a child spawned meanwhile shares the descriptor.
         let held = open_marker_for_lock(&marker).unwrap();
-        held.try_lock().unwrap();
+        let mut waited = 0;
+        while held.try_lock().is_err() {
+            assert!(waited < 200, "the marker lock stayed busy for 2 s");
+            waited += 1;
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         assert_eq!(
             maybe_trigger_prefetch_with(&config, &args, start + 90, || unreachable!()),
             PrefetchTrigger::Busy

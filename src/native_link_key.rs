@@ -1764,20 +1764,52 @@ where
 /// invoked a script instead of `link.exe` / `lld-link.exe`.
 type UnwrappedWindowsLinker = (PathBuf, Option<(String, Vec<String>)>);
 
-/// Firefox's `build/cargo-linker.bat` / `cargo-host-linker.bat` run
-/// `%MOZ_CARGO_WRAP_LD% %* %MOZ_CARGO_WRAP_LDFLAGS%` (or the HOST_ variants).
-/// rustc only sees the `.bat`; the real `link.exe` and extra flags live in
-/// those environment variables. Follow them so identity still pins the tool.
+/// Set when Firefox's clang is newer than rustc's LLVM. `build/cargo-linker`
+/// then swaps rustc's sanitizer runtimes for clang's, which changes the link
+/// line in a way the identity does not model.
+const MOZ_SANITIZER_RUNTIME_SWAP: &str = "MOZ_CLANG_NEWER_THAN_RUSTC_LLVM";
+
+/// Firefox's `build/cargo-host-linker.bat` runs
+/// `%MOZ_CARGO_WRAP_HOST_LD% %* %MOZ_CARGO_WRAP_HOST_LDFLAGS%`, and
+/// `build/cargo-linker.bat` runs `%PYTHON3% %~dpn0 %*`: the Python script
+/// beside it, `build/cargo-linker`, links with `MOZ_CARGO_WRAP_LD` plus
+/// `MOZ_CARGO_WRAP_LDFLAGS`. rustc only sees the `.bat`; the real `link.exe`
+/// and extra flags live in those environment variables. Follow them so
+/// identity still pins the tool. Where host and target are the same triple,
+/// as on Windows, cargo links build scripts and proc-macros with the target
+/// linker, so the Python route is the one Firefox's host units take.
 fn unwrap_windows_linker_wrapper(
     wrapper: &Path,
     environment: &WindowsProbeEnvironment,
 ) -> Result<UnwrappedWindowsLinker> {
-    let bytes = std::fs::read(wrapper).with_context(|| {
+    let mut bytes = std::fs::read(wrapper).with_context(|| {
         format!(
             "selected Windows linker {} is not readable",
             wrapper.display()
         )
     })?;
+    // `%~dpn0` is the script's own path without its extension.
+    if String::from_utf8_lossy(&bytes)
+        .to_ascii_lowercase()
+        .contains("%~dpn0")
+    {
+        let delegate = wrapper.with_extension("");
+        let script = std::fs::read(&delegate).with_context(|| {
+            format!(
+                "wrapper {} runs {}, which is not readable",
+                wrapper.display(),
+                delegate.display()
+            )
+        })?;
+        if environment.var(MOZ_SANITIZER_RUNTIME_SWAP).is_some() {
+            bail!(
+                "{MOZ_SANITIZER_RUNTIME_SWAP} makes {} rewrite link arguments; unmodeled",
+                delegate.display()
+            );
+        }
+        bytes.extend_from_slice(b"\0");
+        bytes.extend_from_slice(&script);
+    }
     let digest = blake3::hash(&bytes).to_hex().to_string();
     let text = String::from_utf8_lossy(&bytes);
     let pairs = [
@@ -1794,9 +1826,14 @@ fn unwrap_windows_linker_wrapper(
                 wrapper.display()
             )
         })?;
-        let extra = environment
-            .var(flags_var)
-            .unwrap_or("")
+        let flags = environment.var(flags_var).unwrap_or("");
+        // The scripts split on whitespace (`%VAR%`, `$VAR` unquoted) or with
+        // shell quoting (`mozshellutil.split`); only unquoted values split
+        // the same way in both.
+        if flags.contains(['"', '\'']) {
+            bail!("{flags_var} carries quotes; its split is unmodeled");
+        }
+        let extra = flags
             .split_whitespace()
             .map(str::to_string)
             .collect::<Vec<_>>();
@@ -3197,6 +3234,82 @@ mod tests {
             format!("{error:#}").contains("thin static archive"),
             "{error:#}"
         );
+    }
+
+    /// Firefox 151's `build/cargo-linker.bat` names no variable itself: it
+    /// runs the Python script beside it, which links with
+    /// `MOZ_CARGO_WRAP_LD`. On Windows cargo links build scripts and
+    /// proc-macros through it too, and every one of them used to be refused.
+    #[test]
+    fn windows_identity_follows_firefox_python_cargo_linker() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut environment = windows_environment(directory.path(), "x64");
+        let lld = directory.path().join("lld-link.exe");
+        std::fs::write(&lld, b"").unwrap();
+        let wrapper = directory.path().join("cargo-linker.bat");
+        std::fs::write(&wrapper, "@echo off\r\n%PYTHON3% %~dpn0 %*\r\n").unwrap();
+        let script = directory.path().join("cargo-linker");
+        std::fs::write(
+            &script,
+            "wrap_ld = os.environ[\"MOZ_CARGO_WRAP_LD\"]\n\
+             args.extend(split(os.environ[\"MOZ_CARGO_WRAP_LDFLAGS\"]))\n",
+        )
+        .unwrap();
+        environment.variables.insert(
+            "MOZ_CARGO_WRAP_LD".into(),
+            lld.to_string_lossy().into_owned(),
+        );
+        environment
+            .variables
+            .insert("MOZ_CARGO_WRAP_LDFLAGS".into(), "/DEBUG /OPT:REF".into());
+        let probe = |environment: &WindowsProbeEnvironment| {
+            probe_windows_msvc_identity_with(
+                Some(&wrapper),
+                "x64",
+                &[],
+                environment,
+                |tool, path| {
+                    if tool == WindowsTool::LldLink {
+                        assert_eq!(path, lld);
+                    }
+                    Ok(match tool {
+                        WindowsTool::LldLink => LLD_LINK_BANNER.into(),
+                        WindowsTool::Cl => compiler_banner("x64"),
+                        WindowsTool::Link => unreachable!(),
+                    })
+                },
+            )
+        };
+
+        let identity = probe(&environment).unwrap();
+        assert_eq!(identity.linker, LLD_LINK_BANNER);
+        let (digest, extra) = identity.wrapper.clone().expect("wrapper identity");
+        assert_eq!(extra, ["/DEBUG", "/OPT:REF"]);
+
+        // The script is part of the wrapper's identity.
+        std::fs::write(
+            &script,
+            "wrap_ld = os.environ[\"MOZ_CARGO_WRAP_LD\"] # v2\n",
+        )
+        .unwrap();
+        let (changed, _) = probe(&environment).unwrap().wrapper.unwrap();
+        assert_ne!(digest, changed);
+
+        let mut quoted = environment.clone();
+        quoted.variables.insert(
+            "MOZ_CARGO_WRAP_LDFLAGS".into(),
+            "\"/LIBPATH:C:/a b\"".into(),
+        );
+        assert!(format!("{:#}", probe(&quoted).unwrap_err()).contains("quotes"));
+
+        let mut sanitizer = environment.clone();
+        sanitizer
+            .variables
+            .insert(MOZ_SANITIZER_RUNTIME_SWAP.into(), "1".into());
+        assert!(format!("{:#}", probe(&sanitizer).unwrap_err()).contains("unmodeled"));
+
+        std::fs::remove_file(&script).unwrap();
+        assert!(format!("{:#}", probe(&environment).unwrap_err()).contains("not readable"));
     }
 
     #[test]

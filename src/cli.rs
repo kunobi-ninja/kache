@@ -9268,8 +9268,8 @@ mod tests {
         write("bar-0123456789abcdef/output", 19);
         write("loose", 23);
         write("foo/0123456789abcdef/extra", 29);
-        write("foo/not-a-unit/file", 31);
-        write("foo/file", 37);
+        write("foo/not-a-unit/out/libfoo.rlib", 31);
+        write("foo/fedcba9876543210", 37);
 
         let (stats, breakdown) = compute_project_stats(dir.path());
         assert_eq!(stats.total_bytes, 95 + 29 + 31 + 37);

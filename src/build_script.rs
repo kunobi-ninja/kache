@@ -89,10 +89,18 @@ pub fn compiled_build_script(args: &RustcArgs) -> Option<PathBuf> {
 }
 
 /// Where a build-script compilation writes its binary, decided from `args`
-/// alone. `None` for every other compilation.
+/// and Cargo's environment. `None` for every other compilation.
 pub fn build_script_output(args: &RustcArgs) -> Option<PathBuf> {
+    build_script_output_for(args, std::env::var_os("CARGO_BIN_NAME").is_some())
+}
+
+/// [`build_script_output`] with whether Cargo set `CARGO_BIN_NAME`. Cargo
+/// sets it for a `[[bin]]` and never for a build script, and from 1.100 a
+/// bin named `build-script-build` compiles under the same crate name into
+/// the same kind of per-unit `out` directory as a build script.
+fn build_script_output_for(args: &RustcArgs, cargo_bin: bool) -> Option<PathBuf> {
     let crate_name = args.crate_name.as_deref()?;
-    if !crate_name.starts_with("build_script_") || args.crate_types != ["bin"] {
+    if cargo_bin || !crate_name.starts_with("build_script_") || args.crate_types != ["bin"] {
         return None;
     }
     let out_dir = args.out_dir.as_deref()?;
@@ -2073,8 +2081,13 @@ mod tests {
             out.to_str().unwrap(),
         ]);
         assert_eq!(
-            build_script_output(&args),
+            build_script_output_for(&args, false),
             Some(out.join("build_script_build"))
+        );
+        assert_eq!(
+            build_script_output_for(&args, true),
+            None,
+            "a [[bin]] named build-script-build is not a build script"
         );
     }
 

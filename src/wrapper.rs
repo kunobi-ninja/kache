@@ -15689,11 +15689,19 @@ exit 0
             maybe_notice_unknown_layout(&config, &unknown, root, now + 1),
             maybe_notice_unknown_layout(&config, &unknown, root, now + BUILD_SESSION_SECS + 2),
         ];
+        // Another wrapper holding the marker is showing the line itself.
+        let later = now + 3 * BUILD_SESSION_SECS;
+        let marker = session_marker_path(&config, root).with_extension("layout");
+        let held = open_marker_for_lock(&marker).unwrap();
+        held.lock().unwrap();
+        let while_held = maybe_notice_unknown_layout(&config, &unknown, root, later);
+        drop(held);
         match previous {
             Some(value) => unsafe { std::env::set_var("CARGO_CRATE_NAME", value) },
             None => unsafe { std::env::remove_var("CARGO_CRATE_NAME") },
         }
         assert_eq!(shown, [false, false, true, false, true]);
+        assert!(!while_held);
     }
 
     #[test]

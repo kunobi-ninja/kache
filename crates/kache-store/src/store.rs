@@ -1018,6 +1018,12 @@ pub struct GcStats {
     /// write lock.
     #[serde(default)]
     pub evict_write_ms: u64,
+    /// Bytes a size-driven sweep found held by live files outside the store:
+    /// last-reference blobs a target directory still clones or hardlinks.
+    /// Evicting them frees nothing, so the sweep leaves them out of the bytes
+    /// it has to free (kunobi-ninja/kache#1206).
+    #[serde(default)]
+    pub bytes_held: u64,
     /// What the run's housekeeping did. `None` for a run that did none, such
     /// as the eviction after an upload.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4446,6 +4452,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         stop_at: Option<(u64, u64)>,
         shadow: Option<&ShadowSelection>,
         durable_upload_keys: &std::collections::HashSet<String>,
+        held: &std::collections::HashMap<String, u64>,
     ) -> GcStats {
         let mut stats = GcStats::default();
         let mut eviction_writes = std::time::Duration::ZERO;
@@ -4479,6 +4486,11 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             if features.is_some_and(|f| f.recently_imported) {
                 stats.entries_pinned += 1;
                 stats.entries_import_pinned += 1;
+                continue;
+            }
+            // Found held by this sweep's probe, and counted there: its
+            // removal would be refused.
+            if held.contains_key(key) {
                 continue;
             }
             let write_started = std::time::Instant::now();
@@ -4583,6 +4595,14 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             selected_compile_time_ms = cost_ms,
             "gc: eviction selection"
         );
+        // Only a size-driven sweep has a byte budget for held bytes to leave.
+        let held = if stop_at.is_some() {
+            self.held_by_live_files(&candidates)?
+        } else {
+            std::collections::HashMap::new()
+        };
+        let bytes_held: u64 = held.values().sum();
+        let stop_at = stop_at.map(|(current, target)| (current.saturating_sub(bytes_held), target));
         let shadow = stop_at.map(|(current, target)| {
             use crate::eviction::EvictionPolicy as _;
             let candidate = crate::eviction::ValueDensityPolicy;
@@ -4599,14 +4619,67 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         let by_key: std::collections::HashMap<&str, &crate::eviction::EntryFeatures> =
             candidates.iter().map(|e| (e.key.as_str(), e)).collect();
         let durable_upload_keys = self.durable_upload_keys()?;
-        Ok(self.apply_eviction(
+        let mut stats = self.apply_eviction(
             &order,
             &by_key,
             policy.name(),
             stop_at,
             shadow.as_ref(),
             &durable_upload_keys,
-        ))
+            &held,
+        );
+        stats.bytes_held = bytes_held;
+        stats.entries_unreclaimable += held.len();
+        Ok(stats)
+    }
+
+    /// Per entry, the bytes of blobs it holds the last reference to that a
+    /// live file outside the store (a clone or hardlink in a target
+    /// directory) holds as well. Evicting the entry would unlink those
+    /// names and free nothing (kunobi-ninja/kache#725), so a size-driven
+    /// sweep counts them apart instead of evicting everything else trying to
+    /// get under a budget they keep it over (kunobi-ninja/kache#1206).
+    ///
+    /// Empty under `gc_evict_shared`, which evicts such entries anyway.
+    fn held_by_live_files(
+        &self,
+        candidates: &[crate::eviction::EntryFeatures],
+    ) -> Result<std::collections::HashMap<String, u64>> {
+        let mut held = std::collections::HashMap::new();
+        if self.config.gc_evict_shared {
+            return Ok(held);
+        }
+        let keys: std::collections::HashSet<&str> =
+            candidates.iter().map(|entry| entry.key.as_str()).collect();
+        // Read every row first: the probes below touch the filesystem, and a
+        // read statement left open across them would pin the WAL snapshot.
+        let last_refs = {
+            let mut stmt = self.db.prepare(
+                "SELECT eb.cache_key, b.hash, b.size, b.refcount, eb.refs
+                 FROM entry_blobs eb JOIN blobs b ON b.hash = eb.hash",
+            )?;
+            stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .into_iter()
+            .filter(|(key, _, _, refcount, refs)| {
+                keys.contains(key.as_str()) && holds_last_reference(*refcount, *refs)
+            })
+            .collect::<Vec<_>>()
+        };
+        for (key, hash, size, _, _) in last_refs {
+            if crate::filesystem::blob_has_external_retainer(&self.blob_path(&hash)) {
+                *held.entry(key).or_insert(0) += size.max(0) as u64;
+            }
+        }
+        Ok(held)
     }
 
     /// Weighted eviction: remove entries with lowest priority score until under the size limit.
@@ -4687,6 +4760,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             None,
             None,
             &durable_upload_keys,
+            &std::collections::HashMap::new(),
         ))
     }
 
@@ -17161,12 +17235,12 @@ mod tests {
         );
     }
 
-    /// Deciding that an entry cannot be reclaimed also takes the write lock,
-    /// so the sweep paces those entries like removals. It used to move to the
-    /// next one at once, and a run of entries still linked into target
-    /// directories took the lock back to back.
+    /// A size-driven sweep probes for entries still linked into target
+    /// directories before it removes anything, and skips them without taking
+    /// the write lock. They used to take it one by one, back to back, to find
+    /// out the removal had to be refused.
     #[test]
-    fn eviction_paces_entries_it_cannot_reclaim() {
+    fn eviction_skips_entries_it_found_held_without_taking_the_lock() {
         let dir = tempfile::tempdir().unwrap();
         let mut config = test_config(dir.path());
         config.deferred_durability = true;
@@ -17191,17 +17265,143 @@ mod tests {
         gc_config.max_size = 1;
         let mut gc = Store::open(&gc_config).unwrap();
         // A zero slice pauses after every entry that took the lock.
-        let pause = Duration::from_millis(150);
+        let pause = Duration::from_secs(5);
         gc.eviction_pacing = (Duration::ZERO, pause);
         let started = std::time::Instant::now();
         let stats = gc.evict().unwrap();
         let elapsed = started.elapsed();
 
         assert_eq!(stats.entries_unreclaimable, 3, "{stats:?}");
+        assert_eq!(stats.evict_write_ms, 0, "{stats:?}");
         assert!(
-            elapsed >= pause * 3,
-            "one pause per entry, swept in {elapsed:?}"
+            elapsed < pause,
+            "no entry took the lock, swept in {elapsed:?}"
         );
+    }
+
+    /// Put `key` with a `size`-byte output last used an hour ago, and return
+    /// its blob's path.
+    fn put_idle_entry(store: &Store, dir: &Path, key: &str, size: usize) -> PathBuf {
+        let output = dir.join(format!("{key}.rlib"));
+        // Distinct content per key, so no two entries share a blob.
+        let mut bytes = vec![0u8; size];
+        bytes[..key.len()].copy_from_slice(key.as_bytes());
+        std::fs::write(&output, bytes).unwrap();
+        store
+            .put(
+                key,
+                key,
+                &["lib".to_string()],
+                &[],
+                "x86_64-unknown-linux-gnu",
+                "dev",
+                &[(output.clone(), format!("lib{key}.rlib"))],
+                "",
+                "",
+            )
+            .unwrap();
+        let _ = std::fs::remove_file(&output);
+        // Read before aging the entry: a get counts as a use.
+        let meta = store.get(key).unwrap().unwrap();
+        store
+            .db
+            .execute(
+                "UPDATE entries SET last_accessed = datetime('now', '-1 hour') WHERE cache_key = ?1",
+                params![key],
+            )
+            .unwrap();
+        store.blob_path(&meta.files[0].hash)
+    }
+
+    /// Bytes a target directory still holds are not bytes a sweep can free,
+    /// so they do not count toward what it has to free (#1206). The sweep
+    /// used to evict every other entry trying to get under a budget those
+    /// bytes alone kept it over.
+    #[test]
+    fn a_size_sweep_leaves_bytes_held_by_target_directories_out_of_its_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        // Trigger at 100 bytes, target 90.
+        config.max_size = 100;
+        let mut store = Store::open(&config).unwrap();
+        let held_blob = put_idle_entry(&store, dir.path(), "held", 200);
+        std::fs::hard_link(&held_blob, dir.path().join("target-copy.rlib")).unwrap();
+        put_idle_entry(&store, dir.path(), "small", 60);
+        assert_eq!(store.physical_size().unwrap(), 260);
+
+        // 260 - 200 held = 60, already under the target.
+        let stats = store.evict().unwrap();
+        assert_eq!(stats.bytes_held, 200, "{stats:?}");
+        assert_eq!(stats.entries_unreclaimable, 1, "{stats:?}");
+        assert_eq!(stats.entries_evicted, 0, "{stats:?}");
+        assert!(store.contains("held") && store.contains("small"));
+
+        // Over the target even without the held bytes: the free part goes.
+        put_idle_entry(&store, dir.path(), "large", 90);
+        let stats = store.evict().unwrap();
+        assert_eq!(stats.bytes_held, 200, "{stats:?}");
+        assert_eq!(stats.entries_evicted, 1, "{stats:?}");
+        assert!(store.contains("held"));
+        let free_part = store.physical_size().unwrap() - stats.bytes_held;
+        assert!(free_part <= 90, "stops at the target: {free_part}");
+
+        // `gc_evict_shared` evicts held entries, so nothing is held back.
+        store.config.gc_evict_shared = true;
+        let stats = store.evict().unwrap();
+        assert_eq!(stats.bytes_held, 0, "{stats:?}");
+        assert!(!store.contains("held"));
+    }
+
+    /// A blob two entries share is not either one's last reference, so
+    /// evicting either would unlink nothing: neither counts as held, even
+    /// when a target directory holds the blob too.
+    #[test]
+    fn a_shared_blob_held_outside_is_no_entrys_held_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.max_size = 100;
+        let store = Store::open(&config).unwrap();
+        for key in ["first", "second"] {
+            let output = dir.path().join(format!("{key}.rlib"));
+            std::fs::write(&output, vec![7u8; 300]).unwrap();
+            store
+                .put(
+                    key,
+                    key,
+                    &["lib".to_string()],
+                    &[],
+                    "x86_64-unknown-linux-gnu",
+                    "dev",
+                    &[(output.clone(), "libshared.rlib".to_string())],
+                    "",
+                    "",
+                )
+                .unwrap();
+            std::fs::remove_file(&output).unwrap();
+        }
+        let meta = store.get("first").unwrap().unwrap();
+        std::fs::hard_link(
+            store.blob_path(&meta.files[0].hash),
+            dir.path().join("target-copy.rlib"),
+        )
+        .unwrap();
+        let candidates = store
+            .eviction_candidates_for(SweepOrigin::Requested)
+            .unwrap();
+        assert!(store.held_by_live_files(&candidates).unwrap().is_empty());
+    }
+
+    /// Only a sweep with a byte budget probes: the others remove what their
+    /// policy selects whatever it holds.
+    #[test]
+    fn only_a_size_sweep_counts_held_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+        let held_blob = put_idle_entry(&store, dir.path(), "held", 200);
+        std::fs::hard_link(&held_blob, dir.path().join("target-copy.rlib")).unwrap();
+        let stats = store.evict_older_than(0).unwrap();
+        assert_eq!(stats.bytes_held, 0, "{stats:?}");
     }
 
     #[test]

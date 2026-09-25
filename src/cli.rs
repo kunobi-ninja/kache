@@ -2184,6 +2184,15 @@ pub fn format_duration_ms(ms: u64) -> String {
     }
 }
 
+/// ` (<size>)` after a count of held entries, when the sweep measured it.
+fn held_bytes_note(bytes_held: u64) -> String {
+    if bytes_held == 0 {
+        String::new()
+    } else {
+        format!(" ({})", ByteSize(bytes_held))
+    }
+}
+
 /// How an eviction sweep went, phrased so "0" is never left unexplained.
 ///
 /// `kache gc` used to print a bare `evicted 0 entries` next to a store sitting
@@ -2227,10 +2236,11 @@ pub(crate) fn describe_eviction(stats: &crate::store::GcStats, over_limit: bool)
         }
         if stats.entries_unreclaimable > 0 {
             msg.push_str(&format!(
-                "\n  {} {} left in place because clones still hold their blocks. \
+                "\n  {} {}{} left in place because clones still hold their blocks. \
                  Inspect stale outputs with `kache clean --tracked --stale 14d --dry-run`, then run `kache gc` again.",
                 stats.entries_unreclaimable,
                 plural(stats.entries_unreclaimable),
+                held_bytes_note(stats.bytes_held),
             ));
         }
         return msg;
@@ -2238,11 +2248,12 @@ pub(crate) fn describe_eviction(stats: &crate::store::GcStats, over_limit: bool)
 
     if stats.entries_unreclaimable > 0 {
         return format!(
-            " nothing reclaimable on disk.\n  {} {} cloned into build outputs \
+            " nothing reclaimable on disk.\n  {} {}{} cloned into build outputs \
              (same bytes as target/, not extra).\n  Remove stale outputs with \
              `kache clean --tracked --stale 14d --dry-run`, then run `kache gc` again.",
             stats.entries_unreclaimable,
             plural(stats.entries_unreclaimable),
+            held_bytes_note(stats.bytes_held),
         );
     }
 
@@ -3252,7 +3263,13 @@ pub fn run_gc_local(config: &Config, mode: GcMode) -> Result<crate::store::GcSta
     let evict_stats = store.evict_for(mode.sweep_origin())?;
     add_gc_stats(&mut combined, &evict_stats);
     if verbose {
-        let over_limit = store_over_limit(store.physical_size().ok(), config.max_size);
+        let over_limit = store_over_limit(
+            store
+                .physical_size()
+                .ok()
+                .map(|size| size.saturating_sub(evict_stats.bytes_held)),
+            config.max_size,
+        );
         println!("{}", describe_eviction(&evict_stats, over_limit));
     }
 
@@ -3307,12 +3324,16 @@ pub fn run_auto_gc_worker(config: &Config, retry_delay: std::time::Duration) {
             auto_gc_worker_sweep(config)
         })
         .flatten();
-    let swept = [first, second].iter().flatten().any(|stats| !stats.skipped);
-    if !swept {
+    // The later sweep's probe is the fresher account of what is held.
+    let Some(last) = [second, first]
+        .into_iter()
+        .flatten()
+        .find(|stats| !stats.skipped)
+    else {
         return;
-    }
+    };
     match Store::open(config).and_then(|store| store.physical_size()) {
-        Ok(size) => crate::wrapper::record_auto_gc_outcome(config, size),
+        Ok(size) => crate::wrapper::record_auto_gc_outcome(config, size, last.bytes_held),
         Err(e) => tracing::debug!("auto-gc: store size after the sweep unknown: {e:#}"),
     }
 }
@@ -3367,6 +3388,9 @@ fn add_gc_stats(total: &mut crate::store::GcStats, part: &crate::store::GcStats)
         .entries_import_pinned
         .saturating_add(part.entries_import_pinned);
     total.evict_write_ms = total.evict_write_ms.saturating_add(part.evict_write_ms);
+    // A measurement of the store, not work done: two sweeps probing the same
+    // held bytes must not add up to twice as many.
+    total.bytes_held = total.bytes_held.max(part.bytes_held);
     total.skipped |= part.skipped;
 }
 
@@ -3385,6 +3409,7 @@ fn gc_stats_from_breakdown(report: &crate::daemon::GcBreakdown) -> crate::store:
         total.entries_failed = total.entries_failed.saturating_add(part.entries_failed);
         total.entries_locked = total.entries_locked.saturating_add(part.entries_locked);
         total.evict_write_ms = total.evict_write_ms.saturating_add(part.evict_write_ms);
+        total.bytes_held = total.bytes_held.max(part.bytes_held);
     }
     total
 }
@@ -3523,7 +3548,13 @@ pub fn gc(
                         );
                     }
                     let store = Store::open(config)?;
-                    let over_limit = store_over_limit(store.physical_size().ok(), config.max_size);
+                    let over_limit = store_over_limit(
+                        store
+                            .physical_size()
+                            .ok()
+                            .map(|size| size.saturating_sub(combined.bytes_held)),
+                        config.max_size,
+                    );
                     println!("{}", describe_eviction(&combined, over_limit));
                 }
             } else if human_gc_output(json) {
@@ -3564,7 +3595,13 @@ pub fn gc(
                 let evict_stats = evict_older_than_recorded(&store, config, hours)?;
                 combined = evict_stats.clone();
                 if human_gc_output(json) {
-                    let over_limit = store_over_limit(store.physical_size().ok(), config.max_size);
+                    let over_limit = store_over_limit(
+                        store
+                            .physical_size()
+                            .ok()
+                            .map(|size| size.saturating_sub(evict_stats.bytes_held)),
+                        config.max_size,
+                    );
                     println!("{}", describe_eviction(&evict_stats, over_limit));
                 }
             } else {
@@ -7413,6 +7450,7 @@ mod tests {
                 entries_failed: (n * 100_000) as usize,
                 entries_locked: (n * 1_000_000) as usize,
                 evict_write_ms: n * 10_000_000,
+                bytes_held: n * 100_000_000,
             }
         }
         let report = crate::daemon::GcBreakdown {
@@ -7430,6 +7468,10 @@ mod tests {
         assert_eq!(total.entries_failed, 600_000);
         assert_eq!(total.entries_locked, 6_000_000);
         assert_eq!(total.evict_write_ms, 60_000_000);
+        assert_eq!(
+            total.bytes_held, 300_000_000,
+            "the largest probe, not a sum"
+        );
 
         let mut accumulated = crate::store::GcStats {
             entries_evicted: 1,
@@ -7446,6 +7488,7 @@ mod tests {
             entries_recent_prefiltered: 0,
             entries_import_pinned: 12,
             evict_write_ms: 11,
+            bytes_held: 13,
             // Set once by the driver, never summed over policies.
             housekeeping: None,
         };
@@ -7464,10 +7507,12 @@ mod tests {
             entries_recent_prefiltered: 0,
             entries_import_pinned: 120,
             evict_write_ms: 110,
+            bytes_held: 7,
             // Set once by the driver, never summed over policies.
             housekeeping: None,
         };
         add_gc_stats(&mut accumulated, &part);
+        assert_eq!(accumulated.bytes_held, 13, "the larger probe, not a sum");
         assert_eq!(accumulated.entries_evicted, 11);
         assert_eq!(accumulated.bytes_freed, 22);
         assert_eq!(accumulated.entries_pinned, 33);
@@ -8134,6 +8179,19 @@ mod tests {
         let msg = describe_eviction(&stats, false);
         assert!(msg.contains("1 entry cloned"), "{msg}");
         assert!(msg.contains("clean --tracked"), "{msg}");
+
+        stats.bytes_held = 3 * 1024 * 1024 * 1024;
+        let msg = describe_eviction(&stats, false);
+        assert!(msg.contains("1 entry (3.0 GiB) cloned"), "{msg}");
+    }
+
+    #[test]
+    fn a_successful_eviction_sizes_the_entries_clones_hold() {
+        let mut stats = gc_stats(1, 0, 1024);
+        stats.entries_unreclaimable = 2;
+        stats.bytes_held = 2048;
+        let msg = describe_eviction(&stats, false);
+        assert!(msg.contains("2 entries (2.0 KiB) left in place"), "{msg}");
     }
 
     #[test]

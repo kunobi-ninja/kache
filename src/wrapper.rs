@@ -335,6 +335,23 @@ struct AutoGcBackoff {
     interval_secs: u64,
     /// Physical store size the sweep left behind.
     size_after: u64,
+    /// Bytes of it the sweep found held by target directories, which no
+    /// sweep can free (kunobi-ninja/kache#1206).
+    #[serde(default)]
+    held: u64,
+}
+
+/// How long a sweep's `held` figure stands in for a fresh probe. Deleting a
+/// worktree frees what it held without changing the store's size, so after
+/// this the trigger goes back to the full size and the next sweep measures
+/// again. The daemon's periodic sweep runs this often.
+const AUTO_GC_HELD_TTL: std::time::Duration = std::time::Duration::from_secs(6 * 3600);
+
+/// The bytes a recorded sweep found held, while that figure is recent.
+fn recent_held_bytes(backoff: Option<AutoGcBackoff>, now: u64) -> u64 {
+    backoff
+        .filter(|b| now < b.since.saturating_add(AUTO_GC_HELD_TTL.as_secs()))
+        .map_or(0, |b| b.held)
 }
 
 fn unix_now_secs() -> u64 {
@@ -349,26 +366,36 @@ fn read_auto_gc_backoff(cache_dir: &Path) -> Option<AutoGcBackoff> {
     serde_json::from_slice(&json).ok()
 }
 
-/// The backoff after a sweep that left the store at `size_after`: none once
-/// the store is back under the trigger, otherwise double the previous
-/// interval, starting from the check interval, up to [`AUTO_GC_MAX_BACKOFF`].
+/// The record after a sweep that left the store at `size_after`, `held` of
+/// it held by target directories. Back under the trigger once the held bytes
+/// are left out, there is no backoff, and a record remains only to carry
+/// `held`. Otherwise the interval doubles, starting from the check interval,
+/// up to [`AUTO_GC_MAX_BACKOFF`].
 fn next_auto_gc_backoff(
     previous: Option<AutoGcBackoff>,
     now: u64,
     size_after: u64,
+    held: u64,
     max_size: u64,
 ) -> Option<AutoGcBackoff> {
-    if size_after <= auto_gc_threshold(max_size) {
-        return None;
+    if size_after.saturating_sub(held) <= auto_gc_threshold(max_size) {
+        return (held > 0).then_some(AutoGcBackoff {
+            since: now,
+            interval_secs: 0,
+            size_after,
+            held,
+        });
     }
     let interval_secs = previous
         .map_or(AUTO_GC_CHECK_INTERVAL.as_secs(), |b| b.interval_secs)
+        .max(AUTO_GC_CHECK_INTERVAL.as_secs())
         .saturating_mul(2)
         .min(AUTO_GC_MAX_BACKOFF.as_secs());
     Some(AutoGcBackoff {
         since: now,
         interval_secs,
         size_after,
+        held,
     })
 }
 
@@ -389,10 +416,12 @@ fn auto_gc_backoff_holds(
         && grown <= max_size / 100 * AUTO_GC_SLACK_PERCENT
 }
 
-/// Whether an automatic sweep of a store now at `total` should wait out the
-/// backoff the last sweep left.
-pub(crate) fn auto_gc_backing_off(config: &Config, total: u64) -> bool {
-    auto_gc_backoff_holds(
+/// The start condition of every automatic sweep, whichever driver asks: the
+/// store is over the trigger, leaving out what the last sweep found held by
+/// target directories, and that sweep left no backoff that still holds.
+/// `kache gc` does not ask.
+pub(crate) fn auto_gc_sweep_due(config: &Config, total: u64) -> bool {
+    auto_gc_due_at(
         read_auto_gc_backoff(&config.cache_dir),
         unix_now_secs(),
         total,
@@ -400,38 +429,59 @@ pub(crate) fn auto_gc_backing_off(config: &Config, total: u64) -> bool {
     )
 }
 
-/// The start condition of every automatic sweep, whichever driver asks: the
-/// store is over the trigger and the last sweep left no backoff that still
-/// holds. `kache gc` does not ask.
-pub(crate) fn auto_gc_sweep_due(config: &Config, total: u64) -> bool {
-    total > auto_gc_threshold(config.max_size) && !auto_gc_backing_off(config, total)
+fn auto_gc_due_at(backoff: Option<AutoGcBackoff>, now: u64, total: u64, max_size: u64) -> bool {
+    total.saturating_sub(recent_held_bytes(backoff, now)) > auto_gc_threshold(max_size)
+        && !auto_gc_backoff_holds(backoff, now, total, max_size)
 }
 
-/// Called by every automatic driver after a sweep: store the next backoff, or
-/// clear it once the store is back under the trigger.
-pub(crate) fn record_auto_gc_outcome(config: &Config, size_after: u64) {
+/// Called by every automatic driver after a sweep that left the store at
+/// `size_after`, `held` bytes of it held by target directories: store the
+/// next backoff, or clear it once the store is back under the trigger.
+pub(crate) fn record_auto_gc_outcome(config: &Config, size_after: u64, held: u64) {
     let path = auto_gc_backoff_path(&config.cache_dir);
     let next = next_auto_gc_backoff(
         read_auto_gc_backoff(&config.cache_dir),
         unix_now_secs(),
         size_after,
+        held,
         config.max_size,
     );
     let Some(next) = next else {
         let _ = std::fs::remove_file(&path);
         return;
     };
-    tracing::info!(
-        "auto-gc: store still at {} after the sweep (max {}); next automatic sweep in {}s at the earliest",
-        size_after,
-        config.max_size,
-        next.interval_secs
-    );
+    tracing::info!("{}", auto_gc_outcome_line(&next, config.max_size));
     if let Ok(json) = serde_json::to_vec(&next)
         && let Err(e) = crate::atomic::atomic_replace(&path, &json)
     {
         tracing::debug!("auto-gc: could not write {}: {e:#}", path.display());
     }
+}
+
+/// What a recorded sweep outcome says in the log.
+fn auto_gc_outcome_line(outcome: &AutoGcBackoff, max_size: u64) -> String {
+    if outcome.interval_secs > 0 {
+        format!(
+            "auto-gc: store still at {} after the sweep, {} of it held by target directories \
+             (max {max_size}); next automatic sweep in {}s at the earliest",
+            outcome.size_after, outcome.held, outcome.interval_secs
+        )
+    } else {
+        format!(
+            "auto-gc: store at {} after the sweep, {} of it held by target directories \
+             that no sweep can free (max {max_size})",
+            outcome.size_after, outcome.held
+        )
+    }
+}
+
+/// Test hook: move the recorded sweep `secs` into the past.
+#[cfg(test)]
+pub(crate) fn age_auto_gc_record_for_test(cache_dir: &Path, secs: u64) {
+    let mut record = read_auto_gc_backoff(cache_dir).expect("a recorded sweep");
+    record.since -= secs;
+    let json = serde_json::to_vec(&record).unwrap();
+    std::fs::write(auto_gc_backoff_path(cache_dir), json).unwrap();
 }
 
 /// Test hook for the other drivers' tests: the recorded backoff interval.
@@ -8199,11 +8249,14 @@ mod tests {
                 &[],
                 "host",
                 "dev",
-                &[(src, format!("{key}.o"))],
+                &[(src.clone(), format!("{key}.o"))],
                 "",
                 "",
             )
             .unwrap();
+        // The store may have cloned it: left in place, the output would hold
+        // the entry's blocks the way a target directory does.
+        std::fs::remove_file(&src).unwrap();
     }
 
     #[test]
@@ -8310,18 +8363,69 @@ mod tests {
         store.set_last_accessed_for_test(key, "-1 hour");
     }
 
-    /// The production thrash: a store over budget whose bytes target
-    /// directories still hold. Every sweep freed nothing and the next check,
-    /// five minutes later, spawned another one, around the clock, contending
-    /// with builds for the index each time.
+    /// An entry a build is using right now: no sweep may evict it, and no
+    /// target directory holds its blocks.
+    fn put_in_use_entry(store: &Store, dir: &std::path::Path, key: &str) {
+        let src = dir.join(format!("{key}.o"));
+        std::fs::write(&src, &key.as_bytes().repeat(4096)[..4096]).unwrap();
+        store
+            .put(
+                key,
+                "test-crate",
+                &[],
+                &[],
+                "host",
+                "dev",
+                &[(src.clone(), format!("{key}.o"))],
+                "",
+                "",
+            )
+            .unwrap();
+        std::fs::remove_file(&src).unwrap();
+        store.set_last_accessed_for_test(key, "+0 seconds");
+    }
+
+    /// The production thrash: a store over budget on bytes target
+    /// directories hold. Every sweep freed nothing and the next check, five
+    /// minutes later, spawned another one around the clock, evicting
+    /// whatever else it could each time (#1206). The sweep now records what
+    /// it found held and the trigger leaves it out until the figure expires.
     #[test]
-    fn auto_gc_backs_off_while_a_sweep_leaves_the_store_over_budget() {
+    fn auto_gc_leaves_bytes_target_directories_hold_out_of_the_trigger() {
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = test_config(dir.path().to_path_buf());
         cfg.max_size = 1024;
         let store = Store::open(&cfg).unwrap();
         put_retained_entry(&store, dir.path(), "retained-1");
         put_retained_entry(&store, dir.path(), "retained-2");
+
+        crate::cli::run_auto_gc_worker(&cfg, std::time::Duration::ZERO);
+        assert!(store.contains("retained-1") && store.contains("retained-2"));
+        let record = read_auto_gc_backoff(&cfg.cache_dir).expect("held bytes recorded");
+        assert_eq!((record.held, record.size_after), (8192, 8192));
+        assert_eq!(record.interval_secs, 0, "nothing to back off from");
+
+        expire_auto_gc_stamp(&cfg);
+        assert!(!auto_gc_wanted(&cfg, &store));
+
+        // A deleted worktree frees what it held without changing the size:
+        // the figure expires, and the next check measures again.
+        age_auto_gc_record_for_test(&cfg.cache_dir, AUTO_GC_HELD_TTL.as_secs());
+        expire_auto_gc_stamp(&cfg);
+        assert!(auto_gc_wanted(&cfg, &store));
+    }
+
+    /// Bytes no sweep may evict yet, such as entries builds are using, still
+    /// back the trigger off, so a sweep that could not clear the pressure is
+    /// not re-run at every check.
+    #[test]
+    fn auto_gc_backs_off_while_a_sweep_leaves_the_store_over_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = test_config(dir.path().to_path_buf());
+        cfg.max_size = 1024;
+        let store = Store::open(&cfg).unwrap();
+        put_in_use_entry(&store, dir.path(), "retained-1");
+        put_in_use_entry(&store, dir.path(), "retained-2");
 
         crate::cli::run_auto_gc_worker(&cfg, std::time::Duration::ZERO);
         assert!(store.contains("retained-1") && store.contains("retained-2"));
@@ -8433,9 +8537,75 @@ mod tests {
         assert_eq!(AUTO_GC_CHECK_INTERVAL.as_secs(), 300);
         assert_eq!(AUTO_GC_SLACK_PERCENT, 10);
         assert_eq!(AUTO_GC_MAX_BACKOFF.as_secs(), 7200);
+        assert_eq!(AUTO_GC_HELD_TTL.as_secs(), 21_600);
         // Start above 110% of max_size, stop at 90%.
         assert_eq!(auto_gc_threshold(1000), 1100);
         assert_eq!(kache_store::eviction::eviction_target(1000), 900);
+    }
+
+    #[test]
+    fn the_outcome_line_mentions_a_wait_only_when_there_is_one() {
+        let held_only = AutoGcBackoff {
+            since: 1,
+            interval_secs: 0,
+            size_after: 5000,
+            held: 3900,
+        };
+        let line = auto_gc_outcome_line(&held_only, 1000);
+        assert!(
+            line.contains("3900 of it held") && line.contains("no sweep can free"),
+            "{line}"
+        );
+        assert!(!line.contains("next automatic sweep"), "{line}");
+        let backoff = AutoGcBackoff {
+            interval_secs: 1,
+            ..held_only
+        };
+        let line = auto_gc_outcome_line(&backoff, 1000);
+        assert!(line.contains("next automatic sweep in 1s"), "{line}");
+    }
+
+    /// max 1000, so the trigger is 1100.
+    #[test]
+    fn held_bytes_are_left_out_of_the_trigger_until_they_expire() {
+        let ttl = AUTO_GC_HELD_TTL.as_secs();
+        // Under the trigger only once the held bytes are left out: no
+        // backoff, but a record that carries them.
+        let record = next_auto_gc_backoff(None, 50, 5000, 3900, 1000).unwrap();
+        assert_eq!(
+            record,
+            AutoGcBackoff {
+                since: 50,
+                interval_secs: 0,
+                size_after: 5000,
+                held: 3900,
+            }
+        );
+        assert_eq!(
+            next_auto_gc_backoff(None, 50, 5000, 0, 1000).map(|r| r.interval_secs),
+            Some(600)
+        );
+        assert_eq!(next_auto_gc_backoff(None, 50, 1100, 0, 1000), None);
+        // Over it even so: a backoff, carrying the held bytes, doubling from
+        // the check interval after a record that had none.
+        let backoff = next_auto_gc_backoff(Some(record), 60, 5000, 3899, 1000).unwrap();
+        assert_eq!((backoff.interval_secs, backoff.held), (600, 3899));
+
+        assert_eq!(recent_held_bytes(None, 50), 0);
+        assert_eq!(recent_held_bytes(Some(record), 50 + ttl - 1), 3900);
+        assert_eq!(recent_held_bytes(Some(record), 50 + ttl), 0);
+
+        assert!(!auto_gc_due_at(Some(record), 60, 5000, 1000));
+        assert!(
+            auto_gc_due_at(Some(record), 60, 5001, 1000),
+            "new bytes past the trigger"
+        );
+        assert!(
+            auto_gc_due_at(Some(record), 50 + ttl, 5000, 1000),
+            "the figure expired"
+        );
+        assert!(auto_gc_due_at(None, 60, 1101, 1000));
+        assert!(!auto_gc_due_at(None, 60, 1100, 1000));
     }
 
     #[test]
@@ -8447,7 +8617,7 @@ mod tests {
         assert!(!auto_gc_sweep_due(&cfg, 1100));
         assert!(auto_gc_sweep_due(&cfg, 1101));
 
-        record_auto_gc_outcome(&cfg, 1101);
+        record_auto_gc_outcome(&cfg, 1101, 0);
         assert!(!auto_gc_sweep_due(&cfg, 1101), "a held backoff defers");
         assert!(!auto_gc_sweep_due(&cfg, 1201));
         assert!(auto_gc_sweep_due(&cfg, 1202), "growth past the slack");
@@ -8566,7 +8736,7 @@ mod tests {
         cfg.record_sessions = true;
         let store = Store::open(&cfg).unwrap();
         put_sized_entry(&store, dir.path(), "evictable", 4096);
-        record_auto_gc_outcome(&cfg, 4096);
+        record_auto_gc_outcome(&cfg, 4096, 0);
 
         crate::cli::run_auto_gc_worker(&cfg, std::time::Duration::ZERO);
         assert!(store.contains("evictable"));
@@ -8636,23 +8806,25 @@ mod tests {
     #[test]
     fn next_auto_gc_backoff_doubles_to_the_cap_and_clears_under_budget() {
         // max 1000: the trigger is 1100.
-        assert_eq!(next_auto_gc_backoff(None, 50, 1100, 1000), None);
-        let first = next_auto_gc_backoff(None, 50, 1101, 1000).unwrap();
+        assert_eq!(next_auto_gc_backoff(None, 50, 1100, 0, 1000), None);
+        let first = next_auto_gc_backoff(None, 50, 1101, 0, 1000).unwrap();
         assert_eq!(
             first,
             AutoGcBackoff {
                 since: 50,
                 interval_secs: 600,
                 size_after: 1101,
+                held: 0,
             }
         );
-        let second = next_auto_gc_backoff(Some(first), 90, 2000, 1000).unwrap();
+        let second = next_auto_gc_backoff(Some(first), 90, 2000, 0, 1000).unwrap();
         assert_eq!(
             second,
             AutoGcBackoff {
                 since: 90,
                 interval_secs: 1200,
                 size_after: 2000,
+                held: 0,
             }
         );
         let long = AutoGcBackoff {
@@ -8660,12 +8832,12 @@ mod tests {
             ..second
         };
         assert_eq!(
-            next_auto_gc_backoff(Some(long), 90, 2000, 1000)
+            next_auto_gc_backoff(Some(long), 90, 2000, 0, 1000)
                 .unwrap()
                 .interval_secs,
             7200
         );
-        assert_eq!(next_auto_gc_backoff(Some(second), 100, 900, 1000), None);
+        assert_eq!(next_auto_gc_backoff(Some(second), 100, 900, 0, 1000), None);
     }
 
     #[test]
@@ -8674,6 +8846,7 @@ mod tests {
             since: 1000,
             interval_secs: 600,
             size_after: 5000,
+            held: 0,
         });
         // max 1000: the slack is 100 bytes.
         assert!(!auto_gc_backoff_holds(None, 1000, 5000, 1000));
@@ -8690,21 +8863,21 @@ mod tests {
         let mut cfg = test_config(dir.path().to_path_buf());
         cfg.max_size = 1000;
         let before = unix_now_secs();
-        record_auto_gc_outcome(&cfg, 5000);
+        record_auto_gc_outcome(&cfg, 5000, 0);
         let backoff = read_auto_gc_backoff(&cfg.cache_dir).unwrap();
         assert_eq!((backoff.interval_secs, backoff.size_after), (600, 5000));
         assert!(backoff.since >= before && backoff.since <= unix_now_secs());
-        assert!(auto_gc_backing_off(&cfg, 5000));
+        assert!(!auto_gc_sweep_due(&cfg, 5000));
 
-        record_auto_gc_outcome(&cfg, 5000);
+        record_auto_gc_outcome(&cfg, 5000, 0);
         assert_eq!(
             read_auto_gc_backoff(&cfg.cache_dir).unwrap().interval_secs,
             1200
         );
 
-        record_auto_gc_outcome(&cfg, 900);
+        record_auto_gc_outcome(&cfg, 900, 0);
         assert!(!auto_gc_backoff_path(&cfg.cache_dir).exists());
-        assert!(!auto_gc_backing_off(&cfg, 5000));
+        assert!(auto_gc_sweep_due(&cfg, 5000));
     }
 
     /// #131: explain_miss names exactly the key groups whose digests changed

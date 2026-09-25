@@ -3343,6 +3343,18 @@ impl StaticLibUse {
 /// A link keeps the archive's path in its debug map unless the `-oso_prefix`
 /// kache injects (`oso_root`, from
 /// [`crate::compiler::rustc::oso_prefix_root_for_key`]) strips it.
+/// Whether `archive` is reached under the `-oso_prefix` root as spelled but
+/// resolves into a sealed hermetic build-script `OUT_DIR`. The linker names
+/// it by the spelled path, which the prefix strips, and the directory it
+/// resolves to is read-only and has the same path in every target directory
+/// that shares it, so its bytes decide the link as much as a copy under the
+/// profile directory would.
+fn hermetic_archive_under(archive: &Path, resolved: &Path, spelled_root: &Path) -> bool {
+    std::path::absolute(archive).is_ok_and(|spelled| spelled.starts_with(spelled_root))
+        && !resolved.starts_with(spelled_root)
+        && crate::build_script::in_sealed_out_dir(resolved)
+}
+
 fn linked_archive_use(args: &RustcArgs, archive: &Path, oso_root: Option<&Path>) -> StaticLibUse {
     if !args.is_executable_output() || oso_root.is_some_and(|root| archive.starts_with(root)) {
         StaticLibUse::Bundled
@@ -3941,11 +3953,18 @@ fn fold_native_link_inputs<H: KeyFold>(
         crate::native_link_key::LinkArgInputs::default()
     };
     // Compared resolved, like OUT_DIR in [`dirs_under`].
-    let oso_root =
-        crate::compiler::rustc::oso_prefix_root_for_key(args).map(|root| resolved_path(&root));
-    let archive_use = |path: &Path| match oso_root.as_deref() {
-        Some(root) => linked_archive_use(args, &resolved_path(path), Some(root)),
-        None => linked_archive_use(args, path, None),
+    let spelled_oso_root = crate::compiler::rustc::oso_prefix_root_for_key(args);
+    let oso_root = spelled_oso_root.as_deref().map(resolved_path);
+    let archive_use = |path: &Path| match (oso_root.as_deref(), spelled_oso_root.as_deref()) {
+        (Some(root), Some(spelled_root)) => {
+            let resolved = resolved_path(path);
+            if hermetic_archive_under(path, &resolved, spelled_root) {
+                linked_archive_use(args, path, Some(spelled_root))
+            } else {
+                linked_archive_use(args, &resolved, Some(root))
+            }
+        }
+        _ => linked_archive_use(args, path, None),
     };
     let hash_archive = |path: &Path| {
         let usage = archive_use(path);
@@ -13661,6 +13680,40 @@ mod tests {
 
     /// A unit that does not link bundles the archive. A link reads it by path
     /// unless the injected `-oso_prefix` root covers it.
+    #[cfg(unix)]
+    #[test]
+    fn an_archive_linked_through_a_sealed_out_dir_counts_as_under_the_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("w/target/debug");
+        let sealed = dir.path().join("cache/out-dirs/v2").join("ef".repeat(16));
+        let shared = sealed.join("debug/build/z-1/out");
+        std::fs::create_dir_all(&shared).unwrap();
+        std::fs::write(shared.join("libz.a"), b"!<arch>\n").unwrap();
+        std::fs::create_dir_all(profile.join("build/z-1")).unwrap();
+        let out = profile.join("build/z-1/out");
+        std::os::unix::fs::symlink(&shared, &out).unwrap();
+        let archive = out.join("libz.a");
+        let resolved = resolved_path(&archive);
+
+        assert!(
+            !hermetic_archive_under(&archive, &resolved, &profile),
+            "not sealed"
+        );
+        std::fs::write(sealed.join(".kache-sealed"), b"{}").unwrap();
+        assert!(hermetic_archive_under(&archive, &resolved, &profile));
+        assert!(
+            !hermetic_archive_under(&archive, &resolved, &dir.path().join("elsewhere")),
+            "spelled outside the root"
+        );
+        let plain = profile.join("deps/libq.a");
+        std::fs::create_dir_all(plain.parent().unwrap()).unwrap();
+        std::fs::write(&plain, b"!<arch>\n").unwrap();
+        assert!(
+            !hermetic_archive_under(&plain, &resolved_path(&plain), &resolved_path(&profile)),
+            "an archive that resolves under the root needs no exception"
+        );
+    }
+
     #[test]
     fn linked_archive_use_follows_output_and_oso_root() {
         let root = Path::new("/w/target/debug");

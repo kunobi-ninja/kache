@@ -55,7 +55,42 @@ Entries stay in the local store: `kache sync` never uploads them.
 - An `OUT_DIR` containing symlinks, more than 50,000 files, or over 1 GiB.
 - Windows, where no launcher is installed.
 
+## Hermetic runs
+
+Set `KACHE_BUILD_SCRIPT_HERMETIC=1` (Unix, not as root) to share runs by
+construction instead. The script runs with `OUT_DIR` in a directory named by its
+key, under `out-dirs/v2/` in the cache directory, so every target directory that
+shares the key sees the same path. Values the script derives from `OUT_DIR`
+(its length, a hash, an escaped spelling) are then the same everywhere too,
+which the regular cache cannot check for.
+
+- The key covers everything the regular key does, with every value as the
+  script sees it rather than with roots replaced, except `OUT_DIR`.
+- The script runs from a copy of its binary beside that `OUT_DIR`, with
+  `CARGO_TARGET_DIR` pointing at the same directory and without `PWD` and
+  `OLDPWD`.
+- A run is kept only when it succeeds, declares the inputs its key was computed
+  from, leaves them unchanged, writes nothing outside `OUT_DIR`, and creates no
+  symlinks. Otherwise the script runs as usual.
+- A kept run is made read-only, and Cargo's `OUT_DIR` becomes a symlink to it.
+  A hit creates that link: nothing is copied, and every worktree shares one
+  copy. `rustc-link-search` lines are replayed with Cargo's own `OUT_DIR`, so
+  `cargo run` and `cargo test` still find libraries there.
+- The first run of a script records what it declares, so hermetic runs start
+  with the second.
+
+Registry and Git dependencies live under the Cargo home, so their keys match
+across worktrees. A workspace member's manifest directory is part of its key,
+so it shares only between target directories of the same checkout.
+
+Shared directories are not collected yet, and they are read-only: make them
+writable (`chmod -R u+w`) before deleting the cache directory by hand.
+
 ## Limits
+
+Without hermetic runs, a result is restored in another target directory when
+nothing it wrote spells a machine-local root. A value the script derives from
+such a root without spelling it is restored unchanged, and can be wrong there.
 
 The key covers what Cargo compares. It does not cover state a script probes
 without declaring it: system libraries, `pkg-config` results, or tools found on

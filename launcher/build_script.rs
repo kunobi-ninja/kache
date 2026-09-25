@@ -34,11 +34,20 @@ unsafe extern "C" {
     fn execve(path: *const c_char, argv: *const *const c_char, envp: *const *const c_char)
     -> c_int;
     fn malloc(size: usize) -> *mut c_void;
+    fn readlink(path: *const c_char, buffer: *mut c_char, size: usize) -> isize;
+    fn unlink(path: *const c_char) -> c_int;
+    fn mkdir(path: *const c_char, mode: Mode) -> c_int;
     fn write(fd: c_int, buffer: *const c_void, count: usize) -> isize;
     fn _exit(status: c_int) -> !;
 }
 
+#[cfg(target_vendor = "apple")]
+type Mode = u16;
+#[cfg(not(target_vendor = "apple"))]
+type Mode = u32;
+
 const O_RDONLY: c_int = 0;
+const OUT_DIR_ENV: &[u8] = b"OUT_DIR=";
 const X_OK: c_int = 1;
 const PATH_CAPACITY: usize = 4096;
 const SHIM_PATH_ENV: &[u8] = b"KACHE_BUILD_SCRIPT_PATH=";
@@ -100,6 +109,7 @@ pub unsafe extern "C" fn main(
             execve(kache.as_ptr().cast(), arguments, environment);
         }
         let real = join(&[directory, real_name]);
+        detach_out_dir(envp);
         let arguments = replace_first(argv, argc, real.as_ptr().cast());
         execve(real.as_ptr().cast(), arguments, envp);
         fail(b"kache: build-script launcher could not exec kache or the preserved script\n")
@@ -148,6 +158,29 @@ unsafe fn read_file(path: &[u8; PATH_CAPACITY], buffer: &mut [u8]) -> usize {
         }
         close(fd);
         length
+    }
+}
+
+/// A hermetic run leaves `OUT_DIR` as a symlink to a shared, read-only
+/// directory. The script run here writes into `OUT_DIR`, so give it an empty
+/// directory of its own first, as kache does.
+unsafe fn detach_out_dir(envp: *const *const c_char) {
+    // SAFETY: `envp` is NULL-terminated and each entry is a C string.
+    unsafe {
+        let mut index = 0;
+        while !(*envp.add(index)).is_null() {
+            let entry = *envp.add(index);
+            if c_bytes(entry).starts_with(OUT_DIR_ENV) {
+                let path = entry.add(OUT_DIR_ENV.len());
+                let mut target = [0 as c_char; 8];
+                if readlink(path, target.as_mut_ptr(), target.len()) >= 0 {
+                    unlink(path);
+                    mkdir(path, 0o777);
+                }
+                return;
+            }
+            index += 1;
+        }
     }
 }
 

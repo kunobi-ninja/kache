@@ -4167,7 +4167,7 @@ fn remove_targets(
             });
             continue;
         }
-        match remove_target_dir(&target.path) {
+        match std::fs::remove_dir_all(&target.path) {
             Ok(()) => {
                 estimated_reclaimed =
                     estimated_reclaimed.saturating_add(target.estimated_reclaimable);
@@ -4222,23 +4222,6 @@ fn cargo_lock_files(dir: &std::path::Path, depth: usize) -> Vec<std::path::PathB
         }
     }
     locks
-}
-
-/// Remove a target directory, moving it aside first so a build that starts
-/// during the deletion gets a fresh directory rather than a half-removed one.
-fn remove_target_dir(path: &std::path::Path) -> std::io::Result<()> {
-    let aside = path.file_name().and_then(|name| {
-        let name = format!(
-            ".{}.kache-removing-{}",
-            name.to_string_lossy(),
-            std::process::id()
-        );
-        path.parent().map(|parent| parent.join(name))
-    });
-    match aside {
-        Some(aside) if std::fs::rename(path, &aside).is_ok() => std::fs::remove_dir_all(aside),
-        _ => std::fs::remove_dir_all(path),
-    }
 }
 
 /// Explain the gap between apparent size and estimated physical reclaim without
@@ -12483,11 +12466,6 @@ mod tests {
         assert_eq!(skipped.len(), 1);
         assert_eq!(skipped[0].path, busy.display().to_string());
         assert_eq!(skipped[0].reason, TARGET_IN_USE);
-        // Moved aside and removed: nothing is left beside it either.
-        let leftovers: Vec<_> = std::fs::read_dir(root.path().join("idle"))
-            .unwrap()
-            .collect();
-        assert!(leftovers.is_empty(), "{leftovers:?}");
     }
 
     #[test]

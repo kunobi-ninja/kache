@@ -458,6 +458,13 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(profile_from_rustc_args(&args), "release");
+        let new_layout = crate::args::RustcArgs::parse(&[
+            "rustc".to_string(),
+            "--out-dir".to_string(),
+            "/ws/target/release/build/serde/0123456789abcdef/out".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(profile_from_rustc_args(&new_layout), "release");
         let unknown = crate::args::RustcArgs::parse(&[
             "rustc".to_string(),
             "--edition".to_string(),

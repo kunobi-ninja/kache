@@ -814,6 +814,9 @@ impl RustcArgs {
     /// stable enough to infer the target dir from the args instead:
     ///
     /// - `--out-dir` is `<target>/<profile>/deps` for libs/bins → walk up 2.
+    /// - With Cargo's new build-dir layout, `--out-dir` is
+    ///   `<target>/<profile>/build/<pkg>/<hash>/out` for every unit; start
+    ///   from that `build` directory, then walk up 2 as for `deps`.
     /// - `-o` for a build script is
     ///   `<target>/<profile>/build/<pkg>/build_script_build-<hash>`; walk up
     ///   to the ancestor named `deps` or `build`, then take its grandparent.
@@ -831,7 +834,15 @@ impl RustcArgs {
     pub fn target_dir(&self) -> Option<PathBuf> {
         let is_cross = self.target.is_some();
         if let Some(od) = &self.out_dir {
-            let mut p = od.parent()?;
+            let layout_dir = od
+                .ancestors()
+                .nth(3)
+                .filter(|build| {
+                    od.file_name() == Some("out".as_ref())
+                        && build.file_name() == Some("build".as_ref())
+                })
+                .unwrap_or(od);
+            let mut p = layout_dir.parent()?;
             p = p.parent()?;
             if is_cross {
                 p = p.parent()?;
@@ -2461,6 +2472,56 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(args.target_dir(), Some(PathBuf::from("/work/proj/target")));
+    }
+
+    #[test]
+    fn test_target_dir_from_new_build_dir_layout() {
+        // Cargo's new build-dir layout: every unit's --out-dir is
+        // `<target>/<profile>/build/<pkg>/<hash>/out`.
+        let args = RustcArgs {
+            out_dir: Some(PathBuf::from(
+                "/work/proj/target/debug/build/aws-lc-rs/c83877ccb1f76231/out",
+            )),
+            ..Default::default()
+        };
+        assert_eq!(args.target_dir(), Some(PathBuf::from("/work/proj/target")));
+    }
+
+    #[test]
+    fn test_target_dir_from_new_build_dir_layout_cross_compiling() {
+        let args = RustcArgs {
+            target: Some("x86_64-unknown-linux-gnu".to_string()),
+            out_dir: Some(PathBuf::from(
+                "/work/proj/target/x86_64-unknown-linux-gnu/debug/build/aws-lc-rs/955404036238599c/out",
+            )),
+            ..Default::default()
+        };
+        assert_eq!(args.target_dir(), Some(PathBuf::from("/work/proj/target")));
+    }
+
+    #[test]
+    fn test_target_dir_new_layout_needs_both_out_and_build() {
+        // An `out` directory three levels below something other than `build`
+        // (an old-layout build-script probe's OUT_DIR) keeps the walk up 2.
+        let probe = RustcArgs {
+            out_dir: Some(PathBuf::from(
+                "/work/proj/target/debug/build/serde-abc123/out",
+            )),
+            ..Default::default()
+        };
+        assert_eq!(
+            probe.target_dir(),
+            Some(PathBuf::from("/work/proj/target/debug/build"))
+        );
+        // A `build` ancestor three levels up without a final `out` does too.
+        let not_out = RustcArgs {
+            out_dir: Some(PathBuf::from("/work/proj/build/a/b/c")),
+            ..Default::default()
+        };
+        assert_eq!(
+            not_out.target_dir(),
+            Some(PathBuf::from("/work/proj/build/a"))
+        );
     }
 
     #[test]

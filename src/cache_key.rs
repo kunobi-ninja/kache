@@ -246,6 +246,13 @@ use std::path::{Path, PathBuf};
 // passthrough. Windows GNU, cross-target, and metadata invocations remain
 // unprobed. Existing Windows linked-output keys did not contain this
 // identity, so invalidate them rather than mix schemas.
+//
+// v32: target_dir() now recognizes Cargo's new build-dir layout, where
+// `--out-dir` is `<target>/<profile>/build/<pkg>/<hash>/out`. Before, it
+// walked up two levels to `<target>/<profile>/build/<pkg>`, so `<TARGET>`
+// missed other packages' OUT_DIR paths in `-L native=` and dep-info was
+// anchored one package deep. The path remapping prefix and dep-info anchor
+// change for every new-layout unit, as they did for cross builds in v22.
 pub(crate) use kache_format::CACHE_KEY_VERSION;
 
 /// Collapse runs of ASCII whitespace into single spaces and trim
@@ -15528,6 +15535,48 @@ mod tests {
             dep_x, dep_y,
             "cargo's -L dependency= must not affect the key"
         );
+    }
+
+    /// With Cargo's new build-dir layout, a `-sys` crate's
+    /// `cargo:rustc-link-search=native=$OUT_DIR` reaches every dependent as
+    /// `<target>/<profile>/build/<pkg>/<hash>/out`. The target directory
+    /// derived from the dependent's own `--out-dir` must cover it, or the
+    /// checkout path stays in the key and the dependent misses in every other
+    /// checkout. The unit is an rlib, as such dependents usually are: a linked
+    /// output would run the native Windows MSVC link probe, which fails closed
+    /// on the made-up search directories.
+    #[test]
+    fn link_search_into_new_layout_out_dir_is_the_same_in_every_checkout() {
+        let _lock = key_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        std::fs::write(&source, b"pub fn hello() {}").unwrap();
+
+        let key_in = |checkout: &str| {
+            let target = checkout_target(checkout);
+            let out_dir = format!("{target}/debug/build/mylib/0123456789abcdef/out");
+            let native = format!("native={target}/debug/build/foo-sys/fedcba9876543210/out");
+            let argv: Vec<String> = [
+                "rustc",
+                "--crate-name",
+                "mylib",
+                &source.to_string_lossy(),
+                "--crate-type",
+                "lib",
+                "--out-dir",
+                &out_dir,
+                "-L",
+                &native,
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+            let args = RustcArgs::parse(&argv).unwrap();
+            let pn = PathNormalizer::empty().with_target_dir(args.target_dir().as_deref());
+            compute_cache_key(&args, &FileHasher::new(), &pn).unwrap()
+        };
+
+        assert_eq!(key_in("checkout-a"), key_in("checkout-b"));
     }
 
     /// Executable (`bin`) outputs key the linker identity (a different linker

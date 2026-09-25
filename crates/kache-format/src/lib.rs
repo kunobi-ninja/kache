@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 /// Cache-key recipe version written into entry metadata.
-pub const CACHE_KEY_VERSION: u32 = 31;
+pub const CACHE_KEY_VERSION: u32 = 32;
 
 /// Emit kinds represented by the current entry format.
 pub const GATED_EMIT_KINDS: [&str; 8] = [

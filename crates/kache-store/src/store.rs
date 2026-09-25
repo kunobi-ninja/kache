@@ -5660,6 +5660,32 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             .unwrap();
     }
 
+    /// Test-only: delete a file that may share a blob's blocks (a `put`
+    /// source, a stand-in target) and wait until the sweep's retainer check
+    /// no longer sees it holding them.
+    ///
+    /// A reflinked ingest shares the source's blocks. XFS frees an unlinked
+    /// inode's blocks in a background worker, so FIEMAP still reports the
+    /// blob as a clone for a moment after the unlink, and a sweep in that
+    /// window skips the entry as unreclaimable (kunobi-ninja/kache#1241).
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn remove_clone_for_test(&self, path: &Path) {
+        let blob = self.blob_path(&crate::file_hash::hash_file(path).unwrap());
+        fs::remove_file(path).unwrap();
+        for _ in 0..2000 {
+            if !crate::filesystem::blob_has_external_retainer(&blob) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!(
+            "{} still shares blocks 10s after {} was removed",
+            blob.display(),
+            path.display()
+        );
+    }
+
     /// Clear the entire store.
     ///
     /// Index rows drop first, in one transaction: once it commits no
@@ -8843,7 +8869,7 @@ mod tests {
                 "",
             )
             .unwrap();
-        let _ = std::fs::remove_file(&output_file);
+        store.remove_clone_for_test(&output_file);
 
         let recent = store.evict().unwrap();
         assert_eq!(recent.entries_recent_prefiltered, 1);
@@ -8887,7 +8913,7 @@ mod tests {
                 "",
             )
             .unwrap();
-        let _ = std::fs::remove_file(&output_file);
+        store.remove_clone_for_test(&output_file);
         store
             .db
             .execute(
@@ -9050,7 +9076,7 @@ mod tests {
                 "",
             )
             .unwrap();
-        let _ = std::fs::remove_file(&output_file);
+        store.remove_clone_for_test(&output_file);
 
         let meta = store.get("kept").unwrap().unwrap();
         let blob = store.blob_path(&meta.files[0].hash);
@@ -9118,7 +9144,7 @@ mod tests {
                 "",
             )
             .unwrap();
-        let _ = std::fs::remove_file(&output_file);
+        store.remove_clone_for_test(&output_file);
 
         let meta = store.get("kept-reflink").unwrap().unwrap();
         let blob = store.blob_path(&meta.files[0].hash);
@@ -9143,7 +9169,7 @@ mod tests {
         assert!(stats.entries_unreclaimable > 0);
         assert!(store.contains("kept-reflink"));
 
-        std::fs::remove_file(&retainer).unwrap();
+        store.remove_clone_for_test(&retainer);
         let stats = store.evict().unwrap();
         assert!(stats.entries_evicted > 0);
         assert!(!store.contains("kept-reflink"));
@@ -9197,8 +9223,8 @@ mod tests {
                 "",
             )
             .unwrap();
-        fs::remove_file(&pending_output).unwrap();
-        fs::remove_file(&newer_output).unwrap();
+        store.remove_clone_for_test(&pending_output);
+        store.remove_clone_for_test(&newer_output);
         // Form a duplicate group while retaining distinct refcount-1 blobs.
         // Healthy identical entries have zero marginal reclaim and are
         // correctly excluded before the durable-upload pin is consulted.
@@ -9308,7 +9334,7 @@ mod tests {
                 2500,
             )
             .unwrap();
-        fs::remove_file(&out).unwrap();
+        store.remove_clone_for_test(&out);
         // Age it past the active-pin grace so it is actually evictable.
         store
             .db
@@ -9758,7 +9784,7 @@ mod tests {
                 "",
             )
             .unwrap();
-        std::fs::remove_file(&output_file).unwrap();
+        store.remove_clone_for_test(&output_file);
 
         // Fresh put → last_accessed = now → within the grace window → pinned.
         let stats = store.evict().unwrap();
@@ -9837,7 +9863,7 @@ mod tests {
                 "",
             )
             .unwrap();
-        std::fs::remove_file(&output).unwrap();
+        store.remove_clone_for_test(&output);
     }
 
     fn set_idle_past_grace(store: &Store) {
@@ -11622,7 +11648,7 @@ mod tests {
                 "",
             )
             .unwrap();
-        std::fs::remove_file(&output).unwrap();
+        store.remove_clone_for_test(&output);
 
         // Backdate the entry so eviction is deterministic (not timing-dependent)
         store
@@ -11693,7 +11719,7 @@ mod tests {
                     "",
                 )
                 .unwrap();
-            std::fs::remove_file(&output).unwrap();
+            store.remove_clone_for_test(&output);
         }
 
         let prior_schema = kache_format::CACHE_KEY_VERSION.saturating_sub(1);
@@ -13896,7 +13922,7 @@ mod tests {
                     "",
                 )
                 .unwrap();
-            let _ = std::fs::remove_file(&src);
+            store.remove_clone_for_test(&src);
         }
         assert_eq!(store.total_size().unwrap(), 400, "logical double-counts");
         assert_eq!(store.physical_size().unwrap(), 200, "disk holds one copy");
@@ -13945,7 +13971,7 @@ mod tests {
                     "",
                 )
                 .unwrap();
-            let _ = std::fs::remove_file(&src);
+            store.remove_clone_for_test(&src);
         }
         // …plus one entry with its own 300-byte blob.
         let src = dir.path().join("unique.rlib");
@@ -13963,7 +13989,7 @@ mod tests {
                 "",
             )
             .unwrap();
-        let _ = std::fs::remove_file(&src);
+        store.remove_clone_for_test(&src);
 
         assert_eq!(store.physical_size().unwrap(), 600 * 1024);
         store
@@ -14062,7 +14088,7 @@ mod tests {
                     "",
                 )
                 .unwrap();
-            let _ = std::fs::remove_file(&src);
+            store.remove_clone_for_test(&src);
         }
         assert_eq!(store.physical_size().unwrap(), 1140);
         store
@@ -14115,7 +14141,7 @@ mod tests {
                     compile_ms,
                 )
                 .unwrap();
-            let _ = std::fs::remove_file(&src);
+            store.remove_clone_for_test(&src);
         }
         store
             .db
@@ -14216,7 +14242,7 @@ mod tests {
                     "",
                 )
                 .unwrap();
-            let _ = std::fs::remove_file(&src);
+            store.remove_clone_for_test(&src);
         }
         store
             .db
@@ -16567,7 +16593,7 @@ mod tests {
                     "",
                 )
                 .unwrap();
-            std::fs::remove_file(&old_file).unwrap();
+            store.remove_clone_for_test(&old_file);
             store
                 .db
                 .execute(
@@ -16597,7 +16623,7 @@ mod tests {
                     "",
                 )
                 .unwrap();
-            std::fs::remove_file(&new_file).unwrap();
+            store.remove_clone_for_test(&new_file);
             store
                 .db
                 .execute(
@@ -17205,7 +17231,7 @@ mod tests {
                     "",
                 )
                 .unwrap();
-            let _ = std::fs::remove_file(&src);
+            store.remove_clone_for_test(&src);
         }
         store
             .db
@@ -17351,7 +17377,7 @@ mod tests {
                 "",
             )
             .unwrap();
-        let _ = std::fs::remove_file(&output);
+        store.remove_clone_for_test(&output);
         // Read before aging the entry: a get counts as a use.
         let meta = store.get(key).unwrap().unwrap();
         store
@@ -17428,7 +17454,7 @@ mod tests {
                     "",
                 )
                 .unwrap();
-            std::fs::remove_file(&output).unwrap();
+            store.remove_clone_for_test(&output);
         }
         let meta = store.get("first").unwrap().unwrap();
         std::fs::hard_link(

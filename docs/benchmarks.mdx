@@ -84,9 +84,10 @@ Only Kache head versus base decides the PR verdict. Increased misses or
 passthroughs fail independently of elapsed time. A timing regression needs at
 least five paired samples, a paired-median bootstrap 95% interval entirely
 above +5%, and a median increase above 250 ms. A corresponding reduction is
-reported as an improvement. Other timing results are **inconclusive**, including
-the single-sample default run. The short suite applies these rules to both warm
-phases; its two cold samples are reported without a timing verdict.
+reported as an improvement. Other timing results are **inconclusive**. Every PR
+runs head and base six times, so both warm phases get a timing verdict; the two
+cold samples are reported without one. sccache and mbx run once, since they
+never decide the verdict. The bench label runs every tool six times.
 
 Intervals describe these samples on this runner. Shared-host load and samples
 reusing a cold seed can remain correlated. Confirm a candidate improvement in
@@ -198,7 +199,7 @@ Contention appears as its own report section and as `bench-hk-contention` or
 results under `contention/` and includes the statistics in `summary.json`.
 Missing backend reports or failed builds invalidate the suite.
 
-Normal PRs use one cold/warm pair per arm. Expanded PRs and nightly use two
+Normal PRs run one contention batch per arm. Expanded PRs and nightly use two
 cold seeds and six warm batches, matching the isolated-build sample counts.
 Every warm batch restores its cold snapshot and clears all targets. A new
 cold seed is measured every third sample, and arm order alternates.

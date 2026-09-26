@@ -17,12 +17,18 @@ use tempfile::TempDir;
 // so the bootstrap helpers in `common` stay unused here.
 #[allow(dead_code)]
 mod common;
-use common::hermetic_command;
+use common::{hermetic_command, stop_daemon};
 
 /// Path to the binary under test. Cargo sets `CARGO_BIN_EXE_kache` to the
 /// artifact it built for this integration test — under `cargo llvm-cov` that
 /// is the instrumented binary, so spawning it counts toward coverage.
 const KACHE_BIN: &str = env!("CARGO_BIN_EXE_kache");
+
+/// Idle timeout for every daemon these tests start. A backstop, not the
+/// cleanup: `Env`'s `Drop` stops the daemon, so it stays warm for the whole
+/// test. This only bounds a daemon whose stop never ran (a hard abort), since
+/// the idle timeout is off by default (#662).
+const DAEMON_IDLE_BACKSTOP_SECS: &str = "60";
 
 /// A `kache` invocation wired to a throwaway environment: its own cache dir,
 /// config path, and HOME/CARGO_HOME so nothing touches the developer's real
@@ -45,10 +51,7 @@ fn kache_process_as(program: &Path, home: &Path, cache_dir: &Path) -> std::proce
         .env("SHELL", "/bin/bash")
         .env_remove("ZDOTDIR")
         .env("XDG_CONFIG_HOME", home.join(".config"))
-        // Daemons spawned during tests must self-exit quickly instead of
-        // lingering indefinitely — otherwise, under `just coverage`,
-        // they pile up and CPU-starve the rest of the suite.
-        .env("KACHE_DAEMON_IDLE_TIMEOUT", "3");
+        .env("KACHE_DAEMON_IDLE_TIMEOUT", DAEMON_IDLE_BACKSTOP_SECS);
     cmd
 }
 
@@ -70,6 +73,17 @@ fn env() -> Env {
     }
 }
 
+impl Drop for Env {
+    /// Stop the daemon this test started, if any, before its dirs go away.
+    fn drop(&mut self) {
+        stop_daemon(
+            kache_process_as(Path::new(KACHE_BIN), &self.home, &self.cache)
+                .args(["daemon", "stop"]),
+            &self.cache,
+        );
+    }
+}
+
 impl Env {
     fn cmd(&self) -> Command {
         kache(&self.home, &self.cache)
@@ -88,9 +102,7 @@ impl Env {
         .env("RUSTC_WRAPPER", KACHE_BIN)
         .env("KACHE_LOG", "off")
         .env("HOME", &self.home)
-        // Short idle timeout so the build-spawned daemon doesn't linger and
-        // pile up across tests (see kache() for rationale).
-        .env("KACHE_DAEMON_IDLE_TIMEOUT", "3")
+        .env("KACHE_DAEMON_IDLE_TIMEOUT", DAEMON_IDLE_BACKSTOP_SECS)
         .env("CARGO_TARGET_DIR", target_dir)
         .env("CARGO_INCREMENTAL", "0")
         .output()
@@ -463,7 +475,6 @@ fn stats_announces_auto_start_and_warns_on_daemon_config_mismatch() {
     // liveness-dependent semantics flip from #689, made visible). The daemon
     // it starts inherits THIS invocation's environment: 1 GiB cap.
     e.cmd()
-        .env("KACHE_DAEMON_IDLE_TIMEOUT", "30")
         .arg("stats")
         .assert()
         .success()
@@ -479,7 +490,6 @@ fn stats_announces_auto_start_and_warns_on_daemon_config_mismatch() {
     let other = e.cache.join("other-config.toml");
     std::fs::write(&other, "[cache]\nlocal_max_size = \"2GiB\"\n").unwrap();
     e.cmd()
-        .env("KACHE_DAEMON_IDLE_TIMEOUT", "30")
         .env("KACHE_CONFIG", &other)
         .arg("stats")
         .assert()
@@ -501,7 +511,6 @@ fn stats_announces_auto_start_and_warns_on_daemon_config_mismatch() {
     let unusable_store = e.cache.join("not-a-directory");
     std::fs::write(&unusable_store, b"file, not a cache directory").unwrap();
     e.cmd()
-        .env("KACHE_DAEMON_IDLE_TIMEOUT", "30")
         .env("KACHE_CONFIG", &other)
         .env("KACHE_CACHE_DIR", &unusable_store)
         .env("KACHE_SOCKET_PATH", e.cache.join("daemon.sock"))
@@ -522,13 +531,8 @@ fn stats_announces_auto_start_and_warns_on_daemon_config_mismatch() {
 #[test]
 fn stats_warns_when_daemon_prefetch_policy_differs() {
     let e = env();
+    e.cmd().arg("stats").assert().success();
     e.cmd()
-        .env("KACHE_DAEMON_IDLE_TIMEOUT", "30")
-        .arg("stats")
-        .assert()
-        .success();
-    e.cmd()
-        .env("KACHE_DAEMON_IDLE_TIMEOUT", "30")
         .env("KACHE_PREFETCH_ENABLED", "0")
         .arg("stats")
         .assert()
@@ -1137,9 +1141,9 @@ fn doctor_reports_configured_remote() {
 
 #[test]
 fn doctor_reports_reachable_daemon_version() {
-    // Build through the wrapper with a longer daemon idle timeout so the spawned
-    // daemon is still alive when doctor queries it — hitting the daemon-version
-    // "reachable + matching" check branch (vs the not-reachable branch).
+    // The daemon the wrapper build spawns is still alive when doctor queries
+    // it, hitting the daemon-version "reachable + matching" check branch (vs
+    // the not-reachable branch).
     let e = env();
     let project = scaffold_lib("kachedoc", "pub fn d() -> u8 { 1 }\n");
     let target_dir = project.path().join("target");
@@ -1149,7 +1153,7 @@ fn doctor_reports_reachable_daemon_version() {
         .env("RUSTC_WRAPPER", KACHE_BIN)
         .env("KACHE_LOG", "off")
         .env("HOME", &e.home)
-        .env("KACHE_DAEMON_IDLE_TIMEOUT", "30") // keep the daemon alive for doctor
+        .env("KACHE_DAEMON_IDLE_TIMEOUT", DAEMON_IDLE_BACKSTOP_SECS)
         .env("CARGO_TARGET_DIR", &target_dir)
         .env("CARGO_INCREMENTAL", "0")
         .output()
@@ -1162,8 +1166,7 @@ fn doctor_reports_reachable_daemon_version() {
         .assert()
         .success()
         .stdout(predicates::str::contains("Daemon version"));
-    // (The daemon self-exits via its idle timeout; no explicit stop — `daemon
-    // stop` races the idle exit and would flakily error on a missing socket.)
+    // `Env`'s `Drop` stops the daemon.
 }
 
 #[test]
@@ -1407,7 +1410,6 @@ fn init_upgrade_keeps_the_service_manager_in_charge() {
         .env("KACHE_TEST_BIN", KACHE_BIN)
         .env("KACHE_TEST_SERVICE_PID", &marker)
         .env("KACHE_TEST_SERVICE_ARGS", e.home.join("service.args"))
-        .env("KACHE_DAEMON_IDLE_TIMEOUT", "60")
         .timeout(std::time::Duration::from_secs(30))
         .output()
         .unwrap();
@@ -1440,26 +1442,13 @@ fn init_upgrade_keeps_the_service_manager_in_charge() {
 fn daemon_restart_preserves_another_cache_daemon() {
     let a = env();
     let b = env();
-    b.cmd()
-        .args(["daemon", "start"])
-        .env("KACHE_DAEMON_IDLE_TIMEOUT", "60")
-        .assert()
-        .success();
+    b.cmd().args(["daemon", "start"]).assert().success();
     let before = std::fs::read(b.cache.join("daemon.state.json")).unwrap();
     let before: serde_json::Value = serde_json::from_slice(&before).unwrap();
-    a.cmd()
-        .args(["daemon", "start"])
-        .env("KACHE_DAEMON_IDLE_TIMEOUT", "60")
-        .assert()
-        .success();
+    a.cmd().args(["daemon", "start"]).assert().success();
     let own_before: serde_json::Value =
         serde_json::from_slice(&std::fs::read(a.cache.join("daemon.state.json")).unwrap()).unwrap();
-    let restart = a
-        .cmd()
-        .args(["daemon", "restart"])
-        .env("KACHE_DAEMON_IDLE_TIMEOUT", "60")
-        .output()
-        .unwrap();
+    let restart = a.cmd().args(["daemon", "restart"]).output().unwrap();
     let other = b
         .cmd()
         .args(["daemon", "status", "--json"])
@@ -1484,6 +1473,37 @@ fn daemon_restart_preserves_another_cache_daemon() {
         own_before["pid"], own_after["pid"],
         "explicit restart must replace a compatible owner"
     );
+}
+
+/// `Env`'s `Drop` is what stops the daemons these tests start (#704). It has
+/// to run when a test fails too, or every failing test would leave one behind.
+#[test]
+fn a_failing_test_still_stops_its_daemon() {
+    let (lock_tx, lock_rx) = std::sync::mpsc::channel();
+    let failed = std::thread::spawn(move || {
+        let e = env();
+        e.cmd().args(["daemon", "start"]).assert().success();
+        let run_lock = std::fs::OpenOptions::new()
+            .write(true)
+            .open(e.cache.join("daemon.run.lock"))
+            .expect("opening the live daemon's lifetime lock");
+        assert!(
+            matches!(run_lock.try_lock(), Err(std::fs::TryLockError::WouldBlock)),
+            "the running daemon must hold its lifetime lock"
+        );
+        lock_tx.send(run_lock).unwrap();
+        panic!("simulated test failure while the daemon runs");
+    })
+    .join();
+    assert!(failed.is_err(), "the fixture thread must have panicked");
+
+    let run_lock = lock_rx
+        .recv()
+        .expect("the daemon never started; see the fixture's panic above");
+    run_lock
+        .try_lock()
+        .expect("Env's Drop must stop the daemon while the test unwinds");
+    run_lock.unlock().unwrap();
 }
 
 /// PATH with a fake `systemctl` running `script` and a no-op `loginctl`
@@ -2685,7 +2705,7 @@ fn workspace_wrapper_via_cargo_build_env_and_path() {
         .env_remove("RUSTC_WORKSPACE_WRAPPER")
         .env("KACHE_LOG", "off")
         .env("HOME", &e.home)
-        .env("KACHE_DAEMON_IDLE_TIMEOUT", "3")
+        .env("KACHE_DAEMON_IDLE_TIMEOUT", DAEMON_IDLE_BACKSTOP_SECS)
         .env("CARGO_TARGET_DIR", &target_dir)
         .env("CARGO_INCREMENTAL", "0")
         .output()
@@ -2735,7 +2755,7 @@ fn workspace_wrapper_via_cargo_config_and_path() {
         .env_remove("CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER")
         .env("KACHE_LOG", "off")
         .env("HOME", &e.home)
-        .env("KACHE_DAEMON_IDLE_TIMEOUT", "3")
+        .env("KACHE_DAEMON_IDLE_TIMEOUT", DAEMON_IDLE_BACKSTOP_SECS)
         .env("CARGO_TARGET_DIR", &target_dir)
         .env("CARGO_INCREMENTAL", "0")
         .output()

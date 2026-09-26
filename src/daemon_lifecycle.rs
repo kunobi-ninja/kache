@@ -7,7 +7,7 @@ use kunobi_daemon::{
 
 pub(super) fn ensure(config: &Config, force: bool) -> Result<bool> {
     // Fail before starting a daemon that could never bind its sockets. The
-    // control endpoint's name is the longer of the two.
+    // control endpoint's path is derived from the socket's, so check both.
     for socket in [
         config.socket_path(),
         super::lifecycle_control::endpoint(config),

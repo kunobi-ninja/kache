@@ -824,7 +824,7 @@ fn probe_events_split_out_of_passthroughs() {
     assert!(summary.contains("1 passthrough"), "got: {summary}");
 }
 
-const REPORT_SCHEMA_JSON: &str = include_str!("../report.schema.json");
+const REPORT_SCHEMA_JSON: &str = include_str!("../../docs/commands/report.schema.json");
 
 fn check_numeric_bounds(val: &serde_json::Value, schema: &serde_json::Value, path: &str) {
     if let Some(num) = val.as_f64() {

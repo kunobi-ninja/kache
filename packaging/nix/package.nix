@@ -19,6 +19,8 @@ rustPlatform.buildRustPackage {
       ../../assets
       ../../build.rs
       ../../crates
+      # The report schema the unit tests validate reports against.
+      ../../docs/commands/report.schema.json
       ../../launcher
       ../../src
       ../../tests/fixtures

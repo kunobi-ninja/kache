@@ -4,7 +4,6 @@
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 mod common;
@@ -245,69 +244,6 @@ fn copy_tree(source: &Path, destination: &Path) {
         } else {
             std::fs::copy(entry.path(), target).unwrap();
         }
-    }
-}
-
-fn run_daemon_command(cache_dir: &Path, subcommand: &str) -> Output {
-    let stdout_path = cache_dir.join(format!("daemon-{subcommand}.stdout"));
-    let stderr_path = cache_dir.join(format!("daemon-{subcommand}.stderr"));
-    let stdout = std::fs::File::create(&stdout_path).unwrap();
-    let stderr = std::fs::File::create(&stderr_path).unwrap();
-    let mut child = hermetic_command(
-        kache_binary(),
-        cache_dir,
-        Some(&isolated_config_path(cache_dir)),
-    )
-    .args(["daemon", subcommand])
-    .env("KACHE_LOCAL_HIT_DAEMON", "1")
-    .env("KACHE_DAEMON_IDLE_TIMEOUT", "60")
-    .env("KACHE_LOG", "off")
-    .env_remove("RUSTC_WORKSPACE_WRAPPER")
-    .stdin(std::process::Stdio::null())
-    .stdout(stdout)
-    .stderr(stderr)
-    .spawn()
-    .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(60);
-    let status = loop {
-        if let Some(status) = child.try_wait().unwrap() {
-            break status;
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            panic!("kache daemon {subcommand} timed out");
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    };
-    Output {
-        status,
-        stdout: std::fs::read(stdout_path).unwrap_or_default(),
-        stderr: std::fs::read(stderr_path).unwrap_or_default(),
-    }
-}
-
-struct DaemonGuard {
-    cache_dir: PathBuf,
-}
-
-impl DaemonGuard {
-    fn start(cache_dir: &Path) -> Self {
-        let output = run_daemon_command(cache_dir, "start");
-        assert!(
-            output.status.success(),
-            "daemon start failed:\n{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        Self {
-            cache_dir: cache_dir.to_path_buf(),
-        }
-    }
-}
-
-impl Drop for DaemonGuard {
-    fn drop(&mut self) {
-        let _ = run_daemon_command(&self.cache_dir, "stop");
     }
 }
 
@@ -839,95 +775,6 @@ edition = "2021"
         "declared input edit after a local hit must invoke Kache"
     );
     assert_eq!(run_fixture(restored_target.path()), "v4");
-
-    // The daemon-local lane reads metadata from cache A without opening cache
-    // B's SQLite. Copy only blobs so a successful fresh-target restore proves
-    // `BlobSource::StoreDir` completed the consumer dep-info.
-    let _daemon = DaemonGuard::start(cache_dir.path());
-    let daemon_socket = cache_dir.path().join("daemon.sock");
-    let daemon_socket_text = daemon_socket.to_string_lossy().into_owned();
-    let daemon_env = [
-        ("KACHE_LOCAL_HIT_DAEMON", "1"),
-        ("KACHE_SOCKET_PATH", daemon_socket_text.as_str()),
-        ("KACHE_LOCAL_HIT_TIMEOUT_MS", "1000"),
-    ];
-    // The daemon deliberately sheds lookup work after 50ms. A saturated CI
-    // runner may therefore take the sound local fallback even though the
-    // donor entry is present. Retry with a fresh consumer cache/target so the
-    // test still proves an actual daemon restore without weakening that
-    // production latency bound.
-    let mut fallback_results = Vec::new();
-    let (daemon_cache, daemon_target) = (0..8)
-        .find_map(|_| {
-            let daemon_cache = TempDir::new().unwrap();
-            copy_tree(
-                &cache_dir.path().join("store/blobs"),
-                &daemon_cache.path().join("store/blobs"),
-            );
-            let daemon_target = TempDir::new().unwrap();
-            let daemon_hit = cargo_build_with_env(
-                relocated_project.path(),
-                daemon_target.path(),
-                daemon_cache.path(),
-                &relocated_input,
-                &input_reader,
-                &daemon_env,
-            );
-            assert_build_succeeded(&daemon_hit);
-            assert_eq!(run_fixture(daemon_target.path()), "v4");
-            let result = last_fixture_event_result(daemon_cache.path());
-            if result.as_deref() == Some("local_hit")
-                && !daemon_cache.path().join("index.db").exists()
-            {
-                Some((daemon_cache, daemon_target))
-            } else {
-                fallback_results.push((
-                    result,
-                    String::from_utf8_lossy(&daemon_hit.stderr).into_owned(),
-                    std::fs::read_to_string(daemon_cache.path().join("events.jsonl"))
-                        .unwrap_or_default(),
-                ));
-                None
-            }
-        })
-        .unwrap_or_else(|| {
-            panic!(
-                "donor daemon never produced a local hit from 8 fresh consumers: {fallback_results:?}"
-            )
-        });
-    let daemon_events = fixture_event_count(daemon_cache.path());
-
-    let daemon_fresh = cargo_build_with_env(
-        relocated_project.path(),
-        daemon_target.path(),
-        daemon_cache.path(),
-        &relocated_input,
-        &input_reader,
-        &daemon_env,
-    );
-    assert_build_succeeded(&daemon_fresh);
-    assert_eq!(
-        fixture_event_count(daemon_cache.path()),
-        daemon_events,
-        "unchanged daemon-restored target must remain Cargo-fresh"
-    );
-
-    std::fs::write(&relocated_input, "daemon-v5").unwrap();
-    let daemon_miss = cargo_build_with_env(
-        relocated_project.path(),
-        daemon_target.path(),
-        daemon_cache.path(),
-        &relocated_input,
-        &input_reader,
-        &daemon_env,
-    );
-    assert_build_succeeded(&daemon_miss);
-    assert!(fixture_event_count(daemon_cache.path()) > daemon_events);
-    assert_eq!(run_fixture(daemon_target.path()), "daemon-v5");
-    assert!(
-        daemon_cache.path().join("index.db").exists(),
-        "new key must miss the donor daemon and compile through the consumer store"
-    );
 
     exercise_uncached_lane(
         relocated_project.path(),

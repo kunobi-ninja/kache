@@ -1858,6 +1858,8 @@ mod tests {
         .unwrap();
         let cache = expected["cache"].as_table_mut().unwrap();
         cache.extend(updates);
+        // A save writes the settings kache knows, so a removed key goes.
+        cache.remove("local_hit_daemon");
         let remote = cache["remote"].as_table_mut().unwrap();
         remote.insert("type".into(), "s3".into());
         remote.insert("bucket".into(), "new-bucket".into());
@@ -1900,6 +1902,8 @@ mod tests {
             "fallback",
             "key_salt",
             "remote",
+            // Removed setting: a save drops it.
+            "local_hit_daemon",
         ] {
             assert!(cache.remove(key).is_some(), "fixture must set {key}");
         }
@@ -1932,7 +1936,6 @@ mod tests {
                 modified_input_guard: None,
                 input_predictions: None,
                 record_sessions: None,
-                local_hit_daemon: None,
                 windows_hardlink: None,
                 shared_hardlink_restores: None,
                 deferred_discovery: None,

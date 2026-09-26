@@ -777,88 +777,10 @@ pub fn blob_path_in_store_dir(store_dir: &Path, hash: &str) -> PathBuf {
     store_dir.join("blobs").join(prefix).join(hash)
 }
 
-/// Outcome of a read-only local-hit probe (kunobi-ninja/kache#565).
-///
-/// `Fallback` covers every state the probe cannot serve without writing:
-/// legacy layout needing migration, missing/short blobs (evict-and-miss),
-/// unreadable meta, verify-restores mode, index read errors. The wrapper's
-/// fully local path owns repair and eviction for all of those, so the daemon
-/// answers "run the local path yourself" instead of mutating the store from a
-/// read-only connection.
-#[derive(Debug)]
-pub enum ProbeOutcome {
-    /// Committed, blob-complete entry: safe to restore from this meta.
-    Hit(Box<EntryMeta>),
-    /// No committed entry for this key (authoritative miss).
-    Miss,
-    /// Not servable read-only; the wrapper must run today's local path.
-    Fallback(&'static str),
-}
-
-/// Read-only equivalent of the lookup half of [`ArtifactStore::get`]: same
-/// committed-row check, `meta.json` parse, legacy-layout detection, and
-/// blob existence/size validation — but with every write side effect
-/// (lazy migration, evict-and-miss, hit accounting) replaced by
-/// [`ProbeOutcome::Fallback`]. Runs on a read-only connection so parallel
-/// probes never contend on the daemon's store mutex (#565).
-pub fn probe_entry_readonly(db: &Connection, store_dir: &Path, cache_key: &str) -> ProbeOutcome {
-    let committed = db.query_row(
-        "SELECT committed, durable FROM entries WHERE cache_key = ?1",
-        params![cache_key],
-        |row| Ok((row.get::<_, bool>(0)?, row.get::<_, bool>(1)?)),
-    );
-    match committed {
-        Ok((true, true)) => {}
-        // Stored without an fsync and not flushed yet: the writing path
-        // verifies the bytes before serving it.
-        Ok((true, false)) => return ProbeOutcome::Fallback("entry pending durability"),
-        Ok((false, _)) => return ProbeOutcome::Miss,
-        Err(SqlError::QueryReturnedNoRows) => return ProbeOutcome::Miss,
-        Err(_) => return ProbeOutcome::Fallback("index read failed"),
-    }
-
-    // Content verification (KACHE_VERIFY_RESTORES) re-hashes blobs and evicts
-    // on mismatch — a write path. Delegate to the wrapper so verify semantics
-    // stay identical whether or not the daemon path is enabled.
-    if !matches!(verify_restores_mode(), VerifyRestores::Off) {
-        return ProbeOutcome::Fallback("verify_restores enabled");
-    }
-
-    let entry_dir = store_dir.join(cache_key);
-    let meta_path = entry_dir.join("meta.json");
-    let content = match fs::read_to_string(&meta_path) {
-        Ok(content) => content,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return ProbeOutcome::Miss,
-        Err(_) => return ProbeOutcome::Fallback("meta.json unreadable"),
-    };
-    let meta: EntryMeta = match serde_json::from_str(&content) {
-        Ok(meta) => meta,
-        Err(_) => return ProbeOutcome::Fallback("meta.json unparseable"),
-    };
-
-    // Poisoned (no files) entries and legacy in-entry-dir artifacts both need
-    // store writes (evict / migrate) that `Store::get` performs lazily.
-    if meta.files.is_empty() {
-        return ProbeOutcome::Fallback("entry has no files");
-    }
-    if meta.files.iter().any(|f| entry_dir.join(&f.name).exists()) {
-        return ProbeOutcome::Fallback("legacy entry needs migration");
-    }
-
-    for cached_file in &meta.files {
-        let blob = blob_path_in_store_dir(store_dir, &cached_file.hash);
-        if validate_blob_metadata(&blob, cached_file.size).is_err() {
-            return ProbeOutcome::Fallback("blob missing or size mismatch");
-        }
-    }
-
-    ProbeOutcome::Hit(Box::new(meta))
-}
-
-/// Open the index database read-only for probe connections (#565). No schema
-/// work, no WAL/synchronous pragma churn — `query_only` hard-refuses any
-/// accidental write, and the busy timeout is half the daemon's 50 ms lookup
-/// deadline so a contended probe still answers (`Fallback`) inside budget.
+/// Open the index database read-only. No schema work, no WAL/synchronous
+/// pragma churn — `query_only` hard-refuses any accidental write, and the
+/// short busy timeout lets a caller skip a figure the index is too busy to
+/// answer instead of waiting for it.
 pub fn open_index_db_readonly(db_path: &Path) -> Result<Connection> {
     let db = Connection::open_with_flags(
         db_path,
@@ -7605,9 +7527,9 @@ mod tests {
 
     /// Deferred durability: a put leaves the entry pending, a hit on a
     /// pending entry verifies the bytes (a same-size corruption is caught and
-    /// evicted), the probe hands a pending entry back to the writing path,
-    /// the flush marks it durable, and a durable entry is served on its size
-    /// check as before. With the feature off, a put is durable at once.
+    /// evicted), the flush marks it durable, and a durable entry is served on
+    /// its size check as before. With the feature off, a put is durable at
+    /// once.
     #[test]
     fn deferred_durability_verifies_pending_hits_until_the_flush() {
         let _env_lock = crate::test_support::process_state_test_lock();
@@ -7648,11 +7570,6 @@ mod tests {
 
         put(b"artifact-bytes-one");
         assert_eq!(store.pending_durability().unwrap(), 1);
-        let ro = open_index_db_readonly(&config.index_db_path()).unwrap();
-        assert!(matches!(
-            probe_entry_readonly(&ro, &config.store_dir(), "pending_key"),
-            ProbeOutcome::Fallback("entry pending durability")
-        ));
         let meta = store
             .get("pending_key")
             .unwrap()
@@ -7675,10 +7592,6 @@ mod tests {
             "nothing left to flush"
         );
         assert!(!store.flush_entry_durability("pending_key").unwrap());
-        assert!(matches!(
-            probe_entry_readonly(&ro, &config.store_dir(), "pending_key"),
-            ProbeOutcome::Hit(_)
-        ));
         let meta = store.get("pending_key").unwrap().unwrap();
         corrupt_same_size(&store.blob_path(&meta.files[0].hash));
         assert!(
@@ -7723,12 +7636,10 @@ mod tests {
         assert!(strict.try_durability_flush_lock().unwrap().is_some());
     }
 
-    /// The read-only probe (#565) must mirror `Store::get`'s servable/hit
-    /// decision without any write side effect: a committed, blob-complete
-    /// entry probes `Hit` and leaves `hit_count` untouched; an unknown key is
-    /// an authoritative `Miss`; anything needing repair probes `Fallback`.
+    /// `Store::get` counts a hit once per stamp interval and evicts an entry
+    /// whose blob is missing or has the wrong size, whatever the damage.
     #[test]
-    fn probe_entry_readonly_hit_miss_fallback() {
+    fn get_counts_hits_and_evicts_damaged_blobs() {
         let _env_lock = crate::test_support::process_state_test_lock();
         let _verify = EnvVarGuard::remove("KACHE_VERIFY_RESTORES");
         for damage in ["missing", "short", "long", "directory"] {
@@ -7752,8 +7663,6 @@ mod tests {
                 )
                 .unwrap();
 
-            let ro = open_index_db_readonly(&config.index_db_path()).unwrap();
-            let store_dir = config.store_dir();
             let hit_count = || {
                 store
                     .db
@@ -7764,36 +7673,19 @@ mod tests {
                     )
                     .unwrap()
             };
-
-            let meta = match probe_entry_readonly(&ro, &store_dir, "probe_key") {
-                ProbeOutcome::Hit(meta) => meta,
-                other => panic!("expected hit, got {other:?}"),
-            };
-            assert_eq!(meta.cache_key, "probe_key");
-            assert_eq!(meta.stdout, "out");
-            assert_eq!(meta.stderr, "err");
-            assert_eq!(meta.files.len(), 1);
-            assert_eq!(
-                hit_count(),
-                0,
-                "the probe must leave accounting to the pin writer"
-            );
+            assert_eq!(hit_count(), 0);
 
             // A hit re-stamps an entry only once per `HIT_STAMP_INTERVAL`;
             // the put just stamped it, so age it first.
             store.set_last_accessed_for_test("probe_key", "-1 minutes");
-            let local = store.get("probe_key").unwrap().unwrap();
-            assert_eq!(local.files, meta.files);
-            assert_eq!(local.stdout, meta.stdout);
-            assert_eq!(local.stderr, meta.stderr);
+            let meta = store.get("probe_key").unwrap().unwrap();
+            assert_eq!(meta.cache_key, "probe_key");
+            assert_eq!(meta.stdout, "out");
+            assert_eq!(meta.stderr, "err");
+            assert_eq!(meta.files.len(), 1);
             assert_eq!(hit_count(), 1, "get must record the hit");
             let _ = store.get("probe_key").unwrap().unwrap();
             assert_eq!(hit_count(), 1, "a fresh stamp is not rewritten");
-
-            assert!(matches!(
-                probe_entry_readonly(&ro, &store_dir, "no_such_key"),
-                ProbeOutcome::Miss
-            ));
 
             let blob = store.blob_path(&meta.files[0].hash);
             let mut perms = fs::metadata(&blob).unwrap().permissions();
@@ -7808,29 +7700,11 @@ mod tests {
                 _ => unreachable!(),
             }
 
-            assert!(
-                matches!(
-                    probe_entry_readonly(&ro, &store_dir, "probe_key"),
-                    ProbeOutcome::Fallback("blob missing or size mismatch")
-                ),
-                "{damage}"
-            );
-            assert!(
-                store.contains("probe_key"),
-                "the probe must not evict: {damage}"
-            );
-            assert_eq!(
-                hit_count(),
-                1,
-                "a fallback must not count as a hit: {damage}"
-            );
             assert!(store.get("probe_key").unwrap().is_none(), "{damage}");
             assert!(!store.contains("probe_key"), "get must evict: {damage}");
         }
     }
 
-    /// `query_only` must make accidental writes through a probe connection a
-    /// hard error rather than a silent store mutation.
     #[test]
     fn probe_connection_refuses_writes() {
         let dir = tempfile::tempdir().unwrap();

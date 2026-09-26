@@ -347,16 +347,6 @@ pub struct Config {
     /// GC run append one line to `telemetry/gc-runs.jsonl`. Off by default. Set via `KACHE_RECORD_SESSIONS=1`/`=true` or `[cache]
     /// record_sessions`; env wins over the file.
     pub record_sessions: bool,
-    /// Experimental daemon-assisted local hits (kunobi-ninja/kache#565): when
-    /// on, a primary rustc invocation skips opening the local SQLite store and
-    /// asks the running daemon to perform the lookup, restoring from the blob
-    /// paths in the reply. Any daemon failure (not running, timeout, overload,
-    /// protocol mismatch) falls back to the fully local path — the daemon is
-    /// never a hard dependency. Off by default. Set via
-    /// `KACHE_LOCAL_HIT_DAEMON=1`/`=true` or `[cache] local_hit_daemon`; env
-    /// wins over the file. `daemon_local` documents the ordering invariant the
-    /// lookup path depends on.
-    pub local_hit_daemon: bool,
     /// Windows only: restore cache hits via HARDLINK instead of copy (#429).
     /// Off by default — and only relevant on a non-CoW volume (NTFS), where the
     /// default is an independent copy because a hardlink to a read-only store
@@ -728,8 +718,6 @@ pub(crate) struct CacheFileConfig {
     pub(crate) input_predictions: Option<bool>,
     /// Session recording. See [`Config::record_sessions`].
     pub(crate) record_sessions: Option<bool>,
-    /// Daemon-assisted local hits. See [`Config::local_hit_daemon`].
-    pub(crate) local_hit_daemon: Option<bool>,
     /// Windows hardlink restore opt-in. See [`Config::windows_hardlink`].
     pub(crate) windows_hardlink: Option<bool>,
     /// Shared-inode restore opt-in. See [`Config::shared_hardlink_restores`].
@@ -1158,7 +1146,6 @@ const IGNORE_ENV_GATED_VARS: &[&str] = &[
     "KACHE_MODIFIED_INPUT_GUARD",
     "KACHE_INPUT_PREDICTIONS",
     "KACHE_RECORD_SESSIONS",
-    "KACHE_LOCAL_HIT_DAEMON",
     "KACHE_WINDOWS_HARDLINK",
     "KACHE_SHARED_HARDLINK_RESTORES",
     "KACHE_DEFERRED_DISCOVERY",
@@ -1243,7 +1230,6 @@ const ENV_FILE_KEYS: &[(&str, &str)] = &[
     ("KACHE_MODIFIED_INPUT_GUARD", "cache.modified_input_guard"),
     ("KACHE_INPUT_PREDICTIONS", "cache.input_predictions"),
     ("KACHE_RECORD_SESSIONS", "cache.record_sessions"),
-    ("KACHE_LOCAL_HIT_DAEMON", "cache.local_hit_daemon"),
     ("KACHE_WINDOWS_HARDLINK", "cache.windows_hardlink"),
     (
         "KACHE_SHARED_HARDLINK_RESTORES",
@@ -1784,7 +1770,6 @@ impl Config {
         let modified_input_guard = Self::modified_input_guard_enabled(&file_config);
         let input_predictions = Self::input_predictions_enabled(&file_config);
         let record_sessions = Self::record_sessions_enabled(&file_config);
-        let local_hit_daemon = Self::local_hit_daemon_enabled(&file_config);
         let windows_hardlink = Self::windows_hardlink_enabled(&file_config);
         let shared_hardlink_restores = Self::shared_hardlink_restores_enabled(&file_config);
         let deferred_discovery = Self::deferred_discovery_enabled(&file_config);
@@ -1846,7 +1831,6 @@ impl Config {
             modified_input_guard,
             input_predictions,
             record_sessions,
-            local_hit_daemon,
             windows_hardlink,
             shared_hardlink_restores,
             deferred_discovery,
@@ -2265,22 +2249,6 @@ impl Config {
             .ok()
             .and_then(|c| c.cache.as_ref())
             .and_then(|c| c.record_sessions)
-            .unwrap_or(false)
-    }
-
-    /// Daemon-assisted local hits (kunobi-ninja/kache#565): env
-    /// `KACHE_LOCAL_HIT_DAEMON=1|true` wins, else `[cache] local_hit_daemon`,
-    /// else off.
-    fn local_hit_daemon_enabled(file_config: &Result<FileConfig>) -> bool {
-        let ignore_env = Self::ignore_env_enabled(file_config);
-        if let Ok(v) = env_or_ignored("KACHE_LOCAL_HIT_DAEMON", ignore_env) {
-            return v == "1" || v.eq_ignore_ascii_case("true");
-        }
-        file_config
-            .as_ref()
-            .ok()
-            .and_then(|c| c.cache.as_ref())
-            .and_then(|c| c.local_hit_daemon)
             .unwrap_or(false)
     }
 
@@ -4804,6 +4772,33 @@ remote_key_cache_refresh_secs = 900
         );
     }
 
+    /// `local_hit_daemon` was removed before 1.0 (kunobi-ninja/kache#565).
+    /// A file that still sets it, in either layer, must load with every other
+    /// setting intact rather than fail the parse.
+    #[test]
+    fn a_removed_local_hit_daemon_key_is_ignored() {
+        let _lock = config_path_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let (host, chosen) = write_host_and_chosen(
+            dir.path(),
+            "[cache]\nlocal_hit_daemon = true\nrecord_sessions = true\n",
+            Some("[cache]\nlocal_hit_daemon = true\nkey_salt = \"kept\"\n"),
+        );
+        let _host = set_host_config_for_test(&host);
+        let _chosen = set_kache_config_for_test(&chosen);
+        let _env = set_env_for_test("KACHE_RECORD_SESSIONS", None);
+
+        let file = Config::load_file_config();
+        let cache = file
+            .as_ref()
+            .expect("a removed key must not fail the parse")
+            .cache
+            .as_ref()
+            .unwrap();
+        assert_eq!(cache.key_salt.as_deref(), Some("kept"));
+        assert!(Config::record_sessions_enabled(&file), "host value");
+    }
+
     /// A remote is one description: mixing a host `path` into a project's
     /// `type = "s3"` would configure a remote neither file named.
     #[test]
@@ -5767,7 +5762,6 @@ remote_key_cache_refresh_secs = 900
                 modified_input_guard: None,
                 input_predictions: None,
                 record_sessions: None,
-                local_hit_daemon: None,
                 windows_hardlink: None,
                 shared_hardlink_restores: None,
                 deferred_discovery: None,
@@ -6299,7 +6293,6 @@ remote_key_cache_refresh_secs = 900
             input_predictions: false,
             record_sessions: false,
             volume_stores: Vec::new(),
-            local_hit_daemon: false,
             windows_hardlink: false,
             shared_hardlink_restores: false,
             deferred_discovery: true,
@@ -6367,7 +6360,6 @@ remote_key_cache_refresh_secs = 900
             input_predictions: false,
             record_sessions: false,
             volume_stores: Vec::new(),
-            local_hit_daemon: false,
             windows_hardlink: false,
             shared_hardlink_restores: false,
             deferred_discovery: true,
@@ -6431,7 +6423,6 @@ remote_key_cache_refresh_secs = 900
             input_predictions: false,
             record_sessions: false,
             volume_stores: Vec::new(),
-            local_hit_daemon: false,
             windows_hardlink: false,
             shared_hardlink_restores: false,
             deferred_discovery: true,
@@ -6514,7 +6505,6 @@ remote_key_cache_refresh_secs = 900
             input_predictions: false,
             record_sessions: false,
             volume_stores: Vec::new(),
-            local_hit_daemon: false,
             windows_hardlink: false,
             shared_hardlink_restores: false,
             deferred_discovery: true,
@@ -7182,7 +7172,6 @@ exclude = ["src/generated/**", "vendor/problem/**"]
                 modified_input_guard: None,
                 input_predictions: None,
                 record_sessions: None,
-                local_hit_daemon: None,
                 windows_hardlink: None,
                 shared_hardlink_restores: None,
                 deferred_discovery: None,

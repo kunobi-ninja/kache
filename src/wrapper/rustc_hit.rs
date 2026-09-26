@@ -1,6 +1,6 @@
 use super::{
-    BlobSource, Config, EntryMeta, EventResult, FileHashStats, HitCompletion, RustcArgs,
-    RustcCompiler, Store, clean_incremental_dir, record_input_prediction, restore_from_cache,
+    Config, EntryMeta, EventResult, FileHashStats, HitCompletion, RustcArgs, RustcCompiler, Store,
+    clean_incremental_dir, record_input_prediction, restore_from_cache,
 };
 use anyhow::Result;
 use std::time::Instant;
@@ -23,7 +23,7 @@ impl RustcHitContext<'_> {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn restore_and_finish(
         &self,
-        blobs: BlobSource<'_>,
+        store: &Store,
         meta: &EntryMeta,
         result: EventResult,
         cache_key: &str,
@@ -36,7 +36,7 @@ impl RustcHitContext<'_> {
         restore_from_cache(
             self.config,
             self.compiler,
-            &blobs,
+            store,
             self.args,
             meta,
             self.extra_inputs,

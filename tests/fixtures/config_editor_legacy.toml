@@ -6,6 +6,7 @@ local_only = false
 remote_readonly = true
 modified_input_guard = false
 input_predictions = true
+# Removed before 1.0 (#565). Loading ignores it; a save drops it.
 local_hit_daemon = true
 windows_hardlink = false
 auto_gc = false

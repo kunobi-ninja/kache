@@ -3355,19 +3355,10 @@ fn run_parsed_rustc(
             );
         }
     }
-    // Daemon-assisted local hits (kunobi-ninja/kache#565): defer the SQLite
-    // open — the daemon path only opens the store when it doesn't serve the
-    // hit. Incremental invocations keep the classic path: clean-incremental
-    // registration needs the store up front, and restoring final artifacts
-    // around live incremental state is exactly the kind of interaction an
-    // experimental fast path should stay out of.
-    let daemon_local = config.local_hit_daemon && args.is_primary && args.incremental.is_none();
     let rustc_route = volume_route_path_rustc(args);
     let mut fallback_store = None;
     let trace_store_open = crate::phase_trace::phase("store_open");
-    let store = if daemon_local {
-        None
-    } else if args.is_primary || (config.clean_incremental && args.incremental.is_some()) {
+    let store = if args.is_primary || (config.clean_incremental && args.incremental.is_some()) {
         match open_primary_and_fallback(config, &rustc_route) {
             Ok((primary, fallback)) => {
                 fallback_store = fallback;
@@ -3469,7 +3460,7 @@ fn run_parsed_rustc(
         );
     }
 
-    if !daemon_local && store.is_none() {
+    let Some(store) = store else {
         return passthrough_with_event(
             config,
             args,
@@ -3478,16 +3469,15 @@ fn run_parsed_rustc(
             start,
             "store unavailable",
         );
-    }
+    };
 
-    // Compute the cache key (store-free on the daemon fast path).
     let keyed = match compute_rustc_cache_key(
         config,
         compiler,
         args,
         workspace_root.as_deref(),
         invocation_start_ns,
-        store.as_ref(),
+        Some(&store),
         extra_inputs.and_then(crate::extra_inputs::ExtraInputsSnapshot::digest),
         extra_inputs_hash_stats,
         extra_inputs_too_new,
@@ -3651,43 +3641,6 @@ fn run_parsed_rustc(
         extra_inputs,
     };
 
-    // Daemon fast path (kunobi-ninja/kache#565): ask the running daemon
-    // before opening SQLite. A served hit returns here; every other outcome
-    // (miss, fallback, no daemon, restore failure) opens the store and runs
-    // the fully local path below with the already-computed key.
-    let mut store = store;
-    // A compile that already ran (deferred discovery) has printed rustc's
-    // diagnostics, including the artifact notifications Cargo pipelines on.
-    // Restoring a peer's entry now would replay them a second time and Cargo
-    // would see the unit finish twice; the outputs are in place, so only the
-    // store step below is left.
-    if daemon_local && precompiled.is_none() {
-        if let Some(exit) = try_daemon_local_hit(&hit_context, &cache_key, key_ms, key_hash_stats) {
-            reset_adaptive_unit(adaptive_unit.as_ref());
-            return Ok(exit);
-        }
-        match open_primary_and_fallback(config, &rustc_route) {
-            Ok((s, fallback)) => {
-                store = Some(s);
-                fallback_store = fallback;
-            }
-            Err(e) => warn_store_unavailable_once(config, &e),
-        }
-    }
-    let store = match store {
-        Some(store) => store,
-        None => {
-            return passthrough_with_event(
-                config,
-                args,
-                crate_name,
-                &event_root,
-                start,
-                "store unavailable",
-            );
-        }
-    };
-
     drop(trace_store_open);
     let trace_remember = crate::phase_trace::phase("remember_target_root");
     if args.is_primary
@@ -3764,7 +3717,7 @@ fn run_parsed_rustc(
             } else {
                 tracing::debug!("local cache hit for {} ({})", crate_name, &cache_key[..16]);
                 if let Err(e) = hit_context.restore_and_finish(
-                    BlobSource::Store(hit_store),
+                    hit_store,
                     &meta,
                     EventResult::LocalHit,
                     &cache_key,
@@ -3940,7 +3893,7 @@ fn run_parsed_rustc(
 
     if let Some(meta) = committed.filter(|_| precompiled.is_none()) {
         if let Err(e) = hit_context.restore_and_finish(
-            BlobSource::Store(&store),
+            &store,
             &meta,
             EventResult::LocalHit,
             &cache_key,
@@ -4889,7 +4842,7 @@ enum RestoredBytes {
 ///      recompile** — never a false hit. ENOENT is called out below so the
 ///      degradation reads as the benign race it is rather than corruption.
 fn materialize_cached_artifact(
-    blobs: &BlobSource<'_>,
+    store: &Store,
     cached_file: &crate::store::CachedFile,
     target_path: &Path,
     kind: ArtifactKind,
@@ -4902,7 +4855,7 @@ fn materialize_cached_artifact(
     context: &str,
     extra_inputs: Option<&crate::extra_inputs::ExtraInputsSnapshot>,
 ) -> Result<RestoredBytes> {
-    let store_path = blobs.blob_path(&cached_file.hash);
+    let store_path = store.blob_path(&cached_file.hash);
     if !store_path.exists() {
         // Blob gone before we could open it — almost always a concurrent GC /
         // purge of this entry (kunobi-ninja/kache#182). Surface it as a restore
@@ -5473,11 +5426,6 @@ fn combine_key_measurements(
     )
 }
 
-/// Compute the rustc cache key. With `store` present the hasher is backed by
-/// the persistent SQLite hash cache; without it (daemon fast path,
-/// kunobi-ninja/kache#565) a store-free hasher still batches hashing through
-/// the daemon. The key value is identical either way — the cache only changes
-/// how it's computed.
 /// How the key may learn a closure it has no record of.
 enum KeyDiscovery {
     /// Run the dep-info pre-pass, as always.
@@ -5502,6 +5450,10 @@ fn discovery_flight_dir(config: &Config, discovery: &KeyDiscovery) -> Option<Pat
         .then(|| config.cache_dir.clone())
 }
 
+/// Compute the rustc cache key. With `store` present the hasher is backed by
+/// the persistent SQLite hash cache; without it a store-free hasher still
+/// batches hashing through the daemon. The key value is identical either way:
+/// the cache only changes how it's computed.
 #[allow(clippy::too_many_arguments)]
 fn compute_rustc_cache_key(
     config: &Config,
@@ -5683,7 +5635,7 @@ fn try_rustc_remote_hit(
         NegativeReply::CheckConcurrentEntry,
     )?;
     Some(hit.restore_and_finish(
-        BlobSource::Store(store),
+        store,
         &meta,
         result,
         cache_key,
@@ -5694,119 +5646,35 @@ fn try_rustc_remote_hit(
     ))
 }
 
-/// Daemon fast path (kunobi-ninja/kache#565): returns `Some(exit_code)` only
-/// when the daemon served a hit AND the restore succeeded. Every other
-/// outcome returns `None` and the caller runs the fully local path — which
-/// owns eviction/repair for whatever the daemon or restore stumbled on.
-fn try_daemon_local_hit(
-    hit: &RustcHitContext<'_>,
-    cache_key: &str,
-    key_ms: u64,
-    key_hash_stats: FileHashStats,
-) -> Option<i32> {
-    let _trace = crate::phase_trace::phase("daemon_hit_path");
-    let lookup_start = std::time::Instant::now();
-    let target_dir = hit.args.target_dir();
-    let trace_lookup = crate::phase_trace::phase("lookup");
-    let reply = crate::daemon::send_local_lookup(
-        hit.config,
-        cache_key,
-        target_dir.as_deref(),
-        hit.args.path_normalization_root(),
-    )?;
-    drop(trace_lookup);
-    let lookup_ms = lookup_start.elapsed().as_millis() as u64;
-    if reply.outcome != "hit" {
-        return None;
-    }
-    let meta = reply.meta?;
-    if meta.files.is_empty() || meta.cache_key != cache_key {
-        return None;
-    }
-
-    if let Err(e) = hit.restore_and_finish(
-        BlobSource::StoreDir(hit.config.store_dir()),
-        &meta,
-        EventResult::LocalHit,
-        cache_key,
-        key_ms,
-        key_hash_stats,
-        lookup_ms,
-        None,
-    ) {
-        // Includes a blob evicted between the daemon's pin and our reflink —
-        // the local path below recompiles; never serve a partial hit.
-        tracing::warn!(
-            "daemon local hit restore failed for {}: {} — running local path",
-            hit.crate_name,
-            e
-        );
-        return None;
-    }
-    Some(0)
-}
-
-/// Where restore reads blobs from: an open store (classic path) or just the
-/// store directory (kunobi-ninja/kache#565 daemon path — the blob layout is
-/// shared, so no SQLite handle is needed to resolve content-addressed paths).
-enum BlobSource<'a> {
-    Store(&'a Store),
-    StoreDir(PathBuf),
-}
-
-impl BlobSource<'_> {
-    fn blob_path(&self, hash: &str) -> PathBuf {
-        match self {
-            BlobSource::Store(store) => store.blob_path(hash),
-            BlobSource::StoreDir(dir) => crate::store::blob_path_in_store_dir(dir, hash),
-        }
-    }
-
-    /// Evict a broken entry when a store handle exists. The daemon path has
-    /// none; its caller falls back to the classic path, which re-detects the
-    /// breakage via `Store::get`/restore and evicts there.
-    fn remove_entry(&self, cache_key: &str) {
-        if let BlobSource::Store(store) = self {
-            let _ = store.remove_entry(cache_key);
-        }
-    }
-
-    /// Tell the file-hash memo what these just-restored artifacts hash to
-    /// (kunobi-ninja/kache#540).
-    ///
-    /// A restored `.rlib`/`.rmeta` is a compiler input for every downstream
-    /// crate in the same build, and hashing it is how those crates' cache keys
-    /// get computed. The entry already carries a verified blake3 for each
-    /// blob, and an [`RestoredBytes::ExactBlobCopy`] restore put exactly those
-    /// bytes on disk, so the read is redundant — this is the restore-side
-    /// counterpart to the seeding `Store::put` already does for
-    /// freshly-compiled outputs. Mis-seeding cannot outlive the file: the memo
-    /// is keyed on size + mtime + ctime + inode, so any later write to the
-    /// artifact retires the row rather than serving it.
-    ///
-    /// Each pair is recorded against the fingerprint that was observed to hold
-    /// the blob's bytes, never against a fresh stat of the path. That is what
-    /// makes a late write harmless rather than dangerous: if anything
-    /// overwrote the artifact after its restore, the row simply stops matching
-    /// and the file gets hashed for real. Recording in order also means the
-    /// last write wins for a path, matching what survives on disk.
-    ///
-    /// Best-effort by construction — `record_verified_file_hash` drops files
-    /// below the memo's size floor, which the hasher would not consult anyway.
-    /// The daemon-assisted local-hit path (`local_hit_daemon`, off by default)
-    /// holds no store handle here and is not seeded; it would need the daemon
-    /// to record on its behalf.
-    fn record_known_file_hashes(&self, restored: &[(crate::cache_key::FileFingerprint, &str)]) {
-        let BlobSource::Store(store) = self else {
-            return;
-        };
-        let _trace = crate::phase_trace::phase("memo_restored");
-        let restored: Vec<_> = restored
-            .iter()
-            .map(|(fingerprint, hash)| (fingerprint.clone(), *hash))
-            .collect();
-        store.record_verified_file_hashes(&restored);
-    }
+/// Tell the file-hash memo what these just-restored artifacts hash to
+/// (kunobi-ninja/kache#540).
+///
+/// A restored `.rlib`/`.rmeta` is a compiler input for every downstream
+/// crate in the same build, and hashing it is how those crates' cache keys
+/// get computed. The entry already carries a verified blake3 for each
+/// blob, and an [`RestoredBytes::ExactBlobCopy`] restore put exactly those
+/// bytes on disk, so the read is redundant — this is the restore-side
+/// counterpart to the seeding `Store::put` already does for
+/// freshly-compiled outputs. Mis-seeding cannot outlive the file: the memo
+/// is keyed on size + mtime + ctime + inode, so any later write to the
+/// artifact retires the row rather than serving it.
+///
+/// Each pair is recorded against the fingerprint that was observed to hold
+/// the blob's bytes, never against a fresh stat of the path. That is what
+/// makes a late write harmless rather than dangerous: if anything
+/// overwrote the artifact after its restore, the row simply stops matching
+/// and the file gets hashed for real. Recording in order also means the
+/// last write wins for a path, matching what survives on disk.
+///
+/// Best-effort by construction — `record_verified_file_hash` drops files
+/// below the memo's size floor, which the hasher would not consult anyway.
+fn record_known_file_hashes(store: &Store, restored: &[(crate::cache_key::FileFingerprint, &str)]) {
+    let _trace = crate::phase_trace::phase("memo_restored");
+    let restored: Vec<_> = restored
+        .iter()
+        .map(|(fingerprint, hash)| (fingerprint.clone(), *hash))
+        .collect();
+    store.record_verified_file_hashes(&restored);
 }
 
 /// Replay cached compiler diagnostics to the given sinks, exactly as a fresh
@@ -6025,7 +5893,7 @@ fn rewrite_emit_value(value: &str, staging: &Path) -> String {
 fn restore_from_cache(
     config: &Config,
     compiler: &RustcCompiler,
-    blobs: &BlobSource<'_>,
+    store: &Store,
     args: &RustcArgs,
     meta: &crate::store::EntryMeta,
     extra_inputs: Option<&crate::extra_inputs::ExtraInputsSnapshot>,
@@ -6045,7 +5913,7 @@ fn restore_from_cache(
     // recompiles a complete entry. Entries with no recorded `emit_kinds`
     // (pre-gate `meta.json`) skip the check, so no mass invalidation.
     if !meta.covers_requested_emit(&args.emit) {
-        blobs.remove_entry(&meta.cache_key);
+        let _ = store.remove_entry(&meta.cache_key);
         anyhow::bail!(
             "cached entry for {} covers --emit {:?} but this invocation requested {:?} \
              — evicting partial entry and recompiling",
@@ -6071,7 +5939,7 @@ fn restore_from_cache(
             ) && Path::new(&file.name).file_name() == Some(expected.as_os_str())
         })
     {
-        blobs.remove_entry(&meta.cache_key);
+        let _ = store.remove_entry(&meta.cache_key);
         anyhow::bail!(
             "cached entry for {} has no dep-info artifact named {} required by active \
              extra_inputs; evicting the legacy entry and recompiling",
@@ -6134,12 +6002,12 @@ fn restore_from_cache(
         }) {
             continue;
         }
-        let blob = blobs.blob_path(&cached_file.hash);
+        let blob = store.blob_path(&cached_file.hash);
         let raw = match read_cached_dep_info_blob(&blob, extra_inputs.is_some()) {
             Ok(Some(raw)) => raw,
             Ok(None) => continue,
             Err(error) => {
-                blobs.remove_entry(&meta.cache_key);
+                let _ = store.remove_entry(&meta.cache_key);
                 return Err(error).with_context(|| {
                     format!(
                         "cached dep-info for {} is unreadable or not UTF-8; evicting the entry",
@@ -6160,7 +6028,7 @@ fn restore_from_cache(
             match snapshot.merge_dep_info_content(&expanded) {
                 Ok(completed) => completed,
                 Err(error) => {
-                    blobs.remove_entry(&meta.cache_key);
+                    let _ = store.remove_entry(&meta.cache_key);
                     return Err(error).with_context(|| {
                         format!(
                             "cached dep-info for {} cannot be completed safely; evicting the entry",
@@ -6175,14 +6043,14 @@ fn restore_from_cache(
         let dependencies = match crate::extra_inputs::parse_dep_info_dependencies(&expanded) {
             Ok(dependencies) if !dependencies.is_empty() => dependencies,
             Ok(_) => {
-                blobs.remove_entry(&meta.cache_key);
+                let _ = store.remove_entry(&meta.cache_key);
                 anyhow::bail!(
                     "cached dep-info for {} has no dependencies; evicting the entry and recompiling",
                     meta.crate_name
                 );
             }
             Err(error) => {
-                blobs.remove_entry(&meta.cache_key);
+                let _ = store.remove_entry(&meta.cache_key);
                 return Err(error).with_context(|| {
                     format!(
                         "cached dep-info for {} is malformed; evicting the entry",
@@ -6193,7 +6061,7 @@ fn restore_from_cache(
         };
         for dep in dependencies {
             if !dep.exists() {
-                blobs.remove_entry(&meta.cache_key);
+                let _ = store.remove_entry(&meta.cache_key);
                 anyhow::bail!(
                     "cached dep-info for {} references {} which does not resolve here — \
                      evicting the entry and recompiling (#330)",
@@ -6252,7 +6120,7 @@ fn restore_from_cache(
         // matching at the call site.
         let kind = compiler.classify_output(args, &cached_file.name);
         let restored = materialize_cached_artifact(
-            blobs,
+            store,
             cached_file,
             &target_path,
             kind,
@@ -6271,7 +6139,7 @@ fn restore_from_cache(
         restored_paths.push((cached_file.name.clone(), target_path));
     }
 
-    blobs.record_known_file_hashes(&exact_restores);
+    record_known_file_hashes(store, &exact_restores);
 
     maybe_verify_restored_hit(compiler, args, &restored_paths);
 
@@ -9781,15 +9649,8 @@ mod tests {
         file.size = dep_info.len() as u64;
         let meta = entry_meta("empty-dependencies", vec![file], &["dep-info"]);
 
-        let error = restore_from_cache(
-            &config,
-            &RustcCompiler::new(),
-            &BlobSource::Store(&store),
-            &args,
-            &meta,
-            None,
-        )
-        .expect_err("empty dependency rules must be evicted");
+        let error = restore_from_cache(&config, &RustcCompiler::new(), &store, &args, &meta, None)
+            .expect_err("empty dependency rules must be evicted");
         assert!(
             format!("{error:#}").contains("has no dependencies"),
             "{error:#}"
@@ -10730,7 +10591,7 @@ mod tests {
         let platform = platform::current();
 
         let err = materialize_cached_artifact(
-            &BlobSource::Store(&store),
+            &store,
             &cached,
             &target,
             ArtifactKind::Library,
@@ -10773,7 +10634,7 @@ mod tests {
         let platform = platform::current();
 
         materialize_cached_artifact(
-            &BlobSource::Store(&store),
+            &store,
             &cached,
             &target,
             ArtifactKind::DepInfo,
@@ -10842,7 +10703,7 @@ mod tests {
         let platform = platform::current();
 
         materialize_cached_artifact(
-            &BlobSource::Store(&store),
+            &store,
             &cached,
             &target,
             ArtifactKind::Other("rustc:unknown"),
@@ -10883,7 +10744,7 @@ mod tests {
         let platform = platform::current();
 
         materialize_cached_artifact(
-            &BlobSource::Store(&store),
+            &store,
             &cached,
             &target,
             ArtifactKind::Library,
@@ -11014,7 +10875,7 @@ mod tests {
         cached.executable = true;
         let target = dir.path().join("target/debug/deps/libfoo_macros-1.so");
         let restored = materialize_cached_artifact(
-            &BlobSource::Store(&store),
+            &store,
             &cached,
             &target,
             ArtifactKind::DynamicLibrary,
@@ -11073,15 +10934,7 @@ mod tests {
             let mut cached = cached_file(file, hash);
             cached.executable = true;
             let meta = entry_meta(crate_name, vec![cached], &["link"]);
-            restore_from_cache(
-                &config,
-                &RustcCompiler::new(),
-                &BlobSource::Store(&store),
-                &args,
-                &meta,
-                None,
-            )
-            .unwrap();
+            restore_from_cache(&config, &RustcCompiler::new(), &store, &args, &meta, None).unwrap();
             (blob, out_dir.join(file))
         };
 
@@ -11125,7 +10978,7 @@ mod tests {
         let platform = platform::current();
 
         let restored = materialize_cached_artifact(
-            &BlobSource::Store(&store),
+            &store,
             &cached,
             &target,
             ArtifactKind::Library,
@@ -11162,7 +11015,7 @@ mod tests {
         let platform = platform::current();
 
         let restored = materialize_cached_artifact(
-            &BlobSource::Store(&store),
+            &store,
             &cached,
             &target,
             ArtifactKind::DepInfo,
@@ -11197,7 +11050,7 @@ mod tests {
         let platform = CountingPlatform::new();
 
         let restored = materialize_cached_artifact(
-            &BlobSource::Store(&store),
+            &store,
             &cached,
             &target,
             ArtifactKind::DynamicLibrary,
@@ -11236,10 +11089,9 @@ mod tests {
         let cached = cached_file("libfoo.rlib", &hash);
         let target = dir.path().join("target").join("libfoo.rlib");
         let platform = platform::current();
-        let blobs = BlobSource::Store(&store);
 
         let RestoredBytes::ExactBlobCopy(fingerprint) = materialize_cached_artifact(
-            &blobs,
+            &store,
             &cached,
             &target,
             ArtifactKind::Library,
@@ -11261,7 +11113,7 @@ mod tests {
         std::fs::remove_file(&target).unwrap();
         std::fs::write(&target, &replacement).unwrap();
 
-        blobs.record_known_file_hashes(&[(fingerprint, hash.as_str())]);
+        record_known_file_hashes(&store, &[(fingerprint, hash.as_str())]);
 
         assert!(
             matches!(
@@ -11316,7 +11168,7 @@ mod tests {
         let target = dir.path().join("target").join("libmac.so");
 
         let restored = materialize_cached_artifact(
-            &BlobSource::Store(&store),
+            &store,
             &cached,
             &target,
             ArtifactKind::DynamicLibrary,
@@ -11352,7 +11204,7 @@ mod tests {
     ) -> RestoredBytes {
         let anchor = target.parent().unwrap();
         materialize_cached_artifact(
-            &BlobSource::Store(store),
+            store,
             &cached_file("libmac.so", hash),
             target,
             ArtifactKind::DynamicLibrary,
@@ -11588,7 +11440,7 @@ mod tests {
         let platform = platform::current();
 
         materialize_cached_artifact(
-            &BlobSource::Store(&store),
+            &store,
             &cached,
             &target,
             ArtifactKind::DebugBundle,
@@ -11682,7 +11534,7 @@ mod tests {
         let target = deps.join("hello-bin.dsym.tar");
         let platform = platform::current();
         materialize_cached_artifact(
-            &BlobSource::Store(&store),
+            &store,
             &cached,
             &target,
             ArtifactKind::DebugBundle,
@@ -13883,21 +13735,6 @@ exit 0
     }
 
     #[test]
-    fn local_daemon_fast_path_records_demand_before_reply() {
-        let _ = crate::demand::take();
-        let dir = tempfile::tempdir().unwrap();
-        let config = test_config(dir.path().join("cache"));
-        assert!(
-            crate::daemon::send_local_lookup(&config, "daemon-local-key", None, None).is_none()
-        );
-        let demands = crate::demand::take();
-        assert_eq!(demands.len(), 1);
-        assert_eq!(demands[0].cache_key, "daemon-local-key");
-        assert!(demands[0].first_demand_at_ms > 0);
-        assert_eq!(demands[0].remote_wait_ms, 0);
-    }
-
-    #[test]
     fn local_hit_demand_reaches_event_without_remote_wait() {
         let _ = crate::demand::take();
         let dir = tempfile::tempdir().unwrap();
@@ -14652,16 +14489,9 @@ exit 0
         .unwrap();
         store.insert_entry_row_for_test("poisoned-key");
 
-        let err = restore_from_cache(
-            &config,
-            &RustcCompiler::new(),
-            &BlobSource::Store(&store),
-            &args,
-            &meta,
-            None,
-        )
-        .unwrap_err()
-        .to_string();
+        let err = restore_from_cache(&config, &RustcCompiler::new(), &store, &args, &meta, None)
+            .unwrap_err()
+            .to_string();
 
         assert!(
             err.contains("does not resolve here"),
@@ -14737,7 +14567,7 @@ exit 0
         let error = restore_from_cache(
             &config,
             &RustcCompiler::new(),
-            &BlobSource::Store(&store),
+            &store,
             &args,
             &meta,
             Some(&snapshot),
@@ -14774,7 +14604,7 @@ exit 0
         let error = restore_from_cache(
             &config,
             &RustcCompiler::new(),
-            &BlobSource::Store(&store),
+            &store,
             &args,
             &legacy_meta,
             Some(&snapshot),
@@ -14809,7 +14639,7 @@ exit 0
         let error = restore_from_cache(
             &config,
             &RustcCompiler::new(),
-            &BlobSource::Store(&store),
+            &store,
             &args,
             &wrong_meta,
             Some(&snapshot),
@@ -14846,7 +14676,7 @@ exit 0
         let error = restore_from_cache(
             &config,
             &RustcCompiler::new(),
-            &BlobSource::Store(&store),
+            &store,
             &args,
             &env_meta,
             Some(&snapshot),
@@ -14996,7 +14826,7 @@ exit 0
         let error = restore_from_cache(
             &config,
             &RustcCompiler::new(),
-            &BlobSource::Store(&store),
+            &store,
             &args,
             &meta,
             initial.as_ref(),
@@ -15090,16 +14920,9 @@ exit 0
         )
         .unwrap();
 
-        let err = restore_from_cache(
-            &config,
-            &RustcCompiler::new(),
-            &BlobSource::Store(&store),
-            &args,
-            &meta,
-            None,
-        )
-        .unwrap_err()
-        .to_string();
+        let err = restore_from_cache(&config, &RustcCompiler::new(), &store, &args, &meta, None)
+            .unwrap_err()
+            .to_string();
 
         assert!(
             err.contains("evicting partial entry"),
@@ -15141,15 +14964,7 @@ exit 0
         ]);
         let meta = entry_meta("seed-key", vec![cached_file("libfoo.rlib", &hash)], &[]);
 
-        restore_from_cache(
-            &config,
-            &RustcCompiler::new(),
-            &BlobSource::Store(&store),
-            &args,
-            &meta,
-            None,
-        )
-        .unwrap();
+        restore_from_cache(&config, &RustcCompiler::new(), &store, &args, &meta, None).unwrap();
 
         let restored = out_dir.join("libfoo.rlib");
         assert_eq!(std::fs::read(&restored).unwrap(), content);
@@ -15216,15 +15031,7 @@ exit 0
         ]);
         let meta = entry_meta("depinfo-key", vec![cached_file("foo.d", &hash)], &[]);
 
-        restore_from_cache(
-            &config,
-            &RustcCompiler::new(),
-            &BlobSource::Store(&store),
-            &args,
-            &meta,
-            None,
-        )
-        .unwrap();
+        restore_from_cache(&config, &RustcCompiler::new(), &store, &args, &meta, None).unwrap();
 
         let restored = out_dir.join("foo.d");
         assert_ne!(
@@ -15264,16 +15071,9 @@ exit 0
             &[],
         );
 
-        let err = restore_from_cache(
-            &config,
-            &RustcCompiler::new(),
-            &BlobSource::Store(&store),
-            &args,
-            &meta,
-            None,
-        )
-        .unwrap_err()
-        .to_string();
+        let err = restore_from_cache(&config, &RustcCompiler::new(), &store, &args, &meta, None)
+            .unwrap_err()
+            .to_string();
 
         assert!(
             err.contains("unsafe artifact name"),
@@ -15291,16 +15091,9 @@ exit 0
         let args = rustc_args(&["rustc", "src/lib.rs", "--crate-name", "foo"]);
         let meta = entry_meta("no-output-key", Vec::new(), &[]);
 
-        let err = restore_from_cache(
-            &config,
-            &RustcCompiler::new(),
-            &BlobSource::Store(&store),
-            &args,
-            &meta,
-            None,
-        )
-        .unwrap_err()
-        .to_string();
+        let err = restore_from_cache(&config, &RustcCompiler::new(), &store, &args, &meta, None)
+            .unwrap_err()
+            .to_string();
 
         assert!(err.contains("no output path"), "unexpected error: {err}");
     }
@@ -15489,15 +15282,8 @@ exit 0
         file.size = content.len() as u64;
         let meta = entry_meta("verify-fail-open", vec![file], &["link"]);
 
-        restore_from_cache(
-            &config,
-            &RustcCompiler::new(),
-            &BlobSource::Store(&store),
-            &args,
-            &meta,
-            None,
-        )
-        .expect("qualification recompile failure must not fail the restore");
+        restore_from_cache(&config, &RustcCompiler::new(), &store, &args, &meta, None)
+            .expect("qualification recompile failure must not fail the restore");
 
         assert_eq!(std::fs::read(out_dir.join("libfoo.rlib")).unwrap(), content);
         let summary = crate::verify_compare::take_last_report();
@@ -15536,15 +15322,7 @@ exit 0
         file.size = content.len() as u64;
         let meta = entry_meta("verify-off", vec![file], &["link"]);
 
-        restore_from_cache(
-            &config,
-            &RustcCompiler::new(),
-            &BlobSource::Store(&store),
-            &args,
-            &meta,
-            None,
-        )
-        .unwrap();
+        restore_from_cache(&config, &RustcCompiler::new(), &store, &args, &meta, None).unwrap();
 
         assert_eq!(std::fs::read(out_dir.join("libfoo.rlib")).unwrap(), content);
         assert!(

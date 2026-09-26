@@ -99,7 +99,6 @@ impl Fixture {
 fn completion_child() {
     let mode = std::env::var("KACHE_TEST_RUSTC_HIT").unwrap();
     let fixture = Fixture::new();
-    let is_daemon = mode == "daemon";
     let fails = mode == "failure";
     if fails {
         std::fs::remove_file(fixture.store.blob_path(&fixture.meta.files[1].hash)).unwrap();
@@ -110,13 +109,8 @@ fn completion_child() {
         _ => EventResult::LocalHit,
     };
     crate::cache_key::stash_last_dep_info_for_test(fixture.closure());
-    let source = if is_daemon {
-        BlobSource::StoreDir(fixture.config.store_dir())
-    } else {
-        BlobSource::Store(&fixture.store)
-    };
     let restored = fixture.context().restore_and_finish(
-        source,
+        &fixture.store,
         &fixture.meta,
         result,
         CACHE_KEY,
@@ -127,7 +121,7 @@ fn completion_child() {
             bytes_hashed: 73,
         },
         29,
-        (!is_daemon).then_some(&fixture.store),
+        Some(&fixture.store),
     );
     let identity = crate::cache_key::rustc_prediction_identity(&fixture.args).unwrap();
     let prediction = fixture.store.file_hasher().input_prediction(&identity);
@@ -152,7 +146,7 @@ fn completion_child() {
         b"second"
     );
     assert!(!fixture.args.incremental.as_ref().unwrap().exists());
-    assert_eq!(prediction.is_some(), !is_daemon);
+    assert!(prediction.is_some());
     assert!(crate::cache_key::take_last_dep_info().is_none());
     let events = events::read_events(&fixture.config.event_log_path()).unwrap();
     assert_eq!(events.len(), 1);
@@ -179,7 +173,6 @@ fn completion_replays_diagnostics_and_progress_only_after_success() {
         ("local", "local hit"),
         ("remote", "remote hit"),
         ("prefetch", "prefetch hit"),
-        ("daemon", "local hit"),
         ("failure", ""),
     ] {
         let output = crate::test_support::without_terminal(&mut std::process::Command::new(
@@ -240,7 +233,7 @@ fn predictions_belong_to_the_key_store_and_are_not_rewritten_when_declined() {
     fixture
         .context()
         .restore_and_finish(
-            BlobSource::Store(&fallback),
+            &fallback,
             &fixture.meta,
             EventResult::LocalHit,
             CACHE_KEY,
@@ -269,7 +262,7 @@ fn predictions_belong_to_the_key_store_and_are_not_rewritten_when_declined() {
     fixture
         .context()
         .restore_and_finish(
-            BlobSource::Store(&fallback),
+            &fallback,
             &fixture.meta,
             EventResult::LocalHit,
             CACHE_KEY,
@@ -379,79 +372,6 @@ fn remote_misses_and_failed_restores_do_not_complete_hits() {
         if let Some(daemon) = daemon {
             assert_eq!(daemon.request_count(), usize::from(mode != "disabled"));
         }
-        assert!(!fixture.config.event_log_path().exists(), "{mode}");
-        assert!(
-            fixture.args.incremental.as_ref().unwrap().is_dir(),
-            "{mode}"
-        );
-    }
-}
-
-#[test]
-fn daemon_hits_need_no_writable_index() {
-    let _lock = crate::test_support::process_state_test_lock();
-    let _manifest = TestEnvGuard::remove("CARGO_MANIFEST_DIR");
-    let Fixture {
-        dir: _dir,
-        config,
-        store,
-        compiler,
-        args,
-        meta,
-    } = Fixture::new();
-    drop(store);
-    std::fs::remove_file(config.index_db_path()).unwrap();
-    std::fs::create_dir(config.index_db_path()).unwrap();
-    let _daemon = RemoteCheckReplyDaemon::with_reply(
-        config.socket_path(),
-        serde_json::json!({"ok": true, "local_lookup": crate::daemon::LocalLookupReply::hit(meta)}),
-    );
-    let hit = RustcHitContext {
-        config: &config,
-        compiler: &compiler,
-        args: &args,
-        crate_name: "foo",
-        event_root: "/consumer",
-        start: Instant::now(),
-        extra_inputs: None,
-    };
-    assert_eq!(
-        try_daemon_local_hit(&hit, CACHE_KEY, 0, FileHashStats::default()),
-        Some(0)
-    );
-    assert!(config.index_db_path().is_dir());
-    assert_eq!(
-        events::read_events(&config.event_log_path()).unwrap().len(),
-        1
-    );
-}
-
-#[test]
-fn daemon_declines_invalid_replies_and_failed_restores() {
-    let _lock = crate::test_support::process_state_test_lock();
-    let _manifest = TestEnvGuard::remove("CARGO_MANIFEST_DIR");
-    for mode in ["miss", "no-meta", "empty", "wrong-key", "missing-blob"] {
-        let fixture = Fixture::new();
-        let mut reply = crate::daemon::LocalLookupReply::hit(fixture.meta.clone());
-        match mode {
-            "miss" => reply.outcome = "miss".into(),
-            "no-meta" => reply.meta = None,
-            "empty" => reply.meta.as_mut().unwrap().files.clear(),
-            "wrong-key" => reply.meta.as_mut().unwrap().cache_key = "other-key".into(),
-            "missing-blob" => {
-                std::fs::remove_file(fixture.store.blob_path(&fixture.meta.files[0].hash)).unwrap()
-            }
-            _ => unreachable!(),
-        }
-        let _daemon = RemoteCheckReplyDaemon::with_reply(
-            fixture.config.socket_path(),
-            serde_json::json!({"ok": true, "local_lookup": reply}),
-        );
-        assert_eq!(
-            try_daemon_local_hit(&fixture.context(), CACHE_KEY, 0, FileHashStats::default()),
-            None,
-            "{mode}"
-        );
         assert!(!fixture.config.event_log_path().exists(), "{mode}");
         assert!(
             fixture.args.incremental.as_ref().unwrap().is_dir(),

@@ -379,6 +379,18 @@ impl Request {
                 | Request::Shutdown
         )
     }
+
+    /// The client binary's build epoch, for the requests that carry one. A
+    /// client newer than the daemon makes it schedule a restart.
+    fn client_epoch(&self) -> u64 {
+        match self {
+            Request::Upload(job) => job.client_epoch,
+            Request::Stats(req) => req.client_epoch,
+            Request::BuildStarted(req) => req.client_epoch,
+            Request::PublishCc(req) => req.client_epoch,
+            _ => 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -8251,13 +8263,7 @@ async fn handle_connection_started_at(
         let parsed = serde_json::from_str::<Request>(&line);
 
         // Extract client_epoch from fire-and-forget requests for staleness detection.
-        let client_epoch = match &parsed {
-            Ok(Request::Upload(job)) => job.client_epoch,
-            Ok(Request::Stats(req)) => req.client_epoch,
-            Ok(Request::BuildStarted(req)) => req.client_epoch,
-            Ok(Request::PublishCc(req)) => req.client_epoch,
-            _ => 0,
-        };
+        let client_epoch = parsed.as_ref().map_or(0, Request::client_epoch);
 
         if parsed.as_ref().is_ok_and(Request::is_build_activity) {
             daemon.request_clock.touch(Instant::now());
@@ -10824,6 +10830,33 @@ mod tests {
         assert!(key_cache_periodic_refresh_disabled(0));
         assert!(!key_cache_periodic_refresh_disabled(1));
         assert!(!key_cache_periodic_refresh_disabled(60));
+    }
+
+    #[test]
+    fn requests_that_carry_a_client_epoch_report_it() {
+        for line in [
+            r#"{"upload":{"key":"k","entry_dir":"d","client_epoch":7}}"#,
+            r#"{"stats":{"include_entries":false,"sort_by":null,"event_hours":null,"client_epoch":7}}"#,
+            r#"{"build_started":{"client_epoch":7}}"#,
+        ] {
+            let request: Request = serde_json::from_str(line).unwrap();
+            assert_eq!(request.client_epoch(), 7, "{line}");
+        }
+        let publish = Request::PublishCc(Box::new(crate::daemon_publish::PublishCcRequest {
+            client_epoch: 7,
+            cache_key: "k".to_string(),
+            crate_name: "a.c".to_string(),
+            target: "x86_64".to_string(),
+            files: Vec::new(),
+            stdout: String::new(),
+            stderr: String::new(),
+            compile_time_ms: 0,
+            publishes_to_remote: false,
+            event: crate::events::BuildEvent::new_for_test("a.c", crate::events::EventResult::Miss),
+            memo: None,
+        }));
+        assert_eq!(publish.client_epoch(), 7);
+        assert_eq!(Request::Health.client_epoch(), 0);
     }
 
     #[test]

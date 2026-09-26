@@ -27,6 +27,7 @@ mod incremental_policy;
 mod index_compact;
 #[cfg(unix)]
 mod init_shell;
+mod key_env;
 use kache_store::link;
 mod cache_remote;
 mod link_probe;

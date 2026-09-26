@@ -18,6 +18,7 @@ use crate::compiler::{
 use crate::config::Config;
 use crate::events::{self, BuildEvent, EventResult};
 use crate::incremental_policy::{AdaptiveUnit, Lease};
+use crate::key_env::KeyEnv;
 use crate::link;
 use crate::maintenance::unix_now_secs;
 use crate::scheduler::{self, FlightIdentity, MissGuard};
@@ -3301,7 +3302,9 @@ fn run_parsed_rustc(
     // cache unless the user trusts the backend.
     let untrusted_codegen_backend =
         untrusted_codegen_backend(args.codegen_backend_dylib(), config.trust_codegen_backends);
-    let current_dir = std::env::current_dir().ok();
+    // The environment and working directory the key reads, taken once.
+    let key_env = KeyEnv::capture();
+    let current_dir = key_env.cwd().map(Path::to_path_buf);
     let workspace_root = args.path_normalization_root().map(Path::to_path_buf);
     let exclude_roots: Vec<_> = workspace_root
         .iter()
@@ -3474,11 +3477,14 @@ fn run_parsed_rustc(
         workspace_root.as_deref(),
         invocation_start_ns,
         Some(&store),
-        extra_inputs.and_then(crate::extra_inputs::ExtraInputsSnapshot::digest),
-        extra_inputs_hash_stats,
-        extra_inputs_too_new,
-        extra_inputs_key_ms,
-        extra_inputs_guard_inputs,
+        &key_env,
+        ExtraInputsKey {
+            digest: extra_inputs.and_then(crate::extra_inputs::ExtraInputsSnapshot::digest),
+            hash_stats: extra_inputs_hash_stats,
+            too_new: extra_inputs_too_new,
+            key_ms: extra_inputs_key_ms,
+            guard_inputs: extra_inputs_guard_inputs,
+        },
         match precompiled.as_mut().and_then(|pre| pre.dep_info.take()) {
             Some(dep_info) => KeyDiscovery::Emitted(dep_info),
             None if deferral_allowed(config, args, adaptive_unit.is_some(), extra_inputs) => {
@@ -3792,6 +3798,7 @@ fn run_parsed_rustc(
             workspace_root.as_deref(),
             invocation_start_ns,
             Some(&store),
+            &key_env,
             extra_inputs.and_then(crate::extra_inputs::ExtraInputsSnapshot::digest),
         ) {
             Ok(recomputed) => {
@@ -5546,6 +5553,16 @@ fn discovery_flight_dir(config: &Config, discovery: &KeyDiscovery) -> Option<Pat
         .then(|| config.cache_dir.clone())
 }
 
+/// What resolving the invocation's extra inputs contributes to its key.
+#[derive(Default)]
+struct ExtraInputsKey<'a> {
+    digest: Option<&'a str>,
+    hash_stats: FileHashStats,
+    too_new: bool,
+    key_ms: u64,
+    guard_inputs: Vec<crate::cache_key::FileFingerprint>,
+}
+
 /// Compute the rustc cache key. With `store` present the hasher is backed by
 /// the persistent SQLite hash cache; without it a store-free hasher still
 /// batches hashing through the daemon. The key value is identical either way:
@@ -5558,13 +5575,17 @@ fn compute_rustc_cache_key(
     workspace_root: Option<&Path>,
     invocation_start_ns: i64,
     store: Option<&Store>,
-    extra_inputs_digest: Option<&str>,
-    extra_inputs_hash_stats: FileHashStats,
-    extra_inputs_too_new: bool,
-    extra_inputs_key_ms: u64,
-    mut extra_inputs_guard_inputs: Vec<crate::cache_key::FileFingerprint>,
+    key_env: &KeyEnv,
+    extra_inputs: ExtraInputsKey<'_>,
     discovery: KeyDiscovery,
 ) -> Result<ComputedKey> {
+    let ExtraInputsKey {
+        digest: extra_inputs_digest,
+        hash_stats: extra_inputs_hash_stats,
+        too_new: extra_inputs_too_new,
+        key_ms: extra_inputs_key_ms,
+        guard_inputs: mut extra_inputs_guard_inputs,
+    } = extra_inputs;
     let key_start = std::time::Instant::now();
     let emitted = matches!(discovery, KeyDiscovery::Emitted(_));
     let flight_dir = discovery_flight_dir(config, &discovery);
@@ -5608,7 +5629,7 @@ fn compute_rustc_cache_key(
         key_env_vars: &config.key_env_vars,
         extra_inputs_digest,
     };
-    let cache_key = match compiler.cache_key(args, &key_ctx) {
+    let cache_key = match compiler.cache_key_in(args, &key_ctx, key_env) {
         Ok(cache_key) => cache_key,
         Err(error)
             if error
@@ -5685,6 +5706,7 @@ fn should_record_closure(predicted: bool, rederived: bool) -> bool {
 /// Used for exactly one thing: turning a predicted key that missed into a key
 /// discovered the slow way, before the invocation is allowed to store, claim
 /// or ask a remote anything.
+#[allow(clippy::too_many_arguments)]
 fn recompute_key_without_prediction(
     config: &Config,
     compiler: &RustcCompiler,
@@ -5692,6 +5714,7 @@ fn recompute_key_without_prediction(
     workspace_root: Option<&Path>,
     invocation_start_ns: i64,
     store: Option<&Store>,
+    key_env: &KeyEnv,
     extra_inputs_digest: Option<&str>,
 ) -> Result<ComputedKey> {
     let mut without = config.clone();
@@ -5703,11 +5726,11 @@ fn recompute_key_without_prediction(
         workspace_root,
         invocation_start_ns,
         store,
-        extra_inputs_digest,
-        FileHashStats::default(),
-        false,
-        0,
-        Vec::new(),
+        key_env,
+        ExtraInputsKey {
+            digest: extra_inputs_digest,
+            ..ExtraInputsKey::default()
+        },
         KeyDiscovery::Rederived,
     )
 }
@@ -16687,11 +16710,8 @@ exit 0
             None,
             invocation_start_ns,
             None,
-            None,
-            FileHashStats::default(),
-            false,
-            0,
-            Vec::new(),
+            &KeyEnv::default(),
+            ExtraInputsKey::default(),
             KeyDiscovery::Emitted(closure),
         )
         .unwrap();
@@ -16774,6 +16794,7 @@ exit 0
             None,
             0,
             Some(&store),
+            &KeyEnv::default(),
             None,
         )
         .unwrap();
@@ -16781,6 +16802,21 @@ exit 0
         assert!(
             keyed.discovery_flight.is_none(),
             "a re-derivation joined a discovery flight"
+        );
+        let with_extra_inputs = recompute_key_without_prediction(
+            &config,
+            &RustcCompiler::new(),
+            &args,
+            None,
+            0,
+            Some(&store),
+            &KeyEnv::default(),
+            Some("extra-inputs-digest"),
+        )
+        .unwrap();
+        assert_ne!(
+            with_extra_inputs.cache_key, keyed.cache_key,
+            "the re-derived key keeps the extra inputs"
         );
     }
 }

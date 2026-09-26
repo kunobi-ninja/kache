@@ -306,7 +306,10 @@ fn crt_fold_key(
             Ok(objects)
         },
         |_| Ok(sdk.to_string()),
-        deployment_target.map(str::to_string),
+        &KeyEnv::from_parts(
+            deployment_target.map(|target| ("MACOSX_DEPLOYMENT_TARGET", target)),
+            None,
+        ),
     )?;
     Ok(hasher.finalize().to_hex().to_string())
 }
@@ -402,7 +405,7 @@ fn native_linux_crt_probe_fails_closed() {
         false,
         |_| anyhow::bail!("no startup object"),
         |_| unreachable!("linux fold must not probe the macOS SDK"),
-        None,
+        &KeyEnv::default(),
     )
     .unwrap_err();
     assert!(
@@ -450,6 +453,17 @@ fn native_macos_linked_outputs_key_sdk_identity() {
         old, with_dt,
         "MACOSX_DEPLOYMENT_TARGET must re-key when set"
     );
+    let empty_dt = crt_fold_key(
+        &args,
+        DARWIN_RUSTC_VERSION,
+        false,
+        true,
+        "",
+        "14.0 (23A344)",
+        Some(""),
+    )
+    .unwrap();
+    assert_eq!(old, empty_dt, "an empty MACOSX_DEPLOYMENT_TARGET is unset");
 }
 
 const WINDOWS_RUSTC_VERSION: &str = "rustc 1.90.0\nhost: x86_64-pc-windows-msvc\nrelease: 1.90.0\n";
@@ -795,13 +809,57 @@ fn native_macos_sdk_probe_fails_closed() {
         true,
         |_| unreachable!("macOS fold must not probe Linux CRT"),
         |_| anyhow::bail!("sdk missing"),
-        None,
+        &KeyEnv::default(),
     )
     .unwrap_err();
     assert!(
         err.to_string()
             .contains("determining macOS SDK identity for cache key")
     );
+}
+
+#[test]
+fn the_sdk_probe_gets_sdkroot_from_the_snapshot() {
+    let bin = parsed_linked_bin(None);
+    let probed = |env: &KeyEnv| {
+        let mut sdkroot = None;
+        fold_native_link_runtime_identity(
+            &mut blake3::Hasher::new(),
+            &bin,
+            DARWIN_RUSTC_VERSION,
+            false,
+            true,
+            |_| unreachable!("macOS fold must not probe Linux CRT"),
+            |value| {
+                sdkroot = Some(value);
+                Ok("sdk".to_string())
+            },
+            env,
+        )
+        .unwrap();
+        sdkroot.expect("the SDK was probed")
+    };
+    assert_eq!(
+        probed(&env_with("SDKROOT", "/sdk")).as_deref(),
+        Some("/sdk")
+    );
+    assert_eq!(probed(&KeyEnv::default()), None);
+}
+
+/// An unremapped build bakes its working directory into DWARF, so the
+/// snapshot's cwd is part of its identity.
+#[test]
+fn unremapped_identity_folds_the_snapshot_cwd() {
+    let args = RustcArgs::parse(&["rustc".to_string(), "lib.rs".to_string()]).unwrap();
+    let fold = |cwd: Option<&str>| {
+        let mut hasher = blake3::Hasher::new();
+        let env = KeyEnv::from_parts([] as [(&str, &str); 0], cwd.map(PathBuf::from));
+        fold_unremapped_path_identity(&mut hasher, &args, &PathNormalizer::empty(), &env);
+        hasher.finalize()
+    };
+    assert_ne!(fold(Some("/work/a")), fold(Some("/work/b")));
+    assert_ne!(fold(Some("/work/a")), fold(None));
+    assert_eq!(fold(Some("/work/a")), fold(Some("/work/a")));
 }
 
 #[test]
@@ -817,7 +875,7 @@ fn metadata_only_outputs_do_not_probe_crt_or_sdk() {
         true,
         |_| panic!("metadata-only output must not probe CRT"),
         |_| panic!("metadata-only output must not probe SDK"),
-        None,
+        &KeyEnv::default(),
     )
     .unwrap();
 }
@@ -1332,6 +1390,55 @@ fn the_prediction_marker_is_taken_once() {
     );
 }
 
+/// The verification switch comes from the snapshot. With it on, a
+/// validated prediction is checked against the pre-pass, and the pass's
+/// answer is used instead.
+#[test]
+fn prediction_verification_reads_the_snapshot() {
+    let _lock = key_test_lock();
+    if get_rustc_version(Path::new("rustc")).is_err() {
+        return;
+    }
+    // Cargo and nextest set kache's own OUT_DIR on the test process.
+    let _out = crate::config::tests::set_env_for_test("OUT_DIR", None);
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("lib.rs");
+    std::fs::write(&source, "pub fn f() {}\n").unwrap();
+    let args = RustcArgs::parse(&[
+        "rustc".to_string(),
+        "--crate-name".to_string(),
+        "x".to_string(),
+        source.to_str().unwrap().to_string(),
+        "--edition=2021".to_string(),
+        "--emit=dep-info,metadata".to_string(),
+    ])
+    .unwrap();
+    let db = dir.path().join("index.db");
+    rusqlite::Connection::open(&db)
+        .unwrap()
+        .execute_batch(
+            "CREATE TABLE entries (cache_key TEXT PRIMARY KEY, crate_name TEXT NOT NULL);",
+        )
+        .unwrap();
+    let hasher = FileHasher::persistent(&db).with_input_predictions(true);
+    let closure = DepInfo {
+        source_files: vec![source.clone()],
+        env_deps: Vec::new(),
+    };
+    let identity = rustc_prediction_identity(&args).unwrap();
+    hasher.record_input_prediction(&identity, Some("x"), &closure, None);
+    let resolve = |env: &KeyEnv| {
+        take_last_key_used_prediction();
+        let inputs = resolve_key_inputs(&args, &hasher, "x", env).unwrap();
+        (inputs, take_last_key_used_prediction())
+    };
+
+    assert_eq!(resolve(&KeyEnv::default()), (Some(closure), true));
+    let (verified, predicted) = resolve(&env_with("KACHE_VERIFY_INPUT_PREDICTIONS", "always"));
+    assert!(!predicted, "the pre-pass answered, not the record");
+    assert!(verified.is_some());
+}
+
 /// With no record and deferral allowed, the key stops instead of running
 /// the pre-pass; the closure the wrapper hands back afterwards is used as
 /// is.
@@ -1391,7 +1498,7 @@ fn discovery_defers_to_the_compile_and_takes_the_emitted_closure() {
         .with_prediction_flights(Some(dir.path().join("cache")));
 
     set_defer_discovery(true);
-    let deferred = resolve_key_inputs(&args, &on, "x");
+    let deferred = resolve_key_inputs(&args, &on, "x", &KeyEnv::default());
     set_defer_discovery(false);
     let error = deferred.expect_err("no record and deferral allowed: no pre-pass");
     assert!(
@@ -1421,7 +1528,7 @@ fn discovery_defers_to_the_compile_and_takes_the_emitted_closure() {
         vec![("CARGO_PKG_NAME".to_string(), "lib".to_string())]
     );
     provide_dep_info(closure.clone());
-    let used = resolve_key_inputs(&args, &on, "x").unwrap();
+    let used = resolve_key_inputs(&args, &on, "x", &KeyEnv::default()).unwrap();
     assert_eq!(used, Some(closure));
 }
 
@@ -1558,7 +1665,7 @@ fn a_crate_the_store_never_held_defers_discovery() {
     .unwrap();
     let deferred = |hasher: &FileHasher<'_>| {
         set_defer_discovery(true);
-        let outcome = resolve_key_inputs(&args, hasher, "x");
+        let outcome = resolve_key_inputs(&args, hasher, "x", &KeyEnv::default());
         set_defer_discovery(false);
         outcome.is_err_and(|error| error.downcast_ref::<DeferredDiscovery>().is_some())
     };
@@ -1573,7 +1680,7 @@ fn a_crate_the_store_never_held_defers_discovery() {
         // Scoped: the hasher holds the unit's discovery flight until it
         // is dropped, and the hashers below need to take it.
         let hasher = FileHasher::persistent(&db).with_prediction_flights(flights.clone());
-        let not_allowed = resolve_key_inputs(&args, &hasher, "x");
+        let not_allowed = resolve_key_inputs(&args, &hasher, "x", &KeyEnv::default());
         assert!(
             !not_allowed.is_err_and(|error| error.downcast_ref::<DeferredDiscovery>().is_some()),
             "the wrapper did not allow deferral"
@@ -1642,7 +1749,7 @@ fn a_unit_the_store_never_held_defers_even_when_its_name_is_taken() {
         let hasher =
             FileHasher::persistent(&db).with_prediction_flights(Some(dir.path().join("cache")));
         set_defer_discovery(true);
-        let outcome = resolve_key_inputs(args, &hasher, "build_script_build");
+        let outcome = resolve_key_inputs(args, &hasher, "build_script_build", &KeyEnv::default());
         set_defer_discovery(false);
         outcome.is_err_and(|error| error.downcast_ref::<DeferredDiscovery>().is_some())
     };
@@ -4215,7 +4322,7 @@ fn emitted_closure_keeps_the_precompile_tree_guard() {
         .with_prediction_flights(Some(dir.path().join("cache")));
     let original_tree = crate_tree_digest(&hasher).unwrap();
     set_defer_discovery(true);
-    let deferred = compute_cache_key(&args, &hasher, &PathNormalizer::empty());
+    let deferred = compute_cache_key(&args, &hasher, &PathNormalizer::empty(), &KeyEnv::default());
     set_defer_discovery(false);
     assert!(deferred.unwrap_err().is::<DeferredDiscovery>());
     // Let a broken handoff reach the pre-pass and fail, not self-deadlock.
@@ -4229,7 +4336,7 @@ fn emitted_closure_keeps_the_precompile_tree_guard() {
     // would make the old emitted closure appear valid for those new files.
     std::fs::write(package.join("macro-input.txt"), "changed").unwrap();
     provide_dep_info(closure.clone());
-    compute_cache_key(&args, &hasher, &PathNormalizer::empty()).unwrap();
+    compute_cache_key(&args, &hasher, &PathNormalizer::empty(), &KeyEnv::default()).unwrap();
     let tree = take_last_tree_digest();
     assert_eq!(tree.as_deref(), Some(original_tree.as_str()));
     assert!(take_last_tree_digest().is_none());
@@ -4245,7 +4352,7 @@ fn emitted_closure_keeps_the_precompile_tree_guard() {
     // inherit the preceding invocation's tree.
     take_last_tree_digest();
     provide_dep_info(closure);
-    compute_cache_key(&args, &hasher, &PathNormalizer::empty()).unwrap();
+    compute_cache_key(&args, &hasher, &PathNormalizer::empty(), &KeyEnv::default()).unwrap();
     assert!(take_last_tree_digest().is_none());
 }
 
@@ -4938,8 +5045,8 @@ fn test_cache_key_deterministic() {
 
     let fh = FileHasher::new();
     let pn = PathNormalizer::empty();
-    let key1 = compute_cache_key(&parsed1, &fh, &pn).unwrap();
-    let key2 = compute_cache_key(&parsed2, &fh, &pn).unwrap();
+    let key1 = compute_cache_key(&parsed1, &fh, &pn, &KeyEnv::default()).unwrap();
+    let key2 = compute_cache_key(&parsed2, &fh, &pn, &KeyEnv::default()).unwrap();
     assert_eq!(key1, key2);
 }
 
@@ -4974,12 +5081,14 @@ fn cache_key_ignores_linker_path() {
         &RustcArgs::parse(&mk("/Users/alice/clang++")).unwrap(),
         &fh,
         &pn,
+        &KeyEnv::default(),
     )
     .unwrap();
     let b = compute_cache_key(
         &RustcArgs::parse(&mk("/home/runner/clang++")).unwrap(),
         &fh,
         &pn,
+        &KeyEnv::default(),
     )
     .unwrap();
     assert_eq!(a, b, "linker path must not affect the cache key");
@@ -5002,7 +5111,13 @@ fn flag_base(source: &Path, extra: &[&str]) -> Vec<String> {
 fn key_of(args: &[String]) -> String {
     let fh = FileHasher::new();
     let pn = PathNormalizer::empty();
-    compute_cache_key(&RustcArgs::parse(args).unwrap(), &fh, &pn).unwrap()
+    compute_cache_key(
+        &RustcArgs::parse(args).unwrap(),
+        &fh,
+        &pn,
+        &KeyEnv::default(),
+    )
+    .unwrap()
 }
 
 /// Compute a key for tests that check whether a *flag* (sysroot, custom
@@ -5018,7 +5133,7 @@ fn key_of_flags(args: &[String]) -> String {
     let pn = PathNormalizer::empty();
     let mut parsed = RustcArgs::parse(args).unwrap();
     parsed.source_file = None;
-    compute_cache_key(&parsed, &fh, &pn).unwrap()
+    compute_cache_key(&parsed, &fh, &pn, &KeyEnv::default()).unwrap()
 }
 
 /// H1: build-script `-l` link libs reach rustc on argv (not via
@@ -5400,7 +5515,8 @@ fn native_linker_side_files_fail_closed() {
         ],
     ))
     .unwrap();
-    let error = compute_cache_key(&guarded, &fh, &PathNormalizer::empty()).unwrap_err();
+    let error =
+        compute_cache_key(&guarded, &fh, &PathNormalizer::empty(), &KeyEnv::default()).unwrap_err();
     assert!(error.to_string().contains("side files are not cacheable"));
 }
 
@@ -6014,8 +6130,13 @@ fn renamed_native_static_lib_is_not_cacheable() {
     let flags = ["-L", search.as_str(), "-l", "static=foo:bar"];
 
     let parsed = RustcArgs::parse(&rlib_base(&source, &flags)).unwrap();
-    let error =
-        compute_cache_key(&parsed, &FileHasher::new(), &PathNormalizer::empty()).unwrap_err();
+    let error = compute_cache_key(
+        &parsed,
+        &FileHasher::new(),
+        &PathNormalizer::empty(),
+        &KeyEnv::default(),
+    )
+    .unwrap_err();
     assert!(
         format!("{error:#}").contains("is not cacheable"),
         "a renamed static lib must fail the key: {error:#}"
@@ -6100,7 +6221,12 @@ fn unit_args(crate_type: &str, out_dir: &Path, extra: &[&str]) -> Vec<String> {
 fn try_key_of_flags(args: &[String]) -> Result<String> {
     let mut parsed = RustcArgs::parse(args).unwrap();
     parsed.source_file = None;
-    compute_cache_key(&parsed, &FileHasher::new(), &PathNormalizer::empty())
+    compute_cache_key(
+        &parsed,
+        &FileHasher::new(),
+        &PathNormalizer::empty(),
+        &KeyEnv::default(),
+    )
 }
 
 /// Key `argv`, rewrite `file` with new bytes, and key it again.
@@ -7619,7 +7745,7 @@ fn link_search_into_new_layout_out_dir_is_the_same_in_every_checkout() {
         .collect();
         let args = RustcArgs::parse(&argv).unwrap();
         let pn = PathNormalizer::empty().with_target_dir(args.target_dir().as_deref());
-        compute_cache_key(&args, &FileHasher::new(), &pn).unwrap()
+        compute_cache_key(&args, &FileHasher::new(), &pn, &KeyEnv::default()).unwrap()
     };
 
     assert_eq!(key_in("checkout-a"), key_in("checkout-b"));
@@ -7663,7 +7789,7 @@ fn bin_output_keys_linker_identity() {
     let key = |args: Vec<String>| {
         let mut parsed = RustcArgs::parse(&args).unwrap();
         parsed.source_file = None;
-        compute_cache_key(&parsed, &fh, &pn)
+        compute_cache_key(&parsed, &fh, &pn, &KeyEnv::default())
     };
     let with_cc = key(bin(&["-Clinker=cc"]));
     let with_missing = key(bin(&["-Clinker=/nonexistent/kache-linker-xyz"]));
@@ -7816,7 +7942,13 @@ fn codegen_backend_dylib_is_keyed_by_content_not_path() {
     let mut parsed = RustcArgs::parse(&flag_base(&source, &[&flag(&missing)])).unwrap();
     parsed.source_file = None;
     assert!(
-        compute_cache_key(&parsed, &FileHasher::new(), &PathNormalizer::empty()).is_err(),
+        compute_cache_key(
+            &parsed,
+            &FileHasher::new(),
+            &PathNormalizer::empty(),
+            &KeyEnv::default()
+        )
+        .is_err(),
         "an unreadable backend must not produce a key"
     );
 }
@@ -7885,12 +8017,12 @@ fn test_cache_key_changes_with_source() {
     let fh = FileHasher::new();
     let pn = PathNormalizer::empty();
     let parsed1 = RustcArgs::parse(&args_vec).unwrap();
-    let key1 = compute_cache_key(&parsed1, &fh, &pn).unwrap();
+    let key1 = compute_cache_key(&parsed1, &fh, &pn, &KeyEnv::default()).unwrap();
 
     // Modified source
     std::fs::write(&source, b"pub fn hello() { println!(\"hi\"); }").unwrap();
     let parsed2 = RustcArgs::parse(&args_vec).unwrap();
-    let key2 = compute_cache_key(&parsed2, &fh, &pn).unwrap();
+    let key2 = compute_cache_key(&parsed2, &fh, &pn, &KeyEnv::default()).unwrap();
 
     assert_ne!(key1, key2);
 }
@@ -7931,8 +8063,8 @@ fn test_unreadable_dep_produces_stable_key() {
 
     let fh = FileHasher::new();
     let pn = PathNormalizer::empty();
-    let key_a = compute_cache_key(&parsed_a, &fh, &pn).unwrap();
-    let key_b = compute_cache_key(&parsed_b, &fh, &pn).unwrap();
+    let key_a = compute_cache_key(&parsed_a, &fh, &pn, &KeyEnv::default()).unwrap();
+    let key_b = compute_cache_key(&parsed_b, &fh, &pn, &KeyEnv::default()).unwrap();
     assert_eq!(
         key_a, key_b,
         "unreadable deps with different paths should produce the same key"
@@ -8357,7 +8489,13 @@ fn key_computation_stashes_whether_it_bakes_out_dir() {
             source_files: vec![source.clone()],
             env_deps,
         });
-        compute_cache_key(&args, &FileHasher::new(), &PathNormalizer::empty()).unwrap();
+        compute_cache_key(
+            &args,
+            &FileHasher::new(),
+            &PathNormalizer::empty(),
+            &KeyEnv::default(),
+        )
+        .unwrap();
     };
 
     key_with(vec![("OUT_DIR".into(), "/nowhere/out".into())]);
@@ -8377,8 +8515,47 @@ fn key_computation_stashes_whether_it_bakes_out_dir() {
     key_with(vec![("OUT_DIR".into(), "/nowhere/out".into())]);
     let mut no_source = args.clone();
     no_source.source_file = None;
-    compute_cache_key(&no_source, &FileHasher::new(), &PathNormalizer::empty()).unwrap();
+    compute_cache_key(
+        &no_source,
+        &FileHasher::new(),
+        &PathNormalizer::empty(),
+        &KeyEnv::default(),
+    )
+    .unwrap();
     assert!(!take_last_key_bakes_out_dir(), "reset by the next key");
+}
+
+/// The unit's OUT_DIR comes from the snapshot: a value under it is baked
+/// only when the snapshot names that OUT_DIR.
+#[test]
+fn key_reads_out_dir_from_the_snapshot() {
+    let _lock = key_test_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("lib.rs");
+    std::fs::write(&source, "pub fn f() {}").unwrap();
+    let args = RustcArgs::parse(&[
+        "rustc".to_string(),
+        "--crate-name".to_string(),
+        "helper".to_string(),
+        source.to_str().unwrap().to_string(),
+    ])
+    .unwrap();
+    // Absent directories, so both sides compare as given; absolute on
+    // every platform, or OUT_DIR anchors nothing.
+    let out_dir = dir.path().join("absent-out");
+    let generated = out_dir.join("gen.rs").to_str().unwrap().to_string();
+    let bakes = |env: &KeyEnv| {
+        provide_dep_info(DepInfo {
+            source_files: vec![source.clone()],
+            env_deps: vec![("GEN".into(), generated.clone())],
+        });
+        compute_cache_key(&args, &FileHasher::new(), &PathNormalizer::empty(), env).unwrap();
+        take_last_key_bakes_out_dir()
+    };
+    let out_env = |path: &Path| KeyEnv::from_parts([("OUT_DIR", path)], None);
+    assert!(bakes(&out_env(&out_dir)));
+    assert!(!bakes(&KeyEnv::default()));
+    assert!(!bakes(&out_env(&dir.path().join("elsewhere"))));
 }
 
 #[test]
@@ -9108,8 +9285,8 @@ fn test_cache_key_changes_with_features() {
 
     let fh = FileHasher::new();
     let pn = PathNormalizer::empty();
-    let key1 = compute_cache_key(&parsed1, &fh, &pn).unwrap();
-    let key2 = compute_cache_key(&parsed2, &fh, &pn).unwrap();
+    let key1 = compute_cache_key(&parsed1, &fh, &pn, &KeyEnv::default()).unwrap();
+    let key2 = compute_cache_key(&parsed2, &fh, &pn, &KeyEnv::default()).unwrap();
 
     assert_ne!(key1, key2);
 }
@@ -9141,8 +9318,8 @@ fn test_cache_key_changes_with_instrument_coverage() {
 
     let fh = FileHasher::new();
     let pn = PathNormalizer::empty();
-    let key_normal = compute_cache_key(&parsed_normal, &fh, &pn).unwrap();
-    let key_coverage = compute_cache_key(&parsed_coverage, &fh, &pn).unwrap();
+    let key_normal = compute_cache_key(&parsed_normal, &fh, &pn, &KeyEnv::default()).unwrap();
+    let key_coverage = compute_cache_key(&parsed_coverage, &fh, &pn, &KeyEnv::default()).unwrap();
 
     assert_ne!(
         key_normal, key_coverage,
@@ -9177,8 +9354,8 @@ fn test_cache_key_changes_with_instrument_coverage_two_arg() {
 
     let fh = FileHasher::new();
     let pn = PathNormalizer::empty();
-    let key_normal = compute_cache_key(&parsed_normal, &fh, &pn).unwrap();
-    let key_coverage = compute_cache_key(&parsed_coverage, &fh, &pn).unwrap();
+    let key_normal = compute_cache_key(&parsed_normal, &fh, &pn, &KeyEnv::default()).unwrap();
+    let key_coverage = compute_cache_key(&parsed_coverage, &fh, &pn, &KeyEnv::default()).unwrap();
 
     assert_ne!(
         key_normal, key_coverage,
@@ -9211,8 +9388,8 @@ fn test_cache_key_changes_with_tarpaulin_cfg() {
 
     let fh = FileHasher::new();
     let pn = PathNormalizer::empty();
-    let key_normal = compute_cache_key(&parsed_normal, &fh, &pn).unwrap();
-    let key_tarpaulin = compute_cache_key(&parsed_tarpaulin, &fh, &pn).unwrap();
+    let key_normal = compute_cache_key(&parsed_normal, &fh, &pn, &KeyEnv::default()).unwrap();
+    let key_tarpaulin = compute_cache_key(&parsed_tarpaulin, &fh, &pn, &KeyEnv::default()).unwrap();
 
     assert_ne!(
         key_normal, key_tarpaulin,
@@ -9247,8 +9424,8 @@ fn test_coverage_keys_consistent_across_remap_forms() {
 
     let fh = FileHasher::new();
     let pn = PathNormalizer::empty();
-    let key_joined = compute_cache_key(&parsed_joined, &fh, &pn).unwrap();
-    let key_two = compute_cache_key(&parsed_two, &fh, &pn).unwrap();
+    let key_joined = compute_cache_key(&parsed_joined, &fh, &pn, &KeyEnv::default()).unwrap();
+    let key_two = compute_cache_key(&parsed_two, &fh, &pn, &KeyEnv::default()).unwrap();
 
     assert_eq!(
         key_joined, key_two,
@@ -9281,8 +9458,8 @@ fn test_cache_key_version_affects_key() {
     let parsed2 = RustcArgs::parse(&args_vec).unwrap();
     let fh = FileHasher::new();
     let pn = PathNormalizer::empty();
-    let key1 = compute_cache_key(&parsed1, &fh, &pn).unwrap();
-    let key2 = compute_cache_key(&parsed2, &fh, &pn).unwrap();
+    let key1 = compute_cache_key(&parsed1, &fh, &pn, &KeyEnv::default()).unwrap();
+    let key2 = compute_cache_key(&parsed2, &fh, &pn, &KeyEnv::default()).unwrap();
     assert_eq!(
         key1, key2,
         "key must be deterministic with version baked in"
@@ -10910,7 +11087,7 @@ fn test_cache_key_changes_with_module_file() {
     let pn = PathNormalizer::empty();
 
     let parsed1 = RustcArgs::parse(&args_vec).unwrap();
-    let key1 = compute_cache_key(&parsed1, &fh, &pn).unwrap();
+    let key1 = compute_cache_key(&parsed1, &fh, &pn, &KeyEnv::default()).unwrap();
 
     // Modify the module file (NOT lib.rs)
     std::fs::write(
@@ -10920,7 +11097,7 @@ fn test_cache_key_changes_with_module_file() {
     .unwrap();
 
     let parsed2 = RustcArgs::parse(&args_vec).unwrap();
-    let key2 = compute_cache_key(&parsed2, &fh, &pn).unwrap();
+    let key2 = compute_cache_key(&parsed2, &fh, &pn, &KeyEnv::default()).unwrap();
 
     assert_ne!(
         key1, key2,
@@ -10957,8 +11134,8 @@ fn test_cache_key_stable_with_module_files() {
     let parsed1 = RustcArgs::parse(&args_vec).unwrap();
     let parsed2 = RustcArgs::parse(&args_vec).unwrap();
 
-    let key1 = compute_cache_key(&parsed1, &fh, &pn).unwrap();
-    let key2 = compute_cache_key(&parsed2, &fh, &pn).unwrap();
+    let key1 = compute_cache_key(&parsed1, &fh, &pn, &KeyEnv::default()).unwrap();
+    let key2 = compute_cache_key(&parsed2, &fh, &pn, &KeyEnv::default()).unwrap();
 
     assert_eq!(
         key1, key2,
@@ -11030,7 +11207,13 @@ fn key_computation_stashes_unit_identity_and_yields_it_once() {
     // records, not source discovery.
     parsed.source_file = None;
 
-    compute_cache_key(&parsed, &FileHasher::new(), &PathNormalizer::empty()).unwrap();
+    compute_cache_key(
+        &parsed,
+        &FileHasher::new(),
+        &PathNormalizer::empty(),
+        &KeyEnv::default(),
+    )
+    .unwrap();
 
     assert_eq!(
         take_last_key_unit_id().as_deref(),
@@ -11092,8 +11275,13 @@ fn key_stashes_do_not_leak_across_threads() {
                 // Loop so the interleaving windows overlap rather than each
                 // thread racing through its compute/take once.
                 for _ in 0..16 {
-                    compute_cache_key(&parsed, &FileHasher::new(), &PathNormalizer::empty())
-                        .unwrap();
+                    compute_cache_key(
+                        &parsed,
+                        &FileHasher::new(),
+                        &PathNormalizer::empty(),
+                        &KeyEnv::default(),
+                    )
+                    .unwrap();
 
                     assert_eq!(
                         take_last_key_unit_id().as_deref(),
@@ -11191,10 +11379,20 @@ fn base_args(source: &Path) -> Vec<String> {
 /// already embedded in `args` (positional) — `RustcArgs::parse`
 /// picks it up — so no separate source argument is needed.
 fn key_for(args: &[String]) -> String {
+    key_with(args, &KeyEnv::capture())
+}
+
+/// [`key_for`] with the environment `env`.
+fn key_with(args: &[String], env: &KeyEnv) -> String {
     let parsed = RustcArgs::parse(args).unwrap();
     let fh = FileHasher::new();
     let pn = PathNormalizer::empty();
-    compute_cache_key(&parsed, &fh, &pn).unwrap()
+    compute_cache_key(&parsed, &fh, &pn, env).unwrap()
+}
+
+/// A snapshot holding only `name=value`.
+fn env_with(name: &str, value: &str) -> KeyEnv {
+    KeyEnv::from_parts([(name, value)], None)
 }
 
 fn restore_env_var(key: &str, old: Option<std::ffi::OsString>) {
@@ -11292,7 +11490,7 @@ fn opt_out_key_folds_all_normalizer_prefixes_not_just_home() {
         let parsed = RustcArgs::parse(&args).unwrap();
         let fh = FileHasher::new();
         let pn = PathNormalizer::from_env(Some(ws.path()));
-        compute_cache_key(&parsed, &fh, &pn).unwrap()
+        compute_cache_key(&parsed, &fh, &pn, &KeyEnv::default()).unwrap()
     };
 
     // SAFETY: env access is serialized by the process-state test lock; restored below.
@@ -11378,36 +11576,17 @@ fn key_rustc_bootstrap_presence_changes_key_but_empty_is_identity() {
     if !rustc_available() {
         return;
     }
-    let old = std::env::var_os("RUSTC_BOOTSTRAP");
-
     let dir = tempfile::tempdir().unwrap();
     let src = dir.path().join("lib.rs");
     std::fs::write(&src, "pub fn f() {}\n").unwrap();
     let args = base_args(&src);
 
-    unsafe {
-        std::env::remove_var("RUSTC_BOOTSTRAP");
-    }
-    let key_unset = key_for(&args);
-
+    let key_unset = key_with(&args, &KeyEnv::default());
     // Empty must hash identically to unset: that is what keeps existing
     // caches valid (no CACHE_KEY_VERSION bump for the common case).
-    unsafe {
-        std::env::set_var("RUSTC_BOOTSTRAP", "");
-    }
-    let key_empty = key_for(&args);
-
-    unsafe {
-        std::env::set_var("RUSTC_BOOTSTRAP", "1");
-    }
-    let key_set = key_for(&args);
-
-    unsafe {
-        std::env::set_var("RUSTC_BOOTSTRAP", "some_crate");
-    }
-    let key_other = key_for(&args);
-
-    restore_env_var("RUSTC_BOOTSTRAP", old);
+    let key_empty = key_with(&args, &env_with("RUSTC_BOOTSTRAP", ""));
+    let key_set = key_with(&args, &env_with("RUSTC_BOOTSTRAP", "1"));
+    let key_other = key_with(&args, &env_with("RUSTC_BOOTSTRAP", "some_crate"));
 
     assert_eq!(
         key_unset, key_empty,
@@ -11428,28 +11607,15 @@ fn key_cargo_encoded_rustflags_changes_key() {
     if !rustc_available() {
         return;
     }
-    let old = std::env::var_os("CARGO_ENCODED_RUSTFLAGS");
     let dir = tempfile::tempdir().unwrap();
     let src = dir.path().join("lib.rs");
     std::fs::write(&src, "pub fn f() {}\n").unwrap();
     let args = base_args(&src);
 
-    unsafe {
-        std::env::remove_var("CARGO_ENCODED_RUSTFLAGS");
-    }
-    let key_unset = key_for(&args);
-
-    unsafe {
-        std::env::set_var("CARGO_ENCODED_RUSTFLAGS", "-C\x1ftarget-cpu=native");
-    }
-    let key_set = key_for(&args);
-
-    unsafe {
-        std::env::set_var("CARGO_ENCODED_RUSTFLAGS", "-C\x1ftarget-cpu=x86-64-v3");
-    }
-    let key_other = key_for(&args);
-
-    restore_env_var("CARGO_ENCODED_RUSTFLAGS", old);
+    let key_unset = key_with(&args, &KeyEnv::default());
+    let flags = |value| env_with("CARGO_ENCODED_RUSTFLAGS", value);
+    let key_set = key_with(&args, &flags("-C\x1ftarget-cpu=native"));
+    let key_other = key_with(&args, &flags("-C\x1ftarget-cpu=x86-64-v3"));
 
     assert_ne!(
         key_unset, key_set,
@@ -11470,28 +11636,14 @@ fn key_cargo_cfg_env_changes_key() {
         return;
     }
     let var = "CARGO_CFG_KACHE_TEST_FLAG";
-    let old = std::env::var_os(var);
     let dir = tempfile::tempdir().unwrap();
     let src = dir.path().join("lib.rs");
     std::fs::write(&src, "pub fn f() {}\n").unwrap();
     let args = base_args(&src);
 
-    unsafe {
-        std::env::remove_var(var);
-    }
-    let key_unset = key_for(&args);
-
-    unsafe {
-        std::env::set_var(var, "1");
-    }
-    let key_set = key_for(&args);
-
-    unsafe {
-        std::env::set_var(var, "2");
-    }
-    let key_other = key_for(&args);
-
-    restore_env_var(var, old);
+    let key_unset = key_with(&args, &KeyEnv::default());
+    let key_set = key_with(&args, &env_with(var, "1"));
+    let key_other = key_with(&args, &env_with(var, "2"));
 
     assert_ne!(key_unset, key_set, "a CARGO_CFG_* var must change the key");
     assert_ne!(
@@ -11574,7 +11726,7 @@ fn key_matrix_manifest_dir_runtime_env_path_changes_key_across_workspaces() {
     }
     let parsed_a = RustcArgs::parse(&base_args(&source_a)).unwrap();
     let pn_a = PathNormalizer::from_env(Some(&workspace_a));
-    let key_a = compute_cache_key(&parsed_a, &fh, &pn_a).unwrap();
+    let key_a = compute_cache_key(&parsed_a, &fh, &pn_a, &KeyEnv::capture()).unwrap();
 
     let manifest_b = workspace_b.join("helper").canonicalize().unwrap();
     unsafe {
@@ -11582,7 +11734,7 @@ fn key_matrix_manifest_dir_runtime_env_path_changes_key_across_workspaces() {
     }
     let parsed_b = RustcArgs::parse(&base_args(&source_b)).unwrap();
     let pn_b = PathNormalizer::from_env(Some(&workspace_b));
-    let key_b = compute_cache_key(&parsed_b, &fh, &pn_b).unwrap();
+    let key_b = compute_cache_key(&parsed_b, &fh, &pn_b, &KeyEnv::capture()).unwrap();
 
     restore_env_var("CARGO_MANIFEST_DIR", old_manifest_dir);
 
@@ -11639,7 +11791,7 @@ pub fn value() -> u8 {
     }
     let parsed_a = RustcArgs::parse(&base_args(&source_a)).unwrap();
     let pn_a = PathNormalizer::from_env(Some(&workspace_a));
-    let key_a = compute_cache_key(&parsed_a, &fh, &pn_a).unwrap();
+    let key_a = compute_cache_key(&parsed_a, &fh, &pn_a, &KeyEnv::capture()).unwrap();
 
     let out_b = out_b.canonicalize().unwrap();
     unsafe {
@@ -11648,7 +11800,7 @@ pub fn value() -> u8 {
     }
     let parsed_b = RustcArgs::parse(&base_args(&source_b)).unwrap();
     let pn_b = PathNormalizer::from_env(Some(&workspace_b));
-    let key_b = compute_cache_key(&parsed_b, &fh, &pn_b).unwrap();
+    let key_b = compute_cache_key(&parsed_b, &fh, &pn_b, &KeyEnv::capture()).unwrap();
 
     restore_env_var("OUT_DIR", old_out_dir);
     restore_env_var("CARGO_MANIFEST_DIR", old_manifest_dir);
@@ -11706,7 +11858,7 @@ pub fn value() -> (&'static str, u8) {
     }
     let parsed_a = RustcArgs::parse(&base_args(&source_a)).unwrap();
     let pn_a = PathNormalizer::from_env(Some(&workspace_a));
-    let key_a = compute_cache_key(&parsed_a, &fh, &pn_a).unwrap();
+    let key_a = compute_cache_key(&parsed_a, &fh, &pn_a, &KeyEnv::capture()).unwrap();
 
     let out_b = out_b.canonicalize().unwrap();
     unsafe {
@@ -11714,7 +11866,7 @@ pub fn value() -> (&'static str, u8) {
     }
     let parsed_b = RustcArgs::parse(&base_args(&source_b)).unwrap();
     let pn_b = PathNormalizer::from_env(Some(&workspace_b));
-    let key_b = compute_cache_key(&parsed_b, &fh, &pn_b).unwrap();
+    let key_b = compute_cache_key(&parsed_b, &fh, &pn_b, &KeyEnv::capture()).unwrap();
 
     restore_env_var("OUT_DIR", old_out_dir);
 
@@ -11921,19 +12073,8 @@ fn key_matrix_rustflags_env_changes_key() {
     std::fs::write(&source, b"pub fn hello() {}").unwrap();
     let args = base_args(&source);
 
-    let saved = std::env::var("RUSTFLAGS").ok();
-
-    // SAFETY: env access is serialized by the process-state test lock; restored below.
-    unsafe { std::env::remove_var("RUSTFLAGS") };
-    let key_none = key_for(&args);
-
-    unsafe { std::env::set_var("RUSTFLAGS", "-C target-cpu=native") };
-    let key_set = key_for(&args);
-
-    match saved {
-        Some(v) => unsafe { std::env::set_var("RUSTFLAGS", v) },
-        None => unsafe { std::env::remove_var("RUSTFLAGS") },
-    }
+    let key_none = key_with(&args, &KeyEnv::default());
+    let key_set = key_with(&args, &env_with("RUSTFLAGS", "-C target-cpu=native"));
 
     assert_ne!(key_none, key_set, "`RUSTFLAGS` env var must affect the key");
 }
@@ -12094,6 +12235,7 @@ fn key_matrix_direct_remap_path_prefix_is_keyed_portably_and_in_order() {
             &parsed,
             &FileHasher::new(),
             &PathNormalizer::from_env(Some(&workspace)),
+            &KeyEnv::default(),
         )
         .unwrap()
     };
@@ -12119,22 +12261,11 @@ fn key_matrix_rustflags_remap_path_prefix_stable_across_checkouts() {
     std::fs::write(&source, b"pub fn hello() {}").unwrap();
     let args = base_args(&source);
 
-    let saved = std::env::var("RUSTFLAGS").ok();
-    let set = |v: &str| unsafe { std::env::set_var("RUSTFLAGS", v) };
-
-    // SAFETY: env access is serialized by the process-state test lock; restored below.
-    set("--remap-path-prefix=/work/clone-a/=/topsrcdir/");
-    let key_a = key_for(&args);
-    set("--remap-path-prefix=/work/clone-b/=/topsrcdir/");
-    let key_b = key_for(&args);
+    let key = |flags| key_with(&args, &env_with("RUSTFLAGS", flags));
+    let key_a = key("--remap-path-prefix=/work/clone-a/=/topsrcdir/");
+    let key_b = key("--remap-path-prefix=/work/clone-b/=/topsrcdir/");
     // Same flag, different stable target → must diverge.
-    set("--remap-path-prefix=/work/clone-a/=/elsewhere/");
-    let key_other_to = key_for(&args);
-
-    match saved {
-        Some(v) => unsafe { std::env::set_var("RUSTFLAGS", v) },
-        None => unsafe { std::env::remove_var("RUSTFLAGS") },
-    }
+    let key_other_to = key("--remap-path-prefix=/work/clone-a/=/elsewhere/");
 
     assert_eq!(
         key_a, key_b,
@@ -12161,24 +12292,12 @@ fn key_matrix_rustflags_whitespace_does_not_change_key() {
     std::fs::write(&source, b"pub fn hello() {}").unwrap();
     let args = base_args(&source);
 
-    let saved = std::env::var("RUSTFLAGS").ok();
-
-    // SAFETY: env access is serialized by the process-state test lock; restored below.
-    unsafe { std::env::set_var("RUSTFLAGS", "-C debuginfo=2 -C codegen-units=1") };
-    let key_tight = key_for(&args);
-
+    let key = |flags| key_with(&args, &env_with("RUSTFLAGS", flags));
+    let key_tight = key("-C debuginfo=2 -C codegen-units=1");
     // Same flags, cosmetically different whitespace.
-    unsafe { std::env::set_var("RUSTFLAGS", "-C debuginfo=2    -C codegen-units=1") };
-    let key_loose = key_for(&args);
-
+    let key_loose = key("-C debuginfo=2    -C codegen-units=1");
     // Same flags, leading whitespace.
-    unsafe { std::env::set_var("RUSTFLAGS", "  -C debuginfo=2 -C codegen-units=1  ") };
-    let key_padded = key_for(&args);
-
-    match saved {
-        Some(v) => unsafe { std::env::set_var("RUSTFLAGS", v) },
-        None => unsafe { std::env::remove_var("RUSTFLAGS") },
-    }
+    let key_padded = key("  -C debuginfo=2 -C codegen-units=1  ");
 
     assert_eq!(
         key_tight, key_loose,
@@ -12306,6 +12425,7 @@ fn check_cfg_values_are_not_path_normalized() {
             &parsed,
             &FileHasher::new(),
             &PathNormalizer::from_env(Some(workspace)),
+            &KeyEnv::default(),
         )
         .unwrap()
     };
@@ -12590,7 +12710,7 @@ fn a_guarded_record_is_refused_when_the_tree_changed() {
 
 #[cfg(unix)]
 #[test]
-fn clippy_identity_reads_the_process_environment() {
+fn clippy_identity_reads_the_snapshot() {
     let _lock = key_test_lock();
     let dir = tempfile::tempdir().unwrap();
     let driver = dir.path().join("clippy-driver");
@@ -12600,28 +12720,40 @@ fn clippy_identity_reads_the_process_environment() {
     );
     let member = dir.path().join("member");
     std::fs::create_dir_all(&member).unwrap();
-    let manifest_dir = std::env::var_os("CARGO_MANIFEST_DIR");
-    // SAFETY: the key test lock serialises environment edits.
-    unsafe {
-        std::env::set_var("CARGO_MANIFEST_DIR", &member);
-        std::env::remove_var("CLIPPY_CONF_DIR");
-        std::env::remove_var("CLIPPY_ARGS");
-    }
-    let identity = clippy_identity(&driver).unwrap();
-    let expected = clippy_identity_in(
+    std::fs::write(member.join("clippy.toml"), "msrv = \"1.70\"\n").unwrap();
+
+    let from_manifest = clippy_identity(
         &driver,
-        |name| std::env::var_os(name),
-        std::env::current_dir().ok(),
+        &KeyEnv::from_parts(
+            [
+                ("CARGO_MANIFEST_DIR", member.as_os_str()),
+                ("CLIPPY_ARGS", OsStr::new("-Dwarnings")),
+            ],
+            None,
+        ),
     )
     .unwrap();
-    unsafe {
-        match manifest_dir {
-            Some(value) => std::env::set_var("CARGO_MANIFEST_DIR", value),
-            None => std::env::remove_var("CARGO_MANIFEST_DIR"),
-        }
-    }
-    assert_eq!(identity, expected);
-    assert!(identity.starts_with("clippy 0.1.98"), "{identity}");
+    assert!(
+        from_manifest.starts_with("clippy 0.1.98"),
+        "{from_manifest}"
+    );
+    assert!(
+        from_manifest.contains("config:clippy.toml:"),
+        "{from_manifest}"
+    );
+    assert!(
+        from_manifest.contains("CLIPPY_ARGS=-Dwarnings"),
+        "{from_manifest}"
+    );
+
+    // With no manifest dir, the search starts at the working directory.
+    let from_cwd = clippy_identity(
+        &driver,
+        &KeyEnv::from_parts([] as [(&str, &str); 0], Some(member.clone())),
+    )
+    .unwrap();
+    assert!(from_cwd.contains("config:clippy.toml:"), "{from_cwd}");
+    assert!(from_cwd.contains("CLIPPY_ARGS unset"), "{from_cwd}");
 }
 
 #[cfg(target_os = "linux")]

@@ -12,6 +12,7 @@ use std::path::PathBuf;
 use crate::args::RustcArgs;
 use crate::cache_key::compute_cache_key;
 use crate::compile;
+use crate::key_env::KeyEnv;
 
 use super::{
     ArtifactKind, CompileResult, Compiler, CompilerAdapter, CompilerId, KeyCtx, RefuseReason,
@@ -95,6 +96,28 @@ impl RustcCompiler {
         };
         let name = super::strip_windows_exe_suffix(name);
         name == "rustc" || name.starts_with("rustc") || name == "clippy-driver"
+    }
+
+    /// [`Compiler::cache_key`] for an invocation whose environment and
+    /// working directory are `env` rather than this process's.
+    pub(crate) fn cache_key_in(
+        &self,
+        parsed: &RustcArgs,
+        ctx: &KeyCtx<'_, '_>,
+        env: &KeyEnv,
+    ) -> Result<String> {
+        let crate_name = parsed.crate_name.as_deref().unwrap_or("unknown");
+        let key = compute_cache_key(parsed, ctx.file_hasher, ctx.path_normalizer, env)?;
+        let key = match ctx.extra_inputs_digest {
+            Some(digest) => crate::cache_key::fold_labeled(key, "extra_inputs", digest),
+            None => key,
+        };
+        let key = crate::cache_key::apply_key_env_vars(key, ctx.key_env_vars, crate_name);
+        Ok(crate::cache_key::apply_key_salt(
+            key,
+            ctx.key_salt,
+            crate_name,
+        ))
     }
 
     /// Execute a caller-visible compile, forwarding metadata readiness to Cargo.
@@ -218,19 +241,9 @@ impl Compiler for RustcCompiler {
         rustc_refuse_reasons(parsed, build_script_out_dir.as_deref())
     }
 
+    /// The key for an invocation that ran in this process's environment.
     fn cache_key(&self, parsed: &RustcArgs, ctx: &KeyCtx<'_, '_>) -> Result<String> {
-        let crate_name = parsed.crate_name.as_deref().unwrap_or("unknown");
-        let key = compute_cache_key(parsed, ctx.file_hasher, ctx.path_normalizer)?;
-        let key = match ctx.extra_inputs_digest {
-            Some(digest) => crate::cache_key::fold_labeled(key, "extra_inputs", digest),
-            None => key,
-        };
-        let key = crate::cache_key::apply_key_env_vars(key, ctx.key_env_vars, crate_name);
-        Ok(crate::cache_key::apply_key_salt(
-            key,
-            ctx.key_salt,
-            crate_name,
-        ))
+        self.cache_key_in(parsed, ctx, &KeyEnv::capture())
     }
 
     fn execute(&self, parsed: &RustcArgs) -> Result<CompileResult> {
@@ -1463,5 +1476,53 @@ mod tests {
         let (user_prefix, _) =
             debug_bin_args(&out_dir, &["-Clink-arg=-Wl,-oso_prefix,/elsewhere/"]);
         assert_eq!(oso_prefix_root_for_key_inner(&user_prefix), None);
+    }
+
+    /// Through the trait, the key reads this process's environment and
+    /// working directory.
+    #[test]
+    fn the_trait_key_reads_this_process() {
+        let _lock = crate::test_support::process_state_test_lock();
+        if std::process::Command::new("rustc")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        std::fs::write(&source, "pub fn f() {}\n").unwrap();
+        let parsed = RustcArgs::parse(&s(&[
+            "rustc",
+            "--crate-name",
+            "k",
+            source.to_str().unwrap(),
+            "--emit=dep-info,metadata",
+        ]))
+        .unwrap();
+        let file_hasher = crate::cache_key::FileHasher::new();
+        let path_normalizer = crate::path_normalizer::PathNormalizer::empty();
+        let ctx = KeyCtx {
+            file_hasher: &file_hasher,
+            path_normalizer: &path_normalizer,
+            cache_dir: dir.path(),
+            key_salt: None,
+            key_env_vars: &[],
+            extra_inputs_digest: None,
+        };
+        let compiler = RustcCompiler::new();
+        let env = KeyEnv::capture();
+        let plain = compute_cache_key(&parsed, &file_hasher, &path_normalizer, &env).unwrap();
+        assert_eq!(compiler.cache_key_in(&parsed, &ctx, &env).unwrap(), plain);
+        assert_eq!(compiler.cache_key(&parsed, &ctx).unwrap(), plain);
+        let salted = KeyCtx {
+            key_salt: Some("salt"),
+            ..ctx
+        };
+        assert_ne!(
+            compiler.cache_key_in(&parsed, &salted, &env).unwrap(),
+            plain
+        );
     }
 }

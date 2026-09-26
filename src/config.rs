@@ -520,6 +520,18 @@ pub struct RemoteConfig {
 pub enum RemoteBackendConfig {
     S3(S3RemoteConfig),
     Filesystem(FilesystemRemoteConfig),
+    Gcs(GcsRemoteConfig),
+}
+
+/// A Google Cloud Storage remote. Credentials come from Application Default
+/// Credentials: `GOOGLE_APPLICATION_CREDENTIALS`, the gcloud user credentials,
+/// or the VM metadata server (GKE workload identity, Compute Engine).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GcsRemoteConfig {
+    pub bucket: String,
+    /// Another endpoint than Google's, for a local emulator. Requests to it go
+    /// unsigned.
+    pub endpoint: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -573,6 +585,7 @@ impl RemoteConfig {
         match &self.backend {
             RemoteBackendConfig::S3(_) => "s3",
             RemoteBackendConfig::Filesystem(_) => "filesystem",
+            RemoteBackendConfig::Gcs(_) => "gcs",
         }
     }
 
@@ -581,6 +594,7 @@ impl RemoteConfig {
         let base = match &self.backend {
             RemoteBackendConfig::S3(s3) => format!("s3://{}", s3.bucket),
             RemoteBackendConfig::Filesystem(fs) => format!("file://{}", fs.root.display()),
+            RemoteBackendConfig::Gcs(gcs) => format!("gs://{}", gcs.bucket),
         };
         if self.prefix.is_empty() {
             base
@@ -2017,6 +2031,45 @@ impl Config {
         Self::load_file_config_with_provenance(path).0
     }
 
+    /// `[cache.remote] type = "gcs"`: a bucket, and optionally a prefix and an
+    /// endpoint. Region, profile, user agent and filesystem fields do not apply.
+    fn load_gcs_remote_config(file_remote: Option<&RemoteFileConfig>) -> Result<RemoteConfig> {
+        let field = |value: Option<&String>| {
+            value
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        };
+        let inapplicable = file_remote.is_some_and(|r| {
+            [
+                &r.region,
+                &r.profile,
+                &r.user_agent,
+                &r.path,
+                &r.atomic_write_dir,
+            ]
+            .into_iter()
+            .any(|value| field(value.as_ref()).is_some())
+        });
+        if inapplicable {
+            anyhow::bail!(
+                "[cache.remote] type = \"gcs\" takes bucket, prefix and endpoint only; \
+                 region, profile, user_agent, path and atomic_write_dir do not apply"
+            );
+        }
+        let bucket = field(file_remote.and_then(|r| r.bucket.as_ref()))
+            .context("[cache.remote] type = \"gcs\" requires a non-empty bucket")?;
+        let prefix = file_remote
+            .and_then(|r| r.prefix.clone())
+            .unwrap_or_else(|| "artifacts".to_string());
+        Ok(RemoteConfig {
+            prefix: resolve_remote_prefix(&prefix)?,
+            backend: RemoteBackendConfig::Gcs(GcsRemoteConfig {
+                bucket,
+                endpoint: field(file_remote.and_then(|r| r.endpoint.as_ref())),
+            }),
+        })
+    }
+
     fn load_remote_config(file_config: &Result<FileConfig>) -> Result<Option<RemoteConfig>> {
         let ignore_env = Self::ignore_env_enabled(file_config);
         let file_remote = file_config
@@ -2042,6 +2095,10 @@ impl Config {
                 .any(|v| v.as_deref().is_some_and(|v| !v.trim().is_empty()))
         });
 
+        if configured_type.as_deref() == Some("gcs") {
+            return Self::load_gcs_remote_config(file_remote).map(Some);
+        }
+
         let use_filesystem = match configured_type.as_deref() {
             Some("filesystem" | "fs") => {
                 if file_has_s3_fields {
@@ -2061,7 +2118,7 @@ impl Config {
             }
             Some(other) => {
                 anyhow::bail!(
-                    "unsupported [cache.remote] type {other:?}; supported types are \"s3\" and \"filesystem\""
+                    "unsupported [cache.remote] type {other:?}; supported types are \"s3\", \"gcs\" and \"filesystem\""
                 );
             }
             None if file_has_s3_fields && file_has_filesystem_fields => {

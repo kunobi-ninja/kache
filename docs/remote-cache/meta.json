@@ -2,6 +2,7 @@
   "title": "Remote cache",
   "pages": [
     "s3-setup",
+    "gcs-setup",
     "filesystem-setup",
     "bounding",
     "sync",

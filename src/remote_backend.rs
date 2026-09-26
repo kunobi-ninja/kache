@@ -23,6 +23,7 @@ use opendal::services::Memory;
 use opendal::{ErrorKind, HttpTransporter, OperationContext, Operator};
 use opendal_http_transport_reqwest::ReqwestTransport;
 use opendal_service_fs::Fs;
+use opendal_service_gcs::Gcs;
 use opendal_service_s3::S3;
 use reqsign_aws_v4::{
     AssumeRoleWithWebIdentityCredentialProvider, Credential, DefaultCredentialProvider,
@@ -36,7 +37,9 @@ use reqsign_core::{
 };
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
-use crate::config::{FilesystemRemoteConfig, RemoteBackendConfig, RemoteConfig, S3RemoteConfig};
+use crate::config::{
+    FilesystemRemoteConfig, GcsRemoteConfig, RemoteBackendConfig, RemoteConfig, S3RemoteConfig,
+};
 
 /// Abort a LIST that cannot yield an entry or completion. Repeated entries are
 /// detected separately because a malformed continuation response can keep
@@ -206,6 +209,10 @@ pub struct OpenDalBackend {
     refusal_reported: AtomicBool,
     /// The configured S3 region, to explain a request sent to the wrong one.
     region: Option<String>,
+    /// Whether a refused read can mean a missing object. S3 answers 403 for a
+    /// missing key without `s3:ListBucket`; GCS does not, so there a refusal
+    /// stays an error.
+    refusal_may_be_absence: bool,
 }
 
 impl OpenDalBackend {
@@ -217,6 +224,7 @@ impl OpenDalBackend {
             download_memory: DOWNLOAD_MEMORY.clone(),
             refusal_reported: AtomicBool::new(false),
             region: None,
+            refusal_may_be_absence: true,
         }
     }
 
@@ -233,6 +241,7 @@ impl OpenDalBackend {
     /// filesystem permission error is a real error.
     fn refusal_means_absent(&self, error: &opendal::Error) -> bool {
         if self.is_filesystem()
+            || !self.refusal_may_be_absence
             || error.kind() != ErrorKind::PermissionDenied
             || credentials_rejected(error)
         {
@@ -856,6 +865,28 @@ fn bucket_region(text: &str) -> Option<&str> {
     quoted("\"x-amz-bucket-region\": \"", '"').or_else(|| quoted("expecting '", '\''))
 }
 
+fn create_gcs_operator(config: &GcsRemoteConfig, pool_idle_secs: u64) -> Result<Operator> {
+    ensure_rustls_provider();
+    // Same connection and inactivity bounds as S3; see create_s3_operator.
+    let client = reqwest::Client::builder()
+        .pool_idle_timeout(Duration::from_secs(pool_idle_secs))
+        .connect_timeout(CONNECT_TIMEOUT)
+        .read_timeout(READ_INACTIVITY_TIMEOUT)
+        .build()
+        .context("building GCS HTTP client")?;
+    let context = OperationContext::new()
+        .with_http_transport(HttpTransporter::new(ReqwestTransport::new(client)));
+    let mut builder = Gcs::default().bucket(&config.bucket);
+    if let Some(endpoint) = &config.endpoint {
+        // A custom endpoint is for an emulator, which takes unsigned requests.
+        builder = builder.endpoint(endpoint).skip_signature();
+    }
+    let operator = Operator::new(builder)
+        .context("building OpenDAL GCS operator")?
+        .with_context(context);
+    Ok(without_retry_layer(operator))
+}
+
 fn without_retry_layer(operator: Operator) -> Operator {
     // Retry ownership lives at the daemon operation boundary. Layering an
     // opaque transport retry underneath daemon retries multiplied deadlines,
@@ -1244,6 +1275,14 @@ pub async fn create_backend(
             backend.region = Some(config.region.clone());
             backend
         }
+        RemoteBackendConfig::Gcs(config) => {
+            let mut backend = OpenDalBackend::new(
+                create_gcs_operator(config, pool_idle_secs)?,
+                format!("gs://{}", config.bucket),
+            );
+            backend.refusal_may_be_absence = false;
+            backend
+        }
         RemoteBackendConfig::Filesystem(config) => {
             let mut backend = OpenDalBackend::new(
                 create_filesystem_operator(config)?,
@@ -1512,6 +1551,66 @@ mod tests {
                 .unwrap()
                 .body,
             "first"
+        );
+    }
+
+    #[tokio::test]
+    async fn gcs_wire_reads_writes_create_only_and_keeps_refusals_as_errors() {
+        let (endpoint, requests) = mock_http_server(vec![
+            "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello".to_string(),
+            http_response("404 Not Found", ""),
+            http_response("412 Precondition Failed", ""),
+            http_response("403 Forbidden", ""),
+        ])
+        .await;
+        let remote = RemoteConfig {
+            prefix: "artifacts".to_string(),
+            backend: RemoteBackendConfig::Gcs(GcsRemoteConfig {
+                bucket: "builds".to_string(),
+                endpoint: Some(endpoint),
+            }),
+        };
+        let backend = create_backend(&remote, 30).await.unwrap();
+
+        // Copy the body out and drop the object at once: a buffered object
+        // holds its share of the process-wide download budget until then.
+        let body = backend
+            .get("artifacts/present", Some(64))
+            .await
+            .unwrap()
+            .unwrap()
+            .body
+            .to_vec();
+        assert_eq!(body, b"hello");
+        assert!(
+            backend
+                .get("artifacts/absent", Some(64))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            backend
+                .put_if_absent("artifacts/present", b"again".to_vec(), None)
+                .await
+                .unwrap(),
+            PutIfAbsentResult::AlreadyExists
+        );
+        assert!(
+            backend.get("artifacts/refused", Some(64)).await.is_err(),
+            "a GCS refusal is not a missing object"
+        );
+
+        let requests = requests.await.unwrap();
+        assert!(
+            requests[0].starts_with("GET /storage/v1/b/builds/o/artifacts%2Fpresent?alt=media"),
+            "{}",
+            requests[0]
+        );
+        assert!(
+            requests[2].contains("ifGenerationMatch=0"),
+            "{}",
+            requests[2]
         );
     }
 

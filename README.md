@@ -58,6 +58,7 @@ Hits, misses, and passthroughs are reported per unit, and `kache why-miss` expla
 | CUDA object files | Supported | Single-source `nvcc -c` and `-dc` via `CUDACXX="kache nvcc"` or a CMake launcher |
 | Local storage | Built in | Content-addressed store with garbage collection |
 | S3-compatible remote storage | Built in | Includes AWS S3, MinIO, and Cloudflare R2 |
+| Google Cloud Storage | Built in | Application Default Credentials, including GKE workload identity |
 | Filesystem remote storage | Built in | Useful for shared disks and CI volumes |
 
 [![Bytes a second Firefox worktree adds to disk on APFS: about 3 GB for Kache, which reflinks the other 13.5 GB, against 16.7 GB for sccache, which writes an independent copy.](https://raw.githubusercontent.com/kunobi-ninja/kache/main/assets/worktree-cost.svg)][storage-chart]

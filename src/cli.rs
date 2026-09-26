@@ -5929,7 +5929,8 @@ const REMOTE_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 fn remote_access_check(remote: &crate::config::RemoteConfig, pool_idle_secs: u64) -> RemoteAccess {
     let region = match &remote.backend {
         crate::config::RemoteBackendConfig::S3(s3) => Some(s3.region.clone()),
-        crate::config::RemoteBackendConfig::Filesystem(_) => None,
+        crate::config::RemoteBackendConfig::Filesystem(_)
+        | crate::config::RemoteBackendConfig::Gcs(_) => None,
     };
     let key = crate::config::join_remote_key(&remote.prefix, "kache-doctor-probe");
     let result = tokio::runtime::Builder::new_current_thread()

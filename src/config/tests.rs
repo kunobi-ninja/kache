@@ -4735,3 +4735,67 @@ fn s3_user_agent_loaded_from_file_and_env() {
             .contains("cannot include S3 bucket, endpoint, region, profile, or user_agent")
     );
 }
+
+fn gcs_remote(remote: RemoteFileConfig) -> Result<Option<RemoteConfig>> {
+    let file = FileConfig {
+        cache: Some(CacheFileConfig {
+            remote: Some(remote),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    Config::load_remote_config(&Ok(file))
+}
+
+#[test]
+fn a_gcs_remote_takes_a_bucket_prefix_and_endpoint() {
+    let remote = gcs_remote(RemoteFileConfig {
+        _type: Some("GCS".to_string()),
+        bucket: Some(" builds ".to_string()),
+        endpoint: Some("http://127.0.0.1:4443".to_string()),
+        ..Default::default()
+    })
+    .unwrap()
+    .unwrap();
+    assert_eq!(remote.prefix, "artifacts");
+    assert_eq!(remote.describe(), "gs://builds/artifacts");
+    assert_eq!(remote.backend_kind(), "gcs");
+    assert_eq!(
+        remote.backend,
+        RemoteBackendConfig::Gcs(GcsRemoteConfig {
+            bucket: "builds".to_string(),
+            endpoint: Some("http://127.0.0.1:4443".to_string()),
+        })
+    );
+}
+
+#[test]
+fn a_gcs_remote_needs_a_bucket_and_refuses_other_backends_fields() {
+    let error = gcs_remote(RemoteFileConfig {
+        _type: Some("gcs".to_string()),
+        ..Default::default()
+    })
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("requires a non-empty bucket"),
+        "{error:#}"
+    );
+    for remote in [
+        RemoteFileConfig {
+            region: Some("us-east-1".to_string()),
+            ..Default::default()
+        },
+        RemoteFileConfig {
+            path: Some("/cache".to_string()),
+            ..Default::default()
+        },
+    ] {
+        let error = gcs_remote(RemoteFileConfig {
+            _type: Some("gcs".to_string()),
+            bucket: Some("builds".to_string()),
+            ..remote
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("do not apply"), "{error:#}");
+    }
+}

@@ -1,0 +1,44 @@
+---
+title: Google Cloud Storage setup
+description: Use a GCS bucket as the remote cache with Application Default Credentials
+---
+
+A GCS remote uses the same objects as S3, stored in a Google Cloud Storage bucket.
+
+```toml title="~/.config/kache/config.toml"
+[cache.remote]
+type = "gcs"
+bucket = "acme-build-cache"
+prefix = "artifacts"
+```
+
+`type = "gcs"` is required. The remote takes `bucket`, `prefix` (default `artifacts`) and `endpoint`. Region, profile and the filesystem settings do not apply.
+
+## Credentials
+
+Kache uses Application Default Credentials, in this order:
+
+1. the key file named by `GOOGLE_APPLICATION_CREDENTIALS`;
+2. the user credentials that `gcloud auth application-default login` wrote;
+3. the VM metadata server, which covers GKE workload identity and Compute Engine.
+
+On GitHub Actions, `google-github-actions/auth` with workload identity federation sets `GOOGLE_APPLICATION_CREDENTIALS` for the job.
+
+Readers need `storage.objects.get`. Writers also need `storage.objects.create`. The role `roles/storage.objectViewer` covers readers and `roles/storage.objectCreator` plus the viewer role covers writers. Listing (`cache.remote_key_listing = true`, `kache sync`) also needs `storage.objects.list`.
+
+## Behaviour
+
+Uploads are create-only (`ifGenerationMatch=0`): an existing object is never replaced. Build manifests and shards merge, but GCS offers no entity-tag precondition through the client Kache uses, so two jobs finishing at the same moment can still drop each other's manifest entries.
+
+A refused read is reported as an error, not a miss.
+
+## Emulator
+
+`endpoint` points Kache at another server, such as a local emulator. Requests to a custom endpoint go unsigned.
+
+```toml
+[cache.remote]
+type = "gcs"
+bucket = "test"
+endpoint = "http://127.0.0.1:4443"
+```

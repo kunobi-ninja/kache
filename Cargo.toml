@@ -49,6 +49,7 @@ opendal-http-transport-reqwest = { version = "=0.58.2", default-features = false
 opendal-layer-retry = { version = "=0.58.2", default-features = false }
 opendal-service-fs = { version = "=0.58.2", default-features = false }
 opendal-service-s3 = { version = "=0.58.2", default-features = false }
+opendal-service-gcs = { version = "=0.58.2", default-features = false }
 # OpenDAL exposes a custom credential chain but not a profile-name shortcut.
 # These published reqsign APIs preserve Kache's explicit profile selection
 # (including SSO and credential_process) without a git-only patch.

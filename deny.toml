@@ -12,9 +12,11 @@ ignore = [
   # Transitive via kunobi-auth (ssh-key, openidconnect). No fixed `rsa`
   # release exists ("Solution: No fixed
   # upgrade is available!"). Re-evaluate when rsa >= 0.10 ships a
-  # constant-time implementation. NOTE: only reachable through
-  # `kache-service`, so cargo-deny must be run per workspace member (a
-  # root-only invocation graphs the `kache` bin alone and misses it).
+  # constant-time implementation. Also reached from the `kache` bin through
+  # the GCS remote (reqsign-google), which only signs service-account tokens
+  # with a local key; Marvin is a decryption-timing oracle, which signing
+  # does not expose. cargo-deny must still run per workspace member (a
+  # root-only invocation graphs the `kache` bin alone).
   "RUSTSEC-2023-0071",
 ]
 

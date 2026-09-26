@@ -12266,7 +12266,7 @@ mod tests {
                 "",
             )
             .unwrap();
-        std::fs::remove_file(&src_file).unwrap();
+        store.remove_clone_for_test(&src_file);
         assert!(store.contains("testkey"));
         assert!(store.total_size().unwrap() >= 200);
         // Age past the active-pin grace so eviction can claim it (a just-put
@@ -12366,7 +12366,7 @@ mod tests {
                 "",
             )
             .unwrap();
-        std::fs::remove_file(&src_file).unwrap();
+        store.remove_clone_for_test(&src_file);
         store.set_last_accessed_for_test("stale_key", "-2 hours");
         drop(store);
 
@@ -12465,8 +12465,8 @@ mod tests {
                 "",
             )
             .unwrap();
-        std::fs::remove_file(&old_file).unwrap();
-        std::fs::remove_file(&fresh_file).unwrap();
+        store.remove_clone_for_test(&old_file);
+        store.remove_clone_for_test(&fresh_file);
         store.set_last_accessed_for_test("old_valuable", "-2 hours");
         store.set_last_accessed_for_test("fresh_cheap", "-2 minutes");
         drop(store);
@@ -12508,7 +12508,7 @@ mod tests {
                 "",
             )
             .unwrap();
-        std::fs::remove_file(&src_file).unwrap();
+        store.remove_clone_for_test(&src_file);
         // Age past the active-pin grace so eviction can claim it
         // (kunobi-ninja/kache#326).
         store.set_last_accessed_for_test("upload_evict_key", "-1 hour");
@@ -12553,7 +12553,7 @@ mod tests {
                 "",
             )
             .unwrap();
-        std::fs::remove_file(&src_file).unwrap();
+        store.remove_clone_for_test(&src_file);
         store.set_last_accessed_for_test("upload_evict_key", "-1 hour");
 
         Daemon::new(config).maybe_evict_after_upload();
@@ -12587,7 +12587,7 @@ mod tests {
                 "",
             )
             .unwrap();
-        std::fs::remove_file(&src_file).unwrap();
+        store.remove_clone_for_test(&src_file);
         // A retained entry is one a build is using: no sweep may evict it
         // yet, so it keeps the store over budget.
         let last_used = if retained { "+0 seconds" } else { "-1 hour" };

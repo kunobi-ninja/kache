@@ -8331,7 +8331,7 @@ mod tests {
             .unwrap();
         // The store may have cloned it: left in place, the output would hold
         // the entry's blocks the way a target directory does.
-        std::fs::remove_file(&src).unwrap();
+        store.remove_clone_for_test(&src);
     }
 
     #[test]
@@ -8456,7 +8456,7 @@ mod tests {
                 "",
             )
             .unwrap();
-        std::fs::remove_file(&src).unwrap();
+        store.remove_clone_for_test(&src);
         store.set_last_accessed_for_test(key, "+0 seconds");
     }
 
@@ -8567,7 +8567,7 @@ mod tests {
             )
             .unwrap();
         // A source left behind can share the blob's blocks and retain it.
-        std::fs::remove_file(&src).unwrap();
+        store.remove_clone_for_test(&src);
         store.set_last_accessed_for_test(key, "-1 hour");
     }
 

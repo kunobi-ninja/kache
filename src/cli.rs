@@ -1129,6 +1129,16 @@ pub(crate) fn render_stats(
             " [client config — daemon did not report its policy]",
         ),
     };
+    let key_listing = match &snap.daemon_effective_config {
+        Some(eff) => eff.remote_key_listing,
+        None => config.remote_key_listing,
+    };
+    if snap.daemon_connected && daemon_has_remote && !key_listing {
+        lines.push(
+            "Listing:    off (reads need only GetObject; `remote_key_listing = true` lists keys)"
+                .to_string(),
+        );
+    }
     if snap.daemon_connected && daemon_has_remote && !prefetch_enabled {
         lines.push(format!(
             "Prefetch:   disabled (exact remote lookup and uploads remain enabled){prefetch_source}"
@@ -1310,6 +1320,12 @@ pub(crate) fn config_mismatch_warnings(
         warnings.push(format!(
             "warning: {daemon_side} has prefetch_enabled={}; {client_side} says {} — {remedy}",
             eff.prefetch_enabled, config.prefetch_enabled,
+        ));
+    }
+    if eff.remote_key_listing != config.remote_key_listing {
+        warnings.push(format!(
+            "warning: {daemon_side} has remote_key_listing={}; {client_side} says {} — {remedy}",
+            eff.remote_key_listing, config.remote_key_listing,
         ));
     }
     let daemon_remote = remote_status(
@@ -10297,6 +10313,7 @@ mod tests {
             compression_level: 3,
             s3_concurrency: 16,
             prefetch_enabled: crate::config::DEFAULT_PREFETCH_ENABLED,
+            remote_key_listing: false,
             remote_key_cache_refresh_secs: crate::config::DEFAULT_REMOTE_KEY_CACHE_REFRESH_SECS,
             prefetch_max_keys: crate::config::DEFAULT_PREFETCH_MAX_KEYS,
             prefetch_max_bytes: crate::config::DEFAULT_PREFETCH_MAX_BYTES,
@@ -10927,6 +10944,24 @@ mod tests {
     /// activity and stays absent for a quiet/offline daemon, so local-only
     /// `kache stats` output is unchanged.
     #[test]
+    fn render_stats_says_when_the_daemon_does_not_list_the_remote() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = save_manifest_config(dir.path().join("cache"), Some(test_remote_cfg()));
+        let render = |listing: bool| {
+            let mut eff = effective_config_like(&config);
+            eff.remote_key_listing = listing;
+            let snap = StatsSnapshot {
+                daemon_connected: true,
+                daemon_effective_config: Some(eff),
+                ..Default::default()
+            };
+            render_stats(&snap, &config, SinceWindow::DEFAULT).join("\n")
+        };
+        assert!(render(false).contains("Listing:    off"));
+        assert!(!render(true).contains("Listing:"));
+    }
+
+    #[test]
     #[allow(clippy::field_reassign_with_default)]
     fn render_stats_prefetch_section_gated_on_activity() {
         let dir = tempfile::tempdir().unwrap();
@@ -11040,6 +11075,7 @@ mod tests {
             config_path: "/daemon-home/.config/kache/config.toml".to_string(),
             config_fingerprint: Some("daemon-fingerprint".to_string()),
             prefetch_enabled: config.prefetch_enabled,
+            remote_key_listing: config.remote_key_listing,
             remote_description: config.remote.as_ref().map(|remote| remote.describe()),
             local_only: config.local_only,
             remote_error: config.remote_error.clone(),
@@ -11200,11 +11236,12 @@ mod tests {
         eff.max_size += 1;
         eff.cache_dir = "/somewhere/else".to_string();
         eff.prefetch_enabled = !config.prefetch_enabled;
+        eff.remote_key_listing = !config.remote_key_listing;
         eff.remote_description = Some("s3://daemon-bucket/artifacts".to_string());
         eff.remote_key_cache_refresh_secs += 1;
         eff.started_at_ms = 0; // old field default must not claim 1970
         let warnings = config_mismatch_warnings(&config, &same, &eff);
-        assert_eq!(warnings.len(), 5);
+        assert_eq!(warnings.len(), 6);
         assert!(
             warnings[1].contains("local_store=/somewhere/else"),
             "{warnings:?}"
@@ -11217,8 +11254,12 @@ mod tests {
             warnings[2].contains("prefetch_enabled=false"),
             "{warnings:?}"
         );
-        assert!(warnings[3].contains("remote=s3://daemon-bucket/artifacts"));
-        assert!(warnings[4].contains("remote_key_cache_refresh_secs=61"));
+        assert!(
+            warnings[3].contains("remote_key_listing=true"),
+            "{warnings:?}"
+        );
+        assert!(warnings[4].contains("remote=s3://daemon-bucket/artifacts"));
+        assert!(warnings[5].contains("remote_key_cache_refresh_secs=61"));
         assert!(warnings[0].contains("started unknown time"), "{warnings:?}");
     }
 

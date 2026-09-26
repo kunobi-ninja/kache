@@ -91,7 +91,9 @@ Prefixes are normalized by trimming surrounding separators and collapsing repeat
 {prefix}/_manifests/...
 ```
 
-The default prefix is `artifacts`. Writers need `s3:GetObject`, `s3:PutObject`, and `s3:ListBucket`. Read-only clients need `GetObject` and `ListBucket`. Prefix-scoped policies must include both `v3/` and `_manifests/`.
+The default prefix is `artifacts`. Readers need only `s3:GetObject`; writers also need `s3:PutObject`. Prefix-scoped policies must include both `v3/` and `_manifests/`.
+
+`s3:ListBucket` is optional. `kache sync` needs it, and so does `cache.remote_key_listing = true`. Without it, S3 answers a request for a missing key with `403` instead of `404`. Kache treats a refused read as a cache miss and says so once in its log. The cost is that a real refusal, such as a policy that denies the prefix or an expired token on an existence check, also looks like a miss: the build compiles instead of failing. A download that S3 refuses with a credential error (an expired token, a bad signature, clock skew) is still reported as an error.
 
 Remote packs use zstd; local blobs remain uncompressed. Configure the level with `cache.compression_level` or `KACHE_COMPRESSION_LEVEL`.
 

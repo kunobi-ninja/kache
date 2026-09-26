@@ -3,7 +3,7 @@ title: Sync
 description: Pull and push cache entries without the daemon
 ---
 
-`kache sync` talks directly to the configured remote. It is useful for explicit CI warm and publish steps.
+`kache sync` talks directly to the configured remote. It is useful for explicit CI warm and publish steps. It lists the remote to compare it with the local store, so on S3 its credentials need `s3:ListBucket`.
 
 ```bash
 kache sync                 # pull, then push

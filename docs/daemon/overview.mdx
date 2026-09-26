@@ -24,6 +24,8 @@ Report JSON marks daemon publication attempts with `store_handed_off` and record
 
 Set `cache.prefetch_enabled = false` or `KACHE_PREFETCH_ENABLED=0` to disable speculative prefetch while retaining exact remote checks and uploads.
 
+The daemon lists an S3 remote only with `cache.remote_key_listing = true`, which needs `s3:ListBucket`. A filesystem remote is listed unless the setting is `false`. It keeps an index of remote keys that the planner uses for crates that no build manifest, shard or local history covers. If the remote refuses to list, the daemon stops listing and logs one warning.
+
 ## When it is required
 
 Local-only caching works with no daemon. A configured remote needs the daemon for reads, writes, and prefetch. If the daemon is unavailable, the wrapper continues with the local store and compiles an exact remote miss locally.

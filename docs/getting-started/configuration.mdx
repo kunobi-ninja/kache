@@ -369,7 +369,8 @@ See [S3 setup](/docs/remote-cache/s3-setup) or [filesystem setup](/docs/remote-c
 | Environment | TOML key | Default | Purpose |
 | --- | --- | --- | --- |
 | `KACHE_PREFETCH_ENABLED` | `cache.prefetch_enabled` | `true` | Enable speculative manifest and planner prefetch |
-| `KACHE_REMOTE_KEY_CACHE_REFRESH_SECS` | `cache.remote_key_cache_refresh_secs` | `60` | Refresh the fallback planner's remote key index; `0` means initial load only |
+| `KACHE_REMOTE_KEY_LISTING` | `cache.remote_key_listing` | `false` for S3, `true` for a filesystem remote | List the remote's keys, for the fallback planner's key index and packed-prefetch catalogs; on S3 this needs `s3:ListBucket` |
+| `KACHE_REMOTE_KEY_CACHE_REFRESH_SECS` | `cache.remote_key_cache_refresh_secs` | `60` | Refresh the remote key index while listing is on; `0` means initial load only |
 | `KACHE_PREFETCH_MAX_KEYS` | `cache.prefetch_max_keys` | `2000` | Entries allowed per plan; `0` is unlimited |
 | `KACHE_PREFETCH_MAX_BYTES` | `cache.prefetch_max_bytes` | `2GiB` | Compressed bytes allowed per plan; in-flight downloads may finish |
 | `KACHE_PREFETCH_DEADLINE_SECS` | `cache.prefetch_deadline_secs` | `300` | Time during which a plan may start downloads; `0` disables the deadline |

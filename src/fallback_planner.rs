@@ -536,6 +536,7 @@ mod tests {
             compression_level: 3,
             s3_concurrency: 16,
             prefetch_enabled: crate::config::DEFAULT_PREFETCH_ENABLED,
+            remote_key_listing: false,
             remote_key_cache_refresh_secs: crate::config::DEFAULT_REMOTE_KEY_CACHE_REFRESH_SECS,
             prefetch_max_keys: crate::config::DEFAULT_PREFETCH_MAX_KEYS,
             prefetch_max_bytes: crate::config::DEFAULT_PREFETCH_MAX_BYTES,

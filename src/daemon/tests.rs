@@ -917,6 +917,7 @@ fn compile_started_wire_tags_and_stats_default() {
             config_path: "/c/config.toml".into(),
             config_fingerprint: Some("fingerprint".into()),
             prefetch_enabled: true,
+            remote_key_listing: false,
             remote_description: None,
             local_only: false,
             remote_error: None,
@@ -936,8 +937,13 @@ fn compile_started_wire_tags_and_stats_default() {
     let mut old_effective = old.get("effective_config").unwrap().clone();
     let old_effective_obj = old_effective.as_object_mut().unwrap();
     old_effective_obj.remove("remote_key_cache_refresh_secs");
+    old_effective_obj.remove("remote_key_listing");
     old_effective_obj.remove("runtime_dir");
     let parsed_effective: EffectiveConfig = serde_json::from_value(old_effective).unwrap();
+    assert!(
+        parsed_effective.remote_key_listing,
+        "an older daemon listed whenever prefetch was on"
+    );
     assert_eq!(
         parsed_effective.remote_key_cache_refresh_secs,
         crate::config::DEFAULT_REMOTE_KEY_CACHE_REFRESH_SECS,
@@ -1322,6 +1328,7 @@ pub(super) fn test_config(dir: &Path) -> Config {
         compression_level: 3,
         s3_concurrency: 16,
         prefetch_enabled: crate::config::DEFAULT_PREFETCH_ENABLED,
+        remote_key_listing: false,
         remote_key_cache_refresh_secs: crate::config::DEFAULT_REMOTE_KEY_CACHE_REFRESH_SECS,
         prefetch_max_keys: crate::config::DEFAULT_PREFETCH_MAX_KEYS,
         prefetch_max_bytes: crate::config::DEFAULT_PREFETCH_MAX_BYTES,
@@ -1395,6 +1402,110 @@ fn key_cache_authoritative_truth_table() {
     ));
     assert!(!key_cache_miss_is_authoritative(0, Some(Duration::ZERO)));
     assert!(!key_cache_miss_is_authoritative(60, None));
+}
+
+#[test]
+fn remote_keys_are_listed_only_when_asked() {
+    assert!(should_list_remote_keys(true, true, true));
+    assert!(!should_list_remote_keys(true, true, false));
+    assert!(!should_list_remote_keys(true, false, true));
+    assert!(!should_list_remote_keys(false, true, true));
+}
+
+/// Drives the refresher with scripted LIST outcomes ("ok", "flaky",
+/// "refused"). Running out of script panics, so a refresher that should
+/// have stopped fails the test instead of looping.
+async fn drive_refresher(
+    script: &[&str],
+    refresh: Option<std::time::Duration>,
+) -> (RefresherExit, usize, Vec<std::time::Duration>) {
+    let script: std::collections::VecDeque<String> =
+        script.iter().map(|step| step.to_string()).collect();
+    let script = std::sync::Mutex::new(script);
+    let calls = std::sync::atomic::AtomicUsize::new(0);
+    let mut backoffs = Vec::new();
+    let exit = run_key_cache_refresher(
+        || {
+            calls.fetch_add(1, Ordering::Relaxed);
+            let step = script
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("refresher ran past the script");
+            async move {
+                match step.as_str() {
+                    "ok" => Ok(1),
+                    other => Err(anyhow::anyhow!("{other}")),
+                }
+            }
+        },
+        |error| error.to_string() == "refused",
+        refresh,
+        |delay| {
+            backoffs.push(delay);
+            async {}
+        },
+    )
+    .await;
+    (exit, calls.load(Ordering::Relaxed), backoffs)
+}
+
+#[tokio::test]
+async fn the_refresher_stops_at_once_when_the_first_listing_is_refused() {
+    let (exit, calls, backoffs) = drive_refresher(&["refused"], None).await;
+    assert_eq!(exit, RefresherExit::ListingRefused);
+    assert_eq!(calls, 1);
+    assert!(backoffs.is_empty());
+}
+
+#[tokio::test]
+async fn the_refresher_retries_flaky_listings_five_times_with_backoff() {
+    let flaky = ["flaky"; 5];
+    let (exit, calls, backoffs) = drive_refresher(&flaky, None).await;
+    assert_eq!(exit, RefresherExit::PeriodicRefreshDisabled);
+    assert_eq!(calls, 5);
+    let secs: Vec<u64> = backoffs.iter().map(|delay| delay.as_secs()).collect();
+    assert_eq!(secs, [1, 2, 4, 8]);
+}
+
+#[tokio::test]
+async fn the_periodic_refresh_survives_flaky_listings_and_stops_when_refused() {
+    let refresh = Some(std::time::Duration::from_millis(1));
+    let (exit, calls, _) = drive_refresher(&["ok", "flaky", "ok", "refused"], refresh).await;
+    assert_eq!(exit, RefresherExit::ListingRefused);
+    assert_eq!(calls, 4);
+}
+
+#[test]
+fn only_a_refused_listing_stops_the_refresher() {
+    let s3 = Some(test_remote_config());
+    let error = |kind, message: &str| -> anyhow::Error {
+        anyhow::Error::from(opendal::Error::new(kind, message.to_string())).context("LIST")
+    };
+    let refused = error(
+        opendal::ErrorKind::PermissionDenied,
+        r#"S3Error { code: "AccessDenied" }"#,
+    );
+    assert!(listing_was_refused(&refused, s3.as_ref()));
+    let expired = error(
+        opendal::ErrorKind::PermissionDenied,
+        r#"S3Error { code: "ExpiredToken" }"#,
+    );
+    assert!(!listing_was_refused(&expired, s3.as_ref()));
+    let flaky = error(opendal::ErrorKind::Unexpected, "timeout");
+    assert!(!listing_was_refused(&flaky, s3.as_ref()));
+    let root = tempfile::tempdir().unwrap();
+    let filesystem = crate::config::RemoteConfig {
+        prefix: "artifacts".to_string(),
+        backend: crate::config::RemoteBackendConfig::Filesystem(
+            crate::config::FilesystemRemoteConfig {
+                root: root.path().to_path_buf(),
+                atomic_write_dir: root.path().join(".staging"),
+            },
+        ),
+    };
+    assert!(!listing_was_refused(&refused, Some(&filesystem)));
+    assert!(!listing_was_refused(&refused, None));
 }
 
 #[test]
@@ -6890,10 +7001,90 @@ async fn packed_receipt_survives_cancellation_after_body_before_import() {
     );
 }
 
+/// Entries imported from a seeded pack catalog. The catalog is found by
+/// a LIST, so none are imported when listing is off or was refused.
+async fn packed_imports_with_listing(listing: bool, refused: bool) -> usize {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path());
+    config.remote_key_listing = listing;
+    config.remote = Some(test_remote_config());
+    let remote = config.remote.clone().unwrap();
+    let backend = test_remote_backend();
+    let daemon = Arc::new(Daemon::new(config));
+    assert!(daemon.remote_backend.set(backend.clone()).is_ok());
+    daemon.listing_refused.store(refused, Ordering::Relaxed);
+    let deps = vec![("serde".to_string(), "1.0.0".to_string())];
+    let context = PackPrefetchContext::from_deps(
+        crate::identity::host_target_triple(),
+        "linux/toolchain/release",
+        &deps,
+    )
+    .unwrap();
+    let key = test_cache_key("unlisted-pack");
+    let (payload, meta_digest) = build_entry_pack_with_meta(&key, "serde");
+    seed_packed_catalog(
+        &backend,
+        &context,
+        vec![crate::remote_pack::PackInputEntry {
+            cache_key: key.clone(),
+            crate_name: "serde".into(),
+            meta_digest,
+            payload,
+        }],
+        None,
+    )
+    .await;
+    let candidates = vec![(key.clone(), "serde".to_string(), daemon.entry_dir_for(&key))];
+    let v3 = daemon.v3_remote().await.unwrap();
+    daemon
+        .try_packed_prefetch(
+            &context,
+            v3,
+            &remote,
+            &candidates,
+            0,
+            &PackedAttribution {
+                origin: &PrefetchOrigin::default(),
+                ranks: &HashMap::new(),
+                sources: &HashMap::new(),
+            },
+        )
+        .await
+        .len()
+}
+
+#[tokio::test]
+async fn packed_prefetch_skips_the_catalog_when_listing_is_off_or_refused() {
+    assert_eq!(packed_imports_with_listing(true, false).await, 1);
+    assert_eq!(packed_imports_with_listing(false, false).await, 0);
+    assert_eq!(packed_imports_with_listing(true, true).await, 0);
+}
+
+#[test]
+fn a_zero_refresh_interval_means_no_periodic_refresh() {
+    assert_eq!(key_cache_refresh_period(0), None);
+    assert_eq!(
+        key_cache_refresh_period(60),
+        Some(std::time::Duration::from_secs(60))
+    );
+}
+
+#[test]
+fn only_a_refused_listing_marks_the_daemon() {
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = Daemon::new(test_config(dir.path()));
+    daemon.record_refresher_exit(RefresherExit::PeriodicRefreshDisabled);
+    assert!(!daemon.listing_refused.load(Ordering::Relaxed));
+    daemon.record_refresher_exit(RefresherExit::ListingRefused);
+    assert!(daemon.listing_refused.load(Ordering::Relaxed));
+}
+
 #[tokio::test]
 async fn packed_prefetch_discovers_one_pack_and_batch_imports_all_entries() {
     let dir = tempfile::tempdir().unwrap();
     let mut config = test_config(dir.path());
+    // Catalog discovery is a LIST.
+    config.remote_key_listing = true;
     config.remote = Some(test_remote_config());
     config.prefetch_max_bytes = 0;
     let backend = test_remote_backend();
@@ -7076,6 +7267,8 @@ async fn packed_prefetch_discovers_one_pack_and_batch_imports_all_entries() {
 async fn packed_prefetch_drains_bodies_with_room_for_only_one_object() {
     let dir = tempfile::tempdir().unwrap();
     let mut config = test_config(dir.path());
+    // Catalog discovery is a LIST.
+    config.remote_key_listing = true;
     let remote = test_remote_config();
     config.remote = Some(remote.clone());
     config.prefetch_max_bytes = 0;
@@ -7185,6 +7378,8 @@ async fn packed_prefetch_drains_bodies_with_room_for_only_one_object() {
 async fn packed_prefetch_response_returns_before_blocked_pack_get() {
     let dir = tempfile::tempdir().unwrap();
     let mut config = test_config(dir.path());
+    // Catalog discovery is a LIST.
+    config.remote_key_listing = true;
     config.remote = Some(test_remote_config());
     let inner = test_remote_backend();
     let context = PackPrefetchContext::from_deps(
@@ -7251,6 +7446,8 @@ async fn packed_prefetch_response_returns_before_blocked_pack_get() {
 async fn demand_v3_read_completes_while_a_prefetch_pack_is_blocked() {
     let dir = tempfile::tempdir().unwrap();
     let mut config = test_config(dir.path());
+    // Catalog discovery is a LIST.
+    config.remote_key_listing = true;
     config.remote = Some(test_remote_config());
     let inner = test_remote_backend();
     let deps = vec![("serde".to_string(), "1.0.0".to_string())];
@@ -7361,6 +7558,8 @@ async fn demand_v3_read_completes_while_a_prefetch_pack_is_blocked() {
 async fn corrupt_pack_falls_back_only_to_the_existing_v3_entry() {
     let dir = tempfile::tempdir().unwrap();
     let mut config = test_config(dir.path());
+    // Catalog discovery is a LIST.
+    config.remote_key_listing = true;
     config.remote = Some(test_remote_config());
     let backend = test_remote_backend();
     let daemon = Arc::new(Daemon::new(config));
@@ -7444,6 +7643,8 @@ async fn corrupt_pack_falls_back_only_to_the_existing_v3_entry() {
 async fn catalog_filename_timestamp_mismatch_rejects_context_and_uses_v3() {
     let dir = tempfile::tempdir().unwrap();
     let mut config = test_config(dir.path());
+    // Catalog discovery is a LIST.
+    config.remote_key_listing = true;
     config.remote = Some(test_remote_config());
     let backend = test_remote_backend();
     let daemon = Arc::new(Daemon::new(config));
@@ -7541,6 +7742,8 @@ async fn catalog_filename_timestamp_mismatch_rejects_context_and_uses_v3() {
 async fn traversal_in_one_pack_entry_preserves_valid_batch_and_falls_back_per_entry() {
     let dir = tempfile::tempdir().unwrap();
     let mut config = test_config(dir.path());
+    // Catalog discovery is a LIST.
+    config.remote_key_listing = true;
     config.remote = Some(test_remote_config());
     let backend = test_remote_backend();
     let daemon = Arc::new(Daemon::new(config));
@@ -7653,6 +7856,8 @@ async fn traversal_in_one_pack_entry_preserves_valid_batch_and_falls_back_per_en
 async fn packed_receipt_keeps_cancelled_entries_when_claim_is_blocked() {
     let dir = tempfile::tempdir().unwrap();
     let mut config = test_config(dir.path());
+    // Catalog discovery is a LIST.
+    config.remote_key_listing = true;
     config.remote = Some(test_remote_config());
     let remote = config.remote.clone().unwrap();
     let backend = test_remote_backend();
@@ -7740,6 +7945,8 @@ async fn packed_receipt_keeps_cancelled_entries_when_claim_is_blocked() {
 async fn packed_import_error_marks_the_pack_failed_without_entry_validation_errors() {
     let dir = tempfile::tempdir().unwrap();
     let mut config = test_config(dir.path());
+    // Catalog discovery is a LIST.
+    config.remote_key_listing = true;
     config.remote = Some(test_remote_config());
     std::fs::create_dir_all(config.store_dir()).unwrap();
     std::fs::write(config.store_dir().join("blobs"), b"not a directory").unwrap();

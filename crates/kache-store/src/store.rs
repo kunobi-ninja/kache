@@ -2549,6 +2549,14 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         let mut put_result = StorePutResult::default();
         let mut total_size = 0u64;
         for (source_path, store_name) in output_files {
+            // Every writer funnels through here, and the index checks over
+            // committed metadata read these names back, so the same predicate
+            // gates both: a name the verifier would call corrupt metadata must
+            // never reach `meta.json` in the first place.
+            anyhow::ensure!(
+                kache_format::is_safe_stored_artifact_name(store_name),
+                "refusing to cache an artifact with an unsafe name: {store_name}"
+            );
             // The mode is read from the compiler's output, never from the
             // staging snapshot taken below. That snapshot is authoritative for
             // *bytes* — hashing it rather than the live output is the whole
@@ -3186,7 +3194,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                 .with_context(|| format!("entry {key}: parsing authoritative meta.json"))?;
             for file in &meta.files {
                 if !kache_format::is_blob_hash(&file.hash)
-                    || !kache_format::is_safe_artifact_name(&file.name)
+                    || !kache_format::is_safe_stored_artifact_name(&file.name)
                 {
                     anyhow::bail!("entry {key}: invalid blob metadata");
                 }
@@ -3437,7 +3445,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         // entry never lands as a row that would resolve to a missing blob.
         for file in &meta.files {
             if !kache_format::is_blob_hash(&file.hash)
-                || !kache_format::is_safe_artifact_name(&file.name)
+                || !kache_format::is_safe_stored_artifact_name(&file.name)
             {
                 return Ok(None);
             }
@@ -8326,6 +8334,114 @@ mod tests {
             let error = store.reconcile_blob_index().unwrap_err().to_string();
             assert!(error.contains("invalid blob metadata"), "{error}");
         }
+    }
+
+    #[test]
+    fn blob_index_accepts_build_script_out_dir_artifact_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+        let flat = dir.path().join("asm.s");
+        fs::write(&flat, b"asm bytes").unwrap();
+        let nested = dir.path().join("asm.o");
+        fs::write(&nested, b"object bytes").unwrap();
+
+        // `build_script.rs` records OUT_DIR contents as `out/<relative>`, so a
+        // committed build-script entry is *not* drift: the verifier has to
+        // accept the names the writer produces. Otherwise every build script
+        // makes `doctor --verify` report phantom corruption it cannot repair.
+        store
+            .put(
+                "build_script_entry",
+                "build_script_run",
+                &["build-script".to_string()],
+                &[],
+                "host",
+                "dev",
+                &[
+                    (flat, "out/asm.s".to_string()),
+                    (nested, "out/nested/asm.o".to_string()),
+                ],
+                "",
+                "",
+            )
+            .unwrap();
+
+        assert_eq!(store.blob_index_drift().unwrap().total(), 0);
+        assert_eq!(store.reconcile_blob_index().unwrap().total(), 0);
+    }
+
+    #[test]
+    fn rebuild_index_from_store_adopts_build_script_names_and_refuses_escaping_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+        let output = dir.path().join("asm.s");
+        fs::write(&output, b"asm bytes").unwrap();
+        // Rebuild scans entry directories by cache key, so this must be one.
+        let key = "b".repeat(64);
+        store
+            .put(
+                &key,
+                "build_script_run",
+                &["build-script".to_string()],
+                &[],
+                "host",
+                "dev",
+                &[(output, "out/asm.s".to_string())],
+                "",
+                "",
+            )
+            .unwrap();
+
+        store.db.execute("DELETE FROM entries", []).unwrap();
+        let stats = store.rebuild_index_from_store().unwrap();
+        assert_eq!(stats.entries_rebuilt, 1, "{stats:?}");
+        assert_eq!(stats.entries_skipped, 0, "{stats:?}");
+        assert!(store.contains(&key));
+
+        // Rebuild reads the same committed metadata as the index checks, so a
+        // name that escapes the entry dir is still refused rather than
+        // registered.
+        let meta_path = store.entry_dir(&key).join("meta.json");
+        let mut meta: EntryMeta =
+            serde_json::from_str(&fs::read_to_string(&meta_path).unwrap()).unwrap();
+        meta.files[0].name = "../escape.s".to_string();
+        fs::write(&meta_path, serde_json::to_vec(&meta).unwrap()).unwrap();
+
+        store.db.execute("DELETE FROM entries", []).unwrap();
+        let stats = store.rebuild_index_from_store().unwrap();
+        assert_eq!(stats.entries_rebuilt, 0, "{stats:?}");
+        assert_eq!(stats.entries_skipped, 1, "{stats:?}");
+    }
+
+    #[test]
+    fn put_rejects_an_artifact_name_that_escapes_the_entry_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+        let output = dir.path().join("output.rlib");
+        fs::write(&output, b"valid blob bytes").unwrap();
+
+        let error = store
+            .put(
+                "escaping_name",
+                "escapelib",
+                &["lib".to_string()],
+                &[],
+                "host",
+                "dev",
+                &[(output, "../escape.rlib".to_string())],
+                "",
+                "",
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("unsafe name"),
+            "a traversal must be refused before it reaches meta.json: {error}"
+        );
+        assert!(!store.contains("escaping_name"));
     }
 
     #[test]

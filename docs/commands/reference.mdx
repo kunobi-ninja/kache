@@ -188,7 +188,7 @@ write: a job that loses a race reads the manifest again and retries, and after
 five tries it fails and leaves the manifest as the other jobs wrote it. Stores
 without conditional writes, including filesystem remotes, get the merged
 manifest written plainly, so two jobs finishing at the same moment can still
-drop each other's entries there.
+drop each other's entries there. Shards merge the same way.
 
 ## `kache daemon`
 

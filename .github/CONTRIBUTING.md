@@ -42,6 +42,7 @@ just fix            # auto-fix formatting + clippy warnings
 just coverage       # tests with cargo-llvm-cov coverage
 just coverage-open  # coverage with HTML report
 just mutants-core   # mutation-test all kache-core behavior
+just e2e-s3         # S3 remote tests against a throwaway local RustFS
 just clean          # remove build artifacts
 ```
 

@@ -80,7 +80,15 @@ pub trait V3Prefetch: Send + Sync {
 
     async fn get_shard(&self, namespace: &str, shard_hash: &str) -> Result<Option<Shard>>;
 
-    async fn put_shard(&self, namespace: &str, shard_hash: &str, shard: &Shard) -> Result<()>;
+    /// Publish `shard` merged with what the remote holds for it; `commit` as
+    /// for [`V3Prefetch::put_build_manifest`].
+    async fn put_shard(
+        &self,
+        namespace: &str,
+        shard_hash: &str,
+        shard: &Shard,
+        commit: Option<&str>,
+    ) -> Result<()>;
 
     /// Object keys under `prefix` for packed prefetch discovery.
     async fn list_prefetch_objects(&self, prefix: &str) -> Result<Vec<String>>;
@@ -218,13 +226,20 @@ impl V3Prefetch for V3Remote {
         .await
     }
 
-    async fn put_shard(&self, namespace: &str, shard_hash: &str, shard: &Shard) -> Result<()> {
+    async fn put_shard(
+        &self,
+        namespace: &str,
+        shard_hash: &str,
+        shard: &Shard,
+        commit: Option<&str>,
+    ) -> Result<()> {
         remote::upload_shard(
             self.backend.as_ref(),
             &self.remote.prefix,
             namespace,
             shard_hash,
             shard,
+            commit,
         )
         .await
     }
@@ -354,7 +369,7 @@ mod tests {
                 artifact_size: Some(5678),
             }],
         };
-        remote.put_shard("ns", "h1", &shard).await.unwrap();
+        remote.put_shard("ns", "h1", &shard, None).await.unwrap();
         let fetched = remote.get_shard("ns", "h1").await.unwrap().unwrap();
         // `Shard` has no `PartialEq`; compare the serialized shape instead.
         assert_eq!(

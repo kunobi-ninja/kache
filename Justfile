@@ -191,6 +191,11 @@ e2e:
     --select tier:gate \
     --out tmp/e2e/results.json
 
+# Run the S3 remote tests against a throwaway local RustFS.
+[group('dev')]
+e2e-s3 *ARGS:
+  scripts/e2e-s3.sh {{ARGS}}
+
 # Run the same gate e2e harness inside a Linux container — CI-equivalent
 # results from a non-Linux host (e.g. macOS), where the host clang behaves
 # differently from CI's Linux clang. Useful to validate quick compile-cache

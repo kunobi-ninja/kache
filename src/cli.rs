@@ -6672,7 +6672,7 @@ async fn upload_manifest_and_shards(
     // Upload sharded build-manifest indexes if a namespace is provided and Cargo.lock exists.
     if let Some(ns) = namespace {
         if lock_path.exists() {
-            let shard_count = upload_shards(remote_cache, ns, lock_path, &entries).await?;
+            let shard_count = upload_shards(remote_cache, ns, lock_path, &entries, commit).await?;
             eprintln!("Uploaded {shard_count} shards for namespace '{ns}'");
         } else {
             eprintln!("No Cargo.lock found, skipping shard upload");
@@ -6692,6 +6692,7 @@ async fn upload_shards(
     namespace: &str,
     lock_path: &std::path::Path,
     entries: &[crate::remote::ManifestEntry],
+    commit: Option<&str>,
 ) -> Result<usize> {
     let deps = crate::shards::parse_cargo_lock(lock_path)?;
     let shard_set = crate::shards::compute_shards(&deps);
@@ -6739,9 +6740,12 @@ async fn upload_shards(
     for (hash, shard) in uploads {
         let remote_cache = Arc::clone(remote_cache);
         let namespace = namespace.to_string();
+        let commit = commit.map(str::to_string);
         let permit = sem.clone().acquire_owned().await?;
         handles.push(tokio::spawn(async move {
-            let result = remote_cache.put_shard(&namespace, &hash, &shard).await;
+            let result = remote_cache
+                .put_shard(&namespace, &hash, &shard, commit.as_deref())
+                .await;
             drop(permit);
             result
         }));
@@ -10176,7 +10180,7 @@ mod tests {
         let remote_cache: Arc<crate::cache_remote::V3Remote> =
             Arc::new(crate::cache_remote::V3Remote::new(client, remote));
 
-        let uploaded = upload_shards(&remote_cache, "ns", &lock, &entries)
+        let uploaded = upload_shards(&remote_cache, "ns", &lock, &entries, None)
             .await
             .expect("upload_shards should succeed");
         assert_eq!(uploaded, expected);
@@ -10205,7 +10209,7 @@ mod tests {
         let remote = test_remote_cfg();
         let remote_cache: Arc<crate::cache_remote::V3Remote> =
             Arc::new(crate::cache_remote::V3Remote::new(client, remote));
-        let uploaded = upload_shards(&remote_cache, "ns", &lock, &[])
+        let uploaded = upload_shards(&remote_cache, "ns", &lock, &[], None)
             .await
             .expect("should succeed with nothing to upload");
         assert_eq!(uploaded, 0);
@@ -10224,7 +10228,7 @@ mod tests {
         let remote_cache: Arc<crate::cache_remote::V3Remote> =
             Arc::new(crate::cache_remote::V3Remote::new(client, remote));
 
-        let err = upload_shards(&remote_cache, "ns", &lock, &[])
+        let err = upload_shards(&remote_cache, "ns", &lock, &[], None)
             .await
             .expect_err("bad lockfile should error");
         assert!(

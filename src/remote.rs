@@ -149,6 +149,12 @@ const MANIFEST_MERGE_WINDOW_SECS: i64 = 60 * 60;
 /// the other publishers wrote it.
 const MANIFEST_PUBLISH_ATTEMPTS: usize = 5;
 
+/// Pause after a lost race before reading again: `attempt` × 50 ms plus up to
+/// 50 ms of `jitter`, so publishers that collided do not collide again.
+fn conflict_backoff(attempt: usize, jitter: u64) -> std::time::Duration {
+    std::time::Duration::from_millis(attempt as u64 * 50 + jitter % 50)
+}
+
 /// Most entries a merged manifest holds. The publishing build's own entries
 /// always stay; stored entries fill what is left, newest publishers first.
 /// About 300 bytes each, so a full manifest stays far below the read limit.
@@ -166,59 +172,126 @@ fn keep_stored_entry(published: &Published, commit: Option<&str>, now: i64) -> b
     }
 }
 
-/// Combine a stored manifest with the entries one build just published.
+/// An entry of a published object that merges by cache key.
+trait MergedEntry: Clone {
+    fn cache_key(&self) -> &str;
+}
+
+impl MergedEntry for ManifestEntry {
+    fn cache_key(&self) -> &str {
+        &self.cache_key
+    }
+}
+
+impl MergedEntry for ShardEntry {
+    fn cache_key(&self) -> &str {
+        &self.cache_key
+    }
+}
+
+/// Merge the entries one build just published with those already stored.
 ///
-/// Several builds share a manifest key: CI jobs for tests, lints and docs on
-/// one lockfile, target and profile. Each publishes what it used, so an
-/// overwrite keeps only the last job's entries. The merge keeps the new
-/// entries first, in the order the build used them, then every stored entry
-/// that [`keep_stored_entry`] retains.
-fn merge_manifest(
-    existing: Option<StoredManifest>,
-    manifest: &BuildManifest,
+/// The new entries come first, in the order the build used them, then every
+/// stored entry that [`keep_stored_entry`] retains, up to
+/// [`MANIFEST_MAX_ENTRIES`]. Returns the entries and their provenance.
+fn merge_entries<E: MergedEntry>(
+    new: &[E],
+    stored: Option<(Vec<E>, BTreeMap<String, Published>)>,
     commit: Option<&str>,
     now: i64,
-) -> StoredManifest {
+) -> (Vec<E>, BTreeMap<String, Published>) {
     let stamp = Published {
         at: now,
         commit: commit.map(str::to_string),
     };
-    let mut merged = StoredManifest {
-        manifest: manifest.clone(),
-        published: manifest
-            .entries
-            .iter()
-            .map(|entry| (entry.cache_key.clone(), stamp.clone()))
-            .collect(),
+    let mut entries = new.to_vec();
+    let mut published: BTreeMap<String, Published> = new
+        .iter()
+        .map(|entry| (entry.cache_key().to_string(), stamp.clone()))
+        .collect();
+    let Some((stored_entries, stored_published)) = stored else {
+        return (entries, published);
     };
-    let Some(existing) = existing else {
-        return merged;
-    };
-    for entry in existing.manifest.entries {
-        if merged.manifest.entries.len() >= MANIFEST_MAX_ENTRIES {
+    for entry in stored_entries {
+        if entries.len() >= MANIFEST_MAX_ENTRIES {
             break;
         }
-        if merged.published.contains_key(&entry.cache_key) {
+        if published.contains_key(entry.cache_key()) {
             continue;
         }
         // An entry from before merging is treated as just published, once.
         // A stamp from the future counts as now, so it still expires.
-        let published = match existing.published.get(&entry.cache_key) {
-            Some(published) => Published {
-                at: published.at.min(now),
-                commit: published.commit.clone(),
+        let provenance = match stored_published.get(entry.cache_key()) {
+            Some(stored) => Published {
+                at: stored.at.min(now),
+                commit: stored.commit.clone(),
             },
             None => Published {
                 at: now,
                 commit: None,
             },
         };
-        if keep_stored_entry(&published, commit, now) {
-            merged.published.insert(entry.cache_key.clone(), published);
-            merged.manifest.entries.push(entry);
+        if keep_stored_entry(&provenance, commit, now) {
+            published.insert(entry.cache_key().to_string(), provenance);
+            entries.push(entry);
         }
     }
-    merged
+    (entries, published)
+}
+
+/// Combine a stored manifest with the entries one build just published.
+///
+/// Several builds share a manifest key: CI jobs for tests, lints and docs on
+/// one lockfile, target and profile. Each publishes what it used, so an
+/// overwrite keeps only the last job's entries. See [`merge_entries`].
+fn merge_manifest(
+    existing: Option<StoredManifest>,
+    manifest: &BuildManifest,
+    commit: Option<&str>,
+    now: i64,
+) -> StoredManifest {
+    let stored = existing.map(|existing| (existing.manifest.entries, existing.published));
+    let (entries, published) = merge_entries(&manifest.entries, stored, commit, now);
+    StoredManifest {
+        manifest: BuildManifest {
+            entries,
+            ..manifest.clone()
+        },
+        published,
+    }
+}
+
+/// A shard as stored, with the same provenance as [`StoredManifest`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StoredShard {
+    #[serde(flatten)]
+    shard: Shard,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    published: BTreeMap<String, Published>,
+}
+
+/// Combine a stored shard with the entries one build just published. Builds
+/// that share a lockfile share its shards, and each job may have used a
+/// different build of the same crate, so they merge like manifests.
+fn merge_shard(
+    existing: Option<StoredShard>,
+    shard: &Shard,
+    commit: Option<&str>,
+    now: i64,
+) -> StoredShard {
+    // A shard of another format version is replaced, not merged: its entries
+    // may not mean what this version's do.
+    let stored = existing
+        .filter(|existing| existing.shard.version == shard.version)
+        .map(|existing| (existing.shard.entries, existing.published));
+    let (entries, published) = merge_entries(&shard.entries, stored, commit, now);
+    StoredShard {
+        shard: Shard {
+            version: shard.version,
+            entries,
+        },
+        published,
+    }
 }
 
 /// Refuse to store a manifest no reader would accept.
@@ -236,8 +309,8 @@ fn strong_etag(etag: Option<String>) -> Option<String> {
     etag.filter(|tag| !tag.trim_start().starts_with("W/"))
 }
 
-/// Publish `manifest`, merged with what the remote already holds for its key
-/// (see [`merge_manifest`]).
+/// Replace `object_key` with `merge(stored bytes, now)`, the stored bytes
+/// being `None` when the object is absent.
 ///
 /// Where the store supports conditional writes, the read and the write are
 /// tied by an entity tag: a publisher that loses a race reads again and
@@ -245,6 +318,65 @@ fn strong_etag(etag: Option<String>) -> Option<String> {
 /// leaving the winners' entries in place. A store that cannot make the write
 /// conditional gets the merge written plainly, so a publisher racing between
 /// the read and the write can still lose there.
+async fn publish_merged(
+    backend: &dyn RemoteBackend,
+    object_key: &str,
+    kind: &str,
+    merge: impl Fn(Option<&[u8]>, i64) -> Result<Vec<u8>>,
+) -> Result<()> {
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        let now = chrono::Utc::now().timestamp();
+        let fetched = backend
+            .get_versioned(object_key, Some(MAX_METADATA_BYTES))
+            .await
+            .with_context(|| format!("downloading {kind} to merge"))?;
+        let present = fetched.is_some();
+        let (stored, etag) = match fetched {
+            Some((object, etag)) => (Some(object.body), strong_etag(etag)),
+            None => (None, None),
+        };
+        let merged = merge(stored.as_deref(), now)?;
+        // Release the read's share of the download budget before the write.
+        drop(stored);
+        let body = within_read_limit(merged, MAX_METADATA_BYTES)?;
+        let outcome = if present && etag.is_none() {
+            // Nothing to make the replacement conditional on.
+            ConditionalPut::Unsupported
+        } else {
+            backend
+                .put_if_match(
+                    object_key,
+                    body.clone(),
+                    Some("application/json"),
+                    etag.as_deref(),
+                )
+                .await
+                .with_context(|| format!("publishing merged {kind}"))?
+        };
+        match outcome {
+            ConditionalPut::Stored => return Ok(()),
+            ConditionalPut::Conflict if attempt < MANIFEST_PUBLISH_ATTEMPTS => {
+                let jitter = u64::from(chrono::Utc::now().timestamp_subsec_nanos());
+                tokio::time::sleep(conflict_backoff(attempt, jitter)).await;
+            }
+            ConditionalPut::Conflict => anyhow::bail!(
+                "{} kept changing during {MANIFEST_PUBLISH_ATTEMPTS} attempts to merge into it",
+                backend.describe(object_key)
+            ),
+            ConditionalPut::Unsupported => {
+                return backend
+                    .put(object_key, body, Some("application/json"))
+                    .await
+                    .with_context(|| format!("uploading {kind}"));
+            }
+        }
+    }
+}
+
+/// Publish `manifest`, merged with what the remote already holds for its key
+/// (see [`merge_manifest`] and [`publish_merged`]).
 pub async fn upload_manifest(
     backend: &dyn RemoteBackend,
     prefix: &str,
@@ -254,52 +386,13 @@ pub async fn upload_manifest(
 ) -> Result<()> {
     let object_key =
         crate::config::join_remote_key(prefix, &format!("{MANIFEST_PREFIX}/{manifest_key}.json"));
-    let mut attempt = 0;
-    loop {
-        attempt += 1;
-        let now = chrono::Utc::now().timestamp();
-        let fetched = backend
-            .get_versioned(&object_key, Some(MAX_METADATA_BYTES))
-            .await
-            .context("downloading manifest to merge")?;
-        let present = fetched.is_some();
-        let (existing, etag) = match fetched {
-            // A manifest this build cannot parse is replaced, not merged.
-            Some((object, etag)) => (serde_json::from_slice(&object.body).ok(), strong_etag(etag)),
-            None => (None, None),
-        };
-        let merged = merge_manifest(existing, manifest, commit, now);
-        let body = serde_json::to_vec(&merged).context("serializing manifest")?;
-        let body = within_read_limit(body, MAX_METADATA_BYTES)?;
-        let outcome = if present && etag.is_none() {
-            // Nothing to make the replacement conditional on.
-            ConditionalPut::Unsupported
-        } else {
-            backend
-                .put_if_match(
-                    &object_key,
-                    body.clone(),
-                    Some("application/json"),
-                    etag.as_deref(),
-                )
-                .await
-                .context("publishing merged manifest")?
-        };
-        match outcome {
-            ConditionalPut::Stored => return Ok(()),
-            ConditionalPut::Conflict if attempt < MANIFEST_PUBLISH_ATTEMPTS => continue,
-            ConditionalPut::Conflict => anyhow::bail!(
-                "{} kept changing during {MANIFEST_PUBLISH_ATTEMPTS} attempts to merge into it",
-                backend.describe(&object_key)
-            ),
-            ConditionalPut::Unsupported => {
-                return backend
-                    .put(&object_key, body, Some("application/json"))
-                    .await
-                    .context("uploading manifest");
-            }
-        }
-    }
+    publish_merged(backend, &object_key, "manifest", |stored, now| {
+        // A manifest this build cannot parse is replaced, not merged.
+        let existing = stored.and_then(|body| serde_json::from_slice(body).ok());
+        serde_json::to_vec(&merge_manifest(existing, manifest, commit, now))
+            .context("serializing manifest")
+    })
+    .await
 }
 
 /// Format: `{prefix}/_manifests/v3/{namespace}/shards/{shard_hash}.json`
@@ -330,22 +423,23 @@ pub async fn download_shard(
     Ok(Some(shard))
 }
 
+/// Publish `shard`, merged with what the remote already holds for it (see
+/// [`merge_shard`] and [`publish_merged`]).
 pub async fn upload_shard(
     backend: &dyn RemoteBackend,
     prefix: &str,
     namespace: &str,
     shard_hash: &str,
     shard: &Shard,
+    commit: Option<&str>,
 ) -> Result<()> {
     let object_key = shard_object_key(prefix, namespace, shard_hash);
-    let body = serde_json::to_vec_pretty(shard).context("serializing shard")?;
-
-    backend
-        .put(&object_key, body, Some("application/json"))
-        .await
-        .context("uploading shard")?;
-
-    Ok(())
+    publish_merged(backend, &object_key, "shard", |stored, now| {
+        // A shard this build cannot parse is replaced, not merged.
+        let existing = stored.and_then(|body| serde_json::from_slice(body).ok());
+        serde_json::to_vec(&merge_shard(existing, shard, commit, now)).context("serializing shard")
+    })
+    .await
 }
 
 #[cfg(test)]
@@ -570,6 +664,14 @@ mod tests {
     }
 
     const NOW: i64 = 1_000_000;
+
+    #[test]
+    fn conflict_backoff_grows_with_attempts_and_bounds_jitter() {
+        use std::time::Duration;
+        assert_eq!(conflict_backoff(1, 0), Duration::from_millis(50));
+        assert_eq!(conflict_backoff(2, 49), Duration::from_millis(149));
+        assert_eq!(conflict_backoff(1, 50), Duration::from_millis(50));
+    }
 
     #[test]
     fn merge_limits_are_an_hour_and_five_attempts() {
@@ -999,5 +1101,251 @@ mod tests {
             .map(|e| e.cache_key.as_str())
             .collect();
         assert_eq!(keys, ["clippy", "test"]);
+    }
+
+    fn shard_entry(cache_key: &str) -> ShardEntry {
+        ShardEntry {
+            cache_key: cache_key.to_string(),
+            crate_name: "serde".to_string(),
+            compile_time_ms: Some(1),
+            artifact_size: Some(1),
+        }
+    }
+
+    #[test]
+    fn shards_merge_like_manifests_and_still_read_as_shards() {
+        let existing = StoredShard {
+            shard: Shard {
+                version: 3,
+                entries: vec![shard_entry("clippy"), shard_entry("old-commit")],
+            },
+            published: [
+                ("clippy".to_string(), at(NOW, Some("c1"))),
+                ("old-commit".to_string(), at(NOW, Some("c0"))),
+            ]
+            .into(),
+        };
+        let new = Shard {
+            version: 3,
+            entries: vec![shard_entry("test")],
+        };
+        let merged = merge_shard(Some(existing), &new, Some("c1"), NOW);
+        assert_eq!(merged.shard.version, 3);
+        let keys: Vec<_> = merged
+            .shard
+            .entries
+            .iter()
+            .map(|e| e.cache_key.as_str())
+            .collect();
+        assert_eq!(keys, ["test", "clippy"]);
+        assert_eq!(merged.published.get("test"), Some(&at(NOW, Some("c1"))));
+
+        let plain: Shard = serde_json::from_slice(&serde_json::to_vec(&merged).unwrap()).unwrap();
+        assert_eq!(plain.entries.len(), 2);
+    }
+
+    #[test]
+    fn a_shard_of_another_version_is_replaced_not_merged() {
+        let existing = StoredShard {
+            shard: Shard {
+                version: 4,
+                entries: vec![shard_entry("newer-format")],
+            },
+            published: BTreeMap::new(),
+        };
+        let new = Shard {
+            version: 3,
+            entries: vec![shard_entry("test")],
+        };
+        let merged = merge_shard(Some(existing), &new, None, NOW);
+        let keys: Vec<_> = merged
+            .shard
+            .entries
+            .iter()
+            .map(|e| e.cache_key.as_str())
+            .collect();
+        assert_eq!(keys, ["test"]);
+        assert_eq!(merged.shard.version, 3);
+    }
+
+    #[tokio::test]
+    async fn two_shard_publishes_to_the_memory_store_keep_both_builds() {
+        let backend = crate::remote_backend::memory_backend();
+        for key in ["test", "clippy"] {
+            let shard = Shard {
+                version: 3,
+                entries: vec![shard_entry(key)],
+            };
+            upload_shard(&backend, "p", "ns", "h1", &shard, Some("c1"))
+                .await
+                .unwrap();
+        }
+        let stored = download_shard(&backend, "p", "ns", "h1")
+            .await
+            .unwrap()
+            .expect("shard");
+        let keys: Vec<_> = stored
+            .entries
+            .iter()
+            .map(|e| e.cache_key.as_str())
+            .collect();
+        assert_eq!(keys, ["clippy", "test"]);
+    }
+
+    /// A real S3-compatible store, when `KACHE_E2E_S3_ENDPOINT` and
+    /// `KACHE_E2E_S3_BUCKET` name one. Credentials come from
+    /// `KACHE_S3_ACCESS_KEY` and `KACHE_S3_SECRET_KEY`. `just e2e-s3` starts a
+    /// local RustFS and sets all four; without them these tests do nothing.
+    async fn e2e_store() -> Option<(std::sync::Arc<dyn RemoteBackend>, String)> {
+        let endpoint = std::env::var("KACHE_E2E_S3_ENDPOINT").ok()?;
+        let bucket = std::env::var("KACHE_E2E_S3_BUCKET").ok()?;
+        let remote = crate::config::RemoteConfig {
+            prefix: "e2e".to_string(),
+            backend: crate::config::RemoteBackendConfig::S3(crate::config::S3RemoteConfig {
+                bucket,
+                endpoint: Some(endpoint),
+                region: "us-east-1".to_string(),
+                profile: None,
+                user_agent: None,
+            }),
+        };
+        let backend = crate::remote_backend::create_backend(&remote, 30)
+            .await
+            .expect("S3 backend for the e2e store");
+        // One fresh prefix per test run, so reruns never see old objects.
+        let run = format!(
+            "e2e/{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        );
+        Some((backend, run))
+    }
+
+    #[tokio::test]
+    async fn e2e_s3_store_honours_conditional_writes() {
+        let Some((backend, run)) = e2e_store().await else {
+            return;
+        };
+        let key = format!("{run}/object.json");
+        let put = |body: &'static [u8], expected: Option<String>| {
+            let (backend, key) = (backend.clone(), key.clone());
+            async move {
+                backend
+                    .put_if_match(
+                        &key,
+                        body.to_vec(),
+                        Some("application/json"),
+                        expected.as_deref(),
+                    )
+                    .await
+                    .unwrap()
+            }
+        };
+
+        // Each read is dropped before the next: a buffered object holds its
+        // share of the process-wide download budget until then.
+        let read = |backend: std::sync::Arc<dyn RemoteBackend>, key: String| async move {
+            let (object, etag) = backend
+                .get_versioned(&key, Some(1024))
+                .await
+                .unwrap()
+                .unwrap();
+            (object.body.to_vec(), etag)
+        };
+
+        assert_eq!(put(b"1", None).await, ConditionalPut::Stored);
+        assert_eq!(put(b"2", None).await, ConditionalPut::Conflict);
+        let (body, first) = read(backend.clone(), key.clone()).await;
+        assert_eq!(body, b"1");
+        let first = first.expect("the store returns an entity tag");
+
+        assert_eq!(put(b"3", Some(first.clone())).await, ConditionalPut::Stored);
+        assert_eq!(put(b"4", Some(first)).await, ConditionalPut::Conflict);
+        let (body, _) = read(backend.clone(), key.clone()).await;
+        assert_eq!(body, b"3");
+    }
+
+    #[tokio::test]
+    async fn e2e_s3_concurrent_publishers_never_lose_a_published_entry() {
+        let Some((backend, run)) = e2e_store().await else {
+            return;
+        };
+        let manifest_key = format!("{run}/id/test");
+        let publishers = 6;
+        let tasks: Vec<_> = (0..publishers)
+            .map(|i| {
+                let (backend, manifest_key) = (backend.clone(), manifest_key.clone());
+                tokio::spawn(async move {
+                    let manifest = manifest_with(vec![entry(&format!("job-{i}"), 1)]);
+                    upload_manifest(backend.as_ref(), "", &manifest_key, &manifest, Some("c1"))
+                        .await
+                        .map(|()| format!("job-{i}"))
+                })
+            })
+            .collect();
+        let mut published = Vec::new();
+        for task in tasks {
+            match task.await.unwrap() {
+                Ok(key) => published.push(key),
+                // Losing every attempt is allowed; losing silently is not.
+                Err(error) => assert!(error.to_string().contains("attempts"), "{error:#}"),
+            }
+        }
+        assert!(!published.is_empty());
+
+        let stored = try_download_manifest(backend.as_ref(), "", &manifest_key)
+            .await
+            .unwrap()
+            .expect("manifest");
+        let stored: Vec<_> = stored.entries.iter().map(|e| e.cache_key.clone()).collect();
+        for key in &published {
+            assert!(stored.contains(key), "{key} missing from {stored:?}");
+        }
+        eprintln!(
+            "{} of {publishers} publishers stored; manifest holds {stored:?}",
+            published.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn e2e_s3_concurrent_shard_publishers_never_lose_a_published_entry() {
+        let Some((backend, run)) = e2e_store().await else {
+            return;
+        };
+        let publishers = 6;
+        let tasks: Vec<_> = (0..publishers)
+            .map(|i| {
+                let (backend, run) = (backend.clone(), run.clone());
+                tokio::spawn(async move {
+                    let shard = Shard {
+                        version: 3,
+                        entries: vec![shard_entry(&format!("job-{i}"))],
+                    };
+                    upload_shard(backend.as_ref(), &run, "ns", "h1", &shard, Some("c1"))
+                        .await
+                        .map(|()| format!("job-{i}"))
+                })
+            })
+            .collect();
+        let mut published = Vec::new();
+        for task in tasks {
+            match task.await.unwrap() {
+                Ok(key) => published.push(key),
+                Err(error) => assert!(error.to_string().contains("attempts"), "{error:#}"),
+            }
+        }
+        assert!(!published.is_empty());
+        let stored = download_shard(backend.as_ref(), &run, "ns", "h1")
+            .await
+            .unwrap()
+            .expect("shard");
+        let stored: Vec<_> = stored.entries.iter().map(|e| e.cache_key.clone()).collect();
+        for key in &published {
+            assert!(stored.contains(key), "{key} missing from {stored:?}");
+        }
+        eprintln!(
+            "{} of {publishers} shard publishers stored",
+            published.len()
+        );
     }
 }

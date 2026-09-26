@@ -4,8 +4,9 @@ use anyhow::{Context, Result};
 pub(crate) use kache_format::{is_valid_cache_key, is_valid_crate_name};
 pub(crate) use kache_store::file_hash::*;
 use std::borrow::Cow;
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::{BTreeMap, HashMap};
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 /// Bump this when cache key logic changes in a way that could have produced
@@ -2240,6 +2241,10 @@ pub fn compute_cache_key(
     let _ = LAST_KEY_USED_PREDICTION.try_with(|stash| stash.set(false));
     let _ = LAST_KEY_BAKES_OUT_DIR.try_with(|stash| stash.set(false));
 
+    // The unit's OUT_DIR, read here once and passed to everything below that
+    // needs it, so those helpers never read the process environment.
+    let out_dir = std::env::var_os("OUT_DIR");
+
     // key version — bump CACHE_KEY_VERSION to invalidate all prior entries
     hasher.update(b"key_version:");
     hasher.update(CACHE_KEY_VERSION.to_string().as_bytes());
@@ -2477,19 +2482,21 @@ pub fn compute_cache_key(
 
         hasher.set_group("env_deps");
         let aliased_out_dir = crate::out_dir_alias::active_alias();
+        let env_dep_paths = EnvDepPaths::new(out_dir.as_deref(), &dep_info.source_files);
         let mut bakes_out_dir = false;
         for (var, val) in &dep_info.env_deps {
+            let value = EnvDepValue::new(val);
             let normalized_env_dep = normalize_env_dep_value_with_hasher(
                 crate_name,
                 var,
-                val,
-                &dep_info.source_files,
+                &value,
+                &env_dep_paths,
                 file_hasher,
                 path_normalizer,
                 aliased_out_dir,
             );
             bakes_out_dir |= env_dep_bakes_out_dir(var, normalized_env_dep.decision, || {
-                value_is_under_out_dir(val)
+                env_dep_paths.value_is_under_out_dir(&value)
             });
             fold_field(&mut hasher, b"env_dep_var:", var.as_bytes());
             fold_field(
@@ -2741,7 +2748,7 @@ pub fn compute_cache_key(
     };
     let rustc_host = link_rustc_version.as_deref().and_then(rustc_host_triple);
     let target = link_target(args.target.as_deref(), rustc_host);
-    let unit_out_dir = std::env::var_os("OUT_DIR").map(PathBuf::from);
+    let unit_out_dir = out_dir.map(PathBuf::from);
     let native_archives = fold_native_link_inputs(
         &mut hasher,
         args,
@@ -4293,14 +4300,13 @@ fn static_lib_spec(spec: &str) -> StaticLibSpec<'_> {
 /// sentinel form when the value lives under the build's own OUT_DIR
 /// (kunobi-ninja/kache#330 — the unit-hash component stays observable), else
 /// the generic prefix-rule normalization.
-fn sentinelized_env_dep_value(resolved: &str, normalized: &str) -> String {
-    if let Some(rel) = out_dir_relative_suffix(resolved) {
-        let unit = std::env::var_os("OUT_DIR")
-            .map(std::path::PathBuf::from)
-            .as_deref()
-            .and_then(|p| p.parent().and_then(|d| d.file_name().map(|n| n.to_owned())))
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
+fn sentinelized_env_dep_value(
+    paths: &EnvDepPaths<'_>,
+    resolved: &EnvDepValue<'_>,
+    normalized: &str,
+) -> String {
+    if let Some(rel) = paths.out_dir_suffix(resolved) {
+        let unit = out_dir_unit(paths.out_dir);
         if rel.is_empty() {
             format!("<OUT_DIR:{unit}>")
         } else {
@@ -4314,12 +4320,13 @@ fn sentinelized_env_dep_value(resolved: &str, normalized: &str) -> String {
 fn normalize_env_dep_value_with_hasher(
     crate_name: &str,
     var: &str,
-    val: &str,
-    source_files: &[std::path::PathBuf],
+    value: &EnvDepValue<'_>,
+    paths: &EnvDepPaths<'_>,
     file_hasher: &FileHasher<'_>,
     path_normalizer: &PathNormalizer,
     aliased_out_dir: Option<&Path>,
 ) -> NormalizedEnvDep {
+    let val = value.raw;
     // The shared OUT_DIR is one string on this machine whatever the checkout,
     // and the artifact bakes exactly that string. A sentinel from a rule that
     // happens to cover the cache dir (`<HOME>`) would give one key to
@@ -4345,7 +4352,9 @@ fn normalize_env_dep_value_with_hasher(
     // wrote into it). Fall back to a lexical `.`/`..` collapse when the path is
     // absent. A no-op on Linux/macOS with a relative target dir, which cargo
     // canonicalizes before invoking rustc.
-    let resolved = crate::path_normalizer::canonical_string(std::path::Path::new(val))
+    let resolved = value
+        .canonical()
+        .and_then(crate::path_normalizer::canonical_form)
         .unwrap_or_else(|| lexically_resolve_path(val));
     let normalized = path_normalizer.normalize(&resolved);
 
@@ -4369,17 +4378,21 @@ fn normalize_env_dep_value_with_hasher(
         && path_normalizer.path_only_env_vars().iter().any(|entry| {
             matches!(entry.split_once(':'), Some((krate, v)) if krate == crate_name && v == var)
         });
+    // The checks below read the resolved form. It is the raw value, and so
+    // shares its canonical path, unless resolution changed the string.
+    let resolved_value = (resolved != val).then(|| EnvDepValue::new(&resolved));
+    let resolved_value = resolved_value.as_ref().unwrap_or(value);
     if forced {
         return NormalizedEnvDep {
-            value: sentinelized_env_dep_value(&resolved, &normalized),
+            value: sentinelized_env_dep_value(paths, resolved_value, &normalized),
             decision: EnvDepNormalizationDecision::ForcedPathOnly,
         };
     }
 
     let decision = env_dep_path_only_decision(
         var,
-        &resolved,
-        source_files,
+        resolved_value,
+        paths,
         path_normalizer.path_only_env_vars(),
         file_hasher,
     );
@@ -4396,7 +4409,7 @@ fn normalize_env_dep_value_with_hasher(
         // observable value, so two units whose OUT_DIRs differ only by
         // unit hash are not interchangeable (cross-model review finding).
         return NormalizedEnvDep {
-            value: sentinelized_env_dep_value(&resolved, &normalized),
+            value: sentinelized_env_dep_value(paths, resolved_value, &normalized),
             decision: EnvDepNormalizationDecision::NormalizedPathOnly,
         };
     }
@@ -4420,11 +4433,24 @@ fn normalize_env_dep_value(
     source_files: &[std::path::PathBuf],
     path_normalizer: &PathNormalizer,
 ) -> NormalizedEnvDep {
+    normalize_env_dep_value_in(crate_name, var, val, source_files, path_normalizer, None)
+}
+
+/// [`normalize_env_dep_value`] for a unit whose `OUT_DIR` is `out_dir`.
+#[cfg(test)]
+fn normalize_env_dep_value_in(
+    crate_name: &str,
+    var: &str,
+    val: &str,
+    source_files: &[std::path::PathBuf],
+    path_normalizer: &PathNormalizer,
+    out_dir: Option<&OsStr>,
+) -> NormalizedEnvDep {
     normalize_env_dep_value_with_hasher(
         crate_name,
         var,
-        val,
-        source_files,
+        &EnvDepValue::new(val),
+        &EnvDepPaths::new(out_dir, source_files),
         &FileHasher::new(),
         path_normalizer,
         None,
@@ -4454,8 +4480,8 @@ fn env_dep_bakes_out_dir(
 /// always included.
 fn env_dep_path_only_decision(
     var: &str,
-    val: &str,
-    source_files: &[std::path::PathBuf],
+    value: &EnvDepValue<'_>,
+    paths: &EnvDepPaths<'_>,
     allowlist: &[String],
     file_hasher: &FileHasher<'_>,
 ) -> EnvDepNormalizationDecision {
@@ -4499,13 +4525,16 @@ fn env_dep_path_only_decision(
     if is_manifest_dir_var(var) {
         return EnvDepNormalizationDecision::KeptAbsoluteManifestDir;
     }
-    if !(var == "OUT_DIR" || allowlist.iter().any(|v| v == var) || value_is_under_out_dir(val)) {
+    if !(var == "OUT_DIR"
+        || allowlist.iter().any(|v| v == var)
+        || paths.value_is_under_out_dir(value))
+    {
         return EnvDepNormalizationDecision::KeptAbsoluteNotPathOnly;
     }
-    if !path_is_only_used_for_includes(val, source_files) {
+    if !path_is_only_used_for_includes(value.probe(), paths.source_probes()) {
         return EnvDepNormalizationDecision::KeptAbsoluteNoIncludeProof;
     }
-    env_dep_source_decision(var, source_files, file_hasher)
+    env_dep_source_decision(var, paths.source_files, file_hasher)
 }
 
 /// Whether `var` names Cargo's manifest dir. Windows matches environment
@@ -4516,23 +4545,121 @@ pub(crate) fn is_manifest_dir_var(var: &str) -> bool {
     var.eq_ignore_ascii_case("CARGO_MANIFEST_DIR")
 }
 
-/// True when `val` is an absolute path located under the current build's
-/// `OUT_DIR`. A build-script `cargo:rustc-env` var whose value points here
-/// (typenum's `TYPENUM_BUILD_CONSTS` → `$OUT_DIR/consts.rs`) is build-generated
-/// and ephemeral, so it shares OUT_DIR's safety for key path-normalization
-/// (kunobi-ninja/kache#431).
+/// The form a path is compared in: canonical when it resolves, else as given.
 ///
-/// Canonical comparison so the macOS `/tmp` ↔ `/private/tmp` symlink doesn't
-/// spuriously miss; falls back to the raw paths when either side can't be
-/// canonicalized. Returns false when `OUT_DIR` is unset (the crate has no build
-/// script, so no such var exists) or the value is not under it — in particular
-/// `CARGO_MANIFEST_DIR`, which lives above OUT_DIR, never qualifies here.
-fn value_is_under_out_dir(val: &str) -> bool {
-    out_dir_relative_suffix(val).is_some()
+/// Canonical comparison keeps the macOS `/tmp` ↔ `/private/tmp` symlink from
+/// producing a spurious mismatch. A path that cannot be canonicalized (file
+/// moved, etc.) falls back to its raw components, and `Path::starts_with`
+/// still compares whole components without requiring lexical matching.
+fn path_probe(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// The probe form of `OUT_DIR`, or `None` when it is unset or its probe is
+/// not absolute. An empty or relative OUT_DIR cannot anchor a meaningful
+/// "under" test.
+fn out_dir_probe(out_dir: Option<&OsStr>) -> Option<PathBuf> {
+    let probe = path_probe(Path::new(out_dir?));
+    probe.is_absolute().then_some(probe)
+}
+
+/// Cargo's per-unit directory name (`<pkg>-<unit hash>`), the parent of
+/// `OUT_DIR`; empty when it has none.
+fn out_dir_unit(out_dir: Option<&OsStr>) -> String {
+    out_dir
+        .map(Path::new)
+        .and_then(Path::parent)
+        .and_then(Path::file_name)
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+/// An env-dep value and its canonical path, resolved at most once however
+/// many checks read it (kunobi-ninja/kache#560).
+struct EnvDepValue<'a> {
+    raw: &'a str,
+    canonical: OnceCell<Option<PathBuf>>,
+}
+
+impl<'a> EnvDepValue<'a> {
+    fn new(raw: &'a str) -> Self {
+        Self {
+            raw,
+            canonical: OnceCell::new(),
+        }
+    }
+
+    fn canonical(&self) -> Option<&Path> {
+        self.canonical
+            .get_or_init(|| std::fs::canonicalize(self.raw).ok())
+            .as_deref()
+    }
+
+    /// The value in [`path_probe`] form.
+    fn probe(&self) -> &Path {
+        self.canonical().unwrap_or(Path::new(self.raw))
+    }
+}
+
+/// The paths env-dep values are compared against, resolved once per key
+/// computation rather than once per env dep (kunobi-ninja/kache#560).
+///
+/// `out_dir` is the invocation's `OUT_DIR`, passed in rather than read from
+/// the process environment. Both probes resolve on first use, so a unit
+/// whose env deps never reach a path check canonicalizes nothing.
+struct EnvDepPaths<'a> {
+    out_dir: Option<&'a OsStr>,
+    out_probe: OnceCell<Option<PathBuf>>,
+    source_files: &'a [PathBuf],
+    source_probes: OnceCell<Vec<PathBuf>>,
+}
+
+impl<'a> EnvDepPaths<'a> {
+    fn new(out_dir: Option<&'a OsStr>, source_files: &'a [PathBuf]) -> Self {
+        Self {
+            out_dir,
+            out_probe: OnceCell::new(),
+            source_files,
+            source_probes: OnceCell::new(),
+        }
+    }
+
+    fn out_probe(&self) -> Option<&Path> {
+        self.out_probe
+            .get_or_init(|| out_dir_probe(self.out_dir))
+            .as_deref()
+    }
+
+    /// The dep-info source files in [`path_probe`] form, in the same order.
+    fn source_probes(&self) -> &[PathBuf] {
+        self.source_probes
+            .get_or_init(|| self.source_files.iter().map(|f| path_probe(f)).collect())
+    }
+
+    /// The value's path relative to the build's own `OUT_DIR`; see
+    /// [`out_dir_relative_suffix`]. `None` when `OUT_DIR` cannot anchor the
+    /// test, which then never resolves the value.
+    fn out_dir_suffix(&self, value: &EnvDepValue<'_>) -> Option<String> {
+        out_dir_relative_suffix(value.probe(), self.out_probe()?)
+    }
+
+    /// True when the value is a path located under the current build's
+    /// `OUT_DIR`. A build-script `cargo:rustc-env` var whose value points
+    /// here (typenum's `TYPENUM_BUILD_CONSTS` → `$OUT_DIR/consts.rs`) is
+    /// build-generated and ephemeral, so it shares OUT_DIR's safety for key
+    /// path-normalization (kunobi-ninja/kache#431).
+    ///
+    /// False when `OUT_DIR` is unset (the crate has no build script, so no
+    /// such var exists) or the value is not under it. In particular
+    /// `CARGO_MANIFEST_DIR`, which lives above OUT_DIR, never qualifies here.
+    fn value_is_under_out_dir(&self, value: &EnvDepValue<'_>) -> bool {
+        self.out_dir_suffix(value).is_some()
+    }
 }
 
 /// The value's path relative to the build's own `OUT_DIR`, when it lives
-/// under it (`Some("")` for `OUT_DIR` itself). This is the anchor for the
+/// under it (`Some("")` for `OUT_DIR` itself). Both arguments are in
+/// [`path_probe`] form. This is the anchor for the
 /// `<OUT_DIR>` sentinel (kunobi-ninja/kache#330): an OUT_DIR-locator value
 /// must normalize relative to OUT_DIR, not through the generic prefix rules
 /// — an out-of-workspace `CARGO_TARGET_DIR` makes the derived workspace
@@ -4541,19 +4668,8 @@ fn value_is_under_out_dir(val: &str) -> bool {
 /// sentinel'd value, diverging the key across build locations. Anchoring on
 /// OUT_DIR itself also drops cargo's per-unit hash from the value, which
 /// the generic rules preserve.
-fn out_dir_relative_suffix(val: &str) -> Option<String> {
-    let out_dir = std::env::var_os("OUT_DIR")?;
-    let out_dir = Path::new(&out_dir);
-    let out_canonical = std::fs::canonicalize(out_dir).ok();
-    let out_probe = out_canonical.as_deref().unwrap_or(out_dir);
-    // An empty/relative OUT_DIR can't anchor a meaningful "under" test.
-    if !out_probe.is_absolute() {
-        return None;
-    }
-    let val_path = Path::new(val);
-    let val_canonical = std::fs::canonicalize(val_path).ok();
-    let val_probe = val_canonical.as_deref().unwrap_or(val_path);
-    val_probe
+fn out_dir_relative_suffix(value_probe: &Path, out_probe: &Path) -> Option<String> {
+    value_probe
         .strip_prefix(out_probe)
         .ok()
         .map(|rel| rel.to_string_lossy().replace('\\', "/"))
@@ -4567,23 +4683,9 @@ fn out_dir_relative_suffix(val: &str) -> Option<String> {
 /// Background and contract: see the OUT_DIR comment in
 /// [`compute_cache_key`] and issue kunobi-ninja/kache#75.
 ///
-/// Compares canonical paths so the macOS `/tmp` ↔ `/private/tmp`
-/// symlink case doesn't produce a spurious false. If either side
-/// can't be canonicalized (file moved, etc.), falls back to the
-/// raw path components — `Path::starts_with` handles partial
-/// component prefixes correctly without requiring lexical matching.
-fn path_is_only_used_for_includes(
-    out_dir_value: &str,
-    source_files: &[std::path::PathBuf],
-) -> bool {
-    let raw = Path::new(out_dir_value);
-    let canonical = std::fs::canonicalize(raw).ok();
-    let probe = canonical.as_deref().unwrap_or(raw);
-    source_files.iter().any(|f| {
-        let f_canonical = std::fs::canonicalize(f).ok();
-        let f_probe = f_canonical.as_deref().unwrap_or(f.as_path());
-        f_probe.starts_with(probe)
-    })
+/// Both arguments are in [`path_probe`] form.
+fn path_is_only_used_for_includes(value_probe: &Path, source_probes: &[PathBuf]) -> bool {
+    source_probes.iter().any(|f| f.starts_with(value_probe))
 }
 
 /// Normalizes only when source text proves `var` is only an `include*!(...)`
@@ -15998,6 +16100,13 @@ mod tests {
         );
     }
 
+    /// [`path_is_only_used_for_includes`] with both sides in probe form, as the
+    /// key computation calls it.
+    fn locates_includes(value: &str, source_files: &[PathBuf]) -> bool {
+        let paths = EnvDepPaths::new(None, source_files);
+        path_is_only_used_for_includes(EnvDepValue::new(value).probe(), paths.source_probes())
+    }
+
     #[test]
     fn path_is_only_used_for_includes_detects_include_pattern() {
         // serde-style include!() puts a build.rs-generated file into
@@ -16010,7 +16119,7 @@ mod tests {
         std::fs::write(&included, b"// generated").unwrap();
         let source_files = vec![std::path::PathBuf::from("/src/lib.rs"), included.clone()];
         assert!(
-            path_is_only_used_for_includes(out_dir.to_str().unwrap(), &source_files),
+            locates_includes(out_dir.to_str().unwrap(), &source_files),
             "OUT_DIR contains an included source file → safe to normalize"
         );
     }
@@ -16027,7 +16136,7 @@ mod tests {
         // nothing under OUT_DIR.
         let source_files = vec![std::path::PathBuf::from("/src/main.rs")];
         assert!(
-            !path_is_only_used_for_includes(out_dir.to_str().unwrap(), &source_files),
+            !locates_includes(out_dir.to_str().unwrap(), &source_files),
             "no source under OUT_DIR → unsafe to normalize"
         );
     }
@@ -16053,12 +16162,137 @@ mod tests {
         // source_files reports /tmp/... (the symlink form)
         let source_files = vec![included];
 
-        let result = path_is_only_used_for_includes(&out_dir_value, &source_files);
+        let result = locates_includes(&out_dir_value, &source_files);
         let _ = std::fs::remove_dir_all(std::path::Path::new("/tmp").join(&unique));
         assert!(
             result,
             "canonical-path comparison must see through the symlink"
         );
+    }
+
+    #[test]
+    fn out_dir_probe_needs_an_absolute_out_dir() {
+        assert_eq!(out_dir_probe(None), None);
+        assert_eq!(out_dir_probe(Some(OsStr::new(""))), None);
+        assert_eq!(
+            out_dir_probe(Some(OsStr::new("kache-no-such-dir/out"))),
+            None
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir.path().canonicalize().unwrap();
+        assert_eq!(
+            out_dir_probe(Some(dir.path().as_os_str())),
+            Some(canonical.clone())
+        );
+        // An absolute OUT_DIR that does not exist anchors in its raw form.
+        let missing = canonical.join("missing/out");
+        assert_eq!(out_dir_probe(Some(missing.as_os_str())), Some(missing));
+    }
+
+    #[test]
+    fn out_dir_suffix_is_relative_to_out_dir_by_components() {
+        let out = Path::new("/o/out");
+        let suffix = |value: &str| out_dir_relative_suffix(Path::new(value), out);
+        assert_eq!(suffix("/o/out"), Some(String::new()));
+        assert_eq!(suffix("/o/out/gen/x.rs"), Some("gen/x.rs".to_string()));
+        assert_eq!(suffix("/o/out2/x.rs"), None);
+        assert_eq!(suffix("/o"), None);
+        // A backslash separates on Windows and is part of a name on Unix; the
+        // suffix spells it `/` either way.
+        assert_eq!(suffix("/o/out/gen\\x.rs"), Some("gen/x.rs".to_string()));
+    }
+
+    #[test]
+    fn env_dep_paths_anchor_only_on_a_usable_out_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().canonicalize().unwrap().join("pkg-1/out");
+        std::fs::create_dir_all(&out).unwrap();
+        let generated = out.join("consts.rs");
+        std::fs::write(&generated, b"").unwrap();
+        let generated = generated.to_str().unwrap();
+        let suffix = |out_dir: Option<&OsStr>, value: &str| {
+            EnvDepPaths::new(out_dir, &[]).out_dir_suffix(&EnvDepValue::new(value))
+        };
+
+        let out_dir = Some(out.as_os_str());
+        assert_eq!(suffix(out_dir, generated), Some("consts.rs".to_string()));
+        assert_eq!(suffix(out_dir, out.to_str().unwrap()), Some(String::new()));
+        assert_eq!(suffix(None, generated), None);
+        assert_eq!(suffix(Some(OsStr::new("pkg-1/out")), generated), None);
+        // A value that does not exist compares in its raw form.
+        let gone = out.join("gone.rs");
+        assert_eq!(
+            suffix(out_dir, gone.to_str().unwrap()),
+            Some("gone.rs".to_string())
+        );
+
+        assert_eq!(out_dir_unit(out_dir), "pkg-1");
+        assert_eq!(out_dir_unit(Some(OsStr::new("out"))), "");
+        assert_eq!(out_dir_unit(None), "");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn env_dep_paths_see_through_a_symlinked_out_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().canonicalize().unwrap().join("real");
+        let out = real.join("pkg-1/out");
+        std::fs::create_dir_all(&out).unwrap();
+        let generated = out.join("consts.rs");
+        std::fs::write(&generated, b"").unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let linked_out = link.join("pkg-1/out");
+        let linked_generated = linked_out.join("consts.rs");
+
+        // OUT_DIR through the link and the value real, then the reverse.
+        let via_link = EnvDepPaths::new(Some(linked_out.as_os_str()), &[]);
+        assert_eq!(
+            via_link.out_dir_suffix(&EnvDepValue::new(generated.to_str().unwrap())),
+            Some("consts.rs".to_string())
+        );
+        let direct = EnvDepPaths::new(Some(out.as_os_str()), &[]);
+        assert_eq!(
+            direct.out_dir_suffix(&EnvDepValue::new(linked_generated.to_str().unwrap())),
+            Some("consts.rs".to_string())
+        );
+        // The unit name comes from OUT_DIR as given.
+        assert_eq!(out_dir_unit(via_link.out_dir), "pkg-1");
+
+        // Source files resolve through the link too.
+        assert!(locates_includes(out.to_str().unwrap(), &[linked_generated]));
+        assert!(locates_includes(linked_out.to_str().unwrap(), &[generated]));
+    }
+
+    #[test]
+    fn source_probes_fall_back_to_the_raw_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let out = root.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let sources = [root.join("src/lib.rs"), out.join("gone.rs")];
+
+        let paths = EnvDepPaths::new(None, &sources);
+        assert_eq!(paths.source_probes(), &sources);
+        let out = out.to_str().unwrap();
+        assert!(locates_includes(out, &sources));
+        assert!(!locates_includes(out, &sources[..1]));
+    }
+
+    /// A value that does not exist but resolves lexically to a path under
+    /// OUT_DIR is compared in its resolved form, not as written.
+    #[cfg(unix)]
+    #[test]
+    fn a_missing_value_compares_in_its_resolved_form() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().canonicalize().unwrap().join("pkg-1/out");
+        std::fs::create_dir_all(&out).unwrap();
+        let value = format!("{}/sub/../gen.rs", out.display());
+        let pn = PathNormalizer::empty().with_path_only_env_vars(vec!["c:GEN".to_string()]);
+
+        let dep = normalize_env_dep_value_in("c", "GEN", &value, &[], &pn, Some(out.as_os_str()));
+        assert_eq!(dep.decision, EnvDepNormalizationDecision::ForcedPathOnly);
+        assert_eq!(dep.value, "<OUT_DIR:pkg-1>/gen.rs");
     }
 
     #[test]
@@ -16187,8 +16421,8 @@ include!(concat!(env!("OUT_DIR"), "/generated.rs"));
                     normalize_env_dep_value_with_hasher(
                         "dmac",
                         var.to_str().unwrap(),
-                        value.to_str().unwrap(),
-                        &[],
+                        &EnvDepValue::new(value.to_str().unwrap()),
+                        &EnvDepPaths::new(None, &[]),
                         &FileHasher::new(),
                         &pn,
                         Some(alias),
@@ -16214,8 +16448,8 @@ include!(concat!(env!("OUT_DIR"), "/generated.rs"));
             normalize_env_dep_value_with_hasher(
                 "dmac",
                 "V",
-                value,
-                &[],
+                &EnvDepValue::new(value),
+                &EnvDepPaths::new(None, &[]),
                 &FileHasher::new(),
                 &pn,
                 aliased,
@@ -16433,8 +16667,8 @@ pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
         normalize_env_dep_value_with_hasher(
             "test_crate",
             "OUT_DIR",
-            &out_dir_value,
-            &source_files,
+            &EnvDepValue::new(&out_dir_value),
+            &EnvDepPaths::new(None, &source_files),
             file_hasher,
             &PathNormalizer::from_env(Some(&workspace)),
             None,
@@ -16753,7 +16987,6 @@ pub fn g(_: &'static str) {}"#,
         // NOT allowlisted, but its value lives UNDER OUT_DIR and only locates a
         // generated include — so it must normalize like OUT_DIR (else typenum
         // re-keys per checkout and the whole substrate stack misses cross-clone).
-        let _lock = key_test_lock();
         let dir = tempfile::tempdir().unwrap();
         let workspace = dir.path().join("workspace");
         let out_dir = workspace.join("target/release/build/genlib-abc123/out");
@@ -16772,19 +17005,16 @@ pub fn g(_: &'static str) {}"#,
             .to_string();
         let path_normalizer = PathNormalizer::from_env(Some(&workspace));
 
-        let old_out_dir = std::env::var_os("OUT_DIR");
-        // SAFETY: serialized by key_test_lock; restored below.
-        unsafe { std::env::set_var("OUT_DIR", &out_dir) };
-        let under = normalize_env_dep_value(
+        let under = normalize_env_dep_value_in(
             "test_crate",
             "GEN_BUILD_CONSTS",
             &value,
             &source_files,
             &path_normalizer,
+            Some(out_dir.as_os_str()),
         );
         // With OUT_DIR unset there is no anchor, so the same var must stay
         // absolute — proves the gate is the under-OUT_DIR test, not the var name.
-        unsafe { std::env::remove_var("OUT_DIR") };
         let no_anchor = normalize_env_dep_value(
             "test_crate",
             "GEN_BUILD_CONSTS",
@@ -16792,7 +17022,6 @@ pub fn g(_: &'static str) {}"#,
             &source_files,
             &path_normalizer,
         );
-        restore_env_var("OUT_DIR", old_out_dir);
 
         assert_eq!(
             under.decision,

@@ -5538,6 +5538,24 @@ pub fn doctor(
             detail: writes,
             fix: None,
         });
+        let access = remote_access_check(remote, cfg.s3_pool_idle_secs);
+        checks.push(Check {
+            label: "Remote access",
+            pass: access.pass,
+            detail: access.detail,
+            fix: access.fix,
+        });
+        if let crate::config::RemoteBackendConfig::S3(s3) = &remote.backend
+            && let Some(endpoint) = crate::remote_backend::s3_endpoint(s3)
+            && crate::remote_backend::plain_http_remote_endpoint(&endpoint)
+        {
+            checks.push(Check {
+                label: "Remote endpoint",
+                pass: false,
+                detail: format!("{endpoint} uses plain http"),
+                fix: Some(crate::remote_backend::PLAIN_HTTP_ENDPOINT.to_string()),
+            });
+        }
     } else if let Some(ref cfg) = config
         && cfg.local_only
     {
@@ -5892,6 +5910,69 @@ pub fn doctor(
     }
 
     Ok(())
+}
+
+/// Outcome of probing the remote from `kache doctor`.
+#[derive(Debug, PartialEq)]
+struct RemoteAccess {
+    pass: bool,
+    detail: String,
+    fix: Option<String>,
+}
+
+/// How long `kache doctor` waits for the remote to answer.
+const REMOTE_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Probe the remote with a GET for a key that is never written. A miss means
+/// the store answered and the credentials were accepted; unlike a HEAD, a
+/// refused GET carries the store's reason.
+fn remote_access_check(remote: &crate::config::RemoteConfig, pool_idle_secs: u64) -> RemoteAccess {
+    let region = match &remote.backend {
+        crate::config::RemoteBackendConfig::S3(s3) => Some(s3.region.clone()),
+        crate::config::RemoteBackendConfig::Filesystem(_) => None,
+    };
+    let key = crate::config::join_remote_key(&remote.prefix, "kache-doctor-probe");
+    let result = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("building tokio runtime")
+        .and_then(|runtime| {
+            runtime.block_on(async {
+                let backend = crate::remote_backend::create_backend(remote, pool_idle_secs).await?;
+                probe_remote(backend.as_ref(), &key, REMOTE_PROBE_TIMEOUT).await
+            })
+        });
+    remote_access_from(result, region.as_deref())
+}
+
+async fn probe_remote(
+    backend: &dyn crate::remote_backend::RemoteBackend,
+    key: &str,
+    timeout: std::time::Duration,
+) -> Result<()> {
+    tokio::time::timeout(timeout, backend.get(key, Some(1024)))
+        .await
+        .map_err(|_| anyhow::anyhow!("no answer within {} s", timeout.as_secs()))?
+        .map(drop)
+}
+
+fn remote_access_from(result: Result<()>, region: Option<&str>) -> RemoteAccess {
+    match result {
+        Ok(()) => RemoteAccess {
+            pass: true,
+            detail: "reachable; credentials accepted".to_string(),
+            fix: None,
+        },
+        Err(error) => RemoteAccess {
+            pass: false,
+            detail: format!("{error:#}"),
+            fix: Some(
+                crate::remote_backend::explain_remote_failure(&error, region).unwrap_or_else(
+                    || "check the endpoint, bucket, region and credentials".to_string(),
+                ),
+            ),
+        },
+    }
 }
 
 fn doctor_has_issues(issues: usize) -> bool {

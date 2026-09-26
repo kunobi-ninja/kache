@@ -203,6 +203,8 @@ pub struct OpenDalBackend {
     download_memory: Arc<DownloadMemory>,
     /// Set once a refused read has been reported as a miss.
     refusal_reported: AtomicBool,
+    /// The configured S3 region, to explain a request sent to the wrong one.
+    region: Option<String>,
 }
 
 impl OpenDalBackend {
@@ -213,6 +215,7 @@ impl OpenDalBackend {
             filesystem_root: None,
             download_memory: DOWNLOAD_MEMORY.clone(),
             refusal_reported: AtomicBool::new(false),
+            region: None,
         }
     }
 
@@ -304,7 +307,13 @@ impl OpenDalBackend {
     }
 
     fn contextual_error(&self, operation: &str, key: &str, error: opendal::Error) -> anyhow::Error {
-        anyhow::Error::new(error).context(format!("{operation} {}", self.describe(key)))
+        let explanation = explain_opendal_failure(&error, self.region.as_deref());
+        let error =
+            anyhow::Error::new(error).context(format!("{operation} {}", self.describe(key)));
+        match explanation {
+            Some(explanation) => error.context(explanation),
+            None => error,
+        }
     }
 
     fn validate_key(&self, operation: &str, key: &str, list_prefix: bool) -> Result<()> {
@@ -758,6 +767,87 @@ pub(crate) fn credentials_rejected(error: &opendal::Error) -> bool {
         .any(|code| message.contains(&format!("\"{code}\"")))
 }
 
+/// The S3 endpoint in use: the configured one, else `AWS_ENDPOINT_URL_S3`.
+pub(crate) fn s3_endpoint(config: &S3RemoteConfig) -> Option<String> {
+    config
+        .endpoint
+        .clone()
+        .or_else(|| std::env::var("AWS_ENDPOINT_URL_S3").ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+pub(crate) const PLAIN_HTTP_ENDPOINT: &str = "plain http to another machine: request \
+    signatures and cached objects travel unencrypted, and anyone on the path can \
+    replace an object. Use https://, or keep plain http to a loopback address";
+
+/// A plain `http://` endpoint on another machine.
+pub(crate) fn plain_http_remote_endpoint(endpoint: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(endpoint) else {
+        return false;
+    };
+    let host = url.host_str().unwrap_or_default();
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    let loopback = host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback());
+    url.scheme() == "http" && !loopback
+}
+
+/// What a failed remote request most likely means, in terms a user can act
+/// on, when the store said. `region` is the configured S3 region.
+pub(crate) fn explain_remote_failure(
+    error: &anyhow::Error,
+    region: Option<&str>,
+) -> Option<String> {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<opendal::Error>())
+        .and_then(|error| explain_opendal_failure(error, region))
+}
+
+fn explain_opendal_failure(error: &opendal::Error, region: Option<&str>) -> Option<String> {
+    let text = error.to_string();
+    let code = |name: &str| text.contains(&format!("\"{name}\""));
+    if code("ExpiredToken") || code("TokenRefreshRequired") || code("InvalidToken") {
+        return Some("the S3 credentials have expired or were revoked; refresh them".into());
+    }
+    if code("InvalidAccessKeyId") {
+        return Some("the store does not know this access key ID".into());
+    }
+    if code("SignatureDoesNotMatch") {
+        return Some("the secret key does not match the access key ID".into());
+    }
+    if code("RequestTimeTooSkewed") {
+        return Some("this machine's clock is too far from the store's; correct the clock".into());
+    }
+    if let Some(actual) = bucket_region(&text) {
+        let configured = region
+            .map(|region| format!(", not {region}"))
+            .unwrap_or_default();
+        return Some(format!(
+            "the bucket is in {actual}{configured}; set cache.remote.region = \"{actual}\""
+        ));
+    }
+    if code("NoSuchBucket") {
+        return Some("the bucket does not exist; check cache.remote.bucket".into());
+    }
+    None
+}
+
+/// The bucket's real region, from the `x-amz-bucket-region` header S3 sends
+/// with a redirect, or from the message of a request signed for the wrong one.
+fn bucket_region(text: &str) -> Option<&str> {
+    let quoted = |start: &str, end: char| {
+        let from = text.find(start)? + start.len();
+        let rest = &text[from..];
+        let region = &rest[..rest.find(end)?];
+        (!region.is_empty()).then_some(region)
+    };
+    quoted("\"x-amz-bucket-region\": \"", '"').or_else(|| quoted("expecting '", '\''))
+}
+
 fn without_retry_layer(operator: Operator) -> Operator {
     // Retry ownership lives at the daemon operation boundary. Layering an
     // opaque transport retry underneath daemon retries multiplied deadlines,
@@ -1033,13 +1123,10 @@ fn create_s3_operator(config: &S3RemoteConfig, pool_idle_secs: u64) -> Result<Op
         // the newer full-object x-amz-checksum-* headers. Content-MD5 is
         // supported by AWS S3 and common S3-compatible PutObject endpoints.
         .checksum_algorithm("md5");
-    let endpoint = config
-        .endpoint
-        .clone()
-        .or_else(|| std::env::var("AWS_ENDPOINT_URL_S3").ok())
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
-    if let Some(endpoint) = endpoint {
+    if let Some(endpoint) = s3_endpoint(config) {
+        if plain_http_remote_endpoint(&endpoint) {
+            tracing::warn!("{endpoint}: {PLAIN_HTTP_ENDPOINT}");
+        }
         builder = builder.endpoint(&endpoint);
     }
 
@@ -1141,10 +1228,14 @@ pub async fn create_backend(
     pool_idle_secs: u64,
 ) -> Result<Arc<dyn RemoteBackend>> {
     let backend = match &remote.backend {
-        RemoteBackendConfig::S3(config) => OpenDalBackend::new(
-            create_s3_operator(config, pool_idle_secs)?,
-            format!("s3://{}", config.bucket),
-        ),
+        RemoteBackendConfig::S3(config) => {
+            let mut backend = OpenDalBackend::new(
+                create_s3_operator(config, pool_idle_secs)?,
+                format!("s3://{}", config.bucket),
+            );
+            backend.region = Some(config.region.clone());
+            backend
+        }
         RemoteBackendConfig::Filesystem(config) => {
             let mut backend = OpenDalBackend::new(
                 create_filesystem_operator(config)?,
@@ -1407,6 +1498,106 @@ mod tests {
                 .unwrap()
                 .body,
             "first"
+        );
+    }
+
+    #[test]
+    fn s3_failures_are_explained_by_their_code_or_region() {
+        let explain = |message: &str, region: Option<&str>| {
+            explain_opendal_failure(
+                &opendal::Error::new(ErrorKind::PermissionDenied, message.to_string()),
+                region,
+            )
+        };
+        let code = |name: &str| format!(r#"S3Error {{ code: "{name}" }}"#);
+        for name in ["ExpiredToken", "TokenRefreshRequired", "InvalidToken"] {
+            assert!(
+                explain(&code(name), None).unwrap().contains("expired"),
+                "{name}"
+            );
+        }
+        assert!(
+            explain(&code("InvalidAccessKeyId"), None)
+                .unwrap()
+                .contains("access key ID")
+        );
+        assert!(
+            explain(&code("SignatureDoesNotMatch"), None)
+                .unwrap()
+                .contains("secret key")
+        );
+        assert!(
+            explain(&code("RequestTimeTooSkewed"), None)
+                .unwrap()
+                .contains("clock")
+        );
+        assert!(
+            explain(&code("NoSuchBucket"), None)
+                .unwrap()
+                .contains("bucket does not exist")
+        );
+        assert_eq!(
+            explain(
+                r#"headers: {"x-amz-bucket-region": "eu-west-1"}"#,
+                Some("us-east-1")
+            )
+            .unwrap(),
+            r#"the bucket is in eu-west-1, not us-east-1; set cache.remote.region = "eu-west-1""#
+        );
+        assert_eq!(
+            explain(
+                "the region 'us-east-1' is wrong; expecting 'eu-west-2'",
+                None
+            )
+            .unwrap(),
+            r#"the bucket is in eu-west-2; set cache.remote.region = "eu-west-2""#
+        );
+        assert_eq!(explain(&code("AccessDenied"), None), None);
+        assert_eq!(explain("expecting ''", None), None);
+    }
+
+    #[test]
+    fn plain_http_is_flagged_only_for_another_machine() {
+        assert!(plain_http_remote_endpoint("http://10.0.0.5:9000"));
+        assert!(plain_http_remote_endpoint("http://minio.internal"));
+        for endpoint in [
+            "http://127.0.0.1:9000",
+            "http://localhost:9000",
+            "http://[::1]:9000",
+            "https://minio.internal",
+            "not a url",
+        ] {
+            assert!(!plain_http_remote_endpoint(endpoint), "{endpoint}");
+        }
+    }
+
+    #[tokio::test]
+    async fn s3_wire_errors_carry_the_explanation() {
+        let error = |code: &str| {
+            format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>{code}</Code>\
+                 <Message>m</Message><RequestId>test</RequestId></Error>"
+            )
+        };
+        let redirect = "HTTP/1.1 301 Moved Permanently\r\nx-amz-bucket-region: eu-west-1\r\n\
+            Content-Length: 0\r\nConnection: close\r\n\r\n"
+            .to_string();
+        let (endpoint, _requests) = mock_http_server(vec![
+            http_response("403 Forbidden", &error("ExpiredToken")),
+            redirect,
+        ])
+        .await;
+        let mut backend = anonymous_s3_backend(&endpoint);
+        backend.region = Some("us-east-1".to_string());
+        let expired = backend.get("key", Some(1024)).await.unwrap_err();
+        assert!(
+            format!("{expired:#}").contains("expired or were revoked"),
+            "{expired:#}"
+        );
+        let moved = backend.get("key", Some(1024)).await.unwrap_err();
+        assert!(
+            format!("{moved:#}").contains("the bucket is in eu-west-1, not us-east-1"),
+            "{moved:#}"
         );
     }
 

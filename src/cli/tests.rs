@@ -292,6 +292,73 @@ fn stats_names_the_host_config_only_when_in_effect() {
 /// unusable file is the only failure, and an overridden key names what
 /// wins over it.
 #[test]
+fn remote_access_reports_the_explained_cause() {
+    let ok = remote_access_from(Ok(()), None);
+    assert!(ok.pass);
+    assert_eq!(ok.fix, None);
+
+    let expired: anyhow::Error = opendal::Error::new(
+        opendal::ErrorKind::PermissionDenied,
+        r#"S3Error { code: "ExpiredToken" }"#,
+    )
+    .into();
+    let failed = remote_access_from(Err(expired), Some("us-east-1"));
+    assert!(!failed.pass);
+    assert!(failed.fix.unwrap().contains("expired"));
+
+    let unknown = remote_access_from(Err(anyhow::anyhow!("connection refused")), None);
+    assert!(!unknown.pass);
+    assert!(unknown.detail.contains("connection refused"));
+    assert_eq!(
+        unknown.fix.as_deref(),
+        Some("check the endpoint, bucket, region and credentials")
+    );
+}
+
+/// A transport whose GET never answers.
+struct Silent;
+
+#[async_trait::async_trait]
+impl crate::remote_backend::RemoteBackend for Silent {
+    async fn head(&self, _key: &str) -> Result<bool> {
+        std::future::pending().await
+    }
+
+    async fn get(
+        &self,
+        _key: &str,
+        _max_bytes: Option<u64>,
+    ) -> Result<Option<crate::remote_backend::GetObject>> {
+        std::future::pending().await
+    }
+
+    async fn put(&self, _key: &str, _body: Vec<u8>, _content_type: Option<&str>) -> Result<()> {
+        std::future::pending().await
+    }
+
+    async fn list(&self, _prefix: &str) -> Result<Vec<String>> {
+        std::future::pending().await
+    }
+
+    fn describe(&self, key: &str) -> String {
+        key.to_string()
+    }
+}
+
+#[tokio::test]
+async fn a_remote_that_never_answers_fails_the_probe() {
+    assert_eq!(REMOTE_PROBE_TIMEOUT, std::time::Duration::from_secs(10));
+    let error = probe_remote(&Silent, "probe", std::time::Duration::from_millis(20))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("no answer within"), "{error:#}");
+    let backend = crate::remote_backend::memory_backend();
+    probe_remote(&backend, "probe", std::time::Duration::from_secs(1))
+        .await
+        .unwrap();
+}
+
+#[test]
 fn doctor_host_config_check_wording() {
     use crate::config::{HostConfigKey, HostConfigStatus, HostKeySource};
     let path = std::path::PathBuf::from("/etc/kache/config.toml");

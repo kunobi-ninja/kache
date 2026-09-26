@@ -80,6 +80,8 @@ The S3 implementation signs with SigV4. It does not currently load SigV4a/Multi-
 
 `AWS_ENDPOINT_URL_S3` is accepted when no Kache endpoint is set. An endpoint stored only inside an AWS shared profile is not loaded; copy it to `cache.remote.endpoint` or `KACHE_S3_ENDPOINT`.
 
+Use `https://` for an endpoint on another machine. Over plain `http://`, request signatures and cached objects travel unencrypted, and anyone on the path can replace an object: the file hashes Kache checks are stored inside the same pack. Kache warns when it starts with such an endpoint, and `kache doctor` fails it. Plain `http://` to a loopback address, such as a local test server, is fine.
+
 Prefixes are normalized by trimming surrounding separators and collapsing repeated `/`. Backslashes and `.` or `..` segments are rejected. A normalized prefix may point at a different object path from an older non-canonical configuration.
 
 ## Object layout and policy

@@ -1,32 +1,13 @@
 {
   lib,
   rustPlatform,
-  fetchurl,
   cacert,
   stdenv,
 }:
 let
   cargoToml = builtins.fromTOML (builtins.readFile ../../Cargo.toml);
-
-  fetchurlWithCratesUserAgent =
-    args:
-    fetchurl (
-      args
-      // {
-        curlOptsList = (args.curlOptsList or [ ]) ++ [
-          "-A"
-          "kache-nix"
-        ];
-      }
-    );
-
-  buildRustPackage = rustPlatform.buildRustPackage.override {
-    importCargoLock = rustPlatform.importCargoLock.override {
-      fetchurl = fetchurlWithCratesUserAgent;
-    };
-  };
 in
-buildRustPackage {
+rustPlatform.buildRustPackage {
   pname = "kache";
   version = cargoToml.package.version;
 

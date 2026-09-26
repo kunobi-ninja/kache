@@ -367,6 +367,16 @@ mod tests {
 
     #[tokio::test]
     async fn earlier_lockfiles_are_read_from_git() {
+        // The Nix build sandbox has no git; the lookup itself then returns
+        // nothing, which the untracked case below covers too.
+        if std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipping: git is not available");
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let git = |args: &[&str]| {
             let status = std::process::Command::new("git")

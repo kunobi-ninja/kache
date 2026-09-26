@@ -75,6 +75,7 @@ local_max_size = "200GiB"
 | `KACHE_INDEX_AUTO_COMPACT` | `cache.index_auto_compact` | `true` | Let the daemon heal the blob index and compact `index.db` when the machine is quiet. See [Daemon index maintenance](#daemon-index-maintenance). |
 | `KACHE_AUTO_CLEAN_ORPHANED_TARGETS` | `cache.auto_clean_orphaned_targets` | `true` | Let the daemon remove target directories whose workspace was deleted. See [Target directory cleanup](#target-directory-cleanup). |
 | `KACHE_AUTO_CLEAN_IDLE_TARGETS_DAYS` | `cache.auto_clean_idle_targets_days` | `0` | Let the daemon also remove target directories no build has used for this many days; `0` disables it |
+| `KACHE_AUTO_CLEAN_UNUSED_UNITS_DAYS` | `cache.auto_clean_unused_units_days` | `30` | Let the daemon remove, from target directories still in use, build units no build has used for this many days; `0` disables it. See [Unused build units](#unused-build-units). |
 | `KACHE_MIN_STORE_COMPILE_MS` | `cache.min_store_compile_ms` | `0` | Skip local retention for faster compiles; `0` stores all eligible results |
 | `KACHE_COMPRESSION_LEVEL` | `cache.compression_level` | `3` | Zstd level, clamped to 1 through 22 |
 | none | `cache.event_log_max_size` | `64MiB` | Rotate the event log after this size. Rotation keeps the build in progress, up to half this size |
@@ -228,6 +229,14 @@ Builds through Kache record the target directories they use; `kache targets` lis
 It applies the same checks as `kache clean --tracked --yes`. A directory is removed only while it is still the Cargo target directory that was recorded, never when it holds a `Cargo.toml` or `.git`, and never while a running build holds it. The daemon renames it aside and checks once more before deleting it, so a build that starts at that moment gets a new directory. A workspace counts as deleted only when looking it up finds nothing; a permission or network error does not count. The daemon log names each directory it removes and why.
 
 The cleanup follows the configuration of the daemon that serves the cache directory.
+
+### Unused build units
+
+A target directory in regular use still collects dead weight. A lockfile update, a feature change or a new toolchain moves the build on to new units and Cargo leaves the old ones behind. The same hourly check removes, from every tracked target directory that stays, the units no build used for `cache.auto_clean_unused_units_days` days (30 by default; `0` turns it off).
+
+Cargo reads the fingerprint of every unit a build uses, even when nothing needs compiling, but a filesystem records only some reads. macOS and Linux's default `relatime` both record a read when the file's access time is older than its modification time. So the first check of a target directory sets each fingerprint's access time just below its modification time and notes the moment. Once the configured days have passed, every unit whose fingerprint was neither read nor written since is removed, and the rest are set up again for the next period. Cargo looks only at modification times, so this changes nothing it relies on.
+
+Nothing is removed on a filesystem where reads never change an access time (`noatime`), or on a network filesystem, where Cargo does not lock its build directories. A profile a running build holds is skipped, and all of Cargo's locks in it are held while its units are removed. Each unit's fingerprint goes before its outputs, so a removal cut short leaves outputs Cargo rebuilds. A unit that is needed after all is restored from the cache or compiled again. The daemon log reports how many units and bytes each target directory lost.
 
 ## Compiler policy
 

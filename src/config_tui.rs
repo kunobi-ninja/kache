@@ -1940,6 +1940,7 @@ mod tests {
                 index_auto_compact: None,
                 auto_clean_orphaned_targets: None,
                 auto_clean_idle_targets_days: None,
+                auto_clean_unused_units_days: None,
                 gc_evict_shared: Some(true),
                 storage_layout_advice: None,
                 heartbeat_secs: None,

@@ -19,8 +19,9 @@
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 /// `<target>/kache-test-bootstrap`, derived from the running test binary at
 /// `<target>/<profile>/deps/<test-bin>` so it follows `CARGO_TARGET_DIR`
@@ -185,4 +186,96 @@ pub fn scratch_dir() -> PathBuf {
     };
     std::fs::create_dir_all(&dir).expect("creating scratch dir");
     dir
+}
+
+/// The lock a live daemon holds for its whole lifetime, under `runtime_dir`.
+/// It is released only after the daemon's shutdown drain, so it is the one
+/// signal that works for Unix sockets and Windows named pipes alike.
+fn daemon_run_lock_path(runtime_dir: &Path) -> PathBuf {
+    runtime_dir.join("daemon.run.lock")
+}
+
+/// Whether a daemon currently holds the run lock under `runtime_dir`. The probe
+/// does not create the file, so a test that never started a daemon stays
+/// untouched. An error other than "missing" counts as held: the caller then
+/// asks the daemon to stop, which is harmless if there is none.
+fn daemon_run_lock_is_held(runtime_dir: &Path) -> bool {
+    let file = match std::fs::OpenOptions::new()
+        .write(true)
+        .open(daemon_run_lock_path(runtime_dir))
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return false,
+        Err(_) => return true,
+    };
+    match file.try_lock() {
+        Ok(()) => {
+            let _ = file.unlock();
+            false
+        }
+        Err(_) => true,
+    }
+}
+
+/// Waits until no daemon holds the run lock under `runtime_dir`.
+#[allow(dead_code)]
+pub fn wait_for_daemon_exit(runtime_dir: &Path, timeout: Duration) -> Result<(), String> {
+    let deadline = Instant::now() + timeout;
+    while daemon_run_lock_is_held(runtime_dir) {
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "daemon lifetime lock {} remained held after its drain phase",
+                daemon_run_lock_path(runtime_dir).display()
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    Ok(())
+}
+
+/// Stops the daemon that owns `runtime_dir`, for a test fixture's `Drop`.
+///
+/// `stop` is a `kache daemon stop` wired to that runtime dir. Each test has its
+/// own runtime dir, so tests running in parallel each stop only their own
+/// daemon, and `Drop` also runs when a test panics. This keeps a daemon warm
+/// for the whole test and leaves nothing behind (kunobi-ninja/kache#704).
+///
+/// Most tests never start a daemon, and a `daemon stop` with nobody to answer
+/// it waits several seconds for a connection, so it only runs while a daemon
+/// holds the run lock. Auto-start returns once the daemon is ready, so a
+/// daemon a test started holds that lock by the time the test ends.
+///
+/// Cleanup must never be what wedges or fails a test run: the stop runs with
+/// null stdio (no pipe for a daemon to hold open) and a deadline, and every
+/// failure is ignored.
+#[allow(dead_code)]
+pub fn stop_daemon(stop: &mut Command, runtime_dir: &Path) {
+    if !daemon_run_lock_is_held(runtime_dir) {
+        return;
+    }
+    let spawned = stop
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+    if let Ok(mut child) = spawned {
+        // `daemon stop` itself waits up to 35s for the drain.
+        let deadline = Instant::now() + Duration::from_secs(45);
+        loop {
+            match child.try_wait() {
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Ok(Some(_)) => break,
+                Ok(None) | Err(_) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break;
+                }
+            }
+        }
+    }
+    // On Windows the daemon can keep handles into the runtime dir during
+    // teardown; wait for it before the fixture removes that directory.
+    let _ = wait_for_daemon_exit(runtime_dir, Duration::from_secs(45));
 }

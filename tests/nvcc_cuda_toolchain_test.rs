@@ -13,7 +13,7 @@ use tempfile::TempDir;
 
 #[allow(dead_code)]
 mod common;
-use common::hermetic_command;
+use common::{hermetic_command, stop_daemon};
 
 /// Path to the binary under test. Cargo sets `CARGO_BIN_EXE_kache` to the
 /// artifact it built for this integration test.
@@ -23,20 +23,22 @@ const KACHE_BIN: &str = env!("CARGO_BIN_EXE_kache");
 /// config path, and HOME/CARGO_HOME so nothing touches the developer's real
 /// setup and no background daemon is contacted.
 fn kache(home: &Path, cache_dir: &Path) -> Command {
-    let mut cmd = Command::from(hermetic_command(
-        KACHE_BIN,
-        cache_dir,
-        Some(&cache_dir.join("config.toml")),
-    ));
+    Command::from(kache_process(home, cache_dir))
+}
+
+/// [`kache`] as a plain [`std::process::Command`].
+fn kache_process(home: &Path, cache_dir: &Path) -> std::process::Command {
+    let mut cmd = hermetic_command(KACHE_BIN, cache_dir, Some(&cache_dir.join("config.toml")));
     cmd.env("KACHE_LOG", "off")
         .env("HOME", home)
         .env("CARGO_HOME", home.join(".cargo"))
         .env("SHELL", "/bin/bash")
         .env_remove("ZDOTDIR")
         .env("XDG_CONFIG_HOME", home.join(".config"))
-        // Daemons spawned during tests must self-exit quickly instead of
-        // lingering indefinitely.
-        .env("KACHE_DAEMON_IDLE_TIMEOUT", "3");
+        // A backstop, not the cleanup: `Env`'s `Drop` stops the daemon. This
+        // only bounds a daemon whose stop never ran (a hard abort), since the
+        // idle timeout is off by default (#662).
+        .env("KACHE_DAEMON_IDLE_TIMEOUT", "60");
     cmd
 }
 
@@ -55,6 +57,16 @@ fn env() -> Env {
         cache: cache.path().to_path_buf(),
         _home: home,
         _cache: cache,
+    }
+}
+
+impl Drop for Env {
+    /// Stop the daemon this test started, if any, before its dirs go away.
+    fn drop(&mut self) {
+        stop_daemon(
+            kache_process(&self.home, &self.cache).args(["daemon", "stop"]),
+            &self.cache,
+        );
     }
 }
 

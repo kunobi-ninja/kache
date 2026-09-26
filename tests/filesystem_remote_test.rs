@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 mod common;
-use common::{build_kache, isolated_config_path, kache_binary};
+use common::{build_kache, isolated_config_path, kache_binary, stop_daemon, wait_for_daemon_exit};
 
 fn rustc_path() -> String {
     std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string())
@@ -367,52 +367,8 @@ impl Client {
             String::from_utf8_lossy(&output.stderr),
         );
 
-        self.wait_for_daemon_exit(Duration::from_secs(45))
+        wait_for_daemon_exit(&self.runtime_dir, Duration::from_secs(45))
             .unwrap_or_else(|error| panic!("{error}"));
-    }
-
-    fn wait_for_daemon_exit(&self, timeout: Duration) -> Result<(), String> {
-        let run_lock_path = self.runtime_dir.join("daemon.run.lock");
-        let run_lock = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(false)
-            .open(&run_lock_path)
-            .map_err(|error| {
-                format!(
-                    "opening daemon lifetime lock probe {}: {error}",
-                    run_lock_path.display()
-                )
-            })?;
-        let deadline = Instant::now() + timeout;
-        loop {
-            match run_lock.try_lock() {
-                Ok(()) => {
-                    run_lock.unlock().map_err(|error| {
-                        format!(
-                            "releasing daemon lifetime lock probe {}: {error}",
-                            run_lock_path.display()
-                        )
-                    })?;
-                    return Ok(());
-                }
-                Err(std::fs::TryLockError::Error(error)) => {
-                    return Err(format!(
-                        "failed to probe daemon lifetime lock {}: {error}",
-                        run_lock_path.display()
-                    ));
-                }
-                Err(error @ std::fs::TryLockError::WouldBlock) if Instant::now() >= deadline => {
-                    return Err(format!(
-                        "daemon lifetime lock {} remained held after its drain phase: {error}",
-                        run_lock_path.display()
-                    ));
-                }
-                Err(std::fs::TryLockError::WouldBlock) => {
-                    std::thread::sleep(Duration::from_millis(100));
-                }
-            }
-        }
     }
 
     fn sync(&self, args: &[&str]) -> Output {
@@ -516,19 +472,9 @@ fn wait_for_remote_entry(shared: &Path, crate_name: &str, cache_key: &str) {
 }
 
 impl Drop for Client {
-    /// Stop this client's daemon when the test ends — including on panic.
-    /// Waiting for its lifetime lock matters on Windows, where the daemon can
-    /// retain handles into temporary directories during teardown.
+    /// Stop this client's daemon when the test ends, including on panic.
     fn drop(&mut self) {
-        // Bounded, and through the same file-backed runner: cleanup must never
-        // be the thing that wedges a test run (#704). Cleanup failures must
-        // not turn an existing test panic into a double panic.
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = self.run_within(&["daemon", "stop"], Duration::from_secs(30));
-            // Upload workers may drain for up to 30s; leave overall shutdown
-            // margin before the client's temporary runtime is removed.
-            let _ = self.wait_for_daemon_exit(Duration::from_secs(45));
-        }));
+        stop_daemon(self.kache().args(["daemon", "stop"]), &self.runtime_dir);
     }
 }
 
@@ -1115,8 +1061,8 @@ fn capturing_kache_output_through_pipes_does_not_hang() {
 
 /// Cleanup by `Drop` must actually work: after a client goes out of scope its
 /// daemon is gone, not merely asked to leave. Without this the suite would
-/// leak a daemon per test, which is what the 3-second idle timeouts elsewhere
-/// were compensating for (kunobi-ninja/kache#704).
+/// leak a daemon per test, which is what the 3-second idle timeouts other
+/// suites used to set were compensating for (kunobi-ninja/kache#704).
 #[test]
 fn dropping_a_client_stops_its_daemon() {
     build_kache();

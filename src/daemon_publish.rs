@@ -288,6 +288,13 @@ pub(crate) async fn drain_publications(
     let mut last_done = progress.done();
     let mut last_change = tokio::time::Instant::now();
     loop {
+        // Each pass ends within a tick of the last check, and a check past
+        // `stall` returns, so the wait never runs far past the window. A
+        // hang would otherwise read as a slow drain.
+        debug_assert!(
+            last_change.elapsed() < stall * 10 + tick,
+            "drain kept waiting past its stall window"
+        );
         match tokio::time::timeout(tick, &mut done).await {
             Ok(_) => return progress.pending(),
             Err(_) => {

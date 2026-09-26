@@ -13312,3 +13312,12 @@ async fn request_read_refuses_frames_across_both_shutdown_boundaries() {
         "a frame completed after shutdown must not be dispatched"
     );
 }
+
+#[test]
+fn a_shutdown_warns_only_about_hand_offs_left_unstored() {
+    assert_eq!(publish_drain_warning(0), None);
+    assert_eq!(
+        publish_drain_warning(1).as_deref(),
+        Some("publish worker stalled at shutdown; 1 queued hand-offs were not stored")
+    );
+}

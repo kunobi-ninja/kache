@@ -2493,6 +2493,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn run_real_reports_the_script_status_or_one_when_it_cannot_start() {
+        // run_real reads OUT_DIR, which other tests set under this lock.
+        let _lock = crate::test_support::process_state_test_lock();
+        let saved = std::env::var_os("OUT_DIR");
+        // SAFETY: the process-state lock serialises environment edits.
+        unsafe { std::env::remove_var("OUT_DIR") };
         let dir = tempfile::tempdir().unwrap();
         let script = |name: &str, body: &str| {
             let path = dir.path().join(name);
@@ -2509,7 +2514,11 @@ mod tests {
             0,
             "arguments reach the script"
         );
-        assert_eq!(run_real(&dir.path().join("absent"), &[]), 1);
+        let absent = run_real(&dir.path().join("absent"), &[]);
+        if let Some(value) = saved {
+            unsafe { std::env::set_var("OUT_DIR", value) };
+        }
+        assert_eq!(absent, 1);
     }
 
     #[cfg(unix)]

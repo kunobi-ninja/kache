@@ -104,9 +104,19 @@ if [[ -z $created ]]; then
   exit 1
 fi
 
+# A second bucket that anonymous readers may only GET from: a reader without
+# s3:ListBucket, as a GetObject-only CI role would be.
+read_only_bucket=kache-e2e-read-only
+policy=$(printf '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":["*"]},"Action":["s3:GetObject"],"Resource":["arn:aws:s3:::%s/*"]}]}' "$read_only_bucket")
+curl -fsS -o /dev/null -X PUT --aws-sigv4 "aws:amz:us-east-1:s3" \
+  --user "$access_key:$secret_key" "$endpoint/$read_only_bucket"
+curl -fsS -o /dev/null -X PUT --aws-sigv4 "aws:amz:us-east-1:s3" \
+  --user "$access_key:$secret_key" --data "$policy" "$endpoint/$read_only_bucket?policy"
+
 output=$(mktemp)
 KACHE_E2E_S3_ENDPOINT=$endpoint \
   KACHE_E2E_S3_BUCKET=$bucket \
+  KACHE_E2E_S3_READ_ONLY_BUCKET=$read_only_bucket \
   KACHE_S3_ACCESS_KEY=$access_key \
   KACHE_S3_SECRET_KEY=$secret_key \
   RUSTC_WRAPPER="" \

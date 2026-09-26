@@ -1200,8 +1200,14 @@ mod tests {
     /// `KACHE_S3_ACCESS_KEY` and `KACHE_S3_SECRET_KEY`. `just e2e-s3` starts a
     /// local RustFS and sets all four; without them these tests do nothing.
     async fn e2e_store() -> Option<(std::sync::Arc<dyn RemoteBackend>, String)> {
+        e2e_store_in("KACHE_E2E_S3_BUCKET").await
+    }
+
+    /// [`e2e_store`], for the bucket that the environment variable
+    /// `bucket_var` names.
+    async fn e2e_store_in(bucket_var: &str) -> Option<(std::sync::Arc<dyn RemoteBackend>, String)> {
         let endpoint = std::env::var("KACHE_E2E_S3_ENDPOINT").ok()?;
-        let bucket = std::env::var("KACHE_E2E_S3_BUCKET").ok()?;
+        let bucket = std::env::var(bucket_var).ok()?;
         let remote = crate::config::RemoteConfig {
             prefix: "e2e".to_string(),
             backend: crate::config::RemoteBackendConfig::S3(crate::config::S3RemoteConfig {
@@ -1350,5 +1356,79 @@ mod tests {
             "{} of {publishers} shard publishers stored",
             published.len()
         );
+    }
+
+    #[tokio::test]
+    async fn e2e_s3_store_keeps_the_first_create_only_write() {
+        let Some((backend, run)) = e2e_store().await else {
+            return;
+        };
+        let key = format!("{run}/immutable.json");
+        let create = |body: &'static [u8]| {
+            let (backend, key) = (backend.clone(), key.clone());
+            async move {
+                backend
+                    .put_if_absent(&key, body.to_vec(), None)
+                    .await
+                    .unwrap()
+            }
+        };
+        use crate::remote_backend::PutIfAbsentResult;
+        assert_eq!(create(b"first").await, PutIfAbsentResult::Created);
+        assert_eq!(create(b"second").await, PutIfAbsentResult::AlreadyExists);
+        let body = backend
+            .get(&key, Some(1024))
+            .await
+            .unwrap()
+            .unwrap()
+            .body
+            .to_vec();
+        assert_eq!(body, b"first");
+    }
+
+    /// `just e2e-s3` also creates a bucket whose policy lets anonymous readers
+    /// do `s3:GetObject` and nothing else: a reader without `s3:ListBucket`.
+    #[tokio::test]
+    async fn e2e_s3_a_get_object_only_reader_reads_without_listing() {
+        let (Ok(endpoint), Ok(bucket)) = (
+            std::env::var("KACHE_E2E_S3_ENDPOINT"),
+            std::env::var("KACHE_E2E_S3_READ_ONLY_BUCKET"),
+        ) else {
+            return;
+        };
+        let (writer, run) = e2e_store_in("KACHE_E2E_S3_READ_ONLY_BUCKET")
+            .await
+            .expect("writer for the read-only bucket");
+        let manifest_key = format!("{run}/id/test");
+        upload_manifest(
+            writer.as_ref(),
+            "",
+            &manifest_key,
+            &manifest_with(vec![entry("published", 1)]),
+            Some("c1"),
+        )
+        .await
+        .unwrap();
+
+        let reader = crate::remote_backend::anonymous_s3_backend_for_bucket(&endpoint, &bucket);
+        let manifest = try_download_manifest(&reader, "", &manifest_key)
+            .await
+            .unwrap()
+            .expect("the reader can GET a published object");
+        assert_eq!(manifest.entries[0].cache_key, "published");
+        let missing = format!("{run}/missing.json");
+        assert!(
+            !reader.head(&missing).await.unwrap(),
+            "a missing key is a miss"
+        );
+        assert!(reader.get(&missing, Some(1024)).await.unwrap().is_none());
+
+        let listing = reader.list(&format!("{run}/")).await.unwrap_err();
+        assert_eq!(
+            crate::remote_resilience::classify_remote_error(&listing),
+            crate::remote_resilience::RemoteErrorClass::Authentication,
+            "a refused LIST is what stops the daemon listing: {listing:#}"
+        );
+        assert!(reader.put(&missing, b"x".to_vec(), None).await.is_err());
     }
 }

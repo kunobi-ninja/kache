@@ -8,7 +8,7 @@ use std::time::Instant;
 
 use crate::config::RemoteConfig;
 use crate::remote::{DownloadResult, UploadResult};
-use crate::remote_backend::{GetTransfer, RemoteBackend};
+use crate::remote_backend::{GetTransfer, PutIfAbsentResult, RemoteBackend};
 use crate::store::{EntryMeta, VerifiedRestoredEntry};
 
 const V3_ROOT: &str = "v3";
@@ -260,8 +260,7 @@ impl<'a> RemoteLayout<'a> {
 
         let pack_key = v3_pack_key(&self.remote.prefix, cache_key, crate_name);
         let put_pack_start = std::time::Instant::now();
-        self.backend
-            .put(&pack_key, packed, None)
+        self.put_immutable(&pack_key, packed, None)
             .await
             .context("uploading v3 pack")?;
         deadline_io_check(deadline, "pack PUT")?;
@@ -281,8 +280,7 @@ impl<'a> RemoteLayout<'a> {
         let manifest_key = v3_manifest_key(&self.remote.prefix, cache_key, crate_name);
 
         let put_manifest_start = std::time::Instant::now();
-        self.backend
-            .put(&manifest_key, manifest_body, Some("application/json"))
+        self.put_immutable(&manifest_key, manifest_body, Some("application/json"))
             .await
             .context("uploading v3 manifest")?;
         deadline_io_check(deadline, "manifest PUT")?;
@@ -297,6 +295,28 @@ impl<'a> RemoteLayout<'a> {
                 network_ms,
             },
         })
+    }
+
+    /// Store an object that is never rewritten: a v3 pack or entry manifest,
+    /// both named by the cache key. Written create-only, so a second uploader
+    /// of the same key, or one that cannot tell an existing entry from a
+    /// missing one, never replaces it. A pack is checked against the metadata
+    /// inside it when restored, so the first upload is as good as any.
+    /// Where the store cannot write create-only, the object is written plainly.
+    async fn put_immutable(
+        &self,
+        key: &str,
+        body: Vec<u8>,
+        content_type: Option<&str>,
+    ) -> Result<()> {
+        match self
+            .backend
+            .put_if_absent(key, body.clone(), content_type)
+            .await?
+        {
+            PutIfAbsentResult::Created | PutIfAbsentResult::AlreadyExists => Ok(()),
+            PutIfAbsentResult::Unsupported => self.backend.put(key, body, content_type).await,
+        }
     }
 
     pub async fn list_keys(&self) -> Result<HashMap<String, String>> {
@@ -1843,6 +1863,131 @@ pub(crate) mod tests {
         assert_eq!(manifest.cache_key, "key123");
         assert_eq!(manifest.crate_name, "foo");
         assert_eq!(manifest.file_count, 1);
+    }
+
+    #[tokio::test]
+    async fn a_second_upload_of_a_key_keeps_the_first_objects() {
+        let (_tmp, store, entry_dir) = populated_entry();
+        let remote = test_remote();
+        let backend = memory_backend();
+        let layout = RemoteLayout::new(&backend, &remote);
+        let pack_key = v3_pack_key(&remote.prefix, "key123", "foo");
+        let manifest_key = v3_manifest_key(&remote.prefix, "key123", "foo");
+        // Stand-ins for what an earlier uploader stored under this key.
+        backend
+            .put(&pack_key, b"first pack".to_vec(), None)
+            .await
+            .unwrap();
+        backend
+            .put(&manifest_key, b"first manifest".to_vec(), None)
+            .await
+            .unwrap();
+
+        layout
+            .upload_entry_until("key123", "foo", &entry_dir, &store.blobs_dir(), 3, None)
+            .await
+            .expect("an existing entry is not an error");
+
+        let body = |key: String| {
+            let backend = &backend;
+            async move {
+                backend
+                    .get(&key, None)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .body
+                    .to_vec()
+            }
+        };
+        assert_eq!(body(pack_key).await, b"first pack");
+        assert_eq!(body(manifest_key).await, b"first manifest");
+    }
+
+    #[tokio::test]
+    async fn a_pack_without_its_manifest_gets_one_from_the_next_upload() {
+        let (_tmp, store, entry_dir) = populated_entry();
+        let remote = test_remote();
+        let backend = memory_backend();
+        let layout = RemoteLayout::new(&backend, &remote);
+        let pack_key = v3_pack_key(&remote.prefix, "key123", "foo");
+        let manifest_key = v3_manifest_key(&remote.prefix, "key123", "foo");
+        backend
+            .put(&pack_key, b"orphan pack".to_vec(), None)
+            .await
+            .unwrap();
+
+        layout
+            .upload_entry_until("key123", "foo", &entry_dir, &store.blobs_dir(), 3, None)
+            .await
+            .unwrap();
+
+        let manifest = backend
+            .get(&manifest_key, None)
+            .await
+            .unwrap()
+            .expect("manifest");
+        let manifest: V3Manifest = serde_json::from_slice(&manifest.body).unwrap();
+        assert_eq!(manifest.pack_key, pack_key);
+    }
+
+    /// A transport with only the required methods, so create-only writes
+    /// report `Unsupported`. Records every plain PUT.
+    #[derive(Default)]
+    struct PlainOnly {
+        puts: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl RemoteBackend for PlainOnly {
+        async fn head(&self, _key: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        async fn get(
+            &self,
+            _key: &str,
+            _max_bytes: Option<u64>,
+        ) -> anyhow::Result<Option<crate::remote_backend::GetObject>> {
+            Ok(None)
+        }
+
+        async fn put(
+            &self,
+            key: &str,
+            _body: Vec<u8>,
+            _content_type: Option<&str>,
+        ) -> anyhow::Result<()> {
+            self.puts.lock().unwrap().push(key.to_string());
+            Ok(())
+        }
+
+        async fn list(&self, _prefix: &str) -> anyhow::Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+
+        fn describe(&self, key: &str) -> String {
+            key.to_string()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_store_without_create_only_writes_gets_plain_puts() {
+        let (_tmp, store, entry_dir) = populated_entry();
+        let remote = test_remote();
+        let backend = PlainOnly::default();
+        let layout = RemoteLayout::new(&backend, &remote);
+        layout
+            .upload_entry_until("key123", "foo", &entry_dir, &store.blobs_dir(), 3, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            *backend.puts.lock().unwrap(),
+            [
+                v3_pack_key(&remote.prefix, "key123", "foo"),
+                v3_manifest_key(&remote.prefix, "key123", "foo"),
+            ]
+        );
     }
 
     #[tokio::test]

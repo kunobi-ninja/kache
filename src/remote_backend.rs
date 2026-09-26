@@ -86,11 +86,12 @@ pub struct GetTransfer {
 }
 
 /// Outcome of an atomic create-only remote publication.
-#[allow(dead_code)] // consumed by the packed-prefetch publisher in the next slice
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PutIfAbsentResult {
     Created,
     AlreadyExists,
+    /// The store cannot make the write create-only. Nothing was written.
+    Unsupported,
 }
 
 /// Outcome of [`RemoteBackend::put_if_match`].
@@ -175,14 +176,14 @@ pub trait RemoteBackend: Send + Sync {
     ///
     /// Implementations must never emulate this with HEAD followed by PUT: that
     /// race would let two publishers overwrite an immutable transport object.
-    #[allow(dead_code)] // consumed by the packed-prefetch publisher in the next slice
+    /// A transport that cannot do it answers `Unsupported` and writes nothing.
     async fn put_if_absent(
         &self,
         _key: &str,
         _body: Vec<u8>,
         _content_type: Option<&str>,
     ) -> Result<PutIfAbsentResult> {
-        anyhow::bail!("remote backend does not support atomic create-only publication")
+        Ok(PutIfAbsentResult::Unsupported)
     }
 
     /// File keys under `prefix`.
@@ -586,6 +587,9 @@ impl RemoteBackend for OpenDalBackend {
     ) -> Result<PutIfAbsentResult> {
         self.validate_key("CREATE", key, false)?;
         self.verify_write_containment(key)?;
+        if !self.operator.info().capability().write_with_if_not_exists {
+            return Ok(PutIfAbsentResult::Unsupported);
+        }
         let request = self.operator.write_with(key, body).if_not_exists(true);
         let result = match content_type {
             Some(content_type) => request.content_type(content_type).await,
@@ -593,7 +597,7 @@ impl RemoteBackend for OpenDalBackend {
         };
         match result {
             Ok(_) => Ok(PutIfAbsentResult::Created),
-            Err(error) => match classify_create_error(error.kind()) {
+            Err(error) => match classify_create_error(&error) {
                 Some(outcome) => Ok(outcome),
                 None => Err(self.contextual_error("CREATE", key, error)),
             },
@@ -705,10 +709,14 @@ fn verify_complete_body(advertised: Option<u64>, read: u64, description: &str) -
 /// Only failed create preconditions mean that an immutable object already won
 /// the publication race. Authentication, transport, and storage failures must
 /// remain errors rather than being reported as a harmless duplicate.
-fn classify_create_error(kind: ErrorKind) -> Option<PutIfAbsentResult> {
-    match kind {
+fn classify_create_error(error: &opendal::Error) -> Option<PutIfAbsentResult> {
+    match error.kind() {
         ErrorKind::ConditionNotMatch | ErrorKind::AlreadyExists => {
             Some(PutIfAbsentResult::AlreadyExists)
+        }
+        ErrorKind::Unsupported => Some(PutIfAbsentResult::Unsupported),
+        ErrorKind::Unexpected if lacks_conditional_writes(error) => {
+            Some(PutIfAbsentResult::Unsupported)
         }
         _ => None,
     }
@@ -1164,6 +1172,23 @@ pub async fn create_backend(
     Ok(Arc::new(backend))
 }
 
+/// An S3 backend that sends unsigned requests, as an anonymous reader does.
+#[cfg(test)]
+pub(crate) fn anonymous_s3_backend_for_bucket(endpoint: &str, bucket: &str) -> OpenDalBackend {
+    ensure_rustls_provider();
+    let client = reqwest::Client::builder().build().unwrap();
+    let builder = S3::default()
+        .bucket(bucket)
+        .region("us-east-1")
+        .endpoint(endpoint)
+        .checksum_algorithm("md5")
+        .skip_signature();
+    let context = OperationContext::new()
+        .with_http_transport(HttpTransporter::new(ReqwestTransport::new(client)));
+    let operator = Operator::new(builder).unwrap().with_context(context);
+    OpenDalBackend::new(operator, format!("s3://{bucket}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1212,18 +1237,7 @@ mod tests {
     }
 
     fn anonymous_s3_backend(endpoint: &str) -> OpenDalBackend {
-        ensure_rustls_provider();
-        let client = reqwest::Client::builder().build().unwrap();
-        let builder = S3::default()
-            .bucket("bucket")
-            .region("us-east-1")
-            .endpoint(endpoint)
-            .checksum_algorithm("md5")
-            .skip_signature();
-        let context = OperationContext::new()
-            .with_http_transport(HttpTransporter::new(ReqwestTransport::new(client)));
-        let operator = Operator::new(builder).unwrap().with_context(context);
-        OpenDalBackend::new(operator, "s3://bucket".to_string())
+        anonymous_s3_backend_for_bucket(endpoint, "bucket")
     }
 
     #[tokio::test]
@@ -1412,16 +1426,30 @@ mod tests {
 
     #[test]
     fn create_only_error_classification_is_exact() {
+        let classify = |kind, message: &str| {
+            classify_create_error(&opendal::Error::new(kind, message.to_string()))
+        };
         assert_eq!(
-            classify_create_error(ErrorKind::ConditionNotMatch),
+            classify(ErrorKind::ConditionNotMatch, ""),
             Some(PutIfAbsentResult::AlreadyExists)
         );
         assert_eq!(
-            classify_create_error(ErrorKind::AlreadyExists),
+            classify(ErrorKind::AlreadyExists, ""),
             Some(PutIfAbsentResult::AlreadyExists)
         );
-        assert_eq!(classify_create_error(ErrorKind::PermissionDenied), None);
-        assert_eq!(classify_create_error(ErrorKind::Unexpected), None);
+        assert_eq!(
+            classify(ErrorKind::Unsupported, ""),
+            Some(PutIfAbsentResult::Unsupported)
+        );
+        assert_eq!(
+            classify(
+                ErrorKind::Unexpected,
+                r#"S3Error { code: "NotImplemented" }"#
+            ),
+            Some(PutIfAbsentResult::Unsupported)
+        );
+        assert_eq!(classify(ErrorKind::PermissionDenied, ""), None);
+        assert_eq!(classify(ErrorKind::Unexpected, "timed out"), None);
     }
 
     #[tokio::test]

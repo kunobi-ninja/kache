@@ -6487,6 +6487,11 @@ fn save_manifest_impl(
         .build()
         .context("building tokio runtime")?;
 
+    // The daemon's auto-publish runs in the daemon's environment, which may
+    // belong to an earlier job, so only a publish from the job itself names
+    // the commit.
+    let commit = manifest_commit(session_id, |name| std::env::var(name).ok());
+
     let pool_idle_secs = config.s3_pool_idle_secs;
     let entry_count = entries.len();
     let published = keys.clone();
@@ -6502,6 +6507,7 @@ fn save_manifest_impl(
                 shard_namespace,
                 std::path::Path::new("Cargo.lock"),
                 entries.clone(),
+                commit.as_deref(),
             )
             .await?;
         }
@@ -6523,6 +6529,24 @@ fn save_manifest_impl(
 /// when a crate appears under one cache_key multiple times the entry with the
 /// largest compile time wins (cargo may invoke rustc repeatedly with differing
 /// flags). Pure — extracted so the dedup logic is unit-testable without S3.
+/// The commit to record with a published manifest: GitHub Actions'
+/// `GITHUB_SHA`, else GitLab's `CI_COMMIT_SHA`, blank values counting as
+/// unset. `None` for the daemon's per-session publish (`session_id` set),
+/// whose environment may belong to an earlier job.
+fn manifest_commit(
+    session_id: Option<&str>,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Option<String> {
+    if session_id.is_some() {
+        return None;
+    }
+    ["GITHUB_SHA", "CI_COMMIT_SHA"]
+        .into_iter()
+        .filter_map(lookup)
+        .map(|value| value.trim().to_string())
+        .find(|value| !value.is_empty())
+}
+
 fn manifest_entries_from_events(
     events: &[crate::events::BuildEvent],
     session_id: Option<&str>,
@@ -6580,6 +6604,7 @@ async fn upload_manifest_and_shards(
     namespace: Option<&str>,
     lock_path: &std::path::Path,
     entries: Vec<crate::remote::ManifestEntry>,
+    commit: Option<&str>,
 ) -> Result<()> {
     let manifest = crate::remote::BuildManifest {
         version: 3,
@@ -6589,7 +6614,9 @@ async fn upload_manifest_and_shards(
     };
 
     // Always upload the monolithic build manifest.
-    remote_cache.put_build_manifest(key, &manifest).await?;
+    remote_cache
+        .put_build_manifest(key, &manifest, commit)
+        .await?;
 
     // Upload sharded build-manifest indexes if a namespace is provided and Cargo.lock exists.
     if let Some(ns) = namespace {
@@ -11642,6 +11669,23 @@ mod tests {
     }
 
     #[test]
+    fn manifest_commit_prefers_github_then_gitlab_and_skips_daemon_sessions() {
+        let env = |vars: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                vars.iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| value.to_string())
+            }
+        };
+        let both = env(&[("GITHUB_SHA", " gh "), ("CI_COMMIT_SHA", "gl")]);
+        assert_eq!(manifest_commit(None, both).as_deref(), Some("gh"));
+        assert_eq!(manifest_commit(Some("session"), both), None);
+        let blank_github = env(&[("GITHUB_SHA", "  "), ("CI_COMMIT_SHA", "gl")]);
+        assert_eq!(manifest_commit(None, blank_github).as_deref(), Some("gl"));
+        assert_eq!(manifest_commit(None, env(&[])), None);
+    }
+
+    #[test]
     fn manifest_entries_from_events_dedups_and_filters() {
         use crate::events::EventResult;
         let events = vec![
@@ -11754,6 +11798,7 @@ mod tests {
             None,
             std::path::Path::new("/nonexistent/Cargo.lock"),
             entries,
+            None,
         )
         .await
         .expect("manifest-only upload should succeed");
@@ -11780,6 +11825,7 @@ mod tests {
             Some("ns"),
             std::path::Path::new("/nonexistent/Cargo.lock"),
             entries,
+            None,
         )
         .await
         .expect("upload should succeed, shards skipped");
@@ -11812,7 +11858,7 @@ mod tests {
         let remote_cache: Arc<crate::cache_remote::V3Remote> =
             Arc::new(crate::cache_remote::V3Remote::new(client, remote));
 
-        upload_manifest_and_shards(&remote_cache, "mykey", Some("ns"), &lock, entries)
+        upload_manifest_and_shards(&remote_cache, "mykey", Some("ns"), &lock, entries, None)
             .await
             .expect("upload with shards should succeed");
         let puts = backend.put_calls();

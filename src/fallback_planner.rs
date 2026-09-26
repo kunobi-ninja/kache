@@ -600,7 +600,7 @@ mod tests {
                 artifact_size: 4096,
             }],
         };
-        crate::remote::upload_manifest(backend.as_ref(), "prefix", "id/test", &manifest)
+        crate::remote::upload_manifest(backend.as_ref(), "prefix", "id/test", &manifest, None)
             .await
             .unwrap();
         let daemon = Arc::new(Daemon::new(config));
@@ -642,7 +642,7 @@ mod tests {
                 artifact_size: 4096,
             }],
         };
-        crate::remote::upload_manifest(backend.as_ref(), "prefix", &legacy, &manifest)
+        crate::remote::upload_manifest(backend.as_ref(), "prefix", &legacy, &manifest, None)
             .await
             .unwrap();
         let daemon = Arc::new(Daemon::new(config));
@@ -683,7 +683,7 @@ mod tests {
                 artifact_size: 4096,
             }],
         };
-        crate::remote::upload_manifest(inner.as_ref(), "prefix", "id/test", &manifest)
+        crate::remote::upload_manifest(inner.as_ref(), "prefix", "id/test", &manifest, None)
             .await
             .unwrap();
         let backend = Arc::new(FailFirstManifestGetBackend {

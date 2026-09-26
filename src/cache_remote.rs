@@ -69,7 +69,14 @@ pub trait CacheRemote: Send + Sync {
 pub trait V3Prefetch: Send + Sync {
     async fn get_build_manifest(&self, manifest_key: &str) -> Result<Option<BuildManifest>>;
 
-    async fn put_build_manifest(&self, manifest_key: &str, manifest: &BuildManifest) -> Result<()>;
+    /// Publish `manifest` merged with what the remote holds for `manifest_key`;
+    /// `commit` is the commit this build ran on, when CI says.
+    async fn put_build_manifest(
+        &self,
+        manifest_key: &str,
+        manifest: &BuildManifest,
+        commit: Option<&str>,
+    ) -> Result<()>;
 
     async fn get_shard(&self, namespace: &str, shard_hash: &str) -> Result<Option<Shard>>;
 
@@ -185,12 +192,18 @@ impl V3Prefetch for V3Remote {
             .await
     }
 
-    async fn put_build_manifest(&self, manifest_key: &str, manifest: &BuildManifest) -> Result<()> {
+    async fn put_build_manifest(
+        &self,
+        manifest_key: &str,
+        manifest: &BuildManifest,
+        commit: Option<&str>,
+    ) -> Result<()> {
         remote::upload_manifest(
             self.backend.as_ref(),
             &self.remote.prefix,
             manifest_key,
             manifest,
+            commit,
         )
         .await
     }
@@ -316,7 +329,10 @@ mod tests {
                 artifact_size: 5678,
             }],
         };
-        remote.put_build_manifest("m1", &manifest).await.unwrap();
+        remote
+            .put_build_manifest("m1", &manifest, None)
+            .await
+            .unwrap();
         let fetched = remote.get_build_manifest("m1").await.unwrap().unwrap();
         // `BuildManifest` has no `PartialEq`; compare the serialized shape instead.
         assert_eq!(

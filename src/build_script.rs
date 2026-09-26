@@ -367,6 +367,7 @@ struct Run {
 
 fn run_cached(real: &Path, argv: &[std::ffi::OsString]) -> Result<i32> {
     let start = std::time::Instant::now();
+    let _trace = crate::phase_trace::start("build_script", &[real.to_string_lossy().into_owned()]);
     let config = Config::load()?;
     let _ = TREE_MEMO_DIR.set(config.cache_dir.clone());
     if config.disabled {
@@ -383,17 +384,30 @@ fn run_cached(real: &Path, argv: &[std::ffi::OsString]) -> Result<i32> {
         start,
     };
 
-    let prediction = run.prediction()?;
+    let prediction = {
+        let _phase = crate::phase_trace::phase("prediction");
+        run.prediction()?
+    };
     if let Some(prediction) = &prediction {
         let key_start = std::time::Instant::now();
-        let key = run.action_key(prediction)?;
+        let key = {
+            let _phase = crate::phase_trace::phase("key");
+            run.action_key(prediction)?
+        };
         let key_ms = key_start.elapsed().as_millis() as u64;
         let lookup_start = std::time::Instant::now();
-        let meta = run.store.get(&key)?;
+        let meta = {
+            let _phase = crate::phase_trace::phase("lookup");
+            run.store.get(&key)?
+        };
         let lookup_ms = lookup_start.elapsed().as_millis() as u64;
         if let Some(meta) = meta {
             let restore_start = std::time::Instant::now();
-            match run.restore(&meta) {
+            let restored = {
+                let _phase = crate::phase_trace::phase("restore");
+                run.restore(&meta)
+            };
+            match restored {
                 Ok(size) => {
                     let restore_ms = restore_start.elapsed().as_millis() as u64;
                     run.log(
@@ -1065,6 +1079,7 @@ impl Run {
                         .environment
                         .within_target_dir(&path)
                         .then_some(&self.environment);
+                    let _phase = crate::phase_trace::phase("dep_state");
                     let state = input_state_as(&path, &[], &file_hasher, &mut budget, 0, text)?;
                     fold(&mut hasher, "cargo_env_path_state", state.as_bytes());
                 }
@@ -1176,12 +1191,30 @@ impl Run {
             prepared.push((
                 link::prepare_writable_target_from_file(&blob, &target)?,
                 cached.executable,
+                cached.hash.as_str(),
             ));
         }
-        for (artifact, executable) in prepared {
+        let mut exact = Vec::with_capacity(prepared.len());
+        for (artifact, executable, hash) in prepared {
             let target = artifact.target().to_path_buf();
             artifact.publish_replacing()?;
             set_executable(&target, executable)?;
+            // Taken after the last change to the file, so it is the
+            // fingerprint that holds the blob's bytes.
+            if let Ok(fingerprint) = crate::cache_key::FileFingerprint::from_path(&target) {
+                exact.push((fingerprint, hash));
+            }
+        }
+        // A `links` dependency's dependents key on these files through its
+        // `DEP_*` paths, right after this restore: tell the file-hash memo
+        // what they hold instead of letting each dependent read them again
+        // (aws-lc-sys's 31 MB for aws-lc-rs and rustls on hk). Keyed on the
+        // fingerprint observed after the restore, so a later write retires
+        // the row (kunobi-ninja/kache#540). Rewritten text files hold other
+        // bytes than their blob and are not recorded.
+        {
+            let _phase = crate::phase_trace::phase("memo_restored");
+            self.store.record_verified_file_hashes(&exact);
         }
         for (blob, target, executable) in texts {
             std::fs::write(
@@ -2771,6 +2804,9 @@ mod tests {
         std::fs::create_dir_all(out.join("lib/pkgconfig")).unwrap();
         std::fs::write(out.join("lib/pkgconfig/z.pc"), pc(out)).unwrap();
         std::fs::write(out.join("lib/adler32.o"), &object).unwrap();
+        // Big enough for the file-hash memo, which skips small files.
+        let archive = vec![7_u8; 70 * 1024];
+        std::fs::write(out.join("lib/libz.a"), &archive).unwrap();
         let after_the_run = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
         a.record(b"cargo:rerun-if-changed=build.rs\n", b"", 5, after_the_run)
             .unwrap();
@@ -2797,6 +2833,21 @@ mod tests {
             pc(out)
         );
         assert_eq!(std::fs::read(out.join("lib/adler32.o")).unwrap(), object);
+        // A dependent keying on the restored archive finds its hash without
+        // reading it.
+        let blob = meta
+            .files
+            .iter()
+            .find(|file| file.name == "out/lib/libz.a")
+            .expect("the archive was recorded");
+        match b
+            .store
+            .file_hash_cache()
+            .lookup_cached(&out.join("lib/libz.a"))
+        {
+            kache_store::file_hash::FileHashLookup::Hit(hash) => assert_eq!(hash, blob.hash),
+            _ => panic!("the restored archive was not memoised"),
+        }
     }
 
     /// A `links` dependency that exports a directory outside the target

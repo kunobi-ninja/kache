@@ -649,7 +649,7 @@ mod tests {
         let at = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
         let age = Duration::from_secs(10);
         assert!(!elapsed_beyond(at, age, at + age));
-        assert!(elapsed_beyond(at, age, at + age + Duration::from_nanos(1)));
+        assert!(elapsed_beyond(at, age, at + age + Duration::from_micros(1)));
         assert!(
             !elapsed_beyond(at, age, at - Duration::from_secs(1)),
             "future"

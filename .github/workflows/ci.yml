@@ -222,8 +222,8 @@ jobs:
 
           mkdir -p tmp/mutants
           git rev-parse --verify 'HEAD^1^{commit}'
-          git diff --no-ext-diff --diff-algorithm=histogram --unified=1 HEAD^1 HEAD -- '*.rs' \
-            > tmp/mutants/pr.diff
+          # Code a change only moves is not changed code: see the script.
+          python3 scripts/mutation-diff.py HEAD^1 HEAD > tmp/mutants/pr.diff
           count="$(
             cargo mutants \
               --workspace \
@@ -667,6 +667,8 @@ jobs:
       # The path-to-job-group mapping Detect changes applies to pull requests.
       - name: Change detection tests
         run: python3 scripts/test-ci-changes.py
+      - name: Mutation diff tests
+        run: python3 scripts/test-mutation-diff.py
 
   # --- Dependency policy audit ---
   # Runs `cargo deny check` (via `just audit`) on every push and non-docs PR:

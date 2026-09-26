@@ -356,28 +356,45 @@ pub(crate) fn take(dest: &Path, blob: &str) -> bool {
 /// wrapper's path; a second pass for the same target while one runs does
 /// nothing.
 pub(crate) fn stage(cache_dir: &Path, target_dir: &Path, blob_path: impl Fn(&str) -> PathBuf) {
-    let directory = records_dir(cache_dir, target_dir);
-    let Ok(lock) = std::fs::create_dir_all(&directory).and_then(|()| {
-        std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(directory.join(STAGING_LOCK))
-    }) else {
-        return;
-    };
-    if lock.try_lock().is_err() {
-        return;
-    }
-    for record in records_for(cache_dir, target_dir) {
-        if let Err(error) = stage_one(&record, &blob_path(&record.blob)) {
-            tracing::debug!("not staging {}: {error:#}", record.dest.display());
+    match stage_pass(cache_dir, target_dir, blob_path) {
+        Ok(results) => {
+            for (dest, result) in results {
+                if let Err(error) = result {
+                    tracing::debug!("not staging {}: {error:#}", dest.display());
+                }
+            }
         }
+        Err(error) => tracing::debug!("no staging pass for {}: {error}", target_dir.display()),
     }
+}
+
+/// One staging pass, and what happened to each record. `Err` when the pass
+/// did not run: the lock could not be opened, or another pass holds it.
+fn stage_pass(
+    cache_dir: &Path,
+    target_dir: &Path,
+    blob_path: impl Fn(&str) -> PathBuf,
+) -> std::io::Result<Vec<(PathBuf, anyhow::Result<()>)>> {
+    let directory = records_dir(cache_dir, target_dir);
+    std::fs::create_dir_all(&directory)?;
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(directory.join(STAGING_LOCK))?;
+    lock.try_lock().map_err(std::io::Error::from)?;
+    let results = records_for(cache_dir, target_dir)
+        .into_iter()
+        .map(|record| {
+            let result = stage_one(&record, &blob_path(&record.blob));
+            (record.dest, result)
+        })
+        .collect();
     // Unlock rather than only drop: a child forked while the file is open
     // shares its lock until the child execs, and would make the next pass
     // skip.
     let _ = lock.unlock();
+    Ok(results)
 }
 
 fn stage_one(record: &Record, blob: &Path) -> anyhow::Result<()> {
@@ -549,6 +566,16 @@ mod tests {
         assert!(!take(&dest, &hash), "taken once");
     }
 
+    /// Stage the one recorded executable, failing with the pass's own error
+    /// rather than leaving a silently unstaged copy for a later assertion.
+    fn stage_ok(cache: &Path, target: &Path, blob_path: &Path) {
+        let results = stage_pass(cache, target, |_| blob_path.to_path_buf()).unwrap();
+        assert_eq!(results.len(), 1);
+        for (dest, result) in results {
+            result.unwrap_or_else(|error| panic!("staging {}: {error:#}", dest.display()));
+        }
+    }
+
     /// A staged copy written to after staging, or staged for another blob,
     /// is never used, and the failed check removes it.
     #[test]
@@ -560,14 +587,14 @@ mod tests {
         let dest = target.join("debug/deps/app-0123456789abcdef");
         remember(&cache, &target, &dest, &hash, MIN_BYTES);
 
-        stage(&cache, &target, |_| blob_path.clone());
+        stage_ok(&cache, &target, &blob_path);
         let staged = staged_path(&dest, &hash).unwrap();
         std::fs::write(&staged, b"an executable, stripped").unwrap();
         assert!(!take(&dest, &hash));
         assert!(!dest.exists() && !staged.exists());
         assert!(!fingerprint_path(&staged).exists());
 
-        stage(&cache, &target, |_| blob_path.clone());
+        stage_ok(&cache, &target, &blob_path);
         let other = "f".repeat(64);
         assert!(
             !take(&dest, &other),
@@ -589,7 +616,11 @@ mod tests {
         remember(&cache, &target, &dest, &hash, MIN_BYTES);
 
         std::fs::write(&blob_path, b"torn bytes!!!").unwrap();
-        stage(&cache, &target, |_| blob_path.clone());
+        let results = stage_pass(&cache, &target, |_| blob_path.clone()).unwrap();
+        assert!(
+            matches!(&results[..], [(_, Err(error))] if error.to_string().contains("reads back as")),
+            "{results:?}"
+        );
         let staged = staged_path(&dest, &hash).unwrap();
         assert!(!staged.exists() && !fingerprint_path(&staged).exists());
         let leftovers = std::fs::read_dir(dest.parent().unwrap()).unwrap().count();
@@ -597,7 +628,7 @@ mod tests {
 
         std::fs::write(&blob_path, b"an executable").unwrap();
         std::fs::write(fingerprint_path(&staged), b"{}").unwrap();
-        stage(&cache, &target, |_| blob_path.clone());
+        stage_ok(&cache, &target, &blob_path);
         assert!(take(&dest, &hash));
     }
 

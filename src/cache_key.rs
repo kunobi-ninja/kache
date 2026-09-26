@@ -9,6 +9,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
+use crate::key_env::KeyEnv;
+
 /// Bump this when cache key logic changes in a way that could have produced
 /// incorrect entries. All entries from previous versions become unreachable.
 ///
@@ -2085,6 +2087,7 @@ fn resolve_key_inputs(
     args: &RustcArgs,
     file_hasher: &FileHasher<'_>,
     crate_name: &str,
+    env: &KeyEnv,
 ) -> Result<Option<DepInfo>> {
     if let Some((provided, tree)) = PROVIDED_DEP_INFO.with(|cell| cell.borrow_mut().take()) {
         let _ = LAST_KEY_TREE_DIGEST.try_with(|stash| *stash.borrow_mut() = tree);
@@ -2115,18 +2118,12 @@ fn resolve_key_inputs(
         match prediction {
             Ok(dep_info) => {
                 crate::phase_trace::decision("prediction", "validated");
-                let mode = parse_verify_predictions(
-                    std::env::var("KACHE_VERIFY_INPUT_PREDICTIONS")
-                        .ok()
-                        .as_deref(),
-                );
+                let mode =
+                    parse_verify_predictions(env.var("KACHE_VERIFY_INPUT_PREDICTIONS").as_deref());
                 // Verification is the exceptional path: it runs the pre-pass
                 // anyway and uses ITS answer, so a disagreement is reported
                 // rather than acted on.
-                let current_dir = std::env::current_dir().ok();
-                if verifies_prediction(mode, args, current_dir.as_deref(), |var| {
-                    std::env::var_os(var)
-                }) {
+                if verifies_prediction(mode, args, env.cwd(), |var| env.var_os(var)) {
                     crate::phase_trace::decision("prediction", "verify-sampled");
                     let discovered = dep_info_pre_pass(args)?;
                     if discovered
@@ -2214,6 +2211,7 @@ pub fn compute_cache_key(
     args: &RustcArgs,
     file_hasher: &FileHasher<'_>,
     path_normalizer: &PathNormalizer,
+    env: &KeyEnv,
 ) -> Result<String> {
     let _trace = crate::phase_trace::phase("key");
     // Grouped: the main digest is identical to a plain hasher's; the group
@@ -2242,8 +2240,8 @@ pub fn compute_cache_key(
     let _ = LAST_KEY_BAKES_OUT_DIR.try_with(|stash| stash.set(false));
 
     // The unit's OUT_DIR, read here once and passed to everything below that
-    // needs it, so those helpers never read the process environment.
-    let out_dir = std::env::var_os("OUT_DIR");
+    // needs it.
+    let out_dir = env.var_os("OUT_DIR");
 
     // key version — bump CACHE_KEY_VERSION to invalidate all prior entries
     hasher.update(b"key_version:");
@@ -2284,7 +2282,7 @@ pub fn compute_cache_key(
     // arguments Cargo hands it through the environment all change what a
     // successful compile prints, and hits replay diagnostics.
     if args.is_clippy_chain() {
-        let identity = clippy_identity(&args.rustc)?;
+        let identity = clippy_identity(&args.rustc, env)?;
         fold_field(&mut hasher, b"clippy.v1:", identity.as_bytes());
         tracing::trace!(
             "[key:{}] clippy={}",
@@ -2436,7 +2434,7 @@ pub fn compute_cache_key(
         tracing::trace!("[key:{}] cfg:{}", crate_name, cfg);
     }
 
-    let dep_info = resolve_key_inputs(args, file_hasher, crate_name)?;
+    let dep_info = resolve_key_inputs(args, file_hasher, crate_name, env)?;
     // Keep the closure available to the wrapper, which records it as a
     // prediction only once the invocation it belongs to has succeeded. The
     // clone is one allocation per closure file against a whole rustc spawn.
@@ -2580,7 +2578,7 @@ pub fn compute_cache_key(
     // `-Cfoo=b -Cfoo=a` because later flags override earlier ones in
     // rustc's parser.
     hasher.set_group("args");
-    if let Ok(rustflags) = std::env::var("RUSTFLAGS") {
+    if let Some(rustflags) = env.var("RUSTFLAGS") {
         // Scrub the per-checkout `from` of any `--remap-path-prefix` BEFORE
         // sentinel normalization, so a checkout path the PathNormalizer would
         // only partially rewrite collapses to a single sentinel and clones
@@ -2594,7 +2592,7 @@ pub fn compute_cache_key(
     }
 
     // CARGO_ENCODED_RUSTFLAGS (cargo's way of passing flags)
-    if let Ok(flags) = std::env::var("CARGO_ENCODED_RUSTFLAGS") {
+    if let Some(flags) = env.var("CARGO_ENCODED_RUSTFLAGS") {
         // Same scrub as RUSTFLAGS; the encoded form is `\x1f`-separated, so
         // tokenize on that (a space-form `--remap-path-prefix` is its own unit
         // with the value in the next unit).
@@ -2638,7 +2636,7 @@ pub fn compute_cache_key(
     // but the var's presence was not. Fold it in only when set, so the key is
     // byte-identical for the common case (var unset): no CACHE_KEY_VERSION bump
     // and no cache invalidation for existing users.
-    if let Ok(bootstrap) = std::env::var("RUSTC_BOOTSTRAP")
+    if let Some(bootstrap) = env.var("RUSTC_BOOTSTRAP")
         && !bootstrap.is_empty()
     {
         hasher.update(b"RUSTC_BOOTSTRAP:");
@@ -2762,7 +2760,7 @@ pub fn compute_cache_key(
             default_dirs: default_library_dirs(
                 target,
                 rustc_host,
-                std::env::var_os("LIBRARY_PATH").as_deref(),
+                env.var_os("LIBRARY_PATH").as_deref(),
             ),
             out_dir: unit_out_dir.as_deref(),
             build_tree: build_tree_roots(args),
@@ -2896,7 +2894,7 @@ pub fn compute_cache_key(
     // Relevant CARGO_CFG_* env vars (sorted for determinism —
     // environment iteration order is platform-defined and not stable)
     hasher.set_group("env_cfg");
-    let cargo_cfgs = cargo_cfg_pairs(std::env::vars_os());
+    let cargo_cfgs = cargo_cfg_pairs(env.cargo_cfgs());
     tracing::trace!("[key:{}] cargo_cfg_count={}", crate_name, cargo_cfgs.len());
     for (key, value) in &cargo_cfgs {
         // Cargo derives CARGO_CFG_* from `--cfg` flags. Build scripts (and
@@ -2960,7 +2958,7 @@ pub fn compute_cache_key(
             Some(identity) => Ok(identity),
             None => anyhow::bail!("the macOS SDK could not be identified"),
         },
-        std::env::var("MACOSX_DEPLOYMENT_TARGET").ok(),
+        env,
     )?;
 
     // Native Windows MSVC links depend on the selected COFF linker/compiler,
@@ -3023,7 +3021,7 @@ pub fn compute_cache_key(
         // coverage). Fold the raw local prefixes that would have been remapped so
         // the key is path-local, matching the cc `KACHE_CC_PATH_NORMALIZE=0`
         // "keys become path-literal" contract.
-        fold_unremapped_path_identity(&mut hasher, args, path_normalizer);
+        fold_unremapped_path_identity(&mut hasher, args, path_normalizer, env);
         "none".to_string()
     } else {
         hasher.update(b"remap:multi-prefix\n");
@@ -3058,6 +3056,17 @@ pub fn compute_cache_key(
     let _ = LAST_KEY_FIELDS.try_with(|stash| *stash.borrow_mut() = Some(fields));
     let key = hash.to_hex().to_string();
     tracing::trace!("[key:{}] final={}", crate_name, &key[..16]);
+    complete_key(env, key)
+}
+
+/// `key`, unless key computation read a variable its snapshot does not hold.
+/// That input would have folded as unset whatever its value, so two builds
+/// that differ in it could share the key; the invocation runs uncached.
+fn complete_key(env: &KeyEnv, key: String) -> Result<String> {
+    anyhow::ensure!(
+        !env.read_undeclared(),
+        "key computation read an environment variable missing from KEY_ENV_VARS"
+    );
     Ok(key)
 }
 
@@ -3089,10 +3098,11 @@ fn fold_unremapped_path_identity<H: KeyFold>(
     hasher: &mut H,
     args: &RustcArgs,
     path_normalizer: &PathNormalizer,
+    env: &KeyEnv,
 ) {
     hasher.update(b"unremapped_path_identity:v1\n");
 
-    if let Ok(cwd) = std::env::current_dir() {
+    if let Some(cwd) = env.cwd() {
         fold_field(
             hasher,
             b"unremapped:cwd:",
@@ -7371,11 +7381,11 @@ fn get_clippy_version(driver: &Path) -> Result<String> {
 /// or `clippy.toml`, searched from `CLIPPY_CONF_DIR`, else the manifest
 /// directory, upwards) and the lint arguments `cargo clippy` passes through
 /// the environment. Content, not location, so two checkouts share keys.
-pub(crate) fn clippy_identity(driver: &Path) -> Result<String> {
+pub(crate) fn clippy_identity(driver: &Path, env: &KeyEnv) -> Result<String> {
     clippy_identity_in(
         driver,
-        |name| std::env::var_os(name),
-        std::env::current_dir().ok(),
+        |name| env.var_os(name),
+        env.cwd().map(Path::to_path_buf),
     )
 }
 
@@ -7752,7 +7762,7 @@ fn fold_native_link_runtime_identity<H, Crt, Sdk>(
     running_on_macos: bool,
     crt_probe: Crt,
     sdk_probe: Sdk,
-    deployment_target: Option<String>,
+    env: &KeyEnv,
 ) -> Result<()>
 where
     H: KeyFold,
@@ -7788,7 +7798,8 @@ where
     }
 
     if running_on_macos && host.split('-').any(|component| component == "darwin") {
-        let identity = sdk_probe(std::env::var("SDKROOT").ok())
+        let deployment_target = env.var("MACOSX_DEPLOYMENT_TARGET");
+        let identity = sdk_probe(env.var("SDKROOT"))
             .context("determining macOS SDK identity for cache key")?;
         fold_field(hasher, b"host_sdk.v1:", identity.as_bytes());
         tracing::trace!(

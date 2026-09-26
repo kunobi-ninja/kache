@@ -138,6 +138,7 @@ pub async fn build_prefetch_plan_with_identity(
         kache_core::PlanLimits::default(),
     )
     .await?;
+    let plan = without_local_only_runs(plan);
 
     // Never silently truncate: a plan trimmed by a composition cap must be
     // distinguishable from one that had nothing more to offer (#616).
@@ -156,6 +157,15 @@ pub async fn build_prefetch_plan_with_identity(
     }
 
     Ok(plan)
+}
+
+/// `plan` without build-script runs. They stay in the local store, so the
+/// remote never has them, but manifests and shards published before they
+/// were left out still name them.
+fn without_local_only_runs(mut plan: PrefetchPlan) -> PrefetchPlan {
+    plan.candidates
+        .retain(|candidate| candidate.crate_name != crate::build_script::CRATE_NAME);
+    plan
 }
 
 /// Report a plan's composition only when a cap actually dropped something
@@ -313,6 +323,34 @@ impl PlannerDataSource for LocalPlannerSource<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_plan_never_asks_the_remote_for_a_build_script_run() {
+        let candidate = |crate_name: &str, key: &str| PrefetchCandidate {
+            cache_key: key.to_string(),
+            crate_name: crate_name.to_string(),
+            compile_time_ms: Some(100),
+            size_bytes: Some(10),
+            source: kache_core::CandidateSource::Manifest,
+            demand_index: Some(0),
+        };
+        let plan = PrefetchPlan {
+            plan_id: Some("p".into()),
+            planner: Some("fallback".into()),
+            disposition: kache_core::PrefetchDisposition::Execute,
+            candidates: vec![
+                candidate("serde", "k-serde"),
+                candidate(crate::build_script::CRATE_NAME, "k-run"),
+                candidate("tokio", "k-tokio"),
+            ],
+        };
+        let kept: Vec<String> = without_local_only_runs(plan)
+            .candidates
+            .into_iter()
+            .map(|candidate| candidate.cache_key)
+            .collect();
+        assert_eq!(kept, ["k-serde", "k-tokio"]);
+    }
 
     #[test]
     fn manifest_entry_zero_measurements_remain_unknown() {

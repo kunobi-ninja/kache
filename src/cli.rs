@@ -6608,7 +6608,9 @@ fn manifest_entries_from_events(
         if session_id.is_some_and(|session_id| e.session_id != session_id) {
             continue;
         }
-        if e.cache_key.is_empty() {
+        // Build-script runs stay in the local store (see `sync`), so a plan
+        // that names one asks the remote for a key it cannot have.
+        if e.cache_key.is_empty() || e.crate_name == crate::build_script::CRATE_NAME {
             continue;
         }
         match e.result {
@@ -11921,6 +11923,15 @@ mod tests {
             // Ignored: non-cacheable outcomes.
             build_event("passth", EventResult::Passthrough, 5, 0, 0, "k-p"),
             build_event("skip", EventResult::Skipped, 5, 0, 0, "k-s"),
+            // Ignored: a build-script run, which never reaches the remote.
+            build_event(
+                crate::build_script::CRATE_NAME,
+                EventResult::Miss,
+                500,
+                0,
+                30,
+                "k-run",
+            ),
         ];
 
         let mut entries = manifest_entries_from_events(&events, None);

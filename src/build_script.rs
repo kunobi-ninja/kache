@@ -1452,7 +1452,7 @@ fn collect_out_dir(out_dir: &Path) -> Result<OutDirContents> {
 /// How long a hermetic run no target directory links to stays for the next
 /// worktree that needs it.
 pub(crate) const HERMETIC_UNLINKED_RETENTION: std::time::Duration =
-    std::time::Duration::from_secs(7 * 24 * 60 * 60);
+    std::time::Duration::from_secs(604_800);
 
 /// Remove hermetic runs no target directory links to that have gone
 /// unlinked for `keep_unlinked`. See [`hermetic::sweep`].

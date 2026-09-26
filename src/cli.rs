@@ -3814,12 +3814,10 @@ pub fn purge(config: &Config, crate_filter: Option<&str>) -> Result<()> {
             &config.cache_dir,
             std::time::Duration::ZERO,
         )?;
-        if sweep.removed > 0 || sweep.kept > 0 {
-            println!(
-                "Removed {} build-script runs; kept {} that target directories link to.",
-                sweep.removed, sweep.kept
-            );
-        }
+        println!(
+            "Removed {} build-script runs; kept {} that target directories link to.",
+            sweep.removed, sweep.kept
+        );
     }
 
     Ok(())

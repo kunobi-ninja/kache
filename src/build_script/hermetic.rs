@@ -884,13 +884,10 @@ mod tests {
         assert_ne!(sandbox.refused_path(), sandbox.lock_path());
     }
 
-    /// A sealed run with the given key, linked from `links` Cargo `OUT_DIR`s.
+    /// A sealed run with the given 64-digit key, linked from `links` Cargo
+    /// `OUT_DIR`s.
     fn sealed_run(cache: &Path, key: &str, links: &[PathBuf]) -> Sandbox {
-        let sandbox = Sandbox::new(
-            cache,
-            &key.repeat(64 / key.len()),
-            Path::new("debug/build/z-1/out"),
-        );
+        let sandbox = Sandbox::new(cache, key, Path::new("debug/build/z-1/out"));
         std::fs::create_dir_all(&sandbox.out_dir).unwrap();
         std::fs::write(sandbox.out_dir.join("gen.rs"), b"x").unwrap();
         seal(
@@ -917,15 +914,15 @@ mod tests {
         let later = std::time::SystemTime::now() + week + week;
         let target = dir.path().join("target/debug/build");
 
-        let linked = sealed_run(&cache, "a1", &[target.join("a-1/out")]);
-        let unlinked = sealed_run(&cache, "b2", &[target.join("b-1/out")]);
+        let linked = sealed_run(&cache, &"a1".repeat(32), &[target.join("a-1/out")]);
+        let unlinked = sealed_run(&cache, &"b2".repeat(32), &[target.join("b-1/out")]);
         std::fs::remove_file(target.join("b-1/out")).unwrap();
-        let relinked = sealed_run(&cache, "c3", &[target.join("c-1/out")]);
+        let relinked = sealed_run(&cache, &"c3".repeat(32), &[target.join("c-1/out")]);
         link_out_dir(&target.join("c-1/out"), &unlinked.out_dir).unwrap();
         record_referrer(&unlinked, &target.join("c-1/out")).unwrap();
         let crashed = Sandbox::new(&cache, &"d4".repeat(32), Path::new("out"));
         std::fs::create_dir_all(&crashed.out_dir).unwrap();
-        let busy = sealed_run(&cache, "e5", &[]);
+        let busy = sealed_run(&cache, &"e5".repeat(32), &[]);
         let held = open_lock(&busy.lock_path()).unwrap();
         held.lock_shared().unwrap();
         let refused = Sandbox::new(&cache, &"f6".repeat(32), Path::new("out"));
@@ -938,7 +935,14 @@ mod tests {
             "unlinked for less than the retention"
         );
         assert!(refused.refused_path().exists());
-        assert_eq!(now.removed, 1);
+        assert_eq!(
+            now,
+            Sweep {
+                removed: 1,
+                kept: 4
+            },
+            "linked, relinked here, recent, and held"
+        );
 
         let later = sweep(&cache, later, week).unwrap();
         assert!(linked.root.exists(), "a live link keeps it");
@@ -971,12 +975,41 @@ mod tests {
     }
 
     #[test]
+    fn a_sweep_skips_what_is_not_a_sandbox_and_fails_on_an_unreadable_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        let root = cache.join(ROOT);
+        std::fs::create_dir_all(root.join("scratch")).unwrap();
+        let file = root.join("ab".repeat(16));
+        std::fs::write(&file, b"not a sandbox").unwrap();
+        let later = std::time::SystemTime::now() + HERMETIC_WEEK + HERMETIC_WEEK;
+        assert_eq!(
+            sweep(&cache, later, HERMETIC_WEEK).unwrap(),
+            Sweep::default()
+        );
+        assert!(root.join("scratch").is_dir());
+        assert!(file.is_file());
+
+        let blocked = dir.path().join("blocked");
+        std::fs::create_dir_all(blocked.join("out-dirs")).unwrap();
+        std::fs::write(blocked.join(ROOT), b"a file where a directory goes").unwrap();
+        assert!(sweep(&blocked, later, HERMETIC_WEEK).is_err());
+    }
+
+    const HERMETIC_WEEK: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 3600);
+
+    #[test]
+    fn unlinked_runs_are_kept_for_a_week() {
+        assert_eq!(super::super::HERMETIC_UNLINKED_RETENTION, HERMETIC_WEEK);
+    }
+
+    #[test]
     fn live_referrers_are_links_into_the_sandbox_once_each() {
         let dir = tempfile::tempdir().unwrap();
         let cache = dir.path().join("cache");
         let target = dir.path().join("target/debug/build");
         let out = target.join("z-1/out");
-        let sandbox = sealed_run(&cache, "ab", &[out.clone(), out.clone()]);
+        let sandbox = sealed_run(&cache, &"ab".repeat(32), &[out.clone(), out.clone()]);
         let stale = target.join("gone/out");
         record_referrer(&sandbox, &stale).unwrap();
         let elsewhere = target.join("y-1/out");

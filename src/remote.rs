@@ -149,6 +149,11 @@ const MANIFEST_MERGE_WINDOW_SECS: i64 = 60 * 60;
 /// the other publishers wrote it.
 const MANIFEST_PUBLISH_ATTEMPTS: usize = 5;
 
+/// Most entries a merged manifest holds. The publishing build's own entries
+/// always stay; stored entries fill what is left, newest publishers first.
+/// About 300 bytes each, so a full manifest stays far below the read limit.
+const MANIFEST_MAX_ENTRIES: usize = 50_000;
+
 /// Whether an entry already stored survives a merge.
 ///
 /// Both commits known: only the same commit's entries stay, whatever their
@@ -190,6 +195,9 @@ fn merge_manifest(
         return merged;
     };
     for entry in existing.manifest.entries {
+        if merged.manifest.entries.len() >= MANIFEST_MAX_ENTRIES {
+            break;
+        }
         if merged.published.contains_key(&entry.cache_key) {
             continue;
         }
@@ -213,42 +221,14 @@ fn merge_manifest(
     merged
 }
 
-/// Serialize `stored` within `limit` bytes, the most a reader accepts.
-///
-/// Stored entries come after the new ones, so the tail is dropped first. The
-/// first `keep` entries, the ones this build published, are never dropped.
-fn serialize_within(stored: &StoredManifest, keep: usize, limit: u64) -> Result<Vec<u8>> {
-    let with = |count: usize| -> Result<Vec<u8>> {
-        let mut prefix = stored.clone();
-        for entry in prefix.manifest.entries.drain(count..) {
-            prefix.published.remove(&entry.cache_key);
-        }
-        serde_json::to_vec(&prefix).context("serializing manifest")
-    };
-    let fits = |body: &Vec<u8>| body.len() as u64 <= limit;
-    let all = with(stored.manifest.entries.len())?;
-    if fits(&all) {
-        return Ok(all);
-    }
-    let mut best = with(keep)?;
+/// Refuse to store a manifest no reader would accept.
+fn within_read_limit(body: Vec<u8>, limit: u64) -> Result<Vec<u8>> {
     anyhow::ensure!(
-        fits(&best),
-        "this build's manifest is {} bytes, over the {limit}-byte limit",
-        best.len()
+        body.len() as u64 <= limit,
+        "merged manifest is {} bytes, over the {limit}-byte read limit",
+        body.len()
     );
-    // Longest prefix that fits: `low` fits, `high + 1` does not.
-    let (mut low, mut high) = (keep, stored.manifest.entries.len() - 1);
-    while low < high {
-        let mid = low + (high - low).div_ceil(2);
-        let body = with(mid)?;
-        if fits(&body) {
-            low = mid;
-            best = body;
-        } else {
-            high = mid - 1;
-        }
-    }
-    Ok(best)
+    Ok(body)
 }
 
 /// A strong entity tag, the only kind `If-Match` can compare.
@@ -289,7 +269,8 @@ pub async fn upload_manifest(
             None => (None, None),
         };
         let merged = merge_manifest(existing, manifest, commit, now);
-        let body = serialize_within(&merged, manifest.entries.len(), MAX_METADATA_BYTES)?;
+        let body = serde_json::to_vec(&merged).context("serializing manifest")?;
+        let body = within_read_limit(body, MAX_METADATA_BYTES)?;
         let outcome = if present && etag.is_none() {
             // Nothing to make the replacement conditional on.
             ConditionalPut::Unsupported
@@ -711,32 +692,44 @@ mod tests {
     }
 
     #[test]
-    fn serialization_drops_stored_entries_from_the_tail_to_fit() {
+    fn merge_fills_up_to_the_entry_cap_with_stored_entries() {
+        assert_eq!(MANIFEST_MAX_ENTRIES, 50_000);
+        let stored_keys: Vec<String> = (0..MANIFEST_MAX_ENTRIES).map(|i| format!("s{i}")).collect();
+        let existing = stored(
+            stored_keys
+                .iter()
+                .map(|key| (key.as_str(), Some(at(NOW, None))))
+                .collect(),
+        );
         let merged = merge_manifest(
-            Some(stored(vec![
-                ("s1", Some(at(NOW, None))),
-                ("s2", Some(at(NOW, None))),
-            ])),
+            Some(existing),
             &manifest_with(vec![entry("new", 1)]),
             None,
             NOW,
         );
-        let size = |manifest: &StoredManifest| serde_json::to_vec(manifest).unwrap().len() as u64;
-        let full = size(&merged);
-        let body = serialize_within(&merged, 1, full).unwrap();
-        assert_eq!(body.len() as u64, full);
+        assert_eq!(merged.manifest.entries.len(), MANIFEST_MAX_ENTRIES);
+        assert_eq!(merged.published.len(), MANIFEST_MAX_ENTRIES);
+        let last = &merged.manifest.entries[MANIFEST_MAX_ENTRIES - 1].cache_key;
+        assert_eq!(last, &format!("s{}", MANIFEST_MAX_ENTRIES - 2));
 
-        let body = serialize_within(&merged, 1, full - 1).unwrap();
-        let fitted: StoredManifest = serde_json::from_slice(&body).unwrap();
-        assert_eq!(keys(&fitted), ["new", "s1"]);
-        assert!(!fitted.published.contains_key("s2"));
+        // A build larger than the cap keeps every entry it published.
+        let big: Vec<ManifestEntry> = (0..MANIFEST_MAX_ENTRIES + 1)
+            .map(|i| entry(&format!("n{i}"), 1))
+            .collect();
+        let merged = merge_manifest(
+            Some(stored(vec![("old", Some(at(NOW, None)))])),
+            &manifest_with(big),
+            None,
+            NOW,
+        );
+        assert_eq!(merged.manifest.entries.len(), MANIFEST_MAX_ENTRIES + 1);
+        assert!(!merged.published.contains_key("old"));
+    }
 
-        let only_new = merge_manifest(None, &manifest_with(vec![entry("new", 1)]), None, NOW);
-        let body = serialize_within(&merged, 1, size(&only_new)).unwrap();
-        let fitted: StoredManifest = serde_json::from_slice(&body).unwrap();
-        assert_eq!(keys(&fitted), ["new"]);
-
-        assert!(serialize_within(&merged, 1, size(&only_new) - 1).is_err());
+    #[test]
+    fn a_manifest_over_the_read_limit_is_refused() {
+        assert_eq!(within_read_limit(vec![0; 4], 4).unwrap().len(), 4);
+        assert!(within_read_limit(vec![0; 5], 4).is_err());
     }
 
     #[test]

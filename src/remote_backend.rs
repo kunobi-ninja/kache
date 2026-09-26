@@ -1872,6 +1872,64 @@ mod tests {
         assert!(!requests[2].contains("\r\nif-match:"), "{}", requests[2]);
     }
 
+    /// A transport that implements only the required methods.
+    struct GetOnly;
+
+    #[async_trait]
+    impl RemoteBackend for GetOnly {
+        async fn head(&self, _key: &str) -> Result<bool> {
+            Ok(true)
+        }
+
+        async fn get(&self, _key: &str, _max_bytes: Option<u64>) -> Result<Option<GetObject>> {
+            Ok(Some(GetObject {
+                body: Bytes::from_static(b"body"),
+                request_ms: 0,
+                body_ms: 0,
+            }))
+        }
+
+        async fn put(&self, _key: &str, _body: Vec<u8>, _content_type: Option<&str>) -> Result<()> {
+            Ok(())
+        }
+
+        async fn list(&self, _prefix: &str) -> Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+
+        fn describe(&self, key: &str) -> String {
+            key.to_string()
+        }
+    }
+
+    #[tokio::test]
+    async fn default_conditional_methods_offer_no_entity_tag_and_no_condition() {
+        let (object, etag) = GetOnly
+            .get_versioned("key", None)
+            .await
+            .unwrap()
+            .expect("the object exists");
+        assert_eq!(&object.body[..], b"body");
+        assert_eq!(etag, None);
+        let outcome = GetOnly
+            .put_if_match("key", Vec::new(), None, Some("\"v1\""))
+            .await
+            .unwrap();
+        assert_eq!(outcome, ConditionalPut::Unsupported);
+    }
+
+    #[tokio::test]
+    async fn s3_wire_head_reports_refusals_as_errors_not_absence() {
+        let (endpoint, _requests) = mock_http_server(vec![
+            http_response("404 Not Found", ""),
+            http_response("403 Forbidden", ""),
+        ])
+        .await;
+        let backend = anonymous_s3_backend(&endpoint);
+        assert!(!backend.head("absent").await.unwrap());
+        assert!(backend.head("refused").await.is_err());
+    }
+
     #[test]
     fn conditional_error_classification_is_exact() {
         let classify = |kind, message: &str, replacing| {

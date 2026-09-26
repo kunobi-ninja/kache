@@ -21355,6 +21355,57 @@ mod tests {
         server.await.unwrap();
     }
 
+    /// A prestage hint reaches the daemon, which stages the executable the
+    /// target directory recorded beside its missing destination.
+    #[tokio::test]
+    async fn a_prestage_hint_stages_the_recorded_executable() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let content = b"an executable";
+        let hash = blake3::hash(content).to_hex().to_string();
+        let blob = crate::store::blob_path_in_store_dir(&config.store_dir(), &hash);
+        std::fs::create_dir_all(blob.parent().unwrap()).unwrap();
+        std::fs::write(&blob, content).unwrap();
+        let target = dir.path().join("work/target");
+        let dest = target.join("debug/deps/app-0123456789abcdef");
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        crate::prestage::remember(
+            &config.cache_dir,
+            &target,
+            &dest,
+            &hash,
+            crate::prestage::MIN_BYTES,
+        );
+
+        let socket_path = config.socket_path();
+        std::fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
+        let listener = bind_listener(&socket_path);
+        let daemon = Arc::new(Daemon::new(config.clone()));
+        let server = tokio::spawn(async move {
+            let stream = tokio::time::timeout(Duration::from_secs(10), listener.accept())
+                .await
+                .expect("the hint reaches the daemon")
+                .expect("accept");
+            let _ = handle_connection(stream, &daemon, &Arc::new(Lifecycle::default())).await;
+        });
+        let cfg = config.clone();
+        let hinted = target.clone();
+        tokio::task::spawn_blocking(move || send_prestage(&cfg, &hinted))
+            .await
+            .unwrap();
+        server.await.unwrap();
+
+        let staged = crate::prestage::staged_path(&dest, &hash).unwrap();
+        for _ in 0..100 {
+            if crate::prestage::take(&dest, &hash) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(std::fs::read(&dest).unwrap(), content);
+        assert!(!staged.exists());
+    }
+
     #[tokio::test]
     async fn test_send_upload_job_client_roundtrip() {
         // CLIENT side: send_upload_job's first fire-and-forget try_send reaches a

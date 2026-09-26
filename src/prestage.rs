@@ -732,6 +732,52 @@ mod tests {
         ));
     }
 
+    /// A hint is recent for strictly less than the interval: at exactly the
+    /// interval the next one is due.
+    #[test]
+    fn a_hint_is_due_again_at_exactly_the_interval() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        let target = target(dir.path(), "a");
+        remember(
+            &cache,
+            &target,
+            &target.join("app"),
+            &"a".repeat(64),
+            MIN_BYTES,
+        );
+        assert!(hint_due(&cache, &target, SystemTime::now()));
+        let sent = std::fs::metadata(records_dir(&cache, &target).join(HINT_MARKER))
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert!(!hint_due(
+            &cache,
+            &target,
+            sent + HINT_INTERVAL - Duration::from_micros(1)
+        ));
+        assert!(hint_due(&cache, &target, sent + HINT_INTERVAL));
+    }
+
+    /// `maybe_hint` marks the hint as sent, daemon or not.
+    #[test]
+    fn maybe_hint_marks_its_hint() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::test_support::test_config(dir.path().join("cache"));
+        let target = target(dir.path(), "a");
+        remember(
+            &config.cache_dir,
+            &target,
+            &target.join("app"),
+            &"a".repeat(64),
+            MIN_BYTES,
+        );
+        let marker = records_dir(&config.cache_dir, &target).join(HINT_MARKER);
+        assert!(!marker.exists());
+        maybe_hint(&config, &target);
+        assert!(marker.exists());
+    }
+
     /// A new target directory borrows the records of its project's target
     /// directory that recorded last, under its own root, and stops borrowing
     /// once it has its own. Another project, or a target directory with no

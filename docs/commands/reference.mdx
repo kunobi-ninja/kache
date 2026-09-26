@@ -174,6 +174,17 @@ known) and the host target triple so older prefetch still finds the file.
 `KACHE_MANIFEST_KEY` or `--manifest-key` writes a single key. A namespace plus
 `Cargo.lock` also publishes content-addressed shards.
 
+CI jobs that share a key, such as tests and lints on the same lockfile, target
+and profile, add to one manifest rather than replacing each other. Entries from
+the same commit (`GITHUB_SHA` or `CI_COMMIT_SHA`) stay together, entries from
+an earlier commit are dropped when a later one publishes, and entries whose
+commit is unknown are kept for an hour. On S3 the update is a conditional
+write: a job that loses a race reads the manifest again and retries, and after
+five tries it fails and leaves the manifest as the other jobs wrote it. Stores
+without conditional writes, including filesystem remotes, get the merged
+manifest written plainly, so two jobs finishing at the same moment can still
+drop each other's entries there.
+
 ## `kache daemon`
 
 ```bash

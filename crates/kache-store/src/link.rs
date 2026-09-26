@@ -1065,7 +1065,11 @@ pub fn prepare_writable_target_from_file(
     let mut source = fs::File::open(src)
         .with_context(|| format!("opening cached cc artifact {}", src.display()))?;
     let mut staged = new_writable_staging_file(target)?;
-    let bytes = std::io::copy(&mut source, staged.writer()).with_context(|| {
+    // Copy between the two `File`s themselves: std then copies in the
+    // kernel (copy_file_range on Linux). Through the staging wrapper it read
+    // and wrote 8 KiB at a time, which put 120 ms on restoring aws-lc-sys's
+    // 31 MB build-script output.
+    let bytes = std::io::copy(&mut source, staged.file_mut()).with_context(|| {
         format!(
             "copying cached cc artifact {} for {}",
             src.display(),

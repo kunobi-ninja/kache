@@ -3339,6 +3339,35 @@ impl StaticLibUse {
     }
 }
 
+/// Whether `archive` is reached under the `-oso_prefix` root as spelled but
+/// resolves into a sealed hermetic build-script `OUT_DIR`. The linker names
+/// it by the spelled path, which the prefix strips, and the directory it
+/// resolves to is read-only and has the same path in every target directory
+/// that shares it, so its bytes decide the link as much as a copy under the
+/// profile directory would.
+fn hermetic_archive_under(archive: &Path, resolved: &Path, spelled_root: &Path) -> bool {
+    std::path::absolute(archive).is_ok_and(|spelled| spelled.starts_with(spelled_root))
+        && !resolved.starts_with(spelled_root)
+        && crate::build_script::in_sealed_out_dir(resolved)
+}
+
+/// [`linked_archive_use`] for a link that gets `-oso_prefix` at
+/// `spelled_root`, which resolves to `root`. Compared resolved, like OUT_DIR
+/// in [`dirs_under`], except for an archive in a sealed hermetic `OUT_DIR`.
+fn oso_archive_use(
+    args: &RustcArgs,
+    archive: &Path,
+    spelled_root: &Path,
+    root: &Path,
+) -> StaticLibUse {
+    let resolved = resolved_path(archive);
+    if hermetic_archive_under(archive, &resolved, spelled_root) {
+        linked_archive_use(args, archive, Some(spelled_root))
+    } else {
+        linked_archive_use(args, &resolved, Some(root))
+    }
+}
+
 /// How this invocation uses `archive`. A unit that does not link bundles it.
 /// A link keeps the archive's path in its debug map unless the `-oso_prefix`
 /// kache injects (`oso_root`, from
@@ -3940,12 +3969,11 @@ fn fold_native_link_inputs<H: KeyFold>(
     } else {
         crate::native_link_key::LinkArgInputs::default()
     };
-    // Compared resolved, like OUT_DIR in [`dirs_under`].
-    let oso_root =
-        crate::compiler::rustc::oso_prefix_root_for_key(args).map(|root| resolved_path(&root));
-    let archive_use = |path: &Path| match oso_root.as_deref() {
-        Some(root) => linked_archive_use(args, &resolved_path(path), Some(root)),
-        None => linked_archive_use(args, path, None),
+    let spelled_oso_root = crate::compiler::rustc::oso_prefix_root_for_key(args);
+    let oso_root = spelled_oso_root.as_deref().map(resolved_path);
+    let archive_use = |path: &Path| match (spelled_oso_root.as_deref(), oso_root.as_deref()) {
+        (Some(spelled_root), Some(root)) => oso_archive_use(args, path, spelled_root, root),
+        _ => linked_archive_use(args, path, None),
     };
     let hash_archive = |path: &Path| {
         let usage = archive_use(path);
@@ -13657,6 +13685,68 @@ mod tests {
         assert!(first_hash.starts_with("path-ar-v1:"));
         assert!(second_hash.starts_with("path-ar-v1:"));
         assert_ne!(first_hash, second_hash);
+    }
+
+    /// A link through Cargo's `OUT_DIR` symlink into a sealed hermetic
+    /// directory keys the archive by content; anything else stays resolved.
+    #[cfg(unix)]
+    #[test]
+    fn an_archive_linked_through_a_sealed_out_dir_counts_as_under_the_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("w/target/debug");
+        let sealed = dir.path().join("cache/out-dirs/v2").join("ef".repeat(16));
+        let shared = sealed.join("debug/build/z-1/out");
+        std::fs::create_dir_all(&shared).unwrap();
+        std::fs::write(shared.join("libz.a"), b"!<arch>\n").unwrap();
+        std::fs::create_dir_all(profile.join("build/z-1")).unwrap();
+        let out = profile.join("build/z-1/out");
+        std::os::unix::fs::symlink(&shared, &out).unwrap();
+        let archive = out.join("libz.a");
+        let resolved = resolved_path(&archive);
+
+        assert!(
+            !hermetic_archive_under(&archive, &resolved, &profile),
+            "not sealed"
+        );
+        std::fs::write(sealed.join(".kache-sealed"), b"{}").unwrap();
+        assert!(hermetic_archive_under(&archive, &resolved, &profile));
+        assert!(
+            !hermetic_archive_under(&archive, &resolved, &dir.path().join("elsewhere")),
+            "spelled outside the root"
+        );
+        let plain = profile.join("deps/libq.a");
+        std::fs::create_dir_all(plain.parent().unwrap()).unwrap();
+        std::fs::write(&plain, b"!<arch>\n").unwrap();
+        assert!(
+            !hermetic_archive_under(&plain, &resolved_path(&plain), &resolved_path(&profile)),
+            "an archive that resolves under the root needs no exception"
+        );
+
+        let bin = RustcArgs::parse(&[
+            "rustc".to_string(),
+            "src/main.rs".to_string(),
+            "--crate-type".to_string(),
+            "bin".to_string(),
+        ])
+        .unwrap();
+        let root = resolved_path(&profile);
+        assert_eq!(
+            oso_archive_use(&bin, &archive, &profile, &root),
+            StaticLibUse::Bundled
+        );
+        assert_eq!(
+            oso_archive_use(&bin, &resolved, &profile, &root),
+            StaticLibUse::Linked,
+            "named by the sealed path itself, the link keeps that path"
+        );
+        assert_eq!(
+            oso_archive_use(&bin, &plain, &profile, &root),
+            StaticLibUse::Bundled
+        );
+        assert_eq!(
+            oso_archive_use(&bin, Path::new("/opt/lib/libz.a"), &profile, &root),
+            StaticLibUse::Linked
+        );
     }
 
     /// A unit that does not link bundles the archive. A link reads it by path

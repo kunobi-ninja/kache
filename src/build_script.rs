@@ -38,6 +38,8 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+mod hermetic;
+
 /// Set by the launcher to the path Cargo invoked, which is where the preserved
 /// binary lives beside.
 pub const SHIM_PATH_ENV: &str = "KACHE_BUILD_SCRIPT_PATH";
@@ -348,6 +350,12 @@ fn zero_ar_date(
 }
 
 fn run_real(real: &Path, argv: &[std::ffi::OsString]) -> i32 {
+    if let Some(out_dir) = std::env::var_os("OUT_DIR")
+        && let Err(error) = detach_out_dir(Path::new(&out_dir))
+    {
+        eprintln!("kache: cannot give the build script its own OUT_DIR: {error}");
+        return 1;
+    }
     match real_command(real, argv).status() {
         Ok(status) => status.code().unwrap_or(1),
         Err(error) => {
@@ -384,6 +392,14 @@ fn run_cached(real: &Path, argv: &[std::ffi::OsString]) -> Result<i32> {
     };
 
     let prediction = run.prediction()?;
+    if let Some(prediction) = &prediction
+        && hermetic::enabled()
+        && let Some(code) = hermetic::run(&run, real, argv, prediction)?
+    {
+        return Ok(code);
+    }
+    // Everything below writes into `OUT_DIR` itself.
+    detach_out_dir(&run.environment.out_dir)?;
     if let Some(prediction) = &prediction {
         let key_start = std::time::Instant::now();
         let key = run.action_key(prediction)?;
@@ -917,6 +933,19 @@ fn parse_declarations(
 /// Cargo-provided environment that shapes a run and is not otherwise keyed.
 /// `NUM_JOBS` and the jobserver variables describe the machine, not the run.
 fn cargo_environment(environment: &Environment) -> BTreeMap<String, Option<String>> {
+    cargo_environment_names()
+        .into_iter()
+        .map(|name| {
+            let value = std::env::var(&name).ok().map(|value| {
+                String::from_utf8_lossy(&environment.normalize_value(value.as_bytes())).into_owned()
+            });
+            (name, value)
+        })
+        .collect()
+}
+
+/// The variables Cargo gives a build script that decide whether it reruns.
+fn cargo_environment_names() -> std::collections::BTreeSet<String> {
     const FIXED: &[&str] = &[
         "CARGO_ENCODED_RUSTFLAGS",
         "CARGO_MANIFEST_DIR",
@@ -945,14 +974,6 @@ fn cargo_environment(environment: &Environment) -> BTreeMap<String, Option<Strin
             .then_some(name)
     }));
     names
-        .into_iter()
-        .map(|name| {
-            let value = std::env::var(&name).ok().map(|value| {
-                String::from_utf8_lossy(&environment.normalize_value(value.as_bytes())).into_owned()
-            });
-            (name, value)
-        })
-        .collect()
 }
 
 fn fold(hasher: &mut blake3::Hasher, label: &str, value: &[u8]) {
@@ -1402,6 +1423,22 @@ fn collect_out_dir(out_dir: &Path) -> Result<OutDirContents> {
         directories,
         empty_files: empty,
     })
+}
+
+/// Whether `path` lies in a sealed hermetic build-script `OUT_DIR`.
+pub(crate) fn in_sealed_out_dir(path: &Path) -> bool {
+    hermetic::in_sealed_out_dir(path)
+}
+
+/// Turn an `OUT_DIR` that a hermetic run left as a symlink to its shared,
+/// read-only directory back into an empty directory of this target's own, so
+/// nothing writes through the link.
+fn detach_out_dir(out_dir: &Path) -> Result<()> {
+    if std::fs::symlink_metadata(out_dir).is_ok_and(|meta| meta.file_type().is_symlink()) {
+        std::fs::remove_file(out_dir)?;
+        std::fs::create_dir(out_dir)?;
+    }
+    Ok(())
 }
 
 fn directory_is_empty(directory: &Path) -> bool {
@@ -2675,6 +2712,97 @@ mod tests {
         );
     }
 
+    /// A hermetic key sees values as the script does: two target directories
+    /// agree except where a value the script reads spells its own target
+    /// directory, which the regular key maps away. `OUT_DIR` itself is left
+    /// out, and where it sits below the target directory is in.
+    #[test]
+    fn a_hermetic_key_leaves_out_only_the_out_dir() {
+        let _lock = crate::test_support::process_state_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::test_support::test_config(dir.path().join("cache"));
+        let run = |target: &str, cargo_home: &str| Run {
+            store: Store::open(&config).unwrap(),
+            config: config.clone(),
+            binary_hash: "aaaa".to_string(),
+            environment: checkout_environment(
+                &dir.path().join(target),
+                &dir.path().join(cargo_home),
+            ),
+            start: std::time::Instant::now(),
+        };
+        let prediction = prediction_with(Some(Vec::new()), true);
+        let below = Path::new("debug/build/x-1/out");
+        let saved = std::env::var_os("CARGO_MANIFEST_DIR");
+        let key = |run: &Run, below: &Path| {
+            // SAFETY: the process-state lock serialises environment edits.
+            unsafe { std::env::set_var("CARGO_MANIFEST_DIR", &run.environment.manifest_dir) };
+            hermetic::key(run, &prediction, below).unwrap()
+        };
+        let (a, b, elsewhere) = (
+            run("a/target", "cargo"),
+            run("b/target", "cargo"),
+            run("b/target", "other-cargo"),
+        );
+        assert_eq!(key(&a, below), key(&b, below), "OUT_DIR is not keyed");
+        assert_ne!(key(&a, below), key(&a, Path::new("release/build/x-1/out")));
+        assert_ne!(
+            key(&b, below),
+            key(&elsewhere, below),
+            "the manifest directory is keyed as the script sees it"
+        );
+
+        let spelled = |run: &Run, target: &str| {
+            let value = dir.path().join(target).join("debug/build/y-1/out");
+            // SAFETY: the process-state lock serialises environment edits.
+            unsafe { std::env::set_var("DEP_Y_ROOT", &value) };
+            let keys = (key(run, below), run.action_key(&prediction).unwrap());
+            unsafe { std::env::remove_var("DEP_Y_ROOT") };
+            keys
+        };
+        let (hermetic_a, regular_a) = spelled(&a, "a/target");
+        let (hermetic_b, regular_b) = spelled(&b, "b/target");
+
+        // What the script declared: an env var's value, an input's content,
+        // and what sits behind a `DEP_*` path.
+        let input = dir.path().join("input.txt");
+        std::fs::write(&input, b"one").unwrap();
+        let mut declared = prediction.clone();
+        declared.env = vec!["KACHE_TEST_HERMETIC_VAR".into()];
+        declared.inputs = vec![input.to_string_lossy().into_owned()];
+        let declared_key = || {
+            unsafe { std::env::set_var("CARGO_MANIFEST_DIR", &a.environment.manifest_dir) };
+            hermetic::key(&a, &declared, below).unwrap()
+        };
+        unsafe { std::env::set_var("KACHE_TEST_HERMETIC_VAR", "x") };
+        let base = declared_key();
+        unsafe { std::env::set_var("KACHE_TEST_HERMETIC_VAR", "y") };
+        assert_ne!(declared_key(), base, "a declared variable's value");
+        unsafe { std::env::set_var("KACHE_TEST_HERMETIC_VAR", "x") };
+        std::fs::write(&input, b"two").unwrap();
+        assert_ne!(declared_key(), base, "a declared input's content");
+        std::fs::write(&input, b"one").unwrap();
+        assert_eq!(declared_key(), base);
+        let dep = dir.path().join("dep-out");
+        std::fs::create_dir(&dep).unwrap();
+        std::fs::write(dep.join("z.h"), b"1").unwrap();
+        unsafe { std::env::set_var("DEP_Y_ROOT", &dep) };
+        let with_dep = declared_key();
+        std::fs::write(dep.join("z.h"), b"2").unwrap();
+        assert_ne!(declared_key(), with_dep, "what a DEP_ path holds");
+        unsafe {
+            std::env::remove_var("DEP_Y_ROOT");
+            std::env::remove_var("KACHE_TEST_HERMETIC_VAR");
+        }
+
+        match saved {
+            Some(value) => unsafe { std::env::set_var("CARGO_MANIFEST_DIR", value) },
+            None => unsafe { std::env::remove_var("CARGO_MANIFEST_DIR") },
+        }
+        assert_eq!(regular_a, regular_b, "the regular key maps the target away");
+        assert_ne!(hermetic_a, hermetic_b, "the script reads each spelling");
+    }
+
     /// libgit2-sys reads libz-sys's `OUT_DIR` through `DEP_Z_ROOT`, and
     /// zlib's pkg-config file there names that directory. The same file in
     /// two target directories keys the dependent the same; other content
@@ -3092,6 +3220,66 @@ mod tests {
         // The directory itself was also modified after `earlier`; only the
         // excluded child is skipped, so this still reports the directory.
         assert!(modified_since(&src, &excluded, earlier).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_launcher_without_kache_never_writes_through_a_linked_out_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let unit = dir.path().join("debug/build/pkg-1");
+        std::fs::create_dir_all(&unit).unwrap();
+        let executable = unit.join("build_script_build-1");
+        kache_fs::testutil::write_executable(
+            &executable,
+            "#!/bin/sh\necho written > \"$OUT_DIR/gen.rs\"\n",
+        );
+        install(&executable).unwrap();
+        std::fs::remove_dir_all(dir.path().join("debug").join(SHIM_DIR)).unwrap();
+        let shared = dir.path().join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        let out_dir = unit.join("out");
+        std::os::unix::fs::symlink(&shared, &out_dir).unwrap();
+
+        let output = std::process::Command::new(&executable)
+            .env("OUT_DIR", &out_dir)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(std::fs::symlink_metadata(&out_dir).unwrap().is_dir());
+        assert_eq!(std::fs::read(out_dir.join("gen.rs")).unwrap(), b"written\n");
+        assert!(
+            !shared.join("gen.rs").exists(),
+            "the shared directory is untouched"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_real_detaches_a_linked_out_dir_first() {
+        let _lock = crate::test_support::process_state_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let shared = dir.path().join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        let out_dir = dir.path().join("out");
+        std::os::unix::fs::symlink(&shared, &out_dir).unwrap();
+        let script = dir.path().join("script");
+        kache_fs::testutil::write_executable(&script, "#!/bin/sh\ntouch \"$OUT_DIR/gen.rs\"\n");
+        let saved = std::env::var_os("OUT_DIR");
+        // SAFETY: the process-state lock serialises environment edits.
+        unsafe { std::env::set_var("OUT_DIR", &out_dir) };
+        let code = run_real(&script, &[]);
+        match saved {
+            Some(value) => unsafe { std::env::set_var("OUT_DIR", value) },
+            None => unsafe { std::env::remove_var("OUT_DIR") },
+        }
+        assert_eq!(code, 0);
+        assert!(std::fs::symlink_metadata(&out_dir).unwrap().is_dir());
+        assert!(out_dir.join("gen.rs").is_file());
+        assert!(!shared.join("gen.rs").exists());
     }
 
     #[cfg(unix)]

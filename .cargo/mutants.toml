@@ -284,6 +284,10 @@ exclude_re = [
     "replace macos_oso_prefix_flag ->",
     "replace macos_install_name_flag ->",
     "replace oso_prefix_root_for_key ->",
+    # The arm that runs only when `oso_prefix_root_for_key` names a root,
+    # which it does only on macOS. `oso_archive_use`, which the arm calls,
+    # stays in scope and is tested on every Unix.
+    "delete match arm \\(Some\\(spelled_root\\), Some\\(root\\)\\) in fold_native_link_inputs",
     "probe_unsupported",
     "from struct AttrList",
     "regular_output_is_independent_windows",

@@ -498,7 +498,7 @@ fn dir_builder(mode: u32, recursive: bool) -> std::fs::DirBuilder {
 }
 
 /// Create `path` and its missing parents, private to this user.
-fn create_private_dir_all(path: &Path) -> std::io::Result<()> {
+pub(crate) fn create_private_dir_all(path: &Path) -> std::io::Result<()> {
     dir_builder(0o700, true).create(path)
 }
 

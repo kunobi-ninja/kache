@@ -1195,3 +1195,170 @@ fn build_scripts_run_with_zero_ar_date_on_macos() {
         );
     }
 }
+
+/// A build script that derives values from its `OUT_DIR` path (its length, a
+/// sum of its bytes) leaves no path in its outputs, so only a hermetic run can
+/// share it: the script sees the same `OUT_DIR` in every target directory,
+/// and Cargo's `OUT_DIR` links to it. Each target directory's binary must
+/// agree with the directory its `OUT_DIR` resolves to.
+#[test]
+fn hermetic_runs_keep_values_derived_from_out_dir_consistent() {
+    let fx = fixture_from(|root| {
+        let write = |relative: &str, content: &str| {
+            let path = root.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, content).unwrap();
+        };
+        write(
+            "Cargo.toml",
+            "[package]\nname = \"derives\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        );
+        write(
+            "build.rs",
+            r#"fn main() {
+    println!("cargo:rerun-if-changed=build.rs");
+    let out = std::env::var("OUT_DIR").unwrap();
+    let sum: u64 = out.bytes().map(u64::from).sum();
+    std::fs::write(
+        std::path::Path::new(&out).join("derived.rs"),
+        format!("const DIR: &str = {out:?};\nconst LEN: usize = {};\nconst SUM: u64 = {sum};\n", out.len()),
+    )
+    .unwrap();
+}
+"#,
+        );
+        write(
+            "src/main.rs",
+            r#"include!(concat!(env!("OUT_DIR"), "/derived.rs"));
+fn main() {
+    let seen = std::fs::canonicalize(DIR).unwrap();
+    let cargo = std::fs::canonicalize(env!("OUT_DIR")).unwrap();
+    let sum: u64 = DIR.bytes().map(u64::from).sum();
+    assert_eq!(seen, cargo, "the script's OUT_DIR is where Cargo's resolves");
+    assert_eq!((LEN, SUM), (DIR.len(), sum), "values derived from the OUT_DIR the script saw");
+    println!("consistent");
+}
+"#,
+        );
+    });
+    let hermetic = [("KACHE_BUILD_SCRIPT_HERMETIC", "1")];
+    for (name, expected, linked) in [
+        ("first", "miss", false),
+        ("second", "miss", true),
+        ("third-with-a-longer-name", "local_hit", true),
+    ] {
+        let target = target(&fx, name);
+        let mark = event_count(&fx.cache);
+        let output = run(&mut cargo(
+            "run",
+            &fx.workspace,
+            &fx.home,
+            &fx.cache,
+            &target,
+            &hermetic,
+        ));
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "consistent",
+            "{name}"
+        );
+        assert_eq!(
+            results_for(&events_since(&fx.cache, mark), "build_script_run"),
+            vec![expected],
+            "{name}: the first run records the declarations, the second seals, the rest link"
+        );
+        let out_dir = walkdir(&target.join("debug/build"))
+            .into_iter()
+            .find(|path| {
+                path.file_name().is_some_and(|name| name == "out")
+                    && path.join("derived.rs").is_file()
+            })
+            .expect("the OUT_DIR holding derived.rs");
+        assert_eq!(
+            std::fs::symlink_metadata(&out_dir)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            linked,
+            "{name}: {}",
+            out_dir.display()
+        );
+    }
+
+    // The script reruns in a target directory whose OUT_DIR is a link. A
+    // hermetic rerun links the same shared run again. A regular one gets a
+    // directory of its own instead of writing through the link into the
+    // read-only shared one.
+    let second = target(&fx, "second");
+    let out_dir_of = |target: &Path| {
+        walkdir(&target.join("debug/build"))
+            .into_iter()
+            .find(|path| {
+                path.file_name().is_some_and(|name| name == "out")
+                    && path.join("derived.rs").exists()
+            })
+            .expect("the OUT_DIR holding derived.rs")
+    };
+    run(&mut cargo(
+        "run",
+        &fx.workspace,
+        &fx.home,
+        &fx.cache,
+        &second,
+        &hermetic,
+    ));
+    let shared = std::fs::read_link(out_dir_of(&second)).unwrap();
+    let sealed = std::fs::read(shared.join("derived.rs")).unwrap();
+    let touch_build_rs = || {
+        let build_rs = fx.workspace.join("build.rs");
+        std::fs::write(&build_rs, std::fs::read(&build_rs).unwrap()).unwrap();
+    };
+
+    touch_build_rs();
+    let mark = event_count(&fx.cache);
+    let output = run(&mut cargo(
+        "run",
+        &fx.workspace,
+        &fx.home,
+        &fx.cache,
+        &second,
+        &hermetic,
+    ));
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "consistent");
+    assert_eq!(
+        results_for(&events_since(&fx.cache, mark), "build_script_run"),
+        vec!["local_hit"]
+    );
+    assert_eq!(std::fs::read_link(out_dir_of(&second)).unwrap(), shared);
+
+    touch_build_rs();
+    run(&mut cargo(
+        "build",
+        &fx.workspace,
+        &fx.home,
+        &fx.cache,
+        &second,
+        &[],
+    ));
+    let out_dir = out_dir_of(&second);
+    assert!(
+        std::fs::symlink_metadata(&out_dir).unwrap().is_dir(),
+        "a regular run detaches the link: {}",
+        out_dir.display()
+    );
+    assert_eq!(std::fs::read(shared.join("derived.rs")).unwrap(), sealed);
+    make_writable(&fx.cache);
+}
+
+/// Sealed hermetic directories are read-only; let the temporary directory go.
+fn make_writable(root: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    for path in walkdir(root) {
+        if let Ok(meta) = std::fs::symlink_metadata(&path)
+            && !meta.file_type().is_symlink()
+        {
+            let mode = meta.permissions().mode() | 0o200;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode));
+        }
+    }
+}

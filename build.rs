@@ -46,6 +46,14 @@ fn main() {
     command.args(link_flags(
         encoded.split('\x1f').filter(|flag| !flag.is_empty()),
     ));
+    // The launcher's own `link(name = "c")` puts libc before the standard
+    // rlibs on the link line. nixpkgs builds compiler_builtins' C code with a
+    // stack protector, and on aarch64 glibc exports `__stack_chk_guard` from
+    // ld.so, which the linker then cannot reach (NixOS/nixpkgs#561411). A
+    // std binary gets libc again after its rlibs; this one needs it asked for.
+    if target_is_glibc() {
+        command.args(["-C", "link-arg=-lc"]);
+    }
 
     let status = command
         .status()
@@ -54,6 +62,12 @@ fn main() {
         status.success(),
         "compiling {SOURCE} for {target} failed: {status}"
     );
+}
+
+/// Whether Cargo is building for a glibc Linux target.
+fn target_is_glibc() -> bool {
+    let cfg = |name: &str| std::env::var(name).unwrap_or_default();
+    cfg("CARGO_CFG_TARGET_OS") == "linux" && cfg("CARGO_CFG_TARGET_ENV") == "gnu"
 }
 
 /// The `-C` options from the target's rustflags that decide how a binary

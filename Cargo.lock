@@ -2145,6 +2145,7 @@ dependencies = [
  "proptest",
  "ratatui",
  "regex",
+ "regex-automata",
  "reqsign-aws-v4",
  "reqsign-core",
  "reqwest 0.13.5",

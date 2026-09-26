@@ -10,6 +10,7 @@ use crate::cache_remote::V3Prefetch;
 use crate::config::Config;
 use crate::daemon;
 use crate::events;
+use crate::machine::{PathIdentity, directory_identity};
 use crate::since::SinceWindow;
 use crate::store::{STAGING_SWEEP_GRACE, Store};
 
@@ -2519,29 +2520,6 @@ fn observe_storage_unsupported(
 #[cfg(not(any(unix, windows)))]
 use self::observe_storage_unsupported as observe_storage;
 
-fn directory_identity(path: &std::path::Path) -> Option<FileIdentity> {
-    let meta = std::fs::symlink_metadata(path).ok()?;
-    if !meta.file_type().is_dir() {
-        return None;
-    }
-
-    #[cfg(unix)]
-    {
-        Some(FileIdentity {
-            device: meta.dev(),
-            inode: meta.ino(),
-        })
-    }
-    #[cfg(windows)]
-    {
-        query_windows_file_identity(path).map(|(identity, _)| identity)
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        None
-    }
-}
-
 fn add_local_bytes(
     stats: &mut ProjectStats,
     breakdown: &mut CategoryBreakdown,
@@ -4331,7 +4309,7 @@ pub fn clean(
 #[derive(Debug)]
 struct RemovalTarget {
     path: std::path::PathBuf,
-    scanned_identity: Option<FileIdentity>,
+    scanned_identity: Option<PathIdentity>,
     estimated_reclaimable: u64,
     apparent_gap: u64,
 }
@@ -4522,7 +4500,7 @@ pub(crate) struct TargetEntry {
     pub size: u64,
     pub cached_bytes: u64,
     pub estimated_reclaimable_bytes: u64,
-    pub(crate) scan_identity: Option<FileIdentity>,
+    pub(crate) scan_identity: Option<PathIdentity>,
     pub profiles: Vec<String>,
     pub breakdown: CategoryBreakdown,
     /// Marked true when a rescan starts; cleared when fresh data arrives.

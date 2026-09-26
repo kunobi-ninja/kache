@@ -1427,7 +1427,7 @@ fn collect_out_dir(out_dir: &Path) -> Result<OutDirContents> {
                 if metadata.len() == 0 {
                     empty.push(EmptyFile {
                         name: relative,
-                        executable: is_executable(&metadata),
+                        executable: kache_store::filesystem::is_executable(&metadata),
                     });
                     continue;
                 }
@@ -1528,19 +1528,6 @@ fn modified_since(path: &Path, excluded: &[PathBuf], since: std::time::SystemTim
         }
     }
     Ok(false)
-}
-
-fn is_executable(metadata: &std::fs::Metadata) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        metadata.permissions().mode() & 0o111 != 0
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = metadata;
-        false
-    }
 }
 
 fn package_exclusions(package: &Path, environment: &Environment) -> Vec<PathBuf> {
@@ -1898,29 +1885,6 @@ mod tests {
             ],
             "only target roots under the package are excluded, never the manifest root"
         );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn is_executable_reads_any_execute_bit() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("f");
-        std::fs::write(&file, "x").unwrap();
-        for (mode, expected) in [
-            (0o644, false),
-            (0o600, false),
-            (0o755, true),
-            (0o700, true),
-            (0o010, true),
-        ] {
-            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(mode)).unwrap();
-            assert_eq!(
-                is_executable(&std::fs::metadata(&file).unwrap()),
-                expected,
-                "mode {mode:o}"
-            );
-        }
     }
 
     #[test]

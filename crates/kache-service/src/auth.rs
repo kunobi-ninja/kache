@@ -8,6 +8,7 @@
 //!
 //! With none configured the planner stays open, as it always has.
 
+use crate::normalize_optional;
 use anyhow::{Result, bail};
 pub use kunobi_auth::common::workload::{
     GITHUB_ACTIONS_ISSUER as GITHUB_ISSUER, GITHUB_ACTIONS_PROVIDER as GITHUB_PROVIDER,
@@ -32,21 +33,16 @@ pub struct AuthSettings {
     pub github_owners: Vec<String>,
 }
 
-fn clean(value: Option<String>) -> Option<String> {
-    value
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-}
-
 impl AuthSettings {
     /// Trim values, drop empty ones, and reject combinations that would
     /// silently weaken or disable a provider.
     pub fn validated(self) -> Result<Self> {
         let settings = AuthSettings {
-            token: clean(self.token),
-            oidc_issuer: clean(self.oidc_issuer).map(|i| i.trim_end_matches('/').to_string()),
-            oidc_client_id: clean(self.oidc_client_id),
-            github_audience: clean(self.github_audience),
+            token: normalize_optional(self.token),
+            oidc_issuer: normalize_optional(self.oidc_issuer)
+                .map(|i| i.trim_end_matches('/').to_string()),
+            oidc_client_id: normalize_optional(self.oidc_client_id),
+            github_audience: normalize_optional(self.github_audience),
             github_owners: self
                 .github_owners
                 .into_iter()

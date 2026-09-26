@@ -296,7 +296,7 @@ fn heartbeat_line(
 }
 
 /// `4m20s` / `51s` / `2h05m` — compact duration for heartbeat lines.
-fn format_secs(total: u64) -> String {
+pub(crate) fn format_secs(total: u64) -> String {
     let (h, m, s) = (total / 3600, (total % 3600) / 60, total % 60);
     if h > 0 {
         format!("{h}h{m:02}m")

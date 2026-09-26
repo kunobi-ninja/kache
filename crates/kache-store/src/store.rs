@@ -1488,19 +1488,6 @@ fn cap_diagnostics(s: &str, max: Option<usize>) -> String {
     }
 }
 
-fn is_executable(metadata: &fs::Metadata) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        metadata.permissions().mode() & 0o111 != 0
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = metadata;
-        false
-    }
-}
-
 fn zero_byte_is_valid_output<P: ArtifactPolicy>(store_name: &str, crate_types: &[String]) -> bool {
     P::allow_empty(store_name, crate_types)
 }
@@ -2506,7 +2493,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             // `false` is precisely the wrong value this guards against — and
             // staging opens the same path one line below regardless.
             let executable = fs::metadata(source_path)
-                .map(|meta| is_executable(&meta))
+                .map(|meta| crate::filesystem::is_executable(&meta))
                 .with_context(|| format!("stating compiler output for {store_name}"))?;
             let use_source_hardlink =
                 source_hardlink_allowed::<P>(allow_source_hardlinks, store_name, executable);

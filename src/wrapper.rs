@@ -19,6 +19,7 @@ use crate::config::Config;
 use crate::events::{self, BuildEvent, EventResult};
 use crate::incremental_policy::{AdaptiveUnit, Lease};
 use crate::link;
+use crate::maintenance::unix_now_secs;
 use crate::scheduler::{self, FlightIdentity, MissGuard};
 use crate::store::{BuildClaim, EntryMeta, KeyLock, Store, StorePutResult};
 
@@ -352,13 +353,6 @@ fn recent_held_bytes(backoff: Option<AutoGcBackoff>, now: u64) -> u64 {
     backoff
         .filter(|b| now < b.since.saturating_add(AUTO_GC_HELD_TTL.as_secs()))
         .map_or(0, |b| b.held)
-}
-
-fn unix_now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
 
 fn read_auto_gc_backoff(cache_dir: &Path) -> Option<AutoGcBackoff> {

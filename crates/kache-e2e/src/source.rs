@@ -271,7 +271,8 @@ pub fn reset_worktree_path(clone_ref: &Path, target: &Path) -> Result<()> {
     Ok(())
 }
 
-fn run(cmd: &mut Command) -> Result<()> {
+/// Run a command with inherited stdio, failing on a non-zero exit.
+pub(crate) fn run(cmd: &mut Command) -> Result<()> {
     let status = cmd.status().with_context(|| format!("spawning {cmd:?}"))?;
     if !status.success() {
         bail!("command failed ({status}): {cmd:?}");

@@ -12936,6 +12936,9 @@ mod tests {
         let held = std::fs::File::open(cross.join(".cargo-lock")).unwrap();
         held.lock().unwrap();
         assert!(target_in_use(&target));
+        // Unlock rather than only drop: a child another test forks while the
+        // file is open shares its lock until the child execs.
+        held.unlock().unwrap();
         drop(held);
         assert!(!target_in_use(&target));
     }

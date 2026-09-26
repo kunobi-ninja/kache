@@ -112,6 +112,7 @@ fn test_config() -> Config {
         index_auto_compact: true,
         auto_clean_orphaned_targets: false,
         auto_clean_idle_targets_days: 0,
+        seed_new_targets: false,
         gc_evict_shared: false,
         storage_layout_advice: true,
         heartbeat_secs: 30,

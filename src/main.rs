@@ -71,6 +71,7 @@ use kache_store::sharing;
 mod compiler_store;
 use compiler_store as store;
 mod target_cleanup;
+mod target_seed;
 mod test_runner;
 #[cfg(test)]
 mod test_support;
@@ -1394,6 +1395,9 @@ fn run_wrapper_mode(args: &[String]) -> Result<()> {
     };
     let exit_code = match wrapper_target(adapter) {
         Some(WrapperTarget::Rustc) => {
+            // Cargo's first call for a target directory it has not built:
+            // let the daemon copy registry units in before Cargo looks.
+            target_seed::before_probe(&config, args);
             // Started here so the trace also covers the OUT_DIR alias check.
             let trace = phase_trace::start("rustc", args);
             // Still single-threaded, like the KACHE_ACTIVE write above:

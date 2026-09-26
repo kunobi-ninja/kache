@@ -14714,6 +14714,11 @@ mod tests {
         let dir = temp.path().join("include");
         let absent = CcListingStamp::take(&dir).unwrap();
         assert_eq!(absent, CcListingStamp::Absent);
+        assert!(absent.holds(&dir), "still absent");
+        // A path that cannot be a directory is not \"absent\": no stamp.
+        let file = temp.path().join("file");
+        fs::write(&file, "").unwrap();
+        assert_eq!(CcListingStamp::take(&file.join("sub")), None);
         fs::create_dir(&dir).unwrap();
         assert!(!absent.holds(&dir));
         assert!(CcListingStamp::take(&dir).is_none(), "modified just now");

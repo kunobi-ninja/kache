@@ -93,6 +93,7 @@ unicode-normalization = "0.1"
 # the classifier on every cc compile argument; bounded cost is a design
 # requirement.
 regex = { version = "1", default-features = false, features = ["std", "perf"] }
+regex-automata = { version = "0.4", default-features = false, features = ["std", "syntax", "meta", "nfa-pikevm"] }
 
 [target.'cfg(windows)'.dependencies]
 # Use the same Visual Studio and Windows SDK discovery path as Rust build

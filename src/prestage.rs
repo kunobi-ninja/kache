@@ -374,6 +374,10 @@ pub(crate) fn stage(cache_dir: &Path, target_dir: &Path, blob_path: impl Fn(&str
             tracing::debug!("not staging {}: {error:#}", record.dest.display());
         }
     }
+    // Unlock rather than only drop: a child forked while the file is open
+    // shares its lock until the child execs, and would make the next pass
+    // skip.
+    let _ = lock.unlock();
 }
 
 fn stage_one(record: &Record, blob: &Path) -> anyhow::Result<()> {

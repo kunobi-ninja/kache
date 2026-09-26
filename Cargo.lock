@@ -2135,6 +2135,7 @@ dependencies = [
  "kunobi-auth",
  "kunobi-daemon",
  "libc",
+ "memchr",
  "opendal-core",
  "opendal-http-transport-reqwest",
  "opendal-layer-retry",

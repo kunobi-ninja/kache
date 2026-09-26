@@ -80,6 +80,7 @@ tar = "0.4"
 futures = "0.3"
 glob = "0.3"
 libc = "0.2"
+memchr = "2"
 tempfile = "3"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider"] }
 # `kache login` and planner bearer sessions. The -core features keep reqwest

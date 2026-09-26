@@ -548,7 +548,7 @@ struct Environment {
     /// Longest first, so nested roots map before their parents.
     mappings: Vec<(PathBuf, &'static str)>,
     /// Each root as Cargo spelled it, without the canonical spellings
-    /// `mappings` adds: what a placeholder is written back as.
+    /// `mappings` adds: what a placeholder is written back as. Longest first.
     spellings: Vec<(PathBuf, &'static str)>,
     /// `KACHE_BASE_DIR`, in both spellings when it is reached through a
     /// symlink. See [`remap_flag_base_dirs`].
@@ -569,7 +569,7 @@ impl Environment {
             (manifest_dir.clone(), "${KACHE_MANIFEST_DIR}"),
         ];
         if let Some(target) = target_dir(&out_dir) {
-            mappings.push((target, "${KACHE_TARGET_DIR}"));
+            mappings.push((target, TARGET_DIR_PLACEHOLDER));
         }
         let cargo_home = std::env::var_os("CARGO_HOME")
             .map(PathBuf::from)
@@ -577,7 +577,9 @@ impl Environment {
         if let Some(cargo_home) = cargo_home {
             mappings.push((cargo_home, "${KACHE_CARGO_HOME}"));
         }
-        let spellings = mappings.clone();
+        let mut spellings = mappings.clone();
+        // Longest first, so a root inside another is replaced before it.
+        spellings.sort_by_key(|(root, _)| std::cmp::Reverse(root.as_os_str().len()));
         // A checkout reached through a symlink is spelled both ways by tools
         // that canonicalize; both spellings map to the same placeholder.
         let canonical: Vec<(PathBuf, &'static str)> = mappings
@@ -646,6 +648,13 @@ impl Environment {
         String::from_utf8_lossy(&self.denormalize(text.as_bytes())).into_owned()
     }
 
+    /// Whether `path` is inside this run's target directory, in any spelling.
+    fn within_target_dir(&self, path: &Path) -> bool {
+        self.mappings.iter().any(|(root, placeholder)| {
+            *placeholder == TARGET_DIR_PLACEHOLDER && path.starts_with(root)
+        })
+    }
+
     /// Every root with its placeholder, `KACHE_BASE_DIR` included.
     fn roots(&self) -> impl Iterator<Item = (&Path, &'static str)> {
         self.mappings
@@ -682,10 +691,17 @@ impl Environment {
         {
             return None;
         }
-        let mut spellings = self.spellings.clone();
-        spellings.sort_by_key(|(root, _)| std::cmp::Reverse(root.as_os_str().len()));
+        // Most text (a C header under a `links` dependency's OUT_DIR) names
+        // no root; finding that out costs one search per root.
+        if !self
+            .spellings
+            .iter()
+            .any(|(root, _)| find_bytes(contents, root.as_os_str().as_encoded_bytes()).is_some())
+        {
+            return None;
+        }
         let mut normalized = contents.to_vec();
-        for (root, placeholder) in &spellings {
+        for (root, placeholder) in &self.spellings {
             normalized = replace_whole_paths(
                 &normalized,
                 root.as_os_str().as_encoded_bytes(),
@@ -751,6 +767,7 @@ impl Environment {
 }
 
 const BASE_DIR_PLACEHOLDER: &str = "${KACHE_BASE_DIR}";
+const TARGET_DIR_PLACEHOLDER: &str = "${KACHE_TARGET_DIR}";
 
 /// Every placeholder starts with this.
 const PLACEHOLDER_PREFIX: &[u8] = b"${KACHE_";
@@ -815,9 +832,10 @@ pub(crate) fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() {
         return None;
     }
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
+    // A build script's outputs run to tens of megabytes (aws-lc-sys, libgit2)
+    // and are searched once per root: a byte-by-byte window scan put seconds
+    // on the build.
+    memchr::memmem::find(haystack, needle)
 }
 
 /// A byte that can continue a file name, so a root followed or preceded by
@@ -832,25 +850,30 @@ fn replace_whole_paths(haystack: &[u8], needle: &[u8], replacement: &[u8]) -> Ve
     if needle.is_empty() {
         return haystack.to_vec();
     }
+    let finder = memchr::memmem::Finder::new(needle);
     let mut out = Vec::with_capacity(haystack.len());
-    let mut index = 0;
-    while index < haystack.len() {
-        let before = index.checked_sub(1).map(|at| haystack[at]);
-        let after = haystack.get(index + needle.len()).copied();
-        let next = if haystack[index..].starts_with(needle)
-            && !before.is_some_and(|byte| is_name_byte(byte) || byte == b'/')
+    let mut copied = 0;
+    let mut from = 0;
+    while let Some(offset) = finder.find(&haystack[from..]) {
+        let start = from + offset;
+        let end = start + needle.len();
+        let before = start.checked_sub(1).map(|at| haystack[at]);
+        let after = haystack.get(end).copied();
+        let next = if !before.is_some_and(|byte| is_name_byte(byte) || byte == b'/')
             && !after.is_some_and(is_name_byte)
         {
+            out.extend_from_slice(&haystack[copied..start]);
             out.extend_from_slice(replacement);
-            index + needle.len()
+            copied = end;
+            end
         } else {
-            out.push(haystack[index]);
-            index + 1
+            start + 1
         };
-        // A loop that stopped advancing would grow `out` without bound.
-        debug_assert!(next > index, "replace_whole_paths must advance");
-        index = next;
+        // A search that stopped advancing would never end.
+        debug_assert!(next > from, "replace_whole_paths must advance");
+        from = next;
     }
+    out.extend_from_slice(&haystack[copied..]);
     out
 }
 
@@ -1055,14 +1078,15 @@ impl Run {
             {
                 let path = PathBuf::from(raw);
                 if path.is_absolute() && path.exists() {
-                    let state = input_state_as(
-                        &path,
-                        &[],
-                        &file_hasher,
-                        &mut budget,
-                        0,
-                        Some(&self.environment),
-                    )?;
+                    // Only another script's output, under this target
+                    // directory, can name the checkout; a system directory
+                    // such as `/usr/include` hashes as it always did, and
+                    // keeps its path-keyed memo in every checkout.
+                    let text = self
+                        .environment
+                        .within_target_dir(&path)
+                        .then_some(&self.environment);
+                    let state = input_state_as(&path, &[], &file_hasher, &mut budget, 0, text)?;
                     fold(&mut hasher, "cargo_env_path_state", state.as_bytes());
                 }
             }
@@ -1499,7 +1523,7 @@ fn is_executable(metadata: &std::fs::Metadata) -> bool {
 fn package_exclusions(package: &Path, environment: &Environment) -> Vec<PathBuf> {
     let mut excluded = vec![package.join(".git"), package.join("target")];
     for (root, placeholder) in &environment.mappings {
-        if *placeholder == "${KACHE_TARGET_DIR}" && root.starts_with(package) {
+        if *placeholder == TARGET_DIR_PLACEHOLDER && root.starts_with(package) {
             excluded.push(root.clone());
         }
     }
@@ -2901,6 +2925,51 @@ mod tests {
             pc(out)
         );
         assert_eq!(std::fs::read(out.join("lib/adler32.o")).unwrap(), object);
+    }
+
+    /// A `links` dependency that exports a directory outside the target
+    /// (libz-sys with the system zlib hands down `/usr/include`) is hashed
+    /// as bytes, as before #1238: its path-keyed memo then serves every
+    /// checkout, where a memo salted by the target directory would miss and
+    /// re-read the whole tree.
+    #[test]
+    fn a_links_dependency_outside_the_target_is_keyed_by_its_bytes() {
+        let mut lock = crate::test_support::process_state_test_lock();
+        let dir = lock.enter(tempfile::tempdir().unwrap());
+        let config = crate::test_support::test_config(dir.as_path().join("cache"));
+        let prediction = prediction_with(Some(Vec::new()), true);
+        let system = dir.as_path().join("usr/include");
+        std::fs::create_dir_all(&system).unwrap();
+        let a_target = dir.as_path().join("a/target");
+        std::fs::write(
+            system.join("zlib.pc"),
+            format!("prefix={}/debug\n", a_target.display()),
+        )
+        .unwrap();
+        let key_in = |target: &Path| {
+            let run = Run {
+                store: Store::open(&config).unwrap(),
+                config: config.clone(),
+                binary_hash: "aaaa".to_string(),
+                environment: checkout_environment(target, &dir.as_path().join("cargo")),
+                start: std::time::Instant::now(),
+            };
+            assert!(!run.environment.within_target_dir(&system));
+            assert!(
+                run.environment
+                    .within_target_dir(&target.join("debug/build/z-1/out"))
+            );
+            // SAFETY: the process-state lock serialises environment edits.
+            unsafe { std::env::set_var("DEP_KT_INCLUDE", &system) };
+            let key = run.action_key(&prediction).unwrap();
+            unsafe { std::env::remove_var("DEP_KT_INCLUDE") };
+            key
+        };
+        assert_eq!(
+            key_in(&a_target),
+            key_in(&dir.as_path().join("b/target")),
+            "the same bytes key the same from any checkout"
+        );
     }
 
     /// 0.23.0 started kache through a `/bin/sh` launcher, and dash drops a

@@ -1,9 +1,9 @@
 ---
 title: Bound a remote
-description: Let the store expire old objects; kache never deletes remotely
+description: Let the store expire old objects; Kache never deletes remotely
 ---
 
-A remote cache grows until something removes old objects. That something is the store, not kache: an S3 lifecycle rule, or a prune job run by the owner of a shared directory. kache reads and writes remote objects and never deletes them, so a policy can run at any time without pausing builds.
+A remote cache grows until the store removes old objects, through an S3 lifecycle rule or a prune job run by the owner of a shared directory. Kache reads and writes remote objects and never deletes them, so a policy can run at any time without pausing builds.
 
 ## What the layout needs from a policy
 
@@ -21,7 +21,7 @@ Three rules keep the store consistent under expiry:
 
 - Expire `v3/manifests/` and `v3/packs/` with the same age. A manifest and its pack are written together and neither is rewritten, so they age together. A manifest that outlives its pack is a miss; a pack that outlives its manifest is unreachable garbage.
 - Expire `v4/prefetch/catalogs/` sooner than `v4/prefetch/packs/` and `pack-meta/`. Packs are shared between catalog generations, so a live catalog must never point at an expired pack.
-- Expire by age since the object was written. kache never rewrites an entry's manifest or pack, so a hot entry expires too and is uploaded again on the next miss. Build manifests and prediction rows are written again each time they are used, so they expire only when idle. An expired prediction row costs one dep-info pre-pass. That is the same trade every object store's lifecycle makes; pick an age longer than the interval at which your builds change.
+- Expire by age since the object was written. Kache never rewrites an entry's manifest or pack, so a hot entry expires too and is uploaded again on the next miss. Build manifests and prediction rows are written again each time they are used, so they expire only when idle. An expired prediction row costs one dep-info pre-pass. Pick an age longer than the interval at which your builds change.
 
 An expired object is a miss. The daemon's remote key index can report an object present for up to `cache.remote_key_cache_refresh_secs` after it expired; the fetch then misses and the crate compiles as usual.
 
@@ -47,7 +47,7 @@ Thirty days for artifacts and fourteen for catalogs is a reasonable start. Every
 aws s3api put-bucket-lifecycle-configuration --bucket my-kache --lifecycle-configuration file://lifecycle.json
 ```
 
-Replace `artifacts/` with your `cache.remote.prefix`. Add an `AbortIncompleteMultipartUpload` rule if your bucket receives multipart uploads from other tools; kache uploads each object in one request.
+Replace `artifacts/` with your `cache.remote.prefix`. Add an `AbortIncompleteMultipartUpload` rule if your bucket receives multipart uploads from other tools; Kache uploads each object in one request.
 
 **Cloudflare R2**
 
@@ -65,7 +65,7 @@ mc ilm rule add --prefix "artifacts/v4/prefetch/pack-meta/" --expire-days 30 mym
 
 ## Filesystem remote
 
-The owner of the shared directory runs one prune job on one machine. Age by modification time so the result is the same on `noatime` mounts, and skip the staging directory kache renames from.
+The owner of the shared directory runs one prune job on one machine. Age by modification time so the result is the same on `noatime` mounts, and skip the staging directory Kache renames from.
 
 ```bash
 #!/bin/sh
@@ -78,6 +78,6 @@ find "$root/v4/prefetch/packs" "$root/v4/prefetch/pack-meta" -type f -mtime +30 
 find "$root" -mindepth 1 -type d -empty -not -path '*/.kache-tmp*' -delete
 ```
 
-Run it from cron or a systemd timer once a day. Nothing coordinates with writers because nothing needs to: a writer that loses a race with the prune uploads again on its next miss, and a reader that loses one records a miss.
+Run it from cron or a systemd timer once a day. The job needs no coordination with writers: a writer that loses a race with the prune uploads again on its next miss, and a reader that loses one records a miss.
 
 `kache gc` bounds the local store only. There is no kache command that deletes remote objects.

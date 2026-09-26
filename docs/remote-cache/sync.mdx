@@ -21,7 +21,7 @@ Pull and push use different scopes:
 
 - Pull normally lists crates from `Cargo.lock` in the current directory. With no usable lockfile it falls back to listing the full remote.
 - `--workspace` lists only Cargo workspace members and fails if it cannot resolve the workspace. It conflicts with `--all`.
-- Push uploads only workspace members, from `cargo metadata --no-deps`. It uploads every local entry only when the directory has no `Cargo.toml` and no `--manifest-path` is given. Build-script runs are never pushed.
+- Inside a Cargo workspace, push uploads only workspace members, from `cargo metadata --no-deps`. With no `Cargo.toml` in the directory and no `--manifest-path`, it uploads every local entry. Build-script runs are never pushed.
 - `--manifest-path` selects the workspace for push and for `--workspace` pulls.
 
 Narrowing the initial pull does not disable on-demand dependency restores during a later daemon-backed build.
@@ -34,7 +34,7 @@ cargo build --release
 kache daemon stop
 ```
 
-The daemon uploads new entries in the background, dependencies included. `kache daemon stop` lets it finish its queued uploads before it exits. An explicit `kache sync --push` uploads only the current workspace's own crates, so use it when the daemon is intentionally absent and the workspace crates are what you want to publish.
+The daemon uploads new entries in the background, dependencies included. `kache daemon stop` lets it finish its queued uploads before it exits. Inside a Cargo workspace, `kache sync --push` uploads only that workspace's own crates. Use it when you run without the daemon and those crates are what you want to publish.
 
 ## Failure behavior
 

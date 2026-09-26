@@ -9,9 +9,9 @@ Kache caches conservative, single-source C and C++ object compilations. If it ca
 
 `kache init` covers both rustc and the objects a build script compiles through the `cc` crate. Without it, put a shim on `PATH`.
 
-On Unix, `kache init` sets `HOST_CC` and `HOST_CXX` in Cargo's config, and `CC_KNOWN_WRAPPER_CUSTOM=kache`. On Windows it sets only `CC_KNOWN_WRAPPER_CUSTOM`, so choose clang-cl through `CC`. Init never sets `CC` or `CXX`, so `cargo build --target` keeps the cross compiler the `cc` crate would have found.
+On Unix, `kache init` sets `HOST_CC` and `HOST_CXX` in Cargo's config, and `CC_KNOWN_WRAPPER_CUSTOM=kache`. On Windows it sets only `CC_KNOWN_WRAPPER_CUSTOM`, so choose clang-cl through `CC` as shown under [Prefix method](#prefix-method). Init never sets `CC` or `CXX`, so `cargo build --target` keeps the cross compiler the `cc` crate would have found.
 
-PATH shims also cover Cargo's C bits when the crate invokes `cc` or `gcc` from `PATH` without `HOST_CC`.
+PATH shims also cover C code in Cargo builds when the crate invokes `cc` or `gcc` from `PATH` without `HOST_CC`.
 
 ## Make, CMake, autotools, PKGBUILD
 
@@ -45,7 +45,7 @@ export PATH="/usr/lib/kache:$PATH"
 
 Nix packages include the same symlinks in `${kache}/shims`, also available at `${kache}/lib/kache`. Add that directory to `PATH` using the [Nix configuration example](/docs/getting-started/installation#nix); no `kache install-shims` step is needed.
 
-`kache install-shims` creates `cc`, `c++`, `gcc`, `g++`, `clang`, and `clang++`. Keep the real compilers later in `PATH`. When Kache looks for the real compiler it skips any entry that resolves to itself or to a binary named `kache`, and every entry in a directory that holds a `.kache-shims` file. The packages write that file, and `kache install-shims` does when the directory holds only Kache links, so two Kache installs on one `PATH` do not run each other. Keep the shim directory for shims only.
+`kache install-shims` creates `cc`, `c++`, `gcc`, `g++`, `clang`, and `clang++`. Keep the real compilers later in `PATH`. When Kache looks for the real compiler it skips any entry that resolves to itself or to a binary named `kache`. It also skips every entry in a directory that holds a `.kache-shims` file. The packages write that file, and `kache install-shims` does when the directory holds only Kache links, so one Kache install on `PATH` never runs another as the compiler. Keep the shim directory for shims only.
 
 Versioned and target-prefixed names (`gcc-13`, `x86_64-pc-linux-gnu-gcc`) work if you create them by hand or scan `PATH`:
 
@@ -56,7 +56,7 @@ kache install-shims --force ~/.local/lib/kache/shims
 
 Omitting the directory uses `~/.local/lib/kache/shims`. `--from-path` adds a symlink for every compiler-shaped name already on `PATH` that is not Kache itself.
 
-This is a native symlink to the `kache` binary. Do not wrap Kache in a shell script; that would spawn a shell per compile.
+Each shim is a native symlink to the `kache` binary. Do not wrap Kache in a shell script; that would spawn a shell per compile.
 
 Kache is a larger process than ccache. On a tree of many tiny `.c` files, measure both before replacing ccache.
 
@@ -98,7 +98,7 @@ clang-cl /c foo.c /Fofoo.obj
 
 The key includes the content of the source and of every header the compile reads, the compiler identity, modeled code-generation options, and normalized paths. Header changes therefore invalidate the entry.
 
-Kache learns the read set without a separate preprocessor run. The first time it sees an invocation it compiles right away, asking GCC or Clang for a dependency file alongside the object (a caller's own `-MD` file serves when present), then fingerprints the files that compile read and keys from their digest. Peers compiling the same unit in other build directories wait for that record instead of compiling too. When a record exists but a file in it changed, Kache runs the preprocessor to rediscover the read set; the key it derives is the same one a compile would, so an entry left by an earlier state of the tree is still found. A read set that includes a file the assembler opens on its own, or a file modified while the build ran, is compiled and not cached. `KACHE_DEFERRED_DISCOVERY=0` keeps the preprocessor as the discovery on every miss.
+Kache learns the read set without a separate preprocessor run. The first time it sees an invocation it compiles right away and asks GCC or Clang for a dependency file alongside the object. A caller's own `-MD` file serves when present. Kache then fingerprints the files the compile read and keys from their digest. Peers compiling the same unit in other build directories wait for that record instead of compiling too. When a record exists but a file in it changed, Kache runs the preprocessor to rediscover the read set. It derives the same key a compile would, so it still finds an entry stored from an earlier state of the tree. A read set that includes a file the assembler opens on its own, or a file modified while the build ran, is compiled and not cached. `KACHE_DEFERRED_DISCOVERY=0` keeps the preprocessor as the discovery on every miss.
 
 Kache recognizes GCC, Clang, Apple Clang, clang-cl, versioned names such as `gcc-13`, and target-prefixed compiler names. It can probe other wrapper names to identify the underlying compiler family.
 
@@ -131,8 +131,12 @@ Kache currently passes through:
 - response files
 - precompiled headers and modules
 - coverage and split-DWARF builds
-- assembly, including inline `asm` in C, that reads another file with `.incbin` or `.include`, or that uses assembler macros and repetitions (`.macro`, `.irp`, `.irpc`, `.rept`, `.altmacro`) able to generate those directives: the assembler reads the file after preprocessing, so the key cannot see it. Inline `asm` whose text is a computed expression rather than a string literal is passed through for the same reason. These compiles run the compiler directly, skipping a configured `KACHE_FALLBACK` wrapper, because a wrapper that keys on preprocessor output cannot see the file either.
+- assembly, including inline `asm` in C, that reads another file with `.incbin` or `.include`
+- assembly that uses macros or repetitions (`.macro`, `.irp`, `.irpc`, `.rept`, `.altmacro`) able to generate those directives
+- inline `asm` whose text is a computed expression rather than a string literal
 - flags it has not classified
+
+The assembler reads `.incbin` and `.include` files after preprocessing, so the key cannot see them, and a computed `asm` string could name one. The three assembly cases run the compiler directly and skip a configured `KACHE_FALLBACK` wrapper, because a wrapper that keys on preprocessor output cannot see those files either.
 
 Inspect passthrough reasons in the monitor or logs:
 

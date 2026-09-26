@@ -23,17 +23,17 @@ cargo install kache
 kache init
 ```
 
-That's it. Your Cargo commands do not change.
+Your Cargo commands do not change.
 
 `kache init` sets `rustc-wrapper` in Cargo's config. On Unix it also adds the `[env]` keys for build-script C and C++. Run `kache init --check` to preview the changes, or `kache init --no-service` to skip the OS service.
 
 ![kache init previewing its changes, applying them, and kache doctor passing every check.](https://raw.githubusercontent.com/kunobi-ninja/kache/main/assets/init.gif)
 
-`cargo install` needs Rust 1.95 or newer. Prebuilt packages exist for Homebrew, APT, AUR, winget, Scoop, Chocolatey, mise, and Nix; release builds cover x86_64 and ARM on all three platforms. See [Install Kache](https://kunobi.ninja/docs/kache/getting-started/installation) for each channel.
+`cargo install` needs Rust 1.95 or newer. Prebuilt packages exist for Homebrew, APT, AUR, winget, Scoop, Chocolatey, mise, and Nix. Release builds cover x86_64 and ARM on Linux, macOS, and Windows. See [Install Kache](https://kunobi.ninja/docs/kache/getting-started/installation) for each channel.
 
 ## See your first cache hit
 
-After `kache init`, [build the same revision in two temporary worktrees][first-reuse]. Each gets its own target directory, so your existing build outputs stay in place. The second tree's report lists the hits, and a bypass reason for every unit that still compiled.
+After `kache init`, [build the same revision in two temporary worktrees][first-reuse]. Each gets its own target directory, so your existing build outputs stay in place. The second tree's report lists the hits and a bypass reason for every unit that still compiled.
 
 ![A second worktree of the same commit building from cache hits, then the build report showing 42 of 42 crates cached.](https://raw.githubusercontent.com/kunobi-ninja/kache/main/assets/demo.gif)
 
@@ -42,8 +42,8 @@ After `kache init`, [build the same revision in two temporary worktrees][first-r
 Kache has three parts: a compiler wrapper, a local store, and an optional daemon.
 
 - The wrapper parses each `rustc`, `cc`, `c++`, or `nvcc` invocation, hashes the inputs that change the output, and normalizes the machine-local paths that do not. Two worktrees of the same revision produce the same key.
-- The store keeps outputs as content-addressed blobs. Identical bytes are stored once. Restores use copy-on-write clones where the filesystem supports them, which is what keeps a second worktree cheap on disk.
-- Concurrent builds that reach the same key join one flight, so the compiler runs once per key on a machine, however many Cargo processes ask for it.
+- Wrappers that reach the same key at the same time join one flight, so the compiler runs once per key on a machine, however many Cargo processes ask for it.
+- The store keeps outputs as content-addressed blobs. Identical bytes are stored once. Restores use copy-on-write clones where the filesystem supports them, so a second worktree costs little disk.
 - The daemon serves remote lookups after a local miss and uploads new entries in the background.
 
 Hits, misses, and passthroughs are reported per unit, and `kache why-miss` explains what changed. [Read the architecture →](https://kunobi.ninja/docs/kache/how-it-works/architecture)
@@ -64,11 +64,11 @@ Hits, misses, and passthroughs are reported per unit, and `kache why-miss` expla
 
 In a Firefox 151 benchmark with Kache 0.7.0 on macOS/APFS, the second worktree added about 3 GB of new data. [Read the measurements and methodology →][storage-report]
 
-Need to choose between compiler caches? Read [Kache or sccache?](https://kunobi.ninja/docs/kache/getting-started/comparison).
+For a comparison with sccache, read [Kache or sccache?](https://kunobi.ninja/docs/kache/getting-started/comparison).
 
 ## Tested nightly on real projects
 
-The scheduled [benchmark workflow](https://github.com/kunobi-ninja/kache/actions/workflows/bench.yml) runs real cold/warm builds of Firefox, LLVM, Substrate, SurrealDB, Lance, OpenDAL, cuda-oxide, and eza on Linux, compares Firefox with sccache, and exercises Firefox on Windows. It also measures how much of a Firefox build survives a source update.
+The scheduled [benchmark workflow](https://github.com/kunobi-ninja/kache/actions/workflows/bench.yml) runs real cold and warm builds of Firefox, LLVM, SurrealDB, Lance, OpenDAL, cuda-oxide, and eza on Linux. Separate workflows build Firefox on Windows every night and compare Firefox with sccache once a week. It also measures how much of a Firefox build survives a source update.
 
 Each run checks its own measurement validity and uploads reports, traces, and logs for 30 days. Treat timing or hit-rate numbers as evidence only when the individual job succeeds and its benchmark verdict is `ok`.
 
@@ -88,7 +88,7 @@ See the [CI guide](https://kunobi.ninja/docs/kache/remote-cache/ci) for GitHub A
 
 ## C and C++
 
-On Unix, `kache init` creates compiler-name shims and offers to add their directory to `PATH` in your zsh, bash, or fish startup file. Make, CMake, autotools, and Arch PKGBUILDs that call `gcc` by name then go through Kache. No `CC=` edit and no shell wrapper.
+On Unix, `kache init` creates compiler-name shims and offers to add their directory to `PATH` in your zsh, bash, or fish startup file. Make, CMake, autotools, and Arch PKGBUILDs that call `gcc` by name then go through Kache, with no `CC=` edit or shell wrapper.
 
 For managed dotfiles or another shell, set it up by hand:
 

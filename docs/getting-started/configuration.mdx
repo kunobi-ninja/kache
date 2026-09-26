@@ -42,9 +42,9 @@ Use `type = "filesystem"` with `path = "/mnt/kache"` for a shared filesystem rem
 
 ### Host config
 
-A machine owner can set keys for every build on the machine in `/etc/kache/config.toml`. Kache reads it underneath the chosen file and merges the two key by key: a key the chosen file sets wins, and a key it leaves unset comes from the host file. Environment variables still win over both.
+A machine owner can set keys for every build on the machine in `/etc/kache/config.toml`. Kache merges it with the chosen file key by key: a key the chosen file sets wins, and a key it leaves unset comes from the host file. Environment variables still win over both.
 
-This reaches CI jobs too. kache-action points `KACHE_CONFIG` at a file of its own that only sets `[cache.remote]`, so a host file like this applies to every job on the runner:
+The host file reaches CI jobs too. kache-action points `KACHE_CONFIG` at a file of its own that only sets `[cache.remote]`, so a host file like this applies to every job on the runner:
 
 ```toml title="/etc/kache/config.toml"
 [cache]
@@ -107,11 +107,11 @@ What a scheduled test binary does:
 - With no thread count set, it takes every free test slot, at least one, and runs with `RUST_TEST_THREADS` set to the number it holds. The reserve stays free even when nothing else runs, so a lone `cargo test` gets fewer threads than without the runner: 12 on 16 CPUs, 3 on 4, 1 on 2. With `--test-threads` or `RUST_TEST_THREADS`, it takes that many slots and the setting is left alone. Under nextest's process-per-test mode, each test takes one slot.
 - On Unix, Kache records the binary's peak memory. A binary that used more than 512 MiB takes at least one slot per 512 MiB on its next run. Under nextest's process-per-test mode it records each test's peak instead, so a heavy test does not raise the others.
 - It waits up to 30 minutes for slots, then runs without them. Under nextest the wait is 2 minutes, because nextest counts it toward the test's timeouts.
-- Builds and test binaries started inside a test count against that test's slots and wait for none of their own. A nested `cargo build` can therefore run more compiles at once than its test holds slots.
-- While tests hold slots, a compile that has waited asks for no more than the slots the tests leave, and never less than the reserve, so a test waiting on a build does not block it.
+- Builds and test binaries started inside a test count against that test's slots and do not wait for slots of their own. A nested `cargo build` can therefore run more compiles at once than its test holds slots.
+- While tests hold slots, a compile that has waited asks for no more slots than the tests leave free, and never fewer than the reserve. A test that waits on a build therefore cannot block that build.
 - Exit codes, signals, stdin and Ctrl-C behave as if the binary ran directly. The runner writes nothing to stdout.
 
-These run unchanged, without waiting: binaries Cargo does not name with a hash (`cargo run`, doctests), test listing (`--list`, which nextest uses), benchmarks (`--bench`), and every run when `KACHE_SCHEDULER=0` or `[cache] scheduler = false`.
+The runner starts these directly, without waiting for slots: binaries Cargo does not name with a hash (`cargo run`, doctests), test listing (`--list`, which nextest uses), benchmarks (`--bench`), and every run when `KACHE_SCHEDULER=0` or `[cache] scheduler = false`.
 
 A nested build finds its test's slots through `KACHE_TEST_LEASE`. A build that runs with a cleared environment cannot see it, so it waits for slots of its own, up to the same limit.
 
@@ -121,21 +121,21 @@ A nested build finds its test's slots through `KACHE_TEST_LEASE`. A build that r
 
 By default, GC keeps an entry when removing its last store name would reclaim zero bytes. This preserves a usable cache hit. It also means the registered store size can remain above `local_max_size` until the target output is removed. `kache gc` reports these entries as unreclaimable, with the bytes they hold, and separates store bytes removed from disk bytes reclaimed.
 
-A size-driven sweep leaves those held bytes out of its budget. Before it removes anything, it checks which entries' last blobs a build output still holds, and it evicts until the rest of the store is back under the target. A store whose registered size is mostly held by target directories is therefore not evicted further: removing other entries would lose cache hits without bringing the held bytes down.
+A size-driven sweep leaves those held bytes out of its budget. Before it removes anything, it finds the entries whose last blob a build output still holds, and it evicts until the rest of the store is back under the target. A store whose registered size is mostly held by target directories is therefore not evicted further: removing other entries would lose cache hits without bringing the held bytes down.
 
-Automatic eviction has one trigger. A sweep starts when the store is above 110% of `local_max_size` and evicts down to 90%. Three things can ask for one: a build that has just stored an entry (checked at most every 5 minutes), the daemon after an upload, and the daemon's 6-hour sweep. All three use the same trigger. `kache gc` still evicts from 100%.
+Automatic eviction has one trigger: a sweep starts when the store is above 110% of `local_max_size` and evicts down to 90%. Three things can ask for one: a build that has just stored an entry (checked at most every 5 minutes), the daemon after an upload, and the daemon's 6-hour sweep. `kache gc` evicts from 100%.
 
-While a daemon is running, it does the sweeping. A build that finds the store over the trigger sends the daemon a hint and continues; it does not wait for the sweep, and it never starts a daemon for this. Hints that arrive during a sweep are dropped. With no daemon, or a daemon too old to know the hint, the build starts a detached `kache gc` as before. That worker sweeps a second time two minutes later only if the first sweep had to skip entries a running build was using.
+While a daemon is running, it does the sweeping. A build that finds the store over the trigger sends the daemon a hint and continues; it does not wait for the sweep, and it never starts a daemon for this. Hints that arrive during a sweep are dropped. With no daemon, or a daemon too old to accept the hint, the build starts a detached `kache gc`. That worker sweeps a second time two minutes later only if the first sweep had to skip entries a running build was using.
 
-Every automatic sweep records where it left the store, whichever of the three started it. When an automatic sweep leaves the store over budget, the next automatic sweep waits 10 minutes. Each further sweep that ends over budget doubles the wait, up to 2 hours. The wait ends early when the store grows by more than 10% of `local_max_size`, and resets once a sweep brings the store back under budget. The wait applies to all three, so one sweep that cannot free enough holds the others back too. The 6-hour sweep still expires entries by `cache.gc_max_age_hours` and removes duplicates during a wait; only its size eviction is skipped. The state lives in `auto-gc-backoff.json` in the cache dir. `kache gc` ignores it.
+Every automatic sweep records the store size it ended at, whichever of the three started it. When an automatic sweep leaves the store over budget, the next automatic sweep waits 10 minutes. Each further sweep that ends over budget doubles the wait, up to 2 hours. The wait ends early when the store grows by more than 10% of `local_max_size`, and resets once a sweep brings the store back under budget. The wait applies to all three, so one sweep that cannot free enough holds the others back too. The 6-hour sweep still expires entries by `cache.gc_max_age_hours` and removes duplicates during a wait; only its size eviction is skipped. The state lives in `auto-gc-backoff.json` in the cache dir. `kache gc` ignores it.
 
-That file also keeps the bytes the last sweep found held by target directories. For 6 hours the trigger compares the store size minus those bytes with 110% of `local_max_size`, so a store over budget only on held bytes starts no sweep. Deleting a worktree frees what it held without changing the store size; after 6 hours the trigger uses the full size again, and the next sweep measures anew.
+`auto-gc-backoff.json` also keeps the bytes the last sweep found held by target directories. For 6 hours the trigger compares the store size minus those bytes with 110% of `local_max_size`, so a store over budget only on held bytes starts no sweep. Deleting a worktree frees what it held without changing the store size; after 6 hours the trigger uses the full size again, and the next sweep measures anew.
 
 Automatic sweeps also keep entries downloaded from the remote in the last 6 hours, whether a build has used them yet or not. A CI job that imports a warm set and then runs several cargo commands keeps that set for the whole job; without this, an upload between two commands could evict what the next command needs. If those entries alone keep the store over budget, the sweep stops and backs off as described above. `kache gc` does not keep them.
 
-A sweep pauses for 150 ms after every 50 ms of index writes, and after each removal that finds a build holding the index write lock, so builds storing entries are not held up by it.
+A sweep pauses for 150 ms after every 50 ms of index writes, and after each removal that finds a build holding the index write lock, so the sweep does not hold up builds that are storing entries.
 
-To reclaim the blocks, remove the retaining build output. `kache targets` lists every target directory Kache has seen, how long it has been idle, and what deleting it frees, and marks targets of deleted worktrees. For known stale targets, preview the deletion first:
+To reclaim the blocks, remove the retaining build output. `kache targets` lists every target directory Kache has seen, how long it has been idle, and what deleting it frees. It also marks targets of deleted worktrees. For known stale targets, preview the deletion first:
 
 ```bash
 kache clean --tracked --stale 14d --dry-run
@@ -144,7 +144,7 @@ kache clean --tracked --stale 14d --yes
 
 Targets of deleted worktrees are offered at any age. `kache clean --orphans --yes` removes only those, which suits a hook that runs after `git worktree remove`.
 
-If enforcing the store namespace limit matters more than retaining hits, restore the older policy:
+If enforcing the store namespace limit matters more than retaining hits, let GC evict shared entries:
 
 ```toml title="~/.config/kache/config.toml"
 [cache]
@@ -155,7 +155,7 @@ The equivalent environment setting is `KACHE_GC_EVICT_SHARED=1`. With this optio
 
 ### Volume shards
 
-GC sweeps every `[cache.volumes]` shard as well as the main store: `kache gc`, the daemon's 6-hour sweep, its sweep after an upload or a build's hint, and the detached auto-GC worker. Each shard is swept like the main store, with the same age, duplicate, and size passes.
+Every GC driver sweeps each `[cache.volumes]` shard as well as the main store: `kache gc`, the daemon's 6-hour sweep, its sweep after an upload or a build's hint, and the detached auto-GC worker. Each shard is swept like the main store, with the same age, duplicate, and size passes.
 
 Each shard has its own budget. An explicit `local_max_size` or `KACHE_MAX_SIZE` applies to each shard as it is. Without one, a shard's budget is 5% of the filesystem that holds it, floored at 5GiB and capped at 100GiB, the same rule as the main store.
 
@@ -167,17 +167,17 @@ GC skips a shard whose store dir has no `index.db`: a missing directory, an unmo
 
 ### Daemon index maintenance
 
-The daemon looks after `index.db` on its own. It checks 60 seconds after it starts, every 5 minutes after that, and once at shutdown. Each check runs two steps in order: it heals the blob index, then compacts the file. Both steps hold the index write lock while they work, so both wait for a quiet machine: no compile, and no test binary run through the [test runner](#test-runner), holds a scheduler slot, and the daemon has received no build request for 60 seconds. Stats polling and an open `kache monitor` do not count as build requests. Neither step overlaps a GC sweep.
+The daemon looks after `index.db` on its own. It checks 60 seconds after it starts, every 5 minutes after that, and once at shutdown. Each check runs two steps in order: it heals the blob index, then compacts the file. Both steps hold the index write lock while they work, so both wait for a quiet machine. A machine is quiet when no compile or test binary run through the [test runner](#test-runner) holds a scheduler slot, and the daemon has received no build request for 60 seconds. Stats polling and an open `kache monitor` do not count as build requests. Neither step overlaps a GC sweep.
 
 Set `cache.index_auto_compact = false` or `KACHE_INDEX_AUTO_COMPACT=0` to turn both steps off. `kache doctor --repair` does the same work on demand either way.
 
 #### Blob index heal
 
-The index keeps two tables about blobs: one row per blob with its size and a reference count, and one row per entry and blob it uses. Both are derived from the entries themselves. They can drift apart: a blob row keeps a reference count that no entry accounts for. Such a blob still counts toward `max_size`, but eviction only removes blobs through entries, so GC cannot free it. A store with enough of them stays over its budget and sweeps again and again without getting under it.
+The index keeps two tables about blobs: one row per blob with its size and a reference count, and one row per entry and blob it uses. Both are derived from the entries themselves. They can drift apart: a blob row keeps a reference count that no entry accounts for. Such a blob still counts toward `max_size`, but eviction only removes blobs through entries, so GC cannot free it. A store with enough of them stays over its budget and keeps sweeping without getting under it.
 
 Every check compares the two tables with one read-only query. When they disagree and the machine is quiet, the daemon rebuilds both tables from the `meta.json` of every committed entry, in one transaction. Blob files that no row references after that are deleted once they are an hour old, the same grace GC uses, so a store in the middle of a write is not disturbed. The compaction step that follows returns the freed pages to the disk.
 
-The heal has no fallback for a machine that is never quiet. It reads every entry's metadata under the write lock, so its duration grows with the store, and drift costs disk space, never a wrong cache hit. At shutdown it runs only when the store has at most 25,000 entries. If another process is using the index when it starts, it stops at once and a later check retries.
+The heal has no fallback for a machine that is never quiet. It reads every entry's metadata under the write lock, so its duration grows with the store. Drift costs disk space, never a wrong cache hit. At shutdown it runs only when the store has at most 25,000 entries. If another process is using the index when it starts, it stops at once and a later check retries.
 
 The rebuild refuses to run if it cannot trust an entry: a `meta.json` that is missing or does not parse, or a blob that is missing or has the wrong size. It then changes nothing, logs one warning that names the entry, and waits 6 hours before it tries again. The wait is kept across daemon restarts, in `blob-heal.json` in the cache dir. To fix it, run `kache doctor --repair` when no build is running: it removes the corrupt entry and rebuilds the blob index.
 
@@ -185,7 +185,7 @@ The rebuild refuses to run if it cannot trust an entry: a `meta.json` that is mi
 
 Deleting rows from `index.db` frees pages inside the file but does not shrink it. After a large prune or a schema migration, most of the file can be free pages. The daemon compacts the index with a SQLite `VACUUM` once free pages reach 64 MiB and a quarter of the file.
 
-A `VACUUM` blocks other index users while it runs, so the daemon picks its moment:
+A `VACUUM` blocks other index users while it runs, so the daemon runs one only in these cases:
 
 - On a quiet machine, when the live part of the index is at most 8 GiB. If anything else is using the index at that moment, the attempt stops at once and a later check retries.
 - At daemon shutdown, under the same permit rule, when the live part of the index is at most 1 GiB.
@@ -209,8 +209,8 @@ A live index above 8 GiB is never compacted automatically, because the rewrite w
 | `KACHE_MODIFIED_INPUT_GUARD` | `cache.modified_input_guard` | `false` | Do not store a result when a keyed input changed at or after build start |
 | `KACHE_INPUT_PREDICTIONS` | `cache.input_predictions` | `true` | Remember each crate's source closure and derive the next key from it, skipping the dep-info pre-pass when every recorded input still checks out |
 | `KACHE_VERIFY_INPUT_PREDICTIONS` | none | off | `sampled` or `always`: also run the dep-info pre-pass for a validated prediction and count disagreements in the report. The pre-pass result is the one used |
-| `KACHE_BUILD_SCRIPT_HERMETIC` | none | `false` | On Unix, run cached build scripts with `OUT_DIR` in a shared directory named by their inputs, so a run is shared across target directories. See [Build scripts](/how-it-works/build-scripts). |
-| `KACHE_BUILD_SCRIPT_CACHE` | none | `true` (Unix) | Cache build-script runs: restore `OUT_DIR` and the script's output instead of running it when its binary, Cargo environment and declared `rerun-if-*` inputs match a recorded run. See [Build scripts](/how-it-works/build-scripts). |
+| `KACHE_BUILD_SCRIPT_HERMETIC` | none | `false` | On Unix, run cached build scripts with `OUT_DIR` in a shared directory named by their inputs, so a run is shared across target directories. See [Build scripts](/docs/how-it-works/build-scripts). |
+| `KACHE_BUILD_SCRIPT_CACHE` | none | `true` on Linux and macOS | Cache build-script runs: restore `OUT_DIR` and the script's output instead of running it when its binary, Cargo environment and declared `rerun-if-*` inputs match a recorded run. See [Build scripts](/docs/how-it-works/build-scripts). |
 | `KACHE_FALLBACK` | `cache.fallback` | none | Wrapper used for ordinary Kache passthroughs |
 | none | `cache.exclude` | `[]` | Source-path globs that bypass Kache |
 | none | `cache.bypass_crates` | `[]` | Exact rustc crate names that bypass Kache |
@@ -240,11 +240,11 @@ bypass_env = ["SPECIAL_BUILD=1"]
 | `KACHE_VERIFY_RESTORES` | none | `off` | Re-hash `sampled` or `always` before restoring |
 | `KACHE_VERIFY` | none | `off` | Recompile each rustc cache hit and compare it to the restored files |
 
-`KACHE_VERIFY` is qualification for cache-key changes. Set it to `1` or `true` to recompile every rustc cache hit into a staging directory and diff those artifacts against the files just restored. Leave it unset (or `0` / `false`) in ordinary builds: each hit pays a full compile. There is no `kache build` command for this.
+Use `KACHE_VERIFY` to check a cache-key change. Set it to `1` or `true` to recompile every rustc cache hit into a staging directory and diff those artifacts against the files just restored. Leave it unset (or `0` / `false`) in ordinary builds: each hit pays a full compile. There is no `kache build` command for this.
 
 Path and debug-info bytes that differ only as embedded absolute paths are reported as `path-debug` and do not fail the build. Remaining byte differences are `content`. In both cases the restored files stay in place so the build continues; the wrapper records the class on the hit event as `verify_compare` (and in tracing when logging is on).
 
-`KACHE_VERIFY_RESTORES` still only re-hashes stored blobs before restore. It does not recompile.
+`KACHE_VERIFY_RESTORES` only re-hashes stored blobs before restore. It does not recompile.
 
 Use a key salt when an unobserved toolchain component changes output:
 
@@ -291,9 +291,10 @@ links it, so the first checkout still rebuilds it. A `crate:VAR` entry for
 `OUT_DIR`, or for a variable whose value is under it, keeps that crate on its
 own `OUT_DIR`. A macro that writes debug output into the shared directory fails
 with a hint: run `cargo clean -p <crate>` and rebuild with
-`KACHE_OUT_DIR_ALIAS=0`. The hint needs rustc's error output, so a compile
-Kache passes straight to rustc, such as a `bypass_*` or `exclude` match or one
-on the `preserve_incremental` lane, fails with rustc's error alone.
+`KACHE_OUT_DIR_ALIAS=0`. The hint comes from rustc's error output, so a compile
+that Kache passes straight to rustc fails with rustc's error alone. That covers
+a `bypass_*` or `exclude` match and a compile on the `preserve_incremental`
+lane.
 
 `key_env_vars` accepts exact names and trailing-star prefix patterns:
 
@@ -302,7 +303,7 @@ on the `preserve_incremental` lane, fails with rustc's error alone.
 key_env_vars = ["BOLTFFI_*"]
 ```
 
-Values are hashed exactly and are not written to event logs. A changing value such as a job ID will destroy hit rate.
+Values are hashed exactly and are not written to event logs. A value that changes on every job, such as a job ID, gives every job its own keys.
 
 ## Hidden compile-time inputs
 
@@ -379,17 +380,17 @@ A planner that requires authentication gets a bearer from the first of these tha
 
 1. `KACHE_PLANNER_TOKEN` / `cache.planner.token`, when set.
 2. In GitHub Actions, the job's OIDC ID token. Its audience is the planner's base URL, so no other endpoint can replay it. The job needs `permissions: id-token: write`, and the planner must trust the repository's owner.
-3. Your Kunobi session. Run `kache login` once: it trusts this planner and stores a session that the daemon refreshes quietly from then on. The session is kept per planner client, so it never replaces another Kunobi tool's login.
+3. Your Kunobi session. Run `kache login` once: it trusts this planner and stores a session that the daemon refreshes from then on. The session is kept per planner client, so it never replaces another Kunobi tool's login.
 
-The second and third are sent only to a planner reached over HTTPS (or on loopback), and a session only to a planner you logged in to, so a planner URL picked up from a project's config cannot collect your credentials. Use `kache login --device` on a machine without a browser, and `kache logout` to revoke it.
+Kache sends the OIDC token and the session only to a planner reached over HTTPS (or on loopback), and the session only to a planner you logged in to. A planner URL picked up from a project's config therefore cannot collect your credentials. Use `kache login --device` on a machine without a browser, and `kache logout` to revoke it.
 
-Nothing here prompts during a build. Without a usable bearer the planner answers 401 and kache plans locally, the same as when the planner is unreachable. If the planner's login issuer changes after you first trusted it, `kache login` refuses; run `kache login --retrust` when the change is expected.
+A build never prompts for a login. Without a usable bearer the planner answers 401 and Kache plans locally, the same as when the planner is unreachable. If the planner's login issuer changes after you first trusted it, `kache login` refuses; run `kache login --retrust` when the change is expected.
 
 ## Telemetry
 
-Kache does not push metrics to a collector. It writes OTLP JSON files that Kartero imports from CI artifacts, the same way nightly benches already work.
+Kache does not push metrics to a collector. It writes OTLP JSON files that Kartero imports from CI artifacts, the same way it imports nightly bench results.
 
-Two signals, never mixed:
+The two metric families stay separate:
 
 - `kache.bench.*`: one-shot bench gauges (duration, speedup, verdict) from `kache-scenario`
 - `kache.cache.*`: cache counters (uploads, prefetch, store size) from `kache telemetry write`
@@ -402,7 +403,7 @@ That writes `metrics.otlp.json` and `schema_version` in the directory. `--scenar
 
 ### Machine telemetry
 
-On a host where several jobs share one cache, the payload reports `kache.cache.store.physical_size`: registered blob bytes, the figure GC compares with `kache.cache.store.max`. `kache.cache.store.size` is the sum of logical entry sizes and may differ. `kache.cache.store.unowned.size` is the part of the physical size held by blobs no entry maps to, which GC cannot free, and `kache.cache.store.refcount_drift` counts the blobs whose reference count disagrees with the entries mapped to them, unowned ones included. Both are zero on a healthy store and return to zero after a [blob index heal](#blob-index-heal). It also reports `kache.cache.index.size` (`index.db` plus `-wal`), `kache.cache.index.wal.size`, `kache.cache.index.free.size` (the space `index.db` holds in free pages, which compaction returns to the disk), and `kache.cache.index.rowid_high_water` per table. Last-run GC gauges include duration, pinned and unreclaimable entries, bytes held by target directories (`kache.cache.gc.last_run.bytes_held`), failed evictions, stale WAL snapshot failures, and recently accessed entries skipped before reading their metadata. The shipper adds host identity. The index probe is read-only with a 25 ms lock timeout and omits unavailable figures. `kache stats --json` carries the index figures and GC summary as `index_bytes`, `index_wal_bytes`, `index_rowid_high_water` and `gc`.
+On a host where several jobs share one cache, the payload reports `kache.cache.store.physical_size`: registered blob bytes, the figure GC compares with `kache.cache.store.max`. `kache.cache.store.size` is the sum of logical entry sizes and may differ. `kache.cache.store.unowned.size` is the part of the physical size held by blobs no entry maps to, which GC cannot free. `kache.cache.store.refcount_drift` counts the blobs whose reference count disagrees with the entries mapped to them, unowned ones included. Both are zero on a healthy store and return to zero after a [blob index heal](#blob-index-heal). It also reports `kache.cache.index.size` (`index.db` plus `-wal`), `kache.cache.index.wal.size`, `kache.cache.index.free.size` (the space `index.db` holds in free pages, which compaction returns to the disk), and `kache.cache.index.rowid_high_water` per table. Last-run GC gauges include duration, pinned and unreclaimable entries, bytes held by target directories (`kache.cache.gc.last_run.bytes_held`), failed evictions, stale WAL snapshot failures, and recently accessed entries skipped before reading their metadata. The shipper adds host identity. The index probe is read-only with a 25 ms lock timeout and omits unavailable figures. `kache stats --json` carries the index figures and GC summary as `index_bytes`, `index_wal_bytes`, `index_rowid_high_water` and `gc`.
 
 `rowid_high_water` reports the largest rowid in each table. Tables written with `INSERT OR REPLACE` (`input_predictions`, `eviction_tombstones`) allocate new rowids on replacement, so this value can grow without adding rows. `file_hashes` has no rowid once GC has rebuilt it as a `WITHOUT ROWID` table, and then drops out of this series. C/C++ memos keep their IDs on update; their high-water value does not count refreshes. Use `kache.cache.index.size` to measure index bytes.
 
@@ -412,13 +413,13 @@ To keep per-build numbers at machine level, add `--record` to `kache report`:
 kache report --format github --since 24h --record
 ```
 
-After rendering the report as usual, it appends one JSON line to `telemetry/sessions.jsonl` in the cache dir: the report's summary and timing breakdown (hit overhead, key, dep-info pre-pass, restore, wait, prediction mismatches), plus load average, CPUs and index size at that moment. Use it at the end of a CI job: the report reads the runtime dir, which the job's cleanup deletes. The root is recorded as a hash, never as a path.
+After rendering the report as usual, it appends one JSON line to `telemetry/sessions.jsonl` in the cache dir. The line holds the report's summary and timing breakdown (hit overhead, key, dep-info pre-pass, restore, wait, prediction mismatches), plus load average, CPUs and index size at that moment. Use it at the end of a CI job: the report reads the runtime dir, which the job's cleanup deletes. The root is recorded as a hash, never as a path.
 
-To record every report on a host without passing the flag, set `KACHE_RECORD_SESSIONS=1` or `[cache] record_sessions = true`. It is off by default, and with neither setting nor `--record`, `kache report` writes nothing.
+To record every report on a host without passing the flag, set `KACHE_RECORD_SESSIONS=1` or `[cache] record_sessions = true`. Recording is off by default: without the setting or `--record`, `kache report` writes nothing.
 
 Every GC driver (the daemon's sweep and its eviction after an upload, the auto-GC worker, and local `kache gc` modes) records its run in `gc_stats.json`. With `record_sessions` on, each run also appends a version 2 line to `telemetry/gc-runs.jsonl` with the driver, outcome, duration, lock failures, stale WAL snapshot failures, and recently accessed entries skipped before metadata reads. `gc_stats.json` keeps only the latest run; the history is what a backend adds up. Skip counts are attempts across policy passes, not unique entries.
 
-Session and GC history are opt-in. `kache telemetry write` reads index rows and files locally; it sends nothing over the network. `telemetry/sessions.jsonl` exists only after `kache report --record` or with `record_sessions` on, and `telemetry/gc-runs.jsonl` only with `record_sessions` on.
+`kache telemetry write` reads index rows and files locally; it sends nothing over the network.
 
 ## Daemon, events, and diagnostics
 

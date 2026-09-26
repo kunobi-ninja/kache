@@ -16,7 +16,7 @@ kache init
 kache doctor
 ```
 
-`init` configures Cargo's Rust wrapper. On Unix it also sets `HOST_CC` and `HOST_CXX` when unset, so build-script C and C++ is cached, and offers compiler-name shims with a `PATH` line for your shell's startup file. It also offers a login service. It does not set `CC` or `CXX`. See [C and C++](/docs/getting-started/c-cpp) for native build setup.
+`kache init` configures Cargo's Rust wrapper. On Unix it also sets `HOST_CC` and `HOST_CXX` when unset, so Kache caches the C and C++ that build scripts compile, and offers compiler-name shims with a `PATH` line for your shell's startup file. It also offers a login service. It does not set `CC` or `CXX`. See [C and C++](/docs/getting-started/c-cpp) for native build setup.
 
 `doctor` checks the wrapper configuration, conflicting wrappers, cache configuration, daemon access, and compiler-name shims. Resolve any setup issues it reports before continuing.
 
@@ -53,7 +53,7 @@ Then build the same revision in the second worktree:
 )
 ```
 
-The explicit target paths keep the two builds separate even if you normally use a shared target directory. Cargo must request outputs for the second tree, giving Kache an opportunity to restore them. Running Cargo again with an already populated target can do no compiler work and produce no new Kache events.
+The explicit target paths keep the two builds separate even if you normally use a shared target directory. Cargo must request outputs for the second tree, so that Kache can restore them. Running Cargo again with an already populated target may do no compiler work and produce no new Kache events.
 
 ## Read the result
 

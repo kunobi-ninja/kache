@@ -17,15 +17,15 @@ Entries refer to blobs through metadata and the SQLite index. Identical bytes sh
 
 ## Restore methods
 
-Kache chooses the safest available method per artifact:
+Kache uses the first of these methods that applies to an artifact:
 
 1. copy-on-write clone on APFS, ReFS, btrfs, or reflink-capable XFS
 2. one exclusive Unix hardlink carrier for immutable `.rlib` and `.rmeta` artifacts, and on Linux for proc-macro libraries and build-script binaries
 3. byte copy
 
-Other executable and loadable outputs use clone or copy, never the hardlink fallback, because signing, stripping, or another consumer may modify them. Nothing rewrites a proc-macro library or a build-script binary after a restore, so on Linux they share the blob's inode when the blob is read-only and executable. A blob without every execute bit, such as one imported from a remote cache, is copied. Windows copies on non-CoW volumes unless the unsafe `windows_hardlink` option is enabled.
+Other executable and loadable outputs use clone or copy, never the hardlink fallback, because signing, stripping, or another consumer may modify them. On Linux, proc-macro libraries and build-script binaries share the blob's inode when the blob is read-only and executable, since nothing rewrites them after a restore. A blob without every execute bit, such as one imported from a remote cache, is copied. Windows copies on non-CoW volumes unless the unsafe `windows_hardlink` option is enabled.
 
-Restored reflinks and copies are writable by their owner, so a later compiler invocation can overwrite them after you remove the Kache wrapper. Adding owner write access to a reflink preserves its other permissions and leaves the cache blob read-only. A real hardlink shares permissions with the blob and stays read-only; rebuilding those outputs without Kache can require removing them first.
+Restored reflinks and copies are writable by their owner, so a later compiler invocation can overwrite them after you remove the Kache wrapper. Adding owner write access to a reflink preserves its other permissions and leaves the cache blob read-only. A hardlink carrier shares permissions with the blob and stays read-only; rebuilding those outputs without Kache can require removing them first.
 
 Reflinks have independent inodes. A later write copies changed blocks instead of modifying the store blob.
 
@@ -41,4 +41,4 @@ Run `kache targets` to see what deleting each target directory frees. `kache cle
 
 ## `dup` build events
 
-A `dup` event is not a restore and is not the dedup metric. It means the cache key missed, the compiler ran, and all resulting blobs were already present. Repeated dups can expose noisy or over-specific key inputs.
+A `dup` event means the cache key missed, the compiler ran, and all resulting blobs were already present. It is not a restore, and it is separate from the `Dedup` metric. Repeated dups can expose noisy or over-specific key inputs.

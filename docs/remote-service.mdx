@@ -32,11 +32,11 @@ cargo run -p kache-service
 
 The default bind address is `0.0.0.0:8080` and the default database path is `/var/lib/kache/planner.db`. Override them with `--bind` / `KACHE_PLANNER_BIND` and `--db-path` / `KACHE_PLANNER_DB_PATH`.
 
-See [Authentication](#authentication) to require a bearer.
+To require a bearer token, see [Authentication](#authentication).
 
 ## Authentication
 
-With no provider configured, the planner accepts anonymous requests. Configure any of these and `POST /v1/prefetch-plan` and `POST /v1/build-timelines` require a bearer that one of them accepts. The health, metrics and discovery endpoints stay open.
+With no provider configured, the planner accepts anonymous requests. Configure any of these and `POST /v1/prefetch-plan` and `POST /v1/build-timelines` require a bearer token that one of them accepts. The health, metrics and discovery endpoints stay open.
 
 | Provider | Service flags (env) | Clients |
 |---|---|---|
@@ -44,11 +44,11 @@ With no provider configured, the planner accepts anonymous requests. Configure a
 | Kunobi login (OIDC) | `--oidc-issuer` (`KACHE_PLANNER_OIDC_ISSUER`), `--oidc-client-id` (`KACHE_PLANNER_OIDC_CLIENT_ID`) | run `kache login` once |
 | GitHub Actions OIDC | `--github-oidc-audience` (`KACHE_PLANNER_GITHUB_AUDIENCE`), `--github-owner` (`KACHE_PLANNER_GITHUB_OWNERS`, comma list) | job has `permissions: id-token: write` |
 
-**Kunobi login.** Register a public OAuth client (PKCE, no secret) with redirect URI `http://localhost:8329/callback` and scopes `openid profile email offline_access`; enable the device grant for `kache login --device`. The client id is the accepted token audience. The service advertises the issuer and client id at `/.well-known/kunobi-auth`, which is how `kache login` finds them.
+**Kunobi login.** Register a public OAuth client (PKCE, no secret) with redirect URI `http://localhost:8329/callback` and scopes `openid profile email offline_access`. Enable the device grant for `kache login --device`. The client id is the accepted token audience. The service advertises the issuer and client id at `/.well-known/kunobi-auth`, which is how `kache login` finds them.
 
-**GitHub Actions.** Tokens must carry the configured audience, and their `repository_owner` claim must match one of the `--github-owner` values (case-insensitive). The service refuses to start with an audience but no owner, since that would trust every repository on GitHub. The kache client fetches the job's token itself when `ACTIONS_ID_TOKEN_REQUEST_URL` is present. Its audience is the planner's base URL (for example `https://kache.example.com`), which binds the token to this planner so no other endpoint can replay it; set the service's `--github-oidc-audience` to that URL.
+**GitHub Actions.** Tokens must carry the configured audience, and their `repository_owner` claim must match one of the `--github-owner` values (case-insensitive). The service refuses to start with an audience but no owner, since that would trust every repository on GitHub. The Kache client fetches the job's token itself when `ACTIONS_ID_TOKEN_REQUEST_URL` is present. Its audience is the planner's base URL (for example `https://kache.example.com`), which binds the token to this planner so no other endpoint can replay it. Set the service's `--github-oidc-audience` to that URL.
 
-Clients send these automatic credentials only to a planner reached over HTTPS (or on loopback), and a Kunobi session only to a planner trusted with `kache login`.
+Clients send these automatic credentials only to a planner reached over HTTPS (or on loopback). They send a Kunobi session only to a planner trusted with `kache login`.
 
 A client that cannot authenticate plans locally, exactly as when the planner is unreachable.
 

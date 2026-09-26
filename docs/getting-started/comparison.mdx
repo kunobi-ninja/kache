@@ -5,7 +5,7 @@ description: Choose a compiler cache based on the workflow you need
 
 Kache and [sccache](https://github.com/mozilla/sccache#readme) both avoid repeated compiler work. This page explains the differences for teams moving to Kache or deciding whether it covers their build today.
 
-This page describes the current projects; it does not claim that one cache is universally faster. Test the same repository, toolchain, runner, and remote before deciding.
+It describes both projects as they are today and does not rank their speed. Test the same repository, toolchain, runner, and remote before deciding.
 
 ## Main differences
 
@@ -19,7 +19,7 @@ This page describes the current projects; it does not claim that one cache is un
 | Remote transfer | On-demand restore plus `sync`, manifests, and prefetch | Remote access is part of normal server operation |
 | Rust executables | Cacheable by default on Linux and macOS | Rust crates that invoke the system linker are not cached, according to the sccache README |
 | Incremental Rust builds | Kache disables or isolates incremental state according to its configured policy | Incrementally compiled Rust crates are not cached, according to the sccache README |
-| Fallback | Hands work it does not cache to another wrapper, such as sccache | No Kache-specific handoff needed |
+| Fallback | Passes invocations it does not cache to another wrapper, such as sccache | No Kache-specific handoff needed |
 
 ## Choose Kache when
 
@@ -31,7 +31,7 @@ This page describes the current projects; it does not claim that one cache is un
 
 ## Gaps sccache can fill
 
-If you need a compiler Kache does not cache yet, [use sccache as a fallback](#use-sccache-as-a-fallback). Kache caches what it supports and passes the rest to sccache, so you do not have to choose one.
+If you need a compiler Kache does not cache yet, [use sccache as a fallback](#use-sccache-as-a-fallback). Kache caches what it supports and passes the rest to sccache, so one build can use both.
 
 If a missing compiler, backend, or workflow still blocks you, [open a feature request](https://github.com/kunobi-ninja/kache/issues/new?template=feature_request.md). Include the build command and the compiler or backend. Concrete workloads help us prioritize support.
 
@@ -68,11 +68,11 @@ compiler. A genuine source error can therefore be reported twice.
 
 On macOS, Kache also checks the output access of an identifiable local sccache TCP
 server. A confirmed sandbox denial skips the fallback before compilation. This
-optional check respects `SCCACHE_SERVER_PORT`; Unix sockets, unidentified servers,
-and unavailable sandbox queries use normal fallback execution and failure recovery.
-Kache does not start, stop, or change the server during this check. A server that
-starts after the check can still inherit its launcher's sandbox, so recovery remains
-necessary. Use `KACHE_FALLBACK=off` to disable the fallback for a build.
+optional check respects `SCCACHE_SERVER_PORT`. With a Unix socket, an unidentified
+server, or no sandbox query available, Kache runs the fallback as usual and retries
+with the direct compiler if it fails. Kache does not start, stop, or change the
+server during this check. A server that starts after the check can still inherit
+its launcher's sandbox, so the retry is still needed. Use `KACHE_FALLBACK=off` to disable the fallback for a build.
 
 Build events and JSON report bypass details include `fallback_attempt` with the
 wrapper, outcome, status, and diagnostic reason. The final `route` and `exit_code`

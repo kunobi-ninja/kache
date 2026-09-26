@@ -72,7 +72,7 @@ The configuration fields also have environment overrides:
 | `KACHE_S3_PROFILE` | `profile` |
 | `KACHE_S3_USER_AGENT` | `user_agent` |
 
-For a persistent daemon, put remote settings in the config file or service definition. An auto-started daemon does not take per-build remote variables from whichever build happened to start first. `kache doctor` and `kache stats` report mismatches between client and daemon configuration.
+For a persistent daemon, put remote settings in the config file or service definition. An auto-started daemon does not take per-build remote variables from the build that started it. `kache doctor` and `kache stats` report mismatches between client and daemon configuration.
 
 ## Compatibility boundaries
 
@@ -97,9 +97,9 @@ Remote packs use zstd; local blobs remain uncompressed. Configure the level with
 
 Each v3 entry download is limited to 8 GiB of compressed data and 8 GiB of extracted file data. Kache rejects an oversized download before restoring it; a compiler invocation recompiles when the remote entry cannot be restored. These are per-entry limits, not a total memory budget for concurrent downloads.
 
-Buffered downloads also share a 512 MiB admission budget per Kache process, including space for temporary copying. Larger requests run alone under the existing per-entry limits. Decoders and parsed metadata use memory outside this budget.
+Buffered downloads also share a 512 MiB memory budget per Kache process, including space for temporary copying. Larger requests run alone under the existing per-entry limits. Decoders and parsed metadata use memory outside this budget.
 
-kache never deletes remote objects. Bound the bucket with a lifecycle rule; [Bound a remote](/docs/remote-cache/bounding) lists the prefixes and ages.
+Kache never deletes remote objects. Bound the bucket with a lifecycle rule; [Bound a remote](/docs/remote-cache/bounding) lists the prefixes and ages.
 
 ## macOS LAN access
 

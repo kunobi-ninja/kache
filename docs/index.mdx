@@ -19,11 +19,11 @@ Then enable it:
 kache init
 ```
 
-That's it. Keep running `cargo build` as usual; Kache now caches the compiler outputs.
+Keep running `cargo build` as usual; Kache now caches the compiler outputs.
 
 `kache init` sets Cargo's `rustc-wrapper` and installs a login service for the background cache. It asks before each change and backs up files it edits.
 
-[Other install methods](/docs/getting-started/installation) include Homebrew, APT, winget, and Nix. The [quick start](/docs/getting-started/quick-start) shows how to confirm cache hits. Comparing compiler caches? Read [Kache or sccache?](/docs/getting-started/comparison).
+[Other install methods](/docs/getting-started/installation) include Homebrew, APT, winget, and Nix. The [quick start](/docs/getting-started/quick-start) shows how to confirm cache hits. For a comparison with sccache, read [Kache or sccache?](/docs/getting-started/comparison).
 
 ## Current support
 

@@ -295,6 +295,31 @@ pub fn begin_miss(
     scheduler.begin_miss(identity, crate_name, is_link, lease)
 }
 
+/// A permit for a compile that runs before it has a key: the compile-first C
+/// path, whose discovery flight already keeps two processes from compiling the
+/// same unit. Same pool and weights as [`begin_miss`], no flight lock. The pool
+/// is what keeps builds that run their own jobs side by side (`make -j` next to
+/// `cargo -j`) from oversubscribing the machine, so a compile must not skip it
+/// just because its key comes later.
+pub fn begin_keyless_compile(
+    cache_dir: &Path,
+    enabled: bool,
+    crate_name: &str,
+    is_link: bool,
+    lease: Option<&Path>,
+) -> MissGuard {
+    if !enabled {
+        return MissGuard::empty();
+    }
+    match Scheduler::open(cache_dir) {
+        Ok(scheduler) => scheduler.keyless_compile(crate_name, is_link, lease),
+        Err(error) => {
+            tracing::debug!("scheduler unusable ({error:#}); compiling without a permit");
+            MissGuard::empty()
+        }
+    }
+}
+
 enum FlightJoin {
     Owner(StoreLock),
     Waited,
@@ -365,6 +390,19 @@ impl Scheduler {
             }
             FlightJoin::Waited => BeginMiss::Recheck,
             FlightJoin::FailOpen => BeginMiss::Compile(MissGuard::empty()),
+        }
+    }
+
+    fn keyless_compile(&self, crate_name: &str, is_link: bool, lease: Option<&Path>) -> MissGuard {
+        let permit = if lease_covers(lease, &self.root) {
+            None
+        } else {
+            self.acquire_permit(self.weight_for(crate_name, is_link))
+        };
+        MissGuard {
+            _permit: permit,
+            _flight: None,
+            weights_dir: Some(self.weights_dir()),
         }
     }
 
@@ -2724,6 +2762,35 @@ mod tests {
             "an uncovered miss takes a permit"
         );
         assert_eq!(permits_in_use(dir.path()), Some(1));
+    }
+
+    /// A compile that runs before its key takes a pool slot and no flight,
+    /// unless the scheduler is off or a test lease covers it.
+    #[test]
+    fn a_keyless_compile_takes_a_permit_and_no_flight() {
+        let dir = temp_cache();
+        let scheduler = budget_scheduler(dir.path(), 2);
+
+        let guard = scheduler.keyless_compile("c_unit", false, None);
+        assert!(guard._permit.is_some(), "a keyless compile takes a permit");
+        assert!(guard._flight.is_none(), "its discovery flight dedupes it");
+        assert_eq!(permits_in_use(dir.path()), Some(1));
+        drop(guard);
+        assert_eq!(permits_in_use(dir.path()), Some(0));
+
+        fs::create_dir_all(tests_dir(&scheduler.root)).unwrap();
+        let marker = tests_dir(&scheduler.root).join("1");
+        let covered = scheduler.keyless_compile("c_unit", false, Some(&marker));
+        assert!(
+            covered._permit.is_none(),
+            "a covered compile takes no permit"
+        );
+
+        let disabled = begin_keyless_compile(dir.path(), false, "c_unit", false, None);
+        assert!(disabled.is_empty());
+        let enabled = begin_keyless_compile(dir.path(), true, "c_unit", false, None);
+        assert!(!enabled.is_empty());
+        assert!(permits_in_use(dir.path()).is_some_and(|held| held >= 1));
     }
 
     #[test]

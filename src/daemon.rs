@@ -352,7 +352,17 @@ pub(crate) enum Request {
     /// A wrapper recorded a portable row; the daemon stores it on a writable
     /// remote in the background.
     PredictionPublish(PredictionPublishRequest),
+    /// A build of a target directory started: copy its recorded large
+    /// executables beside their destinations (see [`crate::prestage`]).
+    /// Fire-and-forget; older daemons reject the unknown variant and the
+    /// restore copies as before.
+    Prestage(PrestageRequest),
     Shutdown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PrestageRequest {
+    pub target_dir: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -3364,6 +3374,7 @@ impl Daemon {
             | Request::PublishCc(_)
             | Request::PredictionFetch(_)
             | Request::PredictionPublish(_)
+            | Request::Prestage(_)
             | Request::BuildStarted(_) => {
                 // These require async — caller must use their async handlers
                 Response::err(
@@ -6438,6 +6449,20 @@ impl Daemon {
         !self.gc_hint_pending.swap(true, Ordering::SeqCst)
     }
 
+    /// Stage the target directory's recorded executables in the background;
+    /// the wrapper that hinted does not wait.
+    fn handle_prestage(self: &Arc<Self>, req: &PrestageRequest) -> Response {
+        let cache_dir = self.config.cache_dir.clone();
+        let store_dir = self.config.store_dir();
+        let target_dir = PathBuf::from(&req.target_dir);
+        tokio::task::spawn_blocking(move || {
+            crate::prestage::stage(&cache_dir, &target_dir, |hash| {
+                crate::store::blob_path_in_store_dir(&store_dir, hash)
+            });
+        });
+        Response::ok()
+    }
+
     /// A wrapper's size-pressure hint: acknowledge now, sweep on the blocking
     /// pool (#281). One sweep, where the wrapper's own worker sweeps twice:
     /// that worker exits and has no later chance at entries a live build
@@ -6709,11 +6734,14 @@ impl Daemon {
         // Key lock files and input predictions grow with every distinct key
         // and eviction removes neither (#1126). Still under gc.lock.
         let housekeeping = gc_store.sweep_housekeeping();
+        let prestage_pruned =
+            crate::prestage::prune(&self.config.cache_dir, std::time::SystemTime::now());
         tracing::info!(
             key_locks_removed = housekeeping.key_locks_removed,
             key_locks_remaining = housekeeping.key_locks_remaining,
             predictions_pruned = housekeeping.predictions_pruned,
             file_hashes_pruned = housekeeping.file_hashes_pruned,
+            prestage_pruned,
             "gc: housekeeping"
         );
 
@@ -8286,6 +8314,7 @@ async fn handle_connection_started_at(
                 offload(move || d.handle_gc(&req)).await
             }
             Ok(Request::GcHint) => daemon.handle_gc_hint(),
+            Ok(Request::Prestage(req)) => daemon.handle_prestage(&req),
             Ok(Request::RemoteCheck(req)) => {
                 daemon
                     .handle_remote_check_started_at(&req, request_started_at)
@@ -8753,6 +8782,17 @@ pub fn send_build_started(config: &Config, req: BuildStartedRequest) {
         Err(e) => {
             tracing::debug!("build-started hint: daemon unreachable ({e}), skipping");
         }
+    }
+}
+
+/// Hint the daemon to stage `target_dir`'s recorded executables.
+/// Non-blocking, fire-and-forget.
+pub fn send_prestage(config: &Config, target_dir: &Path) {
+    let req = Request::Prestage(PrestageRequest {
+        target_dir: target_dir.to_string_lossy().into_owned(),
+    });
+    if let Err(e) = send_request_fire_and_forget(&config.socket_path(), &req) {
+        tracing::debug!("prestage hint: daemon unreachable ({e}), skipping");
     }
 }
 
@@ -20826,6 +20866,57 @@ mod tests {
         .unwrap();
         // The server received and handled the hint without error.
         server.await.unwrap();
+    }
+
+    /// A prestage hint reaches the daemon, which stages the executable the
+    /// target directory recorded beside its missing destination.
+    #[tokio::test]
+    async fn a_prestage_hint_stages_the_recorded_executable() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let content = b"an executable";
+        let hash = blake3::hash(content).to_hex().to_string();
+        let blob = crate::store::blob_path_in_store_dir(&config.store_dir(), &hash);
+        std::fs::create_dir_all(blob.parent().unwrap()).unwrap();
+        std::fs::write(&blob, content).unwrap();
+        let target = dir.path().join("work/target");
+        let dest = target.join("debug/deps/app-0123456789abcdef");
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        crate::prestage::remember(
+            &config.cache_dir,
+            &target,
+            &dest,
+            &hash,
+            crate::prestage::MIN_BYTES,
+        );
+
+        let socket_path = config.socket_path();
+        std::fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
+        let listener = bind_listener(&socket_path);
+        let daemon = Arc::new(Daemon::new(config.clone()));
+        let server = tokio::spawn(async move {
+            let stream = tokio::time::timeout(Duration::from_secs(10), listener.accept())
+                .await
+                .expect("the hint reaches the daemon")
+                .expect("accept");
+            let _ = handle_connection(stream, &daemon, &Arc::new(Lifecycle::default())).await;
+        });
+        let cfg = config.clone();
+        let hinted = target.clone();
+        tokio::task::spawn_blocking(move || send_prestage(&cfg, &hinted))
+            .await
+            .unwrap();
+        server.await.unwrap();
+
+        let staged = crate::prestage::staged_path(&dest, &hash).unwrap();
+        for _ in 0..100 {
+            if crate::prestage::take(&dest, &hash) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(std::fs::read(&dest).unwrap(), content);
+        assert!(!staged.exists());
     }
 
     #[tokio::test]

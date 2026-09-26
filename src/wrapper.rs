@@ -3643,6 +3643,10 @@ fn run_parsed_rustc(
 
     drop(trace_store_open);
     let trace_remember = crate::phase_trace::phase("remember_target_root");
+    // Any unit may be a build's first; the hint is rate-limited per target.
+    if let Some(target_dir) = prestage_target_dir(args) {
+        crate::prestage::maybe_hint(config, &target_dir);
+    }
     if args.is_primary
         && let Some(target_dir) = args.target_dir()
         && let Some(workspace_root) = workspace_root.as_deref()
@@ -4313,6 +4317,15 @@ fn run_parsed_rustc(
             {
                 tracing::debug!("recording the unit of {crate_name}'s entry failed: {e}");
             }
+            // A large executable just stored is the next build's restore.
+            if stores_prestage_candidate(&prepared_store.files)
+                && let Some(output_dir) = rustc_output_dir(args)
+                && let Some(meta) = store.stored_meta(&cache_key)
+            {
+                let shared =
+                    shared_inode_loadable(args, platform::current().may_share_restored_loadables());
+                remember_prestaged_executables(config, compiler, args, &output_dir, shared, &meta);
+            }
             // Store grew — throttled size check + detached background GC if over
             // budget (kunobi-ninja/kache#497). Never blocks the compile path.
             maybe_spawn_auto_gc(config, &store);
@@ -4748,6 +4761,88 @@ fn wants_debug_bundle(args: &RustcArgs) -> bool {
     args.is_user_facing_executable() && rustc_debuginfo_enabled(args)
 }
 
+/// Whether a store's outputs include a file large enough to prestage.
+fn stores_prestage_candidate(files: &[(PathBuf, String)]) -> bool {
+    files.iter().any(|(path, _)| {
+        std::fs::metadata(path).is_ok_and(|m| m.len() >= crate::prestage::MIN_BYTES)
+    })
+}
+
+/// Whether a copy the daemon staged for `cached_file` took its place at
+/// `target_path` ([`crate::prestage`]). Only a large private copy is staged.
+fn take_prestaged(
+    strategy: link::LinkStrategy,
+    cached_file: &crate::store::CachedFile,
+    target_path: &Path,
+) -> bool {
+    strategy == link::LinkStrategy::Copy
+        && cached_file.size >= crate::prestage::MIN_BYTES
+        && crate::prestage::take(target_path, &cached_file.hash)
+}
+
+/// The target directory a compile writes under, for [`crate::prestage`].
+/// [`RustcArgs::target_dir`] answers the profile directory for a build
+/// script compiled into `<profile>/build/<unit>`; this answers its parent.
+fn prestage_target_dir(args: &RustcArgs) -> Option<PathBuf> {
+    if let Some(out_dir) = &args.out_dir
+        && let Some(profile) = crate::cargo_layout::build_script_dir_profile(out_dir)
+    {
+        return profile.parent().map(Path::to_path_buf);
+    }
+    args.target_dir()
+}
+
+/// Where a compile's outputs go: the `-o` path's directory, or `--out-dir`.
+fn rustc_output_dir(args: &RustcArgs) -> Option<PathBuf> {
+    match (&args.output, &args.out_dir) {
+        (Some(output), _) => Some(output.parent().unwrap_or(Path::new(".")).to_path_buf()),
+        (None, Some(dir)) => Some(dir.clone()),
+        (None, None) => None,
+    }
+}
+
+/// Where a cached output goes: the exact `-o` path for the primary output
+/// in `-o` mode, the output directory for everything else.
+fn artifact_target_path(args: &RustcArgs, output_dir: &Path, name: &str) -> PathBuf {
+    match &args.output {
+        Some(output) if name == output.file_name().unwrap_or_default().to_string_lossy() => {
+            output.clone()
+        }
+        _ => output_dir.join(name),
+    }
+}
+
+/// Record the entry's large private-copy executables for this target
+/// directory, so the daemon can copy them ahead of the next build's restore
+/// (crate::prestage).
+fn remember_prestaged_executables(
+    config: &Config,
+    compiler: &RustcCompiler,
+    args: &RustcArgs,
+    output_dir: &Path,
+    shared_loadable: Option<ArtifactKind>,
+    meta: &crate::store::EntryMeta,
+) {
+    let Some(target_dir) = prestage_target_dir(args) else {
+        return;
+    };
+    for file in &meta.files {
+        let kind = compiler.classify_output(args, &file.name);
+        if file.size >= crate::prestage::MIN_BYTES
+            && restore_link_strategy(kind, file.executable, shared_loadable)
+                == link::LinkStrategy::Copy
+        {
+            crate::prestage::remember(
+                &config.cache_dir,
+                &target_dir,
+                &artifact_target_path(args, output_dir, &file.name),
+                &file.hash,
+                file.size,
+            );
+        }
+    }
+}
+
 /// How to materialize one restored artifact.
 ///
 /// `kind` comes from the compile context, which does not always identify an
@@ -4926,13 +5021,18 @@ fn materialize_cached_artifact(
                 .with_context(|| format!("{context}: writing {}", target_path.display()))?;
         }
         None => {
-            link::link_to_target(&store_path, target_path, strategy).with_context(|| {
-                format!(
-                    "{context}: linking {} -> {}",
-                    store_path.display(),
-                    target_path.display()
-                )
-            })?;
+            // A large executable may already sit beside its destination,
+            // copied by the daemon while the build ran (crate::prestage).
+            let staged = take_prestaged(strategy, cached_file, target_path);
+            if !staged {
+                link::link_to_target(&store_path, target_path, strategy).with_context(|| {
+                    format!(
+                        "{context}: linking {} -> {}",
+                        store_path.display(),
+                        target_path.display()
+                    )
+                })?;
+            }
             // A link/clone keeps the blob's old mtime, so it must be
             // re-stamped to read as "written now" — through the same clock
             // ordinary file writes use; see `touch_mtime_write_clock` for
@@ -5948,12 +6048,7 @@ fn restore_from_cache(
         );
     }
 
-    // Determine where output files go: either -o parent dir, or --out-dir
-    let output_dir = if let Some(output) = &args.output {
-        output.parent().unwrap_or(Path::new(".")).to_path_buf()
-    } else if let Some(dir) = &args.out_dir {
-        dir.clone()
-    } else {
+    let Some(output_dir) = rustc_output_dir(args) else {
         anyhow::bail!("no output path (-o) or output directory (--out-dir) in args");
     };
 
@@ -6084,6 +6179,7 @@ fn restore_from_cache(
         platform.name()
     );
     let shared_loadable = shared_inode_loadable(args, platform.may_share_restored_loadables());
+    remember_prestaged_executables(config, compiler, args, &output_dir, shared_loadable, meta);
 
     // Artifacts that came back as verbatim blob copies, each paired with the
     // digest the entry already recorded for it (kunobi-ninja/kache#540).
@@ -6103,17 +6199,7 @@ fn restore_from_cache(
             );
         }
 
-        // For -o mode, the primary output goes to the exact -o path;
-        // for --out-dir mode, everything goes into the directory.
-        let target_path = if let Some(output) = &args.output {
-            if cached_file.name == output.file_name().unwrap_or_default().to_string_lossy() {
-                output.clone()
-            } else {
-                output_dir.join(&cached_file.name)
-            }
-        } else {
-            output_dir.join(&cached_file.name)
-        };
+        let target_path = artifact_target_path(args, &output_dir, &cached_file.name);
 
         // Per-file dispatch by artifact kind: `classify_output` picks
         // the kind, `plan_post_restore` the actions — no ad-hoc filename
@@ -8979,6 +9065,159 @@ mod tests {
         ] {
             assert_eq!(rustc_output_in(reason), "", "{reason}");
         }
+    }
+
+    #[test]
+    fn a_prestage_candidate_is_a_stored_file_of_at_least_the_threshold() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = |name: &str, len: u64| {
+            let path = dir.path().join(name);
+            std::fs::File::create(&path).unwrap().set_len(len).unwrap();
+            (path, name.to_string())
+        };
+        let below = file("below", crate::prestage::MIN_BYTES - 1);
+        let at = file("at", crate::prestage::MIN_BYTES);
+        assert!(!stores_prestage_candidate(std::slice::from_ref(&below)));
+        assert!(stores_prestage_candidate(&[below, at]));
+    }
+
+    /// A staged copy is taken only for a large file restored as a private
+    /// copy; a linked restore leaves it alone.
+    #[test]
+    fn only_a_large_private_copy_takes_a_staged_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob = dir.path().join("blob");
+        std::fs::write(&blob, b"an executable").unwrap();
+        let hash = blake3::hash(b"an executable").to_hex().to_string();
+        let dest = dir.path().join("app-0123456789abcdef");
+        crate::prestage::stage_for_test(&dest, &blob, &hash);
+        let staged = crate::prestage::staged_path(&dest, &hash).unwrap();
+        let mut file = cached_file("app-0123456789abcdef", &hash);
+
+        file.size = crate::prestage::MIN_BYTES;
+        assert!(!take_prestaged(link::LinkStrategy::Hardlink, &file, &dest));
+        assert!(staged.exists() && !dest.exists());
+        file.size = crate::prestage::MIN_BYTES - 1;
+        assert!(!take_prestaged(link::LinkStrategy::Copy, &file, &dest));
+        assert!(staged.exists() && !dest.exists());
+        file.size = crate::prestage::MIN_BYTES;
+        assert!(take_prestaged(link::LinkStrategy::Copy, &file, &dest));
+        assert_eq!(std::fs::read(&dest).unwrap(), b"an executable");
+    }
+
+    /// Only large executables restored as private copies are recorded: not
+    /// small ones, and not large outputs that restore as links.
+    #[test]
+    fn only_large_private_copies_are_recorded_for_prestaging() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path().join("cache"));
+        let out_dir = dir.path().join("target/debug/deps");
+        let args = rustc_args(&[
+            "rustc",
+            "main.rs",
+            "--crate-name",
+            "app",
+            "--crate-type",
+            "bin",
+            "--out-dir",
+            out_dir.to_str().unwrap(),
+            "-C",
+            "extra-filename=-0123456789abcdef",
+        ]);
+        let file = |name: &str, size: u64, executable: bool| {
+            let mut file = cached_file(name, &"a".repeat(64));
+            file.size = size;
+            file.executable = executable;
+            file
+        };
+        let meta = entry_meta(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            vec![
+                file("app-0123456789abcdef", crate::prestage::MIN_BYTES, true),
+                file(
+                    "tool-0123456789abcdef",
+                    crate::prestage::MIN_BYTES - 1,
+                    true,
+                ),
+                file(
+                    "libapp-0123456789abcdef.rlib",
+                    crate::prestage::MIN_BYTES,
+                    false,
+                ),
+            ],
+            &["link"],
+        );
+        remember_prestaged_executables(
+            &config,
+            &RustcCompiler::new(),
+            &args,
+            &out_dir,
+            None,
+            &meta,
+        );
+        assert_eq!(
+            crate::prestage::recorded_dests(&config.cache_dir),
+            vec![out_dir.join("app-0123456789abcdef")]
+        );
+    }
+
+    /// In `-o` mode the primary output goes to the exact `-o` path, and
+    /// every other output into the output directory.
+    #[test]
+    fn artifact_target_path_keeps_the_exact_output_path() {
+        let args = rustc_args(&["rustc", "main.rs", "--crate-name", "app", "-o", "out/app"]);
+        let elsewhere = Path::new("/elsewhere");
+        assert_eq!(
+            artifact_target_path(&args, elsewhere, "app"),
+            PathBuf::from("out/app")
+        );
+        assert_eq!(
+            artifact_target_path(&args, elsewhere, "app.d"),
+            elsewhere.join("app.d")
+        );
+        assert_eq!(rustc_output_dir(&args), Some(PathBuf::from("out")));
+    }
+
+    /// Prestage records and hints go to the target directory itself, also
+    /// for a build script compiled into `<profile>/build/<unit>`, where
+    /// `RustcArgs::target_dir` answers the profile directory.
+    #[test]
+    fn prestage_target_dir_is_the_target_root_for_every_unit() {
+        let parse = |out_dir: &str, target: Option<&str>| {
+            let mut argv = vec![
+                "rustc".to_string(),
+                "--crate-name".to_string(),
+                "build_script_build".to_string(),
+                "build.rs".to_string(),
+                "--out-dir".to_string(),
+                out_dir.to_string(),
+            ];
+            if let Some(target) = target {
+                argv.extend(["--target".to_string(), target.to_string()]);
+            }
+            RustcArgs::parse(&argv).unwrap()
+        };
+        let root = Some(PathBuf::from("/w/target"));
+        for (out_dir, target) in [
+            ("/w/target/debug/build/app-0123456789abcdef", None),
+            ("/w/target/debug/build/app/0123456789abcdef/out", None),
+            ("/w/target/debug/deps", None),
+            (
+                "/w/target/x86_64-unknown-linux-gnu/debug/deps",
+                Some("x86_64-unknown-linux-gnu"),
+            ),
+        ] {
+            assert_eq!(
+                prestage_target_dir(&parse(out_dir, target)),
+                root,
+                "{out_dir}"
+            );
+        }
+        assert_eq!(
+            parse("/w/target/debug/build/app-0123456789abcdef", None).target_dir(),
+            Some(PathBuf::from("/w/target/debug")),
+            "the case prestage_target_dir corrects"
+        );
     }
 
     #[test]

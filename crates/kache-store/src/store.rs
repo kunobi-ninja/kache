@@ -2174,6 +2174,14 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             .unwrap_or(false)
     }
 
+    /// An entry's `meta.json` as written, with none of [`Store::get`]'s work:
+    /// no blob verification, hit accounting or eviction. For a caller that
+    /// just stored the entry and wants its file list.
+    pub fn stored_meta(&self, cache_key: &str) -> Option<EntryMeta> {
+        let content = fs::read(self.entry_dir(cache_key).join("meta.json")).ok()?;
+        serde_json::from_slice(&content).ok()
+    }
+
     /// Load metadata for a cached entry and record a hit.
     pub fn get(&self, cache_key: &str) -> Result<Option<EntryMeta>> {
         if !self.contains(cache_key) {
@@ -6797,6 +6805,34 @@ mod tests {
             let leftovers: Vec<_> = fs::read_dir(&staging).unwrap().flatten().collect();
             assert!(leftovers.is_empty(), "staging litter: {leftovers:?}");
         }
+    }
+
+    /// `stored_meta` reads back what a put wrote, and nothing for a key that
+    /// was never stored.
+    #[test]
+    fn stored_meta_reads_the_entry_a_put_wrote() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+        let output_file = dir.path().join("out.rlib");
+        fs::write(&output_file, b"rlib bytes").unwrap();
+        store
+            .put(
+                "stored_key",
+                "crate",
+                &["lib".to_string()],
+                &[],
+                "x86_64-unknown-linux-gnu",
+                "dev",
+                &[(output_file, "libout.rlib".to_string())],
+                "",
+                "",
+            )
+            .unwrap();
+        let meta = store.stored_meta("stored_key").unwrap();
+        assert_eq!(meta.files.len(), 1);
+        assert_eq!(meta.files[0].name, "libout.rlib");
+        assert!(store.stored_meta("never_stored").is_none());
     }
 
     /// A refused zero-byte artifact must clean up its staged snapshot; a

@@ -117,10 +117,27 @@ impl FileSizing {
     }
 
     /// Shared bytes that no other live file holds, only snapshots. `None`
-    /// when the platform does not report the clone group's size.
+    /// when the platform does not report the clone group's size, or when the
+    /// group's size cannot tell a snapshot from a live file.
+    ///
+    /// APFS counts only the files still in an unmodified clone group. A
+    /// clone that is written to leaves the group and gets a new clone id,
+    /// while it keeps sharing every block it did not rewrite. Partly
+    /// rewriting a clone therefore leaves both files partly shared with a
+    /// refcount of 1 each. A store blob is never written after it is stored,
+    /// so a blob that is partly shared was partly rewritten through a live
+    /// clone, and its shared bytes stay unknown. Appending to a clone leaves
+    /// the blob fully shared with a refcount of 1, which reads the same as
+    /// a snapshot and is counted as one (kunobi-ninja/kache#1195).
     pub fn snapshot_held(&self) -> Option<u64> {
         match self.clone_refcount? {
-            0 | 1 => self.shared(),
+            // APFS also reports `Partial` for a former clone that shares
+            // nothing any more, which leaves no bytes to attribute.
+            0 | 1 => match self.shared()? {
+                0 => Some(0),
+                _ if self.sharing == Sharing::Partial => None,
+                shared => Some(shared),
+            },
             _ => Some(0),
         }
     }
@@ -1128,6 +1145,41 @@ mod tests {
             .snapshot_held(),
             None,
             "unknown private bytes leave the snapshot share unknown"
+        );
+        for alone in [0, 1] {
+            assert_eq!(
+                FileSizing {
+                    unique: Some(1024),
+                    sharing: Sharing::Partial,
+                    clone_refcount: Some(alone),
+                    ..full
+                }
+                .snapshot_held(),
+                None,
+                "a partly rewritten live clone also reports a group of one"
+            );
+            assert_eq!(
+                FileSizing {
+                    unique: Some(4096),
+                    sharing: Sharing::Partial,
+                    clone_refcount: Some(alone),
+                    ..full
+                }
+                .snapshot_held(),
+                Some(0),
+                "a former clone that shares nothing holds nothing in snapshots"
+            );
+        }
+        assert_eq!(
+            FileSizing {
+                unique: Some(1024),
+                sharing: Sharing::Partial,
+                clone_refcount: Some(2),
+                ..full
+            }
+            .snapshot_held(),
+            Some(0),
+            "a partly shared file in a live group is held by that group"
         );
 
         let unknown = FileSizing {

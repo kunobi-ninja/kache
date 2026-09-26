@@ -752,4 +752,83 @@ mod tests {
 
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    /// Clone `blob` to `name` next to it, or `None` when `cp -c` is missing.
+    fn clone_of(blob: &Path, name: &str) -> Option<PathBuf> {
+        let clone = blob.with_file_name(name);
+        let status = Command::new("cp").arg("-c").arg(blob).arg(&clone).status();
+        status.ok()?.success().then_some(clone)
+    }
+
+    /// kunobi-ninja/kache#1195: writing to a clone takes it out of its clone
+    /// group while it keeps sharing the blocks it did not rewrite. The store
+    /// blob then reports a group of one although a live file holds its
+    /// blocks, so the refcount alone cannot say a snapshot holds them.
+    #[test]
+    fn a_rewritten_clone_leaves_the_group_but_keeps_sharing() {
+        use std::io::{Seek, SeekFrom, Write};
+
+        const MIB: u64 = 1024 * 1024;
+        let dir = std::env::temp_dir().join(format!("kache-fs-rewrite-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let Some(probe) = ApfsProbe::new(&dir) else {
+            return; // volume lacks the extended attributes
+        };
+        let blob = dir.join("blob");
+        std::fs::write(&blob, vec![7u8; 4 * MIB as usize]).unwrap();
+        let Some(target) = clone_of(&blob, "target") else {
+            return; // no cp -c: nothing to assert
+        };
+
+        // Overwrite the second MiB of the clone in place.
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&target)
+            .unwrap();
+        file.seek(SeekFrom::Start(MIB)).unwrap();
+        file.write_all(&vec![9u8; MIB as usize]).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+
+        let b = probe.measure_file(&blob).unwrap();
+        assert_eq!(b.sharing, Sharing::Partial, "3 MiB are still shared");
+        assert_eq!(b.shared(), Some(3 * MIB));
+        assert_eq!(
+            b.clone_refcount,
+            Some(1),
+            "the rewritten clone left the group"
+        );
+        assert_eq!(
+            b.snapshot_held(),
+            None,
+            "a live file holds the shared bytes, so they must not read as snapshot-held"
+        );
+
+        // Appending leaves every block of the blob shared, and APFS reports
+        // exactly what a snapshot-held blob reports. Pinned so a change in
+        // either direction is noticed.
+        let appended = dir.join("appended");
+        std::fs::write(&appended, vec![3u8; 2 * MIB as usize]).unwrap();
+        let Some(grown) = clone_of(&appended, "grown") else {
+            return;
+        };
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&grown)
+            .unwrap();
+        file.write_all(&vec![1u8; MIB as usize]).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+
+        let a = probe.measure_file(&appended).unwrap();
+        assert_eq!(a.sharing, Sharing::Full);
+        assert_eq!(a.clone_refcount, Some(1));
+        assert_eq!(
+            a.snapshot_held(),
+            Some(2 * MIB),
+            "indistinguishable from a snapshot: known limit of the refcount"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

@@ -49,7 +49,10 @@ fn wait_for_run_lock(cache_dir: &Path, timeout: std::time::Duration) -> bool {
 }
 
 /// How long a daemon may take to finish its queued publications and exit.
-const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(40);
+/// The daemon keeps publishing while it makes progress, and a large build
+/// (Firefox) can end with minutes of queued work, so this only guards
+/// against a daemon that never exits.
+const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 
 /// A benchmark must not read or replace a cache with queued publications.
 pub fn drain(kache_path: &Path, cache_dir: &Path) -> anyhow::Result<()> {

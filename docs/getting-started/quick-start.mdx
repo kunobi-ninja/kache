@@ -16,7 +16,7 @@ kache init
 kache doctor
 ```
 
-`init` configures Cargo's Rust wrapper and, when unset, `HOST_CC` / `HOST_CXX` for build-script C and C++. On Unix it also offers compiler-name shims and [test pacing](/docs/getting-started/configuration#test-runner), and everywhere a login service. It does not set `CC` or `CXX`. See [C and C++](/docs/getting-started/c-cpp) for native build setup.
+`kache init` configures Cargo's Rust wrapper. On Unix it also sets `HOST_CC` and `HOST_CXX` when unset, so Kache caches the C and C++ that build scripts compile, and offers compiler-name shims with a `PATH` line for your shell's startup file and [test pacing](/docs/getting-started/configuration#test-runner). It also offers a login service. It does not set `CC` or `CXX`. See [C and C++](/docs/getting-started/c-cpp) for native build setup.
 
 `doctor` checks the wrapper configuration, conflicting wrappers, cache configuration, daemon access, and compiler-name shims. Resolve any setup issues it reports before continuing.
 
@@ -53,19 +53,19 @@ Then build the same revision in the second worktree:
 )
 ```
 
-The explicit target paths keep the two builds separate even if you normally use a shared target directory. Cargo must request outputs for the second tree, giving Kache an opportunity to restore them. Running Cargo again with an already populated target can do no compiler work and produce no new Kache events.
+The explicit target paths keep the two builds separate even if you normally use a shared target directory. Cargo must request outputs for the second tree, so that Kache can restore them. Running Cargo again with an already populated target may do no compiler work and produce no new Kache events.
 
 ## Read the result
 
 Look for cache hits and restored bytes in the second tree's report. The first build may also have hits if the store already contains compatible results. Some compiler invocations pass through; check the report's bypass reasons before expecting every unit to hit.
 
-The report filters to the second tree's recorded events in the last 24 hours. On versions whose `kache report --help` lists `--last-build`, select just the latest recorded activity session:
+The report covers the second tree's recorded events from the last 24 hours. To see only the latest build session:
 
 ```bash
 kache report --last-build --root "$kache_trial/second"
 ```
 
-`--last-build` was added after Kache 0.16.0. A session can include nearby or concurrent Cargo commands in one root; it is not an exact Cargo invocation ID. Only completed, retained compiler events appear. See the [command reference](/docs/commands/reference#kache-report) for the selection rules.
+A session can include nearby or concurrent Cargo commands in one root; it is not an exact Cargo invocation ID. Only completed, retained compiler events appear. See the [command reference](/docs/commands/reference#kache-report) for the selection rules.
 
 Compiler work avoided is an aggregate estimate, not elapsed build time saved. This example demonstrates reuse; a speed comparison needs repeated measurements of the same workload. Rust hits also do not prove that C or C++ compilations were cached.
 
@@ -77,7 +77,7 @@ If the second build misses, run `kache why-miss <crate>` from that worktree, usi
 kache report --root "$kache_trial/second" --format markdown --output "$kache_trial/reuse.md"
 ```
 
-Add `--last-build` when your installed version supports it and you want the latest session. Open `reuse.md` before sharing it: reports include local paths and crate names, and store inventory covers the whole cache. The command writes a local file; publication is a separate action.
+Add `--last-build` to report only the latest session. Open `reuse.md` before sharing it: reports include local paths and crate names, and store inventory covers the whole cache. The command writes a local file; publication is a separate action.
 
 Kache is built by [Kunobi](https://kunobi.ninja/). When sharing a result, link this walkthrough so someone else can reproduce it.
 

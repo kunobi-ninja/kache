@@ -38,14 +38,14 @@ nvcc -dc src/kernel.cu -o build/kernel.o
 nvcc -dlink build/kernel.o build/helper.o -o build/device-link.o
 ```
 
-`nvcc` is a driver: one `-c` invocation fans out to the device frontend, one compiler pair per GPU architecture, the fatbinary bundler, and the host C++ compiler. Kache caches the whole invocation as one entry. On a miss it runs `nvcc` end to end and stores the final object; on a hit it restores the object (and the `-MF` dep-info sidecar, when requested) and skips the toolchain.
+`nvcc` is a driver: one `-c` invocation fans out to the device frontend, one compiler pair per GPU architecture, the fatbinary bundler, and the host C++ compiler. Kache caches the whole invocation as one entry. On a miss it runs `nvcc` end to end and stores the final object. On a hit it restores the object (and the `-MF` dep-info sidecar, when requested) and skips the toolchain.
 
 ### Why the key is sound
 
 `nvcc -E` is not a safe cache key: it always defines `__CUDA_ARCH__`, so host-only code guarded by `#ifndef __CUDA_ARCH__` is invisible in its output. Kache does not hash preprocessed output. The key is built from:
 
 - `nvcc`'s version and the host compiler's version (a host upgrade changes the object, probed via `nvcc --dryrun`);
-- the modeled flags verbatim — `-dc` / `-rdc` mode, GPU `-arch` / `-gencode` / `-code`, `-std`, `-O`, defines, and the `-Xcompiler` / `-Xptxas` forwarding flags;
+- the modeled flags verbatim: `-dc` / `-rdc` mode, GPU `-arch` / `-gencode` / `-code`, `-std`, `-O`, defines, and the `-Xcompiler` / `-Xptxas` forwarding flags;
 - the dependency closure: the raw content of the source plus every header `nvcc -M` reports. Hashing raw contents (not preprocessed output) captures host-only code, so any source or header edit invalidates the entry.
 - the driver environment: `NVCC_PREPEND_FLAGS` / `NVCC_APPEND_FLAGS` are folded in verbatim, so the same checkout with different driver flags keys apart.
 
@@ -60,12 +60,12 @@ Anything Kache does not model runs the real `nvcc` uncached, including:
 - link and device-link (`-dlink`) modes, `--lib`, multi-source compiles;
 - standalone `-ptx` / `-cubin` / `-fatbin` / `--optix-ir` emission;
 - device debug (`-G`);
-- machine-resolved values (`-march=native`, `-arch=native`, …) — one key must never cover different objects, so these refuse even when allow-listed;
-- dependency generation without an explicit output (`-M`, `-MM`) or without `-MF` (`-MD`, `-MMD` alone) — combine `-MD`/`-MMD` with `-MF <file>` instead;
+- machine-resolved values (`-march=native`, `-arch=native`, …). One key must never cover different objects, so these refuse even when allow-listed;
+- dependency generation without an explicit output (`-M`, `-MM`) or without `-MF` (`-MD`, `-MMD` alone). Combine `-MD`/`-MMD` with `-MF <file>` instead;
 - compiles without `-o`;
 - `-keep` / `--save-temps`, profiling (`--time`), response files (`@file`);
 - any flag outside the built-in table (see below).
 
-To opt an unmodeled-but-safe flag into caching, add it to the extra allow-list (`[cc] extra_allowlist_flags` or `KACHE_CC_EXTRA_ALLOWLIST_FLAGS`), which the `nvcc` adapter also honors. List explicit flag values. Flags that hide preprocessor inputs (`-Xcompiler -I…`, `-Xcompiler -D…`) stay refused: they would escape dependency tracking.
+To cache a flag that Kache does not model but you know is safe, add it to the extra allow-list (`[cc] extra_allowlist_flags` or `KACHE_CC_EXTRA_ALLOWLIST_FLAGS`), which the `nvcc` adapter also honors. List explicit flag values. Flags that hide preprocessor inputs (`-Xcompiler -I…`, `-Xcompiler -D…`) stay refused: they would escape dependency tracking.
 
 `NVCC_PREPEND_FLAGS` / `NVCC_APPEND_FLAGS` codegen tuning (`-O2`, `-gencode …`) is cached normally. Values that would change what is built or hide inputs (`-G`, `-I…`, `-march=native`) pass through uncached instead.

@@ -21451,6 +21451,7 @@ mod tests {
                 manifest_key: "id/test".into(),
                 entries: Vec::new(),
             },
+            None,
         )
         .await
         .unwrap();
@@ -21698,6 +21699,7 @@ mod tests {
                 manifest_key: manifest_key.clone(),
                 entries: Vec::new(),
             },
+            None,
         )
         .await
         .unwrap();
@@ -21799,7 +21801,7 @@ mod tests {
                 artifact_size: 4096,
             }],
         };
-        crate::remote::upload_manifest(inner.as_ref(), "prefix", "id/test", &manifest)
+        crate::remote::upload_manifest(inner.as_ref(), "prefix", "id/test", &manifest, None)
             .await
             .unwrap();
         let backend = Arc::new(BlockingIdentityBackend {
@@ -21918,7 +21920,7 @@ mod tests {
                 artifact_size: 4096,
             }],
         };
-        crate::remote::upload_manifest(inner.as_ref(), "prefix", "id/test", &manifest)
+        crate::remote::upload_manifest(inner.as_ref(), "prefix", "id/test", &manifest, None)
             .await
             .unwrap();
         let backend = Arc::new(BlockingIdentityBackend {
@@ -22141,7 +22143,7 @@ mod tests {
                 artifact_size: 4096,
             }],
         };
-        crate::remote::upload_manifest(inner.as_ref(), "prefix", "id/test", &manifest)
+        crate::remote::upload_manifest(inner.as_ref(), "prefix", "id/test", &manifest, None)
             .await
             .unwrap();
         let backend = Arc::new(BlockingIdentityBackend {

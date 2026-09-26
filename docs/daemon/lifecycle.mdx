@@ -16,15 +16,21 @@ kache daemon log         # follow logs
 
 Use `KACHE_LOG=kache=debug kache daemon run` for foreground debugging.
 
+When an installed service manages this cache, `start` and `restart` start the service instead of spawning a process. On macOS, Kache loads the job with `launchctl bootstrap` if launchd no longer has it.
+
+On Linux, `daemon log` follows the systemd journal only. A daemon started without the service logs to `<runtime_dir>/daemon.log` and `<cache_dir>/kache.log`.
+
+On Unix, a daemon that a build starts runs in its own session, so Ctrl-C in the build's terminal does not stop it. On Windows, a daemon started under Cargo stays in Cargo's job object and stops when the build is interrupted. Install the service to avoid that.
+
 ## Install a login service
 
 ```bash
 kache daemon install
 ```
 
-On macOS this installs `~/Library/LaunchAgents/ninja.kunobi.kache.plist`. On Linux it installs and enables the `kache.service` systemd user unit.
+On macOS this installs `~/Library/LaunchAgents/ninja.kunobi.kache.plist`. On Linux it installs and enables the `kache.service` systemd user unit. On Windows it registers the Task Scheduler task `kache-daemon`, which runs `kache daemon run` at logon.
 
-Remove either service with:
+Remove the service with:
 
 ```bash
 kache daemon uninstall
@@ -36,7 +42,7 @@ On current macOS releases, the first connection to a LAN cache endpoint may ask 
 
 The daemon records the running binary's build epoch. A newer client asks an older daemon to drain and exit. The service manager restarts installed services; otherwise later background work starts a fresh daemon.
 
-The daemon also fingerprints the active config file and restarts after it changes. Environment is fixed at process start, so changing an export requires a daemon started from the new environment. An installed service uses its stored environment.
+The daemon also fingerprints the active config file and restarts after it changes. `kache daemon start` and automatic starts drop the remote settings from the environment (`KACHE_S3_BUCKET`, `KACHE_S3_ENDPOINT`, `KACHE_S3_REGION`, `KACHE_S3_PREFIX`, `KACHE_S3_PROFILE`, `KACHE_S3_USER_AGENT`, `KACHE_LOCAL_ONLY`, `KACHE_REMOTE_READONLY`), so set these in the config file. Other environment is fixed when the process starts. An installed service uses its stored environment. To try remote variables from a shell, run `kache daemon run` in the foreground.
 
 ## Shared lifecycle
 
@@ -54,14 +60,14 @@ OS peer and checks the Kache service identity and cache-instance identity. Older
 daemons retain the bounded legacy health/shutdown exchange. Failed binary
 negotiation never falls back to that legacy exchange.
 
-Kache retains cache compatibility, upload persistence, service installation and
-compiler fallback policy. Accepted upload intents survive shutdown in the spool;
-the shared crate neither owns nor cancels those jobs. Consumers also decide how
-to export the shared lifecycle observations.
+Kache handles cache compatibility, the upload spool, service installation and
+compiler fallback itself. Upload intents it has accepted survive shutdown in
+the spool, and `kunobi-daemon` never owns or cancels them. Each program that
+uses `kunobi-daemon` decides how to export its lifecycle observations.
 
 ## Idle shutdown
 
-The default idle timeout is disabled:
+Idle shutdown is off by default. Set a timeout in seconds to turn it on:
 
 ```toml
 [cache]
@@ -79,4 +85,6 @@ When the daemon cannot be reached:
 - validated upload intents remain in `<cache_dir>/upload-queue`
 - a later daemon replays queued uploads before retiring their files
 
-The monitor falls back to direct store and event-log reads. Check `kache daemon log` when it remains offline.
+The monitor falls back to direct store and event-log reads. When the daemon stays offline, run `kache daemon status`: it shows where the daemon logs and where a failed start left its error.
+
+If the daemon fails to start, `kache daemon status` says where the reason is: the file `<runtime_dir>/daemon.log` for `daemon start` and automatic starts, the file `~/Library/Logs/kache/err.log` under launchd, or the command `journalctl --user -u kache.service` under systemd. The Windows task keeps no startup output, so run `kache daemon run` to see the error.

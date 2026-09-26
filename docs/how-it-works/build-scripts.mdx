@@ -57,12 +57,12 @@ Entries stay in the local store: `kache sync` never uploads them.
 
 ## Hermetic runs
 
-Set `KACHE_BUILD_SCRIPT_HERMETIC=1` (Unix, not as root) to share runs by
-construction instead. The script runs with `OUT_DIR` in a directory named by its
+Set `KACHE_BUILD_SCRIPT_HERMETIC=1` (Unix, not as root) to share runs through
+one `OUT_DIR` path instead. The script runs with `OUT_DIR` in a directory named by its
 key, under `out-dirs/v2/` in the cache directory, so every target directory that
 shares the key sees the same path. Values the script derives from `OUT_DIR`
-(its length, a hash, an escaped spelling) are then the same everywhere too,
-which the regular cache cannot check for.
+(its length, a hash, an escaped spelling) are then the same everywhere too.
+The regular cache cannot check for such values.
 
 - The key covers everything the regular key does, with every value as the
   script sees it rather than with roots replaced, except `OUT_DIR`.
@@ -91,7 +91,7 @@ for the next sweep.
 
 Shared directories are read-only: make them writable (`chmod -R u+w`) before
 deleting the cache directory by hand. Target directories keep their links, so
-run `cargo clean` in them afterwards, and also before building without kache:
+run `cargo clean` in them afterwards. Run it before building without Kache too:
 Cargo considers the linked runs fresh and would run a script directly against a
 read-only `OUT_DIR`.
 

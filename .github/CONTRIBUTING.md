@@ -70,6 +70,28 @@ in `.pinact.yaml`; bump its SHA manually when you want a newer release.
 - **Error handling**: Use `anyhow::Result` with `.context()` / `.with_context()` for descriptive errors. Avoid bare `.unwrap()` on I/O or network operations.
 - **Unsafe code**: Avoid unless strictly necessary (OS-level FFI). Document safety invariants with `// SAFETY:` comments.
 
+## Writing docs
+
+Docs, the README, PR descriptions and release notes should read like a maintainer explaining kache to a colleague who is about to use it.
+
+- Start with the task, then the command or setting that does it. Edge cases and design reasons come after the normal path.
+- One idea per sentence. Use active voice and the real names of commands, paths and settings.
+- Match the code on `main`: commands, flags, defaults, paths, limits and platform support. A PR that changes one of these updates the page that describes it.
+- State limits plainly: what doesn't work, and on which platform.
+
+Some habits make text vague or padded. Prefer the plain form:
+
+| Instead of | Write |
+| --- | --- |
+| an em dash joining two clauses | a full stop, a colon or parentheses |
+| "seamless", "robust", "powerful", "simply" | what actually happens |
+| "not X, but Y" | Y |
+| a list of three added for rhythm | only the items that matter |
+| a bold label before every bullet | plain bullets, or a table |
+| an "Overview" heading or a closing summary | a heading that names the task, and an end when the content ends |
+
+Read a change aloud before opening the PR. If it sounds like marketing copy or a chat reply, rewrite it.
+
 ## Testing
 
 - **Unit tests**: Place `#[cfg(test)]` modules at the bottom of source files

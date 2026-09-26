@@ -92,6 +92,17 @@ pub enum PutIfAbsentResult {
     AlreadyExists,
 }
 
+/// Outcome of [`RemoteBackend::put_if_match`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConditionalPut {
+    Stored,
+    /// The object changed since it was read, or appeared when absence was
+    /// expected. Nothing was written; read again and retry.
+    Conflict,
+    /// The store cannot make this write conditional. Nothing was written.
+    Unsupported,
+}
+
 /// Byte-object transport backing the remote cache.
 ///
 /// Absence is not an error: `head` answers `false` and `get` answers `None`, so
@@ -130,6 +141,30 @@ pub trait RemoteBackend: Send + Sync {
             request_ms: object.request_ms,
             body_ms: object.body_ms,
         }))
+    }
+
+    /// Fetch `key` with the entity tag of the bytes returned, for a later
+    /// [`Self::put_if_match`]. The tag is `None` when the transport cannot tie
+    /// one to the body it read.
+    async fn get_versioned(
+        &self,
+        key: &str,
+        max_bytes: Option<u64>,
+    ) -> Result<Option<(GetObject, Option<String>)>> {
+        Ok(self.get(key, max_bytes).await?.map(|object| (object, None)))
+    }
+
+    /// Store `body` at `key` only if the object still carries `expected`, an
+    /// entity tag from [`Self::get_versioned`]. With `expected` as `None`,
+    /// store it only if `key` is absent.
+    async fn put_if_match(
+        &self,
+        _key: &str,
+        _body: Vec<u8>,
+        _content_type: Option<&str>,
+        _expected: Option<&str>,
+    ) -> Result<ConditionalPut> {
+        Ok(ConditionalPut::Unsupported)
     }
 
     /// Store `body` at `key`.
@@ -293,40 +328,15 @@ pub(crate) fn memory_backend_with_download_budget(kib: u32) -> OpenDalBackend {
     backend
 }
 
-#[async_trait]
-impl RemoteBackend for OpenDalBackend {
-    async fn head(&self, key: &str) -> Result<bool> {
-        self.validate_key("HEAD", key, false)?;
-        match self.operator.stat(key).await {
-            Ok(metadata) => Ok(metadata.is_file()),
-            Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
-            Err(error) => Err(self.contextual_error("HEAD", key, error)),
-        }
-    }
-
-    async fn get(&self, key: &str, max_bytes: Option<u64>) -> Result<Option<GetObject>> {
-        self.validate_key("GET", key, false)?;
-        let memory = self.download_memory.acquire(max_bytes).await?;
-        let mut body = Vec::new();
-        let Some(transfer) = self.get_into(key, max_bytes, &mut body).await? else {
-            return Ok(None);
-        };
-        Ok(Some(GetObject {
-            body: Bytes::from_owner(BudgetedBody {
-                body: Bytes::from(body),
-                _memory: memory,
-            }),
-            request_ms: transfer.request_ms,
-            body_ms: transfer.body_ms,
-        }))
-    }
-
-    async fn get_into(
+impl OpenDalBackend {
+    /// [`RemoteBackend::get_into`], also returning the entity tag the read
+    /// response carried. The filesystem backend has none to give.
+    async fn read_into(
         &self,
         key: &str,
         max_bytes: Option<u64>,
         destination: &mut (dyn AsyncWrite + Unpin + Send),
-    ) -> Result<Option<GetTransfer>> {
+    ) -> Result<Option<(GetTransfer, Option<String>)>> {
         self.validate_key("GET", key, false)?;
         let request_start = Instant::now();
         let reader = self
@@ -342,12 +352,17 @@ impl RemoteBackend for OpenDalBackend {
         // Opening stream metadata starts the real read request for S3 without
         // consuming its body. Filesystem readers do not expose open metadata,
         // so fall back to stat there.
-        let advertised_length = match stream.metadata().await {
-            Ok(metadata) => Some(metadata.content_length()),
+        let (advertised_length, etag) = match stream.metadata().await {
+            Ok(metadata) => (
+                Some(metadata.content_length()),
+                metadata.etag().map(str::to_string),
+            ),
             Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
             Err(error) if error.kind() == ErrorKind::Unsupported => {
+                // A separate stat can describe a newer object than the one
+                // read, so its tag is not offered for a conditional write.
                 match self.operator.stat(key).await {
-                    Ok(metadata) => Some(metadata.content_length()),
+                    Ok(metadata) => (Some(metadata.content_length()), None),
                     Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
                     Err(error) => return Err(self.contextual_error("STAT", key, error)),
                 }
@@ -407,11 +422,112 @@ impl RemoteBackend for OpenDalBackend {
 
         let body_ms = body_start.elapsed().as_millis() as u64;
 
-        Ok(Some(GetTransfer {
-            bytes: length,
-            request_ms,
-            body_ms,
+        Ok(Some((
+            GetTransfer {
+                bytes: length,
+                request_ms,
+                body_ms,
+            },
+            etag,
+        )))
+    }
+}
+
+#[async_trait]
+impl RemoteBackend for OpenDalBackend {
+    async fn head(&self, key: &str) -> Result<bool> {
+        self.validate_key("HEAD", key, false)?;
+        match self.operator.stat(key).await {
+            Ok(metadata) => Ok(metadata.is_file()),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(self.contextual_error("HEAD", key, error)),
+        }
+    }
+
+    async fn get(&self, key: &str, max_bytes: Option<u64>) -> Result<Option<GetObject>> {
+        self.validate_key("GET", key, false)?;
+        let memory = self.download_memory.acquire(max_bytes).await?;
+        let mut body = Vec::new();
+        let Some(transfer) = self.get_into(key, max_bytes, &mut body).await? else {
+            return Ok(None);
+        };
+        Ok(Some(GetObject {
+            body: Bytes::from_owner(BudgetedBody {
+                body: Bytes::from(body),
+                _memory: memory,
+            }),
+            request_ms: transfer.request_ms,
+            body_ms: transfer.body_ms,
         }))
+    }
+
+    async fn get_into(
+        &self,
+        key: &str,
+        max_bytes: Option<u64>,
+        destination: &mut (dyn AsyncWrite + Unpin + Send),
+    ) -> Result<Option<GetTransfer>> {
+        Ok(self
+            .read_into(key, max_bytes, destination)
+            .await?
+            .map(|(transfer, _)| transfer))
+    }
+
+    async fn get_versioned(
+        &self,
+        key: &str,
+        max_bytes: Option<u64>,
+    ) -> Result<Option<(GetObject, Option<String>)>> {
+        self.validate_key("GET", key, false)?;
+        let memory = self.download_memory.acquire(max_bytes).await?;
+        let mut body = Vec::new();
+        let Some((transfer, etag)) = self.read_into(key, max_bytes, &mut body).await? else {
+            return Ok(None);
+        };
+        let object = GetObject {
+            body: Bytes::from_owner(BudgetedBody {
+                body: Bytes::from(body),
+                _memory: memory,
+            }),
+            request_ms: transfer.request_ms,
+            body_ms: transfer.body_ms,
+        };
+        Ok(Some((object, etag)))
+    }
+
+    async fn put_if_match(
+        &self,
+        key: &str,
+        body: Vec<u8>,
+        content_type: Option<&str>,
+        expected: Option<&str>,
+    ) -> Result<ConditionalPut> {
+        self.validate_key("PUT", key, false)?;
+        self.verify_write_containment(key)?;
+        let capability = self.operator.info().capability();
+        let supported = match expected {
+            Some(_) => capability.write_with_if_match,
+            None => capability.write_with_if_not_exists,
+        };
+        if !supported {
+            return Ok(ConditionalPut::Unsupported);
+        }
+        let request = self.operator.write_with(key, body);
+        let request = match expected {
+            Some(tag) => request.if_match(tag),
+            None => request.if_not_exists(true),
+        };
+        let result = match content_type {
+            Some(content_type) => request.content_type(content_type).await,
+            None => request.await,
+        };
+        match result {
+            Ok(_) => Ok(ConditionalPut::Stored),
+            Err(error) => match classify_conditional_error(&error, expected.is_some()) {
+                Some(outcome) => Ok(outcome),
+                None => Err(self.contextual_error("PUT", key, error)),
+            },
+        }
     }
 
     async fn put(&self, key: &str, body: Vec<u8>, content_type: Option<&str>) -> Result<()> {
@@ -561,6 +677,31 @@ fn classify_create_error(kind: ErrorKind) -> Option<PutIfAbsentResult> {
         }
         _ => None,
     }
+}
+
+/// A conditional write that lost its precondition changed nothing: another
+/// writer got there first (`412`, `409`), or deleted the object an `If-Match`
+/// named (S3 answers `404`). A store that does not implement the condition
+/// says so with `501`, or `400` carrying the `NotImplemented` code, which
+/// OpenDAL reports as an unexpected error; nothing was written then either.
+/// Every other failure stays an error: after a timeout the write may have
+/// landed, so it must not be retried unconditionally.
+fn classify_conditional_error(error: &opendal::Error, replacing: bool) -> Option<ConditionalPut> {
+    match error.kind() {
+        ErrorKind::ConditionNotMatch | ErrorKind::AlreadyExists => Some(ConditionalPut::Conflict),
+        ErrorKind::NotFound if replacing => Some(ConditionalPut::Conflict),
+        ErrorKind::Unsupported => Some(ConditionalPut::Unsupported),
+        ErrorKind::Unexpected if lacks_conditional_writes(error) => {
+            Some(ConditionalPut::Unsupported)
+        }
+        _ => None,
+    }
+}
+
+/// Whether an S3-compatible store rejected a request because it does not
+/// implement part of it.
+fn lacks_conditional_writes(error: &opendal::Error) -> bool {
+    error.message().contains("\"NotImplemented\"") || error.to_string().contains("status: 501")
 }
 
 fn without_retry_layer(operator: Operator) -> Operator {
@@ -1655,6 +1796,237 @@ mod tests {
                 "{request}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn s3_wire_versioned_get_returns_the_response_etag() {
+        let response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nETag: \"v1\"\r\n\
+            Content-Type: application/json\r\nConnection: close\r\n\r\n{}";
+        let (endpoint, _requests) = mock_http_server(vec![response.to_string()]).await;
+        let backend = anonymous_s3_backend(&endpoint);
+
+        let (object, etag) = backend
+            .get_versioned("manifest", Some(1024))
+            .await
+            .unwrap()
+            .expect("the object exists");
+        assert_eq!(&object.body[..], b"{}");
+        assert_eq!(etag.as_deref(), Some("\"v1\""));
+    }
+
+    #[tokio::test]
+    async fn s3_wire_conditional_put_sends_the_precondition_and_reports_conflicts() {
+        let conflict = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+            <Error><Code>PreconditionFailed</Code><Message>changed</Message>\
+            <RequestId>test</RequestId></Error>";
+        let (endpoint, requests) = mock_http_server(vec![
+            http_response("200 OK", ""),
+            http_response("412 Precondition Failed", conflict),
+            http_response("200 OK", ""),
+        ])
+        .await;
+        let backend = anonymous_s3_backend(&endpoint);
+
+        let stored = backend
+            .put_if_match(
+                "manifest",
+                b"a".to_vec(),
+                Some("application/json"),
+                Some("\"v1\""),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stored, ConditionalPut::Stored);
+        let conflict = backend
+            .put_if_match("manifest", b"b".to_vec(), None, Some("\"v1\""))
+            .await
+            .unwrap();
+        assert_eq!(conflict, ConditionalPut::Conflict);
+        let created = backend
+            .put_if_match("manifest", b"c".to_vec(), None, None)
+            .await
+            .unwrap();
+        assert_eq!(created, ConditionalPut::Stored);
+
+        let requests: Vec<String> = requests
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|request| request.to_ascii_lowercase())
+            .collect();
+        assert_eq!(requests.len(), 3);
+        assert!(
+            requests[0].contains("\r\ncontent-type: application/json\r\n"),
+            "{}",
+            requests[0]
+        );
+        for request in &requests[..2] {
+            assert!(request.contains("\r\nif-match: \"v1\"\r\n"), "{request}");
+            assert!(!request.contains("if-none-match"), "{request}");
+        }
+        assert!(
+            requests[2].contains("\r\nif-none-match: *\r\n"),
+            "{}",
+            requests[2]
+        );
+        assert!(!requests[2].contains("\r\nif-match:"), "{}", requests[2]);
+    }
+
+    /// A transport that implements only the required methods.
+    struct GetOnly;
+
+    #[async_trait]
+    impl RemoteBackend for GetOnly {
+        async fn head(&self, _key: &str) -> Result<bool> {
+            Ok(true)
+        }
+
+        async fn get(&self, _key: &str, _max_bytes: Option<u64>) -> Result<Option<GetObject>> {
+            Ok(Some(GetObject {
+                body: Bytes::from_static(b"body"),
+                request_ms: 0,
+                body_ms: 0,
+            }))
+        }
+
+        async fn put(&self, _key: &str, _body: Vec<u8>, _content_type: Option<&str>) -> Result<()> {
+            Ok(())
+        }
+
+        async fn list(&self, _prefix: &str) -> Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+
+        fn describe(&self, key: &str) -> String {
+            key.to_string()
+        }
+    }
+
+    #[tokio::test]
+    async fn default_conditional_methods_offer_no_entity_tag_and_no_condition() {
+        let (object, etag) = GetOnly
+            .get_versioned("key", None)
+            .await
+            .unwrap()
+            .expect("the object exists");
+        assert_eq!(&object.body[..], b"body");
+        assert_eq!(etag, None);
+        let outcome = GetOnly
+            .put_if_match("key", Vec::new(), None, Some("\"v1\""))
+            .await
+            .unwrap();
+        assert_eq!(outcome, ConditionalPut::Unsupported);
+    }
+
+    #[tokio::test]
+    async fn s3_wire_head_reports_refusals_as_errors_not_absence() {
+        let (endpoint, _requests) = mock_http_server(vec![
+            http_response("404 Not Found", ""),
+            http_response("403 Forbidden", ""),
+        ])
+        .await;
+        let backend = anonymous_s3_backend(&endpoint);
+        assert!(!backend.head("absent").await.unwrap());
+        assert!(backend.head("refused").await.is_err());
+    }
+
+    #[test]
+    fn conditional_error_classification_is_exact() {
+        let classify = |kind, message: &str, replacing| {
+            classify_conditional_error(&opendal::Error::new(kind, message.to_string()), replacing)
+        };
+        for replacing in [true, false] {
+            for kind in [ErrorKind::ConditionNotMatch, ErrorKind::AlreadyExists] {
+                assert_eq!(
+                    classify(kind, "", replacing),
+                    Some(ConditionalPut::Conflict)
+                );
+            }
+            assert_eq!(
+                classify(ErrorKind::Unsupported, "", replacing),
+                Some(ConditionalPut::Unsupported)
+            );
+            assert_eq!(classify(ErrorKind::PermissionDenied, "", replacing), None);
+            assert_eq!(
+                classify(ErrorKind::Unexpected, "timed out", replacing),
+                None
+            );
+        }
+        // The object an If-Match named was deleted: read again.
+        assert_eq!(
+            classify(ErrorKind::NotFound, "", true),
+            Some(ConditionalPut::Conflict)
+        );
+        assert_eq!(classify(ErrorKind::NotFound, "", false), None);
+        assert_eq!(
+            classify(
+                ErrorKind::Unexpected,
+                r#"S3Error { code: "NotImplemented" }"#,
+                true
+            ),
+            Some(ConditionalPut::Unsupported)
+        );
+        let status_501 = opendal::Error::new(ErrorKind::Unexpected, "no body")
+            .with_context("response", "Parts { status: 501, version: HTTP/1.1 }");
+        assert_eq!(
+            classify_conditional_error(&status_501, true),
+            Some(ConditionalPut::Unsupported)
+        );
+    }
+
+    #[tokio::test]
+    async fn s3_wire_conditional_put_separates_unsupported_from_failed_writes() {
+        let error = |code: &str| {
+            format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>{code}</Code>\
+                 <Message>m</Message><RequestId>test</RequestId></Error>"
+            )
+        };
+        let (endpoint, _requests) = mock_http_server(vec![
+            http_response("501 Not Implemented", &error("NotImplemented")),
+            http_response("400 Bad Request", &error("NotImplemented")),
+            http_response("400 Bad Request", &error("InvalidArgument")),
+            http_response("404 Not Found", &error("NoSuchKey")),
+        ])
+        .await;
+        let backend = anonymous_s3_backend(&endpoint);
+        let replace = || backend.put_if_match("manifest", b"{}".to_vec(), None, Some("\"v1\""));
+
+        assert_eq!(replace().await.unwrap(), ConditionalPut::Unsupported);
+        assert_eq!(replace().await.unwrap(), ConditionalPut::Unsupported);
+        assert!(replace().await.is_err());
+        assert_eq!(replace().await.unwrap(), ConditionalPut::Conflict);
+    }
+
+    #[tokio::test]
+    async fn filesystem_backend_declines_a_conditional_replace() {
+        let root = tempfile::tempdir().unwrap();
+        let remote = RemoteConfig {
+            prefix: "artifacts".to_string(),
+            backend: RemoteBackendConfig::Filesystem(FilesystemRemoteConfig {
+                root: root.path().to_path_buf(),
+                atomic_write_dir: root.path().join(".staging"),
+            }),
+        };
+        let backend = create_backend(&remote, 30).await.unwrap();
+
+        let outcome = backend
+            .put_if_match(
+                "artifacts/manifest.json",
+                b"{}".to_vec(),
+                None,
+                Some("\"v1\""),
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome, ConditionalPut::Unsupported);
+        assert!(
+            backend
+                .get("artifacts/manifest.json", None)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]

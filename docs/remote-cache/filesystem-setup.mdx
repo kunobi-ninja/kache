@@ -18,7 +18,7 @@ Use an absolute path mounted consistently on every machine. Keep `cache.local_st
 
 Every writer to the mount is trusted. A filesystem remote is not an isolation boundary. Use directory permissions or choose S3 with access policy when clients are not mutually trusted.
 
-Kache validates paths and writes only below the configured root, but this is defense in depth rather than a substitute for mount security.
+Kache validates paths and writes only below the configured root. Treat that as defense in depth and secure the mount as well.
 
 ## Atomic writes
 
@@ -46,6 +46,7 @@ Kache rejects a configuration that cannot provide atomic final renames.
 └── artifacts/
     ├── v3/manifests/{crate}/{key}.json
     ├── v3/packs/{crate}/{key}.tar.zst
+    ├── v3/predictions/
     └── _manifests/
 ```
 
@@ -55,4 +56,4 @@ The [v3 download limits](/docs/remote-cache/s3-setup#object-layout-and-policy) a
 
 ## Reclaim remote space
 
-kache never deletes remote objects. The owner of the directory runs a prune job; [Bound a remote](/docs/remote-cache/bounding) has the script and the ages that keep manifests and packs consistent.
+Kache never deletes remote objects. The owner of the directory runs a prune job; [Bound a remote](/docs/remote-cache/bounding) has the script and the ages that keep manifests and packs consistent.

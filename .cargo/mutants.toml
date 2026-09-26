@@ -384,10 +384,9 @@ exclude_re = [
     # Printing rustc's captured stdout/stderr is gated on `!is_empty()`, so
     # dropping the gate prints an empty string: a no-op.
     "delete ! in run_parsed_rustc",
-    # `daemon_local && precompiled.is_none()`: without a daemon socket
-    # `try_daemon_local_hit` returns None, so the flip is observable only
-    # with a live local-hit daemon, which the e2e lanes run. The precompiled
-    # half is covered by the passthrough exit-code test.
+    # `args.is_primary || (config.clean_incremental && args.incremental.is_some())`:
+    # a non-primary invocation is refused before it uses the store, so
+    # opening one for it after the `&&` flip changes nothing a test can see.
     "src/wrapper.rs:.*replace && with \\|\\| in run_parsed_rustc",
     # `verify` gates one "Repairing:" line on `removed + inputs > 0`, the
     # `run_gc_local` shape above; `prune_cc_preprocess_memos` is tested

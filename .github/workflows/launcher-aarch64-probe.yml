@@ -13,21 +13,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: cachix/install-nix-action@v31
-      - name: Link the launcher with nixpkgs' native rustc
+      - name: Build kache with nixpkgs' native rustc
         run: |
-          nix shell nixpkgs#rustc nixpkgs#stdenv.cc -c sh -c '
-            rustc --version --verbose
-            build() {
-              out=$1; shift
-              rustc --edition 2024 --crate-type bin --crate-name kache_build_script_launcher \
-                --target aarch64-unknown-linux-gnu -C opt-level=s -C panic=abort -C codegen-units=1 \
-                -C debuginfo=0 -C strip=symbols -o "$out" "$@" launcher/build_script.rs
-            }
-            echo "== without a trailing -lc"
-            if build /tmp/plain; then echo "plain: linked"; else echo "plain: FAILED"; fi
-            echo "== with -C link-arg=-lc"
-            if build /tmp/withlc -C link-arg=-lc; then echo "withlc: linked"; else echo "withlc: FAILED"; fi
-          '
-      - name: Build kache itself with nixpkgs' native rustc
-        run: |
-          nix shell nixpkgs#rustc nixpkgs#cargo nixpkgs#stdenv.cc -c cargo build --locked 2>&1 | tail -20
+          nix shell nixpkgs#rustc nixpkgs#cargo nixpkgs#stdenv.cc -c sh -c 'rustc -vV && cargo build --locked'

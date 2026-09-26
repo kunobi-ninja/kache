@@ -5391,6 +5391,12 @@ fn cc_trace_name(parsed: &CcArgs) -> String {
         .unwrap_or_else(|| "cc".to_string())
 }
 
+/// Both halves of the shadowing digest, as the key computes them.
+#[cfg(test)]
+fn digest_cc_include_shadowing(parsed: &CcArgs, read_inputs: &[PathBuf]) -> Result<String> {
+    digest_cc_shadowing_names(parsed, &cc_shadowing_names(parsed, read_inputs))
+}
+
 /// Digest the shadowing risk for the headers a preprocess actually read.
 ///
 /// The walk below exists because a header appearing in an earlier include
@@ -5411,7 +5417,15 @@ fn cc_trace_name(parsed: &CcArgs) -> String {
 /// name, rather than a full enumeration, so there is no cap to exceed. A stat
 /// that fails for any reason other than absence fails closed, as the walk
 /// does for an unreadable directory.
-fn digest_cc_include_shadowing(parsed: &CcArgs, read_inputs: &[PathBuf]) -> Result<String> {
+///
+/// This half is the relative names a compile's read set could be shadowed
+/// under, in the order the digest folds them. It depends on the read set
+/// and the include directories alone, so the post-compile recheck reuses it
+/// and only lists the directories again ([`digest_cc_shadowing_names`]).
+fn cc_shadowing_names(
+    parsed: &CcArgs,
+    read_inputs: &[PathBuf],
+) -> std::collections::BTreeSet<PathBuf> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let dirs = cc_user_include_dirs(parsed, &cwd);
 
@@ -5442,10 +5456,20 @@ fn digest_cc_include_shadowing(parsed: &CcArgs, read_inputs: &[PathBuf]) -> Resu
         }
         names.extend(candidates);
     }
+    names
+}
 
+/// Digest where each of `names` is first provided in the include search
+/// order, read from the directories as they are now.
+fn digest_cc_shadowing_names(
+    parsed: &CcArgs,
+    names: &std::collections::BTreeSet<PathBuf>,
+) -> Result<String> {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let dirs = cc_user_include_dirs(parsed, &cwd);
     let mut hasher = blake3::Hasher::new();
     let mut listings = CcDirectoryListings::default();
-    for name in &names {
+    for name in names {
         hasher.update(name.as_os_str().as_encoded_bytes());
         hasher.update(b"\x1f");
         match cc_first_include_dir_providing_cached(&dirs, name, &mut listings)? {
@@ -5474,9 +5498,15 @@ fn cc_first_include_dir_providing(dirs: &[PathBuf], name: &Path) -> Result<Optio
 /// header names against a dozen include directories one `stat` at a time was
 /// the largest cost of a warm C hit; listing each directory once answers the
 /// same question from memory.
+///
+/// An include directory's own listing is found by its position in the search
+/// order: most header names have no directory part, and hashing the joined
+/// path for each (name, directory) pair was most of a C miss's CPU on
+/// libgit2. A name with a directory part (`sys/types.h`) is listed by path.
 #[derive(Default)]
 struct CcDirectoryListings {
     listings: HashMap<PathBuf, Option<CcDirectoryListing>>,
+    by_position: Vec<Option<Option<CcDirectoryListing>>>,
 }
 
 struct CcDirectoryListing {
@@ -5486,47 +5516,44 @@ struct CcDirectoryListing {
     folded: HashSet<String>,
 }
 
-impl CcDirectoryListings {
-    /// Whether `directory` contains an entry named `file_name`, of any kind.
+impl CcDirectoryListing {
     /// `None` when the directory cannot be listed as a directory: absent, or
     /// an intermediate component is a file, which the compiler skips too.
-    fn contains(&mut self, directory: &Path, file_name: &OsStr) -> Result<bool> {
-        if !self.listings.contains_key(directory) {
-            let listing = match std::fs::read_dir(directory) {
-                Ok(entries) => {
-                    let mut names = HashSet::new();
-                    let mut folded = HashSet::new();
-                    for entry in entries {
-                        let name = entry?.file_name();
-                        folded.insert(name.to_string_lossy().to_lowercase());
-                        names.insert(name);
-                    }
-                    Some(CcDirectoryListing { names, folded })
+    fn read(directory: &Path) -> Result<Option<Self>> {
+        match std::fs::read_dir(directory) {
+            Ok(entries) => {
+                let mut names = HashSet::new();
+                let mut folded = HashSet::new();
+                for entry in entries {
+                    let name = entry?.file_name();
+                    folded.insert(name.to_string_lossy().to_lowercase());
+                    names.insert(name);
                 }
-                Err(error)
-                    if error.kind() == ErrorKind::NotFound
-                        || error.kind() == ErrorKind::NotADirectory =>
-                {
-                    None
-                }
-                Err(error) => anyhow::bail!(
-                    "cc include directory {} is unreadable ({error})",
-                    directory.display()
-                ),
-            };
-            self.listings.insert(directory.to_path_buf(), listing);
+                Ok(Some(Self { names, folded }))
+            }
+            Err(error)
+                if error.kind() == ErrorKind::NotFound
+                    || error.kind() == ErrorKind::NotADirectory =>
+            {
+                Ok(None)
+            }
+            Err(error) => anyhow::bail!(
+                "cc include directory {} is unreadable ({error})",
+                directory.display()
+            ),
         }
-        let Some(listing) = &self.listings[directory] else {
-            return Ok(false);
-        };
-        if listing.names.contains(file_name) {
+    }
+
+    /// Whether `directory`, which this lists, has an entry named `file_name`.
+    fn provides(&self, directory: &Path, file_name: &OsStr) -> Result<bool> {
+        if self.names.contains(file_name) {
             return Ok(true);
         }
         // A case-insensitive filesystem (macOS, Windows, but also a casefold
         // ext4 or a mounted share on Linux) resolves `foo.h` to `Foo.h`; the
         // listing does not. When only the case differs, ask the filesystem,
         // which is what the compiler does.
-        if listing
+        if self
             .folded
             .contains(&file_name.to_string_lossy().to_lowercase())
         {
@@ -5548,6 +5575,43 @@ impl CcDirectoryListings {
     }
 }
 
+impl CcDirectoryListings {
+    /// Whether `directory` contains an entry named `file_name`, of any kind.
+    fn contains(&mut self, directory: &Path, file_name: &OsStr) -> Result<bool> {
+        let listing = match self.listings.entry(directory.to_path_buf()) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(CcDirectoryListing::read(directory)?)
+            }
+        };
+        match listing {
+            Some(listing) => listing.provides(directory, file_name),
+            None => Ok(false),
+        }
+    }
+
+    /// [`Self::contains`] for the include directory at `position` in the
+    /// search order, found without hashing its path.
+    fn contains_at(
+        &mut self,
+        position: usize,
+        directory: &Path,
+        file_name: &OsStr,
+    ) -> Result<bool> {
+        if self.by_position.len() <= position {
+            self.by_position.resize_with(position + 1, || None);
+        }
+        let slot = &mut self.by_position[position];
+        if slot.is_none() {
+            *slot = Some(CcDirectoryListing::read(directory)?);
+        }
+        match slot.as_ref().and_then(Option::as_ref) {
+            Some(listing) => listing.provides(directory, file_name),
+            None => Ok(false),
+        }
+    }
+}
+
 fn cc_first_include_dir_providing_cached(
     dirs: &[PathBuf],
     name: &Path,
@@ -5556,12 +5620,15 @@ fn cc_first_include_dir_providing_cached(
     let Some(file_name) = name.file_name() else {
         return Ok(None);
     };
+    let parent = name
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty());
     for (index, dir) in dirs.iter().enumerate() {
-        let directory = match name.parent() {
-            Some(parent) if !parent.as_os_str().is_empty() => dir.join(parent),
-            _ => dir.clone(),
+        let provided = match parent {
+            Some(parent) => listings.contains(&dir.join(parent), file_name)?,
+            None => listings.contains_at(index, dir, file_name)?,
         };
-        if listings.contains(&directory, file_name)? {
+        if provided {
             return Ok(Some(index));
         }
     }
@@ -6034,7 +6101,10 @@ pub struct CcCompiler {
     pending_preprocess_memo: RefCell<Option<PendingCcPreprocessMemo>>,
     /// The shadowing digest folded into the key, with the read set it was
     /// resolved from, so the publish-time recheck can reproduce it exactly.
-    pending_include_dir_digest: RefCell<Option<(String, Option<Vec<PathBuf>>)>>,
+    /// The include digest folded into the key, and the shadowing names it
+    /// was computed over (`None` when the directories were walked).
+    pending_include_dir_digest:
+        RefCell<Option<(String, Option<std::collections::BTreeSet<PathBuf>>)>>,
     /// The last key bound itself to this checkout's roots. `execute` stores an
     /// object that embeds a raw root only under such a key.
     key_path_bound: Cell<bool>,
@@ -6248,14 +6318,14 @@ impl CcCompiler {
     /// under the old key.
     pub(crate) fn include_dir_names_still_match(&self, parsed: &CcArgs) -> bool {
         let pending = self.pending_include_dir_digest.borrow();
-        let Some((digest, read_inputs)) = pending.as_ref() else {
+        let Some((digest, names)) = pending.as_ref() else {
             return false;
         };
-        // Recompute the way the key did. Resolving against a different set of
-        // names than the key used would compare two unrelated digests and
-        // refuse every store.
-        let now = match read_inputs {
-            Some(inputs) => digest_cc_include_shadowing(parsed, inputs),
+        // Recompute the way the key did, over the same names. Resolving
+        // against a different set of names than the key used would compare
+        // two unrelated digests and refuse every store.
+        let now = match names {
+            Some(names) => digest_cc_shadowing_names(parsed, names),
             None => digest_cc_include_dir_names(parsed),
         };
         now.is_ok_and(|now| now == *digest)
@@ -7062,14 +7132,17 @@ impl CcCompiler {
         // fall back to enumerating the directories, which is what the capped
         // walk has always done.
         let trace_shadowing = crate::phase_trace::phase("cc_shadowing");
-        let (include_dir_digest, include_dir_mode) = match &read_inputs {
-            Some(inputs) => (digest_cc_include_shadowing(parsed, inputs)?, "resolved"),
+        let names = read_inputs
+            .as_deref()
+            .map(|inputs| cc_shadowing_names(parsed, inputs));
+        let (include_dir_digest, include_dir_mode) = match &names {
+            Some(names) => (digest_cc_shadowing_names(parsed, names)?, "resolved"),
             None => (digest_cc_include_dir_names(parsed)?, "walked"),
         };
         drop(trace_shadowing);
         self.pending_include_dir_digest
             .borrow_mut()
-            .replace((include_dir_digest.clone(), read_inputs));
+            .replace((include_dir_digest.clone(), names));
         hasher.update(b"include_dir_names:");
         hasher.update(include_dir_digest.as_bytes());
         hasher.update(b"\n");

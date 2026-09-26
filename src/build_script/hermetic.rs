@@ -1018,6 +1018,12 @@ mod tests {
         record_referrer(&sandbox, &elsewhere).unwrap();
         assert_eq!(live_referrers(&sandbox.root).unwrap(), vec![out]);
         assert!(live_referrers(&dir.path().join("none")).unwrap().is_empty());
+        let unreadable = dir.path().join("unreadable");
+        std::fs::create_dir_all(referrers_path(&unreadable)).unwrap();
+        assert!(
+            live_referrers(&unreadable).is_err(),
+            "an unreadable record is an error, not an empty one"
+        );
     }
 
     #[test]

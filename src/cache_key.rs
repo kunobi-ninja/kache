@@ -7627,7 +7627,7 @@ impl LinuxLibcFamily {
 ///
 /// This must not use [`host_target_triple`]: release kache binaries are built
 /// for musl, but commonly wrap a GNU rustc on a glibc host.
-fn rustc_host_triple(rustc_version: &str) -> Option<&str> {
+pub(crate) fn rustc_host_triple(rustc_version: &str) -> Option<&str> {
     rustc_version.lines().find_map(|line| {
         line.strip_prefix("host:")
             .map(str::trim)

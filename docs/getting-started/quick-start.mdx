@@ -16,7 +16,7 @@ kache init
 kache doctor
 ```
 
-`kache init` configures Cargo's Rust wrapper. On Unix it also sets `HOST_CC` and `HOST_CXX` when unset, so Kache caches the C and C++ that build scripts compile, and offers compiler-name shims with a `PATH` line for your shell's startup file. It also offers a login service. It does not set `CC` or `CXX`. See [C and C++](/docs/getting-started/c-cpp) for native build setup.
+`kache init` configures Cargo's Rust wrapper. On Unix it also sets `HOST_CC` and `HOST_CXX` when unset, so Kache caches the C and C++ that build scripts compile, and offers compiler-name shims with a `PATH` line for your shell's startup file and [test pacing](/docs/getting-started/configuration#test-runner). It also offers a login service. It does not set `CC` or `CXX`. See [C and C++](/docs/getting-started/c-cpp) for native build setup.
 
 `doctor` checks the wrapper configuration, conflicting wrappers, cache configuration, daemon access, and compiler-name shims. Resolve any setup issues it reports before continuing.
 
@@ -95,11 +95,11 @@ The report stays at `$kache_trial/reuse.md`. Git may refuse to remove a worktree
 ```bash
 kache init --check       # print proposed changes only
 kache init --no-service  # configure Cargo without a login service
-kache init --no-shell    # leave terminal C/C++ setup unchanged
+kache init --no-shell    # leave shell startup files unchanged
 kache init --yes         # accept defaults without prompts
 ```
 
-Init asks before editing Cargo or shell configuration and backs up existing files. If you enable C/C++ caching, open a new terminal afterward or run the activation command it prints. `--check` shows the planned changes without prompts or modifications.
+Init asks before editing Cargo or shell configuration and backs up existing files. If you enable C/C++ caching or test pacing, open a new terminal afterward. For C/C++ you can instead run the activation command it prints. `--check` shows the planned changes without prompts or modifications.
 
 After setup, keep using ordinary Cargo commands. Give concurrent worktrees separate target directories. Tools that build in temporary copies, such as cargo-mutants, need no extra setup; see [Mutation testing](/docs/getting-started/mutation-testing).
 

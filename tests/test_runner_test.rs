@@ -43,6 +43,8 @@ case "$PROBE_MODE" in
     exit 3
     ;;
   nested)
+    # Everything below relies on this test's lease; fail at once without it.
+    [ -n "${KACHE_TEST_LEASE-}" ] || exit 13
     : > "$PROBE_DIR/ready"
     i=0
     while [ ! -e "$PROBE_DIR/go" ] && [ "$i" -lt 3000 ]; do sleep 0.02; i=$((i + 1)); done
@@ -57,6 +59,21 @@ case "$PROBE_MODE" in
   *) exit 99 ;;
 esac
 "#;
+
+/// `CARGO_TARGET_<HOST>_RUNNER` for rustc's host, the variable `kache init`
+/// exports.
+fn host_runner_var() -> String {
+    let output = Command::new("rustc").arg("-vV").output().unwrap();
+    let version = String::from_utf8(output.stdout).unwrap();
+    let host = version
+        .lines()
+        .find_map(|line| line.strip_prefix("host: "))
+        .expect("rustc -vV names the host");
+    format!(
+        "CARGO_TARGET_{}_RUNNER",
+        host.to_ascii_uppercase().replace(['-', '.'], "_")
+    )
+}
 
 /// A scratch directory holding the probe, its cache and its config.
 struct Fixture {
@@ -107,7 +124,10 @@ impl Fixture {
             .env_remove("KACHE_DISABLED")
             .process_group(0);
         for (name, _) in std::env::vars_os() {
-            if name.to_string_lossy().starts_with("NEXTEST") {
+            let text = name.to_string_lossy();
+            // `kache init` may have exported a runner for this machine.
+            let runner = text.starts_with("CARGO_TARGET_") && text.ends_with("_RUNNER");
+            if text.starts_with("NEXTEST") || runner {
                 command.env_remove(name);
             }
         }
@@ -274,6 +294,120 @@ fn exit_codes_pass_through_scheduled_and_plain() {
         !fixture.cache().join("scheduler").exists(),
         "with the scheduler off the runner leaves no lease files"
     );
+}
+
+/// `kache init` exports `CARGO_TARGET_<HOST>_RUNNER`, which Cargo ranks
+/// above the project's own runner. The test still runs under that runner.
+#[test]
+fn a_project_runner_the_exported_variable_hides_still_runs() {
+    for (exported, scheduler) in [(true, "1"), (true, "0"), (false, "1")] {
+        let fixture = Fixture::new();
+        kache_fs::testutil::write_executable(
+            &fixture.path().join("wrap"),
+            "#!/bin/sh\n: > \"$PROBE_DIR/wrapped\"\nexec \"$@\"\n",
+        );
+        fs::create_dir(fixture.path().join(".cargo")).unwrap();
+        fs::write(
+            fixture.path().join(".cargo/config.toml"),
+            "[target.'cfg(unix)']\nrunner = ['./wrap']\n",
+        )
+        .unwrap();
+        let mut command = fixture.runner(&fixture.probe(), "exit7");
+        command
+            .current_dir(fixture.path())
+            .env("PWD", fixture.path())
+            .env("KACHE_SCHEDULER", scheduler)
+            .env("CARGO_HOME", fixture.path().join("cargo-home"));
+        if exported {
+            command.env(host_runner_var(), "kache test-runner");
+        }
+        let output = run(command);
+        assert_eq!(output.status.code(), Some(7), "{output:?}");
+        // Without the variable Cargo already chose kache over the project's
+        // runner, so there is nothing to run the test under.
+        assert_eq!(
+            fixture.path().join("wrapped").exists(),
+            exported,
+            "exported={exported} scheduler={scheduler}: {output:?}"
+        );
+    }
+}
+
+/// A project runner that starts `kache test-runner` again gets the test
+/// binary once, not a loop of itself.
+#[test]
+fn a_project_runner_that_starts_kache_again_does_not_loop() {
+    let fixture = Fixture::new();
+    kache_fs::testutil::write_executable(
+        &fixture.path().join("wrap"),
+        "#!/bin/sh\necho x >> \"$PROBE_DIR/wrapped\"\nexec \"$@\"\n",
+    );
+    fs::create_dir(fixture.path().join(".cargo")).unwrap();
+    fs::write(
+        fixture.path().join(".cargo/config.toml"),
+        format!(
+            "[target.'cfg(unix)']\nrunner = ['./wrap', '{}', 'test-runner']\n",
+            kache_binary()
+        ),
+    )
+    .unwrap();
+    let mut command = fixture.runner(&fixture.probe(), "exit7");
+    command
+        .current_dir(fixture.path())
+        .env("PWD", fixture.path())
+        .env("CARGO_HOME", fixture.path().join("cargo-home"))
+        .env(host_runner_var(), "kache test-runner");
+    let output = run(command);
+    assert_eq!(output.status.code(), Some(7), "{output:?}");
+    assert_eq!(
+        fs::read_to_string(fixture.path().join("wrapped")).unwrap(),
+        "x\n"
+    );
+}
+
+/// Cargo refuses two matching `cfg` runners. The runner refuses too, rather
+/// than run the test under neither.
+#[test]
+fn two_matching_project_runners_fail_the_test() {
+    let fixture = Fixture::new();
+    fs::create_dir(fixture.path().join(".cargo")).unwrap();
+    fs::write(
+        fixture.path().join(".cargo/config.toml"),
+        "[target.'cfg(unix)']\nrunner = 'a'\n[target.'cfg(all())']\nrunner = 'b'\n",
+    )
+    .unwrap();
+    let mut command = fixture.runner(&fixture.probe(), "started");
+    command
+        .current_dir(fixture.path())
+        .env("PWD", fixture.path())
+        .env("CARGO_HOME", fixture.path().join("cargo-home"))
+        .env(host_runner_var(), "kache test-runner");
+    let output = run(command);
+    assert_eq!(output.status.code(), Some(101), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("cannot tell which runner Cargo would use"),
+        "{stderr}"
+    );
+    assert!(!fixture.path().join("started").exists());
+
+    // One runner in the package, none where Cargo may have started ($PWD).
+    fs::write(
+        fixture.path().join(".cargo/config.toml"),
+        "[target.'cfg(unix)']\nrunner = 'a'\n",
+    )
+    .unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let mut command = fixture.runner(&fixture.probe(), "started");
+    command
+        .current_dir(fixture.path())
+        .env("PWD", elsewhere.path())
+        .env("CARGO_HOME", fixture.path().join("cargo-home"))
+        .env(host_runner_var(), "kache test-runner");
+    let output = run(command);
+    assert_eq!(output.status.code(), Some(101), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("configure different runners"), "{stderr}");
 }
 
 /// `kache` exits at once, running nothing, when it sees the variables of a

@@ -213,7 +213,8 @@ enum Commands {
         #[arg(long)]
         no_service: bool,
 
-        /// Skip C/C++ shell setup (Cargo native dependencies are still configured)
+        /// Leave shell startup files alone: no C/C++ shims on PATH and no test
+        /// runner (Cargo native dependencies are still configured)
         #[arg(long)]
         no_shell: bool,
 

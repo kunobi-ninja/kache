@@ -13,6 +13,10 @@
 //! runs unchanged: binaries without Cargo's metadata hash (`cargo run`,
 //! doctests), listing, benches, and any run with the scheduler off.
 //!
+//! `kache init` can instead export `CARGO_TARGET_<HOST>_RUNNER` for every
+//! project. Cargo ranks that above a project's own runner, so [`delegate`]
+//! finds the runner the project set and the test binary still runs under it.
+//!
 //! The runner never writes to stdout: test harnesses and nextest read it.
 
 use std::ffi::{OsStr, OsString};
@@ -21,6 +25,10 @@ use std::process::Command;
 use std::time::Duration;
 
 use crate::scheduler::{self, TestWant};
+
+mod delegate;
+#[cfg(unix)]
+pub(crate) use delegate::runner_var;
 
 /// Wait budget under nextest, which counts the wait toward its own
 /// `slow-timeout` and `terminate-after`.
@@ -77,11 +85,20 @@ pub fn run(args: &[OsString]) -> i32 {
         .ok()
         .filter(|config| config.scheduler);
     let cache_dir = config.as_ref().map(|config| config.cache_dir.as_path());
+    let prefix = match delegate::prefix() {
+        Ok(prefix) => prefix,
+        Err(error) => {
+            eprintln!("kache test-runner: {error}");
+            return RUN_FAILED;
+        }
+    };
+    let marker = (!prefix.is_empty()).then(|| delegate::delegate_marker(&prefix));
+    let command = [prefix, args.to_vec()].concat();
     match (cache_dir, plan(args, &env, cache_dir)) {
         (Some(cache_dir), Plan::Schedule { key, want }) => {
-            run_scheduled(args, cache_dir, &env, &key, want)
+            run_scheduled(&command, marker, cache_dir, &env, &key, want)
         }
-        _ => exec(args),
+        _ => exec(&command, marker),
     }
 }
 
@@ -206,10 +223,23 @@ pub(crate) fn exit_disposition(code: Option<i32>, signal: Option<i32>) -> Dispos
     }
 }
 
+/// Set [`delegate::DELEGATE_ENV`] for a delegated runner, and clear one
+/// this runner inherited, so a test that starts Cargo again gets its own
+/// project runner.
+fn set_marker(command: &mut Command, marker: Option<String>) {
+    match marker {
+        Some(marker) => command.env(delegate::DELEGATE_ENV, marker),
+        None => command.env_remove(delegate::DELEGATE_ENV),
+    };
+}
+
 /// Run the binary as it is. On Unix the runner becomes the binary.
-fn exec(args: &[OsString]) -> i32 {
+/// `marker` is set as [`delegate::DELEGATE_ENV`] when a project runner
+/// comes first.
+fn exec(args: &[OsString], marker: Option<String>) -> i32 {
     let mut command = Command::new(&args[0]);
     command.args(&args[1..]);
+    set_marker(&mut command, marker);
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -228,6 +258,7 @@ fn exec(args: &[OsString]) -> i32 {
 /// Run the binary under a test lease, then record its peak RSS.
 fn run_scheduled(
     args: &[OsString],
+    marker: Option<String>,
     cache_dir: &Path,
     env: &TestEnv,
     key: &str,
@@ -241,6 +272,7 @@ fn run_scheduled(
     );
     let mut command = Command::new(&args[0]);
     command.args(&args[1..]);
+    set_marker(&mut command, marker);
     if let Some(lease) = &lease {
         command.envs(lease_env(want, lease.marker_path(), lease.held()));
     }

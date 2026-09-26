@@ -824,6 +824,32 @@ jobs:
           store_kib=$(du -sk /nix/store | cut -f1)
           printf 'Uncompressed Nix store: %s KiB\n' "$store_kib" | tee -a "$GITHUB_STEP_SUMMARY"
 
+  # --- S3 remote against a real store ---
+  # The S3 backend's unit tests talk to a mock HTTP server: they prove what
+  # kache sends, not what a store does with it. This lane runs the conditional
+  # write and concurrent-publisher tests against a local RustFS, so a merge
+  # that silently loses entries on a real store fails here.
+  s3-remote:
+    name: S3 remote (RustFS)
+    runs-on: ${{ fromJSON(!github.event.repository.private && '"ubuntu-latest"' || vars.CI_RUNNER_LINUX) }}
+    needs: changes
+    if: github.event_name != 'pull_request' || needs.changes.outputs.tests == 'true'
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: zondax/actions/setup-runner@8d9900cca4563d4356c5e76c1fa49913158196d4 # v1.5.2
+      - uses: zondax/actions/setup-mise@5ae8fbbddda413b9e5826114fe6ca8d03f8551e2 # v1.4.1
+        with:
+          install: true
+          # Pin mise CLI — see the `check` job's note (v2026.6.10 regression).
+          version: 2026.6.9
+          install_args: rust
+          cache: false
+      - name: Run the S3 remote tests against RustFS
+        env:
+          KACHE_E2E_CACHE: ${{ runner.temp }}/kache-e2e
+        run: scripts/e2e-s3.sh
+
   # --- Copy-on-write filesystem coverage ---
   # Every hosted runner is ext4, where `try_reflink` always fails and the
   # `fs::copy` fallback preserves permissions. That makes an entire class of bug

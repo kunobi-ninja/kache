@@ -99,7 +99,9 @@ Read a change aloud before opening the PR. If it sounds like marketing copy or a
 - **Scenarios**: E2E fixture scenarios live under `scenarios/e2e-*`; benchmark scenarios live under `scenarios/bench-*`
 - **Coverage threshold**: CI enforces a minimum of 88% via `cargo-llvm-cov`
 - **Mutation testing**: CI mutates all `kache-core` behavior plus changed Rust
-  lines in each PR. Reports are uploaded from `tmp/mutants/`.
+  lines in each PR. Lines a PR only moves, which git detects as moved blocks,
+  do not count as changed (`scripts/mutation-diff.py`), so splitting a file
+  mutates only what the split edits. Reports are uploaded from `tmp/mutants/`.
 
 For local mutation runs, install the same version as CI:
 

@@ -1,7 +1,8 @@
 //! The environment variables and working directory a rustc cache key reads.
 //!
-//! [`crate::cache_key::compute_cache_key`] reads them from a [`KeyEnv`], never
-//! from the process. The wrapper captures one per invocation.
+//! [`crate::cache_key::compute_cache_key_with_outputs`] reads them from a
+//! [`KeyEnv`], never from the process. The wrapper captures one per
+//! invocation.
 //!
 //! This is not yet enough to compute a key for another process. Configured
 //! `key_env_vars`, input predictions and the path normalizer still read the
@@ -80,8 +81,9 @@ impl KeyEnv {
     /// The value of `name`, which must be listed in [`KEY_ENV_VARS`].
     ///
     /// A name missing from the list reads as unset and marks the snapshot, and
-    /// [`crate::cache_key::compute_cache_key`] then refuses to return a key:
-    /// an input the snapshot never captured must not drop out of the key.
+    /// [`crate::cache_key::compute_cache_key_with_outputs`] then refuses to
+    /// return a key: an input the snapshot never captured must not drop out
+    /// of the key.
     pub(crate) fn var_os(&self, name: &str) -> Option<OsString> {
         if !KEY_ENV_VARS.contains(&name) {
             self.undeclared_read.set(true);

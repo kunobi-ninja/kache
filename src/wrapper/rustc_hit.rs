@@ -31,6 +31,7 @@ impl RustcHitContext<'_> {
         key_hash_stats: FileHashStats,
         lookup_ms: u64,
         prediction_store: Option<&Store>,
+        key: &crate::cache_key::KeyOutputs,
     ) -> Result<()> {
         let restore_start = Instant::now();
         restore_from_cache(
@@ -54,7 +55,7 @@ impl RustcHitContext<'_> {
             restore_ms,
         }
         .report(self.config, meta);
-        record_input_prediction(self.config, prediction_store, self.args, true);
+        record_input_prediction(self.config, prediction_store, self.args, true, key);
         clean_incremental_dir(self.config, self.args);
         Ok(())
     }

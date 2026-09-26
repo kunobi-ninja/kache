@@ -10,7 +10,7 @@ use std::borrow::Cow;
 use std::path::PathBuf;
 
 use crate::args::RustcArgs;
-use crate::cache_key::compute_cache_key;
+use crate::cache_key::{KeyOutputs, compute_cache_key_with_outputs};
 use crate::compile;
 use crate::key_env::KeyEnv;
 
@@ -99,27 +99,20 @@ impl RustcCompiler {
     }
 
     /// [`Compiler::cache_key`] with the environment and working directory in
-    /// `env`. Configured `key_env_vars`, input predictions and the path
-    /// normalizer still read this process, so `env` must describe this process
-    /// until they move into the snapshot too.
+    /// `env`, and with what the computation learned besides the key (see
+    /// [`KeyOutputs`], returned whether or not the key is). Configured
+    /// `key_env_vars`, input predictions and the path normalizer still read
+    /// this process, so `env` must describe this process until they move
+    /// into the snapshot too.
     pub(crate) fn cache_key_in(
         &self,
         parsed: &RustcArgs,
         ctx: &KeyCtx<'_, '_>,
         env: &KeyEnv,
-    ) -> Result<String> {
-        let crate_name = parsed.crate_name.as_deref().unwrap_or("unknown");
-        let key = compute_cache_key(parsed, ctx.file_hasher, ctx.path_normalizer, env)?;
-        let key = match ctx.extra_inputs_digest {
-            Some(digest) => crate::cache_key::fold_labeled(key, "extra_inputs", digest),
-            None => key,
-        };
-        let key = crate::cache_key::apply_key_env_vars(key, ctx.key_env_vars, crate_name);
-        Ok(crate::cache_key::apply_key_salt(
-            key,
-            ctx.key_salt,
-            crate_name,
-        ))
+    ) -> (Result<String>, KeyOutputs) {
+        let (key, outputs) =
+            compute_cache_key_with_outputs(parsed, ctx.file_hasher, ctx.path_normalizer, env);
+        (key.map(|key| finish_key(parsed, ctx, key)), outputs)
     }
 
     /// Execute a caller-visible compile, forwarding metadata readiness to Cargo.
@@ -244,8 +237,10 @@ impl Compiler for RustcCompiler {
     }
 
     /// The key for an invocation that ran in this process's environment.
+    /// The trait returns only the key, as it does for cc and nvcc; the
+    /// wrapper keys rustc through [`RustcCompiler::cache_key_in`].
     fn cache_key(&self, parsed: &RustcArgs, ctx: &KeyCtx<'_, '_>) -> Result<String> {
-        self.cache_key_in(parsed, ctx, &KeyEnv::capture())
+        self.cache_key_in(parsed, ctx, &KeyEnv::capture()).0
     }
 
     fn execute(&self, parsed: &RustcArgs) -> Result<CompileResult> {
@@ -275,6 +270,17 @@ impl Compiler for RustcCompiler {
             kind => kind,
         }
     }
+}
+
+/// Fold the configured extra inputs, key env vars and salt into `key`.
+fn finish_key(parsed: &RustcArgs, ctx: &KeyCtx<'_, '_>, key: String) -> String {
+    let crate_name = parsed.crate_name.as_deref().unwrap_or("unknown");
+    let key = match ctx.extra_inputs_digest {
+        Some(digest) => crate::cache_key::fold_labeled(key, "extra_inputs", digest),
+        None => key,
+    };
+    let key = crate::cache_key::apply_key_env_vars(key, ctx.key_env_vars, crate_name);
+    crate::cache_key::apply_key_salt(key, ctx.key_salt, crate_name)
 }
 
 fn rustc_refuse_reasons(
@@ -1515,15 +1521,17 @@ mod tests {
         };
         let compiler = RustcCompiler::new();
         let env = KeyEnv::capture();
-        let plain = compute_cache_key(&parsed, &file_hasher, &path_normalizer, &env).unwrap();
-        assert_eq!(compiler.cache_key_in(&parsed, &ctx, &env).unwrap(), plain);
+        let plain =
+            crate::cache_key::compute_cache_key(&parsed, &file_hasher, &path_normalizer, &env)
+                .unwrap();
+        assert_eq!(compiler.cache_key_in(&parsed, &ctx, &env).0.unwrap(), plain);
         assert_eq!(compiler.cache_key(&parsed, &ctx).unwrap(), plain);
         let salted = KeyCtx {
             key_salt: Some("salt"),
             ..ctx
         };
         assert_ne!(
-            compiler.cache_key_in(&parsed, &salted, &env).unwrap(),
+            compiler.cache_key_in(&parsed, &salted, &env).0.unwrap(),
             plain
         );
     }

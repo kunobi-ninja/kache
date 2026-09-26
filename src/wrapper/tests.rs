@@ -92,10 +92,7 @@ fn only_a_fresh_closure_is_worth_recording() {
     assert!(should_record_closure(false, true));
 }
 
-/// Recording is opt-in and needs somewhere to record. Neither refusal may
-/// leave the discovered closure sitting in the thread-local stash, where
-/// the next key computed on this thread would find it and record another
-/// unit's inputs under its own identity.
+/// Recording is opt-in and needs somewhere to record.
 #[test]
 fn input_predictions_record_only_when_enabled_and_backed_by_a_store() {
     let _lock = crate::test_support::process_state_test_lock();
@@ -107,34 +104,29 @@ fn input_predictions_record_only_when_enabled_and_backed_by_a_store() {
         source_files: vec![std::path::PathBuf::from("src/lib.rs")],
         env_deps: Vec::new(),
     };
-    let stash = || crate::cache_key::stash_last_dep_info_for_test(closure.clone());
+    let key = crate::cache_key::KeyOutputs {
+        dep_info: Some(closure.clone()),
+        ..Default::default()
+    };
     let identity = crate::cache_key::rustc_prediction_identity(&args)
         .expect("an invocation with a crate root has an identity");
     let recorded = |store: &Store| store.file_hasher().input_prediction(&identity).is_some();
 
     // Off by default, which is the state every user is in today.
     assert!(!config.input_predictions);
-    stash();
-    record_input_prediction(&config, Some(&store), &args, true);
+    record_input_prediction(&config, Some(&store), &args, true, &key);
     assert!(
         !recorded(&store),
         "the feature is off; nothing may be written"
     );
-    assert!(
-        crate::cache_key::take_last_dep_info().is_none(),
-        "a declined recording must still clear the stash"
-    );
 
     // On, but with no store to record into: the daemon's store-free path.
     config.input_predictions = true;
-    stash();
-    record_input_prediction(&config, None, &args, true);
+    record_input_prediction(&config, None, &args, true, &key);
     assert!(!recorded(&store));
-    assert!(crate::cache_key::take_last_dep_info().is_none());
 
     // On, with a store, and a closure to record.
-    stash();
-    record_input_prediction(&config, Some(&store), &args, true);
+    record_input_prediction(&config, Some(&store), &args, true, &key);
     assert!(
         recorded(&store),
         "an enabled build with a store must remember what it discovered"
@@ -142,10 +134,15 @@ fn input_predictions_record_only_when_enabled_and_backed_by_a_store() {
     let record = store.file_hasher().input_prediction(&identity).unwrap();
     assert_eq!(record.sources, closure.source_files);
 
-    // And with nothing in the stash there is nothing to record: an
-    // invocation that never ran a pre-pass must not write an empty closure
-    // over a good one.
-    record_input_prediction(&config, Some(&store), &args, true);
+    // And with no closure there is nothing to record: an invocation that
+    // never ran a pre-pass must not write an empty closure over a good one.
+    record_input_prediction(
+        &config,
+        Some(&store),
+        &args,
+        true,
+        &crate::cache_key::KeyOutputs::default(),
+    );
     assert_eq!(
         store
             .file_hasher()
@@ -202,9 +199,18 @@ fn a_registry_unit_reading_its_out_dir_records_a_relocated_row() {
     let (relocatable, _) =
         crate::cache_key::relocatable_record(&args, &reads_out_dir, Some("tree")).unwrap();
 
-    crate::cache_key::stash_last_dep_info_for_test(reads_out_dir);
-    crate::cache_key::stash_last_tree_digest_for_test("tree");
-    record_input_prediction(&config, Some(&store), &args, true);
+    let key = |dep_info, tree: &str| crate::cache_key::KeyOutputs {
+        dep_info: Some(dep_info),
+        tree_digest: Some(tree.to_string()),
+        ..Default::default()
+    };
+    record_input_prediction(
+        &config,
+        Some(&store),
+        &args,
+        true,
+        &key(reads_out_dir, "tree"),
+    );
     let hasher = store.file_hasher();
     assert!(hasher.input_prediction(&shared).is_none());
     let record = hasher.portable_prediction(&relocatable).unwrap();
@@ -214,9 +220,13 @@ fn a_registry_unit_reading_its_out_dir_records_a_relocated_row() {
         source_files: vec![lib],
         env_deps: Vec::new(),
     };
-    crate::cache_key::stash_last_dep_info_for_test(package_only.clone());
-    crate::cache_key::stash_last_tree_digest_for_test("tree-2");
-    record_input_prediction(&config, Some(&store), &args, true);
+    record_input_prediction(
+        &config,
+        Some(&store),
+        &args,
+        true,
+        &key(package_only.clone(), "tree-2"),
+    );
     assert_eq!(
         hasher.input_prediction(&shared).unwrap().sources,
         package_only.source_files
@@ -6278,6 +6288,70 @@ fn log_event_with_store_stats_persists_timing_hash_and_store_fields() {
 /// grow and other tests in this binary add real milliseconds to them, so
 /// each field is fed a magnitude ten times the last: a lower bound and a
 /// band catch a zeroed field and a swapped one, whatever ran before.
+/// A rustc key's record rides the next event and only that one. The
+/// extern maps and unit id need `explain_miss`; the group digests do not.
+#[test]
+fn a_key_record_reaches_the_next_event_once() {
+    let _ = crate::verify_compare::take_last_report();
+    let _ = take_key_for_event();
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path().join("cache"));
+    config.explain_miss = true;
+    let map = |name: &str, value: &str| {
+        std::collections::BTreeMap::from([(name.to_string(), value.to_string())])
+    };
+    let log = |config: &Config| {
+        log_event_with_hash_stats(
+            config,
+            "/repo",
+            "foo",
+            EventResult::Passthrough,
+            1,
+            0,
+            0,
+            "",
+            0,
+            FileHashStats::default(),
+            0,
+            0,
+            0,
+        )
+    };
+    let key = crate::cache_key::KeyOutputs {
+        fields: Some(map("args", "aaaa")),
+        externs: Some(map("dep", "dddd")),
+        extern_units: Some(map("dep", "uuuu")),
+        unit_id: Some("self".to_string()),
+        ..Default::default()
+    };
+    stash_key_for_event(&key);
+    log(&config);
+    log(&config);
+    // A key that stopped before its digests replaces the extern record
+    // but leaves the earlier digests for the next event.
+    stash_key_for_event(&key);
+    stash_key_for_event(&crate::cache_key::KeyOutputs::default());
+    log(&config);
+    config.explain_miss = false;
+    stash_key_for_event(&key);
+    log(&config);
+
+    let events = crate::events::read_events(&config.event_log_path()).unwrap();
+    assert_eq!(events.len(), 4);
+    assert_eq!(events[0].key_fields, map("args", "aaaa"));
+    assert!(events[0].key_externs_recorded);
+    assert_eq!(events[0].key_externs, map("dep", "dddd"));
+    assert_eq!(events[0].extern_units, map("dep", "uuuu"));
+    assert_eq!(events[0].unit_id, "self");
+    assert!(events[1].key_fields.is_empty(), "taken by the first event");
+    assert!(!events[1].key_externs_recorded);
+    assert_eq!(events[2].key_fields, map("args", "aaaa"));
+    assert!(!events[2].key_externs_recorded);
+    assert_eq!(events[3].key_fields, map("args", "aaaa"));
+    assert!(!events[3].key_externs_recorded);
+    assert!(events[3].unit_id.is_empty());
+}
+
 #[test]
 fn log_event_records_the_wrapper_phase_accumulators() {
     let _ = crate::verify_compare::take_last_report();
@@ -8850,7 +8924,7 @@ fn a_key_from_emitted_dep_info_always_arms_the_too_new_guard() {
         None,
         &KeyEnv::default(),
         ExtraInputsKey::default(),
-        KeyDiscovery::Emitted(closure),
+        KeyDiscovery::Emitted(closure, None),
     )
     .unwrap();
     assert!(!keyed.cache_key.is_empty());

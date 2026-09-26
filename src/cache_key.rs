@@ -507,10 +507,11 @@ fn key_env_digest(patterns: &[String], mut matched: Vec<RawEnvPair>) -> String {
 }
 
 /// An env var *value* as key bytes: the OS's own representation, losslessly.
+/// The cc preprocessor memo encodes its paths and values the same way.
 ///
 /// `to_string_lossy` would map every distinct invalid sequence onto `U+FFFD`,
 /// merging values a macro reading `var_os` can still tell apart.
-fn env_os_key_bytes(value: &std::ffi::OsStr) -> Vec<u8> {
+pub(crate) fn env_os_key_bytes(value: &std::ffi::OsStr) -> Vec<u8> {
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStrExt;
@@ -725,59 +726,69 @@ impl GroupedHasher {
     }
 }
 
-thread_local! {
-    /// Per-group digests of the most recent [`compute_cache_key`] run on this
-    /// thread, for the wrapper's event logging (one compile per wrapper
-    /// process, same stash pattern as `link.rs`'s toggles). `None` until a key
-    /// is computed (cc compiles, passthroughs).
-    ///
-    /// Thread-local rather than process-global (kunobi-ninja/kache#777): the
-    /// write and every read are one wrapper invocation on one thread, so
-    /// per-thread storage costs the production path nothing and makes the
-    /// take-once contract hold under `cargo test`, where libtest runs each test
-    /// on its own thread and a concurrent key computation would otherwise
-    /// consume or overwrite another test's stash.
-    static LAST_KEY_FIELDS: std::cell::RefCell<Option<std::collections::BTreeMap<String, String>>> =
-        const { std::cell::RefCell::new(None) };
-}
-
-/// Clone the per-group key digests without consuming them.
+/// What a rustc key computation learned besides the key.
 ///
-/// Adaptive incremental policy needs the same input-group evidence as miss
-/// diagnostics before event logging takes the thread-local stash.
-pub fn peek_last_key_fields() -> Option<std::collections::BTreeMap<String, String>> {
-    LAST_KEY_FIELDS
-        .try_with(|stash| stash.borrow().clone())
-        .ok()
-        .flatten()
-}
-
-/// Take (consume) the per-group key digests of the last computed rustc key.
-pub fn take_last_key_fields() -> Option<std::collections::BTreeMap<String, String>> {
-    LAST_KEY_FIELDS
-        .try_with(|stash| stash.borrow_mut().take())
-        .ok()
-        .flatten()
-}
-
-thread_local! {
-    /// Per-EXTERN artifact digests of the most recent [`compute_cache_key`] run
-    /// (kunobi-ninja/kache#609), stashed like [`LAST_KEY_FIELDS`].
+/// Returned by [`compute_cache_key_with_outputs`] even when the key is not:
+/// a deferred discovery still carries the tree digest it took, and a key that
+/// failed late still names the externs it hashed. Every field starts empty or
+/// `false` and is filled only on the paths that produce it.
+#[derive(Debug, Default)]
+pub struct KeyOutputs {
+    /// Per-group digests of the key, for the event log and `explain_miss`
+    /// (kunobi-ninja/kache#131). Set only once the whole key was hashed.
+    pub fields: Option<BTreeMap<String, String>>,
+    /// Per-extern artifact digests (kunobi-ninja/kache#609).
     ///
     /// The `externs` group digest says only THAT some dependency's artifact
     /// changed. In an `extern:` cascade — one native `-sys` crate's `.a`
     /// diverging and re-keying everything above it — every downstream crate
-    /// reports the same undifferentiated "externs changed", which is exactly
-    /// the case that has to be diagnosed by hand today. Keeping the
+    /// reports the same undifferentiated "externs changed". Keeping the
     /// per-dependency hashes lets `why-miss` name WHICH dependency moved, then
     /// follow that dependency's own events to the root of the chain.
     ///
     /// The value is the dependency artifact's own content hash (the same bytes
     /// folded into the key), truncated to [`KEY_FIELD_HEX`] — not a digest of
-    /// the folded segment. Same discriminating power, and it can be compared
-    /// against hashes recorded elsewhere.
-    static LAST_KEY_EXTERNS: std::cell::RefCell<Option<std::collections::BTreeMap<String, String>>> =
-        const { std::cell::RefCell::new(None) };
+    /// the folded segment. `Some` once the externs group was hashed, even
+    /// when the map is empty (a crate with no dependencies).
+    pub externs: Option<BTreeMap<String, String>>,
+    /// Producing-unit identity per extern, teed off the same loop that fills
+    /// [`KeyOutputs::externs`] and set with it (kunobi-ninja/kache#627).
+    ///
+    /// Keyed by the name the CONSUMER used, which under Cargo's
+    /// `package = "..."` renaming is an alias (`foo_old` for a crate whose own
+    /// events say `foo`). The value is the producer's `-C extra-filename`,
+    /// recovered from the artifact path — the one identity visible from both
+    /// sides, so `why-miss` can join a changed dependency to the exact unit
+    /// that produced it instead of guessing by name.
+    ///
+    /// Absent for an extern whose path carries no such suffix (sysroot crates,
+    /// non-cargo invocations); the walk then falls back to matching by name.
+    pub extern_units: Option<BTreeMap<String, String>>,
+    /// The compiling unit's own identity: its `-C extra-filename`, `None`
+    /// when cargo passed none. Set however the computation ends.
+    pub unit_id: Option<String>,
+    /// The native archives the key hashed, for the wrapper's store-time
+    /// bundle audit.
+    pub native_archives: Option<KeyedNativeArchives>,
+    /// The input closure the key folded. The wrapper records it as a
+    /// prediction only once the compile or restore it belongs to has
+    /// succeeded. `None` when the invocation has no source file, or the
+    /// computation stopped before the closure was resolved.
+    pub dep_info: Option<DepInfo>,
+    /// The tree digest a guarded computation used: the crate tree of a
+    /// proc-macro-dependent unit, or the `OUT_DIR` guard of a unit that
+    /// looked for a relocated or workspace record. A record made from this
+    /// invocation must carry it.
+    pub tree_digest: Option<String>,
+    /// Did the key keep an OUT_DIR path (OUT_DIR itself, or a value under it)
+    /// as a literal? A lib whose key does is one whose consumers are worth
+    /// recording (see `out_dir_alias`).
+    pub bakes_out_dir: bool,
+    /// Did the key derive its input set from a record rather than from the
+    /// pre-pass? A derived key that misses locally must be recomputed the
+    /// slow way before anything reaches the remote, the scheduler or the
+    /// store.
+    pub used_prediction: bool,
 }
 
 /// The native archives a key hashed, with the unit's native search dirs.
@@ -804,139 +815,10 @@ pub struct BundledArchive {
     pub packed: bool,
 }
 
-thread_local! {
-    /// [`KeyedNativeArchives`] of the most recent [`compute_cache_key`] run,
-    /// stashed like [`LAST_KEY_EXTERNS`] for the wrapper's store-time bundle
-    /// audit.
-    static LAST_KEY_NATIVE_ARCHIVES: RefCell<Option<KeyedNativeArchives>> =
-        const { RefCell::new(None) };
-}
-
-/// Take (consume) the native archives the last computed rustc key hashed.
-pub fn take_last_key_native_archives() -> Option<KeyedNativeArchives> {
-    LAST_KEY_NATIVE_ARCHIVES
-        .try_with(|stash| stash.borrow_mut().take())
-        .ok()
-        .flatten()
-}
-
 /// Marker recorded for an extern whose artifact could not be hashed — a
 /// sysroot crate (`std`, `core`), whose identity rides on rustc version + name
 /// instead. Distinct from any real hash, so it never reads as a content match.
 pub const EXTERN_UNREADABLE: &str = "(sysroot)";
-
-/// Take (consume) the per-extern artifact digests of the last computed rustc
-/// key. `None` for cc compiles and passthroughs, which compute no rustc key.
-pub fn take_last_key_externs() -> Option<std::collections::BTreeMap<String, String>> {
-    LAST_KEY_EXTERNS
-        .try_with(|stash| stash.borrow_mut().take())
-        .ok()
-        .flatten()
-}
-
-thread_local! {
-    /// Producing-unit identity per extern, teed off the same loop that computes
-    /// [`LAST_KEY_EXTERNS`] (kunobi-ninja/kache#627).
-    ///
-    /// Keyed by the name the CONSUMER used, which under Cargo's
-    /// `package = "..."` renaming is an alias (`foo_old` for a crate whose own
-    /// events say `foo`). The value is the producer's `-C extra-filename`,
-    /// recovered from the artifact path — the one identity visible from both
-    /// sides, so `why-miss` can join a changed dependency to the exact unit
-    /// that produced it instead of guessing by name.
-    ///
-    /// Absent for an extern whose path carries no such suffix (sysroot crates,
-    /// non-cargo invocations); the walk then falls back to matching by name.
-    static LAST_KEY_EXTERN_UNITS: std::cell::RefCell<
-        Option<std::collections::BTreeMap<String, String>>,
-    > = const { std::cell::RefCell::new(None) };
-}
-
-/// Take (consume) the per-extern producing-unit ids of the last computed rustc
-/// key. Always taken alongside [`take_last_key_externs`] so a stale map cannot
-/// outlive its digests.
-pub fn take_last_key_extern_units() -> Option<std::collections::BTreeMap<String, String>> {
-    LAST_KEY_EXTERN_UNITS
-        .try_with(|stash| stash.borrow_mut().take())
-        .ok()
-        .flatten()
-}
-
-thread_local! {
-    /// The compiling unit's own identity, stashed at key computation so the
-    /// event writer needs no extra plumbing — the same pattern the per-group
-    /// digests use (kunobi-ninja/kache#131). Set unconditionally at the top of
-    /// [`compute_cache_key`], including to `None` when cargo passed no
-    /// `-C extra-filename`, so it can never carry over from a previous compile.
-    static LAST_KEY_UNIT_ID: std::cell::RefCell<Option<String>> =
-        const { std::cell::RefCell::new(None) };
-}
-
-/// Take (consume) the unit id of the last computed rustc key.
-pub fn take_last_key_unit_id() -> Option<String> {
-    LAST_KEY_UNIT_ID
-        .try_with(|stash| stash.borrow_mut().take())
-        .ok()
-        .flatten()
-}
-
-thread_local! {
-    /// The input closure the last [`compute_cache_key`] on this thread
-    /// discovered, stashed like the per-group digests above.
-    ///
-    /// The wrapper needs it to record a prediction, but only once the compile
-    /// or restore it belongs to has actually succeeded — which happens far
-    /// below the key computation, past the store, the scheduler and the
-    /// compiler. Threading a `DepInfo` through all of that would touch every
-    /// caller of `compute_cache_key`; the stash is the pattern the other
-    /// key by-products already use.
-    static LAST_KEY_DEP_INFO: std::cell::RefCell<Option<DepInfo>> =
-        const { std::cell::RefCell::new(None) };
-}
-
-/// Put a closure in the stash as a key computation would, so the wrapper's
-/// recording gate can be tested without spawning a compiler.
-#[cfg(test)]
-pub(crate) fn stash_last_dep_info_for_test(dep_info: DepInfo) {
-    let _ = LAST_KEY_DEP_INFO.try_with(|stash| *stash.borrow_mut() = Some(dep_info));
-}
-
-thread_local! {
-    /// The tree digest the last guarded key computation on this thread used,
-    /// so the record made from it carries the same digest.
-    static LAST_KEY_TREE_DIGEST: std::cell::RefCell<Option<String>> =
-        const { std::cell::RefCell::new(None) };
-}
-
-/// Put a tree digest in the stash as a guarded key computation would.
-#[cfg(test)]
-pub(crate) fn stash_last_tree_digest_for_test(tree: &str) {
-    let _ = LAST_KEY_TREE_DIGEST.try_with(|stash| *stash.borrow_mut() = Some(tree.to_string()));
-}
-
-thread_local! {
-    /// Did the last key computed on this thread keep an OUT_DIR path (OUT_DIR
-    /// itself, or a value under it) as a literal? A lib whose key does is one
-    /// whose consumers are worth recording (see `out_dir_alias`).
-    static LAST_KEY_BAKES_OUT_DIR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// Take (consume) whether the last computed rustc key keeps an OUT_DIR path.
-pub(crate) fn take_last_key_bakes_out_dir() -> bool {
-    LAST_KEY_BAKES_OUT_DIR
-        .try_with(|stash| stash.replace(false))
-        .unwrap_or(false)
-}
-
-/// Take (consume) the tree digest of the last computed rustc key: the crate
-/// tree of a proc-macro-dependent unit, or the `OUT_DIR` guard of a registry
-/// unit that looked for a relocated record.
-pub(crate) fn take_last_tree_digest() -> Option<String> {
-    LAST_KEY_TREE_DIGEST
-        .try_with(|stash| stash.borrow_mut().take())
-        .ok()
-        .flatten()
-}
 
 /// Cap on entries digested for the tree guard. A crate directory past this is
 /// a build tree or a monorepo root, and the pre-pass stays cheaper than
@@ -1089,13 +971,6 @@ fn crate_tree_fold(
 }
 
 thread_local! {
-    /// Did the last key computed on this thread derive its input set from a
-    /// record rather than from the pre-pass?
-    ///
-    /// The wrapper needs it for the one rule that keeps stores sound: a
-    /// derived key that misses locally must be recomputed the slow way before
-    /// anything reaches the remote, the scheduler or the store.
-    static LAST_KEY_USED_PREDICTION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// May the key refuse to discover a closure it has no record of, so the
     /// wrapper compiles first and keys from the dep-info rustc emits?
     static DEFER_DISCOVERY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -1127,11 +1002,12 @@ pub fn set_defer_discovery(allowed: bool) {
 }
 
 /// Use `dep_info` for the next key computed on this thread.
-pub fn provide_dep_info(dep_info: DepInfo) {
-    // Rekeying clears the per-key stashes. Carry the tree observed before
-    // compilation with its emitted closure, so a changed tree still rejects
-    // that prediction rather than blessing old inputs with a new digest.
-    let tree = take_last_tree_digest();
+///
+/// `tree` is the tree digest the deferred computation took before the
+/// compile ([`KeyOutputs::tree_digest`]). It rides with the emitted closure,
+/// so a changed tree still rejects that prediction rather than blessing old
+/// inputs with a new digest.
+pub fn provide_dep_info(dep_info: DepInfo, tree: Option<String>) {
     PROVIDED_DEP_INFO.with(|cell| *cell.borrow_mut() = Some((dep_info, tree)));
 }
 
@@ -1148,24 +1024,6 @@ pub fn dep_info_from_emitted(path: &Path, source_file: &Path) -> Result<DepInfo>
         source_files,
         env_deps,
     })
-}
-
-/// Take (consume) whether the last computed rustc key came from a prediction.
-pub(crate) fn take_last_key_used_prediction() -> bool {
-    LAST_KEY_USED_PREDICTION
-        .try_with(|stash| stash.replace(false))
-        .unwrap_or(false)
-}
-
-/// Take (consume) the input closure of the last computed rustc key.
-///
-/// `None` for cc compiles, passthroughs, and any invocation with no source
-/// file — none of which discovered a closure to remember.
-pub(crate) fn take_last_dep_info() -> Option<DepInfo> {
-    LAST_KEY_DEP_INFO
-        .try_with(|stash| stash.borrow_mut().take())
-        .ok()
-        .flatten()
 }
 
 /// Stable identity for one dep-info source path.
@@ -1645,6 +1503,7 @@ fn closures_agree(predicted: &DepInfo, discovered: &DepInfo) -> bool {
 fn predicted_key_inputs(
     args: &RustcArgs,
     file_hasher: &FileHasher<'_>,
+    tree_digest: &mut Option<String>,
 ) -> std::result::Result<DepInfo, Rejection> {
     let _trace = crate::phase_trace::phase("prediction_validate");
     if !file_hasher.uses_input_predictions() {
@@ -1655,8 +1514,9 @@ fn predicted_key_inputs(
     // A unit with a proc-macro dependency is only predictable under the tree
     // guard: the record must carry the tree digest and it must still match.
     // The tree is the package for a registry unit and the whole workspace for
-    // a workspace one. Computed once here and stashed, because the same digest
-    // is what a record made from this invocation has to carry.
+    // a workspace one. Computed once here and handed back in `tree_digest`,
+    // because the same digest is what a record made from this invocation has
+    // to carry.
     let tree = if prediction_applies(&args.externs) {
         None
     } else {
@@ -1666,7 +1526,7 @@ fn predicted_key_inputs(
             None => crate_tree_digest(file_hasher),
         }
         .ok_or(Rejection::NotEligible)?;
-        let _ = LAST_KEY_TREE_DIGEST.try_with(|stash| *stash.borrow_mut() = Some(digest.clone()));
+        *tree_digest = Some(digest.clone());
         Some(digest)
     };
     let identity = rustc_prediction_identity(args).ok_or(Rejection::Disabled)?;
@@ -1685,8 +1545,10 @@ fn predicted_key_inputs(
         })
     else {
         return match &workspace {
-            Some(workspace) => workspace_key_inputs(args, file_hasher, workspace, vars, tree),
-            None => relocated_key_inputs(args, file_hasher, tree),
+            Some(workspace) => {
+                workspace_key_inputs(args, file_hasher, workspace, vars, tree, tree_digest)
+            }
+            None => relocated_key_inputs(args, file_hasher, tree, tree_digest),
         };
     };
     if let Some(tree) = &tree {
@@ -1736,13 +1598,14 @@ fn keep_remote_plain_row(
 /// `OUT_DIR` relocated to this one.
 ///
 /// The guard is `tree` for a proc-macro dependent and a digest of `OUT_DIR`
-/// otherwise. It is stashed before the lookup, so a record made from this
-/// invocation, after a deferred compile included, carries the digest taken
-/// before rustc ran. Only this row is checked against it.
+/// otherwise. It goes into `tree_digest` before the lookup, so a record made
+/// from this invocation, after a deferred compile included, carries the
+/// digest taken before rustc ran. Only this row is checked against it.
 fn relocated_key_inputs(
     args: &RustcArgs,
     file_hasher: &FileHasher<'_>,
     tree: Option<String>,
+    tree_digest: &mut Option<String>,
 ) -> std::result::Result<DepInfo, Rejection> {
     let vars: Vec<_> = std::env::vars_os().collect();
     let out_dir = env_var_in(&vars, "OUT_DIR")
@@ -1758,7 +1621,7 @@ fn relocated_key_inputs(
             out_dir_tree_digest(Path::new(&out_dir), file_hasher).ok_or(Rejection::NoRecord)?
         }
     };
-    let _ = LAST_KEY_TREE_DIGEST.try_with(|stash| *stash.borrow_mut() = Some(guard.clone()));
+    *tree_digest = Some(guard.clone());
     let places = Places {
         out_dir: Some(&out_dir),
         workspace: None,
@@ -1880,6 +1743,7 @@ fn workspace_key_inputs(
     workspace: &WorkspaceRoots,
     vars: Vec<(std::ffi::OsString, std::ffi::OsString)>,
     tree: Option<String>,
+    tree_digest: &mut Option<String>,
 ) -> std::result::Result<DepInfo, Rejection> {
     let identity =
         workspace_prediction_identity(args, vars, workspace).ok_or(Rejection::NoRecord)?;
@@ -1890,7 +1754,7 @@ fn workspace_key_inputs(
             workspace_tree_digest(workspace, file_hasher).ok_or(Rejection::NoRecord)?
         }
     };
-    let _ = LAST_KEY_TREE_DIGEST.try_with(|stash| *stash.borrow_mut() = Some(guard.clone()));
+    *tree_digest = Some(guard.clone());
     let places = workspace.places().ok_or(Rejection::NoRecord)?;
     portable_key_inputs(file_hasher, &identity, args, &guard, &places)
 }
@@ -2088,15 +1952,16 @@ fn resolve_key_inputs(
     file_hasher: &FileHasher<'_>,
     crate_name: &str,
     env: &KeyEnv,
+    out: &mut KeyOutputs,
 ) -> Result<Option<DepInfo>> {
     if let Some((provided, tree)) = PROVIDED_DEP_INFO.with(|cell| cell.borrow_mut().take()) {
-        let _ = LAST_KEY_TREE_DIGEST.try_with(|stash| *stash.borrow_mut() = tree);
+        out.tree_digest = tree;
         crate::phase_trace::decision("prediction", "emitted");
         tracing::trace!("[key:{}] inputs=emitted-dep-info", crate_name);
         return Ok(Some(provided));
     }
     if args.source_file.is_some() {
-        let mut prediction = predicted_key_inputs(args, file_hasher);
+        let mut prediction = predicted_key_inputs(args, file_hasher, &mut out.tree_digest);
         // Whether this process holds the unit's discovery flight. Only the
         // holder may compile before keying: a peer that also found nothing
         // would compile the same unit a second time instead of waiting for
@@ -2112,7 +1977,7 @@ fn resolve_key_inputs(
             // The previous owner may have published while this process
             // waited; a flight taken at once had no owner to publish.
             if flight.waited {
-                prediction = predicted_key_inputs(args, file_hasher);
+                prediction = predicted_key_inputs(args, file_hasher, &mut out.tree_digest);
             }
         }
         match prediction {
@@ -2143,7 +2008,7 @@ fn resolve_key_inputs(
                     return Ok(discovered);
                 }
                 tracing::trace!("[key:{}] inputs=predicted", crate_name);
-                let _ = LAST_KEY_USED_PREDICTION.try_with(|stash| stash.set(true));
+                out.used_prediction = true;
                 return Ok(Some(dep_info));
             }
             // A missing prediction only describes this checkout. Another
@@ -2194,7 +2059,8 @@ fn dep_info_pre_pass(args: &RustcArgs) -> Result<Option<DepInfo>> {
         .transpose()
 }
 
-/// Compute the blake3 cache key for a rustc invocation.
+/// Compute the blake3 cache key for a rustc invocation, with what the
+/// computation learned on the way ([`KeyOutputs`]).
 ///
 /// The key captures everything that affects compilation output:
 /// - rustc version (full verbose string)
@@ -2207,37 +2073,46 @@ fn dep_info_pre_pass(args: &RustcArgs) -> Result<Option<DepInfo>> {
 /// - dependency artifact hashes
 /// - RUSTFLAGS and relevant env vars
 /// - linker identity (for bin/dylib caching)
-pub fn compute_cache_key(
+///
+/// The outputs come back whether or not the key does, and belong to this
+/// computation alone: nothing carries over from an earlier one (#609).
+pub fn compute_cache_key_with_outputs(
     args: &RustcArgs,
     file_hasher: &FileHasher<'_>,
     path_normalizer: &PathNormalizer,
     env: &KeyEnv,
+) -> (Result<String>, KeyOutputs) {
+    let mut out = KeyOutputs {
+        unit_id: args.unit_id(),
+        ..KeyOutputs::default()
+    };
+    let key = compute_key_into(args, file_hasher, path_normalizer, env, &mut out);
+    (key, out)
+}
+
+/// [`compute_cache_key_with_outputs`], for tests that need only the key.
+#[cfg(test)]
+pub(crate) fn compute_cache_key(
+    args: &RustcArgs,
+    file_hasher: &FileHasher<'_>,
+    path_normalizer: &PathNormalizer,
+    env: &KeyEnv,
+) -> Result<String> {
+    compute_cache_key_with_outputs(args, file_hasher, path_normalizer, env).0
+}
+
+fn compute_key_into(
+    args: &RustcArgs,
+    file_hasher: &FileHasher<'_>,
+    path_normalizer: &PathNormalizer,
+    env: &KeyEnv,
+    out: &mut KeyOutputs,
 ) -> Result<String> {
     let _trace = crate::phase_trace::phase("key");
     // Grouped: the main digest is identical to a plain hasher's; the group
     // tee powers `explain_miss` (kunobi-ninja/kache#131).
     let mut hasher = GroupedHasher::new("compiler");
     let crate_name = args.crate_name.as_deref().unwrap_or("unknown");
-
-    // Clear the extern stash up front (#609). It is written near the end of
-    // this function, so a computation that bails before the externs group —
-    // or one that never reaches the event writer — would otherwise leave a
-    // previous invocation's dependency digests to be picked up as if they
-    // belonged to this compile.
-    let _ = LAST_KEY_EXTERNS.try_with(|stash| *stash.borrow_mut() = None);
-    let _ = LAST_KEY_NATIVE_ARCHIVES.try_with(|stash| *stash.borrow_mut() = None);
-    // Same reasoning for the unit ids (#627); both are cleared and written
-    // together so the walk can never pair one compile's digests with another's
-    // identities.
-    let _ = LAST_KEY_EXTERN_UNITS.try_with(|stash| *stash.borrow_mut() = None);
-    let _ = LAST_KEY_UNIT_ID.try_with(|stash| *stash.borrow_mut() = args.unit_id());
-    // And the discovered closure, for the same reason: a computation that
-    // bails before the pre-pass would otherwise leave the previous compile's
-    // closure to be recorded against this one's identity.
-    let _ = LAST_KEY_DEP_INFO.try_with(|stash| *stash.borrow_mut() = None);
-    let _ = LAST_KEY_TREE_DIGEST.try_with(|stash| *stash.borrow_mut() = None);
-    let _ = LAST_KEY_USED_PREDICTION.try_with(|stash| stash.set(false));
-    let _ = LAST_KEY_BAKES_OUT_DIR.try_with(|stash| stash.set(false));
 
     // The unit's OUT_DIR, read here once and passed to everything below that
     // needs it.
@@ -2434,11 +2309,11 @@ pub fn compute_cache_key(
         tracing::trace!("[key:{}] cfg:{}", crate_name, cfg);
     }
 
-    let dep_info = resolve_key_inputs(args, file_hasher, crate_name, env)?;
-    // Keep the closure available to the wrapper, which records it as a
-    // prediction only once the invocation it belongs to has succeeded. The
-    // clone is one allocation per closure file against a whole rustc spawn.
-    let _ = LAST_KEY_DEP_INFO.try_with(|stash| *stash.borrow_mut() = dep_info.clone());
+    let dep_info = resolve_key_inputs(args, file_hasher, crate_name, env, out)?;
+    // Hand the closure back to the wrapper, which records it as a prediction
+    // only once the invocation it belongs to has succeeded. The clone is one
+    // allocation per closure file against a whole rustc spawn.
+    out.dep_info = dep_info.clone();
 
     let mut externs: Vec<_> = args.externs.iter().filter(|e| e.path.is_some()).collect();
     externs.sort_by_key(|e| &e.name);
@@ -2510,7 +2385,7 @@ pub fn compute_cache_key(
                 normalized_env_dep.decision.as_str()
             );
         }
-        let _ = LAST_KEY_BAKES_OUT_DIR.try_with(|stash| stash.set(bakes_out_dir));
+        out.bakes_out_dir = bakes_out_dir;
     }
 
     // ── Group B: extern crate artifacts ──
@@ -2564,8 +2439,8 @@ pub fn compute_cache_key(
             }
         }
     }
-    let _ = LAST_KEY_EXTERNS.try_with(|stash| *stash.borrow_mut() = Some(extern_digests));
-    let _ = LAST_KEY_EXTERN_UNITS.try_with(|stash| *stash.borrow_mut() = Some(extern_units));
+    out.externs = Some(extern_digests);
+    out.extern_units = Some(extern_units);
 
     // RUSTFLAGS — normalize via PathNormalizer (canonical-prefix
     // sentinel substitution; supersedes the older CWD-only
@@ -2777,7 +2652,7 @@ pub fn compute_cache_key(
         fold_field(&mut hasher, b"native_bundle_audit.v1", b"");
         tracing::trace!("[key:{}] native_bundle_audit", crate_name);
     }
-    let _ = LAST_KEY_NATIVE_ARCHIVES.try_with(|stash| *stash.borrow_mut() = Some(native_archives));
+    out.native_archives = Some(native_archives);
 
     // Unstable `-Z` flags arriving on argv outside RUSTFLAGS. Can change
     // codegen (`-Zsanitizer`, `-Zshare-generics`, …); hashed raw.
@@ -3053,7 +2928,7 @@ pub fn compute_cache_key(
     tracing::trace!("[key:{}] remap={}", crate_name, remap);
 
     let (hash, fields) = hasher.finalize_with_fields();
-    let _ = LAST_KEY_FIELDS.try_with(|stash| *stash.borrow_mut() = Some(fields));
+    out.fields = Some(fields);
     let key = hash.to_hex().to_string();
     tracing::trace!("[key:{}] final={}", crate_name, &key[..16]);
     complete_key(env, key)

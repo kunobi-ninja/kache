@@ -177,7 +177,8 @@ Without `--manifest-key`, Kache publishes an identity key
 (`id/<lock-digest>/<target>/<profile>` when `Cargo.lock` and a profile are
 known) and the host target triple so older prefetch still finds the file.
 `KACHE_MANIFEST_KEY` or `--manifest-key` writes a single key. A namespace plus
-`Cargo.lock` also publishes content-addressed shards.
+`Cargo.lock` also publishes content-addressed shards. Build-script runs are left
+out: they stay in the local store, so no other machine could fetch them.
 
 CI jobs that share a key, such as tests and lints on the same lockfile, target
 and profile, add to one manifest rather than replacing each other. Entries from

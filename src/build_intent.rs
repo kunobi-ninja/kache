@@ -641,9 +641,33 @@ mod tests {
     fn fake_cargo(dir: &Path, body: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let path = dir.join("fake-cargo");
-        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::write(
+            &path,
+            format!("#!/bin/sh\n[ -n \"$KACHE_FAKE_CARGO_WARMUP\" ] && exit 0\n{body}\n"),
+        )
+        .unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        path
+        // Run it once before a test times it. A child another test thread
+        // forks while the file is open for writing keeps that descriptor
+        // until it execs, and Linux refuses to execute a file open for
+        // writing (ETXTBSY); macOS makes the first exec of a new file slow.
+        // After one run succeeds, neither can touch the timed runs.
+        for _ in 0..500 {
+            match std::process::Command::new(&path)
+                .env("KACHE_FAKE_CARGO_WARMUP", "1")
+                .status()
+            {
+                Ok(status) => {
+                    assert!(status.success(), "fake cargo warm-up: {status}");
+                    return path;
+                }
+                Err(error) if error.raw_os_error() == Some(libc::ETXTBSY) => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("fake cargo warm-up: {error}"),
+            }
+        }
+        panic!("fake cargo stayed busy");
     }
 
     #[cfg(unix)]

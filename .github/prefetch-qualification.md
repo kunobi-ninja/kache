@@ -6,7 +6,12 @@ Linux benchmark runners. The backend is an isolated filesystem remote. These
 results do not model R2 latency.
 
 A protected `main` push changing the qualification files creates an immutable
-seed containing the Kache binary and remote packs/indexes. Six fresh consumer
+seed containing the Kache binary and remote packs/indexes. After its build the
+seed runs `kache save-manifest`, as kache-action's post step does, so the remote
+holds the build's identity manifest and namespace shards. Every job sets the
+same `KACHE_PROFILE` and `KACHE_NAMESPACE`, so an arm plans from what a CI job
+with a manifest key and namespace would find. Without them the plan came from
+crate names alone and covered 2–9 of 337 demanded keys (#1264). Six fresh consumer
 jobs run in order: off-1, on-1, on-2, off-2, off-3, on-3. Each verifies the seed,
 uses empty cache/runtime/target/Cargo directories, preserves the real CI
 environment and sets the remote read-only. There is no explicit warming step.

@@ -874,8 +874,8 @@ mod tests {
         let plain = file("/p", "");
         let mut with_cfg = file("/p", "");
         with_cfg.cfg_rustflags = true;
-        assert!(flags_known(false, false, &[plain.clone()]));
-        assert!(!flags_known(false, true, &[plain.clone()]));
+        assert!(flags_known(false, false, std::slice::from_ref(&plain)));
+        assert!(!flags_known(false, true, std::slice::from_ref(&plain)));
         assert!(!flags_known(
             false,
             false,

@@ -70,6 +70,21 @@ in `.pinact.yaml`; bump its SHA manually when you want a newer release.
 - **Error handling**: Use `anyhow::Result` with `.context()` / `.with_context()` for descriptive errors. Avoid bare `.unwrap()` on I/O or network operations.
 - **Unsafe code**: Avoid unless strictly necessary (OS-level FFI). Document safety invariants with `// SAFETY:` comments.
 
+## Writing docs
+
+The docs, README, PR descriptions and release notes share one voice: a maintainer explaining the tool to someone who is about to use it.
+
+- Start with what the reader wants to do, then the command or setting that does it. Put rare cases and the reasons behind a design after the normal path.
+- One idea per sentence. Use active voice and concrete verbs. Cut words that don't change the meaning.
+- Every claim about behaviour must match the code on `main`: commands, flags, defaults, paths, limits and platform support. When you change one of those, update the page that describes it in the same PR.
+- Say what doesn't work and on which platform. A known limit stated plainly is more useful than a promise.
+- Avoid the patterns that make text read as generated:
+  - em dashes in prose; use a full stop, a colon or parentheses
+  - filler such as "seamless", "robust", "gracefully", "powerful", "simply", "deliberately", "by design" or "it's worth noting"
+  - "not X, but Y" constructions and lists of three added for rhythm
+  - a bold label in front of every bullet, headings like "Overview" or "Key features", and a closing paragraph that repeats the page
+- Read the change aloud before opening the PR. If it sounds like a sales page or a chat reply, rewrite it.
+
 ## Testing
 
 - **Unit tests**: Place `#[cfg(test)]` modules at the bottom of source files

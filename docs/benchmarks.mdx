@@ -11,7 +11,7 @@ and its merge base, sccache, and mbx sequentially on one runner.
 
 | Trigger | Subjects | Isolated samples per tool | Contention samples per tool |
 | --- | --- | --- | --- |
-| Same-repository PR, ready for review | hk, eza | 1 cold, 1 same-checkout warm, 1 cross-checkout warm | 1 cold + 1 warm batch |
+| Same-repository PR, ready for review | hk, eza | Kache head and base: 2 cold, 6 same-checkout warm, 6 cross-checkout warm. sccache and mbx: 1 of each | 1 cold + 1 warm batch |
 | PR with the `bench` label **or** `[bench]` in its title | hk, eza | 2 cold, 6 same-checkout warm, 6 cross-checkout warm | 2 cold + 6 warm batches |
 | Nightly, 03:37 Europe/Zurich | hk, eza | 2 cold, 6 same-checkout warm, 6 cross-checkout warm | 2 cold + 6 warm batches |
 | Nightly | Firefox Linux/Windows, LLVM, SurrealDB, Lance, OpenDAL, cuda-oxide | One measurement per configured phase | — |
@@ -118,9 +118,10 @@ just bench-sccache eza --warm-same-tree
 just bench-mbx hk --warm-same-tree
 just bench-mbx eza --warm-same-tree
 just bench-mbx hk-pull
+just perf-gate-local       # HEAD against its merge base, with the gate's verdict
 ```
 
-The complete short suite runs on Linux and needs sccache and mbx on PATH.
+The complete short suite runs on Linux. It skips the sccache or mbx arm when that tool is not on PATH.
 On macOS, pass `--skip-contention` to run its isolated builds. It refuses to overwrite its
 output directory; pass `--output <fresh-path>` after the sample count for another
 run. Run builds on an otherwise quiet host. Two minutes for a single build

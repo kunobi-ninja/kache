@@ -5,7 +5,7 @@ description: Every top-level Kache command, its purpose, and common flags
 
 Run `kache <command> --help` for the exact syntax in your installed version.
 
-`--json` emits one versioned JSON document for `list`, `stats`, `gc`, `clean`, `doctor`, `why-miss`, and `daemon status`. `clean --json` is a preview unless `--yes` is also present.
+`--json` emits one versioned JSON document for `list`, `stats`, `gc`, `clean`, `targets`, `doctor`, `why-miss`, and `daemon status`. `clean --json` is a preview unless `--yes` is also present.
 
 | Command | Purpose |
 | --- | --- |
@@ -26,6 +26,8 @@ Run `kache <command> --help` for the exact syntax in your installed version.
 | `why-miss` | Explain a crate's recent key change |
 | `report` | Produce text, Markdown, JSON, or trace output |
 | `config` | Open the configuration editor |
+| `login` | Log in to the planner with a Kunobi account |
+| `logout` | Log out of the planner and revoke the stored session |
 | `install-shims` | Create Unix compiler-name symlinks |
 | `test-runner` | Run a test binary as Cargo's target runner, paced by the scheduler |
 | `completions` | Generate shell completion scripts |
@@ -61,7 +63,7 @@ kache gc --stale-schema
 
 A bare run enforces configured size and age policies. `--max-age` runs the requested age policy. `--stale-schema` removes entries created with old or unrecorded key schemas and conflicts with `--max-age`.
 
-GC affects only the local store. It also sweeps each `[cache.volumes]` shard against that shard's own budget; see [Configuration: Volume shards](/docs/getting-started/configuration#volume-shards).
+GC affects only the local store. It also sweeps each `[cache.volumes]` shard against that shard's own budget; see [Configuration: Volume shards](/docs/getting-started/configuration#volume-shards). `--stale-schema` and `--json` cover only the main store.
 
 GC reports store bytes removed separately from bytes reclaimed on disk. It keeps an entry when its last store blob is still cloned into a build output, because unlinking that blob would free no disk and destroy a usable hit. This can leave the registered store size above `cache.local_max_size`; remove stale targets to reclaim the blocks. A size sweep leaves those held bytes out of its budget instead of evicting other entries to make up for them.
 
@@ -76,7 +78,7 @@ kache purge --crate-name serde
 kache purge
 ```
 
-With no crate name, `purge` wipes the entire local cache after confirmation.
+With no crate name, `purge` wipes the whole local store at once. It does not ask for confirmation.
 
 ## `kache clean`
 
@@ -91,7 +93,7 @@ kache clean --orphans --yes
 
 `clean` recursively finds `target/` directories below the current directory, including worktrees under `.worktrees/` and `.claude/`; other hidden directories are skipped. Sizes cover every profile, custom profiles and `<triple>/<profile>` directories included. The default opens a selector. Use `--dry-run` before a scripted `--yes` run.
 
-`--tracked` uses the bounded machine-local target registry populated by normal builds and restores. `--stale` filters by last use. A target whose worktree or workspace has been deleted qualifies however recently it was built; `--orphans` selects only those. A workspace counts as deleted only while the directory that held it still exists, so an unmounted volume does not.
+`--tracked` uses the bounded machine-local target registry populated by normal builds and restores. `--stale` filters by last use; without it, `--tracked` selects targets unused for 14 days. `--orphans` implies `--tracked`. A target whose worktree or workspace has been deleted qualifies however recently it was built; `--orphans` selects only those. A workspace counts as deleted only while the directory that held it still exists, so an unmounted volume does not.
 
 Cleanup rechecks each directory identity and removes only the derived target directory; missing, moved, replaced, current-workspace, and unsafe paths are skipped. A target a running build holds (its `.cargo-lock`) is skipped with `in use by a running build`, in every mode.
 
@@ -102,7 +104,7 @@ kache targets
 kache targets --json
 ```
 
-`targets` lists every target directory builds through kache have used: its workspace, how long since a build last used it, the bytes it holds, and an estimate of what deleting it frees. The estimate leaves out blocks the target shares with the store or with other hardlinks, so it is what `kache clean` would give back. A target whose worktree has been deleted is marked, and the last line gives the command to remove those.
+`targets` lists every tracked target directory that still exists: its workspace, how long since a build last used it, the bytes it holds, and an estimate of what deleting it frees. The estimate leaves out blocks the target shares with the store or with other hardlinks, so it is what `kache clean` would give back. A target whose worktree has been deleted is marked, and the last line gives the command to remove those.
 
 ## `kache init`
 
@@ -110,12 +112,13 @@ kache targets --json
 kache init
 kache init --check
 kache init --no-service
+kache init --no-shell
 kache init --yes
 ```
 
-`--check` reports proposed changes without writing. `--no-service` skips login-service installation. When the service cannot be installed, such as on a Linux host without a systemd user session or a Windows account that Task Scheduler refuses, init reports why and starts the daemon directly.
+`--check` reports proposed changes without writing. `--no-service` skips login-service installation. `--no-shell` skips the C/C++ shell setup; Cargo's native dependencies are still configured. When the service cannot be installed, such as on a Linux host without a systemd user session or a Windows account that Task Scheduler refuses, init reports why and starts the daemon directly.
 
-Without a terminal, pass `--yes`. If stdin has no answers and Cargo is left unconfigured, init exits with an error. Besides `rustc-wrapper`, init adds `HOST_CC` / `HOST_CXX` / `CC_KNOWN_WRAPPER_CUSTOM` under Cargo `[env]` when those keys are absent. It never sets `CC` or `CXX`.
+Without a terminal, pass `--yes`. If stdin has no answers and Cargo is left unconfigured, init exits with an error. Besides `rustc-wrapper`, init adds `HOST_CC` / `HOST_CXX` / `CC_KNOWN_WRAPPER_CUSTOM` under Cargo `[env]` when those keys are absent. On Windows it adds only `CC_KNOWN_WRAPPER_CUSTOM`. It never sets `CC` or `CXX`.
 
 ## `kache doctor`
 
@@ -131,7 +134,7 @@ kache doctor --repair
 - `--purge-sccache` also removes sccache data and requires `--fix`.
 - `--verify` checks entries, blobs, and metadata.
 - `--checksums` also hashes blob contents and implies `--verify`.
-- `--repair` removes corrupted entries, prunes stale C/C++ memos, and compacts a large, sparse index when disk space allows. It implies `--verify`.
+- `--repair` removes corrupted entries, reconciles the index with the entries on disk, reclaims orphan blobs, prunes stale C/C++ memos, input predictions and old file hashes, and compacts a large, sparse index when disk space allows. It implies `--verify`.
 
 Review destructive options before running them.
 

@@ -36,7 +36,7 @@ A write credential for an S3 or filesystem remote can overwrite or delete object
 
 On GitHub Actions and GitLab CI, Kache suppresses remote writes unless the job is a **push to a protected branch**. Pull requests, merge requests, tags, unprotected branches, `workflow_dispatch`, and scheduled runs are read-only even if the job has a write credential. `KACHE_REMOTE_READONLY=0` does not turn that off.
 
-A laptop or other non-CI process is left as configured, so `kache sync --push` still works locally. Set `KACHE_REMOTE_READONLY=1` (or `cache.remote_readonly`) there when you want reads without writes.
+A laptop or other non-CI process is left as configured, so `kache sync --push` still works locally. Set `remote_readonly = true` under `[cache]` there when you want reads without writes. `KACHE_REMOTE_READONLY=1` affects only the process that reads it: a daemon that a build starts drops it.
 
 ```yaml
 # Optional: make the read-only intent explicit in pull-request jobs.
@@ -48,23 +48,24 @@ GitHub withholds secrets and OIDC tokens from fork pull-request jobs, so those r
 
 Pull-request jobs can still restore entries a trusted branch already published.
 
+In a `container:` job, the runner mounts `HOME` and `runner.temp` separately from the workspace, and a hardlink cannot cross a mount. Leave `cache-dir` unset and the action puts the cache on the workspace's mount. A `cache-dir` on another mount still works, but kache copies every artifact into `target/`.
+
 C and C++ objects publish through the same remote as Rust. A daemon-backed compile restores them on miss; `kache sync --pull --all` also warms them in the local store. clang-cl debug objects stay on the machine and are not published.
 
 ## Other CI systems
 
-Install Kache, then enable it and set the remote. CI has no terminal to answer prompts, so pass `--yes`:
+Install Kache and write the remote to its config file before the first build. The background daemon uploads what the build compiles, and a daemon that a build starts ignores `KACHE_S3_*` variables, so the remote has to be in the file. CI has no terminal to answer prompts, so pass `--yes`:
 
 ```bash
-kache init --yes
-export KACHE_S3_BUCKET=my-build-cache
-export KACHE_S3_REGION=eu-west-1
+mkdir -p ~/.config/kache
+printf '[cache.remote]\ntype = "s3"\nbucket = "my-build-cache"\nregion = "eu-west-1"\n' > ~/.config/kache/config.toml
 
-kache sync --pull
+kache init --yes
 cargo build --locked
-kache sync --push
+kache daemon stop
 ```
 
-Set credentials through the runner's secret store or standard cloud identity chain. Use `--allow-partial` only when cache failure must not fail the job.
+`kache daemon stop` lets the daemon finish its queued uploads before it exits, so run it before the runner goes away. `kache sync --push` is no substitute: it uploads only the current workspace's own crates. Credentials can stay in `KACHE_S3_ACCESS_KEY` and `KACHE_S3_SECRET_KEY`, the runner's secret store, or the standard cloud identity chain. Use `--allow-partial` only when cache failure must not fail the job.
 
 ## Ephemeral and persistent runners
 
@@ -77,7 +78,7 @@ prefetch_enabled = false
 
 This keeps exact remote reads and uploads.
 
-Concurrent jobs may share a persistent local store, but each job should have a distinct `KACHE_RUNTIME_DIR` for sockets, locks, event logs, and session state.
+Concurrent jobs may share a persistent local store, but each job should have a distinct `KACHE_RUNTIME_DIR` for sockets, locks, event logs, and session state. kache-action already gives each job its own. For a trusted disk that persists across jobs, set `node-cache: true` and `cache-dir` on the action.
 
 On a trusted builder that keeps a disk across jobs, point `KACHE_CACHE_DIR` at that disk and set `KACHE_TRUST_DOMAIN` to one label for the trust domain (for example `github.kunobi-ninja.kache`). Kache stores under `$KACHE_CACHE_DIR/<label>/`. Keep `KACHE_RUNTIME_DIR` on the job's scratch disk so sockets die with the pod. Do not mount that disk or export `KACHE_TRUST_DOMAIN` on public or fork jobs. An unusable label leaves `KACHE_CACHE_DIR` unchanged.
 

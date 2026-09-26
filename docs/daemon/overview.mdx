@@ -13,9 +13,12 @@ The daemon keeps network and maintenance work away from compiler processes. Loca
 - Replay durable upload intents after a restart.
 - Prefetch likely entries at the start of a build session.
 - Refresh the remote key index used by fallback planning.
-- Run garbage collection at startup and every six hours.
+- Run garbage collection at startup and every six hours, including `[cache.volumes]` shards.
+- Flush entries that were stored without an fsync, every two seconds.
+- Copy large executables into a target directory while the build runs, so their restore does not wait for the copy.
+- Compact `index.db` when the machine is quiet.
 
-With `cache.daemon_publish` enabled (the default), a C/C++ wrapper can hand its private output snapshots to the daemon. The compiler still runs in the wrapper. If the daemon cannot accept the work within 25 ms, the wrapper keeps the local publication path. Volume-local stores also use that path.
+With `cache.daemon_publish` enabled (the default), a C/C++ wrapper can hand its private output snapshots to the daemon. The compiler still runs in the wrapper. If the daemon cannot accept the work within 25 ms, the wrapper keeps the local publication path. A compile whose store is a `[cache.volumes]` shard always stores from the wrapper.
 
 Report JSON marks daemon publication attempts with `store_handed_off` and records their background time in `daemon_store_ms`. That time is separate from the wrapper's `store_ms`. A daemon crash can lose queued cache entries; the compiler outputs remain available to the build.
 
@@ -29,9 +32,9 @@ Local-only caching works with no daemon. A configured remote needs the daemon fo
 
 On Unix the default socket is `<runtime_dir>/daemon.sock`. Windows derives a named-pipe identity from the configured path. Override the runtime root with `KACHE_RUNTIME_DIR` or only the endpoint with an absolute `KACHE_SOCKET_PATH`.
 
-The daemon also binds a lifecycle control endpoint at `<runtime_dir>/daemon.ctl`. It is deliberately shorter than `daemon.sock`, so a runtime directory that fits one fits both.
+The daemon also binds a lifecycle control endpoint next to the socket, with a `.ctl` extension. Its path is shorter than the socket's, so a runtime directory that fits one fits both.
 
-Use a short, user-owned runtime directory. Unix socket paths are length-limited — 103 bytes on macOS, 107 on Linux — and `kache daemon start` refuses a longer one rather than leaving a daemon that cannot bind. Shared temporary directories also allow another local user to interfere with adjacent lock and state files.
+Use a short, user-owned runtime directory. Unix socket paths are limited to 103 bytes on macOS and 107 on Linux. `kache daemon start` refuses a longer path, so the daemon never starts without a socket it can bind. Shared temporary directories also allow another local user to interfere with adjacent lock and state files.
 
 Every client and daemon process must resolve the same runtime and socket settings. Installed services do not inherit later shell exports; put persistent values in the config or service definition.
 

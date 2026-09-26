@@ -14,7 +14,9 @@ The planner ranks likely artifacts before rustc asks for exact keys. It is optio
 The service in [`crates/kache-service`](https://github.com/kunobi-ninja/kache/tree/main/crates/kache-service) exposes:
 
 - `POST /v1/prefetch-plan`
+- `POST /v1/build-timelines`, where `kache telemetry push` sends build timelines
 - `GET /healthz`
+- `GET /metrics`
 - `GET /readyz`
 - `GET /.well-known/kunobi-auth` (only with [Kunobi login](#authentication) enabled)
 
@@ -34,7 +36,7 @@ See [Authentication](#authentication) to require a bearer.
 
 ## Authentication
 
-With no provider configured, the planner accepts anonymous requests. Configure any of these and `POST /v1/prefetch-plan` requires a bearer that one of them accepts. The health, metrics and discovery endpoints stay open.
+With no provider configured, the planner accepts anonymous requests. Configure any of these and `POST /v1/prefetch-plan` and `POST /v1/build-timelines` require a bearer that one of them accepts. The health, metrics and discovery endpoints stay open.
 
 | Provider | Service flags (env) | Clients |
 |---|---|---|
@@ -86,7 +88,11 @@ ingress:
     cert-manager.io/cluster-issuer: letsencrypt
   tls:
     enabled: true
+service:
+  appProtocol: kubernetes.io/h2c
 ```
+
+Build sessions use one HTTP/2 stream per build, so set `service.appProtocol` to `kubernetes.io/h2c` behind an Ingress. The service speaks HTTP/1.1 and HTTP/2 on the same port.
 
 The Ingress does not add authentication. Configure [a provider](#authentication) before you expose the service beyond a trusted network.
 

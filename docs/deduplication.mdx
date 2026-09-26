@@ -37,7 +37,7 @@ The monitor separates:
 - `Blobs`: physical blob bytes in the store
 - `Scan`: whether project target discovery is running or complete
 
-Use `kache gc` and `kache clean --dry-run` for clone-reclamation estimates. The live monitor stays focused on builds, store usage, and transfers.
+Run `kache targets` to see what deleting each target directory frees. `kache clean --dry-run` gives the same estimate for a selection. The live monitor stays focused on builds, store usage, and transfers.
 
 ## `dup` build events
 

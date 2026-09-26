@@ -10,6 +10,7 @@ A remote cache grows until something removes old objects. That something is the 
 ```text
 {prefix}/v3/manifests/{crate}/{key}.json      one manifest ...
 {prefix}/v3/packs/{crate}/{key}.tar.zst       ... and the pack it describes
+{prefix}/v3/predictions/...                   input prediction rows
 {prefix}/_manifests/...                       build manifests and shards
 {prefix}/v4/prefetch/catalogs/...             prefetch catalogs
 {prefix}/v4/prefetch/packs/...                content-addressed prefetch packs
@@ -20,7 +21,7 @@ Three rules keep the store consistent under expiry:
 
 - Expire `v3/manifests/` and `v3/packs/` with the same age. A manifest and its pack are written together and neither is rewritten, so they age together. A manifest that outlives its pack is a miss; a pack that outlives its manifest is unreachable garbage.
 - Expire `v4/prefetch/catalogs/` sooner than `v4/prefetch/packs/` and `pack-meta/`. Packs are shared between catalog generations, so a live catalog must never point at an expired pack.
-- Expire by age since the object was written. kache does not rewrite an existing object, so a hot entry expires too and is uploaded again on the next miss. That is the same trade every object store's lifecycle makes; pick an age longer than the interval at which your builds change.
+- Expire by age since the object was written. kache never rewrites an entry's manifest or pack, so a hot entry expires too and is uploaded again on the next miss. Build manifests and prediction rows are written again each time they are used, so they expire only when idle. An expired prediction row costs one dep-info pre-pass. That is the same trade every object store's lifecycle makes; pick an age longer than the interval at which your builds change.
 
 An expired object is a miss. The daemon's remote key index can report an object present for up to `cache.remote_key_cache_refresh_secs` after it expired; the fetch then misses and the crate compiles as usual.
 

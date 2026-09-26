@@ -45,7 +45,7 @@ nvcc -dlink build/kernel.o build/helper.o -o build/device-link.o
 `nvcc -E` is not a safe cache key: it always defines `__CUDA_ARCH__`, so host-only code guarded by `#ifndef __CUDA_ARCH__` is invisible in its output. Kache does not hash preprocessed output. The key is built from:
 
 - `nvcc`'s version and the host compiler's version (a host upgrade changes the object, probed via `nvcc --dryrun`);
-- the modeled flags verbatim — `-dc` / `-rdc` mode, GPU `-arch` / `-gencode` / `-code`, `-std`, `-O`, defines, and the `-Xcompiler` / `-Xptxas` forwarding flags;
+- the modeled flags verbatim: `-dc` / `-rdc` mode, GPU `-arch` / `-gencode` / `-code`, `-std`, `-O`, defines, and the `-Xcompiler` / `-Xptxas` forwarding flags;
 - the dependency closure: the raw content of the source plus every header `nvcc -M` reports. Hashing raw contents (not preprocessed output) captures host-only code, so any source or header edit invalidates the entry.
 - the driver environment: `NVCC_PREPEND_FLAGS` / `NVCC_APPEND_FLAGS` are folded in verbatim, so the same checkout with different driver flags keys apart.
 
@@ -60,8 +60,8 @@ Anything Kache does not model runs the real `nvcc` uncached, including:
 - link and device-link (`-dlink`) modes, `--lib`, multi-source compiles;
 - standalone `-ptx` / `-cubin` / `-fatbin` / `--optix-ir` emission;
 - device debug (`-G`);
-- machine-resolved values (`-march=native`, `-arch=native`, …) — one key must never cover different objects, so these refuse even when allow-listed;
-- dependency generation without an explicit output (`-M`, `-MM`) or without `-MF` (`-MD`, `-MMD` alone) — combine `-MD`/`-MMD` with `-MF <file>` instead;
+- machine-resolved values (`-march=native`, `-arch=native`, …). One key must never cover different objects, so these refuse even when allow-listed;
+- dependency generation without an explicit output (`-M`, `-MM`) or without `-MF` (`-MD`, `-MMD` alone). Combine `-MD`/`-MMD` with `-MF <file>` instead;
 - compiles without `-o`;
 - `-keep` / `--save-temps`, profiling (`--time`), response files (`@file`);
 - any flag outside the built-in table (see below).

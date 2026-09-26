@@ -16,6 +16,7 @@ The exact set depends on the invocation. It can include:
 - recorded input-set predictions that substitute for the dep-info spawn on warm builds (`cache.input_predictions`)
 - code-generation flags, rustflags, and requested emit kinds
 - the contents of `--extern` dependencies
+- native static archives the unit links, found through `-L` directories, `-l` specs and `-C link-arg`
 - compile-time environment values rustc reports
 - native libc version and hashed CRT/startup objects for host-loaded Linux outputs
 - macOS SDK identity (version and build) for host-loaded Darwin outputs
@@ -23,7 +24,7 @@ The exact set depends on the invocation. It can include:
 
 Host-loaded Linux and macOS links pass through if those runtime inputs cannot be resolved, rather than sharing a binary neither host pinned. rustc-bundled self-contained WebAssembly targets (`wasm32-unknown-unknown`, the WASI family, `wasm32v1-none`, `wasm64-unknown-unknown`) are cached; custom target specs, emscripten, and `link-self-contained=no` pass through.
 
-On macOS, a cached debug link gets ld64 `-oso_prefix` for `--out-dir`, so `N_OSO` object paths in the binary are not checkout-local.
+On macOS, every cached executable link gets ld64 `-oso_prefix` set to Cargo's profile directory, so `N_OSO` object paths in the binary are not checkout-local. A cached proc-macro link gets `-install_name @rpath/lib<crate>.dylib`.
 
 Incremental directory names and harmless local path spellings are excluded or normalized.
 
@@ -79,7 +80,7 @@ Kache maps known roots to stable sentinels before hashing and asks the compiler 
 
 Common mappings include the workspace, Cargo home, Rustup home, temporary directory, target directory, and configured base directories. Add a missing root with `KACHE_BASE_DIR` or `paths.base_dirs`.
 
-Do not choose an overly broad base directory. Normalization deliberately merges path identities; two genuinely different inputs must not map to the same sentinel.
+Do not choose an overly broad base directory. Normalization merges path identities, so two different inputs must not map to the same sentinel.
 
 Disable Rust path normalization for a local profiling or debugging session:
 

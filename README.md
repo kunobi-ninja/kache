@@ -52,7 +52,7 @@ Hits, misses, and passthroughs are reported per unit, and `kache why-miss` expla
 
 | Workload | Status | Notes |
 | --- | --- | --- |
-| Rust libraries and build scripts | Supported | Run `kache init` |
+| Rust libraries and build scripts | Supported | Run `kache init`. Build-script runs are cached on Linux and macOS |
 | Rust executables | Supported on Linux and macOS | Disabled by default on Windows |
 | C and C++ object files | Supported | GCC, Clang, Apple Clang, and clang-cl. Build scripts via `kache init`; other builds via shims or `CC`/`CXX` |
 | CUDA object files | Supported | Single-source `nvcc -c` and `-dc` via `CUDACXX="kache nvcc"` or a CMake launcher |
@@ -88,7 +88,9 @@ See the [CI guide](https://kunobi.ninja/docs/kache/remote-cache/ci) for GitHub A
 
 ## C and C++
 
-On Unix, install compiler-name shims and put that directory first in `PATH`. Make, CMake, autotools, and Arch PKGBUILDs that call `gcc` by name then go through Kache. No `CC=` edit and no shell wrapper.
+On Unix, `kache init` creates compiler-name shims and offers to add their directory to `PATH` in your zsh, bash, or fish startup file. Make, CMake, autotools, and Arch PKGBUILDs that call `gcc` by name then go through Kache. No `CC=` edit and no shell wrapper.
+
+For managed dotfiles or another shell, set it up by hand:
 
 ```bash
 kache install-shims
@@ -97,7 +99,7 @@ export PATH="$HOME/.local/lib/kache/shims:$PATH"
 
 APT and AUR packages install `/usr/lib/kache`. Nix packages include the same symlinks in `${kache}/shims` and `${kache}/lib/kache`; see the [Nix configuration example](https://kunobi.ninja/docs/kache/getting-started/installation#nix).
 
-`kache init` can create the user farm; it does not change `PATH`. For `makepkg`, put the same assignment in `~/.makepkg.conf`. Wrap extra names already on `PATH` with `kache install-shims --from-path`.
+For `makepkg`, put the same assignment in `~/.makepkg.conf`. Wrap extra names already on `PATH` with `kache install-shims --from-path`.
 
 Kache inspects the real compiler invocation. Unsupported or unsafe invocations pass through. See [C and C++](https://kunobi.ninja/docs/kache/getting-started/c-cpp).
 
@@ -131,6 +133,8 @@ kache install-shims           # Unix compiler-name PATH farm
 kache why-miss <crate>        # explain the latest miss
 kache list                    # inspect cached entries
 kache gc                      # enforce cache limits
+kache targets                 # target dirs, what each frees, deleted worktrees
+kache clean --orphans --yes   # remove the targets of deleted worktrees
 kache sync                    # pull from and push to the configured remote
 kache daemon status           # inspect the background service
 ```

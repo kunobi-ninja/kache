@@ -9,7 +9,7 @@ Kache caches conservative, single-source C and C++ object compilations. If it ca
 
 `kache init` covers both rustc and the objects a build script compiles through the `cc` crate. Without it, put a shim on `PATH`.
 
-`kache init` sets `HOST_CC` and `HOST_CXX` in Cargo's config (and `CC_KNOWN_WRAPPER_CUSTOM=kache`). It does not set `CC` or `CXX`, so `cargo build --target` keeps the cross compiler the `cc` crate would have found.
+On Unix, `kache init` sets `HOST_CC` and `HOST_CXX` in Cargo's config, and `CC_KNOWN_WRAPPER_CUSTOM=kache`. On Windows it sets only `CC_KNOWN_WRAPPER_CUSTOM`, so choose clang-cl through `CC`. Init never sets `CC` or `CXX`, so `cargo build --target` keeps the cross compiler the `cc` crate would have found.
 
 PATH shims also cover Cargo's C bits when the crate invokes `cc` or `gcc` from `PATH` without `HOST_CC`.
 

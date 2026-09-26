@@ -199,7 +199,7 @@ impl PlannerDataSource for LocalPlannerSource<'_> {
         self.daemon
             .remote_config()
             .ok_or_else(|| anyhow::anyhow!("no remote configured"))?;
-        let shard_set = crate::shards::compute_shards(namespace, deps);
+        let shard_set = crate::shards::compute_shards(deps);
 
         tracing::info!(
             "fallback planner: {} deps -> {} shards for namespace '{namespace}'",

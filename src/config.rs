@@ -841,14 +841,10 @@ pub(crate) struct PlannerFileConfig {
 }
 
 /// Tracks which config fields have active env var overrides.
-#[allow(dead_code)]
 pub(crate) struct EnvOverrides {
-    pub(crate) disabled: bool,
     pub(crate) cache_dir: bool,
     pub(crate) max_size: bool,
     pub(crate) cache_executables: bool,
-    pub(crate) cache_cc_links: bool,
-    pub(crate) trust_codegen_backends: bool,
     pub(crate) clean_incremental: bool,
     pub(crate) preserve_incremental: bool,
     pub(crate) adaptive_incremental: bool,
@@ -860,28 +856,17 @@ pub(crate) struct EnvOverrides {
     pub(crate) s3_user_agent: bool,
     pub(crate) fallback: bool,
     pub(crate) key_salt: bool,
-    pub(crate) cc_extra_allowlist_flags: bool,
-    pub(crate) local_only: bool,
-    /// Read-only remote consumer mode. See [`Config::remote_readonly`].
-    pub(crate) remote_readonly: bool,
 }
 
 impl EnvOverrides {
     pub(crate) fn detect() -> Self {
         // When the pinned config sets `ignore_env`, gated env vars no longer win,
-        // so they must NOT show as env-locked in the TUI. `KACHE_DISABLED` is
-        // ungated and always reflects its real env state.
+        // so they must NOT show as env-locked in the TUI.
         let ignore_env = Config::ignore_env_enabled(&Config::load_file_config());
         Self {
-            disabled: std::env::var("KACHE_DISABLED").is_ok(),
-            local_only: env_or_ignored("KACHE_LOCAL_ONLY", ignore_env).is_ok(),
-            remote_readonly: env_or_ignored("KACHE_REMOTE_READONLY", ignore_env).is_ok(),
             cache_dir: env_or_ignored("KACHE_CACHE_DIR", ignore_env).is_ok(),
             max_size: env_or_ignored("KACHE_MAX_SIZE", ignore_env).is_ok(),
             cache_executables: env_or_ignored("KACHE_CACHE_EXECUTABLES", ignore_env).is_ok(),
-            cache_cc_links: env_or_ignored("KACHE_CACHE_CC_LINKS", ignore_env).is_ok(),
-            trust_codegen_backends: env_or_ignored("KACHE_TRUST_CODEGEN_BACKENDS", ignore_env)
-                .is_ok(),
             clean_incremental: env_or_ignored("KACHE_CLEAN_INCREMENTAL", ignore_env).is_ok(),
             preserve_incremental: env_or_ignored("KACHE_PRESERVE_INCREMENTAL", ignore_env).is_ok(),
             adaptive_incremental: env_or_ignored("KACHE_ADAPTIVE_INCREMENTAL", ignore_env).is_ok(),
@@ -893,8 +878,6 @@ impl EnvOverrides {
             s3_user_agent: env_or_ignored("KACHE_S3_USER_AGENT", ignore_env).is_ok(),
             fallback: env_or_ignored("KACHE_FALLBACK", ignore_env).is_ok(),
             key_salt: env_or_ignored("KACHE_KEY_SALT", ignore_env).is_ok(),
-            cc_extra_allowlist_flags: env_or_ignored("KACHE_CC_EXTRA_ALLOWLIST_FLAGS", ignore_env)
-                .is_ok(),
         }
     }
 }
@@ -6424,7 +6407,6 @@ remote_key_cache_refresh_secs = 900
         // Just verify it doesn't panic — actual env var presence is environment-dependent
         let overrides = EnvOverrides::detect();
         // In test environment, these are typically not set
-        let _ = overrides.disabled;
         let _ = overrides.cache_dir;
     }
 

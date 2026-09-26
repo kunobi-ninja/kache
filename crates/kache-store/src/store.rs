@@ -2346,7 +2346,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     /// (`store/blobs/{hash[0..2]}/{hash}`). The entry directory only
     /// contains `meta.json`. Identical content is deduplicated via
     /// reference counting in the `blobs` table.
-    #[allow(dead_code)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn put(
         &self,
         cache_key: &str,
@@ -3508,7 +3508,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     }
 
     /// Directory containing all blobs.
-    #[allow(dead_code)] // used in tests
+    #[cfg(any(test, feature = "test-support"))]
     pub fn blobs_dir(&self) -> PathBuf {
         self.config.store_dir().join("blobs")
     }
@@ -4013,12 +4013,6 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
 
     pub fn entry_dir(&self, cache_key: &str) -> PathBuf {
         self.config.store_dir().join(cache_key)
-    }
-
-    /// Get the full path to a cached file (legacy entry-based layout).
-    #[allow(dead_code)]
-    pub fn cached_file_path(&self, cache_key: &str, filename: &str) -> PathBuf {
-        self.entry_dir(cache_key).join(filename)
     }
 
     /// Calculate the total size of the store.
@@ -5877,7 +5871,6 @@ pub struct BlobStats {
 
 /// Statistics from a blob migration run.
 #[derive(Debug, Default)]
-#[allow(dead_code)]
 pub struct MigrationStats {
     pub entries_scanned: usize,
     pub entries_migrated: usize,
@@ -10568,17 +10561,6 @@ mod tests {
         let entry_dir = store.entry_dir("abc123");
         assert!(entry_dir.to_string_lossy().contains("store"));
         assert!(entry_dir.to_string_lossy().contains("abc123"));
-    }
-
-    #[test]
-    fn test_store_cached_file_path() {
-        let dir = tempfile::tempdir().unwrap();
-        let config = test_config(dir.path());
-        let store = Store::open(&config).unwrap();
-
-        let path = store.cached_file_path("key1", "libfoo.rlib");
-        assert!(path.to_string_lossy().contains("key1"));
-        assert!(path.to_string_lossy().ends_with("libfoo.rlib"));
     }
 
     #[test]

@@ -688,14 +688,6 @@ impl PathNormalizer {
     /// Used in tests and as a sentinel "no normalization configured"
     /// state in code paths where the env-derived constructor isn't
     /// applicable.
-    ///
-    /// `#[allow(dead_code)]` because the only consumer today is the
-    /// test module; production code always builds via `from_env`.
-    /// Kept as part of the public surface so future callers (e.g.
-    /// integration tests of cache_key with deterministic inputs)
-    /// don't have to construct `PathNormalizer` via `from_env` and
-    /// pull in the host's actual env state.
-    #[allow(dead_code)]
     pub fn empty() -> Self {
         Self {
             rules: Vec::new(),

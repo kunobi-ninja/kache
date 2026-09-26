@@ -1032,7 +1032,7 @@ impl PackPrefetchContext {
         if deps.is_empty() {
             anyhow::bail!("packed-prefetch requires Cargo.lock dependencies");
         }
-        let mut shard_hashes = crate::shards::compute_shards(namespace, deps)
+        let mut shard_hashes = crate::shards::compute_shards(deps)
             .shards
             .into_iter()
             .map(|(hash, _)| hash)
@@ -8013,7 +8013,7 @@ async fn shard_prefetch_for_deps(
     deps: &[(String, String)],
 ) -> anyhow::Result<usize> {
     let plan_started_at = Instant::now();
-    let shard_set = crate::shards::compute_shards(namespace, deps);
+    let shard_set = crate::shards::compute_shards(deps);
 
     tracing::info!(
         "shard prefetch: {} deps -> {} shards for namespace '{namespace}'",
@@ -11474,6 +11474,7 @@ mod tests {
 
     #[test]
     fn gc_v2_is_atomic_compatibility_gate_for_old_daemons() {
+        // Only the serde shape matters; the payloads are never read.
         #[allow(dead_code)]
         #[derive(Deserialize)]
         #[serde(rename_all = "snake_case")]
@@ -19092,7 +19093,7 @@ mod tests {
         namespace: &str,
         deps: &[(String, String)],
     ) -> (Arc<dyn crate::remote_backend::RemoteBackend>, usize) {
-        let shard_set = crate::shards::compute_shards(namespace, deps);
+        let shard_set = crate::shards::compute_shards(deps);
         assert!(
             shard_set.shards.len() >= 2,
             "test deps must span at least two shards"

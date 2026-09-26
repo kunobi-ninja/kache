@@ -300,8 +300,6 @@ enum CcArgBucket {
     ProbeKeyed,
     Preprocessor,
     RawKeyed,
-    #[allow(dead_code)]
-    ExtraHashFile,
     Artifact,
     NoObjectEffect,
     TooHard,

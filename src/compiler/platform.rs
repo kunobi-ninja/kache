@@ -148,11 +148,9 @@ pub fn current() -> Box<dyn Platform> {
 /// arm64; other macOS variants (x86_64, future archs) fall through to
 /// no-op because their loaders don't enforce the same requirement.
 ///
-/// `#[allow(dead_code)]` for the same reason as [`LinuxPlatform`] —
-/// on a Linux or Windows build, `current()` doesn't construct it but
-/// cross-platform unit tests do, and the symmetric availability lets
-/// any future test pin the macOS dispatch shape from any host.
-#[allow(dead_code)]
+/// Off macOS, `current()` doesn't construct it but cross-platform unit
+/// tests do, so any host can pin the macOS dispatch shape.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub struct MacOsPlatform;
 
 impl Platform for MacOsPlatform {
@@ -395,12 +393,12 @@ fn collect_files_recursively(root: &Path, dir: &Path, files: &mut Vec<PathBuf>) 
 /// methods independently of the macOS impl when Linux-specific
 /// concerns appear.
 ///
-/// `#[allow(dead_code)]` because cross-platform unit tests construct
-/// `LinuxPlatform` from a macOS host (and vice versa) to exercise the
-/// dispatch shape without spawning real `codesign` / `signtool`. On a
-/// non-Linux production build, no caller constructs it — but having
-/// the struct compile keeps the test surface symmetric.
-#[allow(dead_code)]
+/// Cross-platform unit tests construct `LinuxPlatform` from a macOS host
+/// (and vice versa) to exercise the dispatch shape without spawning real
+/// `codesign` / `signtool`. On a non-Linux production build no caller
+/// constructs it, but having the struct compile keeps the test surface
+/// symmetric.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub struct LinuxPlatform;
 
 impl Platform for LinuxPlatform {
@@ -432,8 +430,8 @@ impl Platform for LinuxPlatform {
 /// drivers and SmartScreen), so [`Platform::ensure_binary_loadable`]
 /// is a no-op. When PE/PDB-specific handling lands, it goes here.
 ///
-/// See [`LinuxPlatform`] for the `#[allow(dead_code)]` rationale.
-#[allow(dead_code)]
+/// Constructed off Windows only by tests; see [`LinuxPlatform`].
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 pub struct WindowsPlatform;
 
 impl Platform for WindowsPlatform {

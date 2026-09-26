@@ -2300,8 +2300,6 @@ struct ProjectStats {
     /// Scan-time estimate of bytes returned if this whole target/ disappears.
     /// Unlike `cached_bytes`, this uses private extents and collapses hardlinks.
     estimated_reclaimable_bytes: u64,
-    #[allow(dead_code)] // tracked but not yet surfaced in the clean TUI
-    cached_files: u64,
     local_bytes: u64,
     local_files: u64,
 }
@@ -2584,7 +2582,6 @@ fn finalize_cache_candidates(
                 .is_some_and(|id| reclaim.hardlink_has_external_ref(id));
         if cache_backed {
             stats.cached_bytes = stats.cached_bytes.saturating_add(candidate.size);
-            stats.cached_files = stats.cached_files.saturating_add(1);
         } else {
             add_local_bytes(stats, breakdown, candidate.bucket, candidate.size);
         }
@@ -2793,7 +2790,6 @@ fn compute_project_stats(target_dir: &std::path::Path) -> (ProjectStats, Categor
         total_bytes: 0,
         cached_bytes: 0,
         estimated_reclaimable_bytes: 0,
-        cached_files: 0,
         local_bytes: 0,
         local_files: 0,
     };
@@ -6694,7 +6690,7 @@ async fn upload_shards(
     entries: &[crate::remote::ManifestEntry],
 ) -> Result<usize> {
     let deps = crate::shards::parse_cargo_lock(lock_path)?;
-    let shard_set = crate::shards::compute_shards(namespace, &deps);
+    let shard_set = crate::shards::compute_shards(&deps);
 
     // crate_name -> its manifest entry (keep the first match per crate). The
     // whole entry, not just the cache key: shards now persist compile cost and
@@ -9538,7 +9534,6 @@ mod tests {
         finalize_cache_candidates(&mut stats, &mut breakdown, &reclaim, &candidates);
 
         assert_eq!(stats.cached_bytes, 300);
-        assert_eq!(stats.cached_files, 2);
         assert_eq!(stats.local_bytes, 0);
         assert_eq!(breakdown.deps_local, 0);
     }
@@ -9709,7 +9704,6 @@ mod tests {
         let (stats, breakdown) = compute_project_stats(&target);
         assert_eq!(stats.total_bytes, 4096);
         assert_eq!(stats.cached_bytes, 4096);
-        assert_eq!(stats.cached_files, 1);
         assert_eq!(stats.local_bytes, 0);
         assert_eq!(breakdown.other, 0);
     }
@@ -10169,7 +10163,7 @@ mod tests {
         // Compute how many shards actually carry entries, so the test is robust
         // to the bucket assignment.
         let deps = crate::shards::parse_cargo_lock(&lock).unwrap();
-        let shard_set = crate::shards::compute_shards("ns", &deps);
+        let shard_set = crate::shards::compute_shards(&deps);
         let expected = shard_set.shards.len();
 
         let backend = TestBackend::memory();
@@ -12068,7 +12062,7 @@ mod tests {
             artifact_size: 1,
         }];
         let deps = crate::shards::parse_cargo_lock(&lock).unwrap();
-        let expected_shards = crate::shards::compute_shards("ns", &deps).shards.len();
+        let expected_shards = crate::shards::compute_shards(&deps).shards.len();
 
         let backend = TestBackend::memory();
         let client = as_remote_backend(&backend);

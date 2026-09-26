@@ -5,9 +5,7 @@ use std::path::Path;
 pub const NUM_SHARDS: usize = 64;
 
 /// A computed set of shards for a dependency graph.
-#[allow(dead_code)]
 pub struct ShardSet {
-    pub namespace: String,
     /// (shard_hash, Vec<(crate_name, version)>)
     pub shards: Vec<(String, Vec<(String, String)>)>,
 }
@@ -17,7 +15,7 @@ pub struct ShardSet {
 /// Sharding is deterministic: `blake3(crate_name) % NUM_SHARDS` assigns the bucket,
 /// then the shard content hash is `blake3("name1@v1|name2@v2|...")` over sorted entries.
 /// This gives insertion stability -- adding one crate only invalidates one shard.
-pub fn compute_shards(namespace: &str, deps: &[(String, String)]) -> ShardSet {
+pub fn compute_shards(deps: &[(String, String)]) -> ShardSet {
     let mut buckets: BTreeMap<usize, Vec<(String, String)>> = BTreeMap::new();
     for (name, version) in deps {
         let hash = blake3::hash(name.as_bytes());
@@ -41,10 +39,7 @@ pub fn compute_shards(namespace: &str, deps: &[(String, String)]) -> ShardSet {
         shards.push((shard_hash, entries));
     }
 
-    ShardSet {
-        namespace: namespace.to_string(),
-        shards,
-    }
+    ShardSet { shards }
 }
 
 #[derive(serde::Deserialize)]
@@ -91,8 +86,8 @@ mod tests {
             ("syn".to_string(), "2.0.0".to_string()),
         ];
 
-        let s1 = compute_shards("test", &deps);
-        let s2 = compute_shards("test", &deps);
+        let s1 = compute_shards(&deps);
+        let s2 = compute_shards(&deps);
 
         assert_eq!(s1.shards.len(), s2.shards.len());
         for ((h1, e1), (h2, e2)) in s1.shards.iter().zip(s2.shards.iter()) {
@@ -115,8 +110,8 @@ mod tests {
             ("syn".to_string(), "2.0.0".to_string()),
         ];
 
-        let s1 = compute_shards("test", &deps_v1);
-        let s2 = compute_shards("test", &deps_v2);
+        let s1 = compute_shards(&deps_v1);
+        let s2 = compute_shards(&deps_v2);
 
         assert_eq!(s1.shards.len(), s2.shards.len());
 
@@ -143,8 +138,8 @@ mod tests {
             ("anyhow".to_string(), "1.0.0".to_string()),
         ];
 
-        let s1 = compute_shards("test", &deps_v1);
-        let s2 = compute_shards("test", &deps_v2);
+        let s1 = compute_shards(&deps_v1);
+        let s2 = compute_shards(&deps_v2);
 
         let s1_hashes: std::collections::HashSet<_> =
             s1.shards.iter().map(|(h, _)| h.clone()).collect();
@@ -157,7 +152,7 @@ mod tests {
 
     #[test]
     fn test_compute_shards_empty() {
-        let s = compute_shards("test", &[]);
+        let s = compute_shards(&[]);
         assert!(s.shards.is_empty());
     }
 
@@ -167,7 +162,7 @@ mod tests {
             .map(|i| (format!("crate_{i:04}"), format!("0.{i}.0")))
             .collect();
 
-        let s = compute_shards("test", &deps);
+        let s = compute_shards(&deps);
         for (_hash, entries) in &s.shards {
             for w in entries.windows(2) {
                 assert!(w[0] <= w[1], "entries should be sorted within shard");

@@ -3247,6 +3247,13 @@ fn the_target_info_probe_seeds_a_new_checkout() {
     let donor_target = donor.join("target");
     let built = e.wrapper_build(&donor, &donor_target);
     assert!(built.status.success(), "{built:?}");
+    // Seeding reads the compiler a target was built by from Cargo's rustc
+    // info cache, which Cargo skips when it cannot fingerprint rustc (the
+    // macOS CI runner's rustup layout). No cache, nothing to seed from.
+    if !donor_target.join(".rustc_info.json").is_file() {
+        eprintln!("skipping: Cargo cached no rustc info for the donor here");
+        return;
+    }
     // A registry unit, as the toolchain lays it out.
     let profile = donor_target.join("debug");
     let hash = "0123456789abcdef";

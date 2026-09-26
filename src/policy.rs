@@ -65,6 +65,23 @@ fn is_trusted_gitlab_writer(get_env: &impl Fn(&str) -> Option<String>) -> bool {
         && env_truthy(get_env("CI_COMMIT_REF_PROTECTED"))
 }
 
+/// Whether this process is a pull request job: a GitHub `pull_request` event
+/// or a GitLab merge request pipeline. `pull_request_target` is not one: it
+/// runs the base branch's workflow with its secrets, so it stays read-only.
+pub(crate) fn pull_request_job() -> bool {
+    pull_request_job_with(|name| std::env::var(name).ok())
+}
+
+pub(crate) fn pull_request_job_with(get_env: impl Fn(&str) -> Option<String>) -> bool {
+    if env_truthy(get_env("GITHUB_ACTIONS")) {
+        return get_env("GITHUB_EVENT_NAME").as_deref() == Some("pull_request");
+    }
+    if env_truthy(get_env("GITLAB_CI")) {
+        return get_env("CI_PIPELINE_SOURCE").as_deref() == Some("merge_request_event");
+    }
+    false
+}
+
 fn env_truthy(value: Option<String>) -> bool {
     value.is_some_and(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
 }
@@ -102,6 +119,27 @@ mod tests {
         let mut vars = env(&[("GITLAB_CI", "true")]);
         vars.extend(env(extra));
         vars
+    }
+
+    #[test]
+    fn only_pull_request_and_merge_request_jobs_are_pull_request_jobs() {
+        let yes = [
+            github(&[("GITHUB_EVENT_NAME", "pull_request")]),
+            gitlab(&[("CI_PIPELINE_SOURCE", "merge_request_event")]),
+        ];
+        for vars in &yes {
+            assert!(pull_request_job_with(lookup(vars)), "{vars:?}");
+        }
+        let no = [
+            HashMap::new(),
+            env(&[("GITHUB_EVENT_NAME", "pull_request")]),
+            github(&[("GITHUB_EVENT_NAME", "pull_request_target")]),
+            github(&[("GITHUB_EVENT_NAME", "push")]),
+            gitlab(&[("CI_PIPELINE_SOURCE", "push")]),
+        ];
+        for vars in &no {
+            assert!(!pull_request_job_with(lookup(vars)), "{vars:?}");
+        }
     }
 
     #[test]

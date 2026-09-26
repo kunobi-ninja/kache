@@ -3434,7 +3434,12 @@ impl Daemon {
                     .remote
                     .as_ref()
                     .ok_or_else(|| anyhow::anyhow!("no remote configured"))?;
-                crate::remote_backend::create_backend(remote, self.config.s3_pool_idle_secs).await
+                crate::remote_backend::create_backend_for(
+                    remote,
+                    self.config.pull_request_prefix.as_deref(),
+                    self.config.s3_pool_idle_secs,
+                )
+                .await
             })
             .await
     }

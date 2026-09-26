@@ -6199,9 +6199,13 @@ async fn sync_inner(
         );
     }
 
-    let backend = crate::remote_backend::create_backend(remote, config.s3_pool_idle_secs)
-        .await
-        .context("connecting to the remote — check its configuration and access")?;
+    let backend = crate::remote_backend::create_backend_for(
+        remote,
+        config.pull_request_prefix.as_deref(),
+        config.s3_pool_idle_secs,
+    )
+    .await
+    .context("connecting to the remote — check its configuration and access")?;
     let remote_cache: Arc<dyn crate::cache_remote::CacheRemote> =
         Arc::new(crate::cache_remote::V3Remote::new(backend, remote.clone()));
     sync_with_client(
@@ -6645,7 +6649,12 @@ fn save_manifest_impl(
     let entry_count = entries.len();
     let published = keys.clone();
     rt.block_on(async {
-        let backend = crate::remote_backend::create_backend(remote, pool_idle_secs).await?;
+        let backend = crate::remote_backend::create_backend_for(
+            remote,
+            config.pull_request_prefix.as_deref(),
+            pool_idle_secs,
+        )
+        .await?;
         let remote_cache = Arc::new(crate::cache_remote::V3Remote::new(backend, remote.clone()));
         for (index, key) in keys.iter().enumerate() {
             let shard_namespace =

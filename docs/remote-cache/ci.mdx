@@ -48,6 +48,43 @@ GitHub withholds secrets and OIDC tokens from fork pull-request jobs, so those r
 
 Pull-request jobs can still restore entries a trusted branch already published.
 
+### A prefix for pull requests
+
+Read-only pull requests never reuse their own work: each push recompiles what the pull request changed, even when the previous push built it. Give pull requests a prefix of their own and they can:
+
+```toml
+[cache.remote]
+type = "s3"
+bucket = "acme-build-cache"
+prefix = "artifacts"
+pull_request_prefix = "artifacts-pr"
+```
+
+`KACHE_PULL_REQUEST_PREFIX` sets the same value. In a pull request job (a GitHub `pull_request` event or a GitLab merge request pipeline), Kache then:
+
+- reads the base prefix first and the pull request prefix for what the base lacks;
+- writes entries, build manifests, shards and prediction rows only under the pull request prefix.
+
+Every other job ignores the setting: protected-branch pushes never read the pull request prefix, and tags, unprotected branches and `pull_request_target` jobs stay read-only. The pull request prefix must differ from `prefix`, and neither may contain the other; otherwise the job stays read-only and Kache logs why.
+
+A pull request job with a prefix runs its own daemon. Its socket and upload queue carry a name derived from the prefix (`daemon-pr-<hash>.sock`, `upload-queue-pr-<hash>`), so on a machine that keeps its disk across jobs it never hands work to, or takes work from, a protected-branch job's daemon.
+
+Kache's policy is not the boundary; the bucket policy is. Give the role that pull request jobs assume read access to both prefixes and write access to the pull request prefix only:
+
+```json
+{
+  "Statement": [
+    { "Effect": "Allow", "Action": "s3:GetObject",
+      "Resource": ["arn:aws:s3:::acme-build-cache/artifacts/*",
+                   "arn:aws:s3:::acme-build-cache/artifacts-pr/*"] },
+    { "Effect": "Allow", "Action": "s3:PutObject",
+      "Resource": "arn:aws:s3:::acme-build-cache/artifacts-pr/*" }
+  ]
+}
+```
+
+Expire the pull request prefix with a lifecycle rule. One prefix is shared by all pull requests of the repository, so someone who can open a pull request can affect another pull request's builds, but never `main`, a tag or a release.
+
 In a `container:` job, the runner mounts `HOME` and `runner.temp` separately from the workspace, and a hardlink cannot cross a mount. Leave `cache-dir` unset and the action puts the cache on the workspace's mount. A `cache-dir` on another mount still works, but kache copies every artifact into `target/`.
 
 C and C++ objects publish through the same remote as Rust. A daemon-backed compile restores them on miss; `kache sync --pull --all` also warms them in the local store. clang-cl debug objects stay on the machine and are not published.

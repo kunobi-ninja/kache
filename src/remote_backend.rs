@@ -1319,6 +1319,140 @@ pub(crate) fn anonymous_s3_backend_for_bucket(endpoint: &str, bucket: &str) -> O
     OpenDalBackend::new(operator, format!("s3://{bucket}"))
 }
 
+/// [`create_backend`], wrapped in a [`PullRequestBackend`] when this pull
+/// request job has a prefix of its own.
+pub async fn create_backend_for(
+    remote: &RemoteConfig,
+    pull_request_prefix: Option<&str>,
+    pool_idle_secs: u64,
+) -> Result<Arc<dyn RemoteBackend>> {
+    let backend = create_backend(remote, pool_idle_secs).await?;
+    Ok(match pull_request_prefix {
+        Some(pull_request) => Arc::new(PullRequestBackend {
+            inner: backend,
+            base: remote.prefix.clone(),
+            pull_request: pull_request.to_string(),
+        }),
+        None => backend,
+    })
+}
+
+/// The remote as a pull request job sees it. Every key names an object under
+/// the base prefix; a read looks there first and then under the pull request
+/// prefix, and every write goes under the pull request prefix, so nothing a
+/// pull request builds reaches the base prefix that trusted builds read.
+/// Merged objects (manifests, shards) are read and written under the pull
+/// request prefix only, so their conditional updates stay consistent.
+pub struct PullRequestBackend {
+    inner: Arc<dyn RemoteBackend>,
+    base: String,
+    pull_request: String,
+}
+
+impl PullRequestBackend {
+    /// `key` moved from the base prefix to the pull request prefix.
+    fn pull_request_key(&self, key: &str) -> String {
+        let rest = key
+            .strip_prefix(&self.base)
+            .and_then(|rest| rest.strip_prefix('/'))
+            .unwrap_or(key);
+        crate::config::join_remote_key(&self.pull_request, rest)
+    }
+
+    /// A key under the pull request prefix, named as the base key it mirrors.
+    fn base_key(&self, key: &str) -> String {
+        let rest = key
+            .strip_prefix(&self.pull_request)
+            .and_then(|rest| rest.strip_prefix('/'))
+            .unwrap_or(key);
+        crate::config::join_remote_key(&self.base, rest)
+    }
+}
+
+#[async_trait]
+impl RemoteBackend for PullRequestBackend {
+    async fn head(&self, key: &str) -> Result<bool> {
+        Ok(self.inner.head(key).await? || self.inner.head(&self.pull_request_key(key)).await?)
+    }
+
+    async fn get(&self, key: &str, max_bytes: Option<u64>) -> Result<Option<GetObject>> {
+        match self.inner.get(key, max_bytes).await? {
+            Some(object) => Ok(Some(object)),
+            None => self.inner.get(&self.pull_request_key(key), max_bytes).await,
+        }
+    }
+
+    async fn get_into(
+        &self,
+        key: &str,
+        max_bytes: Option<u64>,
+        destination: &mut (dyn AsyncWrite + Unpin + Send),
+    ) -> Result<Option<GetTransfer>> {
+        // A missing object is reported before any bytes are written, so the
+        // second read starts from an untouched `destination`.
+        match self.inner.get_into(key, max_bytes, destination).await? {
+            Some(transfer) => Ok(Some(transfer)),
+            None => {
+                self.inner
+                    .get_into(&self.pull_request_key(key), max_bytes, destination)
+                    .await
+            }
+        }
+    }
+
+    async fn get_versioned(
+        &self,
+        key: &str,
+        max_bytes: Option<u64>,
+    ) -> Result<Option<(GetObject, Option<String>)>> {
+        self.inner
+            .get_versioned(&self.pull_request_key(key), max_bytes)
+            .await
+    }
+
+    async fn put_if_match(
+        &self,
+        key: &str,
+        body: Vec<u8>,
+        content_type: Option<&str>,
+        expected: Option<&str>,
+    ) -> Result<ConditionalPut> {
+        self.inner
+            .put_if_match(&self.pull_request_key(key), body, content_type, expected)
+            .await
+    }
+
+    async fn put(&self, key: &str, body: Vec<u8>, content_type: Option<&str>) -> Result<()> {
+        self.inner
+            .put(&self.pull_request_key(key), body, content_type)
+            .await
+    }
+
+    async fn put_if_absent(
+        &self,
+        key: &str,
+        body: Vec<u8>,
+        content_type: Option<&str>,
+    ) -> Result<PutIfAbsentResult> {
+        self.inner
+            .put_if_absent(&self.pull_request_key(key), body, content_type)
+            .await
+    }
+
+    async fn list(&self, prefix: &str) -> Result<Vec<String>> {
+        let mut keys = self.inner.list(prefix).await?;
+        let pull_request = self.inner.list(&self.pull_request_key(prefix)).await?;
+        keys.extend(pull_request.iter().map(|key| self.base_key(key)));
+        keys.sort();
+        keys.dedup();
+        Ok(keys)
+    }
+
+    fn describe(&self, key: &str) -> String {
+        self.inner.describe(key)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1612,6 +1746,121 @@ mod tests {
             "{}",
             requests[2]
         );
+    }
+
+    fn pull_request_view(inner: Arc<dyn RemoteBackend>) -> PullRequestBackend {
+        PullRequestBackend {
+            inner,
+            base: "artifacts".to_string(),
+            pull_request: "artifacts-pr".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_pull_request_job_writes_only_under_its_own_prefix() {
+        let inner: Arc<dyn RemoteBackend> = Arc::new(memory_backend());
+        let view = pull_request_view(inner.clone());
+        view.put("artifacts/v3/packs/a", b"pr".to_vec(), None)
+            .await
+            .unwrap();
+        view.put_if_absent("artifacts/v3/packs/b", b"pr".to_vec(), None)
+            .await
+            .unwrap();
+        assert!(!inner.head("artifacts/v3/packs/a").await.unwrap());
+        assert!(!inner.head("artifacts/v3/packs/b").await.unwrap());
+        assert!(inner.head("artifacts-pr/v3/packs/a").await.unwrap());
+        assert!(inner.head("artifacts-pr/v3/packs/b").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_pull_request_job_reads_the_base_prefix_first() {
+        let inner: Arc<dyn RemoteBackend> = Arc::new(memory_backend());
+        inner
+            .put("artifacts/k/both", b"base".to_vec(), None)
+            .await
+            .unwrap();
+        inner
+            .put("artifacts-pr/k/both", b"pr".to_vec(), None)
+            .await
+            .unwrap();
+        inner
+            .put("artifacts-pr/k/pr-only", b"pr".to_vec(), None)
+            .await
+            .unwrap();
+        let view = pull_request_view(inner);
+        let read = |key: &'static str| {
+            let view = &view;
+            async move {
+                view.get(key, Some(4096))
+                    .await
+                    .unwrap()
+                    .map(|o| o.body.to_vec())
+            }
+        };
+        assert_eq!(read("artifacts/k/both").await.unwrap(), b"base");
+        assert_eq!(read("artifacts/k/pr-only").await.unwrap(), b"pr");
+        assert_eq!(read("artifacts/k/none").await, None);
+        assert!(view.head("artifacts/k/pr-only").await.unwrap());
+        assert!(!view.head("artifacts/k/none").await.unwrap());
+
+        let mut body = Vec::new();
+        let transfer = view
+            .get_into("artifacts/k/pr-only", None, &mut body)
+            .await
+            .unwrap();
+        assert!(transfer.is_some());
+        assert_eq!(body, b"pr");
+
+        let listed = view.list("artifacts/k/").await.unwrap();
+        assert_eq!(listed, ["artifacts/k/both", "artifacts/k/pr-only"]);
+    }
+
+    #[tokio::test]
+    async fn a_pull_request_job_merges_manifests_inside_its_own_prefix() {
+        let inner: Arc<dyn RemoteBackend> = Arc::new(memory_backend());
+        let base_manifest =
+            b"{\"version\":3,\"created\":\"x\",\"manifest_key\":\"id/t\",\"entries\":[]}";
+        inner
+            .put(
+                "artifacts/_manifests/id/t.json",
+                base_manifest.to_vec(),
+                None,
+            )
+            .await
+            .unwrap();
+        let view = pull_request_view(inner.clone());
+        let manifest = crate::remote::BuildManifest {
+            version: 3,
+            created: "now".to_string(),
+            manifest_key: "id/t".to_string(),
+            entries: vec![crate::remote::ManifestEntry {
+                cache_key: "pr-entry".to_string(),
+                crate_name: "c".to_string(),
+                compile_time_ms: 1,
+                artifact_size: 1,
+            }],
+        };
+        crate::remote::upload_manifest(&view, "artifacts", "id/t", &manifest, None)
+            .await
+            .unwrap();
+        // Bodies are copied out at once: a held buffered object keeps its share
+        // of the process-wide download budget.
+        let base = inner
+            .get("artifacts/_manifests/id/t.json", Some(4096))
+            .await
+            .unwrap()
+            .unwrap()
+            .body
+            .to_vec();
+        assert_eq!(base, base_manifest, "the base manifest is untouched");
+        let pr = inner
+            .get("artifacts-pr/_manifests/id/t.json", Some(4096))
+            .await
+            .unwrap()
+            .expect("the pull request's own manifest")
+            .body
+            .to_vec();
+        assert!(String::from_utf8_lossy(&pr).contains("pr-entry"));
     }
 
     #[test]

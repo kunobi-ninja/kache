@@ -66,7 +66,7 @@ input_predictions = true
 | `KACHE_CACHE_DIR` | `cache.local_store` | OS cache directory | Persistent store |
 | `KACHE_TRUST_DOMAIN` | none | unset | Isolate the local store under `$KACHE_CACHE_DIR/<label>/`. One path component (`[A-Za-z0-9._-]`). Invalid labels are ignored. Do not set this on public or fork jobs. |
 | `KACHE_RUNTIME_DIR` | `cache.runtime_dir` | local store | Socket, locks, logs, state, and session markers |
-| none | `cache.volumes` | unset | Volume-local store shards, e.g. `[cache.volumes] "D:" = "D:/kache-store"`. Builds on a mapped volume share inodes there instead of copying across mounts. Unmapped volumes use the main store. |
+| none | `cache.volumes` | unset | Volume-local store shards, e.g. `[cache.volumes] "D:" = "D:/kache-store"`. Builds on a mapped volume share inodes there instead of copying across mounts. Unmapped volumes use the main store. GC sweeps each shard with its own budget; see [Volume shards](#volume-shards). |
 | `KACHE_SOCKET_PATH` | none | `<runtime_dir>/daemon.sock` | Absolute daemon endpoint override |
 | `KACHE_MAX_SIZE` | `cache.local_max_size` | 5% of the cache disk, floored at 5GiB and capped at 100GiB | Registered blob bytes allowed before GC. An explicit size always wins. `none` is not allowed. |
 | `KACHE_AUTO_GC` | `cache.auto_gc` | `true` | Spawn throttled background GC under size pressure |
@@ -152,6 +152,18 @@ gc_evict_shared = true
 ```
 
 The equivalent environment setting is `KACHE_GC_EVICT_SHARED=1`. With this option, GC can drop an entry even though target files still hold all its blocks. The registered store size falls, but disk usage does not. A later build must compile or download that entry again. Explicit `purge` and repair operations remain unconditional regardless of this setting.
+
+### Volume shards
+
+GC sweeps every `[cache.volumes]` shard as well as the main store: `kache gc`, the daemon's 6-hour sweep, its sweep after an upload or a build's hint, and the detached auto-GC worker. Each shard is swept like the main store, with the same age, duplicate, and size passes.
+
+Each shard has its own budget. An explicit `local_max_size` or `KACHE_MAX_SIZE` applies to each shard as it is. Without one, a shard's budget is 5% of the filesystem that holds it, floored at 5GiB and capped at 100GiB, the same rule as the main store.
+
+A shard keeps its own `gc.lock`, `auto-gc-backoff.json` and `gc_stats.json` in its store dir, so its trigger, backoff and held bytes do not mix with the main store's. `kache gc` prints one line per shard after the main store's.
+
+GC skips a shard whose store dir has no `index.db`: a missing directory, an unmounted volume, or a shard no build has written to yet. It never creates a shard directory. A shard that fails to open or sweep is logged, and GC carries on with the others and the main store.
+
+`kache stats`, `kache report`, `kache doctor` and `kache gc --json` still describe only the main store, and `kache gc --stale-schema` still covers only the main store.
 
 ### Daemon index maintenance
 

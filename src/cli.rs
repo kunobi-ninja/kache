@@ -3441,6 +3441,74 @@ pub fn run_gc_local(config: &Config, mode: GcMode) -> Result<crate::store::GcSta
     Ok(combined)
 }
 
+/// [`run_gc_local`] on the main store, then on each `[cache.volumes]` shard
+/// under the shard's own `gc.lock` and budget (kunobi-ninja/kache#974).
+/// Returns the main store's stats; a shard that fails is logged and skipped.
+/// Each store's lock is its own, so a GC that finds the main store busy
+/// still sweeps the shards that are not.
+pub fn run_gc_local_with_shards(config: &Config, mode: GcMode) -> Result<crate::store::GcStats> {
+    let main = run_gc_local(config, mode)?;
+    crate::volume_gc::run_on_volume_shards(config, |shard| {
+        if let Some(heading) = shard_sweep_heading(mode, &shard.cache_dir) {
+            println!("{heading}");
+        }
+        run_gc_local(shard, mode)
+    });
+    Ok(main)
+}
+
+/// What `kache gc` prints before it sweeps a shard: nothing unless the sweep
+/// itself prints its progress.
+fn shard_sweep_heading(mode: GcMode, shard: &std::path::Path) -> Option<String> {
+    (mode == GcMode::Cli).then(|| format!("Volume shard {}:", shard.display()))
+}
+
+/// The auto-GC worker for the main store, then for each `[cache.volumes]`
+/// shard. Each store has its own trigger, budget, and backoff.
+pub fn run_auto_gc_workers(config: &Config, retry_delay: std::time::Duration) {
+    run_auto_gc_worker(config, retry_delay);
+    crate::volume_gc::run_on_volume_shards(config, |shard| {
+        run_auto_gc_worker(shard, retry_delay);
+        Ok(())
+    });
+}
+
+/// `kache gc --max-age` on each `[cache.volumes]` shard when the daemon could
+/// not take it. A shard whose `gc.lock` is held is left to that GC.
+fn evict_shards_older_than(config: &Config, hours: u64) -> Vec<crate::store::GcStats> {
+    crate::volume_gc::run_on_volume_shards(config, |shard| {
+        let store = Store::open(shard)?;
+        let Some(_gc_lock) = store.try_gc_lock()? else {
+            return Ok(skipped_gc_stats());
+        };
+        evict_older_than_recorded(&store, shard, hours)
+    })
+    .into_iter()
+    .map(|(_, stats)| stats)
+    .collect()
+}
+
+/// One line per `[cache.volumes]` shard for the summary `kache gc` prints.
+/// Shards without an index are left out, as GC leaves them.
+fn shard_store_lines(config: &Config) -> Vec<String> {
+    crate::volume_gc::run_on_volume_shards(config, |shard| {
+        let store = Store::open(shard)?;
+        Ok(format!(
+            "Volume shard {}: {} / {} ({} entries)",
+            shard.cache_dir.display(),
+            ByteSize(store.total_size()?),
+            crate::config::describe_max_size(
+                shard.max_size,
+                crate::volume_gc::filesystem_bytes(&shard.cache_dir),
+            ),
+            store.entry_count()?
+        ))
+    })
+    .into_iter()
+    .map(|(_, line)| line)
+    .collect()
+}
+
 /// The detached worker the wrapper spawns under size pressure when no daemon
 /// takes its hint: sweep, and if live builds pinned entries (or another
 /// driver held `gc.lock`), wait `retry_delay` for them to age out and sweep
@@ -3655,7 +3723,7 @@ pub fn gc(
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(121);
 
-        run_auto_gc_worker(config, std::time::Duration::from_secs(sleep_secs));
+        run_auto_gc_workers(config, std::time::Duration::from_secs(sleep_secs));
         return Ok(());
     }
 
@@ -3727,6 +3795,8 @@ pub fn gc(
                     std::io::Write::flush(&mut std::io::stdout()).ok();
                 }
                 let evict_stats = evict_older_than_recorded(&store, config, hours)?;
+                drop(_gc_lock);
+                evict_shards_older_than(config, hours);
                 combined = evict_stats.clone();
                 if human_gc_output(json) {
                     let over_limit = store_over_limit(
@@ -3739,7 +3809,7 @@ pub fn gc(
                     println!("{}", describe_eviction(&evict_stats, over_limit));
                 }
             } else {
-                combined = run_gc_local(
+                combined = run_gc_local_with_shards(
                     config,
                     if json {
                         GcMode::Background
@@ -3767,6 +3837,9 @@ pub fn gc(
         ),
         entry_count
     );
+    for line in shard_store_lines(config) {
+        println!("{line}");
+    }
 
     Ok(())
 }
@@ -8157,6 +8230,173 @@ mod tests {
 
         let stats = crate::report::read_gc_stats(&config.cache_dir).expect("age run recorded");
         assert_eq!(stats.source, "manual");
+    }
+
+    /// An idle `size`-byte entry the store holds alone.
+    fn put_idle_entry(store: &Store, dir: &std::path::Path, key: &str, size: usize) {
+        let src = dir.join(format!("{key}.o"));
+        std::fs::write(&src, &key.as_bytes().repeat(size)[..size]).unwrap();
+        store
+            .put(
+                key,
+                "test-crate",
+                &[],
+                &[],
+                "host",
+                "dev",
+                &[(src.clone(), format!("{key}.o"))],
+                "",
+                "",
+            )
+            .unwrap();
+        store.remove_clone_for_test(&src);
+        store.set_last_accessed_for_test(key, "-1 hour");
+    }
+
+    /// A main config with one `[cache.volumes]` shard of `budget` bytes whose
+    /// store holds two idle 600-byte entries, and one mapped shard that does
+    /// not exist.
+    fn config_with_an_over_budget_shard(
+        dir: &std::path::Path,
+        budget: u64,
+    ) -> (Config, Config, Store) {
+        let mut config = save_manifest_config(dir.join("main"), None);
+        let shard = crate::config::VolumeStore {
+            volume: "/mnt/shard/".into(),
+            store: dir.join("shard"),
+            max_size: Some(budget),
+        };
+        let shard_config = config.for_volume_store(&shard, |_| None);
+        config.volume_stores = vec![
+            crate::config::VolumeStore {
+                volume: "/mnt/gone/".into(),
+                store: dir.join("unmounted"),
+                max_size: None,
+            },
+            shard,
+        ];
+        let store = Store::open(&shard_config).unwrap();
+        put_idle_entry(&store, dir, "shard_a", 600);
+        put_idle_entry(&store, dir, "shard_b", 600);
+        (config, shard_config, store)
+    }
+
+    /// kunobi-ninja/kache#974: `kache gc` without a daemon sweeps each shard
+    /// against its own budget, skips a missing one, and records the shard's
+    /// run in the shard.
+    #[test]
+    fn local_gc_sweeps_each_shard_against_its_own_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config, shard_config, shard) = config_with_an_over_budget_shard(dir.path(), 1000);
+        let main = Store::open(&config).unwrap();
+        put_idle_entry(&main, dir.path(), "main_entry", 1200);
+
+        let stats = run_gc_local_with_shards(&config, GcMode::Cli).unwrap();
+        assert_eq!(stats.entries_evicted, 0, "the stats are the main store's");
+        assert!(main.contains("main_entry"));
+        assert_eq!(shard.physical_size().unwrap(), 600);
+        let recorded = crate::report::read_gc_stats(&shard_config.cache_dir).unwrap();
+        assert_eq!(
+            (recorded.source.as_str(), recorded.entries_evicted),
+            ("manual", 1)
+        );
+        assert!(!dir.path().join("unmounted").exists());
+
+        let dir = tempfile::tempdir().unwrap();
+        let (config, _, shard) = config_with_an_over_budget_shard(dir.path(), 1_000_000);
+        run_gc_local_with_shards(&config, GcMode::Background).unwrap();
+        assert_eq!(
+            shard.physical_size().unwrap(),
+            1200,
+            "under budget: left alone"
+        );
+    }
+
+    /// Each store has its own gc.lock: a busy main store does not stop the
+    /// shards from being swept, and a busy shard is left to its holder.
+    #[test]
+    fn local_gc_takes_each_stores_lock_on_its_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config, _, shard) = config_with_an_over_budget_shard(dir.path(), 1000);
+        let main = Store::open(&config).unwrap();
+        let main_lock = main.try_gc_lock().unwrap().expect("gc lock");
+        let shard_lock = shard.try_gc_lock().unwrap().expect("gc lock");
+
+        let stats = run_gc_local_with_shards(&config, GcMode::Background).unwrap();
+        assert!(stats.skipped);
+        assert_eq!(
+            shard.physical_size().unwrap(),
+            1200,
+            "the shard's lock is held"
+        );
+
+        drop(shard_lock);
+        run_gc_local_with_shards(&config, GcMode::Background).unwrap();
+        assert_eq!(
+            shard.physical_size().unwrap(),
+            600,
+            "only the main lock is held"
+        );
+        drop(main_lock);
+    }
+
+    #[test]
+    fn only_a_printing_sweep_names_the_shard_first() {
+        let shard = std::path::Path::new("/mnt/shard");
+        assert_eq!(
+            shard_sweep_heading(GcMode::Cli, shard).as_deref(),
+            Some("Volume shard /mnt/shard:")
+        );
+        assert_eq!(shard_sweep_heading(GcMode::Background, shard), None);
+    }
+
+    /// The auto-GC worker a build spawns with no daemon sweeps shards too,
+    /// each against its own trigger.
+    #[test]
+    fn the_auto_gc_worker_sweeps_an_over_budget_shard() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config, shard_config, shard) = config_with_an_over_budget_shard(dir.path(), 1000);
+
+        run_auto_gc_workers(&config, std::time::Duration::ZERO);
+        assert_eq!(shard.physical_size().unwrap(), 600);
+        let recorded = crate::report::read_gc_stats(&shard_config.cache_dir).unwrap();
+        assert_eq!(recorded.source, "auto");
+        assert!(!dir.path().join("unmounted").exists());
+    }
+
+    #[test]
+    fn age_gc_without_a_daemon_reaches_shards_whose_lock_is_free() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config, shard_config, shard) = config_with_an_over_budget_shard(dir.path(), 1_000_000);
+        shard.set_last_accessed_for_test("shard_a", "-48 hours");
+
+        let held = shard.try_gc_lock().unwrap().expect("gc lock");
+        let stats = evict_shards_older_than(&config, 24);
+        assert_eq!(stats.len(), 1);
+        assert!(stats[0].skipped);
+        assert!(shard.contains("shard_a"));
+        drop(held);
+
+        let stats = evict_shards_older_than(&config, 24);
+        assert_eq!(stats[0].entries_evicted, 1);
+        assert!(!shard.contains("shard_a") && shard.contains("shard_b"));
+        let recorded = crate::report::read_gc_stats(&shard_config.cache_dir).unwrap();
+        assert_eq!(recorded.source, "manual");
+    }
+
+    #[test]
+    fn the_gc_summary_has_a_line_per_shard_it_swept() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config, shard_config, shard) = config_with_an_over_budget_shard(dir.path(), 1000);
+        assert_eq!(
+            shard_store_lines(&config),
+            vec![format!(
+                "Volume shard {}: {} / {} (2 entries)",
+                shard_config.cache_dir.display(),
+                ByteSize(shard.total_size().unwrap()),
+                ByteSize(1000),
+            )]
+        );
     }
 
     #[test]

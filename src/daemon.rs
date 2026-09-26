@@ -6465,10 +6465,35 @@ impl Daemon {
         }
     }
 
-    /// The sweep behind the post-upload check and wrapper hints. Skips when
-    /// another driver holds `gc.lock`, the store is under the trigger, or the
-    /// backoff holds; each costs a lock attempt and one size query.
+    /// The sweep behind the post-upload check and wrapper hints, of the main
+    /// store and then each `[cache.volumes]` shard. A shard's failure is
+    /// logged and never fails the main store's sweep.
     fn sweep_under_size_pressure(&self) -> Result<()> {
+        let main = self.sweep_main_under_size_pressure();
+        crate::volume_gc::run_on_volume_shards(&self.config, |shard| {
+            self.sweep_shard_under_size_pressure(shard)
+        });
+        main
+    }
+
+    /// One shard's size-pressure sweep, under that shard's `gc.lock`.
+    fn sweep_shard_under_size_pressure(&self, shard: &Config) -> Result<()> {
+        let store = Store::open(shard)?;
+        let Some(_gc_lock) = store.try_gc_lock()? else {
+            tracing::debug!(
+                "gc.lock of shard {} held by another GC; skipping size-pressure eviction",
+                shard.cache_dir.display()
+            );
+            return Ok(());
+        };
+        let size = store.physical_size()?;
+        self.size_pressure_sweep_if_due(shard, size)
+    }
+
+    /// The main store's size-pressure sweep. Skips when another driver holds
+    /// `gc.lock`, the store is under the trigger, or the backoff holds; each
+    /// costs a lock attempt and one size query.
+    fn sweep_main_under_size_pressure(&self) -> Result<()> {
         let Some((_gc_lock, size)) = self.with_store(|store| {
             let Some(lock) = store.try_gc_lock()? else {
                 return Ok(None);
@@ -6481,13 +6506,19 @@ impl Daemon {
             tracing::debug!("gc.lock held by another GC; skipping size-pressure eviction");
             return Ok(());
         };
-        if !crate::wrapper::auto_gc_sweep_due(&self.config, size) {
+        self.size_pressure_sweep_if_due(&self.config, size)
+    }
+
+    /// Sweep the store of `config`, now at `size`, if the shared trigger
+    /// says a sweep is due. Caller holds that store's `gc.lock`.
+    fn size_pressure_sweep_if_due(&self, config: &Config, size: u64) -> Result<()> {
+        if !crate::wrapper::auto_gc_sweep_due(config, size) {
             return Ok(());
         }
         // Under gc.lock like every driver, so the totals cannot race.
-        let store = Store::open(&self.config)?;
-        let stats = self.automatic_size_pass(&store, size)?;
-        if let Err(e) = crate::report::record_gc_run(&self.config, "daemon", &stats) {
+        let store = Store::open(config)?;
+        let stats = self.automatic_size_pass(config, &store, size)?;
+        if let Err(e) = crate::report::record_gc_run(config, "daemon", &stats) {
             tracing::warn!("recording size-pressure GC run: {e:#}");
         }
         Ok(())
@@ -6496,17 +6527,23 @@ impl Daemon {
     /// The size pass of an automatic sweep the shared trigger found due.
     /// Records where the store ended, so a sweep that could not clear the
     /// pressure backs off every automatic driver. Caller holds `gc.lock`.
-    fn automatic_size_pass(&self, store: &Store, size: u64) -> Result<crate::store::GcStats> {
+    fn automatic_size_pass(
+        &self,
+        config: &Config,
+        store: &Store,
+        size: u64,
+    ) -> Result<crate::store::GcStats> {
         tracing::info!(
-            "store size {} over the automatic trigger (max {}), running LRU eviction",
+            "store {} size {} over the automatic trigger (max {}), running LRU eviction",
+            config.cache_dir.display(),
             size,
-            self.config.max_size
+            config.max_size
         );
         let started = Instant::now();
         let mut stats = store.evict_for(crate::store::SweepOrigin::Automatic)?;
         stats.duration_ms = started.elapsed().as_millis() as u64;
         if let Ok(after) = store.physical_size() {
-            crate::wrapper::record_auto_gc_outcome(&self.config, after, stats.bytes_held);
+            crate::wrapper::record_auto_gc_outcome(config, after, stats.bytes_held);
         }
         Ok(stats)
     }
@@ -6515,20 +6552,43 @@ impl Daemon {
     /// and leaves the backoff alone. The timer runs it only when the shared
     /// trigger says a sweep is due; its age and duplicate passes are not
     /// size pressure and stay on schedule.
-    fn size_pass(&self, driver: GcDriver, store: &Store) -> Result<crate::store::GcStats> {
+    fn size_pass(
+        &self,
+        config: &Config,
+        driver: GcDriver,
+        store: &Store,
+    ) -> Result<crate::store::GcStats> {
         if driver == GcDriver::Requested {
             return store.evict();
         }
         let size = store.physical_size()?;
-        if !crate::wrapper::auto_gc_sweep_due(&self.config, size) {
+        if !crate::wrapper::auto_gc_sweep_due(config, size) {
             tracing::info!("periodic GC: size pass not due (under the trigger or backing off)");
             return Ok(crate::store::GcStats::default());
         }
-        self.automatic_size_pass(store, size)
+        self.automatic_size_pass(config, store, size)
     }
 
-    /// Core GC logic with an explicit policy and per-policy result accounting.
+    /// Sweep the main store, then each `[cache.volumes]` shard with its own
+    /// budget (kunobi-ninja/kache#974). The report describes the main store.
+    /// Each store's `gc.lock` is its own: a shard another GC holds is skipped,
+    /// and a busy main store does not stop the shards from being swept.
     fn run_gc(&self, policy: GcPolicy, driver: GcDriver) -> Result<GcRunReport> {
+        let report = self.run_gc_store(&self.config, policy, driver)?;
+        crate::volume_gc::run_on_volume_shards(&self.config, |shard| {
+            self.run_gc_store(shard, policy, driver)
+        });
+        Ok(report)
+    }
+
+    /// Core GC logic for the store of `config` with an explicit policy and
+    /// per-policy result accounting. Holds that store's `gc.lock`.
+    fn run_gc_store(
+        &self,
+        config: &Config,
+        policy: GcPolicy,
+        driver: GcDriver,
+    ) -> Result<GcRunReport> {
         let start = Instant::now();
         let mode = policy.mode();
         // Cross-process GC mutual exclusion (kunobi-ninja/kache#326): if another
@@ -6537,7 +6597,7 @@ impl Daemon {
         // GC may scan and remove thousands of entries. Use its own connection
         // so daemon lookups and uploads can still reach the main Store mutex.
         // SQLite and gc.lock continue to serialize the actual writes.
-        let gc_store = Store::open(&self.config)?;
+        let gc_store = Store::open(config)?;
         let _gc_lock = match gc_store.try_gc_lock()? {
             Some(lock) => lock,
             None => {
@@ -6633,7 +6693,7 @@ impl Daemon {
                         let duplicate_stats = store
                             .evict_duplicate_entries_for(driver.sweep_origin())
                             .unwrap_or_default();
-                        let size_stats = self.size_pass(driver, store)?;
+                        let size_stats = self.size_pass(config, driver, store)?;
                         (duplicate_stats, age_stats, size_stats)
                     }
                 };
@@ -6781,7 +6841,7 @@ impl Daemon {
 
         // Persist GC stats for reports and machine telemetry. Still under
         // gc.lock, so the record cannot race another driver.
-        if let Err(e) = crate::report::record_gc_run(&self.config, "daemon", &stats) {
+        if let Err(e) = crate::report::record_gc_run(config, "daemon", &stats) {
             tracing::debug!(
                 "gc: could not record {}: {e:#}",
                 crate::report::GC_STATS_FILE
@@ -11473,6 +11533,7 @@ mod tests {
         let volumes = [crate::config::VolumeStore {
             volume: "/mnt/vol/".into(),
             store: shard.clone(),
+            max_size: None,
         }];
         assert_eq!(remote_check_cache_dir(main, &volumes, None).unwrap(), main);
         assert_eq!(
@@ -12381,6 +12442,183 @@ mod tests {
         daemon.maybe_evict_after_upload();
         assert!(!store.contains("at_the_trigger"));
         assert!(crate::report::read_gc_stats(dir.path()).is_some());
+    }
+
+    /// Add a `[cache.volumes]` shard with its own `budget` to `config`, and
+    /// open its store, which gives it the index GC looks for.
+    fn add_budgeted_shard(
+        config: &mut Config,
+        dir: &std::path::Path,
+        name: &str,
+        budget: u64,
+    ) -> (Config, Store) {
+        let shard = crate::config::VolumeStore {
+            volume: format!("/mnt/{name}/"),
+            store: dir.join(name),
+            max_size: Some(budget),
+        };
+        let shard_config = config.for_volume_store(&shard, |_| None);
+        config.volume_stores.push(shard);
+        let store = Store::open(&shard_config).unwrap();
+        (shard_config, store)
+    }
+
+    /// kunobi-ninja/kache#974: shards used to grow without a budget, since
+    /// GC only ever saw the main store.
+    #[test]
+    fn requested_and_periodic_gc_sweep_a_shard_over_its_own_budget() {
+        for driver in [GcDriver::Periodic, GcDriver::Requested] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut config = test_config(&dir.path().join("main"));
+            config.max_size = 1_000_000;
+            let main = Store::open(&config).unwrap();
+            put_upload_evict_entry(&main, dir.path(), "main_entry", 1200, false);
+            let (over_config, over) = add_budgeted_shard(&mut config, dir.path(), "over", 1000);
+            put_upload_evict_entry(&over, dir.path(), "over_a", 600, false);
+            put_upload_evict_entry(&over, dir.path(), "over_b", 600, false);
+            let (_, under) = add_budgeted_shard(&mut config, dir.path(), "under", 1_000_000);
+            put_upload_evict_entry(&under, dir.path(), "under_entry", 1200, false);
+
+            let report = Daemon::new(config)
+                .run_gc(GcPolicy::Automatic { max_age_hours: 0 }, driver)
+                .unwrap();
+            assert_eq!(over.physical_size().unwrap(), 600, "{driver:?}");
+            assert!(under.contains("under_entry"), "{driver:?}");
+            assert!(main.contains("main_entry"), "{driver:?}");
+            assert_eq!(
+                report.total.entries_evicted, 0,
+                "the report is the main store's"
+            );
+            let recorded = crate::report::read_gc_stats(&over_config.cache_dir)
+                .expect("the shard's run is recorded in the shard");
+            assert_eq!(recorded.entries_evicted, 1, "{driver:?}");
+        }
+    }
+
+    #[test]
+    fn explicit_age_gc_reaches_shards_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(&dir.path().join("main"));
+        let (_, shard) = add_budgeted_shard(&mut config, dir.path(), "shard", 1_000_000);
+        put_upload_evict_entry(&shard, dir.path(), "stale", 10, false);
+        shard.set_last_accessed_for_test("stale", "-48 hours");
+        put_upload_evict_entry(&shard, dir.path(), "fresh", 10, false);
+
+        Daemon::new(config)
+            .run_gc(GcPolicy::ExplicitAge { hours: 24 }, GcDriver::Requested)
+            .unwrap();
+        assert!(!shard.contains("stale"));
+        assert!(shard.contains("fresh"));
+    }
+
+    /// Each store has its own gc.lock: a busy main store does not stop the
+    /// shards from being swept, and a busy shard is left to its holder.
+    #[test]
+    fn gc_takes_each_stores_lock_on_its_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(&dir.path().join("main"));
+        let (_, shard) = add_budgeted_shard(&mut config, dir.path(), "shard", 1000);
+        put_upload_evict_entry(&shard, dir.path(), "shard_entry", 1200, false);
+        let main = Store::open(&config).unwrap();
+        let _main_lock = main.try_gc_lock().unwrap().expect("gc lock");
+        let shard_lock = shard.try_gc_lock().unwrap().expect("gc lock");
+        let daemon = Daemon::new(config);
+        let policy = GcPolicy::Automatic { max_age_hours: 0 };
+
+        let report = daemon.run_gc(policy, GcDriver::Requested).unwrap();
+        assert!(report.total.skipped);
+        assert!(shard.contains("shard_entry"), "the shard's lock is held");
+
+        drop(shard_lock);
+        let report = daemon.run_gc(policy, GcDriver::Requested).unwrap();
+        assert!(report.total.skipped);
+        assert!(!shard.contains("shard_entry"), "only the main lock is held");
+    }
+
+    #[test]
+    fn gc_skips_a_missing_shard_and_still_sweeps_the_main_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(&dir.path().join("main"));
+        config.max_size = 1000;
+        let main = Store::open(&config).unwrap();
+        let missing = dir.path().join("unmounted");
+        config.volume_stores = vec![crate::config::VolumeStore {
+            volume: "/mnt/unmounted/".into(),
+            store: missing.clone(),
+            max_size: None,
+        }];
+        let daemon = Daemon::new(config);
+
+        put_upload_evict_entry(&main, dir.path(), "main_a", 600, false);
+        put_upload_evict_entry(&main, dir.path(), "main_b", 600, false);
+        let report = daemon
+            .run_gc(
+                GcPolicy::Automatic { max_age_hours: 0 },
+                GcDriver::Requested,
+            )
+            .unwrap();
+        assert_eq!(report.total.entries_evicted, 1);
+
+        put_upload_evict_entry(&main, dir.path(), "main_c", 600, false);
+        daemon.maybe_evict_after_upload();
+        assert_eq!(main.physical_size().unwrap(), 600);
+        assert!(!missing.exists(), "GC must not create a shard it skips");
+    }
+
+    /// The post-upload check and wrapper hints size each shard against its
+    /// own budget, and a shard's held bytes and backoff stay in that shard.
+    #[test]
+    fn size_pressure_sweeps_each_shard_with_its_own_budget_and_backoff() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(&dir.path().join("main"));
+        config.max_size = 1_000_000;
+        let main = Store::open(&config).unwrap();
+        put_upload_evict_entry(&main, dir.path(), "main_entry", 1200, false);
+        let (_, over) = add_budgeted_shard(&mut config, dir.path(), "over", 1000);
+        put_upload_evict_entry(&over, dir.path(), "over_a", 600, false);
+        put_upload_evict_entry(&over, dir.path(), "over_b", 600, false);
+        let (held_config, held) = add_budgeted_shard(&mut config, dir.path(), "held", 1000);
+        for i in 0..6 {
+            let key = format!("held_{i}");
+            put_upload_evict_entry(&held, dir.path(), &key, 200, false);
+            hold_in_target_dir(&held, dir.path(), &key);
+        }
+        put_upload_evict_entry(&held, dir.path(), "evictable", 50, false);
+        let daemon = Daemon::new(config.clone());
+
+        daemon.maybe_evict_after_upload();
+        assert_eq!(over.physical_size().unwrap(), 600);
+        assert!(main.contains("main_entry"));
+        assert!(held.contains("evictable") && held.contains("held_0"));
+        assert_eq!(
+            crate::wrapper::auto_gc_backoff_interval_for_test(&held_config.cache_dir),
+            Some(0),
+            "the shard's held bytes are on record in the shard"
+        );
+        assert_eq!(
+            crate::wrapper::auto_gc_backoff_interval_for_test(&config.cache_dir),
+            None
+        );
+        assert!(!crate::wrapper::auto_gc_sweep_due(
+            &held_config,
+            held.physical_size().unwrap()
+        ));
+    }
+
+    #[test]
+    fn size_pressure_leaves_a_shard_whose_gc_lock_is_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(&dir.path().join("main"));
+        let (_, shard) = add_budgeted_shard(&mut config, dir.path(), "shard", 1000);
+        put_upload_evict_entry(&shard, dir.path(), "shard_entry", 1200, false);
+        let held = shard.try_gc_lock().unwrap().expect("gc lock");
+
+        let daemon = Daemon::new(config);
+        daemon.maybe_evict_after_upload();
+        assert!(shard.contains("shard_entry"));
+        drop(held);
+        daemon.maybe_evict_after_upload();
+        assert!(!shard.contains("shard_entry"));
     }
 
     #[test]
@@ -17124,6 +17362,7 @@ mod tests {
         config.volume_stores = vec![crate::config::VolumeStore {
             volume: "/mnt/vol/".into(),
             store: shard.clone(),
+            max_size: None,
         }];
         let key = test_cache_key("shard-download");
         let pack = build_entry_pack(&key, "serde");

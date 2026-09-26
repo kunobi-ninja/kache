@@ -394,12 +394,15 @@ fn parse_predicate(tokens: &[Token], at: &mut usize) -> Option<Cfg> {
             *at += 1;
             let mut list = Vec::new();
             while tokens.get(*at) != Some(&Token::Close) {
+                let start = *at;
                 list.push(parse_predicate(tokens, at)?);
                 match tokens.get(*at)? {
                     Token::Comma => *at += 1,
                     Token::Close => {}
                     _ => return None,
                 }
+                // Each element moves forward, so the list ends.
+                debug_assert!(*at > start, "cfg parser did not advance");
             }
             *at += 1;
             match name.as_str() {

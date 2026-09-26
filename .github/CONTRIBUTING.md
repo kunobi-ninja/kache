@@ -72,18 +72,25 @@ in `.pinact.yaml`; bump its SHA manually when you want a newer release.
 
 ## Writing docs
 
-The docs, README, PR descriptions and release notes share one voice: a maintainer explaining the tool to someone who is about to use it.
+Docs, the README, PR descriptions and release notes should read like a maintainer explaining kache to a colleague who is about to use it.
 
-- Start with what the reader wants to do, then the command or setting that does it. Put rare cases and the reasons behind a design after the normal path.
-- One idea per sentence. Use active voice and concrete verbs. Cut words that don't change the meaning.
-- Every claim about behaviour must match the code on `main`: commands, flags, defaults, paths, limits and platform support. When you change one of those, update the page that describes it in the same PR.
-- Say what doesn't work and on which platform. A known limit stated plainly is more useful than a promise.
-- Avoid the patterns that make text read as generated:
-  - em dashes in prose; use a full stop, a colon or parentheses
-  - filler such as "seamless", "robust", "gracefully", "powerful", "simply", "deliberately", "by design" or "it's worth noting"
-  - "not X, but Y" constructions and lists of three added for rhythm
-  - a bold label in front of every bullet, headings like "Overview" or "Key features", and a closing paragraph that repeats the page
-- Read the change aloud before opening the PR. If it sounds like a sales page or a chat reply, rewrite it.
+- Start with the task, then the command or setting that does it. Edge cases and design reasons come after the normal path.
+- One idea per sentence. Use active voice and the real names of commands, paths and settings.
+- Match the code on `main`: commands, flags, defaults, paths, limits and platform support. A PR that changes one of these updates the page that describes it.
+- State limits plainly: what doesn't work, and on which platform.
+
+Some habits make text vague or padded. Prefer the plain form:
+
+| Instead of | Write |
+| --- | --- |
+| an em dash joining two clauses | a full stop, a colon or parentheses |
+| "seamless", "robust", "powerful", "simply" | what actually happens |
+| "not X, but Y" | Y |
+| a list of three added for rhythm | only the items that matter |
+| a bold label before every bullet | plain bullets, or a table |
+| an "Overview" heading or a closing summary | a heading that names the task, and an end when the content ends |
+
+Read a change aloud before opening the PR. If it sounds like marketing copy or a chat reply, rewrite it.
 
 ## Testing
 

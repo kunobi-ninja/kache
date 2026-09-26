@@ -37,10 +37,16 @@ use crate::daemon::{Daemon, Response, UploadJob};
 use crate::events::{BuildEvent, EventResult};
 use crate::store::{BuildClaim, KeyLock, Store};
 
-/// Jobs waiting for the worker. A build produces at most a few per second and
-/// each takes a few milliseconds, so the queue only fills when the daemon is
-/// starved; the wrapper then publishes itself.
+/// Jobs waiting for the worker. A small object takes a few milliseconds, but
+/// a large C++ unit (Firefox's `Unified_*.cpp`) takes much longer, so a big
+/// build can end with the queue full. When it is full the wrapper publishes
+/// itself; whatever is queued at shutdown is drained (see
+/// [`drain_publications`]).
 pub(crate) const PUBLISH_QUEUE_CAPACITY: usize = 256;
+
+/// How long shutdown waits for the publish worker to finish another job
+/// before it gives up on the rest of the queue.
+pub(crate) const PUBLISH_DRAIN_STALL: Duration = Duration::from_secs(10);
 
 /// How long a wrapper waits for the daemon to accept a hand-off. The daemon's
 /// side of it is a file lock and a channel send; anything slower means the
@@ -105,13 +111,48 @@ pub(crate) struct PublishJob {
 /// worker with its own store connection.
 pub(crate) struct PublishQueue {
     tx: std::sync::Mutex<Option<tokio::sync::mpsc::Sender<PublishJob>>>,
+    progress: Arc<PublishProgress>,
+}
+
+/// Accepted jobs not yet published, and jobs published so far. Shutdown
+/// reads them after the daemon itself is gone, so they live apart from it.
+#[derive(Default)]
+pub(crate) struct PublishProgress {
+    pending: std::sync::atomic::AtomicUsize,
+    done: std::sync::atomic::AtomicU64,
+}
+
+impl PublishProgress {
+    pub(crate) fn pending(&self) -> usize {
+        self.pending.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub(crate) fn done(&self) -> u64 {
+        self.done.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn accepted(&self) {
+        self.pending
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    fn finished(&self) {
+        self.pending
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        self.done.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
 }
 
 impl PublishQueue {
     pub(crate) fn new() -> Self {
         Self {
             tx: std::sync::Mutex::new(None),
+            progress: Arc::new(PublishProgress::default()),
         }
+    }
+
+    pub(crate) fn progress(&self) -> Arc<PublishProgress> {
+        Arc::clone(&self.progress)
     }
 
     pub(crate) fn set_sender(&self, tx: tokio::sync::mpsc::Sender<PublishJob>) {
@@ -225,8 +266,40 @@ impl Daemon {
             Ok(Err(error)) => return refused(&format!("snapshot failed: {error:#}")),
             Err(error) => return refused(&format!("snapshot task failed: {error}")),
         };
+        self.publish_queue().progress.accepted();
         permit.send(job);
         Response::ok()
+    }
+}
+
+/// Wait for the publish worker to drain the queue after [`PublishQueue::close`].
+///
+/// There is no fixed budget: a large build can end with a full queue of big
+/// objects that take minutes to publish, and each job left behind is an
+/// entry the next build compiles again. The wait ends when the worker exits,
+/// or when it has finished nothing for `stall`, which means it is wedged.
+/// Returns how many accepted jobs were left unpublished.
+pub(crate) async fn drain_publications(
+    mut done: tokio::sync::oneshot::Receiver<()>,
+    progress: &PublishProgress,
+    stall: Duration,
+) -> usize {
+    let tick = stall.min(Duration::from_secs(1));
+    let mut last_done = progress.done();
+    let mut last_change = tokio::time::Instant::now();
+    loop {
+        match tokio::time::timeout(tick, &mut done).await {
+            Ok(_) => return progress.pending(),
+            Err(_) => {
+                let now_done = progress.done();
+                if now_done != last_done {
+                    last_done = now_done;
+                    last_change = tokio::time::Instant::now();
+                } else if last_change.elapsed() >= stall {
+                    return progress.pending();
+                }
+            }
+        }
     }
 }
 
@@ -267,6 +340,7 @@ pub(crate) fn run_publish_worker(
             // Drain so accepted jobs release their locks and files.
             while let Some(job) = rx.blocking_recv() {
                 discard_handoff_files(&job.request);
+                daemon.publish_queue().progress.finished();
             }
             return;
         }
@@ -345,6 +419,7 @@ fn publish_one(daemon: &Arc<Daemon>, config: &Config, store: &Store, job: Publis
     discard_handoff_files(&request);
     crate::wrapper::write_event(config, &event);
     drop(_lock);
+    daemon.publish_queue().progress.finished();
 }
 
 fn discard_handoff_files(request: &PublishCcRequest) {
@@ -1132,6 +1207,46 @@ mod tests {
         let _invalid_receipt = HandoffReceipt::new(&invalid).unwrap();
         invalid.cache_key = "nope".to_string();
         assert!(!daemon.handle_publish_cc(invalid).await.ok);
+    }
+
+    /// A queue that takes longer than any fixed budget to drain is still
+    /// drained, as long as the worker keeps finishing jobs.
+    #[tokio::test]
+    async fn shutdown_waits_for_a_slow_but_moving_worker() {
+        let progress = Arc::new(PublishProgress::default());
+        for _ in 0..10 {
+            progress.accepted();
+        }
+        let (done_tx, done) = tokio::sync::oneshot::channel();
+        let worker = Arc::clone(&progress);
+        tokio::spawn(async move {
+            // Ten jobs, each slower than half the stall window: the whole
+            // queue takes several stall windows, but no single gap does.
+            for _ in 0..10 {
+                tokio::time::sleep(Duration::from_millis(60)).await;
+                worker.finished();
+            }
+            let _ = done_tx.send(());
+        });
+        let left = drain_publications(done, &progress, Duration::from_millis(150)).await;
+        assert_eq!(left, 0);
+        assert_eq!(progress.done(), 10);
+    }
+
+    /// A worker that finishes nothing for the stall window is given up on,
+    /// and the jobs it never reached are counted.
+    #[tokio::test]
+    async fn shutdown_gives_up_on_a_wedged_worker_and_counts_what_is_left() {
+        let progress = Arc::new(PublishProgress::default());
+        for _ in 0..3 {
+            progress.accepted();
+        }
+        progress.finished();
+        let (_done_tx, done) = tokio::sync::oneshot::channel::<()>();
+        let started = std::time::Instant::now();
+        let left = drain_publications(done, &progress, Duration::from_millis(100)).await;
+        assert_eq!(left, 2);
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

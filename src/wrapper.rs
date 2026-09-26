@@ -6711,8 +6711,21 @@ fn cc_compile_before_key(
     } = invocation;
     let start = *start;
     tracing::debug!("no read-set memo for {crate_name}; compiling before keying");
+    // The compile runs before its key exists, but it still takes a slot in the
+    // scheduler's pool: that pool is the only limit when a build runs its own
+    // jobs beside Cargo's.
+    let miss_guard = scheduler::begin_keyless_compile(
+        &config.cache_dir,
+        config.scheduler,
+        crate_name,
+        false,
+        config.test_lease.as_deref(),
+    );
     let compile_start = std::time::Instant::now();
-    let (result, inputs) = match compiler.execute_capturing_inputs(parsed, file_hasher) {
+    let compiled = compiler.execute_capturing_inputs(parsed, file_hasher);
+    miss_guard.record_compile_rss(crate_name);
+    drop(miss_guard);
+    let (result, inputs) = match compiled {
         Ok(pair) => pair,
         Err(e) => {
             return cc_passthrough_with_event(

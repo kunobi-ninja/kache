@@ -1219,6 +1219,18 @@ mod tests {
         assert!(!daemon.handle_publish_cc(invalid).await.ok);
     }
 
+    /// The progress a queue hands out is the one its jobs update, so the
+    /// shutdown drain sees them.
+    #[test]
+    fn a_queue_hands_out_the_progress_its_jobs_update() {
+        let queue = PublishQueue::new();
+        let seen = queue.progress();
+        queue.progress.accepted();
+        assert_eq!(seen.pending(), 1);
+        queue.progress.finished();
+        assert_eq!((seen.pending(), seen.done()), (0, 1));
+    }
+
     /// A queue that takes longer than any fixed budget to drain is still
     /// drained, as long as the worker keeps finishing jobs.
     #[tokio::test]

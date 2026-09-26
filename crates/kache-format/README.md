@@ -1,18 +1,24 @@
 # kache-format
 
-Entry metadata and validation shared by Kache's local store and remote readers.
-The crate depends on Serde. It contains no compiler, database, or network code.
+[![crates.io](https://img.shields.io/crates/v/kache-format.svg)](https://crates.io/crates/kache-format)
+[![docs.rs](https://img.shields.io/docsrs/kache-format)](https://docs.rs/kache-format)
 
-`EntryMeta` and `CachedFile` retain the existing `meta.json` representation.
-The compatibility fixtures cover serialized fields and defaults for older
-entries. `CACHE_KEY_VERSION` identifies the key recipe; moving its declaration
-does not change that recipe.
+Cache-entry metadata and validation for [Kache](https://github.com/kunobi-ninja/kache), a compiler cache for Rust, C/C++ and CUDA. The local store and the remote readers share these types, so both read and write the same `meta.json`.
 
-Deserialization decodes metadata. Callers must still validate names and keys,
-check artifact sizes and hashes, and enforce their import policy. Cache keys
-require lowercase hexadecimal; the existing blob-hash validator also accepts
-uppercase hexadecimal. Artifact-name validation follows the host's path rules.
+## What it provides
 
-This package follows Kache's release version. Changes must remain covered by
-workspace tests, changed-line mutation testing, coverage reports, dependency
-audits, and package verification.
+- `EntryMeta` and `CachedFile`: the metadata stored next to each cached artifact. Compatibility fixtures pin the serialized fields and the defaults older entries rely on.
+- `CACHE_KEY_VERSION`: the version of the cache-key recipe written into every entry.
+- Validators for cache keys, crate names, blob hashes and artifact names. Artifact-name checks follow the host's path rules.
+
+The crate depends only on Serde. It has no compiler, database or network code.
+
+Deserializing an entry only decodes it. Callers still validate names and keys, check artifact sizes and hashes, and apply their own import policy.
+
+## Versioning
+
+Released with Kache under the same version number.
+
+## License
+
+Apache-2.0

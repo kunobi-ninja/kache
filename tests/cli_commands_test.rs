@@ -3285,10 +3285,28 @@ fn the_target_info_probe_seeds_a_new_checkout() {
     };
     let seeded = root.path().join("seeded");
     probe(&seeded, "1");
-    assert!(
-        marker(&seeded.join("target")).is_dir(),
-        "the unit was not copied"
-    );
+    if !marker(&seeded.join("target")).is_dir() {
+        // Seeding needs a tracked donor built by the compiler the probe
+        // reports; name both so a failure says which one differed.
+        let recorded = std::fs::read_to_string(donor_target.join(".rustc_info.json"))
+            .unwrap_or_else(|error| format!("unreadable: {error}"));
+        let probed = std::process::Command::new("rustc")
+            .arg("-vV")
+            .current_dir(&seeded)
+            .env("HOME", &e.home)
+            .env("CARGO_HOME", e.home.join(".cargo"))
+            .output()
+            .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
+            .unwrap_or_else(|error| format!("failed: {error}"));
+        let tracked = e.cmd().args(["targets", "--json"]).output().unwrap();
+        panic!(
+            "the unit was not copied\n\
+             donor .rustc_info.json: {recorded}\n\
+             probe rustc -vV: {probed}\n\
+             tracked targets: {}",
+            String::from_utf8_lossy(&tracked.stdout)
+        );
+    }
     let off = root.path().join("off");
     probe(&off, "0");
     assert!(!off.join("target").exists());

@@ -6885,6 +6885,34 @@ mod tests {
         }
     }
 
+    /// `stored_meta` reads back what a put wrote, and nothing for a key that
+    /// was never stored.
+    #[test]
+    fn stored_meta_reads_the_entry_a_put_wrote() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+        let output_file = dir.path().join("out.rlib");
+        fs::write(&output_file, b"rlib bytes").unwrap();
+        store
+            .put(
+                "stored_key",
+                "crate",
+                &["lib".to_string()],
+                &[],
+                "x86_64-unknown-linux-gnu",
+                "dev",
+                &[(output_file, "libout.rlib".to_string())],
+                "",
+                "",
+            )
+            .unwrap();
+        let meta = store.stored_meta("stored_key").unwrap();
+        assert_eq!(meta.files.len(), 1);
+        assert_eq!(meta.files[0].name, "libout.rlib");
+        assert!(store.stored_meta("never_stored").is_none());
+    }
+
     /// A refused zero-byte artifact must clean up its staged snapshot; a
     /// crash-refusal that leaked it would otherwise sit until GC.
     #[test]

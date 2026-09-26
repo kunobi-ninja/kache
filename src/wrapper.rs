@@ -4365,10 +4365,7 @@ fn run_parsed_rustc(
                 tracing::debug!("recording the unit of {crate_name}'s entry failed: {e}");
             }
             // A large executable just stored is the next build's restore.
-            let large = prepared_store.files.iter().any(|(path, _)| {
-                std::fs::metadata(path).is_ok_and(|m| m.len() >= crate::prestage::MIN_BYTES)
-            });
-            if large
+            if stores_prestage_candidate(&prepared_store.files)
                 && let Some(output_dir) = rustc_output_dir(args)
                 && let Some(meta) = store.stored_meta(&cache_key)
             {
@@ -4811,6 +4808,25 @@ fn wants_debug_bundle(args: &RustcArgs) -> bool {
     args.is_user_facing_executable() && rustc_debuginfo_enabled(args)
 }
 
+/// Whether a store's outputs include a file large enough to prestage.
+fn stores_prestage_candidate(files: &[(PathBuf, String)]) -> bool {
+    files.iter().any(|(path, _)| {
+        std::fs::metadata(path).is_ok_and(|m| m.len() >= crate::prestage::MIN_BYTES)
+    })
+}
+
+/// Whether a copy the daemon staged for `cached_file` took its place at
+/// `target_path` ([`crate::prestage`]). Only a large private copy is staged.
+fn take_prestaged(
+    strategy: link::LinkStrategy,
+    cached_file: &crate::store::CachedFile,
+    target_path: &Path,
+) -> bool {
+    strategy == link::LinkStrategy::Copy
+        && cached_file.size >= crate::prestage::MIN_BYTES
+        && crate::prestage::take(target_path, &cached_file.hash)
+}
+
 /// The target directory a compile writes under, for [`crate::prestage`].
 /// [`RustcArgs::target_dir`] answers the profile directory for a build
 /// script compiled into `<profile>/build/<unit>`; this answers its parent.
@@ -5054,9 +5070,7 @@ fn materialize_cached_artifact(
         None => {
             // A large executable may already sit beside its destination,
             // copied by the daemon while the build ran (crate::prestage).
-            let staged = strategy == link::LinkStrategy::Copy
-                && cached_file.size >= crate::prestage::MIN_BYTES
-                && crate::prestage::take(target_path, &cached_file.hash);
+            let staged = take_prestaged(strategy, cached_file, target_path);
             if !staged {
                 link::link_to_target(&store_path, target_path, strategy).with_context(|| {
                     format!(
@@ -9183,6 +9197,117 @@ mod tests {
         ] {
             assert_eq!(rustc_output_in(reason), "", "{reason}");
         }
+    }
+
+    #[test]
+    fn a_prestage_candidate_is_a_stored_file_of_at_least_the_threshold() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = |name: &str, len: u64| {
+            let path = dir.path().join(name);
+            std::fs::File::create(&path).unwrap().set_len(len).unwrap();
+            (path, name.to_string())
+        };
+        let below = file("below", crate::prestage::MIN_BYTES - 1);
+        let at = file("at", crate::prestage::MIN_BYTES);
+        assert!(!stores_prestage_candidate(std::slice::from_ref(&below)));
+        assert!(stores_prestage_candidate(&[below, at]));
+    }
+
+    /// A staged copy is taken only for a large file restored as a private
+    /// copy; a linked restore leaves it alone.
+    #[test]
+    fn only_a_large_private_copy_takes_a_staged_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob = dir.path().join("blob");
+        std::fs::write(&blob, b"an executable").unwrap();
+        let hash = blake3::hash(b"an executable").to_hex().to_string();
+        let dest = dir.path().join("app-0123456789abcdef");
+        crate::prestage::stage_for_test(&dest, &blob, &hash);
+        let staged = crate::prestage::staged_path(&dest, &hash).unwrap();
+        let mut file = cached_file("app-0123456789abcdef", &hash);
+
+        file.size = crate::prestage::MIN_BYTES;
+        assert!(!take_prestaged(link::LinkStrategy::Hardlink, &file, &dest));
+        assert!(staged.exists() && !dest.exists());
+        file.size = crate::prestage::MIN_BYTES - 1;
+        assert!(!take_prestaged(link::LinkStrategy::Copy, &file, &dest));
+        assert!(staged.exists() && !dest.exists());
+        file.size = crate::prestage::MIN_BYTES;
+        assert!(take_prestaged(link::LinkStrategy::Copy, &file, &dest));
+        assert_eq!(std::fs::read(&dest).unwrap(), b"an executable");
+    }
+
+    /// Only large executables restored as private copies are recorded: not
+    /// small ones, and not large outputs that restore as links.
+    #[test]
+    fn only_large_private_copies_are_recorded_for_prestaging() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path().join("cache"));
+        let out_dir = dir.path().join("target/debug/deps");
+        let args = rustc_args(&[
+            "rustc",
+            "main.rs",
+            "--crate-name",
+            "app",
+            "--crate-type",
+            "bin",
+            "--out-dir",
+            out_dir.to_str().unwrap(),
+            "-C",
+            "extra-filename=-0123456789abcdef",
+        ]);
+        let file = |name: &str, size: u64, executable: bool| {
+            let mut file = cached_file(name, &"a".repeat(64));
+            file.size = size;
+            file.executable = executable;
+            file
+        };
+        let meta = entry_meta(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            vec![
+                file("app-0123456789abcdef", crate::prestage::MIN_BYTES, true),
+                file(
+                    "tool-0123456789abcdef",
+                    crate::prestage::MIN_BYTES - 1,
+                    true,
+                ),
+                file(
+                    "libapp-0123456789abcdef.rlib",
+                    crate::prestage::MIN_BYTES,
+                    false,
+                ),
+            ],
+            &["link"],
+        );
+        remember_prestaged_executables(
+            &config,
+            &RustcCompiler::new(),
+            &args,
+            &out_dir,
+            None,
+            &meta,
+        );
+        assert_eq!(
+            crate::prestage::recorded_dests(&config.cache_dir),
+            vec![out_dir.join("app-0123456789abcdef")]
+        );
+    }
+
+    /// In `-o` mode the primary output goes to the exact `-o` path, and
+    /// every other output into the output directory.
+    #[test]
+    fn artifact_target_path_keeps_the_exact_output_path() {
+        let args = rustc_args(&["rustc", "main.rs", "--crate-name", "app", "-o", "out/app"]);
+        let elsewhere = Path::new("/elsewhere");
+        assert_eq!(
+            artifact_target_path(&args, elsewhere, "app"),
+            PathBuf::from("out/app")
+        );
+        assert_eq!(
+            artifact_target_path(&args, elsewhere, "app.d"),
+            elsewhere.join("app.d")
+        );
+        assert_eq!(rustc_output_dir(&args), Some(PathBuf::from("out")));
     }
 
     /// Prestage records and hints go to the target directory itself, also

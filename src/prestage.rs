@@ -161,9 +161,37 @@ fn changed_at(metadata: &std::fs::Metadata) -> Option<SystemTime> {
 }
 
 fn older_than(metadata: &std::fs::Metadata, age: Duration, now: SystemTime) -> bool {
-    changed_at(metadata)
-        .and_then(|at| now.duration_since(at).ok())
-        .is_some_and(|elapsed| elapsed > age)
+    changed_at(metadata).is_some_and(|at| elapsed_beyond(at, age, now))
+}
+
+/// Whether more than `age` passed between `at` and `now`.
+fn elapsed_beyond(at: SystemTime, age: Duration, now: SystemTime) -> bool {
+    now.duration_since(at).is_ok_and(|elapsed| elapsed > age)
+}
+
+/// Stage `blob_path`'s bytes, named `blob`, for `dest`, as the daemon would.
+#[cfg(test)]
+pub(crate) fn stage_for_test(dest: &Path, blob_path: &Path, blob: &str) {
+    let record = Record {
+        dest: dest.to_path_buf(),
+        rel: PathBuf::from(dest.file_name().unwrap()),
+        blob: blob.to_string(),
+        size: MIN_BYTES,
+    };
+    stage_one(&record, blob_path).unwrap();
+}
+
+/// Every destination recorded under `cache_dir`.
+#[cfg(test)]
+pub(crate) fn recorded_dests(cache_dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(prestage_dir(cache_dir)) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .flat_map(|entry| read_records(&entry.path()))
+        .map(|(_, record)| record.dest)
+        .collect()
 }
 
 /// Remember that a build of `target_dir` put `blob` at `dest`. Best-effort:
@@ -609,6 +637,61 @@ mod tests {
     }
 
     #[test]
+    fn durations_are_pinned() {
+        assert_eq!(MIN_BYTES, 16 * 1024 * 1024);
+        assert_eq!(HINT_INTERVAL, Duration::from_secs(30));
+        assert_eq!(STALE_AFTER, Duration::from_secs(3600));
+        assert_eq!(RECORD_TTL, Duration::from_secs(2_592_000));
+    }
+
+    #[test]
+    fn elapsed_beyond_is_strict() {
+        let at = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
+        let age = Duration::from_secs(10);
+        assert!(!elapsed_beyond(at, age, at + age));
+        assert!(elapsed_beyond(at, age, at + age + Duration::from_nanos(1)));
+        assert!(
+            !elapsed_beyond(at, age, at - Duration::from_secs(1)),
+            "future"
+        );
+    }
+
+    /// A missing blob stages nothing and is not an error: GC may have taken
+    /// it since the record was written.
+    #[test]
+    fn a_missing_blob_is_skipped_quietly() {
+        let dir = tempfile::tempdir().unwrap();
+        let deps = target(dir.path(), "a").join("debug/deps");
+        let dest = deps.join("app-0123456789abcdef");
+        let record = Record {
+            dest: dest.clone(),
+            rel: PathBuf::from("debug/deps/app-0123456789abcdef"),
+            blob: "a".repeat(64),
+            size: MIN_BYTES,
+        };
+        assert!(stage_one(&record, &dir.path().join("gone")).is_ok());
+        assert_eq!(std::fs::read_dir(&deps).unwrap().count(), 0);
+    }
+
+    /// The project's `latest` pointer follows the target directory that
+    /// recorded last, so a third checkout borrows from the newest.
+    #[test]
+    fn the_latest_pointer_follows_the_newest_recording() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        let first = target(dir.path(), "a");
+        let second = target(dir.path(), "b");
+        let third = target(dir.path(), "c");
+        let rel = Path::new("debug/deps/app-0123456789abcdef");
+        let hash = "a".repeat(64);
+        remember(&cache, &first, &first.join(rel), &hash, MIN_BYTES);
+        assert_eq!(lender(&cache, &third), Some(first.clone()));
+        remember(&cache, &second, &second.join(rel), &hash, MIN_BYTES);
+        assert_eq!(lender(&cache, &third), Some(second.clone()));
+        assert_eq!(lender(&cache, &second), None, "not its own lender");
+    }
+
+    #[test]
     fn artifact_keys_drop_the_metadata_hash_only() {
         for (rel, key) in [
             ("debug/deps/hk-0123456789abcdef", "debug/deps/hk"),
@@ -617,6 +700,8 @@ mod tests {
             ("debug/deps/my-tool", "debug/deps/my-tool"),
             ("debug/deps/hk-0123", "debug/deps/hk-0123"),
             ("debug/v1.2/hk-0123456789abcdef", "debug/v1.2/hk"),
+            ("debug/deps/.tool-0123456789abcdef", "debug/deps/.tool"),
+            (".tool-0123456789abcdef", ".tool"),
         ] {
             assert_eq!(artifact_key(Path::new(rel)), key, "{rel}");
         }

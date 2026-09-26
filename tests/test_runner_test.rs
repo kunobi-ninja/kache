@@ -43,6 +43,8 @@ case "$PROBE_MODE" in
     exit 3
     ;;
   nested)
+    # Everything below relies on this test's lease; fail at once without it.
+    [ -n "${KACHE_TEST_LEASE-}" ] || exit 13
     : > "$PROBE_DIR/ready"
     i=0
     while [ ! -e "$PROBE_DIR/go" ] && [ "$i" -lt 3000 ]; do sleep 0.02; i=$((i + 1)); done

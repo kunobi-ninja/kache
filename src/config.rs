@@ -428,6 +428,16 @@ pub struct Config {
     /// false` to disable. `kache doctor --repair` does both on demand either
     /// way.
     pub index_auto_compact: bool,
+    /// Let the daemon remove tracked target directories whose workspace has
+    /// been deleted, on a quiet machine at most once an hour. On by default.
+    /// Set via `KACHE_AUTO_CLEAN_ORPHANED_TARGETS=0`/`=false` or `[cache]
+    /// auto_clean_orphaned_targets = false` to disable.
+    pub auto_clean_orphaned_targets: bool,
+    /// Let the daemon also remove tracked target directories no build has
+    /// used for this many days (default `0`, disabled). Set via
+    /// `KACHE_AUTO_CLEAN_IDLE_TARGETS_DAYS` or `[cache]
+    /// auto_clean_idle_targets_days`.
+    pub auto_clean_idle_targets_days: u64,
     /// Storage-layout advisories (kunobi-ninja/kache#551): when on (the
     /// default), a cache hit restored by COPY because the storage *layout*
     /// prevents zero-copy dedup — no copy-on-write on the volume, cache and
@@ -739,6 +749,10 @@ pub(crate) struct CacheFileConfig {
     pub(crate) auto_gc: Option<bool>,
     /// Daemon index compaction toggle. See [`Config::index_auto_compact`].
     pub(crate) index_auto_compact: Option<bool>,
+    /// See [`Config::auto_clean_orphaned_targets`].
+    pub(crate) auto_clean_orphaned_targets: Option<bool>,
+    /// See [`Config::auto_clean_idle_targets_days`].
+    pub(crate) auto_clean_idle_targets_days: Option<u64>,
     /// Namespace-first GC compatibility mode. See [`Config::gc_evict_shared`].
     pub(crate) gc_evict_shared: Option<bool>,
     /// Storage-layout advisory toggle. See [`Config::storage_layout_advice`].
@@ -1159,6 +1173,8 @@ const IGNORE_ENV_GATED_VARS: &[&str] = &[
     "KACHE_DEFERRED_DURABILITY",
     "KACHE_AUTO_GC",
     "KACHE_INDEX_AUTO_COMPACT",
+    "KACHE_AUTO_CLEAN_ORPHANED_TARGETS",
+    "KACHE_AUTO_CLEAN_IDLE_TARGETS_DAYS",
     "KACHE_STORAGE_LAYOUT_ADVICE",
     "KACHE_HEARTBEAT_SECS",
     "KACHE_EXPLAIN_MISS",
@@ -1246,6 +1262,14 @@ const ENV_FILE_KEYS: &[(&str, &str)] = &[
     ("KACHE_DAEMON_PUBLISH", "cache.daemon_publish"),
     ("KACHE_AUTO_GC", "cache.auto_gc"),
     ("KACHE_INDEX_AUTO_COMPACT", "cache.index_auto_compact"),
+    (
+        "KACHE_AUTO_CLEAN_ORPHANED_TARGETS",
+        "cache.auto_clean_orphaned_targets",
+    ),
+    (
+        "KACHE_AUTO_CLEAN_IDLE_TARGETS_DAYS",
+        "cache.auto_clean_idle_targets_days",
+    ),
     ("KACHE_STORAGE_LAYOUT_ADVICE", "cache.storage_layout_advice"),
     ("KACHE_HEARTBEAT_SECS", "cache.heartbeat_secs"),
     ("KACHE_EXPLAIN_MISS", "cache.explain_miss"),
@@ -1785,6 +1809,8 @@ impl Config {
         let project_rules = ProjectRules::from_file_config(&file_config);
         let auto_gc = Self::auto_gc_enabled(&file_config);
         let index_auto_compact = Self::index_auto_compact_enabled(&file_config);
+        let auto_clean_orphaned_targets = Self::auto_clean_orphaned_targets_enabled(&file_config);
+        let auto_clean_idle_targets_days = Self::auto_clean_idle_targets_days(&file_config);
         let gc_evict_shared = Self::gc_evict_shared_enabled(&file_config);
         let storage_layout_advice = Self::storage_layout_advice_enabled(&file_config);
         let volume_stores = Self::load_volume_stores(&file_config, explicit_max_size);
@@ -1846,6 +1872,8 @@ impl Config {
             project_rules,
             auto_gc,
             index_auto_compact,
+            auto_clean_orphaned_targets,
+            auto_clean_idle_targets_days,
             gc_evict_shared,
             storage_layout_advice,
             volume_stores,
@@ -2372,6 +2400,40 @@ impl Config {
             .and_then(|c| c.cache.as_ref())
             .and_then(|c| c.index_auto_compact)
             .unwrap_or(true)
+    }
+
+    /// Orphaned-target cleanup, on by default.
+    /// `KACHE_AUTO_CLEAN_ORPHANED_TARGETS=0`/`=false` (env wins), else
+    /// `[cache] auto_clean_orphaned_targets`, else on.
+    fn auto_clean_orphaned_targets_enabled(file_config: &Result<FileConfig>) -> bool {
+        let ignore_env = Self::ignore_env_enabled(file_config);
+        if let Ok(v) = env_or_ignored("KACHE_AUTO_CLEAN_ORPHANED_TARGETS", ignore_env) {
+            return v != "0" && !v.eq_ignore_ascii_case("false");
+        }
+        file_config
+            .as_ref()
+            .ok()
+            .and_then(|c| c.cache.as_ref())
+            .and_then(|c| c.auto_clean_orphaned_targets)
+            .unwrap_or(true)
+    }
+
+    /// Idle-target cleanup age in days, `0` (off) by default.
+    /// `KACHE_AUTO_CLEAN_IDLE_TARGETS_DAYS` (env wins), else `[cache]
+    /// auto_clean_idle_targets_days`.
+    fn auto_clean_idle_targets_days(file_config: &Result<FileConfig>) -> u64 {
+        let ignore_env = Self::ignore_env_enabled(file_config);
+        env_or_ignored("KACHE_AUTO_CLEAN_IDLE_TARGETS_DAYS", ignore_env)
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .or_else(|| {
+                file_config
+                    .as_ref()
+                    .ok()
+                    .and_then(|c| c.cache.as_ref())
+                    .and_then(|c| c.auto_clean_idle_targets_days)
+            })
+            .unwrap_or(0)
     }
 
     /// Preserve externally retained entries by default. The opt-in restores
@@ -4129,6 +4191,63 @@ pub(crate) mod tests {
         .unwrap();
         let _ignored = NamedEnvGuard::set("KACHE_INDEX_AUTO_COMPACT", "0");
         assert!(Config::load().unwrap().index_auto_compact);
+    }
+
+    #[test]
+    fn target_cleanup_defaults_and_env_precedence() {
+        let _lock = config_path_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let _config = set_kache_config_for_test(&config_path);
+        let _orphans = NamedEnvGuard::remove("KACHE_AUTO_CLEAN_ORPHANED_TARGETS");
+        let _idle = NamedEnvGuard::remove("KACHE_AUTO_CLEAN_IDLE_TARGETS_DAYS");
+
+        let config = Config::load().unwrap();
+        assert!(config.auto_clean_orphaned_targets);
+        assert_eq!(config.auto_clean_idle_targets_days, 0);
+
+        std::fs::write(
+            &config_path,
+            "[cache]\nauto_clean_orphaned_targets = false\nauto_clean_idle_targets_days = 30\n",
+        )
+        .unwrap();
+        let config = Config::load().unwrap();
+        assert!(!config.auto_clean_orphaned_targets);
+        assert_eq!(config.auto_clean_idle_targets_days, 30);
+
+        let _on = NamedEnvGuard::set("KACHE_AUTO_CLEAN_ORPHANED_TARGETS", "1");
+        let _days = NamedEnvGuard::set("KACHE_AUTO_CLEAN_IDLE_TARGETS_DAYS", "7");
+        let config = Config::load().unwrap();
+        assert!(config.auto_clean_orphaned_targets);
+        assert_eq!(config.auto_clean_idle_targets_days, 7);
+        drop((_on, _days));
+
+        std::fs::write(
+            &config_path,
+            "[cache]\nauto_clean_orphaned_targets = true\n",
+        )
+        .unwrap();
+        for off in ["0", "false", "FALSE"] {
+            let _override = NamedEnvGuard::set("KACHE_AUTO_CLEAN_ORPHANED_TARGETS", off);
+            assert!(
+                !Config::load().unwrap().auto_clean_orphaned_targets,
+                "{off}"
+            );
+        }
+        let _garbage = NamedEnvGuard::set("KACHE_AUTO_CLEAN_IDLE_TARGETS_DAYS", "soon");
+        assert_eq!(Config::load().unwrap().auto_clean_idle_targets_days, 0);
+        drop(_garbage);
+
+        std::fs::write(
+            &config_path,
+            "[cache]\nignore_env = true\nauto_clean_idle_targets_days = 3\n",
+        )
+        .unwrap();
+        let _ignored = NamedEnvGuard::set("KACHE_AUTO_CLEAN_ORPHANED_TARGETS", "0");
+        let _ignored_days = NamedEnvGuard::set("KACHE_AUTO_CLEAN_IDLE_TARGETS_DAYS", "9");
+        let config = Config::load().unwrap();
+        assert!(config.auto_clean_orphaned_targets);
+        assert_eq!(config.auto_clean_idle_targets_days, 3);
     }
 
     #[test]
@@ -5917,6 +6036,8 @@ remote_key_cache_refresh_secs = 900
                 daemon_publish: None,
                 auto_gc: None,
                 index_auto_compact: None,
+                auto_clean_orphaned_targets: None,
+                auto_clean_idle_targets_days: None,
                 gc_evict_shared: None,
                 storage_layout_advice: None,
                 heartbeat_secs: None,
@@ -6449,6 +6570,8 @@ remote_key_cache_refresh_secs = 900
             project_rules: ProjectRules::default(),
             auto_gc: true,
             index_auto_compact: true,
+            auto_clean_orphaned_targets: true,
+            auto_clean_idle_targets_days: 0,
             gc_evict_shared: false,
             storage_layout_advice: true,
             heartbeat_secs: 30,
@@ -6516,6 +6639,8 @@ remote_key_cache_refresh_secs = 900
             project_rules: ProjectRules::default(),
             auto_gc: true,
             index_auto_compact: true,
+            auto_clean_orphaned_targets: true,
+            auto_clean_idle_targets_days: 0,
             gc_evict_shared: false,
             storage_layout_advice: true,
             heartbeat_secs: 30,
@@ -6579,6 +6704,8 @@ remote_key_cache_refresh_secs = 900
             project_rules: ProjectRules::default(),
             auto_gc: true,
             index_auto_compact: true,
+            auto_clean_orphaned_targets: true,
+            auto_clean_idle_targets_days: 0,
             gc_evict_shared: false,
             storage_layout_advice: true,
             heartbeat_secs: 30,
@@ -6661,6 +6788,8 @@ remote_key_cache_refresh_secs = 900
             project_rules: ProjectRules::default(),
             auto_gc: true,
             index_auto_compact: true,
+            auto_clean_orphaned_targets: true,
+            auto_clean_idle_targets_days: 0,
             gc_evict_shared: false,
             storage_layout_advice: true,
             heartbeat_secs: 30,
@@ -7327,6 +7456,8 @@ exclude = ["src/generated/**", "vendor/problem/**"]
                 daemon_publish: None,
                 auto_gc: None,
                 index_auto_compact: None,
+                auto_clean_orphaned_targets: None,
+                auto_clean_idle_targets_days: None,
                 gc_evict_shared: None,
                 storage_layout_advice: None,
                 heartbeat_secs: None,

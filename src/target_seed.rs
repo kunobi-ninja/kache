@@ -630,6 +630,22 @@ source = "git+https://example.com/gitdep#abc"
     }
 
     #[test]
+    fn a_per_unit_donor_gives_only_hash_named_units_with_a_fingerprint() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join(PROFILE);
+        let build = profile.join("build").join("dep");
+        write(&build.join(HASH).join("fingerprint/lib"), "fp");
+        write(&build.join(OTHER).join("out/lib.rlib"), "no fingerprint");
+        write(&build.join("not-a-hash/fingerprint/lib"), "fp");
+        let packages: BTreeSet<String> = ["dep".to_string()].into();
+        let found: Vec<(String, String)> = units(&profile, Layout::PerUnit, &packages)
+            .into_iter()
+            .map(|unit| (unit.package, unit.hash))
+            .collect();
+        assert_eq!(found, [("dep".to_string(), HASH.to_string())]);
+    }
+
+    #[test]
     fn recognizes_cargos_target_info_probe() {
         let rustc = "rustc - --crate-name ___ --print=file-names --crate-type bin";
         assert!(is_target_info_probe(&args(rustc)));
@@ -640,6 +656,7 @@ source = "git+https://example.com/gitdep#abc"
             "rustc -vV",
             "rustc - --crate-name app --print=file-names",
             "rustc - --crate-name ___ --print=cfg",
+            "rustc - --crate-name ___ --print cfg",
             "rustc - --crate-name ___",
             "rustc --print=file-names ___",
             "rustc - --print file-names --crate-name",
@@ -1002,7 +1019,15 @@ source = "git+https://example.com/gitdep#abc"
         let first = try_lock(&path).unwrap();
         assert!(try_lock(&path).is_none());
         drop(first);
-        assert!(try_lock(&path).is_some());
+        // A process another test forks in this instant shares the lock until
+        // it execs, so the release can take a moment to show.
+        let retaken = (0..200).any(|_| {
+            try_lock(&path).is_some() || {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                false
+            }
+        });
+        assert!(retaken, "the lock was not released");
         assert!(try_lock(&dir.path().join("missing/.cargo-lock")).is_none());
     }
 

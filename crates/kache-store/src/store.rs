@@ -2252,6 +2252,14 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             .unwrap_or(false)
     }
 
+    /// An entry's `meta.json` as written, with none of [`Store::get`]'s work:
+    /// no blob verification, hit accounting or eviction. For a caller that
+    /// just stored the entry and wants its file list.
+    pub fn stored_meta(&self, cache_key: &str) -> Option<EntryMeta> {
+        let content = fs::read(self.entry_dir(cache_key).join("meta.json")).ok()?;
+        serde_json::from_slice(&content).ok()
+    }
+
     /// Load metadata for a cached entry and record a hit.
     pub fn get(&self, cache_key: &str) -> Result<Option<EntryMeta>> {
         if !self.contains(cache_key) {

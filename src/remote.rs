@@ -150,9 +150,10 @@ const MANIFEST_MERGE_WINDOW_SECS: i64 = 60 * 60;
 const MANIFEST_PUBLISH_ATTEMPTS: usize = 5;
 
 /// Pause after a lost race before reading again: `attempt` × 50 ms plus up to
-/// 50 ms of `jitter`, so publishers that collided do not collide again.
+/// 50 ms of `jitter`, so publishers that collided do not collide again. Never
+/// more than 300 ms, whatever the inputs.
 fn conflict_backoff(attempt: usize, jitter: u64) -> std::time::Duration {
-    std::time::Duration::from_millis(attempt as u64 * 50 + jitter % 50)
+    std::time::Duration::from_millis((attempt as u64 * 50 + jitter % 50).min(300))
 }
 
 /// Most entries a merged manifest holds. The publishing build's own entries
@@ -671,6 +672,8 @@ mod tests {
         assert_eq!(conflict_backoff(1, 0), Duration::from_millis(50));
         assert_eq!(conflict_backoff(2, 49), Duration::from_millis(149));
         assert_eq!(conflict_backoff(1, 50), Duration::from_millis(50));
+        assert_eq!(conflict_backoff(4, 49), Duration::from_millis(249));
+        assert_eq!(conflict_backoff(9, 0), Duration::from_millis(300));
     }
 
     #[test]

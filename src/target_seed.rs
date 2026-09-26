@@ -481,10 +481,18 @@ fn file_name(path: &Path) -> String {
         .unwrap_or_default()
 }
 
+/// Whether this rustc invocation should ask for a seed: seeding is on and
+/// it is Cargo's target-info probe, which runs before any unit compiles.
+fn asks_for_seed(enabled: bool, args: &[String]) -> bool {
+    enabled && is_target_info_probe(args)
+}
+
 /// The wrapper's side: when `args` is the probe for a target directory Cargo
 /// has not built, ask the daemon to seed it and wait for the answer.
+///
+/// See [`asks_for_seed`] for which invocations qualify.
 pub(crate) fn before_probe(config: &crate::config::Config, args: &[String]) {
-    if !config.seed_new_targets || !is_target_info_probe(args) {
+    if !asks_for_seed(config.seed_new_targets, args) {
         return;
     }
     let Ok(cwd) = std::env::current_dir() else {
@@ -611,6 +619,14 @@ source = "git+https://example.com/gitdep#abc"
 
     fn later() -> Instant {
         Instant::now() + Duration::from_secs(60)
+    }
+
+    #[test]
+    fn only_the_target_info_probe_asks_for_a_seed_and_only_when_enabled() {
+        let probe = args("rustc - --crate-name ___ --print=file-names --crate-type bin");
+        assert!(asks_for_seed(true, &probe));
+        assert!(!asks_for_seed(false, &probe));
+        assert!(!asks_for_seed(true, &args("rustc -vV")));
     }
 
     #[test]
@@ -794,6 +810,17 @@ source = "git+https://example.com/gitdep#abc"
         );
         assert_eq!(
             seed(&new, "  ", std::slice::from_ref(&wrong_rustc), later()),
+            Seeded::default()
+        );
+        // A blank version is not a compiler, even where a donor recorded one.
+        let blank = donor(dir.path(), "blank", Layout::Shared);
+        let info = serde_json::json!({"outputs": {"1": {"stdout": "  "}}});
+        write(
+            &blank.target_dir.join(".rustc_info.json"),
+            &info.to_string(),
+        );
+        assert_eq!(
+            seed(&new, "  ", std::slice::from_ref(&blank), later()),
             Seeded::default()
         );
         // A build holds the donor's lock: the next donor gives the units.

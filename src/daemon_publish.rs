@@ -300,6 +300,9 @@ pub(crate) async fn drain_publications(
             Err(_) => {
                 let now_done = progress.done();
                 if now_done != last_done {
+                    // The count only grows; a change that is not growth
+                    // would keep the stall clock from ever running out.
+                    debug_assert!(now_done > last_done, "publish progress went backwards");
                     last_done = now_done;
                     last_change = tokio::time::Instant::now();
                 } else if last_change.elapsed() >= stall {

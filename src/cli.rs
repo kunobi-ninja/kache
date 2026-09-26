@@ -3310,6 +3310,7 @@ pub fn run_gc_local(config: &Config, mode: GcMode) -> Result<crate::store::GcSta
         crate::wrapper::SESSION_MARKER_RETENTION,
         std::time::SystemTime::now(),
     );
+    crate::build_script::sweep_hermetic_out_dirs_for_gc(&config.cache_dir);
     let backfilled = store.backfill_content_hashes().unwrap_or(0);
     if verbose {
         if backfilled > 0 {
@@ -3807,6 +3808,16 @@ pub fn purge(config: &Config, crate_filter: Option<&str>) -> Result<()> {
     } else {
         store.clear()?;
         println!("Cleared entire local store.");
+        // Runs a target directory still links to stay: removing them would
+        // break its next build.
+        let sweep = crate::build_script::sweep_hermetic_out_dirs(
+            &config.cache_dir,
+            std::time::Duration::ZERO,
+        )?;
+        println!(
+            "Removed {} build-script runs; kept {} that target directories link to.",
+            sweep.removed, sweep.kept
+        );
     }
 
     Ok(())
@@ -8014,6 +8025,43 @@ mod tests {
         run_gc_local(&config, GcMode::Cli).unwrap();
         let stats = crate::report::read_gc_stats(&config.cache_dir).unwrap();
         assert_eq!(stats.source, "manual");
+    }
+
+    /// A sandbox a crashed hermetic attempt left is gone after any GC run.
+    #[test]
+    fn local_gc_sweeps_hermetic_build_script_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = save_manifest_config(dir.path().to_path_buf(), None);
+        let leftover = config.cache_dir.join("out-dirs/v2").join("ab".repeat(16));
+        std::fs::create_dir_all(leftover.join("debug/build/z-1/out")).unwrap();
+        run_gc_local(&config, GcMode::Background).unwrap();
+        assert!(!leftover.exists());
+    }
+
+    /// `kache purge` removes every shared build-script run but the ones a
+    /// target directory still links to.
+    #[cfg(unix)]
+    #[test]
+    fn purge_keeps_only_linked_build_script_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = save_manifest_config(dir.path().join("cache"), None);
+        let v2 = config.cache_dir.join("out-dirs/v2");
+        let run = |key: &str| {
+            let root = v2.join(key.repeat(16));
+            std::fs::create_dir_all(root.join("out")).unwrap();
+            std::fs::write(root.join(".kache-sealed"), b"{}").unwrap();
+            root
+        };
+        let (linked, unlinked) = (run("ab"), run("cd"));
+        let link = dir.path().join("target-out");
+        std::os::unix::fs::symlink(linked.join("out"), &link).unwrap();
+        let mut line = link.as_os_str().as_encoded_bytes().to_vec();
+        line.push(b'\n');
+        std::fs::write(linked.with_extension("refs"), line).unwrap();
+
+        purge(&config, None).unwrap();
+        assert!(linked.exists(), "a target directory links to it");
+        assert!(!unlinked.exists());
     }
 
     /// Every driver records through record_gc_run; the local one shows the

@@ -1449,6 +1449,29 @@ fn collect_out_dir(out_dir: &Path) -> Result<OutDirContents> {
     })
 }
 
+/// How long a hermetic run no target directory links to stays for the next
+/// worktree that needs it.
+pub(crate) const HERMETIC_UNLINKED_RETENTION: std::time::Duration =
+    std::time::Duration::from_secs(604_800);
+
+/// Remove hermetic runs no target directory links to that have gone
+/// unlinked for `keep_unlinked`. See [`hermetic::sweep`].
+pub(crate) fn sweep_hermetic_out_dirs(
+    cache_dir: &Path,
+    keep_unlinked: std::time::Duration,
+) -> Result<hermetic::Sweep> {
+    hermetic::sweep(cache_dir, std::time::SystemTime::now(), keep_unlinked)
+}
+
+/// [`sweep_hermetic_out_dirs`] with the standing retention, for the GC
+/// drivers. A failed sweep leaves the runs in place for the next one.
+pub(crate) fn sweep_hermetic_out_dirs_for_gc(cache_dir: &Path) {
+    match sweep_hermetic_out_dirs(cache_dir, HERMETIC_UNLINKED_RETENTION) {
+        Ok(sweep) => tracing::debug!("build-script run sweep: {sweep:?}"),
+        Err(error) => tracing::warn!("build-script run sweep failed: {error:#}"),
+    }
+}
+
 /// Whether `path` lies in a sealed hermetic build-script `OUT_DIR`.
 pub(crate) fn in_sealed_out_dir(path: &Path) -> bool {
     hermetic::in_sealed_out_dir(path)

@@ -6652,6 +6652,7 @@ impl Daemon {
                 } else {
                     0
                 };
+                crate::build_script::sweep_hermetic_out_dirs_for_gc(&self.config.cache_dir);
 
                 // Reclaim orphaned blob files (crash mid-put, or a meta-less
                 // remove_entry that couldn't decrement refcounts). The grace
@@ -11795,6 +11796,27 @@ mod tests {
                 .expect("GC must finish while the daemon store is in use")
                 .is_ok()
         );
+    }
+
+    /// The daemon's GC sweeps shared build-script runs too: a sandbox a
+    /// crashed hermetic attempt left is gone after a run.
+    #[test]
+    fn daemon_gc_sweeps_hermetic_build_script_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = Daemon::new(test_config(dir.path()));
+        let leftover = daemon
+            .config
+            .cache_dir
+            .join("out-dirs/v2")
+            .join("ab".repeat(16));
+        std::fs::create_dir_all(leftover.join("out")).unwrap();
+        daemon
+            .run_gc(
+                GcPolicy::Automatic { max_age_hours: 0 },
+                GcDriver::Requested,
+            )
+            .unwrap();
+        assert!(!leftover.exists());
     }
 
     /// The daemon's sweep is what flushes entries a miss stored without an

@@ -83,11 +83,17 @@ Registry and Git dependencies live under the Cargo home, so their keys match
 across worktrees. A workspace member's manifest directory is part of its key,
 so it shares only between target directories of the same checkout.
 
-Shared directories are not collected yet, and they are read-only: make them
-writable (`chmod -R u+w`) before deleting the cache directory by hand. Target
-directories keep their links, so run `cargo clean` in them afterwards, and
-also before building without kache: Cargo considers the linked runs fresh
-and would run a script directly against a read-only `OUT_DIR`.
+Every link is recorded beside the shared directory. GC (`kache gc` and the
+daemon's sweeps) keeps a directory while any recorded `OUT_DIR` still links to
+it, and removes it once none has for seven days. `kache purge` removes every
+directory no target directory links to. A directory a build is using is left
+for the next sweep.
+
+Shared directories are read-only: make them writable (`chmod -R u+w`) before
+deleting the cache directory by hand. Target directories keep their links, so
+run `cargo clean` in them afterwards, and also before building without kache:
+Cargo considers the linked runs fresh and would run a script directly against a
+read-only `OUT_DIR`.
 
 A run that cannot be kept is remembered per key, so its script runs once, as
 usual, on later builds instead of twice.

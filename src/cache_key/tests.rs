@@ -12804,3 +12804,12 @@ fn linker_identity_is_the_first_version_line_of_the_configured_linker() {
     assert_eq!(identity.as_deref(), Some("my-ld 9.9"));
     assert_eq!(missing, None, "a linker that cannot run has no identity");
 }
+
+#[test]
+fn a_key_that_read_an_undeclared_variable_is_refused() {
+    let env = crate::key_env::KeyEnv::from_parts([("RUSTFLAGS", "-a")], None);
+    assert_eq!(complete_key(&env, "k".into()).unwrap(), "k");
+    let _ = env.var_os("PATH");
+    let err = complete_key(&env, "k".into()).unwrap_err();
+    assert!(err.to_string().contains("KEY_ENV_VARS"), "{err}");
+}

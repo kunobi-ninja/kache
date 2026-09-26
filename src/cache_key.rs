@@ -3056,6 +3056,17 @@ pub fn compute_cache_key(
     let _ = LAST_KEY_FIELDS.try_with(|stash| *stash.borrow_mut() = Some(fields));
     let key = hash.to_hex().to_string();
     tracing::trace!("[key:{}] final={}", crate_name, &key[..16]);
+    complete_key(env, key)
+}
+
+/// `key`, unless key computation read a variable its snapshot does not hold.
+/// That input would have folded as unset whatever its value, so two builds
+/// that differ in it could share the key; the invocation runs uncached.
+fn complete_key(env: &KeyEnv, key: String) -> Result<String> {
+    anyhow::ensure!(
+        !env.read_undeclared(),
+        "key computation read an environment variable missing from KEY_ENV_VARS"
+    );
     Ok(key)
 }
 

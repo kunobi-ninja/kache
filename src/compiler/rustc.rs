@@ -98,8 +98,10 @@ impl RustcCompiler {
         name == "rustc" || name.starts_with("rustc") || name == "clippy-driver"
     }
 
-    /// [`Compiler::cache_key`] for an invocation whose environment and
-    /// working directory are `env` rather than this process's.
+    /// [`Compiler::cache_key`] with the environment and working directory in
+    /// `env`. Configured `key_env_vars`, input predictions and the path
+    /// normalizer still read this process, so `env` must describe this process
+    /// until they move into the snapshot too.
     pub(crate) fn cache_key_in(
         &self,
         parsed: &RustcArgs,

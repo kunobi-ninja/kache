@@ -1,9 +1,14 @@
 //! The environment variables and working directory a rustc cache key reads.
 //!
 //! [`crate::cache_key::compute_cache_key`] reads them from a [`KeyEnv`], never
-//! from the process. The wrapper captures one per invocation; a caller that
-//! computes keys for another process builds one from that process's parts.
+//! from the process. The wrapper captures one per invocation.
+//!
+//! This is not yet enough to compute a key for another process. Configured
+//! `key_env_vars`, input predictions and the path normalizer still read the
+//! environment and working directory of the process that computes the key, so
+//! a daemon keying another process's invocation would fold its own values.
 
+use std::cell::Cell;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
@@ -37,6 +42,8 @@ pub(crate) struct KeyEnv {
     vars: Vec<(&'static str, OsString)>,
     cargo_cfgs: Vec<(OsString, OsString)>,
     cwd: Option<PathBuf>,
+    /// Set when a read named a variable missing from [`KEY_ENV_VARS`].
+    undeclared_read: Cell<bool>,
 }
 
 impl KeyEnv {
@@ -71,15 +78,24 @@ impl KeyEnv {
     }
 
     /// The value of `name`, which must be listed in [`KEY_ENV_VARS`].
+    ///
+    /// A name missing from the list reads as unset and marks the snapshot, and
+    /// [`crate::cache_key::compute_cache_key`] then refuses to return a key:
+    /// an input the snapshot never captured must not drop out of the key.
     pub(crate) fn var_os(&self, name: &str) -> Option<OsString> {
-        debug_assert!(
-            KEY_ENV_VARS.contains(&name),
-            "{name} is read by key computation but missing from KEY_ENV_VARS"
-        );
+        if !KEY_ENV_VARS.contains(&name) {
+            self.undeclared_read.set(true);
+            return None;
+        }
         self.vars
             .iter()
             .find(|(declared, _)| *declared == name)
             .map(|(_, value)| value.clone())
+    }
+
+    /// Whether any read named a variable missing from [`KEY_ENV_VARS`].
+    pub(crate) fn read_undeclared(&self) -> bool {
+        self.undeclared_read.get()
     }
 
     /// [`Self::var_os`] as UTF-8, `None` when unset or not Unicode, like
@@ -193,10 +209,12 @@ mod tests {
         assert_eq!(env.cwd(), std::env::current_dir().ok().as_deref());
     }
 
-    #[cfg(debug_assertions)]
     #[test]
-    #[should_panic(expected = "missing from KEY_ENV_VARS")]
-    fn an_undeclared_read_fails_in_debug_builds() {
-        KeyEnv::default().var_os("PATH");
+    fn an_undeclared_read_is_unset_and_marks_the_snapshot() {
+        let env = KeyEnv::from_parts([("PATH", "/usr/bin"), ("RUSTFLAGS", "-a")], None);
+        assert_eq!(env.var("RUSTFLAGS").as_deref(), Some("-a"));
+        assert!(!env.read_undeclared(), "a declared read leaves it clear");
+        assert_eq!(env.var_os("PATH"), None);
+        assert!(env.read_undeclared());
     }
 }

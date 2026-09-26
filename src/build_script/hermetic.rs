@@ -26,8 +26,11 @@
 //! Registry and Git packages sit under the Cargo home, so their keys agree in
 //! every checkout on the machine. A workspace package's manifest directory
 //! is in the key, so it shares only between target directories of one
-//! checkout. Sealed directories are not collected yet, so this is off unless
-//! `KACHE_BUILD_SCRIPT_HERMETIC=1`.
+//! checkout.
+//!
+//! Every link is recorded beside the sandbox, and [`sweep`] removes a run
+//! once no recorded `OUT_DIR` links to it and none has for a while. Off
+//! unless `KACHE_BUILD_SCRIPT_HERMETIC=1`.
 
 use super::{
     MAX_INPUT_FILES, Prediction, Run, ZERO_AR_DATE_ENV, fold, input_state, input_state_as,
@@ -87,6 +90,125 @@ impl Sandbox {
     }
 }
 
+/// Beside a sandbox: every `OUT_DIR` ever linked to it, one per line. Its
+/// modification time is when the run was last linked.
+fn referrers_path(sandbox_root: &Path) -> PathBuf {
+    sandbox_root.with_extension("refs")
+}
+
+fn open_lock(path: &Path) -> Result<std::fs::File> {
+    Ok(std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path)?)
+}
+
+/// Note that `cargo_out_dir` links to `sandbox`, so a sweep keeps it.
+fn record_referrer(sandbox: &Sandbox, cargo_out_dir: &Path) -> Result<()> {
+    use std::io::Write as _;
+    let mut line = cargo_out_dir.as_os_str().as_encoded_bytes().to_vec();
+    line.push(b'\n');
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(referrers_path(&sandbox.root))?
+        .write_all(&line)?;
+    Ok(())
+}
+
+/// The recorded `OUT_DIR`s that still link into `sandbox_root`, once each.
+fn live_referrers(sandbox_root: &Path) -> Result<Vec<PathBuf>> {
+    let recorded = match std::fs::read(referrers_path(sandbox_root)) {
+        Ok(recorded) => recorded,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut live: Vec<PathBuf> = Vec::new();
+    for line in recorded
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+    {
+        // SAFETY: written by `record_referrer` from `as_encoded_bytes`.
+        let path = PathBuf::from(unsafe { std::ffi::OsStr::from_encoded_bytes_unchecked(line) });
+        if std::fs::read_link(&path).is_ok_and(|target| target.starts_with(sandbox_root))
+            && !live.contains(&path)
+        {
+            live.push(path);
+        }
+    }
+    Ok(live)
+}
+
+/// What [`sweep`] did.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Sweep {
+    pub removed: usize,
+    pub kept: usize,
+}
+
+/// Remove the shared runs no target directory links to any more and none has
+/// linked for `keep_unlinked`, unfinished sandboxes a crashed attempt left,
+/// and refusals older than `keep_unlinked`. A run a build holds is skipped.
+pub(crate) fn sweep(
+    cache_dir: &Path,
+    now: std::time::SystemTime,
+    keep_unlinked: std::time::Duration,
+) -> Result<Sweep> {
+    let root = cache_dir.join(ROOT);
+    let entries = match std::fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Sweep::default()),
+        Err(error) => return Err(error.into()),
+    };
+    let aged = |path: &Path| {
+        std::fs::metadata(path)
+            .and_then(|meta| meta.modified())
+            .is_ok_and(|modified| now.duration_since(modified).unwrap_or_default() >= keep_unlinked)
+    };
+    let mut sweep = Sweep::default();
+    for entry in entries {
+        let path = entry?.path();
+        let name = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        if name.ends_with(".refused") {
+            if aged(&path) {
+                std::fs::remove_file(&path)?;
+            }
+            continue;
+        }
+        if name.len() != 32 || !path.is_dir() {
+            continue;
+        }
+        let lock = open_lock(&path.with_extension("lock"))?;
+        if lock.try_lock().is_err() {
+            sweep.kept += 1;
+            continue;
+        }
+        let sealed = path.join(SEALED).is_file();
+        if sealed && !live_referrers(&path)?.is_empty() {
+            sweep.kept += 1;
+            continue;
+        }
+        let last_linked = if referrers_path(&path).exists() {
+            referrers_path(&path)
+        } else {
+            path.join(SEALED)
+        };
+        if sealed && !aged(&last_linked) {
+            sweep.kept += 1;
+            continue;
+        }
+        remove_sandbox(&path)?;
+        let _ = std::fs::remove_file(referrers_path(&path));
+        sweep.removed += 1;
+    }
+    Ok(sweep)
+}
+
 /// Whether this key is not to be run hermetically: it was refused before,
 /// or a kache that writes another record sealed it and whoever links it
 /// still needs it.
@@ -116,6 +238,13 @@ pub(super) fn run(
     let key_ms = key_start.elapsed().as_millis() as u64;
     let sandbox = Sandbox::new(&run.config.cache_dir, &key, &below_target);
 
+    // `out-dirs` also holds the shared empty `OUT_DIR`s, which need it private.
+    let shared_roots = run.config.cache_dir.join(ROOT);
+    crate::out_dir_alias::create_private_dir_all(shared_roots.parent().context("no out-dirs")?)?;
+    std::fs::create_dir_all(&shared_roots)?;
+    let lock = open_lock(&sandbox.lock_path())?;
+    // Shared, so a sweep cannot remove the run between finding and linking it.
+    lock.lock_shared()?;
     if let Some(record) = sealed(&sandbox)? {
         restore(run, &sandbox, &record, &key, key_ms)?;
         return Ok(Some(0));
@@ -123,20 +252,15 @@ pub(super) fn run(
     if not_to_attempt(&sandbox) {
         return Ok(None);
     }
-    // `out-dirs` also holds the shared empty `OUT_DIR`s, which need it private.
-    let shared_roots = run.config.cache_dir.join(ROOT);
-    crate::out_dir_alias::create_private_dir_all(shared_roots.parent().context("no out-dirs")?)?;
-    std::fs::create_dir_all(sandbox.root.parent().context("sandbox has no parent")?)?;
-    let lock = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(sandbox.lock_path())?;
+    lock.unlock()?;
     lock.lock()?;
-    // Another build may have sealed it while this one waited.
+    // Another build may have sealed or refused it while this one waited.
     if let Some(record) = sealed(&sandbox)? {
         restore(run, &sandbox, &record, &key, key_ms)?;
         return Ok(Some(0));
+    }
+    if not_to_attempt(&sandbox) {
+        return Ok(None);
     }
     let record = match attempt(run, real, argv, prediction, &sandbox, &key, &below_target) {
         Ok(Some(record)) => record,
@@ -151,8 +275,9 @@ pub(super) fn run(
         }
     };
     seal(&sandbox, &record)?;
-    drop(lock);
     link_out_dir(cargo_out_dir, &sandbox.out_dir)?;
+    record_referrer(&sandbox, cargo_out_dir)?;
+    drop(lock);
     replay(
         link_search_in(&record.stdout, &sandbox.out_dir, cargo_out_dir).as_bytes(),
         record.stderr.as_bytes(),
@@ -173,6 +298,7 @@ pub(super) fn run(
 fn restore(run: &Run, sandbox: &Sandbox, record: &Record, key: &str, key_ms: u64) -> Result<()> {
     let restore_start = std::time::Instant::now();
     link_out_dir(&run.environment.out_dir, &sandbox.out_dir)?;
+    record_referrer(sandbox, &run.environment.out_dir)?;
     replay(
         link_search_in(&record.stdout, &sandbox.out_dir, &run.environment.out_dir).as_bytes(),
         record.stderr.as_bytes(),
@@ -756,6 +882,109 @@ mod tests {
             PathBuf::from(format!("/cache/out-dirs/v2/{}.refused", "ab".repeat(16)))
         );
         assert_ne!(sandbox.refused_path(), sandbox.lock_path());
+    }
+
+    /// A sealed run with the given key, linked from `links` Cargo `OUT_DIR`s.
+    fn sealed_run(cache: &Path, key: &str, links: &[PathBuf]) -> Sandbox {
+        let sandbox = Sandbox::new(
+            cache,
+            &key.repeat(64 / key.len()),
+            Path::new("debug/build/z-1/out"),
+        );
+        std::fs::create_dir_all(&sandbox.out_dir).unwrap();
+        std::fs::write(sandbox.out_dir.join("gen.rs"), b"x").unwrap();
+        seal(
+            &sandbox,
+            &Record {
+                version: RECORD_VERSION,
+                stdout: String::new(),
+                stderr: String::new(),
+            },
+        )
+        .unwrap();
+        for link in links {
+            link_out_dir(link, &sandbox.out_dir).unwrap();
+            record_referrer(&sandbox, link).unwrap();
+        }
+        sandbox
+    }
+
+    #[test]
+    fn a_sweep_keeps_linked_and_recent_runs_and_removes_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        let week = std::time::Duration::from_secs(7 * 24 * 3600);
+        let later = std::time::SystemTime::now() + week + week;
+        let target = dir.path().join("target/debug/build");
+
+        let linked = sealed_run(&cache, "a1", &[target.join("a-1/out")]);
+        let unlinked = sealed_run(&cache, "b2", &[target.join("b-1/out")]);
+        std::fs::remove_file(target.join("b-1/out")).unwrap();
+        let relinked = sealed_run(&cache, "c3", &[target.join("c-1/out")]);
+        link_out_dir(&target.join("c-1/out"), &unlinked.out_dir).unwrap();
+        record_referrer(&unlinked, &target.join("c-1/out")).unwrap();
+        let crashed = Sandbox::new(&cache, &"d4".repeat(32), Path::new("out"));
+        std::fs::create_dir_all(&crashed.out_dir).unwrap();
+        let busy = sealed_run(&cache, "e5", &[]);
+        let held = open_lock(&busy.lock_path()).unwrap();
+        held.lock_shared().unwrap();
+        let refused = Sandbox::new(&cache, &"f6".repeat(32), Path::new("out"));
+        std::fs::write(refused.refused_path(), b"").unwrap();
+
+        let now = sweep(&cache, std::time::SystemTime::now(), week).unwrap();
+        assert!(!crashed.root.exists(), "an unfinished sandbox goes at once");
+        assert!(
+            unlinked.root.exists(),
+            "unlinked for less than the retention"
+        );
+        assert!(refused.refused_path().exists());
+        assert_eq!(now.removed, 1);
+
+        let later = sweep(&cache, later, week).unwrap();
+        assert!(linked.root.exists(), "a live link keeps it");
+        assert!(unlinked.root.exists(), "c-1 links here now");
+        assert!(
+            !relinked.root.exists(),
+            "its only link points elsewhere now"
+        );
+        assert!(busy.root.exists(), "a build holds it");
+        assert!(!refused.refused_path().exists());
+        assert!(!referrers_path(&relinked.root).exists());
+        assert_eq!(
+            later,
+            Sweep {
+                removed: 1,
+                kept: 3
+            }
+        );
+        drop(held);
+
+        assert_eq!(
+            sweep(
+                &dir.path().join("nothing"),
+                std::time::SystemTime::now(),
+                week
+            )
+            .unwrap(),
+            Sweep::default()
+        );
+    }
+
+    #[test]
+    fn live_referrers_are_links_into_the_sandbox_once_each() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        let target = dir.path().join("target/debug/build");
+        let out = target.join("z-1/out");
+        let sandbox = sealed_run(&cache, "ab", &[out.clone(), out.clone()]);
+        let stale = target.join("gone/out");
+        record_referrer(&sandbox, &stale).unwrap();
+        let elsewhere = target.join("y-1/out");
+        std::fs::create_dir_all(target.join("y-1")).unwrap();
+        std::os::unix::fs::symlink(dir.path(), &elsewhere).unwrap();
+        record_referrer(&sandbox, &elsewhere).unwrap();
+        assert_eq!(live_referrers(&sandbox.root).unwrap(), vec![out]);
+        assert!(live_referrers(&dir.path().join("none")).unwrap().is_empty());
     }
 
     #[test]

@@ -6411,7 +6411,11 @@ impl Daemon {
         ));
         tokio::pin!(planner_lookup);
         let mut early_identity_resolution = None;
+        // Biased toward the identity lookup: when it and the planner finish
+        // together, keep the finished lookup instead of dropping it and
+        // fetching the same manifest again.
         let planner_result = tokio::select! {
+            biased;
             resolution = identity_lookup
                 .as_mut()
                 .expect("identity lookup is present")

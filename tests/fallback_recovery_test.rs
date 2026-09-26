@@ -270,10 +270,23 @@ int main(int argc, char **argv) {
         .arg(port.to_string())
         .spawn()
         .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while TcpStream::connect(("127.0.0.1", port)).is_err() && Instant::now() < deadline {
+    // Starting the sandbox can take seconds on a loaded machine. The wait
+    // ends as soon as the port answers, and a listener that never came up
+    // fails here rather than as a confusing fallback run below.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let ready = loop {
+        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            break true;
+        }
+        if Instant::now() >= deadline {
+            break false;
+        }
         std::thread::sleep(Duration::from_millis(10));
-    }
+    };
+    assert!(
+        ready,
+        "the sandboxed listener never answered on port {port}"
+    );
     // The fallback command is never this listener executable. Its basename
     // selects sccache preflight, and its marker proves whether it was invoked.
     let mut fixture = fixture;

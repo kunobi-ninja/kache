@@ -5512,13 +5512,19 @@ impl crate::remote_backend::RemoteBackend for BlockingIdentityBackend {
     ) -> Result<Option<crate::remote_backend::GetObject>> {
         if key.contains("/_manifests/") {
             self.identity_gets.fetch_add(1, Ordering::Relaxed);
-            self.identity_started.notify_one();
             if self.block_identity.load(Ordering::Acquire) {
+                self.identity_started.notify_one();
                 let _pending = PendingIdentityGuard {
                     cancellations: &self.identity_cancellations,
                 };
                 std::future::pending::<()>().await;
             }
+            // Signal once the read has an answer, so a test that waits for the
+            // lookup to start cannot finish its planner while the lookup is
+            // still in flight.
+            let result = self.inner.get(key, max_bytes).await;
+            self.identity_started.notify_one();
+            return result;
         } else {
             if self.identity_cancellations.load(Ordering::Acquire) == 0 {
                 self.artifact_started_before_identity_cancel

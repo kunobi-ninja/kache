@@ -17,12 +17,98 @@ const LOCK_DIGEST_HEX: usize = 16;
 
 /// Content hash of `Cargo.lock`, truncated for object keys.
 pub fn lockfile_digest(path: &Path) -> Option<String> {
-    let bytes = std::fs::read(path).ok()?;
+    lockfile_bytes_digest(&std::fs::read(path).ok()?)
+}
+
+fn lockfile_bytes_digest(bytes: &[u8]) -> Option<String> {
     if bytes.is_empty() {
         return None;
     }
-    let hex = blake3::hash(&bytes).to_hex();
+    let hex = blake3::hash(bytes).to_hex();
     Some(hex[..LOCK_DIGEST_HEX].to_string())
+}
+
+/// Earlier `Cargo.lock` revisions whose manifests a build may borrow.
+pub const PREVIOUS_LOCKFILES: usize = 3;
+
+/// How long the planner waits for git to name earlier lockfiles.
+const PREVIOUS_LOCKFILES_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Identity keys for earlier contents of a lockfile, newest first: the same
+/// target and profile as `identity_key`, over each revision's digest. Skips
+/// the current digest and repeats, and stops at `max`.
+pub fn identity_keys_for_revisions(
+    identity_key: &str,
+    revisions: &[Vec<u8>],
+    max: usize,
+) -> Vec<String> {
+    let Some(rest) = identity_key.strip_prefix(IDENTITY_KEY_PREFIX) else {
+        return Vec::new();
+    };
+    let mut parts = rest.splitn(2, '/');
+    let (Some(current), Some(target_profile)) = (parts.next(), parts.next()) else {
+        return Vec::new();
+    };
+    let mut keys: Vec<String> = Vec::new();
+    for bytes in revisions {
+        if keys.len() >= max {
+            break;
+        }
+        let Some(digest) = lockfile_bytes_digest(bytes) else {
+            continue;
+        };
+        let key = format!("{IDENTITY_KEY_PREFIX}{digest}/{target_profile}");
+        if digest != current && !keys.contains(&key) {
+            keys.push(key);
+        }
+    }
+    keys
+}
+
+/// Identity keys for the last [`PREVIOUS_LOCKFILES`] committed revisions of
+/// `lock_path` that differ from the current one, read from git. A dependency
+/// bump then still prefetches the part of the graph it did not change. Empty
+/// when git is missing, the file is not tracked, or git takes too long.
+pub async fn previous_identity_keys(lock_path: &Path, identity_key: &str) -> Vec<String> {
+    let lookup = async {
+        let dir = lock_path
+            .parent()
+            .filter(|dir| !dir.as_os_str().is_empty())?;
+        let name = lock_path.file_name()?.to_str()?;
+        let log = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["log", "--format=%H"])
+            .arg(format!("-n{}", PREVIOUS_LOCKFILES + 1))
+            .args(["--", name])
+            .output()
+            .await
+            .ok()
+            .filter(|output| output.status.success())?;
+        let mut revisions = Vec::new();
+        for commit in String::from_utf8_lossy(&log.stdout).lines() {
+            let show = tokio::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .arg("show")
+                .arg(format!("{commit}:./{name}"))
+                .output()
+                .await
+                .ok()
+                .filter(|output| output.status.success())?;
+            revisions.push(show.stdout);
+        }
+        Some(identity_keys_for_revisions(
+            identity_key,
+            &revisions,
+            PREVIOUS_LOCKFILES,
+        ))
+    };
+    tokio::time::timeout(PREVIOUS_LOCKFILES_TIMEOUT, lookup)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default()
 }
 
 /// Host target triple used as the pre-identity default manifest key.
@@ -107,12 +193,19 @@ pub fn explicit_manifest_key() -> Option<String> {
 
 /// Keys to fetch, most specific first. `KACHE_MANIFEST_KEY` wins alone.
 pub fn manifest_lookup_keys(identity: Option<&str>) -> Vec<String> {
+    manifest_lookup_keys_with(identity, &[])
+}
+
+/// [`manifest_lookup_keys`], trying `previous` identity keys (earlier
+/// lockfiles) after the current one and before the host triple.
+pub fn manifest_lookup_keys_with(identity: Option<&str>, previous: &[String]) -> Vec<String> {
     if let Some(explicit) = explicit_manifest_key() {
         return vec![explicit];
     }
     let mut keys = Vec::new();
     if let Some(identity) = identity.map(str::trim).filter(|value| !value.is_empty()) {
         keys.push(identity.to_string());
+        keys.extend(previous.iter().cloned());
     }
     let legacy = host_target_triple();
     if !keys.iter().any(|key| key == &legacy) {
@@ -229,6 +322,92 @@ mod tests {
             Some("release")
         );
         assert!(profile_between(&target, Path::new("/elsewhere/debug/deps"), false).is_none());
+    }
+
+    #[test]
+    fn earlier_lockfiles_give_keys_newest_first_without_the_current_one() {
+        let current = lockfile_bytes_digest(b"v3").unwrap();
+        let identity = format!("{IDENTITY_KEY_PREFIX}{current}/x86_64-unknown-linux-gnu/debug");
+        let key = |bytes: &[u8]| {
+            format!(
+                "{IDENTITY_KEY_PREFIX}{}/x86_64-unknown-linux-gnu/debug",
+                lockfile_bytes_digest(bytes).unwrap()
+            )
+        };
+        let revisions: Vec<Vec<u8>> = [&b"v3"[..], b"v2", b"", b"v2", b"v1", b"v0"]
+            .iter()
+            .map(|bytes| bytes.to_vec())
+            .collect();
+        assert_eq!(
+            identity_keys_for_revisions(&identity, &revisions, 2),
+            [key(b"v2"), key(b"v1")]
+        );
+        assert_eq!(
+            identity_keys_for_revisions(&identity, &revisions, 5),
+            [key(b"v2"), key(b"v1"), key(b"v0")]
+        );
+        assert!(identity_keys_for_revisions("x86_64-unknown-linux-gnu", &revisions, 3).is_empty());
+        assert!(identity_keys_for_revisions("id/only-a-digest", &revisions, 3).is_empty());
+        assert_eq!(PREVIOUS_LOCKFILES, 3);
+    }
+
+    #[test]
+    fn lookup_keys_try_earlier_lockfiles_between_identity_and_legacy() {
+        let _lock = crate::config::config_path_lock();
+        let _guard = set_env("KACHE_MANIFEST_KEY", None);
+        let previous = ["id/prev1/t/p".to_string(), "id/prev2/t/p".to_string()];
+        let keys = manifest_lookup_keys_with(Some("id/now/t/p"), &previous);
+        assert_eq!(keys[..3], ["id/now/t/p", "id/prev1/t/p", "id/prev2/t/p"]);
+        assert_eq!(keys[3], host_target_triple());
+        assert_eq!(
+            manifest_lookup_keys_with(None, &previous),
+            [host_target_triple()]
+        );
+    }
+
+    #[tokio::test]
+    async fn earlier_lockfiles_are_read_from_git() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir.path())
+                .args([
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(status.status.success(), "{status:?}");
+        };
+        git(&["init", "-q"]);
+        let lock = dir.path().join("Cargo.lock");
+        for version in ["v1", "v2", "v3"] {
+            std::fs::write(&lock, version).unwrap();
+            git(&["add", "Cargo.lock"]);
+            git(&["commit", "-q", "-m", version]);
+        }
+        // An uncommitted bump: v3, v2 and v1 are all earlier than this.
+        std::fs::write(&lock, "v4").unwrap();
+        let identity = identity_key(&lock, "t", "p").unwrap();
+        let expected: Vec<String> = ["v3", "v2", "v1"]
+            .iter()
+            .map(|version| {
+                let digest = lockfile_bytes_digest(version.as_bytes()).unwrap();
+                format!("{IDENTITY_KEY_PREFIX}{digest}/t/p")
+            })
+            .collect();
+        assert_eq!(previous_identity_keys(&lock, &identity).await, expected);
+
+        let untracked = tempfile::tempdir().unwrap();
+        let lock = untracked.path().join("Cargo.lock");
+        std::fs::write(&lock, "v1").unwrap();
+        assert!(previous_identity_keys(&lock, &identity).await.is_empty());
     }
 
     #[test]

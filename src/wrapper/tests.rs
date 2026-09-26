@@ -8132,6 +8132,7 @@ fn a_failed_discovery_backs_off_and_a_success_clears_it() {
         namespace: None,
         cargo_lock_deps: Vec::new(),
         identity_key: None,
+        lock_path: None,
     };
     // The marker's lock is shared with every process that inherited its
     // descriptor, and a test elsewhere in this binary can spawn a child

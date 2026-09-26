@@ -6520,7 +6520,7 @@ impl Daemon {
                 // work and retry its exact keys through ordinary demand
                 // admission, including after an advisory execution failure.
                 drop(identity_lookup.take());
-                crate::fallback_planner::retry_identity_with_ordinary_admission(&req.intent)
+                crate::fallback_planner::retry_identity_with_ordinary_admission(&req.intent).await
             }
         };
         let fallback_plan = match crate::fallback_planner::build_prefetch_plan_with_identity(

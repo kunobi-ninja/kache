@@ -4876,6 +4876,7 @@ async fn test_socket_build_started_roundtrip_without_remote() {
                 namespace: Some("ns".into()),
                 cargo_lock_deps: vec![],
                 identity_key: None,
+                lock_path: None,
             },
             client_epoch: 0,
             session_id: String::new(),
@@ -6034,6 +6035,7 @@ async fn test_handle_build_started_falls_back_to_local_planning() {
             namespace: None,
             cargo_lock_deps: vec![],
             identity_key: Some("id/cold-build".into()),
+            lock_path: None,
         },
         client_epoch: 0,
         session_id: "cold-session".into(),
@@ -6257,6 +6259,7 @@ fn packed_prefetch_context_is_derived_from_a_complete_build_intent() {
         namespace: Some("linux/toolchain/release".into()),
         cargo_lock_deps: vec![("serde".into(), "1.0.0".into())],
         identity_key: None,
+        lock_path: None,
     };
     let context = PackPrefetchContext::from_intent(&intent)
         .expect("a namespaced lockfile intent must enable catalog discovery");
@@ -11719,6 +11722,7 @@ fn test_build_started_request_serde() {
             namespace: Some("x86_64/hash/release".into()),
             cargo_lock_deps: vec![("serde".into(), "1.0.0".into())],
             identity_key: None,
+            lock_path: None,
         },
         client_epoch: 0,
         session_id: String::new(),

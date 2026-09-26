@@ -182,6 +182,13 @@ known) and the host target triple so older prefetch still finds the file.
 `Cargo.lock` also publishes content-addressed shards. Build-script runs are left
 out: they stay in the local store, so no other machine could fetch them.
 
+When the remote has no manifest for the current lockfile, the planner tries
+the manifests of up to three earlier committed revisions of `Cargo.lock`
+before the host-triple key, so a dependency bump still prefetches the part of
+the graph it did not change. This reads git history: a shallow clone needs
+enough of it (`fetch-depth` on GitHub Actions), and without git the step is
+skipped.
+
 CI jobs that share a key, such as tests and lints on the same lockfile, target
 and profile, add to one manifest rather than replacing each other. Entries from
 the same commit (`GITHUB_SHA` or `CI_COMMIT_SHA`) stay together, entries from

@@ -21,6 +21,10 @@ pub struct BuildIntent {
     /// clients and when no lockfile was visible at session start.
     #[serde(default)]
     pub identity_key: Option<String>,
+    /// The `Cargo.lock` the identity key was computed from, so the planner
+    /// can fall back to manifests published for its earlier revisions.
+    #[serde(default)]
+    pub lock_path: Option<String>,
 }
 
 /// Which source produced a candidate, i.e. how much to trust it
@@ -694,6 +698,7 @@ mod tests {
             namespace: Some("x86_64/hash/release".into()),
             cargo_lock_deps: vec![("serde".into(), "1.0.0".into())],
             identity_key: None,
+            lock_path: None,
         };
 
         let json = serde_json::to_string(&intent).unwrap();
@@ -759,6 +764,7 @@ mod tests {
             namespace: Some("linux/hash/release".into()),
             cargo_lock_deps: vec![("serde".into(), "1.0.0".into())],
             identity_key: None,
+            lock_path: None,
         };
 
         let (plan, composition) =
@@ -789,6 +795,7 @@ mod tests {
             namespace: Some("linux/hash/release".into()),
             cargo_lock_deps: vec![("serde".into(), "1.0.0".into())],
             identity_key: Some("id/abcd/x86_64-unknown-linux-gnu/release".into()),
+            lock_path: None,
         };
 
         let plan = build_prefetch_plan(&source, &intent, "fallback")
@@ -819,6 +826,7 @@ mod tests {
             namespace: Some("linux/hash/debug".into()),
             cargo_lock_deps: vec![("serde".into(), "1.0.0".into())],
             identity_key: None,
+            lock_path: None,
         };
 
         let plan = build_prefetch_plan(&source, &intent, "fallback")
@@ -847,6 +855,7 @@ mod tests {
             namespace: Some("linux/hash/debug".into()),
             cargo_lock_deps: vec![("dep".into(), "1.0.0".into())],
             identity_key: None,
+            lock_path: None,
         };
 
         let plan = build_prefetch_plan(&source, &intent, "fallback")
@@ -887,6 +896,7 @@ mod tests {
             namespace: Some("linux/hash/debug".into()),
             cargo_lock_deps: vec![("dep".into(), "1.0.0".into())],
             identity_key: None,
+            lock_path: None,
         };
 
         let plan = build_prefetch_plan(&source, &intent, "fallback")
@@ -928,6 +938,7 @@ mod tests {
             namespace: Some("linux/hash/debug".into()),
             cargo_lock_deps: vec![("serde".into(), "1.0.0".into())],
             identity_key: None,
+            lock_path: None,
         };
 
         let plan = build_prefetch_plan(&source, &intent, "fallback")
@@ -958,6 +969,7 @@ mod tests {
             namespace: None,
             cargo_lock_deps: vec![],
             identity_key: None,
+            lock_path: None,
         };
 
         let plan = build_prefetch_plan(&source, &intent, "fallback")

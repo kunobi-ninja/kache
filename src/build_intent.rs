@@ -92,11 +92,15 @@ fn discover_with_context(
         )
     });
 
+    let lock_path = identity_key
+        .as_ref()
+        .map(|_| lock_path.to_string_lossy().into_owned());
     Some(BuildIntent {
         crate_names,
         namespace,
         cargo_lock_deps,
         identity_key,
+        lock_path,
     })
 }
 
@@ -613,6 +617,7 @@ mod tests {
             namespace: Some("x86_64/hash/release".into()),
             cargo_lock_deps: vec![("serde".into(), "1.0.0".into())],
             identity_key: Some("id/abcd/x86_64-unknown-linux-gnu/release".into()),
+            lock_path: None,
         };
 
         let req = into_build_started_request(intent, 42, "sess-test".into());

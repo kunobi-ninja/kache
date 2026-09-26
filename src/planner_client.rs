@@ -187,6 +187,7 @@ mod tests {
             namespace: Some("ns".into()),
             cargo_lock_deps: vec![("serde".into(), "1.0.0".into())],
             identity_key: None,
+            lock_path: None,
         };
 
         let plan = resolve_prefetch_plan_with_config(&config, &req)
@@ -216,6 +217,7 @@ mod tests {
             namespace: None,
             cargo_lock_deps: vec![],
             identity_key: None,
+            lock_path: None,
         };
 
         let err = resolve_prefetch_plan_with_config(&config, &req)
@@ -244,6 +246,7 @@ mod tests {
             namespace: None,
             cargo_lock_deps: vec![],
             identity_key: None,
+            lock_path: None,
         };
 
         let plan = resolve_prefetch_plan_with_config(&config, &req)

@@ -983,6 +983,7 @@ mod tests {
                             namespace: Some("linux/hash/debug".to_string()),
                             cargo_lock_deps: vec![("serde".to_string(), "1.0.0".to_string())],
                             identity_key: None,
+                            lock_path: None,
                         })
                         .unwrap(),
                     ))
@@ -1118,6 +1119,7 @@ mod tests {
                             namespace: None,
                             cargo_lock_deps: vec![],
                             identity_key: None,
+                            lock_path: None,
                         })
                         .unwrap(),
                     ))
@@ -1160,6 +1162,7 @@ mod tests {
                             namespace: None,
                             cargo_lock_deps: vec![],
                             identity_key: None,
+                            lock_path: None,
                         })
                         .unwrap(),
                     ))

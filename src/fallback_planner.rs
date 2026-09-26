@@ -20,7 +20,7 @@ pub(crate) enum SpeculativeIdentityOutcome {
 /// Convert an unresolved speculative lookup into exact keys for the ordinary
 /// fallback path. Once fallback is selected, it must use demand admission
 /// rather than remain queued behind the speculative prefetch gate.
-pub(crate) fn retry_identity_with_ordinary_admission(
+pub(crate) async fn retry_identity_with_ordinary_admission(
     intent: &BuildIntent,
 ) -> SpeculativeIdentityOutcome {
     let Some(identity_key) = intent
@@ -31,9 +31,20 @@ pub(crate) fn retry_identity_with_ordinary_admission(
     else {
         return SpeculativeIdentityOutcome::Resolved(Vec::new());
     };
-    SpeculativeIdentityOutcome::NotAdmitted(crate::identity::manifest_lookup_keys(Some(
-        identity_key,
-    )))
+    SpeculativeIdentityOutcome::NotAdmitted(identity_lookup_keys(intent, identity_key).await)
+}
+
+/// Manifest keys to try for this build: its identity, then the identities of
+/// earlier revisions of its lockfile, then the host triple.
+async fn identity_lookup_keys(intent: &BuildIntent, identity_key: &str) -> Vec<String> {
+    let previous = match intent.lock_path.as_deref() {
+        Some(lock_path) => {
+            crate::identity::previous_identity_keys(std::path::Path::new(lock_path), identity_key)
+                .await
+        }
+        None => Vec::new(),
+    };
+    crate::identity::manifest_lookup_keys_with(Some(identity_key), &previous)
 }
 
 /// Resolve identity metadata as lookahead without consuming a half-open
@@ -52,7 +63,7 @@ pub async fn resolve_identity_candidates_speculative(
         return SpeculativeIdentityOutcome::Resolved(Vec::new());
     };
 
-    let lookup_keys = crate::identity::manifest_lookup_keys(Some(identity_key));
+    let lookup_keys = identity_lookup_keys(intent, identity_key).await;
     let mut candidates = Vec::new();
     let mut seen = HashSet::new();
     let mut retryable_failures: Vec<(String, RemoteErrorClass)> = Vec::new();

@@ -46,6 +46,16 @@ upwards, keyed by content), and the lint arguments Cargo passes in
 diagnostics, so warnings appear exactly as on the first run. Other
 `RUSTC_WORKSPACE_WRAPPER` drivers stay uncached.
 
+### Miri
+
+`cargo miri` runs no Rust compile through Kache. cargo-miri sets
+`RUSTC_WRAPPER` to itself and clears `RUSTC_WORKSPACE_WRAPPER`, and the
+environment variable overrides `build.rustc-wrapper` from Cargo's config, so
+Kache never sees the Miri compiles or the Miri sysroot build. It prints a
+warning only when `RUSTC_WRAPPER` was set in the environment. Build scripts
+that compile C through `CC` or `HOST_CC` still reach Kache, as in any other
+build.
+
 ### Misses without a record
 
 The first time a unit is built on a machine, Kache has no recorded closure to

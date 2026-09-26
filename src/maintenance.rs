@@ -4,6 +4,8 @@
 //! then compacts `index.db` ([`crate::index_compact`]): a heal frees rows, and
 //! the compaction after it returns their pages to the disk. Both hold the
 //! index write lock while they work, so both wait for a moment with no build.
+//! Last, [`crate::target_cleanup`] removes target directories the
+//! configuration no longer wants kept.
 
 use crate::config::Config;
 use std::sync::Arc;
@@ -98,6 +100,7 @@ pub(crate) fn unix_now_secs() -> u64 {
 pub(crate) fn run(config: &Config, trigger: Trigger<'_>) {
     crate::blob_heal::run(config, trigger);
     crate::index_compact::run(config, trigger);
+    crate::target_cleanup::run(config, trigger);
 }
 
 /// Check shortly after daemon start, then every few minutes. A check that

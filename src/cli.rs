@@ -4388,7 +4388,7 @@ const TARGET_IN_USE: &str = "in use by a running build";
 /// an exclusive lock on `<profile>/.cargo-lock` (and
 /// `<triple>/<profile>/.cargo-lock`) for the length of a build, so failing to
 /// take it here means a build is writing into this directory now.
-fn target_in_use(target: &std::path::Path) -> bool {
+pub(crate) fn target_in_use(target: &std::path::Path) -> bool {
     cargo_lock_files(target, 3).iter().any(|lock| {
         std::fs::File::open(lock)
             .is_ok_and(|file| matches!(file.try_lock(), Err(std::fs::TryLockError::WouldBlock)))
@@ -4707,12 +4707,16 @@ impl TrackedSelection {
     }
 }
 
-/// A workspace is gone when its directory no longer exists while the
-/// directory holding it still does. The parent check keeps an unmounted
+/// A workspace is gone when looking it up finds nothing while the
+/// directory holding it still exists. The parent check keeps an unmounted
 /// volume or a network share that is offline from reading as a deleted
 /// worktree.
-fn workspace_is_gone(workspace_root: &std::path::Path) -> bool {
-    !workspace_root.exists() && workspace_root.parent().is_some_and(std::path::Path::is_dir)
+pub(crate) fn workspace_is_gone(workspace_root: &std::path::Path) -> bool {
+    // Only a lookup that finds nothing counts: a permission or I/O error on
+    // a network share is not a deleted worktree.
+    let missing = std::fs::symlink_metadata(workspace_root)
+        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
+    missing && workspace_root.parent().is_some_and(std::path::Path::is_dir)
 }
 
 fn tracked_target_entries(
@@ -10259,6 +10263,8 @@ mod tests {
             project_rules: crate::config::ProjectRules::default(),
             auto_gc: true,
             index_auto_compact: true,
+            auto_clean_orphaned_targets: false,
+            auto_clean_idle_targets_days: 0,
             gc_evict_shared: false,
             storage_layout_advice: true,
             heartbeat_secs: 30,

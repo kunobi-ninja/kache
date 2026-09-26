@@ -69,6 +69,7 @@ mod since;
 use kache_store::sharing;
 mod compiler_store;
 use compiler_store as store;
+mod target_cleanup;
 mod test_runner;
 #[cfg(test)]
 mod test_support;

@@ -97,6 +97,8 @@ kache clean --orphans --yes
 
 Cleanup rechecks each directory's identity and removes only the derived target directory. It skips paths that are missing, moved, replaced or unsafe, and targets of the current workspace. A target that a running build holds (its `.cargo-lock`) is skipped with `in use by a running build`, in every mode.
 
+The daemon removes tracked targets whose workspace was deleted on its own, and idle ones when configured. See [Target directory cleanup](/docs/getting-started/configuration#target-directory-cleanup).
+
 ## `kache targets`
 
 ```bash

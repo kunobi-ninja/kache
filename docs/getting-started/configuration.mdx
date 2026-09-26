@@ -73,6 +73,8 @@ local_max_size = "200GiB"
 | `KACHE_GC_MAX_AGE_HOURS` | `cache.gc_max_age_hours` | `0` | Automatic age retention; `0` disables it |
 | `KACHE_GC_EVICT_SHARED` | `cache.gc_evict_shared` | `false` | Restore namespace-first GC for entries retained by build outputs |
 | `KACHE_INDEX_AUTO_COMPACT` | `cache.index_auto_compact` | `true` | Let the daemon heal the blob index and compact `index.db` when the machine is quiet. See [Daemon index maintenance](#daemon-index-maintenance). |
+| `KACHE_AUTO_CLEAN_ORPHANED_TARGETS` | `cache.auto_clean_orphaned_targets` | `true` | Let the daemon remove target directories whose workspace was deleted. See [Target directory cleanup](#target-directory-cleanup). |
+| `KACHE_AUTO_CLEAN_IDLE_TARGETS_DAYS` | `cache.auto_clean_idle_targets_days` | `0` | Let the daemon also remove target directories no build has used for this many days; `0` disables it |
 | `KACHE_MIN_STORE_COMPILE_MS` | `cache.min_store_compile_ms` | `0` | Skip local retention for faster compiles; `0` stores all eligible results |
 | `KACHE_COMPRESSION_LEVEL` | `cache.compression_level` | `3` | Zstd level, clamped to 1 through 22 |
 | none | `cache.event_log_max_size` | `64MiB` | Rotate the event log after this size. Rotation keeps the build in progress, up to half this size |
@@ -194,6 +196,17 @@ A `VACUUM` blocks other index users while it runs, so the daemon runs one only i
 Compaction needs free disk of about twice the live index size, not the file size: a 45 GB index with 1 GB live needs about 2 GB. Without that room the attempt is skipped and retried later. The free pages stay reusable in the meantime, so a skipped compaction costs disk space only.
 
 A live index above 8 GiB is never compacted automatically, because the rewrite would hold the index for too long. The daemon logs that it skipped it; run `kache doctor --repair` when no build is running.
+
+### Target directory cleanup
+
+Builds through Kache record the target directories they use; `kache targets` lists them. The daemon checks that list at most once an hour, when the machine is quiet, and removes:
+
+- target directories whose workspace was deleted and that no build has used for a day, such as the target of a removed worktree built with its own `CARGO_TARGET_DIR`. The day keeps a worktree that is moved or recreated from losing its target. Set `cache.auto_clean_orphaned_targets = false` or `KACHE_AUTO_CLEAN_ORPHANED_TARGETS=0` to keep them.
+- with `cache.auto_clean_idle_targets_days` set, target directories no build has used for that many days, whether or not their workspace still exists.
+
+It applies the same checks as `kache clean --tracked --yes`. A directory is removed only while it is still the Cargo target directory that was recorded, never when it holds a `Cargo.toml` or `.git`, and never while a running build holds it. The daemon renames it aside and checks once more before deleting it, so a build that starts at that moment gets a new directory. A workspace counts as deleted only when looking it up finds nothing; a permission or network error does not count. The daemon log names each directory it removes and why.
+
+The cleanup follows the configuration of the daemon that serves the cache directory.
 
 ## Compiler policy
 

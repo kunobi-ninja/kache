@@ -470,6 +470,8 @@ mod tests {
             project_rules: crate::config::ProjectRules::default(),
             auto_gc: true,
             index_auto_compact: true,
+            auto_clean_orphaned_targets: true,
+            auto_clean_idle_targets_days: 0,
             gc_evict_shared: false,
             storage_layout_advice: true,
             heartbeat_secs: 30,

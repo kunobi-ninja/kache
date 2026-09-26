@@ -1938,6 +1938,8 @@ mod tests {
                 daemon_publish: None,
                 auto_gc: None,
                 index_auto_compact: None,
+                auto_clean_orphaned_targets: None,
+                auto_clean_idle_targets_days: None,
                 gc_evict_shared: Some(true),
                 storage_layout_advice: None,
                 heartbeat_secs: None,

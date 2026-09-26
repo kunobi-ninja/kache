@@ -1265,7 +1265,11 @@ fn warn_if_path_leaked(s: &str) {
 /// form the source produced. See [`PathNormalizer::normalize`] for
 /// the matching-side normalization.
 pub(crate) fn canonical_string(path: &Path) -> Option<String> {
-    let canon = path.canonicalize().ok()?;
+    canonical_form(&path.canonicalize().ok()?)
+}
+
+/// [`canonical_string`] for a path the caller has already canonicalized.
+pub(crate) fn canonical_form(canon: &Path) -> Option<String> {
     let lossy = canon.to_string_lossy();
     let s: String = strip_verbatim_prefix(&lossy).nfc().collect();
     if s.is_empty() { None } else { Some(s) }

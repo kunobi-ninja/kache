@@ -23,7 +23,7 @@ Three rules keep the store consistent under expiry:
 - Expire `v4/prefetch/catalogs/` sooner than `v4/prefetch/packs/` and `pack-meta/`. Packs are shared between catalog generations, so a live catalog must never point at an expired pack.
 - Expire by age since the object was written. Kache never rewrites an entry's manifest or pack, so a hot entry expires too and is uploaded again on the next miss. Build manifests and prediction rows are written again each time they are used, so they expire only when idle. An expired prediction row costs one dep-info pre-pass. Pick an age longer than the interval at which your builds change.
 
-An expired object is a miss. The daemon's remote key index can report an object present for up to `cache.remote_key_cache_refresh_secs` after it expired; the fetch then misses and the crate compiles as usual.
+An expired object is a miss. With `cache.remote_key_listing` on, the daemon's remote key index can report an object present for up to `cache.remote_key_cache_refresh_secs` after it expired; the fetch then misses and the crate compiles as usual.
 
 ## S3 lifecycle rules
 

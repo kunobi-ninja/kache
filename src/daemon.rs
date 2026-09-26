@@ -84,6 +84,129 @@ fn should_start_speculative_prefetch(remote_configured: bool, prefetch_enabled: 
     remote_configured && prefetch_enabled
 }
 
+/// Whether the daemon lists the remote's keys: only when asked to
+/// (`remote_key_listing`), because listing needs `s3:ListBucket`.
+fn should_list_remote_keys(
+    remote_configured: bool,
+    prefetch_enabled: bool,
+    key_listing: bool,
+) -> bool {
+    should_start_speculative_prefetch(remote_configured, prefetch_enabled) && key_listing
+}
+
+/// Whether an S3 LIST was refused for lack of `s3:ListBucket`, which will not
+/// change until the policy does. Credentials S3 rejected outright (an expired
+/// token, say) may recover, and a filesystem permission error is something
+/// else entirely, so neither counts.
+fn listing_was_refused(
+    error: &anyhow::Error,
+    remote: Option<&crate::config::RemoteConfig>,
+) -> bool {
+    let s3 = matches!(
+        remote.map(|remote| &remote.backend),
+        Some(crate::config::RemoteBackendConfig::S3(_))
+    );
+    s3 && error.chain().any(|cause| {
+        cause.downcast_ref::<opendal::Error>().is_some_and(|error| {
+            error.kind() == opendal::ErrorKind::PermissionDenied
+                && !crate::remote_backend::credentials_rejected(error)
+        })
+    })
+}
+
+const LISTING_REFUSED: &str = "the remote refused to list its keys, so the daemon \
+    stops listing. Grant s3:ListBucket, or set `remote_key_listing = false`; exact \
+    lookups and uploads do not need it";
+
+/// The periodic refresh interval, or `None` when refresh is off.
+fn key_cache_refresh_period(refresh_secs: u64) -> Option<std::time::Duration> {
+    (!key_cache_periodic_refresh_disabled(refresh_secs))
+        .then(|| std::time::Duration::from_secs(refresh_secs))
+}
+
+/// Why the remote key-cache refresher stopped.
+#[derive(Debug, PartialEq, Eq)]
+enum RefresherExit {
+    PeriodicRefreshDisabled,
+    ListingRefused,
+}
+
+/// Fill the remote key cache (five tries, backing off 1, 2, 4 and 8 s), then
+/// refill it every `refresh` until the remote refuses to list. `None` stops
+/// after the first fill. Kept out of `server_main` so tests can drive it.
+async fn run_key_cache_refresher<P, PF, B, BF>(
+    mut populate: P,
+    refused: impl Fn(&anyhow::Error) -> bool,
+    refresh: Option<std::time::Duration>,
+    mut backoff: B,
+) -> RefresherExit
+where
+    P: FnMut() -> PF,
+    PF: std::future::Future<Output = Result<usize>>,
+    B: FnMut(std::time::Duration) -> BF,
+    BF: std::future::Future<Output = ()>,
+{
+    let mut delay = std::time::Duration::from_secs(1);
+    for attempt in 1..=5 {
+        match populate().await {
+            Ok(count) => {
+                tracing::info!("remote key cache populated: {count} keys");
+                break;
+            }
+            Err(e) if refused(&e) => {
+                tracing::warn!("{LISTING_REFUSED}: {e}");
+                return RefresherExit::ListingRefused;
+            }
+            Err(e) => {
+                tracing::warn!("remote key cache population attempt {attempt}/5 failed: {e}");
+                if attempt < 5 {
+                    backoff(delay).await;
+                    delay *= 2;
+                }
+            }
+        }
+    }
+
+    let Some(refresh) = refresh else {
+        tracing::info!("remote key cache periodic refresh disabled");
+        return RefresherExit::PeriodicRefreshDisabled;
+    };
+    let mut interval = tokio::time::interval(refresh);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    interval.tick().await; // skip immediate tick
+    let mut consecutive_refresh_failures = 0u32;
+    loop {
+        interval.tick().await;
+        match populate().await {
+            Ok(count) => {
+                if consecutive_refresh_failures > 0 {
+                    tracing::info!(
+                        "remote key cache refresh recovered after {consecutive_refresh_failures} failed attempt(s)"
+                    );
+                    consecutive_refresh_failures = 0;
+                }
+                tracing::debug!("remote key cache refreshed: {count} keys");
+            }
+            Err(e) if refused(&e) => {
+                tracing::warn!("{LISTING_REFUSED}: {e}");
+                return RefresherExit::ListingRefused;
+            }
+            Err(e) => {
+                consecutive_refresh_failures += 1;
+                if should_warn_key_cache_refresh_failure(consecutive_refresh_failures) {
+                    tracing::warn!(
+                        "remote key cache refresh failed (attempt {consecutive_refresh_failures}): {e}"
+                    );
+                } else {
+                    tracing::debug!(
+                        "remote key cache refresh failed (attempt {consecutive_refresh_failures}): {e}"
+                    );
+                }
+            }
+        }
+    }
+}
+
 fn key_cache_periodic_refresh_disabled(refresh_secs: u64) -> bool {
     refresh_secs == 0
 }
@@ -1238,6 +1361,9 @@ pub struct EffectiveConfig {
     pub config_fingerprint: Option<String>,
     /// `[cache] prefetch_enabled` / `KACHE_PREFETCH_ENABLED` as resolved.
     pub prefetch_enabled: bool,
+    /// `[cache] remote_key_listing` / `KACHE_REMOTE_KEY_LISTING` as resolved.
+    #[serde(default = "default_effective_remote_key_listing")]
+    pub remote_key_listing: bool,
     /// Credential-free remote description (for example `s3://bucket/prefix`)
     /// as resolved by the daemon. `None` means no usable remote.
     #[serde(default)]
@@ -1261,6 +1387,11 @@ pub struct EffectiveConfig {
     pub started_at_ms: u64,
 }
 
+/// Daemons from before `remote_key_listing` listed whenever prefetch was on.
+fn default_effective_remote_key_listing() -> bool {
+    true
+}
+
 fn default_effective_remote_key_cache_refresh_secs() -> u64 {
     crate::config::DEFAULT_REMOTE_KEY_CACHE_REFRESH_SECS
 }
@@ -1281,6 +1412,7 @@ impl EffectiveConfig {
             config_path: provenance.path.display().to_string(),
             config_fingerprint: Some(provenance.fingerprint.clone()),
             prefetch_enabled: config.prefetch_enabled,
+            remote_key_listing: config.remote_key_listing,
             remote_description: config.remote.as_ref().map(|remote| remote.describe()),
             local_only: config.local_only,
             remote_error: config.remote_error.clone(),
@@ -2526,6 +2658,9 @@ pub(crate) struct Daemon {
     /// drive it live in [`ActivePlan`] (#581).
     prefetch_cancel: tokio::sync::watch::Sender<bool>,
     prefetch_stopping: AtomicBool,
+    /// Set when the remote refused to list: packed-prefetch catalog discovery
+    /// stops listing too.
+    listing_refused: AtomicBool,
     /// Own both coordinators and their independently scheduled download tasks.
     prefetch_tasks: Mutex<tokio::task::JoinSet<()>>,
     prefetch_cancellations: Arc<Mutex<PrefetchCancellations>>,
@@ -2664,6 +2799,7 @@ impl Daemon {
             prefetched_keys: Arc::new(RwLock::new(HashSet::new())),
             prefetch_cancel,
             prefetch_stopping: AtomicBool::new(false),
+            listing_refused: AtomicBool::new(false),
             prefetch_tasks: Mutex::new(tokio::task::JoinSet::new()),
             prefetch_cancellations: Arc::new(Mutex::new(PrefetchCancellations::default())),
             prefetch_receipts: Arc::new(Mutex::new(PrefetchReceiptQueue::default())),
@@ -4887,6 +5023,11 @@ impl Daemon {
             .map(|(key, _, _)| key.clone())
             .collect::<HashSet<_>>();
         let mut imported = HashSet::new();
+        // Finding the latest catalog is a LIST, which needs s3:ListBucket.
+        // Without it the entries come one by one, as they would with no catalog.
+        if !self.config.remote_key_listing || self.listing_refused.load(Ordering::Relaxed) {
+            return imported;
+        }
         let catalog_prefix =
             match crate::remote_pack::catalog_prefix(&remote.prefix, &context.selector) {
                 Ok(prefix) => prefix,
@@ -6168,6 +6309,13 @@ impl Daemon {
         );
     }
 
+    /// Remember a refused listing, so catalog discovery stops listing too.
+    fn record_refresher_exit(&self, exit: RefresherExit) {
+        if exit == RefresherExit::ListingRefused {
+            self.listing_refused.store(true, Ordering::Relaxed);
+        }
+    }
+
     /// Best-effort rank-0 publish when a session ends. Failures must not
     /// affect the daemon: the next `save-manifest` still writes the same
     /// events.
@@ -7166,71 +7314,29 @@ async fn server_main(
         .then(|| crate::maintenance::spawn_periodic(config.clone(), daemon.request_clock.clone()));
 
     // The remote key cache only serves speculative planning. Exact-key remote
-    // checks and uploads do not depend on it, so disabling prefetch also avoids
-    // the expensive whole-remote LIST entirely.
-    let cache_handle = if should_start_speculative_prefetch(
+    // checks and uploads do not depend on it, so the whole-remote LIST runs
+    // only when `remote_key_listing` asks for it.
+    let cache_handle = if should_list_remote_keys(
         config.remote.is_some(),
         config.prefetch_enabled,
+        config.remote_key_listing,
     ) {
         let cache_daemon = daemon.clone();
         let refresh_secs = config.remote_key_cache_refresh_secs;
         Some(tokio::spawn(async move {
-            // Initial population with retry backoff
-            let mut delay = std::time::Duration::from_secs(1);
-            for attempt in 1..=5 {
-                match populate_key_cache(&cache_daemon).await {
-                    Ok(count) => {
-                        tracing::info!("remote key cache populated: {count} keys");
-                        break;
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            "remote key cache population attempt {attempt}/5 failed: {e}"
-                        );
-                        if attempt < 5 {
-                            tokio::time::sleep(delay).await;
-                            delay *= 2;
-                        }
-                    }
-                }
-            }
-
-            if key_cache_periodic_refresh_disabled(refresh_secs) {
-                tracing::info!("remote key cache periodic refresh disabled");
-                return;
-            }
-
-            // Periodic refresh
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(refresh_secs));
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            interval.tick().await; // skip immediate tick
-            let mut consecutive_refresh_failures = 0u32;
-            loop {
-                interval.tick().await;
-                match populate_key_cache(&cache_daemon).await {
-                    Ok(count) => {
-                        if consecutive_refresh_failures > 0 {
-                            tracing::info!(
-                                "remote key cache refresh recovered after {consecutive_refresh_failures} failed attempt(s)"
-                            );
-                            consecutive_refresh_failures = 0;
-                        }
-                        tracing::debug!("remote key cache refreshed: {count} keys");
-                    }
-                    Err(e) => {
-                        consecutive_refresh_failures += 1;
-                        if should_warn_key_cache_refresh_failure(consecutive_refresh_failures) {
-                            tracing::warn!(
-                                "remote key cache refresh failed (attempt {consecutive_refresh_failures}): {e}"
-                            );
-                        } else {
-                            tracing::debug!(
-                                "remote key cache refresh failed (attempt {consecutive_refresh_failures}): {e}"
-                            );
-                        }
-                    }
-                }
-            }
+            let remote = cache_daemon.config.remote.clone();
+            let populate = || {
+                let daemon = cache_daemon.clone();
+                async move { populate_key_cache(&daemon).await }
+            };
+            let exit = run_key_cache_refresher(
+                populate,
+                |error| listing_was_refused(error, remote.as_ref()),
+                key_cache_refresh_period(refresh_secs),
+                tokio::time::sleep,
+            )
+            .await;
+            cache_daemon.record_refresher_exit(exit);
         }))
     } else {
         None

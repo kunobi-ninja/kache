@@ -11,6 +11,7 @@ use download_memory::{BudgetedBody, DOWNLOAD_MEMORY, DownloadMemory};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -200,6 +201,8 @@ pub struct OpenDalBackend {
     /// write-containment check.
     filesystem_root: Option<PathBuf>,
     download_memory: Arc<DownloadMemory>,
+    /// Set once a refused read has been reported as a miss.
+    refusal_reported: AtomicBool,
 }
 
 impl OpenDalBackend {
@@ -209,7 +212,37 @@ impl OpenDalBackend {
             root_description,
             filesystem_root: None,
             download_memory: DOWNLOAD_MEMORY.clone(),
+            refusal_reported: AtomicBool::new(false),
         }
+    }
+
+    /// True for the first refused read only, so the explanation is logged once.
+    fn first_refusal(&self) -> bool {
+        !self.refusal_reported.swap(true, Ordering::Relaxed)
+    }
+
+    /// Whether a refused read means the object is absent.
+    ///
+    /// Without `s3:ListBucket`, S3 answers `403` instead of `404` for a key
+    /// that does not exist, so a reader granted only `s3:GetObject` sees every
+    /// miss as a refusal. Credentials S3 rejected outright stay errors. A
+    /// filesystem permission error is a real error.
+    fn refusal_means_absent(&self, error: &opendal::Error) -> bool {
+        if self.is_filesystem()
+            || error.kind() != ErrorKind::PermissionDenied
+            || credentials_rejected(error)
+        {
+            return false;
+        }
+        if self.first_refusal() {
+            tracing::warn!(
+                "{} refused a read; treating refusals as cache misses, which is what S3 \
+                 returns for a missing key without s3:ListBucket. If the cache never hits, \
+                 these credentials may not be allowed to read it",
+                self.root_description
+            );
+        }
+        true
     }
 
     fn is_filesystem(&self) -> bool {
@@ -358,6 +391,7 @@ impl OpenDalBackend {
                 metadata.etag().map(str::to_string),
             ),
             Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(error) if self.refusal_means_absent(&error) => return Ok(None),
             Err(error) if error.kind() == ErrorKind::Unsupported => {
                 // A separate stat can describe a newer object than the one
                 // read, so its tag is not offered for a conditional write.
@@ -440,6 +474,7 @@ impl RemoteBackend for OpenDalBackend {
         match self.operator.stat(key).await {
             Ok(metadata) => Ok(metadata.is_file()),
             Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
+            Err(error) if self.refusal_means_absent(&error) => Ok(false),
             Err(error) => Err(self.contextual_error("HEAD", key, error)),
         }
     }
@@ -702,6 +737,25 @@ fn classify_conditional_error(error: &opendal::Error, replacing: bool) -> Option
 /// implement part of it.
 fn lacks_conditional_writes(error: &opendal::Error) -> bool {
     error.message().contains("\"NotImplemented\"") || error.to_string().contains("status: 501")
+}
+
+/// Whether S3 rejected the request's credentials themselves, rather than
+/// refusing one object. These codes arrive in an error body, so a `HEAD` never
+/// carries them.
+pub(crate) fn credentials_rejected(error: &opendal::Error) -> bool {
+    const CODES: [&str; 7] = [
+        "InvalidAccessKeyId",
+        "SignatureDoesNotMatch",
+        "ExpiredToken",
+        "InvalidToken",
+        "TokenRefreshRequired",
+        "RequestTimeTooSkewed",
+        "InvalidSecurity",
+    ];
+    let message = error.message();
+    CODES
+        .iter()
+        .any(|code| message.contains(&format!("\"{code}\"")))
 }
 
 fn without_retry_layer(operator: Operator) -> Operator {
@@ -1919,15 +1973,78 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn s3_wire_head_reports_refusals_as_errors_not_absence() {
+    async fn s3_wire_refused_reads_are_misses_unless_the_credentials_were_rejected() {
+        let error = |code: &str| {
+            format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>{code}</Code>\
+                 <Message>m</Message><RequestId>test</RequestId></Error>"
+            )
+        };
         let (endpoint, _requests) = mock_http_server(vec![
             http_response("404 Not Found", ""),
+            http_response("500 Internal Server Error", ""),
+            // A HEAD response has no body to explain itself.
             http_response("403 Forbidden", ""),
+            http_response("403 Forbidden", &error("AccessDenied")),
+            http_response("403 Forbidden", &error("ExpiredToken")),
         ])
         .await;
         let backend = anonymous_s3_backend(&endpoint);
         assert!(!backend.head("absent").await.unwrap());
-        assert!(backend.head("refused").await.is_err());
+        assert!(backend.head("failing").await.is_err());
+        assert!(!backend.head("refused").await.unwrap());
+        assert!(backend.get("refused", Some(1024)).await.unwrap().is_none());
+        assert!(backend.get("expired", Some(1024)).await.is_err());
+    }
+
+    #[test]
+    fn only_the_first_refusal_is_reported() {
+        let backend = memory_backend();
+        assert!(backend.first_refusal());
+        assert!(!backend.first_refusal());
+    }
+
+    #[test]
+    fn rejected_credentials_are_recognised_by_their_s3_code() {
+        let error =
+            |message: &str| opendal::Error::new(ErrorKind::PermissionDenied, message.to_string());
+        for code in [
+            "InvalidAccessKeyId",
+            "SignatureDoesNotMatch",
+            "ExpiredToken",
+            "InvalidToken",
+            "TokenRefreshRequired",
+            "RequestTimeTooSkewed",
+            "InvalidSecurity",
+        ] {
+            assert!(credentials_rejected(&error(&format!(
+                r#"S3Error {{ code: "{code}" }}"#
+            ))));
+        }
+        assert!(!credentials_rejected(&error(
+            r#"S3Error { code: "AccessDenied" }"#
+        )));
+        assert!(!credentials_rejected(&error("")));
+    }
+
+    #[test]
+    fn a_filesystem_permission_error_is_not_a_miss() {
+        let root = tempfile::tempdir().unwrap();
+        let config = FilesystemRemoteConfig {
+            root: root.path().to_path_buf(),
+            atomic_write_dir: root.path().join(".staging"),
+        };
+        let mut backend = OpenDalBackend::new(
+            create_filesystem_operator(&config).unwrap(),
+            "file://".into(),
+        );
+        backend.filesystem_root = Some(root.path().canonicalize().unwrap());
+        let refused = opendal::Error::new(ErrorKind::PermissionDenied, "EACCES");
+        assert!(!backend.refusal_means_absent(&refused));
+        let s3 = anonymous_s3_backend("http://127.0.0.1:1");
+        assert!(s3.refusal_means_absent(&refused));
+        let other = opendal::Error::new(ErrorKind::Unexpected, "boom");
+        assert!(!s3.refusal_means_absent(&other));
     }
 
     #[test]

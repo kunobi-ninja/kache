@@ -1973,6 +1973,7 @@ mod tests {
                 compression_level: Some(3),
                 s3_concurrency: Some(8),
                 prefetch_enabled: Some(false),
+                remote_key_listing: None,
                 remote_key_cache_refresh_secs: Some(900),
                 prefetch_max_keys: None,
                 prefetch_max_bytes: None,

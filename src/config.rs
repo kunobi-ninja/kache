@@ -16,6 +16,16 @@ pub const DEFAULT_S3_POOL_IDLE_SECS: u64 = 300;
 /// attribution that #618 is about. 0 disables a dimension.
 pub const DEFAULT_PREFETCH_ENABLED: bool = true;
 pub const DEFAULT_REMOTE_KEY_CACHE_REFRESH_SECS: u64 = 60;
+/// `remote_key_listing` when neither the environment nor the file sets it:
+/// on for a filesystem remote, where listing is a directory walk that needs
+/// no extra permission; off for S3, where it needs `s3:ListBucket` and costs a
+/// LIST per daemon every refresh, so readers need only `s3:GetObject`.
+pub fn default_remote_key_listing(remote: Option<&RemoteConfig>) -> bool {
+    matches!(
+        remote.map(|remote| &remote.backend),
+        Some(RemoteBackendConfig::Filesystem(_))
+    )
+}
 pub const DEFAULT_PREFETCH_MAX_KEYS: u64 = 2000;
 pub const DEFAULT_PREFETCH_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 pub const DEFAULT_PREFETCH_DEADLINE_SECS: u64 = 300;
@@ -149,6 +159,12 @@ pub struct Config {
     /// uploads remain enabled. Set via `KACHE_PREFETCH_ENABLED` or
     /// `[cache] prefetch_enabled`.
     pub prefetch_enabled: bool,
+    /// List the remote's keys (default false). Listing fills the daemon's key
+    /// cache, whose entries back a last-resort prefetch guess for crates no
+    /// manifest, shard or history covers, and finds packed-prefetch catalogs.
+    /// It needs `s3:ListBucket`. Off, readers need only `s3:GetObject`. Set
+    /// via `KACHE_REMOTE_KEY_LISTING` or `[cache] remote_key_listing`.
+    pub remote_key_listing: bool,
     /// Periodic remote key-cache refresh interval in seconds (default 60).
     /// `0` performs one initial population and disables periodic refreshes.
     /// Ignored when `prefetch_enabled` is false. Set via
@@ -783,6 +799,7 @@ pub(crate) struct CacheFileConfig {
     pub(crate) compression_level: Option<i32>,
     pub(crate) s3_concurrency: Option<u32>,
     pub(crate) prefetch_enabled: Option<bool>,
+    pub(crate) remote_key_listing: Option<bool>,
     pub(crate) remote_key_cache_refresh_secs: Option<u64>,
     pub(crate) prefetch_max_keys: Option<u64>,
     pub(crate) prefetch_max_bytes: Option<String>,
@@ -1124,6 +1141,7 @@ const IGNORE_ENV_GATED_VARS: &[&str] = &[
     "KACHE_COMPRESSION_LEVEL",
     "KACHE_S3_CONCURRENCY",
     "KACHE_PREFETCH_ENABLED",
+    "KACHE_REMOTE_KEY_LISTING",
     "KACHE_REMOTE_KEY_CACHE_REFRESH_SECS",
     "KACHE_REMOTE_RESTORE_TIMEOUT_SECS",
     "KACHE_REMOTE_NEGATIVE_TTL_SECS",
@@ -1191,6 +1209,7 @@ const ENV_FILE_KEYS: &[(&str, &str)] = &[
     ("KACHE_COMPRESSION_LEVEL", "cache.compression_level"),
     ("KACHE_S3_CONCURRENCY", "cache.s3_concurrency"),
     ("KACHE_PREFETCH_ENABLED", "cache.prefetch_enabled"),
+    ("KACHE_REMOTE_KEY_LISTING", "cache.remote_key_listing"),
     ("KACHE_PREFETCH_MAX_KEYS", "cache.prefetch_max_keys"),
     ("KACHE_PREFETCH_MAX_BYTES", "cache.prefetch_max_bytes"),
     (
@@ -1506,6 +1525,17 @@ impl Config {
                     .and_then(|config| config.cache.as_ref())
                     .and_then(|cache| cache.prefetch_enabled)
                     .unwrap_or(DEFAULT_PREFETCH_ENABLED)
+            });
+        // Resolved against the remote below when neither sets it.
+        let explicit_remote_key_listing = env_or_ignored("KACHE_REMOTE_KEY_LISTING", ignore_env)
+            .ok()
+            .map(|value| prefetch_enabled_from_env(&value))
+            .or_else(|| {
+                file_config
+                    .as_ref()
+                    .ok()
+                    .and_then(|config| config.cache.as_ref())
+                    .and_then(|cache| cache.remote_key_listing)
             });
 
         let remote_key_cache_refresh_secs =
@@ -1832,6 +1862,8 @@ impl Config {
                 }
             }
         };
+        let remote_key_listing = explicit_remote_key_listing
+            .unwrap_or_else(|| default_remote_key_listing(remote.as_ref()));
 
         Ok(Config {
             cache_dir,
@@ -1875,6 +1907,7 @@ impl Config {
             compression_level,
             s3_concurrency,
             prefetch_enabled,
+            remote_key_listing,
             remote_key_cache_refresh_secs,
             prefetch_max_keys,
             prefetch_max_bytes,
@@ -4258,6 +4291,60 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn remote_key_listing_defaults_to_on_only_for_a_filesystem_remote() {
+        let filesystem = RemoteConfig {
+            prefix: "artifacts".to_string(),
+            backend: RemoteBackendConfig::Filesystem(FilesystemRemoteConfig {
+                root: PathBuf::from("/cache"),
+                atomic_write_dir: PathBuf::from("/cache/.staging"),
+            }),
+        };
+        let s3 = RemoteConfig {
+            prefix: "artifacts".to_string(),
+            backend: RemoteBackendConfig::S3(S3RemoteConfig {
+                bucket: "bucket".to_string(),
+                endpoint: None,
+                region: "us-east-1".to_string(),
+                profile: None,
+                user_agent: None,
+            }),
+        };
+        assert!(default_remote_key_listing(Some(&filesystem)));
+        assert!(!default_remote_key_listing(Some(&s3)));
+        assert!(!default_remote_key_listing(None));
+    }
+
+    #[test]
+    fn remote_key_listing_is_off_unless_the_file_or_env_turns_it_on() {
+        let _lock = config_path_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let _config = set_kache_config_for_test(&config_path);
+
+        std::fs::write(&config_path, "[cache]\n").unwrap();
+        {
+            let _listing = NamedEnvGuard::remove("KACHE_REMOTE_KEY_LISTING");
+            assert!(!Config::load().unwrap().remote_key_listing);
+        }
+
+        std::fs::write(&config_path, "[cache]\nremote_key_listing = true\n").unwrap();
+        {
+            let _listing = NamedEnvGuard::remove("KACHE_REMOTE_KEY_LISTING");
+            assert!(Config::load().unwrap().remote_key_listing);
+        }
+        {
+            let _listing = NamedEnvGuard::set("KACHE_REMOTE_KEY_LISTING", "0");
+            assert!(!Config::load().unwrap().remote_key_listing);
+        }
+
+        std::fs::write(&config_path, "[cache]\nremote_key_listing = false\n").unwrap();
+        {
+            let _listing = NamedEnvGuard::set("KACHE_REMOTE_KEY_LISTING", "1");
+            assert!(Config::load().unwrap().remote_key_listing);
+        }
+    }
+
+    #[test]
     fn prefetch_enabled_env_value_truth_table() {
         assert!(!prefetch_enabled_from_env("0"));
         assert!(!prefetch_enabled_from_env("false"));
@@ -6047,6 +6134,7 @@ remote_key_cache_refresh_secs = 900
                 compression_level: Some(3),
                 s3_concurrency: Some(8),
                 prefetch_enabled: None,
+                remote_key_listing: None,
                 remote_key_cache_refresh_secs: None,
                 prefetch_max_keys: None,
                 prefetch_max_bytes: None,
@@ -6582,6 +6670,7 @@ remote_key_cache_refresh_secs = 900
             compression_level: 3,
             s3_concurrency: 16,
             prefetch_enabled: DEFAULT_PREFETCH_ENABLED,
+            remote_key_listing: false,
             remote_key_cache_refresh_secs: DEFAULT_REMOTE_KEY_CACHE_REFRESH_SECS,
             prefetch_max_keys: DEFAULT_PREFETCH_MAX_KEYS,
             prefetch_max_bytes: DEFAULT_PREFETCH_MAX_BYTES,
@@ -6651,6 +6740,7 @@ remote_key_cache_refresh_secs = 900
             compression_level: 3,
             s3_concurrency: 16,
             prefetch_enabled: DEFAULT_PREFETCH_ENABLED,
+            remote_key_listing: false,
             remote_key_cache_refresh_secs: DEFAULT_REMOTE_KEY_CACHE_REFRESH_SECS,
             prefetch_max_keys: DEFAULT_PREFETCH_MAX_KEYS,
             prefetch_max_bytes: DEFAULT_PREFETCH_MAX_BYTES,
@@ -6716,6 +6806,7 @@ remote_key_cache_refresh_secs = 900
             compression_level: 3,
             s3_concurrency: 16,
             prefetch_enabled: DEFAULT_PREFETCH_ENABLED,
+            remote_key_listing: false,
             remote_key_cache_refresh_secs: DEFAULT_REMOTE_KEY_CACHE_REFRESH_SECS,
             prefetch_max_keys: DEFAULT_PREFETCH_MAX_KEYS,
             prefetch_max_bytes: DEFAULT_PREFETCH_MAX_BYTES,
@@ -6800,6 +6891,7 @@ remote_key_cache_refresh_secs = 900
             compression_level: 3,
             s3_concurrency: 16,
             prefetch_enabled: DEFAULT_PREFETCH_ENABLED,
+            remote_key_listing: false,
             remote_key_cache_refresh_secs: DEFAULT_REMOTE_KEY_CACHE_REFRESH_SECS,
             prefetch_max_keys: DEFAULT_PREFETCH_MAX_KEYS,
             prefetch_max_bytes: DEFAULT_PREFETCH_MAX_BYTES,
@@ -7466,6 +7558,7 @@ exclude = ["src/generated/**", "vendor/problem/**"]
                 compression_level: Some(5),
                 s3_concurrency: None,
                 prefetch_enabled: None,
+                remote_key_listing: None,
                 remote_key_cache_refresh_secs: None,
                 prefetch_max_keys: None,
                 prefetch_max_bytes: None,

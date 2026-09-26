@@ -5,7 +5,7 @@ description: Every top-level Kache command, its purpose, and common flags
 
 Run `kache <command> --help` for the exact syntax in your installed version.
 
-`--json` emits one versioned JSON document for `list`, `stats`, `gc`, `clean`, `doctor`, `why-miss`, and `daemon status`. `clean --json` is a preview unless `--yes` is also present.
+`--json` emits one versioned JSON document for `list`, `stats`, `gc`, `clean`, `targets`, `doctor`, `why-miss`, and `daemon status`. `clean --json` is a preview unless `--yes` is also present.
 
 | Command | Purpose |
 | --- | --- |
@@ -26,6 +26,8 @@ Run `kache <command> --help` for the exact syntax in your installed version.
 | `why-miss` | Explain a crate's recent key change |
 | `report` | Produce text, Markdown, JSON, or trace output |
 | `config` | Open the configuration editor |
+| `login` | Log in to the planner with a Kunobi account |
+| `logout` | Log out of the planner and revoke the stored session |
 | `install-shims` | Create Unix compiler-name symlinks |
 | `test-runner` | Run a test binary as Cargo's target runner, paced by the scheduler |
 | `completions` | Generate shell completion scripts |
@@ -61,7 +63,7 @@ kache gc --stale-schema
 
 A bare run enforces configured size and age policies. `--max-age` runs the requested age policy. `--stale-schema` removes entries created with old or unrecorded key schemas and conflicts with `--max-age`.
 
-GC affects only the local store. It also sweeps each `[cache.volumes]` shard against that shard's own budget; see [Configuration: Volume shards](/docs/getting-started/configuration#volume-shards).
+GC affects only the local store. It also sweeps each `[cache.volumes]` shard against that shard's own budget; see [Configuration: Volume shards](/docs/getting-started/configuration#volume-shards). `--stale-schema` sweeps only the main store, and the `--json` document reports the main store's disk use and entry count.
 
 GC reports store bytes removed separately from bytes reclaimed on disk. It keeps an entry when its last store blob is still cloned into a build output, because unlinking that blob would free no disk and destroy a usable hit. This can leave the registered store size above `cache.local_max_size`; remove stale targets to reclaim the blocks. A size sweep leaves those held bytes out of its budget instead of evicting other entries to make up for them.
 
@@ -76,7 +78,7 @@ kache purge --crate-name serde
 kache purge
 ```
 
-With no crate name, `purge` wipes the entire local cache after confirmation.
+With no crate name, `purge` wipes the whole local store at once. It does not ask for confirmation.
 
 ## `kache clean`
 
@@ -91,9 +93,9 @@ kache clean --orphans --yes
 
 `clean` recursively finds `target/` directories below the current directory, including worktrees under `.worktrees/` and `.claude/`; other hidden directories are skipped. Sizes cover every profile, custom profiles and `<triple>/<profile>` directories included. The default opens a selector. Use `--dry-run` before a scripted `--yes` run.
 
-`--tracked` uses the bounded machine-local target registry populated by normal builds and restores. `--stale` filters by last use. A target whose worktree or workspace has been deleted qualifies however recently it was built; `--orphans` selects only those. A workspace counts as deleted only while the directory that held it still exists, so an unmounted volume does not.
+`--tracked` uses the bounded machine-local target registry populated by normal builds and restores. `--stale` filters by last use; without it, `--tracked` selects targets unused for 14 days. `--orphans` implies `--tracked`. A target whose worktree or workspace has been deleted qualifies however recently it was built; `--orphans` selects only those. A workspace counts as deleted only while the directory that held it still exists, so an unmounted volume does not.
 
-Cleanup rechecks each directory identity and removes only the derived target directory; missing, moved, replaced, current-workspace, and unsafe paths are skipped. A target a running build holds (its `.cargo-lock`) is skipped with `in use by a running build`, in every mode.
+Cleanup rechecks each directory's identity and removes only the derived target directory. It skips paths that are missing, moved, replaced or unsafe, and targets of the current workspace. A target that a running build holds (its `.cargo-lock`) is skipped with `in use by a running build`, in every mode.
 
 ## `kache targets`
 
@@ -102,7 +104,7 @@ kache targets
 kache targets --json
 ```
 
-`targets` lists every target directory builds through kache have used: its workspace, how long since a build last used it, the bytes it holds, and an estimate of what deleting it frees. The estimate leaves out blocks the target shares with the store or with other hardlinks, so it is what `kache clean` would give back. A target whose worktree has been deleted is marked, and the last line gives the command to remove those.
+`targets` lists every tracked target directory that still exists: its workspace, how long since a build last used it, the bytes it holds, and an estimate of what deleting it frees. The estimate leaves out blocks the target shares with the store or with other hardlinks, so it is what `kache clean` would give back. A target whose worktree has been deleted is marked. The text output ends with the command that removes those targets; `--json` gives it in `next`.
 
 ## `kache init`
 
@@ -110,12 +112,13 @@ kache targets --json
 kache init
 kache init --check
 kache init --no-service
+kache init --no-shell
 kache init --yes
 ```
 
-`--check` reports proposed changes without writing. `--no-service` skips login-service installation. When the service cannot be installed, such as on a Linux host without a systemd user session or a Windows account that Task Scheduler refuses, init reports why and starts the daemon directly.
+`--check` reports proposed changes without writing. `--no-service` skips login-service installation. `--no-shell` skips the C/C++ shell setup; Cargo's native dependencies are still configured. When the service cannot be installed, such as on a Linux host without a systemd user session or a Windows account that Task Scheduler refuses, init reports why and starts the daemon directly.
 
-Without a terminal, pass `--yes`. If stdin has no answers and Cargo is left unconfigured, init exits with an error. Besides `rustc-wrapper`, init adds `HOST_CC` / `HOST_CXX` / `CC_KNOWN_WRAPPER_CUSTOM` under Cargo `[env]` when those keys are absent. It never sets `CC` or `CXX`.
+Without a terminal, pass `--yes`. If stdin has no answers and Cargo is left unconfigured, init exits with an error. Besides `rustc-wrapper`, init adds `HOST_CC` / `HOST_CXX` / `CC_KNOWN_WRAPPER_CUSTOM` under Cargo `[env]` when those keys are absent. On Windows it adds only `CC_KNOWN_WRAPPER_CUSTOM`. It never sets `CC` or `CXX`.
 
 ## `kache doctor`
 
@@ -131,9 +134,9 @@ kache doctor --repair
 - `--purge-sccache` also removes sccache data and requires `--fix`.
 - `--verify` checks entries, blobs, and metadata.
 - `--checksums` also hashes blob contents and implies `--verify`.
-- `--repair` removes corrupted entries, prunes stale C/C++ memos, and compacts a large, sparse index when disk space allows. It implies `--verify`.
+- `--repair` removes corrupted entries, reconciles the index with the entries on disk, reclaims orphan blobs, prunes stale C/C++ memos, input predictions and old file hashes, and compacts a large, sparse index when disk space allows. It implies `--verify`.
 
-Review destructive options before running them.
+`--purge-sccache` and `--repair` delete data. Check what they will remove before running them.
 
 ## `kache sync`
 
@@ -225,7 +228,7 @@ kache stats --last-build --root "$PWD"
 
 `--last-build` shows the detailed report for the latest recorded activity session. Add `--root` to choose a build tree; without it, the latest event across all roots chooses the session. It cannot be combined with `--since`. With `--json`, the stats envelope contains a `report` object using the build report schema below.
 
-`kache report --record` also appends one JSON line to `telemetry/sessions.jsonl` in the cache dir: the report's summary and timing breakdown, and the machine's load average, CPUs and index size at that moment, with the root stored as a hash. The runtime dir a CI job deletes on exit is where the report reads its events; this line is what survives on the machine. `KACHE_RECORD_SESSIONS=1` or `[cache] record_sessions = true` makes every report record the same way without the flag, and appends each GC run to `telemetry/gc-runs.jsonl`; it is off by default. With neither, the command writes nothing.
+`kache report --record` also appends one JSON line to `telemetry/sessions.jsonl` in the cache dir. The line holds the report's summary and timing breakdown, and the machine's load average, CPUs and index size at that moment. The root is stored as a hash. The runtime dir a CI job deletes on exit is where the report reads its events; this line is what survives on the machine. `KACHE_RECORD_SESSIONS=1` or `[cache] record_sessions = true` makes every report record the same way without the flag, and appends each GC run to `telemetry/gc-runs.jsonl`; it is off by default. With neither, the command writes nothing.
 
 ## `kache telemetry`
 
@@ -257,7 +260,7 @@ The first build in a second clone or worktree has no earlier build of the crate 
 - Only its dependencies differ.
 - Both trees computed the same key. No key input differs, so the key is not why the crate missed.
 
-The cascade below it is walked against the builds the other tree used, so the crate that actually changed is named, with the crates above it shown on the `via:` path. A root whose key matches the other tree while its artifact differs is reported as not reproducible across build trees (JSON kind `path_only`). JSON carries the comparison in `checkout_comparison` and the other tree in `dependency_chain.baseline_root`.
+`why-miss` then walks the dependency cascade through the builds the other tree used. It names the crate that changed and shows the crates above it on the `via:` path. A root whose key matches the other tree while its artifact differs is reported as not reproducible across build trees (JSON kind `path_only`). JSON carries the comparison in `checkout_comparison` and the other tree in `dependency_chain.baseline_root`.
 
 Build trees are matched by Cargo's unit id. It is the same for a workspace member in every checkout of a project, and for a registry crate built the same way in unrelated projects. Kache records it only with `[cache] explain_miss` on, so both builds need it. A build of the crate in the same tree is always preferred.
 
@@ -286,15 +289,15 @@ kache report --format trace --output trace.json
 
 `--last-build` selects by the latest compiler event timestamp across the retained log, including events older than 24 hours. It includes only that root and session ID. For local or older events without session IDs, it infers a session from overlapping compiler activity and gaps shorter than five minutes, stopping at an event with a recorded ID. The report states which rule it used. `--root` limits the search to that tree and its descendants; the selected session still belongs to one exact root.
 
-A session can span concurrent or nearby Cargo commands. This flag does not identify one Cargo invocation. Cargo commands that do no compiler work produce no new events, running compiles have not been logged yet, and log rotation can remove the start of a session. An empty selection is an error.
+A session can span concurrent or nearby Cargo commands. This flag does not identify one Cargo invocation. A Cargo command that does no compiler work produces no new events. Compiles still running have not been logged yet. Log rotation can remove the start of a session. An empty selection is an error.
 
 The session report includes cache hits, misses, bypass reasons, restored bytes and the observed compiler wall span. Compile work avoided is an aggregate estimate, not elapsed build time saved. Remote transfer totals and GC are omitted because those logs cannot identify the selected session. Store inventory and deduplication totals still describe the whole cache.
 
 JSON exposes the selection in `meta.session` (`root`, optional `session_id`, `inferred`, `inactivity_secs`); trace output carries it as `session`. In session reports, `since_secs` and `since_hours` describe the lookback to the first retained compiler start; `meta.session` defines the selection.
 
-Every report format totals the wrapper's phases per crate: startup (process start to wrapper entry), key computation with the rustc dep-info pre-pass split out by time and run count, lookup, scheduler wait (flight join plus permit acquisition), restore or store, and the unattributed remainder. Unattributed is wrapper overhead minus every measured phase, where overhead excludes the compile on a compiled crate and is the whole wrapper time on a hit. Events written by wrappers before schema 17 report zero startup, dep-info and wait time.
+Every report format totals the wrapper's phases per crate: startup, key computation, lookup, scheduler wait, restore or store, and the unattributed remainder. Startup runs from process start to wrapper entry. Key computation splits out the rustc dep-info pre-pass by time and run count. Scheduler wait is the flight join plus permit acquisition. Unattributed is wrapper overhead minus every measured phase, where overhead excludes the compile on a compiled crate and is the whole wrapper time on a hit. Events written by wrappers before schema 17 report zero startup, dep-info and wait time.
 
-In the trace output each crate slice carries these numbers in its `args` and nests one `X` slice per phase on the same lane, in the order `startup`, `key` (with `dep-info` as its child), `lookup`, `wait`, `compile` on compiled crates, then `restore` or `store`. Phase offsets accumulate from the crate slice's start in that order; the wrapper records durations, not start times, so a phase sits where it lands in the sum. The gap after the last phase is the unattributed remainder. Durations are whole milliseconds, so a phase under 1 ms has no slice.
+In the trace output each crate slice carries these numbers in its `args`. It nests one `X` slice per phase on the same lane, in this order: `startup`, `key` (with `dep-info` as its child), `lookup`, `wait`, `compile` on compiled crates, then `restore` or `store`. Phase offsets accumulate from the crate slice's start in that order; the wrapper records durations, not start times, so a phase sits where it lands in the sum. The gap after the last phase is the unattributed remainder. Durations are whole milliseconds, so a phase under 1 ms has no slice.
 
 ## `kache telemetry push`
 
@@ -325,13 +328,14 @@ the existing daemon remote-check calls, including failed calls, IPC and daemon
 admission. It does not estimate time saved. A stale predicted key and its
 replacement retain separate observations. Recording adds no network request.
 
-Graceful daemon shutdown writes the active session's local summary after draining
-prefetch tasks. A timeout aborts remaining tasks and sets `incomplete: true`;
+An orderly daemon shutdown drains prefetch tasks, then writes the active
+session's local summary. A timeout aborts remaining tasks and sets `incomplete: true`;
 missing transfer outcomes then remain unknown. The summary records `shutdown`
 or `shutdown_timeout` as its closure reason. Shutdown does not publish an
-identity manifest. Normal inactivity or supersession summaries are conservative
-snapshots: pending tasks or log writes mark them incomplete. Full precision
-qualification requires an orderly shutdown summary after all producers drain.
+identity manifest. Summaries written after inactivity or supersession are
+snapshots, and pending tasks or log writes mark them incomplete. Complete
+precision figures need a summary from an orderly shutdown, after all producers
+drain.
 `kache stats` marks incomplete summaries as partial totals. Forced termination
 can prevent the final write.
 
@@ -389,7 +393,7 @@ kache login --device
 kache login --retrust
 ```
 
-Logs in to the configured planner with your Kunobi account, for a planner that requires authentication. It reads the planner's issuer and client id from `/.well-known/kunobi-auth`, trusts that planner, and stores a session the daemon refreshes quietly. `--device` prints a URL and a code for a machine without a browser. `--retrust` accepts a planner whose login issuer changed since it was first trusted. See [Planner authentication](/docs/getting-started/configuration#planner-authentication).
+Logs in to the configured planner with your Kunobi account, for a planner that requires authentication. It reads the planner's issuer and client id from `/.well-known/kunobi-auth`, trusts that planner, and stores a session that the daemon refreshes. `--device` prints a URL and a code for a machine without a browser. `--retrust` accepts a planner whose login issuer changed since it was first trusted. See [Planner authentication](/docs/getting-started/configuration#planner-authentication).
 
 ## `kache logout`
 
@@ -407,7 +411,7 @@ kache install-shims --from-path
 kache install-shims --force ~/.local/lib/kache/shims
 ```
 
-Unix only. Creates `cc`, `c++`, `gcc`, `g++`, `clang`, and `clang++` symlinks to Kache. With no directory argument the farm is `~/.local/lib/kache/shims`. `--from-path` also wraps compiler names already on `PATH` (`gcc-13`, target-prefixed drivers). Put the directory before the real compilers in `PATH`. When the directory then holds only Kache links, the run also writes a `.kache-shims` marker, and Kache skips everything in a marked directory when it looks for the real compiler. A directory that also holds other files, such as a real compiler, is left unmarked. See [C and C++](/docs/getting-started/c-cpp).
+Unix only. Creates `cc`, `c++`, `gcc`, `g++`, `clang`, and `clang++` symlinks to Kache. With no directory argument the farm is `~/.local/lib/kache/shims`. `--from-path` also wraps compiler names already on `PATH` (`gcc-13`, target-prefixed drivers). Put the directory before the real compilers in `PATH`. If the directory then holds only Kache links, `install-shims` also writes a `.kache-shims` marker. When Kache looks for the real compiler, it skips everything in a marked directory. A directory that also holds other files, such as a real compiler, is left unmarked. See [C and C++](/docs/getting-started/c-cpp).
 
 ## `kache test-runner`
 

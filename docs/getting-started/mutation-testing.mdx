@@ -14,7 +14,7 @@ cargo mutants
 
 cargo-mutants copies the source tree to a temporary directory and builds there, one build directory per `--jobs` job. Kache maps each build's workspace root to the same `<WORKSPACE>` sentinel, and applies that rule before the temporary-directory rule, so the copy's path never enters a cache key. The root comes from rustc's own arguments: the parent of the target directory Cargo passes in `--out-dir`, accepted only when a `Cargo.toml` sits there and the compiler's working directory is beneath it.
 
-Cargo's `-C metadata` and `-C extra-filename` hashes enter the key verbatim. For path packages inside the workspace, Cargo derives them from workspace-relative package identity, so they are the same in every copy. That is what makes cross-copy hits possible at all.
+Cargo's `-C metadata` and `-C extra-filename` hashes enter the key verbatim. For path packages inside the workspace, Cargo derives them from workspace-relative package identity, so they are the same in every copy and one copy can hit another's entries.
 
 ## What hits
 

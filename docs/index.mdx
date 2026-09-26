@@ -1,6 +1,6 @@
 ---
 title: Kache
-description: A local-first compiler cache for Rust and C/C++ builds
+description: A local-first compiler cache for Rust, C/C++ and CUDA builds
 ---
 
 Kache stores compiler outputs by content and reuses them across builds, repositories, and worktrees. The local cache works on its own. S3-compatible and filesystem remotes are optional.
@@ -19,19 +19,20 @@ Then enable it:
 kache init
 ```
 
-That's it. Keep running `cargo build` as usual; Kache now caches the compiler outputs.
+Keep running `cargo build` as usual; Kache now caches the compiler outputs.
 
 `kache init` sets Cargo's `rustc-wrapper` and installs a login service for the background cache. It asks before each change and backs up files it edits.
 
-[Other install methods](/docs/getting-started/installation) include Homebrew, APT, winget, and Nix. The [quick start](/docs/getting-started/quick-start) shows how to confirm cache hits. Comparing compiler caches? Read [Kache or sccache?](/docs/getting-started/comparison).
+[Other install methods](/docs/getting-started/installation) include Homebrew, APT, winget, and Nix. The [quick start](/docs/getting-started/quick-start) shows how to confirm cache hits. For a comparison with sccache, read [Kache or sccache?](/docs/getting-started/comparison).
 
 ## Current support
 
 | Area | Support |
 | --- | --- |
-| Rust libraries and build scripts | Linux, macOS, and Windows |
+| Rust libraries and build scripts | Linux, macOS, and Windows. Build-script runs are cached on Linux and macOS |
 | Rust executables | Enabled by default on Linux and macOS; disabled by default on Windows |
-| C and C++ object compilation | GCC, Clang, Apple Clang, and MSVC-compatible invocations that Kache can model safely |
+| C and C++ object compilation | GCC, Clang, Apple Clang, and clang-cl. MSVC `cl.exe` is not cached |
+| CUDA object compilation | Single-source `nvcc -c` and `-dc` |
 | Local cache | Content-addressed storage with automatic garbage collection |
 | Remote cache | S3-compatible and filesystem backends |
 | Build visibility | Live monitor, stats, miss explanations, and reports |

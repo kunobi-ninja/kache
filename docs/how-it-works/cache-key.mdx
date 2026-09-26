@@ -16,18 +16,19 @@ The exact set depends on the invocation. It can include:
 - recorded input-set predictions that substitute for the dep-info spawn on warm builds (`cache.input_predictions`)
 - code-generation flags, rustflags, and requested emit kinds
 - the contents of `--extern` dependencies
+- native static archives the unit links, found through `-L` directories, `-l` specs and `-C link-arg`
 - compile-time environment values rustc reports
 - native libc version and hashed CRT/startup objects for host-loaded Linux outputs
 - macOS SDK identity (version and build) for host-loaded Darwin outputs
 - configured salt, extra inputs, and declared environment inputs
 
-Host-loaded Linux and macOS links pass through if those runtime inputs cannot be resolved, rather than sharing a binary neither host pinned. rustc-bundled self-contained WebAssembly targets (`wasm32-unknown-unknown`, the WASI family, `wasm32v1-none`, `wasm64-unknown-unknown`) are cached; custom target specs, emscripten, and `link-self-contained=no` pass through.
+Host-loaded Linux and macOS links pass through if those runtime inputs cannot be resolved, so no host receives a binary built against runtime inputs the key did not record. rustc-bundled self-contained WebAssembly targets (`wasm32-unknown-unknown`, the WASI family, `wasm32v1-none`, `wasm64-unknown-unknown`) are cached; custom target specs, emscripten, and `link-self-contained=no` pass through.
 
-On macOS, a cached debug link gets ld64 `-oso_prefix` for `--out-dir`, so `N_OSO` object paths in the binary are not checkout-local.
+On macOS, every cached executable link gets ld64 `-oso_prefix` set to Cargo's profile directory, so `N_OSO` object paths in the binary are not checkout-local. A cached proc-macro link gets `-install_name @rpath/lib<crate>.dylib`.
 
 Incremental directory names and harmless local path spellings are excluded or normalized.
 
-The live implementation is the authority. Use `kache why-miss` and trace logging to see the components for a particular build.
+Use `kache why-miss` and trace logging to see the components for a particular build.
 
 Input predictions are enabled by default for eligible Rust units. Kache
 revalidates their recorded inputs and falls back to dependency discovery when
@@ -38,17 +39,16 @@ the record cannot be used. Set `KACHE_INPUT_PREDICTIONS=0` or
 
 `cargo clippy` runs workspace crates through `clippy-driver`, which Cargo
 composes with Kache as `kache clippy-driver rustc …`. Kache keys those units
-like any rustc unit and adds the Clippy version, the package's `Cargo.toml`
-(the `cargo` lint group reads it), the `.clippy.toml` or `clippy.toml` Clippy
-would load (found from `CLIPPY_CONF_DIR` or the crate's manifest directory
-upwards, keyed by content), and the lint arguments Cargo passes in
-`CLIPPY_ARGS`. A hit restores the outputs and replays the recorded
+like any rustc unit. It also adds the Clippy version, the lint arguments Cargo
+passes in `CLIPPY_ARGS`, the package's `Cargo.toml` (the `cargo` lint group
+reads it), and the content of the `.clippy.toml` or `clippy.toml` Clippy would
+load, found from `CLIPPY_CONF_DIR` or the crate's manifest directory upwards. A hit restores the outputs and replays the recorded
 diagnostics, so warnings appear exactly as on the first run. Other
 `RUSTC_WORKSPACE_WRAPPER` drivers stay uncached.
 
 ### Miri
 
-`cargo miri` runs no Rust compile through Kache. cargo-miri sets
+`cargo miri` sends no Rust compile through Kache. cargo-miri sets
 `RUSTC_WRAPPER` to itself and clears `RUSTC_WORKSPACE_WRAPPER`, and the
 environment variable overrides `build.rustc-wrapper` from Cargo's config, so
 Kache never sees the Miri compiles or the Miri sysroot build. It prints a
@@ -60,9 +60,9 @@ build.
 
 The first time a unit is built on a machine, Kache has no recorded closure to
 derive a key from. When no remote could hold the entry either, the miss is
-certain, so instead of spawning `rustc --emit=dep-info` to discover the
-closure before compiling, Kache compiles first and keys from the dep-info the
-compile emitted. Every input in that closure is checked against the build's
+certain. Kache then compiles first and keys from the dep-info the compile
+emitted, instead of spawning `rustc --emit=dep-info` to discover the closure
+before compiling. Every input in that closure is checked against the build's
 start time; an input written during the compile leaves the result unstored.
 Peers of the same unit in other target directories wait for this compile as
 they would for a pre-pass. `[cache] deferred_discovery = false` restores the
@@ -79,7 +79,7 @@ Kache maps known roots to stable sentinels before hashing and asks the compiler 
 
 Common mappings include the workspace, Cargo home, Rustup home, temporary directory, target directory, and configured base directories. Add a missing root with `KACHE_BASE_DIR` or `paths.base_dirs`.
 
-Do not choose an overly broad base directory. Normalization deliberately merges path identities; two genuinely different inputs must not map to the same sentinel.
+Do not choose an overly broad base directory. Normalization merges path identities, so two different inputs must not map to the same sentinel.
 
 Disable Rust path normalization for a local profiling or debugging session:
 
@@ -91,7 +91,7 @@ That puts real paths in debug information and makes the key local to those path 
 
 Coverage-instrumented Rust builds use real paths and a separate, path-local key namespace so coverage tools can find source files.
 
-Crates that trybuild builds under `target/tests/trybuild/` get the same treatment. trybuild passes `--cfg trybuild` to every one of them and compares rustc's rendered diagnostics against the checked-in `.stderr` snapshots after substituting the real crate, workspace, and registry directories, so a remapped path such as `/kache/home/...` or `/proc/self/cwd/...` would fail every snapshot. Those units still cache, keyed by their trybuild target directory.
+Crates that trybuild builds under `target/tests/trybuild/` get the same treatment. trybuild passes `--cfg trybuild` to every one of them. It compares rustc's rendered diagnostics against the checked-in `.stderr` snapshots after substituting the real crate, workspace, and registry directories, so a remapped path such as `/kache/home/...` or `/proc/self/cwd/...` would fail every snapshot. Those units still cache, keyed by their trybuild target directory.
 
 ## Debugger source maps
 
@@ -125,7 +125,7 @@ See [Configuration](/docs/getting-started/configuration) for syntax and safety l
 kache why-miss my_crate
 ```
 
-The command compares recent key material for that crate and prints changed groups. In a second checkout with no earlier build of the crate, it compares with the same unit built in another checkout. Groups are hashed after path normalization, so the checkout path alone does not change them. The exception is `remap` when path remapping is off: that group keys the checkout path on purpose. Any other group that differs between checkouts is a real input difference or a path that normalization missed. The same key in both checkouts means no key input differs.
+The command compares recent key material for that crate and prints changed groups. In a second checkout with no earlier build of the crate, it compares with the same unit built in another checkout. Groups are hashed after path normalization, so the checkout path alone does not change them. The exception is `remap` when path remapping is off: that group keys the checkout path on purpose. Any other group that differs between checkouts is a real input difference or a path that normalization missed.
 
 For individual components, run the trace command it suggests, typically:
 

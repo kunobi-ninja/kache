@@ -6,12 +6,12 @@ description: Measure isolated and concurrent builds with cold and warm caches
 ## CI coverage
 
 The [Perf gate](https://github.com/kunobi-ninja/kache/actions/workflows/perf-gate.yml)
-measures **hk and eza** on pull requests. Each subject runs Kache from the PR
+measures **hk and eza** on PRs. Each subject runs Kache from the PR
 and its merge base, sccache, and mbx sequentially on one runner.
 
 | Trigger | Subjects | Isolated samples per tool | Contention samples per tool |
 | --- | --- | --- | --- |
-| Same-repository PR, ready for review | hk, eza | 1 cold, 1 same-checkout warm, 1 cross-checkout warm | 1 cold + 1 warm batch |
+| Same-repository PR, ready for review | hk, eza | Kache head and base, each: 2 cold, 6 same-checkout warm, 6 cross-checkout warm. sccache and mbx: 1 cold, 1 same-checkout warm, 1 cross-checkout warm | 1 cold + 1 warm batch |
 | PR with the `bench` label **or** `[bench]` in its title | hk, eza | 2 cold, 6 same-checkout warm, 6 cross-checkout warm | 2 cold + 6 warm batches |
 | Nightly, 03:37 Europe/Zurich | hk, eza | 2 cold, 6 same-checkout warm, 6 cross-checkout warm | 2 cold + 6 warm batches |
 | Nightly | Firefox Linux/Windows, LLVM, SurrealDB, Lance, OpenDAL, cuda-oxide | One measurement per configured phase | — |
@@ -25,9 +25,9 @@ nightly schedule. Manual `all` excludes Firefox. Substrate is no longer a
 benchmark subject.
 
 The two Firefox/Windows arms run in their own workflow on the same nightly
-cron. Each takes five to six hours, and a workflow run counts as finished only
-when its slowest job is, so keeping them beside the Linux matrix held every
-other arm's telemetry behind them.
+cron. Each takes five to six hours. A workflow run finishes only when its
+slowest job does, so while they shared a workflow with the Linux matrix, every
+other arm's telemetry waited for them.
 
 | Subject | Kache | sccache | mbx |
 | --- | --- | --- | --- |
@@ -38,9 +38,9 @@ other arm's telemetry behind them.
 
 The Firefox sccache arm has its own workflow and its own schedule: weekly, and
 again whenever the pinned sccache version changes. sccache is pinned in
-`mise.toml`, so the arm measures the same binary every night while only Kache
-moves, and Kache against Kache is what the per-pull-request perf gate already
-reports. Running it separately also keeps its 75 minutes off the nightly's
+`mise.toml`, so a nightly arm would measure the same sccache binary every night
+while only Kache changed. The per-PR perf gate already compares Kache with
+itself. Running it separately also keeps its 75 minutes off the nightly's
 critical path, so nightly results reach the collector sooner. mbx tracks its
 latest release, so it stays nightly.
 
@@ -66,16 +66,17 @@ without a wrapper. The operating system's page cache is not flushed.
 
 The short suite fetches dependencies before timing. It alternates arm order,
 keeps each arm's store and paths separate, and measures a new cold seed every
-third sample. Other samples use `--retry`: their saved cold value is excluded
-from the cold sample count and duration telemetry. Each warm phase restores
+third sample. The other samples run with `--retry`, which restores the saved
+cold seed instead of building it. That reused cold value is left out of the
+cold sample count and duration telemetry. Each warm phase restores
 that seed and clears its build artifacts before starting.
 
 ## Reading a PR result
 
-The pull-request comment opens with one table: Kache base and head for each
-subject, as median times per build with the paired change. Timings for every
-tool, contention counters, disk use and the paired test sit in folded sections
-below it; with more than one sample, each time shows its range.
+The PR comment opens with one table: Kache base and head for each subject, as
+median times per build with the paired change. Timings for every tool,
+contention counters, disk use and the paired test sit in folded sections below
+it. With more than one sample, each time shows its range.
 `summary.json` carries the statistics; `samples.json` retains raw measurements,
 source/tool versions, arm order, and the head/base/instrument identities.
 Build logs and engine reports are retained for each sample.
@@ -84,10 +85,11 @@ Only Kache head versus base decides the PR verdict. Increased misses or
 passthroughs fail independently of elapsed time. A timing regression needs at
 least five paired samples, a paired-median bootstrap 95% interval entirely
 above +5%, and a median increase above 250 ms. A corresponding reduction is
-reported as an improvement. Other timing results are **inconclusive**. Every PR
-runs head and base six times, so both warm phases get a timing verdict; the two
-cold samples are reported without one. sccache and mbx run once, since they
-never decide the verdict. The bench label runs every tool six times.
+reported as an improvement. Other timing results are **inconclusive**. On every
+PR, head and base each take six samples of both warm phases, so both get a
+timing verdict. Their two cold samples are reported without one. sccache and
+mbx run once, since they never decide the verdict. With the `bench` label,
+every tool takes six samples.
 
 Intervals describe these samples on this runner. Shared-host load and samples
 reusing a cold seed can remain correlated. Confirm a candidate improvement in
@@ -118,14 +120,15 @@ just bench-sccache eza --warm-same-tree
 just bench-mbx hk --warm-same-tree
 just bench-mbx eza --warm-same-tree
 just bench-mbx hk-pull
+just perf-gate-local       # HEAD against its merge base, with the gate's verdict
 ```
 
-The complete short suite runs on Linux and needs sccache and mbx on PATH.
+The complete short suite runs on Linux. It skips the sccache or mbx arm when that tool is not on PATH.
 On macOS, pass `--skip-contention` to run its isolated builds. It refuses to overwrite its
 output directory; pass `--output <fresh-path>` after the sample count for another
-run. Run builds on an otherwise quiet host. Two minutes for a single build
-phase is not a two-minute CI budget: tool installation, compiling Kache,
-preparing the subject, and repetitions add to the job's elapsed time.
+run. Run builds on an otherwise quiet host. A CI job takes much longer than
+its build phases: tool installation, compiling Kache, preparing the subject,
+and repetitions all add to its elapsed time.
 
 Individual benchmark runs keep reports under `tmp/bench/<scenario>/` and archive
 completed runs in `runs/`. The short suite keeps `samples.json`, `summary.json`,
@@ -161,7 +164,8 @@ runs and exports it as `bench-eza-contention-full-features`. On the validation
 runner, sccache 0.15.0 failed OpenSSL's assembler generation in that variant;
 those results are invalid and excluded from the normal comparison.
 
-The final number in each arm enables (`1`) or disables (`0`) Kache's scheduler.
+The number after the comma in each `--arm` value enables (`1`) or disables (`0`)
+Kache's scheduler.
 Use `--parallelism 1`, `3`, or `6` to vary overlap while retaining the same six
 commands and independent targets. `--jobs-per-build` sets Cargo's parallelism
 inside each command; it does not change the scheduler's permit pool.
@@ -173,10 +177,10 @@ native compiler/preprocessor frontends. Sampling can miss short-lived processes.
 Cgroup measurements include other work inside that container, so compiling
 Kache or running tests alongside the measurement invalidates comparisons.
 
-The export includes `samples.json`, `summary.json`, `report.md`,
-`metrics.otlp.json`, and each phase's
-Cargo logs, raw Kache events, mbx session streams and Perfetto traces, and
-process samples in `result.json`. It records
+The export includes `samples.json`, `summary.json`, `report.md` and
+`metrics.otlp.json`. Each phase adds its Cargo logs, raw Kache events, mbx
+session streams, Perfetto traces, and process samples in `result.json`. The
+export records
 binary hashes, toolchain, source revision, and instrument hash. It reports
 compiler invocations, duplicate compilations of a cache key, and time spent
 computing keys, waiting for peers, and waiting for permits. Summed wait times
@@ -211,10 +215,10 @@ Use `--contention-samples 12` with `bench-short` for a longer local comparison,
 or `--skip-contention` to focus on isolated builds. To run only contention
 with all three tools, add `--sccache /path/to/sccache --mbx /path/to/mbx` to the
 standalone command. Compiler invocation and internal wait counters come from
-Kache events; other tools report their own cache statistics, with unavailable
-fields shown as unknown. mbx's `wrapper_phases_ns` contains exclusive phase
-durations; Kache's key timer includes dependency discovery, so those two
-timers must not be compared as though they described identical work.
+Kache events. Other tools report their own cache statistics, and fields they
+do not report show as unknown. mbx's `wrapper_phases_ns` holds exclusive phase
+durations, while Kache's key timer includes dependency discovery, so the two
+timers measure different work.
 
 ### Detailed phase tracing
 
@@ -228,9 +232,9 @@ their children; summing them double-counts that work.
 
 Outside the benchmark, set `KACHE_PHASE_TRACE_DIR=/tmp/kache-phases` when
 running Cargo through Kache. Each wrapper writes its own trace on return.
-This captures the wrapper's calling thread, excluding CLI startup and work
-inside child processes or other threads. Trace writing adds overhead, so use
-ordinary runs for performance comparisons. The benchmark marks traced runs
+The trace covers the wrapper's calling thread only: it leaves out CLI startup
+and work in child processes or other threads. Trace writing adds overhead, so
+compare performance on untraced runs. The benchmark marks traced runs
 as diagnostic and rejects missing or truncated traces.
 
 `kache report --format perfetto` remains the compact event-based view: its

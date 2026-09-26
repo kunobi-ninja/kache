@@ -17,4 +17,4 @@ Two cargo processes that miss the same crate still share one real compile when t
 
 ## Several test runs at once
 
-Test binaries can wait for the same pool. Set `kache test-runner` as Cargo's target runner and each test binary takes slots above a compile reserve of a quarter of the pool, at least one slot, until it exits. Builds started inside a running test use that test's slots. See [Test runner](/docs/getting-started/configuration#test-runner) to turn it on.
+Test binaries can wait for the same pool. Set `kache test-runner` as Cargo's target runner and each test binary takes slots until it exits. A quarter of the pool, at least one slot, stays reserved for compiles. Builds started inside a running test use that test's slots. See [Test runner](/docs/getting-started/configuration#test-runner) to turn it on.

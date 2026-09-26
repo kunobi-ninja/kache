@@ -168,7 +168,7 @@ impl DaemonCoordFile {
             pid: self.pid,
             build_epoch: self.build_epoch,
             phase,
-            updated_at_ms: now_millis(),
+            updated_at_ms: unix_time_ms(),
             control_version: self.control_version,
         };
         write_json_atomically(&self.path, &state)
@@ -222,13 +222,6 @@ fn daemon_state_path(socket_path: &Path) -> PathBuf {
     socket_path.with_extension("state.json")
 }
 
-fn now_millis() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
-
 fn write_json_atomically<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -276,7 +269,7 @@ fn daemon_state_is_recent(state: &DaemonCoordState) -> bool {
     // A timestamp in the future is not a fresh heartbeat, it is a clock that
     // moved: saturating to an age of zero would read a long-dead record as live
     // until the wall clock caught back up.
-    now_millis()
+    unix_time_ms()
         .checked_sub(state.updated_at_ms)
         .is_some_and(|age_ms| age_ms <= DAEMON_COORD_STALE_AFTER.as_millis() as u64)
 }
@@ -1039,7 +1032,7 @@ impl PackPrefetchContext {
         if deps.is_empty() {
             anyhow::bail!("packed-prefetch requires Cargo.lock dependencies");
         }
-        let mut shard_hashes = crate::shards::compute_shards(namespace, deps)
+        let mut shard_hashes = crate::shards::compute_shards(deps)
             .shards
             .into_iter()
             .map(|(hash, _)| hash)
@@ -1293,7 +1286,7 @@ impl EffectiveConfig {
             remote_error: config.remote_error.clone(),
             remote_key_cache_refresh_secs: config.remote_key_cache_refresh_secs,
             socket_path: config.socket_path().display().to_string(),
-            started_at_ms: now_millis(),
+            started_at_ms: unix_time_ms(),
         }
     }
 }
@@ -1756,6 +1749,7 @@ const fn default_transfer_schema() -> u32 {
     5
 }
 
+/// Ms since the Unix epoch (0 on a pre-epoch clock).
 fn unix_time_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2216,7 +2210,7 @@ impl ActivePlan {
         list_requests_at_install: u64,
         list_duration_ms_at_install: u64,
     ) -> Self {
-        let now = epoch_ms();
+        let now = unix_time_ms();
         Self {
             session_id,
             plan_id,
@@ -2238,7 +2232,7 @@ impl ActivePlan {
     /// Record a demanded key; returns true when adaptive cancellation should
     /// fire NOW (single false→true transition of the latch).
     fn record_demand(&mut self, key: &str) -> bool {
-        self.last_activity_ms = epoch_ms();
+        self.last_activity_ms = unix_time_ms();
         if self.demanded.insert(key.to_string()) {
             if self.candidates.contains(key) {
                 self.demanded_candidates.insert(key.to_string());
@@ -2267,7 +2261,7 @@ impl ActivePlan {
     }
 
     fn record_download(&mut self, key: &str, compressed_bytes: u64) {
-        self.last_activity_ms = epoch_ms();
+        self.last_activity_ms = unix_time_ms();
         self.downloaded.insert(key.to_string(), compressed_bytes);
         if self.demanded.contains(key) {
             self.used.insert(key.to_string());
@@ -2330,13 +2324,6 @@ pub(crate) fn should_cancel_prefetch(
     }
     let upper_bound_hits = demanded_candidates + downloaded_not_demanded;
     (upper_bound_hits as f64 / demanded as f64) < 0.3
-}
-
-fn epoch_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
 }
 
 // ── S3 Key Cache ─────────────────────────────────────────────────
@@ -3587,7 +3574,7 @@ impl Daemon {
             return Vec::new();
         };
         prune_in_flight(&mut map);
-        let now_ms = unix_ms();
+        let now_ms = unix_time_ms();
         let mut entries: Vec<InFlightEntry> = map
             .values()
             .map(|c| {
@@ -4979,7 +4966,7 @@ impl Daemon {
             return imported;
         };
         catalog_receipt.event.outcome = "validation_error".to_owned();
-        let now_ms = epoch_ms();
+        let now_ms = unix_time_ms();
         let catalog = match crate::remote_pack::decode_catalog_for_selector(
             &catalog_object.body,
             &catalog_ref.digest,
@@ -6060,7 +6047,7 @@ impl Daemon {
                     if plan.identity_key.is_some() {
                         existing.identity_key = plan.identity_key;
                     }
-                    existing.last_activity_ms = epoch_ms();
+                    existing.last_activity_ms = unix_time_ms();
                     return;
                 }
                 _ => slot.replace(plan),
@@ -6081,7 +6068,7 @@ impl Daemon {
         let prev = {
             let mut slot = self.active_plan.lock().unwrap_or_else(|p| p.into_inner());
             match slot.as_ref() {
-                Some(p) if epoch_ms().saturating_sub(p.last_activity_ms) >= inactivity_ms => {
+                Some(p) if unix_time_ms().saturating_sub(p.last_activity_ms) >= inactivity_ms => {
                     slot.take()
                 }
                 _ => None,
@@ -8026,7 +8013,7 @@ async fn shard_prefetch_for_deps(
     deps: &[(String, String)],
 ) -> anyhow::Result<usize> {
     let plan_started_at = Instant::now();
-    let shard_set = crate::shards::compute_shards(namespace, deps);
+    let shard_set = crate::shards::compute_shards(deps);
 
     tracing::info!(
         "shard prefetch: {} deps -> {} shards for namespace '{namespace}'",
@@ -8860,19 +8847,11 @@ pub fn send_prestage(config: &Config, target_dir: &Path) {
 /// with that PID is still alive — PID reuse must not resurrect a ghost.
 const IN_FLIGHT_MAX_AGE_MS: u64 = 6 * 60 * 60 * 1000;
 
-/// Ms since the Unix epoch (0 on a pre-epoch clock; entries then age out).
-fn unix_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
-
 /// Drop registry entries whose process is gone or whose age is absurd. Called
 /// on both the register and snapshot paths (kunobi-ninja/kache#131) — a
 /// wrapper killed by OOM or ^C never sends CompileFinished.
 fn prune_in_flight(map: &mut HashMap<u32, CompileStartedRequest>) {
-    let now = unix_ms();
+    let now = unix_time_ms();
     map.retain(|&pid, c| {
         now.saturating_sub(c.started_at_ms) <= IN_FLIGHT_MAX_AGE_MS && pid_alive(pid)
     });
@@ -10298,7 +10277,7 @@ mod tests {
     fn in_flight_registry_upserts_prunes_and_snapshots() {
         let dir = tempfile::tempdir().unwrap();
         let daemon = Daemon::new(test_config(dir.path()));
-        let now = unix_ms();
+        let now = unix_time_ms();
         // Use our own (certainly alive) pid so liveness pruning keeps it.
         let pid = std::process::id();
 
@@ -11245,7 +11224,7 @@ mod tests {
             pid: 1,
             build_epoch: build_epoch(),
             phase: DaemonPhase::Ready,
-            updated_at_ms: now_millis(),
+            updated_at_ms: unix_time_ms(),
             control_version: None,
         };
         assert!(daemon_state_is_recent(&fresh));
@@ -11255,7 +11234,7 @@ mod tests {
             pid: 1,
             build_epoch: build_epoch(),
             phase: DaemonPhase::Ready,
-            updated_at_ms: now_millis()
+            updated_at_ms: unix_time_ms()
                 .saturating_sub(DAEMON_COORD_STALE_AFTER.as_millis() as u64 * 2),
         };
         assert!(!daemon_state_is_recent(&stale));
@@ -11265,7 +11244,7 @@ mod tests {
             pid: 1,
             build_epoch: build_epoch(),
             phase: DaemonPhase::Ready,
-            updated_at_ms: now_millis() + DAEMON_COORD_STALE_AFTER.as_millis() as u64 * 2,
+            updated_at_ms: unix_time_ms() + DAEMON_COORD_STALE_AFTER.as_millis() as u64 * 2,
             control_version: None,
         };
         assert!(!daemon_state_is_recent(&future));
@@ -11408,7 +11387,7 @@ mod tests {
             pid: std::process::id(),
             build_epoch: 4242,
             phase: DaemonPhase::Starting,
-            updated_at_ms: now_millis(),
+            updated_at_ms: unix_time_ms(),
             control_version: None,
         };
         write_json_atomically(&state_path, &state).unwrap();
@@ -11437,7 +11416,7 @@ mod tests {
         // Starting, but the heartbeat went cold — a crashed starter, not a live one.
         state.phase = DaemonPhase::Starting;
         state.updated_at_ms =
-            now_millis().saturating_sub(DAEMON_COORD_STALE_AFTER.as_millis() as u64 * 2);
+            unix_time_ms().saturating_sub(DAEMON_COORD_STALE_AFTER.as_millis() as u64 * 2);
         write_json_atomically(&state_path, &state).unwrap();
         assert_eq!(starting_daemon_epoch(&config), None);
 
@@ -11455,7 +11434,7 @@ mod tests {
         let dead_pid = child.id();
         child.wait().unwrap();
 
-        state.updated_at_ms = now_millis();
+        state.updated_at_ms = unix_time_ms();
         state.pid = dead_pid;
         write_json_atomically(&state_path, &state).unwrap();
         assert_eq!(starting_daemon_epoch(&config), None);
@@ -11495,6 +11474,7 @@ mod tests {
 
     #[test]
     fn gc_v2_is_atomic_compatibility_gate_for_old_daemons() {
+        // Only the serde shape matters; the payloads are never read.
         #[allow(dead_code)]
         #[derive(Deserialize)]
         #[serde(rename_all = "snake_case")]
@@ -15694,7 +15674,7 @@ mod tests {
             object_override.as_deref().unwrap_or(&built.bytes),
         )
         .await;
-        let created_at_ms = epoch_ms();
+        let created_at_ms = unix_time_ms();
         let catalog = crate::remote_pack::PackCatalog {
             version: crate::remote_pack::CATALOG_VERSION,
             key_schema: crate::cache_key::CACHE_KEY_VERSION,
@@ -16640,7 +16620,7 @@ mod tests {
             });
             candidates.push((key.clone(), name.into(), daemon.entry_dir_for(&key)));
         }
-        let now = epoch_ms();
+        let now = unix_time_ms();
         let encoded = crate::remote_pack::encode_catalog(
             "prefix",
             crate::remote_pack::PackCatalog {
@@ -16996,7 +16976,7 @@ mod tests {
         )
         .unwrap();
         put_test_object(&backend, &built.object_key, &built.bytes).await;
-        let created_at_ms = epoch_ms();
+        let created_at_ms = unix_time_ms();
         let catalog = crate::remote_pack::PackCatalog {
             version: crate::remote_pack::CATALOG_VERSION,
             key_schema: crate::cache_key::CACHE_KEY_VERSION,
@@ -19113,7 +19093,7 @@ mod tests {
         namespace: &str,
         deps: &[(String, String)],
     ) -> (Arc<dyn crate::remote_backend::RemoteBackend>, usize) {
-        let shard_set = crate::shards::compute_shards(namespace, deps);
+        let shard_set = crate::shards::compute_shards(deps);
         assert!(
             shard_set.shards.len() >= 2,
             "test deps must span at least two shards"

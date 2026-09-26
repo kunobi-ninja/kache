@@ -772,7 +772,7 @@ pub struct EventTailer {
 
 impl EventTailer {
     /// Start at the current end of the log.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub fn new(path: PathBuf) -> Self {
         let file = File::open(&path).ok();
         let position = file
@@ -810,7 +810,7 @@ impl EventTailer {
     /// skipped — use [`EventTailer::poll_records`] for the mixed stream (all
     /// live consumers do; this narrow view is kept for the rotation/truncation
     /// tests and future builds-only consumers).
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub fn poll(&mut self) -> Result<Vec<BuildEvent>> {
         Ok(self
             .poll_records()?
@@ -1306,7 +1306,7 @@ pub fn rotate_transfers_if_needed(
 }
 
 /// Clear the event log.
-#[allow(dead_code)]
+#[cfg(test)]
 pub fn clear_events(event_log_path: &Path) -> Result<()> {
     if !event_log_path.exists() {
         return Ok(());
@@ -1320,8 +1320,6 @@ pub fn clear_events(event_log_path: &Path) -> Result<()> {
 
 /// Get event statistics.
 pub struct EventStats {
-    #[allow(dead_code)]
-    pub total: usize,
     pub local_hits: usize,
     pub prefetch_hits: usize,
     pub remote_hits: usize,
@@ -1395,7 +1393,6 @@ pub struct EventStats {
 
 pub fn compute_stats(events: &[BuildEvent]) -> EventStats {
     let mut stats = EventStats {
-        total: events.len(),
         local_hits: 0,
         prefetch_hits: 0,
         remote_hits: 0,
@@ -2253,7 +2250,6 @@ mod tests {
         ];
 
         let stats = compute_stats(&events);
-        assert_eq!(stats.total, 8);
         assert_eq!(stats.local_hits, 1);
         assert_eq!(stats.prefetch_hits, 1);
         assert_eq!(stats.remote_hits, 1);
@@ -2271,7 +2267,6 @@ mod tests {
     #[test]
     fn test_compute_stats_empty() {
         let stats = compute_stats(&[]);
-        assert_eq!(stats.total, 0);
         assert_eq!(stats.local_hits, 0);
     }
 

@@ -20,6 +20,7 @@ use crate::daemon;
 #[cfg(test)]
 use crate::events;
 use crate::events::{BuildEvent, EventRecord, EventResult, EventTailer, HeartbeatEvent};
+use crate::heartbeat::format_secs;
 use crate::since::SinceWindow;
 use crate::tui_sessions::{self, Analysis, Cause, Session, SessionState};
 
@@ -1250,7 +1251,7 @@ fn fmt_saved_ms(ms: u64) -> String {
     if ms < 1000 {
         return format!("{ms}ms");
     }
-    fmt_secs(ms / 1000)
+    format_secs(ms / 1000)
 }
 
 /// The Builds table: one row per session, running builds first, the selected
@@ -1392,11 +1393,15 @@ fn draw_in_flight(frame: &mut Frame, entries: &[crate::daemon::InFlightEntry], a
                     format!("{:<24}", e.crate_name),
                     Style::default().fg(Color::Yellow),
                 ),
-                Span::raw(format!(" {} elapsed", fmt_secs(e.elapsed_s))),
+                Span::raw(format!(" {} elapsed", format_secs(e.elapsed_s))),
             ];
             if let (Some(t), Some(eta)) = (e.typical_s, e.eta_s) {
                 spans.push(Span::styled(
-                    format!("  (typical {}, ETA {})", fmt_secs(t), fmt_secs(eta.max(1))),
+                    format!(
+                        "  (typical {}, ETA {})",
+                        format_secs(t),
+                        format_secs(eta.max(1))
+                    ),
                     Style::default().fg(Color::DarkGray),
                 ));
             }
@@ -1409,18 +1414,6 @@ fn draw_in_flight(frame: &mut Frame, entries: &[crate::daemon::InFlightEntry], a
         .collect();
     let block = Block::default().borders(Borders::ALL).title(" In flight ");
     frame.render_widget(Paragraph::new(lines).block(block), area);
-}
-
-/// `4m20s`-style compact seconds for the in-flight panel.
-fn fmt_secs(total: u64) -> String {
-    let (h, m, s) = (total / 3600, (total % 3600) / 60, total % 60);
-    if h > 0 {
-        format!("{h}h{m:02}m")
-    } else if m > 0 {
-        format!("{m}m{s:02}s")
-    } else {
-        format!("{s}s")
-    }
 }
 
 fn draw_stats_bar(frame: &mut Frame, state: &AppState, area: Rect) {
@@ -5309,6 +5302,7 @@ mod tests {
         assert_eq!(s.sessions[0].state, SessionState::Live);
         let screen = rendered_tab(&mut s, Tab::Build);
         assert!(screen.contains("running"), "{screen}");
+        assert!(screen.contains("5s elapsed"), "{screen}");
     }
 
     /// Render `tab` and return the raw buffer, for assertions on style.

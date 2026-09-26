@@ -889,7 +889,6 @@ impl RustcArgs {
     }
 
     /// Output filename stem (`crate_name` + optional `extra_filename`).
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn output_stem(&self) -> Option<String> {
         Some(format_crate_output_stem(
             self.crate_name.as_ref()?,

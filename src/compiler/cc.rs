@@ -300,8 +300,6 @@ enum CcArgBucket {
     ProbeKeyed,
     Preprocessor,
     RawKeyed,
-    #[allow(dead_code)]
-    ExtraHashFile,
     Artifact,
     NoObjectEffect,
     TooHard,
@@ -4654,7 +4652,7 @@ fn effective_source_date_epoch() -> Option<std::ffi::OsString> {
 /// accepted one, which would turn a failing compile into a cached success. Only
 /// when the build set nothing does kache pin its default `"0"`, unless the
 /// caller opted out.
-fn resolve_source_date_epoch(
+pub(super) fn resolve_source_date_epoch(
     build_value: Option<std::ffi::OsString>,
     passthrough: bool,
 ) -> Option<std::ffi::OsString> {

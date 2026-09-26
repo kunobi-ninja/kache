@@ -233,7 +233,7 @@ fn probe_linux(path: &Path) -> FsProbe {
 /// and — the reason that matters most — hard-coding them lets
 /// [`classify_linux_magic`] compile and be **tested on every platform** instead
 /// of only on Linux, the same way `link::classify_copy_restore` is.
-#[allow(dead_code)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod magic {
     pub const NFS: i64 = 0x0000_6969;
     pub const SMB: i64 = 0x0000_517B; // SMB1 via the old smbfs

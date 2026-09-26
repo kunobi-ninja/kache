@@ -32,6 +32,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::probe_memo::{self, Material};
+use kache_store::file_hash::hash_file;
 
 /// What the driver is asked to place, and which of it a key cannot do without.
 ///
@@ -257,7 +258,7 @@ fn probe_files(
     probes: FileProbes,
     place: impl Fn(&str) -> Option<PathBuf>,
 ) -> Result<BTreeMap<String, String>> {
-    probe_files_with_hash(probes, place, hash_placed)
+    probe_files_with_hash(probes, place, hash_file)
 }
 
 fn probe_files_with_hash(
@@ -287,16 +288,6 @@ fn probe_files_with_hash(
         }
     }
     Ok(resolved)
-}
-
-fn hash_placed(path: &Path) -> Result<String> {
-    let file = std::fs::File::open(path)
-        .with_context(|| format!("opening {} for hashing", path.display()))?;
-    let mut hasher = blake3::Hasher::new();
-    hasher
-        .update_reader(file)
-        .with_context(|| format!("reading {} for hashing", path.display()))?;
-    Ok(hasher.finalize().to_hex().to_string())
 }
 
 fn print_file_name(driver: &Path, name: &str) -> Option<PathBuf> {
@@ -1586,7 +1577,7 @@ fn hash_windows_runtime_libraries(
             .map(|directory| directory.join(name))
             .find(|path| path.is_file());
         if let Some(path) = found {
-            let digest = hash_placed(&path)
+            let digest = hash_file(&path)
                 .with_context(|| format!("hashing MSVC runtime library {}", path.display()))?;
             libraries.insert((*name).to_string(), digest);
         }
@@ -2036,7 +2027,7 @@ mod tests {
                 &[],
                 &[],
                 &[],
-                hash_placed,
+                hash_file,
             )
             .expect("production Windows probe should resolve the isolated fixture");
             assert_eq!(identity.linker, LINK_BANNER);
@@ -2116,7 +2107,7 @@ mod tests {
             &[],
             &[],
             &[],
-            hash_placed,
+            hash_file,
         )
         .expect("hosted Windows must expose an installed MSVC toolchain");
         assert!(!identity.linker.is_empty());
@@ -2172,8 +2163,8 @@ mod tests {
             unsafe { std::env::remove_var(name) };
         }
 
-        let direct = probe_linux_crt_objects(&driver, hash_placed).unwrap();
-        let memoized = probe_linux_crt_objects_memoized(&memo_dir, &driver, hash_placed).unwrap();
+        let direct = probe_linux_crt_objects(&driver, hash_file).unwrap();
+        let memoized = probe_linux_crt_objects_memoized(&memo_dir, &driver, hash_file).unwrap();
         assert_eq!(memoized, direct);
         assert_eq!(
             memoized.keys().collect::<Vec<_>>(),
@@ -2186,7 +2177,7 @@ mod tests {
         // would place; the memo must step aside.
         std::fs::write(lib.join("crtn.o"), "n").unwrap();
         assert!(crt_placement_memo(&memo_dir, &driver).is_none());
-        let refreshed = probe_linux_crt_objects_memoized(&memo_dir, &driver, hash_placed).unwrap();
+        let refreshed = probe_linux_crt_objects_memoized(&memo_dir, &driver, hash_file).unwrap();
         assert!(refreshed.contains_key("crtn.o"));
         assert!(crt_placement_memo(&memo_dir, &driver).is_some());
 
@@ -2194,11 +2185,11 @@ mod tests {
         // essentials must resolve.
         std::fs::remove_file(lib.join("libc.so")).unwrap();
         assert!(crt_placement_memo(&memo_dir, &driver).is_none());
-        assert!(probe_linux_crt_objects_memoized(&memo_dir, &driver, hash_placed).is_err());
+        assert!(probe_linux_crt_objects_memoized(&memo_dir, &driver, hash_file).is_err());
 
         // The search variables are part of the identity.
         std::fs::write(lib.join("libc.so"), "libc").unwrap();
-        let _ = probe_linux_crt_objects_memoized(&memo_dir, &driver, hash_placed).unwrap();
+        let _ = probe_linux_crt_objects_memoized(&memo_dir, &driver, hash_file).unwrap();
         assert!(crt_placement_memo(&memo_dir, &driver).is_some());
         unsafe { std::env::set_var("LIBRARY_PATH", "/opt/other") };
         assert!(crt_placement_memo(&memo_dir, &driver).is_none());
@@ -2299,7 +2290,7 @@ mod tests {
         std::fs::write(root.join("libc"), vec![2u8; 131073]).unwrap();
         let changed = run().0.unwrap();
         assert_ne!(changed["libc"], first["libc"]);
-        assert_eq!(changed["libc"], hash_placed(&root.join("libc")).unwrap());
+        assert_eq!(changed["libc"], hash_file(&root.join("libc")).unwrap());
         std::fs::remove_file(root.join("startup")).unwrap();
         assert!(
             run().0.is_err(),
@@ -2356,7 +2347,7 @@ mod tests {
         let Ok(driver) = which_cc() else {
             return;
         };
-        let Ok(objects) = probe_linux_crt_objects(&driver, hash_placed) else {
+        let Ok(objects) = probe_linux_crt_objects(&driver, hash_file) else {
             return;
         };
         assert!(
@@ -3804,12 +3795,12 @@ mod tests {
             &[root.path().to_path_buf()],
             &[],
             &["static=foo".to_string()],
-            hash_placed,
+            hash_file,
         )
         .unwrap();
         assert_eq!(
             hashed.get("link:0").map(String::as_str),
-            Some(hash_placed(&root.path().join("foo.lib")).unwrap().as_str())
+            Some(hash_file(&root.path().join("foo.lib")).unwrap().as_str())
         );
     }
 

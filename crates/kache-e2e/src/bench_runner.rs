@@ -100,6 +100,7 @@ use crate::phase::Phase;
 use crate::report;
 use crate::scenario::{MeasureSpec, ScenarioAssertSpec, Selectors};
 use crate::source;
+use crate::source::run;
 
 const SCCACHE_BENCH_CACHE_SIZE: &str = "80G";
 // Firefox can spend many minutes in non-cacheable link/Rust-LTO work. Keep the
@@ -2887,15 +2888,6 @@ fn key_stability(cold_raw: &serde_json::Value, warm_raw: &serde_json::Value) -> 
         stable,
         compared,
     }
-}
-
-/// Run a command with inherited stdio, failing on a non-zero exit.
-fn run(cmd: &mut Command) -> Result<()> {
-    let status = cmd.status().with_context(|| format!("spawning {cmd:?}"))?;
-    if !status.success() {
-        bail!("command failed ({status}): {cmd:?}");
-    }
-    Ok(())
 }
 
 /// Available bytes on the filesystem backing `path`, via `df -kP`.

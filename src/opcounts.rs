@@ -95,11 +95,6 @@ pub fn record_probe_run() {
 }
 
 /// Compiler probes recorded so far in this process.
-///
-/// `#[allow(dead_code)]`: the probe op-count assertion in the e2e
-/// harness is the production consumer and lands with the harness
-/// change; today only the unit test below reads it.
-#[allow(dead_code)]
 pub fn probe_runs() -> u32 {
     PROBE_RUNS.load(Ordering::Relaxed)
 }

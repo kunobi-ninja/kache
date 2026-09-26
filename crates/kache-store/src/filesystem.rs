@@ -109,9 +109,47 @@ pub fn retainer_from_sharing(size: u64, sharing: Sharing) -> BlobRetainer {
     }
 }
 
+/// Whether any execute bit is set. Always `false` off Unix, where files carry
+/// no execute bit.
+pub fn is_executable(metadata: &std::fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        false
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn is_executable_reads_any_execute_bit() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("f");
+        std::fs::write(&file, "x").unwrap();
+        for (mode, expected) in [
+            (0o644, false),
+            (0o600, false),
+            (0o755, true),
+            (0o700, true),
+            (0o010, true),
+        ] {
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(mode)).unwrap();
+            assert_eq!(
+                is_executable(&std::fs::metadata(&file).unwrap()),
+                expected,
+                "mode {mode:o}"
+            );
+        }
+    }
 
     #[test]
     fn retainer_from_sharing_treats_fully_cloned_as_unreclaimable() {

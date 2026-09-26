@@ -12,8 +12,6 @@
 //! UDS path. On Windows the path is translated to a named pipe under
 //! `\\.\pipe\` by `interprocess`.
 
-#![allow(dead_code)] // wired into daemon.rs incrementally; rm after migration
-
 use anyhow::{Context, Result};
 use std::path::Path;
 
@@ -126,27 +124,11 @@ pub fn socket_name(path: &Path) -> Result<Name<'static>> {
     }
 }
 
-/// Restrict a freshly bound Unix socket file to its owning user (`0600`).
-///
-/// Sockets are created with the process umask applied (typically leaving them
-/// group/world-traversable), which lets any local user attempt `connect(2)`
-/// unless the socket happens to live inside an already-private directory.
-/// Calling this right after binding makes the guarantee independent of the
-/// umask: only the daemon's own user can reach the socket file at all.
-/// Windows named pipes scope access through the kernel object DACL instead of
-/// file permissions, so this is Unix-only.
-#[cfg(unix)]
-pub fn restrict_socket_permissions(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-        .with_context(|| format!("restricting permissions on {}", path.display()))
-}
-
 /// Reject a connection whose peer is not the daemon's own user.
 ///
-/// Defense-in-depth behind [`restrict_socket_permissions`]: even if the socket
-/// file ends up reachable by others (nonstandard umask, relinked path, shared
-/// cache dir), every accepted connection is checked against the peer's
+/// Defense-in-depth behind the `0600` mode kunobi-daemon gives the socket: even
+/// if the socket file ends up reachable by others (nonstandard umask, relinked
+/// path, shared cache dir), every accepted connection is checked against the peer's
 /// effective UID via `SO_PEERCRED` (Linux) / `getpeereid` (macOS, BSDs).
 /// Fails closed when credentials cannot be determined — a peer we cannot
 /// authenticate is a peer we refuse. Windows named pipes carry peer identity
@@ -274,29 +256,6 @@ mod tests {
             .create_sync()
             .expect("bind listener");
         assert!(is_reachable(&path));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn restrict_socket_permissions_sets_owner_only_mode() {
-        // Bind a real listener (socket file created with the ambient umask),
-        // then verify the hardening helper pins the mode to 0600 regardless.
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("restricted.sock");
-        let name = socket_name(&path).unwrap();
-        let _listener = ListenerOptions::new()
-            .name(name)
-            .create_sync()
-            .expect("bind listener");
-        restrict_socket_permissions(&path).expect("restrict permissions");
-        let mode = std::os::unix::fs::PermissionsExt::mode(
-            &std::fs::metadata(&path).unwrap().permissions(),
-        );
-        assert_eq!(
-            mode & 0o777,
-            0o600,
-            "socket must be owner-only after hardening"
-        );
     }
 
     #[cfg(unix)]

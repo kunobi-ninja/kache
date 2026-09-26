@@ -984,23 +984,10 @@ pub(crate) fn nvcc_prefix_map_args(maps: &[NvccPrefixMap]) -> Result<Vec<String>
 /// `__DATE__`/`__TIME__` across rebuilds), unless opted out via
 /// `KACHE_NVCC_SOURCE_DATE_EPOCH=passthrough|wallclock|off`.
 fn nvcc_effective_source_date_epoch() -> Option<std::ffi::OsString> {
-    resolve_nvcc_source_date_epoch(
+    super::cc::resolve_source_date_epoch(
         std::env::var_os("SOURCE_DATE_EPOCH"),
         nvcc_source_date_epoch_passthrough(),
     )
-}
-
-/// Pure core of [`nvcc_effective_source_date_epoch`] — unit-testable
-/// without touching the process environment.
-fn resolve_nvcc_source_date_epoch(
-    build_value: Option<std::ffi::OsString>,
-    passthrough: bool,
-) -> Option<std::ffi::OsString> {
-    match build_value {
-        Some(v) => Some(v),
-        None if passthrough => None,
-        None => Some(std::ffi::OsString::from("0")),
-    }
 }
 
 fn nvcc_source_date_epoch_passthrough() -> bool {
@@ -2248,6 +2235,8 @@ mod tests {
             std::env::set_var("KACHE_NVCC_SOURCE_DATE_EPOCH", "wallclock");
         }
         let epoch = nvcc_effective_source_date_epoch();
+        unsafe { std::env::remove_var("KACHE_NVCC_SOURCE_DATE_EPOCH") };
+        let pinned = nvcc_effective_source_date_epoch();
         match previous_epoch {
             Some(value) => unsafe {
                 std::env::set_var("SOURCE_DATE_EPOCH", value);
@@ -2265,6 +2254,7 @@ mod tests {
             },
         }
         assert_eq!(epoch, None);
+        assert_eq!(pinned, Some(std::ffi::OsString::from("0")));
     }
 
     #[test]
@@ -2423,24 +2413,6 @@ mod tests {
         for other in ["", "yes", "0", "1", "passthroughx"] {
             assert!(!nvcc_epoch_opt_out(other), "{other:?} must pin");
         }
-    }
-
-    #[test]
-    fn epoch_resolution_prefers_build_pin_then_opt_out() {
-        use std::ffi::OsString;
-        assert_eq!(
-            resolve_nvcc_source_date_epoch(Some(OsString::from("12345")), false),
-            Some(OsString::from("12345"))
-        );
-        assert_eq!(
-            resolve_nvcc_source_date_epoch(Some(OsString::from("12345")), true),
-            Some(OsString::from("12345"))
-        );
-        assert_eq!(resolve_nvcc_source_date_epoch(None, true), None);
-        assert_eq!(
-            resolve_nvcc_source_date_epoch(None, false),
-            Some(OsString::from("0"))
-        );
     }
 
     #[test]

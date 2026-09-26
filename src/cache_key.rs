@@ -4640,7 +4640,8 @@ impl<'a> EnvDepPaths<'a> {
     /// [`out_dir_relative_suffix`]. `None` when `OUT_DIR` cannot anchor the
     /// test, which then never resolves the value.
     fn out_dir_suffix(&self, value: &EnvDepValue<'_>) -> Option<String> {
-        out_dir_relative_suffix(value.probe(), self.out_probe()?)
+        let out_probe = self.out_probe()?;
+        out_dir_relative_suffix(value.probe(), out_probe)
     }
 
     /// True when the value is a path located under the current build's

@@ -2124,6 +2124,7 @@ dependencies = [
  "dirs",
  "filetime",
  "find-msvc-tools",
+ "foldhash 0.2.0",
  "futures",
  "glob",
  "home",

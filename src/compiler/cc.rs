@@ -5465,6 +5465,17 @@ fn digest_cc_shadowing_names(
     parsed: &CcArgs,
     names: &std::collections::BTreeSet<PathBuf>,
 ) -> Result<String> {
+    digest_cc_shadowing_names_stamped(parsed, names).map(|(digest, _)| digest)
+}
+
+/// [`digest_cc_shadowing_names`], with the stamps of every directory it
+/// listed when all of them can vouch for their listing (see
+/// [`CcListingStamp`]), so a later check can confirm the digest without
+/// listing again.
+fn digest_cc_shadowing_names_stamped(
+    parsed: &CcArgs,
+    names: &std::collections::BTreeSet<PathBuf>,
+) -> Result<(String, Option<CcListingStamps>)> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let dirs = cc_user_include_dirs(parsed, &cwd);
     let mut hasher = blake3::Hasher::new();
@@ -5483,7 +5494,63 @@ fn digest_cc_shadowing_names(
         }
         hasher.update(b"\n");
     }
-    Ok(hasher.finalize().to_hex().to_string())
+    Ok((
+        hasher.finalize().to_hex().to_string(),
+        listings.stamps(&dirs),
+    ))
+}
+
+/// What a directory looked like just before its listing was read: absent, or
+/// present with this fingerprint. Creating, removing or renaming an entry
+/// sets a directory's mtime to the current time, so an unchanged fingerprint
+/// means an unchanged listing, provided the mtime was already older than the
+/// read by more than any filesystem's timestamp granularity. A directory
+/// modified more recently than that has no stamp and is listed again. The
+/// fingerprint also holds the ctime, which moves when anything resets the
+/// mtime by hand.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CcListingStamp {
+    Absent,
+    Present(crate::cache_key::FileFingerprint),
+}
+
+/// Each listed directory with its stamp.
+type CcListingStamps = Vec<(PathBuf, CcListingStamp)>;
+
+/// Two seconds covers the coarsest directory timestamps in use (FAT's).
+const CC_LISTING_SETTLED_NS: i64 = 2_000_000_000;
+
+impl CcListingStamp {
+    /// The stamp of `directory` now, or `None` when it cannot vouch for a
+    /// listing read right after it.
+    fn take(directory: &Path) -> Option<Self> {
+        let read_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_nanos();
+        let read_at = i64::try_from(read_at).ok()?;
+        match crate::cache_key::FileFingerprint::from_path(directory) {
+            Ok(fingerprint) if fingerprint.mtime_ns < read_at - CC_LISTING_SETTLED_NS => {
+                Some(Self::Present(fingerprint))
+            }
+            Ok(_) => None,
+            Err(_) => match std::fs::metadata(directory) {
+                Err(error) if error.kind() == ErrorKind::NotFound => Some(Self::Absent),
+                _ => None,
+            },
+        }
+    }
+
+    /// Whether `directory` still looks exactly as stamped.
+    fn holds(&self, directory: &Path) -> bool {
+        match self {
+            Self::Absent => {
+                std::fs::metadata(directory).is_err_and(|error| error.kind() == ErrorKind::NotFound)
+            }
+            Self::Present(fingerprint) => crate::cache_key::FileFingerprint::from_path(directory)
+                .is_ok_and(|now| now == *fingerprint),
+        }
+    }
 }
 
 /// Index of the first user include directory that provides `name`, stopping
@@ -5505,15 +5572,33 @@ fn cc_first_include_dir_providing(dirs: &[PathBuf], name: &Path) -> Result<Optio
 /// libgit2. A name with a directory part (`sys/types.h`) is listed by path.
 #[derive(Default)]
 struct CcDirectoryListings {
-    listings: HashMap<PathBuf, Option<CcDirectoryListing>>,
-    by_position: Vec<Option<Option<CcDirectoryListing>>>,
+    listings: foldhash::HashMap<PathBuf, CcStampedListing>,
+    by_position: Vec<Option<CcStampedListing>>,
 }
 
 struct CcDirectoryListing {
-    names: HashSet<std::ffi::OsString>,
+    names: foldhash::HashSet<std::ffi::OsString>,
     /// Lower-cased names, so a case-insensitive filesystem's answer can be
     /// confirmed with one `stat` instead of assumed from the exact spelling.
-    folded: HashSet<String>,
+    /// `None` for a directory shown to be case-sensitive, where only the
+    /// exact spelling resolves.
+    folded: Option<foldhash::HashSet<String>>,
+}
+
+/// A listing, or its absence, with the stamp taken just before it was read.
+struct CcStampedListing {
+    listing: Option<CcDirectoryListing>,
+    stamp: Option<CcListingStamp>,
+}
+
+impl CcStampedListing {
+    fn read(directory: &Path) -> Result<Self> {
+        let stamp = CcListingStamp::take(directory);
+        Ok(Self {
+            listing: CcDirectoryListing::read(directory)?,
+            stamp,
+        })
+    }
 }
 
 impl CcDirectoryListing {
@@ -5522,13 +5607,16 @@ impl CcDirectoryListing {
     fn read(directory: &Path) -> Result<Option<Self>> {
         match std::fs::read_dir(directory) {
             Ok(entries) => {
-                let mut names = HashSet::new();
-                let mut folded = HashSet::new();
+                let mut names = foldhash::HashSet::default();
                 for entry in entries {
-                    let name = entry?.file_name();
-                    folded.insert(name.to_string_lossy().to_lowercase());
-                    names.insert(name);
+                    names.insert(entry?.file_name());
                 }
+                let folded = (!Self::case_sensitive(directory, &names)).then(|| {
+                    names
+                        .iter()
+                        .map(|name| name.to_string_lossy().to_lowercase())
+                        .collect()
+                });
                 Ok(Some(Self { names, folded }))
             }
             Err(error)
@@ -5544,19 +5632,45 @@ impl CcDirectoryListing {
         }
     }
 
+    /// Whether `directory` resolves only exact spellings: an entry's name
+    /// with its ASCII letters case-swapped is not in the listing and does not
+    /// resolve. Anything else, including a listing with no ASCII letter to
+    /// swap, counts as case-insensitive.
+    fn case_sensitive(directory: &Path, names: &foldhash::HashSet<std::ffi::OsString>) -> bool {
+        let Some(swapped) = names.iter().find_map(|name| {
+            let name = name.to_str()?;
+            name.bytes().any(|b| b.is_ascii_alphabetic()).then(|| {
+                name.chars()
+                    .map(|c| {
+                        if c.is_ascii_lowercase() {
+                            c.to_ascii_uppercase()
+                        } else {
+                            c.to_ascii_lowercase()
+                        }
+                    })
+                    .collect::<String>()
+            })
+        }) else {
+            return false;
+        };
+        !names.contains(OsStr::new(&swapped))
+            && std::fs::symlink_metadata(directory.join(&swapped))
+                .is_err_and(|error| error.kind() == ErrorKind::NotFound)
+    }
+
     /// Whether `directory`, which this lists, has an entry named `file_name`.
     fn provides(&self, directory: &Path, file_name: &OsStr) -> Result<bool> {
         if self.names.contains(file_name) {
             return Ok(true);
         }
+        let Some(folded) = &self.folded else {
+            return Ok(false);
+        };
         // A case-insensitive filesystem (macOS, Windows, but also a casefold
         // ext4 or a mounted share on Linux) resolves `foo.h` to `Foo.h`; the
         // listing does not. When only the case differs, ask the filesystem,
         // which is what the compiler does.
-        if self
-            .folded
-            .contains(&file_name.to_string_lossy().to_lowercase())
-        {
+        if folded.contains(&file_name.to_string_lossy().to_lowercase()) {
             return match std::fs::symlink_metadata(directory.join(file_name)) {
                 Ok(_) => Ok(true),
                 Err(error)
@@ -5581,10 +5695,10 @@ impl CcDirectoryListings {
         let listing = match self.listings.entry(directory.to_path_buf()) {
             std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
             std::collections::hash_map::Entry::Vacant(entry) => {
-                entry.insert(CcDirectoryListing::read(directory)?)
+                entry.insert(CcStampedListing::read(directory)?)
             }
         };
-        match listing {
+        match &listing.listing {
             Some(listing) => listing.provides(directory, file_name),
             None => Ok(false),
         }
@@ -5603,12 +5717,26 @@ impl CcDirectoryListings {
         }
         let slot = &mut self.by_position[position];
         if slot.is_none() {
-            *slot = Some(CcDirectoryListing::read(directory)?);
+            *slot = Some(CcStampedListing::read(directory)?);
         }
-        match slot.as_ref().and_then(Option::as_ref) {
+        match slot.as_ref().and_then(|stamped| stamped.listing.as_ref()) {
             Some(listing) => listing.provides(directory, file_name),
             None => Ok(false),
         }
+    }
+
+    /// Every directory listed so far with its stamp; `None` when any of them
+    /// has none. `dirs` is the search order `by_position` indexes.
+    fn stamps(&self, dirs: &[PathBuf]) -> Option<CcListingStamps> {
+        let positioned = self
+            .by_position
+            .iter()
+            .zip(dirs)
+            .filter_map(|(slot, dir)| slot.as_ref().map(|stamped| (dir, stamped)));
+        positioned
+            .chain(self.listings.iter())
+            .map(|(dir, stamped)| Some((dir.clone(), stamped.stamp.clone()?)))
+            .collect()
     }
 }
 
@@ -6099,15 +6227,23 @@ pub struct CcCompiler {
     /// cc key probes and the real compiler invocation.
     base_dirs: Vec<String>,
     pending_preprocess_memo: RefCell<Option<PendingCcPreprocessMemo>>,
-    /// The shadowing digest folded into the key, with the read set it was
-    /// resolved from, so the publish-time recheck can reproduce it exactly.
-    /// The include digest folded into the key, and the shadowing names it
-    /// was computed over (`None` when the directories were walked).
-    pending_include_dir_digest:
-        RefCell<Option<(String, Option<std::collections::BTreeSet<PathBuf>>)>>,
+    /// The include digest folded into the key, so the publish-time recheck
+    /// can reproduce it exactly.
+    pending_include_dir_digest: RefCell<Option<PendingIncludeDirDigest>>,
     /// The last key bound itself to this checkout's roots. `execute` stores an
     /// object that embeds a raw root only under such a key.
     key_path_bound: Cell<bool>,
+}
+
+/// See [`CcCompiler::include_dir_names_still_match`].
+struct PendingIncludeDirDigest {
+    digest: String,
+    /// The shadowing names the digest was computed over; `None` when the
+    /// directories were walked.
+    names: Option<std::collections::BTreeSet<PathBuf>>,
+    /// Stamps of the directories the digest listed, when all could vouch
+    /// for their listing.
+    stamps: Option<CcListingStamps>,
 }
 
 const C_FAMILY_DRIVERS: [(&str, ToolFamily); 7] = [
@@ -6318,17 +6454,24 @@ impl CcCompiler {
     /// under the old key.
     pub(crate) fn include_dir_names_still_match(&self, parsed: &CcArgs) -> bool {
         let pending = self.pending_include_dir_digest.borrow();
-        let Some((digest, names)) = pending.as_ref() else {
+        let Some(pending) = pending.as_ref() else {
             return false;
         };
+        // Directories whose stamps still hold list as they did for the key,
+        // so the digest over them is unchanged.
+        if let Some(stamps) = &pending.stamps
+            && stamps.iter().all(|(dir, stamp)| stamp.holds(dir))
+        {
+            return true;
+        }
         // Recompute the way the key did, over the same names. Resolving
         // against a different set of names than the key used would compare
         // two unrelated digests and refuse every store.
-        let now = match names {
+        let now = match &pending.names {
             Some(names) => digest_cc_shadowing_names(parsed, names),
             None => digest_cc_include_dir_names(parsed),
         };
-        now.is_ok_and(|now| now == *digest)
+        now.is_ok_and(|now| now == pending.digest)
     }
 
     /// Does this argv invoke a C-family compiler?
@@ -7135,14 +7278,21 @@ impl CcCompiler {
         let names = read_inputs
             .as_deref()
             .map(|inputs| cc_shadowing_names(parsed, inputs));
-        let (include_dir_digest, include_dir_mode) = match &names {
-            Some(names) => (digest_cc_shadowing_names(parsed, names)?, "resolved"),
-            None => (digest_cc_include_dir_names(parsed)?, "walked"),
+        let (include_dir_digest, stamps, include_dir_mode) = match &names {
+            Some(names) => {
+                let (digest, stamps) = digest_cc_shadowing_names_stamped(parsed, names)?;
+                (digest, stamps, "resolved")
+            }
+            None => (digest_cc_include_dir_names(parsed)?, None, "walked"),
         };
         drop(trace_shadowing);
         self.pending_include_dir_digest
             .borrow_mut()
-            .replace((include_dir_digest.clone(), names));
+            .replace(PendingIncludeDirDigest {
+                digest: include_dir_digest.clone(),
+                names,
+                stamps,
+            });
         hasher.update(b"include_dir_names:");
         hasher.update(include_dir_digest.as_bytes());
         hasher.update(b"\n");
@@ -14469,6 +14619,121 @@ mod tests {
         assert!(compiler.include_dir_names_still_match(&parse()));
     }
 
+    /// Set a directory's mtime ten seconds back, so it reads as settled.
+    #[cfg(unix)]
+    fn settle(dir: &Path) {
+        let past = std::time::SystemTime::now() - std::time::Duration::from_secs(10);
+        fs::File::open(dir).unwrap().set_modified(past).unwrap();
+    }
+
+    /// The store-time recheck trusts the stamps of settled directories, and
+    /// a header added after the key moves its directory's stamp, so the
+    /// recheck still refuses the store.
+    #[cfg(unix)]
+    #[test]
+    fn a_stamped_recheck_notices_a_header_added_after_the_key() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        fs::create_dir(&first).unwrap();
+        fs::create_dir(&second).unwrap();
+        let read = second.join("header.h");
+        fs::write(&read, "#define A 1\n").unwrap();
+        let source = temp.path().join("unit.c");
+        fs::write(&source, "#include \"header.h\"\nint x;\n").unwrap();
+        let parsed = CcArgs::parse(&s(&[
+            "cc",
+            "-c",
+            source.to_str().unwrap(),
+            "-I",
+            first.to_str().unwrap(),
+            "-I",
+            second.to_str().unwrap(),
+        ]))
+        .unwrap();
+        let names = cc_shadowing_names(&parsed, &[source.clone(), read]);
+        let compiler = CcCompiler::new();
+        let key = |compiler: &CcCompiler| {
+            let (digest, stamps) = digest_cc_shadowing_names_stamped(&parsed, &names).unwrap();
+            let stamped = stamps.is_some();
+            compiler
+                .pending_include_dir_digest
+                .replace(Some(PendingIncludeDirDigest {
+                    digest,
+                    names: Some(names.clone()),
+                    stamps,
+                }));
+            stamped
+        };
+
+        assert!(!key(&compiler), "just-created directories cannot vouch");
+        assert!(compiler.include_dir_names_still_match(&parsed));
+
+        for dir in [&first, &second, &temp.path().to_path_buf()] {
+            settle(dir);
+        }
+        assert!(
+            key(&compiler),
+            "settled directories vouch for their listings"
+        );
+        assert!(compiler.include_dir_names_still_match(&parsed));
+
+        fs::write(first.join("header.h"), "#define A 2\n").unwrap();
+        assert!(
+            !compiler.include_dir_names_still_match(&parsed),
+            "a shadowing header added after the key must refuse the store"
+        );
+    }
+
+    /// A stamp holds while its directory is untouched, and an absent
+    /// directory's stamp breaks when the directory appears.
+    #[cfg(unix)]
+    #[test]
+    fn listing_stamps_break_on_any_entry_change() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("include");
+        let absent = CcListingStamp::take(&dir).unwrap();
+        assert_eq!(absent, CcListingStamp::Absent);
+        fs::create_dir(&dir).unwrap();
+        assert!(!absent.holds(&dir));
+        assert!(CcListingStamp::take(&dir).is_none(), "modified just now");
+
+        fs::write(dir.join("a.h"), "").unwrap();
+        settle(&dir);
+        let stamp = CcListingStamp::take(&dir).unwrap();
+        assert!(stamp.holds(&dir));
+        fs::remove_file(dir.join("a.h")).unwrap();
+        assert!(!stamp.holds(&dir));
+    }
+
+    /// The case probe agrees with the filesystem, and a listing it cannot
+    /// probe keeps the case-folded names.
+    #[test]
+    fn a_directory_listing_probes_its_case_sensitivity() {
+        let temp = tempfile::tempdir().unwrap();
+        let names = |entries: &[&str]| -> foldhash::HashSet<std::ffi::OsString> {
+            entries.iter().map(std::ffi::OsString::from).collect()
+        };
+        fs::write(temp.path().join("Foo.h"), "").unwrap();
+        assert_eq!(
+            CcDirectoryListing::case_sensitive(temp.path(), &names(&["Foo.h"])),
+            temp.path().join("fOO.H").symlink_metadata().is_err()
+        );
+        assert!(!CcDirectoryListing::case_sensitive(
+            temp.path(),
+            &names(&["12", "3"])
+        ));
+        assert!(!CcDirectoryListing::case_sensitive(
+            temp.path(),
+            &names(&["a.h", "A.H"])
+        ));
+        let listing = CcDirectoryListing::read(temp.path()).unwrap().unwrap();
+        assert_eq!(
+            listing.folded.is_some(),
+            temp.path().join("fOO.H").symlink_metadata().is_ok()
+        );
+    }
+
     /// The case-folded fallback asks the filesystem only about a name whose
     /// spelling differs from the listing, and treats "not there" as absence.
     #[test]
@@ -14525,10 +14790,15 @@ mod tests {
         let include = dir.path().join("include");
         std::fs::create_dir(&include).unwrap();
         std::fs::write(include.join("Foo.h"), "").unwrap();
-        let mut listings = CcDirectoryListings::default();
-        assert!(listings.contains(&include, OsStr::new("Foo.h")).unwrap());
+        // A listing with case-folded names, as a case-insensitive directory
+        // gets, so the stat that confirms a folded match runs on any host.
+        let listing = CcDirectoryListing {
+            names: [std::ffi::OsString::from("Foo.h")].into_iter().collect(),
+            folded: Some(["foo.h".to_string()].into_iter().collect()),
+        };
+        assert!(listing.provides(&include, OsStr::new("Foo.h")).unwrap());
         std::fs::set_permissions(&include, std::fs::Permissions::from_mode(0o000)).unwrap();
-        let result = listings.contains(&include, OsStr::new("foo.h"));
+        let result = listing.provides(&include, OsStr::new("foo.h"));
         std::fs::set_permissions(&include, std::fs::Permissions::from_mode(0o755)).unwrap();
         let error = result.expect_err("permission denied is not an answer");
         assert!(error.to_string().contains("unreadable"), "{error:#}");

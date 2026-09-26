@@ -35,6 +35,7 @@ exclude = ["tmp"]
 resolver = "3"
 
 [dependencies]
+foldhash = "0.2"
 kunobi-daemon = { version = "0.5.2", features = ["wire-async", "local-async", "launch"] }
 kache-format = { version = "0.27.0", path = "crates/kache-format" }
 kache-store = { version = "0.27.0", path = "crates/kache-store" }

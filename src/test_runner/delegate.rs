@@ -501,11 +501,17 @@ pub(crate) fn prefix() -> Result<Vec<OsString>, String> {
             Ok(files) => files,
             Err(reason) => return unknown(reason),
         };
-        let flags_known = env_flags.is_some()
-            || !(build_flags_cfg || files.iter().any(|file| file.cfg_rustflags));
+        let flags_known = flags_known(env_flags.is_some(), build_flags_cfg, &files);
         outcomes.push(shadowed_runner(&files, &triple, flags_known, &mut host));
     }
     words_for(agree(outcomes), var(DELEGATE_ENV))
+}
+
+/// Whether the `--cfg` flags Cargo matches `cfg` runners with are known:
+/// `RUSTFLAGS` or `CARGO_ENCODED_RUSTFLAGS` replace every other source, and
+/// without them no `CARGO_BUILD_RUSTFLAGS` or configured rustflags add any.
+pub(crate) fn flags_known(env_flags: bool, build_env_cfg: bool, files: &[ConfigFile]) -> bool {
+    env_flags || !(build_env_cfg || files.iter().any(|file| file.cfg_rustflags))
 }
 
 /// Where Cargo may have started: the test's directory, which is its
@@ -809,6 +815,8 @@ mod tests {
             ("any(windows, unix)", true),
             ("any(windows, target_os = \"none\")", false),
             ("not(windows)", true),
+            ("_private", false),
+            ("not(_private)", true),
             ("not(unix)", false),
             ("all(not(windows), any(target_arch = \"x86_64\"))", true),
         ] {
@@ -818,6 +826,8 @@ mod tests {
         for malformed in [
             "",
             "unix unix",
+            "1unix",
+            "all(9)",
             "all(",
             "all(unix",
             "all(unix windows)",
@@ -857,6 +867,54 @@ mod tests {
             panic!("an unreadable cfg must not be skipped");
         };
         assert!(reason.contains("cannot read cfg("), "{reason}");
+    }
+
+    #[test]
+    fn knows_the_cfg_flags_only_without_other_rustflags_sources() {
+        let plain = file("/p", "");
+        let mut with_cfg = file("/p", "");
+        with_cfg.cfg_rustflags = true;
+        assert!(flags_known(false, false, &[plain.clone()]));
+        assert!(!flags_known(false, true, &[plain.clone()]));
+        assert!(!flags_known(
+            false,
+            false,
+            &[plain.clone(), with_cfg.clone()]
+        ));
+        // RUSTFLAGS wins over both.
+        assert!(flags_known(true, true, &[with_cfg]));
+        assert!(flags_known(false, false, &[]));
+    }
+
+    #[test]
+    fn follows_an_include_chain_up_to_the_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let cargo = dir.path().join("w/.cargo");
+        std::fs::create_dir_all(&cargo).unwrap();
+        let chain = |length: usize| {
+            for at in 0..length {
+                let name = if at == 0 {
+                    "config.toml".to_owned()
+                } else {
+                    format!("{at}.toml")
+                };
+                let next = if at + 1 < length {
+                    format!("include = '{}.toml'\n", at + 1)
+                } else {
+                    String::new()
+                };
+                std::fs::write(cargo.join(name), next).unwrap();
+            }
+            config_files(&dir.path().join("w"), &dir.path().join("home")).map(|files| {
+                files
+                    .iter()
+                    .filter(|file| file.root.starts_with(dir.path()))
+                    .count()
+            })
+        };
+        assert_eq!(chain(MAX_INCLUDE_DEPTH + 1), Ok(MAX_INCLUDE_DEPTH + 1));
+        assert!(chain(MAX_INCLUDE_DEPTH + 2).is_err());
+        assert_eq!(MAX_INCLUDE_DEPTH, 16);
     }
 
     #[test]
@@ -1062,6 +1120,14 @@ mod tests {
         )
         .unwrap();
         std::fs::write(home.join("config.toml"), "[target.a]\nrunner = 'home'\n").unwrap();
+        // Only files under the test directory: a build sandbox can have a
+        // `.cargo/config` in an ancestor.
+        let ours = |files: Vec<ConfigFile>| {
+            files
+                .into_iter()
+                .filter(|file| file.root.starts_with(root))
+                .collect::<Vec<_>>()
+        };
         let runners = |files: Vec<ConfigFile>| {
             files
                 .iter()
@@ -1074,7 +1140,7 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert_eq!(
-            runners(config_files(&work, &home).unwrap()),
+            runners(ours(config_files(&work, &home).unwrap())),
             vec![
                 (work.clone(), "pkg".to_owned()),
                 (root.join("ws"), "ws".to_owned()),
@@ -1082,12 +1148,12 @@ mod tests {
             ]
         );
         // A `$CARGO_HOME` that is an ancestor's `.cargo` is read once.
-        let files = config_files(&work, &work.join(".cargo")).unwrap();
+        let files = ours(config_files(&work, &work.join(".cargo")).unwrap());
         assert_eq!(files.len(), 2);
         // Unparsable files are skipped; a file without `[target]` still counts.
         std::fs::write(work.join(".cargo/config.toml"), "not toml [").unwrap();
         std::fs::write(home.join("config.toml"), "[build]\njobs = 1\n").unwrap();
-        let files = config_files(&work, &home).unwrap();
+        let files = ours(config_files(&work, &home).unwrap());
         assert_eq!(files.len(), 2);
         assert!(files[1].target.is_empty());
     }

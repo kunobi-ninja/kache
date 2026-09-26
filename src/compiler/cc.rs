@@ -2743,6 +2743,12 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         dialect: None,
     },
     FlagSpec {
+        matcher: Matcher::Exact("-faligned-new"),
+        class: FlagClass::CapturedByProbe,
+        source: "RocksDB C++17 aligned new/delete (enabled); resolved cc1 tokens distinguish this from the default and -fno-aligned-new.",
+        dialect: Some(Dialect::Gnu),
+    },
+    FlagSpec {
         matcher: Matcher::Exact("-fno-aligned-new"),
         class: FlagClass::CapturedByProbe,
         source: "Issue #116 — C++ aligned new/delete (disabled).",
@@ -9747,6 +9753,21 @@ mod tests {
         }
     }
 
+    #[test]
+    fn classifier_accepts_aligned_new_modes() {
+        let compile = ["cc", "-c", "foo.cpp", "-o", "foo.o"];
+        assert!(refuse_descriptions(&compile).is_empty());
+        for flag in ["-faligned-new", "-fno-aligned-new"] {
+            let descs = refuse_descriptions(&["cc", "-c", "foo.cpp", "-o", "foo.o", flag]);
+            assert!(descs.is_empty(), "{flag} must not refuse: {descs:?}");
+            assert_eq!(
+                classify_cc_flag(flag, Dialect::Gnu),
+                Some(FlagClass::CapturedByProbe),
+                "{flag} must be included in the resolved-invocation key"
+            );
+        }
+    }
+
     /// Build-system path-remapping flags must NOT refuse: a build enabling its
     /// own `-f*-prefix-map` (e.g. Firefox `--enable-path-remapping`) otherwise
     /// silently disabled all cc caching. They are `CapturedByProbe`, so the
@@ -10474,10 +10495,8 @@ mod tests {
             // their own cluster, post-#146 — see
             // `classifier_does_not_overreach_visibility_additions`.)
             "-fsanitize=undefined",
-            // Aligned-new POSITIVE form not on the list. The negative
-            // form (`-fno-aligned-new`) is what Firefox uses; if a
-            // workload needs `-faligned-new`, file a follow-up.
-            "-faligned-new",
+            // Lookalikes and non-boolean spellings still refuse.
+            "-faligned-new=32",
             "-fsized-deallocation",
             // `-stdlib=` lookalike that isn't actually the C++ stdlib
             // selector.

@@ -5520,6 +5520,12 @@ type CcListingStamps = Vec<(PathBuf, CcListingStamp)>;
 /// Two seconds covers the coarsest directory timestamps in use (FAT's).
 const CC_LISTING_SETTLED_NS: i64 = 2_000_000_000;
 
+/// Whether a directory modified at `mtime_ns` had settled by `read_at`:
+/// modified more than [`CC_LISTING_SETTLED_NS`] before it.
+fn cc_listing_settled(mtime_ns: i64, read_at: i64) -> bool {
+    mtime_ns < read_at - CC_LISTING_SETTLED_NS
+}
+
 impl CcListingStamp {
     /// The stamp of `directory` now, or `None` when it cannot vouch for a
     /// listing read right after it.
@@ -5530,7 +5536,7 @@ impl CcListingStamp {
             .as_nanos();
         let read_at = i64::try_from(read_at).ok()?;
         match crate::cache_key::FileFingerprint::from_path(directory) {
-            Ok(fingerprint) if fingerprint.mtime_ns < read_at - CC_LISTING_SETTLED_NS => {
+            Ok(fingerprint) if cc_listing_settled(fingerprint.mtime_ns, read_at) => {
                 Some(Self::Present(fingerprint))
             }
             Ok(_) => None,
@@ -14683,6 +14689,20 @@ mod tests {
             !compiler.include_dir_names_still_match(&parsed),
             "a shadowing header added after the key must refuse the store"
         );
+    }
+
+    #[test]
+    fn a_listing_settles_strictly_after_two_seconds() {
+        assert_eq!(CC_LISTING_SETTLED_NS, 2_000_000_000);
+        let read_at = 10_000_000_000;
+        assert!(!cc_listing_settled(
+            read_at - CC_LISTING_SETTLED_NS,
+            read_at
+        ));
+        assert!(cc_listing_settled(
+            read_at - CC_LISTING_SETTLED_NS - 1,
+            read_at
+        ));
     }
 
     /// A stamp holds while its directory is untouched, and an absent

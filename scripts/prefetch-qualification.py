@@ -18,6 +18,10 @@ from pathlib import Path
 
 PROJECT = "98442ab17c2c3738701b62a7e060b1431ae2d6ea"
 TOOLCHAIN = "1.90.0"
+# The seed publishes its manifest and shards under these; every arm plans from
+# them, as a CI job with kache-action's manifest-key and namespace does.
+PROFILE = "release"
+NAMESPACE = f"prefetch-qualification/{TOOLCHAIN}/{PROFILE}"
 WORKFLOW = ".github/workflows/prefetch-qualification.yml"
 ARMS = ("off-1", "on-1", "on-2", "off-2", "off-3", "on-3")
 
@@ -95,6 +99,8 @@ def environment(root, binary):
         KACHE_BASE_DIR=str(source),
         KACHE_INPUT_PREDICTIONS="1",
         KACHE_VERIFY_INPUT_PREDICTIONS="sampled",
+        KACHE_PROFILE=PROFILE,
+        KACHE_NAMESPACE=NAMESPACE,
         CFLAGS=remap,
         CXXFLAGS=remap,
         SOURCE_DATE_EPOCH="1735689600",
@@ -119,6 +125,8 @@ WRAPPER_ENV_KEYS = (
     "KACHE_BASE_DIR",
     "KACHE_INPUT_PREDICTIONS",
     "KACHE_VERIFY_INPUT_PREDICTIONS",
+    "KACHE_PROFILE",
+    "KACHE_NAMESPACE",
 )
 
 
@@ -1082,6 +1090,14 @@ prefix = "artifacts"
             output / "artifact.json",
             {"sha256": digest(artifact), "version": version, "listing": listing},
         )
+        if producer:
+            # What kache-action's post step does: without it the arms find no
+            # manifest and plan from crate names alone (#1264).
+            runner.command("save-manifest", [binary, "save-manifest"], source)
+            require(
+                any((remote / "artifacts/_manifests/id").rglob("*.json")),
+                "Seed published no identity manifest",
+            )
         runner.command("stats", [binary, "stats", "--json"])
         require(
             (runtime / "events.jsonl").stat().st_size < 8 * 1024**3,

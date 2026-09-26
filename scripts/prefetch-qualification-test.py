@@ -832,6 +832,18 @@ class SetupEnvironment(unittest.TestCase):
         ):
             self.assertEqual(setup[key], env[key])
 
+    def test_seed_and_arms_share_the_manifest_profile_and_namespace(self):
+        env = self.env()
+        self.assertEqual(env["KACHE_PROFILE"], q.PROFILE)
+        self.assertEqual(env["KACHE_NAMESPACE"], q.NAMESPACE)
+        with tempfile.TemporaryDirectory() as tmp:
+            other = q.environment(Path(tmp), Path(tmp) / "kache")
+        self.assertEqual(
+            (other["KACHE_PROFILE"], other["KACHE_NAMESPACE"]),
+            (env["KACHE_PROFILE"], env["KACHE_NAMESPACE"]),
+            "an arm's root does not change what it plans from",
+        )
+
     def test_measurement_env_still_routes_through_kache(self):
         env = self.env()
         self.assertTrue(env["RUSTC_WRAPPER"].endswith("kache"))

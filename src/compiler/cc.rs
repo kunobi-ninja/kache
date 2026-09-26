@@ -5468,9 +5468,15 @@ fn cc_first_include_dir_providing(dirs: &[PathBuf], name: &Path) -> Result<Optio
 /// header names against a dozen include directories one `stat` at a time was
 /// the largest cost of a warm C hit; listing each directory once answers the
 /// same question from memory.
+///
+/// An include directory's own listing is found by its position in the search
+/// order: most header names have no directory part, and hashing the joined
+/// path for each (name, directory) pair was most of a C miss's CPU on
+/// libgit2. A name with a directory part (`sys/types.h`) is listed by path.
 #[derive(Default)]
 struct CcDirectoryListings {
     listings: HashMap<PathBuf, Option<CcDirectoryListing>>,
+    by_position: Vec<Option<Option<CcDirectoryListing>>>,
 }
 
 struct CcDirectoryListing {
@@ -5480,47 +5486,44 @@ struct CcDirectoryListing {
     folded: HashSet<String>,
 }
 
-impl CcDirectoryListings {
-    /// Whether `directory` contains an entry named `file_name`, of any kind.
+impl CcDirectoryListing {
     /// `None` when the directory cannot be listed as a directory: absent, or
     /// an intermediate component is a file, which the compiler skips too.
-    fn contains(&mut self, directory: &Path, file_name: &OsStr) -> Result<bool> {
-        if !self.listings.contains_key(directory) {
-            let listing = match std::fs::read_dir(directory) {
-                Ok(entries) => {
-                    let mut names = HashSet::new();
-                    let mut folded = HashSet::new();
-                    for entry in entries {
-                        let name = entry?.file_name();
-                        folded.insert(name.to_string_lossy().to_lowercase());
-                        names.insert(name);
-                    }
-                    Some(CcDirectoryListing { names, folded })
+    fn read(directory: &Path) -> Result<Option<Self>> {
+        match std::fs::read_dir(directory) {
+            Ok(entries) => {
+                let mut names = HashSet::new();
+                let mut folded = HashSet::new();
+                for entry in entries {
+                    let name = entry?.file_name();
+                    folded.insert(name.to_string_lossy().to_lowercase());
+                    names.insert(name);
                 }
-                Err(error)
-                    if error.kind() == ErrorKind::NotFound
-                        || error.kind() == ErrorKind::NotADirectory =>
-                {
-                    None
-                }
-                Err(error) => anyhow::bail!(
-                    "cc include directory {} is unreadable ({error})",
-                    directory.display()
-                ),
-            };
-            self.listings.insert(directory.to_path_buf(), listing);
+                Ok(Some(Self { names, folded }))
+            }
+            Err(error)
+                if error.kind() == ErrorKind::NotFound
+                    || error.kind() == ErrorKind::NotADirectory =>
+            {
+                Ok(None)
+            }
+            Err(error) => anyhow::bail!(
+                "cc include directory {} is unreadable ({error})",
+                directory.display()
+            ),
         }
-        let Some(listing) = &self.listings[directory] else {
-            return Ok(false);
-        };
-        if listing.names.contains(file_name) {
+    }
+
+    /// Whether `directory`, which this lists, has an entry named `file_name`.
+    fn provides(&self, directory: &Path, file_name: &OsStr) -> Result<bool> {
+        if self.names.contains(file_name) {
             return Ok(true);
         }
         // A case-insensitive filesystem (macOS, Windows, but also a casefold
         // ext4 or a mounted share on Linux) resolves `foo.h` to `Foo.h`; the
         // listing does not. When only the case differs, ask the filesystem,
         // which is what the compiler does.
-        if listing
+        if self
             .folded
             .contains(&file_name.to_string_lossy().to_lowercase())
         {
@@ -5542,6 +5545,43 @@ impl CcDirectoryListings {
     }
 }
 
+impl CcDirectoryListings {
+    /// Whether `directory` contains an entry named `file_name`, of any kind.
+    fn contains(&mut self, directory: &Path, file_name: &OsStr) -> Result<bool> {
+        let listing = match self.listings.entry(directory.to_path_buf()) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(CcDirectoryListing::read(directory)?)
+            }
+        };
+        match listing {
+            Some(listing) => listing.provides(directory, file_name),
+            None => Ok(false),
+        }
+    }
+
+    /// [`Self::contains`] for the include directory at `position` in the
+    /// search order, found without hashing its path.
+    fn contains_at(
+        &mut self,
+        position: usize,
+        directory: &Path,
+        file_name: &OsStr,
+    ) -> Result<bool> {
+        if self.by_position.len() <= position {
+            self.by_position.resize_with(position + 1, || None);
+        }
+        let slot = &mut self.by_position[position];
+        if slot.is_none() {
+            *slot = Some(CcDirectoryListing::read(directory)?);
+        }
+        match slot.as_ref().and_then(Option::as_ref) {
+            Some(listing) => listing.provides(directory, file_name),
+            None => Ok(false),
+        }
+    }
+}
+
 fn cc_first_include_dir_providing_cached(
     dirs: &[PathBuf],
     name: &Path,
@@ -5550,12 +5590,15 @@ fn cc_first_include_dir_providing_cached(
     let Some(file_name) = name.file_name() else {
         return Ok(None);
     };
+    let parent = name
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty());
     for (index, dir) in dirs.iter().enumerate() {
-        let directory = match name.parent() {
-            Some(parent) if !parent.as_os_str().is_empty() => dir.join(parent),
-            _ => dir.clone(),
+        let provided = match parent {
+            Some(parent) => listings.contains(&dir.join(parent), file_name)?,
+            None => listings.contains_at(index, dir, file_name)?,
         };
-        if listings.contains(&directory, file_name)? {
+        if provided {
             return Ok(Some(index));
         }
     }

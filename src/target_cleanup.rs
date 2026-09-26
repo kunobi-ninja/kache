@@ -159,14 +159,16 @@ fn looks_like_a_source_root(path: &Path) -> bool {
 /// Rename `target` aside, check no build holds it, then delete it. A build
 /// that took its lock before the rename is found, and the directory is
 /// renamed back; one that starts after the rename creates a new directory.
-/// `Ok(false)` when a build holds it.
+/// `Ok(false)` when a build holds it, before or after the rename.
 fn remove(target: &Path, now: i64) -> std::io::Result<bool> {
     let name = target.file_name().unwrap_or_default().to_string_lossy();
     let aside = target.with_file_name(format!(
         ".{name}.kache-removing-{}-{now}",
         std::process::id()
     ));
-    std::fs::rename(target, &aside)?;
+    if let Err(error) = std::fs::rename(target, &aside) {
+        return refused(error, crate::cli::target_in_use(target));
+    }
     if crate::cli::target_in_use(&aside) {
         if std::fs::symlink_metadata(target).is_err() {
             std::fs::rename(&aside, target)?;
@@ -175,6 +177,12 @@ fn remove(target: &Path, now: i64) -> std::io::Result<bool> {
     }
     std::fs::remove_dir_all(&aside)?;
     Ok(true)
+}
+
+/// A rename that fails while a build holds the directory means it is in
+/// use: Windows refuses to rename a directory a build has files open in.
+fn refused(error: std::io::Error, held: bool) -> std::io::Result<bool> {
+    if held { Ok(false) } else { Err(error) }
 }
 
 #[cfg(test)]
@@ -364,6 +372,16 @@ mod tests {
         assert_eq!(
             sweep(&orphans, later).unwrap(),
             vec![(busy.clone(), Reason::Orphaned)]
+        );
+    }
+
+    #[test]
+    fn a_refused_rename_of_a_held_directory_is_in_use() {
+        let denied = || std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert!(!refused(denied(), true).unwrap());
+        assert_eq!(
+            refused(denied(), false).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
         );
     }
 

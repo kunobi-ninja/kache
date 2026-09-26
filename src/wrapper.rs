@@ -535,7 +535,9 @@ fn auto_gc_wanted(config: &Config, store: &Store) -> bool {
             return false;
         }
     };
-    if !auto_gc_sweep_due(config, total) {
+    // A `[cache.volumes]` shard is judged against its own budget and backoff.
+    let swept = config.for_store_dir(store.cache_dir(), crate::volume_gc::filesystem_bytes);
+    if !auto_gc_sweep_due(&swept, total) {
         let now_str = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs().to_string())
@@ -556,7 +558,7 @@ fn auto_gc_wanted(config: &Config, store: &Store) -> bool {
     tracing::info!(
         "auto-gc: store size {} exceeds max {} (+{}% slack), triggering background GC",
         total,
-        config.max_size,
+        swept.max_size,
         AUTO_GC_SLACK_PERCENT
     );
     true
@@ -8668,6 +8670,34 @@ mod tests {
         assert_eq!(store.physical_size().unwrap(), 1101);
         expire_auto_gc_stamp(&cfg);
         assert!(auto_gc_wanted(&cfg, &store));
+    }
+
+    /// A build that stored into a `[cache.volumes]` shard asks whether that
+    /// shard is over its own budget, not the main store's (#974).
+    #[test]
+    fn auto_gc_wanted_judges_a_shard_against_its_own_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = test_config(dir.path().join("main"));
+        cfg.max_size = 1_000_000;
+        let shard = crate::config::VolumeStore {
+            volume: "/mnt/shard/".into(),
+            store: dir.path().join("shard"),
+            max_size: Some(1000),
+        };
+        let shard_cfg = cfg.for_volume_store(&shard, |_| None);
+        cfg.volume_stores = vec![shard];
+        let main = Store::open(&cfg).unwrap();
+        let store = Store::open(&shard_cfg).unwrap();
+        put_sized_entry(&main, dir.path(), "main-entry", 1200);
+        put_sized_entry(&store, dir.path(), "shard-entry", 1200);
+
+        expire_auto_gc_stamp(&cfg);
+        assert!(!auto_gc_wanted(&cfg, &main), "main is far under its budget");
+        expire_auto_gc_stamp(&cfg);
+        assert!(
+            auto_gc_wanted(&cfg, &store),
+            "the shard is over its 1000 bytes"
+        );
     }
 
     #[test]

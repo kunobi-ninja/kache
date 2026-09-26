@@ -67,6 +67,11 @@ pub struct VolumeStore {
     /// Shard store dir on that volume (holds `blobs/`, `index.db`,
     /// `staging/`). Sockets, events, and markers stay in the main runtime.
     pub store: PathBuf,
+    /// Explicit `KACHE_MAX_SIZE` / `[cache] local_max_size`, which applies
+    /// to each shard as it does to the main store. `None` means the shard's
+    /// budget is the disk share of the filesystem that holds it, measured
+    /// when GC sweeps it (kunobi-ninja/kache#974).
+    pub max_size: Option<u64>,
 }
 
 /// Join a relative path onto the process cwd so `[cache.volumes]` keys, which
@@ -1375,7 +1380,7 @@ impl Config {
         let socket_path_override =
             resolve_socket_path_override(std::env::var_os("KACHE_SOCKET_PATH"));
 
-        let max_size = env_or_ignored("KACHE_MAX_SIZE", ignore_env)
+        let explicit_max_size = env_or_ignored("KACHE_MAX_SIZE", ignore_env)
             .ok()
             .and_then(|s| parse_local_max_size(&s, "KACHE_MAX_SIZE"))
             .or_else(|| {
@@ -1385,7 +1390,8 @@ impl Config {
                     .and_then(|c| c.cache.as_ref())
                     .and_then(|c| c.local_max_size.as_ref())
                     .and_then(|s| parse_local_max_size(s, "[cache] local_max_size"))
-            })
+            });
+        let max_size = explicit_max_size
             .unwrap_or_else(|| disk_share_budget(crate::cache_fs::probe(&cache_dir).total_bytes));
 
         let cache_executables = env_or_ignored("KACHE_CACHE_EXECUTABLES", ignore_env)
@@ -1781,7 +1787,7 @@ impl Config {
         let index_auto_compact = Self::index_auto_compact_enabled(&file_config);
         let gc_evict_shared = Self::gc_evict_shared_enabled(&file_config);
         let storage_layout_advice = Self::storage_layout_advice_enabled(&file_config);
-        let volume_stores = Self::load_volume_stores(&file_config);
+        let volume_stores = Self::load_volume_stores(&file_config, explicit_max_size);
         let heartbeat_secs = env_or_ignored("KACHE_HEARTBEAT_SECS", ignore_env)
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
@@ -2523,6 +2529,41 @@ impl Config {
         routed
     }
 
+    /// Config GC uses to sweep `shard`: the shard as `cache_dir`, and its
+    /// own budget. An explicit max size applies as it is; otherwise the
+    /// budget is the disk share of the filesystem that holds the shard,
+    /// which `filesystem_bytes` measures. Runtime dir, socket, and remote
+    /// stay on the main config, as in [`Self::routed_for_path`].
+    pub(crate) fn for_volume_store(
+        &self,
+        shard: &VolumeStore,
+        filesystem_bytes: impl FnOnce(&Path) -> Option<u64>,
+    ) -> Config {
+        let mut swept = self.clone();
+        swept.cache_dir = shard.store.clone();
+        swept.max_size = shard
+            .max_size
+            .unwrap_or_else(|| disk_share_budget(filesystem_bytes(&shard.store)));
+        swept
+    }
+
+    /// Config GC uses for the store at `cache_dir`: the shard's own when
+    /// `cache_dir` is a `[cache.volumes]` shard, the main config otherwise.
+    pub(crate) fn for_store_dir(
+        &self,
+        cache_dir: &Path,
+        filesystem_bytes: impl FnOnce(&Path) -> Option<u64>,
+    ) -> Config {
+        match self
+            .volume_stores
+            .iter()
+            .find(|shard| shard.store == cache_dir)
+        {
+            Some(shard) => self.for_volume_store(shard, filesystem_bytes),
+            None => self.clone(),
+        }
+    }
+
     /// Append `sep` unless already there. Pure and platform-neutral so the
     /// Linux mutation lane covers the Windows trailing-separator rule too.
     fn ensure_trailing_sep(mut text: String, sep: char) -> String {
@@ -2577,7 +2618,10 @@ impl Config {
     /// Parse `[cache.volumes]` into normalized shards. Invalid entries are
     /// skipped with a warning, never fatal: a typo must cost hits on one
     /// volume, not break every build (same policy as an unusable remote).
-    fn load_volume_stores(file_config: &Result<FileConfig>) -> Vec<VolumeStore> {
+    fn load_volume_stores(
+        file_config: &Result<FileConfig>,
+        explicit_max_size: Option<u64>,
+    ) -> Vec<VolumeStore> {
         let Some(map) = file_config
             .as_ref()
             .ok()
@@ -2599,6 +2643,7 @@ impl Config {
                 Some(VolumeStore {
                     volume,
                     store: PathBuf::from(store),
+                    max_size: explicit_max_size,
                 })
             })
             .collect();
@@ -4467,7 +4512,11 @@ remote_key_cache_refresh_secs = 900
         let _lock = config_path_lock();
         let dir = tempfile::tempdir().unwrap();
         let cfg_path = dir.path().join("config.toml");
-        std::fs::write(&cfg_path, "[cache]\n").unwrap();
+        std::fs::write(
+            &cfg_path,
+            "[cache]\n[cache.volumes]\n\"/mnt/biglake\" = \"/mnt/biglake/kache-store\"\n",
+        )
+        .unwrap();
         let cache_dir = dir.path().join("store");
         std::fs::create_dir(&cache_dir).unwrap();
         let _cfg = set_kache_config_for_test(&cfg_path);
@@ -4475,6 +4524,11 @@ remote_key_cache_refresh_secs = 900
         let _max = set_env_for_test("KACHE_MAX_SIZE", Some(std::ffi::OsStr::new("2GiB")));
         let loaded = Config::load().unwrap();
         assert_eq!(loaded.max_size, 2 * 1024 * 1024 * 1024);
+        assert_eq!(
+            loaded.volume_stores[0].max_size,
+            Some(2 * 1024 * 1024 * 1024),
+            "an explicit max size applies to each shard"
+        );
     }
 
     #[test]
@@ -5392,7 +5446,7 @@ remote_key_cache_refresh_secs = 900
             }),
             ..Default::default()
         });
-        let shards = Config::load_volume_stores(&file_config);
+        let shards = Config::load_volume_stores(&file_config, None);
         let kept: Vec<(&str, &str)> = shards
             .iter()
             .map(|shard| (shard.volume.as_str(), shard.store.to_str().unwrap()))
@@ -5417,10 +5471,12 @@ remote_key_cache_refresh_secs = 900
                 VolumeStore {
                     volume: Config::normalize_volume_root(loose).unwrap(),
                     store: PathBuf::from("loose-store"),
+                    max_size: None,
                 },
                 VolumeStore {
                     volume: Config::normalize_volume_root(tight).unwrap(),
                     store: PathBuf::from("tight-store"),
+                    max_size: None,
                 },
             ]
         };
@@ -5478,7 +5534,7 @@ remote_key_cache_refresh_secs = 900
             }),
             ..Default::default()
         });
-        let shards = Config::load_volume_stores(&file_config);
+        let shards = Config::load_volume_stores(&file_config, None);
         if cfg!(windows) {
             assert_eq!(shards.len(), 1);
             assert_eq!(shards[0].volume, "D:\\");
@@ -5486,6 +5542,93 @@ remote_key_cache_refresh_secs = 900
             // Unix keys must be absolute paths; drive letters never match.
             assert!(shards.is_empty());
         }
+    }
+
+    #[test]
+    fn load_volume_stores_carries_the_explicit_max_size_to_each_shard() {
+        let file_config: Result<FileConfig> = Ok(FileConfig {
+            cache: Some(CacheFileConfig {
+                volumes: Some(
+                    [
+                        ("/mnt/a".to_string(), "/mnt/a/store".to_string()),
+                        ("/mnt/b".to_string(), "/mnt/b/store".to_string()),
+                    ]
+                    .into_iter()
+                    .collect(),
+                ),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let explicit = Config::load_volume_stores(&file_config, Some(7));
+        let derived = Config::load_volume_stores(&file_config, None);
+        if !cfg!(windows) {
+            assert_eq!(explicit.len(), 2);
+        }
+        assert!(explicit.iter().all(|shard| shard.max_size == Some(7)));
+        assert!(derived.iter().all(|shard| shard.max_size.is_none()));
+    }
+
+    #[test]
+    fn a_shard_budget_is_the_explicit_max_size_or_its_own_disk_share() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let dir = tempfile::tempdir().unwrap();
+        let mut main = crate::test_support::test_config(dir.path().join("main"));
+        main.max_size = 50 * GIB;
+        let shard_dir = dir.path().join("shard");
+        let mut shard = VolumeStore {
+            volume: "/mnt/vol/".into(),
+            store: shard_dir.clone(),
+            max_size: Some(3 * GIB),
+        };
+
+        let explicit =
+            main.for_volume_store(&shard, |_| panic!("an explicit budget needs no probe"));
+        assert_eq!(explicit.max_size, 3 * GIB);
+        assert_eq!(explicit.cache_dir, shard_dir);
+        assert_eq!(
+            explicit.runtime_dir, main.runtime_dir,
+            "runtime stays on main"
+        );
+
+        shard.max_size = None;
+        let derived = main.for_volume_store(&shard, |path| {
+            assert_eq!(path, shard_dir, "the shard's own filesystem is measured");
+            Some(200 * GIB)
+        });
+        assert_eq!(derived.max_size, 10 * GIB, "5% of the shard's 200GiB");
+        let unknown = main.for_volume_store(&shard, |_| None);
+        assert_eq!(unknown.max_size, DISK_SHARE_FALLBACK);
+        assert_eq!(main.max_size, 50 * GIB, "the main budget is untouched");
+    }
+
+    #[test]
+    fn for_store_dir_picks_the_shard_budget_only_for_a_shard() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut main = crate::test_support::test_config(dir.path().join("main"));
+        main.max_size = 5000;
+        let shard_dir = dir.path().join("shard");
+        main.volume_stores = vec![VolumeStore {
+            volume: "/mnt/vol/".into(),
+            store: shard_dir.clone(),
+            max_size: Some(700),
+        }];
+
+        let shard = main.for_store_dir(&shard_dir, |_| None);
+        assert_eq!(
+            (shard.cache_dir.as_path(), shard.max_size),
+            (shard_dir.as_path(), 700)
+        );
+        let same = main.for_store_dir(&main.cache_dir.clone(), |_| None);
+        assert_eq!(
+            (same.cache_dir, same.max_size),
+            (main.cache_dir.clone(), 5000)
+        );
+        let other = main.for_store_dir(&dir.path().join("elsewhere"), |_| None);
+        assert_eq!(
+            (other.cache_dir, other.max_size),
+            (main.cache_dir.clone(), 5000)
+        );
     }
 
     #[test]
@@ -5509,6 +5652,10 @@ remote_key_cache_refresh_secs = 900
         .unwrap();
         let config = Config::load().unwrap();
         assert_eq!(config.volume_stores.len(), 1);
+        assert_eq!(
+            config.volume_stores[0].max_size, None,
+            "with no explicit max size a shard derives its own budget"
+        );
         #[cfg(windows)]
         {
             assert_eq!(

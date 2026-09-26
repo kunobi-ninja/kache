@@ -78,6 +78,7 @@ mod transport;
 mod tui;
 mod tui_sessions;
 mod verify_compare;
+mod volume_gc;
 mod wrapper;
 mod wrapper_config;
 

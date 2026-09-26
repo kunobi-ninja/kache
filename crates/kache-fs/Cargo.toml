@@ -6,6 +6,11 @@ rust-version = "1.95"
 description = "Filesystem measurements, file identity, native cloning and copying."
 license = "Apache-2.0"
 repository = "https://github.com/kunobi-ninja/kache"
+homepage = "https://kunobi.ninja/docs/kache"
+documentation = "https://docs.rs/kache-fs"
+readme = "README.md"
+keywords = ["reflink", "filesystem", "hardlink", "disk-usage", "fiemap"]
+categories = ["filesystem", "development-tools::build-utils"]
 
 [dependencies]
 libc = "0.2"

@@ -6,6 +6,11 @@ rust-version = "1.95"
 description = "Cache-entry metadata and validation for kache."
 license = "Apache-2.0"
 repository = "https://github.com/kunobi-ninja/kache"
+homepage = "https://kunobi.ninja/docs/kache"
+documentation = "https://docs.rs/kache-format"
+readme = "README.md"
+keywords = ["build-cache", "cache", "metadata", "compiler-cache"]
+categories = ["development-tools::build-utils", "caching"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

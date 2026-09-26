@@ -1607,6 +1607,131 @@ fn init_continues_when_the_login_service_cannot_be_installed() {
     assert!(!e.home.join(".config/systemd/user/kache.service").exists());
 }
 
+/// Test pacing: init exports the host runner variable from the shell
+/// startup files, keeps the files as they are on a rerun, and leaves them
+/// alone under `--check`, `--no-shell` or a declined prompt.
+#[cfg(unix)]
+#[test]
+fn init_exports_the_test_runner_for_the_host() {
+    // The test HOME hides rustup's toolchains, so hand init the real rustc.
+    let sysroot = std::process::Command::new("rustc")
+        .args(["--print", "sysroot"])
+        .output()
+        .unwrap();
+    let rustc = Path::new(String::from_utf8(sysroot.stdout).unwrap().trim()).join("bin/rustc");
+    let version = std::process::Command::new(&rustc)
+        .arg("-vV")
+        .output()
+        .unwrap();
+    let version = String::from_utf8(version.stdout).unwrap();
+    let host = version
+        .lines()
+        .find_map(|line| line.strip_prefix("host: "))
+        .unwrap();
+    let var = format!(
+        "CARGO_TARGET_{}_RUNNER",
+        host.to_ascii_uppercase().replace(['-', '.'], "_")
+    );
+    let export = format!("{var}='kache test-runner'; export {var}");
+    let init = |e: &Env, args: &[&str], runner: Option<&str>, stdin: &str| {
+        let mut command = e.cmd();
+        command
+            .arg("init")
+            .args(args)
+            .env("RUSTC", &rustc)
+            .env_remove(&var)
+            .write_stdin(stdin.to_owned());
+        if let Some(runner) = runner {
+            command.env(&var, runner);
+        }
+        let output = command.assert().success().get_output().stdout.clone();
+        String::from_utf8(output).unwrap()
+    };
+    let bashrc = |e: &Env| std::fs::read_to_string(e.home.join(".bashrc")).unwrap_or_default();
+
+    let e = env();
+    let out = init(&e, &["--no-service", "--no-shell"], None, "y\nn\n");
+    assert!(out.contains("Test pacing: skipped (--no-shell)"), "{out}");
+    let out = init(&e, &["--no-service", "--check"], None, "");
+    assert!(
+        out.contains(&format!("Would set {var} in new terminals.")),
+        "{out}"
+    );
+    assert!(!e.home.join(".bashrc").exists());
+
+    // C/C++ no, test pacing yes, daemon no.
+    let out = init(&e, &["--no-service"], None, "n\ny\nn\n");
+    assert!(
+        out.contains("Pace test binaries in new terminals?"),
+        "{out}"
+    );
+    assert!(
+        out.contains("Test pacing: configured for new terminals"),
+        "{out}"
+    );
+    assert!(
+        out.contains("Open a new terminal to pace test binaries."),
+        "{out}"
+    );
+    let saved = bashrc(&e);
+    assert!(saved.contains("# >>> kache test runner >>>"), "{saved}");
+    assert!(saved.contains(&export), "{saved}");
+    assert!(!saved.contains("kache compiler cache"), "{saved}");
+    let profile = std::fs::read_to_string(e.home.join(".bash_profile")).unwrap();
+    assert!(profile.contains(&export), "{profile}");
+
+    // Nothing to change on a rerun; the terminal decides what init reports.
+    let out = init(&e, &["--no-service"], Some("kache test-runner"), "n\nn\n");
+    assert!(out.contains("Test pacing: active"), "{out}");
+    assert!(!out.contains("Pace test binaries"), "{out}");
+    assert!(!out.contains("pace test binaries."), "{out}");
+    let out = init(&e, &["--no-service"], Some("qemu-user"), "n\nn\n");
+    assert!(
+        out.contains(&format!("sets {var}=\"qemu-user\", which stays")),
+        "{out}"
+    );
+    assert_eq!(bashrc(&e), saved);
+
+    let declined = env();
+    let out = init(&declined, &["--no-service"], None, "y\nn\nn\nn\n");
+    assert!(out.contains("Test pacing: skipped"), "{out}");
+    assert!(!bashrc(&declined).contains("kache test runner"));
+
+    // No host triple, an unsupported shell, or a malformed block: no edit.
+    let other = env();
+    let mut command = other.cmd();
+    command
+        .args(["init", "--no-service"])
+        .env("RUSTC", other.home.join("no-rustc"))
+        .write_stdin("y\nn\nn\n");
+    let out = command.assert().success().get_output().stdout.clone();
+    let out = String::from_utf8(out).unwrap();
+    assert!(
+        out.contains("rustc did not report its host target"),
+        "{out}"
+    );
+    let mut command = other.cmd();
+    command
+        .args(["init", "--no-service"])
+        .env("RUSTC", &rustc)
+        .env("SHELL", "/bin/tcsh")
+        .write_stdin("n\n");
+    let out = command.assert().success().get_output().stdout.clone();
+    let out = String::from_utf8(out).unwrap();
+    assert!(
+        out.contains(&format!("Export {var}=\"kache test-runner\"")),
+        "{out}"
+    );
+    std::fs::write(
+        other.home.join(".bashrc"),
+        "# >>> kache test runner >>>\nno end marker\n",
+    )
+    .unwrap();
+    let out = init(&other, &["--no-service"], None, "n\nn\n");
+    assert!(out.contains("Test pacing changed no shell files."), "{out}");
+    assert!(!bashrc(&other).contains(&export));
+}
+
 #[cfg(unix)]
 #[test]
 fn init_saves_shell_setup_preserves_cargo_choices_and_is_idempotent() {

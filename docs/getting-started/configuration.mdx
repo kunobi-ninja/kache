@@ -86,7 +86,28 @@ On macOS the default store is `~/Library/Caches/kache`; on Linux it is `$XDG_CAC
 
 ## Test runner
 
-Several `cargo test` runs on one machine each start a test thread per CPU. `kache test-runner` makes test binaries wait for slots in the scheduler's pool instead, the same pool compiles use. It is off until you set it as Cargo's target runner in the project's `.cargo/config.toml`:
+Several `cargo test` runs on one machine each start a test thread per CPU. `kache test-runner` makes test binaries wait for slots in the scheduler's pool instead, the same pool compiles use.
+
+On Unix, `kache init` offers to turn it on for every project. It adds this line to your shell startup file, with your machine's target in the name:
+
+```bash
+[ -n "${CARGO_TARGET_AARCH64_APPLE_DARWIN_RUNNER-}" ] || CARGO_TARGET_AARCH64_APPLE_DARWIN_RUNNER='kache test-runner'; export CARGO_TARGET_AARCH64_APPLE_DARWIN_RUNNER
+```
+
+It reaches every process started from a shell that reads that file, including coding agents launched from a terminal. A value you set earlier in the file is kept.
+
+Cargo ranks the variable above a project's own `[target.<triple>]` or `[target.'cfg(..)']` runner, so the test runner looks that runner up and runs the test binary under it. A project that tests under `sudo -E` or an emulator keeps doing so. Cargo reads configuration from the directory it was started in, which a test binary is not told, so the lookup reads `.cargo/config.toml` upward from both the package directory and `$PWD`, plus the files they `include` and `$CARGO_HOME/config.toml`. `cfg` runners are matched against `rustc --print cfg` with the `--cfg` flags from `RUSTFLAGS`.
+
+When the test runner cannot tell which runner Cargo would have used, the test fails with `cannot tell which runner Cargo would use` and the reason. That happens when:
+
+- the package directory and `$PWD` configure different runners, as with `cargo test --manifest-path` run from outside the project;
+- more than one `cfg` runner matches;
+- rustc cannot report the target's cfg, or a `cfg` runner's expression cannot be read;
+- `--cfg` flags come from `build.rustflags`, `target.<triple>.rustflags` or `CARGO_BUILD_RUSTFLAGS`, which the test runner does not evaluate.
+
+Unset the variable in that shell to let Cargo choose.
+
+To turn it on for one project instead, set it as Cargo's target runner in the project's `.cargo/config.toml`:
 
 ```toml title=".cargo/config.toml"
 [target.'cfg(all())']
@@ -99,7 +120,7 @@ For a single run, pass the same setting to Cargo:
 cargo test --config "target.'cfg(all())'.runner = ['kache', 'test-runner']"
 ```
 
-`CARGO_TARGET_<TRIPLE>_RUNNER="kache test-runner"` works too, for example `CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER`. Cargo rejects two `cfg` runners that both match a target, so if the project already sets one, replace it rather than adding a second.
+Cargo rejects two `cfg` runners that both match a target, so if the project already sets one, replace it rather than adding a second. Do not put a `cfg(all())` runner in `$CARGO_HOME/config.toml`: every project with its own `cfg` runner, embedded projects using probe-rs among them, would then fail to load its configuration.
 
 What a scheduled test binary does:
 

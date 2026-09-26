@@ -7,6 +7,31 @@ use std::path::{Path, PathBuf};
 const BEGIN: &str = "# >>> kache compiler cache >>>";
 const END: &str = "# <<< kache compiler cache <<<";
 
+/// The marker lines around one block kache owns in a startup file.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Block {
+    begin: &'static str,
+    end: &'static str,
+    /// Keep the block after everything else in the file, moving it there
+    /// on every edit. Otherwise it stays where it is.
+    last: bool,
+}
+
+/// Puts the compiler shims first on `PATH`, so it runs after any other
+/// `PATH` change in the file.
+pub(crate) const COMPILER_BLOCK: Block = Block {
+    begin: BEGIN,
+    end: END,
+    last: true,
+};
+/// Makes `kache test-runner` Cargo's runner for the host target. A new one
+/// goes above the compiler block, which then stays last.
+pub(crate) const TEST_RUNNER_BLOCK: Block = Block {
+    begin: "# >>> kache test runner >>>",
+    end: "# <<< kache test runner <<<",
+    last: false,
+};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Shell {
     Zsh,
@@ -87,6 +112,46 @@ impl Shell {
             }
         })
     }
+
+    /// Export `var`, set to `value` unless the shell already has a
+    /// non-empty `var`, so a value the user chose earlier in the file wins
+    /// and reaches Cargo.
+    pub fn export_unless_set(self, var: &str, value: &str) -> Result<String> {
+        ensure!(
+            !var.is_empty()
+                && var
+                    .bytes()
+                    .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_'),
+            "invalid environment variable name {var:?}"
+        );
+        ensure!(
+            value
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == ' ' || c == '-'),
+            "invalid value {value:?} for {var}"
+        );
+        Ok(match self {
+            Self::Fish => format!(
+                "if test -z \"${var}\"; set -gx {var} '{value}'; else; set -gx {var} ${var}; end"
+            ),
+            _ => format!("[ -n \"${{{var}-}}\" ] || {var}='{value}'; export {var}"),
+        })
+    }
+}
+
+/// Where `marker` starts a line of `text`.
+fn line_start(text: &str, marker: &str) -> Option<usize> {
+    text.match_indices(marker)
+        .map(|(at, _)| at)
+        .find(|&at| at == 0 || text.as_bytes()[at - 1] == b'\n')
+}
+
+/// Append `block` to `text` on a line of its own.
+fn append(text: &mut String, block: &str) {
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text.push_str(block);
 }
 
 pub(crate) struct Edit {
@@ -119,20 +184,27 @@ fn read_regular(path: &Path) -> Result<Option<String>> {
 
 impl Edit {
     pub fn plan(path: PathBuf, activation: &str) -> Result<Self> {
+        Self::plan_block(path, COMPILER_BLOCK, activation)
+    }
+
+    /// Replace `block` in the file at `path` with one holding `body`.
+    pub fn plan_block(path: PathBuf, block: Block, body: &str) -> Result<Self> {
+        let Block { begin, end, last } = block;
         let original = read_regular(&path)?;
         let existing = original.as_deref().unwrap_or_default();
         let mut updated = existing.to_string();
-        let starts = existing.match_indices(BEGIN).collect::<Vec<_>>();
-        let ends = existing.match_indices(END).collect::<Vec<_>>();
-        match (starts.as_slice(), ends.as_slice()) {
-            ([], []) => {}
-            ([(start, _)], [(end, _)]) => {
+        let text = format!("{begin}\n{body}\n{end}\n");
+        let starts = existing.match_indices(begin).collect::<Vec<_>>();
+        let ends = existing.match_indices(end).collect::<Vec<_>>();
+        let found = match (starts.as_slice(), ends.as_slice()) {
+            ([], []) => None,
+            ([(start, _)], [(end_at, _)]) => {
                 ensure!(
-                    existing[*start..].contains(END),
+                    existing[*start..].contains(end),
                     "closing kache shell marker precedes opening marker in {}",
                     path.display()
                 );
-                let after = end + END.len();
+                let after = end_at + end.len();
                 ensure!(
                     (*start == 0 || existing.as_bytes()[start - 1] == b'\n')
                         && (after == existing.len() || existing.as_bytes()[after] == b'\n'),
@@ -140,17 +212,24 @@ impl Edit {
                     path.display()
                 );
                 let after = after + usize::from(existing.as_bytes().get(after) == Some(&b'\n'));
-                updated.replace_range(*start..after, "");
+                Some(*start..after)
             }
             _ => anyhow::bail!(
                 "incomplete or duplicate kache shell block in {}; review it before retrying",
                 path.display()
             ),
+        };
+        match (found, last) {
+            (Some(range), false) => updated.replace_range(range, &text),
+            (None, false) if let Some(at) = line_start(existing, COMPILER_BLOCK.begin) => {
+                updated.insert_str(at, &text)
+            }
+            (Some(range), true) => {
+                updated.replace_range(range, "");
+                append(&mut updated, &text);
+            }
+            (None, _) => append(&mut updated, &text),
         }
-        if !updated.is_empty() && !updated.ends_with('\n') {
-            updated.push('\n');
-        }
-        updated.push_str(&format!("{BEGIN}\n{activation}\n{END}\n"));
         Ok(Self {
             path,
             original,
@@ -418,6 +497,114 @@ mod tests {
         assert!(read_regular(&path).is_err());
         std::fs::write(&path, [0xff]).unwrap();
         assert!(read_regular(&path).is_err());
+    }
+
+    #[test]
+    fn export_unless_set_keeps_a_value_the_user_chose() {
+        let _guard = crate::test_support::process_state_test_lock();
+        let bash = crate::compiler::resolve_program_on_path("bash").expect("Bash on test PATH");
+        let export = Shell::Bash
+            .export_unless_set("CARGO_TARGET_X_RUNNER", "kache test-runner")
+            .unwrap();
+        for (initial, earlier, expected) in [
+            (None, "", "kache test-runner"),
+            (Some(""), "", "kache test-runner"),
+            (Some("mine"), "", "mine"),
+            // Set earlier in the file but not exported: exported as it is.
+            (None, "CARGO_TARGET_X_RUNNER=earlier\n", "earlier"),
+        ] {
+            let script = format!(
+                "set -u\n{earlier}{export}\n\
+                 bash --noprofile --norc -c 'printf %s \"$CARGO_TARGET_X_RUNNER\"'"
+            );
+            let mut command = std::process::Command::new(&bash);
+            command
+                .args(["--noprofile", "--norc", "-c", &script])
+                .env_remove("BASH_ENV")
+                .env_remove("CARGO_TARGET_X_RUNNER");
+            if let Some(initial) = initial {
+                command.env("CARGO_TARGET_X_RUNNER", initial);
+            }
+            let output = command.output().unwrap();
+            assert!(output.status.success());
+            assert_eq!(String::from_utf8(output.stdout).unwrap(), expected);
+        }
+        assert_eq!(
+            Shell::Fish
+                .export_unless_set("CARGO_TARGET_X_RUNNER", "kache test-runner")
+                .unwrap(),
+            "if test -z \"$CARGO_TARGET_X_RUNNER\"; \
+             set -gx CARGO_TARGET_X_RUNNER 'kache test-runner'; \
+             else; set -gx CARGO_TARGET_X_RUNNER $CARGO_TARGET_X_RUNNER; end"
+        );
+        for var in ["", "lower", "A-B", "A B", "A$B"] {
+            assert!(Shell::Zsh.export_unless_set(var, "kache").is_err(), "{var}");
+        }
+        assert!(Shell::Zsh.export_unless_set("A_1", "kache").is_ok());
+        for value in ["it's", "a$b", "a;b", "a/b"] {
+            assert!(Shell::Zsh.export_unless_set("A", value).is_err(), "{value}");
+        }
+    }
+
+    #[test]
+    fn the_runner_block_stays_put_above_the_compiler_block() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join(".zshrc");
+        let runner = |body: &str| {
+            format!(
+                "{}\n{body}\n{}\n",
+                TEST_RUNNER_BLOCK.begin, TEST_RUNNER_BLOCK.end
+            )
+        };
+        let shims = format!("{BEGIN}\nshims\n{END}\n");
+        std::fs::write(&path, format!("# user\n{shims}")).unwrap();
+        Edit::plan_block(path.clone(), TEST_RUNNER_BLOCK, "runner")
+            .unwrap()
+            .apply()
+            .unwrap();
+        let both = format!("# user\n{}{shims}", runner("runner"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), both);
+        // Running init again changes neither file nor order.
+        assert!(!Edit::plan(path.clone(), "shims").unwrap().changed());
+        assert!(
+            !Edit::plan_block(path.clone(), TEST_RUNNER_BLOCK, "runner")
+                .unwrap()
+                .changed()
+        );
+        // A changed runner block is rewritten where it is.
+        assert_eq!(
+            Edit::plan_block(path.clone(), TEST_RUNNER_BLOCK, "other")
+                .unwrap()
+                .updated,
+            format!("# user\n{}{shims}", runner("other"))
+        );
+        // Without a compiler block, or with only a mention of its marker
+        // inside a line, a new runner block is appended.
+        for original in [
+            "# user",
+            "# user\n",
+            "# see # >>> kache compiler cache >>>\n",
+        ] {
+            std::fs::write(&path, original).unwrap();
+            let updated = Edit::plan_block(path.clone(), TEST_RUNNER_BLOCK, "runner")
+                .unwrap()
+                .updated;
+            assert_eq!(
+                updated,
+                format!(
+                    "{}{}",
+                    original.trim_end_matches('\n').to_owned() + "\n",
+                    runner("runner")
+                )
+            );
+        }
+        std::fs::write(&path, &shims).unwrap();
+        assert_eq!(
+            Edit::plan_block(path.clone(), TEST_RUNNER_BLOCK, "runner")
+                .unwrap()
+                .updated,
+            format!("{}{shims}", runner("runner"))
+        );
     }
 
     #[test]

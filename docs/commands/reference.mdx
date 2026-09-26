@@ -15,7 +15,7 @@ Run `kache <command> --help` for the exact syntax in your installed version.
 | `purge` | Remove local cache entries |
 | `clean` | Remove Cargo target directories below cwd or from the local tracked-root registry |
 | `targets` | Show tracked target directories: size, what deleting each frees, and whether its worktree still exists |
-| `init` | Configure Cargo, optional C/C++ shims, and the daemon service |
+| `init` | Configure Cargo, optional C/C++ shims, test pacing, and the daemon service |
 | `doctor` | Diagnose setup and store integrity |
 | `sync` | Pull from and push to a remote |
 | `save-manifest` | Publish build metadata for later prefetch |
@@ -116,6 +116,8 @@ kache init --yes
 `--check` reports proposed changes without writing. `--no-service` skips login-service installation. When the service cannot be installed, such as on a Linux host without a systemd user session or a Windows account that Task Scheduler refuses, init reports why and starts the daemon directly.
 
 Without a terminal, pass `--yes`. If stdin has no answers and Cargo is left unconfigured, init exits with an error. Besides `rustc-wrapper`, init adds `HOST_CC` / `HOST_CXX` / `CC_KNOWN_WRAPPER_CUSTOM` under Cargo `[env]` when those keys are absent. It never sets `CC` or `CXX`.
+
+On Unix, init offers to pace test binaries: it exports `CARGO_TARGET_<HOST>_RUNNER="kache test-runner"` from the same shell startup files the C/C++ setup edits, so `cargo test` in every project waits for the scheduler's slots. A value you already export stays. `--no-shell` skips both edits. See [Test runner](/docs/getting-started/configuration#test-runner).
 
 ## `kache doctor`
 

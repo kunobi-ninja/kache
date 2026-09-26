@@ -9872,6 +9872,25 @@ mod tests {
         assert_eq!(b.other, 0);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn init_reports_whether_this_terminal_paces_tests() {
+        assert_eq!(test_pacing(Some("kache test-runner")), TestPacing::Active);
+        assert_eq!(
+            test_pacing(Some("qemu-x86_64")),
+            TestPacing::Overridden("qemu-x86_64".into())
+        );
+        assert_eq!(test_pacing(Some("")), TestPacing::Pending);
+        assert_eq!(test_pacing(None), TestPacing::Pending);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn init_reads_the_host_triple_from_rustc() {
+        let host = rustc_host().expect("rustc on the test PATH");
+        assert!(host.contains(std::env::consts::ARCH), "{host}");
+    }
+
     #[test]
     fn test_cargo_wrapper_edit_create() {
         let dir = tempfile::tempdir().unwrap();
@@ -13617,6 +13636,8 @@ mod tests {
 //       when those keys are absent. Never sets CC or CXX.
 //   1c. Unix: offers compiler-name shims in ~/.local/lib/kache/shims.
 //       Saves shell PATH setup after confirmation; activation needs a new terminal.
+//   1d. Unix: offers CARGO_TARGET_<HOST>_RUNNER="kache test-runner" in the
+//       same startup files, so test binaries share the scheduler's slots.
 //   2. Installs the daemon as a login service (launchd/systemd)
 //   3. Starts the daemon
 //
@@ -13753,7 +13774,7 @@ fn prompt_yes_no(question: &str, default_yes: bool, auto_yes: bool) -> Result<bo
 }
 
 /// `$CARGO_HOME`, falling back to `~/.cargo` (cargo's documented default).
-fn cargo_home_dir() -> std::path::PathBuf {
+pub(crate) fn cargo_home_dir() -> std::path::PathBuf {
     if let Some(cargo_home) = std::env::var_os("CARGO_HOME").filter(|value| !value.is_empty()) {
         let cargo_home = std::path::PathBuf::from(cargo_home);
         if cargo_home.is_absolute() {
@@ -13849,10 +13870,12 @@ pub fn init(yes: bool, no_service: bool, no_shell: bool, check: bool) -> Result<
 
     #[cfg(unix)]
     let shell_pending = init_compiler_setup(yes, no_shell, check)?;
+    #[cfg(unix)]
+    let tests_pending = init_test_runner(yes, no_shell, check)?;
     #[cfg(not(unix))]
-    let shell_pending = {
+    let (shell_pending, tests_pending) = {
         let _ = no_shell;
-        false
+        (false, false)
     };
 
     // ── Step 2: daemon service ───────────────────────────────────
@@ -13963,23 +13986,22 @@ pub fn init(yes: bool, no_service: bool, no_shell: bool, check: bool) -> Result<
     if shell_pending {
         println!("  Open a new terminal to activate C/C++ caching.");
     }
+    if tests_pending {
+        println!("  Open a new terminal to pace test binaries.");
+    }
     println!("  Run kache doctor to check this terminal.\n");
     Ok(())
 }
 
 #[cfg(unix)]
 fn init_compiler_setup(yes: bool, no_shell: bool, check: bool) -> Result<bool> {
-    use crate::init_shell::{Edit, Shell};
+    use crate::init_shell::Edit;
     if no_shell {
         println!("  • Terminal C/C++ caching: skipped (--no-shell)");
         return Ok(false);
     }
     let shim_dir = crate::compiler::shim::default_shim_dir();
-    let home = dirs::home_dir().context("could not find your home directory")?;
-    let shell = std::env::var_os("SHELL")
-        .as_deref()
-        .and_then(|shell| Shell::detect(std::path::Path::new(shell)));
-    let Some(shell) = shell else {
+    let Some((shell, paths)) = shell_startup_files()? else {
         println!("  • Terminal C/C++ caching: shell not supported for automatic setup");
         println!(
             "    Use kache install-shims, then add {} to your shell's PATH.",
@@ -13987,15 +14009,8 @@ fn init_compiler_setup(yes: bool, no_shell: bool, check: bool) -> Result<bool> {
         );
         return Ok(false);
     };
-    let zdotdir = std::env::var_os("ZDOTDIR")
-        .filter(|v| !v.is_empty())
-        .map(std::path::PathBuf::from);
-    let xdg = std::env::var_os("XDG_CONFIG_HOME")
-        .filter(|v| !v.is_empty())
-        .map(std::path::PathBuf::from);
     let activation = shell.activation(&shim_dir)?;
-    let edits = shell
-        .paths(&home, zdotdir.as_deref(), xdg.as_deref())?
+    let edits = paths
         .into_iter()
         .map(|path| Edit::plan(path, &activation))
         .collect::<Result<Vec<_>>>();
@@ -14052,6 +14067,144 @@ fn init_compiler_setup(yes: bool, no_shell: bool, check: bool) -> Result<bool> {
         println!("    For this terminal, run:");
         println!("    {}", shell.command(&shim_dir)?);
         Ok(true)
+    }
+}
+
+/// The login shell and the startup files `kache init` edits for it. `None`
+/// for a shell it cannot set up.
+#[cfg(unix)]
+fn shell_startup_files() -> Result<Option<(crate::init_shell::Shell, Vec<std::path::PathBuf>)>> {
+    let home = dirs::home_dir().context("could not find your home directory")?;
+    let shell = std::env::var_os("SHELL")
+        .as_deref()
+        .and_then(|shell| crate::init_shell::Shell::detect(std::path::Path::new(shell)));
+    let Some(shell) = shell else {
+        return Ok(None);
+    };
+    let zdotdir = std::env::var_os("ZDOTDIR")
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from);
+    let xdg = std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from);
+    let paths = shell.paths(&home, zdotdir.as_deref(), xdg.as_deref())?;
+    Ok(Some((shell, paths)))
+}
+
+/// What `kache init` sets as Cargo's runner for the host target.
+#[cfg(unix)]
+const TEST_RUNNER: &str = "kache test-runner";
+
+/// The host triple of the `rustc` Cargo would use here.
+#[cfg(unix)]
+fn rustc_host() -> Option<String> {
+    let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+    let output = std::process::Command::new(rustc)
+        .arg("-vV")
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let host = crate::cache_key::rustc_host_triple(&stdout)?;
+    output.status.success().then(|| host.to_owned())
+}
+
+/// What `init` says about test pacing once the startup files are set up.
+#[cfg(unix)]
+#[derive(Debug, PartialEq, Eq)]
+enum TestPacing {
+    /// This terminal already runs tests through kache.
+    Active,
+    /// This terminal sets another runner, which the saved block leaves alone.
+    Overridden(String),
+    /// New terminals will run tests through kache.
+    Pending,
+}
+
+#[cfg(unix)]
+fn test_pacing(current: Option<&str>) -> TestPacing {
+    match current {
+        Some(TEST_RUNNER) => TestPacing::Active,
+        Some(value) if !value.is_empty() => TestPacing::Overridden(value.to_owned()),
+        _ => TestPacing::Pending,
+    }
+}
+
+/// Export `CARGO_TARGET_<HOST>_RUNNER="kache test-runner"` from the shell
+/// startup files, so `cargo test` in any project paces its test binaries.
+/// Cargo ranks the variable above a project's own runner; `kache
+/// test-runner` looks that runner up and still runs the binary under it.
+/// Returns true when a new terminal is needed.
+#[cfg(unix)]
+fn init_test_runner(yes: bool, no_shell: bool, check: bool) -> Result<bool> {
+    use crate::init_shell::{Edit, TEST_RUNNER_BLOCK};
+    if no_shell {
+        println!("  • Test pacing: skipped (--no-shell)");
+        return Ok(false);
+    }
+    let Some(host) = rustc_host() else {
+        println!("  • Test pacing: skipped (rustc did not report its host target)");
+        return Ok(false);
+    };
+    let var = crate::test_runner::runner_var(&host);
+    let Some((shell, paths)) = shell_startup_files()? else {
+        println!("  • Test pacing: shell not supported for automatic setup");
+        println!("    Export {var}=\"{TEST_RUNNER}\" from your shell's startup file.");
+        return Ok(false);
+    };
+    let export = shell.export_unless_set(&var, TEST_RUNNER)?;
+    let edits = paths
+        .into_iter()
+        .map(|path| Edit::plan_block(path, TEST_RUNNER_BLOCK, &export))
+        .collect::<Result<Vec<_>>>();
+    let edits = match edits {
+        Ok(edits) => edits,
+        Err(error) => {
+            println!("  • Test pacing: shell config needs manual attention");
+            println!("    {error}");
+            println!("    Test pacing changed no shell files.");
+            return Ok(false);
+        }
+    };
+    if edits.iter().any(Edit::changed) {
+        println!("  Test pacing: cargo test waits for the CPU slots builds use");
+        for edit in edits.iter().filter(|edit| edit.changed()) {
+            println!(
+                "    Shell config: {}",
+                crate::wrapper_config::display_path(&edit.path)
+            );
+        }
+        if check {
+            println!("    Would set {var} in new terminals.");
+            return Ok(false);
+        }
+        if !prompt_yes_no("Pace test binaries in new terminals?", true, yes)? {
+            println!("  • Test pacing: skipped");
+            return Ok(false);
+        }
+        for edit in &edits {
+            if let Some(backup) = edit.apply()? {
+                println!(
+                    "    Backup: {}",
+                    crate::wrapper_config::display_path(&backup)
+                );
+            }
+        }
+    }
+    match test_pacing(std::env::var(&var).ok().as_deref()) {
+        TestPacing::Active => {
+            println!("  ✓ Test pacing: active");
+            Ok(false)
+        }
+        TestPacing::Overridden(value) => {
+            println!("  • Test pacing: this terminal sets {var}={value:?}, which stays in effect");
+            Ok(false)
+        }
+        TestPacing::Pending => {
+            println!("  ✓ Test pacing: configured for new terminals");
+            Ok(true)
+        }
     }
 }
 

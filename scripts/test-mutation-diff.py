@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """The mutation diff keeps new and edited lines and drops moved ones."""
 
+from collections import Counter
 import importlib.util
 from pathlib import Path
+import random
 import re
 import subprocess
 import sys
@@ -177,6 +179,115 @@ class HunkOrderTests(unittest.TestCase):
 
     def test_a_hunk_whose_count_is_wrong_is_not_well_formed(self):
         self.assertFalse(md.well_formed(["@@ -1,2 +1,1 @@", " a", "+b"]))
+
+
+def random_function(rng, index):
+    """A Rust function long enough for git to track as a moved block."""
+    name = f"function_number_{index}_{rng.randrange(10**6)}"
+    body = [f"    let value_{i} = input.wrapping_mul({rng.randrange(2, 99)});" for i in range(rng.randrange(2, 7))]
+    return [f"pub fn {name}(input: u64) -> u64 {{", *body, "    input", "}"]
+
+
+def random_change(rng, blocks):
+    """Head files built from the base blocks: some moved to another file or
+    indented into a module, some edited, some new, some removed."""
+    a, b = [], []
+    for block in blocks:
+        roll = rng.random()
+        if roll < 0.25:
+            b.append(["pub mod moved {", *("    " + line for line in block), "}"])
+        elif roll < 0.4:
+            b.append(block)
+        elif roll < 0.55:
+            edited = list(block)
+            edited[rng.randrange(1, len(edited) - 1)] = "    let edited = input + 1;"
+            a.append(edited)
+        elif roll < 0.65:
+            continue
+        else:
+            a.append(block)
+        if rng.random() < 0.3:
+            a.append(random_function(rng, 1000 + len(a)))
+    rng.shuffle(b)
+    # Reorder within the same file too: moved lines then land in hunks next to
+    # other changes in that file, which is where hunks can collide.
+    if len(a) > 2 and rng.random() < 0.7:
+        i, j = rng.sample(range(len(a)), 2)
+        a.insert(j, a.pop(i))
+    return a, b
+
+
+def hunks(diff):
+    """(file, new_start, new_count, body) for each hunk."""
+    current = None
+    out = []
+    lines = diff.splitlines()
+    for index, line in enumerate(lines):
+        if line.startswith("+++ "):
+            current = line[6:] if line.startswith("+++ b/") else None
+            continue
+        match = md.HUNK.match(line)
+        if not match:
+            continue
+        body = []
+        for following in lines[index + 1 :]:
+            if following.startswith(("@@", "diff --git ")):
+                break
+            body.append(following)
+        out.append((current, int(match.group(3)), int(match.group(4) or 1), body))
+    return out
+
+
+def parses_like_cargo_mutants(diff):
+    """cargo-mutants' parser rule, written independently of the script:
+    counts match each hunk body, and within a file every hunk ends at or
+    before the next one starts, on both sides, using the header numbers."""
+    previous = None
+    for line in diff.splitlines():
+        if line.startswith("diff --git "):
+            previous = None
+            continue
+        match = re.match(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", line)
+        if not match:
+            continue
+        old = (int(match.group(1)), int(match.group(2) or 1))
+        new = (int(match.group(3)), int(match.group(4) or 1))
+        if previous and (previous[0] > old[0] or previous[1] > new[0]):
+            return False
+        previous = (old[0] + old[1], new[0] + new[1])
+    return True
+
+
+class PropertyTests(unittest.TestCase):
+    """For random refactors, the rewritten diff is one cargo-mutants accepts,
+    agrees with the files it describes, and only ever drops changed lines."""
+
+    CASES = 40
+
+    def test_rewritten_diffs_are_well_formed_and_match_the_tree(self):
+        for seed in range(self.CASES):
+            with self.subTest(seed=seed):
+                rng = random.Random(seed)
+                repo = Repo()
+                blocks = [random_function(rng, i) for i in range(rng.randrange(3, 9))]
+                base = repo.commit({"src/a.rs": "\n\n".join("\n".join(b) for b in blocks) + "\n"})
+                a, b = random_change(rng, blocks)
+                files = {"src/a.rs": "\n\n".join("\n".join(x) for x in a) + "\n"}
+                if b:
+                    files["src/b.rs"] = "\n\n".join("\n".join(x) for x in b) + "\n"
+                head = repo.commit(files)
+                diff = repo.mutation_diff(base, head)
+                plain = repo.git(*md.DIFF_ARGS, "--no-color", base, head, "--", "*.rs")
+
+                self.assertTrue(parses_like_cargo_mutants(diff), diff)
+                check_counts(self, diff)
+                self.assertLessEqual(Counter(added(diff)), Counter(added(plain)))
+                for path, start, count, body in hunks(diff):
+                    if path is None or count == 0:
+                        continue
+                    tree = repo.git("show", f"{head}:{path}").splitlines()
+                    new_side = [line[1:] for line in body if line[:1] in " +"]
+                    self.assertEqual(tree[start - 1 : start - 1 + count], new_side, (path, start))
 
 
 class AlignmentTests(unittest.TestCase):

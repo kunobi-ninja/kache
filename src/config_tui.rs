@@ -1967,6 +1967,7 @@ mod tests {
                 auto_clean_orphaned_targets: None,
                 auto_clean_idle_targets_days: None,
                 scheduler_memory_pressure: None,
+                auto_clean_unused_units_days: None,
                 seed_new_targets: None,
                 gc_evict_shared: Some(true),
                 storage_layout_advice: None,

@@ -80,6 +80,7 @@ mod timeline_client;
 mod transport;
 mod tui;
 mod tui_sessions;
+mod unit_prune;
 mod verify_compare;
 mod volume_gc;
 mod wrapper;

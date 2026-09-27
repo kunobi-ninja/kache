@@ -1302,6 +1302,7 @@ pub(super) fn test_config(dir: &Path) -> Config {
         auto_clean_orphaned_targets: false,
         auto_clean_idle_targets_days: 0,
         scheduler_memory_pressure: true,
+        auto_clean_unused_units_days: 0,
         seed_new_targets: false,
         gc_evict_shared: false,
         storage_layout_advice: true,

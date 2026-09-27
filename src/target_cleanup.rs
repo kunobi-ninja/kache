@@ -9,6 +9,10 @@
 //! directory that was recorded, and no running build holds its lock. It is
 //! first renamed aside and checked again, so a build that starts meanwhile
 //! gets a fresh directory instead of one being deleted under it.
+//!
+//! A target directory that stays loses the build units no build used for
+//! `[cache] auto_clean_unused_units_days` (30 by default; see
+//! [`crate::unit_prune`]).
 
 use crate::config::Config;
 use crate::maintenance::{Trigger, is_quiet, unix_now_secs};
@@ -73,7 +77,9 @@ pub(crate) fn due(
     last: u64,
     now: u64,
 ) -> bool {
-    let enabled = config.auto_clean_orphaned_targets || config.auto_clean_idle_targets_days > 0;
+    let enabled = config.auto_clean_orphaned_targets
+        || config.auto_clean_idle_targets_days > 0
+        || config.auto_clean_unused_units_days > 0;
     // A clock set back behind the record does not stop the checks.
     let waited = last == 0 || now < last || now - last >= INTERVAL.as_secs();
     enabled
@@ -96,12 +102,20 @@ pub(crate) fn run(config: &Config, trigger: Trigger<'_>) {
         return;
     }
     match sweep(config, now) {
-        Ok(removed) => {
-            for (path, reason) in removed {
+        Ok(swept) => {
+            for (path, reason) in swept.removed {
                 tracing::info!(
                     "removed target directory {} because {}",
                     path.display(),
                     reason.describe()
+                );
+            }
+            for (path, pruned) in swept.pruned {
+                tracing::info!(
+                    "removed {} unused build units ({}) from {}",
+                    pruned.units,
+                    bytesize::ByteSize(pruned.bytes),
+                    path.display()
                 );
             }
         }
@@ -109,23 +123,49 @@ pub(crate) fn run(config: &Config, trigger: Trigger<'_>) {
     }
 }
 
-/// Remove every tracked target directory `config` selects at `now` and
-/// return them. A registry row whose directory is gone, moved or no longer
-/// a derived target directory is forgotten; a directory a running build
-/// holds is kept for the next check.
-pub(crate) fn sweep(config: &Config, now: u64) -> anyhow::Result<Vec<(PathBuf, Reason)>> {
+/// What one sweep did.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct Swept {
+    /// Target directories removed, and why.
+    pub(crate) removed: Vec<(PathBuf, Reason)>,
+    /// Target directories that stayed and lost unused units.
+    pub(crate) pruned: Vec<(PathBuf, crate::unit_prune::Pruned)>,
+}
+
+/// How long a unit may go unused before it is removed, `None` when
+/// unused-unit cleanup is off or the window cannot be expressed.
+pub(crate) fn unit_window(days: u64) -> Option<Duration> {
+    (days > 0)
+        .then(|| days.checked_mul(DAY_SECS))
+        .flatten()
+        .map(Duration::from_secs)
+}
+
+/// Remove every tracked target directory `config` selects at `now`, and the
+/// unused units of those that stay. A registry row whose directory is gone,
+/// moved or no longer a derived target directory is forgotten; a directory a
+/// running build holds is kept for the next check.
+pub(crate) fn sweep(config: &Config, now: u64) -> anyhow::Result<Swept> {
     let store = Store::open(config)?;
+    let window = unit_window(config.auto_clean_unused_units_days);
+    let at = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(now);
     let now = i64::try_from(now).unwrap_or(i64::MAX);
-    let mut removed = Vec::new();
+    let mut swept = Swept::default();
     for tracked in store.tracked_target_roots(0)? {
         let orphaned = crate::cli::workspace_is_gone(&tracked.workspace_root);
         let idle = now.saturating_sub(tracked.last_seen);
-        let Some(reason) = reason(config, orphaned, idle) else {
-            continue;
-        };
         let intact = crate::machine::target_root_is_safe(&tracked.path, &tracked.workspace_root)
             && crate::machine::directory_identity(&tracked.path) == Some(tracked.identity)
             && !looks_like_a_source_root(&tracked.path);
+        let Some(reason) = reason(config, orphaned, idle) else {
+            if let Some(window) = window.filter(|_| intact) {
+                let pruned = crate::unit_prune::prune(&config.cache_dir, &tracked.path, window, at);
+                if pruned.units > 0 {
+                    swept.pruned.push((tracked.path, pruned));
+                }
+            }
+            continue;
+        };
         if !intact {
             store.forget_target_root(&tracked.path)?;
             continue;
@@ -136,7 +176,7 @@ pub(crate) fn sweep(config: &Config, now: u64) -> anyhow::Result<Vec<(PathBuf, R
         match remove(&tracked.path, now) {
             Ok(true) => {
                 store.forget_target_root(&tracked.path)?;
-                removed.push((tracked.path, reason));
+                swept.removed.push((tracked.path, reason));
             }
             Ok(false) => {}
             Err(error) => tracing::warn!(
@@ -145,7 +185,7 @@ pub(crate) fn sweep(config: &Config, now: u64) -> anyhow::Result<Vec<(PathBuf, R
             ),
         }
     }
-    Ok(removed)
+    Ok(swept)
 }
 
 /// A directory holding a manifest or a repository is a source tree, never
@@ -275,6 +315,88 @@ mod tests {
     }
 
     #[test]
+    fn unit_cleanup_turns_the_check_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut units_only = config(dir.path(), false, 0);
+        units_only.auto_clean_unused_units_days = 30;
+        let quiet = RequestClock::idle();
+        assert!(due(
+            &units_only,
+            Trigger::Periodic(&quiet),
+            Some(0),
+            0,
+            10_000
+        ));
+        assert_eq!(unit_window(0), None);
+        assert_eq!(unit_window(30), Some(Duration::from_secs(30 * 86_400)));
+        assert_eq!(unit_window(u64::MAX), None);
+    }
+
+    #[test]
+    fn a_target_that_stays_loses_its_unused_units() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let mut units = config(cache.path(), true, 0);
+        units.auto_clean_unused_units_days = 30;
+        let store = Store::open(&units).unwrap();
+        let (_, live) = tracked_target(&store, root.path(), "live");
+        let long_ago =
+            filetime::FileTime::from_unix_time((unix_now_secs() - 80 * DAY_SECS) as i64, 0);
+        let unit = |hash: &str| {
+            let dir = live.join("debug/build/dep").join(hash);
+            std::fs::create_dir_all(dir.join("fingerprint")).unwrap();
+            std::fs::write(dir.join("fingerprint/lib-dep"), "fp").unwrap();
+            filetime::set_file_times(dir.join("fingerprint/lib-dep"), long_ago, long_ago).unwrap();
+            dir
+        };
+        let stale = unit("0123456789abcdef");
+        let current = unit("fedcba9876543210");
+        let now = unix_now_secs();
+        // The first check arms the target and removes nothing.
+        assert_eq!(
+            sweep(&units, now - 40 * DAY_SECS).unwrap(),
+            Swept::default()
+        );
+        // A build used `current` since.
+        let read = filetime::FileTime::from_unix_time(now as i64, 0);
+        filetime::set_file_atime(current.join("fingerprint/lib-dep"), read).unwrap();
+        let swept = sweep(&units, now).unwrap();
+        if !crate::unit_prune::reads_visible(root.path()) {
+            // Where reads do not show, nothing is ever removed.
+            assert_eq!(swept, Swept::default());
+            assert!(stale.exists());
+            return;
+        }
+        assert!(swept.removed.is_empty());
+        assert_eq!(swept.pruned.len(), 1);
+        assert_eq!(swept.pruned[0].0, live);
+        assert_eq!(swept.pruned[0].1.units, 1);
+        assert!(!stale.exists());
+        assert!(
+            current.exists() && live.exists(),
+            "the target and its used unit stay"
+        );
+        // Off: nothing is pruned, however long it waits.
+        let stale = unit("0123456789abcdef");
+        units.auto_clean_unused_units_days = 0;
+        assert_eq!(
+            sweep(&units, now + 400 * DAY_SECS).unwrap(),
+            Swept::default()
+        );
+        assert!(stale.exists());
+        // A target that is no longer the recorded one is not pruned.
+        units.auto_clean_unused_units_days = 30;
+        std::fs::remove_file(live.join("CACHEDIR.TAG")).unwrap();
+        assert!(
+            sweep(&units, now + 400 * DAY_SECS)
+                .unwrap()
+                .pruned
+                .is_empty()
+        );
+        assert!(stale.exists());
+    }
+
+    #[test]
     fn checks_hourly_when_on_and_quiet() {
         let dir = tempfile::tempdir().unwrap();
         let on = config(dir.path(), true, 0);
@@ -309,9 +431,9 @@ mod tests {
         let now = unix_now_secs();
 
         // Just orphaned: kept for a day in case the worktree comes back.
-        assert!(sweep(&both, now).unwrap().is_empty());
+        assert!(sweep(&both, now).unwrap().removed.is_empty());
         let tomorrow = now + DAY_SECS;
-        let removed = sweep(&both, tomorrow).unwrap();
+        let removed = sweep(&both, tomorrow).unwrap().removed;
         assert_eq!(removed, vec![(gone.clone(), Reason::Orphaned)]);
         assert!(!gone.exists());
         assert!(fresh.exists());
@@ -320,9 +442,9 @@ mod tests {
         // 31 days on, the fresh one is idle.
         let later = now + 31 * DAY_SECS;
         let orphans_only = config(cache.path(), true, 0);
-        assert!(sweep(&orphans_only, later).unwrap().is_empty());
+        assert!(sweep(&orphans_only, later).unwrap().removed.is_empty());
         assert_eq!(
-            sweep(&both, later).unwrap(),
+            sweep(&both, later).unwrap().removed,
             vec![(fresh.clone(), Reason::Idle)]
         );
         assert!(!fresh.exists());
@@ -362,7 +484,7 @@ mod tests {
         lock.lock().unwrap();
 
         let later = unix_now_secs() + DAY_SECS;
-        assert!(sweep(&orphans, later).unwrap().is_empty());
+        assert!(sweep(&orphans, later).unwrap().removed.is_empty());
         for kept in [&replaced, &untagged, &manifest, &repo, &busy] {
             assert!(kept.exists(), "{}", kept.display());
         }
@@ -370,7 +492,7 @@ mod tests {
 
         drop(lock);
         assert_eq!(
-            sweep(&orphans, later).unwrap(),
+            sweep(&orphans, later).unwrap().removed,
             vec![(busy.clone(), Reason::Orphaned)]
         );
     }

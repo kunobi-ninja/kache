@@ -3622,6 +3622,25 @@ fn a_vendored_package_is_guarded_by_itself_not_the_workspace() {
 }
 
 #[test]
+fn same_dir_is_equal_spelling_or_one_place() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("missing");
+    assert!(
+        same_dir(&missing, &missing),
+        "spelled the same, even if absent"
+    );
+    assert!(!same_dir(&missing, &dir.path().join("other")));
+    let real = dir.path().join("real");
+    std::fs::create_dir(&real).unwrap();
+    #[cfg(unix)]
+    {
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(same_dir(&link, &real), "the same place by another spelling");
+    }
+}
+
+#[test]
 fn a_vendored_source_is_what_cargo_says_it_is() {
     let dir = tempfile::tempdir().unwrap();
     let (root, relative) = workspace_invocation(dir.path(), "a", "kt");
@@ -10640,6 +10659,13 @@ fn an_oversized_tree_is_counted_not_hashed_and_remembered() {
     assert!(
         tree_digest_memoised(roots(), &hasher, 4, &memo, half_an_hour).is_none(),
         "still remembered half an hour on"
+    );
+    let marked = std::fs::metadata(oversized_tree_marker(&memo, &tree, 4))
+        .and_then(|metadata| metadata.modified())
+        .unwrap();
+    assert!(
+        tree_digest_memoised(roots(), &hasher, 4, &memo, marked + OVERSIZED_TREE_TTL).is_some(),
+        "a marker exactly its lifetime old has expired"
     );
     let later = now + OVERSIZED_TREE_TTL + std::time::Duration::from_secs(1);
     assert_eq!(

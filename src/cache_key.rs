@@ -2082,13 +2082,6 @@ pub(crate) fn is_vendored_package(manifest_dir: &Path) -> bool {
 /// a vendored crate's always does. The lint cap Cargo gives non-path packages is required
 /// too; `cargo -vv` omits it, and the unit then keeps the workspace guard.
 fn vendored_source(args: &RustcArgs, manifest_dir: &Path, current_dir: &Path) -> bool {
-    let same_dir = |a: &Path, b: &Path| {
-        a == b
-            || std::fs::canonicalize(a)
-                .ok()
-                .zip(std::fs::canonicalize(b).ok())
-                .is_some_and(|(a, b)| a == b)
-    };
     args.cargo_capped_lints()
         && args
             .source_file
@@ -2096,6 +2089,16 @@ fn vendored_source(args: &RustcArgs, manifest_dir: &Path, current_dir: &Path) ->
             .is_some_and(|source| source.is_absolute() && source.starts_with(manifest_dir))
         && same_dir(current_dir, manifest_dir)
         && is_vendored_package(manifest_dir)
+}
+
+/// Whether `a` and `b` name one directory: spelled the same, or resolving to
+/// the same place.
+fn same_dir(a: &Path, b: &Path) -> bool {
+    a == b
+        || std::fs::canonicalize(a)
+            .ok()
+            .zip(std::fs::canonicalize(b).ok())
+            .is_some_and(|(a, b)| a == b)
 }
 
 /// The guard of a vendored package: its directory (less `target` and `.git`,

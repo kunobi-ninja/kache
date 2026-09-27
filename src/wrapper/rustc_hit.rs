@@ -1,6 +1,6 @@
 use super::{
-    Config, EntryMeta, EventResult, FileHashStats, HitCompletion, RustcArgs, RustcCompiler, Store,
-    clean_incremental_dir, record_input_prediction, restore_from_cache,
+    Config, EntryMeta, EventResult, FileHashStats, HitCompletion, KeyEventRecord, RustcArgs,
+    RustcCompiler, Store, clean_incremental_dir, record_input_prediction, restore_from_cache,
 };
 use anyhow::Result;
 use std::time::Instant;
@@ -32,6 +32,7 @@ impl RustcHitContext<'_> {
         lookup_ms: u64,
         prediction_store: Option<&Store>,
         key: &crate::cache_key::KeyOutputs,
+        key_record: &KeyEventRecord,
     ) -> Result<()> {
         let restore_start = Instant::now();
         restore_from_cache(
@@ -53,6 +54,7 @@ impl RustcHitContext<'_> {
             key_hash_stats,
             lookup_ms,
             restore_ms,
+            key_record: key_record.clone(),
         }
         .report(self.config, meta);
         record_input_prediction(self.config, prediction_store, self.args, true, key);

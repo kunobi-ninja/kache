@@ -1152,6 +1152,7 @@ pub fn run_nvcc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
                 key_hash_stats: FileHashStats::default(),
                 lookup_ms,
                 restore_ms,
+                key_record: KeyEventRecord::default(),
             }
             .report(config, &meta);
             return Ok(0);
@@ -1225,6 +1226,7 @@ pub fn run_nvcc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
             key_hash_stats: FileHashStats::default(),
             lookup_ms,
             restore_ms,
+            key_record: KeyEventRecord::default(),
         }
         .report(config, &meta);
         return Ok(0);
@@ -1319,23 +1321,17 @@ pub fn run_nvcc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     let elapsed = start.elapsed().as_millis() as u64;
     let size = result.artifacts.total_size();
     let event_result = event_result_for_store_admission(store_candidate, admitted, store_put);
-    log_event_with_store_and_lookup_outcome(
+    log_event(
         config,
-        &event_root,
-        &crate_name,
-        event_result,
-        elapsed,
-        compile_time_ms,
-        size,
-        &cache_key,
-        key_ms,
-        FileHashStats::default(),
-        lookup_ms,
-        0,
-        store_ms,
-        store_put,
-        store_error,
-        lookup_rejection,
+        EventInputs::new(&event_root, &crate_name, event_result, elapsed)
+            .compile_time_ms(compile_time_ms)
+            .size(size)
+            .keyed(&cache_key, key_ms, FileHashStats::default())
+            .lookup_ms(lookup_ms)
+            .store_ms(store_ms)
+            .store_put(store_put)
+            .store_error(store_error)
+            .lookup_rejection(lookup_rejection),
     );
     print_progress(&crate_name, event_result, elapsed, size);
     Ok(result.exit_code)
@@ -1369,13 +1365,15 @@ fn nvcc_passthrough_with_event<R: Into<String>>(
     reason: R,
 ) -> Result<i32> {
     let output = nvcc_passthrough(parsed)?;
-    log_passthrough_event(
+    log_event(
         config,
-        root,
-        crate_name,
-        start.elapsed().as_millis() as u64,
-        reason.into(),
-        &output,
+        EventInputs::passthrough(
+            root,
+            crate_name,
+            start.elapsed().as_millis() as u64,
+            reason.into(),
+            &output,
+        ),
     );
     Ok(output.exit_code)
 }
@@ -1588,6 +1586,7 @@ fn nvcc_try_remote_hit(
         key_hash_stats: FileHashStats::default(),
         lookup_ms,
         restore_ms,
+        key_record: KeyEventRecord::default(),
     }
     .report(config, &meta);
     Ok(Some(0))
@@ -1973,6 +1972,7 @@ fn run_cc_with_store(
                 key_hash_stats: FileHashStats::default(),
                 lookup_ms,
                 restore_ms,
+                key_record: KeyEventRecord::default(),
             }
             .report(config, &meta);
             drop(trace_report);
@@ -2092,6 +2092,7 @@ fn run_cc_with_store(
             key_hash_stats: FileHashStats::default(),
             lookup_ms,
             restore_ms,
+            key_record: KeyEventRecord::default(),
         }
         .report(config, &meta);
         compiler.commit_preprocess_memo(&file_hasher);
@@ -2300,23 +2301,17 @@ fn run_cc_with_store(
     let elapsed = start.elapsed().as_millis() as u64;
     let size = result.artifacts.total_size();
     let event_result = event_result_for_store_admission(store_candidate, admitted, store_put);
-    log_event_with_store_and_lookup_outcome(
+    log_event(
         config,
-        event_root,
-        crate_name,
-        event_result,
-        elapsed,
-        compile_time_ms,
-        size,
-        &cache_key,
-        key_ms,
-        FileHashStats::default(),
-        lookup_ms,
-        0,
-        store_ms,
-        store_put,
-        store_error,
-        lookup_rejection,
+        EventInputs::new(event_root, crate_name, event_result, elapsed)
+            .compile_time_ms(compile_time_ms)
+            .size(size)
+            .keyed(&cache_key, key_ms, FileHashStats::default())
+            .lookup_ms(lookup_ms)
+            .store_ms(store_ms)
+            .store_put(store_put)
+            .store_error(store_error)
+            .lookup_rejection(lookup_rejection),
     );
     print_progress(crate_name, event_result, elapsed, size);
     Ok(result.exit_code)
@@ -2988,6 +2983,7 @@ fn cc_try_remote_hit(
         key_hash_stats: FileHashStats::default(),
         lookup_ms,
         restore_ms,
+        key_record: KeyEventRecord::default(),
     }
     .report(config, &meta);
     compiler.commit_preprocess_memo(file_hasher);
@@ -3101,42 +3097,6 @@ pub(crate) fn build_script_event_root(out_dir: &Path, manifest_dir: &Path) -> St
     )
 }
 
-/// Event for one build-script run, on the same log as compiler events.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn log_build_script_event(
-    config: &Config,
-    root: &str,
-    crate_name: &str,
-    result: EventResult,
-    elapsed_ms: u64,
-    size: u64,
-    cache_key: &str,
-    key_ms: u64,
-    lookup_ms: u64,
-    restore_ms: u64,
-    store_ms: u64,
-    store_put: StorePutResult,
-) {
-    log_event_with_store_and_lookup_outcome(
-        config,
-        root,
-        crate_name,
-        result,
-        elapsed_ms,
-        0,
-        size,
-        cache_key,
-        key_ms,
-        FileHashStats::default(),
-        lookup_ms,
-        restore_ms,
-        store_ms,
-        store_put,
-        String::new(),
-        String::new(),
-    );
-}
-
 pub(crate) fn resolve_extra_inputs_for_passthrough(
     config: &Config,
     args: &RustcArgs,
@@ -3247,6 +3207,12 @@ fn run_parsed_rustc(
 ) -> Result<i32> {
     let crate_name = args.crate_name.as_deref().unwrap_or("unknown");
     let event_root = rustc_event_root(args);
+    // What this invocation's keys record for its event. The keyed flow a
+    // deferred compile re-enters continues the record its first key started.
+    let mut key_record = precompiled
+        .as_mut()
+        .map(|pre| std::mem::take(&mut pre.key_record))
+        .unwrap_or_default();
     // In-flight heartbeats (kunobi-ninja/kache#131): armed once per wrapper
     // process; the monitor only actually starts if this invocation reaches a
     // miss compile, and only beats once the compile outlives one cadence.
@@ -3269,7 +3235,14 @@ fn run_parsed_rustc(
     let preserve_incremental = preserve_incremental_requested(config, args);
     if preserve_incremental && compile::isolate_incremental_flags(&args.all_args).is_some() {
         tracing::debug!("preserving incremental compilation for {crate_name}");
-        return preserved_incremental_with_event(config, args, crate_name, &event_root, start);
+        return preserved_incremental_with_event(
+            config,
+            args,
+            crate_name,
+            &event_root,
+            start,
+            key_record,
+        );
     }
     if preserve_incremental {
         tracing::warn!(
@@ -3339,6 +3312,7 @@ fn run_parsed_rustc(
                     lease,
                     format!("incremental force-list: {crate_name}"),
                     None,
+                    key_record,
                 );
             }
         } else if let Some(lease) = adaptive_unit.as_ref().and_then(AdaptiveUnit::try_active) {
@@ -3351,6 +3325,7 @@ fn run_parsed_rustc(
                 lease,
                 "adaptive active",
                 None,
+                key_record,
             );
         }
     }
@@ -3396,6 +3371,7 @@ fn run_parsed_rustc(
             &event_root,
             start,
             UNTRUSTED_CODEGEN_BACKEND_REASON,
+            key_record,
         );
     }
 
@@ -3417,6 +3393,7 @@ fn run_parsed_rustc(
             &event_root,
             start,
             refuse_reason_string(&refuse),
+            key_record,
         );
     }
 
@@ -3430,13 +3407,22 @@ fn run_parsed_rustc(
             &event_root,
             start,
             format!("source excluded: {}", source.display()),
+            key_record,
         );
     }
 
     if let Some(reason) = user_bypass {
         tracing::debug!("rustc invocation bypassed by user rule: {reason}");
         reset_adaptive_unit(adaptive_unit.as_ref());
-        return passthrough_with_event(config, args, crate_name, &event_root, start, reason);
+        return passthrough_with_event(
+            config,
+            args,
+            crate_name,
+            &event_root,
+            start,
+            reason,
+            key_record,
+        );
     }
 
     // Skip-cache only for *user-facing* executables (`bin` / `--test`).
@@ -3456,6 +3442,7 @@ fn run_parsed_rustc(
             start,
             adaptive_unit.as_ref(),
             "user-facing executable (cache_executables=false)",
+            key_record,
         );
     }
 
@@ -3467,6 +3454,7 @@ fn run_parsed_rustc(
             &event_root,
             start,
             "store unavailable",
+            key_record,
         );
     };
 
@@ -3495,6 +3483,7 @@ fn run_parsed_rustc(
             }
             None => KeyDiscovery::Immediate,
         },
+        &mut key_record,
     ) {
         Ok(keyed) => keyed,
         Err(e) => {
@@ -3507,6 +3496,7 @@ fn run_parsed_rustc(
                 &event_root,
                 start,
                 uncacheable_reason(&e),
+                key_record,
             );
         }
     };
@@ -3539,6 +3529,7 @@ fn run_parsed_rustc(
                     &event_root,
                     start,
                     format!("compiler spawn failed: {e}"),
+                    key_record,
                 );
             }
         };
@@ -3552,20 +3543,12 @@ fn run_parsed_rustc(
         after_rustc_exit(result.exit_code, &result.stderr, &args.externs);
         if result.exit_code != 0 {
             let elapsed = start.elapsed().as_millis() as u64;
-            log_event_with_hash_stats(
+            log_event(
                 config,
-                &event_root,
-                crate_name,
-                EventResult::Error,
-                elapsed,
-                compile_time_ms,
-                0,
-                "",
-                key_ms,
-                key_hash_stats,
-                0,
-                0,
-                0,
+                EventInputs::new(&event_root, crate_name, EventResult::Error, elapsed)
+                    .compile_time_ms(compile_time_ms)
+                    .keyed("", key_ms, key_hash_stats)
+                    .key_record(key_record),
             );
             print_progress(crate_name, EventResult::Error, elapsed, 0);
             return Ok(result.exit_code);
@@ -3582,20 +3565,12 @@ fn run_parsed_rustc(
                     other.map(|r| r.map(|_| ()))
                 );
                 let elapsed = start.elapsed().as_millis() as u64;
-                log_event_with_hash_stats(
+                log_event(
                     config,
-                    &event_root,
-                    crate_name,
-                    EventResult::Skipped,
-                    elapsed,
-                    compile_time_ms,
-                    0,
-                    "",
-                    key_ms,
-                    key_hash_stats,
-                    0,
-                    0,
-                    0,
+                    EventInputs::new(&event_root, crate_name, EventResult::Skipped, elapsed)
+                        .compile_time_ms(compile_time_ms)
+                        .keyed("", key_ms, key_hash_stats)
+                        .key_record(key_record),
                 );
                 print_progress(crate_name, EventResult::Skipped, elapsed, 0);
                 return Ok(result.exit_code);
@@ -3619,6 +3594,7 @@ fn run_parsed_rustc(
                 compile_time_ms,
                 dep_info: Some(dep_info),
                 tree_digest: key_outputs.tree_digest,
+                key_record,
             }),
         );
         PRECOMPILED_EXIT.with(|cell| cell.set(None));
@@ -3707,6 +3683,7 @@ fn run_parsed_rustc(
                     &event_root,
                     start,
                     format!("store lookup failed: {e}"),
+                    key_record,
                 );
             }
         };
@@ -3737,6 +3714,7 @@ fn run_parsed_rustc(
                     lookup_ms,
                     record_closure.then_some(&store),
                     &key_outputs,
+                    &key_record,
                 ) {
                     tracing::warn!(
                         "restoring local cache hit for {} failed: {} — recompiling",
@@ -3750,6 +3728,7 @@ fn run_parsed_rustc(
                         &event_root,
                         start,
                         format!("restore failed: {e}"),
+                        key_record,
                     );
                 }
                 reset_adaptive_unit(adaptive_unit.as_ref());
@@ -3772,6 +3751,7 @@ fn run_parsed_rustc(
             lookup_ms,
             record_closure,
             &key_outputs,
+            &key_record,
         ) {
             if let Err(e) = restored {
                 tracing::warn!(
@@ -3786,6 +3766,7 @@ fn run_parsed_rustc(
                     &event_root,
                     start,
                     format!("restore failed: {e}"),
+                    key_record,
                 );
             }
             reset_adaptive_unit(adaptive_unit.as_ref());
@@ -3807,6 +3788,7 @@ fn run_parsed_rustc(
             Some(&store),
             &key_env,
             extra_inputs.and_then(crate::extra_inputs::ExtraInputsSnapshot::digest),
+            &mut key_record,
         ) {
             Ok(recomputed) => {
                 cache_key = recomputed.cache_key;
@@ -3833,6 +3815,7 @@ fn run_parsed_rustc(
                     &event_root,
                     start,
                     uncacheable_reason(&e),
+                    key_record,
                 );
             }
         }
@@ -3858,6 +3841,7 @@ fn run_parsed_rustc(
             lease,
             "adaptive seed",
             Some((&cache_key, key_ms, key_hash_stats, lookup_ms)),
+            key_record,
         );
     }
 
@@ -3891,6 +3875,7 @@ fn run_parsed_rustc(
                     &event_root,
                     start,
                     format!("build claim failed: {e}"),
+                    key_record,
                 );
             }
             Ok(BuildClaim::Contended) => {
@@ -3917,6 +3902,7 @@ fn run_parsed_rustc(
             lookup_ms,
             record_closure.then_some(&store),
             &key_outputs,
+            &key_record,
         ) {
             tracing::warn!(
                 "restoring cache hit for {} failed: {} — recompiling",
@@ -3930,6 +3916,7 @@ fn run_parsed_rustc(
                 &event_root,
                 start,
                 format!("restore failed: {e}"),
+                key_record,
             );
         }
         reset_adaptive_unit(adaptive_unit.as_ref());
@@ -3945,6 +3932,7 @@ fn run_parsed_rustc(
             &event_root,
             start,
             "build lock wait failed",
+            key_record,
         );
     };
 
@@ -3974,6 +3962,7 @@ fn run_parsed_rustc(
                     &event_root,
                     start,
                     format!("compiler spawn failed: {e}"),
+                    key_record,
                 );
             }
         },
@@ -3996,20 +3985,12 @@ fn run_parsed_rustc(
     after_rustc_exit(result.exit_code, &result.stderr, &args.externs);
     if result.exit_code != 0 {
         let elapsed = start.elapsed().as_millis() as u64;
-        log_event_with_hash_stats(
+        log_event(
             config,
-            &event_root,
-            crate_name,
-            EventResult::Error,
-            elapsed,
-            0,
-            0,
-            &cache_key,
-            key_ms,
-            key_hash_stats,
-            lookup_ms,
-            0,
-            0,
+            EventInputs::new(&event_root, crate_name, EventResult::Error, elapsed)
+                .keyed(&cache_key, key_ms, key_hash_stats)
+                .lookup_ms(lookup_ms)
+                .key_record(key_record),
         );
         print_progress(crate_name, EventResult::Error, elapsed, 0);
         drop(lock);
@@ -4033,20 +4014,12 @@ fn run_parsed_rustc(
         key_inputs_changed,
     ) {
         let elapsed = start.elapsed().as_millis() as u64;
-        log_event_with_hash_stats(
+        log_event(
             config,
-            &event_root,
-            crate_name,
-            EventResult::Skipped,
-            elapsed,
-            0,
-            0,
-            &cache_key,
-            key_ms,
-            key_hash_stats,
-            lookup_ms,
-            0,
-            0,
+            EventInputs::new(&event_root, crate_name, EventResult::Skipped, elapsed)
+                .keyed(&cache_key, key_ms, key_hash_stats)
+                .lookup_ms(lookup_ms)
+                .key_record(key_record),
         );
         print_progress(crate_name, EventResult::Skipped, elapsed, 0);
         drop(lock);
@@ -4057,20 +4030,13 @@ fn run_parsed_rustc(
     // dep-info that lists a file under the alias root, is not stored.
     if !crate::out_dir_alias::store_gate(args) {
         let elapsed = start.elapsed().as_millis() as u64;
-        log_event_with_hash_stats(
+        log_event(
             config,
-            &event_root,
-            crate_name,
-            EventResult::Skipped,
-            elapsed,
-            compile_time_ms,
-            0,
-            &cache_key,
-            key_ms,
-            key_hash_stats,
-            lookup_ms,
-            0,
-            0,
+            EventInputs::new(&event_root, crate_name, EventResult::Skipped, elapsed)
+                .compile_time_ms(compile_time_ms)
+                .keyed(&cache_key, key_ms, key_hash_stats)
+                .lookup_ms(lookup_ms)
+                .key_record(key_record),
         );
         print_progress(crate_name, EventResult::Skipped, elapsed, 0);
         drop(lock);
@@ -4100,20 +4066,13 @@ fn run_parsed_rustc(
                 .collect::<Vec<_>>()
         );
         let elapsed = start.elapsed().as_millis() as u64;
-        log_event_with_hash_stats(
+        log_event(
             config,
-            &event_root,
-            crate_name,
-            EventResult::Skipped,
-            elapsed,
-            compile_time_ms,
-            0,
-            &cache_key,
-            key_ms,
-            key_hash_stats,
-            lookup_ms,
-            0,
-            0,
+            EventInputs::new(&event_root, crate_name, EventResult::Skipped, elapsed)
+                .compile_time_ms(compile_time_ms)
+                .keyed(&cache_key, key_ms, key_hash_stats)
+                .lookup_ms(lookup_ms)
+                .key_record(key_record),
         );
         print_progress(crate_name, EventResult::Skipped, elapsed, 0);
         drop(lock);
@@ -4134,20 +4093,13 @@ fn run_parsed_rustc(
     if let Some(reason) = unaudited {
         tracing::warn!("not caching {crate_name}: {reason}");
         let elapsed = start.elapsed().as_millis() as u64;
-        log_event_with_hash_stats(
+        log_event(
             config,
-            &event_root,
-            crate_name,
-            EventResult::Skipped,
-            elapsed,
-            compile_time_ms,
-            0,
-            &cache_key,
-            key_ms,
-            key_hash_stats,
-            lookup_ms,
-            0,
-            0,
+            EventInputs::new(&event_root, crate_name, EventResult::Skipped, elapsed)
+                .compile_time_ms(compile_time_ms)
+                .keyed(&cache_key, key_ms, key_hash_stats)
+                .lookup_ms(lookup_ms)
+                .key_record(key_record),
         );
         print_progress(crate_name, EventResult::Skipped, elapsed, 0);
         drop(lock);
@@ -4165,20 +4117,13 @@ fn run_parsed_rustc(
             "admission: compile too cheap to store"
         );
         let elapsed = start.elapsed().as_millis() as u64;
-        log_event_with_hash_stats(
+        log_event(
             config,
-            &event_root,
-            crate_name,
-            EventResult::Skipped,
-            elapsed,
-            compile_time_ms,
-            0,
-            &cache_key,
-            key_ms,
-            key_hash_stats,
-            lookup_ms,
-            0,
-            0,
+            EventInputs::new(&event_root, crate_name, EventResult::Skipped, elapsed)
+                .compile_time_ms(compile_time_ms)
+                .keyed(&cache_key, key_ms, key_hash_stats)
+                .lookup_ms(lookup_ms)
+                .key_record(key_record),
         );
         print_progress(crate_name, EventResult::Skipped, elapsed, 0);
         clean_incremental_dir(config, args);
@@ -4276,20 +4221,13 @@ fn run_parsed_rustc(
                 crate_name
             );
             let elapsed = start.elapsed().as_millis() as u64;
-            log_event_with_hash_stats(
+            log_event(
                 config,
-                &event_root,
-                crate_name,
-                EventResult::Skipped,
-                elapsed,
-                compile_time_ms,
-                0,
-                &cache_key,
-                key_ms,
-                key_hash_stats,
-                lookup_ms,
-                0,
-                0,
+                EventInputs::new(&event_root, crate_name, EventResult::Skipped, elapsed)
+                    .compile_time_ms(compile_time_ms)
+                    .keyed(&cache_key, key_ms, key_hash_stats)
+                    .lookup_ms(lookup_ms)
+                    .key_record(key_record),
             );
             print_progress(crate_name, EventResult::Skipped, elapsed, 0);
             clean_incremental_dir(config, args);
@@ -4371,22 +4309,17 @@ fn run_parsed_rustc(
     let elapsed = start.elapsed().as_millis() as u64;
     let size = result.artifacts.total_size();
     let event_result = event_result_for_store_put(store_put);
-    log_event_with_store_outcome(
+    log_event(
         config,
-        &event_root,
-        crate_name,
-        event_result,
-        elapsed,
-        compile_time_ms,
-        size,
-        &cache_key,
-        key_ms,
-        key_hash_stats,
-        lookup_ms,
-        0,
-        store_ms,
-        store_put,
-        store_error,
+        EventInputs::new(&event_root, crate_name, event_result, elapsed)
+            .compile_time_ms(compile_time_ms)
+            .size(size)
+            .keyed(&cache_key, key_ms, key_hash_stats)
+            .lookup_ms(lookup_ms)
+            .store_ms(store_ms)
+            .store_put(store_put)
+            .store_error(store_error)
+            .key_record(key_record),
     );
     print_progress(crate_name, event_result, elapsed, size);
 
@@ -4467,25 +4400,18 @@ fn hand_off_cc_store(
     let trace_event = crate::phase_trace::phase("handoff_event");
     let event = build_event_details(
         config,
-        handoff.event_root,
-        handoff.crate_name,
-        EventResult::Miss,
-        elapsed,
-        handoff.compile_time_ms,
-        handoff.size,
-        handoff.cache_key,
-        handoff.key_ms,
-        FileHashStats::default(),
-        handoff.lookup_ms,
-        0,
-        handoff.store_start.elapsed().as_millis() as u64,
-        StorePutResult::default(),
-        String::new(),
-        String::new(),
-        handoff.lookup_rejection.to_string(),
-        false,
-        None,
-        None,
+        EventInputs::new(
+            handoff.event_root,
+            handoff.crate_name,
+            EventResult::Miss,
+            elapsed,
+        )
+        .compile_time_ms(handoff.compile_time_ms)
+        .size(handoff.size)
+        .keyed(handoff.cache_key, handoff.key_ms, FileHashStats::default())
+        .lookup_ms(handoff.lookup_ms)
+        .store_ms(handoff.store_start.elapsed().as_millis() as u64)
+        .lookup_rejection(handoff.lookup_rejection.to_string()),
     );
     drop(trace_event);
     let request = PublishCcRequest {
@@ -5362,6 +5288,9 @@ struct Precompiled {
     /// The tree digest the deferred key took before the compile, handed to
     /// the key with `dep_info`.
     tree_digest: Option<String>,
+    /// What the deferred key recorded for the event. The keyed flow the
+    /// compile re-enters continues this record.
+    key_record: KeyEventRecord,
 }
 
 /// Compile-before-key is only sound where the miss is certain from the local
@@ -5584,7 +5513,8 @@ struct ExtraInputsKey<'a> {
 /// Compute the rustc cache key. With `store` present the hasher is backed by
 /// the persistent SQLite hash cache; without it a store-free hasher still
 /// batches hashing through the daemon. The key value is identical either way:
-/// the cache only changes how it's computed.
+/// the cache only changes how it's computed. What the event log records of
+/// the computation goes into `key_record`, whether or not a key comes back.
 #[allow(clippy::too_many_arguments)]
 fn compute_rustc_cache_key(
     config: &Config,
@@ -5596,6 +5526,7 @@ fn compute_rustc_cache_key(
     key_env: &KeyEnv,
     extra_inputs: ExtraInputsKey<'_>,
     discovery: KeyDiscovery,
+    key_record: &mut KeyEventRecord,
 ) -> Result<ComputedKey> {
     let ExtraInputsKey {
         digest: extra_inputs_digest,
@@ -5648,7 +5579,7 @@ fn compute_rustc_cache_key(
         extra_inputs_digest,
     };
     let (cache_key, outputs) = compiler.cache_key_in(args, &key_ctx, key_env);
-    stash_key_for_event(&outputs);
+    key_record.absorb(&outputs);
     let cache_key = match cache_key {
         Ok(cache_key) => cache_key,
         Err(error)
@@ -5738,6 +5669,7 @@ fn recompute_key_without_prediction(
     store: Option<&Store>,
     key_env: &KeyEnv,
     extra_inputs_digest: Option<&str>,
+    key_record: &mut KeyEventRecord,
 ) -> Result<ComputedKey> {
     let mut without = config.clone();
     without.input_predictions = false;
@@ -5754,6 +5686,7 @@ fn recompute_key_without_prediction(
             ..ExtraInputsKey::default()
         },
         KeyDiscovery::Rederived,
+        key_record,
     )
 }
 
@@ -5769,6 +5702,7 @@ fn try_rustc_remote_hit(
     lookup_ms: u64,
     record_closure: bool,
     key: &crate::cache_key::KeyOutputs,
+    key_record: &KeyEventRecord,
 ) -> Option<Result<()>> {
     let (meta, result) = acquire_entry(
         hit.config,
@@ -5787,6 +5721,7 @@ fn try_rustc_remote_hit(
         lookup_ms,
         record_closure.then_some(store),
         key,
+        key_record,
     ))
 }
 
@@ -6493,6 +6428,7 @@ fn intentional_passthrough_with_event<R: Into<String>>(
     start: std::time::Instant,
     adaptive_unit: Option<&AdaptiveUnit>,
     reason: R,
+    key_record: KeyEventRecord,
 ) -> Result<i32> {
     let reason = reason.into();
     if config.fallback.is_none()
@@ -6507,9 +6443,10 @@ fn intentional_passthrough_with_event<R: Into<String>>(
             lease,
             format!("adaptive passthrough: {reason}"),
             None,
+            key_record,
         );
     }
-    passthrough_with_event(config, args, crate_name, root, start, reason)
+    passthrough_with_event(config, args, crate_name, root, start, reason, key_record)
 }
 
 /// Compile with policy-owned incremental state and never publish the result
@@ -6526,6 +6463,7 @@ fn adaptive_incremental_with_event<R: Into<String>>(
     lease: Lease,
     reason: R,
     keyed: Option<(&str, u64, FileHashStats, u64)>,
+    key_record: KeyEventRecord,
 ) -> Result<i32> {
     let reason = reason.into();
     let kind = lease.kind();
@@ -6549,6 +6487,7 @@ fn adaptive_incremental_with_event<R: Into<String>>(
                 root,
                 start,
                 format!("adaptive compiler spawn failed: {error}"),
+                key_record,
             );
         }
     };
@@ -6569,27 +6508,20 @@ fn adaptive_incremental_with_event<R: Into<String>>(
 
     let (cache_key, key_ms, key_hash_stats, lookup_ms) =
         keyed.unwrap_or(("", 0, FileHashStats::default(), 0));
-    log_event_details(
+    log_event(
         config,
-        root,
-        crate_name,
-        EventResult::Passthrough,
-        start.elapsed().as_millis() as u64,
-        compile_time_ms,
-        0,
-        cache_key,
-        key_ms,
-        key_hash_stats,
-        lookup_ms,
-        0,
-        0,
-        StorePutResult::default(),
-        reason,
-        String::new(),
-        String::new(),
-        false,
-        Some(result.exit_code),
-        None,
+        EventInputs::new(
+            root,
+            crate_name,
+            EventResult::Passthrough,
+            start.elapsed().as_millis() as u64,
+        )
+        .compile_time_ms(compile_time_ms)
+        .keyed(cache_key, key_ms, key_hash_stats)
+        .lookup_ms(lookup_ms)
+        .passthrough_reason(reason)
+        .exit_code(result.exit_code)
+        .key_record(key_record),
     );
     Ok(result.exit_code)
 }
@@ -6649,25 +6581,16 @@ fn passthrough_with_event<R: Into<String>>(
     root: &str,
     start: std::time::Instant,
     reason: R,
+    key_record: KeyEventRecord,
 ) -> Result<i32> {
     if let Some(exit_code) = PRECOMPILED_EXIT.with(std::cell::Cell::get) {
         let reason = reason.into();
         tracing::debug!("{crate_name}: compiled, not stored: {reason}");
         let elapsed = start.elapsed().as_millis() as u64;
-        log_event_with_hash_stats(
+        log_event(
             config,
-            root,
-            crate_name,
-            EventResult::Skipped,
-            elapsed,
-            0,
-            0,
-            "",
-            0,
-            FileHashStats::default(),
-            0,
-            0,
-            0,
+            EventInputs::new(root, crate_name, EventResult::Skipped, elapsed)
+                .key_record(key_record),
         );
         print_progress(crate_name, EventResult::Skipped, elapsed, 0);
         return Ok(exit_code);
@@ -6680,7 +6603,10 @@ fn passthrough_with_event<R: Into<String>>(
     )?;
     let elapsed = start.elapsed().as_millis() as u64;
     after_rustc_exit(output.exit_code, rustc_output_in(&reason), &args.externs);
-    log_passthrough_event(config, root, crate_name, elapsed, reason, &output);
+    log_event(
+        config,
+        EventInputs::passthrough(root, crate_name, elapsed, reason, &output).key_record(key_record),
+    );
     Ok(output.exit_code)
 }
 
@@ -6703,18 +6629,22 @@ fn rustc_direct_passthrough_with_event(
     root: &str,
     start: std::time::Instant,
     reason: &str,
+    key_record: KeyEventRecord,
 ) -> Result<i32> {
     if PRECOMPILED_EXIT.with(std::cell::Cell::get).is_some() {
-        return passthrough_with_event(config, args, crate_name, root, start, reason);
+        return passthrough_with_event(config, args, crate_name, root, start, reason, key_record);
     }
     let output = passthrough(args, None, config.preserve_incremental)?;
-    log_passthrough_event(
+    log_event(
         config,
-        root,
-        crate_name,
-        start.elapsed().as_millis() as u64,
-        reason.to_string(),
-        &output,
+        EventInputs::passthrough(
+            root,
+            crate_name,
+            start.elapsed().as_millis() as u64,
+            reason.to_string(),
+            &output,
+        )
+        .key_record(key_record),
     );
     Ok(output.exit_code)
 }
@@ -6728,15 +6658,19 @@ fn preserved_incremental_with_event(
     crate_name: &str,
     root: &str,
     start: std::time::Instant,
+    key_record: KeyEventRecord,
 ) -> Result<i32> {
     let output = passthrough(args, None, true)?;
-    log_passthrough_event(
+    log_event(
         config,
-        root,
-        crate_name,
-        start.elapsed().as_millis() as u64,
-        "incremental preserved".to_string(),
-        &output,
+        EventInputs::passthrough(
+            root,
+            crate_name,
+            start.elapsed().as_millis() as u64,
+            "incremental preserved".to_string(),
+            &output,
+        )
+        .key_record(key_record),
     );
     Ok(output.exit_code)
 }
@@ -6795,20 +6729,10 @@ fn cc_compile_before_key(
     );
     if result.exit_code != 0 {
         let elapsed = start.elapsed().as_millis() as u64;
-        log_event_with_hash_stats(
+        log_event(
             config,
-            event_root,
-            crate_name,
-            EventResult::Error,
-            elapsed,
-            compile_time_ms,
-            0,
-            "",
-            0,
-            FileHashStats::default(),
-            0,
-            0,
-            0,
+            EventInputs::new(event_root, crate_name, EventResult::Error, elapsed)
+                .compile_time_ms(compile_time_ms),
         );
         print_progress(crate_name, EventResult::Error, elapsed, 0);
         return Ok(result.exit_code);
@@ -6850,20 +6774,9 @@ fn cc_precompiled_skipped(
 ) -> Result<i32> {
     tracing::debug!("{crate_name}: compiled, not stored: {reason}");
     let elapsed = start.elapsed().as_millis() as u64;
-    log_event_with_hash_stats(
+    log_event(
         config,
-        root,
-        crate_name,
-        EventResult::Skipped,
-        elapsed,
-        0,
-        0,
-        "",
-        0,
-        FileHashStats::default(),
-        0,
-        0,
-        0,
+        EventInputs::new(root, crate_name, EventResult::Skipped, elapsed),
     );
     print_progress(crate_name, EventResult::Skipped, elapsed, 0);
     Ok(exit_code)
@@ -6881,13 +6794,15 @@ fn cc_passthrough_with_event<R: Into<String>>(
         return cc_precompiled_skipped(config, crate_name, root, start, reason.into(), exit_code);
     }
     let output = cc_passthrough(config, parsed)?;
-    log_passthrough_event(
+    log_event(
         config,
-        root,
-        crate_name,
-        start.elapsed().as_millis() as u64,
-        reason.into(),
-        &output,
+        EventInputs::passthrough(
+            root,
+            crate_name,
+            start.elapsed().as_millis() as u64,
+            reason.into(),
+            &output,
+        ),
     );
     Ok(output.exit_code)
 }
@@ -6904,49 +6819,176 @@ fn cc_direct_passthrough_with_event<R: Into<String>>(
         return cc_precompiled_skipped(config, crate_name, root, start, reason.into(), exit_code);
     }
     let output = cc_direct_passthrough(config, parsed)?;
-    log_passthrough_event(
+    log_event(
         config,
-        root,
-        crate_name,
-        start.elapsed().as_millis() as u64,
-        reason.into(),
-        &output,
+        EventInputs::passthrough(
+            root,
+            crate_name,
+            start.elapsed().as_millis() as u64,
+            reason.into(),
+            &output,
+        ),
     );
     Ok(output.exit_code)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn log_event_with_hash_stats(
-    config: &Config,
-    root: &str,
-    crate_name: &str,
+/// What one event records about the invocation it describes, besides this
+/// process's counters. Start from [`EventInputs::new`] and set what the
+/// invocation measured. A value left unset is written as zero or empty, the
+/// event log's "not measured here".
+pub(crate) struct EventInputs<'a> {
+    root: &'a str,
+    crate_name: &'a str,
     result: EventResult,
     elapsed_ms: u64,
     compile_time_ms: u64,
     size: u64,
-    cache_key: &str,
+    cache_key: &'a str,
     key_ms: u64,
     key_hash_stats: FileHashStats,
     lookup_ms: u64,
     restore_ms: u64,
     store_ms: u64,
-) {
-    log_event_with_store_stats(
-        config,
-        root,
-        crate_name,
-        result,
-        elapsed_ms,
-        compile_time_ms,
-        size,
-        cache_key,
-        key_ms,
-        key_hash_stats,
-        lookup_ms,
-        restore_ms,
-        store_ms,
-        StorePutResult::default(),
-    );
+    store_put: StorePutResult,
+    passthrough_reason: String,
+    store_error: String,
+    lookup_rejection: String,
+    fallback: bool,
+    exit_code: Option<i32>,
+    fallback_attempt: Option<crate::fallback::Attempt>,
+    key_record: KeyEventRecord,
+}
+
+impl<'a> EventInputs<'a> {
+    pub(crate) fn new(
+        root: &'a str,
+        crate_name: &'a str,
+        result: EventResult,
+        elapsed_ms: u64,
+    ) -> Self {
+        Self {
+            root,
+            crate_name,
+            result,
+            elapsed_ms,
+            compile_time_ms: 0,
+            size: 0,
+            cache_key: "",
+            key_ms: 0,
+            key_hash_stats: FileHashStats::default(),
+            lookup_ms: 0,
+            restore_ms: 0,
+            store_ms: 0,
+            store_put: StorePutResult::default(),
+            passthrough_reason: String::new(),
+            store_error: String::new(),
+            lookup_rejection: String::new(),
+            fallback: false,
+            exit_code: None,
+            fallback_attempt: None,
+            key_record: KeyEventRecord::default(),
+        }
+    }
+
+    /// A compile run without caching, as `output` reports it.
+    fn passthrough(
+        root: &'a str,
+        crate_name: &'a str,
+        elapsed_ms: u64,
+        reason: String,
+        output: &PassthroughOutput,
+    ) -> Self {
+        Self::new(root, crate_name, EventResult::Passthrough, elapsed_ms)
+            .passthrough_reason(reason)
+            .fallback(output.fallback, output.fallback_attempt.clone())
+            .exit_code(output.exit_code)
+    }
+
+    fn compile_time_ms(mut self, compile_time_ms: u64) -> Self {
+        self.compile_time_ms = compile_time_ms;
+        self
+    }
+
+    pub(crate) fn size(mut self, size: u64) -> Self {
+        self.size = size;
+        self
+    }
+
+    /// The key this invocation used and what computing it cost.
+    pub(crate) fn keyed(
+        mut self,
+        cache_key: &'a str,
+        key_ms: u64,
+        key_hash_stats: FileHashStats,
+    ) -> Self {
+        self.cache_key = cache_key;
+        self.key_ms = key_ms;
+        self.key_hash_stats = key_hash_stats;
+        self
+    }
+
+    pub(crate) fn lookup_ms(mut self, lookup_ms: u64) -> Self {
+        self.lookup_ms = lookup_ms;
+        self
+    }
+
+    pub(crate) fn restore_ms(mut self, restore_ms: u64) -> Self {
+        self.restore_ms = restore_ms;
+        self
+    }
+
+    pub(crate) fn store_ms(mut self, store_ms: u64) -> Self {
+        self.store_ms = store_ms;
+        self
+    }
+
+    pub(crate) fn store_put(mut self, store_put: StorePutResult) -> Self {
+        self.store_put = store_put;
+        self
+    }
+
+    /// Why `Store::put` failed, so the compile is recorded as the
+    /// *repeating* miss it is (kunobi-ninja/kache#629).
+    fn store_error(mut self, store_error: String) -> Self {
+        self.store_error = store_error;
+        self
+    }
+
+    /// Why an exact-key cache entry was rejected before the replacement
+    /// compile (kunobi-ninja/kache#655).
+    fn lookup_rejection(mut self, lookup_rejection: String) -> Self {
+        self.lookup_rejection = lookup_rejection;
+        self
+    }
+
+    fn passthrough_reason(mut self, reason: String) -> Self {
+        self.passthrough_reason = reason;
+        self
+    }
+
+    fn fallback(mut self, fallback: bool, attempt: Option<crate::fallback::Attempt>) -> Self {
+        self.fallback = fallback;
+        self.fallback_attempt = attempt;
+        self
+    }
+
+    fn exit_code(mut self, exit_code: i32) -> Self {
+        self.exit_code = Some(exit_code);
+        self
+    }
+
+    /// What this invocation's rustc keys recorded for the event.
+    fn key_record(mut self, key_record: KeyEventRecord) -> Self {
+        self.key_record = key_record;
+        self
+    }
+}
+
+/// Build the event for `inputs` and append it to the event log.
+pub(crate) fn log_event(config: &Config, inputs: EventInputs<'_>) {
+    let _trace = crate::phase_trace::phase("event_report");
+    let event = build_event_details(config, inputs);
+    write_event(config, &event);
 }
 
 /// Render a failed `Store::put` for the event log and the report.
@@ -6979,186 +7021,59 @@ pub(crate) fn store_error_for_event(error: &anyhow::Error) -> String {
     bounded
 }
 
-#[allow(clippy::too_many_arguments)]
-fn log_event_with_store_stats(
-    config: &Config,
-    root: &str,
-    crate_name: &str,
-    result: EventResult,
-    elapsed_ms: u64,
-    compile_time_ms: u64,
-    size: u64,
-    cache_key: &str,
-    key_ms: u64,
-    key_hash_stats: FileHashStats,
-    lookup_ms: u64,
-    restore_ms: u64,
-    store_ms: u64,
-    store_put: StorePutResult,
-) {
-    let _trace = crate::phase_trace::phase("event_report");
-    log_event_with_store_outcome(
-        config,
-        root,
-        crate_name,
-        result,
-        elapsed_ms,
-        compile_time_ms,
-        size,
-        cache_key,
-        key_ms,
-        key_hash_stats,
-        lookup_ms,
-        restore_ms,
-        store_ms,
-        store_put,
-        String::new(),
+/// Append `event` to the event log and rotate the logs. Best-effort: nothing
+/// here may fail a build.
+pub(crate) fn write_event(config: &Config, event: &BuildEvent) {
+    let _trace = crate::phase_trace::phase("event_log");
+    let _ = events::log_event(&config.event_log_path(), event);
+    let _ = events::rotate_if_needed(
+        &config.event_log_path(),
+        config.event_log_max_size,
+        config.event_log_keep_lines,
+    );
+    let _ = events::rotate_transfers_if_needed(
+        &config.transfer_log_path(),
+        config.event_log_max_size,
+        config.event_log_keep_lines,
     );
 }
 
-/// Like [`log_event_with_store_stats`], but carries the reason `Store::put`
-/// failed so the compile is recorded as the *repeating* miss it is
-/// (kunobi-ninja/kache#629). `store_error` is empty on the normal path.
-#[allow(clippy::too_many_arguments)]
-fn log_event_with_store_outcome(
-    config: &Config,
-    root: &str,
-    crate_name: &str,
-    result: EventResult,
-    elapsed_ms: u64,
-    compile_time_ms: u64,
-    size: u64,
-    cache_key: &str,
-    key_ms: u64,
-    key_hash_stats: FileHashStats,
-    lookup_ms: u64,
-    restore_ms: u64,
-    store_ms: u64,
-    store_put: StorePutResult,
-    store_error: String,
-) {
-    log_event_with_store_and_lookup_outcome(
-        config,
-        root,
-        crate_name,
-        result,
-        elapsed_ms,
-        compile_time_ms,
-        size,
-        cache_key,
-        key_ms,
-        key_hash_stats,
-        lookup_ms,
-        restore_ms,
-        store_ms,
-        store_put,
-        store_error,
-        String::new(),
-    );
+/// The parts of a rustc key's [`KeyOutputs`](crate::cache_key::KeyOutputs)
+/// the event log records. An invocation keeps one record, folds each key it
+/// computes into it, and hands it to its event. Events of compiles that
+/// computed no key carry an empty record.
+#[derive(Clone, Default)]
+pub(crate) struct KeyEventRecord {
+    fields: Option<std::collections::BTreeMap<String, String>>,
+    externs: Option<std::collections::BTreeMap<String, String>>,
+    extern_units: Option<std::collections::BTreeMap<String, String>>,
+    unit_id: Option<String>,
 }
 
-/// Like [`log_event_with_store_outcome`], but records why an exact-key cache
-/// entry was rejected before the replacement compile (kunobi-ninja/kache#655).
-#[allow(clippy::too_many_arguments)]
-fn log_event_with_store_and_lookup_outcome(
-    config: &Config,
-    root: &str,
-    crate_name: &str,
-    result: EventResult,
-    elapsed_ms: u64,
-    compile_time_ms: u64,
-    size: u64,
-    cache_key: &str,
-    key_ms: u64,
-    key_hash_stats: FileHashStats,
-    lookup_ms: u64,
-    restore_ms: u64,
-    store_ms: u64,
-    store_put: StorePutResult,
-    store_error: String,
-    lookup_rejection: String,
-) {
-    log_event_details(
-        config,
-        root,
-        crate_name,
-        result,
-        elapsed_ms,
-        compile_time_ms,
-        size,
-        cache_key,
-        key_ms,
-        key_hash_stats,
-        lookup_ms,
-        restore_ms,
-        store_ms,
-        store_put,
-        String::new(),
-        store_error,
-        lookup_rejection,
-        false,
-        None,
-        None,
-    );
+impl KeyEventRecord {
+    /// Fold in what one key computation returned.
+    ///
+    /// The unit id and the extern maps replace whatever an earlier key left
+    /// (#609, #627). The group digests exist only once the whole key was
+    /// hashed, so a computation that stopped earlier leaves the previous ones
+    /// in place. In practice that is a predicted key that missed and whose
+    /// re-derivation then failed: the passthrough event keeps the predicted
+    /// key's digests.
+    fn absorb(&mut self, outputs: &crate::cache_key::KeyOutputs) {
+        if let Some(fields) = &outputs.fields {
+            self.fields = Some(fields.clone());
+        }
+        self.externs = outputs.externs.clone();
+        self.extern_units = outputs.extern_units.clone();
+        self.unit_id = outputs.unit_id.clone();
+    }
 }
 
-fn log_passthrough_event(
-    config: &Config,
-    root: &str,
-    crate_name: &str,
-    elapsed_ms: u64,
-    reason: String,
-    output: &PassthroughOutput,
-) {
-    log_event_details(
-        config,
-        root,
-        crate_name,
-        EventResult::Passthrough,
-        elapsed_ms,
-        0,
-        0,
-        "",
-        0,
-        FileHashStats::default(),
-        0,
-        0,
-        0,
-        StorePutResult::default(),
-        reason,
-        String::new(),
-        String::new(),
-        output.fallback,
-        Some(output.exit_code),
-        output.fallback_attempt.clone(),
-    );
-}
-
-#[allow(clippy::too_many_arguments)]
-fn log_event_details(
-    config: &Config,
-    root: &str,
-    crate_name: &str,
-    result: EventResult,
-    elapsed_ms: u64,
-    compile_time_ms: u64,
-    size: u64,
-    cache_key: &str,
-    key_ms: u64,
-    key_hash_stats: FileHashStats,
-    lookup_ms: u64,
-    restore_ms: u64,
-    store_ms: u64,
-    store_put: StorePutResult,
-    passthrough_reason: String,
-    store_error: String,
-    lookup_rejection: String,
-    fallback: bool,
-    exit_code: Option<i32>,
-    fallback_attempt: Option<crate::fallback::Attempt>,
-) {
-    let event = build_event_details(
-        config,
+/// The event for one invocation, built from its measurements and this
+/// process's counters. Written by [`write_event`], here or, for a compile
+/// handed to the daemon, there.
+pub(crate) fn build_event_details(config: &Config, inputs: EventInputs<'_>) -> BuildEvent {
+    let EventInputs {
         root,
         crate_name,
         result,
@@ -7178,96 +7093,8 @@ fn log_event_details(
         fallback,
         exit_code,
         fallback_attempt,
-    );
-    write_event(config, &event);
-}
-
-/// Append `event` to the event log and rotate the logs. Best-effort: nothing
-/// here may fail a build.
-pub(crate) fn write_event(config: &Config, event: &BuildEvent) {
-    let _trace = crate::phase_trace::phase("event_log");
-    let _ = events::log_event(&config.event_log_path(), event);
-    let _ = events::rotate_if_needed(
-        &config.event_log_path(),
-        config.event_log_max_size,
-        config.event_log_keep_lines,
-    );
-    let _ = events::rotate_transfers_if_needed(
-        &config.transfer_log_path(),
-        config.event_log_max_size,
-        config.event_log_keep_lines,
-    );
-}
-
-/// The parts of a rustc key's [`KeyOutputs`](crate::cache_key::KeyOutputs)
-/// the event log records.
-#[derive(Default)]
-struct KeyEventRecord {
-    fields: Option<std::collections::BTreeMap<String, String>>,
-    externs: Option<std::collections::BTreeMap<String, String>>,
-    extern_units: Option<std::collections::BTreeMap<String, String>>,
-    unit_id: Option<String>,
-}
-
-thread_local! {
-    /// The record of the last rustc key computed on this thread, until an
-    /// event takes it. The key computation returns its outputs; this stash
-    /// only carries four of them past the `log_event_*` callers, which do not
-    /// take them as arguments.
-    static KEY_EVENT_RECORD: std::cell::RefCell<KeyEventRecord> =
-        std::cell::RefCell::new(KeyEventRecord::default());
-}
-
-/// Keep what `outputs` gives the event log for the next event.
-///
-/// The unit id and the extern maps replace whatever an earlier key left
-/// (#609, #627). The group digests exist only once the whole key was hashed,
-/// so a computation that stopped earlier leaves the previous ones in place.
-fn stash_key_for_event(outputs: &crate::cache_key::KeyOutputs) {
-    KEY_EVENT_RECORD.with(|record| {
-        let mut record = record.borrow_mut();
-        if let Some(fields) = &outputs.fields {
-            record.fields = Some(fields.clone());
-        }
-        record.externs = outputs.externs.clone();
-        record.extern_units = outputs.extern_units.clone();
-        record.unit_id = outputs.unit_id.clone();
-    });
-}
-
-/// Take (consume) the key record [`stash_key_for_event`] kept.
-fn take_key_for_event() -> KeyEventRecord {
-    KEY_EVENT_RECORD
-        .try_with(|record| std::mem::take(&mut *record.borrow_mut()))
-        .unwrap_or_default()
-}
-
-/// The event for one invocation, built from its measurements and this
-/// process's counters. Written by [`write_event`], here or, for a compile
-/// handed to the daemon, there.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn build_event_details(
-    config: &Config,
-    root: &str,
-    crate_name: &str,
-    result: EventResult,
-    elapsed_ms: u64,
-    compile_time_ms: u64,
-    size: u64,
-    cache_key: &str,
-    key_ms: u64,
-    key_hash_stats: FileHashStats,
-    lookup_ms: u64,
-    restore_ms: u64,
-    store_ms: u64,
-    store_put: StorePutResult,
-    passthrough_reason: String,
-    store_error: String,
-    lookup_rejection: String,
-    fallback: bool,
-    exit_code: Option<i32>,
-    fallback_attempt: Option<crate::fallback::Attempt>,
-) -> BuildEvent {
+        key_record: recorded,
+    } = inputs;
     // Session attribution (#583 P0.5): join or open the root's build session
     // and refresh the marker so the 5-minute window measures inactivity. Both
     // are best-effort; an empty id only means the marker was unusable.
@@ -7278,13 +7105,10 @@ pub(crate) fn build_event_details(
     );
     refresh_session_marker(config, root, &session_id);
 
-    // What this compile's key computation recorded for the event (empty for
-    // cc / passthrough). Consumed here, at the single write site, so no
-    // signature threading (kunobi-ninja/kache#131).
-    let recorded = take_key_for_event();
+    // What this compile's key computations recorded for the event (empty for
+    // cc and for passthroughs that computed no key; kunobi-ninja/kache#131).
     let key_fields = recorded.fields.unwrap_or_default();
-    // Always consumed, so the stash never leaks into a later compile in this
-    // process; persisted only under `explain_miss` (#609). Unlike `key_diff`,
+    // Persisted only under `explain_miss` (#609). Unlike `key_diff`,
     // this rides HITS too — the chain walk diffs a miss against the last hit,
     // so a hit with no recorded externs leaves nothing to diff against.
     // `Some(map)` means a rustc key was computed for this compile, even when
@@ -7298,10 +7122,9 @@ pub(crate) fn build_event_details(
     } else {
         Default::default()
     };
-    // Unit identities ride the same stash-and-gate as the digests they explain
-    // (kunobi-ninja/kache#627): taken unconditionally so nothing leaks into the
-    // next compile in this process, persisted only under `explain_miss`, and
-    // only together with `key_externs` — a unit id with no digests to join is
+    // Unit identities ride the same record and gate as the digests they
+    // explain (kunobi-ninja/kache#627): persisted only under `explain_miss`,
+    // and only together with `key_externs` — a unit id with no digests to join is
     // dead weight on the wire.
     let recorded_extern_units = recorded.extern_units;
     let recorded_unit_id = recorded.unit_id;

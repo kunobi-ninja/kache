@@ -25,6 +25,7 @@ fn report_preserves_phase_metrics() {
         },
         lookup_ms: 23,
         restore_ms: 19,
+        key_record: KeyEventRecord::default(),
     }
     .report(&config, &meta);
     let events = events::read_events(&config.event_log_path()).unwrap();

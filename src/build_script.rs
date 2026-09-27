@@ -28,10 +28,12 @@
 //! are never published to a remote.
 
 use crate::args::RustcArgs;
+use crate::cache_key::FileHashStats;
 use crate::compiler_store::StoreHashExt as _;
 use crate::config::Config;
 use crate::events::EventResult;
 use crate::store::{EntryMeta, Store, StorePutResult, link};
+use crate::wrapper::EventInputs;
 use anyhow::{Context, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
@@ -1328,22 +1330,20 @@ impl Run {
         put: StorePutResult,
         size: u64,
     ) {
-        crate::wrapper::log_build_script_event(
+        let root = crate::wrapper::build_script_event_root(
+            &self.environment.out_dir,
+            &self.environment.manifest_dir,
+        );
+        let elapsed_ms = self.start.elapsed().as_millis() as u64;
+        crate::wrapper::log_event(
             &self.config,
-            &crate::wrapper::build_script_event_root(
-                &self.environment.out_dir,
-                &self.environment.manifest_dir,
-            ),
-            CRATE_NAME,
-            result,
-            self.start.elapsed().as_millis() as u64,
-            size,
-            key,
-            key_ms,
-            lookup_ms,
-            restore_ms,
-            store_ms,
-            put,
+            EventInputs::new(&root, CRATE_NAME, result, elapsed_ms)
+                .size(size)
+                .keyed(key, key_ms, FileHashStats::default())
+                .lookup_ms(lookup_ms)
+                .restore_ms(restore_ms)
+                .store_ms(store_ms)
+                .store_put(put),
         );
     }
 }

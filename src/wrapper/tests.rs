@@ -1239,6 +1239,14 @@ fn a_passthrough_after_a_deferred_compile_keeps_the_first_exit_code() {
         "src/lib.rs".into(),
     ])
     .unwrap();
+    let mut key_record = KeyEventRecord::default();
+    key_record.absorb(&crate::cache_key::KeyOutputs {
+        fields: Some(std::collections::BTreeMap::from([(
+            "args".to_string(),
+            "aaaa".to_string(),
+        )])),
+        ..Default::default()
+    });
     PRECOMPILED_EXIT.with(|cell| cell.set(Some(0)));
     let exit = passthrough_with_event(
         &config,
@@ -1247,9 +1255,18 @@ fn a_passthrough_after_a_deferred_compile_keeps_the_first_exit_code() {
         "root",
         std::time::Instant::now(),
         "build lock wait failed",
+        key_record,
     );
     PRECOMPILED_EXIT.with(|cell| cell.set(None));
     assert_eq!(exit.unwrap(), 0, "the compiler must not run a second time");
+    let events = crate::events::read_events(&config.event_log_path()).unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].result, EventResult::Skipped);
+    assert_eq!(
+        events[0].key_fields.get("args").map(String::as_str),
+        Some("aaaa"),
+        "the skipped event keeps the key the compile was keyed with"
+    );
     assert!(
         passthrough_with_event(
             &config,
@@ -1258,6 +1275,7 @@ fn a_passthrough_after_a_deferred_compile_keeps_the_first_exit_code() {
             "root",
             std::time::Instant::now(),
             "build lock wait failed",
+            KeyEventRecord::default(),
         )
         .is_err(),
         "without a deferred compile the passthrough runs the (missing) compiler"
@@ -4103,6 +4121,14 @@ exit 0
     let unit = AdaptiveUnit::eligible(&args, true, &guard).unwrap();
     let lease = unit.try_immediate().unwrap();
 
+    let mut key_record = KeyEventRecord::default();
+    key_record.absorb(&crate::cache_key::KeyOutputs {
+        fields: Some(std::collections::BTreeMap::from([(
+            "args".to_string(),
+            "aaaa".to_string(),
+        )])),
+        ..Default::default()
+    });
     let exit = adaptive_incremental_with_event(
         &config,
         &args,
@@ -4111,10 +4137,23 @@ exit 0
         std::time::Instant::now(),
         lease,
         "adaptive passthrough",
-        None,
+        Some(("adaptive-key", 3, FileHashStats::default(), 4)),
+        key_record,
     )
     .unwrap();
     assert_eq!(exit, 0);
+    let events = crate::events::read_events(&config.event_log_path()).unwrap();
+    assert_eq!(events.len(), 1);
+    let event = &events[0];
+    assert_eq!(event.result, EventResult::Passthrough);
+    assert_eq!(event.passthrough_reason, "adaptive passthrough");
+    assert_eq!(event.exit_code, Some(0));
+    assert_eq!(event.cache_key, "adaptive-key");
+    assert_eq!((event.key_ms, event.lookup_ms), (3, 4));
+    assert_eq!(
+        event.key_fields.get("args").map(String::as_str),
+        Some("aaaa")
+    );
 
     let argv = std::fs::read_to_string(argv_dump).unwrap();
     let rustc_incremental = argv
@@ -6190,21 +6229,12 @@ fn local_hit_demand_reaches_event_without_remote_wait() {
             .is_some()
     );
     let after = chrono::Utc::now().timestamp_millis() as u64;
-    log_event_with_store_stats(
+    log_event(
         &config,
-        "/repo",
-        "foo",
-        EventResult::LocalHit,
-        10,
-        20,
-        30,
-        "local-demand-key",
-        0,
-        FileHashStats::default(),
-        0,
-        0,
-        0,
-        StorePutResult::default(),
+        EventInputs::new("/repo", "foo", EventResult::LocalHit, 10)
+            .compile_time_ms(20)
+            .size(30)
+            .keyed("local-demand-key", 0, FileHashStats::default()),
     );
     let events = crate::events::read_events(&config.event_log_path()).unwrap();
     assert_eq!(events.len(), 1);
@@ -6235,21 +6265,16 @@ fn log_event_with_store_stats_persists_timing_hash_and_store_fields() {
         bytes_hashed: 6,
     };
 
-    log_event_with_store_stats(
+    log_event(
         &config,
-        "/repo",
-        "foo",
-        EventResult::Miss,
-        10,
-        20,
-        30,
-        "cache-key",
-        40,
-        hash_stats,
-        50,
-        60,
-        70,
-        store_put,
+        EventInputs::new("/repo", "foo", EventResult::Miss, 10)
+            .compile_time_ms(20)
+            .size(30)
+            .keyed("cache-key", 40, hash_stats)
+            .lookup_ms(50)
+            .restore_ms(60)
+            .store_ms(70)
+            .store_put(store_put),
     );
 
     let events = crate::events::read_events(&config.event_log_path()).unwrap();
@@ -6288,33 +6313,21 @@ fn log_event_with_store_stats_persists_timing_hash_and_store_fields() {
 /// grow and other tests in this binary add real milliseconds to them, so
 /// each field is fed a magnitude ten times the last: a lower bound and a
 /// band catch a zeroed field and a swapped one, whatever ran before.
-/// A rustc key's record rides the next event and only that one. The
-/// extern maps and unit id need `explain_miss`; the group digests do not.
+/// An event carries the record its invocation's keys left. The extern maps
+/// and unit id need `explain_miss`; the group digests do not.
 #[test]
-fn a_key_record_reaches_the_next_event_once() {
+fn an_event_carries_its_invocations_key_record() {
     let _ = crate::verify_compare::take_last_report();
-    let _ = take_key_for_event();
     let dir = tempfile::tempdir().unwrap();
     let mut config = test_config(dir.path().join("cache"));
     config.explain_miss = true;
     let map = |name: &str, value: &str| {
         std::collections::BTreeMap::from([(name.to_string(), value.to_string())])
     };
-    let log = |config: &Config| {
-        log_event_with_hash_stats(
+    let log = |config: &Config, key_record: KeyEventRecord| {
+        log_event(
             config,
-            "/repo",
-            "foo",
-            EventResult::Passthrough,
-            1,
-            0,
-            0,
-            "",
-            0,
-            FileHashStats::default(),
-            0,
-            0,
-            0,
+            EventInputs::new("/repo", "foo", EventResult::Passthrough, 1).key_record(key_record),
         )
     };
     let key = crate::cache_key::KeyOutputs {
@@ -6324,17 +6337,18 @@ fn a_key_record_reaches_the_next_event_once() {
         unit_id: Some("self".to_string()),
         ..Default::default()
     };
-    stash_key_for_event(&key);
-    log(&config);
-    log(&config);
+    let mut record = KeyEventRecord::default();
+    record.absorb(&key);
+    log(&config, record.clone());
+    log(&config, KeyEventRecord::default());
     // A key that stopped before its digests replaces the extern record
-    // but leaves the earlier digests for the next event.
-    stash_key_for_event(&key);
-    stash_key_for_event(&crate::cache_key::KeyOutputs::default());
-    log(&config);
+    // but keeps the earlier digests.
+    record.absorb(&crate::cache_key::KeyOutputs::default());
+    log(&config, record);
     config.explain_miss = false;
-    stash_key_for_event(&key);
-    log(&config);
+    let mut record = KeyEventRecord::default();
+    record.absorb(&key);
+    log(&config, record);
 
     let events = crate::events::read_events(&config.event_log_path()).unwrap();
     assert_eq!(events.len(), 4);
@@ -6343,7 +6357,7 @@ fn a_key_record_reaches_the_next_event_once() {
     assert_eq!(events[0].key_externs, map("dep", "dddd"));
     assert_eq!(events[0].extern_units, map("dep", "uuuu"));
     assert_eq!(events[0].unit_id, "self");
-    assert!(events[1].key_fields.is_empty(), "taken by the first event");
+    assert!(events[1].key_fields.is_empty(), "no key, no record");
     assert!(!events[1].key_externs_recorded);
     assert_eq!(events[2].key_fields, map("args", "aaaa"));
     assert!(!events[2].key_externs_recorded);
@@ -6374,20 +6388,14 @@ fn log_event_records_the_wrapper_phase_accumulators() {
     crate::opcounts::record_flight_wait(std::time::Duration::from_millis(FLIGHT_MS));
     crate::opcounts::record_permit_wait(std::time::Duration::from_millis(PERMIT_MS));
 
-    log_event_with_hash_stats(
+    log_event(
         &config,
-        "/repo",
-        "foo",
-        EventResult::Miss,
-        100,
-        20,
-        30,
-        "cache-key",
-        40,
-        FileHashStats::default(),
-        50,
-        0,
-        60,
+        EventInputs::new("/repo", "foo", EventResult::Miss, 100)
+            .compile_time_ms(20)
+            .size(30)
+            .keyed("cache-key", 40, FileHashStats::default())
+            .lookup_ms(50)
+            .store_ms(60),
     );
 
     let events = crate::events::read_events(&config.event_log_path()).unwrap();
@@ -6463,22 +6471,13 @@ fn log_event_with_store_outcome_persists_the_store_failure_reason() {
     let dir = tempfile::tempdir().unwrap();
     let config = test_config(dir.path().join("cache"));
 
-    log_event_with_store_outcome(
+    log_event(
         &config,
-        "/repo",
-        "foo",
-        EventResult::Miss,
-        10,
-        20,
-        30,
-        "cache-key",
-        0,
-        FileHashStats::default(),
-        0,
-        0,
-        0,
-        StorePutResult::default(),
-        "refusing to cache zero-byte artifact: libfoo.rlib".to_string(),
+        EventInputs::new("/repo", "foo", EventResult::Miss, 10)
+            .compile_time_ms(20)
+            .size(30)
+            .keyed("cache-key", 0, FileHashStats::default())
+            .store_error("refusing to cache zero-byte artifact: libfoo.rlib".to_string()),
     );
 
     let events = crate::events::read_events(&config.event_log_path()).unwrap();
@@ -6504,27 +6503,22 @@ fn log_event_persists_same_key_lookup_rejection() {
     let dir = tempfile::tempdir().unwrap();
     let config = test_config(dir.path().join("cache"));
 
-    log_event_with_store_and_lookup_outcome(
+    log_event(
         &config,
-        "/repo",
-        "foo.c",
-        EventResult::Miss,
-        10,
-        20,
-        30,
-        "same-key",
-        0,
-        FileHashStats::default(),
-        1,
-        0,
-        2,
-        StorePutResult {
-            output_blobs: 2,
-            duplicate_blobs: 0,
-            new_blobs: 2,
-        },
-        String::new(),
-        "matching entry lacks dep-info required by this invocation".to_string(),
+        EventInputs::new("/repo", "foo.c", EventResult::Miss, 10)
+            .compile_time_ms(20)
+            .size(30)
+            .keyed("same-key", 0, FileHashStats::default())
+            .lookup_ms(1)
+            .store_ms(2)
+            .store_put(StorePutResult {
+                output_blobs: 2,
+                duplicate_blobs: 0,
+                new_blobs: 2,
+            })
+            .lookup_rejection(
+                "matching entry lacks dep-info required by this invocation".to_string(),
+            ),
     );
 
     let events = crate::events::read_events(&config.event_log_path()).unwrap();
@@ -6551,20 +6545,12 @@ fn log_event_persists_verify_compare_class_on_hit() {
     let dir = tempfile::tempdir().unwrap();
     let config = test_config(dir.path().join("cache"));
 
-    log_event_with_hash_stats(
+    log_event(
         &config,
-        "/repo",
-        "foo",
-        EventResult::LocalHit,
-        1,
-        20,
-        30,
-        "hit-key",
-        0,
-        FileHashStats::default(),
-        0,
-        0,
-        0,
+        EventInputs::new("/repo", "foo", EventResult::LocalHit, 1)
+            .compile_time_ms(20)
+            .size(30)
+            .keyed("hit-key", 0, FileHashStats::default()),
     );
     let events = crate::events::read_events(&config.event_log_path()).unwrap();
     assert_eq!(events[0].schema, 21);
@@ -6575,20 +6561,13 @@ fn log_event_persists_verify_compare_class_on_hit() {
     );
 
     crate::verify_compare::record_report("content: libfoo.rlib (byte mismatch)".to_string());
-    log_event_with_hash_stats(
+    log_event(
         &config,
-        "/repo",
-        "foo",
-        EventResult::LocalHit,
-        2,
-        20,
-        30,
-        "hit-key",
-        0,
-        FileHashStats::default(),
-        0,
-        1,
-        0,
+        EventInputs::new("/repo", "foo", EventResult::LocalHit, 2)
+            .compile_time_ms(20)
+            .size(30)
+            .keyed("hit-key", 0, FileHashStats::default())
+            .restore_ms(1),
     );
     let events = crate::events::read_events(&config.event_log_path()).unwrap();
     assert_eq!(events.len(), 2);
@@ -6606,19 +6585,27 @@ fn log_passthrough_event_persists_reason_fallback_and_exit_code() {
     let _ = crate::verify_compare::take_last_report();
     let dir = tempfile::tempdir().unwrap();
     let config = test_config(dir.path().join("cache"));
+    let attempt = crate::fallback::Attempt {
+        wrapper: "fallback-wrapper".to_string(),
+        outcome: crate::fallback::Outcome::Failed,
+        exit_code: Some(42),
+        detail: "fallback detail".to_string(),
+    };
     let output = PassthroughOutput {
         exit_code: 42,
         fallback: true,
-        fallback_attempt: None,
+        fallback_attempt: Some(attempt.clone()),
     };
 
-    log_passthrough_event(
+    log_event(
         &config,
-        "/repo",
-        "foo",
-        17,
-        "unsupported|cc link mode — not yet".to_string(),
-        &output,
+        EventInputs::passthrough(
+            "/repo",
+            "foo",
+            17,
+            "unsupported|cc link mode — not yet".to_string(),
+            &output,
+        ),
     );
 
     let events = crate::events::read_events(&config.event_log_path()).unwrap();
@@ -6631,6 +6618,7 @@ fn log_passthrough_event_persists_reason_fallback_and_exit_code() {
         "unsupported|cc link mode — not yet"
     );
     assert!(event.fallback);
+    assert_eq!(event.fallback_attempt, Some(attempt));
     assert_eq!(event.exit_code, Some(42));
     assert_eq!(event.cache_key, "");
     assert!(
@@ -8925,6 +8913,7 @@ fn a_key_from_emitted_dep_info_always_arms_the_too_new_guard() {
         &KeyEnv::default(),
         ExtraInputsKey::default(),
         KeyDiscovery::Emitted(closure, None),
+        &mut KeyEventRecord::default(),
     )
     .unwrap();
     assert!(!keyed.cache_key.is_empty());
@@ -8999,6 +8988,7 @@ fn a_rederived_key_holds_no_discovery_flight() {
             out.to_str().unwrap(),
         ]))
         .unwrap();
+    let mut key_record = KeyEventRecord::default();
     let keyed = recompute_key_without_prediction(
         &config,
         &RustcCompiler::new(),
@@ -9008,9 +8998,14 @@ fn a_rederived_key_holds_no_discovery_flight() {
         Some(&store),
         &KeyEnv::default(),
         None,
+        &mut key_record,
     )
     .unwrap();
     assert!(!keyed.cache_key.is_empty());
+    assert_eq!(
+        key_record.fields, keyed.outputs.fields,
+        "the event records the re-derived key"
+    );
     assert!(
         keyed.discovery_flight.is_none(),
         "a re-derivation joined a discovery flight"
@@ -9024,6 +9019,7 @@ fn a_rederived_key_holds_no_discovery_flight() {
         Some(&store),
         &KeyEnv::default(),
         Some("extra-inputs-digest"),
+        &mut KeyEventRecord::default(),
     )
     .unwrap();
     assert_ne!(

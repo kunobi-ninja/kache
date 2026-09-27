@@ -3,6 +3,19 @@ use std::time::{Duration, Instant};
 
 const CACHE_KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
+/// A key record whose group digests an event can be checked for.
+fn key_record() -> KeyEventRecord {
+    let mut record = KeyEventRecord::default();
+    record.absorb(&crate::cache_key::KeyOutputs {
+        fields: Some(std::collections::BTreeMap::from([(
+            "args".to_string(),
+            "aaaa".to_string(),
+        )])),
+        ..Default::default()
+    });
+    record
+}
+
 fn key_with(dep_info: crate::cache_key::DepInfo) -> crate::cache_key::KeyOutputs {
     crate::cache_key::KeyOutputs {
         dep_info: Some(dep_info),
@@ -133,6 +146,7 @@ fn completion_child() {
         29,
         Some(&fixture.store),
         &fixture.key(),
+        &key_record(),
     );
     let identity = crate::cache_key::rustc_prediction_identity(&fixture.args).unwrap();
     let prediction = fixture.store.file_hasher().input_prediction(&identity);
@@ -168,6 +182,10 @@ fn completion_child() {
     assert_eq!(event.compile_time_ms, 7);
     assert!(event.elapsed_ms >= 1500);
     assert_eq!(event.key_ms, 41);
+    assert_eq!(
+        event.key_fields.get("args").map(String::as_str),
+        Some("aaaa")
+    );
     assert_eq!(event.key_hash_hits, 3);
     assert_eq!(event.key_hash_misses, 5);
     assert_eq!(event.key_hash_bytes, 73);
@@ -250,6 +268,7 @@ fn predictions_belong_to_the_key_store_and_are_not_rewritten_when_declined() {
             0,
             Some(&fixture.store),
             &fixture.key(),
+            &KeyEventRecord::default(),
         )
         .unwrap();
     let identity = crate::cache_key::rustc_prediction_identity(&fixture.args).unwrap();
@@ -279,6 +298,7 @@ fn predictions_belong_to_the_key_store_and_are_not_rewritten_when_declined() {
                 source_files: vec!["do-not-record.rs".into()],
                 env_deps: Vec::new(),
             }),
+            &KeyEventRecord::default(),
         )
         .unwrap();
     assert_eq!(
@@ -319,12 +339,17 @@ fn remote_hits_report_provenance_and_record_fresh_predictions() {
             29,
             record_closure,
             &fixture.key(),
+            &key_record(),
         )
         .expect("a committed entry is usable even if the daemon reports found:false")
         .unwrap();
         assert_eq!(daemon.request_count(), 1);
         let events = events::read_events(&fixture.config.event_log_path()).unwrap();
         assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].key_fields.get("args").map(String::as_str),
+            Some("aaaa")
+        );
         assert_eq!(
             events[0].result,
             if !found {
@@ -371,6 +396,7 @@ fn remote_misses_and_failed_restores_do_not_complete_hits() {
             0,
             true,
             &fixture.key(),
+            &KeyEventRecord::default(),
         );
         if mode == "restore-error" {
             assert!(restored.unwrap().is_err());

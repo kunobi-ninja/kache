@@ -7,3 +7,5 @@
 cc 189eb4795268b0f68c8eebf1d2241c0c0541f1b7eb73017221c99b12675b871f # shrinks to install = Mise, alias = Absent, profiles = [Absent, Absent, Absent, Absent, Absent], entries = [MiseShims], sudo = false
 cc a4478fe7c1ccd80e044d6921ffcfdf6fe0adc03be05da6fcca75884c058902e5 # shrinks to install = Mise, alias = Absent, profiles = [Absent, Absent, Absent, Absent, Absent], entries = [], sudo = false
 cc 0429488362466695e32ad89186644b1eea07e957ea19f7aac30f752352b529b9 # shrinks to install = Homebrew, alias = Other, profiles = [Absent, Absent, Absent, Absent, Absent], entries = [Relative(0)], sudo = false
+cc dbb51d7cfd02acb404263c0802db2598d1b29914374620dfc63ced74c0c183a1 # shrinks to shape = Homebrew custom=false alias=This copy=true profiles=[Absent, Absent, Absent, Absent, Absent, Absent, Absent] sudo=false, entries = []
+cc 6ba318af65d45531ff0f475f8fa6665fa43bf6c195d6ece33562fc18b9b70cf4 # shrinks to shape = Mise custom=false alias=Absent copy=false profiles=[Absent, Absent, Absent, Absent, Absent, Absent, Absent] sudo=false, entries = [Generation]

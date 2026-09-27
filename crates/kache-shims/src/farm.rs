@@ -31,12 +31,26 @@ pub fn has_marker(dir: &Path) -> bool {
     dir.join(MARKER).is_file()
 }
 
-pub fn write_marker(dir: &Path) -> io::Result<()> {
-    std::fs::write(
-        dir.join(MARKER),
-        "kache compiler shims. kache skips this directory when it looks for \
-         the real compiler, so keep only shims here.\n",
-    )
+/// Writes the marker unless something is already there. `Ok(false)` when the
+/// name is taken by anything but a regular file: never write through a link.
+pub fn write_marker(dir: &Path) -> io::Result<bool> {
+    use std::io::Write;
+    let path = dir.join(MARKER);
+    match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => return Ok(metadata.is_file()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    // create_new fails on any existing entry, a link included.
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)?;
+    file.write_all(
+        b"kache compiler shims. kache skips this directory when it looks for \
+          the real compiler, so keep only shims here.\n",
+    )?;
+    Ok(true)
 }
 
 /// Catches shims of another kache install, including farms older than the marker.
@@ -141,8 +155,8 @@ fn classify(
 }
 
 #[cfg(unix)]
-/// Without `force`, replace only what serves no one (broken) or an upgrade
-/// will break (versioned), and only in a directory kache owns.
+/// Without `force`, replace only a kache shim that serves no one (broken) or
+/// that an upgrade will break (versioned), in a directory kache owns.
 fn decide(slot: Slot, force: bool, owned: bool) -> Action {
     match slot {
         Slot::Empty => Action::Create,
@@ -205,6 +219,35 @@ impl Installed {
     }
 }
 
+#[cfg(unix)]
+/// A single plain file name: no separators, no `.` or `..`.
+fn valid_name(name: &str) -> bool {
+    let mut components = Path::new(name).components();
+    matches!(components.next(), Some(Component::Normal(first)) if first == name)
+        && components.next().is_none()
+        && !name.contains(['/', '\\'])
+}
+
+#[cfg(unix)]
+/// Point `link` at `target` through a temporary name and a rename, so the
+/// name is never missing and a failure leaves the old entry in place.
+fn replace_link(dir: &Path, name: &str, target: &Path) -> Result<(), InstallError> {
+    let link = dir.join(name);
+    let temporary = dir.join(format!(".{name}.kache-{}", std::process::id()));
+    match std::fs::remove_file(&temporary) {
+        Err(error) if error.kind() != io::ErrorKind::NotFound => {
+            return Err(InstallError::new("clearing", &temporary, error));
+        }
+        _ => {}
+    }
+    std::os::unix::fs::symlink(target, &temporary)
+        .map_err(|error| InstallError::new("creating shim", &temporary, error))?;
+    std::fs::rename(&temporary, &link).map_err(|error| {
+        let _ = std::fs::remove_file(&temporary);
+        InstallError::new("replacing", &link, error)
+    })
+}
+
 /// An [`install`] step that failed.
 #[derive(Debug)]
 pub struct InstallError {
@@ -235,7 +278,7 @@ impl std::error::Error for InstallError {
 }
 
 /// Link each of `names` in `dir` to `target`. Existing entries stay unless
-/// `force`, except broken or versioned links in a directory kache owns
+/// `force`, except broken or versioned kache shims in a directory kache owns
 /// (created now, marked, or holding only kache shims). Marks the directory
 /// when it ends up holding only shims.
 #[cfg(unix)]
@@ -247,6 +290,14 @@ pub fn install(
     layout: &Layout,
 ) -> Result<Installed, InstallError> {
     let fs = crate::fs::RealFs;
+    if let Some(name) = names.iter().find(|name| !valid_name(name)) {
+        let error = io::Error::new(io::ErrorKind::InvalidInput, "not a plain file name");
+        return Err(InstallError::new(
+            "refusing shim name",
+            Path::new(name),
+            error,
+        ));
+    }
     let created = std::fs::symlink_metadata(dir).is_err();
     std::fs::create_dir_all(dir)
         .map_err(|error| InstallError::new("creating shim directory", dir, error))?;
@@ -256,6 +307,7 @@ pub fn install(
         holds_only_shims(dir, Some(target), &fs),
     );
     let versioned = |path: &Path| layout.versioned(path).is_some();
+    let target_real = fs.resolve(target);
 
     let mut report = Installed::default();
     for name in names {
@@ -273,21 +325,19 @@ pub fn install(
         };
         let reaches = crate::fs::is_executable_file(&link);
         let slot = classify(occupied, text.as_deref(), reaches, target, &versioned);
-        let action = decide(slot, force, owned);
-        if let Action::Replace(_) = action {
-            std::fs::remove_file(&link)
-                .map_err(|error| InstallError::new("replacing", &link, error))?;
-        }
-        if matches!(action, Action::Create | Action::Replace(_)) {
-            std::os::unix::fs::symlink(target, &link)
-                .map_err(|error| InstallError::new("creating shim", &link, error))?;
+        let kache_entry = is_shim_entry(&link, target_real.as_deref(), &fs);
+        let action = decide(slot, force, owned && kache_entry);
+        match action {
+            Action::Create => std::os::unix::fs::symlink(target, &link)
+                .map_err(|error| InstallError::new("creating shim", &link, error))?,
+            Action::Replace(_) => replace_link(dir, name, target)?,
+            Action::Keep | Action::Skip => {}
         }
         report.record(name.clone(), action);
     }
 
-    report.marked = holds_only_shims(dir, Some(target), &fs);
-    if report.marked {
-        write_marker(dir)
+    if holds_only_shims(dir, Some(target), &fs) {
+        report.marked = write_marker(dir)
             .map_err(|error| InstallError::new("marking shim directory", dir, error))?;
     }
     Ok(report)
@@ -334,23 +384,30 @@ impl Status {
         }
     }
 
-    /// The command that fixes this state.
-    pub fn fix(&self, default_dir: &Path) -> Option<String> {
+    /// The command that fixes this state. `default_dir` is `None` without a
+    /// home directory.
+    pub fn fix(&self, default_dir: Option<&Path>) -> Option<String> {
         match self {
             Status::Active { .. } => None,
-            Status::Broken { dir, .. } if dir == default_dir => Some("kache install-shims".into()),
+            Status::Broken { dir, .. } if Some(dir.as_path()) == default_dir => {
+                Some("kache install-shims".into())
+            }
             Status::Broken { dir, .. } => Some(format!("kache install-shims {}", dir.display())),
             Status::NotFirst { dir } => Some(format!("export PATH=\"{}:$PATH\"", dir.display())),
-            Status::NotInstalled => Some(format!(
-                "kache install-shims && export PATH=\"{}:$PATH\"",
-                default_dir.display()
-            )),
+            Status::NotInstalled => Some(match default_dir {
+                Some(dir) => format!(
+                    "kache install-shims && export PATH=\"{}:$PATH\"",
+                    dir.display()
+                ),
+                None => "no home directory: run kache install-shims DIR and put DIR first on PATH"
+                    .into(),
+            }),
         }
     }
 }
 
 fn broken_shims(dir: &Path, fs: &dyn Fs) -> Option<(Vec<String>, PathBuf)> {
-    if !dir.has_root() {
+    if !dir.is_absolute() {
         return None;
     }
     let marked = fs.is_file(&dir.join(MARKER));
@@ -386,14 +443,19 @@ fn active_shim(
     })
 }
 
-/// `known_dirs` are the default and system farms. A broken farm is reported
-/// first: its fix is the one that restores caching.
+/// `known_dirs` are the default and system farms. A working farm first on
+/// `PATH` wins; otherwise a broken farm comes next, since its fix is the one
+/// that restores caching.
 pub fn status(
     path_dirs: &[PathBuf],
     self_exe: Option<&Path>,
     known_dirs: &[PathBuf],
     fs: &dyn Fs,
 ) -> Status {
+    let own = self_exe.and_then(|exe| fs.identity(exe));
+    if let Some(active) = active_shim(path_dirs, own, fs) {
+        return active;
+    }
     let broken = known_dirs
         .iter()
         .chain(path_dirs)
@@ -404,10 +466,6 @@ pub fn status(
             names,
             target,
         };
-    }
-    let own = self_exe.and_then(|exe| fs.identity(exe));
-    if let Some(active) = active_shim(path_dirs, own, fs) {
-        return active;
     }
     let installed = known_dirs.iter().find(|dir| {
         own.is_some()

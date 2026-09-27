@@ -9,4 +9,7 @@ mod select;
 pub use farm::install;
 pub use farm::{InstallError, Installed, Status};
 pub use fs::{Fs, RealFs, is_executable_file};
-pub use select::{Elevation, Env, Error, Kind, Layout, Selection, Stability, detect, select};
+pub use kache_fs::InodeId;
+pub use select::{
+    Elevation, Env, Error, Kind, Layout, Selection, Stability, detect, running_identity, select,
+};

@@ -172,7 +172,7 @@ fn each_layout_selects_the_expected_path() {
             reason: "Homebrew removes this version",
         },
         Row {
-            name: "Homebrew without an opt link falls back to PATH",
+            name: "a PATH link into a keg is as pinned as the keg",
             fs: || {
                 FakeFs::new()
                     .exe("/home/linuxbrew/.linuxbrew/Cellar/kache/0.20.0/bin/kache")
@@ -184,9 +184,93 @@ fn each_layout_selects_the_expected_path() {
             exe: "/home/linuxbrew/.linuxbrew/Cellar/kache/0.20.0/bin/kache",
             path: &["/home/linuxbrew/.linuxbrew/bin"],
             tweak: plain_env,
-            want: "/home/linuxbrew/.linuxbrew/bin/kache",
+            want: "/home/linuxbrew/.linuxbrew/Cellar/kache/0.20.0/bin/kache",
             kind: Homebrew,
-            stability: UserManaged,
+            stability: Versioned,
+            reason: "",
+        },
+        Row {
+            name: "a symlinked PATH dir into a mise version",
+            fs: || FakeFs::new().exe(MISE_EXE).link("/usr/local/bin", MISE_BIN),
+            exe: MISE_EXE,
+            path: &["/usr/local/bin"],
+            tweak: plain_env,
+            want: MISE_EXE,
+            kind: Mise,
+            stability: Versioned,
+            reason: "",
+        },
+        Row {
+            name: "a Homebrew opt copy is not an installer alias",
+            fs: || {
+                FakeFs::new()
+                    .exe(KEG)
+                    .same_file("/opt/homebrew/opt/kache/bin/kache", KEG)
+            },
+            exe: KEG,
+            path: &[],
+            tweak: plain_env,
+            want: KEG,
+            kind: Homebrew,
+            stability: Versioned,
+            reason: "",
+        },
+        Row {
+            name: "MISE_INSTALLS_DIR",
+            fs: || {
+                FakeFs::new()
+                    .exe("/mise-installs/kache/0.26.3/bin/kache")
+                    .link("/mise-installs/kache/latest", "0.26.3")
+            },
+            exe: "/mise-installs/kache/0.26.3/bin/kache",
+            path: &[],
+            tweak: |env| env.mise_installs_dir = Some("/mise-installs".into()),
+            want: "/mise-installs/kache/latest/bin/kache",
+            kind: Mise,
+            stability: InstallerManaged,
+            reason: "",
+        },
+        Row {
+            name: "ASDF_DIR when ~/.asdf is absent",
+            fs: || FakeFs::new().exe("/opt/asdf/installs/kache/1.0/bin/kache"),
+            exe: "/opt/asdf/installs/kache/1.0/bin/kache",
+            path: &["/opt/asdf/installs/kache/1.0/bin"],
+            tweak: |env| env.asdf_dir = Some("/opt/asdf".into()),
+            want: "/opt/asdf/installs/kache/1.0/bin/kache",
+            kind: Asdf,
+            stability: Versioned,
+            reason: "",
+        },
+        Row {
+            name: "a pinned Nix generation on PATH",
+            fs: || {
+                FakeFs::new().exe("/opt/tools/kache").same_file(
+                    "/nix/var/nix/profiles/profile-7-link/bin/kache",
+                    "/opt/tools/kache",
+                )
+            },
+            exe: "/opt/tools/kache",
+            path: &["/nix/var/nix/profiles/profile-7-link/bin"],
+            tweak: plain_env,
+            want: "/opt/tools/kache",
+            kind: Other,
+            stability: Versioned,
+            reason: "",
+        },
+        Row {
+            name: "root's Nix profile",
+            fs: || {
+                FakeFs::new().exe(STORE).link(
+                    "/nix/var/nix/profiles/per-user/root/profile/bin/kache",
+                    STORE,
+                )
+            },
+            exe: STORE,
+            path: &[],
+            tweak: plain_env,
+            want: "/nix/var/nix/profiles/per-user/root/profile/bin/kache",
+            kind: Nix,
+            stability: InstallerManaged,
             reason: "",
         },
         Row {
@@ -466,8 +550,12 @@ enum Entry {
     AsdfShims,
     OwnDir,
     Store,
+    Generation,
     ShimFarm,
     Stable(usize, Reach),
+    /// A PATH link, or a linked PATH dir, that resolves to this binary.
+    Linked(usize),
+    LinkedDir(usize),
 }
 
 fn reach() -> impl Strategy<Value = Reach> {
@@ -481,8 +569,11 @@ fn entry() -> impl Strategy<Value = Entry> {
         Just(Entry::AsdfShims),
         Just(Entry::OwnDir),
         Just(Entry::Store),
+        Just(Entry::Generation),
         Just(Entry::ShimFarm),
         (0..3usize, reach()).prop_map(|(i, r)| Entry::Stable(i, r)),
+        (0..2usize).prop_map(Entry::Linked),
+        (0..2usize).prop_map(Entry::LinkedDir),
     ]
 }
 
@@ -496,12 +587,15 @@ fn install() -> impl Strategy<Value = Install> {
     ]
 }
 
-const NIX_BINS: [&str; 5] = [
+/// `nix_profile_bins` order for user `me`.
+const NIX_BINS: [&str; 7] = [
     "/home/me/.nix-profile/bin",
     "/home/me/.local/state/nix/profile/bin",
     "/etc/profiles/per-user/me/bin",
+    "/nix/var/nix/profiles/per-user/me/profile/bin",
     "/run/current-system/sw/bin",
     "/nix/var/nix/profiles/default/bin",
+    "/nix/var/nix/profiles/per-user/root/profile/bin",
 ];
 
 struct World {
@@ -514,84 +608,97 @@ struct World {
     kind: Kind,
 }
 
-fn world(
+/// `custom` moves mise installs to `MISE_INSTALLS_DIR` and asdf to `ASDF_DIR`;
+/// `copy` makes the Homebrew or mise alias a same-file copy, not a link.
+struct Shape {
     install: Install,
+    custom: bool,
     alias: Reach,
-    profiles: [Reach; 5],
-    entries: &[Entry],
+    copy: bool,
+    profiles: [Reach; 7],
     sudo: bool,
-) -> World {
-    let (exe, other, kind) = match install {
+}
+
+fn world(shape: &Shape, entries: &[Entry]) -> World {
+    let mise_installs = if shape.custom && shape.install == Install::Mise {
+        "/custom/mise-installs"
+    } else {
+        "/home/me/.local/share/mise/installs"
+    };
+    let asdf_root = if shape.custom && shape.install == Install::Asdf {
+        "/opt/asdf"
+    } else {
+        "/home/me/.asdf"
+    };
+    let (exe, other, kind) = match shape.install {
         Install::Homebrew => (
-            "/opt/homebrew/Cellar/kache/1.0.0/bin/kache",
-            "/opt/homebrew/Cellar/kache/0.9.0/bin/kache",
+            "/opt/homebrew/Cellar/kache/1.0.0/bin/kache".to_string(),
+            "/opt/homebrew/Cellar/kache/0.9.0/bin/kache".to_string(),
             Kind::Homebrew,
         ),
         Install::Nix => (
-            "/nix/store/aaa-kache-1.0.0/bin/kache",
-            "/nix/store/bbb-kache-0.9.0/bin/kache",
+            "/nix/store/aaa-kache-1.0.0/bin/kache".to_string(),
+            "/nix/store/bbb-kache-0.9.0/bin/kache".to_string(),
             Kind::Nix,
         ),
         Install::Mise => (
-            "/home/me/.local/share/mise/installs/kache/1.0.0/bin/kache",
-            "/home/me/.local/share/mise/installs/kache/0.9.0/bin/kache",
+            format!("{mise_installs}/kache/1.0.0/bin/kache"),
+            format!("{mise_installs}/kache/0.9.0/bin/kache"),
             Kind::Mise,
         ),
         Install::Asdf => (
-            "/home/me/.asdf/installs/kache/1.0.0/bin/kache",
-            "/home/me/.asdf/installs/kache/0.9.0/bin/kache",
+            format!("{asdf_root}/installs/kache/1.0.0/bin/kache"),
+            format!("{asdf_root}/installs/kache/0.9.0/bin/kache"),
             Kind::Asdf,
         ),
-        Install::Plain => ("/opt/tools/kache", "/opt/other/kache", Kind::Other),
+        Install::Plain => (
+            "/opt/tools/kache".to_string(),
+            "/opt/other/kache".to_string(),
+            Kind::Other,
+        ),
     };
+    let (exe, other) = (exe.as_str(), other.as_str());
     let target = |reach: Reach| if reach == Reach::This { exe } else { other };
     let mut fs = FakeFs::new().exe(exe).exe(other);
     let mut aliases = Vec::new();
-    match install {
-        Install::Homebrew if alias != Reach::Absent => {
-            let version = if alias == Reach::This {
-                "1.0.0"
-            } else {
-                "0.9.0"
-            };
-            fs = fs.link(
-                "/opt/homebrew/opt/kache",
-                &format!("../Cellar/kache/{version}"),
-            );
+    let version = |reach: Reach| {
+        if reach == Reach::This {
+            "1.0.0"
+        } else {
+            "0.9.0"
         }
-        Install::Mise if alias != Reach::Absent => {
-            let version = if alias == Reach::This {
-                "1.0.0"
-            } else {
-                "0.9.0"
-            };
-            fs = fs.link("/home/me/.local/share/mise/installs/kache/latest", version);
-        }
-        Install::Nix => {
-            for (bin, reach) in NIX_BINS.iter().zip(profiles) {
-                if reach != Reach::Absent {
-                    fs = fs.link(&format!("{bin}/kache"), target(reach));
-                }
-                if reach == Reach::This {
-                    aliases.push(Path::new(bin).join("kache"));
-                }
+    };
+    let alias_path = match shape.install {
+        Install::Homebrew => Some(("/opt/homebrew/opt/kache".to_string(), "../Cellar/kache")),
+        Install::Mise => Some((format!("{mise_installs}/kache/latest"), ".")),
+        _ => None,
+    };
+    if let (Some((alias, base)), true) = (&alias_path, shape.alias != Reach::Absent) {
+        let path = format!("{alias}/bin/kache");
+        if shape.copy {
+            fs = fs.same_file(&path, target(shape.alias));
+        } else {
+            fs = fs.link(alias, &format!("{base}/{}", version(shape.alias)));
+            if shape.alias == Reach::This {
+                aliases.push(PathBuf::from(path));
             }
         }
-        _ => {}
     }
-    if alias == Reach::This {
-        match install {
-            Install::Homebrew => aliases.push("/opt/homebrew/opt/kache/bin/kache".into()),
-            Install::Mise => {
-                aliases.push("/home/me/.local/share/mise/installs/kache/latest/bin/kache".into())
+    if shape.install == Install::Nix {
+        for (bin, reach) in NIX_BINS.iter().zip(shape.profiles) {
+            if reach != Reach::Absent {
+                fs = fs.link(&format!("{bin}/kache"), target(reach));
             }
-            _ => {}
+            if reach == Reach::This {
+                aliases.push(Path::new(bin).join("kache"));
+            }
         }
     }
 
     let mut path = Vec::new();
     let mut stable_dirs = Vec::new();
     let own_dir = Path::new(exe).parent().unwrap().to_path_buf();
+    let plain = shape.install == Install::Plain;
     for entry in entries {
         let dir = match *entry {
             Entry::Relative(i) => {
@@ -599,20 +706,36 @@ fn world(
                 // Place this binary where a relative entry would find it.
                 let absolute = Path::new("/").join(dir).join("kache");
                 fs = fs.same_file(absolute.to_str().unwrap(), exe);
-                PathBuf::from(dir)
+                path.push(PathBuf::from(dir));
+                continue;
             }
             Entry::MiseShims => PathBuf::from("/home/me/.local/share/mise/shims"),
-            Entry::AsdfShims => PathBuf::from("/home/me/.asdf/shims"),
+            Entry::AsdfShims => Path::new(asdf_root).join("shims"),
             Entry::Store => PathBuf::from("/nix/store/ccc-tools/bin"),
+            Entry::Generation => PathBuf::from("/nix/var/nix/profiles/profile-3-link/bin"),
             Entry::ShimFarm => {
                 fs = fs.plain("/home/me/.local/lib/kache/shims/.kache-shims");
                 PathBuf::from("/home/me/.local/lib/kache/shims")
             }
-            Entry::OwnDir => {
-                if install == Install::Plain {
-                    stable_dirs.push(own_dir.clone());
+            Entry::OwnDir | Entry::Linked(_) | Entry::LinkedDir(_) => {
+                let dir = match *entry {
+                    Entry::Linked(i) => {
+                        let dir = PathBuf::from(format!("/linked{i}"));
+                        fs = fs.link(dir.join("kache").to_str().unwrap(), exe);
+                        dir
+                    }
+                    Entry::LinkedDir(i) => {
+                        let dir = PathBuf::from(format!("/linked-dir{i}"));
+                        fs = fs.link(dir.to_str().unwrap(), own_dir.to_str().unwrap());
+                        dir
+                    }
+                    _ => own_dir.clone(),
+                };
+                // Only a standalone binary lives outside a version directory.
+                if plain {
+                    stable_dirs.push(dir.clone());
                 }
-                path.push(own_dir.clone());
+                path.push(dir);
                 continue;
             }
             Entry::Stable(i, reach) => {
@@ -628,15 +751,20 @@ fn world(
         };
         // Every skipped kind of directory holds this very binary, so a rule
         // that failed to skip it would select it.
-        if !matches!(entry, Entry::Relative(_)) {
-            fs = fs.same_file(dir.join("kache").to_str().unwrap(), exe);
-        }
+        fs = fs.same_file(dir.join("kache").to_str().unwrap(), exe);
         path.push(dir);
     }
 
     let mut env = env(exe, &[]);
     env.path = path;
-    if sudo {
+    if shape.custom {
+        match shape.install {
+            Install::Mise => env.mise_installs_dir = Some(mise_installs.into()),
+            Install::Asdf => env.asdf_dir = Some(asdf_root.into()),
+            _ => {}
+        }
+    }
+    if shape.sudo {
         env.elevation = Some(Elevation::Sudo { user: "me".into() });
     }
     World {
@@ -648,16 +776,42 @@ fn world(
     }
 }
 
+fn shape() -> impl Strategy<Value = Shape> {
+    (
+        install(),
+        any::<bool>(),
+        reach(),
+        any::<bool>(),
+        proptest::array::uniform7(reach()),
+        any::<bool>(),
+    )
+        .prop_map(|(install, custom, alias, copy, profiles, sudo)| Shape {
+            install,
+            custom,
+            alias,
+            copy,
+            profiles,
+            sudo,
+        })
+}
+
+impl std::fmt::Debug for Shape {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{:?} custom={} alias={:?} copy={} profiles={:?} sudo={}",
+            self.install, self.custom, self.alias, self.copy, self.profiles, self.sudo
+        )
+    }
+}
+
 proptest! {
     #[test]
     fn selection_reaches_the_binary_and_picks_the_right_tier(
-        install in install(),
-        alias in reach(),
-        profiles in proptest::array::uniform5(reach()),
+        shape in shape(),
         entries in proptest::collection::vec(entry(), 0..6),
-        sudo in any::<bool>(),
     ) {
-        let world = world(install, alias, profiles, &entries, sudo);
+        let world = world(&shape, &entries);
         let got = select(&world.env, &world.fs).unwrap();
         let own = world.fs.identity(&world.env.exe);
         prop_assert_eq!(world.fs.identity(&got.path), own, "{:?}", got);
@@ -673,7 +827,7 @@ proptest! {
             (None, None) => (world.env.exe.clone(), Stability::Versioned),
         };
         prop_assert_eq!(&got.path, &want_path);
-        let want_stability = if sudo && want_stability.survives_upgrade() {
+        let want_stability = if shape.sudo && want_stability.survives_upgrade() {
             Stability::Unverified
         } else {
             want_stability
@@ -691,7 +845,8 @@ fn keg_paths_split_into_opt_and_formula() {
             "/opt/homebrew/Cellar/kache/0.20.0/libexec/bin/kache"
         )),
         Some((
-            PathBuf::from("/opt/homebrew/opt/kache/libexec/bin/kache"),
+            PathBuf::from("/opt/homebrew/opt/kache"),
+            PathBuf::from("libexec/bin/kache"),
             "kache".to_string()
         ))
     );
@@ -713,7 +868,8 @@ fn without_home_only_system_locations_are_known() {
         nix_profile_bins(&env),
         [
             PathBuf::from("/run/current-system/sw/bin"),
-            PathBuf::from("/nix/var/nix/profiles/default/bin")
+            PathBuf::from("/nix/var/nix/profiles/default/bin"),
+            PathBuf::from("/nix/var/nix/profiles/per-user/root/profile/bin"),
         ]
     );
     let layout = Layout::new(&env, &FakeFs::new());
@@ -737,25 +893,39 @@ fn elevation_is_sudo_as_root_or_a_home_owned_by_someone_else() {
     let foreign = Some(Elevation::ForeignHome {
         home: "/home/me".into(),
     });
+    let me = Some("me");
     let cases = [
-        (0, Some("me"), home, Some(0), sudo),
-        // SUDO_USER without root is a leftover variable.
-        (1000, Some("me"), home, Some(1000), None),
-        (0, Some(""), home, Some(0), None),
-        (0, None, home, Some(0), None),
-        (0, None, home, Some(1000), foreign),
-        (1000, None, home, None, None),
-        (1000, None, None, Some(0), None),
+        (0, Some("me"), Some("root"), home, Some(0), sudo.clone()),
+        // `sudo -u bob` as me: not root, but someone else's environment.
+        (1000, Some("me"), Some("bob"), home, Some(1000), sudo),
+        // SUDO_USER equal to the current user is a leftover variable.
+        (1000, Some("me"), me, home, Some(1000), None),
+        (0, Some(""), me, home, Some(0), None),
+        (0, None, me, home, Some(0), None),
+        (0, None, me, home, Some(1000), foreign),
+        (1000, None, me, home, None, None),
+        (1000, None, me, None, Some(0), None),
     ];
-    for (euid, sudo_user, home, owner, want) in cases {
-        let got = elevation(euid, sudo_user.map(String::from), home, owner);
-        assert_eq!(got, want, "euid={euid} sudo={sudo_user:?} owner={owner:?}");
+    for (euid, sudo_user, user, home, owner, want) in cases {
+        let got = elevation(euid, sudo_user.map(String::from), user, home, owner);
+        assert_eq!(
+            got, want,
+            "euid={euid} sudo={sudo_user:?} user={user:?} owner={owner:?}"
+        );
     }
 }
 
 #[test]
 fn a_replaced_or_missing_binary_is_an_error() {
-    let fs = FakeFs::new().exe("/usr/bin/kache");
+    let fs = FakeFs::new().exe("/usr/bin/kache").exe("/usr/bin/other");
+    // The path now names a different file from the running image.
+    let mut swapped = env("/usr/bin/kache", &[]);
+    swapped.exe_identity = fs.identity(Path::new("/usr/bin/other"));
+    let error = select(&swapped, &fs).unwrap_err();
+    assert!(matches!(&error, Error::Replaced(p) if p == Path::new("/usr/bin/kache")));
+    swapped.exe_identity = fs.identity(Path::new("/usr/bin/kache"));
+    assert!(select(&swapped, &fs).is_ok());
+
     let replaced = select(&env("/usr/bin/kache (deleted)", &[]), &fs).unwrap_err();
     assert!(matches!(&replaced, Error::Replaced(p) if p == Path::new("/usr/bin/kache")));
     assert!(
@@ -808,21 +978,35 @@ fn live_wiring_reads_this_process() {
 
     let env = Env::from_process().unwrap();
     assert_eq!(env.exe, exe);
+    assert_eq!(env.exe_identity, kache_fs::file_identity(&exe).ok());
+    assert_eq!(running_identity(), env.exe_identity);
     let path = std::env::var_os("PATH").unwrap_or_default();
     assert_eq!(env.path, std::env::split_paths(&path).collect::<Vec<_>>());
     assert_eq!(env.home, std::env::var_os("HOME").map(PathBuf::from));
 
-    if let Some(home) = &env.home
-        && std::env::var_os("ASDF_DATA_DIR").is_none()
-    {
-        let install = home.join(".asdf/installs/kache/1.0/bin");
-        assert_eq!(Layout::from_process().versioned(&install), Some(Kind::Asdf));
+    if let Some(home) = &env.home {
+        let var = |name| {
+            std::env::var_os(name)
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from)
+        };
+        let installs = var("MISE_INSTALLS_DIR").unwrap_or_else(|| {
+            var("MISE_DATA_DIR")
+                .or_else(|| var("XDG_DATA_HOME").map(|data| data.join("mise")))
+                .unwrap_or_else(|| home.join(".local/share/mise"))
+                .join("installs")
+        });
+        let version_dir = installs.join("kache/1.0/bin");
+        assert_eq!(
+            Layout::from_process().versioned(&version_dir),
+            Some(Kind::Mise)
+        );
     }
 
     // SAFETY: geteuid has no preconditions.
     if unsafe { libc::geteuid() } != 0 {
         assert_eq!(
-            process_elevation(Some(Path::new("/"))),
+            process_elevation(Some(Path::new("/")), env.user.as_deref()),
             Some(Elevation::ForeignHome { home: "/".into() })
         );
     }

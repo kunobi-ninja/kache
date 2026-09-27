@@ -42,14 +42,100 @@ fn default_and_system_farms_are_the_documented_locations() {
 fn the_marker_is_a_file() {
     let (_dir, root) = scratch();
     assert!(!has_marker(&root));
-    write_marker(&root).unwrap();
+    assert!(write_marker(&root).unwrap());
     assert!(has_marker(&root));
+    std::fs::write(root.join(MARKER), "packaged").unwrap();
+    assert!(write_marker(&root).unwrap(), "an existing marker is kept");
+    assert_eq!(std::fs::read(root.join(MARKER)).unwrap(), b"packaged");
     let (_dir, root) = scratch();
     std::fs::create_dir(root.join(MARKER)).unwrap();
     assert!(
         !has_marker(&root),
         "a directory named like the marker is not one"
     );
+    assert!(!write_marker(&root).unwrap());
+}
+
+/// A marker that is a link must never be written through: it could point at
+/// any file the user owns.
+#[test]
+fn the_marker_never_follows_a_symlink() {
+    let (_dir, root) = scratch();
+    let profile = root.join("profile");
+    std::fs::write(&profile, "export PATH=...").unwrap();
+    let target = root.join("bin/kache");
+    write_executable(&target);
+    let shims = root.join("shims");
+    std::fs::create_dir_all(&shims).unwrap();
+    symlink(&profile, shims.join(MARKER)).unwrap();
+    assert!(!write_marker(&shims).unwrap());
+    let report = install_all(&shims, &target, false);
+    assert!(!report.marked);
+    assert_eq!(std::fs::read(&profile).unwrap(), b"export PATH=...");
+
+    let dangling = root.join("nothing-here");
+    std::fs::remove_file(shims.join(MARKER)).unwrap();
+    symlink(&dangling, shims.join(MARKER)).unwrap();
+    assert!(!write_marker(&shims).unwrap());
+    assert!(!dangling.exists(), "the link's target must not be created");
+}
+
+#[test]
+fn shim_names_are_plain_file_names() {
+    for name in ["cc", "c++", "gcc-13", "x86_64-linux-gnu-gcc"] {
+        assert!(valid_name(name), "{name}");
+    }
+    for name in ["", ".", "..", "../cc", "a/b", "/usr/bin/cc", "a\\b"] {
+        assert!(!valid_name(name), "{name}");
+    }
+    let (_dir, root) = scratch();
+    let shims = root.join("shims");
+    let error = install(
+        &shims,
+        &root.join("kache"),
+        &["cc".into(), "../escape".into()],
+        false,
+        &Layout::default(),
+    )
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .starts_with("refusing shim name ../escape"),
+        "{error}"
+    );
+    assert!(!shims.exists(), "nothing is created for a bad name");
+}
+
+/// Replacement goes through a temporary link and a rename: success leaves no
+/// temporary behind, and a failure leaves the old link in place.
+#[test]
+fn replacement_is_atomic() {
+    let (_dir, root) = scratch();
+    let target = root.join("new/kache");
+    write_executable(&target);
+    let shims = root.join("shims");
+    std::fs::create_dir_all(&shims).unwrap();
+    write_marker(&shims).unwrap();
+    let old = root.join("old/kache");
+    symlink(&old, shims.join("cc")).unwrap();
+
+    // The temporary name is taken by a directory, so the swap cannot start.
+    let blocker = shims.join(format!(".cc.kache-{}", std::process::id()));
+    std::fs::create_dir_all(blocker.join("inside")).unwrap();
+    let error = install(&shims, &target, &["cc".into()], false, &Layout::default()).unwrap_err();
+    assert!(error.to_string().starts_with("clearing "), "{error}");
+    assert_eq!(std::fs::read_link(shims.join("cc")).unwrap(), old);
+
+    std::fs::remove_dir_all(&blocker).unwrap();
+    let report = install(&shims, &target, &["cc".into()], false, &Layout::default()).unwrap();
+    assert_eq!(report.repaired, ["cc"]);
+    assert_eq!(std::fs::read_link(shims.join("cc")).unwrap(), target);
+    let names: Vec<_> = std::fs::read_dir(&shims)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(names.len(), 2, "only cc and the marker: {names:?}");
 }
 
 #[test]
@@ -381,11 +467,19 @@ fn status_tells_each_state_apart() {
             Status::NotInstalled,
         ),
         (
-            "a broken farm outranks a working one",
+            "a working farm first on PATH outranks a broken unused one",
             shims(base(), "/usr/lib/kache", ME).link(&format!("{FARM}/cc"), "/gone/kache"),
             dirs(&["/usr/lib/kache"]),
             Some(ME),
             dirs(&[FARM]),
+            active("cc", "/usr/lib/kache"),
+        ),
+        (
+            "a broken farm outranks one that is installed but not first",
+            shims(base(), "/usr/lib/kache", ME).link(&format!("{FARM}/cc"), "/gone/kache"),
+            dirs(&["/usr/bin"]),
+            Some(ME),
+            dirs(&[FARM, "/usr/lib/kache"]),
             broken(FARM, &["cc"], "/gone/kache"),
         ),
     ];
@@ -432,8 +526,15 @@ fn status_wording_names_the_fix() {
     ];
     for (status, detail, fix) in rows {
         assert_eq!(status.detail(), detail);
-        assert_eq!(status.fix(default).as_deref(), fix, "{detail}");
+        assert_eq!(status.fix(Some(default)).as_deref(), fix, "{detail}");
     }
+    // Without a home directory there is no default farm to name.
+    assert_eq!(
+        broken(FARM, &["cc"], "/gone/kache").fix(None).as_deref(),
+        Some("kache install-shims /home/me/.local/lib/kache/shims")
+    );
+    let homeless = Status::NotInstalled.fix(None).unwrap();
+    assert!(homeless.starts_with("no home directory"), "{homeless}");
 }
 
 // Install, against the real filesystem.
@@ -507,7 +608,25 @@ fn an_existing_link_is_kept_or_replaced_by_what_it_reaches() {
     let skipped: Bucket = |r| &r.skipped;
     let current: Bucket = |r| &r.current;
     // (case, link text, target, an extra real file in the dir, marked, bucket)
-    let rows: [(&str, &str, &str, bool, bool, Bucket); 6] = [
+    let rows: [(&str, &str, &str, bool, bool, Bucket); 8] = [
+        // Ownership is per directory, replacement per entry: a user's own
+        // link stays even in a marked farm.
+        (
+            "a user's dangling link, marked",
+            "old-gcc",
+            "new/kache",
+            false,
+            true,
+            skipped,
+        ),
+        (
+            "a user's link into a keg, marked",
+            "Cellar/gcc/13/bin/gcc",
+            "new/kache",
+            false,
+            true,
+            skipped,
+        ),
         (
             "dangling, owned",
             "old/kache",
@@ -564,6 +683,7 @@ fn an_existing_link_is_kept_or_replaced_by_what_it_reaches() {
             "other/kache",
             "Cellar/kache/0.19.0/bin/kache",
             "Cellar/kache/0.20.0/bin/kache",
+            "Cellar/gcc/13/bin/gcc",
         ] {
             write_executable(&root.join(exe));
         }

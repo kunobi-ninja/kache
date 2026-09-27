@@ -125,13 +125,20 @@ pub enum Elevation {
 pub struct Env {
     /// `current_exe()`, unresolved.
     pub exe: PathBuf,
+    /// Identity of the running image (`/proc/self/exe` on Linux). When set,
+    /// `exe` must still name this file, or the binary was replaced.
+    pub exe_identity: Option<InodeId>,
     pub path: Vec<PathBuf>,
     pub home: Option<PathBuf>,
     pub user: Option<String>,
     pub xdg_state_home: Option<PathBuf>,
     pub xdg_data_home: Option<PathBuf>,
     pub mise_data_dir: Option<PathBuf>,
+    pub mise_installs_dir: Option<PathBuf>,
     pub asdf_data_dir: Option<PathBuf>,
+    /// asdf's own checkout, its data dir when `ASDF_DATA_DIR` is unset and
+    /// `~/.asdf` does not exist.
+    pub asdf_dir: Option<PathBuf>,
     pub elevation: Option<Elevation>,
 }
 
@@ -146,22 +153,41 @@ impl Env {
         let user = var("USER")
             .or_else(|| var("LOGNAME"))
             .and_then(|user| user.into_string().ok());
-        let elevation = process_elevation(home.as_deref());
+        let elevation = process_elevation(home.as_deref(), user.as_deref());
         Ok(Self {
             exe: std::env::current_exe()?,
+            exe_identity: running_identity(),
             path,
             home,
             user,
             xdg_state_home: dir("XDG_STATE_HOME"),
             xdg_data_home: dir("XDG_DATA_HOME"),
             mise_data_dir: dir("MISE_DATA_DIR"),
+            mise_installs_dir: dir("MISE_INSTALLS_DIR"),
             asdf_data_dir: dir("ASDF_DATA_DIR"),
+            asdf_dir: dir("ASDF_DIR"),
             elevation,
         })
     }
 }
 
-fn process_elevation(home: Option<&Path>) -> Option<Elevation> {
+/// Identity of the running image. On Linux `/proc/self/exe` reaches it even
+/// after the path was replaced; elsewhere this re-reads `current_exe()`, a
+/// present-time check.
+pub fn running_identity() -> Option<InodeId> {
+    #[cfg(target_os = "linux")]
+    {
+        kache_fs::file_identity(Path::new("/proc/self/exe")).ok()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        std::env::current_exe()
+            .ok()
+            .and_then(|exe| kache_fs::file_identity(&exe).ok())
+    }
+}
+
+fn process_elevation(home: Option<&Path>, user: Option<&str>) -> Option<Elevation> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
@@ -169,23 +195,27 @@ fn process_elevation(home: Option<&Path>) -> Option<Elevation> {
         let euid = unsafe { libc::geteuid() };
         let sudo_user = std::env::var("SUDO_USER").ok();
         let home_owner = home.and_then(|home| std::fs::metadata(home).ok().map(|m| m.uid()));
-        elevation(euid, sudo_user, home, home_owner)
+        elevation(euid, sudo_user, user, home, home_owner)
     }
     #[cfg(not(unix))]
     {
-        let _ = home;
+        let _ = (home, user);
         None
     }
 }
 
 #[cfg_attr(not(unix), allow(dead_code))]
+/// sudo to root, or `sudo -u <other>`; a `SUDO_USER` equal to the current
+/// user is a leftover.
 fn elevation(
     euid: u32,
     sudo_user: Option<String>,
+    user: Option<&str>,
     home: Option<&Path>,
     home_owner: Option<u32>,
 ) -> Option<Elevation> {
-    if let Some(user) = sudo_user.filter(|user| euid == 0 && !user.is_empty()) {
+    let sudo = |by: &String| !by.is_empty() && (euid == 0 || user != Some(by.as_str()));
+    if let Some(user) = sudo_user.filter(sudo) {
         return Some(Elevation::Sudo { user });
     }
     match (home, home_owner) {
@@ -199,8 +229,9 @@ fn elevation(
 /// Where the version managers keep their installs and dispatchers.
 #[derive(Debug, Clone, Default)]
 pub struct Layout {
-    mise: Vec<PathBuf>,
-    asdf: Vec<PathBuf>,
+    mise_installs: Vec<PathBuf>,
+    asdf_installs: Vec<PathBuf>,
+    dispatchers: Vec<PathBuf>,
 }
 
 impl Layout {
@@ -211,13 +242,26 @@ impl Layout {
             .clone()
             .or_else(|| env.xdg_data_home.as_ref().map(|data| data.join("mise")))
             .or_else(|| home.map(|home| home.join(".local/share/mise")));
+        let mise_installs = env
+            .mise_installs_dir
+            .clone()
+            .or_else(|| mise.as_ref().map(|mise| mise.join("installs")));
+        let home_asdf = home
+            .map(|home| home.join(".asdf"))
+            .filter(|dir| fs.resolve(dir).is_some());
         let asdf = env
             .asdf_data_dir
             .clone()
-            .or_else(|| home.map(|home| home.join(".asdf")));
+            .or(home_asdf)
+            .or_else(|| env.asdf_dir.clone());
+        let shims = |root: &Option<PathBuf>| root.as_ref().map(|root| root.join("shims"));
         Self {
-            mise: with_resolved(mise, fs),
-            asdf: with_resolved(asdf, fs),
+            mise_installs: with_resolved(mise_installs, fs),
+            asdf_installs: with_resolved(asdf.as_ref().map(|asdf| asdf.join("installs")), fs),
+            dispatchers: [shims(&mise), shims(&asdf)]
+                .into_iter()
+                .flat_map(|dir| with_resolved(dir, fs))
+                .collect(),
         }
     }
 
@@ -230,16 +274,16 @@ impl Layout {
     /// The installer whose version directory holds `path`. mise's `latest`
     /// alias is not a version directory.
     pub fn versioned(&self, path: &Path) -> Option<Kind> {
-        if path.starts_with("/nix/store") {
+        if path.starts_with("/nix/store") || path.components().any(is_nix_generation) {
             return Some(Kind::Nix);
         }
         if homebrew_keg(path).is_some() {
             return Some(Kind::Homebrew);
         }
-        if install_parts(path, &self.mise).is_some_and(|parts| parts.version != "latest") {
+        if install_parts(path, &self.mise_installs).is_some_and(|parts| parts.version != "latest") {
             return Some(Kind::Mise);
         }
-        if install_parts(path, &self.asdf).is_some() {
+        if install_parts(path, &self.asdf_installs).is_some() {
             return Some(Kind::Asdf);
         }
         None
@@ -247,10 +291,7 @@ impl Layout {
 
     /// mise and asdf shims run whatever version the current directory selects.
     fn is_dispatcher(&self, dir: &Path) -> bool {
-        self.mise
-            .iter()
-            .chain(&self.asdf)
-            .any(|root| dir == root.join("shims"))
+        self.dispatchers.iter().any(|shims| dir == shims)
     }
 }
 
@@ -263,19 +304,19 @@ fn with_resolved(dir: Option<PathBuf>, fs: &dyn Fs) -> Vec<PathBuf> {
     std::iter::once(dir).chain(real).collect()
 }
 
-/// `<prefix>/Cellar/<formula>/<version>/<rest>` -> (`<prefix>/opt/<formula>/<rest>`, formula).
-fn homebrew_keg(path: &Path) -> Option<(PathBuf, String)> {
+/// `<prefix>/Cellar/<formula>/<version>/<rest>` -> (`<prefix>/opt/<formula>`, rest, formula).
+fn homebrew_keg(path: &Path) -> Option<(PathBuf, PathBuf, String)> {
     let components: Vec<Component<'_>> = path.components().collect();
     let cellar = components.iter().position(|c| c.as_os_str() == "Cellar")?;
     let formula = components.get(cellar + 1)?.as_os_str();
     let rest = components
         .get(cellar + 3..)
         .filter(|rest| !rest.is_empty())?;
-    let mut opt: PathBuf = components[..cellar].iter().collect();
-    opt.push("opt");
-    opt.push(formula);
-    opt.extend(rest);
-    Some((opt, formula.to_string_lossy().into_owned()))
+    let mut link: PathBuf = components[..cellar].iter().collect();
+    link.push("opt");
+    link.push(formula);
+    let rest = rest.iter().collect();
+    Some((link, rest, formula.to_string_lossy().into_owned()))
 }
 
 struct InstallParts {
@@ -285,10 +326,20 @@ struct InstallParts {
     rest: PathBuf,
 }
 
-/// `<root>/installs/<tool>/<version>/<rest>` for one of `roots`.
+/// A pinned Nix generation such as `profile-12-link`.
+fn is_nix_generation(component: Component<'_>) -> bool {
+    let name = component.as_os_str().to_string_lossy();
+    name.strip_suffix("-link")
+        .and_then(|rest| rest.rsplit_once('-'))
+        .is_some_and(|(profile, number)| {
+            !profile.is_empty() && !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit())
+        })
+}
+
+/// `<installs>/<tool>/<version>/<rest>` for one of `roots`.
 fn install_parts(path: &Path, roots: &[PathBuf]) -> Option<InstallParts> {
     roots.iter().find_map(|root| {
-        let inside = path.strip_prefix(root.join("installs")).ok()?;
+        let inside = path.strip_prefix(root).ok()?;
         let mut components = inside.components();
         let tool = components
             .next()?
@@ -323,14 +374,19 @@ fn nix_profile_bins(env: &Env) -> Vec<PathBuf> {
     }
     if let Some(user) = &env.user {
         bins.push(Path::new("/etc/profiles/per-user").join(user).join("bin"));
+        let per_user = Path::new("/nix/var/nix/profiles/per-user").join(user);
+        bins.push(per_user.join("profile/bin"));
     }
     bins.push(PathBuf::from("/run/current-system/sw/bin"));
     bins.push(PathBuf::from("/nix/var/nix/profiles/default/bin"));
+    bins.push(PathBuf::from(
+        "/nix/var/nix/profiles/per-user/root/profile/bin",
+    ));
     bins
 }
 
 fn skip_path_dir(dir: &Path, layout: &Layout, fs: &dyn Fs) -> bool {
-    !dir.has_root()
+    !dir.is_absolute()
         || layout.versioned(dir).is_some()
         || layout.is_dispatcher(dir)
         || fs.is_file(&dir.join(crate::farm::MARKER))
@@ -338,7 +394,7 @@ fn skip_path_dir(dir: &Path, layout: &Layout, fs: &dyn Fs) -> bool {
 
 /// The path to record for `env.exe`.
 pub fn select(env: &Env, fs: &dyn Fs) -> Result<Selection, Error> {
-    let own = fs.identity(&env.exe).ok_or_else(|| missing_exe(&env.exe))?;
+    let own = own_identity(env, fs)?;
     let resolved = fs.resolve(&env.exe).unwrap_or_else(|| env.exe.clone());
     let layout = Layout::new(env, fs);
     let kind = layout.versioned(&resolved).unwrap_or(Kind::Other);
@@ -349,7 +405,7 @@ pub fn select(env: &Env, fs: &dyn Fs) -> Result<Selection, Error> {
         .map(PathBuf::from)
         .unwrap_or_default();
     let reaches = |candidate: &Path| reaches(candidate, own, fs);
-    let selection = installer_alias(&resolved, kind, &name, env, &layout, &reaches)
+    let selection = installer_alias(&resolved, kind, &name, env, &layout, fs, &reaches)
         .or_else(|| path_entry(&name, kind, env, &layout, fs, &reaches))
         .unwrap_or_else(|| fallback(resolved, kind));
     Ok(with_elevation(selection, env.elevation.as_ref()))
@@ -359,6 +415,15 @@ pub fn select(env: &Env, fs: &dyn Fs) -> Result<Selection, Error> {
 pub fn detect() -> Result<Selection, Error> {
     let env = Env::from_process().map_err(Error::CurrentExe)?;
     select(&env, &RealFs)
+}
+
+/// The path must still name the running image; otherwise it was replaced.
+fn own_identity(env: &Env, fs: &dyn Fs) -> Result<InodeId, Error> {
+    let at_path = fs.identity(&env.exe).ok_or_else(|| missing_exe(&env.exe))?;
+    match env.exe_identity {
+        Some(running) if running != at_path => Err(Error::Replaced(env.exe.clone())),
+        _ => Ok(at_path),
+    }
 }
 
 fn missing_exe(exe: &Path) -> Error {
@@ -373,12 +438,15 @@ fn reaches(candidate: &Path, own: InodeId, fs: &dyn Fs) -> bool {
     fs.is_executable_file(candidate) && fs.identity(candidate) == Some(own)
 }
 
+/// An alias counts only if it is a link the installer maintains; a copy with
+/// the same identity is not.
 fn installer_alias(
     resolved: &Path,
     kind: Kind,
     name: &Path,
     env: &Env,
     layout: &Layout,
+    fs: &dyn Fs,
     reaches: &dyn Fn(&Path) -> bool,
 ) -> Option<Selection> {
     let managed = |path: PathBuf, reason: String| Selection {
@@ -389,8 +457,9 @@ fn installer_alias(
     };
     match kind {
         Kind::Homebrew => {
-            let (opt, formula) = homebrew_keg(resolved)?;
-            reaches(&opt).then(|| {
+            let (link, rest, formula) = homebrew_keg(resolved)?;
+            let opt = link.join(rest);
+            (fs.read_link(&link).is_some() && reaches(&opt)).then(|| {
                 managed(
                     opt,
                     format!("Homebrew's opt link for {formula}, which each upgrade repoints"),
@@ -409,14 +478,10 @@ fn installer_alias(
                 )
             }),
         Kind::Mise => {
-            let parts = install_parts(resolved, &layout.mise)?;
-            let latest = parts
-                .root
-                .join("installs")
-                .join(&parts.tool)
-                .join("latest")
-                .join(&parts.rest);
-            reaches(&latest).then(|| {
+            let parts = install_parts(resolved, &layout.mise_installs)?;
+            let alias = parts.root.join(&parts.tool).join("latest");
+            let latest = alias.join(&parts.rest);
+            (fs.read_link(&alias).is_some() && reaches(&latest)).then(|| {
                 managed(
                     latest,
                     format!(
@@ -438,11 +503,17 @@ fn path_entry(
     fs: &dyn Fs,
     reaches: &dyn Fn(&Path) -> bool,
 ) -> Option<Selection> {
+    // A link into a version or store directory is as pinned as its target.
+    let resolves_outside = |candidate: &Path| {
+        fs.resolve(candidate)
+            .and_then(|real| real.parent().map(Path::to_path_buf))
+            .is_some_and(|dir| !skip_path_dir(&dir, layout, fs))
+    };
     env.path
         .iter()
         .filter(|dir| !skip_path_dir(dir, layout, fs))
         .map(|dir| dir.join(name))
-        .find(|candidate| reaches(candidate))
+        .find(|candidate| reaches(candidate) && resolves_outside(candidate))
         .map(|path| {
             let reason = format!(
                 "the first {} on PATH, which keeps working until that file is replaced or removed",

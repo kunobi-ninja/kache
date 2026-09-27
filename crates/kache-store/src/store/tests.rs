@@ -11657,3 +11657,125 @@ fn blob_refcount_drift_reads_the_store_without_the_write_lock() {
     let ro = open_index_db_readonly(&config.index_db_path()).unwrap();
     assert_eq!(crate::blob_refcount_drift(&ro).unwrap(), expected);
 }
+
+/// Generated stores for the size sweep. The examples above each pin one
+/// rule; this checks them together against a model of the walk.
+mod size_sweep_properties {
+    use super::*;
+    use crate::eviction::{SizePressurePolicy, eviction_target, over_eviction_trigger};
+    use proptest::prelude::*;
+
+    #[derive(Debug, Clone)]
+    struct EntrySpec {
+        size: usize,
+        idle_hours: u32,
+        hits: i64,
+        /// Last used inside `EVICTION_IDLE_GRACE`.
+        recent: bool,
+        /// Its only blob is hardlinked into a "target directory".
+        held: bool,
+    }
+
+    fn entry_spec() -> impl Strategy<Value = EntrySpec> {
+        (
+            32usize..=400,
+            1u32..=4,
+            0i64..=3,
+            proptest::bool::weighted(0.25),
+            proptest::bool::weighted(0.3),
+        )
+            .prop_map(|(size, idle_hours, hits, recent, held)| EntrySpec {
+                size,
+                idle_hours,
+                hits,
+                recent,
+                held,
+            })
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 32,
+            max_shrink_iters: 64,
+            ..ProptestConfig::default()
+        })]
+
+        /// Walking the size-pressure ranking, the sweep stops as soon as
+        /// the store minus held bytes is at or below 90% of `max_size`,
+        /// checked before each entry, so the last entry it evicts is the
+        /// one that crosses the line. On the way it skips entries used
+        /// within the grace and, unless `gc_evict_shared` is on, entries
+        /// whose last blob a target directory holds. The evicted set must
+        /// equal that walk exactly.
+        #[test]
+        fn size_sweep_evicts_exactly_the_ranked_prefix_it_may(
+            specs in proptest::collection::vec(entry_spec(), 1..=6),
+            evict_shared in any::<bool>(),
+            max_percent in 1u64..=110,
+        ) {
+            let dir = tempfile::tempdir().unwrap();
+            let mut config = test_config(dir.path());
+            config.deferred_durability = true;
+            let mut store = Store::open(&config).unwrap();
+            let keys: Vec<String> = (0..specs.len()).map(|i| format!("prop-entry-{i}")).collect();
+            for (key, spec) in keys.iter().zip(&specs) {
+                let blob = put_idle_entry(&store, dir.path(), key, spec.size);
+                if spec.held {
+                    std::fs::hard_link(&blob, dir.path().join(format!("target-{key}"))).unwrap();
+                }
+            }
+            // One reference instant, so every entry's idle time moves together.
+            let now: String = store.db.query_row("SELECT datetime('now')", [], |row| row.get(0)).unwrap();
+            for (key, spec) in keys.iter().zip(&specs) {
+                let hours = if spec.recent { 0 } else { spec.idle_hours };
+                store
+                    .db
+                    .execute(
+                        "UPDATE entries SET last_accessed = datetime(?1, ?2), hit_count = ?3 WHERE cache_key = ?4",
+                        params![now, format!("-{hours} hours"), spec.hits, key],
+                    )
+                    .unwrap();
+            }
+            let total: u64 = specs.iter().map(|s| s.size as u64).sum();
+            store.config.max_size = (total * max_percent / 100).max(1);
+            store.config.gc_evict_shared = evict_shared;
+
+            // The model: the live ranking, walked with the sweep's rules.
+            let spec_of = |key: &str| &specs[keys.iter().position(|k| k == key).unwrap()];
+            let order = SizePressurePolicy.select(&store.eviction_candidates().unwrap());
+            let physical = store.physical_size().unwrap();
+            prop_assert_eq!(physical, total);
+            let target = eviction_target(store.config.max_size);
+            let mut expected = std::collections::BTreeSet::new();
+            if over_eviction_trigger(physical, store.config.max_size) {
+                let held: u64 = specs
+                    .iter()
+                    .filter(|s| s.held && !evict_shared)
+                    .map(|s| s.size as u64)
+                    .sum();
+                let mut current = physical.saturating_sub(held);
+                for key in &order {
+                    if current <= target {
+                        break;
+                    }
+                    let spec = spec_of(key);
+                    if spec.recent || (spec.held && !evict_shared) {
+                        continue;
+                    }
+                    expected.insert(key.clone());
+                    current -= spec.size as u64;
+                }
+            }
+
+            store.evict().unwrap();
+            let evicted: std::collections::BTreeSet<String> =
+                keys.iter().filter(|k| !store.contains(k)).cloned().collect();
+            for key in &evicted {
+                let spec = spec_of(key);
+                prop_assert!(!spec.recent, "{key} was used within the grace");
+                prop_assert!(evict_shared || !spec.held, "{key} is held by a target directory");
+            }
+            prop_assert_eq!(evicted, expected);
+        }
+    }
+}

@@ -575,4 +575,86 @@ mod tests {
 
         assert_eq!(DuplicatePolicy.select(&[newest, oldest]), vec!["oldest"]);
     }
+
+    mod properties {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// Candidates with unique keys. Idle times and sizes come from small
+        /// sets so scores tie often; reclaim covers unknown, zero and full.
+        fn candidates() -> impl Strategy<Value = Vec<EntryFeatures>> {
+            let entry = (
+                proptest::sample::select(&[0_i64, 512, 4096, 3 << 20][..]),
+                0_i64..4,
+                proptest::sample::select(&[-1.0, 0.0, 0.5, 2.0, 30.0][..]),
+                proptest::option::of(proptest::sample::select(&["h0", "h1"][..])),
+                any::<bool>(),
+                0_u8..3,
+            );
+            proptest::collection::vec(entry, 0..12).prop_map(|entries| {
+                entries
+                    .into_iter()
+                    .enumerate()
+                    .map(
+                        |(i, (size, hits, idle, hash, committed, reclaim))| EntryFeatures {
+                            key: format!("k{i:02}"),
+                            size,
+                            hit_count: hits,
+                            idle_hours: idle,
+                            content_hash: hash.map(str::to_string),
+                            committed,
+                            compile_time_ms: 0,
+                            reclaimable_bytes: [None, Some(0), Some(size)][reclaim as usize],
+                            recently_accessed: false,
+                            recently_imported: false,
+                        },
+                    )
+                    .collect()
+            })
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig {
+                cases: 64,
+                max_shrink_iters: 256,
+                ..ProptestConfig::default()
+            })]
+
+            /// Selection is a pure function of the candidate list. Size
+            /// pressure ranks every key once by ascending score; reordering
+            /// the list can only reorder keys whose scores tie, since ties
+            /// keep list order. Duplicate selection does not depend on list
+            /// order at all, and keeps each group's most recent member.
+            #[test]
+            fn eviction_selection_is_deterministic(
+                (list, shuffled) in candidates().prop_flat_map(|c| (Just(c.clone()), Just(c).prop_shuffle())),
+            ) {
+                let score = |key: &String| {
+                    size_pressure_score(list.iter().find(|e| &e.key == key).unwrap())
+                };
+                let ranked = SizePressurePolicy.select(&list);
+                prop_assert_eq!(&ranked, &SizePressurePolicy.select(&list));
+                let mut keys = ranked.clone();
+                keys.sort();
+                prop_assert_eq!(keys, list.iter().map(|e| e.key.clone()).collect::<Vec<_>>());
+                let scores: Vec<f64> = ranked.iter().map(score).collect();
+                prop_assert!(scores.is_sorted(), "{scores:?}");
+                let reordered: Vec<f64> = SizePressurePolicy.select(&shuffled).iter().map(score).collect();
+                prop_assert_eq!(scores, reordered);
+
+                let duplicates = DuplicatePolicy.select(&list);
+                prop_assert_eq!(&duplicates, &DuplicatePolicy.select(&shuffled));
+                for key in &duplicates {
+                    let e = list.iter().find(|e| &e.key == key).unwrap();
+                    let newest = list
+                        .iter()
+                        .filter(|o| o.committed && o.content_hash.is_some() && o.content_hash == e.content_hash)
+                        .map(|o| o.idle_hours)
+                        .fold(f64::INFINITY, f64::min);
+                    prop_assert!(e.committed && e.idle_hours > newest, "{e:?}");
+                    prop_assert!(e.reclaimable_bytes.is_some_and(|b| b > 0), "{e:?}");
+                }
+            }
+        }
+    }
 }

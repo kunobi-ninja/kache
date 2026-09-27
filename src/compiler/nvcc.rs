@@ -2477,4 +2477,249 @@ mod tests {
         );
         assert_eq!(maps_a, maps_b);
     }
+
+    /// Generated-argv properties. The examples above pin single flags;
+    /// these check the invariants over mixes of them.
+    mod properties {
+        use super::*;
+        use proptest::prelude::*;
+        use proptest::sample::{Index, select, subsequence};
+
+        /// Tokens with their own branch in the parser or the refusals.
+        const SPECIAL_TOKENS: &[&str] = &[
+            "-c",
+            "-dc",
+            "-dlink",
+            "--lib",
+            "-E",
+            "-ptx",
+            "-cubin",
+            "-fatbin",
+            "--optix-ir",
+            "-G",
+            "-keep",
+            "--version",
+            "-o",
+            "-oout.o",
+            "-MF",
+            "-MFk.d",
+            "-MD",
+            "-MMD",
+            "-M",
+            "-Xcompiler",
+            "-Xcompiler=-fPIC",
+            "--compiler-options",
+            "-rdc",
+            "-rdc=true",
+            "-rdc=maybe",
+            "-D",
+            "-I",
+            "-O",
+            "-O3",
+            "-std=c++17",
+            "-arch",
+            "-arch=native",
+            "-gencode",
+            "arch=compute_80,code=sm_80",
+            "-Xptxas",
+            "-v",
+            "-shared",
+            "-W",
+            "@args.rsp",
+            "k.cu",
+            "host.cpp",
+            "lib.o",
+            "-",
+            "",
+        ];
+
+        fn argv_token() -> impl Strategy<Value = String> {
+            prop_oneof![
+                4 => select(SPECIAL_TOKENS).prop_map(str::to_string),
+                2 => "[-@]?[A-Za-z0-9=,._+/:-]{0,10}",
+                1 => ".{0,8}",
+            ]
+        }
+
+        /// Flags the parser keys verbatim.
+        const KNOWN_UNITS: &[&[&str]] = &[
+            &["-O2"],
+            &["-O", "3"],
+            &["-DKACHE_PROP=1"],
+            &["-D", "KACHE_OTHER"],
+            &["-I", "include"],
+            &["-std=c++17"],
+            &["-arch=sm_80"],
+            &["-gencode", "arch=compute_90,code=sm_90"],
+            &["-Xcompiler", "-fPIC"],
+            &["-Xptxas", "-v"],
+            &["-MMD", "-MF", "k.d"],
+            &["--expt-relaxed-constexpr"],
+            &["-m64"],
+            &["-w"],
+        ];
+
+        /// Tokens the parser does not know: real flags it leaves out, a
+        /// made-up one, and a linker input.
+        const UNKNOWN_UNITS: &[&[&str]] = &[&["-lineinfo"], &["--kache-unknown"], &["lib.o"]];
+
+        fn line(units: &[Vec<String>]) -> Vec<String> {
+            std::iter::once("nvcc".to_string())
+                .chain(units.iter().flatten().cloned())
+                .collect()
+        }
+
+        /// A `-c` compile of one source with `-o`, plus `extra` units, in a
+        /// random order.
+        fn compile_units(
+            extra: impl Strategy<Value = Vec<Vec<String>>>,
+        ) -> impl Strategy<Value = Vec<Vec<String>>> {
+            extra
+                .prop_map(|extra| {
+                    let mut all = vec![
+                        vec!["-c".to_string()],
+                        vec!["k.cu".to_string()],
+                        vec!["-o".to_string(), "k.o".to_string()],
+                    ];
+                    all.extend(extra);
+                    all
+                })
+                .prop_shuffle()
+        }
+
+        fn units_from(
+            pool: &'static [&'static [&'static str]],
+        ) -> impl Strategy<Value = Vec<Vec<String>>> {
+            subsequence(pool, 0..=pool.len()).prop_map(|units| {
+                units
+                    .into_iter()
+                    .map(|unit| unit.iter().map(|arg| arg.to_string()).collect())
+                    .collect()
+            })
+        }
+
+        /// Two different values from `values`.
+        fn distinct(
+            values: &'static [&'static str],
+        ) -> impl Strategy<Value = (&'static str, &'static str)> {
+            (select(values), select(values)).prop_filter("same value", |(a, b)| a != b)
+        }
+
+        /// The flag entries `cache_key` hashes, in its order.
+        fn keyed_flags<'a>(parsed: &'a NvccArgs, allow: &[String]) -> Vec<&'a str> {
+            parsed
+                .deferred_flags
+                .iter()
+                .chain(
+                    parsed
+                        .unknown_flags
+                        .iter()
+                        .filter(|f| allow.iter().any(|a| flag_matches(a, f))),
+                )
+                .map(String::as_str)
+                .collect()
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig {
+                cases: 64,
+                max_shrink_iters: 256,
+                ..ProptestConfig::default()
+            })]
+
+            /// Parsing either errors or yields a line that refusal and the
+            /// key helpers handle; nothing panics.
+            #[test]
+            fn nvcc_argument_handling_never_panics(
+                rest in proptest::collection::vec(argv_token(), 0..24),
+                allow in proptest::collection::vec(argv_token(), 0..3),
+            ) {
+                let argv = std::iter::once("nvcc".to_string()).chain(rest).collect::<Vec<_>>();
+                let _ = NvccCompiler::recognizes(&argv);
+                if let Ok(parsed) = NvccArgs::parse(&argv) {
+                    let _ = parsed.refuse_reasons(&allow);
+                    let _ = nvcc_target_label(&parsed.deferred_flags);
+                    let _ = nvcc_dep_forward_args(&parsed.deferred_flags);
+                    let _ = nvcc_dependency_query_args(&parsed);
+                    let _ = keyed_flags(&parsed, &allow);
+                }
+            }
+
+            /// Fail closed: on a line nvcc accepts for caching, every token is
+            /// structure (`-c`, `-o` and its value, the one source) or part of
+            /// a flag entry the key hashes. Anything else must refuse.
+            #[test]
+            fn nvcc_cacheable_line_keys_every_flag(
+                units in compile_units(
+                    (units_from(KNOWN_UNITS), units_from(UNKNOWN_UNITS)).prop_map(|(mut known, unknown)| {
+                        known.extend(unknown.into_iter().take(1));
+                        known
+                    }),
+                ),
+                allow in subsequence(&["--kache-unknown", "lib.o", "-lineinfo", "-O"][..], 0..=2),
+            ) {
+                let argv = line(&units);
+                let allow: Vec<String> = allow.into_iter().map(str::to_string).collect();
+                let parsed = NvccArgs::parse(&argv).unwrap();
+                if parsed.refuse_reasons(&allow).is_empty() {
+                    let keyed = keyed_flags(&parsed, &allow);
+                    let keyed_words: Vec<&str> = keyed.iter().flat_map(|e| e.splitn(2, ' ')).collect();
+                    let output = parsed.output.as_ref().map(|o| o.to_string_lossy().into_owned());
+                    let mut tokens = parsed.rest.iter().map(String::as_str);
+                    while let Some(token) = tokens.next() {
+                        if token == "-o" {
+                            prop_assert_eq!(tokens.next(), output.as_deref());
+                            continue;
+                        }
+                        let structural = token == "-c" || parsed.sources.iter().any(|s| s.as_os_str() == token);
+                        prop_assert!(
+                            structural || keyed_words.contains(&token),
+                            "{token} is on a cacheable line but not in the key: {keyed:?}"
+                        );
+                    }
+                } else {
+                    // The generated line refuses only for an unlisted unknown.
+                    let unlisted = parsed.unknown_flags.iter().any(|f| !allow.iter().any(|a| flag_matches(a, f)));
+                    prop_assert!(unlisted, "refused for another reason: {:?}", parsed.refuse_reasons(&allow));
+                }
+            }
+
+            /// A different value for a modeled flag changes the hashed flag
+            /// entries, and both lines stay cacheable. nvcc keys its flags in
+            /// argv order (`-I` order is search order), so no reordering is
+            /// expected to leave the key alone.
+            #[test]
+            fn nvcc_modeled_flag_values_reach_the_key(
+                units in compile_units(Just(Vec::new())),
+                (a, b) in prop_oneof![
+                    distinct(&["-O0", "-O1", "-O2", "-O3"]),
+                    distinct(&["-DKACHE_V=1", "-DKACHE_V=2", "-DKACHE_W"]),
+                    distinct(&["-std=c++14", "-std=c++17", "-std=c++20"]),
+                    distinct(&["-arch=sm_70", "-arch=sm_80", "-arch=sm_90"]),
+                ],
+                separated in any::<bool>(),
+                at in any::<Index>(),
+            ) {
+                let spell = |flag: &str| -> Vec<String> {
+                    // `-DX` / `-D X`, `-O2` / `-O 2`, `-arch=sm_80` / `-arch sm_80`.
+                    let split = ["-arch=", "-std=", "-D", "-O"].iter().find(|p| flag.starts_with(**p));
+                    match split {
+                        Some(prefix) if separated => vec![
+                            prefix.trim_end_matches('=').to_string(),
+                            flag[prefix.len()..].to_string(),
+                        ],
+                        _ => vec![flag.to_string()],
+                    }
+                };
+                let with = |flag: &str| {
+                    let mut units = units.clone();
+                    units.insert(at.index(units.len() + 1), spell(flag));
+                    NvccArgs::parse(&line(&units)).unwrap()
+                };
+                let (parsed_a, parsed_b) = (with(a), with(b));
+                prop_assert!(parsed_a.refuse_reasons(&[]).is_empty() && parsed_b.refuse_reasons(&[]).is_empty());
+                prop_assert_ne!(keyed_flags(&parsed_a, &[]), keyed_flags(&parsed_b, &[]));
+            }
+        }
+    }
 }

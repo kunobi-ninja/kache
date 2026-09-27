@@ -7897,3 +7897,340 @@ fn memo_key_ignores_the_order_of_the_prefix_maps() {
         "a different set of targets is a different mapping"
     );
 }
+
+/// Generated-argv properties for the C/C++ adapter. The examples above pin
+/// individual flags; these check the invariants over mixes of them.
+mod properties {
+    use super::*;
+    use proptest::prelude::*;
+    use proptest::sample::{Index, select, subsequence};
+
+    const PROGRAMS: &[&str] = &[
+        "cc",
+        "gcc",
+        "clang",
+        "clang++",
+        "clang-cl",
+        "/usr/bin/c++",
+        "zigcc",
+    ];
+
+    /// Tokens with their own branch in the parser, the classifier or the
+    /// procedural refusals, so generated lines reach those branches.
+    const SPECIAL_TOKENS: &[&str] = &[
+        "-c",
+        "-E",
+        "-S",
+        "-o",
+        "-",
+        "-x",
+        "c++",
+        "cuda",
+        "-xc",
+        "-I",
+        "-D",
+        "-U",
+        "-MF",
+        "-MT",
+        "-MQ",
+        "-MD",
+        "-MMD",
+        "-Xclang",
+        "-arch",
+        "-include",
+        "--include",
+        "--include=x.pch",
+        "-std=c++17",
+        "-std:c++17",
+        "-O2",
+        "-Ofast",
+        "-g",
+        "-g3",
+        "--driver-mode=cl",
+        "/c",
+        "/Fo",
+        "-Fox.obj",
+        "/Z7",
+        "-Wa,--debug-prefix-map=/a=/b",
+        "-Wa,--debug-prefix-map=",
+        "@args.rsp",
+        "@",
+        "a.c",
+        "b.cpp",
+        "k.cu",
+        "x.pch",
+        "--coverage",
+        "-gsplit-dwarf",
+        "-fmodules",
+        "",
+    ];
+
+    fn argv_token() -> impl Strategy<Value = String> {
+        prop_oneof![
+            4 => select(SPECIAL_TOKENS).prop_map(str::to_string),
+            2 => "[-/@]?[A-Za-z0-9=,._+/:-]{0,10}",
+            1 => ".{0,8}",
+        ]
+    }
+
+    /// A single-source `-c` compile whose every flag is modeled, in a
+    /// random order. `extra` units are drawn from `optional`.
+    fn compile_units(
+        optional: &'static [&'static [&'static str]],
+    ) -> impl Strategy<Value = Vec<Vec<String>>> {
+        subsequence(optional, 0..=optional.len())
+            .prop_map(|units| {
+                let mut all = vec![vec!["-c".to_string()], vec!["prop.c".to_string()]];
+                all.extend(
+                    units
+                        .into_iter()
+                        .map(|unit| unit.iter().map(|arg| arg.to_string()).collect()),
+                );
+                all
+            })
+            .prop_shuffle()
+    }
+
+    /// Modeled flags a cacheable line may carry.
+    const MODELED_UNITS: &[&[&str]] = &[
+        &["-O2"],
+        &["-g"],
+        &["-fPIC"],
+        &["-std=c11"],
+        &["-DKACHE_PROP=1"],
+        &["-Iinclude"],
+        &["-Wall"],
+        &["-MD"],
+        &["-MF", "prop.d"],
+        &["-arch", "arm64"],
+        &["-o", "prop-out.o"],
+    ];
+
+    /// Modeled flags outside the families `modeled_value_change` varies.
+    const NEUTRAL_UNITS: &[&[&str]] = &[
+        &["-fPIC"],
+        &["-Iinclude"],
+        &["-Wall"],
+        &["-MD"],
+        &["-MF", "prop.d"],
+        &["-o", "prop-out.o"],
+    ];
+
+    fn argv(program: &str, units: &[Vec<String>]) -> Vec<String> {
+        std::iter::once(program.to_string())
+            .chain(units.iter().flatten().cloned())
+            .collect()
+    }
+
+    fn cacheable(argv: &[String], allow: &[String]) -> bool {
+        CcArgs::parse(argv)
+            .unwrap()
+            .refuse_reasons(allow)
+            .is_empty()
+    }
+
+    fn names_unsupported_flag(reasons: &[RefuseReason]) -> bool {
+        reasons
+            .iter()
+            .any(|r| matches!(r, RefuseReason::Unsupported(d) if d.contains("unsupported flag")))
+    }
+
+    /// A flag `CC_FLAGS` does not classify: real ones the adapter
+    /// deliberately leaves out, plus made-up spellings.
+    fn unmodeled_flag() -> impl Strategy<Value = String> {
+        prop_oneof![
+            select(
+                &[
+                    "-Ofast",
+                    "-O4",
+                    "-march=native",
+                    "-fsanitize=address",
+                    "-pg",
+                    "-target",
+                    "--target=aarch64-linux-gnu",
+                    "-fprofile-generate",
+                    "-mllvm",
+                    "-gdwarf-5",
+                ][..]
+            )
+            .prop_map(str::to_string),
+            "-[A-Za-z][A-Za-z0-9_=,.+-]{0,12}",
+            "--[a-z][a-z0-9-]{0,12}",
+        ]
+        .prop_filter("CC_FLAGS classifies it", |flag| {
+            classify_cc_flag(flag, Dialect::Gnu).is_none()
+        })
+    }
+
+    /// The fields `cache_key_with` hashes by name for the modeled codegen
+    /// flags; `-D` reaches the key through the preprocessor argv instead.
+    fn keyed_fields(
+        parsed: &CcArgs,
+    ) -> (Option<OptLevel>, Option<u8>, Option<String>, bool, String) {
+        (
+            parsed.optimization,
+            parsed.debug_level,
+            parsed.std.clone(),
+            parsed.pic,
+            parsed.cache_target_arch(),
+        )
+    }
+
+    /// Two spellings of one modeled flag with different values, and whether
+    /// that value is keyed through the preprocessor argv (`-D`) rather than
+    /// a named key field.
+    fn modeled_value_change() -> impl Strategy<Value = (Vec<String>, Vec<String>, bool)> {
+        fn distinct(
+            values: &'static [&'static str],
+        ) -> impl Strategy<Value = (&'static str, &'static str)> {
+            (select(values), select(values)).prop_filter("same value", |(a, b)| a != b)
+        }
+        let one = |s: &str| vec![s.to_string()];
+        prop_oneof![
+            distinct(&["-O0", "-O1", "-O2", "-O3", "-Os", "-Oz", "-Og"]).prop_map(move |(a, b)| (
+                one(a),
+                one(b),
+                false
+            )),
+            distinct(&["-g0", "-g1", "-g2", "-g3"]).prop_map(move |(a, b)| (one(a), one(b), false)),
+            distinct(&[
+                "-std=c99",
+                "-std=c11",
+                "-std=gnu11",
+                "-std=c++17",
+                "-std=c++20"
+            ])
+            .prop_map(move |(a, b)| (one(a), one(b), false)),
+            distinct(&["x86_64", "arm64", "arm64e", "i386"]).prop_map(|(a, b)| {
+                (
+                    vec!["-arch".to_string(), a.to_string()],
+                    vec!["-arch".to_string(), b.to_string()],
+                    false,
+                )
+            }),
+            distinct(&["-DKACHE_V=1", "-DKACHE_V=2", "-DKACHE_V", "-DKACHE_W=1"])
+                .prop_map(move |(a, b)| (one(a), one(b), true)),
+        ]
+    }
+
+    /// Unmodeled flags a user might allow-list; all unclassified.
+    const ALLOW_LISTED: &[&str] = &[
+        "-fkache-prop-a",
+        "-fkache-prop-b",
+        "--kache-prop-c",
+        "-mkache-prop-d",
+    ];
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 64,
+            max_shrink_iters: 256,
+            ..ProptestConfig::default()
+        })]
+
+        /// Parsing, refusal and every key-input helper return on any argv.
+        #[test]
+        fn cc_argument_handling_never_panics(
+            program in select(PROGRAMS),
+            rest in proptest::collection::vec(argv_token(), 0..24),
+            allow in proptest::collection::vec(argv_token(), 0..3),
+        ) {
+            let argv = std::iter::once(program.to_string()).chain(rest).collect::<Vec<_>>();
+            let parsed = CcArgs::parse(&argv).expect("a non-empty argv parses");
+            let _ = parsed.refuse_reasons(&allow);
+            let _ = parsed.config_args();
+            let _ = build_preprocess_args(&parsed);
+            let _ = parsed.compiler_output_paths();
+            let _ = parsed.depinfo_output_path();
+            let _ = parsed.depinfo_anchor();
+            let _ = parsed.cache_target_arch();
+            let _ = parsed.embeds_codeview_debug();
+            let _ = cc_extra_flags_for_key(&parsed, &allow);
+            let _ = cc_raw_flags_for_key(&parsed, &[]);
+            let _ = cc_flags_need_resolved_invocation(&parsed);
+            let _ = cc_resolved_per_tu_paths(&parsed);
+        }
+
+        /// Fail closed: a flag `CC_FLAGS` does not classify, bare or forwarded
+        /// with `-Xclang`, refuses the compile. Allow-listing it is the only
+        /// way past the classifier, and then it is keyed verbatim.
+        #[test]
+        fn cc_unmodeled_flag_is_refused_unless_allow_listed_and_keyed(
+            mut units in compile_units(MODELED_UNITS),
+            flag in unmodeled_flag(),
+            forwarded in any::<bool>(),
+            at in any::<Index>(),
+            allow_listed in any::<bool>(),
+        ) {
+            prop_assume!(!(forwarded && XCLANG_INERT_CC1_FLAGS.contains(&flag.as_str())));
+            prop_assert!(cacheable(&argv("cc", &units), &[]), "base line is cacheable");
+
+            let unit = if forwarded { vec!["-Xclang".to_string(), flag.clone()] } else { vec![flag.clone()] };
+            units.insert(at.index(units.len() + 1), unit);
+            let parsed = CcArgs::parse(&argv("cc", &units)).unwrap();
+            let allow = if allow_listed { vec![flag.clone()] } else { Vec::new() };
+            let reasons = parsed.refuse_reasons(&allow);
+            if allow_listed {
+                prop_assert!(!names_unsupported_flag(&reasons), "{reasons:?}");
+                prop_assert!(cc_extra_flags_for_key(&parsed, &allow).contains(&flag.as_str()));
+            } else {
+                prop_assert!(!reasons.is_empty(), "{flag} was accepted unkeyed");
+            }
+        }
+
+        /// A different value for a modeled flag changes what the key hashes
+        /// for it, and both lines stay cacheable.
+        #[test]
+        fn cc_modeled_flag_values_reach_the_key(
+            units in compile_units(NEUTRAL_UNITS),
+            (a, b, via_preprocessor) in modeled_value_change(),
+            at in any::<Index>(),
+        ) {
+            let with = |value: &Vec<String>| {
+                let mut units = units.clone();
+                units.insert(at.index(units.len() + 1), value.clone());
+                argv("cc", &units)
+            };
+            let (argv_a, argv_b) = (with(&a), with(&b));
+            prop_assert!(cacheable(&argv_a, &[]) && cacheable(&argv_b, &[]));
+            let (parsed_a, parsed_b) = (CcArgs::parse(&argv_a).unwrap(), CcArgs::parse(&argv_b).unwrap());
+            if via_preprocessor {
+                prop_assert_ne!(build_preprocess_args(&parsed_a), build_preprocess_args(&parsed_b));
+            } else {
+                prop_assert_ne!(keyed_fields(&parsed_a), keyed_fields(&parsed_b));
+            }
+        }
+
+        /// Allow-listed flags are keyed as a sorted set: reordering or
+        /// repeating them, or listing entries the line does not use, changes
+        /// nothing the key hashes.
+        #[test]
+        fn cc_allow_listed_flags_key_the_same_in_any_order(
+            units in compile_units(MODELED_UNITS),
+            extras in subsequence(ALLOW_LISTED, 1..=ALLOW_LISTED.len()).prop_shuffle(),
+            reordered in any::<Index>(),
+            repeated in any::<Index>(),
+        ) {
+            let allow: Vec<String> = ALLOW_LISTED.iter().map(|f| f.to_string()).collect();
+            for flag in ALLOW_LISTED {
+                prop_assert!(classify_cc_flag(flag, Dialect::Gnu).is_none(), "{flag} is modeled");
+            }
+            let line = |extras: &[&str]| {
+                let mut units = units.clone();
+                units.extend(extras.iter().map(|f| vec![f.to_string()]));
+                argv("cc", &units)
+            };
+            let mut other = extras.clone();
+            other.rotate_left(reordered.index(extras.len()));
+            other.push(extras[repeated.index(extras.len())]);
+            let (argv_a, argv_b) = (line(&extras), line(&other));
+            prop_assert!(cacheable(&argv_a, &allow) && cacheable(&argv_b, &allow));
+            let (parsed_a, parsed_b) = (CcArgs::parse(&argv_a).unwrap(), CcArgs::parse(&argv_b).unwrap());
+            prop_assert_eq!(
+                cc_extra_flags_for_key(&parsed_a, &allow),
+                cc_extra_flags_for_key(&parsed_b, &allow)
+            );
+            prop_assert_eq!(keyed_fields(&parsed_a), keyed_fields(&parsed_b));
+        }
+    }
+}

@@ -1037,6 +1037,8 @@ pub struct TrackedTargetRoot {
     pub first_seen: i64,
     pub last_seen: i64,
     pub identity: crate::filesystem::PathIdentity,
+    /// The `rustc -vV` that last built into it, when kache recorded one.
+    pub rustc: Option<String>,
 }
 
 /// A shadow policy's would-evict set for one size-driven sweep
@@ -1693,11 +1695,15 @@ fn initialize_db(db: &Connection) -> rusqlite::Result<()> {
             first_seen     INTEGER NOT NULL DEFAULT (unixepoch()),
             last_seen      INTEGER NOT NULL DEFAULT (unixepoch()),
             device         TEXT NOT NULL,
-            inode          TEXT NOT NULL
+            inode          TEXT NOT NULL,
+            rustc          TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_target_roots_last_seen
             ON target_roots(last_seen);",
     )?;
+    // The `rustc -vV` a target was last built by, so a new checkout's build
+    // can be seeded only from targets its own compiler built.
+    let _ = db.execute_batch("ALTER TABLE target_roots ADD COLUMN rustc TEXT");
 
     crate::file_hash::ensure_file_hash_cache_schema(db)?;
     db.pragma_update(None, "user_version", INDEX_SCHEMA_GENERATION)?;
@@ -1716,7 +1722,8 @@ fn initialize_db(db: &Connection) -> rusqlite::Result<()> {
 ///    two units of one crate name apart (every build script is one name).
 /// 6: `entries.imported_at`, so automatic eviction can keep what the remote
 ///    delivered for the job still running (#1008).
-const INDEX_SCHEMA_GENERATION: i64 = 6;
+/// 7: `target_roots.rustc`, the compiler a tracked target was built by.
+const INDEX_SCHEMA_GENERATION: i64 = 7;
 
 /// Raise the refcount of every blob `cache_key` maps to at least the
 /// references all mappings hold on it. Run before giving this key's
@@ -4079,6 +4086,17 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     /// entries or remote data. Updates are debounced to keep compiler-wrapper
     /// writes off the hot path.
     pub fn remember_target_root(&self, target: &Path, workspace_root: &Path) -> Result<()> {
+        self.remember_target_root_built_by(target, workspace_root, None)
+    }
+
+    /// [`Self::remember_target_root`], also recording the `rustc -vV` that
+    /// built into it. `None` keeps whatever was recorded.
+    pub fn remember_target_root_built_by(
+        &self,
+        target: &Path,
+        workspace_root: &Path,
+        rustc: Option<&str>,
+    ) -> Result<()> {
         if !crate::filesystem::target_root_is_safe(target, workspace_root) {
             return Ok(());
         }
@@ -4096,12 +4114,14 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             .query_row(
                 "SELECT last_seen > unixepoch() - 300
                     AND workspace_root = ?2 AND device = ?3 AND inode = ?4
+                    AND (?5 IS NULL OR rustc IS ?5)
                  FROM target_roots WHERE path = ?1",
                 params![
                     target.to_string_lossy(),
                     workspace_root.to_string_lossy(),
                     identity.device.to_string(),
                     identity.inode.to_string(),
+                    rustc,
                 ],
                 |row| row.get(0),
             )
@@ -4111,22 +4131,25 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         }
         let changed = self.db.execute(
             "INSERT INTO target_roots
-                (path, workspace_root, first_seen, last_seen, device, inode)
-             VALUES (?1, ?2, unixepoch(), unixepoch(), ?3, ?4)
+                (path, workspace_root, first_seen, last_seen, device, inode, rustc)
+             VALUES (?1, ?2, unixepoch(), unixepoch(), ?3, ?4, ?5)
              ON CONFLICT(path) DO UPDATE SET
                 workspace_root = excluded.workspace_root,
                 last_seen = unixepoch(),
                 device = excluded.device,
-                inode = excluded.inode
+                inode = excluded.inode,
+                rustc = COALESCE(excluded.rustc, target_roots.rustc)
              WHERE target_roots.last_seen <= unixepoch() - 300
                 OR target_roots.workspace_root != excluded.workspace_root
                 OR target_roots.device != excluded.device
-                OR target_roots.inode != excluded.inode",
+                OR target_roots.inode != excluded.inode
+                OR (excluded.rustc IS NOT NULL AND target_roots.rustc IS NOT excluded.rustc)",
             params![
                 target.to_string_lossy(),
                 workspace_root.to_string_lossy(),
                 identity.device.to_string(),
                 identity.inode.to_string(),
+                rustc,
             ],
         )?;
         if changed > 0 {
@@ -4149,7 +4172,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     pub fn tracked_target_roots(&self, stale_hours: u64) -> Result<Vec<TrackedTargetRoot>> {
         let stale_seconds = stale_hours.saturating_mul(3600).min(i64::MAX as u64) as i64;
         let mut stmt = self.db.prepare(
-            "SELECT path, workspace_root, first_seen, last_seen, device, inode
+            "SELECT path, workspace_root, first_seen, last_seen, device, inode, rustc
              FROM target_roots
              WHERE last_seen <= unixepoch() - ?1
              ORDER BY last_seen ASC, path ASC",
@@ -4164,11 +4187,12 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                 row.get::<_, i64>(3)?,
                 device,
                 inode,
+                row.get::<_, Option<String>>(6)?,
             ))
         })?;
         let mut targets = Vec::new();
         for row in rows {
-            let (path, workspace_root, first_seen, last_seen, device, inode) = row?;
+            let (path, workspace_root, first_seen, last_seen, device, inode, rustc) = row?;
             let (Ok(device), Ok(inode)) = (device.parse::<u64>(), inode.parse::<u64>()) else {
                 continue;
             };
@@ -4178,6 +4202,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                 first_seen,
                 last_seen,
                 identity: crate::filesystem::PathIdentity { device, inode },
+                rustc,
             });
         }
         Ok(targets)

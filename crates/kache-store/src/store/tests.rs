@@ -4202,6 +4202,63 @@ fn target_root_registry_is_local_bounded_provenance_with_identity() {
 }
 
 #[test]
+fn a_target_root_records_the_compiler_that_built_into_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let store = Store::open(&config).unwrap();
+    let workspace = dir.path().join("workspace");
+    let target = workspace.join("target");
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::write(
+        target.join("CACHEDIR.TAG"),
+        "Signature: 8a477f597d28d172789f06886806bc55",
+    )
+    .unwrap();
+    // A Cargo profile directory, as a target without a rustc info cache has.
+    std::fs::create_dir_all(target.join("debug")).unwrap();
+    let rustc = |store: &Store| store.tracked_target_roots(0).unwrap()[0].rustc.clone();
+
+    store
+        .remember_target_root_built_by(&target, &workspace, Some("rustc 1"))
+        .unwrap();
+    assert_eq!(rustc(&store).as_deref(), Some("rustc 1"));
+    store
+        .remember_target_root_built_by(&target, &workspace, Some("rustc 2"))
+        .unwrap();
+    assert_eq!(
+        rustc(&store).as_deref(),
+        Some("rustc 2"),
+        "another compiler updates a row that is still fresh"
+    );
+    store.remember_target_root(&target, &workspace).unwrap();
+    assert_eq!(
+        rustc(&store).as_deref(),
+        Some("rustc 2"),
+        "registering without a compiler keeps the recorded one"
+    );
+    drop(store);
+
+    // An index from before the column gains it when opened.
+    let db = rusqlite::Connection::open(config.index_db_path()).unwrap();
+    db.execute_batch(
+        "DROP TABLE target_roots;
+         CREATE TABLE target_roots (
+            path TEXT PRIMARY KEY, workspace_root TEXT NOT NULL,
+            first_seen INTEGER NOT NULL DEFAULT (unixepoch()),
+            last_seen INTEGER NOT NULL DEFAULT (unixepoch()),
+            device TEXT NOT NULL, inode TEXT NOT NULL);
+         PRAGMA user_version = 6;",
+    )
+    .unwrap();
+    drop(db);
+    let store = Store::open(&config).unwrap();
+    store
+        .remember_target_root_built_by(&target, &workspace, Some("rustc 3"))
+        .unwrap();
+    assert_eq!(rustc(&store).as_deref(), Some("rustc 3"));
+}
+
+#[test]
 fn target_root_registry_filters_by_last_seen() {
     let dir = tempfile::tempdir().unwrap();
     let config = test_config(dir.path());

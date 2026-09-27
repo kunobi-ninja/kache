@@ -7215,6 +7215,12 @@ fn unescape_env_dep_value(s: &str) -> String {
 /// itself is updated.  A file cache avoids spawning `rustc --version --verbose`
 /// 300+ times per parallel build — the first invocation writes the file and the
 /// rest read it back in <1 ms.
+/// `rustc -vV` of `rustc`, as the cache key reads it (cached per binary), or
+/// `None` when it cannot be run.
+pub(crate) fn rustc_version_text(rustc: &Path) -> Option<String> {
+    get_rustc_version(rustc).ok()
+}
+
 fn get_rustc_version(rustc: &Path) -> Result<String> {
     let _trace = crate::phase_trace::phase("compiler_identity");
     if let Some(cached) = read_tool_version_cache(rustc, "rustc-ver") {

@@ -8995,6 +8995,7 @@ fn handle_seed_target(config: &Config, req: &SeedTargetRequest) -> Response {
             .map(|root| crate::target_seed::Donor {
                 target_dir: root.path,
                 workspace_root: root.workspace_root,
+                rustc: root.rustc,
             })
             .collect(),
         Err(error) => return Response::err(format!("reading tracked targets: {error:#}")),

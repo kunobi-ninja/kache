@@ -3633,7 +3633,11 @@ fn run_parsed_rustc(
     if args.is_primary
         && let Some(target_dir) = args.target_dir()
         && let Some(workspace_root) = workspace_root.as_deref()
-        && let Err(e) = store.remember_target_root(&target_dir, workspace_root)
+        && let Err(e) = store.remember_target_root_built_by(
+            &target_dir,
+            workspace_root,
+            crate::cache_key::rustc_version_text(&args.rustc).as_deref(),
+        )
     {
         tracing::warn!(
             "failed to register target root {}: {}",

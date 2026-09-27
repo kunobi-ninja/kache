@@ -26,8 +26,11 @@
 //!   Cargo rebuilds rather than one it trusts.
 //! - A build script whose recorded output names the other checkout, other
 //!   than its own `OUT_DIR` (which Cargo rewrites), is not copied.
-//! - The other checkout must have been built by the same `rustc`, and no
-//!   build may hold either profile's lock while units are copied.
+//! - The other checkout must have been built by the same `rustc`: the one
+//!   kache recorded while building into it, else the one Cargo's rustc info
+//!   cache names (Cargo does not write that cache when it cannot fingerprint
+//!   `rustc`). No build may hold either profile's lock while units are
+//!   copied.
 //!
 //! Both of Cargo's layouts are handled (see [`crate::cargo_layout`]). Only
 //! the host `debug` profile is seeded: the probe does not say which profile
@@ -163,6 +166,8 @@ pub(crate) fn registry_packages(lockfile: &str) -> BTreeSet<String> {
 pub(crate) struct Donor {
     pub(crate) target_dir: PathBuf,
     pub(crate) workspace_root: PathBuf,
+    /// The `rustc -vV` kache recorded building into it, if any.
+    pub(crate) rustc: Option<String>,
 }
 
 /// Which of Cargo's layouts a profile directory uses.
@@ -395,7 +400,7 @@ pub(crate) fn seed(
         if Instant::now() >= deadline {
             break;
         }
-        if donor.target_dir == target.target_dir || !built_by(&donor.target_dir, rustc_version) {
+        if donor.target_dir == target.target_dir || !donor_built_by(donor, rustc_version) {
             continue;
         }
         let from = donor.target_dir.join(PROFILE);
@@ -431,6 +436,16 @@ pub(crate) fn seed(
 }
 
 /// Whether Cargo's cached `rustc -vV` answer in `target_dir` is `version`.
+/// Whether `version` built `donor`. What kache recorded while building into
+/// it decides; without a record, Cargo's rustc info cache does, which Cargo
+/// does not always write (it cannot fingerprint every rustc).
+fn donor_built_by(donor: &Donor, version: &str) -> bool {
+    match &donor.rustc {
+        Some(recorded) => recorded.trim() == version.trim(),
+        None => built_by(&donor.target_dir, version),
+    }
+}
+
 fn built_by(target_dir: &Path, version: &str) -> bool {
     let Ok(text) = std::fs::read_to_string(target_dir.join(".rustc_info.json")) else {
         return false;
@@ -611,6 +626,7 @@ source = "git+https://example.com/gitdep#abc"
         Donor {
             target_dir,
             workspace_root,
+            rustc: None,
         }
     }
 
@@ -629,6 +645,32 @@ source = "git+https://example.com/gitdep#abc"
 
     fn later() -> Instant {
         Instant::now() + Duration::from_secs(60)
+    }
+
+    /// kache's own record of a donor's compiler decides, trimmed; Cargo's
+    /// rustc info cache is the fallback when there is no record.
+    #[test]
+    fn a_donors_recorded_compiler_decides_before_cargos_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut recorded = donor(dir.path(), "recorded", Layout::Shared);
+        std::fs::remove_file(recorded.target_dir.join(".rustc_info.json")).unwrap();
+        assert!(!donor_built_by(&recorded, VERSION), "no record, no cache");
+        recorded.rustc = Some(VERSION.trim().to_string());
+        assert!(donor_built_by(&recorded, VERSION));
+        recorded.rustc = Some("rustc 2.0.0".into());
+        assert!(!donor_built_by(&recorded, VERSION));
+
+        let cached = donor(dir.path(), "cached", Layout::Shared);
+        assert!(
+            donor_built_by(&cached, VERSION),
+            "Cargo's cache, without a record"
+        );
+        let mut contradicted = cached.clone();
+        contradicted.rustc = Some("rustc 2.0.0".into());
+        assert!(
+            !donor_built_by(&contradicted, VERSION),
+            "a record overrides Cargo's cache"
+        );
     }
 
     #[test]
@@ -874,6 +916,7 @@ source = "git+https://example.com/gitdep#abc"
         let own = Donor {
             target_dir: other.target_dir.clone(),
             workspace_root: other.workspace_root.clone(),
+            rustc: None,
         };
         let empty = donor(dir.path(), "empty", Layout::Shared);
         std::fs::remove_dir_all(empty.target_dir.join(PROFILE)).unwrap();

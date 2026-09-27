@@ -1011,3 +1011,20 @@ fn live_wiring_reads_this_process() {
         );
     }
 }
+
+#[test]
+fn nix_generations_are_numbered_profile_links() {
+    let generation = |name: &str| is_nix_generation(Component::Normal(name.as_ref()));
+    for name in ["profile-12-link", "system-3-link"] {
+        assert!(generation(name), "{name}");
+    }
+    for name in [
+        "-12-link",
+        "profile--link",
+        "profile-ab-link",
+        "profile-12",
+        "link",
+    ] {
+        assert!(!generation(name), "{name}");
+    }
+}

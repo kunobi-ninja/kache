@@ -87,12 +87,8 @@ fn canonical_or_original(path: &Path) -> PathBuf {
 /// What is wrong with the binary a service file runs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ServiceExeProblem {
-    /// The recorded path reaches nothing, typically a version an upgrade
-    /// removed.
     Missing { recorded: PathBuf },
-    /// The recorded path reaches a file that cannot be run.
     NotExecutable { recorded: PathBuf },
-    /// The recorded path is a different file from the running kache.
     OtherBinary { recorded: PathBuf, current: PathBuf },
 }
 
@@ -120,9 +116,7 @@ impl ServiceExeProblem {
     }
 }
 
-/// Compare the recorded service binary with the running one by file
-/// identity, so a link, hardlink or bind mount of the same file matches.
-/// When the running binary itself is gone there is nothing to compare.
+/// By file identity, so a link, hardlink or bind mount of the same file matches.
 fn recorded_exe_problem(
     recorded: &Path,
     current: &Path,
@@ -146,7 +140,6 @@ fn recorded_exe_problem(
     })
 }
 
-/// The problem with the binary the service file at `path` runs, if any.
 pub(crate) fn service_exe_problem(path: &Path) -> Option<ServiceExeProblem> {
     let recorded = parse_exe_from_service_file(path)?;
     let current = std::env::current_exe().ok()?;

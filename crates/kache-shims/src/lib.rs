@@ -1,9 +1,5 @@
-//! Upgrade-safe paths to an installed binary, and the compiler-name shim
-//! farms that point at it.
-//!
-//! [`select`] (or [`detect`] for the running process) picks the path kache
-//! records in shims and service files. The [`farm`] module creates, repairs
-//! and reports on the shim directories.
+//! Upgrade-safe paths to an installed binary ([`select`], [`detect`]) and the
+//! compiler-name shim farms that point at it ([`farm`]).
 
 pub mod farm;
 mod fs;

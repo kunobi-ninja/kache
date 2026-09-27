@@ -1,25 +1,17 @@
-//! The filesystem questions path selection and farm status ask.
+//! Read-only filesystem access, injectable so rules test with fake paths.
 
 use kache_fs::InodeId;
 use std::path::{Path, PathBuf};
 
-/// Read-only filesystem access. [`RealFs`] answers from the live
-/// filesystem; tests answer from a table of fake paths.
 pub trait Fs {
-    /// Device and inode of the file `path` reaches, following links.
+    /// Device and inode, following links.
     fn identity(&self, path: &Path) -> Option<InodeId>;
-    /// Whether `path` reaches a regular file that may be executed. On Unix
-    /// that needs an execute bit; elsewhere any regular file counts.
     fn is_executable_file(&self, path: &Path) -> bool;
-    /// Whether `path` reaches a regular file.
     fn is_file(&self, path: &Path) -> bool;
-    /// The text of the symlink at `path`, or `None` when `path` is not one.
     fn read_link(&self, path: &Path) -> Option<PathBuf>;
-    /// `path` with every link resolved, or `None` when it reaches nothing.
     fn resolve(&self, path: &Path) -> Option<PathBuf>;
 }
 
-/// [`Fs`] against the live filesystem.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RealFs;
 
@@ -45,8 +37,7 @@ impl Fs for RealFs {
     }
 }
 
-/// Whether `path` reaches a regular file that may be executed. On Unix that
-/// needs an execute bit; elsewhere any regular file counts.
+/// A regular file with an execute bit (any regular file off Unix).
 pub fn is_executable_file(path: &Path) -> bool {
     let Ok(metadata) = std::fs::metadata(path) else {
         return false;
@@ -114,10 +105,8 @@ pub(crate) mod fake {
 
     #[derive(Default)]
     pub(crate) struct FakeFs {
-        /// Regular files: identity and whether the execute bit is set.
+        /// Identity and execute bit.
         files: BTreeMap<PathBuf, (InodeId, bool)>,
-        /// Symlinks: path to link text, relative text resolved against the
-        /// link's directory.
         links: BTreeMap<PathBuf, PathBuf>,
         next_ino: u64,
     }
@@ -127,7 +116,6 @@ pub(crate) mod fake {
             Self::default()
         }
 
-        /// An executable file with its own inode.
         pub(crate) fn exe(mut self, path: &str) -> Self {
             self.next_ino += 1;
             let id = InodeId {
@@ -138,7 +126,6 @@ pub(crate) mod fake {
             self
         }
 
-        /// A regular file without an execute bit.
         pub(crate) fn plain(mut self, path: &str) -> Self {
             self.next_ino += 1;
             let id = InodeId {
@@ -149,8 +136,7 @@ pub(crate) mod fake {
             self
         }
 
-        /// A second name for the file at `existing`: a hardlink, or the same
-        /// file seen through a bind mount.
+        /// A hardlink, or the same file through a bind mount.
         pub(crate) fn same_file(mut self, path: &str, existing: &str) -> Self {
             let entry = self.files[Path::new(existing)];
             self.files.insert(path.into(), entry);

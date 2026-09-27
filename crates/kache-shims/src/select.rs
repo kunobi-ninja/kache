@@ -1,39 +1,21 @@
-//! Which path to record for the running binary.
-//!
-//! Shims and service files outlive the binary that wrote them. Recording the
-//! resolved path of a versioned install (a Homebrew keg, a Nix store path, a
-//! mise or asdf version directory) breaks them when that version is removed.
-//! [`select`] looks for a path that reaches the same file today and that the
-//! installer keeps pointing at the current version.
-//!
-//! Rules, first match wins:
-//!
-//! 1. An installer alias: Homebrew's `opt/<formula>` link, a Nix profile, or
-//!    mise's `installs/<tool>/latest`.
-//! 2. The first entry on `PATH` that reaches the running binary, skipping
-//!    relative entries, versioned install directories, mise and asdf shim
-//!    dispatchers, and directories marked as compiler-shim farms.
-//! 3. The running binary's own resolved path.
-//!
-//! "Reaches the running binary" compares device and inode, so a hardlink or a
-//! bind mount of the same file counts. It is a check of the present: a later
-//! upgrade decides what the recorded path reaches then.
+//! Which path to record for the running binary so shims and service files
+//! survive an upgrade. Rules, first match wins: an installer alias, a stable
+//! `PATH` entry, the binary's own path. A candidate counts only if it has the
+//! running binary's file identity (device and inode), checked now.
 
 use crate::fs::{Fs, RealFs};
 use kache_fs::InodeId;
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
 
-/// The installer that placed the running binary, judged from its resolved
-/// path.
+/// The installer that placed the running binary, judged from its resolved path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     Homebrew,
     Nix,
     Mise,
     Asdf,
-    /// No installer layout recognized: `cargo install`, a distro package or a
-    /// copied binary.
+    /// `cargo install`, a distro package, a copied binary.
     Other,
 }
 
@@ -55,20 +37,16 @@ impl fmt::Display for Kind {
     }
 }
 
-/// Whether the selected path is expected to keep reaching kache after an
-/// upgrade.
+/// Whether the selected path is expected to keep working after an upgrade.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stability {
-    /// An alias the installer repoints at the new version on every upgrade.
+    /// An alias the installer repoints on every upgrade.
     InstallerManaged,
-    /// A `PATH` entry outside any versioned directory. It keeps working until
-    /// someone replaces or removes that file.
+    /// A `PATH` entry outside version directories; valid until replaced.
     UserManaged,
-    /// The binary's own path inside a version directory. Removing that
-    /// version breaks whatever recorded it.
+    /// The binary's own path; removing this version breaks it.
     Versioned,
-    /// Running as another user (sudo), so `HOME` and `PATH` may not be the
-    /// ones the recorded path is used with.
+    /// Running under sudo or a foreign `HOME`, so no claim is made.
     Unverified,
 }
 
@@ -82,7 +60,6 @@ impl Stability {
         }
     }
 
-    /// Whether an upgrade is expected to leave the path working.
     pub fn survives_upgrade(self) -> bool {
         matches!(self, Stability::InstallerManaged | Stability::UserManaged)
     }
@@ -100,19 +77,16 @@ pub struct Selection {
     pub path: PathBuf,
     pub kind: Kind,
     pub stability: Stability,
-    /// One sentence a person can read in `kache doctor`.
+    /// One sentence for `kache doctor`.
     pub reason: String,
 }
 
 /// Why no path could be selected.
 #[derive(Debug)]
 pub enum Error {
-    /// The OS would not say where the running binary is.
     CurrentExe(std::io::Error),
-    /// The running binary was replaced on disk while it ran. Linux reports
-    /// its old path with a ` (deleted)` suffix.
+    /// Replaced on disk while running (Linux reports `<path> (deleted)`).
     Replaced(PathBuf),
-    /// The running binary's path reaches no file.
     Unreachable(PathBuf),
 }
 
@@ -139,23 +113,18 @@ impl std::error::Error for Error {
     }
 }
 
-/// Running with someone else's identity, so `HOME` and `PATH` may describe
-/// another account.
+/// `HOME` and `PATH` may belong to another account.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Elevation {
-    /// Root through sudo, invoked by `user`.
     Sudo { user: String },
-    /// `HOME` is owned by a different user.
     ForeignHome { home: PathBuf },
 }
 
-/// Everything selection reads from the process, passed in so each rule can
-/// be tested with fake values.
+/// Everything selection reads from the process.
 #[derive(Debug, Clone, Default)]
 pub struct Env {
-    /// The running binary as the OS reports it, unresolved.
+    /// `current_exe()`, unresolved.
     pub exe: PathBuf,
-    /// `PATH`, split.
     pub path: Vec<PathBuf>,
     pub home: Option<PathBuf>,
     pub user: Option<String>,
@@ -167,7 +136,6 @@ pub struct Env {
 }
 
 impl Env {
-    /// Read the running process.
     pub fn from_process() -> std::io::Result<Self> {
         let var = |name: &str| std::env::var_os(name).filter(|value| !value.is_empty());
         let dir = |name: &str| var(name).map(PathBuf::from);
@@ -197,7 +165,7 @@ fn process_elevation(home: Option<&Path>) -> Option<Elevation> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        // SAFETY: geteuid has no preconditions and cannot fail.
+        // SAFETY: geteuid has no preconditions.
         let euid = unsafe { libc::geteuid() };
         let sudo_user = std::env::var("SUDO_USER").ok();
         let home_owner = home.and_then(|home| std::fs::metadata(home).ok().map(|m| m.uid()));
@@ -210,8 +178,6 @@ fn process_elevation(home: Option<&Path>) -> Option<Elevation> {
     }
 }
 
-/// Root with `SUDO_USER` set is sudo; otherwise a `HOME` owned by another
-/// user means the environment belongs to someone else.
 #[cfg_attr(not(unix), allow(dead_code))]
 fn elevation(
     euid: u32,
@@ -255,15 +221,14 @@ impl Layout {
         }
     }
 
-    /// [`Layout::new`] for the running process.
     pub fn from_process() -> Self {
         Env::from_process()
             .map(|env| Self::new(&env, &RealFs))
             .unwrap_or_default()
     }
 
-    /// The installer whose version directory holds `path`, if any. A path
-    /// through mise's `latest` alias is not versioned.
+    /// The installer whose version directory holds `path`. mise's `latest`
+    /// alias is not a version directory.
     pub fn versioned(&self, path: &Path) -> Option<Kind> {
         if path.starts_with("/nix/store") {
             return Some(Kind::Nix);
@@ -280,8 +245,7 @@ impl Layout {
         None
     }
 
-    /// Whether `dir` holds mise or asdf dispatchers, which run whatever
-    /// version the current directory selects.
+    /// mise and asdf shims run whatever version the current directory selects.
     fn is_dispatcher(&self, dir: &Path) -> bool {
         self.mise
             .iter()
@@ -290,7 +254,7 @@ impl Layout {
     }
 }
 
-/// `dir` and, when it resolves, its real path. The two may be equal.
+/// `current_exe()` comes back resolved, so match data dirs by their real path too.
 fn with_resolved(dir: Option<PathBuf>, fs: &dyn Fs) -> Vec<PathBuf> {
     let Some(dir) = dir else {
         return Vec::new();
@@ -299,8 +263,7 @@ fn with_resolved(dir: Option<PathBuf>, fs: &dyn Fs) -> Vec<PathBuf> {
     std::iter::once(dir).chain(real).collect()
 }
 
-/// `<prefix>/Cellar/<formula>/<version>/<rest>` split into the `opt` alias
-/// `<prefix>/opt/<formula>/<rest>` and the formula name.
+/// `<prefix>/Cellar/<formula>/<version>/<rest>` -> (`<prefix>/opt/<formula>/<rest>`, formula).
 fn homebrew_keg(path: &Path) -> Option<(PathBuf, String)> {
     let components: Vec<Component<'_>> = path.components().collect();
     let cellar = components.iter().position(|c| c.as_os_str() == "Cellar")?;
@@ -346,7 +309,6 @@ fn install_parts(path: &Path, roots: &[PathBuf]) -> Option<InstallParts> {
     })
 }
 
-/// Nix profile `bin` directories, most specific first.
 fn nix_profile_bins(env: &Env) -> Vec<PathBuf> {
     let mut bins = Vec::new();
     if let Some(home) = &env.home {
@@ -367,7 +329,6 @@ fn nix_profile_bins(env: &Env) -> Vec<PathBuf> {
     bins
 }
 
-/// Whether rule 2 ignores `dir` on `PATH`.
 fn skip_path_dir(dir: &Path, layout: &Layout, fs: &dyn Fs) -> bool {
     !dir.has_root()
         || layout.versioned(dir).is_some()
@@ -375,7 +336,7 @@ fn skip_path_dir(dir: &Path, layout: &Layout, fs: &dyn Fs) -> bool {
         || fs.is_file(&dir.join(crate::farm::MARKER))
 }
 
-/// Select the path to record for the binary `env.exe`.
+/// The path to record for `env.exe`.
 pub fn select(env: &Env, fs: &dyn Fs) -> Result<Selection, Error> {
     let own = fs.identity(&env.exe).ok_or_else(|| missing_exe(&env.exe))?;
     let resolved = fs.resolve(&env.exe).unwrap_or_else(|| env.exe.clone());

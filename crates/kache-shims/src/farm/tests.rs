@@ -18,8 +18,7 @@ fn write_executable(path: &Path) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 
-/// A temporary directory with its real path, so link targets compare equal
-/// on macOS, where the temp dir sits behind `/var -> /private/var`.
+/// Canonical, so link targets compare equal behind macOS's `/var` link.
 fn scratch() -> (tempfile::TempDir, PathBuf) {
     let dir = tempfile::tempdir().unwrap();
     let root = std::fs::canonicalize(dir.path()).unwrap();
@@ -29,8 +28,6 @@ fn scratch() -> (tempfile::TempDir, PathBuf) {
 fn install_all(dir: &Path, target: &Path, force: bool) -> Installed {
     install(dir, target, &names(), force, &Layout::default()).unwrap()
 }
-
-// Locations, names and the marker.
 
 #[test]
 fn default_and_system_farms_are_the_documented_locations() {
@@ -42,20 +39,17 @@ fn default_and_system_farms_are_the_documented_locations() {
 }
 
 #[test]
-fn marker_round_trips_through_the_filesystem() {
+fn the_marker_is_a_file() {
     let (_dir, root) = scratch();
     assert!(!has_marker(&root));
     write_marker(&root).unwrap();
     assert!(has_marker(&root));
-    assert!(root.join(MARKER).is_file());
-}
-
-/// A directory that happens to be named like the marker is not one.
-#[test]
-fn a_marker_must_be_a_file() {
     let (_dir, root) = scratch();
     std::fs::create_dir(root.join(MARKER)).unwrap();
-    assert!(!has_marker(&root));
+    assert!(
+        !has_marker(&root),
+        "a directory named like the marker is not one"
+    );
 }
 
 #[test]
@@ -109,9 +103,6 @@ fn resolves_to_kache_by_identity_or_by_name() {
     ));
 }
 
-/// Links to this install and to another, a dangling link to a kache, and
-/// the marker may share a marked directory. A real compiler, a plain file or
-/// a dangling link to something else keeps it unmarked.
 #[test]
 fn only_a_directory_of_kache_links_may_be_marked() {
     let (_dir, root) = scratch();
@@ -155,8 +146,6 @@ fn a_directory_that_cannot_be_read_may_not_be_marked() {
     let (_dir, root) = scratch();
     assert!(!holds_only_shims(&root.join("missing"), None, &RealFs));
 }
-
-// Decisions, one entry at a time.
 
 #[test]
 fn entries_are_classified_by_what_they_reach() {
@@ -243,12 +232,10 @@ fn a_ready_farm_links_every_name_to_the_target() {
     assert!(!is_ready(Path::new("/shims"), Path::new(target), &broken));
 }
 
-// Status.
-
 const ME: &str = "/opt/kache/bin/kache";
+const FARM: &str = "/home/me/.local/lib/kache/shims";
 
-fn fake_with_shims(dir: &str, target: &str) -> FakeFs {
-    let mut fs = FakeFs::new().exe(ME);
+fn shims(mut fs: FakeFs, dir: &str, target: &str) -> FakeFs {
     for name in SHIM_NAMES {
         fs = fs.link(&format!("{dir}/{name}"), target);
     }
@@ -259,272 +246,239 @@ fn dirs(list: &[&str]) -> Vec<PathBuf> {
     list.iter().map(PathBuf::from).collect()
 }
 
-#[test]
-fn the_first_gcc_being_kache_is_active() {
-    let fs = fake_with_shims("/shims", ME).exe("/usr/bin/cc");
-    let status = super::status(
-        &dirs(&["/shims", "/usr/bin"]),
-        Some(Path::new(ME)),
-        &[],
-        &fs,
-    );
-    assert_eq!(
-        status,
-        Status::Active {
-            name: "cc".into(),
-            dir: "/shims".into()
-        }
-    );
-    assert!(status.is_active());
-    assert_eq!(status.detail(), "cc on PATH is a kache shim (/shims)");
-    assert_eq!(status.fix(Path::new("/default")), None);
+fn active(name: &str, dir: &str) -> Status {
+    Status::Active {
+        name: name.into(),
+        dir: dir.into(),
+    }
+}
+
+fn broken(dir: &str, names: &[&str], target: &str) -> Status {
+    Status::Broken {
+        dir: dir.into(),
+        names: names.iter().map(|name| name.to_string()).collect(),
+        target: target.into(),
+    }
 }
 
 #[test]
-fn a_hardlinked_shim_is_active() {
-    let fs = FakeFs::new().exe(ME).same_file("/shims/gcc", ME);
-    let status = super::status(&dirs(&["/shims"]), Some(Path::new(ME)), &[], &fs);
-    assert_eq!(
-        status,
-        Status::Active {
-            name: "gcc".into(),
-            dir: "/shims".into()
-        }
-    );
+fn status_tells_each_state_apart() {
+    let all: Vec<&str> = SHIM_NAMES.to_vec();
+    let base = || FakeFs::new().exe(ME).exe("/usr/bin/cc");
+    let rows: Vec<(
+        &str,
+        FakeFs,
+        Vec<PathBuf>,
+        Option<&str>,
+        Vec<PathBuf>,
+        Status,
+    )> = vec![
+        (
+            "first cc is kache",
+            shims(base(), "/shims", ME),
+            dirs(&["/shims", "/usr/bin"]),
+            Some(ME),
+            vec![],
+            active("cc", "/shims"),
+        ),
+        (
+            "a hardlinked shim",
+            base().same_file("/shims/gcc", ME),
+            dirs(&["/shims"]),
+            Some(ME),
+            vec![],
+            active("gcc", "/shims"),
+        ),
+        (
+            "real cc first, so the next name decides",
+            shims(base(), "/shims", ME),
+            dirs(&["/usr/bin", "/shims"]),
+            Some(ME),
+            vec![],
+            active("c++", "/shims"),
+        ),
+        (
+            "only a shadowed cc",
+            base().link("/shims/cc", ME),
+            dirs(&["/usr/bin", "/shims"]),
+            Some(ME),
+            vec![],
+            Status::NotInstalled,
+        ),
+        (
+            "installed but not on PATH",
+            shims(base(), FARM, ME),
+            dirs(&["/usr/bin"]),
+            Some(ME),
+            dirs(&[FARM]),
+            Status::NotFirst { dir: FARM.into() },
+        ),
+        (
+            "a known dir holding something else",
+            base(),
+            dirs(&["/usr/bin"]),
+            Some(ME),
+            dirs(&["/opt/other/shims"]),
+            Status::NotInstalled,
+        ),
+        (
+            "without knowing itself",
+            shims(base(), "/shims", ME),
+            dirs(&["/shims"]),
+            None,
+            dirs(&["/shims"]),
+            Status::NotInstalled,
+        ),
+        (
+            "dangling links to a removed kache",
+            shims(base(), FARM, "/gone/kache"),
+            dirs(&[FARM, "/usr/bin"]),
+            Some(ME),
+            dirs(&[FARM]),
+            broken(FARM, &all, "/gone/kache"),
+        ),
+        (
+            "a link to a kache that is not executable",
+            base().plain("/old/kache").link("/shims/gcc", "/old/kache"),
+            dirs(&["/shims"]),
+            Some(ME),
+            vec![],
+            broken("/shims", &["gcc"], "/old/kache"),
+        ),
+        (
+            "any dangling link in a marked farm",
+            base()
+                .plain("/usr/lib/kache/.kache-shims")
+                .link("/usr/lib/kache/cc", "/nix/store/abc/bin/kache-wrapped"),
+            vec![],
+            Some(ME),
+            dirs(&["/usr/lib/kache"]),
+            broken(
+                "/usr/lib/kache",
+                &["cc"],
+                "/nix/store/abc/bin/kache-wrapped",
+            ),
+        ),
+        (
+            "a dangling link that is not kache's",
+            FakeFs::new()
+                .exe(ME)
+                .link("/usr/bin/cc", "/etc/alternatives/cc"),
+            dirs(&["/usr/bin"]),
+            Some(ME),
+            vec![],
+            Status::NotInstalled,
+        ),
+        (
+            "a relative PATH entry is not scanned",
+            FakeFs::new().exe(ME).link("/shims/cc", "/gone/kache"),
+            dirs(&["shims"]),
+            Some(ME),
+            vec![],
+            Status::NotInstalled,
+        ),
+        (
+            "a broken farm outranks a working one",
+            shims(base(), "/usr/lib/kache", ME).link(&format!("{FARM}/cc"), "/gone/kache"),
+            dirs(&["/usr/lib/kache"]),
+            Some(ME),
+            dirs(&[FARM]),
+            broken(FARM, &["cc"], "/gone/kache"),
+        ),
+    ];
+    for (name, fs, path, me, known, want) in rows {
+        let got = super::status(&path, me.map(Path::new), &known, &fs);
+        assert_eq!(got, want, "{name}");
+        assert_eq!(
+            got.is_active(),
+            matches!(want, Status::Active { .. }),
+            "{name}"
+        );
+    }
 }
 
 #[test]
-fn a_real_compiler_first_on_path_is_not_active() {
-    let fs = fake_with_shims("/shims", ME).exe("/usr/bin/cc");
-    let status = super::status(
-        &dirs(&["/usr/bin", "/shims"]),
-        Some(Path::new(ME)),
-        &[],
-        &fs,
-    );
-    // cc hits the real one first; gcc falls through to the shim.
-    assert_eq!(
-        status,
-        Status::Active {
-            name: "c++".into(),
-            dir: "/shims".into()
-        }
-    );
-    let fs = FakeFs::new()
-        .exe(ME)
-        .exe("/usr/bin/cc")
-        .link("/shims/cc", ME);
-    let second = super::status(
-        &dirs(&["/usr/bin", "/shims"]),
-        Some(Path::new(ME)),
-        &[],
-        &fs,
-    );
-    assert_eq!(second, Status::NotInstalled);
-}
-
-#[test]
-fn an_installed_farm_that_is_not_on_path_is_not_first() {
-    let farm = "/home/me/.local/lib/kache/shims";
-    let fs = fake_with_shims(farm, ME).exe("/usr/bin/cc");
-    let status = super::status(
-        &dirs(&["/usr/bin"]),
-        Some(Path::new(ME)),
-        &dirs(&[farm]),
-        &fs,
-    );
-    assert_eq!(status, Status::NotFirst { dir: farm.into() });
-    assert!(!status.is_active());
-    assert_eq!(
-        status.detail(),
-        format!("installed at {farm}, not first on PATH")
-    );
-    assert_eq!(
-        status.fix(Path::new(farm)).as_deref(),
-        Some("export PATH=\"/home/me/.local/lib/kache/shims:$PATH\"")
-    );
-}
-
-#[test]
-fn nothing_installed_says_how_to_install() {
-    let fs = FakeFs::new().exe(ME).exe("/usr/bin/cc");
-    let status = super::status(
-        &dirs(&["/usr/bin"]),
-        Some(Path::new(ME)),
-        &dirs(&["/opt/other/shims"]),
-        &fs,
-    );
-    assert_eq!(status, Status::NotInstalled);
-    assert_eq!(status.detail(), "not installed");
-    assert_eq!(
-        status.fix(Path::new("/home/me/shims")).as_deref(),
-        Some("kache install-shims && export PATH=\"/home/me/shims:$PATH\"")
-    );
-}
-
-#[test]
-fn without_knowing_itself_nothing_is_active_or_installed() {
-    let fs = fake_with_shims("/shims", ME);
-    let status = super::status(&dirs(&["/shims"]), None, &dirs(&["/shims"]), &fs);
-    assert_eq!(status, Status::NotInstalled);
-}
-
-#[test]
-fn a_farm_of_dangling_kache_links_is_broken() {
-    // The farm points at a kache that an upgrade removed. PATH lookup skips
-    // a dangling link, so this used to read as "not installed".
-    let farm = "/home/me/.local/lib/kache/shims";
-    let gone = "/home/me/.local/share/mise/installs/kache/0.26.3/bin/kache";
-    let fs = fake_with_shims(farm, gone).exe("/usr/bin/cc");
-    let status = super::status(
-        &dirs(&[farm, "/usr/bin"]),
-        Some(Path::new(ME)),
-        &dirs(&[farm]),
-        &fs,
-    );
-    assert_eq!(
-        status,
-        Status::Broken {
-            dir: farm.into(),
-            names: names(),
-            target: gone.into()
-        }
-    );
-    assert_eq!(
-        status.detail(),
-        format!(
-            "broken: cc, c++, gcc, g++, clang, clang++ in {farm} point at {gone}, which is missing or not executable"
-        )
-    );
-    assert_eq!(
-        status.fix(Path::new(farm)).as_deref(),
-        Some("kache install-shims")
-    );
-    assert_eq!(
-        status.fix(Path::new("/elsewhere")).as_deref(),
-        Some("kache install-shims /home/me/.local/lib/kache/shims")
-    );
-}
-
-#[test]
-fn a_link_to_a_kache_that_is_not_executable_is_broken() {
-    let fs = FakeFs::new()
-        .exe(ME)
-        .plain("/old/kache")
-        .link("/shims/gcc", "/old/kache");
-    let status = super::status(&dirs(&["/shims"]), Some(Path::new(ME)), &[], &fs);
-    assert_eq!(
-        status,
-        Status::Broken {
-            dir: "/shims".into(),
-            names: vec!["gcc".into()],
-            target: "/old/kache".into()
-        }
-    );
-}
-
-#[test]
-fn a_marked_farm_counts_any_dangling_link_as_broken() {
-    let fs = FakeFs::new()
-        .exe(ME)
-        .plain("/usr/lib/kache/.kache-shims")
-        .link("/usr/lib/kache/cc", "/nix/store/abc/bin/kache-wrapped");
-    let status = super::status(&[], Some(Path::new(ME)), &dirs(&["/usr/lib/kache"]), &fs);
-    assert!(matches!(status, Status::Broken { .. }), "{status:?}");
-}
-
-#[test]
-fn a_dangling_link_that_is_not_kache_is_not_a_broken_farm() {
-    // /usr/bin/cc -> /etc/alternatives/cc with the alternative removed.
-    let fs = FakeFs::new()
-        .exe(ME)
-        .link("/usr/bin/cc", "/etc/alternatives/cc");
-    let status = super::status(&dirs(&["/usr/bin"]), Some(Path::new(ME)), &[], &fs);
-    assert_eq!(status, Status::NotInstalled);
-}
-
-#[test]
-fn relative_path_entries_are_not_scanned_for_broken_shims() {
-    let fs = FakeFs::new().exe(ME).link("/shims/cc", "/gone/kache");
-    let status = super::status(&dirs(&["shims"]), Some(Path::new(ME)), &[], &fs);
-    assert_eq!(status, Status::NotInstalled);
-}
-
-#[test]
-fn a_broken_farm_is_reported_before_a_working_one() {
-    let fs = fake_with_shims("/usr/lib/kache", ME)
-        .link("/home/me/.local/lib/kache/shims/cc", "/gone/kache");
-    let status = super::status(
-        &dirs(&["/usr/lib/kache"]),
-        Some(Path::new(ME)),
-        &dirs(&["/home/me/.local/lib/kache/shims"]),
-        &fs,
-    );
-    assert!(matches!(status, Status::Broken { .. }), "{status:?}");
+fn status_wording_names_the_fix() {
+    let default = Path::new(FARM);
+    let rows = [
+        (
+            active("cc", "/shims"),
+            "cc on PATH is a kache shim (/shims)",
+            None,
+        ),
+        (
+            broken(FARM, &["cc", "gcc"], "/gone/kache"),
+            "broken: cc, gcc in /home/me/.local/lib/kache/shims point at /gone/kache, which is missing or not executable",
+            Some("kache install-shims"),
+        ),
+        (
+            broken("/usr/lib/kache", &["cc"], "/gone/kache"),
+            "broken: cc in /usr/lib/kache point at /gone/kache, which is missing or not executable",
+            Some("kache install-shims /usr/lib/kache"),
+        ),
+        (
+            Status::NotFirst { dir: FARM.into() },
+            "installed at /home/me/.local/lib/kache/shims, not first on PATH",
+            Some("export PATH=\"/home/me/.local/lib/kache/shims:$PATH\""),
+        ),
+        (
+            Status::NotInstalled,
+            "not installed",
+            Some("kache install-shims && export PATH=\"/home/me/.local/lib/kache/shims:$PATH\""),
+        ),
+    ];
+    for (status, detail, fix) in rows {
+        assert_eq!(status.detail(), detail);
+        assert_eq!(status.fix(default).as_deref(), fix, "{detail}");
+    }
 }
 
 // Install, against the real filesystem.
 
 #[test]
-fn installs_a_symlink_for_every_name_and_marks_the_directory() {
+fn install_links_every_name_marks_the_farm_and_reruns_cleanly() {
     let (_dir, root) = scratch();
     let target = root.join("bin/kache");
     write_executable(&target);
     let shims = root.join("shims");
     let report = install_all(&shims, &target, false);
     assert_eq!(report.created, names());
-    assert!(report.marked);
-    assert!(has_marker(&shims));
-    for name in SHIM_NAMES {
-        assert_eq!(std::fs::read_link(shims.join(name)).unwrap(), target);
-    }
+    assert!(report.marked && has_marker(&shims));
     assert!(is_ready(&shims, &target, &RealFs));
+
+    // A farm from before the marker existed gets it on a rerun, and nothing
+    // accumulates.
+    std::fs::remove_file(shims.join(MARKER)).unwrap();
+    let report = install_all(&shims, &target, true);
+    assert_eq!(report.current, names());
+    assert!(has_marker(&shims));
+    assert_eq!(
+        std::fs::read_dir(&shims).unwrap().count(),
+        SHIM_NAMES.len() + 1
+    );
 }
 
-/// Without `force` an existing entry is left exactly as it was: users may
-/// point the command at `~/.local/bin`.
+/// Users may point the command at `~/.local/bin`, so without `force` a file
+/// that is not a kache link stays, and a marker would hide it.
 #[test]
 fn existing_entries_are_preserved_unless_forced() {
     let (_dir, root) = scratch();
     let target = root.join("bin/kache");
     write_executable(&target);
     let shims = root.join("shims");
-    std::fs::create_dir_all(&shims).unwrap();
     let occupied = shims.join("cc");
-    std::fs::write(&occupied, b"a real compiler wrapper").unwrap();
+    write_executable(&occupied);
 
     let report = install_all(&shims, &target, false);
     assert_eq!(report.skipped, ["cc"]);
-    assert_eq!(
-        std::fs::read(&occupied).unwrap(),
-        b"a real compiler wrapper"
-    );
-    for name in &SHIM_NAMES[1..] {
-        assert!(is_symlink(&shims.join(name)), "{name} should be installed");
-    }
-    assert!(!report.marked, "the wrapper would be hidden by a marker");
+    assert!(!is_symlink(&occupied));
+    assert_eq!(report.created.len(), SHIM_NAMES.len() - 1);
+    assert!(!report.marked);
 
     let report = install_all(&shims, &target, true);
     assert_eq!(report.replaced, ["cc"]);
-    assert_eq!(report.current.len(), SHIM_NAMES.len() - 1);
     assert!(is_symlink(&occupied));
     assert!(report.marked);
-}
-
-#[test]
-fn a_forced_reinstall_is_idempotent() {
-    let (_dir, root) = scratch();
-    let target = root.join("bin/kache");
-    write_executable(&target);
-    let shims = root.join("shims");
-    install_all(&shims, &target, false);
-    let report = install_all(&shims, &target, true);
-    assert_eq!(report.current, names());
-    assert_eq!(
-        std::fs::read_dir(&shims).unwrap().count(),
-        SHIM_NAMES.len() + 1,
-        "only the shims and the marker"
-    );
 }
 
 #[test]
@@ -538,71 +492,104 @@ fn an_install_that_creates_nothing_does_not_mark_the_directory() {
     }
     let report = install_all(&shims, &target, false);
     assert_eq!(report.skipped, names());
-    assert!(!report.marked);
-    assert!(!has_marker(&shims));
+    assert!(!report.marked && !has_marker(&shims));
 }
 
+/// One existing `cc` link, kept or replaced by what it reaches and whether
+/// kache owns the directory.
 #[test]
-fn a_farm_made_before_the_marker_gets_it_on_a_rerun() {
-    let (_dir, root) = scratch();
-    let target = root.join("bin/kache");
-    write_executable(&target);
-    let shims = root.join("shims");
-    install_all(&shims, &target, false);
-    std::fs::remove_file(shims.join(MARKER)).unwrap();
-    assert!(install_all(&shims, &target, false).marked);
-    assert!(has_marker(&shims));
-}
-
-#[test]
-fn a_dangling_shim_in_an_owned_directory_is_repaired_without_force() {
-    let (_dir, root) = scratch();
-    let old = root.join("old/kache");
-    let new = root.join("new/kache");
-    write_executable(&new);
-    let shims = root.join("shims");
-    std::fs::create_dir_all(&shims).unwrap();
-    for name in SHIM_NAMES {
-        symlink(&old, shims.join(name)).unwrap();
+fn an_existing_link_is_kept_or_replaced_by_what_it_reaches() {
+    type Bucket = fn(&Installed) -> &Vec<String>;
+    let repaired: Bucket = |r| &r.repaired;
+    let skipped: Bucket = |r| &r.skipped;
+    let current: Bucket = |r| &r.current;
+    // (case, link text, target, an extra real file in the dir, marked, bucket)
+    let rows: [(&str, &str, &str, bool, bool, Bucket); 6] = [
+        (
+            "dangling, owned",
+            "old/kache",
+            "new/kache",
+            false,
+            false,
+            repaired,
+        ),
+        (
+            "not executable, marked",
+            "plain/kache",
+            "new/kache",
+            true,
+            true,
+            repaired,
+        ),
+        (
+            "dangling, not owned",
+            "old/kache",
+            "new/kache",
+            true,
+            false,
+            skipped,
+        ),
+        (
+            "versioned, target versioned too",
+            "Cellar/kache/0.19.0/bin/kache",
+            "Cellar/kache/0.20.0/bin/kache",
+            false,
+            false,
+            skipped,
+        ),
+        (
+            "another working kache",
+            "other/kache",
+            "new/kache",
+            false,
+            false,
+            skipped,
+        ),
+        (
+            "relative link to the target",
+            "../new/kache",
+            "new/kache",
+            false,
+            false,
+            current,
+        ),
+    ];
+    for (case, text, target, extra, marked, bucket) in rows {
+        let (_dir, root) = scratch();
+        for exe in [
+            "new/kache",
+            "other/kache",
+            "Cellar/kache/0.19.0/bin/kache",
+            "Cellar/kache/0.20.0/bin/kache",
+        ] {
+            write_executable(&root.join(exe));
+        }
+        std::fs::create_dir_all(root.join("plain")).unwrap();
+        std::fs::write(root.join("plain/kache"), "").unwrap();
+        let shims = root.join("shims");
+        std::fs::create_dir_all(&shims).unwrap();
+        let text = if text.starts_with("..") {
+            PathBuf::from(text)
+        } else {
+            root.join(text)
+        };
+        symlink(&text, shims.join("cc")).unwrap();
+        if extra {
+            write_executable(&shims.join("make"));
+        }
+        if marked {
+            write_marker(&shims).unwrap();
+        }
+        let report = install(
+            &shims,
+            &root.join(target),
+            &["cc".into()],
+            false,
+            &Layout::default(),
+        )
+        .unwrap();
+        assert_eq!(bucket(&report), &["cc"], "{case}: {report:?}");
     }
-    let report = install_all(&shims, &new, false);
-    assert_eq!(report.repaired, names());
-    for name in SHIM_NAMES {
-        assert_eq!(std::fs::read_link(shims.join(name)).unwrap(), new);
-    }
-    assert!(report.marked);
-}
-
-#[test]
-fn a_shim_to_a_file_that_is_not_executable_is_repaired() {
-    let (_dir, root) = scratch();
-    let old = root.join("old/kache");
-    std::fs::create_dir_all(old.parent().unwrap()).unwrap();
-    std::fs::write(&old, "not a program").unwrap();
-    let new = root.join("new/kache");
-    write_executable(&new);
-    let shims = root.join("shims");
-    std::fs::create_dir_all(&shims).unwrap();
-    write_marker(&shims).unwrap();
-    symlink(&old, shims.join("cc")).unwrap();
-    let report = install_all(&shims, &new, false);
-    assert_eq!(report.repaired, ["cc"]);
-}
-
-#[test]
-fn a_dangling_link_in_a_directory_kache_does_not_own_is_left_alone() {
-    let (_dir, root) = scratch();
-    let new = root.join("new/kache");
-    write_executable(&new);
-    let bin = root.join("bin");
-    write_executable(&bin.join("make"));
-    symlink(root.join("old/kache"), bin.join("cc")).unwrap();
-    let report = install(&bin, &new, &["cc".into()], false, &Layout::default()).unwrap();
-    assert_eq!(report.skipped, ["cc"]);
-    assert_eq!(
-        std::fs::read_link(bin.join("cc")).unwrap(),
-        root.join("old/kache")
-    );
 }
 
 #[test]
@@ -639,32 +626,6 @@ fn versioned_homebrew_links_move_to_the_opt_link() {
             assert!(is_ready(&shims, &target, &RealFs));
         }
     }
-}
-
-#[test]
-fn a_versioned_link_stays_when_the_target_is_versioned_too() {
-    let (_dir, root) = scratch();
-    let keg = root.join("Cellar/kache/0.19.0/bin/kache");
-    let target = root.join("Cellar/kache/0.20.0/bin/kache");
-    write_executable(&keg);
-    write_executable(&target);
-    let shims = root.join("shims");
-    std::fs::create_dir_all(&shims).unwrap();
-    symlink(&keg, shims.join("cc")).unwrap();
-    let report = install(&shims, &target, &["cc".into()], false, &Layout::default()).unwrap();
-    assert_eq!(report.skipped, ["cc"]);
-}
-
-#[test]
-fn a_relative_link_is_read_from_its_directory() {
-    let (_dir, root) = scratch();
-    let target = root.join("bin/kache");
-    write_executable(&target);
-    let shims = root.join("shims");
-    std::fs::create_dir_all(&shims).unwrap();
-    symlink("../bin/kache", shims.join("cc")).unwrap();
-    let report = install(&shims, &target, &["cc".into()], false, &Layout::default()).unwrap();
-    assert_eq!(report.current, ["cc"]);
 }
 
 #[test]

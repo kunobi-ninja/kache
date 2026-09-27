@@ -1,5 +1,5 @@
-//! Compiler-name shim farms: directories of `cc`, `gcc`, `clang`, ...
-//! symlinks to kache, put ahead of the real toolchain on `PATH`.
+//! Compiler-name shim farms: `cc`, `gcc`, `clang`, ... symlinks to kache,
+//! put ahead of the real toolchain on `PATH`.
 
 use crate::fs::Fs;
 #[cfg(unix)]
@@ -10,34 +10,27 @@ use std::io;
 use std::path::Component;
 use std::path::{Path, PathBuf};
 
-/// The compiler names a farm holds: the canonical drivers only. A shim is a
-/// `PATH` ambush, so it covers what builds invoke rather than every name
-/// kache recognizes. Versioned and target-prefixed names are added on
-/// request.
+/// The canonical drivers. Versioned and target-prefixed names are opt-in.
 pub const SHIM_NAMES: &[&str] = &["cc", "c++", "gcc", "g++", "clang", "clang++"];
 
-/// File that marks a directory of kache shims. Packages that build a farm
-/// write it, and [`install`] does when the directory holds nothing else.
-/// Every entry in a marked directory is taken to be a shim, whichever kache
-/// it belongs to.
+/// Marks a directory of kache shims. Every kache skips every entry in it when
+/// looking for the real compiler, so it goes only on shim-only directories.
 pub const MARKER: &str = ".kache-shims";
 
-/// The farm `kache install-shims` fills when given no directory.
+/// The farm `kache install-shims` fills by default.
 pub fn default_dir(home: &Path) -> PathBuf {
     home.join(".local/lib/kache/shims")
 }
 
-/// The farm the distro packages install.
+/// The farm the distro packages ship.
 pub fn system_dir() -> PathBuf {
     PathBuf::from("/usr/lib/kache")
 }
 
-/// Whether `dir` holds [`MARKER`].
 pub fn has_marker(dir: &Path) -> bool {
     dir.join(MARKER).is_file()
 }
 
-/// Mark `dir` as a shim directory.
 pub fn write_marker(dir: &Path) -> io::Result<()> {
     std::fs::write(
         dir.join(MARKER),
@@ -46,17 +39,13 @@ pub fn write_marker(dir: &Path) -> io::Result<()> {
     )
 }
 
-/// Whether `path` names a kache binary by its file name. This catches the
-/// shims of another kache install, including farms made before the marker
-/// existed.
+/// Catches shims of another kache install, including farms older than the marker.
 pub fn is_kache_binary(path: &Path) -> bool {
     path.file_name().is_some_and(|name| {
         name.eq_ignore_ascii_case("kache") || name.eq_ignore_ascii_case("kache.exe")
     })
 }
 
-/// Whether `candidate` resolves to `self_real` or to any binary named
-/// `kache`.
 pub fn resolves_to_kache(
     candidate: &Path,
     self_real: Option<&Path>,
@@ -66,9 +55,7 @@ pub fn resolves_to_kache(
         .is_some_and(|real| self_real == Some(real.as_path()) || is_kache_binary(&real))
 }
 
-/// Whether `path` is a kache shim: it resolves to `self_real` or a binary
-/// named `kache`, or it is a symlink whose text names one. The last case
-/// covers a dangling shim, which resolves to nothing.
+/// The link-text check covers a dangling shim, which resolves to nothing.
 fn is_shim_entry(path: &Path, self_real: Option<&Path>, fs: &dyn Fs) -> bool {
     resolves_to_kache(path, self_real, &|path| fs.resolve(path))
         || fs
@@ -76,9 +63,7 @@ fn is_shim_entry(path: &Path, self_real: Option<&Path>, fs: &dyn Fs) -> bool {
             .is_some_and(|text| is_kache_binary(&text))
 }
 
-/// Whether `dir` may be marked: every entry other than the marker is a kache
-/// shim. The marker hides every entry from every kache, so a real compiler,
-/// or any other file, keeps the directory unmarked.
+/// Whether `dir` may be marked: everything in it besides the marker is a kache shim.
 pub fn holds_only_shims(dir: &Path, self_exe: Option<&Path>, fs: &dyn Fs) -> bool {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return false;
@@ -91,8 +76,7 @@ pub fn holds_only_shims(dir: &Path, self_exe: Option<&Path>, fs: &dyn Fs) -> boo
     })
 }
 
-/// Whether every canonical shim in `dir` is a link to exactly `target` that
-/// reaches an executable.
+/// Every canonical shim in `dir` is a working link whose text is exactly `target`.
 pub fn is_ready(dir: &Path, target: &Path, fs: &dyn Fs) -> bool {
     SHIM_NAMES.iter().all(|name| {
         let link = dir.join(name);
@@ -101,24 +85,18 @@ pub fn is_ready(dir: &Path, target: &Path, fs: &dyn Fs) -> bool {
 }
 
 #[cfg(unix)]
-/// What one name in the farm holds before [`install`] touches it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Slot {
-    /// Nothing.
     Empty,
-    /// A link to the target that reaches an executable.
     Current,
-    /// A link whose target is missing or not executable.
+    /// Target missing or not executable.
     Broken,
-    /// A working link into a versioned install directory while the target
-    /// is not in one.
+    /// Works, but points into a version directory while the target does not.
     Versioned,
-    /// Anything else: a file, a directory, a link elsewhere.
     Other,
 }
 
 #[cfg(unix)]
-/// What [`install`] does with one name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Action {
     Create,
@@ -136,8 +114,7 @@ enum Why {
 }
 
 #[cfg(unix)]
-/// Classify one entry. `link` is the symlink's text made absolute,
-/// `reaches_executable` whether following it ends at an executable file.
+/// `link` is the symlink text made absolute; `None` for anything else.
 fn classify(
     occupied: bool,
     link: Option<&Path>,
@@ -164,9 +141,8 @@ fn classify(
 }
 
 #[cfg(unix)]
-/// Replace only what cannot be serving anyone (a broken link) or what an
-/// upgrade will break (a versioned link), and only in a directory kache
-/// owns. `force` replaces anything but a current link.
+/// Without `force`, replace only what serves no one (broken) or an upgrade
+/// will break (versioned), and only in a directory kache owns.
 fn decide(slot: Slot, force: bool, owned: bool) -> Action {
     match slot {
         Slot::Empty => Action::Create,
@@ -179,15 +155,12 @@ fn decide(slot: Slot, force: bool, owned: bool) -> Action {
 }
 
 #[cfg(unix)]
-/// A directory kache owns: created by this run, marked, or holding nothing
-/// but kache shims.
 fn owns(created: bool, marked: bool, only_shims: bool) -> bool {
     created || marked || only_shims
 }
 
 #[cfg(unix)]
-/// Where the link text `text` in `dir` points, with `.` and `..` removed
-/// lexically, so a relative link compares equal to an absolute target.
+/// Lexical, so a relative link compares equal to an absolute target.
 fn link_path(dir: &Path, text: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for component in dir.join(text).components() {
@@ -205,19 +178,15 @@ fn link_path(dir: &Path, text: &Path) -> PathBuf {
 /// What [`install`] did, name by name.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Installed {
-    /// New links.
     pub created: Vec<String>,
-    /// Links whose target was missing or not executable, replaced.
+    /// Broken links replaced.
     pub repaired: Vec<String>,
-    /// Links into a versioned install directory, moved to the target.
+    /// Versioned links moved to the target.
     pub refreshed: Vec<String>,
-    /// Entries replaced because the caller forced it.
+    /// Replaced because of `force`.
     pub replaced: Vec<String>,
-    /// Links that already pointed at the target.
     pub current: Vec<String>,
-    /// Entries left alone.
     pub skipped: Vec<String>,
-    /// Whether the directory now carries [`MARKER`].
     pub marked: bool,
 }
 
@@ -265,13 +234,10 @@ impl std::error::Error for InstallError {
     }
 }
 
-/// Fill `dir` with symlinks named `names`, each pointing at `target`.
-///
-/// An existing entry is kept unless `force` is set, with two exceptions in a
-/// directory kache owns: a link whose target is missing or not executable is
-/// replaced, and so is a working link into a versioned install directory
-/// when `target` is not in one. When the directory ends up holding only
-/// kache shims it is marked with [`MARKER`].
+/// Link each of `names` in `dir` to `target`. Existing entries stay unless
+/// `force`, except broken or versioned links in a directory kache owns
+/// (created now, marked, or holding only kache shims). Marks the directory
+/// when it ends up holding only shims.
 #[cfg(unix)]
 pub fn install(
     dir: &Path,
@@ -327,23 +293,18 @@ pub fn install(
     Ok(report)
 }
 
-/// Where the compiler shims stand for one `PATH`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Status {
-    /// The first `name` on `PATH` is a shim of the running kache.
     Active {
         name: String,
         dir: PathBuf,
     },
-    /// A farm holds shims whose target is missing or not executable. A
-    /// shell's `PATH` lookup skips them, so builds run the compiler
-    /// uncached.
+    /// `PATH` lookup skips a dangling link, so builds silently run uncached.
     Broken {
         dir: PathBuf,
         names: Vec<String>,
         target: PathBuf,
     },
-    /// A working farm that is not first on `PATH`.
     NotFirst {
         dir: PathBuf,
     },
@@ -355,7 +316,6 @@ impl Status {
         matches!(self, Status::Active { .. })
     }
 
-    /// One line for a status report.
     pub fn detail(&self) -> String {
         match self {
             Status::Active { name, dir } => {
@@ -374,8 +334,7 @@ impl Status {
         }
     }
 
-    /// The command that fixes this state. `default_dir` is the farm
-    /// `kache install-shims` fills with no argument.
+    /// The command that fixes this state.
     pub fn fix(&self, default_dir: &Path) -> Option<String> {
         match self {
             Status::Active { .. } => None,
@@ -390,8 +349,6 @@ impl Status {
     }
 }
 
-/// Shims in `dir` that are kache's and no longer reach an executable, with
-/// the text of the first one's link.
 fn broken_shims(dir: &Path, fs: &dyn Fs) -> Option<(Vec<String>, PathBuf)> {
     if !dir.has_root() {
         return None;
@@ -412,7 +369,6 @@ fn broken_shims(dir: &Path, fs: &dyn Fs) -> Option<(Vec<String>, PathBuf)> {
     first.map(|target| (names, target))
 }
 
-/// The first canonical name whose first `PATH` hit is the running kache.
 fn active_shim(
     path_dirs: &[PathBuf],
     own: Option<kache_fs::InodeId>,
@@ -430,9 +386,8 @@ fn active_shim(
     })
 }
 
-/// Report the shims for `path_dirs`, checking `known_dirs` (the default and
-/// system farms) for one that is installed but not on `PATH`. A broken farm
-/// in either list comes first: its fix is the one that restores caching.
+/// `known_dirs` are the default and system farms. A broken farm is reported
+/// first: its fix is the one that restores caching.
 pub fn status(
     path_dirs: &[PathBuf],
     self_exe: Option<&Path>,

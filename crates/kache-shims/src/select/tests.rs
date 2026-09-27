@@ -1,258 +1,688 @@
 use super::*;
 use crate::fs::fake::FakeFs;
-
-const HOME: &str = "/home/me";
+use proptest::prelude::*;
 
 fn env(exe: &str, path: &[&str]) -> Env {
     Env {
         exe: exe.into(),
         path: path.iter().map(PathBuf::from).collect(),
-        home: Some(HOME.into()),
+        home: Some("/home/me".into()),
         user: Some("me".into()),
         ..Env::default()
     }
 }
 
-fn pick(env: &Env, fs: &FakeFs) -> Selection {
-    select(env, fs).expect("the running binary exists")
+struct Row {
+    name: &'static str,
+    fs: fn() -> FakeFs,
+    exe: &'static str,
+    path: &'static [&'static str],
+    tweak: fn(&mut Env),
+    want: &'static str,
+    kind: Kind,
+    stability: Stability,
+    reason: &'static str,
 }
 
-fn assert_picked(selection: &Selection, path: &str, kind: Kind, stability: Stability) {
-    assert_eq!(selection.path, Path::new(path), "{selection:?}");
-    assert_eq!(selection.kind, kind, "{selection:?}");
-    assert_eq!(selection.stability, stability, "{selection:?}");
-}
+fn plain_env(_: &mut Env) {}
 
-// Rule 2: a PATH entry that reaches the same file.
-
+/// One row per installer layout and PATH shape.
 #[test]
-fn a_path_entry_that_is_the_running_binary_is_user_managed() {
-    let fs = FakeFs::new().exe("/home/me/.cargo/bin/kache");
-    let env = env(
-        "/home/me/.cargo/bin/kache",
-        &["/usr/bin", "/home/me/.cargo/bin"],
-    );
-    let selection = pick(&env, &fs);
-    assert_picked(
-        &selection,
-        "/home/me/.cargo/bin/kache",
-        Kind::Other,
-        Stability::UserManaged,
-    );
-    assert!(
-        selection.reason.contains("first kache on PATH"),
-        "{selection:?}"
-    );
-}
-
-#[test]
-fn a_hardlink_on_path_counts_as_the_same_file() {
-    let fs = FakeFs::new()
-        .exe("/opt/tools/kache")
-        .same_file("/usr/local/bin/kache", "/opt/tools/kache");
-    let env = env("/opt/tools/kache", &["/usr/local/bin"]);
-    assert_picked(
-        &pick(&env, &fs),
-        "/usr/local/bin/kache",
-        Kind::Other,
-        Stability::UserManaged,
-    );
-}
-
-#[test]
-fn a_bind_mounted_copy_on_path_counts_as_the_same_file() {
-    // A bind mount shows the same device and inode under a second path.
-    let fs = FakeFs::new()
-        .exe("/srv/tools/bin/kache")
-        .same_file("/mnt/tools/bin/kache", "/srv/tools/bin/kache");
-    let env = env("/srv/tools/bin/kache", &["/mnt/tools/bin"]);
-    assert_picked(
-        &pick(&env, &fs),
-        "/mnt/tools/bin/kache",
-        Kind::Other,
-        Stability::UserManaged,
-    );
-}
-
-#[test]
-fn a_different_kache_on_path_is_not_selected() {
-    let fs = FakeFs::new()
-        .exe("/opt/new/kache")
-        .exe("/usr/local/bin/kache");
-    let env = env("/opt/new/kache", &["/usr/local/bin"]);
-    assert_picked(
-        &pick(&env, &fs),
-        "/opt/new/kache",
-        Kind::Other,
-        Stability::Versioned,
-    );
-}
-
-#[test]
-fn a_same_file_that_is_not_executable_is_not_selected() {
-    let fs = FakeFs::new().plain("/opt/tools/kache");
-    let env = env("/opt/tools/kache", &["/opt/tools"]);
-    assert_picked(
-        &pick(&env, &fs),
-        "/opt/tools/kache",
-        Kind::Other,
-        Stability::Versioned,
-    );
-}
-
-#[test]
-fn relative_and_empty_path_entries_are_skipped() {
-    // The fake filesystem resolves a relative path from `/`, so `bin` would
-    // reach `/bin/kache` if the rule did not skip it.
-    let fs = FakeFs::new().exe("/bin/kache");
-    for entry in ["bin", "", ".", "./bin"] {
-        let env = env("/bin/kache", &[entry]);
-        assert_picked(
-            &pick(&env, &fs),
-            "/bin/kache",
-            Kind::Other,
-            Stability::Versioned,
+fn each_layout_selects_the_expected_path() {
+    use Kind::*;
+    use Stability::*;
+    const KEG: &str = "/opt/homebrew/Cellar/kache/0.20.0/bin/kache";
+    const STORE: &str = "/nix/store/abc-kache-0.26.0/bin/kache";
+    const MISE_EXE: &str = "/home/me/.local/share/mise/installs/kache/0.26.3/bin/kache";
+    const MISE_BIN: &str = "/home/me/.local/share/mise/installs/kache/0.26.3/bin";
+    let rows = [
+        Row {
+            name: "cargo install on PATH",
+            fs: || FakeFs::new().exe("/home/me/.cargo/bin/kache"),
+            exe: "/home/me/.cargo/bin/kache",
+            path: &["/usr/bin", "/home/me/.cargo/bin"],
+            tweak: plain_env,
+            want: "/home/me/.cargo/bin/kache",
+            kind: Other,
+            stability: UserManaged,
+            reason: "the first kache on PATH",
+        },
+        Row {
+            name: "hardlink on PATH",
+            fs: || {
+                FakeFs::new()
+                    .exe("/opt/tools/kache")
+                    .same_file("/usr/local/bin/kache", "/opt/tools/kache")
+            },
+            exe: "/opt/tools/kache",
+            path: &["/usr/local/bin"],
+            tweak: plain_env,
+            want: "/usr/local/bin/kache",
+            kind: Other,
+            stability: UserManaged,
+            reason: "",
+        },
+        Row {
+            name: "bind mount on PATH",
+            fs: || {
+                FakeFs::new()
+                    .exe("/srv/tools/bin/kache")
+                    .same_file("/mnt/tools/bin/kache", "/srv/tools/bin/kache")
+            },
+            exe: "/srv/tools/bin/kache",
+            path: &["/mnt/tools/bin"],
+            tweak: plain_env,
+            want: "/mnt/tools/bin/kache",
+            kind: Other,
+            stability: UserManaged,
+            reason: "",
+        },
+        Row {
+            name: "a same file without the execute bit",
+            fs: || FakeFs::new().plain("/opt/tools/kache"),
+            exe: "/opt/tools/kache",
+            path: &["/opt/tools"],
+            tweak: plain_env,
+            want: "/opt/tools/kache",
+            kind: Other,
+            stability: Versioned,
+            reason: "no installer alias or PATH entry",
+        },
+        Row {
+            name: "relative PATH entries",
+            fs: || FakeFs::new().exe("/bin/kache"),
+            exe: "/bin/kache",
+            path: &["bin", "", ".", "./bin"],
+            tweak: plain_env,
+            want: "/bin/kache",
+            kind: Other,
+            stability: Versioned,
+            reason: "",
+        },
+        Row {
+            name: "Homebrew opt link",
+            fs: || {
+                FakeFs::new()
+                    .exe(KEG)
+                    .link("/opt/homebrew/opt/kache", "../Cellar/kache/0.20.0")
+                    .link(
+                        "/opt/homebrew/bin/kache",
+                        "../Cellar/kache/0.20.0/bin/kache",
+                    )
+            },
+            exe: KEG,
+            path: &["/opt/homebrew/bin"],
+            tweak: plain_env,
+            want: "/opt/homebrew/opt/kache/bin/kache",
+            kind: Homebrew,
+            stability: InstallerManaged,
+            reason: "Homebrew's opt link for kache",
+        },
+        Row {
+            name: "Homebrew run through its bin link (macOS current_exe)",
+            fs: || {
+                FakeFs::new()
+                    .exe(KEG)
+                    .link("/opt/homebrew/opt/kache", "../Cellar/kache/0.20.0")
+                    .link(
+                        "/opt/homebrew/bin/kache",
+                        "../Cellar/kache/0.20.0/bin/kache",
+                    )
+            },
+            exe: "/opt/homebrew/bin/kache",
+            path: &[],
+            tweak: plain_env,
+            want: "/opt/homebrew/opt/kache/bin/kache",
+            kind: Homebrew,
+            stability: InstallerManaged,
+            reason: "",
+        },
+        Row {
+            name: "Homebrew formula named differently from the binary",
+            fs: || {
+                FakeFs::new()
+                    .exe("/opt/homebrew/Cellar/kache-unstable/0.28.0-rc.1/bin/kache")
+                    .link(
+                        "/opt/homebrew/opt/kache-unstable",
+                        "../Cellar/kache-unstable/0.28.0-rc.1",
+                    )
+            },
+            exe: "/opt/homebrew/Cellar/kache-unstable/0.28.0-rc.1/bin/kache",
+            path: &[],
+            tweak: plain_env,
+            want: "/opt/homebrew/opt/kache-unstable/bin/kache",
+            kind: Homebrew,
+            stability: InstallerManaged,
+            reason: "opt link for kache-unstable",
+        },
+        Row {
+            name: "Homebrew old keg after opt moved on",
+            fs: || {
+                FakeFs::new()
+                    .exe("/opt/homebrew/Cellar/kache/0.19.0/bin/kache")
+                    .exe(KEG)
+                    .link("/opt/homebrew/opt/kache", "../Cellar/kache/0.20.0")
+            },
+            exe: "/opt/homebrew/Cellar/kache/0.19.0/bin/kache",
+            path: &["/opt/homebrew/Cellar/kache/0.19.0/bin"],
+            tweak: plain_env,
+            want: "/opt/homebrew/Cellar/kache/0.19.0/bin/kache",
+            kind: Homebrew,
+            stability: Versioned,
+            reason: "Homebrew removes this version",
+        },
+        Row {
+            name: "Homebrew without an opt link falls back to PATH",
+            fs: || {
+                FakeFs::new()
+                    .exe("/home/linuxbrew/.linuxbrew/Cellar/kache/0.20.0/bin/kache")
+                    .link(
+                        "/home/linuxbrew/.linuxbrew/bin/kache",
+                        "../Cellar/kache/0.20.0/bin/kache",
+                    )
+            },
+            exe: "/home/linuxbrew/.linuxbrew/Cellar/kache/0.20.0/bin/kache",
+            path: &["/home/linuxbrew/.linuxbrew/bin"],
+            tweak: plain_env,
+            want: "/home/linuxbrew/.linuxbrew/bin/kache",
+            kind: Homebrew,
+            stability: UserManaged,
+            reason: "",
+        },
+        Row {
+            name: "Nix store binary with a matching user profile",
+            fs: || {
+                FakeFs::new()
+                    .exe(STORE)
+                    .link("/home/me/.nix-profile", "/nix/store/prof-user-environment")
+                    .link("/nix/store/prof-user-environment/bin/kache", STORE)
+            },
+            exe: STORE,
+            path: &["/nix/store/abc-kache-0.26.0/bin"],
+            tweak: plain_env,
+            want: "/home/me/.nix-profile/bin/kache",
+            kind: Nix,
+            stability: InstallerManaged,
+            reason: "the Nix profile in /home/me/.nix-profile/bin",
+        },
+        Row {
+            name: "Nix profile under XDG_STATE_HOME",
+            fs: || {
+                FakeFs::new()
+                    .exe(STORE)
+                    .link("/xdg/nix/profile/bin/kache", STORE)
+            },
+            exe: STORE,
+            path: &[],
+            tweak: |env| env.xdg_state_home = Some("/xdg".into()),
+            want: "/xdg/nix/profile/bin/kache",
+            kind: Nix,
+            stability: InstallerManaged,
+            reason: "",
+        },
+        Row {
+            name: "NixOS per-user profile",
+            fs: || {
+                FakeFs::new()
+                    .exe(STORE)
+                    .link("/etc/profiles/per-user/me/bin/kache", STORE)
+            },
+            exe: STORE,
+            path: &[],
+            tweak: plain_env,
+            want: "/etc/profiles/per-user/me/bin/kache",
+            kind: Nix,
+            stability: InstallerManaged,
+            reason: "",
+        },
+        Row {
+            name: "Nix store binary without a matching profile",
+            fs: || {
+                FakeFs::new()
+                    .exe(STORE)
+                    .exe("/nix/store/def-kache-0.27.0/bin/kache")
+                    .link(
+                        "/home/me/.nix-profile/bin/kache",
+                        "/nix/store/def-kache-0.27.0/bin/kache",
+                    )
+            },
+            exe: STORE,
+            path: &[
+                "/nix/store/abc-kache-0.26.0/bin",
+                "/home/me/.nix-profile/bin",
+            ],
+            tweak: plain_env,
+            want: STORE,
+            kind: Nix,
+            stability: Versioned,
+            reason: "garbage collected",
+        },
+        Row {
+            name: "mise activate mode puts the version dir on PATH",
+            fs: || {
+                FakeFs::new().exe(MISE_EXE).link(
+                    "/home/me/.local/share/mise/installs/kache/latest",
+                    "./0.26.3",
+                )
+            },
+            exe: MISE_EXE,
+            path: &[MISE_BIN],
+            tweak: plain_env,
+            want: "/home/me/.local/share/mise/installs/kache/latest/bin/kache",
+            kind: Mise,
+            stability: InstallerManaged,
+            reason: "mise's latest alias for kache",
+        },
+        Row {
+            name: "mise latest points at another version",
+            fs: || {
+                FakeFs::new()
+                    .exe(MISE_EXE)
+                    .exe("/home/me/.local/share/mise/installs/kache/0.27.0/bin/kache")
+                    .link("/home/me/.local/share/mise/installs/kache/latest", "0.27.0")
+            },
+            exe: MISE_EXE,
+            path: &[MISE_BIN],
+            tweak: plain_env,
+            want: MISE_EXE,
+            kind: Mise,
+            stability: Versioned,
+            reason: "mise removes it",
+        },
+        Row {
+            name: "mise dispatcher is skipped even when it is this file",
+            fs: || {
+                FakeFs::new().exe("/home/me/.cargo/bin/kache").same_file(
+                    "/home/me/.local/share/mise/shims/kache",
+                    "/home/me/.cargo/bin/kache",
+                )
+            },
+            exe: "/home/me/.cargo/bin/kache",
+            path: &["/home/me/.local/share/mise/shims", "/home/me/.cargo/bin"],
+            tweak: plain_env,
+            want: "/home/me/.cargo/bin/kache",
+            kind: Other,
+            stability: UserManaged,
+            reason: "",
+        },
+        Row {
+            name: "MISE_DATA_DIR",
+            fs: || {
+                FakeFs::new()
+                    .exe("/tools/mise/installs/cargo-kache/0.26.3/bin/kache")
+                    .link("/tools/mise/installs/cargo-kache/latest", "0.26.3")
+            },
+            exe: "/tools/mise/installs/cargo-kache/0.26.3/bin/kache",
+            path: &[],
+            tweak: |env| env.mise_data_dir = Some("/tools/mise".into()),
+            want: "/tools/mise/installs/cargo-kache/latest/bin/kache",
+            kind: Mise,
+            stability: InstallerManaged,
+            reason: "",
+        },
+        Row {
+            name: "XDG_DATA_HOME mise",
+            fs: || {
+                FakeFs::new()
+                    .exe("/xdg/data/mise/installs/kache/1.0.0/kache")
+                    .link("/xdg/data/mise/installs/kache/latest", "1.0.0")
+            },
+            exe: "/xdg/data/mise/installs/kache/1.0.0/kache",
+            path: &[],
+            tweak: |env| env.xdg_data_home = Some("/xdg/data".into()),
+            want: "/xdg/data/mise/installs/kache/latest/kache",
+            kind: Mise,
+            stability: InstallerManaged,
+            reason: "",
+        },
+        Row {
+            name: "mise data dir that is itself a symlink",
+            fs: || {
+                FakeFs::new()
+                    .exe("/data/mise/installs/kache/0.26.3/bin/kache")
+                    .link("/home/me/.local/share/mise", "/data/mise")
+                    .link("/data/mise/installs/kache/latest", "0.26.3")
+            },
+            exe: "/data/mise/installs/kache/0.26.3/bin/kache",
+            path: &[],
+            tweak: plain_env,
+            want: "/data/mise/installs/kache/latest/bin/kache",
+            kind: Mise,
+            stability: InstallerManaged,
+            reason: "",
+        },
+        Row {
+            name: "asdf keeps no alias",
+            fs: || {
+                let exe = "/home/me/.asdf/installs/kache/0.26.0/bin/kache";
+                FakeFs::new()
+                    .exe(exe)
+                    .same_file("/home/me/.asdf/shims/kache", exe)
+            },
+            exe: "/home/me/.asdf/installs/kache/0.26.0/bin/kache",
+            path: &[
+                "/home/me/.asdf/shims",
+                "/home/me/.asdf/installs/kache/0.26.0/bin",
+            ],
+            tweak: plain_env,
+            want: "/home/me/.asdf/installs/kache/0.26.0/bin/kache",
+            kind: Asdf,
+            stability: Versioned,
+            reason: "asdf keeps no alias",
+        },
+        Row {
+            name: "ASDF_DATA_DIR",
+            fs: || FakeFs::new().exe("/opt/asdf/installs/kache/1.0/bin/kache"),
+            exe: "/opt/asdf/installs/kache/1.0/bin/kache",
+            path: &[],
+            tweak: |env| env.asdf_data_dir = Some("/opt/asdf".into()),
+            want: "/opt/asdf/installs/kache/1.0/bin/kache",
+            kind: Asdf,
+            stability: Versioned,
+            reason: "",
+        },
+        Row {
+            name: "sudo is reported",
+            fs: || {
+                FakeFs::new()
+                    .exe(KEG)
+                    .link("/opt/homebrew/opt/kache", "../Cellar/kache/0.20.0")
+            },
+            exe: KEG,
+            path: &[],
+            tweak: |env| env.elevation = Some(Elevation::Sudo { user: "me".into() }),
+            want: "/opt/homebrew/opt/kache/bin/kache",
+            kind: Homebrew,
+            stability: Unverified,
+            reason: "running as root through sudo for me, so HOME and PATH may be root's; Homebrew",
+        },
+        Row {
+            name: "a HOME owned by someone else is reported",
+            fs: || FakeFs::new().exe("/usr/bin/kache"),
+            exe: "/usr/bin/kache",
+            path: &["/usr/bin"],
+            tweak: |env| {
+                env.elevation = Some(Elevation::ForeignHome {
+                    home: "/home/other".into(),
+                })
+            },
+            want: "/usr/bin/kache",
+            kind: Other,
+            stability: Unverified,
+            reason: "HOME (/home/other) belongs to another user",
+        },
+        Row {
+            name: "sudo keeps a versioned path versioned",
+            fs: || FakeFs::new().exe("/opt/tools/kache"),
+            exe: "/opt/tools/kache",
+            path: &[],
+            tweak: |env| env.elevation = Some(Elevation::Sudo { user: "me".into() }),
+            want: "/opt/tools/kache",
+            kind: Other,
+            stability: Versioned,
+            reason: "sudo",
+        },
+    ];
+    for row in rows {
+        let mut env = env(row.exe, row.path);
+        (row.tweak)(&mut env);
+        let got = select(&env, &(row.fs)()).expect(row.name);
+        assert_eq!(got.path, Path::new(row.want), "{}: {got:?}", row.name);
+        assert_eq!(
+            (got.kind, got.stability),
+            (row.kind, row.stability),
+            "{}",
+            row.name
         );
+        assert!(got.reason.contains(row.reason), "{}: {got:?}", row.name);
     }
-    let env = env("/bin/kache", &["bin", "/bin"]);
-    assert_picked(
-        &pick(&env, &fs),
-        "/bin/kache",
-        Kind::Other,
-        Stability::UserManaged,
-    );
 }
 
-#[test]
-fn a_marked_shim_farm_on_path_is_skipped() {
-    let farm = "/home/me/.local/lib/kache/shims";
-    let fs = FakeFs::new()
-        .exe("/opt/tools/kache")
-        .same_file("/home/me/.local/lib/kache/shims/kache", "/opt/tools/kache")
-        .plain("/home/me/.local/lib/kache/shims/.kache-shims")
-        .same_file("/usr/bin/kache", "/opt/tools/kache");
-    let env = env("/opt/tools/kache", &[farm, "/usr/bin"]);
-    assert_picked(
-        &pick(&env, &fs),
-        "/usr/bin/kache",
-        Kind::Other,
-        Stability::UserManaged,
-    );
+// Property: over random installs, aliases and PATHs, the selection always
+// reaches the running binary, and each tier wins exactly when it should.
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Install {
+    Homebrew,
+    Nix,
+    Mise,
+    Asdf,
+    Plain,
 }
 
-// Homebrew.
-
-#[test]
-fn homebrew_records_the_opt_link() {
-    let fs = FakeFs::new()
-        .exe("/opt/homebrew/Cellar/kache/0.20.0/bin/kache")
-        .link("/opt/homebrew/opt/kache", "../Cellar/kache/0.20.0")
-        .link(
-            "/opt/homebrew/bin/kache",
-            "../Cellar/kache/0.20.0/bin/kache",
-        );
-    let env = env(
-        "/opt/homebrew/Cellar/kache/0.20.0/bin/kache",
-        &["/opt/homebrew/bin"],
-    );
-    let selection = pick(&env, &fs);
-    assert_picked(
-        &selection,
-        "/opt/homebrew/opt/kache/bin/kache",
-        Kind::Homebrew,
-        Stability::InstallerManaged,
-    );
-    assert!(
-        selection.reason.contains("opt link for kache"),
-        "{selection:?}"
-    );
+/// Whether an alias or PATH entry is absent, reaches this binary, or reaches
+/// another version.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Reach {
+    Absent,
+    This,
+    Other,
 }
 
-#[test]
-fn homebrew_run_through_its_bin_link_still_records_the_opt_link() {
-    // macOS reports the path used to exec, so current_exe is the bin link.
-    let fs = FakeFs::new()
-        .exe("/opt/homebrew/Cellar/kache/0.20.0/bin/kache")
-        .link("/opt/homebrew/opt/kache", "../Cellar/kache/0.20.0")
-        .link(
-            "/opt/homebrew/bin/kache",
-            "../Cellar/kache/0.20.0/bin/kache",
-        );
-    let env = env("/opt/homebrew/bin/kache", &["/opt/homebrew/bin"]);
-    assert_picked(
-        &pick(&env, &fs),
-        "/opt/homebrew/opt/kache/bin/kache",
-        Kind::Homebrew,
-        Stability::InstallerManaged,
-    );
+#[derive(Debug, Clone, Copy)]
+enum Entry {
+    Relative(usize),
+    MiseShims,
+    AsdfShims,
+    OwnDir,
+    Store,
+    ShimFarm,
+    Stable(usize, Reach),
 }
 
-#[test]
-fn homebrew_uses_the_formula_name_not_the_binary_name() {
-    let fs = FakeFs::new()
-        .exe("/opt/homebrew/Cellar/kache-unstable/0.28.0-rc.1/bin/kache")
-        .link(
-            "/opt/homebrew/opt/kache-unstable",
-            "../Cellar/kache-unstable/0.28.0-rc.1",
-        );
-    let env = env(
-        "/opt/homebrew/Cellar/kache-unstable/0.28.0-rc.1/bin/kache",
-        &[],
-    );
-    let selection = pick(&env, &fs);
-    assert_picked(
-        &selection,
-        "/opt/homebrew/opt/kache-unstable/bin/kache",
-        Kind::Homebrew,
-        Stability::InstallerManaged,
-    );
-    assert!(selection.reason.contains("kache-unstable"), "{selection:?}");
+fn reach() -> impl Strategy<Value = Reach> {
+    prop_oneof![Just(Reach::Absent), Just(Reach::This), Just(Reach::Other)]
 }
 
-#[test]
-fn an_old_keg_whose_opt_link_moved_on_is_versioned() {
-    // After an upgrade the old binary may still run; opt reaches the new one.
-    let fs = FakeFs::new()
-        .exe("/opt/homebrew/Cellar/kache/0.19.0/bin/kache")
-        .exe("/opt/homebrew/Cellar/kache/0.20.0/bin/kache")
-        .link("/opt/homebrew/opt/kache", "../Cellar/kache/0.20.0")
-        .link(
-            "/opt/homebrew/bin/kache",
-            "../Cellar/kache/0.20.0/bin/kache",
-        );
-    let env = env(
-        "/opt/homebrew/Cellar/kache/0.19.0/bin/kache",
-        &["/opt/homebrew/Cellar/kache/0.19.0/bin", "/opt/homebrew/bin"],
-    );
-    let selection = pick(&env, &fs);
-    assert_picked(
-        &selection,
-        "/opt/homebrew/Cellar/kache/0.19.0/bin/kache",
-        Kind::Homebrew,
-        Stability::Versioned,
-    );
-    assert!(selection.reason.contains("Homebrew"), "{selection:?}");
+fn entry() -> impl Strategy<Value = Entry> {
+    prop_oneof![
+        (0..3usize).prop_map(Entry::Relative),
+        Just(Entry::MiseShims),
+        Just(Entry::AsdfShims),
+        Just(Entry::OwnDir),
+        Just(Entry::Store),
+        Just(Entry::ShimFarm),
+        (0..3usize, reach()).prop_map(|(i, r)| Entry::Stable(i, r)),
+    ]
 }
 
-#[test]
-fn homebrew_without_an_opt_link_falls_back_to_path() {
-    let fs = FakeFs::new()
-        .exe("/home/linuxbrew/.linuxbrew/Cellar/kache/0.20.0/bin/kache")
-        .link(
-            "/home/linuxbrew/.linuxbrew/bin/kache",
-            "../Cellar/kache/0.20.0/bin/kache",
-        );
-    let env = env(
-        "/home/linuxbrew/.linuxbrew/Cellar/kache/0.20.0/bin/kache",
-        &["/home/linuxbrew/.linuxbrew/bin"],
-    );
-    assert_picked(
-        &pick(&env, &fs),
-        "/home/linuxbrew/.linuxbrew/bin/kache",
-        Kind::Homebrew,
-        Stability::UserManaged,
-    );
+fn install() -> impl Strategy<Value = Install> {
+    prop_oneof![
+        Just(Install::Homebrew),
+        Just(Install::Nix),
+        Just(Install::Mise),
+        Just(Install::Asdf),
+        Just(Install::Plain),
+    ]
 }
+
+const NIX_BINS: [&str; 5] = [
+    "/home/me/.nix-profile/bin",
+    "/home/me/.local/state/nix/profile/bin",
+    "/etc/profiles/per-user/me/bin",
+    "/run/current-system/sw/bin",
+    "/nix/var/nix/profiles/default/bin",
+];
+
+struct World {
+    env: Env,
+    fs: FakeFs,
+    /// Installer aliases that reach this binary, in rule order.
+    aliases: Vec<PathBuf>,
+    /// PATH dirs a correct rule 2 may use.
+    stable_dirs: Vec<PathBuf>,
+    kind: Kind,
+}
+
+fn world(
+    install: Install,
+    alias: Reach,
+    profiles: [Reach; 5],
+    entries: &[Entry],
+    sudo: bool,
+) -> World {
+    let (exe, other, kind) = match install {
+        Install::Homebrew => (
+            "/opt/homebrew/Cellar/kache/1.0.0/bin/kache",
+            "/opt/homebrew/Cellar/kache/0.9.0/bin/kache",
+            Kind::Homebrew,
+        ),
+        Install::Nix => (
+            "/nix/store/aaa-kache-1.0.0/bin/kache",
+            "/nix/store/bbb-kache-0.9.0/bin/kache",
+            Kind::Nix,
+        ),
+        Install::Mise => (
+            "/home/me/.local/share/mise/installs/kache/1.0.0/bin/kache",
+            "/home/me/.local/share/mise/installs/kache/0.9.0/bin/kache",
+            Kind::Mise,
+        ),
+        Install::Asdf => (
+            "/home/me/.asdf/installs/kache/1.0.0/bin/kache",
+            "/home/me/.asdf/installs/kache/0.9.0/bin/kache",
+            Kind::Asdf,
+        ),
+        Install::Plain => ("/opt/tools/kache", "/opt/other/kache", Kind::Other),
+    };
+    let target = |reach: Reach| if reach == Reach::This { exe } else { other };
+    let mut fs = FakeFs::new().exe(exe).exe(other);
+    let mut aliases = Vec::new();
+    match install {
+        Install::Homebrew if alias != Reach::Absent => {
+            let version = if alias == Reach::This {
+                "1.0.0"
+            } else {
+                "0.9.0"
+            };
+            fs = fs.link(
+                "/opt/homebrew/opt/kache",
+                &format!("../Cellar/kache/{version}"),
+            );
+        }
+        Install::Mise if alias != Reach::Absent => {
+            let version = if alias == Reach::This {
+                "1.0.0"
+            } else {
+                "0.9.0"
+            };
+            fs = fs.link("/home/me/.local/share/mise/installs/kache/latest", version);
+        }
+        Install::Nix => {
+            for (bin, reach) in NIX_BINS.iter().zip(profiles) {
+                if reach != Reach::Absent {
+                    fs = fs.link(&format!("{bin}/kache"), target(reach));
+                }
+                if reach == Reach::This {
+                    aliases.push(Path::new(bin).join("kache"));
+                }
+            }
+        }
+        _ => {}
+    }
+    if alias == Reach::This {
+        match install {
+            Install::Homebrew => aliases.push("/opt/homebrew/opt/kache/bin/kache".into()),
+            Install::Mise => {
+                aliases.push("/home/me/.local/share/mise/installs/kache/latest/bin/kache".into())
+            }
+            _ => {}
+        }
+    }
+
+    let mut path = Vec::new();
+    let mut stable_dirs = Vec::new();
+    let own_dir = Path::new(exe).parent().unwrap().to_path_buf();
+    for entry in entries {
+        let dir = match *entry {
+            Entry::Relative(i) => {
+                let dir = ["bin", "", "."][i];
+                // Place this binary where a relative entry would find it.
+                let absolute = Path::new("/").join(dir).join("kache");
+                fs = fs.same_file(absolute.to_str().unwrap(), exe);
+                PathBuf::from(dir)
+            }
+            Entry::MiseShims => PathBuf::from("/home/me/.local/share/mise/shims"),
+            Entry::AsdfShims => PathBuf::from("/home/me/.asdf/shims"),
+            Entry::Store => PathBuf::from("/nix/store/ccc-tools/bin"),
+            Entry::ShimFarm => {
+                fs = fs.plain("/home/me/.local/lib/kache/shims/.kache-shims");
+                PathBuf::from("/home/me/.local/lib/kache/shims")
+            }
+            Entry::OwnDir => {
+                if install == Install::Plain {
+                    stable_dirs.push(own_dir.clone());
+                }
+                path.push(own_dir.clone());
+                continue;
+            }
+            Entry::Stable(i, reach) => {
+                let dir = PathBuf::from(format!("/stable{i}/bin"));
+                if reach != Reach::Absent {
+                    let kache = dir.join("kache");
+                    fs = fs.same_file(kache.to_str().unwrap(), target(reach));
+                }
+                stable_dirs.push(dir.clone());
+                path.push(dir);
+                continue;
+            }
+        };
+        // Every skipped kind of directory holds this very binary, so a rule
+        // that failed to skip it would select it.
+        if !matches!(entry, Entry::Relative(_)) {
+            fs = fs.same_file(dir.join("kache").to_str().unwrap(), exe);
+        }
+        path.push(dir);
+    }
+
+    let mut env = env(exe, &[]);
+    env.path = path;
+    if sudo {
+        env.elevation = Some(Elevation::Sudo { user: "me".into() });
+    }
+    World {
+        env,
+        fs,
+        aliases,
+        stable_dirs,
+        kind,
+    }
+}
+
+proptest! {
+    #[test]
+    fn selection_reaches_the_binary_and_picks_the_right_tier(
+        install in install(),
+        alias in reach(),
+        profiles in proptest::array::uniform5(reach()),
+        entries in proptest::collection::vec(entry(), 0..6),
+        sudo in any::<bool>(),
+    ) {
+        let world = world(install, alias, profiles, &entries, sudo);
+        let got = select(&world.env, &world.fs).unwrap();
+        let own = world.fs.identity(&world.env.exe);
+        prop_assert_eq!(world.fs.identity(&got.path), own, "{:?}", got);
+        prop_assert_eq!(got.kind, world.kind);
+
+        // The first PATH entry of a stable kind that holds this binary.
+        let first_stable = world.env.path.iter().find(|dir| {
+            world.stable_dirs.contains(dir) && world.fs.identity(&dir.join("kache")) == own
+        });
+        let (want_path, want_stability) = match (world.aliases.first(), first_stable) {
+            (Some(alias), _) => (alias.clone(), Stability::InstallerManaged),
+            (None, Some(dir)) => (dir.join("kache"), Stability::UserManaged),
+            (None, None) => (world.env.exe.clone(), Stability::Versioned),
+        };
+        prop_assert_eq!(&got.path, &want_path);
+        let want_stability = if sudo && want_stability.survives_upgrade() {
+            Stability::Unverified
+        } else {
+            want_stability
+        };
+        prop_assert_eq!(got.stability, want_stability);
+    }
+}
+
+// Helpers and wiring the table and the property do not reach.
 
 #[test]
 fn keg_paths_split_into_opt_and_formula() {
@@ -265,86 +695,18 @@ fn keg_paths_split_into_opt_and_formula() {
             "kache".to_string()
         ))
     );
-    // A keg needs a formula, a version and something inside it.
-    assert_eq!(
-        homebrew_keg(Path::new("/opt/homebrew/Cellar/kache/0.20.0")),
-        None
-    );
-    assert_eq!(homebrew_keg(Path::new("/opt/homebrew/Cellar/kache")), None);
-    assert_eq!(homebrew_keg(Path::new("/opt/homebrew/bin/kache")), None);
-}
-
-// Nix.
-
-const STORE_KACHE: &str = "/nix/store/abc-kache-0.26.0/bin/kache";
-
-#[test]
-fn nix_records_the_user_profile_that_reaches_the_store_path() {
-    let fs = FakeFs::new()
-        .exe(STORE_KACHE)
-        .link("/home/me/.nix-profile", "/nix/store/prof-user-environment")
-        .link("/nix/store/prof-user-environment/bin/kache", STORE_KACHE);
-    let env = env(STORE_KACHE, &["/nix/store/abc-kache-0.26.0/bin"]);
-    let selection = pick(&env, &fs);
-    assert_picked(
-        &selection,
-        "/home/me/.nix-profile/bin/kache",
-        Kind::Nix,
-        Stability::InstallerManaged,
-    );
-    assert!(selection.reason.contains("Nix profile"), "{selection:?}");
-}
-
-#[test]
-fn nix_checks_every_profile_location() {
-    let cases = [
-        ("/home/me/.local/state/nix/profile/bin/kache", None),
-        ("/xdg/state/nix/profile/bin/kache", Some("/xdg/state")),
-        ("/etc/profiles/per-user/me/bin/kache", None),
-        ("/run/current-system/sw/bin/kache", None),
-        ("/nix/var/nix/profiles/default/bin/kache", None),
-    ];
-    for (profile, state) in cases {
-        let fs = FakeFs::new().exe(STORE_KACHE).link(profile, STORE_KACHE);
-        let mut env = env(STORE_KACHE, &[]);
-        env.xdg_state_home = state.map(PathBuf::from);
-        assert_picked(
-            &pick(&env, &fs),
-            profile,
-            Kind::Nix,
-            Stability::InstallerManaged,
-        );
+    for incomplete in [
+        "/opt/homebrew/Cellar/kache/0.20.0",
+        "/opt/homebrew/Cellar/kache",
+        "/opt/homebrew/bin/kache",
+    ] {
+        assert_eq!(homebrew_keg(Path::new(incomplete)), None, "{incomplete}");
     }
 }
 
 #[test]
-fn nix_without_a_matching_profile_is_versioned() {
-    // The profile holds a newer kache; the store path on PATH is skipped.
-    let fs = FakeFs::new()
-        .exe(STORE_KACHE)
-        .exe("/nix/store/def-kache-0.27.0/bin/kache")
-        .link(
-            "/home/me/.nix-profile/bin/kache",
-            "/nix/store/def-kache-0.27.0/bin/kache",
-        );
-    let env = env(
-        STORE_KACHE,
-        &[
-            "/nix/store/abc-kache-0.26.0/bin",
-            "/home/me/.nix-profile/bin",
-        ],
-    );
-    let selection = pick(&env, &fs);
-    assert_picked(&selection, STORE_KACHE, Kind::Nix, Stability::Versioned);
-    assert!(
-        selection.reason.contains("garbage collected"),
-        "{selection:?}"
-    );
-}
-
-#[test]
-fn nix_profile_bins_follow_the_environment() {
-    let mut env = env(STORE_KACHE, &[]);
+fn without_home_only_system_locations_are_known() {
+    let mut env = env("/unused", &[]);
     env.home = None;
     env.user = None;
     assert_eq!(
@@ -354,283 +716,61 @@ fn nix_profile_bins_follow_the_environment() {
             PathBuf::from("/nix/var/nix/profiles/default/bin")
         ]
     );
-}
-
-// mise and asdf.
-
-const MISE: &str = "/home/me/.local/share/mise";
-
-#[test]
-fn mise_activate_mode_records_the_latest_alias() {
-    // `mise activate` puts the version directory itself on PATH.
-    let exe = format!("{MISE}/installs/kache/0.26.3/bin/kache");
-    let fs = FakeFs::new()
-        .exe(&exe)
-        .link(&format!("{MISE}/installs/kache/latest"), "./0.26.3");
-    let version_dir = format!("{MISE}/installs/kache/0.26.3/bin");
-    let env = env(&exe, &[&version_dir]);
-    let selection = pick(&env, &fs);
-    assert_picked(
-        &selection,
-        &format!("{MISE}/installs/kache/latest/bin/kache"),
-        Kind::Mise,
-        Stability::InstallerManaged,
-    );
-    assert!(
-        selection.reason.contains("latest alias for kache"),
-        "{selection:?}"
-    );
-}
-
-#[test]
-fn mise_versioned_path_entry_is_skipped_when_latest_is_another_version() {
-    let exe = format!("{MISE}/installs/kache/0.26.3/bin/kache");
-    let fs = FakeFs::new()
-        .exe(&exe)
-        .exe(&format!("{MISE}/installs/kache/0.27.0/bin/kache"))
-        .link(&format!("{MISE}/installs/kache/latest"), "./0.27.0");
-    let version_dir = format!("{MISE}/installs/kache/0.26.3/bin");
-    let env = env(&exe, &[&version_dir]);
-    let selection = pick(&env, &fs);
-    assert_picked(&selection, &exe, Kind::Mise, Stability::Versioned);
-    assert!(selection.reason.contains("mise"), "{selection:?}");
-}
-
-#[test]
-fn the_mise_dispatcher_is_skipped() {
-    // In shims mode PATH holds mise's dispatcher, which runs whichever
-    // version a directory selects. Even one that is this file is skipped.
-    let fs = FakeFs::new()
-        .exe("/home/me/.cargo/bin/kache")
-        .same_file(&format!("{MISE}/shims/kache"), "/home/me/.cargo/bin/kache");
-    let shims = format!("{MISE}/shims");
-    let env_with = env(
-        "/home/me/.cargo/bin/kache",
-        &[&shims, "/home/me/.cargo/bin"],
-    );
-    assert_picked(
-        &pick(&env_with, &fs),
-        "/home/me/.cargo/bin/kache",
-        Kind::Other,
-        Stability::UserManaged,
-    );
-    let env_only = env("/home/me/.cargo/bin/kache", &[&shims]);
-    assert_eq!(pick(&env_only, &fs).stability, Stability::Versioned);
-}
-
-#[test]
-fn mise_data_dir_comes_from_the_environment() {
-    let exe = "/tools/mise/installs/cargo-kache/0.26.3/bin/kache";
-    let fs = FakeFs::new()
-        .exe(exe)
-        .link("/tools/mise/installs/cargo-kache/latest", "0.26.3");
-    let mut custom = env(exe, &[]);
-    custom.mise_data_dir = Some("/tools/mise".into());
-    assert_picked(
-        &pick(&custom, &fs),
-        "/tools/mise/installs/cargo-kache/latest/bin/kache",
-        Kind::Mise,
-        Stability::InstallerManaged,
-    );
-
-    let exe = "/xdg/data/mise/installs/kache/1.0.0/kache";
-    let fs = FakeFs::new()
-        .exe(exe)
-        .link("/xdg/data/mise/installs/kache/latest", "1.0.0");
-    let mut xdg = env(exe, &[]);
-    xdg.xdg_data_home = Some("/xdg/data".into());
-    assert_picked(
-        &pick(&xdg, &fs),
-        "/xdg/data/mise/installs/kache/latest/kache",
-        Kind::Mise,
-        Stability::InstallerManaged,
-    );
-}
-
-#[test]
-fn a_symlinked_mise_data_dir_is_matched_by_its_resolved_path() {
-    // current_exe comes back resolved, so the layout also knows the real
-    // location of a data directory that is itself a link.
-    let exe = "/data/mise/installs/kache/0.26.3/bin/kache";
-    let fs = FakeFs::new()
-        .exe(exe)
-        .link(MISE, "/data/mise")
-        .link("/data/mise/installs/kache/latest", "0.26.3");
-    let env = env(exe, &[]);
-    assert_picked(
-        &pick(&env, &fs),
-        "/data/mise/installs/kache/latest/bin/kache",
-        Kind::Mise,
-        Stability::InstallerManaged,
-    );
-}
-
-#[test]
-fn asdf_has_no_alias_so_its_install_is_versioned() {
-    let exe = "/home/me/.asdf/installs/kache/0.26.0/bin/kache";
-    let fs = FakeFs::new()
-        .exe(exe)
-        .same_file("/home/me/.asdf/shims/kache", exe);
-    let env = env(
-        exe,
-        &[
-            "/home/me/.asdf/shims",
-            "/home/me/.asdf/installs/kache/0.26.0/bin",
-        ],
-    );
-    let selection = pick(&env, &fs);
-    assert_picked(&selection, exe, Kind::Asdf, Stability::Versioned);
-    assert!(selection.reason.contains("asdf"), "{selection:?}");
-
-    let mut custom = env.clone();
-    custom.asdf_data_dir = Some("/opt/asdf".into());
-    custom.exe = "/opt/asdf/installs/kache/1.0/bin/kache".into();
-    let fs = FakeFs::new().exe("/opt/asdf/installs/kache/1.0/bin/kache");
-    assert_eq!(pick(&custom, &fs).kind, Kind::Asdf);
-}
-
-#[test]
-fn layout_classifies_versioned_directories() {
-    let env = env("/unused", &[]);
-    let layout = Layout::new(&env, &FakeFs::new());
-    let versioned = |path: &str| layout.versioned(Path::new(path));
-    assert_eq!(versioned("/nix/store/abc-kache/bin"), Some(Kind::Nix));
-    assert_eq!(
-        versioned("/opt/homebrew/Cellar/kache/1.0/bin"),
-        Some(Kind::Homebrew)
-    );
-    assert_eq!(
-        versioned(&format!("{MISE}/installs/kache/1.0/bin")),
-        Some(Kind::Mise)
-    );
-    assert_eq!(
-        versioned(&format!("{MISE}/installs/kache/latest/bin")),
-        None
-    );
-    assert_eq!(versioned(&format!("{MISE}/installs/kache")), None);
-    assert_eq!(
-        versioned("/home/me/.asdf/installs/kache/1.0/bin"),
-        Some(Kind::Asdf)
-    );
-    assert_eq!(versioned("/home/me/.asdf/installs"), None);
-    assert_eq!(versioned("/usr/bin"), None);
-    assert!(layout.is_dispatcher(Path::new("/home/me/.asdf/shims")));
-    assert!(layout.is_dispatcher(&PathBuf::from(format!("{MISE}/shims"))));
-    assert!(!layout.is_dispatcher(Path::new("/usr/bin")));
-}
-
-#[test]
-fn a_layout_without_a_home_knows_only_the_nix_store_and_kegs() {
-    let mut env = env("/unused", &[]);
-    env.home = None;
     let layout = Layout::new(&env, &FakeFs::new());
     assert_eq!(
         layout.versioned(Path::new("/nix/store/x/bin")),
         Some(Kind::Nix)
     );
     assert_eq!(
-        layout.versioned(&PathBuf::from(format!("{MISE}/installs/kache/1.0/bin"))),
+        layout.versioned(Path::new(
+            "/home/me/.local/share/mise/installs/kache/1.0/bin"
+        )),
         None
     );
     assert!(!layout.is_dispatcher(Path::new("/home/me/.asdf/shims")));
 }
 
-// Elevation and errors.
-
 #[test]
-fn sudo_is_reported_and_not_called_upgrade_safe() {
-    let fs = FakeFs::new()
-        .exe("/opt/homebrew/Cellar/kache/0.20.0/bin/kache")
-        .link("/opt/homebrew/opt/kache", "../Cellar/kache/0.20.0");
-    let mut env = env("/opt/homebrew/Cellar/kache/0.20.0/bin/kache", &[]);
-    env.elevation = Some(Elevation::Sudo { user: "me".into() });
-    let selection = pick(&env, &fs);
-    assert_picked(
-        &selection,
-        "/opt/homebrew/opt/kache/bin/kache",
-        Kind::Homebrew,
-        Stability::Unverified,
-    );
-    assert!(
-        selection
-            .reason
-            .starts_with("running as root through sudo for me"),
-        "{selection:?}"
-    );
-    assert!(selection.reason.contains("opt link"), "{selection:?}");
-}
-
-#[test]
-fn a_foreign_home_is_reported() {
-    let fs = FakeFs::new().exe("/usr/bin/kache");
-    let mut env = env("/usr/bin/kache", &["/usr/bin"]);
-    env.elevation = Some(Elevation::ForeignHome {
-        home: "/home/other".into(),
-    });
-    let selection = pick(&env, &fs);
-    assert_eq!(selection.stability, Stability::Unverified);
-    assert!(
-        selection
-            .reason
-            .contains("HOME (/home/other) belongs to another user")
-    );
-}
-
-#[test]
-fn elevation_keeps_a_versioned_path_versioned() {
-    let fs = FakeFs::new().exe("/opt/tools/kache");
-    let mut env = env("/opt/tools/kache", &[]);
-    env.elevation = Some(Elevation::Sudo { user: "me".into() });
-    let selection = pick(&env, &fs);
-    assert_eq!(selection.stability, Stability::Versioned);
-    assert!(selection.reason.contains("sudo"), "{selection:?}");
-}
-
-#[test]
-fn elevation_is_sudo_or_a_home_owned_by_someone_else() {
+fn elevation_is_sudo_as_root_or_a_home_owned_by_someone_else() {
     let home = Some(Path::new("/home/me"));
-    assert_eq!(
-        elevation(0, Some("me".into()), home, Some(0)),
-        Some(Elevation::Sudo { user: "me".into() })
-    );
-    // SUDO_USER without root is a leftover variable, not sudo.
-    assert_eq!(elevation(1000, Some("me".into()), home, Some(1000)), None);
-    assert_eq!(elevation(0, Some(String::new()), home, Some(0)), None);
-    assert_eq!(elevation(0, None, home, Some(0)), None);
-    assert_eq!(
-        elevation(0, None, home, Some(1000)),
-        Some(Elevation::ForeignHome {
-            home: "/home/me".into()
-        })
-    );
-    assert_eq!(elevation(1000, None, home, None), None);
-    assert_eq!(elevation(1000, None, None, Some(0)), None);
+    let sudo = Some(Elevation::Sudo { user: "me".into() });
+    let foreign = Some(Elevation::ForeignHome {
+        home: "/home/me".into(),
+    });
+    let cases = [
+        (0, Some("me"), home, Some(0), sudo),
+        // SUDO_USER without root is a leftover variable.
+        (1000, Some("me"), home, Some(1000), None),
+        (0, Some(""), home, Some(0), None),
+        (0, None, home, Some(0), None),
+        (0, None, home, Some(1000), foreign),
+        (1000, None, home, None, None),
+        (1000, None, None, Some(0), None),
+    ];
+    for (euid, sudo_user, home, owner, want) in cases {
+        let got = elevation(euid, sudo_user.map(String::from), home, owner);
+        assert_eq!(got, want, "euid={euid} sudo={sudo_user:?} owner={owner:?}");
+    }
 }
 
 #[test]
-fn a_replaced_binary_is_an_error() {
+fn a_replaced_or_missing_binary_is_an_error() {
     let fs = FakeFs::new().exe("/usr/bin/kache");
-    let env = env("/usr/bin/kache (deleted)", &["/usr/bin"]);
-    let error = select(&env, &fs).unwrap_err();
-    assert!(matches!(&error, Error::Replaced(path) if path == Path::new("/usr/bin/kache")));
+    let replaced = select(&env("/usr/bin/kache (deleted)", &[]), &fs).unwrap_err();
+    assert!(matches!(&replaced, Error::Replaced(p) if p == Path::new("/usr/bin/kache")));
     assert!(
-        error
+        replaced
             .to_string()
             .contains("was replaced while this process ran")
     );
-}
 
-#[test]
-fn a_missing_binary_is_an_error() {
-    let env = env("/usr/bin/kache", &[]);
-    let error = select(&env, &FakeFs::new()).unwrap_err();
-    assert!(matches!(&error, Error::Unreachable(path) if path == Path::new("/usr/bin/kache")));
-    assert_eq!(error.to_string(), "/usr/bin/kache no longer exists");
-    assert!(std::error::Error::source(&error).is_none());
+    let missing = select(&env("/usr/bin/kache", &[]), &FakeFs::new()).unwrap_err();
+    assert_eq!(missing.to_string(), "/usr/bin/kache no longer exists");
+    assert!(std::error::Error::source(&missing).is_none());
 
-    let error = Error::CurrentExe(std::io::Error::other("no procfs"));
-    assert!(error.to_string().contains("no procfs"));
-    assert!(std::error::Error::source(&error).is_some());
+    let current = Error::CurrentExe(std::io::Error::other("no procfs"));
+    assert!(current.to_string().contains("no procfs"));
+    assert!(std::error::Error::source(&current).is_some());
 }
 
 #[test]
@@ -657,48 +797,33 @@ fn labels_name_each_kind_and_stability() {
     }
 }
 
-// Live wiring.
-
 #[test]
-fn detect_selects_a_path_to_this_test_binary() {
-    let selection = detect().expect("the test binary exists");
+fn live_wiring_reads_this_process() {
     let exe = std::env::current_exe().unwrap();
+    let selection = detect().expect("the test binary exists");
     assert_eq!(
         kache_fs::file_identity(&selection.path).unwrap(),
         kache_fs::file_identity(&exe).unwrap()
     );
-}
 
-#[test]
-fn the_process_environment_is_read() {
     let env = Env::from_process().unwrap();
-    assert_eq!(env.exe, std::env::current_exe().unwrap());
+    assert_eq!(env.exe, exe);
     let path = std::env::var_os("PATH").unwrap_or_default();
     assert_eq!(env.path, std::env::split_paths(&path).collect::<Vec<_>>());
     assert_eq!(env.home, std::env::var_os("HOME").map(PathBuf::from));
-}
 
-#[test]
-fn the_process_layout_uses_home() {
-    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
-        return;
-    };
-    if std::env::var_os("ASDF_DATA_DIR").is_some() {
-        return;
+    if let Some(home) = &env.home
+        && std::env::var_os("ASDF_DATA_DIR").is_none()
+    {
+        let install = home.join(".asdf/installs/kache/1.0/bin");
+        assert_eq!(Layout::from_process().versioned(&install), Some(Kind::Asdf));
     }
-    let layout = Layout::from_process();
-    let install = home.join(".asdf/installs/kache/1.0/bin");
-    assert_eq!(layout.versioned(&install), Some(Kind::Asdf));
-}
 
-#[test]
-fn a_home_owned_by_another_user_is_seen_by_the_live_check() {
     // SAFETY: geteuid has no preconditions.
-    if unsafe { libc::geteuid() } == 0 {
-        return;
+    if unsafe { libc::geteuid() } != 0 {
+        assert_eq!(
+            process_elevation(Some(Path::new("/"))),
+            Some(Elevation::ForeignHome { home: "/".into() })
+        );
     }
-    assert_eq!(
-        process_elevation(Some(Path::new("/"))),
-        Some(Elevation::ForeignHome { home: "/".into() })
-    );
 }

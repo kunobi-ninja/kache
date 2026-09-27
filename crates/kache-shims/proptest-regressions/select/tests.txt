@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 189eb4795268b0f68c8eebf1d2241c0c0541f1b7eb73017221c99b12675b871f # shrinks to install = Mise, alias = Absent, profiles = [Absent, Absent, Absent, Absent, Absent], entries = [MiseShims], sudo = false
+cc a4478fe7c1ccd80e044d6921ffcfdf6fe0adc03be05da6fcca75884c058902e5 # shrinks to install = Mise, alias = Absent, profiles = [Absent, Absent, Absent, Absent, Absent], entries = [], sudo = false
+cc 0429488362466695e32ad89186644b1eea07e957ea19f7aac30f752352b529b9 # shrinks to install = Homebrew, alias = Other, profiles = [Absent, Absent, Absent, Absent, Absent], entries = [Relative(0)], sudo = false

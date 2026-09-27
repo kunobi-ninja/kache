@@ -2281,6 +2281,7 @@ version = "0.27.0"
 dependencies = [
  "kache-fs",
  "libc",
+ "proptest",
  "tempfile",
 ]
 

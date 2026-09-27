@@ -8045,9 +8045,8 @@ fn init_test_runner(yes: bool, no_shell: bool, check: bool) -> Result<bool> {
     }
 }
 
-/// The path shims record for this kache: an installer alias or a stable
-/// PATH entry when one reaches this binary, so an upgrade does not leave the
-/// farm dangling.
+/// An installer alias or stable PATH entry when one reaches this binary, so
+/// an upgrade does not leave the farm dangling.
 #[cfg(unix)]
 fn shim_target() -> Result<kache_shims::Selection> {
     kache_shims::detect().context("locating the kache binary")
@@ -8061,8 +8060,6 @@ fn shim_dir_is_ready(dir: &std::path::Path) -> bool {
         .is_ok_and(|target| kache_shims::farm::is_ready(dir, &target.path, &kache_shims::RealFs))
 }
 
-/// The canonical names plus `extra_names`, each checked to be a compiler
-/// name kache can wrap.
 #[cfg(unix)]
 fn shim_names(extra_names: &[String]) -> Result<Vec<String>> {
     let mut names: Vec<String> = kache_shims::farm::SHIM_NAMES

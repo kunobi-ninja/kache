@@ -1,9 +1,9 @@
 //! Conservative policy for isolated incremental rustc passthroughs.
 //!
-//! A normal cache hit is always preferred. After observing two misses for the
-//! same Cargo unit in the same target where only source/extern key groups
-//! changed, however far apart, the second compile may seed a private
-//! incremental directory. Successful seeds enable a small, time-bounded run
+//! A normal cache hit is always preferred. After a build of a Cargo unit (a
+//! hit or a miss) and a later miss in the same target where only
+//! source/extern key groups changed, however far apart, the miss may seed a
+//! private incremental directory. Successful seeds enable a small, time-bounded run
 //! of early passthroughs before Kache probes the cache again. An explicit crate force-list can request the same managed
 //! directory without the learning step. Every decision is target-local and
 //! protected by a cross-process lock held for the complete compiler invocation.
@@ -206,13 +206,10 @@ impl AdaptiveUnit {
         self.try_seed_at(cache_key, fields, now_secs())
     }
 
-    /// Record a miss that compiled through the normal non-incremental path.
-    pub(crate) fn observe_normal_miss(
-        &self,
-        cache_key: &str,
-        fields: &BTreeMap<String, String>,
-    ) -> bool {
-        self.observe_normal_miss_at(cache_key, fields, now_secs())
+    /// Record a build that did not use incremental state: a miss compiled
+    /// through the normal path, or a cache hit.
+    pub(crate) fn observe_build(&self, cache_key: &str, fields: &BTreeMap<String, String>) -> bool {
+        self.observe_build_at(cache_key, fields, now_secs())
     }
 
     /// A cache hit disproves the need for automatic passthrough. Remove both
@@ -354,7 +351,7 @@ impl AdaptiveUnit {
         })
     }
 
-    fn observe_normal_miss_at(
+    fn observe_build_at(
         &self,
         cache_key: &str,
         fields: &BTreeMap<String, String>,
@@ -861,7 +858,7 @@ mod tests {
     }
 
     fn teach(unit: &AdaptiveUnit, at: u64) {
-        assert!(unit.observe_normal_miss_at(
+        assert!(unit.observe_build_at(
             &cache_key("first"),
             &fields("stable", "source-a", "extern-a"),
             at,
@@ -1471,7 +1468,7 @@ mod tests {
     #[test]
     fn invalid_fingerprint_data_cannot_train_policy() {
         let (_temp, _args, unit) = fixture();
-        assert!(!unit.observe_normal_miss_at("short", &fields("a", "b", "c"), 1));
+        assert!(!unit.observe_build_at("short", &fields("a", "b", "c"), 1));
         assert!(key_fingerprint("short", &fields("a", "b", "c")).is_none());
         assert!(key_fingerprint(&cache_key("ok"), &BTreeMap::new()).is_none());
         assert!(

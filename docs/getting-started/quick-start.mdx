@@ -107,7 +107,7 @@ After setup, keep using ordinary Cargo commands. Give concurrent worktrees separ
 
 Kache caches eligible Rust executables by default on Linux and macOS. The default is off on Windows because executable debug information still refers to an external PDB path. Override the policy with `KACHE_CACHE_EXECUTABLES` or `cache.cache_executables`.
 
-Normal artifact-cached builds strip Cargo's incremental directory argument. Adaptive incremental mode, enabled by default, notices a Cargo unit you are editing (two misses in the same target where only its sources or dependencies changed) and gives it isolated incremental state. After 15 minutes without a build of that unit, Kache checks the cache again before using it. Use `KACHE_ADAPTIVE_INCREMENTAL=0` to turn that off or `KACHE_PRESERVE_INCREMENTAL=1` to force the incremental path for diagnostics.
+Normal artifact-cached builds strip Cargo's incremental directory argument. Adaptive incremental mode, enabled by default, notices a Cargo unit you are editing (a build of it, then a miss in the same target where only its sources or dependencies changed) and gives it isolated incremental state. After 15 minutes without a build of that unit, Kache checks the cache again before using it. Use `KACHE_ADAPTIVE_INCREMENTAL=0` to turn that off or `KACHE_PRESERVE_INCREMENTAL=1` to force the incremental path for diagnostics.
 
 ## Temporarily disable caching
 

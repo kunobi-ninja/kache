@@ -270,11 +270,13 @@ fn source_churn_adapts_then_returns_to_exact_cache_hits() {
     assert_eq!(restored["result"], "local_hit", "event: {restored:#}");
     assert_eq!(restored["compiler_runs"], 0);
 
-    // A hit clears the learned churn state, so a new variant starts learning
-    // with a normal stored miss rather than another adaptive passthrough.
-    let after_reset = build(15);
-    assert_eq!(after_reset["result"], "miss", "event: {after_reset:#}");
-    assert_eq!(after_reset["compiler_runs"], 1);
+    // A hit discards the incremental state it could not have used, but it
+    // is still a build of the unit: the next edit seeds fresh state rather
+    // than compiling once more without it. The consumer check in
+    // `build_variant` proves the fresh state produced the new answer.
+    let after_hit = build(15);
+    assert_passthrough(&after_hit, "adaptive seed");
+    assert_eq!(after_hit["compiler_runs"], 1);
 }
 
 #[test]

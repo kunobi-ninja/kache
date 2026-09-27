@@ -28,7 +28,7 @@ These hit in every build directory, including all of them under `--jobs N`, and 
 
 The mutated crate rebuilds, together with every crate downstream of it and their test binaries. A dependent's key includes the content hash of each `--extern` artifact, so a changed rlib changes every key above it.
 
-For the unit that misses on every mutant, Kache keeps rustc's incremental compilation instead of caching. Adaptive incremental mode notices a Cargo unit that misses twice in the same target with only its sources or dependencies changed, and gives it a private incremental directory while you keep building it. To pin that to the crate you are mutating:
+For the unit that misses on every mutant, Kache keeps rustc's incremental compilation instead of caching. Adaptive incremental mode notices a Cargo unit that is built and then misses in the same target with only its sources or dependencies changed, and gives it a private incremental directory while you keep building it. To pin that to the crate you are mutating:
 
 ```bash
 KACHE_INCREMENTAL_CRATES=my_crate cargo mutants

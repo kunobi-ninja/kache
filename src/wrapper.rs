@@ -3735,7 +3735,11 @@ fn run_parsed_rustc(
                         key_record,
                     );
                 }
-                reset_adaptive_unit(adaptive_unit.as_ref());
+                observe_adaptive_hit(
+                    adaptive_unit.as_ref(),
+                    adaptive_key_fields.as_ref(),
+                    &cache_key,
+                );
 
                 return Ok(0);
             }
@@ -3773,7 +3777,11 @@ fn run_parsed_rustc(
                     key_record,
                 );
             }
-            reset_adaptive_unit(adaptive_unit.as_ref());
+            observe_adaptive_hit(
+                adaptive_unit.as_ref(),
+                adaptive_key_fields.as_ref(),
+                &cache_key,
+            );
             return Ok(0);
         }
 
@@ -3923,7 +3931,11 @@ fn run_parsed_rustc(
                 key_record,
             );
         }
-        reset_adaptive_unit(adaptive_unit.as_ref());
+        observe_adaptive_hit(
+            adaptive_unit.as_ref(),
+            adaptive_key_fields.as_ref(),
+            &cache_key,
+        );
         return Ok(0);
     }
 
@@ -4136,7 +4148,7 @@ fn run_parsed_rustc(
     }
 
     if let (Some(unit), Some(fields)) = (adaptive_unit.as_ref(), adaptive_key_fields.as_ref()) {
-        let _ = unit.observe_normal_miss(&cache_key, fields);
+        let _ = unit.observe_build(&cache_key, fields);
     }
 
     // 5. Store the output files
@@ -6438,6 +6450,22 @@ fn passthrough_args(
         fallback: false,
         fallback_attempt,
     })
+}
+
+/// A hit restored a unit's outputs without its incremental state. Count it as
+/// the unit's first build, so the next edit seeds state instead of first
+/// compiling once more without it.
+fn observe_adaptive_hit(
+    unit: Option<&AdaptiveUnit>,
+    fields: Option<&std::collections::BTreeMap<String, String>>,
+    cache_key: &str,
+) {
+    match (unit, fields) {
+        (Some(unit), Some(fields)) => {
+            let _ = unit.observe_build(cache_key, fields);
+        }
+        (unit, _) => reset_adaptive_unit(unit),
+    }
 }
 
 fn reset_adaptive_unit(unit: Option<&AdaptiveUnit>) {

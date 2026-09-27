@@ -412,7 +412,40 @@ fn doctor_host_config_check_wording() {
 }
 
 #[test]
+fn doctor_install_path_check_wording() {
+    let mut selection = kache_shims::Selection {
+        path: "/home/me/.nix-profile/bin/kache".into(),
+        kind: kache_shims::Kind::Nix,
+        stability: kache_shims::Stability::InstallerManaged,
+        reason:
+            "the Nix profile in /home/me/.nix-profile/bin, which each upgrade or rollback repoints"
+                .into(),
+    };
+    let (pass, detail, fix) = doctor_install_path_check(&Ok(selection.clone()));
+    assert!(pass);
+    assert_eq!(
+        detail,
+        "/home/me/.nix-profile/bin/kache (Nix, installer-managed): the Nix profile in \
+         /home/me/.nix-profile/bin, which each upgrade or rollback repoints"
+    );
+    assert_eq!(fix, None);
+
+    selection.stability = kache_shims::Stability::Versioned;
+    let (pass, _, fix) = doctor_install_path_check(&Ok(selection));
+    assert!(!pass);
+    assert!(fix.unwrap().contains("kache daemon install"));
+
+    let error = kache_shims::Error::Replaced("/usr/bin/kache".into());
+    let (pass, detail, fix) = doctor_install_path_check(&Err(error));
+    assert!(!pass);
+    assert!(detail.contains("was replaced"), "{detail}");
+    assert_eq!(fix, None);
+}
+
+#[test]
 fn doctor_check_optionality_truth_table() {
+    // An install path an upgrade may break is information, not an issue.
+    assert!(doctor_check_is_optional("Install path", false, false));
     // Daemon labels downgrade exactly when the daemon is optional.
     assert!(doctor_check_is_optional("Daemon version", true, false));
     assert!(!doctor_check_is_optional("Daemon version", false, false));

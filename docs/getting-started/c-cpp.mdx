@@ -60,9 +60,19 @@ Each shim is a native symlink to the `kache` binary. Do not wrap Kache in a shel
 
 Kache is a larger process than ccache. On a tree of many tiny `.c` files, measure both before replacing ccache.
 
-`kache doctor` checks the current terminal's PATH. If init saved shell setup but doctor still reports inactive shims, open a new terminal or run the activation command. Init cannot change its parent shell's environment.
+`kache doctor` checks the current terminal's PATH and reports the shims as active, broken, installed but not first on PATH, or not installed. If init saved shell setup but doctor still reports inactive shims, open a new terminal or run the activation command. Init cannot change its parent shell's environment.
 
-If Homebrew shims were created by an older Kache version, run `kache init` once after upgrading. It replaces Kache-owned links to a versioned Cellar keg with links through Homebrew's `opt` path, which stays valid across later formula upgrades. Other files in the shim directory are left alone.
+### Upgrades
+
+The shims link to a path that keeps working after Kache is upgraded. `install-shims` checks these in order and uses the first one that reaches the running binary:
+
+1. The installer's alias: Homebrew's `opt/<formula>/bin/kache`, a Nix profile such as `~/.nix-profile/bin/kache`, or mise's `installs/<tool>/latest`.
+2. The first `kache` on `PATH`, skipping relative entries, version directories (mise and asdf `installs/<version>`, Homebrew kegs, `/nix/store`), the mise and asdf shim directories, and marked shim directories.
+3. The running binary's own path. `install-shims` then says to rerun it after each upgrade. asdf installs usually end up here, since asdf keeps no alias for a version.
+
+`kache doctor` shows the chosen path under "Install path", with the installer and whether the path survives an upgrade.
+
+If the binary a shim points at is removed, the shell skips the link and builds run the real compiler uncached. Doctor then reports the farm as broken. Run `kache install-shims` again. In a directory Kache owns (it created it, it carries a `.kache-shims` marker, or it holds only Kache links), a rerun replaces links whose target is missing or not executable, and moves links that point into a version directory to the upgrade-safe path when there is one. It needs no `--force` for either, and it leaves other files alone.
 
 ## Prefix method
 

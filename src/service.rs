@@ -80,27 +80,77 @@ fn launchd_service_registered(uid: u32) -> bool {
         .is_ok_and(|out| out.status.success())
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ServiceExeMismatch {
-    pub installed: PathBuf,
-    pub current: PathBuf,
-}
-
 fn canonical_or_original(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
-pub(crate) fn service_exe_mismatch(path: &Path) -> Option<ServiceExeMismatch> {
-    let installed = parse_exe_from_service_file(path)?;
-    let current = std::env::current_exe()
-        .ok()
-        .map(|p| canonical_or_original(&p))?;
+/// What is wrong with the binary a service file runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ServiceExeProblem {
+    /// The recorded path reaches nothing, typically a version an upgrade
+    /// removed.
+    Missing { recorded: PathBuf },
+    /// The recorded path reaches a file that cannot be run.
+    NotExecutable { recorded: PathBuf },
+    /// The recorded path is a different file from the running kache.
+    OtherBinary { recorded: PathBuf, current: PathBuf },
+}
 
-    if canonical_or_original(&installed) == current {
-        None
-    } else {
-        Some(ServiceExeMismatch { installed, current })
+impl ServiceExeProblem {
+    pub(crate) fn detail(&self) -> String {
+        match self {
+            Self::Missing { recorded } => {
+                format!(
+                    "the service runs {}, which no longer exists",
+                    recorded.display()
+                )
+            }
+            Self::NotExecutable { recorded } => {
+                format!(
+                    "the service runs {}, which is not executable",
+                    recorded.display()
+                )
+            }
+            Self::OtherBinary { recorded, current } => format!(
+                "the service runs {}, a different file from this kache ({})",
+                recorded.display(),
+                current.display()
+            ),
+        }
     }
+}
+
+/// Compare the recorded service binary with the running one by file
+/// identity, so a link, hardlink or bind mount of the same file matches.
+/// When the running binary itself is gone there is nothing to compare.
+fn recorded_exe_problem(
+    recorded: &Path,
+    current: &Path,
+    fs: &dyn kache_shims::Fs,
+) -> Option<ServiceExeProblem> {
+    let recorded_id = fs.identity(recorded);
+    if recorded_id.is_none() {
+        return Some(ServiceExeProblem::Missing {
+            recorded: recorded.to_path_buf(),
+        });
+    }
+    if !fs.is_executable_file(recorded) {
+        return Some(ServiceExeProblem::NotExecutable {
+            recorded: recorded.to_path_buf(),
+        });
+    }
+    let current_id = fs.identity(current)?;
+    (recorded_id != Some(current_id)).then(|| ServiceExeProblem::OtherBinary {
+        recorded: recorded.to_path_buf(),
+        current: current.to_path_buf(),
+    })
+}
+
+/// The problem with the binary the service file at `path` runs, if any.
+pub(crate) fn service_exe_problem(path: &Path) -> Option<ServiceExeProblem> {
+    let recorded = parse_exe_from_service_file(path)?;
+    let current = std::env::current_exe().ok()?;
+    recorded_exe_problem(&recorded, &current, &kache_shims::RealFs)
 }
 
 // ── Install ──────────────────────────────────────────────────────
@@ -128,10 +178,11 @@ fn systemd_user_manager_reachable() -> bool {
 }
 
 pub fn install() -> Result<()> {
-    let exe = std::env::current_exe()
-        .context("resolving current executable")?
-        .canonicalize()
-        .context("canonicalizing executable path")?;
+    let selection = kache_shims::detect().context("locating the kache binary")?;
+    for line in selection_lines(&selection) {
+        println!("{line}");
+    }
+    let exe = selection.path;
 
     if cfg!(target_os = "macos") {
         install_launchd(&exe)
@@ -142,6 +193,23 @@ pub fn install() -> Result<()> {
     } else {
         anyhow::bail!("unsupported platform");
     }
+}
+
+/// What `kache daemon install` says about the path it records.
+fn selection_lines(selection: &kache_shims::Selection) -> Vec<String> {
+    let mut lines = vec![format!(
+        "Recording {} ({}, {}).",
+        selection.path.display(),
+        selection.kind,
+        selection.stability
+    )];
+    if !selection.stability.survives_upgrade() {
+        lines.push(format!(
+            "  Note: {}. Rerun `kache daemon install` after upgrading kache.",
+            selection.reason
+        ));
+    }
+    lines
 }
 
 /// Render the launchd plist that runs `exe daemon run` with the given log paths.
@@ -910,9 +978,9 @@ pub fn status(json: bool) -> Result<()> {
     } else {
         None
     };
-    let exe_mismatch = installed_service_path
+    let exe_problem = installed_service_path
         .as_deref()
-        .and_then(service_exe_mismatch);
+        .and_then(service_exe_problem);
 
     if json {
         #[derive(serde::Serialize)]
@@ -949,7 +1017,7 @@ pub fn status(json: bool) -> Result<()> {
                     .and_then(|stats| stats.effective_config.as_ref())
                     .map(|config| config.config_path.clone()),
                 startup_log: config.as_ref().map(|cfg| startup_log(cfg).to_string()),
-                service_executable_mismatch: exe_mismatch.is_some(),
+                service_executable_mismatch: exe_problem.is_some(),
             },
             if running {
                 Vec::new()
@@ -1010,12 +1078,10 @@ pub fn status(json: bool) -> Result<()> {
         }
     }
 
-    // 6. Exe path mismatch warning
-    if let Some(mismatch) = exe_mismatch {
+    // 6. Recorded binary warning
+    if let Some(problem) = exe_problem {
         println!();
-        println!("  \x1b[33mWarning: installed exe differs from current exe\x1b[0m");
-        println!("    installed: {}", mismatch.installed.display());
-        println!("    current:   {}", mismatch.current.display());
+        println!("  \x1b[33mWarning: {}\x1b[0m", problem.detail());
         println!("    run `kache daemon install` to update");
     }
 
@@ -1502,7 +1568,7 @@ WantedBy=default.target
     }
 
     #[test]
-    fn test_service_exe_mismatch_accepts_current_exe() {
+    fn test_service_exe_problem_accepts_current_exe() {
         if !(cfg!(target_os = "macos") || cfg!(target_os = "linux")) {
             return;
         }
@@ -1512,11 +1578,11 @@ WantedBy=default.target
         let current = std::env::current_exe().unwrap();
         write_service_file(&service_file, &current);
 
-        assert_eq!(service_exe_mismatch(&service_file), None);
+        assert_eq!(service_exe_problem(&service_file), None);
     }
 
     #[test]
-    fn test_service_exe_mismatch_detects_stale_exe() {
+    fn test_service_exe_problem_detects_a_removed_exe() {
         if !(cfg!(target_os = "macos") || cfg!(target_os = "linux")) {
             return;
         }
@@ -1526,11 +1592,102 @@ WantedBy=default.target
         let stale = dir.path().join("old-kache");
         write_service_file(&service_file, &stale);
 
-        let mismatch = service_exe_mismatch(&service_file).unwrap();
-        assert_eq!(mismatch.installed, stale);
         assert_eq!(
-            mismatch.current,
-            canonical_or_original(&std::env::current_exe().unwrap())
+            service_exe_problem(&service_file),
+            Some(ServiceExeProblem::Missing { recorded: stale })
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recorded_exe_problems_are_told_apart() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let current = dir.path().join("kache");
+        fs::write(&current, "#!/bin/sh\n").unwrap();
+        fs::set_permissions(&current, fs::Permissions::from_mode(0o755)).unwrap();
+        let link = dir.path().join("opt-kache");
+        std::os::unix::fs::symlink(&current, &link).unwrap();
+        let hardlink = dir.path().join("hardlinked-kache");
+        fs::hard_link(&current, &hardlink).unwrap();
+        let other = dir.path().join("other-kache");
+        fs::copy(&current, &other).unwrap();
+        let plain = dir.path().join("plain-kache");
+        fs::write(&plain, "").unwrap();
+        let real = kache_shims::RealFs;
+
+        assert_eq!(recorded_exe_problem(&current, &current, &real), None);
+        assert_eq!(recorded_exe_problem(&link, &current, &real), None);
+        assert_eq!(recorded_exe_problem(&hardlink, &current, &real), None);
+        assert_eq!(
+            recorded_exe_problem(&other, &current, &real),
+            Some(ServiceExeProblem::OtherBinary {
+                recorded: other.clone(),
+                current: current.clone()
+            })
+        );
+        assert_eq!(
+            recorded_exe_problem(&plain, &current, &real),
+            Some(ServiceExeProblem::NotExecutable {
+                recorded: plain.clone()
+            })
+        );
+        let gone = dir.path().join("gone");
+        assert_eq!(
+            recorded_exe_problem(&gone, &current, &real),
+            Some(ServiceExeProblem::Missing {
+                recorded: gone.clone()
+            })
+        );
+        // A running binary that was replaced leaves nothing to compare.
+        assert_eq!(recorded_exe_problem(&other, &gone, &real), None);
+    }
+
+    #[test]
+    fn service_exe_problems_name_the_recorded_path() {
+        let recorded = PathBuf::from("/nix/store/abc-kache/bin/kache");
+        assert_eq!(
+            ServiceExeProblem::Missing {
+                recorded: recorded.clone()
+            }
+            .detail(),
+            "the service runs /nix/store/abc-kache/bin/kache, which no longer exists"
+        );
+        assert_eq!(
+            ServiceExeProblem::NotExecutable {
+                recorded: recorded.clone()
+            }
+            .detail(),
+            "the service runs /nix/store/abc-kache/bin/kache, which is not executable"
+        );
+        assert_eq!(
+            ServiceExeProblem::OtherBinary {
+                recorded,
+                current: "/usr/bin/kache".into()
+            }
+            .detail(),
+            "the service runs /nix/store/abc-kache/bin/kache, a different file from this kache (/usr/bin/kache)"
+        );
+    }
+
+    #[test]
+    fn install_reports_the_recorded_path_and_warns_when_it_is_versioned() {
+        let mut selection = kache_shims::Selection {
+            path: "/opt/homebrew/opt/kache/bin/kache".into(),
+            kind: kache_shims::Kind::Homebrew,
+            stability: kache_shims::Stability::InstallerManaged,
+            reason: "Homebrew's opt link for kache, which each upgrade repoints".into(),
+        };
+        assert_eq!(
+            selection_lines(&selection),
+            ["Recording /opt/homebrew/opt/kache/bin/kache (Homebrew, installer-managed)."]
+        );
+        selection.stability = kache_shims::Stability::Versioned;
+        let lines = selection_lines(&selection);
+        assert_eq!(lines.len(), 2);
+        assert!(
+            lines[1].contains("Rerun `kache daemon install`"),
+            "{lines:?}"
         );
     }
 

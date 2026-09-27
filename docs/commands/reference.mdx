@@ -142,6 +142,8 @@ kache doctor --repair
 
 `--purge-sccache` and `--repair` delete data. Check what they will remove before running them.
 
+Doctor also reports where the running binary is installed ("Install path"), whether the C/C++ shims are active, broken, not first on `PATH` or not installed, and whether the login service runs a binary that no longer exists, is not executable, or is a different file from the running Kache. Run `kache daemon install` to fix the last one.
+
 With a remote configured, `kache doctor` also asks it for an object that is never written. A miss passes: the store answered and accepted the credentials. A failure names the likely cause when the store says, such as expired credentials, a secret key that does not match, a clock too far from the store's, the bucket's real region, or a bucket that does not exist. An S3 endpoint that uses plain `http://` to another machine fails its own check.
 
 ## `kache sync`
@@ -425,7 +427,9 @@ kache install-shims --from-path
 kache install-shims --force ~/.local/lib/kache/shims
 ```
 
-Unix only. Creates `cc`, `c++`, `gcc`, `g++`, `clang`, and `clang++` symlinks to Kache. With no directory argument the farm is `~/.local/lib/kache/shims`. `--from-path` also wraps compiler names already on `PATH` (`gcc-13`, target-prefixed drivers). Put the directory before the real compilers in `PATH`. If the directory then holds only Kache links, `install-shims` also writes a `.kache-shims` marker. When Kache looks for the real compiler, it skips everything in a marked directory. A directory that also holds other files, such as a real compiler, is left unmarked. See [C and C++](/docs/getting-started/c-cpp).
+Unix only. Creates `cc`, `c++`, `gcc`, `g++`, `clang`, and `clang++` symlinks to Kache. With no directory argument the farm is `~/.local/lib/kache/shims`. `--from-path` also wraps compiler names already on `PATH` (`gcc-13`, target-prefixed drivers). Put the directory before the real compilers in `PATH`. If the directory then holds only Kache links, `install-shims` also writes a `.kache-shims` marker. When Kache looks for the real compiler, it skips everything in a marked directory. A directory that also holds other files, such as a real compiler, is left unmarked.
+
+The links point at a path that survives upgrades when one reaches the running binary: Homebrew's `opt` link, a Nix profile, mise's `latest` alias, or a `kache` on `PATH` outside version directories. Without `--force`, existing entries are kept, except in a directory Kache created, marked, or filled only with Kache links. There a rerun replaces links whose target is missing or not executable, and moves links into a version directory to the upgrade-safe path. See [C and C++](/docs/getting-started/c-cpp#upgrades).
 
 ## `kache test-runner`
 

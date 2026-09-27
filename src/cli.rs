@@ -5092,12 +5092,39 @@ fn doctor_host_config_check(
 
 /// Whether a failing doctor check is informational rather than an issue:
 /// daemon checks when no remote/planner needs a daemon (#443), the
-/// compiler probe when there is no `cc` at all to diagnose (#626), and
-/// C/C++ shims (PATH masquerade is opt-in).
+/// compiler probe when there is no `cc` at all to diagnose (#626),
+/// C/C++ shims (PATH masquerade is opt-in), and an install path that an
+/// upgrade may break, which only matters once something records it.
 fn doctor_check_is_optional(label: &str, daemon_optional: bool, probe_no_compiler: bool) -> bool {
     (daemon_optional && DAEMON_CHECK_LABELS.contains(&label))
         || (label == "Compiler probe" && probe_no_compiler)
         || label == "C/C++ shims"
+        || label == "Install path"
+}
+
+/// Wording for the "Install path" check, as `(pass, detail, fix hint)`:
+/// the path shims and the service record, the installer, and whether the
+/// path survives an upgrade.
+fn doctor_install_path_check(
+    selection: &Result<kache_shims::Selection, kache_shims::Error>,
+) -> (bool, String, Option<String>) {
+    match selection {
+        Ok(selection) => {
+            let survives = selection.stability.survives_upgrade();
+            let detail = format!(
+                "{} ({}, {}): {}",
+                selection.path.display(),
+                selection.kind,
+                selection.stability,
+                selection.reason
+            );
+            let fix = (!survives).then(|| {
+                "rerun kache install-shims and kache daemon install after each upgrade".to_string()
+            });
+            (survives, detail, fix)
+        }
+        Err(error) => (false, error.to_string(), None),
+    }
 }
 
 /// The daemon footnote prints when at least one daemon check failed but was
@@ -5687,33 +5714,38 @@ pub fn doctor(
     // Startup and ownership locks are persistent. Never unlink their inodes,
     // even while idle: another process may already have opened the same file.
 
-    // 12. Service plist exe mismatch (macOS/Linux) — if the registered
-    //     service points to a binary that no longer exists or differs from
-    //     the current `kache`, the daemon will relaunch the wrong binary.
+    // 12. The binary the service runs. After an upgrade removes the version
+    //     it recorded, launchd or systemd has nothing to start.
     if let Some(service_path) = crate::service::service_file_path()
         && service_path.exists()
-        && let Some(mismatch) = crate::service::service_exe_mismatch(&service_path)
+        && let Some(problem) = crate::service::service_exe_problem(&service_path)
     {
         checks.push(Check {
             label: "Service exe",
             pass: false,
-            detail: format!(
-                "plist points to {} but current exe is {}",
-                mismatch.installed.display(),
-                mismatch.current.display()
-            ),
-            fix: Some("kache daemon install  (re-registers against current binary)".into()),
+            detail: problem.detail(),
+            fix: Some("kache daemon install".into()),
         });
     }
 
+    // Informational: the path shims and the service record for this binary,
+    // and whether it outlives an upgrade.
+    let (pass, detail, hint) = doctor_install_path_check(&kache_shims::detect());
+    checks.push(Check {
+        label: "Install path",
+        pass,
+        detail,
+        fix: hint,
+    });
+
     // Informational: rust-only setups skip the farm, so a miss here is not
     // an issue. Failures tell Make/PKGBUILD users why gcc is not kache.
-    let shim_status = crate::compiler::shim::live_shim_path_status();
+    let shim_status = crate::compiler::shim::live_shim_status();
     checks.push(Check {
         label: "C/C++ shims",
-        pass: shim_status.on_path,
-        detail: shim_status.detail,
-        fix: shim_status.fix,
+        pass: shim_status.is_active(),
+        detail: shim_status.detail(),
+        fix: shim_status.fix(&crate::compiler::shim::default_shim_dir()),
     });
 
     // Compiler probe (#626): reported from the live toolchain, bypassing the
@@ -7688,10 +7720,10 @@ pub fn init(yes: bool, no_service: bool, no_shell: bool, check: bool) -> Result<
     // ── Step 2: daemon service ───────────────────────────────────
     let service_path = crate::service::service_file_path();
     let service_installed = service_path.as_ref().is_some_and(|p| p.exists());
-    let service_mismatch = service_path
+    let service_problem = service_path
         .as_deref()
         .filter(|p| p.exists())
-        .and_then(crate::service::service_exe_mismatch);
+        .and_then(crate::service::service_exe_problem);
     let mut service_action_taken = false;
 
     if no_service {
@@ -7700,10 +7732,9 @@ pub fn init(yes: bool, no_service: bool, no_shell: bool, check: bool) -> Result<
         // Containers and CI runners have no systemd user manager. Installing
         // the unit would fail, so start the daemon directly below (#1080).
         println!("  • Login service: unavailable (no systemd user session)");
-    } else if let Some(mismatch) = service_mismatch {
+    } else if let Some(problem) = service_problem {
         println!("  \x1b[33m→\x1b[0m Background service: update to this Kache binary");
-        println!("    installed: {}", mismatch.installed.display());
-        println!("    current:   {}", mismatch.current.display());
+        println!("    {}", problem.detail());
         if !check && prompt_yes_no("Update service?", true, yes)? {
             service_action_taken = install_login_service();
         }
@@ -7849,7 +7880,6 @@ fn init_compiler_setup(yes: bool, no_shell: bool, check: bool) -> Result<bool> {
             return Ok(false);
         }
         if !shims_ready {
-            migrate_homebrew_shims(&shim_dir, &shim_target_executable()?)?;
             install_shims_named_with_output(&shim_dir, false, &[], false)?;
             anyhow::ensure!(
                 shim_dir_is_ready(&shim_dir),
@@ -7866,7 +7896,7 @@ fn init_compiler_setup(yes: bool, no_shell: bool, check: bool) -> Result<bool> {
             }
         }
     }
-    if crate::compiler::shim::live_shim_path_status().on_path {
+    if crate::compiler::shim::live_shim_status().is_active() {
         println!("  ✓ Terminal C/C++ caching: active");
         Ok(false)
     } else {
@@ -8015,108 +8045,39 @@ fn init_test_runner(yes: bool, no_shell: bool, check: bool) -> Result<bool> {
     }
 }
 
-/// True when `dir` already holds the canonical compiler-name farm for the
-/// active shim target. Used by `kache init` so a second run is a no-op.
+/// The path shims record for this kache: an installer alias or a stable
+/// PATH entry when one reaches this binary, so an upgrade does not leave the
+/// farm dangling.
 #[cfg(unix)]
-fn shim_dir_is_ready_for_executable(dir: &std::path::Path, exe: &std::path::Path) -> bool {
-    let resolved = std::fs::canonicalize(exe).unwrap_or_else(|_| exe.to_path_buf());
-    let homebrew_opt = homebrew_opt_shim_target(&resolved).as_deref() == Some(exe);
-    crate::compiler::shim::SHIM_NAMES.iter().all(|name| {
-        let link = dir.join(name);
-        if homebrew_opt {
-            std::fs::read_link(&link).is_ok_and(|target| target == exe)
-        } else {
-            std::fs::canonicalize(&link).is_ok_and(|real| real == resolved)
-        }
-    })
+fn shim_target() -> Result<kache_shims::Selection> {
+    kache_shims::detect().context("locating the kache binary")
 }
 
-/// Refresh links written by older Kache releases without replacing other files.
-#[cfg(unix)]
-fn migrate_homebrew_shims(dir: &std::path::Path, target: &std::path::Path) -> Result<()> {
-    let Ok(resolved) = std::fs::canonicalize(target) else {
-        return Ok(());
-    };
-    if homebrew_opt_shim_target(&resolved).as_deref() != Some(target) {
-        return Ok(());
-    }
-    let Some(formula) = target.parent().and_then(std::path::Path::parent) else {
-        return Ok(());
-    };
-    let Some(prefix) = formula.parent().and_then(std::path::Path::parent) else {
-        return Ok(());
-    };
-    let Some(formula_name) = formula.file_name() else {
-        return Ok(());
-    };
-    let cellar_formula = prefix.join("Cellar").join(formula_name);
-    for name in crate::compiler::shim::SHIM_NAMES {
-        let link = dir.join(name);
-        let Ok(previous) = std::fs::read_link(&link) else {
-            continue;
-        };
-        let owned = previous.file_name() == target.file_name()
-            && previous
-                .parent()
-                .is_some_and(|bin| bin.file_name().is_some_and(|n| n == "bin"))
-            && previous
-                .parent()
-                .and_then(std::path::Path::parent)
-                .and_then(std::path::Path::parent)
-                == Some(cellar_formula.as_path());
-        if !owned {
-            continue;
-        }
-        std::fs::remove_file(&link)
-            .with_context(|| format!("removing old shim {}", link.display()))?;
-        std::os::unix::fs::symlink(target, &link)
-            .with_context(|| format!("refreshing shim {}", link.display()))?;
-    }
-    Ok(())
-}
-
+/// True when `dir` already links every canonical compiler name to the
+/// selected target. Used by `kache init` so a second run is a no-op.
 #[cfg(unix)]
 fn shim_dir_is_ready(dir: &std::path::Path) -> bool {
-    shim_target_executable().is_ok_and(|exe| shim_dir_is_ready_for_executable(dir, &exe))
+    shim_target()
+        .is_ok_and(|target| kache_shims::farm::is_ready(dir, &target.path, &kache_shims::RealFs))
 }
 
-/// Return Homebrew's stable executable path when `exe` is in a Cellar keg.
-///
-/// The `opt/<formula>` symlink is repointed on upgrade, unlike a versioned keg
-/// path. Keep this path non-canonical when writing compiler shims; callers that
-/// compare executable identities still canonicalize their inputs.
+/// The canonical names plus `extra_names`, each checked to be a compiler
+/// name kache can wrap.
 #[cfg(unix)]
-fn homebrew_opt_shim_target(exe: &std::path::Path) -> Option<std::path::PathBuf> {
-    let bin = exe.parent()?;
-    if bin.file_name()? != "bin" {
-        return None;
+fn shim_names(extra_names: &[String]) -> Result<Vec<String>> {
+    let mut names: Vec<String> = kache_shims::farm::SHIM_NAMES
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    for extra in extra_names {
+        if !crate::compiler::shim::invoked_as_compiler(extra) {
+            anyhow::bail!("`{extra}` is not a compiler name kache can wrap");
+        }
+        if !names.iter().any(|n| n == extra) {
+            names.push(extra.clone());
+        }
     }
-    let version = bin.parent()?;
-    let formula = version.parent()?;
-    let cellar = formula.parent()?;
-    if cellar.file_name()? != "Cellar" {
-        return None;
-    }
-
-    let target = cellar
-        .parent()?
-        .join("opt")
-        .join(formula.file_name()?)
-        .join("bin")
-        .join(exe.file_name()?);
-    target.is_file().then_some(target)
-}
-
-#[cfg(unix)]
-fn shim_target_for_executable(exe: std::path::PathBuf) -> std::path::PathBuf {
-    let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
-    homebrew_opt_shim_target(&exe).unwrap_or(exe)
-}
-
-#[cfg(unix)]
-fn shim_target_executable() -> Result<std::path::PathBuf> {
-    let exe = std::env::current_exe().context("locating the kache binary")?;
-    Ok(shim_target_for_executable(exe))
+    Ok(names)
 }
 
 /// Populate `dir` with compiler-name symlinks pointing at this kache binary
@@ -8145,270 +8106,158 @@ fn install_shims_named_with_output(
     extra_names: &[String],
     verbose: bool,
 ) -> anyhow::Result<()> {
-    // Resolve aliases for identity checks, but preserve Homebrew's opt path in
-    // the links so a formula upgrade repoints the existing shim farm.
-    let exe = shim_target_executable()?;
-    std::fs::create_dir_all(dir)
-        .with_context(|| format!("creating shim directory {}", dir.display()))?;
-
-    let mut names: Vec<String> = crate::compiler::shim::SHIM_NAMES
-        .iter()
-        .map(|s| (*s).to_string())
-        .collect();
-    for extra in extra_names {
-        if !crate::compiler::shim::invoked_as_compiler(extra) {
-            anyhow::bail!("`{extra}` is not a compiler name kache can wrap");
-        }
-        if !names.iter().any(|n| n == extra) {
-            names.push(extra.clone());
+    let target = shim_target()?;
+    let names = shim_names(extra_names)?;
+    let layout = kache_shims::Layout::from_process();
+    let report = kache_shims::install(dir, &target.path, &names, force, &layout)?;
+    if verbose {
+        for line in install_report_lines(dir, &target, &report) {
+            println!("{line}");
         }
     }
+    Ok(())
+}
 
-    let mut created = Vec::new();
-    let mut skipped = Vec::new();
-    for name in &names {
-        let link = dir.join(name);
-        match std::fs::symlink_metadata(&link) {
-            Ok(_) if !force => {
-                skipped.push(name.clone());
-                continue;
-            }
-            Ok(_) => std::fs::remove_file(&link)
-                .with_context(|| format!("replacing existing {}", link.display()))?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => {
-                return Err(e).with_context(|| format!("inspecting {}", link.display()));
-            }
-        }
-        std::os::unix::fs::symlink(&exe, &link)
-            .with_context(|| format!("creating shim {}", link.display()))?;
-        created.push(name.clone());
-    }
-    // The marker hides every entry in the directory from every kache, so a
-    // directory that also holds a real compiler, or anything else, stays
-    // unmarked. The links in it are still recognized by what they point at.
-    let marked = crate::compiler::shim::holds_only_shims(dir, Some(&exe), &|path| {
-        std::fs::canonicalize(path).ok()
-    });
-    if marked {
-        crate::compiler::shim::write_shim_marker(dir)
-            .with_context(|| format!("marking shim directory {}", dir.display()))?;
-    }
-
-    if !verbose {
-        return Ok(());
-    }
-    println!(
+/// What `kache install-shims` prints. Pure so each outcome is testable.
+#[cfg(unix)]
+fn install_report_lines(
+    dir: &std::path::Path,
+    target: &kache_shims::Selection,
+    report: &kache_shims::Installed,
+) -> Vec<String> {
+    let mut lines = vec![format!(
         "Created {} shim(s) in {} -> {}",
-        created.len(),
+        report.created.len(),
         dir.display(),
-        exe.display()
-    );
-    if !created.is_empty() {
-        println!("  {}", created.join(", "));
+        target.path.display()
+    )];
+    if !report.created.is_empty() {
+        lines.push(format!("  {}", report.created.join(", ")));
     }
-    if !skipped.is_empty() {
-        println!(
+    let groups = [
+        (&report.repaired, "Repaired", "broken shim(s)"),
+        (&report.refreshed, "Moved", "shim(s) off a versioned path"),
+        (&report.replaced, "Replaced", "existing entr(ies)"),
+    ];
+    for (names, verb, what) in groups {
+        if !names.is_empty() {
+            lines.push(format!(
+                "{verb} {} {what}: {}",
+                names.len(),
+                names.join(", ")
+            ));
+        }
+    }
+    if !report.skipped.is_empty() {
+        lines.push(format!(
             "Skipped {} existing entr(ies): {} (use --force to replace)",
-            skipped.len(),
-            skipped.join(", ")
-        );
+            report.skipped.len(),
+            report.skipped.join(", ")
+        ));
     }
-    if !marked {
-        println!(
+    if !target.stability.survives_upgrade() {
+        lines.push(format!(
+            "Note: {}. Rerun kache install-shims after upgrading kache.",
+            target.reason
+        ));
+    }
+    if !report.marked {
+        lines.push(format!(
             "Left {} without a {} marker: it holds files that are not kache links.",
             dir.display(),
-            crate::compiler::shim::SHIM_DIR_MARKER
-        );
+            kache_shims::farm::MARKER
+        ));
     }
-    println!();
-    println!("Add it to PATH ahead of your toolchain:");
-    println!("  export PATH=\"{}:$PATH\"", dir.display());
-    println!();
+    lines.push(String::new());
+    lines.push("Add it to PATH ahead of your toolchain:".into());
+    lines.push(format!("  export PATH=\"{}:$PATH\"", dir.display()));
+    lines.push(String::new());
     // The ordering caveat is the one way this silently does nothing: a shim
     // dir appended rather than prepended is never consulted.
-    println!(
+    lines.push(
         "The directory must come BEFORE the real toolchain on PATH, and the real \
          compilers must remain on PATH behind it — kache runs them."
+            .into(),
     );
-    println!(
+    lines.push(
         "Make, CMake, autotools, and Arch PKGBUILDs that invoke gcc/cc/clang \
          from PATH then go through kache. No CC/CXX edit and no shell wrapper."
+            .into(),
     );
-    println!(
+    lines.push(format!(
         "For makepkg, put PATH=\"{}:$PATH\" in ~/.makepkg.conf.",
         dir.display()
-    );
-    Ok(())
+    ));
+    lines
 }
 
 #[cfg(all(test, unix))]
 mod shim_install_tests {
+    use kache_shims::farm::{SHIM_NAMES, has_marker};
+    use std::os::unix::fs::PermissionsExt;
+
     fn install_shims(dir: &std::path::Path, force: bool) -> anyhow::Result<()> {
         super::install_shims_named(dir, force, &[])
     }
-    use crate::compiler::shim::SHIM_NAMES;
-    use std::os::unix::fs::PermissionsExt;
+
+    fn target() -> std::path::PathBuf {
+        super::shim_target().unwrap().path
+    }
 
     fn is_symlink(path: &std::path::Path) -> bool {
         std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink())
     }
 
     #[test]
-    fn homebrew_shim_target_uses_the_upgrade_stable_opt_path() {
-        let dir = tempfile::tempdir().unwrap();
-        let prefix = dir.path().join("homebrew");
-        let keg = prefix.join("Cellar/kache/0.20.0");
-        let exe = keg.join("bin/kache");
-        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
-        std::fs::write(&exe, b"kache").unwrap();
-
-        let prefix = std::fs::canonicalize(&prefix).unwrap();
-        let opt = prefix.join("opt/kache");
-        std::fs::create_dir_all(opt.parent().unwrap()).unwrap();
-        std::os::unix::fs::symlink(prefix.join("Cellar/kache/0.20.0"), &opt).unwrap();
-
-        let target = super::shim_target_for_executable(exe.clone());
-        assert_eq!(target, opt.join("bin/kache"));
+    fn the_shim_target_reaches_this_binary() {
+        let exe = std::env::current_exe().unwrap();
         assert_eq!(
-            std::fs::canonicalize(target).unwrap(),
-            std::fs::canonicalize(exe).unwrap(),
-            "the stable opt link must resolve to this keg"
+            kache_fs::file_identity(&target()).unwrap(),
+            kache_fs::file_identity(&exe).unwrap()
         );
     }
 
     #[test]
-    fn homebrew_opt_target_refreshes_shims_after_an_upgrade() {
+    fn installs_a_symlink_for_every_shim_name() {
         let dir = tempfile::tempdir().unwrap();
-        let prefix = dir.path().join("homebrew");
-        let old_keg = prefix.join("Cellar/kache/0.19.0");
-        let new_keg = prefix.join("Cellar/kache/0.20.0");
-        let old_exe = old_keg.join("bin/kache");
-        let new_exe = new_keg.join("bin/kache");
-        for exe in [&old_exe, &new_exe] {
-            std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
-            std::fs::write(exe, b"kache").unwrap();
-        }
-
-        let prefix = std::fs::canonicalize(&prefix).unwrap();
-        let opt = prefix.join("opt/kache");
-        std::fs::create_dir_all(opt.parent().unwrap()).unwrap();
-        std::os::unix::fs::symlink(prefix.join("Cellar/kache/0.20.0"), &opt).unwrap();
-
         let shims = dir.path().join("shims");
-        std::fs::create_dir_all(&shims).unwrap();
+        install_shims(&shims, false).unwrap();
         for name in SHIM_NAMES {
-            std::os::unix::fs::symlink(opt.join("bin/kache"), shims.join(name)).unwrap();
+            let link = shims.join(name);
+            assert!(is_symlink(&link), "{name} must be a symlink");
+            assert_eq!(std::fs::read_link(&link).unwrap(), target(), "{name}");
         }
-
-        let target = super::shim_target_for_executable(old_exe.clone());
-        assert!(super::shim_dir_is_ready_for_executable(&shims, &target));
-        assert!(
-            !super::shim_dir_is_ready_for_executable(&shims, &old_exe),
-            "a versioned old-keg target must be refreshed through opt"
-        );
-    }
-
-    #[test]
-    fn migrates_versioned_homebrew_shims_before_and_after_upgrade() {
-        for formula in ["kache", "kache-unstable"] {
-            let dir = tempfile::tempdir().unwrap();
-            let prefix = dir.path().join("homebrew");
-            let current = prefix.join(format!("Cellar/{formula}/0.20.0/bin/kache"));
-            std::fs::create_dir_all(current.parent().unwrap()).unwrap();
-            std::fs::write(&current, b"kache").unwrap();
-            let prefix = std::fs::canonicalize(prefix).unwrap();
-            let opt = prefix.join(format!("opt/{formula}"));
-            std::fs::create_dir_all(opt.parent().unwrap()).unwrap();
-            std::os::unix::fs::symlink(current.parent().unwrap().parent().unwrap(), &opt).unwrap();
-            let target = opt.join("bin/kache");
-            let shims = dir.path().join("shims");
-            std::fs::create_dir_all(&shims).unwrap();
-
-            for old_version in ["0.20.0", "0.19.0"] {
-                let old = prefix.join(format!("Cellar/{formula}/{old_version}/bin/kache"));
-                for name in SHIM_NAMES {
-                    let link = shims.join(name);
-                    if std::fs::symlink_metadata(&link).is_ok() {
-                        std::fs::remove_file(&link).unwrap();
-                    }
-                    std::os::unix::fs::symlink(&old, &link).unwrap();
-                }
-                assert!(!super::shim_dir_is_ready_for_executable(&shims, &target));
-                super::migrate_homebrew_shims(&shims, &target).unwrap();
-                assert!(super::shim_dir_is_ready_for_executable(&shims, &target));
-                for name in SHIM_NAMES {
-                    assert_eq!(std::fs::read_link(shims.join(name)).unwrap(), target);
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn migration_preserves_unrelated_links() {
-        let dir = tempfile::tempdir().unwrap();
-        let prefix = dir.path().join("homebrew");
-        let current = prefix.join("Cellar/kache/0.20.0/bin/kache");
-        std::fs::create_dir_all(current.parent().unwrap()).unwrap();
-        std::fs::write(&current, b"kache").unwrap();
-        let prefix = std::fs::canonicalize(prefix).unwrap();
-        let opt = prefix.join("opt/kache");
-        std::fs::create_dir_all(opt.parent().unwrap()).unwrap();
-        std::os::unix::fs::symlink(current.parent().unwrap().parent().unwrap(), &opt).unwrap();
-        let shims = dir.path().join("shims");
-        std::fs::create_dir_all(&shims).unwrap();
-        let link = shims.join("cc");
-        std::os::unix::fs::symlink("/usr/bin/clang", &link).unwrap();
-        let other_formula = shims.join("gcc");
-        let unstable = prefix.join("Cellar/kache-unstable/0.19.0/bin/kache");
-        std::os::unix::fs::symlink(&unstable, &other_formula).unwrap();
-        let regular_file = shims.join("clang");
-        std::fs::write(&regular_file, b"custom compiler").unwrap();
-        super::migrate_homebrew_shims(&shims, &opt.join("bin/kache")).unwrap();
-        assert_eq!(
-            std::fs::read_link(link).unwrap(),
-            std::path::Path::new("/usr/bin/clang")
-        );
-        assert_eq!(std::fs::read_link(other_formula).unwrap(), unstable);
-        assert_eq!(std::fs::read(regular_file).unwrap(), b"custom compiler");
-    }
-
-    #[test]
-    fn homebrew_shim_target_requires_a_cellar_keg_with_a_live_opt_target() {
-        let dir = tempfile::tempdir().unwrap();
-        let missing_opt = dir.path().join("Cellar/kache/0.20.0/bin/kache");
-        std::fs::create_dir_all(missing_opt.parent().unwrap()).unwrap();
-        std::fs::write(&missing_opt, b"kache").unwrap();
-        assert_eq!(
-            super::shim_target_for_executable(missing_opt.clone()),
-            std::fs::canonicalize(&missing_opt).unwrap()
-        );
-
-        let outside_cellar = dir.path().join("packages/kache/0.20.0/bin/kache");
-        std::fs::create_dir_all(outside_cellar.parent().unwrap()).unwrap();
-        std::fs::write(&outside_cellar, b"kache").unwrap();
-        assert_eq!(
-            super::shim_target_for_executable(outside_cellar.clone()),
-            std::fs::canonicalize(&outside_cellar).unwrap()
-        );
+        assert!(has_marker(&shims));
     }
 
     #[test]
     fn extra_compiler_name_is_installed_next_to_the_canonical_farm() {
         let dir = tempfile::tempdir().unwrap();
         let shims = dir.path().join("shims");
-        super::install_shims_named(&shims, false, &["gcc-13".into()]).unwrap();
-
-        let exe = std::fs::canonicalize(std::env::current_exe().unwrap()).unwrap();
-        let link = shims.join("gcc-13");
-        assert!(is_symlink(&link));
-        assert_eq!(std::fs::read_link(&link).unwrap(), exe);
+        super::install_shims_named(&shims, false, &["gcc-13".into(), "gcc".into()]).unwrap();
+        assert_eq!(std::fs::read_link(shims.join("gcc-13")).unwrap(), target());
         for name in SHIM_NAMES {
             assert!(
                 is_symlink(&shims.join(name)),
                 "{name} must still be installed"
             );
         }
+        assert_eq!(
+            std::fs::read_dir(&shims).unwrap().count(),
+            SHIM_NAMES.len() + 2,
+            "a canonical name given again is linked once"
+        );
+    }
+
+    #[test]
+    fn extra_name_that_is_not_a_compiler_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let shims = dir.path().join("shims");
+        let err = super::install_shims_named(&shims, false, &["gcc-ar".into()]).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("gcc-ar"), "{msg}");
+        assert!(msg.contains("not a compiler name"), "{msg}");
+        assert!(!shims.exists(), "a rejected name must not create the farm");
     }
 
     #[test]
@@ -8430,130 +8279,18 @@ mod shim_install_tests {
             "the installer must produce a farm that init treats as already done"
         );
 
-        let other = dir.path().join("other");
-        std::fs::create_dir_all(&other).unwrap();
-        let not_kache = other.join("not-kache");
+        let not_kache = dir.path().join("other/not-kache");
+        std::fs::create_dir_all(not_kache.parent().unwrap()).unwrap();
         std::fs::write(&not_kache, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&not_kache, std::fs::Permissions::from_mode(0o755)).unwrap();
         for name in SHIM_NAMES {
             std::fs::remove_file(shims.join(name)).unwrap();
-            std::os::unix::fs::symlink(not_kache.as_path(), shims.join(name)).unwrap();
+            std::os::unix::fs::symlink(&not_kache, shims.join(name)).unwrap();
         }
         assert!(
             !super::shim_dir_is_ready(&shims),
-            "links that do not resolve to this kache must not look ready"
+            "links that do not point at this kache must not look ready"
         );
-    }
-
-    #[test]
-    fn extra_name_that_is_not_a_compiler_is_rejected() {
-        let dir = tempfile::tempdir().unwrap();
-        let shims = dir.path().join("shims");
-        let err = super::install_shims_named(&shims, false, &["gcc-ar".into()]).unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(msg.contains("gcc-ar"), "{msg}");
-        assert!(msg.contains("not a compiler name"), "{msg}");
-    }
-
-    #[test]
-    fn installs_a_symlink_for_every_shim_name() {
-        let dir = tempfile::tempdir().unwrap();
-        let shims = dir.path().join("shims");
-        install_shims(&shims, false).unwrap();
-
-        let exe = std::fs::canonicalize(std::env::current_exe().unwrap()).unwrap();
-        for name in SHIM_NAMES {
-            let link = shims.join(name);
-            assert!(is_symlink(&link), "{name} must be a symlink");
-            assert_eq!(
-                std::fs::read_link(&link).unwrap(),
-                exe,
-                "{name} must point at this binary"
-            );
-        }
-    }
-
-    /// Without `--force` an existing entry is left exactly as it was. Silently
-    /// overwriting whatever sits in the target directory would be a
-    /// destructive default for a command users may point at `~/.local/bin`.
-    #[test]
-    fn existing_entries_are_preserved_unless_forced() {
-        let dir = tempfile::tempdir().unwrap();
-        let shims = dir.path().join("shims");
-        std::fs::create_dir_all(&shims).unwrap();
-        let occupied = shims.join(SHIM_NAMES[0]);
-        std::fs::write(&occupied, b"a real compiler wrapper").unwrap();
-
-        install_shims(&shims, false).unwrap();
-
-        assert!(
-            !is_symlink(&occupied),
-            "existing entry must not be replaced"
-        );
-        assert_eq!(
-            std::fs::read(&occupied).unwrap(),
-            b"a real compiler wrapper",
-            "existing content must be untouched"
-        );
-        // The rest are still installed: one collision must not abort the run.
-        for name in &SHIM_NAMES[1..] {
-            assert!(is_symlink(&shims.join(name)), "{name} should be installed");
-        }
-    }
-
-    #[test]
-    fn force_replaces_an_existing_entry() {
-        let dir = tempfile::tempdir().unwrap();
-        let shims = dir.path().join("shims");
-        std::fs::create_dir_all(&shims).unwrap();
-        let occupied = shims.join(SHIM_NAMES[0]);
-        std::fs::write(&occupied, b"stale").unwrap();
-
-        install_shims(&shims, true).unwrap();
-
-        assert!(is_symlink(&occupied), "--force must replace the entry");
-    }
-
-    /// Re-running with `--force` is the "I moved the kache binary" refresh, so
-    /// it must not fail on its own previous output or accumulate entries.
-    #[test]
-    fn forced_reinstall_is_idempotent() {
-        let dir = tempfile::tempdir().unwrap();
-        let shims = dir.path().join("shims");
-        install_shims(&shims, false).unwrap();
-        install_shims(&shims, true).unwrap();
-
-        for name in SHIM_NAMES {
-            assert!(is_symlink(&shims.join(name)));
-        }
-        assert_eq!(
-            std::fs::read_dir(&shims).unwrap().count(),
-            SHIM_NAMES.len() + 1,
-            "reinstall must not accumulate entries beyond the shims and the marker"
-        );
-    }
-
-    /// Another kache install on PATH finds this farm by its marker, so it can
-    /// skip the farm even when the shims are not symlinks to a `kache` file.
-    #[test]
-    fn install_marks_the_directory_it_populates() {
-        let dir = tempfile::tempdir().unwrap();
-        let shims = dir.path().join("shims");
-        install_shims(&shims, false).unwrap();
-        assert!(crate::compiler::shim::has_shim_marker(&shims));
-    }
-
-    /// A run that created nothing leaves the directory unmarked: every name
-    /// there belongs to something else, and a marker would hide it.
-    #[test]
-    fn install_that_creates_nothing_does_not_mark_the_directory() {
-        let dir = tempfile::tempdir().unwrap();
-        let shims = dir.path().join("shims");
-        std::fs::create_dir_all(&shims).unwrap();
-        for name in SHIM_NAMES {
-            std::fs::write(shims.join(name), b"a real compiler").unwrap();
-        }
-        install_shims(&shims, false).unwrap();
-        assert!(!crate::compiler::shim::has_shim_marker(&shims));
     }
 
     /// A run that skips a real compiler must not mark the directory even when
@@ -8571,7 +8308,7 @@ mod shim_install_tests {
         install_shims(&shims, false).unwrap();
 
         assert!(is_symlink(&shims.join("cc")), "free names are still linked");
-        assert!(!crate::compiler::shim::has_shim_marker(&shims));
+        assert!(!has_marker(&shims));
         let exe = std::env::current_exe().unwrap();
         assert_eq!(
             crate::compiler::shim::resolve_real_compiler_on(
@@ -8582,20 +8319,6 @@ mod shim_install_tests {
             Some(clang),
             "the real clang must stay visible to shim resolution"
         );
-    }
-
-    /// A farm made before the marker existed gets it on a rerun, even though
-    /// every name is already taken, because every name is a kache link.
-    #[test]
-    fn reinstall_over_an_unmarked_farm_marks_it() {
-        let dir = tempfile::tempdir().unwrap();
-        let shims = dir.path().join("shims");
-        install_shims(&shims, false).unwrap();
-        std::fs::remove_file(shims.join(crate::compiler::shim::SHIM_DIR_MARKER)).unwrap();
-
-        install_shims(&shims, false).unwrap();
-
-        assert!(crate::compiler::shim::has_shim_marker(&shims));
     }
 
     /// An inspection failure that is NOT "missing" must surface rather than be
@@ -8614,13 +8337,70 @@ mod shim_install_tests {
         let result = install_shims(&shims, false);
         std::fs::set_permissions(&shims, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        // The MESSAGE matters, not just the failure: treating a
-        // permission error as "nothing there" would fall through to the
-        // symlink call and report the wrong stage.
         let err = format!("{:#}", result.unwrap_err());
         assert!(
             err.contains("inspecting"),
             "an inspection failure must be reported as such, got: {err}"
+        );
+    }
+
+    fn selection(stability: kache_shims::Stability) -> kache_shims::Selection {
+        kache_shims::Selection {
+            path: "/opt/homebrew/opt/kache/bin/kache".into(),
+            kind: kache_shims::Kind::Homebrew,
+            stability,
+            reason: "Homebrew's opt link does not reach this binary".into(),
+        }
+    }
+
+    #[test]
+    fn the_report_names_each_outcome() {
+        let report = kache_shims::Installed {
+            created: vec!["cc".into()],
+            repaired: vec!["gcc".into(), "g++".into()],
+            refreshed: vec!["clang".into()],
+            replaced: vec!["c++".into()],
+            current: vec!["clang++".into()],
+            skipped: vec!["gcc-13".into()],
+            marked: true,
+        };
+        let dir = std::path::Path::new("/home/me/shims");
+        let lines = super::install_report_lines(
+            dir,
+            &selection(kache_shims::Stability::InstallerManaged),
+            &report,
+        );
+        let expected = [
+            "Created 1 shim(s) in /home/me/shims -> /opt/homebrew/opt/kache/bin/kache",
+            "  cc",
+            "Repaired 2 broken shim(s): gcc, g++",
+            "Moved 1 shim(s) off a versioned path: clang",
+            "Replaced 1 existing entr(ies): c++",
+            "Skipped 1 existing entr(ies): gcc-13 (use --force to replace)",
+            "",
+            "Add it to PATH ahead of your toolchain:",
+            "  export PATH=\"/home/me/shims:$PATH\"",
+        ];
+        assert_eq!(&lines[..expected.len()], expected);
+        assert!(lines.last().unwrap().contains("~/.makepkg.conf"));
+    }
+
+    #[test]
+    fn the_report_warns_about_a_versioned_target_and_a_missing_marker() {
+        let report = kache_shims::Installed::default();
+        let dir = std::path::Path::new("/home/me/shims");
+        let lines = super::install_report_lines(
+            dir,
+            &selection(kache_shims::Stability::Versioned),
+            &report,
+        );
+        assert_eq!(
+            &lines[..3],
+            [
+                "Created 0 shim(s) in /home/me/shims -> /opt/homebrew/opt/kache/bin/kache",
+                "Note: Homebrew's opt link does not reach this binary. Rerun kache install-shims after upgrading kache.",
+                "Left /home/me/shims without a .kache-shims marker: it holds files that are not kache links.",
+            ]
         );
     }
 }

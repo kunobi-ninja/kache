@@ -1006,7 +1006,7 @@ mod tests {
             Some(&exe),
             &|candidate| is_executable_file(candidate),
             &|path| std::fs::canonicalize(path).ok(),
-            &|dir| crate::compiler::shim::has_shim_marker(dir),
+            &|dir| kache_shims::farm::has_marker(dir),
         ) else {
             eprintln!("skipping: no real `cc` on PATH");
             return;

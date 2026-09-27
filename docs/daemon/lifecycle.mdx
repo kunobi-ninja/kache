@@ -30,6 +30,8 @@ kache daemon install
 
 On macOS this installs `~/Library/LaunchAgents/ninja.kunobi.kache.plist`. On Linux it installs and enables the `kache.service` systemd user unit. On Windows it registers the Task Scheduler task `kache-daemon`, which runs `kache daemon run` at logon.
 
+The service records the same upgrade-safe path as the [C/C++ shims](/docs/getting-started/c-cpp#upgrades), such as Homebrew's `opt` link or a Nix profile, rather than a versioned path that an upgrade removes. The install prints the path it recorded. When no such path reaches the running binary, it records the binary's own path and says to rerun `kache daemon install` after each upgrade. `kache doctor` reports a service whose binary is missing, not executable, or a different file from the running Kache.
+
 Remove the service with:
 
 ```bash

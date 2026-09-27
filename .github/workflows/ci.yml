@@ -124,7 +124,7 @@ jobs:
       - name: Check crates.io package metadata
         # Cargo stages workspace dependencies together, including crates whose
         # first version has not reached crates.io yet.
-        run: cargo package --locked -p kache-core -p kache-format -p kache-fs -p kache-store -p kache
+        run: cargo package --locked -p kache-core -p kache-format -p kache-fs -p kache-shims -p kache-store -p kache
         env:
           RUSTC_WRAPPER: ""
       - name: Check coverage scope and threshold (88%)

@@ -46,7 +46,9 @@ pub const UNMEASURED_COMPILE_WEIGHT: u32 = 1;
 /// Permit slots occupied by an unmeasured rustc invocation that runs the
 /// system linker (see [`crate::args::RustcArgs::invokes_linker`]).
 pub const UNMEASURED_LINK_WEIGHT: u32 = 2;
-/// RSS bytes that map to one permit slot after a crate has been measured.
+/// The least RSS one permit slot stands for once a crate has been measured.
+/// A slot is the machine's memory shared across the pool, never less than
+/// this (see [`slot_bytes`]).
 pub const RSS_BYTES_PER_SLOT: u64 = 512 * 1024 * 1024;
 
 /// Environment variable that carries a running test's lease marker to its
@@ -809,8 +811,94 @@ fn wait_for_lock(path: &Path, timeout: Duration, poll: Duration) -> Result<bool>
 }
 
 pub(crate) fn weight_from_rss(rss_bytes: u64, pool_size: u32) -> u32 {
-    let slots = rss_bytes.div_ceil(RSS_BYTES_PER_SLOT);
+    weight_in_slots(
+        rss_bytes,
+        pool_size,
+        slot_bytes(machine_memory(), pool_size),
+    )
+}
+
+fn weight_in_slots(rss_bytes: u64, pool_size: u32, slot_bytes: u64) -> u32 {
+    let slots = rss_bytes.div_ceil(slot_bytes);
     u32::try_from(slots).unwrap_or(u32::MAX).clamp(1, pool_size)
+}
+
+/// The RSS one slot stands for: the machine's memory shared across the
+/// pool, or [`RSS_BYTES_PER_SLOT`] when that is less or the memory is
+/// unknown. A fixed 512 MiB made a 2 GiB link take half of an 8-slot pool
+/// on a machine with 64 GiB; memory pressure itself is watched by
+/// [`pressure`].
+fn slot_bytes(memory: Option<u64>, pool_size: u32) -> u64 {
+    memory.map_or(RSS_BYTES_PER_SLOT, |memory| {
+        (memory / u64::from(pool_size.max(1))).max(RSS_BYTES_PER_SLOT)
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The memory a test's scheduler sees: `Some(memory)` stands in for the
+    /// machine, so weights do not depend on the host running the suite;
+    /// `None` reads the machine.
+    static TEST_MEMORY: std::cell::Cell<Option<Option<u64>>> =
+        const { std::cell::Cell::new(Some(None)) };
+}
+
+/// Physical memory, bounded by the cgroup's `memory.max` on Linux. Read once
+/// per process.
+fn machine_memory() -> Option<u64> {
+    static MEMORY: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    #[cfg(test)]
+    if let Some(memory) = TEST_MEMORY.with(std::cell::Cell::get) {
+        return memory;
+    }
+    *MEMORY.get_or_init(detected_memory)
+}
+
+fn detected_memory() -> Option<u64> {
+    {
+        #[cfg(target_os = "linux")]
+        {
+            let total = fs::read_to_string("/proc/meminfo")
+                .ok()
+                .and_then(|text| meminfo_total_bytes(&text));
+            let limit = ResourceSnapshot::discover().memory_limit_bytes;
+            match (total, limit) {
+                (Some(total), Some(limit)) => Some(total.min(limit)),
+                (total, limit) => total.or(limit),
+            }
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let mut bytes: u64 = 0;
+            let mut size = std::mem::size_of::<u64>();
+            // SAFETY: the name is NUL-terminated, and `bytes`/`size` describe
+            // a buffer of exactly the size the kernel writes for hw.memsize.
+            let rc = unsafe {
+                libc::sysctlbyname(
+                    c"hw.memsize".as_ptr(),
+                    (&raw mut bytes).cast(),
+                    &raw mut size,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            (rc == 0 && bytes > 0).then_some(bytes)
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            None
+        }
+    }
+}
+
+/// `MemTotal:` of `/proc/meminfo` in bytes (the kernel's `kB` is KiB).
+#[cfg(any(test, target_os = "linux"))]
+fn meminfo_total_bytes(text: &str) -> Option<u64> {
+    let line = text
+        .lines()
+        .find_map(|line| line.strip_prefix("MemTotal:"))?;
+    let kib: u64 = line.split_whitespace().next()?.parse().ok()?;
+    kib.checked_mul(1024)
 }
 
 fn weight_path(weights_dir: &Path, crate_name: &str) -> PathBuf {
@@ -1972,14 +2060,64 @@ mod tests {
     }
 
     #[test]
-    fn weight_from_rss_uses_512mib_slots() {
+    fn weight_in_slots_rounds_up_within_the_pool() {
         const MIB: u64 = 1024 * 1024;
-        assert_eq!(weight_from_rss(512 * MIB, 8), 1);
-        assert_eq!(weight_from_rss(513 * MIB, 8), 2);
-        assert_eq!(weight_from_rss(0, 8), 1);
-        assert_eq!(weight_from_rss(1, 8), 1);
-        assert_eq!(weight_from_rss(512 * MIB * 4, 8), 4);
-        assert_eq!(weight_from_rss(512 * MIB * 100, 8), 8);
+        let slot = RSS_BYTES_PER_SLOT;
+        assert_eq!(weight_in_slots(512 * MIB, 8, slot), 1);
+        assert_eq!(weight_in_slots(513 * MIB, 8, slot), 2);
+        assert_eq!(weight_in_slots(0, 8, slot), 1);
+        assert_eq!(weight_in_slots(1, 8, slot), 1);
+        assert_eq!(weight_in_slots(512 * MIB * 4, 8, slot), 4);
+        assert_eq!(weight_in_slots(512 * MIB * 100, 8, slot), 8);
+    }
+
+    #[test]
+    fn a_slot_is_the_memory_shared_across_the_pool() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        // 64 GiB over 8 slots: a 2 GiB link takes one slot, a 9 GiB one three.
+        let slot = slot_bytes(Some(64 * GIB), 8);
+        assert_eq!(slot, 8 * GIB);
+        assert_eq!(weight_in_slots(2 * GIB, 8, slot), 1);
+        assert_eq!(weight_in_slots(9 * GIB, 8, slot), 2);
+        assert_eq!(weight_in_slots(17 * GIB, 8, slot), 3);
+        // Too little memory per slot, or none known: the 512 MiB floor.
+        assert_eq!(slot_bytes(Some(2 * GIB), 8), RSS_BYTES_PER_SLOT);
+        assert_eq!(slot_bytes(Some(4 * GIB), 8), RSS_BYTES_PER_SLOT);
+        assert_eq!(slot_bytes(Some(4 * GIB + 8), 8), 4 * GIB / 8 + 1);
+        assert_eq!(slot_bytes(None, 8), RSS_BYTES_PER_SLOT);
+        assert_eq!(slot_bytes(Some(64 * GIB), 0), 64 * GIB);
+    }
+
+    #[test]
+    fn measured_weights_follow_the_machines_memory() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let dir = temp_cache();
+        let scheduler = test_scheduler(dir.path(), 8);
+        write_weight(&scheduler.weights_dir(), "link", 2 * GIB).unwrap();
+        assert_eq!(scheduler.weight_for("link", true), 4);
+        TEST_MEMORY.with(|memory| memory.set(Some(Some(64 * GIB))));
+        assert_eq!(scheduler.weight_for("link", true), 1);
+        TEST_MEMORY.with(|memory| memory.set(Some(None)));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn the_machines_memory_is_read() {
+        let detected = detected_memory().expect("this host reports its memory");
+        assert!(detected >= 256 * 1024 * 1024, "{detected} bytes");
+        TEST_MEMORY.with(|memory| memory.set(None));
+        assert_eq!(machine_memory(), Some(detected));
+        TEST_MEMORY.with(|memory| memory.set(Some(None)));
+    }
+
+    #[test]
+    fn meminfo_total_is_read_in_kib() {
+        assert_eq!(
+            meminfo_total_bytes("MemTotal:       16374584 kB\nMemFree:  905392 kB\n"),
+            Some(16374584 * 1024)
+        );
+        assert_eq!(meminfo_total_bytes("MemFree: 905392 kB\n"), None);
+        assert_eq!(meminfo_total_bytes("MemTotal: many kB\n"), None);
     }
 
     #[test]

@@ -297,10 +297,16 @@ pub(crate) fn prune(
         crate::cache_fs::classify(&crate::cache_fs::probe(target_dir)),
         crate::cache_fs::CacheFsVerdict::Local
     );
-    if !local || !reads_visible(target_dir) {
+    if !can_prune(local, || reads_visible(target_dir)) {
         return Pruned::default();
     }
     judge(cache_dir, target_dir, window, now)
+}
+
+/// Pruning needs a local filesystem, where Cargo locks its build
+/// directories, that also shows reads. `reads` is only asked when local.
+fn can_prune(local: bool, reads: impl FnOnce() -> bool) -> bool {
+    local && reads()
 }
 
 /// Arm `target_dir`, wait out `window`, then remove what was not used; the
@@ -697,6 +703,16 @@ mod tests {
             let record = armed_record(&cache, &target);
             assert!(read_armed(&record).is_some());
         }
+    }
+
+    #[test]
+    fn needs_a_local_filesystem_that_shows_reads() {
+        assert!(can_prune(true, || true));
+        assert!(!can_prune(true, || false));
+        assert!(!can_prune(false, || true));
+        assert!(!can_prune(false, || panic!(
+            "not asked off a local filesystem"
+        )));
     }
 
     #[test]

@@ -4890,6 +4890,11 @@ fn a_bare_compiler_name_finds_its_version_cache_on_path() {
     let path_var = std::env::join_paths([empty.path(), shadow.path(), dir.path()]).unwrap();
     let bare = Path::new("kache-test-rustc");
 
+    assert_eq!(
+        program_path(bare, Some(&path_var)).as_deref(),
+        Some(binary.as_path()),
+        "a bare name resolves to the file a spawn runs"
+    );
     let resolved = tool_version_cache_path_in(bare, "rustc-ver", Some(&path_var));
     assert!(resolved.is_some(), "a bare name on PATH has a cache file");
     assert_eq!(

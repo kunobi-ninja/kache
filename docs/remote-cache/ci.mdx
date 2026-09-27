@@ -67,7 +67,7 @@ pull_request_prefix = "artifacts-pr"
 
 Every other job ignores the setting: protected-branch pushes never read the pull request prefix, and tags, unprotected branches and `pull_request_target` jobs stay read-only. The pull request prefix must differ from `prefix`, and neither may contain the other; otherwise the job stays read-only and Kache logs why.
 
-A pull request job with a prefix runs its own daemon. Its socket and upload queue carry a name derived from the prefix (`daemon-pr-<hash>.sock`, `upload-queue-pr-<hash>`), so on a machine that keeps its disk across jobs it never hands work to, or takes work from, a protected-branch job's daemon.
+A pull request job with a prefix runs its own daemon. Its socket and upload queue carry a name derived from the prefix (`daemon-pr-<hash>.sock`, `upload-queue-pr-<hash>`), so it never hands uploads to a protected-branch job's daemon or reads through one. It still must not share a local store with trusted jobs: an artifact it compiles there would be a local hit for the next trusted build. Keep pull request jobs off the persistent disk described in [Ephemeral and persistent runners](#ephemeral-and-persistent-runners).
 
 Kache's policy is not the boundary; the bucket policy is. Give the role that pull request jobs assume read access to both prefixes and write access to the pull request prefix only:
 

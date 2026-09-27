@@ -295,13 +295,13 @@ pub fn install(
     for name in names {
         let link = dir.join(name);
         let (occupied, text) = match std::fs::symlink_metadata(&link) {
-            Ok(metadata) if metadata.file_type().is_symlink() => (
+            // read_link fails for anything that is not a symlink.
+            Ok(_) => (
                 true,
                 std::fs::read_link(&link)
                     .ok()
                     .map(|text| link_path(dir, &text)),
             ),
-            Ok(_) => (true, None),
             Err(error) if error.kind() == io::ErrorKind::NotFound => (false, None),
             Err(error) => return Err(InstallError::new("inspecting", &link, error)),
         };
@@ -466,5 +466,6 @@ pub fn status(
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
+#[cfg(unix)]
 mod tests;

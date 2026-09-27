@@ -193,19 +193,21 @@ impl Env {
     }
 }
 
-#[cfg(unix)]
 fn process_elevation(home: Option<&Path>) -> Option<Elevation> {
-    use std::os::unix::fs::MetadataExt;
-    // SAFETY: geteuid has no preconditions and cannot fail.
-    let euid = unsafe { libc::geteuid() };
-    let sudo_user = std::env::var("SUDO_USER").ok();
-    let home_owner = home.and_then(|home| std::fs::metadata(home).ok().map(|m| m.uid()));
-    elevation(euid, sudo_user, home, home_owner)
-}
-
-#[cfg(not(unix))]
-fn process_elevation(_home: Option<&Path>) -> Option<Elevation> {
-    None
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let euid = unsafe { libc::geteuid() };
+        let sudo_user = std::env::var("SUDO_USER").ok();
+        let home_owner = home.and_then(|home| std::fs::metadata(home).ok().map(|m| m.uid()));
+        elevation(euid, sudo_user, home, home_owner)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = home;
+        None
+    }
 }
 
 /// Root with `SUDO_USER` set is sudo; otherwise a `HOME` owned by another
@@ -288,14 +290,13 @@ impl Layout {
     }
 }
 
+/// `dir` and, when it resolves, its real path. The two may be equal.
 fn with_resolved(dir: Option<PathBuf>, fs: &dyn Fs) -> Vec<PathBuf> {
     let Some(dir) = dir else {
         return Vec::new();
     };
-    match fs.resolve(&dir) {
-        Some(real) if real != dir => vec![dir, real],
-        _ => vec![dir],
-    }
+    let real = fs.resolve(&dir);
+    std::iter::once(dir).chain(real).collect()
 }
 
 /// `<prefix>/Cellar/<formula>/<version>/<rest>` split into the `opt` alias
@@ -540,5 +541,6 @@ fn with_elevation(mut selection: Selection, elevation: Option<&Elevation>) -> Se
     selection
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
+#[cfg(unix)]
 mod tests;

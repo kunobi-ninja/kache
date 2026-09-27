@@ -45,22 +45,66 @@ impl Fs for RealFs {
     }
 }
 
-/// Whether `path` reaches a regular file that may be executed.
-#[cfg(unix)]
+/// Whether `path` reaches a regular file that may be executed. On Unix that
+/// needs an execute bit; elsewhere any regular file counts.
 pub fn is_executable_file(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(path)
-        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    #[cfg(unix)]
+    let runnable = {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    };
+    #[cfg(not(unix))]
+    let runnable = true;
+    metadata.is_file() && runnable
 }
 
-/// Whether `path` reaches a regular file that may be executed.
-#[cfg(not(unix))]
-pub fn is_executable_file(path: &Path) -> bool {
-    path.is_file()
+#[cfg(test)]
+#[cfg(unix)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn the_real_filesystem_answers_each_question() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let program = root.join("program");
+        std::fs::write(&program, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let data = root.join("data");
+        std::fs::write(&data, "").unwrap();
+        let link = root.join("link");
+        std::os::unix::fs::symlink("program", &link).unwrap();
+        let missing = root.join("missing");
+        let fs = RealFs;
+
+        assert!(fs.is_executable_file(&program));
+        assert!(fs.is_executable_file(&link));
+        assert!(!fs.is_executable_file(&data), "no execute bit");
+        assert!(!fs.is_executable_file(&root), "a directory");
+        assert!(!fs.is_executable_file(&missing));
+
+        assert!(fs.is_file(&data));
+        assert!(fs.is_file(&link));
+        assert!(!fs.is_file(&root));
+        assert!(!fs.is_file(&missing));
+
+        assert_eq!(fs.read_link(&link), Some(PathBuf::from("program")));
+        assert_eq!(fs.read_link(&program), None);
+        assert_eq!(fs.resolve(&link), Some(program.clone()));
+        assert_eq!(fs.resolve(&missing), None);
+        assert_eq!(fs.identity(&link), fs.identity(&program));
+        assert_ne!(fs.identity(&data), fs.identity(&program));
+        assert_eq!(fs.identity(&missing), None);
+    }
 }
 
 /// A table of fake files and links for unit tests.
-#[cfg(all(test, unix))]
+#[cfg(test)]
+#[cfg(unix)]
 pub(crate) mod fake {
     use super::Fs;
     use kache_fs::InodeId;

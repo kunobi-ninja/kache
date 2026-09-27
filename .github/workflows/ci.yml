@@ -220,6 +220,10 @@ jobs:
             exit 0
           fi
 
+          # A cargo-mutants error must fail the plan. Without pipefail the
+          # pipeline's status is the counter's, and an unparsable diff read
+          # as zero mutants: the gate passed without testing anything.
+          set -o pipefail
           mkdir -p tmp/mutants
           git rev-parse --verify 'HEAD^1^{commit}'
           # Code a change only moves is not changed code: see the script.

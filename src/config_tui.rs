@@ -732,6 +732,12 @@ fn fields_to_file_config(fields: &[FormField], original: &FileConfig) -> FileCon
 
     let remote = if has_remote {
         Some(RemoteFileConfig {
+            // Not a form field: carried over so saving never drops it.
+            pull_request_prefix: original
+                .cache
+                .as_ref()
+                .and_then(|cache| cache.remote.as_ref())
+                .and_then(|remote| remote.pull_request_prefix.clone()),
             _type: remote_type,
             bucket,
             endpoint,
@@ -1909,6 +1915,26 @@ mod tests {
     }
 
     #[test]
+    fn saving_from_the_editor_keeps_the_pull_request_prefix() {
+        let original = FileConfig {
+            cache: Some(CacheFileConfig {
+                remote: Some(RemoteFileConfig {
+                    _type: Some("s3".to_string()),
+                    bucket: Some("b".to_string()),
+                    pull_request_prefix: Some("artifacts-pr".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let fields = build_fields(&original, &empty_env());
+        let saved = fields_to_file_config(&fields, &original);
+        let remote = saved.cache.unwrap().remote.unwrap();
+        assert_eq!(remote.pull_request_prefix.as_deref(), Some("artifacts-pr"));
+    }
+
+    #[test]
     fn test_fields_to_file_config_roundtrip() {
         let original = FileConfig {
             cc: None,
@@ -1941,6 +1967,7 @@ mod tests {
                 auto_clean_orphaned_targets: None,
                 auto_clean_idle_targets_days: None,
                 scheduler_memory_pressure: None,
+                seed_new_targets: None,
                 gc_evict_shared: Some(true),
                 storage_layout_advice: None,
                 heartbeat_secs: None,
@@ -1996,6 +2023,7 @@ mod tests {
                     user_agent: Some("custom-ua/1.0".to_string()),
                     path: None,
                     atomic_write_dir: None,
+                    pull_request_prefix: None,
                 }),
             }),
         };

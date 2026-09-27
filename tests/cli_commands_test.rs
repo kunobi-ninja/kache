@@ -3228,3 +3228,93 @@ fn daemon_start_needs_no_more_path_than_its_own_socket() {
     assert!(start.status.success(), "{stderr}");
     assert!(bound, "the daemon must have bound its socket: {stderr}");
 }
+
+/// Cargo's first call for a target directory it has not built is its
+/// target-info probe. Sent through the wrapper, it has the daemon copy the
+/// registry units another checkout built (see `src/target_seed.rs`) before
+/// the probe returns.
+#[test]
+fn the_target_info_probe_seeds_a_new_checkout() {
+    let e = env();
+    e.cmd().args(["daemon", "start"]).assert().success();
+    let root = TempDir::new().unwrap();
+    // A checkout built through kache: the daemon now tracks its target.
+    let donor = root.path().join("donor");
+    std::fs::create_dir_all(donor.join("src")).unwrap();
+    let manifest = "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n";
+    std::fs::write(donor.join("Cargo.toml"), manifest).unwrap();
+    std::fs::write(donor.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+    let donor_target = donor.join("target");
+    let built = e.wrapper_build(&donor, &donor_target);
+    assert!(built.status.success(), "{built:?}");
+    // Seeding reads the compiler a target was built by from Cargo's rustc
+    // info cache, which Cargo skips when it cannot fingerprint rustc (the
+    // macOS CI runner's rustup layout). No cache, nothing to seed from.
+    if !donor_target.join(".rustc_info.json").is_file() {
+        eprintln!("skipping: Cargo cached no rustc info for the donor here");
+        return;
+    }
+    // A registry unit, as the toolchain lays it out.
+    let profile = donor_target.join("debug");
+    let hash = "0123456789abcdef";
+    let per_unit = !profile.join(".fingerprint").is_dir();
+    let marker = |target: &Path| {
+        if per_unit {
+            target.join("debug/build/dep").join(hash)
+        } else {
+            target
+                .join("debug/.fingerprint")
+                .join(format!("dep-{hash}"))
+        }
+    };
+    let donor_marker = marker(&donor_target);
+    std::fs::create_dir_all(donor_marker.join("fingerprint")).unwrap();
+    std::fs::write(donor_marker.join("fingerprint/lib"), "fp").unwrap();
+    // The new checkout's lockfile names the registry package.
+    let lock = "[[package]]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
+                [[package]]\nname = \"dep\"\nversion = \"1.0.0\"\n\
+                source = \"registry+https://github.com/rust-lang/crates.io-index\"\n";
+    let probe = |checkout: &Path, seed: &str| {
+        std::fs::create_dir_all(checkout).unwrap();
+        std::fs::write(checkout.join("Cargo.toml"), manifest).unwrap();
+        std::fs::write(checkout.join("Cargo.lock"), lock).unwrap();
+        e.cmd()
+            .current_dir(checkout)
+            .env("KACHE_SEED_NEW_TARGETS", seed)
+            .env_remove("CARGO_TARGET_DIR")
+            .env_remove("CARGO_BUILD_TARGET_DIR")
+            .env_remove("CARGO_BUILD_BUILD_DIR")
+            .args(["rustc", "-", "--crate-name", "___", "--print=file-names"])
+            .args(["--crate-type", "lib"])
+            .write_stdin("")
+            .assert()
+            .success();
+    };
+    let seeded = root.path().join("seeded");
+    probe(&seeded, "1");
+    if !marker(&seeded.join("target")).is_dir() {
+        // Seeding needs a tracked donor built by the compiler the probe
+        // reports; name both so a failure says which one differed.
+        let recorded = std::fs::read_to_string(donor_target.join(".rustc_info.json"))
+            .unwrap_or_else(|error| format!("unreadable: {error}"));
+        let probed = std::process::Command::new("rustc")
+            .arg("-vV")
+            .current_dir(&seeded)
+            .env("HOME", &e.home)
+            .env("CARGO_HOME", e.home.join(".cargo"))
+            .output()
+            .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
+            .unwrap_or_else(|error| format!("failed: {error}"));
+        let tracked = e.cmd().args(["targets", "--json"]).output().unwrap();
+        panic!(
+            "the unit was not copied\n\
+             donor .rustc_info.json: {recorded}\n\
+             probe rustc -vV: {probed}\n\
+             tracked targets: {}",
+            String::from_utf8_lossy(&tracked.stdout)
+        );
+    }
+    let off = root.path().join("off");
+    probe(&off, "0");
+    assert!(!off.join("target").exists());
+}

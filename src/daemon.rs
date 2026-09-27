@@ -473,12 +473,25 @@ pub(crate) enum Request {
     /// Fire-and-forget; older daemons reject the unknown variant and the
     /// restore copies as before.
     Prestage(PrestageRequest),
+    /// Cargo is probing a target directory it has not built: copy another
+    /// checkout's registry units into it before Cargo checks freshness (see
+    /// [`crate::target_seed`]). The wrapper waits for the answer; older
+    /// daemons reject the unknown variant and nothing is copied.
+    SeedTarget(SeedTargetRequest),
     Shutdown,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PrestageRequest {
     pub target_dir: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SeedTargetRequest {
+    pub target_dir: String,
+    pub workspace_root: String,
+    /// `rustc -vV` from the compiler Cargo is probing.
+    pub rustc_version: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -3434,7 +3447,12 @@ impl Daemon {
                     .remote
                     .as_ref()
                     .ok_or_else(|| anyhow::anyhow!("no remote configured"))?;
-                crate::remote_backend::create_backend(remote, self.config.s3_pool_idle_secs).await
+                crate::remote_backend::create_backend_for(
+                    remote,
+                    self.config.pull_request_prefix.as_deref(),
+                    self.config.s3_pool_idle_secs,
+                )
+                .await
             })
             .await
     }
@@ -3498,6 +3516,7 @@ impl Daemon {
             | Request::PredictionFetch(_)
             | Request::PredictionPublish(_)
             | Request::Prestage(_)
+            | Request::SeedTarget(_)
             | Request::BuildStarted(_) => {
                 // These require async — caller must use their async handlers
                 Response::err(
@@ -8486,6 +8505,10 @@ async fn handle_connection_started_at(
             }
             Ok(Request::GcHint) => daemon.handle_gc_hint(),
             Ok(Request::Prestage(req)) => daemon.handle_prestage(&req),
+            Ok(Request::SeedTarget(req)) => {
+                let config = daemon.config.clone();
+                offload(move || handle_seed_target(&config, &req)).await
+            }
             Ok(Request::RemoteCheck(req)) => {
                 daemon
                     .handle_remote_check_started_at(&req, request_started_at)
@@ -8953,6 +8976,53 @@ pub fn send_build_started(config: &Config, req: BuildStartedRequest) {
         Err(e) => {
             tracing::debug!("build-started hint: daemon unreachable ({e}), skipping");
         }
+    }
+}
+
+/// Seed a new target directory from the most recently used tracked targets
+/// (see [`crate::target_seed`]), within [`crate::target_seed::SEED_DEADLINE`].
+fn handle_seed_target(config: &Config, req: &SeedTargetRequest) -> Response {
+    let deadline = std::time::Instant::now() + crate::target_seed::SEED_DEADLINE;
+    let target = crate::target_seed::NewTarget {
+        target_dir: PathBuf::from(&req.target_dir),
+        workspace_root: PathBuf::from(&req.workspace_root),
+    };
+    let tracked = Store::open(config).and_then(|store| store.tracked_target_roots(0));
+    let donors: Vec<_> = match tracked {
+        Ok(tracked) => tracked
+            .into_iter()
+            .rev()
+            .map(|root| crate::target_seed::Donor {
+                target_dir: root.path,
+                workspace_root: root.workspace_root,
+            })
+            .collect(),
+        Err(error) => return Response::err(format!("reading tracked targets: {error:#}")),
+    };
+    let seeded = crate::target_seed::seed(&target, &req.rustc_version, &donors, deadline);
+    if let Some(donor) = &seeded.donor {
+        tracing::info!(
+            "seeded {} registry units into {} from {}",
+            seeded.units,
+            target.target_dir.display(),
+            donor.display()
+        );
+    }
+    Response::ok()
+}
+
+/// Ask the daemon to seed a target directory Cargo has not built, and wait
+/// until it has, up to the seeding deadline. Never starts the daemon: a
+/// build without one simply is not seeded.
+pub fn send_seed_target(config: &Config, target: &crate::target_seed::NewTarget, version: &str) {
+    let req = Request::SeedTarget(SeedTargetRequest {
+        target_dir: target.target_dir.to_string_lossy().into_owned(),
+        workspace_root: target.workspace_root.to_string_lossy().into_owned(),
+        rustc_version: version.to_owned(),
+    });
+    let wait = crate::target_seed::seed_wait();
+    if let Err(e) = send_request_with_timeout(&config.socket_path(), &req, wait) {
+        tracing::debug!("seed request: daemon unreachable or slow ({e}), building unseeded");
     }
 }
 

@@ -358,8 +358,15 @@ mod tests {
             Swept::default()
         );
         // A build used `current` since.
-        std::fs::read(current.join("fingerprint/lib-dep")).unwrap();
+        let read = filetime::FileTime::from_unix_time(now as i64, 0);
+        filetime::set_file_atime(current.join("fingerprint/lib-dep"), read).unwrap();
         let swept = sweep(&units, now).unwrap();
+        if !crate::unit_prune::reads_visible(root.path()) {
+            // Where reads do not show, nothing is ever removed.
+            assert_eq!(swept, Swept::default());
+            assert!(stale.exists());
+            return;
+        }
         assert!(swept.removed.is_empty());
         assert_eq!(swept.pruned.len(), 1);
         assert_eq!(swept.pruned[0].0, live);

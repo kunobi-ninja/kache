@@ -65,10 +65,15 @@ pub(crate) fn reads_visible(dir: &Path) -> bool {
         let armed = arm_file(&probe)?;
         std::fs::read(&probe)?;
         let accessed = filetime::FileTime::from_last_access_time(&std::fs::metadata(&probe)?);
-        Ok(accessed > armed)
+        Ok(moved_past(accessed, armed))
     })();
     let _ = std::fs::remove_file(&probe);
     moved.unwrap_or(false)
+}
+
+/// Whether `accessed` is later than the `armed` access time: a read moved it.
+fn moved_past(accessed: filetime::FileTime, armed: filetime::FileTime) -> bool {
+    accessed > armed
 }
 
 /// Set `file`'s access time a second below its modification time, and
@@ -167,20 +172,12 @@ type Outputs = HashMap<String, Vec<(String, PathBuf)>>;
 /// Split `name` at its `-<16 hex>` unit hash, the hash followed by the end
 /// or a `.`: `libserde-0123456789abcdef.rlib` is `("libserde", hash)`.
 pub(crate) fn hashed_name(name: &str) -> Option<(&str, &str)> {
-    let mut from = 0;
-    while let Some(dash) = name[from..].find('-') {
-        let at = from + dash;
-        let hash = name.get(at + 1..at + 17);
-        let after = name.get(at + 17..at + 18);
-        if let Some(hash) = hash
-            && crate::cargo_layout::is_unit_hash(hash)
-            && matches!(after, None | Some("."))
-        {
-            return Some((&name[..at], hash));
-        }
-        from = at + 1;
-    }
-    None
+    name.match_indices('-').find_map(|(at, _)| {
+        let (stem, rest) = name.split_at(at);
+        let (hash, after) = rest.get(1..)?.split_at_checked(16)?;
+        let ends = after.is_empty() || after.starts_with('.');
+        (crate::cargo_layout::is_unit_hash(hash) && ends).then_some((stem, hash))
+    })
 }
 
 fn outputs(profile: &Path) -> Outputs {
@@ -303,6 +300,12 @@ pub(crate) fn prune(
     if !local || !reads_visible(target_dir) {
         return Pruned::default();
     }
+    judge(cache_dir, target_dir, window, now)
+}
+
+/// Arm `target_dir`, wait out `window`, then remove what was not used; the
+/// part of [`prune`] after the filesystem was found to show reads.
+fn judge(cache_dir: &Path, target_dir: &Path, window: Duration, now: SystemTime) -> Pruned {
     let record = armed_record(cache_dir, target_dir);
     let pruned = match step(read_armed(&record), now, window) {
         Step::Wait => return Pruned::default(),
@@ -471,11 +474,22 @@ mod tests {
     }
 
     #[test]
-    fn reads_move_an_armed_access_time_here() {
+    fn probes_whether_reads_move_an_armed_access_time() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(reads_visible(dir.path()));
+        let visible = reads_visible(dir.path());
+        // Linux's `relatime` shows reads. NTFS usually does not update last
+        // access times, and some macOS volumes do not either.
+        if cfg!(target_os = "linux") {
+            assert!(visible);
+        }
         assert!(entries(dir.path()).is_empty(), "the probe is removed");
         assert!(!reads_visible(&dir.path().join("missing")));
+        let armed = filetime::FileTime::from_unix_time(1_000, 0);
+        assert!(moved_past(
+            filetime::FileTime::from_unix_time(1_001, 0),
+            armed
+        ));
+        assert!(!moved_past(armed, armed));
     }
 
     #[test]
@@ -605,9 +619,36 @@ mod tests {
         let modified = filetime::FileTime::from_last_modification_time(&metadata);
         let accessed = filetime::FileTime::from_last_access_time(&metadata);
         assert_eq!(accessed.unix_seconds(), modified.unix_seconds() - 1);
-        // A read now moves it past any moment after arming.
+        assert!(!used_since(&fingerprint, ago(5)));
+        // Where reads show, a read now moves it past any moment after arming.
         std::fs::read(fingerprint.join("a")).unwrap();
-        assert!(used_since(&fingerprint, ago(1)));
+        if reads_visible(dir.path()) {
+            assert!(used_since(&fingerprint, ago(1)));
+        }
+    }
+
+    #[test]
+    fn a_time_equal_to_the_arming_is_not_use() {
+        let dir = tempfile::tempdir().unwrap();
+        let armed = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let at = filetime::FileTime::from_system_time(armed);
+        let fingerprint = dir.path().join("fp");
+        write(&fingerprint.join("a"), "a");
+        filetime::set_file_times(fingerprint.join("a"), at, at).unwrap();
+        assert!(!used_since(&fingerprint, armed));
+        let empty = dir.path().join("empty");
+        std::fs::create_dir(&empty).unwrap();
+        filetime::set_file_mtime(&empty, at).unwrap();
+        assert!(!used_since(&empty, armed));
+    }
+
+    /// Record a build's read of `unit`'s fingerprint now, the way a
+    /// filesystem that shows reads would.
+    fn read_now(unit: &Unit) {
+        let now = filetime::FileTime::now();
+        for file in entries(&unit.fingerprint()) {
+            filetime::set_file_atime(&file, now).unwrap();
+        }
     }
 
     #[test]
@@ -625,16 +666,16 @@ mod tests {
             set_times(&profile, ago(60));
             let window = Duration::from_secs(30 * DAY);
             // First sight: armed, nothing removed.
-            assert_eq!(prune(&cache, &target, window, ago(40)), Pruned::default());
+            assert_eq!(judge(&cache, &target, window, ago(40)), Pruned::default());
             assert_eq!(units(&profile).len(), 2);
             // Within the window: nothing to judge.
-            assert_eq!(prune(&cache, &target, window, ago(20)), Pruned::default());
+            assert_eq!(judge(&cache, &target, window, ago(20)), Pruned::default());
             // A build used `NEW` after arming.
-            std::fs::read(unit_named(&profile, NEW).fingerprint().join("lib-serde")).unwrap();
+            read_now(&unit_named(&profile, NEW));
             let old = unit_named(&profile, OLD);
             let parts = old.parts(&outputs(&profile));
             let bytes: u64 = parts.iter().map(|part| size(part)).sum();
-            let pruned = prune(&cache, &target, window, SystemTime::now());
+            let pruned = judge(&cache, &target, window, SystemTime::now());
             assert_eq!(pruned, Pruned { units: 1, bytes }, "per_unit={per_unit}");
             for part in &parts {
                 assert!(!part.exists(), "{}", part.display());
@@ -650,12 +691,31 @@ mod tests {
             }
             // Re-armed: judged again only after another window.
             assert_eq!(
-                prune(&cache, &target, window, SystemTime::now()),
+                judge(&cache, &target, window, SystemTime::now()),
                 Pruned::default()
             );
             let record = armed_record(&cache, &target);
             assert!(read_armed(&record).is_some());
         }
+    }
+
+    #[test]
+    fn prunes_only_where_the_filesystem_shows_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        let window = Duration::from_secs(30 * DAY);
+        let missing = dir.path().join("missing");
+        assert_eq!(
+            prune(&cache, &missing, window, SystemTime::now()),
+            Pruned::default()
+        );
+        let target = dir.path().join("target");
+        per_unit_profile(&target.join("debug"));
+        set_times(&target, ago(60));
+        prune(&cache, &target, window, ago(40));
+        let armed = read_armed(&armed_record(&cache, &target));
+        // Arming happens only where reads show, and only then is it recorded.
+        assert_eq!(armed.is_some(), reads_visible(&target));
     }
 
     #[test]
@@ -705,13 +765,26 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
+            // SAFETY: plain libc call with no arguments.
+            let root = unsafe { libc::geteuid() } == 0;
             let locked = dir.path().join("locked");
             write(&locked.join("file"), "x");
             std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).unwrap();
             let after = dir.path().join("after");
             write(&after, "x");
-            assert!(remove(&[locked.join("file"), after.clone()]).is_err());
-            assert!(after.exists(), "nothing after a failure is removed");
+            if !root {
+                assert!(remove(&[locked.join("file"), after.clone()]).is_err());
+                assert!(after.exists(), "nothing after a failure is removed");
+            }
+            // A part that cannot even be looked up is a failure, not absent.
+            let sealed = dir.path().join("sealed");
+            write(&sealed.join("file"), "x");
+            std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o000)).unwrap();
+            if !root {
+                assert!(remove(&[sealed.join("file"), after.clone()]).is_err());
+                assert!(after.exists());
+            }
+            std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o755)).unwrap();
             std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
     }

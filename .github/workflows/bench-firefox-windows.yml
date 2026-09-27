@@ -150,7 +150,7 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - name: Install tools via mise
-        uses: zondax/actions/setup-mise@5ae8fbbddda413b9e5826114fe6ca8d03f8551e2 # v1.4.1
+        uses: zondax/actions/setup-mise@14e656f2dcc6012c36298e3a6e95dc4ae0f022f0 # v1.5.3
         with:
           install: true
           # Pin mise CLI — see ci.yml (v2026.6.10 regression).
@@ -401,7 +401,7 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - name: Install tools via mise
-        uses: zondax/actions/setup-mise@5ae8fbbddda413b9e5826114fe6ca8d03f8551e2 # v1.4.1
+        uses: zondax/actions/setup-mise@14e656f2dcc6012c36298e3a6e95dc4ae0f022f0 # v1.5.3
         with:
           install: true
           # Pin mise CLI — see ci.yml (v2026.6.10 regression).

@@ -491,10 +491,17 @@ mod tests {
         assert_eq!(tracked(&store), vec![busy.clone()]);
 
         drop(lock);
-        assert_eq!(
-            sweep(&orphans, later).unwrap().removed,
-            vec![(busy.clone(), Reason::Orphaned)]
-        );
+        // A process another test forks in this instant shares the lock until
+        // it execs, so the release can take a moment to show.
+        let mut removed = Vec::new();
+        for _ in 0..200 {
+            removed = sweep(&orphans, later).unwrap().removed;
+            if !removed.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(removed, vec![(busy.clone(), Reason::Orphaned)]);
     }
 
     #[test]

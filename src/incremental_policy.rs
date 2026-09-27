@@ -1267,6 +1267,10 @@ mod tests {
         };
 
         assert!(active_lease_allowed(&state, 100 + ACTIVE_IDLE_SECS, true));
+        assert!(
+            active_lease_allowed(&state, 100 + 10 * 60, true),
+            "ten minutes between two edits keeps the unit active"
+        );
         state.active_leases = MAX_ACTIVE_LEASES;
         assert!(!active_lease_allowed(&state, 100 + ACTIVE_IDLE_SECS, true));
         state.active_leases = 0;

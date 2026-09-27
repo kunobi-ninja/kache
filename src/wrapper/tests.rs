@@ -9139,3 +9139,46 @@ fn a_rederived_key_holds_no_discovery_flight() {
         "the re-derived key keeps the extra inputs"
     );
 }
+
+/// A hit restores a unit without its incremental state, so it counts as the
+/// unit's first build: the next edit seeds at once instead of only teaching
+/// the policy.
+#[test]
+fn a_hit_counts_as_the_build_an_edit_seeds_from() {
+    let dir = tempfile::tempdir().unwrap();
+    let deps = dir.path().join("target/debug/deps");
+    let incremental = dir.path().join("target/debug/incremental");
+    std::fs::create_dir_all(&deps).unwrap();
+    std::fs::create_dir_all(&incremental).unwrap();
+    let args = RustcArgs::parse(&[
+        "/toolchain/bin/rustc".to_string(),
+        "--crate-name".to_string(),
+        "sample".to_string(),
+        "src/lib.rs".to_string(),
+        "--out-dir".to_string(),
+        deps.display().to_string(),
+        format!("-Cincremental={}", incremental.display()),
+        "-Cextra-filename=-1234abcd".to_string(),
+    ])
+    .unwrap();
+    let unit = AdaptiveUnit::eligible(&args, true, b"").unwrap();
+    let fields = |sources: &str| {
+        std::collections::BTreeMap::from(
+            [
+                ("args", "stable"),
+                ("compiler", "compiler"),
+                ("externs", "extern-a"),
+                ("sources", sources),
+            ]
+            .map(|(name, value)| (name.to_string(), value.to_string())),
+        )
+    };
+    let key = |label: &str| blake3::hash(label.as_bytes()).to_hex().to_string();
+
+    observe_adaptive_hit(Some(&unit), Some(&fields("source-a")), &key("hit"));
+
+    let lease = unit
+        .try_seed(&key("edit"), &fields("source-b"))
+        .expect("the first edit after a hit seeds");
+    assert_eq!(lease.kind(), crate::incremental_policy::LeaseKind::Seed);
+}

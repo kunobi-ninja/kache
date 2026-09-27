@@ -481,6 +481,13 @@ fn file_name(path: &Path) -> String {
         .unwrap_or_default()
 }
 
+/// Whether Cargo puts this build's units somewhere other than its target
+/// directory: `CARGO_BUILD_BUILD_DIR` is set, or a Cargo config names a
+/// target or build directory.
+fn builds_elsewhere(build_dir_env: bool, cwd: &Path, cargo_home: &Path) -> bool {
+    build_dir_env || configured_elsewhere(cwd, cargo_home)
+}
+
 /// Whether this rustc invocation should ask for a seed: seeding is on and
 /// it is Cargo's target-info probe, which runs before any unit compiles.
 fn asks_for_seed(enabled: bool, args: &[String]) -> bool {
@@ -500,8 +507,11 @@ pub(crate) fn before_probe(config: &crate::config::Config, args: &[String]) {
     };
     let target_env =
         std::env::var_os("CARGO_TARGET_DIR").or_else(|| std::env::var_os("CARGO_BUILD_TARGET_DIR"));
-    let elsewhere = std::env::var_os("CARGO_BUILD_BUILD_DIR").is_some()
-        || configured_elsewhere(&cwd, &crate::cli::cargo_home_dir());
+    let elsewhere = builds_elsewhere(
+        std::env::var_os("CARGO_BUILD_BUILD_DIR").is_some(),
+        &cwd,
+        &crate::cli::cargo_home_dir(),
+    );
     let Some(target) = new_target(&cwd, target_env.as_deref(), elsewhere) else {
         return;
     };
@@ -619,6 +629,18 @@ source = "git+https://example.com/gitdep#abc"
 
     fn later() -> Instant {
         Instant::now() + Duration::from_secs(60)
+    }
+
+    #[test]
+    fn a_build_dir_from_the_environment_or_a_config_moves_the_build() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("work");
+        let home = dir.path().join("cargo-home");
+        std::fs::create_dir_all(&cwd).unwrap();
+        assert!(!builds_elsewhere(false, &cwd, &home));
+        assert!(builds_elsewhere(true, &cwd, &home), "CARGO_BUILD_BUILD_DIR");
+        write(&home.join("config.toml"), "[build]\nbuild-dir = \"/b\"\n");
+        assert!(builds_elsewhere(false, &cwd, &home), "a Cargo config");
     }
 
     #[test]

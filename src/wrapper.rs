@@ -3485,8 +3485,11 @@ fn run_parsed_rustc(
             key_ms: extra_inputs_key_ms,
             guard_inputs: extra_inputs_guard_inputs,
         },
-        match precompiled.as_mut().and_then(|pre| pre.dep_info.take()) {
-            Some(dep_info) => KeyDiscovery::Emitted(dep_info),
+        match precompiled
+            .as_mut()
+            .and_then(|pre| Some((pre.dep_info.take()?, pre.tree_digest.take())))
+        {
+            Some((dep_info, tree)) => KeyDiscovery::Emitted(dep_info, tree),
             None if deferral_allowed(config, args, adaptive_unit.is_some(), extra_inputs) => {
                 KeyDiscovery::Deferrable
             }
@@ -3512,6 +3515,7 @@ fn run_parsed_rustc(
         deferred,
         discovery_flight: _discovery_flight,
         predicted,
+        outputs: mut key_outputs,
         mut key_ms,
         mut key_hash_stats,
         mut key_too_new,
@@ -3614,6 +3618,7 @@ fn run_parsed_rustc(
                 result,
                 compile_time_ms,
                 dep_info: Some(dep_info),
+                tree_digest: key_outputs.tree_digest,
             }),
         );
         PRECOMPILED_EXIT.with(|cell| cell.set(None));
@@ -3621,14 +3626,14 @@ fn run_parsed_rustc(
         // outputs are in place.
         return stored.or(Ok(exit_code));
     }
-    crate::out_dir_alias::register_after_key(crate::cache_key::take_last_key_bakes_out_dir());
+    crate::out_dir_alias::register_after_key(key_outputs.bakes_out_dir);
     // A force-list request that could not obtain its immediate lease must not
     // retry through the post-key adaptive seed path in the same invocation.
     // It stays on the normal cache path with incremental stripped.
     let adaptive_key_fields = if adaptive_policy_for_invocation {
         adaptive_unit
             .as_ref()
-            .and_then(|_| crate::cache_key::peek_last_key_fields())
+            .and_then(|_| key_outputs.fields.clone())
     } else {
         None
     };
@@ -3731,6 +3736,7 @@ fn run_parsed_rustc(
                     key_hash_stats,
                     lookup_ms,
                     record_closure.then_some(&store),
+                    &key_outputs,
                 ) {
                     tracing::warn!(
                         "restoring local cache hit for {} failed: {} — recompiling",
@@ -3765,6 +3771,7 @@ fn run_parsed_rustc(
             key_hash_stats,
             lookup_ms,
             record_closure,
+            &key_outputs,
         ) {
             if let Err(e) = restored {
                 tracing::warn!(
@@ -3803,6 +3810,7 @@ fn run_parsed_rustc(
         ) {
             Ok(recomputed) => {
                 cache_key = recomputed.cache_key;
+                key_outputs = recomputed.outputs;
                 // Accumulate rather than replace: the first computation's
                 // measurements already include the extra-inputs resolve, and
                 // this second pass is real time this invocation spent.
@@ -3908,6 +3916,7 @@ fn run_parsed_rustc(
             key_hash_stats,
             lookup_ms,
             record_closure.then_some(&store),
+            &key_outputs,
         ) {
             tracing::warn!(
                 "restoring cache hit for {} failed: {} — recompiling",
@@ -4114,7 +4123,7 @@ fn run_parsed_rustc(
     // Bundle audit: an rlib must not be stored when it carries an archive from
     // its `-L` dirs that the key did not hash (a `#[link(kind = "static")]`
     // attribute, say). The compile already ran; we only decline to cache it.
-    let native_archives = crate::cache_key::take_last_key_native_archives().unwrap_or_default();
+    let native_archives = key_outputs.native_archives.take().unwrap_or_default();
     let unaudited = match unaudited_native_bundle(args, &result.artifacts, &native_archives) {
         Ok(None) => None,
         Ok(Some(member)) => Some(format!(
@@ -4354,7 +4363,7 @@ fn run_parsed_rustc(
     // 6. Queue remote publication through the shared durable upload path.
     maybe_enqueue_upload(config, &store, &cache_key, crate_name, true);
 
-    record_input_prediction(config, Some(&store), args, record_closure);
+    record_input_prediction(config, Some(&store), args, record_closure, &key_outputs);
 
     // 7. Clean incremental dir, as with kache's caching, incremental compilation is redundant
     clean_incremental_dir(config, args);
@@ -5331,6 +5340,9 @@ struct ComputedKey {
     /// The caller owes it a re-derivation before the key may reach anything
     /// that stores or publishes.
     predicted: bool,
+    /// What the key computation learned besides the key. A deferred key
+    /// still carries the tree digest its compile must be keyed against.
+    outputs: crate::cache_key::KeyOutputs,
     key_ms: u64,
     key_hash_stats: FileHashStats,
     key_too_new: bool,
@@ -5347,6 +5359,9 @@ struct Precompiled {
     compile_time_ms: u64,
     /// Taken by the key computation; `None` afterwards.
     dep_info: Option<crate::cache_key::DepInfo>,
+    /// The tree digest the deferred key took before the compile, handed to
+    /// the key with `dep_info`.
+    tree_digest: Option<String>,
 }
 
 /// Compile-before-key is only sound where the miss is certain from the local
@@ -5398,16 +5413,18 @@ fn fetches_remote_predictions(config: &Config) -> bool {
 /// Silent and best-effort throughout. Every reason to give up (feature off, no
 /// store, no closure to record, no identity) costs a future pre-pass and
 /// nothing else, so none of them is worth a warning on a successful build.
-fn record_input_prediction(config: &Config, store: Option<&Store>, args: &RustcArgs, wanted: bool) {
+fn record_input_prediction(
+    config: &Config,
+    store: Option<&Store>,
+    args: &RustcArgs,
+    wanted: bool,
+    key: &crate::cache_key::KeyOutputs,
+) {
     let _trace = crate::phase_trace::phase("prediction_record");
-    // Taken before any gate. The closure belongs to this invocation whether or
-    // not it gets written, and leaving it in the stash would let whatever key
-    // is computed next on this thread record it under a different identity.
-    let dep_info = crate::cache_key::take_last_dep_info();
     if !config.input_predictions || !wanted {
         return;
     }
-    let Some(dep_info) = dep_info else {
+    let Some(dep_info) = &key.dep_info else {
         return;
     };
     let Some(store) = store else {
@@ -5422,15 +5439,15 @@ fn record_input_prediction(config: &Config, store: Option<&Store>, args: &RustcA
     };
     // Present exactly when the key was computed under the tree guard; the
     // record must carry it or the guard will never accept the record.
-    let tree = crate::cache_key::take_last_tree_digest();
+    let tree = key.tree_digest.clone();
     let registry = crate::cache_key::registry_src_of(&std::env::vars_os().collect::<Vec<_>>());
     // A workspace or path unit gets a row another checkout of the workspace
     // can use, when the guard was taken before rustc ran (kunobi-ninja/kache#1005).
-    let workspace = crate::cache_key::workspace_record(args, &dep_info, tree.as_deref());
+    let workspace = crate::cache_key::workspace_record(args, dep_info, tree.as_deref());
     file_hasher.record_input_prediction(
         &identity,
         args.crate_name.as_deref(),
-        &dep_info,
+        dep_info,
         crate::cache_key::same_tree_guard(
             tree.clone(),
             crate::cache_key::is_workspace_unit(args),
@@ -5447,18 +5464,18 @@ fn record_input_prediction(config: &Config, store: Option<&Store>, args: &RustcA
     }
     // A source under target keeps the shared row out. A registry unit whose
     // only such sources are its own OUT_DIR gets a relocated row instead.
-    if crate::cache_key::shared_prediction_can_record(args, &dep_info) {
+    if crate::cache_key::shared_prediction_can_record(args, dep_info) {
         if let Some(identity) = crate::cache_key::rustc_shared_prediction_identity(args) {
             file_hasher.record_input_prediction(
                 &identity,
                 args.crate_name.as_deref(),
-                &dep_info,
+                dep_info,
                 tree.clone(),
             );
             // A registry unit's row serves any machine whose Cargo home has
             // the same path.
             if let Some(registry) = &registry {
-                let row = crate::cache_key::InputPrediction::from_dep_info(&dep_info, tree);
+                let row = crate::cache_key::InputPrediction::from_dep_info(dep_info, tree);
                 publish_prediction(
                     config,
                     &identity,
@@ -5467,7 +5484,7 @@ fn record_input_prediction(config: &Config, store: Option<&Store>, args: &RustcA
             }
         }
     } else if let Some((identity, record)) =
-        crate::cache_key::relocatable_record(args, &dep_info, tree.as_deref())
+        crate::cache_key::relocatable_record(args, dep_info, tree.as_deref())
     {
         file_hasher.record_portable_prediction(&identity, args.crate_name.as_deref(), &record);
         publish_prediction(
@@ -5537,8 +5554,9 @@ enum KeyDiscovery {
     Deferrable,
     /// The compile already ran; this is its emitted closure. The too-new
     /// guard is armed regardless of configuration: an input written during
-    /// the compile must not be keyed as if the compiler had read it.
-    Emitted(crate::cache_key::DepInfo),
+    /// the compile must not be keyed as if the compiler had read it. The tree
+    /// digest is the one the deferred computation took before the compile.
+    Emitted(crate::cache_key::DepInfo, Option<String>),
     /// Run the pre-pass again for a predicted key that missed. The caller
     /// may hold this unit's discovery flight, and that lock is not
     /// re-entrant, so this computation joins no flight.
@@ -5587,11 +5605,11 @@ fn compute_rustc_cache_key(
         guard_inputs: mut extra_inputs_guard_inputs,
     } = extra_inputs;
     let key_start = std::time::Instant::now();
-    let emitted = matches!(discovery, KeyDiscovery::Emitted(_));
+    let emitted = matches!(discovery, KeyDiscovery::Emitted(..));
     let flight_dir = discovery_flight_dir(config, &discovery);
     crate::cache_key::set_defer_discovery(matches!(discovery, KeyDiscovery::Deferrable));
-    if let KeyDiscovery::Emitted(dep_info) = discovery {
-        crate::cache_key::provide_dep_info(dep_info);
+    if let KeyDiscovery::Emitted(dep_info, tree) = discovery {
+        crate::cache_key::provide_dep_info(dep_info, tree);
     }
     let mut file_hasher = match store {
         Some(store) => store.file_hasher_with_daemon(config.socket_path()),
@@ -5629,7 +5647,9 @@ fn compute_rustc_cache_key(
         key_env_vars: &config.key_env_vars,
         extra_inputs_digest,
     };
-    let cache_key = match compiler.cache_key_in(args, &key_ctx, key_env) {
+    let (cache_key, outputs) = compiler.cache_key_in(args, &key_ctx, key_env);
+    stash_key_for_event(&outputs);
+    let cache_key = match cache_key {
         Ok(cache_key) => cache_key,
         Err(error)
             if error
@@ -5642,6 +5662,7 @@ fn compute_rustc_cache_key(
                 deferred: true,
                 discovery_flight: file_hasher.take_discovery_flight(),
                 predicted: false,
+                outputs,
                 key_ms: key_start.elapsed().as_millis() as u64,
                 key_hash_stats: file_hasher.stats(),
                 key_too_new: false,
@@ -5668,7 +5689,8 @@ fn compute_rustc_cache_key(
         cache_key,
         deferred: false,
         discovery_flight: file_hasher.take_discovery_flight(),
-        predicted: crate::cache_key::take_last_key_used_prediction(),
+        predicted: outputs.used_prediction,
+        outputs,
         key_ms,
         key_hash_stats,
         key_too_new,
@@ -5737,6 +5759,7 @@ fn recompute_key_without_prediction(
 
 /// Complete an entry made available by a remote check. `None` means no entry;
 /// a restore error stays distinct so the caller recompiles without reporting a hit.
+#[allow(clippy::too_many_arguments)]
 fn try_rustc_remote_hit(
     hit: &RustcHitContext<'_>,
     store: &Store,
@@ -5745,6 +5768,7 @@ fn try_rustc_remote_hit(
     key_hash_stats: FileHashStats,
     lookup_ms: u64,
     record_closure: bool,
+    key: &crate::cache_key::KeyOutputs,
 ) -> Option<Result<()>> {
     let (meta, result) = acquire_entry(
         hit.config,
@@ -5762,6 +5786,7 @@ fn try_rustc_remote_hit(
         key_hash_stats,
         lookup_ms,
         record_closure.then_some(store),
+        key,
     ))
 }
 
@@ -7174,6 +7199,49 @@ pub(crate) fn write_event(config: &Config, event: &BuildEvent) {
     );
 }
 
+/// The parts of a rustc key's [`KeyOutputs`](crate::cache_key::KeyOutputs)
+/// the event log records.
+#[derive(Default)]
+struct KeyEventRecord {
+    fields: Option<std::collections::BTreeMap<String, String>>,
+    externs: Option<std::collections::BTreeMap<String, String>>,
+    extern_units: Option<std::collections::BTreeMap<String, String>>,
+    unit_id: Option<String>,
+}
+
+thread_local! {
+    /// The record of the last rustc key computed on this thread, until an
+    /// event takes it. The key computation returns its outputs; this stash
+    /// only carries four of them past the `log_event_*` callers, which do not
+    /// take them as arguments.
+    static KEY_EVENT_RECORD: std::cell::RefCell<KeyEventRecord> =
+        std::cell::RefCell::new(KeyEventRecord::default());
+}
+
+/// Keep what `outputs` gives the event log for the next event.
+///
+/// The unit id and the extern maps replace whatever an earlier key left
+/// (#609, #627). The group digests exist only once the whole key was hashed,
+/// so a computation that stopped earlier leaves the previous ones in place.
+fn stash_key_for_event(outputs: &crate::cache_key::KeyOutputs) {
+    KEY_EVENT_RECORD.with(|record| {
+        let mut record = record.borrow_mut();
+        if let Some(fields) = &outputs.fields {
+            record.fields = Some(fields.clone());
+        }
+        record.externs = outputs.externs.clone();
+        record.extern_units = outputs.extern_units.clone();
+        record.unit_id = outputs.unit_id.clone();
+    });
+}
+
+/// Take (consume) the key record [`stash_key_for_event`] kept.
+fn take_key_for_event() -> KeyEventRecord {
+    KEY_EVENT_RECORD
+        .try_with(|record| std::mem::take(&mut *record.borrow_mut()))
+        .unwrap_or_default()
+}
+
 /// The event for one invocation, built from its measurements and this
 /// process's counters. Written by [`write_event`], here or, for a compile
 /// handed to the daemon, there.
@@ -7210,10 +7278,11 @@ pub(crate) fn build_event_details(
     );
     refresh_session_marker(config, root, &session_id);
 
-    // Per-group key digests of this compile's key computation (empty for cc /
-    // passthrough). Consumed here, at the single write site, so no signature
-    // threading (kunobi-ninja/kache#131).
-    let key_fields = crate::cache_key::take_last_key_fields().unwrap_or_default();
+    // What this compile's key computation recorded for the event (empty for
+    // cc / passthrough). Consumed here, at the single write site, so no
+    // signature threading (kunobi-ninja/kache#131).
+    let recorded = take_key_for_event();
+    let key_fields = recorded.fields.unwrap_or_default();
     // Always consumed, so the stash never leaks into a later compile in this
     // process; persisted only under `explain_miss` (#609). Unlike `key_diff`,
     // this rides HITS too — the chain walk diffs a miss against the last hit,
@@ -7222,7 +7291,7 @@ pub(crate) fn build_event_details(
     // the map is empty (a crate with no dependencies) — which the cascade walk
     // must be able to tell apart from "not recorded". Persisted only under
     // `explain_miss`.
-    let recorded_externs = crate::cache_key::take_last_key_externs();
+    let recorded_externs = recorded.externs;
     let key_externs_recorded = config.explain_miss && recorded_externs.is_some();
     let key_externs = if key_externs_recorded {
         recorded_externs.unwrap_or_default()
@@ -7234,8 +7303,8 @@ pub(crate) fn build_event_details(
     // next compile in this process, persisted only under `explain_miss`, and
     // only together with `key_externs` — a unit id with no digests to join is
     // dead weight on the wire.
-    let recorded_extern_units = crate::cache_key::take_last_key_extern_units();
-    let recorded_unit_id = crate::cache_key::take_last_key_unit_id();
+    let recorded_extern_units = recorded.extern_units;
+    let recorded_unit_id = recorded.unit_id;
     let (unit_id, extern_units) = if key_externs_recorded {
         (
             recorded_unit_id.unwrap_or_default(),

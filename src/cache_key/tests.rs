@@ -1373,23 +1373,6 @@ fn every_rejection_names_itself_distinctly() {
     assert_eq!(Rejection::Sibling.as_str(), "sibling");
 }
 
-/// The wrapper reads this to decide whether a key still owes a
-/// re-derivation, and a stale `true` would make it recompute a key that
-/// was never predicted.
-#[test]
-fn the_prediction_marker_is_taken_once() {
-    assert!(
-        !take_last_key_used_prediction(),
-        "nothing has been predicted on this thread"
-    );
-    LAST_KEY_USED_PREDICTION.with(|stash| stash.set(true));
-    assert!(take_last_key_used_prediction());
-    assert!(
-        !take_last_key_used_prediction(),
-        "taking must clear it, or the next key inherits this one's answer"
-    );
-}
-
 /// The verification switch comes from the snapshot. With it on, a
 /// validated prediction is checked against the pre-pass, and the pass's
 /// answer is used instead.
@@ -1428,9 +1411,9 @@ fn prediction_verification_reads_the_snapshot() {
     let identity = rustc_prediction_identity(&args).unwrap();
     hasher.record_input_prediction(&identity, Some("x"), &closure, None);
     let resolve = |env: &KeyEnv| {
-        take_last_key_used_prediction();
-        let inputs = resolve_key_inputs(&args, &hasher, "x", env).unwrap();
-        (inputs, take_last_key_used_prediction())
+        let mut out = KeyOutputs::default();
+        let inputs = resolve_key_inputs(&args, &hasher, "x", env, &mut out).unwrap();
+        (inputs, out.used_prediction)
     };
 
     assert_eq!(resolve(&KeyEnv::default()), (Some(closure), true));
@@ -1498,7 +1481,13 @@ fn discovery_defers_to_the_compile_and_takes_the_emitted_closure() {
         .with_prediction_flights(Some(dir.path().join("cache")));
 
     set_defer_discovery(true);
-    let deferred = resolve_key_inputs(&args, &on, "x", &KeyEnv::default());
+    let deferred = resolve_key_inputs(
+        &args,
+        &on,
+        "x",
+        &KeyEnv::default(),
+        &mut KeyOutputs::default(),
+    );
     set_defer_discovery(false);
     let error = deferred.expect_err("no record and deferral allowed: no pre-pass");
     assert!(
@@ -1527,8 +1516,15 @@ fn discovery_defers_to_the_compile_and_takes_the_emitted_closure() {
         closure.env_deps,
         vec![("CARGO_PKG_NAME".to_string(), "lib".to_string())]
     );
-    provide_dep_info(closure.clone());
-    let used = resolve_key_inputs(&args, &on, "x", &KeyEnv::default()).unwrap();
+    provide_dep_info(closure.clone(), None);
+    let used = resolve_key_inputs(
+        &args,
+        &on,
+        "x",
+        &KeyEnv::default(),
+        &mut KeyOutputs::default(),
+    )
+    .unwrap();
     assert_eq!(used, Some(closure));
 }
 
@@ -1665,7 +1661,13 @@ fn a_crate_the_store_never_held_defers_discovery() {
     .unwrap();
     let deferred = |hasher: &FileHasher<'_>| {
         set_defer_discovery(true);
-        let outcome = resolve_key_inputs(&args, hasher, "x", &KeyEnv::default());
+        let outcome = resolve_key_inputs(
+            &args,
+            hasher,
+            "x",
+            &KeyEnv::default(),
+            &mut KeyOutputs::default(),
+        );
         set_defer_discovery(false);
         outcome.is_err_and(|error| error.downcast_ref::<DeferredDiscovery>().is_some())
     };
@@ -1680,7 +1682,13 @@ fn a_crate_the_store_never_held_defers_discovery() {
         // Scoped: the hasher holds the unit's discovery flight until it
         // is dropped, and the hashers below need to take it.
         let hasher = FileHasher::persistent(&db).with_prediction_flights(flights.clone());
-        let not_allowed = resolve_key_inputs(&args, &hasher, "x", &KeyEnv::default());
+        let not_allowed = resolve_key_inputs(
+            &args,
+            &hasher,
+            "x",
+            &KeyEnv::default(),
+            &mut KeyOutputs::default(),
+        );
         assert!(
             !not_allowed.is_err_and(|error| error.downcast_ref::<DeferredDiscovery>().is_some()),
             "the wrapper did not allow deferral"
@@ -1749,7 +1757,13 @@ fn a_unit_the_store_never_held_defers_even_when_its_name_is_taken() {
         let hasher =
             FileHasher::persistent(&db).with_prediction_flights(Some(dir.path().join("cache")));
         set_defer_discovery(true);
-        let outcome = resolve_key_inputs(args, &hasher, "build_script_build", &KeyEnv::default());
+        let outcome = resolve_key_inputs(
+            args,
+            &hasher,
+            "build_script_build",
+            &KeyEnv::default(),
+            &mut KeyOutputs::default(),
+        );
         set_defer_discovery(false);
         outcome.is_err_and(|error| error.downcast_ref::<DeferredDiscovery>().is_some())
     };
@@ -1790,20 +1804,20 @@ fn a_record_is_only_consulted_for_an_eligible_invocation() {
 
     let off = FileHasher::persistent(&db);
     assert_eq!(
-        predicted_key_inputs(&plain, &off),
+        predicted_key_inputs(&plain, &off, &mut None),
         Err(Rejection::Disabled),
         "predictions off must not touch the table"
     );
 
     let on = FileHasher::persistent(&db).with_input_predictions(true);
     assert_eq!(
-        predicted_key_inputs(&with_macro, &on),
+        predicted_key_inputs(&with_macro, &on, &mut None),
         Err(Rejection::NotEligible),
         "a proc-macro dependency outside a registry package is refused before any lookup"
     );
     if get_rustc_version(Path::new("rustc")).is_ok() {
         assert_eq!(
-            predicted_key_inputs(&plain, &on),
+            predicted_key_inputs(&plain, &on, &mut None),
             Err(Rejection::NoRecord),
             "an eligible invocation with nothing recorded falls back"
         );
@@ -3990,13 +4004,13 @@ fn a_workspace_unit_never_reads_a_relocated_record() {
     };
     hasher.record_portable_prediction(&would_be, Some("kt"), &record);
     assert_eq!(
-        predicted_key_inputs(&args, &hasher),
+        predicted_key_inputs(&args, &hasher, &mut None),
         Err(Rejection::NoRecord)
     );
 }
 
 /// After this checkout's row and the shared one miss, a registry unit
-/// reads the relocated row under its OUT_DIR guard, and stashes that guard
+/// reads the relocated row under its OUT_DIR guard, and reports that guard
 /// before the lookup so the record it makes carries it.
 #[test]
 fn a_registry_unit_reads_a_relocated_record_under_its_out_dir_guard() {
@@ -4016,13 +4030,13 @@ fn a_registry_unit_reads_a_relocated_record_under_its_out_dir_guard() {
     let hasher = FileHasher::persistent(&dir.path().join("index.db")).with_input_predictions(true);
     let guard = out_dir_tree_digest(&out, &hasher).unwrap();
 
-    take_last_tree_digest();
+    let mut tree = None;
     assert_eq!(
-        predicted_key_inputs(&args, &hasher),
+        predicted_key_inputs(&args, &hasher, &mut tree),
         Err(Rejection::NoRecord)
     );
     assert_eq!(
-        take_last_tree_digest().as_deref(),
+        tree.as_deref(),
         Some(guard.as_str()),
         "a cold build records the guard it saw before compiling"
     );
@@ -4038,7 +4052,8 @@ fn a_registry_unit_reads_a_relocated_record_under_its_out_dir_guard() {
         tree: guard.clone(),
     };
     hasher.record_portable_prediction(&identity, Some("kt"), &record);
-    let dep_info = predicted_key_inputs(&args, &hasher).unwrap();
+    let mut tree = None;
+    let dep_info = predicted_key_inputs(&args, &hasher, &mut tree).unwrap();
     assert_eq!(
         dep_info.source_files,
         vec![package.join("src/lib.rs"), out.join("gen.rs")]
@@ -4047,11 +4062,11 @@ fn a_registry_unit_reads_a_relocated_record_under_its_out_dir_guard() {
         dep_info.env_deps,
         vec![("OUT_DIR".to_string(), out.display().to_string())]
     );
-    assert_eq!(take_last_tree_digest(), Some(guard));
+    assert_eq!(tree, Some(guard));
 
     std::fs::write(out.join("extra.rs"), "").unwrap();
     assert_eq!(
-        predicted_key_inputs(&args, &hasher),
+        predicted_key_inputs(&args, &hasher, &mut None),
         Err(Rejection::TreeChanged),
         "a file added under OUT_DIR changes the guard"
     );
@@ -4138,12 +4153,15 @@ fn an_aliased_out_dir_takes_the_shared_row(macro_dep: bool) {
     let tree = macro_dep.then(|| crate_tree_digest(&hasher).unwrap());
     let identity = rustc_shared_prediction_identity(&args_a).unwrap();
     hasher.record_input_prediction(&identity, Some("kt"), &dep_info, tree);
-    assert_eq!(predicted_key_inputs(&args_b, &hasher), Ok(dep_info));
+    assert_eq!(
+        predicted_key_inputs(&args_b, &hasher, &mut None),
+        Ok(dep_info)
+    );
 
     if macro_dep {
         std::fs::write(alias.join("stray.rs"), "").unwrap();
         assert_eq!(
-            predicted_key_inputs(&args_b, &hasher),
+            predicted_key_inputs(&args_b, &hasher, &mut None),
             Err(Rejection::TreeChanged),
             "the tree guard reads the alias as OUT_DIR"
         );
@@ -4152,7 +4170,7 @@ fn an_aliased_out_dir_takes_the_shared_row(macro_dep: bool) {
 
     let _own = crate::config::tests::set_env_for_test("OUT_DIR", Some(own_out_dir.as_os_str()));
     assert_eq!(
-        predicted_key_inputs(&args_b, &hasher),
+        predicted_key_inputs(&args_b, &hasher, &mut None),
         Err(Rejection::NoRecord),
         "a build with its own OUT_DIR has another identity"
     );
@@ -4322,7 +4340,12 @@ fn emitted_closure_keeps_the_precompile_tree_guard() {
         .with_prediction_flights(Some(dir.path().join("cache")));
     let original_tree = crate_tree_digest(&hasher).unwrap();
     set_defer_discovery(true);
-    let deferred = compute_cache_key(&args, &hasher, &PathNormalizer::empty(), &KeyEnv::default());
+    let (deferred, deferred_outputs) = compute_cache_key_with_outputs(
+        &args,
+        &hasher,
+        &PathNormalizer::empty(),
+        &KeyEnv::default(),
+    );
     set_defer_discovery(false);
     assert!(deferred.unwrap_err().is::<DeferredDiscovery>());
     // Let a broken handoff reach the pre-pass and fail, not self-deadlock.
@@ -4335,25 +4358,38 @@ fn emitted_closure_keeps_the_precompile_tree_guard() {
     // A macro input changed during compilation. Recording the newer tree
     // would make the old emitted closure appear valid for those new files.
     std::fs::write(package.join("macro-input.txt"), "changed").unwrap();
-    provide_dep_info(closure.clone());
-    compute_cache_key(&args, &hasher, &PathNormalizer::empty(), &KeyEnv::default()).unwrap();
-    let tree = take_last_tree_digest();
+    provide_dep_info(closure.clone(), deferred_outputs.tree_digest);
+    let (key, outputs) = compute_cache_key_with_outputs(
+        &args,
+        &hasher,
+        &PathNormalizer::empty(),
+        &KeyEnv::default(),
+    );
+    key.unwrap();
+    let tree = outputs.tree_digest;
     assert_eq!(tree.as_deref(), Some(original_tree.as_str()));
-    assert!(take_last_tree_digest().is_none());
     let identity = rustc_prediction_identity(&args).unwrap();
     hasher.record_input_prediction(&identity, Some("guarded"), &closure, tree);
     assert_eq!(
-        predicted_key_inputs(&args, &hasher),
+        predicted_key_inputs(&args, &hasher, &mut None),
         Err(Rejection::TreeChanged)
     );
     std::fs::remove_file(package.join("macro-input.txt")).unwrap();
-    assert_eq!(predicted_key_inputs(&args, &hasher).unwrap(), closure);
+    assert_eq!(
+        predicted_key_inputs(&args, &hasher, &mut None).unwrap(),
+        closure
+    );
     // An emitted closure without a prior guarded discovery must not
     // inherit the preceding invocation's tree.
-    take_last_tree_digest();
-    provide_dep_info(closure);
-    compute_cache_key(&args, &hasher, &PathNormalizer::empty(), &KeyEnv::default()).unwrap();
-    assert!(take_last_tree_digest().is_none());
+    provide_dep_info(closure, None);
+    let (key, outputs) = compute_cache_key_with_outputs(
+        &args,
+        &hasher,
+        &PathNormalizer::empty(),
+        &KeyEnv::default(),
+    );
+    key.unwrap();
+    assert!(outputs.tree_digest.is_none());
 }
 
 /// A row this build cannot vouch for reads as absent. The cost of that is
@@ -5134,6 +5170,17 @@ fn key_of_flags(args: &[String]) -> String {
     let mut parsed = RustcArgs::parse(args).unwrap();
     parsed.source_file = None;
     compute_cache_key(&parsed, &fh, &pn, &KeyEnv::default()).unwrap()
+}
+
+/// [`key_of_flags`], returning what the key computation learned.
+fn outputs_of_flags(args: &[String]) -> KeyOutputs {
+    let fh = FileHasher::new();
+    let pn = PathNormalizer::empty();
+    let mut parsed = RustcArgs::parse(args).unwrap();
+    parsed.source_file = None;
+    let (key, outputs) = compute_cache_key_with_outputs(&parsed, &fh, &pn, &KeyEnv::default());
+    key.unwrap();
+    outputs
 }
 
 /// H1: build-script `-l` link libs reach rustc on argv (not via
@@ -7337,7 +7384,7 @@ fn rlib_bundle_follows_bundle_and_packing() {
 }
 
 /// The bundle-audit marker keys rlibs with a native dir apart from
-/// entries stored without the audit, and the stash reports what the key
+/// entries stored without the audit, and the outputs report what the key
 /// hashed and what the rlib carries.
 ///
 /// A dir outside the workspace counts like one inside it (see
@@ -7351,8 +7398,8 @@ fn native_bundle_audit_marks_rlibs_with_a_native_dir() {
     let search = format!("native={}", tree.out.display());
     let outside = format!("native={}", tree.elsewhere.display());
     let marked = |crate_type: &str, extra: &[&str]| {
-        key_of_flags(&unit_args(crate_type, &tree.deps, extra));
-        take_last_key_fields()
+        outputs_of_flags(&unit_args(crate_type, &tree.deps, extra))
+            .fields
             .unwrap()
             .contains_key("native_bundle_audit")
     };
@@ -7363,7 +7410,7 @@ fn native_bundle_audit_marks_rlibs_with_a_native_dir() {
     #[cfg(not(windows))]
     assert!(!marked("bin", &["-L", &search]));
 
-    key_of_flags(&unit_args(
+    let outputs = outputs_of_flags(&unit_args(
         "rlib",
         &tree.deps,
         &[
@@ -7380,7 +7427,7 @@ fn native_bundle_audit_marks_rlibs_with_a_native_dir() {
         ],
     ));
     assert_eq!(
-        take_last_key_native_archives(),
+        outputs.native_archives,
         Some(KeyedNativeArchives {
             archives: vec![tree.out.join("libfoo.a"), tree.elsewhere.join("libbar.a")],
             bundled: vec![
@@ -7396,7 +7443,6 @@ fn native_bundle_audit_marks_rlibs_with_a_native_dir() {
             dirs: vec![tree.out.clone(), tree.elsewhere.clone()],
         })
     );
-    assert_eq!(take_last_key_native_archives(), None, "taken once");
 }
 
 /// Rustc's `-O` / `-g` shorthands must share keys with their exact `-C`
@@ -8472,7 +8518,7 @@ fn env_dep_bakes_out_dir_when_an_out_dir_path_stays_literal() {
 /// The key says whether it kept an OUT_DIR path, and a later key that
 /// did not starts clean.
 #[test]
-fn key_computation_stashes_whether_it_bakes_out_dir() {
+fn key_computation_reports_whether_it_bakes_out_dir() {
     let _lock = key_test_lock();
     let dir = tempfile::tempdir().unwrap();
     let source = dir.path().join("lib.rs");
@@ -8484,45 +8530,40 @@ fn key_computation_stashes_whether_it_bakes_out_dir() {
         source.to_str().unwrap().to_string(),
     ])
     .unwrap();
-    let key_with = |env_deps: Vec<(String, String)>| {
-        provide_dep_info(DepInfo {
-            source_files: vec![source.clone()],
-            env_deps,
-        });
-        compute_cache_key(
-            &args,
+    let bakes = |args: &RustcArgs| {
+        let (key, outputs) = compute_cache_key_with_outputs(
+            args,
             &FileHasher::new(),
             &PathNormalizer::empty(),
             &KeyEnv::default(),
-        )
-        .unwrap();
+        );
+        key.unwrap();
+        outputs.bakes_out_dir
+    };
+    let key_with = |env_deps: Vec<(String, String)>| {
+        provide_dep_info(
+            DepInfo {
+                source_files: vec![source.clone()],
+                env_deps,
+            },
+            None,
+        );
+        bakes(&args)
     };
 
-    key_with(vec![("OUT_DIR".into(), "/nowhere/out".into())]);
-    assert!(take_last_key_bakes_out_dir());
-    assert!(!take_last_key_bakes_out_dir(), "taken, not copied");
-
-    key_with(vec![("CARGO_PKG_NAME".into(), "helper".into())]);
-    assert!(!take_last_key_bakes_out_dir());
+    assert!(key_with(vec![("OUT_DIR".into(), "/nowhere/out".into())]));
+    assert!(!key_with(vec![("CARGO_PKG_NAME".into(), "helper".into())]));
 
     // Any one baking value is enough, however many there are.
-    key_with(vec![
+    assert!(key_with(vec![
         ("OUT_DIR".into(), "/nowhere/out".into()),
         ("OUT_DIR".into(), "/nowhere/out".into()),
-    ]);
-    assert!(take_last_key_bakes_out_dir());
+    ]));
 
-    key_with(vec![("OUT_DIR".into(), "/nowhere/out".into())]);
+    assert!(key_with(vec![("OUT_DIR".into(), "/nowhere/out".into())]));
     let mut no_source = args.clone();
     no_source.source_file = None;
-    compute_cache_key(
-        &no_source,
-        &FileHasher::new(),
-        &PathNormalizer::empty(),
-        &KeyEnv::default(),
-    )
-    .unwrap();
-    assert!(!take_last_key_bakes_out_dir(), "reset by the next key");
+    assert!(!bakes(&no_source), "a key with no closure bakes nothing");
 }
 
 /// The unit's OUT_DIR comes from the snapshot: a value under it is baked
@@ -8545,12 +8586,21 @@ fn key_reads_out_dir_from_the_snapshot() {
     let out_dir = dir.path().join("absent-out");
     let generated = out_dir.join("gen.rs").to_str().unwrap().to_string();
     let bakes = |env: &KeyEnv| {
-        provide_dep_info(DepInfo {
-            source_files: vec![source.clone()],
-            env_deps: vec![("GEN".into(), generated.clone())],
-        });
-        compute_cache_key(&args, &FileHasher::new(), &PathNormalizer::empty(), env).unwrap();
-        take_last_key_bakes_out_dir()
+        provide_dep_info(
+            DepInfo {
+                source_files: vec![source.clone()],
+                env_deps: vec![("GEN".into(), generated.clone())],
+            },
+            None,
+        );
+        let (key, outputs) = compute_cache_key_with_outputs(
+            &args,
+            &FileHasher::new(),
+            &PathNormalizer::empty(),
+            env,
+        );
+        key.unwrap();
+        outputs.bakes_out_dir
     };
     let out_env = |path: &Path| KeyEnv::from_parts([("OUT_DIR", path)], None);
     assert!(bakes(&out_env(&out_dir)));
@@ -11182,12 +11232,10 @@ fn key_test_lock() -> crate::test_support::ProcessStateTestGuard {
     process_state_test_lock()
 }
 
-/// Key computation stashes this compile's unit identity and its per-extern
-/// producer ids, and each is TAKEN — a second read yields `None`, so a
-/// compile that computes no rustc key cannot inherit the previous one's
-/// identities from the same process (kunobi-ninja/kache#627).
+/// Key computation returns this compile's unit identity and its per-extern
+/// producer ids (kunobi-ninja/kache#627).
 #[test]
-fn key_computation_stashes_unit_identity_and_yields_it_once() {
+fn key_computation_returns_unit_identity() {
     let _lock = key_test_lock();
     let args: Vec<String> = [
         "rustc",
@@ -11207,22 +11255,21 @@ fn key_computation_stashes_unit_identity_and_yields_it_once() {
     // records, not source discovery.
     parsed.source_file = None;
 
-    compute_cache_key(
+    let (key, outputs) = compute_cache_key_with_outputs(
         &parsed,
         &FileHasher::new(),
         &PathNormalizer::empty(),
         &KeyEnv::default(),
-    )
-    .unwrap();
+    );
+    key.unwrap();
 
     assert_eq!(
-        take_last_key_unit_id().as_deref(),
+        outputs.unit_id.as_deref(),
         Some("843f02d6a46ebef1"),
         "the compile's own `-C extra-filename`"
     );
-    assert_eq!(take_last_key_unit_id(), None, "taken, not copied");
 
-    let units = take_last_key_extern_units().expect("recorded with the digests");
+    let units = outputs.extern_units.expect("recorded with the digests");
     assert_eq!(
         units.get("foo_old").map(String::as_str),
         // Keyed by the alias the consumer used; the value is the producer's
@@ -11230,83 +11277,11 @@ fn key_computation_stashes_unit_identity_and_yields_it_once() {
         // file does not exist here.
         Some("0532daf0ee3516f0")
     );
-    assert_eq!(take_last_key_extern_units(), None, "taken, not copied");
-}
-
-/// The key stashes are per-thread, so a concurrent key computation can
-/// neither overwrite nor consume another's (kunobi-ninja/kache#777).
-///
-/// Before the stashes were thread-local this was the shape that made
-/// `key_computation_stashes_unit_identity_and_yields_it_once` flaky under
-/// the default `cargo test` parallelism: any other thread computing a key
-/// between a compute and its take would win the race. The outer
-/// `key_test_lock` still serializes this group against the env-mutating
-/// matrix; what runs concurrently here is the stash access itself.
-#[test]
-fn key_stashes_do_not_leak_across_threads() {
-    let _lock = key_test_lock();
-
-    // Distinct unit ids per thread, so a leak shows up as another thread's
-    // value rather than as an absence.
-    let units = ["aaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbb", "cccccccccccccccc"];
-    std::thread::scope(|scope| {
-        for unit in units {
-            scope.spawn(move || {
-                let extra = format!("extra-filename=-{unit}");
-                let extern_arg = format!("dep_{unit}=/w/target/debug/deps/libdep-{unit}.rlib");
-                let args: Vec<String> = [
-                    "rustc",
-                    "--crate-name",
-                    "app",
-                    "src/lib.rs",
-                    "-C",
-                    &extra,
-                    "--extern",
-                    &extern_arg,
-                ]
-                .iter()
-                .map(|s| s.to_string())
-                .collect();
-                let mut parsed = RustcArgs::parse(&args).unwrap();
-                // Skip the dep-info pre-pass, as above: forking rustc from
-                // every thread would swamp the point being made.
-                parsed.source_file = None;
-
-                // Loop so the interleaving windows overlap rather than each
-                // thread racing through its compute/take once.
-                for _ in 0..16 {
-                    compute_cache_key(
-                        &parsed,
-                        &FileHasher::new(),
-                        &PathNormalizer::empty(),
-                        &KeyEnv::default(),
-                    )
-                    .unwrap();
-
-                    assert_eq!(
-                        take_last_key_unit_id().as_deref(),
-                        Some(unit),
-                        "each thread sees its own unit id"
-                    );
-                    assert_eq!(take_last_key_unit_id(), None, "taken, not copied");
-
-                    let recorded = take_last_key_extern_units().expect("recorded with the digests");
-                    assert_eq!(
-                        recorded.get(&format!("dep_{unit}")).map(String::as_str),
-                        Some(unit),
-                        "each thread sees its own extern units"
-                    );
-                    assert_eq!(take_last_key_extern_units(), None, "taken, not copied");
-
-                    assert!(
-                        take_last_key_externs().is_some(),
-                        "digests ride the same thread as their identities"
-                    );
-                    assert!(take_last_key_fields().is_some(), "per-group digests too");
-                }
-            });
-        }
-    });
+    assert!(
+        outputs.externs.is_some(),
+        "digests ride with their identities"
+    );
+    assert!(outputs.fields.is_some(), "per-group digests too");
 }
 
 /// True if a bare `rustc` is invocable. `compute_cache_key` forks
@@ -12518,15 +12493,6 @@ fn key_matrix_error_format_does_not_change_key() {
 }
 
 #[test]
-fn the_stashed_tree_digest_is_taken_once() {
-    let _ = LAST_KEY_TREE_DIGEST.try_with(|stash| *stash.borrow_mut() = None);
-    assert_eq!(take_last_tree_digest(), None);
-    let _ = LAST_KEY_TREE_DIGEST.try_with(|stash| *stash.borrow_mut() = Some("tree-1".to_string()));
-    assert_eq!(take_last_tree_digest().as_deref(), Some("tree-1"));
-    assert_eq!(take_last_tree_digest(), None, "taken, not peeked");
-}
-
-#[test]
 fn a_deferred_discovery_says_so_when_displayed() {
     let text = DeferredDiscovery.to_string();
     assert!(text.contains("deferred"), "{text}");
@@ -12677,26 +12643,27 @@ fn a_guarded_record_is_refused_when_the_tree_changed() {
 
     on.record_input_prediction(&identity, Some("kt"), &closure, None);
     assert_eq!(
-        predicted_key_inputs(&with_macro, &on),
+        predicted_key_inputs(&with_macro, &on, &mut None),
         Err(Rejection::NoRecord),
         "a record without a tree digest cannot guard a proc-macro unit"
     );
 
     on.record_input_prediction(&identity, Some("kt"), &closure, Some("stale".to_string()));
     assert_eq!(
-        predicted_key_inputs(&with_macro, &on),
+        predicted_key_inputs(&with_macro, &on, &mut None),
         Err(Rejection::TreeChanged)
     );
 
     on.record_input_prediction(&identity, Some("kt"), &closure, Some(tree.clone()));
-    let current = predicted_key_inputs(&with_macro, &on);
+    let mut current_tree = None;
+    let current = predicted_key_inputs(&with_macro, &on, &mut current_tree);
     assert_ne!(current, Err(Rejection::TreeChanged), "{current:?}");
     assert_ne!(current, Err(Rejection::NoRecord), "{current:?}");
-    assert_eq!(take_last_tree_digest(), Some(tree));
+    assert_eq!(current_tree, Some(tree));
 
     std::fs::write(package.join("extra.txt"), "read by the macro").unwrap();
     assert_eq!(
-        predicted_key_inputs(&with_macro, &on),
+        predicted_key_inputs(&with_macro, &on, &mut None),
         Err(Rejection::TreeChanged),
         "a file added under the package changes the tree"
     );

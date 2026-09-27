@@ -2341,7 +2341,13 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         self.wait_for_committed_with_timeout(cache_key, BUILD_LOCK_TIMEOUT)
     }
 
-    fn wait_for_committed_with_timeout(&self, cache_key: &str, timeout: Duration) -> Result<bool> {
+    /// [`Store::wait_for_committed`] with a caller-chosen bound. `false` when
+    /// the holder kept the key past `timeout` or released it without storing.
+    pub fn wait_for_committed_with_timeout(
+        &self,
+        cache_key: &str,
+        timeout: Duration,
+    ) -> Result<bool> {
         let lock_path = self.entry_dir(cache_key).with_extension("lock");
         let _ = StoreLock::wait_until_available(&lock_path, timeout)?;
         Ok(self.contains(cache_key))

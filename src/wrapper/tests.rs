@@ -4913,27 +4913,16 @@ fn cc_try_remote_hit_does_not_restore_on_a_remote_miss() {
     );
 }
 
-/// A declined hand-off from the main store re-claims the key; a peer
-/// that took it in the gap publishes, and the wrapper only logs its
-/// event.
-#[test]
-fn a_declined_hand_off_yields_to_a_peer_that_took_the_key() {
-    let dir = tempfile::tempdir().unwrap();
-    let config = test_config(dir.path().join("cache"));
-    let store = Store::open(&config).unwrap();
-    let key = blake3::hash(b"cc-handoff-peer").to_hex().to_string();
-    let BuildClaim::Acquired(_peer) = store.claim_build(&key).unwrap() else {
-        panic!("fresh key");
-    };
-    let object = dir.path().join("foo.o");
-    std::fs::write(&object, b"object bytes").unwrap();
-    let files = vec![(object, "foo.o".to_string())];
-    let now = std::time::Instant::now();
-    let handoff = CcHandoff {
-        cache_key: &key,
+fn cc_handoff<'a>(
+    key: &'a str,
+    files: &'a [(std::path::PathBuf, String)],
+    now: std::time::Instant,
+) -> CcHandoff<'a> {
+    CcHandoff {
+        cache_key: key,
         crate_name: "foo.c",
         target: "x86_64",
-        files: &files,
+        files,
         stdout: "",
         stderr: "",
         compile_time_ms: 5,
@@ -4946,11 +4935,60 @@ fn a_declined_hand_off_yields_to_a_peer_that_took_the_key() {
         lookup_rejection: "",
         store_start: now,
         memo: None,
+    }
+}
+
+/// Hold `key` from another thread until `hold` has passed, storing an entry
+/// first when `commit` is set, as a peer that compiled the key would.
+fn hold_key_then_release(
+    store_dir: std::path::PathBuf,
+    key: String,
+    hold: std::time::Duration,
+    commit: bool,
+) -> std::thread::JoinHandle<()> {
+    let config = test_config(store_dir.join("cache"));
+    let store = Store::open(&config).unwrap();
+    let BuildClaim::Acquired(lock) = store.claim_build(&key).unwrap() else {
+        panic!("fresh key");
     };
+    std::thread::spawn(move || {
+        std::thread::sleep(hold);
+        if commit {
+            seed_cc_object_entry(&store, &key, &store_dir.join("peer"));
+        }
+        drop(lock);
+    })
+}
+
+/// When the daemon declines the offer, the wrapper takes its key back. A peer
+/// that took it in the gap and stored it publishes, and the wrapper only logs
+/// its event.
+#[test]
+fn a_declined_hand_off_yields_to_a_peer_that_took_the_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path().join("cache"));
+    let store = Store::open(&config).unwrap();
+    let key = blake3::hash(b"cc-handoff-peer").to_hex().to_string();
+    std::fs::create_dir_all(dir.path().join("peer")).unwrap();
+    let peer = hold_key_then_release(
+        dir.path().to_path_buf(),
+        key.clone(),
+        std::time::Duration::from_millis(100),
+        true,
+    );
+    let object = dir.path().join("foo.o");
+    std::fs::write(&object, b"object bytes").unwrap();
+    let files = vec![(object, "foo.o".to_string())];
 
     // No daemon: the offer is declined and the key is the peer's.
     let mut lock = None;
-    let outcome = hand_off_cc_store(&config, &store, &mut lock, handoff);
+    let outcome = hand_off_cc_store(
+        &config,
+        &store,
+        &mut lock,
+        cc_handoff(&key, &files, std::time::Instant::now()),
+    );
+    peer.join().unwrap();
 
     assert!(matches!(outcome, CcHandoffOutcome::Done));
     assert!(lock.is_none());
@@ -4958,6 +4996,80 @@ fn a_declined_hand_off_yields_to_a_peer_that_took_the_key() {
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].result, EventResult::Miss);
     assert!(!events[0].store_handed_off);
+}
+
+/// The daemon claims the key before it accepts the receipt. When the wrapper
+/// cancels in between, the daemon refuses and releases the key without
+/// storing. The wrapper must then publish itself, or the compile is neither
+/// stored nor uploaded.
+#[test]
+fn a_declined_hand_off_publishes_when_the_holder_releases_without_storing() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path().join("cache"));
+    let store = Store::open(&config).unwrap();
+    let key = blake3::hash(b"cc-handoff-refused").to_hex().to_string();
+    let daemon = hold_key_then_release(
+        dir.path().to_path_buf(),
+        key.clone(),
+        std::time::Duration::from_millis(100),
+        false,
+    );
+    let object = dir.path().join("foo.o");
+    std::fs::write(&object, b"object bytes").unwrap();
+    let files = vec![(object, "foo.o".to_string())];
+
+    let mut lock = None;
+    let outcome = hand_off_cc_store(
+        &config,
+        &store,
+        &mut lock,
+        cc_handoff(&key, &files, std::time::Instant::now()),
+    );
+    daemon.join().unwrap();
+
+    assert!(matches!(outcome, CcHandoffOutcome::Publish));
+    assert!(lock.is_some(), "the wrapper stores under its own lock");
+    assert!(
+        crate::events::read_events(&config.event_log_path())
+            .unwrap()
+            .is_empty(),
+        "the publish path writes the event"
+    );
+}
+
+/// A holder that outlasts the wait is a peer compiling the same key; the
+/// wrapper leaves the key to it instead of blocking on the whole compile.
+#[test]
+fn reclaim_after_a_declined_hand_off_gives_up_on_a_long_holder() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path().join("cache"));
+    let store = Store::open(&config).unwrap();
+    let key = blake3::hash(b"cc-handoff-long-holder").to_hex().to_string();
+    let peer = hold_key_then_release(
+        dir.path().to_path_buf(),
+        key.clone(),
+        std::time::Duration::from_millis(500),
+        false,
+    );
+
+    let claim =
+        reclaim_after_declined_handoff(&store, &key, std::time::Duration::from_millis(20)).unwrap();
+    peer.join().unwrap();
+
+    assert!(matches!(claim, BuildClaim::Contended));
+}
+
+#[test]
+fn reclaim_after_a_declined_hand_off_takes_a_free_key_at_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path().join("cache"));
+    let store = Store::open(&config).unwrap();
+    let key = blake3::hash(b"cc-handoff-free").to_hex().to_string();
+
+    let claim =
+        reclaim_after_declined_handoff(&store, &key, std::time::Duration::from_secs(60)).unwrap();
+
+    assert!(matches!(claim, BuildClaim::Acquired(_)));
 }
 
 #[test]

@@ -4442,7 +4442,7 @@ fn hand_off_cc_store(
         Handoff::Declined(reason) => {
             tracing::debug!("cc hand-off declined for {}: {reason}", handoff.crate_name);
             crate::daemon_publish::remove_handoff_files(&request.files);
-            match store.claim_build(handoff.cache_key) {
+            match reclaim_after_declined_handoff(store, handoff.cache_key, HANDOFF_HOLDER_WAIT) {
                 Ok(BuildClaim::Acquired(lock)) => {
                     *build_lock = Some(lock);
                     CcHandoffOutcome::Publish
@@ -4472,6 +4472,33 @@ fn hand_off_cc_store(
                 }
             }
         }
+    }
+}
+
+/// How long a declined hand-off waits for whoever holds the key. The daemon
+/// holds it only between claiming and refusing; a holder still there after
+/// this is a peer compiling the same key, and it publishes.
+const HANDOFF_HOLDER_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Take the key back after the daemon declined a hand-off.
+///
+/// The daemon claims the key before it accepts the receipt. When the wrapper's
+/// budget runs out in between, the wrapper cancels the receipt and finds the
+/// key held by the daemon's own handler, which then refuses because the
+/// receipt is gone. Trusting that holder to publish left the compile neither
+/// stored nor uploaded. So wait for the holder to finish, then claim again:
+/// an entry means it published, a free key means it gave up.
+fn reclaim_after_declined_handoff(
+    store: &Store,
+    cache_key: &str,
+    wait: std::time::Duration,
+) -> anyhow::Result<BuildClaim> {
+    match store.claim_build(cache_key)? {
+        BuildClaim::Contended => {
+            store.wait_for_committed_with_timeout(cache_key, wait)?;
+            store.claim_build(cache_key)
+        }
+        claim => Ok(claim),
     }
 }
 

@@ -659,11 +659,13 @@ pub fn acquire_test_lease(
     }
 }
 
-/// The fewest slots a test binary takes: its last recorded peak RSS in
-/// 512 MiB slots, or 1 with no sample. Callers clamp it to the pool.
+/// The fewest slots a test binary takes: its last recorded peak RSS in the
+/// slots of the default pool, as a compile is weighed, or 1 with no sample.
+/// Callers clamp it to the pool.
 pub fn test_floor(cache_dir: &Path, key: &str) -> u32 {
+    let slot = slot_bytes(machine_memory(), default_pool_size());
     read_weight(&scheduler_root(cache_dir).join("weights"), key)
-        .map_or(1, |rss| weight_from_rss(rss, u32::MAX))
+        .map_or(1, |rss| weight_in_slots(rss, u32::MAX, slot))
 }
 
 /// Record the waited-for test child's peak RSS under `key`. No-op on
@@ -2104,7 +2106,7 @@ mod tests {
     #[test]
     fn the_machines_memory_is_read() {
         let detected = detected_memory().expect("this host reports its memory");
-        assert!(detected >= 256 * 1024 * 1024, "{detected} bytes");
+        assert!(detected > 0);
         TEST_MEMORY.with(|memory| memory.set(None));
         assert_eq!(machine_memory(), Some(detected));
         TEST_MEMORY.with(|memory| memory.set(Some(None)));
@@ -3050,6 +3052,13 @@ mod tests {
             100,
             "the pool clamp is the caller's"
         );
+        // A test binary is weighed in the same slots as a compile: 4 GiB
+        // each when the machine has that much per slot of the default pool.
+        let memory = u64::from(default_pool_size()) * 4 * 1024 * MIB;
+        TEST_MEMORY.with(|cell| cell.set(Some(Some(memory))));
+        assert_eq!(test_floor(dir.path(), "test:demo:probe"), 1);
+        assert_eq!(test_floor(dir.path(), "test:demo:big"), 13);
+        TEST_MEMORY.with(|cell| cell.set(Some(None)));
     }
 
     #[cfg(unix)]

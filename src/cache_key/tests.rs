@@ -4537,6 +4537,24 @@ fn tool_version_cache_write_is_read_back() {
     let _ = std::fs::remove_file(&cache_file);
 }
 
+/// The compiler a target is recorded as built by is what `rustc -vV` says,
+/// and nothing when the compiler cannot be run.
+#[cfg(unix)]
+#[test]
+fn rustc_version_text_is_the_compilers_own_description() {
+    let _lock = key_test_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let rustc = dir.path().join("rustc");
+    kache_fs::testutil::write_executable(
+        &rustc,
+        "#!/bin/sh\nprintf 'rustc 1.98.0 (fake 2026-09-01)\\nhost: test\\n'\n",
+    );
+    let text = rustc_version_text(&rustc).expect("a runnable compiler");
+    assert!(text.starts_with("rustc 1.98.0 (fake 2026-09-01)"), "{text}");
+    assert!(text.contains("host: test"), "{text}");
+    assert_eq!(rustc_version_text(&dir.path().join("missing")), None);
+}
+
 #[cfg(unix)]
 #[test]
 fn clippy_identity_follows_version_config_and_lint_arguments() {

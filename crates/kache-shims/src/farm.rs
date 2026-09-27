@@ -36,12 +36,11 @@ pub fn has_marker(dir: &Path) -> bool {
 pub fn write_marker(dir: &Path) -> io::Result<bool> {
     use std::io::Write;
     let path = dir.join(MARKER);
-    match std::fs::symlink_metadata(&path) {
-        Ok(metadata) => return Ok(metadata.is_file()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
+    if let Ok(metadata) = std::fs::symlink_metadata(&path) {
+        return Ok(metadata.is_file());
     }
-    // create_new fails on any existing entry, a link included.
+    // create_new fails on any existing entry, a link included, and reports
+    // whatever else kept the lookup from answering.
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)

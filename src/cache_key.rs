@@ -8366,14 +8366,18 @@ fn program_path<'a>(binary: &'a Path, path_var: Option<&OsStr>) -> Option<Cow<'a
     }
 }
 
-#[cfg(unix)]
+/// One function with a cfg block per platform, so the Linux mutation lane
+/// mutates the body it compiles and tests.
 fn bare_program_path(name: &OsStr, path_var: Option<&OsStr>) -> Option<std::path::PathBuf> {
-    resolve_in(name.to_str()?, path_var?)
-}
-
-#[cfg(not(unix))]
-fn bare_program_path(_name: &OsStr, _path_var: Option<&OsStr>) -> Option<std::path::PathBuf> {
-    None
+    #[cfg(unix)]
+    {
+        resolve_in(name.to_str()?, path_var?)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (name, path_var);
+        None
+    }
 }
 
 #[cfg(test)]

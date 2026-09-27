@@ -10636,6 +10636,11 @@ fn an_oversized_tree_is_counted_not_hashed_and_remembered() {
         tree_digest_memoised(roots(), &hasher, 4, &memo, now).is_none(),
         "remembered while fresh"
     );
+    let half_an_hour = now + std::time::Duration::from_secs(30 * 60);
+    assert!(
+        tree_digest_memoised(roots(), &hasher, 4, &memo, half_an_hour).is_none(),
+        "still remembered half an hour on"
+    );
     let later = now + OVERSIZED_TREE_TTL + std::time::Duration::from_secs(1);
     assert_eq!(
         tree_digest_memoised(roots(), &hasher, 4, &memo, later),

@@ -871,26 +871,31 @@ fn detected_memory() -> Option<u64> {
         }
         #[cfg(target_os = "macos")]
         {
-            let mut bytes: u64 = 0;
-            let mut size = std::mem::size_of::<u64>();
-            // SAFETY: the name is NUL-terminated, and `bytes`/`size` describe
-            // a buffer of exactly the size the kernel writes for hw.memsize.
-            let rc = unsafe {
-                libc::sysctlbyname(
-                    c"hw.memsize".as_ptr(),
-                    (&raw mut bytes).cast(),
-                    &raw mut size,
-                    std::ptr::null_mut(),
-                    0,
-                )
-            };
-            (rc == 0 && bytes > 0).then_some(bytes)
+            macos_memsize()
         }
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
             None
         }
     }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_memsize() -> Option<u64> {
+    let mut bytes: u64 = 0;
+    let mut size = std::mem::size_of::<u64>();
+    // SAFETY: the name is NUL-terminated, and `bytes`/`size` describe a
+    // buffer of exactly the size the kernel writes for hw.memsize.
+    let rc = unsafe {
+        libc::sysctlbyname(
+            c"hw.memsize".as_ptr(),
+            (&raw mut bytes).cast(),
+            &raw mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    (rc == 0 && bytes > 0).then_some(bytes)
 }
 
 /// `MemTotal:` of `/proc/meminfo` in bytes (the kernel's `kB` is KiB).
@@ -2106,7 +2111,10 @@ mod tests {
     #[test]
     fn the_machines_memory_is_read() {
         let detected = detected_memory().expect("this host reports its memory");
-        assert!(detected > 0);
+        assert!(
+            detected >= 256 * 1024 * 1024,
+            "no test host has under 256 MiB: {detected}"
+        );
         TEST_MEMORY.with(|memory| memory.set(None));
         assert_eq!(machine_memory(), Some(detected));
         TEST_MEMORY.with(|memory| memory.set(Some(None)));

@@ -4874,16 +4874,20 @@ fn tool_version_cache_path_is_a_named_file_in_the_cache_dir() {
 
 /// Cargo passes a bare `rustc` when the toolchain's `bin` directory is on
 /// PATH without rustup's proxy. It must find the same cache file as the
-/// path it resolves to; before, it found none and every call spawned
+/// file a spawn runs; before, it found none and every call spawned
 /// `rustc -vV`.
+#[cfg(unix)]
 #[test]
 fn a_bare_compiler_name_finds_its_version_cache_on_path() {
     let _lock = key_test_lock();
+    let shadow = tempfile::tempdir().unwrap();
     let dir = tempfile::tempdir().unwrap();
     let empty = tempfile::tempdir().unwrap();
+    // Earlier on PATH but not executable: a spawn skips it, and so must we.
+    std::fs::write(shadow.path().join("kache-test-rustc"), b"not runnable").unwrap();
     let binary = dir.path().join("kache-test-rustc");
-    std::fs::write(&binary, b"test rustc").unwrap();
-    let path_var = std::env::join_paths([empty.path(), dir.path()]).unwrap();
+    kache_fs::testutil::write_executable(&binary, "#!/bin/sh\n");
+    let path_var = std::env::join_paths([empty.path(), shadow.path(), dir.path()]).unwrap();
     let bare = Path::new("kache-test-rustc");
 
     let resolved = tool_version_cache_path_in(bare, "rustc-ver", Some(&path_var));

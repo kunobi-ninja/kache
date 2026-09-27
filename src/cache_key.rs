@@ -8326,24 +8326,43 @@ fn resolve_in_path(name: &str) -> Option<std::path::PathBuf> {
     resolve_in(name, &std::env::var_os("PATH")?)
 }
 
-/// The first file named `name` in `path_var`.
+/// The first file named `name` in `path_var` that a spawn could run: on
+/// Unix, one with an execute bit, as `execvp` skips the others.
 fn resolve_in(name: &str, path_var: &OsStr) -> Option<std::path::PathBuf> {
     std::env::split_paths(path_var)
         .map(|dir| dir.join(name))
-        .find(|p| p.is_file())
+        .find(|p| runnable_file(p))
 }
 
-/// The file a spawn of `binary` runs: a bare name is searched on `path_var`
-/// as the spawn would, anything with a directory is left as it is. Cargo
-/// hands the wrapper a bare `rustc` when a toolchain's `bin` directory is on
-/// PATH without rustup's proxy, and canonicalizing that name against the
-/// working directory fails.
+fn runnable_file(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        metadata.is_file()
+    }
+}
+
+/// The file a spawn of `binary` runs: on Unix a bare name is searched on
+/// `path_var` as `execvp` would, anything with a directory is left as it is.
+/// Cargo hands the wrapper a bare `rustc` when a toolchain's `bin` directory
+/// is on PATH without rustup's proxy, and canonicalizing that name against
+/// the working directory fails. Windows searches the wrapper's own directory
+/// and adds `.exe` first, so a bare name there is not resolved and the
+/// caller runs the tool as before.
 fn program_path<'a>(binary: &'a Path, path_var: Option<&OsStr>) -> Option<Cow<'a, Path>> {
     let mut components = binary.components();
     match (components.next(), components.next()) {
-        (Some(std::path::Component::Normal(name)), None) => {
+        (Some(std::path::Component::Normal(name)), None) if cfg!(unix) => {
             resolve_in(name.to_str()?, path_var?).map(Cow::Owned)
         }
+        (Some(std::path::Component::Normal(_)), None) => None,
         _ => Some(Cow::Borrowed(binary)),
     }
 }

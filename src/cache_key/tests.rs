@@ -3178,6 +3178,7 @@ fn workspace_test_roots() -> WorkspaceRoots {
         target: PathBuf::from("/w/target"),
         canonical_target: PathBuf::from("/private/w/target"),
         out_dir: Some(PathBuf::from("/w/target/debug/build/kt-1/out")),
+        vendored_package: None,
     }
 }
 
@@ -3250,6 +3251,87 @@ fn only_a_package_inside_the_workspace_is_a_workspace_unit() {
     assert!(
         workspace_roots_in(&args, &[], &root).is_none(),
         "no package at all"
+    );
+}
+
+#[test]
+fn a_linker_or_search_path_in_the_checkout_does_not_split_the_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let identity = |name: &str, extra: &[String]| {
+        let (root, mut args) = workspace_invocation(dir.path(), name, "kt");
+        args.all_args.extend(
+            extra
+                .iter()
+                .map(|arg| arg.replace("ROOT", &root.display().to_string())),
+        );
+        let vars = manifest_vars(&root.join("kt"));
+        let roots = workspace_roots_in(&args, &vars, &root).unwrap();
+        workspace_prediction_identity(&args, vars, &roots).unwrap()
+    };
+    let strings = |args: &[&str]| args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
+    let linker = strings(&["-C", "linker=ROOT/build/cargo-linker"]);
+    assert_eq!(identity("a", &linker), identity("b", &linker));
+    let joined = strings(&["-Clinker=ROOT/build/cargo-linker"]);
+    assert_eq!(identity("a", &joined), identity("b", &joined));
+    let search = strings(&["-L", "native=ROOT/lib"]);
+    assert_ne!(
+        identity("a", &search),
+        identity("b", &search),
+        "a search path can change which library resolves"
+    );
+    let external = strings(&["--extern", "x=ROOT/prebuilt/libx.rlib"]);
+    assert_ne!(
+        identity("a", &external),
+        identity("b", &external),
+        "a crate in the checkout can change what a macro expands to"
+    );
+}
+
+#[test]
+fn only_linker_paths_under_the_root_are_made_neutral() {
+    let roots = workspace_test_roots();
+    let args = |args: &[&str]| args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
+    let some = |arg: &str| Some(arg.to_string());
+    assert_eq!(
+        workspace_neutral_link_args(
+            &args(&[
+                "-C",
+                "linker=/w/build/cargo-linker",
+                "-Clinker=/private/w/l",
+                "--codegen=linker=/w/l",
+                "--codegen",
+                "linker=/w/m",
+            ]),
+            &roots
+        ),
+        vec![
+            None,
+            some("linker=kache-workspace:/build/cargo-linker"),
+            some("-Clinker=kache-workspace:/l"),
+            some("--codegen=linker=kache-workspace:/l"),
+            None,
+            some("linker=kache-workspace:/m"),
+        ]
+    );
+    let kept = args(&[
+        "-C",
+        "linker=/usr/bin/cc",
+        "-C",
+        "opt-level=3",
+        "-Clinker=/w2/l",
+        "--extern",
+        "x=/w/libx.rlib",
+        "-L",
+        "native=/w/lib",
+        "-L/w/dir",
+        "-C",
+        "linker=/w/../outside",
+        "linker=/w/l",
+    ]);
+    assert!(
+        workspace_neutral_link_args(&kept, &roots)
+            .iter()
+            .all(Option::is_none)
     );
 }
 
@@ -3441,6 +3523,7 @@ fn the_workspace_guard_covers_everything_but_target_and_git() {
         target: root.join("target"),
         canonical_target: root.join("target").canonicalize().unwrap(),
         out_dir: Some(root.join("target/debug/build/kt-1/out")),
+        vendored_package: None,
     };
     let hasher = FileHasher::new();
     let digest = || workspace_tree_digest(&roots, &hasher).unwrap();
@@ -3468,6 +3551,130 @@ fn the_workspace_guard_covers_everything_but_target_and_git() {
 }
 
 #[test]
+fn a_vendored_package_is_guarded_by_itself_not_the_workspace() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("w");
+    let write = |path: &str, content: &str| {
+        let path = root.join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, content).unwrap();
+    };
+    write("Cargo.toml", "[workspace]\n");
+    write("third_party/rust/foo/.cargo-checksum.json", "{}");
+    write("third_party/rust/foo/src/lib.rs", "pub fn a() {}\n");
+    write("target/debug/build/foo-1/out/gen.rs", "// gen\n");
+    let mut roots = WorkspaceRoots {
+        root: root.clone(),
+        cwd: String::new(),
+        canonical_root: root.canonicalize().unwrap(),
+        target: root.join("target"),
+        canonical_target: root.join("target").canonicalize().unwrap(),
+        out_dir: Some(root.join("target/debug/build/foo-1/out")),
+        vendored_package: Some(root.join("third_party/rust/foo")),
+    };
+    let hasher = FileHasher::new();
+    let digest = |roots: &WorkspaceRoots| workspace_tree_digest(roots, &hasher).unwrap();
+    let baseline = digest(&roots);
+
+    write("docs/new.md", "new");
+    write("third_party/rust/bar/src/lib.rs", "other package");
+    assert_eq!(
+        digest(&roots),
+        baseline,
+        "sibling packages and the rest of the tree do not count"
+    );
+    write(".git", "gitdir: /elsewhere/.git/worktrees/w");
+    assert_eq!(
+        digest(&roots),
+        baseline,
+        "a worktree's .git file differs between checkouts"
+    );
+    std::fs::remove_file(root.join(".git")).unwrap();
+    for found_on_the_way_up in [".env", ".sqlx/query.json", "third_party/.config/x"] {
+        write(found_on_the_way_up, "x");
+        assert_ne!(digest(&roots), baseline, "{found_on_the_way_up}");
+        std::fs::remove_file(root.join(found_on_the_way_up)).unwrap();
+    }
+    std::fs::remove_dir_all(root.join(".sqlx")).unwrap();
+    std::fs::remove_dir_all(root.join("third_party/.config")).unwrap();
+    assert_eq!(digest(&roots), baseline);
+    #[cfg(unix)]
+    {
+        write("elsewhere/env", "A=1");
+        std::os::unix::fs::symlink(root.join("elsewhere/env"), root.join(".env")).unwrap();
+        let linked = digest(&roots);
+        assert_ne!(linked, baseline);
+        write("elsewhere/env", "A=2");
+        assert_ne!(digest(&roots), linked, "what a read through the link finds");
+        std::fs::remove_file(root.join(".env")).unwrap();
+        assert_eq!(digest(&roots), baseline);
+    }
+    write("third_party/rust/foo/src/lib.rs", "pub fn b() {}\n");
+    assert_ne!(digest(&roots), baseline, "the package's content");
+    write("third_party/rust/foo/src/lib.rs", "pub fn a() {}\n");
+    assert_eq!(digest(&roots), baseline);
+    write("target/debug/build/foo-1/out/gen.rs", "// other\n");
+    assert_ne!(digest(&roots), baseline, "OUT_DIR");
+
+    let vendored = digest(&roots);
+    roots.vendored_package = None;
+    assert_ne!(digest(&roots), vendored, "not the workspace digest");
+}
+
+#[test]
+fn a_vendored_source_is_what_cargo_says_it_is() {
+    let dir = tempfile::tempdir().unwrap();
+    let (root, relative) = workspace_invocation(dir.path(), "a", "kt");
+    let package = root.join("kt");
+    let vars = manifest_vars(&package);
+    std::fs::write(package.join(".cargo-checksum.json"), "{}").unwrap();
+    // How Cargo invokes rustc for a vendored package: an absolute source,
+    // run from the package, lints capped.
+    let mut vendored = relative.clone();
+    vendored.source_file = Some(package.join("src/lib.rs"));
+    vendored.outcome_lint_flags = vec!["--cap-lints".into(), "allow".into()];
+    let vendored_package = |args: &RustcArgs, cwd: &Path| {
+        workspace_roots_in(args, &vars, cwd)
+            .unwrap()
+            .vendored_package
+    };
+    assert_eq!(vendored_package(&vendored, &package), Some(package.clone()));
+
+    let mut member = vendored.clone();
+    member.source_file = relative.source_file.clone();
+    assert_eq!(
+        vendored_package(&member, &root),
+        None,
+        "a path package inside the workspace, however its lints are capped"
+    );
+    assert_eq!(
+        vendored_package(&vendored, &root),
+        None,
+        "run from the workspace root"
+    );
+    let mut uncapped = vendored.clone();
+    uncapped.outcome_lint_flags = vec!["--cap-lints".into(), "warn".into()];
+    assert_eq!(
+        vendored_package(&uncapped, &package),
+        None,
+        "not capped by Cargo"
+    );
+    let mut escaping = vendored.clone();
+    escaping.source_file = Some(dir.path().join("elsewhere/lib.rs"));
+    assert_eq!(
+        vendored_package(&escaping, &package),
+        None,
+        "a source outside the package, as a `[lib] path` can name"
+    );
+    std::fs::remove_file(package.join(".cargo-checksum.json")).unwrap();
+    assert_eq!(
+        vendored_package(&vendored, &package),
+        None,
+        "no checksum file"
+    );
+}
+
+#[test]
 fn the_workspace_guard_gives_up_past_its_entry_budget() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("w");
@@ -3482,6 +3689,7 @@ fn the_workspace_guard_gives_up_past_its_entry_budget() {
         target: root.join("target"),
         canonical_target: root.join("target"),
         out_dir: None,
+        vendored_package: None,
     };
     let hasher = FileHasher::new();
     // Three files; `target` is skipped before it is counted.
@@ -10396,6 +10604,76 @@ fn guarded_inputs_verify_despite_future_mtimes() {
         FileHasher::guarded_inputs_unchanged_since_hash(&hasher.take_guarded_inputs()),
         "untouched bytes verify despite the skewed clock"
     );
+}
+
+/// A root past the entry budget withholds the digest without reading a
+/// file, and is remembered so the next unit does not walk it; a stale memo
+/// counts the tree again.
+#[test]
+fn an_oversized_tree_is_counted_not_hashed_and_remembered() {
+    let dir = tempfile::tempdir().unwrap();
+    let memo = dir.path().join("memo");
+    let tree = dir.path().join("tree");
+    std::fs::create_dir_all(tree.join("sub")).unwrap();
+    for i in 0..4 {
+        std::fs::write(tree.join("sub").join(format!("f{i}")), b"x").unwrap();
+    }
+    // Five entries: `sub` and its four files.
+    let roots = || vec![(tree.clone(), &b"workspace"[..], &[][..])];
+    let now = std::time::SystemTime::now();
+    let hasher = FileHasher::new();
+
+    assert!(tree_digest_memoised(roots(), &hasher, 4, &memo, now).is_none());
+    assert_eq!(hasher.stats().bytes_hashed, 0, "no file is read");
+    assert!(oversized_tree_marker(&memo, &tree, 4).exists());
+    assert!(
+        tree_digest_memoised(roots(), &hasher, 5, &memo, now).is_some(),
+        "the marker is per budget"
+    );
+
+    std::fs::remove_file(tree.join("sub").join("f3")).unwrap();
+    assert!(
+        tree_digest_memoised(roots(), &hasher, 4, &memo, now).is_none(),
+        "remembered while fresh"
+    );
+    let later = now + OVERSIZED_TREE_TTL + std::time::Duration::from_secs(1);
+    assert_eq!(
+        tree_digest_memoised(roots(), &hasher, 4, &memo, later),
+        tree_digest_memoised(roots(), &hasher, 5, &memo, later),
+        "a stale memo counts the tree again, and the digest does not depend on the budget"
+    );
+}
+
+/// Roots that each fit but together run past the budget withhold the digest
+/// without marking either, and an excluded directory does not count.
+#[test]
+fn tree_budgets_add_up_across_roots_and_skip_exclusions() {
+    let dir = tempfile::tempdir().unwrap();
+    let memo = dir.path().join("memo");
+    let (first, second) = (dir.path().join("a"), dir.path().join("b"));
+    for root in [&first, &second] {
+        std::fs::create_dir_all(root).unwrap();
+        for i in 0..3 {
+            std::fs::write(root.join(format!("f{i}")), b"x").unwrap();
+        }
+    }
+    std::fs::create_dir_all(first.join("target")).unwrap();
+    for i in 0..10 {
+        std::fs::write(first.join("target").join(format!("t{i}")), b"x").unwrap();
+    }
+    let hasher = FileHasher::new();
+    let now = std::time::SystemTime::now();
+    let skipped: &[&str] = &["target"];
+    let roots = || {
+        vec![
+            (first.clone(), &b"workspace"[..], skipped),
+            (second.clone(), &b"out_dir"[..], &[][..]),
+        ]
+    };
+    assert!(tree_digest_memoised(roots(), &hasher, 5, &memo, now).is_none());
+    assert!(!oversized_tree_marker(&memo, &first, 5).exists());
+    assert!(!oversized_tree_marker(&memo, &second, 5).exists());
+    assert!(tree_digest_memoised(roots(), &hasher, 6, &memo, now).is_some());
 }
 
 #[test]

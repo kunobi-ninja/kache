@@ -890,6 +890,69 @@ fn tree_digest(
     file_hasher: &FileHasher<'_>,
     max_entries: usize,
 ) -> Option<String> {
+    tree_digest_memoised(
+        roots,
+        file_hasher,
+        max_entries,
+        &crate::config::probe_memo_dir(),
+        std::time::SystemTime::now(),
+    )
+}
+
+/// How long a root that ran past its entry budget is taken to still be past
+/// it. The answer only ever withholds a digest, which leaves the unit on the
+/// pre-pass, so a stale answer costs a shortcut, never a wrong key.
+const OVERSIZED_TREE_TTL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// The marker recording that `root` holds more than `max_entries` entries.
+fn oversized_tree_marker(memo_dir: &Path, root: &Path, max_entries: usize) -> PathBuf {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(root.as_os_str().as_encoded_bytes());
+    hasher.update(&max_entries.to_le_bytes());
+    memo_dir
+        .join("oversized-trees")
+        .join(&hasher.finalize().to_hex()[..32])
+}
+
+/// [`tree_digest`] with its "too large" memo in `memo_dir`. A workspace root
+/// can be a whole monorepo: every unit used to walk and hash the first
+/// `max_entries` entries of it, only to find it too large and discard the
+/// work. Now each root is counted first, without reading a file, and one that
+/// alone runs past the budget is remembered for [`OVERSIZED_TREE_TTL`].
+fn tree_digest_memoised(
+    roots: Vec<(PathBuf, &[u8], &[&str])>,
+    file_hasher: &FileHasher<'_>,
+    max_entries: usize,
+    memo_dir: &Path,
+    now: std::time::SystemTime,
+) -> Option<String> {
+    let mut total = 0usize;
+    for (root, _, skipped) in &roots {
+        let marker = oversized_tree_marker(memo_dir, root, max_entries);
+        let recent = std::fs::metadata(&marker)
+            .and_then(|metadata| metadata.modified())
+            .is_ok_and(|marked| {
+                now.duration_since(marked)
+                    .map_or(true, |age| age < OVERSIZED_TREE_TTL)
+            });
+        if recent {
+            return None;
+        }
+        let excluded: Vec<PathBuf> = skipped.iter().map(|name| root.join(name)).collect();
+        let mut budget = max_entries;
+        match count_tree_entries(root, &excluded, &mut budget) {
+            TreeCount::Fits => total += max_entries - budget,
+            TreeCount::TooLarge => {
+                let _ = std::fs::create_dir_all(marker.parent()?)
+                    .and_then(|()| std::fs::write(&marker, b""));
+                return None;
+            }
+            TreeCount::Unreadable => return None,
+        }
+    }
+    if total > max_entries {
+        return None;
+    }
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"kache-crate-tree-v1\n");
     let mut budget = max_entries;
@@ -908,6 +971,44 @@ fn tree_digest(
         )?;
     }
     Some(hasher.finalize().to_hex().to_string())
+}
+
+enum TreeCount {
+    Fits,
+    TooLarge,
+    Unreadable,
+}
+
+/// Count the entries under `directory` against `budget`, as
+/// [`crate_tree_fold`] spends it, reading directories but no file: a
+/// symlink counts once and is not followed.
+fn count_tree_entries(directory: &Path, excluded: &[PathBuf], budget: &mut usize) -> TreeCount {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return TreeCount::Unreadable;
+    };
+    for entry in entries {
+        let Ok(entry) = entry else {
+            return TreeCount::Unreadable;
+        };
+        let path = entry.path();
+        if excluded.contains(&path) {
+            continue;
+        }
+        let Some(left) = budget.checked_sub(1) else {
+            return TreeCount::TooLarge;
+        };
+        *budget = left;
+        let Ok(file_type) = entry.file_type() else {
+            return TreeCount::Unreadable;
+        };
+        if file_type.is_dir() {
+            match count_tree_entries(&path, excluded, budget) {
+                TreeCount::Fits => {}
+                other => return other,
+            }
+        }
+    }
+    TreeCount::Fits
 }
 
 /// Is `manifest_dir` an extracted registry package (`<CARGO_HOME>/registry/src/<index>/<pkg>`)?
@@ -1513,8 +1614,8 @@ fn predicted_key_inputs(
     let workspace = workspace_roots(args, &vars);
     // A unit with a proc-macro dependency is only predictable under the tree
     // guard: the record must carry the tree digest and it must still match.
-    // The tree is the package for a registry unit and the whole workspace for
-    // a workspace one. Computed once here and handed back in `tree_digest`,
+    // The tree is the package for a registry or vendored unit and the whole
+    // workspace for any other workspace one. Computed once here and handed back in `tree_digest`,
     // because the same digest is what a record made from this invocation has
     // to carry.
     let tree = if prediction_applies(&args.externs) {
@@ -1759,6 +1860,42 @@ fn workspace_key_inputs(
     portable_key_inputs(file_hasher, &identity, args, &guard, &places)
 }
 
+/// For each of `args`, the argument with the workspace root in a linker path
+/// (`-C linker=`) written relative to it, or `None` where there is none. The
+/// linker does not change which files rustc reads to build the crate, so two
+/// checkouts that differ only there share a record; the cache key itself
+/// still sees the argument as it is. Firefox points Cargo's linker at
+/// `<checkout>/build/cargo-linker`, which otherwise kept every unit's record
+/// to its own checkout. Anything else naming the checkout (an `--extern`
+/// outside the target directory, or a `-L` search path, which can change
+/// which library resolves) still keeps two checkouts apart.
+fn workspace_neutral_link_args(args: &[String], workspace: &WorkspaceRoots) -> Vec<Option<String>> {
+    let neutral = |path: &str| {
+        [&workspace.root, &workspace.canonical_root]
+            .iter()
+            .find_map(|root| suffix_within(std::ffi::OsStr::new(path), root, 0))
+            .map(|relative| format!("kache-workspace:{relative}"))
+    };
+    let mut previous: Option<&str> = None;
+    args.iter()
+        .map(|arg| {
+            let flag = previous.replace(arg.as_str());
+            match flag {
+                Some("-C" | "--codegen") => arg
+                    .strip_prefix("linker=")
+                    .and_then(neutral)
+                    .map(|path| format!("linker={path}")),
+                _ => ["-Clinker=", "--codegen=linker="]
+                    .iter()
+                    .find_map(|prefix| {
+                        let path = arg.strip_prefix(prefix)?;
+                        Some(format!("{prefix}{}", neutral(path)?))
+                    }),
+            }
+        })
+        .collect()
+}
+
 /// The directories a workspace unit's record is relocated against.
 #[derive(Debug, Clone)]
 pub(crate) struct WorkspaceRoots {
@@ -1770,6 +1907,9 @@ pub(crate) struct WorkspaceRoots {
     pub(crate) target: PathBuf,
     pub(crate) canonical_target: PathBuf,
     pub(crate) out_dir: Option<PathBuf>,
+    /// The package directory, for a vendored package ([`is_vendored_package`]):
+    /// its guard is the package, not the workspace.
+    pub(crate) vendored_package: Option<PathBuf>,
 }
 
 impl WorkspaceRoots {
@@ -1826,6 +1966,8 @@ fn workspace_roots_in(
         canonical_root,
         canonical_target: std::fs::canonicalize(&target).ok()?,
         out_dir: env_var_in(vars, "OUT_DIR").map(PathBuf::from),
+        vendored_package: vendored_source(args, manifest_dir, current_dir)
+            .then(|| manifest_dir.to_path_buf()),
         root,
         target,
     })
@@ -1855,10 +1997,19 @@ fn workspace_prediction_identity(
         format!("kache-cwd:{}", source.to_str()?)
     };
     let current_dir = format!("kache-workspace:{}", workspace.cwd);
-    let mut closure_args = shared_prediction_args(
-        &closure_shaping_args(source, &args.all_args),
-        &workspace.target,
-    );
+    let raw_args = closure_shaping_args(source, &args.all_args);
+    let mut closure_args = shared_prediction_args(&raw_args, &workspace.target);
+    // A linker in the checkout, under its own tag.
+    for (arg, neutral) in closure_args
+        .iter_mut()
+        .zip(workspace_neutral_link_args(&raw_args, workspace))
+    {
+        if let Some(neutral) = neutral
+            && arg.starts_with("[\"literal\"")
+        {
+            *arg = serde_json::to_string(&("workspace-link", "", "", neutral.as_str())).ok()?;
+        }
+    }
     // The crate root leads the closure arguments; spell it as above.
     *closure_args.first_mut()? =
         serde_json::to_string(&("source", "", "", source_spelling.as_str())).ok()?;
@@ -1887,13 +2038,148 @@ fn workspace_prediction_identity(
     Some(format!("{WORKSPACE_PREDICTION_PREFIX}{identity}"))
 }
 
-/// A content digest of the workspace, less its target directory and `.git`,
-/// and of `OUT_DIR`: the guard for a workspace unit's records.
+/// The guard for a workspace unit's records: a content digest of the
+/// workspace, less its target directory and `.git`, and of `OUT_DIR`. A
+/// vendored package is guarded by its own directory and `OUT_DIR` instead.
 fn workspace_tree_digest(
     workspace: &WorkspaceRoots,
     file_hasher: &FileHasher<'_>,
 ) -> Option<String> {
+    if let Some(package) = &workspace.vendored_package {
+        return vendored_package_digest(
+            package,
+            workspace.out_dir.as_deref(),
+            &workspace.root,
+            file_hasher,
+        );
+    }
     workspace_tree_digest_within(workspace, file_hasher, CRATE_TREE_MAX_ENTRIES)
+}
+
+/// Is `manifest_dir` a vendored package: a crate `cargo vendor` copied into
+/// the tree, as Firefox does for every crates.io and git dependency under
+/// `third_party/rust`? Cargo writes `.cargo-checksum.json` into each one and
+/// checks it before building from a vendored source. The file alone could
+/// be a leftover in an ordinary member; [`vendored_source`] also asks how
+/// Cargo invoked rustc.
+///
+/// A vendored package is a published crate, copied alone: the same package a
+/// registry holds, so what [`crate_tree_digest`] relies on holds here too. A
+/// macro in it can only read the package and its `OUT_DIR`, and nothing else
+/// of the tree it was copied into. Its guard is that package, which costs a
+/// few files instead of the whole workspace.
+pub(crate) fn is_vendored_package(manifest_dir: &Path) -> bool {
+    manifest_dir.join(".cargo-checksum.json").is_file()
+}
+
+/// Did Cargo build this unit from a vendored source, not a path package
+/// that happens to hold a checksum file? Cargo hands rustc a path package
+/// inside the workspace (a member, or a `[patch]` to a path) as a source path
+/// relative to the workspace root, run from there. Any other source gets an
+/// absolute path, run from the package's own directory, and only Cargo
+/// decides which. A path package whose `[lib] path` leaves the workspace gets
+/// an absolute path too, so the source must also sit inside the package, as
+/// a vendored crate's always does. The lint cap Cargo gives non-path packages is required
+/// too; `cargo -vv` omits it, and the unit then keeps the workspace guard.
+fn vendored_source(args: &RustcArgs, manifest_dir: &Path, current_dir: &Path) -> bool {
+    let same_dir = |a: &Path, b: &Path| {
+        a == b
+            || std::fs::canonicalize(a)
+                .ok()
+                .zip(std::fs::canonicalize(b).ok())
+                .is_some_and(|(a, b)| a == b)
+    };
+    args.cargo_capped_lints()
+        && args
+            .source_file
+            .as_deref()
+            .is_some_and(|source| source.is_absolute() && source.starts_with(manifest_dir))
+        && same_dir(current_dir, manifest_dir)
+        && is_vendored_package(manifest_dir)
+}
+
+/// The guard of a vendored package: its directory (less `target` and `.git`,
+/// as for a registry package) and `OUT_DIR`, and what a search upward from
+/// the package could find on the way to the workspace root: the files and
+/// dot-directories at the top of each directory in between (a `.env`, a
+/// `.sqlx`, a config file). A crate built from a registry finds nothing
+/// there; vendored into a tree, a lookup that falls back when nothing is
+/// found could read one of them, so they count. Other directories on the
+/// way (sibling packages, the rest of the tree) do not.
+fn vendored_package_digest(
+    package: &Path,
+    out_dir: Option<&Path>,
+    workspace_root: &Path,
+    file_hasher: &FileHasher<'_>,
+) -> Option<String> {
+    let mut roots = vec![(
+        package.to_path_buf(),
+        &b"vendored_package"[..],
+        MANIFEST_DIR_SKIPPED,
+    )];
+    if let Some(out_dir) = out_dir {
+        roots.push((out_dir.to_path_buf(), &b"out_dir"[..], &[]));
+    }
+    let package_digest = tree_digest(roots, file_hasher, CRATE_TREE_MAX_ENTRIES)?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"kache-vendored-guard-v1\n");
+    fold_field(&mut hasher, b"package:", package_digest.as_bytes());
+    let mut ancestor = package.parent();
+    while let Some(directory) = ancestor.filter(|directory| directory.starts_with(workspace_root)) {
+        fold_field(
+            &mut hasher,
+            b"ancestor:",
+            ancestor_top_digest(directory, file_hasher)?.as_bytes(),
+        );
+        ancestor = directory.parent();
+    }
+    Some(hasher.finalize().to_hex().to_string())
+}
+
+/// The files, symlinks and dot-directories (less `.git`, of either kind) at the top of
+/// `directory`, by name and content. A symlink to a file counts by its
+/// target and by the content read through it.
+fn ancestor_top_digest(directory: &Path, file_hasher: &FileHasher<'_>) -> Option<String> {
+    let mut entries: Vec<_> = std::fs::read_dir(directory)
+        .ok()?
+        .collect::<std::io::Result<_>>()
+        .ok()?;
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    let mut hasher = blake3::Hasher::new();
+    for entry in entries {
+        let name = entry.file_name();
+        // A directory in a clone, a file naming the repository in a git
+        // worktree: either way it is not what a macro reads, and it differs
+        // between checkouts.
+        if name == ".git" {
+            continue;
+        }
+        let path = entry.path();
+        let metadata = std::fs::symlink_metadata(&path).ok()?;
+        let content = if metadata.file_type().is_symlink() {
+            // Where it points, and what a read through it would find.
+            let target = std::fs::read_link(&path).ok()?;
+            let found = if path.is_file() {
+                file_hasher.hash(&path).ok()?
+            } else {
+                String::new()
+            };
+            format!("symlink:{}:{found}", target.display())
+        } else if metadata.is_file() {
+            format!("file:{}", file_hasher.hash(&path).ok()?)
+        } else if metadata.is_dir() && name.as_encoded_bytes().starts_with(b".") && name != ".git" {
+            let roots = vec![(path.clone(), &b"dot_dir"[..], &[][..])];
+            format!(
+                "dir:{}",
+                tree_digest(roots, file_hasher, CRATE_TREE_MAX_ENTRIES)?
+            )
+        } else {
+            continue;
+        };
+        fold_field(&mut hasher, b"name:", name.as_encoded_bytes());
+        fold_field(&mut hasher, b"entry:", content.as_bytes());
+    }
+    Some(hasher.finalize().to_hex().to_string())
 }
 
 /// [`workspace_tree_digest`] with its entry budget supplied.

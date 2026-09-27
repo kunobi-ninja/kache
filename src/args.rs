@@ -777,6 +777,18 @@ impl RustcArgs {
     /// a relocatable source root can alias unrelated files. Requiring a
     /// manifest at the candidate and the compiler cwd beneath it fails closed
     /// for external/shared targets while retaining normal workspace layouts.
+    /// Did Cargo cap this unit's lints with `--cap-lints allow`? Cargo does
+    /// that for every package that is not a path package (registry, git and
+    /// vendored sources) and never for a workspace member or path dependency,
+    /// unless it runs with `-vv`.
+    pub fn cargo_capped_lints(&self) -> bool {
+        let flags = &self.outcome_lint_flags;
+        flags.iter().any(|flag| flag == "--cap-lints=allow")
+            || flags
+                .windows(2)
+                .any(|pair| pair[0] == "--cap-lints" && pair[1] == "allow")
+    }
+
     pub fn verified_workspace_root(&self, cwd: &Path) -> Option<PathBuf> {
         let candidate = self.workspace_root()?;
         if !candidate.join("Cargo.toml").is_file() {
@@ -1289,6 +1301,10 @@ mod tests {
 
         let long = parse(&["--cap-lints", "allow"]);
         assert_eq!(long.outcome_lint_flags, ["--cap-lints", "allow"]);
+        assert!(long.cargo_capped_lints());
+        assert!(parse(&["--cap-lints=allow"]).cargo_capped_lints());
+        assert!(!parse(&["--cap-lints", "warn"]).cargo_capped_lints());
+        assert!(!parse(&[]).cargo_capped_lints());
         assert!(long.residual_args.is_empty());
 
         let long_attached = parse(&["--forbid=unused"]);

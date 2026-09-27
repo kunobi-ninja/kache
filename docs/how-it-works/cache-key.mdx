@@ -35,6 +35,15 @@ revalidates their recorded inputs and falls back to dependency discovery when
 the record cannot be used. Set `KACHE_INPUT_PREDICTIONS=0` or
 `[cache] input_predictions = false` to disable predictions.
 
+A record made in another checkout of the same workspace is used only while
+the files a proc macro could read are what the recording build saw. For a
+workspace crate that is the whole workspace, less the target directory and
+`.git`, up to 20,000 entries; past that, those crates use dependency
+discovery. A vendored crate (one `cargo vendor` copied into the tree, as
+Firefox does under `third_party/rust`) is guarded by its own package, its
+`OUT_DIR`, and the files and dot-directories at the top of each directory
+between it and the workspace root, so it shares records at any tree size.
+
 ### Clippy
 
 `cargo clippy` runs workspace crates through `clippy-driver`, which Cargo

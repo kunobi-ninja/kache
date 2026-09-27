@@ -261,18 +261,21 @@ fn broken(dir: &str, names: &[&str], target: &str) -> Status {
     }
 }
 
+/// (case, filesystem, PATH, running binary, known farms, expected)
+type StatusRow = (
+    &'static str,
+    FakeFs,
+    Vec<PathBuf>,
+    Option<&'static str>,
+    Vec<PathBuf>,
+    Status,
+);
+
 #[test]
 fn status_tells_each_state_apart() {
     let all: Vec<&str> = SHIM_NAMES.to_vec();
     let base = || FakeFs::new().exe(ME).exe("/usr/bin/cc");
-    let rows: Vec<(
-        &str,
-        FakeFs,
-        Vec<PathBuf>,
-        Option<&str>,
-        Vec<PathBuf>,
-        Status,
-    )> = vec![
+    let rows: Vec<StatusRow> = vec![
         (
             "first cc is kache",
             shims(base(), "/shims", ME),

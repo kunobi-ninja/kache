@@ -271,9 +271,9 @@ fn source_churn_adapts_then_returns_to_exact_cache_hits() {
     assert_eq!(restored["compiler_runs"], 0);
 
     // A hit discards the incremental state it could not have used, but it
-    // is still a build of the unit: the next edit seeds fresh state rather
-    // than compiling once more without it. The consumer check in
-    // `build_variant` proves the fresh state produced the new answer.
+    // is still a build of the unit: the next edit seeds state rather than
+    // compiling once more without it. The consumer check in `build_variant`
+    // proves the seeded compile produced the new answer.
     let after_hit = build(15);
     assert_passthrough(&after_hit, "adaptive seed");
     assert_eq!(after_hit["compiler_runs"], 1);

@@ -854,6 +854,9 @@ pub(crate) mod tests {
 
     #[test]
     fn debug_bundle_command_runs_outside_cargo_layout_from_the_output_dir() {
+        // Both the command and this test resolve against the current
+        // directory, which other tests move while holding this lock.
+        let _lock = crate::test_support::process_state_test_lock();
         let command =
             debug_bundle_command(Path::new("out/demo"), Path::new("out/demo.dSYM")).unwrap();
         let cwd = std::env::current_dir().unwrap();

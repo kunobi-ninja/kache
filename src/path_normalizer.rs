@@ -1847,6 +1847,9 @@ mod tests {
         // exactly. Without this rule a debug build leaks the build path
         // through `comp_dir`. kache runs as RUSTC_WRAPPER with no
         // `chdir`, so the wrapper CWD is the CWD rustc records.
+        // `from_env` reads the current directory again, which other tests
+        // move while holding this lock.
+        let _lock = crate::test_support::process_state_test_lock();
         let cwd = std::env::current_dir().unwrap();
         let canonical = canonical_string(&cwd).expect("cwd must canonicalize");
         let n = PathNormalizer::from_env(None);

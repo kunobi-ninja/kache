@@ -3364,6 +3364,9 @@ inputs = ["shared/value.txt"]
 
     #[test]
     fn artifact_provenance_rejects_incomplete_and_missing_producer_dep_info() {
+        // The dep-info below is relative to the current directory, which
+        // other tests move while holding this lock.
+        let _lock = crate::test_support::process_state_test_lock();
         let (dir, _, _, _) = workspace_fixture(false);
         let workspace_manifest = dir.path().join("Cargo.toml");
         let package = load_workspace_packages(dir.path(), &workspace_manifest)

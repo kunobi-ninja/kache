@@ -8359,12 +8359,21 @@ fn runnable_file(path: &Path) -> bool {
 fn program_path<'a>(binary: &'a Path, path_var: Option<&OsStr>) -> Option<Cow<'a, Path>> {
     let mut components = binary.components();
     match (components.next(), components.next()) {
-        (Some(std::path::Component::Normal(name)), None) if cfg!(unix) => {
-            resolve_in(name.to_str()?, path_var?).map(Cow::Owned)
+        (Some(std::path::Component::Normal(name)), None) => {
+            bare_program_path(name, path_var).map(Cow::Owned)
         }
-        (Some(std::path::Component::Normal(_)), None) => None,
         _ => Some(Cow::Borrowed(binary)),
     }
+}
+
+#[cfg(unix)]
+fn bare_program_path(name: &OsStr, path_var: Option<&OsStr>) -> Option<std::path::PathBuf> {
+    resolve_in(name.to_str()?, path_var?)
+}
+
+#[cfg(not(unix))]
+fn bare_program_path(_name: &OsStr, _path_var: Option<&OsStr>) -> Option<std::path::PathBuf> {
+    None
 }
 
 #[cfg(test)]

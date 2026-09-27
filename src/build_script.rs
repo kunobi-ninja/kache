@@ -3466,12 +3466,12 @@ mod tests {
                 Some(value) => command.env(SHIM_PATH_ENV, value),
                 None => command.env_remove(SHIM_PATH_ENV),
             };
-            let output = command
+            command
                 .args([ENV_PRINTER, "--exact", "--nocapture", "--test-threads=1"])
                 .env(ENV_PRINTER, "1")
-                .env(NAME, "kept")
-                .output()
-                .unwrap();
+                .env(NAME, "kept");
+            // `install` wrote the launcher from this process.
+            let output = crate::test_support::output_retrying_etxtbsy(&mut command).unwrap();
             assert!(
                 output.status.success(),
                 "{}",

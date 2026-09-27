@@ -154,6 +154,31 @@ pub(crate) fn test_config(cache_dir: PathBuf) -> crate::config::Config {
     }
 }
 
+/// Run `command` to completion, retrying while its exec fails with ETXTBSY.
+///
+/// A test that writes an executable and then runs it races every fork on
+/// another test thread: the forked child holds this process's write
+/// descriptor until it execs, and exec of the file fails in that window
+/// (kunobi-ninja/kache#673). The window is microseconds; an error that lasts
+/// past the retries is real.
+#[cfg(unix)]
+pub(crate) fn output_retrying_etxtbsy(
+    command: &mut std::process::Command,
+) -> std::io::Result<std::process::Output> {
+    for _ in 0..ETXTBSY_RETRIES {
+        match command.output() {
+            Err(error) if error.raw_os_error() == Some(libc::ETXTBSY) => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            result => return result,
+        }
+    }
+    command.output()
+}
+
+#[cfg(unix)]
+const ETXTBSY_RETRIES: usize = 50;
+
 #[cfg(test)]
 mod tests {
     use super::process_state_test_lock;
@@ -204,5 +229,60 @@ mod tests {
         let _lock = process_state_test_lock();
         assert_eq!(std::env::current_dir().unwrap(), original);
         assert!(!entered.exists(), "the entered dir goes with the guard");
+    }
+
+    /// Linux refuses to exec a file that is open for writing; macOS does not,
+    /// so only Linux can hold the error open on purpose.
+    #[cfg(target_os = "linux")]
+    fn busy_script(dir: &std::path::Path) -> (std::path::PathBuf, std::fs::File) {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt as _;
+        let script = dir.join("busy.sh");
+        let mut file = std::fs::File::create(&script).unwrap();
+        file.write_all(b"#!/bin/sh\nexit 0\n").unwrap();
+        file.set_permissions(std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        (script, file)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_spawn_waits_out_a_writer_that_closes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (script, writer) = busy_script(dir.path());
+        let error = std::process::Command::new(&script).output().unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::ETXTBSY));
+
+        let closer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            drop(writer);
+        });
+        let output = super::output_retrying_etxtbsy(&mut std::process::Command::new(&script));
+        closer.join().unwrap();
+        assert!(output.unwrap().status.success());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_writer_that_stays_open_is_a_real_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let (script, _writer) = busy_script(dir.path());
+        let error =
+            super::output_retrying_etxtbsy(&mut std::process::Command::new(&script)).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::ETXTBSY));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn other_spawn_errors_are_not_retried() {
+        let dir = tempfile::tempdir().unwrap();
+        let started = std::time::Instant::now();
+        let error = super::output_retrying_etxtbsy(&mut std::process::Command::new(
+            dir.path().join("missing"),
+        ))
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        // Retrying would sleep 10 ms per attempt, 500 ms in all.
+        assert!(started.elapsed() < std::time::Duration::from_millis(250));
     }
 }

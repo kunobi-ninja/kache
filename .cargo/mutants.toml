@@ -278,6 +278,14 @@ exclude_re = [
     # `ingest_tailed_records`, `stats_fetch_due`, `project_scan_due`, and
     # `handle_terminal_event`, which stay in scope.
     "delete ! in run_monitor",
+    # `scheduler/pressure.rs` asks the OS whether memory is short: each
+    # `under_pressure` is compiled for one platform and reads live kernel
+    # state (a sysctl on macOS, `/proc` on Linux) that no test can set, so a
+    # replaced body is unobservable here. The choice among readings,
+    # `pressured_from`, the parsers and the admission weight stay in scope
+    # and are tested with fixed inputs.
+    "src/scheduler/pressure.rs:.*replace under_pressure -> bool",
+    "src/scheduler/pressure.rs:.* in under_pressure$",
     "probe_macos",
     "replace sdk_identity_for",
     "xcrun",

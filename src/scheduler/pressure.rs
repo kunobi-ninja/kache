@@ -133,16 +133,21 @@ fn under_pressure() -> bool {
         )
         .map(|domain| domain.current.join("memory.pressure"))
     });
-    // The cgroup's own reading when it has one, else the host's.
-    let read = |path: &Path| {
+    pressured_from(cgroup.as_deref(), Path::new("/proc/pressure/memory"))
+}
+
+/// The cgroup's own PSI reading when `cgroup` names a readable one, else the
+/// host's; no pressure when neither can be read.
+#[cfg(any(test, target_os = "linux"))]
+pub(crate) fn pressured_from(cgroup: Option<&std::path::Path>, host: &std::path::Path) -> bool {
+    let read = |path: &std::path::Path| {
         std::fs::read_to_string(path)
             .ok()
             .and_then(|text| psi_pressured(&text))
     };
     cgroup
-        .as_deref()
         .and_then(read)
-        .or_else(|| read(Path::new("/proc/pressure/memory")))
+        .or_else(|| read(host))
         .unwrap_or(false)
 }
 
@@ -182,6 +187,34 @@ mod tests {
         assert_eq!(psi_pressured("some avg10=lots\n"), None);
         assert_eq!(psi_pressured(""), None);
         assert_eq!(PSI_SOME_AVG10, 10.0);
+    }
+
+    #[test]
+    fn prefers_the_cgroup_reading_then_the_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let calm = dir.path().join("calm");
+        let busy = dir.path().join("busy");
+        let bad = dir.path().join("bad");
+        let missing = dir.path().join("missing");
+        std::fs::write(&calm, "some avg10=0.00 avg60=0 avg300=0 total=0\n").unwrap();
+        std::fs::write(&busy, "some avg10=50.00 avg60=0 avg300=0 total=0\n").unwrap();
+        std::fs::write(&bad, "nothing useful\n").unwrap();
+        assert!(
+            pressured_from(Some(&busy), &calm),
+            "the cgroup's own reading wins"
+        );
+        assert!(!pressured_from(Some(&calm), &busy), "even when calm");
+        assert!(
+            pressured_from(Some(&missing), &busy),
+            "unreadable cgroup: host"
+        );
+        assert!(pressured_from(Some(&bad), &busy), "unusable cgroup: host");
+        assert!(pressured_from(None, &busy));
+        assert!(!pressured_from(None, &calm));
+        assert!(
+            !pressured_from(Some(&missing), &missing),
+            "nothing readable: none"
+        );
     }
 
     #[test]

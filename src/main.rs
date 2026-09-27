@@ -1341,6 +1341,7 @@ fn run_wrapper_mode(args: &[String]) -> Result<()> {
     }
 
     let config = config::Config::load()?;
+    scheduler::pressure::set_enabled(config.scheduler_memory_pressure);
 
     if config.disabled {
         // Caching off — pass straight through to the real compiler. The

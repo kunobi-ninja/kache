@@ -11,6 +11,8 @@ After a local and remote miss, the wrapper joins a machine-wide flight for its c
 
 The permit pool size is `std::thread::available_parallelism()`, with a floor of 1. Unmeasured compiles occupy one slot. Unmeasured rustc invocations that run the system linker (binaries, dylibs, cdylibs, and proc macros) occupy two. A library compile is not a link, even though Cargo asks it to emit `link`. On Unix, a real compile records the child's peak RSS by crate name. Later invocations of that crate occupy `ceil(rss / 512 MiB)` slots, clamped to the pool.
 
+The memory estimate cannot see what else is running: builds outside Kache, an editor, a browser. So the scheduler also checks whether the machine is short of memory. Under memory pressure a compile asks for the whole pool: it waits for the other compiles to finish, so they run one after another until pressure eases. Slots held by running tests still count against that as usual, so a test waiting on a compile cannot stall it. On macOS, pressure is the kernel's pressure level at warning or critical. On Linux it is memory PSI, some task stalled on memory for at least 10% of the last ten seconds, read from the process's cgroup when it has its own `memory.pressure` and from the host otherwise. Other systems report no pressure. Set `cache.scheduler_memory_pressure = false` or `KACHE_SCHEDULER_MEMORY_PRESSURE=0` to turn the check off.
+
 If the scheduler directory cannot be used, compilation continues without a permit. Set `KACHE_SCHEDULER=0` or `[cache] scheduler = false` to turn it off.
 
 Two cargo processes that miss the same crate still share one real compile when the first stores an entry the second can restore. Distinct target directories remain required.

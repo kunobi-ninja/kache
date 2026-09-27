@@ -3019,6 +3019,7 @@ fn save_manifest_config(
         index_auto_compact: true,
         auto_clean_orphaned_targets: false,
         auto_clean_idle_targets_days: 0,
+        scheduler_memory_pressure: true,
         gc_evict_shared: false,
         storage_layout_advice: true,
         heartbeat_secs: 30,

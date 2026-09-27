@@ -16,8 +16,9 @@
 //! wrappers record the child's peak RSS by crate name; later invocations of
 //! that crate occupy `ceil(rss / 512 MiB)` slots, clamped to the pool.
 //!
-//! Linux cgroup-v2 resources are logged for diagnostics. Resource-aware
-//! admission needs a shared namespace policy and remains future work.
+//! Under memory pressure (see [`pressure`]) a compile asks for the whole
+//! pool, so compiles run one after another until pressure eases. Linux
+//! cgroup-v2 limits are logged for diagnostics.
 //!
 //! If the scheduler directory cannot be used, compilation continues without
 //! a permit. [`Config::scheduler`] / `KACHE_SCHEDULER=0` turns the module off.
@@ -30,6 +31,7 @@
 //! is covered by the test's slots and takes none of its own; see
 //! [`lease_covers`].
 
+pub(crate) mod pressure;
 use anyhow::Result;
 use std::fs;
 use std::io::Write;
@@ -463,6 +465,7 @@ impl Scheduler {
         let _trace = crate::phase_trace::phase("permit_wait");
         let started = std::time::Instant::now();
         let slots = self.wait_for_permit(0..self.pool_size, |waited| {
+            let weight = pressure::weight(weight, self.pool_size, pressure::now());
             compile_need(weight, self.pool_size, waited, || tests_held(&self.root))
         });
         crate::opcounts::record_permit_wait(started.elapsed());
@@ -2483,6 +2486,33 @@ mod tests {
         assert_eq!(test_need(6, 8), 6);
         assert_eq!(test_need(7, 8), 6);
         assert_eq!(test_need(1, 1), 0, "a pool of one has no test slots");
+    }
+
+    #[test]
+    fn memory_pressure_admits_a_compile_only_when_no_other_holds_a_slot() {
+        let dir = temp_cache();
+        let scheduler = Scheduler::open_with(
+            dir.path(),
+            4,
+            Duration::from_millis(150),
+            Duration::from_millis(5),
+        )
+        .unwrap();
+        let held = scheduler.acquire_permit(1).unwrap();
+        pressure::force(Some(true));
+        assert!(
+            scheduler.acquire_permit(1).is_none(),
+            "under pressure a compile waits for the other to finish"
+        );
+        drop(held);
+        let alone = scheduler.acquire_permit(1).unwrap();
+        assert_eq!(alone._slots.len(), 4, "it takes the whole pool");
+        drop(alone);
+        pressure::force(Some(false));
+        let first = scheduler.acquire_permit(1).unwrap();
+        let second = scheduler.acquire_permit(1).unwrap();
+        assert_eq!(first._slots.len() + second._slots.len(), 2);
+        pressure::force(None);
     }
 
     #[test]

@@ -416,6 +416,33 @@ fn target_cleanup_defaults_and_env_precedence() {
 }
 
 #[test]
+fn memory_pressure_admission_is_on_by_default_and_obeys_env_precedence() {
+    let _lock = config_path_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("config.toml");
+    let _config = set_kache_config_for_test(&config_path);
+    let _missing = NamedEnvGuard::remove("KACHE_SCHEDULER_MEMORY_PRESSURE");
+    assert!(Config::load().unwrap().scheduler_memory_pressure);
+    std::fs::write(&config_path, "[cache]\nscheduler_memory_pressure = false\n").unwrap();
+    assert!(!Config::load().unwrap().scheduler_memory_pressure);
+    let _on = NamedEnvGuard::set("KACHE_SCHEDULER_MEMORY_PRESSURE", "1");
+    assert!(Config::load().unwrap().scheduler_memory_pressure);
+    drop(_on);
+    std::fs::write(&config_path, "[cache]\nscheduler_memory_pressure = true\n").unwrap();
+    for off in ["0", "false", "FALSE"] {
+        let _off = NamedEnvGuard::set("KACHE_SCHEDULER_MEMORY_PRESSURE", off);
+        assert!(!Config::load().unwrap().scheduler_memory_pressure, "{off}");
+    }
+    std::fs::write(
+        &config_path,
+        "[cache]\nignore_env = true\nscheduler_memory_pressure = true\n",
+    )
+    .unwrap();
+    let _ignored = NamedEnvGuard::set("KACHE_SCHEDULER_MEMORY_PRESSURE", "0");
+    assert!(Config::load().unwrap().scheduler_memory_pressure);
+}
+
+#[test]
 fn min_store_compile_is_opt_in_and_obeys_env_precedence() {
     let _lock = config_path_lock();
     let dir = tempfile::tempdir().unwrap();
@@ -2244,6 +2271,7 @@ fn test_file_config_roundtrip() {
             index_auto_compact: None,
             auto_clean_orphaned_targets: None,
             auto_clean_idle_targets_days: None,
+            scheduler_memory_pressure: None,
             gc_evict_shared: None,
             storage_layout_advice: None,
             heartbeat_secs: None,
@@ -2777,6 +2805,7 @@ fn test_config_store_dir() {
         index_auto_compact: true,
         auto_clean_orphaned_targets: true,
         auto_clean_idle_targets_days: 0,
+        scheduler_memory_pressure: true,
         gc_evict_shared: false,
         storage_layout_advice: true,
         heartbeat_secs: 30,
@@ -2847,6 +2876,7 @@ fn test_config_index_db_path() {
         index_auto_compact: true,
         auto_clean_orphaned_targets: true,
         auto_clean_idle_targets_days: 0,
+        scheduler_memory_pressure: true,
         gc_evict_shared: false,
         storage_layout_advice: true,
         heartbeat_secs: 30,
@@ -2913,6 +2943,7 @@ fn test_config_event_log_path() {
         index_auto_compact: true,
         auto_clean_orphaned_targets: true,
         auto_clean_idle_targets_days: 0,
+        scheduler_memory_pressure: true,
         gc_evict_shared: false,
         storage_layout_advice: true,
         heartbeat_secs: 30,
@@ -2998,6 +3029,7 @@ fn test_config_socket_path() {
         index_auto_compact: true,
         auto_clean_orphaned_targets: true,
         auto_clean_idle_targets_days: 0,
+        scheduler_memory_pressure: true,
         gc_evict_shared: false,
         storage_layout_advice: true,
         heartbeat_secs: 30,
@@ -3661,6 +3693,7 @@ fn test_save_and_load_file_config() {
             index_auto_compact: None,
             auto_clean_orphaned_targets: None,
             auto_clean_idle_targets_days: None,
+            scheduler_memory_pressure: None,
             gc_evict_shared: None,
             storage_layout_advice: None,
             heartbeat_secs: None,

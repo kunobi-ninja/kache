@@ -12780,3 +12780,314 @@ fn a_key_that_read_an_undeclared_variable_is_refused() {
     let err = complete_key(&env, "k".into()).unwrap_err();
     assert!(err.to_string().contains("KEY_ENV_VARS"), "{err}");
 }
+
+/// Property tests for the key's two false-hit guards: every keyed input moves
+/// the key, and what the key must ignore does not. Each case writes a small
+/// crate (a root, module files, an OUT_DIR `include!`, two externs) and hands
+/// its closure in through [`provide_dep_info`], so no rustc pre-pass runs.
+mod properties {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// Codegen options, each with two non-default values.
+    const CODEGEN: [(&str, [&str; 2]); 3] = [
+        ("opt-level", ["1", "3"]),
+        ("debuginfo", ["1", "2"]),
+        ("codegen-units", ["3", "5"]),
+    ];
+    const CFGS: [&str; 3] = ["alpha", "beta", "gamma"];
+    const FEATURES: [&str; 3] = ["std", "derive", "serde"];
+    const RUSTFLAGS: [&str; 3] = ["--cfg=rf_a", "-Cdebug-assertions=on", "-Aunused"];
+    const CARGO_CFGS: [&str; 2] = ["CARGO_CFG_PROP_A", "CARGO_CFG_PROP_B"];
+    const ENV_DEPS: [&str; 2] = ["PROP_ENV_A", "PROP_ENV_B"];
+    const EXTERNS: [&str; 2] = ["dep_a", "dep_b"];
+
+    #[derive(Debug, Clone, PartialEq)]
+    struct Unit {
+        codegen: [Option<usize>; 3],
+        cfgs: [bool; 3],
+        features: [bool; 3],
+        /// `sources[0]` is the crate root's text; the rest are module files.
+        sources: Vec<String>,
+        generated: String,
+        out_dir_unit: String,
+        rustflags: [bool; 3],
+        cargo_cfgs: [Option<String>; 2],
+        env_deps: [String; 2],
+        externs: [Option<String>; 2],
+    }
+
+    fn text() -> impl Strategy<Value = String> {
+        "[a-z0-9 ]{0,12}"
+    }
+
+    fn unit() -> impl Strategy<Value = Unit> {
+        (
+            prop::array::uniform3(prop::option::of(0..2usize)),
+            prop::array::uniform3(any::<bool>()),
+            prop::array::uniform3(any::<bool>()),
+            prop::collection::vec(text(), 1..4),
+            text(),
+            "[a-f0-9]{4}",
+            prop::array::uniform3(any::<bool>()),
+            prop::array::uniform2(prop::option::of("[a-z0-9,]{0,6}")),
+            prop::array::uniform2("[a-z0-9./]{0,6}"),
+            prop::array::uniform2(prop::option::of(text())),
+        )
+            .prop_map(
+                |(
+                    codegen,
+                    cfgs,
+                    features,
+                    sources,
+                    generated,
+                    out_dir_unit,
+                    rustflags,
+                    cargo_cfgs,
+                    env_deps,
+                    externs,
+                )| Unit {
+                    codegen,
+                    cfgs,
+                    features,
+                    sources,
+                    generated,
+                    out_dir_unit,
+                    rustflags,
+                    cargo_cfgs,
+                    env_deps,
+                    externs,
+                },
+            )
+    }
+
+    /// One edit to one key-relevant input.
+    #[derive(Debug, Clone)]
+    enum Change {
+        Codegen(usize),
+        Cfg(usize),
+        Feature(usize),
+        Source(usize, String),
+        Generated(String),
+        OutDirUnit(String),
+        Rustflag(usize),
+        CargoCfg(usize, String),
+        EnvDep(usize, String),
+        Extern(usize, String),
+    }
+
+    fn change() -> impl Strategy<Value = Change> {
+        prop_oneof![
+            (0..3usize).prop_map(Change::Codegen),
+            (0..3usize).prop_map(Change::Cfg),
+            (0..3usize).prop_map(Change::Feature),
+            (0..4usize, text()).prop_map(|(i, t)| Change::Source(i, t)),
+            text().prop_map(Change::Generated),
+            "[a-f0-9]{4}".prop_map(Change::OutDirUnit),
+            (0..3usize).prop_map(Change::Rustflag),
+            (0..2usize, "[a-z0-9,]{0,6}").prop_map(|(i, v)| Change::CargoCfg(i, v)),
+            (0..2usize, "[a-z0-9./]{0,6}").prop_map(|(i, v)| Change::EnvDep(i, v)),
+            (0..2usize, text()).prop_map(|(i, t)| Change::Extern(i, t)),
+        ]
+    }
+
+    /// `unit` with `change` applied, or `None` when the edit is a no-op.
+    fn apply(unit: &Unit, change: &Change) -> Option<Unit> {
+        let mut next = unit.clone();
+        match change {
+            // Absent -> first value -> second value -> absent.
+            Change::Codegen(i) => {
+                next.codegen[*i] = match unit.codegen[*i] {
+                    None => Some(0),
+                    Some(0) => Some(1),
+                    Some(_) => None,
+                }
+            }
+            Change::Cfg(i) => next.cfgs[*i] = !unit.cfgs[*i],
+            Change::Feature(i) => next.features[*i] = !unit.features[*i],
+            Change::Source(i, t) => next.sources[i % unit.sources.len()] = t.clone(),
+            Change::Generated(t) => next.generated = t.clone(),
+            Change::OutDirUnit(u) => next.out_dir_unit = u.clone(),
+            Change::Rustflag(i) => next.rustflags[*i] = !unit.rustflags[*i],
+            Change::CargoCfg(i, v) => {
+                next.cargo_cfgs[*i] = (unit.cargo_cfgs[*i].as_ref() != Some(v)).then(|| v.clone())
+            }
+            Change::EnvDep(i, v) => next.env_deps[*i] = v.clone(),
+            Change::Extern(i, t) => {
+                next.externs[*i] = (unit.externs[*i].as_ref() != Some(t)).then(|| t.clone())
+            }
+        }
+        (next != *unit).then_some(next)
+    }
+
+    /// Deterministic shuffle; seed 0 keeps the order.
+    fn shuffle<T>(items: &mut [T], seed: u64) {
+        let mut state = seed;
+        for i in (1..items.len()).rev() {
+            if seed == 0 {
+                return;
+            }
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            items.swap(i, (state >> 33) as usize % (i + 1));
+        }
+    }
+
+    /// Write `unit` under `root` and key it the way the wrapper does: the
+    /// workspace and target rules from `root`, OUT_DIR in the snapshot, and the
+    /// closure the compile would emit. `seed` reorders every input the key
+    /// treats as a set.
+    fn key_in(unit: &Unit, root: &Path, seed: u64) -> String {
+        let src = root.join("src");
+        let target = root.join("target");
+        let deps = target.join("debug/deps");
+        let out_dir = target
+            .join("debug/build")
+            .join(format!("probe-{}", unit.out_dir_unit))
+            .join("out");
+        for dir in [&src, &deps, &out_dir] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let lib = src.join("lib.rs");
+        std::fs::write(
+            &lib,
+            format!(
+                "include!(concat!(env!(\"OUT_DIR\"), \"/gen.rs\"));\n// {}\n",
+                unit.sources[0]
+            ),
+        )
+        .unwrap();
+        let generated = out_dir.join("gen.rs");
+        std::fs::write(&generated, format!("// {}\n", unit.generated)).unwrap();
+        let mut source_files = vec![lib.clone(), generated];
+        for (i, text) in unit.sources.iter().enumerate().skip(1) {
+            let module = src.join(format!("m{i}.rs"));
+            std::fs::write(&module, format!("// {text}\n")).unwrap();
+            source_files.push(module);
+        }
+
+        let mut groups: Vec<Vec<String>> = vec![
+            vec!["--crate-name".into(), "probe".into()],
+            vec!["--crate-type".into(), "lib".into()],
+            vec!["--edition=2021".into()],
+            vec![lib.to_string_lossy().into_owned()],
+        ];
+        for ((name, values), value) in CODEGEN.iter().zip(unit.codegen) {
+            if let Some(v) = value {
+                groups.push(vec!["-C".into(), format!("{name}={}", values[v])]);
+            }
+        }
+        for (cfg, on) in CFGS.iter().zip(unit.cfgs) {
+            if on {
+                groups.push(vec!["--cfg".into(), (*cfg).into()]);
+            }
+        }
+        for (feature, on) in FEATURES.iter().zip(unit.features) {
+            if on {
+                groups.push(vec!["--cfg".into(), format!("feature=\"{feature}\"")]);
+            }
+        }
+        for (name, content) in EXTERNS.iter().zip(&unit.externs) {
+            if let Some(content) = content {
+                let rlib = deps.join(format!("lib{name}.rlib"));
+                std::fs::write(&rlib, content).unwrap();
+                groups.push(vec![
+                    "--extern".into(),
+                    format!("{name}={}", rlib.display()),
+                ]);
+            }
+        }
+        shuffle(&mut groups, seed);
+        shuffle(&mut source_files, seed);
+        let argv: Vec<String> = std::iter::once("rustc".to_string())
+            .chain(groups.into_iter().flatten())
+            .collect();
+
+        let mut rustflags = vec![format!("-Lnative={}", root.join("native").display())];
+        rustflags.extend(
+            RUSTFLAGS
+                .iter()
+                .zip(unit.rustflags)
+                .filter(|(_, on)| *on)
+                .map(|(flag, _)| flag.to_string()),
+        );
+        let out_dir = out_dir.to_string_lossy().into_owned();
+        let mut vars = vec![
+            ("OUT_DIR".to_string(), out_dir.clone()),
+            ("RUSTFLAGS".to_string(), rustflags.join(" ")),
+        ];
+        for (name, value) in CARGO_CFGS.iter().zip(&unit.cargo_cfgs) {
+            if let Some(value) = value {
+                vars.push(((*name).into(), value.clone()));
+            }
+        }
+        shuffle(&mut vars, seed);
+        let env = KeyEnv::from_parts(vars, Some(root.to_path_buf()));
+
+        let mut env_deps = vec![("OUT_DIR".to_string(), out_dir)];
+        env_deps.extend(
+            ENV_DEPS
+                .iter()
+                .zip(&unit.env_deps)
+                .map(|(name, value)| ((*name).to_string(), value.clone())),
+        );
+        let normalizer = PathNormalizer::from_env(Some(root)).with_target_dir(Some(&target));
+        provide_dep_info(
+            DepInfo {
+                source_files,
+                env_deps,
+            },
+            None,
+        );
+        compute_cache_key(
+            &RustcArgs::parse(&argv).unwrap(),
+            &FileHasher::new(),
+            &normalizer,
+            &env,
+        )
+        .unwrap()
+    }
+
+    /// A temp dir by its canonical spelling, as Cargo reports paths.
+    fn checkout() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = PathBuf::from(crate::path_normalizer::canonical_string(dir.path()).unwrap());
+        (dir, root)
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 32,
+            max_shrink_iters: 256,
+            ..ProptestConfig::default()
+        })]
+
+        // Editing any one keyed input (codegen flag, cfg, feature, source or
+        // generated file, OUT_DIR unit, RUSTFLAGS, CARGO_CFG_*, env-dep value,
+        // extern content) moves the key. A miss here is a false hit.
+        #[test]
+        fn every_keyed_input_changes_the_key(unit in unit(), change in change()) {
+            let edited = apply(&unit, &change);
+            prop_assume!(edited.is_some());
+            let _lock = key_test_lock();
+            let (_dir, root) = checkout();
+            let before = key_in(&unit, &root, 0);
+            let after = key_in(&edited.unwrap(), &root, 0);
+            prop_assert_ne!(before, after, "{:?} left the key unchanged", change);
+        }
+
+        // The same crate in another checkout, with its flags, closure, and
+        // CARGO_CFG_* vars in another order, gets the same key.
+        #[test]
+        fn checkout_location_and_input_order_do_not_change_the_key(
+            unit in unit(),
+            seed in any::<u64>(),
+        ) {
+            let _lock = key_test_lock();
+            let (_a, root_a) = checkout();
+            let (_b, root_b) = checkout();
+            prop_assert_eq!(key_in(&unit, &root_a, 0), key_in(&unit, &root_b, seed));
+        }
+    }
+}

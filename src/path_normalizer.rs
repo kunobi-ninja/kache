@@ -3759,4 +3759,100 @@ mod tests {
         );
         assert!(normalizer.remap_args().iter().any(|arg| arg == &expected));
     }
+
+    // Property tests. The configured roots are absent on disk, so every host
+    // builds the same lexical rule set: three nested/sibling base dirs plus two
+    // automatic substring rules, each root owning exactly one sentinel.
+    mod properties {
+        use super::*;
+        use proptest::prelude::*;
+
+        const ROOTS: [&str; 3] = ["/o", "/w", "/w/sub"];
+
+        fn normalizer() -> PathNormalizer {
+            let roots: Vec<String> = ROOTS.iter().map(|r| r.to_string()).collect();
+            pn_with_rules(vec![("/h/u", "<HOME>"), ("/t", "<TMPDIR>")]).with_base_dirs(&roots)
+        }
+
+        /// Cache-key-shaped text: root spellings, near misses, flag and list
+        /// delimiters, a drive prefix, and composed/decomposed accents.
+        fn key_text() -> impl Strategy<Value = String> {
+            const FRAGMENTS: &[&str] = &[
+                "/o", "/w", "/w/sub", "/h/u", "/t", "/", "sub", "x", ".", "..", " ", "=", "-L",
+                ":", ";", "C:", "\\", "\u{1f}", "\u{e9}", "e\u{301}", "w\u{301}",
+            ];
+            proptest::collection::vec(proptest::sample::select(FRAGMENTS), 0..12)
+                .prop_map(|parts| parts.concat())
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig {
+                cases: 64,
+                max_shrink_iters: 256,
+                ..ProptestConfig::default()
+            })]
+
+            // A second pass finds nothing to replace: a sentinel never spells or
+            // exposes a rule prefix.
+            #[test]
+            fn normalize_is_idempotent(input in key_text()) {
+                let n = normalizer();
+                let once = n.normalize(&input);
+                prop_assert_eq!(n.normalize(&once), once);
+            }
+
+            // Expanding every sentinel back to its one root recovers the NFC input,
+            // so two inputs that differ in more than Unicode form never share an
+            // output (and so never share a key).
+            #[test]
+            fn normalize_is_injective_when_each_sentinel_has_one_root(input in key_text()) {
+                let n = normalizer();
+                let mut roots = std::collections::BTreeMap::new();
+                for (prefix, sentinel) in rules_for(&n) {
+                    let previous = roots.insert(sentinel.clone(), prefix);
+                    prop_assert!(previous.is_none(), "{} has two roots", sentinel);
+                }
+                let mut restored = n.normalize(&input);
+                for (sentinel, prefix) in &roots {
+                    restored = restored.replace(sentinel.as_str(), prefix);
+                }
+                prop_assert_eq!(restored, input.nfc().collect::<String>());
+            }
+
+            // Relocating a configured root keeps both normalized text and source
+            // identity equal, and the identity carries the path under the root
+            // byte for byte (no NFC, no `.`/`..` folding).
+            #[test]
+            fn configured_root_relocates_losslessly(
+                parent_a in "[a-z]{1,4}",
+                parent_b in "[a-z]{1,4}/[a-z]{1,4}",
+                tail in proptest::collection::vec(
+                    proptest::sample::select(&["src", "lib.rs", ".", "..", "\u{e9}", "e\u{301}"][..]),
+                    1..5,
+                ),
+            ) {
+                let tail = tail.join("/");
+                let root_a = format!("/k/{parent_a}/root");
+                let root_b = format!("/m/{parent_b}/root");
+                let a = PathNormalizer::empty().with_base_dirs(std::slice::from_ref(&root_a));
+                let b = PathNormalizer::empty().with_base_dirs(std::slice::from_ref(&root_b));
+                let path_a = format!("{root_a}/{tail}");
+                let path_b = format!("{root_b}/{tail}");
+
+                let expected_text = format!("<BASE_DIR_0>/{}", tail.nfc().collect::<String>());
+                prop_assert_eq!(a.normalize(&path_a), expected_text.clone());
+                prop_assert_eq!(b.normalize(&path_b), expected_text);
+
+                let expected_identity = format!("<BASE_DIR_0>/{tail}").into_bytes();
+                prop_assert_eq!(
+                    a.source_path_identity(Path::new(&path_a)),
+                    Some(expected_identity.clone())
+                );
+                prop_assert_eq!(
+                    b.source_path_identity(Path::new(&path_b)),
+                    Some(expected_identity)
+                );
+            }
+        }
+    }
 }

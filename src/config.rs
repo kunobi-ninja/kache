@@ -297,8 +297,8 @@ pub struct Config {
     /// Cargo's original incremental argument. User-facing executables first
     /// follow `cache_executables`; the existing intentional managed
     /// passthrough is available only when no fallback owns the compile. This
-    /// is intended for edit-loop-hot leaf crates whose compile cadence
-    /// outruns the adaptive policy's learning window.
+    /// is intended for edit-loop-hot leaf crates that should skip the
+    /// adaptive policy's learning step (its first miss).
     ///
     /// Entries match the exact rustc `--crate-name`; `-` is normalized to `_`
     /// on both sides. A Cargo package name is not authoritative because one

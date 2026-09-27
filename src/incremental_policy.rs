@@ -1,10 +1,10 @@
 //! Conservative policy for isolated incremental rustc passthroughs.
 //!
-//! A normal cache hit is always preferred. After observing two nearby misses
-//! for the same Cargo unit where only source/extern key groups changed, the
-//! second compile may seed a private incremental directory. Successful seeds
-//! enable a small, time-bounded run of early passthroughs before Kache probes
-//! the cache again. An explicit crate force-list can request the same managed
+//! A normal cache hit is always preferred. After observing two misses for the
+//! same Cargo unit in the same target where only source/extern key groups
+//! changed, however far apart, the second compile may seed a private
+//! incremental directory. Successful seeds enable a small, time-bounded run
+//! of early passthroughs before Kache probes the cache again. An explicit crate force-list can request the same managed
 //! directory without the learning step. Every decision is target-local and
 //! protected by a cross-process lock held for the complete compiler invocation.
 
@@ -17,8 +17,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const POLICY_VERSION: &str = "v1";
 const STATE_SCHEMA: u32 = 1;
-const LEARNING_WINDOW_SECS: u64 = 60;
-const ACTIVE_IDLE_SECS: u64 = 30;
+/// How long an active unit may sit idle and still skip the cache: a person
+/// between two edits, not a return to the checkout after a break.
+const ACTIVE_IDLE_SECS: u64 = 15 * 60;
 const MAX_ACTIVE_LEASES: u8 = 8;
 const MAX_STATE_BYTES: u64 = 64 * 1024;
 
@@ -324,7 +325,7 @@ impl AdaptiveUnit {
             return None;
         }
         let prior_observation = previous.observation.as_ref()?;
-        if !qualifying_pair(prior_observation, &fingerprint, now) {
+        if !qualifying_pair(prior_observation, &fingerprint) {
             return None;
         }
         if !ensure_real_directory(&self.rustc_dir) {
@@ -585,9 +586,11 @@ pub(crate) fn key_fingerprint(
     })
 }
 
-fn qualifying_pair(previous: &Observation, current: &KeyFingerprint, now: u64) -> bool {
-    recent(previous.at_secs, now, LEARNING_WINDOW_SECS)
-        && previous.cache_key != current.cache_key
+/// Two misses of one unit that differ only in its sources or dependencies:
+/// someone is editing it. The gap between them does not matter; a person
+/// takes minutes between edits.
+fn qualifying_pair(previous: &Observation, current: &KeyFingerprint) -> bool {
+    previous.cache_key != current.cache_key
         && previous.stable == current.stable
         && previous.sources_externs != current.sources_externs
 }
@@ -1213,7 +1216,7 @@ mod tests {
     }
 
     #[test]
-    fn seed_requires_recent_dynamic_only_change() {
+    fn seed_requires_dynamic_only_change() {
         let (_temp, _args, unit) = fixture();
         teach(&unit, 100);
         assert!(
@@ -1232,14 +1235,20 @@ mod tests {
             )
             .is_none()
         );
-        assert!(
-            unit.try_seed_at(
-                &cache_key("too-late"),
+    }
+
+    #[test]
+    fn a_second_edit_an_hour_later_still_seeds() {
+        let (_temp, _args, unit) = fixture();
+        teach(&unit, 100);
+        let lease = unit
+            .try_seed_at(
+                &cache_key("second"),
                 &fields("stable", "source-b", "extern-a"),
-                161,
+                100 + 3600,
             )
-            .is_none()
-        );
+            .unwrap();
+        assert_eq!(lease.kind(), LeaseKind::Seed);
     }
 
     #[test]
@@ -1260,11 +1269,11 @@ mod tests {
             in_flight: false,
         };
 
-        assert!(active_lease_allowed(&state, 130, true));
+        assert!(active_lease_allowed(&state, 100 + ACTIVE_IDLE_SECS, true));
         state.active_leases = MAX_ACTIVE_LEASES;
-        assert!(!active_lease_allowed(&state, 130, true));
+        assert!(!active_lease_allowed(&state, 100 + ACTIVE_IDLE_SECS, true));
         state.active_leases = 0;
-        assert!(!active_lease_allowed(&state, 131, true));
+        assert!(!active_lease_allowed(&state, 101 + ACTIVE_IDLE_SECS, true));
         assert!(!active_lease_allowed(&state, 100, false));
     }
 

@@ -417,6 +417,33 @@ fn target_cleanup_defaults_and_env_precedence() {
 }
 
 #[test]
+fn target_seeding_is_on_by_default_and_obeys_env_precedence() {
+    let _lock = config_path_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("config.toml");
+    let _config = set_kache_config_for_test(&config_path);
+    let _missing = NamedEnvGuard::remove("KACHE_SEED_NEW_TARGETS");
+    assert!(Config::load().unwrap().seed_new_targets);
+    std::fs::write(&config_path, "[cache]\nseed_new_targets = false\n").unwrap();
+    assert!(!Config::load().unwrap().seed_new_targets);
+    let _on = NamedEnvGuard::set("KACHE_SEED_NEW_TARGETS", "1");
+    assert!(Config::load().unwrap().seed_new_targets);
+    drop(_on);
+    std::fs::write(&config_path, "[cache]\nseed_new_targets = true\n").unwrap();
+    for off in ["0", "false", "FALSE"] {
+        let _off = NamedEnvGuard::set("KACHE_SEED_NEW_TARGETS", off);
+        assert!(!Config::load().unwrap().seed_new_targets, "{off}");
+    }
+    std::fs::write(
+        &config_path,
+        "[cache]\nignore_env = true\nseed_new_targets = true\n",
+    )
+    .unwrap();
+    let _ignored = NamedEnvGuard::set("KACHE_SEED_NEW_TARGETS", "0");
+    assert!(Config::load().unwrap().seed_new_targets);
+}
+
+#[test]
 fn unused_unit_cleanup_defaults_to_thirty_days() {
     let _lock = config_path_lock();
     let dir = tempfile::tempdir().unwrap();
@@ -1637,9 +1664,14 @@ fn every_env_var_config_reads_maps_to_a_config_key() {
         gated, mapped,
         "ignore_env gates exactly the file-backed variables"
     );
+    // KACHE_PULL_REQUEST_PREFIX modifies a remote but does not describe one,
+    // so it must not make the host's [cache.remote] table yield to the
+    // environment.
     let remote: Vec<&str> = ENV_FILE_KEYS
         .iter()
-        .filter(|(_, key)| key.starts_with("cache.remote."))
+        .filter(|(var, key)| {
+            key.starts_with("cache.remote.") && *var != "KACHE_PULL_REQUEST_PREFIX"
+        })
         .map(|(var, _)| *var)
         .collect();
     assert_eq!(remote, REMOTE_ENV_VARS);
@@ -2271,6 +2303,7 @@ fn test_file_config_roundtrip() {
             auto_clean_orphaned_targets: None,
             auto_clean_idle_targets_days: None,
             auto_clean_unused_units_days: None,
+            seed_new_targets: None,
             gc_evict_shared: None,
             storage_layout_advice: None,
             heartbeat_secs: None,
@@ -2318,6 +2351,7 @@ fn test_file_config_roundtrip() {
                 user_agent: None,
                 path: None,
                 atomic_write_dir: None,
+                pull_request_prefix: None,
             }),
             scheduler: None,
         }),
@@ -2789,6 +2823,7 @@ fn test_config_store_dir() {
         cc_extra_allowlist_flags: Vec::new(),
         local_only: false,
         remote_readonly: false,
+        pull_request_prefix: None,
         modified_input_guard: false,
         input_predictions: false,
         record_sessions: false,
@@ -2805,6 +2840,7 @@ fn test_config_store_dir() {
         auto_clean_orphaned_targets: true,
         auto_clean_idle_targets_days: 0,
         auto_clean_unused_units_days: 0,
+        seed_new_targets: false,
         gc_evict_shared: false,
         storage_layout_advice: true,
         heartbeat_secs: 30,
@@ -2860,6 +2896,7 @@ fn test_config_index_db_path() {
         cc_extra_allowlist_flags: Vec::new(),
         local_only: false,
         remote_readonly: false,
+        pull_request_prefix: None,
         modified_input_guard: false,
         input_predictions: false,
         record_sessions: false,
@@ -2876,6 +2913,7 @@ fn test_config_index_db_path() {
         auto_clean_orphaned_targets: true,
         auto_clean_idle_targets_days: 0,
         auto_clean_unused_units_days: 0,
+        seed_new_targets: false,
         gc_evict_shared: false,
         storage_layout_advice: true,
         heartbeat_secs: 30,
@@ -2927,6 +2965,7 @@ fn test_config_event_log_path() {
         cc_extra_allowlist_flags: Vec::new(),
         local_only: false,
         remote_readonly: false,
+        pull_request_prefix: None,
         modified_input_guard: false,
         input_predictions: false,
         record_sessions: false,
@@ -2943,6 +2982,7 @@ fn test_config_event_log_path() {
         auto_clean_orphaned_targets: true,
         auto_clean_idle_targets_days: 0,
         auto_clean_unused_units_days: 0,
+        seed_new_targets: false,
         gc_evict_shared: false,
         storage_layout_advice: true,
         heartbeat_secs: 30,
@@ -3013,6 +3053,7 @@ fn test_config_socket_path() {
         cc_extra_allowlist_flags: Vec::new(),
         local_only: false,
         remote_readonly: false,
+        pull_request_prefix: None,
         modified_input_guard: false,
         input_predictions: false,
         record_sessions: false,
@@ -3029,6 +3070,7 @@ fn test_config_socket_path() {
         auto_clean_orphaned_targets: true,
         auto_clean_idle_targets_days: 0,
         auto_clean_unused_units_days: 0,
+        seed_new_targets: false,
         gc_evict_shared: false,
         storage_layout_advice: true,
         heartbeat_secs: 30,
@@ -3693,6 +3735,7 @@ fn test_save_and_load_file_config() {
             auto_clean_orphaned_targets: None,
             auto_clean_idle_targets_days: None,
             auto_clean_unused_units_days: None,
+            seed_new_targets: None,
             gc_evict_shared: None,
             storage_layout_advice: None,
             heartbeat_secs: None,
@@ -4830,4 +4873,128 @@ fn a_gcs_remote_needs_a_bucket_and_refuses_other_backends_fields() {
         .unwrap_err();
         assert!(error.to_string().contains("do not apply"), "{error:#}");
     }
+}
+
+#[test]
+fn a_pull_request_prefix_must_stay_clear_of_the_base_prefix() {
+    assert_eq!(pull_request_prefix_for("artifacts", "  ").unwrap(), None);
+    assert_eq!(
+        pull_request_prefix_for("artifacts", "artifacts-pr")
+            .unwrap()
+            .as_deref(),
+        Some("artifacts-pr")
+    );
+    for (base, configured) in [
+        ("artifacts", "artifacts"),
+        ("artifacts", "artifacts/pr"),
+        ("shared/artifacts", "shared"),
+        ("", "pr"),
+    ] {
+        assert!(
+            pull_request_prefix_for(base, configured).is_err(),
+            "{base:?} / {configured:?}"
+        );
+    }
+}
+
+fn load_in_ci(event: &str, protected: &str, remote_toml: &str) -> Config {
+    let _guard = config_path_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("kache/config.toml");
+    std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+    std::fs::write(&config_path, remote_toml).unwrap();
+    let _cfg = set_kache_config_for_test(&config_path);
+    let _gha = NamedEnvGuard::set("GITHUB_ACTIONS", "true");
+    let _event = NamedEnvGuard::set("GITHUB_EVENT_NAME", event);
+    let _ref_type = NamedEnvGuard::set("GITHUB_REF_TYPE", "branch");
+    let _protected = NamedEnvGuard::set("GITHUB_REF_PROTECTED", protected);
+    let _gitlab = NamedEnvGuard::remove("GITLAB_CI");
+    let _explicit = NamedEnvGuard::remove("KACHE_REMOTE_READONLY");
+    let _prefix_env = NamedEnvGuard::remove("KACHE_PULL_REQUEST_PREFIX");
+    let _bucket = NamedEnvGuard::remove("KACHE_S3_BUCKET");
+    let _s3_prefix = NamedEnvGuard::remove("KACHE_S3_PREFIX");
+    Config::load().unwrap()
+}
+
+#[test]
+fn a_pull_request_job_with_its_own_prefix_may_write_there() {
+    let with_prefix = "[cache.remote]\ntype = \"s3\"\nbucket = \"b\"\nprefix = \"artifacts\"\n\
+                       pull_request_prefix = \"artifacts-pr\"\n";
+    let config = load_in_ci("pull_request", "false", with_prefix);
+    assert_eq!(config.pull_request_prefix.as_deref(), Some("artifacts-pr"));
+    assert!(!config.remote_readonly);
+
+    let without = "[cache.remote]\ntype = \"s3\"\nbucket = \"b\"\nprefix = \"artifacts\"\n";
+    let config = load_in_ci("pull_request", "false", without);
+    assert_eq!(config.pull_request_prefix, None);
+    assert!(config.remote_readonly, "no prefix of its own: read-only");
+
+    let nested = "[cache.remote]\ntype = \"s3\"\nbucket = \"b\"\nprefix = \"artifacts\"\n\
+                  pull_request_prefix = \"artifacts/pr\"\n";
+    let config = load_in_ci("pull_request", "false", nested);
+    assert_eq!(config.pull_request_prefix, None);
+    assert!(
+        config.remote_readonly,
+        "an unusable prefix leaves the job read-only"
+    );
+
+    let config = load_in_ci("push", "true", with_prefix);
+    assert_eq!(
+        config.pull_request_prefix, None,
+        "a protected push never uses the pull request prefix"
+    );
+    assert!(!config.remote_readonly);
+}
+
+#[test]
+fn a_pull_request_job_never_shares_a_daemon_or_upload_queue_with_a_trusted_job() {
+    let with_prefix = "[cache.remote]\ntype = \"s3\"\nbucket = \"b\"\nprefix = \"artifacts\"\n\
+                       pull_request_prefix = \"artifacts-pr/7\"\n";
+    let pull_request = load_in_ci("pull_request", "false", with_prefix);
+    let push = Config {
+        pull_request_prefix: None,
+        ..pull_request.clone()
+    };
+    assert_eq!(push.socket_path(), push.runtime_dir.join("daemon.sock"));
+    assert_eq!(push.upload_spool_dir(), push.cache_dir.join("upload-queue"));
+
+    let socket = pull_request.socket_path();
+    assert_eq!(socket.parent(), push.socket_path().parent());
+    let name = socket.file_name().unwrap().to_str().unwrap();
+    assert!(
+        name.starts_with("daemon-pr-") && name.ends_with(".sock") && name.len() == 23,
+        "{name}"
+    );
+    let queue = pull_request.upload_spool_dir();
+    assert_eq!(queue.parent(), Some(pull_request.cache_dir.as_path()));
+    assert_eq!(
+        queue.file_name().unwrap().to_str().unwrap(),
+        format!(
+            "upload-queue-{}",
+            &name["daemon-".len()..name.len() - ".sock".len()]
+        )
+    );
+
+    let other = Config {
+        pull_request_prefix: Some("artifacts-pr/8".into()),
+        ..pull_request.clone()
+    };
+    assert_ne!(
+        other.socket_path(),
+        socket,
+        "each prefix gets its own daemon"
+    );
+    assert_ne!(other.upload_spool_dir(), queue);
+}
+
+#[test]
+fn a_scoped_socket_keeps_its_directory_and_extension() {
+    assert_eq!(
+        scoped_socket_path(Path::new("/run/kache/daemon.sock"), "pr-0123abcd"),
+        PathBuf::from("/run/kache/daemon-pr-0123abcd.sock")
+    );
+    assert_eq!(
+        scoped_socket_path(Path::new("/run/kache/pipe"), "pr-0123abcd"),
+        PathBuf::from("/run/kache/pipe-pr-0123abcd")
+    );
 }

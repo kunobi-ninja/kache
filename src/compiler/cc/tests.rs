@@ -3887,8 +3887,8 @@ fn preprocess_dependency_parser_handles_make_escapes_and_continuations() {
 #[test]
 fn cc_memo_os_bytes_preserves_distinct_values() {
     assert_ne!(
-        cc_memo_os_bytes(OsStr::new("compiler-a")),
-        cc_memo_os_bytes(OsStr::new("compiler-b"))
+        crate::cache_key::env_os_key_bytes(OsStr::new("compiler-a")),
+        crate::cache_key::env_os_key_bytes(OsStr::new("compiler-b"))
     );
 }
 

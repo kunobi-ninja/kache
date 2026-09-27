@@ -3,6 +3,13 @@ use std::time::{Duration, Instant};
 
 const CACHE_KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
+fn key_with(dep_info: crate::cache_key::DepInfo) -> crate::cache_key::KeyOutputs {
+    crate::cache_key::KeyOutputs {
+        dep_info: Some(dep_info),
+        ..Default::default()
+    }
+}
+
 struct Fixture {
     dir: tempfile::TempDir,
     config: Config,
@@ -81,6 +88,10 @@ impl Fixture {
         }
     }
 
+    fn key(&self) -> crate::cache_key::KeyOutputs {
+        key_with(self.closure())
+    }
+
     fn publish(&self) {
         let entry_dir = self.store.entry_dir(CACHE_KEY);
         std::fs::create_dir_all(&entry_dir).unwrap();
@@ -108,7 +119,6 @@ fn completion_child() {
         "prefetch" => EventResult::PrefetchHit,
         _ => EventResult::LocalHit,
     };
-    crate::cache_key::stash_last_dep_info_for_test(fixture.closure());
     let restored = fixture.context().restore_and_finish(
         &fixture.store,
         &fixture.meta,
@@ -122,6 +132,7 @@ fn completion_child() {
         },
         29,
         Some(&fixture.store),
+        &fixture.key(),
     );
     let identity = crate::cache_key::rustc_prediction_identity(&fixture.args).unwrap();
     let prediction = fixture.store.file_hasher().input_prediction(&identity);
@@ -133,7 +144,6 @@ fn completion_child() {
         );
         assert!(fixture.args.incremental.as_ref().unwrap().is_dir());
         assert!(prediction.is_none());
-        assert!(crate::cache_key::take_last_dep_info().is_some());
         return;
     }
     restored.unwrap();
@@ -147,7 +157,6 @@ fn completion_child() {
     );
     assert!(!fixture.args.incremental.as_ref().unwrap().exists());
     assert!(prediction.is_some());
-    assert!(crate::cache_key::take_last_dep_info().is_none());
     let events = events::read_events(&fixture.config.event_log_path()).unwrap();
     assert_eq!(events.len(), 1);
     let event = &events[0];
@@ -229,7 +238,6 @@ fn predictions_belong_to_the_key_store_and_are_not_rewritten_when_declined() {
         std::fs::remove_file(fixture.store.blob_path(&file.hash)).unwrap();
     }
     let closure = fixture.closure();
-    crate::cache_key::stash_last_dep_info_for_test(closure.clone());
     fixture
         .context()
         .restore_and_finish(
@@ -241,6 +249,7 @@ fn predictions_belong_to_the_key_store_and_are_not_rewritten_when_declined() {
             FileHashStats::default(),
             0,
             Some(&fixture.store),
+            &fixture.key(),
         )
         .unwrap();
     let identity = crate::cache_key::rustc_prediction_identity(&fixture.args).unwrap();
@@ -255,10 +264,6 @@ fn predictions_belong_to_the_key_store_and_are_not_rewritten_when_declined() {
     );
     assert!(fallback.file_hasher().input_prediction(&identity).is_none());
 
-    crate::cache_key::stash_last_dep_info_for_test(crate::cache_key::DepInfo {
-        source_files: vec!["do-not-record.rs".into()],
-        env_deps: Vec::new(),
-    });
     fixture
         .context()
         .restore_and_finish(
@@ -270,6 +275,10 @@ fn predictions_belong_to_the_key_store_and_are_not_rewritten_when_declined() {
             FileHashStats::default(),
             0,
             None,
+            &key_with(crate::cache_key::DepInfo {
+                source_files: vec!["do-not-record.rs".into()],
+                env_deps: Vec::new(),
+            }),
         )
         .unwrap();
     assert_eq!(
@@ -281,7 +290,6 @@ fn predictions_belong_to_the_key_store_and_are_not_rewritten_when_declined() {
             .sources,
         closure.source_files
     );
-    assert!(crate::cache_key::take_last_dep_info().is_none());
 }
 
 #[test]
@@ -302,7 +310,6 @@ fn remote_hits_report_provenance_and_record_fresh_predictions() {
             fixture.config.socket_path(),
             serde_json::json!({"ok": true, "found": found, "prefetched": prefetched}),
         );
-        crate::cache_key::stash_last_dep_info_for_test(fixture.closure());
         try_rustc_remote_hit(
             &fixture.context(),
             &fixture.store,
@@ -311,6 +318,7 @@ fn remote_hits_report_provenance_and_record_fresh_predictions() {
             FileHashStats::default(),
             29,
             record_closure,
+            &fixture.key(),
         )
         .expect("a committed entry is usable even if the daemon reports found:false")
         .unwrap();
@@ -333,7 +341,6 @@ fn remote_hits_report_provenance_and_record_fresh_predictions() {
         if let Some(prediction) = prediction {
             assert_eq!(prediction.sources, fixture.closure().source_files);
         }
-        assert!(crate::cache_key::take_last_dep_info().is_none());
     }
 }
 
@@ -363,6 +370,7 @@ fn remote_misses_and_failed_restores_do_not_complete_hits() {
             FileHashStats::default(),
             0,
             true,
+            &fixture.key(),
         );
         if mode == "restore-error" {
             assert!(restored.unwrap().is_err());

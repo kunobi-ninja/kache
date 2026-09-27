@@ -4677,23 +4677,6 @@ fn source_date_epoch_passthrough() -> bool {
         .unwrap_or(false)
 }
 
-fn cc_memo_os_bytes(value: &OsStr) -> Vec<u8> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::ffi::OsStrExt;
-        value.as_bytes().to_vec()
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::ffi::OsStrExt;
-        value.encode_wide().flat_map(u16::to_le_bytes).collect()
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        value.to_string_lossy().into_owned().into_bytes()
-    }
-}
-
 fn fold_cc_memo_field(hasher: &mut blake3::Hasher, label: &[u8], value: &[u8]) {
     hasher.update(&(label.len() as u64).to_le_bytes());
     hasher.update(label);
@@ -4839,12 +4822,12 @@ fn cc_preprocess_memo_key(
     fold_cc_memo_field(
         &mut hasher,
         b"compiler-program",
-        cc_memo_os_bytes(OsStr::new(&parsed.program)).as_slice(),
+        crate::cache_key::env_os_key_bytes(OsStr::new(&parsed.program)).as_slice(),
     );
     fold_cc_memo_field(
         &mut hasher,
         b"compiler-path",
-        cc_memo_os_bytes(compiler_path.as_os_str()).as_slice(),
+        crate::cache_key::env_os_key_bytes(compiler_path.as_os_str()).as_slice(),
     );
     fold_cc_memo_field(
         &mut hasher,
@@ -4882,7 +4865,7 @@ fn cc_preprocess_memo_key(
     fold_cc_memo_field(
         &mut hasher,
         b"source-date-epoch",
-        cc_memo_os_bytes(&epoch).as_slice(),
+        crate::cache_key::env_os_key_bytes(&epoch).as_slice(),
     );
     // Likewise the argv: `-I` and the source path carry the checkout root.
     // The maps are folded below, so two trees agree here only when they agree
@@ -4928,11 +4911,13 @@ fn cc_preprocess_memo_key(
                 Some(text) => {
                     let mapped =
                         apply_cc_prefix_maps_to_bytes(text.as_bytes().to_vec(), prefix_maps);
-                    cc_memo_os_bytes(OsStr::new(String::from_utf8_lossy(&mapped).as_ref()))
+                    crate::cache_key::env_os_key_bytes(OsStr::new(
+                        String::from_utf8_lossy(&mapped).as_ref(),
+                    ))
                 }
-                None => cc_memo_os_bytes(&value),
+                None => crate::cache_key::env_os_key_bytes(&value),
             };
-            (cc_memo_os_bytes(&name), mapped)
+            (crate::cache_key::env_os_key_bytes(&name), mapped)
         })
         .collect();
     environment.sort();
@@ -5155,7 +5140,7 @@ fn common_is_temp_dir(common: &Path) -> bool {
 /// The same rewrite the expansion and the resolved tokens already get, so a
 /// path recorded here reads the same from any checkout the maps cover.
 fn cc_mapped_path(path: &Path, prefix_maps: &[CcPrefixMap]) -> String {
-    // Text, not `cc_memo_os_bytes`: that encodes UTF-16 on Windows, and the
+    // Text, not `env_os_key_bytes`: that encodes UTF-16 on Windows, and the
     // map sources and targets are UTF-8, so nothing would ever match and
     // every Windows memo missed. The maps are applied to argv strings the
     // same way.

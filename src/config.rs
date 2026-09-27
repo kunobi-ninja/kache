@@ -16,6 +16,26 @@ pub const DEFAULT_S3_POOL_IDLE_SECS: u64 = 300;
 /// attribution that #618 is about. 0 disables a dimension.
 pub const DEFAULT_PREFETCH_ENABLED: bool = true;
 pub const DEFAULT_REMOTE_KEY_CACHE_REFRESH_SECS: u64 = 60;
+/// The pull request prefix to use, from a configured value: `None` when it is
+/// blank. It must differ from `base` and neither may contain the other, so
+/// that nothing a pull request writes is ever under the base prefix.
+pub(crate) fn pull_request_prefix_for(base: &str, configured: &str) -> Result<Option<String>> {
+    let configured = configured.trim();
+    if configured.is_empty() {
+        return Ok(None);
+    }
+    let prefix = resolve_remote_prefix(configured)?;
+    let nested = |outer: &str, inner: &str| {
+        outer.is_empty() || inner == outer || inner.starts_with(&format!("{outer}/"))
+    };
+    anyhow::ensure!(
+        !prefix.is_empty() && !nested(base, &prefix) && !nested(&prefix, base),
+        "pull_request_prefix {prefix:?} must differ from the remote prefix {base:?} and \
+         neither may contain the other"
+    );
+    Ok(Some(prefix))
+}
+
 /// `remote_key_listing` when neither the environment nor the file sets it:
 /// on for a filesystem remote, where listing is a directory walk that needs
 /// no extra permission; off for S3, where it needs `s3:ListBucket` and costs a
@@ -350,6 +370,13 @@ pub struct Config {
     /// this on. `KACHE_REMOTE_READONLY=0` does not disable that. See
     /// [`crate::policy`].
     pub remote_readonly: bool,
+    /// The prefix this pull request job writes to and reads from after the
+    /// base prefix: `[cache.remote] pull_request_prefix` or
+    /// `KACHE_PULL_REQUEST_PREFIX`, resolved only in a pull request job
+    /// ([`crate::policy::pull_request_job`]). Protected-branch pushes never
+    /// read it. `None` elsewhere, and in a pull request job without it, which
+    /// stays read-only.
+    pub pull_request_prefix: Option<String>,
     /// Opt-in too-new-input guard (kunobi-ninja/kache#324): when on, an
     /// invocation whose keyed inputs were modified at/after the build started is
     /// looked up but NOT stored (its hashes are racy relative to what the
@@ -462,6 +489,11 @@ pub struct Config {
     /// disables it). Set via `KACHE_AUTO_CLEAN_UNUSED_UNITS_DAYS` or
     /// `[cache] auto_clean_unused_units_days`.
     pub auto_clean_unused_units_days: u64,
+    /// Copy another checkout's registry build units into a target directory
+    /// Cargo has not built yet, before Cargo checks freshness. On by
+    /// default. Set via `KACHE_SEED_NEW_TARGETS=0`/`=false` or `[cache]
+    /// seed_new_targets = false` to disable.
+    pub seed_new_targets: bool,
     /// Storage-layout advisories (kunobi-ninja/kache#551): when on (the
     /// default), a cache hit restored by COPY because the storage *layout*
     /// prevents zero-copy dedup — no copy-on-write on the volume, cache and
@@ -793,6 +825,8 @@ pub(crate) struct CacheFileConfig {
     pub(crate) auto_clean_idle_targets_days: Option<u64>,
     /// See [`Config::auto_clean_unused_units_days`].
     pub(crate) auto_clean_unused_units_days: Option<u64>,
+    /// See [`Config::seed_new_targets`].
+    pub(crate) seed_new_targets: Option<bool>,
     /// Namespace-first GC compatibility mode. See [`Config::gc_evict_shared`].
     pub(crate) gc_evict_shared: Option<bool>,
     /// Storage-layout advisory toggle. See [`Config::storage_layout_advice`].
@@ -883,6 +917,8 @@ pub(crate) struct RemoteFileConfig {
     pub(crate) path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) atomic_write_dir: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) pull_request_prefix: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
@@ -1166,6 +1202,7 @@ const IGNORE_ENV_GATED_VARS: &[&str] = &[
     "KACHE_S3_CONCURRENCY",
     "KACHE_PREFETCH_ENABLED",
     "KACHE_REMOTE_KEY_LISTING",
+    "KACHE_PULL_REQUEST_PREFIX",
     "KACHE_REMOTE_KEY_CACHE_REFRESH_SECS",
     "KACHE_REMOTE_RESTORE_TIMEOUT_SECS",
     "KACHE_REMOTE_NEGATIVE_TTL_SECS",
@@ -1201,6 +1238,7 @@ const IGNORE_ENV_GATED_VARS: &[&str] = &[
     "KACHE_AUTO_CLEAN_ORPHANED_TARGETS",
     "KACHE_AUTO_CLEAN_IDLE_TARGETS_DAYS",
     "KACHE_AUTO_CLEAN_UNUSED_UNITS_DAYS",
+    "KACHE_SEED_NEW_TARGETS",
     "KACHE_STORAGE_LAYOUT_ADVICE",
     "KACHE_HEARTBEAT_SECS",
     "KACHE_EXPLAIN_MISS",
@@ -1235,6 +1273,10 @@ const ENV_FILE_KEYS: &[(&str, &str)] = &[
     ("KACHE_S3_CONCURRENCY", "cache.s3_concurrency"),
     ("KACHE_PREFETCH_ENABLED", "cache.prefetch_enabled"),
     ("KACHE_REMOTE_KEY_LISTING", "cache.remote_key_listing"),
+    (
+        "KACHE_PULL_REQUEST_PREFIX",
+        "cache.remote.pull_request_prefix",
+    ),
     ("KACHE_PREFETCH_MAX_KEYS", "cache.prefetch_max_keys"),
     ("KACHE_PREFETCH_MAX_BYTES", "cache.prefetch_max_bytes"),
     (
@@ -1301,6 +1343,7 @@ const ENV_FILE_KEYS: &[(&str, &str)] = &[
         "KACHE_AUTO_CLEAN_UNUSED_UNITS_DAYS",
         "cache.auto_clean_unused_units_days",
     ),
+    ("KACHE_SEED_NEW_TARGETS", "cache.seed_new_targets"),
     ("KACHE_STORAGE_LAYOUT_ADVICE", "cache.storage_layout_advice"),
     ("KACHE_HEARTBEAT_SECS", "cache.heartbeat_secs"),
     ("KACHE_EXPLAIN_MISS", "cache.explain_miss"),
@@ -1854,6 +1897,7 @@ impl Config {
         let auto_clean_orphaned_targets = Self::auto_clean_orphaned_targets_enabled(&file_config);
         let auto_clean_idle_targets_days = Self::auto_clean_idle_targets_days(&file_config);
         let auto_clean_unused_units_days = Self::auto_clean_unused_units_days(&file_config);
+        let seed_new_targets = Self::seed_new_targets_enabled(&file_config);
         let gc_evict_shared = Self::gc_evict_shared_enabled(&file_config);
         let storage_layout_advice = Self::storage_layout_advice_enabled(&file_config);
         let volume_stores = Self::load_volume_stores(&file_config, explicit_max_size);
@@ -1894,6 +1938,34 @@ impl Config {
         };
         let remote_key_listing = explicit_remote_key_listing
             .unwrap_or_else(|| default_remote_key_listing(remote.as_ref()));
+        let pull_request_prefix = if crate::policy::pull_request_job() {
+            remote.as_ref().and_then(|remote| {
+                let configured = env_or_ignored("KACHE_PULL_REQUEST_PREFIX", ignore_env)
+                    .ok()
+                    .or_else(|| {
+                        file_config
+                            .as_ref()
+                            .ok()
+                            .and_then(|config| config.cache.as_ref())
+                            .and_then(|cache| cache.remote.as_ref())
+                            .and_then(|remote| remote.pull_request_prefix.clone())
+                    })?;
+                match pull_request_prefix_for(&remote.prefix, &configured) {
+                    Ok(prefix) => prefix,
+                    Err(error) => {
+                        tracing::warn!("{error:#}; this pull request job stays read-only");
+                        None
+                    }
+                }
+            })
+        } else {
+            None
+        };
+        if pull_request_prefix.is_some() && !Self::remote_readonly_enabled(&file_config) {
+            // The CI policy made this job read-only; writing to its own prefix
+            // is the exception the configuration asked for.
+            remote_readonly = false;
+        }
 
         Ok(Config {
             cache_dir,
@@ -1905,6 +1977,7 @@ impl Config {
             disabled,
             local_only,
             remote_readonly,
+            pull_request_prefix,
             modified_input_guard,
             input_predictions,
             record_sessions,
@@ -1920,6 +1993,7 @@ impl Config {
             auto_clean_orphaned_targets,
             auto_clean_idle_targets_days,
             auto_clean_unused_units_days,
+            seed_new_targets,
             gc_evict_shared,
             storage_layout_advice,
             volume_stores,
@@ -2508,6 +2582,21 @@ impl Config {
             .unwrap_or(true)
     }
 
+    /// Target seeding, on by default. `KACHE_SEED_NEW_TARGETS=0`/`=false`
+    /// (env wins), else `[cache] seed_new_targets`, else on.
+    fn seed_new_targets_enabled(file_config: &Result<FileConfig>) -> bool {
+        let ignore_env = Self::ignore_env_enabled(file_config);
+        if let Ok(v) = env_or_ignored("KACHE_SEED_NEW_TARGETS", ignore_env) {
+            return v != "0" && !v.eq_ignore_ascii_case("false");
+        }
+        file_config
+            .as_ref()
+            .ok()
+            .and_then(|c| c.cache.as_ref())
+            .and_then(|c| c.seed_new_targets)
+            .unwrap_or(true)
+    }
+
     /// Unused-unit cleanup age in days, `30` by default.
     /// `KACHE_AUTO_CLEAN_UNUSED_UNITS_DAYS` (env wins), else `[cache]
     /// auto_clean_unused_units_days`.
@@ -2837,8 +2926,29 @@ impl Config {
         deduped
     }
 
+    /// Queued uploads. A pull request job queues under its own name, so a
+    /// trusted job's daemon sharing the store never replays them into the
+    /// base prefix.
     pub(crate) fn upload_spool_dir(&self) -> PathBuf {
-        self.cache_dir.join("upload-queue")
+        match self.pull_request_scope() {
+            Some(scope) => self.cache_dir.join(format!("upload-queue-{scope}")),
+            None => self.cache_dir.join("upload-queue"),
+        }
+    }
+
+    /// A short name for this job's pull request prefix, when it has one.
+    ///
+    /// A daemon keeps the remote and policy it started with. A pull request
+    /// job that reached a trusted job's daemon would publish into the base
+    /// prefix, and a trusted job that reached a pull request daemon would read
+    /// that pull request's objects. Naming the socket and the upload queue
+    /// after the prefix keeps the two apart even when they share a runtime
+    /// directory and a store.
+    fn pull_request_scope(&self) -> Option<String> {
+        self.pull_request_prefix.as_ref().map(|prefix| {
+            let hash = blake3::hash(prefix.as_bytes()).to_hex();
+            format!("pr-{}", &hash[..8])
+        })
     }
 
     pub fn index_db_path(&self) -> PathBuf {
@@ -2860,10 +2970,15 @@ impl Config {
     }
 
     pub fn socket_path(&self) -> PathBuf {
-        self.socket_path_override
+        let socket = self
+            .socket_path_override
             .as_ref()
             .and_then(|path| resolve_socket_path_override(Some(path.as_os_str().to_owned())))
-            .unwrap_or_else(|| self.runtime_dir.join("daemon.sock"))
+            .unwrap_or_else(|| self.runtime_dir.join("daemon.sock"));
+        match self.pull_request_scope() {
+            Some(scope) => scoped_socket_path(&socket, &scope),
+            None => socket,
+        }
     }
 
     /// Return true when `source_path` matches one of `[cache].exclude`'s glob
@@ -3603,6 +3718,18 @@ pub(crate) fn config_file_path() -> PathBuf {
 
 /// Resolve the daemon endpoint once. Invalid values fall back to the default
 /// instead of reaching daemon startup's `socket_path.parent().unwrap()` calls.
+/// `daemon.sock` becomes `daemon-<scope>.sock` in the same directory.
+fn scoped_socket_path(socket: &Path, scope: &str) -> PathBuf {
+    let mut name = socket.file_stem().unwrap_or_default().to_os_string();
+    name.push("-");
+    name.push(scope);
+    if let Some(extension) = socket.extension() {
+        name.push(".");
+        name.push(extension);
+    }
+    socket.with_file_name(name)
+}
+
 fn resolve_socket_path_override(raw: Option<std::ffi::OsString>) -> Option<PathBuf> {
     let raw = raw?;
     if raw.is_empty() {

@@ -429,7 +429,7 @@ kache install-shims --force ~/.local/lib/kache/shims
 
 Unix only. Creates `cc`, `c++`, `gcc`, `g++`, `clang`, and `clang++` symlinks to Kache. With no directory argument the farm is `~/.local/lib/kache/shims`. `--from-path` also wraps compiler names already on `PATH` (`gcc-13`, target-prefixed drivers). Put the directory before the real compilers in `PATH`. If the directory then holds only Kache links, `install-shims` also writes a `.kache-shims` marker. When Kache looks for the real compiler, it skips everything in a marked directory. A directory that also holds other files, such as a real compiler, is left unmarked.
 
-The links point at a path that survives upgrades when one reaches the running binary: Homebrew's `opt` link, a Nix profile, mise's `latest` alias, or a `kache` on `PATH` outside version directories. Without `--force`, existing entries are kept, except in a directory Kache created, marked, or filled only with Kache links. There a rerun replaces links whose target is missing or not executable, and moves links into a version directory to the upgrade-safe path. See [C and C++](/docs/getting-started/c-cpp#upgrades).
+The links point at a path that survives upgrades when one reaches the running binary: Homebrew's `opt` link, a Nix profile, mise's `latest` alias, or a `kache` on `PATH` outside version directories. Without `--force`, existing entries are kept, except in a directory Kache created, marked, or filled only with Kache links. There a rerun replaces Kache links whose target is missing or not executable, and moves Kache links into a version directory to the upgrade-safe path. Other links are kept. See [C and C++](/docs/getting-started/c-cpp#upgrades).
 
 ## `kache test-runner`
 

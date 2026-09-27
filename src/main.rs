@@ -1020,7 +1020,9 @@ fn main() -> Result<()> {
             force,
             from_path,
         }) => {
-            let dir = dir.unwrap_or_else(compiler::shim::default_shim_dir);
+            let dir = dir
+                .or_else(compiler::shim::default_shim_dir)
+                .context("no home directory; pass the shim directory to use")?;
             let extra = if from_path {
                 compiler::shim::extra_compiler_names_from_env()
             } else {

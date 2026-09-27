@@ -87,9 +87,21 @@ fn canonical_or_original(path: &Path) -> PathBuf {
 /// What is wrong with the binary a service file runs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ServiceExeProblem {
-    Missing { recorded: PathBuf },
-    NotExecutable { recorded: PathBuf },
-    OtherBinary { recorded: PathBuf, current: PathBuf },
+    Missing {
+        recorded: PathBuf,
+    },
+    NotExecutable {
+        recorded: PathBuf,
+    },
+    OtherBinary {
+        recorded: PathBuf,
+        current: PathBuf,
+    },
+    /// The running kache cannot be read, so the two cannot be compared.
+    Unverifiable {
+        recorded: PathBuf,
+        current: PathBuf,
+    },
 }
 
 impl ServiceExeProblem {
@@ -112,6 +124,11 @@ impl ServiceExeProblem {
                 recorded.display(),
                 current.display()
             ),
+            Self::Unverifiable { recorded, current } => format!(
+                "the service runs {}, which cannot be compared with this kache ({}): its file cannot be read",
+                recorded.display(),
+                current.display()
+            ),
         }
     }
 }
@@ -120,6 +137,7 @@ impl ServiceExeProblem {
 fn recorded_exe_problem(
     recorded: &Path,
     current: &Path,
+    current_id: Option<kache_shims::InodeId>,
     fs: &dyn kache_shims::Fs,
 ) -> Option<ServiceExeProblem> {
     let recorded_id = fs.identity(recorded);
@@ -133,17 +151,21 @@ fn recorded_exe_problem(
             recorded: recorded.to_path_buf(),
         });
     }
-    let current_id = fs.identity(current)?;
-    (recorded_id != Some(current_id)).then(|| ServiceExeProblem::OtherBinary {
-        recorded: recorded.to_path_buf(),
-        current: current.to_path_buf(),
-    })
+    let (recorded, current) = (recorded.to_path_buf(), current.to_path_buf());
+    match current_id {
+        None => Some(ServiceExeProblem::Unverifiable { recorded, current }),
+        Some(id) if recorded_id != Some(id) => {
+            Some(ServiceExeProblem::OtherBinary { recorded, current })
+        }
+        Some(_) => None,
+    }
 }
 
 pub(crate) fn service_exe_problem(path: &Path) -> Option<ServiceExeProblem> {
     let recorded = parse_exe_from_service_file(path)?;
-    let current = std::env::current_exe().ok()?;
-    recorded_exe_problem(&recorded, &current, &kache_shims::RealFs)
+    let current = std::env::current_exe().unwrap_or_default();
+    let current_id = kache_shims::running_identity();
+    recorded_exe_problem(&recorded, &current, current_id, &kache_shims::RealFs)
 }
 
 // ── Install ──────────────────────────────────────────────────────
@@ -196,11 +218,16 @@ fn selection_lines(selection: &kache_shims::Selection) -> Vec<String> {
         selection.kind,
         selection.stability
     )];
-    if !selection.stability.survives_upgrade() {
-        lines.push(format!(
+    match selection.stability {
+        kache_shims::Stability::Versioned => lines.push(format!(
             "  Note: {}. Rerun `kache daemon install` after upgrading kache.",
             selection.reason
-        ));
+        )),
+        kache_shims::Stability::Unverified => lines.push(format!(
+            "  Warning: {}. The service may run as a user who cannot reach this path.",
+            selection.reason
+        )),
+        _ => {}
     }
     lines
 }
@@ -1608,32 +1635,41 @@ WantedBy=default.target
         let plain = dir.path().join("plain-kache");
         fs::write(&plain, "").unwrap();
         let real = kache_shims::RealFs;
+        let id = kache_shims::Fs::identity(&real, &current);
+        let check = |recorded: &Path| recorded_exe_problem(recorded, &current, id, &real);
 
-        assert_eq!(recorded_exe_problem(&current, &current, &real), None);
-        assert_eq!(recorded_exe_problem(&link, &current, &real), None);
-        assert_eq!(recorded_exe_problem(&hardlink, &current, &real), None);
+        assert_eq!(check(&current), None);
+        assert_eq!(check(&link), None);
+        assert_eq!(check(&hardlink), None);
         assert_eq!(
-            recorded_exe_problem(&other, &current, &real),
+            check(&other),
             Some(ServiceExeProblem::OtherBinary {
                 recorded: other.clone(),
                 current: current.clone()
             })
         );
         assert_eq!(
-            recorded_exe_problem(&plain, &current, &real),
+            check(&plain),
             Some(ServiceExeProblem::NotExecutable {
                 recorded: plain.clone()
             })
         );
         let gone = dir.path().join("gone");
         assert_eq!(
-            recorded_exe_problem(&gone, &current, &real),
+            check(&gone),
             Some(ServiceExeProblem::Missing {
                 recorded: gone.clone()
             })
         );
-        // A running binary that was replaced leaves nothing to compare.
-        assert_eq!(recorded_exe_problem(&other, &gone, &real), None);
+        // Without the running binary's identity there is nothing to compare
+        // against, which is not the same as healthy.
+        assert_eq!(
+            recorded_exe_problem(&current, &gone, None, &real),
+            Some(ServiceExeProblem::Unverifiable {
+                recorded: current.clone(),
+                current: gone.clone()
+            })
+        );
     }
 
     #[test]
@@ -1661,6 +1697,14 @@ WantedBy=default.target
             .detail(),
             "the service runs /nix/store/abc-kache/bin/kache, a different file from this kache (/usr/bin/kache)"
         );
+        assert_eq!(
+            ServiceExeProblem::Unverifiable {
+                recorded: "/usr/bin/kache".into(),
+                current: "/usr/bin/kache (deleted)".into()
+            }
+            .detail(),
+            "the service runs /usr/bin/kache, which cannot be compared with this kache (/usr/bin/kache (deleted)): its file cannot be read"
+        );
     }
 
     #[test]
@@ -1680,6 +1724,14 @@ WantedBy=default.target
         assert_eq!(lines.len(), 2);
         assert!(
             lines[1].contains("Rerun `kache daemon install`"),
+            "{lines:?}"
+        );
+        selection.stability = kache_shims::Stability::Unverified;
+        let lines = selection_lines(&selection);
+        assert_eq!(lines.len(), 2);
+        assert!(lines[1].starts_with("  Warning: "), "{lines:?}");
+        assert!(
+            lines[1].contains("may run as a user who cannot reach"),
             "{lines:?}"
         );
     }

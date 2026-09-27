@@ -2027,8 +2027,9 @@ pub(crate) mod shim {
     }
 
     /// User-level farm created by `kache install-shims` with no directory argument.
-    pub(crate) fn default_shim_dir() -> PathBuf {
-        farm::default_dir(&dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")))
+    /// `None` without a home directory.
+    pub(crate) fn default_shim_dir() -> Option<PathBuf> {
+        dirs::home_dir().map(|home| farm::default_dir(&home))
     }
 
     /// Compiler names already on PATH that are not in [`farm::SHIM_NAMES`].
@@ -2097,7 +2098,10 @@ pub(crate) mod shim {
         let path = std::env::var_os("PATH").unwrap_or_default();
         let dirs: Vec<PathBuf> = std::env::split_paths(&path).collect();
         let self_exe = std::env::current_exe().ok();
-        let known = [default_shim_dir(), farm::system_dir()];
+        let known: Vec<PathBuf> = default_shim_dir()
+            .into_iter()
+            .chain([farm::system_dir()])
+            .collect();
         farm::status(&dirs, self_exe.as_deref(), &known, &kache_shims::RealFs)
     }
 
@@ -2515,7 +2519,7 @@ mod shim_tests {
 
     #[test]
     fn default_shim_dir_is_the_documented_location() {
-        let home = default_shim_dir();
+        let home = default_shim_dir().expect("tests run with a home directory");
         assert!(
             home.ends_with(".local/lib/kache/shims"),
             "user farm must be ~/.local/lib/kache/shims, got {}",

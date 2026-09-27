@@ -5745,7 +5745,7 @@ pub fn doctor(
         label: "C/C++ shims",
         pass: shim_status.is_active(),
         detail: shim_status.detail(),
-        fix: shim_status.fix(&crate::compiler::shim::default_shim_dir()),
+        fix: shim_status.fix(crate::compiler::shim::default_shim_dir().as_deref()),
     });
 
     // Compiler probe (#626): reported from the live toolchain, bypassing the
@@ -7838,7 +7838,10 @@ fn init_compiler_setup(yes: bool, no_shell: bool, check: bool) -> Result<bool> {
         println!("  • Terminal C/C++ caching: skipped (--no-shell)");
         return Ok(false);
     }
-    let shim_dir = crate::compiler::shim::default_shim_dir();
+    let Some(shim_dir) = crate::compiler::shim::default_shim_dir() else {
+        println!("  • Terminal C/C++ caching: skipped (no home directory)");
+        return Ok(false);
+    };
     let Some((shell, paths)) = shell_startup_files()? else {
         println!("  • Terminal C/C++ caching: shell not supported for automatic setup");
         println!(

@@ -10567,6 +10567,7 @@ fn test_file_hasher_persistent_cache_skips_small_files() {
 
 #[test]
 fn test_dep_info_finds_modules() {
+    let _lock = key_test_lock();
     let dir = tempfile::tempdir().unwrap();
     let src = dir.path().join("src");
     std::fs::create_dir_all(&src).unwrap();
@@ -10611,6 +10612,7 @@ fn test_dep_info_finds_modules() {
 
 #[test]
 fn run_dep_info_pass_errors_on_compile_failure() {
+    let _lock = key_test_lock();
     // A failing dep-info pre-pass must return Err, NOT a crate-root-only
     // DepInfo: keying off an incomplete input set risks a stale-artifact
     // false hit (kunobi-ninja/kache#323). The wrapper turns this Err into a
@@ -10932,6 +10934,7 @@ fn dep_info_pass_args_strips_every_incremental_spelling() {
 
 #[test]
 fn dep_info_pass_prepass_succeeds_through_response_file() {
+    let _lock = key_test_lock();
     // The `use_response_file` path — taken whenever cargo's own argv
     // arrived via `@file` — had no coverage. A crate under a path with
     // spaces exercises the verbatim one-arg-per-line round-trip, which is
@@ -10999,6 +11002,7 @@ fn read_dep_info_file_rejects_non_utf8() {
 
 #[test]
 fn dep_info_pass_prepass_succeeds_with_extra_filename() {
+    let _lock = key_test_lock();
     // End-to-end regression for kunobi-ninja/kache#896: a lib-target argv
     // shaped like cargo's, carrying `-C extra-filename`, must produce a
     // clean pre-pass and the crate's full source closure — not a refusal.
@@ -11228,6 +11232,11 @@ fn test_cache_key_stable_with_module_files() {
 /// `compute_cache_key` reading process-global env directly.
 /// Keep the local name used throughout this large test module while the
 /// underlying lock remains shared with other process-state observers.
+///
+/// Tests that spawn rustc hold it too. A child inherits the current
+/// directory, and a key test that moves into a `TempDir` deletes that
+/// directory once it is done. A rustc started inside that window fails
+/// with "Current directory is invalid", or panics.
 fn key_test_lock() -> crate::test_support::ProcessStateTestGuard {
     process_state_test_lock()
 }

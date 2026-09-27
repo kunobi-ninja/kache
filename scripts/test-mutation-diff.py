@@ -138,6 +138,47 @@ class MutationDiffTests(unittest.TestCase):
         self.assertEqual(self.repo.mutation_diff(self.base, head), "")
 
 
+class HunkOrderTests(unittest.TestCase):
+    """cargo-mutants refuses a diff whose hunks overlap on either side, checked
+    on the header numbers as written."""
+
+    PLAIN = [
+        "diff --git a/x.rs b/x.rs",
+        "--- a/x.rs",
+        "+++ b/x.rs",
+        "@@ -1,2 +1,4 @@",
+        " a",
+        "+moved",
+        "+new",
+        " b",
+        "@@ -3,2 +5,2 @@",
+        " c",
+        "-d",
+        "+e",
+    ]
+
+    def test_a_moved_line_pushes_later_hunks_down_on_the_old_side(self):
+        out = md.rewrite(self.PLAIN, {5})
+        self.assertIn("@@ -1,3 +1,4 @@", out)
+        # The moved line lengthened the first hunk's old side by one.
+        self.assertIn("@@ -4,2 +5,2 @@", out)
+        self.assertTrue(md.well_formed(out))
+
+    def test_without_the_shift_the_hunks_would_overlap(self):
+        unshifted = md.rewrite(self.PLAIN, {5})
+        unshifted[unshifted.index("@@ -4,2 +5,2 @@")] = "@@ -3,2 +5,2 @@"
+        self.assertFalse(md.well_formed(unshifted))
+
+    def test_the_shift_restarts_in_each_file(self):
+        second = [line.replace("x.rs", "y.rs") for line in self.PLAIN]
+        out = md.rewrite(self.PLAIN + second, {5})
+        self.assertEqual(out.count("@@ -3,2 +5,2 @@"), 1, out)
+        self.assertTrue(md.well_formed(out))
+
+    def test_a_hunk_whose_count_is_wrong_is_not_well_formed(self):
+        self.assertFalse(md.well_formed(["@@ -1,2 +1,1 @@", " a", "+b"]))
+
+
 class AlignmentTests(unittest.TestCase):
     ESC = "\x1b[4;35m"
 

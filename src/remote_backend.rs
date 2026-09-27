@@ -1813,6 +1813,26 @@ mod tests {
 
         let listed = view.list("artifacts/k/").await.unwrap();
         assert_eq!(listed, ["artifacts/k/both", "artifacts/k/pr-only"]);
+
+        // Merged objects are read from the pull request prefix alone.
+        let (object, _etag) = view
+            .get_versioned("artifacts/k/both", Some(4096))
+            .await
+            .unwrap()
+            .expect("the pull request's copy");
+        assert_eq!(object.body.to_vec(), b"pr");
+        drop(object);
+        assert!(
+            view.get_versioned("artifacts/k/none", Some(4096))
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        assert_eq!(
+            view.describe("artifacts/k/both"),
+            "memory://test/artifacts/k/both"
+        );
     }
 
     #[tokio::test]

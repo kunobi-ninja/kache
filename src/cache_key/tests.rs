@@ -4872,6 +4872,39 @@ fn tool_version_cache_path_is_a_named_file_in_the_cache_dir() {
     assert!(digest.bytes().all(|byte| byte.is_ascii_hexdigit()));
 }
 
+/// Cargo passes a bare `rustc` when the toolchain's `bin` directory is on
+/// PATH without rustup's proxy. It must find the same cache file as the
+/// path it resolves to; before, it found none and every call spawned
+/// `rustc -vV`.
+#[test]
+fn a_bare_compiler_name_finds_its_version_cache_on_path() {
+    let _lock = key_test_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let empty = tempfile::tempdir().unwrap();
+    let binary = dir.path().join("kache-test-rustc");
+    std::fs::write(&binary, b"test rustc").unwrap();
+    let path_var = std::env::join_paths([empty.path(), dir.path()]).unwrap();
+    let bare = Path::new("kache-test-rustc");
+
+    let resolved = tool_version_cache_path_in(bare, "rustc-ver", Some(&path_var));
+    assert!(resolved.is_some(), "a bare name on PATH has a cache file");
+    assert_eq!(
+        resolved,
+        tool_version_cache_path_in(&binary, "rustc-ver", Some(&path_var))
+    );
+    assert_eq!(
+        tool_version_cache_path_in(bare, "rustc-ver", Some(empty.path().as_os_str())),
+        None,
+        "a bare name absent from PATH has none"
+    );
+    // A name with a directory is not searched for.
+    let relative = Path::new("bin").join("kache-test-rustc");
+    assert_eq!(
+        program_path(&relative, Some(&path_var)).as_deref(),
+        Some(relative.as_path())
+    );
+}
+
 #[test]
 #[ignore = "spawned by the explicit RUSTUP_HOME regression"]
 fn rustup_settings_path_explicit_home_fixture() {

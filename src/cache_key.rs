@@ -7710,7 +7710,16 @@ fn write_tool_version_cache(binary: &Path, prefix: &str, version: &str) {
 /// when the toolchain is updated, plus the rustup toolchain-selection state
 /// (see [`toolchain_selector_fingerprint`]).
 fn tool_version_cache_path(binary: &Path, prefix: &str) -> Option<std::path::PathBuf> {
-    let canon = std::fs::canonicalize(binary).ok()?;
+    tool_version_cache_path_in(binary, prefix, std::env::var_os("PATH").as_deref())
+}
+
+/// [`tool_version_cache_path`] with `PATH` given.
+fn tool_version_cache_path_in(
+    binary: &Path,
+    prefix: &str,
+    path_var: Option<&OsStr>,
+) -> Option<std::path::PathBuf> {
+    let canon = std::fs::canonicalize(program_path(binary, path_var)?).ok()?;
     let mtime = std::fs::metadata(&canon)
         .ok()?
         .modified()
@@ -8314,10 +8323,29 @@ fn get_linker_identity(args: &RustcArgs) -> Option<String> {
 
 /// Resolve a bare command name to a full path by searching PATH.
 fn resolve_in_path(name: &str) -> Option<std::path::PathBuf> {
-    let path_var = std::env::var_os("PATH")?;
-    std::env::split_paths(&path_var)
+    resolve_in(name, &std::env::var_os("PATH")?)
+}
+
+/// The first file named `name` in `path_var`.
+fn resolve_in(name: &str, path_var: &OsStr) -> Option<std::path::PathBuf> {
+    std::env::split_paths(path_var)
         .map(|dir| dir.join(name))
         .find(|p| p.is_file())
+}
+
+/// The file a spawn of `binary` runs: a bare name is searched on `path_var`
+/// as the spawn would, anything with a directory is left as it is. Cargo
+/// hands the wrapper a bare `rustc` when a toolchain's `bin` directory is on
+/// PATH without rustup's proxy, and canonicalizing that name against the
+/// working directory fails.
+fn program_path<'a>(binary: &'a Path, path_var: Option<&OsStr>) -> Option<Cow<'a, Path>> {
+    let mut components = binary.components();
+    match (components.next(), components.next()) {
+        (Some(std::path::Component::Normal(name)), None) => {
+            resolve_in(name.to_str()?, path_var?).map(Cow::Owned)
+        }
+        _ => Some(Cow::Borrowed(binary)),
+    }
 }
 
 #[cfg(test)]

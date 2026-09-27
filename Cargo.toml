@@ -41,15 +41,15 @@ kache-format = { version = "0.27.0", path = "crates/kache-format" }
 kache-store = { version = "0.27.0", path = "crates/kache-store" }
 blake3 = "1"
 bytes = "1"
-# OpenDAL 0.58 publishes its modules as separate crates. Depending on only the
+# OpenDAL publishes its modules as separate crates. Depending on only the
 # core, S3, filesystem, retry, and reqwest transport modules keeps Kache's
 # supported backend set explicit and avoids compiling unused services.
-opendal = { package = "opendal-core", version = "=0.58.2", default-features = false, features = ["executors-tokio"] }
-opendal-http-transport-reqwest = { version = "=0.58.2", default-features = false, features = ["rustls-no-provider"] }
-opendal-layer-retry = { version = "=0.58.2", default-features = false }
-opendal-service-fs = { version = "=0.58.2", default-features = false }
-opendal-service-s3 = { version = "=0.58.2", default-features = false }
-opendal-service-gcs = { version = "=0.58.2", default-features = false }
+opendal = { package = "opendal-core", version = "=0.59.3", default-features = false, features = ["executors-tokio"] }
+opendal-http-transport-reqwest = { version = "=0.59.3", default-features = false, features = ["rustls-no-provider"] }
+opendal-layer-retry = { version = "=0.59.3", default-features = false }
+opendal-service-fs = { version = "=0.59.3", default-features = false }
+opendal-service-s3 = { version = "=0.59.3", default-features = false }
+opendal-service-gcs = { version = "=0.59.3", default-features = false }
 # OpenDAL exposes a custom credential chain but not a profile-name shortcut.
 # These published reqsign APIs preserve Kache's explicit profile selection
 # (including SSO and credential_process) without a git-only patch.

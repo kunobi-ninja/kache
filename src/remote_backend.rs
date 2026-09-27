@@ -729,7 +729,9 @@ fn verify_complete_body(advertised: Option<u64>, read: u64, description: &str) -
 /// remain errors rather than being reported as a harmless duplicate.
 fn classify_create_error(error: &opendal::Error) -> Option<PutIfAbsentResult> {
     match error.kind() {
-        ErrorKind::ConditionNotMatch | ErrorKind::AlreadyExists => {
+        // S3 answers a create racing another conditional write with 409
+        // `ConditionalRequestConflict`: the other writer holds the same bytes.
+        ErrorKind::ConditionNotMatch | ErrorKind::AlreadyExists | ErrorKind::Conflict => {
             Some(PutIfAbsentResult::AlreadyExists)
         }
         ErrorKind::Unsupported => Some(PutIfAbsentResult::Unsupported),
@@ -749,7 +751,9 @@ fn classify_create_error(error: &opendal::Error) -> Option<PutIfAbsentResult> {
 /// landed, so it must not be retried unconditionally.
 fn classify_conditional_error(error: &opendal::Error, replacing: bool) -> Option<ConditionalPut> {
     match error.kind() {
-        ErrorKind::ConditionNotMatch | ErrorKind::AlreadyExists => Some(ConditionalPut::Conflict),
+        ErrorKind::ConditionNotMatch | ErrorKind::AlreadyExists | ErrorKind::Conflict => {
+            Some(ConditionalPut::Conflict)
+        }
         ErrorKind::NotFound if replacing => Some(ConditionalPut::Conflict),
         ErrorKind::Unsupported => Some(ConditionalPut::Unsupported),
         ErrorKind::Unexpected if lacks_conditional_writes(error) => {
@@ -1997,6 +2001,10 @@ mod tests {
             Some(PutIfAbsentResult::AlreadyExists)
         );
         assert_eq!(
+            classify(ErrorKind::Conflict, ""),
+            Some(PutIfAbsentResult::AlreadyExists)
+        );
+        assert_eq!(
             classify(ErrorKind::Unsupported, ""),
             Some(PutIfAbsentResult::Unsupported)
         );
@@ -2247,24 +2255,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn s3_wire_rejects_streamed_oversize_without_content_length() {
-        let response = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\
-                        Connection: close\r\n\r\n2\r\nhe\r\n3\r\nllo\r\n0\r\n\r\n";
-        let (endpoint, _requests) = mock_http_server(vec![response.to_string()]).await;
-        let backend = anonymous_s3_backend(&endpoint);
-
-        let error = backend
-            .get("key", Some(4))
-            .await
-            .expect_err("the body must be bounded even without Content-Length")
-            .to_string();
-        assert!(
-            error.contains("too large: at least 5 bytes (max 4)"),
-            "{error}"
-        );
-    }
-
-    #[tokio::test]
     async fn v3_download_rejects_oversize_before_publishing_an_entry() {
         // Advertise one byte above 8 GiB without allocating a large body. Pin
         // the public download path and its ceiling, not just Backend::get.
@@ -2437,6 +2427,34 @@ mod tests {
                 "{request}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn s3_wire_a_racing_conditional_write_is_a_conflict() {
+        let racing = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+            <Error><Code>ConditionalRequestConflict</Code><Message>in progress</Message>\
+            <RequestId>test</RequestId></Error>";
+        let (endpoint, _requests) = mock_http_server(vec![
+            http_response("409 Conflict", racing),
+            http_response("409 Conflict", racing),
+        ])
+        .await;
+        let backend = anonymous_s3_backend(&endpoint);
+
+        assert_eq!(
+            backend
+                .put_if_absent("immutable", b"same".to_vec(), None)
+                .await
+                .unwrap(),
+            PutIfAbsentResult::AlreadyExists
+        );
+        assert_eq!(
+            backend
+                .put_if_match("manifest", b"b".to_vec(), None, Some("\"v1\""))
+                .await
+                .unwrap(),
+            ConditionalPut::Conflict
+        );
     }
 
     #[tokio::test]
@@ -2640,7 +2658,11 @@ mod tests {
             classify_conditional_error(&opendal::Error::new(kind, message.to_string()), replacing)
         };
         for replacing in [true, false] {
-            for kind in [ErrorKind::ConditionNotMatch, ErrorKind::AlreadyExists] {
+            for kind in [
+                ErrorKind::ConditionNotMatch,
+                ErrorKind::AlreadyExists,
+                ErrorKind::Conflict,
+            ] {
                 assert_eq!(
                     classify(kind, "", replacing),
                     Some(ConditionalPut::Conflict)

@@ -184,6 +184,12 @@ pub struct ModifySpec {
     /// Replacement substring. Must change the preprocessed/compiled
     /// output (not just a comment) so the cache key actually diverges.
     pub replace: String,
+    /// Stdout the edited program must print. When set, the phase runs the
+    /// fixture's `[verify]` command with these strings in place of its own,
+    /// so a stale binary restored from the cache fails the phase even when
+    /// the miss counts look right. Empty = the phase skips verify.
+    #[serde(default)]
+    pub expected_stdout_contains: Vec<String>,
 }
 
 /// Required shell commands. `build` runs the compiler under kache;

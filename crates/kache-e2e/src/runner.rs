@@ -14,6 +14,7 @@
 //! metric assertions impossible to write tightly.
 
 use anyhow::{Context, Result};
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Instant;
@@ -732,17 +733,8 @@ fn run_phase(
         ));
     }
 
-    // Verify: run the artifact, check stdout contract. Skipped for
-    // `relocate-modified` — that phase edits the source, so the
-    // program's output no longer matches the fixture's contract.
-    let verify = if phase.runs_verify() {
-        fixture
-            .verify
-            .as_ref()
-            .map(|v| run_verify(v, fixture, cwd, cache_dir))
-    } else {
-        None
-    };
+    // Verify: run the artifact, check stdout contract.
+    let verify = phase_verify_spec(phase, fixture).map(|v| run_verify(&v, fixture, cwd, cache_dir));
 
     let (typed, raw) = report::fetch(kache_path, cache_dir)?;
     // Per-phase delta: subtract the previous cumulative summary so
@@ -1041,6 +1033,25 @@ fn run_step(
 }
 
 /// Run [`Verify::run`] in `cwd`, check exit + stdout contract.
+/// The `[verify]` contract a phase checks, if any. `relocate-modified` edited
+/// the source, so the fixture's stdout contract no longer holds there: that
+/// phase checks the edit's own `expected_stdout_contains`, and skips verify
+/// when the fixture declares none.
+fn phase_verify_spec(phase: Phase, fixture: &Fixture) -> Option<Cow<'_, Verify>> {
+    let verify = fixture.verify.as_ref()?;
+    if phase.runs_verify() {
+        return Some(Cow::Borrowed(verify));
+    }
+    let modify = fixture.modify.as_ref()?;
+    if modify.expected_stdout_contains.is_empty() {
+        return None;
+    }
+    Some(Cow::Owned(Verify {
+        expected_stdout_contains: modify.expected_stdout_contains.clone(),
+        ..verify.clone()
+    }))
+}
+
 fn run_verify(spec: &Verify, fixture: &Fixture, cwd: &Path, cache_dir: &Path) -> VerifyResult {
     let output = match Command::new("sh")
         .arg("-c")
@@ -1340,6 +1351,7 @@ mod tests {
         KeytraceFields, artifact_candidates, inspect_restored_depinfo, key_divergence_report,
         keytrace_dir, parse_keytrace, render_key_divergence, resolve_artifact,
     };
+    use crate::phase::Phase;
     use std::path::{Path, PathBuf};
 
     /// A realistic tracing line, so the `[key:` offset arithmetic is exercised
@@ -1587,6 +1599,57 @@ mod tests {
             windows: None,
             dir: PathBuf::new(),
         }
+    }
+
+    fn verify_fixture(modify_stdout: Option<&[&str]>) -> crate::fixture::Fixture {
+        let mut fixture = dummy_shim_fixture(false);
+        fixture.verify = Some(crate::fixture::Verify {
+            run: "./app".into(),
+            expected_exit_code: 0,
+            expected_stdout_contains: vec!["v1".into()],
+            timeout_s: 30,
+            forbidden_substrings: vec!["/home/".into()],
+            required_substrings: Vec::new(),
+            required_substrings_linux: Vec::new(),
+        });
+        fixture.modify = modify_stdout.map(|stdout| crate::fixture::ModifySpec {
+            file: "value.txt".into(),
+            find: "v1".into(),
+            replace: "v2".into(),
+            expected_stdout_contains: stdout.iter().map(|s| s.to_string()).collect(),
+        });
+        fixture
+    }
+
+    #[test]
+    fn unmodified_phases_verify_the_fixture_contract() {
+        let fixture = verify_fixture(Some(&["v2"]));
+        for phase in [Phase::Cold, Phase::Warm, Phase::Noop, Phase::Relocate] {
+            let spec = super::phase_verify_spec(phase, &fixture).expect("verify runs");
+            assert_eq!(spec.expected_stdout_contains, ["v1"], "{phase:?}");
+        }
+    }
+
+    #[test]
+    fn relocate_modified_verifies_the_edited_stdout() {
+        let fixture = verify_fixture(Some(&["v2"]));
+        let spec = super::phase_verify_spec(Phase::RelocateModified, &fixture)
+            .expect("an expected stdout on the edit turns verify on");
+        assert_eq!(spec.expected_stdout_contains, ["v2"]);
+        // The rest of the contract carries over.
+        assert_eq!(spec.run, "./app");
+        assert_eq!(spec.forbidden_substrings, ["/home/"]);
+    }
+
+    #[test]
+    fn relocate_modified_skips_verify_without_an_edited_stdout() {
+        for fixture in [verify_fixture(Some(&[])), verify_fixture(None)] {
+            assert!(super::phase_verify_spec(Phase::RelocateModified, &fixture).is_none());
+        }
+        let mut fixture = verify_fixture(Some(&["v2"]));
+        fixture.verify = None;
+        assert!(super::phase_verify_spec(Phase::RelocateModified, &fixture).is_none());
+        assert!(super::phase_verify_spec(Phase::Cold, &fixture).is_none());
     }
 
     #[test]

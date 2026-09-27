@@ -30,6 +30,7 @@ came from the second pass.
 | User `--remap-path-prefix` | `e2e-rust-remap-prefix` |
 | Out-of-tree / symlinked target dir | `e2e-rust-out-of-tree-target`, `e2e-rust-symlinked-target` |
 | Rust + C FFI (`cc` crate via build.rs) | `e2e-rust-c-ffi` |
+| Native archive reached only through a dependency re-keys the binary (#1301) | `e2e-rust-transitive-native` |
 | Cached `--test` executable permission contract (#298) | `e2e-rust-test-exec` |
 | Exclude rules (`.kache.toml [cache].exclude`) | `e2e-exclude-rust`, `e2e-exclude-c` |
 | Bypass rules (`[cache].bypass_env` / `_argv` / `_crates`, #222) | `e2e-bypass-rules` |

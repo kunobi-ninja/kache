@@ -43,7 +43,8 @@ impl Phase {
         !matches!(self, Phase::Noop | Phase::RelocateNoop)
     }
 
-    /// Should this phase run runtime verification?
+    /// Does this phase check the fixture's own `[verify]` contract? The
+    /// edited `relocate-modified` build checks `[modify]`'s stdout instead.
     pub(crate) fn runs_verify(self) -> bool {
         !matches!(self, Phase::RelocateModified)
     }

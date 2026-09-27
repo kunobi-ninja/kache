@@ -1,0 +1,5 @@
+# `app` reaches the C library only through `mid`: it has no dependency on
+# `native`, so the static archive is not among app's direct `--extern`s.
+[workspace]
+members = ["native", "mid", "app"]
+resolver = "2"

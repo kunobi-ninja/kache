@@ -1,0 +1,63 @@
+# kache-e2e fixture for kunobi-ninja/kache#1301.
+#
+# `native` compiles csrc/value.c into a static library with the `cc` crate,
+# and rustc bundles it into native's rlib. `mid` depends on `native`; `app`
+# depends only on `mid`. The archive therefore reaches app's link through
+# `-L dependency=` and never as one of app's own `--extern`s.
+#
+# Editing value.c changes what app links, while every Rust source and the
+# rmeta files app reads stay the same. Before #1182 app's key did not cover
+# archives reached this way, so the rebuild restored the old binary and it
+# printed the old value.
+#
+# Contracts:
+#   1. relocate-modified: after the edit app misses, and the binary prints
+#      the new value.
+#   2. relocate: with no edit, the same workspace hits at another path with
+#      no misses, so the archive digest in app's key is path-independent.
+
+name = "e2e-rust-transitive-native"
+tags = ["suite:e2e", "lang:rust", "lang:cc", "case:ffi"]
+
+# Windows would need the windows-gnu target and compiler shims that
+# e2e-rust-c-ffi sets up. The keying under test is the same on every OS.
+os = ["linux", "macos"]
+
+[source]
+kind = "fixture"
+path = "source"
+
+[env]
+RUSTC_WRAPPER = "$KACHE"
+
+[commands]
+build = "cargo build --release"
+clean = "rm -rf target"
+
+[verify]
+run = "./target/release/app"
+expected_stdout_contains = ["transitive-native: 41"]
+
+[modify]
+file = "native/csrc/value.c"
+find = "return 41"
+replace = "return 42"
+expected_stdout_contains = ["transitive-native: 42"]
+
+[assertions.cold]
+min_entries_after = 1
+
+[assertions.warm]
+min_hits = 3
+
+[assertions.noop]
+should_not_recompile = true
+recompile_marker = "Compiling"
+
+[assertions.relocate]
+min_hits = 3
+max_misses = 0
+
+# Pinned to app: the edit must re-key the binary that links the archive.
+[assertions.relocate-modified]
+min_misses_per_crate = { app = 1 }

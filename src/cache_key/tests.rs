@@ -11403,6 +11403,39 @@ fn first_rustc_error_line_matches_unnumbered_human_errors() {
     assert_eq!(line, "error: expected one of `!` or `::`");
 }
 
+/// The deleted-cwd panic, as rustc 1.98 prints it: the panic, a backtrace,
+/// then the generic banner. Only the panic's message names the cause.
+#[test]
+fn first_rustc_error_line_prefers_a_compiler_panic_message() {
+    let stderr = "\nthread 'main' (21712) panicked at compiler/rustc_span/src/source_map.rs:221:14:\n\
+                  expecting a current working directory to exist: Os { code: 2 }\n\
+                  stack backtrace:\n\
+                  error: the compiler unexpectedly panicked. This is a bug\n";
+    assert_eq!(
+        first_rustc_error_line(stderr),
+        Some("expecting a current working directory to exist: Os { code: 2 }")
+    );
+    // Older toolchains print no thread id.
+    let stderr = "thread 'rustc' panicked at src/lib.rs:1:1:\n\nboom\n";
+    assert_eq!(first_rustc_error_line(stderr), Some("boom"));
+}
+
+#[test]
+fn first_rustc_error_line_keeps_a_panic_header_with_no_message() {
+    let stderr = "thread 'rustc' panicked at src/lib.rs:1:1:\n  \n";
+    assert_eq!(
+        first_rustc_error_line(stderr),
+        Some("thread 'rustc' panicked at src/lib.rs:1:1:")
+    );
+    // A panic header needs both the thread prefix and "panicked at".
+    for stderr in [
+        "note: a thread panicked at startup\nwarning: noise\nerror: real cause\n",
+        "thread 'x' started\nwarning: noise\nerror: real cause\n",
+    ] {
+        assert_eq!(first_rustc_error_line(stderr), Some("error: real cause"));
+    }
+}
+
 #[test]
 fn first_rustc_error_line_falls_back_to_the_first_content_line() {
     // rustc killed by a signal, or a wrapper that failed before rustc ran,
@@ -11705,23 +11738,23 @@ fn opt_out_key_is_path_local_but_default_stays_portable() {
     // Two identical crates at DIFFERENT paths; source arg is relative
     // ("lib.rs") so cwd is the only thing that varies — exactly what cargo
     // passes and what makes `comp_dir` the discriminator.
-    let dir_a = tempfile::tempdir().unwrap();
-    let dir_b = tempfile::tempdir().unwrap();
-    std::fs::write(dir_a.path().join("lib.rs"), "pub fn f() {}\n").unwrap();
-    std::fs::write(dir_b.path().join("lib.rs"), "pub fn f() {}\n").unwrap();
+    let dir_a = crate::test_support::cwd_dir();
+    let dir_b = crate::test_support::cwd_dir();
+    std::fs::write(dir_a.join("lib.rs"), "pub fn f() {}\n").unwrap();
+    std::fs::write(dir_b.join("lib.rs"), "pub fn f() {}\n").unwrap();
     let args = base_args(Path::new("lib.rs"));
 
     // SAFETY: env access is serialized by the process-state test lock; restored below.
     unsafe { std::env::set_var("KACHE_RUSTC_PATH_NORMALIZE", "0") };
-    std::env::set_current_dir(dir_a.path()).unwrap();
+    std::env::set_current_dir(&dir_a).unwrap();
     let optout_a = key_for(&args);
-    std::env::set_current_dir(dir_b.path()).unwrap();
+    std::env::set_current_dir(&dir_b).unwrap();
     let optout_b = key_for(&args);
 
     restore_env_var("KACHE_RUSTC_PATH_NORMALIZE", None);
-    std::env::set_current_dir(dir_a.path()).unwrap();
+    std::env::set_current_dir(&dir_a).unwrap();
     let default_a = key_for(&args);
-    std::env::set_current_dir(dir_b.path()).unwrap();
+    std::env::set_current_dir(&dir_b).unwrap();
     let default_b = key_for(&args);
 
     std::env::set_current_dir(&old_cwd).unwrap();
@@ -11825,10 +11858,10 @@ fn coverage_key_is_path_local() {
     let old_var = std::env::var_os("KACHE_RUSTC_PATH_NORMALIZE");
     restore_env_var("KACHE_RUSTC_PATH_NORMALIZE", None);
 
-    let dir_a = tempfile::tempdir().unwrap();
-    let dir_b = tempfile::tempdir().unwrap();
-    std::fs::write(dir_a.path().join("lib.rs"), "pub fn f() {}\n").unwrap();
-    std::fs::write(dir_b.path().join("lib.rs"), "pub fn f() {}\n").unwrap();
+    let dir_a = crate::test_support::cwd_dir();
+    let dir_b = crate::test_support::cwd_dir();
+    std::fs::write(dir_a.join("lib.rs"), "pub fn f() {}\n").unwrap();
+    std::fs::write(dir_b.join("lib.rs"), "pub fn f() {}\n").unwrap();
     let mut args = base_args(Path::new("lib.rs"));
     args.push("-Cinstrument-coverage".to_string());
 
@@ -11840,9 +11873,9 @@ fn coverage_key_is_path_local() {
         "test must exercise the coverage remap:none path, not the opt-out path"
     );
 
-    std::env::set_current_dir(dir_a.path()).unwrap();
+    std::env::set_current_dir(&dir_a).unwrap();
     let cov_a = key_for(&args);
-    std::env::set_current_dir(dir_b.path()).unwrap();
+    std::env::set_current_dir(&dir_b).unwrap();
     let cov_b = key_for(&args);
 
     std::env::set_current_dir(&old_cwd).unwrap();

@@ -2610,7 +2610,7 @@ mod tests {
     #[test]
     fn dep_paths_are_keyed_by_content_only_when_absolute_and_present() {
         let mut lock = crate::test_support::process_state_test_lock();
-        let dir = lock.enter(tempfile::tempdir().unwrap());
+        let dir = lock.enter();
         let config = crate::test_support::test_config(dir.as_path().join("cache"));
         let run = Run {
             store: Store::open(&config).unwrap(),
@@ -2830,7 +2830,7 @@ mod tests {
     #[test]
     fn a_links_dependency_is_keyed_by_its_text_with_the_roots_mapped() {
         let mut lock = crate::test_support::process_state_test_lock();
-        let dir = lock.enter(tempfile::tempdir().unwrap());
+        let dir = lock.enter();
         let config = crate::test_support::test_config(dir.as_path().join("cache"));
         let prediction = prediction_with(Some(Vec::new()), true);
         let key_in = |target: &str, content: &dyn Fn(&Path) -> String| {
@@ -2865,7 +2865,7 @@ mod tests {
     #[test]
     fn a_recorded_run_restores_under_another_out_dir() {
         let mut lock = crate::test_support::process_state_test_lock();
-        let dir = lock.enter(tempfile::tempdir().unwrap());
+        let dir = lock.enter();
         let config = crate::test_support::test_config(dir.as_path().join("cache"));
         let run_in = |target: &str| {
             let environment =
@@ -2931,7 +2931,7 @@ mod tests {
     #[test]
     fn a_links_dependency_outside_the_target_is_keyed_by_its_bytes() {
         let mut lock = crate::test_support::process_state_test_lock();
-        let dir = lock.enter(tempfile::tempdir().unwrap());
+        let dir = lock.enter();
         let config = crate::test_support::test_config(dir.as_path().join("cache"));
         let prediction = prediction_with(Some(Vec::new()), true);
         let system = dir.as_path().join("usr/include");

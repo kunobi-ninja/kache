@@ -7615,7 +7615,7 @@ fn memo_key_maps_environment_values_like_arguments() {
 #[test]
 fn out_dir_and_sdk_maps_follow_the_environment_and_the_normalize_switch() {
     let mut lock = crate::test_support::process_state_test_lock();
-    let dir = lock.enter(tempfile::tempdir().unwrap());
+    let dir = lock.enter();
     let out = dir.as_path().join("target/debug/build/pkg-1/out");
     std::fs::create_dir_all(&out).unwrap();
     std::fs::write(dir.as_path().join("a.c"), "int a;\n").unwrap();
@@ -7703,7 +7703,7 @@ fn out_dir_and_sdk_maps_follow_the_environment_and_the_normalize_switch() {
 #[test]
 fn remembered_prefix_maps_follow_the_configured_base_dirs() {
     let mut lock = crate::test_support::process_state_test_lock();
-    let dir = lock.enter(tempfile::tempdir().unwrap());
+    let dir = lock.enter();
     std::fs::write(dir.as_path().join("a.c"), "int a;\n").unwrap();
     let saved: Vec<(&str, Option<std::ffi::OsString>)> = [
         "OUT_DIR",

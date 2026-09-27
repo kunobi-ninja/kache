@@ -7270,11 +7270,21 @@ fn closure_shaping_args(source_file: &Path, rustc_args: &[String]) -> Vec<String
 /// Prefer the first error-level line in either `--error-format=json` or human
 /// form, and fall back to the first non-empty line when nothing looks like an
 /// error (`rustc` can die on a signal, or a wrapper can fail before rustc runs).
+///
+/// A compiler panic is the exception. rustc prints the panic first, then a
+/// generic "error: the compiler unexpectedly panicked" banner, and only the
+/// panic's message says what went wrong, so that message wins.
 pub(crate) fn first_rustc_error_line(stderr: &str) -> Option<&str> {
     let mut fallback = None;
-    for line in stderr.lines() {
+    let mut lines = stderr.lines();
+    while let Some(line) = lines.next() {
         if line.trim().is_empty() {
             continue;
+        }
+        if is_panic_header(line)
+            && let Some(message) = lines.clone().find(|next| !next.trim().is_empty())
+        {
+            return Some(message);
         }
         // JSON: `{"$message_type":"diagnostic",…,"level":"error",…}`.
         // Human: `error: …` or `error[E0433]: …` at column 0 — indented lines
@@ -7288,6 +7298,12 @@ pub(crate) fn first_rustc_error_line(stderr: &str) -> Option<&str> {
         fallback.get_or_insert(line);
     }
     fallback
+}
+
+/// `thread 'rustc' panicked at compiler/…/source_map.rs:221:14:`, the line
+/// before a panic's message. Newer toolchains add the thread id after the name.
+fn is_panic_header(line: &str) -> bool {
+    line.starts_with("thread '") && line.contains(" panicked at ")
 }
 
 /// Run `rustc --emit=dep-info` as a pre-pass to discover source files and env deps.

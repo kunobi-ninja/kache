@@ -8,35 +8,24 @@ static PROCESS_STATE_TEST_LOCK: Mutex<()> = Mutex::new(());
 /// Holds the process-state lock and puts the current directory back where it
 /// was once the guard drops.
 ///
-/// A test that moves into a `TempDir` and then panics never reaches its own
-/// restore line, and unwinding deletes the directory the process is standing
-/// in. From then on every `std::env::current_dir()` in the binary goes through
-/// libc's `getcwd` fallback, which climbs `..` and reads each parent directory
-/// to recover the name; under a `$TMPDIR` full of test scratch that costs
-/// seconds per call, and the rest of the run crawls. The mutation lane saw
-/// this as a mutant the key tests do observe scoring TIMEOUT instead of
-/// caught, because the failing test was one of the two that change directory.
+/// A test that moves into a directory and then panics never reaches its own
+/// restore line. The guard restores the directory for it: otherwise the next
+/// `std::env::current_dir()` in the binary goes through libc's `getcwd`
+/// fallback, which climbs `..` and reads each parent directory to recover the
+/// name; under a `$TMPDIR` full of test scratch that costs seconds per call,
+/// and the rest of the run crawls. The mutation lane saw this as a mutant the
+/// key tests do observe scoring TIMEOUT instead of caught, because the failing
+/// test was one of the two that change directory.
 pub(crate) struct ProcessStateTestGuard {
     original_dir: Option<PathBuf>,
-    // Declared before the lock: fields drop in order, after `Drop::drop` has
-    // put the directory back.
-    entered_dir: Option<tempfile::TempDir>,
     _lock: MutexGuard<'static, ()>,
 }
 
 impl ProcessStateTestGuard {
-    /// Make `dir` the current directory until the guard drops, and keep it
-    /// alive until then.
-    ///
-    /// A `TempDir` the test declares after the guard drops before it, so the
-    /// directory would be deleted while the process still stands in it. Tests
-    /// that read `current_dir()` without the lock, such as those deriving an
-    /// event root from it, then get an error for that window and fail at
-    /// random.
-    pub(crate) fn enter(&mut self, dir: tempfile::TempDir) -> PathBuf {
-        let path = dir.path().to_path_buf();
+    /// Make a fresh [`cwd_dir`] the current directory until the guard drops.
+    pub(crate) fn enter(&mut self) -> PathBuf {
+        let path = cwd_dir();
         std::env::set_current_dir(&path).unwrap();
-        self.entered_dir = Some(dir);
         path
     }
 }
@@ -52,6 +41,43 @@ impl Drop for ProcessStateTestGuard {
     }
 }
 
+/// Directories tests made the current directory, kept until the binary exits.
+///
+/// A child process inherits the current directory when it starts. A test that
+/// spawns rustc without the lock can therefore start it inside another test's
+/// directory, and rustc can still be starting when that test finishes. rustc
+/// panics when its working directory no longer exists ("expecting a current
+/// working directory to exist"), so deleting the directory at the end of the
+/// test failed unrelated dep-info tests at random.
+static CWD_DIRS: Mutex<Vec<tempfile::TempDir>> = Mutex::new(Vec::new());
+
+/// A new directory a test may make the current directory. It stays on disk
+/// until the test binary exits; see [`CWD_DIRS`].
+pub(crate) fn cwd_dir() -> PathBuf {
+    static REMOVE_AT_EXIT: std::sync::Once = std::sync::Once::new();
+    REMOVE_AT_EXIT.call_once(|| {
+        // SAFETY: registers a plain function that captures nothing. Exiting
+        // runs it after the harness has joined every test, so no child a test
+        // spawned is still running.
+        unsafe { libc::atexit(remove_cwd_dirs) };
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+    CWD_DIRS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .push(dir);
+    path
+}
+
+extern "C" fn remove_cwd_dirs() {
+    // Unwinding out of an `extern "C"` function aborts, so skip a poisoned
+    // lock rather than unwrap it.
+    if let Ok(mut dirs) = CWD_DIRS.lock() {
+        dirs.clear();
+    }
+}
+
 /// Keep a poisoned lock usable so one failing test does not cascade into
 /// unrelated failures.
 pub(crate) fn process_state_test_lock() -> ProcessStateTestGuard {
@@ -60,7 +86,6 @@ pub(crate) fn process_state_test_lock() -> ProcessStateTestGuard {
         .unwrap_or_else(|error| error.into_inner());
     ProcessStateTestGuard {
         original_dir: std::env::current_dir().ok(),
-        entered_dir: None,
         _lock: lock,
     }
 }
@@ -156,7 +181,7 @@ pub(crate) fn test_config(cache_dir: PathBuf) -> crate::config::Config {
 
 #[cfg(test)]
 mod tests {
-    use super::process_state_test_lock;
+    use super::{cwd_dir, process_state_test_lock};
 
     #[test]
     fn dropping_the_guard_restores_the_current_directory() {
@@ -168,11 +193,11 @@ mod tests {
             let _lock = process_state_test_lock();
             std::env::current_dir().unwrap()
         };
-        let scratch = tempfile::tempdir().unwrap();
+        let scratch = cwd_dir();
 
         {
             let _lock = process_state_test_lock();
-            std::env::set_current_dir(scratch.path()).unwrap();
+            std::env::set_current_dir(&scratch).unwrap();
             assert_ne!(std::env::current_dir().unwrap(), original);
         }
 
@@ -188,12 +213,11 @@ mod tests {
     }
 
     #[test]
-    fn an_entered_dir_lives_until_the_guard_has_restored_the_directory() {
+    fn an_entered_dir_outlives_the_guard() {
         let (original, entered) = {
             let mut lock = process_state_test_lock();
             let original = std::env::current_dir().unwrap();
-            let entered = lock.enter(tempfile::tempdir().unwrap());
-            assert!(entered.is_dir(), "the guard keeps the entered dir alive");
+            let entered = lock.enter();
             assert_eq!(
                 std::env::current_dir().unwrap().canonicalize().unwrap(),
                 entered.canonicalize().unwrap()
@@ -203,6 +227,10 @@ mod tests {
 
         let _lock = process_state_test_lock();
         assert_eq!(std::env::current_dir().unwrap(), original);
-        assert!(!entered.exists(), "the entered dir goes with the guard");
+        // A child another test started in it may still be running.
+        assert!(
+            entered.is_dir(),
+            "the entered dir stays until the binary exits"
+        );
     }
 }

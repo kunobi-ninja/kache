@@ -344,6 +344,17 @@ pub fn codegen_backend_dylib(unstable_flags: &[String]) -> Option<&str> {
         .filter(|backend| backend.contains('.'))
 }
 
+/// The last `codegen-backend=` value among `-Z` flags, when it names a backend
+/// rustc loads from its sysroot: not a dylib path, and not `llvm` or `dummy`,
+/// which are built into rustc.
+pub fn codegen_backend_name(unstable_flags: &[String]) -> Option<&str> {
+    unstable_flags
+        .iter()
+        .rev()
+        .find_map(|flag| flag.strip_prefix("codegen-backend="))
+        .filter(|backend| !backend.contains('.') && !matches!(*backend, "" | "llvm" | "dummy"))
+}
+
 /// Whether kache can key a trusted backend dylib by the file it hashes.
 ///
 /// A value without a path separator (`x.so`) is handed to the platform
@@ -750,6 +761,12 @@ impl RustcArgs {
         codegen_backend_dylib(&self.unstable_flags)
     }
 
+    /// The toolchain codegen backend this compile loads by name, when
+    /// `-Zcodegen-backend` selects one (see [`codegen_backend_name`]).
+    pub fn codegen_backend_name(&self) -> Option<&str> {
+        codegen_backend_name(&self.unstable_flags)
+    }
+
     /// Derive the workspace root from `--out-dir`. Cargo invokes
     /// rustc with `--out-dir <workspace>/target/<profile>/deps`, so
     /// three `parent()` steps land on the workspace root.
@@ -1107,6 +1124,27 @@ fn record_codegen_opt(parsed: &mut RustcArgs, value: &str) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn codegen_backend_name_is_a_sysroot_backend() {
+        let flags = |values: &[&str]| values.iter().map(|v| v.to_string()).collect::<Vec<_>>();
+        let name = |values: &[&str]| codegen_backend_name(&flags(values)).map(str::to_string);
+        assert_eq!(name(&[]), None);
+        assert_eq!(
+            name(&["codegen-backend=cranelift"]).as_deref(),
+            Some("cranelift")
+        );
+        for builtin in ["llvm", "dummy", ""] {
+            assert_eq!(name(&[&format!("codegen-backend={builtin}")]), None);
+        }
+        assert_eq!(name(&["codegen-backend=librustc_codegen_x.so"]), None);
+        assert_eq!(
+            name(&["codegen-backend=cranelift", "codegen-backend=gcc"]).as_deref(),
+            Some("gcc"),
+            "the last codegen-backend wins"
+        );
+        assert_eq!(name(&["codegen-backend=gcc", "codegen-backend=llvm"]), None);
+    }
+
     #[test]
     fn codegen_backend_dylib_follows_rustc_selection() {
         let flags = |values: &[&str]| values.iter().map(|v| v.to_string()).collect::<Vec<_>>();

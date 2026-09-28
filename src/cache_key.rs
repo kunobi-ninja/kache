@@ -2972,6 +2972,31 @@ fn compute_key_into(
         hasher.update(b"\n");
         tracing::trace!("[key:{}] unstable:{}", crate_name, z);
     }
+    // A backend selected by name (`cranelift`, `gcc`) is a library in the
+    // toolchain that `rustc -vV` does not describe: a toolchain built from
+    // source can replace it without reporting a new version.
+    if let Some(backend) = args.codegen_backend_name() {
+        for (library, content) in
+            toolchain_codegen_backends(args, &rustc_version, backend, file_hasher)?
+        {
+            fold_field(
+                &mut hasher,
+                b"codegen_backend_library.v1:",
+                library.as_bytes(),
+            );
+            fold_field(
+                &mut hasher,
+                b"codegen_backend_content.v1:",
+                content.as_bytes(),
+            );
+            tracing::trace!(
+                "[key:{}] codegen_backend_library:{} {}",
+                crate_name,
+                library,
+                content
+            );
+        }
+    }
 
     // Parallel frontend compilation changes the compiler execution mode and
     // can affect emitted artifacts. Preserve occurrence order because rustc
@@ -7665,7 +7690,12 @@ pub(crate) fn get_rustc_sysroot(args: &RustcArgs) -> Option<PathBuf> {
     if let Some(sysroot) = &args.sysroot {
         return Some(sysroot.clone());
     }
-    let rustc = &args.rustc;
+    default_rustc_sysroot(&args.rustc)
+}
+
+/// `rustc --print sysroot` without `--sysroot`: the toolchain's own sysroot,
+/// file-cached like the version probe.
+fn default_rustc_sysroot(rustc: &Path) -> Option<PathBuf> {
     if let Some(cached) = read_tool_version_cache(rustc, "rustc-sysroot") {
         return Some(PathBuf::from(cached));
     }
@@ -7683,6 +7713,82 @@ pub(crate) fn get_rustc_sysroot(args: &RustcArgs) -> Option<PathBuf> {
     }
     write_tool_version_cache(rustc, "rustc-sysroot", &sysroot);
     Some(PathBuf::from(sysroot))
+}
+
+/// The libraries rustc may load for the codegen backend `name`, with their
+/// content hashes, under an explicit `--sysroot` and under the toolchain's own
+/// sysroot. Both are hashed because which one rustc searches first depends on
+/// its release. Finding none is an error, so the compile is not cached under a
+/// key that describes no backend.
+fn toolchain_codegen_backends(
+    args: &RustcArgs,
+    rustc_version: &str,
+    name: &str,
+    file_hasher: &FileHasher,
+) -> Result<Vec<(String, String)>> {
+    let host = rustc_host_triple(rustc_version).context("rustc -vV reports no host")?;
+    let sysroots = args
+        .sysroot
+        .iter()
+        .cloned()
+        .chain(default_rustc_sysroot(&args.rustc));
+    let found = codegen_backend_libraries(sysroots, host, name, file_hasher)?;
+    anyhow::ensure!(
+        !found.is_empty(),
+        "codegen backend {name} is not installed in the toolchain"
+    );
+    Ok(found)
+}
+
+/// `{DLL_PREFIX}rustc_codegen_<name>[-<release>]{DLL_SUFFIX}` in each
+/// sysroot's `lib/rustlib/<host>/codegen-backends`, where rustc looks for a
+/// backend it loads by name, as (file name, content hash) in sysroot order.
+fn codegen_backend_libraries(
+    sysroots: impl IntoIterator<Item = PathBuf>,
+    host: &str,
+    name: &str,
+    file_hasher: &FileHasher,
+) -> Result<Vec<(String, String)>> {
+    let stem = format!("rustc_codegen_{name}");
+    let mut found = Vec::new();
+    for sysroot in sysroots {
+        let directory = sysroot
+            .join("lib")
+            .join("rustlib")
+            .join(host)
+            .join("codegen-backends");
+        let entries = match std::fs::read_dir(&directory) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            entries => entries.with_context(|| format!("listing {}", directory.display()))?,
+        };
+        let mut libraries = BTreeMap::new();
+        for entry in entries {
+            let path = entry?.path();
+            if let Some(library) = path
+                .file_name()
+                .and_then(|file| file.to_str())
+                .filter(|file| is_codegen_backend_library(file, &stem))
+            {
+                libraries.insert(library.to_string(), path.clone());
+            }
+        }
+        for (library, path) in libraries {
+            let content = file_hasher
+                .hash(&path)
+                .with_context(|| format!("hashing codegen backend {}", path.display()))?;
+            found.push((library, content));
+        }
+    }
+    Ok(found)
+}
+
+/// Whether `file` is a library rustc loads for the backend whose library
+/// stem is `stem` (`rustc_codegen_cranelift`), bare or release-suffixed.
+fn is_codegen_backend_library(file: &str, stem: &str) -> bool {
+    file.strip_prefix(std::env::consts::DLL_PREFIX)
+        .and_then(|file| file.strip_suffix(std::env::consts::DLL_SUFFIX))
+        .and_then(|file| file.strip_prefix(stem))
+        .is_some_and(|release| release.is_empty() || release.starts_with('-'))
 }
 
 /// Read a cached tool-version string.  Returns `None` on any failure (missing

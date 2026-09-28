@@ -8266,9 +8266,27 @@ fn codegen_backend_dylib_is_keyed_by_content_not_path() {
     let rebuilt = key_of_flags(&flag_base(&source, &[&flag(&clone_a)]));
     assert_ne!(a, rebuilt, "a rebuilt backend must change the key");
 
-    let cranelift = key_of_flags(&flag_base(&source, &["-Zcodegen-backend=cranelift"]));
-    let gcc = key_of_flags(&flag_base(&source, &["-Zcodegen-backend=gcc"]));
-    assert_ne!(cranelift, gcc, "toolchain backend names stay keyed");
+    let sysroot = dir.path().join("sysroot");
+    let backends = sysroot_codegen_backends(&sysroot);
+    for name in ["cranelift", "gcc"] {
+        std::fs::write(backends.join(backend_library(name, "")), b"same bytes").unwrap();
+    }
+    let named = |name: &str| {
+        key_of_flags(&flag_base(
+            &source,
+            &[
+                "--sysroot",
+                &sysroot.to_string_lossy(),
+                &format!("-Zcodegen-backend={name}"),
+            ],
+        ))
+    };
+    let cranelift = named("cranelift");
+    assert_ne!(
+        cranelift,
+        named("gcc"),
+        "toolchain backend names stay keyed"
+    );
     assert_ne!(cranelift, a);
 
     let missing = dir.path().join("missing.so");
@@ -8284,6 +8302,129 @@ fn codegen_backend_dylib_is_keyed_by_content_not_path() {
         .is_err(),
         "an unreadable backend must not produce a key"
     );
+}
+
+/// `<sysroot>/lib/rustlib/<host>/codegen-backends`, created, for the rustc
+/// the key tests run.
+fn sysroot_codegen_backends(sysroot: &Path) -> PathBuf {
+    let version = get_rustc_version(Path::new("rustc")).unwrap();
+    let backends = sysroot
+        .join("lib")
+        .join("rustlib")
+        .join(rustc_host_triple(&version).unwrap())
+        .join("codegen-backends");
+    std::fs::create_dir_all(&backends).unwrap();
+    backends
+}
+
+/// The file name rustc loads for backend `name`, with `release` appended.
+fn backend_library(name: &str, release: &str) -> String {
+    format!(
+        "{}rustc_codegen_{name}{release}{}",
+        std::env::consts::DLL_PREFIX,
+        std::env::consts::DLL_SUFFIX
+    )
+}
+
+/// A backend selected by name is keyed by the library rustc loads for it,
+/// so a toolchain whose backend is rebuilt in place, with the same
+/// `rustc -vV`, does not serve outputs of the old backend.
+#[test]
+fn named_codegen_backend_is_keyed_by_its_library() {
+    let _lock = key_test_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("lib.rs");
+    std::fs::write(&source, b"pub fn hello() {}").unwrap();
+    let sysroot = dir.path().join("sysroot");
+    let backends = sysroot_codegen_backends(&sysroot);
+    let key = |name: &str| {
+        let mut parsed = RustcArgs::parse(&flag_base(
+            &source,
+            &[
+                "--sysroot",
+                &sysroot.to_string_lossy(),
+                &format!("-Zcodegen-backend={name}"),
+            ],
+        ))
+        .unwrap();
+        parsed.source_file = None;
+        compute_cache_key(
+            &parsed,
+            &FileHasher::new(),
+            &PathNormalizer::empty(),
+            &KeyEnv::default(),
+        )
+    };
+
+    assert!(
+        key("kachetest").is_err(),
+        "a backend that is not installed must not produce a key"
+    );
+    std::fs::write(backends.join(backend_library("kachetest", "")), b"v1").unwrap();
+    let first = key("kachetest").unwrap();
+    std::fs::write(
+        backends.join(backend_library("kachetest", "")),
+        b"v2 rebuilt",
+    )
+    .unwrap();
+    let rebuilt = key("kachetest").unwrap();
+    assert_ne!(first, rebuilt, "a rebuilt backend must change the key");
+
+    // Other files in the directory are not this backend.
+    std::fs::write(backends.join(backend_library("kachetest_other", "")), b"x").unwrap();
+    std::fs::write(backends.join("librustc_codegen_kachetest.a"), b"x").unwrap();
+    assert_eq!(rebuilt, key("kachetest").unwrap());
+
+    std::fs::write(
+        backends.join(backend_library("kachetest", "-1.99.0-nightly")),
+        b"release",
+    )
+    .unwrap();
+    assert_ne!(
+        rebuilt,
+        key("kachetest").unwrap(),
+        "the release-suffixed library is one rustc loads too"
+    );
+}
+
+/// Every sysroot rustc may search contributes its backend libraries; a
+/// sysroot without a `codegen-backends` directory contributes none.
+#[test]
+fn codegen_backend_libraries_span_every_sysroot() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = "aarch64-apple-darwin";
+    let sysroot = |name: &str| dir.path().join(name);
+    for (name, content) in [
+        ("explicit", b"explicit".as_slice()),
+        ("default", b"default"),
+    ] {
+        let backends = sysroot(name)
+            .join("lib")
+            .join("rustlib")
+            .join(host)
+            .join("codegen-backends");
+        std::fs::create_dir_all(&backends).unwrap();
+        std::fs::write(backends.join(backend_library("gcc", "")), content).unwrap();
+    }
+    let hasher = FileHasher::new();
+    let libraries = |sysroots: &[&str]| {
+        codegen_backend_libraries(
+            sysroots.iter().map(|name| sysroot(name)),
+            host,
+            "gcc",
+            &hasher,
+        )
+        .unwrap()
+    };
+
+    let both = libraries(&["missing", "explicit", "default"]);
+    assert_eq!(both.len(), 2);
+    assert!(
+        both.iter()
+            .all(|(file, _)| *file == backend_library("gcc", ""))
+    );
+    assert_ne!(both[0].1, both[1].1);
+    assert!(libraries(&["missing"]).is_empty());
 }
 
 /// H2: `--sysroot` selects which std rustc links against; with the

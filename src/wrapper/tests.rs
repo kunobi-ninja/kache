@@ -9036,6 +9036,33 @@ fn a_key_from_emitted_dep_info_always_arms_the_too_new_guard() {
     );
 }
 
+/// Only a compile that reports its dep-info and does not link may start
+/// before its key: a stopped rustc must not leave a linker behind.
+#[test]
+fn only_a_non_linking_compile_that_reports_its_dep_info_is_stopped_on_a_hit() {
+    let parse = |crate_type: &str, json: bool| {
+        let mut argv = vec![
+            "rustc",
+            "--crate-name",
+            "x",
+            "src/lib.rs",
+            "--crate-type",
+            crate_type,
+            "--emit=dep-info,metadata,link",
+        ];
+        if json {
+            argv.extend(["--error-format=json", "--json=artifacts"]);
+        }
+        RustcArgs::parse(&argv.iter().map(|a| a.to_string()).collect::<Vec<_>>()).unwrap()
+    };
+    assert!(stop_on_hit_allowed(&parse("lib", true)));
+    assert!(stop_on_hit_allowed(&parse("rlib", true)));
+    assert!(!stop_on_hit_allowed(&parse("lib", false)));
+    for linked in ["bin", "proc-macro", "cdylib", "dylib"] {
+        assert!(!stop_on_hit_allowed(&parse(linked, true)), "{linked}");
+    }
+}
+
 #[test]
 fn a_rederivation_never_waits_on_a_discovery_flight() {
     let dir = tempfile::tempdir().unwrap();
@@ -9047,7 +9074,7 @@ fn a_rederivation_never_waits_on_a_discovery_flight() {
         Some(config.cache_dir.clone())
     );
     assert_eq!(
-        flights(KeyDiscovery::Deferrable),
+        flights(KeyDiscovery::Deferrable { stop_on_hit: true }),
         Some(config.cache_dir.clone())
     );
     assert_eq!(

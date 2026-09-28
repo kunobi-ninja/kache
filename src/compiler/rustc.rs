@@ -131,6 +131,26 @@ impl RustcCompiler {
             compile::IncrementalMode::Strip,
             None,
             metadata_sink,
+            None,
+        )
+    }
+
+    /// [`Self::execute_streaming`], asking `on_dep_info` once rustc has
+    /// written the dep-info whether to carry on. `false` stops rustc there:
+    /// nothing has reached Cargo yet, and the result is a failed compile
+    /// with no artifacts.
+    pub(crate) fn execute_streaming_until_dep_info(
+        &self,
+        parsed: &RustcArgs,
+        on_dep_info: &mut dyn FnMut() -> bool,
+    ) -> Result<CompileResult> {
+        self.execute_with_args(
+            parsed,
+            &parsed.all_args,
+            compile::IncrementalMode::Strip,
+            None,
+            Some(&mut std::io::stderr()),
+            Some(on_dep_info),
         )
     }
 
@@ -148,6 +168,7 @@ impl RustcCompiler {
             compile::IncrementalMode::PreserveIsolated,
             None,
             Some(&mut std::io::stderr()),
+            None,
         )
     }
 
@@ -165,6 +186,7 @@ impl RustcCompiler {
             compile::IncrementalMode::PreserveIsolated,
             Some(true),
             Some(&mut std::io::stderr()),
+            None,
         )
     }
 
@@ -175,6 +197,7 @@ impl RustcCompiler {
         incremental_mode: compile::IncrementalMode,
         skip_remap_override: Option<bool>,
         metadata_sink: Option<&mut dyn std::io::Write>,
+        on_dep_info: Option<&mut dyn FnMut() -> bool>,
     ) -> Result<CompileResult> {
         // The invocation and key must use the same path-normalization rules.
         let workspace_root = parsed.path_normalization_root();
@@ -216,6 +239,7 @@ impl RustcCompiler {
             &path_normalizer,
             incremental_mode,
             metadata_sink,
+            on_dep_info,
         )
     }
 }

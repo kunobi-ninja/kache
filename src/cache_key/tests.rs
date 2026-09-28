@@ -1715,6 +1715,44 @@ fn a_crate_the_store_never_held_defers_discovery() {
             "an entry for the crate may match: predictions={predictions}"
         );
     }
+
+    // Compiling while keying defers that case too, but not as a certain
+    // miss: the wrapper still stops the compile if the emitted closure hits.
+    let while_keying = |hasher: &FileHasher<'_>, defer: bool| {
+        set_defer_discovery(defer);
+        set_compile_while_keying(true);
+        let outcome = resolve_key_inputs(
+            &args,
+            hasher,
+            "x",
+            &KeyEnv::default(),
+            &mut KeyOutputs::default(),
+        );
+        set_compile_while_keying(false);
+        set_defer_discovery(false);
+        outcome.err().and_then(|error| {
+            error
+                .downcast_ref::<DeferredDiscovery>()
+                .map(|d| d.miss_certain)
+        })
+    };
+    {
+        let hasher = FileHasher::persistent(&db).with_prediction_flights(flights.clone());
+        assert_eq!(while_keying(&hasher, true), Some(false));
+    }
+    {
+        let hasher = FileHasher::persistent(&db).with_prediction_flights(flights.clone());
+        assert_eq!(
+            while_keying(&hasher, false),
+            None,
+            "only with deferral allowed"
+        );
+    }
+    assert_eq!(
+        while_keying(&FileHasher::persistent(&db), true),
+        None,
+        "without a flight nobody owns the unit"
+    );
 }
 
 /// Every build script is `build_script_build`; Cargo's `-C metadata` hash
@@ -12896,9 +12934,9 @@ fn key_matrix_error_format_does_not_change_key() {
 
 #[test]
 fn a_deferred_discovery_says_so_when_displayed() {
-    let text = DeferredDiscovery.to_string();
+    let text = DeferredDiscovery { miss_certain: true }.to_string();
     assert!(text.contains("deferred"), "{text}");
-    let error: anyhow::Error = DeferredDiscovery.into();
+    let error: anyhow::Error = DeferredDiscovery { miss_certain: true }.into();
     assert!(error.downcast_ref::<DeferredDiscovery>().is_some());
 }
 

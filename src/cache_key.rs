@@ -1075,15 +1075,22 @@ thread_local! {
     /// May the key refuse to discover a closure it has no record of, so the
     /// wrapper compiles first and keys from the dep-info rustc emits?
     static DEFER_DISCOVERY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// May the key also defer when a hit is possible, because the wrapper
+    /// will stop the compile if the emitted closure keys to a stored entry?
+    static COMPILE_WHILE_KEYING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// A closure handed in by the wrapper after such a compile: the next key
     /// computation uses it instead of a record or a pre-pass.
     static PROVIDED_DEP_INFO: std::cell::RefCell<Option<(DepInfo, Option<String>)>> = const { std::cell::RefCell::new(None) };
 }
 
-/// The key stopped before discovering the closure: no record, and the wrapper
-/// allowed compiling first (see [`set_defer_discovery`]).
+/// The key stopped before discovering the closure, and the wrapper compiles
+/// first (see [`set_defer_discovery`]). With `miss_certain`, no entry for the
+/// unit can exist; without it, the wrapper keys from the dep-info the compile
+/// writes early and stops the compile on a hit ([`set_compile_while_keying`]).
 #[derive(Debug)]
-pub struct DeferredDiscovery;
+pub struct DeferredDiscovery {
+    pub miss_certain: bool,
+}
 
 impl std::fmt::Display for DeferredDiscovery {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1102,6 +1109,14 @@ pub fn set_defer_discovery(allowed: bool) {
     DEFER_DISCOVERY.with(|cell| cell.set(allowed));
 }
 
+/// Also defer when an entry could exist: the pre-pass would take as long as
+/// the compile takes to write its own dep-info, so the wrapper starts the
+/// compile, keys from that dep-info, and stops the compile if the key hits.
+/// Only meaningful with [`set_defer_discovery`] on.
+pub fn set_compile_while_keying(allowed: bool) {
+    COMPILE_WHILE_KEYING.with(|cell| cell.set(allowed));
+}
+
 /// Use `dep_info` for the next key computed on this thread.
 ///
 /// `tree` is the tree digest the deferred computation took before the
@@ -1110,6 +1125,13 @@ pub fn set_defer_discovery(allowed: bool) {
 /// inputs with a new digest.
 pub fn provide_dep_info(dep_info: DepInfo, tree: Option<String>) {
     PROVIDED_DEP_INFO.with(|cell| *cell.borrow_mut() = Some((dep_info, tree)));
+}
+
+/// Is a closure from [`provide_dep_info`] waiting for the next key? It came
+/// from a compile, so that key must arm the too-new guard: an input written
+/// since may not be what the compiler read.
+pub fn dep_info_provided() -> bool {
+    PROVIDED_DEP_INFO.with(|cell| cell.borrow().is_some())
 }
 
 /// The closure rustc wrote to `path` during the compile whose crate root is
@@ -2313,7 +2335,22 @@ fn resolve_key_inputs(
             {
                 crate::phase_trace::decision("prediction", "deferred-new-crate");
                 tracing::trace!("[key:{}] inputs=deferred(new crate)", crate_name);
-                return Err(anyhow::Error::new(DeferredDiscovery));
+                return Err(anyhow::Error::new(DeferredDiscovery { miss_certain: true }));
+            }
+            Err(reason)
+                if owns_flight
+                    && DEFER_DISCOVERY.with(std::cell::Cell::get)
+                    && COMPILE_WHILE_KEYING.with(std::cell::Cell::get) =>
+            {
+                crate::phase_trace::decision("prediction", reason.as_str());
+                tracing::trace!(
+                    "[key:{}] inputs=compile-while-keying({})",
+                    crate_name,
+                    reason.as_str()
+                );
+                return Err(anyhow::Error::new(DeferredDiscovery {
+                    miss_certain: false,
+                }));
             }
             Err(reason) => {
                 crate::phase_trace::decision("prediction", reason.as_str());

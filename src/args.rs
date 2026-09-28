@@ -908,6 +908,30 @@ impl RustcArgs {
         ))
     }
 
+    /// Does rustc report the files it writes as JSON artifact messages
+    /// (`--error-format=json --json=artifacts`, as Cargo asks)? Only then
+    /// does it say when the dep-info is complete.
+    pub fn reports_artifacts(&self) -> bool {
+        let mut json_errors = false;
+        let mut artifacts = false;
+        let mut args = self.all_args.iter();
+        while let Some(arg) = args.next() {
+            let (flag, value) = match arg.split_once('=') {
+                Some((flag, value)) if flag.starts_with("--") => (flag, Some(value.to_string())),
+                _ => (arg.as_str(), None),
+            };
+            let value = || value.clone().or_else(|| args.clone().next().cloned());
+            match flag {
+                "--error-format" => json_errors = value().as_deref() == Some("json"),
+                "--json" => {
+                    artifacts |= value().is_some_and(|v| v.split(',').any(|v| v == "artifacts"))
+                }
+                _ => {}
+            }
+        }
+        json_errors && artifacts
+    }
+
     /// Path of the Cargo-facing rustc dep-info output for this invocation.
     ///
     /// Cargo's normal invocation uses `<out-dir>/<crate><extra>.d`. Explicit
@@ -2714,5 +2738,27 @@ mod tests {
         ]);
         assert!(other_wrapper.inner_rustc.is_some());
         assert!(!other_wrapper.is_clippy_chain(), "not the clippy driver");
+    }
+    #[test]
+    fn rustc_reports_artifacts_only_with_json_errors_and_the_artifacts_notification() {
+        let parse = |extra: &[&str]| {
+            let mut argv = vec!["rustc", "--crate-name", "x", "src/lib.rs"];
+            argv.extend_from_slice(extra);
+            RustcArgs::parse(&argv.iter().map(|a| a.to_string()).collect::<Vec<_>>()).unwrap()
+        };
+        assert!(
+            parse(&[
+                "--error-format=json",
+                "--json=diagnostic-rendered-ansi,artifacts"
+            ])
+            .reports_artifacts()
+        );
+        assert!(parse(&["--error-format", "json", "--json", "artifacts"]).reports_artifacts());
+        assert!(
+            !parse(&["--error-format=json", "--json=diagnostic-rendered-ansi"]).reports_artifacts()
+        );
+        assert!(!parse(&["--json=artifacts"]).reports_artifacts());
+        assert!(!parse(&["--error-format=human", "--json=artifacts"]).reports_artifacts());
+        assert!(!parse(&[]).reports_artifacts());
     }
 }

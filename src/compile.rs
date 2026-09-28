@@ -102,6 +102,7 @@ pub fn run_rustc(
     path_normalizer: &crate::path_normalizer::PathNormalizer,
     incremental_mode: IncrementalMode,
     metadata_sink: Option<&mut dyn Write>,
+    on_dep_info: Option<&mut dyn FnMut() -> bool>,
 ) -> Result<CompileResult> {
     // Pre-clean output paths: remove any read-only hardlinks left by a previous
     // kache cache hit. Without this, rustc cannot overwrite the 0444 hardlinked
@@ -192,7 +193,13 @@ pub fn run_rustc(
     let child_stdout = child.stdout.take().context("capturing rustc stdout")?;
     let child_stderr = child.stderr.take().context("capturing rustc stderr")?;
     let forwarding_metadata = metadata_sink.is_some();
-    let captured = capture_rustc_output(&mut child, child_stdout, child_stderr, metadata_sink);
+    let captured = capture_rustc_output_with(
+        &mut child,
+        child_stdout,
+        child_stderr,
+        metadata_sink,
+        on_dep_info,
+    );
     drop(compiler_trace);
     drop(response_file);
     if let Some(monitor) = monitor {
@@ -227,7 +234,7 @@ pub fn run_rustc(
     // for invocations that don't emit those messages (a bare `rustc`
     // without `--json=artifacts`), where filename guessing is the best
     // available signal.
-    let artifacts = if exit_code == 0 {
+    let artifacts = if exit_code == 0 && !captured_stderr.stopped {
         let from_json = resolve_artifacts(&captured_stderr.artifacts);
         if from_json.is_empty() {
             tracing::debug!(
@@ -261,11 +268,24 @@ pub fn run_rustc(
     })
 }
 
+#[cfg(test)]
 fn capture_rustc_output(
+    child: &mut Child,
+    stdout: impl Read + Send,
+    stderr: impl Read,
+    metadata_sink: Option<&mut dyn Write>,
+) -> Result<(ExitStatus, Vec<u8>, CapturedStderr)> {
+    capture_rustc_output_with(child, stdout, stderr, metadata_sink, None)
+}
+
+/// Drain both pipes. `on_dep_info` is asked, when rustc reports its dep-info
+/// written, whether to let the compile go on; `false` stops rustc there.
+fn capture_rustc_output_with(
     child: &mut Child,
     mut stdout: impl Read + Send,
     stderr: impl Read,
     metadata_sink: Option<&mut dyn Write>,
+    on_dep_info: Option<&mut dyn FnMut() -> bool>,
 ) -> Result<(ExitStatus, Vec<u8>, CapturedStderr)> {
     let child = std::sync::Mutex::new(child);
     std::thread::scope(|scope| {
@@ -279,8 +299,8 @@ fn capture_rustc_output(
             }
             result
         });
-        let stderr = capture_rustc_stderr(stderr, metadata_sink);
-        if stderr.is_err() {
+        let stderr = capture_rustc_stderr_with(stderr, metadata_sink, on_dep_info);
+        if stderr.as_ref().is_err() || stderr.as_ref().is_ok_and(|captured| captured.stopped) {
             let _ = child.lock().unwrap().kill();
         }
         let stdout = stdout.join();
@@ -300,17 +320,29 @@ struct CapturedStderr {
     verbatim: Vec<u8>,
     undelivered: Vec<u8>,
     artifacts: Vec<PathBuf>,
+    /// `on_dep_info` asked to stop rustc; the rest of stderr was not read.
+    stopped: bool,
 }
 
+#[cfg(test)]
 fn capture_rustc_stderr(
     reader: impl Read,
+    metadata_sink: Option<&mut dyn Write>,
+) -> io::Result<CapturedStderr> {
+    capture_rustc_stderr_with(reader, metadata_sink, None)
+}
+
+fn capture_rustc_stderr_with(
+    reader: impl Read,
     mut metadata_sink: Option<&mut dyn Write>,
+    mut on_dep_info: Option<&mut dyn FnMut() -> bool>,
 ) -> io::Result<CapturedStderr> {
     let mut reader = BufReader::new(reader);
     let mut captured = CapturedStderr {
         verbatim: Vec::new(),
         undelivered: Vec::new(),
         artifacts: Vec::new(),
+        stopped: false,
     };
     let mut line = Vec::new();
     while reader.read_until(b'\n', &mut line)? != 0 {
@@ -323,11 +355,20 @@ fn capture_rustc_stderr(
         {
             captured.artifacts.push(PathBuf::from(path));
         }
-        let metadata = artifact
+        let emit = artifact
             .as_ref()
             .and_then(|message| message.get("emit"))
-            .and_then(|emit| emit.as_str())
-            == Some("metadata");
+            .and_then(|emit| emit.as_str());
+        // rustc writes dep-info right after expansion, long before metadata,
+        // so nothing has reached Cargo yet when the caller decides.
+        if emit == Some("dep-info")
+            && let Some(decide) = on_dep_info.as_deref_mut()
+            && !decide()
+        {
+            captured.stopped = true;
+            return Ok(captured);
+        }
+        let metadata = emit == Some("metadata");
         if metadata && let Some(sink) = metadata_sink.as_deref_mut() {
             // A write/flush error may follow partial or complete delivery.
             // Replaying the line could corrupt JSON or duplicate notification;
@@ -761,6 +802,34 @@ mod tests {
         }
     }
 
+    /// Stopping at the dep-info line kills the compiler and returns at once,
+    /// instead of waiting for a child that would run on for half a minute.
+    #[cfg(unix)]
+    #[test]
+    fn stopping_at_the_dep_info_line_kills_the_compiler() {
+        let script = "printf '%s\\n' '{\"$message_type\":\"artifact\",\"artifact\":\"x.d\",\"emit\":\"dep-info\"}' >&2; exec sleep 30";
+        let mut child = Command::new("sh")
+            .args(["-c", script])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let stderr = child.stderr.take().unwrap();
+        let started = std::time::Instant::now();
+        let mut stop = || false;
+        let (status, _, captured) =
+            capture_rustc_output_with(&mut child, stdout, stderr, None, Some(&mut stop)).unwrap();
+        assert!(captured.stopped);
+        assert!(!status.success());
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "the compiler was left running: {:?}",
+            started.elapsed()
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn either_pipe_read_failure_kills_and_reaps_the_child() {
@@ -867,6 +936,40 @@ mod tests {
 
         fn flush(&mut self) -> io::Result<()> {
             Err(io::ErrorKind::BrokenPipe.into())
+        }
+    }
+
+    /// Asked once, at the dep-info line: stopping there forwards nothing to
+    /// Cargo and reads no further; carrying on is the ordinary capture.
+    #[test]
+    fn the_dep_info_line_decides_whether_the_compile_goes_on() {
+        let warning = b"early warning\n";
+        let dep_info =
+            b"{\"$message_type\":\"artifact\",\"artifact\":\"foo.d\",\"emit\":\"dep-info\"}\n";
+        let metadata = b"{\"$message_type\":\"artifact\",\"artifact\":\"libfoo.rmeta\",\"emit\":\"metadata\"}\n";
+        let input = [warning.as_slice(), dep_info, metadata].concat();
+        for go_on in [false, true] {
+            let mut asked = 0;
+            let mut decide = || {
+                asked += 1;
+                go_on
+            };
+            let mut sink = Vec::new();
+            let mut reader = Cursor::new(&input);
+            let captured =
+                capture_rustc_stderr_with(&mut reader, Some(&mut sink), Some(&mut decide)).unwrap();
+            assert_eq!(asked, 1);
+            assert_eq!(captured.stopped, !go_on);
+            if go_on {
+                assert_eq!(sink, metadata);
+                assert_eq!(captured.verbatim, input);
+            } else {
+                assert!(
+                    sink.is_empty(),
+                    "nothing reaches Cargo from a stopped compile"
+                );
+                assert_eq!(captured.verbatim, [warning.as_slice(), dep_info].concat());
+            }
         }
     }
 

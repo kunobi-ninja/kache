@@ -3479,7 +3479,9 @@ fn run_parsed_rustc(
         {
             Some((dep_info, tree)) => KeyDiscovery::Emitted(dep_info, tree),
             None if deferral_allowed(config, args, adaptive_unit.is_some(), extra_inputs) => {
-                KeyDiscovery::Deferrable
+                KeyDiscovery::Deferrable {
+                    stop_on_hit: stop_on_hit_allowed(args),
+                }
             }
             None => KeyDiscovery::Immediate,
         },
@@ -3503,6 +3505,7 @@ fn run_parsed_rustc(
     let ComputedKey {
         mut cache_key,
         deferred,
+        stop_on_hit,
         discovery_flight: _discovery_flight,
         predicted,
         outputs: mut key_outputs,
@@ -3519,7 +3522,62 @@ fn run_parsed_rustc(
         // Cargo starts pipelined consumers on the rmeta, before this key.
         crate::out_dir_alias::register_before_compile();
         let compile_start = std::time::Instant::now();
-        let result = match compiler.execute_streaming(args) {
+        // An entry could exist: key from the dep-info rustc writes right
+        // after expansion, and stop the compile if that key is stored. This
+        // is the closure the pre-pass would have found, at the same point
+        // in time, without a second rustc.
+        let mut hit_closure = None;
+        let executed = if stop_on_hit {
+            let tree = key_outputs.tree_digest.clone();
+            let mut on_dep_info = || {
+                let Some(dep_info) = emitted_dep_info(args) else {
+                    return true;
+                };
+                let mut record = KeyEventRecord::default();
+                let keyed = compute_rustc_cache_key(
+                    config,
+                    compiler,
+                    args,
+                    workspace_root.as_deref(),
+                    invocation_start_ns,
+                    Some(&store),
+                    &key_env,
+                    ExtraInputsKey::default(),
+                    KeyDiscovery::Emitted(dep_info.clone(), tree.clone()),
+                    &mut record,
+                );
+                let stored = keyed
+                    .ok()
+                    .is_some_and(|keyed| store.get(&keyed.cache_key).ok().flatten().is_some());
+                if stored {
+                    hit_closure = Some((dep_info, tree.clone()));
+                }
+                !stored
+            };
+            compiler.execute_streaming_until_dep_info(args, &mut on_dep_info)
+        } else {
+            compiler.execute_streaming(args)
+        };
+        if let Some((dep_info, tree)) = hit_closure {
+            // Stopped before anything reached Cargo. Key again from the
+            // closure the compile wrote, and restore like any hit.
+            tracing::debug!("{crate_name}: stored entry found while compiling; restoring it");
+            crate::cache_key::provide_dep_info(dep_info, tree);
+            return run_parsed_rustc(
+                config,
+                compiler,
+                args,
+                start,
+                invocation_start_ns,
+                extra_inputs,
+                extra_inputs_hash_stats,
+                extra_inputs_too_new,
+                extra_inputs_key_ms,
+                guard_inputs,
+                None,
+            );
+        }
+        let result = match executed {
             Ok(result) => result,
             Err(e) => {
                 return passthrough_with_event(
@@ -5304,6 +5362,9 @@ struct ComputedKey {
     /// dep-info (`cache_key` is empty). `discovery_flight` is still held so
     /// peers of the same unit wait for this compile instead of repeating it.
     deferred: bool,
+    /// With `deferred`: an entry could exist, so the compile keys from its
+    /// dep-info as soon as rustc writes it and stops on a hit.
+    stop_on_hit: bool,
     discovery_flight: Option<crate::store::StoreLock>,
     /// Did this key come from a recorded closure rather than the pre-pass?
     /// The caller owes it a re-derivation before the key may reach anything
@@ -5334,6 +5395,21 @@ struct Precompiled {
     /// What the deferred key recorded for the event. The keyed flow the
     /// compile re-enters continues this record.
     key_record: KeyEventRecord,
+}
+
+/// May this compile start before its key and be stopped on a hit? rustc has
+/// to report its dep-info as a JSON artifact, and must not link: stopping
+/// kills rustc alone, and a linker it had already started could still write
+/// over the restored output.
+fn stop_on_hit_allowed(args: &RustcArgs) -> bool {
+    args.reports_artifacts() && !args.invokes_linker()
+}
+
+/// The closure the running compile wrote to its dep-info, once rustc has
+/// reported that file complete.
+fn emitted_dep_info(args: &RustcArgs) -> Option<crate::cache_key::DepInfo> {
+    let path = args.dep_info_path()?;
+    crate::cache_key::dep_info_from_emitted(&path, args.source_file.as_deref()?).ok()
 }
 
 /// Compile-before-key is only sound where the miss is certain from the local
@@ -5522,8 +5598,11 @@ fn combine_key_measurements(
 enum KeyDiscovery {
     /// Run the dep-info pre-pass, as always.
     Immediate,
-    /// Stop and let the wrapper compile first (local store only).
-    Deferrable,
+    /// Stop and let the wrapper compile first (local store only). With
+    /// `stop_on_hit`, also when an entry could exist: rustc reports its
+    /// dep-info as a JSON artifact, so the wrapper can key from it and stop
+    /// the compile on a hit.
+    Deferrable { stop_on_hit: bool },
     /// The compile already ran; this is its emitted closure. The too-new
     /// guard is armed regardless of configuration: an input written during
     /// the compile must not be keyed as if the compiler had read it. The tree
@@ -5579,9 +5658,14 @@ fn compute_rustc_cache_key(
         guard_inputs: mut extra_inputs_guard_inputs,
     } = extra_inputs;
     let key_start = std::time::Instant::now();
-    let emitted = matches!(discovery, KeyDiscovery::Emitted(..));
+    let emitted =
+        matches!(discovery, KeyDiscovery::Emitted(..)) || crate::cache_key::dep_info_provided();
     let flight_dir = discovery_flight_dir(config, &discovery);
-    crate::cache_key::set_defer_discovery(matches!(discovery, KeyDiscovery::Deferrable));
+    crate::cache_key::set_defer_discovery(matches!(discovery, KeyDiscovery::Deferrable { .. }));
+    crate::cache_key::set_compile_while_keying(matches!(
+        discovery,
+        KeyDiscovery::Deferrable { stop_on_hit: true }
+    ));
     if let KeyDiscovery::Emitted(dep_info, tree) = discovery {
         crate::cache_key::provide_dep_info(dep_info, tree);
     }
@@ -5623,17 +5707,20 @@ fn compute_rustc_cache_key(
     };
     let (cache_key, outputs) = compiler.cache_key_in(args, &key_ctx, key_env);
     key_record.absorb(&outputs);
+    let deferral = cache_key.as_ref().err().and_then(|error| {
+        error
+            .downcast_ref::<crate::cache_key::DeferredDiscovery>()
+            .map(|deferred| deferred.miss_certain)
+    });
+    crate::cache_key::set_compile_while_keying(false);
     let cache_key = match cache_key {
         Ok(cache_key) => cache_key,
-        Err(error)
-            if error
-                .downcast_ref::<crate::cache_key::DeferredDiscovery>()
-                .is_some() =>
-        {
+        Err(_) if let Some(miss_certain) = deferral => {
             crate::cache_key::set_defer_discovery(false);
             return Ok(ComputedKey {
                 cache_key: String::new(),
                 deferred: true,
+                stop_on_hit: !miss_certain,
                 discovery_flight: file_hasher.take_discovery_flight(),
                 predicted: false,
                 outputs,
@@ -5662,6 +5749,7 @@ fn compute_rustc_cache_key(
     Ok(ComputedKey {
         cache_key,
         deferred: false,
+        stop_on_hit: false,
         discovery_flight: file_hasher.take_discovery_flight(),
         predicted: outputs.used_prediction,
         outputs,

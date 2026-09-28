@@ -734,6 +734,30 @@ impl WorkspaceUnit {
     /// Compile `kt` in `checkout` the way Cargo compiles a workspace member:
     /// from the workspace root, with a relative crate root.
     fn build(&self, checkout: &Path, predictions: bool, verify: Option<&str>) -> LastEvent {
+        self.build_with(checkout, predictions, verify, &[])
+    }
+
+    /// [`Self::build`] with Cargo's JSON diagnostics, so rustc reports the
+    /// dep-info it writes and the wrapper can key while compiling.
+    fn build_as_cargo(&self, checkout: &Path) -> LastEvent {
+        self.build_with(
+            checkout,
+            true,
+            None,
+            &[
+                "--error-format=json",
+                "--json=diagnostic-rendered-ansi,artifacts",
+            ],
+        )
+    }
+
+    fn build_with(
+        &self,
+        checkout: &Path,
+        predictions: bool,
+        verify: Option<&str>,
+        extra: &[&str],
+    ) -> LastEvent {
         let target = checkout.join("target");
         let deps = target.join("debug/deps");
         let mut args: Vec<String> = vec![
@@ -758,6 +782,7 @@ impl WorkspaceUnit {
             args.push("--extern".into());
             args.push(format!("pm={}", self.macro_in(&target).display()));
         }
+        args.extend(extra.iter().map(|arg| arg.to_string()));
         let config_path = write_test_config(&self.cache, predictions);
         let mut command = std::process::Command::new(kache_binary());
         command
@@ -818,6 +843,48 @@ fn workspace_unit_predicts_in_another_checkout(unit: WorkspaceUnit) {
     assert_eq!(verified.dep_info_runs, 1);
     assert_eq!(verified.prediction_mismatches, 0);
     assert_eq!(verified.cache_key, off.cache_key);
+}
+
+/// A second checkout whose tree differs rejects the first one's record. The
+/// wrapper then keys from the dep-info its own compile writes instead of
+/// running the pre-pass: a stored entry stops the compile and restores, a
+/// missing one lets it finish and stores under the key the pre-pass gives.
+#[test]
+fn a_rejected_record_keys_from_the_running_compile() {
+    let unit = WorkspaceUnit::new(true);
+    build_kache();
+    let a = unit.checkout("a");
+    let b = unit.checkout("b");
+    std::fs::write(b.join("NOTES.md"), "not in checkout a\n").unwrap();
+    assert_eq!(unit.build_as_cargo(&a).result, "miss");
+
+    let hit = unit.build_as_cargo(&b);
+    assert_eq!(hit.result, "local_hit");
+    assert_eq!(
+        hit.dep_info_runs, 0,
+        "no pre-pass: the compile wrote the closure"
+    );
+    assert_eq!(hit.compiler_runs, 1, "the compile ran, and was stopped");
+
+    std::fs::write(
+        b.join("kt/src/lib.rs"),
+        format!("{}pub const EDIT: u8 = 1;\n", unit.lib),
+    )
+    .unwrap();
+    let miss = unit.build_as_cargo(&b);
+    assert_eq!(miss.result, "miss");
+    assert_eq!(miss.dep_info_runs, 0);
+    assert_eq!(miss.compiler_runs, 1);
+    // The pre-pass, without predictions, arrives at the same key.
+    std::fs::remove_dir_all(b.join("target/debug/deps")).unwrap();
+    std::fs::create_dir_all(b.join("target/debug/deps")).unwrap();
+    if let Some(proc_macro) = &unit.proc_macro {
+        std::fs::copy(proc_macro, unit.macro_in(&b.join("target"))).unwrap();
+    }
+    let checked = unit.build(&b, false, None);
+    assert_eq!(checked.result, "local_hit");
+    assert_eq!(checked.dep_info_runs, 1);
+    assert_eq!(checked.cache_key, miss.cache_key);
 }
 
 #[test]

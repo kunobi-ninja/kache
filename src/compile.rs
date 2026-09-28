@@ -282,7 +282,7 @@ pub fn run_rustc(
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn capture_rustc_output(
     child: &mut Child,
     stdout: impl Read + Send,

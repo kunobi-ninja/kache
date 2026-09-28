@@ -74,6 +74,49 @@ fn load_gc_summary_absent_on_malformed_stats_file() {
     assert!(load_gc_summary(dir.path(), SinceWindow::DEFAULT.cutoff(Utc::now())).is_none());
 }
 
+#[test]
+fn load_gc_summary_all_sums_unique_stores_and_selects_latest_instant() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = crate::test_support::test_config(dir.path().join("main"));
+    let shard = crate::config::VolumeStore {
+        volume: "/build".into(),
+        store: dir.path().join("shard"),
+        max_size: Some(1000),
+    };
+    config.volume_stores = vec![shard.clone(), shard.clone()];
+    let cutoff = DateTime::parse_from_rfc3339("2026-09-28T00:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    assert!(load_gc_summary_all(&config, cutoff).is_none());
+    for (path, time, n) in [
+        (&config.cache_dir, "2026-09-28T10:00:00+02:00", 2),
+        (&shard.store, "2026-09-28T09:00:00Z", 3),
+    ] {
+        std::fs::create_dir_all(path).unwrap();
+        std::fs::write(
+            path.join("gc_stats.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "last_run": time, "entries_evicted": n, "bytes_freed": n * 100,
+                "disk_bytes_reclaimed": n * 40, "blobs_removed": n * 2, "duration_ms": 1
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+    let gc = load_gc_summary_all(&config, cutoff).unwrap();
+    assert_eq!(gc.last_run, "2026-09-28T09:00:00Z");
+    assert_eq!(gc.entries_evicted, 5);
+    assert_eq!(gc.bytes_freed, 500);
+    assert_eq!(gc.disk_bytes_reclaimed, 200);
+    assert_eq!(gc.shared_bytes_retained, 300);
+    assert_eq!(gc.blobs_removed, 10);
+    config.volume_stores[0].store = config.cache_dir.clone();
+    config.cache_dir = shard.store;
+    let reversed = load_gc_summary_all(&config, cutoff).unwrap();
+    assert_eq!(reversed.last_run, gc.last_run);
+    assert_eq!(reversed.bytes_freed, gc.bytes_freed);
+}
+
 /// The GC history is opt-in with session recording. Off, a run writes
 /// gc_stats.json and nothing under `telemetry/`; on, each run appends one
 /// line carrying every figure of that run.
@@ -2370,6 +2413,8 @@ fn render_includes_storage_and_gc_sections_when_present() {
     let mut report = generate_report(&config, SinceWindow::DEFAULT, 10).unwrap();
 
     report.storage = StorageBreakdown {
+        stores: Vec::new(),
+        store_entries: 0,
         reflinked_bytes: 1024,
         hardlinked_bytes: 512,
         copied_bytes: 256,
@@ -3028,6 +3073,8 @@ fn transfer_event_v2_deserializes_without_v3_timing_fields() {
 #[test]
 fn test_push_storage_table_renders_rows() {
     let storage = StorageBreakdown {
+        stores: Vec::new(),
+        store_entries: 0,
         reflinked_bytes: 800,
         hardlinked_bytes: 150,
         copied_bytes: 50,
@@ -3149,6 +3196,8 @@ fn report_counts_each_download_transfer_format() {
 #[test]
 fn push_storage_table_renders_copy_reason_sums() {
     let storage = StorageBreakdown {
+        stores: Vec::new(),
+        store_entries: 0,
         reflinked_bytes: 0,
         hardlinked_bytes: 0,
         copied_bytes: 0,
@@ -3207,6 +3256,8 @@ fn push_storage_table_renders_store_ingest_line() {
     // counts both reflinked and hardlinked bytes as shared.
     // Covers push_storage_table's ingest>0 branch.
     let storage = StorageBreakdown {
+        stores: Vec::new(),
+        store_entries: 0,
         reflinked_bytes: 0,
         hardlinked_bytes: 0,
         copied_bytes: 0,
@@ -3249,6 +3300,8 @@ fn github_storage_summary_without_restores_shows_logical_and_blobs() {
     let config = write_test_events(dir.path());
     let mut report = generate_report(&config, SinceWindow::DEFAULT, 10).unwrap();
     report.storage = StorageBreakdown {
+        stores: Vec::new(),
+        store_entries: 0,
         reflinked_bytes: 0,
         hardlinked_bytes: 0,
         copied_bytes: 0,
@@ -3371,6 +3424,8 @@ fn storage_render_preserves_zero_boundaries_and_summary_choice() {
 
 fn empty_storage() -> StorageBreakdown {
     StorageBreakdown {
+        stores: Vec::new(),
+        store_entries: 0,
         reflinked_bytes: 0,
         hardlinked_bytes: 0,
         copied_bytes: 0,

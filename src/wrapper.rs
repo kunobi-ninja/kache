@@ -849,6 +849,7 @@ fn volume_cache_dirs_match(routed: &Path, main: &Path) -> bool {
 
 /// Open the volume shard (or main store) plus an optional main-store fallback.
 fn open_primary_and_fallback(config: &Config, route: &Path) -> Result<(Store, Option<Store>)> {
+    crate::link::set_mapped_target(config.volume_store_for(route).is_some());
     let routed = config.routed_for_path(route);
     let primary = Store::open(&routed)?;
     if volume_cache_dirs_match(&routed.cache_dir, &config.cache_dir) {

@@ -1455,6 +1455,7 @@ fn sample_build_event(
 
 fn sample_stats_entry(crate_name: &str, size: u64, hits: u64) -> daemon::StatsEntry {
     daemon::StatsEntry {
+        store_dirs: Vec::new(),
         cache_key: "0123456789abcdef".to_string(),
         crate_name: crate_name.to_string(),
         crate_type: "lib".to_string(),

@@ -542,6 +542,10 @@ fn pct_of(part: u64, total: u64) -> f64 {
 /// unavailable (shared inode), then a full copy.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct StorageBreakdown {
+    #[serde(default)]
+    pub store_entries: usize,
+    #[serde(default)]
+    pub stores: Vec<crate::store_view::StoreSummary>,
     /// Bytes restored by CoW reflink — zero physical copy.
     pub reflinked_bytes: u64,
     /// Bytes restored by hardlink — zero physical copy, shared inode.
@@ -1164,10 +1168,26 @@ pub fn generate_report_with_filter(
     // independent of machine speed. A missing/unreadable store degrades
     // to zeroed dedup stats rather than failing the whole report.
     let restored_bytes = stats.reflinked_bytes + stats.hardlinked_bytes + stats.copied_bytes;
-    let blob_stats = crate::store::Store::open(config)
-        .and_then(|s| s.blob_stats())
-        .unwrap_or_default();
+    let inventory = crate::store_view::read(config, false, "name").unwrap_or_default();
+    let blob_stats = inventory.blob_stats;
+    let stores = inventory.stores;
+    let accounting_consistent = stores.iter().all(|s| {
+        s.error.is_none()
+            && s.blob_stats
+                .as_ref()
+                .is_none_or(|b| blob_accounting_consistent(b.total_logical_size, b.total_blob_size))
+    });
+    for store in &stores {
+        if let Some(error) = &store.error {
+            suggestions.push(format!(
+                "Store {} unavailable: {error}",
+                store.path.display()
+            ));
+        }
+    }
     let storage = StorageBreakdown {
+        store_entries: inventory.entry_count,
+        stores,
         reflinked_bytes: stats.reflinked_bytes,
         hardlinked_bytes: stats.hardlinked_bytes,
         copied_bytes: stats.copied_bytes,
@@ -1194,10 +1214,7 @@ pub fn generate_report_with_filter(
         logical_bytes: blob_stats.total_logical_size,
         blob_bytes: blob_stats.total_blob_size,
         dedup_saved_bytes: blob_stats.savings,
-        accounting_consistent: blob_accounting_consistent(
-            blob_stats.total_logical_size,
-            blob_stats.total_blob_size,
-        ),
+        accounting_consistent,
     };
 
     Ok(BuildReport {
@@ -1300,7 +1317,7 @@ pub fn generate_report_with_filter(
         gc: if filter.last_build {
             None
         } else {
-            load_gc_summary(&config.cache_dir, since)
+            load_gc_summary_all(config, since)
         },
     })
 }
@@ -1368,6 +1385,26 @@ fn event_matches_root(event: &BuildEvent, root: &str) -> bool {
             .root
             .strip_prefix(root)
             .is_some_and(|suffix| suffix.starts_with(std::path::MAIN_SEPARATOR))
+}
+
+fn load_gc_summary_all(config: &Config, cutoff: DateTime<Utc>) -> Option<GcSummary> {
+    std::iter::once(config.clone())
+        .chain(crate::store_view::shard_configs(config))
+        .filter_map(|store| load_gc_summary(&store.cache_dir, cutoff))
+        .reduce(|mut total, next| {
+            // load_gc_summary has already validated both timestamps.
+            if DateTime::parse_from_rfc3339(&next.last_run).unwrap()
+                > DateTime::parse_from_rfc3339(&total.last_run).unwrap()
+            {
+                total.last_run = next.last_run;
+            }
+            total.entries_evicted += next.entries_evicted;
+            total.bytes_freed += next.bytes_freed;
+            total.disk_bytes_reclaimed += next.disk_bytes_reclaimed;
+            total.shared_bytes_retained += next.shared_bytes_retained;
+            total.blobs_removed += next.blobs_removed;
+            total
+        })
 }
 
 /// Load GC stats from gc_stats.json if GC ran at or after `cutoff`.
@@ -2424,6 +2461,10 @@ fn has_storage_data(storage: &StorageBreakdown) -> bool {
 fn push_storage_table(lines: &mut Vec<String>, storage: &StorageBreakdown) {
     lines.push("| Metric | Value |".to_string());
     lines.push("|---|---|".to_string());
+    lines.push(format!(
+        "| Stored entries (unique keys) | {} |",
+        storage.store_entries
+    ));
     if storage.restored_bytes > 0 {
         lines.push(format!(
             "| Restored bytes | {} total: {} reflink, {} hardlink, {} copied |",
@@ -3772,6 +3813,11 @@ pub fn format_text(report: &BuildReport) -> String {
         }
         lines.push(String::new());
     }
+
+    lines.push(format!(
+        "Stored entries: {} unique keys",
+        report.storage.store_entries
+    ));
 
     // Prefetch
     lines.push(format!(

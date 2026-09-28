@@ -2,6 +2,42 @@ use super::*;
 use std::fs;
 
 #[test]
+fn doctor_link_layout_uses_the_mapped_store_and_leaves_missing_shards_absent() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = crate::test_support::test_config(dir.path().join("main"));
+    let build = dir.path().join("build");
+    fs::create_dir(&build).unwrap();
+    let mapping = crate::config::VolumeStore {
+        volume: build.display().to_string(),
+        store: dir.path().join("shard"),
+        max_size: Some(1000),
+    };
+    config.volume_stores.push(mapping.clone());
+    let missing = doctor_link_layout(&config, &build);
+    assert!(!missing.pass);
+    assert!(missing.detail.contains("unavailable; link probe skipped"));
+    assert!(!mapping.store.exists());
+
+    Store::open(&config.for_volume_store(&mapping, |_| None)).unwrap();
+    let mapped = doctor_link_layout(&config, &build);
+    assert!(mapped.pass, "{}", mapped.detail);
+    assert!(mapped.detail.contains(&mapping.store.display().to_string()));
+    assert!(mapped.fix.is_none());
+
+    config.volume_stores.clear();
+    let unmapped = doctor_link_layout(&config, &build);
+    assert!(unmapped.pass, "{}", unmapped.detail);
+    assert!(
+        unmapped
+            .detail
+            .contains(&config.cache_dir.display().to_string())
+    );
+    let failed = doctor_link_layout(&config, &dir.path().join("absent-build"));
+    assert!(!failed.pass);
+    assert!(failed.fix.unwrap().contains("SAME mount"));
+}
+
+#[test]
 fn shutdown_summary_status_distinguishes_partial_totals_from_cancellation() {
     assert_eq!(summary_status_suffix(false, false), "");
     assert_eq!(summary_status_suffix(true, false), ", CANCELLED");

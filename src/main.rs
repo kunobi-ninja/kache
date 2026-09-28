@@ -70,6 +70,7 @@ mod since;
 use kache_store::sharing;
 mod compiler_store;
 use compiler_store as store;
+mod store_view;
 mod target_cleanup;
 mod target_seed;
 mod test_runner;

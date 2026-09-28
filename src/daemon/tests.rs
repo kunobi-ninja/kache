@@ -857,6 +857,7 @@ fn compile_started_wire_tags_and_stats_default() {
     // A StatsResponse serialized by an OLD daemon (no in_flight field)
     // must deserialize with an empty registry view.
     let mut old = serde_json::to_value(StatsResponse {
+        stores: Vec::new(),
         total_size: 0,
         max_size: 0,
         entry_count: 0,
@@ -3938,6 +3939,7 @@ fn test_stats_request_serde() {
 #[test]
 fn test_stats_response_serde() {
     let stats = StatsResponse {
+        stores: Vec::new(),
         total_size: 1024,
         max_size: 4096,
         entry_count: 5,
@@ -3997,11 +3999,13 @@ fn test_stats_response_serde() {
 #[test]
 fn test_stats_response_with_entries() {
     let stats = StatsResponse {
+        stores: Vec::new(),
         total_size: 2048,
         max_size: 8192,
         entry_count: 2,
         entries: Some(vec![
             StatsEntry {
+                store_dirs: Vec::new(),
                 cache_key: "abc123def456".into(),
                 crate_name: "serde".into(),
                 crate_type: "lib".into(),
@@ -4013,6 +4017,7 @@ fn test_stats_response_with_entries() {
                 content_hash: None,
             },
             StatsEntry {
+                store_dirs: Vec::new(),
                 cache_key: "789abc012def".into(),
                 crate_name: "tokio".into(),
                 crate_type: "lib".into(),

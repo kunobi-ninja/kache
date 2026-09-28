@@ -63,6 +63,14 @@ pub fn set_storage_layout_advice(enabled: bool) {
     STORAGE_LAYOUT_ADVICE.store(enabled, Ordering::Relaxed);
 }
 
+/// A mapped target may intentionally restore from the main-store fallback.
+/// Do not suggest another volume mapping for that copy; faults still report.
+static MAPPED_TARGET: AtomicBool = AtomicBool::new(false);
+
+pub fn set_mapped_target(mapped: bool) {
+    MAPPED_TARGET.store(mapped, Ordering::Relaxed);
+}
+
 /// Is `[cache] storage_layout_advice` active for this process?
 fn storage_layout_advice_enabled() -> bool {
     STORAGE_LAYOUT_ADVICE.load(Ordering::Relaxed)
@@ -109,6 +117,12 @@ pub(crate) enum HardlinkIoReason {
     CrossDevice,
     Permission,
     Other,
+}
+
+impl HardlinkIoReason {
+    fn mapped_volume_advice(self, mapped: bool) -> bool {
+        self == Self::CrossDevice && mapped
+    }
 }
 
 /// Classify a `link(2)` io error kind into a copy reason. Pure so the decision
@@ -206,7 +220,9 @@ pub(crate) fn warn_hardlink_fallback_once(
         );
         return;
     }
-    if !storage_layout_advice_enabled() {
+    if !storage_layout_advice_enabled()
+        || reason.mapped_volume_advice(MAPPED_TARGET.load(Ordering::Relaxed))
+    {
         tracing::debug!(
             "hardlink failed ({:?}; layout advice muted): {} -> {}",
             reason,
@@ -669,6 +685,11 @@ enum CopyRestoreCause {
 }
 
 impl CopyRestoreCause {
+    #[cfg_attr(not(windows), allow(dead_code))]
+    fn mapped_volume_advice(self, mapped: bool) -> bool {
+        self == Self::CrossVolume && mapped
+    }
+
     /// Which dedup bucket this advisory belongs to.
     ///
     /// A storage-*layout* advisory ("no CoW", "cross-volume") must NOT be able
@@ -869,7 +890,9 @@ fn warn_no_cow_restore_once(
     // layout — and `[cache] storage_layout_advice = false` is the user saying
     // their layout is intentional (#551). Either way this mutes only the
     // *advice*: a genuine clone fault still reports (see `layout_advice`).
-    if cause.is_layout_advisory() && (!layout_advice || !storage_layout_advice_enabled()) {
+    if cause.mapped_volume_advice(MAPPED_TARGET.load(Ordering::Relaxed))
+        || (cause.is_layout_advisory() && (!layout_advice || !storage_layout_advice_enabled()))
+    {
         tracing::debug!(
             "copy-restored {} ({:?}; layout advice muted: strategy={}, config={})",
             target_path.display(),
@@ -1948,6 +1971,34 @@ pub enum DepInfoMode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_mapped_volume_mutes_only_cross_volume_advice() {
+        for reason in [
+            HardlinkIoReason::CrossDevice,
+            HardlinkIoReason::Permission,
+            HardlinkIoReason::Other,
+        ] {
+            assert!(!reason.mapped_volume_advice(false));
+            assert_eq!(
+                reason.mapped_volume_advice(true),
+                reason == HardlinkIoReason::CrossDevice
+            );
+        }
+        for cause in [
+            CopyRestoreCause::CrossVolume,
+            CopyRestoreCause::NoCow,
+            CopyRestoreCause::UnknownCow,
+            CopyRestoreCause::SubClusterOnCowVolume,
+            CopyRestoreCause::UnexpectedOnCowVolume,
+        ] {
+            assert!(!cause.mapped_volume_advice(false));
+            assert_eq!(
+                cause.mapped_volume_advice(true),
+                cause == CopyRestoreCause::CrossVolume
+            );
+        }
+    }
 
     /// The regression from #508: on a ReFS Dev Drive that DOES block-clone, a
     /// sub-cluster file (every `.d` under ~4 KB) falls back to copy — and kache

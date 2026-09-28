@@ -189,7 +189,11 @@ A shard keeps its own `gc.lock`, `auto-gc-backoff.json` and `gc_stats.json` in i
 
 GC skips a shard whose store dir has no `index.db`: a missing directory, an unmounted volume, or a shard no build has written to yet. It never creates a shard directory. A shard that fails to open or sweep is logged, and GC carries on with the others and the main store.
 
-`kache stats`, `kache report`, `kache doctor` and `kache gc --json` still describe only the main store, and `kache gc --stale-schema` still covers only the main store.
+`kache stats` and `kache report` include every configured store. Entry counts count each cache key once; stored bytes count every copy across stores. JSON includes per-store paths, sizes, budgets and errors. The `stats --json` filesystem `disk` and index measurements still describe the main store; use `stores` for shard measurements.
+
+`kache list` and `kache why-miss` show the stores that hold each entry. `kache doctor` checks shard availability and accounting, and its link-layout probe uses the shard mapped to the current directory. `doctor --verify` checks every stored copy; `--repair` also repairs shards. Missing shards are reported without creating their directories.
+
+`kache gc --json`, `kache gc --stale-schema` and `kache purge` still cover only the main store. Automatic prefetch still imports into the main store.
 
 ### Daemon index maintenance
 

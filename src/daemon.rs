@@ -1259,6 +1259,8 @@ pub struct DaemonHealth {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct StatsResponse {
+    #[serde(default)]
+    pub stores: Vec<crate::store_view::StoreSummary>,
     pub total_size: u64,
     pub max_size: u64,
     pub entry_count: usize,
@@ -1517,6 +1519,8 @@ pub struct PrefetchStatsSnapshot {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct StatsEntry {
+    #[serde(default)]
+    pub store_dirs: Vec<std::path::PathBuf>,
     pub cache_key: String,
     pub crate_name: String,
     pub crate_type: String,
@@ -3539,34 +3543,16 @@ impl Daemon {
 
     /// Handle a stats request — reads store and event log.
     pub fn handle_stats(&self, req: &StatsRequest) -> Response {
-        let (total_size, entry_count, entries, blob_stats) = match self.with_store(|store| {
-            let total_size = store.total_size().unwrap_or(0);
-            let entry_count = store.entry_count().unwrap_or(0);
-            let entries = if req.include_entries {
-                let sort = req.sort_by.as_deref().unwrap_or("size");
-                store.list_entries(sort).ok().map(|list| {
-                    list.into_iter()
-                        .map(|e| StatsEntry {
-                            cache_key: e.cache_key,
-                            crate_name: e.crate_name,
-                            crate_type: e.crate_type,
-                            profile: e.profile,
-                            size: e.size,
-                            hit_count: e.hit_count,
-                            created_at: e.created_at,
-                            last_accessed: e.last_accessed,
-                            content_hash: e.content_hash,
-                        })
-                        .collect()
-                })
-            } else {
-                None
-            };
-            let blob_stats = store.blob_stats().ok();
-            Ok((total_size, entry_count, entries, blob_stats))
+        let inventory = match self.with_store(|store| {
+            crate::store_view::read_with_main(
+                &self.config,
+                store,
+                req.include_entries,
+                req.sort_by.as_deref().unwrap_or("size"),
+            )
         }) {
-            Ok(values) => values,
-            Err(e) => return Response::err(format!("store open failed: {e}")),
+            Ok(inventory) => inventory,
+            Err(error) => return Response::err(format!("store open failed: {error}")),
         };
 
         let since = req.window().cutoff(chrono::Utc::now());
@@ -3604,10 +3590,11 @@ impl Daemon {
         let in_flight = self.in_flight_snapshot();
 
         Response::ok_stats(StatsResponse {
-            total_size,
-            max_size: self.config.max_size,
-            entry_count,
-            entries,
+            total_size: inventory.total_size,
+            max_size: inventory.max_size,
+            entry_count: inventory.entry_count,
+            entries: req.include_entries.then_some(inventory.entries),
+            stores: inventory.stores,
             events: EventStatsResponse {
                 local_hits: es.local_hits,
                 prefetch_hits: es.prefetch_hits,
@@ -3624,7 +3611,7 @@ impl Daemon {
                 store_duplicate_blobs: es.store_duplicate_blobs,
                 store_new_blobs: es.store_new_blobs,
             },
-            blob_stats,
+            blob_stats: Some(inventory.blob_stats),
             recent_summaries,
             version: self.version.clone(),
             build_epoch: self.build_epoch,

@@ -234,7 +234,23 @@
         "logical_bytes": { "type": "integer", "minimum": 0 },
         "blob_bytes": { "type": "integer", "minimum": 0 },
         "dedup_saved_bytes": { "type": "integer", "minimum": 0 },
-        "accounting_consistent": { "type": "boolean" }
+        "accounting_consistent": { "type": "boolean" },
+        "store_entries": { "type": "integer", "minimum": 0 },
+        "stores": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["path", "bytes", "max_size", "entries", "blob_stats", "error"],
+            "properties": {
+              "path": { "type": "string" },
+              "bytes": { "type": "integer", "minimum": 0 },
+              "max_size": { "type": "integer", "minimum": 0 },
+              "entries": { "type": "integer", "minimum": 0 },
+              "blob_stats": { "type": ["object", "null"] },
+              "error": { "type": ["string", "null"] }
+            }
+          }
+        }
       }
     },
     "network": {

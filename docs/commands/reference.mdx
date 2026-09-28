@@ -449,3 +449,7 @@ kache completions fish > ~/.config/fish/completions/kache.fish
 ```
 
 Supported shells are Bash, Elvish, Fish, PowerShell, and Zsh.
+
+### Inspecting volume shards
+
+With `[cache.volumes]`, `stats` and `report` sum bytes across stores and count unique cache keys. `list` and `why-miss` identify each entry's store directories. `doctor --verify` checks every copy, including copies in shards; missing shards are reported without creating them. See [Volume shards](/docs/getting-started/configuration#volume-shards).

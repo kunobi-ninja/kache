@@ -1124,6 +1124,9 @@ jobs:
           cargo build --release -p kache && cargo build --release -p kache-e2e
         env:
           RUSTC_WRAPPER: ""
+      - name: Qualify volume shards on bind mounts or drive letters
+        if: env.RUN_E2E == 'true' && runner.os != 'macOS'
+        run: python3 scripts/volume-shards-check.py ./target/release/kache${{ matrix.exe_suffix }}
       - name: Run e2e harness (gate scenarios)
         if: env.RUN_E2E == 'true'
         # Single Rust harness drives selected e2e scenarios from scenarios/

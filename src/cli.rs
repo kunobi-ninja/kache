@@ -23,6 +23,7 @@ use miss_diagnosis::{Cause, MissDiagnosis};
 /// Cached store + event stats, refreshed periodically.
 /// Used by both the TUI monitor and `kache stats` CLI.
 pub(crate) struct StatsSnapshot {
+    pub stores: Vec<crate::store_view::StoreSummary>,
     pub total_size: u64,
     pub max_size: u64,
     pub entry_count: usize,
@@ -71,6 +72,7 @@ pub(crate) struct StatsSnapshot {
 impl Default for StatsSnapshot {
     fn default() -> Self {
         Self {
+            stores: Vec::new(),
             total_size: 0,
             max_size: 0,
             entry_count: 0,
@@ -164,6 +166,7 @@ pub(crate) fn fetch_stats_snapshot(
         Some(window),
     ) {
         return StatsSnapshot {
+            stores: resp.stores,
             total_size: resp.total_size,
             max_size: resp.max_size,
             entry_count: resp.entry_count,
@@ -216,6 +219,7 @@ pub(crate) fn fetch_stats_snapshot(
         )
     {
         return StatsSnapshot {
+            stores: resp.stores,
             total_size: resp.total_size,
             max_size: resp.max_size,
             entry_count: resp.entry_count,
@@ -264,37 +268,7 @@ pub(crate) fn snapshot_from_direct_reads(
     window: SinceWindow,
     include_summaries: bool,
 ) -> StatsSnapshot {
-    let store = Store::open(config).ok();
-    let total_size = store
-        .as_ref()
-        .and_then(|s| s.total_size().ok())
-        .unwrap_or(0);
-    let entry_count = store
-        .as_ref()
-        .and_then(|s| s.entry_count().ok())
-        .unwrap_or(0);
-
-    let entries = if include_entries {
-        store
-            .as_ref()
-            .and_then(|s| s.list_entries(sort_by).ok())
-            .unwrap_or_default()
-            .into_iter()
-            .map(|e| daemon::StatsEntry {
-                cache_key: e.cache_key,
-                crate_name: e.crate_name,
-                crate_type: e.crate_type,
-                profile: e.profile,
-                size: e.size,
-                hit_count: e.hit_count,
-                created_at: e.created_at,
-                last_accessed: e.last_accessed,
-                content_hash: e.content_hash,
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
+    let inventory = crate::store_view::read(config, include_entries, sort_by).unwrap_or_default();
 
     let since = window.cutoff(chrono::Utc::now());
     let event_list = events::read_events_since(&config.event_log_path(), since).unwrap_or_default();
@@ -311,10 +285,11 @@ pub(crate) fn snapshot_from_direct_reads(
     };
 
     StatsSnapshot {
-        total_size,
-        max_size: config.max_size,
-        entry_count,
-        entries,
+        total_size: inventory.total_size,
+        max_size: inventory.max_size,
+        entry_count: inventory.entry_count,
+        entries: inventory.entries,
+        stores: inventory.stores,
         event_stats: daemon::EventStatsResponse {
             local_hits: es.local_hits,
             prefetch_hits: es.prefetch_hits,
@@ -352,7 +327,7 @@ pub(crate) fn snapshot_from_direct_reads(
         bytes_uploaded: 0,
         bytes_downloaded: 0,
         recent_transfers: Vec::new(),
-        blob_stats: store.as_ref().and_then(|s| s.blob_stats().ok()),
+        blob_stats: Some(inventory.blob_stats),
         recent_summaries,
         prefetch: daemon::PrefetchStatsSnapshot::default(),
         in_flight: Vec::new(),
@@ -650,6 +625,7 @@ pub fn telemetry_write(
         Some(SinceWindow::DEFAULT),
     ) {
         Ok(resp) => StatsSnapshot {
+            stores: resp.stores,
             total_size: resp.total_size,
             max_size: resp.max_size,
             entry_count: resp.entry_count,
@@ -784,12 +760,17 @@ pub fn stats(
         }
     }
 
-    let store_bytes = snap
-        .blob_stats
-        .as_ref()
+    let main_store = snap.stores.first();
+    let store_bytes = main_store
+        .and_then(|s| s.blob_stats.as_ref())
+        .or(snap.blob_stats.as_ref())
         .map(|s| s.total_blob_size)
         .unwrap_or(snap.total_size);
-    let disk = crate::machine::disk_view(&config.store_dir(), store_bytes, snap.max_size);
+    let disk = crate::machine::disk_view(
+        &config.store_dir(),
+        store_bytes,
+        main_store.map_or(snap.max_size, |s| s.max_size),
+    );
     let host_config = host_config_in_effect(&crate::config::host_config_status());
     let machine = machine_snapshot(config);
 
@@ -797,6 +778,7 @@ pub fn stats(
         #[derive(serde::Serialize)]
         struct Body<'a> {
             disk: crate::machine::DiskView,
+            stores: &'a [crate::store_view::StoreSummary],
             /// This machine's shared index (`index.db` plus `-wal`) and each
             /// table's largest rowid, as `kache telemetry write` reports them.
             /// The rowid grows with every insert and replacement; it is not
@@ -838,6 +820,7 @@ pub fn stats(
             "stats",
             Body {
                 disk: disk.clone(),
+                stores: &snap.stores,
                 index_bytes: machine.index_bytes,
                 index_wal_bytes: machine.wal_bytes,
                 index_rowid_high_water: machine.rowid_high_water.iter().copied().collect(),
@@ -983,13 +966,34 @@ pub(crate) fn render_stats(
     lines.push(format!(
         "Store:      {} / {} ({} entries, {:.0}%)",
         ByteSize(snap.total_size),
-        crate::config::describe_max_size(
-            snap.max_size,
-            crate::cache_fs::probe(&config.cache_dir).total_bytes,
-        ),
+        if snap.stores.len() > 1 {
+            ByteSize(snap.max_size).to_string()
+        } else {
+            crate::config::describe_max_size(
+                snap.max_size,
+                crate::cache_fs::probe(&config.cache_dir).total_bytes,
+            )
+        },
         snap.entry_count,
         store_pct,
     ));
+
+    for store in &snap.stores {
+        if let Some(error) = &store.error {
+            lines.push(format!(
+                "Store {}: unavailable ({error})",
+                store.path.display()
+            ));
+        } else if snap.stores.len() > 1 {
+            lines.push(format!(
+                "Store {}: {} / {} ({} entries)",
+                store.path.display(),
+                ByteSize(store.bytes),
+                ByteSize(store.max_size),
+                store.entries
+            ));
+        }
+    }
 
     // Content dedup stats
     if let Some(blob_stats) = snap
@@ -1578,6 +1582,13 @@ pub fn why_miss(config: &Config, crate_name: &str, json: bool) -> Result<()> {
         return Ok(());
     }
 
+    let inventory = crate::store_view::read(config, true, "name")?;
+    let all_entries = inventory.entries;
+    let stored: Vec<_> = all_entries
+        .iter()
+        .filter(|e| e.crate_name == crate_name)
+        .collect();
+
     // ── Find last entry miss ───────────────────────────────────────────
     let last_miss = crate_events.iter().rev().find(|e| {
         matches!(
@@ -1592,17 +1603,33 @@ pub fn why_miss(config: &Config, crate_name: &str, json: bool) -> Result<()> {
             struct Body<'a> {
                 crate_name: &'a str,
                 diagnosis: &'static str,
+                stored_entries: usize,
+                store_dirs: Vec<&'a std::path::Path>,
+                stores: &'a [crate::store_view::StoreSummary],
             }
             return crate::machine::emit(
                 "why-miss",
                 Body {
                     crate_name,
                     diagnosis: "all_hits",
+                    stored_entries: stored.len(),
+                    store_dirs: stored
+                        .iter()
+                        .flat_map(|e| e.store_dirs.iter().map(std::path::PathBuf::as_path))
+                        .collect(),
+                    stores: &inventory.stores,
                 },
                 Vec::new(),
             );
         }
         println!("No misses or dups found for `{crate_name}` -- all events are hits!");
+        for entry in &stored {
+            println!(
+                "  key: {} stores: {}",
+                key_short(&entry.cache_key),
+                entry.store_locations()
+            );
+        }
         println!("\nRecent events:");
         for event in crate_events.iter().rev().take(5).rev() {
             let time = event.ts.format("%Y-%m-%dT%H:%M:%S");
@@ -1629,12 +1656,6 @@ pub fn why_miss(config: &Config, crate_name: &str, json: bool) -> Result<()> {
                 events::EventResult::Dup | events::EventResult::Miss
             )
     };
-    let store = Store::open(config)?;
-    let all_entries = store.list_entries("name")?;
-    let stored: Vec<_> = all_entries
-        .iter()
-        .filter(|e| e.crate_name == crate_name)
-        .collect();
     let same_key_present = stored.iter().any(|e| e.cache_key == miss.cache_key);
     let miss_index = all_events
         .iter()
@@ -1651,7 +1672,13 @@ pub fn why_miss(config: &Config, crate_name: &str, json: bool) -> Result<()> {
     diagnosis.checkout =
         miss_index.and_then(|index| crate::miss_chain::compare_checkout(&all_events, index));
     if json {
-        return why_miss_json(crate_name, miss, stored.len(), &diagnosis);
+        return why_miss_json(crate_name, miss, &stored, &inventory.stores, &diagnosis);
+    }
+
+    for store in &inventory.stores {
+        if let Some(error) = &store.error {
+            println!("Store {}: unavailable ({error})", store.path.display());
+        }
     }
 
     // ── Header ─────────────────────────────────────────────────────────
@@ -1675,8 +1702,12 @@ pub fn why_miss(config: &Config, crate_name: &str, json: bool) -> Result<()> {
 
     // Show miss metadata if it was subsequently stored
     if !miss.cache_key.is_empty() {
-        let meta_path = config.store_dir().join(&miss.cache_key).join("meta.json");
-        if let Ok(content) = std::fs::read_to_string(&meta_path)
+        let meta_path = stored
+            .iter()
+            .find(|e| e.cache_key == miss.cache_key)
+            .map(|e| e.meta_path());
+        if let Some(meta_path) = meta_path
+            && let Ok(content) = std::fs::read_to_string(&meta_path)
             && let Ok(meta) = serde_json::from_str::<crate::store::EntryMeta>(&content)
         {
             if !meta.target.is_empty() {
@@ -1708,6 +1739,7 @@ pub fn why_miss(config: &Config, crate_name: &str, json: bool) -> Result<()> {
             let ek = key_short(&entry.cache_key);
             let accessed = format_relative_time(&entry.last_accessed);
             let size = ByteSize(entry.size);
+            let stores = entry.store_locations();
             let hits = entry.hit_count;
             let profile_tag = if entry.profile.is_empty() {
                 String::new()
@@ -1728,7 +1760,7 @@ pub fn why_miss(config: &Config, crate_name: &str, json: bool) -> Result<()> {
             // Read meta.json for richer diff info
             let mut features_tag = String::new();
             let mut target_tag = String::new();
-            let meta_path = store.entry_dir(&entry.cache_key).join("meta.json");
+            let meta_path = entry.meta_path();
             if let Ok(content) = std::fs::read_to_string(&meta_path)
                 && let Ok(meta) = serde_json::from_str::<crate::store::EntryMeta>(&content)
             {
@@ -1741,14 +1773,14 @@ pub fn why_miss(config: &Config, crate_name: &str, json: bool) -> Result<()> {
             }
 
             println!(
-                "    - key: {ek} (last accessed: {accessed}, size: {size}, hits: {hits}{profile_tag}{crate_type_tag}{target_tag}{features_tag}){match_indicator}"
+                "    - key: {ek} (last accessed: {accessed}, size: {size}, hits: {hits}, stores: {stores}{profile_tag}{crate_type_tag}{target_tag}{features_tag}){match_indicator}"
             );
         }
         if hidden > 0 {
             println!("    ... and {hidden} older entries");
         }
     }
-    print_miss_diagnosis(config, &store, miss, &stored, &diagnosis);
+    print_miss_diagnosis(miss, &stored, &diagnosis);
 
     // Render the dependency analysis shared with JSON output.
     print_checkout_comparison(&diagnosis);
@@ -1987,10 +2019,8 @@ fn print_extern_chain(diagnosis: &MissDiagnosis) {
 }
 
 fn print_miss_diagnosis(
-    config: &Config,
-    store: &Store,
     miss: &events::BuildEvent,
-    stored: &[&crate::store::EntryInfo],
+    stored: &[&daemon::StatsEntry],
     diagnosis: &MissDiagnosis,
 ) {
     match diagnosis.cause {
@@ -2019,7 +2049,7 @@ fn print_miss_diagnosis(
                 .iter()
                 .filter(|e| e.cache_key != miss.cache_key)
                 .collect();
-            why_miss_diff_entries(config, store, miss, &other_entries);
+            why_miss_diff_entries(miss, stored, &other_entries);
         }
     }
 }
@@ -2027,7 +2057,8 @@ fn print_miss_diagnosis(
 fn why_miss_json(
     crate_name: &str,
     miss: &events::BuildEvent,
-    stored_entries: usize,
+    stored: &[&daemon::StatsEntry],
+    stores: &[crate::store_view::StoreSummary],
     diagnosis: &MissDiagnosis,
 ) -> Result<()> {
     #[derive(serde::Serialize)]
@@ -2039,6 +2070,8 @@ fn why_miss_json(
         store_error: &'a str,
         lookup_rejection: &'a str,
         stored_entries: usize,
+        store_dirs: Vec<&'a std::path::Path>,
+        stores: &'a [crate::store_view::StoreSummary],
         dependency_chain: &'a Option<crate::miss_chain::Chain>,
         dependency_recording_missing: bool,
         checkout_comparison: &'a Option<crate::miss_chain::CheckoutComparison>,
@@ -2053,7 +2086,13 @@ fn why_miss_json(
             cache_key: &miss.cache_key,
             store_error: &miss.store_error,
             lookup_rejection: &miss.lookup_rejection,
-            stored_entries,
+            stored_entries: stored.len(),
+            store_dirs: stored
+                .iter()
+                .filter(|e| e.cache_key == miss.cache_key)
+                .flat_map(|e| e.store_dirs.iter().map(std::path::PathBuf::as_path))
+                .collect(),
+            stores,
             dependency_chain: &diagnosis.dependency_chain,
             dependency_recording_missing: diagnosis.dependency_recording_missing,
             checkout_comparison: &diagnosis.checkout,
@@ -2065,20 +2104,16 @@ fn why_miss_json(
 /// Compare the miss event's stored metadata against other stored entries
 /// to surface what likely differs (target, profile, features).
 fn why_miss_diff_entries(
-    config: &Config,
-    store: &Store,
     miss: &events::BuildEvent,
-    other_entries: &[&&crate::store::EntryInfo],
+    stored: &[&daemon::StatsEntry],
+    other_entries: &[&&daemon::StatsEntry],
 ) {
     // Load metadata for the miss key (if stored)
-    let miss_meta = if !miss.cache_key.is_empty() {
-        let meta_path = config.store_dir().join(&miss.cache_key).join("meta.json");
-        std::fs::read_to_string(&meta_path)
-            .ok()
-            .and_then(|c| serde_json::from_str::<crate::store::EntryMeta>(&c).ok())
-    } else {
-        None
-    };
+    let miss_meta = stored
+        .iter()
+        .find(|e| e.cache_key == miss.cache_key)
+        .and_then(|entry| std::fs::read_to_string(entry.meta_path()).ok())
+        .and_then(|content| serde_json::from_str::<crate::store::EntryMeta>(&content).ok());
 
     let Some(miss_meta) = miss_meta else {
         return;
@@ -2087,7 +2122,7 @@ fn why_miss_diff_entries(
     let mut other_metas = Vec::new();
 
     for entry in other_entries {
-        let meta_path = store.entry_dir(&entry.cache_key).join("meta.json");
+        let meta_path = entry.meta_path();
         let other_meta = std::fs::read_to_string(&meta_path)
             .ok()
             .and_then(|c| serde_json::from_str::<crate::store::EntryMeta>(&c).ok());
@@ -2968,12 +3003,13 @@ pub fn list(
     no_pager: bool,
     json: bool,
 ) -> Result<()> {
-    let store = Store::open(config)?;
+    let inventory = crate::store_view::read(config, true, sort_by)?;
 
     if json {
         #[derive(serde::Serialize)]
         struct EntryBody<'a> {
             cache_key: &'a str,
+            store_dirs: &'a [std::path::PathBuf],
             crate_name: &'a str,
             crate_type: &'a str,
             profile: &'a str,
@@ -2982,8 +3018,8 @@ pub fn list(
             created_at: &'a str,
             last_accessed: &'a str,
         }
-        let entries = store.list_entries(sort_by)?;
-        let matching: Vec<&crate::store::EntryInfo> = if let Some(name) = crate_name {
+        let entries = inventory.entries;
+        let matching: Vec<&daemon::StatsEntry> = if let Some(name) = crate_name {
             entries
                 .iter()
                 .filter(|e| crate_name_matches(name, &e.crate_name))
@@ -2995,6 +3031,7 @@ pub fn list(
             .iter()
             .map(|e| EntryBody {
                 cache_key: &e.cache_key,
+                store_dirs: &e.store_dirs,
                 crate_name: &e.crate_name,
                 crate_type: &e.crate_type,
                 profile: &e.profile,
@@ -3007,13 +3044,26 @@ pub fn list(
         #[derive(serde::Serialize)]
         struct Body<T> {
             entries: Vec<T>,
+            stores: Vec<crate::store_view::StoreSummary>,
         }
-        return crate::machine::emit("list", Body { entries: body }, Vec::new());
+        return crate::machine::emit(
+            "list",
+            Body {
+                entries: body,
+                stores: inventory.stores,
+            },
+            Vec::new(),
+        );
     }
 
+    for store in &inventory.stores {
+        if let Some(error) = &store.error {
+            eprintln!("Store {}: unavailable ({error})", store.path.display());
+        }
+    }
     if let Some(name) = crate_name {
         // Detail view for a specific crate
-        let entries = store.list_entries("name")?;
+        let entries = inventory.entries;
         let matching: Vec<_> = entries.iter().filter(|e| e.crate_name == name).collect();
 
         if matching.is_empty() {
@@ -3025,6 +3075,7 @@ pub fn list(
         for entry in &matching {
             lines.push(format!("Cache key: {}", &entry.cache_key[..16]));
             lines.push(format!("  Crate:    {}", entry.crate_name));
+            lines.push(format!("  Stores:   {}", entry.store_locations()));
             push_nonempty_detail(&mut lines, "  Type:     ", &entry.crate_type);
             push_nonempty_detail(&mut lines, "  Profile:  ", &entry.profile);
             lines.push(format!("  Size:     {}", ByteSize(entry.size)));
@@ -3032,7 +3083,7 @@ pub fn list(
             lines.push(format!("  Created:  {}", entry.created_at));
             lines.push(format!("  Accessed: {}", entry.last_accessed));
 
-            let meta_path = store.entry_dir(&entry.cache_key).join("meta.json");
+            let meta_path = entry.meta_path();
             if let Ok(content) = std::fs::read_to_string(&meta_path)
                 && let Ok(meta) = serde_json::from_str::<crate::store::EntryMeta>(&content)
             {
@@ -3048,7 +3099,7 @@ pub fn list(
         write_paged(&lines, no_pager);
     } else {
         // Summary view of all entries
-        let entries = store.list_entries(sort_by)?;
+        let entries = inventory.entries;
 
         if entries.is_empty() {
             println!("No cached entries.");
@@ -3057,8 +3108,8 @@ pub fn list(
 
         let mut lines = vec![
             format!(
-                "{:<30} {:<10} {:<8} {:>10} {:>6} {:>12} {:>12}",
-                "Crate", "Type", "Profile", "Size", "Hits", "Created", "Accessed"
+                "{:<30} {:<10} {:<8} {:>10} {:>6} {:>12} {:>12}  {}",
+                "Crate", "Type", "Profile", "Size", "Hits", "Created", "Accessed", "Stores"
             ),
             "-".repeat(92),
         ];
@@ -3075,7 +3126,7 @@ pub fn list(
                 &entry.profile
             };
             lines.push(format!(
-                "{:<30} {:<10} {:<8} {:>10} {:>6} {:>12} {:>12}",
+                "{:<30} {:<10} {:<8} {:>10} {:>6} {:>12} {:>12}  {}",
                 entry.crate_name,
                 crate_type,
                 profile,
@@ -3083,6 +3134,7 @@ pub fn list(
                 entry.hit_count,
                 &entry.created_at[..10],
                 &entry.last_accessed[..10],
+                entry.store_locations(),
             ));
         }
 
@@ -5278,6 +5330,95 @@ fn daemon_version_check(
     }
 }
 
+pub(crate) struct Check {
+    label: &'static str,
+    pub(crate) pass: bool,
+    pub(crate) detail: String,
+    fix: Option<String>,
+}
+
+pub(crate) fn doctor_shards(config: &Config) -> Vec<Check> {
+    crate::store_view::shard_configs(config)
+        .iter()
+        .map(|shard| {
+            let path = shard.cache_dir.display();
+            if !crate::volume_gc::shard_has_index(&shard.cache_dir) {
+                return Check {
+                    label: "Volume store",
+                    pass: false,
+                    detail: format!("{path}: no index (not initialized or volume unavailable)"),
+                    fix: Some(
+                        "check the volume is mounted and the configured shard path is correct"
+                            .into(),
+                    ),
+                };
+            }
+            let result = Store::open(shard).and_then(|store| {
+                Ok((
+                    store.entry_count()?,
+                    store.total_size()?,
+                    store.blob_stats()?,
+                ))
+            });
+            match result {
+                Ok((entries, bytes, blobs)) => {
+                    let fs = crate::cache_fs::advisory_for(
+                        &crate::cache_fs::probe(&shard.cache_dir),
+                        &shard.cache_dir,
+                    );
+                    let drift = blobs.total_blob_size > blobs.total_logical_size;
+                    Check {
+                        label: "Volume store",
+                        pass: fs.is_none() && !drift,
+                        detail: format!(
+                            "{path}: {entries} entries, {} / {}{}",
+                            ByteSize(bytes),
+                            ByteSize(shard.max_size),
+                            if drift {
+                                "; blob accounting needs repair"
+                            } else {
+                                ""
+                            }
+                        ),
+                        fix: fs.or_else(|| {
+                            drift.then(|| "run `kache doctor --verify --repair`".into())
+                        }),
+                    }
+                }
+                Err(error) => Check {
+                    label: "Volume store",
+                    pass: false,
+                    detail: format!("{path}: {error}"),
+                    fix: Some("check the shard's storage and permissions".into()),
+                },
+            }
+        })
+        .collect()
+}
+
+fn doctor_link_layout(config: &Config, build_dir: &std::path::Path) -> Check {
+    let routed = config.routed_for_path(build_dir);
+    let staging = routed.store_dir().join("staging");
+    if routed.cache_dir != config.cache_dir && !crate::volume_gc::shard_has_index(&routed.cache_dir)
+    {
+        return Check {
+            label: "Link layout",
+            pass: false,
+            detail: format!(
+                "mapped store {} is unavailable; link probe skipped",
+                routed.cache_dir.display()
+            ),
+            fix: None,
+        };
+    }
+    let probe = crate::link_probe::probe_link_layout(build_dir, &staging);
+    Check {
+        label: "Link layout", pass: probe.hardlink_supported,
+        detail: format!("{} (build: {}, staging: {})", crate::link_probe::format_probe_detail(&probe), build_dir.display(), staging.display()),
+        fix: (!probe.hardlink_supported).then(|| "put the cache and build tree on the SAME mount for zero-copy sharing; if this layout is intentional, expect copies (see `kache report` copy reasons)".into()),
+    }
+}
+
 pub fn doctor(
     fix: bool,
     purge_sccache: bool,
@@ -5298,13 +5439,6 @@ pub fn doctor(
         config.as_ref().is_some_and(|c| c.remote.is_some()),
         crate::config::Config::load_planner_config().is_some(),
     );
-
-    struct Check {
-        label: &'static str,
-        pass: bool,
-        detail: String,
-        fix: Option<String>,
-    }
 
     // Live compiler probe (#626): a toolchain whose `cc -###` resolves no
     // compile line makes every probe-keyed C/C++ flag refuse to cache —
@@ -5508,38 +5642,22 @@ pub fn doctor(
             }),
         }
 
-        // 4c. Hardlink layout (#835): can the build tree hardlink into
-        // `<store>/staging`? EXDEV across two bind mounts of one filesystem
-        // is the most likely cause of 0% multi-link blobs on ext4 CI, with
-        // both ingest and restore falling silently to a copy. The probe
-        // creates a temp file in the build tree (current dir as proxy) and
-        // links it into staging, then removes both — observability only.
-        {
-            let build_dir = std::env::current_dir().unwrap_or_else(|_| cfg.cache_dir.clone());
-            let staging_dir = cfg.store_dir().join("staging");
-            let probe = crate::link_probe::probe_link_layout(&build_dir, &staging_dir);
-            let detail = crate::link_probe::format_probe_detail(&probe);
-            let full_detail = format!(
-                "{} (build: {}, staging: {})",
-                detail,
-                build_dir.display(),
-                staging_dir.display()
-            );
+        if let Ok(view) = crate::store_view::read(cfg, false, "name") {
             checks.push(Check {
-                label: "Link layout",
-                pass: probe.hardlink_supported,
-                detail: full_detail,
-                fix: if probe.hardlink_supported {
-                    None
-                } else {
-                    Some(
-                        "put the cache and build tree on the SAME mount for zero-copy sharing; \
-                         if this layout is intentional, expect copies (see `kache report` copy reasons)"
-                            .to_string(),
-                    )
-                },
+                label: "Store totals",
+                pass: view.stores.iter().all(|s| s.error.is_none()),
+                detail: format!(
+                    "{} unique entries, {} stored across {} configured stores",
+                    view.entry_count,
+                    ByteSize(view.total_size),
+                    view.stores.len()
+                ),
+                fix: None,
             });
         }
+        checks.extend(doctor_shards(cfg));
+        let build_dir = std::env::current_dir().unwrap_or_else(|_| cfg.cache_dir.clone());
+        checks.push(doctor_link_layout(cfg, &build_dir));
     }
 
     // 5. Remote cache
@@ -7122,6 +7240,28 @@ fn scrub_blob_checksums(
 }
 
 pub fn verify(config: &Config, checksums: bool, repair: bool) -> Result<VerifyOutcome> {
+    let mut total = verify_store(config, checksums, repair)?;
+    for shard in crate::store_view::shard_configs(config) {
+        anyhow::ensure!(
+            crate::volume_gc::shard_has_index(&shard.cache_dir),
+            "cannot verify volume store {}: no index (not initialized or volume unavailable)",
+            shard.cache_dir.display()
+        );
+        println!("\nVolume store: {}", shard.cache_dir.display());
+        let outcome = verify_store(&shard, checksums, repair)?;
+        total.total_entries += outcome.total_entries;
+        total.valid_entries += outcome.valid_entries;
+        total.corrupted_entries += outcome.corrupted_entries;
+        total.missing_blobs += outcome.missing_blobs;
+        total.checksum_failures += outcome.checksum_failures;
+        total.orphaned_blobs += outcome.orphaned_blobs;
+        total.corrupted_removed += outcome.corrupted_removed;
+        total.index_drift += outcome.index_drift;
+    }
+    Ok(total)
+}
+
+fn verify_store(config: &Config, checksums: bool, repair: bool) -> Result<VerifyOutcome> {
     let store = Store::open(config)?;
 
     // Adopt entries the index doesn't know about before verifying it (#415).

@@ -957,13 +957,12 @@ fn a_rejected_record_keys_from_the_running_compile() {
     std::fs::write(b.join("NOTES.md"), "not in checkout a\n").unwrap();
     assert_eq!(unit.build_as_cargo(&a).result, "miss");
 
+    // The compile stopped at its dep-info did the pre-pass's work and is
+    // counted as one; a hit still records no compiler run.
     let hit = unit.build_as_cargo(&b);
     assert_eq!(hit.result, "local_hit");
-    assert_eq!(
-        hit.dep_info_runs, 0,
-        "no pre-pass: the compile wrote the closure"
-    );
-    assert_eq!(hit.compiler_runs, 1, "the compile ran, and was stopped");
+    assert_eq!(hit.dep_info_runs, 1);
+    assert_eq!(hit.compiler_runs, 0);
 
     std::fs::write(
         b.join("kt/src/lib.rs"),

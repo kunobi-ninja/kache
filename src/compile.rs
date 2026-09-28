@@ -109,7 +109,14 @@ pub fn run_rustc(
     // files and fails with "output file is not writeable".
     pre_clean_outputs(output_path, out_dir, crate_name, extra_filename, emit);
 
-    crate::opcounts::record_compiler_run();
+    // A compile that may stop at its dep-info is counted once it is known
+    // whether it did: stopped, it did the pre-pass's work and no more, and a
+    // hit records no compiler run.
+    let may_stop = on_dep_info.is_some();
+    if !may_stop {
+        crate::opcounts::record_compiler_run();
+    }
+    let spawned = std::time::Instant::now();
     let mut cmd = Command::new(rustc);
 
     // Double-wrapper (RUSTC_WRAPPER + RUSTC_WORKSPACE_WRAPPER): the workspace
@@ -208,6 +215,13 @@ pub fn run_rustc(
 
     let (status, stdout, captured_stderr) =
         captured.with_context(|| format!("executing {}", rustc.display()))?;
+    if may_stop {
+        if captured_stderr.stopped {
+            crate::opcounts::record_dep_info_run(spawned.elapsed());
+        } else {
+            crate::opcounts::record_compiler_run();
+        }
+    }
 
     let exit_code = status.code().unwrap_or(1);
     let stdout = String::from_utf8_lossy(&stdout).to_string();

@@ -248,7 +248,7 @@ pub fn run_rustc(
     // for invocations that don't emit those messages (a bare `rustc`
     // without `--json=artifacts`), where filename guessing is the best
     // available signal.
-    let artifacts = if exit_code == 0 && !captured_stderr.stopped {
+    let artifacts = if exit_code == 0 {
         let from_json = resolve_artifacts(&captured_stderr.artifacts);
         if from_json.is_empty() {
             tracing::debug!(

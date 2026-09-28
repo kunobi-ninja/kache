@@ -917,8 +917,8 @@ impl RustcArgs {
         let mut args = self.all_args.iter();
         while let Some(arg) = args.next() {
             let (flag, value) = match arg.split_once('=') {
-                Some((flag, value)) if flag.starts_with("--") => (flag, Some(value.to_string())),
-                _ => (arg.as_str(), None),
+                Some((flag, value)) => (flag, Some(value.to_string())),
+                None => (arg.as_str(), None),
             };
             let value = || value.clone().or_else(|| args.clone().next().cloned());
             match flag {

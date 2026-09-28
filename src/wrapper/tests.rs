@@ -8013,6 +8013,7 @@ fn session_markers_are_job_scoped_when_store_is_shared() {
 
 #[test]
 fn remote_prefetch_creates_a_fresh_marker_in_the_job_runtime() {
+    let _lock = crate::test_support::process_state_test_lock();
     let dir = tempfile::tempdir().unwrap();
     let workspace = dir.path().join("workspace");
     let source = workspace.join("src/lib.rs");

@@ -36,7 +36,7 @@ package() {
   # compiler::shim::SHIM_NAMES. Symlink target is the installed path, not
   # the extracted srcdir binary.
   install -d "$pkgdir/usr/lib/kache"
-  for name in cc c++ gcc g++ clang clang++; do
+  for name in cc c++ gcc g++ clang clang++ cargo; do
     ln -s /usr/bin/kache "$pkgdir/usr/lib/kache/$name"
   done
   # Marks the farm so another kache on PATH skips it (see

@@ -17,7 +17,7 @@ pub(crate) struct Block {
     last: bool,
 }
 
-/// Puts the compiler shims first on `PATH`, so it runs after any other
+/// Puts the Cargo and compiler shims first on `PATH`, so it runs after any other
 /// `PATH` change in the file.
 pub(crate) const COMPILER_BLOCK: Block = Block {
     begin: BEGIN,

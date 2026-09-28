@@ -81,10 +81,19 @@ pub fn run(args: &[OsString]) -> i32 {
         return RUN_FAILED;
     }
     let env = TestEnv::capture();
-    let config = crate::config::Config::load()
-        .ok()
-        .filter(|config| config.scheduler);
+    let config = crate::config::Config::load().ok();
     let cache_dir = config.as_ref().map(|config| config.cache_dir.as_path());
+    let target_use = match cache_dir.map(crate::target_use::shared).transpose() {
+        Ok(lease) => lease,
+        Err(error) => {
+            eprintln!("kache test-runner: cannot protect target directory: {error}");
+            return RUN_FAILED;
+        }
+    };
+    let scheduler_dir = config
+        .as_ref()
+        .filter(|config| config.scheduler)
+        .map(|config| config.cache_dir.as_path());
     let prefix = match delegate::prefix() {
         Ok(prefix) => prefix,
         Err(error) => {
@@ -94,11 +103,31 @@ pub fn run(args: &[OsString]) -> i32 {
     };
     let marker = (!prefix.is_empty()).then(|| delegate::delegate_marker(&prefix));
     let command = [prefix, args.to_vec()].concat();
-    match (cache_dir, plan(args, &env, cache_dir)) {
+    match (scheduler_dir, plan(args, &env, scheduler_dir)) {
         (Some(cache_dir), Plan::Schedule { key, want }) => {
+            let _target_use = target_use;
             run_scheduled(&command, marker, cache_dir, &env, &key, want)
         }
-        _ => exec(&command, marker),
+        _ => match target_use {
+            Some(lease) => run_protected(&command, marker, lease),
+            None => exec(&command, marker),
+        },
+    }
+}
+
+/// Keep the target lease in this process until an unscheduled test exits.
+fn run_protected(args: &[OsString], marker: Option<String>, _lease: std::fs::File) -> i32 {
+    let mut command = Command::new(&args[0]);
+    command.args(&args[1..]);
+    set_marker(&mut command, marker);
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => return run_failed(&args[0], &error),
+    };
+    signals::forward_to(child.id());
+    match child.wait() {
+        Ok(status) => finish(exit_disposition(status.code(), signals::of(&status))),
+        Err(error) => run_failed(&args[0], &error),
     }
 }
 
@@ -299,7 +328,7 @@ fn run_failed(program: &OsStr, error: &std::io::Error) -> i32 {
 }
 
 /// The runner's exit code. A signal death re-raises the signal first.
-fn finish(disposition: Disposition) -> i32 {
+pub(crate) fn finish(disposition: Disposition) -> i32 {
     match disposition {
         Disposition::Exit(code) => code,
         Disposition::Signal { signal, fallback } => {
@@ -310,7 +339,7 @@ fn finish(disposition: Disposition) -> i32 {
 }
 
 #[cfg(unix)]
-mod signals {
+pub(crate) mod signals {
     use std::sync::atomic::{AtomicI32, Ordering};
 
     static CHILD: AtomicI32 = AtomicI32::new(0);
@@ -324,7 +353,7 @@ mod signals {
     /// Leave terminal interrupts to the child, which shares the process
     /// group and receives them itself, and pass termination on to it. The
     /// runner then exits the way the child does.
-    pub(super) fn forward_to(child: u32) {
+    pub(crate) fn forward_to(child: u32) {
         CHILD.store(child as libc::pid_t, Ordering::SeqCst);
         let handler = forward as extern "C" fn(libc::c_int) as libc::sighandler_t;
         for (signal, action) in [
@@ -345,13 +374,13 @@ mod signals {
         }
     }
 
-    pub(super) fn of(status: &std::process::ExitStatus) -> Option<i32> {
+    pub(crate) fn of(status: &std::process::ExitStatus) -> Option<i32> {
         use std::os::unix::process::ExitStatusExt;
         status.signal()
     }
 
     /// Die of `signal` without dumping core: the child already did.
-    pub(super) fn raise(signal: i32) {
+    pub(crate) fn raise(signal: i32) {
         // SAFETY: plain libc calls on values owned here.
         unsafe {
             let no_core = libc::rlimit {
@@ -372,20 +401,20 @@ mod signals {
 // Named apart from the Unix module so the Linux mutation lane, which never
 // compiles it, can exclude it by name.
 #[cfg(windows)]
-use windows_signals as signals;
+pub(crate) use windows_signals as signals;
 
 #[cfg(windows)]
-mod windows_signals {
+pub(crate) mod windows_signals {
     /// Leave Ctrl-C to the child, which shares the console and receives it
     /// itself. The runner then exits the way the child does.
-    pub(super) fn forward_to(_child: u32) {
+    pub(crate) fn forward_to(_child: u32) {
         // SAFETY: a null handler with TRUE makes this process ignore Ctrl-C.
         unsafe {
             windows_sys::Win32::System::Console::SetConsoleCtrlHandler(None, 1);
         }
     }
 
-    pub(super) fn of(_status: &std::process::ExitStatus) -> Option<i32> {
+    pub(crate) fn of(_status: &std::process::ExitStatus) -> Option<i32> {
         None
     }
 

@@ -172,7 +172,7 @@ assets = [
     ["README.md", "usr/share/doc/kache/README", "644"],
 ]
 # postinst runs `kache install-shims --force /usr/lib/kache` so the farm
-# matches SHIM_NAMES in this binary. prerm removes those six links.
+# matches SHIM_NAMES in this binary. prerm removes those links.
 maintainer-scripts = "packaging/debian/"
 
 [profile.release]

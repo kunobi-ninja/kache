@@ -7,6 +7,7 @@ use std::ffi::OsString;
 use std::os::unix::ffi::OsStringExt;
 use std::path::Path;
 use std::process::{Command, Output};
+use std::time::{Duration, Instant};
 
 const KACHE_BIN: &str = env!("CARGO_BIN_EXE_kache");
 
@@ -32,6 +33,76 @@ fn proxied_cargo(home: &Path, cache: &Path, target: &Path) -> Command {
         // An inherited build-dir turns the proxy's worktree isolation off.
         .env_remove("CARGO_BUILD_BUILD_DIR");
     command
+}
+
+#[test]
+fn cargo_shim_holds_target_lease_for_whole_test() {
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path().join("project");
+    let target = project.join("target");
+    let cache = dir.path().join("cache");
+    let shims = dir.path().join("shims");
+    let real = dir.path().join("real");
+    let ready = dir.path().join("ready");
+    let go = dir.path().join("go");
+    std::fs::create_dir_all(target.join("debug")).unwrap();
+    std::fs::create_dir_all(&shims).unwrap();
+    std::fs::create_dir_all(&real).unwrap();
+    std::fs::write(project.join("Cargo.toml"), "[workspace]\n").unwrap();
+    std::fs::write(target.join("debug/output"), "still needed").unwrap();
+    std::os::unix::fs::symlink(KACHE_BIN, shims.join("cargo")).unwrap();
+    let fake = real.join("cargo");
+    std::fs::write(
+        &fake,
+        "#!/bin/sh\n[ \"$1\" = test ] || exit 12\n: > \"$READY\"\nwhile [ ! -e \"$GO\" ]; do sleep 0.02; done\n[ -e \"$TARGET/debug/output\" ] || exit 13\n",
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let base_path = std::env::var_os("PATH").unwrap();
+    let path = std::env::join_paths(
+        [shims.clone(), real.clone()]
+            .into_iter()
+            .chain(std::env::split_paths(&base_path)),
+    )
+    .unwrap();
+    let mut command = hermetic_command(shims.join("cargo"), &cache, None);
+    let mut child = command
+        .arg("test")
+        .current_dir(&project)
+        .env("PATH", path)
+        .env("READY", &ready)
+        .env("GO", &go)
+        .env("TARGET", &target)
+        .env_remove("KACHE_REAL_CARGO")
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !ready.exists() {
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "Cargo exited before test started"
+        );
+        assert!(Instant::now() < deadline, "Cargo did not start the test");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let lease = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(cache.join("target-use.lock"))
+        .unwrap();
+    assert!(
+        matches!(lease.try_lock(), Err(std::fs::TryLockError::WouldBlock)),
+        "the cargo shim released the target while its test was running"
+    );
+    assert!(target.join("debug/output").exists());
+
+    std::fs::write(&go, "").unwrap();
+    assert!(child.wait().unwrap().success());
+    lease.lock().unwrap();
+    lease.unlock().unwrap();
 }
 
 #[test]

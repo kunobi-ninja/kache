@@ -6,7 +6,7 @@ set -e
 case "$1" in
 remove|deconfigure)
   if [ -d /usr/lib/kache ]; then
-    for name in cc c++ gcc g++ clang clang++; do
+    for name in cc c++ gcc g++ clang clang++ cargo; do
       path="/usr/lib/kache/$name"
       if [ -L "$path" ]; then
         rm -f "$path"

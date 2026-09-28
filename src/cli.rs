@@ -4276,7 +4276,7 @@ pub fn clean(
         let to_remove: Vec<_> = targets.iter().map(RemovalTarget::from_entry).collect();
         let mut skipped = skipped.clone();
         let (removed, estimated_reclaimed, apparent_gap) =
-            remove_targets(&to_remove, &root, json, &mut skipped);
+            remove_targets(&to_remove, &root, &config.cache_dir, json, &mut skipped);
         let removed_paths: Vec<String> = to_remove
             .iter()
             .filter(|target| path_was_removed(&target.path))
@@ -4350,7 +4350,7 @@ pub fn clean(
         }
         Some(to_remove) => {
             let (removed, estimated_reclaimed, apparent_gap) =
-                remove_targets(&to_remove, &root, false, &mut Vec::new());
+                remove_targets(&to_remove, &root, &config.cache_dir, false, &mut Vec::new());
             if tracked {
                 let store = Store::open(config)?;
                 for target in &to_remove {
@@ -4398,6 +4398,7 @@ impl RemovalTarget {
 fn remove_targets(
     to_remove: &[RemovalTarget],
     root: &std::path::Path,
+    cache_dir: &std::path::Path,
     quiet: bool,
     skipped: &mut Vec<CleanSkipped>,
 ) -> (usize, u64, u64) {
@@ -4416,7 +4417,11 @@ fn remove_targets(
             }
             continue;
         }
-        if target_in_use(&target.path) {
+        let reservation = crate::target_use::try_exclusive(cache_dir).unwrap_or_else(|error| {
+            tracing::warn!("cannot check running Cargo commands before clean: {error}");
+            None
+        });
+        if reservation.is_none() || target_in_use(&target.path) {
             if human_clean_output(quiet) {
                 println!("  skipped {} — {TARGET_IN_USE}", rel.display());
             }
@@ -4450,7 +4455,7 @@ fn human_clean_output(quiet: bool) -> bool {
     !quiet
 }
 
-const TARGET_IN_USE: &str = "in use by a running build";
+const TARGET_IN_USE: &str = "in use by a running Cargo command or test";
 
 /// Whether a Cargo process holds one of `target`'s build locks. Cargo takes
 /// an exclusive lock on `<profile>/.cargo-lock` (and
@@ -7989,15 +7994,17 @@ pub fn init(yes: bool, no_service: bool, no_shell: bool, check: bool) -> Result<
 fn init_compiler_setup(yes: bool, no_shell: bool, check: bool) -> Result<bool> {
     use crate::init_shell::Edit;
     if no_shell {
-        println!("  • Terminal C/C++ caching: skipped (--no-shell)");
+        println!("  • Cargo target protection and C/C++ caching: skipped (--no-shell)");
         return Ok(false);
     }
     let Some(shim_dir) = crate::compiler::shim::default_shim_dir() else {
-        println!("  • Terminal C/C++ caching: skipped (no home directory)");
+        println!("  • Cargo target protection and C/C++ caching: skipped (no home directory)");
         return Ok(false);
     };
     let Some((shell, paths)) = shell_startup_files()? else {
-        println!("  • Terminal C/C++ caching: shell not supported for automatic setup");
+        println!(
+            "  • Cargo target protection and C/C++ caching: shell not supported for automatic setup"
+        );
         println!(
             "    Use kache install-shims, then add {} to your shell's PATH.",
             shim_dir.display()
@@ -8012,7 +8019,9 @@ fn init_compiler_setup(yes: bool, no_shell: bool, check: bool) -> Result<bool> {
     let edits = match edits {
         Ok(edits) => edits,
         Err(error) => {
-            println!("  • Terminal C/C++ caching: shell config needs manual attention");
+            println!(
+                "  • Cargo target protection and C/C++ caching: shell config needs manual attention"
+            );
             println!("    {error}");
             println!("    No shell files were changed.");
             return Ok(false);
@@ -8021,7 +8030,7 @@ fn init_compiler_setup(yes: bool, no_shell: bool, check: bool) -> Result<bool> {
     let shims_ready = shim_dir_is_ready(&shim_dir);
     let needs_edit = edits.iter().any(Edit::changed);
     if !shims_ready || needs_edit {
-        println!("  C/C++ caching: terminal builds using cc, gcc or clang");
+        println!("  Cargo target protection and C/C++ caching in new terminals");
         for edit in edits.iter().filter(|edit| edit.changed()) {
             println!(
                 "    Shell config: {}",
@@ -8029,11 +8038,15 @@ fn init_compiler_setup(yes: bool, no_shell: bool, check: bool) -> Result<bool> {
             );
         }
         if check {
-            println!("    Would install compiler links and save the shell setup.");
+            println!("    Would install Cargo and compiler links and save the shell setup.");
             return Ok(false);
         }
-        if !prompt_yes_no("Enable C/C++ caching in new terminals?", true, yes)? {
-            println!("  • Terminal C/C++ caching: skipped");
+        if !prompt_yes_no(
+            "Protect Cargo targets and cache C/C++ in new terminals?",
+            true,
+            yes,
+        )? {
+            println!("  • Cargo target protection and C/C++ caching: skipped");
             return Ok(false);
         }
         if !shims_ready {
@@ -8054,10 +8067,10 @@ fn init_compiler_setup(yes: bool, no_shell: bool, check: bool) -> Result<bool> {
         }
     }
     if crate::compiler::shim::live_shim_status().is_active() {
-        println!("  ✓ Terminal C/C++ caching: active");
+        println!("  ✓ Cargo target protection and C/C++ caching: active");
         Ok(false)
     } else {
-        println!("  ✓ Terminal C/C++ caching: configured for new terminals");
+        println!("  ✓ Cargo target protection and C/C++ caching: configured for new terminals");
         println!("    For this terminal, run:");
         println!("    {}", shell.command(&shim_dir)?);
         Ok(true)
@@ -8336,6 +8349,11 @@ fn install_report_lines(
     lines.push(
         "Make, CMake, autotools, and Arch PKGBUILDs that invoke gcc/cc/clang \
          from PATH then go through kache. No CC/CXX edit and no shell wrapper."
+            .into(),
+    );
+    lines.push(
+        "Cargo commands on PATH also run through kache, which keeps target directories \
+         until the command exits. The command remains cargo build/test/run."
             .into(),
     );
     lines.push(format!(

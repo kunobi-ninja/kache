@@ -28,7 +28,7 @@ Run `kache <command> --help` for the exact syntax in your installed version.
 | `config` | Open the configuration editor |
 | `login` | Log in to the planner with a Kunobi account |
 | `logout` | Log out of the planner and revoke the stored session |
-| `install-shims` | Create Unix compiler-name symlinks |
+| `install-shims` | Create Unix Cargo and compiler symlinks |
 | `test-runner` | Run a test binary as Cargo's target runner, paced by the scheduler |
 | `completions` | Generate shell completion scripts |
 
@@ -95,7 +95,7 @@ kache clean --orphans --yes
 
 `--tracked` uses the bounded machine-local target registry populated by normal builds and restores. `--stale` filters by last use; without it, `--tracked` selects targets unused for 14 days. `--orphans` implies `--tracked`. A target whose worktree or workspace has been deleted qualifies however recently it was built; `--orphans` selects only those. A workspace counts as deleted only while the directory that held it still exists, so an unmounted volume does not.
 
-Cleanup rechecks each directory's identity and removes only the derived target directory. It skips paths that are missing, moved, replaced or unsafe, and targets of the current workspace. A target that a running build holds (its `.cargo-lock`) is skipped with `in use by a running build`, in every mode.
+Cleanup rechecks each directory's identity and removes only the derived target directory. It skips paths that are missing, moved, replaced or unsafe, and targets of the current workspace. A target in use by a running Cargo command or test is skipped in every mode. Kache checks Cargo's `.cargo-lock` and its own command lock before deleting it.
 
 The daemon removes tracked targets whose workspace was deleted on its own, and idle ones when configured. See [Target directory cleanup](/docs/getting-started/configuration#target-directory-cleanup).
 
@@ -427,7 +427,7 @@ kache install-shims --from-path
 kache install-shims --force ~/.local/lib/kache/shims
 ```
 
-Unix only. Creates `cc`, `c++`, `gcc`, `g++`, `clang`, and `clang++` symlinks to Kache. With no directory argument the farm is `~/.local/lib/kache/shims`. `--from-path` also wraps compiler names already on `PATH` (`gcc-13`, target-prefixed drivers). Put the directory before the real compilers in `PATH`. If the directory then holds only Kache links, `install-shims` also writes a `.kache-shims` marker. When Kache looks for the real compiler, it skips everything in a marked directory. A directory that also holds other files, such as a real compiler, is left unmarked.
+Unix only. Creates `cargo`, `cc`, `c++`, `gcc`, `g++`, `clang`, and `clang++` symlinks to Kache. With no directory argument the farm is `~/.local/lib/kache/shims`. `--from-path` also wraps compiler names already on `PATH` (`gcc-13`, target-prefixed drivers). Put the directory before the real compilers in `PATH`. If the directory then holds only Kache links, `install-shims` also writes a `.kache-shims` marker. When Kache looks for the real compiler, it skips everything in a marked directory. A directory that also holds other files, such as a real compiler, is left unmarked.
 
 The links point at a path that survives upgrades when one reaches the running binary: Homebrew's `opt` link, a Nix profile, mise's `latest` alias, or a `kache` on `PATH` outside version directories. Without `--force`, existing entries are kept, except in a directory Kache created, marked, or filled only with Kache links. There a rerun replaces Kache links whose target is missing or not executable, and moves Kache links into a version directory to the upgrade-safe path. Other links are kept. See [C and C++](/docs/getting-started/c-cpp#upgrades).
 

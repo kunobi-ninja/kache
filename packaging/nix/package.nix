@@ -70,7 +70,7 @@ rustPlatform.buildRustPackage {
 
   postInstall = lib.optionalString stdenv.hostPlatform.isUnix ''
     mkdir -p $out/lib/kache
-    for name in cc c++ gcc g++ clang clang++; do
+    for name in cc c++ gcc g++ clang clang++ cargo; do
       ln -s $out/bin/kache $out/lib/kache/$name
     done
     # Marks the farm so another kache on PATH skips it (see

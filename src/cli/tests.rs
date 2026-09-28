@@ -6038,7 +6038,7 @@ fn remove_targets_deletes_all_and_reports_estimates() {
         },
     ];
     let (removed, estimated_reclaimed, apparent_gap) =
-        remove_targets(&to_remove, root.path(), false, &mut Vec::new());
+        remove_targets(&to_remove, root.path(), root.path(), false, &mut Vec::new());
 
     assert_eq!(removed, 2, "both target/ dirs removed");
     assert_eq!(estimated_reclaimed, 260);
@@ -6070,7 +6070,7 @@ fn remove_targets_skips_failures_without_aborting() {
         },
     ];
     let (removed, estimated_reclaimed, apparent_gap) =
-        remove_targets(&to_remove, root.path(), false, &mut Vec::new());
+        remove_targets(&to_remove, root.path(), root.path(), false, &mut Vec::new());
 
     assert_eq!(removed, 1, "only the existing dir counts as removed");
     assert_eq!(
@@ -6130,12 +6130,40 @@ fn remove_targets_leaves_a_target_a_build_is_writing() {
         apparent_gap: 0,
     });
     let mut skipped = Vec::new();
-    let (removed, reclaimed, _) = remove_targets(&to_remove, root.path(), true, &mut skipped);
+    let (removed, reclaimed, _) =
+        remove_targets(&to_remove, root.path(), root.path(), true, &mut skipped);
     assert_eq!((removed, reclaimed), (1, 10));
     assert!(busy.exists() && !idle.exists());
     assert_eq!(skipped.len(), 1);
     assert_eq!(skipped[0].path, busy.display().to_string());
     assert_eq!(skipped[0].reason, TARGET_IN_USE);
+}
+
+#[test]
+fn remove_targets_keeps_a_target_while_cargo_is_running() {
+    let root = tempfile::tempdir().unwrap();
+    let target = root.path().join("project/target");
+    std::fs::create_dir_all(&target).unwrap();
+    let to_remove = [RemovalTarget {
+        path: target.clone(),
+        scanned_identity: directory_identity(&target),
+        estimated_reclaimable: 10,
+        apparent_gap: 0,
+    }];
+    let command = crate::target_use::shared(root.path()).unwrap();
+    let mut skipped = Vec::new();
+    assert_eq!(
+        remove_targets(&to_remove, root.path(), root.path(), true, &mut skipped).0,
+        0
+    );
+    assert!(target.exists());
+    assert_eq!(skipped[0].reason, TARGET_IN_USE);
+    drop(command);
+    assert_eq!(
+        remove_targets(&to_remove, root.path(), root.path(), true, &mut Vec::new()).0,
+        1
+    );
+    assert!(!target.exists());
 }
 
 #[test]
@@ -6329,7 +6357,7 @@ fn remove_targets_refuses_a_directory_replaced_after_scan() {
         apparent_gap: 0,
     }];
     let (removed, estimated_reclaimed, apparent_gap) =
-        remove_targets(&to_remove, root.path(), false, &mut Vec::new());
+        remove_targets(&to_remove, root.path(), root.path(), false, &mut Vec::new());
 
     assert_eq!((removed, estimated_reclaimed, apparent_gap), (0, 0, 0));
     assert!(

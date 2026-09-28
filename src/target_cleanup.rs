@@ -173,7 +173,7 @@ pub(crate) fn sweep(config: &Config, now: u64) -> anyhow::Result<Swept> {
         if crate::cli::target_in_use(&tracked.path) {
             continue;
         }
-        match remove(&tracked.path, now) {
+        match remove(&tracked.path, now, &config.cache_dir) {
             Ok(true) => {
                 store.forget_target_root(&tracked.path)?;
                 swept.removed.push((tracked.path, reason));
@@ -200,7 +200,10 @@ fn looks_like_a_source_root(path: &Path) -> bool {
 /// that took its lock before the rename is found, and the directory is
 /// renamed back; one that starts after the rename creates a new directory.
 /// `Ok(false)` when a build holds it, before or after the rename.
-fn remove(target: &Path, now: i64) -> std::io::Result<bool> {
+fn remove(target: &Path, now: i64, cache_dir: &Path) -> std::io::Result<bool> {
+    let Some(_reservation) = crate::target_use::try_exclusive(cache_dir)? else {
+        return Ok(false);
+    };
     let name = target.file_name().unwrap_or_default().to_string_lossy();
     let aside = target.with_file_name(format!(
         ".{name}.kache-removing-{}-{now}",
@@ -521,14 +524,25 @@ mod tests {
         std::fs::create_dir_all(target.join("debug")).unwrap();
         let lock = std::fs::File::create(target.join("debug/.cargo-lock")).unwrap();
         lock.lock().unwrap();
-        assert!(!remove(&target, 7).unwrap());
+        assert!(!remove(&target, 7, root.path()).unwrap());
         assert!(target.join("debug/.cargo-lock").exists());
-        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+        assert!(target.exists());
         drop(lock);
-        assert!(remove(&target, 7).unwrap());
+        assert!(remove(&target, 7, root.path()).unwrap());
         assert!(!target.exists());
-        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
-        assert!(remove(&target, 7).is_err());
+        assert!(remove(&target, 7, root.path()).is_err());
+    }
+
+    #[test]
+    fn a_running_cargo_command_keeps_its_target_until_exit() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("target");
+        std::fs::create_dir_all(target.join("debug")).unwrap();
+        let command = crate::target_use::shared(root.path()).unwrap();
+        assert!(!remove(&target, 7, root.path()).unwrap());
+        assert!(target.exists());
+        drop(command);
+        assert!(remove(&target, 7, root.path()).unwrap());
     }
 
     #[test]

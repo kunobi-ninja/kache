@@ -52,7 +52,7 @@ kache init
 
     Replace `stable` with `unstable` to receive prereleases as well as stable releases.
 
-    The package also installs compiler-name shims in `/usr/lib/kache`. Prepend that directory to `PATH` to cache Make and CMake object compiles. See [C and C++](/docs/getting-started/c-cpp).
+    The package also installs Cargo and compiler shims in `/usr/lib/kache`. Prepend that directory to `PATH` to cache Make and CMake object compiles. See [C and C++](/docs/getting-started/c-cpp).
   </Tab>
   <Tab value="Windows">
     ```powershell
@@ -73,7 +73,7 @@ kache init
 
     `kache-bin` is the official prebuilt package. `kache-git` builds the current main branch; the community `kache` package builds a release from source.
 
-    Both official packages install compiler-name shims in `/usr/lib/kache`. For `makepkg`, put `PATH="/usr/lib/kache:$PATH"` in `~/.makepkg.conf`.
+    Both official packages install Cargo and compiler shims in `/usr/lib/kache`. For `makepkg`, put `PATH="/usr/lib/kache:$PATH"` in `~/.makepkg.conf`.
   </Tab>
   <Tab value="mise">
     ```bash
@@ -101,7 +101,7 @@ nix profile install github:kunobi-ninja/kache/v0.26.3
 
 The flake also exports an overlay, NixOS module, and nix-darwin module. See the repository [`flake.nix`](https://github.com/kunobi-ninja/kache/blob/main/flake.nix) for their current names and options.
 
-The package includes `cc`, `c++`, `gcc`, `g++`, `clang`, and `clang++` symlinks in `${kache}/shims`. With this flake's `overlays.default` applied, enable them in your NixOS configuration:
+The package includes `cargo`, `cc`, `c++`, `gcc`, `g++`, `clang`, and `clang++` symlinks in `${kache}/shims`. With this flake's `overlays.default` applied, enable them in your NixOS configuration:
 
 ```nix
 { pkgs, ... }:
@@ -114,7 +114,7 @@ The package includes `cc`, `c++`, `gcc`, `g++`, `clang`, and `clang++` symlinks 
 }
 ```
 
-Keep the real compilers later in `PATH`. The shims cover C and C++; Rust still uses `RUSTC_WRAPPER`. Nix builds the symlinks, so no `kache install-shims` step is needed. The existing `${kache}/lib/kache` path remains available.
+Keep the real compilers later in `PATH`. The compiler shims cover C and C++; Rust still uses `RUSTC_WRAPPER`. The Cargo shim protects targets while Cargo commands run. Nix builds the symlinks, so no `kache install-shims` step is needed. The existing `${kache}/lib/kache` path remains available.
 
 ## Supported release targets
 

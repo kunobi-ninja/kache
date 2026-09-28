@@ -1,5 +1,5 @@
-//! Compiler-name shim farms: `cc`, `gcc`, `clang`, ... symlinks to kache,
-//! put ahead of the real toolchain on `PATH`.
+//! Toolchain shims (`cargo`, `cc`, `gcc`, `clang`, ...) ahead of the real
+//! programs on `PATH`.
 
 use crate::fs::Fs;
 #[cfg(unix)]
@@ -10,8 +10,8 @@ use std::io;
 use std::path::Component;
 use std::path::{Path, PathBuf};
 
-/// The canonical drivers. Versioned and target-prefixed names are opt-in.
-pub const SHIM_NAMES: &[&str] = &["cc", "c++", "gcc", "g++", "clang", "clang++"];
+/// The canonical drivers. Versioned and target-prefixed compiler names are opt-in.
+pub const SHIM_NAMES: &[&str] = &["cc", "c++", "gcc", "g++", "clang", "clang++", "cargo"];
 
 /// Marks a directory of kache shims. Every kache skips every entry in it when
 /// looking for the real compiler, so it goes only on shim-only directories.
@@ -46,8 +46,8 @@ pub fn write_marker(dir: &Path) -> io::Result<bool> {
         .create_new(true)
         .open(&path)?;
     file.write_all(
-        b"kache compiler shims. kache skips this directory when it looks for \
-          the real compiler, so keep only shims here.\n",
+        b"kache toolchain shims. kache skips this directory when it looks for \
+          the real toolchain, so keep only shims here.\n",
     )?;
     Ok(true)
 }

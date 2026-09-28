@@ -88,8 +88,20 @@ enum PlanDecision {
 /// this command a conservative convenience rather than a second, incomplete
 /// Cargo config implementation.
 pub(crate) fn run(cargo_args: Vec<OsString>) -> Result<()> {
+    run_with_source(cargo_args)
+}
+
+/// Cargo reached through the `cargo` link in Kache's shim directory.
+pub(crate) fn run_shim(cargo_args: Vec<OsString>) -> Result<()> {
+    let cargo = real_cargo_program(true)?;
+    let mut command = Command::new(&cargo);
+    command.args(cargo_args);
+    run_cargo_with_target_protection(command, &cargo)
+}
+
+fn run_with_source(cargo_args: Vec<OsString>) -> Result<()> {
     let cwd = std::env::current_dir().context("resolving the Cargo working directory")?;
-    let cargo = real_cargo_program()?;
+    let cargo = real_cargo_program(false)?;
 
     // Cargo owns freshness before RUSTC_WRAPPER runs. Sharing its intermediate
     // fingerprint directory across worktrees can therefore declare the wrong
@@ -163,22 +175,41 @@ pub(crate) fn run(cargo_args: Vec<OsString>) -> Result<()> {
         command.env("CARGO_ENCODED_RUSTFLAGS", flags);
     }
 
-    #[cfg(unix)]
-    {
-        exec_cargo_unix(command, &cargo)
-    }
-    #[cfg(not(unix))]
-    {
-        run_cargo_non_unix(command, &cargo)
-    }
+    run_cargo_with_target_protection(command, &cargo)
 }
 
-fn real_cargo_program() -> Result<PathBuf> {
+fn run_cargo_with_target_protection(command: Command, cargo: &Path) -> Result<()> {
+    let config = crate::config::Config::load().context("loading the cache configuration")?;
+    let target_use = crate::target_use::shared(&config.cache_dir)
+        .context("protecting target directories while Cargo runs")?;
+    run_cargo_guarded(command, cargo, target_use)
+}
+
+fn real_cargo_program(shimmed: bool) -> Result<PathBuf> {
     let program = std::env::var_os("KACHE_REAL_CARGO")
-        .or_else(|| std::env::var_os("CARGO"))
-        .unwrap_or_else(|| OsString::from("cargo"));
+        .or_else(|| (!shimmed).then(|| std::env::var_os("CARGO")).flatten())
+        .or_else(|| {
+            crate::compiler::shim::resolve_real_compiler_from_env("cargo")
+                .map(PathBuf::into_os_string)
+        })
+        .context("finding Cargo behind the Kache shim")?;
     let cwd = std::env::current_dir().context("resolving the Cargo working directory")?;
     resolve_cargo_program(&program, &cwd)
+}
+
+/// Stay alive with the lease until Cargo and everything it runs has exited.
+fn run_cargo_guarded(mut command: Command, cargo: &Path, _lease: std::fs::File) -> Result<()> {
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("running Cargo program {cargo:?}"))?;
+    crate::test_runner::signals::forward_to(child.id());
+    let status = child.wait().context("waiting for Cargo")?;
+    std::process::exit(crate::test_runner::finish(
+        crate::test_runner::exit_disposition(
+            status.code(),
+            crate::test_runner::signals::of(&status),
+        ),
+    ));
 }
 
 fn resolve_cargo_program(program: &OsStr, cwd: &Path) -> Result<PathBuf> {
@@ -209,22 +240,6 @@ fn resolve_cargo_program(program: &OsStr, cwd: &Path) -> Result<PathBuf> {
     // to the shared rustup binary, whose behavior depends on argv[0]. Executing
     // its canonical target would launch `rustup`, not the Cargo proxy.
     Ok(executable)
-}
-
-#[cfg(unix)]
-fn exec_cargo_unix(mut command: Command, cargo: &Path) -> Result<()> {
-    use std::os::unix::process::CommandExt;
-
-    let error = command.exec();
-    Err(error).with_context(|| format!("executing Cargo program {cargo:?}"))
-}
-
-#[cfg(not(unix))]
-fn run_cargo_non_unix(mut command: Command, cargo: &Path) -> Result<()> {
-    let status = command
-        .status()
-        .with_context(|| format!("running Cargo program {cargo:?}"))?;
-    std::process::exit(status.code().unwrap_or(1));
 }
 
 fn normalization_plan(cwd: &Path, cargo_args: &[OsString]) -> PlanDecision {

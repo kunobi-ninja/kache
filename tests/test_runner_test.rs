@@ -296,6 +296,28 @@ fn exit_codes_pass_through_scheduled_and_plain() {
     );
 }
 
+#[test]
+fn an_unscheduled_test_holds_target_protection_until_exit() {
+    let fixture = Fixture::new();
+    let mut command = fixture.runner(&fixture.probe(), "term");
+    command
+        .env("KACHE_SCHEDULER", "0")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut child = command.spawn().unwrap();
+    wait_for_file(&fixture.path().join("ready"), &mut child);
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(fixture.cache().join("target-use.lock"))
+        .unwrap();
+    assert!(matches!(lock.try_lock(), Err(fs::TryLockError::WouldBlock)));
+    kill_group(&child);
+    let _ = child.wait().unwrap();
+    lock.lock().unwrap();
+    lock.unlock().unwrap();
+}
+
 /// `kache init` exports `CARGO_TARGET_<HOST>_RUNNER`, which Cargo ranks
 /// above the project's own runner. The test still runs under that runner.
 #[test]

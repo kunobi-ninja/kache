@@ -1898,7 +1898,7 @@ fn init_repairs_each_half_of_terminal_setup_and_reports_activation() {
         .assert()
         .success()
         .stdout(predicates::str::contains(
-            "Enable C/C++ caching in new terminals?",
+            "Protect Cargo targets and cache C/C++ in new terminals?",
         ));
     assert!(std::fs::read_to_string(&rc).unwrap().ends_with(&configured));
     let repaired = std::fs::read_to_string(&rc).unwrap();
@@ -1910,7 +1910,7 @@ fn init_repairs_each_half_of_terminal_setup_and_reports_activation() {
         .assert()
         .success()
         .stdout(predicates::str::contains(
-            "Enable C/C++ caching in new terminals?",
+            "Protect Cargo targets and cache C/C++ in new terminals?",
         ));
     assert_eq!(std::fs::read_to_string(&rc).unwrap(), repaired);
     assert_eq!(
@@ -1927,7 +1927,9 @@ fn init_repairs_each_half_of_terminal_setup_and_reports_activation() {
         .write_stdin("n\n")
         .assert()
         .success()
-        .stdout(predicates::str::contains("Terminal C/C++ caching: active"))
+        .stdout(predicates::str::contains(
+            "Cargo target protection and C/C++ caching: active",
+        ))
         .stdout(predicates::str::contains("Open a new terminal").not());
 
     std::fs::remove_file(shims.join("cc")).unwrap();

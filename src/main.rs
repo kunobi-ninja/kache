@@ -73,6 +73,7 @@ use compiler_store as store;
 mod store_view;
 mod target_cleanup;
 mod target_seed;
+mod target_use;
 mod test_runner;
 #[cfg(test)]
 mod test_support;
@@ -687,6 +688,15 @@ fn main() -> Result<()> {
     // Cargo target runner. Checked before the probe and shim guards, which
     // exit without running anything: a test must always run.
     let raw_args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    if raw_args.first().is_some_and(|arg| {
+        std::path::Path::new(arg)
+            .file_name()
+            .is_some_and(|name| name == "cargo")
+    }) && std::env::var_os(platform::SELF_SPAWN_ENV).is_none()
+    {
+        init_logging(LogMode::Cli);
+        return cargo_proxy::run_shim(raw_args[1..].to_vec());
+    }
     if let Some(args) = test_runner_args(&raw_args) {
         init_logging(LogMode::Wrapper);
         std::process::exit(test_runner::run(args));

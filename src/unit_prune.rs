@@ -293,6 +293,9 @@ pub(crate) fn prune(
     window: Duration,
     now: SystemTime,
 ) -> Pruned {
+    let Ok(Some(_reservation)) = crate::target_use::try_exclusive(cache_dir) else {
+        return Pruned::default();
+    };
     let local = matches!(
         crate::cache_fs::classify(&crate::cache_fs::probe(target_dir)),
         crate::cache_fs::CacheFsVerdict::Local

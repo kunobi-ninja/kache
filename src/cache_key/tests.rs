@@ -12932,6 +12932,25 @@ fn key_matrix_error_format_does_not_change_key() {
     );
 }
 
+/// A handed-over closure is visible until the next key takes it, so that key
+/// knows to arm the too-new guard.
+#[test]
+fn a_provided_closure_is_pending_until_a_key_takes_it() {
+    let _lock = key_test_lock();
+    assert!(!dep_info_provided());
+    provide_dep_info(
+        DepInfo {
+            source_files: vec![PathBuf::from("src/lib.rs")],
+            env_deps: Vec::new(),
+        },
+        None,
+    );
+    assert!(dep_info_provided());
+    let taken = PROVIDED_DEP_INFO.with(|cell| cell.borrow_mut().take());
+    assert!(taken.is_some());
+    assert!(!dep_info_provided());
+}
+
 #[test]
 fn a_deferred_discovery_says_so_when_displayed() {
     let text = DeferredDiscovery { miss_certain: true }.to_string();

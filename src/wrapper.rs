@@ -5346,6 +5346,15 @@ fn compile_before_key(
     } = *ctx;
     // Cargo starts pipelined consumers on the rmeta, before this key.
     crate::out_dir_alias::register_before_compile();
+    // No key yet, but the compile still takes a slot in the scheduler's
+    // pool, as every other compile does.
+    let miss_guard = scheduler::begin_keyless_compile(
+        &config.cache_dir,
+        config.scheduler,
+        crate_name,
+        args.invokes_linker(),
+        config.test_lease.as_deref(),
+    );
     let compile_start = std::time::Instant::now();
     // An entry could exist: key from the dep-info rustc writes right
     // after expansion, and stop the compile if that key is stored. This
@@ -5383,6 +5392,10 @@ fn compile_before_key(
     } else {
         compiler.execute_streaming(args)
     };
+    if hit_closure.is_none() {
+        miss_guard.record_compile_rss(crate_name);
+    }
+    drop(miss_guard);
     if let Some((dep_info, tree)) = hit_closure {
         // Stopped before anything reached Cargo. Key again from the
         // closure the compile wrote, and restore like any hit.

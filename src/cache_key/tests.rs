@@ -8425,6 +8425,32 @@ fn codegen_backend_libraries_span_every_sysroot() {
     );
     assert_ne!(both[0].1, both[1].1);
     assert!(libraries(&["missing"]).is_empty());
+
+    // A directory that exists but cannot be listed is not a missing one.
+    let unlistable = sysroot("unlistable").join("lib").join("rustlib").join(host);
+    std::fs::create_dir_all(&unlistable).unwrap();
+    std::fs::write(unlistable.join("codegen-backends"), b"not a directory").unwrap();
+    assert!(codegen_backend_libraries([sysroot("unlistable")], host, "gcc", &hasher).is_err());
+}
+
+/// An explicit `--sysroot` wins; otherwise the toolchain reports its own.
+#[test]
+fn rustc_sysroot_prefers_the_explicit_one() {
+    let _lock = key_test_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("lib.rs");
+    let explicit = dir.path().join("sysroot");
+    let args = |extra: &[&str]| RustcArgs::parse(&flag_base(&source, extra)).unwrap();
+    assert_eq!(
+        get_rustc_sysroot(&args(&["--sysroot", &explicit.to_string_lossy()])),
+        Some(explicit)
+    );
+    let own = get_rustc_sysroot(&args(&[])).unwrap();
+    assert!(
+        own.join("lib").join("rustlib").is_dir(),
+        "{}",
+        own.display()
+    );
 }
 
 /// H2: `--sysroot` selects which std rustc links against; with the

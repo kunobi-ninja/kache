@@ -1164,6 +1164,13 @@ def main():
             ],
             check=True,
         )
+        # Keep fetch and all benchmark arms on the selected Rust toolchain,
+        # even when PATH contains mise shims and the source has its own config.
+        toolchain_bin = Path(
+            capture(["rustup", "which", "--toolchain", args.toolchain, "cargo"])
+        ).parent
+        os.environ["PATH"] = f"{toolchain_bin}{os.pathsep}{os.environ['PATH']}"
+        env["PATH"] = os.environ["PATH"]
         subprocess.run(["cargo", "fetch", "--locked"], cwd=mirror, env=env, check=True)
         run_batches(args, arms, mirror, work, data)
     except Exception as error:

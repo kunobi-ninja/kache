@@ -6447,6 +6447,7 @@ fn passthrough_args(
     }
 
     let mut cmd = std::process::Command::new(&args.rustc);
+    crate::toolchain_dylib::apply(&mut cmd, &args.rustc);
     if disable_incremental_env(incremental_preserved) {
         cmd.env("CARGO_INCREMENTAL", "0");
     }

@@ -110,6 +110,7 @@ pub fn run_rustc(
 
     crate::opcounts::record_compiler_run();
     let mut cmd = Command::new(rustc);
+    crate::toolchain_dylib::apply(&mut cmd, rustc);
 
     // Double-wrapper (RUSTC_WRAPPER + RUSTC_WORKSPACE_WRAPPER): the workspace
     // wrapper (e.g. clippy-driver) expects the actual rustc path as its first arg.

@@ -77,6 +77,7 @@ mod test_runner;
 mod test_support;
 mod timeline;
 mod timeline_client;
+mod toolchain_dylib;
 mod transport;
 mod tui;
 mod tui_sessions;
@@ -1255,7 +1256,8 @@ fn run_compiler_process_directly(args: &[String], preserve_incremental: bool) ->
     };
     let program = compiler::resolve_program_on_path(&args[0])
         .unwrap_or_else(|| std::path::PathBuf::from(&args[0]));
-    let mut command = std::process::Command::new(program);
+    let mut command = std::process::Command::new(&program);
+    toolchain_dylib::apply(&mut command, &program);
     if !incremental_preserved {
         command.env("CARGO_INCREMENTAL", "0");
     }

@@ -67,7 +67,49 @@ fn run_kache_rustc_verify(
     predictions: bool,
     verify: Option<&str>,
 ) -> std::process::Output {
-    let args: Vec<String> = vec![
+    run_kache_rustc_with(
+        cache_dir,
+        out_dir,
+        src,
+        predictions,
+        verify,
+        Invocation::Plain,
+    )
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Invocation {
+    /// `--emit=link` only.
+    Plain,
+    /// Cargo's emits, without JSON diagnostics: the key is Cargo's, and
+    /// discovery takes the pre-pass.
+    CargoEmits,
+    /// Cargo's emits and JSON diagnostics reporting each artifact.
+    Cargo,
+}
+
+/// The same unit invoked as Cargo invokes it: dep-info emitted, and JSON
+/// diagnostics that report each artifact rustc writes.
+fn run_kache_rustc_as_cargo(cache_dir: &Path, out_dir: &Path, src: &Path, predictions: bool) {
+    run_kache_rustc_with(
+        cache_dir,
+        out_dir,
+        src,
+        predictions,
+        None,
+        Invocation::Cargo,
+    );
+}
+
+fn run_kache_rustc_with(
+    cache_dir: &Path,
+    out_dir: &Path,
+    src: &Path,
+    predictions: bool,
+    verify: Option<&str>,
+    invocation: Invocation,
+) -> std::process::Output {
+    let mut args: Vec<String> = vec![
         rustc_path(),
         "--crate-name".into(),
         "kt".into(),
@@ -75,11 +117,24 @@ fn run_kache_rustc_verify(
         "lib".into(),
         "--edition".into(),
         "2021".into(),
-        "--emit=link".into(),
         "--out-dir".into(),
         out_dir.display().to_string(),
         src.display().to_string(),
     ];
+    if invocation == Invocation::Plain {
+        args.push("--emit=link".into());
+    } else {
+        args.push("--emit=dep-info,metadata,link".into());
+    }
+    if invocation == Invocation::Cargo {
+        args.extend(
+            [
+                "--error-format=json",
+                "--json=diagnostic-rendered-ansi,artifacts",
+            ]
+            .map(String::from),
+        );
+    }
     let config_path = write_test_config(cache_dir, predictions);
     let output = std::process::Command::new(kache_binary())
         .args(&args)
@@ -230,6 +285,50 @@ fn predictions_cold_warm_off_and_stale_closure() {
     let regrown = last_event(cache_dir);
     assert_eq!(regrown.result, "local_hit");
     assert_eq!(regrown.cache_key, grown.cache_key);
+}
+
+/// A stale record's predicted key misses and must be re-derived before the
+/// entry is stored. Invoked as Cargo invokes rustc, the compile's own
+/// dep-info does that instead of a pre-pass, and the entry lands under the
+/// key the pre-pass gives.
+#[test]
+fn a_stale_record_is_re_derived_from_the_running_compile() {
+    build_kache();
+    let (work, cache, out, src) = fixture();
+    let (cache_dir, out_dir) = (cache.path(), out.path());
+    run_kache_rustc_as_cargo(cache_dir, out_dir, &src, true);
+    let cold = last_event(cache_dir);
+    assert_eq!(cold.result, "miss");
+
+    std::fs::write(
+        &src,
+        b"mod a;\nmod b;\npub fn f() -> u32 {\n    let _ = include_str!(\"data.txt\");\n    let _ = env!(\"KACHE_INT_SET\");\n    let _ = option_env!(\"KACHE_INT_UNSET\");\n    a::g() + b::h()\n}\n",
+    )
+    .unwrap();
+    std::fs::write(work.path().join("b.rs"), b"pub fn h() -> u32 { 1 }\n").unwrap();
+    run_kache_rustc_as_cargo(cache_dir, out_dir, &src, true);
+    let grown = last_event(cache_dir);
+    assert_eq!(grown.result, "miss");
+    assert_eq!(grown.dep_info_runs, 0, "the compile re-derived the closure");
+    assert_eq!(grown.compiler_runs, 1);
+    assert_ne!(grown.cache_key, cold.cache_key);
+
+    // The pre-pass, predictions off, in a fresh directory: the same key.
+    // JSON diagnostics are not keyed, so dropping them only changes how
+    // the closure is discovered.
+    let fresh = TempDir::new().unwrap();
+    run_kache_rustc_with(
+        cache_dir,
+        fresh.path(),
+        &src,
+        false,
+        None,
+        Invocation::CargoEmits,
+    );
+    let checked = last_event(cache_dir);
+    assert_eq!(checked.result, "local_hit");
+    assert_eq!(checked.dep_info_runs, 1);
+    assert_eq!(checked.cache_key, grown.cache_key);
 }
 
 /// A shadowing sibling that rustc rejects must never restore: the

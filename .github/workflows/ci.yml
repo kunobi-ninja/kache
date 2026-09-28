@@ -1547,6 +1547,8 @@ jobs:
       # --- GCP-KMS code signing (reuses the CODESIGN_* identity for all platforms) ---
       enable_signing: true
       notarize_macos: true
+      # Lets DYLD_* reach the rustc kache runs; see the plist (#1326).
+      macos_entitlements: assets/macos/kache.entitlements
       # NOTE: CODESIGN_*/PGP_SIGN_* config is passed via `secrets:` below — they're
       # repo secrets (public repo) and the `secrets` context isn't allowed in `with:`.
       # sha256 pins for the downloaded signers (set as repo vars once known;

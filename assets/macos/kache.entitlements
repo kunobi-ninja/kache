@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	  Hardened runtime otherwise removes DYLD_* before kache starts, so the
+	  rustc it runs loses the DYLD_FALLBACK_LIBRARY_PATH Cargo sets. Rust 1.98+
+	  strips macOS binaries with rust-objcopy, which needs it to find
+	  libLLVM.dylib when llvm-tools is not installed (#1326). Library
+	  validation stays on: only Apple- or team-signed dylibs load.
+	-->
+	<key>com.apple.security.cs.allow-dyld-environment-variables</key>
+	<true/>
+</dict>
+</plist>

@@ -3108,7 +3108,13 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     /// Read the authoritative blob reference graph from committed entry
     /// metadata. The caller must hold SQLite's write lock so a publisher or
     /// remover cannot change the row/meta pairing during the scan (#819).
-    fn authoritative_blob_index(&self, conn: &Connection) -> Result<AuthoritativeBlobIndex> {
+    /// A strict call fails on the first entry that does not verify; with
+    /// `drop_unverifiable` those entries are left out and returned instead.
+    fn authoritative_blob_index(
+        &self,
+        conn: &Connection,
+        drop_unverifiable: bool,
+    ) -> Result<(AuthoritativeBlobIndex, Vec<String>)> {
         let keys: Vec<String> = {
             let mut stmt = conn
                 .prepare("SELECT cache_key FROM entries WHERE committed = 1 ORDER BY cache_key")?;
@@ -3116,31 +3122,18 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                 .collect::<Result<Vec<_>, _>>()?
         };
         let mut index = AuthoritativeBlobIndex::default();
+        let mut dropped = Vec::new();
         for key in keys {
-            let meta_path = self.entry_dir(&key).join("meta.json");
-            let content = fs::read_to_string(&meta_path)
-                .with_context(|| format!("entry {key}: reading authoritative meta.json"))?;
-            let meta: EntryMeta = serde_json::from_str(&content)
-                .with_context(|| format!("entry {key}: parsing authoritative meta.json"))?;
-            for file in &meta.files {
-                if !kache_format::is_blob_hash(&file.hash)
-                    || !kache_format::is_safe_stored_artifact_name(&file.name)
-                {
-                    anyhow::bail!("entry {key}: invalid blob metadata");
+            let files = match self.verified_entry_files(&key) {
+                Ok(files) => files,
+                Err(error) if drop_unverifiable => {
+                    tracing::warn!("removing an entry that failed verification: {error:#}");
+                    dropped.push(key);
+                    continue;
                 }
-                let blob_path = self.blob_path(&file.hash);
-                let actual_size = fs::metadata(&blob_path)
-                    .with_context(|| format!("entry {key}: reading blob {}", file.hash))?
-                    .len();
-                if actual_size != file.size {
-                    anyhow::bail!(
-                        "entry {key}: blob {} size mismatch (expected {}, got {})",
-                        file.hash,
-                        file.size,
-                        actual_size
-                    );
-                }
-
+                Err(error) => return Err(error),
+            };
+            for file in files {
                 *index
                     .entry_mappings
                     .entry((key.clone(), file.hash.clone()))
@@ -3162,7 +3155,39 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                 }
             }
         }
-        Ok(index)
+        Ok((index, dropped))
+    }
+
+    /// The files a committed entry's `meta.json` names, each checked against
+    /// its blob on disk. An error means the entry cannot be restored as
+    /// recorded: its metadata is missing or unreadable, names an unsafe file,
+    /// or points at a blob that is gone or has another size.
+    fn verified_entry_files(&self, key: &str) -> Result<Vec<CachedFile>> {
+        let meta_path = self.entry_dir(key).join("meta.json");
+        let content = fs::read_to_string(&meta_path)
+            .with_context(|| format!("entry {key}: reading authoritative meta.json"))?;
+        let meta: EntryMeta = serde_json::from_str(&content)
+            .with_context(|| format!("entry {key}: parsing authoritative meta.json"))?;
+        for file in &meta.files {
+            if !kache_format::is_blob_hash(&file.hash)
+                || !kache_format::is_safe_stored_artifact_name(&file.name)
+            {
+                anyhow::bail!("entry {key}: invalid blob metadata");
+            }
+            let blob_path = self.blob_path(&file.hash);
+            let actual_size = fs::metadata(&blob_path)
+                .with_context(|| format!("entry {key}: reading blob {}", file.hash))?
+                .len();
+            if actual_size != file.size {
+                anyhow::bail!(
+                    "entry {key}: blob {} size mismatch (expected {}, got {})",
+                    file.hash,
+                    file.size,
+                    actual_size
+                );
+            }
+        }
+        Ok(meta.files)
     }
 
     fn indexed_blob_graph(&self, conn: &Connection) -> Result<AuthoritativeBlobIndex> {
@@ -3213,7 +3238,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     pub fn blob_index_drift(&self) -> Result<BlobIndexDrift> {
         self.db.execute_batch("BEGIN IMMEDIATE")?;
         let result = (|| {
-            let expected = self.authoritative_blob_index(&self.db)?;
+            let (expected, _) = self.authoritative_blob_index(&self.db, false)?;
             let actual = self.indexed_blob_graph(&self.db)?;
             Ok(Self::compare_blob_indexes(&expected, &actual))
         })();
@@ -3240,13 +3265,45 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     /// Physical orphan reclamation deliberately happens after this transaction
     /// through [`Self::sweep_orphan_blobs`], never while SQL can roll back.
     pub fn reconcile_blob_index(&self) -> Result<BlobIndexDrift> {
+        self.reconcile_blob_index_with(false)
+            .map(|(drift, _)| drift)
+    }
+
+    /// [`Self::reconcile_blob_index`] that removes, in the same transaction,
+    /// every committed entry whose metadata or blobs fail verification, and
+    /// returns their keys. Such an entry can never be served: a lookup evicts
+    /// it on sight. Kept, it makes the strict rebuild refuse the whole store.
+    /// Blobs only those entries referenced lose their rows and are left to
+    /// [`Self::sweep_orphan_blobs`].
+    pub fn reconcile_blob_index_dropping_unverifiable(
+        &self,
+    ) -> Result<(BlobIndexDrift, Vec<String>)> {
+        self.reconcile_blob_index_with(true)
+    }
+
+    fn reconcile_blob_index_with(
+        &self,
+        drop_unverifiable: bool,
+    ) -> Result<(BlobIndexDrift, Vec<String>)> {
         self.db.execute_batch("BEGIN IMMEDIATE")?;
-        let result = (|| -> Result<BlobIndexDrift> {
-            let expected = self.authoritative_blob_index(&self.db)?;
+        let result = (|| -> Result<(BlobIndexDrift, Vec<String>)> {
+            let (expected, dropped) = self.authoritative_blob_index(&self.db, drop_unverifiable)?;
+            for key in &dropped {
+                self.db
+                    .execute("DELETE FROM entries WHERE cache_key = ?1", params![key])?;
+                let entry_dir = self.entry_dir(key);
+                if let Err(error) = fs::remove_dir_all(&entry_dir)
+                    && error.kind() != std::io::ErrorKind::NotFound
+                {
+                    return Err(error).with_context(|| {
+                        format!("entry {key}: removing an entry that failed verification")
+                    });
+                }
+            }
             let actual = self.indexed_blob_graph(&self.db)?;
             let drift = Self::compare_blob_indexes(&expected, &actual);
             if drift.total() == 0 {
-                return Ok(drift);
+                return Ok((drift, dropped));
             }
 
             self.db.execute("DELETE FROM entry_blobs", [])?;
@@ -3263,12 +3320,12 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                     params![hash, size, refcount],
                 )?;
             }
-            Ok(drift)
+            Ok((drift, dropped))
         })();
         match result {
-            Ok(drift) => {
+            Ok(outcome) => {
                 self.db.execute_batch("COMMIT")?;
-                Ok(drift)
+                Ok(outcome)
             }
             Err(error) => {
                 let _ = self.db.execute_batch("ROLLBACK");

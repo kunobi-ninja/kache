@@ -151,6 +151,9 @@ pub(crate) enum Outcome {
     Healed {
         /// What the probe saw before the repair.
         probe: BlobRefcountDrift,
+        /// Entries removed first because their metadata or blobs failed
+        /// verification.
+        removed: usize,
         /// Rows the rebuild found wrong against committed metadata.
         repaired: BlobIndexDrift,
         /// Blob files unlinked afterwards, `None` when the sweep failed.
@@ -171,6 +174,7 @@ impl Outcome {
             Outcome::IndexBusy => "blob index heal found the index busy; will retry".to_string(),
             Outcome::Healed {
                 probe,
+                removed,
                 repaired,
                 swept,
                 elapsed,
@@ -182,9 +186,13 @@ impl Outcome {
                     ),
                     None => "the blob sweep failed and is left to the next GC".to_string(),
                 };
+                let removed = match removed {
+                    0 => String::new(),
+                    n => format!("removed {n} entries that failed verification; "),
+                };
                 format!(
                     "blob index healed in {} ms: {} blobs ({}) had no owner, {} refcounts were off; \
-                     rewrote {} blob rows and {} mappings; {swept}",
+                     {removed}rewrote {} blob rows and {} mappings; {swept}",
                     elapsed.as_millis(),
                     probe.unowned,
                     crate::report::format_bytes(probe.unowned_bytes),
@@ -252,8 +260,11 @@ fn attempt(config: &Config, trigger: Trigger<'_>, now: u64) -> anyhow::Result<Ou
         .file_hash_cache()
         .db()
         .pragma_update(None, "busy_timeout", 0)?;
-    let repaired = match store.reconcile_blob_index() {
-        Ok(repaired) => repaired,
+    // An entry whose metadata or blobs no longer check out would make a
+    // strict rebuild refuse the whole store on every retry. A lookup evicts
+    // such an entry anyway, so the rebuild drops it.
+    let (repaired, removed) = match store.reconcile_blob_index_dropping_unverifiable() {
+        Ok((repaired, dropped)) => (repaired, dropped.len()),
         Err(error) if is_index_busy(&error) => return Ok(Outcome::IndexBusy),
         Err(error) => {
             let reason = format!("{error:#}");
@@ -268,6 +279,7 @@ fn attempt(config: &Config, trigger: Trigger<'_>, now: u64) -> anyhow::Result<Ou
         .ok();
     Ok(Outcome::Healed {
         probe,
+        removed,
         repaired,
         swept,
         elapsed: started.elapsed(),
@@ -477,6 +489,7 @@ mod tests {
     fn only_refusals_warn_and_only_repairs_inform() {
         let healed = Outcome::Healed {
             probe: BlobRefcountDrift::default(),
+            removed: 0,
             repaired: BlobIndexDrift::default(),
             swept: None,
             elapsed: Duration::ZERO,
@@ -511,7 +524,8 @@ mod tests {
             Outcome::IndexBusy.describe(),
             "blob index heal found the index busy; will retry"
         );
-        let healed = |swept| Outcome::Healed {
+        let healed = |removed, swept| Outcome::Healed {
+            removed,
             probe: BlobRefcountDrift {
                 unowned: 1_430,
                 unowned_bytes: 27 << 30,
@@ -528,7 +542,7 @@ mod tests {
             elapsed: Duration::from_millis(1500),
         };
         assert_eq!(
-            healed(Some((1_430, 1 << 20))).describe(),
+            healed(0, Some((1_430, 1 << 20))).describe(),
             format!(
                 "blob index healed in 1500 ms: 1430 blobs ({}) had no owner, 574 refcounts were off; \
                  rewrote 2004 blob rows and 3 mappings; swept 1430 blob files ({})",
@@ -537,9 +551,14 @@ mod tests {
             )
         );
         assert!(
-            healed(None)
+            healed(0, None)
                 .describe()
                 .ends_with("3 mappings; the blob sweep failed and is left to the next GC")
+        );
+        assert!(
+            healed(2, None)
+                .describe()
+                .contains("were off; removed 2 entries that failed verification; rewrote 2004")
         );
         assert_eq!(
             Outcome::Failed {
@@ -816,53 +835,29 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn corrupt_entry_fails_closed_and_backs_off() {
+    fn a_corrupt_entry_is_removed_and_the_rest_heals() {
         let dir = tempfile::tempdir().unwrap();
         let drifted = drifted_store(dir.path());
-        let cache_dir = &drifted.config.cache_dir;
         let meta = Store::open(&drifted.config)
             .unwrap()
             .entry_dir("heal_b")
             .join("meta.json");
-        let good = std::fs::read(&meta).unwrap();
         std::fs::write(&meta, b"{truncated").unwrap();
 
+        // One bad entry used to fail the whole rebuild, retried every 6 h
+        // forever. It could never be served, so it goes and the rest heals.
         let clock = RequestClock::idle();
-        let Some(Outcome::Failed { reason }) = run(&drifted.config, Trigger::Periodic(&clock))
+        let Outcome::Healed { removed, .. } =
+            attempt(&drifted.config, Trigger::Periodic(&clock), NOW).unwrap()
         else {
-            panic!("a corrupt entry must fail the heal");
+            panic!("a corrupt entry must not stop the heal");
         };
-        assert!(reason.contains("entry heal_b"), "{reason}");
-        assert_untouched(&drifted);
-        let recorded = read_failure(cache_dir).unwrap();
-        assert_eq!(recorded.reason, reason);
-        assert!(recorded.failed_at >= unix_now_secs() - 60);
-
-        // The write lock is not taken again inside the window.
-        record_failure(cache_dir, NOW, &reason);
-        for now in [NOW, NOW + 21_599] {
-            assert_eq!(
-                attempt(&drifted.config, Trigger::Periodic(&clock), now).unwrap(),
-                Outcome::Skipped(SkipReason::BackingOff)
-            );
-        }
-        assert_eq!(read_failure(cache_dir).unwrap().failed_at, NOW);
-
-        // After it, one more attempt, recorded at its own time.
-        assert!(matches!(
-            attempt(&drifted.config, Trigger::Periodic(&clock), NOW + 21_600).unwrap(),
-            Outcome::Failed { .. }
-        ));
-        assert_eq!(read_failure(cache_dir).unwrap().failed_at, NOW + 21_600);
-        assert_untouched(&drifted);
-
-        // A repaired entry heals on the next attempt and clears the record.
-        std::fs::write(&meta, good).unwrap();
-        assert!(matches!(
-            attempt(&drifted.config, Trigger::Periodic(&clock), NOW + 2 * 21_600).unwrap(),
-            Outcome::Healed { .. }
-        ));
-        assert!(!state_path(cache_dir).exists());
-        assert_eq!(refcount(&drifted.config, &drifted.shared), 2);
+        assert_eq!(removed, 1);
+        assert!(!state_path(&drifted.config.cache_dir).exists());
+        let store = Store::open(&drifted.config).unwrap();
+        assert!(store.get("heal_b").unwrap().is_none());
+        assert!(store.get("heal_a").unwrap().is_some());
+        assert_eq!(refcount(&drifted.config, &drifted.shared), 1);
+        assert_eq!(probe(&drifted.config), BlobRefcountDrift::default());
     }
 }

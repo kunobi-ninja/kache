@@ -2274,6 +2274,72 @@ fn reconcile_blob_index_fails_closed_on_unreadable_metadata() {
     assert_eq!(refcount, 9, "failed repair must leave the index untouched");
 }
 
+/// Each way an entry stops matching its blobs gets it removed; entries that
+/// still check out stay, and the rebuild then succeeds.
+#[test]
+fn unverifiable_entries_are_removed_and_the_index_rebuilds() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let store = Store::open(&config).unwrap();
+    for (key, bytes) in [
+        ("good", &b"good bytes"[..]),
+        ("missing_blob", b"missing blob bytes"),
+        ("resized_blob", b"resized blob bytes"),
+        ("bad_meta", b"bad meta bytes"),
+        ("gone_dir", b"gone dir bytes"),
+    ] {
+        let output = dir.path().join(format!("{key}.rlib"));
+        fs::write(&output, bytes).unwrap();
+        store
+            .put(
+                key,
+                key,
+                &["lib".to_string()],
+                &[],
+                "host",
+                "dev",
+                &[(output, format!("lib{key}.rlib"))],
+                "",
+                "",
+            )
+            .unwrap();
+    }
+    let blob_of = |key: &str| store.blob_path(&store.get(key).unwrap().unwrap().files[0].hash);
+    fs::remove_file(blob_of("missing_blob")).unwrap();
+    let resized = blob_of("resized_blob");
+    let mut permissions = fs::metadata(&resized).unwrap().permissions();
+    #[allow(clippy::permissions_set_readonly_false)]
+    permissions.set_readonly(false);
+    fs::set_permissions(&resized, permissions).unwrap();
+    fs::write(&resized, b"shorter").unwrap();
+    fs::write(store.entry_dir("bad_meta").join("meta.json"), b"not json").unwrap();
+    fs::remove_dir_all(store.entry_dir("gone_dir")).unwrap();
+
+    assert!(
+        store.reconcile_blob_index().is_err(),
+        "the strict rebuild still refuses"
+    );
+    let (_, mut dropped) = store.reconcile_blob_index_dropping_unverifiable().unwrap();
+    dropped.sort();
+    assert_eq!(
+        dropped,
+        ["bad_meta", "gone_dir", "missing_blob", "resized_blob"]
+    );
+    for key in &dropped {
+        assert!(!store.entry_dir(key).exists(), "{key}");
+        assert!(store.get(key).unwrap().is_none(), "{key}");
+    }
+    assert!(store.get("good").unwrap().is_some());
+    assert!(store.blob_refcount_drift().unwrap().is_clean());
+    assert_eq!(
+        store
+            .reconcile_blob_index_dropping_unverifiable()
+            .unwrap()
+            .1,
+        Vec::<String>::new()
+    );
+}
+
 #[test]
 fn reconcile_blob_index_rejects_each_invalid_metadata_dimension() {
     for invalid_hash in [true, false] {

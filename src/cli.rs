@@ -7338,8 +7338,22 @@ pub fn verify(config: &Config, checksums: bool, repair: bool) -> Result<VerifyOu
     // the store write lock so a concurrent publisher/remover cannot create a
     // transient mismatch, and rebuild them atomically when requested (#819).
     let index_drift = if repair {
-        match store.reconcile_blob_index() {
-            Ok(drift) => {
+        // Dropping, not strict: an entry whose meta.json cannot be parsed is
+        // one `remove_entry` above refuses to touch (#276), and a strict
+        // rebuild would then refuse the whole store because of it.
+        match store.reconcile_blob_index_dropping_unverifiable() {
+            Ok((drift, dropped)) => {
+                // A corrupted entry `remove_entry` refused is gone now too.
+                corrupted_removed += dropped
+                    .iter()
+                    .filter(|key| corrupted_keys.contains(key))
+                    .count();
+                if !dropped.is_empty() {
+                    println!(
+                        "Repairing: removed {} entries that failed verification.",
+                        dropped.len()
+                    );
+                }
                 if let Some(message) = reconciled_index_message(drift) {
                     println!("{message}");
                 }

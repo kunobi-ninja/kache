@@ -99,13 +99,21 @@ def check(binary, rustc, root, mounts):
             kache(*args, cwd=build)
             assert list(output.glob("*.rmeta")), "warm restore produced no metadata"
 
+            # The same artifact must have independent physical storage in both
+            # shards. Distinct artifacts alone cannot detect cross-store links.
+            common = build / "common.rs"
+            common.write_text("pub fn value() -> u32 { 42 }\n")
+            kache(rustc, "--crate-name", "shard_common", "--crate-type", "rlib",
+                  "--emit=metadata", "--remap-path-prefix", f"{build}=/src",
+                  common, "--out-dir", output, cwd=build)
+
         entries = json.loads(kache("list", "--json"))
-        assert {e["crate_name"] for e in entries["entries"]} == {"shard_0", "shard_1"}, entries
+        assert {e["crate_name"] for e in entries["entries"]} == {"shard_0", "shard_1", "shard_common"}, entries
         for index, store in enumerate(stores):
             row = next(e for e in entries["entries"] if e["crate_name"] == f"shard_{index}")
             assert [os.path.normcase(p) for p in row["store_dirs"]] == [os.path.normcase(str(store))], row
             with sqlite3.connect(store / "index.db") as db:
-                assert db.execute("SELECT count(*) FROM entries WHERE committed=1").fetchone()[0] == 1
+                assert db.execute("SELECT count(*) FROM entries WHERE committed=1").fetchone()[0] == 2
             why = json.loads(kache("why-miss", f"shard_{index}", "--json"))
             assert why["stored_entries"] == 1, why
             assert [os.path.normcase(p) for p in why["store_dirs"]] == [os.path.normcase(str(store))], why
@@ -118,17 +126,20 @@ def check(binary, rustc, root, mounts):
 
         # Each physical store owns its blobs, even when both mounts share a disk.
         identities = []
+        hashes = []
         for store in stores:
-            identities.append({(p.stat().st_dev, p.stat().st_ino)
-                               for p in (store / "store" / "blobs").rglob("*") if p.is_file()})
+            blobs = [p for p in (store / "store" / "blobs").rglob("*") if p.is_file()]
+            identities.append({(p.stat().st_dev, p.stat().st_ino) for p in blobs})
+            hashes.append({p.name for p in blobs})
         assert all(identities), "the fixture produced no blobs"
+        assert hashes[0] & hashes[1], "the fixture must store identical content in both shards"
         assert identities[0].isdisjoint(identities[1]), "shards share blob inodes"
         stats = json.loads(kache("stats", "--json"))
-        assert stats["entries"] == 2, stats
+        assert stats["entries"] == len(entries["entries"]), stats
         assert len(stats["stores"]) == 3, stats
         assert stats["stores"][0]["entries"] == 0, stats
         report = json.loads(kache("report", "--format", "json"))
-        assert report["storage"]["store_entries"] == 2, report["storage"]
+        assert report["storage"]["store_entries"] == len(entries["entries"]), report["storage"]
         assert report["storage"]["logical_bytes"] == sum(s["bytes"] for s in stats["stores"])
         assert report["summary"]["local_hits"] >= 2, report["summary"]
         kache("doctor", "--verify")

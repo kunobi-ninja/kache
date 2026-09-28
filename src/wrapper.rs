@@ -3728,6 +3728,25 @@ fn run_parsed_rustc(
             return Ok(0);
         }
 
+        // Both lookups missed. Incremental compilation needs no artifact key
+        // re-derivation: rustc reads the current inputs and this result is never
+        // stored. Keep the ordinary lookup first so a hit still restores.
+        if let (Some(unit), Some(fields)) = (adaptive_unit.as_ref(), adaptive_key_fields.as_ref())
+            && let Some(lease) = unit.try_seed(&cache_key, fields)
+        {
+            return adaptive_incremental_with_event(
+                config,
+                args,
+                crate_name,
+                &event_root,
+                start,
+                lease,
+                "adaptive seed",
+                Some((&cache_key, key_ms, key_hash_stats, lookup_ms)),
+                key_record,
+            );
+        }
+
         if !owes_rederivation(predicted, rederived) {
             break;
         }
@@ -3796,25 +3815,6 @@ fn run_parsed_rustc(
             // this key; asking again would be the same two misses.
             break;
         }
-    }
-
-    // Exact local and remote lookups both missed. A second nearby miss whose
-    // stable key groups match may seed isolated incremental state. The result
-    // is deliberately not stored under the normal artifact key.
-    if let (Some(unit), Some(fields)) = (adaptive_unit.as_ref(), adaptive_key_fields.as_ref())
-        && let Some(lease) = unit.try_seed(&cache_key, fields)
-    {
-        return adaptive_incremental_with_event(
-            config,
-            args,
-            crate_name,
-            &event_root,
-            start,
-            lease,
-            "adaptive seed",
-            Some((&cache_key, key_ms, key_hash_stats, lookup_ms)),
-            key_record,
-        );
     }
 
     // 3. Cache miss — join the machine-wide flight, take a permit, then

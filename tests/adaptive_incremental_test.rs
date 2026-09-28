@@ -221,6 +221,10 @@ fn source_churn_adapts_then_returns_to_exact_cache_hits() {
     let seed = build(2);
     assert_passthrough(&seed, "adaptive seed");
     assert_eq!(seed["compiler_runs"], 1);
+    assert_eq!(
+        seed["dep_info_runs"], 0,
+        "a seed must not re-derive a missed prediction: {seed:#}"
+    );
     assert!(!seed["fallback"].as_bool().unwrap_or(false));
 
     let active = build(3);
@@ -277,6 +281,16 @@ fn source_churn_adapts_then_returns_to_exact_cache_hits() {
     let after_hit = build(15);
     assert_passthrough(&after_hit, "adaptive seed");
     assert_eq!(after_hit["compiler_runs"], 1);
+    assert_eq!(
+        after_hit["dep_info_runs"], 0,
+        "the first edit after a hit must skip re-derivation: {after_hit:#}"
+    );
+
+    // The predicted key may select incremental compilation, but must not
+    // publish its output. With policy state removed, this variant still misses.
+    fs::remove_dir_all(&policy_root).unwrap();
+    let unseeded = build(15);
+    assert_eq!(unseeded["result"], "miss", "event: {unseeded:#}");
 }
 
 #[test]

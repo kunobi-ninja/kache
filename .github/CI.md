@@ -4,6 +4,16 @@ Public repositories, including forks, run validation on GitHub-hosted Linux,
 macOS, and Windows runners. No runner variables or publication credentials
 are needed. Pull requests run the normal checks; pushes to `main` do too.
 
+## Filesystem test runners
+
+Three jobs always use GitHub-hosted runners:
+
+- `Nix package (macOS)` installs Nix and manages its APFS store on a fresh Mac.
+- `CoW filesystem (btrfs)` creates a loopback filesystem to exercise reflinks.
+- `E2E smoke (Linux)` creates bind mounts to check per-volume cache routing.
+
+These jobs need filesystem setup that other runners may not support.
+
 ## Optional workloads
 
 The official repository retains its existing benchmark and performance pools.

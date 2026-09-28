@@ -799,29 +799,13 @@ jobs:
           - os: Linux
             runner: ${{ fromJSON(!github.event.repository.private && '"ubuntu-latest"' || vars.CI_RUNNER_LINUX) }}
           - os: macOS
-            runner: ${{ fromJSON(!github.event.repository.private && '"macos-latest"' || vars.CI_RUNNER_MACOS) }}
+            # Nix installs and manages its APFS store on a disposable host.
+            runner: macos-latest
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-      # A self-hosted Mac is one persistent host shared by several runners. A
-      # per-job install there races the other runners and hangs creating the
-      # Nix Store volume, leaving a root installer behind every time. Those
-      # hosts get Nix once when they are provisioned; the job uses that store
-      # and fails at once when it is missing.
-      - name: Use the host's Nix
-        if: runner.environment == 'self-hosted' && runner.os == 'macOS'
-        shell: bash
-        run: |
-          nix_bin=/nix/var/nix/profiles/default/bin
-          if [ ! -x "$nix_bin/nix" ]; then
-            echo "::error::Nix is not installed on this self-hosted Mac. Provision it on the host; this job does not install it."
-            exit 1
-          fi
-          echo "$nix_bin" >> "$GITHUB_PATH"
       - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
-        if: runner.environment != 'self-hosted' || runner.os != 'macOS'
         timeout-minutes: 10
       - name: Restore Nix store
-        if: runner.environment != 'self-hosted' || runner.os != 'macOS'
         uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569 # v7
         with:
           primary-key: nix-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('flake.lock', 'rust-toolchain.toml', 'Cargo.lock') }}
@@ -883,7 +867,8 @@ jobs:
   # the ingest half; both shipped green. This lane exists so a third round can't.
   cow-filesystem:
     name: CoW filesystem (btrfs)
-    runs-on: ${{ fromJSON(!github.event.repository.private && '"ubuntu-latest"' || vars.CI_RUNNER_LINUX) }}
+    # The test creates a btrfs filesystem through the host's loop devices.
+    runs-on: ubuntu-latest
     needs: changes
     if: github.event_name != 'pull_request' || needs.changes.outputs.tests == 'true'
     timeout-minutes: 30
@@ -980,7 +965,8 @@ jobs:
       matrix:
         include:
           - os: Linux
-            runner: ${{ fromJSON(!github.event.repository.private && '"ubuntu-latest"' || vars.CI_RUNNER_LINUX) }}
+            # Volume-shard checks need real bind mounts.
+            runner: ubuntu-latest
             exe_suffix: ""
           # Public validation stays hosted. Private runner groups must grant
           # access only to the intended repositories and workflow trust level.

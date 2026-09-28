@@ -136,6 +136,11 @@ for (const [file, workflow] of Object.entries(files)) {
   }
 }
 assert(routing.length > 0);
+const hostedFilesystemJobs = new Set([
+  "ci.yml:nix-package:macOS",
+  "ci.yml:cow-filesystem",
+  "ci.yml:e2e:Linux",
+]);
 function resolveRunner(source, context) {
   return typeof source === "string" && source.trim().startsWith("${{")
     ? evaluate(source, context)
@@ -176,6 +181,16 @@ for (const [name, expression] of routing) {
     `${name} external fork PR remains hosted`,
   );
   for (const repository of privateRepos) {
+    if (hostedFilesystemJobs.has(name)) {
+      for (const vars of [{}, privateVars, { [platform]: "broken JSON" }]) {
+        eq(
+          resolveRunner(expression, context(repository, true, vars)),
+          hosted,
+          `${name} filesystem setup uses a disposable hosted runner`,
+        );
+      }
+      continue;
+    }
     eq(
       resolveRunner(expression, context(repository, true, privateVars)),
       JSON.parse(privateVars[platform]),

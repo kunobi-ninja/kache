@@ -643,24 +643,46 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[test]
+    fn readiness_candidate_fixture() {
+        use std::io::Write;
+        use std::os::fd::FromRawFd;
+
+        let Some(release) = std::env::var_os("KACHE_TEST_READINESS_RELEASE") else {
+            return;
+        };
+        let fd = std::env::var("KUNOBI_DAEMON_READY")
+            .unwrap()
+            .parse()
+            .unwrap();
+        // SAFETY: DaemonCommand passed this child its owned readiness pipe.
+        let mut channel = unsafe { std::fs::File::from_raw_fd(fd) };
+        writeln!(
+            channel,
+            "{}",
+            std::env::var("KACHE_TEST_READINESS_MESSAGE").unwrap()
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !Path::new(&release).exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(unix)]
     fn verify_signaled_candidate(config: &Config, message: &str) -> Result<Progress> {
         let root = tempfile::tempdir().unwrap();
         let release = root.path().join("release");
-        let mut command = kunobi_daemon::launch::DaemonCommand::new("/usr/bin/python3");
+        let mut command =
+            kunobi_daemon::launch::DaemonCommand::new(std::env::current_exe().unwrap());
         command
             .args([
-                "-c",
-                r#"
-import os, sys, time
-fd = int(os.environ['KUNOBI_DAEMON_READY'])
-os.write(fd, (sys.argv[1] + '\n').encode())
-deadline = time.monotonic() + 5
-while not os.path.exists(sys.argv[2]) and time.monotonic() < deadline:
-    time.sleep(0.01)
-"#,
-                message,
+                "--exact",
+                "daemon::lifecycle_client::tests::readiness_candidate_fixture",
+                "--nocapture",
             ])
-            .arg(&release)
+            .env("KACHE_TEST_READINESS_RELEASE", &release)
+            .env("KACHE_TEST_READINESS_MESSAGE", message)
             .readiness_channel();
         let mut replacement = driver(config);
         replacement.child = Some(command.spawn().unwrap());

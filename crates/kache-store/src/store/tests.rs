@@ -2325,6 +2325,11 @@ fn unverifiable_entries_are_removed_and_the_index_rebuilds() {
         dropped,
         ["bad_meta", "gone_dir", "missing_blob", "resized_blob"]
     );
+    assert_eq!(
+        store.entry_count().unwrap(),
+        1,
+        "only the good entry's row stays"
+    );
     for key in &dropped {
         assert!(!store.entry_dir(key).exists(), "{key}");
         assert!(store.get(key).unwrap().is_none(), "{key}");

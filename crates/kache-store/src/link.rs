@@ -686,8 +686,9 @@ enum CopyRestoreCause {
 
 impl CopyRestoreCause {
     #[cfg_attr(not(windows), allow(dead_code))]
-    fn mapped_volume_advice(self, mapped: bool) -> bool {
-        self == Self::CrossVolume && mapped
+    fn mute_advice(self, mapped: bool, strategy_advice: bool, config_advice: bool) -> bool {
+        (self == Self::CrossVolume && mapped)
+            || (self.is_layout_advisory() && (!strategy_advice || !config_advice))
     }
 
     /// Which dedup bucket this advisory belongs to.
@@ -890,9 +891,11 @@ fn warn_no_cow_restore_once(
     // layout — and `[cache] storage_layout_advice = false` is the user saying
     // their layout is intentional (#551). Either way this mutes only the
     // *advice*: a genuine clone fault still reports (see `layout_advice`).
-    if cause.mapped_volume_advice(MAPPED_TARGET.load(Ordering::Relaxed))
-        || (cause.is_layout_advisory() && (!layout_advice || !storage_layout_advice_enabled()))
-    {
+    if cause.mute_advice(
+        MAPPED_TARGET.load(Ordering::Relaxed),
+        layout_advice,
+        storage_layout_advice_enabled(),
+    ) {
         tracing::debug!(
             "copy-restored {} ({:?}; layout advice muted: strategy={}, config={})",
             target_path.display(),
@@ -1992,11 +1995,80 @@ mod tests {
             CopyRestoreCause::SubClusterOnCowVolume,
             CopyRestoreCause::UnexpectedOnCowVolume,
         ] {
-            assert!(!cause.mapped_volume_advice(false));
+            assert!(!cause.mute_advice(false, true, true));
             assert_eq!(
-                cause.mapped_volume_advice(true),
+                cause.mute_advice(true, true, true),
                 cause == CopyRestoreCause::CrossVolume
             );
+        }
+    }
+
+    #[test]
+    fn copy_advice_switches_preserve_faults_for_every_mapping() {
+        for mapped in [false, true] {
+            for (strategy, config) in [(false, true), (true, false), (false, false)] {
+                for cause in [
+                    CopyRestoreCause::CrossVolume,
+                    CopyRestoreCause::NoCow,
+                    CopyRestoreCause::UnknownCow,
+                ] {
+                    assert!(cause.mute_advice(mapped, strategy, config));
+                }
+                for cause in [
+                    CopyRestoreCause::SubClusterOnCowVolume,
+                    CopyRestoreCause::UnexpectedOnCowVolume,
+                ] {
+                    assert!(!cause.mute_advice(mapped, strategy, config));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mapped_target_changes_the_emitted_hardlink_advice() {
+        const CASE: &str = "KACHE_TEST_MAPPED_HARDLINK_ADVICE";
+        if let Ok(case) = std::env::var(CASE) {
+            set_mapped_target(case != "unmapped-cross");
+            let (reason, kind) = if case == "mapped-permission" {
+                (
+                    HardlinkIoReason::Permission,
+                    std::io::ErrorKind::PermissionDenied,
+                )
+            } else {
+                (
+                    HardlinkIoReason::CrossDevice,
+                    std::io::ErrorKind::CrossesDevices,
+                )
+            };
+            warn_hardlink_fallback_once(
+                Path::new("store"),
+                Path::new("target"),
+                reason,
+                &std::io::Error::from(kind),
+            );
+            return;
+        }
+        // Separate processes isolate both the mapping flag and once-only warning.
+        for (case, expected) in [
+            ("mapped-cross", None),
+            ("unmapped-cross", Some("EXDEV")),
+            ("mapped-permission", Some("EPERM")),
+        ] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "link::tests::mapped_target_changes_the_emitted_hardlink_advice",
+                    "--nocapture",
+                ])
+                .env(CASE, case)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{case}: {output:?}");
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            match expected {
+                Some(message) => assert!(stderr.contains(message), "{case}: {stderr}"),
+                None => assert!(!stderr.contains("EXDEV"), "{case}: {stderr}"),
+            }
         }
     }
 

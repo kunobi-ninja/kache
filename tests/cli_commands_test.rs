@@ -2424,6 +2424,60 @@ fn why_miss_reports_key_mismatch_after_source_edit() {
 }
 
 #[test]
+fn why_miss_compares_features_from_a_volume_shard() {
+    let e = env();
+    let project = scaffold_lib("shardfeatures", "pub fn value() -> u32 { 42 }\n");
+    let target = project.path().join("target");
+    let shard = e.cache.join("volume-store");
+    let config = "[cache]\nlocal_only = true\nscheduler = false\ndaemon_publish = false\n";
+    std::fs::write(e.cache.join("config.toml"), config).unwrap();
+    let manifest_path = project.path().join("Cargo.toml");
+    let manifest = std::fs::read_to_string(&manifest_path).unwrap();
+    for feature in ["old", "new"] {
+        if feature == "new" {
+            // Keep the previous key on the main store and the latest key in a
+            // shard, so reporting the wrong entry also reports the wrong path.
+            std::fs::write(
+                e.cache.join("config.toml"),
+                format!(
+                    "{config}[cache.volumes]\n{} = {}\n",
+                    serde_json::to_string(&project.path().display().to_string()).unwrap(),
+                    serde_json::to_string(&shard.display().to_string()).unwrap(),
+                ),
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            &manifest_path,
+            format!("{manifest}\n[features]\ndefault = [\"{feature}\"]\nold = []\nnew = []\n"),
+        )
+        .unwrap();
+        let build = e.wrapper_build(project.path(), &target);
+        assert!(
+            build.status.success(),
+            "{feature}: {}",
+            String::from_utf8_lossy(&build.stderr)
+        );
+    }
+    e.cmd()
+        .args(["why-miss", "shardfeatures"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("different features vs"))
+        .stdout(predicates::str::contains("    features: default, new"))
+        .stdout(predicates::str::contains(shard.display().to_string()));
+    let output = e
+        .cmd()
+        .args(["why-miss", "shardfeatures", "--json"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let diagnosis: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(diagnosis["stored_entries"], 2);
+    assert_eq!(diagnosis["store_dirs"], serde_json::json!([shard]));
+}
+
+#[test]
 fn why_miss_legacy_repeated_same_key_does_not_claim_key_mismatch() {
     let e = env();
     write_legacy_miss_events(&e, "legacy-cc", &["same-key", "same-key"]);

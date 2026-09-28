@@ -112,7 +112,7 @@ def check(binary, rustc, root, mounts):
         for index, store in enumerate(stores):
             row = next(e for e in entries["entries"] if e["crate_name"] == f"shard_{index}")
             assert [os.path.normcase(p) for p in row["store_dirs"]] == [os.path.normcase(str(store))], row
-            with sqlite3.connect(store / "index.db") as db:
+            with contextlib.closing(sqlite3.connect(store / "index.db")) as db:
                 assert db.execute("SELECT count(*) FROM entries WHERE committed=1").fetchone()[0] == 2
             why = json.loads(kache("why-miss", f"shard_{index}", "--json"))
             assert why["stored_entries"] == 1, why

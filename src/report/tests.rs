@@ -1265,6 +1265,8 @@ fn last_build_report_uses_retained_history_and_omits_unscoped_data() {
     let mut hit = session_event(root_str, "selected", 10, 100);
     hit.result = EventResult::LocalHit;
     hit.compile_time_ms = 4_000;
+    hit.reflinked_bytes = 128;
+    hit.hardlinked_bytes = 256;
     hit.copied_bytes = 512;
     let mut miss = session_event(root_str, "selected", 0, 200);
     miss.crate_name = "compiled".to_string();
@@ -1295,7 +1297,7 @@ fn last_build_report_uses_retained_history_and_omits_unscoped_data() {
     assert_eq!(report.summary.misses, 1);
     assert_eq!(report.summary.passthroughs, 1);
     assert_eq!(report.summary.time_saved_ms, 4_000);
-    assert_eq!(report.storage.restored_bytes, 512);
+    assert_eq!(report.storage.restored_bytes, 896);
     assert_eq!(report.timeline.event_count, 3);
     assert_eq!(report.timeline.duration_ms, 10_200);
     assert!(report.network.is_none());

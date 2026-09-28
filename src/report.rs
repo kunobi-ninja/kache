@@ -1393,11 +1393,10 @@ fn load_gc_summary_all(config: &Config, cutoff: DateTime<Utc>) -> Option<GcSumma
         .filter_map(|store| load_gc_summary(&store.cache_dir, cutoff))
         .reduce(|mut total, next| {
             // load_gc_summary has already validated both timestamps.
-            if DateTime::parse_from_rfc3339(&next.last_run).unwrap()
-                > DateTime::parse_from_rfc3339(&total.last_run).unwrap()
-            {
-                total.last_run = next.last_run;
-            }
+            total.last_run = [total.last_run, next.last_run]
+                .into_iter()
+                .max_by_key(|time| DateTime::parse_from_rfc3339(time).unwrap())
+                .unwrap();
             total.entries_evicted += next.entries_evicted;
             total.bytes_freed += next.bytes_freed;
             total.disk_bytes_reclaimed += next.disk_bytes_reclaimed;

@@ -106,6 +106,7 @@ fn volume_inventory_skips_unavailable_shards_without_creating_them() {
     assert_eq!(view.entry_count, 1);
     assert_eq!(view.max_size, 1000);
     assert_eq!(view.stores[1].path, shard_config.cache_dir);
+    assert_eq!(view.stores[1].max_size, 2000);
     assert!(
         view.stores[1]
             .error
@@ -167,6 +168,21 @@ fn volume_inventory_single_store_and_sort_orders() {
     assert_eq!(view.entry_count, 2);
     assert_eq!(view.total_size, 10);
     assert!(view.entries.is_empty());
+    let window = crate::since::SinceWindow::DEFAULT;
+    let snapshot = crate::cli::snapshot_from_direct_reads(&config, false, "name", window, false);
+    let lines = crate::cli::render_stats(&snapshot, &config, window);
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|line| line.starts_with("Store:"))
+            .count(),
+        1
+    );
+    assert!(
+        !lines
+            .iter()
+            .any(|line| line.starts_with(&format!("Store {}:", config.cache_dir.display())))
+    );
     assert_eq!(
         read(&config, true, "name").unwrap().entries[0].crate_name,
         "a"

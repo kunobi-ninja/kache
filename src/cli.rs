@@ -4405,6 +4405,10 @@ fn remove_targets(
     let mut estimated_reclaimed = 0u64;
     let mut apparent_gap = 0u64;
     let mut removed = 0usize;
+    let reservation = crate::target_use::try_exclusive(cache_dir).unwrap_or_else(|error| {
+        tracing::warn!("cannot check running Cargo commands before clean: {error}");
+        None
+    });
     for target in to_remove {
         let rel = target.path.strip_prefix(root).unwrap_or(&target.path);
         let current_identity = directory_identity(&target.path);
@@ -4417,10 +4421,6 @@ fn remove_targets(
             }
             continue;
         }
-        let reservation = crate::target_use::try_exclusive(cache_dir).unwrap_or_else(|error| {
-            tracing::warn!("cannot check running Cargo commands before clean: {error}");
-            None
-        });
         if reservation.is_none() || target_in_use(&target.path) {
             if human_clean_output(quiet) {
                 println!("  skipped {} — {TARGET_IN_USE}", rel.display());

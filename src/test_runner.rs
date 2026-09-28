@@ -116,7 +116,11 @@ pub fn run(args: &[OsString]) -> i32 {
 }
 
 /// Keep the target lease in this process until an unscheduled test exits.
-fn run_protected(args: &[OsString], marker: Option<String>, _lease: std::fs::File) -> i32 {
+fn run_protected(
+    args: &[OsString],
+    marker: Option<String>,
+    _lease: crate::target_use::Lease,
+) -> i32 {
     let mut command = Command::new(&args[0]);
     command.args(&args[1..]);
     set_marker(&mut command, marker);

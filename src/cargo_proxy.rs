@@ -198,7 +198,11 @@ fn real_cargo_program(shimmed: bool) -> Result<PathBuf> {
 }
 
 /// Stay alive with the lease until Cargo and everything it runs has exited.
-fn run_cargo_guarded(mut command: Command, cargo: &Path, _lease: std::fs::File) -> Result<()> {
+fn run_cargo_guarded(
+    mut command: Command,
+    cargo: &Path,
+    _lease: crate::target_use::Lease,
+) -> Result<()> {
     let mut child = command
         .spawn()
         .with_context(|| format!("running Cargo program {cargo:?}"))?;

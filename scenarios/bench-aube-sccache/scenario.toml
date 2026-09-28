@@ -1,0 +1,54 @@
+# aube through sccache, for a side-by-side comparison with bench-aube. See
+# bench-aube for why aube.
+name = "bench-aube-sccache"
+tags = ["suite:bench", "project:aube", "backend:sccache", "lang:rust", "lang:cc"]
+
+requires = ["cargo", "rustc", "cc", "cmake"]
+
+setup = [
+  "echo '[bench] bench-aube-sccache needs a C compiler (aws-lc-sys, mimalloc, tree-sitter through cc-rs) and cmake (libz-ng-sys).'",
+]
+
+prepare = "cargo fetch --locked"
+
+build = """
+repo="$(pwd -P)"
+prefix_map="-ffile-prefix-map=$repo=. -fdebug-prefix-map=$repo=. -fmacro-prefix-map=$repo=."
+export CFLAGS="${CFLAGS:-} $prefix_map"
+export CXXFLAGS="${CXXFLAGS:-} $prefix_map"
+export SOURCE_DATE_EPOCH=1735689600
+export ZERO_AR_DATE=1
+
+cargo build --locked
+"""
+
+[env]
+HOST_CC = "{cache} cc"
+HOST_CXX = "{cache} c++"
+CC_KNOWN_WRAPPER_CUSTOM = "sccache"
+
+[source]
+kind   = "clone"
+repo   = "https://github.com/aubepkg/aube.git"
+# The child commit of the parent/child pair aube's next-push comparisons use.
+ref    = "e9a36ebef471af5acd13e5b5ace31fd94751215f"
+objdir = "target"
+
+[[file]]
+path = "rust-toolchain.toml"
+content = """
+[toolchain]
+channel = "1.97.1"
+profile = "minimal"
+"""
+
+# aube's mise.toml needs a newer mise than the runners pin, installs its own
+# tool set, and routes `cargo` through another cache. Emptied, so every arm
+# runs the same Cargo.
+[[file]]
+path = "mise.toml"
+content = ""
+
+# Advisory only: the number is the point.
+[checks.measure.warm]
+min_hit_rate_pct = 50.0

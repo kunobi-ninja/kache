@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Measure overlapping hk/eza Cargo jobs against a shared compiler cache on Linux."""
+"""Measure overlapping hk/eza/aube Cargo jobs against a shared compiler cache on Linux."""
 
 import argparse
 import hashlib
@@ -938,6 +938,15 @@ def remove_owned_tree(path):
         raise FileExistsError(path)
 
 
+def write_scenario_files(repo, files):
+    """The scenario's `[[file]]` entries, as the benchmark engine writes them
+    into its own checkouts (aube's is an emptied mise.toml)."""
+    for entry in files:
+        path = repo / entry["path"]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(entry["content"])
+
+
 def run_batches(args, arms, mirror, work, data):
     workload = getattr(args, "workload", JOBS)
     for sample in range(args.samples):
@@ -961,6 +970,7 @@ def run_batches(args, arms, mirror, work, data):
                         ],
                         check=True,
                     )
+                    write_scenario_files(cell / name, getattr(args, "scenario_files", ()))
             repos = [cell / name for name, _ in workload]
             store, runtime, snapshot = (
                 cell / "cache",
@@ -1011,7 +1021,7 @@ def run_batches(args, arms, mirror, work, data):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--project", choices=("hk", "eza"), default="hk")
+    parser.add_argument("--project", choices=("hk", "eza", "aube"), default="hk")
     parser.add_argument(
         "--arm", action="append", default=[], metavar="NAME=BINARY,SCHEDULER"
     )
@@ -1081,7 +1091,8 @@ def main():
         (args.scenarios / f"bench-{args.project}" / "scenario.toml").read_text()
     )
     source = profile["source"]
-    args.toolchain = args.toolchain or {"hk": "1.97.1", "eza": "1.90.0"}[args.project]
+    args.scenario_files = profile.get("file", [])
+    args.toolchain = args.toolchain or {"hk": "1.97.1", "eza": "1.90.0", "aube": "1.97.1"}[args.project]
     data = {
         "schema_version": 1,
         "project": args.project,

@@ -1,0 +1,90 @@
+# aube (aubepkg/aube) compile-cache benchmark: cold, warm-same-tree, warm.
+#
+# Why aube: a 15-crate workspace with C dependencies. Its build scripts compile
+# aws-lc-sys, mimalloc and tree-sitter grammars through cc-rs and libz-ng-sys
+# through cmake, it expands proc macros in most workspace crates, and an edit
+# to a low crate rebuilds a chain of workspace crates. hk is one crate over a
+# large dependency graph; aube is where workspace units dominate.
+#
+# The build-script compilers are wired the way `kache init` does (HOST_CC and
+# HOST_CXX, CC and CXX untouched). cmake-rs passes the wrapper through as
+# CMAKE_C_COMPILER_LAUNCHER because cc-rs recognises it by its file stem.
+name = "bench-aube"
+tags = ["suite:bench", "project:aube", "backend:kache", "lang:rust", "lang:cc"]
+
+requires = ["cargo", "rustc", "cc", "cmake"]
+
+setup = [
+  "echo '[bench] bench-aube needs a C compiler (aws-lc-sys, mimalloc, tree-sitter through cc-rs) and cmake (libz-ng-sys).'",
+]
+
+prepare = "cargo fetch --locked"
+
+build = """
+# Input-set predictions, with a sampled cross-check, as in bench-hk.
+export KACHE_INPUT_PREDICTIONS=1
+export KACHE_VERIFY_INPUT_PREDICTIONS=sampled
+
+repo="$(pwd -P)"
+prefix_map="-ffile-prefix-map=$repo=. -fdebug-prefix-map=$repo=. -fmacro-prefix-map=$repo=."
+export CFLAGS="${CFLAGS:-} $prefix_map"
+export CXXFLAGS="${CXXFLAGS:-} $prefix_map"
+export SOURCE_DATE_EPOCH=1735689600
+export ZERO_AR_DATE=1
+export KACHE_BASE_DIR="$repo"
+
+cargo build --locked
+"""
+
+[env]
+HOST_CC = "{kache} cc"
+HOST_CXX = "{kache} c++"
+CC_KNOWN_WRAPPER_CUSTOM = "kache"
+
+[source]
+kind   = "clone"
+repo   = "https://github.com/aubepkg/aube.git"
+# The child commit of the parent/child pair aube's next-push comparisons use.
+ref    = "e9a36ebef471af5acd13e5b5ace31fd94751215f"
+objdir = "target"
+
+[[file]]
+path = "rust-toolchain.toml"
+content = """
+[toolchain]
+channel = "1.97.1"
+profile = "minimal"
+"""
+
+# aube's mise.toml needs a newer mise than the runners pin, installs its own
+# tool set, and routes `cargo` through another cache. Emptied, so every arm
+# runs the same Cargo.
+[[file]]
+path = "mise.toml"
+content = ""
+
+# Validity floors, not regression bounds: a phase that recompiled the world
+# must fail loudly rather than report a flattering wall clock. A healthy run
+# restores about 580 units.
+[checks.assert.warm-same-tree]
+max_passthrough_pct = 40.0
+max_errors = 0
+min_hits = 300
+min_restored_bytes = 67108864 # 64 MiB
+
+[checks.assert.warm]
+min_key_stability_pct = 50.0
+max_passthrough_pct = 40.0
+max_errors = 0
+min_hits = 300
+min_restored_bytes = 67108864 # 64 MiB
+
+[checks.measure.warm]
+# Reasons kache still passes real compiles through for. Any other reason warns;
+# delete an entry once it is fixed.
+known_passthrough = [
+  "unsupported|rustc build-script probe",
+  "unsupported|cc link mode",
+  # aws-lc-sys assembly defines `.macro`s, which can build `.incbin` (#1015).
+  "uncacheable|cc: the assembler may read a file the cache key cannot see",
+]

@@ -129,7 +129,7 @@ held constant — the everyday "I cleaned my `target/`" case. Its own gate is
 `[checks.assert.warm-same-tree]`, evaluated separately from `[checks.assert.warm]`
 and folded into the same exit code.
 
-hk and eza run all three phases through Kache, sccache, and mbx. See the
+hk, eza and aube run all three phases through Kache, sccache, and mbx. See the
 per-PR perf gate in `.github/workflows/perf-gate.yml`, and `just bench-pr`
 to run one Kache side locally. Both warm phases start from the cold snapshot.
 

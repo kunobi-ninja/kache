@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Repeated hk/eza measurements; each arm owns its cache and checkout paths."""
+"""Repeated hk/eza/aube measurements; each arm owns its cache and checkout paths."""
 
 import argparse
 import json
@@ -308,7 +308,7 @@ def run(args):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--project", choices=("hk", "eza"), required=True)
+    parser.add_argument("--project", choices=("hk", "eza", "aube"), required=True)
     parser.add_argument("--engine", type=Path, required=True)
     parser.add_argument("--scenarios", type=Path, default=Path("scenarios"))
     parser.add_argument("--kache", required=True)

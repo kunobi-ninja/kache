@@ -202,8 +202,8 @@ def main():
     parser.add_argument(
         "--projects",
         nargs="+",
-        choices=("hk", "eza"),
-        default=["hk", "eza"],
+        choices=("hk", "eza", "aube"),
+        default=["hk", "eza", "aube"],
         help="subjects to measure",
     )
     parser.add_argument("--samples", type=int, choices=range(1, 21), default=3)

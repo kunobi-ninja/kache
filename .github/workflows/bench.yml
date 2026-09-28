@@ -1,9 +1,9 @@
 name: Bench
 
 # Clone benchmark — builds kache from THIS ref and runs the cross-clone
-# cold/warm scenarios and the repeated hk/eza suites, then uploads reports. This is the heavy, hours-long, tens-of-GB-disk job, so
+# cold/warm scenarios and the repeated hk/eza/aube suites, then uploads reports. This is the heavy, hours-long, tens-of-GB-disk job, so
 # it lives in its own workflow and never blocks a push or PR. The per-PR perf
-# gate (perf-gate.yml) measures hk and eza separately.
+# gate (perf-gate.yml) measures hk, eza and aube separately.
 #
 # Triggers:
 #   - schedule  : nightly, runs every arm in the matrix below except the
@@ -41,10 +41,10 @@ on:
       scenario:
         description: "Which scenario(s) to run"
         type: choice
-        options: [all, hk-comparison, surrealdb, lance, opendal, cuda-oxide, cuda-oxide-patched, eza, llvm, hk, hk-nopred, hk-pull, hk-pull-perf, hk-pull-nopred, hk-mbx, hk-pull-mbx, opendal-mbx, lance-mbx, surrealdb-mbx, firefox-sccache]
+        options: [all, hk-comparison, surrealdb, lance, opendal, cuda-oxide, cuda-oxide-patched, eza, aube, llvm, hk, hk-nopred, hk-pull, hk-pull-perf, hk-pull-nopred, hk-mbx, hk-pull-mbx, opendal-mbx, lance-mbx, surrealdb-mbx, firefox-sccache]
         default: all
       extra_args:
-        description: "Extra recipe arguments (hk/eza: sample count; other scenarios: --skip-clone, --retry)"
+        description: "Extra recipe arguments (hk/eza/aube: sample count; other scenarios: --skip-clone, --retry)"
         type: string
         default: ""
 
@@ -171,6 +171,11 @@ jobs:
           # run). The cheapest arm in the sweep: minutes, and under a gigabyte
           # of build output.
           eza='{"name":"eza","cmd":"bench-short eza","dir":"bench-eza","timeout":60,"job_timeout":90,"min_free_gb":40,"runner":"kunobi-runners"}'
+          # aube: a 15-crate workspace with C dependencies (aws-lc-sys,
+          # mimalloc, tree-sitter through cc-rs; libz-ng-sys through cmake).
+          # Where hk is one crate over a large graph, aube's time goes to
+          # workspace units that depend on each other.
+          aube='{"name":"aube","cmd":"bench-short aube","dir":"bench-aube","timeout":120,"job_timeout":150,"min_free_gb":40,"runner":"kunobi-runners"}'
           # Two more subjects on the same side-by-side axis. mbx fronts Cargo,
           # so the arms it can serve at all are exactly the cargo-driven ones:
           # firefox (mach/gn/ninja) and llvm (cmake) are out of reach, which is
@@ -196,6 +201,7 @@ jobs:
             hk-pull-nopred)       inc="[$hk_pull_nopred]" ;;
             hk-pull-mbx)          inc="[$hk_pull_mbx]" ;;
             eza)                  inc="[$eza]" ;;
+            aube)                 inc="[$aube]" ;;
             opendal-mbx)          inc="[$opendal_mbx]" ;;
             lance-mbx)            inc="[$lance_mbx]" ;;
             surrealdb-mbx)        inc="[$surrealdb_mbx]" ;;
@@ -210,7 +216,7 @@ jobs:
             # so the Linux matrix is EMPTY for them (an empty include
             # skips the `bench` job cleanly). Without this they'd fall to `*)`
             # and wastefully run the whole Linux `all` matrix alongside.
-            *)                    inc="[$surrealdb,$lance,$opendal,$cuda_oxide,$cuda_oxide_patched,$llvm,$hk,$hk_nopred,$hk_pull,$hk_pull_perf,$hk_pull_nopred,$hk_pull_mbx,$eza,$opendal_mbx,$lance_mbx,$surrealdb_mbx]" ;;
+            *)                    inc="[$surrealdb,$lance,$opendal,$cuda_oxide,$cuda_oxide_patched,$llvm,$hk,$hk_nopred,$hk_pull,$hk_pull_perf,$hk_pull_nopred,$hk_pull_mbx,$eza,$aube,$opendal_mbx,$lance_mbx,$surrealdb_mbx]" ;;
           esac
           if [ "$EVENT_NAME" = "schedule" ]; then
             inc="$(jq -c --argjson extra "[$firefox,$firefox_pull]" '. + $extra' <<<"$inc")"
@@ -363,7 +369,7 @@ jobs:
           install: true
           # Pin mise CLI — see ci.yml (v2026.6.10 regression).
           version: 2026.6.9
-          install_args: --force rust github:casey/just${{ (endsWith(matrix.name, '-sccache') || matrix.name == 'hk' || matrix.name == 'eza') && ' github:mozilla/sccache' || '' }}
+          install_args: --force rust github:casey/just${{ (endsWith(matrix.name, '-sccache') || matrix.name == 'hk' || matrix.name == 'eza' || matrix.name == 'aube') && ' github:mozilla/sccache' || '' }}
           cache: false
           reshim: false
 
@@ -373,7 +379,7 @@ jobs:
         with:
           install: true
           version: 2026.6.9
-          install_args: --force rust github:casey/just${{ (endsWith(matrix.name, '-sccache') || matrix.name == 'hk' || matrix.name == 'eza') && ' github:mozilla/sccache' || '' }}
+          install_args: --force rust github:casey/just${{ (endsWith(matrix.name, '-sccache') || matrix.name == 'hk' || matrix.name == 'eza' || matrix.name == 'aube') && ' github:mozilla/sccache' || '' }}
           cache: false
           reshim: false
 
@@ -384,7 +390,7 @@ jobs:
       # on purpose — the arm tracks the tool as it ships — with the checksum
       # verified and the version recorded in the log.
       - name: Install mbx (comparison arms only)
-        if: endsWith(matrix.name, '-mbx') || matrix.name == 'hk' || matrix.name == 'eza'
+        if: endsWith(matrix.name, '-mbx') || matrix.name == 'hk' || matrix.name == 'eza' || matrix.name == 'aube'
         timeout-minutes: 10
         run: |
           bash scripts/install-bench-mbx.sh
@@ -516,7 +522,7 @@ jobs:
       # Only the arms that pass `--warm-same-tree` write this directory; the
       # step is skipped elsewhere so a missing phase never reads as a warning.
       - name: Upload cache telemetry (warm-same-tree)
-        if: always() && (contains(matrix.cmd, '--warm-same-tree') || matrix.name == 'hk' || matrix.name == 'eza') && !endsWith(matrix.name, '-mbx')
+        if: always() && (contains(matrix.cmd, '--warm-same-tree') || matrix.name == 'hk' || matrix.name == 'eza' || matrix.name == 'aube') && !endsWith(matrix.name, '-mbx')
         timeout-minutes: 10
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

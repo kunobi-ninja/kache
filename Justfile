@@ -329,11 +329,12 @@ bench-short PROJECT SAMPLES="6" *ARGS:
     --engine target/release/kache-scenario --kache target/release/kache \
     --output "tmp/bench/bench-{{PROJECT}}" {{ARGS}}
 
-# One Kache side of both PR subjects; use a separate checkout for each version.
+# One Kache side of the PR subjects; use a separate checkout for each version.
 [group('bench')]
 bench-pr:
   just bench hk --warm-same-tree
   just bench eza --warm-same-tree
+  just bench aube --warm-same-tree
 
 # Validate sample isolation, result admission and paired comparisons.
 [group('bench')]

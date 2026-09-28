@@ -43,6 +43,22 @@ class ContentionTests(unittest.TestCase):
             bench.wait_for_daemon_lock(path, 0)
             bench.wait_for_daemon_lock(path, 0)
 
+    def test_scenario_files_replace_what_the_checkout_had(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            (repo / "mise.toml").write_text("[wrappers.cargo]\ncommand = \"other\"\n")
+            bench.write_scenario_files(
+                repo,
+                [
+                    {"path": "mise.toml", "content": ""},
+                    {"path": "nested/rust-toolchain.toml", "content": "[toolchain]\n"},
+                ],
+            )
+            self.assertEqual((repo / "mise.toml").read_text(), "")
+            self.assertEqual(
+                (repo / "nested" / "rust-toolchain.toml").read_text(), "[toolchain]\n"
+            )
+
     def test_storage_counts_hardlinks_once_and_does_not_follow_symlinks(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

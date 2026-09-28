@@ -347,7 +347,9 @@ jobs:
           set -euo pipefail
           git switch --detach "$MERGE_BASE"
           cargo build --release -p kache
-          cp target/release/kache "$RUNNER_TEMP/kache-base"
+          # cc-rs recognizes wrappers by filename, including CMake dependencies.
+          mkdir -p "$RUNNER_TEMP/base"
+          cp target/release/kache "$RUNNER_TEMP/base/kache"
 
       - name: Build kache from the PR head
         env:
@@ -357,9 +359,10 @@ jobs:
           set -euo pipefail
           git switch --detach "$HEAD_SHA"
           cargo build --release -p kache
-          cp target/release/kache "$RUNNER_TEMP/kache-head"
-          "$RUNNER_TEMP/kache-base" --version
-          "$RUNNER_TEMP/kache-head" --version
+          mkdir -p "$RUNNER_TEMP/head"
+          cp target/release/kache "$RUNNER_TEMP/head/kache"
+          "$RUNNER_TEMP/base/kache" --version
+          "$RUNNER_TEMP/head/kache" --version
 
       # The harness clones third-party subjects over https. Anonymous
       # requests share this cluster's egress quota, and when it is exhausted
@@ -397,7 +400,7 @@ jobs:
             --context-samples "$BENCH_CONTEXT_SAMPLES" --contention-samples "$BENCH_CONTENTION_SAMPLES" \
             --engine "$RUNNER_TEMP/instrument/kache-scenario" \
             --scenarios "$RUNNER_TEMP/instrument/scenarios" \
-            --kache "$RUNNER_TEMP/kache-head" --base "$RUNNER_TEMP/kache-base" \
+            --kache "$RUNNER_TEMP/head/kache" --base "$RUNNER_TEMP/base/kache" \
             --output "$RUNNER_TEMP/perf-gate/$BENCH_PROJECT" || status=$?
           report="$RUNNER_TEMP/perf-gate/$BENCH_PROJECT/perf-gate.md"
           if [ -f "$report" ]; then cat "$report" >> "$GITHUB_STEP_SUMMARY"; fi

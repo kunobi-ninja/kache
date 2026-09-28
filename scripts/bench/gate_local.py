@@ -251,8 +251,9 @@ def main():
     )
 
     stage_instrument(instrument_sha, staging)
-    base = build(base_sha, "kache", "kache", output / "kache-base", "base kache")
-    head = build(head_sha, "kache", "kache", output / "kache-head", "head kache")
+    # cc-rs recognizes wrappers by filename, including CMake dependencies.
+    base = build(base_sha, "kache", "kache", _fresh(output / "base") / "kache", "base kache")
+    head = build(head_sha, "kache", "kache", _fresh(output / "head") / "kache", "head kache")
 
     status = 0
     measured = []

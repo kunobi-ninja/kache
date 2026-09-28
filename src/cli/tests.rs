@@ -7,8 +7,11 @@ fn doctor_link_layout_uses_the_mapped_store_and_leaves_missing_shards_absent() {
     let mut config = crate::test_support::test_config(dir.path().join("main"));
     let build = dir.path().join("build");
     fs::create_dir(&build).unwrap();
+    let volume = format!("{}{}", build.display(), std::path::MAIN_SEPARATOR);
+    #[cfg(windows)]
+    let volume = volume.replace('/', "\\").to_uppercase();
     let mapping = crate::config::VolumeStore {
-        volume: build.display().to_string(),
+        volume,
         store: dir.path().join("shard"),
         max_size: Some(1000),
     };

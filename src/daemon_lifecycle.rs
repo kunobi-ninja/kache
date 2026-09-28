@@ -641,4 +641,91 @@ mod tests {
         drop(lock);
         server.finish().await;
     }
+
+    #[cfg(unix)]
+    fn verify_signaled_candidate(config: &Config, message: &str) -> Result<Progress> {
+        let root = tempfile::tempdir().unwrap();
+        let release = root.path().join("release");
+        let mut command = kunobi_daemon::launch::DaemonCommand::new("/usr/bin/python3");
+        command
+            .args([
+                "-c",
+                r#"
+import os, sys, time
+fd = int(os.environ['KUNOBI_DAEMON_READY'])
+os.write(fd, (sys.argv[1] + '\n').encode())
+deadline = time.monotonic() + 5
+while not os.path.exists(sys.argv[2]) and time.monotonic() < deadline:
+    time.sleep(0.01)
+"#,
+                message,
+            ])
+            .arg(&release)
+            .readiness_channel();
+        let mut replacement = driver(config);
+        replacement.child = Some(command.spawn().unwrap());
+        let result =
+            replacement.perform(Step::Verify, Some(Instant::now() + Duration::from_secs(3)));
+        std::fs::write(&release, "").unwrap();
+        if let Some(mut child) = replacement.child.take() {
+            assert!(
+                child
+                    .wait_until(Instant::now() + Duration::from_secs(3))
+                    .unwrap()
+                    .unwrap()
+                    .success()
+            );
+        }
+        result
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn candidate_verification_rejects_malformed_readiness() {
+        let root = tempfile::tempdir().unwrap();
+        let config = super::super::tests::test_config(root.path());
+        let error = verify_signaled_candidate(&config, "not-a-readiness-message").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("malformed readiness notification"),
+            "{error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn candidate_verification_preserves_health_protocol_errors() {
+        let root = tempfile::tempdir().unwrap();
+        let config = super::super::tests::test_config(root.path());
+        let mut coord = DaemonCoordFile::for_socket(&config.socket_path());
+        coord.control_version = Some(u32::MAX);
+        coord.write_phase(DaemonPhase::Ready).unwrap();
+        let error = verify_signaled_candidate(&config, "ready").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported lifecycle control version"),
+            "{error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn candidate_verification_returns_done_only_with_fresh_health_proof() {
+        let root = tempfile::tempdir().unwrap();
+        let config = super::super::tests::test_config(root.path());
+        let lifecycle = Arc::new(Lifecycle::default());
+        let mut server = lifecycle_control::serve(&config, lifecycle).await.unwrap();
+        server.service.mark_ready();
+        let mut coord = DaemonCoordFile::for_socket(&config.socket_path());
+        coord.control_version = Some(kunobi_daemon::wire::VERSION);
+        coord.write_phase(DaemonPhase::Ready).unwrap();
+        let result =
+            tokio::task::spawn_blocking(move || verify_signaled_candidate(&config, "ready"))
+                .await
+                .unwrap();
+        server.finish().await;
+        assert_eq!(result.unwrap(), Progress::Done);
+    }
 }

@@ -513,6 +513,88 @@ fn test_wrapper_hello_world() {
     );
 }
 
+/// kunobi-ninja/kache#1326: rustc only warns when it cannot strip a binary,
+/// and the key does not change once the toolchain is repaired. A compile that
+/// reports the failure must not be stored, or every later build would restore
+/// the unstripped binary.
+#[cfg(unix)]
+#[test]
+fn test_rust_compile_with_failed_strip_is_not_stored() {
+    build_kache();
+
+    let sysroot = std::process::Command::new("rustc")
+        .args(["--print", "sysroot"])
+        .output()
+        .expect("failed to run rustc --print sysroot");
+    let real_rustc = Path::new(String::from_utf8(sysroot.stdout).unwrap().trim()).join("bin/rustc");
+
+    // The wrapper runs the real rustc and, while `warn` exists, appends the
+    // warning rustc prints when `rust-objcopy` cannot load libLLVM.
+    let tools = TempDir::new().unwrap();
+    let warn = tools.path().join("warn");
+    let runs = tools.path().join("runs");
+    let fake_rustc = tools.path().join("rustc");
+    std::fs::write(
+        &fake_rustc,
+        format!(
+            "#!/bin/sh\n\
+             case \" $* \" in\n\
+             *\" --crate-name hello_world \"*) echo run >> '{runs}' ;;\n\
+             esac\n\
+             '{rustc}' \"$@\" || exit $?\n\
+             if [ -f '{warn}' ]; then\n\
+             echo 'warning: stripping debug info with `rust-objcopy` failed: signal: 6 (SIGABRT)' >&2\n\
+             fi\n",
+            runs = runs.display(),
+            rustc = real_rustc.display(),
+            warn = warn.display(),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(
+        &fake_rustc,
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+    )
+    .unwrap();
+
+    let test_project = Path::new(env!("CARGO_MANIFEST_DIR")).join("test-projects/hello-world");
+    let cache_dir = TempDir::new().unwrap();
+    let target_dir = TempDir::new().unwrap();
+    let build = || {
+        let _ = std::fs::remove_dir_all(target_dir.path());
+        let output = hermetic_command(
+            "cargo",
+            cache_dir.path(),
+            Some(&isolated_config_path(cache_dir.path())),
+        )
+        .args(["build"])
+        .current_dir(&test_project)
+        .env("RUSTC", &fake_rustc)
+        .env("RUSTC_WRAPPER", kache_binary())
+        .env("CARGO_TARGET_DIR", target_dir.path())
+        .env("CARGO_INCREMENTAL", "0")
+        .env("KACHE_MIN_STORE_COMPILE_MS", "0")
+        .output()
+        .expect("failed to run cargo build with kache");
+        assert!(
+            output.status.success(),
+            "cargo build failed.\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+        std::fs::read_to_string(&runs).unwrap().lines().count()
+    };
+
+    std::fs::write(&warn, "").unwrap();
+    assert_eq!(build(), 1);
+    std::fs::remove_file(&warn).unwrap();
+    assert_eq!(build(), 2, "the degraded compile must not be restored");
+    assert_eq!(
+        build(),
+        2,
+        "the clean recompile must be stored and restored"
+    );
+}
+
 #[test]
 fn test_manifest_dir_env_dep_does_not_restore_stale_rlib_across_worktrees() {
     build_kache();

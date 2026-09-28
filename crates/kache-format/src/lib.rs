@@ -67,6 +67,20 @@ impl EntryMeta {
     }
 }
 
+/// Whether rustc's `stderr` reports that a debug-info tool failed after
+/// linking (kunobi-ninja/kache#1326). rustc only warns when `rust-objcopy`
+/// cannot strip a binary or `dsymutil` cannot package its debug info, and the
+/// build still succeeds with the output unstripped or without its dSYM. Such
+/// a compile must not be cached: the key does not change when the toolchain
+/// is repaired, so the degraded output would be served from then on.
+///
+/// Matches both rustc's human and JSON diagnostic formats.
+pub fn reports_debug_info_tool_failure(stderr: &str) -> bool {
+    stderr
+        .lines()
+        .any(|line| line.contains("debug info with `") && line.contains("` failed: "))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CachedFile {
     /// Filename relative to the cache entry directory
@@ -168,6 +182,35 @@ pub fn is_safe_stored_artifact_name(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn debug_info_tool_failure_is_detected_in_both_diagnostic_formats() {
+        // What rustc 1.98 prints when `rust-objcopy` cannot load libLLVM.
+        assert!(reports_debug_info_tool_failure(
+            "warning: stripping debug info with `rust-objcopy` failed: signal: 6 (SIGABRT)\n\
+             \n\
+             warning: 1 warning emitted\n"
+        ));
+        assert!(reports_debug_info_tool_failure(
+            r#"{"$message_type":"diagnostic","message":"stripping debug info with `rust-objcopy` failed: signal: 6 (SIGABRT)","level":"warning"}"#
+        ));
+        assert!(reports_debug_info_tool_failure(
+            "warning: processing debug info with `dsymutil` failed: exit status: 1\n"
+        ));
+    }
+    #[test]
+    fn debug_info_tool_failure_ignores_clean_and_unrelated_output() {
+        assert!(!reports_debug_info_tool_failure(""));
+        assert!(!reports_debug_info_tool_failure(
+            "warning: unused variable: `x`\n --> src/main.rs:2:9\n"
+        ));
+        // Each half of the message alone is not a tool failure.
+        assert!(!reports_debug_info_tool_failure(
+            "note: stripping debug info with `strip`\n"
+        ));
+        assert!(!reports_debug_info_tool_failure(
+            "warning: build script `foo` failed: exit status: 1\n"
+        ));
+    }
     #[test]
     fn is_valid_cache_key_rejects_traversal_and_malformed() {
         assert!(!is_valid_cache_key(""));

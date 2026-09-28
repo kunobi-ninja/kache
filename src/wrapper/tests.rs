@@ -2123,6 +2123,53 @@ fn restore_rejects_dep_info_with_no_dependencies() {
     );
 }
 
+/// kunobi-ninja/kache#1326: an entry stored while rustc could not strip the
+/// binary is evicted on lookup so the recompile replaces it.
+#[test]
+fn restore_evicts_entries_built_with_a_failed_strip() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path().join("cache"));
+    let store = Store::open(&config).unwrap();
+    let out_dir = dir.path().join("target/release/deps");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let args = rustc_args(&[
+        "rustc",
+        "src/main.rs",
+        "--crate-name",
+        "foo",
+        "--crate-type",
+        "bin",
+        "--emit",
+        "link",
+        "--out-dir",
+        out_dir.to_str().unwrap(),
+    ]);
+
+    let hash = blake3::hash(b"unstripped").to_hex().to_string();
+    create_blob(&store, &hash, b"unstripped");
+    let mut meta = entry_meta("degraded-key", vec![cached_file("foo", &hash)], &["link"]);
+    meta.crate_types = vec!["bin".to_string()];
+    meta.stderr =
+        "warning: stripping debug info with `rust-objcopy` failed: signal: 6 (SIGABRT)\n".into();
+    let entry_dir = store.entry_dir(&meta.cache_key);
+    std::fs::create_dir_all(&entry_dir).unwrap();
+    std::fs::write(
+        entry_dir.join("meta.json"),
+        serde_json::to_string(&meta).unwrap(),
+    )
+    .unwrap();
+    store.insert_entry_row_for_test("degraded-key");
+
+    let error = restore_from_cache(&config, &RustcCompiler::new(), &store, &args, &meta, None)
+        .expect_err("a degraded entry must not restore");
+    assert!(format!("{error:#}").contains("degraded"), "{error:#}");
+    assert!(
+        !entry_dir.join("meta.json").exists(),
+        "the degraded entry must be evicted"
+    );
+    assert!(!out_dir.join("foo").exists(), "nothing may be restored");
+}
+
 #[test]
 fn cc_store_freezes_private_artifacts_without_mutating_compiler_outputs() {
     let dir = tempfile::tempdir().unwrap();

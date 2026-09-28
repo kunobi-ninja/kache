@@ -5,6 +5,7 @@ on:
     paths:
       - .github/workflows/prefetch-qualification*.yml
       - scripts/prefetch-qualification*.py
+      - scripts/prefetch_remote.py
   workflow_dispatch:
     inputs:
       seed_run_id:

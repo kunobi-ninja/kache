@@ -47,6 +47,52 @@ latest release, so it stays nightly.
 hk retains its prediction-disabled and next-commit scenarios. The next-commit
 Kache variants separate exhaustive prediction verification from timing.
 
+## Cold CI prefetch qualification
+
+The `Prefetch cold CI qualification` workflow compares three prefetch on/off
+pairs using a pinned eza revision, Rust 1.90.0 and two Cargo jobs. A protected main push produces
+one immutable seed containing Kache, cached artifacts, manifests and namespace
+shards. Every consumer starts with empty local and target directories.
+The harness sets `KACHE_EVENT_ROOT` to the workload root so Rust, build scripts
+and native compiles share one session even when Cargo creates no directory tag.
+
+Consumers read that seed through a loopback S3 fixture with a 50 ms delay before
+each response. The fixture records requests and rejects writes. This measures
+prefetch under controlled request latency; it does not model cloud bandwidth,
+packet loss or variable service latency. Remote key listing is enabled in both
+arms. The ordinary S3 default leaves listing disabled.
+
+The collector requires matching executable hashes, drained telemetry, complete
+GET-body precision accounting and matching latency controls. It reports full
+GitHub job durations separately from the build phases. HTTP logs and transport
+profiles are included in each consumer artifact.
+Startup downloads carry no session ID. In this isolated runtime, the collector
+joins them to the sole demand session only after the daemon has drained all
+prefetch tasks. Multiple demand sessions or incomplete receipts fail admission.
+
+A manual workflow run reuses the binary in its selected seed. To qualify a new
+Kache revision, use a new seed produced by a main push. Reusing an old seed does
+not test newly merged fixes.
+
+For a Linux sandbox experiment before merging the workflow, build Kache from the
+revision under test, install Rust 1.90.0, then run:
+
+```sh
+python3 scripts/prefetch-qualification.py experiment \
+  --root /tmp/prefetch-experiment \
+  --output /tmp/prefetch-results \
+  --binary "$PWD/target/release/kache" \
+  --revision "$(git rev-parse HEAD)" \
+  --response-delay-ms 50
+```
+
+Use a fresh root for each experiment. The result contains three alternating
+on/off pairs and build durations. A local experiment seed is rejected by CI;
+its timings are not GitHub job durations. Use `--response-delay-ms 0` for an HTTP
+baseline without an injected delay.
+Pass `--archive /path/to/seed.tar.gz` to repeat an experiment with the same local
+seed. Its recorded revision must match `--revision`; the bundled binary is used.
+
 ## Phases
 
 | Phase in JSON | Cache before the build | Build directory |

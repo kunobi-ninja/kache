@@ -667,6 +667,7 @@ jobs:
         run: |
           python3 -m unittest discover -s scripts/bench/tests -t scripts
           python3 scripts/test-bench-contention.py
+          python3 scripts/prefetch-qualification-test.py
 
       # The path-to-job-group mapping Detect changes applies to pull requests.
       - name: Change detection tests

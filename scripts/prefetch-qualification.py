@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Isolated real-CI prefetch control. Uses only Python's standard library."""
+"""Isolated prefetch qualification for CI and sandbox experiments."""
 
 import argparse
 import fcntl
@@ -13,8 +13,12 @@ import tarfile
 import time
 import urllib.request
 from collections import Counter
+from contextlib import ExitStack
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
+
+from prefetch_remote import ReadOnlyRemote
 
 PROJECT = "98442ab17c2c3738701b62a7e060b1431ae2d6ea"
 TOOLCHAIN = "1.90.0"
@@ -97,6 +101,10 @@ def environment(root, binary):
         HOST_CXX=f"{binary} c++",
         CC_KNOWN_WRAPPER_CUSTOM="kache",
         KACHE_BASE_DIR=str(source),
+        # An explicit CARGO_TARGET_DIR has no CACHEDIR.TAG with the pinned
+        # Cargo. Name the known workload root so all compiler families share
+        # one telemetry session instead of superseding each other's plans.
+        KACHE_EVENT_ROOT=str(source),
         KACHE_INPUT_PREDICTIONS="1",
         KACHE_VERIFY_INPUT_PREDICTIONS="sampled",
         KACHE_PROFILE=PROFILE,
@@ -123,6 +131,7 @@ WRAPPER_ENV_KEYS = (
     "CC_KNOWN_WRAPPER_CUSTOM",
     "KACHE_CONFIG",
     "KACHE_BASE_DIR",
+    "KACHE_EVENT_ROOT",
     "KACHE_INPUT_PREDICTIONS",
     "KACHE_VERIFY_INPUT_PREDICTIONS",
     "KACHE_PROFILE",
@@ -173,7 +182,7 @@ class Run:
             dump(self.output / "phases.json", self.phases)
 
 
-def unpack(archive, destination):
+def unpack(archive, destination, *, local=False):
     require(not destination.exists(), "Seed destination must be fresh")
     with tarfile.open(archive, "r:gz") as tar:
         for item in tar.getmembers():
@@ -199,7 +208,10 @@ def unpack(archive, destination):
         "Seed workload mismatch",
     )
     require(manifest["files"] == files(destination), "Seed content hash mismatch")
-    require(manifest["trusted_push"] is True, "Seed was not produced by a trusted push")
+    require(
+        local or manifest["trusted_push"] is True,
+        "Seed was not produced by a trusted push",
+    )
     return manifest
 
 
@@ -381,9 +393,7 @@ def join_evidence(records, lifecycle):
         "available": True,
         **{field: totals[field] for field in fields},
         "useful_share_of_consumed_bytes": (
-            totals["useful_prefetch_bytes"] / consumed_bytes
-            if consumed_bytes
-            else None
+            totals["useful_prefetch_bytes"] / consumed_bytes if consumed_bytes else None
         ),
         "scope": "Per-key payload bytes the join credited; "
         "not the GET-body base used by get_body_byte_precision",
@@ -482,6 +492,7 @@ def summarize_accounted(
     lifecycle,
     raw_transfers,
     raw_summaries,
+    isolated,
 ):
     speculative = [
         t
@@ -648,12 +659,35 @@ def summarize_accounted(
                 )
             )
 
+    # The harness owns a fresh runtime and runs exactly one workload. Startup
+    # downloads precede BuildStarted and carry no session id. Only this explicit
+    # isolation contract plus a drained shutdown permits joining them to the
+    # sole demand session; generic telemetry and multi-session runs stay unknown.
+    summaries = raw_summaries if raw_summaries is not None else []
+    shutdown_groups = {
+        (s.get("session_id", ""), s.get("plan_id", ""), s.get("plan_source", ""))
+        for s in summaries
+        if s.get("schema") == 2
+        and s.get("closure_reason") == "shutdown"
+        and s.get("incomplete") is False
+    }
+    observed_sessions = {session for session, _ in demands}
+    shutdown_sessions = {key[0] for key in shutdown_groups}
+    shutdown_complete = observed_sessions <= shutdown_sessions
+    startup_session = (
+        next(iter(observed_sessions))
+        if isolated and len(observed_sessions) == 1 and shutdown_complete
+        else None
+    )
+    startup_origin = ("", "", "unscoped")
     credited, payload_rows = set(), []
     sessions = {record["session_id"] for record in records}
     for entry, receipt, group in sorted(
         candidates, key=lambda value: value[0]["finished_at_ms"]
     ):
         key = (entry["prefetch"]["session_id"], entry["cache_key"])
+        if startup_session and plan_identity(entry["prefetch"]) == startup_origin:
+            key = (startup_session, entry["cache_key"])
         demand = demands.get(key)
         finished = entry["finished_at_ms"]
         if entry["outcome"] != "completed":
@@ -688,26 +722,14 @@ def summarize_accounted(
         )
 
     # A normal closure is a snapshot, not a barrier against tasks or log writers.
-    summaries = raw_summaries if raw_summaries is not None else []
-    shutdown_groups = {
-        (s.get("session_id", ""), s.get("plan_id", ""), s.get("plan_source", ""))
-        for s in summaries
-        if s.get("schema") == 2
-        and s.get("closure_reason") == "shutdown"
-        and s.get("incomplete") is False
-    }
-    observed_sessions = {session for session, _ in demands}
-    shutdown_sessions = {key[0] for key in shutdown_groups}
-    shutdown_complete = observed_sessions <= shutdown_sessions
     incomplete_groups = {
         plan_identity(t["prefetch"])
         for t in coverage["unprojected"] + coverage["projected_without_raw"]
         if (t.get("accounting") or {}).get("operation") != "list"
     }
     for key, group in groups.items():
-        if (
-            group["get_receipts"] or group["unknown_operations"]
-        ) and key not in shutdown_groups:
+        drained = key in shutdown_groups or (startup_session and key == startup_origin)
+        if (group["get_receipts"] or group["unknown_operations"]) and not drained:
             group["problems"].append("Plan lacks a drained shutdown summary")
         if key in incomplete_groups or raw_transfers is None:
             group["problems"].append("Raw/projected GET receipt coverage is incomplete")
@@ -746,6 +768,7 @@ def summarize_accounted(
         ),
         "lifecycle": lifecycle,
         "shutdown_complete": shutdown_complete,
+        "isolated_startup_session": startup_session,
         "receipt_coverage": coverage,
         "plans": list(groups.values()),
         "backend_totals": {
@@ -791,7 +814,9 @@ def summarize_accounted(
     }
 
 
-def summarize(records, enabled, raw_transfers=None, raw_summaries=None):
+def summarize(
+    records, enabled, raw_transfers=None, raw_summaries=None, *, isolated=False
+):
     lifecycle = lifecycle_evidence(records, raw_summaries)
     require(len({r["schema"] for r in records}) == 1, "Mixed timeline schemas")
     sessions = [r["session_id"] for r in records]
@@ -883,6 +908,7 @@ def summarize(records, enabled, raw_transfers=None, raw_summaries=None):
             lifecycle,
             raw_transfers,
             raw_summaries,
+            isolated,
         )
     restored = [
         t
@@ -981,7 +1007,53 @@ def artifact_problems(artifacts):
     return problems
 
 
-def measure(args):
+def measure(args, *, local_revision=None):
+    with ExitStack() as stack:
+        measure_inner(args, stack, local_revision)
+    if args.mode == "consume":
+        output = args.output.resolve()
+        profile = json.loads((output / "transport.json").read_text())
+        if profile["kind"] == "s3-loopback":
+            rows = [
+                json.loads(line)
+                for line in (output / "http.jsonl").read_text().splitlines()
+            ]
+            profile.update(http_evidence(rows, profile["response_delay_ms"]))
+            dump(output / "transport.json", profile)
+
+
+def http_evidence(rows, delay_ms):
+    require(rows, "No HTTP requests observed")
+    require(
+        all(r["method"] in ("GET", "HEAD") for r in rows),
+        "Consumer attempted to mutate the remote",
+    )
+    require(
+        all(
+            r["response_delay_ms"] == delay_ms and r["headers_after_ms"] >= delay_ms
+            for r in rows
+        ),
+        "HTTP latency control was not applied",
+    )
+    require(
+        any(
+            r["method"] == "GET" and r["status"] == 200 and r["body_bytes"] > 0
+            for r in rows
+        ),
+        "No successful HTTP body transfer",
+    )
+    require(
+        all(r["status"] in (200, 206, 404) for r in rows), "Unexpected HTTP response"
+    )
+    return {
+        "request_count": len(rows),
+        "statuses": dict(Counter(str(r["status"]) for r in rows)),
+        "body_bytes": sum(r["body_bytes"] for r in rows),
+        "minimum_headers_ms": min(r["headers_after_ms"] for r in rows),
+    }
+
+
+def measure_inner(args, stack, local_revision):
     root, output = args.root.resolve(), args.output.resolve()
     require(not root.exists(), "Measurement root must be new")
     root.mkdir(parents=True)
@@ -989,7 +1061,10 @@ def measure(args):
     producer = args.mode == "seed"
     enabled = args.arm.startswith("on") if not producer else False
     if producer:
-        require(trusted_push(os.environ), "Seed requires a protected main push")
+        require(
+            local_revision is not None or trusted_push(os.environ),
+            "Seed requires a protected main push",
+        )
         bundle = root / "bundle"
         bundle.mkdir()
         binary = bundle / "kache"
@@ -999,7 +1074,7 @@ def measure(args):
         manifest = {}
     else:
         bundle = root / "bundle"
-        manifest = unpack(args.archive, bundle)
+        manifest = unpack(args.archive, bundle, local=local_revision is not None)
         require(str(manifest["run_id"]) == args.seed_run_id, "Unexpected seed run")
         require(manifest["kache_revision"] == args.seed_sha, "Unexpected seed revision")
         binary, remote = bundle / "kache", bundle / "remote"
@@ -1009,6 +1084,23 @@ def measure(args):
     env = environment(root, binary)
     runner = Run(root, output, env)
     cache, runtime = root / "cache", root / "runtime"
+    delay_ms = getattr(args, "response_delay_ms", None)
+    transport = {"kind": "filesystem", "response_delay_ms": None}
+    remote_config = f'type = "filesystem"\npath = {json.dumps(str(remote))}'
+    if not producer and delay_ms is not None:
+        server = stack.enter_context(
+            ReadOnlyRemote(remote, delay_ms, output / "http.jsonl")
+        )
+        remote_config = (
+            'type = "s3"\nbucket = "qualification"\nregion = "us-east-1"\n'
+            f"endpoint = {json.dumps(server.endpoint)}"
+        )
+        # Explicit fixture credentials prevent any ambient AWS credential lookup.
+        env.update(
+            KACHE_S3_ACCESS_KEY="qualification", KACHE_S3_SECRET_KEY="qualification"
+        )
+        transport = {"kind": "s3-loopback", "response_delay_ms": delay_ms}
+    dump(output / "transport.json", transport)
     config = f"""[cache]
 ignore_env = true
 local_store = {json.dumps(str(cache))}
@@ -1016,11 +1108,11 @@ runtime_dir = {json.dumps(str(runtime))}
 min_store_compile_ms = 0
 record_sessions = true
 prefetch_enabled = {str(enabled).lower()}
+remote_key_listing = true
 remote_readonly = {str(not producer).lower()}
 event_log_max_size = "8GiB"
 [cache.remote]
-type = "filesystem"
-path = {json.dumps(str(remote))}
+{remote_config}
 prefix = "artifacts"
 """
     (root / "config.toml").write_text(config)
@@ -1148,9 +1240,11 @@ prefix = "artifacts"
             "lock_sha256": digest(source / "Cargo.lock"),
             "compiler": compiler,
             "cc": cc,
-            "kache_revision": os.environ["GITHUB_SHA"],
-            "run_id": os.environ["GITHUB_RUN_ID"],
-            "trusted_push": True,
+            "kache_revision": local_revision or os.environ["GITHUB_SHA"],
+            "run_id": f"local-{local_revision}"
+            if local_revision
+            else os.environ["GITHUB_RUN_ID"],
+            "trusted_push": local_revision is None,
             "files": files(bundle),
         }
         dump(bundle / "manifest.json", manifest)
@@ -1166,9 +1260,97 @@ prefix = "artifacts"
         ]
         dump(
             output / "admission.json",
-            summarize(records, enabled, raw_transfers, raw_summaries),
+            summarize(records, enabled, raw_transfers, raw_summaries, isolated=True),
         )
     dump(output / "identity.json", manifest)
+
+
+def experiment(args):
+    """Run a sandbox experiment; its seed is never admitted as trusted CI input."""
+    require(
+        len(args.revision) == 40
+        and all(c in "0123456789abcdef" for c in args.revision),
+        "Pass the binary's full source revision",
+    )
+    root, output = args.root.resolve(), args.output.resolve()
+    require(not root.exists(), "Experiment root must be new")
+    root.mkdir(parents=True)
+    seed_output = output / "seed"
+    common = vars(args) | {
+        "seed_run_id": f"local-{args.revision}",
+        "seed_sha": args.revision,
+    }
+    archive = args.archive.resolve() if args.archive else seed_output / "seed.tar.gz"
+    if args.archive is None:
+        measure(
+            SimpleNamespace(
+                **(
+                    common
+                    | {"mode": "seed", "root": root / "seed", "output": seed_output}
+                )
+            ),
+            local_revision=args.revision,
+        )
+    results = {}
+    for arm in ARMS:
+        folder = output / arm
+        measure(
+            SimpleNamespace(
+                **(
+                    common
+                    | {
+                        "mode": "consume",
+                        "arm": arm,
+                        "root": root / arm,
+                        "output": folder,
+                        "archive": archive,
+                    }
+                )
+            ),
+            local_revision=args.revision,
+        )
+        results[arm] = {
+            name: json.loads((folder / f"{name}.json").read_text())
+            for name in ("admission", "artifact", "identity", "transport", "phases")
+        }
+        dump(output / "progress.json", {"completed": list(results)})
+    problems = artifact_problems(
+        {arm: value["artifact"] for arm, value in results.items()}
+    )
+    build_times = {
+        arm: next(p["seconds"] for p in value["phases"] if p["name"] == "build")
+        for arm, value in results.items()
+    }
+    dump(
+        output / "experiment.json",
+        {
+            "scope": "Sequential sandbox builds with fresh stores; not GitHub job-time qualification",
+            "response_delay_ms": args.response_delay_ms,
+            "controls_valid": not problems,
+            "complete_precision_qualification": all(
+                r["admission"]["complete_precision_qualification"]
+                for r in results.values()
+            ),
+            "problems": problems,
+            "build_seconds": build_times,
+            "pairs": [
+                {
+                    "pair": i,
+                    "on_minus_off_seconds": build_times[f"on-{i}"]
+                    - build_times[f"off-{i}"],
+                }
+                for i in range(1, 4)
+            ],
+            "results": results,
+        },
+    )
+    require(not problems, "; ".join(problems))
+    require(
+        all(
+            r["admission"]["complete_precision_qualification"] for r in results.values()
+        ),
+        "Precision qualification incomplete; inspect experiment.json",
+    )
 
 
 def api(path):
@@ -1295,6 +1477,7 @@ def collect(args):
         ]
         dump(args.output / "seed-run.json", seed_run)
     identities, artifacts, lifecycles, admissions, retention = {}, {}, {}, {}, {}
+    transports = {}
     for arm in ARMS:
         folder = args.results / ("prefetch-qualification-" + arm)
         for name, target in (("identity", identities), ("artifact", artifacts)):
@@ -1325,6 +1508,16 @@ def collect(args):
             admissions[arm] = json.loads(admission.read_text())
         else:
             problems.append(f"{arm} did not pass telemetry admission")
+        transport_path = folder / "transport.json"
+        if transport_path.exists():
+            transports[arm] = json.loads(transport_path.read_text())
+            profile = transports[arm]
+            if profile.get("kind") != "s3-loopback" or not profile.get("request_count"):
+                problems.append(f"{arm} lacks HTTP transport evidence")
+        else:
+            problems.append(f"{arm} lacks transport evidence")
+    if len({p.get("response_delay_ms") for p in transports.values()}) != 1:
+        problems.append("Consumers used different response delays")
     problems.extend(artifact_problems(artifacts))
     require_same = {json.dumps(value, sort_keys=True) for value in identities.values()}
     if len(require_same) != 1:
@@ -1363,6 +1556,7 @@ def collect(args):
             "lifecycle": lifecycles,
             "admissions": admissions,
             "retention": retention,
+            "transport": transports,
             "run_id": os.environ["GITHUB_RUN_ID"],
             "run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
             "producer": producer_jobs,
@@ -1372,11 +1566,20 @@ def collect(args):
         success,
         "Controls incomplete or failed; inspect job-times.json and raw artifacts",
     )
+    require(
+        all(
+            a.get("complete_precision_qualification") is True
+            for a in admissions.values()
+        ),
+        "Precision qualification incomplete; inspect job-times.json",
+    )
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=("seed", "consume", "authorize", "collect"))
+    parser.add_argument(
+        "mode", choices=("seed", "consume", "authorize", "collect", "experiment")
+    )
     parser.add_argument("--root", type=Path)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--binary", type=Path)
@@ -1385,8 +1588,12 @@ def main():
     parser.add_argument("--seed-run-id", default="")
     parser.add_argument("--seed-sha", default="")
     parser.add_argument("--results", type=Path)
+    parser.add_argument("--response-delay-ms", type=int, default=50)
+    parser.add_argument("--revision", default="")
     args = parser.parse_args()
-    if args.mode == "authorize":
+    if args.mode == "experiment":
+        experiment(args)
+    elif args.mode == "authorize":
         authorize(args)
     elif args.mode == "collect":
         collect(args)

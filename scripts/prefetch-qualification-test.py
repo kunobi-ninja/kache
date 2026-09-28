@@ -10,6 +10,9 @@ import sys
 import tarfile
 import tempfile
 import unittest
+import urllib.error
+import urllib.request
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -65,6 +68,8 @@ class Policy(unittest.TestCase):
         self.assertNotIn("KACHE_REMOTE", env)
         self.assertNotIn("CC", env)
         self.assertEqual(env["KACHE_HOST_CONFIG"], "")
+        self.assertEqual(env["KACHE_EVENT_ROOT"], "/scratch/source")
+        self.assertNotIn("KACHE_EVENT_ROOT", q.setup_environment(env))
 
     def test_manual_seed_admission_requires_trusted_provenance(self):
         run = {
@@ -96,6 +101,31 @@ class Policy(unittest.TestCase):
 
 
 class Integrity(unittest.TestCase):
+    def test_local_experiment_seed_is_rejected_by_ci(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            bundle = root / "bundle"
+            bundle.mkdir()
+            (bundle / "kache").write_bytes(b"binary")
+            q.dump(
+                bundle / "manifest.json",
+                {
+                    "project": q.PROJECT,
+                    "toolchain": q.TOOLCHAIN,
+                    "trusted_push": False,
+                    "files": q.files(bundle),
+                },
+            )
+            archive = root / "seed.tar.gz"
+            with tarfile.open(archive, "w:gz") as tar:
+                for path in bundle.iterdir():
+                    tar.add(path, arcname=path.name)
+            with self.assertRaisesRegex(ValueError, "trusted push"):
+                q.unpack(archive, root / "ci")
+            self.assertFalse(
+                q.unpack(archive, root / "local", local=True)["trusted_push"]
+            )
+
     def test_seed_corruption_is_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -136,6 +166,80 @@ class Integrity(unittest.TestCase):
                     tar.addfile(item, io.BytesIO())
                 with self.assertRaises(ValueError):
                     q.unpack(root / "bad.tar.gz", root / "unpacked")
+
+
+class LatencyRemote(unittest.TestCase):
+    def test_http_admission_rejects_missing_delay_writes_and_empty_bodies(self):
+        good = {
+            "method": "GET",
+            "status": 200,
+            "body_bytes": 10,
+            "response_delay_ms": 50,
+            "headers_after_ms": 51,
+        }
+        evidence = q.http_evidence([good, good | {"status": 404, "body_bytes": 0}], 50)
+        self.assertEqual(evidence["statuses"], {"200": 1, "404": 1})
+        self.assertEqual(evidence["body_bytes"], 10)
+        for bad in (
+            [],
+            [good | {"method": "PUT"}],
+            [good | {"headers_after_ms": 49}],
+            [good | {"response_delay_ms": 0}],
+            [good | {"status": 500}],
+            [good | {"body_bytes": 0}],
+        ):
+            with self.assertRaises(ValueError):
+                q.http_evidence(bad, 50)
+
+    def test_http_reads_delay_ranges_listing_and_write_rejection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = root / "store"
+            store.mkdir()
+            for name, body in (("a&b", b"abcdef"), ("z", b"last")):
+                (store / name).write_bytes(body)
+            log = root / "http.jsonl"
+            with q.ReadOnlyRemote(store, 10, log) as server:
+
+                def request(path, method="GET", headers=None):
+                    return urllib.request.urlopen(
+                        urllib.request.Request(
+                            server.endpoint + "/qualification" + path,
+                            method=method,
+                            headers=headers or {},
+                        ),
+                        timeout=5,
+                    )
+
+                with request("/a%26b") as response:
+                    self.assertEqual(response.read(), b"abcdef")
+                with request("/a%26b", "HEAD") as response:
+                    self.assertEqual(response.headers["Content-Length"], "6")
+                    self.assertEqual(response.read(), b"")
+                with request("/a%26b", headers={"Range": "bytes=2-4"}) as response:
+                    self.assertEqual(response.status, 206)
+                    self.assertEqual(response.headers["Content-Range"], "bytes 2-4/6")
+                    self.assertEqual(response.read(), b"cde")
+                with request("?list-type=2&max-keys=1") as response:
+                    page = ET.fromstring(response.read())
+                    self.assertEqual(page.findtext("{*}NextContinuationToken"), "a&b")
+                with request("?list-type=2&continuation-token=a%26b") as response:
+                    page = ET.fromstring(response.read())
+                    self.assertEqual(page.findtext("{*}Contents/{*}Key"), "z")
+                    self.assertEqual(page.findtext("{*}IsTruncated"), "false")
+                for path, method, status in (
+                    ("/a%26b", "PUT", 405),
+                    ("/../outside", "GET", 404),
+                    ("/absent", "GET", 404),
+                ):
+                    with self.assertRaises(urllib.error.HTTPError) as failure:
+                        request(path, method)
+                    self.assertEqual(failure.exception.code, status)
+                    failure.exception.close()
+            rows = [json.loads(line) for line in log.read_text().splitlines()]
+            self.assertEqual(len(rows), 8)
+            self.assertTrue(all(r["headers_after_ms"] >= 10 for r in rows))
+            self.assertEqual((store / "a&b").read_bytes(), b"abcdef")
 
 
 def record():
@@ -295,14 +399,27 @@ class Telemetry(unittest.TestCase):
         self.assertEqual(result["unit_outcomes"], {"local_hit": 1, "miss": 1})
 
     def test_local_only_unit_with_remote_evidence_fails(self):
-        for change in ({"result": "remote_hit"}, {"result": "prefetch_hit"},
-                       {"prefetch": {"timing": "before_demand"}},
-                       {"demands": [{"cache_key": "script-run",
-                                     "first_demand_at_ms": 100,
-                                     "remote_wait_ms": 0}]}):
+        for change in (
+            {"result": "remote_hit"},
+            {"result": "prefetch_hit"},
+            {"prefetch": {"timing": "before_demand"}},
+            {
+                "demands": [
+                    {
+                        "cache_key": "script-run",
+                        "first_demand_at_ms": 100,
+                        "remote_wait_ms": 0,
+                    }
+                ]
+            },
+        ):
             rec = record()
-            unit = {"cache_key": "script-run", "crate_name": "build_script_run",
-                    "result": "miss", "event_schema": 20}
+            unit = {
+                "cache_key": "script-run",
+                "crate_name": "build_script_run",
+                "result": "miss",
+                "event_schema": 20,
+            }
             rec["units"].append(unit | change)
             with self.assertRaisesRegex(ValueError, "Local-only unit"):
                 q.summarize([rec], True)
@@ -310,8 +427,12 @@ class Telemetry(unittest.TestCase):
     def test_other_keyed_units_still_need_demands(self):
         rec = record()
         rec["units"].append(
-            {"cache_key": "lib", "crate_name": "serde", "result": "miss",
-             "event_schema": 20}
+            {
+                "cache_key": "lib",
+                "crate_name": "serde",
+                "result": "miss",
+                "event_schema": 20,
+            }
         )
         with self.assertRaisesRegex(ValueError, "schema-20 demands"):
             q.summarize([rec], True)
@@ -403,6 +524,42 @@ class Lifecycle(unittest.TestCase):
 
 
 class PackedAccounting(unittest.TestCase):
+    def test_startup_receipts_need_isolation_one_session_and_drained_shutdown(self):
+        rec, summaries = self.inputs()
+        origin = {"session_id": "", "plan_id": "", "source": "unscoped"}
+        for transfer in rec["transfers"]:
+            transfer["prefetch"] = dict(origin)
+            for entry in transfer["accounting"].get("entries", []):
+                entry["prefetch"] = dict(origin)
+        raw = self.raw(rec["transfers"])
+        generic = q.summarize([rec], True, raw, summaries)
+        self.assertFalse(generic["complete_precision_qualification"])
+        self.assertEqual(generic["recorded_useful_prefetch_bytes"], 0)
+        isolated = q.summarize([rec], True, raw, summaries, isolated=True)
+        self.assertTrue(isolated["complete_precision_qualification"])
+        self.assertEqual(isolated["recorded_useful_prefetch_bytes"], 30)
+        self.assertEqual(isolated["get_body_byte_precision"], 30 / 110)
+        self.assertEqual(isolated["isolated_startup_session"], "session")
+        self.assertEqual(isolated["plans"][0]["source"], "unscoped")
+        for evidence in ([], [dict(summaries[0], closure_reason="inactivity")]):
+            result = q.summarize([rec], True, raw, evidence, isolated=True)
+            self.assertFalse(result["complete_precision_qualification"])
+            self.assertIsNone(result["isolated_startup_session"])
+        result = q.summarize([rec], True, [], summaries, isolated=True)
+        self.assertFalse(result["complete_precision_qualification"])
+        other = copy.deepcopy(rec)
+        other.update(session_id="other", client_record_id="other", transfers=[])
+        result = q.summarize(
+            [rec, other],
+            True,
+            raw,
+            summaries + [dict(summaries[0], session_id="other")],
+            isolated=True,
+        )
+        self.assertFalse(result["complete_precision_qualification"])
+        self.assertIsNone(result["isolated_startup_session"])
+        self.assertEqual(result["recorded_useful_prefetch_bytes"], 0)
+
     def inputs(self):
         rec = record()
         rec.update(
@@ -958,7 +1115,18 @@ class Timing(unittest.TestCase):
                         "listing": "alpha\nbeta\n",
                     },
                 )
-                q.dump(folder / "admission.json", {"demanded_keys": 2})
+                q.dump(
+                    folder / "admission.json",
+                    {"demanded_keys": 2, "complete_precision_qualification": True},
+                )
+                q.dump(
+                    folder / "transport.json",
+                    {
+                        "kind": "s3-loopback",
+                        "response_delay_ms": 50,
+                        "request_count": 1,
+                    },
+                )
                 q.dump(folder / "lifecycle.json", {"problems": []})
                 q.dump(folder / "retention.json", {"rotation_markers": []})
             with (
@@ -971,9 +1139,38 @@ class Timing(unittest.TestCase):
                 report = json.loads((args.output / "job-times.json").read_text())
                 self.assertTrue(report["controls_valid"])
                 self.assertEqual(report["run_attempt"], "2")
+                admission_path = (
+                    args.results / "prefetch-qualification-on-3" / "admission.json"
+                )
+                q.dump(admission_path, {"complete_precision_qualification": False})
+                with self.assertRaisesRegex(
+                    ValueError, "Precision qualification incomplete"
+                ):
+                    q.collect(args)
+                self.assertFalse(
+                    json.loads((args.output / "job-times.json").read_text())[
+                        "complete_precision_qualification"
+                    ]
+                )
+                q.dump(admission_path, {"complete_precision_qualification": True})
+                transport_path = (
+                    args.results / "prefetch-qualification-on-3" / "transport.json"
+                )
+                transport = json.loads(transport_path.read_text())
+                q.dump(transport_path, transport | {"response_delay_ms": 0})
+                with self.assertRaises(ValueError):
+                    q.collect(args)
+                self.assertIn(
+                    "Consumers used different response delays",
+                    json.loads((args.output / "job-times.json").read_text())[
+                        "problems"
+                    ],
+                )
+                q.dump(transport_path, transport)
                 for name, contents in (
                     ("lifecycle", {"problems": []}),
                     ("retention", {"rotation_markers": []}),
+                    ("transport", transport),
                 ):
                     evidence_path = (
                         args.results / "prefetch-qualification-on-3" / (name + ".json")

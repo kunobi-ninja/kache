@@ -142,6 +142,15 @@ pub fn identity_key(lock_path: &Path, target: &str, profile: &str) -> Option<Str
 
 /// Cargo profile directory under `target/` (`debug`, `release`, …).
 pub fn profile_from_rustc_args(args: &RustcArgs) -> String {
+    if let Some(profile) = args
+        .out_dir
+        .as_deref()
+        .and_then(crate::cargo_layout::build_script_dir_profile)
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+    {
+        return profile.to_string();
+    }
     if let (Some(out_dir), Some(target_dir)) = (args.out_dir.as_deref(), args.target_dir())
         && let Some(profile) = profile_between(&target_dir, out_dir, args.target.is_some())
     {
@@ -654,6 +663,13 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(profile_from_rustc_args(&new_layout), "release");
+        let legacy_build_script = crate::args::RustcArgs::parse(&[
+            "rustc".to_string(),
+            "--out-dir".to_string(),
+            "/ws/target/release/build/serde-0123abcd".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(profile_from_rustc_args(&legacy_build_script), "release");
         let unknown = crate::args::RustcArgs::parse(&[
             "rustc".to_string(),
             "--edition".to_string(),

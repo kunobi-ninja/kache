@@ -134,6 +134,21 @@ struct KacheReplacement<'a> {
     /// candidate that dies early can be reported with what it wrote.
     log_start: Option<(PathBuf, u64)>,
 }
+
+struct ReadinessProbe<'a>(&'a Config);
+
+impl kunobi_daemon::selection::Evidence for ReadinessProbe<'_> {
+    type Proof = DaemonHealth;
+    type Error = anyhow::Error;
+
+    fn committed(&mut self) -> Result<bool> {
+        Ok(false)
+    }
+
+    fn probe(&mut self, deadline: Instant) -> Result<Option<Self::Proof>> {
+        current(self.0, deadline)
+    }
+}
 impl Driver for KacheReplacement<'_> {
     type Error = anyhow::Error;
     fn perform(&mut self, step: Step, deadline: Option<Instant>) -> Result<Progress> {
@@ -228,6 +243,31 @@ impl Driver for KacheReplacement<'_> {
                         candidate_exit_message(exit, self.log_start.as_ref())
                     );
                     self.child = None; // A concurrent service owner may have won.
+                }
+                if step == Step::Verify
+                    && let Some(channel) =
+                        self.child.as_mut().and_then(|child| child.take_readiness())
+                {
+                    use kunobi_daemon::readiness::channel::{NotReady, Signaled, SignaledError};
+                    use kunobi_daemon::selection::{Budget, Selection, await_selection};
+                    let mut evidence =
+                        Signaled::new(ReadinessProbe(config), channel, DAEMON_START_TIMEOUT);
+                    match await_selection(
+                        Budget {
+                            commit: deadline.saturating_duration_since(Instant::now()),
+                            proof: Duration::ZERO,
+                        },
+                        &mut evidence,
+                    ) {
+                        Ok(Selection::Current(_)) => return Ok(Progress::Done),
+                        Err(SignaledError::Evidence(error)) => return Err(error),
+                        Err(SignaledError::NotReady(NotReady::Malformed)) => {
+                            anyhow::bail!("daemon sent a malformed readiness notification")
+                        }
+                        // Recheck the child's exit and a possible winning service
+                        // owner on the next round. The original deadline still applies.
+                        _ => return Ok(Progress::Pending),
+                    }
                 }
                 if current(config, deadline)?.is_none() {
                     if step == Step::Verify {

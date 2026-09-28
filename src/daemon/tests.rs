@@ -1602,7 +1602,8 @@ async fn server_main_binds_socket_and_handles_shutdown() {
     let coord = DaemonCoordFile::for_socket(&socket_path);
     let server_config = config.clone();
     let provenance = crate::config::config_file_provenance_at(dir.path().join("config.toml"));
-    let server = tokio::spawn(async move { server_main(&server_config, &provenance, coord).await });
+    let server =
+        tokio::spawn(async move { server_main(&server_config, &provenance, coord, None).await });
 
     let ready_socket = socket_path.clone();
     let ready = tokio::task::spawn_blocking(move || {

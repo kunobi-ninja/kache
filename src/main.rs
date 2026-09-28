@@ -685,6 +685,13 @@ fn main() -> Result<()> {
     // First, before argv or config: `startup_ms` on every build event is
     // measured from here.
     opcounts::mark_process_start();
+    // SAFETY: before logging, runtimes, or other threads start. DaemonCommand
+    // exclusively passes the channel descriptor to this process.
+    let mut readiness = unsafe { kunobi_daemon::readiness::channel::Notifier::from_env() }
+        .context("opening daemon readiness channel")?;
+    if let Some(notifier) = &mut readiness {
+        let _ = notifier.progress("starting kache");
+    }
     // Cargo target runner. Checked before the probe and shim guards, which
     // exit without running anything: a test must always run.
     let raw_args: Vec<std::ffi::OsString> = std::env::args_os().collect();
@@ -923,7 +930,7 @@ fn main() -> Result<()> {
         }) => service::status(json),
         Some(Commands::Daemon {
             command: Some(DaemonCommands::Run),
-        }) => daemon::run_server(&config, &config_provenance),
+        }) => daemon::run_server(&config, &config_provenance, readiness),
         Some(Commands::Daemon {
             command: Some(DaemonCommands::Start),
         }) => match daemon::start_daemon_background() {

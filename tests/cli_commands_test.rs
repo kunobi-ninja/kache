@@ -3408,3 +3408,52 @@ fn the_target_info_probe_seeds_a_new_checkout() {
     probe(&off, "0");
     assert!(!off.join("target").exists());
 }
+
+#[test]
+fn daemon_readiness_channel_precedes_a_fresh_running_status() {
+    use kunobi_daemon::launch::DaemonCommand;
+    use std::time::{Duration, Instant};
+    let e = env();
+    let configured = kache_process_as(Path::new(KACHE_BIN), &e.home, &e.cache);
+    let mut command = DaemonCommand::new(KACHE_BIN);
+    command.args(["daemon", "run"]).readiness_channel();
+    for (name, value) in configured.get_envs() {
+        match value {
+            Some(value) => {
+                command.env(name, value);
+            }
+            None => {
+                command.env_remove(name);
+            }
+        }
+    }
+    let mut child = command.spawn().unwrap();
+    let mut readiness = child.take_readiness().unwrap();
+    readiness.wait(Duration::from_secs(10)).unwrap();
+    assert!(readiness.progress_reports() >= 1);
+    let status = e
+        .cmd()
+        .args(["daemon", "status", "--json"])
+        .output()
+        .unwrap();
+    let stopped = e.cmd().args(["daemon", "stop"]).output().unwrap();
+    assert!(
+        stopped.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stopped.stderr)
+    );
+    assert!(
+        child
+            .wait_until(Instant::now() + Duration::from_secs(5))
+            .unwrap()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        status.status.success(),
+        "{}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(status["daemon_running"], true, "{status}");
+}

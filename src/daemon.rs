@@ -7056,7 +7056,11 @@ impl Daemon {
 // ── Server (thin I/O shell) ──────────────────────────────────────
 
 /// Run the daemon server (foreground, blocking).
-pub fn run_server(config: &Config, provenance: &crate::config::ConfigFileProvenance) -> Result<()> {
+pub fn run_server(
+    config: &Config,
+    provenance: &crate::config::ConfigFileProvenance,
+    readiness: Option<kunobi_daemon::readiness::channel::Notifier>,
+) -> Result<()> {
     // Acquire an exclusive file lock to guarantee only one daemon process runs
     // at a time.  We use a dedicated "daemon.run.lock" (separate from the
     // "daemon.lock" that start_daemon_background uses to serialize *spawning*)
@@ -7084,7 +7088,7 @@ pub fn run_server(config: &Config, provenance: &crate::config::ConfigFileProvena
         .enable_all()
         .build()?;
 
-    run_daemon_runtime(rt, server_main(config, provenance, coord))
+    run_daemon_runtime(rt, server_main(config, provenance, coord, readiness))
 }
 
 fn run_daemon_runtime(
@@ -7142,6 +7146,7 @@ async fn server_main(
     config: &Config,
     provenance: &crate::config::ConfigFileProvenance,
     mut coord: DaemonCoordFile,
+    readiness: Option<kunobi_daemon::readiness::channel::Notifier>,
 ) -> Result<()> {
     let socket_path = config.socket_path();
     std::fs::create_dir_all(socket_path.parent().unwrap())?;
@@ -7393,6 +7398,9 @@ async fn server_main(
     // Readiness is published only after application setup can enter the accept loop.
     control.service.mark_ready();
     coord.write_phase(DaemonPhase::Ready)?;
+    if let Some(notifier) = readiness {
+        let _ = notifier.ready();
+    }
     let heartbeat_coord = coord.clone();
     let heartbeat_handle = tokio::spawn(async move {
         let mut interval = tokio::time::interval(DAEMON_COORD_HEARTBEAT_INTERVAL);
@@ -9636,7 +9644,7 @@ fn spawn_detached_daemon(
     let mut command = daemon_run_command(exe);
     strip_ambient_remote_env(&mut command);
     let mut daemon = detached_command(&command);
-    daemon.stderr(stderr_target);
+    daemon.stderr(stderr_target).readiness_channel();
     let child = daemon.spawn().context("spawning daemon process")?;
     if child.in_callers_job() {
         tracing::debug!(

@@ -2410,9 +2410,9 @@ dependencies = [
 
 [[package]]
 name = "kunobi-daemon"
-version = "0.7.0"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9c4abdabc738a54b35c16540c2490b87f8c073f421787d06606d1840c6444305"
+checksum = "24b13037e7adbf2f65d6aba12b259b43ff76d63c6ec3894b6797057cf5deac74"
 dependencies = [
  "buffa",
  "interprocess",

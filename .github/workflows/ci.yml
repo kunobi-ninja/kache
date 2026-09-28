@@ -1503,6 +1503,9 @@ jobs:
     with:
       binary_name: kache
       cache_windows_sysroot: true
+      # Published binaries keep whole-program optimization. [profile.release]
+      # is lighter so that `cargo install kache` finishes sooner.
+      build_args: '--config profile.release.lto="fat" --config profile.release.codegen-units=1'
       # Build .deb assets (kache_<version>_{amd64,arm64}.deb) for the apt repo,
       # consumed by .github/workflows/package-publish.yml after release publish.
       # NOTE: requires the _workflows `build_deb` change merged AND the `v10` tag

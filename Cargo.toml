@@ -175,9 +175,14 @@ assets = [
 # matches SHIM_NAMES in this binary. prerm removes those six links.
 maintainer-scripts = "packaging/debian/"
 
+# `cargo install kache` builds with this profile. Thin LTO over 16 codegen
+# units halves the final link of the kache binary against fat LTO with one
+# unit (120 s against 233 s on 8 CPUs) with no measurable change in build
+# times through the wrapper. Release artifacts still use fat LTO and one
+# unit: see `build_args` in .github/workflows/ci.yml.
 [profile.release]
-lto = "fat"
-codegen-units = 1
+lto = "thin"
+codegen-units = 16
 strip = "symbols"
 
 [lints.rust]

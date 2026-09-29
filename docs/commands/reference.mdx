@@ -282,6 +282,20 @@ Build trees are matched by Cargo's unit id. It is the same for a workspace membe
 
 > A crate that depends on a path crate outside the workspace root, or is built with `RUSTFLAGS` that contain the checkout path, gets a different unit id in each checkout. It has no comparison.
 
+## `kache diff`
+
+```bash
+kache diff
+kache diff --root "$PWD"
+kache --json diff
+```
+
+Compares the two newest sessions that share one recorded build root. Without `--root`, that pair is the one whose later session finished most recently. `--root` is canonicalized and has to equal the session root.
+
+The text names the root, both miss counts, and each session's share of misses with no recorded cause. `EXCESS` means the later session missed more often. `UNKNOWN` means a larger share of its misses has no recorded cause. Either line exits 1. Fewer than two sessions prints `need two sessions to compare` and exits 0.
+
+`--json` returns the same counts and those lines.
+
 ## `kache report`
 
 ```bash
@@ -300,6 +314,7 @@ kache report --format trace --output trace.json
 | `--root` | all roots | Include events from one build tree |
 | `--output`, `-o` | stdout | Write to a file |
 | `--top` | `10` | Number of ranked entries |
+| `--redact` | off | Replace cache keys, roots, object keys, and object paths with `redacted` |
 
 `trace`, `perfetto`, and `chrome-trace` select the same trace representation. The JSON contract is documented by [`report.schema.json`](https://github.com/kunobi-ninja/kache/blob/main/docs/commands/report.schema.json).
 
@@ -313,7 +328,9 @@ JSON exposes the selection in `meta.session` (`root`, optional `session_id`, `in
 
 Every report format totals the wrapper's phases per crate: startup, key computation, lookup, scheduler wait, restore or store, and the unattributed remainder. Startup runs from process start to wrapper entry. Key computation splits out the rustc dep-info pre-pass by time and run count. Scheduler wait is the flight join plus permit acquisition. Unattributed is wrapper overhead minus every measured phase, where overhead excludes the compile on a compiled crate and is the whole wrapper time on a hit. Events written by wrappers before schema 17 report zero startup, dep-info and wait time.
 
-In the trace output each crate slice carries these numbers in its `args`. It nests one `X` slice per phase on the same lane, in this order: `startup`, `key` (with `dep-info` as its child), `lookup`, `wait`, `compile` on compiled crates, then `restore` or `store`. Phase offsets accumulate from the crate slice's start in that order; the wrapper records durations, not start times, so a phase sits where it lands in the sum. The gap after the last phase is the unattributed remainder. Durations are whole milliseconds, so a phase under 1 ms has no slice.
+In the trace output each crate slice carries these numbers in its `args`. It nests one `X` slice per phase on the same lane, in this order: `startup`, `key` (with `dep-info` as its child), `lookup`, `wait`, `compile` on compiled crates, then `restore` or `store`. Phase offsets accumulate from the crate slice's start in that order; the wrapper records durations, not start times, so a phase sits where it lands in the sum. The gap after the last phase is the unattributed remainder. Durations are whole milliseconds, so a phase under 1 ms has no slice. A remote transfer that has both a start and a finish follows the crate slices as an async `b`/`e` pair with category `kache.transfer`.
+
+`--redact` applies to every format. The session line in `telemetry/sessions.jsonl` is written first, so the machine keeps the keys. Empty fields stay empty. Store-error text is left as recorded. A C or C++ row can also carry `object_output`, the path named with `-o`.
 
 ## `kache telemetry push`
 

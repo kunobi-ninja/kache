@@ -367,6 +367,11 @@
       "type": "array",
       "items": { "type": "string" }
     },
+    "timed_transfers": {
+      "type": "array",
+      "description": "Remote transfers that recorded both a start and a finish, in log order. Omitted when empty. A root-filtered report does not load the transfer log.",
+      "items": { "$ref": "#/definitions/TransferSpan" }
+    },
     "gc": {
       "type": ["object", "null"],
       "properties": {
@@ -429,6 +434,7 @@
         "overhead_ms": { "type": "integer", "minimum": 0 },
         "size": { "type": "integer", "minimum": 0 },
         "cache_key": { "type": "string" },
+        "object_output": { "type": "string", "description": "Object path a C or C++ compile named with -o. Omitted when empty." },
         "store_output_blobs": { "type": "integer", "minimum": 0 },
         "store_duplicate_blobs": { "type": "integer", "minimum": 0 },
         "store_new_blobs": { "type": "integer", "minimum": 0 },
@@ -574,6 +580,7 @@
         "route": { "type": "string" },
         "reason": { "type": "string" },
         "cache_key": { "type": "string" },
+        "object_output": { "type": "string", "description": "Object path a C or C++ compile named with -o. Omitted when empty." },
         "elapsed_ms": { "type": "integer", "minimum": 0 },
         "compile_time_ms": { "type": "integer", "minimum": 0 },
         "overhead_ms": { "type": "integer", "minimum": 0 },
@@ -596,6 +603,18 @@
         "store_ms": { "type": "integer", "minimum": 0 },
         "unattributed_ms": { "type": "integer", "minimum": 0, "description": "overhead_ms minus every measured phase, clamped at zero. The trace output draws this as the gap after the last nested phase slice." },
         "exit_code": { "type": ["integer", "null"] }
+      }
+    },
+    "TransferSpan": {
+      "type": "object",
+      "required": ["direction", "crate_name", "started_at_unix_ms", "finished_at_unix_ms"],
+      "properties": {
+        "direction": { "type": "string", "enum": ["upload", "download"] },
+        "crate_name": { "type": "string" },
+        "cache_key": { "type": "string" },
+        "object_key": { "type": "string" },
+        "started_at_unix_ms": { "type": "integer", "minimum": 0 },
+        "finished_at_unix_ms": { "type": "integer", "minimum": 0 }
       }
     },
     "ErrorDetail": {

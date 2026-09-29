@@ -673,6 +673,7 @@ mod tests {
     }
 
     /// A unit under `target`'s debug profile, last touched long ago.
+    #[cfg(unix)]
     fn old_unit(target: &Path, hash: &str) -> PathBuf {
         let long_ago =
             filetime::FileTime::from_unix_time((unix_now_secs() - 80 * DAY_SECS) as i64, 0);
@@ -683,6 +684,7 @@ mod tests {
         dir
     }
 
+    #[cfg(unix)]
     fn root_of(store: &Store, path: &Path) -> TrackedTargetRoot {
         store
             .tracked_target_roots(0)

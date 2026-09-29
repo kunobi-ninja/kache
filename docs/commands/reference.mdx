@@ -5,7 +5,7 @@ description: Every top-level Kache command, its purpose, and common flags
 
 Run `kache <command> --help` for the exact syntax in your installed version.
 
-`--json` emits one versioned JSON document for `list`, `stats`, `gc`, `clean`, `targets`, `doctor`, `why-miss`, and `daemon status`. `clean --json` is a preview unless `--yes` is also present.
+`--json` emits one versioned JSON document for `list`, `stats`, `gc`, `clean`, `targets`, `targets share`, `doctor`, `why-miss`, and `daemon status`. `clean --json` is a preview unless `--yes` is also present.
 
 | Command | Purpose |
 | --- | --- |
@@ -14,7 +14,7 @@ Run `kache <command> --help` for the exact syntax in your installed version.
 | `gc` | Evict local entries |
 | `purge` | Remove local cache entries |
 | `clean` | Remove Cargo target directories below cwd or from the local tracked-root registry |
-| `targets` | Show tracked target directories: size, what deleting each frees, and whether its worktree still exists |
+| `targets` | Show tracked target directories. `share` reports files the store already holds and clones them when asked |
 | `init` | Configure Cargo, optional C/C++ shims, test pacing, and the daemon service |
 | `doctor` | Diagnose setup and store integrity |
 | `sync` | Pull from and push to a remote |
@@ -104,9 +104,18 @@ The daemon removes tracked targets whose workspace was deleted on its own, and i
 ```bash
 kache targets
 kache targets --json
+kache targets share
+kache targets share --apply
+kache targets share --apply target/
 ```
 
 `targets` lists every tracked target directory that still exists: its workspace, how long since a build last used it, the bytes it holds, and an estimate of what deleting it frees. The estimate leaves out blocks the target shares with the store or with other hardlinks, so it is what `kache clean` would give back. The daemon also discovers default targets in sibling Git worktrees; these show `?` for idle time until Kache observes a build there. A target whose worktree has been deleted is marked. When a free-space floor is configured, targets eligible for the daemon's next pressure cleanup are marked as recovery candidates. The text output ends with the command that removes eligible orphaned targets; `--json` gives it in `next`.
+
+`targets share` reads those directories, or the directories named after it. A file whose length matches no stored blob is finished after a `stat`. A file that differs in its first or last block is finished after those two reads. Only a file that survives both is hashed, and only once. A later run trusts that stamp and does not read the file again.
+
+`--apply` replaces a proven match with a clone of the stored blob. The replacement keeps the file's mode and modification time. The pass takes the profile's `.cargo-lock` and skips a target a running build holds. It does not hardlink, it does not copy a file onto another volume, and it does not enter `incremental/` or `.fingerprint/`. Without `--apply` it only reports.
+
+With `cache.auto_share_target_files` on (the default), the daemon runs one short slice of the same pass, with `--apply`, while the machine is idle. The slice stops when a compile starts. A check that already repaired the index or swept targets does not also run the slice.
 
 ## `kache init`
 

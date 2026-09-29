@@ -295,6 +295,8 @@ mod tests {
                 "user.name=Kache Test",
                 "-c",
                 "user.email=kache@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
                 "commit",
                 "-q",
                 "--allow-empty",

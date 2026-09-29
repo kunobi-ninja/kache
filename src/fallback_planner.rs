@@ -521,6 +521,7 @@ mod tests {
             auto_gc: true,
             index_auto_compact: true,
             auto_clean_orphaned_targets: true,
+            auto_share_target_files: true,
             auto_clean_idle_targets_days: 0,
             auto_recover_min_free_bytes: 0,
             scheduler_memory_pressure: true,

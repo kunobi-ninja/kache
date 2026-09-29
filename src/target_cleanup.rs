@@ -93,17 +93,20 @@ pub(crate) fn due(
 }
 
 /// The maintenance step. Logs what it removed.
-pub(crate) fn run(config: &Config, trigger: Trigger<'_>) {
+///
+/// `true` when this call walked targets. The dedup slice stays out of that
+/// gap.
+pub(crate) fn run(config: &Config, trigger: Trigger<'_>) -> bool {
     let now = unix_now_secs();
     let permits = crate::scheduler::permits_in_use(&config.cache_dir);
     if !due(config, trigger, permits, last_check(&config.cache_dir), now) {
-        return;
+        return false;
     }
     let record = config.cache_dir.join(LAST_CHECK_FILE);
     // The record is what keeps the checks hourly.
     if let Err(error) = crate::atomic::atomic_replace(&record, now.to_string().as_bytes()) {
         tracing::warn!("skipping target directory cleanup: cannot record the time: {error:#}");
-        return;
+        return false;
     }
     match sweep(config, now) {
         Ok(swept) => {
@@ -132,6 +135,7 @@ pub(crate) fn run(config: &Config, trigger: Trigger<'_>) {
         }
         Err(error) => tracing::warn!("target directory cleanup failed: {error:#}"),
     }
+    true
 }
 
 /// What one sweep did.

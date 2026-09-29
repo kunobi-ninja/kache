@@ -11896,3 +11896,25 @@ mod size_sweep_properties {
         }
     }
 }
+
+#[test]
+fn lists_indexed_blobs_from_a_size_up() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(test_config(dir.path())).unwrap();
+    for (hash, size) in [("small", 99_i64), ("edge", 100), ("large", 101)] {
+        store
+            .db
+            .execute(
+                "INSERT INTO blobs (hash, size, refcount) VALUES (?1, ?2, 1)",
+                params![hash, size],
+            )
+            .unwrap();
+    }
+    let mut blobs = store.blobs_at_least(100).unwrap();
+    blobs.sort();
+    assert_eq!(
+        blobs,
+        vec![("edge".to_string(), 100), ("large".to_string(), 101)]
+    );
+    assert!(store.blobs_at_least(u64::MAX).unwrap().is_empty());
+}

@@ -4273,6 +4273,52 @@ fn target_root_registry_is_local_bounded_provenance_with_identity() {
 }
 
 #[test]
+fn discovered_target_remains_unbuilt_until_a_real_build_uses_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let store = Store::open(&config).unwrap();
+    let workspace = dir.path().join("workspace");
+    let target = workspace.join("target");
+    std::fs::create_dir_all(target.join("debug")).unwrap();
+    std::fs::write(
+        target.join("CACHEDIR.TAG"),
+        "Signature: 8a477f597d28d172789f06886806bc55",
+    )
+    .unwrap();
+
+    assert!(
+        store
+            .remember_discovered_target_root(&target, &workspace)
+            .unwrap()
+    );
+    assert!(
+        !store
+            .remember_discovered_target_root(&target, &workspace)
+            .unwrap()
+    );
+    let before = store.tracked_target_roots(0).unwrap().remove(0);
+    assert!(before.discovered);
+    assert_eq!(before.rustc, None);
+    store
+        .remember_target_root_built_by(&target, &workspace, Some("rustc 1"))
+        .unwrap();
+    let after = store.tracked_target_roots(0).unwrap().remove(0);
+    assert!(!after.discovered);
+    assert_eq!(after.rustc.as_deref(), Some("rustc 1"));
+    assert!(
+        !store
+            .remember_discovered_target_root(&target, &workspace)
+            .unwrap()
+    );
+    assert!(!store.tracked_target_roots(0).unwrap()[0].discovered);
+    assert!(
+        !store
+            .remember_discovered_target_root(&workspace, &workspace)
+            .unwrap()
+    );
+}
+
+#[test]
 fn a_target_root_records_the_compiler_that_built_into_it() {
     let dir = tempfile::tempdir().unwrap();
     let config = test_config(dir.path());

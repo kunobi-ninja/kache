@@ -4,7 +4,7 @@ use crate::sharing::Sharing;
 use serde::Serialize;
 use std::path::Path;
 
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, Hash)]
 pub struct PathIdentity {
     pub device: u64,
     pub inode: u64,

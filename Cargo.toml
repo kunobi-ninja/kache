@@ -39,6 +39,7 @@ resolver = "3"
 foldhash = "0.2"
 kunobi-daemon = { version = "0.8.0", features = ["wire-async", "local-async", "launch"] }
 kache-format = { version = "0.28.1", path = "crates/kache-format" }
+kache-fs = { version = "0.28.1", path = "crates/kache-fs" }
 kache-store = { version = "0.28.1", path = "crates/kache-store" }
 kache-shims = { version = "0.28.1", path = "crates/kache-shims" }
 blake3 = "1"

@@ -1966,6 +1966,7 @@ mod tests {
                 index_auto_compact: None,
                 auto_clean_orphaned_targets: None,
                 auto_clean_idle_targets_days: None,
+                auto_recover_min_free_bytes: None,
                 scheduler_memory_pressure: None,
                 auto_clean_unused_units_days: None,
                 seed_new_targets: None,

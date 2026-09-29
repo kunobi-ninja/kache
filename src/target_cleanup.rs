@@ -46,6 +46,8 @@ pub(crate) enum Reason {
     Orphaned,
     /// No build has used it for the configured number of days.
     Idle,
+    /// The volume fell below its configured free-space floor.
+    Pressure,
 }
 
 impl Reason {
@@ -53,6 +55,7 @@ impl Reason {
         match self {
             Reason::Orphaned => "its workspace was deleted",
             Reason::Idle => "no build used it within auto_clean_idle_targets_days",
+            Reason::Pressure => "its volume fell below auto_recover_min_free_bytes",
         }
     }
 }
@@ -79,7 +82,8 @@ pub(crate) fn due(
 ) -> bool {
     let enabled = config.auto_clean_orphaned_targets
         || config.auto_clean_idle_targets_days > 0
-        || config.auto_clean_unused_units_days > 0;
+        || config.auto_clean_unused_units_days > 0
+        || config.auto_recover_min_free_bytes > 0;
     // A clock set back behind the record does not stop the checks.
     let waited = last == 0 || now < last || now - last >= INTERVAL.as_secs();
     enabled
@@ -118,6 +122,13 @@ pub(crate) fn run(config: &Config, trigger: Trigger<'_>) {
                     path.display()
                 );
             }
+            for (path, bytes) in swept.reclaimed {
+                tracing::info!(
+                    "target recovery returned about {} of free space after removing {}",
+                    bytesize::ByteSize(bytes),
+                    path.display()
+                );
+            }
         }
         Err(error) => tracing::warn!("target directory cleanup failed: {error:#}"),
     }
@@ -130,6 +141,8 @@ pub(crate) struct Swept {
     pub(crate) removed: Vec<(PathBuf, Reason)>,
     /// Target directories that stayed and lost unused units.
     pub(crate) pruned: Vec<(PathBuf, crate::unit_prune::Pruned)>,
+    /// Observed free-space increase after pressure-driven removal.
+    pub(crate) reclaimed: Vec<(PathBuf, u64)>,
 }
 
 /// How long a unit may go unused before it is removed, `None` when
@@ -147,11 +160,22 @@ pub(crate) fn unit_window(days: u64) -> Option<Duration> {
 /// running build holds is kept for the next check.
 pub(crate) fn sweep(config: &Config, now: u64) -> anyhow::Result<Swept> {
     let store = Store::open(config)?;
+    crate::worktree_discovery::discover(&store)?;
     let window = unit_window(config.auto_clean_unused_units_days);
     let at = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(now);
     let now = i64::try_from(now).unwrap_or(i64::MAX);
     let mut swept = Swept::default();
     for tracked in store.tracked_target_roots(0)? {
+        if tracked.discovered {
+            let missing_with_parent =
+                !tracked.path.exists() && tracked.path.parent().is_some_and(Path::is_dir);
+            let replaced = crate::machine::directory_identity(&tracked.path)
+                .is_some_and(|identity| identity != tracked.identity);
+            if missing_with_parent || replaced {
+                store.forget_target_root(&tracked.path)?;
+            }
+            continue;
+        }
         let orphaned = crate::cli::workspace_is_gone(&tracked.workspace_root);
         let idle = now.saturating_sub(tracked.last_seen);
         let intact = crate::machine::target_root_is_safe(&tracked.path, &tracked.workspace_root)
@@ -173,7 +197,7 @@ pub(crate) fn sweep(config: &Config, now: u64) -> anyhow::Result<Swept> {
         if crate::cli::target_in_use(&tracked.path) {
             continue;
         }
-        match remove(&tracked.path, now, &config.cache_dir) {
+        match remove(&tracked.path, tracked.identity, now, &config.cache_dir) {
             Ok(true) => {
                 store.forget_target_root(&tracked.path)?;
                 swept.removed.push((tracked.path, reason));
@@ -185,7 +209,128 @@ pub(crate) fn sweep(config: &Config, now: u64) -> anyhow::Result<Swept> {
             ),
         }
     }
+    recover_under_pressure(config, &store, now, &mut swept)?;
     Ok(swept)
+}
+
+struct PressureCandidate {
+    path: PathBuf,
+    workspace_root: PathBuf,
+    identity: crate::machine::PathIdentity,
+    reclaimable: u64,
+    idle: i64,
+}
+
+/// The daemon's whole-target pressure policy, also used by `kache targets`
+/// to preview which paths it may remove on its next quiet pass.
+pub(crate) fn pressure_eligible(
+    config: &Config,
+    tracked: &crate::store::TrackedTargetRoot,
+    now: i64,
+) -> bool {
+    let floor = config.auto_recover_min_free_bytes;
+    if floor == 0 || tracked.discovered || now.saturating_sub(tracked.last_seen) < DAY_SECS as i64 {
+        return false;
+    }
+    let Some(true) = crate::cache_fs::probe(&tracked.path).is_local else {
+        return false;
+    };
+    let Some(usage) = kache_fs::volume_usage(&tracked.path) else {
+        return false;
+    };
+    floor <= usage.total
+        && volume_below_floor(usage.free, floor)
+        && crate::machine::target_root_is_safe(&tracked.path, &tracked.workspace_root)
+        && crate::machine::directory_identity(&tracked.path) == Some(tracked.identity)
+        && !looks_like_a_source_root(&tracked.path)
+        && !crate::cli::target_in_use(&tracked.path)
+}
+
+fn volume_below_floor(free: u64, floor: u64) -> bool {
+    free < floor
+}
+
+/// Remove older build targets on volumes below the explicitly configured
+/// free-space floor. Every candidate is rescanned and revalidated at removal.
+fn recover_under_pressure(
+    config: &Config,
+    store: &Store,
+    now: i64,
+    swept: &mut Swept,
+) -> anyhow::Result<()> {
+    let floor = config.auto_recover_min_free_bytes;
+    if floor == 0 {
+        return Ok(());
+    }
+    let mut candidates = Vec::new();
+    for tracked in store.tracked_target_roots(0)? {
+        if !pressure_eligible(config, &tracked, now) {
+            continue;
+        }
+        let reclaimable = crate::cli::target_reclaimable_bytes(&tracked.path);
+        if reclaimable == 0 {
+            continue;
+        }
+        candidates.push(PressureCandidate {
+            path: tracked.path,
+            workspace_root: tracked.workspace_root,
+            identity: tracked.identity,
+            reclaimable,
+            idle: now.saturating_sub(tracked.last_seen),
+        });
+    }
+    candidates.sort_by_key(|candidate| {
+        (
+            std::cmp::Reverse(candidate.reclaimable),
+            std::cmp::Reverse(candidate.idle),
+        )
+    });
+    let mut stalled_volumes = std::collections::HashSet::new();
+    for candidate in candidates {
+        if stalled_volumes.contains(&candidate.identity.device) {
+            continue;
+        }
+        let Some(parent) = candidate.path.parent() else {
+            continue;
+        };
+        let Some(before) = kache_fs::volume_usage(parent) else {
+            continue;
+        };
+        if !volume_below_floor(before.free, floor) {
+            continue;
+        }
+        if !crate::machine::target_root_is_safe(&candidate.path, &candidate.workspace_root) {
+            continue;
+        }
+        if looks_like_a_source_root(&candidate.path) {
+            continue;
+        }
+        if crate::cli::target_in_use(&candidate.path) {
+            continue;
+        }
+        match remove(&candidate.path, candidate.identity, now, &config.cache_dir) {
+            Ok(true) => {
+                store.forget_target_root(&candidate.path)?;
+                let freed = kache_fs::volume_usage(parent)
+                    .map_or(0, |after| after.free.saturating_sub(before.free));
+                record_stalled_volume(&mut stalled_volumes, candidate.identity.device, freed);
+                swept.reclaimed.push((candidate.path.clone(), freed));
+                swept.removed.push((candidate.path, Reason::Pressure));
+            }
+            Ok(false) => {}
+            Err(error) => tracing::warn!(
+                "could not recover target directory {}: {error}",
+                candidate.path.display()
+            ),
+        }
+    }
+    Ok(())
+}
+
+fn record_stalled_volume(stalled: &mut std::collections::HashSet<u64>, device: u64, freed: u64) {
+    if freed == 0 {
+        stalled.insert(device);
+    }
 }
 
 /// A directory holding a manifest or a repository is a source tree, never
@@ -200,10 +345,28 @@ fn looks_like_a_source_root(path: &Path) -> bool {
 /// that took its lock before the rename is found, and the directory is
 /// renamed back; one that starts after the rename creates a new directory.
 /// `Ok(false)` when a build holds it, before or after the rename.
-fn remove(target: &Path, now: i64, cache_dir: &Path) -> std::io::Result<bool> {
+fn remove(
+    target: &Path,
+    expected: crate::machine::PathIdentity,
+    now: i64,
+    cache_dir: &Path,
+) -> std::io::Result<bool> {
+    remove_after_rename(target, expected, now, cache_dir, |_| {})
+}
+
+fn remove_after_rename(
+    target: &Path,
+    expected: crate::machine::PathIdentity,
+    now: i64,
+    cache_dir: &Path,
+    after_rename: impl FnOnce(&Path),
+) -> std::io::Result<bool> {
     let Some(_reservation) = crate::target_use::try_exclusive(cache_dir)? else {
         return Ok(false);
     };
+    if crate::machine::directory_identity(target) != Some(expected) {
+        return Ok(false);
+    }
     let name = target.file_name().unwrap_or_default().to_string_lossy();
     let aside = target.with_file_name(format!(
         ".{name}.kache-removing-{}-{now}",
@@ -212,7 +375,11 @@ fn remove(target: &Path, now: i64, cache_dir: &Path) -> std::io::Result<bool> {
     if let Err(error) = std::fs::rename(target, &aside) {
         return refused(error, crate::cli::target_in_use(target));
     }
-    if crate::cli::target_in_use(&aside) {
+    after_rename(&aside);
+    let unchanged = crate::machine::directory_identity(&aside) == Some(expected)
+        && std::fs::symlink_metadata(&aside).is_ok_and(|meta| meta.file_type().is_dir())
+        && !looks_like_a_source_root(&aside);
+    if !unchanged || crate::cli::target_in_use(&aside) {
         if std::fs::symlink_metadata(target).is_err() {
             std::fs::rename(&aside, target)?;
         }
@@ -411,6 +578,9 @@ mod tests {
         let now = 10_000;
         assert!(due(&on, periodic, Some(0), 0, now));
         assert!(due(&idle_only, periodic, Some(0), 0, now));
+        let mut pressure_only = off.clone();
+        pressure_only.auto_recover_min_free_bytes = 1;
+        assert!(due(&pressure_only, periodic, Some(0), 0, now));
         assert!(!due(&off, periodic, Some(0), 0, now));
         assert!(!due(&on, Trigger::Shutdown, Some(0), 0, now));
         assert!(!due(&on, Trigger::Periodic(&busy), Some(0), 0, now));
@@ -458,6 +628,155 @@ mod tests {
             .map(|entry| entry.unwrap().file_name())
             .collect();
         assert_eq!(left, vec![std::ffi::OsString::from("fresh")]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_discovery_does_not_count_as_a_build_for_automatic_cleanup() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let mut idle = config(cache.path(), false, 1);
+        let store = Store::open(&idle).unwrap();
+        let (workspace, target) = tracked_target(&store, root.path(), "discovered");
+        std::fs::write(target.join("debug/artifact"), vec![7; 64 * 1024]).unwrap();
+        store.forget_target_root(&target).unwrap();
+        store
+            .remember_discovered_target_root(&target, &workspace)
+            .unwrap();
+        let later = unix_now_secs() + 2 * DAY_SECS;
+        idle.auto_recover_min_free_bytes = kache_fs::volume_usage(&target).unwrap().total - 1;
+        assert!(sweep(&idle, later).unwrap().removed.is_empty());
+        assert!(target.exists());
+        assert!(store.tracked_target_roots(0).unwrap()[0].discovered);
+        std::fs::remove_dir_all(&target).unwrap();
+        assert!(sweep(&idle, later).unwrap().removed.is_empty());
+        assert!(store.tracked_target_roots(0).unwrap().is_empty());
+
+        let (workspace, replaced) = tracked_target(&store, root.path(), "replaced");
+        store.forget_target_root(&replaced).unwrap();
+        assert!(
+            store
+                .remember_discovered_target_root(&replaced, &workspace)
+                .unwrap()
+        );
+        std::fs::rename(&replaced, workspace.join("old-target")).unwrap();
+        std::fs::create_dir_all(replaced.join("debug")).unwrap();
+        std::fs::write(
+            replaced.join("CACHEDIR.TAG"),
+            "Signature: 8a477f597d28d172789f06886806bc55",
+        )
+        .unwrap();
+        assert!(sweep(&idle, later).unwrap().removed.is_empty());
+        assert!(store.tracked_target_roots(0).unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pressure_recovery_waits_for_a_build_lock_then_removes_an_idle_target() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let mut pressure = config(cache.path(), false, 0);
+        let store = Store::open(&pressure).unwrap();
+        let (_, target) = tracked_target(&store, root.path(), "idle");
+        std::fs::write(target.join("debug/artifact"), vec![7; 64 * 1024]).unwrap();
+        assert!(crate::cli::target_reclaimable_bytes(&target) >= 64 * 1024);
+        pressure.auto_recover_min_free_bytes = kache_fs::volume_usage(&target).unwrap().total - 1;
+        let later = unix_now_secs() + 2 * DAY_SECS;
+        let lock = std::fs::File::create(target.join("debug/.cargo-lock")).unwrap();
+        lock.lock().unwrap();
+        let tracked = store.tracked_target_roots(0).unwrap().remove(0);
+        assert!(!pressure_eligible(&pressure, &tracked, later as i64));
+        assert!(sweep(&pressure, later).unwrap().removed.is_empty());
+        assert!(target.exists());
+        drop(lock);
+        for _ in 0..200 {
+            if pressure_eligible(&pressure, &tracked, later as i64) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(pressure_eligible(&pressure, &tracked, later as i64));
+        let exact_day = tracked.last_seen + DAY_SECS as i64;
+        assert!(!pressure_eligible(&pressure, &tracked, exact_day - 1));
+        assert!(pressure_eligible(&pressure, &tracked, exact_day));
+        let total = kache_fs::volume_usage(&target).unwrap().total;
+        pressure.auto_recover_min_free_bytes = total + 1;
+        assert!(!pressure_eligible(&pressure, &tracked, later as i64));
+        pressure.auto_recover_min_free_bytes = total;
+        assert!(pressure_eligible(&pressure, &tracked, later as i64));
+        pressure.auto_recover_min_free_bytes = total - 1;
+        let mut swept = Swept::default();
+        for _ in 0..200 {
+            swept = sweep(&pressure, later).unwrap();
+            if !swept.removed.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(swept.removed, vec![(target.clone(), Reason::Pressure)]);
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn pressure_stops_at_the_free_space_floor() {
+        assert!(volume_below_floor(99, 100));
+        assert!(!volume_below_floor(100, 100));
+        assert!(!volume_below_floor(101, 100));
+    }
+
+    #[test]
+    fn a_volume_stalls_only_when_removal_frees_no_space() {
+        let mut stalled = std::collections::HashSet::new();
+        record_stalled_volume(&mut stalled, 3, 1);
+        assert!(!stalled.contains(&3));
+        record_stalled_volume(&mut stalled, 4, 0);
+        assert!(stalled.contains(&4));
+    }
+
+    #[test]
+    fn guarded_remove_keeps_a_source_root() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("Cargo.toml"), "[workspace]\n").unwrap();
+        let identity = crate::machine::directory_identity(&target).unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        assert!(!remove(&target, identity, 7, cache.path()).unwrap());
+        assert!(target.join("Cargo.toml").exists());
+    }
+
+    #[test]
+    fn guarded_remove_rechecks_directory_identity_after_rename() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("target");
+        let saved = root.path().join("saved");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("artifact"), b"original").unwrap();
+        let identity = crate::machine::directory_identity(&target).unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let removed = remove_after_rename(&target, identity, 7, cache.path(), |aside| {
+            std::fs::rename(aside, &saved).unwrap();
+            std::fs::create_dir(aside).unwrap();
+        })
+        .unwrap();
+        assert!(!removed);
+        assert_eq!(std::fs::read(saved.join("artifact")).unwrap(), b"original");
+        assert!(target.is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn guarded_remove_keeps_a_symlink() {
+        let root = tempfile::tempdir().unwrap();
+        let real = root.path().join("real");
+        let link = root.path().join("target");
+        std::fs::create_dir(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let identity = crate::machine::directory_identity(&real).unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        assert!(!remove(&link, identity, 7, cache.path()).unwrap());
+        assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
+        assert!(real.exists());
     }
 
     #[test]
@@ -524,13 +843,16 @@ mod tests {
         std::fs::create_dir_all(target.join("debug")).unwrap();
         let lock = std::fs::File::create(target.join("debug/.cargo-lock")).unwrap();
         lock.lock().unwrap();
-        assert!(!remove(&target, 7, root.path()).unwrap());
+        let identity = crate::machine::directory_identity(&target).unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        assert!(!remove(&target, identity, 7, cache.path()).unwrap());
         assert!(target.join("debug/.cargo-lock").exists());
         assert!(target.exists());
         drop(lock);
-        assert!(remove(&target, 7, root.path()).unwrap());
+        assert!(remove(&target, identity, 7, cache.path()).unwrap());
         assert!(!target.exists());
-        assert!(remove(&target, 7, root.path()).is_err());
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+        assert!(!remove(&target, identity, 7, cache.path()).unwrap());
     }
 
     #[test]
@@ -538,11 +860,12 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let target = root.path().join("target");
         std::fs::create_dir_all(target.join("debug")).unwrap();
+        let identity = crate::machine::directory_identity(&target).unwrap();
         let command = crate::target_use::shared(root.path()).unwrap();
-        assert!(!remove(&target, 7, root.path()).unwrap());
+        assert!(!remove(&target, identity, 7, root.path()).unwrap());
         assert!(target.exists());
         drop(command);
-        assert!(remove(&target, 7, root.path()).unwrap());
+        assert!(remove(&target, identity, 7, root.path()).unwrap());
     }
 
     #[test]

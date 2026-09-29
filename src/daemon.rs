@@ -8986,6 +8986,7 @@ fn handle_seed_target(config: &Config, req: &SeedTargetRequest) -> Response {
     let donors: Vec<_> = match tracked {
         Ok(tracked) => tracked
             .into_iter()
+            .filter(|root| !root.discovered)
             .rev()
             .map(|root| crate::target_seed::Donor {
                 target_dir: root.path,

@@ -2973,6 +2973,14 @@ fn compute_project_stats(target_dir: &std::path::Path) -> (ProjectStats, Categor
     (stats, breakdown)
 }
 
+/// Physical-byte estimate used by daemon target recovery. The CLI's target
+/// preview and the daemon must rank candidates from the same measurement.
+pub(crate) fn target_reclaimable_bytes(target_dir: &std::path::Path) -> u64 {
+    compute_project_stats(target_dir)
+        .0
+        .estimated_reclaimable_bytes
+}
+
 /// Whether a file in `target/` is a binary-shaped artifact (executable
 /// or dynamic library) for stats bucketing purposes.
 ///
@@ -4590,8 +4598,12 @@ pub(crate) struct TargetRow {
     path: String,
     workspace: String,
     state: TargetState,
-    /// Seconds since a build last used it.
-    idle_seconds: u64,
+    /// Seconds since a build last used it, unknown for Git discoveries.
+    idle_seconds: Option<u64>,
+    /// Git found this target, but kache has not observed a build using it.
+    discovered: bool,
+    /// The daemon may remove this target on its next quiet pressure pass.
+    recovery_candidate: bool,
     profiles: Vec<String>,
     /// Bytes its files add up to, counting shared blocks in full.
     apparent_bytes: u64,
@@ -4609,7 +4621,10 @@ fn target_rows(config: &Config, now: i64) -> Result<Vec<TargetRow>> {
     let tracked: Vec<_> = store
         .tracked_target_roots(0)?
         .into_iter()
-        .filter(|tracked| tracked.path.is_dir())
+        .filter(|tracked| {
+            tracked.path.is_dir()
+                && crate::machine::directory_identity(&tracked.path) == Some(tracked.identity)
+        })
         .collect();
     // Each scan walks a whole target and probes extents; they are independent
     // and bound by the filesystem, so run several at once.
@@ -4649,7 +4664,11 @@ fn target_rows(config: &Config, now: i64) -> Result<Vec<TargetRow>> {
             } else {
                 TargetState::Live
             },
-            idle_seconds: now.saturating_sub(tracked.last_seen).max(0) as u64,
+            idle_seconds: (!tracked.discovered)
+                .then_some(now.saturating_sub(tracked.last_seen).max(0) as u64),
+            discovered: tracked.discovered,
+            recovery_candidate: stats.estimated_reclaimable_bytes > 0
+                && crate::target_cleanup::pressure_eligible(config, tracked, now),
             profiles,
             apparent_bytes: stats.total_bytes,
             reclaimable_bytes: stats.estimated_reclaimable_bytes,
@@ -4690,17 +4709,29 @@ fn render_targets(rows: &[TargetRow]) -> Vec<String> {
         } else {
             ""
         };
+        let discovered = if row.discovered {
+            "  (Git discovery)"
+        } else {
+            ""
+        };
+        let recovery = if row.recovery_candidate {
+            "  (recovery candidate)"
+        } else {
+            ""
+        };
         lines.push(format!(
-            "  {:>10}  {:>10}  {:>5}  {}{deleted}",
+            "  {:>10}  {:>10}  {:>5}  {}{deleted}{discovered}{recovery}",
             ByteSize(row.reclaimable_bytes).to_string(),
             ByteSize(row.apparent_bytes).to_string(),
-            format_idle(row.idle_seconds),
+            row.idle_seconds
+                .map(format_idle)
+                .unwrap_or_else(|| "?".into()),
             row.workspace
         ));
     }
     let orphans = rows
         .iter()
-        .filter(|row| row.state == TargetState::WorktreeDeleted)
+        .filter(|row| !row.discovered && row.state == TargetState::WorktreeDeleted)
         .count();
     if orphans > 0 {
         lines.push(format!(
@@ -4715,7 +4746,7 @@ fn render_targets(rows: &[TargetRow]) -> Vec<String> {
 fn targets_next_actions(rows: &[TargetRow]) -> Vec<crate::machine::NextAction> {
     let orphans = rows
         .iter()
-        .filter(|row| row.state == TargetState::WorktreeDeleted)
+        .filter(|row| !row.discovered && row.state == TargetState::WorktreeDeleted)
         .count();
     if orphans == 0 {
         return Vec::new();
@@ -4819,6 +4850,10 @@ fn tracked_target_entries(
             path: display.clone(),
             reason: reason.to_string(),
         };
+        if tracked.discovered {
+            skipped.push(skip("Git discovery has no observed build time"));
+            continue;
+        }
         if !tracked.path.exists() {
             skipped.push(skip("path no longer exists; registry entry removed"));
             store.forget_target_root(&tracked.path)?;

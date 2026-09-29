@@ -3092,6 +3092,7 @@ fn save_manifest_config(
         index_auto_compact: true,
         auto_clean_orphaned_targets: false,
         auto_clean_idle_targets_days: 0,
+        auto_recover_min_free_bytes: 0,
         scheduler_memory_pressure: true,
         auto_clean_unused_units_days: 0,
         seed_new_targets: false,
@@ -6183,7 +6184,9 @@ fn row(workspace: &str, state: TargetState, reclaimable: u64) -> TargetRow {
         path: format!("{workspace}/target"),
         workspace: workspace.to_string(),
         state,
-        idle_seconds: 3 * 86_400,
+        idle_seconds: Some(3 * 86_400),
+        discovered: false,
+        recovery_candidate: false,
         profiles: vec!["debug".to_string()],
         apparent_bytes: reclaimable * 2,
         reclaimable_bytes: reclaimable,
@@ -6257,7 +6260,7 @@ fn target_rows_report_each_worktree_and_sort_by_what_frees_most() {
         targets.push((workspace, target));
     }
     std::fs::remove_dir_all(&targets[1].0).unwrap();
-    std::fs::create_dir_all(dir.path().join("targets/gone")).unwrap();
+    std::fs::create_dir_all(dir.path().join("targets/gone/debug")).unwrap();
     std::fs::write(
         dir.path().join("targets/gone/CACHEDIR.TAG"),
         CARGO_CACHEDIR_TAG,
@@ -6266,21 +6269,64 @@ fn target_rows_report_each_worktree_and_sort_by_what_frees_most() {
     store
         .remember_target_root(&dir.path().join("targets/gone"), &targets[0].0)
         .unwrap();
-    std::fs::remove_dir_all(dir.path().join("targets/gone")).unwrap();
+    assert!(
+        store
+            .tracked_target_roots(0)
+            .unwrap()
+            .iter()
+            .any(|tracked| { tracked.path == dir.path().join("targets/gone") })
+    );
+    std::fs::rename(
+        dir.path().join("targets/gone"),
+        dir.path().join("targets/old-gone"),
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.path().join("targets/gone/debug")).unwrap();
+    std::fs::write(
+        dir.path().join("targets/gone/CACHEDIR.TAG"),
+        CARGO_CACHEDIR_TAG,
+    )
+    .unwrap();
 
     let now = kache_store::markers::now_epoch_secs() as i64 + 120;
     let rows = target_rows(&config, now).unwrap();
-    assert_eq!(rows.len(), 2, "a vanished target is not listed: {rows:?}");
+    assert_eq!(rows.len(), 2, "a replaced target is not listed: {rows:?}");
     assert!(rows[0].path.ends_with("large") && rows[1].path.ends_with("small"));
     assert_eq!(rows[0].state, TargetState::WorktreeDeleted);
     assert_eq!(rows[1].state, TargetState::Live);
     assert!(rows[0].reclaimable_bytes >= 64 * 1024, "{rows:?}");
     assert!(
-        rows.iter()
-            .all(|row| (120..=125).contains(&row.idle_seconds)),
+        rows.iter().all(|row| row
+            .idle_seconds
+            .is_some_and(|secs| (120..=125).contains(&secs))),
         "{rows:?}"
     );
     assert_eq!(rows[1].profiles, ["debug"]);
+    assert!(rows.iter().all(|row| !row.recovery_candidate));
+    #[cfg(unix)]
+    {
+        let mut pressure = config.clone();
+        pressure.auto_recover_min_free_bytes =
+            kache_fs::volume_usage(&targets[0].1).unwrap().total - 1;
+        let empty_workspace = dir.path().join("wt/empty");
+        let empty_target = dir.path().join("targets/empty");
+        std::fs::create_dir_all(&empty_workspace).unwrap();
+        std::fs::create_dir_all(empty_target.join("debug")).unwrap();
+        let shared_marker = dir.path().join("shared-marker");
+        std::fs::write(&shared_marker, CARGO_CACHEDIR_TAG).unwrap();
+        std::fs::hard_link(&shared_marker, empty_target.join("CACHEDIR.TAG")).unwrap();
+        store
+            .remember_target_root(&empty_target, &empty_workspace)
+            .unwrap();
+        let aged = target_rows(&pressure, now + 2 * 86_400).unwrap();
+        assert!(aged.iter().any(|row| row.recovery_candidate));
+        let empty = aged
+            .iter()
+            .find(|row| row.path == empty_target.display().to_string())
+            .unwrap();
+        assert_eq!(empty.reclaimable_bytes, 0);
+        assert!(!empty.recovery_candidate);
+    }
 }
 
 #[test]

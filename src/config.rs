@@ -484,6 +484,9 @@ pub struct Config {
     /// `KACHE_AUTO_CLEAN_IDLE_TARGETS_DAYS` or `[cache]
     /// auto_clean_idle_targets_days`.
     pub auto_clean_idle_targets_days: u64,
+    /// Minimum free bytes to maintain on a target's volume by removing
+    /// targets idle for at least a day. Zero (the default) disables it.
+    pub auto_recover_min_free_bytes: u64,
     /// Under memory pressure, admit a compile only when no other compile
     /// holds a scheduler slot. On by default. Set via
     /// `KACHE_SCHEDULER_MEMORY_PRESSURE=0`/`=false` or `[cache]
@@ -828,6 +831,8 @@ pub(crate) struct CacheFileConfig {
     pub(crate) auto_clean_orphaned_targets: Option<bool>,
     /// See [`Config::auto_clean_idle_targets_days`].
     pub(crate) auto_clean_idle_targets_days: Option<u64>,
+    /// See [`Config::auto_recover_min_free_bytes`].
+    pub(crate) auto_recover_min_free_bytes: Option<u64>,
     /// See [`Config::scheduler_memory_pressure`].
     pub(crate) scheduler_memory_pressure: Option<bool>,
     /// See [`Config::auto_clean_unused_units_days`].
@@ -1244,6 +1249,7 @@ const IGNORE_ENV_GATED_VARS: &[&str] = &[
     "KACHE_INDEX_AUTO_COMPACT",
     "KACHE_AUTO_CLEAN_ORPHANED_TARGETS",
     "KACHE_AUTO_CLEAN_IDLE_TARGETS_DAYS",
+    "KACHE_AUTO_RECOVER_MIN_FREE_BYTES",
     "KACHE_SCHEDULER_MEMORY_PRESSURE",
     "KACHE_AUTO_CLEAN_UNUSED_UNITS_DAYS",
     "KACHE_SEED_NEW_TARGETS",
@@ -1346,6 +1352,10 @@ const ENV_FILE_KEYS: &[(&str, &str)] = &[
     (
         "KACHE_AUTO_CLEAN_IDLE_TARGETS_DAYS",
         "cache.auto_clean_idle_targets_days",
+    ),
+    (
+        "KACHE_AUTO_RECOVER_MIN_FREE_BYTES",
+        "cache.auto_recover_min_free_bytes",
     ),
     (
         "KACHE_SCHEDULER_MEMORY_PRESSURE",
@@ -1908,6 +1918,7 @@ impl Config {
         let index_auto_compact = Self::index_auto_compact_enabled(&file_config);
         let auto_clean_orphaned_targets = Self::auto_clean_orphaned_targets_enabled(&file_config);
         let auto_clean_idle_targets_days = Self::auto_clean_idle_targets_days(&file_config);
+        let auto_recover_min_free_bytes = Self::auto_recover_min_free_bytes(&file_config);
         let scheduler_memory_pressure = Self::scheduler_memory_pressure_enabled(&file_config);
         let auto_clean_unused_units_days = Self::auto_clean_unused_units_days(&file_config);
         let seed_new_targets = Self::seed_new_targets_enabled(&file_config);
@@ -2005,6 +2016,7 @@ impl Config {
             index_auto_compact,
             auto_clean_orphaned_targets,
             auto_clean_idle_targets_days,
+            auto_recover_min_free_bytes,
             scheduler_memory_pressure,
             auto_clean_unused_units_days,
             seed_new_targets,
@@ -2659,6 +2671,22 @@ impl Config {
                     .ok()
                     .and_then(|c| c.cache.as_ref())
                     .and_then(|c| c.auto_clean_idle_targets_days)
+            })
+            .unwrap_or(0)
+    }
+
+    /// Free-space threshold for daemon target recovery; off by default.
+    fn auto_recover_min_free_bytes(file_config: &Result<FileConfig>) -> u64 {
+        let ignore_env = Self::ignore_env_enabled(file_config);
+        env_or_ignored("KACHE_AUTO_RECOVER_MIN_FREE_BYTES", ignore_env)
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .or_else(|| {
+                file_config
+                    .as_ref()
+                    .ok()
+                    .and_then(|c| c.cache.as_ref())
+                    .and_then(|c| c.auto_recover_min_free_bytes)
             })
             .unwrap_or(0)
     }

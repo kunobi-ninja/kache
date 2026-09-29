@@ -366,27 +366,32 @@ fn target_cleanup_defaults_and_env_precedence() {
     let _config = set_kache_config_for_test(&config_path);
     let _orphans = NamedEnvGuard::remove("KACHE_AUTO_CLEAN_ORPHANED_TARGETS");
     let _idle = NamedEnvGuard::remove("KACHE_AUTO_CLEAN_IDLE_TARGETS_DAYS");
+    let _floor = NamedEnvGuard::remove("KACHE_AUTO_RECOVER_MIN_FREE_BYTES");
     let _units = NamedEnvGuard::remove("KACHE_AUTO_CLEAN_UNUSED_UNITS_DAYS");
 
     let config = Config::load().unwrap();
     assert!(config.auto_clean_orphaned_targets);
     assert_eq!(config.auto_clean_idle_targets_days, 0);
+    assert_eq!(config.auto_recover_min_free_bytes, 0);
 
     std::fs::write(
         &config_path,
-        "[cache]\nauto_clean_orphaned_targets = false\nauto_clean_idle_targets_days = 30\n",
+        "[cache]\nauto_clean_orphaned_targets = false\nauto_clean_idle_targets_days = 30\nauto_recover_min_free_bytes = 1073741824\n",
     )
     .unwrap();
     let config = Config::load().unwrap();
     assert!(!config.auto_clean_orphaned_targets);
     assert_eq!(config.auto_clean_idle_targets_days, 30);
+    assert_eq!(config.auto_recover_min_free_bytes, 1 << 30);
 
     let _on = NamedEnvGuard::set("KACHE_AUTO_CLEAN_ORPHANED_TARGETS", "1");
     let _days = NamedEnvGuard::set("KACHE_AUTO_CLEAN_IDLE_TARGETS_DAYS", "7");
+    let _floor_override = NamedEnvGuard::set("KACHE_AUTO_RECOVER_MIN_FREE_BYTES", "2147483648");
     let config = Config::load().unwrap();
     assert!(config.auto_clean_orphaned_targets);
     assert_eq!(config.auto_clean_idle_targets_days, 7);
-    drop((_on, _days));
+    assert_eq!(config.auto_recover_min_free_bytes, 2 << 30);
+    drop((_on, _days, _floor_override));
 
     std::fs::write(
         &config_path,
@@ -406,14 +411,16 @@ fn target_cleanup_defaults_and_env_precedence() {
 
     std::fs::write(
         &config_path,
-        "[cache]\nignore_env = true\nauto_clean_idle_targets_days = 3\n",
+        "[cache]\nignore_env = true\nauto_clean_idle_targets_days = 3\nauto_recover_min_free_bytes = 1048576\n",
     )
     .unwrap();
     let _ignored = NamedEnvGuard::set("KACHE_AUTO_CLEAN_ORPHANED_TARGETS", "0");
     let _ignored_days = NamedEnvGuard::set("KACHE_AUTO_CLEAN_IDLE_TARGETS_DAYS", "9");
+    let _ignored_floor = NamedEnvGuard::set("KACHE_AUTO_RECOVER_MIN_FREE_BYTES", "5242880");
     let config = Config::load().unwrap();
     assert!(config.auto_clean_orphaned_targets);
     assert_eq!(config.auto_clean_idle_targets_days, 3);
+    assert_eq!(config.auto_recover_min_free_bytes, 1 << 20);
 }
 
 #[test]
@@ -2329,6 +2336,7 @@ fn test_file_config_roundtrip() {
             index_auto_compact: None,
             auto_clean_orphaned_targets: None,
             auto_clean_idle_targets_days: None,
+            auto_recover_min_free_bytes: None,
             scheduler_memory_pressure: None,
             auto_clean_unused_units_days: None,
             seed_new_targets: None,
@@ -2867,6 +2875,7 @@ fn test_config_store_dir() {
         index_auto_compact: true,
         auto_clean_orphaned_targets: true,
         auto_clean_idle_targets_days: 0,
+        auto_recover_min_free_bytes: 0,
         scheduler_memory_pressure: true,
         auto_clean_unused_units_days: 0,
         seed_new_targets: false,
@@ -2941,6 +2950,7 @@ fn test_config_index_db_path() {
         index_auto_compact: true,
         auto_clean_orphaned_targets: true,
         auto_clean_idle_targets_days: 0,
+        auto_recover_min_free_bytes: 0,
         scheduler_memory_pressure: true,
         auto_clean_unused_units_days: 0,
         seed_new_targets: false,
@@ -3011,6 +3021,7 @@ fn test_config_event_log_path() {
         index_auto_compact: true,
         auto_clean_orphaned_targets: true,
         auto_clean_idle_targets_days: 0,
+        auto_recover_min_free_bytes: 0,
         scheduler_memory_pressure: true,
         auto_clean_unused_units_days: 0,
         seed_new_targets: false,
@@ -3100,6 +3111,7 @@ fn test_config_socket_path() {
         index_auto_compact: true,
         auto_clean_orphaned_targets: true,
         auto_clean_idle_targets_days: 0,
+        auto_recover_min_free_bytes: 0,
         scheduler_memory_pressure: true,
         auto_clean_unused_units_days: 0,
         seed_new_targets: false,
@@ -3766,6 +3778,7 @@ fn test_save_and_load_file_config() {
             index_auto_compact: None,
             auto_clean_orphaned_targets: None,
             auto_clean_idle_targets_days: None,
+            auto_recover_min_free_bytes: None,
             scheduler_memory_pressure: None,
             auto_clean_unused_units_days: None,
             seed_new_targets: None,

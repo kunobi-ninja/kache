@@ -1039,6 +1039,8 @@ pub struct TrackedTargetRoot {
     pub identity: crate::filesystem::PathIdentity,
     /// The `rustc -vV` that last built into it, when kache recorded one.
     pub rustc: Option<String>,
+    /// Found through Git, but never observed in a build through kache.
+    pub discovered: bool,
 }
 
 /// A shadow policy's would-evict set for one size-driven sweep
@@ -1696,7 +1698,8 @@ fn initialize_db(db: &Connection) -> rusqlite::Result<()> {
             last_seen      INTEGER NOT NULL DEFAULT (unixepoch()),
             device         TEXT NOT NULL,
             inode          TEXT NOT NULL,
-            rustc          TEXT
+            rustc          TEXT,
+            discovered     INTEGER NOT NULL DEFAULT 0
         );
         CREATE INDEX IF NOT EXISTS idx_target_roots_last_seen
             ON target_roots(last_seen);",
@@ -1704,6 +1707,8 @@ fn initialize_db(db: &Connection) -> rusqlite::Result<()> {
     // The `rustc -vV` a target was last built by, so a new checkout's build
     // can be seeded only from targets its own compiler built.
     let _ = db.execute_batch("ALTER TABLE target_roots ADD COLUMN rustc TEXT");
+    let _ = db
+        .execute_batch("ALTER TABLE target_roots ADD COLUMN discovered INTEGER NOT NULL DEFAULT 0");
 
     crate::file_hash::ensure_file_hash_cache_schema(db)?;
     db.pragma_update(None, "user_version", INDEX_SCHEMA_GENERATION)?;
@@ -1723,7 +1728,8 @@ fn initialize_db(db: &Connection) -> rusqlite::Result<()> {
 /// 6: `entries.imported_at`, so automatic eviction can keep what the remote
 ///    delivered for the job still running (#1008).
 /// 7: `target_roots.rustc`, the compiler a tracked target was built by.
-const INDEX_SCHEMA_GENERATION: i64 = 7;
+/// 8: `target_roots.discovered`, separating Git discovery from build activity.
+const INDEX_SCHEMA_GENERATION: i64 = 8;
 
 /// Raise the refcount of every blob `cache_key` maps to at least the
 /// references all mappings hold on it. Run before giving this key's
@@ -4175,7 +4181,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         let fresh: Option<bool> = self
             .db
             .query_row(
-                "SELECT last_seen > unixepoch() - 300
+                "SELECT discovered = 0 AND last_seen > unixepoch() - 300
                     AND workspace_root = ?2 AND device = ?3 AND inode = ?4
                     AND (?5 IS NULL OR rustc IS ?5)
                  FROM target_roots WHERE path = ?1",
@@ -4194,19 +4200,21 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         }
         let changed = self.db.execute(
             "INSERT INTO target_roots
-                (path, workspace_root, first_seen, last_seen, device, inode, rustc)
-             VALUES (?1, ?2, unixepoch(), unixepoch(), ?3, ?4, ?5)
+                (path, workspace_root, first_seen, last_seen, device, inode, rustc, discovered)
+             VALUES (?1, ?2, unixepoch(), unixepoch(), ?3, ?4, ?5, 0)
              ON CONFLICT(path) DO UPDATE SET
                 workspace_root = excluded.workspace_root,
                 last_seen = unixepoch(),
                 device = excluded.device,
                 inode = excluded.inode,
-                rustc = COALESCE(excluded.rustc, target_roots.rustc)
+                rustc = COALESCE(excluded.rustc, target_roots.rustc),
+                discovered = 0
              WHERE target_roots.last_seen <= unixepoch() - 300
                 OR target_roots.workspace_root != excluded.workspace_root
                 OR target_roots.device != excluded.device
                 OR target_roots.inode != excluded.inode
-                OR (excluded.rustc IS NOT NULL AND target_roots.rustc IS NOT excluded.rustc)",
+                OR (excluded.rustc IS NOT NULL AND target_roots.rustc IS NOT excluded.rustc)
+                OR target_roots.discovered != 0",
             params![
                 target.to_string_lossy(),
                 workspace_root.to_string_lossy(),
@@ -4216,6 +4224,18 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             ],
         )?;
         if changed > 0 {
+            // Git may report a canonical /private path while Cargo used a
+            // /var or /tmp spelling of the same directory. The build row is
+            // authoritative; discard its discovered alias by inode.
+            self.db.execute(
+                "DELETE FROM target_roots
+                 WHERE path != ?1 AND device = ?2 AND inode = ?3 AND discovered != 0",
+                params![
+                    target.to_string_lossy(),
+                    identity.device.to_string(),
+                    identity.inode.to_string(),
+                ],
+            )?;
             self.db.execute(
                 "DELETE FROM target_roots WHERE last_seen < unixepoch() - 15552000",
                 [],
@@ -4223,7 +4243,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             self.db.execute(
                 "DELETE FROM target_roots WHERE path IN (
                     SELECT path FROM target_roots
-                    ORDER BY last_seen DESC, path ASC
+                    ORDER BY discovered ASC, last_seen DESC, path ASC
                     LIMIT -1 OFFSET 2048
                 )",
                 [],
@@ -4232,10 +4252,61 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         Ok(())
     }
 
+    /// Record a Cargo target found in a sibling Git worktree without claiming
+    /// that a kache build used it. Never refresh an existing row's last use.
+    pub fn remember_discovered_target_root(
+        &self,
+        target: &Path,
+        workspace_root: &Path,
+    ) -> Result<bool> {
+        if !crate::filesystem::target_root_is_safe(target, workspace_root) {
+            return Ok(false);
+        }
+        let target = std::path::absolute(target)?;
+        let workspace_root = std::path::absolute(workspace_root)?;
+        let Some(identity) = crate::filesystem::directory_identity(&target) else {
+            return Ok(false);
+        };
+        let inserted = self.db.execute(
+            "INSERT INTO target_roots
+                (path, workspace_root, first_seen, last_seen, device, inode, discovered)
+             VALUES (?1, ?2, unixepoch(), unixepoch(), ?3, ?4, 1)
+             ON CONFLICT(path) DO UPDATE SET
+                workspace_root = excluded.workspace_root,
+                first_seen = unixepoch(),
+                last_seen = unixepoch(),
+                device = excluded.device,
+                inode = excluded.inode
+             WHERE target_roots.discovered != 0 AND (
+                target_roots.workspace_root != excluded.workspace_root OR
+                target_roots.device != excluded.device OR
+                target_roots.inode != excluded.inode
+             )",
+            params![
+                target.to_string_lossy(),
+                workspace_root.to_string_lossy(),
+                identity.device.to_string(),
+                identity.inode.to_string(),
+            ],
+        )?;
+        let inserted = inserted != 0;
+        // A Git repository can expose many worktrees, but it must not crowd
+        // targets whose builds kache actually observed out of the registry.
+        self.db.execute(
+            "DELETE FROM target_roots WHERE path IN (
+                SELECT path FROM target_roots
+                ORDER BY discovered ASC, last_seen DESC, path ASC
+                LIMIT -1 OFFSET 2048
+            )",
+            [],
+        )?;
+        Ok(inserted)
+    }
+
     pub fn tracked_target_roots(&self, stale_hours: u64) -> Result<Vec<TrackedTargetRoot>> {
         let stale_seconds = stale_hours.saturating_mul(3600).min(i64::MAX as u64) as i64;
         let mut stmt = self.db.prepare(
-            "SELECT path, workspace_root, first_seen, last_seen, device, inode, rustc
+            "SELECT path, workspace_root, first_seen, last_seen, device, inode, rustc, discovered
              FROM target_roots
              WHERE last_seen <= unixepoch() - ?1
              ORDER BY last_seen ASC, path ASC",
@@ -4251,11 +4322,13 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                 device,
                 inode,
                 row.get::<_, Option<String>>(6)?,
+                row.get::<_, bool>(7)?,
             ))
         })?;
         let mut targets = Vec::new();
         for row in rows {
-            let (path, workspace_root, first_seen, last_seen, device, inode, rustc) = row?;
+            let (path, workspace_root, first_seen, last_seen, device, inode, rustc, discovered) =
+                row?;
             let (Ok(device), Ok(inode)) = (device.parse::<u64>(), inode.parse::<u64>()) else {
                 continue;
             };
@@ -4266,6 +4339,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                 last_seen,
                 identity: crate::filesystem::PathIdentity { device, inode },
                 rustc,
+                discovered,
             });
         }
         Ok(targets)

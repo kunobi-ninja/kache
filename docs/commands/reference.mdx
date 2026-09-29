@@ -106,7 +106,7 @@ kache targets
 kache targets --json
 ```
 
-`targets` lists every tracked target directory that still exists: its workspace, how long since a build last used it, the bytes it holds, and an estimate of what deleting it frees. The estimate leaves out blocks the target shares with the store or with other hardlinks, so it is what `kache clean` would give back. A target whose worktree has been deleted is marked. The text output ends with the command that removes those targets; `--json` gives it in `next`.
+`targets` lists every tracked target directory that still exists: its workspace, how long since a build last used it, the bytes it holds, and an estimate of what deleting it frees. The estimate leaves out blocks the target shares with the store or with other hardlinks, so it is what `kache clean` would give back. The daemon also discovers default targets in sibling Git worktrees; these show `?` for idle time until Kache observes a build there. A target whose worktree has been deleted is marked. When a free-space floor is configured, targets eligible for the daemon's next pressure cleanup are marked as recovery candidates. The text output ends with the command that removes eligible orphaned targets; `--json` gives it in `next`.
 
 ## `kache init`
 

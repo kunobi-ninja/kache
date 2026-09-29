@@ -1262,6 +1262,13 @@ source = "git+https://example.com/gitdep#abc"
                 !out_dir_names_the_donor(&from, layout, &dep, &named),
                 "{layout:?}"
             );
+            // Longer than both needles, and neither needle is in it. A
+            // shorter miss makes `windows` empty, so `==` and `!=` agree.
+            write(&cache, "xxxx see /neither xxxxxxxxx\n");
+            assert!(
+                !out_dir_names_the_donor(&from, layout, &dep, &named),
+                "{layout:?}: a longer file that names neither path"
+            );
 
             let mut blank = donor.clone();
             blank.target_dir.clear();

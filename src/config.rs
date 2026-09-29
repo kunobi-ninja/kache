@@ -484,8 +484,9 @@ pub struct Config {
     /// `KACHE_AUTO_CLEAN_IDLE_TARGETS_DAYS` or `[cache]
     /// auto_clean_idle_targets_days`.
     pub auto_clean_idle_targets_days: u64,
-    /// Minimum free bytes to maintain on a target's volume by removing
-    /// targets idle for at least a day. Zero (the default) disables it.
+    /// Minimum free bytes to maintain on a target's volume by removing build
+    /// units unused for a day, then targets idle for at least a day. Zero
+    /// (the default) disables it.
     pub auto_recover_min_free_bytes: u64,
     /// Under memory pressure, admit a compile only when no other compile
     /// holds a scheduler slot. On by default. Set via

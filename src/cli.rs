@@ -4605,8 +4605,8 @@ pub(crate) struct TargetRow {
     idle_seconds: Option<u64>,
     /// Git found this target, but kache has not observed a build using it.
     discovered: bool,
-    /// The daemon may remove this target on its next quiet pressure pass.
-    recovery_candidate: bool,
+    /// What the daemon's next quiet pass would do to this target.
+    next_pass: crate::target_cleanup::Plan,
     profiles: Vec<String>,
     /// Bytes its files add up to, counting shared blocks in full.
     apparent_bytes: u64,
@@ -4646,8 +4646,9 @@ fn target_rows(config: &Config, now: i64) -> Result<Vec<TargetRow>> {
                     };
                     let stats = compute_project_stats(&root.path).0;
                     let profiles = detect_profiles(&root.path);
+                    let plan = crate::target_cleanup::plan(config, root, now.max(0) as u64);
                     if let Ok(mut scanned) = scanned.lock() {
-                        scanned.push((index, stats, profiles));
+                        scanned.push((index, stats, profiles, plan));
                     }
                 }
             });
@@ -4657,7 +4658,7 @@ fn target_rows(config: &Config, now: i64) -> Result<Vec<TargetRow>> {
         .into_inner()
         .unwrap_or_else(|error| error.into_inner());
     let mut rows = Vec::with_capacity(scanned.len());
-    for (index, stats, profiles) in scanned {
+    for (index, stats, profiles, next_pass) in scanned {
         let tracked = &tracked[index];
         rows.push(TargetRow {
             path: tracked.path.display().to_string(),
@@ -4670,8 +4671,7 @@ fn target_rows(config: &Config, now: i64) -> Result<Vec<TargetRow>> {
             idle_seconds: (!tracked.discovered)
                 .then_some(now.saturating_sub(tracked.last_seen).max(0) as u64),
             discovered: tracked.discovered,
-            recovery_candidate: stats.estimated_reclaimable_bytes > 0
-                && crate::target_cleanup::pressure_eligible(config, tracked, now),
+            next_pass,
             profiles,
             apparent_bytes: stats.total_bytes,
             reclaimable_bytes: stats.estimated_reclaimable_bytes,
@@ -4717,13 +4717,9 @@ fn render_targets(rows: &[TargetRow]) -> Vec<String> {
         } else {
             ""
         };
-        let recovery = if row.recovery_candidate {
-            "  (recovery candidate)"
-        } else {
-            ""
-        };
+        let next_pass = next_pass_note(&row.next_pass);
         lines.push(format!(
-            "  {:>10}  {:>10}  {:>5}  {}{deleted}{discovered}{recovery}",
+            "  {:>10}  {:>10}  {:>5}  {}{deleted}{discovered}{next_pass}",
             ByteSize(row.reclaimable_bytes).to_string(),
             ByteSize(row.apparent_bytes).to_string(),
             row.idle_seconds
@@ -4743,6 +4739,30 @@ fn render_targets(rows: &[TargetRow]) -> Vec<String> {
         ));
     }
     lines
+}
+
+/// What the daemon's next quiet pass would do to a target, as a suffix.
+fn next_pass_note(plan: &crate::target_cleanup::Plan) -> String {
+    let mut steps = Vec::new();
+    if plan.units.units > 0 {
+        steps.push(format!(
+            "prunes {} unused unit{} ({})",
+            plan.units.units,
+            if plan.units.units == 1 { "" } else { "s" },
+            ByteSize(plan.units.bytes)
+        ));
+    }
+    match plan.remove {
+        Some(crate::target_cleanup::Reason::Pressure) => {
+            steps.push("removes it if the volume is still below the free-space floor".into());
+        }
+        Some(reason) => steps.push(format!("removes it: {}", reason.describe())),
+        None => {}
+    }
+    if steps.is_empty() {
+        return String::new();
+    }
+    format!("  (next pass {})", steps.join(", then "))
 }
 
 /// The clean that removes deleted worktrees' targets, when there are any.

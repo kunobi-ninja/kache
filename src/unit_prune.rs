@@ -50,7 +50,7 @@ const PROBE: &str = ".kache-atime-probe";
 const ARMED_DIR: &str = "unit-prune";
 
 /// What [`prune`] removed from one target directory.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub(crate) struct Pruned {
     pub(crate) units: usize,
     pub(crate) bytes: u64,
@@ -330,6 +330,44 @@ fn judge(cache_dir: &Path, target_dir: &Path, window: Duration, now: SystemTime)
     pruned
 }
 
+/// What [`prune`] would remove from `target_dir` at `now` for `window`. Reads
+/// only: nothing is removed or armed, and no lock is taken.
+pub(crate) fn preview(
+    cache_dir: &Path,
+    target_dir: &Path,
+    window: Duration,
+    now: SystemTime,
+) -> Pruned {
+    let Step::Judge(armed) = step(
+        read_armed(&armed_record(cache_dir, target_dir)),
+        now,
+        window,
+    ) else {
+        return Pruned::default();
+    };
+    let mut unused = Pruned::default();
+    for profile in profiles(target_dir) {
+        let outputs = outputs(&profile);
+        for unit in units(&profile) {
+            if let Some((_, bytes)) = stale(&unit, &outputs, armed) {
+                unused.units += 1;
+                unused.bytes += bytes;
+            }
+        }
+    }
+    unused
+}
+
+/// The parts of `unit` and their bytes, when no build used it since `armed`.
+fn stale(unit: &Unit, outputs: &Outputs, armed: SystemTime) -> Option<(Vec<PathBuf>, u64)> {
+    if used_since(&unit.fingerprint(), armed) {
+        return None;
+    }
+    let parts = unit.parts(outputs);
+    let bytes = parts.iter().map(|part| size(part)).sum();
+    Some((parts, bytes))
+}
+
 /// Under each profile's locks, remove the units not used since `armed` (none
 /// when `None`) and arm the rest.
 fn sweep(target_dir: &Path, armed: Option<SystemTime>) -> Pruned {
@@ -340,17 +378,14 @@ fn sweep(target_dir: &Path, armed: Option<SystemTime>) -> Pruned {
         };
         let outputs = outputs(&profile);
         for unit in units(&profile) {
-            let fingerprint = unit.fingerprint();
-            if armed.is_some_and(|armed| !used_since(&fingerprint, armed)) {
-                let parts = unit.parts(&outputs);
-                let bytes = parts.iter().map(|part| size(part)).sum::<u64>();
+            if let Some((parts, bytes)) = armed.and_then(|armed| stale(&unit, &outputs, armed)) {
                 if remove(&parts).is_ok() {
                     pruned.units += 1;
                     pruned.bytes += bytes;
                 }
                 continue;
             }
-            arm(&fingerprint);
+            arm(&unit.fingerprint());
         }
     }
     pruned
@@ -705,6 +740,45 @@ mod tests {
             );
             let record = armed_record(&cache, &target);
             assert!(read_armed(&record).is_some());
+        }
+    }
+
+    #[test]
+    fn a_preview_reports_what_a_prune_removes_and_changes_nothing() {
+        for per_unit in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let cache = dir.path().join("cache");
+            let target = dir.path().join("target");
+            let profile = target.join("debug");
+            if per_unit {
+                per_unit_profile(&profile);
+            } else {
+                shared_profile(&profile);
+            }
+            set_times(&profile, ago(60));
+            let window = Duration::from_secs(30 * DAY);
+            let now = SystemTime::now();
+            assert_eq!(preview(&cache, &target, window, now), Pruned::default());
+            judge(&cache, &target, window, ago(40));
+            assert_eq!(preview(&cache, &target, window, ago(20)), Pruned::default());
+            let used = unit_named(&profile, NEW);
+            read_now(&used);
+            let accessed = |unit: &Unit| {
+                entries(&unit.fingerprint())
+                    .iter()
+                    .map(|file| std::fs::metadata(file).unwrap().accessed().unwrap())
+                    .collect::<Vec<_>>()
+            };
+            let before = accessed(&used);
+            let record = armed_record(&cache, &target);
+            let armed = read_armed(&record);
+            let expected = preview(&cache, &target, window, now);
+            assert_eq!(expected.units, 1, "per_unit={per_unit}");
+            assert!(expected.bytes > 0);
+            assert_eq!(units(&profile).len(), 2, "nothing removed");
+            assert_eq!(accessed(&used), before, "nothing armed");
+            assert_eq!(read_armed(&record), armed, "the record kept");
+            assert_eq!(judge(&cache, &target, window, now), expected);
         }
     }
 

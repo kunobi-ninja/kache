@@ -13,16 +13,25 @@
 //! A target directory that stays loses the build units no build used for
 //! `[cache] auto_clean_unused_units_days` (30 by default; see
 //! [`crate::unit_prune`]).
+//!
+//! With `[cache] auto_recover_min_free_bytes` set, a volume below that floor
+//! first loses the units no build used for a day, from every target on it;
+//! only then do whole targets idle for a day go, largest first, until the
+//! volume is back above the floor. [`plan`] reports what the next pass would
+//! do to one target, from the same checks.
 
 use crate::config::Config;
 use crate::maintenance::{Trigger, is_quiet, unix_now_secs};
-use crate::store::Store;
+use crate::store::{Store, TrackedTargetRoot};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 /// How often a quiet machine is checked.
 const INTERVAL: Duration = Duration::from_secs(3600);
 const DAY_SECS: u64 = 86_400;
+/// Under disk pressure, a unit no build used for this long goes before any
+/// whole target does.
+const PRESSURE_UNIT_WINDOW: Duration = Duration::from_secs(DAY_SECS);
 /// How long an orphaned target must also have gone unused, so a worktree
 /// that is moved or recreated keeps its target.
 const ORPHAN_GRACE_SECS: u64 = DAY_SECS;
@@ -40,7 +49,8 @@ fn last_check(cache_dir: &Path) -> u64 {
 }
 
 /// Why a target directory was removed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum Reason {
     /// Its workspace has been deleted.
     Orphaned,
@@ -51,7 +61,7 @@ pub(crate) enum Reason {
 }
 
 impl Reason {
-    fn describe(self) -> &'static str {
+    pub(crate) fn describe(self) -> &'static str {
         match self {
             Reason::Orphaned => "its workspace was deleted",
             Reason::Idle => "no build used it within auto_clean_idle_targets_days",
@@ -124,7 +134,7 @@ pub(crate) fn run(config: &Config, trigger: Trigger<'_>) {
             }
             for (path, bytes) in swept.reclaimed {
                 tracing::info!(
-                    "target recovery returned about {} of free space after removing {}",
+                    "target recovery returned about {} of free space from {}",
                     bytesize::ByteSize(bytes),
                     path.display()
                 );
@@ -141,7 +151,7 @@ pub(crate) struct Swept {
     pub(crate) removed: Vec<(PathBuf, Reason)>,
     /// Target directories that stayed and lost unused units.
     pub(crate) pruned: Vec<(PathBuf, crate::unit_prune::Pruned)>,
-    /// Observed free-space increase after pressure-driven removal.
+    /// Observed free-space increase after each pressure-driven prune or removal.
     pub(crate) reclaimed: Vec<(PathBuf, u64)>,
 }
 
@@ -178,9 +188,7 @@ pub(crate) fn sweep(config: &Config, now: u64) -> anyhow::Result<Swept> {
         }
         let orphaned = crate::cli::workspace_is_gone(&tracked.workspace_root);
         let idle = now.saturating_sub(tracked.last_seen);
-        let intact = crate::machine::target_root_is_safe(&tracked.path, &tracked.workspace_root)
-            && crate::machine::directory_identity(&tracked.path) == Some(tracked.identity)
-            && !looks_like_a_source_root(&tracked.path);
+        let intact = intact(&tracked);
         let Some(reason) = reason(config, orphaned, idle) else {
             if let Some(window) = window.filter(|_| intact) {
                 let pruned = crate::unit_prune::prune(&config.cache_dir, &tracked.path, window, at);
@@ -209,8 +217,122 @@ pub(crate) fn sweep(config: &Config, now: u64) -> anyhow::Result<Swept> {
             ),
         }
     }
+    prune_under_pressure(config, &store, at, &mut swept)?;
     recover_under_pressure(config, &store, now, &mut swept)?;
     Ok(swept)
+}
+
+/// Still the recorded, derived target directory, and not a source tree.
+fn intact(tracked: &TrackedTargetRoot) -> bool {
+    crate::machine::target_root_is_safe(&tracked.path, &tracked.workspace_root)
+        && crate::machine::directory_identity(&tracked.path) == Some(tracked.identity)
+        && !looks_like_a_source_root(&tracked.path)
+}
+
+/// What the daemon's next quiet pass would do to one tracked target.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct Plan {
+    /// Why the whole target would go. Under pressure it goes only if its
+    /// volume is still below the floor once unused units are pruned.
+    pub(crate) remove: Option<Reason>,
+    /// Unused build units that would go while the target stays.
+    pub(crate) units: crate::unit_prune::Pruned,
+}
+
+/// What [`sweep`] would do to `tracked` at `now`, from the same checks,
+/// without changing anything.
+pub(crate) fn plan(config: &Config, tracked: &TrackedTargetRoot, now: u64) -> Plan {
+    if tracked.discovered {
+        return Plan::default();
+    }
+    let at = SystemTime::UNIX_EPOCH + Duration::from_secs(now);
+    let now = i64::try_from(now).unwrap_or(i64::MAX);
+    let intact = intact(tracked);
+    let orphaned = crate::cli::workspace_is_gone(&tracked.workspace_root);
+    let reason = reason(config, orphaned, now.saturating_sub(tracked.last_seen));
+    if let Some(reason) = reason.filter(|_| intact && !crate::cli::target_in_use(&tracked.path)) {
+        return Plan {
+            remove: Some(reason),
+            ..Plan::default()
+        };
+    }
+    if !intact {
+        return Plan::default();
+    }
+    let pressured = under_pressure(config, tracked);
+    let window = unit_plan_window(
+        pressured,
+        reason.is_some(),
+        unit_window(config.auto_clean_unused_units_days),
+    );
+    Plan {
+        remove: (pressured
+            && pressure_eligible(config, tracked, now)
+            && crate::cli::target_reclaimable_bytes(&tracked.path) > 0)
+            .then_some(Reason::Pressure),
+        units: window.map_or_else(Default::default, |window| {
+            crate::unit_prune::preview(&config.cache_dir, &tracked.path, window, at)
+        }),
+    }
+}
+
+/// The unit window a pass judges a staying target by: a day under pressure,
+/// otherwise the configured one, and none for a target it would have removed
+/// but a build held.
+fn unit_plan_window(
+    pressured: bool,
+    selected: bool,
+    configured: Option<Duration>,
+) -> Option<Duration> {
+    if pressured {
+        Some(PRESSURE_UNIT_WINDOW)
+    } else if selected {
+        None
+    } else {
+        configured
+    }
+}
+
+/// Whether `tracked` is a recorded target on a local volume below the
+/// configured free-space floor.
+fn under_pressure(config: &Config, tracked: &TrackedTargetRoot) -> bool {
+    let floor = config.auto_recover_min_free_bytes;
+    if floor == 0 || tracked.discovered {
+        return false;
+    }
+    let Some(true) = crate::cache_fs::probe(&tracked.path).is_local else {
+        return false;
+    };
+    kache_fs::volume_usage(&tracked.path)
+        .is_some_and(|usage| floor <= usage.total && volume_below_floor(usage.free, floor))
+}
+
+/// On a volume below the floor, remove the units no build used for a day
+/// from each target on it, until the volume is back above the floor.
+fn prune_under_pressure(
+    config: &Config,
+    store: &Store,
+    at: SystemTime,
+    swept: &mut Swept,
+) -> anyhow::Result<()> {
+    for tracked in store.tracked_target_roots(0)? {
+        if !under_pressure(config, &tracked) || !intact(&tracked) {
+            continue;
+        }
+        let Some(before) = kache_fs::volume_usage(&tracked.path) else {
+            continue;
+        };
+        let pruned =
+            crate::unit_prune::prune(&config.cache_dir, &tracked.path, PRESSURE_UNIT_WINDOW, at);
+        if pruned.units == 0 {
+            continue;
+        }
+        let freed = kache_fs::volume_usage(&tracked.path)
+            .map_or(0, |after| after.free.saturating_sub(before.free));
+        swept.reclaimed.push((tracked.path.clone(), freed));
+        swept.pruned.push((tracked.path, pruned));
+    }
+    Ok(())
 }
 
 struct PressureCandidate {
@@ -223,26 +345,10 @@ struct PressureCandidate {
 
 /// The daemon's whole-target pressure policy, also used by `kache targets`
 /// to preview which paths it may remove on its next quiet pass.
-pub(crate) fn pressure_eligible(
-    config: &Config,
-    tracked: &crate::store::TrackedTargetRoot,
-    now: i64,
-) -> bool {
-    let floor = config.auto_recover_min_free_bytes;
-    if floor == 0 || tracked.discovered || now.saturating_sub(tracked.last_seen) < DAY_SECS as i64 {
-        return false;
-    }
-    let Some(true) = crate::cache_fs::probe(&tracked.path).is_local else {
-        return false;
-    };
-    let Some(usage) = kache_fs::volume_usage(&tracked.path) else {
-        return false;
-    };
-    floor <= usage.total
-        && volume_below_floor(usage.free, floor)
-        && crate::machine::target_root_is_safe(&tracked.path, &tracked.workspace_root)
-        && crate::machine::directory_identity(&tracked.path) == Some(tracked.identity)
-        && !looks_like_a_source_root(&tracked.path)
+pub(crate) fn pressure_eligible(config: &Config, tracked: &TrackedTargetRoot, now: i64) -> bool {
+    now.saturating_sub(tracked.last_seen) >= DAY_SECS as i64
+        && under_pressure(config, tracked)
+        && intact(tracked)
         && !crate::cli::target_in_use(&tracked.path)
 }
 
@@ -564,6 +670,165 @@ mod tests {
                 .is_empty()
         );
         assert!(stale.exists());
+    }
+
+    /// A unit under `target`'s debug profile, last touched long ago.
+    fn old_unit(target: &Path, hash: &str) -> PathBuf {
+        let long_ago =
+            filetime::FileTime::from_unix_time((unix_now_secs() - 80 * DAY_SECS) as i64, 0);
+        let dir = target.join("debug/build/dep").join(hash);
+        std::fs::create_dir_all(dir.join("fingerprint")).unwrap();
+        std::fs::write(dir.join("fingerprint/lib-dep"), "fp").unwrap();
+        filetime::set_file_times(dir.join("fingerprint/lib-dep"), long_ago, long_ago).unwrap();
+        dir
+    }
+
+    fn root_of(store: &Store, path: &Path) -> TrackedTargetRoot {
+        store
+            .tracked_target_roots(0)
+            .unwrap()
+            .into_iter()
+            .find(|tracked| tracked.path == path)
+            .unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pressure_prunes_units_unused_for_a_day_from_a_target_still_in_use() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let mut pressure = config(cache.path(), false, 0);
+        let store = Store::open(&pressure).unwrap();
+        let (_, live) = tracked_target(&store, root.path(), "live");
+        let stale = old_unit(&live, "0123456789abcdef");
+        let current = old_unit(&live, "fedcba9876543210");
+        let now = unix_now_secs();
+        pressure.auto_recover_min_free_bytes = kache_fs::volume_usage(&live).unwrap().total - 1;
+        // The first pass arms the target and prunes nothing.
+        assert_eq!(
+            sweep(&pressure, now - 2 * DAY_SECS).unwrap(),
+            Swept::default()
+        );
+        let read = filetime::FileTime::from_unix_time(now as i64, 0);
+        filetime::set_file_atime(current.join("fingerprint/lib-dep"), read).unwrap();
+        let planned = plan(&pressure, &root_of(&store, &live), now);
+        let swept = sweep(&pressure, now).unwrap();
+        if !crate::unit_prune::reads_visible(root.path()) {
+            assert_eq!(swept, Swept::default());
+            assert!(stale.exists());
+            return;
+        }
+        // A build used the target within the day, so it stays.
+        assert!(swept.removed.is_empty(), "{swept:?}");
+        assert_eq!(swept.pruned.len(), 1);
+        assert_eq!(swept.pruned[0].0, live);
+        assert_eq!(swept.pruned[0].1.units, 1);
+        assert_eq!(
+            planned.units, swept.pruned[0].1,
+            "the plan matched the pass"
+        );
+        assert_eq!(planned.remove, None);
+        assert_eq!(swept.reclaimed.len(), 1);
+        assert_eq!(swept.reclaimed[0].0, live);
+        assert!(!stale.exists());
+        assert!(current.exists() && live.exists());
+
+        // Above the floor, nothing is pruned.
+        let stale = old_unit(&live, "0123456789abcdef");
+        pressure.auto_recover_min_free_bytes = 1;
+        assert_eq!(
+            sweep(&pressure, now + 2 * DAY_SECS).unwrap(),
+            Swept::default()
+        );
+        assert!(stale.exists());
+        // Nor from a directory that is no longer the recorded target.
+        pressure.auto_recover_min_free_bytes = kache_fs::volume_usage(&live).unwrap().total - 1;
+        let tracked = root_of(&store, &live);
+        // `current` was armed again by the last prune and not read since.
+        assert_eq!(plan(&pressure, &tracked, now + 2 * DAY_SECS).units.units, 2);
+        std::fs::remove_file(live.join("CACHEDIR.TAG")).unwrap();
+        assert_eq!(
+            plan(&pressure, &tracked, now + 2 * DAY_SECS),
+            Plan::default()
+        );
+        assert!(
+            sweep(&pressure, now + 2 * DAY_SECS)
+                .unwrap()
+                .pruned
+                .is_empty()
+        );
+        assert!(stale.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_plan_says_what_the_next_pass_does_without_doing_it() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let mut policy = config(cache.path(), false, 3);
+        let store = Store::open(&policy).unwrap();
+        let (workspace, live) = tracked_target(&store, root.path(), "live");
+        std::fs::write(live.join("debug/artifact"), vec![7; 64 * 1024]).unwrap();
+        let now = unix_now_secs();
+        let tracked = root_of(&store, &live);
+        assert_eq!(plan(&policy, &tracked, now), Plan::default());
+        assert_eq!(
+            plan(&policy, &tracked, now + 3 * DAY_SECS).remove,
+            Some(Reason::Idle)
+        );
+        let lock = std::fs::File::create(live.join("debug/.cargo-lock")).unwrap();
+        lock.lock().unwrap();
+        assert_eq!(plan(&policy, &tracked, now + 3 * DAY_SECS), Plan::default());
+        drop(lock);
+
+        policy.auto_clean_idle_targets_days = 0;
+        policy.auto_recover_min_free_bytes = kache_fs::volume_usage(&live).unwrap().total - 1;
+        assert_eq!(plan(&policy, &tracked, now).remove, None, "used today");
+        assert_eq!(
+            plan(&policy, &tracked, now + 2 * DAY_SECS).remove,
+            Some(Reason::Pressure)
+        );
+        std::fs::remove_file(live.join("CACHEDIR.TAG")).unwrap();
+        assert_eq!(plan(&policy, &tracked, now + 2 * DAY_SECS), Plan::default());
+        std::fs::write(
+            live.join("CACHEDIR.TAG"),
+            "Signature: 8a477f597d28d172789f06886806bc55\n",
+        )
+        .unwrap();
+
+        policy.auto_clean_idle_targets_days = 3;
+        std::fs::remove_file(live.join("CACHEDIR.TAG")).unwrap();
+        assert_eq!(
+            plan(&policy, &tracked, now + 3 * DAY_SECS),
+            Plan::default(),
+            "not the recorded target"
+        );
+        std::fs::write(
+            live.join("CACHEDIR.TAG"),
+            "Signature: 8a477f597d28d172789f06886806bc55\n",
+        )
+        .unwrap();
+        store.forget_target_root(&live).unwrap();
+        store
+            .remember_discovered_target_root(&live, &workspace)
+            .unwrap();
+        let discovered = root_of(&store, &live);
+        assert_eq!(
+            plan(&policy, &discovered, now + 3 * DAY_SECS),
+            Plan::default()
+        );
+        assert!(live.join("debug/artifact").exists());
+    }
+
+    #[test]
+    fn a_staying_target_is_judged_by_a_day_under_pressure() {
+        let configured = Some(Duration::from_secs(30 * DAY_SECS));
+        let day = Some(Duration::from_secs(DAY_SECS));
+        assert_eq!(unit_plan_window(true, false, configured), day);
+        assert_eq!(unit_plan_window(true, true, None), day);
+        assert_eq!(unit_plan_window(false, true, configured), None);
+        assert_eq!(unit_plan_window(false, false, configured), configured);
+        assert_eq!(unit_plan_window(false, false, None), None);
     }
 
     #[test]

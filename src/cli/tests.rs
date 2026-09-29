@@ -6190,7 +6190,7 @@ fn row(workspace: &str, state: TargetState, reclaimable: u64) -> TargetRow {
         state,
         idle_seconds: Some(3 * 86_400),
         discovered: false,
-        recovery_candidate: false,
+        next_pass: Default::default(),
         profiles: vec!["debug".to_string()],
         apparent_bytes: reclaimable * 2,
         reclaimable_bytes: reclaimable,
@@ -6213,6 +6213,50 @@ fn json_targets_suggest_the_orphan_clean_only_when_a_worktree_is_gone() {
 }
 
 #[test]
+fn a_target_says_what_the_next_pass_does_to_it() {
+    use crate::target_cleanup::{Plan, Reason};
+    use crate::unit_prune::Pruned;
+    let one_unit = Plan {
+        remove: None,
+        units: Pruned {
+            units: 1,
+            bytes: 2048,
+        },
+    };
+    assert_eq!(
+        next_pass_note(&one_unit),
+        "  (next pass prunes 1 unused unit (2.0 KiB))"
+    );
+    let both = Plan {
+        remove: Some(Reason::Pressure),
+        units: Pruned {
+            units: 3,
+            bytes: 1024,
+        },
+    };
+    assert_eq!(
+        next_pass_note(&both),
+        "  (next pass prunes 3 unused units (1.0 KiB), then removes it if the volume is still below the free-space floor)"
+    );
+    let idle = Plan {
+        remove: Some(Reason::Idle),
+        units: Pruned::default(),
+    };
+    assert_eq!(
+        next_pass_note(&idle),
+        "  (next pass removes it: no build used it within auto_clean_idle_targets_days)"
+    );
+    assert_eq!(next_pass_note(&Plan::default()), "");
+    let mut planned = row("/wt/a", TargetState::Live, 1024);
+    planned.next_pass = idle;
+    let rendered = render_targets(&[planned]).join("\n");
+    assert!(
+        rendered.contains("/wt/a  (next pass removes it: no build used it"),
+        "{rendered}"
+    );
+}
+
+#[test]
 fn the_targets_table_totals_and_points_at_deleted_worktrees() {
     let one = render_targets(&[row("/wt/a", TargetState::Live, 1024)]).join("\n");
     assert!(
@@ -6221,6 +6265,7 @@ fn the_targets_table_totals_and_points_at_deleted_worktrees() {
     );
     assert!(one.contains("3d  /wt/a"), "{one}");
     assert!(!one.contains("deleted"), "{one}");
+    assert!(!one.contains("next pass"), "{one}");
 
     let rows = [
         row("/wt/a", TargetState::Live, 1024),
@@ -6306,7 +6351,7 @@ fn target_rows_report_each_worktree_and_sort_by_what_frees_most() {
         "{rows:?}"
     );
     assert_eq!(rows[1].profiles, ["debug"]);
-    assert!(rows.iter().all(|row| !row.recovery_candidate));
+    assert!(rows.iter().all(|row| row.next_pass.remove.is_none()));
     #[cfg(unix)]
     {
         let mut pressure = config.clone();
@@ -6323,13 +6368,16 @@ fn target_rows_report_each_worktree_and_sort_by_what_frees_most() {
             .remember_target_root(&empty_target, &empty_workspace)
             .unwrap();
         let aged = target_rows(&pressure, now + 2 * 86_400).unwrap();
-        assert!(aged.iter().any(|row| row.recovery_candidate));
+        assert!(
+            aged.iter()
+                .any(|row| row.next_pass.remove == Some(crate::target_cleanup::Reason::Pressure))
+        );
         let empty = aged
             .iter()
             .find(|row| row.path == empty_target.display().to_string())
             .unwrap();
         assert_eq!(empty.reclaimable_bytes, 0);
-        assert!(!empty.recovery_candidate);
+        assert_eq!(empty.next_pass.remove, None);
     }
 }
 

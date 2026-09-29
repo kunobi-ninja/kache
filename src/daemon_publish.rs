@@ -18,7 +18,9 @@
 //! - The daemon answers `ok` only once the job is queued behind that lock.
 //!   An atomic receipt resolves lost replies: the daemon renames pending
 //!   to accepted before enqueueing; the wrapper can cancel by removing pending.
-//!   A declined or cancelled request falls back to wrapper publication.
+//!   A refusal before the daemon holds the key falls back to the wrapper.
+//!   A cancellation after the daemon has snapshotted and holds the key is
+//!   published by the daemon, so a slow snapshot cannot drop the compile.
 //! - The daemon owns the handoff files from acceptance on and removes them
 //!   once the put has copied them. A daemon that dies with jobs queued loses
 //!   those stores, never a build: the compile has already produced its
@@ -247,10 +249,14 @@ impl Daemon {
                 .collect::<Vec<_>>();
             let owned = snapshot_for_handoff(&config, &files)?;
             // Rename and client cancellation race on the same pending file.
-            // Exactly one wins, even if the socket reply is lost.
+            // Exactly one wins, even if the socket reply is lost. A missing
+            // receipt means the wrapper already gave up. It publishes only if
+            // it can take the key back, so keep these snapshots and the claim.
             if let Err(error) = accept_receipt(&request) {
-                remove_handoff_files(&owned);
-                return Err(error);
+                if !receipt_cancelled(&error) {
+                    remove_handoff_files(&owned);
+                    return Err(error);
+                }
             }
             remove_handoff_files(&request.files);
             let mut request = request;
@@ -577,6 +583,17 @@ impl Drop for HandoffReceipt {
 fn accept_receipt(request: &PublishCcRequest) -> Result<()> {
     let (pending, accepted) = receipt_paths(request)?;
     std::fs::rename(pending, accepted).context("handoff cancelled before acceptance")
+}
+
+/// The wrapper removes `pending` to cancel. `rename` then fails with
+/// [`std::io::ErrorKind::NotFound`]. Every other failure still has a receipt
+/// the wrapper may publish from, so the daemon must release the key.
+fn receipt_cancelled(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+    })
 }
 
 fn finish_handoff(receipt: &HandoffReceipt, reply: Result<String>) -> Handoff {
@@ -1310,8 +1327,12 @@ mod tests {
         assert_eq!(std::fs::read_dir(handoff_dir(&config)).unwrap().count(), 0);
     }
 
+    /// The wrapper's 25 ms budget ran out and it removed the receipt. The
+    /// daemon already holds the key, so it stores the snapshot itself. While
+    /// that job is queued the wrapper's reclaim sees the key held; after the
+    /// put it sees a commit and does not store a second copy.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_timed_out_wrapper_cancels_a_late_publication() {
+    async fn a_cancelled_receipt_is_published_when_the_daemon_holds_the_key() {
         let dir = tempfile::tempdir().unwrap();
         let config = crate::test_support::test_config(dir.path().join("cache"));
         let daemon = Arc::new(Daemon::new(config.clone()));
@@ -1324,8 +1345,55 @@ mod tests {
             Handoff::Declined("timed out".to_string()),
         );
         let response = daemon.handle_publish_cc(request.clone()).await;
-        assert!(!response.ok);
-        assert!(response.error.unwrap().contains("cancelled"));
+        assert!(response.ok, "{response:?}");
+        let job = rx.try_recv().expect("the cancelled hand-off is queued");
+        assert_eq!(job.request.cache_key, request.cache_key);
+        assert_ne!(job.request.files, request.files);
+        assert_eq!(
+            std::fs::read(&job.request.files[0].path).unwrap(),
+            b"object bytes"
+        );
+        let store = Store::open(&config).unwrap();
+        assert!(matches!(
+            store.claim_build(&request.cache_key).unwrap(),
+            BuildClaim::Contended
+        ));
+        publish_one(&daemon, &config, &store, job);
+        assert!(store.get(&request.cache_key).unwrap().is_some());
+        assert!(matches!(
+            store.claim_build(&request.cache_key).unwrap(),
+            BuildClaim::Committed(_)
+        ));
+        let events = crate::events::read_events(&config.event_log_path()).unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(
+            events[0].store_error.is_empty(),
+            "{:?}",
+            events[0].store_error
+        );
+        drop(receipt);
+        assert_eq!(std::fs::read_dir(handoff_dir(&config)).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_receipt_rename_that_is_not_cancellation_still_frees_the_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::test_support::test_config(dir.path().join("cache"));
+        let daemon = Arc::new(Daemon::new(config.clone()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        daemon.publish_queue().set_sender(tx);
+        let request = handoff_request(&config, &key("rename-denied"), dir.path());
+        let receipt = HandoffReceipt::new(&request).unwrap();
+        let parent = receipt.pending.parent().unwrap();
+        let original = std::fs::metadata(parent).unwrap().permissions();
+        let mut readonly = original.clone();
+        readonly.set_readonly(true);
+        std::fs::set_permissions(parent, readonly).unwrap();
+        let response = daemon.handle_publish_cc(request.clone()).await;
+        std::fs::set_permissions(parent, original).unwrap();
+        assert!(!response.ok, "{response:?}");
+        assert!(response.error.unwrap().contains("snapshot failed"));
         assert!(matches!(
             rx.try_recv(),
             Err(tokio::sync::mpsc::error::TryRecvError::Empty)
@@ -1335,14 +1403,25 @@ mod tests {
             store.claim_build(&request.cache_key).unwrap(),
             BuildClaim::Acquired(_)
         ));
-        assert!(!config.event_log_path().exists());
-        assert_eq!(
-            std::fs::read(&request.files[0].path).unwrap(),
-            b"object bytes"
-        );
         drop(receipt);
         remove_handoff_files(&request.files);
-        assert_eq!(std::fs::read_dir(handoff_dir(&config)).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn only_a_missing_receipt_counts_as_cancellation() {
+        let cancelled =
+            anyhow::Error::from(std::io::Error::new(std::io::ErrorKind::NotFound, "rename"))
+                .context("handoff cancelled before acceptance");
+        let denied = anyhow::Error::from(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "rename",
+        ))
+        .context("handoff cancelled before acceptance");
+        assert!(receipt_cancelled(&cancelled));
+        assert!(!receipt_cancelled(&denied));
+        assert!(!receipt_cancelled(&anyhow::Error::msg(
+            "handoff cancelled before acceptance"
+        )));
     }
 
     #[test]

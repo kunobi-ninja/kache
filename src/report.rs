@@ -321,6 +321,10 @@ pub struct BuildReport {
     pub suggestions: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gc: Option<GcSummary>,
+    /// Transfers with both a start and a finish, in log order. Empty for a
+    /// root-filtered report, which does not load the transfer log.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub timed_transfers: Vec<TransferSpan>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -817,6 +821,9 @@ pub struct TraceArgs {
     pub route: String,
     pub reason: String,
     pub cache_key: String,
+    /// Object file recorded on a C or C++ event. Empty for rustc.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub object_output: String,
     pub elapsed_ms: u64,
     pub compile_time_ms: u64,
     pub overhead_ms: u64,
@@ -905,6 +912,8 @@ pub struct CrateDetail {
     pub overhead_ms: u64,
     pub size: u64,
     pub cache_key: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub object_output: String,
     #[serde(default)]
     pub store_output_blobs: u32,
     #[serde(default)]
@@ -988,6 +997,19 @@ pub struct TransferDetail {
     pub blobs_total: u32,
     pub throughput_mbps: f64,
     pub ok: bool,
+}
+
+/// One remote transfer placed on the chrome trace as an async `b`/`e` pair.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TransferSpan {
+    pub direction: String,
+    pub crate_name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub cache_key: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub object_key: String,
+    pub started_at_unix_ms: u64,
+    pub finished_at_unix_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1156,6 +1178,9 @@ pub fn generate_report_with_filter(
         total_cacheable,
         total_hits,
     );
+    if let Some(alarm) = unexplained_suggestion(&build_events) {
+        suggestions.push(alarm);
+    }
     if let Some(cut) = events::session_cut_by_rotation(&config.event_log_path())
         && build_events.iter().any(|event| event.session_id == cut)
     {
@@ -1319,6 +1344,7 @@ pub fn generate_report_with_filter(
         } else {
             load_gc_summary_all(config, since)
         },
+        timed_transfers: timed_transfer_spans(&transfers),
     })
 }
 
@@ -1362,7 +1388,7 @@ fn select_last_build(events: &mut Vec<BuildEvent>) -> Result<ReportSession> {
     Ok(session)
 }
 
-fn normalize_filter_root(root: &Path) -> String {
+pub(crate) fn normalize_filter_root(root: &Path) -> String {
     let abs = if root.is_absolute() {
         root.to_path_buf()
     } else {
@@ -1572,6 +1598,7 @@ fn to_trace_event(event: &BuildEvent, lane: u32) -> TraceEvent {
             route: bypass_route(event).to_string(),
             reason: bypass_reason(event),
             cache_key: event.cache_key.clone(),
+            object_output: event.object_output.clone(),
             elapsed_ms: event.elapsed_ms,
             compile_time_ms: event.compile_time_ms,
             overhead_ms,
@@ -1720,6 +1747,7 @@ fn to_crate_detail(e: &BuildEvent) -> CrateDetail {
         overhead_ms: overhead,
         size: e.size,
         cache_key: e.cache_key.clone(),
+        object_output: e.object_output.clone(),
         store_output_blobs: e.store_output_blobs,
         store_duplicate_blobs: e.store_duplicate_blobs,
         store_new_blobs: e.store_new_blobs,
@@ -2607,6 +2635,132 @@ fn push_bypass_tables(lines: &mut Vec<String>, bypass: &BypassAnalysis) {
     }
 }
 
+/// Transfers that have both timestamps. A zero start or a zero finish is an
+/// older record, and it is not a span.
+pub(crate) fn timed_transfer_spans(transfers: &[TransferEvent]) -> Vec<TransferSpan> {
+    transfers
+        .iter()
+        .filter(|event| event.started_at_unix_ms != 0 && event.finished_at_unix_ms != 0)
+        .map(|event| TransferSpan {
+            direction: match event.direction {
+                TransferDirection::Upload => "upload".to_string(),
+                TransferDirection::Download => "download".to_string(),
+            },
+            crate_name: event.crate_name.clone(),
+            cache_key: event.cache_key.clone(),
+            object_key: event.object_key.clone(),
+            started_at_unix_ms: event.started_at_unix_ms,
+            finished_at_unix_ms: event.finished_at_unix_ms,
+        })
+        .collect()
+}
+
+fn transfer_trace_us(unix_ms: u64) -> i64 {
+    (unix_ms as i64) * 1000
+}
+
+fn append_transfer_spans(out: &mut Vec<serde_json::Value>, spans: &[TransferSpan]) {
+    for (index, span) in spans.iter().enumerate() {
+        let id = format!("transfer-{index}");
+        out.push(transfer_edge(span, "b", &id));
+        out.push(transfer_edge(span, "e", &id));
+    }
+}
+
+fn transfer_edge(span: &TransferSpan, ph: &str, id: &str) -> serde_json::Value {
+    let ms = if ph == "b" {
+        span.started_at_unix_ms
+    } else {
+        span.finished_at_unix_ms
+    };
+    serde_json::json!({
+        "name": format!("{} {}", span.direction, span.crate_name),
+        "cat": "kache.transfer",
+        "ph": ph,
+        "ts": transfer_trace_us(ms),
+        "pid": 1,
+        "tid": 0,
+        "id": id,
+        "args": {
+            "cache_key": span.cache_key,
+            "object_key": span.object_key,
+            "crate_name": span.crate_name,
+        }
+    })
+}
+
+fn unexplained_suggestion(events: &[BuildEvent]) -> Option<String> {
+    let indices: Vec<usize> = (0..events.len()).collect();
+    let unexplained = crate::tui_sessions::unexplained_misses(events, &indices);
+    let misses = events
+        .iter()
+        .filter(|event| matches!(event.result, EventResult::Miss | EventResult::Dup))
+        .count();
+    unexplained_alarm_line(unexplained, misses)
+}
+
+/// The report line for unexplained misses, or nothing when there is no count
+/// to compare.
+pub(crate) fn unexplained_alarm_line(unexplained: usize, misses: usize) -> Option<String> {
+    if unexplained == 0 || misses == 0 {
+        return None;
+    }
+    let share = (unexplained as u64).saturating_mul(100) / (misses as u64);
+    Some(format!(
+        "{unexplained} unexplained misses ({share}% of misses) have no recorded cause"
+    ))
+}
+
+fn redact_owned(value: &mut String) {
+    if !value.is_empty() {
+        *value = "redacted".to_string();
+    }
+}
+
+fn redact_trace_args(args: &mut TraceArgs) {
+    redact_owned(&mut args.cache_key);
+    redact_owned(&mut args.root);
+    redact_owned(&mut args.object_output);
+}
+
+/// Replace cache keys, roots, object keys, and object paths before a report
+/// is written out. Empty fields stay empty. Free-form store errors are left
+/// as recorded.
+pub fn redact_report(report: &mut BuildReport) {
+    if let Some(root) = report.meta.root_filter.as_mut() {
+        redact_owned(root);
+    }
+    if let Some(session) = report.meta.session.as_mut() {
+        redact_owned(&mut session.root);
+    }
+    for event in &mut report.trace_events {
+        redact_trace_args(&mut event.args);
+    }
+    for detail in report
+        .top_misses
+        .iter_mut()
+        .chain(report.top_hits.iter_mut())
+        .chain(report.all_events.iter_mut())
+    {
+        redact_owned(&mut detail.root);
+        redact_owned(&mut detail.cache_key);
+        redact_owned(&mut detail.object_output);
+    }
+    for error in &mut report.errors_detail {
+        redact_owned(&mut error.cache_key);
+    }
+    if let Some(network) = report.network.as_mut() {
+        for download in &mut network.slowest_downloads {
+            redact_owned(&mut download.cache_key);
+            redact_owned(&mut download.object_key);
+        }
+    }
+    for span in &mut report.timed_transfers {
+        redact_owned(&mut span.cache_key);
+        redact_owned(&mut span.object_key);
+    }
+}
+
 pub fn format_json(report: &BuildReport) -> Result<String> {
     Ok(serde_json::to_string_pretty(report)?)
 }
@@ -2646,6 +2800,7 @@ pub fn format_trace_json(report: &BuildReport) -> Result<String> {
             trace_events.push(serde_json::to_value(phase)?);
         }
     }
+    append_transfer_spans(&mut trace_events, &report.timed_transfers);
 
     Ok(serde_json::to_string_pretty(&TraceOutput {
         display_time_unit: &report.display_time_unit,

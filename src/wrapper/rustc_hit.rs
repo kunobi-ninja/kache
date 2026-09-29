@@ -55,6 +55,7 @@ impl RustcHitContext<'_> {
             lookup_ms,
             restore_ms,
             key_record: key_record.clone(),
+            object_output: String::new(),
         }
         .report(self.config, meta);
         record_input_prediction(self.config, prediction_store, self.args, true, key);

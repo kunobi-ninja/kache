@@ -1154,6 +1154,7 @@ pub fn run_nvcc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
                 lookup_ms,
                 restore_ms,
                 key_record: KeyEventRecord::default(),
+                object_output: recorded_object_output(parsed.object_output_path()),
             }
             .report(config, &meta);
             return Ok(0);
@@ -1228,6 +1229,7 @@ pub fn run_nvcc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
             lookup_ms,
             restore_ms,
             key_record: KeyEventRecord::default(),
+            object_output: recorded_object_output(parsed.object_output_path()),
         }
         .report(config, &meta);
         return Ok(0);
@@ -1332,7 +1334,8 @@ pub fn run_nvcc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
             .store_ms(store_ms)
             .store_put(store_put)
             .store_error(store_error)
-            .lookup_rejection(lookup_rejection),
+            .lookup_rejection(lookup_rejection)
+            .object_output(&recorded_object_output(parsed.object_output_path())),
     );
     print_progress(&crate_name, event_result, elapsed, size);
     Ok(result.exit_code)
@@ -1374,7 +1377,8 @@ fn nvcc_passthrough_with_event<R: Into<String>>(
             start.elapsed().as_millis() as u64,
             reason.into(),
             &output,
-        ),
+        )
+        .object_output(&recorded_object_output(parsed.object_output_path())),
     );
     Ok(output.exit_code)
 }
@@ -1588,6 +1592,7 @@ fn nvcc_try_remote_hit(
         lookup_ms,
         restore_ms,
         key_record: KeyEventRecord::default(),
+        object_output: recorded_object_output(parsed.object_output_path()),
     }
     .report(config, &meta);
     Ok(Some(0))
@@ -1974,6 +1979,7 @@ fn run_cc_with_store(
                 lookup_ms,
                 restore_ms,
                 key_record: KeyEventRecord::default(),
+                object_output: recorded_object_output(parsed.object_output_path()),
             }
             .report(config, &meta);
             drop(trace_report);
@@ -2094,6 +2100,7 @@ fn run_cc_with_store(
             lookup_ms,
             restore_ms,
             key_record: KeyEventRecord::default(),
+            object_output: recorded_object_output(parsed.object_output_path()),
         }
         .report(config, &meta);
         compiler.commit_preprocess_memo(&file_hasher);
@@ -2312,7 +2319,8 @@ fn run_cc_with_store(
             .store_ms(store_ms)
             .store_put(store_put)
             .store_error(store_error)
-            .lookup_rejection(lookup_rejection),
+            .lookup_rejection(lookup_rejection)
+            .object_output(&recorded_object_output(parsed.object_output_path())),
     );
     print_progress(crate_name, event_result, elapsed, size);
     Ok(result.exit_code)
@@ -2985,6 +2993,7 @@ fn cc_try_remote_hit(
         lookup_ms,
         restore_ms,
         key_record: KeyEventRecord::default(),
+        object_output: recorded_object_output(parsed.object_output_path()),
     }
     .report(config, &meta);
     compiler.commit_preprocess_memo(file_hasher);
@@ -7071,7 +7080,8 @@ fn cc_passthrough_with_event<R: Into<String>>(
             start.elapsed().as_millis() as u64,
             reason.into(),
             &output,
-        ),
+        )
+        .object_output(&recorded_object_output(parsed.object_output_path())),
     );
     Ok(output.exit_code)
 }
@@ -7096,7 +7106,8 @@ fn cc_direct_passthrough_with_event<R: Into<String>>(
             start.elapsed().as_millis() as u64,
             reason.into(),
             &output,
-        ),
+        )
+        .object_output(&recorded_object_output(parsed.object_output_path())),
     );
     Ok(output.exit_code)
 }
@@ -7120,6 +7131,7 @@ pub(crate) struct EventInputs<'a> {
     store_ms: u64,
     store_put: StorePutResult,
     passthrough_reason: String,
+    object_output: String,
     store_error: String,
     lookup_rejection: String,
     fallback: bool,
@@ -7150,6 +7162,7 @@ impl<'a> EventInputs<'a> {
             store_ms: 0,
             store_put: StorePutResult::default(),
             passthrough_reason: String::new(),
+            object_output: String::new(),
             store_error: String::new(),
             lookup_rejection: String::new(),
             fallback: false,
@@ -7232,6 +7245,12 @@ impl<'a> EventInputs<'a> {
 
     fn passthrough_reason(mut self, reason: String) -> Self {
         self.passthrough_reason = reason;
+        self
+    }
+
+    /// Object path a C or C++ invocation named. Empty when it named none.
+    pub(crate) fn object_output(mut self, object_output: &str) -> Self {
+        self.object_output = object_output.to_string();
         self
     }
 
@@ -7357,6 +7376,7 @@ pub(crate) fn build_event_details(config: &Config, inputs: EventInputs<'_>) -> B
         store_ms,
         store_put,
         passthrough_reason,
+        object_output,
         store_error,
         lookup_rejection,
         fallback,
@@ -7406,6 +7426,7 @@ pub(crate) fn build_event_details(config: &Config, inputs: EventInputs<'_>) -> B
         (String::new(), Default::default())
     };
     let key_diff = explain_miss_diff(config, root, crate_name, result, cache_key, &key_fields);
+    let miss_reason = events::MissReason::classify(&passthrough_reason);
     BuildEvent {
         ts: Utc::now(),
         crate_name: crate_name.to_string(),
@@ -7416,7 +7437,7 @@ pub(crate) fn build_event_details(config: &Config, inputs: EventInputs<'_>) -> B
         compile_time_ms,
         size,
         cache_key: cache_key.to_string(),
-        schema: 21,
+        schema: 22,
         demands: crate::demand::take(),
         session_id,
         key_ms,
@@ -7458,6 +7479,8 @@ pub(crate) fn build_event_details(config: &Config, inputs: EventInputs<'_>) -> B
         restore_copy_exclusive_bytes: crate::opcounts::restore_copy_exclusive_bytes(),
         restore_copy_other_bytes: crate::opcounts::restore_copy_other_bytes(),
         passthrough_reason,
+        miss_reason,
+        object_output,
         store_error,
         store_handed_off: false,
         daemon_store_ms: 0,
@@ -7472,6 +7495,14 @@ pub(crate) fn build_event_details(config: &Config, inputs: EventInputs<'_>) -> B
         key_externs_recorded,
         unit_id,
         extern_units,
+    }
+}
+
+/// The object path to record, or empty when the invocation named none.
+pub(crate) fn recorded_object_output(path: Option<std::path::PathBuf>) -> String {
+    match path {
+        Some(path) if !path.as_os_str().is_empty() => path.to_string_lossy().into_owned(),
+        _ => String::new(),
     }
 }
 

@@ -1450,6 +1450,8 @@ fn sample_build_event(
         key_externs_recorded: false,
         unit_id: String::new(),
         extern_units: Default::default(),
+        miss_reason: events::MissReason::None,
+        object_output: String::new(),
     }
 }
 

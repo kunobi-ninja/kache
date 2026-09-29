@@ -5,6 +5,49 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
+/// Coarse class of a free-form passthrough reason.
+///
+/// Old logs omit the field. `None` is the same absence: a hit, a miss, or a
+/// passthrough whose reason is empty.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MissReason {
+    #[default]
+    None,
+    NotACompile,
+    Unsupported,
+    Refused,
+    Other,
+}
+
+impl MissReason {
+    /// Classify the wrapper's free-form reason. `kind|detail`, and the legacy
+    /// `refused:` prefix, map onto the typed arms. Anything else is [`Other`].
+    pub(crate) fn classify(reason: &str) -> Self {
+        let reason = reason.trim();
+        if reason.is_empty() {
+            return Self::None;
+        }
+        let kind = if let Some((kind, _)) = reason.split_once('|') {
+            kind.trim()
+        } else if reason.starts_with("refused:") {
+            "refused"
+        } else {
+            ""
+        };
+        match kind {
+            "not-a-compile" => Self::NotACompile,
+            "unsupported" => Self::Unsupported,
+            "refused" => Self::Refused,
+            _ => Self::Other,
+        }
+    }
+
+    fn is_none(&self) -> bool {
+        *self == Self::None
+    }
+}
+
 /// A single build event logged by the wrapper.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BuildEvent {
@@ -48,6 +91,7 @@ pub struct BuildEvent {
     /// 19 = fallback attempt and recovery details.
     /// 20 = per-key first-demand timestamps and remote-check wait.
     /// 21 = daemon publication and its background store time.
+    /// 22 = typed miss reason and the C/C++ object output.
     #[serde(default)]
     pub schema: u32,
     /// Build session this event belongs to (kunobi-ninja/kache#583 P0.5).
@@ -320,6 +364,13 @@ pub struct BuildEvent {
     /// that suffix simply has no entry and the walk falls back to name matching.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub extern_units: std::collections::BTreeMap<String, String>,
+    /// Typed class of [`Self::passthrough_reason`]. Schema 22.
+    #[serde(default, skip_serializing_if = "MissReason::is_none")]
+    pub miss_reason: MissReason,
+    /// Object file a C or C++ compile named with `-o`. Empty for rustc and
+    /// for an invocation that named no object. Schema 22.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub object_output: String,
 }
 
 impl BuildEvent {
@@ -1596,6 +1647,8 @@ impl BuildEvent {
             key_externs_recorded: false,
             unit_id: String::new(),
             extern_units: Default::default(),
+            miss_reason: MissReason::None,
+            object_output: String::new(),
         }
     }
 }
@@ -1756,6 +1809,8 @@ mod tests {
             key_externs_recorded: false,
             unit_id: String::new(),
             extern_units: Default::default(),
+            miss_reason: MissReason::None,
+            object_output: String::new(),
         };
 
         log_event(&log_path, &event).unwrap();
@@ -1765,6 +1820,56 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].crate_name, "serde");
         assert_eq!(events[0].result, EventResult::LocalHit);
+    }
+
+    #[test]
+    fn miss_reason_classifies_each_arm_and_old_logs_omit_none() {
+        assert_eq!(MissReason::classify(""), MissReason::None);
+        assert_eq!(MissReason::classify("   "), MissReason::None);
+        assert_eq!(
+            MissReason::classify(" not-a-compile| "),
+            MissReason::NotACompile
+        );
+        assert_eq!(
+            MissReason::classify("unsupported|link mode"),
+            MissReason::Unsupported
+        );
+        assert_eq!(
+            MissReason::classify("refused: linker invocation"),
+            MissReason::Refused
+        );
+        assert_eq!(
+            MissReason::classify("refused|linker invocation"),
+            MissReason::Refused
+        );
+        assert_eq!(
+            MissReason::classify("compiler spawn failed"),
+            MissReason::Other
+        );
+
+        let none = BuildEvent::new_for_test("a", EventResult::LocalHit);
+        let json = serde_json::to_value(&none).unwrap();
+        assert!(json.get("miss_reason").is_none());
+        assert!(json.get("object_output").is_none());
+
+        let mut other = BuildEvent::new_for_test("a", EventResult::Passthrough);
+        other.miss_reason = MissReason::Other;
+        other.passthrough_reason = "compiler spawn failed".to_string();
+        other.object_output = "a.o".to_string();
+        let json = serde_json::to_value(&other).unwrap();
+        assert_eq!(json["miss_reason"], "other");
+        assert_eq!(json["object_output"], "a.o");
+
+        let parsed: BuildEvent = serde_json::from_value(serde_json::json!({
+            "ts": "2026-01-01T00:00:00Z",
+            "crate_name": "a",
+            "result": "miss",
+            "elapsed_ms": 1,
+            "size": 1
+        }))
+        .unwrap();
+        assert_eq!(parsed.miss_reason, MissReason::None);
+        assert_eq!(parsed.object_output, "");
     }
 
     /// Phase arithmetic for the report and the trace: overhead excludes a

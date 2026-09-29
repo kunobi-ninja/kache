@@ -1562,6 +1562,7 @@ fn report_run(config: &Config, out: &std::path::Path, record: bool) {
         Some(out.join("report.json")),
         10,
         record,
+        false,
     )
     .unwrap();
 }
@@ -1678,6 +1679,7 @@ fn report_record_that_cannot_write_still_delivers_the_report() {
         Some(out.path().join("report.json")),
         10,
         true,
+        false,
     );
 
     assert!(result.is_ok(), "{result:?}");
@@ -4712,6 +4714,8 @@ fn build_event(
         key_externs_recorded: false,
         unit_id: String::new(),
         extern_units: Default::default(),
+        miss_reason: crate::events::MissReason::None,
+        object_output: String::new(),
     }
 }
 

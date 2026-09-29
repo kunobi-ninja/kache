@@ -57,6 +57,7 @@ mod remote_pack;
 mod remote_plan;
 mod remote_resilience;
 mod report;
+mod run_diff;
 mod scheduler;
 mod service;
 mod shards;
@@ -130,7 +131,7 @@ pub const VERSION: &str = {
 #[derive(Parser)]
 #[command(name = "kache", version = VERSION, about)]
 pub(crate) struct Cli {
-    /// Machine-readable JSON on stdout (stats, gc, clean, doctor, why-miss, list, daemon status)
+    /// Machine-readable JSON on stdout (stats, gc, clean, doctor, why-miss, diff, list, daemon status)
     #[arg(long, global = true)]
     json: bool,
 
@@ -345,6 +346,13 @@ enum Commands {
         crate_name: String,
     },
 
+    /// Compare miss counts of the two newest sessions that share a build root
+    Diff {
+        /// Only sessions recorded for this build tree
+        #[arg(long)]
+        root: Option<PathBuf>,
+    },
+
     /// Generate a detailed build report (json, trace, markdown, or text)
     Report {
         /// Output format: json, trace, perfetto, chrome-trace, markdown, github, text
@@ -377,6 +385,10 @@ enum Commands {
         /// runtime dir a CI job deletes
         #[arg(long)]
         record: bool,
+
+        /// Replace cache keys, roots, and object paths with `redacted`
+        #[arg(long)]
+        redact: bool,
     },
 
     /// Open the configuration editor
@@ -481,6 +493,7 @@ fn command_supports_json(command: &Option<Commands>) -> bool {
                 | Commands::Doctor { .. }
                 | Commands::Stats { .. }
                 | Commands::WhyMiss { .. }
+                | Commands::Diff { .. }
                 | Commands::Daemon { command: None }
                 | Commands::Daemon {
                     command: Some(DaemonCommands::Status),
@@ -787,7 +800,7 @@ fn main() -> Result<()> {
     let json = cli.json;
     if json && !command_supports_json(&cli.command) {
         anyhow::bail!(
-            "`--json` is supported on stats, gc, clean, doctor, why-miss, list, and daemon status."
+            "`--json` is supported on stats, gc, clean, doctor, why-miss, diff, list, and daemon status."
         );
     }
 
@@ -973,6 +986,7 @@ fn main() -> Result<()> {
             output,
             top,
             record,
+            redact,
         }) => {
             let window = parse_since_window(&since)?;
             cli::report(
@@ -983,6 +997,7 @@ fn main() -> Result<()> {
                 output,
                 top,
                 record,
+                redact,
             )
         }
         Some(Commands::Stats {
@@ -1021,6 +1036,7 @@ fn main() -> Result<()> {
             cli::telemetry_push(&config, &selection, &labels, dry_run)
         }
         Some(Commands::WhyMiss { crate_name }) => cli::why_miss(&config, &crate_name, json),
+        Some(Commands::Diff { root }) => run_diff::run(&config, root.as_deref(), json),
         Some(Commands::Monitor { since }) => {
             if json {
                 anyhow::bail!("`kache monitor` is interactive; use `kache stats --json`.");
@@ -1610,6 +1626,7 @@ mod tests {
 
     #[test]
     fn json_support_is_limited_to_machine_readable_commands() {
+        assert!(command_supports_json(&Some(Commands::Diff { root: None })));
         assert!(command_supports_json(&Some(Commands::Stats {
             since: "24h".to_string(),
             last_build: false,

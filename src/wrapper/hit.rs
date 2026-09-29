@@ -17,6 +17,8 @@ pub(super) struct HitCompletion<'a> {
     pub restore_ms: u64,
     /// What the hit's key recorded for the event; empty for C and C++.
     pub key_record: KeyEventRecord,
+    /// Object path for a C or C++ hit. Empty for rustc.
+    pub object_output: String,
 }
 
 impl HitCompletion<'_> {
@@ -33,7 +35,8 @@ impl HitCompletion<'_> {
                 .keyed(self.cache_key, self.key_ms, self.key_hash_stats)
                 .lookup_ms(self.lookup_ms)
                 .restore_ms(self.restore_ms)
-                .key_record(self.key_record),
+                .key_record(self.key_record)
+                .object_output(&self.object_output),
         );
         print_progress(self.crate_name, self.result, elapsed, size);
         replay_cached_diagnostics(meta, std::io::stdout(), std::io::stderr());

@@ -444,6 +444,8 @@ fn test_event(
         key_externs_recorded: false,
         unit_id: String::new(),
         extern_units: Default::default(),
+        miss_reason: crate::events::MissReason::None,
+        object_output: String::new(),
     }
 }
 
@@ -3610,4 +3612,137 @@ fn test_build_bypass_analysis_respects_top_limit() {
     assert_eq!(analysis.passthroughs, 5, "totals count all events");
     assert!(analysis.reasons.len() <= 2, "reasons truncated to top");
     assert!(analysis.slowest.len() <= 2, "slowest truncated to top");
+}
+
+#[test]
+fn unexplained_alarm_line_needs_both_counts() {
+    assert_eq!(unexplained_alarm_line(0, 4), None);
+    assert_eq!(unexplained_alarm_line(2, 0), None);
+    assert_eq!(
+        unexplained_alarm_line(1, 4).as_deref(),
+        Some("1 unexplained misses (25% of misses) have no recorded cause")
+    );
+    assert_eq!(
+        unexplained_alarm_line(2, 4).as_deref(),
+        Some("2 unexplained misses (50% of misses) have no recorded cause")
+    );
+}
+
+#[test]
+fn timed_transfers_are_async_spans_and_a_zero_timestamp_is_skipped() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = write_test_events(dir.path());
+    let mut zero_start =
+        test_transfer("skip-start", TransferDirection::Download, "v3", 10, 5, true);
+    zero_start.started_at_unix_ms = 0;
+    zero_start.finished_at_unix_ms = 5;
+    let mut zero_finish = test_transfer(
+        "skip-finish",
+        TransferDirection::Download,
+        "v3",
+        10,
+        5,
+        true,
+    );
+    zero_finish.started_at_unix_ms = 5;
+    zero_finish.finished_at_unix_ms = 0;
+    let mut download = test_transfer("serde", TransferDirection::Download, "v3", 10, 5, true);
+    download.started_at_unix_ms = 1_700_000_000_000;
+    download.finished_at_unix_ms = 1_700_000_000_010;
+    let mut upload = test_transfer("serde", TransferDirection::Upload, "v3", 10, 5, true);
+    upload.started_at_unix_ms = 1_700_000_000_020;
+    upload.finished_at_unix_ms = 1_700_000_000_030;
+    for transfer in [&zero_start, &zero_finish, &download, &upload] {
+        events::log_transfer(&config.transfer_log_path(), transfer).unwrap();
+    }
+
+    let report = generate_report(&config, SinceWindow::DEFAULT, 10).unwrap();
+    assert_eq!(report.timed_transfers.len(), 2);
+    assert_eq!(report.timed_transfers[0].direction, "download");
+    assert_eq!(report.timed_transfers[1].direction, "upload");
+
+    let raw: serde_json::Value =
+        serde_json::from_str(&format_trace_json(&report).unwrap()).unwrap();
+    let spans: Vec<_> = raw["traceEvents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|event| event["cat"] == "kache.transfer")
+        .collect();
+    assert_eq!(spans.len(), 4);
+    assert_eq!(spans[0]["ph"], "b");
+    assert_eq!(spans[1]["ph"], "e");
+    assert_eq!(spans[0]["id"], "transfer-0");
+    assert_eq!(spans[1]["id"], spans[0]["id"]);
+    assert_eq!(spans[2]["id"], "transfer-1");
+    assert_ne!(spans[0]["id"], spans[2]["id"]);
+    assert_eq!(spans[0]["ts"], 1_700_000_000_000_000i64);
+    assert_eq!(spans[1]["ts"], 1_700_000_000_010_000i64);
+    assert_eq!(spans[0]["pid"], 1);
+    assert_eq!(spans[0]["tid"], 0);
+}
+
+#[test]
+fn redact_replaces_keys_and_paths_and_leaves_empty_fields_empty() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = write_test_events(dir.path());
+    let mut report = generate_report(&config, SinceWindow::DEFAULT, 10).unwrap();
+    report.meta.root_filter = Some("/secret/tree".to_string());
+    report.all_events[0].object_output = "a.o".to_string();
+    report.all_events[0].store_error = "disk full at /secret".to_string();
+    report.trace_events[0].args.object_output = "a.o".to_string();
+    report.errors_detail.push(ErrorDetail {
+        crate_name: "empty".to_string(),
+        cache_key: String::new(),
+        timestamp: "t".to_string(),
+    });
+    report.errors_detail.push(ErrorDetail {
+        crate_name: "named".to_string(),
+        cache_key: "secret-key".to_string(),
+        timestamp: "t".to_string(),
+    });
+    report.timed_transfers.push(TransferSpan {
+        direction: "download".to_string(),
+        crate_name: "serde".to_string(),
+        cache_key: "secret-key".to_string(),
+        object_key: "objects/secret".to_string(),
+        started_at_unix_ms: 5,
+        finished_at_unix_ms: 9,
+    });
+    report.timed_transfers.push(TransferSpan {
+        direction: "upload".to_string(),
+        crate_name: "empty".to_string(),
+        cache_key: String::new(),
+        object_key: String::new(),
+        started_at_unix_ms: 5,
+        finished_at_unix_ms: 9,
+    });
+    let kept_error = report.all_events[0].store_error.clone();
+
+    redact_report(&mut report);
+
+    assert_eq!(report.meta.root_filter.as_deref(), Some("redacted"));
+    assert_eq!(report.all_events[0].cache_key, "redacted");
+    assert_eq!(report.all_events[0].object_output, "redacted");
+    assert_eq!(report.all_events[0].root, "redacted");
+    assert_eq!(report.all_events[0].store_error, kept_error);
+    assert_eq!(report.trace_events[0].args.cache_key, "redacted");
+    assert_eq!(report.trace_events[0].args.root, "redacted");
+    assert_eq!(report.trace_events[0].args.object_output, "redacted");
+    let empty_error = report
+        .errors_detail
+        .iter()
+        .find(|error| error.crate_name == "empty")
+        .unwrap();
+    let named_error = report
+        .errors_detail
+        .iter()
+        .find(|error| error.crate_name == "named")
+        .unwrap();
+    assert_eq!(empty_error.cache_key, "");
+    assert_eq!(named_error.cache_key, "redacted");
+    assert_eq!(report.timed_transfers[0].cache_key, "redacted");
+    assert_eq!(report.timed_transfers[0].object_key, "redacted");
+    assert_eq!(report.timed_transfers[1].cache_key, "");
+    assert_eq!(report.timed_transfers[1].object_key, "");
 }

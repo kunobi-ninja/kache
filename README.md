@@ -129,6 +129,8 @@ Credentials come from the standard AWS environment variables or credential chain
 kache monitor                 # live build and cache activity
 kache stats                   # non-interactive summary
 kache report --last-build     # hits, misses, and bypass reasons of the latest build
+kache report --redact         # strip cache keys and paths before sharing a report
+kache diff                    # compare the two newest sessions of one root
 kache doctor                  # setup and integrity checks
 kache install-shims           # Unix compiler-name PATH farm
 kache why-miss <crate>        # explain the latest miss

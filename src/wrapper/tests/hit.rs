@@ -26,6 +26,7 @@ fn report_preserves_phase_metrics() {
         lookup_ms: 23,
         restore_ms: 19,
         key_record: KeyEventRecord::default(),
+        object_output: "consumer.o".to_string(),
     }
     .report(&config, &meta);
     let events = events::read_events(&config.event_log_path()).unwrap();
@@ -45,6 +46,8 @@ fn report_preserves_phase_metrics() {
     assert_eq!(event.lookup_ms, 23);
     assert_eq!(event.restore_ms, 19);
     assert_eq!(event.store_ms, 0);
+    assert_eq!(event.object_output, "consumer.o");
+    assert_eq!(event.miss_reason, crate::events::MissReason::None);
 }
 
 // Capture the real reporting streams without redirecting other tests' output.

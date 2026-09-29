@@ -651,6 +651,34 @@ fn cause_of(
     }
 }
 
+/// Misses in `indices` whose cause is [`Cause::Unexplained`].
+pub(crate) fn unexplained_misses(events: &[BuildEvent], indices: &[usize]) -> usize {
+    let mut first_compile: HashMap<(&str, &str), usize> = HashMap::new();
+    for (index, event) in events.iter().enumerate() {
+        let compiled = is_lookup(event)
+            || (matches!(event.result, EventResult::Passthrough) && !is_probe(event));
+        if compiled && !event.root.is_empty() {
+            first_compile
+                .entry((event.root.as_str(), event.crate_name.as_str()))
+                .or_insert(index);
+        }
+    }
+    indices
+        .iter()
+        .filter(|&&index| {
+            is_miss(&events[index]) && cause_of(events, index, &first_compile) == Cause::Unexplained
+        })
+        .count()
+}
+
+/// Lookups in `indices` that missed.
+pub(crate) fn miss_count(events: &[BuildEvent], indices: &[usize]) -> usize {
+    indices
+        .iter()
+        .filter(|&&index| is_miss(&events[index]))
+        .count()
+}
+
 /// Crates in `root` that missed in at least three of its builds, or in two
 /// with a store failure on the latest lookup, most often first. Only
 /// lookups count as a build "seeing" a crate: a build that only ran a query
@@ -755,6 +783,22 @@ mod tests {
 
     fn gap() -> Duration {
         Duration::from_secs(300)
+    }
+
+    #[test]
+    fn unexplained_misses_count_a_repeat_and_an_empty_root() {
+        let mut stored = event("b", EventResult::Miss, 3, "/w", "s1");
+        stored.store_error = "disk full".to_string();
+        let events = vec![
+            event("a", EventResult::Miss, 1, "/w", "s1"),
+            event("a", EventResult::Miss, 2, "/w", "s1"),
+            stored,
+            event("c", EventResult::Miss, 4, "", "s1"),
+        ];
+        let all: Vec<usize> = (0..events.len()).collect();
+        assert_eq!(unexplained_misses(&events, &all), 2);
+        assert_eq!(miss_count(&events, &all), 4);
+        assert_eq!(unexplained_misses(&events, &[0]), 0);
     }
 
     #[test]

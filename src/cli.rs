@@ -1409,12 +1409,23 @@ pub fn report(
     output: Option<std::path::PathBuf>,
     top: usize,
     record: bool,
+    redact: bool,
 ) -> Result<()> {
-    let report = if filter.root.is_some() || filter.last_build {
+    let mut report = if filter.root.is_some() || filter.last_build {
         crate::report::generate_report_with_filter(config, window, top, &filter)?
     } else {
         crate::report::generate_report(config, window, top)?
     };
+
+    // Record the unredacted report. Redaction is for the copy being shared.
+    let recorded = if record || config.record_sessions {
+        record_session(config, &report)
+    } else {
+        Ok(())
+    };
+    if redact {
+        crate::report::redact_report(&mut report);
+    }
 
     let text = match format {
         "json" => crate::report::format_json(&report)?,
@@ -1432,14 +1443,6 @@ pub fn report(
         println!("{text}");
     }
 
-    // The session line is a side effect of the report: a cache dir it cannot
-    // write costs that line and a warning, never the report or the exit code.
-    // `record_sessions` records every report as `--record` does.
-    let recorded = if record || config.record_sessions {
-        record_session(config, &report)
-    } else {
-        Ok(())
-    };
     if let Err(e) = recorded {
         eprintln!("warning: this session was not recorded: {e:#}");
     }

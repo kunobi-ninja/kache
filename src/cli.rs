@@ -5626,6 +5626,21 @@ pub fn doctor(
         fix: cargo_fix,
     });
 
+    let rustdoc_setting = crate::wrapper_config::cargo_rustdoc_setting();
+    let rustdoc_value = rustdoc_setting.as_ref().map(|(value, _)| value.as_str());
+    #[cfg(unix)]
+    let rustdoc_path_ok = rustdoc_value.is_some_and(rustdoc_shim_path_ok);
+    #[cfg(not(unix))]
+    let rustdoc_path_ok = false;
+    let (doc_pass, doc_class) = rustdoc_doctor_fields(cfg!(unix), rustdoc_value, rustdoc_path_ok);
+    checks.push(Check {
+        label: "cargo doc",
+        pass: doc_pass,
+        detail: doc_class.to_string(),
+        fix: (!doc_pass)
+            .then(|| "point build.rustdoc at the rustdoc shim from kache init".to_string()),
+    });
+
     // 3b. Host config layer
     let (host_pass, host_detail, host_fix) =
         doctor_host_config_check(&crate::config::host_config_status());
@@ -7855,6 +7870,183 @@ fn cargo_config_target_path() -> std::path::PathBuf {
     }
 }
 
+/// `build.rustdoc` assignment, not `rustdoc-extra` and not a comment.
+pub(crate) fn is_rustdoc_assignment(line: &str) -> bool {
+    let Some(rest) = line.trim().strip_prefix("rustdoc") else {
+        return false;
+    };
+    rest.trim_start().starts_with('=')
+}
+
+fn closes_toml_table(trimmed: &str) -> bool {
+    trimmed.starts_with('[') && trimmed.ends_with(']')
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RustdocEdit {
+    Skip,
+    Already,
+    Leave,
+    Write,
+}
+
+pub(crate) fn rustdoc_edit_decision(
+    wrapper: Option<&str>,
+    current: Option<&str>,
+    shim: &str,
+) -> RustdocEdit {
+    if wrapper != Some("kache") {
+        return RustdocEdit::Skip;
+    }
+    match current {
+        None => RustdocEdit::Write,
+        Some(value) if value == shim => RustdocEdit::Already,
+        Some(_) => RustdocEdit::Leave,
+    }
+}
+
+/// Insert or replace `build.rustdoc`. A line that already names `shim_path`
+/// is returned unchanged. `rustdoc-extra` and comments are left in place.
+pub(crate) fn apply_rustdoc_edit(existing: &str, shim_path: &str) -> String {
+    let assignment = format!("rustdoc = \"{shim_path}\"");
+    if existing.trim().is_empty() {
+        return format!("[build]\n{assignment}\n");
+    }
+    let lines: Vec<&str> = existing.lines().collect();
+    let mut build_header = None;
+    let mut assignments = Vec::new();
+    let mut in_build = false;
+    for (index, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if trimmed == "[build]" {
+            in_build = true;
+            if build_header.is_none() {
+                build_header = Some(index);
+            }
+        } else if closes_toml_table(trimmed) {
+            in_build = false;
+        } else if in_build && is_rustdoc_assignment(trimmed) {
+            assignments.push(index);
+        }
+    }
+    if assignments.len() == 1 && lines[assignments[0]].trim() == assignment {
+        return existing.to_string();
+    }
+    let mut out = String::new();
+    if let Some(header) = build_header {
+        let mut placed = false;
+        for (index, line) in lines.iter().enumerate() {
+            if assignments.contains(&index) {
+                if !placed {
+                    out.push_str(&assignment);
+                    out.push('\n');
+                    placed = true;
+                }
+                continue;
+            }
+            out.push_str(line);
+            out.push('\n');
+            if index == header && assignments.is_empty() && !placed {
+                out.push_str(&assignment);
+                out.push('\n');
+                placed = true;
+            }
+        }
+        assert!(
+            placed,
+            "a [build] section must gain exactly one rustdoc assignment"
+        );
+        return out;
+    }
+    for line in &lines {
+        out.push_str(line);
+        out.push('\n');
+    }
+    if !lines.is_empty() {
+        out.push('\n');
+    }
+    out.push_str("[build]\n");
+    out.push_str(&assignment);
+    out.push('\n');
+    out
+}
+
+/// Absolute path whose filename is `rustdoc` and which names a file.
+/// A symlink to the kache binary counts: `Path::is_file` follows it.
+#[cfg(any(test, unix))]
+pub(crate) fn rustdoc_shim_path_shape(value: &str) -> bool {
+    let path = std::path::Path::new(value);
+    path.is_absolute() && path.file_name().and_then(|name| name.to_str()) == Some("rustdoc")
+}
+
+#[cfg(any(test, unix))]
+pub(crate) fn rustdoc_shim_path_ok(value: &str) -> bool {
+    rustdoc_shim_path_shape(value) && std::path::Path::new(value).is_file()
+}
+
+pub(crate) fn rustdoc_doctor_fields(
+    unix_shims: bool,
+    configured: Option<&str>,
+    path_ok: bool,
+) -> (bool, &'static str) {
+    if !unix_shims {
+        return (true, "not cached on Windows");
+    }
+    if configured.is_none() {
+        return (true, "not set");
+    }
+    if path_ok {
+        (true, "shim")
+    } else {
+        (false, "not a rustdoc shim")
+    }
+}
+
+#[cfg(unix)]
+fn configure_cargo_rustdoc(check: bool) {
+    let Some(shim_dir) = crate::compiler::shim::default_shim_dir() else {
+        return;
+    };
+    let shim = shim_dir.join("rustdoc");
+    if !shim.is_file() {
+        return;
+    }
+    let Some(shim_path) = shim.to_str() else {
+        return;
+    };
+    let cargo_path = cargo_config_target_path();
+    let existing = std::fs::read_to_string(&cargo_path).unwrap_or_default();
+    let parsed: Option<toml::Value> = toml::from_str(&existing).ok();
+    let wrapper = parsed
+        .as_ref()
+        .and_then(|value| value.get("build"))
+        .and_then(|build| build.get("rustc-wrapper"))
+        .and_then(toml::Value::as_str);
+    let current = parsed
+        .as_ref()
+        .and_then(|value| value.get("build"))
+        .and_then(|build| build.get("rustdoc"))
+        .and_then(toml::Value::as_str);
+    match rustdoc_edit_decision(wrapper, current, shim_path) {
+        RustdocEdit::Write => {}
+        RustdocEdit::Leave => {
+            println!("  • cargo doc: build.rustdoc is already set");
+            return;
+        }
+        RustdocEdit::Skip | RustdocEdit::Already => return,
+    }
+    if check {
+        println!("    Would set build.rustdoc to {}", shim.display());
+        return;
+    }
+    let updated = apply_rustdoc_edit(&existing, shim_path);
+    if let Err(error) = std::fs::write(&cargo_path, updated) {
+        println!("  • cargo doc: could not set build.rustdoc ({error})");
+        return;
+    }
+    println!("  ✓ cargo doc: build.rustdoc set");
+}
+
 pub fn init(yes: bool, no_service: bool, no_shell: bool, check: bool) -> Result<()> {
     println!("\n  Set up Kache\n");
     if check {
@@ -7926,6 +8118,10 @@ pub fn init(yes: bool, no_service: bool, no_shell: bool, check: bool) -> Result<
 
     #[cfg(unix)]
     let shell_pending = init_compiler_setup(yes, no_shell, check)?;
+    #[cfg(unix)]
+    if !no_shell {
+        configure_cargo_rustdoc(check);
+    }
     #[cfg(unix)]
     let tests_pending = init_test_runner(yes, no_shell, check)?;
     #[cfg(not(unix))]

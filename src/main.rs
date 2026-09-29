@@ -1361,6 +1361,8 @@ fn rustc_args_for_direct_preclean(args: &[String]) -> Option<&[String]> {
 fn wrapper_target(adapter: &compiler::CompilerAdapter) -> Option<WrapperTarget> {
     if adapter.id() == compiler::rustc::RUSTC_ID {
         Some(WrapperTarget::Rustc)
+    } else if adapter.id() == compiler::rustdoc::RUSTDOC_ID {
+        Some(WrapperTarget::Rustdoc)
     } else if adapter.id() == compiler::cc::CC_ID {
         Some(WrapperTarget::Cc)
     } else if adapter.id() == compiler::nvcc::NVCC_ID {
@@ -1373,6 +1375,7 @@ fn wrapper_target(adapter: &compiler::CompilerAdapter) -> Option<WrapperTarget> 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WrapperTarget {
     Rustc,
+    Rustdoc,
     Cc,
     Nvcc,
 }
@@ -1477,6 +1480,7 @@ fn run_wrapper_mode(args: &[String]) -> Result<()> {
             drop(trace);
             exit
         }
+        Some(WrapperTarget::Rustdoc) => compiler::rustdoc::run(&config, args)?,
         Some(WrapperTarget::Cc) => wrapper::run_cc(&config, args)?,
         Some(WrapperTarget::Nvcc) => wrapper::run_nvcc(&config, args)?,
         None => anyhow::bail!(
@@ -1799,6 +1803,10 @@ mod tests {
         assert_eq!(
             wrapper_target(adapter_for(&["rustc", "--crate-name", "foo"])),
             Some(WrapperTarget::Rustc)
+        );
+        assert_eq!(
+            wrapper_target(adapter_for(&["rustdoc", "--crate-name", "demo"])),
+            Some(WrapperTarget::Rustdoc)
         );
         assert_eq!(
             wrapper_target(adapter_for(&["cc", "-c", "foo.c"])),

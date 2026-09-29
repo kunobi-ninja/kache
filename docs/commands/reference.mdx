@@ -131,6 +131,8 @@ kache init --yes
 
 Without a terminal, pass `--yes`. If stdin has no answers and Cargo is left unconfigured, init exits with an error. Besides `rustc-wrapper`, init adds `HOST_CC` / `HOST_CXX` / `CC_KNOWN_WRAPPER_CUSTOM` under Cargo `[env]` when those keys are absent. On Windows it adds only `CC_KNOWN_WRAPPER_CUSTOM`. It never sets `CC` or `CXX`.
 
+On Unix, when the compiler shims are installed, init sets `build.rustdoc` to the absolute `rustdoc` link in that directory. Cargo then runs `cargo doc` through Kache. Caching documentation on stable needs `RUSTC_BOOTSTRAP=1` and `-Z rustdoc-depinfo -Z rustdoc-mergeable-info`. Init does not replace a `build.rustdoc` value you already set. Windows has no compiler shims, so `cargo doc` is not cached there.
+
 On Unix, init offers to pace test binaries: it exports `CARGO_TARGET_<HOST>_RUNNER="kache test-runner"` from the same shell startup files the C/C++ setup edits, so `cargo test` in every project waits for the scheduler's slots. A value you already export stays. `--no-shell` skips both edits. See [Test runner](/docs/getting-started/configuration#test-runner).
 
 ## `kache doctor`
@@ -453,7 +455,7 @@ kache install-shims --from-path
 kache install-shims --force ~/.local/lib/kache/shims
 ```
 
-Unix only. Creates `cargo`, `cc`, `c++`, `gcc`, `g++`, `clang`, and `clang++` symlinks to Kache. With no directory argument the farm is `~/.local/lib/kache/shims`. `--from-path` also wraps compiler names already on `PATH` (`gcc-13`, target-prefixed drivers). Put the directory before the real compilers in `PATH`. If the directory then holds only Kache links, `install-shims` also writes a `.kache-shims` marker. When Kache looks for the real compiler, it skips everything in a marked directory. A directory that also holds other files, such as a real compiler, is left unmarked.
+Unix only. Creates `cargo`, `cc`, `c++`, `gcc`, `g++`, `clang`, `clang++`, and `rustdoc` symlinks to Kache. With no directory argument the farm is `~/.local/lib/kache/shims`. `--from-path` also wraps compiler names already on `PATH` (`gcc-13`, target-prefixed drivers). Put the directory before the real compilers in `PATH`. If the directory then holds only Kache links, `install-shims` also writes a `.kache-shims` marker. When Kache looks for the real compiler, it skips everything in a marked directory. A directory that also holds other files, such as a real compiler, is left unmarked.
 
 The links point at a path that survives upgrades when one reaches the running binary: Homebrew's `opt` link, a Nix profile, mise's `latest` alias, or a `kache` on `PATH` outside version directories. Without `--force`, existing entries are kept, except in a directory Kache created, marked, or filled only with Kache links. There a rerun replaces Kache links whose target is missing or not executable, and moves Kache links into a version directory to the upgrade-safe path. Other links are kept. See [C and C++](/docs/getting-started/c-cpp#upgrades).
 

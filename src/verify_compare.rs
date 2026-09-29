@@ -45,7 +45,10 @@ impl DivergenceClass {
 pub(crate) struct ArtifactDivergence {
     pub name: String,
     pub class: DivergenceClass,
-    pub detail: &'static str,
+    /// Static reason, or for a content mismatch the first differing offset
+    /// and a short excerpt of each side. The hit event's `cache_key` is the
+    /// join to the entry; this string does not repeat it.
+    pub detail: String,
 }
 
 /// Compare result for a set of artifacts.
@@ -163,7 +166,7 @@ pub(crate) fn compare_artifact_trees(restored: &Path, compiled: &Path) -> Compar
             None => artifacts.push(ArtifactDivergence {
                 name: name.clone(),
                 class: DivergenceClass::Content,
-                detail: "missing from recompile",
+                detail: "missing from recompile".to_string(),
             }),
         }
     }
@@ -196,21 +199,21 @@ fn compare_paths(name: &str, restored: &Path, compiled: Option<&Path>) -> Artifa
         return ArtifactDivergence {
             name: name.to_string(),
             class: DivergenceClass::Content,
-            detail: "unreadable restored file",
+            detail: "unreadable restored file".to_string(),
         };
     };
     let Some(compiled) = compiled else {
         return ArtifactDivergence {
             name: name.to_string(),
             class: DivergenceClass::Content,
-            detail: "missing from recompile",
+            detail: "missing from recompile".to_string(),
         };
     };
     let Ok(compiled_bytes) = std::fs::read(compiled) else {
         return ArtifactDivergence {
             name: name.to_string(),
             class: DivergenceClass::Content,
-            detail: "missing from recompile",
+            detail: "missing from recompile".to_string(),
         };
     };
     classify_bytes(name, &restored_bytes, &compiled_bytes)
@@ -221,21 +224,79 @@ pub(crate) fn classify_bytes(name: &str, restored: &[u8], compiled: &[u8]) -> Ar
         return ArtifactDivergence {
             name: name.to_string(),
             class: DivergenceClass::Match,
-            detail: "",
+            detail: String::new(),
         };
     }
     if bytes_equal_ignoring_embedded_paths(restored, compiled) {
         return ArtifactDivergence {
             name: name.to_string(),
             class: DivergenceClass::PathDebug,
-            detail: "",
+            detail: String::new(),
         };
     }
     ArtifactDivergence {
         name: name.to_string(),
         class: DivergenceClass::Content,
-        detail: "byte mismatch",
+        detail: content_mismatch_detail(name, restored, compiled),
     }
+}
+
+/// Bytes shown from each side at the first mismatch. Long enough to see a
+/// token, short enough that one object cannot fill the event.
+const DIVERGENCE_EXCERPT_BYTES: usize = 16;
+
+fn content_mismatch_detail(name: &str, restored: &[u8], compiled: &[u8]) -> String {
+    let offset = mismatch_offset(restored, compiled);
+    let mut detail = format!(
+        "byte mismatch at {offset}: restored {} compiled {}",
+        excerpt_at(restored, offset),
+        excerpt_at(compiled, offset)
+    );
+    if let Some(line) = text_line_at(name, restored, compiled, offset) {
+        detail.push_str(&format!(" line {line}"));
+    }
+    detail
+}
+
+fn mismatch_offset(left: &[u8], right: &[u8]) -> usize {
+    left.iter()
+        .zip(right)
+        .position(|(left_byte, right_byte)| left_byte != right_byte)
+        .unwrap_or_else(|| left.len().min(right.len()))
+}
+
+fn excerpt_at(bytes: &[u8], offset: usize) -> String {
+    let start = offset.min(bytes.len());
+    let end = (start + DIVERGENCE_EXCERPT_BYTES).min(bytes.len());
+    escape_excerpt(&bytes[start..end])
+}
+
+fn escape_excerpt(bytes: &[u8]) -> String {
+    let mut out = String::new();
+    for byte in bytes {
+        if byte.is_ascii_graphic() || *byte == b' ' {
+            out.push(char::from(*byte));
+        } else {
+            out.push_str(&format!("\\x{byte:02x}"));
+        }
+    }
+    out
+}
+
+/// 1-based line of `offset` for a text artifact. Dep-info is named `.d`.
+/// Other text is recognized by a newline. A NUL is a binary artifact.
+fn text_line_at(name: &str, restored: &[u8], compiled: &[u8], offset: usize) -> Option<usize> {
+    if restored.contains(&0) || compiled.contains(&0) {
+        return None;
+    }
+    if std::str::from_utf8(restored).is_err() || std::str::from_utf8(compiled).is_err() {
+        return None;
+    }
+    if !name.ends_with(".d") && !restored.contains(&b'\n') && !compiled.contains(&b'\n') {
+        return None;
+    }
+    let prefix = restored.get(..offset)?;
+    Some(prefix.iter().filter(|byte| **byte == b'\n').count() + 1)
 }
 
 /// True when `left` and `right` differ only in embedded absolute-path /
@@ -555,6 +616,87 @@ mod tests {
             classify_bytes("libfoo.rlib", left, right).class,
             DivergenceClass::Content
         );
+    }
+
+    #[test]
+    fn a_content_mismatch_records_the_offset_and_a_capped_excerpt() {
+        let mut restored = vec![b'a'; 4];
+        restored.extend(std::iter::repeat_n(b'R', 20));
+        let mut compiled = vec![b'a'; 4];
+        compiled.extend(std::iter::repeat_n(b'C', 20));
+        let detail = classify_bytes("libfoo.rlib", &restored, &compiled).detail;
+        assert!(
+            detail.starts_with("byte mismatch at 4: restored "),
+            "{detail}"
+        );
+        assert!(detail.contains("restored RRRRRRRRRRRRRRRR compiled CCCCCCCCCCCCCCCC"));
+        assert!(
+            !detail.contains("RRRRRRRRRRRRRRRRR"),
+            "excerpt is 16 bytes: {detail}"
+        );
+        assert!(!detail.contains("line "), "{detail}");
+    }
+
+    #[test]
+    fn a_text_mismatch_records_the_line() {
+        let restored = b"alpha\nbeta\nOLD\n";
+        let compiled = b"alpha\nbeta\nNEW\n";
+        let detail = classify_bytes("foo.d", restored, compiled).detail;
+        assert!(detail.contains("byte mismatch at 11:"), "{detail}");
+        assert!(detail.contains(" line 3"), "{detail}");
+        let one_line = classify_bytes("foo.d", b"OLD", b"NEW").detail;
+        assert!(one_line.contains(" line 1"), "{one_line}");
+        let other = classify_bytes("notes.txt", b"alpha\nOLD\n", b"alpha\nNEW\n").detail;
+        assert!(other.contains(" line 2"), "{other}");
+        // A newline on only one side still makes the artifact text. Each
+        // side has to be able to fail on its own.
+        let restored_only = classify_bytes("notes.txt", b"ab\n", b"ac").detail;
+        assert!(restored_only.contains(" line 1"), "{restored_only}");
+        let compiled_only = classify_bytes("notes.txt", b"ab", b"a\nc").detail;
+        assert!(compiled_only.contains(" line 1"), "{compiled_only}");
+    }
+
+    #[test]
+    fn a_shorter_file_ends_the_excerpt_at_its_last_byte() {
+        let longer = classify_bytes("libfoo.rlib", b"prefix", b"prefix!").detail;
+        assert!(
+            longer.contains("byte mismatch at 6: restored  compiled !"),
+            "{longer}"
+        );
+        let shorter = classify_bytes("libfoo.rlib", b"prefix!", b"prefix").detail;
+        assert!(
+            shorter.contains("byte mismatch at 6: restored ! compiled "),
+            "{shorter}"
+        );
+        assert_eq!(excerpt_at(b"hi", 0), "hi");
+        assert_eq!(excerpt_at(b"hi", 100), "");
+    }
+
+    #[test]
+    fn a_space_stays_and_other_controls_are_escaped() {
+        let detail = classify_bytes("foo.d", b"a b\n", b"a\tb\n").detail;
+        assert!(
+            detail.contains("byte mismatch at 1: restored  b\\x0a compiled \\x09b\\x0a"),
+            "{detail}"
+        );
+        assert!(detail.contains(" line 1"), "{detail}");
+        assert!(!detail.contains("\\x20"), "{detail}");
+    }
+
+    #[test]
+    fn a_nul_or_non_utf8_artifact_has_no_line() {
+        let nul_restored = classify_bytes("foo.d", b"OLD\0", b"NEW").detail;
+        assert!(
+            nul_restored.contains("restored OLD\\x00 compiled NEW"),
+            "{nul_restored}"
+        );
+        assert!(!nul_restored.contains("line "), "{nul_restored}");
+        let nul_compiled = classify_bytes("foo.d", b"OLD", b"NEW\0").detail;
+        assert!(!nul_compiled.contains("line "), "{nul_compiled}");
+        let bad_restored = classify_bytes("foo.d", b"\xff\n", b"a\n").detail;
+        assert!(!bad_restored.contains("line "), "{bad_restored}");
+        let bad_compiled = classify_bytes("foo.d", b"a\n", b"\xff\n").detail;
+        assert!(!bad_compiled.contains("line "), "{bad_compiled}");
     }
 
     #[test]

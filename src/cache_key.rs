@@ -260,6 +260,13 @@ use crate::key_env::KeyEnv;
 // compile maps its own and other units' OUT_DIRs, a macOS link strips the
 // profile directory from N_OSO paths, and native archives under the target
 // dir are keyed by their portable digest. Each changes new-layout keys only.
+//
+// #1190 needs no bump. A trybuild unit folds a raw prefix only when the
+// working directory, the crate source, or `OUT_DIR` sits under it. Those are
+// the paths rustc writes into the rmeta; `--out-dir` reaches dep-info, which
+// restore already rewrites. Coverage and `KACHE_RUSTC_PATH_NORMALIZE=0` still
+// fold every prefix. Only the trybuild `remap:none` bytes change, so a
+// previous trybuild entry misses and every other key stays valid.
 pub(crate) use kache_format::CACHE_KEY_VERSION;
 
 /// Collapse runs of ASCII whitespace into single spaces and trim
@@ -3320,6 +3327,18 @@ fn complete_key(env: &KeyEnv, key: String) -> Result<String> {
 /// A path baked into DWARF that lies OUTSIDE every prefix is not normalized in
 /// the key either, so it already reaches the key raw via its dep-info field — no
 /// separate handling needed here.
+///
+/// trybuild is the exception (kunobi-ninja/kache#1190). It skips remapping so
+/// its diagnostics still match the snapshots, and every crate it builds,
+/// including registry dependencies, takes that path. A registry rmeta records
+/// the package directory and the source file, not `--out-dir`. Folding the
+/// per-worktree target prefix anyway made those dependencies miss in every
+/// checkout. A trybuild unit therefore folds a prefix only when the working
+/// directory, the source, or `OUT_DIR` is under it. A build script that
+/// `include!`s `OUT_DIR` writes that absolute path into the rmeta, so the
+/// prefix that holds `OUT_DIR` stays. Coverage and the normalize opt-out keep
+/// folding every prefix: their artifacts carry the paths the profraw and the
+/// debugger look up.
 fn fold_unremapped_path_identity<H: KeyFold>(
     hasher: &mut H,
     args: &RustcArgs,
@@ -3344,11 +3363,47 @@ fn fold_unremapped_path_identity<H: KeyFold>(
     }
     // Sort so the fold is order-stable regardless of rule-construction order.
     let mut prefixes: Vec<&str> = path_normalizer.raw_prefixes().collect();
+    if args.is_trybuild_unit() {
+        let reached = trybuild_paths_in_the_artifact(args, env);
+        prefixes.retain(|prefix| reached.iter().any(|path| path_is_under(path, prefix)));
+    }
     prefixes.sort_unstable();
     prefixes.dedup();
     for prefix in prefixes {
         fold_field(hasher, b"unremapped:prefix:", prefix.as_bytes());
     }
+}
+
+/// Paths an unremapped trybuild compile writes into the rmeta.
+///
+/// A relative source or `OUT_DIR` is resolved against the working directory,
+/// which is where rustc records it. An empty `OUT_DIR` is not a path.
+fn trybuild_paths_in_the_artifact(args: &RustcArgs, env: &KeyEnv) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Some(cwd) = env.cwd() {
+        paths.push(cwd.to_path_buf());
+    }
+    if let Some(source) = &args.source_file {
+        paths.push(joined_under(env.cwd(), source));
+    }
+    if let Some(out_dir) = env.var_os("OUT_DIR").filter(|value| !value.is_empty()) {
+        paths.push(joined_under(env.cwd(), Path::new(&out_dir)));
+    }
+    paths
+}
+
+fn joined_under(cwd: Option<&Path>, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else if let Some(cwd) = cwd {
+        cwd.join(path)
+    } else {
+        path.to_path_buf()
+    }
+}
+
+fn path_is_under(path: &Path, prefix: &str) -> bool {
+    path.starts_with(prefix)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

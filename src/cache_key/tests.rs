@@ -862,6 +862,136 @@ fn unremapped_identity_folds_the_snapshot_cwd() {
     assert_eq!(fold(Some("/work/a")), fold(Some("/work/a")));
 }
 
+fn hash_unremapped(args: &RustcArgs, normalizer: &PathNormalizer, env: &KeyEnv) -> blake3::Hash {
+    let mut hasher = blake3::Hasher::new();
+    fold_unremapped_path_identity(&mut hasher, args, normalizer, env);
+    hasher.finalize()
+}
+
+fn normalizer_for(target: &std::path::Path, base: &std::path::Path) -> PathNormalizer {
+    PathNormalizer::empty()
+        .with_target_dir(Some(target))
+        .with_base_dirs(&[base.to_string_lossy().into_owned()])
+}
+
+/// A registry crate built by trybuild records its package directory, not the
+/// per-worktree target directory. Two targets must share that key. `OUT_DIR`
+/// is recorded when the crate includes it, and a coverage build still folds
+/// a target nothing in the compile reaches.
+#[test]
+fn trybuild_folds_only_prefixes_the_artifact_reaches() {
+    let dir = tempfile::tempdir().unwrap();
+    let registry = dir.path().join("registry/src/dep-hash");
+    std::fs::create_dir_all(registry.join("src")).unwrap();
+    let target_a = dir.path().join("wt-a/target");
+    let target_b = dir.path().join("wt-b/target");
+    std::fs::create_dir_all(&target_a).unwrap();
+    std::fs::create_dir_all(&target_b).unwrap();
+    let registry = registry.canonicalize().unwrap();
+    let target_a = target_a.canonicalize().unwrap();
+    let target_b = target_b.canonicalize().unwrap();
+    let source = registry.join("src/lib.rs");
+
+    let trybuild = RustcArgs::parse(&[
+        "rustc".into(),
+        "--cfg".into(),
+        "trybuild".into(),
+        source.display().to_string(),
+    ])
+    .unwrap();
+    assert!(trybuild.is_trybuild_unit());
+    let env = KeyEnv::from_parts([] as [(&str, &str); 0], Some(registry.clone()));
+    let shared = |target: &std::path::Path| {
+        hash_unremapped(&trybuild, &normalizer_for(target, &registry), &env)
+    };
+    assert_eq!(
+        shared(&target_a),
+        shared(&target_b),
+        "a target prefix the rmeta does not reach stays out of the key"
+    );
+
+    let out_a = target_a.join("debug/build/dep/out");
+    let out_b = target_b.join("debug/build/dep/out");
+    let with_out = |out: &std::path::Path, target: &std::path::Path| {
+        let env = KeyEnv::from_parts([("OUT_DIR", out.to_str().unwrap())], Some(registry.clone()));
+        hash_unremapped(&trybuild, &normalizer_for(target, &registry), &env)
+    };
+    assert_ne!(
+        with_out(&out_a, &target_a),
+        with_out(&out_b, &target_b),
+        "OUT_DIR is inside the rmeta, so its prefix stays"
+    );
+
+    let coverage = RustcArgs::parse(&[
+        "rustc".into(),
+        "-C".into(),
+        "instrument-coverage".into(),
+        source.display().to_string(),
+    ])
+    .unwrap();
+    assert!(coverage.skip_path_remap());
+    assert!(!coverage.is_trybuild_unit());
+    let covered = |target: &std::path::Path| {
+        hash_unremapped(&coverage, &normalizer_for(target, &registry), &env)
+    };
+    assert_ne!(
+        covered(&target_a),
+        covered(&target_b),
+        "coverage still folds a target prefix the compile does not reach"
+    );
+}
+
+#[test]
+fn trybuild_artifact_paths_join_a_relative_source_and_ignore_an_empty_out_dir() {
+    let relative = RustcArgs::parse(&[
+        "rustc".into(),
+        "--cfg".into(),
+        "trybuild".into(),
+        "src/lib.rs".into(),
+    ])
+    .unwrap();
+    let joined = trybuild_paths_in_the_artifact(
+        &relative,
+        &KeyEnv::from_parts(
+            [] as [(&str, &str); 0],
+            Some(std::path::PathBuf::from("/registry/dep")),
+        ),
+    );
+    assert!(
+        joined
+            .iter()
+            .any(|path| path == std::path::Path::new("/registry/dep/src/lib.rs"))
+    );
+    assert!(path_is_under(
+        std::path::Path::new("/registry/dep/src/lib.rs"),
+        "/registry/dep"
+    ));
+    assert!(!path_is_under(
+        std::path::Path::new("/registry/dep/src/lib.rs"),
+        "/registry/depot"
+    ));
+
+    let absolute = RustcArgs::parse(&[
+        "rustc".into(),
+        "--cfg".into(),
+        "trybuild".into(),
+        "/registry/dep/src/lib.rs".into(),
+    ])
+    .unwrap();
+    let kept = trybuild_paths_in_the_artifact(
+        &absolute,
+        &KeyEnv::from_parts(
+            [("OUT_DIR", "")],
+            Some(std::path::PathBuf::from("/somewhere/else")),
+        ),
+    );
+    assert!(
+        kept.iter()
+            .any(|path| path == std::path::Path::new("/registry/dep/src/lib.rs"))
+    );
+    assert_eq!(kept.len(), 2, "an empty OUT_DIR is not a path");
+}
+
 #[test]
 fn metadata_only_outputs_do_not_probe_crt_or_sdk() {
     let mut metadata = parsed_linked_bin(None);

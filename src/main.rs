@@ -1036,7 +1036,12 @@ fn main() -> Result<()> {
             cli::telemetry_push(&config, &selection, &labels, dry_run)
         }
         Some(Commands::WhyMiss { crate_name }) => cli::why_miss(&config, &crate_name, json),
-        Some(Commands::Diff { root }) => run_diff::run(&config, root.as_deref(), json),
+        Some(Commands::Diff { root }) => {
+            if run_diff::run(&config, root.as_deref(), json)? {
+                std::process::exit(1);
+            }
+            Ok(())
+        }
         Some(Commands::Monitor { since }) => {
             if json {
                 anyhow::bail!("`kache monitor` is interactive; use `kache stats --json`.");

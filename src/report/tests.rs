@@ -3615,6 +3615,18 @@ fn test_build_bypass_analysis_respects_top_limit() {
 }
 
 #[test]
+fn unexplained_suggestion_names_a_repeat() {
+    let mut first = test_event("a", EventResult::Miss, 10, 10, 1, "k1");
+    first.root = "/w".to_string();
+    let mut second = test_event("a", EventResult::Miss, 10, 10, 1, "k2");
+    second.root = "/w".to_string();
+    assert_eq!(
+        unexplained_suggestion(&[first, second]).as_deref(),
+        Some("1 unexplained misses (50% of misses) have no recorded cause")
+    );
+}
+
+#[test]
 fn unexplained_alarm_line_needs_both_counts() {
     assert_eq!(unexplained_alarm_line(0, 4), None);
     assert_eq!(unexplained_alarm_line(2, 0), None);

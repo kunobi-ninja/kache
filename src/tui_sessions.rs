@@ -802,6 +802,16 @@ mod tests {
     }
 
     #[test]
+    fn a_probe_does_not_make_the_following_miss_unexplained() {
+        let mut probe = event("a", EventResult::Passthrough, 1, "/w", "s1");
+        probe.passthrough_reason = "not-a-compile|--print cfg".to_string();
+        let events = vec![probe, event("a", EventResult::Miss, 2, "/w", "s1")];
+        let all: Vec<usize> = (0..events.len()).collect();
+        assert_eq!(unexplained_misses(&events, &all), 0);
+        assert_eq!(miss_count(&events, &all), 1);
+    }
+
+    #[test]
     fn state_labels_are_the_words_on_screen() {
         assert_eq!(SessionState::Live.label(), "running");
         assert_eq!(SessionState::Finished.label(), "done");

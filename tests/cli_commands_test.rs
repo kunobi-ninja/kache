@@ -3457,3 +3457,51 @@ fn daemon_readiness_channel_precedes_a_fresh_running_status() {
     let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
     assert_eq!(status["daemon_running"], true, "{status}");
 }
+
+fn write_diff_sessions(e: &Env, sessions: &[(&str, &[&str])]) {
+    let mut lines = Vec::new();
+    let mut second = 1u32;
+    for &(session, crates) in sessions {
+        for crate_name in crates {
+            lines.push(
+                serde_json::json!({
+                    "ts": format!("2026-01-01T00:00:{second:02}Z"),
+                    "root": "/w",
+                    "session_id": session,
+                    "crate_name": crate_name,
+                    "result": "miss",
+                    "elapsed_ms": 1,
+                    "size": 1,
+                    "cache_key": crate_name,
+                    "schema": 22
+                })
+                .to_string(),
+            );
+            second += 1;
+        }
+    }
+    std::fs::write(e.cache.join("events.jsonl"), lines.join("\n") + "\n").unwrap();
+}
+
+#[test]
+fn diff_exits_when_the_later_session_misses_more() {
+    let e = env();
+    write_diff_sessions(&e, &[("s1", &["a"]), ("s2", &["b", "c"])]);
+    e.cmd()
+        .arg("diff")
+        .assert()
+        .failure()
+        .stdout(predicates::str::contains("EXCESS later misses 2 earlier 1"));
+}
+
+#[test]
+fn diff_is_quiet_when_the_sessions_match() {
+    let e = env();
+    write_diff_sessions(&e, &[("s1", &["a"]), ("s2", &["b"])]);
+    e.cmd()
+        .arg("diff")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("EXCESS").not())
+        .stdout(predicates::str::contains("misses 1 -> 1"));
+}

@@ -7500,10 +7500,8 @@ pub(crate) fn build_event_details(config: &Config, inputs: EventInputs<'_>) -> B
 
 /// The object path to record, or empty when the invocation named none.
 pub(crate) fn recorded_object_output(path: Option<std::path::PathBuf>) -> String {
-    match path {
-        Some(path) if !path.as_os_str().is_empty() => path.to_string_lossy().into_owned(),
-        _ => String::new(),
-    }
+    path.map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
 /// `[cache] explain_miss` (kunobi-ninja/kache#131): on a miss for a crate

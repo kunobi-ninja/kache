@@ -146,9 +146,10 @@ fn root_selected(session: &Session, root: Option<&str>) -> bool {
 
 const NEED_TWO: &str = "need two sessions to compare";
 
-/// Print the comparison. Exit 1 when the later session has more misses or a
-/// larger unexplained share. Fewer than two sessions prints a line and exits 0.
-pub fn run(config: &Config, root: Option<&Path>, json: bool) -> Result<()> {
+/// Print the comparison. `Ok(true)` means the later session has more misses
+/// or a larger unexplained share; the caller exits 1. Fewer than two
+/// sessions prints a line and returns `Ok(false)`.
+pub fn run(config: &Config, root: Option<&Path>, json: bool) -> Result<bool> {
     let events = events::read_events(&config.event_log_path())?;
     let root = root.map(crate::report::normalize_filter_root);
     match compare(&events, root.as_deref()) {
@@ -158,11 +159,11 @@ pub fn run(config: &Config, root: Option<&Path>, json: bool) -> Result<()> {
                 struct Body {
                     message: &'static str,
                 }
-                crate::machine::emit("diff", Body { message: NEED_TWO }, Vec::new())
+                crate::machine::emit("diff", Body { message: NEED_TWO }, Vec::new())?;
             } else {
                 println!("{NEED_TWO}");
-                Ok(())
             }
+            Ok(false)
         }
         DiffOutcome::Compared(body) => {
             let alarmed = body.alarmed();
@@ -196,10 +197,7 @@ pub fn run(config: &Config, root: Option<&Path>, json: bool) -> Result<()> {
             } else {
                 println!("{}", body.text());
             }
-            if alarmed {
-                std::process::exit(1);
-            }
-            Ok(())
+            Ok(alarmed)
         }
     }
 }
@@ -371,5 +369,33 @@ mod tests {
         assert_eq!(body.earlier_misses, 1);
         assert_eq!(body.later_misses, 1);
         assert!(!body.excess);
+    }
+
+    fn logged(events: &[BuildEvent]) -> (tempfile::TempDir, crate::config::Config) {
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::test_support::test_config(dir.path().to_path_buf());
+        for event in events {
+            events::log_event(&config.event_log_path(), event).unwrap();
+        }
+        (dir, config)
+    }
+
+    #[test]
+    fn run_reports_an_alarm_when_the_later_session_misses_more() {
+        let (_dir, config) = logged(&[
+            ev("a", EventResult::Miss, "/w", "s1", 1),
+            ev("b", EventResult::Miss, "/w", "s2", 2),
+            ev("c", EventResult::Miss, "/w", "s2", 3),
+        ]);
+        assert!(run(&config, None, false).unwrap());
+    }
+
+    #[test]
+    fn run_is_quiet_when_the_sessions_match() {
+        let (_dir, config) = logged(&[
+            ev("a", EventResult::Miss, "/w", "s1", 1),
+            ev("b", EventResult::Miss, "/w", "s2", 2),
+        ]);
+        assert!(!run(&config, None, false).unwrap());
     }
 }

@@ -291,6 +291,6 @@ and work in child processes or other threads. Trace writing adds overhead, so
 compare performance on untraced runs. The benchmark marks traced runs
 as diagnostic and rejects missing or truncated traces.
 
-`kache report --format perfetto` remains the compact event-based view: its
+`kache stats --format perfetto` remains the compact event-based view: its
 phase offsets are reconstructed from millisecond totals. The opt-in files
 above record actual interval placement and retain sub-millisecond work.

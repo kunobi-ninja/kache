@@ -76,6 +76,7 @@ mod target_cleanup;
 mod target_dedup;
 mod target_seed;
 mod target_use;
+mod term;
 mod test_runner;
 #[cfg(test)]
 mod test_support;
@@ -324,7 +325,8 @@ enum Commands {
         since: Option<String>,
     },
 
-    /// Show cache stats summary (non-interactive)
+    /// Show what the cache did: hit rate, time saved, size. `--full` adds
+    /// timing, storage, remote transfers and what was not cached
     Stats {
         /// Event window (e.g. 15m, 2h, 7d; a bare number is hours)
         #[arg(long, default_value = "24h")]
@@ -335,9 +337,38 @@ enum Commands {
         #[arg(long, conflicts_with = "since")]
         last_build: bool,
 
-        /// Select the latest session within this build tree/root
-        #[arg(long, requires = "last_build")]
+        /// Only this build tree/root: the latest session in it with
+        /// `--last-build`, its compiler events with `--full`
+        #[arg(long)]
         root: Option<PathBuf>,
+
+        /// The full build report instead of the summary
+        #[arg(long)]
+        full: bool,
+
+        /// Write the full report as json, markdown, github, or trace
+        /// (Perfetto / Chrome trace). Implies --full
+        #[arg(long, value_name = "FORMAT")]
+        format: Option<String>,
+
+        /// Write the full report to a file instead of stdout. Implies --full
+        #[arg(long, short)]
+        output: Option<PathBuf>,
+
+        /// Entries in each top list of the full report. Implies --full
+        #[arg(long)]
+        top: Option<usize>,
+
+        /// Also append the full report's summary and timing, with the host's
+        /// load, to `<cache dir>/telemetry/sessions.jsonl`, which outlives the
+        /// runtime dir a CI job deletes. Implies --full
+        #[arg(long)]
+        record: bool,
+
+        /// Replace cache keys, roots, and object paths in the full report
+        /// with `redacted`. Implies --full
+        #[arg(long)]
+        redact: bool,
     },
 
     /// Write cache counters as OTLP JSON for Kartero to import later
@@ -359,7 +390,9 @@ enum Commands {
         root: Option<PathBuf>,
     },
 
-    /// Generate a detailed build report (json, trace, markdown, or text)
+    /// The full build report. Kept for scripts; `kache stats --full` is the
+    /// same report
+    #[command(hide = true)]
     Report {
         /// Output format: json, trace, perfetto, chrome-trace, markdown, github, text
         #[arg(long, default_value = "text")]
@@ -1027,9 +1060,34 @@ fn main() -> Result<()> {
             since,
             last_build,
             root,
+            full,
+            format,
+            output,
+            top,
+            record,
+            redact,
         }) => {
+            let full =
+                full || format.is_some() || output.is_some() || top.is_some() || record || redact;
+            if full {
+                let format = report_format(format, json);
+                let window = parse_since_window(&since)?;
+                return cli::report(
+                    &config,
+                    &format,
+                    window,
+                    report::ReportFilter { root, last_build },
+                    output,
+                    top.unwrap_or(DEFAULT_REPORT_TOP),
+                    record,
+                    redact,
+                );
+            }
             if last_build {
                 return cli::stats_last_build(&config, root, json);
+            }
+            if root.is_some() {
+                anyhow::bail!("`--root` needs `--last-build` or `--full`");
             }
             let window = parse_since_window(&since)?;
             cli::stats(&config, &config_provenance, window, json)
@@ -1488,6 +1546,15 @@ fn run_wrapper_mode(args: &[String]) -> Result<()> {
     std::process::exit(exit_code);
 }
 
+/// Entries in each top list of the full report by default.
+const DEFAULT_REPORT_TOP: usize = 10;
+
+/// The full report's format: the one asked for, else JSON under `--json`,
+/// else text.
+fn report_format(format: Option<String>, json: bool) -> String {
+    format.unwrap_or_else(|| if json { "json" } else { "text" }.to_string())
+}
+
 /// Parse a `--since` value, or fail loudly. Falling back to the default on a
 /// value that did not parse is how `--since 15m` came to report a 24h window
 /// labelled as such (kunobi-ninja/kache#897).
@@ -1686,6 +1753,12 @@ mod tests {
             since: "24h".to_string(),
             last_build: false,
             root: None,
+            full: false,
+            format: None,
+            output: None,
+            top: None,
+            record: false,
+            redact: false,
         })));
         assert!(command_supports_json(&Some(Commands::Daemon {
             command: Some(DaemonCommands::Status),

@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft-07/schema#",
   "$id": "https://github.com/kunobi-ninja/kache/blob/main/docs/commands/report.schema.json",
   "title": "KacheBuildReport",
-  "description": "Schema for kache report --format json machine-readable build reports.",
+  "description": "Schema for the machine-readable full build report: kache stats --full --json (also kache report --format json).",
   "type": "object",
   "required": [
     "schema_version",

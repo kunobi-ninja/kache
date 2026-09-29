@@ -2300,11 +2300,16 @@ fn generate_suggestions(
             / (stats.miss_compile_time_ms + stats.hit_compile_time_ms) as f64
             * 100.0;
         if miss_share > 80.0 && total_compiled > 3 {
-            let top_names: Vec<&str> = top_misses
-                .iter()
-                .take(3)
-                .map(|c| c.crate_name.as_str())
-                .collect();
+            // One crate built for two targets or profiles is one name here.
+            let mut top_names: Vec<&str> = Vec::new();
+            for name in top_misses.iter().map(|c| c.crate_name.as_str()) {
+                if top_names.len() == 3 {
+                    break;
+                }
+                if !top_names.contains(&name) {
+                    top_names.push(name);
+                }
+            }
             suggestions.push(format!(
                 "{:.0}% of compile time spent on compiled cache-key misses — improve hit rate for {}",
                 miss_share,
@@ -3743,347 +3748,469 @@ pub fn format_github(report: &BuildReport) -> String {
 }
 
 pub fn format_text(report: &BuildReport) -> String {
-    use crate::cli::format_duration_ms;
+    use crate::term::{self, Align::Left, Align::Right};
 
-    let mut lines = Vec::new();
     let s = &report.summary;
     let t = &report.timing;
     let total_hits = s.local_hits + s.prefetch_hits + s.remote_hits;
     let total_compiled = s.dups + s.misses;
 
-    lines.push(format!(
-        "kache build report (last {})",
+    let mut lines = vec![format!(
+        "kache · last {} · full report",
         report.meta.window_label()
-    ));
+    )];
     if let Some(session) = &report.meta.session {
         lines.push(format!("  {}", session.description()));
     }
-    lines.push(format!(
-        "  {:.1}% hit rate — {}/{} cacheable crates cached, {} compiled",
-        s.hit_rate_pct, total_hits, s.total_crates, total_compiled,
-    ));
-    if s.dups > 0 {
-        lines.push(format!(
-            "  Dups: {} storage duplicates after compile",
-            s.dups
-        ));
-    }
+    lines.push(String::new());
+
+    // The summary, then remote transfer and storage, on shared columns.
+    let mut summary = vec![(
+        "Hit rate",
+        term::percent(s.hit_rate_pct),
+        format!(
+            "{} of {} crates from cache, {} compiled",
+            term::count(total_hits as u64),
+            term::count(s.total_crates as u64),
+            term::count(total_compiled as u64)
+        ),
+    )];
     if let Some(w) = s.weighted_hit_rate_pct {
-        lines.push(format!("  {:.1}% by compile cost", w));
+        summary.push(("By cost", term::percent(w), "of compile time".into()));
     }
-    lines.push(format!(
-        "  Compile work avoided: {} aggregate",
-        format_duration_ms(s.time_saved_ms)
+    summary.push((
+        "Time saved",
+        term::duration_ms(s.time_saved_ms),
+        "compile work avoided".into(),
     ));
-    if let Some(overhead) = cache_overhead_summary(report) {
-        lines.push(format!("  Cache hit overhead: {overhead}"));
-    }
-    if let Some(roi) = cache_roi(report) {
-        lines.push(format!(
-            "  Cache ROI: {:.1}x compile work per cache-hit overhead",
-            roi
+    if total_hits > 0 && t.hit_time_ms > 0 {
+        let payback = cache_roi(report)
+            .map(|roi| format!(", {roi:.1}x paid back in compile work"))
+            .unwrap_or_default();
+        summary.push((
+            "Hit overhead",
+            average_ms(t.avg_hit_ms),
+            format!(
+                "per hit, {} in all{payback}",
+                term::duration_ms(t.hit_time_ms)
+            ),
         ));
     }
     if t.miss_compile_time_ms > 0 {
-        lines.push(format!(
-            "  Miss compile work: {} aggregate",
-            format_duration_ms(t.miss_compile_time_ms)
+        summary.push((
+            "Miss work",
+            term::duration_ms(t.miss_compile_time_ms),
+            "compiling on misses".into(),
+        ));
+    }
+    if s.dups > 0 {
+        summary.push((
+            "Duplicates",
+            term::count(s.dups as u64),
+            "compiled, then found already stored".into(),
         ));
     }
     if s.store_failures > 0 {
-        lines.push(format!(
-            "  Compiled but not cached: {} (will miss again next build)",
-            s.store_failures
+        summary.push((
+            "Not stored",
+            term::count(s.store_failures as u64),
+            "compiled but not cached, so they miss again next build".into(),
         ));
     }
     if s.errors > 0 {
-        lines.push(format!("  Errors: {}", s.errors));
+        summary.push(("Errors", term::count(s.errors as u64), String::new()));
     }
     if s.passthroughs > 0 || s.skipped > 0 || s.probes > 0 {
-        lines.push(format!(
-            "  Passthroughs/skipped: {}",
-            format_bypass_summary(&report.bypass)
+        summary.push((
+            "Not cached",
+            format_bypass_summary(&report.bypass),
+            String::new(),
         ));
     }
-    lines.push(String::new());
 
-    // Timing
-    lines.push("Timing:".to_string());
-    lines.push(format!(
-        "  Hits overhead: {} aggregate (avg {:.0}ms/hit)",
-        format_duration_ms(t.hit_time_ms),
-        t.avg_hit_ms
-    ));
-    lines.push(format!(
-        "  Compiles: {} (avg {:.0}ms/crate)",
-        format_duration_ms(t.miss_time_ms),
-        t.avg_miss_ms
-    ));
-    if t.total_key_ms > 0 || t.total_lookup_ms > 0 || t.total_restore_ms > 0 {
-        lines.push(format!(
-            "  Hit overhead: avg {:.0}ms key + {:.0}ms lookup + {:.0}ms restore",
-            t.avg_key_ms, t.avg_lookup_ms, t.avg_restore_ms
-        ));
-    }
-    if t.total_store_ms > 0 {
-        lines.push(format!(
-            "  Miss overhead: avg {:.0}ms key + {:.0}ms lookup + {:.0}ms store",
-            t.avg_key_ms, t.avg_lookup_ms, t.avg_store_ms
-        ));
-    }
-    if s.total_crates > 0 {
-        lines.push(format!(
-            "  Startup: {} aggregate (avg {:.1}ms/crate)",
-            format_duration_ms(t.total_startup_ms),
-            t.avg_startup_ms
-        ));
-        lines.push(format!(
-            "  Dep-info pre-pass: {} runs, {} aggregate (avg {:.1}ms/run)",
-            t.dep_info_runs,
-            format_duration_ms(t.total_dep_info_ms),
-            t.avg_dep_info_ms
-        ));
-        lines.push(format!(
-            "  Scheduler wait: {} aggregate (flight {}, permit {})",
-            format_duration_ms(t.total_wait_ms),
-            format_duration_ms(t.total_flight_wait_ms),
-            format_duration_ms(t.total_permit_wait_ms)
-        ));
-        lines.push(format!(
-            "  Unattributed: {} aggregate (avg {:.1}ms/crate)",
-            format_duration_ms(t.total_unattributed_ms),
-            t.avg_unattributed_ms
-        ));
-    }
-    lines.push(String::new());
-
-    // Remote transfers
+    let mut network = Vec::new();
     if let Some(net) = &report.network {
-        lines.push("Remote transfer:".to_string());
-        lines.push(format!(
-            "  Downloaded: {} ({} ok, {} failed)",
-            format_bytes(net.bytes_down),
-            net.downloads_ok,
-            net.downloads_failed
+        network.push((
+            "Downloaded",
+            term::bytes(net.bytes_down),
+            format!("{} ok, {} failed", net.downloads_ok, net.downloads_failed),
         ));
-        lines.push(format!(
-            "  Uploaded: {} ({} ok, {} failed)",
-            format_bytes(net.bytes_up),
-            net.uploads_ok,
-            net.uploads_failed
+        network.push((
+            "Uploaded",
+            term::bytes(net.bytes_up),
+            format!("{} ok, {} failed", net.uploads_ok, net.uploads_failed),
         ));
-        lines.push(format!(
-            "  Latency: avg {:.0}ms, p95 {}ms, max {}ms",
-            net.avg_download_ms, net.p95_download_ms, net.max_download_ms
+        network.push((
+            "Latency",
+            average_ms(net.avg_download_ms),
+            format!(
+                "average download, p95 {} ms, max {} ms",
+                net.p95_download_ms, net.max_download_ms
+            ),
         ));
         if net.observed_span_ms > 0 {
-            lines.push(format!(
-                "  Observed wall-span throughput: {:.1} MB/s over {} ({} timed downloads, peak {} concurrent)",
-                net.observed_throughput_mbps,
-                format_duration_ms(net.observed_span_ms),
-                net.observed_downloads,
-                net.max_concurrent_downloads
+            network.push((
+                "Throughput",
+                format!("{:.1} MB/s", net.observed_throughput_mbps),
+                format!(
+                    "over {}, {} timed downloads, up to {} at once",
+                    term::duration_ms(net.observed_span_ms),
+                    net.observed_downloads,
+                    net.max_concurrent_downloads
+                ),
             ));
         } else if net.downloads_ok > 0 {
-            lines.push(
-                "  Observed wall-span throughput: unavailable (legacy transfer events)".to_string(),
-            );
+            network.push((
+                "Throughput",
+                "unknown".into(),
+                "older transfer events carry no timing".into(),
+            ));
         }
-        lines.push(format!(
-            "  Cumulative service-time rates: {:.1} MB/s read, {:.1} MB/s open+read, {:.1} MB/s end-to-end",
-            net.body_throughput_mbps, net.network_throughput_mbps, net.throughput_mbps
+        network.push((
+            "Read rate",
+            format!("{:.1} MB/s", net.body_throughput_mbps),
+            format!(
+                "{:.1} MB/s with open, {:.1} MB/s end to end",
+                net.network_throughput_mbps, net.throughput_mbps
+            ),
         ));
         if !net.dominant_download_phase.is_empty() && net.dominant_download_phase_ms > 0 {
-            lines.push(format!(
-                "  Dominant cumulative phase: {} — {} ({:.1}%)",
-                human_download_phase(&net.dominant_download_phase),
-                format_duration_ms(net.dominant_download_phase_ms),
-                net.dominant_download_phase_pct
+            network.push((
+                "Slowest phase",
+                human_download_phase(&net.dominant_download_phase).to_string(),
+                format!(
+                    "{} ({:.1}%)",
+                    term::duration_ms(net.dominant_download_phase_ms),
+                    net.dominant_download_phase_pct
+                ),
             ));
         }
         if net.compression_ratio > 0.0 {
-            lines.push(format!(
-                "  Compression: {:.1}x ratio ({} → {})",
-                net.compression_ratio,
-                format_bytes(net.original_bytes_down),
-                format_bytes(net.bytes_down)
-            ));
-        }
-        if net.total_semaphore_wait_ms > 0
-            || net.total_head_ms > 0
-            || net.total_decompress_ms > 0
-            || net.total_extract_ms > 0
-            || net.total_import_lock_wait_ms > 0
-            || net.total_import_ms > 0
-            || net.total_disk_io_ms > 0
-        {
-            lines.push(format!(
-                "  Cumulative phase time: queue wait {}ms, existence check {}ms, open/setup {}ms, read/transfer {}ms, decompress {}ms, extract {}ms, import lock wait {}ms, import execution {}ms, local disk I/O {}ms",
-                net.total_semaphore_wait_ms,
-                net.total_head_ms,
-                net.total_request_ms,
-                net.total_body_ms,
-                net.total_decompress_ms,
-                net.total_extract_ms,
-                net.total_import_lock_wait_ms,
-                net.total_import_ms,
-                net.total_disk_io_ms
+            network.push((
+                "Compression",
+                format!("{:.1}x", net.compression_ratio),
+                format!(
+                    "{} sent as {}",
+                    term::bytes(net.original_bytes_down),
+                    term::bytes(net.bytes_down)
+                ),
             ));
         }
         if net.blobs_total > 0 {
-            lines.push(format!(
-                "  Blob dedup: {}/{} already local ({:.0}% skipped)",
-                net.blobs_skipped,
-                net.blobs_total,
-                net.blobs_skipped as f64 / net.blobs_total.max(1) as f64 * 100.0
+            network.push((
+                "Blobs",
+                format!(
+                    "{} of {}",
+                    term::count(net.blobs_skipped as u64),
+                    term::count(net.blobs_total as u64)
+                ),
+                format!(
+                    "already local ({:.0}% skipped)",
+                    net.blobs_skipped as f64 / net.blobs_total.max(1) as f64 * 100.0
+                ),
             ));
         }
-        lines.push(String::new());
     }
 
-    if has_storage_data(&report.storage) {
-        lines.push("Storage:".to_string());
-        if report.storage.restored_bytes > 0 {
-            lines.push(format!(
-                "  Restored: {} ({:.1}% zero-copy, {} copied)",
-                format_bytes(report.storage.restored_bytes),
+    let mut storage = Vec::new();
+    if report.storage.restored_bytes > 0 {
+        storage.push((
+            "Restored",
+            term::bytes(report.storage.restored_bytes),
+            format!(
+                "{:.1}% without copying, {} copied",
                 report.storage.zero_copy_pct,
-                format_bytes(report.storage.copied_bytes)
-            ));
-        }
-        match storage_accounting_state(&report.storage) {
-            StorageAccountingState::Consistent => lines.push(format!(
-                "  Store: {} logical -> {} blobs ({} dedup saved)",
-                format_bytes(report.storage.logical_bytes),
-                format_bytes(report.storage.blob_bytes),
-                format_bytes(report.storage.dedup_saved_bytes)
-            )),
-            StorageAccountingState::Inconsistent => lines.push(format!(
-                "  Store accounting inconsistent: {} logical entry bytes, {} indexed blob bytes; the store index needs repair",
-                format_bytes(report.storage.logical_bytes),
-                format_bytes(report.storage.blob_bytes)
-            )),
-            StorageAccountingState::Absent => {}
-        }
-        lines.push(String::new());
+                term::bytes(report.storage.copied_bytes)
+            ),
+        ));
     }
-
-    lines.push(format!(
-        "Stored entries: {} unique keys",
-        report.storage.store_entries
+    match storage_accounting_state(&report.storage) {
+        StorageAccountingState::Consistent => storage.push((
+            "Stored",
+            term::bytes(report.storage.logical_bytes),
+            format!(
+                "as {} of blobs, {} saved by dedup",
+                term::bytes(report.storage.blob_bytes),
+                term::bytes(report.storage.dedup_saved_bytes)
+            ),
+        )),
+        StorageAccountingState::Inconsistent => storage.push((
+            "Stored",
+            "inconsistent".into(),
+            format!(
+                "{} in entries, {} in indexed blobs; the store index needs repair",
+                term::bytes(report.storage.logical_bytes),
+                term::bytes(report.storage.blob_bytes)
+            ),
+        )),
+        StorageAccountingState::Absent => {}
+    }
+    storage.push((
+        "Entries",
+        term::count(report.storage.store_entries as u64),
+        "unique keys".into(),
     ));
+    if report.prefetch.prefetch_hits > 0 {
+        storage.push((
+            "Prefetch",
+            format!(
+                "{} of {}",
+                term::count(report.prefetch.prefetch_hits as u64),
+                term::count(report.prefetch.total_hits as u64)
+            ),
+            format!("hits ({:.1}%)", report.prefetch.contribution_pct),
+        ));
+    }
+    if let Some(gc) = &report.gc {
+        storage.push((
+            "Last GC",
+            local_time(&gc.last_run),
+            format!(
+                "{} entries evicted, {} removed, {} reclaimed on disk, {} still shared, {} blobs removed",
+                term::count(gc.entries_evicted as u64),
+                term::bytes(gc.bytes_freed),
+                term::bytes(gc.disk_bytes_reclaimed),
+                term::bytes(gc.shared_bytes_retained),
+                term::count(gc.blobs_removed as u64)
+            ),
+        ));
+    }
+    lines.extend(term::sections(&[summary, network, storage]));
 
-    // Prefetch
-    lines.push(format!(
-        "Prefetch: {} / {} hits ({:.1}%)",
-        report.prefetch.prefetch_hits, report.prefetch.total_hits, report.prefetch.contribution_pct
-    ));
+    // Where wrapper time went.
+    let mut timing = vec![
+        timing_row("Cache hits", t.hit_time_ms, t.avg_hit_ms, "per hit"),
+        timing_row("Compiles", t.miss_time_ms, t.avg_miss_ms, "per crate"),
+    ];
+    let steps = [
+        ("  cache key", t.total_key_ms, t.avg_key_ms),
+        ("  lookup", t.total_lookup_ms, t.avg_lookup_ms),
+        ("  restore", t.total_restore_ms, t.avg_restore_ms),
+        ("  store", t.total_store_ms, t.avg_store_ms),
+    ];
+    for (step, total, average) in steps {
+        if total > 0 {
+            timing.push(timing_row(step, total, average, ""));
+        }
+    }
+    if s.total_crates > 0 {
+        timing.push(timing_row(
+            "Startup",
+            t.total_startup_ms,
+            t.avg_startup_ms,
+            "per crate",
+        ));
+        timing.push(timing_row(
+            "Dep-info pre-pass",
+            t.total_dep_info_ms,
+            t.avg_dep_info_ms,
+            &format!("per run, {} runs", term::count(t.dep_info_runs)),
+        ));
+        timing.push(vec![
+            "Scheduler wait".into(),
+            term::duration_ms(t.total_wait_ms),
+            String::new(),
+            format!(
+                "{} on a shared compile, {} for a permit",
+                term::duration_ms(t.total_flight_wait_ms),
+                term::duration_ms(t.total_permit_wait_ms)
+            ),
+        ]);
+        timing.push(timing_row(
+            "Unattributed",
+            t.total_unattributed_ms,
+            t.avg_unattributed_ms,
+            "per crate",
+        ));
+    }
     lines.push(String::new());
+    lines.push("Timing".into());
+    lines.extend(term::table(
+        &["", "TOTAL", "AVERAGE", ""],
+        &[Left, Right, Right, Left],
+        &timing,
+    ));
+
+    if let Some(net) = &report.network {
+        let phases = [
+            ("queue wait", net.total_semaphore_wait_ms),
+            ("existence check", net.total_head_ms),
+            ("open/setup", net.total_request_ms),
+            ("read/transfer", net.total_body_ms),
+            ("decompress", net.total_decompress_ms),
+            ("extract", net.total_extract_ms),
+            ("import lock wait", net.total_import_lock_wait_ms),
+            ("import", net.total_import_ms),
+            ("local disk I/O", net.total_disk_io_ms),
+        ];
+        let body: Vec<Vec<String>> = phases
+            .iter()
+            .filter(|(_, ms)| *ms > 0)
+            .map(|(phase, ms)| vec![(*phase).to_string(), term::duration_ms(*ms)])
+            .collect();
+        if !body.is_empty() {
+            lines.push(String::new());
+            lines.push("Download phases".into());
+            lines.extend(term::table(&["", "TIME"], &[Left, Right], &body));
+        }
+    }
 
     if bypass_total(&report.bypass) > 0 {
-        lines.push("Passthroughs/skips:".to_string());
-        for reason in &report.bypass.reasons {
-            lines.push(format!(
-                "  {} via {}: {} ({} total, {} failed, max {})",
-                reason.result,
-                reason.route,
-                reason.reason,
-                reason.count,
-                reason.failures,
-                format_duration_ms(reason.max_elapsed_ms)
+        let body: Vec<Vec<String>> = report
+            .bypass
+            .reasons
+            .iter()
+            .map(|reason| {
+                vec![
+                    term::count(reason.count as u64),
+                    term::count(reason.failures as u64),
+                    term::duration_ms(reason.max_elapsed_ms),
+                    format!("{}, {}", reason.result, reason.route),
+                    reason.reason.clone(),
+                ]
+            })
+            .collect();
+        lines.push(String::new());
+        lines.push("Not cached".into());
+        lines.extend(term::table(
+            &["COUNT", "FAILED", "SLOWEST", "HOW", "WHY"],
+            &[Right, Right, Right, Left, Left],
+            &body,
+        ));
+        // Only worth a table when something took long enough to notice.
+        if report
+            .bypass
+            .slowest
+            .iter()
+            .any(|detail| detail.elapsed_ms >= SLOW_NOT_CACHED_MS)
+        {
+            let body: Vec<Vec<String>> = report
+                .bypass
+                .slowest
+                .iter()
+                .map(|detail| {
+                    vec![
+                        detail.crate_name.clone(),
+                        term::duration_ms(detail.elapsed_ms),
+                        format_exit_code(detail.exit_code),
+                        bypass_detail_reason(detail),
+                    ]
+                })
+                .collect();
+            lines.push(String::new());
+            lines.push("Slowest not cached".into());
+            lines.extend(term::table(
+                &["CRATE", "TIME", "EXIT", "WHY"],
+                &[Left, Right, Right, Left],
+                &body,
             ));
         }
-        if !report.bypass.slowest.is_empty() {
-            lines.push("  Slowest:".to_string());
-            for detail in &report.bypass.slowest {
-                lines.push(format!(
-                    "    {} — {} via {}, {}, exit {}, {}",
-                    detail.crate_name,
-                    detail.result,
-                    detail.route,
-                    format_duration_ms(detail.elapsed_ms),
-                    format_exit_code(detail.exit_code),
-                    bypass_detail_reason(detail)
-                ));
-            }
-        }
-        lines.push(String::new());
     }
 
-    // Top compiled cache-key misses
     if !report.top_misses.is_empty() {
-        lines.push("Top compiled cache-key misses:".to_string());
-        for c in &report.top_misses {
-            // A row that failed to store is not a cold miss that warms up on the
-            // next build; say so where the user is already looking (#629).
-            let not_cached = if c.store_error.is_empty() {
-                String::new()
-            } else {
-                format!("  [not cached: {}]", c.store_error)
-            };
-            lines.push(format!(
-                "  {} — {} ({}){}",
-                c.crate_name,
-                format_duration_ms(c.compile_time_ms),
-                format_bytes(c.size),
-                not_cached,
-            ));
-        }
+        // A row that failed to store is not a cold miss that warms up on the
+        // next build; say so where the user is already looking (#629).
+        let body: Vec<Vec<String>> = report
+            .top_misses
+            .iter()
+            .map(|c| {
+                vec![
+                    c.crate_name.clone(),
+                    term::duration_ms(c.compile_time_ms),
+                    term::bytes(c.size),
+                    if c.store_error.is_empty() {
+                        String::new()
+                    } else {
+                        format!("not cached: {}", c.store_error)
+                    },
+                ]
+            })
+            .collect();
         lines.push(String::new());
+        lines.push("Slowest misses".into());
+        lines.extend(term::table(
+            &["CRATE", "COMPILE", "SIZE", ""],
+            &[Left, Right, Right, Left],
+            &body,
+        ));
     }
 
     if !report.top_hits.is_empty() {
-        lines.push("Expensive cache hits:".to_string());
-        for c in &report.top_hits {
-            lines.push(format!(
-                "  {} — {} avoided ({})",
-                c.crate_name,
-                format_duration_ms(c.compile_time_ms),
-                format_bytes(c.size),
-            ));
-        }
+        let body: Vec<Vec<String>> = report
+            .top_hits
+            .iter()
+            .map(|c| {
+                vec![
+                    c.crate_name.clone(),
+                    term::duration_ms(c.compile_time_ms),
+                    term::bytes(c.size),
+                ]
+            })
+            .collect();
         lines.push(String::new());
+        lines.push("Most valuable hits".into());
+        lines.extend(term::table(
+            &["CRATE", "AVOIDED", "SIZE"],
+            &[Left, Right, Right],
+            &body,
+        ));
     }
 
     if !report.errors_detail.is_empty() {
-        lines.push("Errors:".to_string());
-        for err in report.errors_detail.iter().take(10) {
-            lines.push(format!("  {} — {}", err.crate_name, err.timestamp));
-        }
+        let body: Vec<Vec<String>> = report
+            .errors_detail
+            .iter()
+            .take(10)
+            .map(|err| vec![err.crate_name.clone(), local_time(&err.timestamp)])
+            .collect();
         lines.push(String::new());
+        lines.push("Errors".into());
+        lines.extend(term::table(&["CRATE", "WHEN"], &[Left, Left], &body));
     }
 
-    // Suggestions
     if !report.suggestions.is_empty() {
-        lines.push("Suggestions:".to_string());
-        for s in &report.suggestions {
-            lines.push(format!("  - {s}"));
+        lines.push(String::new());
+        lines.push("Suggestions".into());
+        for suggestion in &report.suggestions {
+            lines.push(format!("  - {suggestion}"));
         }
-        lines.push(String::new());
-    }
-
-    // GC
-    if let Some(gc) = &report.gc {
-        lines.push("GC:".to_string());
-        lines.push(format!("  Last run: {}", gc.last_run));
-        lines.push(format!("  Entries evicted: {}", gc.entries_evicted));
-        lines.push(format!(
-            "  Store bytes removed: {}",
-            format_bytes(gc.bytes_freed)
-        ));
-        lines.push(format!(
-            "  Disk bytes reclaimed: {}",
-            format_bytes(gc.disk_bytes_reclaimed)
-        ));
-        lines.push(format!(
-            "  Shared bytes retained: {}",
-            format_bytes(gc.shared_bytes_retained)
-        ));
-        lines.push(format!("  Blobs removed: {}", gc.blobs_removed));
-        lines.push(String::new());
     }
 
     lines.join("\n")
+}
+
+/// A compile that went uncached and took this long is listed by name.
+const SLOW_NOT_CACHED_MS: u64 = 1_000;
+
+/// `TOTAL`, `AVERAGE` and a note for one row of the timing table.
+fn timing_row(label: &str, total_ms: u64, average: f64, per: &str) -> Vec<String> {
+    vec![
+        label.to_string(),
+        crate::term::duration_ms(total_ms),
+        average_ms(average),
+        per.to_string(),
+    ]
+}
+
+/// An average in milliseconds: a decimal below 10 ms, whole above.
+fn average_ms(ms: f64) -> String {
+    if ms < 10.0 {
+        format!("{ms:.1} ms")
+    } else {
+        format!("{ms:.0} ms")
+    }
+}
+
+/// An RFC 3339 time in this machine's zone, `Sep 30 01:34`; the input
+/// unchanged when it does not parse.
+fn local_time(rfc3339: &str) -> String {
+    DateTime::parse_from_rfc3339(rfc3339)
+        .map(|at| {
+            at.with_timezone(&chrono::Local)
+                .format("%b %d %H:%M")
+                .to_string()
+        })
+        .unwrap_or_else(|_| rfc3339.to_string())
 }
 
 pub fn format_bytes(bytes: u64) -> String {

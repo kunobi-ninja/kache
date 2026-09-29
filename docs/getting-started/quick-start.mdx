@@ -49,7 +49,7 @@ Then build the same revision in the second worktree:
   set -e
   cd "$kache_trial/second"
   KACHE_PROGRESS=hits cargo build --locked --target-dir "$PWD/target"
-  kache report --root "$PWD"
+  kache stats --full --root "$PWD"
 )
 ```
 
@@ -62,7 +62,7 @@ Look for cache hits and restored bytes in the second tree's report. The first bu
 The report covers the second tree's recorded events from the last 24 hours. To see only the latest build session:
 
 ```bash
-kache report --last-build --root "$kache_trial/second"
+kache stats --full --last-build --root "$kache_trial/second"
 ```
 
 A session can include nearby or concurrent Cargo commands in one root; it is not an exact Cargo invocation ID. Only completed, retained compiler events appear. See the [command reference](/docs/commands/reference#kache-report) for the selection rules.
@@ -74,7 +74,7 @@ If the second build misses, run `kache why-miss <crate>` from that worktree, usi
 ## Save a report
 
 ```bash
-kache report --root "$kache_trial/second" --format markdown --output "$kache_trial/reuse.md"
+kache stats --full --root "$kache_trial/second" --format markdown --output "$kache_trial/reuse.md"
 ```
 
 Add `--last-build` to report only the latest session. Open `reuse.md` before sharing it: reports include local paths and crate names, and store inventory covers the whole cache. The command writes a local file; publication is a separate action.

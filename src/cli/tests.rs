@@ -751,17 +751,21 @@ fn gc_stats(evicted: usize, pinned: usize, bytes: u64) -> crate::store::GcStats 
 fn cloned_targets_summary_only_appears_for_retained_blocks() {
     let dir = tempfile::tempdir().unwrap();
     let mut disk = crate::machine::disk_view(dir.path(), 0, 1024);
-    assert!(cloned_targets_line(&disk).is_none());
+    assert!(cloned_targets_row(&disk).map(row_text).is_none());
 
     disk.disk_private_bytes = 3;
     disk.cloned_into_targets_bytes = 7;
-    let line = cloned_targets_line(&disk).expect("cloned blocks need a summary");
+    let line = cloned_targets_row(&disk)
+        .map(row_text)
+        .expect("cloned blocks need a summary");
     assert!(line.contains("3 B"), "{line}");
     assert!(line.contains("7 B cloned"), "{line}");
     assert!(!line.contains("snapshots"), "{line}");
 
     disk.snapshot_retained_bytes = 5;
-    let line = cloned_targets_line(&disk).expect("both retainers are named");
+    let line = cloned_targets_row(&disk)
+        .map(row_text)
+        .expect("both retainers are named");
     assert!(line.contains("7 B cloned"), "{line}");
     assert!(
         line.contains("5 B held only by filesystem snapshots"),
@@ -769,7 +773,9 @@ fn cloned_targets_summary_only_appears_for_retained_blocks() {
     );
 
     disk.cloned_into_targets_bytes = 0;
-    let line = cloned_targets_line(&disk).expect("snapshot blocks need a summary");
+    let line = cloned_targets_row(&disk)
+        .map(row_text)
+        .expect("snapshot blocks need a summary");
     assert!(!line.contains("cloned"), "{line}");
     assert!(line.contains("5 B held only"), "{line}");
 }
@@ -1335,16 +1341,21 @@ fn machine_snapshot_never_checkpoints_the_wal() {
     );
 }
 
-/// The GC line grows a suffix only when there is something to report:
+/// One `kache stats` row as plain text, for assertions.
+fn row_text(row: StatsRow) -> String {
+    format!("{} | {} | {}", row.0, row.1, row.2)
+}
+
+/// The GC note grows a suffix only when there is something to report:
 /// zero failures and zero write time add nothing, one of each adds both.
 /// A record without a driver predates `source`, when only the daemon
-/// wrote one.
+/// wrote one. A time that does not parse is shown as it was recorded.
 #[test]
-fn stats_gc_line_suffixes_start_at_one() {
-    let gc_line = |failed: usize, locked: usize, write_ms: u64, source: &str| {
-        machine_lines(&crate::otel::MachineSnapshot {
+fn stats_gc_note_suffixes_start_at_one() {
+    let gc_rows = |failed: usize, locked: usize, write_ms: u64, source: &str| {
+        machine_rows(&crate::otel::MachineSnapshot {
             gc: Some(crate::report::GcStatsPersisted {
-                last_run: "2026-09-12T12:11:05+00:00".to_string(),
+                last_run: "not a time".to_string(),
                 source: source.to_string(),
                 entries_evicted: 3,
                 entries_failed: failed,
@@ -1354,27 +1365,33 @@ fn stats_gc_line_suffixes_start_at_one() {
             }),
             ..Default::default()
         })
+        .into_iter()
+        .map(row_text)
+        .collect::<Vec<_>>()
     };
     assert_eq!(
-        gc_line(0, 0, 0, "manual"),
-        vec!["GC:        last run 2026-09-12T12:11:05+00:00 (manual): 3 evicted".to_string()]
+        gc_rows(0, 0, 0, "manual"),
+        vec!["Last GC | not a time | manual, 3 evicted".to_string()]
     );
     assert_eq!(
-            gc_line(1, 1, 1, ""),
-            vec![
-                "GC:        last run 2026-09-12T12:11:05+00:00 (daemon): 3 evicted, 1 failed (1 lost the index write lock), 1 ms in index writes"
-                    .to_string()
-            ]
-        );
-    let index_only = machine_lines(&crate::otel::MachineSnapshot {
+        gc_rows(1, 1, 1, ""),
+        vec![
+            "Last GC | not a time | daemon, 3 evicted, 1 failed (1 lost the index write lock), 1 ms in index writes"
+                .to_string()
+        ]
+    );
+    let index_only = machine_rows(&crate::otel::MachineSnapshot {
         index_bytes: Some(4096),
         ..Default::default()
     });
-    assert_eq!(index_only, vec![format!("Index:     {}", ByteSize(4096))]);
+    assert_eq!(
+        index_only.into_iter().map(row_text).collect::<Vec<_>>(),
+        vec!["Index | 4.0 KiB | ".to_string()]
+    );
 }
 
 #[test]
-fn stats_lines_show_the_index_and_a_gc_that_keeps_losing_the_lock() {
+fn stats_rows_show_the_index_and_a_gc_that_keeps_losing_the_lock() {
     let machine = crate::otel::MachineSnapshot {
         store_physical_bytes: None,
         index_bytes: Some(29_074_419_712),
@@ -1397,32 +1414,23 @@ fn stats_lines_show_the_index_and_a_gc_that_keeps_losing_the_lock() {
             ..Default::default()
         }),
     };
-    let lines = machine_lines(&machine);
-    assert!(lines[0].starts_with("Index:"), "{lines:?}");
+    let rows: Vec<String> = machine_rows(&machine).into_iter().map(row_text).collect();
+    assert_eq!(
+        rows[0],
+        "Index | 27.1 GiB | WAL 1.0 GiB · rows written: file_hashes 13,286,285, eviction_tombstones 5,425,819, cc_preprocess_memos 874,517"
+    );
+    assert!(rows[1].starts_with("Last GC | "), "{rows:?}");
     assert!(
-        lines[0].contains(&format!(
-            "{}, WAL {} (rowid high-water:",
-            ByteSize(29_074_419_712),
-            ByteSize(1_073_741_824)
-        )),
-        "{lines:?}"
+        !rows[1].contains("2026-09-12T"),
+        "shown in local time: {rows:?}"
     );
     assert!(
-        lines[0].contains("(rowid high-water: file_hashes 13286285"),
-        "{lines:?}"
+        rows[1].contains("auto, 0 evicted, 40 failed (40 lost the index write lock)"),
+        "{rows:?}"
     );
-    assert!(
-        !lines[0].contains("blobs"),
-        "only the three largest tables: {lines:?}"
-    );
-    assert!(lines[1].contains("(auto)"), "{lines:?}");
-    assert!(
-        lines[1].contains("40 lost the index write lock"),
-        "{lines:?}"
-    );
-    assert!(lines[1].ends_with(", 4200 ms in index writes"), "{lines:?}");
-    assert_eq!(lines.len(), 2, "{lines:?}");
-    assert!(machine_lines(&crate::otel::MachineSnapshot::default()).is_empty());
+    assert!(rows[1].ends_with(", 4200 ms in index writes"), "{rows:?}");
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert!(machine_rows(&crate::otel::MachineSnapshot::default()).is_empty());
 }
 
 /// Dropping a table leaves its pages on the freelist until a compaction.
@@ -3620,6 +3628,24 @@ fn verify_reports_valid_entries_on_a_clean_store() {
     verify(&config, true, false).expect("verify of a clean store should succeed");
 }
 
+/// The `kache stats` row labelled `label` as `label | value | note`, the
+/// same form as [`row_text`].
+fn stats_row(lines: &[String], label: &str) -> Option<String> {
+    let line = lines.iter().find(|line| {
+        line.strip_prefix("  ")
+            .and_then(|rest| rest.strip_prefix(label))
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with("   "))
+    })?;
+    let mut cells = line
+        .split("   ")
+        .map(str::trim)
+        .filter(|cell| !cell.is_empty())
+        .skip(1);
+    let value = cells.next().unwrap_or_default();
+    let note = cells.collect::<Vec<_>>().join("   ");
+    Some(format!("{label} | {value} | {note}"))
+}
+
 #[test]
 #[allow(clippy::field_reassign_with_default)] // incremental snapshot setup reads clearer
 fn render_stats_rich_snapshot_covers_all_lines() {
@@ -3647,19 +3673,26 @@ fn render_stats_rich_snapshot_covers_all_lines() {
         total_logical_size: 4096,
         savings: 2048,
     });
-    let out = render_stats(&snap, &config, SinceWindow::DEFAULT).join("\n");
-    assert!(out.contains("Store:"));
-    assert!(out.contains("Dedup:      4 unique blobs"));
-    assert!(out.contains("Hit rate:"));
-    assert!(out.contains("Weighted:"));
-    assert!(out.contains("Miss share:"));
-    assert!(out.contains("Time saved:"));
-    assert!(out.contains("Daemon:     v9.9.9"));
-    assert!(
-        !out.contains("MISMATCH"),
-        "matching epoch -> no mismatch tag"
+    let lines = render_stats(&snap, &config, SinceWindow::DEFAULT);
+    let row = |label| stats_row(&lines, label).unwrap_or_else(|| panic!("{label}: {lines:#?}"));
+    assert!(row("Cache").starts_with("Cache | 4.9 KiB | of 9.8 KiB"));
+    assert!(row("Dedup").starts_with("Dedup | 4 blobs | "));
+    assert_eq!(
+        row("Hit rate"),
+        "Hit rate | 80.0% | 8 of 10 crates from cache"
     );
-    assert!(out.contains("Remote:     s3://"));
+    assert_eq!(row("By cost"), "By cost | 71.4% | of compile time");
+    assert_eq!(
+        row("Miss time"),
+        "Miss time | 30.0% | of wrapper time (300 ms)"
+    );
+    assert_eq!(row("Time saved"), "Time saved | 5 s | compile work avoided");
+    assert!(row("Daemon").starts_with("Daemon | v9.9.9 | "));
+    assert!(
+        !row("Daemon").contains("restart pending"),
+        "matching epoch -> no mismatch note"
+    );
+    assert!(row("Remote").starts_with("Remote | s3://"));
 }
 
 #[test]
@@ -3675,7 +3708,7 @@ fn render_stats_resilience_requires_both_sources_and_any_single_signal() {
     assert!(
         render_stats(&quiet, &remote_config, SinceWindow::DEFAULT)
             .iter()
-            .all(|line| !line.starts_with("Resilience:"))
+            .all(|line| !line.starts_with("  Resilience "))
     );
 
     let signals = [
@@ -3720,7 +3753,7 @@ fn render_stats_resilience_requires_both_sources_and_any_single_signal() {
         assert!(
             render_stats(&snap, &remote_config, SinceWindow::DEFAULT)
                 .iter()
-                .any(|line| line.starts_with("Resilience:")),
+                .any(|line| line.starts_with("  Resilience ")),
             "{signal} must independently render the resilience section"
         );
     }
@@ -3732,7 +3765,7 @@ fn render_stats_resilience_requires_both_sources_and_any_single_signal() {
     assert!(
         render_stats(&disconnected, &remote_config, SinceWindow::DEFAULT)
             .iter()
-            .all(|line| !line.starts_with("Resilience:"))
+            .all(|line| !line.starts_with("  Resilience "))
     );
     let connected_without_remote = StatsSnapshot {
         daemon_connected: true,
@@ -3746,7 +3779,7 @@ fn render_stats_resilience_requires_both_sources_and_any_single_signal() {
             SinceWindow::DEFAULT
         )
         .iter()
-        .all(|line| !line.starts_with("Resilience:"))
+        .all(|line| !line.starts_with("  Resilience "))
     );
 }
 
@@ -3765,10 +3798,13 @@ fn render_stats_says_when_the_daemon_does_not_list_the_remote() {
             daemon_effective_config: Some(eff),
             ..Default::default()
         };
-        render_stats(&snap, &config, SinceWindow::DEFAULT).join("\n")
+        stats_row(
+            &render_stats(&snap, &config, SinceWindow::DEFAULT),
+            "Listing",
+        )
     };
-    assert!(render(false).contains("Listing:    off"));
-    assert!(!render(true).contains("Listing:"));
+    assert!(render(false).unwrap().starts_with("Listing | off | "));
+    assert_eq!(render(true), None);
 }
 
 #[test]
@@ -3779,9 +3815,9 @@ fn render_stats_prefetch_section_gated_on_activity() {
     // Quiet daemon: no prefetch lines at all.
     let mut quiet = StatsSnapshot::default();
     quiet.daemon_connected = true;
-    let out = render_stats(&quiet, &config, SinceWindow::DEFAULT).join("\n");
-    assert!(!out.contains("Prefetch:"));
-    assert!(!out.contains("Planning:"));
+    let out = render_stats(&quiet, &config, SinceWindow::DEFAULT);
+    assert_eq!(stats_row(&out, "Prefetch"), None);
+    assert_eq!(stats_row(&out, "Planning"), None);
 
     // Active daemon: all lines present with the right arithmetic.
     let mut snap = StatsSnapshot::default();
@@ -3816,41 +3852,66 @@ fn render_stats_prefetch_section_gated_on_activity() {
     let mut eff = effective_config_like(&config);
     eff.remote_key_cache_refresh_secs = 7;
     snap.daemon_effective_config = Some(eff);
-    let out = render_stats(&snap, &config, SinceWindow::DEFAULT).join("\n");
-    assert!(out.contains("Prefetch:   4 downloads"));
-    assert!(out.contains("2 used (50%)"));
-    assert!(out.contains("CANCELLED"));
-    assert!(out.contains("Planning:   1 advisory / 2 fallback plans (last: 7 candidates)"));
-    assert!(out.contains("Transport:  pack 3 requests"));
-    assert!(out.contains("v3 1 requests"));
-    assert!(out.contains("Plan wall:  250 ms last / 500 ms total"));
-    assert!(out.contains("Key LIST:   250000 keys in 88 ms (refreshes every 7s)"));
-    assert!(!out.contains("daemon did not report its cadence"));
-    assert!(out.contains("Join-wait:  5 waits, 1234 ms total"));
+    let out = render_stats(&snap, &config, SinceWindow::DEFAULT);
+    let row = |out: &[String], label| stats_row(out, label).unwrap_or_default();
+    let prefetch = row(&out, "Prefetch");
+    assert!(
+        prefetch.starts_with("Prefetch | 4 downloads | "),
+        "{prefetch}"
+    );
+    assert!(prefetch.contains("2 used (50%)"), "{prefetch}");
+    assert!(prefetch.ends_with(", CANCELLED"), "{prefetch}");
+    assert_eq!(
+        row(&out, "Planning"),
+        "Planning | 1 advisory | 2 fallback plans, last had 7 candidates"
+    );
+    let transport = row(&out, "Transport");
+    assert!(
+        transport.starts_with("Transport | 3 pack requests | "),
+        "{transport}"
+    );
+    assert!(transport.contains("v3 1 requests"), "{transport}");
+    assert_eq!(
+        row(&out, "Plan time"),
+        "Plan time | 250 ms | last plan; 500 ms in all"
+    );
+    assert_eq!(
+        row(&out, "Key LIST"),
+        "Key LIST | 250,000 keys | in 88 ms (refreshes every 7s)"
+    );
+    assert_eq!(
+        row(&out, "Join wait"),
+        "Join wait | 5 waits | 1234 ms in all, waiting on a download already in flight"
+    );
 
     let mut initial_only = config.clone();
     initial_only.remote_key_cache_refresh_secs = 0;
     let mut eff = effective_config_like(&initial_only);
     eff.remote_key_cache_refresh_secs = 0;
     snap.daemon_effective_config = Some(eff);
-    let out = render_stats(&snap, &initial_only, SinceWindow::DEFAULT).join("\n");
-    assert!(out.contains(
-        "Key LIST:   250000 keys in 88 ms (one initial population; periodic refresh disabled)"
-    ));
+    let out = render_stats(&snap, &initial_only, SinceWindow::DEFAULT);
+    assert_eq!(
+        row(&out, "Key LIST"),
+        "Key LIST | 250,000 keys | in 88 ms (one initial population; periodic refresh disabled)"
+    );
 
     let mut disabled = config.clone();
     disabled.prefetch_enabled = false;
-    let out = render_stats(&quiet, &disabled, SinceWindow::DEFAULT).join("\n");
-    assert!(out.contains("Prefetch:   disabled (exact remote lookup and uploads remain enabled)"));
-    assert!(!out.contains("Planning:"));
-    assert!(!out.contains("Key LIST:"));
+    let out = render_stats(&quiet, &disabled, SinceWindow::DEFAULT);
+    assert!(
+        row(&out, "Prefetch")
+            .starts_with("Prefetch | disabled | exact remote lookup and uploads stay on")
+    );
+    assert_eq!(stats_row(&out, "Planning"), None);
+    assert_eq!(stats_row(&out, "Key LIST"), None);
 
     snap.prefetch.last_list_key_count = 0;
-    let out = render_stats(&snap, &config, SinceWindow::DEFAULT).join("\n");
-    assert!(out.contains("Prefetch:   4 downloads"));
-    assert!(
-        !out.contains("Key LIST:"),
-        "zero listed keys must not render a LIST status line: {out}"
+    let out = render_stats(&snap, &config, SinceWindow::DEFAULT);
+    assert!(row(&out, "Prefetch").starts_with("Prefetch | 4 downloads | "));
+    assert_eq!(
+        stats_row(&out, "Key LIST"),
+        None,
+        "zero listed keys must not render a LIST status row"
     );
     snap.prefetch.last_list_key_count = 250_000;
 
@@ -3859,17 +3920,17 @@ fn render_stats_prefetch_section_gated_on_activity() {
     snap.prefetch.pack_requests_total = 0;
     snap.prefetch.v3_requests_total = 0;
     snap.prefetch.last_plan_wall_ms = 0;
-    let out = render_stats(&snap, &config, SinceWindow::DEFAULT).join("\n");
-    assert!(!out.contains("Transport:"));
-    assert!(!out.contains("Plan wall:"));
+    let out = render_stats(&snap, &config, SinceWindow::DEFAULT);
+    assert_eq!(stats_row(&out, "Transport"), None);
+    assert_eq!(stats_row(&out, "Plan time"), None);
 
     snap.prefetch.pack_requests_total = 1;
-    let out = render_stats(&snap, &config, SinceWindow::DEFAULT).join("\n");
-    assert!(out.contains("Transport:  pack 1 requests"));
+    let out = render_stats(&snap, &config, SinceWindow::DEFAULT);
+    assert!(row(&out, "Transport").starts_with("Transport | 1 pack requests | "));
     snap.prefetch.pack_requests_total = 0;
     snap.prefetch.v3_requests_total = 1;
-    let out = render_stats(&snap, &config, SinceWindow::DEFAULT).join("\n");
-    assert!(out.contains("v3 1 requests"));
+    let out = render_stats(&snap, &config, SinceWindow::DEFAULT);
+    assert!(row(&out, "Transport").contains("v3 1 requests"));
 }
 
 /// A daemon-shaped [`crate::daemon::EffectiveConfig`] mirroring `config`,
@@ -3910,12 +3971,17 @@ fn render_stats_prefetch_policy_prefers_daemon_effective() {
     eff.prefetch_enabled = true; // …but the daemon is still planning
     snap.daemon_effective_config = Some(eff);
 
-    let out = render_stats(&snap, &config, SinceWindow::DEFAULT).join("\n");
+    let out = render_stats(&snap, &config, SinceWindow::DEFAULT);
     assert!(
-        !out.contains("Prefetch:   disabled"),
-        "must not claim disabled while the daemon reports enabled: {out}"
+        !stats_row(&out, "Prefetch").is_some_and(|row| row.starts_with("Prefetch | disabled")),
+        "must not claim disabled while the daemon reports enabled: {out:#?}"
     );
-    assert!(out.contains("config /daemon-home/.config/kache/config.toml"));
+    assert!(
+        stats_row(&out, "Daemon")
+            .unwrap()
+            .contains(" · /daemon-home/.config/kache/config.toml"),
+        "{out:#?}"
+    );
 
     // And the inverse: the daemon reports disabled, so the line shows it
     // even though this process's config says enabled — unlabeled, because
@@ -3924,9 +3990,12 @@ fn render_stats_prefetch_policy_prefers_daemon_effective() {
     let mut eff = effective_config_like(&config);
     eff.prefetch_enabled = false;
     snap.daemon_effective_config = Some(eff);
-    let out = render_stats(&snap, &config, SinceWindow::DEFAULT).join("\n");
-    assert!(out.contains("Prefetch:   disabled (exact remote lookup and uploads remain enabled)"));
-    assert!(!out.contains("client config"));
+    let out = render_stats(&snap, &config, SinceWindow::DEFAULT);
+    assert_eq!(
+        stats_row(&out, "Prefetch").unwrap(),
+        "Prefetch | disabled | exact remote lookup and uploads stay on"
+    );
+    assert!(!out.join("\n").contains("client config"));
 }
 
 /// Old-daemon fallback (#689): a daemon that predates effective-config
@@ -3942,15 +4011,18 @@ fn render_stats_prefetch_policy_labels_client_fallback_for_old_daemon() {
 
     let mut snap = StatsSnapshot::default();
     snap.daemon_connected = true; // reachable, but reported no config
+    snap.daemon_build_epoch = crate::daemon::build_epoch();
 
-    let out = render_stats(&snap, &config, SinceWindow::DEFAULT).join("\n");
-    assert!(out.contains(
-        "Prefetch:   disabled (exact remote lookup and uploads remain enabled) \
-             [client config — daemon did not report its policy]"
-    ));
-    assert!(
-        !out.contains(", config "),
-        "no daemon config path to show without a report: {out}"
+    let out = render_stats(&snap, &config, SinceWindow::DEFAULT);
+    assert_eq!(
+        stats_row(&out, "Prefetch").unwrap(),
+        "Prefetch | disabled | exact remote lookup and uploads stay on \
+         [client config — daemon did not report its policy]"
+    );
+    assert_eq!(
+        stats_row(&out, "Daemon").unwrap(),
+        format!("Daemon | v | epoch {}", crate::daemon::build_epoch()),
+        "no daemon config path to show without a report"
     );
 }
 
@@ -4085,20 +4157,22 @@ fn render_stats_remote_state_prefers_daemon_effective() {
     eff.remote_description = None;
     eff.remote_key_cache_refresh_secs = 7;
     snap.daemon_effective_config = Some(eff);
-    let out = render_stats(&snap, &client_remote, SinceWindow::DEFAULT).join("\n");
-    assert!(out.contains("Remote:     not configured"), "{out}");
-    assert!(!out.contains("Remote:     s3://"), "{out}");
+    let out = render_stats(&snap, &client_remote, SinceWindow::DEFAULT);
+    assert_eq!(
+        stats_row(&out, "Remote").unwrap(),
+        "Remote | not configured | "
+    );
 
     let client_local = save_manifest_config(dir.path().join("client-local"), None);
     let mut eff = effective_config_like(&client_local);
     eff.remote_description = Some("s3://daemon-bucket/artifacts".to_string());
     snap.daemon_effective_config = Some(eff);
-    let out = render_stats(&snap, &client_local, SinceWindow::DEFAULT).join("\n");
-    assert!(
-        out.contains("Remote:     s3://daemon-bucket/artifacts"),
-        "{out}"
+    let out = render_stats(&snap, &client_local, SinceWindow::DEFAULT);
+    assert_eq!(
+        stats_row(&out, "Remote").unwrap(),
+        "Remote | s3://daemon-bucket/artifacts | "
     );
-    assert!(!out.contains("client config"), "{out}");
+    assert!(!out.join("\n").contains("client config"), "{out:#?}");
 }
 
 #[test]
@@ -4112,9 +4186,17 @@ fn render_stats_daemon_mismatch_and_local_only() {
     snap.daemon_connected = true;
     snap.daemon_version = "1.0.0".to_string();
     snap.daemon_build_epoch = crate::daemon::build_epoch().wrapping_add(1); // mismatch
-    let out = render_stats(&snap, &config, SinceWindow::DEFAULT).join("\n");
-    assert!(out.contains("MISMATCH — auto-restart pending"));
-    assert!(out.contains("local-only mode"));
+    let out = render_stats(&snap, &config, SinceWindow::DEFAULT);
+    assert!(
+        stats_row(&out, "Daemon")
+            .unwrap()
+            .ends_with(" · a different build than this kache, restart pending")
+    );
+    assert!(
+        stats_row(&out, "Remote")
+            .unwrap()
+            .starts_with("Remote | local-only mode")
+    );
 }
 
 #[test]
@@ -4122,11 +4204,14 @@ fn render_stats_offline_and_not_configured() {
     let dir = tempfile::tempdir().unwrap();
     let config = save_manifest_config(dir.path().join("cache"), None);
     let snap = StatsSnapshot::default(); // daemon_connected=false
-    let out = render_stats(&snap, &config, SinceWindow::DEFAULT).join("\n");
-    assert!(out.contains("Daemon:     offline"));
-    assert!(out.contains("Remote:     not configured"));
-    // No blobs -> no Dedup line.
-    assert!(!out.contains("Dedup:"));
+    let out = render_stats(&snap, &config, SinceWindow::DEFAULT);
+    assert_eq!(stats_row(&out, "Daemon").unwrap(), "Daemon | offline | ");
+    assert_eq!(
+        stats_row(&out, "Remote").unwrap(),
+        "Remote | not configured | "
+    );
+    // No blobs -> no Dedup row.
+    assert_eq!(stats_row(&out, "Dedup"), None);
 }
 
 #[test]
@@ -4147,13 +4232,20 @@ fn render_stats_handles_zero_limits_and_zero_logical_dedup() {
     };
 
     let window = SinceWindow::parse("15m").unwrap();
-    let out = render_stats(&snap, &config, window).join("\n");
-    assert!(out.contains("Store:      500 B / 0 B (0 entries, 0%)"));
-    assert!(out.contains("Dedup:      2 unique blobs, 500 B physical, 0.0% savings"));
-    // #897: the label names the requested window, not a hardcoded 24h.
-    assert!(
-        out.contains("Time saved: n/a (estimated compile work avoided, last 15m)"),
-        "{out}"
+    let out = render_stats(&snap, &config, window);
+    assert_eq!(
+        stats_row(&out, "Cache").unwrap(),
+        "Cache | 500 B | of 0 B · 0 entries"
+    );
+    assert_eq!(
+        stats_row(&out, "Dedup").unwrap(),
+        "Dedup | 2 blobs | 500 B on disk, 0.0% saved"
+    );
+    // #897: the title names the requested window, not a hardcoded 24h.
+    assert_eq!(out[0], "kache · last 15m");
+    assert_eq!(
+        stats_row(&out, "Time saved").unwrap(),
+        "Time saved | none yet | "
     );
 
     let no_blobs = StatsSnapshot {
@@ -4165,10 +4257,11 @@ fn render_stats_handles_zero_limits_and_zero_logical_dedup() {
         }),
         ..Default::default()
     };
-    let out = render_stats(&no_blobs, &config, window).join("\n");
-    assert!(
-        !out.contains("Dedup:"),
-        "an empty blob snapshot must not render a dedup line: {out}"
+    let out = render_stats(&no_blobs, &config, window);
+    assert_eq!(
+        stats_row(&out, "Dedup"),
+        None,
+        "an empty blob snapshot must not render a dedup row"
     );
 }
 

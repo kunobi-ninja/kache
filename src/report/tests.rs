@@ -765,9 +765,15 @@ fn store_failures_are_visible_without_leaving_the_miss_accounting() {
     assert_eq!(report.summary.store_failures, 1);
 
     let text = format_text(&report);
-    assert!(text.contains("Compiled but not cached: 1"), "text: {text}");
+    assert_eq!(
+        text_row(&text, "Not stored").as_deref(),
+        Some("Not stored | 1 | compiled but not cached, so they miss again next build"),
+        "text: {text}"
+    );
     assert!(
-        text.contains("[not cached: refusing to cache zero-byte artifact: liblint.rmeta]"),
+        text_row(&text, "lint_crate")
+            .unwrap()
+            .ends_with(" | not cached: refusing to cache zero-byte artifact: liblint.rmeta"),
         "the miss row should carry the reason: {text}"
     );
 }
@@ -1159,7 +1165,11 @@ fn report_window_narrows_events_and_labels_itself() {
     assert_eq!(wide.meta.since_hours, 24);
     assert_eq!(wide.meta.since_secs, 86_400);
 
-    assert!(format_text(&narrow).contains("kache build report (last 15m)"));
+    assert!(
+        format_text(&narrow).starts_with("kache · last 15m · full report\n"),
+        "{}",
+        format_text(&narrow)
+    );
     assert!(format_markdown(&narrow).contains("| Window | last 15m |"));
     assert!(format_github(&narrow).contains("| **Window** | last 15m |"));
     assert!(format_github(&narrow).contains("· last 15m*"));
@@ -1729,13 +1739,23 @@ fn text_markdown_and_github_reports_show_the_wrapper_phases() {
     let report = generate_report(&config, SinceWindow::DEFAULT, 10).unwrap();
 
     let text = format_text(&report);
-    for line in [
-        "  Startup: ~7ms aggregate (avg 3.5ms/crate)",
-        "  Dep-info pre-pass: 2 runs, ~15ms aggregate (avg 7.5ms/run)",
-        "  Scheduler wait: ~18ms aggregate (flight ~7ms, permit ~11ms)",
-        "  Unattributed: ~47ms aggregate (avg 23.5ms/crate)",
+    for (label, row) in [
+        ("Startup", "Startup | 7 ms | 3.5 ms | per crate"),
+        (
+            "Dep-info pre-pass",
+            "Dep-info pre-pass | 15 ms | 7.5 ms | per run, 2 runs",
+        ),
+        (
+            "Scheduler wait",
+            "Scheduler wait | 18 ms | 7 ms on a shared compile, 11 ms for a permit",
+        ),
+        ("Unattributed", "Unattributed | 47 ms | 24 ms | per crate"),
     ] {
-        assert!(text.contains(line), "text is missing {line:?}:\n{text}");
+        assert_eq!(
+            text_row(&text, label).as_deref(),
+            Some(row),
+            "text is missing {row:?}:\n{text}"
+        );
     }
 
     // Percentages are of tracked wrapper time: 40 + 500 = 540 ms.
@@ -1771,7 +1791,7 @@ fn reports_without_crates_show_no_phase_lines() {
     events::clear_events(&config.event_log_path()).unwrap();
     let report = generate_report(&config, SinceWindow::DEFAULT, 10).unwrap();
     assert_eq!(report.summary.total_crates, 0);
-    assert!(!format_text(&report).contains("Startup:"));
+    assert_eq!(text_row(&format_text(&report), "Startup"), None);
     assert!(!format_markdown(&report).contains("| Startup |"));
     assert!(!format_github(&report).contains("| Startup |"));
 }
@@ -2411,11 +2431,28 @@ fn test_text_output() {
     let report = generate_report(&config, SinceWindow::DEFAULT, 10).unwrap();
 
     let text = format_text(&report);
-    assert!(text.contains("kache build report"));
-    assert!(text.contains("hit rate"));
-    assert!(text.contains("Timing:"));
-    assert!(text.contains("Remote transfer:"));
-    assert!(text.contains("Passthroughs/skips:"));
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines[0], "kache · last 24h · full report");
+    assert!(text_row(&text, "Hit rate").is_some(), "{text}");
+    assert!(lines.contains(&"Timing"), "{text}");
+    assert!(text_row(&text, "Downloaded").is_some(), "{text}");
+    assert!(lines.contains(&"Not cached"), "{text}");
+}
+
+/// The text-report row labelled `label`, its non-empty cells joined with
+/// ` | `. Section rows and table rows both split on three spaces.
+fn text_row(text: &str, label: &str) -> Option<String> {
+    let line = text.lines().find(|line| {
+        line.strip_prefix("  ")
+            .and_then(|rest| rest.strip_prefix(label))
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with("   "))
+    })?;
+    let cells: Vec<&str> = line
+        .split("   ")
+        .map(str::trim)
+        .filter(|cell| !cell.is_empty())
+        .collect();
+    Some(cells.join(" | "))
 }
 
 #[test]
@@ -2466,7 +2503,17 @@ fn render_includes_storage_and_gc_sections_when_present() {
         assert!(rendered.contains("Storage"), "missing Storage section");
     }
     let text = format_text(&report);
-    assert!(text.contains("Storage:"), "text missing Storage section");
+    assert_eq!(
+        text_row(&text, "Stored").as_deref(),
+        Some("Stored | 4.0 KiB | as 2.0 KiB of blobs, 2.0 KiB saved by dedup"),
+        "text missing the Stored row: {text}"
+    );
+    assert!(
+        text_row(&text, "Last GC")
+            .unwrap()
+            .contains("7 entries evicted"),
+        "{text}"
+    );
     // GC summary surfaces its evicted-entry count in every format.
     for rendered in [
         format_markdown(&report),
@@ -2571,12 +2618,38 @@ fn render_network_and_error_sections_with_all_optional_fields() {
 
     let positive_markdown = format_markdown(&report);
     let positive_github = format_github(&report);
-    let positive_text = format_text(&report);
+    let text = format_text(&report);
     assert!(
         positive_github.contains("67 MB/s observed wall span"),
         "GitHub summary must prefer the observed wall-span rate: {positive_github}"
     );
-    for rendered in [positive_markdown, positive_github, positive_text] {
+    // The text report states the same facts as rows and tables.
+    for (label, row) in [
+        ("Uploaded", "Uploaded | 5.0 MiB | 4 ok, 2 failed"),
+        (
+            "Compression",
+            "Compression | 3.2x | 64.0 MiB sent as 20.0 MiB",
+        ),
+        ("Blobs", "Blobs | 6 of 10 | already local (60% skipped)"),
+        ("boom", "boom | "),
+        (
+            "Throughput",
+            "Throughput | 66.7 MB/s | over 300 ms, 10 timed downloads, up to 4 at once",
+        ),
+        (
+            "Read rate",
+            "Read rate | 70.0 MB/s | 60.0 MB/s with open, 50.0 MB/s end to end",
+        ),
+        (
+            "Slowest phase",
+            "Slowest phase | read/transfer | 800 ms (55.5%)",
+        ),
+        ("import lock wait", "import lock wait | 35 ms"),
+    ] {
+        let found = text_row(&text, label).unwrap_or_default();
+        assert!(found.starts_with(row), "missing {row:?}: {text}");
+    }
+    for rendered in [positive_markdown, positive_github] {
         let lower = rendered.to_lowercase();
         // Upload row (uploads_ok > 0) and its compression/existence split.
         assert!(
@@ -2643,12 +2716,23 @@ fn render_network_and_error_sections_with_all_optional_fields() {
 
     let legacy_markdown = format_markdown(&report);
     let legacy_github = format_github(&report);
-    let legacy_text = format_text(&report);
+    let text = format_text(&report);
     assert!(
         legacy_github.contains("70 MB/s cumulative read service"),
         "GitHub summary must label the legacy fallback as cumulative: {legacy_github}"
     );
-    for rendered in [legacy_markdown, legacy_github, legacy_text] {
+    assert_eq!(
+        text_row(&text, "Throughput").as_deref(),
+        Some("Throughput | unknown | older transfer events carry no timing"),
+        "zero observed span must render the legacy-event fallback: {text}"
+    );
+    assert_eq!(
+        text_row(&text, "import lock wait").as_deref(),
+        Some("import lock wait | 35 ms"),
+        "isolated import-lock timing must render the phase row: {text}"
+    );
+    assert_eq!(text_row(&text, "Slowest phase"), None, "{text}");
+    for rendered in [legacy_markdown, legacy_github] {
         let lower = rendered.to_lowercase();
         assert!(
             lower.contains("observed wall-span throughput") && lower.contains("unavailable"),
@@ -2663,11 +2747,17 @@ fn render_network_and_error_sections_with_all_optional_fields() {
     let network = report.network.as_mut().unwrap();
     network.downloads_ok = 0;
     network.total_import_lock_wait_ms = 0;
-    for rendered in [
-        format_markdown(&report),
-        format_github(&report),
-        format_text(&report),
-    ] {
+    let text = format_text(&report);
+    assert_eq!(
+        text_row(&text, "Throughput"),
+        None,
+        "no downloads must not claim a legacy throughput fallback: {text}"
+    );
+    assert!(
+        !text.lines().any(|line| line == "Download phases"),
+        "all-zero phase totals must omit the phase table: {text}"
+    );
+    for rendered in [format_markdown(&report), format_github(&report)] {
         let lower = rendered.to_lowercase();
         assert!(
             !lower.contains("unavailable (legacy transfer events)"),
@@ -3367,8 +3457,13 @@ fn storage_render_flags_impossible_dedup_accounting() {
     assert!(!github.contains("0 B dedup saved"), "{github}");
 
     let text = format_text(&report);
-    assert!(text.contains("Store accounting inconsistent"), "{text}");
-    assert!(text.contains("store index needs repair"), "{text}");
+    assert_eq!(
+        text_row(&text, "Stored").as_deref(),
+        Some(
+            "Stored | inconsistent | 29 B in entries, 56 B in indexed blobs; the store index needs repair"
+        ),
+        "{text}"
+    );
 }
 
 #[test]
@@ -3387,12 +3482,22 @@ fn storage_render_preserves_zero_boundaries_and_summary_choice() {
     for (logical, blobs) in [(1, 0), (0, 1)] {
         let (github, text) = render(logical, blobs, true);
         assert!(github.contains("Store footprint"), "{github}");
-        assert!(text.contains("  Store:"), "{text}");
+        assert!(
+            text_row(&text, "Stored")
+                .unwrap()
+                .starts_with(&format!("Stored | {logical} B | as {blobs} B of blobs")),
+            "{text}"
+        );
     }
     for (logical, blobs) in [(1, 0), (0, 1)] {
         let (github, text) = render(logical, blobs, false);
         assert!(github.contains("accounting inconsistent"), "{github}");
-        assert!(text.contains("Store accounting inconsistent"), "{text}");
+        assert!(
+            text_row(&text, "Stored")
+                .unwrap()
+                .starts_with("Stored | inconsistent | "),
+            "{text}"
+        );
     }
 
     let (github, _) = render(1, 1, true);

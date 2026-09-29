@@ -171,18 +171,15 @@ fn volume_inventory_single_store_and_sort_orders() {
     let window = crate::since::SinceWindow::DEFAULT;
     let snapshot = crate::cli::snapshot_from_direct_reads(&config, false, "name", window, false);
     let lines = crate::cli::render_stats(&snapshot, &config, window);
+    // One store: the summary row only, no per-store row.
     assert_eq!(
         lines
             .iter()
-            .filter(|line| line.starts_with("Store:"))
+            .filter(|line| line.starts_with("  Cache "))
             .count(),
         1
     );
-    assert!(
-        !lines
-            .iter()
-            .any(|line| line.starts_with(&format!("Store {}:", config.cache_dir.display())))
-    );
+    assert!(!lines.iter().any(|line| line.starts_with("  Store ")));
     assert_eq!(
         read(&config, true, "name").unwrap().entries[0].crate_name,
         "a"

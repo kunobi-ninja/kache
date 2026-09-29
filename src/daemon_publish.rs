@@ -252,11 +252,11 @@ impl Daemon {
             // Exactly one wins, even if the socket reply is lost. A missing
             // receipt means the wrapper already gave up. It publishes only if
             // it can take the key back, so keep these snapshots and the claim.
-            if let Err(error) = accept_receipt(&request) {
-                if !receipt_cancelled(&error) {
-                    remove_handoff_files(&owned);
-                    return Err(error);
-                }
+            if let Err(error) = accept_receipt(&request)
+                && !receipt_cancelled(&error)
+            {
+                remove_handoff_files(&owned);
+                return Err(error);
             }
             remove_handoff_files(&request.files);
             let mut request = request;

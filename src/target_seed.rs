@@ -25,7 +25,9 @@
 //!   fingerprint is put in place last, so an interrupted copy leaves a unit
 //!   Cargo rebuilds rather than one it trusts.
 //! - A build script whose recorded output names the other checkout, other
-//!   than its own `OUT_DIR` (which Cargo rewrites), is not copied.
+//!   than its own `OUT_DIR` (which Cargo rewrites), is not copied. Files
+//!   under that script's `out/` are copied unchanged, so one that names
+//!   the other checkout keeps the unit out too.
 //! - The other checkout must have been built by the same `rustc`: the one
 //!   kache recorded while building into it, else the one Cargo's rustc info
 //!   cache names (Cargo does not write that cache when it cannot fingerprint
@@ -57,6 +59,11 @@ const PROFILE: &str = "debug";
 
 /// Where a unit is copied before it is renamed into place.
 const STAGING: &str = ".kache-seeding-";
+
+/// Largest build-script output file searched for a donor path. Caches such
+/// as `CMakeCache.txt` sit well under this. A bigger file is left unread so
+/// one object cannot spend the seeding deadline.
+const OUT_FILE_SCAN_LIMIT: u64 = 1 << 20;
 
 /// Is `args` (the compiler and its arguments) Cargo's target-info probe?
 pub(crate) fn is_target_info_probe(args: &[String]) -> bool {
@@ -275,6 +282,93 @@ fn names_the_donor(profile: &Path, layout: Layout, unit: &Unit, donor: &Donor) -
         .any(|path| rest.contains(path.to_string_lossy().as_ref()))
 }
 
+/// Whether a file under the build script's `out/` names the donor.
+///
+/// Cargo rewrites `OUT_DIR` only when it replays the script's stdout. A
+/// cache written into `out/` (cmake's `CMakeCache.txt` records
+/// `OUT_DIR/build`) still contains the other checkout's path, and copying
+/// it makes the script fail in the new target. The scan runs only when the
+/// script's stdout record exists, so a compiler unit's `out/` is the
+/// artifact itself and is still copied. A file larger than
+/// [`OUT_FILE_SCAN_LIMIT`] is not read. An unreadable file, or a directory
+/// that cannot be listed, keeps the unit out.
+fn out_dir_names_the_donor(profile: &Path, layout: Layout, unit: &Unit, donor: &Donor) -> bool {
+    let stdout = match layout {
+        Layout::PerUnit => profile
+            .join("build")
+            .join(&unit.package)
+            .join(&unit.hash)
+            .join("run/stdout"),
+        Layout::Shared => profile
+            .join("build")
+            .join(format!("{}-{}", unit.package, unit.hash))
+            .join("output"),
+    };
+    if !stdout.is_file() {
+        return false;
+    }
+    let needles = donor_needles(donor);
+    directory_names_the_donor(&build_script_out_dir(profile, layout, unit), &needles)
+}
+
+/// `out/` of a build script: `<unit>/out` since Cargo 1.100, and
+/// `build/<pkg>-<hash>/out` before that.
+fn build_script_out_dir(profile: &Path, layout: Layout, unit: &Unit) -> PathBuf {
+    match layout {
+        Layout::PerUnit => profile
+            .join("build")
+            .join(&unit.package)
+            .join(&unit.hash)
+            .join("out"),
+        Layout::Shared => profile
+            .join("build")
+            .join(format!("{}-{}", unit.package, unit.hash))
+            .join("out"),
+    }
+}
+
+fn donor_needles(donor: &Donor) -> Vec<String> {
+    [&donor.target_dir, &donor.workspace_root]
+        .into_iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .filter(|text| !text.is_empty())
+        .collect()
+}
+
+fn directory_names_the_donor(dir: &Path, needles: &[String]) -> bool {
+    let listed = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(_) => return dir.exists(),
+    };
+    listed.flatten().any(|entry| {
+        let path = entry.path();
+        std::fs::symlink_metadata(&path).is_ok_and(|metadata| {
+            if metadata.is_dir() {
+                directory_names_the_donor(&path, needles)
+            } else {
+                metadata.is_file() && file_names_the_donor(&path, metadata.len(), needles)
+            }
+        })
+    })
+}
+
+fn file_names_the_donor(path: &Path, len: u64, needles: &[String]) -> bool {
+    if len > OUT_FILE_SCAN_LIMIT {
+        return false;
+    }
+    let Ok(bytes) = std::fs::read(path) else {
+        return true;
+    };
+    needles.iter().any(|needle| bytes_contain(&bytes, needle))
+}
+
+fn bytes_contain(haystack: &[u8], needle: &str) -> bool {
+    let needle = needle.as_bytes();
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
+
 /// Copy one unit from the donor profile `from` to `to`. The unit's marker
 /// goes last, by rename.
 fn copy_unit(
@@ -427,7 +521,10 @@ pub(crate) fn seed(
             if Instant::now() >= deadline {
                 break;
             }
-            if marker(&to, layout, &unit).exists() || names_the_donor(&from, layout, &unit, donor) {
+            if marker(&to, layout, &unit).exists()
+                || names_the_donor(&from, layout, &unit, donor)
+                || out_dir_names_the_donor(&from, layout, &unit, donor)
+            {
                 continue;
             }
             match copy_unit(&from, &to, layout, &unit, deadline) {
@@ -983,6 +1080,33 @@ source = "git+https://example.com/gitdep#abc"
         assert_eq!(seed(&bare, VERSION, &[free], later()), Seeded::default());
     }
 
+    fn script_stdout(profile: &Path, layout: Layout) -> PathBuf {
+        match layout {
+            Layout::PerUnit => profile.join("build/dep").join(HASH).join("run/stdout"),
+            Layout::Shared => profile.join("build").join(format!("dep-{HASH}/output")),
+        }
+    }
+
+    fn script_root_output(profile: &Path, layout: Layout) -> PathBuf {
+        script_stdout(profile, layout).with_file_name("root-output")
+    }
+
+    fn cmake_cache(profile: &Path, layout: Layout) -> PathBuf {
+        build_script_out_dir(profile, layout, &unit("dep", HASH)).join("build/CMakeCache.txt")
+    }
+
+    /// Record a build script whose stdout is only its own `OUT_DIR`.
+    fn record_out_dir_stdout(profile: &Path, layout: Layout) -> PathBuf {
+        let out_dir = build_script_out_dir(profile, layout, &unit("dep", HASH));
+        let recorded = out_dir.display().to_string();
+        write(
+            &script_stdout(profile, layout),
+            &format!("cargo:rustc-link-search={recorded}\n"),
+        );
+        write(&script_root_output(profile, layout), &recorded);
+        out_dir
+    }
+
     #[test]
     fn leaves_build_scripts_that_name_the_donor() {
         for layout in [Layout::PerUnit, Layout::Shared] {
@@ -1040,6 +1164,171 @@ source = "git+https://example.com/gitdep#abc"
                 seed(&new, VERSION, std::slice::from_ref(&donor), later()),
                 Seeded::default()
             );
+        }
+    }
+
+    #[test]
+    fn an_output_file_that_names_the_donor_is_not_seeded() {
+        for layout in [Layout::PerUnit, Layout::Shared] {
+            let dir = tempfile::tempdir().unwrap();
+            let donor = donor(dir.path(), "a", layout);
+            let from = donor.target_dir.join(PROFILE);
+            let dep = unit("dep", HASH);
+            let out_dir = record_out_dir_stdout(&from, layout);
+            // The stdout check strips OUT_DIR. The cache file is not rewritten,
+            // and `OUT_DIR/build` still contains the donor target directory.
+            write(
+                &cmake_cache(&from, layout),
+                &format!("CMAKE_CACHEFILE_DIR:INTERNAL={}/build\n", out_dir.display()),
+            );
+            assert!(
+                !names_the_donor(&from, layout, &dep, &donor),
+                "{layout:?}: stdout only names OUT_DIR"
+            );
+            assert!(
+                out_dir_names_the_donor(&from, layout, &dep, &donor),
+                "{layout:?}"
+            );
+            let new = checkout(dir.path(), "b");
+            assert_eq!(
+                seed(&new, VERSION, std::slice::from_ref(&donor), later()),
+                Seeded::default(),
+                "{layout:?}"
+            );
+            assert!(
+                !marker(&new.target_dir.join(PROFILE), layout, &dep).exists(),
+                "{layout:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_output_file_that_does_not_name_the_donor_is_seeded() {
+        for layout in [Layout::PerUnit, Layout::Shared] {
+            let dir = tempfile::tempdir().unwrap();
+            let donor = donor(dir.path(), "a", layout);
+            let from = donor.target_dir.join(PROFILE);
+            let dep = unit("dep", HASH);
+            record_out_dir_stdout(&from, layout);
+            let cache = "portable-cache\n";
+            write(&cmake_cache(&from, layout), cache);
+            assert!(
+                !out_dir_names_the_donor(&from, layout, &dep, &donor),
+                "{layout:?}"
+            );
+            let new = checkout(dir.path(), "b");
+            assert_eq!(
+                seed(&new, VERSION, std::slice::from_ref(&donor), later()),
+                Seeded {
+                    units: 1,
+                    donor: Some(donor.workspace_root.clone()),
+                },
+                "{layout:?}"
+            );
+            let copied = cmake_cache(&new.target_dir.join(PROFILE), layout);
+            assert_eq!(
+                std::fs::read_to_string(&copied).unwrap(),
+                cache,
+                "{layout:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn each_donor_path_is_enough_and_a_long_file_is_not_read() {
+        for layout in [Layout::PerUnit, Layout::Shared] {
+            let dir = tempfile::tempdir().unwrap();
+            let donor = donor(dir.path(), "a", layout);
+            let from = donor.target_dir.join(PROFILE);
+            let dep = unit("dep", HASH);
+            write(&script_stdout(&from, layout), "cargo:rustc-cfg=x\n");
+            let cache = cmake_cache(&from, layout);
+
+            let mut named = donor.clone();
+            named.target_dir = PathBuf::from("/needle-target");
+            named.workspace_root = PathBuf::from("/needle-workspace");
+            write(&cache, "see /needle-workspace/src\n");
+            assert!(
+                out_dir_names_the_donor(&from, layout, &dep, &named),
+                "{layout:?} workspace"
+            );
+            write(&cache, "see /needle-target/debug\n");
+            assert!(
+                out_dir_names_the_donor(&from, layout, &dep, &named),
+                "{layout:?} target"
+            );
+            write(&cache, "see /neither\n");
+            assert!(
+                !out_dir_names_the_donor(&from, layout, &dep, &named),
+                "{layout:?}"
+            );
+
+            let mut blank = donor.clone();
+            blank.target_dir.clear();
+            blank.workspace_root.clear();
+            write(&cache, "x\n");
+            assert!(
+                !out_dir_names_the_donor(&from, layout, &dep, &blank),
+                "{layout:?} empty"
+            );
+
+            let needle = donor.target_dir.to_string_lossy().into_owned();
+            let mut exact = vec![b'a'; 1024 * 1024];
+            exact[..needle.len()].copy_from_slice(needle.as_bytes());
+            std::fs::write(&cache, &exact).unwrap();
+            assert!(
+                out_dir_names_the_donor(&from, layout, &dep, &donor),
+                "{layout:?}: a file at the scan limit is read"
+            );
+            let mut over = vec![b'a'; 1024 * 1024 + 1];
+            over[..needle.len()].copy_from_slice(needle.as_bytes());
+            std::fs::write(&cache, &over).unwrap();
+            assert!(
+                !out_dir_names_the_donor(&from, layout, &dep, &donor),
+                "{layout:?}: a longer file is not read"
+            );
+
+            std::fs::remove_file(script_stdout(&from, layout)).unwrap();
+            write(&cache, &format!("{needle}\n"));
+            assert!(
+                !out_dir_names_the_donor(&from, layout, &dep, &donor),
+                "{layout:?}: no script record, so out/ is the unit's artifact"
+            );
+
+            write(&script_stdout(&from, layout), "cargo:rustc-cfg=x\n");
+            write(&cache, &format!("{needle}\n"));
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let out = build_script_out_dir(&from, layout, &dep);
+                std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o000)).unwrap();
+                assert!(
+                    std::fs::read(&cache).is_err(),
+                    "{layout:?}: mode 000 must be unreadable here"
+                );
+                assert!(
+                    out_dir_names_the_donor(&from, layout, &dep, &donor),
+                    "{layout:?}: an unreadable output file is not copied"
+                );
+                std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+                std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o000)).unwrap();
+                assert!(
+                    out_dir_names_the_donor(&from, layout, &dep, &donor),
+                    "{layout:?}: an unlisted out/ is not copied"
+                );
+                std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+                let outside = dir.path().join("outside.txt");
+                write(&outside, &needle);
+                write(&cache, "portable-cache\n");
+                let link = out.join("linked-cache");
+                std::os::unix::fs::symlink(&outside, &link).unwrap();
+                assert!(
+                    !out_dir_names_the_donor(&from, layout, &dep, &donor),
+                    "{layout:?}: a symlink is not followed"
+                );
+            }
         }
     }
 

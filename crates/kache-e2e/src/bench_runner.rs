@@ -1424,8 +1424,8 @@ fn prepare_clone(
 /// for failure triage.
 ///
 /// The baseline kache env (`KACHE_CACHE_DIR` / `KACHE_CONFIG` /
-/// `RUSTC_WRAPPER` / `KACHE_LOG*`) is set last so a scenario's `[env]`
-/// can't accidentally override it.
+/// `RUSTC_WRAPPER` / `KACHE_SEED_NEW_TARGETS` / `KACHE_LOG*`) is set last
+/// so a scenario's `[env]` can't accidentally override it.
 #[allow(clippy::too_many_arguments)]
 fn build(
     profile: &BenchProfile,
@@ -1498,7 +1498,11 @@ fn build(
                         "kache=warn"
                     },
                 )
-                .env("KACHE_LOG_FILE_PATH", &wrapper_log_path);
+                .env("KACHE_LOG_FILE_PATH", &wrapper_log_path)
+                // A seeded target lets Cargo skip registry units. Those units
+                // never reach the wrapper, and a warm phase then falls short
+                // of the hit floor that says the run restored a cache.
+                .env("KACHE_SEED_NEW_TARGETS", "0");
         }
         CacheBackend::Sccache => {
             cmd.env("SCCACHE_DIR", cache_dir)

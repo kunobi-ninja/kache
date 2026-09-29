@@ -2180,6 +2180,55 @@ build = "sleep 0.2"
     );
 }
 
+/// A measured kache build must not seed the fresh target. Seeding lets Cargo
+/// skip registry units, so the wrapper's hit count is no longer the restore
+/// the warm phase's floor checks. The scenario's own env is applied first
+/// and cannot turn seeding back on.
+#[cfg(unix)]
+#[test]
+fn kache_build_disables_target_seeding() {
+    let dir = tempfile::tempdir().unwrap();
+    let profile_path = dir.path().join("seed.toml");
+    std::fs::write(
+        &profile_path,
+        r#"
+name = "seed"
+repo = "https://example.com/seed.git"
+ref = "v1"
+objdir = "target"
+build = "printf '%s' \"$KACHE_SEED_NEW_TARGETS\" > seed-flag.txt"
+
+[env]
+KACHE_SEED_NEW_TARGETS = "1"
+"#,
+    )
+    .unwrap();
+    let profile = BenchProfile::load(&profile_path).unwrap();
+    let clone = dir.path().join("clone");
+    std::fs::create_dir_all(&clone).unwrap();
+    let work_dir = dir.path().join("work");
+    std::fs::create_dir_all(&work_dir).unwrap();
+
+    build(
+        &profile,
+        &clone,
+        "cold",
+        &dir.path().join("cache"),
+        &dir.path().join("kache.toml"),
+        &dir.path().join("kache"),
+        &work_dir,
+        CacheBackend::Kache,
+        false,
+        &posix_sh().unwrap(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(clone.join("seed-flag.txt")).unwrap(),
+        "0"
+    );
+}
+
 fn prepare_fixture(dir: &Path, prepare: Option<&str>) -> BenchProfile {
     let path = dir.join("prep.toml");
     let prepare = prepare

@@ -1565,6 +1565,12 @@ jobs:
         # musl/darwin matrix legs ignore these.
         CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS=-C target-feature=+crt-static
         CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_RUSTFLAGS=-C target-feature=+crt-static
+        # Link the Linux musl binaries as plain static executables instead of
+        # static-pie. Every compiler invocation starts kache, and a static-pie
+        # binary applies its relocations on each start. kache's own code then
+        # loads at a fixed address. `cross` forwards CARGO_* into its container.
+        CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS=-C relocation-model=static
+        CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUSTFLAGS=-C relocation-model=static
       # --- GCP-KMS code signing (reuses the CODESIGN_* identity for all platforms) ---
       enable_signing: true
       notarize_macos: true

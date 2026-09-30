@@ -470,7 +470,12 @@ fn scan_rust(bytes: &[u8]) -> Result<Vec<Found>> {
     let mut modules: Vec<(String, usize)> = Vec::new();
     let mut depth = 0usize;
     let mut index = 0;
+    let mut previous = None;
     while tokens.get(index).is_some() {
+        // Every step moves forward. A mutated step that does not would hang
+        // the mutation run instead of failing a test.
+        debug_assert!(previous.is_none_or(|previous| index > previous));
+        previous = Some(index);
         if punct_at(&tokens, index, b'#') && punct_at(&tokens, index + 1, b'[') {
             let inner = punct_at(&tokens, index + 2, b'!');
             let start = if inner { index + 3 } else { index + 2 };
@@ -609,7 +614,11 @@ fn close_at(tokens: &[Tok], start: usize, open: u8, close: u8) -> Option<usize> 
 fn rust_tokens(bytes: &[u8]) -> Vec<Tok> {
     let mut out = Vec::new();
     let mut index = 0;
+    let mut previous = None;
     while index < bytes.len() {
+        // Every step moves forward; see `scan_rust`.
+        debug_assert!(previous.is_none_or(|previous| index > previous));
+        previous = Some(index);
         let byte = bytes[index];
         if byte.is_ascii_whitespace() {
             index += 1;
@@ -658,7 +667,9 @@ fn rust_tokens(bytes: &[u8]) -> Vec<Tok> {
         if is_ident_start(byte) {
             let start = index;
             while index < bytes.len() && is_ident_continue(bytes[index]) {
+                let before = index;
                 index += 1;
+                debug_assert!(index > before);
             }
             out.push(Tok::Ident(
                 String::from_utf8_lossy(&bytes[start..index]).into_owned(),
@@ -704,7 +715,9 @@ fn skip_char_or_lifetime(bytes: &[u8], index: usize) -> usize {
             next += 1;
             if bytes.get(next) == Some(&b'{') {
                 while next < bytes.len() && bytes[next] != b'}' {
+                    let before = next;
                     next += 1;
+                    debug_assert!(next > before);
                 }
                 next = next.saturating_add(1);
             }
@@ -725,7 +738,11 @@ fn skip_char_or_lifetime(bytes: &[u8], index: usize) -> usize {
 fn cooked_string(bytes: &[u8], index: usize) -> (String, usize) {
     let mut out = String::new();
     let mut cursor = index + 1;
+    let mut previous = None;
     while cursor < bytes.len() {
+        // Every step moves forward; see `scan_rust`.
+        debug_assert!(previous.is_none_or(|previous| cursor > previous));
+        previous = Some(cursor);
         let byte = bytes[cursor];
         if byte == b'"' {
             return (out, cursor + 1);
@@ -2940,6 +2957,18 @@ mod tests {
         );
         assert!(rewrite_bytes(b"keep", &[]).as_slice() == b"keep");
         assert!(source_rewrites(&stored, &stored).is_empty());
+    }
+
+    /// A crate directory spelled `.` or `/` names no directory. Replacing it
+    /// would rewrite every relative or absolute path in the page.
+    #[test]
+    fn a_crate_directory_without_a_name_is_not_rewritten() {
+        for unnamed in [".", "/"] {
+            let named = vec![record(".", "/src")];
+            let bare = vec![record(".", unnamed)];
+            assert!(source_rewrites(&bare, &named).is_empty(), "{unnamed}");
+            assert!(source_rewrites(&named, &bare).is_empty(), "{unnamed}");
+        }
     }
 
     #[test]

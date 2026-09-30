@@ -24,6 +24,10 @@
 //! - Files are cloned where the filesystem can, else copied. Each unit's
 //!   fingerprint is put in place last, so an interrupted copy leaves a unit
 //!   Cargo rebuilds rather than one it trusts.
+//! - A build script's `OUT_DIR` that a hermetic run left as a link to its
+//!   sealed, shared run in this kache's cache is linked to the same run, and
+//!   recorded as linking to it so the run is kept while the new target uses
+//!   it. Any other symbolic link keeps the unit out.
 //! - A build script whose recorded output names the other checkout, other
 //!   than its own `OUT_DIR` (which Cargo rewrites), is not copied. Files
 //!   under that script's `out/` are copied unchanged, so one that names
@@ -376,6 +380,7 @@ fn copy_unit(
     to: &Path,
     layout: Layout,
     unit: &Unit,
+    cache_dir: &Path,
     deadline: Instant,
 ) -> std::io::Result<()> {
     match layout {
@@ -385,6 +390,7 @@ fn copy_unit(
             place_tree(
                 &from.join("build").join(&unit.package).join(&unit.hash),
                 &package.join(&unit.hash),
+                cache_dir,
                 deadline,
             )
         }
@@ -397,18 +403,19 @@ fn copy_unit(
                 let name = file_name(&file);
                 let ours = name.contains(&format!("{suffix}.")) || name.ends_with(&suffix);
                 if ours && !deps.join(&name).exists() {
-                    place_tree(&file, &deps.join(&name), deadline)?;
+                    place_tree(&file, &deps.join(&name), cache_dir, deadline)?;
                 }
             }
             let build = from.join("build").join(&named);
             if build.is_dir() {
                 std::fs::create_dir_all(to.join("build"))?;
-                place_tree(&build, &to.join("build").join(&named), deadline)?;
+                place_tree(&build, &to.join("build").join(&named), cache_dir, deadline)?;
             }
             std::fs::create_dir_all(to.join(".fingerprint"))?;
             place_tree(
                 &from.join(".fingerprint").join(&named),
                 &to.join(".fingerprint").join(&named),
+                cache_dir,
                 deadline,
             )
         }
@@ -416,10 +423,15 @@ fn copy_unit(
 }
 
 /// Copy `from` (a file or a directory) beside `to` and rename it there.
-fn place_tree(from: &Path, to: &Path, deadline: Instant) -> std::io::Result<()> {
+fn place_tree(from: &Path, to: &Path, cache_dir: &Path, deadline: Instant) -> std::io::Result<()> {
     let staging = to.with_file_name(format!("{STAGING}{}-{}", file_name(to), std::process::id()));
+    let tree = Placing {
+        from,
+        to,
+        cache_dir,
+    };
     let copied =
-        copy_tree(from, &staging, from, deadline).and_then(|()| std::fs::rename(&staging, to));
+        copy_tree(from, &staging, tree, deadline).and_then(|()| std::fs::rename(&staging, to));
     if copied.is_err() {
         let _ = std::fs::remove_dir_all(&staging);
         let _ = std::fs::remove_file(&staging);
@@ -427,16 +439,27 @@ fn place_tree(from: &Path, to: &Path, deadline: Instant) -> std::io::Result<()> 
     copied
 }
 
-/// Copy a file or directory tree, keeping every file's modification time.
-/// A symbolic link that stays inside the tree at `root` is copied as a link;
-/// any other fails the copy, and so does reaching `deadline` before a file.
+/// A tree [`place_tree`] copies: where it comes from, where it is placed,
+/// and the cache whose hermetic runs a link in it may name.
+#[derive(Clone, Copy)]
+struct Placing<'a> {
+    from: &'a Path,
+    to: &'a Path,
+    cache_dir: &'a Path,
+}
+
+/// Copy `from`, a file or directory in `tree`, to `to`, keeping every file's
+/// modification time. A symbolic link that stays inside the tree is copied
+/// as a link, and a build script's `OUT_DIR` linked to its sealed hermetic
+/// run is linked to the same run; any other symbolic link fails the copy,
+/// and so does reaching `deadline` before a file.
 #[cfg_attr(not(unix), allow(clippy::only_used_in_recursion))]
-fn copy_tree(from: &Path, to: &Path, root: &Path, deadline: Instant) -> std::io::Result<()> {
+fn copy_tree(from: &Path, to: &Path, tree: Placing, deadline: Instant) -> std::io::Result<()> {
     let metadata = std::fs::symlink_metadata(from)?;
     if metadata.is_dir() {
         std::fs::create_dir(to)?;
         for entry in entries(from) {
-            copy_tree(&entry, &to.join(file_name(&entry)), root, deadline)?;
+            copy_tree(&entry, &to.join(file_name(&entry)), tree, deadline)?;
         }
         return Ok(());
     }
@@ -446,11 +469,17 @@ fn copy_tree(from: &Path, to: &Path, root: &Path, deadline: Instant) -> std::io:
     #[cfg(unix)]
     if metadata.file_type().is_symlink() {
         let target = std::fs::read_link(from)?;
-        if from
-            .strip_prefix(root)
-            .is_ok_and(|link| crate::build_script::link_stays_inside(link, &target))
-        {
+        let below = from
+            .strip_prefix(tree.from)
+            .map_err(std::io::Error::other)?;
+        if crate::build_script::link_stays_inside(below, &target) {
             return std::os::unix::fs::symlink(target, to);
+        }
+        let cargo_out_dir = tree.to.join(below);
+        if crate::build_script::link_sealed_out_dir(tree.cache_dir, &target, &cargo_out_dir, to)
+            .map_err(std::io::Error::other)?
+        {
+            return Ok(());
         }
     }
     if !metadata.is_file() {
@@ -484,12 +513,14 @@ pub(crate) struct Seeded {
 }
 
 /// Copy the registry units `target` needs from the first donor, most recent
-/// first, built by the `rustc -vV` in `rustc_version` that has any. Stops at
+/// first, built by the `rustc -vV` in `rustc_version` that has any. A link
+/// to a hermetic run is linked again only into `cache_dir`. Stops at
 /// `deadline`.
 pub(crate) fn seed(
     target: &NewTarget,
     rustc_version: &str,
     donors: &[Donor],
+    cache_dir: &Path,
     deadline: Instant,
 ) -> Seeded {
     let Ok(lockfile) = std::fs::read_to_string(target.workspace_root.join("Cargo.lock")) else {
@@ -539,7 +570,7 @@ pub(crate) fn seed(
             {
                 continue;
             }
-            match copy_unit(&from, &to, layout, &unit, deadline) {
+            match copy_unit(&from, &to, layout, &unit, cache_dir, deadline) {
                 Ok(()) => copied += 1,
                 Err(error) => {
                     tracing::debug!("did not seed {}-{}: {error}", unit.package, unit.hash)
@@ -706,6 +737,8 @@ mod tests {
     const HASH: &str = "0123456789abcdef";
     const OTHER: &str = "fedcba9876543210";
     const VERSION: &str = "rustc 1.0.0 (test)\nhost: test\n";
+    /// A cache directory seeding tests without hermetic runs pass.
+    const NO_CACHE: &str = "/nonexistent/kache-cache";
 
     fn args(line: &str) -> Vec<String> {
         line.split_whitespace().map(str::to_owned).collect()
@@ -960,7 +993,13 @@ source = "git+https://example.com/gitdep#abc"
                 filetime::set_file_mtime(&file, old).unwrap();
             }
             let new = checkout(dir.path(), "b");
-            let seeded = seed(&new, VERSION, std::slice::from_ref(&donor), later());
+            let seeded = seed(
+                &new,
+                VERSION,
+                std::slice::from_ref(&donor),
+                Path::new(NO_CACHE),
+                later(),
+            );
             assert_eq!(
                 seeded,
                 Seeded {
@@ -998,7 +1037,13 @@ source = "git+https://example.com/gitdep#abc"
             assert!(marker_from.is_dir(), "the donor keeps its units");
             // A second seeding finds the unit present and copies nothing.
             assert_eq!(
-                seed(&new, VERSION, std::slice::from_ref(&donor), later()),
+                seed(
+                    &new,
+                    VERSION,
+                    std::slice::from_ref(&donor),
+                    Path::new(NO_CACHE),
+                    later()
+                ),
                 Seeded::default()
             );
         }
@@ -1034,12 +1079,19 @@ source = "git+https://example.com/gitdep#abc"
                 &new,
                 "rustc 9.9.9\n",
                 std::slice::from_ref(&wrong_rustc),
+                Path::new(NO_CACHE),
                 later()
             ),
             Seeded::default()
         );
         assert_eq!(
-            seed(&new, "  ", std::slice::from_ref(&wrong_rustc), later()),
+            seed(
+                &new,
+                "  ",
+                std::slice::from_ref(&wrong_rustc),
+                Path::new(NO_CACHE),
+                later()
+            ),
             Seeded::default()
         );
         // A blank version is not a compiler, even where a donor recorded one.
@@ -1050,14 +1102,26 @@ source = "git+https://example.com/gitdep#abc"
             &info.to_string(),
         );
         assert_eq!(
-            seed(&new, "  ", std::slice::from_ref(&blank), later()),
+            seed(
+                &new,
+                "  ",
+                std::slice::from_ref(&blank),
+                Path::new(NO_CACHE),
+                later()
+            ),
             Seeded::default()
         );
         // A build holds the donor's lock: the next donor gives the units.
         let busy = donor(dir.path(), "busy", Layout::Shared);
         let held = try_lock(&busy.target_dir.join(PROFILE).join(".cargo-lock")).unwrap();
         let free = donor(dir.path(), "free", Layout::PerUnit);
-        let seeded = seed(&new, VERSION, &[busy.clone(), free.clone()], later());
+        let seeded = seed(
+            &new,
+            VERSION,
+            &[busy.clone(), free.clone()],
+            Path::new(NO_CACHE),
+            later(),
+        );
         assert_eq!(seeded.donor, Some(free.workspace_root.clone()));
         drop(held);
         // The target itself, and a donor with no units, give nothing.
@@ -1071,13 +1135,19 @@ source = "git+https://example.com/gitdep#abc"
         std::fs::remove_dir_all(empty.target_dir.join(PROFILE)).unwrap();
         std::fs::create_dir_all(empty.target_dir.join(PROFILE)).unwrap();
         assert_eq!(
-            seed(&other, VERSION, &[own, empty], later()),
+            seed(&other, VERSION, &[own, empty], Path::new(NO_CACHE), later()),
             Seeded::default()
         );
         // Past the deadline nothing is copied.
         let late = checkout(dir.path(), "late");
         assert_eq!(
-            seed(&late, VERSION, std::slice::from_ref(&free), Instant::now()),
+            seed(
+                &late,
+                VERSION,
+                std::slice::from_ref(&free),
+                Path::new(NO_CACHE),
+                Instant::now()
+            ),
             Seeded::default()
         );
         // A build holding the new target's lock is left alone.
@@ -1085,7 +1155,13 @@ source = "git+https://example.com/gitdep#abc"
         std::fs::create_dir_all(locked.target_dir.join(PROFILE)).unwrap();
         let ours = try_lock(&locked.target_dir.join(PROFILE).join(".cargo-lock")).unwrap();
         assert_eq!(
-            seed(&locked, VERSION, std::slice::from_ref(&free), later()),
+            seed(
+                &locked,
+                VERSION,
+                std::slice::from_ref(&free),
+                Path::new(NO_CACHE),
+                later()
+            ),
             Seeded::default()
         );
         drop(ours);
@@ -1093,14 +1169,23 @@ source = "git+https://example.com/gitdep#abc"
         let bare = checkout(dir.path(), "bare");
         std::fs::remove_file(bare.workspace_root.join("Cargo.lock")).unwrap();
         assert_eq!(
-            seed(&bare, VERSION, std::slice::from_ref(&free), later()),
+            seed(
+                &bare,
+                VERSION,
+                std::slice::from_ref(&free),
+                Path::new(NO_CACHE),
+                later()
+            ),
             Seeded::default()
         );
         write(
             &bare.workspace_root.join("Cargo.lock"),
             "[[package]]\nname = \"app\"\n",
         );
-        assert_eq!(seed(&bare, VERSION, &[free], later()), Seeded::default());
+        assert_eq!(
+            seed(&bare, VERSION, &[free], Path::new(NO_CACHE), later()),
+            Seeded::default()
+        );
     }
 
     fn script_stdout(profile: &Path, layout: Layout) -> PathBuf {
@@ -1184,7 +1269,13 @@ source = "git+https://example.com/gitdep#abc"
             );
             let new = checkout(dir.path(), "b");
             assert_eq!(
-                seed(&new, VERSION, std::slice::from_ref(&donor), later()),
+                seed(
+                    &new,
+                    VERSION,
+                    std::slice::from_ref(&donor),
+                    Path::new(NO_CACHE),
+                    later()
+                ),
                 Seeded::default()
             );
         }
@@ -1214,7 +1305,13 @@ source = "git+https://example.com/gitdep#abc"
             );
             let new = checkout(dir.path(), "b");
             assert_eq!(
-                seed(&new, VERSION, std::slice::from_ref(&donor), later()),
+                seed(
+                    &new,
+                    VERSION,
+                    std::slice::from_ref(&donor),
+                    Path::new(NO_CACHE),
+                    later()
+                ),
                 Seeded::default(),
                 "{layout:?}"
             );
@@ -1241,7 +1338,13 @@ source = "git+https://example.com/gitdep#abc"
             );
             let new = checkout(dir.path(), "b");
             assert_eq!(
-                seed(&new, VERSION, std::slice::from_ref(&donor), later()),
+                seed(
+                    &new,
+                    VERSION,
+                    std::slice::from_ref(&donor),
+                    Path::new(NO_CACHE),
+                    later()
+                ),
                 Seeded {
                     units: 1,
                     donor: Some(donor.workspace_root.clone()),
@@ -1372,7 +1475,13 @@ source = "git+https://example.com/gitdep#abc"
         #[cfg(not(unix))]
         std::fs::remove_dir_all(unit_dir.join("out")).unwrap();
         let new = checkout(dir.path(), "b");
-        let seeded = seed(&new, VERSION, std::slice::from_ref(&donor), later());
+        let seeded = seed(
+            &new,
+            VERSION,
+            std::slice::from_ref(&donor),
+            Path::new(NO_CACHE),
+            later(),
+        );
         #[cfg(unix)]
         {
             assert_eq!(seeded, Seeded::default());
@@ -1396,7 +1505,7 @@ source = "git+https://example.com/gitdep#abc"
         write(&from.join("out/include/rdkafka.h"), "h");
         std::os::unix::fs::symlink("../include", from.join("out/src/include")).unwrap();
         let to = dir.path().join("copy");
-        place_tree(&from, &to, later()).unwrap();
+        place_tree(&from, &to, Path::new(NO_CACHE), later()).unwrap();
         let link = to.join("out/src/librdkafka.so");
         assert_eq!(
             std::fs::read_link(&link).unwrap(),
@@ -1409,12 +1518,91 @@ source = "git+https://example.com/gitdep#abc"
         );
 
         std::os::unix::fs::symlink("../../../elsewhere", from.join("out/src/up")).unwrap();
-        assert!(place_tree(&from, &dir.path().join("escaped"), later()).is_err());
+        assert!(
+            place_tree(
+                &from,
+                &dir.path().join("escaped"),
+                Path::new(NO_CACHE),
+                later()
+            )
+            .is_err()
+        );
         assert!(!dir.path().join("escaped").exists());
 
         let linked_unit = dir.path().join("linked-unit");
         std::os::unix::fs::symlink("unit", &linked_unit).unwrap();
-        assert!(place_tree(&linked_unit, &dir.path().join("whole"), later()).is_err());
+        assert!(
+            place_tree(
+                &linked_unit,
+                &dir.path().join("whole"),
+                Path::new(NO_CACHE),
+                later()
+            )
+            .is_err()
+        );
+    }
+
+    /// A hermetic run leaves `OUT_DIR` as an absolute link to its sealed,
+    /// shared run. Seeding with the cache that holds the run links the new
+    /// unit's `OUT_DIR` to it and records the link; with any other cache the
+    /// unit is left out. Both layouts.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_to_a_sealed_hermetic_run_is_linked_again_and_recorded() {
+        use crate::build_script::hermetic_test_support::{linked_to, sealed_run};
+        const RUN: &str = "1111222233334444";
+        for layout in [Layout::PerUnit, Layout::Shared] {
+            let dir = tempfile::tempdir().unwrap();
+            let donor = donor(dir.path(), "a", layout);
+            let from = donor.target_dir.join(PROFILE);
+            let run = match layout {
+                Layout::PerUnit => {
+                    let run = from.join("build/dep").join(RUN);
+                    write(&run.join("fingerprint/run-build-script"), "fp");
+                    write(&run.join("run/stdout"), "cargo:rerun-if-changed=build.rs\n");
+                    run
+                }
+                Layout::Shared => {
+                    let named = format!("dep-{RUN}");
+                    write(&from.join(".fingerprint").join(&named).join("run"), "fp");
+                    let run = from.join("build").join(&named);
+                    write(&run.join("output"), "cargo:rerun-if-changed=build.rs\n");
+                    run
+                }
+            };
+            let below = run.join("out");
+            let below = below.strip_prefix(&donor.target_dir).unwrap();
+            let cache = dir.path().join("cache");
+            let shared = sealed_run(&cache, &"ab".repeat(32), below);
+            std::os::unix::fs::symlink(&shared, run.join("out")).unwrap();
+            let elsewhere = dir.path().join("other-cache");
+            let new = checkout(dir.path(), "b");
+            let seeded = seed(
+                &new,
+                VERSION,
+                std::slice::from_ref(&donor),
+                &elsewhere,
+                later(),
+            );
+            assert_eq!(seeded.units, 1, "{layout:?}: only the lib unit");
+            let to = new.target_dir.join(below);
+            assert!(std::fs::symlink_metadata(&to).is_err(), "{layout:?}");
+            assert!(
+                !marker(&new.target_dir.join(PROFILE), layout, &unit("dep", RUN)).exists(),
+                "{layout:?}"
+            );
+
+            let new = checkout(dir.path(), "c");
+            let seeded = seed(&new, VERSION, std::slice::from_ref(&donor), &cache, later());
+            assert_eq!(seeded.units, 2, "{layout:?}: the lib and run units");
+            let to = new.target_dir.join(below);
+            assert_eq!(std::fs::read_link(&to).unwrap(), shared, "{layout:?}");
+            assert_eq!(
+                std::fs::read_to_string(to.join("gen.rs")).unwrap(),
+                "pub const N: u8 = 1;"
+            );
+            assert_eq!(linked_to(&shared, below), vec![to.clone()], "{layout:?}");
+        }
     }
 
     #[test]
@@ -1423,10 +1611,10 @@ source = "git+https://example.com/gitdep#abc"
         let from = dir.path().join("unit");
         write(&from.join("a/file"), "x");
         let to = dir.path().join("copy");
-        let error = place_tree(&from, &to, Instant::now()).unwrap_err();
+        let error = place_tree(&from, &to, Path::new(NO_CACHE), Instant::now()).unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
         assert_eq!(entries(dir.path()), vec![from.clone()]);
-        place_tree(&from, &to, later()).unwrap();
+        place_tree(&from, &to, Path::new(NO_CACHE), later()).unwrap();
         assert_eq!(std::fs::read_to_string(to.join("a/file")).unwrap(), "x");
     }
 
@@ -1436,7 +1624,10 @@ source = "git+https://example.com/gitdep#abc"
     fn a_target_seeding_creates_is_tagged_like_cargos() {
         let dir = tempfile::tempdir().unwrap();
         let new = checkout(dir.path(), "b");
-        assert_eq!(seed(&new, VERSION, &[], later()), Seeded::default());
+        assert_eq!(
+            seed(&new, VERSION, &[], Path::new(NO_CACHE), later()),
+            Seeded::default()
+        );
         let tag = std::fs::read_to_string(new.target_dir.join("CACHEDIR.TAG")).unwrap();
         assert_eq!(tag, CARGO_CACHEDIR_TAG);
         assert!(crate::machine::target_root_is_safe(
@@ -1452,7 +1643,7 @@ source = "git+https://example.com/gitdep#abc"
         let dir = tempfile::tempdir().unwrap();
         let new = checkout(dir.path(), "b");
         std::fs::create_dir_all(&new.target_dir).unwrap();
-        seed(&new, VERSION, &[], later());
+        seed(&new, VERSION, &[], Path::new(NO_CACHE), later());
         assert!(new.target_dir.join(PROFILE).is_dir());
         assert!(!new.target_dir.join("CACHEDIR.TAG").exists());
     }
@@ -1499,7 +1690,13 @@ source = "git+https://example.com/gitdep#abc"
         let new = checkout(dir.path(), "b");
         write(&new.target_dir.join(".rustc_info.json"), "{}");
         assert_eq!(
-            seed(&new, VERSION, std::slice::from_ref(&donor), later()),
+            seed(
+                &new,
+                VERSION,
+                std::slice::from_ref(&donor),
+                Path::new(NO_CACHE),
+                later()
+            ),
             Seeded::default()
         );
         assert!(!new.target_dir.join(PROFILE).join(".fingerprint").exists());

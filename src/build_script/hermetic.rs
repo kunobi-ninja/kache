@@ -29,9 +29,10 @@
 //! is in the key, so it shares only between target directories of one
 //! checkout.
 //!
-//! Every link is recorded beside the sandbox, and [`sweep`] removes a run
-//! once no recorded `OUT_DIR` links to it and none has for a while. Off
-//! unless `KACHE_BUILD_SCRIPT_HERMETIC=1`.
+//! Every link is recorded beside the sandbox, including the ones seeding
+//! makes in a new target directory (see [`crate::target_seed`]), and
+//! [`sweep`] removes a run once no recorded `OUT_DIR` links to it and none
+//! has for a while. Off unless `KACHE_BUILD_SCRIPT_HERMETIC=1`.
 
 use super::{
     MAX_INPUT_FILES, Prediction, Run, ZERO_AR_DATE_ENV, fold, input_state, input_state_as,
@@ -396,6 +397,61 @@ pub(super) fn in_sealed_out_dir(path: &Path) -> bool {
     })
 }
 
+/// Make `link` a symlink to `shared` when `shared` is a sealed run in
+/// `cache_dir`, placed below its sandbox as `cargo_out_dir` is below its
+/// target directory, which is where a hermetic run links that `OUT_DIR`.
+/// `cargo_out_dir` is recorded as linking to the run before the link is
+/// made. `false`, with nothing made, for any other `shared` and while the
+/// run's lock is held exclusively.
+#[cfg(unix)]
+pub(super) fn link_sealed_out_dir(
+    cache_dir: &Path,
+    shared: &Path,
+    cargo_out_dir: &Path,
+    link: &Path,
+) -> Result<bool> {
+    let Some(sandbox) = sandbox_of(cache_dir, shared, cargo_out_dir) else {
+        return Ok(false);
+    };
+    let lock = open_lock(&sandbox.lock_path())?;
+    // Shared, so a sweep cannot remove the run between finding and recording
+    // it; not waited for, so seeding stays within its deadline.
+    if lock.try_lock_shared().is_err() {
+        return Ok(false);
+    }
+    if sealed(&sandbox)?.is_none() {
+        return Ok(false);
+    }
+    record_referrer(&sandbox, cargo_out_dir)?;
+    std::os::unix::fs::symlink(shared, link)?;
+    Ok(true)
+}
+
+/// The sandbox `shared` is the `OUT_DIR` of, when `shared` sits below a
+/// sandbox of `cache_dir` exactly as `cargo_out_dir` sits below its target
+/// directory.
+#[cfg(unix)]
+fn sandbox_of(cache_dir: &Path, shared: &Path, cargo_out_dir: &Path) -> Option<Sandbox> {
+    let target = crate::cargo_layout::out_dir_profile(cargo_out_dir)?.parent()?;
+    let below_target = cargo_out_dir.strip_prefix(target).ok()?;
+    let root = shared.ancestors().nth(below_target.components().count())?;
+    let key = root.file_name()?.to_str()?;
+    (root.parent()? == cache_dir.join(ROOT)
+        && is_sandbox_name(key)
+        && root.join(below_target) == shared)
+        .then(|| Sandbox::new(cache_dir, key, below_target))
+}
+
+/// Whether `name` is what [`Sandbox::new`] names a sandbox: the first 32
+/// lowercase hex digits of a key.
+#[cfg(unix)]
+fn is_sandbox_name(name: &str) -> bool {
+    name.len() == 32
+        && name
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
 /// The sealed run in `sandbox`, if there is one.
 fn sealed(sandbox: &Sandbox) -> Result<Option<Record>> {
     let bytes = match std::fs::read(sandbox.root.join(SEALED)) {
@@ -675,8 +731,161 @@ fn link_search_in(stdout: &str, shared: &Path, cargo_out_dir: &Path) -> String {
 }
 
 #[cfg(all(test, unix))]
+pub(crate) mod test_support {
+    use super::*;
+
+    /// A sealed run for the `OUT_DIR` at `below_target` holding `gen.rs`;
+    /// its shared `OUT_DIR`.
+    pub(crate) fn sealed_run(cache_dir: &Path, key: &str, below_target: &Path) -> PathBuf {
+        let sandbox = Sandbox::new(cache_dir, key, below_target);
+        std::fs::create_dir_all(&sandbox.out_dir).unwrap();
+        std::fs::write(sandbox.out_dir.join("gen.rs"), b"pub const N: u8 = 1;").unwrap();
+        seal(
+            &sandbox,
+            &Record {
+                version: RECORD_VERSION,
+                stdout: String::new(),
+                stderr: String::new(),
+            },
+        )
+        .unwrap();
+        sandbox.out_dir
+    }
+
+    /// The `OUT_DIR`s recorded as still linking to the sealed run `shared`
+    /// of the `OUT_DIR` at `below_target`.
+    pub(crate) fn linked_to(shared: &Path, below_target: &Path) -> Vec<PathBuf> {
+        let root = shared
+            .ancestors()
+            .nth(below_target.components().count())
+            .unwrap();
+        live_referrers(root).unwrap()
+    }
+}
+
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    /// Seeding links a new target's `OUT_DIR` to the run the donor's links
+    /// to only where a hermetic run of that unit would link it, only in this
+    /// kache's cache, and only while the run is sealed and free, recording
+    /// the link first. Both of Cargo's layouts.
+    #[test]
+    fn a_sealed_run_is_linked_again_only_from_its_own_place() {
+        for (below, other_unit) in [
+            (
+                "debug/build/z-0123456789abcdef/out",
+                "debug/build/y-0123456789abcdef/out",
+            ),
+            (
+                "debug/build/z/0123456789abcdef/out",
+                "debug/build/z/fedcba9876543210/out",
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let below = Path::new(below);
+            let cache = dir.path().join("cache");
+            let shared = test_support::sealed_run(&cache, &"ab".repeat(32), below);
+            let cargo = dir.path().join("new/target").join(below);
+            std::fs::create_dir_all(cargo.parent().unwrap()).unwrap();
+            let staging = cargo.with_file_name("staging");
+
+            assert!(link_sealed_out_dir(&cache, &shared, &cargo, &staging).unwrap());
+            assert_eq!(std::fs::read_link(&staging).unwrap(), shared);
+            std::fs::rename(&staging, &cargo).unwrap();
+            assert_eq!(test_support::linked_to(&shared, below), vec![cargo.clone()]);
+            std::fs::remove_file(&cargo).unwrap();
+
+            let refused = |cache: &Path, shared: &Path, cargo_out_dir: &Path| {
+                let made = link_sealed_out_dir(cache, shared, cargo_out_dir, &staging).unwrap();
+                assert!(std::fs::symlink_metadata(&staging).is_err());
+                !made
+            };
+            let other_unit = dir.path().join("new/target").join(other_unit);
+            assert!(
+                refused(&cache, &shared, &other_unit),
+                "another unit's place"
+            );
+            assert!(
+                refused(
+                    &cache,
+                    &shared,
+                    &dir.path().join("new/target/debug/deps/out")
+                ),
+                "not a build script's OUT_DIR"
+            );
+            let relative = shared.strip_prefix(dir.path()).unwrap();
+            assert!(refused(&cache, relative, &cargo), "a relative link");
+
+            let root = dir.path().join("elsewhere/v2/k");
+            let elsewhere = Sandbox {
+                out_dir: root.join(below),
+                root,
+            };
+            std::fs::create_dir_all(&elsewhere.out_dir).unwrap();
+            let record = Record {
+                version: RECORD_VERSION,
+                stdout: String::new(),
+                stderr: String::new(),
+            };
+            seal(&elsewhere, &record).unwrap();
+            assert!(
+                refused(&cache, &elsewhere.out_dir, &cargo),
+                "sealed, but not under out-dirs/v2"
+            );
+            remove_sandbox(&elsewhere.root).unwrap();
+
+            let other_cache = dir.path().join("other-cache");
+            let foreign = test_support::sealed_run(&other_cache, &"ab".repeat(32), below);
+            assert!(
+                refused(&cache, &foreign, &cargo),
+                "sealed in another cache's out-dirs/v2"
+            );
+            assert!(
+                !other_cache
+                    .join(ROOT)
+                    .join("ab".repeat(16))
+                    .with_extension("lock")
+                    .exists()
+            );
+            for (name, why) in [
+                ("AB".repeat(16), "not lowercase"),
+                ("ab".repeat(15), "shorter than a sandbox name"),
+                ("gh".repeat(16), "not hex"),
+            ] {
+                let misnamed = Sandbox {
+                    root: cache.join(ROOT).join(&name),
+                    out_dir: cache.join(ROOT).join(&name).join(below),
+                };
+                std::fs::create_dir_all(&misnamed.out_dir).unwrap();
+                seal(&misnamed, &record).unwrap();
+                assert!(refused(&cache, &misnamed.out_dir, &cargo), "{why}");
+                assert!(live_referrers(&misnamed.root).unwrap().is_empty());
+                remove_sandbox(&misnamed.root).unwrap();
+            }
+
+            let unsealed = Sandbox::new(&cache, &"cd".repeat(32), below);
+            std::fs::create_dir_all(&unsealed.out_dir).unwrap();
+            assert!(
+                refused(&cache, &unsealed.out_dir, &cargo),
+                "an unfinished attempt"
+            );
+            assert!(live_referrers(&unsealed.root).unwrap().is_empty());
+
+            let swept = Sandbox::new(&cache, &"ab".repeat(32), below);
+            let held = open_lock(&swept.lock_path()).unwrap();
+            held.try_lock().unwrap();
+            assert!(refused(&cache, &shared, &cargo), "a sweep holds the run");
+            drop(held);
+            assert_eq!(
+                test_support::linked_to(&shared, below),
+                Vec::<PathBuf>::new()
+            );
+            remove_sandbox(&swept.root).unwrap();
+            remove_sandbox(foreign.ancestors().nth(below.components().count()).unwrap()).unwrap();
+        }
+    }
 
     #[test]
     fn only_link_search_paths_under_the_shared_out_dir_are_respelled() {

@@ -328,4 +328,23 @@ mod tests {
         assert_eq!(setting.0, "/project/shim/rustdoc");
         assert_eq!(setting.1, project.join(".cargo/config.toml"));
     }
+
+    #[test]
+    fn cargo_rustdoc_setting_reads_the_cargo_home_config() {
+        let _lock = crate::config::config_path_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let cargo_home = dir.path().join("cargo-home");
+        std::fs::create_dir_all(&cargo_home).unwrap();
+        std::fs::write(
+            cargo_home.join("config.toml"),
+            "[build]\nrustdoc = \"/shim/rustdoc\"\n",
+        )
+        .unwrap();
+        let _cargo =
+            crate::config::tests::set_env_for_test("CARGO_HOME", Some(cargo_home.as_os_str()));
+        let _home = crate::config::tests::set_env_for_test("HOME", Some(dir.path().as_os_str()));
+        let (value, path) = cargo_rustdoc_setting().expect("configured rustdoc");
+        assert_eq!(value, "/shim/rustdoc");
+        assert_eq!(path, cargo_home.join("config.toml"));
+    }
 }

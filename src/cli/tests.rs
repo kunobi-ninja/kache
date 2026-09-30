@@ -2767,12 +2767,17 @@ fn apply_rustdoc_edit_inserts_replaces_and_leaves_a_correct_line() {
     );
     let correct = "[build]\nrustdoc = \"/shim/rustdoc\"";
     assert_eq!(apply_rustdoc_edit(correct, shim), correct);
-    let net = "[net]\noffline = true\n";
-    let appended = apply_rustdoc_edit(net, shim);
-    assert!(appended.contains("[net]\n"));
-    assert!(appended.contains("offline = true\n"));
-    assert!(appended.ends_with("[build]\nrustdoc = \"/shim/rustdoc\"\n"));
-    assert_eq!(appended.matches("rustdoc =").count(), 1);
+    assert_eq!(
+        apply_rustdoc_edit(
+            "[build]\nrustc-wrapper = \"kache\"\nrustdoc = \"/old\"\n",
+            shim
+        ),
+        "[build]\nrustc-wrapper = \"kache\"\nrustdoc = \"/shim/rustdoc\"\n"
+    );
+    assert_eq!(
+        apply_rustdoc_edit("[net]\noffline = true\n", shim),
+        "[net]\noffline = true\n\n[build]\nrustdoc = \"/shim/rustdoc\"\n"
+    );
     let extra = "[build]\nrustdoc-extra = \"keep\"\n# rustdoc = \"no\"\nrustdoc = \"/a\"\nrustdoc = \"/b\"\n";
     let replaced = apply_rustdoc_edit(extra, shim);
     assert!(replaced.contains("rustdoc-extra = \"keep\""));
@@ -2792,6 +2797,13 @@ fn apply_rustdoc_edit_inserts_replaces_and_leaves_a_correct_line() {
         edited.contains("[build]\nrustdoc = \"/shim/rustdoc\"\nrustc-wrapper = \"kache\"\n"),
         "{edited}"
     );
+    let later = "[build]\nrustc-wrapper = \"kache\"\n[env]\nrustdoc = \"/keep\"\n";
+    let edited = apply_rustdoc_edit(later, shim);
+    assert_eq!(
+        edited,
+        "[build]\nrustdoc = \"/shim/rustdoc\"\nrustc-wrapper = \"kache\"\n[env]\nrustdoc = \"/keep\"\n",
+        "{edited}"
+    );
     for distractor in ["note]", "[not-closed"] {
         let body =
             format!("[build]\nrustc-wrapper = \"kache\"\n{distractor}\nrustdoc = \"/old\"\n");
@@ -2803,6 +2815,15 @@ fn apply_rustdoc_edit_inserts_replaces_and_leaves_a_correct_line() {
             "{distractor}: {edited}"
         );
     }
+}
+
+#[test]
+fn rustdoc_doctor_fix_is_present_only_when_the_check_fails() {
+    assert_eq!(rustdoc_doctor_fix(true), None);
+    assert_eq!(
+        rustdoc_doctor_fix(false).as_deref(),
+        Some("point build.rustdoc at the rustdoc shim from kache init")
+    );
 }
 
 #[test]

@@ -5637,8 +5637,7 @@ pub fn doctor(
         label: "cargo doc",
         pass: doc_pass,
         detail: doc_class.to_string(),
-        fix: (!doc_pass)
-            .then(|| "point build.rustdoc at the rustdoc shim from kache init".to_string()),
+        fix: rustdoc_doctor_fix(doc_pass),
     });
 
     // 3b. Host config layer
@@ -7871,6 +7870,7 @@ fn cargo_config_target_path() -> std::path::PathBuf {
 }
 
 /// `build.rustdoc` assignment, not `rustdoc-extra` and not a comment.
+#[cfg(any(test, unix))]
 pub(crate) fn is_rustdoc_assignment(line: &str) -> bool {
     let Some(rest) = line.trim().strip_prefix("rustdoc") else {
         return false;
@@ -7878,10 +7878,12 @@ pub(crate) fn is_rustdoc_assignment(line: &str) -> bool {
     rest.trim_start().starts_with('=')
 }
 
+#[cfg(any(test, unix))]
 fn closes_toml_table(trimmed: &str) -> bool {
     trimmed.starts_with('[') && trimmed.ends_with(']')
 }
 
+#[cfg(any(test, unix))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RustdocEdit {
     Skip,
@@ -7890,6 +7892,7 @@ pub(crate) enum RustdocEdit {
     Write,
 }
 
+#[cfg(any(test, unix))]
 pub(crate) fn rustdoc_edit_decision(
     wrapper: Option<&str>,
     current: Option<&str>,
@@ -7907,6 +7910,7 @@ pub(crate) fn rustdoc_edit_decision(
 
 /// Insert or replace `build.rustdoc`. A line that already names `shim_path`
 /// is returned unchanged. `rustdoc-extra` and comments are left in place.
+#[cfg(any(test, unix))]
 pub(crate) fn apply_rustdoc_edit(existing: &str, shim_path: &str) -> String {
     let assignment = format!("rustdoc = \"{shim_path}\"");
     if existing.trim().is_empty() {
@@ -7982,6 +7986,10 @@ pub(crate) fn rustdoc_shim_path_shape(value: &str) -> bool {
 #[cfg(any(test, unix))]
 pub(crate) fn rustdoc_shim_path_ok(value: &str) -> bool {
     rustdoc_shim_path_shape(value) && std::path::Path::new(value).is_file()
+}
+
+pub(crate) fn rustdoc_doctor_fix(pass: bool) -> Option<String> {
+    (!pass).then(|| "point build.rustdoc at the rustdoc shim from kache init".to_string())
 }
 
 pub(crate) fn rustdoc_doctor_fields(

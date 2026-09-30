@@ -358,9 +358,9 @@ fn act_takes_value(act: Act) -> bool {
 
 fn classify(arg: &str) -> Option<(Act, Option<&str>)> {
     if let Some((name, value)) = arg.split_once('=')
-        && name.starts_with("--")
+        && let Some(act) = long_act(name)
     {
-        return long_act(name).map(|act| (act, Some(value)));
+        return Some((act, Some(value)));
     }
     if arg.starts_with("--") {
         return long_act(arg).map(|act| (act, None));
@@ -1266,6 +1266,73 @@ mod tests {
     }
 
     #[test]
+    fn flags_keep_their_values_and_do_not_swallow_sources() {
+        let missing = parse(&["rustdoc", "--out-dir"]);
+        assert!(missing.unknown);
+        assert!(missing.out_dir.is_none());
+
+        let verbose = parse(&["rustdoc", "--verbose", "src/lib.rs"]);
+        assert!(!verbose.unknown);
+        assert_eq!(verbose.sources, vec![PathBuf::from("src/lib.rs")]);
+        assert!(verbose.keyed.iter().any(|item| item == "bare"));
+
+        let private = parse(&["rustdoc", "--document-private-items", "src/lib.rs"]);
+        assert!(!private.unknown);
+        assert_eq!(private.sources, vec![PathBuf::from("src/lib.rs")]);
+
+        let out = parse(&["rustdoc", "--out-dir", "/tmp/doc"]);
+        assert!(!out.unknown);
+        assert_eq!(out.out_dir.as_deref(), Some(Path::new("/tmp/doc")));
+
+        let inline = parse(&["rustdoc", "--crate-name=demo", "file=name.rs"]);
+        assert_eq!(inline.crate_name.as_deref(), Some("demo"));
+        assert_eq!(inline.sources, vec![PathBuf::from("file=name.rs")]);
+        assert!(!inline.unknown);
+
+        let stopped = parse(&["rustdoc", "--", "--crate-name", "demo"]);
+        assert_eq!(
+            stopped.sources,
+            vec![PathBuf::from("--crate-name"), PathBuf::from("demo")]
+        );
+        assert!(stopped.crate_name.is_none());
+
+        let externed = parse(&["rustdoc", "--extern", "demo=/tmp/libdemo.rlib"]);
+        assert_eq!(
+            externed.externs,
+            vec![("demo".to_string(), Some(PathBuf::from("/tmp/libdemo.rlib")))]
+        );
+
+        let tested = parse(&["rustdoc", "--test-args"]);
+        assert!(tested.blocked);
+        assert!(!tested.unknown);
+
+        let header = parse(&["rustdoc", "--html-in-header", "header.html"]);
+        assert!(!header.unknown);
+        assert_eq!(header.html_files, vec![PathBuf::from("header.html")]);
+
+        let refused = parse(&["rustdoc", "--test"]);
+        assert!(!RustdocCompiler.refuse_reasons(&refused).is_empty());
+    }
+
+    #[test]
+    fn a_directory_dep_info_is_not_stored() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut parsed = parse(&["rustdoc"]);
+        parsed.dep_info = Some(dir.path().to_path_buf());
+        let bundle = files_written(&parsed, &BTreeMap::new(), &BTreeMap::new()).unwrap();
+        assert!(bundle.depinfo.is_none());
+    }
+
+    #[test]
+    fn rewrite_bytes_replaces_one_path_and_keeps_the_suffix() {
+        let out = rewrite_bytes(
+            b"see /old/lib.rs now",
+            &[(b"/old/lib.rs".to_vec(), b"/new/lib.rs".to_vec())],
+        );
+        assert_eq!(out, b"see /new/lib.rs now");
+    }
+
+    #[test]
     fn merge_none_is_cacheable_only_with_its_inputs() {
         let full = parse_args(&crate_argv("/out", "/parts", "src/lib.rs"));
         assert!(refusal(&full).is_none(), "{full:?}");
@@ -1858,5 +1925,58 @@ mod tests {
         assert_eq!(compiled.exit_code, 0);
         assert_eq!(compiled.stdout, "out\n");
         assert_eq!(compiled.stderr, "err\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_refused_run_returns_rustdoc_status_and_records_the_event() {
+        let _lock = crate::config::config_path_lock();
+        let _root = crate::config::tests::set_env_for_test(
+            "KACHE_EVENT_ROOT",
+            Some(std::ffi::OsStr::new("")),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("rustdoc");
+        let source = dir.path().join("lib.rs");
+        std::fs::write(&source, "pub fn demo() {}\n").unwrap();
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nif [ \"$1\" = \"-Vv\" ]; then echo 'rustdoc 1.98.0-fake'; exit 0; fi\nif [ \"$1\" = \"--version\" ]; then echo version; exit 7; fi\nout=; parts=; name=\nwhile [ $# -gt 0 ]; do\n  case \"$1\" in\n    -o|--out-dir) out=\"$2\"; shift 2 ;;\n    --parts-out-dir) parts=\"$2\"; shift 2 ;;\n    --crate-name) name=\"$2\"; shift 2 ;;\n    *) shift ;;\n  esac\ndone\nmkdir -p \"$out/$name\" \"$parts\"\nprintf '<p>demo</p>\\n' > \"$out/$name/index.html\"\nprintf '{}\\n' > \"$parts/$name.json\"\nexit 0\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let cache = dir.path().join("cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        let mut config = crate::test_support::test_config(cache);
+        config.daemon_publish = false;
+        let program = script.to_string_lossy().to_string();
+        let out = dir.path().join("doc");
+        let parts = dir.path().join("parts");
+        let code = run(
+            &config,
+            &argv(&[
+                &program,
+                "--crate-name",
+                "demo",
+                &source.to_string_lossy(),
+                "-o",
+                &out.to_string_lossy(),
+                "--parts-out-dir",
+                &parts.to_string_lossy(),
+                "--merge=none",
+                "-Z",
+                "unstable-options",
+            ]),
+        )
+        .unwrap();
+        assert_eq!(code, 0);
+        let log = std::fs::read_to_string(config.event_log_path()).unwrap();
+        assert!(log.contains("\"result\":\"miss\""), "{log}");
+        assert!(log.contains("\"root\":"), "{log}");
+        let version = run(&config, &argv(&[&program, "--version"])).unwrap();
+        assert_eq!(version, 7);
+        let log = std::fs::read_to_string(config.event_log_path()).unwrap();
+        assert!(log.contains("\"result\":\"passthrough\""), "{log}");
     }
 }

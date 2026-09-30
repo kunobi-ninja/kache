@@ -685,7 +685,8 @@ impl Environment {
     /// not replaced inside `/t/out2`), and only as Cargo spelled it. Any path
     /// left that does not start at a placeholder (`/usr/include`, a sibling
     /// of the checkout) would come back unchanged in another checkout, so
-    /// such text is not rewritten and stays bound to its roots.
+    /// such text is not rewritten and stays bound to its roots. A web or Git
+    /// URL is not such a path (see [`only_placeholder_paths`]).
     fn rewrite_text(&self, contents: &[u8]) -> Option<Vec<u8>> {
         if contents.contains(&0)
             || std::str::from_utf8(contents).is_err()
@@ -710,7 +711,12 @@ impl Environment {
                 placeholder.as_bytes(),
             );
         }
-        (normalized != contents && only_placeholder_paths(&normalized)).then_some(normalized)
+        // A root that is not a whole path (inside a URL) was not replaced.
+        let unreplaced = self.spellings.iter().any(|(root, _)| {
+            find_bytes(&normalized, root.as_os_str().as_encoded_bytes()).is_some()
+        });
+        (normalized != contents && !unreplaced && only_placeholder_paths(&normalized))
+            .then_some(normalized)
     }
 
     /// Sort the recorded files by how they name machine-local roots. A text
@@ -880,18 +886,65 @@ fn replace_whole_paths(haystack: &[u8], needle: &[u8], replacement: &[u8]) -> Ve
 }
 
 /// Whether every path in `text` starts at a placeholder or a `${var}`
-/// reference: each `/` belongs to a word that begins with `${`.
+/// reference: each `/` belongs to a word that begins with `${`, or to a web
+/// or Git URL (a pkg-config `URL:` line), which names no local path.
 fn only_placeholder_paths(text: &[u8]) -> bool {
-    let delimiter = |byte: u8| byte.is_ascii_whitespace() || b"\"'`=:;,()<>[]|".contains(&byte);
     let mut word_start = 0;
+    let mut url_end = 0;
     for (index, &byte) in text.iter().enumerate() {
-        if delimiter(byte) {
+        if index < url_end {
+            continue;
+        }
+        if ends_word(byte) {
             word_start = index + 1;
+        } else if byte == b'/' && is_url_authority(text, index) {
+            url_end = end_of_url(text, index);
         } else if byte == b'/' && !text[word_start..].starts_with(b"${") {
             return false;
         }
     }
     true
+}
+
+/// A byte that ends a word of a path list or a pkg-config line.
+fn ends_word(byte: u8) -> bool {
+    byte.is_ascii_whitespace() || b"\"'`=:;,()<>[]|".contains(&byte)
+}
+
+/// Schemes whose URLs name no local path. `git+` may precede any of them.
+const URL_SCHEMES: [&[u8]; 5] = [b"http", b"https", b"ftp", b"git", b"ssh"];
+
+/// Whether `text[at..]` is the `//authority` of a URL: it follows `scheme:`,
+/// and the scheme is one of [`URL_SCHEMES`]. A drive letter (`C://`) and a
+/// filesystem scheme (`file:`, `nfs:`) name local paths.
+fn is_url_authority(text: &[u8], at: usize) -> bool {
+    let Some(colon) = at.checked_sub(1) else {
+        return false;
+    };
+    if text[colon] != b':' || !text[at..].starts_with(b"//") {
+        return false;
+    }
+    let scheme_start = text[..colon]
+        .iter()
+        .rposition(|&byte| !(byte.is_ascii_alphanumeric() || b"+-.".contains(&byte)))
+        .map_or(0, |before| before + 1);
+    let scheme = text[scheme_start..colon].to_ascii_lowercase();
+    let scheme = scheme.strip_prefix(b"git+").unwrap_or(&scheme[..]);
+    URL_SCHEMES.contains(&scheme)
+}
+
+/// Where the URL whose `//authority` starts at `at` ends: at the first byte
+/// that ends a word, except a `:` in the authority (`host:8080`).
+fn end_of_url(text: &[u8], at: usize) -> usize {
+    let mut slashes = 0;
+    for (index, &byte) in text.iter().enumerate().skip(at) {
+        if byte == b'/' {
+            slashes += 1;
+        } else if ends_word(byte) && (byte != b':' || slashes > 2) {
+            return index;
+        }
+    }
+    text.len()
 }
 
 fn replace_all(haystack: &[u8], needle: &[u8], replacement: &[u8]) -> Vec<u8> {
@@ -2475,8 +2528,53 @@ mod tests {
         ));
         assert!(only_placeholder_paths(b"Cflags: -I${includedir}"));
         assert!(!only_placeholder_paths(b"Cflags: -I/usr/include"));
-        assert!(!only_placeholder_paths(b"url https://example.com"));
         assert!(!only_placeholder_paths(b"${KACHE_OUT_DIR} /opt"));
+    }
+
+    #[test]
+    fn a_url_is_not_a_path() {
+        assert!(only_placeholder_paths(b"URL: https://libssh2.org/"));
+        assert!(only_placeholder_paths(b"url https://example.com:8080/a/b"));
+        assert!(only_placeholder_paths(b"see <git+ssh://h/r.git>, ${p}/x"));
+        assert!(only_placeholder_paths(
+            b"URL: HTTPS://h/a\nlibdir=${prefix}/lib"
+        ));
+        assert!(only_placeholder_paths(b"https://h/a ${p}/x"));
+        assert!(only_placeholder_paths(b"URL: git://h/r.git"));
+        assert!(only_placeholder_paths(b"URL: ftp://h/a"));
+        assert!(only_placeholder_paths(b"URL: http://h/a"));
+        assert!(only_placeholder_paths(b"URL: GIT+HTTPS://h/r.git"));
+        assert!(!only_placeholder_paths(b"/opt"));
+        assert!(!only_placeholder_paths(b"URL: https://h/a /opt"));
+        assert!(!only_placeholder_paths(b"URL: https://h/a\n/opt"));
+        // A byte that ends a word ends the URL, so a path after it is seen.
+        assert!(!only_placeholder_paths(b"see <https://h/a>/opt"));
+        assert!(!only_placeholder_paths(b"\"https://h/a\"/opt"));
+        assert!(!only_placeholder_paths(
+            b"prefix=${KACHE_OUT_DIR}\nURL: https://example.com/a,/opt/include\n"
+        ));
+        for end in [";", ")", "(", "]", "[", "|", "="] {
+            let text = format!("URL: https://example.com/a{end}/opt");
+            assert!(!only_placeholder_paths(text.as_bytes()), "{text}");
+        }
+        // Only a port's `:` stays in the URL, and only in the authority.
+        assert!(!only_placeholder_paths(b"URL: https://h/a:/opt"));
+        assert!(!only_placeholder_paths(b"URL: https://h,/opt"));
+        // A drive letter or a filesystem scheme names a local path.
+        for local in [
+            "C://Users/foo/out",
+            "nfs://server/export/lib",
+            "prefix://usr/local",
+        ] {
+            assert!(!only_placeholder_paths(local.as_bytes()), "{local}");
+        }
+        assert!(!only_placeholder_paths(b"git+file://h/r.git"));
+        assert!(!only_placeholder_paths(b"file:///usr/lib"));
+        assert!(!only_placeholder_paths(b"FILE://h/usr/lib"));
+        assert!(!only_placeholder_paths(b"x=//h/a"));
+        assert!(!only_placeholder_paths(b"://h/a"));
+        assert!(!only_placeholder_paths(b" 1x://h/a"));
+        assert!(!only_placeholder_paths(b"https:/usr/lib"));
     }
 
     #[test]
@@ -2533,6 +2631,24 @@ mod tests {
         assert!(roots.rewritten.is_empty());
         assert_eq!(roots.embedded, vec!["${KACHE_OUT_DIR}".to_string()]);
         assert_eq!(stored, mixed.as_bytes());
+
+        // A URL names no local path; one that embeds a root still binds.
+        let pc = format!("prefix={}\nURL: https://libssh2.org/\n", out.display());
+        let (roots, stored) = classify_one(&env, "libssh2.pc", pc.as_bytes());
+        assert_eq!(roots.rewritten, vec!["libssh2.pc".to_string()]);
+        assert_eq!(
+            stored,
+            b"prefix=${KACHE_OUT_DIR}\nURL: https://libssh2.org/\n"
+        );
+        let pc = format!(
+            "prefix={}\nURL: https://h{}/x\n",
+            out.display(),
+            out.display()
+        );
+        let (roots, stored) = classify_one(&env, "url-root.pc", pc.as_bytes());
+        assert!(roots.rewritten.is_empty());
+        assert_eq!(roots.embedded, vec!["${KACHE_OUT_DIR}".to_string()]);
+        assert_eq!(stored, pc.as_bytes());
 
         // Text already holding a placeholder would change on the way back.
         let text = format!("{} and ${{KACHE_OUT_DIR}}", out.display());

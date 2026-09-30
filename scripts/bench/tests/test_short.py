@@ -292,7 +292,17 @@ class BenchTests(unittest.TestCase):
                         args.output / f"cache-otlp-{phase}" / "metrics.otlp.json"
                     ).read_text()
                 )
-                self.assertEqual(len(cached["resourceMetrics"]), expected)
+                # One entry per sample went in; they share a resource, so one
+                # comes out, holding every sample's two points.
+                self.assertEqual(len(cached["resourceMetrics"]), 1)
+                self.assertEqual(
+                    len(
+                        cached["resourceMetrics"][0]["scopeMetrics"][0]["metrics"][0][
+                            "gauge"
+                        ]["dataPoints"]
+                    ),
+                    expected * 2,
+                )
 
     def test_contention_compares_paired_work_and_rejects_incomplete_pairs(self):
         records = []
@@ -461,6 +471,123 @@ class BenchTests(unittest.TestCase):
                 "INVALID MEASUREMENT", (args.output / "perf-gate.md").read_text()
             )
             self.assertTrue((args.output / "logs/00-kache/engine.log").exists())
+
+
+def otlp_entry(tool, scope, metrics):
+    """One sample's `resourceMetrics` entry, as the engine writes it."""
+    return {
+        "resource": {
+            "attributes": [
+                {"key": "kache.bench.cache_tool_version", "value": {"stringValue": tool}}
+            ]
+        },
+        "scopeMetrics": [{"scope": {"name": scope}, "metrics": metrics}],
+    }
+
+
+def otlp_points(entries):
+    """Every data point with the resource, scope and metric it belongs to."""
+    return sorted(
+        json.dumps(
+            [
+                entry["resource"],
+                scope["scope"],
+                {**metric, kind: {**metric[kind], "dataPoints": None}},
+                point,
+            ],
+            sort_keys=True,
+        )
+        for entry in entries
+        for scope in entry["scopeMetrics"]
+        for metric in scope["metrics"]
+        for kind in short.INSTRUMENTS
+        if kind in metric
+        for point in metric[kind]["dataPoints"]
+    )
+
+
+class TelemetryGroupingTests(unittest.TestCase):
+    def nightly(self):
+        """The shape of a nightly hk payload: 14 samples for each of three
+        tools, plus a contention scope, every sample its own entry."""
+        entries = []
+        for tool in ("kache 1.0", "sccache 1.0", "mbx 1.0"):
+            for sample in range(14):
+                scope = "contention" if sample % 7 == 0 else "bench"
+                entries.append(
+                    otlp_entry(
+                        tool,
+                        scope,
+                        [
+                            {
+                                "name": name,
+                                "unit": "s",
+                                "gauge": {
+                                    "dataPoints": [
+                                        {"asDouble": sample + 0.5, "timeUnixNano": str(t)}
+                                        for t in (sample, sample + 100)
+                                    ]
+                                },
+                            }
+                            for name in ("build.duration", "compile.time_saved")
+                        ],
+                    )
+                )
+        return entries
+
+    def test_grouping_fits_the_collector_and_keeps_every_point(self):
+        entries = self.nightly()
+        self.assertEqual(len(entries), 42)
+        grouped = short.group_resources(copy.deepcopy(entries))
+        self.assertEqual(len(grouped), 3)
+        for resource in grouped:
+            self.assertEqual(len(resource["scopeMetrics"]), 2)
+            for scope in resource["scopeMetrics"]:
+                names = [metric["name"] for metric in scope["metrics"]]
+                self.assertEqual(sorted(names), ["build.duration", "compile.time_saved"])
+        self.assertEqual(otlp_points(grouped), otlp_points(entries))
+        self.assertEqual(len(otlp_points(grouped)), 42 * 2 * 2)
+
+    def test_metrics_that_differ_in_unit_or_instrument_stay_apart(self):
+        point = {"asInt": "1", "timeUnixNano": "1"}
+        variants = [
+            {"name": "m", "unit": "s", "gauge": {"dataPoints": [point]}},
+            {"name": "m", "unit": "By", "gauge": {"dataPoints": [point]}},
+            {
+                "name": "m",
+                "unit": "s",
+                "sum": {"isMonotonic": True, "aggregationTemporality": 2, "dataPoints": [point]},
+            },
+            {
+                "name": "m",
+                "unit": "s",
+                "sum": {"isMonotonic": False, "aggregationTemporality": 2, "dataPoints": [point]},
+            },
+        ]
+        entries = [otlp_entry("kache 1.0", "bench", [variant]) for variant in variants * 2]
+        grouped = short.group_resources(copy.deepcopy(entries))
+        metrics = grouped[0]["scopeMetrics"][0]["metrics"]
+        self.assertEqual(len(metrics), 4)
+        self.assertEqual(otlp_points(grouped), otlp_points(entries))
+
+    def test_a_payload_the_collector_would_drop_fails_the_run(self):
+        gauge = [{"name": "m", "gauge": {"dataPoints": [{"asInt": "1"}]}}]
+        at_limit = [otlp_entry(f"tool {n}", "bench", gauge) for n in range(4)]
+        self.assertEqual(len(short.group_resources(at_limit)), 4)
+        with self.assertRaisesRegex(ValueError, "5 resources; the collector accepts 4"):
+            short.group_resources(
+                [otlp_entry(f"tool {n}", "bench", gauge) for n in range(5)]
+            )
+        scopes_at_limit = [otlp_entry("kache 1.0", f"scope {n}", gauge) for n in range(8)]
+        self.assertEqual(len(short.group_resources(scopes_at_limit)[0]["scopeMetrics"]), 8)
+        with self.assertRaisesRegex(ValueError, "9 scopes in one resource"):
+            short.group_resources(
+                [otlp_entry("kache 1.0", f"scope {n}", gauge) for n in range(9)]
+            )
+        with self.assertRaisesRegex(ValueError, "no known instrument"):
+            short.group_resources(
+                [otlp_entry("kache 1.0", "bench", [{"name": "m", "summary": {}}])]
+            )
 
 
 def subject(root, name, records, contention=None, error=None):

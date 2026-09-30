@@ -43,6 +43,44 @@ class ContentionTests(unittest.TestCase):
             bench.wait_for_daemon_lock(path, 0)
             bench.wait_for_daemon_lock(path, 0)
 
+    @unittest.skipUnless(os.name == "posix", "contention runner requires Linux")
+    def test_a_slow_sccache_shutdown_is_killed_instead_of_failing_the_run(self):
+        """The aube nightly reached 22 of 24 batches and then died here: the
+        server took more than ten seconds to exit after a finished batch."""
+
+        def server(seconds):
+            return subprocess.Popen(
+                [sys.executable, "-c", f"import time; time.sleep({seconds})"],
+                start_new_session=True,
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            hangs = Path(directory) / "hangs"
+            hangs.write_text("#!/bin/sh\nexec sleep 60\n")
+            hangs.chmod(0o755)
+            env = dict(os.environ)
+
+            # Asked to stop, never exits.
+            stuck = server(60)
+            self.assertTrue(
+                bench.stop_sccache("/usr/bin/true", env, stuck, exit_timeout=0.2)
+            )
+            self.assertEqual(stuck.returncode, -9)
+
+            # The stop command itself hangs.
+            stuck = server(60)
+            self.assertTrue(
+                bench.stop_sccache(hangs, env, stuck, stop_timeout=0.2)
+            )
+            self.assertEqual(stuck.returncode, -9)
+
+            # Exits by itself in time: left alone, not killed.
+            prompt = server(0.05)
+            self.assertFalse(
+                bench.stop_sccache("/usr/bin/true", env, prompt, exit_timeout=5)
+            )
+            self.assertEqual(prompt.returncode, 0)
+
     def test_scenario_files_replace_what_the_checkout_had(self):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)

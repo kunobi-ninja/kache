@@ -470,13 +470,13 @@ fn scan_rust(bytes: &[u8]) -> Result<Vec<Found>> {
     let mut modules: Vec<(String, usize)> = Vec::new();
     let mut depth = 0usize;
     let mut index = 0;
-    let mut previous = None;
-    while tokens.get(index).is_some() {
-        // Every step moves forward. A mutated step that does not would hang
-        // the mutation run instead of failing a test.
-        debug_assert!(previous.is_none_or(|previous| index > previous));
-        previous = Some(index);
-        if punct_at(&tokens, index, b'#') && punct_at(&tokens, index + 1, b'[') {
+    for _ in &tokens {
+        let Some(current) = tokens.get(index) else {
+            return Ok(found);
+        };
+        if matches!(current, Tok::Punct(byte) if *byte == b'#')
+            && punct_at(&tokens, index + 1, b'[')
+        {
             let inner = punct_at(&tokens, index + 2, b'!');
             let start = if inner { index + 3 } else { index + 2 };
             let Some(end) = close_at(&tokens, start, b'[', b']') else {
@@ -614,14 +614,17 @@ fn close_at(tokens: &[Tok], start: usize, open: u8, close: u8) -> Option<usize> 
 fn rust_tokens(bytes: &[u8]) -> Vec<Tok> {
     let mut out = Vec::new();
     let mut index = 0;
-    let mut previous = None;
-    while index < bytes.len() {
-        // Every step moves forward; see `scan_rust`.
-        debug_assert!(previous.is_none_or(|previous| index > previous));
-        previous = Some(index);
+    for _ in bytes {
+        if index + 1 > bytes.len() {
+            break;
+        }
         let byte = bytes[index];
         if byte.is_ascii_whitespace() {
-            index += 1;
+            let skip = bytes[index..]
+                .iter()
+                .take_while(|byte| byte.is_ascii_whitespace())
+                .count();
+            index += skip;
             continue;
         }
         if byte == b'/' && bytes.get(index + 1) == Some(&b'/') {
@@ -666,11 +669,11 @@ fn rust_tokens(bytes: &[u8]) -> Vec<Tok> {
         }
         if is_ident_start(byte) {
             let start = index;
-            while index < bytes.len() && is_ident_continue(bytes[index]) {
-                let before = index;
-                index += 1;
-                debug_assert!(index > before);
-            }
+            let len = bytes[index..]
+                .iter()
+                .take_while(|byte| is_ident_continue(**byte))
+                .count();
+            index += len;
             out.push(Tok::Ident(
                 String::from_utf8_lossy(&bytes[start..index]).into_owned(),
             ));
@@ -714,12 +717,13 @@ fn skip_char_or_lifetime(bytes: &[u8], index: usize) -> usize {
         if bytes.get(next) == Some(&b'u') {
             next += 1;
             if bytes.get(next) == Some(&b'{') {
-                while next < bytes.len() && bytes[next] != b'}' {
-                    let before = next;
-                    next += 1;
-                    debug_assert!(next > before);
-                }
-                next = next.saturating_add(1);
+                let rest = &bytes[next..];
+                let offset = rest
+                    .iter()
+                    .position(|byte| *byte == b'}')
+                    .map(|at| at + 1)
+                    .unwrap_or(rest.len());
+                next += offset;
             }
         } else {
             next += 1;
@@ -738,11 +742,10 @@ fn skip_char_or_lifetime(bytes: &[u8], index: usize) -> usize {
 fn cooked_string(bytes: &[u8], index: usize) -> (String, usize) {
     let mut out = String::new();
     let mut cursor = index + 1;
-    let mut previous = None;
-    while cursor < bytes.len() {
-        // Every step moves forward; see `scan_rust`.
-        debug_assert!(previous.is_none_or(|previous| cursor > previous));
-        previous = Some(cursor);
+    for _ in bytes {
+        if cursor + 1 > bytes.len() {
+            break;
+        }
         let byte = bytes[cursor];
         if byte == b'"' {
             return (out, cursor + 1);
@@ -3277,6 +3280,9 @@ mod tests {
         assert_eq!(text, "say \"hi\" end");
         assert!(module_names("mod foo").is_empty());
         let (text, _) = cooked_string(b"\"\\nb\"", 0);
+        let (open, end) = cooked_string(b"\"ab", 0);
+        assert_eq!(open, "ab");
+        assert_eq!(end, 3);
         assert_eq!(text, "\nb");
     }
 

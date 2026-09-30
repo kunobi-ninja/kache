@@ -2860,6 +2860,11 @@ fn rustdoc_shim_path_requires_an_absolute_rustdoc_file() {
     ));
     let file = dir.path().join("rustdoc");
     std::fs::write(&file, b"kache").unwrap();
+    assert!(
+        !rustdoc_shim_path_ok(&file.to_string_lossy()),
+        "an absolute file named rustdoc is the real toolchain until it is a shim"
+    );
+    std::fs::write(dir.path().join(".kache-shims"), b"kache shims\n").unwrap();
     assert!(rustdoc_shim_path_ok(&file.to_string_lossy()));
     let other = dir.path().join("kache");
     std::fs::write(&other, b"kache").unwrap();
@@ -2878,6 +2883,11 @@ fn rustdoc_shim_path_accepts_a_symlink_to_kache() {
     let link = dir.path().join("rustdoc");
     std::os::unix::fs::symlink(&target, &link).unwrap();
     assert!(rustdoc_shim_path_ok(&link.to_string_lossy()));
+    std::fs::remove_file(&link).unwrap();
+    let other = dir.path().join("not-kache");
+    std::fs::write(&other, b"bin").unwrap();
+    std::os::unix::fs::symlink(&other, &link).unwrap();
+    assert!(!rustdoc_shim_path_ok(&link.to_string_lossy()));
 }
 
 #[test]

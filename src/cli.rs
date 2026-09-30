@@ -7975,17 +7975,34 @@ pub(crate) fn apply_rustdoc_edit(existing: &str, shim_path: &str) -> String {
     out
 }
 
-/// Absolute path whose filename is `rustdoc` and which names a file.
-/// A symlink to the kache binary counts: `Path::is_file` follows it.
+/// Absolute path whose filename is `rustdoc`.
 #[cfg(any(test, unix))]
 pub(crate) fn rustdoc_shim_path_shape(value: &str) -> bool {
     let path = std::path::Path::new(value);
     path.is_absolute() && path.file_name().and_then(|name| name.to_str()) == Some("rustdoc")
 }
 
+/// A rustdoc shim: the path is an absolute `rustdoc` file, and it is a kache
+/// shim. The directory marker counts, and so does a link that resolves to this
+/// kache or to a binary named `kache`. The real toolchain `rustdoc` is neither.
 #[cfg(any(test, unix))]
 pub(crate) fn rustdoc_shim_path_ok(value: &str) -> bool {
-    rustdoc_shim_path_shape(value) && std::path::Path::new(value).is_file()
+    if !rustdoc_shim_path_shape(value) {
+        return false;
+    }
+    let path = std::path::Path::new(value);
+    if !path.is_file() {
+        return false;
+    }
+    if path.parent().is_some_and(kache_shims::farm::has_marker) {
+        return true;
+    }
+    let self_real = std::env::current_exe()
+        .ok()
+        .and_then(|exe| std::fs::canonicalize(exe).ok());
+    kache_shims::farm::resolves_to_kache(path, self_real.as_deref(), &|candidate| {
+        std::fs::canonicalize(candidate).ok()
+    })
 }
 
 pub(crate) fn rustdoc_doctor_fix(pass: bool) -> Option<String> {

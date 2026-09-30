@@ -6,10 +6,13 @@
 //! Every other rustdoc invocation runs the real binary and is not stored.
 //!
 //! The cached bytes are one tar per invocation. Output paths stay out of the
-//! key, so a second checkout restores into its own directories.
+//! key, so a second checkout restores into its own directories. The key hashes
+//! the crate source, every `mod` and string `include!` it names, and each flag
+//! with its name. Dep-info is not an input: the first `cargo doc` has none,
+//! and hashing it would miss on the next identical run.
 
 use anyhow::{Context, Result};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
@@ -103,7 +106,14 @@ impl Compiler for RustdocCompiler {
 
     fn cache_key(&self, parsed: &RustdocArgs, ctx: &KeyCtx<'_, '_>) -> Result<String> {
         let version = rustdoc_version(&parsed.program)?;
-        cache_key_with(parsed, &version, ctx.key_salt)
+        let base = cache_key_with(parsed, &version, None)?;
+        let label = parsed.crate_name.as_deref().unwrap_or("doc-merge");
+        Ok(finish_rustdoc_key(
+            base,
+            label,
+            ctx.key_env_vars,
+            ctx.key_salt,
+        ))
     }
 
     fn execute(&self, parsed: &RustdocArgs) -> Result<super::CompileResult> {
@@ -184,8 +194,17 @@ pub(crate) fn cache_key_with(
         hasher.update(kind.as_bytes());
         hasher.update(b"\0");
     }
-    for source in &parsed.sources {
-        hash_labeled_file(&mut hasher, b"source", source)?;
+    for record in source_records(&parsed.sources)? {
+        if record.relative == "." {
+            continue;
+        }
+        let Some(path) = record.paths.first() else {
+            continue;
+        };
+        hasher.update(b"source\0");
+        hasher.update(record.relative.as_bytes());
+        hasher.update(b"\0");
+        hash_file_bytes(&mut hasher, Path::new(path))?;
     }
     for (name, path) in &parsed.externs {
         hasher.update(b"extern\0");
@@ -228,6 +247,531 @@ fn hash_file_bytes(hasher: &mut blake3::Hasher, path: &Path) -> Result<()> {
     hasher.update(&bytes);
     hasher.update(b"\0");
     Ok(())
+}
+
+/// Env vars, then the salt. Empty env vars leave the key unchanged. The salt
+/// sees the env fold, matching rustc.
+fn finish_rustdoc_key(
+    base: String,
+    label: &str,
+    key_env_vars: &[String],
+    salt: Option<&str>,
+) -> String {
+    let keyed = crate::cache_key::apply_key_env_vars(base, key_env_vars, label);
+    crate::cache_key::apply_key_salt(keyed, salt, label)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SourceRecord {
+    /// `/`-separated path relative to the crate directory. `.` is that directory.
+    relative: String,
+    /// Spellings rustdoc may have written. The first is the one a restore writes.
+    paths: Vec<String>,
+}
+
+/// Crate inputs in a stable order.
+///
+/// `mod name;` and `#[path = "rel"] mod name;` are followed even when a `cfg`
+/// would drop them. A `mod` inside an inline `mod name { ... }` is resolved
+/// under that name. A missing file is skipped. A file that exists but cannot
+/// be read is an error, and the invocation is not cached. `include!`,
+/// `include_str!`, and `include_bytes!` count only with a string literal;
+/// anything else is an error. Dep-info is not read here.
+fn source_records(sources: &[PathBuf]) -> Result<Vec<SourceRecord>> {
+    let Some(primary) = sources.first() else {
+        return Ok(Vec::new());
+    };
+    let crate_dir = lexical_absolute(primary.parent().unwrap_or(Path::new("")));
+    let mut seen = BTreeSet::new();
+    let mut files = Vec::new();
+    for source in sources {
+        collect_source(
+            &lexical_absolute(source),
+            &crate_dir,
+            true,
+            &mut seen,
+            &mut files,
+        )?;
+    }
+    files.sort_by(|left, right| left.relative.cmp(&right.relative));
+    let mut records = Vec::with_capacity(files.len() + 1);
+    records.push(SourceRecord {
+        relative: ".".to_string(),
+        paths: vec![crate_dir.to_string_lossy().into_owned()],
+    });
+    records.extend(files);
+    Ok(records)
+}
+
+fn collect_source(
+    path: &Path,
+    crate_dir: &Path,
+    required: bool,
+    seen: &mut BTreeSet<PathBuf>,
+    out: &mut Vec<SourceRecord>,
+) -> Result<()> {
+    let absolute = lexical_absolute(path);
+    if !seen.insert(absolute.clone()) {
+        return Ok(());
+    }
+    match std::fs::metadata(&absolute) {
+        Ok(meta) if meta.is_file() => {}
+        Ok(_) => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if required {
+                anyhow::bail!(
+                    "reading {} for the rustdoc cache key: not found",
+                    absolute.display()
+                );
+            }
+            return Ok(());
+        }
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("reading {} for the rustdoc cache key", absolute.display())
+            });
+        }
+    }
+    let bytes = std::fs::read(&absolute)
+        .with_context(|| format!("reading {} for the rustdoc cache key", absolute.display()))?;
+    let relative = relative_label(crate_dir, &absolute);
+    out.push(SourceRecord {
+        relative,
+        paths: vec![absolute.to_string_lossy().into_owned()],
+    });
+    let parent = absolute.parent().unwrap_or(Path::new(""));
+    for found in scan_rust(&bytes)? {
+        match found {
+            Found::Include(rel) => {
+                collect_source(&parent.join(rel), crate_dir, false, seen, out)?;
+            }
+            Found::Module { path, name } => {
+                if let Some(next) = resolve_module(parent, path.as_deref(), &name)? {
+                    collect_source(&next, crate_dir, false, seen, out)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn resolve_module(dir: &Path, path: Option<&str>, name: &str) -> Result<Option<PathBuf>> {
+    let candidates = if let Some(path) = path {
+        vec![dir.join(path)]
+    } else {
+        vec![
+            dir.join(format!("{name}.rs")),
+            dir.join(name).join("mod.rs"),
+        ]
+    };
+    for candidate in candidates {
+        match std::fs::metadata(&candidate) {
+            Ok(meta) if meta.is_file() => return Ok(Some(lexical_absolute(&candidate))),
+            Ok(_) => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("reading {} for the rustdoc cache key", candidate.display())
+                });
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn lexical_absolute(path: &Path) -> PathBuf {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    };
+    let mut cleaned = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !cleaned.pop() {
+                    cleaned.push("..");
+                }
+            }
+            other => cleaned.push(other.as_os_str()),
+        }
+    }
+    if cleaned.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        cleaned
+    }
+}
+
+fn relative_label(base: &Path, path: &Path) -> String {
+    if let Ok(stripped) = path.strip_prefix(base) {
+        let label = slash_components(stripped);
+        if label.is_empty() {
+            return ".".to_string();
+        }
+        return label;
+    }
+    let mut ups = 0usize;
+    let mut cursor = base;
+    while ups < 8 {
+        let Some(parent) = cursor.parent() else {
+            break;
+        };
+        if parent == cursor {
+            break;
+        }
+        cursor = parent;
+        ups += 1;
+        if let Ok(stripped) = path.strip_prefix(cursor) {
+            let mut label = "../".repeat(ups);
+            let rest = slash_components(stripped);
+            if rest.is_empty() {
+                label.pop();
+            } else {
+                label.push_str(&rest);
+            }
+            return label;
+        }
+    }
+    slash_components(path)
+}
+
+fn slash_components(path: &Path) -> String {
+    path.components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(part) => Some(part.to_string_lossy().into_owned()),
+            std::path::Component::ParentDir => Some("..".to_string()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+enum Found {
+    Include(String),
+    Module { path: Option<String>, name: String },
+}
+
+enum Tok {
+    Ident(String),
+    Str(String),
+    Punct(u8),
+}
+
+fn scan_rust(bytes: &[u8]) -> Result<Vec<Found>> {
+    let tokens = rust_tokens(bytes);
+    let mut found = Vec::new();
+    let mut pending_path: Option<String> = None;
+    // Inline `mod name { ... }` bodies. A child `mod` is `name/child.rs`,
+    // and a `{` that belongs to a function must not pop the module.
+    let mut modules: Vec<(String, usize)> = Vec::new();
+    let mut depth = 0usize;
+    let mut index = 0;
+    while index < tokens.len() {
+        if punct_at(&tokens, index, b'#') && punct_at(&tokens, index + 1, b'[') {
+            let inner = punct_at(&tokens, index + 2, b'!');
+            let start = if inner { index + 3 } else { index + 2 };
+            let Some(end) = close_at(&tokens, start, b'[', b']') else {
+                index += 1;
+                continue;
+            };
+            if !inner && let Some(path) = path_attribute(&tokens[start..end]) {
+                pending_path = Some(path);
+            }
+            index = end + 1;
+            continue;
+        }
+        if ident_at(&tokens, index, "pub") {
+            index += 1;
+            if punct_at(&tokens, index, b'(') {
+                let Some(end) = close_at(&tokens, index + 1, b'(', b')') else {
+                    break;
+                };
+                index = end + 1;
+            }
+            continue;
+        }
+        if ident_at(&tokens, index, "mod")
+            && let Some(Tok::Ident(name)) = tokens.get(index + 1)
+        {
+            match tokens.get(index + 2) {
+                Some(Tok::Punct(b';')) => {
+                    let path = pending_path.take();
+                    let located = match &path {
+                        Some(_) => name.clone(),
+                        None => module_name(&modules, name),
+                    };
+                    found.push(Found::Module {
+                        path,
+                        name: located,
+                    });
+                    index += 3;
+                    continue;
+                }
+                Some(Tok::Punct(b'{')) => {
+                    depth += 1;
+                    modules.push((name.clone(), depth));
+                    pending_path = None;
+                    index += 3;
+                    continue;
+                }
+                _ => {
+                    pending_path = None;
+                    index += 1;
+                    continue;
+                }
+            }
+        }
+        if tokens
+            .get(index)
+            .is_some_and(|token| matches!(token, Tok::Ident(name) if is_include(name)))
+            && punct_at(&tokens, index + 1, b'!')
+            && punct_at(&tokens, index + 2, b'(')
+        {
+            match tokens.get(index + 3) {
+                Some(Tok::Str(text)) => found.push(Found::Include(text.clone())),
+                _ => anyhow::bail!("rustdoc include is not a string literal"),
+            }
+            index += 4;
+            continue;
+        }
+        if punct_at(&tokens, index, b'{') {
+            depth += 1;
+            pending_path = None;
+        } else if punct_at(&tokens, index, b'}') {
+            depth = depth.saturating_sub(1);
+            if modules.last().is_some_and(|(_, opened)| *opened > depth) {
+                modules.pop();
+            }
+        } else if punct_at(&tokens, index, b';') {
+            pending_path = None;
+        }
+        index += 1;
+    }
+    Ok(found)
+}
+
+fn is_include(name: &str) -> bool {
+    matches!(name, "include" | "include_str" | "include_bytes")
+}
+
+/// File path of a `mod` item. Inline parents become directories.
+fn module_name(modules: &[(String, usize)], name: &str) -> String {
+    let mut out = String::new();
+    for (parent, _) in modules {
+        out.push_str(parent);
+        out.push('/');
+    }
+    out.push_str(name);
+    out
+}
+
+fn ident_at(tokens: &[Tok], index: usize, name: &str) -> bool {
+    matches!(tokens.get(index), Some(Tok::Ident(text)) if text == name)
+}
+
+fn punct_at(tokens: &[Tok], index: usize, punct: u8) -> bool {
+    matches!(tokens.get(index), Some(Tok::Punct(byte)) if *byte == punct)
+}
+
+fn path_attribute(tokens: &[Tok]) -> Option<String> {
+    for index in 0..tokens.len() {
+        if !ident_at(tokens, index, "path") {
+            continue;
+        }
+        if punct_at(tokens, index + 1, b'=')
+            && let Some(Tok::Str(text)) = tokens.get(index + 2)
+        {
+            return Some(text.clone());
+        }
+    }
+    None
+}
+
+fn close_at(tokens: &[Tok], start: usize, open: u8, close: u8) -> Option<usize> {
+    let mut depth = 1usize;
+    for index in start..tokens.len() {
+        if punct_at(tokens, index, open) {
+            depth += 1;
+        } else if punct_at(tokens, index, close) {
+            depth -= 1;
+            if depth == 0 {
+                return Some(index);
+            }
+        }
+    }
+    None
+}
+
+fn rust_tokens(bytes: &[u8]) -> Vec<Tok> {
+    let mut out = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte.is_ascii_whitespace() {
+            index += 1;
+            continue;
+        }
+        if byte == b'/' && bytes.get(index + 1) == Some(&b'/') {
+            index += 2;
+            while index < bytes.len() && bytes[index] != b'\n' {
+                index += 1;
+            }
+            continue;
+        }
+        if byte == b'/' && bytes.get(index + 1) == Some(&b'*') {
+            index += 2;
+            while index + 1 < bytes.len() && !(bytes[index] == b'*' && bytes[index + 1] == b'/') {
+                index += 1;
+            }
+            index = index.saturating_add(2).min(bytes.len());
+            continue;
+        }
+        if byte == b'b' && matches!(bytes.get(index + 1), Some(b'"' | b'r' | b'\'')) {
+            index = skip_byte_literal(bytes, index);
+            continue;
+        }
+        if byte == b'\'' {
+            index = skip_char_or_lifetime(bytes, index);
+            continue;
+        }
+        if byte == b'"' {
+            let (text, next) = cooked_string(bytes, index);
+            out.push(Tok::Str(text));
+            index = next;
+            continue;
+        }
+        if byte == b'r'
+            && let Some((text, next)) = raw_string(bytes, index)
+        {
+            out.push(Tok::Str(text));
+            index = next;
+            continue;
+        }
+        if is_ident_start(byte) {
+            let start = index;
+            index += 1;
+            while index < bytes.len() && is_ident_continue(bytes[index]) {
+                index += 1;
+            }
+            out.push(Tok::Ident(
+                String::from_utf8_lossy(&bytes[start..index]).into_owned(),
+            ));
+            continue;
+        }
+        if matches!(
+            byte,
+            b'(' | b')' | b'{' | b'}' | b'[' | b']' | b';' | b',' | b'=' | b'#' | b'!'
+        ) {
+            out.push(Tok::Punct(byte));
+            index += 1;
+            continue;
+        }
+        index += 1;
+    }
+    out
+}
+
+fn is_ident_start(byte: u8) -> bool {
+    byte.is_ascii_alphabetic() || byte == b'_'
+}
+
+fn is_ident_continue(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+fn skip_byte_literal(bytes: &[u8], index: usize) -> usize {
+    match bytes.get(index + 1) {
+        Some(b'\'') => skip_char_or_lifetime(bytes, index + 1),
+        Some(b'"') => cooked_string(bytes, index + 1).1,
+        Some(b'r') => raw_string(bytes, index + 1)
+            .map(|(_, next)| next)
+            .unwrap_or(index + 1),
+        _ => index + 1,
+    }
+}
+
+fn skip_char_or_lifetime(bytes: &[u8], index: usize) -> usize {
+    if bytes.get(index + 1) == Some(&b'\\') {
+        let mut next = index + 2;
+        if bytes.get(next) == Some(&b'u') {
+            next += 1;
+            if bytes.get(next) == Some(&b'{') {
+                while next < bytes.len() && bytes[next] != b'}' {
+                    next += 1;
+                }
+                next = next.saturating_add(1);
+            }
+        } else {
+            next += 1;
+        }
+        if bytes.get(next) == Some(&b'\'') {
+            return next + 1;
+        }
+        return index + 1;
+    }
+    if bytes.get(index + 2) == Some(&b'\'') {
+        return index + 3;
+    }
+    index + 1
+}
+
+fn cooked_string(bytes: &[u8], index: usize) -> (String, usize) {
+    let mut out = String::new();
+    let mut cursor = index + 1;
+    while cursor < bytes.len() {
+        let byte = bytes[cursor];
+        if byte == b'"' {
+            return (out, cursor + 1);
+        }
+        if byte == b'\\' {
+            cursor += 1;
+            match bytes.get(cursor) {
+                Some(b'n') => out.push('\n'),
+                Some(b'r') => out.push('\r'),
+                Some(b't') => out.push('\t'),
+                Some(b'\\') => out.push('\\'),
+                Some(b'"') => out.push('"'),
+                Some(b'\'') => out.push('\''),
+                Some(b'0') => out.push('\0'),
+                Some(other) => out.push(*other as char),
+                None => break,
+            }
+            cursor += 1;
+            continue;
+        }
+        out.push(byte as char);
+        cursor += 1;
+    }
+    (out, bytes.len())
+}
+
+fn raw_string(bytes: &[u8], index: usize) -> Option<(String, usize)> {
+    let mut cursor = index + 1;
+    let mut hashes = 0usize;
+    while bytes.get(cursor) == Some(&b'#') {
+        hashes += 1;
+        cursor += 1;
+    }
+    if bytes.get(cursor) != Some(&b'"') {
+        return None;
+    }
+    cursor += 1;
+    let start = cursor;
+    while cursor < bytes.len() {
+        if bytes[cursor] == b'"' {
+            let tail = &bytes[cursor + 1..];
+            if tail.len() >= hashes && tail[..hashes].iter().all(|byte| *byte == b'#') {
+                let text = String::from_utf8_lossy(&bytes[start..cursor]).into_owned();
+                return Some((text, cursor + 1 + hashes));
+            }
+        }
+        cursor += 1;
+    }
+    None
 }
 
 fn hash_tree(hasher: &mut blake3::Hasher, dir: &Path) -> Result<()> {
@@ -318,11 +862,15 @@ fn parse_args(args: &[String]) -> RustdocArgs {
                 .extend(args[index + 1..].iter().map(PathBuf::from));
             break;
         }
+        if arg.starts_with('@') {
+            parsed.unknown = true;
+            continue;
+        }
         if is_query(arg) {
             parsed.query = true;
             continue;
         }
-        if let Some((act, inline)) = classify(arg) {
+        if let Some((flag, act, inline)) = classify(arg) {
             let value = match inline {
                 Some(value) => Some(value.to_string()),
                 None if act_takes_value(act) => match args.get(index + 1) {
@@ -337,7 +885,7 @@ fn parse_args(args: &[String]) -> RustdocArgs {
                 },
                 None => None,
             };
-            apply(&mut parsed, act, value.as_deref());
+            apply(&mut parsed, flag, act, value.as_deref());
             continue;
         }
         if arg.starts_with('-') {
@@ -357,14 +905,14 @@ fn act_takes_value(act: Act) -> bool {
     !matches!(act, Act::Bare | Act::Block)
 }
 
-fn classify(arg: &str) -> Option<(Act, Option<&str>)> {
+fn classify(arg: &str) -> Option<(&str, Act, Option<&str>)> {
     if let Some((name, value)) = arg.split_once('=')
         && let Some(act) = long_act(name)
     {
-        return Some((act, Some(value)));
+        return Some((name, act, Some(value)));
     }
     if arg.starts_with("--") {
-        return long_act(arg).map(|act| (act, None));
+        return long_act(arg).map(|act| (arg, act, None));
     }
     if arg.starts_with('-') {
         return short_act(arg);
@@ -454,7 +1002,7 @@ fn long_act(name: &str) -> Option<Act> {
     })
 }
 
-fn short_act(arg: &str) -> Option<(Act, Option<&str>)> {
+fn short_act(arg: &str) -> Option<(&str, Act, Option<&str>)> {
     const FLAGS: &[(&str, Act)] = &[
         ("-C", Act::Keyed),
         ("-L", Act::Lib),
@@ -470,27 +1018,27 @@ fn short_act(arg: &str) -> Option<(Act, Option<&str>)> {
     ];
     for (flag, act) in FLAGS {
         if arg == *flag {
-            return Some((*act, None));
+            return Some((*flag, *act, None));
         }
         if let Some(rest) = arg.strip_prefix(flag)
             && !rest.is_empty()
         {
             let rest = rest.strip_prefix('=').unwrap_or(rest);
-            return Some((*act, Some(rest)));
+            return Some((*flag, *act, Some(rest)));
         }
     }
     None
 }
 
-fn apply(parsed: &mut RustdocArgs, act: Act, value: Option<&str>) {
+fn apply(parsed: &mut RustdocArgs, flag: &str, act: Act, value: Option<&str>) {
     match act {
         Act::Bare => parsed.keyed.push(match value {
-            Some(value) => format!("bare={value}"),
-            None => "bare".to_string(),
+            Some(value) => format!("{flag}={value}"),
+            None => flag.to_string(),
         }),
         Act::Block => parsed.blocked = true,
         Act::Keyed => match value {
-            Some(value) => parsed.keyed.push(value.to_string()),
+            Some(value) => parsed.keyed.push(format!("{flag}={value}")),
             None => parsed.unknown = true,
         },
         Act::Out => set_path(&mut parsed.out_dir, &mut parsed.unknown, value),
@@ -613,7 +1161,7 @@ struct Bundle {
     out_files: Vec<(String, Vec<u8>)>,
     parts_files: Vec<(String, Vec<u8>)>,
     depinfo: Option<Vec<u8>>,
-    sources: Vec<String>,
+    sources: Vec<SourceRecord>,
 }
 
 fn pack(bundle: &Bundle) -> Result<Vec<u8>> {
@@ -621,7 +1169,7 @@ fn pack(bundle: &Bundle) -> Result<Vec<u8>> {
     append(
         &mut builder,
         "sources",
-        bundle.sources.join("\n").as_bytes(),
+        encode_sources(&bundle.sources)?.as_bytes(),
     )?;
     if let Some(depinfo) = &bundle.depinfo {
         append(&mut builder, "depinfo", depinfo)?;
@@ -663,14 +1211,7 @@ fn unpack(bytes: &[u8]) -> Result<Bundle> {
         let mut buf = Vec::new();
         entry.read_to_end(&mut buf)?;
         if path == "sources" {
-            bundle.sources = if buf.is_empty() {
-                Vec::new()
-            } else {
-                String::from_utf8_lossy(&buf)
-                    .lines()
-                    .map(str::to_string)
-                    .collect()
-            };
+            bundle.sources = decode_sources(&buf);
         } else if path == "depinfo" {
             bundle.depinfo = Some(buf);
         } else if let Some(rel) = strip_root(&path, "out") {
@@ -712,38 +1253,6 @@ fn strip_root(path: &str, root: &str) -> Option<String> {
     }
 }
 
-fn snapshot(dir: &Path) -> Result<BTreeMap<String, blake3::Hash>> {
-    let mut files = Vec::new();
-    if dir.exists() {
-        collect_files(&mut files, dir, dir)?;
-    }
-    let mut out = BTreeMap::new();
-    for (rel, path) in files {
-        let bytes = std::fs::read(&path)?;
-        out.insert(rel, blake3::hash(&bytes));
-    }
-    Ok(out)
-}
-
-fn changed_files(
-    dir: &Path,
-    before: &BTreeMap<String, blake3::Hash>,
-) -> Result<Vec<(String, Vec<u8>)>> {
-    let mut files = Vec::new();
-    if dir.exists() {
-        collect_files(&mut files, dir, dir)?;
-    }
-    let mut out = Vec::new();
-    for (rel, path) in files {
-        let bytes = std::fs::read(&path)?;
-        let hash = blake3::hash(&bytes);
-        if before.get(&rel).is_none_or(|previous| previous != &hash) {
-            out.push((rel, bytes));
-        }
-    }
-    Ok(out)
-}
-
 fn spawn(parsed: &RustdocArgs) -> Result<std::process::Output> {
     Command::new(&parsed.program)
         .args(&parsed.rest)
@@ -760,49 +1269,108 @@ fn replay(stdout: &str, stderr: &str, mut out: impl std::io::Write, mut err: imp
     let _ = err.write_all(stderr.as_bytes());
 }
 
-pub(crate) fn source_rewrites(stored: &[String], current: &[PathBuf]) -> Vec<(Vec<u8>, Vec<u8>)> {
-    let mut stored_by_name: BTreeMap<String, Vec<&str>> = BTreeMap::new();
-    for path in stored {
-        if !Path::new(path).is_absolute() {
+fn encode_sources(records: &[SourceRecord]) -> Result<String> {
+    let mut lines = Vec::new();
+    for record in records {
+        anyhow::ensure!(
+            !record.relative.contains(['\n', '\t']),
+            "rustdoc source label cannot be stored"
+        );
+        for path in &record.paths {
+            anyhow::ensure!(
+                !path.contains(['\n', '\t']),
+                "rustdoc source path cannot be stored"
+            );
+            lines.push(format!("{}\t{path}", record.relative));
+        }
+    }
+    Ok(lines.join("\n"))
+}
+
+fn decode_sources(bytes: &[u8]) -> Vec<SourceRecord> {
+    let text = String::from_utf8_lossy(bytes);
+    let mut order = Vec::new();
+    let mut paths: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for line in text.lines() {
+        let Some((relative, path)) = line.split_once('\t') else {
+            continue;
+        };
+        if relative.is_empty() || path.is_empty() {
             continue;
         }
-        let Some(name) = Path::new(path).file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
-        stored_by_name
-            .entry(name.to_string())
+        if !paths.contains_key(relative) {
+            order.push(relative.to_string());
+        }
+        paths
+            .entry(relative.to_string())
             .or_default()
-            .push(path);
+            .push(path.to_string());
     }
-    let mut current_by_name: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for path in current {
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
-        current_by_name
-            .entry(name.to_string())
-            .or_default()
-            .push(path.to_string_lossy().into_owned());
-    }
+    order
+        .into_iter()
+        .filter_map(|relative| {
+            paths
+                .remove(&relative)
+                .map(|paths| SourceRecord { relative, paths })
+        })
+        .collect()
+}
+
+/// Pair stored paths with the current checkout by relative path.
+///
+/// Two `mod.rs` files stay apart because `a/mod.rs` and `b/mod.rs` are
+/// different labels. The crate directory is replaced only at a separator, so
+/// a shorter prefix cannot eat a longer path that merely starts the same way.
+fn source_rewrites(stored: &[SourceRecord], current: &[SourceRecord]) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let current_by: BTreeMap<&str, &[String]> = current
+        .iter()
+        .map(|record| (record.relative.as_str(), record.paths.as_slice()))
+        .collect();
     let mut out = Vec::new();
-    for (name, stored_paths) in &stored_by_name {
-        if stored_paths.len() != 1 {
-            continue;
-        }
-        let Some(current_paths) = current_by_name.get(name) else {
+    for record in stored {
+        let Some(now) = current_by.get(record.relative.as_str()) else {
             continue;
         };
-        if current_paths.len() != 1 {
+        let Some(target) = now.first() else {
+            continue;
+        };
+        if record.relative == "." {
+            for old in &record.paths {
+                if old != target && prefix_is_specific(old) && prefix_is_specific(target) {
+                    out.extend(prefix_pairs(old, target));
+                }
+            }
             continue;
         }
-        let old = stored_paths[0];
-        let new = &current_paths[0];
-        if old != new {
-            out.push((old.as_bytes().to_vec(), new.as_bytes().to_vec()));
+        for old in &record.paths {
+            if old != target {
+                out.push((old.as_bytes().to_vec(), target.as_bytes().to_vec()));
+            }
         }
     }
     out.sort_by_key(|left| std::cmp::Reverse(left.0.len()));
     out
+}
+
+fn prefix_is_specific(path: &str) -> bool {
+    Path::new(path)
+        .components()
+        .any(|component| matches!(component, std::path::Component::Normal(_)))
+}
+
+fn prefix_pairs(from: &str, to: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut pairs = Vec::new();
+    if from.contains('\\') || to.contains('\\') {
+        pairs.push((
+            format!("{from}\\").into_bytes(),
+            format!("{to}\\").into_bytes(),
+        ));
+    }
+    pairs.push((
+        format!("{from}/").into_bytes(),
+        format!("{to}/").into_bytes(),
+    ));
+    pairs
 }
 
 pub(crate) fn rewrite_bytes(input: &[u8], replacements: &[(Vec<u8>, Vec<u8>)]) -> Vec<u8> {
@@ -817,7 +1385,8 @@ pub(crate) fn rewrite_bytes(input: &[u8], replacements: &[(Vec<u8>, Vec<u8>)]) -
 }
 
 fn restore_bundle(parsed: &RustdocArgs, bundle: &Bundle) -> Result<()> {
-    let rewrites = source_rewrites(&bundle.sources, &parsed.sources);
+    let current = source_records(&parsed.sources)?;
+    let rewrites = source_rewrites(&bundle.sources, &current);
     if let Some(out_dir) = &parsed.out_dir {
         for (rel, bytes) in &bundle.out_files {
             let path = join_under(out_dir, rel)?;
@@ -913,7 +1482,13 @@ pub fn run(config: &crate::config::Config, args: &[String]) -> Result<i32> {
             return Ok(code);
         }
     };
-    if let Some(meta) = store.get(&cache_key)?
+    let cached = match store.get(&cache_key) {
+        Ok(meta) => meta,
+        Err(error) => {
+            return pass_store(config, &parsed, &root, &crate_name, start, &error);
+        }
+    };
+    if let Some(meta) = cached
         && cached_entry_is_reusable(&meta)
         && restore_meta(&store, &parsed, &meta).is_ok()
     {
@@ -933,7 +1508,13 @@ pub fn run(config: &crate::config::Config, args: &[String]) -> Result<i32> {
         );
         return Ok(0);
     }
-    match store.claim_build(&cache_key)? {
+    let claim = match store.claim_build(&cache_key) {
+        Ok(claim) => claim,
+        Err(error) => {
+            return pass_store(config, &parsed, &root, &crate_name, start, &error);
+        }
+    };
+    match claim {
         crate::store::BuildClaim::Committed(meta) => {
             if restore_meta(&store, &parsed, &meta).is_ok() {
                 replay(
@@ -954,8 +1535,20 @@ pub fn run(config: &crate::config::Config, args: &[String]) -> Result<i32> {
             }
         }
         crate::store::BuildClaim::Contended => {
-            if store.wait_for_committed(&cache_key)?
-                && let Some(meta) = store.get(&cache_key)?
+            let waited = match store.wait_for_committed(&cache_key) {
+                Ok(waited) => waited,
+                Err(error) => {
+                    return pass_store(config, &parsed, &root, &crate_name, start, &error);
+                }
+            };
+            let after = match store.get(&cache_key) {
+                Ok(meta) => meta,
+                Err(error) => {
+                    return pass_store(config, &parsed, &root, &crate_name, start, &error);
+                }
+            };
+            if waited
+                && let Some(meta) = after
                 && restore_meta(&store, &parsed, &meta).is_ok()
             {
                 replay(
@@ -1027,17 +1620,6 @@ fn compile_and_store(
     cache_key: &str,
     crate_name: &str,
 ) -> Result<Compiled> {
-    // Sample before spawn. A hit must restore only the files this rustdoc
-    // wrote, so a crate page that was already in the output directory stays
-    // where the other invocation left it.
-    let out_before = match &parsed.out_dir {
-        Some(dir) => snapshot(dir)?,
-        None => BTreeMap::new(),
-    };
-    let parts_before = match &parsed.parts_out_dir {
-        Some(dir) => snapshot(dir)?,
-        None => BTreeMap::new(),
-    };
     let output = spawn(parsed)?;
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
@@ -1049,7 +1631,7 @@ fn compile_and_store(
             stored: false,
         });
     }
-    let bundle = match files_written(parsed, &out_before, &parts_before) {
+    let bundle = match files_written(parsed) {
         Ok(bundle) => bundle,
         Err(_) => {
             return Ok(Compiled {
@@ -1070,30 +1652,100 @@ fn compile_and_store(
     })
 }
 
-fn files_written(
-    parsed: &RustdocArgs,
-    out_before: &BTreeMap<String, blake3::Hash>,
-    parts_before: &BTreeMap<String, blake3::Hash>,
-) -> Result<Bundle> {
+/// This crate's pages, or finalize's top-level files.
+///
+/// A diff of the shared doc root drops pages rustdoc left untouched and
+/// would restore an empty checkout without them. Sibling crate directories
+/// stay out: `--merge=none` reads `out/<crate>/` and `out/src/<crate>/`, and
+/// finalize reads only the files in the output root.
+fn files_written(parsed: &RustdocArgs) -> Result<Bundle> {
+    let out_files = match (&parsed.mode, &parsed.out_dir) {
+        (RustdocMode::Crate, Some(dir)) => crate_output_files(dir, parsed.crate_name.as_deref())?,
+        (RustdocMode::Finalize, Some(dir)) => top_level_files(dir)?,
+        _ => Vec::new(),
+    };
+    let parts_files = match (&parsed.mode, &parsed.parts_out_dir) {
+        (RustdocMode::Crate, Some(dir)) => read_tree(dir)?,
+        _ => Vec::new(),
+    };
     Ok(Bundle {
-        out_files: match &parsed.out_dir {
-            Some(dir) => changed_files(dir, out_before)?,
-            None => Vec::new(),
-        },
-        parts_files: match &parsed.parts_out_dir {
-            Some(dir) => changed_files(dir, parts_before)?,
-            None => Vec::new(),
-        },
+        out_files,
+        parts_files,
         depinfo: match &parsed.dep_info {
             Some(path) if path.is_file() => Some(std::fs::read(path)?),
             _ => None,
         },
-        sources: parsed
-            .sources
-            .iter()
-            .map(|path| path.to_string_lossy().into_owned())
-            .collect(),
+        sources: source_records(&parsed.sources)?,
     })
+}
+
+fn crate_output_files(out_dir: &Path, crate_name: Option<&str>) -> Result<Vec<(String, Vec<u8>)>> {
+    let Some(name) = crate_name else {
+        return Ok(Vec::new());
+    };
+    if !safe_rel(name) {
+        return Ok(Vec::new());
+    }
+    let mut files = read_prefixed(out_dir, name)?;
+    files.extend(read_prefixed(out_dir, &format!("src/{name}"))?);
+    Ok(files)
+}
+
+fn read_prefixed(root: &Path, prefix: &str) -> Result<Vec<(String, Vec<u8>)>> {
+    let dir = join_under(root, prefix)?;
+    if !dir.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut listed = Vec::new();
+    collect_files(&mut listed, root, &dir)?;
+    read_listed(listed)
+}
+
+fn read_tree(dir: &Path) -> Result<Vec<(String, Vec<u8>)>> {
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut listed = Vec::new();
+    collect_files(&mut listed, dir, dir)?;
+    read_listed(listed)
+}
+
+fn read_listed(listed: Vec<(String, PathBuf)>) -> Result<Vec<(String, Vec<u8>)>> {
+    let mut out = Vec::with_capacity(listed.len());
+    for (rel, path) in listed {
+        out.push((
+            rel,
+            std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?,
+        ));
+    }
+    Ok(out)
+}
+
+fn top_level_files(dir: &Path) -> Result<Vec<(String, Vec<u8>)>> {
+    if !dir.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
+        let entry = entry?;
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        if !kind.is_file() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !safe_rel(&name) {
+            continue;
+        }
+        out.push((
+            name,
+            std::fs::read(entry.path())
+                .with_context(|| format!("reading {}", entry.path().display()))?,
+        ));
+    }
+    out.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(out)
 }
 
 fn store_bundle(
@@ -1136,6 +1788,25 @@ fn restore_meta(
         .with_context(|| format!("reading rustdoc archive {}", file.hash))?;
     let bundle = decode_archive(&bytes, file.size)?;
     restore_bundle(parsed, &bundle)
+}
+
+fn pass_store(
+    config: &crate::config::Config,
+    parsed: &RustdocArgs,
+    root: &str,
+    crate_name: &str,
+    start: std::time::Instant,
+    error: &anyhow::Error,
+) -> Result<i32> {
+    let code = passthrough(parsed)?;
+    log_pass(
+        config,
+        root,
+        crate_name,
+        start.elapsed().as_millis() as u64,
+        &format!("store unavailable: {error:#}"),
+    );
+    Ok(code)
 }
 
 fn passthrough(parsed: &RustdocArgs) -> Result<i32> {
@@ -1238,28 +1909,6 @@ mod tests {
     }
 
     #[test]
-    fn changed_files_keeps_new_and_edited_paths_only() {
-        let dir = tempfile::tempdir().unwrap();
-        let same = dir.path().join("same.txt");
-        let edit = dir.path().join("edit.txt");
-        std::fs::write(&same, b"same").unwrap();
-        std::fs::write(&edit, b"before").unwrap();
-        let before = snapshot(dir.path()).unwrap();
-        std::fs::write(&edit, b"after").unwrap();
-        std::fs::write(dir.path().join("new.txt"), b"new").unwrap();
-        let changed = changed_files(dir.path(), &before).unwrap();
-        let names: Vec<&str> = changed.iter().map(|(name, _)| name.as_str()).collect();
-        assert!(names.contains(&"edit.txt"), "{names:?}");
-        assert!(names.contains(&"new.txt"), "{names:?}");
-        assert!(!names.contains(&"same.txt"), "{names:?}");
-        let edited = changed
-            .iter()
-            .find(|(name, _)| name == "edit.txt")
-            .map(|(_, bytes)| bytes.as_slice());
-        assert_eq!(edited, Some(b"after".as_slice()));
-    }
-
-    #[test]
     fn recognizes_rustdoc_and_not_rustc() {
         assert!(RustdocCompiler::recognizes(&argv(&["rustdoc"])));
         assert!(RustdocCompiler::recognizes(&argv(&["/usr/bin/rustdoc"])));
@@ -1279,7 +1928,7 @@ mod tests {
         let verbose = parse(&["rustdoc", "--verbose", "src/lib.rs"]);
         assert!(!verbose.unknown);
         assert_eq!(verbose.sources, vec![PathBuf::from("src/lib.rs")]);
-        assert!(verbose.keyed.iter().any(|item| item == "bare"));
+        assert!(verbose.keyed.iter().any(|item| item == "--verbose"));
 
         let private = parse(&["rustdoc", "--document-private-items", "src/lib.rs"]);
         assert!(!private.unknown);
@@ -1347,7 +1996,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut parsed = parse(&["rustdoc"]);
         parsed.dep_info = Some(dir.path().to_path_buf());
-        let bundle = files_written(&parsed, &BTreeMap::new(), &BTreeMap::new()).unwrap();
+        let bundle = files_written(&parsed).unwrap();
         assert!(bundle.depinfo.is_none());
     }
 
@@ -1368,6 +2017,323 @@ mod tests {
         );
         assert_eq!(strip_root("out/../etc/passwd", "out"), None);
         assert_eq!(strip_root("out", "out"), None);
+    }
+
+    #[test]
+    fn flag_names_enter_the_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        std::fs::write(&source, b"pub fn demo() {}\n").unwrap();
+        let source_arg = source.to_string_lossy().into_owned();
+        let base = [
+            "rustdoc",
+            "--merge=none",
+            "--crate-name",
+            "demo",
+            "-o",
+            "/out",
+            "--parts-out-dir",
+            "/parts",
+        ];
+        let with = |extra: &[&str]| {
+            let mut args = base.to_vec();
+            args.extend(extra.iter().copied());
+            args.push(source_arg.as_str());
+            cache_key_with(&parse(&args), "v", None).unwrap()
+        };
+        let private = with(&["--document-private-items"]);
+        let hidden_source = with(&["--html-no-source"]);
+        assert_ne!(private, hidden_source);
+        let deny = with(&["-D", "missing_docs"]);
+        let allow = with(&["-A", "missing_docs"]);
+        assert_ne!(deny, allow);
+        let edition_eq = with(&["--edition=2021"]);
+        let edition_sp = with(&["--edition", "2021"]);
+        assert_eq!(edition_eq, edition_sp);
+        assert_eq!(
+            parse(&["rustdoc", "--edition=2021"]).keyed,
+            parse(&["rustdoc", "--edition", "2021"]).keyed
+        );
+        let response = parse(&["rustdoc", "@args"]);
+        assert!(response.unknown);
+        assert!(refusal(&response).is_some());
+    }
+
+    #[test]
+    fn modules_and_includes_enter_the_key_and_dep_info_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(src.join("a")).unwrap();
+        std::fs::create_dir_all(src.join("b")).unwrap();
+        let lib = src.join("lib.rs");
+        std::fs::write(
+            &lib,
+            "#[cfg(any())]\nmod hidden;\nmod a;\nmod b;\nmod inline {\n    fn keep() {}\n    mod nested;\n}\nmod after;\nconst TEXT: &str = \"include_str!(\\\"secret.txt\\\")\";\n// include_str!(\"comment.txt\")\npub fn demo() {}\n",
+        )
+        .unwrap();
+        std::fs::write(src.join("hidden.rs"), b"pub fn hidden() {}\n").unwrap();
+        std::fs::write(
+            src.join("a/mod.rs"),
+            "include_str!(\"note.txt\");\n#[path = \"renamed.rs\"]\nmod c;\n",
+        )
+        .unwrap();
+        std::fs::write(src.join("a/note.txt"), b"note\n").unwrap();
+        std::fs::write(src.join("a/renamed.rs"), b"pub fn c() {}\n").unwrap();
+        std::fs::write(src.join("a/c.rs"), b"pub fn not_used() {}\n").unwrap();
+        std::fs::write(src.join("b/mod.rs"), b"pub fn b() {}\n").unwrap();
+        std::fs::create_dir_all(src.join("inline")).unwrap();
+        std::fs::write(src.join("inline/nested.rs"), b"pub fn nested() {}\n").unwrap();
+        std::fs::write(src.join("nested.rs"), b"pub fn sibling() {}\n").unwrap();
+        std::fs::write(src.join("after.rs"), b"pub fn after() {}\n").unwrap();
+        std::fs::write(dir.path().join("README.md"), b"readme\n").unwrap();
+        std::fs::write(
+            src.join("decoy.rs"),
+            "const TEXT: &str = \"include_str!(\\\"secret.txt\\\")\";\n// include_str!(\"comment.txt\")\n",
+        )
+        .unwrap();
+        std::fs::write(src.join("secret.txt"), b"secret\n").unwrap();
+        std::fs::write(src.join("comment.txt"), b"comment\n").unwrap();
+        let parsed = parse(&[
+            "rustdoc",
+            "--merge=none",
+            "--crate-name",
+            "demo",
+            &lib.to_string_lossy(),
+            "-o",
+            "/out",
+            "--parts-out-dir",
+            "/parts",
+        ]);
+        let key = cache_key_with(&parsed, "v", None).unwrap();
+        let dep = dir.path().join("demo.d");
+        std::fs::write(&dep, b"out: src/lib.rs\n").unwrap();
+        let mut with_dep = parsed.clone();
+        with_dep.dep_info = Some(dep);
+        assert_eq!(key, cache_key_with(&with_dep, "v", None).unwrap());
+
+        std::fs::write(src.join("hidden.rs"), b"pub fn hidden() { let _ = 1; }\n").unwrap();
+        assert_ne!(key, cache_key_with(&parsed, "v", None).unwrap());
+        std::fs::write(src.join("hidden.rs"), b"pub fn hidden() {}\n").unwrap();
+        assert_eq!(key, cache_key_with(&parsed, "v", None).unwrap());
+
+        std::fs::write(src.join("a/note.txt"), b"note2\n").unwrap();
+        assert_ne!(key, cache_key_with(&parsed, "v", None).unwrap());
+        std::fs::write(src.join("a/note.txt"), b"note\n").unwrap();
+
+        std::fs::write(src.join("a/c.rs"), b"pub fn not_used() { let _ = 1; }\n").unwrap();
+        assert_eq!(
+            key,
+            cache_key_with(&parsed, "v", None).unwrap(),
+            "a path attribute selects renamed.rs, not c.rs"
+        );
+        std::fs::write(src.join("a/renamed.rs"), b"pub fn c() { let _ = 1; }\n").unwrap();
+        assert_ne!(key, cache_key_with(&parsed, "v", None).unwrap());
+        std::fs::write(src.join("a/renamed.rs"), b"pub fn c() {}\n").unwrap();
+
+        std::fs::write(src.join("b/mod.rs"), b"pub fn b() { let _ = 1; }\n").unwrap();
+        assert_ne!(key, cache_key_with(&parsed, "v", None).unwrap());
+        std::fs::write(src.join("b/mod.rs"), b"pub fn b() {}\n").unwrap();
+        assert_eq!(key, cache_key_with(&parsed, "v", None).unwrap());
+
+        std::fs::write(
+            src.join("inline/nested.rs"),
+            b"pub fn nested() { let _ = 1; }\n",
+        )
+        .unwrap();
+        assert_ne!(key, cache_key_with(&parsed, "v", None).unwrap());
+        std::fs::write(src.join("inline/nested.rs"), b"pub fn nested() {}\n").unwrap();
+        std::fs::write(src.join("nested.rs"), b"pub fn sibling() { let _ = 1; }\n").unwrap();
+        assert_eq!(
+            key,
+            cache_key_with(&parsed, "v", None).unwrap(),
+            "an inline module's child is not the sibling file"
+        );
+        std::fs::write(src.join("nested.rs"), b"pub fn sibling() {}\n").unwrap();
+        std::fs::write(src.join("after.rs"), b"pub fn after() { let _ = 1; }\n").unwrap();
+        assert_ne!(
+            key,
+            cache_key_with(&parsed, "v", None).unwrap(),
+            "a module after an inline module is still beside this file"
+        );
+        std::fs::write(src.join("after.rs"), b"pub fn after() {}\n").unwrap();
+        assert_eq!(key, cache_key_with(&parsed, "v", None).unwrap());
+
+        std::fs::write(src.join("secret.txt"), b"secret2\n").unwrap();
+        std::fs::write(src.join("comment.txt"), b"comment2\n").unwrap();
+        std::fs::write(dir.path().join("README.md"), b"readme2\n").unwrap();
+        assert_eq!(key, cache_key_with(&parsed, "v", None).unwrap());
+
+        let other = tempfile::tempdir().unwrap();
+        let other_src = other.path().join("src");
+        std::fs::create_dir_all(other_src.join("a")).unwrap();
+        std::fs::create_dir_all(other_src.join("b")).unwrap();
+        std::fs::write(other_src.join("lib.rs"), std::fs::read(&lib).unwrap()).unwrap();
+        std::fs::write(
+            other_src.join("hidden.rs"),
+            std::fs::read(src.join("hidden.rs")).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            other_src.join("a/mod.rs"),
+            std::fs::read(src.join("a/mod.rs")).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            other_src.join("a/note.txt"),
+            std::fs::read(src.join("a/note.txt")).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            other_src.join("a/renamed.rs"),
+            std::fs::read(src.join("a/renamed.rs")).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            other_src.join("b/mod.rs"),
+            std::fs::read(src.join("b/mod.rs")).unwrap(),
+        )
+        .unwrap();
+        std::fs::create_dir_all(other_src.join("inline")).unwrap();
+        std::fs::write(
+            other_src.join("inline/nested.rs"),
+            std::fs::read(src.join("inline/nested.rs")).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            other_src.join("after.rs"),
+            std::fs::read(src.join("after.rs")).unwrap(),
+        )
+        .unwrap();
+        let moved = parse(&[
+            "rustdoc",
+            "--merge=none",
+            "--crate-name",
+            "demo",
+            &other_src.join("lib.rs").to_string_lossy(),
+            "-o",
+            "/elsewhere",
+            "--parts-out-dir",
+            "/parts-b",
+        ]);
+        assert_eq!(key, cache_key_with(&moved, "v", None).unwrap());
+
+        std::fs::write(src.join("missing_mod.rs"), b"pub fn later() {}\n").unwrap();
+        std::fs::write(&lib, "mod missing_mod;\n").unwrap();
+        let with_mod = cache_key_with(&parsed, "v", None).unwrap();
+        std::fs::remove_file(src.join("missing_mod.rs")).unwrap();
+        assert_ne!(with_mod, cache_key_with(&parsed, "v", None).unwrap());
+
+        std::fs::write(&lib, "include!(concat!(\"generated.rs\"));\n").unwrap();
+        assert!(cache_key_with(&parsed, "v", None).is_err());
+    }
+
+    #[test]
+    fn crate_pages_are_stored_whole_and_finalize_stays_at_the_top() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("doc");
+        let parts = dir.path().join("parts");
+        std::fs::create_dir_all(out.join("demo")).unwrap();
+        std::fs::create_dir_all(out.join("src/demo")).unwrap();
+        std::fs::create_dir_all(out.join("other")).unwrap();
+        std::fs::create_dir_all(&parts).unwrap();
+        std::fs::write(out.join("demo/index.html"), b"<p>same</p>").unwrap();
+        std::fs::write(out.join("src/demo/lib.rs.html"), b"source").unwrap();
+        std::fs::write(out.join("other/index.html"), b"sibling").unwrap();
+        std::fs::write(out.join("search-index.js"), b"idx").unwrap();
+        std::fs::write(parts.join("demo.json"), b"{}").unwrap();
+        let source = dir.path().join("lib.rs");
+        std::fs::write(&source, b"pub fn demo() {}\n").unwrap();
+        let parsed = parse(&[
+            "rustdoc",
+            "--merge=none",
+            "--crate-name",
+            "demo",
+            &source.to_string_lossy(),
+            "-o",
+            &out.to_string_lossy(),
+            "--parts-out-dir",
+            &parts.to_string_lossy(),
+        ]);
+        let bundle = files_written(&parsed).unwrap();
+        let names: Vec<&str> = bundle
+            .out_files
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect();
+        assert!(names.contains(&"demo/index.html"), "{names:?}");
+        assert!(names.contains(&"src/demo/lib.rs.html"), "{names:?}");
+        assert!(!names.contains(&"other/index.html"), "{names:?}");
+        assert!(!names.contains(&"search-index.js"), "{names:?}");
+        assert_eq!(bundle.parts_files.len(), 1);
+
+        let fin = parse(&["rustdoc", "-o", &out.to_string_lossy(), "--merge=finalize"]);
+        let fin_bundle = files_written(&fin).unwrap();
+        let fin_names: Vec<&str> = fin_bundle
+            .out_files
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect();
+        assert_eq!(fin_names, vec!["search-index.js"]);
+        assert!(fin_bundle.parts_files.is_empty());
+    }
+
+    #[test]
+    fn key_env_vars_are_folded_before_the_salt() {
+        let _lock = crate::config::config_path_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        std::fs::write(&source, b"pub fn demo() {}\n").unwrap();
+        let parsed = parse_args(&crate_argv("/out", "/parts", &source.to_string_lossy()));
+        let base = cache_key_with(&parsed, "v", None).unwrap();
+        assert_eq!(finish_rustdoc_key(base.clone(), "demo", &[], None), base);
+        assert_eq!(
+            finish_rustdoc_key(base.clone(), "demo", &[], Some("s")),
+            cache_key_with(&parsed, "v", Some("s")).unwrap()
+        );
+        let _env = crate::config::tests::set_env_for_test(
+            "KACHE_RUSTDOC_KEY_PROBE",
+            Some(std::ffi::OsStr::new("one")),
+        );
+        let patterns = vec!["KACHE_RUSTDOC_KEY_PROBE".to_string()];
+        let with_env = finish_rustdoc_key(base.clone(), "demo", &patterns, None);
+        assert_ne!(with_env, base);
+        let env_then_salt = finish_rustdoc_key(base.clone(), "demo", &patterns, Some("s"));
+        let salt_then_env = crate::cache_key::apply_key_env_vars(
+            crate::cache_key::apply_key_salt(base.clone(), Some("s"), "demo"),
+            &patterns,
+            "demo",
+        );
+        assert_ne!(env_then_salt, salt_then_env);
+        assert_eq!(
+            env_then_salt,
+            crate::cache_key::apply_key_salt(with_env, Some("s"), "demo")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_module_is_not_cached() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = dir.path().join("lib.rs");
+        let hidden = dir.path().join("hidden.rs");
+        std::fs::write(&lib, b"mod hidden;\n").unwrap();
+        std::fs::write(&hidden, b"pub fn hidden() {}\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&hidden, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let parsed = parse(&[
+            "rustdoc",
+            "--merge=none",
+            "--crate-name",
+            "demo",
+            &lib.to_string_lossy(),
+            "-o",
+            "/out",
+            "--parts-out-dir",
+            "/parts",
+        ]);
+        let result = cache_key_with(&parsed, "v", None);
+        std::fs::set_permissions(&hidden, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(result.is_err(), "{result:?}");
     }
 
     #[test]
@@ -1696,6 +2662,8 @@ mod tests {
         let current_source = std::env::temp_dir()
             .join("kache-rustdoc-new")
             .join("lib.rs");
+        std::fs::create_dir_all(current_source.parent().unwrap()).unwrap();
+        std::fs::write(&current_source, b"pub fn demo() {}\n").unwrap();
         let bundle = Bundle {
             out_files: vec![(
                 "demo/index.html".into(),
@@ -1703,7 +2671,16 @@ mod tests {
             )],
             parts_files: vec![("demo.json".into(), b"{}".to_vec())],
             depinfo: Some(format!("{}: {}\n", "doc.d", stored_source.display()).into_bytes()),
-            sources: vec![stored_source.display().to_string()],
+            sources: vec![
+                SourceRecord {
+                    relative: ".".into(),
+                    paths: vec![stored_source.parent().unwrap().display().to_string()],
+                },
+                SourceRecord {
+                    relative: "lib.rs".into(),
+                    paths: vec![stored_source.display().to_string()],
+                },
+            ],
         };
         let bytes = pack(&bundle).unwrap();
         let decoded = decode_archive(&bytes, bytes.len() as u64).unwrap();
@@ -1739,36 +2716,38 @@ mod tests {
         );
     }
 
-    #[test]
-    fn rewrites_one_absolute_source_and_leaves_ambiguous_names() {
-        let old = std::env::temp_dir().join("one").join("lib.rs");
-        let new = PathBuf::from("src").join("lib.rs");
-        let rewrites = source_rewrites(&[old.display().to_string()], std::slice::from_ref(&new));
-        assert_eq!(rewrites.len(), 1);
-        let html = format!("see {}", old.display());
-        let updated = rewrite_bytes(html.as_bytes(), &rewrites);
-        assert_eq!(
-            String::from_utf8(updated).unwrap(),
-            format!("see {}", new.display())
-        );
+    fn record(relative: &str, path: &str) -> SourceRecord {
+        SourceRecord {
+            relative: relative.to_string(),
+            paths: vec![path.to_string()],
+        }
+    }
 
-        let other = std::env::temp_dir().join("two").join("lib.rs");
-        assert!(
-            source_rewrites(
-                &[old.display().to_string(), other.display().to_string()],
-                std::slice::from_ref(&new)
-            )
-            .is_empty()
+    #[test]
+    fn rewrites_child_paths_by_relative_directory() {
+        let stored = vec![
+            record(".", "/old/src"),
+            record("lib.rs", "/old/src/lib.rs"),
+            record("a/mod.rs", "/old/src/a/mod.rs"),
+            record("b/mod.rs", "/old/src/b/mod.rs"),
+            record("../README.md", "/old/README.md"),
+        ];
+        let current = vec![
+            record(".", "/new/src"),
+            record("lib.rs", "/new/src/lib.rs"),
+            record("a/mod.rs", "/new/src/a/mod.rs"),
+            record("b/mod.rs", "/new/src/b/mod.rs"),
+            record("../README.md", "/new/README.md"),
+        ];
+        let html =
+            b"see /old/src/a/mod.rs and /old/src/b/mod.rs and /old/README.md and /old/src-extra";
+        let updated = rewrite_bytes(html, &source_rewrites(&stored, &current));
+        assert_eq!(
+            updated,
+            b"see /new/src/a/mod.rs and /new/src/b/mod.rs and /new/README.md and /old/src-extra"
         );
-        assert!(
-            source_rewrites(
-                &[old.display().to_string()],
-                &[new.clone(), PathBuf::from("b/lib.rs")]
-            )
-            .is_empty()
-        );
-        assert!(source_rewrites(&["src/lib.rs".into()], &[new]).is_empty());
         assert!(rewrite_bytes(b"keep", &[]).as_slice() == b"keep");
+        assert!(source_rewrites(&stored, &stored).is_empty());
     }
 
     #[test]

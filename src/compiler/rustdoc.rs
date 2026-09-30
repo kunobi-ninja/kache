@@ -727,19 +727,20 @@ fn cooked_string(bytes: &[u8], index: usize) -> (String, usize) {
             return (out, cursor + 1);
         }
         if byte == b'\\' {
-            cursor += 1;
-            match bytes.get(cursor) {
-                Some(b'n') => out.push('\n'),
-                Some(b'r') => out.push('\r'),
-                Some(b't') => out.push('\t'),
-                Some(b'\\') => out.push('\\'),
-                Some(b'"') => out.push('"'),
-                Some(b'\'') => out.push('\''),
-                Some(b'0') => out.push('\0'),
-                Some(other) => out.push(*other as char),
-                None => break,
-            }
-            cursor += 1;
+            let Some(escaped) = bytes.get(cursor + 1).copied() else {
+                break;
+            };
+            out.push(match escaped {
+                b'n' => '\n',
+                b'r' => '\r',
+                b't' => '\t',
+                b'\\' => '\\',
+                b'"' => '"',
+                b'\'' => '\'',
+                b'0' => '\0',
+                other => other as char,
+            });
+            cursor += 2;
             continue;
         }
         out.push(byte as char);
@@ -3235,7 +3236,13 @@ mod tests {
         assert_eq!(skip_char_or_lifetime(b"'a", 0), 1);
         assert!(raw_string(b"r#\"abc", 0).is_none());
         assert_eq!(module_names("mod real; // tail"), vec!["real".to_string()]);
+        assert_eq!(
+            module_names("mod a; //x\nmod b;"),
+            vec!["a".to_string(), "b".to_string()]
+        );
         assert!(module_names("mod foo").is_empty());
+        let (text, _) = cooked_string(b"\"\\nb\"", 0);
+        assert_eq!(text, "\nb");
     }
 
     #[test]
@@ -3303,5 +3310,15 @@ mod tests {
         )
         .unwrap();
         assert_eq!(code, 7);
+    }
+
+    #[test]
+    fn decode_sources_drops_a_blank_side() {
+        assert!(decode_sources(b"\t/abs/lib.rs").is_empty());
+        assert!(decode_sources(b"lib.rs\t").is_empty());
+        let records = decode_sources(b"lib.rs\t/abs/lib.rs");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].relative, "lib.rs");
+        assert_eq!(records[0].paths, vec!["/abs/lib.rs".to_string()]);
     }
 }

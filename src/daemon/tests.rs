@@ -1771,6 +1771,20 @@ fn is_client_disconnect_matches_disconnect_kinds() {
     assert!(!is_client_disconnect(&Error::from(ErrorKind::TimedOut)));
 }
 
+#[test]
+fn request_failure_marks_only_withdrawn_handoffs_routine() {
+    assert_eq!(request_failure(&Response::ok()), None);
+    assert_eq!(
+        request_failure(&Response::err("publish refused: queue full")),
+        Some(("publish refused: queue full", false))
+    );
+    let withdrawn = "publish refused: the wrapper withdrew the hand-off first";
+    assert_eq!(
+        request_failure(&Response::err(withdrawn)),
+        Some((withdrawn, true))
+    );
+}
+
 /// Descriptor exhaustion pauses the accept loop; any other accept error
 /// retries at once, as before.
 #[cfg(unix)]

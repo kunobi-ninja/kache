@@ -7573,6 +7573,7 @@ const ACCEPT_LOOP_IDLE_TICK: Duration = Duration::from_secs(60);
 /// How long the accept loop pauses after the process runs out of file
 /// descriptors. Retrying at once spins on the same error until a handler
 /// closes one; the queued clients wait in the listen backlog either way.
+#[cfg(unix)]
 const ACCEPT_EXHAUSTED_BACKOFF: Duration = Duration::from_millis(50);
 
 /// The pause before accepting again after `error`, if any.
@@ -8585,10 +8586,9 @@ async fn handle_connection_started_at(
             // Wake the accept loop so the restart starts now (issue #288).
         }
 
-        if !resp.ok {
-            let error = resp.error.as_deref().unwrap_or("unknown");
+        if let Some((error, routine)) = request_failure(&resp) {
             let elapsed_ms = elapsed.as_millis() as u64;
-            if crate::daemon_publish::refusal_is_routine(error) {
+            if routine {
                 tracing::debug!(elapsed_ms, error, "request failed");
             } else {
                 tracing::warn!(elapsed_ms, error, "request failed");
@@ -8609,6 +8609,15 @@ async fn handle_connection_started_at(
 
 /// Returns true for I/O errors that mean the client disconnected, so the
 /// daemon can downgrade the log level instead of warning on every occurrence.
+/// A failed response's error, and whether the client recovers from it on its
+/// own (logged at debug instead of warn).
+fn request_failure(resp: &Response) -> Option<(&str, bool)> {
+    (!resp.ok).then(|| {
+        let error = resp.error.as_deref().unwrap_or("unknown");
+        (error, crate::daemon_publish::refusal_is_routine(error))
+    })
+}
+
 fn is_client_disconnect(e: &std::io::Error) -> bool {
     matches!(
         e.kind(),

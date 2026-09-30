@@ -287,6 +287,11 @@ exclude_re = [
     "src/scheduler/pressure.rs:.*replace under_pressure -> bool",
     "src/scheduler/pressure.rs:.* in under_pressure$",
     "probe_macos",
+    # The per-process descriptor cap is a live sysctl, compiled only on macOS
+    # and checked against `sysctl -n` there. `open_file_target` and
+    # `raise_open_file_limit` stay in scope.
+    "replace macos_max_files_per_proc ->",
+    " in macos_max_files_per_proc$",
     "replace sdk_identity_for",
     "xcrun",
     "replace macos_oso_prefix_flag ->",

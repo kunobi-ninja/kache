@@ -166,8 +166,13 @@ pub fn raise_open_file_limit() -> std::io::Result<Option<(libc::rlim_t, libc::rl
     if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
         return Err(std::io::Error::last_os_error());
     }
-    let Some(target) = open_file_target(limit.rlim_cur, limit.rlim_max, per_process_file_cap())
-    else {
+    // macOS rejects a soft limit above `kern.maxfilesperproc`, and launchd's
+    // hard limit is unlimited.
+    #[cfg(target_os = "macos")]
+    let cap = Some(macos_max_files_per_proc());
+    #[cfg(not(target_os = "macos"))]
+    let cap = None;
+    let Some(target) = open_file_target(limit.rlim_cur, limit.rlim_max, cap) else {
         return Ok(None);
     };
     let before = limit.rlim_cur;
@@ -191,10 +196,10 @@ fn open_file_target(
     (target > soft).then_some(target)
 }
 
-/// macOS rejects a soft limit above `kern.maxfilesperproc`, and launchd's
-/// hard limit is unlimited.
+/// `kern.maxfilesperproc`, or OPEN_MAX (the documented safe ceiling) when
+/// the sysctl is unreadable.
 #[cfg(target_os = "macos")]
-fn per_process_file_cap() -> Option<libc::rlim_t> {
+fn macos_max_files_per_proc() -> libc::rlim_t {
     let mut value: libc::c_int = 0;
     let mut size = std::mem::size_of::<libc::c_int>();
     // SAFETY: the name is NUL-terminated and `value`/`size` describe a c_int.
@@ -207,17 +212,11 @@ fn per_process_file_cap() -> Option<libc::rlim_t> {
             0,
         )
     };
-    // OPEN_MAX is the documented safe ceiling when the sysctl is unreadable.
-    Some(if status == 0 && value > 0 {
+    if status == 0 && value > 0 {
         value as libc::rlim_t
     } else {
         10_240
-    })
-}
-
-#[cfg(all(unix, not(target_os = "macos")))]
-fn per_process_file_cap() -> Option<libc::rlim_t> {
-    None
+    }
 }
 
 /// Resolve when the OS asks the daemon to stop. SIGTERM/SIGINT on Unix,
@@ -362,27 +361,52 @@ mod tests {
         assert_eq!(open_file_target(8192, 524_288, Some(4096)), None);
     }
 
-    /// Raising only ever grows the soft limit, so doing it in the test
-    /// process is harmless. The second call finds nothing left to raise.
+    /// Lowering the soft limit is always allowed, so setting it one below
+    /// the target gives the raise something to do on any host. A soft limit
+    /// already above the target (a shell's `ulimit -n`) is never lowered.
     #[cfg(unix)]
     #[test]
-    fn raise_open_file_limit_reaches_the_target_once() {
-        let mut limit = libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
+    fn raise_open_file_limit_restores_a_lowered_limit_once() {
+        let current = || {
+            let mut limit = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            assert_eq!(
+                unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+                0
+            );
+            limit
         };
+        #[cfg(target_os = "macos")]
+        let cap = Some(super::macos_max_files_per_proc());
+        #[cfg(not(target_os = "macos"))]
+        let cap = None;
+        let mut limit = current();
+        let target = super::open_file_target(0, limit.rlim_max, cap).unwrap();
+        limit.rlim_cur = target - 1;
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
         assert_eq!(
-            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
-            0
+            super::raise_open_file_limit().unwrap(),
+            Some((target - 1, target))
         );
-        if let Some((before, after)) = super::raise_open_file_limit().unwrap() {
-            assert_eq!(before, limit.rlim_cur);
-            assert!(after > before);
-            let mut now = limit;
-            assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut now) }, 0);
-            assert_eq!(now.rlim_cur, after);
-        }
+        assert_eq!(current().rlim_cur, target);
         assert_eq!(super::raise_open_file_limit().unwrap(), None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_cap_reads_kern_maxfilesperproc() {
+        let out = std::process::Command::new("sysctl")
+            .args(["-n", "kern.maxfilesperproc"])
+            .output()
+            .unwrap();
+        let expected: libc::rlim_t = String::from_utf8(out.stdout)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(super::macos_max_files_per_proc(), expected);
     }
 
     /// The program stays the path kache was started through; only argv

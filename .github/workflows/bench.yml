@@ -458,7 +458,10 @@ jobs:
           # actual compile error on a failed run), and sccache's
           # *.sccache-adv.txt stats for the sccache arm. These are flat globs
           # in the scratch dir, so they exclude the multi-GB clone worktrees /
-          # objdirs / cache.
+          # objdirs / cache. The two `!` lines drop scratch the contention
+          # driver removes on exit: a timed-out step leaves it behind with
+          # builds still running in it, and files vanishing mid-walk fail the
+          # whole upload.
           path: |
             tmp/bench/${{ matrix.dir }}/*.json
             tmp/bench/${{ matrix.dir }}/*.md
@@ -471,9 +474,6 @@ jobs:
             tmp/bench/${{ matrix.dir }}/logs/
             tmp/bench/${{ matrix.dir }}/contention/
             tmp/bench/${{ matrix.dir }}/contention.log
-            # Scratch the contention driver removes on exit. A timed-out step
-            # leaves it behind with builds still running in it, and files
-            # vanishing mid-walk fail the whole upload.
             !tmp/bench/${{ matrix.dir }}/contention/work/**
             !tmp/bench/${{ matrix.dir }}/contention/cargo-home/**
           retention-days: 30

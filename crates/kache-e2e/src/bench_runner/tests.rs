@@ -2748,8 +2748,9 @@ fn the_refusal_categories_come_from_their_own_counters() {
     );
 }
 
-/// A phase's own load reading reaches the payload, and the external arms,
-/// which do not carry one yet, report none rather than a zero.
+/// Every tool's phase carries the load it was measured under: tools share
+/// a node in one job, and a comparison is only fair if both sides say how
+/// busy it was.
 #[test]
 fn the_load_a_phase_was_measured_under_reaches_the_payload() {
     let load = crate::bench_host::PhaseLoad {
@@ -2761,12 +2762,17 @@ fn the_load_a_phase_was_measured_under_reaches_the_payload() {
         load: load.clone(),
         ..Default::default()
     };
-    assert_eq!(otlp_phase("warm", &metrics, 0).load, Some(load));
+    assert_eq!(otlp_phase("warm", &metrics, 0).load, Some(load.clone()));
 
-    let sccache = SccachePhaseMetrics::from_raw(&serde_json::json!({}), 1_000);
-    assert_eq!(otlp_sccache_phase("warm", &sccache, 0).load, None);
-    let mbx = MbxPhaseMetrics::from_report(&serde_json::json!({}), 1_000);
-    assert_eq!(otlp_mbx_phase("warm", &mbx, 0).load, None);
+    let mut sccache = SccachePhaseMetrics::from_raw(&serde_json::json!({}), 1_000);
+    sccache.load = load.clone();
+    assert_eq!(
+        otlp_sccache_phase("warm", &sccache, 0).load,
+        Some(load.clone())
+    );
+    let mut mbx = MbxPhaseMetrics::from_report(&serde_json::json!({}), 1_000);
+    mbx.load = load.clone();
+    assert_eq!(otlp_mbx_phase("warm", &mbx, 0).load, Some(load));
 }
 
 /// The same-tree warm is a phase of the same gauges, present only when it

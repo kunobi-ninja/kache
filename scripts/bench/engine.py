@@ -7,14 +7,31 @@ import subprocess
 from pathlib import Path
 
 
-def run_measurement(command, **kwargs):
-    # A timed-out engine can leave compiler children alive. Stop the whole
-    # measurement group before its scratch directory is removed.
+# The longest one engine pass may take. A run's own deadline can shorten it.
+MEASUREMENT_TIMEOUT = 1200
+
+
+def run_measurement(command, timeout=MEASUREMENT_TIMEOUT, grace=0, **kwargs):
+    """Run one measurement in its own process group.
+
+    A timed-out measurement can leave compiler children alive, so the whole
+    group is stopped before its scratch directory is removed. With `grace`,
+    the group gets SIGINT first and that many seconds to clean up: the
+    contention driver starts its builds in groups of their own and only it
+    can stop them.
+    """
     with subprocess.Popen(command, start_new_session=True, **kwargs) as process:
         try:
-            status = process.wait(timeout=1200)
+            status = process.wait(timeout=timeout)
         except BaseException:
             try:
+                if grace:
+                    os.killpg(process.pid, signal.SIGINT)
+                    try:
+                        process.wait(timeout=grace)
+                    except subprocess.TimeoutExpired:
+                        pass
+                # Also after a clean exit: children can outlive the leader.
                 os.killpg(process.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass

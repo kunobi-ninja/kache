@@ -443,6 +443,10 @@ jobs:
         # failure rather than uploading a misleading green report.
         run: |
           rustc --version && cargo --version && just --version
+          # The short suites (hk, eza, aube) stop five minutes before this
+          # step's limit and report what they finished; a killed step
+          # reports nothing. Other arms ignore it.
+          export BENCH_DEADLINE_AT=$(( $(date +%s) + (${{ matrix.timeout }} - 5) * 60 ))
           # EXTRA_ARGS is passed via env (not interpolated into the command line)
           # so a dispatch input can't inject shell. Unquoted on purpose: the
           # bench flags (e.g. `--skip-clone --retry`) must word-split. matrix.cmd

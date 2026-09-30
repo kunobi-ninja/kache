@@ -394,6 +394,9 @@ jobs:
           RUSTUP_TOOLCHAIN: ""
         run: |
           set -euo pipefail
+          # Five minutes inside the step limit above, so a run that runs out
+          # of time stops itself and reports what it finished.
+          export BENCH_DEADLINE_AT=$(( $(date +%s) + 55 * 60 ))
           status=0
           python3 "$RUNNER_TEMP/instrument/bench-short.py" \
             --project "$BENCH_PROJECT" --samples "$BENCH_SAMPLES" --order-seed "$ORDER_SEED" \

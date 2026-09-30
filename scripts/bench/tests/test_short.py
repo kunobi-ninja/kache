@@ -106,6 +106,22 @@ class BenchTests(unittest.TestCase):
                 engine.run_measurement(["engine"])
             kill.assert_called_once_with(1234, engine.signal.SIGKILL)
 
+            # With a grace period the group is asked first, then killed.
+            kill.reset_mock()
+            process.wait.reset_mock()
+            process.wait.side_effect = [
+                subprocess.TimeoutExpired("contention", 60),
+                subprocess.TimeoutExpired("contention", 5),
+                0,
+            ]
+            with self.assertRaises(subprocess.TimeoutExpired):
+                engine.run_measurement(["contention"], timeout=60, grace=5)
+            self.assertEqual(
+                [c.args for c in kill.call_args_list],
+                [(1234, engine.signal.SIGINT), (1234, engine.signal.SIGKILL)],
+            )
+            self.assertEqual(process.wait.call_args_list[1].kwargs, {"timeout": 5})
+
     def test_refuses_invalid_measurements(self):
         for backend in ("kache", "sccache", "mbx"):
             stats.validate(result(backend), backend)
@@ -235,7 +251,8 @@ class BenchTests(unittest.TestCase):
 
             invoke = fake_engine(calls)
 
-            def contention(args, arms):
+            def contention(args, arms, timeout=None):
+                self.assertIsNone(timeout)
                 self.assertFalse((args.output / "scratch").exists())
                 self.assertEqual(
                     [arm[0] for arm in arms], ["base", "head", "sccache", "mbx"]
@@ -364,7 +381,7 @@ class BenchTests(unittest.TestCase):
                 (output / "samples.json").write_text(json.dumps({"records": records}))
                 (output / "summary.json").write_text("[]")
 
-            with patch.object(short.subprocess, "run", run):
+            with patch.object(short, "run_measurement", run):
                 self.assertEqual(short.run_contention(args, arms)["failures"], [])
                 self.assertIn("kache=/kache,1", calls[0])
                 self.assertIn("--sccache", calls[0])
@@ -471,6 +488,154 @@ class BenchTests(unittest.TestCase):
                 "INVALID MEASUREMENT", (args.output / "perf-gate.md").read_text()
             )
             self.assertTrue((args.output / "logs/00-kache/engine.log").exists())
+
+
+class FakeClock:
+    """Time that moves only when the fake engine says a build took some."""
+
+    def __init__(self):
+        self.now = 0.0
+
+    def monotonic(self):
+        return self.now
+
+    def time(self):
+        return 1_000_000.0 + self.now
+
+    def time_ns(self):
+        return int(self.time() * 1e9)
+
+
+def timed_engine(clock, calls, cold=100.0, warm=10.0):
+    """The fake engine, taking `cold` seconds for a measured cold build and
+    `warm` for a reused one, and timing out like the real one would."""
+    write = fake_engine(calls)
+
+    def invoke(command, timeout=None, **kwargs):
+        needs = warm if "--retry" in command else cold
+        if timeout is not None and needs > timeout:
+            clock.now += timeout
+            calls.append(command)
+            raise subprocess.TimeoutExpired(command, timeout)
+        clock.now += needs
+        write(command, **kwargs)
+
+    return invoke
+
+
+def run_marker_values(output):
+    metrics = json.loads((output / "metrics.otlp.json").read_text())
+    return [
+        point["asInt"]
+        for resource in metrics["resourceMetrics"]
+        for scope in resource["scopeMetrics"]
+        for metric in scope["metrics"]
+        if metric.get("name") == "kache.bench.run.complete"
+        for point in metric["gauge"]["dataPoints"]
+    ]
+
+
+class DeadlineTests(unittest.TestCase):
+    """A run that runs out of time still reports what it measured.
+
+    The aube nightly was killed at its step limit twice and uploaded
+    nothing: no samples, no telemetry, and a timeout that read like a hang.
+    """
+
+    def run_with(self, budget, samples=6, skip_contention=False, cold=100.0):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        clock = FakeClock()
+        args = argparse.Namespace(
+            output=root / "output",
+            project="aube",
+            engine=root / "engine",
+            scenarios=root / "scenarios",
+            kache="/kache",
+            base="/base",
+            sccache="/sccache",
+            mbx="/mbx",
+            samples=samples,
+            context_samples=1,
+            order_seed=0,
+            cold_every=3,
+            skip_contention=skip_contention,
+            deadline_at=clock.time() + budget,
+        )
+        calls = []
+
+        def contention(*_args, **_kwargs):
+            self.fail("contention started without the time to finish")
+
+        with (
+            patch.object(short, "time", clock),
+            patch.object(short, "run_measurement", timed_engine(clock, calls, cold=cold)),
+            patch.object(short, "run_contention", contention),
+        ):
+            status = short.run(args)
+        payload = json.loads((args.output / "samples.json").read_text())
+        return status, args.output, payload, calls
+
+    def test_a_build_that_would_not_fit_is_not_started(self):
+        # Sample 1 measures cold for all four tools (400 s); samples 2 and 3
+        # reuse it (20 s each). Sample 4 measures cold again, and 60 s are
+        # left for a build that took 100.
+        status, output, payload, calls = self.run_with(budget=500)
+        self.assertEqual(status, 1)
+        self.assertEqual(len(calls), 8)
+        self.assertEqual(
+            payload["truncated"],
+            "stopped before sample 4 of 6 (head): 1 min left, and the last one took 2",
+        )
+        summary = json.loads((output / "summary.json").read_text())
+        self.assertTrue(summary["failures"][0].startswith("incomplete: "))
+        warm = next(c for c in summary["comparisons"] if c["phase"] == "warm")
+        self.assertEqual(warm["n"], 3)
+        report_text = (output / "perf-gate.md").read_text()
+        self.assertTrue(report_text.startswith("## Perf gate: FAIL (aube)"))
+        self.assertIn("incomplete", report_text)
+        self.assertEqual(run_marker_values(output), ["0"])
+
+    def test_a_build_still_running_at_the_deadline_is_stopped(self):
+        # 15 s after sample 1: head's reused build (10 s) fits, base's has
+        # 5 s and is stopped. Its sample has no pair, so only sample 1 counts.
+        status, output, payload, calls = self.run_with(budget=415)
+        self.assertEqual(status, 1)
+        self.assertEqual(
+            [(r["sample"], r["arm"]) for r in payload["records"]][-1], (1, "head")
+        )
+        self.assertIn("sample 2 of 6 (base) was still running", payload["truncated"])
+        summary = json.loads((output / "summary.json").read_text())
+        warm = next(c for c in summary["comparisons"] if c["phase"] == "warm")
+        self.assertEqual(warm["n"], 1)
+        self.assertEqual(run_marker_values(output), ["0"])
+        # Every finished build is exported, the unpaired one included.
+        self.assertTrue((output / "logs" / "01-head" / "metrics.otlp.json").exists())
+
+    def test_no_time_left_skips_contention(self):
+        status, output, payload, _ = self.run_with(budget=400, samples=1)
+        self.assertEqual(status, 1)
+        self.assertEqual(payload["truncated"], "no time left for contention")
+        self.assertEqual(len(payload["records"]), 4)
+        self.assertEqual(run_marker_values(output), ["0"])
+
+    def test_a_run_that_fits_says_it_completed(self):
+        status, output, payload, calls = self.run_with(
+            budget=10_000, samples=3, skip_contention=True
+        )
+        self.assertEqual(status, 0)
+        self.assertNotIn("truncated", payload)
+        self.assertEqual(len(calls), 8)
+        self.assertEqual(run_marker_values(output), ["1"])
+
+    def test_no_full_sample_is_invalid_but_still_exported(self):
+        # Base finishes its cold build; head does not.
+        status, output, payload, _ = self.run_with(budget=150)
+        self.assertEqual(status, 1)
+        self.assertIn("before one full sample", payload["error"])
+        self.assertIn("INVALID MEASUREMENT", (output / "perf-gate.md").read_text())
+        self.assertEqual(run_marker_values(output), ["0"])
 
 
 def otlp_entry(tool, scope, metrics):

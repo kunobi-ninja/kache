@@ -44,7 +44,7 @@ on:
         options: [all, hk-comparison, surrealdb, lance, opendal, kobe, cuda-oxide, cuda-oxide-patched, eza, aube, llvm, hk, hk-nopred, hk-pull, hk-pull-perf, hk-pull-nopred, hk-mbx, hk-pull-mbx, opendal-mbx, lance-mbx, surrealdb-mbx, firefox-sccache, firefox-mbx]
         default: all
       extra_args:
-        description: "Extra recipe arguments (hk/eza/aube: sample count; other scenarios: --skip-clone, --retry)"
+        description: "Extra recipe arguments (hk/eza/aube: bench-short flags; other scenarios: --skip-clone, --retry)"
         type: string
         default: ""
 
@@ -157,7 +157,13 @@ jobs:
           # the way `kache init` does it so both compiler families are measured.
           # `--warm-same-tree` adds the same-path warm phase between cold and the
           # cross-clone warm. Minutes, not hours; a C compiler is all it needs.
-          hk='{"name":"hk","cmd":"bench-short hk","dir":"bench-hk","timeout":120,"job_timeout":150,"min_free_gb":40,"runner":"kunobi-runners"}'
+          #
+          # The three short subjects (hk, eza, aube) pass the same flags: six
+          # kache samples, one of sccache and of mbx, and three warm contention
+          # batches. Six of everything is the per-PR gate's setting for a
+          # head-against-base test, which needs five pairs; a nightly has no
+          # base, and at six the other two tools took most of each arm.
+          hk='{"name":"hk","cmd":"bench-short hk 6 --context-samples 1 --contention-samples 3","dir":"bench-hk","timeout":120,"job_timeout":150,"min_free_gb":40,"runner":"kunobi-runners"}'
           # hk with input predictions off: the control for the arm above, so
           # the same nightly shows what predictions are worth (#1000).
           hk_nopred='{"name":"hk-nopred","cmd":"bench hk-nopred --warm-same-tree","dir":"bench-hk-nopred","timeout":60,"job_timeout":90,"min_free_gb":40,"runner":"kunobi-runners"}'
@@ -178,12 +184,13 @@ jobs:
           # majority of its cacheable units on the C side (199 of 319 in a local
           # run). The cheapest arm in the sweep: minutes, and under a gigabyte
           # of build output.
-          eza='{"name":"eza","cmd":"bench-short eza","dir":"bench-eza","timeout":60,"job_timeout":90,"min_free_gb":40,"runner":"kunobi-runners"}'
+          eza='{"name":"eza","cmd":"bench-short eza 6 --context-samples 1 --contention-samples 3","dir":"bench-eza","timeout":60,"job_timeout":90,"min_free_gb":40,"runner":"kunobi-runners"}'
           # aube: a 15-crate workspace with C dependencies (aws-lc-sys,
           # mimalloc, tree-sitter through cc-rs; libz-ng-sys through cmake).
           # Where hk is one crate over a large graph, aube's time goes to
-          # workspace units that depend on each other.
-          aube='{"name":"aube","cmd":"bench-short aube","dir":"bench-aube","timeout":120,"job_timeout":150,"min_free_gb":40,"runner":"kunobi-runners"}'
+          # workspace units that depend on each other. At six samples of
+          # every tool this arm needs about 146 minutes.
+          aube='{"name":"aube","cmd":"bench-short aube 6 --context-samples 1 --contention-samples 3","dir":"bench-aube","timeout":120,"job_timeout":150,"min_free_gb":40,"runner":"kunobi-runners"}'
           # Three more subjects through mbx's Cargo front, which caches both
           # Rust and the C a build script compiles. Builds Cargo does not drive
           # go through `mbx exec` instead and get C/C++ caching only: firefox
@@ -436,6 +443,10 @@ jobs:
         # failure rather than uploading a misleading green report.
         run: |
           rustc --version && cargo --version && just --version
+          # The short suites (hk, eza, aube) stop five minutes before this
+          # step's limit and report what they finished; a killed step
+          # reports nothing. Other arms ignore it.
+          export BENCH_DEADLINE_AT=$(( $(date +%s) + (${{ matrix.timeout }} - 5) * 60 ))
           # EXTRA_ARGS is passed via env (not interpolated into the command line)
           # so a dispatch input can't inject shell. Unquoted on purpose: the
           # bench flags (e.g. `--skip-clone --retry`) must word-split. matrix.cmd
@@ -467,7 +478,10 @@ jobs:
           # actual compile error on a failed run), and sccache's
           # *.sccache-adv.txt stats for the sccache arm. These are flat globs
           # in the scratch dir, so they exclude the multi-GB clone worktrees /
-          # objdirs / cache.
+          # objdirs / cache. The two `!` lines drop scratch the contention
+          # driver removes on exit: a timed-out step leaves it behind with
+          # builds still running in it, and files vanishing mid-walk fail the
+          # whole upload.
           path: |
             tmp/bench/${{ matrix.dir }}/*.json
             tmp/bench/${{ matrix.dir }}/*.md
@@ -480,6 +494,8 @@ jobs:
             tmp/bench/${{ matrix.dir }}/logs/
             tmp/bench/${{ matrix.dir }}/contention/
             tmp/bench/${{ matrix.dir }}/contention.log
+            !tmp/bench/${{ matrix.dir }}/contention/work/**
+            !tmp/bench/${{ matrix.dir }}/contention/cargo-home/**
           retention-days: 30
           if-no-files-found: warn
 

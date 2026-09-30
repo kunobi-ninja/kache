@@ -1140,9 +1140,7 @@ fn otlp_sccache_phase(
         // count of what it looked at without consulting the cache.
         top_misses: Vec::new(),
         unconsulted: None,
-        // Not carried for this arm yet; the kache arm of the same job reports
-        // the node it shared.
-        load: None,
+        load: Some(metrics.load.clone()),
     }
 }
 
@@ -2108,7 +2106,7 @@ fn measure_sccache_phase(
     sccache_start(sccache, cache_dir, clone)?;
     let measured = (|| {
         sccache_zero_stats(sccache, cache_dir, clone)?;
-        let ms = build(
+        let run = build(
             profile,
             clone,
             phase,
@@ -2119,9 +2117,10 @@ fn measure_sccache_phase(
             CacheBackend::Sccache,
             false,
             sh,
-        )?
-        .wall_ms;
-        let metrics = capture_sccache_report(sccache, cache_dir, clone, work_dir, phase, ms)?;
+        )?;
+        let mut metrics =
+            capture_sccache_report(sccache, cache_dir, clone, work_dir, phase, run.wall_ms)?;
+        metrics.load = run.load;
         ensure_sccache_cache_location(&metrics, cache_dir, phase)?;
         ensure_sccache_base_dirs(&metrics, clone, phase)?;
         anyhow::ensure!(metrics.cache_hits > 0, "[{phase}] sccache restored nothing");
@@ -2190,7 +2189,7 @@ fn run_sccache_cold_phase(
     std::fs::create_dir_all(cache_dir)?;
     sccache_start(sccache, cache_dir, clone_a)?;
     sccache_zero_stats(sccache, cache_dir, clone_a)?;
-    let cold_ms = build(
+    let cold_run = build(
         profile,
         clone_a,
         Phase::Cold.name(),
@@ -2201,16 +2200,16 @@ fn run_sccache_cold_phase(
         CacheBackend::Sccache,
         false,
         sh,
-    )?
-    .wall_ms;
-    let cold_metrics = capture_sccache_report(
+    )?;
+    let mut cold_metrics = capture_sccache_report(
         sccache,
         cache_dir,
         clone_a,
         work_dir,
         Phase::Cold.name(),
-        cold_ms,
+        cold_run.wall_ms,
     )?;
+    cold_metrics.load = cold_run.load;
     sccache_stop(sccache, cache_dir);
 
     source::snapshot_dir(cache_dir, &work_dir.join("cache-after-cold"))?;
@@ -3121,7 +3120,7 @@ fn measure_mbx_phase(
     sh: &Path,
 ) -> Result<MbxPhaseMetrics> {
     let before = list_mbx_session_files(cache_dir)?;
-    let wall_ms = build(
+    let run = build(
         profile,
         clone,
         phase,
@@ -3132,9 +3131,9 @@ fn measure_mbx_phase(
         CacheBackend::Mbx,
         false,
         sh,
-    )?
-    .wall_ms;
-    let metrics = capture_mbx_report(work_dir, phase, wall_ms)?;
+    )?;
+    let mut metrics = capture_mbx_report(work_dir, phase, run.wall_ms)?;
+    metrics.load = run.load;
     export_new_mbx_session_trace(mbx, cache_dir, work_dir, phase, &before)?;
     Ok(metrics)
 }
@@ -3165,6 +3164,9 @@ struct MbxPhaseMetrics {
     reflinked_output_bytes: u64,
     copied_output_bytes: u64,
     stored_bytes: u64,
+    /// How contended the host was across the timed build.
+    #[serde(default)]
+    load: crate::bench_host::PhaseLoad,
 }
 
 impl MbxPhaseMetrics {
@@ -3208,6 +3210,7 @@ impl MbxPhaseMetrics {
             reflinked_output_bytes: count("reflinked_output_bytes"),
             copied_output_bytes: count("copied_output_bytes"),
             stored_bytes: count("stored_bytes"),
+            load: Default::default(),
         }
     }
 }
@@ -3281,7 +3284,7 @@ fn otlp_mbx_phase(
         // No per-unit cost in its report.
         top_misses: Vec::new(),
         unconsulted: Some(metrics.unconsulted),
-        load: None,
+        load: Some(metrics.load.clone()),
     }
 }
 
@@ -3724,6 +3727,9 @@ struct SccachePhaseMetrics {
     cache_location: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     base_dirs: Vec<String>,
+    /// How contended the host was across the timed build.
+    #[serde(default)]
+    load: crate::bench_host::PhaseLoad,
 }
 
 impl SccachePhaseMetrics {
@@ -3765,6 +3771,7 @@ impl SccachePhaseMetrics {
                         .collect()
                 })
                 .unwrap_or_default(),
+            load: Default::default(),
         }
     }
 }

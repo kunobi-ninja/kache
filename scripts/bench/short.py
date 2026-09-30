@@ -13,7 +13,7 @@ import time
 from pathlib import Path
 
 from bench import report as perf_gate_report
-from bench.engine import installed, run_measurement, tool_path
+from bench.engine import MEASUREMENT_TIMEOUT, installed, run_measurement, tool_path
 from bench.stats import contention_comparison, summarize, validate
 
 # Lives beside the package, in the instrument directory the gate stages.
@@ -91,7 +91,11 @@ def group_resources(entries):
 DEFAULT_TOOL = {"sccache": "sccache", "mbx": "mbx"}
 
 
-def run_contention(args, arms):
+class DeadlineReached(Exception):
+    """The run's time budget ran out. What finished is still reported."""
+
+
+def run_contention(args, arms, timeout=None):
     output = args.output.resolve() / "contention"
     samples = getattr(args, "contention_samples", None) or args.samples
     command = [
@@ -117,14 +121,25 @@ def run_contention(args, arms):
             else ["--" + backend, binary]
         )
     # The child enforces a timeout per Cargo job and stops its process groups.
-    # Workflow timeouts bound the whole suite; setup and all samples can exceed
-    # the isolated engine's 20-minute timeout.
+    # Only a run's deadline bounds the whole stage; it can take longer than the
+    # isolated engine's timeout.
     print(
         f"{args.project}: contention, {samples} warm batches and {math.ceil(samples / 3)} cold seeds per arm; see contention.log",
         flush=True,
     )
     with (args.output / "contention.log").open("w") as stream:
-        subprocess.run(command, stdout=stream, stderr=subprocess.STDOUT, check=True)
+        try:
+            run_measurement(
+                command,
+                timeout=timeout,
+                grace=60,
+                stdout=stream,
+                stderr=subprocess.STDOUT,
+            )
+        except subprocess.TimeoutExpired:
+            raise DeadlineReached(
+                "contention was still running when the time budget ran out"
+            ) from None
     data = json.loads((output / "samples.json").read_text())
     expected = {
         (sample, arm, phase)
@@ -177,6 +192,140 @@ def wanted_arm(arm, args):
 VERDICT_ARMS = ("head", "base", "kache")
 
 
+def sample_arms(sample, arms, args):
+    """The arms a sample measures, in the order it measures them."""
+    order = arms if (sample + args.order_seed) % 2 == 0 else list(reversed(arms))
+    if sample >= (getattr(args, "context_samples", None) or args.samples):
+        order = [a for a in order if a[0] in VERDICT_ARMS]
+    return order
+
+
+def complete_samples(records, arms, args):
+    """Records of the samples every arm finished.
+
+    A run stopped by its deadline can end halfway through a sample, and a
+    head without its base is not a pair.
+    """
+    finished = {}
+    for record in records:
+        finished.setdefault(record["sample"], set()).add(record["arm"])
+    return [
+        record
+        for record in records
+        if finished[record["sample"]]
+        == {arm for arm, _, _ in sample_arms(record["sample"], arms, args)}
+    ]
+
+
+def run_marker(project, complete, resource):
+    """`kache.bench.run.complete`: 1 when every requested measurement ran.
+
+    Each sample reports its own verdict, so a run stopped halfway looks
+    healthy sample by sample. This point is what says it stopped.
+    """
+    return {
+        **resource,
+        "scopeMetrics": [
+            {
+                "scope": {"name": "kache.bench.short"},
+                "metrics": [
+                    {
+                        "name": "kache.bench.run.complete",
+                        "unit": "1",
+                        "gauge": {
+                            "dataPoints": [
+                                {
+                                    "timeUnixNano": str(time.time_ns()),
+                                    "asInt": str(int(complete)),
+                                    "attributes": [
+                                        {
+                                            "key": "kache.bench.project",
+                                            "value": {"stringValue": f"bench-{project}"},
+                                        },
+                                        {
+                                            "key": "kache.bench.cache_tool",
+                                            "value": {"stringValue": "kache"},
+                                        },
+                                    ],
+                                }
+                            ]
+                        },
+                    }
+                ],
+            }
+        ],
+    }
+
+
+def write_telemetry(root, project, records, contention, complete):
+    """Every finished measurement's telemetry, plus whether the run completed."""
+    # Every sample has its own timestamp. Reused cold observations are not new samples.
+    resources = []
+    if contention:
+        resources.extend(
+            json.loads((root / "contention" / "metrics.otlp.json").read_text())[
+                "resourceMetrics"
+            ]
+        )
+    for record in records:
+        logs = root / "logs" / f"{record['sample']:02d}-{record['arm']}"
+        otlp = json.loads((logs / "metrics.otlp.json").read_text())
+        for resource in otlp["resourceMetrics"]:
+            for scope in resource["scopeMetrics"]:
+                for metric in scope["metrics"]:
+                    if record["cold_reused"]:
+                        gauge = metric.get("gauge", {})
+                        gauge["dataPoints"] = [
+                            point
+                            for point in gauge.get("dataPoints", [])
+                            if not any(
+                                a["key"] == "kache.bench.phase"
+                                and a["value"].get("stringValue") == "cold"
+                                for a in point.get("attributes", [])
+                            )
+                        ]
+            resources.append(resource)
+    if not resources:
+        # Nothing finished: the workflow's seeded failure point stands.
+        return
+    # Beside a resource the payload already has, so it adds no new one.
+    first = next(r for r in resources if "scopeMetrics" in r)
+    resources.append(
+        run_marker(
+            project,
+            complete,
+            {k: v for k, v in first.items() if k != "scopeMetrics"},
+        )
+    )
+    (root / "metrics.otlp.json").write_text(
+        json.dumps({"resourceMetrics": group_resources(resources)}) + "\n"
+    )
+    (root / "schema_version").write_text("1\n")
+    for phase in ("cold", "warm-same-tree", "warm"):
+        cache_resources = []
+        for record in records:
+            if record["backend"] != "kache" or (
+                phase == "cold" and record["cold_reused"]
+            ):
+                continue
+            source = (
+                root
+                / "logs"
+                / f"{record['sample']:02d}-{record['arm']}"
+                / f"cache-otlp-{phase}"
+                / "metrics.otlp.json"
+            )
+            if source.exists():
+                cache_resources.extend(json.loads(source.read_text())["resourceMetrics"])
+        if cache_resources:
+            dest = root / f"cache-otlp-{phase}"
+            dest.mkdir(exist_ok=True)
+            (dest / "metrics.otlp.json").write_text(
+                json.dumps({"resourceMetrics": group_resources(cache_resources)}) + "\n"
+            )
+            (dest / "schema_version").write_text("1\n")
+
+
 def run(args):
     root = args.output.resolve()
     if (root / "samples.json").exists() or (root / "scratch").exists():
@@ -193,6 +342,12 @@ def run(args):
     arms = [(name, backend, tool_path(binary)) for name, backend, binary in arms]
     records = []
     started = time.monotonic()
+    # Wall-clock seconds since the epoch, so a workflow can set it when its
+    # step starts, before this driver's own setup.
+    deadline = getattr(args, "deadline_at", None)
+    deadline = None if deadline is None else started + (deadline - time.time())
+    # Longest pass so far per arm and cold mode: what the next one will need.
+    took = {}
     payload = {
         "schema_version": 1,
         "project": args.project,
@@ -211,164 +366,165 @@ def run(args):
         },
         "records": records,
     }
+
+    def left():
+        return None if deadline is None else deadline - time.monotonic()
+
+    def save():
+        payload["elapsed_s"] = time.monotonic() - started
+        (root / "samples.json").write_text(json.dumps(payload, indent=2) + "\n")
+
+    contention = False
     try:
-        for sample in range(args.samples):
-            order = (
-                arms if (sample + args.order_seed) % 2 == 0 else list(reversed(arms))
-            )
-            if sample >= (getattr(args, "context_samples", None) or args.samples):
-                order = [a for a in order if a[0] in VERDICT_ARMS]
-            for position, (arm, backend, binary) in enumerate(order):
-                scratch = root / "scratch" / arm
-                scenario = f"bench-{args.project}" + (
-                    "" if backend == "kache" else f"-{backend}"
-                )
-                command = [
-                    str(args.engine.resolve()),
-                    "--cache-backend",
-                    backend,
-                    f"--{backend}",
-                    binary,
-                    "--scenarios",
-                    str(args.scenarios.resolve()),
-                    "--select",
-                    "suite:bench",
-                    "--select",
-                    f"backend:{backend}",
-                    "--profile",
-                    scenario,
-                    "--warm-same-tree",
-                    "--work-dir",
-                    str(scratch),
-                ]
-                reused = cold_is_reused(sample, args.cold_every)
-                if sample:
-                    command.append("--skip-clone")
-                if reused:
-                    command.append("--retry")
-                logs = root / "logs" / f"{sample:02d}-{arm}"
-                logs.mkdir(parents=True)
-                print(
-                    f"{args.project}: sample {sample + 1}/{args.samples}, {arm}, cold {'reused' if reused else 'measured'}",
-                    flush=True,
-                )
-                env = dict(os.environ, RUSTC_WRAPPER="", RUSTUP_TOOLCHAIN="")
-                try:
-                    with (logs / "engine.log").open("w") as stream:
-                        run_measurement(
-                            command,
-                            env=env,
-                            stdout=stream,
-                            stderr=subprocess.STDOUT,
+        try:
+            for sample in range(args.samples):
+                for position, (arm, backend, binary) in enumerate(
+                    sample_arms(sample, arms, args)
+                ):
+                    scratch = root / "scratch" / arm
+                    scenario = f"bench-{args.project}" + (
+                        "" if backend == "kache" else f"-{backend}"
+                    )
+                    command = [
+                        str(args.engine.resolve()),
+                        "--cache-backend",
+                        backend,
+                        f"--{backend}",
+                        binary,
+                        "--scenarios",
+                        str(args.scenarios.resolve()),
+                        "--select",
+                        "suite:bench",
+                        "--select",
+                        f"backend:{backend}",
+                        "--profile",
+                        scenario,
+                        "--warm-same-tree",
+                        "--work-dir",
+                        str(scratch),
+                    ]
+                    reused = cold_is_reused(sample, args.cold_every)
+                    if sample:
+                        command.append("--skip-clone")
+                    if reused:
+                        command.append("--retry")
+                    remaining = left()
+                    needed = took.get((arm, reused))
+                    if remaining is not None and (
+                        remaining <= 0 or (needed and needed > remaining)
+                    ):
+                        raise DeadlineReached(
+                            f"stopped before sample {sample + 1} of {args.samples} ({arm}): "
+                            f"{max(remaining, 0) / 60:.0f} min left"
+                            + (f", and the last one took {needed / 60:.0f}" if needed else "")
                         )
-                finally:
-                    for artifact in scratch.glob("*"):
-                        if artifact.is_file() and artifact.suffix in (
-                            ".json",
-                            ".log",
-                            ".txt",
-                        ):
-                            shutil.copy2(artifact, logs / artifact.name)
-                        elif artifact.is_dir() and artifact.name.startswith(
-                            "cache-otlp-"
-                        ):
-                            shutil.copytree(artifact, logs / artifact.name)
-                result = json.loads((scratch / f"{scenario}.json").read_text())
-                validate(result, backend)
-                records.append(
-                    {
-                        "sample": sample,
-                        "position": position,
-                        "arm": arm,
-                        "backend": backend,
-                        "cold_reused": reused,
-                        "result": result,
-                    }
-                )
-                payload["elapsed_s"] = time.monotonic() - started
-                (root / "samples.json").write_text(json.dumps(payload, indent=2) + "\n")
-        summary = summarize(records)
+                    logs = root / "logs" / f"{sample:02d}-{arm}"
+                    logs.mkdir(parents=True)
+                    print(
+                        f"{args.project}: sample {sample + 1}/{args.samples}, {arm}, cold {'reused' if reused else 'measured'}",
+                        flush=True,
+                    )
+                    env = dict(os.environ, RUSTC_WRAPPER="", RUSTUP_TOOLCHAIN="")
+                    timeout = MEASUREMENT_TIMEOUT
+                    if remaining is not None and remaining < timeout:
+                        timeout = remaining
+                    began = time.monotonic()
+                    try:
+                        with (logs / "engine.log").open("w") as stream:
+                            run_measurement(
+                                command,
+                                timeout=timeout,
+                                env=env,
+                                stdout=stream,
+                                stderr=subprocess.STDOUT,
+                            )
+                    except subprocess.TimeoutExpired:
+                        if timeout < MEASUREMENT_TIMEOUT:
+                            raise DeadlineReached(
+                                f"sample {sample + 1} of {args.samples} ({arm}) was still "
+                                "running when the time budget ran out"
+                            ) from None
+                        raise
+                    finally:
+                        for artifact in scratch.glob("*"):
+                            if artifact.is_file() and artifact.suffix in (
+                                ".json",
+                                ".log",
+                                ".txt",
+                            ):
+                                shutil.copy2(artifact, logs / artifact.name)
+                            elif artifact.is_dir() and artifact.name.startswith(
+                                "cache-otlp-"
+                            ):
+                                shutil.copytree(artifact, logs / artifact.name)
+                    took[(arm, reused)] = max(
+                        took.get((arm, reused), 0), time.monotonic() - began
+                    )
+                    result = json.loads((scratch / f"{scenario}.json").read_text())
+                    validate(result, backend)
+                    records.append(
+                        {
+                            "sample": sample,
+                            "position": position,
+                            "arm": arm,
+                            "backend": backend,
+                            "cold_reused": reused,
+                            "result": result,
+                        }
+                    )
+                    save()
+            measured = records
+        except DeadlineReached as reason:
+            payload["truncated"] = str(reason)
+            measured = complete_samples(records, arms, args)
+            if not measured:
+                raise ValueError(
+                    f"the time budget ran out before one full sample: {reason}"
+                ) from None
+        summary = summarize(measured)
         # Release isolated-build scratch before allocating six contention targets.
         shutil.rmtree(root / "scratch", ignore_errors=True)
-        if not getattr(args, "skip_contention", False):
-            summary["contention"] = run_contention(args, arms)
-            summary["comparisons"].extend(summary["contention"]["comparisons"])
-            summary["failures"].extend(summary["contention"]["failures"])
-            contention_data = json.loads(
-                (root / "contention" / "samples.json").read_text()
-            )
-            if contention_data["revision"] != records[0]["result"]["git_ref"]:
-                raise ValueError(
-                    "contention and isolated builds used different source revisions"
+        if not getattr(args, "skip_contention", False) and "truncated" not in payload:
+            try:
+                remaining = left()
+                if remaining is not None and remaining <= 0:
+                    raise DeadlineReached("no time left for contention")
+                summary["contention"] = run_contention(args, arms, timeout=remaining)
+            except DeadlineReached as reason:
+                payload["truncated"] = str(reason)
+            else:
+                contention = True
+                summary["comparisons"].extend(summary["contention"]["comparisons"])
+                summary["failures"].extend(summary["contention"]["failures"])
+                contention_data = json.loads(
+                    (root / "contention" / "samples.json").read_text()
                 )
-            payload["contention_samples"] = "contention/samples.json"
-            payload["elapsed_s"] = time.monotonic() - started
-            (root / "samples.json").write_text(json.dumps(payload, indent=2) + "\n")
+                if contention_data["revision"] != records[0]["result"]["git_ref"]:
+                    raise ValueError(
+                        "contention and isolated builds used different source revisions"
+                    )
+                payload["contention_samples"] = "contention/samples.json"
+        if "truncated" in payload:
+            # A missing measurement fails the job, but not before the rest is
+            # summarized and reported.
+            summary["failures"].insert(0, f"incomplete: {payload['truncated']}")
+        save()
         (root / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
         (root / "perf-gate.md").write_text(perf_gate_report.render([root]))
-        # Every sample has its own timestamp. Reused cold observations are not new samples.
-        resources = []
-        if "contention" in summary:
-            resources.extend(
-                json.loads((root / "contention" / "metrics.otlp.json").read_text())[
-                    "resourceMetrics"
-                ]
-            )
-        for record in records:
-            logs = root / "logs" / f"{record['sample']:02d}-{record['arm']}"
-            otlp = json.loads((logs / "metrics.otlp.json").read_text())
-            for resource in otlp["resourceMetrics"]:
-                for scope in resource["scopeMetrics"]:
-                    for metric in scope["metrics"]:
-                        if record["cold_reused"]:
-                            gauge = metric.get("gauge", {})
-                            gauge["dataPoints"] = [
-                                point
-                                for point in gauge.get("dataPoints", [])
-                                if not any(
-                                    a["key"] == "kache.bench.phase"
-                                    and a["value"].get("stringValue") == "cold"
-                                    for a in point.get("attributes", [])
-                                )
-                            ]
-                resources.append(resource)
-        (root / "metrics.otlp.json").write_text(
-            json.dumps({"resourceMetrics": group_resources(resources)}) + "\n"
+        write_telemetry(
+            root, args.project, records, contention, "truncated" not in payload
         )
-        (root / "schema_version").write_text("1\n")
-        for phase in ("cold", "warm-same-tree", "warm"):
-            cache_resources = []
-            for record in records:
-                if record["backend"] != "kache" or (
-                    phase == "cold" and record["cold_reused"]
-                ):
-                    continue
-                source = (
-                    root
-                    / "logs"
-                    / f"{record['sample']:02d}-{record['arm']}"
-                    / f"cache-otlp-{phase}"
-                    / "metrics.otlp.json"
-                )
-                if source.exists():
-                    cache_resources.extend(
-                        json.loads(source.read_text())["resourceMetrics"]
-                    )
-            if cache_resources:
-                dest = root / f"cache-otlp-{phase}"
-                dest.mkdir()
-                (dest / "metrics.otlp.json").write_text(
-                    json.dumps({"resourceMetrics": group_resources(cache_resources)})
-                    + "\n"
-                )
-                (dest / "schema_version").write_text("1\n")
         return int(bool(summary["failures"]))
     except (ValueError, KeyError, OSError, subprocess.SubprocessError) as error:
         payload["error"] = str(error)
-        (root / "samples.json").write_text(json.dumps(payload, indent=2) + "\n")
+        save()
         (root / "perf-gate.md").write_text(
             f"## Perf gate: INVALID MEASUREMENT ({args.project})\n\n{error}\n"
         )
+        try:
+            write_telemetry(root, args.project, records, False, False)
+        except (ValueError, KeyError, OSError) as telemetry:
+            print(f"{args.project}: no telemetry written: {telemetry}", flush=True)
         return 1
     finally:
         shutil.rmtree(root / "scratch", ignore_errors=True)
@@ -404,6 +560,15 @@ def main():
         type=int,
         choices=range(1, 21),
         help="samples of the other tools (sccache, mbx); defaults to --samples. They never decide the verdict, so the gate measures them once and repeats only the kache arms",
+    )
+    parser.add_argument(
+        "--deadline-at",
+        type=float,
+        metavar="EPOCH_SECONDS",
+        default=float(os.environ["BENCH_DEADLINE_AT"])
+        if os.environ.get("BENCH_DEADLINE_AT")
+        else None,
+        help="when the run must end, in seconds since the epoch (default: $BENCH_DEADLINE_AT). A measurement that would not fit is not started, one still running then is stopped, and what finished is summarized, reported and exported before the run fails",
     )
     parser.add_argument(
         "--skip-contention",

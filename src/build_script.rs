@@ -710,7 +710,12 @@ impl Environment {
                 placeholder.as_bytes(),
             );
         }
-        (normalized != contents && only_placeholder_paths(&normalized)).then_some(normalized)
+        // A root that is not a whole path (inside a URL) was not replaced.
+        let unreplaced = self.spellings.iter().any(|(root, _)| {
+            find_bytes(&normalized, root.as_os_str().as_encoded_bytes()).is_some()
+        });
+        (normalized != contents && !unreplaced && only_placeholder_paths(&normalized))
+            .then_some(normalized)
     }
 
     /// Sort the recorded files by how they name machine-local roots. A text
@@ -880,18 +885,47 @@ fn replace_whole_paths(haystack: &[u8], needle: &[u8], replacement: &[u8]) -> Ve
 }
 
 /// Whether every path in `text` starts at a placeholder or a `${var}`
-/// reference: each `/` belongs to a word that begins with `${`.
+/// reference: each `/` belongs to a word that begins with `${`, or to a URL
+/// other than `file:` (a pkg-config `URL:` line), which names no local path.
 fn only_placeholder_paths(text: &[u8]) -> bool {
     let delimiter = |byte: u8| byte.is_ascii_whitespace() || b"\"'`=:;,()<>[]|".contains(&byte);
     let mut word_start = 0;
-    for (index, &byte) in text.iter().enumerate() {
+    let mut index = 0;
+    while let Some(&byte) = text.get(index) {
         if delimiter(byte) {
             word_start = index + 1;
-        } else if byte == b'/' && !text[word_start..].starts_with(b"${") {
-            return false;
+        } else if byte == b'/' {
+            if is_url_authority(text, index) {
+                index = text[index..]
+                    .iter()
+                    .position(|&byte| byte.is_ascii_whitespace() || b"\"'`<>".contains(&byte))
+                    .map_or(text.len(), |end| index + end);
+                continue;
+            }
+            if !text[word_start..].starts_with(b"${") {
+                return false;
+            }
         }
+        index += 1;
     }
     true
+}
+
+/// Whether `text[at..]` is the `//authority` of a URL: it follows `scheme:`,
+/// and the scheme is not `file`.
+fn is_url_authority(text: &[u8], at: usize) -> bool {
+    let Some(colon) = at.checked_sub(1) else {
+        return false;
+    };
+    if text[colon] != b':' || !text[at..].starts_with(b"//") {
+        return false;
+    }
+    let scheme_start = text[..colon]
+        .iter()
+        .rposition(|&byte| !(byte.is_ascii_alphanumeric() || b"+-.".contains(&byte)))
+        .map_or(0, |before| before + 1);
+    let scheme = &text[scheme_start..colon];
+    scheme.first().is_some_and(u8::is_ascii_alphabetic) && !scheme.eq_ignore_ascii_case(b"file")
 }
 
 fn replace_all(haystack: &[u8], needle: &[u8], replacement: &[u8]) -> Vec<u8> {
@@ -2475,8 +2509,25 @@ mod tests {
         ));
         assert!(only_placeholder_paths(b"Cflags: -I${includedir}"));
         assert!(!only_placeholder_paths(b"Cflags: -I/usr/include"));
-        assert!(!only_placeholder_paths(b"url https://example.com"));
         assert!(!only_placeholder_paths(b"${KACHE_OUT_DIR} /opt"));
+    }
+
+    #[test]
+    fn a_url_is_not_a_path() {
+        assert!(only_placeholder_paths(b"URL: https://libssh2.org/"));
+        assert!(only_placeholder_paths(b"url https://example.com:8080/a/b"));
+        assert!(only_placeholder_paths(b"see <git+ssh://h/r.git>, ${p}/x"));
+        assert!(only_placeholder_paths(
+            b"URL: HTTPS://h/a\nlibdir=${prefix}/lib"
+        ));
+        assert!(!only_placeholder_paths(b"URL: https://h/a /opt"));
+        assert!(!only_placeholder_paths(b"URL: https://h/a\n/opt"));
+        assert!(!only_placeholder_paths(b"file:///usr/lib"));
+        assert!(!only_placeholder_paths(b"FILE://h/usr/lib"));
+        assert!(!only_placeholder_paths(b"x=//h/a"));
+        assert!(!only_placeholder_paths(b"://h/a"));
+        assert!(!only_placeholder_paths(b" 1x://h/a"));
+        assert!(!only_placeholder_paths(b"https:/usr/lib"));
     }
 
     #[test]
@@ -2533,6 +2584,24 @@ mod tests {
         assert!(roots.rewritten.is_empty());
         assert_eq!(roots.embedded, vec!["${KACHE_OUT_DIR}".to_string()]);
         assert_eq!(stored, mixed.as_bytes());
+
+        // A URL names no local path; one that embeds a root still binds.
+        let pc = format!("prefix={}\nURL: https://libssh2.org/\n", out.display());
+        let (roots, stored) = classify_one(&env, "libssh2.pc", pc.as_bytes());
+        assert_eq!(roots.rewritten, vec!["libssh2.pc".to_string()]);
+        assert_eq!(
+            stored,
+            b"prefix=${KACHE_OUT_DIR}\nURL: https://libssh2.org/\n"
+        );
+        let pc = format!(
+            "prefix={}\nURL: https://h{}/x\n",
+            out.display(),
+            out.display()
+        );
+        let (roots, stored) = classify_one(&env, "url-root.pc", pc.as_bytes());
+        assert!(roots.rewritten.is_empty());
+        assert_eq!(roots.embedded, vec!["${KACHE_OUT_DIR}".to_string()]);
+        assert_eq!(stored, pc.as_bytes());
 
         // Text already holding a placeholder would change on the way back.
         let text = format!("{} and ${{KACHE_OUT_DIR}}", out.display());

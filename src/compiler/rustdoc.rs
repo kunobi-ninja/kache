@@ -3279,6 +3279,10 @@ mod tests {
         let (text, _) = raw_string(br##"r#"say "hi" end"#"##, 0).unwrap();
         assert_eq!(text, "say \"hi\" end");
         assert!(module_names("mod foo").is_empty());
+        assert_eq!(
+            module_names("mod notitem + mod real;"),
+            vec!["real".to_string()]
+        );
         let (text, _) = cooked_string(b"\"\\nb\"", 0);
         let (open, end) = cooked_string(b"\"ab", 0);
         assert_eq!(open, "ab");

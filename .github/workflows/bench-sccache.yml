@@ -11,7 +11,11 @@
 # its 300-line job keeps one definition of how a benchmark runs; the result is
 # a separate workflow run, which is what takes it off the nightly's critical
 # path and lets the collector import it independently.
-name: Bench sccache
+#
+# The weekly run also dispatches Firefox through mbx. That arm installs the
+# latest mbx release, so there is no pin to watch: it runs on the schedule and
+# on a manual dispatch, never on a push.
+name: Bench Firefox (weekly)
 
 on:
   schedule:
@@ -29,7 +33,7 @@ permissions:
 
 jobs:
   dispatch:
-    name: Run the sccache comparison
+    name: Run the weekly Firefox arms
     if: github.repository == 'kunobi-ninja/kache'
     runs-on: ${{ fromJSON(!github.event.repository.private && '"ubuntu-latest"' || vars.CI_RUNNER_LINUX) }}
     timeout-minutes: 10
@@ -70,3 +74,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh workflow run bench.yml -R "${{ github.repository }}" -f scenario=firefox-sccache
+
+      - name: Dispatch mbx
+        if: github.event_name != 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run bench.yml -R "${{ github.repository }}" -f scenario=firefox-mbx

@@ -7,8 +7,8 @@ name: Bench
 #
 # Triggers:
 #   - schedule  : nightly, runs every arm in the matrix below except the
-#                 Firefox sccache comparison, which bench-sccache.yml dispatches
-#                 on its own weekly cadence.
+#                 Firefox sccache and mbx arms, which bench-sccache.yml
+#                 dispatches on its own weekly cadence.
 #   - dispatch  : manual, pick a scenario (default all, excluding Firefox).
 #                 Extra flags depend on the selected recipe.
 #
@@ -41,7 +41,7 @@ on:
       scenario:
         description: "Which scenario(s) to run"
         type: choice
-        options: [all, hk-comparison, surrealdb, lance, opendal, cuda-oxide, cuda-oxide-patched, eza, aube, llvm, hk, hk-nopred, hk-pull, hk-pull-perf, hk-pull-nopred, hk-mbx, hk-pull-mbx, opendal-mbx, lance-mbx, surrealdb-mbx, firefox-sccache]
+        options: [all, hk-comparison, surrealdb, lance, opendal, cuda-oxide, cuda-oxide-patched, eza, aube, llvm, hk, hk-nopred, hk-pull, hk-pull-perf, hk-pull-nopred, hk-mbx, hk-pull-mbx, opendal-mbx, lance-mbx, surrealdb-mbx, firefox-sccache, firefox-mbx]
         default: all
       extra_args:
         description: "Extra recipe arguments (hk/eza: sample count; aube: bench-short flags; other scenarios: --skip-clone, --retry)"
@@ -133,6 +133,10 @@ jobs:
           firefox='{"name":"firefox","cmd":"bench firefox","dir":"bench-firefox","timeout":360,"job_timeout":405,"min_free_gb":120,"runner":"kunobi-runners-large"}'
           # Same Firefox shape through sccache for a side-by-side comparison.
           firefox_sccache='{"name":"firefox-sccache","cmd":"bench-sccache firefox","dir":"bench-firefox-sccache","timeout":360,"job_timeout":405,"min_free_gb":120,"runner":"kunobi-runners-large"}'
+          # Firefox through `mbx exec`, which caches its C and C++ compiles
+          # and leaves the Rust crates to compile in every phase (see the
+          # scenario file).
+          firefox_mbx='{"name":"firefox-mbx","cmd":"bench-mbx firefox","dir":"bench-firefox-mbx","timeout":360,"job_timeout":405,"min_free_gb":120,"runner":"kunobi-runners-large"}'
           # Almost-pure C/C++ CMake build (X86-only Release) — lighter than Firefox.
           llvm='{"name":"llvm","cmd":"bench llvm","dir":"bench-llvm","timeout":240,"job_timeout":285,"min_free_gb":100,"runner":"kunobi-runners-large"}'
           # Daily-pull (TEMPORAL axis, #477): one clone, build ref A then rebuild
@@ -176,13 +180,13 @@ jobs:
           # Where hk is one crate over a large graph, aube's time goes to
           # workspace units that depend on each other. sccache and mbx are
           # sampled once and contention runs three warm batches, as the per-PR
-          # gate does: at six samples each the arm needs about 155 minutes, 89
-          # of them building through the other two tools.
+          # gate does: at six samples each the arm needs about 146 minutes,
+          # most of them building through the other two tools.
           aube='{"name":"aube","cmd":"bench-short aube 6 --context-samples 1 --contention-samples 3","dir":"bench-aube","timeout":120,"job_timeout":150,"min_free_gb":40,"runner":"kunobi-runners"}'
-          # Two more subjects on the same side-by-side axis. mbx fronts Cargo,
-          # so the arms it can serve at all are exactly the cargo-driven ones:
-          # firefox (mach/gn/ninja) and llvm (cmake) are out of reach, which is
-          # why firefox's comparison arm is sccache instead. Both sit on the
+          # Three more subjects through mbx's Cargo front, which caches both
+          # Rust and the C a build script compiles. Builds Cargo does not drive
+          # go through `mbx exec` instead and get C/C++ caching only: firefox
+          # has such an arm (firefox_mbx above), llvm does not. opendal and lance sit on the
           # general pool — the reserved runner takes one job at a time and is
           # already carrying the multi-hour arms.
           opendal_mbx='{"name":"opendal-mbx","cmd":"bench-mbx opendal","dir":"bench-opendal-mbx","timeout":120,"job_timeout":165,"min_free_gb":40,"runner":"kunobi-runners"}'
@@ -215,6 +219,9 @@ jobs:
             # bump — so the nightly never waits for it and its results reach
             # the collector on their own schedule.
             firefox-sccache)      inc="[$firefox_sccache]" ;;
+            # Weekly too, from the same dispatcher. It tracks the latest mbx
+            # release, and a Firefox build is too long for the nightly.
+            firefox-mbx)          inc="[$firefox_mbx]" ;;
             # Windows-only scenarios are served by bench-firefox-windows.yml,
             # so the Linux matrix is EMPTY for them (an empty include
             # skips the `bench` job cleanly). Without this they'd fall to `*)`

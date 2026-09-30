@@ -517,27 +517,31 @@ mod tests {
             .unwrap()
     }
 
-    /// Whether `dir`'s filesystem is mounted `noatime`.
+    /// Whether reads should move atime on `dir`: on Linux, unless `noatime`.
     #[cfg(target_os = "linux")]
-    fn mounted_noatime(dir: &Path) -> bool {
+    fn reads_should_show(dir: &Path) -> Option<bool> {
         use std::os::unix::ffi::OsStrExt;
         let path = std::ffi::CString::new(dir.as_os_str().as_bytes()).unwrap();
         // SAFETY: statvfs is plain old data; all-zero bytes are a valid value.
         let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
         // SAFETY: `path` is NUL-terminated and `stat` is a valid out pointer.
         assert_eq!(unsafe { libc::statvfs(path.as_ptr(), &mut stat) }, 0);
-        stat.f_flag & libc::ST_NOATIME != 0
+        Some(stat.f_flag & libc::ST_NOATIME == 0)
+    }
+
+    /// Unknown elsewhere: NTFS and some macOS volumes skip it by setting.
+    #[cfg(not(target_os = "linux"))]
+    fn reads_should_show(_dir: &Path) -> Option<bool> {
+        None
     }
 
     #[test]
     fn probes_whether_reads_move_an_armed_access_time() {
         let dir = tempfile::tempdir().unwrap();
         let visible = reads_visible(dir.path());
-        // Linux's `relatime` shows reads and `noatime` hides them, so the
-        // probe must agree with the mount. NTFS usually does not update last
-        // access times, and some macOS volumes do not either.
-        #[cfg(target_os = "linux")]
-        assert_eq!(visible, !mounted_noatime(dir.path()));
+        if let Some(expected) = reads_should_show(dir.path()) {
+            assert_eq!(visible, expected);
+        }
         assert!(entries(dir.path()).is_empty(), "the probe is removed");
         assert!(!reads_visible(&dir.path().join("missing")));
         let armed = filetime::FileTime::from_unix_time(1_000, 0);

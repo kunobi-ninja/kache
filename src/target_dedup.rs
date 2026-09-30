@@ -601,7 +601,7 @@ fn consider(
     let SizeClass::Few(blobs) = class else {
         return Ok(Consider::Done);
     };
-    let device = device_of(&meta);
+    let device = device_of(path, &meta);
     if blobs.iter().all(|blob| !same_volume(blob.device, device)) {
         db.reject(&stamp, REJECT_DEVICE);
         report.cross_device = report.cross_device.saturating_add(1);
@@ -771,10 +771,11 @@ fn blob_file(store_dir: &Path, hash: &str) -> PathBuf {
 /// retried, never taken as a difference.
 fn load_index(store: &crate::store::Store, store_dir: &Path) -> Result<BlobIndex> {
     let mut by_size: HashMap<u64, SizeClass> = HashMap::new();
-    let Ok(blobs_dir) = fs::metadata(store_dir.join("blobs")) else {
+    let blobs_path = store_dir.join("blobs");
+    let Ok(blobs_dir) = fs::metadata(&blobs_path) else {
         return Ok(BlobIndex { by_size });
     };
-    let device = device_of(&blobs_dir);
+    let device = device_of(&blobs_path, &blobs_dir);
     for (hash, size) in store.blobs_at_least(MIN_BYTES)? {
         let path = blob_file(store_dir, &hash);
         push_blob(&mut by_size, size, Blob { hash, path, device });
@@ -844,31 +845,57 @@ fn read_ends(path: &Path) -> io::Result<Ends> {
     Ok(Ends { head, tail })
 }
 
-/// Volume that holds `meta`.
+/// Volume that holds this file.
 ///
-/// Unix uses `st_dev`. Windows uses the volume serial. A missing serial is
-/// `None`, not `0`: every unknown file used to compare equal, so a cross-drive
-/// copy was hashed and then recorded as a failed clone.
-fn device_of(meta: &fs::Metadata) -> Option<u64> {
+/// Unix uses `st_dev` from `meta`. Windows cannot: `volume_serial_number` is
+/// still the unstable `windows_by_handle` feature on the 1.98 toolchain, so
+/// the serial comes from `GetFileInformationByHandle` on `path`. A missing
+/// serial is `None`, not `0`. Unknown files used to compare equal, and a
+/// cross-drive copy was hashed and then recorded as a failed clone.
+fn device_of(path: &Path, meta: &fs::Metadata) -> Option<u64> {
     #[cfg(unix)]
     {
+        let _ = path;
         use std::os::unix::fs::MetadataExt;
         Some(meta.dev())
     }
     #[cfg(windows)]
     {
-        use std::os::windows::fs::MetadataExt;
-        meta.volume_serial_number().map(u64::from)
+        let _ = meta;
+        windows_volume_serial(path)
     }
     #[cfg(not(any(unix, windows)))]
     {
-        let _ = meta;
+        let _ = (path, meta);
         None
     }
 }
 
+/// Volume serial of `path`, including a directory. `None` when the file cannot
+/// be opened or the query fails.
+#[cfg(windows)]
+fn windows_volume_serial(path: &Path) -> Option<u64> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS, GetFileInformationByHandle,
+    };
+
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+        .ok()?;
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: `file` is open and `info` is a valid output buffer for this call.
+    let ok = unsafe { GetFileInformationByHandle(file.as_raw_handle() as _, &mut info) };
+    (ok != 0).then_some(u64::from(info.dwVolumeSerialNumber))
+}
+
 fn device_of_path(path: &Path) -> Option<u64> {
-    fs::metadata(path).ok().and_then(|meta| device_of(&meta))
+    fs::metadata(path)
+        .ok()
+        .and_then(|meta| device_of(path, &meta))
 }
 
 /// Both identities known and equal. `None` does not match `None`.
@@ -1733,7 +1760,7 @@ mod tests {
         assert_eq!(blobs[0].path, blob_file(&config.store_dir(), &hash));
         assert_eq!(
             blobs[0].device,
-            device_of(&fs::metadata(&blobs[0].path).unwrap())
+            device_of(&blobs[0].path, &fs::metadata(&blobs[0].path).unwrap())
         );
     }
 
@@ -1755,7 +1782,7 @@ mod tests {
         let body = bytes(MIN_BYTES as usize, 3);
         let hash = write_blob(&config, &body);
         let file = target_file(&target, "libcross.rlib", &body);
-        let real = device_of(&fs::metadata(&file).unwrap());
+        let real = device_of(&file, &fs::metadata(&file).unwrap());
         let other = real.map(|value| value.wrapping_add(1)).or(Some(1));
         let mut by_size = HashMap::new();
         push_blob(
@@ -1843,7 +1870,7 @@ mod tests {
         let body = bytes(MIN_BYTES as usize, 3);
         let other_body = bytes(MIN_BYTES as usize, 9);
         let file = target_file(&target, "libmix.rlib", &body);
-        let Some(real) = device_of(&fs::metadata(&file).unwrap()) else {
+        let Some(real) = device_of(&file, &fs::metadata(&file).unwrap()) else {
             return;
         };
         let same = write_blob(&config, &body);
@@ -1876,7 +1903,7 @@ mod tests {
         let body = bytes(MIN_BYTES as usize, 3);
         let other_body = bytes(MIN_BYTES as usize, 9);
         let file = target_file(&target, "libforeign.rlib", &body);
-        let Some(real) = device_of(&fs::metadata(&file).unwrap()) else {
+        let Some(real) = device_of(&file, &fs::metadata(&file).unwrap()) else {
             return;
         };
         let same_bytes = write_blob(&config, &body);

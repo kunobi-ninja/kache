@@ -1,9 +1,10 @@
-//! Old target files that are already stored blobs.
+//! Target files that are already stored blobs.
 //!
-//! A checkout built before kache, or a worktree kache did not populate, can
-//! hold a full copy of an `.rlib` the store already has. This pass replaces
-//! that copy with a clone of the blob. The path Cargo opens does not move,
-//! and the file keeps its mode and modification time.
+//! Kache remaps paths into the artifacts it compiles, and the store keeps
+//! those bytes. This pass replaces a target file with a clone of the blob
+//! when the file is a copy of that artifact: another worktree, or a target
+//! restored from the same blobs. The path Cargo opens does not move, and the
+//! file keeps its mode and modification time.
 //!
 //! Comparison is a pipeline. A file whose length matches no blob is finished
 //! after a `stat`. A file that differs in its first or last block is finished
@@ -131,7 +132,8 @@ struct Ends {
 struct Blob {
     hash: String,
     path: PathBuf,
-    device: u64,
+    /// Volume identity. `None` when the platform did not report one.
+    device: Option<u64>,
 }
 
 enum SizeClass {
@@ -600,7 +602,7 @@ fn consider(
         return Ok(Consider::Done);
     };
     let device = device_of(&meta);
-    if blobs.iter().all(|blob| blob.device != device) {
+    if blobs.iter().all(|blob| !same_volume(blob.device, device)) {
         db.reject(&stamp, REJECT_DEVICE);
         report.cross_device = report.cross_device.saturating_add(1);
         return Ok(Consider::Done);
@@ -620,7 +622,7 @@ fn consider(
     let mut matched = false;
     let mut compared = false;
     for blob in blobs {
-        if blob.device != device {
+        if !same_volume(blob.device, device) {
             continue;
         }
         let blob_ends = match cached_ends(ends_cache, blob) {
@@ -708,9 +710,7 @@ fn account_match(
     if !apply {
         return;
     }
-    let same_device = fs::metadata(&blob)
-        .ok()
-        .is_some_and(|meta| device_of(&meta) == device_of_path(path));
+    let same_device = same_volume(device_of_path(&blob), device_of_path(path));
     // Locks this pass already holds are not a build. `target_in_use` would
     // see them and refuse every file after the first.
     let busy = another_build_holds(root, held);
@@ -844,21 +844,36 @@ fn read_ends(path: &Path) -> io::Result<Ends> {
     Ok(Ends { head, tail })
 }
 
-fn device_of(meta: &fs::Metadata) -> u64 {
+/// Volume that holds `meta`.
+///
+/// Unix uses `st_dev`. Windows uses the volume serial. A missing serial is
+/// `None`, not `0`: every unknown file used to compare equal, so a cross-drive
+/// copy was hashed and then recorded as a failed clone.
+fn device_of(meta: &fs::Metadata) -> Option<u64> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        meta.dev()
+        Some(meta.dev())
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        meta.volume_serial_number().map(u64::from)
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = meta;
-        0
+        None
     }
 }
 
-fn device_of_path(path: &Path) -> u64 {
-    fs::metadata(path).map(|meta| device_of(&meta)).unwrap_or(0)
+fn device_of_path(path: &Path) -> Option<u64> {
+    fs::metadata(path).ok().and_then(|meta| device_of(&meta))
+}
+
+/// Both identities known and equal. `None` does not match `None`.
+fn same_volume(left: Option<u64>, right: Option<u64>) -> bool {
+    matches!((left, right), (Some(left), Some(right)) if left == right)
 }
 
 /// `true` when `root` can still hold a file after `cursor`.
@@ -1155,11 +1170,26 @@ pub(crate) fn replace_with(
             "clone does not match the source",
         ));
     }
-    fs::set_permissions(&temporary, dest_meta.permissions())?;
     let modified = filetime::FileTime::from_last_modification_time(&dest_meta);
     let accessed = filetime::FileTime::from_last_access_time(&dest_meta);
-    filetime::set_file_times(&temporary, accessed, modified)?;
-    fs::rename(&temporary, dest)?;
+    commit_or_abandon(
+        &temporary,
+        fs::set_permissions(&temporary, dest_meta.permissions()),
+    )?;
+    commit_or_abandon(
+        &temporary,
+        filetime::set_file_times(&temporary, accessed, modified),
+    )?;
+    commit_or_abandon(&temporary, fs::rename(&temporary, dest))?;
+    Ok(())
+}
+
+/// Run `step`. On failure, remove `temporary` and return the error.
+fn commit_or_abandon(temporary: &Path, step: io::Result<()>) -> io::Result<()> {
+    if let Err(error) = step {
+        let _ = fs::remove_file(temporary);
+        return Err(error);
+    }
     Ok(())
 }
 
@@ -1367,7 +1397,7 @@ mod tests {
                 Blob {
                     hash: format!("hash-{index}"),
                     path: PathBuf::from(format!("blob-{index}")),
-                    device: 1,
+                    device: Some(1),
                 },
             );
         }
@@ -1378,7 +1408,7 @@ mod tests {
             Blob {
                 hash: "only".into(),
                 path: PathBuf::from("only"),
-                device: 1,
+                device: Some(1),
             },
         );
         assert!(matches!(
@@ -1705,6 +1735,188 @@ mod tests {
             blobs[0].device,
             device_of(&fs::metadata(&blobs[0].path).unwrap())
         );
+    }
+
+    #[test]
+    fn same_volume_needs_two_known_identities() {
+        assert!(same_volume(Some(7), Some(7)));
+        assert!(!same_volume(Some(7), Some(8)));
+        assert!(!same_volume(None, None));
+        assert!(!same_volume(Some(7), None));
+        assert!(!same_volume(None, Some(7)));
+    }
+
+    #[test]
+    fn a_different_volume_is_cross_device_before_the_hash() {
+        let cache = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let config = crate::test_support::test_config(cache.path().to_path_buf());
+        let target = track(&config, workspace.path());
+        let body = bytes(MIN_BYTES as usize, 3);
+        let hash = write_blob(&config, &body);
+        let file = target_file(&target, "libcross.rlib", &body);
+        let real = device_of(&fs::metadata(&file).unwrap());
+        let other = real.map(|value| value.wrapping_add(1)).or(Some(1));
+        let mut by_size = HashMap::new();
+        push_blob(
+            &mut by_size,
+            MIN_BYTES,
+            Blob {
+                hash: hash.clone(),
+                path: blob_file(&config.store_dir(), &hash),
+                device: other,
+            },
+        );
+        let index = BlobIndex { by_size };
+        let store = crate::store::Store::open(&config).unwrap();
+        let mut db = PipelineDb::open(&config.cache_dir).unwrap();
+        let report = one_pass(
+            &store,
+            &config.store_dir(),
+            &index,
+            &mut db,
+            std::slice::from_ref(&target),
+            true,
+            &Limits {
+                examine: EXAMINE_PER_SLICE,
+                ends: ENDS_PER_SLICE,
+                hashes: HASH_PER_SLICE,
+                budget: Duration::from_secs(60),
+            },
+            &mut |_| true,
+        )
+        .unwrap();
+        assert_eq!(report.cross_device, 1, "{report:?}");
+        assert_eq!(report.hashed, 0, "{report:?}");
+        assert!(
+            !matches!(
+                store.file_hash_lookup(&file),
+                kache_store::file_hash::FileHashLookup::Hit(_)
+            ),
+            "a different volume is decided before the file is hashed"
+        );
+    }
+
+    fn blob_at(config: &Config, hash: &str, device: u64) -> Blob {
+        Blob {
+            hash: hash.to_string(),
+            path: blob_file(&config.store_dir(), hash),
+            device: Some(device),
+        }
+    }
+
+    /// Run one pass against an index built by the caller, not the store.
+    fn report_against(config: &Config, target: &PathBuf, blobs: Vec<Blob>) -> Report {
+        let mut by_size = HashMap::new();
+        for blob in blobs {
+            push_blob(&mut by_size, MIN_BYTES, blob);
+        }
+        let store = crate::store::Store::open(config).unwrap();
+        let mut db = PipelineDb::open(&config.cache_dir).unwrap();
+        one_pass(
+            &store,
+            &config.store_dir(),
+            &BlobIndex { by_size },
+            &mut db,
+            std::slice::from_ref(target),
+            false,
+            &Limits {
+                examine: EXAMINE_PER_SLICE,
+                ends: ENDS_PER_SLICE,
+                hashes: HASH_PER_SLICE,
+                budget: Duration::from_secs(60),
+            },
+            &mut |_| true,
+        )
+        .unwrap()
+    }
+
+    /// One blob on this volume still reaches the hash when another blob of
+    /// the same length is on a different volume. A single foreign blob must
+    /// not shelve the file.
+    #[test]
+    fn a_same_volume_blob_is_hashed_beside_a_foreign_one() {
+        let cache = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let config = crate::test_support::test_config(cache.path().to_path_buf());
+        let target = track(&config, workspace.path());
+        let body = bytes(MIN_BYTES as usize, 3);
+        let other_body = bytes(MIN_BYTES as usize, 9);
+        let file = target_file(&target, "libmix.rlib", &body);
+        let Some(real) = device_of(&fs::metadata(&file).unwrap()) else {
+            return;
+        };
+        let same = write_blob(&config, &body);
+        let different = write_blob(&config, &other_body);
+        let report = report_against(
+            &config,
+            &target,
+            vec![
+                blob_at(&config, &same, real),
+                blob_at(&config, &different, real.wrapping_add(1)),
+            ],
+        );
+        assert_eq!(report.hashed, 1, "{report:?}");
+        assert_eq!(report.cross_device, 0, "{report:?}");
+        let store = crate::store::Store::open(&config).unwrap();
+        assert!(matches!(
+            store.file_hash_lookup(&file),
+            kache_store::file_hash::FileHashLookup::Hit(_)
+        ));
+    }
+
+    /// The foreign blob can have the same ends. It is not a reason to hash,
+    /// and it is not a match: only the blob on this volume is compared.
+    #[test]
+    fn a_foreign_blob_with_the_same_ends_is_not_hashed() {
+        let cache = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let config = crate::test_support::test_config(cache.path().to_path_buf());
+        let target = track(&config, workspace.path());
+        let body = bytes(MIN_BYTES as usize, 3);
+        let other_body = bytes(MIN_BYTES as usize, 9);
+        let file = target_file(&target, "libforeign.rlib", &body);
+        let Some(real) = device_of(&fs::metadata(&file).unwrap()) else {
+            return;
+        };
+        let same_bytes = write_blob(&config, &body);
+        let different_bytes = write_blob(&config, &other_body);
+        let report = report_against(
+            &config,
+            &target,
+            vec![
+                blob_at(&config, &different_bytes, real),
+                blob_at(&config, &same_bytes, real.wrapping_add(1)),
+            ],
+        );
+        assert_eq!(report.hashed, 0, "{report:?}");
+        assert_eq!(report.cross_device, 0, "{report:?}");
+        assert_eq!(report.ends_rejected, 1, "{report:?}");
+        let store = crate::store::Store::open(&config).unwrap();
+        assert!(
+            !matches!(
+                store.file_hash_lookup(&file),
+                kache_store::file_hash::FileHashLookup::Hit(_)
+            ),
+            "ends on another volume are not this file's match"
+        );
+    }
+
+    #[test]
+    fn commit_or_abandon_removes_the_temporary_only_when_the_step_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let temporary = dir.path().join(".dest.rlib.kache-dedup");
+        fs::write(&temporary, b"partial").unwrap();
+        let error = commit_or_abandon(
+            &temporary,
+            Err(io::Error::new(ErrorKind::PermissionDenied, "mode")),
+        );
+        assert_eq!(error.unwrap_err().kind(), ErrorKind::PermissionDenied);
+        assert!(!temporary.exists());
+
+        fs::write(&temporary, b"kept").unwrap();
+        commit_or_abandon(&temporary, Ok(())).unwrap();
+        assert_eq!(fs::read(&temporary).unwrap(), b"kept");
     }
 
     #[test]

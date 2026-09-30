@@ -229,25 +229,20 @@ pub fn run(config: &Config, paths: &[PathBuf], apply: bool, json: bool) -> Resul
         hashes: usize::MAX,
         budget: Duration::from_secs(86_400),
     };
-    // The command walks until the cursor comes back around. Each pass is
-    // still the same stages; the loop only continues a cursor.
-    loop {
-        let quiet = true;
-        let report = one_pass(
-            &store,
-            &store_dir,
-            &index,
-            &mut db,
-            &roots,
-            apply,
-            &limits,
-            &mut |_| quiet,
-        )?;
-        fold(&mut totals, &report);
-        if report.exhausted {
-            break;
-        }
-    }
+    // One pass. A stop saves the cursor, and the next invocation continues
+    // from it.
+    let quiet = true;
+    let report = one_pass(
+        &store,
+        &store_dir,
+        &index,
+        &mut db,
+        &roots,
+        apply,
+        &limits,
+        &mut |_| quiet,
+    )?;
+    fold(&mut totals, &report);
     for line in present(&totals, apply, json)? {
         println!("{line}");
     }
@@ -503,7 +498,8 @@ fn one_pass(
                 report.exhausted = false;
                 return Ok(report);
             }
-            if counters.examined >= limits.examine || counters.started.elapsed() >= limits.budget {
+            // The file list is already capped at `limits.examine`.
+            if counters.started.elapsed() >= limits.budget {
                 db.set_cursor(&last_done);
                 report.exhausted = false;
                 return Ok(report);
@@ -1534,6 +1530,7 @@ mod tests {
         fs::write(target.join("debug/incremental/libskip.rlib"), &match_body).unwrap();
 
         let first = run_quiet(&config);
+        assert!(first.exhausted, "a finished tree is not left open");
         assert_eq!(first.hashed, 1, "only the matching file is hashed");
         assert_eq!(first.size_rejected, 1);
         assert_eq!(first.ends_rejected, 1);
@@ -2024,29 +2021,23 @@ mod tests {
         let mut db = PipelineDb::open(&config.cache_dir).unwrap();
         let store = crate::store::Store::open(config).unwrap();
         let mut report = Report::new(roots.len());
-        loop {
-            let pass = one_pass(
-                &store,
-                &config.store_dir(),
-                &index,
-                &mut db,
-                &roots,
-                false,
-                &Limits {
-                    examine: usize::MAX,
-                    ends: usize::MAX,
-                    hashes: usize::MAX,
-                    budget: Duration::from_secs(60),
-                },
-                &mut |_| true,
-            )
-            .unwrap();
-            let done = pass.exhausted;
-            fold(&mut report, &pass);
-            if done {
-                break;
-            }
-        }
+        let pass = one_pass(
+            &store,
+            &config.store_dir(),
+            &index,
+            &mut db,
+            &roots,
+            false,
+            &Limits {
+                examine: usize::MAX,
+                ends: usize::MAX,
+                hashes: usize::MAX,
+                budget: Duration::from_secs(60),
+            },
+            &mut |_| true,
+        )
+        .unwrap();
+        fold(&mut report, &pass);
         report
     }
 
@@ -2185,6 +2176,16 @@ mod tests {
     }
 
     #[test]
+    fn a_file_of_one_block_has_two_ends() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("block.rlib");
+        fs::write(&path, bytes(4096, 4)).unwrap();
+        let ends = read_ends(&path).expect("one block is long enough to read");
+        assert_eq!(ends.head[0], 4);
+        assert_eq!(ends.tail[4095], 4);
+    }
+
+    #[test]
     fn temporary_clone_paths_skip_names_already_taken() {
         let dir = tempfile::tempdir().unwrap();
         let dest = dir.path().join("lib.rlib");
@@ -2199,6 +2200,30 @@ mod tests {
             second.file_name().unwrap(),
             std::ffi::OsStr::new(".lib.rlib.kache-dedup-1")
         );
+    }
+
+    #[test]
+    fn a_longer_source_is_rejected_before_it_is_placed() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.rlib");
+        let dest = dir.path().join("dest.rlib");
+        let dest_body = bytes(8192, 7);
+        let mut source_body = bytes(8192, 7);
+        source_body.extend_from_slice(&bytes(4096, 7));
+        fs::write(&source, &source_body).unwrap();
+        fs::write(&dest, &dest_body).unwrap();
+        let mut placed = false;
+        let err = replace_with(&source, &dest, &mut |_from, _to| {
+            placed = true;
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(
+            !placed,
+            "a source of a different length is not placed: {err}"
+        );
+        assert!(err.to_string().contains("no longer matches"), "{err}");
+        assert_eq!(fs::read(&dest).unwrap(), dest_body);
     }
 
     #[cfg(unix)]

@@ -1312,6 +1312,15 @@ mod tests {
 
         let refused = parse(&["rustdoc", "--test"]);
         assert!(!RustdocCompiler.refuse_reasons(&refused).is_empty());
+
+        let emit = parse(&["rustdoc", "--emit", "html,,dep-info=/tmp/demo.d"]);
+        assert_eq!(emit.dep_info.as_deref(), Some(Path::new("/tmp/demo.d")));
+        assert!(emit.keyed.iter().any(|item| item == "emit=html"));
+        assert!(
+            !emit.keyed.iter().any(|item| item == "emit="),
+            "{:?}",
+            emit.keyed
+        );
     }
 
     #[test]

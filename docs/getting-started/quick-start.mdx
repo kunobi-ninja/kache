@@ -65,7 +65,7 @@ The report covers the second tree's recorded events from the last 24 hours. To s
 kache stats --full --last-build --root "$kache_trial/second"
 ```
 
-A session can include nearby or concurrent Cargo commands in one root; it is not an exact Cargo invocation ID. Only completed, retained compiler events appear. See the [command reference](/docs/commands/reference#kache-report) for the selection rules.
+A session can include nearby or concurrent Cargo commands in one root; it is not an exact Cargo invocation ID. Only completed, retained compiler events appear. See the [command reference](/docs/commands/reference#the-full-report) for the selection rules.
 
 Compiler work avoided is an aggregate estimate, not elapsed build time saved. This example demonstrates reuse; a speed comparison needs repeated measurements of the same workload. Rust hits also do not prove that C or C++ compilations were cached.
 

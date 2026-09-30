@@ -4215,6 +4215,23 @@ fn render_stats_offline_and_not_configured() {
 }
 
 #[test]
+fn cache_limit_note_is_only_an_unclamped_share() {
+    const GIB: u64 = 1 << 30;
+    let share = " (5% of disk)";
+    // 5% of 200 GiB is 10 GiB, inside the 5 GiB floor and 100 GiB cap.
+    assert_eq!(cache_limit_note(0, 10 * GIB, Some(200 * GIB)), share);
+    assert_eq!(cache_limit_note(1, 10 * GIB, Some(200 * GIB)), share);
+    assert_eq!(cache_limit_note(2, 10 * GIB, Some(200 * GIB)), "");
+    assert_eq!(cache_limit_note(0, 7 * GIB, Some(200 * GIB)), "");
+    // 5% of 1 GiB rounds to 0, so the 5 GiB floor is not that share.
+    assert_eq!(cache_limit_note(0, 5 * GIB, Some(GIB)), "");
+    // 5% of 4000 GiB is 200 GiB, so the 100 GiB cap is not that share.
+    assert_eq!(cache_limit_note(0, 100 * GIB, Some(4000 * GIB)), "");
+    assert_eq!(cache_limit_note(0, 50 * GIB, None), "");
+    assert_eq!(cache_limit_note(0, 0, Some(0)), "");
+}
+
+#[test]
 fn render_stats_handles_zero_limits_and_zero_logical_dedup() {
     // Zero max/logical sizes -> percentage branches stay finite.
     let dir = tempfile::tempdir().unwrap();

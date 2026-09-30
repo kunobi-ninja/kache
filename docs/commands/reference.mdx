@@ -257,6 +257,43 @@ kache stats --last-build --root "$PWD"
 
 `--record` also appends one JSON line to `telemetry/sessions.jsonl` in the cache dir. The line holds the report's summary and timing breakdown, and the machine's load average, CPUs and index size at that moment. The root is stored as a hash. The runtime dir a CI job deletes on exit is where the report reads its events; this line is what survives on the machine. `KACHE_RECORD_SESSIONS=1` or `[cache] record_sessions = true` makes every report record the same way without the flag, and appends each GC run to `telemetry/gc-runs.jsonl`; it is off by default. With neither, the command writes nothing.
 
+### The full report
+
+```bash
+kache stats --format text --since 24h
+kache stats --format markdown --root "$PWD"
+kache stats --full --last-build --root "$PWD" --format markdown
+kache stats --format json --output report.json
+kache stats --format trace --output trace.json
+```
+
+| Flag | Default | Values or purpose |
+| --- | --- | --- |
+| `--full` | off | The full report instead of the summary. `--format`, `--output`, `--top`, `--record`, and `--redact` imply it |
+| `--format` | `text` | `json`, `trace`, `perfetto`, `chrome-trace`, `markdown`, `github`, `text`; `--json` alone gives `json` |
+| `--since` | `24h` | Event window; same forms as `kache stats` (`15m`, `2h`, `7d`, bare hours) |
+| `--last-build` | off | Latest recorded activity session; conflicts with `--since` |
+| `--root` | all roots | Include events from one build tree |
+| `--output`, `-o` | stdout | Write to a file |
+| `--top` | `10` | Number of ranked entries |
+| `--redact` | off | Replace cache keys, roots, object keys, and object paths with `redacted` |
+
+`trace`, `perfetto`, and `chrome-trace` select the same trace representation. `kache report` takes the same flags and prints the same report, for scripts written before `--full`. The JSON contract is documented by [`report.schema.json`](https://github.com/kunobi-ninja/kache/blob/main/docs/commands/report.schema.json).
+
+`--last-build` selects by the latest compiler event timestamp across the retained log, including events older than 24 hours. It includes only that root and session ID. For local or older events without session IDs, it infers a session from overlapping compiler activity and gaps shorter than five minutes, stopping at an event with a recorded ID. The report states which rule it used. `--root` limits the search to that tree and its descendants; the selected session still belongs to one exact root.
+
+A session can span concurrent or nearby Cargo commands. This flag does not identify one Cargo invocation. A Cargo command that does no compiler work produces no new events. Compiles still running have not been logged yet. Log rotation can remove the start of a session. An empty selection is an error.
+
+The session report includes cache hits, misses, bypass reasons, restored bytes and the observed compiler wall span. Compile work avoided is an aggregate estimate, not elapsed build time saved. Remote transfer totals and GC are omitted because those logs cannot identify the selected session. Store inventory and deduplication totals still describe the whole cache.
+
+JSON exposes the selection in `meta.session` (`root`, optional `session_id`, `inferred`, `inactivity_secs`); trace output carries it as `session`. In session reports, `since_secs` and `since_hours` describe the lookback to the first retained compiler start; `meta.session` defines the selection.
+
+Every report format totals the wrapper's phases per crate: startup, key computation, lookup, scheduler wait, restore or store, and the unattributed remainder. Startup runs from process start to wrapper entry. Key computation splits out the rustc dep-info pre-pass by time and run count. Scheduler wait is the flight join plus permit acquisition. Unattributed is wrapper overhead minus every measured phase, where overhead excludes the compile on a compiled crate and is the whole wrapper time on a hit. Events written by wrappers before schema 17 report zero startup, dep-info and wait time.
+
+In the trace output each crate slice carries these numbers in its `args`. It nests one `X` slice per phase on the same lane, in this order: `startup`, `key` (with `dep-info` as its child), `lookup`, `wait`, `compile` on compiled crates, then `restore` or `store`. Phase offsets accumulate from the crate slice's start in that order; the wrapper records durations, not start times, so a phase sits where it lands in the sum. The gap after the last phase is the unattributed remainder. Durations are whole milliseconds, so a phase under 1 ms has no slice. A remote transfer that has both a start and a finish follows the crate slices as an async `b`/`e` pair with category `kache.transfer`.
+
+`--redact` applies to every format. The session line in `telemetry/sessions.jsonl` is written first, so the machine keeps the keys. Empty fields stay empty. Store-error text is left as recorded. A C or C++ row can also carry `object_output`, the path named with `-o`.
+
 ## `kache telemetry`
 
 ```bash
@@ -306,43 +343,6 @@ Compares the two newest sessions that share one recorded build root. Without `--
 The text names the root, both miss counts, and each session's share of misses with no recorded cause. `EXCESS` means the later session missed more often. `UNKNOWN` means a larger share of its misses has no recorded cause. Either line exits 1. Fewer than two sessions prints `need two sessions to compare` and exits 0.
 
 `--json` returns the same counts and those lines.
-
-### The full report
-
-```bash
-kache stats --format text --since 24h
-kache stats --format markdown --root "$PWD"
-kache stats --full --last-build --root "$PWD" --format markdown
-kache stats --format json --output report.json
-kache stats --format trace --output trace.json
-```
-
-| Flag | Default | Values or purpose |
-| --- | --- | --- |
-| `--full` | off | The full report instead of the summary; every flag below implies it |
-| `--format` | `text` | `json`, `trace`, `perfetto`, `chrome-trace`, `markdown`, `github`, `text`; `--json` alone gives `json` |
-| `--since` | `24h` | Event window; same forms as `kache stats` (`15m`, `2h`, `7d`, bare hours) |
-| `--last-build` | off | Latest recorded activity session; conflicts with `--since` |
-| `--root` | all roots | Include events from one build tree |
-| `--output`, `-o` | stdout | Write to a file |
-| `--top` | `10` | Number of ranked entries |
-| `--redact` | off | Replace cache keys, roots, object keys, and object paths with `redacted` |
-
-`trace`, `perfetto`, and `chrome-trace` select the same trace representation. `kache report` takes the same flags and prints the same report, for scripts written before `--full`. The JSON contract is documented by [`report.schema.json`](https://github.com/kunobi-ninja/kache/blob/main/docs/commands/report.schema.json).
-
-`--last-build` selects by the latest compiler event timestamp across the retained log, including events older than 24 hours. It includes only that root and session ID. For local or older events without session IDs, it infers a session from overlapping compiler activity and gaps shorter than five minutes, stopping at an event with a recorded ID. The report states which rule it used. `--root` limits the search to that tree and its descendants; the selected session still belongs to one exact root.
-
-A session can span concurrent or nearby Cargo commands. This flag does not identify one Cargo invocation. A Cargo command that does no compiler work produces no new events. Compiles still running have not been logged yet. Log rotation can remove the start of a session. An empty selection is an error.
-
-The session report includes cache hits, misses, bypass reasons, restored bytes and the observed compiler wall span. Compile work avoided is an aggregate estimate, not elapsed build time saved. Remote transfer totals and GC are omitted because those logs cannot identify the selected session. Store inventory and deduplication totals still describe the whole cache.
-
-JSON exposes the selection in `meta.session` (`root`, optional `session_id`, `inferred`, `inactivity_secs`); trace output carries it as `session`. In session reports, `since_secs` and `since_hours` describe the lookback to the first retained compiler start; `meta.session` defines the selection.
-
-Every report format totals the wrapper's phases per crate: startup, key computation, lookup, scheduler wait, restore or store, and the unattributed remainder. Startup runs from process start to wrapper entry. Key computation splits out the rustc dep-info pre-pass by time and run count. Scheduler wait is the flight join plus permit acquisition. Unattributed is wrapper overhead minus every measured phase, where overhead excludes the compile on a compiled crate and is the whole wrapper time on a hit. Events written by wrappers before schema 17 report zero startup, dep-info and wait time.
-
-In the trace output each crate slice carries these numbers in its `args`. It nests one `X` slice per phase on the same lane, in this order: `startup`, `key` (with `dep-info` as its child), `lookup`, `wait`, `compile` on compiled crates, then `restore` or `store`. Phase offsets accumulate from the crate slice's start in that order; the wrapper records durations, not start times, so a phase sits where it lands in the sum. The gap after the last phase is the unattributed remainder. Durations are whole milliseconds, so a phase under 1 ms has no slice. A remote transfer that has both a start and a finish follows the crate slices as an async `b`/`e` pair with category `kache.transfer`.
-
-`--redact` applies to every format. The session line in `telemetry/sessions.jsonl` is written first, so the machine keeps the keys. Empty fields stay empty. Store-error text is left as recorded. A C or C++ row can also carry `object_output`, the path named with `-o`.
 
 ## `kache telemetry push`
 

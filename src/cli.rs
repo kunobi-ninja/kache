@@ -1065,22 +1065,46 @@ fn build_rows(snap: &StatsSnapshot) -> Vec<StatsRow> {
     rows
 }
 
+/// ` (5% of disk)` when one store's cap is the unclamped disk share, else empty.
+///
+/// A missing probe and a floor or cap clamp are real limits. They are not 5%.
+/// Extra stores keep their own caps, so the summary row stays unlabeled.
+fn cache_limit_note(
+    store_count: usize,
+    max_size: u64,
+    filesystem_bytes: Option<u64>,
+) -> &'static str {
+    if store_count > 1 {
+        return "";
+    }
+    let Some(total) = filesystem_bytes.filter(|&bytes| bytes > 0) else {
+        return "";
+    };
+    let raw = total.saturating_mul(crate::config::DISK_SHARE_PERCENT) / 100;
+    const GIB: u64 = 1024 * 1024 * 1024;
+    let rounded = raw.saturating_add(GIB / 2) / GIB * GIB;
+    if max_size == rounded {
+        " (5% of disk)"
+    } else {
+        ""
+    }
+}
+
 /// The store, each extra store, and content dedup.
 fn cache_rows(snap: &StatsSnapshot, config: &Config) -> Vec<StatsRow> {
-    // A limit kache derived from the disk says so; the formula is in the
-    // configuration docs.
-    let derived = snap.stores.len() <= 1
-        && crate::config::describe_max_size(
-            snap.max_size,
-            crate::cache_fs::probe(&config.cache_dir).total_bytes,
-        ) != term::bytes(snap.max_size);
+    // Only an unclamped 5% share. The floor, the cap, and the unknown-disk
+    // fallback are different numbers, and the row must not call them 5%.
+    let note = cache_limit_note(
+        snap.stores.len(),
+        snap.max_size,
+        crate::cache_fs::probe(&config.cache_dir).total_bytes,
+    );
     let mut rows = vec![(
         "Cache",
         term::bytes(snap.total_size),
         format!(
-            "of {}{} · {} entries",
+            "of {}{note} · {} entries",
             term::bytes(snap.max_size),
-            if derived { " (5% of disk)" } else { "" },
             term::count(snap.entry_count as u64)
         ),
     )];

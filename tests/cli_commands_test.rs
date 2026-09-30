@@ -1749,7 +1749,7 @@ fn init_saves_shell_setup_preserves_cargo_choices_and_is_idempotent() {
     let output = e
         .cmd()
         .args(["init", "--no-service"])
-        .write_stdin("y\ny\nn\n")
+        .write_stdin("y\ny\ny\nn\n")
         .assert()
         .success()
         .get_output()
@@ -1757,6 +1757,7 @@ fn init_saves_shell_setup_preserves_cargo_choices_and_is_idempotent() {
         .clone();
     let output = String::from_utf8(output).unwrap();
     assert!(output.contains("Replace sccache with Kache for Cargo builds?"));
+    assert!(output.contains("Cache cargo doc as well?"));
     assert!(output.contains("Open a new terminal"));
     assert!(!output.contains("Setup complete"));
     assert!(!output.contains("PKGBUILD"));
@@ -1779,17 +1780,23 @@ fn init_saves_shell_setup_preserves_cargo_choices_and_is_idempotent() {
         Some("rustdoc")
     );
     assert!(rustdoc_path.is_file(), "{rustdoc}");
-    let backup = std::fs::read_dir(cargo.parent().unwrap())
+    // One backup before each edit: the wrapper, then build.rustdoc.
+    let mut backups: Vec<String> = std::fs::read_dir(cargo.parent().unwrap())
         .unwrap()
         .map(|entry| entry.unwrap().path())
-        .find(|path| {
+        .filter(|path| {
             path.file_name()
                 .unwrap()
                 .to_string_lossy()
                 .starts_with(".kache-cargo-backup-")
         })
-        .unwrap();
-    assert_eq!(std::fs::read_to_string(backup).unwrap(), original);
+        .map(|path| std::fs::read_to_string(path).unwrap())
+        .collect();
+    backups.sort_by_key(|backup| backup.contains("rustc-wrapper = \"kache\""));
+    assert_eq!(backups.len(), 2, "{backups:?}");
+    assert_eq!(backups[0], original);
+    assert!(backups[1].contains("rustc-wrapper = \"kache\""));
+    assert!(!backups[1].contains("rustdoc"));
     let before = std::fs::read_to_string(e.home.join(".bashrc")).unwrap();
     assert!(before.starts_with("# user rc\n"));
     assert_eq!(before.matches("# >>> kache compiler cache >>>").count(), 1);

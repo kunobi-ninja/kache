@@ -8027,17 +8027,36 @@ pub(crate) fn rustdoc_doctor_fields(
     }
 }
 
+/// Keep a copy of the Cargo config beside it before init edits it.
+fn back_up_cargo_config(cargo_path: &std::path::Path, existing: &str) -> Result<()> {
+    use std::io::Write;
+    let mut backup = tempfile::Builder::new()
+        .prefix(".kache-cargo-backup-")
+        .tempfile_in(cargo_path.parent().context("Cargo config has no parent")?)?;
+    backup.write_all(existing.as_bytes())?;
+    backup.as_file().sync_all()?;
+    let (_, backup) = backup.keep()?;
+    println!(
+        "    Backup: {}",
+        crate::wrapper_config::display_path(&backup)
+    );
+    Ok(())
+}
+
+/// Point `build.rustdoc` at the rustdoc shim, after asking and with a backup,
+/// like the `rustc-wrapper` edit. Only a config whose wrapper is already
+/// `kache` is edited.
 #[cfg(unix)]
-fn configure_cargo_rustdoc(check: bool) {
+fn configure_cargo_rustdoc(yes: bool, check: bool) -> Result<()> {
     let Some(shim_dir) = crate::compiler::shim::default_shim_dir() else {
-        return;
+        return Ok(());
     };
     let shim = shim_dir.join("rustdoc");
     if !shim.is_file() {
-        return;
+        return Ok(());
     }
     let Some(shim_path) = shim.to_str() else {
-        return;
+        return Ok(());
     };
     let cargo_path = cargo_config_target_path();
     let existing = std::fs::read_to_string(&cargo_path).unwrap_or_default();
@@ -8056,20 +8075,26 @@ fn configure_cargo_rustdoc(check: bool) {
         RustdocEdit::Write => {}
         RustdocEdit::Leave => {
             println!("  • cargo doc: build.rustdoc is already set");
-            return;
+            return Ok(());
         }
-        RustdocEdit::Skip | RustdocEdit::Already => return,
+        RustdocEdit::Skip | RustdocEdit::Already => return Ok(()),
     }
     if check {
         println!("    Would set build.rustdoc to {}", shim.display());
-        return;
+        return Ok(());
     }
+    if !prompt_yes_no("Cache cargo doc as well?", true, yes)? {
+        println!("  • cargo doc: skipped");
+        return Ok(());
+    }
+    back_up_cargo_config(&cargo_path, &existing)?;
     let updated = apply_rustdoc_edit(&existing, shim_path);
     if let Err(error) = std::fs::write(&cargo_path, updated) {
         println!("  • cargo doc: could not set build.rustdoc ({error})");
-        return;
+        return Ok(());
     }
     println!("  ✓ cargo doc: build.rustdoc set");
+    Ok(())
 }
 
 pub fn init(yes: bool, no_service: bool, no_shell: bool, check: bool) -> Result<()> {
@@ -8121,17 +8146,7 @@ pub fn init(yes: bool, no_service: bool, no_shell: bool, check: bool) -> Result<
                 std::fs::create_dir_all(parent)?;
             }
             if cargo_path.exists() {
-                use std::io::Write;
-                let mut backup = tempfile::Builder::new()
-                    .prefix(".kache-cargo-backup-")
-                    .tempfile_in(cargo_path.parent().context("Cargo config has no parent")?)?;
-                backup.write_all(existing.as_bytes())?;
-                backup.as_file().sync_all()?;
-                let (_, backup) = backup.keep()?;
-                println!(
-                    "    Backup: {}",
-                    crate::wrapper_config::display_path(&backup)
-                );
+                back_up_cargo_config(&cargo_path, &existing)?;
             }
             std::fs::write(&cargo_path, updated).context("save Cargo configuration")?;
             cargo_ready = true;
@@ -8145,7 +8160,7 @@ pub fn init(yes: bool, no_service: bool, no_shell: bool, check: bool) -> Result<
     let shell_pending = init_compiler_setup(yes, no_shell, check)?;
     #[cfg(unix)]
     if !no_shell {
-        configure_cargo_rustdoc(check);
+        configure_cargo_rustdoc(yes, check)?;
     }
     #[cfg(unix)]
     let tests_pending = init_test_runner(yes, no_shell, check)?;

@@ -940,7 +940,7 @@ fn machine_rows(machine: &crate::otel::MachineSnapshot) -> Vec<StatsRow> {
             .map(|(table, rows)| format!("{table} {}", term::count(*rows)))
             .collect();
         if !top.is_empty() {
-            notes.push(format!("rows written: {}", top.join(", ")));
+            notes.push(format!("rowid high-water: {}", top.join(", ")));
         }
         rows.push(("Index", term::bytes(bytes), notes.join(" · ")));
     }
@@ -1065,35 +1065,28 @@ fn build_rows(snap: &StatsSnapshot) -> Vec<StatsRow> {
     rows
 }
 
-/// ` (5% of disk)` when one store's cap is the unclamped disk share, else empty.
+/// Parenthetical for a cap that is the disk-share budget, matching
+/// [`crate::config::describe_max_size`].
 ///
-/// A missing probe and a floor or cap clamp are real limits. They are not 5%.
-/// Extra stores keep their own caps, so the summary row stays unlabeled.
-fn cache_limit_note(
-    store_count: usize,
-    max_size: u64,
-    filesystem_bytes: Option<u64>,
-) -> &'static str {
+/// One store whose cap equals that budget says `5% of <disk>, floor 5GiB,
+/// cap 100GiB`, or `default; disk size unknown` when the probe failed. Any
+/// other cap, and a summary that covers more than one store, stays unlabeled.
+fn cache_limit_note(store_count: usize, max_size: u64, filesystem_bytes: Option<u64>) -> String {
     if store_count > 1 {
-        return "";
+        return String::new();
     }
-    let Some(total) = filesystem_bytes.filter(|&bytes| bytes > 0) else {
-        return "";
-    };
-    let raw = total.saturating_mul(crate::config::DISK_SHARE_PERCENT) / 100;
-    const GIB: u64 = 1024 * 1024 * 1024;
-    let rounded = raw.saturating_add(GIB / 2) / GIB * GIB;
-    if max_size == rounded {
-        " (5% of disk)"
-    } else {
-        ""
+    let derived = crate::config::disk_share_budget(filesystem_bytes);
+    if max_size != derived {
+        return String::new();
+    }
+    match filesystem_bytes.filter(|&bytes| bytes > 0) {
+        Some(total) => format!(" (5% of {}, floor 5GiB, cap 100GiB)", ByteSize(total)),
+        None => " (default; disk size unknown)".to_string(),
     }
 }
 
 /// The store, each extra store, and content dedup.
 fn cache_rows(snap: &StatsSnapshot, config: &Config) -> Vec<StatsRow> {
-    // Only an unclamped 5% share. The floor, the cap, and the unknown-disk
-    // fallback are different numbers, and the row must not call them 5%.
     let note = cache_limit_note(
         snap.stores.len(),
         snap.max_size,
@@ -1537,7 +1530,15 @@ pub fn stats_last_build(
     };
     let report =
         crate::report::generate_report_with_filter(config, SinceWindow::DEFAULT, 10, &filter)?;
-    if json {
+    // `--record` takes the full-report path. This summary is what
+    // `kache stats --last-build` prints, and a host that set
+    // `record_sessions` still needs the session written.
+    let recorded = if config.record_sessions {
+        record_session(config, &report)
+    } else {
+        Ok(())
+    };
+    let printed = if json {
         #[derive(serde::Serialize)]
         struct Body {
             report: crate::report::BuildReport,
@@ -1546,7 +1547,11 @@ pub fn stats_last_build(
     } else {
         println!("{}", crate::report::format_text(&report));
         Ok(())
+    };
+    if let Err(error) = recorded {
+        eprintln!("warning: this session was not recorded: {error:#}");
     }
+    printed
 }
 
 pub fn report(

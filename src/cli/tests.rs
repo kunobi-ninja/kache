@@ -1417,7 +1417,7 @@ fn stats_rows_show_the_index_and_a_gc_that_keeps_losing_the_lock() {
     let rows: Vec<String> = machine_rows(&machine).into_iter().map(row_text).collect();
     assert_eq!(
         rows[0],
-        "Index | 27.1 GiB | WAL 1.0 GiB · rows written: file_hashes 13,286,285, eviction_tombstones 5,425,819, cc_preprocess_memos 874,517"
+        "Index | 27.1 GiB | WAL 1.0 GiB · rowid high-water: file_hashes 13,286,285, eviction_tombstones 5,425,819, cc_preprocess_memos 874,517"
     );
     assert!(rows[1].starts_with("Last GC | "), "{rows:?}");
     assert!(
@@ -1592,6 +1592,44 @@ fn tree_contents(dir: &std::path::Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
     }
     files.sort();
     files
+}
+
+/// `kache stats --last-build` is not the full report, but a host that turned
+/// `record_sessions` on still gets the session. `--record` never reaches
+/// this function: it selects the full report instead.
+#[test]
+fn stats_last_build_records_when_record_sessions_is_on() {
+    let cache = tempfile::tempdir().unwrap();
+    let mut config = save_manifest_config(cache.path().to_path_buf(), None);
+    config.record_sessions = true;
+    plant_last_build(&config);
+    stats_last_build(&config, None, false).unwrap();
+    stats_last_build(&config, None, true).unwrap();
+    let log = std::fs::read_to_string(session_log_path(&config)).unwrap();
+    assert_eq!(log.lines().count(), 2, "{log}");
+
+    let quiet = tempfile::tempdir().unwrap();
+    let config = save_manifest_config(quiet.path().to_path_buf(), None);
+    plant_last_build(&config);
+    stats_last_build(&config, None, true).unwrap();
+    assert!(
+        !session_log_path(&config).exists(),
+        "a last-build summary records only when record_sessions is on"
+    );
+}
+
+fn plant_last_build(config: &Config) {
+    let mut event = build_event(
+        "demo",
+        crate::events::EventResult::LocalHit,
+        4,
+        5,
+        64,
+        "key",
+    );
+    event.root = "/repo".to_string();
+    event.session_id = "build".to_string();
+    crate::events::log_event(&config.event_log_path(), &event).unwrap();
 }
 
 /// `record_sessions` (env or config) makes a plain `kache report` record
@@ -4215,20 +4253,33 @@ fn render_stats_offline_and_not_configured() {
 }
 
 #[test]
-fn cache_limit_note_is_only_an_unclamped_share() {
+fn cache_limit_note_names_the_disk_share_budget() {
     const GIB: u64 = 1 << 30;
-    let share = " (5% of disk)";
-    // 5% of 200 GiB is 10 GiB, inside the 5 GiB floor and 100 GiB cap.
+    let share = format!(" (5% of {}, floor 5GiB, cap 100GiB)", ByteSize(200 * GIB));
+    // 5% of 200 GiB is 10 GiB, inside the floor and the cap.
     assert_eq!(cache_limit_note(0, 10 * GIB, Some(200 * GIB)), share);
     assert_eq!(cache_limit_note(1, 10 * GIB, Some(200 * GIB)), share);
     assert_eq!(cache_limit_note(2, 10 * GIB, Some(200 * GIB)), "");
     assert_eq!(cache_limit_note(0, 7 * GIB, Some(200 * GIB)), "");
-    // 5% of 1 GiB rounds to 0, so the 5 GiB floor is not that share.
-    assert_eq!(cache_limit_note(0, 5 * GIB, Some(GIB)), "");
-    // 5% of 4000 GiB is 200 GiB, so the 100 GiB cap is not that share.
-    assert_eq!(cache_limit_note(0, 100 * GIB, Some(4000 * GIB)), "");
-    assert_eq!(cache_limit_note(0, 50 * GIB, None), "");
+    // 5% of 1 GiB rounds to 0, then the floor raises the budget to 5 GiB.
+    let floor = cache_limit_note(0, 5 * GIB, Some(GIB));
+    assert!(floor.contains("floor"), "{floor}");
+    assert!(floor.contains("5GiB"), "{floor}");
+    assert!(floor.contains(&ByteSize(GIB).to_string()), "{floor}");
+    // 5% of 4000 GiB is 200 GiB, then the cap lowers the budget to 100 GiB.
+    let cap = cache_limit_note(0, 100 * GIB, Some(4000 * GIB));
+    assert!(cap.contains("cap"), "{cap}");
+    assert!(cap.contains("100GiB"), "{cap}");
+    assert_eq!(
+        cache_limit_note(0, 50 * GIB, None),
+        " (default; disk size unknown)"
+    );
+    assert_eq!(
+        cache_limit_note(1, 50 * GIB, Some(0)),
+        " (default; disk size unknown)"
+    );
     assert_eq!(cache_limit_note(0, 0, Some(0)), "");
+    assert_eq!(cache_limit_note(0, 49 * GIB, None), "");
 }
 
 #[test]

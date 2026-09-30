@@ -470,7 +470,7 @@ fn scan_rust(bytes: &[u8]) -> Result<Vec<Found>> {
     let mut modules: Vec<(String, usize)> = Vec::new();
     let mut depth = 0usize;
     let mut index = 0;
-    while index < tokens.len() {
+    while tokens.get(index).is_some() {
         if punct_at(&tokens, index, b'#') && punct_at(&tokens, index + 1, b'[') {
             let inner = punct_at(&tokens, index + 2, b'!');
             let start = if inner { index + 3 } else { index + 2 };
@@ -653,7 +653,6 @@ fn rust_tokens(bytes: &[u8]) -> Vec<Tok> {
         }
         if is_ident_start(byte) {
             let start = index;
-            index += 1;
             while index < bytes.len() && is_ident_continue(bytes[index]) {
                 index += 1;
             }
@@ -3228,5 +3227,81 @@ mod tests {
         assert_eq!(version, 7);
         let log = std::fs::read_to_string(config.event_log_path()).unwrap();
         assert!(log.contains("\"result\":\"passthrough\""), "{log}");
+    }
+
+    #[test]
+    fn a_raw_byte_string_is_one_literal() {
+        assert_eq!(skip_byte_literal(b"br\"abc\"", 0), 7);
+        assert_eq!(skip_char_or_lifetime(b"'a", 0), 1);
+        assert!(raw_string(b"r#\"abc", 0).is_none());
+        assert_eq!(module_names("mod real; // tail"), vec!["real".to_string()]);
+        assert!(module_names("mod foo").is_empty());
+    }
+
+    #[test]
+    fn a_directory_is_not_a_source_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut seen = BTreeSet::new();
+        let mut out = Vec::new();
+        collect_source(dir.path(), dir.path(), true, &mut seen, &mut out).unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn a_missing_include_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut seen = BTreeSet::new();
+        let mut out = Vec::new();
+        collect_source(
+            &dir.path().join("missing.rs"),
+            dir.path(),
+            false,
+            &mut seen,
+            &mut out,
+        )
+        .unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn parent_segments_fold_out_of_the_path() {
+        let cwd = std::env::current_dir().unwrap();
+        let path = cwd.join("a").join("b").join("..").join("c");
+        assert_eq!(lexical_absolute(&path), cwd.join("a").join("c"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_looping_symlink_is_not_a_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("loop.rs");
+        std::os::unix::fs::symlink(&link, &link).unwrap();
+        let mut seen = BTreeSet::new();
+        let mut out = Vec::new();
+        assert!(collect_source(&link, dir.path(), false, &mut seen, &mut out).is_err());
+        assert!(resolve_module(dir.path(), None, "loop").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pass_store_returns_the_compiler_status() {
+        let _lock = crate::config::config_path_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("rustdoc");
+        std::fs::write(&script, "#!/bin/sh\nexit 7\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let config = crate::test_support::test_config(dir.path().join("cache"));
+        let parsed = parse(&[&script.to_string_lossy()]);
+        let code = pass_store(
+            &config,
+            &parsed,
+            "root",
+            "demo",
+            std::time::Instant::now(),
+            &anyhow::anyhow!("store full"),
+        )
+        .unwrap();
+        assert_eq!(code, 7);
     }
 }

@@ -174,8 +174,11 @@ jobs:
           # aube: a 15-crate workspace with C dependencies (aws-lc-sys,
           # mimalloc, tree-sitter through cc-rs; libz-ng-sys through cmake).
           # Where hk is one crate over a large graph, aube's time goes to
-          # workspace units that depend on each other.
-          aube='{"name":"aube","cmd":"bench-short aube","dir":"bench-aube","timeout":120,"job_timeout":150,"min_free_gb":40,"runner":"kunobi-runners"}'
+          # workspace units that depend on each other. The longest of the
+          # three short subjects: its isolated samples take about an hour
+          # (hk: 23 minutes) and its contention batches about as long again,
+          # so hk's 120 minutes cut it off mid-contention.
+          aube='{"name":"aube","cmd":"bench-short aube","dir":"bench-aube","timeout":240,"job_timeout":270,"min_free_gb":40,"runner":"kunobi-runners"}'
           # Two more subjects on the same side-by-side axis. mbx fronts Cargo,
           # so the arms it can serve at all are exactly the cargo-driven ones:
           # firefox (mach/gn/ninja) and llvm (cmake) are out of reach, which is
@@ -468,6 +471,11 @@ jobs:
             tmp/bench/${{ matrix.dir }}/logs/
             tmp/bench/${{ matrix.dir }}/contention/
             tmp/bench/${{ matrix.dir }}/contention.log
+            # Scratch the contention driver removes on exit. A timed-out step
+            # leaves it behind with builds still running in it, and files
+            # vanishing mid-walk fail the whole upload.
+            !tmp/bench/${{ matrix.dir }}/contention/work/**
+            !tmp/bench/${{ matrix.dir }}/contention/cargo-home/**
           retention-days: 30
           if-no-files-found: warn
 

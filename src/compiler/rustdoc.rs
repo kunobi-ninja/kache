@@ -1336,6 +1336,14 @@ mod tests {
         assert!(!libs.unknown);
         assert_eq!(libs.library_kinds, vec!["dependency".to_string()]);
 
+        let html = parse(&["rustdoc", "--output-format", "html", "src/lib.rs"]);
+        assert!(!html.unknown);
+        assert!(!html.blocked);
+        assert_eq!(html.sources, vec![PathBuf::from("src/lib.rs")]);
+        let json = parse(&["rustdoc", "--output-format", "json"]);
+        assert!(json.blocked);
+        assert!(!json.unknown);
+
         let refused = parse(&["rustdoc", "--test"]);
         assert!(!RustdocCompiler.refuse_reasons(&refused).is_empty());
 

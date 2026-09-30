@@ -86,13 +86,6 @@ def group_resources(entries):
     return grouped
 
 
-# Context arms that run by default, and the bare names they default to. A
-# default that is not installed skips its arm; an explicitly named binary
-# never does. sccache is a pinned binary that does not change between runs,
-# so it runs only when named, which the weekly reference run does.
-DEFAULT_TOOL = {"mbx": "mbx"}
-
-
 class DeadlineReached(Exception):
     """The run's time budget ran out. What finished is still reported."""
 
@@ -173,23 +166,13 @@ def cold_is_reused(sample, cold_every):
 
 
 def wanted_arm(arm, args):
-    """Whether to measure this arm.
+    """Whether to measure this arm: the Kache arms always, sccache and mbx
+    only when named.
 
-    The Kache arms decide the verdict, so a missing binary there is fatal and
-    is caught before any cloning. sccache and mbx are context. mbx defaults to
-    a bare name, and on a machine without it the honest answer is a run
-    without it, not a run that clones a subject and then dies. sccache runs
-    only when named. A named binary is asked for, so a missing one stays fatal.
+    The other tools never decide the verdict. The per-PR gate leaves them
+    out; the nightly names mbx and the weekly reference names both.
     """
-    name, _, binary = arm
-    if binary is None:
-        return False
-    if name in ("kache", "head", "base") or binary != DEFAULT_TOOL.get(name):
-        return True
-    if installed(binary):
-        return True
-    print(f"{name}: not installed, skipping this arm", flush=True)
-    return False
+    return arm[2] is not None
 
 
 # The arms whose timings the gate compares; every other tool is context.
@@ -547,8 +530,7 @@ def main():
     )
     parser.add_argument(
         "--mbx",
-        default=DEFAULT_TOOL["mbx"],
-        help="mbx binary; the arm is skipped when the default is not installed",
+        help="mbx binary to measure as well; without it there is no mbx arm",
     )
     parser.add_argument("--samples", type=int, choices=range(1, 21), default=1)
     parser.add_argument("--order-seed", type=int, default=0)
@@ -605,7 +587,12 @@ def main():
             f"--engine is not an executable file: {args.engine} "
             "(it wants the measuring instrument, target/release/kache-scenario, not the kache binary)"
         )
-    for flag, binary in (("--kache", args.kache), ("--base", args.base)):
+    for flag, binary in (
+        ("--kache", args.kache),
+        ("--base", args.base),
+        ("--sccache", args.sccache),
+        ("--mbx", args.mbx),
+    ):
         if binary is not None and not installed(binary):
             parser.error(f"{flag} is not installed: {binary}")
     return run(args)

@@ -391,29 +391,15 @@ class BenchTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "incomplete contention"):
                     short.run_contention(args, arms)
 
-    def test_a_missing_context_tool_skips_its_arm_and_a_named_one_does_not(self):
-        """A laptop without mbx should still measure head against base.
-
-        Before this, the run cloned the subject, built it, and only then died
-        because a bare `mbx` was not on PATH.
-        """
-        args = argparse.Namespace(sccache=None, mbx="mbx", base="/base")
-        with patch.object(engine.shutil, "which", return_value=None):
-            self.assertFalse(short.wanted_arm(("mbx", "mbx", "mbx"), args))
-            # The arms that decide the verdict are never skipped away.
-            self.assertTrue(short.wanted_arm(("head", "kache", "/kache"), args))
-            self.assertTrue(short.wanted_arm(("base", "kache", "/base"), args))
-
-        # Asking for a specific binary keeps the arm, so a wrong path is still
-        # an error rather than a silently missing comparison.
-        named = argparse.Namespace(sccache="/opt/sccache", mbx="mbx", base=None)
-        with patch.object(engine.shutil, "which", return_value=None):
-            self.assertTrue(short.wanted_arm(("sccache", "sccache", "/opt/sccache"), named))
-
-        with patch.object(engine.shutil, "which", return_value="/usr/bin/mbx"):
-            self.assertTrue(short.wanted_arm(("mbx", "mbx", "mbx"), args))
-            # sccache runs only when named, installed or not.
-            self.assertFalse(short.wanted_arm(("sccache", "sccache", None), args))
+    def test_other_tools_run_only_when_named(self):
+        """The per-PR gate measures Kache alone; the nightly names mbx and the
+        weekly reference names sccache too."""
+        args = argparse.Namespace(sccache=None, mbx=None, base="/base")
+        self.assertTrue(short.wanted_arm(("head", "kache", "/kache"), args))
+        self.assertTrue(short.wanted_arm(("base", "kache", "/base"), args))
+        self.assertFalse(short.wanted_arm(("sccache", "sccache", None), args))
+        self.assertFalse(short.wanted_arm(("mbx", "mbx", None), args))
+        self.assertTrue(short.wanted_arm(("mbx", "mbx", "mbx"), args))
 
     def test_context_tools_run_only_in_their_samples(self):
         """sccache and mbx never decide the verdict: the gate measures them

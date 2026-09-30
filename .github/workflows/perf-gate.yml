@@ -407,13 +407,18 @@ jobs:
           exit "$status"
 
       # always(): a failed comparison is exactly when the per-phase reports and
-      # build logs are worth reading.
+      # build logs are worth reading. The `!` lines drop contention scratch: a
+      # stopped run can leave builds deleting files in it, and a file that
+      # vanishes mid-walk fails the whole upload.
       - name: Upload perf-gate artifacts
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: perf-gate-${{ matrix.project }}
-          path: ${{ runner.temp }}/perf-gate/
+          path: |
+            ${{ runner.temp }}/perf-gate/
+            !${{ runner.temp }}/perf-gate/*/contention/work/**
+            !${{ runner.temp }}/perf-gate/*/contention/cargo-home/**
           retention-days: 14
           if-no-files-found: warn
 

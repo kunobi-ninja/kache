@@ -4118,6 +4118,23 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         Ok(size as u64)
     }
 
+    /// Every indexed blob of at least `min_size` bytes, as `(hash, size)`.
+    /// One query, where listing the blob directories would stat every file.
+    pub fn blobs_at_least(&self, min_size: u64) -> Result<Vec<(String, u64)>> {
+        let mut stmt = self
+            .db
+            .prepare("SELECT hash, size FROM blobs WHERE size >= ?1")?;
+        let rows = stmt.query_map([i64::try_from(min_size).unwrap_or(i64::MAX)], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        let mut blobs = Vec::new();
+        for row in rows {
+            let (hash, size) = row?;
+            blobs.push((hash, u64::try_from(size).unwrap_or(0)));
+        }
+        Ok(blobs)
+    }
+
     /// Get the number of entries in the store.
     pub fn entry_count(&self) -> Result<usize> {
         let count: i64 = self

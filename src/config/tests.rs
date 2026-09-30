@@ -2335,6 +2335,7 @@ fn test_file_config_roundtrip() {
             auto_gc: None,
             index_auto_compact: None,
             auto_clean_orphaned_targets: None,
+            auto_share_target_files: None,
             auto_clean_idle_targets_days: None,
             auto_recover_min_free_bytes: None,
             scheduler_memory_pressure: None,
@@ -2874,6 +2875,7 @@ fn test_config_store_dir() {
         auto_gc: true,
         index_auto_compact: true,
         auto_clean_orphaned_targets: true,
+        auto_share_target_files: true,
         auto_clean_idle_targets_days: 0,
         auto_recover_min_free_bytes: 0,
         scheduler_memory_pressure: true,
@@ -2949,6 +2951,7 @@ fn test_config_index_db_path() {
         auto_gc: true,
         index_auto_compact: true,
         auto_clean_orphaned_targets: true,
+        auto_share_target_files: true,
         auto_clean_idle_targets_days: 0,
         auto_recover_min_free_bytes: 0,
         scheduler_memory_pressure: true,
@@ -3020,6 +3023,7 @@ fn test_config_event_log_path() {
         auto_gc: true,
         index_auto_compact: true,
         auto_clean_orphaned_targets: true,
+        auto_share_target_files: true,
         auto_clean_idle_targets_days: 0,
         auto_recover_min_free_bytes: 0,
         scheduler_memory_pressure: true,
@@ -3110,6 +3114,7 @@ fn test_config_socket_path() {
         auto_gc: true,
         index_auto_compact: true,
         auto_clean_orphaned_targets: true,
+        auto_share_target_files: true,
         auto_clean_idle_targets_days: 0,
         auto_recover_min_free_bytes: 0,
         scheduler_memory_pressure: true,
@@ -3777,6 +3782,7 @@ fn test_save_and_load_file_config() {
             auto_gc: None,
             index_auto_compact: None,
             auto_clean_orphaned_targets: None,
+            auto_share_target_files: None,
             auto_clean_idle_targets_days: None,
             auto_recover_min_free_bytes: None,
             scheduler_memory_pressure: None,
@@ -5043,4 +5049,30 @@ fn a_scoped_socket_keeps_its_directory_and_extension() {
         scoped_socket_path(Path::new("/run/kache/pipe"), "pr-0123abcd"),
         PathBuf::from("/run/kache/pipe-pr-0123abcd")
     );
+}
+
+#[test]
+fn target_file_sharing_is_on_unless_turned_off() {
+    let _lock = config_path_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("config.toml");
+    let _config = set_kache_config_for_test(&config_path);
+    let _share = NamedEnvGuard::remove("KACHE_AUTO_SHARE_TARGET_FILES");
+    assert!(Config::load().unwrap().auto_share_target_files);
+
+    std::fs::write(&config_path, "[cache]\nauto_share_target_files = false\n").unwrap();
+    assert!(!Config::load().unwrap().auto_share_target_files);
+    let on = NamedEnvGuard::set("KACHE_AUTO_SHARE_TARGET_FILES", "1");
+    assert!(Config::load().unwrap().auto_share_target_files, "env wins");
+    drop(on);
+
+    std::fs::write(&config_path, "[cache]\nauto_share_target_files = true\n").unwrap();
+    for off in ["0", "false", "FALSE"] {
+        let _off = NamedEnvGuard::set("KACHE_AUTO_SHARE_TARGET_FILES", off);
+        assert!(!Config::load().unwrap().auto_share_target_files, "{off}");
+    }
+
+    std::fs::write(&config_path, "[cache]\nignore_env = true\n").unwrap();
+    let _ignored = NamedEnvGuard::set("KACHE_AUTO_SHARE_TARGET_FILES", "0");
+    assert!(Config::load().unwrap().auto_share_target_files);
 }

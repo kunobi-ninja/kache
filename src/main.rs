@@ -73,6 +73,7 @@ mod compiler_store;
 use compiler_store as store;
 mod store_view;
 mod target_cleanup;
+mod target_dedup;
 mod target_seed;
 mod target_use;
 mod test_runner;
@@ -132,7 +133,7 @@ pub const VERSION: &str = {
 #[derive(Parser)]
 #[command(name = "kache", version = VERSION, about)]
 pub(crate) struct Cli {
-    /// Machine-readable JSON on stdout (stats, gc, clean, doctor, why-miss, diff, list, daemon status)
+    /// Machine-readable JSON on stdout (stats, gc, clean, targets, doctor, why-miss, diff, list, daemon status)
     #[arg(long, global = true)]
     json: bool,
 
@@ -209,7 +210,11 @@ enum Commands {
 
     /// Show tracked target directories: what each holds on disk, what
     /// deleting it frees, and whether its worktree still exists
-    Targets,
+    #[command(subcommand_required = false)]
+    Targets {
+        #[command(subcommand)]
+        command: Option<TargetCommands>,
+    },
 
     /// Set up caching for Cargo and C/C++ builds
     Init {
@@ -434,6 +439,20 @@ enum Commands {
 }
 
 #[derive(Subcommand)]
+enum TargetCommands {
+    /// Share target files with blobs the store already holds
+    Share {
+        /// Clone each match from the stored blob. Without this, only report.
+        #[arg(long)]
+        apply: bool,
+
+        /// Target directories to read. Defaults to tracked directories.
+        #[arg(value_name = "TARGET")]
+        paths: Vec<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
 enum DaemonCommands {
     /// Show daemon status (alias for bare `kache daemon`)
     Status,
@@ -490,7 +509,7 @@ fn command_supports_json(command: &Option<Commands>) -> bool {
             Commands::List { .. }
                 | Commands::Gc { .. }
                 | Commands::Clean { .. }
-                | Commands::Targets
+                | Commands::Targets { .. }
                 | Commands::Doctor { .. }
                 | Commands::Stats { .. }
                 | Commands::WhyMiss { .. }
@@ -801,7 +820,7 @@ fn main() -> Result<()> {
     let json = cli.json;
     if json && !command_supports_json(&cli.command) {
         anyhow::bail!(
-            "`--json` is supported on stats, gc, clean, doctor, why-miss, diff, list, and daemon status."
+            "`--json` is supported on stats, gc, clean, targets, doctor, why-miss, diff, list, and daemon status."
         );
     }
 
@@ -888,7 +907,10 @@ fn main() -> Result<()> {
             };
             cli::clean(&config, dry_run, yes, json, selection)
         }
-        Some(Commands::Targets) => cli::targets(&config, json),
+        Some(Commands::Targets { command: None }) => cli::targets(&config, json),
+        Some(Commands::Targets {
+            command: Some(TargetCommands::Share { apply, paths }),
+        }) => target_dedup::run(&config, &paths, apply, json),
         Some(Commands::Init {
             yes,
             no_service,
@@ -1631,8 +1653,35 @@ mod tests {
     }
 
     #[test]
+    fn targets_share_is_a_subcommand() {
+        let list = Cli::try_parse_from(["kache", "targets"]).unwrap();
+        assert!(matches!(
+            list.command,
+            Some(Commands::Targets { command: None })
+        ));
+        let share =
+            Cli::try_parse_from(["kache", "targets", "share", "--apply", "target"]).unwrap();
+        assert!(matches!(
+            share.command,
+            Some(Commands::Targets {
+                command: Some(TargetCommands::Share { apply: true, ref paths })
+            }) if paths == &vec![PathBuf::from("target")]
+        ));
+        assert!(Cli::try_parse_from(["kache", "targets-dedup"]).is_err());
+    }
+
+    #[test]
     fn json_support_is_limited_to_machine_readable_commands() {
         assert!(command_supports_json(&Some(Commands::Diff { root: None })));
+        assert!(command_supports_json(&Some(Commands::Targets {
+            command: None
+        })));
+        assert!(command_supports_json(&Some(Commands::Targets {
+            command: Some(TargetCommands::Share {
+                apply: false,
+                paths: Vec::new(),
+            }),
+        })));
         assert!(command_supports_json(&Some(Commands::Stats {
             since: "24h".to_string(),
             last_build: false,

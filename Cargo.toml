@@ -102,6 +102,9 @@ regex = { version = "1", default-features = false, features = ["std", "perf"] }
 regex-automata = { version = "0.4", default-features = false, features = ["std", "syntax", "meta", "nfa-pikevm"] }
 
 [target.'cfg(windows)'.dependencies]
+# `#[mutants::skip]` on the Win32 volume query. The attribute is a no-op;
+# cargo-mutants reads it so a body Linux never compiles is not a survivor.
+mutants = "0.0.4"
 # Use the same Visual Studio and Windows SDK discovery path as Rust build
 # tooling, including shells where VsDevCmd has not populated PATH/LIB.
 find-msvc-tools = "0.1.12"

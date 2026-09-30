@@ -479,6 +479,12 @@ pub struct Config {
     /// Set via `KACHE_AUTO_CLEAN_ORPHANED_TARGETS=0`/`=false` or `[cache]
     /// auto_clean_orphaned_targets = false` to disable.
     pub auto_clean_orphaned_targets: bool,
+    /// Let the daemon replace, on a quiet machine, target files that are full
+    /// copies of blobs the store already holds with clones of those blobs.
+    /// On by default. Set via `KACHE_AUTO_SHARE_TARGET_FILES=0`/`=false` or
+    /// `[cache] auto_share_target_files = false` to disable. `kache targets
+    /// share --apply` works either way.
+    pub auto_share_target_files: bool,
     /// Let the daemon also remove tracked target directories no build has
     /// used for this many days (default `0`, disabled). Set via
     /// `KACHE_AUTO_CLEAN_IDLE_TARGETS_DAYS` or `[cache]
@@ -830,6 +836,8 @@ pub(crate) struct CacheFileConfig {
     pub(crate) index_auto_compact: Option<bool>,
     /// See [`Config::auto_clean_orphaned_targets`].
     pub(crate) auto_clean_orphaned_targets: Option<bool>,
+    /// See [`Config::auto_share_target_files`].
+    pub(crate) auto_share_target_files: Option<bool>,
     /// See [`Config::auto_clean_idle_targets_days`].
     pub(crate) auto_clean_idle_targets_days: Option<u64>,
     /// See [`Config::auto_recover_min_free_bytes`].
@@ -1249,6 +1257,7 @@ const IGNORE_ENV_GATED_VARS: &[&str] = &[
     "KACHE_AUTO_GC",
     "KACHE_INDEX_AUTO_COMPACT",
     "KACHE_AUTO_CLEAN_ORPHANED_TARGETS",
+    "KACHE_AUTO_SHARE_TARGET_FILES",
     "KACHE_AUTO_CLEAN_IDLE_TARGETS_DAYS",
     "KACHE_AUTO_RECOVER_MIN_FREE_BYTES",
     "KACHE_SCHEDULER_MEMORY_PRESSURE",
@@ -1349,6 +1358,10 @@ const ENV_FILE_KEYS: &[(&str, &str)] = &[
     (
         "KACHE_AUTO_CLEAN_ORPHANED_TARGETS",
         "cache.auto_clean_orphaned_targets",
+    ),
+    (
+        "KACHE_AUTO_SHARE_TARGET_FILES",
+        "cache.auto_share_target_files",
     ),
     (
         "KACHE_AUTO_CLEAN_IDLE_TARGETS_DAYS",
@@ -1918,6 +1931,7 @@ impl Config {
         let auto_gc = Self::auto_gc_enabled(&file_config);
         let index_auto_compact = Self::index_auto_compact_enabled(&file_config);
         let auto_clean_orphaned_targets = Self::auto_clean_orphaned_targets_enabled(&file_config);
+        let auto_share_target_files = Self::auto_share_target_files_enabled(&file_config);
         let auto_clean_idle_targets_days = Self::auto_clean_idle_targets_days(&file_config);
         let auto_recover_min_free_bytes = Self::auto_recover_min_free_bytes(&file_config);
         let scheduler_memory_pressure = Self::scheduler_memory_pressure_enabled(&file_config);
@@ -2016,6 +2030,7 @@ impl Config {
             auto_gc,
             index_auto_compact,
             auto_clean_orphaned_targets,
+            auto_share_target_files,
             auto_clean_idle_targets_days,
             auto_recover_min_free_bytes,
             scheduler_memory_pressure,
@@ -2606,6 +2621,22 @@ impl Config {
             .ok()
             .and_then(|c| c.cache.as_ref())
             .and_then(|c| c.auto_clean_orphaned_targets)
+            .unwrap_or(true)
+    }
+
+    /// Target-file sharing, on by default.
+    /// `KACHE_AUTO_SHARE_TARGET_FILES=0`/`=false` (env wins), else
+    /// `[cache] auto_share_target_files`, else on.
+    fn auto_share_target_files_enabled(file_config: &Result<FileConfig>) -> bool {
+        let ignore_env = Self::ignore_env_enabled(file_config);
+        if let Ok(v) = env_or_ignored("KACHE_AUTO_SHARE_TARGET_FILES", ignore_env) {
+            return v != "0" && !v.eq_ignore_ascii_case("false");
+        }
+        file_config
+            .as_ref()
+            .ok()
+            .and_then(|c| c.cache.as_ref())
+            .and_then(|c| c.auto_share_target_files)
             .unwrap_or(true)
     }
 

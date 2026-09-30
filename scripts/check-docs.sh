@@ -57,7 +57,10 @@ for page in pages:
         errors.append(f"{page}: upstream links must use /docs/...; kunobi-web adds the /kache product slug")
 
 main = root.joinpath("src/main.rs").read_text()
-command_block = main.split("enum Commands {", 1)[1].split("enum DaemonCommands", 1)[0]
+after_commands = main.split("enum Commands {", 1)[1]
+# TargetCommands is declared before DaemonCommands. Stopping at DaemonCommands
+# treats `Share` as a top-level command and demands `kache share`.
+command_block = after_commands.split("\n}\n", 1)[0]
 variants = re.findall(r"^    ([A-Z][A-Za-z0-9]+)(?:\s*\{|,)", command_block, re.MULTILINE)
 
 def kebab(name: str) -> str:

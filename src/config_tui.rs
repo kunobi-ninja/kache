@@ -1965,6 +1965,7 @@ mod tests {
                 auto_gc: None,
                 index_auto_compact: None,
                 auto_clean_orphaned_targets: None,
+                auto_share_target_files: None,
                 auto_clean_idle_targets_days: None,
                 auto_recover_min_free_bytes: None,
                 scheduler_memory_pressure: None,

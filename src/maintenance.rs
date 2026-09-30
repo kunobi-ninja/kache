@@ -5,7 +5,9 @@
 //! the compaction after it returns their pages to the disk. Both hold the
 //! index write lock while they work, so both wait for a moment with no build.
 //! Last, [`crate::target_cleanup`] removes target directories the
-//! configuration no longer wants kept.
+//! configuration no longer wants kept. When that sweep did not run, and the
+//! index was not repaired or compacted, [`crate::target_dedup`] may clone a
+//! stored blob over an old target file that holds a full copy of it.
 
 use crate::config::Config;
 use std::sync::Arc;
@@ -96,16 +98,48 @@ pub(crate) fn unix_now_secs() -> u64 {
 }
 
 /// One maintenance pass. Blocking: call from `spawn_blocking`. The steps log
-/// their own failures; one failing does not stop the other.
+/// their own failures; one failing does not stop the other. The dedup slice
+/// runs only when the earlier steps left the gap free.
 pub(crate) fn run(config: &Config, trigger: Trigger<'_>) {
-    crate::blob_heal::run(config, trigger);
-    crate::index_compact::run(config, trigger);
-    crate::target_cleanup::run(config, trigger);
+    let heal = crate::blob_heal::run(config, trigger);
+    let compact = crate::index_compact::run(config, trigger);
+    let cleaned = crate::target_cleanup::run(config, trigger);
+    if gap_still_free(heal.as_ref(), compact.as_ref(), cleaned) {
+        crate::target_dedup::idle_slice(config, trigger);
+    }
+}
+
+/// The clone slice waits for a check that did not already rewrite the index
+/// or walk targets. A skipped or busy index still counts as free: those
+/// returns are a few queries. An error does not.
+fn gap_still_free(
+    heal: Option<&crate::blob_heal::Outcome>,
+    compact: Option<&crate::index_compact::Outcome>,
+    cleaned: bool,
+) -> bool {
+    !cleaned && heal.is_some_and(heal_left_the_gap) && compact.is_some_and(compact_left_the_gap)
+}
+
+fn heal_left_the_gap(outcome: &crate::blob_heal::Outcome) -> bool {
+    matches!(
+        outcome,
+        crate::blob_heal::Outcome::NotNeeded
+            | crate::blob_heal::Outcome::Skipped(_)
+            | crate::blob_heal::Outcome::IndexBusy
+    )
+}
+
+fn compact_left_the_gap(outcome: &crate::index_compact::Outcome) -> bool {
+    matches!(
+        outcome,
+        crate::index_compact::Outcome::NotNeeded | crate::index_compact::Outcome::Skipped(_)
+    )
 }
 
 /// Check shortly after daemon start, then every few minutes. A check that
 /// finds nothing to do costs two index opens, one aggregate query over the
-/// blob tables and three PRAGMAs.
+/// blob tables and three PRAGMAs. With `auto_share_target_files` on, a quiet
+/// check also runs one short clone slice over the tracked targets.
 pub(crate) fn spawn_periodic(
     config: Config,
     clock: Arc<RequestClock>,
@@ -209,5 +243,48 @@ mod tests {
         let age = Trigger::Periodic(&idle).idle_for();
         assert!(age >= 2 * QUIET_AFTER && age < 3 * QUIET_AFTER, "{age:?}");
         assert_eq!(Trigger::Shutdown.idle_for(), Duration::MAX);
+    }
+
+    #[test]
+    fn dedup_waits_for_a_check_that_did_not_already_work() {
+        let idle_heal = crate::blob_heal::Outcome::NotNeeded;
+        let idle_compact = crate::index_compact::Outcome::NotNeeded;
+        assert!(gap_still_free(Some(&idle_heal), Some(&idle_compact), false));
+        assert!(!gap_still_free(None, Some(&idle_compact), false));
+        assert!(!gap_still_free(Some(&idle_heal), None, false));
+        assert!(!gap_still_free(Some(&idle_heal), Some(&idle_compact), true));
+
+        let healed = crate::blob_heal::Outcome::Healed {
+            probe: crate::store::BlobRefcountDrift::default(),
+            removed: 0,
+            repaired: crate::store::BlobIndexDrift::default(),
+            swept: None,
+            elapsed: Duration::ZERO,
+        };
+        assert!(!gap_still_free(Some(&healed), Some(&idle_compact), false));
+        let failed = crate::blob_heal::Outcome::Failed {
+            reason: "unreadable".to_string(),
+        };
+        assert!(!gap_still_free(Some(&failed), Some(&idle_compact), false));
+        let compacted = crate::index_compact::Outcome::Attempted {
+            mode: crate::index_compact::Mode::Quiet,
+            result: crate::cache_key::IndexCompaction::NotNeeded,
+            elapsed: Duration::ZERO,
+        };
+        assert!(!gap_still_free(Some(&idle_heal), Some(&compacted), false));
+
+        let skipped_heal = crate::blob_heal::Outcome::Skipped(crate::blob_heal::SkipReason::Busy);
+        let skipped_compact =
+            crate::index_compact::Outcome::Skipped(crate::index_compact::SkipReason::Busy);
+        assert!(gap_still_free(
+            Some(&skipped_heal),
+            Some(&skipped_compact),
+            false
+        ));
+        assert!(gap_still_free(
+            Some(&crate::blob_heal::Outcome::IndexBusy),
+            Some(&idle_compact),
+            false
+        ));
     }
 }

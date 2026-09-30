@@ -391,22 +391,34 @@ fn sweep(target_dir: &Path, armed: Option<SystemTime>) -> Pruned {
     pruned
 }
 
+/// Cargo locks this process holds, released when dropped.
+struct Held(Vec<std::fs::File>);
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        // Closing our descriptor is insufficient if a concurrent fork still
+        // holds a duplicate. Release ownership before that child reaches exec.
+        for file in &self.0 {
+            let _ = file.unlock();
+        }
+    }
+}
+
 /// Take every Cargo lock of `profile` without waiting, creating any that is
 /// missing. `None` while a build holds one.
-fn hold(profile: &Path) -> Option<Vec<std::fs::File>> {
-    LOCKS
-        .iter()
-        .map(|name| {
-            let file = std::fs::OpenOptions::new()
-                .create(true)
-                .truncate(false)
-                .write(true)
-                .open(profile.join(name))
-                .ok()?;
-            file.try_lock().ok()?;
-            Some(file)
-        })
-        .collect()
+fn hold(profile: &Path) -> Option<Held> {
+    let mut held = Held(Vec::new());
+    for name in LOCKS {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(profile.join(name))
+            .ok()?;
+        file.try_lock().ok()?;
+        held.0.push(file);
+    }
+    Some(held)
 }
 
 /// Remove `parts` in order, stopping at the first failure.
@@ -827,8 +839,34 @@ mod tests {
             lock.lock().unwrap();
             assert_eq!(sweep(dir.path(), Some(ago(5))), Pruned::default(), "{name}");
             assert_eq!(units(&profile).len(), 2);
+            // A fork elsewhere in the suite can hold a duplicate past the drop.
+            lock.unlock().unwrap();
         }
         assert_eq!(sweep(dir.path(), Some(ago(5))).units, 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn released_locks_are_free_while_a_fork_holds_a_duplicate() {
+        let dir = tempfile::tempdir().unwrap();
+        let held = hold(dir.path()).unwrap();
+        // SAFETY: the child only waits in `pause` until the parent kills it.
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork failed");
+        if child == 0 {
+            loop {
+                // SAFETY: async-signal-safe; nothing else runs in the child.
+                unsafe { libc::pause() };
+            }
+        }
+        drop(held);
+        let free = hold(dir.path()).is_some();
+        // SAFETY: `child` is this test's own child process.
+        unsafe {
+            libc::kill(child, libc::SIGKILL);
+            libc::waitpid(child, std::ptr::null_mut(), 0);
+        }
+        assert!(free, "the child's duplicate kept a lock held");
     }
 
     #[test]

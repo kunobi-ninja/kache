@@ -517,15 +517,27 @@ mod tests {
             .unwrap()
     }
 
+    /// Whether `dir`'s filesystem is mounted `noatime`.
+    #[cfg(target_os = "linux")]
+    fn mounted_noatime(dir: &Path) -> bool {
+        use std::os::unix::ffi::OsStrExt;
+        let path = std::ffi::CString::new(dir.as_os_str().as_bytes()).unwrap();
+        // SAFETY: statvfs is plain old data; all-zero bytes are a valid value.
+        let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+        // SAFETY: `path` is NUL-terminated and `stat` is a valid out pointer.
+        assert_eq!(unsafe { libc::statvfs(path.as_ptr(), &mut stat) }, 0);
+        stat.f_flag & libc::ST_NOATIME != 0
+    }
+
     #[test]
     fn probes_whether_reads_move_an_armed_access_time() {
         let dir = tempfile::tempdir().unwrap();
         let visible = reads_visible(dir.path());
-        // Linux's `relatime` shows reads. NTFS usually does not update last
+        // Linux's `relatime` shows reads and `noatime` hides them, so the
+        // probe must agree with the mount. NTFS usually does not update last
         // access times, and some macOS volumes do not either.
-        if cfg!(target_os = "linux") {
-            assert!(visible);
-        }
+        #[cfg(target_os = "linux")]
+        assert_eq!(visible, !mounted_noatime(dir.path()));
         assert!(entries(dir.path()).is_empty(), "the probe is removed");
         assert!(!reads_visible(&dir.path().join("missing")));
         let armed = filetime::FileTime::from_unix_time(1_000, 0);

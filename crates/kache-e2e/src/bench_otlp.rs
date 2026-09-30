@@ -109,6 +109,12 @@ pub struct OtlpPhase {
     /// A reason that passes through a thousand 20 ms preprocessor runs costs
     /// less than one that passes through a single 100 s compile.
     pub passthrough_reasons: Vec<(String, u64, u64)>,
+    /// How busy the host was while this phase built, when it was measured.
+    ///
+    /// The runners are shared, and the same build has taken 30 to 50 percent
+    /// longer on a loaded node. Without this beside the wall clock, a slow
+    /// night and a regression are the same number.
+    pub load: Option<crate::bench_host::PhaseLoad>,
 }
 
 impl OtlpRun {
@@ -188,6 +194,10 @@ fn metrics_for(run: &OtlpRun) -> Vec<Value> {
     let mut passthrough_points = Vec::new();
     let mut reason_compile_points = Vec::new();
     let mut reason_time_points = Vec::new();
+    let mut load_points = Vec::new();
+    let mut cpu_pressure_points = Vec::new();
+    let mut io_pressure_points = Vec::new();
+    let mut memory_pressure_points = Vec::new();
 
     for phase in &run.phases {
         let phase_attrs = common_attrs(run, Some(phase.name));
@@ -266,6 +276,26 @@ fn metrics_for(run: &OtlpRun) -> Vec<Value> {
             &run.time_unix_nano,
             &phase_attrs,
         ));
+        if let Some(load) = &phase.load {
+            // The load the build walked into, not the one it left behind: by
+            // the end, the one-minute average is mostly the build itself.
+            if let Some([one_minute, _, _]) = load.loadavg_start {
+                load_points.push(as_double(one_minute, &run.time_unix_nano, &phase_attrs));
+            }
+            for (points, stalled_us) in [
+                (&mut cpu_pressure_points, load.cpu_pressure_some_us),
+                (&mut io_pressure_points, load.io_pressure_some_us),
+                (&mut memory_pressure_points, load.memory_pressure_some_us),
+            ] {
+                if let Some(stalled_us) = stalled_us {
+                    points.push(as_double(
+                        stalled_us as f64 / 1_000_000.0,
+                        &run.time_unix_nano,
+                        &phase_attrs,
+                    ));
+                }
+            }
+        }
     }
 
     metrics.push(gauge("kache.bench.build.duration", "s", duration_points));
@@ -305,6 +335,20 @@ fn metrics_for(run: &OtlpRun) -> Vec<Value> {
         )],
     ));
     metrics.push(gauge("kache.bench.objdir.size", "By", objdir_points));
+    for (name, unit, points) in [
+        ("kache.bench.host.load", "{thread}", load_points),
+        ("kache.bench.host.pressure.cpu", "s", cpu_pressure_points),
+        ("kache.bench.host.pressure.io", "s", io_pressure_points),
+        (
+            "kache.bench.host.pressure.memory",
+            "s",
+            memory_pressure_points,
+        ),
+    ] {
+        if !points.is_empty() {
+            metrics.push(gauge(name, unit, points));
+        }
+    }
     if !miss_cost_points.is_empty() {
         metrics.push(gauge("kache.bench.miss.cost", "s", miss_cost_points));
     }
@@ -472,6 +516,7 @@ mod tests {
                     unconsulted: Some(3),
                     passthrough: Vec::new(),
                     passthrough_reasons: Vec::new(),
+                    load: None,
                 },
                 OtlpPhase {
                     name: "warm",
@@ -498,6 +543,7 @@ mod tests {
                         188,
                         412_000,
                     )],
+                    load: None,
                 },
             ],
         }
@@ -554,6 +600,48 @@ mod tests {
             }
         }
         keys
+    }
+
+    #[test]
+    fn host_load_is_reported_beside_the_phase_it_was_measured_in() {
+        let mut run = kache_run();
+        // Cold has no reading; warm has CPU and memory pressure but no IO
+        // counter, as on a kernel that exposes only part of PSI.
+        run.phases[1].load = Some(crate::bench_host::PhaseLoad {
+            cpu_pressure_some_us: Some(2_500_000),
+            io_pressure_some_us: None,
+            memory_pressure_some_us: Some(0),
+            loadavg_start: Some([12.5, 9.0, 8.0]),
+            loadavg_end: Some([40.0, 20.0, 10.0]),
+        });
+        let body = serialize_metrics(&run);
+
+        let load = metric(&body, "kache.bench.host.load");
+        assert_eq!(load["unit"], "{thread}");
+        let points = load["gauge"]["dataPoints"].as_array().unwrap();
+        assert_eq!(points.len(), 1);
+        assert_eq!(points[0]["asDouble"], 12.5);
+        assert_eq!(attr_map(&points[0])["kache.bench.phase"], "warm");
+
+        let cpu = metric(&body, "kache.bench.host.pressure.cpu");
+        assert_eq!(cpu["unit"], "s");
+        assert_eq!(cpu["gauge"]["dataPoints"][0]["asDouble"], 2.5);
+        // A measured zero is a reading; a missing counter is not.
+        let memory = metric(&body, "kache.bench.host.pressure.memory");
+        assert_eq!(memory["gauge"]["dataPoints"][0]["asDouble"], 0.0);
+        assert!(!names(&body).contains(&"kache.bench.host.pressure.io"));
+    }
+
+    #[test]
+    fn a_run_without_load_readings_emits_no_host_metrics() {
+        let body = serialize_metrics(&kache_run());
+        assert!(
+            names(&body)
+                .iter()
+                .all(|name| !name.starts_with("kache.bench.host.")),
+            "{:?}",
+            names(&body)
+        );
     }
 
     #[test]
@@ -731,6 +819,7 @@ mod tests {
             unconsulted: None,
             passthrough: Vec::new(),
             passthrough_reasons: Vec::new(),
+            load: None,
         }];
         let body = serialize_metrics(&run);
         let duration = &metric(&body, "kache.bench.build.duration")["gauge"]["dataPoints"][0];
@@ -770,6 +859,7 @@ mod tests {
                 unconsulted: None,
                 passthrough: Vec::new(),
                 passthrough_reasons: Vec::new(),
+                load: None,
             }],
         };
         let body = serialize_metrics(&run);

@@ -1111,6 +1111,7 @@ fn otlp_phase(
                 .total
                 .saturating_sub(metrics.event_log.cached),
         ),
+        load: Some(metrics.load.clone()),
     }
 }
 
@@ -1139,6 +1140,9 @@ fn otlp_sccache_phase(
         // count of what it looked at without consulting the cache.
         top_misses: Vec::new(),
         unconsulted: None,
+        // Not carried for this arm yet; the kache arm of the same job reports
+        // the node it shared.
+        load: None,
     }
 }
 
@@ -3277,6 +3281,7 @@ fn otlp_mbx_phase(
         // No per-unit cost in its report.
         top_misses: Vec::new(),
         unconsulted: Some(metrics.unconsulted),
+        load: None,
     }
 }
 

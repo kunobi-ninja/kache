@@ -214,7 +214,10 @@ pub fn run(config: &Config, paths: &[PathBuf], apply: bool, json: bool) -> Resul
     let roots = resolve_roots(config, paths)?;
     let mut totals = Report::new(roots.len());
     if roots.is_empty() {
-        return present(&totals, apply, json);
+        for line in present(&totals, apply, json)? {
+            println!("{line}");
+        }
+        return Ok(());
     }
     let store_dir = config.store_dir();
     let store = crate::store::Store::open(config)?;
@@ -224,7 +227,7 @@ pub fn run(config: &Config, paths: &[PathBuf], apply: bool, json: bool) -> Resul
         examine: usize::MAX,
         ends: usize::MAX,
         hashes: usize::MAX,
-        budget: Duration::from_secs(24 * 3600),
+        budget: Duration::from_secs(86_400),
     };
     // The command walks until the cursor comes back around. Each pass is
     // still the same stages; the loop only continues a cursor.
@@ -245,7 +248,10 @@ pub fn run(config: &Config, paths: &[PathBuf], apply: bool, json: bool) -> Resul
             break;
         }
     }
-    present(&totals, apply, json)
+    for line in present(&totals, apply, json)? {
+        println!("{line}");
+    }
+    Ok(())
 }
 
 /// One idle slice over the tracked targets, when `auto_share_target_files`
@@ -300,12 +306,8 @@ pub(crate) fn idle_slice(config: &Config, trigger: Trigger<'_>) {
             if report.exhausted {
                 db.mark_cycle(unix_now());
             }
-            if report.replaced > 0 {
-                tracing::info!(
-                    "cloned {} stored artifacts into old target directories (about {} now shared)",
-                    report.replaced,
-                    bytesize::ByteSize(report.matched_bytes),
-                );
+            if let Some(note) = share_note(report.replaced, report.matched_bytes) {
+                tracing::info!("{note}");
             }
         }
         Err(error) => tracing::warn!("target dedup slice failed: {error:#}"),
@@ -333,7 +335,18 @@ fn fold(totals: &mut Report, report: &Report) {
     totals.exhausted = report.exhausted;
 }
 
-fn present(report: &Report, apply: bool, json: bool) -> Result<()> {
+/// One line of the text report. `None` when nothing was rewritten.
+fn share_note(replaced: usize, matched_bytes: u64) -> Option<String> {
+    if replaced == 0 {
+        return None;
+    }
+    Some(format!(
+        "cloned {replaced} stored artifacts into old target directories (about {} now shared)",
+        bytesize::ByteSize(matched_bytes),
+    ))
+}
+
+fn present(report: &Report, apply: bool, json: bool) -> Result<Vec<String>> {
     if json {
         #[derive(serde::Serialize)]
         struct Body {
@@ -352,7 +365,7 @@ fn present(report: &Report, apply: bool, json: bool) -> Result<()> {
             skipped_busy: usize,
             applied: bool,
         }
-        return crate::machine::emit(
+        crate::machine::emit(
             "targets-share",
             Body {
                 targets: report.targets,
@@ -371,12 +384,10 @@ fn present(report: &Report, apply: bool, json: bool) -> Result<()> {
                 applied: apply,
             },
             Vec::new(),
-        );
+        )?;
+        return Ok(Vec::new());
     }
-    for line in render(report, apply) {
-        println!("{line}");
-    }
-    Ok(())
+    Ok(render(report, apply))
 }
 
 fn render(report: &Report, apply: bool) -> Vec<String> {
@@ -560,9 +571,12 @@ fn consider(
     report: &mut Report,
 ) -> Result<Consider> {
     let meta = match fs::symlink_metadata(path) {
-        Ok(meta) if meta.is_file() => meta,
-        _ => return Ok(Consider::Done),
+        Ok(meta) => meta,
+        Err(_) => return Ok(Consider::Done),
     };
+    if !meta.is_file() {
+        return Ok(Consider::Done);
+    }
     let relative = path.strip_prefix(root).unwrap_or(path);
     if !candidate(relative, meta.len()) {
         return Ok(Consider::Done);
@@ -873,7 +887,12 @@ fn device_of(path: &Path, meta: &fs::Metadata) -> Option<u64> {
 
 /// Volume serial of `path`, including a directory. `None` when the file cannot
 /// be opened or the query fails.
+///
+/// The Win32 call is not in the Linux mutation binary. Skipping it here keeps
+/// a replaced body from being reported as a survivor of tests that never
+/// compiled it.
 #[cfg(windows)]
+#[mutants::skip]
 fn windows_volume_serial(path: &Path) -> Option<u64> {
     use std::os::windows::fs::OpenOptionsExt;
     use std::os::windows::io::AsRawHandle;
@@ -909,7 +928,7 @@ fn cursor_before_root(cursor: &str, root: &Path) -> bool {
         return true;
     }
     let root = root.to_string_lossy();
-    path_holds(root.as_ref(), cursor) || cursor < root.as_ref()
+    path_still_ahead(root.as_ref(), cursor)
 }
 
 fn dir_may_contain(dir: &Path, cursor: &str) -> bool {
@@ -917,7 +936,19 @@ fn dir_may_contain(dir: &Path, cursor: &str) -> bool {
         return true;
     }
     let dir = dir.to_string_lossy();
-    path_holds(dir.as_ref(), cursor) || cursor < dir.as_ref()
+    path_still_ahead(dir.as_ref(), cursor)
+}
+
+/// `cursor` is inside `dir`, or a path that sorts at or before `dir`.
+///
+/// Equality has to reach the comparison. `path_holds` is already true when
+/// the strings are equal, and a strict `<` beside that check is the same
+/// either way.
+fn path_still_ahead(dir: &str, cursor: &str) -> bool {
+    if cursor != dir && path_holds(dir, cursor) {
+        return true;
+    }
+    cursor <= dir
 }
 
 fn path_holds(dir: &str, cursor: &str) -> bool {
@@ -932,19 +963,9 @@ fn path_holds(dir: &str, cursor: &str) -> bool {
 }
 
 fn path_separator(byte: u8) -> bool {
-    if byte == b'/' {
-        return true;
-    }
-    // Windows records `Path` with `\`. A `/`-only check skips the directory
-    // that still contains the cursor, so the next slice never sees it.
-    #[cfg(windows)]
-    {
-        return byte == b'\\';
-    }
-    #[cfg(not(windows))]
-    {
-        false
-    }
+    // `\` separates paths only where `Path` does. Both checks are compiled
+    // everywhere: a Windows-only `==` never changes the Linux mutation binary.
+    matches!(byte, b'/') || cfg!(windows) && matches!(byte, b'\\')
 }
 
 /// Collect up to `limit` candidate files strictly after `cursor`. `true` means
@@ -2050,5 +2071,235 @@ mod tests {
             &mut |_| true,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn share_note_names_only_a_rewrite() {
+        assert_eq!(share_note(0, 4096), None);
+        let note = share_note(2, 4096).unwrap();
+        assert!(note.starts_with("cloned 2 stored artifacts"), "{note}");
+        assert!(note.contains("shared"), "{note}");
+    }
+
+    #[test]
+    fn present_returns_the_text_report() {
+        let mut report = Report::new(2);
+        report.examined = 4;
+        report.failed = 1;
+        let text = present(&report, true, false).unwrap().join("\n");
+        assert!(
+            text.contains("2 target directories, 4 files examined"),
+            "{text}"
+        );
+        assert!(text.contains("replaced 0 files, 1 failed"), "{text}");
+        report.failed = 0;
+        let quiet = present(&report, true, false).unwrap().join("\n");
+        assert!(!quiet.contains("replaced"), "{quiet}");
+    }
+
+    #[test]
+    fn resolve_roots_keeps_the_directory_it_was_given() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::test_support::test_config(dir.path().join("cache"));
+        let root = dir.path().join("target");
+        fs::create_dir_all(&root).unwrap();
+        let resolved = resolve_roots(&config, std::slice::from_ref(&root)).unwrap();
+        assert_eq!(resolved, vec![std::path::absolute(&root).unwrap()]);
+        let file = root.join("lib.rlib");
+        fs::write(&file, b"x").unwrap();
+        let err = resolve_roots(&config, &[file]).unwrap_err().to_string();
+        assert!(err.contains("not a directory"), "{err}");
+    }
+
+    #[test]
+    fn share_command_opens_the_pipeline_for_a_target() {
+        let cache = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let config = crate::test_support::test_config(cache.path().to_path_buf());
+        let target = track(&config, workspace.path());
+        run(&config, &[target], false, false).unwrap();
+        assert!(cache.path().join(DB_FILE).is_file());
+    }
+
+    #[test]
+    fn separators_are_slash_and_the_platform_separator() {
+        assert!(path_separator(b'/'));
+        assert!(!path_separator(b'a'));
+        if std::path::MAIN_SEPARATOR == '\\' {
+            assert!(path_separator(b'\\'));
+        } else {
+            assert!(!path_separator(b'\\'));
+        }
+    }
+
+    #[test]
+    fn the_cursor_keeps_a_directory_that_can_still_hold_a_later_file() {
+        let root = Path::new("/work/z");
+        assert!(cursor_before_root("", root));
+        assert!(cursor_before_root("/work/z", root));
+        assert!(cursor_before_root("/work/a", root));
+        assert!(cursor_before_root("/work/z/debug/lib.rlib", root));
+        assert!(!cursor_before_root("/work/zz", root));
+
+        let dir = Path::new("/work/z/debug");
+        assert!(dir_may_contain(dir, ""));
+        assert!(dir_may_contain(dir, "/work/z/debug"));
+        assert!(dir_may_contain(dir, "/work/a"));
+        assert!(dir_may_contain(dir, "/work/z/debug/lib.rlib"));
+        assert!(!dir_may_contain(dir, "/work/z/debug2"));
+    }
+
+    #[test]
+    fn candidates_after_the_cursor_stop_when_the_tree_ends() {
+        let root = tempfile::tempdir().unwrap();
+        // One directory under the root, so the recursive return reaches the caller.
+        let deps = root.path().join("deps");
+        fs::create_dir_all(&deps).unwrap();
+        let body = bytes(MIN_BYTES as usize, 1);
+        let first = deps.join("a.rlib");
+        let second = deps.join("b.rlib");
+        fs::write(&first, &body).unwrap();
+        fs::write(&second, &body).unwrap();
+
+        let mut found = Vec::new();
+        assert!(collect_candidates(root.path(), "", 10, &mut found));
+        assert_eq!(found.len(), 2, "{found:?}");
+
+        let cursor = first.to_string_lossy().into_owned();
+        let mut later = Vec::new();
+        assert!(collect_candidates(root.path(), &cursor, 10, &mut later));
+        assert_eq!(later.len(), 1, "{later:?}");
+        assert_eq!(later[0], second);
+    }
+
+    #[test]
+    fn a_short_file_is_rejected_before_its_ends_are_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("short.rlib");
+        fs::write(&path, [1, 2, 3]).unwrap();
+        let Err(err) = read_ends(&path) else {
+            panic!("a short file has no block ends");
+        };
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("shorter"), "{err}");
+    }
+
+    #[test]
+    fn temporary_clone_paths_skip_names_already_taken() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("lib.rlib");
+        let first = temporary_path(dir.path(), &dest).unwrap();
+        assert_eq!(
+            first.file_name().unwrap(),
+            std::ffi::OsStr::new(".lib.rlib.kache-dedup")
+        );
+        fs::write(&first, b"x").unwrap();
+        let second = temporary_path(dir.path(), &dest).unwrap();
+        assert_eq!(
+            second.file_name().unwrap(),
+            std::ffi::OsStr::new(".lib.rlib.kache-dedup-1")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_clone_with_the_right_ends_and_the_wrong_length_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.rlib");
+        let dest = dir.path().join("dest.rlib");
+        let body = bytes(8192, 7);
+        fs::write(&source, &body).unwrap();
+        fs::write(&dest, &body).unwrap();
+        let err = replace_with(&source, &dest, &mut |_from, to| {
+            let mut wrong = bytes(4096, 7);
+            wrong.extend(bytes(8192, 1));
+            wrong.extend(bytes(4096, 7));
+            fs::write(to, wrong)?;
+            Ok(())
+        });
+        assert!(err.is_err(), "a longer clone is not the source");
+        assert_eq!(fs::read(&dest).unwrap(), body);
+    }
+
+    #[test]
+    fn the_pipeline_remembers_the_cursor_and_pauses_after_a_cycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = PipelineDb::open(dir.path()).unwrap();
+        assert_eq!(db.cursor(), "");
+        assert_eq!(db.meta("missing"), None);
+        db.set_meta("k", "v");
+        assert_eq!(db.meta("k").as_deref(), Some("v"));
+        db.set_cursor("target/debug/lib.rlib");
+        assert_eq!(db.cursor(), "target/debug/lib.rlib");
+
+        let now = 1_700_000_000;
+        assert!(!db.cycle_paused(now));
+        db.mark_cycle(now);
+        assert_eq!(db.meta("cycle_finished_at").as_deref(), Some("1700000000"));
+        assert!(db.cycle_paused(now));
+        assert!(db.cycle_paused(now + CYCLE_PAUSE.as_secs() - 1));
+        assert!(!db.cycle_paused(now + CYCLE_PAUSE.as_secs()));
+        assert!(unix_now() > 1_700_000_000);
+    }
+
+    #[test]
+    fn a_file_device_is_its_volume_not_a_constant() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lib.rlib");
+        fs::write(&path, b"abc").unwrap();
+        let meta = fs::metadata(&path).unwrap();
+        let device = device_of(&path, &meta);
+        assert_eq!(device_of_path(&path), device);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(device, Some(meta.dev()));
+            assert!(meta.dev() > 1, "dev {}", meta.dev());
+        }
+        assert_ne!(device, Some(0));
+        assert_ne!(device, Some(1));
+    }
+
+    #[test]
+    fn lock_profile_records_the_lock_it_takes() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("debug");
+        fs::create_dir(&profile).unwrap();
+        let mut held = HashMap::new();
+        assert!(lock_profile(&profile, &mut held).unwrap());
+        assert!(held.contains_key(&profile));
+        assert!(profile.join(".cargo-lock").is_file());
+    }
+
+    fn lock_held(path: &Path) -> File {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+            .unwrap();
+        file.try_lock().unwrap();
+        file
+    }
+
+    #[test]
+    fn a_locked_file_that_is_not_the_cargo_lock_does_not_block_the_walk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lib.rlib");
+        let _lock = lock_held(&path);
+        assert!(!another_build_holds(dir.path(), &HashMap::new()));
+    }
+
+    #[test]
+    fn a_cargo_lock_past_the_walk_depth_does_not_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut deep = dir.path().to_path_buf();
+        for name in ["a", "b", "c", "d", "e"] {
+            deep.push(name);
+        }
+        fs::create_dir_all(&deep).unwrap();
+        let _lock = lock_held(&deep.join(".cargo-lock"));
+        assert!(!another_build_holds(dir.path(), &HashMap::new()));
     }
 }

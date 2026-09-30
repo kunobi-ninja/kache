@@ -476,7 +476,10 @@ fn one_pass(
         }
         if apply && another_build_holds(root, &held) {
             report.skipped_busy = report.skipped_busy.saturating_add(1);
-            continue;
+            // A busy target is not a finished walk. Marking the cycle here
+            // would wait an hour before these files were considered again.
+            exhausted = false;
+            break;
         }
         let mut files = Vec::new();
         let room = limits.examine.saturating_sub(counters.examined);
@@ -876,7 +879,30 @@ fn dir_may_contain(dir: &Path, cursor: &str) -> bool {
 }
 
 fn path_holds(dir: &str, cursor: &str) -> bool {
-    cursor == dir || (cursor.starts_with(dir) && cursor.as_bytes().get(dir.len()) == Some(&b'/'))
+    let Some(rest) = cursor.strip_prefix(dir) else {
+        return false;
+    };
+    rest.is_empty()
+        || rest
+            .as_bytes()
+            .first()
+            .is_some_and(|&byte| path_separator(byte))
+}
+
+fn path_separator(byte: u8) -> bool {
+    if byte == b'/' {
+        return true;
+    }
+    // Windows records `Path` with `\`. A `/`-only check skips the directory
+    // that still contains the cursor, so the next slice never sees it.
+    #[cfg(windows)]
+    {
+        return byte == b'\\';
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
 }
 
 /// Collect up to `limit` candidate files strictly after `cursor`. `true` means
@@ -1212,7 +1238,10 @@ mod tests {
     }
 
     fn target_file(root: &Path, name: &str, body: &[u8]) -> PathBuf {
-        let deps = root.join("debug/deps");
+        // `join("debug/deps")` keeps the slash on Windows, while the walk
+        // records the backslash `read_dir` returns. The hash is keyed by that
+        // string, so the lookup has to use the same components.
+        let deps = root.join("debug").join("deps");
         fs::create_dir_all(&deps).unwrap();
         fs::write(
             root.join("CACHEDIR.TAG"),
@@ -1546,6 +1575,78 @@ mod tests {
                 "a volume that cannot clone leaves the copies"
             );
         }
+    }
+
+    #[test]
+    fn path_holds_stops_at_a_separator_and_accepts_the_directory_itself() {
+        assert!(path_holds("/work/target", "/work/target"));
+        assert!(path_holds(
+            "/work/target",
+            "/work/target/debug/deps/lib.rlib"
+        ));
+        assert!(!path_holds("/work/target", "/work/target2/debug"));
+        assert!(!path_holds("/work/target", "/elsewhere/target/debug"));
+        assert!(!path_holds("/work/target/debug", "/work/target"));
+        #[cfg(windows)]
+        {
+            assert!(path_holds(
+                r"C:\work\target",
+                r"C:\work\target\debug\deps\lib.rlib"
+            ));
+            assert!(!path_holds(r"C:\work\target", r"C:\work\target2\debug"));
+        }
+        #[cfg(not(windows))]
+        assert!(!path_holds("work", "work\\debug"));
+    }
+
+    #[test]
+    fn a_busy_target_does_not_finish_the_walk() {
+        let cache = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let config = crate::test_support::test_config(cache.path().to_path_buf());
+        let target = track(&config, workspace.path());
+        let body = bytes(MIN_BYTES as usize, 3);
+        write_blob(&config, &body);
+        target_file(&target, "libbusy.rlib", &body);
+        let lock_path = target.join("debug").join(".cargo-lock");
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .unwrap();
+        lock.try_lock().unwrap();
+
+        let store = crate::store::Store::open(&config).unwrap();
+        let roots = tracked_roots(&store).unwrap();
+        let found = index(&config);
+        let mut db = PipelineDb::open(&config.cache_dir).unwrap();
+        let report = one_pass(
+            &store,
+            &config.store_dir(),
+            &found,
+            &mut db,
+            &roots,
+            true,
+            &Limits {
+                examine: usize::MAX,
+                ends: usize::MAX,
+                hashes: usize::MAX,
+                budget: Duration::from_secs(60),
+            },
+            &mut |_| true,
+        )
+        .unwrap();
+        assert_eq!(report.skipped_busy, 1);
+        assert!(
+            !report.exhausted,
+            "a held cargo lock is retried, not finished"
+        );
+        assert_eq!(report.examined, 0);
+        assert_eq!(report.hashed, 0);
+        assert_eq!(db.cursor(), "");
+        drop(lock);
     }
 
     #[test]

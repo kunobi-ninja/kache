@@ -1163,7 +1163,7 @@ impl Run {
         let manifest: Manifest =
             serde_json::from_slice(&std::fs::read(self.store.blob_path(&manifest.hash))?)?;
         anyhow::ensure!(
-            matches!(manifest.version, 1 | 2),
+            matches!(manifest.version, 1..=3),
             "unsupported build-script manifest"
         );
         let rewritten: BTreeSet<&str> = manifest.rewritten.iter().map(String::as_str).collect();
@@ -1221,6 +1221,9 @@ impl Run {
             std::fs::write(&target, b"")?;
             set_executable(&target, empty.executable)?;
         }
+        for symlink in &manifest.symlinks {
+            restore_symlink(out_dir, symlink)?;
+        }
         replay(
             &self.environment.denormalize(manifest.stdout.as_bytes()),
             &self.environment.denormalize(manifest.stderr.as_bytes()),
@@ -1262,6 +1265,7 @@ impl Run {
             files,
             directories: manifest_dirs,
             empty_files,
+            symlinks,
         } = collect_out_dir(&self.environment.out_dir)?;
         let staging = tempfile::Builder::new()
             .prefix("kache-build-script-")
@@ -1282,10 +1286,18 @@ impl Run {
         let key = self.action_key(&prediction)?;
         let key_ms = key_start.elapsed().as_millis() as u64;
         let manifest = Manifest {
-            // Version 1 readers would restore the placeholders verbatim.
-            version: if rewritten.is_empty() { 1 } else { 2 },
+            // Version 1 readers would restore the placeholders verbatim, and
+            // version 2 readers would leave the symlinks out.
+            version: if !symlinks.is_empty() {
+                3
+            } else if rewritten.is_empty() {
+                1
+            } else {
+                2
+            },
             directories: manifest_dirs,
             empty_files,
+            symlinks,
             stdout: String::from_utf8_lossy(&self.environment.normalize(stdout)).into_owned(),
             stderr: String::from_utf8_lossy(&self.environment.normalize(stderr)).into_owned(),
             rewritten,
@@ -1359,12 +1371,78 @@ struct Manifest {
     /// Files stored with their roots as placeholders (version 2).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     rewritten: Vec<String>,
+    /// Symlinks that stay inside `OUT_DIR` (version 3).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    symlinks: Vec<Symlink>,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct EmptyFile {
     name: String,
     executable: bool,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct Symlink {
+    name: String,
+    target: String,
+}
+
+/// Whether a symlink at `link`, relative to the root of a tree, resolves to
+/// `target` inside the tree whatever the other links in it point at:
+/// `target` is relative, climbs with leading `..` no higher than the root,
+/// and then only descends. A `..` after a name could climb out of a
+/// directory that is itself a link. The root itself is not inside.
+pub(crate) fn link_stays_inside(link: &Path, target: &Path) -> bool {
+    let Some(parent) = link.parent() else {
+        return false;
+    };
+    let depth = parent.components().count();
+    let mut climbed = 0;
+    let mut descended = false;
+    for component in target.components() {
+        match component {
+            std::path::Component::ParentDir if !descended => climbed += 1,
+            std::path::Component::Normal(_) => descended = true,
+            std::path::Component::CurDir => {}
+            _ => return false,
+        }
+    }
+    climbed <= depth
+}
+
+/// Create a recorded symlink under `out_dir`. `link_stays_inside` holds only
+/// when every directory above the link is a real directory, so a link whose
+/// path passes through an already restored link is refused.
+fn restore_symlink(out_dir: &Path, symlink: &Symlink) -> Result<()> {
+    let link = checked_relative(&symlink.name)?;
+    anyhow::ensure!(
+        link_stays_inside(link, Path::new(&symlink.target)),
+        "recorded build-script symlink leaves OUT_DIR: {} -> {}",
+        symlink.name,
+        symlink.target
+    );
+    let mut directory = out_dir.to_path_buf();
+    for component in link.parent().into_iter().flat_map(Path::components) {
+        directory.push(component);
+        anyhow::ensure!(
+            std::fs::symlink_metadata(&directory).is_ok_and(|metadata| metadata.is_dir()),
+            "recorded build-script symlink is not under a real directory of OUT_DIR: {} -> {}",
+            symlink.name,
+            symlink.target
+        );
+    }
+    let path = out_dir.join(link);
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(&symlink.target, &path)?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    anyhow::bail!(
+        "build-script symlinks are only restored on Unix: {}",
+        path.display()
+    )
 }
 
 /// Reject a recorded name that would escape `OUT_DIR`.
@@ -1394,17 +1472,20 @@ fn set_executable(path: &Path, executable: bool) -> Result<()> {
 }
 
 /// Every regular file under `OUT_DIR` as `(path, "out/<relative>")`, plus the
-/// directory list and the zero-byte files the store will not take as blobs.
+/// directory list, the zero-byte files the store will not take as blobs, and
+/// the symlinks.
 struct OutDirContents {
     files: Vec<(PathBuf, String)>,
     directories: Vec<String>,
     empty_files: Vec<EmptyFile>,
+    symlinks: Vec<Symlink>,
 }
 
 fn collect_out_dir(out_dir: &Path) -> Result<OutDirContents> {
     let mut files = Vec::new();
     let mut directories = Vec::new();
     let mut empty = Vec::new();
+    let mut symlinks = Vec::new();
     let mut total = 0u64;
     let mut pending = vec![out_dir.to_path_buf()];
     while let Some(directory) = pending.pop() {
@@ -1419,7 +1500,19 @@ fn collect_out_dir(out_dir: &Path) -> Result<OutDirContents> {
                 .replace(std::path::MAIN_SEPARATOR, "/");
             let metadata = std::fs::symlink_metadata(&path)?;
             if metadata.file_type().is_symlink() {
-                anyhow::bail!("OUT_DIR contains a symlink, which is not recorded");
+                let target = std::fs::read_link(&path)?;
+                anyhow::ensure!(
+                    link_stays_inside(Path::new(&relative), &target),
+                    "OUT_DIR contains a symlink that is absolute or leaves it: {relative} -> {}",
+                    target.display()
+                );
+                symlinks.push(Symlink {
+                    target: target
+                        .to_str()
+                        .context("OUT_DIR symlink target is not UTF-8")?
+                        .to_string(),
+                    name: relative,
+                });
             } else if metadata.is_dir() {
                 directories.push(relative);
                 pending.push(path);
@@ -1446,6 +1539,7 @@ fn collect_out_dir(out_dir: &Path) -> Result<OutDirContents> {
         files,
         directories,
         empty_files: empty,
+        symlinks,
     })
 }
 
@@ -2914,6 +3008,7 @@ mod tests {
             .get(&b.action_key(&prediction).unwrap())
             .unwrap()
             .expect("the same key in another target directory");
+        assert_eq!(stored_manifest(&b, &meta).version, 2);
         b.restore(&meta).unwrap();
         let out = &b.environment.out_dir;
         assert_eq!(
@@ -2921,6 +3016,189 @@ mod tests {
             pc(out)
         );
         assert_eq!(std::fs::read(out.join("lib/adler32.o")).unwrap(), object);
+    }
+
+    fn stored_manifest(run: &Run, meta: &EntryMeta) -> Manifest {
+        let manifest = meta
+            .files
+            .iter()
+            .find(|file| file.name == MANIFEST_NAME)
+            .unwrap();
+        serde_json::from_slice(&std::fs::read(run.store.blob_path(&manifest.hash)).unwrap())
+            .unwrap()
+    }
+
+    /// rdkafka-sys's `make libs` leaves `librdkafka.so -> librdkafka.so.1`
+    /// beside the library. The link is recorded, comes back as the same link
+    /// in another `OUT_DIR`, and the manifest is version 3, so a kache that
+    /// cannot restore links refuses it.
+    #[cfg(unix)]
+    #[test]
+    fn a_recorded_run_restores_its_symlinks_under_another_out_dir() {
+        let mut lock = crate::test_support::process_state_test_lock();
+        let dir = lock.enter();
+        let config = crate::test_support::test_config(dir.as_path().join("cache"));
+        let run_in = |target: &str| {
+            let environment =
+                checkout_environment(&dir.as_path().join(target), &dir.as_path().join("cargo"));
+            std::fs::create_dir_all(&environment.manifest_dir).unwrap();
+            std::fs::write(environment.manifest_dir.join("build.rs"), "fn main() {}").unwrap();
+            Run {
+                store: Store::open(&config).unwrap(),
+                config: config.clone(),
+                binary_hash: "aaaa".to_string(),
+                environment,
+                start: std::time::Instant::now(),
+            }
+        };
+        let a = run_in("a/target");
+        let out = &a.environment.out_dir;
+        std::fs::create_dir_all(out.join("src")).unwrap();
+        std::fs::write(out.join("src/librdkafka.so.1"), b"\x7fELF\0").unwrap();
+        std::os::unix::fs::symlink("librdkafka.so.1", out.join("src/librdkafka.so")).unwrap();
+        let after_the_run = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+        a.record(b"cargo:rerun-if-changed=build.rs\n", b"", 5, after_the_run)
+            .unwrap();
+
+        let b = run_in("b/target");
+        let prediction = b.prediction().unwrap().expect("the run was recorded");
+        let meta = b
+            .store
+            .get(&b.action_key(&prediction).unwrap())
+            .unwrap()
+            .expect("the same key in another target directory");
+        assert_eq!(
+            stored_manifest(&b, &meta).version,
+            3,
+            "older kache refuses what it would drop"
+        );
+        b.restore(&meta).unwrap();
+        let link = b.environment.out_dir.join("src/librdkafka.so");
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            std::fs::read_link(&link).unwrap(),
+            Path::new("librdkafka.so.1")
+        );
+        assert_eq!(std::fs::read(&link).unwrap(), b"\x7fELF\0");
+    }
+
+    /// `d/a -> ..` and `d/a/c -> ../x` each stay inside when every directory
+    /// above them is real, but the second, created through the first, is
+    /// `out/c -> ../x`. Recording never descends through a link, so only a
+    /// tampered manifest holds such a pair.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_under_a_restored_link_is_refused() {
+        let mut lock = crate::test_support::process_state_test_lock();
+        let dir = lock.enter();
+        let config = crate::test_support::test_config(dir.as_path().join("cache"));
+        let environment =
+            checkout_environment(&dir.as_path().join("target"), &dir.as_path().join("cargo"));
+        let run = Run {
+            store: Store::open(&config).unwrap(),
+            config: config.clone(),
+            binary_hash: "aaaa".to_string(),
+            environment,
+            start: std::time::Instant::now(),
+        };
+        let link = |name: &str, target: &str| Symlink {
+            name: name.into(),
+            target: target.into(),
+        };
+        let manifest = Manifest {
+            version: 3,
+            directories: vec!["d".into()],
+            empty_files: Vec::new(),
+            stdout: String::new(),
+            stderr: String::new(),
+            rewritten: Vec::new(),
+            symlinks: vec![link("d/a", ".."), link("d/a/c", "../x")],
+        };
+        let manifest_path = dir.as_path().join(MANIFEST_NAME);
+        std::fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        run.store
+            .put_with_compile_time_independent(
+                "tampered",
+                CRATE_NAME,
+                &["build-script".to_string()],
+                &[],
+                "",
+                "",
+                &[(manifest_path, MANIFEST_NAME.to_string())],
+                "",
+                "",
+                0,
+            )
+            .unwrap();
+        let meta = run.store.get("tampered").unwrap().unwrap();
+
+        let error = run.restore(&meta).unwrap_err().to_string();
+        assert!(error.contains("d/a/c"), "{error}");
+        let out = &run.environment.out_dir;
+        assert!(std::fs::symlink_metadata(out.join("c")).is_err());
+        assert!(std::fs::symlink_metadata(out.parent().unwrap().join("x")).is_err());
+    }
+
+    #[test]
+    fn a_link_stays_inside_only_by_leading_climbs_within_its_depth() {
+        let inside =
+            |link: &str, target: &str| link_stays_inside(Path::new(link), Path::new(target));
+        assert!(inside("libz.so", "libz.so.1"));
+        assert!(inside("libz.so", "./libz.so.1"));
+        assert!(inside("lib/libz.so", "../include/z.h"));
+        assert!(inside("lib/libz.so", "libz.so.1"));
+        assert!(inside("a/b/l", "../c"));
+        assert!(inside("a/b/l", "../../c"));
+        assert!(!inside("libz.so", "../libz.so.1"), "above the root");
+        assert!(!inside("lib/libz.so", "../../libz.so.1"));
+        assert!(!inside("lib/libz.so", "/usr/lib/libz.so.1"), "absolute");
+        assert!(
+            !inside("lib/libz.so", "sub/../x"),
+            "a climb after a name could leave through a linked directory"
+        );
+        assert!(!inside("", "x"), "the root itself");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn out_dir_symlinks_that_leave_it_are_not_recorded_or_restored() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out");
+        std::fs::create_dir_all(out.join("lib")).unwrap();
+        std::fs::write(out.join("lib/libz.so.1"), "so").unwrap();
+        std::os::unix::fs::symlink("libz.so.1", out.join("lib/libz.so")).unwrap();
+        let contents = collect_out_dir(&out).unwrap();
+        assert_eq!(contents.symlinks.len(), 1);
+        assert_eq!(contents.symlinks[0].name, "lib/libz.so");
+        assert_eq!(contents.symlinks[0].target, "libz.so.1");
+
+        for target in ["/usr/lib/libz.so.1", "../../libz.so.1"] {
+            let link = out.join("lib/escape");
+            std::os::unix::fs::symlink(target, &link).unwrap();
+            let error = collect_out_dir(&out).err().expect(target).to_string();
+            assert!(error.contains("lib/escape"), "{error}");
+            std::fs::remove_file(&link).unwrap();
+        }
+
+        let restored = dir.path().join("restored");
+        std::fs::create_dir(&restored).unwrap();
+        let symlink = |name: &str, target: &str| Symlink {
+            name: name.into(),
+            target: target.into(),
+        };
+        assert!(restore_symlink(&restored, &symlink("up", "../x")).is_err());
+        assert!(restore_symlink(&restored, &symlink("../up", "x")).is_err());
+        assert!(std::fs::symlink_metadata(restored.join("up")).is_err());
+        restore_symlink(&restored, &symlink("libz.so", "libz.so.1")).unwrap();
+        assert_eq!(
+            std::fs::read_link(restored.join("libz.so")).unwrap(),
+            Path::new("libz.so.1")
+        );
     }
 
     /// A `links` dependency that exports a directory outside the target

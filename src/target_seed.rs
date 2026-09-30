@@ -418,7 +418,8 @@ fn copy_unit(
 /// Copy `from` (a file or a directory) beside `to` and rename it there.
 fn place_tree(from: &Path, to: &Path, deadline: Instant) -> std::io::Result<()> {
     let staging = to.with_file_name(format!("{STAGING}{}-{}", file_name(to), std::process::id()));
-    let copied = copy_tree(from, &staging, deadline).and_then(|()| std::fs::rename(&staging, to));
+    let copied =
+        copy_tree(from, &staging, from, deadline).and_then(|()| std::fs::rename(&staging, to));
     if copied.is_err() {
         let _ = std::fs::remove_dir_all(&staging);
         let _ = std::fs::remove_file(&staging);
@@ -427,19 +428,30 @@ fn place_tree(from: &Path, to: &Path, deadline: Instant) -> std::io::Result<()> 
 }
 
 /// Copy a file or directory tree, keeping every file's modification time.
-/// A symbolic link fails the copy, and so does reaching `deadline` before a
-/// file.
-fn copy_tree(from: &Path, to: &Path, deadline: Instant) -> std::io::Result<()> {
+/// A symbolic link that stays inside the tree at `root` is copied as a link;
+/// any other fails the copy, and so does reaching `deadline` before a file.
+#[cfg_attr(not(unix), allow(clippy::only_used_in_recursion))]
+fn copy_tree(from: &Path, to: &Path, root: &Path, deadline: Instant) -> std::io::Result<()> {
     let metadata = std::fs::symlink_metadata(from)?;
     if metadata.is_dir() {
         std::fs::create_dir(to)?;
         for entry in entries(from) {
-            copy_tree(&entry, &to.join(file_name(&entry)), deadline)?;
+            copy_tree(&entry, &to.join(file_name(&entry)), root, deadline)?;
         }
         return Ok(());
     }
     if Instant::now() >= deadline {
         return Err(std::io::ErrorKind::TimedOut.into());
+    }
+    #[cfg(unix)]
+    if metadata.file_type().is_symlink() {
+        let target = std::fs::read_link(from)?;
+        if from
+            .strip_prefix(root)
+            .is_ok_and(|link| crate::build_script::link_stays_inside(link, &target))
+        {
+            return std::os::unix::fs::symlink(target, to);
+        }
     }
     if !metadata.is_file() {
         return Err(std::io::Error::other(format!(
@@ -1358,6 +1370,40 @@ source = "git+https://example.com/gitdep#abc"
         }
         #[cfg(not(unix))]
         let _ = seeded;
+    }
+
+    /// rdkafka-sys leaves `librdkafka.so -> librdkafka.so.1` in its
+    /// `OUT_DIR`. A link that stays inside the unit is copied as the same
+    /// link; one that leaves it, or is the whole unit, fails the copy.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_inside_the_unit_is_copied_as_a_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let from = dir.path().join("unit");
+        write(&from.join("out/src/librdkafka.so.1"), "so");
+        std::os::unix::fs::symlink("librdkafka.so.1", from.join("out/src/librdkafka.so")).unwrap();
+        write(&from.join("out/include/rdkafka.h"), "h");
+        std::os::unix::fs::symlink("../include", from.join("out/src/include")).unwrap();
+        let to = dir.path().join("copy");
+        place_tree(&from, &to, later()).unwrap();
+        let link = to.join("out/src/librdkafka.so");
+        assert_eq!(
+            std::fs::read_link(&link).unwrap(),
+            Path::new("librdkafka.so.1")
+        );
+        assert_eq!(std::fs::read_to_string(&link).unwrap(), "so");
+        assert_eq!(
+            std::fs::read_to_string(to.join("out/src/include/rdkafka.h")).unwrap(),
+            "h"
+        );
+
+        std::os::unix::fs::symlink("../../../elsewhere", from.join("out/src/up")).unwrap();
+        assert!(place_tree(&from, &dir.path().join("escaped"), later()).is_err());
+        assert!(!dir.path().join("escaped").exists());
+
+        let linked_unit = dir.path().join("linked-unit");
+        std::os::unix::fs::symlink("unit", &linked_unit).unwrap();
+        assert!(place_tree(&linked_unit, &dir.path().join("whole"), later()).is_err());
     }
 
     #[test]

@@ -15,7 +15,8 @@
 //! sandbox, with `CARGO_TARGET_DIR` pointing at the sandbox and without
 //! `PWD`/`OLDPWD`. A run is sealed read-only and shared only when it
 //! succeeded, declared exactly the inputs the key was computed from, left
-//! them unchanged, wrote nothing outside `OUT_DIR` and made no symlinks.
+//! them unchanged, wrote nothing outside `OUT_DIR` and made no symlink that
+//! leaves it.
 //! Otherwise the sandbox is removed and the script runs as usual.
 //!
 //! Cargo's own `OUT_DIR` then becomes a symlink to the sealed directory.
@@ -512,7 +513,7 @@ fn without_dirs_under(value: &std::ffi::OsStr, root: &Path) -> OsString {
 }
 
 /// The first thing in the sandbox that is neither `OUT_DIR` nor a directory
-/// on the way to it, or a symlink inside `OUT_DIR`.
+/// on the way to it, or a symlink inside `OUT_DIR` that leaves it.
 fn escape(sandbox: &Sandbox) -> Result<Option<PathBuf>> {
     let mut pending = vec![sandbox.root.clone()];
     while let Some(directory) = pending.pop() {
@@ -520,7 +521,12 @@ fn escape(sandbox: &Sandbox) -> Result<Option<PathBuf>> {
             let path = entry?.path();
             let kind = std::fs::symlink_metadata(&path)?.file_type();
             if path.starts_with(&sandbox.out_dir) {
-                if kind.is_symlink() {
+                if kind.is_symlink()
+                    && !super::link_stays_inside(
+                        path.strip_prefix(&sandbox.out_dir)?,
+                        &std::fs::read_link(&path)?,
+                    )
+                {
                     return Ok(Some(path));
                 }
                 if kind.is_dir() {
@@ -553,6 +559,10 @@ fn read_only(path: &Path) -> Result<()> {
     {
         use std::os::unix::fs::PermissionsExt;
         let metadata = std::fs::symlink_metadata(path)?;
+        // Setting a link's mode sets its target's, which is sealed on its own.
+        if metadata.file_type().is_symlink() {
+            return Ok(());
+        }
         if metadata.is_dir() {
             for entry in std::fs::read_dir(path)? {
                 read_only(&entry?.path())?;
@@ -744,7 +754,13 @@ mod tests {
         );
         std::fs::remove_dir(&empty).unwrap();
 
+        std::os::unix::fs::symlink("libz.a", sandbox.out_dir.join("lib/libz.so")).unwrap();
+        assert_eq!(escape(&sandbox).unwrap(), None, "a link inside OUT_DIR");
+
         let link = sandbox.out_dir.join("lib/link");
+        std::os::unix::fs::symlink("../../output", &link).unwrap();
+        assert_eq!(escape(&sandbox).unwrap(), Some(link.clone()));
+        std::fs::remove_file(&link).unwrap();
         std::os::unix::fs::symlink("/etc", &link).unwrap();
         assert_eq!(escape(&sandbox).unwrap(), Some(link));
     }
@@ -774,6 +790,37 @@ mod tests {
 
         remove_sandbox(&sandbox.root).unwrap();
         assert!(!sandbox.root.exists());
+        remove_sandbox(&sandbox.root).unwrap();
+    }
+
+    /// A link's own mode is its target's, so sealing through it would make
+    /// a library executable, or fail on a link to a file not yet written.
+    #[test]
+    fn sealing_leaves_a_link_and_its_target_as_they_were() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let sandbox = sandbox_in(dir.path());
+        let library = sandbox.out_dir.join("libz.so.1");
+        std::fs::write(&library, b"so").unwrap();
+        std::fs::set_permissions(&library, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::os::unix::fs::symlink("libz.so.1", sandbox.out_dir.join("libz.so")).unwrap();
+        seal(
+            &sandbox,
+            &Record {
+                version: RECORD_VERSION,
+                stdout: String::new(),
+                stderr: String::new(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::metadata(&library).unwrap().permissions().mode() & 0o777,
+            0o444
+        );
+        assert_eq!(
+            std::fs::read_link(sandbox.out_dir.join("libz.so")).unwrap(),
+            Path::new("libz.so.1")
+        );
         remove_sandbox(&sandbox.root).unwrap();
     }
 

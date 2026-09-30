@@ -811,22 +811,7 @@ pub(crate) fn rewrite_bytes(input: &[u8], replacements: &[(Vec<u8>, Vec<u8>)]) -
         if from.is_empty() {
             continue;
         }
-        out = replace_all(&out, from, to);
-    }
-    out
-}
-
-fn replace_all(input: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(input.len());
-    let mut index = 0;
-    while index < input.len() {
-        if input[index..].starts_with(from) {
-            out.extend_from_slice(to);
-            index += from.len();
-        } else {
-            out.push(input[index]);
-            index += 1;
-        }
+        out = crate::build_script::replace_all(&out, from, to);
     }
     out
 }

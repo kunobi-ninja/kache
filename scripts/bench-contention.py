@@ -353,6 +353,32 @@ def stop_kache(binary, env, dest):
     wait_for_daemon_lock(Path(env["KACHE_RUNTIME_DIR"]) / "daemon.run.lock", 40)
 
 
+def stop_sccache(binary, env, server, stop_timeout=30, exit_timeout=10):
+    """Ask the foreground sccache server to stop; kill it if it does not.
+
+    This runs after the batch is timed and its statistics are read, so a slow
+    shutdown takes nothing from the measurement. Returns whether the server had
+    to be killed.
+    """
+    try:
+        subprocess.run(
+            [str(binary), "--stop-server"],
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=stop_timeout,
+            check=False,
+        )
+        server.wait(timeout=exit_timeout)
+    except subprocess.TimeoutExpired:
+        pass
+    killed = server.poll() is None
+    if killed:
+        os.killpg(server.pid, signal.SIGKILL)
+        server.wait()
+    return killed
+
+
 def wait_for_daemon_lock(path, timeout):
     import fcntl
 
@@ -519,19 +545,12 @@ def run_phase(
             stop_kache(binary, control_env, dest)
         if server is not None:
             try:
-                subprocess.run(
-                    [str(binary), "--stop-server"],
-                    env=control_env,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    timeout=30,
-                    check=False,
-                )
-                server.wait(timeout=10)
+                if stop_sccache(binary, control_env, server):
+                    print(
+                        f"{phase}: sccache server did not stop in time and was killed",
+                        flush=True,
+                    )
             finally:
-                if server.poll() is None:
-                    os.killpg(server.pid, signal.SIGKILL)
-                    server.wait()
                 server_log.close()
     traces = []
     if backend == "mbx":

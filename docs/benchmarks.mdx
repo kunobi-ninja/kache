@@ -32,7 +32,7 @@ other arm's telemetry waited for them.
 | Subject | Kache | sccache | mbx |
 | --- | --- | --- | --- |
 | hk, eza | yes | yes | yes |
-| Firefox Linux | yes | yes | — |
+| Firefox Linux | yes | yes | C and C++ only |
 | Firefox Windows, LLVM, cuda-oxide | yes | — | — |
 | SurrealDB, Lance, OpenDAL | yes | — | yes |
 
@@ -43,6 +43,12 @@ while only Kache changed. The per-PR perf gate already compares Kache with
 itself. Running it separately also keeps its 75 minutes off the nightly's
 critical path, so nightly results reach the collector sooner. mbx tracks its
 latest release, so it stays nightly.
+
+The Firefox mbx arm is the exception. A Firefox build is too long for the
+nightly, so it runs weekly from the same workflow. It builds with
+`mbx exec ./mach build`, which caches C and C++ compiles. Cargo calls inside
+that session are not cached, so the arm's Rust crates compile in every phase
+and its hit rate counts C and C++ only.
 
 hk retains its prediction-disabled and next-commit scenarios. The next-commit
 Kache variants separate exhaustive prediction verification from timing.

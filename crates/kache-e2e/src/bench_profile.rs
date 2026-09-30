@@ -965,6 +965,43 @@ setup_marker = "{}"
         }
     }
 
+    /// `just bench-mbx firefox` must select the mbx arm, and that arm must
+    /// build the tree bench-firefox builds, through `mbx exec`.
+    #[test]
+    fn firefox_mbx_arm_builds_the_firefox_tree_through_mbx_exec() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scenarios");
+        let selectors = Selectors::parse_many(&[
+            "suite:bench".into(),
+            "backend:mbx".into(),
+            "name:firefox".into(),
+        ])
+        .unwrap();
+        let profiles = BenchProfile::discover(&root, &selectors).unwrap();
+        assert_eq!(profiles.len(), 1);
+        let mbx = &profiles[0];
+        assert_eq!(mbx.name, "bench-firefox-mbx");
+
+        let kache = BenchProfile::load(&repo_profile("firefox")).unwrap();
+        assert_eq!(mbx.repo, kache.repo);
+        assert_eq!(mbx.git_ref, kache.git_ref);
+        let patches = |profile: &BenchProfile| {
+            profile
+                .files
+                .iter()
+                .filter(|file| file.mode == FileMode::Patch)
+                .map(|file| {
+                    let path = file.content_file.as_deref().expect("patch file");
+                    path.rsplit('/').next().unwrap().to_string()
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(patches(mbx), patches(&kache));
+
+        let build = mbx.build_command(Path::new("/m"));
+        assert!(build.contains("/m exec sh -c"), "{build}");
+        assert!(build.contains("./mach build"), "{build}");
+    }
+
     fn repo_profile(name: &str) -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join(format!("../../scenarios/bench-{name}/scenario.toml"))

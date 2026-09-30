@@ -152,6 +152,74 @@ pub fn current_uid() -> u32 {
     0
 }
 
+/// Raise the soft open-file limit as far as the hard limit allows. launchd
+/// starts agents with a soft limit of 256, as does a stock macOS shell, and a
+/// daemon serving a parallel build holds a socket and store files per request
+/// (#1361). Returns the old and new soft limit when it changed.
+#[cfg(unix)]
+pub fn raise_open_file_limit() -> std::io::Result<Option<(libc::rlim_t, libc::rlim_t)>> {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `limit` is a valid output slot for getrlimit.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let Some(target) = open_file_target(limit.rlim_cur, limit.rlim_max, per_process_file_cap())
+    else {
+        return Ok(None);
+    };
+    let before = limit.rlim_cur;
+    limit.rlim_cur = target;
+    // SAFETY: `limit` is a valid, initialized rlimit.
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(Some((before, target)))
+}
+
+/// The soft limit to ask for: the hard limit, capped by what the kernel lets
+/// one process open. `None` when that is no higher than `soft`.
+#[cfg(unix)]
+fn open_file_target(
+    soft: libc::rlim_t,
+    hard: libc::rlim_t,
+    cap: Option<libc::rlim_t>,
+) -> Option<libc::rlim_t> {
+    let target = cap.map_or(hard, |cap| hard.min(cap));
+    (target > soft).then_some(target)
+}
+
+/// macOS rejects a soft limit above `kern.maxfilesperproc`, and launchd's
+/// hard limit is unlimited.
+#[cfg(target_os = "macos")]
+fn per_process_file_cap() -> Option<libc::rlim_t> {
+    let mut value: libc::c_int = 0;
+    let mut size = std::mem::size_of::<libc::c_int>();
+    // SAFETY: the name is NUL-terminated and `value`/`size` describe a c_int.
+    let status = unsafe {
+        libc::sysctlbyname(
+            c"kern.maxfilesperproc".as_ptr(),
+            (&raw mut value).cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    // OPEN_MAX is the documented safe ceiling when the sysctl is unreadable.
+    Some(if status == 0 && value > 0 {
+        value as libc::rlim_t
+    } else {
+        10_240
+    })
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn per_process_file_cap() -> Option<libc::rlim_t> {
+    None
+}
+
 /// Resolve when the OS asks the daemon to stop. SIGTERM/SIGINT on Unix,
 /// Ctrl+C / console-close on Windows.
 pub async fn wait_for_shutdown() {
@@ -271,6 +339,50 @@ mod tests {
     fn ps_available() -> bool {
         std::env::var_os("PATH")
             .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join("ps").is_file()))
+    }
+
+    /// launchd's 256/unlimited must land on the per-process cap, never on
+    /// RLIM_INFINITY (which macOS rejects), and a limit that is already as
+    /// high as allowed is left alone.
+    #[cfg(unix)]
+    #[test]
+    fn open_file_target_takes_the_hard_limit_up_to_the_cap() {
+        use super::open_file_target;
+        assert_eq!(
+            open_file_target(256, libc::RLIM_INFINITY, Some(61_440)),
+            Some(61_440)
+        );
+        assert_eq!(open_file_target(1024, 524_288, None), Some(524_288));
+        assert_eq!(open_file_target(256, 4096, Some(61_440)), Some(4096));
+        assert_eq!(open_file_target(4096, 4096, None), None);
+        assert_eq!(
+            open_file_target(61_440, libc::RLIM_INFINITY, Some(61_440)),
+            None
+        );
+        assert_eq!(open_file_target(8192, 524_288, Some(4096)), None);
+    }
+
+    /// Raising only ever grows the soft limit, so doing it in the test
+    /// process is harmless. The second call finds nothing left to raise.
+    #[cfg(unix)]
+    #[test]
+    fn raise_open_file_limit_reaches_the_target_once() {
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+            0
+        );
+        if let Some((before, after)) = super::raise_open_file_limit().unwrap() {
+            assert_eq!(before, limit.rlim_cur);
+            assert!(after > before);
+            let mut now = limit;
+            assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut now) }, 0);
+            assert_eq!(now.rlim_cur, after);
+        }
+        assert_eq!(super::raise_open_file_limit().unwrap(), None);
     }
 
     /// The program stays the path kache was started through; only argv

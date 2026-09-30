@@ -2059,6 +2059,164 @@ mod tests {
         assert!(refusal(&response).is_some());
     }
 
+    fn module_names(source: &str) -> Vec<String> {
+        scan_rust(source.as_bytes())
+            .unwrap()
+            .into_iter()
+            .filter_map(|found| match found {
+                Found::Module { name, .. } => Some(name),
+                Found::Include(_) => None,
+            })
+            .collect()
+    }
+
+    fn module_path(source: &str) -> Option<String> {
+        scan_rust(source.as_bytes())
+            .unwrap()
+            .into_iter()
+            .find_map(|found| match found {
+                Found::Module { path, name } if name == "child" || name == "real" => path,
+                _ => None,
+            })
+    }
+
+    fn includes(source: &str) -> Vec<String> {
+        scan_rust(source.as_bytes())
+            .unwrap()
+            .into_iter()
+            .filter_map(|found| match found {
+                Found::Include(text) => Some(text),
+                Found::Module { .. } => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn comments_and_literals_do_not_invent_modules() {
+        assert_eq!(
+            module_names("/* mod fake; */ mod real;"),
+            vec!["real".to_string()]
+        );
+        assert_eq!(
+            module_names("// mod fake;\nmod real;"),
+            vec!["real".to_string()]
+        );
+        assert_eq!(module_names("/ mod real;"), vec!["real".to_string()]);
+        assert_eq!(module_names("fn 'm'mod real;"), vec!["real".to_string()]);
+        assert_eq!(
+            module_names("'\\z; mod escaped;"),
+            vec!["escaped".to_string()]
+        );
+        assert_eq!(
+            module_names("'\\u{61}'; mod after;"),
+            vec!["after".to_string()]
+        );
+        assert_eq!(module_names("'\\u{61; mod uni;"), vec!["uni".to_string()]);
+        assert_eq!(
+            module_names("r##\" \" # mod fake; \"##\nmod real;"),
+            vec!["real".to_string()]
+        );
+        assert_eq!(module_names("b'a'; mod real;"), vec!["real".to_string()]);
+        assert_eq!(
+            module_names("b\"mod fake\"; mod real;"),
+            vec!["real".to_string()]
+        );
+        assert!(includes("foo!(\"secret.txt\"); mod real;").is_empty());
+        assert_eq!(
+            includes("/* include!(\"fake.txt\"); */ include!(\"real.txt\");"),
+            vec!["real.txt".to_string()]
+        );
+
+        assert_eq!(skip_char_or_lifetime(b"fn 'm'", 3), 6);
+        assert_eq!(skip_char_or_lifetime(b"'\\z;", 0), 1);
+        assert_eq!(skip_char_or_lifetime(b"'\\u{61}'", 0), 8);
+        assert_eq!(skip_char_or_lifetime(b"'\\u{61;", 0), 1);
+        assert_eq!(skip_byte_literal(b"b'a'", 0), 4);
+        assert_eq!(skip_byte_literal(b"b\"hi\"", 0), 5);
+        let (text, next) = raw_string(b"r#\"ab\"#", 0).unwrap();
+        assert_eq!(text, "ab");
+        assert_eq!(next, 7);
+        let (text, next) = raw_string(b"r##\" \" # \"##", 0).unwrap();
+        assert_eq!(text, " \" # ");
+        assert_eq!(next, 12);
+
+        let nested = rust_tokens(b"(())");
+        assert_eq!(close_at(&nested, 1, b'(', b')'), Some(3));
+    }
+
+    #[test]
+    fn attributes_keep_only_an_outer_path() {
+        assert_eq!(
+            module_path("#[path = \"renamed.rs\"]\nmod child;"),
+            Some("renamed.rs".to_string())
+        );
+        assert_eq!(
+            module_path("#[!path = \"nope.rs\" mod fake;] mod real;"),
+            None
+        );
+        assert_eq!(
+            module_names("#[!path = \"nope.rs\" mod fake;] mod real;"),
+            vec!["real".to_string()]
+        );
+        assert_eq!(module_names("#[\nmod child;"), vec!["child".to_string()]);
+        assert_eq!(module_path("a[path = \"renamed.rs\"]\nmod child;"), None);
+        assert_eq!(
+            module_names("pub(crate) mod child;"),
+            vec!["child".to_string()]
+        );
+        assert_eq!(
+            module_names("pub(super(crate)) mod child;"),
+            vec!["child".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_source_outside_the_crate_walks_up_to_eight_levels() {
+        assert_eq!(
+            relative_label(
+                Path::new("/work/crate"),
+                Path::new("/work/crate/src/lib.rs")
+            ),
+            "src/lib.rs"
+        );
+        assert_eq!(
+            relative_label(Path::new("/work/crate"), Path::new("/work/other.rs")),
+            "../other.rs"
+        );
+        assert_eq!(
+            relative_label(Path::new("/work/crate/inner"), Path::new("/work/other.rs")),
+            "../../other.rs"
+        );
+        let deep = Path::new("/a/b/c/d/e/f/g/h/crate");
+        assert_eq!(
+            relative_label(deep, Path::new("/a/sibling.rs")),
+            format!("{}sibling.rs", "../".repeat(8))
+        );
+        assert_eq!(relative_label(deep, Path::new("/outside.rs")), "outside.rs");
+        assert_eq!(slash_components(Path::new("../readme.md")), "../readme.md");
+    }
+
+    #[test]
+    fn a_directory_named_like_a_module_file_is_not_the_source() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("dirmod.rs")).unwrap();
+        std::fs::create_dir(dir.path().join("dirmod")).unwrap();
+        std::fs::write(dir.path().join("dirmod/mod.rs"), b"fn x() {}\n").unwrap();
+        let found = resolve_module(dir.path(), None, "dirmod").unwrap().unwrap();
+        assert_eq!(found.file_name().unwrap(), "mod.rs");
+    }
+
+    #[test]
+    fn a_backslash_prefix_is_rewritten_from_either_side() {
+        let stored = vec![record(".", r"C:\old\src")];
+        let current = vec![record(".", "/new/src")];
+        let updated = rewrite_bytes(
+            br"see C:\old\src\lib.rs",
+            &source_rewrites(&stored, &current),
+        );
+        assert_eq!(updated, br"see /new/src\lib.rs");
+    }
+
     #[test]
     fn modules_and_includes_enter_the_key_and_dep_info_does_not() {
         let dir = tempfile::tempdir().unwrap();
@@ -2264,7 +2422,10 @@ mod tests {
         assert!(names.contains(&"src/demo/lib.rs.html"), "{names:?}");
         assert!(!names.contains(&"other/index.html"), "{names:?}");
         assert!(!names.contains(&"search-index.js"), "{names:?}");
-        assert_eq!(bundle.parts_files.len(), 1);
+        assert_eq!(
+            bundle.parts_files,
+            vec![("demo.json".to_string(), b"{}".to_vec())]
+        );
 
         let fin = parse(&["rustdoc", "-o", &out.to_string_lossy(), "--merge=finalize"]);
         let fin_bundle = files_written(&fin).unwrap();
@@ -2739,12 +2900,11 @@ mod tests {
             record("b/mod.rs", "/new/src/b/mod.rs"),
             record("../README.md", "/new/README.md"),
         ];
-        let html =
-            b"see /old/src/a/mod.rs and /old/src/b/mod.rs and /old/README.md and /old/src-extra";
+        let html = b"see /old/src/a/mod.rs and /old/src/b/mod.rs and /old/README.md and /old/src/generated.html and /old/src-extra";
         let updated = rewrite_bytes(html, &source_rewrites(&stored, &current));
         assert_eq!(
             updated,
-            b"see /new/src/a/mod.rs and /new/src/b/mod.rs and /new/README.md and /old/src-extra"
+            b"see /new/src/a/mod.rs and /new/src/b/mod.rs and /new/README.md and /new/src/generated.html and /old/src-extra"
         );
         assert!(rewrite_bytes(b"keep", &[]).as_slice() == b"keep");
         assert!(source_rewrites(&stored, &stored).is_empty());

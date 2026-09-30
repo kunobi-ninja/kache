@@ -616,18 +616,22 @@ fn rust_tokens(bytes: &[u8]) -> Vec<Tok> {
             continue;
         }
         if byte == b'/' && bytes.get(index + 1) == Some(&b'/') {
-            index += 2;
-            while index < bytes.len() && bytes[index] != b'\n' {
-                index += 1;
-            }
+            let rest = &bytes[index + 2..];
+            let offset = rest
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .unwrap_or(rest.len());
+            index += 2 + offset;
             continue;
         }
         if byte == b'/' && bytes.get(index + 1) == Some(&b'*') {
-            index += 2;
-            while index + 1 < bytes.len() && !(bytes[index] == b'*' && bytes[index + 1] == b'/') {
-                index += 1;
-            }
-            index = index.saturating_add(2).min(bytes.len());
+            let rest = &bytes[index + 2..];
+            let offset = rest
+                .windows(2)
+                .position(|pair| pair == b"*/")
+                .map(|at| at + 2)
+                .unwrap_or(rest.len());
+            index += 2 + offset;
             continue;
         }
         if byte == b'b' && matches!(bytes.get(index + 1), Some(b'"' | b'r' | b'\'')) {
@@ -751,27 +755,23 @@ fn cooked_string(bytes: &[u8], index: usize) -> (String, usize) {
 
 fn raw_string(bytes: &[u8], index: usize) -> Option<(String, usize)> {
     let mut cursor = index + 1;
-    let mut hashes = 0usize;
-    while bytes.get(cursor) == Some(&b'#') {
-        hashes += 1;
-        cursor += 1;
-    }
+    let hashes = bytes[cursor..]
+        .iter()
+        .take_while(|byte| **byte == b'#')
+        .count();
+    cursor += hashes;
     if bytes.get(cursor) != Some(&b'"') {
         return None;
     }
-    cursor += 1;
-    let start = cursor;
-    while cursor < bytes.len() {
-        if bytes[cursor] == b'"' {
-            let tail = &bytes[cursor + 1..];
-            if tail.len() >= hashes && tail[..hashes].iter().all(|byte| *byte == b'#') {
-                let text = String::from_utf8_lossy(&bytes[start..cursor]).into_owned();
-                return Some((text, cursor + 1 + hashes));
-            }
-        }
-        cursor += 1;
-    }
-    None
+    let start = cursor + 1;
+    let end = (start..bytes.len()).find(|at| {
+        bytes[*at] == b'"'
+            && bytes[*at + 1..]
+                .get(..hashes)
+                .is_some_and(|tail| tail.iter().all(|byte| *byte == b'#'))
+    })?;
+    let text = String::from_utf8_lossy(&bytes[start..end]).into_owned();
+    Some((text, end + 1 + hashes))
 }
 
 fn hash_tree(hasher: &mut blake3::Hasher, dir: &Path) -> Result<()> {
@@ -3240,6 +3240,12 @@ mod tests {
             module_names("mod a; //x\nmod b;"),
             vec!["a".to_string(), "b".to_string()]
         );
+        assert_eq!(
+            module_names("mod a; /*x*/ mod b;"),
+            vec!["a".to_string(), "b".to_string()]
+        );
+        let (text, _) = raw_string(br##"r#"say "hi" end"#"##, 0).unwrap();
+        assert_eq!(text, "say \"hi\" end");
         assert!(module_names("mod foo").is_empty());
         let (text, _) = cooked_string(b"\"\\nb\"", 0);
         assert_eq!(text, "\nb");

@@ -86,9 +86,11 @@ def group_resources(entries):
     return grouped
 
 
-# Context arms and the bare names they default to. A default that is not
-# installed skips its arm; an explicitly named binary never does.
-DEFAULT_TOOL = {"sccache": "sccache", "mbx": "mbx"}
+# Context arms that run by default, and the bare names they default to. A
+# default that is not installed skips its arm; an explicitly named binary
+# never does. sccache is a pinned binary that does not change between runs,
+# so it runs only when named, which the weekly reference run does.
+DEFAULT_TOOL = {"mbx": "mbx"}
 
 
 class DeadlineReached(Exception):
@@ -174,12 +176,14 @@ def wanted_arm(arm, args):
     """Whether to measure this arm.
 
     The Kache arms decide the verdict, so a missing binary there is fatal and
-    is caught before any cloning. sccache and mbx are context: their defaults
-    are bare names, and on a machine where neither is installed the honest
-    answer is a run without them, not a run that clones a subject and then
-    dies. Naming one explicitly asks for it, so that stays fatal too.
+    is caught before any cloning. sccache and mbx are context. mbx defaults to
+    a bare name, and on a machine without it the honest answer is a run
+    without it, not a run that clones a subject and then dies. sccache runs
+    only when named. A named binary is asked for, so a missing one stays fatal.
     """
     name, _, binary = arm
+    if binary is None:
+        return False
     if name in ("kache", "head", "base") or binary != DEFAULT_TOOL.get(name):
         return True
     if installed(binary):
@@ -539,8 +543,7 @@ def main():
     parser.add_argument("--base")
     parser.add_argument(
         "--sccache",
-        default=DEFAULT_TOOL["sccache"],
-        help="sccache binary; the arm is skipped when the default is not installed",
+        help="sccache binary to measure as well; without it there is no sccache arm",
     )
     parser.add_argument(
         "--mbx",

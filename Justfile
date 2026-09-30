@@ -321,7 +321,8 @@ perf-gate-local *ARGS:
 trace-phases DIR *ARGS:
   python3 scripts/trace-phases.py "{{DIR}}" {{ARGS}}
 
-# Run isolated builds (2 cold / 6 warm) and contention (2 cold / 6 warm), three tools.
+# Run isolated builds (2 cold / 6 warm) and contention (2 cold / 6 warm), kache and mbx.
+# Add `--sccache sccache` to measure sccache as well.
 [group('bench')]
 bench-short PROJECT SAMPLES="6" *ARGS:
   cargo build --release -p kache -p kache-e2e --bin kache --bin kache-scenario

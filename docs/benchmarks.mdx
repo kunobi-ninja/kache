@@ -6,14 +6,15 @@ description: Measure isolated and concurrent builds with cold and warm caches
 ## CI coverage
 
 The [Perf gate](https://github.com/kunobi-ninja/kache/actions/workflows/perf-gate.yml)
-measures **hk and eza** on PRs. Each subject runs Kache from the PR
-and its merge base, sccache, and mbx sequentially on one runner.
+measures **hk, eza and aube** on PRs. Each subject runs Kache from the PR
+and its merge base, and mbx, sequentially on one runner.
 
 | Trigger | Subjects | Isolated samples per tool | Contention samples per tool |
 | --- | --- | --- | --- |
-| Same-repository PR, ready for review | hk, eza | Kache head and base, each: 2 cold, 6 same-checkout warm, 6 cross-checkout warm. sccache and mbx: 1 cold, 1 same-checkout warm, 1 cross-checkout warm | 1 cold + 1 warm batch |
-| PR with the `bench` label **or** `[bench]` in its title | hk, eza | 2 cold, 6 same-checkout warm, 6 cross-checkout warm | 2 cold + 6 warm batches |
-| Nightly, 03:37 Europe/Zurich | hk, eza | 2 cold, 6 same-checkout warm, 6 cross-checkout warm | 2 cold + 6 warm batches |
+| Same-repository PR, ready for review | hk, eza, aube | Kache head and base, each: 2 cold, 6 same-checkout warm, 6 cross-checkout warm. mbx: 1 cold, 1 same-checkout warm, 1 cross-checkout warm | 1 cold + 1 warm batch |
+| PR with the `bench` label **or** `[bench]` in its title | hk, eza, aube | 2 cold, 6 same-checkout warm, 6 cross-checkout warm | 2 cold + 6 warm batches |
+| Nightly, 03:37 Europe/Zurich | hk, eza, aube | Kache: 2 cold, 6 same-checkout warm, 6 cross-checkout warm. mbx: 1 of each | 1 cold + 3 warm batches |
+| Weekly, Sunday | hk, eza, aube | As the nightly, plus sccache: 1 of each | 1 cold + 3 warm batches |
 | Nightly | Firefox Linux/Windows, LLVM, SurrealDB, Lance, OpenDAL, cuda-oxide | One measurement per configured phase | — |
 
 The opt-in also runs on same-repository draft PRs. Adding either trigger or
@@ -31,13 +32,14 @@ other arm's telemetry waited for them.
 
 | Subject | Kache | sccache | mbx |
 | --- | --- | --- | --- |
-| hk, eza | yes | yes | yes |
+| hk, eza, aube | yes | weekly | yes |
 | Firefox Linux | yes | yes | C and C++ only |
 | Firefox Windows, LLVM, cuda-oxide, kobe | yes | — | — |
 | SurrealDB, Lance, OpenDAL | yes | — | yes |
 
-The Firefox sccache arm has its own workflow and its own schedule: weekly, and
-again whenever the pinned sccache version changes. sccache is pinned in
+The sccache arms have their own workflow and their own schedule: weekly, and
+again whenever the pinned sccache version changes. That covers Firefox and the
+hk, eza and aube suites. sccache is pinned in
 `mise.toml`, so a nightly arm would measure the same sccache binary every night
 while only Kache changed. The per-PR perf gate already compares Kache with
 itself. Running it separately also keeps its 75 minutes off the nightly's
@@ -175,7 +177,7 @@ just bench-mbx hk-pull
 just perf-gate-local       # HEAD against its merge base, with the gate's verdict
 ```
 
-The complete short suite runs on Linux. It skips the sccache or mbx arm when that tool is not on PATH.
+The complete short suite runs on Linux. It skips the mbx arm when mbx is not on PATH, and measures sccache only when given `--sccache <binary>`.
 On macOS, pass `--skip-contention` to run its isolated builds. It refuses to overwrite its
 output directory; pass `--output <fresh-path>` after the sample count for another
 run. Run builds on an otherwise quiet host. A CI job takes much longer than

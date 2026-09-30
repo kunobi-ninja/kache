@@ -392,14 +392,13 @@ class BenchTests(unittest.TestCase):
                     short.run_contention(args, arms)
 
     def test_a_missing_context_tool_skips_its_arm_and_a_named_one_does_not(self):
-        """A laptop without sccache should still measure head against base.
+        """A laptop without mbx should still measure head against base.
 
         Before this, the run cloned the subject, built it, and only then died
-        because a bare `sccache` was not on PATH.
+        because a bare `mbx` was not on PATH.
         """
-        args = argparse.Namespace(sccache="sccache", mbx="mbx", base="/base")
+        args = argparse.Namespace(sccache=None, mbx="mbx", base="/base")
         with patch.object(engine.shutil, "which", return_value=None):
-            self.assertFalse(short.wanted_arm(("sccache", "sccache", "sccache"), args))
             self.assertFalse(short.wanted_arm(("mbx", "mbx", "mbx"), args))
             # The arms that decide the verdict are never skipped away.
             self.assertTrue(short.wanted_arm(("head", "kache", "/kache"), args))
@@ -411,8 +410,10 @@ class BenchTests(unittest.TestCase):
         with patch.object(engine.shutil, "which", return_value=None):
             self.assertTrue(short.wanted_arm(("sccache", "sccache", "/opt/sccache"), named))
 
-        with patch.object(engine.shutil, "which", return_value="/usr/bin/sccache"):
-            self.assertTrue(short.wanted_arm(("sccache", "sccache", "sccache"), args))
+        with patch.object(engine.shutil, "which", return_value="/usr/bin/mbx"):
+            self.assertTrue(short.wanted_arm(("mbx", "mbx", "mbx"), args))
+            # sccache runs only when named, installed or not.
+            self.assertFalse(short.wanted_arm(("sccache", "sccache", None), args))
 
     def test_context_tools_run_only_in_their_samples(self):
         """sccache and mbx never decide the verdict: the gate measures them

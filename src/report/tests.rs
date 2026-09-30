@@ -4084,6 +4084,20 @@ fn text_timing_and_bypass_sections_hide_a_zero() {
 }
 
 #[test]
+fn text_hit_table_appears_only_when_a_hit_is_listed() {
+    let mut report = blank_report();
+    report.suggestions.clear();
+    report.top_hits.clear();
+    let text = format_text(&report);
+    assert!(!heading(&text, "Most valuable hits"), "{text}");
+
+    report.top_hits.push(miss_detail("saved"));
+    let text = format_text(&report);
+    assert!(heading(&text, "Most valuable hits"), "{text}");
+    assert!(text.contains("saved"), "{text}");
+}
+
+#[test]
 fn average_ms_prints_a_decimal_only_below_ten() {
     assert_eq!(average_ms(9.9), "9.9 ms");
     assert_eq!(average_ms(10.0), "10 ms");

@@ -19,6 +19,73 @@ from bench.stats import contention_comparison, summarize, validate
 # Lives beside the package, in the instrument directory the gate stages.
 CONTENTION_SCRIPT = Path(__file__).resolve().parent.parent / "bench-contention.py"
 
+# What the telemetry collector accepts in one artifact. It drops a larger
+# payload whole and says so only in its own log, so the limits are enforced
+# here, where a run can fail on them.
+COLLECTOR_MAX_RESOURCES = 4
+COLLECTOR_MAX_SCOPES = 8
+INSTRUMENTS = ("gauge", "sum", "histogram")
+
+
+def group_resources(entries):
+    """Merge `resourceMetrics` entries that describe the same resource.
+
+    Every sample writes its own entry, so a run of 14 samples per tool arrives
+    as dozens of entries over three resources. Entries with an equal resource
+    become one, their scopes and metrics likewise, and every data point is
+    kept.
+    """
+
+    def identity(value, without):
+        return json.dumps(
+            {k: v for k, v in value.items() if k != without}, sort_keys=True
+        )
+
+    resources = {}
+    for entry in entries:
+        resource = resources.setdefault(
+            identity(entry, "scopeMetrics"),
+            ({k: v for k, v in entry.items() if k != "scopeMetrics"}, {}),
+        )
+        for scope in entry.get("scopeMetrics", []):
+            merged_scope = resource[1].setdefault(
+                identity(scope, "metrics"),
+                ({k: v for k, v in scope.items() if k != "metrics"}, {}),
+            )
+            for metric in scope.get("metrics", []):
+                kind = next((k for k in INSTRUMENTS if k in metric), None)
+                if kind is None:
+                    raise ValueError(
+                        f"telemetry metric {metric.get('name')!r} has no known instrument"
+                    )
+                shape = {**metric, kind: {**metric[kind], "dataPoints": None}}
+                merged = merged_scope[1].setdefault(
+                    json.dumps(shape, sort_keys=True),
+                    {**metric, kind: {**metric[kind], "dataPoints": []}},
+                )
+                merged[kind]["dataPoints"].extend(metric[kind].get("dataPoints", []))
+    grouped = [
+        {
+            **head,
+            "scopeMetrics": [
+                {**scope_head, "metrics": list(metrics.values())}
+                for scope_head, metrics in scopes.values()
+            ],
+        }
+        for head, scopes in resources.values()
+    ]
+    if len(grouped) > COLLECTOR_MAX_RESOURCES:
+        raise ValueError(
+            f"telemetry has {len(grouped)} resources; the collector accepts {COLLECTOR_MAX_RESOURCES}"
+        )
+    widest = max((len(r["scopeMetrics"]) for r in grouped), default=0)
+    if widest > COLLECTOR_MAX_SCOPES:
+        raise ValueError(
+            f"telemetry has {widest} scopes in one resource; the collector accepts {COLLECTOR_MAX_SCOPES}"
+        )
+    return grouped
+
+
 # Context arms and the bare names they default to. A default that is not
 # installed skips its arm; an explicitly named binary never does.
 DEFAULT_TOOL = {"sccache": "sccache", "mbx": "mbx"}
@@ -266,7 +333,7 @@ def run(args):
                             ]
                 resources.append(resource)
         (root / "metrics.otlp.json").write_text(
-            json.dumps({"resourceMetrics": resources}) + "\n"
+            json.dumps({"resourceMetrics": group_resources(resources)}) + "\n"
         )
         (root / "schema_version").write_text("1\n")
         for phase in ("cold", "warm-same-tree", "warm"):
@@ -291,7 +358,8 @@ def run(args):
                 dest = root / f"cache-otlp-{phase}"
                 dest.mkdir()
                 (dest / "metrics.otlp.json").write_text(
-                    json.dumps({"resourceMetrics": cache_resources}) + "\n"
+                    json.dumps({"resourceMetrics": group_resources(cache_resources)})
+                    + "\n"
                 )
                 (dest / "schema_version").write_text("1\n")
         return int(bool(summary["failures"]))

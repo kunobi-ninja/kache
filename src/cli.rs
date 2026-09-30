@@ -864,51 +864,57 @@ pub fn stats(
     // (survives daemon restarts) behind the live snapshot above. Keys/bytes
     // are daemon-visible lower bounds; join events.jsonl by session_id for
     // full attribution.
-    let summaries = &snap.recent_summaries;
-    if !summaries.is_empty() {
-        println!();
-        println!("Prefetch sessions");
-        let body: Vec<Vec<String>> = summaries
-            .iter()
-            .rev()
-            .take(5)
-            .map(|s| {
-                vec![
-                    s.ts.format("%m-%d %H:%M").to_string(),
-                    if s.session_id.is_empty() {
-                        "legacy".to_string()
-                    } else {
-                        s.session_id.clone()
-                    },
-                    format!(
-                        "{}/{}",
-                        term::count(s.downloaded_keys),
-                        term::count(s.candidate_keys)
-                    ),
-                    term::bytes(s.downloaded_bytes),
-                    term::count(s.used_keys),
-                    format!(
-                        "{}, {} demanded, {}{}",
-                        s.plan_source,
-                        s.demanded_keys,
-                        s.closure_reason,
-                        summary_status_suffix(s.cancelled, s.incomplete)
-                    ),
-                ]
-            })
-            .collect();
-        use term::Align::{Left, Right};
-        for line in term::table(
-            &["WHEN", "SESSION", "FETCHED", "BYTES", "USED", "PLAN"],
-            &[Left, Left, Right, Right, Right, Left],
-            &body,
-        ) {
-            println!("{line}");
-        }
+    for line in prefetch_session_lines(&snap.recent_summaries) {
+        println!("{line}");
     }
     println!();
     println!("Details: kache stats --full");
     Ok(())
+}
+
+/// Lines for the recent prefetch sessions, including the heading.
+/// Empty when there are no summaries, so a quiet window stays quiet.
+fn prefetch_session_lines(summaries: &[crate::events::BuildSummaryEvent]) -> Vec<String> {
+    if summaries.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec![String::new(), "Prefetch sessions".to_string()];
+    let body: Vec<Vec<String>> = summaries
+        .iter()
+        .rev()
+        .take(5)
+        .map(|s| {
+            vec![
+                s.ts.format("%m-%d %H:%M").to_string(),
+                if s.session_id.is_empty() {
+                    "legacy".to_string()
+                } else {
+                    s.session_id.clone()
+                },
+                format!(
+                    "{}/{}",
+                    term::count(s.downloaded_keys),
+                    term::count(s.candidate_keys)
+                ),
+                term::bytes(s.downloaded_bytes),
+                term::count(s.used_keys),
+                format!(
+                    "{}, {} demanded, {}{}",
+                    s.plan_source,
+                    s.demanded_keys,
+                    s.closure_reason,
+                    summary_status_suffix(s.cancelled, s.incomplete)
+                ),
+            ]
+        })
+        .collect();
+    use term::Align::{Left, Right};
+    lines.extend(term::table(
+        &["WHEN", "SESSION", "FETCHED", "BYTES", "USED", "PLAN"],
+        &[Left, Left, Right, Right, Right, Left],
+        &body,
+    ));
+    lines
 }
 
 fn summary_status_suffix(cancelled: bool, incomplete: bool) -> &'static str {

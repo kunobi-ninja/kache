@@ -57,10 +57,8 @@ pub(crate) fn table(header: &[&str], align: &[Align], body: &[Vec<String>]) -> V
             if column > 0 {
                 out.push_str("   ");
             }
-            let last = column + 1 == columns;
             match align.get(column).copied().unwrap_or(Align::Left) {
                 Align::Right => out.push_str(&pad_left(cell, widths[column])),
-                Align::Left if last => out.push_str(cell),
                 Align::Left => out.push_str(&pad(cell, widths[column])),
             }
         }

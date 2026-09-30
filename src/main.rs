@@ -1067,8 +1067,14 @@ fn main() -> Result<()> {
             record,
             redact,
         }) => {
-            let full =
-                full || format.is_some() || output.is_some() || top.is_some() || record || redact;
+            let full = stats_wants_full(
+                full,
+                format.is_some(),
+                output.is_some(),
+                top.is_some(),
+                record,
+                redact,
+            );
             if full {
                 let format = report_format(format, json);
                 let window = parse_since_window(&since)?;
@@ -1549,6 +1555,18 @@ fn run_wrapper_mode(args: &[String]) -> Result<()> {
 /// Entries in each top list of the full report by default.
 const DEFAULT_REPORT_TOP: usize = 10;
 
+/// `--full`, or any flag that only the full report understands.
+fn stats_wants_full(
+    full: bool,
+    format: bool,
+    output: bool,
+    top: bool,
+    record: bool,
+    redact: bool,
+) -> bool {
+    full || format || output || top || record || redact
+}
+
 /// The full report's format: the one asked for, else JSON under `--json`,
 /// else text.
 fn report_format(format: Option<String>, json: bool) -> String {
@@ -1697,6 +1715,24 @@ mod tests {
         assert!(err.contains("loop"), "{err}");
         assert!(err.contains(".kache-shims"), "{err}");
         assert!(check_wrapper_depth(MAX_WRAPPERS_ABOVE + 1, None).is_err());
+    }
+
+    #[test]
+    fn stats_wants_the_full_report_for_any_full_flag() {
+        assert!(!stats_wants_full(false, false, false, false, false, false));
+        assert!(stats_wants_full(true, false, false, false, false, false));
+        assert!(stats_wants_full(false, true, false, false, false, false));
+        assert!(stats_wants_full(false, false, true, false, false, false));
+        assert!(stats_wants_full(false, false, false, true, false, false));
+        assert!(stats_wants_full(false, false, false, false, true, false));
+        assert!(stats_wants_full(false, false, false, false, false, true));
+    }
+
+    #[test]
+    fn report_format_prefers_an_explicit_name() {
+        assert_eq!(report_format(None, false), "text");
+        assert_eq!(report_format(None, true), "json");
+        assert_eq!(report_format(Some("md".to_string()), true), "md");
     }
 
     #[test]

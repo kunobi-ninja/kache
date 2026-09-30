@@ -3879,3 +3879,253 @@ fn redact_replaces_keys_and_paths_and_leaves_empty_fields_empty() {
     assert_eq!(report.timed_transfers[1].cache_key, "");
     assert_eq!(report.timed_transfers[1].object_key, "");
 }
+
+fn blank_report() -> BuildReport {
+    let dir = tempfile::tempdir().unwrap();
+    let config = crate::test_support::test_config(dir.path().to_path_buf());
+    generate_report(&config, crate::since::SinceWindow::DEFAULT, 10).unwrap()
+}
+
+fn zero_network() -> NetworkAnalysis {
+    serde_json::from_value(serde_json::json!({
+        "bytes_up": 0,
+        "bytes_down": 0,
+        "uploads_ok": 0,
+        "uploads_failed": 0,
+        "downloads_ok": 0,
+        "downloads_failed": 0,
+        "avg_download_ms": 0.0,
+        "p95_download_ms": 0,
+        "max_download_ms": 0,
+        "throughput_mbps": 0.0,
+        "network_throughput_mbps": 0.0,
+        "compression_ratio": 0.0,
+        "original_bytes_down": 0,
+        "total_decompress_ms": 0,
+        "total_disk_io_ms": 0,
+        "blobs_skipped": 0,
+        "blobs_total": 0,
+        "slowest_downloads": []
+    }))
+    .unwrap()
+}
+
+fn miss_detail(name: &str) -> CrateDetail {
+    serde_json::from_value(serde_json::json!({
+        "crate_name": name,
+        "result": "miss",
+        "elapsed_ms": 1,
+        "compile_time_ms": 1,
+        "overhead_ms": 0,
+        "size": 0,
+        "cache_key": "k"
+    }))
+    .unwrap()
+}
+
+fn heading(text: &str, title: &str) -> bool {
+    text.lines().any(|line| line == title)
+}
+
+#[test]
+fn text_summary_rows_appear_only_past_zero() {
+    let mut report = blank_report();
+    report.suggestions.clear();
+    report.summary.local_hits = 2;
+    report.timing.hit_time_ms = 1;
+    let text = format_text(&report);
+    assert!(text_row(&text, "Hit overhead").is_some(), "{text}");
+
+    report.summary.local_hits = 0;
+    let text = format_text(&report);
+    assert!(text_row(&text, "Hit overhead").is_none(), "{text}");
+
+    report.summary.local_hits = 2;
+    report.timing.hit_time_ms = 0;
+    let text = format_text(&report);
+    assert!(text_row(&text, "Hit overhead").is_none(), "{text}");
+
+    report.timing.miss_compile_time_ms = 2;
+    let text = format_text(&report);
+    assert!(text_row(&text, "Miss work").is_some(), "{text}");
+    report.timing.miss_compile_time_ms = 0;
+    let text = format_text(&report);
+    assert!(text_row(&text, "Miss work").is_none(), "{text}");
+
+    report.summary.dups = 2;
+    let text = format_text(&report);
+    assert!(text_row(&text, "Duplicates").is_some(), "{text}");
+    report.summary.dups = 0;
+    let text = format_text(&report);
+    assert!(text_row(&text, "Duplicates").is_none(), "{text}");
+
+    report.summary.store_failures = 2;
+    let text = format_text(&report);
+    assert!(text_row(&text, "Not stored").is_some(), "{text}");
+    report.summary.store_failures = 0;
+    let text = format_text(&report);
+    assert!(text_row(&text, "Not stored").is_none(), "{text}");
+
+    report.summary.errors = 2;
+    let text = format_text(&report);
+    assert!(text_row(&text, "Errors").is_some(), "{text}");
+    report.summary.errors = 0;
+    let text = format_text(&report);
+    assert!(text_row(&text, "Errors").is_none(), "{text}");
+
+    for (passthroughs, skipped, probes) in [(2, 0, 0), (0, 2, 0), (0, 0, 2)] {
+        report.summary.passthroughs = passthroughs;
+        report.summary.skipped = skipped;
+        report.summary.probes = probes;
+        let text = format_text(&report);
+        assert!(text_row(&text, "Not cached").is_some(), "{text}");
+    }
+    report.summary.passthroughs = 0;
+    report.summary.skipped = 0;
+    report.summary.probes = 0;
+    let text = format_text(&report);
+    assert!(text_row(&text, "Not cached").is_none(), "{text}");
+    assert!(!heading(&text, "Not cached"), "{text}");
+}
+
+#[test]
+fn text_network_and_storage_rows_hide_a_zero() {
+    let mut report = blank_report();
+    report.suggestions.clear();
+    let mut network = zero_network();
+    network.dominant_download_phase = "body".to_string();
+    network.dominant_download_phase_ms = 2;
+    report.network = Some(network);
+    let text = format_text(&report);
+    assert!(text_row(&text, "Slowest phase").is_some(), "{text}");
+
+    report
+        .network
+        .as_mut()
+        .unwrap()
+        .dominant_download_phase
+        .clear();
+    let text = format_text(&report);
+    assert!(text_row(&text, "Slowest phase").is_none(), "{text}");
+
+    let network = report.network.as_mut().unwrap();
+    network.dominant_download_phase = "body".to_string();
+    network.dominant_download_phase_ms = 0;
+    let text = format_text(&report);
+    assert!(text_row(&text, "Slowest phase").is_none(), "{text}");
+
+    report.network.as_mut().unwrap().compression_ratio = 0.0;
+    let text = format_text(&report);
+    assert!(text_row(&text, "Compression").is_none(), "{text}");
+    assert!(!text.contains("0.0x"), "{text}");
+
+    report.network.as_mut().unwrap().blobs_total = 0;
+    let text = format_text(&report);
+    assert!(text_row(&text, "Blobs").is_none(), "{text}");
+    report.network.as_mut().unwrap().blobs_total = 2;
+    let text = format_text(&report);
+    assert!(text_row(&text, "Blobs").is_some(), "{text}");
+
+    report.prefetch.prefetch_hits = 2;
+    report.prefetch.total_hits = 4;
+    let text = format_text(&report);
+    assert!(text_row(&text, "Prefetch").is_some(), "{text}");
+    report.prefetch.prefetch_hits = 0;
+    let text = format_text(&report);
+    assert!(text_row(&text, "Prefetch").is_none(), "{text}");
+}
+
+#[test]
+fn text_timing_and_bypass_sections_hide_a_zero() {
+    let mut report = blank_report();
+    report.suggestions.clear();
+    report.timing.total_key_ms = 2;
+    let text = format_text(&report);
+    assert!(text.contains("cache key"), "{text}");
+    report.timing.total_key_ms = 0;
+    let text = format_text(&report);
+    assert!(!text.contains("cache key"), "{text}");
+
+    report.bypass.passthroughs = 2;
+    let text = format_text(&report);
+    assert!(heading(&text, "Not cached"), "{text}");
+    report.bypass.passthroughs = 0;
+    let text = format_text(&report);
+    assert!(!heading(&text, "Not cached"), "{text}");
+
+    report.bypass.passthroughs = 1;
+    report.bypass.slowest.push(BypassDetail {
+        crate_name: "slow".to_string(),
+        root: String::new(),
+        result: "passthrough".to_string(),
+        route: "direct".to_string(),
+        reason: "flag".to_string(),
+        start_time: String::new(),
+        end_time: String::new(),
+        start_unix_ms: 0,
+        end_unix_ms: 0,
+        elapsed_ms: 1_000,
+        exit_code: None,
+        timestamp: "2026-09-30T12:00:00Z".to_string(),
+        fallback_attempt: None,
+    });
+    let text = format_text(&report);
+    assert!(heading(&text, "Slowest not cached"), "{text}");
+    report.bypass.slowest[0].elapsed_ms = 999;
+    let text = format_text(&report);
+    assert!(!heading(&text, "Slowest not cached"), "{text}");
+
+    report.suggestions.push("raise the cap".to_string());
+    let text = format_text(&report);
+    assert!(heading(&text, "Suggestions"), "{text}");
+    report.suggestions.clear();
+    let text = format_text(&report);
+    assert!(!heading(&text, "Suggestions"), "{text}");
+}
+
+#[test]
+fn average_ms_prints_a_decimal_only_below_ten() {
+    assert_eq!(average_ms(9.9), "9.9 ms");
+    assert_eq!(average_ms(10.0), "10 ms");
+}
+
+#[test]
+fn local_time_keeps_an_unparsed_input() {
+    assert_eq!(local_time("not-a-time"), "not-a-time");
+    let stamp = "2026-09-30T12:34:00Z";
+    let expected = chrono::DateTime::parse_from_rfc3339(stamp)
+        .unwrap()
+        .with_timezone(&chrono::Local)
+        .format("%b %d %H:%M")
+        .to_string();
+    assert_eq!(local_time(stamp), expected);
+    assert_ne!(local_time(stamp), "xyzzy");
+}
+
+#[test]
+fn suggestions_name_three_distinct_misses_only_above_the_share() {
+    let prefetch = PrefetchAnalysis {
+        prefetch_hits: 0,
+        total_hits: 0,
+        contribution_pct: 0.0,
+    };
+    let suggest = |miss_ms, hit_ms, dups, misses, names: &[&str]| {
+        let mut stats = crate::events::compute_stats(&[]);
+        stats.miss_compile_time_ms = miss_ms;
+        stats.hit_compile_time_ms = hit_ms;
+        stats.dups = dups;
+        stats.misses = misses;
+        let details: Vec<CrateDetail> = names.iter().copied().map(miss_detail).collect();
+        generate_suggestions(&stats, &prefetch, &None, false, &details, 1, 0).join("\n")
+    };
+    let phrase = "compile time spent on compiled cache-key misses";
+    assert!(!suggest(80, 20, 4, 0, &["a"]).contains(phrase));
+    assert!(!suggest(50, 50, 4, 0, &["a"]).contains(phrase));
+    assert!(!suggest(81, 19, 3, 0, &["a"]).contains(phrase));
+    let named = suggest(81, 19, 4, 0, &["a", "b", "c", "d"]);
+    assert!(named.contains(phrase), "{named}");
+    assert!(named.contains("`a`") && named.contains("`c`"), "{named}");
+    assert!(!named.contains("`d`"), "{named}");
+    let repeated = suggest(81, 19, 4, 0, &["a", "a"]);
+    assert_eq!(repeated.matches("`a`").count(), 1, "{repeated}");
+}

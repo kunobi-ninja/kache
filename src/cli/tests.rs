@@ -3846,6 +3846,49 @@ fn render_stats_says_when_the_daemon_does_not_list_the_remote() {
 }
 
 #[test]
+fn prefetch_session_lines_follow_the_summaries() {
+    assert!(prefetch_session_lines(&[]).is_empty());
+    let summary: crate::events::BuildSummaryEvent =
+        serde_json::from_str(r#"{"ts":"2026-09-30T12:00:00Z","schema":1,"session_id":"sess"}"#)
+            .unwrap();
+    let lines = prefetch_session_lines(&[summary]);
+    let text = lines.join("\n");
+    assert!(text.contains("Prefetch sessions"), "{text}");
+    assert!(text.contains("sess"), "{text}");
+}
+
+#[test]
+fn hit_rate_row_adds_every_outcome() {
+    let row = |local, prefetch, remote, dups, misses| {
+        let dir = tempfile::tempdir().unwrap();
+        let config = save_manifest_config(dir.path().join("cache"), None);
+        let mut snap = StatsSnapshot::default();
+        snap.event_stats.local_hits = local;
+        snap.event_stats.prefetch_hits = prefetch;
+        snap.event_stats.remote_hits = remote;
+        snap.event_stats.dups = dups;
+        snap.event_stats.misses = misses;
+        let lines = render_stats(&snap, &config, SinceWindow::DEFAULT);
+        stats_row(&lines, "Hit rate").unwrap_or_default()
+    };
+    assert!(
+        row(1, 4, 0, 0, 0).contains("5 of 5 crates from cache (1 local, 0 remote, 4 prefetched)"),
+        "{}",
+        row(1, 4, 0, 0, 0)
+    );
+    assert!(
+        row(1, 0, 4, 0, 0).contains("5 of 5 crates from cache (1 local, 4 remote, 0 prefetched)"),
+        "{}",
+        row(1, 0, 4, 0, 0)
+    );
+    assert!(
+        row(3, 1, 1, 2, 0).contains("5 of 7 crates from cache (3 local, 1 remote, 1 prefetched)"),
+        "{}",
+        row(3, 1, 1, 2, 0)
+    );
+}
+
+#[test]
 #[allow(clippy::field_reassign_with_default)]
 fn render_stats_prefetch_section_gated_on_activity() {
     let dir = tempfile::tempdir().unwrap();
@@ -3921,6 +3964,23 @@ fn render_stats_prefetch_section_gated_on_activity() {
         row(&out, "Join wait"),
         "Join wait | 5 waits | 1234 ms in all, waiting on a download already in flight"
     );
+    assert_eq!(stats_row(&out, "LIST total"), None);
+    snap.prefetch.list_requests_total = 2;
+    snap.prefetch.list_failures_total = 1;
+    snap.prefetch.list_duration_ms_total = 40;
+    snap.prefetch.list_keys_total = 9;
+    let out = render_stats(&snap, &config, SinceWindow::DEFAULT);
+    assert_eq!(
+        row(&out, "LIST total"),
+        "LIST total | 2 requests | 1 failed, 40 ms, 9 keys returned"
+    );
+    snap.prefetch.list_requests_total = 0;
+    let out = render_stats(&snap, &config, SinceWindow::DEFAULT);
+    assert_eq!(stats_row(&out, "LIST total"), None);
+    snap.prefetch.dedup_join_waits = 0;
+    let out = render_stats(&snap, &config, SinceWindow::DEFAULT);
+    assert_eq!(stats_row(&out, "Join wait"), None);
+    snap.prefetch.dedup_join_waits = 5;
 
     let mut initial_only = config.clone();
     initial_only.remote_key_cache_refresh_secs = 0;

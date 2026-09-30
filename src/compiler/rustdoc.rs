@@ -10,7 +10,7 @@
 
 use anyhow::{Context, Result};
 use std::collections::BTreeMap;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 use std::sync::Mutex;
@@ -306,9 +306,12 @@ fn parse_args(args: &[String]) -> RustdocArgs {
         rest: args.get(1..).unwrap_or(&[]).to_vec(),
         ..RustdocArgs::default()
     };
-    let mut index = 1;
-    while index < args.len() {
-        let arg = &args[index];
+    let mut skip_next = false;
+    for (index, arg) in args.iter().enumerate().skip(1) {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
         if arg == "--" {
             parsed
                 .sources
@@ -317,33 +320,31 @@ fn parse_args(args: &[String]) -> RustdocArgs {
         }
         if is_query(arg) {
             parsed.query = true;
-            index += 1;
             continue;
         }
         if let Some((act, inline)) = classify(arg) {
-            let (value, consumed) = match inline {
-                Some(value) => (Some(value.to_string()), 1),
+            let value = match inline {
+                Some(value) => Some(value.to_string()),
                 None if act_takes_value(act) => match args.get(index + 1) {
-                    Some(next) => (Some(next.clone()), 2),
+                    Some(next) => {
+                        skip_next = true;
+                        Some(next.clone())
+                    }
                     None => {
                         parsed.unknown = true;
-                        index += 1;
                         continue;
                     }
                 },
-                None => (None, 1),
+                None => None,
             };
             apply(&mut parsed, act, value.as_deref());
-            index += consumed;
             continue;
         }
         if arg.starts_with('-') {
             parsed.unknown = true;
-            index += 1;
             continue;
         }
         parsed.sources.push(PathBuf::from(arg));
-        index += 1;
     }
     parsed
 }
@@ -365,7 +366,7 @@ fn classify(arg: &str) -> Option<(Act, Option<&str>)> {
     if arg.starts_with("--") {
         return long_act(arg).map(|act| (act, None));
     }
-    if arg.starts_with('-') && !arg.starts_with("--") {
+    if arg.starts_with('-') {
         return short_act(arg);
     }
     None
@@ -754,10 +755,8 @@ fn exit_code(status: &ExitStatus) -> i32 {
     status.code().unwrap_or(1)
 }
 
-fn replay(stdout: &str, stderr: &str) {
-    let mut out = std::io::stdout().lock();
+fn replay(stdout: &str, stderr: &str, mut out: impl std::io::Write, mut err: impl std::io::Write) {
     let _ = out.write_all(stdout.as_bytes());
-    let mut err = std::io::stderr().lock();
     let _ = err.write_all(stderr.as_bytes());
 }
 
@@ -930,10 +929,15 @@ pub fn run(config: &crate::config::Config, args: &[String]) -> Result<i32> {
         }
     };
     if let Some(meta) = store.get(&cache_key)?
-        && !meta.files.is_empty()
+        && cached_entry_is_reusable(&meta)
         && restore_meta(&store, &parsed, &meta).is_ok()
     {
-        replay(&meta.stdout, &meta.stderr);
+        replay(
+            &meta.stdout,
+            &meta.stderr,
+            std::io::stdout(),
+            std::io::stderr(),
+        );
         log_result(
             config,
             &root,
@@ -947,7 +951,12 @@ pub fn run(config: &crate::config::Config, args: &[String]) -> Result<i32> {
     match store.claim_build(&cache_key)? {
         crate::store::BuildClaim::Committed(meta) => {
             if restore_meta(&store, &parsed, &meta).is_ok() {
-                replay(&meta.stdout, &meta.stderr);
+                replay(
+                    &meta.stdout,
+                    &meta.stderr,
+                    std::io::stdout(),
+                    std::io::stderr(),
+                );
                 log_result(
                     config,
                     &root,
@@ -964,7 +973,12 @@ pub fn run(config: &crate::config::Config, args: &[String]) -> Result<i32> {
                 && let Some(meta) = store.get(&cache_key)?
                 && restore_meta(&store, &parsed, &meta).is_ok()
             {
-                replay(&meta.stdout, &meta.stderr);
+                replay(
+                    &meta.stdout,
+                    &meta.stderr,
+                    std::io::stdout(),
+                    std::io::stderr(),
+                );
                 log_result(
                     config,
                     &root,
@@ -1042,7 +1056,7 @@ fn compile_and_store(
     let output = spawn(parsed)?;
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    replay(&stdout, &stderr);
+    replay(&stdout, &stderr, std::io::stdout(), std::io::stderr());
     let code = exit_code(&output.status);
     if code != 0 {
         return Ok(Compiled {
@@ -1144,6 +1158,8 @@ fn passthrough(parsed: &RustdocArgs) -> Result<i32> {
     replay(
         &String::from_utf8_lossy(&output.stdout),
         &String::from_utf8_lossy(&output.stderr),
+        std::io::stdout(),
+        std::io::stderr(),
     );
     Ok(exit_code(&output.status))
 }
@@ -1157,6 +1173,10 @@ fn event_root() -> String {
     std::env::current_dir()
         .map(|path| path.to_string_lossy().into_owned())
         .unwrap_or_default()
+}
+
+fn cached_entry_is_reusable(meta: &crate::store::EntryMeta) -> bool {
+    !meta.files.is_empty()
 }
 
 fn log_pass(
@@ -1280,9 +1300,11 @@ mod tests {
         assert!(!private.unknown);
         assert_eq!(private.sources, vec![PathBuf::from("src/lib.rs")]);
 
-        let out = parse(&["rustdoc", "--out-dir", "/tmp/doc"]);
+        let out = parse(&["rustdoc", "--out-dir", "/tmp/doc", "--crate-name", "demo"]);
         assert!(!out.unknown);
         assert_eq!(out.out_dir.as_deref(), Some(Path::new("/tmp/doc")));
+        assert_eq!(out.crate_name.as_deref(), Some("demo"));
+        assert!(out.sources.is_empty());
 
         let inline = parse(&["rustdoc", "--crate-name=demo", "file=name.rs"]);
         assert_eq!(inline.crate_name.as_deref(), Some("demo"));
@@ -1310,6 +1332,10 @@ mod tests {
         assert!(!header.unknown);
         assert_eq!(header.html_files, vec![PathBuf::from("header.html")]);
 
+        let libs = parse(&["rustdoc", "--library-path", "dependency=/tmp/deps"]);
+        assert!(!libs.unknown);
+        assert_eq!(libs.library_kinds, vec!["dependency".to_string()]);
+
         let refused = parse(&["rustdoc", "--test"]);
         assert!(!RustdocCompiler.refuse_reasons(&refused).is_empty());
 
@@ -1330,6 +1356,52 @@ mod tests {
         parsed.dep_info = Some(dir.path().to_path_buf());
         let bundle = files_written(&parsed, &BTreeMap::new(), &BTreeMap::new()).unwrap();
         assert!(bundle.depinfo.is_none());
+    }
+
+    #[test]
+    fn replay_writes_stdout_and_stderr() {
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        replay("out\n", "err\n", &mut out, &mut err);
+        assert_eq!(out, b"out\n");
+        assert_eq!(err, b"err\n");
+    }
+
+    #[test]
+    fn strip_root_rejects_a_parent_segment() {
+        assert_eq!(
+            strip_root("out/demo/index.html", "out").as_deref(),
+            Some("demo/index.html")
+        );
+        assert_eq!(strip_root("out/../etc/passwd", "out"), None);
+        assert_eq!(strip_root("out", "out"), None);
+    }
+
+    #[test]
+    fn an_empty_file_list_is_not_reusable() {
+        let empty = crate::store::EntryMeta {
+            cache_key: "ab".repeat(32),
+            key_schema: 0,
+            crate_name: "demo".to_string(),
+            crate_types: Vec::new(),
+            files: Vec::new(),
+            stdout: String::new(),
+            stderr: String::new(),
+            features: Vec::new(),
+            target: String::new(),
+            profile: String::new(),
+            compile_time_ms: 0,
+            emit_kinds: Vec::new(),
+        };
+        assert!(!cached_entry_is_reusable(&empty));
+        let mut stored = empty;
+        stored.files.push(crate::store::CachedFile {
+            name: "docs.tar".to_string(),
+            size: 1,
+            hash: "cd".repeat(32),
+            executable: false,
+        });
+        assert!(cached_entry_is_reusable(&stored));
     }
 
     #[test]
@@ -1982,7 +2054,12 @@ mod tests {
         assert_eq!(code, 0);
         let log = std::fs::read_to_string(config.event_log_path()).unwrap();
         assert!(log.contains("\"result\":\"miss\""), "{log}");
-        assert!(log.contains("\"root\":"), "{log}");
+        let root = std::env::current_dir()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let encoded = serde_json::to_string(&root).unwrap();
+        assert!(log.contains(&format!("\"root\":{encoded}")), "{log}");
         let version = run(&config, &argv(&[&program, "--version"])).unwrap();
         assert_eq!(version, 7);
         let log = std::fs::read_to_string(config.event_log_path()).unwrap();

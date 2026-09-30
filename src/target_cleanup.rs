@@ -781,7 +781,8 @@ mod tests {
         let lock = std::fs::File::create(live.join("debug/.cargo-lock")).unwrap();
         lock.lock().unwrap();
         assert_eq!(plan(&policy, &tracked, now + 3 * DAY_SECS), Plan::default());
-        drop(lock);
+        // A fork elsewhere in the suite can hold a duplicate past the drop.
+        lock.unlock().unwrap();
 
         policy.auto_clean_idle_targets_days = 0;
         policy.auto_recover_min_free_bytes = kache_fs::volume_usage(&live).unwrap().total - 1;
@@ -955,7 +956,8 @@ mod tests {
         assert!(!pressure_eligible(&pressure, &tracked, later as i64));
         assert!(sweep(&pressure, later).unwrap().removed.is_empty());
         assert!(target.exists());
-        drop(lock);
+        // A fork elsewhere in the suite can hold a duplicate past the drop.
+        lock.unlock().unwrap();
         for _ in 0..200 {
             if pressure_eligible(&pressure, &tracked, later as i64) {
                 break;
@@ -1079,7 +1081,8 @@ mod tests {
         }
         assert_eq!(tracked(&store), vec![busy.clone()]);
 
-        drop(lock);
+        // A fork elsewhere in the suite can hold a duplicate past the drop.
+        lock.unlock().unwrap();
         // A process another test forks in this instant shares the lock until
         // it execs, so the release can take a moment to show.
         let mut removed = Vec::new();
@@ -1115,7 +1118,8 @@ mod tests {
         assert!(!remove(&target, identity, 7, cache.path()).unwrap());
         assert!(target.join("debug/.cargo-lock").exists());
         assert!(target.exists());
-        drop(lock);
+        // A fork elsewhere in the suite can hold a duplicate past the drop.
+        lock.unlock().unwrap();
         assert!(remove(&target, identity, 7, cache.path()).unwrap());
         assert!(!target.exists());
         assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);

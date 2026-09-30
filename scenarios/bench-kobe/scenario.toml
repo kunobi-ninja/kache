@@ -1,0 +1,79 @@
+# kobe (kunobi-ninja/kobe) compile-cache benchmark: cold, warm-same-tree, warm.
+#
+# Why kobe: a Kubernetes operator and its CLI in one workspace of four
+# packages over a kube-rs / tokio / rustls graph of about 790 locked crates.
+# It is one of our own projects, so what this arm shows is what kache would
+# save in kobe's CI and on a developer machine.
+#
+# The build-script compilers (aws-lc-sys, ring, libsqlite3-sys through cc-rs)
+# are wired the way `kache init` does it: HOST_CC and HOST_CXX, CC and CXX
+# untouched.
+name = "bench-kobe"
+tags = ["suite:bench", "project:kobe", "backend:kache", "lang:rust", "lang:cc"]
+
+requires = ["cargo", "rustc", "cc"]
+
+setup = [
+  "echo '[bench] bench-kobe needs a C compiler (aws-lc-sys, ring, libsqlite3-sys through cc-rs); cmake only as the aws-lc-sys fallback.'",
+]
+
+prepare = "cargo fetch --locked"
+
+build = """
+# Input-set predictions, with a sampled cross-check, as in bench-hk.
+export KACHE_INPUT_PREDICTIONS=1
+export KACHE_VERIFY_INPUT_PREDICTIONS=sampled
+
+repo="$(pwd -P)"
+prefix_map="-ffile-prefix-map=$repo=. -fdebug-prefix-map=$repo=. -fmacro-prefix-map=$repo=."
+export CFLAGS="${CFLAGS:-} $prefix_map"
+export CXXFLAGS="${CXXFLAGS:-} $prefix_map"
+export SOURCE_DATE_EPOCH=1735689600
+export ZERO_AR_DATE=1
+export KACHE_BASE_DIR="$repo"
+
+cargo build --locked --workspace
+"""
+
+[env]
+HOST_CC = "{kache} cc"
+HOST_CXX = "{kache} c++"
+CC_KNOWN_WRAPPER_CUSTOM = "kache"
+
+[source]
+kind   = "clone"
+repo   = "https://github.com/kunobi-ninja/kobe.git"
+# v0.60.0.
+ref    = "904a86a6e1f882d6ef595bee823c4a271fce2591"
+objdir = "target"
+
+# kobe pins its toolchain in mise.toml, not rust-toolchain.toml. Same version,
+# in the file rustup reads.
+[[file]]
+path = "rust-toolchain.toml"
+content = """
+[toolchain]
+channel = "1.95.0"
+profile = "minimal"
+"""
+
+# kobe's mise.toml installs its whole tool set (bun, helm, kind, kubectl). The
+# build needs none of it. Emptied, so the bench runs the runner's Cargo.
+[[file]]
+path = "mise.toml"
+content = ""
+
+# Validity floors, not regression bounds: a phase that recompiled the world
+# must fail loudly rather than report a flattering wall clock.
+[checks.assert.warm-same-tree]
+max_passthrough_pct = 40.0
+max_errors = 0
+min_hits = 200
+min_restored_bytes = 67108864 # 64 MiB
+
+[checks.assert.warm]
+min_key_stability_pct = 50.0
+max_passthrough_pct = 40.0
+max_errors = 0
+min_hits = 200
+min_restored_bytes = 67108864 # 64 MiB

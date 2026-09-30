@@ -41,7 +41,7 @@ on:
       scenario:
         description: "Which scenario(s) to run"
         type: choice
-        options: [all, hk-comparison, surrealdb, lance, opendal, cuda-oxide, cuda-oxide-patched, eza, aube, llvm, hk, hk-nopred, hk-pull, hk-pull-perf, hk-pull-nopred, hk-mbx, hk-pull-mbx, opendal-mbx, lance-mbx, surrealdb-mbx, firefox-sccache, firefox-mbx]
+        options: [all, hk-comparison, surrealdb, lance, opendal, kobe, cuda-oxide, cuda-oxide-patched, eza, aube, llvm, hk, hk-nopred, hk-pull, hk-pull-perf, hk-pull-nopred, hk-mbx, hk-pull-mbx, opendal-mbx, lance-mbx, surrealdb-mbx, firefox-sccache, firefox-mbx]
         default: all
       extra_args:
         description: "Extra recipe arguments (hk/eza/aube: sample count; other scenarios: --skip-clone, --retry)"
@@ -116,6 +116,10 @@ jobs:
           # aws-lc-sys (rustls) compiles outside kache; cmake + a C compiler
           # are already in the apt step below.
           opendal='{"name":"opendal","cmd":"bench opendal","dir":"bench-opendal","timeout":120,"job_timeout":165,"min_free_gb":40,"runner":"kunobi-runners"}'
+          # kobe (kunobi-ninja/kobe): our own Kubernetes operator and CLI, a
+          # four-package workspace over about 790 locked crates. Minutes, and
+          # a C compiler is all it needs.
+          kobe='{"name":"kobe","cmd":"bench kobe --warm-same-tree","dir":"bench-kobe","timeout":60,"job_timeout":90,"min_free_gb":40,"runner":"kunobi-runners"}'
           # NVlabs/cuda-oxide's examples-compile job: its rustc codegen backend,
           # the shared host dependency tree, and 200+ example workspaces built
           # into one target dir. Needs the CUDA toolkit headers and LLVM 22,
@@ -193,6 +197,7 @@ jobs:
             surrealdb)            inc="[$surrealdb]" ;;
             lance)                inc="[$lance]" ;;
             opendal)              inc="[$opendal]" ;;
+            kobe)                 inc="[$kobe]" ;;
             cuda-oxide)           inc="[$cuda_oxide]" ;;
             cuda-oxide-patched)   inc="[$cuda_oxide_patched]" ;;
             llvm)                 inc="[$llvm]" ;;
@@ -223,7 +228,7 @@ jobs:
             # so the Linux matrix is EMPTY for them (an empty include
             # skips the `bench` job cleanly). Without this they'd fall to `*)`
             # and wastefully run the whole Linux `all` matrix alongside.
-            *)                    inc="[$surrealdb,$lance,$opendal,$cuda_oxide,$cuda_oxide_patched,$llvm,$hk,$hk_nopred,$hk_pull,$hk_pull_perf,$hk_pull_nopred,$hk_pull_mbx,$eza,$aube,$opendal_mbx,$lance_mbx,$surrealdb_mbx]" ;;
+            *)                    inc="[$surrealdb,$lance,$opendal,$kobe,$cuda_oxide,$cuda_oxide_patched,$llvm,$hk,$hk_nopred,$hk_pull,$hk_pull_perf,$hk_pull_nopred,$hk_pull_mbx,$eza,$aube,$opendal_mbx,$lance_mbx,$surrealdb_mbx]" ;;
           esac
           if [ "$EVENT_NAME" = "schedule" ]; then
             inc="$(jq -c --argjson extra "[$firefox,$firefox_pull]" '. + $extra' <<<"$inc")"

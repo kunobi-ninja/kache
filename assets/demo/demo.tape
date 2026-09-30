@@ -33,7 +33,7 @@ Type "KACHE_PROGRESS=hits cargo build --locked"
 Enter
 Wait
 Sleep 2500ms
-Type "clear && kache report --last-build | head -12"
+Type "clear && kache stats --last-build | head -12"
 Enter
 Wait
 Sleep 6s

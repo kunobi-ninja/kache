@@ -30,7 +30,7 @@ tapes build on each other's state: run them in the order above, and re-run
 | Tape | Shows |
 | --- | --- |
 | `init.tape` | `kache init --check`, then `kache init` answering its prompts, then `kache doctor`. HOME and CARGO_HOME point into the demo root, so nothing on the recording machine changes. |
-| `demo.tape` | The crate is built cold off screen. On screen: the same commit in a second worktree with an empty target directory, every crate a hit, then `kache report --last-build`. |
+| `demo.tape` | The crate is built cold off screen. On screen: the same commit in a second worktree with an empty target directory, every crate a hit, then `kache stats --last-build`. |
 | `why-miss.tape` | One source edit, one recompile, and `kache why-miss` naming the key that changed. |
 | `monitor.tape` | `kache monitor` following a build in a third worktree, then the Why, Projects, and Store tabs. |
 | `clean.tape` | `kache clean` listing the target directories under the tree and how much of each is already in the store. |

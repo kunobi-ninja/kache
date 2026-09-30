@@ -2636,7 +2636,11 @@ fn discover_cc_link_sidecars_names_a_dsym_dir_as_dsym_tar() {
 #[cfg(unix)]
 #[test]
 fn execute_opt_in_link_writes_the_output() {
-    let _lock = crate::test_support::process_state_test_lock();
+    // Link from outside the checkout: a Nix dev shell's `cc` adds
+    // `-rpath $out/lib` with `$out` inside it, and a binary that names the
+    // checkout is rightly not stored.
+    let mut lock = crate::test_support::process_state_test_lock();
+    lock.enter();
     let dir = tempfile::tempdir().unwrap();
     let src_a = dir.path().join("a.c");
     let src_b = dir.path().join("b.c");

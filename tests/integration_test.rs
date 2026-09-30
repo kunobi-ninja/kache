@@ -1994,6 +1994,22 @@ fn test_cc_no_omit_leaf_frame_pointer_keys_on_probe_issue_839() {
         eprintln!("skipping: `cc` does not accept -mno-omit-leaf-frame-pointer");
         return;
     }
+    // A driver that already passes the flag on every compile (Nix's cc
+    // wrapper enables frame pointers) builds both modes the same, so one key
+    // is right there.
+    let by_default = std::process::Command::new("cc")
+        .arg("-###")
+        .arg("-c")
+        .arg(&gate_src)
+        .arg("-o")
+        .arg(probe_dir.path().join("gate.o"))
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stderr).contains("-mno-omit-leaf-frame-pointer"))
+        .unwrap_or(false);
+    if by_default {
+        eprintln!("skipping: `cc` already applies -mno-omit-leaf-frame-pointer by default");
+        return;
+    }
     build_kache();
     if !kache_caches_probe_keyed_flags(probe_dir.path()) {
         eprintln!("skipping: probe-keyed flags are not cacheable on this host");

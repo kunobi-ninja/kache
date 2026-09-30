@@ -225,9 +225,9 @@ fn deferred_cc_does_not_publish_inputs_changed_during_the_compile() {
         &compiler,
         r#"#!/bin/sh
 for argument in "$@"; do
-    case "$argument" in -###|--version|-E) exec /usr/bin/cc "$@" ;; esac
+    case "$argument" in -###|--version|-E) exec cc "$@" ;; esac
 done
-/usr/bin/cc "$@"
+cc "$@"
 status=$?
 if [ "$status" = 0 ]; then
     case " $* " in *" unit.c "*) printf '#define VALUE 17\n' > value.h ;; esac

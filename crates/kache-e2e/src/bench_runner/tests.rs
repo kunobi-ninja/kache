@@ -1744,7 +1744,8 @@ fn export_mbx_session_trace_writes_stdout_and_rejects_failure() {
     assert!(body.contains("1-1-aaaa.jsonl"), "{body}");
 
     let empty = dir.path().join("trace-empty.json");
-    export_mbx_session_trace(Path::new("/usr/bin/true"), &session, &empty).unwrap();
+    let quiet = unix_script(dir.path(), "true", "#!/bin/sh\nexit 0\n");
+    export_mbx_session_trace(&quiet, &session, &empty).unwrap();
     assert!(
         !empty.exists(),
         "a successful trace with empty stdout must not write a file"
@@ -2313,6 +2314,7 @@ fn prepare_is_a_no_op_when_the_scenario_declares_none() {
 fn mbx_pull_reports_both_revisions_and_rejects_empty_restores() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().canonicalize().unwrap();
+    let tool = unix_script(&root, "true", "#!/bin/sh\nexit 0\n");
     let repo = root.join("repo");
     std::fs::create_dir(&repo).unwrap();
     run(Command::new("git").arg("init").arg("-q").arg(&repo)).unwrap();
@@ -2379,9 +2381,9 @@ objdir = "target"
         .unwrap();
         let work = root.join(format!("run-{hits}"));
         let result = run_bench(BenchRunConfig {
-            kache: "/usr/bin/true".into(),
-            sccache: "/usr/bin/true".into(),
-            mbx: "/usr/bin/true".into(),
+            kache: tool.clone(),
+            sccache: tool.clone(),
+            mbx: tool.clone(),
             cache_backend: CacheBackend::Mbx,
             scenarios: scenarios.clone(),
             select: vec!["suite:bench".into()],

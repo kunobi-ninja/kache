@@ -1633,9 +1633,12 @@ pub(crate) fn link_sealed_out_dir(
     shared: &Path,
     cargo_out_dir: &Path,
     link: &Path,
-) -> Result<bool> {
+) -> Result<Option<HeldRun>> {
     hermetic::link_sealed_out_dir(cache_dir, shared, cargo_out_dir, link)
 }
+
+#[cfg(unix)]
+pub(crate) use hermetic::HeldRun;
 
 #[cfg(all(test, unix))]
 pub(crate) use hermetic::test_support as hermetic_test_support;

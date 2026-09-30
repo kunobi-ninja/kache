@@ -397,34 +397,52 @@ pub(super) fn in_sealed_out_dir(path: &Path) -> bool {
     })
 }
 
+/// A sealed run's lock, held shared so a sweep keeps the run. Released when
+/// dropped.
+#[cfg(unix)]
+pub(crate) struct HeldRun(std::fs::File);
+
+#[cfg(unix)]
+impl Drop for HeldRun {
+    fn drop(&mut self) {
+        // Closing our descriptor is insufficient if a concurrent fork still
+        // holds a duplicate. Release ownership before that child reaches exec.
+        let _ = self.0.unlock();
+    }
+}
+
 /// Make `link` a symlink to `shared` when `shared` is a sealed run in
 /// `cache_dir`, placed below its sandbox as `cargo_out_dir` is below its
 /// target directory, which is where a hermetic run links that `OUT_DIR`.
 /// `cargo_out_dir` is recorded as linking to the run before the link is
-/// made. `false`, with nothing made, for any other `shared` and while the
+/// made. `None`, with nothing made, for any other `shared` and while the
 /// run's lock is held exclusively.
+///
+/// The run counts as in use only once `cargo_out_dir` links to it, so hold
+/// the returned lock until `link` is renamed there.
 #[cfg(unix)]
 pub(super) fn link_sealed_out_dir(
     cache_dir: &Path,
     shared: &Path,
     cargo_out_dir: &Path,
     link: &Path,
-) -> Result<bool> {
+) -> Result<Option<HeldRun>> {
     let Some(sandbox) = sandbox_of(cache_dir, shared, cargo_out_dir) else {
-        return Ok(false);
+        return Ok(None);
     };
     let lock = open_lock(&sandbox.lock_path())?;
-    // Shared, so a sweep cannot remove the run between finding and recording
-    // it; not waited for, so seeding stays within its deadline.
+    // Shared, so a sweep cannot remove the run while it is being linked; not
+    // waited for, so seeding stays within its deadline.
     if lock.try_lock_shared().is_err() {
-        return Ok(false);
+        return Ok(None);
     }
+    let held = HeldRun(lock);
     if sealed(&sandbox)?.is_none() {
-        return Ok(false);
+        return Ok(None);
     }
     record_referrer(&sandbox, cargo_out_dir)?;
     std::os::unix::fs::symlink(shared, link)?;
-    Ok(true)
+    Ok(Some(held))
 }
 
 /// The sandbox `shared` is the `OUT_DIR` of, when `shared` sits below a
@@ -791,16 +809,43 @@ mod tests {
             std::fs::create_dir_all(cargo.parent().unwrap()).unwrap();
             let staging = cargo.with_file_name("staging");
 
-            assert!(link_sealed_out_dir(&cache, &shared, &cargo, &staging).unwrap());
+            let run = link_sealed_out_dir(&cache, &shared, &cargo, &staging)
+                .unwrap()
+                .expect("linked");
             assert_eq!(std::fs::read_link(&staging).unwrap(), shared);
+            // `kache purge` keeps no unlinked run. The recorded `OUT_DIR` does
+            // not link to it until the rename, so only the held lock keeps it.
+            let purge = || {
+                sweep(
+                    &cache,
+                    std::time::SystemTime::now(),
+                    std::time::Duration::ZERO,
+                )
+                .unwrap()
+            };
+            assert_eq!(
+                purge(),
+                Sweep {
+                    removed: 0,
+                    kept: 1
+                }
+            );
             std::fs::rename(&staging, &cargo).unwrap();
+            drop(run);
+            assert_eq!(
+                purge(),
+                Sweep {
+                    removed: 0,
+                    kept: 1
+                }
+            );
             assert_eq!(test_support::linked_to(&shared, below), vec![cargo.clone()]);
             std::fs::remove_file(&cargo).unwrap();
 
             let refused = |cache: &Path, shared: &Path, cargo_out_dir: &Path| {
                 let made = link_sealed_out_dir(cache, shared, cargo_out_dir, &staging).unwrap();
                 assert!(std::fs::symlink_metadata(&staging).is_err());
-                !made
+                made.is_none()
             };
             let other_unit = dir.path().join("new/target").join(other_unit);
             assert!(
@@ -885,6 +930,39 @@ mod tests {
             remove_sandbox(&swept.root).unwrap();
             remove_sandbox(foreign.ancestors().nth(below.components().count()).unwrap()).unwrap();
         }
+    }
+
+    #[test]
+    fn a_released_run_is_free_while_a_fork_holds_a_duplicate() {
+        let dir = tempfile::tempdir().unwrap();
+        let below = Path::new("debug/build/z-0123456789abcdef/out");
+        let cache = dir.path().join("cache");
+        let key = "ab".repeat(32);
+        let shared = test_support::sealed_run(&cache, &key, below);
+        let cargo = dir.path().join("new/target").join(below);
+        std::fs::create_dir_all(cargo.parent().unwrap()).unwrap();
+        let run = link_sealed_out_dir(&cache, &shared, &cargo, &cargo)
+            .unwrap()
+            .expect("linked");
+        // SAFETY: the child only waits in `pause` until the parent kills it.
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork failed");
+        if child == 0 {
+            loop {
+                // SAFETY: async-signal-safe; nothing else runs in the child.
+                unsafe { libc::pause() };
+            }
+        }
+        drop(run);
+        let lock = open_lock(&Sandbox::new(&cache, &key, below).lock_path()).unwrap();
+        let free = lock.try_lock().is_ok();
+        let _ = lock.unlock();
+        // SAFETY: `child` is this test's own child process.
+        unsafe {
+            libc::kill(child, libc::SIGKILL);
+            libc::waitpid(child, std::ptr::null_mut(), 0);
+        }
+        assert!(free, "the child's duplicate kept the run locked");
     }
 
     #[test]

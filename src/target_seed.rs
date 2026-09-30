@@ -48,6 +48,12 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+#[cfg(unix)]
+use crate::build_script::HeldRun;
+/// No hermetic run is linked to off Unix.
+#[cfg(not(unix))]
+type HeldRun = std::convert::Infallible;
+
 /// How long the daemon copies for. Copying stops at this deadline, between
 /// files, and Cargo builds whatever was not copied.
 pub(crate) const SEED_DEADLINE: Duration = Duration::from_secs(3);
@@ -430,8 +436,11 @@ fn place_tree(from: &Path, to: &Path, cache_dir: &Path, deadline: Instant) -> st
         to,
         cache_dir,
     };
-    let copied =
-        copy_tree(from, &staging, tree, deadline).and_then(|()| std::fs::rename(&staging, to));
+    // Held past the rename, so a sweep keeps each run the tree links to until
+    // its recorded `OUT_DIR` does.
+    let mut runs = Vec::new();
+    let copied = copy_tree(from, &staging, tree, &mut runs, deadline)
+        .and_then(|()| std::fs::rename(&staging, to));
     if copied.is_err() {
         let _ = std::fs::remove_dir_all(&staging);
         let _ = std::fs::remove_file(&staging);
@@ -442,6 +451,7 @@ fn place_tree(from: &Path, to: &Path, cache_dir: &Path, deadline: Instant) -> st
 /// A tree [`place_tree`] copies: where it comes from, where it is placed,
 /// and the cache whose hermetic runs a link in it may name.
 #[derive(Clone, Copy)]
+#[cfg_attr(not(unix), allow(dead_code))]
 struct Placing<'a> {
     from: &'a Path,
     to: &'a Path,
@@ -452,14 +462,21 @@ struct Placing<'a> {
 /// modification time. A symbolic link that stays inside the tree is copied
 /// as a link, and a build script's `OUT_DIR` linked to its sealed hermetic
 /// run is linked to the same run; any other symbolic link fails the copy,
-/// and so does reaching `deadline` before a file.
+/// and so does reaching `deadline` before a file. The runs linked to are
+/// added to `runs`, held.
 #[cfg_attr(not(unix), allow(clippy::only_used_in_recursion))]
-fn copy_tree(from: &Path, to: &Path, tree: Placing, deadline: Instant) -> std::io::Result<()> {
+fn copy_tree(
+    from: &Path,
+    to: &Path,
+    tree: Placing,
+    runs: &mut Vec<HeldRun>,
+    deadline: Instant,
+) -> std::io::Result<()> {
     let metadata = std::fs::symlink_metadata(from)?;
     if metadata.is_dir() {
         std::fs::create_dir(to)?;
         for entry in entries(from) {
-            copy_tree(&entry, &to.join(file_name(&entry)), tree, deadline)?;
+            copy_tree(&entry, &to.join(file_name(&entry)), tree, runs, deadline)?;
         }
         return Ok(());
     }
@@ -476,9 +493,11 @@ fn copy_tree(from: &Path, to: &Path, tree: Placing, deadline: Instant) -> std::i
             return std::os::unix::fs::symlink(target, to);
         }
         let cargo_out_dir = tree.to.join(below);
-        if crate::build_script::link_sealed_out_dir(tree.cache_dir, &target, &cargo_out_dir, to)
-            .map_err(std::io::Error::other)?
+        if let Some(run) =
+            crate::build_script::link_sealed_out_dir(tree.cache_dir, &target, &cargo_out_dir, to)
+                .map_err(std::io::Error::other)?
         {
+            runs.push(run);
             return Ok(());
         }
     }

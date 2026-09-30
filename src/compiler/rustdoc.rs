@@ -481,7 +481,7 @@ fn scan_rust(bytes: &[u8]) -> Result<Vec<Found>> {
             if !inner && let Some(path) = path_attribute(&tokens[start..end]) {
                 pending_path = Some(path);
             }
-            index = end + 1;
+            index = end.saturating_add(1);
             continue;
         }
         if ident_at(&tokens, index, "pub") {
@@ -490,7 +490,7 @@ fn scan_rust(bytes: &[u8]) -> Result<Vec<Found>> {
                 let Some(end) = close_at(&tokens, index + 1, b'(', b')') else {
                     break;
                 };
-                index = end + 1;
+                index = end.saturating_add(1);
             }
             continue;
         }
@@ -2098,6 +2098,15 @@ mod tests {
             vec!["real".to_string()]
         );
         assert_eq!(
+            module_names("/*x mod fake;*/mod real;"),
+            vec!["real".to_string()]
+        );
+        assert_eq!(
+            module_names("/* * mod fake;*/mod real;"),
+            vec!["real".to_string()]
+        );
+        assert!(rust_tokens(b"/*a*").len() < 8);
+        assert_eq!(
             module_names("// mod fake;\nmod real;"),
             vec!["real".to_string()]
         );
@@ -2130,6 +2139,7 @@ mod tests {
         assert_eq!(skip_char_or_lifetime(b"fn 'm'", 3), 6);
         assert_eq!(skip_char_or_lifetime(b"'\\z;", 0), 1);
         assert_eq!(skip_char_or_lifetime(b"'\\u{61}'", 0), 8);
+        assert_eq!(skip_char_or_lifetime(b"'\\n'", 0), 4);
         assert_eq!(skip_char_or_lifetime(b"'\\u{61;", 0), 1);
         assert_eq!(skip_byte_literal(b"b'a'", 0), 4);
         assert_eq!(skip_byte_literal(b"b\"hi\"", 0), 5);
@@ -2142,12 +2152,26 @@ mod tests {
 
         let nested = rust_tokens(b"(())");
         assert_eq!(close_at(&nested, 1, b'(', b')'), Some(3));
+        let idents: Vec<_> = rust_tokens(b"mod real")
+            .into_iter()
+            .filter_map(|token| match token {
+                Tok::Ident(text) => Some(text),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(idents, ["mod".to_string(), "real".to_string()]);
+        assert_eq!(skip_byte_literal(b"br", 0), 1);
+        assert_eq!(skip_byte_literal(b"bx", 0), 1);
     }
 
     #[test]
     fn attributes_keep_only_an_outer_path() {
         assert_eq!(
             module_path("#[path = \"renamed.rs\"]\nmod child;"),
+            Some("renamed.rs".to_string())
+        );
+        assert_eq!(
+            module_path("#[path = \"renamed.rs\";]\nmod child;"),
             Some("renamed.rs".to_string())
         );
         assert_eq!(
@@ -2167,6 +2191,14 @@ mod tests {
         assert_eq!(
             module_names("pub(super(crate)) mod child;"),
             vec!["child".to_string()]
+        );
+        assert_eq!(
+            module_names("pub(pub) mod child;"),
+            vec!["child".to_string()]
+        );
+        assert_eq!(
+            module_path("#[path = \"renamed.rs\"]\npub(;) mod child;"),
+            Some("renamed.rs".to_string())
         );
     }
 

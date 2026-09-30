@@ -1179,11 +1179,13 @@ mod tests {
     /// literal `./~/probes/` directory relative to the build's cwd.
     #[test]
     fn family_probe_cache_dir_expands_tilde() {
+        // Read HOME under the lock: other tests point it at a tempdir while
+        // holding it, and a read taken before it can see their value.
+        let lock = crate::config::config_path_lock();
         let Some(home) = dirs::home_dir() else {
             eprintln!("skipping: no home dir");
             return;
         };
-        let lock = crate::config::config_path_lock();
         let previous = std::env::var_os("KACHE_CACHE_DIR");
 
         unsafe { std::env::set_var("KACHE_CACHE_DIR", "~") };

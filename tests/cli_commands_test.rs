@@ -1801,7 +1801,13 @@ fn init_saves_shell_setup_preserves_cargo_choices_and_is_idempotent() {
     // System bashrc files can print a welcome banner before the user's rc.
     // Capture the resolved compiler separately from shell startup output.
     let resolved_cc = e.home.join("resolved-cc");
-    let shell = std::process::Command::new("/bin/bash")
+    // Nix provides Bash in its store, not at /bin/bash. Resolve it before
+    // replacing the child's PATH.
+    let bash = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .map(|dir| dir.join("bash"))
+        .find(|path| path.is_file())
+        .expect("Bash on test PATH");
+    let shell = std::process::Command::new(bash)
         .args([
             "--noprofile",
             "--rcfile",

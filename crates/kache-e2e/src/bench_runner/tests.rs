@@ -2748,6 +2748,27 @@ fn the_refusal_categories_come_from_their_own_counters() {
     );
 }
 
+/// A phase's own load reading reaches the payload, and the external arms,
+/// which do not carry one yet, report none rather than a zero.
+#[test]
+fn the_load_a_phase_was_measured_under_reaches_the_payload() {
+    let load = crate::bench_host::PhaseLoad {
+        cpu_pressure_some_us: Some(7_000_000),
+        loadavg_start: Some([31.0, 20.0, 10.0]),
+        ..Default::default()
+    };
+    let metrics = PhaseMetrics {
+        load: load.clone(),
+        ..Default::default()
+    };
+    assert_eq!(otlp_phase("warm", &metrics, 0).load, Some(load));
+
+    let sccache = SccachePhaseMetrics::from_raw(&serde_json::json!({}), 1_000);
+    assert_eq!(otlp_sccache_phase("warm", &sccache, 0).load, None);
+    let mbx = MbxPhaseMetrics::from_report(&serde_json::json!({}), 1_000);
+    assert_eq!(otlp_mbx_phase("warm", &mbx, 0).load, None);
+}
+
 /// The same-tree warm is a phase of the same gauges, present only when it
 /// ran, between cold and the cross-clone warm, and measured on the cold
 /// clone's objdir.

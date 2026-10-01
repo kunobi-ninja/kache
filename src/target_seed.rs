@@ -43,7 +43,7 @@
 //! the build uses, and `debug` is the one `build`, `check`, `test` and
 //! `clippy` share.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -369,23 +369,46 @@ fn file_names_the_donor(path: &Path, len: u64, needles: &[String]) -> bool {
     let Ok(bytes) = std::fs::read(path) else {
         return true;
     };
-    needles.iter().any(|needle| bytes_contain(&bytes, needle))
+    needles
+        .iter()
+        .any(|needle| crate::build_script::find_bytes(&bytes, needle.as_bytes()).is_some())
 }
 
-fn bytes_contain(haystack: &[u8], needle: &str) -> bool {
-    let needle = needle.as_bytes();
-    haystack
-        .windows(needle.len())
-        .any(|window| window == needle)
+/// The files in a shared-layout donor's `deps/`, by the unit hash their name
+/// carries (`<name>-<hash>` or `<name>-<hash>.<ext>`). `deps/` holds a file
+/// or more per unit, so it is listed once per donor, not once per unit.
+fn deps_by_hash(deps: &Path) -> HashMap<String, Vec<PathBuf>> {
+    let mut index: HashMap<String, Vec<PathBuf>> = HashMap::new();
+    for file in entries(deps) {
+        let name = file_name(&file);
+        for hash in unit_hashes(&name) {
+            index.entry(hash.to_owned()).or_default().push(file.clone());
+        }
+    }
+    index
+}
+
+/// Every unit hash in a `deps/` file name: 16 hex digits after a `-`,
+/// followed by a `.` or the end of the name.
+fn unit_hashes(name: &str) -> impl Iterator<Item = &str> {
+    name.match_indices('-').filter_map(move |(at, _)| {
+        let rest = &name[at + 1..];
+        let hash = rest.get(..16)?;
+        (crate::cargo_layout::is_unit_hash(hash)
+            && matches!(rest.as_bytes().get(16), None | Some(b'.')))
+        .then_some(hash)
+    })
 }
 
 /// Copy one unit from the donor profile `from` to `to`. The unit's marker
-/// goes last, by rename.
+/// goes last, by rename. `deps` is [`deps_by_hash`] of the donor's `deps/`
+/// for the shared layout.
 fn copy_unit(
     from: &Path,
     to: &Path,
     layout: Layout,
     unit: &Unit,
+    deps: &HashMap<String, Vec<PathBuf>>,
     cache_dir: &Path,
     deadline: Instant,
 ) -> std::io::Result<()> {
@@ -402,14 +425,12 @@ fn copy_unit(
         }
         Layout::Shared => {
             let named = format!("{}-{}", unit.package, unit.hash);
-            let suffix = format!("-{}", unit.hash);
-            let deps = to.join("deps");
-            std::fs::create_dir_all(&deps)?;
-            for file in entries(&from.join("deps")) {
-                let name = file_name(&file);
-                let ours = name.contains(&format!("{suffix}.")) || name.ends_with(&suffix);
-                if ours && !deps.join(&name).exists() {
-                    place_tree(&file, &deps.join(&name), cache_dir, deadline)?;
+            let to_deps = to.join("deps");
+            std::fs::create_dir_all(&to_deps)?;
+            for file in deps.get(&unit.hash).into_iter().flatten() {
+                let name = file_name(file);
+                if !to_deps.join(&name).exists() {
+                    place_tree(file, &to_deps.join(&name), cache_dir, deadline)?;
                 }
             }
             let build = from.join("build").join(&named);
@@ -578,6 +599,10 @@ pub(crate) fn seed(
         let Some(_theirs) = try_lock(&from.join(".cargo-lock")) else {
             continue;
         };
+        let deps = match layout {
+            Layout::Shared => deps_by_hash(&from.join("deps")),
+            Layout::PerUnit => HashMap::new(),
+        };
         let mut copied = 0;
         for unit in units(&from, layout, &packages) {
             if Instant::now() >= deadline {
@@ -589,7 +614,7 @@ pub(crate) fn seed(
             {
                 continue;
             }
-            match copy_unit(&from, &to, layout, &unit, cache_dir, deadline) {
+            match copy_unit(&from, &to, layout, &unit, &deps, cache_dir, deadline) {
                 Ok(()) => copied += 1,
                 Err(error) => {
                     tracing::debug!("did not seed {}-{}: {error}", unit.package, unit.hash)
@@ -1622,6 +1647,45 @@ source = "git+https://example.com/gitdep#abc"
             );
             assert_eq!(linked_to(&shared, below), vec![to.clone()], "{layout:?}");
         }
+    }
+
+    #[test]
+    fn a_deps_file_is_indexed_by_the_unit_hash_in_its_name() {
+        let hash = "0123456789abcdef";
+        for name in [
+            format!("libfoo_bar-{hash}.rlib"),
+            format!("libfoo_bar-{hash}.so.1"),
+            format!("foo-bar-{hash}"),
+            format!("foo_bar-{hash}.d"),
+        ] {
+            assert_eq!(unit_hashes(&name).collect::<Vec<_>>(), vec![hash], "{name}");
+        }
+        for name in [
+            format!("foo-{hash}0.rlib"),
+            format!("foo-{hash}x"),
+            "foo-0123456789abcdeg.rlib".to_owned(),
+            format!("foo_{hash}.rlib"),
+        ] {
+            assert!(unit_hashes(&name).next().is_none(), "{name}");
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        for name in [
+            format!("libfoo-{hash}.rlib"),
+            format!("foo-{hash}.d"),
+            "other.d".to_owned(),
+        ] {
+            write(&dir.path().join(name), "x");
+        }
+        let index = deps_by_hash(dir.path());
+        assert_eq!(index.len(), 1);
+        assert_eq!(
+            index[hash],
+            vec![
+                dir.path().join(format!("foo-{hash}.d")),
+                dir.path().join(format!("libfoo-{hash}.rlib"))
+            ]
+        );
     }
 
     #[test]

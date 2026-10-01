@@ -765,9 +765,15 @@ fn store_failures_are_visible_without_leaving_the_miss_accounting() {
     assert_eq!(report.summary.store_failures, 1);
 
     let text = format_text(&report);
-    assert!(text.contains("Compiled but not cached: 1"), "text: {text}");
+    assert_eq!(
+        text_row(&text, "Not stored").as_deref(),
+        Some("Not stored | 1 | compiled but not cached, so they miss again next build"),
+        "text: {text}"
+    );
     assert!(
-        text.contains("[not cached: refusing to cache zero-byte artifact: liblint.rmeta]"),
+        text_row(&text, "lint_crate")
+            .unwrap()
+            .ends_with(" | not cached: refusing to cache zero-byte artifact: liblint.rmeta"),
         "the miss row should carry the reason: {text}"
     );
 }
@@ -1159,7 +1165,11 @@ fn report_window_narrows_events_and_labels_itself() {
     assert_eq!(wide.meta.since_hours, 24);
     assert_eq!(wide.meta.since_secs, 86_400);
 
-    assert!(format_text(&narrow).contains("kache build report (last 15m)"));
+    assert!(
+        format_text(&narrow).starts_with("kache · last 15m · full report\n"),
+        "{}",
+        format_text(&narrow)
+    );
     assert!(format_markdown(&narrow).contains("| Window | last 15m |"));
     assert!(format_github(&narrow).contains("| **Window** | last 15m |"));
     assert!(format_github(&narrow).contains("· last 15m*"));
@@ -1729,13 +1739,23 @@ fn text_markdown_and_github_reports_show_the_wrapper_phases() {
     let report = generate_report(&config, SinceWindow::DEFAULT, 10).unwrap();
 
     let text = format_text(&report);
-    for line in [
-        "  Startup: ~7ms aggregate (avg 3.5ms/crate)",
-        "  Dep-info pre-pass: 2 runs, ~15ms aggregate (avg 7.5ms/run)",
-        "  Scheduler wait: ~18ms aggregate (flight ~7ms, permit ~11ms)",
-        "  Unattributed: ~47ms aggregate (avg 23.5ms/crate)",
+    for (label, row) in [
+        ("Startup", "Startup | 7 ms | 3.5 ms | per crate"),
+        (
+            "Dep-info pre-pass",
+            "Dep-info pre-pass | 15 ms | 7.5 ms | per run, 2 runs",
+        ),
+        (
+            "Scheduler wait",
+            "Scheduler wait | 18 ms | 7 ms on a shared compile, 11 ms for a permit",
+        ),
+        ("Unattributed", "Unattributed | 47 ms | 24 ms | per crate"),
     ] {
-        assert!(text.contains(line), "text is missing {line:?}:\n{text}");
+        assert_eq!(
+            text_row(&text, label).as_deref(),
+            Some(row),
+            "text is missing {row:?}:\n{text}"
+        );
     }
 
     // Percentages are of tracked wrapper time: 40 + 500 = 540 ms.
@@ -1771,7 +1791,7 @@ fn reports_without_crates_show_no_phase_lines() {
     events::clear_events(&config.event_log_path()).unwrap();
     let report = generate_report(&config, SinceWindow::DEFAULT, 10).unwrap();
     assert_eq!(report.summary.total_crates, 0);
-    assert!(!format_text(&report).contains("Startup:"));
+    assert_eq!(text_row(&format_text(&report), "Startup"), None);
     assert!(!format_markdown(&report).contains("| Startup |"));
     assert!(!format_github(&report).contains("| Startup |"));
 }
@@ -2411,11 +2431,28 @@ fn test_text_output() {
     let report = generate_report(&config, SinceWindow::DEFAULT, 10).unwrap();
 
     let text = format_text(&report);
-    assert!(text.contains("kache build report"));
-    assert!(text.contains("hit rate"));
-    assert!(text.contains("Timing:"));
-    assert!(text.contains("Remote transfer:"));
-    assert!(text.contains("Passthroughs/skips:"));
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines[0], "kache · last 24h · full report");
+    assert!(text_row(&text, "Hit rate").is_some(), "{text}");
+    assert!(lines.contains(&"Timing"), "{text}");
+    assert!(text_row(&text, "Downloaded").is_some(), "{text}");
+    assert!(lines.contains(&"Not cached"), "{text}");
+}
+
+/// The text-report row labelled `label`, its non-empty cells joined with
+/// ` | `. Section rows and table rows both split on three spaces.
+fn text_row(text: &str, label: &str) -> Option<String> {
+    let line = text.lines().find(|line| {
+        line.strip_prefix("  ")
+            .and_then(|rest| rest.strip_prefix(label))
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with("   "))
+    })?;
+    let cells: Vec<&str> = line
+        .split("   ")
+        .map(str::trim)
+        .filter(|cell| !cell.is_empty())
+        .collect();
+    Some(cells.join(" | "))
 }
 
 #[test]
@@ -2466,7 +2503,17 @@ fn render_includes_storage_and_gc_sections_when_present() {
         assert!(rendered.contains("Storage"), "missing Storage section");
     }
     let text = format_text(&report);
-    assert!(text.contains("Storage:"), "text missing Storage section");
+    assert_eq!(
+        text_row(&text, "Stored").as_deref(),
+        Some("Stored | 4.0 KiB | as 2.0 KiB of blobs, 2.0 KiB saved by dedup"),
+        "text missing the Stored row: {text}"
+    );
+    assert!(
+        text_row(&text, "Last GC")
+            .unwrap()
+            .contains("7 entries evicted"),
+        "{text}"
+    );
     // GC summary surfaces its evicted-entry count in every format.
     for rendered in [
         format_markdown(&report),
@@ -2571,12 +2618,38 @@ fn render_network_and_error_sections_with_all_optional_fields() {
 
     let positive_markdown = format_markdown(&report);
     let positive_github = format_github(&report);
-    let positive_text = format_text(&report);
+    let text = format_text(&report);
     assert!(
         positive_github.contains("67 MB/s observed wall span"),
         "GitHub summary must prefer the observed wall-span rate: {positive_github}"
     );
-    for rendered in [positive_markdown, positive_github, positive_text] {
+    // The text report states the same facts as rows and tables.
+    for (label, row) in [
+        ("Uploaded", "Uploaded | 5.0 MiB | 4 ok, 2 failed"),
+        (
+            "Compression",
+            "Compression | 3.2x | 64.0 MiB sent as 20.0 MiB",
+        ),
+        ("Blobs", "Blobs | 6 of 10 | already local (60% skipped)"),
+        ("boom", "boom | "),
+        (
+            "Throughput",
+            "Throughput | 66.7 MB/s | over 300 ms, 10 timed downloads, up to 4 at once",
+        ),
+        (
+            "Read rate",
+            "Read rate | 70.0 MB/s | 60.0 MB/s with open, 50.0 MB/s end to end",
+        ),
+        (
+            "Slowest phase",
+            "Slowest phase | read/transfer | 800 ms (55.5%)",
+        ),
+        ("import lock wait", "import lock wait | 35 ms"),
+    ] {
+        let found = text_row(&text, label).unwrap_or_default();
+        assert!(found.starts_with(row), "missing {row:?}: {text}");
+    }
+    for rendered in [positive_markdown, positive_github] {
         let lower = rendered.to_lowercase();
         // Upload row (uploads_ok > 0) and its compression/existence split.
         assert!(
@@ -2643,12 +2716,23 @@ fn render_network_and_error_sections_with_all_optional_fields() {
 
     let legacy_markdown = format_markdown(&report);
     let legacy_github = format_github(&report);
-    let legacy_text = format_text(&report);
+    let text = format_text(&report);
     assert!(
         legacy_github.contains("70 MB/s cumulative read service"),
         "GitHub summary must label the legacy fallback as cumulative: {legacy_github}"
     );
-    for rendered in [legacy_markdown, legacy_github, legacy_text] {
+    assert_eq!(
+        text_row(&text, "Throughput").as_deref(),
+        Some("Throughput | unknown | older transfer events carry no timing"),
+        "zero observed span must render the legacy-event fallback: {text}"
+    );
+    assert_eq!(
+        text_row(&text, "import lock wait").as_deref(),
+        Some("import lock wait | 35 ms"),
+        "isolated import-lock timing must render the phase row: {text}"
+    );
+    assert_eq!(text_row(&text, "Slowest phase"), None, "{text}");
+    for rendered in [legacy_markdown, legacy_github] {
         let lower = rendered.to_lowercase();
         assert!(
             lower.contains("observed wall-span throughput") && lower.contains("unavailable"),
@@ -2663,11 +2747,17 @@ fn render_network_and_error_sections_with_all_optional_fields() {
     let network = report.network.as_mut().unwrap();
     network.downloads_ok = 0;
     network.total_import_lock_wait_ms = 0;
-    for rendered in [
-        format_markdown(&report),
-        format_github(&report),
-        format_text(&report),
-    ] {
+    let text = format_text(&report);
+    assert_eq!(
+        text_row(&text, "Throughput"),
+        None,
+        "no downloads must not claim a legacy throughput fallback: {text}"
+    );
+    assert!(
+        !text.lines().any(|line| line == "Download phases"),
+        "all-zero phase totals must omit the phase table: {text}"
+    );
+    for rendered in [format_markdown(&report), format_github(&report)] {
         let lower = rendered.to_lowercase();
         assert!(
             !lower.contains("unavailable (legacy transfer events)"),
@@ -3367,8 +3457,13 @@ fn storage_render_flags_impossible_dedup_accounting() {
     assert!(!github.contains("0 B dedup saved"), "{github}");
 
     let text = format_text(&report);
-    assert!(text.contains("Store accounting inconsistent"), "{text}");
-    assert!(text.contains("store index needs repair"), "{text}");
+    assert_eq!(
+        text_row(&text, "Stored").as_deref(),
+        Some(
+            "Stored | inconsistent | 29 B in entries, 56 B in indexed blobs; the store index needs repair"
+        ),
+        "{text}"
+    );
 }
 
 #[test]
@@ -3387,12 +3482,22 @@ fn storage_render_preserves_zero_boundaries_and_summary_choice() {
     for (logical, blobs) in [(1, 0), (0, 1)] {
         let (github, text) = render(logical, blobs, true);
         assert!(github.contains("Store footprint"), "{github}");
-        assert!(text.contains("  Store:"), "{text}");
+        assert!(
+            text_row(&text, "Stored")
+                .unwrap()
+                .starts_with(&format!("Stored | {logical} B | as {blobs} B of blobs")),
+            "{text}"
+        );
     }
     for (logical, blobs) in [(1, 0), (0, 1)] {
         let (github, text) = render(logical, blobs, false);
         assert!(github.contains("accounting inconsistent"), "{github}");
-        assert!(text.contains("Store accounting inconsistent"), "{text}");
+        assert!(
+            text_row(&text, "Stored")
+                .unwrap()
+                .starts_with("Stored | inconsistent | "),
+            "{text}"
+        );
     }
 
     let (github, _) = render(1, 1, true);
@@ -3773,4 +3878,268 @@ fn redact_replaces_keys_and_paths_and_leaves_empty_fields_empty() {
     assert_eq!(report.timed_transfers[0].object_key, "redacted");
     assert_eq!(report.timed_transfers[1].cache_key, "");
     assert_eq!(report.timed_transfers[1].object_key, "");
+}
+
+fn blank_report() -> BuildReport {
+    let dir = tempfile::tempdir().unwrap();
+    let config = crate::test_support::test_config(dir.path().to_path_buf());
+    generate_report(&config, crate::since::SinceWindow::DEFAULT, 10).unwrap()
+}
+
+fn zero_network() -> NetworkAnalysis {
+    serde_json::from_value(serde_json::json!({
+        "bytes_up": 0,
+        "bytes_down": 0,
+        "uploads_ok": 0,
+        "uploads_failed": 0,
+        "downloads_ok": 0,
+        "downloads_failed": 0,
+        "avg_download_ms": 0.0,
+        "p95_download_ms": 0,
+        "max_download_ms": 0,
+        "throughput_mbps": 0.0,
+        "network_throughput_mbps": 0.0,
+        "compression_ratio": 0.0,
+        "original_bytes_down": 0,
+        "total_decompress_ms": 0,
+        "total_disk_io_ms": 0,
+        "blobs_skipped": 0,
+        "blobs_total": 0,
+        "slowest_downloads": []
+    }))
+    .unwrap()
+}
+
+fn miss_detail(name: &str) -> CrateDetail {
+    serde_json::from_value(serde_json::json!({
+        "crate_name": name,
+        "result": "miss",
+        "elapsed_ms": 1,
+        "compile_time_ms": 1,
+        "overhead_ms": 0,
+        "size": 0,
+        "cache_key": "k"
+    }))
+    .unwrap()
+}
+
+fn heading(text: &str, title: &str) -> bool {
+    text.lines().any(|line| line == title)
+}
+
+#[test]
+fn text_summary_rows_appear_only_past_zero() {
+    let mut report = blank_report();
+    report.suggestions.clear();
+    report.summary.local_hits = 2;
+    report.timing.hit_time_ms = 1;
+    let text = format_text(&report);
+    assert!(text_row(&text, "Hit overhead").is_some(), "{text}");
+
+    report.summary.local_hits = 0;
+    let text = format_text(&report);
+    assert!(text_row(&text, "Hit overhead").is_none(), "{text}");
+
+    report.summary.local_hits = 2;
+    report.timing.hit_time_ms = 0;
+    let text = format_text(&report);
+    assert!(text_row(&text, "Hit overhead").is_none(), "{text}");
+
+    report.timing.miss_compile_time_ms = 2;
+    let text = format_text(&report);
+    assert!(text_row(&text, "Miss work").is_some(), "{text}");
+    report.timing.miss_compile_time_ms = 0;
+    let text = format_text(&report);
+    assert!(text_row(&text, "Miss work").is_none(), "{text}");
+
+    report.summary.dups = 2;
+    let text = format_text(&report);
+    assert!(text_row(&text, "Duplicates").is_some(), "{text}");
+    report.summary.dups = 0;
+    let text = format_text(&report);
+    assert!(text_row(&text, "Duplicates").is_none(), "{text}");
+
+    report.summary.store_failures = 2;
+    let text = format_text(&report);
+    assert!(text_row(&text, "Not stored").is_some(), "{text}");
+    report.summary.store_failures = 0;
+    let text = format_text(&report);
+    assert!(text_row(&text, "Not stored").is_none(), "{text}");
+
+    report.summary.errors = 2;
+    let text = format_text(&report);
+    assert!(text_row(&text, "Errors").is_some(), "{text}");
+    report.summary.errors = 0;
+    let text = format_text(&report);
+    assert!(text_row(&text, "Errors").is_none(), "{text}");
+
+    for (passthroughs, skipped, probes) in [(2, 0, 0), (0, 2, 0), (0, 0, 2)] {
+        report.summary.passthroughs = passthroughs;
+        report.summary.skipped = skipped;
+        report.summary.probes = probes;
+        let text = format_text(&report);
+        assert!(text_row(&text, "Not cached").is_some(), "{text}");
+    }
+    report.summary.passthroughs = 0;
+    report.summary.skipped = 0;
+    report.summary.probes = 0;
+    let text = format_text(&report);
+    assert!(text_row(&text, "Not cached").is_none(), "{text}");
+    assert!(!heading(&text, "Not cached"), "{text}");
+}
+
+#[test]
+fn text_network_and_storage_rows_hide_a_zero() {
+    let mut report = blank_report();
+    report.suggestions.clear();
+    let mut network = zero_network();
+    network.dominant_download_phase = "body".to_string();
+    network.dominant_download_phase_ms = 2;
+    report.network = Some(network);
+    let text = format_text(&report);
+    assert!(text_row(&text, "Slowest phase").is_some(), "{text}");
+
+    report
+        .network
+        .as_mut()
+        .unwrap()
+        .dominant_download_phase
+        .clear();
+    let text = format_text(&report);
+    assert!(text_row(&text, "Slowest phase").is_none(), "{text}");
+
+    let network = report.network.as_mut().unwrap();
+    network.dominant_download_phase = "body".to_string();
+    network.dominant_download_phase_ms = 0;
+    let text = format_text(&report);
+    assert!(text_row(&text, "Slowest phase").is_none(), "{text}");
+
+    report.network.as_mut().unwrap().compression_ratio = 0.0;
+    let text = format_text(&report);
+    assert!(text_row(&text, "Compression").is_none(), "{text}");
+    assert!(!text.contains("0.0x"), "{text}");
+
+    report.network.as_mut().unwrap().blobs_total = 0;
+    let text = format_text(&report);
+    assert!(text_row(&text, "Blobs").is_none(), "{text}");
+    report.network.as_mut().unwrap().blobs_total = 2;
+    let text = format_text(&report);
+    assert!(text_row(&text, "Blobs").is_some(), "{text}");
+
+    report.prefetch.prefetch_hits = 2;
+    report.prefetch.total_hits = 4;
+    let text = format_text(&report);
+    assert!(text_row(&text, "Prefetch").is_some(), "{text}");
+    report.prefetch.prefetch_hits = 0;
+    let text = format_text(&report);
+    assert!(text_row(&text, "Prefetch").is_none(), "{text}");
+}
+
+#[test]
+fn text_timing_and_bypass_sections_hide_a_zero() {
+    let mut report = blank_report();
+    report.suggestions.clear();
+    report.timing.total_key_ms = 2;
+    let text = format_text(&report);
+    assert!(text.contains("cache key"), "{text}");
+    report.timing.total_key_ms = 0;
+    let text = format_text(&report);
+    assert!(!text.contains("cache key"), "{text}");
+
+    report.bypass.passthroughs = 2;
+    let text = format_text(&report);
+    assert!(heading(&text, "Not cached"), "{text}");
+    report.bypass.passthroughs = 0;
+    let text = format_text(&report);
+    assert!(!heading(&text, "Not cached"), "{text}");
+
+    report.bypass.passthroughs = 1;
+    report.bypass.slowest.push(BypassDetail {
+        crate_name: "slow".to_string(),
+        root: String::new(),
+        result: "passthrough".to_string(),
+        route: "direct".to_string(),
+        reason: "flag".to_string(),
+        start_time: String::new(),
+        end_time: String::new(),
+        start_unix_ms: 0,
+        end_unix_ms: 0,
+        elapsed_ms: 1_000,
+        exit_code: None,
+        timestamp: "2026-09-30T12:00:00Z".to_string(),
+        fallback_attempt: None,
+    });
+    let text = format_text(&report);
+    assert!(heading(&text, "Slowest not cached"), "{text}");
+    report.bypass.slowest[0].elapsed_ms = 999;
+    let text = format_text(&report);
+    assert!(!heading(&text, "Slowest not cached"), "{text}");
+
+    report.suggestions.push("raise the cap".to_string());
+    let text = format_text(&report);
+    assert!(heading(&text, "Suggestions"), "{text}");
+    report.suggestions.clear();
+    let text = format_text(&report);
+    assert!(!heading(&text, "Suggestions"), "{text}");
+}
+
+#[test]
+fn text_hit_table_appears_only_when_a_hit_is_listed() {
+    let mut report = blank_report();
+    report.suggestions.clear();
+    report.top_hits.clear();
+    let text = format_text(&report);
+    assert!(!heading(&text, "Most valuable hits"), "{text}");
+
+    report.top_hits.push(miss_detail("saved"));
+    let text = format_text(&report);
+    assert!(heading(&text, "Most valuable hits"), "{text}");
+    assert!(text.contains("saved"), "{text}");
+}
+
+#[test]
+fn average_ms_prints_a_decimal_only_below_ten() {
+    assert_eq!(average_ms(9.9), "9.9 ms");
+    assert_eq!(average_ms(10.0), "10 ms");
+}
+
+#[test]
+fn local_time_keeps_an_unparsed_input() {
+    assert_eq!(local_time("not-a-time"), "not-a-time");
+    let stamp = "2026-09-30T12:34:00Z";
+    let expected = chrono::DateTime::parse_from_rfc3339(stamp)
+        .unwrap()
+        .with_timezone(&chrono::Local)
+        .format("%b %d %H:%M")
+        .to_string();
+    assert_eq!(local_time(stamp), expected);
+    assert_ne!(local_time(stamp), "xyzzy");
+}
+
+#[test]
+fn suggestions_name_three_distinct_misses_only_above_the_share() {
+    let prefetch = PrefetchAnalysis {
+        prefetch_hits: 0,
+        total_hits: 0,
+        contribution_pct: 0.0,
+    };
+    let suggest = |miss_ms, hit_ms, dups, misses, names: &[&str]| {
+        let mut stats = crate::events::compute_stats(&[]);
+        stats.miss_compile_time_ms = miss_ms;
+        stats.hit_compile_time_ms = hit_ms;
+        stats.dups = dups;
+        stats.misses = misses;
+        let details: Vec<CrateDetail> = names.iter().copied().map(miss_detail).collect();
+        generate_suggestions(&stats, &prefetch, &None, false, &details, 1, 0).join("\n")
+    };
+    let phrase = "compile time spent on compiled cache-key misses";
+    assert!(!suggest(80, 20, 4, 0, &["a"]).contains(phrase));
+    assert!(!suggest(50, 50, 4, 0, &["a"]).contains(phrase));
+    assert!(!suggest(81, 19, 3, 0, &["a"]).contains(phrase));
+    let named = suggest(81, 19, 4, 0, &["a", "b", "c", "d"]);
+    assert!(named.contains(phrase), "{named}");
+    assert!(named.contains("`a`") && named.contains("`c`"), "{named}");
+    assert!(!named.contains("`d`"), "{named}");
+    let repeated = suggest(81, 19, 4, 0, &["a", "a"]);
+    assert_eq!(repeated.matches("`a`").count(), 1, "{repeated}");
 }

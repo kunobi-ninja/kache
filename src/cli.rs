@@ -1,3 +1,4 @@
+use crate::term;
 use anyhow::{Context, Result};
 use bytesize::ByteSize;
 use std::io::IsTerminal;
@@ -722,23 +723,27 @@ fn otel_snapshot_from_stats(config: &Config, snap: &StatsSnapshot) -> crate::ote
 
 // ── kache stats ────────────────────────────────────────────────────────────
 
-fn cloned_targets_line(disk: &crate::machine::DiskView) -> Option<String> {
+fn cloned_targets_row(disk: &crate::machine::DiskView) -> Option<StatsRow> {
     let cloned = disk.cloned_into_targets_bytes;
     let snapshot = disk.snapshot_retained_bytes;
     if cloned == 0 && snapshot == 0 {
         return None;
     }
-    let mut line = format!("On disk:    {} private", ByteSize(disk.disk_private_bytes));
+    let mut notes = vec!["private".to_string()];
     if cloned > 0 {
-        line.push_str(&format!("; {} cloned into target/", ByteSize(cloned)));
+        notes.push(format!("{} cloned into target/", term::bytes(cloned)));
     }
     if snapshot > 0 {
-        line.push_str(&format!(
-            "; {} held only by filesystem snapshots",
-            ByteSize(snapshot)
+        notes.push(format!(
+            "{} held only by filesystem snapshots",
+            term::bytes(snapshot)
         ));
     }
-    Some(line)
+    Some((
+        "On disk",
+        term::bytes(disk.disk_private_bytes),
+        notes.join(", "),
+    ))
 }
 
 /// Print a one-shot stats summary to stdout.
@@ -843,16 +848,15 @@ pub fn stats(
         );
     }
 
-    for line in render_stats(&snap, config, window) {
-        println!("{line}");
-    }
+    let mut extras = StatsExtras::default();
+    extras.cache.extend(cloned_targets_row(&disk));
+    extras.cache.extend(machine_rows(&machine));
     if let Some(path) = &host_config {
-        println!("Host config: {path}");
+        extras
+            .service
+            .push(("Host config", path.clone(), String::new()));
     }
-    if let Some(line) = cloned_targets_line(&disk) {
-        println!("{line}");
-    }
-    for line in machine_lines(&machine) {
+    for line in render_stats_with(&snap, config, window, &extras) {
         println!("{line}");
     }
 
@@ -860,31 +864,57 @@ pub fn stats(
     // (survives daemon restarts) behind the live snapshot above. Keys/bytes
     // are daemon-visible lower bounds; join events.jsonl by session_id for
     // full attribution.
-    let summaries = &snap.recent_summaries;
-    if !summaries.is_empty() {
-        println!("Sessions (last {}):", summaries.len().min(5));
-        for s in summaries.iter().rev().take(5) {
-            let status = summary_status_suffix(s.cancelled, s.incomplete);
-            println!(
-                "  {} [{}] {}: {}/{} candidates downloaded ({}), {} used, {} demanded ({}){}",
-                s.ts.format("%m-%d %H:%M"),
-                if s.session_id.is_empty() {
-                    "legacy"
-                } else {
-                    &s.session_id
-                },
-                s.plan_source,
-                s.downloaded_keys,
-                s.candidate_keys,
-                ByteSize(s.downloaded_bytes),
-                s.used_keys,
-                s.demanded_keys,
-                s.closure_reason,
-                status,
-            );
-        }
+    for line in prefetch_session_lines(&snap.recent_summaries) {
+        println!("{line}");
     }
+    println!();
+    println!("Details: kache stats --full");
     Ok(())
+}
+
+/// Lines for the recent prefetch sessions, including the heading.
+/// Empty when there are no summaries, so a quiet window stays quiet.
+fn prefetch_session_lines(summaries: &[crate::events::BuildSummaryEvent]) -> Vec<String> {
+    if summaries.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec![String::new(), "Prefetch sessions".to_string()];
+    let body: Vec<Vec<String>> = summaries
+        .iter()
+        .rev()
+        .take(5)
+        .map(|s| {
+            vec![
+                s.ts.format("%m-%d %H:%M").to_string(),
+                if s.session_id.is_empty() {
+                    "legacy".to_string()
+                } else {
+                    s.session_id.clone()
+                },
+                format!(
+                    "{}/{}",
+                    term::count(s.downloaded_keys),
+                    term::count(s.candidate_keys)
+                ),
+                term::bytes(s.downloaded_bytes),
+                term::count(s.used_keys),
+                format!(
+                    "{}, {} demanded, {}{}",
+                    s.plan_source,
+                    s.demanded_keys,
+                    s.closure_reason,
+                    summary_status_suffix(s.cancelled, s.incomplete)
+                ),
+            ]
+        })
+        .collect();
+    use term::Align::{Left, Right};
+    lines.extend(term::table(
+        &["WHEN", "SESSION", "FETCHED", "BYTES", "USED", "PLAN"],
+        &[Left, Left, Right, Right, Right, Left],
+        &body,
+    ));
+    lines
 }
 
 fn summary_status_suffix(cancelled: bool, incomplete: bool) -> &'static str {
@@ -896,32 +926,29 @@ fn summary_status_suffix(cancelled: bool, incomplete: bool) -> &'static str {
     }
 }
 
-/// `kache stats` lines for the machine's shared index and GC record: what the
+/// `kache stats` rows for the machine's shared index and GC record: what the
 /// cache costs the host beyond its artifacts, and whether GC keeps up. Pure,
 /// like [`render_stats`].
-fn machine_lines(machine: &crate::otel::MachineSnapshot) -> Vec<String> {
-    let mut lines = Vec::new();
+fn machine_rows(machine: &crate::otel::MachineSnapshot) -> Vec<StatsRow> {
+    let mut rows = Vec::new();
     if let Some(bytes) = machine.index_bytes {
-        let mut rows = machine.rowid_high_water.clone();
-        rows.sort_by_key(|&(_, rows)| std::cmp::Reverse(rows));
-        let top: Vec<String> = rows
+        let mut notes = Vec::new();
+        if let Some(wal) = machine.wal_bytes {
+            notes.push(format!("WAL {}", term::bytes(wal)));
+        }
+        // Each table's largest rowid: it grows with every insert and
+        // replacement, so it shows where the index churns, not a row count.
+        let mut tables = machine.rowid_high_water.clone();
+        tables.sort_by_key(|&(_, rows)| std::cmp::Reverse(rows));
+        let top: Vec<String> = tables
             .iter()
             .take(3)
-            .map(|(table, rows)| format!("{table} {rows}"))
+            .map(|(table, rows)| format!("{table} {}", term::count(*rows)))
             .collect();
-        let wal = machine
-            .wal_bytes
-            .map(|wal| format!(", WAL {}", ByteSize(wal)))
-            .unwrap_or_default();
-        if top.is_empty() {
-            lines.push(format!("Index:     {}{wal}", ByteSize(bytes)));
-        } else {
-            lines.push(format!(
-                "Index:     {}{wal} (rowid high-water: {})",
-                ByteSize(bytes),
-                top.join(", ")
-            ));
+        if !top.is_empty() {
+            notes.push(format!("rowid high-water: {}", top.join(", ")));
         }
+        rows.push(("Index", term::bytes(bytes), notes.join(" · ")));
     }
     if let Some(gc) = &machine.gc {
         let source = if gc.source.is_empty() {
@@ -929,73 +956,177 @@ fn machine_lines(machine: &crate::otel::MachineSnapshot) -> Vec<String> {
         } else {
             gc.source.as_str()
         };
-        let mut line = format!(
-            "GC:        last run {} ({source}): {} evicted",
-            gc.last_run, gc.entries_evicted
+        let when = chrono::DateTime::parse_from_rfc3339(&gc.last_run)
+            .map(|at| {
+                at.with_timezone(&chrono::Local)
+                    .format("%b %d %H:%M")
+                    .to_string()
+            })
+            .unwrap_or_else(|_| gc.last_run.clone());
+        let mut note = format!(
+            "{source}, {} evicted",
+            term::count(gc.entries_evicted as u64)
         );
         if gc.entries_failed > 0 {
-            line.push_str(&format!(
+            note.push_str(&format!(
                 ", {} failed ({} lost the index write lock)",
                 gc.entries_failed, gc.entries_locked
             ));
         }
         if gc.evict_write_ms > 0 {
-            line.push_str(&format!(", {} ms in index writes", gc.evict_write_ms));
+            note.push_str(&format!(", {} ms in index writes", gc.evict_write_ms));
         }
-        lines.push(line);
+        rows.push(("Last GC", when, note));
     }
-    lines
+    rows
 }
 
-/// Render the `kache stats` summary lines from a fetched snapshot. Pure (no I/O)
-/// so the dedup / weighted-hit / miss-share / daemon / remote display branches
-/// are unit-testable from crafted snapshots without a daemon or store.
+/// One `label   value   note` row of `kache stats`.
+pub(crate) type StatsRow = (&'static str, String, String);
+
+/// Rows `kache stats` adds to the snapshot's sections from its own reads.
+#[derive(Default)]
+pub(crate) struct StatsExtras {
+    pub(crate) cache: Vec<StatsRow>,
+    pub(crate) service: Vec<StatsRow>,
+}
+
+/// [`render_stats_with`] without extra rows.
+#[cfg(test)]
 pub(crate) fn render_stats(
     snap: &StatsSnapshot,
     config: &Config,
     window: SinceWindow,
 ) -> Vec<String> {
-    let mut lines = Vec::new();
+    render_stats_with(snap, config, window, &StatsExtras::default())
+}
 
-    // Store line
-    let store_pct = if snap.max_size > 0 {
-        (snap.total_size as f64 / snap.max_size as f64) * 100.0
+/// The `kache stats` summary: a title, then the build, cache and service
+/// sections on shared columns.
+pub(crate) fn render_stats_with(
+    snap: &StatsSnapshot,
+    config: &Config,
+    window: SinceWindow,
+    extras: &StatsExtras,
+) -> Vec<String> {
+    let mut cache = cache_rows(snap, config);
+    cache.extend(extras.cache.iter().cloned());
+    let mut service = service_rows(snap, config);
+    service.extend(extras.service.iter().cloned());
+    let mut lines = vec![format!("kache · last {window}"), String::new()];
+    lines.extend(term::sections(&[build_rows(snap), cache, service]));
+    lines
+}
+
+/// Hit rate, weighted hit rate, time saved and miss time.
+fn build_rows(snap: &StatsSnapshot) -> Vec<StatsRow> {
+    let es = &snap.event_stats;
+    let hits = es.local_hits + es.prefetch_hits + es.remote_hits;
+    let total = hits + es.dups + es.misses;
+    let mut from_cache = if total == 0 {
+        "no builds in this window".to_string()
     } else {
-        0.0
+        format!(
+            "{} of {} crates from cache",
+            term::count(hits as u64),
+            term::count(total as u64)
+        )
     };
-    lines.push(format!(
-        "Store:      {} / {} ({} entries, {:.0}%)",
-        ByteSize(snap.total_size),
-        if snap.stores.len() > 1 {
-            ByteSize(snap.max_size).to_string()
-        } else {
-            crate::config::describe_max_size(
-                snap.max_size,
-                crate::cache_fs::probe(&config.cache_dir).total_bytes,
-            )
-        },
-        snap.entry_count,
-        store_pct,
-    ));
+    if es.remote_hits + es.prefetch_hits > 0 {
+        from_cache.push_str(&format!(
+            " ({} local, {} remote, {} prefetched)",
+            term::count(es.local_hits as u64),
+            term::count(es.remote_hits as u64),
+            term::count(es.prefetch_hits as u64)
+        ));
+    }
+    let mut rows = vec![("Hit rate", term::percent(count_hit_rate(es)), from_cache)];
+    if let Some(weighted) = compile_weighted_hit_rate(es) {
+        rows.push((
+            "By cost",
+            term::percent(weighted),
+            "of compile time".to_string(),
+        ));
+    }
+    rows.push(if es.hit_compile_time_ms > 0 {
+        (
+            "Time saved",
+            term::duration_ms(es.hit_compile_time_ms),
+            "compile work avoided".to_string(),
+        )
+    } else {
+        ("Time saved", "none yet".to_string(), String::new())
+    });
+    if es.total_elapsed_ms > 0 {
+        let miss_share = (es.miss_elapsed_ms as f64 / es.total_elapsed_ms as f64) * 100.0;
+        rows.push((
+            "Miss time",
+            term::percent(miss_share),
+            format!(
+                "of wrapper time ({})",
+                term::duration_ms(es.miss_elapsed_ms)
+            ),
+        ));
+    }
+    rows
+}
 
+/// Parenthetical for a cap that is the disk-share budget, matching
+/// [`crate::config::describe_max_size`].
+///
+/// One store whose cap equals that budget says `5% of <disk>, floor 5GiB,
+/// cap 100GiB`, or `default; disk size unknown` when the probe failed. Any
+/// other cap, and a summary that covers more than one store, stays unlabeled.
+fn cache_limit_note(store_count: usize, max_size: u64, filesystem_bytes: Option<u64>) -> String {
+    if store_count > 1 {
+        return String::new();
+    }
+    let derived = crate::config::disk_share_budget(filesystem_bytes);
+    if max_size != derived {
+        return String::new();
+    }
+    match filesystem_bytes.filter(|&bytes| bytes > 0) {
+        Some(total) => format!(" (5% of {}, floor 5GiB, cap 100GiB)", ByteSize(total)),
+        None => " (default; disk size unknown)".to_string(),
+    }
+}
+
+/// The store, each extra store, and content dedup.
+fn cache_rows(snap: &StatsSnapshot, config: &Config) -> Vec<StatsRow> {
+    let note = cache_limit_note(
+        snap.stores.len(),
+        snap.max_size,
+        crate::cache_fs::probe(&config.cache_dir).total_bytes,
+    );
+    let mut rows = vec![(
+        "Cache",
+        term::bytes(snap.total_size),
+        format!(
+            "of {}{note} · {} entries",
+            term::bytes(snap.max_size),
+            term::count(snap.entry_count as u64)
+        ),
+    )];
     for store in &snap.stores {
         if let Some(error) = &store.error {
-            lines.push(format!(
-                "Store {}: unavailable ({error})",
-                store.path.display()
+            rows.push((
+                "Store",
+                "unavailable".to_string(),
+                format!("{} ({error})", term::home_path(&store.path)),
             ));
         } else if snap.stores.len() > 1 {
-            lines.push(format!(
-                "Store {}: {} / {} ({} entries)",
-                store.path.display(),
-                ByteSize(store.bytes),
-                ByteSize(store.max_size),
-                store.entries
+            rows.push((
+                "Store",
+                term::bytes(store.bytes),
+                format!(
+                    "of {} · {} entries · {}",
+                    term::bytes(store.max_size),
+                    term::count(store.entries as u64),
+                    term::home_path(&store.path)
+                ),
             ));
         }
     }
-
-    // Content dedup stats
     if let Some(blob_stats) = snap
         .blob_stats
         .as_ref()
@@ -1006,47 +1137,26 @@ pub(crate) fn render_stats(
         } else {
             0.0
         };
-        lines.push(format!(
-            "Dedup:      {} unique blobs, {} physical, {:.1}% savings",
-            blob_stats.total_blobs,
-            ByteSize(blob_stats.total_blob_size),
-            savings_pct,
+        rows.push((
+            "Dedup",
+            format!("{} blobs", term::count(blob_stats.total_blobs as u64)),
+            format!(
+                "{} on disk, {savings_pct:.1}% saved",
+                term::bytes(blob_stats.total_blob_size)
+            ),
         ));
     }
+    rows
+}
 
-    // Hit rate
-    let es = &snap.event_stats;
-    let hit_rate = count_hit_rate(es);
-    lines.push(format!(
-        "Hit rate:   {hit_rate:.1}% (local: {}, prefetch: {}, remote: {}, dup: {}, miss: {})",
-        es.local_hits, es.prefetch_hits, es.remote_hits, es.dups, es.misses,
-    ));
-    if let Some(weighted) = compile_weighted_hit_rate(es) {
-        lines.push(format!("Weighted:   {weighted:.1}% by compile cost"));
-    }
-    if es.total_elapsed_ms > 0 {
-        let miss_share = (es.miss_elapsed_ms as f64 / es.total_elapsed_ms as f64) * 100.0;
-        lines.push(format!(
-            "Miss share: {:.1}% of wrapper time ({})",
-            miss_share,
-            format_duration_ms(es.miss_elapsed_ms)
-        ));
-    }
-
-    let time_saved = if es.hit_compile_time_ms > 0 {
-        format_duration_ms(es.hit_compile_time_ms)
-    } else {
-        "n/a".to_string()
-    };
-    lines.push(format!(
-        "Time saved: {time_saved} (estimated compile work avoided, last {window})"
-    ));
-
+/// The daemon, the remote, and remote traffic when there is any.
+fn service_rows(snap: &StatsSnapshot, config: &Config) -> Vec<StatsRow> {
+    let mut rows: Vec<StatsRow> = Vec::new();
     // Daemon status
     if snap.daemon_connected {
         let my_epoch = crate::daemon::build_epoch();
         let mismatch = if snap.daemon_build_epoch != my_epoch {
-            " (MISMATCH — auto-restart pending)"
+            " · a different build than this kache, restart pending"
         } else {
             ""
         };
@@ -1056,14 +1166,20 @@ pub(crate) fn render_stats(
         let config_note = snap
             .daemon_effective_config
             .as_ref()
-            .map(|eff| format!(", config {}", eff.config_path))
+            .map(|eff| {
+                format!(
+                    " · {}",
+                    term::home_path(std::path::Path::new(&eff.config_path))
+                )
+            })
             .unwrap_or_default();
-        lines.push(format!(
-            "Daemon:     v{} (epoch {}{config_note}){mismatch}",
-            snap.daemon_version, snap.daemon_build_epoch,
+        rows.push((
+            "Daemon",
+            format!("v{}", snap.daemon_version),
+            format!("epoch {}{config_note}{mismatch}", snap.daemon_build_epoch),
         ));
     } else {
-        lines.push("Daemon:     offline".to_string());
+        rows.push(("Daemon", "offline".to_string(), String::new()));
     }
 
     // Remote state belongs to the daemon just like the counters above it.
@@ -1096,7 +1212,11 @@ pub(crate) fn render_stats(
             },
         ),
     };
-    lines.push(format!("Remote:     {remote_status}{remote_source}"));
+    rows.push((
+        "Remote",
+        format!("{remote_status}{remote_source}"),
+        String::new(),
+    ));
 
     // Remote resilience (kunobi-ninja/kache#327, #564): breaker state and
     // negative-cache effectiveness (hits avoided vs. round trips paid). Shown
@@ -1104,17 +1224,20 @@ pub(crate) fn render_stats(
     // output stays unchanged for quiet or local-only setups.
     if snap.daemon_connected && config.remote.is_some() && has_remote_resilience_activity(snap) {
         let degraded = if snap.remote_degraded {
-            " — DEGRADED (reads suppressed, uploads deferred)"
+            ", DEGRADED: reads suppressed, uploads deferred"
         } else {
             ""
         };
-        lines.push(format!(
-            "Resilience: {} remote round trips, {} negative-cache hits ({} remembered), {} restores suppressed / {} uploads deferred{degraded}",
-            snap.remote_check_roundtrips,
-            snap.negative_hits,
-            snap.negative_entries,
-            snap.downloads_suppressed,
-            snap.uploads_suppressed,
+        rows.push((
+            "Resilience",
+            format!("{} round trips", term::count(snap.remote_check_roundtrips)),
+            format!(
+                "{} negative-cache hits ({} remembered), {} restores suppressed, {} uploads deferred{degraded}",
+                term::count(snap.negative_hits),
+                term::count(snap.negative_entries),
+                term::count(snap.downloads_suppressed),
+                term::count(snap.uploads_suppressed),
+            ),
         ));
     }
 
@@ -1138,14 +1261,17 @@ pub(crate) fn render_stats(
         None => config.remote_key_listing,
     };
     if snap.daemon_connected && daemon_has_remote && !key_listing {
-        lines.push(
-            "Listing:    off (reads need only GetObject; `remote_key_listing = true` lists keys)"
-                .to_string(),
-        );
+        rows.push((
+            "Listing",
+            "off".to_string(),
+            "reads need only GetObject; `remote_key_listing = true` lists keys".to_string(),
+        ));
     }
     if snap.daemon_connected && daemon_has_remote && !prefetch_enabled {
-        lines.push(format!(
-            "Prefetch:   disabled (exact remote lookup and uploads remain enabled){prefetch_source}"
+        rows.push((
+            "Prefetch",
+            "disabled".to_string(),
+            format!("exact remote lookup and uploads stay on{prefetch_source}"),
         ));
     } else if snap.daemon_connected
         && (pf.downloads_completed > 0
@@ -1158,34 +1284,44 @@ pub(crate) fn render_stats(
             0.0
         };
         let cancelled = if pf.cancelled { ", CANCELLED" } else { "" };
-        lines.push(format!(
-            "Prefetch:   {} downloads ({}), {} used ({:.0}%), {} cancelled{}",
-            pf.downloads_completed,
-            ByteSize(pf.bytes_downloaded),
-            pf.keys_used,
-            used_pct,
-            pf.keys_cancelled,
-            cancelled,
+        rows.push((
+            "Prefetch",
+            format!("{} downloads", term::count(pf.downloads_completed)),
+            format!(
+                "{}, {} used ({used_pct:.0}%), {} cancelled{cancelled}",
+                term::bytes(pf.bytes_downloaded),
+                term::count(pf.keys_used),
+                term::count(pf.keys_cancelled),
+            ),
         ));
-        lines.push(format!(
-            "Planning:   {} advisory / {} fallback plans (last: {} candidates)",
-            pf.plans_advisory, pf.plans_fallback, pf.last_plan_candidates,
+        rows.push((
+            "Planning",
+            format!("{} advisory", term::count(pf.plans_advisory)),
+            format!(
+                "{} fallback plans, last had {} candidates",
+                term::count(pf.plans_fallback),
+                term::count(pf.last_plan_candidates)
+            ),
         ));
         if pf.pack_requests_total + pf.v3_requests_total > 0 {
-            lines.push(format!(
-                "Transport:  pack {} requests / {}, v3 {} requests / {}; {} validation failures, {} v3 fallbacks",
-                pf.pack_requests_total,
-                ByteSize(pf.pack_bytes_downloaded),
-                pf.v3_requests_total,
-                ByteSize(pf.v3_bytes_downloaded),
-                pf.pack_validation_failures,
-                pf.pack_fallback_entries,
+            rows.push((
+                "Transport",
+                format!("{} pack requests", term::count(pf.pack_requests_total)),
+                format!(
+                    "{}; v3 {} requests, {}; {} validation failures, {} v3 fallbacks",
+                    term::bytes(pf.pack_bytes_downloaded),
+                    term::count(pf.v3_requests_total),
+                    term::bytes(pf.v3_bytes_downloaded),
+                    term::count(pf.pack_validation_failures),
+                    term::count(pf.pack_fallback_entries),
+                ),
             ));
         }
         if pf.last_plan_wall_ms > 0 {
-            lines.push(format!(
-                "Plan wall:  {} ms last / {} ms total",
-                pf.last_plan_wall_ms, pf.plan_wall_ms_total,
+            rows.push((
+                "Plan time",
+                format!("{} ms", pf.last_plan_wall_ms),
+                format!("last plan; {} ms in all", pf.plan_wall_ms_total),
             ));
         }
         if pf.last_list_key_count > 0 {
@@ -1201,31 +1337,42 @@ pub(crate) fn render_stats(
             } else {
                 format!("refreshes every {refresh_secs}s")
             };
-            lines.push(format!(
-                "Key LIST:   {} keys in {} ms ({refresh}{refresh_source})",
-                pf.last_list_key_count, pf.last_list_duration_ms,
+            rows.push((
+                "Key LIST",
+                format!("{} keys", term::count(pf.last_list_key_count)),
+                format!(
+                    "in {} ms ({refresh}{refresh_source})",
+                    pf.last_list_duration_ms
+                ),
             ));
         }
         // Cumulative LIST cost (#583 P0.5): the totals the P3 decision gate
         // reads. Rendered only once refreshes have happened.
         if pf.list_requests_total > 0 {
-            lines.push(format!(
-                "LIST total: {} requests ({} failed), {} ms, {} keys returned",
-                pf.list_requests_total,
-                pf.list_failures_total,
-                pf.list_duration_ms_total,
-                pf.list_keys_total,
+            rows.push((
+                "LIST total",
+                format!("{} requests", term::count(pf.list_requests_total)),
+                format!(
+                    "{} failed, {} ms, {} keys returned",
+                    term::count(pf.list_failures_total),
+                    pf.list_duration_ms_total,
+                    term::count(pf.list_keys_total),
+                ),
             ));
         }
         if pf.dedup_join_waits > 0 {
-            lines.push(format!(
-                "Join-wait:  {} waits, {} ms total (in-flight download dedup)",
-                pf.dedup_join_waits, pf.dedup_join_wait_ms,
+            rows.push((
+                "Join wait",
+                format!("{} waits", term::count(pf.dedup_join_waits)),
+                format!(
+                    "{} ms in all, waiting on a download already in flight",
+                    pf.dedup_join_wait_ms
+                ),
             ));
         }
     }
 
-    lines
+    rows
 }
 
 fn has_remote_resilience_activity(snap: &StatsSnapshot) -> bool {
@@ -1389,7 +1536,15 @@ pub fn stats_last_build(
     };
     let report =
         crate::report::generate_report_with_filter(config, SinceWindow::DEFAULT, 10, &filter)?;
-    if json {
+    // `--record` takes the full-report path. This summary is what
+    // `kache stats --last-build` prints, and a host that set
+    // `record_sessions` still needs the session written.
+    let recorded = if config.record_sessions {
+        record_session(config, &report)
+    } else {
+        Ok(())
+    };
+    let printed = if json {
         #[derive(serde::Serialize)]
         struct Body {
             report: crate::report::BuildReport,
@@ -1398,7 +1553,11 @@ pub fn stats_last_build(
     } else {
         println!("{}", crate::report::format_text(&report));
         Ok(())
+    };
+    if let Err(error) = recorded {
+        eprintln!("warning: this session was not recorded: {error:#}");
     }
+    printed
 }
 
 pub fn report(

@@ -201,7 +201,7 @@ fn help_lists_subcommands() {
         .assert()
         .success()
         .stdout(predicates::str::contains("list"))
-        .stdout(predicates::str::contains("report"))
+        .stdout(predicates::str::contains("stats"))
         .stdout(predicates::str::contains("doctor"))
         .stdout(predicates::str::contains("completions"));
 }
@@ -440,12 +440,22 @@ fn stats_and_report_label_the_requested_window() {
         .args(["stats", "--since", "15m"])
         .assert()
         .success()
-        .stdout(predicates::str::contains("last 15m)"));
+        .stdout(predicates::str::starts_with("kache · last 15m\n"));
+    e.cmd()
+        .args(["stats", "--full", "--since", "90m"])
+        .assert()
+        .success()
+        .stdout(predicates::str::starts_with(
+            "kache · last 90m · full report\n",
+        ));
+    // `report` stays for scripts and prints the same report.
     e.cmd()
         .args(["report", "--format", "text", "--since", "90m"])
         .assert()
         .success()
-        .stdout(predicates::str::contains("kache build report (last 90m)"));
+        .stdout(predicates::str::starts_with(
+            "kache · last 90m · full report\n",
+        ));
     e.cmd()
         .args(["stats", "--since", "soon"])
         .assert()
@@ -483,7 +493,7 @@ fn stats_announces_auto_start_and_warns_on_daemon_config_mismatch() {
                 "starting one inheriting this process's environment",
             )),
         )
-        .stdout(predicates::str::contains("/ 1.0 GiB"));
+        .stdout(predicates::str::contains("of 1.0 GiB · "));
 
     // Same daemon, different CLI config: the daemon's cap still renders (it
     // is the value in effect), and the divergence is named on stderr.
@@ -494,7 +504,7 @@ fn stats_announces_auto_start_and_warns_on_daemon_config_mismatch() {
         .arg("stats")
         .assert()
         .success()
-        .stdout(predicates::str::contains("/ 1.0 GiB"))
+        .stdout(predicates::str::contains("of 1.0 GiB · "))
         .stderr(
             predicates::str::contains("local_max_size=1.0 GiB")
                 .and(predicates::str::contains("says 2.0 GiB"))
@@ -517,7 +527,7 @@ fn stats_announces_auto_start_and_warns_on_daemon_config_mismatch() {
         .arg("stats")
         .assert()
         .success()
-        .stdout(predicates::str::contains("/ 1.0 GiB"))
+        .stdout(predicates::str::contains("of 1.0 GiB · "))
         .stderr(predicates::str::contains("local_store="));
 
     // A probe session must not leave its daemon behind.
@@ -2334,10 +2344,10 @@ fn commands_operate_on_a_populated_cache() {
         .arg("stats")
         .assert()
         .success()
-        .stdout(predicates::str::contains("Store:"))
-        .stdout(predicates::str::contains("Hit rate:"))
-        .stdout(predicates::str::contains("Dedup:"))
-        .stdout(predicates::str::contains("Time saved:"));
+        .stdout(predicates::str::contains("\n  Cache "))
+        .stdout(predicates::str::contains("\n  Hit rate "))
+        .stdout(predicates::str::contains("\n  Dedup "))
+        .stdout(predicates::str::contains("\n  Time saved "));
     e.cmd()
         .args(["doctor", "--verify", "--checksums"])
         .assert()

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Repeated hk/eza/aube measurements; each arm owns its cache and checkout paths."""
+"""Repeated benchmark measurements; each arm owns its cache and checkout paths."""
 
 import argparse
 import json
@@ -15,6 +15,14 @@ from pathlib import Path
 from bench import report as perf_gate_report
 from bench.engine import MEASUREMENT_TIMEOUT, installed, run_measurement, tool_path
 from bench.stats import contention_comparison, summarize, validate
+
+# Subjects with a `bench-<subject>` scenario. The contention stage drives
+# Cargo commands of its own and knows only the first three.
+PROJECTS = ("hk", "eza", "aube", "opendal", "lance", "llvm")
+CONTENTION_PROJECTS = ("hk", "eza", "aube")
+# Longer limits for one engine pass where a cold build alone can exceed the
+# default. LLVM's takes about 26 minutes on the shared runners.
+PASS_TIMEOUT = {"lance": 2400, "llvm": 3600}
 
 # Lives beside the package, in the instrument directory the gate stages.
 CONTENTION_SCRIPT = Path(__file__).resolve().parent.parent / "bench-contention.py"
@@ -412,7 +420,8 @@ def run(args):
                         flush=True,
                     )
                     env = dict(os.environ, RUSTC_WRAPPER="", RUSTUP_TOOLCHAIN="")
-                    timeout = MEASUREMENT_TIMEOUT
+                    limit = PASS_TIMEOUT.get(args.project, MEASUREMENT_TIMEOUT)
+                    timeout = limit
                     if remaining is not None and remaining < timeout:
                         timeout = remaining
                     began = time.monotonic()
@@ -426,7 +435,7 @@ def run(args):
                                 stderr=subprocess.STDOUT,
                             )
                     except subprocess.TimeoutExpired:
-                        if timeout < MEASUREMENT_TIMEOUT:
+                        if timeout < limit:
                             raise DeadlineReached(
                                 f"sample {sample + 1} of {args.samples} ({arm}) was still "
                                 "running when the time budget ran out"
@@ -471,7 +480,11 @@ def run(args):
         summary = summarize(measured)
         # Release isolated-build scratch before allocating six contention targets.
         shutil.rmtree(root / "scratch", ignore_errors=True)
-        if not getattr(args, "skip_contention", False) and "truncated" not in payload:
+        if (
+            args.project in CONTENTION_PROJECTS
+            and not getattr(args, "skip_contention", False)
+            and "truncated" not in payload
+        ):
             try:
                 remaining = left()
                 if remaining is not None and remaining <= 0:
@@ -519,7 +532,12 @@ def run(args):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--project", choices=("hk", "eza", "aube"), required=True)
+    parser.add_argument(
+        "--project",
+        choices=PROJECTS,
+        required=True,
+        help=f"subject to measure; contention runs for {', '.join(CONTENTION_PROJECTS)} only",
+    )
     parser.add_argument("--engine", type=Path, required=True)
     parser.add_argument("--scenarios", type=Path, default=Path("scenarios"))
     parser.add_argument("--kache", required=True)
@@ -574,7 +592,11 @@ def main():
         help="directory to write samples.json, logs and scratch into; must not already hold a run",
     )
     args = parser.parse_args()
-    if platform.system() != "Linux" and not args.skip_contention:
+    if (
+        platform.system() != "Linux"
+        and not args.skip_contention
+        and args.project in CONTENTION_PROJECTS
+    ):
         parser.error(
             "contention requires Linux; use a Linux runner or --skip-contention for isolated local builds"
         )

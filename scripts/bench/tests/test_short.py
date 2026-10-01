@@ -136,6 +136,15 @@ class BenchTests(unittest.TestCase):
                 r[phase]["hits"] = r[phase]["cache_hits"] = 0
                 with self.assertRaises(ValueError):
                     stats.validate(r, backend)
+        # A build-script probe that fails to compile on purpose is counted in
+        # Kache's `errors` and is not a cache fault (Lance's cold build has one).
+        r = result()
+        r["cold"]["errors"] = 1
+        stats.validate(r, "kache")
+        r = result("sccache")
+        r["warm"]["cache_errors"] = 1
+        with self.assertRaises(ValueError):
+            stats.validate(r, "sccache")
         r = result()
         r["warm_same_tree_verdict"]["ok"] = False
         with self.assertRaises(ValueError):
@@ -435,6 +444,53 @@ class BenchTests(unittest.TestCase):
             self.assertIn((0, "mbx"), arms)
             self.assertNotIn((1, "mbx"), arms)
             self.assertEqual(sorted(a for s_, a in arms if s_ == 2), ["base", "head"])
+
+    def test_a_subject_without_contention_repeats_its_builds_only(self):
+        """The contention stage drives Cargo commands written for hk, eza and
+        aube. A larger subject is repeated without it, both tools alternating
+        in one runner."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            args = argparse.Namespace(
+                output=root / "output",
+                project="lance",
+                engine=root / "engine",
+                scenarios=root / "scenarios",
+                kache="/kache",
+                base=None,
+                sccache=None,
+                mbx="/mbx",
+                samples=3,
+                order_seed=0,
+                cold_every=3,
+                skip_contention=False,
+            )
+            calls = []
+
+            def contention(*_args, **_kwargs):
+                self.fail("contention ran for a subject it has no commands for")
+
+            timeouts = set()
+            engine_run = fake_engine(calls)
+
+            def measure(command, timeout=None, **kwargs):
+                timeouts.add(timeout)
+                engine_run(command, **kwargs)
+
+            with (
+                patch.object(short, "run_measurement", measure),
+                patch.object(short, "run_contention", contention),
+            ):
+                self.assertEqual(short.run(args), 0)
+            profiles = [call[call.index("--profile") + 1] for call in calls]
+            self.assertEqual(timeouts, {short.PASS_TIMEOUT["lance"]})
+            # Alternating order, so neither tool always runs on a warmer node.
+            self.assertEqual(
+                profiles,
+                ["bench-lance", "bench-lance-mbx", "bench-lance-mbx"]
+                + ["bench-lance", "bench-lance", "bench-lance-mbx"],
+            )
+            self.assertTrue((args.output / "metrics.otlp.json").exists())
 
     def test_cold_every_one_measures_every_cold_build(self):
         """A change aimed at cold needs more than one cold measurement.

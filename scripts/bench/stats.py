@@ -27,10 +27,12 @@ def validate(result, backend):
             raise ValueError(f"{phase}: missing or invalid wall_ms")
         if metrics.get("invalid_reasons"):
             raise ValueError(f"{phase}: {metrics['invalid_reasons']}")
+        # Not Kache's `errors`: it counts wrapped compiles that exited non-zero,
+        # such as build-script probes that fail on purpose. Its cache faults
+        # arrive as `invalid_reasons` above.
         if any(
             metrics.get(key, 0)
             for key in (
-                "errors",
                 "cache_errors",
                 "cache_read_errors",
                 "cache_write_errors",

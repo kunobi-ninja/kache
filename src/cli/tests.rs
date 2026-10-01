@@ -6514,6 +6514,23 @@ fn a_target_whose_build_lock_is_held_is_in_use() {
 }
 
 #[test]
+fn probing_a_free_lock_leaves_it_free_while_a_duplicate_lives() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(".cargo-lock");
+    std::fs::write(&path, b"").unwrap();
+    let probe = std::fs::File::open(&path).unwrap();
+    // Stands in for a child forked while the probe held the lock.
+    let duplicate = probe.try_clone().unwrap();
+    assert!(!held_elsewhere(&probe));
+    drop(probe);
+    let next = std::fs::File::open(&path).unwrap();
+    assert!(!held_elsewhere(&next), "the probe left its lock behind");
+    next.lock().unwrap();
+    assert!(held_elsewhere(&std::fs::File::open(&path).unwrap()));
+    drop(duplicate);
+}
+
+#[test]
 fn remove_targets_leaves_a_target_a_build_is_writing() {
     let root = tempfile::tempdir().unwrap();
     let busy = root.path().join("busy/target");

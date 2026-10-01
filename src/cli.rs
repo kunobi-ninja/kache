@@ -4632,10 +4632,24 @@ const TARGET_IN_USE: &str = "in use by a running Cargo command or test";
 /// `<triple>/<profile>/.cargo-lock`) for the length of a build, so failing to
 /// take it here means a build is writing into this directory now.
 pub(crate) fn target_in_use(target: &std::path::Path) -> bool {
-    cargo_lock_files(target, 3).iter().any(|lock| {
-        std::fs::File::open(lock)
-            .is_ok_and(|file| matches!(file.try_lock(), Err(std::fs::TryLockError::WouldBlock)))
-    })
+    cargo_lock_files(target, 3)
+        .iter()
+        .any(|lock| std::fs::File::open(lock).is_ok_and(|file| held_elsewhere(&file)))
+}
+
+/// Whether someone else holds `file`'s lock. A lock the probe takes is
+/// released explicitly: closing alone leaves it held while a child forked
+/// meanwhile still has the descriptor, and the next probe or Cargo itself
+/// would find it taken.
+fn held_elsewhere(file: &std::fs::File) -> bool {
+    match file.try_lock() {
+        Ok(()) => {
+            let _ = file.unlock();
+            false
+        }
+        Err(std::fs::TryLockError::WouldBlock) => true,
+        Err(std::fs::TryLockError::Error(_)) => false,
+    }
 }
 
 /// `.cargo-lock` files at most `depth` directories below `dir`. Symlinks

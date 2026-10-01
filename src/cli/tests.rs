@@ -7144,3 +7144,11 @@ async fn save_manifest_skipped_when_remote_readonly() {
     save_manifest(&config, Some("mykey"), None)
         .expect("save_manifest should succeed by doing nothing");
 }
+
+#[test]
+fn a_quiet_gc_the_user_asked_for_is_requested() {
+    use crate::store::SweepOrigin;
+    assert_eq!(GcMode::Cli.sweep_origin(), SweepOrigin::Requested);
+    assert_eq!(GcMode::CliQuiet.sweep_origin(), SweepOrigin::Requested);
+    assert_eq!(GcMode::Background.sweep_origin(), SweepOrigin::Automatic);
+}

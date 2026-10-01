@@ -6,7 +6,9 @@
 //! folds in the events it drops, and every recorded GC run adds the bytes it
 //! pruned. Lifetime figures are the ledger plus what the log still holds.
 //!
-//! A missing, corrupt or newer-schema ledger reads as not recorded.
+//! A missing, corrupt or newer-schema ledger reads as not recorded. A
+//! corrupt one is moved to `savings.json.corrupt` before the next write; a
+//! newer one is never rewritten.
 
 use crate::config::Config;
 use crate::events::BuildEvent;
@@ -109,13 +111,6 @@ struct LedgerFile {
     totals: Totals,
 }
 
-impl LedgerFile {
-    /// Written by a later kache: readable fields may mean something else.
-    fn is_newer(&self) -> bool {
-        self.schema > SAVINGS_SCHEMA
-    }
-}
-
 pub fn ledger_path(cache_dir: &Path) -> PathBuf {
     cache_dir.join(SAVINGS_FILE)
 }
@@ -124,21 +119,55 @@ fn lock_path(cache_dir: &Path) -> PathBuf {
     cache_dir.join(format!("{SAVINGS_FILE}.lock"))
 }
 
-fn parse(path: &Path) -> Option<LedgerFile> {
-    let content = fs::read_to_string(path).ok()?;
-    serde_json::from_str(&content).ok()
+/// What a `savings.json` holds.
+enum Ledger {
+    Missing,
+    /// Unreadable as a ledger of any schema.
+    Corrupt,
+    /// Written by a newer kache. Its shape may differ, so the schema number
+    /// is read before anything else and the file is never rewritten.
+    Newer,
+    Current(LedgerFile),
+}
+
+fn load(path: &Path) -> Ledger {
+    let Ok(content) = fs::read_to_string(path) else {
+        return if path.exists() {
+            Ledger::Corrupt
+        } else {
+            Ledger::Missing
+        };
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return Ledger::Corrupt;
+    };
+    let schema = value.get("schema").and_then(serde_json::Value::as_u64);
+    if schema.is_some_and(|schema| schema > u64::from(SAVINGS_SCHEMA)) {
+        return Ledger::Newer;
+    }
+    match serde_json::from_value::<LedgerFile>(value) {
+        Ok(file) => Ledger::Current(file),
+        Err(_) => Ledger::Corrupt,
+    }
+}
+
+/// Where a corrupt ledger is moved before a fresh one replaces it.
+fn corrupt_path(cache_dir: &Path) -> PathBuf {
+    cache_dir.join(format!("{SAVINGS_FILE}.corrupt"))
 }
 
 /// The ledger in `cache_dir`, or `None` when it is not recorded.
 pub fn read(cache_dir: &Path) -> Option<Totals> {
-    parse(&ledger_path(cache_dir))
-        .filter(|file| !file.is_newer())
-        .map(|file| file.totals)
+    match load(&ledger_path(cache_dir)) {
+        Ledger::Current(file) => Some(file.totals),
+        Ledger::Missing | Ledger::Corrupt | Ledger::Newer => None,
+    }
 }
 
 /// Add `delta` to the ledger in `cache_dir` under its lock, so a rotation and
-/// a GC in different processes cannot lose each other's update. A missing or
-/// corrupt ledger starts over from `delta`; a newer one is left alone.
+/// a GC in different processes cannot lose each other's update. A missing
+/// ledger starts from `delta`; a corrupt one is moved to `savings.json.corrupt`
+/// first; a newer one is left alone, and `delta` is not recorded.
 fn add(cache_dir: &Path, delta: &Totals) -> Result<()> {
     fs::create_dir_all(cache_dir).context("creating cache dir for the savings ledger")?;
     let lock = OpenOptions::new()
@@ -151,13 +180,15 @@ fn add(cache_dir: &Path, delta: &Totals) -> Result<()> {
     lock.lock().context("locking savings ledger")?;
     let path = ledger_path(cache_dir);
     let res = (|| -> Result<()> {
-        let current = parse(&path);
-        if current.as_ref().is_some_and(LedgerFile::is_newer) {
-            return Ok(());
-        }
         let mut totals = delta.clone();
-        if let Some(current) = current {
-            totals.absorb(&current.totals);
+        match load(&path) {
+            Ledger::Newer => return Ok(()),
+            Ledger::Missing => {}
+            Ledger::Corrupt => {
+                fs::rename(&path, corrupt_path(cache_dir))
+                    .context("moving the corrupt savings ledger aside")?;
+            }
+            Ledger::Current(current) => totals.absorb(&current.totals),
         }
         let json = serde_json::to_string_pretty(&LedgerFile {
             schema: SAVINGS_SCHEMA,
@@ -169,10 +200,10 @@ fn add(cache_dir: &Path, delta: &Totals) -> Result<()> {
     res
 }
 
-/// Fold the event-log lines a rotation drops into the ledger. Called by the
-/// rotation while it still holds the log's exclusive lock, after the log
-/// has been replaced: a reader holding the shared lock sees each event in
-/// the log or in the ledger, never both. Lines that are not build events
+/// Fold the event-log lines a rotation drops into the ledger. Called after
+/// the log has been replaced and its lock released, so a reader sees each
+/// event in the log or in the ledger, never both; between the replace and
+/// this fold it briefly sees it in neither. Lines that are not build events
 /// (heartbeats, torn writes) count for nothing.
 pub(crate) fn fold_dropped_lines(cache_dir: &Path, lines: &[&str]) -> Result<()> {
     let events: Vec<BuildEvent> = lines

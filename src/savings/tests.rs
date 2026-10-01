@@ -250,6 +250,15 @@ fn a_corrupt_ledger_reads_as_none_and_the_next_write_starts_over() {
     let mut only_this_run = totals(at(2));
     only_this_run.pruned_requested_bytes = 9;
     assert_eq!(read(dir.path()), Some(only_this_run));
+    assert_eq!(
+        std::fs::read_to_string(corrupt_path(dir.path())).unwrap(),
+        "{ not json",
+        "the corrupt ledger is kept aside"
+    );
+
+    // Valid JSON in the current schema with the wrong shape is corrupt too.
+    std::fs::write(ledger_path(dir.path()), r#"{"schema":1,"hits":"many"}"#).unwrap();
+    assert_eq!(read(dir.path()), None);
 }
 
 #[test]
@@ -261,6 +270,14 @@ fn a_newer_ledger_is_neither_read_nor_overwritten() {
     assert_eq!(read(dir.path()), None);
     record_pruned(dir.path(), SweepOrigin::Automatic, 9, at(2)).unwrap();
     assert_eq!(std::fs::read_to_string(&path).unwrap(), newer);
+
+    // A newer schema in a shape this version cannot parse is left alone
+    // too: the schema number is read first.
+    let reshaped = r#"{"schema":2,"totals":{"hits":5}}"#;
+    std::fs::write(&path, reshaped).unwrap();
+    record_pruned(dir.path(), SweepOrigin::Automatic, 9, at(2)).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), reshaped);
+    assert!(!corrupt_path(dir.path()).exists());
 
     // The current schema is read and added to.
     std::fs::write(&path, newer.replace("\"schema\":2", "\"schema\":1")).unwrap();

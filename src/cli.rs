@@ -3542,6 +3542,8 @@ fn write_paged(lines: &[String], no_pager: bool) {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GcMode {
     Cli,
+    /// A `kache gc --json` the daemon could not take: requested, but quiet.
+    CliQuiet,
     Background,
 }
 
@@ -3550,7 +3552,7 @@ impl GcMode {
     /// user typed is not, and may evict what the remote just delivered.
     pub fn sweep_origin(self) -> crate::store::SweepOrigin {
         match self {
-            GcMode::Cli => crate::store::SweepOrigin::Requested,
+            GcMode::Cli | GcMode::CliQuiet => crate::store::SweepOrigin::Requested,
             GcMode::Background => crate::store::SweepOrigin::Automatic,
         }
     }
@@ -4107,11 +4109,7 @@ pub fn gc(
             } else {
                 combined = run_gc_local_with_shards(
                     config,
-                    if json {
-                        GcMode::Background
-                    } else {
-                        GcMode::Cli
-                    },
+                    if json { GcMode::CliQuiet } else { GcMode::Cli },
                 )?;
             }
         }

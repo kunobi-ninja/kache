@@ -730,8 +730,9 @@ pub fn read_events(event_log_path: &Path) -> Result<Vec<BuildEvent>> {
 }
 
 /// Read all events from the event log, and call `also` under the same shared
-/// lock. A rotation folds the events it drops into the savings ledger under
-/// the exclusive lock, so reading the ledger in `also` sees each event once.
+/// lock. A rotation replaces the log under the exclusive lock before it folds
+/// the dropped events into the savings ledger, so reading the ledger in
+/// `also` never sees an event in both.
 pub fn read_events_and<T>(
     event_log_path: &Path,
     also: impl FnOnce() -> T,
@@ -1115,8 +1116,8 @@ pub fn session_cut_by_rotation(event_log_path: &Path) -> Option<String> {
 /// progress (see [`retained_suffix`]).
 ///
 /// `fold` receives the complete lines the rotation drops, after the log has
-/// been replaced and while the exclusive lock is still held. A failed fold
-/// is logged; the rotation stands.
+/// been replaced and its lock released, so concurrent appends do not wait on
+/// the fold. A failed fold is logged; the rotation stands.
 fn rotate_log_impl(
     log_path: &Path,
     max_size: u64,
@@ -1139,10 +1140,11 @@ fn rotate_log_impl(
     let lock = open_log_lock(log_path).context("opening log lock")?;
     lock.lock().context("locking log for rotation")?;
 
-    let res = (|| -> Result<()> {
+    // The dropped lines, for the fold after the lock is released.
+    let res = (|| -> Result<Option<String>> {
         let meta = fs::metadata(log_path)?;
         if meta.len() <= max_size {
-            return Ok(());
+            return Ok(None);
         }
 
         // Clean up stale temp files in the same directory (older than 5 minutes)
@@ -1172,11 +1174,7 @@ fn rotate_log_impl(
         let output = kept.concat();
         crate::atomic::atomic_replace(log_path, output.as_bytes())
             .context("writing and replacing log file atomically")?;
-        // After the replace: a crash in between loses these lines from the
-        // ledger rather than counting them twice.
-        if let Err(e) = fold(&lines[..retained.start]) {
-            tracing::warn!("folding rotated {log_label} lines: {e:#}");
-        }
+        let dropped = lines[..retained.start].concat();
 
         // Record the rotation so tailers can map their cursor onto the new
         // file instead of re-delivering the retained tail (#528). Written
@@ -1203,11 +1201,20 @@ fn rotate_log_impl(
             kept.len(),
             lines.len()
         );
-        Ok(())
+        Ok(Some(dropped))
     })();
 
     let _ = lock.unlock();
-    res
+    // After the replace: a crash before the fold loses these lines from the
+    // ledger rather than counting them twice. A reader between the two sees
+    // them in neither, briefly, never in both.
+    if let Some(dropped) = res? {
+        let lines: Vec<&str> = dropped.split_inclusive('\n').collect();
+        if let Err(e) = fold(&lines) {
+            tracing::warn!("folding rotated {log_label} lines: {e:#}");
+        }
+    }
+    Ok(())
 }
 
 /// Rotate the event log if it exceeds the max size, keeping at least the

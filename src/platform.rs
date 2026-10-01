@@ -397,10 +397,13 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_cap_reads_kern_maxfilesperproc() {
-        let out = std::process::Command::new("sysctl")
+        // The Nix build sandbox has no sysctl binary; `Test (macOS)` runs this.
+        let Ok(out) = std::process::Command::new("/usr/sbin/sysctl")
             .args(["-n", "kern.maxfilesperproc"])
             .output()
-            .unwrap();
+        else {
+            return;
+        };
         let expected: libc::rlim_t = String::from_utf8(out.stdout)
             .unwrap()
             .trim()

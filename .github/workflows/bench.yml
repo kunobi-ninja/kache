@@ -302,6 +302,10 @@ jobs:
       run:
         shell: bash
     steps:
+      # For the job's own duration, reported by the last step.
+      - name: Record the job start
+        run: echo "BENCH_JOB_STARTED=$(date +%s)" >> "$GITHUB_ENV"
+
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         timeout-minutes: 10
 
@@ -566,5 +570,32 @@ jobs:
         with:
           name: telemetry-otlp-v1-cache-${{ matrix.name }}-warm-same-tree
           path: tmp/bench/${{ matrix.dir }}/cache-otlp-warm-same-tree/
+          retention-days: 14
+          if-no-files-found: warn
+
+      # Last, so the duration covers the uploads and the conclusion covers every
+      # step before. A job killed at its own limit runs no further steps, so a
+      # missing point here is itself the signal. The ARC image may lack Python
+      # if setup failed early; there is nothing to report then either.
+      - name: Write job telemetry
+        if: always()
+        env:
+          JOB_STATUS: ${{ job.status }}
+          CACHE_TOOL: ${{ endsWith(matrix.name, '-sccache') && 'sccache' || endsWith(matrix.name, '-mbx') && 'mbx' || 'kache' }}
+        run: |
+          if command -v python3 >/dev/null && [ -n "${BENCH_JOB_STARTED:-}" ]; then
+            python3 scripts/bench/job_telemetry.py \
+              --project "${{ matrix.dir }}" --cache-tool "$CACHE_TOOL" \
+              --started "$BENCH_JOB_STARTED" --status "$JOB_STATUS" \
+              --output "tmp/bench-job/${{ matrix.dir }}"
+          fi
+
+      - name: Upload job telemetry
+        if: always()
+        timeout-minutes: 10
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: telemetry-otlp-v1-job-${{ matrix.name }}
+          path: tmp/bench-job/${{ matrix.dir }}/
           retention-days: 14
           if-no-files-found: warn

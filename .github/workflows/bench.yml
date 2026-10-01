@@ -159,11 +159,13 @@ jobs:
           # cross-clone warm. Minutes, not hours; a C compiler is all it needs.
           #
           # The three short subjects (hk, eza, aube) pass the same flags: six
-          # kache samples, one of sccache and of mbx, and three warm contention
-          # batches. Six of everything is the per-PR gate's setting for a
-          # head-against-base test, which needs five pairs; a nightly has no
-          # base, and at six the other two tools took most of each arm.
-          hk='{"name":"hk","cmd":"bench-short hk 6 --context-samples 1 --contention-samples 3","dir":"bench-hk","timeout":120,"job_timeout":150,"min_free_gb":40,"runner":"kunobi-runners"}'
+          # kache samples, one of mbx (the daily reading against it; the
+          # per-PR gate runs Kache alone), and three warm contention batches. Six
+          # of everything is the per-PR gate's setting for a head-against-base
+          # test, which needs five pairs; a nightly has no base. sccache is
+          # pinned and runs only in the weekly reference (bench-sccache.yml);
+          # under contention it took a third of the aube arm.
+          hk='{"name":"hk","cmd":"bench-short hk 6 --context-samples 1 --contention-samples 3 --mbx mbx","dir":"bench-hk","timeout":120,"job_timeout":150,"min_free_gb":40,"runner":"kunobi-runners"}'
           # hk with input predictions off: the control for the arm above, so
           # the same nightly shows what predictions are worth (#1000).
           hk_nopred='{"name":"hk-nopred","cmd":"bench hk-nopred --warm-same-tree","dir":"bench-hk-nopred","timeout":60,"job_timeout":90,"min_free_gb":40,"runner":"kunobi-runners"}'
@@ -184,13 +186,13 @@ jobs:
           # majority of its cacheable units on the C side (199 of 319 in a local
           # run). The cheapest arm in the sweep: minutes, and under a gigabyte
           # of build output.
-          eza='{"name":"eza","cmd":"bench-short eza 6 --context-samples 1 --contention-samples 3","dir":"bench-eza","timeout":60,"job_timeout":90,"min_free_gb":40,"runner":"kunobi-runners"}'
+          eza='{"name":"eza","cmd":"bench-short eza 6 --context-samples 1 --contention-samples 3 --mbx mbx","dir":"bench-eza","timeout":60,"job_timeout":90,"min_free_gb":40,"runner":"kunobi-runners"}'
           # aube: a 15-crate workspace with C dependencies (aws-lc-sys,
           # mimalloc, tree-sitter through cc-rs; libz-ng-sys through cmake).
           # Where hk is one crate over a large graph, aube's time goes to
           # workspace units that depend on each other. At six samples of
           # every tool this arm needs about 146 minutes.
-          aube='{"name":"aube","cmd":"bench-short aube 6 --context-samples 1 --contention-samples 3","dir":"bench-aube","timeout":120,"job_timeout":150,"min_free_gb":40,"runner":"kunobi-runners"}'
+          aube='{"name":"aube","cmd":"bench-short aube 6 --context-samples 1 --contention-samples 3 --mbx mbx","dir":"bench-aube","timeout":120,"job_timeout":150,"min_free_gb":40,"runner":"kunobi-runners"}'
           # Three more subjects through mbx's Cargo front, which caches both
           # Rust and the C a build script compiles. Builds Cargo does not drive
           # go through `mbx exec` instead and get C/C++ caching only: firefox
@@ -372,8 +374,9 @@ jobs:
           } >> "$GITHUB_ENV"
 
       # mise installs rust (per rust-toolchain.toml) and just (the bench recipe
-      # is `just bench`) for every arm, and sccache only for the sccache arm,
-      # which wires it as the compiler cache (version pinned by mise.toml). A
+      # is `just bench`) for every arm, and sccache only for the sccache arms
+      # and a short suite dispatched with `--sccache` (the weekly reference),
+      # version pinned by mise.toml. A
       # tool an arm does not use must never be able to fail its install step:
       # on 2026-09-10 a GitHub attestation 503 on the sccache download failed
       # five arms that never run it. A transient failure gets one retry below.
@@ -388,7 +391,7 @@ jobs:
           install: true
           # Pin mise CLI — see ci.yml (v2026.6.10 regression).
           version: 2026.6.9
-          install_args: --force rust github:casey/just${{ (endsWith(matrix.name, '-sccache') || matrix.name == 'hk' || matrix.name == 'eza' || matrix.name == 'aube') && ' github:mozilla/sccache' || '' }}
+          install_args: --force rust github:casey/just${{ (endsWith(matrix.name, '-sccache') || contains(github.event.inputs.extra_args, '--sccache')) && ' github:mozilla/sccache' || '' }}
           cache: false
           reshim: false
 
@@ -398,7 +401,7 @@ jobs:
         with:
           install: true
           version: 2026.6.9
-          install_args: --force rust github:casey/just${{ (endsWith(matrix.name, '-sccache') || matrix.name == 'hk' || matrix.name == 'eza' || matrix.name == 'aube') && ' github:mozilla/sccache' || '' }}
+          install_args: --force rust github:casey/just${{ (endsWith(matrix.name, '-sccache') || contains(github.event.inputs.extra_args, '--sccache')) && ' github:mozilla/sccache' || '' }}
           cache: false
           reshim: false
 

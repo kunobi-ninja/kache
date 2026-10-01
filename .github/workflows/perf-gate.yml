@@ -1,9 +1,10 @@
 name: Perf gate
 
-# hk, eza and aube, Kache head/base plus sccache and mbx on each subject's runner.
-# Six paired Kache runs normally (six warm pairs, two cold seeds), with sccache,
-# mbx and contention measured once; the bench label or [bench] title measures
-# every tool and contention six times, including same-repo drafts.
+# hk, eza and aube, Kache head/base plus mbx on each subject's runner.
+# Six paired Kache runs normally (six warm pairs, two cold seeds), with mbx and
+# contention measured once; the bench label or [bench] title measures both and
+# contention six times, including same-repo drafts. sccache is pinned and runs
+# only in the weekly reference (bench-sccache.yml).
 # The instrument and policy come from the default branch. Only the two Kache
 # binaries vary with the PR. The published perf-gate/warm status remains optional.
 #
@@ -238,7 +239,7 @@ jobs:
           install: true
           # Pin mise CLI — see ci.yml (v2026.6.10 regression).
           version: 2026.6.9
-          install_args: --force rust github:casey/just github:mozilla/sccache
+          install_args: --force rust github:casey/just
           cache: false
           reshim: false
 
@@ -251,7 +252,7 @@ jobs:
           bash "$RUNNER_TEMP/install-bench-mbx.sh"
 
       # Disk-full mid-build is the worst failure mode on the emptyDir-backed
-      # work volume. Four arms retain isolated cold snapshots and build trees
+      # work volume. Three arms retain isolated cold snapshots and build trees
       # between repetitions. The
       # floor includes their build trees and Kache build output.
       - name: Free-disk precheck
@@ -404,6 +405,7 @@ jobs:
             --engine "$RUNNER_TEMP/instrument/kache-scenario" \
             --scenarios "$RUNNER_TEMP/instrument/scenarios" \
             --kache "$RUNNER_TEMP/head/kache" --base "$RUNNER_TEMP/base/kache" \
+            --mbx mbx \
             --output "$RUNNER_TEMP/perf-gate/$BENCH_PROJECT" || status=$?
           report="$RUNNER_TEMP/perf-gate/$BENCH_PROJECT/perf-gate.md"
           if [ -f "$report" ]; then cat "$report" >> "$GITHUB_STEP_SUMMARY"; fi

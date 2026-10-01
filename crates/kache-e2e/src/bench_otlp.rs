@@ -115,6 +115,26 @@ pub struct OtlpPhase {
     /// longer on a loaded node. Without this beside the wall clock, a slow
     /// night and a regression are the same number.
     pub load: Option<crate::bench_host::PhaseLoad>,
+    /// Where Kache's wrapper spent this phase, for the tool that has one.
+    pub wrapper: Option<WrapperBreakdown>,
+}
+
+/// Where Kache's wrapper spent a phase, and how the bytes it restored came
+/// back. The wall clock says a warm build got slower; this says whether it
+/// was keys, the dep-info pre-pass, waiting or restoring.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct WrapperBreakdown {
+    /// `(stage, ms)` summed over every invocation in the phase, so parallel
+    /// invocations add up past the wall clock. The stages partition the
+    /// wrapper's time: `key` excludes the dep-info pre-pass, which is its own
+    /// stage.
+    pub stages_ms: Vec<(&'static str, u64)>,
+    /// Dep-info pre-passes spawned. Input predictions exist to avoid them.
+    pub dep_info_runs: u64,
+    /// Sampled checks where a prediction disagreed with the pre-pass.
+    pub prediction_mismatches: u64,
+    /// `(method, bytes)` restored by reflink, hardlink and copy.
+    pub restored_bytes: Vec<(&'static str, u64)>,
 }
 
 impl OtlpRun {
@@ -198,6 +218,10 @@ fn metrics_for(run: &OtlpRun) -> Vec<Value> {
     let mut cpu_pressure_points = Vec::new();
     let mut io_pressure_points = Vec::new();
     let mut memory_pressure_points = Vec::new();
+    let mut stage_points = Vec::new();
+    let mut dep_info_points = Vec::new();
+    let mut mismatch_points = Vec::new();
+    let mut restore_points = Vec::new();
 
     for phase in &run.phases {
         let phase_attrs = common_attrs(run, Some(phase.name));
@@ -296,6 +320,28 @@ fn metrics_for(run: &OtlpRun) -> Vec<Value> {
                 }
             }
         }
+        if let Some(wrapper) = &phase.wrapper {
+            for (stage, ms) in &wrapper.stages_ms {
+                let mut attrs = phase_attrs.clone();
+                attrs.push(str_attr("kache.bench.stage", stage));
+                stage_points.push(as_double(seconds(*ms), &run.time_unix_nano, &attrs));
+            }
+            dep_info_points.push(as_int(
+                wrapper.dep_info_runs,
+                &run.time_unix_nano,
+                &phase_attrs,
+            ));
+            mismatch_points.push(as_int(
+                wrapper.prediction_mismatches,
+                &run.time_unix_nano,
+                &phase_attrs,
+            ));
+            for (method, bytes) in &wrapper.restored_bytes {
+                let mut attrs = phase_attrs.clone();
+                attrs.push(str_attr("kache.bench.method", method));
+                restore_points.push(as_int(*bytes, &run.time_unix_nano, &attrs));
+            }
+        }
     }
 
     metrics.push(gauge("kache.bench.build.duration", "s", duration_points));
@@ -344,6 +390,20 @@ fn metrics_for(run: &OtlpRun) -> Vec<Value> {
             "s",
             memory_pressure_points,
         ),
+    ] {
+        if !points.is_empty() {
+            metrics.push(gauge(name, unit, points));
+        }
+    }
+    for (name, unit, points) in [
+        ("kache.bench.wrapper.time", "s", stage_points),
+        ("kache.bench.dep_info.runs", "{run}", dep_info_points),
+        (
+            "kache.bench.prediction.mismatches",
+            "{check}",
+            mismatch_points,
+        ),
+        ("kache.bench.restore.bytes", "By", restore_points),
     ] {
         if !points.is_empty() {
             metrics.push(gauge(name, unit, points));
@@ -517,6 +577,7 @@ mod tests {
                     passthrough: Vec::new(),
                     passthrough_reasons: Vec::new(),
                     load: None,
+                    wrapper: None,
                 },
                 OtlpPhase {
                     name: "warm",
@@ -544,6 +605,7 @@ mod tests {
                         412_000,
                     )],
                     load: None,
+                    wrapper: None,
                 },
             ],
         }
@@ -630,6 +692,64 @@ mod tests {
         let memory = metric(&body, "kache.bench.host.pressure.memory");
         assert_eq!(memory["gauge"]["dataPoints"][0]["asDouble"], 0.0);
         assert!(!names(&body).contains(&"kache.bench.host.pressure.io"));
+    }
+
+    #[test]
+    fn the_wrapper_breakdown_is_reported_per_stage_and_method() {
+        let mut run = kache_run();
+        run.phases[1].wrapper = Some(WrapperBreakdown {
+            stages_ms: vec![("key", 4_000), ("dep_info", 800), ("restore", 3_500)],
+            dep_info_runs: 19,
+            prediction_mismatches: 1,
+            restored_bytes: vec![("reflink", 1_000), ("copy", 24)],
+        });
+        let body = serialize_metrics(&run);
+
+        let stages = metric(&body, "kache.bench.wrapper.time");
+        assert_eq!(stages["unit"], "s");
+        let points = stages["gauge"]["dataPoints"].as_array().unwrap();
+        let by_stage: Vec<(String, f64)> = points
+            .iter()
+            .map(|p| {
+                (
+                    attr_map(p)["kache.bench.stage"].to_string(),
+                    p["asDouble"].as_f64().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            by_stage,
+            vec![
+                ("key".to_string(), 4.0),
+                ("dep_info".to_string(), 0.8),
+                ("restore".to_string(), 3.5)
+            ]
+        );
+        assert_eq!(attr_map(&points[0])["kache.bench.phase"], "warm");
+
+        let runs = metric(&body, "kache.bench.dep_info.runs");
+        assert_eq!(runs["gauge"]["dataPoints"][0]["asInt"], "19");
+        let mismatches = metric(&body, "kache.bench.prediction.mismatches");
+        assert_eq!(mismatches["gauge"]["dataPoints"][0]["asInt"], "1");
+
+        let restored = metric(&body, "kache.bench.restore.bytes");
+        let points = restored["gauge"]["dataPoints"].as_array().unwrap();
+        assert_eq!(points.len(), 2);
+        assert_eq!(attr_map(&points[1])["kache.bench.method"], "copy");
+        assert_eq!(points[1]["asInt"], "24");
+    }
+
+    #[test]
+    fn a_run_without_a_wrapper_breakdown_emits_none_of_its_metrics() {
+        let body = serialize_metrics(&kache_run());
+        for name in [
+            "kache.bench.wrapper.time",
+            "kache.bench.dep_info.runs",
+            "kache.bench.prediction.mismatches",
+            "kache.bench.restore.bytes",
+        ] {
+            assert!(!names(&body).contains(&name), "{name}");
+        }
     }
 
     #[test]
@@ -820,6 +940,7 @@ mod tests {
             passthrough: Vec::new(),
             passthrough_reasons: Vec::new(),
             load: None,
+            wrapper: None,
         }];
         let body = serialize_metrics(&run);
         let duration = &metric(&body, "kache.bench.build.duration")["gauge"]["dataPoints"][0];
@@ -860,6 +981,7 @@ mod tests {
                 passthrough: Vec::new(),
                 passthrough_reasons: Vec::new(),
                 load: None,
+                wrapper: None,
             }],
         };
         let body = serialize_metrics(&run);

@@ -1112,7 +1112,39 @@ fn otlp_phase(
                 .saturating_sub(metrics.event_log.cached),
         ),
         load: Some(metrics.load.clone()),
+        wrapper: wrapper_breakdown(&metrics.phases, &metrics.storage),
     }
+}
+
+/// The wrapper's time by stage and the restore methods, or `None` for a phase
+/// whose events carry no stage timings (written before schema 17).
+fn wrapper_breakdown(
+    times: &PhaseTimes,
+    storage: &StorageInfo,
+) -> Option<crate::bench_otlp::WrapperBreakdown> {
+    let stages_ms = vec![
+        ("startup", times.startup_ms),
+        ("key", times.key_ms.saturating_sub(times.dep_info_ms)),
+        ("dep_info", times.dep_info_ms),
+        ("lookup", times.lookup_ms),
+        ("wait", times.wait_ms),
+        ("restore", times.restore_ms),
+        ("store", times.store_ms),
+        ("unattributed", times.unattributed_ms),
+    ];
+    if stages_ms.iter().all(|(_, ms)| *ms == 0) {
+        return None;
+    }
+    Some(crate::bench_otlp::WrapperBreakdown {
+        stages_ms,
+        dep_info_runs: times.dep_info_runs,
+        prediction_mismatches: times.prediction_mismatches,
+        restored_bytes: vec![
+            ("reflink", storage.reflinked_bytes),
+            ("hardlink", storage.hardlinked_bytes),
+            ("copy", storage.copied_bytes),
+        ],
+    })
 }
 
 fn otlp_sccache_phase(
@@ -1141,6 +1173,7 @@ fn otlp_sccache_phase(
         top_misses: Vec::new(),
         unconsulted: None,
         load: Some(metrics.load.clone()),
+        wrapper: None,
     }
 }
 
@@ -3285,6 +3318,7 @@ fn otlp_mbx_phase(
         top_misses: Vec::new(),
         unconsulted: Some(metrics.unconsulted),
         load: Some(metrics.load.clone()),
+        wrapper: None,
     }
 }
 

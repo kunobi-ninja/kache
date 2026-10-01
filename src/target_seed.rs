@@ -600,9 +600,20 @@ fn built_by(target_dir: &Path, version: &str) -> bool {
         })
 }
 
+/// A Cargo lock seeding holds, released when dropped. Closing alone is not
+/// enough: a child forked meanwhile keeps a duplicate descriptor until it
+/// execs, and Cargo would wait for that.
+struct Held(std::fs::File);
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
 /// Lock `path` exclusively without waiting, creating it if needed. `None`
 /// when another process holds it or it cannot be opened.
-fn try_lock(path: &Path) -> Option<std::fs::File> {
+fn try_lock(path: &Path) -> Option<Held> {
     let file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -610,7 +621,7 @@ fn try_lock(path: &Path) -> Option<std::fs::File> {
         .open(path)
         .ok()?;
     file.try_lock().ok()?;
-    Some(file)
+    Some(Held(file))
 }
 
 fn entries(dir: &Path) -> Vec<PathBuf> {
@@ -1516,16 +1527,11 @@ source = "git+https://example.com/gitdep#abc"
         let path = dir.path().join(".cargo-lock");
         let first = try_lock(&path).unwrap();
         assert!(try_lock(&path).is_none());
+        // Stands in for a child forked while the lock was held.
+        let duplicate = first.0.try_clone().unwrap();
         drop(first);
-        // A process another test forks in this instant shares the lock until
-        // it execs, so the release can take a moment to show.
-        let retaken = (0..200).any(|_| {
-            try_lock(&path).is_some() || {
-                std::thread::sleep(std::time::Duration::from_millis(10));
-                false
-            }
-        });
-        assert!(retaken, "the lock was not released");
+        assert!(try_lock(&path).is_some(), "the lock was not released");
+        drop(duplicate);
         assert!(try_lock(&dir.path().join("missing/.cargo-lock")).is_none());
     }
 

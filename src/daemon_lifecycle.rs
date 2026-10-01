@@ -657,12 +657,13 @@ mod tests {
             .unwrap();
         // SAFETY: DaemonCommand passed this child its owned readiness pipe.
         let mut channel = unsafe { std::fs::File::from_raw_fd(fd) };
-        writeln!(
+        // A verifier that fails on its own probe first stops reading, so the
+        // write can meet a closed pipe. The fixture still has to exit cleanly.
+        let _ = writeln!(
             channel,
             "{}",
             std::env::var("KACHE_TEST_READINESS_MESSAGE").unwrap()
-        )
-        .unwrap();
+        );
         let deadline = Instant::now() + Duration::from_secs(5);
         while !Path::new(&release).exists() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));

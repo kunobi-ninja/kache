@@ -947,7 +947,7 @@ fn end_of_url(text: &[u8], at: usize) -> usize {
     text.len()
 }
 
-fn replace_all(haystack: &[u8], needle: &[u8], replacement: &[u8]) -> Vec<u8> {
+pub(crate) fn replace_all(haystack: &[u8], needle: &[u8], replacement: &[u8]) -> Vec<u8> {
     if needle.is_empty() {
         return haystack.to_vec();
     }

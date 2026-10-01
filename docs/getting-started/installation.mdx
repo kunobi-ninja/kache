@@ -101,7 +101,7 @@ nix profile install github:kunobi-ninja/kache/v0.26.3
 
 The flake also exports an overlay, NixOS module, and nix-darwin module. See the repository [`flake.nix`](https://github.com/kunobi-ninja/kache/blob/main/flake.nix) for their current names and options.
 
-The package includes `cargo`, `cc`, `c++`, `gcc`, `g++`, `clang`, and `clang++` symlinks in `${kache}/shims`. With this flake's `overlays.default` applied, enable them in your NixOS configuration:
+The package includes `cargo`, `cc`, `c++`, `gcc`, `g++`, `clang`, `clang++`, and `rustdoc` symlinks in `${kache}/shims`. With this flake's `overlays.default` applied, enable them in your NixOS configuration:
 
 ```nix
 { pkgs, ... }:
@@ -114,7 +114,7 @@ The package includes `cargo`, `cc`, `c++`, `gcc`, `g++`, `clang`, and `clang++` 
 }
 ```
 
-Keep the real compilers later in `PATH`. The compiler shims cover C and C++; Rust still uses `RUSTC_WRAPPER`. The Cargo shim protects targets while Cargo commands run. Nix builds the symlinks, so no `kache install-shims` step is needed. The existing `${kache}/lib/kache` path remains available.
+Keep the real compilers later in `PATH`. The compiler shims cover C and C++; Rust still uses `RUSTC_WRAPPER`. Point `build.rustdoc` at the `rustdoc` link to cache `cargo doc`. The Cargo shim protects targets while Cargo commands run. Nix builds the symlinks, so no `kache install-shims` step is needed. The existing `${kache}/lib/kache` path remains available.
 
 ## Supported release targets
 

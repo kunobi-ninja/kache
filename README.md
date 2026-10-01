@@ -41,7 +41,7 @@ After `kache init`, [build the same revision in two temporary worktrees][first-r
 
 Kache has three parts: a compiler wrapper, a local store, and an optional daemon.
 
-- The wrapper parses each `rustc`, `cc`, `c++`, or `nvcc` invocation, hashes the inputs that change the output, and normalizes the machine-local paths that do not. Two worktrees of the same revision produce the same key.
+- The wrapper parses each `rustc`, `rustdoc`, `cc`, `c++`, or `nvcc` invocation, hashes the inputs that change the output, and normalizes the machine-local paths that do not. Two worktrees of the same revision produce the same key.
 - Wrappers that reach the same key at the same time join one flight, so the compiler runs once per key on a machine, however many Cargo processes ask for it.
 - The store keeps outputs as content-addressed blobs. Identical bytes are stored once. Restores use copy-on-write clones where the filesystem supports them, so a second worktree costs little disk.
 - The daemon serves remote lookups after a local miss and uploads new entries in the background.
@@ -56,6 +56,7 @@ Hits, misses, and passthroughs are reported per unit, and `kache why-miss` expla
 | Rust executables | Supported on Linux and macOS | Disabled by default on Windows |
 | C and C++ object files | Supported | GCC, Clang, Apple Clang, and clang-cl. Build scripts via `kache init`; other builds via shims or `CC`/`CXX` |
 | CUDA object files | Supported | Single-source `nvcc -c` and `-dc` via `CUDACXX="kache nvcc"` or a CMake launcher |
+| Rust documentation | Unix | `cargo doc` with `RUSTC_BOOTSTRAP=1` and `-Z rustdoc-depinfo -Z rustdoc-mergeable-info`. Windows has no compiler shims, so `cargo doc` is not cached there |
 | Local storage | Built in | Content-addressed store with garbage collection |
 | S3-compatible remote storage | Built in | Includes AWS S3, MinIO, and Cloudflare R2 |
 | Google Cloud Storage | Built in | Application Default Credentials, including GKE workload identity |

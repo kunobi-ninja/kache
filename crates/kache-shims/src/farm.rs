@@ -11,7 +11,9 @@ use std::path::Component;
 use std::path::{Path, PathBuf};
 
 /// The canonical drivers. Versioned and target-prefixed compiler names are opt-in.
-pub const SHIM_NAMES: &[&str] = &["cc", "c++", "gcc", "g++", "clang", "clang++", "cargo"];
+pub const SHIM_NAMES: &[&str] = &[
+    "cc", "c++", "gcc", "g++", "clang", "clang++", "cargo", "rustdoc",
+];
 
 /// Marks a directory of kache shims. Every kache skips every entry in it when
 /// looking for the real compiler, so it goes only on shim-only directories.

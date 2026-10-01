@@ -26,6 +26,7 @@ pub mod flags;
 pub mod nvcc;
 pub mod platform;
 pub mod rustc;
+pub mod rustdoc;
 
 pub use platform::{Loadability, Platform};
 
@@ -766,7 +767,8 @@ pub trait Compiler {
 /// Registration is deliberately concrete and local: adding an adapter means
 /// adding its module-owned descriptor here, with no broad enum of possible
 /// future tool kinds.
-pub const COMPILER_ADAPTERS: &[CompilerAdapter] = &[rustc::ADAPTER, cc::ADAPTER, nvcc::ADAPTER];
+pub const COMPILER_ADAPTERS: &[CompilerAdapter] =
+    &[rustc::ADAPTER, rustdoc::ADAPTER, cc::ADAPTER, nvcc::ADAPTER];
 
 /// Detect which compiler adapter an argv vector is invoking.
 ///
@@ -1958,10 +1960,16 @@ pub(crate) mod shim {
     /// Whether `argv[0]` names a compiler, meaning kache is being invoked
     /// through a shim rather than as itself.
     pub(crate) fn invoked_as_compiler(arg0: &str) -> bool {
+        let argv = [arg0.to_string()];
+        // `rustdoc` is an exact basename. It must not go through the C-family
+        // probe, and a versioned `gcc-13` must still match below.
+        if super::rustdoc::RustdocCompiler::recognizes(&argv) {
+            return true;
+        }
         // Reuses the full name set (exact, versioned, target-prefixed, MinGW
         // alternatives), so a hand-made `x86_64-linux-gnu-gcc` shim works
         // without a second list to keep in sync.
-        super::cc::CcCompiler::recognizes(std::slice::from_ref(&arg0.to_string()))
+        super::cc::CcCompiler::recognizes(&argv)
     }
 
     /// The real compiler behind a shim: the first `name` on `PATH` that is not
@@ -2142,7 +2150,16 @@ mod shim_tests {
 
     #[test]
     fn compiler_shaped_argv0_is_recognized_but_kache_itself_is_not() {
-        for name in ["cc", "gcc", "g++", "clang++", "/usr/local/bin/gcc"] {
+        for name in [
+            "cc",
+            "gcc",
+            "g++",
+            "clang++",
+            "/usr/local/bin/gcc",
+            "rustdoc",
+            "/usr/bin/rustdoc",
+            "rustdoc.exe",
+        ] {
             assert!(invoked_as_compiler(name), "{name} should look like a shim");
         }
         // Versioned and target-prefixed shims work without a second list.

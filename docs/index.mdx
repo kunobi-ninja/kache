@@ -21,7 +21,7 @@ kache init
 
 Keep running `cargo build` as usual; Kache now caches the compiler outputs.
 
-`kache init` sets Cargo's `rustc-wrapper` and installs a login service for the background cache. It asks before each change and backs up files it edits.
+`kache init` sets Cargo's `rustc-wrapper` and installs a login service for the background cache. It asks before each change and backs up files it edits. On Unix, once the compiler shims are installed, it also points `build.rustdoc` at the `rustdoc` link.
 
 [Other install methods](/docs/getting-started/installation) include Homebrew, APT, winget, and Nix. The [quick start](/docs/getting-started/quick-start) shows how to confirm cache hits. For a comparison with sccache, read [Kache or sccache?](/docs/getting-started/comparison).
 
@@ -33,6 +33,7 @@ Keep running `cargo build` as usual; Kache now caches the compiler outputs.
 | Rust executables | Enabled by default on Linux and macOS; disabled by default on Windows |
 | C and C++ object compilation | GCC, Clang, Apple Clang, and clang-cl. MSVC `cl.exe` is not cached |
 | CUDA object compilation | Single-source `nvcc -c` and `-dc` |
+| Rust documentation | Unix, for Cargo's per-crate and finalize rustdoc invocations. Not cached on Windows |
 | Local cache | Content-addressed storage with automatic garbage collection |
 | Remote cache | S3-compatible and filesystem backends |
 | Build visibility | Live monitor, stats, miss explanations, and reports |

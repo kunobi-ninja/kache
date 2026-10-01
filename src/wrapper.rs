@@ -7243,7 +7243,7 @@ impl<'a> EventInputs<'a> {
         self
     }
 
-    fn passthrough_reason(mut self, reason: String) -> Self {
+    pub(crate) fn passthrough_reason(mut self, reason: String) -> Self {
         self.passthrough_reason = reason;
         self
     }

@@ -2762,6 +2762,181 @@ fn test_cargo_wrapper_edit_create() {
 }
 
 #[test]
+fn rustdoc_assignment_ignores_a_longer_key_and_a_comment() {
+    assert!(is_rustdoc_assignment("rustdoc = \"/shim/rustdoc\""));
+    assert!(is_rustdoc_assignment("rustdoc=\"/shim/rustdoc\""));
+    assert!(is_rustdoc_assignment("  rustdoc = \"/shim/rustdoc\""));
+    assert!(!is_rustdoc_assignment("rustdoc-extra = \"/shim/rustdoc\""));
+    assert!(!is_rustdoc_assignment("# rustdoc = \"/shim/rustdoc\""));
+    assert!(!is_rustdoc_assignment("build-rustdoc = \"x\""));
+}
+
+#[test]
+fn rustdoc_edit_decision_writes_only_for_kache_without_a_key() {
+    let shim = "/home/user/.local/lib/kache/shims/rustdoc";
+    assert_eq!(rustdoc_edit_decision(None, None, shim), RustdocEdit::Skip);
+    assert_eq!(
+        rustdoc_edit_decision(Some("sccache"), None, shim),
+        RustdocEdit::Skip
+    );
+    assert_eq!(
+        rustdoc_edit_decision(Some("kache"), None, shim),
+        RustdocEdit::Write
+    );
+    assert_eq!(
+        rustdoc_edit_decision(Some("kache"), Some(shim), shim),
+        RustdocEdit::Already
+    );
+    assert_eq!(
+        rustdoc_edit_decision(Some("kache"), Some("/usr/bin/rustdoc"), shim),
+        RustdocEdit::Leave
+    );
+}
+
+#[test]
+fn apply_rustdoc_edit_inserts_replaces_and_leaves_a_correct_line() {
+    let shim = "/shim/rustdoc";
+    assert_eq!(
+        apply_rustdoc_edit("", shim),
+        "[build]\nrustdoc = \"/shim/rustdoc\"\n"
+    );
+    assert_eq!(
+        apply_rustdoc_edit("[build]\nrustc-wrapper = \"kache\"\n", shim),
+        "[build]\nrustdoc = \"/shim/rustdoc\"\nrustc-wrapper = \"kache\"\n"
+    );
+    assert_eq!(
+        apply_rustdoc_edit(
+            "[build]\nrustdoc = \"/old/rustdoc\"\nrustc-wrapper = \"kache\"\n",
+            shim
+        ),
+        "[build]\nrustdoc = \"/shim/rustdoc\"\nrustc-wrapper = \"kache\"\n"
+    );
+    let correct = "[build]\nrustdoc = \"/shim/rustdoc\"";
+    assert_eq!(apply_rustdoc_edit(correct, shim), correct);
+    assert_eq!(
+        apply_rustdoc_edit(
+            "[build]\nrustc-wrapper = \"kache\"\nrustdoc = \"/old\"\n",
+            shim
+        ),
+        "[build]\nrustc-wrapper = \"kache\"\nrustdoc = \"/shim/rustdoc\"\n"
+    );
+    assert_eq!(
+        apply_rustdoc_edit("[net]\noffline = true\n", shim),
+        "[net]\noffline = true\n\n[build]\nrustdoc = \"/shim/rustdoc\"\n"
+    );
+    let extra = "[build]\nrustdoc-extra = \"keep\"\n# rustdoc = \"no\"\nrustdoc = \"/a\"\nrustdoc = \"/b\"\n";
+    let replaced = apply_rustdoc_edit(extra, shim);
+    assert!(replaced.contains("rustdoc-extra = \"keep\""));
+    assert!(replaced.contains("# rustdoc = \"no\""));
+    assert_eq!(
+        replaced
+            .lines()
+            .filter(|line| is_rustdoc_assignment(line))
+            .count(),
+        1,
+        "{replaced}"
+    );
+    let outside = "[net]\nrustdoc = \"/old\"\n[build]\nrustc-wrapper = \"kache\"\n";
+    let edited = apply_rustdoc_edit(outside, shim);
+    assert!(edited.contains("rustdoc = \"/old\""), "{edited}");
+    assert!(
+        edited.contains("[build]\nrustdoc = \"/shim/rustdoc\"\nrustc-wrapper = \"kache\"\n"),
+        "{edited}"
+    );
+    let later = "[build]\nrustc-wrapper = \"kache\"\n[env]\nrustdoc = \"/keep\"\n";
+    let edited = apply_rustdoc_edit(later, shim);
+    assert_eq!(
+        edited,
+        "[build]\nrustdoc = \"/shim/rustdoc\"\nrustc-wrapper = \"kache\"\n[env]\nrustdoc = \"/keep\"\n",
+        "{edited}"
+    );
+    for distractor in ["note]", "[not-closed"] {
+        let body =
+            format!("[build]\nrustc-wrapper = \"kache\"\n{distractor}\nrustdoc = \"/old\"\n");
+        let edited = apply_rustdoc_edit(&body, shim);
+        assert!(!edited.contains("/old"), "{distractor}: {edited}");
+        assert_eq!(
+            edited.matches("rustdoc =").count(),
+            1,
+            "{distractor}: {edited}"
+        );
+    }
+}
+
+#[test]
+fn rustdoc_doctor_fix_is_present_only_when_the_check_fails() {
+    assert_eq!(rustdoc_doctor_fix(true), None);
+    assert_eq!(
+        rustdoc_doctor_fix(false).as_deref(),
+        Some("point build.rustdoc at the rustdoc shim from kache init")
+    );
+}
+
+#[test]
+fn rustdoc_doctor_fields_cover_windows_unset_and_a_bad_path() {
+    assert_eq!(
+        rustdoc_doctor_fields(false, Some("/usr/bin/rustdoc"), false),
+        (true, "not cached on Windows")
+    );
+    assert_eq!(rustdoc_doctor_fields(true, None, false), (true, "not set"));
+    assert_eq!(
+        rustdoc_doctor_fields(true, Some("/shim/rustdoc"), true),
+        (true, "shim")
+    );
+    assert_eq!(
+        rustdoc_doctor_fields(true, Some("/usr/bin/rustdoc"), false),
+        (false, "not a rustdoc shim")
+    );
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn rustdoc_shim_path_requires_an_absolute_rustdoc_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("rustdoc");
+    let missing = missing.to_string_lossy().into_owned();
+    assert!(rustdoc_shim_path_shape(&missing));
+    assert!(!rustdoc_shim_path_ok(&missing));
+    assert!(!rustdoc_shim_path_shape("rustdoc"));
+    assert!(!rustdoc_shim_path_shape(
+        &std::env::temp_dir().join("rustdoc-extra").to_string_lossy()
+    ));
+    assert!(!rustdoc_shim_path_shape(
+        &std::env::temp_dir().join("kache").to_string_lossy()
+    ));
+    let file = dir.path().join("rustdoc");
+    std::fs::write(&file, b"kache").unwrap();
+    assert!(
+        !rustdoc_shim_path_ok(&file.to_string_lossy()),
+        "an absolute file named rustdoc is the real toolchain until it is a shim"
+    );
+    std::fs::write(dir.path().join(".kache-shims"), b"kache shims\n").unwrap();
+    assert!(rustdoc_shim_path_ok(&file.to_string_lossy()));
+    let other = dir.path().join("kache");
+    std::fs::write(&other, b"kache").unwrap();
+    assert!(!rustdoc_shim_path_ok(&other.to_string_lossy()));
+    let as_dir = dir.path().join("nested/rustdoc");
+    std::fs::create_dir_all(&as_dir).unwrap();
+    assert!(!rustdoc_shim_path_ok(&as_dir.to_string_lossy()));
+}
+
+#[cfg(unix)]
+#[test]
+fn rustdoc_shim_path_accepts_a_symlink_to_kache() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("kache");
+    std::fs::write(&target, b"bin").unwrap();
+    let link = dir.path().join("rustdoc");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    assert!(rustdoc_shim_path_ok(&link.to_string_lossy()));
+    std::fs::remove_file(&link).unwrap();
+    let other = dir.path().join("not-kache");
+    std::fs::write(&other, b"bin").unwrap();
+    std::os::unix::fs::symlink(&other, &link).unwrap();
+    assert!(!rustdoc_shim_path_ok(&link.to_string_lossy()));
+}
+
+#[test]
 fn test_cargo_wrapper_edit_replace() {
     let existing = "[build]\nrustc-wrapper = \"sccache\"\n";
     let plan = CargoWrapperPlan::Replace("sccache".into());

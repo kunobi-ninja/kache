@@ -290,13 +290,14 @@ mod tests {
     }
 
     /// Prints this process's argv[0] when run as a child of
-    /// [`self_command_runs_as_kache_on_unix`].
+    /// [`self_command_runs_as_kache_on_unix`]. On stderr: with one test
+    /// thread, libtest puts its own progress text on the same stdout line.
     #[cfg(unix)]
     #[test]
     #[ignore = "child fixture for self_command_runs_as_kache_on_unix"]
     fn print_argv0_fixture() {
         if std::env::var_os("KACHE_TEST_PRINT_ARGV0").is_some() {
-            println!("argv0={}", std::env::args().next().unwrap_or_default());
+            eprintln!("argv0={}", std::env::args().next().unwrap_or_default());
         }
     }
 
@@ -317,10 +318,10 @@ mod tests {
             .output()
             .unwrap();
         assert!(output.status.success(), "{output:?}");
-        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
-            stdout.lines().any(|line| line == "argv0=kache"),
-            "argv[0] must be kache, not the path the program was started from: {stdout}"
+            stderr.lines().any(|line| line == "argv0=kache"),
+            "argv[0] must be kache, not the path the program was started from: {stderr}"
         );
     }
 

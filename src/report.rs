@@ -164,10 +164,24 @@ pub(crate) fn gc_runs_log_path(cache_dir: &Path) -> PathBuf {
     cache_dir.join("telemetry").join("gc-runs.jsonl")
 }
 
-/// Record one finished GC run: `gc_stats.json` always, and one line in
-/// `telemetry/gc-runs.jsonl` when session recording is on, rotated like the
-/// other logs. Callers hold `gc.lock`.
-pub fn record_gc_run(config: &Config, source: &str, stats: &crate::store::GcStats) -> Result<()> {
+/// Record one finished GC run: its freed bytes in the savings ledger,
+/// `gc_stats.json` always, and one line in `telemetry/gc-runs.jsonl` when
+/// session recording is on, rotated like the other logs. `origin` says
+/// whether the user asked for the run; `source` alone cannot, since a
+/// requested `kache gc` the daemon runs is recorded as `daemon`. Callers hold
+/// `gc.lock`.
+pub fn record_gc_run(
+    config: &Config,
+    source: &str,
+    origin: crate::store::SweepOrigin,
+    stats: &crate::store::GcStats,
+) -> Result<()> {
+    // A ledger that cannot be written costs the lifetime total, not the record.
+    if let Err(e) =
+        crate::savings::record_pruned(&config.cache_dir, origin, stats.bytes_freed, Utc::now())
+    {
+        tracing::debug!("gc: could not update the savings ledger: {e:#}");
+    }
     write_last_gc_run(&config.cache_dir, source, stats)?;
     if !config.record_sessions {
         return Ok(());

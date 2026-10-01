@@ -778,6 +778,7 @@ pub fn stats(
     );
     let host_config = host_config_in_effect(&crate::config::host_config_status());
     let machine = machine_snapshot(config);
+    let lifetime = crate::savings::lifetime(config);
 
     if json {
         #[derive(serde::Serialize)]
@@ -798,6 +799,10 @@ pub fn stats(
             /// The last GC run, from `gc_stats.json`.
             #[serde(skip_serializing_if = "Option::is_none")]
             gc: Option<crate::report::GcStatsPersisted>,
+            /// Totals since counting began: the savings ledger plus the
+            /// event log. Absent while nothing is recorded.
+            #[serde(skip_serializing_if = "Option::is_none")]
+            lifetime: Option<crate::savings::Totals>,
             entries: usize,
             hit_rate_pct: f64,
             local_hits: usize,
@@ -830,6 +835,7 @@ pub fn stats(
                 index_wal_bytes: machine.wal_bytes,
                 index_rowid_high_water: machine.rowid_high_water.iter().copied().collect(),
                 gc: machine.gc.clone(),
+                lifetime,
                 entries: snap.entry_count,
                 hit_rate_pct: hit_rate,
                 local_hits: snap.event_stats.local_hits,
@@ -848,7 +854,10 @@ pub fn stats(
         );
     }
 
-    let mut extras = StatsExtras::default();
+    let mut extras = StatsExtras {
+        lifetime: lifetime_rows(lifetime.as_ref(), chrono::Local::now().date_naive()),
+        ..Default::default()
+    };
     extras.cache.extend(cloned_targets_row(&disk));
     extras.cache.extend(machine_rows(&machine));
     if let Some(path) = &host_config {
@@ -987,6 +996,7 @@ pub(crate) type StatsRow = (&'static str, String, String);
 /// Rows `kache stats` adds to the snapshot's sections from its own reads.
 #[derive(Default)]
 pub(crate) struct StatsExtras {
+    pub(crate) lifetime: Vec<StatsRow>,
     pub(crate) cache: Vec<StatsRow>,
     pub(crate) service: Vec<StatsRow>,
 }
@@ -1014,8 +1024,77 @@ pub(crate) fn render_stats_with(
     let mut service = service_rows(snap, config);
     service.extend(extras.service.iter().cloned());
     let mut lines = vec![format!("kache · last {window}"), String::new()];
-    lines.extend(term::sections(&[build_rows(snap), cache, service]));
+    lines.extend(term::sections(&[
+        build_rows(snap),
+        extras.lifetime.clone(),
+        cache,
+        service,
+    ]));
     lines
+}
+
+/// The `kache stats` section on lifetime totals, after the window's rows.
+/// A total that is still zero gets no row, and the section is empty when
+/// every total is. Dates are local, like the `Last GC` row.
+fn lifetime_rows(
+    totals: Option<&crate::savings::Totals>,
+    today: chrono::NaiveDate,
+) -> Vec<StatsRow> {
+    let Some(totals) = totals else {
+        return Vec::new();
+    };
+    let mut rows = Vec::new();
+    if totals.hits > 0 {
+        rows.push((
+            "Time saved",
+            term::duration_ms(totals.hit_compile_time_ms),
+            format!(
+                "compile work avoided over {} {}",
+                term::count(totals.hits),
+                if totals.hits == 1 { "hit" } else { "hits" }
+            ),
+        ));
+    }
+    if totals.zero_copy_bytes + totals.copied_bytes > 0 {
+        rows.push((
+            "No-copy",
+            term::bytes(totals.zero_copy_bytes),
+            format!(
+                "restored without copying, {} copied",
+                term::bytes(totals.copied_bytes)
+            ),
+        ));
+    }
+    if totals.pruned_bytes() > 0 {
+        rows.push((
+            "Pruned",
+            term::bytes(totals.pruned_bytes()),
+            format!(
+                "{} automatically, {} on request",
+                term::bytes(totals.pruned_automatic_bytes),
+                term::bytes(totals.pruned_requested_bytes)
+            ),
+        ));
+    }
+    if rows.is_empty() {
+        return rows;
+    }
+    let since = totals.since.with_timezone(&chrono::Local).date_naive();
+    rows.insert(
+        0,
+        ("Since", since_label(since, today), "lifetime".to_string()),
+    );
+    rows
+}
+
+/// `Sep 12`, with the year when it is not this year's.
+fn since_label(since: chrono::NaiveDate, today: chrono::NaiveDate) -> String {
+    use chrono::Datelike;
+    if since.year() == today.year() {
+        since.format("%b %d").to_string()
+    } else {
+        since.format("%b %d %Y").to_string()
+    }
 }
 
 /// Hit rate, weighted hit rate, time saved and miss time.
@@ -3643,7 +3722,7 @@ pub fn run_gc_local(config: &Config, mode: GcMode) -> Result<crate::store::GcSta
     } else {
         "manual"
     };
-    if let Err(e) = crate::report::record_gc_run(config, source, &combined) {
+    if let Err(e) = crate::report::record_gc_run(config, source, mode.sweep_origin(), &combined) {
         tracing::debug!(
             "gc: could not record {}: {e:#}",
             crate::report::GC_STATS_FILE
@@ -3872,7 +3951,12 @@ fn emit_gc_json(config: &Config, skipped: bool, stats: &crate::store::GcStats) -
 /// Record a GC run `kache gc` made itself. A failed write costs the record,
 /// never the GC.
 fn record_manual_gc_run(config: &Config, stats: &crate::store::GcStats) {
-    if let Err(e) = crate::report::record_gc_run(config, "manual", stats) {
+    if let Err(e) = crate::report::record_gc_run(
+        config,
+        "manual",
+        crate::store::SweepOrigin::Requested,
+        stats,
+    ) {
         tracing::warn!("recording GC run: {e:#}");
     }
 }

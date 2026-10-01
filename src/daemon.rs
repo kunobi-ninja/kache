@@ -6688,7 +6688,12 @@ impl Daemon {
         // Under gc.lock like every driver, so the totals cannot race.
         let store = Store::open(config)?;
         let stats = self.automatic_size_pass(config, &store, size)?;
-        if let Err(e) = crate::report::record_gc_run(config, "daemon", &stats) {
+        if let Err(e) = crate::report::record_gc_run(
+            config,
+            "daemon",
+            crate::store::SweepOrigin::Automatic,
+            &stats,
+        ) {
             tracing::warn!("recording size-pressure GC run: {e:#}");
         }
         Ok(())
@@ -7014,7 +7019,9 @@ impl Daemon {
 
         // Persist GC stats for reports and machine telemetry. Still under
         // gc.lock, so the record cannot race another driver.
-        if let Err(e) = crate::report::record_gc_run(config, "daemon", &stats) {
+        if let Err(e) =
+            crate::report::record_gc_run(config, "daemon", driver.sweep_origin(), &stats)
+        {
             tracing::debug!(
                 "gc: could not record {}: {e:#}",
                 crate::report::GC_STATS_FILE

@@ -1251,7 +1251,13 @@ fn machine_snapshot_reads_a_store_without_creating_one() {
         )
         .unwrap();
     drop(store);
-    crate::report::record_gc_run(&config, "auto", &crate::store::GcStats::default()).unwrap();
+    crate::report::record_gc_run(
+        &config,
+        "auto",
+        crate::store::SweepOrigin::Automatic,
+        &crate::store::GcStats::default(),
+    )
+    .unwrap();
     let snap = machine_snapshot(&config);
     let db_len = std::fs::metadata(config.index_db_path()).unwrap().len();
     let mut wal_path = config.index_db_path().into_os_string();
@@ -1431,6 +1437,117 @@ fn stats_rows_show_the_index_and_a_gc_that_keeps_losing_the_lock() {
     assert!(rows[1].ends_with(", 4200 ms in index writes"), "{rows:?}");
     assert_eq!(rows.len(), 2, "{rows:?}");
     assert!(machine_rows(&crate::otel::MachineSnapshot::default()).is_empty());
+}
+
+fn lifetime_totals() -> crate::savings::Totals {
+    crate::savings::Totals {
+        since: chrono::DateTime::parse_from_rfc3339("2026-09-12T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc),
+        hits: 128_402,
+        hit_compile_time_ms: 147_600_000,
+        zero_copy_bytes: 3 << 30,
+        copied_bytes: 1 << 20,
+        pruned_automatic_bytes: 2 << 30,
+        pruned_requested_bytes: 1 << 30,
+    }
+}
+
+fn lifetime_text(totals: Option<&crate::savings::Totals>) -> Vec<String> {
+    let today = chrono::NaiveDate::from_ymd_opt(2026, 10, 1).unwrap();
+    lifetime_rows(totals, today)
+        .into_iter()
+        .map(row_text)
+        .collect()
+}
+
+#[test]
+fn lifetime_rows_show_each_recorded_total() {
+    assert!(
+        lifetime_text(None).is_empty(),
+        "nothing recorded: no section"
+    );
+    let totals = lifetime_totals();
+    let rows = lifetime_text(Some(&totals));
+    assert_eq!(rows.len(), 4, "{rows:?}");
+    assert!(rows[0].starts_with("Since | Sep "), "{rows:?}");
+    assert!(rows[0].ends_with(" | lifetime"), "{rows:?}");
+    assert_eq!(
+        rows[1..],
+        [
+            "Time saved | ~41.0 h | compile work avoided over 128,402 hits",
+            "No-copy | 3.0 GiB | restored without copying, 1.0 MiB copied",
+            "Pruned | 3.0 GiB | 2.0 GiB automatically, 1.0 GiB on request",
+        ]
+    );
+}
+
+/// A total that is still zero gets no row, and all zeros get no section;
+/// one of each part is enough for its row.
+#[test]
+fn lifetime_rows_leave_out_zero_totals() {
+    let mut totals = crate::savings::Totals {
+        hits: 0,
+        hit_compile_time_ms: 0,
+        zero_copy_bytes: 0,
+        copied_bytes: 0,
+        pruned_automatic_bytes: 0,
+        pruned_requested_bytes: 0,
+        ..lifetime_totals()
+    };
+    assert!(
+        lifetime_text(Some(&totals)).is_empty(),
+        "nothing saved yet: no section"
+    );
+
+    totals.hits = 1;
+    totals.copied_bytes = 5;
+    totals.pruned_requested_bytes = 7;
+    let rows = lifetime_text(Some(&totals));
+    assert_eq!(
+        rows[1..],
+        [
+            "Time saved | 0 ms | compile work avoided over 1 hit",
+            "No-copy | 0 B | restored without copying, 5 B copied",
+            "Pruned | 7 B | 0 B automatically, 7 B on request",
+        ]
+    );
+}
+
+#[test]
+fn since_label_adds_the_year_only_for_another_year() {
+    let date = |y, m, d| chrono::NaiveDate::from_ymd_opt(y, m, d).unwrap();
+    assert_eq!(since_label(date(2026, 9, 2), date(2026, 10, 1)), "Sep 02");
+    assert_eq!(
+        since_label(date(2025, 9, 2), date(2026, 10, 1)),
+        "Sep 02 2025"
+    );
+}
+
+/// The lifetime section sits between the window's build rows and the cache.
+#[test]
+fn render_stats_places_the_lifetime_section_after_the_window() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = crate::test_support::test_config(dir.path().to_path_buf());
+    let extras = StatsExtras {
+        lifetime: vec![("Since", "Sep 12".to_string(), "lifetime".to_string())],
+        ..Default::default()
+    };
+    let lines = render_stats_with(
+        &StatsSnapshot::default(),
+        &config,
+        SinceWindow::DEFAULT,
+        &extras,
+    );
+    let at = |label: &str| {
+        lines
+            .iter()
+            .position(|line| line.trim_start().starts_with(label))
+            .unwrap_or_else(|| panic!("{label}: {lines:#?}"))
+    };
+    assert!(at("Time saved") < at("Since"), "{lines:#?}");
+    assert!(at("Since") < at("Cache"), "{lines:#?}");
+    assert_eq!(lines[at("Since") - 1], "", "its own section: {lines:#?}");
 }
 
 /// Dropping a table leaves its pages on the freelist until a compaction.

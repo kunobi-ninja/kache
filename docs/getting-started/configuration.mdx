@@ -187,7 +187,7 @@ Every GC driver sweeps each `[cache.volumes]` shard as well as the main store: `
 
 Each shard has its own budget. An explicit `local_max_size` or `KACHE_MAX_SIZE` applies to each shard as it is. Without one, a shard's budget is 5% of the filesystem that holds it, floored at 5GiB and capped at 100GiB, the same rule as the main store.
 
-A shard keeps its own `gc.lock`, `auto-gc-backoff.json` and `gc_stats.json` in its store dir, so its trigger, backoff and held bytes do not mix with the main store's. `kache gc` prints one line per shard after the main store's.
+A shard keeps its own `gc.lock`, `auto-gc-backoff.json`, `gc_stats.json` and `savings.json` in its store dir, so its trigger, backoff and held bytes do not mix with the main store's. `kache gc` prints one line per shard after the main store's.
 
 GC skips a shard whose store dir has no `index.db`: a missing directory, an unmounted volume, or a shard no build has written to yet. It never creates a shard directory. A shard that fails to open or sweep is logged, and GC carries on with the others and the main store.
 
@@ -493,7 +493,7 @@ After rendering the report as usual, it appends one JSON line to `telemetry/sess
 
 To record every report on a host without passing the flag, set `KACHE_RECORD_SESSIONS=1` or `[cache] record_sessions = true`. Recording is off by default: without the setting or `--record`, `kache stats --full` writes nothing.
 
-Every GC driver (the daemon's sweep and its eviction after an upload, the auto-GC worker, and local `kache gc` modes) records its run in `gc_stats.json`. With `record_sessions` on, each run also appends a version 2 line to `telemetry/gc-runs.jsonl` with the driver, outcome, duration, lock failures, stale WAL snapshot failures, and recently accessed entries skipped before metadata reads. `gc_stats.json` keeps only the latest run; the history is what a backend adds up. Skip counts are attempts across policy passes, not unique entries.
+Every GC driver (the daemon's sweep and its eviction after an upload, the auto-GC worker, and local `kache gc` modes) records its run in `gc_stats.json`. With `record_sessions` on, each run also appends a version 2 line to `telemetry/gc-runs.jsonl` with the driver, outcome, duration, lock failures, stale WAL snapshot failures, and recently accessed entries skipped before metadata reads. `gc_stats.json` keeps only the latest run; the history is what a backend adds up. The bytes each run frees are also added to `savings.json`, the lifetime totals `kache stats` shows. Skip counts are attempts across policy passes, not unique entries.
 
 `kache telemetry write` reads index rows and files locally; it sends nothing over the network.
 

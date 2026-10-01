@@ -15,7 +15,9 @@ and its merge base, and mbx, sequentially on one runner. sccache runs weekly.
 | PR with the `bench` label **or** `[bench]` in its title | hk, eza, aube | 2 cold, 6 same-checkout warm, 6 cross-checkout warm | 2 cold + 6 warm batches |
 | Nightly, 03:37 Europe/Zurich | hk, eza, aube | Kache: 2 cold, 6 same-checkout warm, 6 cross-checkout warm. mbx: 1 of each | 1 cold + 3 warm batches |
 | Weekly, Sunday | hk, eza, aube | As the nightly, plus sccache: 1 of each | 1 cold + 3 warm batches |
-| Nightly | Firefox Linux/Windows, LLVM, SurrealDB, Lance, OpenDAL, cuda-oxide | One measurement per configured phase | — |
+| Nightly | Lance, OpenDAL | Kache and mbx, each: 1 cold, 3 same-checkout warm, 3 cross-checkout warm | — |
+| Nightly | LLVM | Kache: 1 cold, 3 same-checkout warm, 3 cross-checkout warm | — |
+| Nightly | Firefox Linux/Windows, SurrealDB, cuda-oxide, kobe | One measurement per configured phase | — |
 
 The opt-in also runs on same-repository draft PRs. Adding either trigger or
 pushing a new commit starts a measurement; a newer run cancels the older one.

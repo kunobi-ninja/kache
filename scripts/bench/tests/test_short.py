@@ -436,6 +436,45 @@ class BenchTests(unittest.TestCase):
             self.assertNotIn((1, "mbx"), arms)
             self.assertEqual(sorted(a for s_, a in arms if s_ == 2), ["base", "head"])
 
+    def test_a_subject_without_contention_repeats_its_builds_only(self):
+        """The contention stage drives Cargo commands written for hk, eza and
+        aube. A larger subject is repeated without it, both tools alternating
+        in one runner."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            args = argparse.Namespace(
+                output=root / "output",
+                project="lance",
+                engine=root / "engine",
+                scenarios=root / "scenarios",
+                kache="/kache",
+                base=None,
+                sccache=None,
+                mbx="/mbx",
+                samples=3,
+                order_seed=0,
+                cold_every=3,
+                skip_contention=False,
+            )
+            calls = []
+
+            def contention(*_args, **_kwargs):
+                self.fail("contention ran for a subject it has no commands for")
+
+            with (
+                patch.object(short, "run_measurement", fake_engine(calls)),
+                patch.object(short, "run_contention", contention),
+            ):
+                self.assertEqual(short.run(args), 0)
+            profiles = [call[call.index("--profile") + 1] for call in calls]
+            # Alternating order, so neither tool always runs on a warmer node.
+            self.assertEqual(
+                profiles,
+                ["bench-lance", "bench-lance-mbx", "bench-lance-mbx"]
+                + ["bench-lance", "bench-lance", "bench-lance-mbx"],
+            )
+            self.assertTrue((args.output / "metrics.otlp.json").exists())
+
     def test_cold_every_one_measures_every_cold_build(self):
         """A change aimed at cold needs more than one cold measurement.
 

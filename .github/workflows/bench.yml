@@ -110,12 +110,19 @@ jobs:
           # workspace (Arrow, DataFusion, object-store backends, prost codegen).
           # Needs protoc + openssl headers (already installed below). Lighter
           # than surrealdb: no rocksdb/grpcio/quickjs native compile.
-          lance='{"name":"lance","cmd":"bench lance","dir":"bench-lance","timeout":180,"job_timeout":225,"min_free_gb":60,"runner":"kunobi-runners-large"}'
+          #
+          # Lance, OpenDAL and LLVM run three samples through bench-short: one
+          # cold build and three of each warm build per tool, Kache and mbx
+          # alternating in one pod. A single warm sample of Lance has ranged
+          # from 5 to 420 s across nights; repeats reuse the cold build, so they
+          # cost minutes. No contention stage: it knows only hk, eza and aube.
+          # Both tools keep a checkout and cold snapshot, hence the disk floors.
+          lance='{"name":"lance","cmd":"bench-short lance 3 --mbx mbx","dir":"bench-lance","timeout":180,"job_timeout":225,"min_free_gb":100,"runner":"kunobi-runners-large"}'
           # OpenDAL core (apache/opendal `core/` workspace) with the portable
           # service-feature set — mid-size pure-Rust, lighter than surrealdb.
           # aws-lc-sys (rustls) compiles outside kache; cmake + a C compiler
           # are already in the apt step below.
-          opendal='{"name":"opendal","cmd":"bench opendal","dir":"bench-opendal","timeout":120,"job_timeout":165,"min_free_gb":40,"runner":"kunobi-runners"}'
+          opendal='{"name":"opendal","cmd":"bench-short opendal 3 --mbx mbx","dir":"bench-opendal","timeout":120,"job_timeout":165,"min_free_gb":60,"runner":"kunobi-runners"}'
           # kobe (kunobi-ninja/kobe): our own Kubernetes operator and CLI, a
           # four-package workspace over about 790 locked crates. Minutes, and
           # a C compiler is all it needs.
@@ -142,7 +149,7 @@ jobs:
           # scenario file).
           firefox_mbx='{"name":"firefox-mbx","cmd":"bench-mbx firefox","dir":"bench-firefox-mbx","timeout":360,"job_timeout":405,"min_free_gb":120,"runner":"kunobi-runners-large"}'
           # Almost-pure C/C++ CMake build (X86-only Release) — lighter than Firefox.
-          llvm='{"name":"llvm","cmd":"bench llvm","dir":"bench-llvm","timeout":240,"job_timeout":285,"min_free_gb":100,"runner":"kunobi-runners-large"}'
+          llvm='{"name":"llvm","cmd":"bench-short llvm 3","dir":"bench-llvm","timeout":240,"job_timeout":285,"min_free_gb":100,"runner":"kunobi-runners-large"}'
           # Daily-pull (TEMPORAL axis, #477): one clone, build ref A then rebuild
           # ref B in the SAME worktree — two full sequential Firefox builds, so a
           # longer timeout than `firefox`. Only ONE worktree (no cross-clone
@@ -193,12 +200,12 @@ jobs:
           # workspace units that depend on each other. At six samples of
           # every tool this arm needs about 146 minutes.
           aube='{"name":"aube","cmd":"bench-short aube 6 --context-samples 1 --contention-samples 3 --mbx mbx","dir":"bench-aube","timeout":120,"job_timeout":150,"min_free_gb":40,"runner":"kunobi-runners"}'
-          # Three more subjects through mbx's Cargo front, which caches both
-          # Rust and the C a build script compiles. Builds Cargo does not drive
-          # go through `mbx exec` instead and get C/C++ caching only: firefox
-          # has such an arm (firefox_mbx above), llvm does not. opendal and lance sit on the
-          # general pool — the reserved runner takes one job at a time and is
-          # already carrying the multi-hour arms.
+          # Subjects through mbx's Cargo front, which caches both Rust and the
+          # C a build script compiles. Builds Cargo does not drive go through
+          # `mbx exec` instead and get C/C++ caching only: firefox has such an
+          # arm (firefox_mbx above), llvm does not. The nightly measures
+          # opendal and lance through mbx inside their bench-short arms above;
+          # these single runs stay for a manual dispatch.
           opendal_mbx='{"name":"opendal-mbx","cmd":"bench-mbx opendal","dir":"bench-opendal-mbx","timeout":120,"job_timeout":165,"min_free_gb":40,"runner":"kunobi-runners"}'
           lance_mbx='{"name":"lance-mbx","cmd":"bench-mbx lance","dir":"bench-lance-mbx","timeout":180,"job_timeout":225,"min_free_gb":60,"runner":"kunobi-runners"}'
           surrealdb_mbx='{"name":"surrealdb-mbx","cmd":"bench-mbx surrealdb","dir":"bench-surrealdb-mbx","timeout":180,"job_timeout":225,"min_free_gb":80,"runner":"kunobi-runners-large"}'
@@ -237,7 +244,7 @@ jobs:
             # so the Linux matrix is EMPTY for them (an empty include
             # skips the `bench` job cleanly). Without this they'd fall to `*)`
             # and wastefully run the whole Linux `all` matrix alongside.
-            *)                    inc="[$surrealdb,$lance,$opendal,$kobe,$cuda_oxide,$cuda_oxide_patched,$llvm,$hk,$hk_nopred,$hk_pull,$hk_pull_perf,$hk_pull_nopred,$hk_pull_mbx,$eza,$aube,$opendal_mbx,$lance_mbx,$surrealdb_mbx]" ;;
+            *)                    inc="[$surrealdb,$lance,$opendal,$kobe,$cuda_oxide,$cuda_oxide_patched,$llvm,$hk,$hk_nopred,$hk_pull,$hk_pull_perf,$hk_pull_nopred,$hk_pull_mbx,$eza,$aube,$surrealdb_mbx]" ;;
           esac
           if [ "$EVENT_NAME" = "schedule" ]; then
             inc="$(jq -c --argjson extra "[$firefox,$firefox_pull]" '. + $extra' <<<"$inc")"
@@ -412,7 +419,7 @@ jobs:
       # on purpose — the arm tracks the tool as it ships — with the checksum
       # verified and the version recorded in the log.
       - name: Install mbx (comparison arms only)
-        if: endsWith(matrix.name, '-mbx') || matrix.name == 'hk' || matrix.name == 'eza' || matrix.name == 'aube'
+        if: endsWith(matrix.name, '-mbx') || contains(matrix.cmd, '--mbx')
         timeout-minutes: 10
         run: |
           bash scripts/install-bench-mbx.sh
@@ -553,7 +560,7 @@ jobs:
       # Only the arms that pass `--warm-same-tree` write this directory; the
       # step is skipped elsewhere so a missing phase never reads as a warning.
       - name: Upload cache telemetry (warm-same-tree)
-        if: always() && (contains(matrix.cmd, '--warm-same-tree') || matrix.name == 'hk' || matrix.name == 'eza' || matrix.name == 'aube') && !endsWith(matrix.name, '-mbx')
+        if: always() && (contains(matrix.cmd, '--warm-same-tree') || startsWith(matrix.cmd, 'bench-short')) && !endsWith(matrix.name, '-mbx')
         timeout-minutes: 10
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

@@ -3175,3 +3175,46 @@ fn daemon_start_reports_whether_the_start_succeeded() {
         &down.path().join("kache.toml")
     ));
 }
+
+/// The exported stages add up to the wrapper's time: the dep-info pre-pass is
+/// part of the report's key time, so `key` is exported without it. A phase
+/// with no stage timings exports no breakdown rather than zeros.
+#[test]
+fn the_wrapper_breakdown_partitions_key_time_and_skips_uninstrumented_phases() {
+    let times = PhaseTimes {
+        startup_ms: 700,
+        key_ms: 4_100,
+        dep_info_ms: 800,
+        dep_info_runs: 19,
+        restore_ms: 4_000,
+        ..Default::default()
+    };
+    let storage = StorageInfo {
+        reflinked_bytes: 10,
+        hardlinked_bytes: 20,
+        copied_bytes: 30,
+        ..Default::default()
+    };
+    let breakdown = wrapper_breakdown(&times, &storage).unwrap();
+    let stage = |name: &str| {
+        breakdown
+            .stages_ms
+            .iter()
+            .find(|(s, _)| *s == name)
+            .unwrap()
+            .1
+    };
+    assert_eq!(stage("key"), 3_300);
+    assert_eq!(stage("dep_info"), 800);
+    assert_eq!(
+        breakdown.stages_ms.iter().map(|(_, ms)| ms).sum::<u64>(),
+        700 + 4_100 + 4_000
+    );
+    assert_eq!(breakdown.dep_info_runs, 19);
+    assert_eq!(
+        breakdown.restored_bytes,
+        vec![("reflink", 10), ("hardlink", 20), ("copy", 30)]
+    );
+
+    assert_eq!(wrapper_breakdown(&PhaseTimes::default(), &storage), None);
+}

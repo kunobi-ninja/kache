@@ -9034,7 +9034,13 @@ fn handle_seed_target(config: &Config, req: &SeedTargetRequest) -> Response {
             .collect(),
         Err(error) => return Response::err(format!("reading tracked targets: {error:#}")),
     };
-    let seeded = crate::target_seed::seed(&target, &req.rustc_version, &donors, deadline);
+    let seeded = crate::target_seed::seed(
+        &target,
+        &req.rustc_version,
+        &donors,
+        &config.cache_dir,
+        deadline,
+    );
     if let Some(donor) = &seeded.donor {
         tracing::info!(
             "seeded {} registry units into {} from {}",

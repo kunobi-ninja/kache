@@ -1624,6 +1624,25 @@ pub(crate) fn in_sealed_out_dir(path: &Path) -> bool {
     hermetic::in_sealed_out_dir(path)
 }
 
+/// Link `link`, to be renamed to the Cargo `OUT_DIR` at `cargo_out_dir`, to
+/// the sealed hermetic run `shared` in `cache_dir`, and record it for the
+/// sweep. See [`hermetic::link_sealed_out_dir`].
+#[cfg(unix)]
+pub(crate) fn link_sealed_out_dir(
+    cache_dir: &Path,
+    shared: &Path,
+    cargo_out_dir: &Path,
+    link: &Path,
+) -> Result<Option<HeldRun>> {
+    hermetic::link_sealed_out_dir(cache_dir, shared, cargo_out_dir, link)
+}
+
+#[cfg(unix)]
+pub(crate) use hermetic::HeldRun;
+
+#[cfg(all(test, unix))]
+pub(crate) use hermetic::test_support as hermetic_test_support;
+
 /// Turn an `OUT_DIR` that a hermetic run left as a symlink to its shared,
 /// read-only directory back into an empty directory of this target's own, so
 /// nothing writes through the link.

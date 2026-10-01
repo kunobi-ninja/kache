@@ -136,6 +136,15 @@ class BenchTests(unittest.TestCase):
                 r[phase]["hits"] = r[phase]["cache_hits"] = 0
                 with self.assertRaises(ValueError):
                     stats.validate(r, backend)
+        # A build-script probe that fails to compile on purpose is counted in
+        # Kache's `errors` and is not a cache fault (Lance's cold build has one).
+        r = result()
+        r["cold"]["errors"] = 1
+        stats.validate(r, "kache")
+        r = result("sccache")
+        r["warm"]["cache_errors"] = 1
+        with self.assertRaises(ValueError):
+            stats.validate(r, "sccache")
         r = result()
         r["warm_same_tree_verdict"]["ok"] = False
         with self.assertRaises(ValueError):
@@ -461,12 +470,20 @@ class BenchTests(unittest.TestCase):
             def contention(*_args, **_kwargs):
                 self.fail("contention ran for a subject it has no commands for")
 
+            timeouts = set()
+            engine_run = fake_engine(calls)
+
+            def measure(command, timeout=None, **kwargs):
+                timeouts.add(timeout)
+                engine_run(command, **kwargs)
+
             with (
-                patch.object(short, "run_measurement", fake_engine(calls)),
+                patch.object(short, "run_measurement", measure),
                 patch.object(short, "run_contention", contention),
             ):
                 self.assertEqual(short.run(args), 0)
             profiles = [call[call.index("--profile") + 1] for call in calls]
+            self.assertEqual(timeouts, {short.PASS_TIMEOUT["lance"]})
             # Alternating order, so neither tool always runs on a warmer node.
             self.assertEqual(
                 profiles,

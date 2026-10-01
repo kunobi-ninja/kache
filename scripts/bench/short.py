@@ -20,6 +20,9 @@ from bench.stats import contention_comparison, summarize, validate
 # Cargo commands of its own and knows only the first three.
 PROJECTS = ("hk", "eza", "aube", "opendal", "lance", "llvm")
 CONTENTION_PROJECTS = ("hk", "eza", "aube")
+# Longer limits for one engine pass where a cold build alone can exceed the
+# default. LLVM's takes about 26 minutes on the shared runners.
+PASS_TIMEOUT = {"lance": 2400, "llvm": 3600}
 
 # Lives beside the package, in the instrument directory the gate stages.
 CONTENTION_SCRIPT = Path(__file__).resolve().parent.parent / "bench-contention.py"
@@ -417,7 +420,8 @@ def run(args):
                         flush=True,
                     )
                     env = dict(os.environ, RUSTC_WRAPPER="", RUSTUP_TOOLCHAIN="")
-                    timeout = MEASUREMENT_TIMEOUT
+                    limit = PASS_TIMEOUT.get(args.project, MEASUREMENT_TIMEOUT)
+                    timeout = limit
                     if remaining is not None and remaining < timeout:
                         timeout = remaining
                     began = time.monotonic()
@@ -431,7 +435,7 @@ def run(args):
                                 stderr=subprocess.STDOUT,
                             )
                     except subprocess.TimeoutExpired:
-                        if timeout < MEASUREMENT_TIMEOUT:
+                        if timeout < limit:
                             raise DeadlineReached(
                                 f"sample {sample + 1} of {args.samples} ({arm}) was still "
                                 "running when the time budget ran out"

@@ -193,7 +193,28 @@ fn handoff_path_is_owned(config: &Config, path: &Path) -> bool {
 /// Why a hand-off was refused, in the response's error text. The wrapper only
 /// needs to know it was refused; the text is for `kache daemon` logs.
 fn refused(reason: &str) -> Response {
-    Response::err(format!("publish refused: {reason}"))
+    Response::err(format!("{REFUSED}{reason}"))
+}
+
+const REFUSED: &str = "publish refused: ";
+
+/// The wrapper's budget ran out before the daemon copied its files, so it
+/// cancelled, removed them and stores the compile itself. Under load this is
+/// routine and only logged at debug level (#1362).
+const WITHDRAWN: &str = "the wrapper withdrew the hand-off first";
+
+/// Whether a failed request's `error` is a refusal the wrapper recovers from
+/// on its own, so the daemon need not warn about it.
+pub(crate) fn refusal_is_routine(error: &str) -> bool {
+    error.strip_prefix(REFUSED) == Some(WITHDRAWN)
+}
+
+/// The wrapper removes its receipt before the files it sent, so a snapshot
+/// that found a file missing while the receipt is also gone lost that race.
+fn handoff_withdrawn(request: &PublishCcRequest, error: &anyhow::Error) -> bool {
+    receipt_cancelled(error)
+        && receipt_paths(request)
+            .is_ok_and(|(pending, _)| std::fs::symlink_metadata(pending).is_err())
 }
 
 impl Daemon {
@@ -247,7 +268,11 @@ impl Daemon {
                 .iter()
                 .map(|file| (PathBuf::from(&file.path), file.store_name.clone()))
                 .collect::<Vec<_>>();
-            let owned = snapshot_for_handoff(&config, &files)?;
+            let owned = match snapshot_for_handoff(&config, &files) {
+                Ok(owned) => owned,
+                Err(error) if handoff_withdrawn(&request, &error) => return Ok(None),
+                Err(error) => return Err(error),
+            };
             // Rename and client cancellation race on the same pending file.
             // Exactly one wins, even if the socket reply is lost. A missing
             // receipt means the wrapper already gave up. It publishes only if
@@ -261,14 +286,15 @@ impl Daemon {
             remove_handoff_files(&request.files);
             let mut request = request;
             request.files = owned;
-            Ok::<_, anyhow::Error>(PublishJob {
+            Ok::<_, anyhow::Error>(Some(PublishJob {
                 request,
                 _lock: lock,
-            })
+            }))
         })
         .await;
         let job = match claimed {
-            Ok(Ok(job)) => job,
+            Ok(Ok(Some(job))) => job,
+            Ok(Ok(None)) => return refused(WITHDRAWN),
             Ok(Err(error)) => return refused(&format!("snapshot failed: {error:#}")),
             Err(error) => return refused(&format!("snapshot task failed: {error}")),
         };
@@ -1405,6 +1431,40 @@ mod tests {
         ));
         drop(receipt);
         remove_handoff_files(&request.files);
+    }
+
+    /// A wrapper that withdrew removed its receipt, then its files. Only
+    /// that pair is routine; files missing under a live receipt still warn.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn files_gone_after_the_receipt_is_a_routine_withdrawal() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::test_support::test_config(dir.path().join("cache"));
+        let daemon = Arc::new(Daemon::new(config.clone()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+        daemon.publish_queue().set_sender(tx);
+        for withdrawn in [true, false] {
+            let request = handoff_request(&config, &key(&format!("gone-{withdrawn}")), dir.path());
+            let receipt = HandoffReceipt::new(&request).unwrap();
+            if withdrawn {
+                std::fs::remove_file(&receipt.pending).unwrap();
+            }
+            remove_handoff_files(&request.files);
+            let error = daemon
+                .handle_publish_cc(request.clone())
+                .await
+                .error
+                .unwrap();
+            assert_eq!(refusal_is_routine(&error), withdrawn, "{error}");
+            assert_eq!(error.contains("snapshot failed"), !withdrawn, "{error}");
+            let store = Store::open(&config).unwrap();
+            assert!(matches!(
+                store.claim_build(&request.cache_key).unwrap(),
+                BuildClaim::Acquired(_)
+            ));
+        }
+        assert!(rx.try_recv().is_err());
+        assert!(!refusal_is_routine(WITHDRAWN));
+        assert!(!refusal_is_routine("publish refused: queue full"));
     }
 
     #[test]

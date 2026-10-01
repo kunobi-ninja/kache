@@ -1772,6 +1772,39 @@ fn is_client_disconnect_matches_disconnect_kinds() {
 }
 
 #[test]
+fn request_failure_marks_only_withdrawn_handoffs_routine() {
+    assert_eq!(request_failure(&Response::ok()), None);
+    assert_eq!(
+        request_failure(&Response::err("publish refused: queue full")),
+        Some(("publish refused: queue full", false))
+    );
+    let withdrawn = "publish refused: the wrapper withdrew the hand-off first";
+    assert_eq!(
+        request_failure(&Response::err(withdrawn)),
+        Some((withdrawn, true))
+    );
+}
+
+/// Descriptor exhaustion pauses the accept loop; any other accept error
+/// retries at once, as before.
+#[cfg(unix)]
+#[test]
+fn accept_backoff_pauses_only_on_descriptor_exhaustion() {
+    use std::io::{Error, ErrorKind};
+    for errno in [libc::EMFILE, libc::ENFILE] {
+        assert_eq!(
+            accept_backoff(&Error::from_raw_os_error(errno)),
+            Some(ACCEPT_EXHAUSTED_BACKOFF)
+        );
+    }
+    assert_eq!(
+        accept_backoff(&Error::from_raw_os_error(libc::ECONNABORTED)),
+        None
+    );
+    assert_eq!(accept_backoff(&Error::from(ErrorKind::Other)), None);
+}
+
+#[test]
 fn key_prefix_is_multibyte_safe() {
     // 64-char ASCII hex: first 16 chars.
     let hex = "0123456789abcdef".repeat(4);

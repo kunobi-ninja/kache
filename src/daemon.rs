@@ -7078,6 +7078,14 @@ pub fn run_server(
         tracing::info!("another daemon holds the run lock, exiting");
         return Ok(());
     };
+    #[cfg(unix)]
+    match crate::platform::raise_open_file_limit() {
+        Ok(Some((before, after))) => {
+            tracing::info!("raised the open-file limit from {before} to {after}");
+        }
+        Ok(None) => {}
+        Err(error) => tracing::warn!("could not raise the open-file limit: {error}"),
+    }
     let coord = DaemonCoordFile::for_socket(&socket_path);
     coord
         .write_phase(DaemonPhase::Starting)
@@ -7562,6 +7570,23 @@ async fn drain_upload_pipeline(
 /// daemon is completely quiet.
 const ACCEPT_LOOP_IDLE_TICK: Duration = Duration::from_secs(60);
 
+/// How long the accept loop pauses after the process runs out of file
+/// descriptors. Retrying at once spins on the same error until a handler
+/// closes one; the queued clients wait in the listen backlog either way.
+#[cfg(unix)]
+const ACCEPT_EXHAUSTED_BACKOFF: Duration = Duration::from_millis(50);
+
+/// The pause before accepting again after `error`, if any.
+fn accept_backoff(error: &std::io::Error) -> Option<Duration> {
+    #[cfg(unix)]
+    if matches!(error.raw_os_error(), Some(libc::EMFILE | libc::ENFILE)) {
+        return Some(ACCEPT_EXHAUSTED_BACKOFF);
+    }
+    #[cfg(not(unix))]
+    let _ = error;
+    None
+}
+
 /// Maximum time to let accepted IPC handlers finish their current response
 /// during shutdown. A bounded drain preserves in-flight replies (including the
 /// shutdown acknowledgement) without letting a silent client hold the daemon
@@ -7862,6 +7887,9 @@ async fn accept_loop(
                     }
                     Err(e) => {
                         tracing::warn!("accept error: {e}");
+                        if let Some(pause) = accept_backoff(&e) {
+                            tokio::time::sleep(pause).await;
+                        }
                     }
                 }
             }
@@ -8558,12 +8586,13 @@ async fn handle_connection_started_at(
             // Wake the accept loop so the restart starts now (issue #288).
         }
 
-        if !resp.ok {
-            tracing::warn!(
-                elapsed_ms = elapsed.as_millis() as u64,
-                error = resp.error.as_deref().unwrap_or("unknown"),
-                "request failed"
-            );
+        if let Some((error, routine)) = request_failure(&resp) {
+            let elapsed_ms = elapsed.as_millis() as u64;
+            if routine {
+                tracing::debug!(elapsed_ms, error, "request failed");
+            } else {
+                tracing::warn!(elapsed_ms, error, "request failed");
+            }
         }
 
         let mut resp_line = serde_json::to_string(&resp)?;
@@ -8580,6 +8609,15 @@ async fn handle_connection_started_at(
 
 /// Returns true for I/O errors that mean the client disconnected, so the
 /// daemon can downgrade the log level instead of warning on every occurrence.
+/// A failed response's error, and whether the client recovers from it on its
+/// own (logged at debug instead of warn).
+fn request_failure(resp: &Response) -> Option<(&str, bool)> {
+    (!resp.ok).then(|| {
+        let error = resp.error.as_deref().unwrap_or("unknown");
+        (error, crate::daemon_publish::refusal_is_routine(error))
+    })
+}
+
 fn is_client_disconnect(e: &std::io::Error) -> bool {
     matches!(
         e.kind(),

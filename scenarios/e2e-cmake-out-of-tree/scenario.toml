@@ -36,7 +36,12 @@ CMAKE_C_COMPILER_LAUNCHER = "$KACHE"
 # Out-of-tree build into a sibling of the source dir. No `-g`: debug info embeds
 # absolute build/source paths in DWARF, a separate concern from the
 # -I/path-normalization this scenario isolates.
-build = "cmake -S . -B ../cmake-build -DCMAKE_C_FLAGS=-O0 >/dev/null && cmake --build ../cmake-build"
+#
+# The relocated copy of the source tree has a different directory name, and
+# the key folds the source path as the object would spell it. Without a base
+# dir that spelling includes the checkout's own name, so name the source root
+# the way a renamed checkout has to.
+build = "export KACHE_BASE_DIR=\"$PWD\" && cmake -S . -B ../cmake-build -DCMAKE_C_FLAGS=-O0 >/dev/null && cmake --build ../cmake-build"
 clean = "rm -rf ../cmake-build"
 
 [verify]

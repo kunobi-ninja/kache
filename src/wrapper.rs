@@ -732,6 +732,19 @@ fn cc_restore_committed(precompiled: bool, entry_ok: bool) -> bool {
     !precompiled && entry_ok
 }
 
+/// Whether a clean compile's memo may be recorded: not when an input moved
+/// under it, and not when a header appeared in an earlier include dir since
+/// the key was taken (it can replace one the read set names). A peer's entry
+/// under the same key does not matter; the memo is what lets the next
+/// invocation find that entry (kunobi-ninja/kache#1390).
+fn cc_memo_publishable(
+    clean: bool,
+    inputs_changed: bool,
+    include_dirs_hold: impl FnOnce() -> bool,
+) -> bool {
+    clean && !inputs_changed && include_dirs_hold()
+}
+
 /// Whether a clean compile may be stored: not when an input moved under it,
 /// and not when a peer already published the key.
 fn cc_store_candidate(clean: bool, inputs_changed: bool, peer_committed: bool) -> bool {
@@ -2163,23 +2176,24 @@ fn run_cc_with_store(
     let store_start = std::time::Instant::now();
     let mut store_put = StorePutResult::default();
     let mut store_error = String::new();
-    let store_candidate = cc_store_candidate(
-        should_store_cc_result(result.exit_code, !result.artifacts.is_empty()),
-        inputs_changed,
-        peer_committed,
-    );
+    let clean = should_store_cc_result(result.exit_code, !result.artifacts.is_empty());
+    let store_candidate = cc_store_candidate(clean, inputs_changed, peer_committed);
+    let memo_publishable = cc_memo_publishable(clean, inputs_changed, || {
+        !cc_store_revalidates_include_dirs(parsed.mode)
+            || compiler.include_dir_names_still_match(parsed)
+    });
     // Without a live daemon, keep the ordinary staging and memo path.
     // The lifetime lock works for both Unix sockets and Windows pipes.
     let daemon_publish = config.daemon_publish
         && crate::daemon::existing_daemon_run_lock_is_held(&config.socket_path()).unwrap_or(false);
     // A deferred compile's memo goes to the daemon with the entry; the
     // wrapper records it only if the hand-off does not happen (below). Only
-    // a deferred compile captures one, and a compile that is no store
-    // candidate neither hands it off nor records it.
+    // a deferred compile captures one. A compile that is no store candidate
+    // never hands it off; it records it below if the memo is still valid.
     let handoff_memo = daemon_publish
         .then(|| compiler.captured_preprocess_memo())
         .flatten();
-    if store_candidate && handoff_memo.is_none() {
+    if store_candidate && memo_publishable && handoff_memo.is_none() {
         compiler.commit_preprocess_memo(&file_hasher);
     }
     let publishes_to_remote = cc_publishes_to_remote(parsed);
@@ -2193,10 +2207,9 @@ fn run_cc_with_store(
             "admission: compile too cheap to store"
         );
     }
-    if store_decision.should_store
-        && cc_store_revalidates_include_dirs(parsed.mode)
-        && !compiler.include_dir_names_still_match(parsed)
-    {
+    // A store candidate's memo is withheld only when the include dirs moved;
+    // the entry would describe the same stale read set.
+    if store_decision.should_store && !memo_publishable {
         tracing::debug!(
             crate_name = %crate_name,
             "cc include-dir names changed during compile; skipping store"
@@ -2299,9 +2312,10 @@ fn run_cc_with_store(
             }
         }
     }
-    // A skipped admission or failed snapshot never transfers the memo.
-    // Keep it for the next invocation even when no artifact was stored.
-    if store_candidate {
+    // A skipped admission, a failed snapshot or a peer's entry never
+    // transfers the memo. Keep it for the next invocation even when no
+    // artifact was stored.
+    if memo_publishable {
         compiler.commit_preprocess_memo(&file_hasher);
     }
     let store_ms = store_start.elapsed().as_millis() as u64;

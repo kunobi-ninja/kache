@@ -36,8 +36,10 @@ CMAKE_CXX_COMPILER_LAUNCHER = "$KACHE"
 # Out-of-tree Ninja build into a sibling dir. The flag set is every realistic
 # Release codegen knob, all modeled (math/sections/visibility/frame-pointer/
 # interposition both polarities via the stem list). No -g: DWARF path baking is a
-# separate concern (covered by other fixtures).
-build = "cmake -S . -B ../ninja-build -G Ninja -DCMAKE_CXX_FLAGS='-O2 -DNDEBUG -fPIC -std=c++17 -fvisibility=hidden -fvisibility-inlines-hidden -fno-exceptions -fno-rtti -fno-semantic-interposition -fomit-frame-pointer -ffunction-sections -fdata-sections -fno-strict-aliasing -funwind-tables -ffast-math -fno-math-errno' >/dev/null && cmake --build ../ninja-build"
+# separate concern (covered by other fixtures). KACHE_BASE_DIR names the source
+# root the way bench-llvm does: the relocated copy has a different directory
+# name, which the key would otherwise see in the source path.
+build = "export KACHE_BASE_DIR=\"$PWD\" && cmake -S . -B ../ninja-build -G Ninja -DCMAKE_CXX_FLAGS='-O2 -DNDEBUG -fPIC -std=c++17 -fvisibility=hidden -fvisibility-inlines-hidden -fno-exceptions -fno-rtti -fno-semantic-interposition -fomit-frame-pointer -ffunction-sections -fdata-sections -fno-strict-aliasing -funwind-tables -ffast-math -fno-math-errno' >/dev/null && cmake --build ../ninja-build"
 clean = "rm -rf ../ninja-build"
 
 [verify]

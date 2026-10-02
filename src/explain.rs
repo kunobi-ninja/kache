@@ -76,11 +76,13 @@ pub(crate) fn fix(cause: &Cause, max_size: u64) -> String {
 /// What would let a second checkout reuse what another one built, from the
 /// key input groups that differ between them.
 ///
-/// Rust output already leaves the checkout out: kache remaps its paths. So for
-/// two checkouts of one commit, a differing group is a path kache does not map
-/// (a source, environment value, flag or link path outside the roots it knows)
-/// or a file a build script generated with the checkout's path or a timestamp
-/// in it, typically a C or C++ library.
+/// A group says only that something in it differs. The exact input, which
+/// `kache explain <crate>` names, decides the fix: a path into the checkout
+/// that kache did not map wants `KACHE_BASE_DIR`; a C or C++ library a build
+/// script generated with the checkout's path or a timestamp in it wants prefix
+/// maps and reproducible timestamps; a flag, variable or file that really
+/// differs wants nothing from kache. So the advice leads with that command and
+/// names each fix with the evidence it fits.
 fn checkout_fix(groups: &[String]) -> String {
     let has = |name: &str| groups.iter().any(|group| group == name);
     let mut advice: Vec<String> = Vec::new();
@@ -89,31 +91,38 @@ fn checkout_fix(groups: &[String]) -> String {
         .any(|g| has(g))
     {
         advice.push(
-            "set `KACHE_BASE_DIR` to the checkout root so paths outside the ones kache maps stop naming the checkout"
+            "a path into this checkout that kache did not map: set `KACHE_BASE_DIR` to the checkout root"
                 .to_string(),
         );
     }
     if has("sources") || has("link") {
         advice.push(
-            "if a build script compiles C or C++, add `-ffile-prefix-map=$PWD=.` to `CFLAGS` and `CXXFLAGS` and set `ZERO_AR_DATE=1` and `SOURCE_DATE_EPOCH`, so what it generates stops recording the checkout"
+            "a C or C++ library a build script generated: add `-ffile-prefix-map=$PWD=.` to `CFLAGS` and `CXXFLAGS` and set `ZERO_AR_DATE=1` and `SOURCE_DATE_EPOCH`"
                 .to_string(),
         );
     }
     if has("remap") {
         advice.push(
-            "path remapping differs between the checkouts (`KACHE_RUSTC_PATH_NORMALIZE`)"
+            "path remapping is on in one checkout and off in the other (`KACHE_RUSTC_PATH_NORMALIZE`)"
                 .to_string(),
         );
     }
-    for group in groups {
-        if !["sources", "env_deps", "args", "link", "remap"].contains(&group.as_str()) {
-            advice.push(input_words(group).to_string());
-        }
+    let mut message =
+        "`kache explain <crate>` names the input that differs from the other checkout".to_string();
+    if !advice.is_empty() {
+        message.push_str("; if it is ");
+        message.push_str(&advice.join("; if it is "));
     }
-    format!(
-        "if both checkouts are at the same commit: {}; `kache explain <crate>` names the input",
-        advice.join("; ")
-    )
+    let other: Vec<&str> = groups
+        .iter()
+        .filter(|group| !["sources", "env_deps", "args", "link", "remap"].contains(&group.as_str()))
+        .map(|group| input_words(group))
+        .collect();
+    if !other.is_empty() {
+        message.push_str("; also ");
+        message.push_str(&other.join(", "));
+    }
+    message
 }
 
 /// A cache-key input group in words.
@@ -482,18 +491,22 @@ mod tests {
                 max,
             )
         };
-        // A path kache does not map: the base dir, and nothing about C.
+        // Wording: which advice each differing group earns. Whether a base
+        // directory or a prefix map actually equalizes the keys is the cache
+        // key's own tests; this says only that the advice points at them for
+        // the groups they can affect, and nowhere else.
         let env = checkout(&["env_deps"]);
         assert!(
-            env.starts_with("if both checkouts are at the same commit: "),
+            env.starts_with("`kache explain <crate>` names the input"),
             "{env}"
         );
+        assert!(env.contains("if it is a path into this checkout"), "{env}");
         assert!(env.contains("KACHE_BASE_DIR"), "{env}");
         assert!(!env.contains("-ffile-prefix-map"), "{env}");
-        // A differing source or link input can also be a generated C library.
         for group in ["sources", "link"] {
             let text = checkout(&[group]);
             assert!(text.contains("KACHE_BASE_DIR"), "{text}");
+            assert!(text.contains("if it is a C or C++ library"), "{text}");
             assert!(text.contains("-ffile-prefix-map=$PWD=."), "{text}");
             assert!(text.contains("ZERO_AR_DATE=1"), "{text}");
         }
@@ -501,9 +514,12 @@ mod tests {
         let remap = checkout(&["remap"]);
         assert!(remap.contains("KACHE_RUSTC_PATH_NORMALIZE"), "{remap}");
         assert!(!remap.contains("KACHE_BASE_DIR"), "{remap}");
-        // A group no path explains is named, not dressed up as one.
+        // A group no path explains is named, with no path advice.
         let edition = checkout(&["crate"]);
-        assert!(edition.contains("edition"), "{edition}");
+        assert!(
+            edition.contains("also its name, edition or crate type changed"),
+            "{edition}"
+        );
         assert!(!edition.contains("KACHE_BASE_DIR"), "{edition}");
         assert!(fix(&Cause::Unexplained, max).contains("explain_miss"));
         for (group, words) in [

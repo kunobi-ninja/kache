@@ -8836,6 +8836,38 @@ fn a_deferred_cc_compile_is_stored_unless_a_peer_beat_it_or_an_input_moved() {
         !cc_store_candidate(true, false, true),
         "the peer's entry stands"
     );
+    let hold = || true;
+    assert!(
+        cc_memo_publishable(true, false, hold),
+        "a peer's entry does not stop the memo (#1390)"
+    );
+    assert!(!cc_memo_publishable(false, false, hold), "a failed compile");
+    assert!(
+        !cc_memo_publishable(true, true, hold),
+        "an input written during the build"
+    );
+    assert!(
+        !cc_memo_publishable(true, false, || false),
+        "a header that now shadows one the read set names"
+    );
+    assert!(
+        !cc_memo_publishable(false, false, || panic!(
+            "checked a failed compile's include dirs"
+        )),
+        "the include-dir check runs only for a memo that could be recorded"
+    );
+    use crate::compiler::cc::CompileMode;
+    assert!(cc_include_dirs_hold(CompileMode::Compile, || true));
+    assert!(
+        !cc_include_dirs_hold(CompileMode::Compile, || false),
+        "a compile re-checks its include dirs"
+    );
+    assert!(
+        cc_include_dirs_hold(CompileMode::Preprocess, || panic!(
+            "re-checked a preprocess"
+        )),
+        "only a compile re-checks"
+    );
     assert!(cc_restore_committed(false, true));
     assert!(
         !cc_restore_committed(false, false),

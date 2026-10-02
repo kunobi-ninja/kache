@@ -275,3 +275,123 @@ exit "$status"
         assert_eq!(count, 0, "a changed input must not populate {table}");
     }
 }
+
+fn last_cc_event(root: &std::path::Path) -> serde_json::Value {
+    let events = fs::read_to_string(root.join("cache/events.jsonl")).unwrap();
+    serde_json::from_str(events.lines().last().unwrap()).unwrap()
+}
+
+fn cc_memo_count(root: &std::path::Path) -> i64 {
+    rusqlite::Connection::open(root.join("cache/index.db"))
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM cc_preprocess_memos", [], |row| {
+            row.get(0)
+        })
+        .unwrap()
+}
+
+/// A compile-first miss that finds its entry already committed leaves that
+/// entry alone but still records its memo, so the next run hits
+/// (kunobi-ninja/kache#1390).
+#[test]
+fn deferred_cc_records_its_memo_when_the_entry_already_exists() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    fs::write(root.join("kache.toml"), "").unwrap();
+    fs::write(
+        root.join("unit.c"),
+        "int square(int value) { return value * value; }\n",
+    )
+    .unwrap();
+    let compile = |deferred: &str| {
+        let output = cacheable_cc_command(&root)
+            .args(["cc", "-c", "unit.c", "-o", "unit.o"])
+            .env("KACHE_DEFERRED_DISCOVERY", deferred)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        last_cc_event(&root)
+    };
+
+    let seeded = compile("0");
+    assert_eq!(seeded["result"], "miss", "{seeded}");
+    // A memo pruned or retired while its entry stays.
+    rusqlite::Connection::open(root.join("cache/index.db"))
+        .unwrap()
+        .execute_batch("DELETE FROM cc_memo_input_refs; DELETE FROM cc_preprocess_memos;")
+        .unwrap();
+
+    let deferred = compile("1");
+    assert_eq!(deferred["result"], "miss", "{deferred}");
+    assert_eq!(deferred["compiler_runs"], 1, "{deferred}");
+    assert_eq!(deferred["cache_key"], seeded["cache_key"]);
+    assert_eq!(
+        cc_memo_count(&root),
+        1,
+        "the deferred compile records its memo"
+    );
+
+    let next = compile("1");
+    assert_eq!(next["result"], "local_hit", "{next}");
+    assert_eq!(next["compiler_runs"], 0, "{next}");
+}
+
+/// Two byte-identical sources are still two translation units: each object
+/// spells its own path, so they must not share an entry.
+#[test]
+fn identical_sources_at_different_paths_get_their_own_entries() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    fs::write(root.join("kache.toml"), "").unwrap();
+    let unit = "const char *unit_file(void) { return __FILE__; }\n";
+    for copy in ["a", "b"] {
+        fs::create_dir(root.join(copy)).unwrap();
+        fs::write(root.join(copy).join("unit.c"), unit).unwrap();
+    }
+    fs::write(
+        root.join("main.c"),
+        "#include <stdio.h>\nconst char *unit_file(void);\nint main(void) { puts(unit_file()); return 0; }\n",
+    )
+    .unwrap();
+
+    for deferred in ["0", "1"] {
+        let _ = fs::remove_dir_all(root.join("cache"));
+        let mut keys = Vec::new();
+        for copy in ["a", "b", "b"] {
+            let output = cacheable_cc_command(&root)
+                .args(["cc", "-c", &format!("{copy}/unit.c"), "-o", "unit.o"])
+                .env("KACHE_DEFERRED_DISCOVERY", deferred)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            keys.push(last_cc_event(&root)["cache_key"].clone());
+        }
+        assert_ne!(
+            keys[0], keys[1],
+            "deferred={deferred}: the copies share a key"
+        );
+        assert_eq!(keys[1], keys[2], "deferred={deferred}: b's key is stable");
+        assert!(
+            Command::new("cc")
+                .args(["main.c", "unit.o", "-o", "which-file"])
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let printed = Command::new(root.join("which-file")).output().unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&printed.stdout).trim(),
+            "b/unit.c",
+            "deferred={deferred}"
+        );
+    }
+}

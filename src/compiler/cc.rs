@@ -3699,18 +3699,18 @@ pub static CC_FLAGS: &[FlagSpec] = &[
     },
     // ── PreprocessorCaptured: -FC makes __FILE__ expand to the full path ──
     //
-    // clang-cl's `/EP` preprocessor hash captures `__FILE__` expansions,
-    // so `-FC`'s effect (full path in `__FILE__`) is already in the key.
+    // clang accepts `-FC` and ignores it: `__FILE__` keeps the argv
+    // spelling (checked with clang 23), and the key folds that spelling.
     FlagSpec {
         matcher: Matcher::Exact("-FC"),
         class: FlagClass::PreprocessorCaptured,
-        source: "#285 Layer 4 — clang-cl full-path __FILE__ (-FC). Makes __FILE__ expand to the absolute source path; that expansion is captured by the /EP preprocessor hash.",
+        source: "#285 Layer 4 — clang-cl full-path __FILE__ (-FC). MSVC makes __FILE__ absolute; clang accepts the flag and ignores it.",
         dialect: Some(Dialect::Cl),
     },
     FlagSpec {
         matcher: Matcher::Exact("/FC"),
         class: FlagClass::PreprocessorCaptured,
-        source: "#285 Layer 4 — clang-cl full-path __FILE__ (/FC). Makes __FILE__ expand to the absolute source path; that expansion is captured by the /EP preprocessor hash.",
+        source: "#285 Layer 4 — clang-cl full-path __FILE__ (/FC). MSVC makes __FILE__ absolute; clang accepts the flag and ignores it.",
         dialect: Some(Dialect::Cl),
     },
     // ── NoObjectEffect: diagnostics / build mechanics ──
@@ -6986,6 +6986,25 @@ impl CcCompiler {
             }
             hasher.update(b"\n");
         }
+        // The read-set digest below hashes contents only, so two
+        // byte-identical sources at different paths would share a key. Their
+        // objects differ wherever the compiler spells the source path:
+        // `__FILE__`, `assert`, the debug info's file name. Fold the path in
+        // the spelling the object gets, so checkouts the maps cover still
+        // agree.
+        hasher.update(b"source_paths:");
+        for source in &parsed.sources {
+            let mapped = cc_mapped_path(source, &prefix_maps);
+            hasher.update(mapped.as_bytes());
+            hasher.update(b"\x1f");
+            tracing::trace!(
+                target: "kache::cache_key",
+                "[key:{}] source_path={}",
+                trace_name,
+                mapped
+            );
+        }
+        hasher.update(b"\n");
         if let Some(std) = &parsed.std {
             hasher.update(b"std:");
             hasher.update(std.as_bytes());

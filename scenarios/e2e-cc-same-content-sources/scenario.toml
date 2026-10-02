@@ -1,0 +1,62 @@
+# kache-e2e fixture: byte-identical C sources at different paths.
+#
+# src/a/util.c and src/b/util.c read the same bytes, and the key's read-set
+# digest hashes contents only. Their objects still differ: each returns its
+# own `__FILE__`, and `-g` records its own file name. They must not share a
+# cache entry, or tool-b prints tool-a's path.
+#
+# Built preprocess-first; e2e-cc-same-content-sources-parallel covers the
+# compile-first path.
+
+name = "e2e-cc-same-content-sources"
+tags = ["suite:e2e", "lang:cc", "case:false-hit"]
+
+[source]
+kind = "fixture"
+path = "source"
+
+[env]
+CC = "$KACHE cc"
+KACHE_DEFERRED_DISCOVERY = "0"
+
+[commands]
+build = "make"
+clean = "make clean"
+
+[verify]
+run = "./build/tool-a && ./build/tool-b"
+expected_stdout_contains = ["util v1 src/a/util.c", "util v1 src/b/util.c"]
+
+[diff]
+artifacts = ["build/a/util.o", "build/b/util.o"]
+
+# Only tool-a's copy of the header changes.
+[modify]
+file = "src/a/util.h"
+find = "v1"
+replace = "v2"
+expected_stdout_contains = ["util v2 src/a/util.c", "util v1 src/b/util.c"]
+
+# Cold: three translation units, three compiles. A shared entry would show
+# up here as a hit for the second copy.
+[assertions.cold]
+min_misses = 3
+max_compiler_runs = 3
+
+[assertions.warm]
+min_hits = 3
+max_misses = 0
+max_compiler_runs = 0
+
+[assertions.noop]
+should_not_recompile = false
+
+[assertions.relocate]
+min_hits = 3
+max_compiler_runs = 0
+
+# Relocate-modified: tool-a's copy misses; tool-b's copy still hits.
+[assertions.relocate-modified]
+min_misses = 1
+max_misses = 1
+max_compiler_runs = 1

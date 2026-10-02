@@ -1,0 +1,48 @@
+# kache-e2e fixture: e2e-cc-same-content-sources built with `make -j` and
+# compile-first discovery (kunobi-ninja/kache#1390).
+#
+# The copies compile at once and key from what they read afterwards. Each
+# must get its own entry and record its own memo, so the warm build hits
+# every object and each tool still prints its own path.
+
+name = "e2e-cc-same-content-sources-parallel"
+tags = ["suite:e2e", "lang:cc", "case:false-hit", "case:memo", "case:concurrency"]
+
+[source]
+kind = "fixture"
+path = "../e2e-cc-same-content-sources/source"
+
+[env]
+CC = "$KACHE cc"
+KACHE_DEFERRED_DISCOVERY = "1"
+
+[commands]
+build = "make -j4"
+clean = "make clean"
+
+[verify]
+run = "./build/tool-a && ./build/tool-b"
+expected_stdout_contains = ["util v1 src/a/util.c", "util v1 src/b/util.c"]
+
+[diff]
+artifacts = ["build/a/util.o", "build/b/util.o"]
+
+# Cold: no compile preprocesses first. One that does is not on the
+# compile-first path (a host config with a remote or a fallback turns it
+# off).
+[assertions.cold]
+min_misses = 3
+max_compiler_runs = 3
+max_preprocessor_runs = 0
+
+[assertions.warm]
+min_hits = 3
+max_misses = 0
+max_compiler_runs = 0
+
+[assertions.noop]
+should_not_recompile = false
+
+[assertions.relocate]
+min_hits = 3
+max_compiler_runs = 0

@@ -1,0 +1,76 @@
+# kache-e2e fixture: a compile-first miss whose entry already exists
+# (kunobi-ninja/kache#1390).
+#
+# src/util.c is compiled twice, through `cc` and `/usr/bin/cc`. The key
+# names the compiler by file name, so both get the same object key; the
+# preprocessor memo key folds the spelling, so the second compile finds no
+# memo, compiles first, and then finds the entry the first compile
+# committed. It must still record its memo. Without it, every later build
+# compiles build/b/util.o again.
+#
+# A flag that only changes diagnostics would be simpler, but gcc's resolved
+# command line carries -fdiagnostics-color, so it splits the object key too.
+#
+# The same state arises when a memo is pruned or retired while its entry
+# stays in the cache.
+
+name = "e2e-cc-memo-after-entry"
+tags = ["suite:e2e", "lang:cc", "case:memo"]
+
+[source]
+kind = "fixture"
+path = "source"
+
+[env]
+CC = "$KACHE cc"
+CC_ALT = "$KACHE /usr/bin/cc"
+KACHE_DEFERRED_DISCOVERY = "1"
+
+# Windows has no /usr/bin/cc, and `cc` and `cc.exe` are different file names
+# to the key. Name `cc.exe` both ways: bare, and by its absolute path.
+[windows]
+build = 'make CC_ALT="\"${CC%% *}\" \"$(cygpath -m "$(command -v cc.exe)")\""'
+
+[windows.env]
+CC = "$KACHE cc.exe"
+
+[commands]
+build = "make"
+clean = "make clean"
+
+[verify]
+run = "./build/tool"
+expected_stdout_contains = ["util value 42"]
+
+[diff]
+artifacts = ["build/a/util.o", "build/b/util.o"]
+
+[modify]
+file = "src/util.h"
+find = "42"
+replace = "17"
+expected_stdout_contains = ["util value 17"]
+
+# Cold: each compile runs, and none preprocesses first.
+[assertions.cold]
+max_compiler_runs = 3
+max_preprocessor_runs = 0
+
+# Warm: build/b/util.o hits through the memo its cold compile recorded.
+[assertions.warm]
+min_hits = 3
+max_misses = 0
+max_compiler_runs = 0
+
+[assertions.noop]
+should_not_recompile = false
+
+[assertions.relocate]
+min_hits = 3
+max_compiler_runs = 0
+
+# Relocate-modified: the first spelling recompiles the edited unit; the
+# second finds that entry.
+[assertions.relocate-modified]
+min_misses = 1
+max_compiler_runs = 1

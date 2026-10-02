@@ -7906,7 +7906,8 @@ fn write_tool_version_cache(binary: &Path, prefix: &str, version: &str) {
 /// Build the cache-file path: `<cache_dir>/<prefix>-<hash>.txt` where the hash
 /// is derived from the binary's canonical path + mtime so it auto-invalidates
 /// when the toolchain is updated, plus the rustup toolchain-selection state
-/// (see [`toolchain_selector_fingerprint`]).
+/// (see [`toolchain_selector_fingerprint`]) and the installed toolchains
+/// (see [`installed_toolchains_fingerprint`]).
 fn tool_version_cache_path(binary: &Path, prefix: &str) -> Option<std::path::PathBuf> {
     tool_version_cache_path_in(binary, prefix, std::env::var_os("PATH").as_deref())
 }
@@ -7925,14 +7926,24 @@ fn tool_version_cache_path_in(
         .duration_since(std::time::UNIX_EPOCH)
         .ok()?
         .as_secs();
+    let rustup_home = rustup_home();
     let key = format!(
-        "{}:{}:{}",
+        "{}:{}:{}:{}",
         canon.display(),
         mtime,
         toolchain_selector_fingerprint(
             std::env::var_os("RUSTUP_TOOLCHAIN").as_deref(),
             std::env::current_dir().ok().as_deref(),
-            rustup_settings_path().as_deref(),
+            rustup_home
+                .as_ref()
+                .map(|home| home.join("settings.toml"))
+                .as_deref(),
+        ),
+        installed_toolchains_fingerprint(
+            rustup_home
+                .as_ref()
+                .map(|home| home.join("toolchains"))
+                .as_deref()
         )
     );
     let hash = blake3::hash(key.as_bytes()).to_hex();
@@ -7991,13 +8002,49 @@ fn toolchain_selector_fingerprint(
     fp
 }
 
-/// `$RUSTUP_HOME/settings.toml` (or its `~/.rustup` default), which records
-/// the `rustup default` toolchain.
-fn rustup_settings_path() -> Option<std::path::PathBuf> {
-    let home = std::env::var_os("RUSTUP_HOME")
+/// Each installed toolchain's own `bin/rustc`, by name, mtime and size.
+///
+/// `rustup update nightly` replaces the toolchain behind an unchanged shim
+/// and an unchanged selection, so neither the shim's mtime nor
+/// [`toolchain_selector_fingerprint`] moves, and the old `rustc -vV` would
+/// keep keying entries the new compiler cannot read (#1406). Every
+/// installed toolchain is folded rather than the selected one, so this
+/// needs none of rustup's resolution rules: a directory read and one stat
+/// per toolchain. Installing, updating, removing or rebuilding a linked
+/// toolchain re-probes every tool once.
+fn installed_toolchains_fingerprint(toolchains: Option<&Path>) -> String {
+    let Some(entries) = toolchains.and_then(|dir| std::fs::read_dir(dir).ok()) else {
+        return String::new();
+    };
+    let rustc = format!("rustc{}", std::env::consts::EXE_SUFFIX);
+    let mut stamps: Vec<String> = entries
+        .filter_map(|entry| entry.ok())
+        .map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            // `metadata` follows a linked toolchain to its build directory.
+            match std::fs::metadata(entry.path().join("bin").join(&rustc)) {
+                Ok(meta) => {
+                    let mtime = meta
+                        .modified()
+                        .ok()
+                        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map_or(0, |since| since.as_nanos());
+                    format!("{name}={mtime}:{}", meta.len())
+                }
+                Err(_) => format!("{name}=none"),
+            }
+        })
+        .collect();
+    stamps.sort();
+    stamps.join(";")
+}
+
+/// `$RUSTUP_HOME` (or its `~/.rustup` default): `settings.toml` records the
+/// `rustup default` toolchain, `toolchains/` holds the installed ones.
+fn rustup_home() -> Option<std::path::PathBuf> {
+    std::env::var_os("RUSTUP_HOME")
         .map(std::path::PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|home| home.join(".rustup")))?;
-    Some(home.join("settings.toml"))
+        .or_else(|| dirs::home_dir().map(|home| home.join(".rustup")))
 }
 
 /// Content digest of a small selector file, or `None` if unreadable.

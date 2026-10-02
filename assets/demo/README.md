@@ -17,8 +17,8 @@ cd assets/demo
 vhs init.tape && vhs demo.tape && vhs why-miss.tape && vhs monitor.tape && vhs clean.tape
 ```
 
-`env.sh` picks the root (`/Users/Shared/kache-demo` on macOS, where `kache clean`
-skips `/private`; `/tmp/kache-demo` elsewhere) and points Kache at a scratch
+`env.sh` picks the root (`/Users/Shared/kache-demo` on macOS, outside the
+`/private` tree the monitor's project scan skips; `/tmp/kache-demo` elsewhere) and points Kache at a scratch
 store and configuration there, so the recordings never touch your own cache.
 Every tape sources it off screen. `prepare.sh` builds a small crate with a
 committed lockfile under that root. The
@@ -31,6 +31,6 @@ tapes build on each other's state: run them in the order above, and re-run
 | --- | --- |
 | `init.tape` | `kache init --check`, then `kache init` answering its prompts, then `kache doctor`. HOME and CARGO_HOME point into the demo root, so nothing on the recording machine changes. |
 | `demo.tape` | The crate is built cold off screen. On screen: the same commit in a second worktree with an empty target directory, every crate a hit, then `kache stats --last-build`. |
-| `why-miss.tape` | One source edit, one recompile, and `kache why-miss` naming the key that changed. |
+| `why-miss.tape` | One source edit, one recompile, and `kache explain` naming the key that changed. |
 | `monitor.tape` | `kache monitor` following a build in a third worktree, then the Why, Projects, and Store tabs. |
-| `clean.tape` | `kache clean` listing the target directories under the tree and how much of each is already in the store. |
+| `clean.tape` | `kache clean --dry-run` listing the target directories Kache tracks, what deleting each frees, and what a clean would remove. |

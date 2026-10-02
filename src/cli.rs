@@ -2521,7 +2521,7 @@ pub(crate) fn describe_eviction(stats: &crate::store::GcStats, over_limit: bool)
         if stats.entries_pinned > 0 {
             msg.push_str(&format!(
                 "\n  {} more {} accessed within the last {grace_secs}s or awaiting a durable \
-                 remote upload and left in place; re-run `kache gc` once builds and uploads \
+                 remote upload and left in place; run it again once builds and uploads \
                  are idle.",
                 stats.entries_pinned,
                 plural(stats.entries_pinned),
@@ -2530,7 +2530,7 @@ pub(crate) fn describe_eviction(stats: &crate::store::GcStats, over_limit: bool)
         if stats.entries_unreclaimable > 0 {
             msg.push_str(&format!(
                 "\n  {} {}{} left in place because clones still hold their blocks. \
-                 Inspect stale outputs with `kache clean --tracked --stale 14d --dry-run`, then run `kache gc` again.",
+                 Inspect stale outputs with `kache clean --stale 14d --dry-run`, then run it again.",
                 stats.entries_unreclaimable,
                 plural(stats.entries_unreclaimable),
                 held_bytes_note(stats.bytes_held),
@@ -2543,7 +2543,7 @@ pub(crate) fn describe_eviction(stats: &crate::store::GcStats, over_limit: bool)
         return format!(
             " nothing reclaimable on disk.\n  {} {}{} cloned into build outputs \
              (same bytes as target/, not extra).\n  Remove stale outputs with \
-             `kache clean --tracked --stale 14d --dry-run`, then run `kache gc` again.",
+             `kache clean --stale 14d --dry-run`, then run it again.",
             stats.entries_unreclaimable,
             plural(stats.entries_unreclaimable),
             held_bytes_note(stats.bytes_held),
@@ -2555,7 +2555,7 @@ pub(crate) fn describe_eviction(stats: &crate::store::GcStats, over_limit: bool)
         return format!(
             " evicted 0 entries.\n  {} {} were selected but accessed within the last \
              {grace_secs}s or are awaiting a durable remote upload, so they were left in \
-             place. Re-run `kache gc` once builds and uploads are idle.",
+             place. Run it again once builds and uploads are idle.",
             stats.entries_pinned,
             plural(stats.entries_pinned),
         );
@@ -4403,6 +4403,217 @@ struct CleanSkipped {
 
 pub(crate) const DEFAULT_TRACKED_STALE_HOURS: u64 = 336;
 
+/// Which target directories `kache clean` looks at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CleanScope {
+    /// The ones kache tracks, filtered.
+    Tracked(TrackedSelection),
+    /// `target/` directories found under this directory.
+    Scan(std::path::PathBuf),
+}
+
+/// `14d`, `36h`: a window in whole days when it is one.
+fn window_label(hours: u64) -> String {
+    if hours > 0 && hours.is_multiple_of(24) {
+        format!("{}d", hours / 24)
+    } else {
+        format!("{hours}h")
+    }
+}
+
+/// Why a tracked clean found nothing to remove, and how to widen it.
+fn nothing_to_clean(selection: TrackedSelection) -> String {
+    match selection {
+        TrackedSelection::Orphaned => {
+            "Nothing to remove: every tracked target's worktree is still there.".to_string()
+        }
+        TrackedSelection::StaleOrOrphaned(hours) => format!(
+            "Nothing to remove: no tracked target's worktree is gone, and every one was built within {}.\n\
+             `kache clean --dry-run` lists them all; `--stale 7d` widens the window.",
+            window_label(hours)
+        ),
+    }
+}
+
+/// What `kache clean --cache` or `--crate` removes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CacheClean {
+    /// Entries older than this many hours.
+    OlderThan(u64),
+    /// Entries from old or unrecorded cache-key schemas.
+    StaleSchema,
+    /// Every entry.
+    All,
+    /// One crate's entries.
+    Crate(String),
+}
+
+/// `kache clean --cache` and its hidden forms. Eviction by age runs at once,
+/// as the daemon would. Removing everything, or a whole crate, asks first
+/// unless `yes` is set.
+pub fn clean_cache(
+    config: &Config,
+    what: CacheClean,
+    dry_run: bool,
+    yes: bool,
+    json: bool,
+) -> Result<()> {
+    let (entries, bytes) = cache_counts(&Store::open(config)?, &what)?;
+    match cache_action(what, entries, bytes, dry_run, json)? {
+        CacheAction::Say(text) => {
+            println!("{text}");
+            Ok(())
+        }
+        CacheAction::Gc {
+            max_age_hours,
+            stale_schema,
+        } => gc(config, max_age_hours, stale_schema, json),
+        CacheAction::Purge {
+            crate_name,
+            question,
+        } => {
+            let terminal = std::io::stdin().is_terminal();
+            if !confirm_removal_with(&question, yes, terminal, |question| {
+                prompt_yes_no(question, false, false)
+            })? {
+                println!("Nothing removed.");
+                return Ok(());
+            }
+            purge(config, crate_name.as_deref())
+        }
+    }
+}
+
+/// The entries a cache clean is about, and their bytes: one crate's, or
+/// the whole cache's.
+fn cache_counts(store: &Store, what: &CacheClean) -> Result<(usize, u64)> {
+    match what {
+        CacheClean::Crate(name) => crate_entries(store, name),
+        _ => Ok((store.entry_count()?, store.physical_size()?)),
+    }
+}
+
+/// What a cache clean does.
+#[derive(Debug, PartialEq, Eq)]
+enum CacheAction {
+    /// Print this and stop: a preview, or nothing to remove.
+    Say(String),
+    Gc {
+        max_age_hours: Option<u64>,
+        stale_schema: bool,
+    },
+    /// Ask `question`, then remove one crate's entries or all of them.
+    Purge {
+        crate_name: Option<String>,
+        question: String,
+    },
+}
+
+/// Decide a cache clean from what it is about. Pure.
+fn cache_action(
+    what: CacheClean,
+    entries: usize,
+    bytes: u64,
+    dry_run: bool,
+    json: bool,
+) -> Result<CacheAction> {
+    if dry_run {
+        return Ok(CacheAction::Say(cache_preview(&what, entries, bytes)));
+    }
+    Ok(match what {
+        CacheClean::OlderThan(hours) => CacheAction::Gc {
+            max_age_hours: Some(hours),
+            stale_schema: false,
+        },
+        CacheClean::StaleSchema => CacheAction::Gc {
+            max_age_hours: None,
+            stale_schema: true,
+        },
+        CacheClean::All | CacheClean::Crate(_) if json => anyhow::bail!(
+            "removing cache entries this way has no JSON form yet; run it without `--json`."
+        ),
+        CacheClean::Crate(name) if entries == 0 => {
+            CacheAction::Say(format!("No cache entries for '{name}'."))
+        }
+        what => {
+            let question = format!("Remove {}?", removal_words(&what, entries, bytes));
+            CacheAction::Purge {
+                crate_name: match what {
+                    CacheClean::Crate(name) => Some(name),
+                    _ => None,
+                },
+                question,
+            }
+        }
+    })
+}
+
+/// How many of the cache's entries belong to `name`, and their bytes.
+fn crate_entries(store: &Store, name: &str) -> Result<(usize, u64)> {
+    let matching: Vec<_> = store
+        .list_entries("name")?
+        .into_iter()
+        .filter(|entry| entry.crate_name == name)
+        .collect();
+    Ok((
+        matching.len(),
+        matching.iter().map(|entry| entry.size).sum(),
+    ))
+}
+
+/// `all 4 cache entries (6.8 MiB)`, `2 cache entries for 'serde' (957 KiB)`.
+fn removal_words(what: &CacheClean, entries: usize, bytes: u64) -> String {
+    let plural = if entries == 1 { "y" } else { "ies" };
+    match what {
+        CacheClean::Crate(name) => format!(
+            "{} cache entr{plural} for '{name}' ({})",
+            term::count(entries as u64),
+            term::bytes(bytes)
+        ),
+        _ => format!(
+            "all {} cache entr{plural} ({})",
+            term::count(entries as u64),
+            term::bytes(bytes)
+        ),
+    }
+}
+
+/// What a cache clean would do, for `--dry-run`. Pure.
+fn cache_preview(what: &CacheClean, entries: usize, bytes: u64) -> String {
+    match what {
+        CacheClean::OlderThan(hours) => format!(
+            "Cache is {} in {} entries. This would evict the entries older than {}.",
+            term::bytes(bytes),
+            term::count(entries as u64),
+            window_label(*hours)
+        ),
+        CacheClean::StaleSchema => format!(
+            "This would remove the entries not keyed by schema {}.",
+            crate::cache_key::CACHE_KEY_VERSION
+        ),
+        CacheClean::Crate(name) if entries == 0 => format!("No cache entries for '{name}'."),
+        what => format!("Would remove {}.", removal_words(what, entries, bytes)),
+    }
+}
+
+/// `--yes`, or a yes at `prompt` when `terminal`. Without a terminal and
+/// without `--yes` nothing is removed.
+fn confirm_removal_with(
+    question: &str,
+    yes: bool,
+    terminal: bool,
+    prompt: impl FnOnce(&str) -> Result<bool>,
+) -> Result<bool> {
+    if yes {
+        return Ok(true);
+    }
+    if !terminal {
+        println!("{question} Pass --yes to remove without asking.");
+        return Ok(false);
+    }
+    prompt(question)
+}
+
 fn path_was_removed(path: &std::path::Path) -> bool {
     !path.exists()
 }
@@ -4414,21 +4625,39 @@ pub fn clean(
     dry_run: bool,
     yes: bool,
     json: bool,
-    tracked: Option<TrackedSelection>,
+    scope: CleanScope,
 ) -> Result<()> {
     use crossterm::event;
     use ratatui::prelude::*;
     use std::io::stdout;
 
-    let root = std::env::current_dir()?;
-    let (mut targets, skipped, orphans) = if let Some(selection) = tracked {
+    let (root, selection) = match &scope {
+        CleanScope::Scan(dir) => {
+            if !dir.is_dir() {
+                anyhow::bail!("{} is not a directory", dir.display());
+            }
+            (std::path::absolute(dir)?, None)
+        }
+        CleanScope::Tracked(selection) => (std::env::current_dir()?, Some(*selection)),
+    };
+    let (mut targets, skipped, orphans) = if let Some(selection) = selection {
         tracked_target_entries(config, selection)?
     } else {
         let mut targets = Vec::new();
-        find_target_dirs(&root, &mut targets);
+        find_target_dirs_in(&root, &mut targets);
         (targets, Vec::new(), std::collections::HashSet::new())
     };
-    let tracked = tracked.is_some();
+    let tracked = selection.is_some();
+
+    // A tracked preview lists every target kache knows, not only the ones it
+    // would remove, so it answers "what is using my disk" too.
+    if let Some(selection) = selection.filter(|_| dry_run && !json) {
+        let now = kache_store::markers::now_epoch_secs() as i64;
+        for line in render_tracked_plan(config, selection, &targets, &skipped, now)? {
+            println!("{line}");
+        }
+        return Ok(());
+    }
 
     if targets.is_empty() {
         if json {
@@ -4455,10 +4684,9 @@ pub fn clean(
         for item in &skipped {
             println!("Skipped {}: {}", item.path, item.reason);
         }
-        if tracked {
-            println!("No stale tracked target directories found.");
-        } else {
-            println!("No target/ directories found.");
+        match selection {
+            Some(selection) => println!("{}", nothing_to_clean(selection)),
+            None => println!("No target/ directories under {}.", root.display()),
         }
         return Ok(());
     }
@@ -4546,9 +4774,8 @@ pub fn clean(
             return emit_clean_json(&targets, &skipped, removed_paths, estimated_reclaimed);
         }
         println!(
-            "\nRemoved {removed} target/ dirs; estimated reclaimed {}{}",
-            ByteSize(estimated_reclaimed),
-            estimate_context_note(apparent_gap)
+            "\n{}",
+            removal_summary(removed, estimated_reclaimed, apparent_gap)
         );
         return Ok(());
     }
@@ -4612,9 +4839,8 @@ pub fn clean(
                 }
             }
             println!(
-                "\nRemoved {removed} target/ dirs; estimated reclaimed {}{}",
-                ByteSize(estimated_reclaimed),
-                estimate_context_note(apparent_gap)
+                "\n{}",
+                removal_summary(removed, estimated_reclaimed, apparent_gap)
             );
         }
     }
@@ -4757,15 +4983,21 @@ fn cargo_lock_files(dir: &std::path::Path, depth: usize) -> Vec<std::path::PathB
 /// Explain the gap between apparent size and estimated physical reclaim without
 /// pretending every shared extent belongs to kache or survives the selected
 /// deletion set. The gap can also contain sparse holes and duplicate hardlinks.
-fn estimate_context_note(apparent_gap: u64) -> String {
-    if apparent_gap > 0 {
-        format!(
-            " ({} of apparent size is shared, sparse, or duplicate)",
-            ByteSize(apparent_gap)
-        )
-    } else {
-        String::new()
-    }
+/// `Removed 2 target directories, about 1.2 GiB freed.`
+fn removal_summary(removed: usize, freed: u64, apparent_gap: u64) -> String {
+    format!(
+        "Removed {removed} target director{}, about {} freed.{}",
+        if removed == 1 { "y" } else { "ies" },
+        term::bytes(freed),
+        if apparent_gap > 0 {
+            format!(
+                " Another {} of their size was shared, sparse, or duplicate.",
+                term::bytes(apparent_gap)
+            )
+        } else {
+            String::new()
+        }
+    )
 }
 
 fn render_clean_dry_run(
@@ -4773,49 +5005,49 @@ fn render_clean_dry_run(
     root: &std::path::Path,
     orphans: &std::collections::HashSet<std::path::PathBuf>,
 ) -> Vec<String> {
+    use term::Align::{Left, Right};
     let total_size: u64 = targets.iter().map(|t| t.size).sum();
-    let total_cached: u64 = targets.iter().map(|t| t.cached_bytes).sum();
+    let estimated_reclaimable: u64 = targets.iter().map(|t| t.estimated_reclaimable_bytes).sum();
     let mut lines = vec![format!(
-        "Found {} target/ director{} ({} total, {} cached)\n",
+        "Remove   {} target director{} under {} · {} on disk · {} freeable",
         targets.len(),
         if targets.len() == 1 { "y" } else { "ies" },
-        ByteSize(total_size),
-        ByteSize(total_cached),
+        term::home_path(root),
+        term::bytes(total_size),
+        term::bytes(estimated_reclaimable),
     )];
-    let max_path = targets
+    let body: Vec<Vec<String>> = targets
         .iter()
         .map(|t| {
-            let rel = t.path.strip_prefix(root).unwrap_or(&t.path);
-            format!("{}", rel.display()).len()
+            let mut path = t
+                .path
+                .strip_prefix(root)
+                .unwrap_or(&t.path)
+                .display()
+                .to_string();
+            if !t.profiles.is_empty() {
+                path.push_str(&format!("  [{}]", t.profiles.join(", ")));
+            }
+            if orphans.contains(&t.path) {
+                path.push_str("  (worktree deleted)");
+            }
+            vec![
+                term::bytes(t.estimated_reclaimable_bytes),
+                term::bytes(t.size),
+                term::bytes(t.cached_bytes),
+                path,
+            ]
         })
-        .max()
-        .unwrap_or(40);
-    let w = max_path.max(10);
-
-    for t in targets {
-        let rel = t.path.strip_prefix(root).unwrap_or(&t.path);
-        let profile_str = if t.profiles.is_empty() {
-            String::new()
-        } else {
-            format!("  [{}]", t.profiles.join(", "))
-        };
-        let orphan_str = if orphans.contains(&t.path) {
-            "  (worktree deleted)"
-        } else {
-            ""
-        };
-        lines.push(format!(
-            "  {:<w$}  {:>10}  cached: {:>10}{profile_str}{orphan_str}",
-            rel.display(),
-            ByteSize(t.size),
-            ByteSize(t.cached_bytes)
-        ));
-    }
-    let estimated_reclaimable: u64 = targets.iter().map(|t| t.estimated_reclaimable_bytes).sum();
+        .collect();
+    lines.extend(term::table(
+        &["FREEABLE", "ON DISK", "CACHED", "PATH"],
+        &[Right, Right, Right, Left],
+        &body,
+    ));
+    lines.push(String::new());
     lines.push(format!(
-        "\nDry run: estimated to free {}{}",
-        ByteSize(estimated_reclaimable),
-        estimate_context_note(total_size.saturating_sub(estimated_reclaimable))
+        "Dry run, nothing removed. `kache clean {} --yes` removes them.",
+        term::home_path(root)
     ));
     lines
 }
@@ -4994,6 +5226,166 @@ fn render_targets(rows: &[TargetRow]) -> Vec<String> {
         ));
     }
     lines
+}
+
+/// `kache clean --dry-run` on tracked targets: the ones this clean would
+/// remove, the ones it keeps with what the daemon will do to them, and the
+/// cache. Reads the registry and the store; removes nothing.
+fn render_tracked_plan(
+    config: &Config,
+    selection: TrackedSelection,
+    remove: &[TargetEntry],
+    skipped: &[CleanSkipped],
+    now: i64,
+) -> Result<Vec<String>> {
+    let rows = target_rows(config, now)?;
+    let store = Store::open(config)?;
+    let cache = CacheLine {
+        bytes: store.physical_size()?,
+        limit: config.max_size,
+        entries: store.entry_count()? as u64,
+    };
+    let remove: std::collections::HashSet<String> = remove
+        .iter()
+        .map(|entry| entry.path.display().to_string())
+        .collect();
+    Ok(plan_lines(&rows, &remove, skipped, selection, &cache))
+}
+
+/// The cache's size for the last line of a clean preview.
+struct CacheLine {
+    bytes: u64,
+    limit: u64,
+    entries: u64,
+}
+
+/// What a tracked clean selects, in words.
+fn selection_words(selection: TrackedSelection) -> String {
+    match selection {
+        TrackedSelection::Orphaned => "worktree gone".to_string(),
+        TrackedSelection::StaleOrOrphaned(hours) => {
+            format!("worktree gone, or no build in {}", window_label(hours))
+        }
+    }
+}
+
+/// The command that removes what a tracked preview selected.
+fn clean_command(selection: TrackedSelection) -> String {
+    match selection {
+        TrackedSelection::Orphaned => "kache clean --orphans --yes".to_string(),
+        TrackedSelection::StaleOrOrphaned(DEFAULT_TRACKED_STALE_HOURS) => {
+            "kache clean --yes".to_string()
+        }
+        TrackedSelection::StaleOrOrphaned(hours) => {
+            format!("kache clean --stale {} --yes", window_label(hours))
+        }
+    }
+}
+
+/// The tracked clean preview, from its parts. Pure.
+fn plan_lines(
+    rows: &[TargetRow],
+    remove: &std::collections::HashSet<String>,
+    skipped: &[CleanSkipped],
+    selection: TrackedSelection,
+    cache: &CacheLine,
+) -> Vec<String> {
+    let (removed, kept): (Vec<&TargetRow>, Vec<&TargetRow>) =
+        rows.iter().partition(|row| remove.contains(&row.path));
+    let freeable = |rows: &[&TargetRow]| rows.iter().map(|row| row.reclaimable_bytes).sum::<u64>();
+    let count = |n: usize| format!("{n} target{}", if n == 1 { "" } else { "s" });
+    let mut lines = Vec::new();
+    if removed.is_empty() {
+        lines.push(format!(
+            "Remove   nothing: no target matches ({})",
+            selection_words(selection)
+        ));
+    } else {
+        lines.push(format!(
+            "Remove   {} · {} freeable · {}",
+            count(removed.len()),
+            term::bytes(freeable(&removed)),
+            selection_words(selection)
+        ));
+        lines.extend(target_table(&removed));
+    }
+    if !kept.is_empty() {
+        let (listed, empty): (Vec<&TargetRow>, Vec<&TargetRow>) =
+            kept.iter().partition(|row| row.reclaimable_bytes > 0);
+        lines.push(String::new());
+        lines.push(format!(
+            "Keep     {} · {} freeable",
+            count(kept.len()),
+            term::bytes(freeable(&kept))
+        ));
+        if !listed.is_empty() {
+            lines.extend(target_table(&listed));
+        }
+        if !empty.is_empty() {
+            lines.push(format!("  + {} more with nothing to free", empty.len()));
+        }
+    }
+    if !skipped.is_empty() {
+        lines.push(String::new());
+        lines.push("Skipped".to_string());
+        for item in skipped {
+            lines.push(format!(
+                "  {}   {}",
+                term::home_path(std::path::Path::new(&item.path)),
+                item.reason
+            ));
+        }
+    }
+    lines.push(String::new());
+    lines.push(format!(
+        "Cache    {} of {} · {} entries · kept under its limit automatically; `kache clean --cache` empties it",
+        term::bytes(cache.bytes),
+        term::bytes(cache.limit),
+        term::count(cache.entries)
+    ));
+    lines.push(String::new());
+    lines.push(if removed.is_empty() {
+        "Dry run, nothing removed. `--stale 7d` widens the window.".to_string()
+    } else {
+        format!(
+            "Dry run, nothing removed. `{}` removes the {} above.",
+            clean_command(selection),
+            count(removed.len())
+        )
+    });
+    lines
+}
+
+/// FREEABLE, ON DISK, IDLE and PATH for tracked targets, with what makes a
+/// row special after its path.
+fn target_table(rows: &[&TargetRow]) -> Vec<String> {
+    use term::Align::{Left, Right};
+    let body: Vec<Vec<String>> = rows
+        .iter()
+        .map(|row| {
+            let mut path = term::home_path(std::path::Path::new(&row.path));
+            if row.state == TargetState::WorktreeDeleted {
+                path.push_str("  (worktree deleted)");
+            }
+            if row.discovered {
+                path.push_str("  (found through Git)");
+            }
+            path.push_str(&next_pass_note(&row.next_pass));
+            vec![
+                term::bytes(row.reclaimable_bytes),
+                term::bytes(row.apparent_bytes),
+                row.idle_seconds
+                    .map(format_idle)
+                    .unwrap_or_else(|| "?".into()),
+                path,
+            ]
+        })
+        .collect();
+    term::table(
+        &["FREEABLE", "ON DISK", "IDLE", "PATH"],
+        &[Right, Right, Right, Left],
+        &body,
+    )
 }
 
 /// What the daemon's next quiet pass would do to a target, as a suffix.
@@ -5232,8 +5624,18 @@ fn is_macos_protected(_path: &std::path::Path) -> bool {
 const WORKTREE_CONTAINERS: [&str; 2] = [".worktrees", ".claude"];
 
 pub(crate) fn find_target_dirs(dir: &std::path::Path, results: &mut Vec<TargetEntry>) {
+    walk_target_dirs(dir, results, true);
+}
+
+/// [`find_target_dirs`] for a directory the user named. macOS-protected
+/// locations under it are read too: the user asked for this one.
+pub(crate) fn find_target_dirs_in(dir: &std::path::Path, results: &mut Vec<TargetEntry>) {
+    walk_target_dirs(dir, results, false);
+}
+
+fn walk_target_dirs(dir: &std::path::Path, results: &mut Vec<TargetEntry>, protect: bool) {
     // Check *before* read_dir to avoid triggering macOS TCC permission prompts.
-    if is_macos_protected(dir) {
+    if protect && is_macos_protected(dir) {
         return;
     }
 
@@ -5293,7 +5695,7 @@ pub(crate) fn find_target_dirs(dir: &std::path::Path, results: &mut Vec<TargetEn
     // Recurse into subdirs (but not into target/ itself)
     for (name, path) in &subdirs {
         if name != "target" {
-            find_target_dirs(path, results);
+            walk_target_dirs(path, results, protect);
         }
     }
 }

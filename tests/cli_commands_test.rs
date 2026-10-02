@@ -953,22 +953,27 @@ fn targets_lists_a_tracked_target_and_flags_its_deleted_worktree() {
 #[test]
 fn clean_dry_run_reports_no_targets_in_empty_dir() {
     let e = env();
-    // Run from an empty working dir so `clean` finds nothing to remove.
+    // Nothing tracked, and nothing under an empty directory.
     let workdir = TempDir::new().unwrap();
     e.cmd()
         .current_dir(workdir.path())
         .args(["clean", "--dry-run"])
         .assert()
         .success()
-        .stdout(predicates::str::contains("No target/ directories found"));
+        .stdout(predicates::str::starts_with(
+            "Remove   nothing: no target matches",
+        ));
+    e.cmd()
+        .arg("clean")
+        .arg(workdir.path())
+        .arg("--dry-run")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("No target/ directories under"));
 }
 
-// On macOS `clean` skips any path under a TCC-protected prefix (`/private`,
-// `~/Documents`, …) to avoid permission prompts — and every temp dir lives
-// under `/private`, so the populated-scan branch is unreachable there. The
-// scan logic is identical cross-platform and CI measures coverage on Linux,
-// so this runs everywhere except macOS.
-#[cfg(not(target_os = "macos"))]
+// A directory named to `clean` is scanned even under a macOS-protected
+// prefix, which is where every macOS temp dir lives.
 #[test]
 fn clean_dry_run_reports_a_populated_target_dir() {
     // A cargo project with a non-empty target/ exercises the populated
@@ -987,19 +992,22 @@ fn clean_dry_run_reports_a_populated_target_dir() {
     }
 
     e.cmd()
-        .current_dir(root)
-        .args(["clean", "--dry-run"])
+        .arg("clean")
+        .arg(root)
+        .arg("--dry-run")
         .assert()
         .success()
-        .stdout(predicates::str::contains("Found 1 target"))
-        .stdout(predicates::str::contains(
-            "Dry run: estimated to free 10.0 KiB",
+        .stdout(predicates::str::starts_with(
+            "Remove   1 target directory under",
         ))
-        // Plain copies have no apparent-size accounting gap.
-        .stdout(predicates::str::contains("shared, sparse, or duplicate").not());
+        // Plain copies: everything on disk is freeable.
+        .stdout(predicates::str::contains(
+            " · 10.0 KiB on disk · 10.0 KiB freeable",
+        ))
+        .stdout(predicates::str::contains("target  [debug, release]"));
 }
 
-#[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(unix)]
 #[test]
 fn clean_dry_run_collapses_hardlinks_wholly_inside_target() {
     let e = env();
@@ -1014,16 +1022,13 @@ fn clean_dry_run_collapses_hardlinks_wholly_inside_target() {
     std::fs::hard_link(&first, &second).unwrap();
 
     e.cmd()
-        .current_dir(root)
-        .args(["clean", "--dry-run"])
+        .arg("clean")
+        .arg(root)
+        .arg("--dry-run")
         .assert()
         .success()
-        .stdout(predicates::str::contains("8.0 KiB total, 0 B cached"))
         .stdout(predicates::str::contains(
-            "Dry run: estimated to free 4.0 KiB",
-        ))
-        .stdout(predicates::str::contains(
-            "4.0 KiB of apparent size is shared, sparse, or duplicate",
+            " · 8.0 KiB on disk · 4.0 KiB freeable",
         ));
 }
 

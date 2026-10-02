@@ -1,7 +1,7 @@
 # Environment for the recordings. Every tape sources this off screen; prepare.sh
 # uses the same root. Override KACHE_DEMO_ROOT to record somewhere else.
 case "$(uname)" in
-  Darwin) default_root=/Users/Shared/kache-demo ;; # `kache clean` skips /private
+  Darwin) default_root=/Users/Shared/kache-demo ;; # the monitor's project scan skips /private
   *) default_root=/tmp/kache-demo ;;
 esac
 export KACHE_DEMO_ROOT="${KACHE_DEMO_ROOT:-$default_root}"

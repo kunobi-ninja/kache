@@ -464,6 +464,7 @@ fn test_event(
         extern_units: Default::default(),
         miss_reason: crate::events::MissReason::None,
         object_output: String::new(),
+        package: String::new(),
     }
 }
 
@@ -2930,8 +2931,10 @@ fn fallback_recovery_survives_report_conversion_and_formatting() {
     let mut event = test_event("fixture", EventResult::Passthrough, 5, 0, 0, "");
     event.passthrough_reason = "unsupported|assembly".into();
     event.exit_code = Some(0);
+    event.package = "fixture-package".into();
     let plain = to_bypass_detail(&event);
     assert_eq!(bypass_detail_reason(&plain), "unsupported|assembly");
+    assert_eq!(plain.package, "fixture-package");
     event.fallback_attempt = Some(crate::fallback::Attempt {
         wrapper: "sccache".into(),
         outcome: crate::fallback::Outcome::Failed,
@@ -3708,6 +3711,7 @@ fn test_push_bypass_tables_renders_reasons_and_slowest() {
             fallback_attempt: None,
             crate_name: "foo".to_string(),
             root: String::new(),
+            package: String::new(),
             result: "passthrough".to_string(),
             route: "direct".to_string(),
             reason: "linker".to_string(),
@@ -4075,6 +4079,7 @@ fn text_timing_and_bypass_sections_hide_a_zero() {
     report.bypass.slowest.push(BypassDetail {
         crate_name: "slow".to_string(),
         root: String::new(),
+        package: String::new(),
         result: "passthrough".to_string(),
         route: "direct".to_string(),
         reason: "flag".to_string(),

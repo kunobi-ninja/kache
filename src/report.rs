@@ -790,6 +790,9 @@ pub struct BypassDetail {
     pub crate_name: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub root: String,
+    /// Package of a build-script run. Empty for compiles.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub package: String,
     pub result: String,
     pub route: String,
     pub reason: String,
@@ -838,6 +841,9 @@ pub struct TraceArgs {
     /// Object file recorded on a C or C++ event. Empty for rustc.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub object_output: String,
+    /// Package of a build-script run. Empty for compiles.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub package: String,
     pub elapsed_ms: u64,
     pub compile_time_ms: u64,
     pub overhead_ms: u64,
@@ -928,6 +934,8 @@ pub struct CrateDetail {
     pub cache_key: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub object_output: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub package: String,
     #[serde(default)]
     pub store_output_blobs: u32,
     #[serde(default)]
@@ -1613,6 +1621,7 @@ fn to_trace_event(event: &BuildEvent, lane: u32) -> TraceEvent {
             reason: bypass_reason(event),
             cache_key: event.cache_key.clone(),
             object_output: event.object_output.clone(),
+            package: event.package.clone(),
             elapsed_ms: event.elapsed_ms,
             compile_time_ms: event.compile_time_ms,
             overhead_ms,
@@ -1762,6 +1771,7 @@ fn to_crate_detail(e: &BuildEvent) -> CrateDetail {
         size: e.size,
         cache_key: e.cache_key.clone(),
         object_output: e.object_output.clone(),
+        package: e.package.clone(),
         store_output_blobs: e.store_output_blobs,
         store_duplicate_blobs: e.store_duplicate_blobs,
         store_new_blobs: e.store_new_blobs,
@@ -1869,6 +1879,7 @@ fn to_bypass_detail(e: &BuildEvent) -> BypassDetail {
     BypassDetail {
         crate_name: e.crate_name.clone(),
         root: e.root.clone(),
+        package: e.package.clone(),
         result: e.result.to_string(),
         route: bypass_route(e).to_string(),
         reason: bypass_reason(e),

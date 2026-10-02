@@ -371,6 +371,9 @@ pub struct BuildEvent {
     /// for an invocation that named no object. Schema 22.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub object_output: String,
+    /// Package a build-script run belongs to. Empty for compiles. Schema 23.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub package: String,
 }
 
 impl BuildEvent {
@@ -1707,6 +1710,7 @@ impl BuildEvent {
             extern_units: Default::default(),
             miss_reason: MissReason::None,
             object_output: String::new(),
+            package: String::new(),
         }
     }
 }
@@ -1869,6 +1873,7 @@ mod tests {
             extern_units: Default::default(),
             miss_reason: MissReason::None,
             object_output: String::new(),
+            package: String::new(),
         };
 
         log_event(&log_path, &event).unwrap();

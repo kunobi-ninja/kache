@@ -5234,6 +5234,7 @@ fn build_event(
         extern_units: Default::default(),
         miss_reason: crate::events::MissReason::None,
         object_output: String::new(),
+        package: String::new(),
     }
 }
 

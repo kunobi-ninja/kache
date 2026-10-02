@@ -3243,3 +3243,28 @@ fn only_cargo_network_lines_count_as_a_dependency_fetch() {
         assert!(!is_dependency_fetch(line.as_bytes()), "{line:?}");
     }
 }
+
+/// A build log with downloads is refused and says how many lines it saw; one
+/// without is accepted.
+#[test]
+fn a_timed_build_that_fetched_is_refused() {
+    let mut count = FetchCount::default();
+    for line in [
+        "    Updating crates.io index\n",
+        "   Compiling a v1.0.0\n",
+        "  Downloaded b v1.0.0\n",
+        "  Downloaded c v1.0.0\n",
+    ] {
+        count.observe(line.as_bytes());
+    }
+    let err = count
+        .refuse("cold", Path::new("build-cold.log"))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("(3 Cargo download or index lines)"), "{err}");
+    assert!(err.contains("cargo fetch --locked"), "{err}");
+
+    let mut clean = FetchCount::default();
+    clean.observe(b"   Compiling a v1.0.0\n");
+    clean.refuse("warm", Path::new("build-warm.log")).unwrap();
+}

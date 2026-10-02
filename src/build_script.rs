@@ -64,6 +64,8 @@ const SHIM_DIR: &str = ".kache-build-script-shims";
 const LAUNCHER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/build-script-launcher"));
 const PREDICTION_SCHEMA: u32 = 1;
 const PREDICTION_PREFIX: &str = "build-script:";
+/// Marks a script binary that writes into its inputs on every run.
+const UNSETTLED_PREFIX: &str = "unsettled:";
 const MANIFEST_NAME: &str = "kache-build-script.json";
 const OUT_PREFIX: &str = "out/";
 pub(crate) const CRATE_NAME: &str = "build_script_run";
@@ -438,27 +440,94 @@ fn run_cached(real: &Path, argv: &[std::ffi::OsString]) -> Result<i32> {
     // Only a run that starts from an empty OUT_DIR produces a state worth
     // recording: a rerun over leftovers would snapshot the leftovers too.
     let out_dir_was_empty = directory_is_empty(&run.environment.out_dir);
-    let started = write_floor(std::time::SystemTime::now());
-    let compile_start = std::time::Instant::now();
-    let output = real_command(real, argv)
-        .output()
-        .with_context(|| format!("running {}", real.display()))?;
-    let compile_ms = compile_start.elapsed().as_millis() as u64;
-    replay(&output.stdout, &output.stderr);
-    if !output.status.success() {
-        return Ok(output.status.code().unwrap_or(1));
+    let first = ScriptRun::start(real, argv)?;
+    if !first.succeeded() || !out_dir_was_empty {
+        first.replay();
+        if first.succeeded() {
+            run.log_unrecorded("it ran over an existing OUT_DIR", first.compile_ms);
+        }
+        return Ok(first.exit_code());
     }
-    // The script has run and Cargo has its output; nothing below may change
-    // the exit status.
-    if !out_dir_was_empty {
-        run.log_unrecorded("it ran over an existing OUT_DIR", compile_ms);
+    let error = match run.record_run(&first) {
+        Ok(()) => {
+            first.replay();
+            return Ok(0);
+        }
+        Err(error) => error,
+    };
+    if !error.is::<InputsChanged>() || !run.reruns_settle() {
+        first.replay();
+        run.log_unrecorded(&format!("{error:#}"), first.compile_ms);
         return Ok(0);
     }
-    if let Err(error) = run.record(&output.stdout, &output.stderr, compile_ms, started) {
-        run.log_unrecorded(&format!("{error:#}"), compile_ms);
+    // The script wrote into its own inputs, as a generator creating its data
+    // directory does. A second run starts from the tree the first one left;
+    // when it leaves that tree alone, it is an ordinary run to record. Cargo
+    // gets the second run's output, which matches what is in OUT_DIR.
+    clear_directory(&run.environment.out_dir)?;
+    // The first run's writes must fall before the second run's floor.
+    std::thread::sleep(FS_CLOCK_TICK * 2);
+    let second = ScriptRun::start(real, argv)?;
+    second.replay();
+    if !second.succeeded() {
+        return Ok(second.exit_code());
+    }
+    if let Err(error) = run.record_run(&second) {
+        if error.is::<InputsChanged>() {
+            run.mark_unsettled();
+        }
+        run.log_unrecorded(&format!("{error:#}"), second.compile_ms);
     }
     Ok(0)
 }
+
+/// One execution of the real build script, its output held back from Cargo
+/// until kache knows whether it is the run Cargo should see.
+struct ScriptRun {
+    output: std::process::Output,
+    compile_ms: u64,
+    started: std::time::SystemTime,
+}
+
+impl ScriptRun {
+    fn start(real: &Path, argv: &[std::ffi::OsString]) -> Result<Self> {
+        let started = write_floor(std::time::SystemTime::now());
+        let compile_start = std::time::Instant::now();
+        let output = real_command(real, argv)
+            .output()
+            .with_context(|| format!("running {}", real.display()))?;
+        Ok(Self {
+            output,
+            compile_ms: compile_start.elapsed().as_millis() as u64,
+            started,
+        })
+    }
+
+    fn succeeded(&self) -> bool {
+        self.output.status.success()
+    }
+
+    fn exit_code(&self) -> i32 {
+        self.output.status.code().unwrap_or(1)
+    }
+
+    fn replay(&self) {
+        replay(&self.output.stdout, &self.output.stderr);
+    }
+}
+
+/// [`Run::record`] refused the run because a declared input changed while it
+/// ran.
+#[derive(Debug)]
+struct InputsChanged;
+
+impl std::fmt::Display for InputsChanged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("a declared input changed while the script ran")
+    }
+}
+
+impl std::error::Error for InputsChanged {}
 
 /// File systems stamp writes from a clock that advances in ticks (a jiffy on
 /// Linux, 15.6 ms by default on Windows), so a write just after `now` can
@@ -1296,6 +1365,39 @@ impl Run {
         Ok(size)
     }
 
+    fn record_run(&self, script: &ScriptRun) -> Result<()> {
+        self.record(
+            &script.output.stdout,
+            &script.output.stderr,
+            script.compile_ms,
+            script.started,
+        )
+    }
+
+    /// Whether a script that wrote into its inputs is worth a second run: not
+    /// when one already did so again on its second run.
+    fn reruns_settle(&self) -> bool {
+        !matches!(
+            self.store
+                .file_hash_cache()
+                .get_input_prediction(&self.unsettled_identity()),
+            Ok(Some(_))
+        )
+    }
+
+    fn mark_unsettled(&self) {
+        let _ = self.store.file_hash_cache().put_input_prediction(
+            &self.unsettled_identity(),
+            PREDICTION_SCHEMA,
+            Some(CRATE_NAME),
+            "{}",
+        );
+    }
+
+    fn unsettled_identity(&self) -> String {
+        format!("{UNSETTLED_PREFIX}{}", self.identity())
+    }
+
     fn record(
         &self,
         stdout: &[u8],
@@ -1322,7 +1424,7 @@ impl Run {
                 Vec::new()
             };
             if modified_since(&path, &excluded, started)? {
-                anyhow::bail!("a declared input changed while the script ran");
+                return Err(InputsChanged.into());
             }
         }
         let OutDirContents {
@@ -2933,6 +3035,19 @@ mod tests {
         assert!(identity.len() > PREDICTION_PREFIX.len() + 32);
         assert_eq!(identity, a.identity(), "stable across calls");
         assert_ne!(identity, run("bbbb").identity());
+        // The unsettled marker is its own row, per binary.
+        assert_eq!(
+            a.unsettled_identity(),
+            format!("{UNSETTLED_PREFIX}{identity}")
+        );
+        assert!(a.reruns_settle(), "no marker yet");
+        a.mark_unsettled();
+        assert!(!a.reruns_settle());
+        assert!(run("bbbb").reruns_settle());
+        assert!(
+            a.prediction().unwrap().is_none(),
+            "the marker is no prediction"
+        );
     }
 
     /// A `links` dependency hands its outputs down as `DEP_*` paths. What is

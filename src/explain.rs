@@ -62,6 +62,7 @@ pub(crate) fn fix(cause: &Cause, max_size: u64) -> String {
                 changed.join(", ")
             )
         }
+        Cause::OtherCheckout { groups, .. } => checkout_fix(groups),
         Cause::NoHistory => {
             "first build of these crates in this tree; the next build can reuse them".to_string()
         }
@@ -70,6 +71,49 @@ pub(crate) fn fix(cause: &Cause, max_size: u64) -> String {
                 .to_string()
         }
     }
+}
+
+/// What would let a second checkout reuse what another one built, from the
+/// key input groups that differ between them.
+///
+/// Rust output already leaves the checkout out: kache remaps its paths. So for
+/// two checkouts of one commit, a differing group is a path kache does not map
+/// (a source, environment value, flag or link path outside the roots it knows)
+/// or a file a build script generated with the checkout's path or a timestamp
+/// in it, typically a C or C++ library.
+fn checkout_fix(groups: &[String]) -> String {
+    let has = |name: &str| groups.iter().any(|group| group == name);
+    let mut advice: Vec<String> = Vec::new();
+    if ["sources", "env_deps", "args", "link"]
+        .iter()
+        .any(|g| has(g))
+    {
+        advice.push(
+            "set `KACHE_BASE_DIR` to the checkout root so paths outside the ones kache maps stop naming the checkout"
+                .to_string(),
+        );
+    }
+    if has("sources") || has("link") {
+        advice.push(
+            "if a build script compiles C or C++, add `-ffile-prefix-map=$PWD=.` to `CFLAGS` and `CXXFLAGS` and set `ZERO_AR_DATE=1` and `SOURCE_DATE_EPOCH`, so what it generates stops recording the checkout"
+                .to_string(),
+        );
+    }
+    if has("remap") {
+        advice.push(
+            "path remapping differs between the checkouts (`KACHE_RUSTC_PATH_NORMALIZE`)"
+                .to_string(),
+        );
+    }
+    for group in groups {
+        if !["sources", "env_deps", "args", "link", "remap"].contains(&group.as_str()) {
+            advice.push(input_words(group).to_string());
+        }
+    }
+    format!(
+        "if both checkouts are at the same commit: {}; `kache explain <crate>` names the input",
+        advice.join("; ")
+    )
 }
 
 /// A cache-key input group in words.
@@ -429,6 +473,38 @@ mod tests {
             "its source files changed, an environment variable it reads changed; `kache explain <crate>` names the exact input"
         );
         assert!(fix(&Cause::NoHistory, max).starts_with("first build"));
+        let checkout = |groups: &[&str]| {
+            fix(
+                &Cause::OtherCheckout {
+                    groups: groups.iter().map(|g| g.to_string()).collect(),
+                    baseline_root: "/a".into(),
+                },
+                max,
+            )
+        };
+        // A path kache does not map: the base dir, and nothing about C.
+        let env = checkout(&["env_deps"]);
+        assert!(
+            env.starts_with("if both checkouts are at the same commit: "),
+            "{env}"
+        );
+        assert!(env.contains("KACHE_BASE_DIR"), "{env}");
+        assert!(!env.contains("-ffile-prefix-map"), "{env}");
+        // A differing source or link input can also be a generated C library.
+        for group in ["sources", "link"] {
+            let text = checkout(&[group]);
+            assert!(text.contains("KACHE_BASE_DIR"), "{text}");
+            assert!(text.contains("-ffile-prefix-map=$PWD=."), "{text}");
+            assert!(text.contains("ZERO_AR_DATE=1"), "{text}");
+        }
+        assert!(checkout(&["args"]).contains("KACHE_BASE_DIR"));
+        let remap = checkout(&["remap"]);
+        assert!(remap.contains("KACHE_RUSTC_PATH_NORMALIZE"), "{remap}");
+        assert!(!remap.contains("KACHE_BASE_DIR"), "{remap}");
+        // A group no path explains is named, not dressed up as one.
+        let edition = checkout(&["crate"]);
+        assert!(edition.contains("edition"), "{edition}");
+        assert!(!edition.contains("KACHE_BASE_DIR"), "{edition}");
         assert!(fix(&Cause::Unexplained, max).contains("explain_miss"));
         for (group, words) in [
             ("args", "flags"),

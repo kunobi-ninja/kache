@@ -395,6 +395,14 @@ pub(crate) enum Cause {
     Downstream { root: String, complete: bool },
     /// This crate's own key inputs changed; the groups that moved.
     OwnInputs(Vec<String>),
+    /// The first build of this crate in its tree, whose own key inputs differ
+    /// from the same unit built in another checkout (`baseline_root`). Two
+    /// checkouts of one commit hash the same inputs, so for them each group
+    /// here carries a path or a timestamp that came from the checkout.
+    OtherCheckout {
+        groups: Vec<String>,
+        baseline_root: String,
+    },
     /// No earlier compile of this crate in this build tree is in the loaded
     /// history. A cold cache or the `--since` cutoff; the events cannot tell.
     NoHistory,
@@ -422,6 +430,13 @@ impl Cause {
                 complete: false,
             } => format!("downstream of {root} (and more; cascade not fully resolved)"),
             Cause::OwnInputs(groups) => format!("own inputs changed: {}", groups.join(", ")),
+            Cause::OtherCheckout {
+                groups,
+                baseline_root,
+            } => format!(
+                "differs from the build in {baseline_root}: {}",
+                groups.join(", ")
+            ),
             Cause::NoHistory => "no earlier compile in the loaded history".to_string(),
             Cause::Unexplained => "unexplained (no key diff recorded)".to_string(),
         }
@@ -685,7 +700,10 @@ fn cause_of(events: &[BuildEvent], index: usize, history: &History) -> Cause {
     if let Some(checkout) = miss_chain::compare_checkout(events, index)
         && checkout.verdict == miss_chain::CheckoutVerdict::OwnInputs
     {
-        return Cause::OwnInputs(checkout.groups);
+        return Cause::OtherCheckout {
+            groups: checkout.groups,
+            baseline_root: checkout.baseline_root,
+        };
     }
     if event.root.is_empty() {
         // "Here" has no identity; two unknown-root events with one crate
@@ -712,6 +730,32 @@ pub(crate) fn unexplained_misses(events: &[BuildEvent], indices: &[usize]) -> us
             is_miss(&events[index]) && cause_of(events, index, &history) == Cause::Unexplained
         })
         .count()
+}
+
+/// Misses in `indices` that differ from the same unit built in another
+/// checkout, with that checkout when every one of them names the same.
+pub(crate) fn other_checkout_misses(
+    events: &[BuildEvent],
+    indices: &[usize],
+) -> (usize, Option<String>) {
+    let history = History::of(events);
+    let mut count = 0;
+    let mut baseline: Option<String> = None;
+    let mut several = false;
+    for &index in indices {
+        if !is_miss(&events[index]) {
+            continue;
+        }
+        if let Cause::OtherCheckout { baseline_root, .. } = cause_of(events, index, &history) {
+            count += 1;
+            match &baseline {
+                None => baseline = Some(baseline_root),
+                Some(seen) if *seen != baseline_root => several = true,
+                Some(_) => {}
+            }
+        }
+    }
+    (count, baseline.filter(|_| !several))
 }
 
 /// Lookups in `indices` that missed.
@@ -1281,14 +1325,36 @@ mod tests {
         );
         assert_eq!(
             cause_of_crate("leaf"),
-            Some(Cause::OwnInputs(vec!["sources".into()])),
+            Some(Cause::OtherCheckout {
+                groups: vec!["sources".into()],
+                baseline_root: "/first".into(),
+            }),
             "{:?}",
             analysis.causes
+        );
+        assert_eq!(
+            cause_of_crate("leaf").unwrap().describe(),
+            "differs from the build in /first: sources"
+        );
+
+        // `kache doctor` counts the second tree's misses that trace to the
+        // first: the leaf, not the crate downstream of it.
+        let second: Vec<usize> = (0..events.len())
+            .filter(|&i| events[i].root == "/second")
+            .collect();
+        assert_eq!(
+            other_checkout_misses(&events, &second),
+            (1, Some("/first".to_string()))
         );
 
         // Same inputs in both trees: nothing to name, so no cause is invented.
         let mut events = build("/first", "before", 0, "1111", "aaaa");
         events.extend(build("/second", "now", 100, "1111", "bbbb"));
+        let second: Vec<usize> = (0..events.len())
+            .filter(|&i| events[i].root == "/second")
+            .collect();
+        assert_eq!(other_checkout_misses(&events, &second), (0, None));
+
         let analysis = analyze_one(&events);
         let leaf = analysis
             .causes
@@ -1296,6 +1362,27 @@ mod tests {
             .find(|g| g.examples.iter().any(|e| e == "leaf"))
             .unwrap();
         assert_eq!(leaf.cause, Cause::NoHistory);
+
+        // Each crate last built in a different checkout: both counted, and no
+        // single checkout to name.
+        let single = |name: &str, root: &str, session: &str, at: i64, sources: &str| {
+            let mut e = unit(
+                with_fields(
+                    with_externs(event(name, EventResult::Miss, at, root, session), &[]),
+                    &[("sources", sources)],
+                ),
+                &format!("u{name}"),
+            );
+            e.key_externs_recorded = true;
+            e
+        };
+        let events = vec![
+            single("one", "/first", "a", 0, "1111"),
+            single("two", "/third", "b", 10, "3333"),
+            single("one", "/second", "now", 100, "2222"),
+            single("two", "/second", "now", 101, "4444"),
+        ];
+        assert_eq!(other_checkout_misses(&events, &[2, 3]), (2, None));
     }
 
     /// A miss below two changed leaves names both, not the first one the

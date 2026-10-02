@@ -25,11 +25,6 @@ clean = "make clean"
 [diff]
 artifacts = ["build/a/util.obj", "build/b/util.obj"]
 
-[modify]
-file = "src/a/util.h"
-find = "v1"
-replace = "v2"
-
 # Cold: two translation units, two compiles. A shared entry shows up here as
 # a hit for the second copy.
 [assertions.cold]
@@ -44,12 +39,5 @@ max_compiler_runs = 0
 [assertions.noop]
 should_not_recompile = false
 
-[assertions.relocate]
-min_hits = 2
-max_compiler_runs = 0
-
-# Relocate-modified: the edited copy misses; the other still hits.
-[assertions.relocate-modified]
-min_misses = 1
-max_misses = 1
-max_compiler_runs = 1
+# No relocate assertions: on Windows clang-cl keys are path-literal
+# (#299/#312), so a relocated build misses there by design.

@@ -1,12 +1,12 @@
 # kache-e2e fixture: a compile-first miss whose entry already exists
 # (kunobi-ninja/kache#1390).
 #
-# src/util.c is compiled twice, through `cc` and `/usr/bin/cc` (`cc.exe` on
-# Windows). The object
-# key is the same for both; the preprocessor memo key folds the compiler's
-# spelling, so the second compile finds no memo, compiles first, and then
-# finds the entry the first compile committed. It must still record its
-# memo. Without it, every later build compiles build/b/util.o again.
+# src/util.c is compiled twice, the second time with
+# -fdiagnostics-color=never. The object key is the same for both; the
+# preprocessor memo key folds the argv, so the second compile finds no memo,
+# compiles first, and then finds the entry the first compile committed. It
+# must still record its memo. Without it, every later build compiles
+# build/b/util.o again.
 #
 # The same state arises when a memo is pruned or retired while its entry
 # stays in the cache.
@@ -20,12 +20,7 @@ path = "source"
 
 [env]
 CC = "$KACHE cc"
-CC_ALT = "$KACHE /usr/bin/cc"
 KACHE_DEFERRED_DISCOVERY = "1"
-
-# No /usr/bin/cc on Windows; `cc.exe` is another spelling of the same driver.
-[windows.env]
-CC_ALT = "$KACHE cc.exe"
 
 [commands]
 build = "make"

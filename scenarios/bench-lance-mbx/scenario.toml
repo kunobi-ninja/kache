@@ -35,6 +35,10 @@ setup = [
 # prost-build, CARGO_MANIFEST_DIR) portable across the two clones so the
 # headline cross-clone metric is measuring kache, not path baking.
 build = """
+# mbx's own workspace-root mapping, the counterpart of the KACHE_BASE_DIR the
+# Kache arm of this subject sets: without it a crate rebuilt in the second
+# checkout records that checkout, and everything above it misses.
+export MBX_SHARE_WORKSPACE_ROOT=1
 src="$(pwd -P)"
 cargo build --release -p lance
 """

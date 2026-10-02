@@ -551,7 +551,12 @@ def main():
         help="mbx binary to measure as well; without it there is no mbx arm",
     )
     parser.add_argument("--samples", type=int, choices=range(1, 21), default=1)
-    parser.add_argument("--order-seed", type=int, default=0)
+    parser.add_argument(
+        "--order-seed",
+        type=int,
+        default=int(os.environ.get("BENCH_ORDER_SEED") or 0),
+        help="which tool goes first in the first sample (default: $BENCH_ORDER_SEED, else 0). The nightly passes its run number, so the tool that measures cold first changes from night to night",
+    )
     parser.add_argument(
         "--contention-samples",
         type=int,

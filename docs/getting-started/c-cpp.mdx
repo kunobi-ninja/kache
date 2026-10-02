@@ -26,7 +26,7 @@ Open a new terminal after setup, or run the activation command printed by init i
 Use `kache init --no-shell` to leave terminal setup alone while configuring Cargo. For managed dotfiles or another shell, use the manual setup:
 
 ```bash
-kache install-shims
+kache init --shims
 export PATH="$HOME/.local/lib/kache/shims:$PATH"
 ```
 
@@ -45,13 +45,13 @@ export PATH="/usr/lib/kache:$PATH"
 
 Nix packages include the same symlinks in `${kache}/shims`, also available at `${kache}/lib/kache`. Add that directory to `PATH` using the [Nix configuration example](/docs/getting-started/installation#nix); no `kache install-shims` step is needed.
 
-`kache install-shims` creates `cargo`, `cc`, `c++`, `gcc`, `g++`, `clang`, `clang++`, and `rustdoc`. Keep the real compilers later in `PATH`. When Kache looks for the real compiler it skips any entry that resolves to itself or to a binary named `kache`. It also skips every entry in a directory that holds a `.kache-shims` file. The packages write that file, and `kache install-shims` does when the directory holds only Kache links, so one Kache install on `PATH` never runs another as the compiler. Keep the shim directory for shims only.
+`kache init --shims` creates `cargo`, `cc`, `c++`, `gcc`, `g++`, `clang`, `clang++`, and `rustdoc`. Keep the real compilers later in `PATH`. When Kache looks for the real compiler it skips any entry that resolves to itself or to a binary named `kache`. It also skips every entry in a directory that holds a `.kache-shims` file. The packages write that file, and `kache install-shims` does when the directory holds only Kache links, so one Kache install on `PATH` never runs another as the compiler. Keep the shim directory for shims only.
 
 Versioned and target-prefixed names (`gcc-13`, `x86_64-pc-linux-gnu-gcc`) work if you create them by hand or scan `PATH`:
 
 ```bash
-kache install-shims --from-path
-kache install-shims --force ~/.local/lib/kache/shims
+kache init --shims --from-path
+kache init --shims --force
 ```
 
 Omitting the directory uses `~/.local/lib/kache/shims`. `--from-path` adds a symlink for every compiler-shaped name already on `PATH` that is not Kache itself.
@@ -64,15 +64,15 @@ Kache is a larger process than ccache. On a tree of many tiny `.c` files, measur
 
 ### Upgrades
 
-The shims link to a path that keeps working after Kache is upgraded. `install-shims` checks these in order and uses the first one that reaches the running binary:
+The shims link to a path that keeps working after Kache is upgraded. `kache init --shims` checks these in order and uses the first one that reaches the running binary:
 
 1. The installer's alias: Homebrew's `opt/<formula>/bin/kache`, a Nix profile such as `~/.nix-profile/bin/kache`, or mise's `installs/<tool>/latest` (under `MISE_INSTALLS_DIR` when set). The Homebrew and mise aliases must be the installer's symlinks; a copy does not count.
 2. The first `kache` on `PATH`, skipping relative entries, version directories (mise and asdf `installs/<version>`, Homebrew kegs, `/nix/store`, pinned Nix generations such as `profile-12-link`), the mise and asdf shim directories, and marked shim directories. A `PATH` entry that is a link into one of those directories is skipped too.
-3. The running binary's own path. `install-shims` then says to rerun it after each upgrade. asdf installs usually end up here, since asdf keeps no alias for a version.
+3. The running binary's own path. `kache init --shims` then says to rerun it after each upgrade. asdf installs usually end up here, since asdf keeps no alias for a version.
 
 `kache doctor` shows the chosen path under "Install path", with the installer and whether the path survives an upgrade.
 
-If the binary a shim points at is removed, the shell skips the link and builds run the real compiler uncached. Doctor then reports the farm as broken. Run `kache install-shims` again. In a directory Kache owns (it created it, it carries a `.kache-shims` marker, or it holds only Kache links), a rerun replaces Kache links whose target is missing or not executable, and moves Kache links that point into a version directory to the upgrade-safe path when there is one. It needs no `--force` for either. Links to anything else, and other files, are left alone.
+If the binary a shim points at is removed, the shell skips the link and builds run the real compiler uncached. Doctor then reports the farm as broken. Run `kache init --shims` again. In a directory Kache owns (it created it, it carries a `.kache-shims` marker, or it holds only Kache links), a rerun replaces Kache links whose target is missing or not executable, and moves Kache links that point into a version directory to the upgrade-safe path when there is one. It needs no `--force` for either. Links to anything else, and other files, are left alone.
 
 ## Prefix method
 
@@ -94,7 +94,7 @@ For clang-cl driver mode:
 $env:CC = "kache clang-cl"
 ```
 
-Windows has no `install-shims` generator yet. Use `CC`/`CXX`, or copy `kache.exe` to `gcc.exe` and put that directory first on `PATH`. Create an empty `.kache-shims` file in that directory as well, so another Kache install does not mistake the copies for compilers.
+Windows has no shim generator yet. Use `CC`/`CXX`, or copy `kache.exe` to `gcc.exe` and put that directory first on `PATH`. Create an empty `.kache-shims` file in that directory as well, so another Kache install does not mistake the copies for compilers.
 
 ## Cached invocations
 

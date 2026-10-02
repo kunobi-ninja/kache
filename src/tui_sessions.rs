@@ -384,6 +384,9 @@ pub(crate) enum Cause {
     /// An entry for this exact key existed but could not serve the
     /// invocation (kunobi-ninja/kache#655).
     LookupRejected(String),
+    /// The exact key was stored or served earlier, so nothing in its inputs
+    /// changed: the entry was evicted, or never reached this machine.
+    Evicted,
     /// Downstream of dependencies whose artifacts changed; `root` names the
     /// crates at the bottom of the cascade, resolved ones first
     /// (kunobi-ninja/kache#609). `complete` is false when the walk was cut
@@ -407,6 +410,9 @@ impl Cause {
         match self {
             Cause::StoreFailed(reason) => format!("compiled but not cached: {reason}"),
             Cause::LookupRejected(reason) => format!("entry rejected at lookup: {reason}"),
+            Cause::Evicted => {
+                "built before with this exact key, but the entry was gone".to_string()
+            }
             Cause::Downstream {
                 root,
                 complete: true,
@@ -424,7 +430,10 @@ impl Cause {
     /// Whether the cause is a caching failure rather than a changed input:
     /// something to fix, not something that changed.
     pub(crate) fn is_failure(&self) -> bool {
-        matches!(self, Cause::StoreFailed(_) | Cause::LookupRejected(_))
+        matches!(
+            self,
+            Cause::StoreFailed(_) | Cause::LookupRejected(_) | Cause::Evicted
+        )
     }
 }
 
@@ -498,24 +507,12 @@ pub(crate) fn analyze_session(
         .skip(misses_total.saturating_sub(MAX_ANALYZED_MISSES))
         .collect();
 
-    // The history test asks "was this crate compiled in this tree before
-    // index i". One pass over the log answers it for every miss at once
-    // instead of rescanning the prefix per miss.
-    let mut first_compile: HashMap<(&str, &str), usize> = HashMap::new();
-    for (index, event) in events.iter().enumerate() {
-        let compiled = is_lookup(event)
-            || (matches!(event.result, EventResult::Passthrough) && !is_probe(event));
-        if compiled && !event.root.is_empty() {
-            first_compile
-                .entry((event.root.as_str(), event.crate_name.as_str()))
-                .or_insert(index);
-        }
-    }
+    let history = History::of(events);
 
     let mut groups: BTreeMap<Cause, CauseGroup> = BTreeMap::new();
     for &index in &analyzed {
         let event = &events[index];
-        let cause = cause_of(events, index, &first_compile);
+        let cause = cause_of(events, index, &history);
         let group = groups.entry(cause.clone()).or_insert_with(|| CauseGroup {
             cause,
             count: 0,
@@ -586,17 +583,71 @@ pub(crate) fn passthrough_parts(reason: &str) -> (&str, &str) {
     }
 }
 
-fn cause_of(
-    events: &[BuildEvent],
-    index: usize,
-    first_compile: &HashMap<(&str, &str), usize>,
-) -> Cause {
+/// What the log knew before each event, built in one pass so every miss is
+/// classified without rescanning the prefix.
+struct History<'a> {
+    /// First compile of each crate in each build tree.
+    first_compile: HashMap<(&'a str, &'a str), usize>,
+    /// First event that stored or served each cache key.
+    first_stored: HashMap<&'a str, usize>,
+}
+
+impl<'a> History<'a> {
+    fn of(events: &'a [BuildEvent]) -> Self {
+        let mut first_compile = HashMap::new();
+        let mut first_stored = HashMap::new();
+        for (index, event) in events.iter().enumerate() {
+            let compiled = is_lookup(event)
+                || (matches!(event.result, EventResult::Passthrough) && !is_probe(event));
+            if compiled && !event.root.is_empty() {
+                first_compile
+                    .entry((event.root.as_str(), event.crate_name.as_str()))
+                    .or_insert(index);
+            }
+            if stored_or_served(event) {
+                first_stored
+                    .entry(event.cache_key.as_str())
+                    .or_insert(index);
+            }
+        }
+        Self {
+            first_compile,
+            first_stored,
+        }
+    }
+
+    /// Whether a lookup before `index` stored or served `key`.
+    fn stored_before(&self, key: &str, index: usize) -> bool {
+        !key.is_empty()
+            && self
+                .first_stored
+                .get(key)
+                .is_some_and(|&first| first < index)
+    }
+}
+
+/// A lookup that left its key in the store: a hit, or a miss whose result
+/// was stored.
+fn stored_or_served(event: &BuildEvent) -> bool {
+    match event.result {
+        EventResult::LocalHit | EventResult::PrefetchHit | EventResult::RemoteHit => true,
+        EventResult::Miss => event.store_error.is_empty(),
+        _ => false,
+    }
+}
+
+fn cause_of(events: &[BuildEvent], index: usize, history: &History) -> Cause {
     let event = &events[index];
     if !event.store_error.is_empty() {
         return Cause::StoreFailed(event.store_error.clone());
     }
     if !event.lookup_rejection.is_empty() {
         return Cause::LookupRejected(event.lookup_rejection.clone());
+    }
+    // A duplicate store is a concurrent compile of a key another build just
+    // stored; only a plain miss of a known key means the entry went away.
+    if matches!(event.result, EventResult::Miss) && history.stored_before(&event.cache_key, index) {
+        return Cause::Evicted;
     }
     if let Some(chain) = miss_chain::analyze(events, index)
         && !chain.roots.is_empty()
@@ -641,7 +692,8 @@ fn cause_of(
         // name may be unrelated workspaces.
         return Cause::Unexplained;
     }
-    let seen_before = first_compile
+    let seen_before = history
+        .first_compile
         .get(&(event.root.as_str(), event.crate_name.as_str()))
         .is_some_and(|&first| first < index);
     if seen_before {
@@ -653,20 +705,11 @@ fn cause_of(
 
 /// Misses in `indices` whose cause is [`Cause::Unexplained`].
 pub(crate) fn unexplained_misses(events: &[BuildEvent], indices: &[usize]) -> usize {
-    let mut first_compile: HashMap<(&str, &str), usize> = HashMap::new();
-    for (index, event) in events.iter().enumerate() {
-        let compiled = is_lookup(event)
-            || (matches!(event.result, EventResult::Passthrough) && !is_probe(event));
-        if compiled && !event.root.is_empty() {
-            first_compile
-                .entry((event.root.as_str(), event.crate_name.as_str()))
-                .or_insert(index);
-        }
-    }
+    let history = History::of(events);
     indices
         .iter()
         .filter(|&&index| {
-            is_miss(&events[index]) && cause_of(events, index, &first_compile) == Cause::Unexplained
+            is_miss(&events[index]) && cause_of(events, index, &history) == Cause::Unexplained
         })
         .count()
 }
@@ -783,6 +826,46 @@ mod tests {
 
     fn gap() -> Duration {
         Duration::from_secs(300)
+    }
+
+    #[test]
+    fn a_miss_of_a_key_stored_before_is_an_eviction() {
+        let keyed = |result: EventResult, at: i64, key: &str| {
+            let mut e = event("a", result, at, "/w", "s1");
+            e.cache_key = key.to_string();
+            e
+        };
+        let mut failed = keyed(EventResult::Miss, 3, "k2");
+        failed.store_error = "disk full".to_string();
+        let events = vec![
+            keyed(EventResult::LocalHit, 1, "k1"),
+            keyed(EventResult::Miss, 2, "k1"),
+            failed,
+            keyed(EventResult::Miss, 4, "k2"),
+            keyed(EventResult::Dup, 5, "k1"),
+            keyed(EventResult::Miss, 6, "k3"),
+            keyed(EventResult::Miss, 7, "k3"),
+            keyed(EventResult::Miss, 8, ""),
+            keyed(EventResult::Miss, 9, ""),
+        ];
+        let history = History::of(&events);
+        let cause = |index| cause_of(&events, index, &history);
+        assert_eq!(cause(1), Cause::Evicted, "served before, missed now");
+        assert_ne!(
+            cause(3),
+            Cause::Evicted,
+            "a failed store left nothing to evict"
+        );
+        assert_ne!(
+            cause(4),
+            Cause::Evicted,
+            "a duplicate store is not a lost entry"
+        );
+        assert_ne!(cause(5), Cause::Evicted, "the first stored miss");
+        assert_eq!(cause(6), Cause::Evicted, "stored by the miss before it");
+        assert_ne!(cause(8), Cause::Evicted, "no key, no identity");
+        assert!(Cause::Evicted.is_failure());
+        assert!(Cause::Evicted.describe().contains("exact key"));
     }
 
     #[test]

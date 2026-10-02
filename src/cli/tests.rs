@@ -1864,7 +1864,7 @@ fn evicting_nothing_because_everything_is_pinned_explains_itself() {
         "must name the grace period so the wait is bounded and knowable: {msg}"
     );
     assert!(
-        msg.contains("Re-run"),
+        msg.contains("Run it again once builds and uploads are idle"),
         "must tell the user what to do next: {msg}"
     );
     assert!(
@@ -1918,7 +1918,8 @@ fn fully_retained_eviction_has_a_cleanup_path() {
     stats.entries_unreclaimable = 1;
     let msg = describe_eviction(&stats, false);
     assert!(msg.contains("1 entry cloned"), "{msg}");
-    assert!(msg.contains("clean --tracked"), "{msg}");
+    assert!(msg.contains("kache clean --stale 14d --dry-run"), "{msg}");
+    assert!(msg.contains("then run it again"), "{msg}");
 
     stats.bytes_held = 3 * 1024 * 1024 * 1024;
     let msg = describe_eviction(&stats, false);
@@ -6436,11 +6437,20 @@ fn render_clean_dry_run_formats_plural_profiles_and_fallback_paths() {
     }];
     let none = std::collections::HashSet::new();
     let single_out = render_clean_dry_run(&single, root, &none).join("\n");
-    assert!(single_out.contains("Found 1 target/ directory"));
-    assert!(single_out.contains("proj/target"));
-    assert!(single_out.contains("[debug]"));
-    assert!(single_out.contains("Dry run: estimated to free 512 B"));
-    assert!(single_out.contains("(512 B of apparent size is shared, sparse, or duplicate)"));
+    assert!(
+        single_out.starts_with(
+            "Remove   1 target directory under /work · 1.0 KiB on disk · 512 B freeable"
+        ),
+        "{single_out}"
+    );
+    assert!(
+        single_out.contains("   512 B   1.0 KiB    512 B   proj/target  [debug]"),
+        "{single_out}"
+    );
+    assert!(
+        single_out.ends_with("`kache clean /work --yes` removes them."),
+        "{single_out}"
+    );
 
     let many = vec![
         TargetEntry {
@@ -6469,11 +6479,20 @@ fn render_clean_dry_run_formats_plural_profiles_and_fallback_paths() {
     let orphaned = [std::path::PathBuf::from("/outside/proj-b/target")].into();
     let marked = render_clean_dry_run(&many, root, &orphaned).join("\n");
     assert_eq!(marked.matches("(worktree deleted)").count(), 1, "{marked}");
-    assert!(many_out.contains("Found 2 target/ directories"));
-    assert!(many_out.contains("/outside/proj-b/target"));
-    assert!(many_out.contains("Dry run: estimated to free 25 B"));
-    assert!(many_out.contains("(5 B of apparent size is shared, sparse, or duplicate)"));
-    assert!(!many_out.contains("estimated to free 30 B"));
+    assert!(
+        many_out.starts_with(
+            "Remove   2 target directories under /work · 30 B on disk · 25 B freeable"
+        ),
+        "{many_out}"
+    );
+    assert!(
+        many_out.contains("  proj-a/target\n"),
+        "relative under the root: {many_out}"
+    );
+    assert!(
+        many_out.contains("/outside/proj-b/target  [release]"),
+        "{many_out}"
+    );
 }
 
 #[test]
@@ -7151,4 +7170,272 @@ fn a_quiet_gc_the_user_asked_for_is_requested() {
     assert_eq!(GcMode::Cli.sweep_origin(), SweepOrigin::Requested);
     assert_eq!(GcMode::CliQuiet.sweep_origin(), SweepOrigin::Requested);
     assert_eq!(GcMode::Background.sweep_origin(), SweepOrigin::Automatic);
+}
+
+#[test]
+fn clean_names_its_window_and_the_command_that_repeats_it() {
+    assert_eq!(window_label(336), "14d");
+    assert_eq!(window_label(24), "1d");
+    assert_eq!(window_label(36), "36h");
+    assert_eq!(window_label(0), "0h");
+    let default = TrackedSelection::StaleOrOrphaned(DEFAULT_TRACKED_STALE_HOURS);
+    assert_eq!(clean_command(default), "kache clean --yes");
+    assert_eq!(
+        clean_command(TrackedSelection::StaleOrOrphaned(48)),
+        "kache clean --stale 2d --yes"
+    );
+    assert_eq!(
+        clean_command(TrackedSelection::Orphaned),
+        "kache clean --orphans --yes"
+    );
+    assert_eq!(selection_words(TrackedSelection::Orphaned), "worktree gone");
+    assert_eq!(
+        selection_words(default),
+        "worktree gone, or no build in 14d"
+    );
+    assert!(nothing_to_clean(default).contains("built within 14d"));
+    assert!(nothing_to_clean(default).contains("--stale 7d"));
+    assert!(nothing_to_clean(TrackedSelection::Orphaned).contains("still there"));
+}
+
+#[test]
+fn a_removal_summary_counts_directories_and_names_shared_bytes_only_when_there_are_some() {
+    assert_eq!(
+        removal_summary(1, 2048, 0),
+        "Removed 1 target directory, about 2.0 KiB freed."
+    );
+    assert_eq!(
+        removal_summary(2, 0, 512),
+        "Removed 2 target directories, about 0 B freed. Another 512 B of their size was shared, sparse, or duplicate."
+    );
+}
+
+#[test]
+fn the_clean_preview_splits_what_goes_from_what_stays() {
+    let gone = row("/wt/gone", TargetState::WorktreeDeleted, 1024);
+    let busy = row("/wt/busy", TargetState::Live, 2048);
+    let empty = row("/wt/empty", TargetState::Live, 0);
+    let rows = vec![busy.clone(), gone.clone(), empty];
+    let remove: std::collections::HashSet<String> = [gone.path.clone()].into();
+    let skipped = vec![CleanSkipped {
+        path: "/wt/here/target".into(),
+        reason: "belongs to the current workspace".into(),
+    }];
+    let cache = CacheLine {
+        bytes: 3 << 20,
+        limit: 5 << 30,
+        entries: 1_234,
+    };
+    let default = TrackedSelection::StaleOrOrphaned(DEFAULT_TRACKED_STALE_HOURS);
+    let lines = plan_lines(&rows, &remove, &skipped, default, &cache);
+    assert_eq!(
+        lines[0],
+        "Remove   1 target · 1.0 KiB freeable · worktree gone, or no build in 14d"
+    );
+    assert!(
+        lines[2].ends_with("/wt/gone/target  (worktree deleted)"),
+        "{lines:#?}"
+    );
+    let keep = lines
+        .iter()
+        .position(|line| line.starts_with("Keep"))
+        .unwrap();
+    assert_eq!(lines[keep], "Keep     2 targets · 2.0 KiB freeable");
+    assert!(lines[keep + 2].ends_with("/wt/busy/target"), "{lines:#?}");
+    assert!(lines.contains(&"  + 1 more with nothing to free".to_string()));
+    assert!(lines.contains(&"  /wt/here/target   belongs to the current workspace".to_string()));
+    assert!(lines.contains(&"Cache    3.0 MiB of 5.0 GiB · 1,234 entries · kept under its limit automatically; `kache clean --cache` empties it".to_string()));
+    assert_eq!(
+        lines.last().unwrap(),
+        "Dry run, nothing removed. `kache clean --yes` removes the 1 target above."
+    );
+
+    let none = plan_lines(
+        &rows,
+        &Default::default(),
+        &[],
+        TrackedSelection::Orphaned,
+        &cache,
+    );
+    assert_eq!(
+        none[0],
+        "Remove   nothing: no target matches (worktree gone)"
+    );
+    assert!(!none.iter().any(|line| line == "Skipped"));
+    assert_eq!(
+        none.last().unwrap(),
+        "Dry run, nothing removed. `--stale 7d` widens the window."
+    );
+}
+
+#[test]
+fn cache_cleaning_previews_without_removing_and_removes_on_yes() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = crate::test_support::test_config(dir.path().join("cache"));
+    put_entry(&config, "k1", "serde", dir.path());
+    put_entry(&config, "k2", "serde", dir.path());
+    put_entry(&config, "k3", "tokio", dir.path());
+    let entries = || Store::open(&config).unwrap().entry_count().unwrap();
+
+    clean_cache(
+        &config,
+        CacheClean::Crate("serde".into()),
+        true,
+        false,
+        false,
+    )
+    .unwrap();
+    clean_cache(&config, CacheClean::All, true, false, false).unwrap();
+    clean_cache(&config, CacheClean::OlderThan(24), true, false, false).unwrap();
+    clean_cache(&config, CacheClean::StaleSchema, true, false, false).unwrap();
+    assert_eq!(entries(), 3, "a dry run removes nothing");
+    assert!(clean_cache(&config, CacheClean::All, false, true, true).is_err());
+    assert_eq!(entries(), 3, "JSON is refused before anything is removed");
+
+    clean_cache(
+        &config,
+        CacheClean::Crate("missing".into()),
+        false,
+        true,
+        false,
+    )
+    .unwrap();
+    clean_cache(
+        &config,
+        CacheClean::Crate("serde".into()),
+        false,
+        true,
+        false,
+    )
+    .unwrap();
+    assert_eq!(entries(), 1, "only serde's entries go");
+    clean_cache(&config, CacheClean::All, false, true, false).unwrap();
+    assert_eq!(entries(), 0);
+}
+
+#[test]
+fn a_cache_preview_says_what_each_clean_would_do() {
+    assert_eq!(
+        cache_preview(&CacheClean::OlderThan(48), 3, 2048),
+        "Cache is 2.0 KiB in 3 entries. This would evict the entries older than 2d."
+    );
+    assert!(cache_preview(&CacheClean::StaleSchema, 3, 2048).contains("not keyed by schema"));
+    assert_eq!(
+        cache_preview(&CacheClean::All, 1, 1024),
+        "Would remove all 1 cache entry (1.0 KiB)."
+    );
+    assert_eq!(
+        cache_preview(&CacheClean::Crate("serde".into()), 2, 1024),
+        "Would remove 2 cache entries for 'serde' (1.0 KiB)."
+    );
+    assert_eq!(
+        cache_preview(&CacheClean::Crate("serde".into()), 0, 0),
+        "No cache entries for 'serde'."
+    );
+}
+
+#[test]
+fn crate_entries_counts_only_that_crate() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = crate::test_support::test_config(dir.path().join("cache"));
+    put_entry(&config, "k1", "serde", dir.path());
+    put_entry(&config, "k2", "serde", dir.path());
+    put_entry(&config, "k3", "tokio", dir.path());
+    let store = Store::open(&config).unwrap();
+    let (serde, serde_bytes) = crate_entries(&store, "serde").unwrap();
+    assert_eq!(serde, 2);
+    assert!(serde_bytes > 0);
+    assert_eq!(crate_entries(&store, "tokio").unwrap().0, 1);
+    assert_eq!(crate_entries(&store, "missing").unwrap(), (0, 0));
+}
+
+#[test]
+fn clean_yes_removes_a_selected_tracked_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = crate::test_support::test_config(dir.path().join("cache"));
+    let workspace = dir.path().join("ws");
+    let target = workspace.join("target");
+    std::fs::create_dir_all(target.join("debug/deps")).unwrap();
+    std::fs::write(workspace.join("Cargo.toml"), "[package]\nname = \"p\"\n").unwrap();
+    std::fs::write(target.join("CACHEDIR.TAG"), CARGO_CACHEDIR_TAG).unwrap();
+    std::fs::write(target.join("debug/deps/libp.rlib"), vec![1; 4096]).unwrap();
+    Store::open(&config)
+        .unwrap()
+        .remember_target_root(&target, &workspace)
+        .unwrap();
+    let every = CleanScope::Tracked(TrackedSelection::StaleOrOrphaned(0));
+
+    clean(&config, true, true, false, every.clone()).unwrap();
+    assert!(target.exists(), "a dry run removes nothing");
+    clean(&config, false, true, false, every).unwrap();
+    assert!(!target.exists(), "--yes removes what was selected");
+}
+
+#[test]
+fn removal_asks_only_at_a_terminal() {
+    let never = |_: &str| -> Result<bool> { panic!("asked without a terminal") };
+    assert!(confirm_removal_with("Remove?", true, false, never).unwrap());
+    assert!(!confirm_removal_with("Remove?", false, false, never).unwrap());
+    assert!(confirm_removal_with("Remove?", false, true, |_| Ok(true)).unwrap());
+    assert!(!confirm_removal_with("Remove?", false, true, |_| Ok(false)).unwrap());
+}
+
+#[test]
+fn a_cache_clean_decides_from_what_it_counted() {
+    let serde = || CacheClean::Crate("serde".into());
+    assert_eq!(
+        cache_action(serde(), 2, 1024, true, false).unwrap(),
+        CacheAction::Say("Would remove 2 cache entries for 'serde' (1.0 KiB).".into())
+    );
+    assert_eq!(
+        cache_action(serde(), 0, 0, false, false).unwrap(),
+        CacheAction::Say("No cache entries for 'serde'.".into())
+    );
+    assert_eq!(
+        cache_action(serde(), 2, 1024, false, false).unwrap(),
+        CacheAction::Purge {
+            crate_name: Some("serde".into()),
+            question: "Remove 2 cache entries for 'serde' (1.0 KiB)?".into(),
+        }
+    );
+    assert_eq!(
+        cache_action(CacheClean::All, 3, 2048, false, false).unwrap(),
+        CacheAction::Purge {
+            crate_name: None,
+            question: "Remove all 3 cache entries (2.0 KiB)?".into(),
+        }
+    );
+    assert!(cache_action(CacheClean::All, 3, 2048, false, true).is_err());
+    assert!(cache_action(serde(), 2, 1024, false, true).is_err());
+    assert_eq!(
+        cache_action(CacheClean::OlderThan(24), 3, 0, false, true).unwrap(),
+        CacheAction::Gc {
+            max_age_hours: Some(24),
+            stale_schema: false
+        }
+    );
+    assert_eq!(
+        cache_action(CacheClean::StaleSchema, 3, 0, false, false).unwrap(),
+        CacheAction::Gc {
+            max_age_hours: None,
+            stale_schema: true
+        }
+    );
+}
+
+#[test]
+fn cache_counts_cover_one_crate_or_the_whole_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = crate::test_support::test_config(dir.path().join("cache"));
+    put_entry(&config, "k1", "serde", dir.path());
+    put_entry(&config, "k2", "tokio", dir.path());
+    let store = Store::open(&config).unwrap();
+    assert_eq!(
+        cache_counts(&store, &CacheClean::Crate("serde".into()))
+            .unwrap()
+            .0,
+        1
+    );
+    assert_eq!(cache_counts(&store, &CacheClean::All).unwrap().0, 2);
+    assert!(cache_counts(&store, &CacheClean::All).unwrap().1 > 0);
 }

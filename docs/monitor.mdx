@@ -68,6 +68,6 @@ Narrow terminals drop the least important columns first instead of clipping ever
 ## Triage
 
 - Daemon offline: run `kache daemon status` and inspect `kache daemon log`.
-- Store near its limit: run `kache gc`. If cloned outputs keep entries in place, preview stale targets with `kache clean --tracked --stale 14d --dry-run`.
+- Store near its limit: the daemon evicts entries on its own. If cloned outputs keep entries in place, preview stale targets with `kache clean --stale 14d --dry-run`.
 - No remote activity: check daemon state, credentials, and `kache doctor`.
-- Unexpected misses: run `kache why-miss <crate>`.
+- Unexpected misses: run `kache explain`, or `kache explain <crate>`.

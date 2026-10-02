@@ -45,7 +45,7 @@ Identical output bytes share one blob. Restores first try copy-on-write cloning.
 
 See [Deduplication](/docs/deduplication) for platform details.
 
-A miss stores its outputs without waiting for an fsync. The daemon flushes the new blobs and metadata to disk on a two-second sweep and marks those entries durable, and `kache gc` flushes whatever is still pending. Without a reachable daemon the wrapper flushes the entry itself, so a store used without a daemon does not accumulate unflushed entries. Until an entry is flushed, a hit on it verifies every blob against its content hash before restoring, so a crash in between costs a recompile, never a wrong artifact. `[cache] deferred_durability = false` flushes inside the compile instead.
+A miss stores its outputs without waiting for an fsync. The daemon flushes the new blobs and metadata to disk on a two-second sweep and marks those entries durable, and a GC run flushes whatever is still pending. Without a reachable daemon the wrapper flushes the entry itself, so a store used without a daemon does not accumulate unflushed entries. Until an entry is flushed, a hit on it verifies every blob against its content hash before restoring, so a crash in between costs a recompile, never a wrong artifact. `[cache] deferred_durability = false` flushes inside the compile instead.
 
 ## Daemon
 
@@ -65,7 +65,7 @@ See [Daemon overview](/docs/daemon/overview) and [Lifecycle](/docs/daemon/lifecy
 
 As `RUSTC_WRAPPER`, Kache sees rustc and workspace-wrapper invocations. It does not wrap Cargo itself or arbitrary tools. Rust link work driven by rustc can be cached when the artifact policy allows it; an independently invoked linker is outside this path.
 
-C/C++ caching is separate. Kache must be invoked as the compiler wrapper (`kache cc`) or through a compiler-name shim on `PATH` (`kache install-shims`). Supported object compilations use the same local store and remote pipeline as rustc. clang-cl debug objects stay machine-local. See [C and C++](/docs/getting-started/c-cpp).
+C/C++ caching is separate. Kache must be invoked as the compiler wrapper (`kache cc`) or through a compiler-name shim on `PATH` (`kache init --shims`). Supported object compilations use the same local store and remote pipeline as rustc. clang-cl debug objects stay machine-local. See [C and C++](/docs/getting-started/c-cpp).
 
 ## Planner
 

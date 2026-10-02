@@ -18,6 +18,7 @@ mod daemon;
 mod daemon_publish;
 mod demand;
 mod events;
+mod explain;
 mod extra_inputs;
 mod fallback;
 mod fallback_planner;
@@ -135,7 +136,7 @@ pub const VERSION: &str = {
 #[derive(Parser)]
 #[command(name = "kache", version = VERSION, about)]
 pub(crate) struct Cli {
-    /// Machine-readable JSON on stdout (stats, gc, clean, targets, doctor, why-miss, diff, list, daemon status)
+    /// Machine-readable JSON on stdout, on commands that support it
     #[arg(long, global = true)]
     json: bool,
 
@@ -146,13 +147,15 @@ pub(crate) struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Run Cargo with canonical duplicate Cargo-home rustflags collapsed once
+    #[command(hide = true)]
     Cargo {
         /// Built-in build/check arguments passed verbatim to Cargo (use `--` first)
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<std::ffi::OsString>,
     },
 
-    /// List cache entries, or show details for one crate
+    /// List cache entries, or one crate's entries in detail
+    #[command(display_order = 22)]
     List {
         /// Crate name to show details for (omit to list all)
         crate_name: Option<String>,
@@ -166,7 +169,9 @@ enum Commands {
         no_pager: bool,
     },
 
-    /// Run garbage collection
+    /// Evict cache entries by the size and age limits, as the daemon does.
+    /// Kept for scripts
+    #[command(hide = true)]
     Gc {
         /// Evict entries older than this duration (e.g. 7d, 24h)
         #[arg(long, conflicts_with = "stale_schema")]
@@ -177,48 +182,74 @@ enum Commands {
         stale_schema: bool,
     },
 
-    /// Wipe entire cache or entries for a specific crate
+    /// Remove the whole cache or one crate's entries. Kept for scripts;
+    /// `kache clean --cache` empties the cache too
+    #[command(hide = true)]
     Purge {
         /// Only purge entries for this crate
         #[arg(long)]
         crate_name: Option<String>,
     },
 
-    /// Recursively find and remove target/ directories under the current directory
+    /// Free disk space: remove old target directories, or empty the cache
+    #[command(display_order = 11)]
     Clean {
-        /// Preview what would be removed without deleting (pairs with --yes)
+        /// Look for target/ directories under this directory instead of using
+        /// the ones kache tracks
+        #[arg(value_name = "DIR", conflicts_with_all = ["cache", "crate_name"])]
+        path: Option<PathBuf>,
+
+        /// Show what would be removed and what kache keeps, and remove nothing
         #[arg(long, short = 'n')]
         dry_run: bool,
 
-        /// Non-interactive: remove all target/ directories without the selector.
-        /// For scripts and cron. Preview first with --dry-run.
+        /// Remove without asking. For scripts and cron; preview first with
+        /// --dry-run
         #[arg(long, short = 'y')]
         yes: bool,
 
-        /// Use target directories remembered by the compiler wrapper
-        #[arg(long)]
-        tracked: bool,
-
-        /// Only tracked targets not seen for this long (for example 14d).
-        /// Targets whose workspace no longer exists qualify either way.
-        #[arg(long, requires = "tracked")]
+        /// Targets no build used for this long, and targets whose worktree
+        /// is gone (default 14d)
+        #[arg(long, value_name = "DURATION")]
         stale: Option<String>,
 
-        /// Only tracked targets whose worktree or workspace no longer exists,
-        /// however recently they were built. Implies --tracked.
-        #[arg(long, conflicts_with = "stale")]
+        /// Empty the cache instead. Asks first. The daemon already keeps it
+        /// under its size limit
+        #[arg(long)]
+        cache: bool,
+
+        /// Only targets whose worktree or workspace no longer exists, however
+        /// recently they were built
+        #[arg(long, hide = true, conflicts_with_all = ["stale", "cache", "crate_name"])]
         orphans: bool,
+
+        /// With --cache: the same, kept for older scripts
+        #[arg(long, hide = true, requires = "cache", conflicts_with_all = ["stale", "stale_schema"])]
+        all: bool,
+
+        /// Remove the cache entries of this crate
+        #[arg(long = "crate", hide = true, value_name = "NAME", conflicts_with_all = ["cache", "stale"])]
+        crate_name: Option<String>,
+
+        /// With --cache, remove entries from old or unrecorded cache-key schemas
+        #[arg(long, hide = true, requires = "cache", conflicts_with = "stale")]
+        stale_schema: bool,
+
+        /// Accepted for older scripts: tracked targets are the default now
+        #[arg(long, hide = true)]
+        tracked: bool,
     },
 
-    /// Show tracked target directories: what each holds on disk, what
-    /// deleting it frees, and whether its worktree still exists
-    #[command(subcommand_required = false)]
+    /// Show tracked target directories. Kept for scripts; `kache clean
+    /// --dry-run` shows the same targets
+    #[command(hide = true, subcommand_required = false)]
     Targets {
         #[command(subcommand)]
         command: Option<TargetCommands>,
     },
 
     /// Set up caching for Cargo and C/C++ builds
+    #[command(display_order = 1)]
     Init {
         /// Accept all default answers (non-interactive)
         #[arg(long, short = 'y')]
@@ -236,9 +267,29 @@ enum Commands {
         /// Print what would change without modifying anything
         #[arg(long)]
         check: bool,
+
+        /// Only create the compiler-name links to kache (Unix), in DIR or
+        /// ~/.local/lib/kache/shims, and change nothing else
+        #[arg(
+            long,
+            value_name = "DIR",
+            num_args = 0..=1,
+            conflicts_with_all = ["check", "no_service", "no_shell"]
+        )]
+        shims: Option<Option<PathBuf>>,
+
+        /// With --shims, also link compiler names already on PATH (gcc-13,
+        /// target triplets)
+        #[arg(long, requires = "shims")]
+        from_path: bool,
+
+        /// With --shims, replace existing entries instead of refusing
+        #[arg(long, requires = "shims")]
+        force: bool,
     },
 
     /// Diagnose setup issues and verify cache integrity
+    #[command(display_order = 2)]
     Doctor {
         /// Auto-fix issues (migrate from sccache, repair config)
         #[arg(long)]
@@ -261,7 +312,8 @@ enum Commands {
         repair: bool,
     },
 
-    /// Synchronize the local cache with its configured remote (pull + push)
+    /// Pull from and push to the configured remote
+    #[command(display_order = 30)]
     Sync {
         /// Path to Cargo.toml (default: current directory)
         #[arg(long)]
@@ -301,6 +353,7 @@ enum Commands {
     },
 
     /// Save a build manifest for future prefetch warming
+    #[command(hide = true)]
     SaveManifest {
         /// Override manifest key (default: identity key plus host triple)
         #[arg(long)]
@@ -311,14 +364,15 @@ enum Commands {
         namespace: Option<String>,
     },
 
-    /// Daemon management. With no subcommand, shows daemon status.
-    #[command(subcommand_required = false)]
+    /// Show the background daemon's status, or start, stop or install it
+    #[command(subcommand_required = false, display_order = 40)]
     Daemon {
         #[command(subcommand)]
         command: Option<DaemonCommands>,
     },
 
-    /// Live TUI dashboard for monitoring builds
+    /// Live dashboard of builds and the cache
+    #[command(display_order = 12)]
     Monitor {
         /// Preload events from this window (e.g. 15m, 2h, 7d; a bare number
         /// is hours)
@@ -326,8 +380,8 @@ enum Commands {
         since: Option<String>,
     },
 
-    /// Show what the cache did: hit rate, time saved, size. `--full` adds
-    /// timing, storage, remote transfers and what was not cached
+    /// Hit rate, time saved and cache size; --full for the whole report
+    #[command(display_order = 10)]
     Stats {
         /// Event window (e.g. 15m, 2h, 7d; a bare number is hours)
         #[arg(long, default_value = "24h")]
@@ -373,18 +427,27 @@ enum Commands {
     },
 
     /// Write cache counters as OTLP JSON for Kartero to import later
+    #[command(hide = true)]
     Telemetry {
         #[command(subcommand)]
         command: TelemetryCommands,
     },
 
-    /// Diagnose why a specific crate missed the cache
-    WhyMiss {
-        /// Crate name to investigate
-        crate_name: String,
+    /// Explain why a crate, or the latest build, missed the cache
+    #[command(display_order = 20, alias = "why-miss")]
+    Explain {
+        /// The crate to explain. Without one, compare the latest build's
+        /// misses with the build before it
+        crate_name: Option<String>,
+
+        /// Without a crate: only builds recorded for this build tree
+        #[arg(long, conflicts_with = "crate_name")]
+        root: Option<PathBuf>,
     },
 
-    /// Compare miss counts of the two newest sessions that share a build root
+    /// Compare misses in the two newest sessions of one build root. Kept
+    /// for scripts; `kache explain` with no crate explains the same build
+    #[command(hide = true)]
     Diff {
         /// Only sessions recorded for this build tree
         #[arg(long)]
@@ -432,9 +495,11 @@ enum Commands {
     },
 
     /// Open the configuration editor
+    #[command(display_order = 3)]
     Config,
 
-    /// Log in to the planner with your Kunobi account (for planner auth)
+    /// Log in to the planner with your Kunobi account
+    #[command(display_order = 31)]
     Login {
         /// Sign in on another device (prints a URL and a code)
         #[arg(long)]
@@ -446,10 +511,13 @@ enum Commands {
     },
 
     /// Log out of the planner and revoke the stored Kunobi session
+    #[command(display_order = 32)]
     Logout,
 
-    /// Create compiler-name symlinks pointing at kache, for transparent
-    /// interception by prepending the directory to PATH
+    /// Create compiler-name links to kache in a directory you put first on
+    /// PATH. Kept for scripts and packages; `kache init --shims` does the
+    /// same in the default directory
+    #[command(hide = true)]
     InstallShims {
         /// Directory to populate. Defaults to ~/.local/lib/kache/shims
         #[arg(value_name = "DIR")]
@@ -465,6 +533,7 @@ enum Commands {
     },
 
     /// Generate shell completion scripts
+    #[command(display_order = 41)]
     Completions {
         /// Shell to generate completions for
         #[arg(value_enum)]
@@ -546,7 +615,7 @@ fn command_supports_json(command: &Option<Commands>) -> bool {
                 | Commands::Targets { .. }
                 | Commands::Doctor { .. }
                 | Commands::Stats { .. }
-                | Commands::WhyMiss { .. }
+                | Commands::Explain { .. }
                 | Commands::Diff { .. }
                 | Commands::Daemon { command: None }
                 | Commands::Daemon {
@@ -854,7 +923,7 @@ fn main() -> Result<()> {
     let json = cli.json;
     if json && !command_supports_json(&cli.command) {
         anyhow::bail!(
-            "`--json` is supported on stats, gc, clean, targets, doctor, why-miss, diff, list, and daemon status."
+            "`--json` is supported on stats, clean, doctor, explain, list, and daemon status."
         );
     }
 
@@ -921,35 +990,58 @@ fn main() -> Result<()> {
             cli::purge(&config, crate_name.as_deref())
         }
         Some(Commands::Clean {
+            path,
             dry_run,
             yes,
-            tracked,
             stale,
             orphans,
+            cache,
+            all,
+            crate_name,
+            stale_schema,
+            tracked: _,
         }) => {
-            let selection = if orphans {
-                Some(cli::TrackedSelection::Orphaned)
-            } else if tracked {
-                let hours = match stale.as_deref() {
-                    Some(stale) => parse_duration_hours(stale)
-                        .ok_or_else(|| anyhow::anyhow!("invalid --stale duration"))?,
-                    None => cli::DEFAULT_TRACKED_STALE_HOURS,
-                };
-                Some(cli::TrackedSelection::StaleOrOrphaned(hours))
-            } else {
-                None
-            };
-            cli::clean(&config, dry_run, yes, json, selection)
+            let stale_hours = stale
+                .as_deref()
+                .map(|value| {
+                    parse_duration_hours(value).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "invalid --stale {value:?}; expected hours or a duration like 24h or 7d"
+                        )
+                    })
+                })
+                .transpose()?;
+            if let Some(name) = crate_name {
+                return cli::clean_cache(&config, cli::CacheClean::Crate(name), dry_run, yes, json);
+            }
+            if cache {
+                // `--all` is what `--cache` does now; it stays for scripts.
+                let _ = all;
+                let what = cache_clean_choice(stale_schema, stale_hours);
+                return cli::clean_cache(&config, what, dry_run, yes, json);
+            }
+            let scope = clean_scope(path, orphans, stale_hours);
+            cli::clean(&config, dry_run, yes, json, scope)
         }
         Some(Commands::Targets { command: None }) => cli::targets(&config, json),
         Some(Commands::Targets {
             command: Some(TargetCommands::Share { apply, paths }),
         }) => target_dedup::run(&config, &paths, apply, json),
+        #[cfg(unix)]
+        Some(Commands::Init {
+            shims: Some(dir),
+            from_path,
+            force,
+            ..
+        }) => install_shims(dir, force, from_path),
+        #[cfg(not(unix))]
+        Some(Commands::Init { shims: Some(_), .. }) => Err(anyhow::anyhow!(UNIX_ONLY_SHIMS)),
         Some(Commands::Init {
             yes,
             no_service,
             no_shell,
             check,
+            ..
         }) => cli::init(yes, no_service, no_shell, check),
         Some(Commands::Doctor {
             fix,
@@ -1123,7 +1215,14 @@ fn main() -> Result<()> {
             };
             cli::telemetry_push(&config, &selection, &labels, dry_run)
         }
-        Some(Commands::WhyMiss { crate_name }) => cli::why_miss(&config, &crate_name, json),
+        Some(Commands::Explain {
+            crate_name: Some(crate_name),
+            ..
+        }) => cli::why_miss(&config, &crate_name, json),
+        Some(Commands::Explain {
+            crate_name: None,
+            root,
+        }) => explain::run(&config, root.as_deref(), json),
         Some(Commands::Diff { root }) => {
             if run_diff::run(&config, root.as_deref(), json)? {
                 std::process::exit(1);
@@ -1147,23 +1246,9 @@ fn main() -> Result<()> {
             dir,
             force,
             from_path,
-        }) => {
-            let dir = dir
-                .or_else(compiler::shim::default_shim_dir)
-                .context("no home directory; pass the shim directory to use")?;
-            let extra = if from_path {
-                compiler::shim::extra_compiler_names_from_env()
-            } else {
-                Vec::new()
-            };
-            cli::install_shims_named(&dir, force, &extra)
-        }
-        // Unix-only (symlinks); the Windows `.exe` shim story differs (#310).
+        }) => install_shims(dir, force, from_path),
         #[cfg(not(unix))]
-        Some(Commands::InstallShims { .. }) => Err(anyhow::anyhow!(
-            "shim installation is Unix-only for now: it relies on symlinks, and the Windows \
-             `.exe` shim story differs (kunobi-ninja/kache#310). Use `CC`/`CXX` there."
-        )),
+        Some(Commands::InstallShims { .. }) => Err(anyhow::anyhow!(UNIX_ONLY_SHIMS)),
         Some(Commands::Cargo { .. }) => unreachable!(),
         Some(Commands::Config) => unreachable!(),
         Some(Commands::Login { .. } | Commands::Logout) => unreachable!(),
@@ -1557,6 +1642,47 @@ fn run_wrapper_mode(args: &[String]) -> Result<()> {
     std::process::exit(exit_code);
 }
 
+/// What `kache clean --cache` removes, from its hidden flags.
+fn cache_clean_choice(stale_schema: bool, stale_hours: Option<u64>) -> cli::CacheClean {
+    match stale_hours {
+        _ if stale_schema => cli::CacheClean::StaleSchema,
+        Some(hours) => cli::CacheClean::OlderThan(hours),
+        None => cli::CacheClean::All,
+    }
+}
+
+/// Which target directories `kache clean` looks at.
+fn clean_scope(path: Option<PathBuf>, orphans: bool, stale_hours: Option<u64>) -> cli::CleanScope {
+    match path {
+        Some(dir) => cli::CleanScope::Scan(dir),
+        None if orphans => cli::CleanScope::Tracked(cli::TrackedSelection::Orphaned),
+        None => cli::CleanScope::Tracked(cli::TrackedSelection::StaleOrOrphaned(
+            stale_hours.unwrap_or(cli::DEFAULT_TRACKED_STALE_HOURS),
+        )),
+    }
+}
+
+/// `kache init --shims` and the hidden `kache install-shims`: compiler-name
+/// links to kache in `dir`, by default `~/.local/lib/kache/shims`.
+#[cfg(unix)]
+fn install_shims(dir: Option<PathBuf>, force: bool, from_path: bool) -> Result<()> {
+    let dir = dir
+        .or_else(compiler::shim::default_shim_dir)
+        .context("no home directory; pass the shim directory to use")?;
+    let extra = if from_path {
+        compiler::shim::extra_compiler_names_from_env()
+    } else {
+        Vec::new()
+    };
+    cli::install_shims_named(&dir, force, &extra)
+}
+
+/// Shims are Unix-only (symlinks); the Windows `.exe` shim story differs
+/// (#310).
+#[cfg(not(unix))]
+const UNIX_ONLY_SHIMS: &str = "shim installation is Unix-only for now: it relies on symlinks, and \
+     the Windows `.exe` shim story differs (kunobi-ninja/kache#310). Use `CC`/`CXX` there.";
+
 /// Entries in each top list of the full report by default.
 const DEFAULT_REPORT_TOP: usize = 10;
 
@@ -1776,6 +1902,153 @@ mod tests {
             }) if paths == &vec![PathBuf::from("target")]
         ));
         assert!(Cli::try_parse_from(["kache", "targets-dedup"]).is_err());
+    }
+
+    #[test]
+    fn clean_flags_keep_targets_and_cache_apart() {
+        let parse = |args: &[&str]| Cli::try_parse_from(["kache", "clean"].iter().chain(args));
+        assert!(parse(&["--cache"]).is_ok());
+        assert!(
+            parse(&["--cache", "--all"]).is_ok(),
+            "older scripts still parse"
+        );
+        assert!(parse(&["--cache", "--stale", "7d"]).is_ok());
+        assert!(parse(&["--crate", "serde", "--yes"]).is_ok());
+        assert!(parse(&["some/dir", "--dry-run"]).is_ok());
+        assert!(parse(&["--tracked"]).is_ok(), "older scripts still parse");
+        assert!(parse(&["--all"]).is_err(), "--all needs --cache");
+        assert!(
+            parse(&["--stale-schema"]).is_err(),
+            "--stale-schema needs --cache"
+        );
+        assert!(parse(&["some/dir", "--cache"]).is_err());
+        assert!(parse(&["--orphans", "--stale", "7d"]).is_err());
+        assert!(parse(&["--crate", "serde", "--cache"]).is_err());
+        assert!(parse(&["--cache", "--all", "--stale", "7d"]).is_err());
+        for hidden in ["gc", "purge", "targets", "report"] {
+            assert!(Cli::try_parse_from(["kache", hidden]).is_ok(), "{hidden}");
+        }
+    }
+
+    #[test]
+    fn clean_flags_pick_what_to_remove() {
+        use cli::{CacheClean, CleanScope, TrackedSelection};
+        assert_eq!(cache_clean_choice(false, None), CacheClean::All);
+        assert_eq!(
+            cache_clean_choice(false, Some(24)),
+            CacheClean::OlderThan(24)
+        );
+        assert_eq!(cache_clean_choice(true, None), CacheClean::StaleSchema);
+        assert_eq!(
+            clean_scope(None, false, None),
+            CleanScope::Tracked(TrackedSelection::StaleOrOrphaned(
+                cli::DEFAULT_TRACKED_STALE_HOURS
+            ))
+        );
+        assert_eq!(
+            clean_scope(None, false, Some(48)),
+            CleanScope::Tracked(TrackedSelection::StaleOrOrphaned(48))
+        );
+        assert_eq!(
+            clean_scope(None, true, None),
+            CleanScope::Tracked(TrackedSelection::Orphaned)
+        );
+        assert_eq!(
+            clean_scope(Some(PathBuf::from("d")), true, None),
+            CleanScope::Scan(PathBuf::from("d"))
+        );
+    }
+
+    #[test]
+    fn init_shims_and_why_miss_without_a_crate_parse() {
+        let shims =
+            Cli::try_parse_from(["kache", "init", "--shims", "--from-path", "--force"]).unwrap();
+        assert!(matches!(
+            shims.command,
+            Some(Commands::Init {
+                shims: Some(None),
+                from_path: true,
+                force: true,
+                ..
+            })
+        ));
+        let package =
+            Cli::try_parse_from(["kache", "init", "--shims", "/usr/lib/kache", "--force"]).unwrap();
+        assert!(matches!(
+            package.command,
+            Some(Commands::Init { shims: Some(Some(ref dir)), force: true, .. })
+                if dir == std::path::Path::new("/usr/lib/kache")
+        ));
+        let plain = Cli::try_parse_from(["kache", "init"]).unwrap();
+        assert!(matches!(
+            plain.command,
+            Some(Commands::Init { shims: None, .. })
+        ));
+        assert!(
+            Cli::try_parse_from(["kache", "init", "--from-path"]).is_err(),
+            "needs --shims"
+        );
+        assert!(Cli::try_parse_from(["kache", "init", "--shims", "--check"]).is_err());
+        let build = Cli::try_parse_from(["kache", "why-miss", "--root", "x"]).unwrap();
+        assert!(matches!(
+            build.command,
+            Some(Commands::Explain {
+                crate_name: None,
+                root: Some(_)
+            })
+        ));
+        assert!(Cli::try_parse_from(["kache", "why-miss", "serde", "--root", "x"]).is_err());
+        for hidden in ["install-shims", "diff"] {
+            assert!(Cli::try_parse_from(["kache", hidden]).is_ok(), "{hidden}");
+        }
+    }
+
+    #[test]
+    fn help_lists_commands_by_task_and_leaves_out_plumbing() {
+        use clap::CommandFactory;
+        let help = Cli::command().render_help().to_string();
+        let listed: Vec<&str> = help
+            .lines()
+            .skip_while(|line| *line != "Commands:")
+            .skip(1)
+            .take_while(|line| !line.is_empty())
+            .filter_map(|line| line.split_whitespace().next())
+            .collect();
+        assert_eq!(
+            listed,
+            [
+                "init",
+                "doctor",
+                "config",
+                "stats",
+                "clean",
+                "monitor",
+                "explain",
+                "list",
+                "sync",
+                "login",
+                "logout",
+                "daemon",
+                "completions",
+                "help",
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn init_shims_creates_the_links_in_the_named_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let farm = dir.path().join("farm");
+        install_shims(Some(farm.clone()), false, false).unwrap();
+        for name in ["cc", "c++", "cargo"] {
+            assert!(
+                farm.join(name)
+                    .symlink_metadata()
+                    .is_ok_and(|meta| meta.file_type().is_symlink()),
+                "{name}"
+            );
+        }
     }
 
     #[test]

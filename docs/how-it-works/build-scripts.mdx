@@ -92,7 +92,7 @@ so it shares only between target directories of the same checkout.
 Every link is recorded beside the shared directory, including the links
 seeding makes in a new checkout's target directory. GC (`kache gc` and the
 daemon's sweeps) keeps a directory while any recorded `OUT_DIR` still links to
-it, and removes it once none has for seven days. `kache purge` removes every
+it, and removes it once none has for seven days. Emptying the cache with `kache clean --cache` removes every
 directory no target directory links to. A directory a build is using is left
 for the next sweep.
 

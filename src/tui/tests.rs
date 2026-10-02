@@ -764,6 +764,8 @@ fn session_event(
     secs_ago: i64,
 ) -> BuildEvent {
     let mut event = sample_build_event(crate_name, result, 100, 1);
+    // Each build of a crate gets its own key, as a changed input would.
+    event.cache_key = format!("{crate_name}-{session}");
     event.root = root.to_string();
     event.session_id = session.to_string();
     event.ts = chrono::Utc::now() - chrono::Duration::seconds(secs_ago);

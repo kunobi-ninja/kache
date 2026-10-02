@@ -80,4 +80,4 @@ find "$root" -mindepth 1 -type d -empty -not -path '*/.kache-tmp*' -delete
 
 Run it from cron or a systemd timer once a day. The job needs no coordination with writers: a writer that loses a race with the prune uploads again on its next miss, and a reader that loses one records a miss.
 
-`kache gc` bounds the local store only. There is no kache command that deletes remote objects.
+GC bounds the local store only. There is no kache command that deletes remote objects.

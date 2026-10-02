@@ -46,7 +46,7 @@ Kache has three parts: a compiler wrapper, a local store, and an optional daemon
 - The store keeps outputs as content-addressed blobs. Identical bytes are stored once. Restores use copy-on-write clones where the filesystem supports them, so a second worktree costs little disk.
 - The daemon serves remote lookups after a local miss and uploads new entries in the background.
 
-Hits, misses, and passthroughs are reported per unit, and `kache why-miss` explains what changed. [Read the architecture →](https://kunobi.ninja/docs/kache/how-it-works/architecture)
+Hits, misses, and passthroughs are reported per unit, and `kache explain` says what changed. [Read the architecture →](https://kunobi.ninja/docs/kache/how-it-works/architecture)
 
 ## What Kache caches
 
@@ -95,13 +95,13 @@ On Unix, `kache init` creates compiler-name shims and offers to add their direct
 For managed dotfiles or another shell, set it up by hand:
 
 ```bash
-kache install-shims
+kache init --shims
 export PATH="$HOME/.local/lib/kache/shims:$PATH"
 ```
 
 APT and AUR packages install `/usr/lib/kache`. Nix packages include the same symlinks in `${kache}/shims` and `${kache}/lib/kache`; see the [Nix configuration example](https://kunobi.ninja/docs/kache/getting-started/installation#nix).
 
-For `makepkg`, put the same assignment in `~/.makepkg.conf`. Wrap extra names already on `PATH` with `kache install-shims --from-path`.
+For `makepkg`, put the same assignment in `~/.makepkg.conf`. Wrap extra names already on `PATH` with `kache init --shims --from-path`.
 
 Kache inspects the real compiler invocation. Unsupported or unsafe invocations pass through. See [C and C++](https://kunobi.ninja/docs/kache/getting-started/c-cpp).
 
@@ -131,14 +131,13 @@ kache monitor                 # live build and cache activity
 kache stats                   # hit rate, time saved, cache size
 kache stats --last-build      # hits, misses, and bypass reasons of the latest build
 kache stats --full --redact   # full report without cache keys and paths, for sharing
-kache diff                    # compare the two newest sessions of one root
+kache explain                 # why the latest build missed, costliest cause first
 kache doctor                  # setup and integrity checks
-kache install-shims           # Unix compiler-name PATH farm
-kache why-miss <crate>        # explain the latest miss
+kache explain <crate>         # what changed in one crate's key
 kache list                    # inspect cached entries
-kache gc                      # enforce cache limits
-kache targets                 # target dirs, what each frees, deleted worktrees
+kache clean --dry-run         # target dirs, what each frees, what a clean removes
 kache clean --orphans --yes   # remove the targets of deleted worktrees
+kache clean --cache           # empty the cache (the daemon keeps it under its limit)
 kache sync                    # pull from and push to the configured remote
 kache daemon status           # inspect the background service
 ```

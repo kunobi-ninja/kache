@@ -1,5 +1,5 @@
-# kache clean: target directories under the current tree, and how much of
-# each is already in the store. Runs after demo.tape.
+# kache clean --dry-run: the target directories Kache tracks, what each
+# frees, and what a clean would remove. Runs after demo.tape.
 
 Output ../clean.gif
 Output ../clean.webm
@@ -21,8 +21,6 @@ Enter
 Wait
 Show
 
-Type "kache clean"
+Type "kache clean --dry-run"
 Enter
 Sleep 7s
-Type "q"
-Sleep 800ms

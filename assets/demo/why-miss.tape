@@ -1,4 +1,4 @@
-# One source edit, one recompile, and why-miss explains which key changed.
+# One source edit, one recompile, and kache explain says which key changed.
 # Runs after demo.tape (uses its second worktree).
 
 Output ../why-miss.gif
@@ -28,7 +28,7 @@ Type "KACHE_PROGRESS=verbose cargo build --locked"
 Enter
 Wait
 Sleep 2s
-Type "clear && kache why-miss demo_app"
+Type "clear && kache explain demo_app"
 Enter
 Wait
 Sleep 7s

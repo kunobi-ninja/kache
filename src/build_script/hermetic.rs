@@ -1091,6 +1091,8 @@ mod tests {
         std::fs::write(&library, b"so").unwrap();
         std::fs::set_permissions(&library, std::fs::Permissions::from_mode(0o644)).unwrap();
         std::os::unix::fs::symlink("libz.so.1", sandbox.out_dir.join("libz.so")).unwrap();
+        // Dangling: a chmod through it fails whatever order the walk takes.
+        std::os::unix::fs::symlink("libz.so.2", sandbox.out_dir.join("libz.so.next")).unwrap();
         seal(
             &sandbox,
             &Record {
@@ -1107,6 +1109,12 @@ mod tests {
         assert_eq!(
             std::fs::read_link(sandbox.out_dir.join("libz.so")).unwrap(),
             Path::new("libz.so.1")
+        );
+        // Sealing the link after its target must not make the library executable.
+        read_only(&sandbox.out_dir.join("libz.so")).unwrap();
+        assert_eq!(
+            std::fs::metadata(&library).unwrap().permissions().mode() & 0o777,
+            0o444
         );
         remove_sandbox(&sandbox.root).unwrap();
     }

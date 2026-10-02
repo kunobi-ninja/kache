@@ -71,6 +71,8 @@ pub(crate) const CRATE_NAME: &str = "build_script_run";
 /// tree, not a build-script product, and restoring it would not be cheaper
 /// than the run.
 const MAX_OUT_DIR_BYTES: u64 = 1 << 30;
+/// Non-empty files and symlinks together: each costs a manifest entry and a
+/// restore.
 const MAX_OUT_DIR_FILES: usize = 50_000;
 const MAX_INPUT_FILES: usize = 100_000;
 
@@ -1535,6 +1537,11 @@ struct OutDirContents {
 }
 
 fn collect_out_dir(out_dir: &Path) -> Result<OutDirContents> {
+    collect_out_dir_capped(out_dir, MAX_OUT_DIR_FILES)
+}
+
+/// [`collect_out_dir`] with `max_entries` for its file and symlink cap.
+fn collect_out_dir_capped(out_dir: &Path, max_entries: usize) -> Result<OutDirContents> {
     let mut files = Vec::new();
     let mut directories = Vec::new();
     let mut empty = Vec::new();
@@ -1559,6 +1566,10 @@ fn collect_out_dir(out_dir: &Path) -> Result<OutDirContents> {
                     "OUT_DIR contains a symlink that is absolute or leaves it: {relative} -> {}",
                     target.display()
                 );
+                anyhow::ensure!(
+                    files.len() + symlinks.len() < max_entries,
+                    "OUT_DIR is too large to record"
+                );
                 symlinks.push(Symlink {
                     target: target
                         .to_str()
@@ -1579,7 +1590,7 @@ fn collect_out_dir(out_dir: &Path) -> Result<OutDirContents> {
                 }
                 total += metadata.len();
                 anyhow::ensure!(
-                    total <= MAX_OUT_DIR_BYTES && files.len() < MAX_OUT_DIR_FILES,
+                    total <= MAX_OUT_DIR_BYTES && files.len() + symlinks.len() < max_entries,
                     "OUT_DIR is too large to record"
                 );
                 files.push((path, format!("{OUT_PREFIX}{relative}")));
@@ -2715,8 +2726,35 @@ mod tests {
         let second = std::fs::File::create(out.join("second.bin")).unwrap();
         second.set_len(MAX_OUT_DIR_BYTES / 2 + 1).unwrap();
         assert!(collect_out_dir(&out).is_err(), "sizes add up across files");
-        second.set_len(1).unwrap();
-        assert_eq!(collect_out_dir(&out).unwrap().files.len(), 2);
+        second.set_len(MAX_OUT_DIR_BYTES / 2).unwrap();
+        assert_eq!(
+            collect_out_dir(&out).unwrap().files.len(),
+            2,
+            "the cap is inclusive"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinks_count_toward_the_out_dir_entry_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out");
+        std::fs::create_dir(&out).unwrap();
+        // Entries are visited by name, so the file `z` comes after the links.
+        for name in ["a", "b", "c"] {
+            std::os::unix::fs::symlink("z", out.join(name)).unwrap();
+        }
+        assert_eq!(collect_out_dir_capped(&out, 3).unwrap().symlinks.len(), 3);
+        assert!(
+            collect_out_dir_capped(&out, 2).is_err(),
+            "links alone reach the cap"
+        );
+        std::fs::write(out.join("z"), "z").unwrap();
+        assert_eq!(collect_out_dir_capped(&out, 4).unwrap().files.len(), 1);
+        assert!(
+            collect_out_dir_capped(&out, 3).is_err(),
+            "a file after the links is over the cap"
+        );
     }
 
     #[cfg(unix)]

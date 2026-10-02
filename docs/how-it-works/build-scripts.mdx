@@ -53,11 +53,11 @@ Entries stay in the local store: `kache sync` never uploads them.
   declares an input under `OUT_DIR`.
 - A run that started with a non-empty `OUT_DIR`, or during which a declared
   input changed.
-- An `OUT_DIR` containing a symlink whose target is absolute or leads out of
-  `OUT_DIR`, more than 50,000 files, or over 1 GiB. A relative symlink whose
-  target climbs no higher than `OUT_DIR` with leading `..` and then only
-  descends (such as `libfoo.so -> libfoo.so.1`) is recorded and restored as a
-  link, on Unix.
+- An `OUT_DIR` over 1 GiB, with more than 50,000 non-empty files and symlinks
+  together, or with a symlink whose target is absolute or does not follow
+  this rule: climb no higher than `OUT_DIR` with leading `..`, then only
+  descend. A link that follows it, such as `libfoo.so -> libfoo.so.1`, is
+  recorded and restored as a link, on Unix.
 - Windows, where no launcher is installed.
 
 ## Hermetic runs
@@ -75,9 +75,10 @@ The regular cache cannot check for such values.
   `CARGO_TARGET_DIR` pointing at the same directory and without `PWD` and
   `OLDPWD`.
 - A run is kept only when it succeeds, declares the inputs its key was computed
-  from, leaves them unchanged, writes nothing outside `OUT_DIR`, and creates no
-  symlink that is absolute or leads out of `OUT_DIR`. Otherwise the script runs
-  as usual.
+  from, leaves them unchanged, writes nothing outside `OUT_DIR`, and creates
+  only relative symlinks that climb no higher than `OUT_DIR` with leading `..`
+  and then only descend (`lib/foo -> sub/../libfoo.so.1` does not). Otherwise
+  the script runs as usual.
 - A kept run is made read-only, and Cargo's `OUT_DIR` becomes a symlink to it.
   A hit creates that link: nothing is copied, and every worktree shares one
   copy. `rustc-link-search` lines are replayed with Cargo's own `OUT_DIR`, so

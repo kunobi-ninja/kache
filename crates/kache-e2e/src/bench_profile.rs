@@ -655,6 +655,35 @@ content = "value"
         assert!(!profiles.is_empty());
     }
 
+    /// A Cargo build that fetches inside its timed phase measures the network,
+    /// and only for whichever tool builds first in a job. The engine refuses
+    /// such a build when it happens; this catches the scenario before it runs.
+    #[test]
+    fn every_shipped_cargo_bench_fetches_before_it_is_timed() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scenarios");
+        let selectors = Selectors::parse_many(&["suite:bench".to_string()]).unwrap();
+        let profiles = BenchProfile::discover(&root, &selectors).unwrap();
+        let cargo_builds: Vec<_> = profiles
+            .iter()
+            .filter(|p| {
+                p.build
+                    .lines()
+                    .any(|line| !line.trim_start().starts_with('#') && line.contains("cargo build"))
+            })
+            .collect();
+        assert!(cargo_builds.len() > 10, "{}", cargo_builds.len());
+        let missing: Vec<_> = cargo_builds
+            .iter()
+            .filter(|p| {
+                !p.prepare
+                    .as_deref()
+                    .is_some_and(|c| c.contains("cargo fetch"))
+            })
+            .map(|p| p.name.as_str())
+            .collect();
+        assert!(missing.is_empty(), "no untimed `cargo fetch`: {missing:?}");
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn all_shipped_bench_shell_commands_parse_with_linux_sh() {

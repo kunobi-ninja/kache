@@ -10,6 +10,10 @@ setup = [
 
 # Same portability knobs as bench-hk so the two arms build identical
 # inputs; the store location comes from the harness.
+# Untimed: a download inside a timed build is network time, not cache
+# time, and the engine refuses it.
+prepare = "cargo fetch --locked"
+
 build = """
 # mbx's own workspace-root mapping, the counterpart of the KACHE_BASE_DIR the
 # Kache arm of this subject sets: without it a crate rebuilt in the second

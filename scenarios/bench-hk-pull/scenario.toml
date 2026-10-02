@@ -15,6 +15,10 @@ setup = [
   "echo '[bench] bench-hk-pull needs a C compiler (aws-lc-sys cc builder, vendored libgit2); cmake only as the aws-lc-sys fallback.'",
 ]
 
+# Untimed: a download inside a timed build is network time, not cache
+# time, and the engine refuses it.
+prepare = "cargo fetch --locked"
+
 build = """
 # Input-set predictions, with EVERY prediction cross-checked
 # (kunobi-ninja/kache#1000). The pull phase is the one where inputs really

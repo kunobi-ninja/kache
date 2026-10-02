@@ -35,6 +35,10 @@ setup = [
 # measures): each clone builds at a different absolute path, so pin
 # native-build paths/determinism the same way bench-surrealdb does. These
 # knobs change build PATHS and timestamps, not WHAT is built.
+# Untimed: a download inside a timed build is network time, not cache
+# time, and the engine refuses it.
+prepare = "cd core && cargo fetch --locked"
+
 build = """
 # mbx's own workspace-root mapping, the counterpart of the KACHE_BASE_DIR the
 # Kache arm of this subject sets: without it a crate rebuilt in the second

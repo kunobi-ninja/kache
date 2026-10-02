@@ -2,6 +2,10 @@ name = "bench-hk-pull-nopred"
 tags = ["suite:bench", "project:hk", "backend:kache", "lang:rust", "lang:cc", "scenario:pull"]
 requires = ["cargo", "rustc", "cc"]
 
+# Untimed: a download inside a timed build is network time, not cache
+# time, and the engine refuses it.
+prepare = "cargo fetch --locked"
+
 build = """
 export KACHE_INPUT_PREDICTIONS=0
 export KACHE_VERIFY_INPUT_PREDICTIONS=0

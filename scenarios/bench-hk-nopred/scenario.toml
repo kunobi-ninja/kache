@@ -19,6 +19,10 @@ setup = [
   "echo '[bench] bench-hk-nopred needs a C compiler (aws-lc-sys cc builder, vendored libgit2); cmake only as the aws-lc-sys fallback.'",
 ]
 
+# Untimed: a download inside a timed build is network time, not cache
+# time, and the engine refuses it.
+prepare = "cargo fetch --locked"
+
 build = """
 # Predictions off: every rustc unit runs the dep-info pre-pass. This is the
 # baseline bench-hk's predictions are measured against (kunobi-ninja/kache#1000).

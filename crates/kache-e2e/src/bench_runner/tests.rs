@@ -3218,3 +3218,53 @@ fn the_wrapper_breakdown_partitions_key_time_and_skips_uninstrumented_phases() {
 
     assert_eq!(wrapper_breakdown(&PhaseTimes::default(), &storage), None);
 }
+
+/// Cargo's own network lines, coloured or not, and nothing that only looks
+/// like one: a timed build that fetched must fail, and one that did not must
+/// pass.
+#[test]
+fn only_cargo_network_lines_count_as_a_dependency_fetch() {
+    for line in [
+        "\u{1b}[1m\u{1b}[92m  Downloaded\u{1b}[0m adler2 v2.0.1\n",
+        "  Downloading crates ...\n",
+        "    Updating crates.io index\n",
+        "    Updating `my-registry` index\n",
+        "    Updating git repository `https://github.com/x/y`\n",
+    ] {
+        assert!(is_dependency_fetch(line.as_bytes()), "{line:?}");
+    }
+    for line in [
+        "\u{1b}[1m\u{1b}[92m   Compiling\u{1b}[0m opendal v0.58.2\n",
+        "    Finished `release` profile [optimized] target(s) in 3m 53s\n",
+        "Updating the build configuration\n",
+        "note: Downloaded nothing\n",
+        "\n",
+    ] {
+        assert!(!is_dependency_fetch(line.as_bytes()), "{line:?}");
+    }
+}
+
+/// A build log with downloads is refused and says how many lines it saw; one
+/// without is accepted.
+#[test]
+fn a_timed_build_that_fetched_is_refused() {
+    let mut count = FetchCount::default();
+    for line in [
+        "    Updating crates.io index\n",
+        "   Compiling a v1.0.0\n",
+        "  Downloaded b v1.0.0\n",
+        "  Downloaded c v1.0.0\n",
+    ] {
+        count.observe(line.as_bytes());
+    }
+    let err = count
+        .refuse("cold", Path::new("build-cold.log"))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("(3 Cargo download or index lines)"), "{err}");
+    assert!(err.contains("cargo fetch --locked"), "{err}");
+
+    let mut clean = FetchCount::default();
+    clean.observe(b"   Compiling a v1.0.0\n");
+    clean.refuse("warm", Path::new("build-warm.log")).unwrap();
+}

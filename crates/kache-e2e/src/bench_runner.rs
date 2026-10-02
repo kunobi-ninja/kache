@@ -1587,6 +1587,7 @@ fn build(
     // diagnostics relayed through it — to stdout, so the log must capture
     // stdout, not just stderr. Byte-oriented so non-UTF-8 build output
     // can't break it.
+    let mut fetches = FetchCount::default();
     if let Some(stdout) = child.stdout.take() {
         let mut reader = std::io::BufReader::new(stdout);
         let mut buf = Vec::new();
@@ -1594,6 +1595,7 @@ fn build(
             let _ = std::io::stdout().write_all(&buf);
             log.write_all(&buf)
                 .with_context(|| format!("writing {}", log_path.display()))?;
+            fetches.observe(&buf);
             buf.clear();
         }
     }
@@ -1607,7 +1609,60 @@ fn build(
             log_path.display()
         );
     }
+    fetches.refuse(phase, &log_path)?;
     Ok(BuildRun { wall_ms, load })
+}
+
+/// Cargo network lines seen in one timed build's log.
+#[derive(Debug, Default)]
+struct FetchCount(usize);
+
+impl FetchCount {
+    fn observe(&mut self, line: &[u8]) {
+        self.0 += usize::from(is_dependency_fetch(line));
+    }
+
+    /// Network time inside a timed build is not cache time, and it lands on
+    /// whichever tool builds first in a job, so a comparison built on it is
+    /// wrong. OpenDAL's kache cold build once carried 319 downloads its mbx
+    /// cold build did not.
+    fn refuse(&self, phase: &str, log_path: &Path) -> Result<()> {
+        if self.0 > 0 {
+            bail!(
+                "[{phase}] the timed build fetched dependencies ({} Cargo \
+                 download or index lines) — fetch them before timing, e.g. \
+                 `prepare = \"cargo fetch --locked\"` in the scenario; see {}",
+                self.0,
+                log_path.display()
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Whether a build log line is Cargo reaching the network: an index update or
+/// a crate download.
+fn is_dependency_fetch(line: &[u8]) -> bool {
+    let line = String::from_utf8_lossy(line);
+    let mut plain = String::with_capacity(line.len());
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            // An ANSI escape: skip to the letter that ends it.
+            for c in chars.by_ref() {
+                if c.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            plain.push(c);
+        }
+    }
+    let plain = plain.trim();
+    plain.starts_with("Downloaded ")
+        || plain.starts_with("Downloading crates")
+        || (plain.starts_with("Updating ")
+            && (plain.ends_with(" index") || plain.contains("git repository")))
 }
 
 /// One timed build: its wall clock and how busy the host was meanwhile.

@@ -577,6 +577,12 @@ fn a_build_script_writing_into_its_inputs_is_logged_but_not_recorded() {
                 field(event, "passthrough_reason").contains("changed while the script ran"),
                 "{event}"
             );
+            // The next run must not depend on how soon Cargo starts again.
+            let old = filetime::FileTime::from_unix_time(1_600_000_000, 0);
+            for path in walkdir(&fx.workspace) {
+                filetime::set_file_mtime(&path, old).unwrap();
+            }
+            filetime::set_file_mtime(&fx.workspace, old).unwrap();
         }
     }
 }

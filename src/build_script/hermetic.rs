@@ -498,7 +498,7 @@ fn attempt(
     let script = bin.join(real.file_name().context("build script has no name")?);
     std::fs::copy(real, &script)?;
 
-    let started = super::write_floor(std::time::SystemTime::now());
+    let started = std::time::SystemTime::now();
     let target = target_dir(&run.environment.out_dir).context("no target directory")?;
     let mut command = real_command(&script, argv);
     command

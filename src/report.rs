@@ -790,6 +790,9 @@ pub struct BypassDetail {
     pub crate_name: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub root: String,
+    /// Package of a build-script run. Empty for compiles.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub package: String,
     pub result: String,
     pub route: String,
     pub reason: String,
@@ -1876,6 +1879,7 @@ fn to_bypass_detail(e: &BuildEvent) -> BypassDetail {
     BypassDetail {
         crate_name: e.crate_name.clone(),
         root: e.root.clone(),
+        package: e.package.clone(),
         result: e.result.to_string(),
         route: bypass_route(e).to_string(),
         reason: bypass_reason(e),

@@ -449,19 +449,19 @@ fn run_cached(real: &Path, argv: &[std::ffi::OsString]) -> Result<i32> {
     // The script has run and Cargo has its output; nothing below may change
     // the exit status.
     if !out_dir_was_empty {
-        run.log_unrecorded("it ran over an existing OUT_DIR");
+        run.log_unrecorded("it ran over an existing OUT_DIR", compile_ms);
         return Ok(0);
     }
     if let Err(error) = run.record(&output.stdout, &output.stderr, compile_ms, started) {
-        run.log_unrecorded(&format!("{error:#}"));
+        run.log_unrecorded(&format!("{error:#}"), compile_ms);
     }
     Ok(0)
 }
 
 /// File systems stamp writes from a clock that advances in ticks (a jiffy on
 /// Linux, 15.6 ms by default on Windows), so a write just after `now` can
-/// carry an mtime just before it. Whatever is written after `now` has an
-/// mtime at or after the floor.
+/// carry an mtime just before it. The floor covers those ticks; HFS+, with
+/// one-second timestamps, is coarser than any floor worth paying for.
 const FS_CLOCK_TICK: std::time::Duration = std::time::Duration::from_millis(50);
 
 fn write_floor(now: std::time::SystemTime) -> std::time::SystemTime {
@@ -1424,7 +1424,7 @@ impl Run {
 
     /// A run that executed but was not stored is a passthrough, so reports
     /// count it as uncached rather than losing it.
-    fn log_unrecorded(&self, why: &str) {
+    fn log_unrecorded(&self, why: &str, compile_ms: u64) {
         tracing::debug!("build-script result not recorded: {why}");
         let root = crate::wrapper::build_script_event_root(
             &self.environment.out_dir,
@@ -1434,6 +1434,7 @@ impl Run {
         crate::wrapper::log_event(
             &self.config,
             EventInputs::new(&root, CRATE_NAME, EventResult::Passthrough, elapsed_ms)
+                .compile_time_ms(compile_ms)
                 .package(package_name())
                 .passthrough_reason(unrecorded_reason(why)),
         );

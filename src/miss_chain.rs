@@ -707,10 +707,16 @@ fn passthroughs_for(
     let needle = crate_name.replace('_', "-");
     let mut counts: BTreeMap<String, usize> = BTreeMap::new();
     for event in &events[..before.min(events.len())] {
-        if event.result != EventResult::Passthrough || event.root.is_empty() {
+        if event.result != EventResult::Passthrough {
             continue;
         }
-        if !package_dir_matches(&event.root, &needle) {
+        // A build-script event names its package; its root is the workspace.
+        let matches = if event.package.is_empty() {
+            !event.root.is_empty() && package_dir_matches(&event.root, &needle)
+        } else {
+            event.package.replace('_', "-") == needle
+        };
+        if !matches {
             continue;
         }
         let reason = if event.passthrough_reason.is_empty() {
@@ -1755,6 +1761,21 @@ mod tests {
         assert_eq!(root.passthroughs.len(), 1);
         assert_eq!(root.passthroughs[0].count, 2);
         assert!(root.passthroughs[0].reason.contains("--include="));
+    }
+
+    #[test]
+    fn build_script_passthroughs_are_attributed_by_package() {
+        let mut refused = BuildEvent::new_for_test("build_script_run", EventResult::Passthrough);
+        refused.root = "/w/dep_with_script".to_string();
+        refused.package = "dep-with-script".to_string();
+        refused.passthrough_reason = "refused|changed input".to_string();
+        let mut other = refused.clone();
+        other.package = "another".to_string();
+
+        let found = passthroughs_for(&[refused, other], "dep_with_script", 2);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].count, 1);
+        assert_eq!(found[0].reason, "refused|changed input");
     }
 
     /// Passthroughs logged after the compile being explained belong to a later

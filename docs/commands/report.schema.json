@@ -491,6 +491,7 @@
       "properties": {
         "crate_name": { "type": "string" },
         "root": { "type": "string" },
+        "package": { "type": "string", "description": "Package a build-script run belongs to. Omitted when empty." },
         "result": {
           "type": "string",
           "enum": [

@@ -7214,7 +7214,7 @@ impl<'a> EventInputs<'a> {
             .exit_code(output.exit_code)
     }
 
-    fn compile_time_ms(mut self, compile_time_ms: u64) -> Self {
+    pub(crate) fn compile_time_ms(mut self, compile_time_ms: u64) -> Self {
         self.compile_time_ms = compile_time_ms;
         self
     }

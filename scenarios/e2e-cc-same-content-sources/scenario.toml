@@ -10,7 +10,6 @@
 
 name = "e2e-cc-same-content-sources"
 tags = ["suite:e2e", "lang:cc", "case:false-hit"]
-os = ["linux", "macos"]
 
 [source]
 kind = "fixture"

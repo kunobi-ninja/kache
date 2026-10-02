@@ -8238,32 +8238,3 @@ mod properties {
         }
     }
 }
-
-/// The key spells a source the way its object does: `__FILE__` follows the
-/// argv spelling, except under clang-cl's `-FC`, which makes it absolute.
-#[test]
-fn key_source_path_follows_what_file_expands_to() {
-    let cwd = std::env::current_dir().unwrap();
-    let absolute = absolutize_path(&cwd, Path::new("src/unit.c"))
-        .to_string_lossy()
-        .into_owned();
-    for fc in ["/FC", "-FC"] {
-        let parsed =
-            CcArgs::parse(&s(&["clang-cl", "-c", fc, "/Founit.obj", "src/unit.c"])).unwrap();
-        assert_eq!(
-            cc_key_source_path(&parsed, Path::new("src/unit.c"), &[]),
-            absolute,
-            "{fc}"
-        );
-    }
-    let cl = CcArgs::parse(&s(&["clang-cl", "-c", "/Founit.obj", "src/unit.c"])).unwrap();
-    assert_eq!(
-        cc_key_source_path(&cl, Path::new("src/unit.c"), &[]),
-        "src/unit.c"
-    );
-    let gnu = CcArgs::parse(&s(&["cc", "-c", "src/unit.c", "-o", "unit.o"])).unwrap();
-    assert_eq!(
-        cc_key_source_path(&gnu, Path::new("src/unit.c"), &[]),
-        "src/unit.c"
-    );
-}

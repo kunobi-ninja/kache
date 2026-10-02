@@ -1,0 +1,55 @@
+# kache-e2e fixture: e2e-cc-same-content-sources for clang-cl.
+#
+# src/a/util.c and src/b/util.c read the same bytes; each object holds its
+# own `__FILE__`. clang-cl keys from the same contents-only read set as the
+# GNU drivers and gets no prefix maps, so without the source path in the key
+# the second copy hit the first copy's entry. Compile-only: no linker or SDK
+# needed, so it runs on every OS.
+
+name = "e2e-cc-cl-same-content-sources"
+tags = ["suite:e2e", "lang:cc", "case:false-hit"]
+requires = ["clang"]
+
+[source]
+kind = "fixture"
+path = "source"
+
+[env]
+CC = "$KACHE clang --driver-mode=cl"
+
+[commands]
+build = "make"
+clean = "make clean"
+
+# Each object must be the one its own compile produced, at every hit.
+[diff]
+artifacts = ["build/a/util.obj", "build/b/util.obj"]
+
+[modify]
+file = "src/a/util.h"
+find = "v1"
+replace = "v2"
+
+# Cold: two translation units, two compiles. A shared entry shows up here as
+# a hit for the second copy.
+[assertions.cold]
+min_misses = 2
+max_compiler_runs = 2
+
+[assertions.warm]
+min_hits = 2
+max_misses = 0
+max_compiler_runs = 0
+
+[assertions.noop]
+should_not_recompile = false
+
+[assertions.relocate]
+min_hits = 2
+max_compiler_runs = 0
+
+# Relocate-modified: the edited copy misses; the other still hits.
+[assertions.relocate-modified]
+min_misses = 1
+max_misses = 1
+max_compiler_runs = 1

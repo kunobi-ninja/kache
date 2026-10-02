@@ -8856,6 +8856,18 @@ fn a_deferred_cc_compile_is_stored_unless_a_peer_beat_it_or_an_input_moved() {
         )),
         "the include-dir check runs only for a memo that could be recorded"
     );
+    use crate::compiler::cc::CompileMode;
+    assert!(cc_include_dirs_hold(CompileMode::Compile, || true));
+    assert!(
+        !cc_include_dirs_hold(CompileMode::Compile, || false),
+        "a compile re-checks its include dirs"
+    );
+    assert!(
+        cc_include_dirs_hold(CompileMode::Preprocess, || panic!(
+            "re-checked a preprocess"
+        )),
+        "only a compile re-checks"
+    );
     assert!(cc_restore_committed(false, true));
     assert!(
         !cc_restore_committed(false, false),

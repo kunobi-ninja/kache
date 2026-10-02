@@ -42,7 +42,7 @@ came from the second pass.
 | `__FILE__` / out-of-tree base-dir handling (#410) | `e2e-cc-file-macro-oot`, `e2e-cmake-file-macro-oot` |
 | Checkout paths in string literals stay checkout-bound (#1004) | `e2e-cc-literal-path` |
 | Files read by the assembler (`.incbin`, `.include`, macro-built) are never cached (#1015) | `e2e-cc-asm-incbin` |
-| Byte-identical sources at different paths keep their own entries | `e2e-cc-same-content-sources`, `e2e-cc-same-content-sources-parallel` |
+| Byte-identical sources at different paths keep their own entries | `e2e-cc-same-content-sources`, `e2e-cc-same-content-sources-parallel`, `e2e-cc-cl-same-content-sources` |
 | A compile-first miss records its memo when the entry already exists (#1390) | `e2e-cc-memo-after-entry`, `e2e-cc-same-content-sources-parallel` |
 | CMake launcher + Ninja generator | `e2e-cmake-out-of-tree`, `e2e-cmake-file-macro-oot`, `e2e-cmake-ninja-flagset` |
 | Unsupported-flag passthrough | `e2e-c-passthrough` |

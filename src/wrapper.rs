@@ -2179,8 +2179,9 @@ fn run_cc_with_store(
     let clean = should_store_cc_result(result.exit_code, !result.artifacts.is_empty());
     let store_candidate = cc_store_candidate(clean, inputs_changed, peer_committed);
     let memo_publishable = cc_memo_publishable(clean, inputs_changed, || {
-        !cc_store_revalidates_include_dirs(parsed.mode)
-            || compiler.include_dir_names_still_match(parsed)
+        cc_include_dirs_hold(parsed.mode, || {
+            compiler.include_dir_names_still_match(parsed)
+        })
     });
     // Without a live daemon, keep the ordinary staging and memo path.
     // The lifetime lock works for both Unix sockets and Windows pipes.
@@ -2193,7 +2194,9 @@ fn run_cc_with_store(
     let handoff_memo = daemon_publish
         .then(|| compiler.captured_preprocess_memo())
         .flatten();
-    if store_candidate && memo_publishable && handoff_memo.is_none() {
+    // Record it before a hand-off can take the compile: an accepted hand-off
+    // discards a memo the daemon was not given.
+    if memo_publishable && handoff_memo.is_none() {
         compiler.commit_preprocess_memo(&file_hasher);
     }
     let publishes_to_remote = cc_publishes_to_remote(parsed);
@@ -2494,6 +2497,15 @@ fn cc_preprocess_restore_target(
 
 fn cc_store_revalidates_include_dirs(mode: crate::compiler::cc::CompileMode) -> bool {
     mode == crate::compiler::cc::CompileMode::Compile
+}
+
+/// Whether the include dirs still resolve every name the way the key saw
+/// them. Only a compile re-checks; `names_still_match` does the work.
+fn cc_include_dirs_hold(
+    mode: crate::compiler::cc::CompileMode,
+    names_still_match: impl FnOnce() -> bool,
+) -> bool {
+    !cc_store_revalidates_include_dirs(mode) || names_still_match()
 }
 
 fn cc_cache_entry_rejection_reason(

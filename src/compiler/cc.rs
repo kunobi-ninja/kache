@@ -3699,18 +3699,18 @@ pub static CC_FLAGS: &[FlagSpec] = &[
     },
     // ── PreprocessorCaptured: -FC makes __FILE__ expand to the full path ──
     //
-    // The key folds the absolute source path when `-FC` is present (see
-    // `cc_key_source_path`), so its effect on `__FILE__` is in the key.
+    // clang accepts `-FC` and ignores it: `__FILE__` keeps the argv
+    // spelling (checked with clang 23), and the key folds that spelling.
     FlagSpec {
         matcher: Matcher::Exact("-FC"),
         class: FlagClass::PreprocessorCaptured,
-        source: "#285 Layer 4 — clang-cl full-path __FILE__ (-FC). Makes __FILE__ expand to the absolute source path, which the key folds.",
+        source: "#285 Layer 4 — clang-cl full-path __FILE__ (-FC). MSVC makes __FILE__ absolute; clang accepts the flag and ignores it.",
         dialect: Some(Dialect::Cl),
     },
     FlagSpec {
         matcher: Matcher::Exact("/FC"),
         class: FlagClass::PreprocessorCaptured,
-        source: "#285 Layer 4 — clang-cl full-path __FILE__ (/FC). Makes __FILE__ expand to the absolute source path, which the key folds.",
+        source: "#285 Layer 4 — clang-cl full-path __FILE__ (/FC). MSVC makes __FILE__ absolute; clang accepts the flag and ignores it.",
         dialect: Some(Dialect::Cl),
     },
     // ── NoObjectEffect: diagnostics / build mechanics ──
@@ -5146,18 +5146,6 @@ fn cc_mapped_path(path: &Path, prefix_maps: &[CcPrefixMap]) -> String {
     // same way.
     let text = path.to_string_lossy().into_owned().into_bytes();
     String::from_utf8_lossy(&apply_cc_prefix_maps_to_bytes(text, prefix_maps)).into_owned()
-}
-
-/// A source path as the object spells it. That is the argv spelling, except
-/// under clang-cl's `-FC`, which makes `__FILE__` absolute; clang-cl gets no
-/// prefix maps, so the absolute path stays literal.
-fn cc_key_source_path(parsed: &CcArgs, source: &Path, prefix_maps: &[CcPrefixMap]) -> String {
-    let full_path = parsed.family.dialect() == Dialect::Cl
-        && parsed.rest.iter().any(|arg| arg == "-FC" || arg == "/FC");
-    match std::env::current_dir() {
-        Ok(cwd) if full_path => cc_mapped_path(&absolutize_path(&cwd, source), prefix_maps),
-        _ => cc_mapped_path(source, prefix_maps),
-    }
 }
 
 /// blake3 of a file's contents with the prefix maps applied.
@@ -7006,7 +6994,7 @@ impl CcCompiler {
         // agree.
         hasher.update(b"source_paths:");
         for source in &parsed.sources {
-            let mapped = cc_key_source_path(parsed, source, &prefix_maps);
+            let mapped = cc_mapped_path(source, &prefix_maps);
             hasher.update(mapped.as_bytes());
             hasher.update(b"\x1f");
             tracing::trace!(

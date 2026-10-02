@@ -134,7 +134,9 @@ pub fn install_shim(args: &RustcArgs) {
         return;
     };
     if let Err(error) = install(&executable) {
-        tracing::debug!(
+        // The script then runs without kache: uncached, and with no event, so
+        // nothing else says it happened.
+        tracing::warn!(
             "build-script launcher not installed for {}: {error:#}",
             executable.display()
         );
@@ -312,7 +314,7 @@ pub fn run_shim() -> i32 {
         match run_cached(&real, &argv) {
             Ok(code) => Some(code),
             Err(error) => {
-                tracing::debug!("build-script cache bypassed: {error:#}");
+                log_bypass(&error);
                 None
             }
         }
@@ -320,6 +322,35 @@ pub fn run_shim() -> i32 {
         None
     };
     cached.unwrap_or_else(|| run_real(&real, &argv))
+}
+
+/// A run the cache gave up on before it ran or recorded anything: it runs
+/// uncached, and without this nothing in a report says so. The next build
+/// misses the unit with no earlier event to explain it.
+fn log_bypass(error: &anyhow::Error) {
+    tracing::warn!("build-script cache bypassed: {error:#}");
+    let Ok(config) = Config::load() else {
+        return;
+    };
+    let out_dir = std::env::var_os("OUT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_default();
+    let manifest_dir = std::env::var_os("CARGO_MANIFEST_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_default();
+    let root = crate::wrapper::build_script_event_root(&out_dir, &manifest_dir);
+    crate::wrapper::log_event(
+        &config,
+        EventInputs::new(&root, CRATE_NAME, EventResult::Passthrough, 0)
+            .package(package_name())
+            .passthrough_reason(bypass_reason(error)),
+    );
+}
+
+/// The passthrough reason for a bypassed run: the outermost context only, so
+/// one cause groups as one reason instead of one per path in its chain.
+fn bypass_reason(error: &anyhow::Error) -> String {
+    format!("refused|build-script cache bypassed: {error}")
 }
 
 fn real_command(real: &Path, argv: &[std::ffi::OsString]) -> Command {
@@ -3888,6 +3919,38 @@ mod tests {
         std::os::unix::fs::symlink("a.c", root.join("src/link.c")).unwrap();
         assert!(tree_stamp(&root, &[], 100).is_none());
         unsafe { std::env::remove_var("KACHE_CACHE_DIR") };
+    }
+
+    /// A run the cache gave up on still leaves an event, so the next build's
+    /// miss has a cause in the report. The reason keeps only the outermost
+    /// context: one cause is one reason, whatever paths its chain names.
+    #[test]
+    fn a_bypassed_run_is_logged_as_a_passthrough_with_its_cause() {
+        let _lock = crate::test_support::process_state_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        // SAFETY: the process-state lock serialises environment edits.
+        unsafe {
+            std::env::set_var("KACHE_CACHE_DIR", dir.path().join("cache"));
+            std::env::set_var("KACHE_RUNTIME_DIR", dir.path().join("run"));
+        }
+        std::fs::create_dir_all(dir.path().join("run")).unwrap();
+        let error = anyhow::anyhow!("database is locked: /some/path/index.db")
+            .context("looking up the build-script run");
+        log_bypass(&error);
+
+        let config = Config::load().unwrap();
+        let events = crate::events::read_events(&config.event_log_path()).unwrap();
+        unsafe {
+            std::env::remove_var("KACHE_CACHE_DIR");
+            std::env::remove_var("KACHE_RUNTIME_DIR");
+        }
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0].crate_name, CRATE_NAME);
+        assert_eq!(events[0].result, EventResult::Passthrough);
+        assert_eq!(
+            events[0].passthrough_reason,
+            "refused|build-script cache bypassed: looking up the build-script run"
+        );
     }
 
     #[test]

@@ -6848,6 +6848,21 @@ impl Daemon {
                         "gc: post-eviction demand by shadow verdict (value-density, #594)"
                     );
                 }
+                // Both sides over the same sweeps: what each policy's
+                // evictions cost in rebuilds the build later asked for.
+                if let Ok(cost) = store.shadow_counterfactual()
+                    && cost.shadow.evicted > 0
+                {
+                    tracing::info!(
+                        live_evicted = cost.live.evicted,
+                        live_bytes = cost.live.bytes,
+                        live_demanded_compile_time_ms = cost.live.demanded_compile_time_ms,
+                        shadow_evicted = cost.shadow.evicted,
+                        shadow_bytes = cost.shadow.bytes,
+                        shadow_demanded_compile_time_ms = cost.shadow.demanded_compile_time_ms,
+                        "gc: rebuild cost of each policy's evictions (value-density, #594)"
+                    );
+                }
 
                 let (dedup_stats, age_evict_stats, evict_stats) = match policy {
                     GcPolicy::ExplicitAge { hours } => (

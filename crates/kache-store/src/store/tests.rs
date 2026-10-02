@@ -8458,6 +8458,163 @@ fn size_sweep_records_shadow_verdicts_and_demand_splits() {
     );
 }
 
+/// kunobi-ninja/kache#594: the shadow's own victims, the entries it would
+/// have evicted that the live policy kept, are recorded once, and later use
+/// of one counts against the shadow. With both sides in, each policy is
+/// charged for the rebuilds its evictions caused.
+#[test]
+fn size_sweep_records_the_shadows_own_victims_for_both_sided_cost() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path());
+    config.max_size = 450_000; // target 405_000; physical 500_000
+    let store = Store::open(&config).unwrap();
+
+    for (key, bytes, fill, compile_ms) in [
+        ("huge_expensive", 400_000usize, b'a', 60_000u64),
+        ("small_cheap", 100_000usize, b'b', 7u64),
+    ] {
+        let src = dir.path().join(format!("{key}.rlib"));
+        std::fs::write(&src, vec![fill; bytes]).unwrap();
+        store
+            .put_with_compile_time(
+                key,
+                "c",
+                &["lib".into()],
+                &[],
+                "",
+                "dev",
+                &[(src.clone(), "lib.rlib".into())],
+                "",
+                "",
+                compile_ms,
+            )
+            .unwrap();
+        store.remove_clone_for_test(&src);
+    }
+    let age = |store: &Store| {
+        store
+            .db
+            .execute(
+                "UPDATE entries SET last_accessed = datetime('now', '-1 hour')",
+                [],
+            )
+            .unwrap();
+    };
+    age(&store);
+
+    store.evict().unwrap();
+    assert!(!store.contains("huge_expensive"));
+    assert!(store.contains("small_cheap"), "the live policy kept it");
+    let recorded = |store: &Store| -> Vec<(String, i64, i64)> {
+        let mut stmt = store
+            .db
+            .prepare("SELECT cache_key, size, compile_time_ms FROM shadow_victims")
+            .unwrap();
+        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    };
+    assert_eq!(
+        recorded(&store),
+        vec![("small_cheap".to_string(), 100_000, 7)],
+        "only the entry the shadow would have taken instead"
+    );
+
+    // Nothing asked for either yet: both sides evicted, neither paid.
+    let quiet = store.shadow_counterfactual().unwrap();
+    assert_eq!(
+        quiet.live,
+        PolicyCost {
+            evicted: 1,
+            bytes: 400_000,
+            demanded_compile_time_ms: 0,
+        }
+    );
+    assert_eq!(
+        quiet.shadow,
+        PolicyCost {
+            evicted: 1,
+            bytes: 100_000,
+            demanded_compile_time_ms: 0,
+        }
+    );
+
+    // The build uses both again. The live policy pays for the expensive
+    // rebuild; the shadow pays for the hit on the entry it would have lost.
+    assert!(store.get("huge_expensive").unwrap().is_none());
+    assert!(store.get("small_cheap").unwrap().is_some());
+    let used = store.shadow_counterfactual().unwrap();
+    assert_eq!(used.live.demanded_compile_time_ms, 60_000);
+    assert_eq!(used.shadow.demanded_compile_time_ms, 7);
+
+    // A later sweep that wants the same victim again keeps its first record,
+    // since that is when the shadow would have removed it.
+    store
+        .db
+        .execute(
+            "UPDATE shadow_victims SET swept_at = datetime('now', '-1 day')",
+            [],
+        )
+        .unwrap();
+    let first: String = store
+        .db
+        .query_row("SELECT swept_at FROM shadow_victims", [], |row| row.get(0))
+        .unwrap();
+    let victim = store
+        .eviction_candidates_for(SweepOrigin::Requested)
+        .unwrap()
+        .into_iter()
+        .find(|entry| entry.key == "small_cheap")
+        .unwrap();
+    store.record_shadow_victims("value-density", "2026-01-01 00:00:00", &[&victim]);
+    let again: String = store
+        .db
+        .query_row("SELECT swept_at FROM shadow_victims", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(again, first);
+
+    // Retention follows the tombstones.
+    store.prune_tombstones(0).unwrap();
+    assert!(recorded(&store).is_empty());
+}
+
+/// Entries the sweep itself protects are kept under any ranking, so they
+/// are not the shadow's victims.
+#[test]
+fn shadow_only_victims_skip_what_the_sweep_protects() {
+    let features = |key: &str| crate::eviction::EntryFeatures {
+        key: key.to_string(),
+        size: 1,
+        hit_count: 0,
+        idle_hours: 1.0,
+        content_hash: None,
+        committed: true,
+        compile_time_ms: 1,
+        reclaimable_bytes: Some(1),
+        recently_accessed: key == "recent",
+        recently_imported: key == "imported",
+    };
+    let all: Vec<_> = ["evicted", "durable", "held", "recent", "imported", "plain"]
+        .into_iter()
+        .map(features)
+        .collect();
+    let by_key = all.iter().map(|f| (f.key.as_str(), f)).collect();
+    let shadow = ShadowSelection {
+        policy: "value-density",
+        victims: all.iter().map(|f| f.key.clone()).collect(),
+    };
+    let evicted = ["evicted"].into_iter().collect();
+    let durable = ["durable".to_string()].into_iter().collect();
+    let held = [("held".to_string(), 1)].into_iter().collect();
+
+    let kept = shadow_only_victims(&shadow, &evicted, &by_key, &durable, &held);
+    assert_eq!(
+        kept.iter().map(|f| f.key.as_str()).collect::<Vec<_>>(),
+        vec!["plain"]
+    );
+}
+
 /// kunobi-ninja/kache#608 (honest accounting): a sweep over a fully-shared
 /// family reports the physical bytes it freed (once, when the last
 /// reference goes), not the logical sum of the evicted entries.

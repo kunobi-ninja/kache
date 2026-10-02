@@ -34,6 +34,10 @@ setup = [
 # selection. KACHE_BASE_DIR keeps checkout-absolute paths (OUT_DIR from
 # prost-build, CARGO_MANIFEST_DIR) portable across the two clones so the
 # headline cross-clone metric is measuring kache, not path baking.
+# Untimed: a download inside a timed build is network time, not cache
+# time, and the engine refuses it.
+prepare = "cargo fetch"
+
 build = """
 src="$(pwd -P)"
 cargo build --release -p lance

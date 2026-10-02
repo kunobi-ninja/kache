@@ -35,6 +35,10 @@ setup = [
 # measures): each clone builds at a different absolute path, so pin
 # native-build paths/determinism the same way bench-surrealdb does. These
 # knobs change build PATHS and timestamps, not WHAT is built.
+# Untimed: a download inside a timed build is network time, not cache
+# time, and the engine refuses it.
+prepare = "cd core && cargo fetch --locked"
+
 build = """
 repo="$(pwd -P)"
 prefix_map="-ffile-prefix-map=$repo=. -fdebug-prefix-map=$repo=. -fmacro-prefix-map=$repo=."

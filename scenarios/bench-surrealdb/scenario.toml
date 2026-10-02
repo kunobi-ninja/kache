@@ -32,6 +32,10 @@ setup = [
 # No RUSTUP_TOOLCHAIN pin: the tree's rust-toolchain.toml drives toolchain
 # selection. This shell lives in config rather than Rust, which is the whole
 # point of scenarios.
+# Untimed: a download inside a timed build is network time, not cache
+# time, and the engine refuses it.
+prepare = "cargo fetch"
+
 build = """
 # Input-set predictions, with a sampled cross-check (kunobi-ninja/kache#945).
 # Predictions replace the rustc dep-info pre-pass with a recorded closure, so

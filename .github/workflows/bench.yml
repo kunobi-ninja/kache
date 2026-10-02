@@ -320,7 +320,7 @@ jobs:
       - name: Seed failure telemetry
         run: |
           mkdir -p tmp/bench
-          npx --yes @kunobi/kartero@0.3.0 gauge \
+          npx --yes @kunobi/kartero@0.4.14 gauge \
             --name kache.bench.verdict.ok \
             --value 0 \
             --unit 1 \
@@ -524,7 +524,7 @@ jobs:
       - name: Validate telemetry
         if: always()
         timeout-minutes: 5
-        run: npx --yes @kunobi/kartero@0.3.0 validate --input tmp/bench/${{ matrix.dir }}
+        run: npx --yes @kunobi/kartero@0.4.14 validate --input tmp/bench/${{ matrix.dir }}
         env:
           NPM_CONFIG_CACHE: ${{ runner.temp }}/kartero-npm-cache
 
@@ -543,8 +543,19 @@ jobs:
 
       # Daemon/store counters (`kache.cache.*`), not the bench gauges above.
       # Separate artifacts so Kartero imports them as different payloads.
-      # Do not validate with @kunobi/kartero@0.3.0: that CLI's published
-      # allowlist does not include kache.cache.* yet.
+      # Checked like the bench payload: since 0.4.14 the CLI refuses what the
+      # collector would refuse, and it has no metric-name allowlist to fail on.
+      - name: Validate cache telemetry
+        if: always()
+        timeout-minutes: 5
+        run: |
+          for dir in tmp/bench/${{ matrix.dir }}/cache-otlp-*/; do
+            [ -f "$dir/metrics.otlp.json" ] || continue
+            npx --yes @kunobi/kartero@0.4.14 validate --input "$dir"
+          done
+        env:
+          NPM_CONFIG_CACHE: ${{ runner.temp }}/kartero-npm-cache
+
       - name: Upload cache telemetry (cold)
         if: always()
         timeout-minutes: 10

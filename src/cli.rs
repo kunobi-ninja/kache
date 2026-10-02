@@ -1292,7 +1292,7 @@ fn service_rows(snap: &StatsSnapshot, config: &Config) -> Vec<StatsRow> {
         ),
     };
     rows.push((
-        "Remote",
+        "Remote store",
         format!("{remote_status}{remote_source}"),
         String::new(),
     ));

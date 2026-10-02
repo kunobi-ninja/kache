@@ -1383,6 +1383,18 @@ mod tests {
             single("two", "/second", "now", 101, "4444"),
         ];
         assert_eq!(other_checkout_misses(&events, &[2, 3]), (2, None));
+
+        // Both crates last built in the same other checkout: that one is named.
+        let events = vec![
+            single("one", "/first", "a", 0, "1111"),
+            single("two", "/first", "a", 10, "3333"),
+            single("one", "/second", "now", 100, "2222"),
+            single("two", "/second", "now", 101, "4444"),
+        ];
+        assert_eq!(
+            other_checkout_misses(&events, &[2, 3]),
+            (2, Some("/first".to_string()))
+        );
     }
 
     /// A miss below two changed leaves names both, not the first one the

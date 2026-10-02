@@ -863,26 +863,16 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn released_locks_are_free_while_a_fork_holds_a_duplicate() {
+    fn released_locks_are_free_while_a_duplicate_is_open() {
         let dir = tempfile::tempdir().unwrap();
         let held = hold(dir.path()).unwrap();
-        // SAFETY: the child only waits in `pause` until the parent kills it.
-        let child = unsafe { libc::fork() };
-        assert!(child >= 0, "fork failed");
-        if child == 0 {
-            loop {
-                // SAFETY: async-signal-safe; nothing else runs in the child.
-                unsafe { libc::pause() };
-            }
-        }
+        // A fork shares the open file description the same way a duplicate does.
+        let duplicates: Vec<_> = held.0.iter().map(|f| f.try_clone().unwrap()).collect();
+        assert_eq!(duplicates.len(), LOCKS.len());
+        assert!(hold(dir.path()).is_none(), "the locks are held");
         drop(held);
-        let free = hold(dir.path()).is_some();
-        // SAFETY: `child` is this test's own child process.
-        unsafe {
-            libc::kill(child, libc::SIGKILL);
-            libc::waitpid(child, std::ptr::null_mut(), 0);
-        }
-        assert!(free, "the child's duplicate kept a lock held");
+        assert!(hold(dir.path()).is_some(), "a duplicate kept a lock held");
+        drop(duplicates);
     }
 
     #[test]

@@ -5089,10 +5089,115 @@ fn rustup_settings_path_explicit_home_fixture() {
         .map(std::path::PathBuf::from)
         .expect("fixture requires its isolated expected home");
 
-    assert_eq!(
-        rustup_settings_path(),
-        Some(expected_home.join("settings.toml"))
+    assert_eq!(rustup_home(), Some(expected_home));
+}
+
+/// #1406: `rustup update nightly` swaps the toolchain behind an unchanged
+/// shim and an unchanged selection. The version probe must see the new
+/// compiler, or its old `rustc -vV` keys entries the new one cannot read.
+#[cfg(unix)]
+#[test]
+#[ignore = "spawned by the toolchain update regression"]
+fn rustc_version_after_toolchain_update_fixture() {
+    let home = std::env::var_os("RUSTUP_HOME")
+        .map(PathBuf::from)
+        .expect("fixture requires an isolated RUSTUP_HOME");
+    let toolchain_rustc = home.join("toolchains/nightly-test/bin/rustc");
+    let shim = home.join("shim/rustc");
+    for file in [&toolchain_rustc, &shim] {
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    }
+    let install = |commit: &str, mtime: i64| {
+        kache_fs::testutil::write_executable(
+            &toolchain_rustc,
+            format!("#!/bin/sh\necho 'rustc 1.101.0-nightly ({commit})'\n"),
+        );
+        filetime::set_file_mtime(
+            &toolchain_rustc,
+            filetime::FileTime::from_unix_time(mtime, 0),
+        )
+        .unwrap();
+    };
+    // The shim stays put, like `~/.cargo/bin/rustc` or Homebrew's wrapper.
+    kache_fs::testutil::write_executable(
+        &shim,
+        format!("#!/bin/sh\nexec '{}' \"$@\"\n", toolchain_rustc.display()),
     );
+
+    install("c1070d693", 1_790_000_000);
+    assert_eq!(
+        get_rustc_version(&shim).unwrap(),
+        "rustc 1.101.0-nightly (c1070d693)"
+    );
+    install("21b707e3f", 1_790_200_000);
+    assert_eq!(
+        get_rustc_version(&shim).unwrap(),
+        "rustc 1.101.0-nightly (21b707e3f)"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn rustc_version_follows_a_toolchain_update_behind_its_shim() {
+    let cache_dir = crate::config::default_cache_dir();
+    if std::fs::create_dir_all(&cache_dir).is_err() || tempfile::tempfile_in(&cache_dir).is_err() {
+        eprintln!("skipping: {} is not writable", cache_dir.display());
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let output = std::process::Command::new(
+        std::env::current_exe().expect("resolve cache-key test executable"),
+    )
+    .args([
+        "--ignored",
+        "--exact",
+        "cache_key::tests::rustc_version_after_toolchain_update_fixture",
+        "--test-threads=1",
+    ])
+    .env("RUSTUP_HOME", dir.path())
+    .env_remove("RUSTUP_TOOLCHAIN")
+    .output()
+    .expect("spawn isolated toolchain update fixture");
+
+    assert!(
+        output.status.success(),
+        "toolchain update fixture failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// What the fingerprint must notice, and what it must not depend on.
+#[test]
+fn installed_toolchains_fingerprint_tracks_installed_compilers() {
+    let dir = tempfile::tempdir().unwrap();
+    let toolchains = dir.path().join("toolchains");
+    assert_eq!(installed_toolchains_fingerprint(None), "");
+    assert_eq!(installed_toolchains_fingerprint(Some(&toolchains)), "");
+
+    let rustc = format!("rustc{}", std::env::consts::EXE_SUFFIX);
+    let install = |name: &str, content: &str, mtime: i64| {
+        let path = toolchains.join(name).join("bin").join(&rustc);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, content).unwrap();
+        filetime::set_file_mtime(&path, filetime::FileTime::from_unix_time(mtime, 0)).unwrap();
+    };
+    install("stable", "stable", 1_000);
+    install("nightly", "old", 2_000);
+    let base = installed_toolchains_fingerprint(Some(&toolchains));
+    assert_eq!(base, installed_toolchains_fingerprint(Some(&toolchains)));
+
+    // An update with the same size still moves the mtime.
+    install("nightly", "new", 3_000);
+    let updated = installed_toolchains_fingerprint(Some(&toolchains));
+    assert_ne!(updated, base);
+    // A rebuild that keeps the mtime still changes the size.
+    install("nightly", "newer", 3_000);
+    let rebuilt = installed_toolchains_fingerprint(Some(&toolchains));
+    assert_ne!(rebuilt, updated);
+    // Installing a toolchain, even one with no compiler yet, moves it.
+    std::fs::create_dir_all(toolchains.join("beta")).unwrap();
+    assert_ne!(installed_toolchains_fingerprint(Some(&toolchains)), rebuilt);
 }
 
 #[test]

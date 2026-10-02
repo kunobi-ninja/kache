@@ -726,8 +726,19 @@ fn median(samples: &[u64]) -> Option<u64> {
 
 /// Read all events from the event log.
 pub fn read_events(event_log_path: &Path) -> Result<Vec<BuildEvent>> {
+    Ok(read_events_and(event_log_path, || ())?.0)
+}
+
+/// Read all events from the event log, and call `also` under the same shared
+/// lock. A rotation replaces the log under the exclusive lock before it folds
+/// the dropped events into the savings ledger, so reading the ledger in
+/// `also` never sees an event in both.
+pub fn read_events_and<T>(
+    event_log_path: &Path,
+    also: impl FnOnce() -> T,
+) -> Result<(Vec<BuildEvent>, T)> {
     if !event_log_path.exists() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), also()));
     }
 
     let lock = open_log_lock(event_log_path).context("opening event log lock")?;
@@ -750,8 +761,9 @@ pub fn read_events(event_log_path: &Path) -> Result<Vec<BuildEvent>> {
         }
     }
 
+    let extra = also();
     lock.unlock().context("unlocking event log")?;
-    Ok(events)
+    Ok((events, extra))
 }
 
 /// Read events since a given timestamp.
@@ -1102,11 +1114,16 @@ pub fn session_cut_by_rotation(event_log_path: &Path) -> Option<String> {
 
 /// Rotate the event log if it exceeds the max size, keeping the build in
 /// progress (see [`retained_suffix`]).
+///
+/// `fold` receives the complete lines the rotation drops, after the log has
+/// been replaced and its lock released, so concurrent appends do not wait on
+/// the fold. A failed fold is logged; the rotation stands.
 fn rotate_log_impl(
     log_path: &Path,
     max_size: u64,
     keep_lines: usize,
     log_label: &str,
+    fold: impl FnOnce(&[&str]) -> Result<()>,
 ) -> Result<()> {
     if !log_path.exists() {
         return Ok(());
@@ -1123,10 +1140,11 @@ fn rotate_log_impl(
     let lock = open_log_lock(log_path).context("opening log lock")?;
     lock.lock().context("locking log for rotation")?;
 
-    let res = (|| -> Result<()> {
+    // The dropped lines, for the fold after the lock is released.
+    let res = (|| -> Result<Option<String>> {
         let meta = fs::metadata(log_path)?;
         if meta.len() <= max_size {
-            return Ok(());
+            return Ok(None);
         }
 
         // Clean up stale temp files in the same directory (older than 5 minutes)
@@ -1156,6 +1174,7 @@ fn rotate_log_impl(
         let output = kept.concat();
         crate::atomic::atomic_replace(log_path, output.as_bytes())
             .context("writing and replacing log file atomically")?;
+        let dropped = lines[..retained.start].concat();
 
         // Record the rotation so tailers can map their cursor onto the new
         // file instead of re-delivering the retained tail (#528). Written
@@ -1182,17 +1201,50 @@ fn rotate_log_impl(
             kept.len(),
             lines.len()
         );
-        Ok(())
+        Ok(Some(dropped))
     })();
 
     let _ = lock.unlock();
-    res
+    // After the replace: a crash before the fold loses these lines from the
+    // ledger rather than counting them twice. A reader between the two sees
+    // them in neither, briefly, never in both.
+    if let Some(dropped) = res? {
+        let lines: Vec<&str> = dropped.split_inclusive('\n').collect();
+        if let Err(e) = fold(&lines) {
+            tracing::warn!("folding rotated {log_label} lines: {e:#}");
+        }
+    }
+    Ok(())
 }
 
 /// Rotate the event log if it exceeds the max size, keeping at least the
 /// last `keep_lines` lines and the build session in progress.
 pub fn rotate_if_needed(event_log_path: &Path, max_size: u64, keep_lines: usize) -> Result<()> {
-    rotate_log_impl(event_log_path, max_size, keep_lines, "event log")
+    rotate_log_impl(
+        event_log_path,
+        max_size,
+        keep_lines,
+        "event log",
+        |_| Ok(()),
+    )
+}
+
+/// [`rotate_if_needed`] for the build event log: the events a rotation drops
+/// are added to the savings ledger in `cache_dir`, so lifetime totals
+/// outlive the log.
+pub fn rotate_events_if_needed(
+    event_log_path: &Path,
+    max_size: u64,
+    keep_lines: usize,
+    cache_dir: &Path,
+) -> Result<()> {
+    rotate_log_impl(
+        event_log_path,
+        max_size,
+        keep_lines,
+        "event log",
+        |dropped| crate::savings::fold_dropped_lines(cache_dir, dropped),
+    )
 }
 
 // ── Summary log ─────────────────────────────────────────────────────────────
@@ -1353,7 +1405,13 @@ pub fn rotate_transfers_if_needed(
     max_size: u64,
     keep_lines: usize,
 ) -> Result<()> {
-    rotate_log_impl(transfer_log_path, max_size, keep_lines, "transfer log")
+    rotate_log_impl(
+        transfer_log_path,
+        max_size,
+        keep_lines,
+        "transfer log",
+        |_| Ok(()),
+    )
 }
 
 /// Clear the event log.

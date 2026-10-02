@@ -148,7 +148,13 @@ fn gc_runs_history_is_appended_only_with_record_sessions() {
         ..Default::default()
     };
 
-    record_gc_run(&config, "daemon", &run).unwrap();
+    record_gc_run(
+        &config,
+        "daemon",
+        crate::store::SweepOrigin::Automatic,
+        &run,
+    )
+    .unwrap();
     let persisted = read_gc_stats(&config.cache_dir).unwrap();
     assert_eq!(persisted.source, "daemon");
     assert_eq!(persisted.bytes_held, 12);
@@ -158,8 +164,14 @@ fn gc_runs_history_is_appended_only_with_record_sessions() {
     );
 
     config.record_sessions = true;
-    record_gc_run(&config, "auto", &run).unwrap();
-    record_gc_run(&config, "manual", &crate::store::GcStats::default()).unwrap();
+    record_gc_run(&config, "auto", crate::store::SweepOrigin::Automatic, &run).unwrap();
+    record_gc_run(
+        &config,
+        "manual",
+        crate::store::SweepOrigin::Requested,
+        &crate::store::GcStats::default(),
+    )
+    .unwrap();
 
     let log = std::fs::read_to_string(gc_runs_log_path(&config.cache_dir)).unwrap();
     let records: Vec<GcRunRecord> = log
@@ -215,7 +227,13 @@ fn gc_runs_history_rotates_like_the_other_logs() {
             entries_evicted,
             ..Default::default()
         };
-        record_gc_run(&config, "manual", &run).unwrap();
+        record_gc_run(
+            &config,
+            "manual",
+            crate::store::SweepOrigin::Requested,
+            &run,
+        )
+        .unwrap();
     }
     let log = std::fs::read_to_string(gc_runs_log_path(&config.cache_dir)).unwrap();
     let evicted: Vec<usize> = log

@@ -58,6 +58,7 @@ mod remote_plan;
 mod remote_resilience;
 mod report;
 mod run_diff;
+mod savings;
 mod scheduler;
 mod service;
 mod shards;

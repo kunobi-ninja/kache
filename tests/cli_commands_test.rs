@@ -769,6 +769,49 @@ fn why_miss_json_reports_the_last_recorded_miss() {
     assert_eq!(value["stored_entries"], 0);
 }
 
+/// `kache stats` adds lifetime totals from `savings.json` and the event log,
+/// and leaves them out while nothing is recorded.
+#[test]
+fn stats_reports_lifetime_totals_from_the_savings_ledger() {
+    let e = env();
+    let stats_json = |e: &Env| -> serde_json::Value {
+        let output = e.cmd().args(["--json", "stats"]).output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        serde_json::from_slice(&output.stdout).unwrap()
+    };
+    assert!(stats_json(&e).get("lifetime").is_none());
+    e.cmd()
+        .arg("stats")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("  Since ").not());
+
+    std::fs::write(
+        e.cache.join("savings.json"),
+        r#"{"schema":1,"since":"2026-09-12T08:00:00Z","hits":10,"hit_compile_time_ms":5000,
+            "zero_copy_bytes":4096,"copied_bytes":1024,
+            "pruned_automatic_bytes":3072,"pruned_requested_bytes":2048}"#,
+    )
+    .unwrap();
+    let lifetime = stats_json(&e)["lifetime"].clone();
+    assert_eq!(lifetime["since"], "2026-09-12T08:00:00Z");
+    assert_eq!(lifetime["hits"], 10);
+    assert_eq!(lifetime["hit_compile_time_ms"], 5000);
+    assert_eq!(lifetime["zero_copy_bytes"], 4096);
+    assert_eq!(lifetime["copied_bytes"], 1024);
+    assert_eq!(lifetime["pruned_automatic_bytes"], 3072);
+    assert_eq!(lifetime["pruned_requested_bytes"], 2048);
+    e.cmd().arg("stats").assert().success().stdout(
+        predicates::str::contains("lifetime")
+            .and(predicates::str::contains(
+                "compile work avoided over 10 hits",
+            ))
+            .and(predicates::str::contains(
+                "3.0 KiB automatically, 2.0 KiB on request",
+            )),
+    );
+}
+
 #[test]
 fn machine_readable_commands_emit_one_json_document() {
     let e = env();

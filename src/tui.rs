@@ -22,7 +22,7 @@ use crate::events;
 use crate::events::{BuildEvent, EventRecord, EventResult, EventTailer, HeartbeatEvent};
 use crate::heartbeat::format_secs;
 use crate::since::SinceWindow;
-use crate::tui_sessions::{self, Analysis, Cause, Session, SessionState};
+use crate::tui_sessions::{self, Analysis, Cause, Session};
 
 // ── Terminal mode guard ────────────────────────────────────────────────────
 
@@ -99,9 +99,11 @@ fn restore_terminal() {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Tab {
+    /// Landing screen: the store, the hit rate, and the builds.
+    Now,
     Build,
     /// Why the selected build missed: causes, passthrough reasons, chronic
-    /// misses. Sits next to Build because Enter on a build lands here.
+    /// misses. Enter on Now or Build lands here.
     Why,
     Projects,
     Store,
@@ -109,7 +111,8 @@ enum Tab {
 }
 
 impl Tab {
-    const ORDER: [Tab; 5] = [
+    const ORDER: [Tab; 6] = [
+        Tab::Now,
         Tab::Build,
         Tab::Why,
         Tab::Projects,
@@ -290,7 +293,7 @@ fn reset_filtered_viewports(state: &mut AppState) {
         Tab::Build => state.build_scroll.reset(),
         Tab::Store => state.store_scroll.reset(),
         Tab::Why => state.why_scroll.reset(),
-        Tab::Projects | Tab::Transfer => {}
+        Tab::Now | Tab::Projects | Tab::Transfer => {}
     }
 }
 
@@ -330,6 +333,7 @@ impl SortMode {
 type StatsSnapshot = cli::StatsSnapshot;
 
 /// Replace the user's home directory prefix with `~` for shorter, more private display.
+#[cfg(test)]
 fn shorten_home(path: &std::path::Path) -> String {
     if let Some(home) = dirs::home_dir()
         && let Ok(rest) = path.strip_prefix(&home)
@@ -374,6 +378,7 @@ struct ProjectScanData {
     scanned: bool,
 }
 
+#[cfg(test)]
 fn project_scan_status(stats_loaded: bool, scanning: bool, scanned: bool) -> &'static str {
     if !stats_loaded || scanning {
         "calculating"
@@ -423,6 +428,10 @@ struct AppState {
     project_scan: Arc<Mutex<ProjectScanData>>,
     last_project_refresh: Instant,
     project_scroll: Viewport,
+    /// Which tree the Projects list is on, and whether Enter has opened its
+    /// other columns.
+    selected_project: usize,
+    project_detail: bool,
 
     // Build sessions (kunobi-ninja/kache#583). Regrouped when the log grew,
     // re-sorted every tick. The selected build drives the Build event panel
@@ -468,19 +477,41 @@ struct AppState {
     spark_window: Duration,
     rustc_version: String,
     wrapper_status: String,
-    service_installed: bool,
 }
 
 impl AppState {
     /// The viewport of the panel the active tab scrolls.
     fn active_viewport(&mut self) -> &mut Viewport {
         match self.active_tab {
-            Tab::Build => &mut self.build_scroll,
+            // Now moves the build selection instead of this viewport. The arm
+            // is here so a page key that missed its own match still has one.
+            Tab::Now | Tab::Build => &mut self.build_scroll,
             Tab::Projects => &mut self.project_scroll,
             Tab::Store => &mut self.store_scroll,
             Tab::Transfer => &mut self.transfer_scroll,
             Tab::Why => &mut self.why_scroll,
         }
+    }
+
+    fn project_count(&self) -> usize {
+        self.project_scan
+            .lock()
+            .map(|scan| scan.project_targets.len())
+            .unwrap_or(0)
+    }
+
+    fn step_project(&mut self, delta: isize) {
+        let count = self.project_count();
+        if count == 0 {
+            self.selected_project = 0;
+            return;
+        }
+        let current = self.selected_project.min(count - 1);
+        self.selected_project = if delta < 0 {
+            current.saturating_sub(delta.unsigned_abs())
+        } else {
+            (current + delta as usize).min(count - 1)
+        };
     }
 
     /// Read what the event log appended since the last tick: build events
@@ -656,7 +687,7 @@ impl AppState {
             Tab::Build => &self.build_filter,
             Tab::Store => &self.store_filter,
             Tab::Why => &self.why_filter,
-            Tab::Projects | Tab::Transfer => "",
+            Tab::Now | Tab::Projects | Tab::Transfer => "",
         }
     }
 
@@ -667,7 +698,7 @@ impl AppState {
             Tab::Build => Some(&mut self.build_filter),
             Tab::Store => Some(&mut self.store_filter),
             Tab::Why => Some(&mut self.why_filter),
-            Tab::Projects | Tab::Transfer => None,
+            Tab::Now | Tab::Projects | Tab::Transfer => None,
         }
     }
 
@@ -745,13 +776,9 @@ pub fn run_monitor(config: &Config, since: Option<SinceWindow>) -> Result<()> {
     let stats_snapshot = StatsSnapshot::default();
     let stats_result_slot: Arc<Mutex<Option<StatsSnapshot>>> = Arc::new(Mutex::new(None));
 
-    let service_installed = crate::service::service_file_path()
-        .map(|p| p.exists())
-        .unwrap_or(false);
-
     let mut state = AppState {
         config: config.clone(),
-        active_tab: Tab::Build,
+        active_tab: Tab::Now,
         tailer,
         events: initial_events,
         live_heartbeats: std::collections::HashMap::new(),
@@ -768,6 +795,8 @@ pub fn run_monitor(config: &Config, since: Option<SinceWindow>) -> Result<()> {
         project_scan,
         last_project_refresh: Instant::now(),
         project_scroll: Viewport::new(ScrollAnchor::Top),
+        selected_project: 0,
+        project_detail: false,
         sessions: Vec::new(),
         grouped_len: 0,
         selected_session: None,
@@ -790,7 +819,6 @@ pub fn run_monitor(config: &Config, since: Option<SinceWindow>) -> Result<()> {
         }),
         rustc_version: "\u{2026}".to_string(), // placeholder until background thread completes
         wrapper_status: crate::wrapper_config::wrapper_status_line(),
-        service_installed,
     };
 
     loop {
@@ -946,7 +974,7 @@ fn switch_tab(state: &mut AppState, tab: Tab) {
     match tab {
         Tab::Projects => state.last_project_refresh = Instant::now() - PROJECT_REFRESH_INTERVAL,
         Tab::Store => state.last_stats_fetch = Instant::now() - SNAPSHOT_REFRESH_INTERVAL,
-        Tab::Build | Tab::Transfer | Tab::Why => {}
+        Tab::Now | Tab::Build | Tab::Transfer | Tab::Why => {}
     }
 }
 
@@ -983,6 +1011,16 @@ fn handle_mouse(state: &mut AppState, mouse: MouseEvent, area: Rect) {
         MouseEventKind::Down(MouseButton::Left) if mouse.row == area.y => {
             if let Some(tab) = tab_at_column(mouse.column.saturating_sub(area.x)) {
                 switch_tab(state, tab);
+            }
+        }
+        MouseEventKind::ScrollUp if state.active_tab == Tab::Now => {
+            for _ in 0..3 {
+                state.select_previous_session();
+            }
+        }
+        MouseEventKind::ScrollDown if state.active_tab == Tab::Now => {
+            for _ in 0..3 {
+                state.select_next_session();
             }
         }
         MouseEventKind::ScrollUp => state.active_viewport().scroll_up_by(3),
@@ -1039,26 +1077,62 @@ fn handle_key(state: &mut AppState, key: KeyCode) {
                 reset_filtered_viewports(state);
             }
         }
-        // Tab switching
-        KeyCode::Char('1') => switch_tab(state, Tab::Build),
-        KeyCode::Char('2') => switch_tab(state, Tab::Why),
-        KeyCode::Char('3') => switch_tab(state, Tab::Projects),
-        KeyCode::Char('4') => switch_tab(state, Tab::Store),
-        KeyCode::Char('5') => switch_tab(state, Tab::Transfer),
+        // Tab switching. Now is 1; Transfer stays last.
+        KeyCode::Char('1') => switch_tab(state, Tab::Now),
+        KeyCode::Char('2') => switch_tab(state, Tab::Build),
+        KeyCode::Char('3') => switch_tab(state, Tab::Why),
+        KeyCode::Char('4') => switch_tab(state, Tab::Projects),
+        KeyCode::Char('5') => switch_tab(state, Tab::Store),
+        KeyCode::Char('6') => switch_tab(state, Tab::Transfer),
         KeyCode::Tab => switch_tab(state, state.active_tab.next()),
         // Shift+Tab used to share an arm with Tab and cycle forward too, so
         // there was no way back except by number.
         KeyCode::BackTab => switch_tab(state, state.active_tab.previous()),
-        // On Build and Why, Up/Down pick the build; the event panel scrolls by
-        // page and by End. A flat list needed one axis, a list of builds with
-        // a panel each needs two.
-        KeyCode::Up | KeyCode::Char('k') if matches!(state.active_tab, Tab::Build | Tab::Why) => {
+        // Now, Build, and Why share one selected build. Up/Down move it; the
+        // event panel still scrolls by page and by End.
+        KeyCode::Up | KeyCode::Char('k')
+            if matches!(state.active_tab, Tab::Now | Tab::Build | Tab::Why) =>
+        {
             state.select_previous_session();
         }
-        KeyCode::Down | KeyCode::Char('j') if matches!(state.active_tab, Tab::Build | Tab::Why) => {
+        KeyCode::Down | KeyCode::Char('j')
+            if matches!(state.active_tab, Tab::Now | Tab::Build | Tab::Why) =>
+        {
             state.select_next_session();
         }
-        KeyCode::Enter if state.active_tab == Tab::Build => switch_tab(state, Tab::Why),
+        KeyCode::PageUp if state.active_tab == Tab::Now => {
+            for _ in 0..5 {
+                state.select_previous_session();
+            }
+        }
+        KeyCode::PageDown if state.active_tab == Tab::Now => {
+            for _ in 0..5 {
+                state.select_next_session();
+            }
+        }
+        KeyCode::Home if state.active_tab == Tab::Now => {
+            state.selected_session = None;
+            state.reconcile_shown_build();
+        }
+        KeyCode::End if state.active_tab == Tab::Now => {
+            if let Some(last) = state.sessions.last() {
+                let key = last.key.clone();
+                state.selected_session = Some(key);
+                state.reconcile_shown_build();
+            }
+        }
+        KeyCode::Up | KeyCode::Char('k') if state.active_tab == Tab::Projects => {
+            state.step_project(-1);
+        }
+        KeyCode::Down | KeyCode::Char('j') if state.active_tab == Tab::Projects => {
+            state.step_project(1);
+        }
+        KeyCode::Enter if matches!(state.active_tab, Tab::Now | Tab::Build) => {
+            switch_tab(state, Tab::Why);
+        }
+        KeyCode::Enter if state.active_tab == Tab::Projects => {
+            state.project_detail = !state.project_detail;
+        }
         // Scrolling: one row, one page, or straight to either end. `j`/`k`
         // for hands that live on the home row.
         KeyCode::Up | KeyCode::Char('k') => state.active_viewport().scroll_up(),
@@ -1133,6 +1207,7 @@ fn draw_ui(frame: &mut Frame, state: &mut AppState) {
     draw_tab_bar(frame, state, chunks[0]);
 
     match state.active_tab {
+        Tab::Now => draw_now_tab(frame, state, chunks[1]),
         Tab::Build => draw_build_tab(frame, state, chunks[1]),
         Tab::Projects => draw_projects_tab(frame, state, chunks[1]),
         Tab::Store => draw_store_tab(frame, state, chunks[1]),
@@ -1171,13 +1246,14 @@ fn draw_tab_bar(frame: &mut Frame, state: &AppState, area: Rect) {
 
 /// Every tab's label and the column it starts at in the tab bar. One place
 /// for the geometry so the drawing and the mouse hit-test cannot disagree.
-fn tab_titles() -> [(Tab, &'static str, u16); 5] {
-    const LABELS: [(Tab, &str); 5] = [
-        (Tab::Build, " [1] Build "),
-        (Tab::Why, "[2] Why "),
-        (Tab::Projects, "[3] Projects"),
-        (Tab::Store, "[4] Store "),
-        (Tab::Transfer, "[5] Transfer "),
+fn tab_titles() -> [(Tab, &'static str, u16); 6] {
+    const LABELS: [(Tab, &str); 6] = [
+        (Tab::Now, " [1] Now "),
+        (Tab::Build, "[2] Build "),
+        (Tab::Why, "[3] Why "),
+        (Tab::Projects, "[4] Projects "),
+        (Tab::Store, "[5] Store "),
+        (Tab::Transfer, "[6] Transfer "),
     ];
     let mut x = 0u16;
     LABELS.map(|(tab, label)| {
@@ -1195,7 +1271,256 @@ fn tab_at_column(column: u16) -> Option<Tab> {
         .map(|(tab, _, _)| tab)
 }
 
-// ── Build tab (existing monitor) ───────────────────────────────────────────
+// ── Now ────────────────────────────────────────────────────────────────────
+
+/// How many builds the landing list shows at once. The rest are a count.
+const NOW_ROWS: usize = 5;
+
+/// Lookups the tally actually consulted. Passthroughs are not among them.
+fn lookup_count(tally: &tui_sessions::Tally) -> u64 {
+    tally.hits.saturating_add(tally.compiled())
+}
+
+/// Misses for the landing list: `—` when the build never consulted the cache.
+fn misses_label(tally: &tui_sessions::Tally) -> String {
+    if lookup_count(tally) == 0 {
+        "—".to_string()
+    } else {
+        tally.compiled().to_string()
+    }
+}
+
+fn figure_saved(ms: u64) -> String {
+    if ms == 0 {
+        "0s".to_string()
+    } else {
+        crate::cli::format_duration_ms(ms)
+            .trim_start_matches('~')
+            .to_string()
+    }
+}
+
+fn weighted_sentence(rate: Option<f64>) -> String {
+    match rate {
+        Some(rate) => format!("{rate:.0}% of compile time came back from the cache"),
+        None => "no compile time recorded yet".to_string(),
+    }
+}
+
+fn miss_clock_sentence(share: Option<f64>) -> String {
+    match share {
+        Some(share) => format!("{share:.0}% of the clock was a miss"),
+        None => "no lookup time recorded yet".to_string(),
+    }
+}
+
+fn remote_sentence(status: &str) -> String {
+    match status {
+        "not configured" | "local-only" => "remote is off".to_string(),
+        other => format!("remote: {other}"),
+    }
+}
+
+fn count_hit_figure(es: &daemon::EventStatsResponse) -> String {
+    let total = es.local_hits + es.prefetch_hits + es.remote_hits + es.dups + es.misses;
+    if total == 0 {
+        "—".to_string()
+    } else {
+        format!("{:.0}%", crate::cli::count_hit_rate(es))
+    }
+}
+
+fn miss_time_share(es: &daemon::EventStatsResponse) -> Option<f64> {
+    (es.total_elapsed_ms > 0)
+        .then(|| (es.miss_elapsed_ms as f64 / es.total_elapsed_ms as f64) * 100.0)
+}
+
+/// First visible row of the landing list, keeping the selection on screen.
+fn now_window_start(count: usize, selected: usize) -> usize {
+    if count <= NOW_ROWS {
+        return 0;
+    }
+    let max_start = count - NOW_ROWS;
+    selected.saturating_sub(NOW_ROWS / 2).min(max_start)
+}
+
+fn draw_now_tab(frame: &mut Frame, state: &mut AppState, area: Rect) {
+    let chunks = Layout::vertical([
+        Constraint::Length(7),
+        Constraint::Min(6),
+        Constraint::Length(1),
+    ])
+    .split(area);
+    draw_now_figures(frame, state, chunks[0]);
+    draw_now_builds(frame, state, chunks[1]);
+    let help = help_line(
+        state,
+        "q: quit  p: pause  ↑↓: build  Enter: why  ⇥/⇧⇥: tabs",
+    );
+    frame.render_widget(
+        Paragraph::new(help).style(Style::default().fg(Color::DarkGray)),
+        chunks[2],
+    );
+}
+
+fn draw_now_figures(frame: &mut Frame, state: &AppState, area: Rect) {
+    let snap = &state.stats_snapshot;
+    let loaded = state.stats_loaded;
+    let store = if loaded {
+        ByteSize(snap.total_size).to_string()
+    } else {
+        "…".to_string()
+    };
+    let cap = if loaded {
+        format!("cap {}", ByteSize(snap.max_size))
+    } else {
+        "cap …".to_string()
+    };
+    let hit = if loaded {
+        count_hit_figure(&snap.event_stats)
+    } else {
+        "…".to_string()
+    };
+    let saved = if loaded {
+        figure_saved(snap.event_stats.hit_compile_time_ms)
+    } else {
+        "…".to_string()
+    };
+    let builds = state.sessions.len().to_string();
+    let window = SinceWindow::DEFAULT.label();
+    let bold = Style::default().add_modifier(Modifier::BOLD);
+    let muted = Style::default().fg(Color::DarkGray);
+    let figure = |text: &str| format!("{text:<16}");
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled(format!("  {}", figure(&store)), bold),
+            Span::styled(figure(&hit), bold),
+            Span::styled(figure(&saved), bold),
+            Span::styled(builds, bold),
+        ]),
+        Line::from(vec![
+            Span::styled(format!("  {}", figure(&cap)), muted),
+            Span::styled(figure("lookups hit"), muted),
+            Span::styled(figure(&format!("saved, {window}")), muted),
+            Span::styled("builds", muted),
+        ]),
+        Line::from(""),
+    ];
+    if loaded {
+        lines.push(Line::from(format!(
+            "  {}",
+            weighted_sentence(crate::cli::compile_weighted_hit_rate(&snap.event_stats))
+        )));
+        lines.push(Line::from(format!(
+            "  {}",
+            miss_clock_sentence(miss_time_share(&snap.event_stats))
+        )));
+    } else {
+        lines.push(Line::styled("  stats are still loading", muted));
+        lines.push(Line::from(""));
+    }
+    lines.push(Line::from(format!(
+        "  {}",
+        remote_sentence(&effective_remote_status(&state.config, snap))
+    )));
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn draw_now_builds(frame: &mut Frame, state: &mut AppState, area: Rect) {
+    let count = state.sessions.len();
+    let following = state.selected_session.is_none();
+    let selected = state.selected_index().unwrap_or(0);
+    let start = now_window_start(count, selected);
+    let shown = count.min(NOW_ROWS);
+    let older = count.saturating_sub(start + shown);
+    let newer = start;
+    let mut title = if following && count > 0 {
+        " Builds · following the top build".to_string()
+    } else {
+        " Builds".to_string()
+    };
+    if newer > 0 {
+        title.push_str(&format!(" · {newer} newer"));
+    }
+    if older > 0 {
+        title.push_str(&format!(" · {older} more, older"));
+    }
+    let block = Block::bordered()
+        .title(format!("{title} "))
+        .border_style(Style::default().fg(Color::Cyan));
+    if count == 0 {
+        frame.render_widget(
+            Paragraph::new(
+                "  Waiting for builds…\n\n  Run `cargo build` in any workspace; builds from every\n  workspace on this machine appear here, newest on top.",
+            )
+            .block(block),
+            area,
+        );
+        return;
+    }
+
+    let header = Row::new([
+        Cell::from("Build"),
+        Cell::from(Line::from("Misses").right_aligned()),
+        Cell::from(Line::from("Saved").right_aligned()),
+    ])
+    .style(Style::default().fg(Color::DarkGray));
+    let right = |text: String, style: Style| Cell::from(Line::styled(text, style).right_aligned());
+    let rows: Vec<Row> = state
+        .sessions
+        .iter()
+        .skip(start)
+        .take(shown)
+        .map(|session| {
+            let name = if session.inferred {
+                format!("{} ~", session.workspace_name())
+            } else {
+                session.workspace_name().to_string()
+            };
+            let misses = misses_label(&session.tally);
+            let miss_color = if misses == "—" || misses == "0" {
+                Color::DarkGray
+            } else {
+                Color::White
+            };
+            let saved_ms = session.tally.saved_ms;
+            Row::new([
+                Cell::from(name),
+                right(misses, Style::default().fg(miss_color)),
+                right(
+                    fmt_saved_ms(saved_ms),
+                    Style::default().fg(if saved_ms == 0 {
+                        Color::DarkGray
+                    } else {
+                        Color::Green
+                    }),
+                ),
+            ])
+        })
+        .collect();
+    let widths = [
+        Constraint::Min(16),
+        Constraint::Length(8),
+        Constraint::Length(8),
+    ];
+    let visible = area.height.saturating_sub(3) as usize;
+    let highlight = selected.saturating_sub(start);
+    let table = Table::new(rows, widths)
+        .header(header)
+        .highlight_symbol("▸ ")
+        .row_highlight_style(
+            Style::default()
+                .add_modifier(Modifier::BOLD)
+                .add_modifier(Modifier::REVERSED),
+        )
+        .block(block);
+    let mut table_state = TableState::default()
+        .with_selected(highlight)
+        .with_offset(highlight.saturating_add(1).saturating_sub(visible.max(1)));
+    frame.render_stateful_widget(table, area, &mut table_state);
+}
+
+// ── Build tab ──────────────────────────────────────────────────────────────
 
 fn draw_build_tab(frame: &mut Frame, state: &mut AppState, area: Rect) {
     // The In-flight panel (kunobi-ninja/kache#131) only takes rows while
@@ -1208,39 +1533,27 @@ fn draw_build_tab(frame: &mut Frame, state: &mut AppState, area: Rect) {
         // can't crowd out the event stream.
         (in_flight.len().min(6) + 2) as u16
     };
-    // Builds panel: border (2) + header (1) + up to five rows. Absent until
-    // there is a build to list, so an idle monitor keeps the classic layout.
-    let has_builds = !state.sessions.is_empty();
-    let builds_rows = if has_builds {
-        (state.sessions.len().min(5) + 3) as u16
-    } else {
-        0
-    };
     // On a short terminal the sparkline goes before the event rows do.
     let show_spark = area.height >= 30;
     let spark_rows = if show_spark { 5 } else { 0 };
     let chunks = Layout::vertical([
-        Constraint::Length(9),              // Stats bar
-        Constraint::Length(in_flight_rows), // In-flight compiles (if any)
-        Constraint::Length(builds_rows),    // Builds (if any)
-        Constraint::Min(6),                 // Selected build's events
-        Constraint::Length(spark_rows),     // Sparkline
-        Constraint::Length(1),              // Help bar
+        Constraint::Length(in_flight_rows),
+        Constraint::Min(6),
+        Constraint::Length(spark_rows),
+        Constraint::Length(1),
     ])
     .split(area);
 
-    draw_stats_bar(frame, state, chunks[0]);
+    // A zero-height slot stays in the split, so the index is the slot, not
+    // the count of panels actually drawn.
     if in_flight_rows > 0 {
-        draw_in_flight(frame, &in_flight, chunks[1]);
+        draw_in_flight(frame, &in_flight, chunks[0]);
     }
-    if has_builds {
-        draw_builds(frame, state, chunks[2]);
-    }
-    draw_live_build(frame, state, chunks[3]);
+    draw_live_build(frame, state, chunks[1]);
     if show_spark {
-        draw_sparkline(frame, state, chunks[4]);
+        draw_sparkline(frame, state, chunks[2]);
     }
-    draw_build_help(frame, state, chunks[5]);
+    draw_build_help(frame, state, chunks[3]);
 }
 
 /// `4m12s`-style compact milliseconds for cost strips; blank for zero.
@@ -1252,134 +1565,6 @@ fn fmt_saved_ms(ms: u64) -> String {
         return format!("{ms}ms");
     }
     format_secs(ms / 1000)
-}
-
-/// The Builds table: one row per session, running builds first, the selected
-/// one marked. Selecting a build scopes the event panel and the Why tab.
-fn draw_builds(frame: &mut Frame, state: &mut AppState, area: Rect) {
-    let selected = state.selected_index().unwrap_or(0);
-    let count = state.sessions.len();
-    let following = state.selected_session.is_none();
-    let title = format!(
-        " Builds · {}/{}{} ",
-        selected + 1,
-        count,
-        if following {
-            " · following the top build"
-        } else {
-            ""
-        }
-    );
-    let block = Block::bordered()
-        .title(title)
-        .border_style(Style::default().fg(Color::Cyan));
-
-    let wide = area.width >= 100;
-    let mut labels = vec!["Build", "Started", "State"];
-    let mut widths = vec![
-        Constraint::Min(16),
-        Constraint::Length(8),
-        Constraint::Length(8),
-    ];
-    let numeric_from = labels.len();
-    labels.extend(["hit", "miss"]);
-    widths.extend([Constraint::Length(6), Constraint::Length(6)]);
-    if wide {
-        labels.push("pass");
-        widths.push(Constraint::Length(6));
-    }
-    labels.push("rate");
-    widths.push(Constraint::Length(5));
-    if wide {
-        labels.push("saved");
-        widths.push(Constraint::Length(8));
-    }
-    let header = Row::new(
-        labels
-            .iter()
-            .enumerate()
-            .map(|(i, label)| {
-                let line = Line::from(*label);
-                Cell::from(if i >= numeric_from {
-                    line.right_aligned()
-                } else {
-                    line
-                })
-            })
-            .collect::<Vec<_>>(),
-    )
-    .style(Style::default().fg(Color::DarkGray));
-
-    let right = |text: String, style: Style| Cell::from(Line::styled(text, style).right_aligned());
-    let count_cell = |value: u64, color: Color| {
-        right(
-            value.to_string(),
-            Style::default().fg(if value == 0 { Color::DarkGray } else { color }),
-        )
-    };
-    let rows: Vec<Row> = state
-        .sessions
-        .iter()
-        .map(|session| {
-            let state_style = match session.state {
-                SessionState::Live => Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
-                SessionState::Finished => Style::default().fg(Color::DarkGray),
-            };
-            let name = if session.inferred {
-                format!("{} ~", session.workspace_name())
-            } else {
-                session.workspace_name().to_string()
-            };
-            let mut cells = vec![
-                Cell::from(name),
-                Cell::from(
-                    session
-                        .started
-                        .with_timezone(&chrono::Local)
-                        .format("%H:%M:%S")
-                        .to_string(),
-                ),
-                Cell::from(Span::styled(session.state.label(), state_style)),
-                count_cell(session.tally.hits, Color::Green),
-                count_cell(session.tally.compiled(), Color::White),
-            ];
-            if wide {
-                cells.push(count_cell(session.tally.passthroughs, Color::Magenta));
-            }
-            cells.push(right(
-                session
-                    .tally
-                    .hit_rate()
-                    .map_or_else(|| "-".to_string(), |rate| format!("{rate:.0}%")),
-                Style::default(),
-            ));
-            if wide {
-                cells.push(right(
-                    fmt_saved_ms(session.tally.saved_ms),
-                    Style::default().fg(Color::Green),
-                ));
-            }
-            Row::new(cells)
-        })
-        .collect();
-
-    let visible = area.height.saturating_sub(3) as usize;
-    let table = Table::new(rows, widths)
-        .header(header)
-        .highlight_symbol("▸ ")
-        .row_highlight_style(
-            Style::default()
-                .add_modifier(Modifier::BOLD)
-                .add_modifier(Modifier::REVERSED),
-        )
-        .block(block);
-    // A stateful table keeps the selected row visible past the first page.
-    let mut table_state = TableState::default()
-        .with_selected(selected)
-        .with_offset(selected.saturating_add(1).saturating_sub(visible.max(1)));
-    frame.render_stateful_widget(table, area, &mut table_state);
 }
 
 /// Render the in-flight compiles panel: oldest first, one line each.
@@ -1416,172 +1601,29 @@ fn draw_in_flight(frame: &mut Frame, entries: &[crate::daemon::InFlightEntry], a
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
-fn draw_stats_bar(frame: &mut Frame, state: &AppState, area: Rect) {
+fn daemon_identity(state: &AppState) -> String {
+    let version = crate::VERSION;
     let snap = &state.stats_snapshot;
-    let daemon_tag = if !state.stats_loaded {
-        " (loading)"
-    } else {
-        match (snap.daemon_connected, state.service_installed) {
-            (true, true) => "",
-            (true, false) => " (no service)",
-            (false, true) => " (daemon offline)",
-            (false, false) => " (daemon offline, no service)",
-        }
-    };
-    let block = Block::bordered().title(format!(" kache monitor{daemon_tag} "));
-
-    let total = snap.event_stats.local_hits
-        + snap.event_stats.prefetch_hits
-        + snap.event_stats.remote_hits
-        + snap.event_stats.dups
-        + snap.event_stats.misses;
-    let (local_pct, remote_pct, miss_pct) = if total > 0 {
-        (
-            ((snap.event_stats.local_hits + snap.event_stats.prefetch_hits) as f64 / total as f64)
-                * 100.0,
-            (snap.event_stats.remote_hits as f64 / total as f64) * 100.0,
-            ((snap.event_stats.dups + snap.event_stats.misses) as f64 / total as f64) * 100.0,
-        )
-    } else {
-        (0.0, 0.0, 0.0)
-    };
-
-    let store_pct = if snap.max_size > 0 {
-        (snap.total_size as f64 / snap.max_size as f64) * 100.0
-    } else {
-        0.0
-    };
-
-    let remote_status = effective_remote_status(&state.config, snap);
-    let effective_cache_dir = snap
-        .daemon_effective_config
-        .as_ref()
-        .map(|eff| std::path::Path::new(eff.cache_dir.as_str()))
-        .unwrap_or(&state.config.cache_dir);
-
-    let wrapper_status = &state.wrapper_status;
-
-    let kache_version = crate::VERSION;
-
-    let daemon_info = if !state.stats_loaded {
+    let daemon = if !state.stats_loaded {
         "daemon: checking".to_string()
     } else if snap.daemon_connected && !snap.daemon_version.is_empty() {
         let epoch = snap.daemon_build_epoch;
-        let my_epoch = crate::daemon::build_epoch();
-        if epoch == my_epoch {
-            format!("daemon: v{} (epoch {epoch})", snap.daemon_version)
+        let mine = crate::daemon::build_epoch();
+        if epoch == mine {
+            format!("daemon v{} (epoch {epoch})", snap.daemon_version)
         } else {
             format!(
-                "daemon: v{} (epoch {epoch}) \u{2190} MISMATCH, auto-restart pending",
+                "daemon v{} (epoch {epoch}, restart pending)",
                 snap.daemon_version
             )
         }
     } else {
-        "daemon: offline".to_string()
+        "daemon offline".to_string()
     };
-
-    let my_epoch = crate::daemon::build_epoch();
-
-    let dedup_line = {
-        // Blob-level savings from the latest periodic stats refresh.
-        let blob_savings = state.stats_snapshot.blob_stats.as_ref();
-
-        let scan_part = if let Ok(scan_stats) = state.project_scan.lock() {
-            let dedup_status =
-                project_scan_status(state.stats_loaded, scan_stats.scanning, scan_stats.scanned);
-            format!("Scan: {dedup_status}")
-        } else {
-            "n/a".to_string()
-        };
-
-        if let Some(bs) = blob_savings {
-            let pct = if bs.total_logical_size > 0 {
-                bs.savings as f64 / bs.total_logical_size as f64 * 100.0
-            } else {
-                0.0
-            };
-            format!(
-                "  Dedup: {} saved ({:.1}%)    Blobs: {} physical    {scan_part}",
-                ByteSize(bs.savings),
-                pct,
-                ByteSize(bs.total_blob_size),
-            )
-        } else if state.stats_loaded {
-            format!("  Dedup: {scan_part}")
-        } else {
-            "  Dedup: calculating...".to_string()
-        }
-    };
-
-    let transfer_line = if !state.stats_loaded {
-        "  Transfer: calculating...".to_string()
-    } else if snap.daemon_connected {
-        format!(
-            "  Transfer: ↑ {} uploading  ↓ {} downloading",
-            snap.pending_uploads, snap.active_downloads,
-        )
-    } else {
-        "  Transfer: n/a (daemon offline)".to_string()
-    };
-
-    let hit_line = if !state.stats_loaded {
-        format!("  Hit rate: calculating...    Remote: {remote_status}")
-    } else {
-        let count_hit_rate = crate::cli::count_hit_rate(&snap.event_stats);
-        let weighted_hit_rate = crate::cli::compile_weighted_hit_rate(&snap.event_stats);
-        let miss_time_share = if snap.event_stats.total_elapsed_ms > 0 {
-            Some(
-                (snap.event_stats.miss_elapsed_ms as f64
-                    / snap.event_stats.total_elapsed_ms as f64)
-                    * 100.0,
-            )
-        } else {
-            None
-        };
-
-        match (weighted_hit_rate, miss_time_share) {
-            (Some(weighted), Some(miss_share)) => format!(
-                "  Hit rate: {count_hit_rate:.0}% count | {weighted:.0}% weighted | {miss_share:.0}% miss-time    Remote: {remote_status}",
-            ),
-            (Some(weighted), None) => format!(
-                "  Hit rate: {count_hit_rate:.0}% count | {weighted:.0}% weighted    Remote: {remote_status}",
-            ),
-            _ => format!(
-                "  Hit rate: {local_pct:.0}% local | {remote_pct:.0}% remote | {miss_pct:.0}% miss    Remote: {remote_status}",
-            ),
-        }
-    };
-
-    let store_line = if state.stats_loaded {
-        Line::from(format!(
-            "  Store: {} / {} [{:>5.1}%]    {} entries",
-            ByteSize(snap.total_size),
-            ByteSize(snap.max_size),
-            store_pct,
-            snap.entry_count,
-        ))
-    } else {
-        Line::from("  Store: calculating...")
-    };
-
-    let text = vec![
-        store_line,
-        Line::from(hit_line),
-        Line::from(
-            "  count = % builds served from cache · weighted = % compile-time saved · miss-time = % wall-time in misses",
-        )
-        .style(Style::default().fg(Color::DarkGray)),
-        Line::from(dedup_line),
-        Line::from(transfer_line),
-        Line::from(format!("  {wrapper_status}    {}", state.rustc_version)),
-        Line::from(format!(
-            "  kache v{kache_version} (epoch {my_epoch})    {daemon_info}    Cache: {}",
-            shorten_home(effective_cache_dir)
-        )),
-    ];
-
-    let paragraph = Paragraph::new(text).block(block);
-    frame.render_widget(paragraph, area);
+    format!(
+        "  kache v{version} · {daemon} · {} · {}",
+        state.wrapper_status, state.rustc_version
+    )
 }
 
 /// Per-disposition presentation: a status glyph + short label, the *action*
@@ -1611,6 +1653,69 @@ fn fmt_duration_ms(ms: u64) -> String {
     }
 }
 
+/// A passthrough whose crate name was never recorded. Five of these used to
+/// read as five identical rows.
+fn crate_name_unrecorded(name: &str) -> bool {
+    name.is_empty() || name == "unknown"
+}
+
+fn only_unnamed_passthroughs(events: &[&BuildEvent]) -> bool {
+    !events.is_empty()
+        && events.iter().all(|event| {
+            matches!(event.result, EventResult::Passthrough)
+                && crate_name_unrecorded(&event.crate_name)
+        })
+}
+
+/// The other build with the most compiles, when the one on screen never
+/// consulted the cache.
+fn busiest_other_build(state: &AppState, except_key: &str) -> Option<(String, u64, u64)> {
+    state
+        .sessions
+        .iter()
+        .filter(|session| session.key != except_key && session.tally.compiled() > 0)
+        .max_by_key(|session| (session.tally.compiled(), session.tally.miss_ms))
+        .map(|session| {
+            (
+                session.workspace_name().to_string(),
+                session.tally.compiled(),
+                session.tally.saved_ms,
+            )
+        })
+}
+
+fn draw_unnamed_passthrough(
+    frame: &mut Frame,
+    state: &AppState,
+    area: Rect,
+    block: Block<'_>,
+    session_key: &str,
+) {
+    let muted = Style::default().fg(Color::DarkGray);
+    let mut lines = vec![
+        Line::from(""),
+        Line::from("  passed through"),
+        Line::styled("  the crate name was not recorded", muted),
+    ];
+    if let Some((name, misses, saved_ms)) = busiest_other_build(state, session_key) {
+        let misses = if misses == 1 {
+            "1 miss".to_string()
+        } else {
+            format!("{misses} misses")
+        };
+        let saved = if saved_ms == 0 {
+            "nothing saved".to_string()
+        } else {
+            format!("{} saved", fmt_saved_ms(saved_ms))
+        };
+        lines.push(Line::from(""));
+        lines.push(Line::from(format!(
+            "  {name} is the build with {misses} and {saved}"
+        )));
+    }
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
 fn draw_live_build(frame: &mut Frame, state: &mut AppState, area: Rect) {
     // A reader who scrolled back is told so, and told the way back: rows that
     // stop moving otherwise look like a build that stopped.
@@ -1619,23 +1724,16 @@ fn draw_live_build(frame: &mut Frame, state: &mut AppState, area: Rect) {
     } else {
         " · scrolled back, End follows"
     };
-    // The selected build's name and its cost strip: what the cache saved it,
-    // what its misses cost, and what kache itself cost. The last figure is
-    // the one nobody else reports.
     let title = match state.selected_session() {
-        Some(session) => {
-            let t = &session.tally;
-            let overhead = t.overhead_share().map_or_else(
-                || fmt_saved_ms(t.overhead_ms),
-                |share| format!("{} ({share:.0}%)", fmt_saved_ms(t.overhead_ms)),
-            );
-            format!(
-                " {} · saved {} · in misses {} · kache {overhead}{scrolled} ",
-                session.workspace_name(),
-                fmt_saved_ms(t.saved_ms),
-                fmt_saved_ms(t.miss_ms),
-            )
-        }
+        Some(session) => format!(
+            " {} · {} · {}{scrolled} ",
+            session.workspace_name(),
+            session.state.label(),
+            session
+                .started
+                .with_timezone(&chrono::Local)
+                .format("%H:%M:%S"),
+        ),
         None => format!(" Live Build{scrolled} "),
     };
     let block = Block::bordered()
@@ -1659,6 +1757,18 @@ fn draw_live_build(frame: &mut Frame, state: &mut AppState, area: Rect) {
         .selected_session()
         .map(|session| session.events.clone())
         .unwrap_or_default();
+    let session_events: Vec<&BuildEvent> = selected_events
+        .iter()
+        .map(|&index| &state.events[index])
+        .collect();
+    if filter_empty && only_unnamed_passthroughs(&session_events) {
+        let key = state
+            .selected_session()
+            .map(|session| session.key.clone())
+            .unwrap_or_default();
+        draw_unnamed_passthrough(frame, state, area, block, &key);
+        return;
+    }
     let filtered_events: Vec<&BuildEvent> = selected_events
         .iter()
         .map(|&index| &state.events[index])
@@ -1924,13 +2034,18 @@ fn draw_build_help(frame: &mut Frame, state: &AppState, area: Rect) {
 
 fn draw_store_tab(frame: &mut Frame, state: &mut AppState, area: Rect) {
     let chunks = Layout::vertical([
-        Constraint::Min(5),    // Crates table (full height)
+        Constraint::Min(5),    // Crates table
+        Constraint::Length(1), // Version and daemon, off the front screen
         Constraint::Length(1), // Help bar
     ])
     .split(area);
 
     draw_store_table(frame, state, chunks[0]);
-    draw_store_help(frame, state, chunks[1]);
+    frame.render_widget(
+        Paragraph::new(daemon_identity(state)).style(Style::default().fg(Color::DarkGray)),
+        chunks[1],
+    );
+    draw_store_help(frame, state, chunks[2]);
 }
 
 fn draw_store_table(frame: &mut Frame, state: &mut AppState, area: Rect) {
@@ -2091,339 +2206,186 @@ fn draw_store_help(frame: &mut Frame, state: &AppState, area: Rect) {
 
 // ── Projects tab ───────────────────────────────────────────────────────────
 
-fn draw_projects_tab(frame: &mut Frame, state: &mut AppState, area: Rect) {
-    let chunks = Layout::vertical([
-        Constraint::Length(9), // Overview panel
-        Constraint::Min(5),    // Projects table
-        Constraint::Length(3), // Totals bar
-        Constraint::Length(1), // Help bar
-    ])
-    .split(area);
-
-    draw_projects_overview(frame, state, chunks[0]);
-    draw_projects_table(frame, state, chunks[1]);
-    draw_projects_totals(frame, state, chunks[2]);
-    draw_projects_help(frame, state, chunks[3]);
+fn tree_name(path: &std::path::Path) -> String {
+    let last = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    if last == "target" {
+        path.parent()
+            .and_then(|parent| parent.file_name())
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty())
+            .unwrap_or("target")
+            .to_string()
+    } else if last.is_empty() {
+        path.display().to_string()
+    } else {
+        last.to_string()
+    }
 }
 
-fn draw_projects_overview(frame: &mut Frame, state: &AppState, area: Rect) {
-    let scan_stats = state.project_scan.lock().unwrap();
-    let scanning = scan_stats.scanning;
-    let snap = &state.stats_snapshot;
-
-    let daemon_tag = match (snap.daemon_connected, state.service_installed) {
-        (true, true) => "",
-        (true, false) => " (no service)",
-        (false, true) => " (daemon offline)",
-        (false, false) => " (daemon offline, no service)",
-    };
-    let scan_tag = if scanning { " (scanning...)" } else { "" };
-    let title = format!(" kache projects{daemon_tag}{scan_tag}");
-    let block = Block::bordered().title(title);
-
-    let store_pct = if snap.max_size > 0 {
-        (snap.total_size as f64 / snap.max_size as f64) * 100.0
+fn tree_cached_sentence(cached: u64, incremental: u64) -> String {
+    if cached == 0 {
+        "nothing cached".to_string()
+    } else if incremental == 0 {
+        format!("{} of this tree is cached", ByteSize(cached))
     } else {
-        0.0
-    };
+        format!(
+            "{} of this tree is cached. incremental is {}",
+            ByteSize(cached),
+            ByteSize(incremental)
+        )
+    }
+}
 
-    let es = &snap.event_stats;
-    let hit_rate = crate::cli::count_hit_rate(es);
-    let weighted_hit_rate = crate::cli::compile_weighted_hit_rate(es);
-    let time_saved = if es.hit_compile_time_ms > 0 {
-        crate::cli::format_duration_ms(es.hit_compile_time_ms)
-    } else {
-        "n/a".to_string()
-    };
+fn as_usize(value: u64) -> usize {
+    usize::try_from(value).unwrap_or(usize::MAX)
+}
 
-    // Blob-level content dedup is the only storage figure in the live header.
-    // Clone reclamation belongs to `kache gc` and `kache clean`.
-    let dedup_summary = if let Some(bs) = state.stats_snapshot.blob_stats.as_ref() {
-        let pct = if bs.total_logical_size > 0 {
-            bs.savings as f64 / bs.total_logical_size as f64 * 100.0
-        } else {
-            0.0
-        };
-        format!("{} saved ({:.1}%)", ByteSize(bs.savings), pct)
-    } else {
-        "calculating...".to_string()
-    };
-
-    let wrapper_status = crate::wrapper_config::wrapper_status_line();
-
-    let remote_status = effective_remote_status(&state.config, snap);
-
-    let kache_version = crate::VERSION;
-    let my_epoch = crate::daemon::build_epoch();
-
-    let daemon_info = if snap.daemon_connected && !snap.daemon_version.is_empty() {
-        let epoch = snap.daemon_build_epoch;
-        if epoch == my_epoch {
-            format!("daemon: v{} (epoch {epoch})", snap.daemon_version)
-        } else {
-            format!(
-                "daemon: v{} (epoch {epoch}) \u{2190} MISMATCH, auto-restart pending",
-                snap.daemon_version
-            )
+/// The columns the overview does not show. Zero categories stay off the list.
+fn tree_detail_lines(entry: &cli::TargetEntry) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut push = |label: &str, bytes: u64| {
+        if bytes > 0 {
+            lines.push(format!("    {label:<16}{}", ByteSize(bytes)));
         }
-    } else {
-        "daemon: offline".to_string()
     };
-
-    let transfer_spans = if snap.daemon_connected {
-        vec![
-            Span::styled("  Transfer: ", Style::default().fg(Color::Cyan)),
-            Span::styled(
-                format!("↑ {}", snap.pending_uploads),
-                if snap.pending_uploads > 0 {
-                    Style::default().fg(Color::Yellow)
-                } else {
-                    Style::default()
-                },
-            ),
-            Span::raw(" uploading  "),
-            Span::styled(
-                format!("↓ {}", snap.active_downloads),
-                if snap.active_downloads > 0 {
-                    Style::default().fg(Color::Blue)
-                } else {
-                    Style::default()
-                },
-            ),
-            Span::raw(" downloading"),
-        ]
-    } else {
-        vec![
-            Span::styled("  Transfer: ", Style::default().fg(Color::Cyan)),
-            Span::styled("n/a", Style::default().fg(Color::DarkGray)),
-        ]
-    };
-
-    let text = vec![
-        Line::from(vec![
-            Span::styled("  Store: ", Style::default().fg(Color::Cyan)),
-            Span::raw(format!(
-                "{} / {} [{:.1}%]",
-                ByteSize(snap.total_size),
-                ByteSize(snap.max_size),
-                store_pct
-            )),
-            Span::raw(format!("    {} entries", snap.entry_count)),
-        ]),
-        Line::from(vec![
-            Span::styled("  Hit rate: ", Style::default().fg(Color::Cyan)),
-            Span::raw(format!(
-                "{hit_rate:.0}% count{} (24h: {} hits, {} dups, {} misses)",
-                weighted_hit_rate
-                    .map(|v| format!(" | {v:.0}% weighted"))
-                    .unwrap_or_default(),
-                es.local_hits + es.prefetch_hits + es.remote_hits,
-                es.dups,
-                es.misses
-            )),
-            Span::raw(format!("    Time saved: {time_saved}")),
-        ]),
-        Line::from(vec![
-            Span::styled("  Dedup: ", Style::default().fg(Color::Cyan)),
-            Span::raw(dedup_summary),
-        ]),
-        Line::from(transfer_spans),
-        Line::from(vec![
-            Span::styled("  Remote: ", Style::default().fg(Color::Cyan)),
-            Span::raw(format!("{remote_status}    {wrapper_status}")),
-        ]),
-        Line::from(format!(
-            "  kache v{kache_version} (epoch {my_epoch})    {daemon_info}    {}",
-            state.rustc_version
-        )),
-    ];
-
-    let paragraph = Paragraph::new(text).block(block);
-    frame.render_widget(paragraph, area);
+    let breakdown = &entry.breakdown;
+    push("incremental", breakdown.incremental);
+    push("build scripts", breakdown.build_scripts);
+    push("binaries", breakdown.binaries);
+    push("fingerprints", breakdown.fingerprints);
+    if !entry.profiles.is_empty() {
+        lines.push(format!(
+            "    {:<16}[{}]",
+            "profiles",
+            entry.profiles.join(", ")
+        ));
+    }
+    lines
 }
 
-fn draw_projects_table(frame: &mut Frame, state: &mut AppState, area: Rect) {
+fn draw_projects_tab(frame: &mut Frame, state: &mut AppState, area: Rect) {
+    let chunks = Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).split(area);
+    draw_projects_body(frame, state, chunks[0]);
+    draw_projects_help(frame, state, chunks[1]);
+}
+
+fn draw_projects_body(frame: &mut Frame, state: &mut AppState, area: Rect) {
+    let count = state.project_count();
+    if count > 0 && state.selected_project >= count {
+        state.selected_project = count - 1;
+    }
     let block = Block::bordered()
         .title(" Projects ")
         .border_style(Style::default().fg(Color::Cyan));
-
-    let (item_count, scanning) = {
-        let stats = state.project_scan.lock().unwrap();
-        (stats.project_targets.len(), stats.scanning)
+    let inner = block.inner(area);
+    let (lines, anchor) = project_lines(state, inner.width);
+    let page = inner.height.max(1) as usize;
+    let offset = state.project_scroll.offset;
+    state.project_scroll.offset = if anchor < offset {
+        anchor
+    } else if anchor >= offset.saturating_add(page) {
+        anchor.saturating_sub(page.saturating_sub(1))
+    } else {
+        offset
     };
-
-    if item_count == 0 {
-        let msg = if scanning {
-            "  Scanning..."
-        } else {
-            "  No target/ directories found."
-        };
-        frame.render_widget(Paragraph::new(msg).block(block), area);
-        return;
-    }
-
-    let visible_rows = (area.height as usize).saturating_sub(3); // borders + header
-    let range = state.project_scroll.visible_range(item_count, visible_rows);
-
-    // The per-category breakdown is detail; path, size, and cached bytes are
-    // the answer. Narrow terminals keep the answer.
-    let show_breakdown = area.width >= 100;
-    let show_profile = area.width >= 80;
-
-    let mut labels = vec!["Path", "Size", "Cached"];
-    let mut widths = vec![
-        Constraint::Min(20),
-        Constraint::Length(9),
-        Constraint::Length(9),
-    ];
-    if show_breakdown {
-        labels.extend(["Incr", "Build", "Deps", "Bin", "Fprint"]);
-        widths.extend([Constraint::Length(9); 5]);
-    }
-    if show_profile {
-        labels.push("Profile");
-        widths.push(Constraint::Length(14));
-    }
-    let header = Row::new(labels).style(Style::default().add_modifier(Modifier::BOLD));
-
-    let root = std::env::current_dir().unwrap_or_default();
-
-    let fmt = |v: u64| -> String {
-        if v > 0 {
-            format!("{:>8}", ByteSize(v))
-        } else {
-            String::new()
-        }
-    };
-
-    let rows: Vec<Row> = {
-        let stats = state.project_scan.lock().unwrap();
-        stats
-            .project_targets
-            .iter()
-            .skip(range.start)
-            .take(range.len())
-            .map(|t| {
-                let rel = t.path.strip_prefix(&root).unwrap_or(&t.path);
-                let path_label = if t.stale {
-                    format!("~ {}", rel.display())
-                } else {
-                    format!("{}", rel.display())
-                };
-
-                let profile_str = if t.profiles.is_empty() {
-                    String::new()
-                } else {
-                    format!("[{}]", t.profiles.join(", "))
-                };
-
-                let b = &t.breakdown;
-                let mut cells = vec![
-                    Cell::from(path_label),
-                    Cell::from(format!("{:>8}", ByteSize(t.size))),
-                    Cell::from(format!("{:>8}", ByteSize(t.cached_bytes))),
-                ];
-                if show_breakdown {
-                    cells.extend([
-                        Cell::from(fmt(b.incremental)),
-                        Cell::from(fmt(b.build_scripts)),
-                        Cell::from(fmt(b.deps_local)),
-                        Cell::from(fmt(b.binaries)),
-                        Cell::from(fmt(b.fingerprints)),
-                    ]);
-                }
-                if show_profile {
-                    cells.push(Cell::from(profile_str));
-                }
-                Row::new(cells)
-            })
-            .collect()
-    };
-
-    let table = Table::new(rows, widths).header(header).block(block);
-    frame.render_widget(table, area);
+    let range = state
+        .project_scroll
+        .visible_range(lines.len(), inner.height as usize);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .scroll((range.start as u16, 0))
+            .block(block),
+        area,
+    );
 }
 
-fn draw_projects_totals(frame: &mut Frame, state: &AppState, area: Rect) {
-    let stats = state.project_scan.lock().unwrap();
-
-    if stats.project_targets.is_empty() {
-        frame.render_widget(Block::bordered().title(" Total "), area);
-        return;
-    }
-
-    let mut total_size = 0u64;
-    let mut total_cached = 0u64;
-    let mut total_incr = 0u64;
-    let mut total_build = 0u64;
-    let mut total_deps = 0u64;
-    let mut total_bin = 0u64;
-    let mut total_fprint = 0u64;
-
-    for t in &stats.project_targets {
-        total_size += t.size;
-        total_cached += t.cached_bytes;
-        total_incr += t.breakdown.incremental;
-        total_build += t.breakdown.build_scripts;
-        total_deps += t.breakdown.deps_local;
-        total_bin += t.breakdown.binaries;
-        total_fprint += t.breakdown.fingerprints;
-    }
-
-    let n = stats.project_targets.len();
-    let title = format!(" Total ({n} project{}) ", if n == 1 { "" } else { "s" });
-
-    let fmt = |v: u64| -> Span {
-        if v > 0 {
-            Span::raw(format!("{} ", ByteSize(v)))
-        } else {
-            Span::styled("- ", Style::default().fg(Color::DarkGray))
-        }
+/// Figures, then one deps bar and a cached line per tree. `anchor` is the
+/// line the selection sits on, so the viewport can keep it in view.
+fn project_lines(state: &AppState, width: u16) -> (Vec<Line<'static>>, usize) {
+    let scan = match state.project_scan.lock() {
+        Ok(scan) => scan,
+        Err(_) => return (vec![Line::from("  Projects are unavailable.")], 0),
     };
-
-    let mut spans = vec![
-        Span::styled("  Size: ", Style::default().fg(Color::Cyan)),
-        Span::styled(
-            format!("{}", ByteSize(total_size)),
-            Style::default().add_modifier(Modifier::BOLD),
-        ),
-        Span::raw("   "),
-        Span::styled("Cached: ", Style::default().fg(Color::Cyan)),
-        Span::styled(
-            format!("{}", ByteSize(total_cached)),
-            Style::default().add_modifier(Modifier::BOLD),
-        ),
-        Span::raw("   "),
-    ];
-    // Same threshold as the table above: the breakdown appears in both places
-    // or neither.
-    if area.width >= 100 {
-        spans.extend([
-            Span::styled("Incr: ", Style::default().fg(Color::DarkGray)),
-            fmt(total_incr),
-            Span::styled("Build: ", Style::default().fg(Color::DarkGray)),
-            fmt(total_build),
-            Span::styled("Deps: ", Style::default().fg(Color::DarkGray)),
-            fmt(total_deps),
-            Span::styled("Bin: ", Style::default().fg(Color::DarkGray)),
-            fmt(total_bin),
-            Span::styled("Fprint: ", Style::default().fg(Color::DarkGray)),
-            fmt(total_fprint),
-        ]);
+    let width = width as usize;
+    if scan.project_targets.is_empty() {
+        let msg = if scan.scanning {
+            "  Scanning…"
+        } else {
+            "  No target directories found."
+        };
+        return (vec![Line::from(msg)], 0);
     }
-    let line = Line::from(spans);
 
-    let block = Block::bordered().title(title);
-    let paragraph = Paragraph::new(line).block(block);
-    frame.render_widget(paragraph, area);
+    let bold = Style::default().add_modifier(Modifier::BOLD);
+    let muted = Style::default().fg(Color::DarkGray);
+    let total_size: u64 = scan.project_targets.iter().map(|t| t.size).sum();
+    let total_cached: u64 = scan.project_targets.iter().map(|t| t.cached_bytes).sum();
+    let n = scan.project_targets.len();
+    let trees = if n == 1 { "tree" } else { "trees" };
+    let cached_figure = if total_cached == 0 {
+        "nothing cached".to_string()
+    } else {
+        format!("{} already cached", ByteSize(total_cached))
+    };
+    let mut lines = vec![Line::from(vec![
+        Span::styled(format!("  {} in {n} {trees}", ByteSize(total_size)), bold),
+        Span::raw("   "),
+        Span::styled(cached_figure, bold),
+    ])];
+    if scan.scanning {
+        lines.push(Line::styled("  scanning…", muted));
+    }
+    lines.push(Line::from(""));
+    let selected = state.selected_project.min(n - 1);
+    let mut anchor = 0;
+    let bar_width = 28.min(width.saturating_sub(16)).max(4);
+    for (index, entry) in scan.project_targets.iter().enumerate() {
+        if index == selected {
+            anchor = lines.len();
+        }
+        let mut label = tree_name(&entry.path);
+        if entry.stale {
+            label = format!("~ {label}");
+        }
+        let marker = if index == selected { "▸ " } else { "  " };
+        let size = ByteSize(entry.size).to_string();
+        let room = width.saturating_sub(cells(marker) + cells(&size) + 1);
+        let label = clip(&label, room);
+        let gap = width.saturating_sub(cells(marker) + cells(&label) + cells(&size));
+        lines.push(Line::from(format!(
+            "{marker}{label}{}{size}",
+            " ".repeat(gap)
+        )));
+        let total = as_usize(entry.size);
+        let deps = entry.breakdown.deps_local;
+        let bar = if total == 0 {
+            " ".repeat(bar_width)
+        } else {
+            share_bar(as_usize(deps), total, bar_width)
+        };
+        lines.push(Line::from(format!("  deps  {bar}  {}", ByteSize(deps))));
+        lines.push(Line::from(format!(
+            "  {}",
+            tree_cached_sentence(entry.cached_bytes, entry.breakdown.incremental)
+        )));
+        if state.project_detail && index == selected {
+            for detail in tree_detail_lines(entry) {
+                lines.push(Line::from(detail));
+            }
+        }
+        lines.push(Line::from(""));
+    }
+    (lines, anchor)
 }
 
 fn draw_projects_help(frame: &mut Frame, state: &AppState, area: Rect) {
     let help = help_line(
         state,
-        "q: quit  p: pause  r: refresh  ↑↓ PgUp PgDn: scroll  ⇥/⇧⇥: tabs",
+        "q: quit  p: pause  r: refresh  ↑↓: tree  Enter: details  ⇥/⇧⇥: tabs",
     );
-
     let paragraph = Paragraph::new(help).style(Style::default().fg(Color::DarkGray));
     frame.render_widget(paragraph, area);
 }
@@ -2753,6 +2715,52 @@ fn pad(text: &str, width: usize) -> String {
     format!("{text}{}", " ".repeat(padding))
 }
 
+/// `count` as a percentage of `total`, rounded, in four cells (`" 32%"`,
+/// `"100%"`).
+fn share_pct(count: usize, total: usize) -> String {
+    if total == 0 {
+        return "  —".to_string();
+    }
+    let pct = count.saturating_mul(100).saturating_add(total / 2) / total;
+    format!("{pct:>3}%")
+}
+
+/// Wide terminals get a 16-cell bar; narrower ones keep the label.
+fn cause_bar_width(width: usize) -> usize {
+    if width >= 80 { 16 } else { 8 }
+}
+
+/// One cause, laid out inside `width`: label, count, share, time, bar, and
+/// examples only when more than twelve cells remain after the bar.
+fn cause_row(
+    label: &str,
+    count: usize,
+    total: usize,
+    cost: &str,
+    examples: &str,
+    width: usize,
+) -> String {
+    let bar = share_bar(count, total, cause_bar_width(width));
+    let pct = share_pct(count, total);
+    let cost = if cost.is_empty() {
+        "      ".to_string()
+    } else {
+        format!("{cost:>6}")
+    };
+    let stats = format!("{count:>4}  {pct}  {cost}  {bar}");
+    let label_budget = width.saturating_sub(cells(&stats).saturating_add(4));
+    let label = clip(label, label_budget);
+    let prefix = format!("  {label}  {stats}");
+    let room = width.saturating_sub(cells(&prefix));
+    if !examples.is_empty() && room > 12 {
+        format!("{prefix}  {}", clip(examples, room.saturating_sub(2)))
+    } else if cells(&prefix) > width {
+        clip(&prefix, width)
+    } else {
+        prefix
+    }
+}
+
 /// The Why body, as lines. Pure so it can be asserted on in tests without
 /// a terminal. `width` is the inner width the lines are laid out for.
 fn why_lines(state: &mut AppState, width: u16) -> Vec<Line<'static>> {
@@ -2780,26 +2788,7 @@ fn why_lines(state: &mut AppState, width: u16) -> Vec<Line<'static>> {
     let width = width as usize;
 
     let mut lines = Vec::new();
-    lines.push(Line::from(vec![
-        Span::styled(
-            format!("  {} ", session.workspace_name()),
-            Style::default().add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!(
-                "· {} · started {} · {} hits, {} misses, {} passthroughs",
-                session.state.label(),
-                session
-                    .started
-                    .with_timezone(&chrono::Local)
-                    .format("%H:%M:%S"),
-                t.hits,
-                t.compiled(),
-                t.passthroughs,
-            ),
-            muted,
-        ),
-    ]));
+    let lookups = lookup_count(t);
     let overhead = t.overhead_share().map_or_else(
         || fmt_saved_ms(t.overhead_ms),
         |share| {
@@ -2809,6 +2798,23 @@ fn why_lines(state: &mut AppState, width: u16) -> Vec<Line<'static>> {
             )
         },
     );
+    let lead = if lookups == 0 {
+        "no lookups".to_string()
+    } else if t.hits == 0 {
+        format!("cold    0 of {lookups} hit")
+    } else {
+        format!("{} of {lookups} hit", t.hits)
+    };
+    lines.push(Line::from(vec![
+        Span::styled(
+            format!("  {lead}"),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(format!(
+            "    compiled {}    kache {overhead}",
+            fmt_saved_ms(t.miss_ms)
+        )),
+    ]));
     let restored = match t.copy_share() {
         Some(share) if share >= 1.0 => format!(
             " · restored {}, {share:.0}% by copy",
@@ -2820,9 +2826,7 @@ fn why_lines(state: &mut AppState, width: u16) -> Vec<Line<'static>> {
     lines.push(Line::from(vec![
         Span::raw("  saved "),
         Span::styled(fmt_saved_ms(t.saved_ms), Style::default().fg(Color::Green)),
-        Span::raw(" · in misses "),
-        Span::styled(fmt_saved_ms(t.miss_ms), Style::default().fg(Color::White)),
-        Span::raw(format!(" · kache overhead {overhead}{restored}")),
+        Span::raw(restored),
     ]));
 
     // ── Misses by cause ──
@@ -2889,40 +2893,60 @@ fn why_lines(state: &mut AppState, width: u16) -> Vec<Line<'static>> {
                 }
             )
         };
-        let prefix = format!(
-            "  {} {:>count_width$}  ",
-            share_bar(group.count, analysis.misses_analyzed, bar_width),
-            group.count
+        let text = cause_row(
+            &group.cause.describe(),
+            group.count,
+            analysis.misses_total,
+            &fmt_saved_ms(group.compile_ms),
+            &examples,
+            width,
         );
-        let cost = format!("  {}", fmt_saved_ms(group.compile_ms));
-        let room = width.saturating_sub(cells(&prefix) + cells(&cost) + 2);
-        let describe = group.cause.describe();
-        let describe_cells = cells(&describe);
-        let (describe_width, example_width) = if room > describe_cells + 12 {
-            (describe_cells, room - describe_cells - 2)
-        } else {
-            (room, 0)
-        };
-        let mut spans = vec![
-            Span::styled(prefix, Style::default().fg(color)),
-            Span::raw(clip(&describe, describe_width)),
-        ];
-        if example_width > 0 && !examples.is_empty() {
-            spans.push(Span::styled(
-                format!("  {}", clip(&examples, example_width)),
+        lines.push(Line::styled(text, Style::default().fg(color)));
+    }
+    let older = analysis
+        .misses_total
+        .saturating_sub(analysis.misses_analyzed);
+    if older > 0 {
+        lines.push(Line::styled(
+            cause_row(
+                "older, not analyzed",
+                older,
+                analysis.misses_total,
+                "",
+                "",
+                width,
+            ),
+            muted,
+        ));
+    }
+    if let Some(group) = analysis
+        .causes
+        .iter()
+        .find(|group| matches!(group.cause, Cause::Unexplained))
+        && !analysis.cascade_recorded
+    {
+        lines.push(Line::styled(
+            if explain_miss {
+                "  no dependency digests on this build's misses; the next build records them (explain_miss is on)".to_string()
+            } else {
+                "  explain_miss is off: set [cache] explain_miss = true to name the crate that changed".to_string()
+            },
+            muted,
+        ));
+        if !explain_miss {
+            lines.push(Line::styled(
+                format!("  the {} cannot name the crate that changed", group.count),
                 muted,
             ));
         }
-        spans.push(Span::styled(cost, muted));
-        lines.push(Line::from(spans));
     }
-    if analysis.misses_total > 0 && !analysis.cascade_recorded {
+    if let Some(group) = analysis
+        .causes
+        .iter()
+        .find(|group| matches!(group.cause, Cause::NoHistory))
+    {
         lines.push(Line::styled(
-            if explain_miss {
-                "  no dependency digests on this build's misses; the next build records them (explain_miss is on)"
-            } else {
-                "  dependency cascades are not recorded: set [cache] explain_miss = true to name the crate that changed"
-            },
+            format!("  the {} have no earlier compile to diff", group.count),
             muted,
         ));
     }
@@ -3006,72 +3030,68 @@ fn why_lines(state: &mut AppState, width: u16) -> Vec<Line<'static>> {
                 || event.passthrough_reason.contains(&filter)
         })
         .collect();
-    lines.push(Line::default());
-    lines.push(Line::styled(
-        format!(
-            "  Passthroughs in this build · {}{}",
-            passthroughs.len(),
-            if filter.is_empty() {
-                String::new()
-            } else {
-                format!(" matching {filter:?}")
-            }
-        ),
-        heading,
-    ));
-    if passthroughs.is_empty() {
+    // An empty list with no filter is the common case and says nothing.
+    if !passthroughs.is_empty() || !filter.is_empty() {
+        lines.push(Line::default());
         lines.push(Line::styled(
-            if filter.is_empty() {
-                "  none"
-            } else {
-                "  none match the filter"
-            },
-            muted,
-        ));
-    }
-    // Route and exit code are detail; on a narrow terminal the reason wins.
-    let wide = width >= 96;
-    // The crate and kind columns give up width before the reason does.
-    let crate_width = (width / 4).clamp(8, 22);
-    let kind_width = (width / 6).clamp(6, 14);
-    for event in passthroughs.iter().rev() {
-        let (kind, reason) = tui_sessions::passthrough_parts(&event.passthrough_reason);
-        let mut spans = vec![
-            Span::styled(
-                format!(
-                    "  {}  ",
-                    event.ts.with_timezone(&chrono::Local).format("%H:%M:%S")
-                ),
-                muted,
+            format!(
+                "  Passthroughs in this build · {}{}",
+                passthroughs.len(),
+                if filter.is_empty() {
+                    String::new()
+                } else {
+                    format!(" matching {filter:?}")
+                }
             ),
-            Span::raw(pad(&event.crate_name, crate_width)),
-        ];
-        if wide {
-            let route = if event.fallback { "fallback" } else { "direct" };
-            let (exit, exit_style) = match event.exit_code {
-                Some(0) => ("0".to_string(), Style::default().fg(Color::Green)),
-                Some(code) => (code.to_string(), Style::default().fg(Color::Red)),
-                None => ("-".to_string(), muted),
-            };
-            spans.push(Span::styled(
-                format!("  {route:<9}"),
-                Style::default().fg(Color::Magenta),
-            ));
-            spans.push(Span::styled(format!("{exit:>4}  "), exit_style));
-        } else {
-            spans.push(Span::raw("  "));
-        }
-        let kind = if kind.is_empty() { "-" } else { kind };
-        spans.push(Span::styled(
-            pad(kind, kind_width),
-            Style::default().fg(Color::Cyan),
+            heading,
         ));
-        let used: usize = spans.iter().map(|span| cells(&span.content)).sum();
-        spans.push(Span::raw(format!(
-            "  {}",
-            clip(reason, width.saturating_sub(used + 2))
-        )));
-        lines.push(Line::from(spans));
+        if passthroughs.is_empty() {
+            lines.push(Line::styled("  none match the filter", muted));
+        }
+        // Route and exit code are detail; on a narrow terminal the reason wins.
+        let wide = width >= 96;
+        // The crate and kind columns give up width before the reason does.
+        let crate_width = (width / 4).clamp(8, 22);
+        let kind_width = (width / 6).clamp(6, 14);
+        for event in passthroughs.iter().rev() {
+            let (kind, reason) = tui_sessions::passthrough_parts(&event.passthrough_reason);
+            let mut spans = vec![
+                Span::styled(
+                    format!(
+                        "  {}  ",
+                        event.ts.with_timezone(&chrono::Local).format("%H:%M:%S")
+                    ),
+                    muted,
+                ),
+                Span::raw(pad(&event.crate_name, crate_width)),
+            ];
+            if wide {
+                let route = if event.fallback { "fallback" } else { "direct" };
+                let (exit, exit_style) = match event.exit_code {
+                    Some(0) => ("0".to_string(), Style::default().fg(Color::Green)),
+                    Some(code) => (code.to_string(), Style::default().fg(Color::Red)),
+                    None => ("-".to_string(), muted),
+                };
+                spans.push(Span::styled(
+                    format!("  {route:<9}"),
+                    Style::default().fg(Color::Magenta),
+                ));
+                spans.push(Span::styled(format!("{exit:>4}  "), exit_style));
+            } else {
+                spans.push(Span::raw("  "));
+            }
+            let kind = if kind.is_empty() { "-" } else { kind };
+            spans.push(Span::styled(
+                pad(kind, kind_width),
+                Style::default().fg(Color::Cyan),
+            ));
+            let used: usize = spans.iter().map(|span| cells(&span.content)).sum();
+            spans.push(Span::raw(format!(
+                "  {}",
+                clip(reason, width.saturating_sub(used + 2))
+            )));
+            lines.push(Line::from(spans));
+        }
     }
     lines
 }

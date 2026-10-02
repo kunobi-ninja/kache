@@ -10,29 +10,35 @@ kache monitor
 kache monitor --since 1h
 ```
 
-Without `--since`, the monitor opens with the last hour of builds. The monitor attempts to start the daemon for transfer statistics. It still reads the local store and event log if the daemon is unavailable.
+Without `--since`, the monitor lists the last hour of builds. The figures on the first screen are the daemon's last 24 hours, the same window as `kache stats`. The monitor attempts to start the daemon for transfer statistics. It still reads the local store and event log if the daemon is unavailable.
 
 <video src="https://raw.githubusercontent.com/kunobi-ninja/kache/main/assets/monitor.webm" aria-label="kache monitor following a build, then the Why, Projects, and Store tabs" autoPlay loop muted playsInline controls />
 
-## Header
+The recording above is the previous layout.
 
-| Field | Meaning |
+## Now
+
+The monitor opens on Now.
+
+| Figure | Meaning |
 | --- | --- |
-| `Store` | Registered blob bytes and configured maximum |
-| `Hit rate` | Count rate, compile-time-weighted rate, and miss-time share when timing exists |
-| `Remote` | Effective remote state |
-| `Dedup` | Logical bytes avoided by shared content blobs |
-| `Blobs` | Physical blob bytes |
-| `Transfer` | Active daemon uploads and downloads |
-| wrapper and versions | Cargo wrapper source, client version, daemon version, and cache path |
+| Store size | Registered blob bytes, with the configured cap under it |
+| Hit % | Lookups that hit, over lookups |
+| Time saved | Compile time restored from the cache over the last 24 hours |
+| Builds | How many builds are in the list below |
+
+Under the figures: the share of compile time that came back from the cache, and the share of lookup time that was a miss. Remote is one line. When the daemon reports `not configured` or `local-only`, that line reads `remote is off`.
+
+The list under that shows five builds: name, misses, and time saved. Misses count compiles that missed, including ones whose output was already in the store. A build with no lookups shows `—`. Up and Down move the selection. The list follows the newest build until you move; Home returns to that. Enter opens Why.
 
 ## Tabs
 
-1. `Build` lists the builds the event log has seen, newest on top and running ones first, and shows the selected build's compiler events with outcome, action, timing, and size. The panel title carries the build's cost strip: compile time saved, compile time spent in misses, and Kache's own overhead.
-2. `Why` explains the selected build. Misses are collapsed to their causes, most frequent first: a failed store or a rejected lookup (a caching failure to fix), a dependency cascade named by the crate that actually changed, the crate's own changed inputs, no earlier compile in the loaded history, or unexplained. Passthroughs are grouped by reason, with queries such as `--print` kept apart from compiles. Crates that keep missing across builds of the same tree are listed as chronic, and every passthrough in the build is listed at the end. PgUp and PgDn scroll the whole tab.
-3. `Projects` lists observed target directories and disk use. Press `r` to rescan.
-4. `Store` lists cache entries. Press `s` to change sort order.
-5. `Transfer` shows recent remote uploads and downloads.
+1. `Now` is the screen above. The build list is here.
+2. `Build` shows the selected build: compiles still running, then that build's compiler events, with outcome, action, timing, and size. A build whose events are all passthroughs and whose crate names were not recorded collapses to one line, and points at another build when one of those has misses. On a tall terminal, a lookup strip covers the last five minutes, or the `--since` window, with hits above misses.
+3. `Why` explains the selected build. It leads with the verdict: how many lookups hit, compile time spent on misses, and Kache's overhead as a share of lookup time. Misses are collapsed to their causes, most frequent first: a failed store or a rejected lookup (a caching failure to fix), a dependency cascade named by the crate that actually changed, the crate's own changed inputs, no earlier compile in the loaded history, or unexplained. Each bar is that cause's share of the misses. Passthroughs are grouped by reason, with queries such as `--print` kept apart from compiles. Crates that keep missing across builds of the same tree are listed as chronic. PgUp and PgDn scroll the whole tab.
+4. `Projects` lists observed target directories. Each tree shows its size, a bar for local dependencies, and how much of the tree is already cached. Enter shows the other columns: incremental output, build scripts, binaries, fingerprints, and profiles. Press `r` to rescan. A `target` directory is labeled with the project above it. A stale tree is marked `~`.
+5. `Store` lists cache entries. The title includes physical blob bytes and the share of logical size that sharing saved. A muted line under the table names the client version, the daemon, the wrapper, and rustc. Press `s` to change sort order.
+6. `Transfer` shows recent remote uploads and downloads.
 
 A build is every event sharing one session id. The wrapper records one per workspace, and it covers the crates, build scripts, and C/C++ compiles of that workspace until it sits idle for five minutes, so Cargo commands run back to back count as one build. Events from older wrappers have no id and are grouped by build root with the same five-minute rule. Those builds carry a `~` after their name.
 
@@ -46,22 +52,27 @@ Cascade causes need per-dependency digests on the events, which `[cache] explain
 q, Ctrl+C         quit
 p                 pause and resume (the log keeps its place; nothing is lost)
 Tab, Shift+Tab    next and previous tab
-1 2 3 4 5         select a tab
-Up / Down, j / k  on Build and Why: pick a build; elsewhere: scroll one row
-Enter             on Build: open Why for the picked build
-PgUp / PgDn       scroll one page
-Home / End        first and last row; End on Build follows new events again
-f                 filter the current supported tab
+1 2 3 4 5 6       Now, Build, Why, Projects, Store, Transfer
+Up / Down, j / k  on Now, Build, and Why: pick a build
+                  on Projects: pick a tree
+                  elsewhere: scroll one row
+Enter             on Now and Build: open Why
+                  on Projects: show or hide the other columns
+PgUp / PgDn       on Now: move five builds; elsewhere: scroll one page
+Home              on Now: follow the newest build again; elsewhere: first row
+End               on Now: select the oldest listed build
+                  on Build: follow new events again
+                  elsewhere: last row
+f                 filter Build, Why, or Store
+Esc               clear the current filter
 s                 change Store sort
 c                 clear Build events
 r                 rescan Projects
 ```
 
-The monitor starts by following the top build, and the Builds panel title says "following the top build". Pressing Up past the first row returns to that mode. The top build is the newest running one, or the newest finished one when nothing is running.
+The monitor starts by following the top build, and the Now list title says "following the top build". Pressing Up on the first row returns to that mode. The top build is the newest running one, or the newest finished one when nothing is running.
 
-Clicking a tab title selects it and the mouse wheel scrolls the current panel.
-
-The `Lookups` strip under the Build events has one column per slice of the last five minutes (or of the `--since` window), with hits above misses on a shared scale. A quiet minute stays flat and a burst stands out.
+Clicking a tab title selects it. On Now the mouse wheel moves the selected build by three. On the other tabs it scrolls the panel.
 
 Narrow terminals drop the least important columns first instead of clipping every column. Below 60×16 the monitor says so and points at `kache stats`, which prints the same numbers as text and works in a pipe.
 

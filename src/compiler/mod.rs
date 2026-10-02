@@ -2034,6 +2034,14 @@ pub(crate) mod shim {
         resolve_real_compiler_on(name, &dirs, self_exe.as_deref())
     }
 
+    /// Whether a real `name`, not a kache shim, is in the directories of `path`.
+    #[cfg(unix)]
+    pub(crate) fn real_compiler_on(path: &std::ffi::OsStr, name: &str) -> bool {
+        let dirs: Vec<PathBuf> = std::env::split_paths(path).collect();
+        let self_exe = std::env::current_exe().ok();
+        resolve_real_compiler_on(name, &dirs, self_exe.as_deref()).is_some()
+    }
+
     /// User-level farm created by `kache install-shims` with no directory argument.
     /// `None` without a home directory.
     pub(crate) fn default_shim_dir() -> Option<PathBuf> {
@@ -2553,6 +2561,23 @@ mod shim_tests {
             "user farm must be ~/.local/lib/kache/shims, got {}",
             home.display()
         );
+    }
+
+    proptest::proptest! {
+        /// `shim_names` rejects a name `invoked_as_compiler` does not accept,
+        /// so a versioned driver found on PATH that failed here would make
+        /// `kache init` fail outright.
+        #[test]
+        fn every_versioned_driver_is_a_compiler_name(
+            driver in proptest::sample::select(&["cc", "c++", "gcc", "g++", "clang", "clang++"][..]),
+            version in "[0-9.]{0,8}",
+        ) {
+            let name = format!("{driver}-{version}");
+            proptest::prop_assert!(
+                !kache_shims::farm::is_versioned_driver(&name) || invoked_as_compiler(&name),
+                "{name}"
+            );
+        }
     }
 
     /// Without `--from-path` only versioned drivers join the canonical names;

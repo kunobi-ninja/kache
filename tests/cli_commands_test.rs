@@ -2002,8 +2002,13 @@ fn init_repairs_each_half_of_terminal_setup_and_reports_activation() {
     e.cmd()
         .env(
             "PATH",
-            std::env::join_paths([shims.as_path(), Path::new("/usr/bin"), Path::new("/bin")])
-                .unwrap(),
+            // Shims first, then the compilers the earlier runs linked, so
+            // none of their versioned shims counts as stale.
+            std::env::join_paths(
+                std::iter::once(shims.clone())
+                    .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+            )
+            .unwrap(),
         )
         .args(["init", "--no-service"])
         .write_stdin("n\n")

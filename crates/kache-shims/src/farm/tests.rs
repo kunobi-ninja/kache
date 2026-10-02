@@ -926,3 +926,65 @@ fn link_text_is_joined_to_its_directory_and_normalized() {
         Path::new("/home/me/shims/kache")
     );
 }
+
+fn farm_with_versions(root: &Path, versioned: &[&str]) -> (PathBuf, PathBuf) {
+    let target = root.join("bin/kache");
+    write_executable(&target);
+    let shims = root.join("shims");
+    let mut all = names();
+    all.extend(versioned.iter().map(|name| name.to_string()));
+    install(&shims, &target, &all, false, &Layout::default()).unwrap();
+    (shims, target)
+}
+
+/// Canonical shims and kept names are never stale, whatever `keep` says
+/// about the canonical ones.
+#[test]
+fn only_unkept_versioned_shims_are_stale() {
+    let (_dir, root) = scratch();
+    let (shims, target) = farm_with_versions(&root, &["gcc-14", "clang-19", "clang++-19.1"]);
+    let keep = |name: &str| name == "clang-19";
+    assert_eq!(
+        stale_versioned(&shims, &target, &keep, &RealFs),
+        ["clang++-19.1", "gcc-14"]
+    );
+}
+
+/// A file that is not a kache link is never stale, and a directory kache
+/// does not own lists nothing.
+#[test]
+fn stale_shims_are_listed_only_where_kache_owns_the_directory() {
+    let (_dir, root) = scratch();
+    let (shims, target) = farm_with_versions(&root, &["gcc-14"]);
+    let keep_none = |_: &str| false;
+    write_executable(&shims.join("gcc-12"));
+    assert_eq!(
+        stale_versioned(&shims, &target, &keep_none, &RealFs),
+        ["gcc-14"],
+        "marked, with a real compiler beside the shims"
+    );
+    std::fs::remove_file(shims.join(MARKER)).unwrap();
+    assert!(
+        stale_versioned(&shims, &target, &keep_none, &RealFs).is_empty(),
+        "unmarked and not only shims"
+    );
+    std::fs::remove_file(shims.join("gcc-12")).unwrap();
+    assert_eq!(
+        stale_versioned(&shims, &target, &keep_none, &RealFs),
+        ["gcc-14"],
+        "unmarked, but only shims"
+    );
+}
+
+#[test]
+fn prune_removes_the_stale_shims_and_nothing_else() {
+    let (_dir, root) = scratch();
+    let (shims, target) = farm_with_versions(&root, &["gcc-14", "gcc-15"]);
+    let keep = |name: &str| name == "gcc-15";
+    assert_eq!(prune(&shims, &target, &keep).unwrap(), ["gcc-14"]);
+    assert!(std::fs::symlink_metadata(shims.join("gcc-14")).is_err());
+    for name in names().iter().map(String::as_str).chain(["gcc-15"]) {
+        assert!(is_symlink(&shims.join(name)), "{name}");
+    }
+    assert!(prune(&shims, &target, &keep).unwrap().is_empty());
+}

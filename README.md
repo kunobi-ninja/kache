@@ -101,7 +101,7 @@ export PATH="$HOME/.local/lib/kache/shims:$PATH"
 
 APT and AUR packages install `/usr/lib/kache`. Nix packages include the same symlinks in `${kache}/shims` and `${kache}/lib/kache`; see the [Nix configuration example](https://kunobi.ninja/docs/kache/getting-started/installation#nix).
 
-For `makepkg`, put the same assignment in `~/.makepkg.conf`. Wrap extra names already on `PATH` with `kache init --shims --from-path`.
+For `makepkg`, put the same assignment in `~/.makepkg.conf`. `kache init` also links versioned compilers on `PATH`, such as `clang-19`. Wrap target-prefixed names with `kache init --shims --from-path`.
 
 Kache inspects the real compiler invocation. Unsupported or unsafe invocations pass through. See [C and C++](https://kunobi.ninja/docs/kache/getting-started/c-cpp).
 

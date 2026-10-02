@@ -37,7 +37,7 @@ For `makepkg`, you can set the path directly:
 PATH="$HOME/.local/lib/kache/shims:$PATH"
 ```
 
-The APT and AUR packages also install `/usr/lib/kache` with the same symlinks:
+The APT and AUR packages also install `/usr/lib/kache` with links for the unversioned names:
 
 ```bash
 export PATH="/usr/lib/kache:$PATH"
@@ -45,16 +45,20 @@ export PATH="/usr/lib/kache:$PATH"
 
 Nix packages include the same symlinks in `${kache}/shims`, also available at `${kache}/lib/kache`. Add that directory to `PATH` using the [Nix configuration example](/docs/getting-started/installation#nix); no `kache install-shims` step is needed.
 
-`kache init --shims` creates `cargo`, `cc`, `c++`, `gcc`, `g++`, `clang`, `clang++`, and `rustdoc`. Keep the real compilers later in `PATH`. When Kache looks for the real compiler it skips any entry that resolves to itself or to a binary named `kache`. It also skips every entry in a directory that holds a `.kache-shims` file. The packages write that file, and `kache install-shims` does when the directory holds only Kache links, so one Kache install on `PATH` never runs another as the compiler. Keep the shim directory for shims only.
+The packaged directories hold no versioned compilers such as `clang-19`. `kache init` links those in `~/.local/lib/kache/shims`.
 
-Versioned and target-prefixed names (`gcc-13`, `x86_64-pc-linux-gnu-gcc`) work if you create them by hand or scan `PATH`:
+`kache init --shims` creates `cargo`, `cc`, `c++`, `gcc`, `g++`, `clang`, `clang++`, and `rustdoc`. It also links each versioned C and C++ compiler on `PATH`, such as `clang-19`, `clang++-19`, and `gcc-13`. It matches them by name and runs none of them. Keep the real compilers later in `PATH`. When Kache looks for the real compiler it skips any entry that resolves to itself or to a binary named `kache`. It also skips every entry in a directory that holds a `.kache-shims` file. The packages write that file, and `kache init --shims` does when the directory holds only Kache links, so one Kache install on `PATH` never runs another as the compiler. Keep the shim directory for shims only.
+
+After installing another compiler version, run `kache init` again to link it. It does not remove links: after uninstalling a version, delete its link from the shim directory. Until then, that name runs Kache, which reports that no real compiler is behind the shim.
+
+Target-prefixed names (`x86_64-pc-linux-gnu-gcc`) work if you create them by hand or scan `PATH`:
 
 ```bash
 kache init --shims --from-path
 kache init --shims --force
 ```
 
-Omitting the directory uses `~/.local/lib/kache/shims`. `--from-path` adds a symlink for every compiler-shaped name already on `PATH` that is not Kache itself.
+Omitting the directory uses `~/.local/lib/kache/shims`. `--from-path` adds a symlink for every compiler-shaped name already on `PATH` that is not Kache itself. `--canonical-only` links only the unversioned names.
 
 Each shim is a native symlink to the `kache` binary. Do not wrap Kache in a shell script; that would spawn a shell per compile.
 

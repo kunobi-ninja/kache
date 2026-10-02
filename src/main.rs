@@ -278,10 +278,15 @@ enum Commands {
         )]
         shims: Option<Option<PathBuf>>,
 
-        /// With --shims, also link compiler names already on PATH (gcc-13,
-        /// target triplets)
+        /// With --shims, also link every other compiler name on PATH (target
+        /// triplets)
         #[arg(long, requires = "shims")]
         from_path: bool,
+
+        /// With --shims, link only the unversioned names, not the versioned
+        /// compilers on PATH (clang-19, g++-13)
+        #[arg(long, requires = "shims", conflicts_with = "from_path")]
+        canonical_only: bool,
 
         /// With --shims, replace existing entries instead of refusing
         #[arg(long, requires = "shims")]
@@ -527,9 +532,13 @@ enum Commands {
         #[arg(long)]
         force: bool,
 
-        /// Also wrap compiler names already on PATH (gcc-13, target triplets)
+        /// Also wrap every other compiler name on PATH (target triplets)
         #[arg(long)]
         from_path: bool,
+
+        /// Link only the unversioned names, not the versioned compilers on PATH
+        #[arg(long, conflicts_with = "from_path")]
+        canonical_only: bool,
     },
 
     /// Generate shell completion scripts
@@ -1031,9 +1040,10 @@ fn main() -> Result<()> {
         Some(Commands::Init {
             shims: Some(dir),
             from_path,
+            canonical_only,
             force,
             ..
-        }) => install_shims(dir, force, from_path),
+        }) => install_shims(dir, force, from_path, canonical_only),
         #[cfg(not(unix))]
         Some(Commands::Init { shims: Some(_), .. }) => Err(anyhow::anyhow!(UNIX_ONLY_SHIMS)),
         Some(Commands::Init {
@@ -1246,7 +1256,8 @@ fn main() -> Result<()> {
             dir,
             force,
             from_path,
-        }) => install_shims(dir, force, from_path),
+            canonical_only,
+        }) => install_shims(dir, force, from_path, canonical_only),
         #[cfg(not(unix))]
         Some(Commands::InstallShims { .. }) => Err(anyhow::anyhow!(UNIX_ONLY_SHIMS)),
         Some(Commands::Cargo { .. }) => unreachable!(),
@@ -1665,14 +1676,20 @@ fn clean_scope(path: Option<PathBuf>, orphans: bool, stale_hours: Option<u64>) -
 /// `kache init --shims` and the hidden `kache install-shims`: compiler-name
 /// links to kache in `dir`, by default `~/.local/lib/kache/shims`.
 #[cfg(unix)]
-fn install_shims(dir: Option<PathBuf>, force: bool, from_path: bool) -> Result<()> {
+fn install_shims(
+    dir: Option<PathBuf>,
+    force: bool,
+    from_path: bool,
+    canonical_only: bool,
+) -> Result<()> {
     let dir = dir
         .or_else(compiler::shim::default_shim_dir)
         .context("no home directory; pass the shim directory to use")?;
-    let extra = if from_path {
-        compiler::shim::extra_compiler_names_from_env()
-    } else {
+    let extra = if canonical_only {
         Vec::new()
+    } else {
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        compiler::shim::names_on_path(&path, from_path)
     };
     cli::install_shims_named(&dir, force, &extra)
 }
@@ -1989,6 +2006,27 @@ mod tests {
             "needs --shims"
         );
         assert!(Cli::try_parse_from(["kache", "init", "--shims", "--check"]).is_err());
+        let canonical =
+            Cli::try_parse_from(["kache", "init", "--shims", "--canonical-only"]).unwrap();
+        assert!(matches!(
+            canonical.command,
+            Some(Commands::Init {
+                canonical_only: true,
+                from_path: false,
+                ..
+            })
+        ));
+        assert!(Cli::try_parse_from(["kache", "init", "--canonical-only"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "kache",
+                "init",
+                "--shims",
+                "--canonical-only",
+                "--from-path"
+            ])
+            .is_err()
+        );
         let build = Cli::try_parse_from(["kache", "why-miss", "--root", "x"]).unwrap();
         assert!(matches!(
             build.command,
@@ -2040,7 +2078,7 @@ mod tests {
     fn init_shims_creates_the_links_in_the_named_directory() {
         let dir = tempfile::tempdir().unwrap();
         let farm = dir.path().join("farm");
-        install_shims(Some(farm.clone()), false, false).unwrap();
+        install_shims(Some(farm.clone()), false, false, true).unwrap();
         for name in ["cc", "c++", "cargo"] {
             assert!(
                 farm.join(name)

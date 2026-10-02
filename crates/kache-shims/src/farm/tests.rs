@@ -303,19 +303,98 @@ fn a_ready_farm_links_every_name_to_the_target() {
     for name in SHIM_NAMES {
         fs = fs.link(&format!("/shims/{name}"), target);
     }
-    assert!(is_ready(Path::new("/shims"), Path::new(target), &fs));
+    assert!(is_ready(
+        Path::new("/shims"),
+        Path::new(target),
+        &names(),
+        &fs
+    ));
     assert!(
         !is_ready(
             Path::new("/shims"),
             Path::new("/opt/homebrew/Cellar/kache/0.20.0/bin/kache"),
+            &names(),
             &fs
         ),
         "links through opt are not links to the keg"
     );
-    assert!(!is_ready(Path::new("/empty"), Path::new(target), &fs));
+    assert!(!is_ready(
+        Path::new("/empty"),
+        Path::new(target),
+        &names(),
+        &fs
+    ));
 
     let broken = FakeFs::new().link("/shims/cc", target);
-    assert!(!is_ready(Path::new("/shims"), Path::new(target), &broken));
+    assert!(!is_ready(
+        Path::new("/shims"),
+        Path::new(target),
+        &names(),
+        &broken
+    ));
+}
+
+/// A versioned compiler found on PATH counts once it is asked for: the farm
+/// is not ready until it is linked too.
+#[test]
+fn a_farm_is_ready_only_when_every_requested_name_is_linked() {
+    let target = "/opt/kache/bin/kache";
+    let fs = shims(FakeFs::new().exe(target), "/shims", target);
+    let mut wanted = names();
+    wanted.push("clang-19".into());
+    assert!(!is_ready(
+        Path::new("/shims"),
+        Path::new(target),
+        &wanted,
+        &fs
+    ));
+    let fs = fs.link("/shims/clang-19", target);
+    assert!(is_ready(
+        Path::new("/shims"),
+        Path::new(target),
+        &wanted,
+        &fs
+    ));
+}
+
+#[test]
+fn versioned_drivers_are_c_and_cxx_drivers_with_a_numeric_version() {
+    for name in [
+        "clang-19",
+        "clang++-23",
+        "gcc-13",
+        "g++-14",
+        "cc-12",
+        "c++-14",
+        "gcc-13.2.0",
+    ] {
+        assert!(is_versioned_driver(name), "{name}");
+    }
+    for name in [
+        // Canonical names are linked anyway.
+        "clang",
+        "gcc",
+        // Tools that ship next to the drivers.
+        "clang-format-19",
+        "clang-cpp-19",
+        "clang-cl-19",
+        "gcc-ar-13",
+        "cpp-13",
+        // Target-prefixed drivers stay behind --from-path.
+        "x86_64-linux-gnu-gcc-13",
+        // Not C or C++ drivers.
+        "cargo-1",
+        "rustdoc-1",
+        // Not a version.
+        "clang-",
+        "clang-x",
+        "clang-19a",
+        "gcc-13.",
+        "gcc-.13",
+        "gcc-13..2",
+    ] {
+        assert!(!is_versioned_driver(name), "{name}");
+    }
 }
 
 const ME: &str = "/opt/kache/bin/kache";
@@ -548,7 +627,7 @@ fn install_links_every_name_marks_the_farm_and_reruns_cleanly() {
     let report = install_all(&shims, &target, false);
     assert_eq!(report.created, names());
     assert!(report.marked && has_marker(&shims));
-    assert!(is_ready(&shims, &target, &RealFs));
+    assert!(is_ready(&shims, &target, &names(), &RealFs));
 
     // A farm from before the marker existed gets it on a rerun, and nothing
     // accumulates.
@@ -738,7 +817,7 @@ fn versioned_homebrew_links_move_to_the_opt_link() {
                 let _ = std::fs::remove_file(&link);
                 symlink(keg, &link).unwrap();
             }
-            assert!(!is_ready(&shims, &target, &RealFs));
+            assert!(!is_ready(&shims, &target, &names(), &RealFs));
             let report = install_all(&shims, &target, false);
             assert_eq!(
                 report.refreshed,
@@ -746,7 +825,7 @@ fn versioned_homebrew_links_move_to_the_opt_link() {
                 "{formula} from {}",
                 keg.display()
             );
-            assert!(is_ready(&shims, &target, &RealFs));
+            assert!(is_ready(&shims, &target, &names(), &RealFs));
         }
     }
 }

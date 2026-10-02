@@ -1051,6 +1051,29 @@ struct ShadowSelection {
     victims: std::collections::HashSet<String>,
 }
 
+/// The shadow's victims the live sweep left in the store, minus those any
+/// policy would have kept: a durable upload's backing entry, a recent
+/// access or import, or blobs a live file still holds. Those are kept by
+/// the sweep, not by the ranking, so a flipped policy would keep them too.
+fn shadow_only_victims<'a>(
+    shadow: &ShadowSelection,
+    evicted: &std::collections::HashSet<&str>,
+    by_key: &std::collections::HashMap<&str, &'a crate::eviction::EntryFeatures>,
+    durable_upload_keys: &std::collections::HashSet<String>,
+    held: &std::collections::HashMap<String, u64>,
+) -> Vec<&'a crate::eviction::EntryFeatures> {
+    let mut victims: Vec<_> = shadow
+        .victims
+        .iter()
+        .filter(|key| !evicted.contains(key.as_str()))
+        .filter(|key| !durable_upload_keys.contains(*key) && !held.contains_key(*key))
+        .filter_map(|key| by_key.get(key.as_str()).copied())
+        .filter(|features| !features.recently_accessed && !features.recently_imported)
+        .collect();
+    victims.sort_by(|a, b| a.key.cmp(&b.key));
+    victims
+}
+
 /// Post-eviction demand, split by whether the shadow policy agreed with the
 /// live one about each evicted entry (kunobi-ninja/kache#594).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1064,6 +1087,24 @@ pub struct ShadowDemandSplit {
     /// …of which were later asked for again — the shadow's saves, had it
     /// been live.
     pub shadow_kept_demanded: usize,
+}
+
+/// Evictions one policy made, and the compile time later spent rebuilding
+/// the ones the build asked for again (kunobi-ninja/kache#594).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PolicyCost {
+    pub evicted: u64,
+    /// Logical bytes of the evicted entries.
+    pub bytes: u64,
+    pub demanded_compile_time_ms: u64,
+}
+
+/// The live policy against the value-density shadow over the same sweeps:
+/// see [`Store::shadow_counterfactual`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ShadowCounterfactual {
+    pub live: PolicyCost,
+    pub shadow: PolicyCost,
 }
 
 /// Statistics returned by [`ArtifactStore::sweep_orphan_blobs`].
@@ -1679,6 +1720,22 @@ fn initialize_db(db: &Connection) -> rusqlite::Result<()> {
     let _ = db.execute_batch("ALTER TABLE eviction_tombstones ADD COLUMN shadow_policy TEXT");
     let _ =
         db.execute_batch("ALTER TABLE eviction_tombstones ADD COLUMN shadow_would_evict INTEGER");
+    // The other side of the shadow comparison (kunobi-ninja/kache#594): the
+    // entries the shadow would have evicted that the live policy kept. Only
+    // the first such sweep per key is kept, since that is when the shadow
+    // would have removed it. Whether the build used one afterwards is read
+    // later from `entries.hit_count` (or its tombstone), so the hit path
+    // gains no write.
+    db.execute_batch(
+        "CREATE TABLE IF NOT EXISTS shadow_victims (
+            cache_key       TEXT PRIMARY KEY,
+            swept_at        TEXT NOT NULL DEFAULT (datetime('now')),
+            shadow_policy   TEXT NOT NULL,
+            size            INTEGER NOT NULL DEFAULT 0,
+            hit_count       INTEGER NOT NULL DEFAULT 0,
+            compile_time_ms INTEGER NOT NULL DEFAULT 0
+        );",
+    )?;
 
     db.execute_batch(
         "CREATE TABLE IF NOT EXISTS incremental_dirs (
@@ -4566,6 +4623,14 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             Some((current, target)) => (current, Some(target)),
             None => (0, None),
         };
+        let mut evicted = std::collections::HashSet::new();
+        // The shadow's victims are stamped with the sweep's start, so the
+        // sweep's own tombstones are never older than them.
+        let swept_at: Option<String> = shadow.and_then(|_| {
+            self.db
+                .query_row("SELECT datetime('now')", [], |row| row.get(0))
+                .ok()
+        });
 
         for key in order {
             if let Some(target) = target
@@ -4612,6 +4677,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             match removal {
                 Ok(GuardedRemoval::Reclaimed(reclaim)) => {
                     stats.entries_evicted += 1;
+                    evicted.insert(key.as_str());
                     // Budget on bytes the removal *actually* freed on disk, not
                     // the entry's logical size: evicting an entry whose blobs
                     // are all shared frees nothing, and the sweep must keep
@@ -4658,6 +4724,10 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             }
         }
         stats.evict_write_ms = eviction_writes.as_millis() as u64;
+        if let (Some(shadow), Some(swept_at)) = (shadow, swept_at) {
+            let kept = shadow_only_victims(shadow, &evicted, by_key, durable_upload_keys, held);
+            self.record_shadow_victims(shadow.policy, &swept_at, &kept);
+        }
         stats
     }
 
@@ -5179,6 +5249,110 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         }
     }
 
+    /// Record the entries the shadow policy would have evicted in this sweep
+    /// that the live one kept (kunobi-ninja/kache#594). A key already
+    /// recorded keeps its first sweep. Best-effort, like
+    /// [`Self::record_tombstone`].
+    fn record_shadow_victims(
+        &self,
+        policy: &str,
+        swept_at: &str,
+        victims: &[&crate::eviction::EntryFeatures],
+    ) {
+        if victims.is_empty() {
+            return;
+        }
+        let result = (|| -> rusqlite::Result<()> {
+            let tx = self.db.unchecked_transaction()?;
+            {
+                let mut insert = tx.prepare(
+                    "INSERT OR IGNORE INTO shadow_victims
+                        (cache_key, swept_at, shadow_policy, size, hit_count, compile_time_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                )?;
+                for victim in victims {
+                    insert.execute(params![
+                        victim.key,
+                        swept_at,
+                        policy,
+                        victim.size,
+                        victim.hit_count,
+                        victim.compile_time_ms,
+                    ])?;
+                }
+            }
+            tx.commit()
+        })();
+        if let Err(e) = result {
+            tracing::debug!("gc: could not record shadow victims: {e}");
+        }
+    }
+
+    /// What each policy's evictions cost in later recompilation, over the
+    /// sweeps both sides were recorded for (kunobi-ninja/kache#594).
+    ///
+    /// The live side is every shadowed tombstone since the first recorded
+    /// shadow victim. The shadow side is the tombstones it agreed with plus
+    /// its own victims the live policy kept; a key it took earlier is not
+    /// counted again when the live policy evicts it later. A shadow victim
+    /// was demanded when its hit count rose after the sweep, on the entry or
+    /// on its later tombstone, or when its tombstone saw a request. Rows of
+    /// unknown cost are left out, as in [`Self::shadow_demand_split`].
+    pub fn shadow_counterfactual(&self) -> Result<ShadowCounterfactual> {
+        let row = self.db.query_row(
+            "WITH since AS (SELECT MIN(swept_at) AS t FROM shadow_victims),
+             live AS (
+                SELECT * FROM eviction_tombstones
+                 WHERE shadow_policy = 'value-density' AND compile_time_ms > 0
+                   AND evicted_at >= (SELECT t FROM since)
+             ),
+             own AS (
+                SELECT sv.size, sv.compile_time_ms,
+                       (COALESCE(e.hit_count, 0) > sv.hit_count
+                        OR COALESCE(t.hit_count, 0) > sv.hit_count
+                        OR t.demanded_at IS NOT NULL) AS demanded
+                  FROM shadow_victims sv
+                  LEFT JOIN entries e ON e.cache_key = sv.cache_key
+                  LEFT JOIN eviction_tombstones t
+                         ON t.cache_key = sv.cache_key AND t.evicted_at >= sv.swept_at
+                 WHERE sv.shadow_policy = 'value-density' AND sv.compile_time_ms > 0
+             )
+             SELECT
+                (SELECT COUNT(*) FROM live),
+                (SELECT COALESCE(SUM(size), 0) FROM live),
+                (SELECT COALESCE(SUM(compile_time_ms), 0) FROM live WHERE demanded_at IS NOT NULL),
+                (SELECT COUNT(*) FROM live
+                  WHERE shadow_would_evict = 1
+                    AND cache_key NOT IN (SELECT cache_key FROM shadow_victims))
+                  + (SELECT COUNT(*) FROM own),
+                (SELECT COALESCE(SUM(size), 0) FROM live
+                  WHERE shadow_would_evict = 1
+                    AND cache_key NOT IN (SELECT cache_key FROM shadow_victims))
+                  + (SELECT COALESCE(SUM(size), 0) FROM own),
+                (SELECT COALESCE(SUM(compile_time_ms), 0) FROM live
+                  WHERE shadow_would_evict = 1 AND demanded_at IS NOT NULL
+                    AND cache_key NOT IN (SELECT cache_key FROM shadow_victims))
+                  + (SELECT COALESCE(SUM(compile_time_ms), 0) FROM own WHERE demanded)",
+            [],
+            |row| {
+                let count = |i: usize| row.get::<_, i64>(i).map(|v| v.max(0) as u64);
+                Ok(ShadowCounterfactual {
+                    live: PolicyCost {
+                        evicted: count(0)?,
+                        bytes: count(1)?,
+                        demanded_compile_time_ms: count(2)?,
+                    },
+                    shadow: PolicyCost {
+                        evicted: count(3)?,
+                        bytes: count(4)?,
+                        demanded_compile_time_ms: count(5)?,
+                    },
+                })
+            },
+        )?;
+        Ok(row)
+    }
+
     /// Note that a key was requested after being evicted — the observation the
     /// live store cannot provide, since the entries it evicted are precisely
     /// the ones missing from it (kunobi-ninja/kache#594).
@@ -5217,9 +5391,14 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     /// Run from the GC sweep. A tombstone's value is the demand signal in the
     /// window after eviction; past that it is only taking up space.
     pub fn prune_tombstones(&self, keep_days: u64) -> Result<usize> {
+        let cutoff = format!("-{keep_days} days");
         let removed = self.db.execute(
             "DELETE FROM eviction_tombstones WHERE evicted_at < datetime('now', ?1)",
-            params![format!("-{keep_days} days")],
+            params![cutoff],
+        )?;
+        self.db.execute(
+            "DELETE FROM shadow_victims WHERE swept_at < datetime('now', ?1)",
+            params![cutoff],
         )?;
         Ok(removed)
     }

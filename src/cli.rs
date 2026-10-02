@@ -5880,8 +5880,8 @@ const OTHER_CHECKOUTS: &str = "Other checkouts";
 /// Whether the latest recorded build missed crates that another checkout of
 /// the project had built, for a reason `kache explain` can name. `None` when
 /// there is no recorded build to look at.
-fn doctor_checkout_check(config: &Config) -> Option<Check> {
-    let events = crate::events::read_events(&config.event_log_path()).ok()?;
+fn doctor_checkout_check(event_log: &std::path::Path) -> Option<Check> {
+    let events = crate::events::read_events(event_log).ok()?;
     let sessions = crate::tui_sessions::group(
         &events,
         std::time::Duration::from_secs(crate::wrapper::BUILD_SESSION_SECS),
@@ -6654,7 +6654,7 @@ pub fn doctor(
     });
 
     if let Some(ref cfg) = config
-        && let Some(check) = doctor_checkout_check(cfg)
+        && let Some(check) = doctor_checkout_check(&cfg.event_log_path())
     {
         checks.push(check);
     }

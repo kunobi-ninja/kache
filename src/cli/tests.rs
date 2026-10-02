@@ -7462,3 +7462,34 @@ fn checkout_check_wording() {
         "3 misses in /w/b differ from the build in other checkouts"
     );
 }
+
+/// Read from a real event log: a second checkout whose first build of a crate
+/// differs from the first checkout's is reported; no log reports nothing.
+#[test]
+fn doctor_reads_cross_checkout_misses_from_the_event_log() {
+    use crate::events::{BuildEvent, EventResult};
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("events.jsonl");
+    assert!(doctor_checkout_check(&log).is_none());
+
+    let built = |root: &str, session: &str, sources: &str| {
+        let mut e = BuildEvent::new_for_test("one", EventResult::Miss);
+        e.root = root.to_string();
+        e.session_id = session.to_string();
+        e.unit_id = "uone".to_string();
+        e.key_fields = [("sources".to_string(), sources.to_string())]
+            .into_iter()
+            .collect();
+        e.key_externs_recorded = true;
+        e
+    };
+    for event in [built("/first", "a", "1111"), built("/second", "b", "2222")] {
+        crate::events::log_event(&log, &event).unwrap();
+    }
+    let check = doctor_checkout_check(&log).unwrap();
+    assert!(!check.pass);
+    assert_eq!(
+        check.detail,
+        "1 miss in /second differs from the build in /first"
+    );
+}

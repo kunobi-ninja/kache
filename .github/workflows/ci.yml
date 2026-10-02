@@ -872,6 +872,74 @@ jobs:
           KACHE_E2E_CACHE: ${{ runner.temp }}/kache-e2e
         run: scripts/e2e-s3.sh
 
+  # kache-action runs kache's CLI and reads its output, and it only warns when
+  # that output changes under it. This lane runs the action, pinned to the
+  # revision its v1 tag points at, against this commit's kache and a local
+  # RustFS with `strict: true`, so a change that would break the action fails
+  # here instead of in users' CI after a release. Move the pin with v1.
+  action-contract:
+    name: kache-action contract
+    runs-on: ${{ fromJSON(!github.event.repository.private && '"ubuntu-latest"' || vars.CI_RUNNER_LINUX) }}
+    needs: changes
+    if: github.event_name != 'pull_request' || needs.changes.outputs.tests == 'true'
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: zondax/actions/setup-runner@8d9900cca4563d4356c5e76c1fa49913158196d4 # v1.5.2
+      - uses: zondax/actions/setup-mise@14e656f2dcc6012c36298e3a6e95dc4ae0f022f0 # v1.5.3
+        with:
+          install: true
+          # Pin mise CLI — see the `check` job's note (v2026.6.10 regression).
+          version: 2026.6.9
+          install_args: rust
+          cache: false
+      - name: Build kache
+        run: cargo build --locked -p kache --bin kache
+        env:
+          RUSTC_WRAPPER: ""
+      # The action looks in the runner's tool cache before downloading a
+      # release. A version no release uses keeps this build from shadowing one.
+      - name: Put this build where the action looks for it
+        id: binary
+        run: |
+          version="$(cargo pkgid -p kache | sed 's/.*[#@]//')-ci.${{ github.run_id }}.${{ github.run_attempt }}"
+          case "$RUNNER_ARCH" in
+            X64) arch=x64 ;;
+            ARM64) arch=arm64 ;;
+            *) echo "unexpected runner arch $RUNNER_ARCH" >&2; exit 1 ;;
+          esac
+          dir="$RUNNER_TOOL_CACHE/kache/$version/$arch"
+          mkdir -p "$dir"
+          cp target/debug/kache "$dir/"
+          touch "$dir.complete"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Start RustFS
+        id: rustfs
+        env:
+          KACHE_E2E_CACHE: ${{ runner.temp }}/kache-e2e
+        run: |
+          rustfs=$(scripts/rustfs-start.sh kache-action)
+          eval "$rustfs"
+          echo "endpoint=$RUSTFS_ENDPOINT" >> "$GITHUB_OUTPUT"
+          echo "access-key=$RUSTFS_ACCESS_KEY" >> "$GITHUB_OUTPUT"
+          echo "secret-key=$RUSTFS_SECRET_KEY" >> "$GITHUB_OUTPUT"
+      - uses: kunobi-ninja/kache-action@ab8dcda2212b3930ee0018bfdaf8339c100ce169 # v1
+        with:
+          version: ${{ steps.binary.outputs.version }}
+          s3-bucket: kache-action
+          s3-endpoint: ${{ steps.rustfs.outputs.endpoint }}
+          s3-access-key-id: ${{ steps.rustfs.outputs.access-key }}
+          s3-secret-access-key: ${{ steps.rustfs.outputs.secret-key }}
+          github-cache: "false"
+          pr-comment: "false"
+          strict: "true"
+      # The action's post step then saves the manifest, pushes to RustFS and
+      # renders the report from this build's events.
+      - name: Build a crate through the action's wrapper
+        run: |
+          cargo new --lib --vcs none "$RUNNER_TEMP/contract"
+          cargo build --manifest-path "$RUNNER_TEMP/contract/Cargo.toml"
+
   # --- Copy-on-write filesystem coverage ---
   # Every hosted runner is ext4, where `try_reflink` always fails and the
   # `fs::copy` fallback preserves permissions. That makes an entire class of bug
@@ -1498,9 +1566,11 @@ jobs:
     # the full validation suite — `version-consistency` rejects a tag that
     # disagrees with the manifest BEFORE any binary builds; `e2e` includes the
     # (blocking) Windows arm, so a tag won't release unless Windows e2e is green.
+    # `action-contract` keeps a release from breaking kache-action's v1.
     needs:
       [
         check,
+        action-contract,
         cow-filesystem,
         nix-package,
         e2e,

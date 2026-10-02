@@ -213,6 +213,7 @@ mod tests {
 
     #[test]
     fn retrust_moves_a_changed_issuer() {
+        let _config = crate::test_support::KunobiConfigGuard::new();
         let directory = tempfile::tempdir().unwrap();
         let store = store(&directory);
         store
@@ -239,6 +240,7 @@ mod tests {
 
     #[test]
     fn retrust_moves_a_changed_audience() {
+        let _config = crate::test_support::KunobiConfigGuard::new();
         let directory = tempfile::tempdir().unwrap();
         let store = store(&directory);
         store
@@ -256,6 +258,7 @@ mod tests {
 
     #[test]
     fn retrust_is_silent_when_the_pin_matches_or_is_new() {
+        let _config = crate::test_support::KunobiConfigGuard::new();
         let directory = tempfile::tempdir().unwrap();
         let store = store(&directory);
         assert_eq!(
@@ -321,6 +324,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_changed_issuer_needs_retrust() {
+        let _config = crate::test_support::KunobiConfigGuard::new();
         crate::planner_client::ensure_crypto_provider();
         let planner = stub_planner("https://clerk.example").await;
         let directory = tempfile::tempdir().unwrap();

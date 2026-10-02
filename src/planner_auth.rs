@@ -465,6 +465,22 @@ mod tests {
         assert!(dir.is_absolute(), "{}", dir.display());
     }
 
+    /// The lock directory has to be created. A Nix build sets `HOME` to a
+    /// directory the sandbox cannot write, so the guard has to move it.
+    #[cfg(unix)]
+    #[test]
+    fn tofu_locks_are_created_inside_the_config_guard() {
+        let guard = crate::test_support::KunobiConfigGuard::new();
+        let dir = default_lock_dir().unwrap();
+        assert!(
+            dir.starts_with(guard.path()),
+            "lock dir {} is outside {}",
+            dir.display(),
+            guard.path().display()
+        );
+        std::fs::create_dir_all(&dir).unwrap();
+    }
+
     /// In-memory stand-in for kunobi-auth's file store, keyed like it is.
     #[derive(Default, Clone)]
     struct MemoryStore(Arc<Mutex<HashMap<String, StoredToken>>>);
@@ -632,6 +648,7 @@ mod tests {
 
     #[tokio::test]
     async fn only_a_planner_pinned_by_kache_login_offers_its_session() {
+        let _config = crate::test_support::KunobiConfigGuard::new();
         crate::planner_client::ensure_crypto_provider();
         let (base, hits) = stub_planner("https://clerk.example").await;
         let directory = tempfile::tempdir().unwrap();

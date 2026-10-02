@@ -90,6 +90,58 @@ pub(crate) fn process_state_test_lock() -> ProcessStateTestGuard {
     }
 }
 
+/// kunobi-auth keeps the TOFU cross-process lock in
+/// `dirs::config_dir()/kunobi/locks`. That directory follows `XDG_CONFIG_HOME`
+/// on Linux and `HOME` on macOS, and the Nix sandbox sets `HOME` to a
+/// directory the build cannot write. Hold one of these for any test that
+/// calls `TofuStore::trust` or `check_and_pin`.
+pub(crate) struct KunobiConfigGuard {
+    _lock: ProcessStateTestGuard,
+    /// Kept so the directory outlives the tests that pin a service into it.
+    /// Read on Unix, where `dirs::config_dir` follows this process's `HOME`.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    dir: tempfile::TempDir,
+    saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+}
+
+impl KunobiConfigGuard {
+    pub(crate) fn new() -> Self {
+        let lock = process_state_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let saved = ["HOME", "XDG_CONFIG_HOME"]
+            .into_iter()
+            .map(|key| {
+                let previous = std::env::var_os(key);
+                unsafe { std::env::set_var(key, dir.path()) };
+                (key, previous)
+            })
+            .collect();
+        Self {
+            _lock: lock,
+            dir,
+            saved,
+        }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn path(&self) -> &std::path::Path {
+        self.dir.path()
+    }
+}
+
+impl Drop for KunobiConfigGuard {
+    fn drop(&mut self) {
+        for (key, value) in self.saved.drain(..) {
+            unsafe {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+}
+
 /// A `Config` rooted in `cache_dir` with every optional feature off, for
 /// tests that need a store without reading the developer's configuration.
 /// Start `command` without a controlling terminal, so a child that shows

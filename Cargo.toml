@@ -56,8 +56,8 @@ opendal-service-gcs = { version = "=0.59.3", default-features = false }
 # OpenDAL exposes a custom credential chain but not a profile-name shortcut.
 # These published reqsign APIs preserve Kache's explicit profile selection
 # (including SSO and credential_process) without a git-only patch.
-reqsign-aws-v4 = { version = "=3.3.0", default-features = false }
-reqsign-core = { version = "=3.3.1", default-features = false }
+reqsign-aws-v4 = { version = "=3.3.1", default-features = false }
+reqsign-core = { version = "=3.3.2", default-features = false }
 # Direct dep so OpenDAL/reqwest can use ring without reintroducing aws-lc.
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 kache-core = { version = "0.28.1", path = "crates/kache-core", default-features = false, features = ["planning"] }
@@ -65,7 +65,7 @@ async-trait = "0.1"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "process", "fs", "io-util", "net", "time", "signal", "sync"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-base64 = "0.22"
+base64 = "0.23"
 toml = "1"
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
@@ -90,7 +90,7 @@ tempfile = "3"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider"] }
 # `kache login` and planner bearer sessions. The -core features keep reqwest
 # on `rustls-no-provider`, so ring stays the only TLS provider (no aws-lc).
-kunobi-auth = { version = "0.13.0", default-features = false, features = ["client-core", "browser-login-core", "rust_crypto"] }
+kunobi-auth = { version = "1.0.0", default-features = false, features = ["client-core", "browser-login-core", "rust_crypto"] }
 interprocess = { version = "2.4.4", features = ["tokio"] }
 unicode-normalization = "0.1"
 # Used by `src/compiler/flags.rs` (the cc / future Swift / future MSVC

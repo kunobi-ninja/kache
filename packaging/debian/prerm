@@ -2,7 +2,7 @@
 set -e
 
 # Remove only the canonical farm. Extra names a local admin added with
-# `kache install-shims --from-path /usr/lib/kache` are left in place.
+# `kache install-shims /usr/lib/kache` are left in place.
 case "$1" in
 remove|deconfigure)
   if [ -d /usr/lib/kache ]; then

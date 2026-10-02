@@ -2040,16 +2040,18 @@ pub(crate) mod shim {
         dirs::home_dir().map(|home| farm::default_dir(&home))
     }
 
-    /// Compiler names already on PATH that are not in [`farm::SHIM_NAMES`].
+    /// Names already on PATH that `wanted` accepts and [`farm::SHIM_NAMES`]
+    /// lacks.
     ///
-    /// `kache install-shims --from-path` uses this so versioned and
-    /// target-prefixed drivers (`gcc-13`, `x86_64-pc-linux-gnu-gcc`) get a
-    /// symlink without a second hardcoded list. Shims are skipped by the same
-    /// rules as [`resolve_real_compiler`], otherwise a re-run would treat a
-    /// farm, this one or another install's, as compilers.
+    /// `kache install-shims` links the versioned drivers this finds
+    /// (`clang-19`, `g++-13`), and with `--from-path` every compiler name
+    /// (`x86_64-pc-linux-gnu-gcc`), without a second hardcoded list. Shims are
+    /// skipped by the same rules as [`resolve_real_compiler`], otherwise a
+    /// re-run would treat a farm, this one or another install's, as compilers.
     pub(crate) fn extra_compiler_names(
         path_dirs: &[PathBuf],
         self_exe: Option<&Path>,
+        wanted: &dyn Fn(&str) -> bool,
         is_candidate: &dyn Fn(&Path) -> bool,
         resolve: &dyn Fn(&Path) -> Option<PathBuf>,
         is_marked: &dyn Fn(&Path) -> bool,
@@ -2077,7 +2079,7 @@ pub(crate) mod shim {
                 if farm::SHIM_NAMES.contains(&name) {
                     continue;
                 }
-                if invoked_as_compiler(name) {
+                if wanted(name) {
                     names.insert(name.to_string());
                 }
             }
@@ -2085,15 +2087,23 @@ pub(crate) mod shim {
         names.into_iter().collect()
     }
 
-    /// Live wiring for [`extra_compiler_names`].
+    /// What `kache install-shims` and `kache init` link besides
+    /// [`farm::SHIM_NAMES`], found in the directories of `path`: the
+    /// versioned drivers, or with `from_path` every compiler name. Only
+    /// `from_path` may run a program, to probe a name it does not know.
     #[cfg_attr(not(unix), allow(dead_code))]
-    pub(crate) fn extra_compiler_names_from_env() -> Vec<String> {
-        let path = std::env::var_os("PATH").unwrap_or_default();
-        let dirs: Vec<PathBuf> = std::env::split_paths(&path).collect();
+    pub(crate) fn names_on_path(path: &std::ffi::OsStr, from_path: bool) -> Vec<String> {
+        let dirs: Vec<PathBuf> = std::env::split_paths(path).collect();
         let self_exe = std::env::current_exe().ok();
+        let wanted: &dyn Fn(&str) -> bool = if from_path {
+            &invoked_as_compiler
+        } else {
+            &farm::is_versioned_driver
+        };
         extra_compiler_names(
             &dirs,
             self_exe.as_deref(),
+            wanted,
             &|candidate| super::is_executable(candidate),
             &|path| std::fs::canonicalize(path).ok(),
             &|dir| farm::has_marker(dir),
@@ -2424,6 +2434,7 @@ mod shim_tests {
         let names = extra_compiler_names(
             &[own, other, marked, real],
             Some(&me),
+            &invoked_as_compiler,
             &|candidate| super::is_executable(candidate),
             &|path| std::fs::canonicalize(path).ok(),
             &|dir| kache_shims::farm::has_marker(dir),
@@ -2544,46 +2555,30 @@ mod shim_tests {
         );
     }
 
+    /// Without `--from-path` only versioned drivers join the canonical names;
+    /// with it, every compiler name. Neither lists this binary's own shims.
     #[cfg(unix)]
     #[test]
-    fn extra_names_on_path_include_versioned_compilers_not_the_farm() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let _lock = crate::config::tests::config_path_lock();
+    fn names_on_path_are_versioned_drivers_unless_every_name_is_asked_for() {
         let dir = tempfile::tempdir().unwrap();
         let shim_dir = dir.path().join("shims");
         let real_dir = dir.path().join("real");
         std::fs::create_dir_all(&shim_dir).unwrap();
-        std::fs::create_dir_all(&real_dir).unwrap();
 
         let exe = std::env::current_exe().unwrap();
         std::os::unix::fs::symlink(&exe, shim_dir.join("gcc")).unwrap();
+        std::os::unix::fs::symlink(&exe, shim_dir.join("clang-18")).unwrap();
+        // Canonical names are already in SHIM_NAMES; neither mode re-lists
+        // them just because a real gcc sits later on PATH.
+        for name in ["gcc", "gcc-13", "clang++-19", "x86_64-linux-gnu-gcc-13"] {
+            write_executable(&real_dir.join(name), "#!/bin/sh\nexit 0\n");
+        }
+        let path = std::env::join_paths([&shim_dir, &real_dir]).unwrap();
 
-        let gcc13 = real_dir.join("gcc-13");
-        std::fs::write(&gcc13, "#!/bin/sh\nexit 0\n").unwrap();
-        std::fs::set_permissions(&gcc13, std::fs::Permissions::from_mode(0o755)).unwrap();
-        // Canonical names are already in SHIM_NAMES; --from-path must not
-        // re-list them just because a real gcc sits later on PATH.
-        let gcc = real_dir.join("gcc");
-        std::fs::write(&gcc, "#!/bin/sh\nexit 0\n").unwrap();
-        std::fs::set_permissions(&gcc, std::fs::Permissions::from_mode(0o755)).unwrap();
-
-        let _path = PathForTest(std::env::var_os("PATH"));
-        unsafe {
-            std::env::set_var(
-                "PATH",
-                format!("{}:{}", shim_dir.display(), real_dir.display()),
-            )
-        };
-
-        let extra = extra_compiler_names_from_env();
-        assert!(
-            extra.iter().any(|n| n == "gcc-13"),
-            "versioned compiler must be wrapped, got {extra:?}"
-        );
-        assert!(
-            !extra.iter().any(|n| n == "gcc"),
-            "canonical names belong to SHIM_NAMES, got {extra:?}"
+        assert_eq!(names_on_path(&path, false), ["clang++-19", "gcc-13"]);
+        assert_eq!(
+            names_on_path(&path, true),
+            ["clang++-19", "gcc-13", "x86_64-linux-gnu-gcc-13"]
         );
     }
 }

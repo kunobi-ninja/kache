@@ -448,7 +448,8 @@ enum Commands {
     Logout,
 
     /// Create compiler-name symlinks pointing at kache, for transparent
-    /// interception by prepending the directory to PATH
+    /// interception by prepending the directory to PATH. Versioned compilers
+    /// on PATH (clang-19, g++-13) are linked too
     InstallShims {
         /// Directory to populate. Defaults to ~/.local/lib/kache/shims
         #[arg(value_name = "DIR")]
@@ -458,9 +459,13 @@ enum Commands {
         #[arg(long)]
         force: bool,
 
-        /// Also wrap compiler names already on PATH (gcc-13, target triplets)
+        /// Also wrap every other compiler name on PATH (target triplets)
         #[arg(long)]
         from_path: bool,
+
+        /// Link only the unversioned names, not the versioned compilers on PATH
+        #[arg(long, conflicts_with = "from_path")]
+        canonical_only: bool,
     },
 
     /// Generate shell completion scripts
@@ -1146,14 +1151,16 @@ fn main() -> Result<()> {
             dir,
             force,
             from_path,
+            canonical_only,
         }) => {
             let dir = dir
                 .or_else(compiler::shim::default_shim_dir)
                 .context("no home directory; pass the shim directory to use")?;
-            let extra = if from_path {
-                compiler::shim::extra_compiler_names_from_env()
-            } else {
+            let extra = if canonical_only {
                 Vec::new()
+            } else {
+                let path = std::env::var_os("PATH").unwrap_or_default();
+                compiler::shim::names_on_path(&path, from_path)
             };
             cli::install_shims_named(&dir, force, &extra)
         }

@@ -8494,7 +8494,9 @@ fn init_compiler_setup(yes: bool, no_shell: bool, check: bool) -> Result<bool> {
             return Ok(false);
         }
     };
-    let shims_ready = shim_dir_is_ready(&shim_dir);
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let extra = crate::compiler::shim::names_on_path(&path, false);
+    let shims_ready = shim_dir_is_ready(&shim_dir, &extra);
     let needs_edit = edits.iter().any(Edit::changed);
     if !shims_ready || needs_edit {
         println!("  Cargo target protection and C/C++ caching in new terminals");
@@ -8517,9 +8519,9 @@ fn init_compiler_setup(yes: bool, no_shell: bool, check: bool) -> Result<bool> {
             return Ok(false);
         }
         if !shims_ready {
-            install_shims_named_with_output(&shim_dir, false, &[], false)?;
+            install_shims_named_with_output(&shim_dir, false, &extra, false)?;
             anyhow::ensure!(
-                shim_dir_is_ready(&shim_dir),
+                shim_dir_is_ready(&shim_dir, &extra),
                 "existing files in {} prevent compiler setup; inspect them before using kache install-shims --force",
                 shim_dir.display()
             );
@@ -8689,12 +8691,17 @@ fn shim_target() -> Result<kache_shims::Selection> {
     kache_shims::detect().context("locating the kache binary")
 }
 
-/// True when `dir` already links every canonical compiler name to the
-/// selected target. Used by `kache init` so a second run is a no-op.
+/// True when `dir` already links every name an install with `extra_names`
+/// would create to the selected target. Used by `kache init` so a second run
+/// is a no-op, and a compiler version installed since the first is linked.
 #[cfg(unix)]
-fn shim_dir_is_ready(dir: &std::path::Path) -> bool {
-    shim_target()
-        .is_ok_and(|target| kache_shims::farm::is_ready(dir, &target.path, &kache_shims::RealFs))
+fn shim_dir_is_ready(dir: &std::path::Path, extra_names: &[String]) -> bool {
+    let Ok(names) = shim_names(extra_names) else {
+        return false;
+    };
+    shim_target().is_ok_and(|target| {
+        kache_shims::farm::is_ready(dir, &target.path, &names, &kache_shims::RealFs)
+    })
 }
 
 #[cfg(unix)]
@@ -8903,7 +8910,7 @@ mod shim_install_tests {
     fn empty_dir_is_not_ready() {
         let dir = tempfile::tempdir().unwrap();
         assert!(
-            !super::shim_dir_is_ready(dir.path()),
+            !super::shim_dir_is_ready(dir.path(), &[]),
             "an empty directory must not count as an installed farm"
         );
     }
@@ -8914,7 +8921,7 @@ mod shim_install_tests {
         let shims = dir.path().join("shims");
         install_shims(&shims, false).unwrap();
         assert!(
-            super::shim_dir_is_ready(&shims),
+            super::shim_dir_is_ready(&shims, &[]),
             "the installer must produce a farm that init treats as already done"
         );
 
@@ -8927,9 +8934,27 @@ mod shim_install_tests {
             std::os::unix::fs::symlink(&not_kache, shims.join(name)).unwrap();
         }
         assert!(
-            !super::shim_dir_is_ready(&shims),
+            !super::shim_dir_is_ready(&shims, &[]),
             "links that do not point at this kache must not look ready"
         );
+    }
+
+    /// A compiler version installed after the farm was made leaves it not
+    /// ready, so a rerun of `kache init` links it.
+    #[test]
+    fn a_versioned_compiler_the_farm_lacks_makes_it_not_ready() {
+        let dir = tempfile::tempdir().unwrap();
+        let shims = dir.path().join("shims");
+        let extra = ["clang-19".to_string()];
+        install_shims(&shims, false).unwrap();
+        assert!(!super::shim_dir_is_ready(&shims, &extra));
+
+        super::install_shims_named(&shims, false, &extra).unwrap();
+        assert_eq!(
+            std::fs::read_link(shims.join("clang-19")).unwrap(),
+            target()
+        );
+        assert!(super::shim_dir_is_ready(&shims, &extra));
     }
 
     /// A run that skips a real compiler must not mark the directory even when

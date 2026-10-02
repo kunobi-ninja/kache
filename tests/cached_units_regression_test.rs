@@ -520,70 +520,142 @@ fn build_script_runs_are_restored_and_keyed_on_their_declarations() {
     assert!(results_for(&events_since(&fx.cache, mark), "build_script_run").is_empty());
 }
 
-/// A script that writes into its own declared inputs, as a generator does
-/// when it creates its data directory on the first run, is not recorded: the
-/// key computed afterwards describes neither the tree the run read nor one a
-/// restore would leave. The run is still logged, as a refusal that says why.
-/// The script runs in a few milliseconds, inside one file-system clock tick,
-/// which is how the refusal used to be missed some of the time.
-#[test]
-fn a_build_script_writing_into_its_inputs_is_logged_but_not_recorded() {
-    let fx = fixture_from(|root| {
-        std::fs::write(
-            root.join("Cargo.toml"),
-            "[package]\nname = \"selfwriter\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
-        )
-        .unwrap();
-        std::fs::write(
-            root.join("build.rs"),
-            r#"fn main() {
+/// A package whose build script declares the package directory, writes
+/// `body` into it, and appends a line to `$SELFWRITER_RUNS` on every run.
+fn write_selfwriter(root: &Path, body: &str) {
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"selfwriter\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("build.rs"),
+        format!(
+            r#"use std::io::Write;
+fn main() {{
     let package = std::path::PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap());
-    println!("cargo:rerun-if-changed={}", package.display());
-    std::fs::create_dir_all(package.join("data")).unwrap();
+    println!("cargo:rerun-if-changed={{}}", package.display());
+    println!("cargo:warning=selfwriter ran");
+    let runs = std::env::var_os("SELFWRITER_RUNS").unwrap();
+    let mut runs = std::fs::OpenOptions::new().create(true).append(true).open(runs).unwrap();
+    writeln!(runs, "run").unwrap();
+    {body}
+}}
+"#
+        ),
+    )
+    .unwrap();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/lib.rs"), "").unwrap();
 }
-"#,
-        )
-        .unwrap();
-        std::fs::create_dir_all(root.join("src")).unwrap();
-        std::fs::write(root.join("src/lib.rs"), "").unwrap();
-    });
-    for (name, expected) in [
-        ("first", "passthrough"),
-        ("settled", "miss"),
-        ("restored", "local_hit"),
-    ] {
+
+/// A script that writes into its own declared inputs is not recorded from
+/// that run: the key computed afterwards describes neither the tree the run
+/// read nor one a restore would leave. A generator that creates its data
+/// directory on the first run leaves the tree alone on the next, so kache
+/// runs it once more and records that run. A script that writes into its
+/// inputs every time is refused, and later misses run it only once.
+#[test]
+fn a_build_script_writing_into_its_inputs_is_recorded_once_it_settles() {
+    let runs_of = |fx: &Fixture, name: &str| -> (Vec<String>, String, usize) {
+        let runs = fx.home.join(format!("runs-{name}"));
         let mark = event_count(&fx.cache);
-        run(&mut cargo(
+        let output = run(&mut cargo(
             "check",
             &fx.workspace,
             &fx.home,
             &fx.cache,
-            &target(&fx, name),
-            &[],
+            &target(fx, name),
+            &[("SELFWRITER_RUNS", runs.to_str().unwrap())],
         ));
         let events = events_since(&fx.cache, mark);
-        assert_eq!(
-            results_for(&events, "build_script_run"),
-            vec![expected],
-            "{name}"
-        );
         let event = events
             .iter()
             .find(|e| field(e, "crate_name") == "build_script_run")
             .unwrap();
         assert_eq!(field(event, "package"), "selfwriter", "{event}");
-        if expected == "passthrough" {
-            assert!(
-                field(event, "passthrough_reason").contains("changed while the script ran"),
-                "{event}"
-            );
-            // The next run must not depend on how soon Cargo starts again.
-            let old = filetime::FileTime::from_unix_time(1_600_000_000, 0);
-            for path in walkdir(&fx.workspace) {
-                filetime::set_file_mtime(&path, old).unwrap();
-            }
-            filetime::set_file_mtime(&fx.workspace, old).unwrap();
-        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let reason = field(event, "passthrough_reason").to_string();
+        let ran = std::fs::read_to_string(&runs).map_or(0, |text| text.lines().count());
+        assert!(
+            stderr.matches("selfwriter ran").count() <= 1,
+            "Cargo sees one run's output: {stderr}"
+        );
+        (
+            results_for(&events, "build_script_run")
+                .iter()
+                .map(|r| r.to_string())
+                .collect(),
+            reason,
+            ran,
+        )
+    };
+
+    let settles = fixture_from(|root| {
+        write_selfwriter(
+            root,
+            r#"std::fs::create_dir_all(package.join("data")).unwrap();"#,
+        )
+    });
+    let (results, _, ran) = runs_of(&settles, "first");
+    assert_eq!(
+        (results, ran),
+        (vec!["miss".to_string()], 2),
+        "recorded from the second run"
+    );
+    let (results, _, ran) = runs_of(&settles, "restored");
+    assert_eq!((results, ran), (vec!["local_hit".to_string()], 0));
+
+    let never = fixture_from(|root| {
+        write_selfwriter(
+            root,
+            r#"std::fs::write(package.join("stamp"), format!("{:?}", std::time::SystemTime::now())).unwrap();"#,
+        )
+    });
+    for (name, expected_runs) in [("first", 2), ("again", 1)] {
+        let (results, reason, ran) = runs_of(&never, name);
+        assert_eq!(results, vec!["passthrough".to_string()], "{name}");
+        assert!(
+            reason.contains("changed while the script ran"),
+            "{name}: {reason}"
+        );
+        assert_eq!(
+            ran, expected_runs,
+            "{name}: a second run only until it fails to settle"
+        );
+    }
+
+    // Cargo gets the exit status of the run whose output it sees: the second
+    // when the first wrote into its inputs, else the first.
+    let fails = fixture_from(|root| {
+        write_selfwriter(
+            root,
+            r#"if package.join("data").exists() { std::process::exit(3) }
+    std::fs::create_dir_all(package.join("data")).unwrap();"#,
+        )
+    });
+    for (name, expected_runs) in [("second-fails", 2), ("first-fails", 1)] {
+        let runs = fails.home.join(format!("runs-{name}"));
+        let mark = event_count(&fails.cache);
+        let output = cargo(
+            "check",
+            &fails.workspace,
+            &fails.home,
+            &fails.cache,
+            &target(&fails, name),
+            &[("SELFWRITER_RUNS", runs.to_str().unwrap())],
+        )
+        .output()
+        .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{name}: {stderr}");
+        assert!(stderr.contains("exit status: 3"), "{name}: {stderr}");
+        let ran = std::fs::read_to_string(&runs).map_or(0, |text| text.lines().count());
+        assert_eq!(ran, expected_runs, "{name}");
+        assert!(
+            results_for(&events_since(&fails.cache, mark), "build_script_run").is_empty(),
+            "{name}: a failed run is not an event"
+        );
     }
 }
 

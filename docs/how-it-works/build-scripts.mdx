@@ -52,7 +52,11 @@ Entries stay in the local store: `kache sync` never uploads them.
 - A script that prints an empty `cargo:rerun-if-changed=` (always rerun) or
   declares an input under `OUT_DIR`.
 - A run that started with a non-empty `OUT_DIR`, or during which a declared
-  input changed.
+  input changed. When the script itself wrote into its inputs, as a generator
+  does when it creates its data directory on the first run, kache runs it once
+  more on the tree it left and records that run instead; Cargo sees only the
+  second run's output. A script whose second run writes into its inputs again
+  is not run twice after that.
 - An `OUT_DIR` over 1 GiB, with more than 50,000 non-empty files and symlinks
   together, or with a symlink whose target is absolute or does not follow
   this rule: climb no higher than `OUT_DIR` with leading `..`, then only

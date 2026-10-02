@@ -485,6 +485,8 @@ fn doctor_install_path_check_wording() {
 fn doctor_check_optionality_truth_table() {
     // An install path an upgrade may break is information, not an issue.
     assert!(doctor_check_is_optional("Install path", false, false));
+    // So is a build that could reuse another checkout with a setting changed.
+    assert!(doctor_check_is_optional(OTHER_CHECKOUTS, false, false));
     // Daemon labels downgrade exactly when the daemon is optional.
     assert!(doctor_check_is_optional("Daemon version", true, false));
     assert!(!doctor_check_is_optional("Daemon version", false, false));
@@ -7438,4 +7440,56 @@ fn cache_counts_cover_one_crate_or_the_whole_cache() {
     );
     assert_eq!(cache_counts(&store, &CacheClean::All).unwrap().0, 2);
     assert!(cache_counts(&store, &CacheClean::All).unwrap().1 > 0);
+}
+
+/// The "Other checkouts" line names the count, both trees and where to look,
+/// in the singular and the plural, and says nothing when nothing traced there.
+#[test]
+fn checkout_check_wording() {
+    let clean = checkout_check("/w/b", 0, None);
+    assert!(clean.pass);
+    assert_eq!(clean.fix, None);
+
+    let one = checkout_check("/w/b", 1, Some("/w/a"));
+    assert!(!one.pass);
+    assert_eq!(one.label, OTHER_CHECKOUTS);
+    assert_eq!(one.detail, "1 miss in /w/b differs from the build in /w/a");
+    assert!(one.fix.as_deref().unwrap().contains("kache explain"));
+
+    let many = checkout_check("/w/b", 3, None);
+    assert_eq!(
+        many.detail,
+        "3 misses in /w/b differ from the build in other checkouts"
+    );
+}
+
+/// Read from a real event log: a second checkout whose first build of a crate
+/// differs from the first checkout's is reported; no log reports nothing.
+#[test]
+fn doctor_reads_cross_checkout_misses_from_the_event_log() {
+    use crate::events::{BuildEvent, EventResult};
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("events.jsonl");
+    assert!(doctor_checkout_check(&log).is_none());
+
+    let built = |root: &str, session: &str, sources: &str| {
+        let mut e = BuildEvent::new_for_test("one", EventResult::Miss);
+        e.root = root.to_string();
+        e.session_id = session.to_string();
+        e.unit_id = "uone".to_string();
+        e.key_fields = [("sources".to_string(), sources.to_string())]
+            .into_iter()
+            .collect();
+        e.key_externs_recorded = true;
+        e
+    };
+    for event in [built("/first", "a", "1111"), built("/second", "b", "2222")] {
+        crate::events::log_event(&log, &event).unwrap();
+    }
+    let check = doctor_checkout_check(&log).unwrap();
+    assert!(!check.pass);
+    assert_eq!(
+        check.detail,
+        "1 miss in /second differs from the build in /first"
+    );
 }

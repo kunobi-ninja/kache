@@ -5872,6 +5872,59 @@ fn doctor_check_is_optional(label: &str, daemon_optional: bool, probe_no_compile
         || (label == "Compiler probe" && probe_no_compiler)
         || label == "C/C++ shims"
         || label == "Install path"
+        || label == OTHER_CHECKOUTS
+}
+
+const OTHER_CHECKOUTS: &str = "Other checkouts";
+
+/// Whether the latest recorded build missed crates that another checkout of
+/// the project had built, for a reason `kache explain` can name. `None` when
+/// there is no recorded build to look at.
+fn doctor_checkout_check(event_log: &std::path::Path) -> Option<Check> {
+    let events = crate::events::read_events(event_log).ok()?;
+    let sessions = crate::tui_sessions::group(
+        &events,
+        std::time::Duration::from_secs(crate::wrapper::BUILD_SESSION_SECS),
+    );
+    let builds = crate::explain::latest_builds(&sessions, None)?;
+    let (count, baseline) =
+        crate::tui_sessions::other_checkout_misses(&events, &builds.latest.events);
+    Some(checkout_check(
+        &builds.latest.root,
+        count,
+        baseline.as_deref(),
+    ))
+}
+
+/// Wording for the "Other checkouts" check. Informational: the misses are
+/// real, but whether to normalize paths is the user's call.
+fn checkout_check(root: &str, count: usize, baseline: Option<&str>) -> Check {
+    if count == 0 {
+        return Check {
+            label: OTHER_CHECKOUTS,
+            pass: true,
+            detail: "no miss in the latest build traces to another checkout".into(),
+            fix: None,
+        };
+    }
+    let other = baseline.map_or_else(
+        || "other checkouts".to_string(),
+        |path| crate::term::home_path(std::path::Path::new(path)),
+    );
+    Check {
+        label: OTHER_CHECKOUTS,
+        pass: false,
+        detail: format!(
+            "{} {} in {} differ{} from the build in {other}",
+            count,
+            if count == 1 { "miss" } else { "misses" },
+            crate::term::home_path(std::path::Path::new(root)),
+            if count == 1 { "s" } else { "" },
+        ),
+        fix: Some(
+            "`kache explain` says what to set, often `KACHE_BASE_DIR` or C/C++ prefix maps".into(),
+        ),
+    }
 }
 
 /// Wording for the "Install path" check, as `(pass, detail, fix hint)`:
@@ -6599,6 +6652,12 @@ pub fn doctor(
         detail: shim_status.detail(),
         fix: shim_status.fix(crate::compiler::shim::default_shim_dir().as_deref()),
     });
+
+    if let Some(ref cfg) = config
+        && let Some(check) = doctor_checkout_check(&cfg.event_log_path())
+    {
+        checks.push(check);
+    }
 
     // Compiler probe (#626): reported from the live toolchain, bypassing the
     // probe cache, so a stale stored "unresolved" record can't mask a fixed

@@ -160,7 +160,7 @@ kache doctor --repair
 
 `--purge-sccache` and `--repair` delete data. Check what they will remove before running them.
 
-Doctor also reports where the running binary is installed ("Install path"), whether the C/C++ shims are active, broken, not first on `PATH` or not installed, and whether the login service runs a binary that no longer exists, is not executable, or is a different file from the running Kache. Run `kache daemon install` to fix the last one.
+Doctor also reports, for information, how many misses in the latest build differ from the same crates built in another checkout ("Other checkouts"); `kache explain` says what to set. It reports where the running binary is installed ("Install path"), whether the C/C++ shims are active, broken, not first on `PATH` or not installed, and whether the login service runs a binary that no longer exists, is not executable, or is a different file from the running Kache. Run `kache daemon install` to fix the last one.
 
 With a remote configured, `kache doctor` also asks it for an object that is never written. A miss passes: the store answered and accepted the credentials. A failure names the likely cause when the store says, such as expired credentials, a secret key that does not match, a clock too far from the store's, the bucket's real region, or a bucket that does not exist. An S3 endpoint that uses plain `http://` to another machine fails its own check.
 
@@ -339,6 +339,7 @@ Without a crate, `explain` reads the latest recorded build and says why it misse
 | built before with this exact key, but the entry was gone | Nothing in its inputs changed; the entry was evicted or never reached this machine |
 | downstream of a crate | A dependency changed and every crate built on it recompiled; the crate where the change started is named |
 | own inputs changed | Its sources, compiler flags, profile or features, an environment variable it reads, its linker, or its path remapping changed |
+| differs from the build in another checkout | The first build of the crate in this tree, and its inputs differ from the same crate built in another checkout. `kache explain <crate>` names the input. A path into the checkout that Kache did not map needs `KACHE_BASE_DIR`; a C or C++ library a build script generated with the checkout's path or a timestamp in it needs prefix maps and `ZERO_AR_DATE`; a flag or file that really differs needs nothing |
 | no earlier compile | The first build of the crate in this tree, or older history was rotated away |
 | unexplained | Nothing recorded why; `[cache] explain_miss = true` records it from the next build |
 

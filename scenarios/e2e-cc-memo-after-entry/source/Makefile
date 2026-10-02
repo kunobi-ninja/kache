@@ -1,8 +1,9 @@
-# One source compiled twice, once with a diagnostics-only flag. The objects
-# are identical, so both outputs share one cache entry, but the flag is part
-# of the preprocessor memo key, so each compile has its own memo. CC is
-# overridden by the harness to "$KACHE cc".
+# One source compiled twice, through two spellings of the same compiler.
+# The objects are identical, so both outputs share one cache entry, but
+# each spelling has its own preprocessor memo. The harness sets CC to
+# "$KACHE cc" and CC_ALT to the same driver by absolute path.
 CC     ?= cc
+CC_ALT ?= $(CC)
 CFLAGS ?= -O0 -g
 BUILD  := build
 
@@ -15,7 +16,7 @@ $(BUILD)/a/util.o: src/util.c
 
 $(BUILD)/b/util.o: src/util.c
 	mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) -fdiagnostics-color=never -c $< -o $@
+	$(CC_ALT) $(CFLAGS) -c $< -o $@
 
 # Link only one copy; the other is compiled for the cache's sake.
 $(BUILD)/tool: $(BUILD)/a/util.o $(BUILD)/b/util.o src/main.c

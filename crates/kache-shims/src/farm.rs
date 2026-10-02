@@ -10,10 +10,24 @@ use std::io;
 use std::path::Component;
 use std::path::{Path, PathBuf};
 
-/// The canonical drivers. Versioned and target-prefixed compiler names are opt-in.
+/// The canonical drivers. Versioned drivers ([`is_versioned_driver`]) are
+/// linked when found on `PATH`; target-prefixed compiler names are opt-in.
 pub const SHIM_NAMES: &[&str] = &[
     "cc", "c++", "gcc", "g++", "clang", "clang++", "cargo", "rustdoc",
 ];
+
+/// A C or C++ driver from [`SHIM_NAMES`] with a version suffix, as Debian,
+/// Ubuntu and Homebrew install releases side by side: `clang-19`,
+/// `clang++-19`, `gcc-13`, `g++-14`. Decided by name alone, so finding them
+/// on `PATH` runs nothing.
+pub fn is_versioned_driver(name: &str) -> bool {
+    name.rsplit_once('-').is_some_and(|(driver, version)| {
+        matches!(driver, "cc" | "c++" | "gcc" | "g++" | "clang" | "clang++")
+            && version
+                .split('.')
+                .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+    })
+}
 
 /// Marks a directory of kache shims. Every kache skips every entry in it when
 /// looking for the real compiler, so it goes only on shim-only directories.
@@ -91,9 +105,9 @@ pub fn holds_only_shims(dir: &Path, self_exe: Option<&Path>, fs: &dyn Fs) -> boo
     })
 }
 
-/// Every canonical shim in `dir` is a working link whose text is exactly `target`.
-pub fn is_ready(dir: &Path, target: &Path, fs: &dyn Fs) -> bool {
-    SHIM_NAMES.iter().all(|name| {
+/// Each of `names` in `dir` is a working link whose text is exactly `target`.
+pub fn is_ready(dir: &Path, target: &Path, names: &[String], fs: &dyn Fs) -> bool {
+    names.iter().all(|name| {
         let link = dir.join(name);
         fs.read_link(&link).as_deref() == Some(target) && fs.is_executable_file(&link)
     })

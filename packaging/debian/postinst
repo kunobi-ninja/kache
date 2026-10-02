@@ -2,10 +2,12 @@
 set -e
 
 # Recreate the compiler-name farm from the installed binary so the
-# names cannot drift from compiler::shim::SHIM_NAMES.
+# names cannot drift from kache_shims::farm::SHIM_NAMES. Versioned
+# compilers stay out: a link made here would outlive the compiler's
+# package, and prerm would leave it behind.
 case "$1" in
 configure)
-  kache init --shims /usr/lib/kache --force >/dev/null
+  kache init --shims /usr/lib/kache --force --canonical-only >/dev/null
   ;;
 esac
 

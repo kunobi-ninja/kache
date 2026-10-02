@@ -10,6 +10,7 @@ Finds the path to record for a running binary so it survives an upgrade, and man
 - `detect` (or `select` with your own `Env` and `Fs`) picks the path to write into shims and service files. An installer alias comes first (Homebrew's `opt` link, a Nix profile, mise's `latest`), then a stable `PATH` entry, then the binary's own path. A candidate counts only if it reaches the same file (device and inode) as the running binary.
 - `Selection` carries the installer (`Kind`), whether the path survives an upgrade (`Stability`), and a reason to show the user.
 - `install` creates the symlink farm and writes the `.kache-shims` marker. In a directory it owns, it also replaces links whose target is gone, without being forced.
+- `farm::is_versioned_driver` recognizes a versioned C or C++ driver (`clang-19`, `g++-13`) by name, so a caller can link the ones on `PATH` without running them.
 - `farm::status` reports a farm as active, broken, not first on `PATH`, or not installed.
 - `Fs` is the read-only filesystem interface selection and status use, so each rule can be tested with fake paths.
 

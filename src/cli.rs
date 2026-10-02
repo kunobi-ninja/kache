@@ -6652,6 +6652,12 @@ pub fn doctor(
         detail: shim_status.detail(),
         fix: shim_status.fix(crate::compiler::shim::default_shim_dir().as_deref()),
     });
+    #[cfg(unix)]
+    if let Some(dir) = crate::compiler::shim::default_shim_dir()
+        && let Some(check) = stale_shims_check(&dir, &std::env::var_os("PATH").unwrap_or_default())
+    {
+        checks.push(check);
+    }
 
     if let Some(ref cfg) = config
         && let Some(check) = doctor_checkout_check(&cfg.event_log_path())
@@ -9242,9 +9248,47 @@ fn shim_dir_is_ready(dir: &std::path::Path, extra_names: &[String]) -> bool {
     let Ok(names) = shim_names(extra_names) else {
         return false;
     };
+    let path = std::env::var_os("PATH").unwrap_or_default();
     shim_target().is_ok_and(|target| {
         kache_shims::farm::is_ready(dir, &target.path, &names, &kache_shims::RealFs)
+            && kache_shims::farm::stale_versioned(
+                dir,
+                &target.path,
+                &|name| keeps_shim(&names, &path, name),
+                &kache_shims::RealFs,
+            )
+            .is_empty()
     })
+}
+
+/// Versioned shims in `dir` that a rerun of `kache install-shims` would
+/// remove. `None` when there are none.
+#[cfg(unix)]
+fn stale_shims_check(dir: &std::path::Path, path: &std::ffi::OsStr) -> Option<Check> {
+    let target = shim_target().ok()?;
+    let stale = kache_shims::farm::stale_versioned(
+        dir,
+        &target.path,
+        &|name| keeps_shim(&[], path, name),
+        &kache_shims::RealFs,
+    );
+    (!stale.is_empty()).then(|| Check {
+        label: "Stale shims",
+        pass: false,
+        detail: format!(
+            "no real compiler on PATH behind {} in {}",
+            stale.join(", "),
+            dir.display()
+        ),
+        fix: Some("kache install-shims".into()),
+    })
+}
+
+/// A shim stays while kache links its name or a real compiler of that name
+/// is on `path`.
+#[cfg(unix)]
+fn keeps_shim(names: &[String], path: &std::ffi::OsStr, name: &str) -> bool {
+    names.iter().any(|kept| kept == name) || crate::compiler::shim::real_compiler_on(path, name)
 }
 
 #[cfg(unix)]
@@ -9293,7 +9337,10 @@ fn install_shims_named_with_output(
     let target = shim_target()?;
     let names = shim_names(extra_names)?;
     let layout = kache_shims::Layout::from_process();
-    let report = kache_shims::install(dir, &target.path, &names, force, &layout)?;
+    let mut report = kache_shims::install(dir, &target.path, &names, force, &layout)?;
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    report.pruned =
+        kache_shims::farm::prune(dir, &target.path, &|name| keeps_shim(&names, &path, name))?;
     if verbose {
         for line in install_report_lines(dir, &target, &report) {
             println!("{line}");
@@ -9322,6 +9369,11 @@ fn install_report_lines(
         (&report.repaired, "Repaired", "broken shim(s)"),
         (&report.refreshed, "Moved", "shim(s) off a versioned path"),
         (&report.replaced, "Replaced", "existing entr(ies)"),
+        (
+            &report.pruned,
+            "Removed",
+            "shim(s) with no compiler behind them",
+        ),
     ];
     for (names, verb, what) in groups {
         if !names.is_empty() {
@@ -9551,6 +9603,60 @@ mod shim_install_tests {
         );
     }
 
+    fn path_with_real(dir: &std::path::Path, name: &str) -> std::ffi::OsString {
+        let real = dir.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(real.join(name), b"#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(real.join(name), std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::env::join_paths([real]).unwrap()
+    }
+
+    #[test]
+    fn a_shim_is_kept_for_a_linked_name_or_a_real_compiler() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = path_with_real(dir.path(), "gcc-999");
+        assert!(super::keeps_shim(&[], &path, "gcc-999"));
+        assert!(!super::keeps_shim(&[], &path, "gcc-998"));
+        assert!(super::keeps_shim(&["gcc-998".into()], &path, "gcc-998"));
+    }
+
+    /// `gcc-999` stands in for a compiler that was upgraded away: no runner
+    /// has one on PATH.
+    #[test]
+    fn a_versioned_shim_with_no_compiler_is_pruned_by_a_rerun() {
+        let dir = tempfile::tempdir().unwrap();
+        let shims = dir.path().join("shims");
+        let gone = ["gcc-999".to_string()];
+        super::install_shims_named(&shims, false, &gone).unwrap();
+        assert!(
+            super::shim_dir_is_ready(&shims, &gone),
+            "a name being linked is kept"
+        );
+        assert!(
+            !super::shim_dir_is_ready(&shims, &[]),
+            "init must rerun to remove it"
+        );
+
+        super::install_shims_named(&shims, false, &[]).unwrap();
+        assert!(std::fs::symlink_metadata(shims.join("gcc-999")).is_err());
+        assert!(super::shim_dir_is_ready(&shims, &[]));
+    }
+
+    #[test]
+    fn doctor_names_versioned_shims_with_no_compiler() {
+        let dir = tempfile::tempdir().unwrap();
+        let shims = dir.path().join("shims");
+        super::install_shims_named(&shims, false, &["gcc-999".into()]).unwrap();
+
+        let check = super::stale_shims_check(&shims, std::ffi::OsStr::new("")).unwrap();
+        assert!(!check.pass);
+        assert!(check.detail.contains("gcc-999"), "{}", check.detail);
+        assert_eq!(check.fix.as_deref(), Some("kache install-shims"));
+
+        let path = path_with_real(dir.path(), "gcc-999");
+        assert!(super::stale_shims_check(&shims, &path).is_none());
+    }
+
     fn selection(stability: kache_shims::Stability) -> kache_shims::Selection {
         kache_shims::Selection {
             path: "/opt/homebrew/opt/kache/bin/kache".into(),
@@ -9569,6 +9675,7 @@ mod shim_install_tests {
             replaced: vec!["c++".into()],
             current: vec!["clang++".into()],
             skipped: vec!["gcc-13".into()],
+            pruned: vec!["gcc-14".into()],
             marked: true,
         };
         let dir = std::path::Path::new("/home/me/shims");
@@ -9583,6 +9690,7 @@ mod shim_install_tests {
             "Repaired 2 broken shim(s): gcc, g++",
             "Moved 1 shim(s) off a versioned path: clang",
             "Replaced 1 existing entr(ies): c++",
+            "Removed 1 shim(s) with no compiler behind them: gcc-14",
             "Skipped 1 existing entr(ies): gcc-13 (use --force to replace)",
             "",
             "Add it to PATH ahead of your toolchain:",

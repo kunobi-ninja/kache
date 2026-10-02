@@ -113,6 +113,55 @@ pub fn is_ready(dir: &Path, target: &Path, names: &[String], fs: &dyn Fs) -> boo
     })
 }
 
+/// A versioned driver name nothing keeps. A tool probing `PATH` for it would
+/// pick the shim, which then has no compiler to run.
+fn is_stale(name: &str, keep: &dyn Fn(&str) -> bool) -> bool {
+    is_versioned_driver(name) && !keep(name)
+}
+
+/// Versioned driver shims in `dir` that `keep` rejects, sorted. Canonical
+/// names are never listed. Empty unless kache owns `dir`: marked, or holding
+/// only kache shims.
+pub fn stale_versioned(
+    dir: &Path,
+    target: &Path,
+    keep: &dyn Fn(&str) -> bool,
+    fs: &dyn Fs,
+) -> Vec<String> {
+    if !has_marker(dir) && !holds_only_shims(dir, Some(target), fs) {
+        return Vec::new();
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let target_real = fs.resolve(target);
+    let mut names: Vec<String> = entries
+        .flatten()
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|name| {
+            is_stale(name, keep) && is_shim_entry(&dir.join(name), target_real.as_deref(), fs)
+        })
+        .collect();
+    names.sort();
+    names
+}
+
+/// Removes the [`stale_versioned`] shims from `dir` and returns their names.
+#[cfg(unix)]
+pub fn prune(
+    dir: &Path,
+    target: &Path,
+    keep: &dyn Fn(&str) -> bool,
+) -> Result<Vec<String>, InstallError> {
+    let names = stale_versioned(dir, target, keep, &crate::fs::RealFs);
+    for name in &names {
+        let link = dir.join(name);
+        std::fs::remove_file(&link)
+            .map_err(|error| InstallError::new("removing stale shim", &link, error))?;
+    }
+    Ok(names)
+}
+
 #[cfg(unix)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Slot {
@@ -216,6 +265,8 @@ pub struct Installed {
     pub replaced: Vec<String>,
     pub current: Vec<String>,
     pub skipped: Vec<String>,
+    /// Versioned shims removed by [`prune`].
+    pub pruned: Vec<String>,
     pub marked: bool,
 }
 

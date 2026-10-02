@@ -1456,6 +1456,7 @@ fn sample_build_event(
         extern_units: Default::default(),
         miss_reason: events::MissReason::None,
         object_output: String::new(),
+        package: String::new(),
     }
 }
 

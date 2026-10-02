@@ -520,6 +520,67 @@ fn build_script_runs_are_restored_and_keyed_on_their_declarations() {
     assert!(results_for(&events_since(&fx.cache, mark), "build_script_run").is_empty());
 }
 
+/// A script that writes into its own declared inputs, as a generator does
+/// when it creates its data directory on the first run, is not recorded: the
+/// key computed afterwards describes neither the tree the run read nor one a
+/// restore would leave. The run is still logged, as a refusal that says why.
+/// The script runs in a few milliseconds, inside one file-system clock tick,
+/// which is how the refusal used to be missed some of the time.
+#[test]
+fn a_build_script_writing_into_its_inputs_is_logged_but_not_recorded() {
+    let fx = fixture_from(|root| {
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"selfwriter\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("build.rs"),
+            r#"fn main() {
+    let package = std::path::PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap());
+    println!("cargo:rerun-if-changed={}", package.display());
+    std::fs::create_dir_all(package.join("data")).unwrap();
+}
+"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "").unwrap();
+    });
+    for (name, expected) in [
+        ("first", "passthrough"),
+        ("settled", "miss"),
+        ("restored", "local_hit"),
+    ] {
+        let mark = event_count(&fx.cache);
+        run(&mut cargo(
+            "check",
+            &fx.workspace,
+            &fx.home,
+            &fx.cache,
+            &target(&fx, name),
+            &[],
+        ));
+        let events = events_since(&fx.cache, mark);
+        assert_eq!(
+            results_for(&events, "build_script_run"),
+            vec![expected],
+            "{name}"
+        );
+        let event = events
+            .iter()
+            .find(|e| field(e, "crate_name") == "build_script_run")
+            .unwrap();
+        assert_eq!(field(event, "package"), "selfwriter", "{event}");
+        if expected == "passthrough" {
+            assert!(
+                field(event, "passthrough_reason").contains("changed while the script ran"),
+                "{event}"
+            );
+        }
+    }
+}
+
 /// Cargo passes a `links` dependency's metadata to its dependents as
 /// `DEP_<LINKS>_<KEY>`, spelling the key as the script printed it. Tauri prints
 /// `cargo:core:window__CORE_PLUGIN___PERMISSION_FILES_PATH=...`, and under a

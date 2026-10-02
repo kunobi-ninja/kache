@@ -303,7 +303,7 @@ Every report format totals the wrapper's phases per crate: startup, key computat
 
 In the trace output each crate slice carries these numbers in its `args`. It nests one `X` slice per phase on the same lane, in this order: `startup`, `key` (with `dep-info` as its child), `lookup`, `wait`, `compile` on compiled crates, then `restore` or `store`. Phase offsets accumulate from the crate slice's start in that order; the wrapper records durations, not start times, so a phase sits where it lands in the sum. The gap after the last phase is the unattributed remainder. Durations are whole milliseconds, so a phase under 1 ms has no slice. A remote transfer that has both a start and a finish follows the crate slices as an async `b`/`e` pair with category `kache.transfer`.
 
-`--redact` applies to every format. The session line in `telemetry/sessions.jsonl` is written first, so the machine keeps the keys. Empty fields stay empty. Store-error text is left as recorded. A C or C++ row can also carry `object_output`, the path named with `-o`.
+`--redact` applies to every format. The session line in `telemetry/sessions.jsonl` is written first, so the machine keeps the keys. Empty fields stay empty. Store-error text is left as recorded. A C or C++ row can also carry `object_output`, the path named with `-o`. A build-script row carries `package`.
 
 ## `kache telemetry`
 

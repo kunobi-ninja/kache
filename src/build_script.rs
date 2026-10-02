@@ -436,7 +436,7 @@ fn run_cached(real: &Path, argv: &[std::ffi::OsString]) -> Result<i32> {
     // Only a run that starts from an empty OUT_DIR produces a state worth
     // recording: a rerun over leftovers would snapshot the leftovers too.
     let out_dir_was_empty = directory_is_empty(&run.environment.out_dir);
-    let started = std::time::SystemTime::now();
+    let started = write_floor(std::time::SystemTime::now());
     let compile_start = std::time::Instant::now();
     let output = real_command(real, argv)
         .output()
@@ -449,13 +449,23 @@ fn run_cached(real: &Path, argv: &[std::ffi::OsString]) -> Result<i32> {
     // The script has run and Cargo has its output; nothing below may change
     // the exit status.
     if !out_dir_was_empty {
-        tracing::debug!("build script ran over an existing OUT_DIR; not recorded");
+        run.log_unrecorded("it ran over an existing OUT_DIR");
         return Ok(0);
     }
     if let Err(error) = run.record(&output.stdout, &output.stderr, compile_ms, started) {
-        tracing::debug!("build-script result not recorded: {error:#}");
+        run.log_unrecorded(&format!("{error:#}"));
     }
     Ok(0)
+}
+
+/// File systems stamp writes from a clock that advances in ticks (a jiffy on
+/// Linux, 15.6 ms by default on Windows), so a write just after `now` can
+/// carry an mtime just before it. Whatever is written after `now` has an
+/// mtime at or after the floor.
+const FS_CLOCK_TICK: std::time::Duration = std::time::Duration::from_millis(50);
+
+fn write_floor(now: std::time::SystemTime) -> std::time::SystemTime {
+    now - FS_CLOCK_TICK
 }
 
 fn stored_binary_hash(real: &Path) -> Result<String> {
@@ -1296,8 +1306,7 @@ impl Run {
         let Some((inputs, env, default_package)) =
             parse_declarations(stdout_text, &self.environment)
         else {
-            tracing::debug!("build script asks to rerun every time; not recorded");
-            return Ok(());
+            anyhow::bail!("it asks to rerun every time");
         };
         // An input written while the script ran is either an edit racing the
         // build or the script writing into its own inputs; the key computed
@@ -1403,6 +1412,7 @@ impl Run {
         crate::wrapper::log_event(
             &self.config,
             EventInputs::new(&root, CRATE_NAME, result, elapsed_ms)
+                .package(package_name())
                 .size(size)
                 .keyed(key, key_ms, FileHashStats::default())
                 .lookup_ms(lookup_ms)
@@ -1411,6 +1421,31 @@ impl Run {
                 .store_put(put),
         );
     }
+
+    /// A run that executed but was not stored is a passthrough, so reports
+    /// count it as uncached rather than losing it.
+    fn log_unrecorded(&self, why: &str) {
+        tracing::debug!("build-script result not recorded: {why}");
+        let root = crate::wrapper::build_script_event_root(
+            &self.environment.out_dir,
+            &self.environment.manifest_dir,
+        );
+        let elapsed_ms = self.start.elapsed().as_millis() as u64;
+        crate::wrapper::log_event(
+            &self.config,
+            EventInputs::new(&root, CRATE_NAME, EventResult::Passthrough, elapsed_ms)
+                .package(package_name())
+                .passthrough_reason(unrecorded_reason(why)),
+        );
+    }
+}
+
+fn package_name() -> String {
+    std::env::var("CARGO_PKG_NAME").unwrap_or_default()
+}
+
+fn unrecorded_reason(why: &str) -> String {
+    format!("refused|build-script run not recorded: {why}")
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -2674,6 +2709,34 @@ mod tests {
         let (roots, stored) = classify_one(&env, "odd.txt", text.as_bytes());
         assert_eq!(roots.embedded, vec!["${KACHE_OUT_DIR}".to_string()]);
         assert_eq!(stored, text.as_bytes());
+    }
+
+    /// A write in the clock tick the run started in can be stamped before
+    /// the start; it still happened during the run.
+    #[test]
+    fn a_write_stamped_up_to_a_tick_early_counts_as_during_the_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("f");
+        std::fs::write(&file, "x").unwrap();
+        let now = std::time::SystemTime::now();
+        let written_before = |ms: u64| {
+            let mtime = now - std::time::Duration::from_millis(ms);
+            filetime::set_file_mtime(&file, filetime::FileTime::from_system_time(mtime)).unwrap();
+            modified_since(&file, &[], write_floor(now)).unwrap()
+        };
+        assert!(written_before(1));
+        assert!(written_before(16), "a default Windows tick");
+        assert!(!written_before(1_000));
+    }
+
+    #[test]
+    fn an_unrecorded_run_is_a_refusal_that_says_why() {
+        let reason = unrecorded_reason("a declared input changed while the script ran");
+        assert_eq!(
+            crate::events::MissReason::classify(&reason),
+            crate::events::MissReason::Refused
+        );
+        assert!(reason.ends_with("a declared input changed while the script ran"));
     }
 
     #[test]

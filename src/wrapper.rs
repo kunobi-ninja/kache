@@ -7158,6 +7158,7 @@ pub(crate) struct EventInputs<'a> {
     store_put: StorePutResult,
     passthrough_reason: String,
     object_output: String,
+    package: String,
     store_error: String,
     lookup_rejection: String,
     fallback: bool,
@@ -7189,6 +7190,7 @@ impl<'a> EventInputs<'a> {
             store_put: StorePutResult::default(),
             passthrough_reason: String::new(),
             object_output: String::new(),
+            package: String::new(),
             store_error: String::new(),
             lookup_rejection: String::new(),
             fallback: false,
@@ -7277,6 +7279,12 @@ impl<'a> EventInputs<'a> {
     /// Object path a C or C++ invocation named. Empty when it named none.
     pub(crate) fn object_output(mut self, object_output: &str) -> Self {
         self.object_output = object_output.to_string();
+        self
+    }
+
+    /// Package a build-script run belongs to.
+    pub(crate) fn package(mut self, package: String) -> Self {
+        self.package = package;
         self
     }
 
@@ -7404,6 +7412,7 @@ pub(crate) fn build_event_details(config: &Config, inputs: EventInputs<'_>) -> B
         store_put,
         passthrough_reason,
         object_output,
+        package,
         store_error,
         lookup_rejection,
         fallback,
@@ -7464,7 +7473,7 @@ pub(crate) fn build_event_details(config: &Config, inputs: EventInputs<'_>) -> B
         compile_time_ms,
         size,
         cache_key: cache_key.to_string(),
-        schema: 22,
+        schema: 23,
         demands: crate::demand::take(),
         session_id,
         key_ms,
@@ -7508,6 +7517,7 @@ pub(crate) fn build_event_details(config: &Config, inputs: EventInputs<'_>) -> B
         passthrough_reason,
         miss_reason,
         object_output,
+        package,
         store_error,
         store_handed_off: false,
         daemon_store_ms: 0,

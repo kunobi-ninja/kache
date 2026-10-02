@@ -1767,10 +1767,11 @@ mod tests {
     fn build_script_passthroughs_are_attributed_by_package() {
         let mut refused = BuildEvent::new_for_test("build_script_run", EventResult::Passthrough);
         refused.root = "/w/dep_with_script".to_string();
-        refused.package = "dep-with-script".to_string();
+        refused.package = "dep_with_script".to_string();
         refused.passthrough_reason = "refused|changed input".to_string();
         let mut other = refused.clone();
         other.package = "another".to_string();
+        other.passthrough_reason = "refused|another reason".to_string();
 
         let found = passthroughs_for(&[refused, other], "dep_with_script", 2);
         assert_eq!(found.len(), 1);

@@ -151,11 +151,11 @@ jobs:
       - name: Export coverage telemetry
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         run: |
-          npx --yes @kunobi/kartero@0.3.0 coverage \
+          npx --yes @kunobi/kartero@0.4.14 coverage \
             --input tmp/llvm-cov/coverage.json \
             --format llvm-cov-json \
             --output tmp/coverage-telemetry
-          npx --yes @kunobi/kartero@0.3.0 validate \
+          npx --yes @kunobi/kartero@0.4.14 validate \
             --input tmp/coverage-telemetry
         env:
           NPM_CONFIG_CACHE: ${{ runner.temp }}/kartero-npm-cache

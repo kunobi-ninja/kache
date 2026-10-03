@@ -37,7 +37,11 @@ is restored only when all of these match:
   (a directory is digested recursively; the digest of a directory whose
   entries' sizes and timestamps are unchanged is reused from a memo, so a
   vendored C library costs one stat walk per run). A script that declares
-  nothing depends on its whole package directory, as in Cargo;
+  nothing depends on its whole package directory, as in Cargo. An absolute
+  declaration outside the mapped package, target and Cargo home roots also
+  binds the run to its package directory. Such runs can be reused across
+  target directories in one checkout. Use a package-relative declaration
+  to share them across checkouts;
 - the `OUT_DIR` path, when anything the script wrote spells a machine-local
   root;
 - the operating system and architecture, and the configured key salt.

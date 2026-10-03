@@ -2389,6 +2389,8 @@ fn test_file_config_roundtrip() {
                 path: None,
                 atomic_write_dir: None,
                 pull_request_prefix: None,
+                repository: None,
+                insecure: None,
             }),
             scheduler: None,
         }),
@@ -4925,6 +4927,122 @@ fn a_gcs_remote_needs_a_bucket_and_refuses_other_backends_fields() {
         .unwrap_err();
         assert!(error.to_string().contains("do not apply"), "{error:#}");
     }
+}
+
+#[test]
+fn oci_remote_config_validates_repository_and_keeps_s3_environment_out() {
+    let remote = gcs_remote(RemoteFileConfig {
+        _type: Some(" OCI ".to_string()),
+        repository: Some(" ghcr.io/team/cache ".to_string()),
+        ..Default::default()
+    })
+    .unwrap()
+    .unwrap();
+    assert_eq!(remote.backend_kind(), "oci");
+    assert_eq!(remote.describe(), "oci://ghcr.io/team/cache/artifacts");
+    assert_eq!(
+        remote.backend,
+        RemoteBackendConfig::Oci(OciRemoteConfig {
+            repository: "ghcr.io/team/cache".to_string(),
+            insecure: false,
+        })
+    );
+    let remote = gcs_remote(RemoteFileConfig {
+        _type: Some("oci".to_string()),
+        repository: Some("localhost:5000/team/cache".to_string()),
+        prefix: Some("".to_string()),
+        insecure: Some(true),
+        ..Default::default()
+    })
+    .unwrap()
+    .unwrap();
+    assert_eq!(remote.describe(), "oci://localhost:5000/team/cache");
+    assert!(matches!(
+        remote.backend,
+        RemoteBackendConfig::Oci(OciRemoteConfig { insecure: true, .. })
+    ));
+    for repository in [
+        "",
+        "team/cache",
+        "cache",
+        "https://ghcr.io/team/cache",
+        "ghcr.io/team/cache:tag",
+        "ghcr.io/team/cache@sha256:1234",
+        "ghcr.io/Team/cache",
+        "ghcr.io",
+        "ghcr.io/",
+    ] {
+        assert!(
+            gcs_remote(RemoteFileConfig {
+                _type: Some("oci".to_string()),
+                repository: Some(repository.to_string()),
+                ..Default::default()
+            })
+            .is_err(),
+            "{repository:?}"
+        );
+    }
+    assert!(
+        gcs_remote(RemoteFileConfig {
+            _type: Some("oci".to_string()),
+            ..Default::default()
+        })
+        .is_err()
+    );
+}
+
+#[test]
+fn oci_remote_rejects_mixed_backend_fields_and_round_trips_toml() {
+    for field in [
+        "bucket",
+        "endpoint",
+        "region",
+        "profile",
+        "user_agent",
+        "path",
+        "atomic_write_dir",
+    ] {
+        let remote: RemoteFileConfig = toml::from_str(&format!(
+            "type = \"oci\"\nrepository = \"ghcr.io/team/cache\"\n{field} = \"value\"\n"
+        ))
+        .unwrap();
+        assert!(
+            gcs_remote(remote)
+                .unwrap_err()
+                .to_string()
+                .contains("takes repository"),
+            "{field}"
+        );
+    }
+    for backend in [None, Some("s3"), Some("gcs"), Some("filesystem")] {
+        for remote in [
+            RemoteFileConfig {
+                repository: Some("ghcr.io/team/cache".to_string()),
+                ..Default::default()
+            },
+            RemoteFileConfig {
+                insecure: Some(false),
+                ..Default::default()
+            },
+        ] {
+            assert!(
+                gcs_remote(RemoteFileConfig {
+                    _type: backend.map(str::to_string),
+                    ..remote
+                })
+                .unwrap_err()
+                .to_string()
+                .contains("require [cache.remote] type")
+            );
+        }
+    }
+    let file: FileConfig = toml::from_str("[cache.remote]\ntype = \"oci\"\nrepository = \"ghcr.io/team/cache\"\ninsecure = false\nprefix = \"team/artifacts\"\n").unwrap();
+    let serialized = toml::to_string(&file).unwrap();
+    let parsed: FileConfig = toml::from_str(&serialized).unwrap();
+    assert_eq!(
+        Config::load_remote_config(&Ok(file)).unwrap(),
+        Config::load_remote_config(&Ok(parsed)).unwrap()
+    );
 }
 
 #[test]

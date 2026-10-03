@@ -53,6 +53,8 @@ opendal-layer-retry = { version = "=0.59.3", default-features = false }
 opendal-service-fs = { version = "=0.59.3", default-features = false }
 opendal-service-s3 = { version = "=0.59.3", default-features = false }
 opendal-service-gcs = { version = "=0.59.3", default-features = false }
+oci-client = { version = "0.18", default-features = false, features = ["rustls-tls-no-provider"] }
+docker_credential = "1.3"
 # OpenDAL exposes a custom credential chain but not a profile-name shortcut.
 # These published reqsign APIs preserve Kache's explicit profile selection
 # (including SSO and credential_process) without a git-only patch.

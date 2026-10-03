@@ -1,4 +1,5 @@
 use super::*;
+use crate::tui_sessions::SessionState;
 
 fn terminal_restore_was_observed(action: impl FnOnce()) -> bool {
     TERMINAL_RESTORE_OBSERVED.with(|observed| observed.set(false));
@@ -20,11 +21,20 @@ fn terminal_restore_guard_runs_on_drop() {
 
 #[test]
 fn test_tab_needs_entries_only_for_store() {
+    assert!(!tab_needs_entries(Tab::Now));
     assert!(!tab_needs_entries(Tab::Build));
     assert!(!tab_needs_entries(Tab::Projects));
     assert!(tab_needs_entries(Tab::Store));
     assert!(!tab_needs_entries(Tab::Transfer));
     assert!(!tab_needs_entries(Tab::Why));
+}
+
+#[test]
+fn now_leads_and_transfer_stays_last() {
+    assert_eq!(Tab::ORDER[0], Tab::Now);
+    assert_eq!(*Tab::ORDER.last().unwrap(), Tab::Transfer);
+    assert_eq!(Tab::Now.next(), Tab::Build);
+    assert_eq!(Tab::Build.previous(), Tab::Now);
 }
 
 #[test]
@@ -181,6 +191,8 @@ fn test_state() -> AppState {
         project_scan: Arc::new(Mutex::new(ProjectScanData::default())),
         last_project_refresh: Instant::now(),
         project_scroll: Viewport::new(ScrollAnchor::Top),
+        selected_project: 0,
+        project_detail: false,
         sessions: Vec::new(),
         grouped_len: 0,
         selected_session: None,
@@ -201,7 +213,6 @@ fn test_state() -> AppState {
         spark_window: SPARK_WINDOW,
         rustc_version: "test".to_string(),
         wrapper_status: "test".to_string(),
-        service_installed: false,
     }
 }
 
@@ -317,16 +328,18 @@ fn viewport_visible_range_shrink_and_expand() {
 #[test]
 fn handle_key_number_keys_switch_tabs() {
     let mut s = test_state();
-    handle_key(&mut s, KeyCode::Char('2'));
-    assert_eq!(s.active_tab, Tab::Why);
-    handle_key(&mut s, KeyCode::Char('3'));
-    assert_eq!(s.active_tab, Tab::Projects);
-    handle_key(&mut s, KeyCode::Char('4'));
-    assert_eq!(s.active_tab, Tab::Store);
-    handle_key(&mut s, KeyCode::Char('5'));
-    assert_eq!(s.active_tab, Tab::Transfer);
     handle_key(&mut s, KeyCode::Char('1'));
+    assert_eq!(s.active_tab, Tab::Now);
+    handle_key(&mut s, KeyCode::Char('2'));
     assert_eq!(s.active_tab, Tab::Build);
+    handle_key(&mut s, KeyCode::Char('3'));
+    assert_eq!(s.active_tab, Tab::Why);
+    handle_key(&mut s, KeyCode::Char('4'));
+    assert_eq!(s.active_tab, Tab::Projects);
+    handle_key(&mut s, KeyCode::Char('5'));
+    assert_eq!(s.active_tab, Tab::Store);
+    handle_key(&mut s, KeyCode::Char('6'));
+    assert_eq!(s.active_tab, Tab::Transfer);
 }
 
 /// Landing on Projects or Store backdates that tab's refresh clock so its
@@ -368,6 +381,7 @@ fn handle_key_tab_cycles_forward_and_wraps() {
         Tab::Projects,
         Tab::Store,
         Tab::Transfer,
+        Tab::Now,
         Tab::Build,
     ];
     for expected in order {
@@ -577,7 +591,10 @@ fn tab_bar_click_targets_match_the_drawn_labels() {
 
     let mut s = test_state();
     let area = Rect::new(0, 0, 120, 40);
-    let (_, _, store_x) = titles[3];
+    let (_, _, store_x) = titles
+        .into_iter()
+        .find(|(tab, _, _)| *tab == Tab::Store)
+        .unwrap();
     handle_mouse(
         &mut s,
         MouseEvent {
@@ -790,8 +807,9 @@ fn arrows_pick_a_build_and_enter_opens_why() {
     assert!(s.selected_session.is_none(), "following by default");
     assert_eq!(s.selected_session().unwrap().key, "id:s-new");
 
+    let now = rendered_tab(&mut s, Tab::Now);
+    assert!(now.contains("following the top build"), "{now}");
     let screen = rendered_tab(&mut s, Tab::Build);
-    assert!(screen.contains("following the top build"), "{screen}");
     assert!(screen.contains("new_a"), "the event panel is the top build");
     assert!(!screen.contains("old_a"), "other builds' events stay out");
 
@@ -926,30 +944,15 @@ fn why_tab_collapses_a_cascade_to_its_root() {
     let screen = rendered_tab(&mut s, Tab::Why);
     assert!(screen.contains("downstream of leaf"), "{screen}");
 
-    // Narrow: the examples still fit at 60 columns (bar, count, and the
-    // cost take 28), and are the first thing to go below that.
-    let narrow = why_lines(&mut s, 60)
-        .iter()
-        .map(|line| line.to_string())
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(narrow.contains("downstream of leaf  app0"), "{narrow}");
-    // At 58 the room is exactly the description plus twelve: examples
-    // need more than that, so none; at 60 they fit but are clipped to the
-    // twelve cells left.
-    let edge = why_text(&mut s, 58).join("\n");
-    assert!(
-        edge.contains("downstream of leaf  1m20s"),
-        "no ellipsis: {edge}"
-    );
-    assert!(!edge.contains("app0"), "{edge}");
-    assert!(narrow.contains("app0, app1,…"), "{narrow}");
-    assert!(!narrow.contains("app2"), "{narrow}");
-    let narrower = why_lines(&mut s, 55)
-        .iter()
-        .map(|line| line.to_string())
-        .collect::<Vec<_>>()
-        .join("\n");
+    // Examples need more than twelve cells after the bar. At 62 that room
+    // is exactly twelve, so they stay off; one more column lets them on.
+    let hidden = why_text(&mut s, 62).join("\n");
+    assert!(hidden.contains("downstream of leaf"), "{hidden}");
+    assert!(hidden.contains("1m20s"), "{hidden}");
+    assert!(!hidden.contains("app0"), "{hidden}");
+    let shown = why_text(&mut s, 63).join("\n");
+    assert!(shown.contains("app0"), "{shown}");
+    let narrower = why_text(&mut s, 55).join("\n");
     assert!(narrower.contains("downstream of leaf"), "{narrower}");
     assert!(!narrower.contains("app0"), "{narrower}");
 }
@@ -976,6 +979,14 @@ fn why_tab_says_when_it_cannot_explain_and_how_to_fix_that() {
         "{text}"
     );
     assert!(text.contains("explain_miss = true"), "{text}");
+    assert!(
+        text.contains("the 1 have no earlier compile to diff"),
+        "{text}"
+    );
+    assert!(
+        text.contains("cannot name the crate that changed"),
+        "{text}"
+    );
 
     s.config.explain_miss = true;
     s.why_cache = None;
@@ -983,9 +994,14 @@ fn why_tab_says_when_it_cannot_explain_and_how_to_fix_that() {
         .iter()
         .map(|line| line.to_string())
         .collect();
+    let text = text.join("\n");
     assert!(
-        !text.join("\n").contains("explain_miss = true"),
-        "already on, so no hint"
+        !text.contains("explain_miss = true"),
+        "already on, so no hint: {text}"
+    );
+    assert!(
+        !text.contains("cannot name the crate that changed"),
+        "{text}"
     );
 }
 
@@ -1015,9 +1031,10 @@ fn share_bar_never_hides_a_present_cause() {
 #[test]
 fn every_tab_fits_narrow_and_wide_terminals() {
     for (tab, seeded, wide_only) in [
+        (Tab::Now, "(unknown root)", ""),
         (Tab::Build, "serde", "Size"),
         (Tab::Store, "serde", "Created"),
-        (Tab::Projects, "myproj", "Fprint"),
+        (Tab::Projects, "myproj", ""),
         (Tab::Transfer, "serde", ""),
         (Tab::Why, "build.rs", "direct"),
     ] {
@@ -1042,6 +1059,12 @@ fn every_tab_fits_narrow_and_wide_terminals() {
             }
         }
     }
+    let mut state = populated_state();
+    let screen = rendered_lines(&mut state, Tab::Now, 120, 40).join("\n");
+    assert!(
+        screen.contains("(unknown root) ~"),
+        "an inferred build keeps the mark: {screen}"
+    );
 }
 
 #[test]
@@ -1141,11 +1164,13 @@ fn shift_tab_walks_backwards() {
     assert_eq!(s.active_tab, Tab::Why);
     handle_key(&mut s, KeyCode::BackTab);
     assert_eq!(s.active_tab, Tab::Build);
-    // And it wraps to the last tab rather than sticking.
+    // Back from Build is Now, and back from Now wraps to Transfer.
+    handle_key(&mut s, KeyCode::BackTab);
+    assert_eq!(s.active_tab, Tab::Now);
     handle_key(&mut s, KeyCode::BackTab);
     assert_eq!(s.active_tab, Tab::Transfer);
     handle_key(&mut s, KeyCode::Tab);
-    assert_eq!(s.active_tab, Tab::Build);
+    assert_eq!(s.active_tab, Tab::Now);
 }
 
 /// Render `tab` and return everything on screen as one string.
@@ -1317,6 +1342,7 @@ fn draw_ui_renders_every_tab_without_panicking() {
     use ratatui::backend::TestBackend;
 
     for tab in [
+        Tab::Now,
         Tab::Build,
         Tab::Projects,
         Tab::Store,
@@ -1476,25 +1502,17 @@ fn sample_stats_entry(crate_name: &str, size: u64, hits: u64) -> daemon::StatsEn
 }
 
 #[test]
-fn draw_stats_bar_renders_healthy_connected_daemon() {
-    // The existing populated render exercises the offline/empty arms of
-    // draw_stats_bar. This drives the "healthy" combinations: daemon
-    // connected + service installed (daemon_tag ""), non-zero event totals
-    // (hit-rate %), max_size > 0 (store %), a known daemon version, and a
-    // configured remote. Covers draw_stats_bar's connected branches.
-    use ratatui::Terminal;
-    use ratatui::backend::TestBackend;
-
+fn store_names_the_daemon_and_now_leaves_the_version_off() {
+    // 10 hits out of 14 lookups is 71%. 3000 of 5000 ms is 60% of the clock.
+    // Compile time is unset, so the weighted sentence stays empty.
     let mut state = test_state();
-    state.active_tab = Tab::Build;
-    state.service_installed = true;
     state.config.remote = Some(crate::config::RemoteConfig::test_s3("b", "p"));
     state.stats_loaded = true;
 
     let snap = &mut state.stats_snapshot;
     snap.daemon_connected = true;
     snap.daemon_version = "9.9.9".to_string();
-    snap.daemon_build_epoch = 4242;
+    snap.daemon_build_epoch = crate::daemon::build_epoch().wrapping_add(1);
     snap.max_size = 10_000_000;
     snap.total_size = 4_000_000;
     snap.event_stats.local_hits = 7;
@@ -1504,18 +1522,62 @@ fn draw_stats_bar_renders_healthy_connected_daemon() {
     snap.event_stats.misses = 3;
     snap.event_stats.total_elapsed_ms = 5000;
     snap.event_stats.miss_elapsed_ms = 3000;
+    snap.daemon_effective_config = Some(crate::daemon::EffectiveConfig {
+        max_size: snap.max_size,
+        cache_dir: "/cache".to_string(),
+        runtime_dir: "/runtime".to_string(),
+        config_path: "/daemon/config.toml".to_string(),
+        config_fingerprint: None,
+        prefetch_enabled: false,
+        remote_key_listing: false,
+        remote_description: None,
+        local_only: false,
+        remote_error: None,
+        remote_key_cache_refresh_secs: 60,
+        socket_path: "/daemon.sock".to_string(),
+        started_at_ms: 1,
+    });
 
-    let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
-    terminal
-        .draw(|frame| draw_ui(frame, &mut state))
-        .expect("healthy-daemon draw should succeed");
-    let buffer = terminal.backend().buffer().clone();
-    let rendered: String = buffer.content().iter().map(|c| c.symbol()).collect();
-    // The connected daemon's version surfaces in the stats bar.
+    let now = rendered_tab(&mut state, Tab::Now);
+    assert!(now.contains("71%"), "{now}");
+    assert!(now.contains("60% of the clock was a miss"), "{now}");
+    assert!(now.contains("no compile time recorded yet"), "{now}");
+    assert!(now.contains("remote is off"), "{now}");
+    assert!(!now.contains("9.9.9"), "version stays on Store: {now}");
+    assert!(!now.contains("stats are still loading"), "{now}");
+
+    state.stats_snapshot.event_stats.hit_compile_time_ms = 50;
+    state.stats_snapshot.event_stats.miss_compile_time_ms = 50;
+    let now = rendered_tab(&mut state, Tab::Now);
     assert!(
-        rendered.contains("9.9.9"),
-        "connected daemon version should render in the stats bar"
+        now.contains("50% of compile time came back from the cache"),
+        "{now}"
     );
+
+    state.stats_snapshot.event_stats.total_elapsed_ms = 0;
+    state.stats_snapshot.event_stats.miss_elapsed_ms = 0;
+    let now = rendered_tab(&mut state, Tab::Now);
+    assert!(now.contains("no lookup time recorded yet"), "{now}");
+
+    let store = rendered_tab(&mut state, Tab::Store);
+    assert!(store.contains("9.9.9"), "{store}");
+    assert!(store.contains("restart pending"), "{store}");
+
+    state.stats_snapshot.daemon_build_epoch = crate::daemon::build_epoch();
+    let store = rendered_tab(&mut state, Tab::Store);
+    assert!(store.contains("daemon v9.9.9"), "{store}");
+    assert!(!store.contains("restart pending"), "{store}");
+
+    state.stats_snapshot.daemon_connected = false;
+    let store = rendered_tab(&mut state, Tab::Store);
+    assert!(store.contains("daemon offline"), "{store}");
+
+    state.stats_loaded = false;
+    let now = rendered_tab(&mut state, Tab::Now);
+    assert!(now.contains("stats are still loading"), "{now}");
+    assert!(now.contains('\u{2026}'), "{now}");
+    let store = rendered_tab(&mut state, Tab::Store);
+    assert!(store.contains("daemon: checking"), "{store}");
 }
 
 #[test]
@@ -1575,17 +1637,33 @@ fn draw_projects_tab_renders_populated_scan() {
     state.active_tab = Tab::Projects;
     {
         let mut scan = state.project_scan.lock().unwrap();
-        scan.project_targets = vec![cli::TargetEntry {
-            path: std::path::PathBuf::from("/work/myproj/target"),
-            size: 5_000_000,
-            cached_bytes: 3_000_000,
-            estimated_reclaimable_bytes: 2_000_000,
-            scan_identity: None,
-            profiles: vec!["debug".to_string(), "release".to_string()],
-            breakdown: cli::CategoryBreakdown::default(),
-            stale: false,
-        }];
-        scan.scanning = false;
+        scan.project_targets = vec![
+            cli::TargetEntry {
+                path: std::path::PathBuf::from("/work/myproj/target"),
+                size: 5_000_000,
+                cached_bytes: 3_000_000,
+                estimated_reclaimable_bytes: 2_000_000,
+                scan_identity: None,
+                profiles: vec!["debug".to_string(), "release".to_string()],
+                breakdown: cli::CategoryBreakdown {
+                    incremental: 1_000,
+                    deps_local: 2_000_000,
+                    ..cli::CategoryBreakdown::default()
+                },
+                stale: false,
+            },
+            cli::TargetEntry {
+                path: std::path::PathBuf::from("/work/other/target"),
+                size: 100,
+                cached_bytes: 0,
+                estimated_reclaimable_bytes: 100,
+                scan_identity: None,
+                profiles: Vec::new(),
+                breakdown: cli::CategoryBreakdown::default(),
+                stale: true,
+            },
+        ];
+        scan.scanning = true;
         scan.scanned = true;
     }
 
@@ -1595,13 +1673,18 @@ fn draw_projects_tab_renders_populated_scan() {
         .expect("projects draw should succeed");
     let buffer = terminal.backend().buffer().clone();
     let rendered: String = buffer.content().iter().map(|c| c.symbol()).collect();
+    assert!(rendered.contains("in 2 trees"), "{rendered}");
+    assert!(rendered.contains("already cached"), "{rendered}");
+    assert!(rendered.contains("myproj"), "{rendered}");
+    assert!(rendered.contains("of this tree is cached"), "{rendered}");
+    assert!(rendered.contains("incremental is"), "{rendered}");
+    assert!(rendered.contains('█'), "deps get a bar: {rendered}");
+    assert!(rendered.contains("~ other"), "{rendered}");
+    assert!(rendered.contains("nothing cached"), "{rendered}");
+    assert!(rendered.contains("scanning"), "{rendered}");
     assert!(
-        rendered.contains("myproj") || rendered.contains("target"),
-        "projects tab should render the scanned target path"
-    );
-    assert!(
-        rendered.contains("kache projects"),
-        "projects overview title should render: {rendered}"
+        !rendered.contains("[debug]"),
+        "profiles wait for Enter: {rendered}"
     );
 }
 #[test]
@@ -1717,7 +1800,10 @@ fn terminal_events_dispatch_presses_and_mouse_only() {
     assert!(s.should_quit);
 
     let mut s = test_state();
-    let (_, _, store_x) = tab_titles()[3];
+    let (_, _, store_x) = tab_titles()
+        .into_iter()
+        .find(|(tab, _, _)| *tab == Tab::Store)
+        .unwrap();
     handle_terminal_event(
         &mut s,
         Event::Mouse(MouseEvent {
@@ -1893,16 +1979,12 @@ fn sparkline_needs_three_rows_and_twelve_columns_inside_the_frame() {
     }
 }
 
-/// The columns that survive a narrow terminal: Compile and Exit and the
-/// Projects profile need 78/80 columns, Type/Profile on Store need 84.
+/// Compile needs 78 columns and Profile on Store needs 84. Project profiles
+/// wait until Enter, at any width.
 #[test]
 fn mid_priority_columns_have_their_own_thresholds() {
     let mut state = populated_state();
-    for (tab, column, min_width) in [
-        (Tab::Build, "Compile", 78u16),
-        (Tab::Store, "Profile", 84),
-        (Tab::Projects, "[debug]", 80),
-    ] {
+    for (tab, column, min_width) in [(Tab::Build, "Compile", 78u16), (Tab::Store, "Profile", 84)] {
         for width in [min_width - 1, min_width, 120] {
             let screen = rendered_lines(&mut state, tab, width, 40).join("\n");
             assert_eq!(
@@ -1913,14 +1995,21 @@ fn mid_priority_columns_have_their_own_thresholds() {
         }
     }
     let screen = rendered_lines(&mut state, Tab::Projects, 120, 40).join("\n");
-    assert!(screen.contains("Total (1 project)"), "{screen}");
+    assert!(screen.contains("in 1 tree"), "{screen}");
+    assert!(!screen.contains("trees"), "{screen}");
     assert!(
-        screen.contains("Fprint:"),
-        "totals carry the breakdown when wide"
+        !screen.contains("[debug]"),
+        "profiles wait for Enter: {screen}"
     );
-    let screen = rendered_lines(&mut state, Tab::Projects, 80, 24).join("\n");
-    assert!(screen.contains("Total (1 project)"), "{screen}");
-    assert!(!screen.contains("Fprint:"), "and drop it when narrow");
+    assert!(!screen.contains("Fprint"), "{screen}");
+    state.active_tab = Tab::Projects;
+    handle_key(&mut state, KeyCode::Enter);
+    let screen = rendered_lines(&mut state, Tab::Projects, 80, 40).join("\n");
+    assert!(screen.contains("[debug]"), "{screen}");
+    assert!(
+        !screen.contains("fingerprints"),
+        "a zero category stays off: {screen}"
+    );
 }
 
 #[test]
@@ -1973,6 +2062,7 @@ fn build_tab_layout_thresholds() {
     let mut s = test_state();
     let screen = rendered_tab(&mut s, Tab::Build);
     assert!(!screen.contains("Builds ·"), "{screen}");
+    assert!(!screen.contains("In flight"), "{screen}");
 
     // The sparkline needs 30 content rows (31 with the tab bar).
     let mut s = populated_state();
@@ -1980,9 +2070,12 @@ fn build_tab_layout_thresholds() {
     assert!(tall.contains("Lookups · last"), "{tall}");
     let short = rendered_lines(&mut s, Tab::Build, 100, 30).join("\n");
     assert!(!short.contains("Lookups · last"), "{short}");
+    assert!(short.contains("serde"), "the event panel stays: {short}");
     assert!(
-        short.contains("Builds ·"),
-        "the builds panel stays: {short}"
+        rendered_lines(&mut s, Tab::Build, 100, 31)
+            .join("\n")
+            .contains("serde"),
+        "and on the tall screen too"
     );
 
     // The long help needs 100 columns.
@@ -2056,6 +2149,7 @@ fn why_cost_strip_mentions_copies_only_when_there_are_any() {
     s.refresh_sessions(chrono::Utc::now());
     let text = why_text(&mut s, 120).join("\n");
     assert!(text.contains("none: nothing was looked up"), "{text}");
+    assert!(text.contains("no lookups"), "{text}");
 }
 
 #[test]
@@ -2067,12 +2161,17 @@ fn why_counts_misses_in_english_and_says_when_capped() {
     assert!(text.contains("Misses by cause · 1 miss\n"), "{text}");
     assert!(!text.contains("Misses by cause · 1 misses"), "{text}");
     assert!(!text.contains("analyzed)"), "{text}");
+    assert!(!text.contains("older, not analyzed"), "{text}");
     assert!(!text.contains("none:"), "there is a miss: {text}");
     assert!(
         !text.contains("Passthroughs by reason"),
         "none to group: {text}"
     );
     assert!(!text.contains("Chronic misses"), "none: {text}");
+    assert!(
+        !text.contains("Passthroughs in this build"),
+        "an empty list stays off: {text}"
+    );
 
     for i in 0..(tui_sessions::MAX_ANALYZED_MISSES + 9) {
         s.push_event(session_event(
@@ -2094,6 +2193,7 @@ fn why_counts_misses_in_english_and_says_when_capped() {
         )),
         "{text}"
     );
+    assert!(text.contains("older, not analyzed"), "{text}");
 }
 
 /// Every bar line and every passthrough row is laid out inside the
@@ -2189,14 +2289,27 @@ fn why_lines_fit_the_width_they_are_given() {
     assert!(text.contains("none match the filter"), "{text}");
 }
 #[test]
-fn enter_opens_why_only_from_build() {
+fn enter_opens_why_from_now_and_build() {
     let mut s = test_state();
     s.active_tab = Tab::Store;
     handle_key(&mut s, KeyCode::Enter);
     assert_eq!(s.active_tab, Tab::Store);
+
+    s.active_tab = Tab::Now;
+    handle_key(&mut s, KeyCode::Enter);
+    assert_eq!(s.active_tab, Tab::Why);
+
     s.active_tab = Tab::Build;
     handle_key(&mut s, KeyCode::Enter);
     assert_eq!(s.active_tab, Tab::Why);
+
+    s.active_tab = Tab::Projects;
+    assert!(!s.project_detail);
+    handle_key(&mut s, KeyCode::Enter);
+    assert!(s.project_detail);
+    assert_eq!(s.active_tab, Tab::Projects);
+    handle_key(&mut s, KeyCode::Enter);
+    assert!(!s.project_detail);
 }
 
 #[test]
@@ -2250,11 +2363,11 @@ fn row_text(buffer: &Buffer, y: u16) -> String {
         .collect()
 }
 
-/// The Builds table: a lone build gets its row, the selected row is
-/// highlighted, zero counts are muted, headers sit left and numbers
-/// right, and the pass and saved columns need 100 columns.
+/// The landing list: the newest build is highlighted, a hit's misses stay
+/// muted, its saved time is green, and Saved does not drop on a narrow
+/// terminal.
 #[test]
-fn builds_table_layout_and_styling() {
+fn now_list_layout_and_styling() {
     let mut s = test_state();
     s.events = vec![
         session_event("a", EventResult::Miss, "/w/one", "s1", 5),
@@ -2262,63 +2375,499 @@ fn builds_table_layout_and_styling() {
     ];
     s.refresh_sessions(chrono::Utc::now());
 
-    let buffer = rendered_buffer(&mut s, Tab::Build, 100, 40);
+    let buffer = rendered_buffer(&mut s, Tab::Now, 100, 40);
     let rows: Vec<String> = (0..40).map(|y| row_text(&buffer, y)).collect();
     let header_y = rows
         .iter()
-        .position(|row| row.contains("Started") && row.contains("State"))
+        .position(|row| row.contains("Build") && row.contains("Misses") && row.contains("Saved"))
         .unwrap_or_else(|| panic!("{}", rows.join("\n")));
-    let header = &rows[header_y];
-    assert!(header.starts_with("│  Build"), "labels left: {header:?}");
-    assert!(
-        header.contains("pass") && header.contains("saved"),
-        "{header:?}"
-    );
-    assert!(
-        header.trim_end_matches('│').trim_end().ends_with("saved"),
-        "numbers right: {header:?}"
-    );
-
     let selected_y = header_y + 1;
-    assert!(rows[selected_y].contains("▸ one"), "{}", rows[selected_y]);
+    assert!(rows[selected_y].contains("▸"), "{}", rows[selected_y]);
+    assert!(rows[selected_y].contains("one"), "{}", rows[selected_y]);
     let mark = rows[selected_y].find('▸').unwrap() as u16;
-    let style = &buffer[(mark + 2, selected_y as u16)];
+    let style = &buffer[(mark, selected_y as u16)];
     assert!(style.modifier.contains(Modifier::REVERSED), "{style:?}");
     assert!(style.modifier.contains(Modifier::BOLD), "{style:?}");
 
-    // "two" has 0 misses: that cell is muted; its 1 hit is not.
+    // "two" consulted the cache and hit: misses 0 is muted, 2s saved is green.
     let other_y = selected_y + 1;
     assert!(rows[other_y].contains("two"), "{}", rows[other_y]);
-    // Column, not byte offset: the border glyphs are multi-byte.
-    let col_of = |row: &str, needle: &str| -> usize {
-        let chars: Vec<char> = row.chars().collect();
-        let needle: Vec<char> = needle.chars().collect();
-        chars
-            .windows(needle.len())
-            .position(|window| window == needle.as_slice())
-            .unwrap()
-    };
-    let miss_x = col_of(header, "miss") + 3;
-    let hit_x = col_of(header, "hit") + 2;
-    assert_eq!(buffer[(miss_x as u16, other_y as u16)].symbol(), "0");
-    assert_eq!(buffer[(miss_x as u16, other_y as u16)].fg, Color::DarkGray);
-    assert_eq!(buffer[(hit_x as u16, other_y as u16)].symbol(), "1");
-    assert_eq!(buffer[(hit_x as u16, other_y as u16)].fg, Color::Green);
+    let mut saw_zero = false;
+    let mut saw_saved = false;
+    for x in 0..buffer.area.width {
+        let cell = &buffer[(x, other_y as u16)];
+        if cell.symbol() == "0" {
+            assert_eq!(cell.fg, Color::DarkGray, "misses at {x}: {cell:?}");
+            saw_zero = true;
+        }
+        if cell.symbol() == "2" {
+            assert_eq!(cell.fg, Color::Green, "saved at {x}: {cell:?}");
+            saw_saved = true;
+        }
+    }
+    assert!(saw_zero && saw_saved, "{}", rows[other_y]);
 
-    let narrow = rendered_lines(&mut s, Tab::Build, 99, 40);
+    // A real miss is white. The em dash and the zero are the muted ones.
+    let mut saw_miss = false;
+    for x in 0..buffer.area.width {
+        let cell = &buffer[(x, selected_y as u16)];
+        if cell.symbol() == "1" {
+            assert_eq!(cell.fg, Color::White, "misses at {x}: {cell:?}");
+            saw_miss = true;
+        }
+    }
+    assert!(saw_miss, "{}", rows[selected_y]);
+
+    let narrow = rendered_lines(&mut s, Tab::Now, 70, 40);
     let header = narrow
         .iter()
-        .find(|row| row.contains("Started") && row.contains("State"))
-        .unwrap();
-    assert!(
-        !header.contains("pass") && !header.contains("saved"),
-        "{header:?}"
-    );
+        .find(|row| row.contains("Misses"))
+        .unwrap_or_else(|| panic!("{}", narrow.join("\n")));
+    assert!(header.contains("Saved"), "{header:?}");
 
-    // One build alone still gets its row (border, header, one row).
     let mut s = test_state();
     s.events = vec![session_event("a", EventResult::Miss, "/w/one", "s1", 5)];
     s.refresh_sessions(chrono::Utc::now());
+    let screen = rendered_tab(&mut s, Tab::Now);
+    assert!(screen.contains("one"), "{screen}");
+    assert!(screen.contains("following the top build"), "{screen}");
+}
+
+#[test]
+fn share_pct_rounds_to_the_nearest_percent() {
+    assert_eq!(share_pct(0, 0), "  \u{2014}");
+    assert_eq!(share_pct(2, 3), " 67%");
+    assert_eq!(share_pct(147, 788), " 19%");
+    assert_eq!(share_pct(1, 1), "100%");
+}
+
+#[test]
+fn now_copy_uses_the_rates_the_daemon_already_has() {
+    assert_eq!(weighted_sentence(None), "no compile time recorded yet");
+    assert_eq!(
+        weighted_sentence(Some(50.0)),
+        "50% of compile time came back from the cache"
+    );
+    assert_eq!(miss_clock_sentence(None), "no lookup time recorded yet");
+    assert_eq!(
+        miss_clock_sentence(Some(78.0)),
+        "78% of the clock was a miss"
+    );
+    assert_eq!(remote_sentence("not configured"), "remote is off");
+    assert_eq!(remote_sentence("local-only"), "remote is off");
+    assert_eq!(remote_sentence("misconfigured"), "remote: misconfigured");
+    assert_eq!(figure_saved(0), "0s");
+    assert_eq!(figure_saved(3_600_000), "1.0h");
+
+    let label = |result| {
+        let mut s = test_state();
+        s.events = vec![session_event("c", result, "/w", "s", 1)];
+        s.refresh_sessions(chrono::Utc::now());
+        misses_label(&s.sessions[0].tally)
+    };
+    assert_eq!(label(EventResult::Passthrough), "\u{2014}");
+    assert_eq!(label(EventResult::LocalHit), "0");
+    assert_eq!(label(EventResult::Miss), "1");
+}
+
+#[test]
+fn tree_name_uses_the_project_above_target() {
+    assert_eq!(
+        tree_name(std::path::Path::new("/work/myproj/target")),
+        "myproj"
+    );
+    assert_eq!(tree_name(std::path::Path::new("target")), "target");
+    assert_eq!(
+        tree_name(std::path::Path::new("/work/myproj/debug")),
+        "debug"
+    );
+}
+
+#[test]
+fn now_pages_the_build_list_and_the_wheel_moves_three() {
+    let mut s = test_state();
+    for i in 0..8 {
+        s.push_event(session_event(
+            "a",
+            EventResult::Miss,
+            &format!("/w/n{i}"),
+            &format!("s{i}"),
+            100 - i,
+        ));
+    }
+    s.refresh_sessions(chrono::Utc::now());
+    let screen = rendered_tab(&mut s, Tab::Now);
+    assert!(screen.contains("following the top build"), "{screen}");
+    assert!(screen.contains("3 more, older"), "{screen}");
+    assert!(screen.contains("n7"), "{screen}");
+    assert!(!screen.contains("n0"), "{screen}");
+    assert!(!screen.contains("newer"), "{screen}");
+
+    s.active_tab = Tab::Now;
+    handle_key(&mut s, KeyCode::Char('j'));
+    assert_eq!(s.selected_session.as_deref(), Some("id:s6"));
+    let pinned = rendered_tab(&mut s, Tab::Now);
+    assert!(!pinned.contains("following"), "{pinned}");
+    handle_key(&mut s, KeyCode::Char('k'));
+    assert_eq!(s.selected_session.as_deref(), Some("id:s7"));
+    handle_key(&mut s, KeyCode::Char('k'));
+    assert!(s.selected_session.is_none());
+
+    handle_key(&mut s, KeyCode::PageDown);
+    assert_eq!(s.selected_session.as_deref(), Some("id:s2"));
+    handle_key(&mut s, KeyCode::Home);
+    assert!(s.selected_session.is_none());
+    handle_key(&mut s, KeyCode::End);
+    assert_eq!(s.selected_session.as_deref(), Some("id:s0"));
+    handle_key(&mut s, KeyCode::PageUp);
+    assert_eq!(s.selected_session.as_deref(), Some("id:s5"));
+    handle_key(&mut s, KeyCode::End);
+    assert_eq!(s.selected_session.as_deref(), Some("id:s0"));
+    let screen = rendered_tab(&mut s, Tab::Now);
+    assert!(screen.contains("3 newer"), "{screen}");
+    assert!(screen.contains("n0"), "{screen}");
+    assert!(!screen.contains("n7"), "{screen}");
+    assert!(!screen.contains("more, older"), "{screen}");
+
+    handle_key(&mut s, KeyCode::Home);
+    let area = Rect::new(0, 0, 120, 40);
+    let wheel = |kind| MouseEvent {
+        kind,
+        column: 10,
+        row: 10,
+        modifiers: KeyModifiers::NONE,
+    };
+    handle_mouse(&mut s, wheel(MouseEventKind::ScrollDown), area);
+    assert_eq!(s.selected_session.as_deref(), Some("id:s4"));
+    handle_mouse(&mut s, wheel(MouseEventKind::ScrollUp), area);
+    assert_eq!(s.selected_session.as_deref(), Some("id:s7"));
+    handle_mouse(&mut s, wheel(MouseEventKind::ScrollUp), area);
+    assert!(s.selected_session.is_none());
+}
+
+fn project_tree(path: &str, size: u64) -> cli::TargetEntry {
+    cli::TargetEntry {
+        path: std::path::PathBuf::from(path),
+        size,
+        cached_bytes: 0,
+        estimated_reclaimable_bytes: 0,
+        scan_identity: None,
+        profiles: Vec::new(),
+        breakdown: cli::CategoryBreakdown::default(),
+        stale: false,
+    }
+}
+
+#[test]
+fn project_keys_move_between_trees() {
+    let mut s = test_state();
+    s.active_tab = Tab::Projects;
+    s.selected_project = 4;
+    handle_key(&mut s, KeyCode::Down);
+    assert_eq!(s.selected_project, 0);
+
+    {
+        let mut scan = s.project_scan.lock().unwrap();
+        scan.project_targets = vec![
+            project_tree("/work/one/target", 10),
+            project_tree("/work/two/target", 20),
+        ];
+    }
+    handle_key(&mut s, KeyCode::Up);
+    assert_eq!(s.selected_project, 0);
+    handle_key(&mut s, KeyCode::Char('j'));
+    assert_eq!(s.selected_project, 1);
+    handle_key(&mut s, KeyCode::Down);
+    assert_eq!(s.selected_project, 1);
+    handle_key(&mut s, KeyCode::Char('k'));
+    assert_eq!(s.selected_project, 0);
+
+    s.selected_project = 100;
+    s.step_project(-1);
+    assert_eq!(s.selected_project, 0);
+}
+
+fn quiet_passthrough(name: &str, secs_ago: i64) -> BuildEvent {
+    session_event(
+        name,
+        EventResult::Passthrough,
+        "/w/quiet",
+        "quiet",
+        secs_ago,
+    )
+}
+
+#[test]
+fn unnamed_passthroughs_collapse_and_point_at_the_build_that_missed() {
+    let mut s = test_state();
+    s.push_event(quiet_passthrough("", 5));
+    s.push_event(quiet_passthrough("unknown", 4));
+    s.push_event(session_event(
+        "a",
+        EventResult::Miss,
+        "/w/busy",
+        "busy",
+        400,
+    ));
+    s.refresh_sessions(chrono::Utc::now());
     let screen = rendered_tab(&mut s, Tab::Build);
-    assert!(screen.contains("▸ one"), "{screen}");
+    assert!(screen.contains("passed through"), "{screen}");
+    assert!(
+        screen.contains("the crate name was not recorded"),
+        "{screen}"
+    );
+    assert!(
+        screen.contains("busy is the build with 1 miss and nothing saved"),
+        "{screen}"
+    );
+    assert!(!screen.contains("Status"), "no event table: {screen}");
+
+    let mut s = test_state();
+    s.push_event(quiet_passthrough("unknown", 5));
+    s.push_event(session_event(
+        "a",
+        EventResult::Miss,
+        "/w/warm",
+        "warm",
+        800,
+    ));
+    s.push_event(session_event(
+        "b",
+        EventResult::Miss,
+        "/w/warm",
+        "warm",
+        799,
+    ));
+    s.push_event(session_event(
+        "h",
+        EventResult::LocalHit,
+        "/w/warm",
+        "warm",
+        798,
+    ));
+    s.refresh_sessions(chrono::Utc::now());
+    let screen = rendered_tab(&mut s, Tab::Build);
+    assert!(
+        screen.contains("warm is the build with 2 misses and 2s saved"),
+        "{screen}"
+    );
+
+    // A filter keeps the table. The collapse is only the unfiltered wall.
+    s.build_filter = "nope".to_string();
+    let screen = rendered_tab(&mut s, Tab::Build);
+    assert!(!screen.contains("passed through"), "{screen}");
+}
+
+#[test]
+fn a_named_or_missed_event_keeps_the_build_table() {
+    let mut s = test_state();
+    s.push_event(quiet_passthrough("unknown", 5));
+    s.push_event(session_event(
+        "build.rs",
+        EventResult::Passthrough,
+        "/w/quiet",
+        "quiet",
+        4,
+    ));
+    s.refresh_sessions(chrono::Utc::now());
+    let screen = rendered_tab(&mut s, Tab::Build);
+    assert!(screen.contains("build.rs"), "{screen}");
+    assert!(!screen.contains("passed through"), "{screen}");
+
+    let mut s = test_state();
+    s.push_event(quiet_passthrough("", 5));
+    s.push_event(session_event(
+        "leaf",
+        EventResult::Miss,
+        "/w/quiet",
+        "quiet",
+        4,
+    ));
+    s.refresh_sessions(chrono::Utc::now());
+    let screen = rendered_tab(&mut s, Tab::Build);
+    assert!(screen.contains("leaf"), "{screen}");
+    assert!(
+        !screen.contains("the crate name was not recorded"),
+        "{screen}"
+    );
+}
+
+#[test]
+fn a_cold_miss_with_no_history_does_not_mention_explain_miss() {
+    let mut s = test_state();
+    s.events = vec![session_event("leaf", EventResult::Miss, "/w/app", "s1", 5)];
+    s.refresh_sessions(chrono::Utc::now());
+    let text = why_text(&mut s, 100).join("\n");
+    assert!(text.contains("cold    0 of 1 hit"), "{text}");
+    assert!(
+        text.contains("no earlier compile in the loaded history"),
+        "{text}"
+    );
+    assert!(
+        text.contains("the 1 have no earlier compile to diff"),
+        "{text}"
+    );
+    assert!(!text.contains("explain_miss"), "{text}");
+    assert!(!text.contains("Passthroughs in this build"), "{text}");
+}
+
+fn event_stats(
+    local_hits: usize,
+    prefetch_hits: usize,
+    remote_hits: usize,
+    dups: usize,
+    misses: usize,
+) -> daemon::EventStatsResponse {
+    daemon::EventStatsResponse {
+        local_hits,
+        prefetch_hits,
+        remote_hits,
+        dups,
+        misses,
+        errors: 0,
+        total_elapsed_ms: 0,
+        hit_elapsed_ms: 0,
+        miss_elapsed_ms: 0,
+        hit_compile_time_ms: 0,
+        miss_compile_time_ms: 0,
+        store_output_blobs: 0,
+        store_duplicate_blobs: 0,
+        store_new_blobs: 0,
+    }
+}
+
+#[test]
+fn count_hit_figure_is_blank_only_when_every_lookup_counter_is_zero() {
+    assert_eq!(count_hit_figure(&event_stats(0, 0, 0, 0, 0)), "\u{2014}");
+    // `*` binds tighter than `+`, so a product replaces only its two
+    // operands. One of those two has to be the only non-zero counter.
+    assert_eq!(count_hit_figure(&event_stats(2, 0, 0, 0, 0)), "100%");
+    assert_eq!(count_hit_figure(&event_stats(0, 3, 0, 0, 0)), "100%");
+    assert_eq!(count_hit_figure(&event_stats(0, 0, 3, 0, 0)), "100%");
+    assert_eq!(count_hit_figure(&event_stats(0, 0, 0, 3, 0)), "0%");
+    assert_eq!(count_hit_figure(&event_stats(3, 3, 0, 0, 0)), "100%");
+    assert_eq!(count_hit_figure(&event_stats(3, 0, 3, 0, 0)), "100%");
+    assert_eq!(count_hit_figure(&event_stats(3, 0, 0, 3, 0)), "50%");
+    assert_eq!(count_hit_figure(&event_stats(3, 0, 0, 0, 3)), "50%");
+}
+
+#[test]
+fn now_window_keeps_the_selection_away_from_the_edges() {
+    assert_eq!(now_window_start(10, 5), 3);
+    assert_eq!(now_window_start(4, 3), 0);
+}
+
+#[test]
+fn now_title_follows_only_while_a_build_is_on_screen() {
+    let mut s = test_state();
+    let screen = rendered_tab(&mut s, Tab::Now);
+    assert!(!screen.contains("following"), "{screen}");
+}
+
+#[test]
+fn a_hit_only_build_is_not_the_one_with_misses() {
+    let mut s = test_state();
+    s.push_event(quiet_passthrough("", 5));
+    s.push_event(session_event(
+        "a",
+        EventResult::LocalHit,
+        "/w/warm",
+        "warm",
+        400,
+    ));
+    s.refresh_sessions(chrono::Utc::now());
+    let screen = rendered_tab(&mut s, Tab::Build);
+    assert!(screen.contains("passed through"), "{screen}");
+    assert!(!screen.contains("is the build with"), "{screen}");
+}
+
+#[test]
+fn project_scroll_offset_keeps_the_selection_on_screen() {
+    assert_eq!(project_scroll_offset(10, 2, 5), 2);
+    assert_eq!(project_scroll_offset(5, 6, 10), 5);
+    assert_eq!(project_scroll_offset(0, 5, 5), 1);
+    assert_eq!(project_scroll_offset(2, 8, 5), 4);
+    assert_eq!(project_scroll_offset(0, 2, 10), 0);
+}
+
+#[test]
+fn project_selection_clamps_only_past_the_end() {
+    let mut s = test_state();
+    {
+        let mut scan = s.project_scan.lock().unwrap();
+        scan.project_targets = vec![
+            project_tree("/work/one/target", 10),
+            project_tree("/work/two/target", 20),
+        ];
+    }
+    s.selected_project = 0;
+    rendered_tab(&mut s, Tab::Projects);
+    assert_eq!(s.selected_project, 0);
+
+    s.selected_project = 99;
+    rendered_tab(&mut s, Tab::Projects);
+    assert_eq!(s.selected_project, 1);
+}
+
+#[test]
+fn project_lines_mark_and_anchor_the_selected_tree() {
+    let s = test_state();
+    {
+        let mut scan = s.project_scan.lock().unwrap();
+        scan.project_targets = vec![
+            project_tree("/work/alpha/target", 10),
+            project_tree("/work/beta/target", 20),
+        ];
+    }
+    let (lines, anchor) = project_lines(&s, 80);
+    let text: Vec<String> = lines.iter().map(|line| line.to_string()).collect();
+    let marked = text
+        .iter()
+        .position(|line| line.contains('▸'))
+        .unwrap_or_else(|| panic!("{}", text.join("\n")));
+    assert_eq!(anchor, marked);
+    assert!(text[marked].contains("alpha"), "{}", text[marked]);
+    assert!(!text[marked].contains("beta"), "{}", text[marked]);
+}
+
+#[test]
+fn project_row_reserves_the_size_and_clips_the_name() {
+    let s = test_state();
+    {
+        let mut scan = s.project_scan.lock().unwrap();
+        scan.project_targets = vec![project_tree("/work/abcdefghijklmnopqrstuvwxyz/target", 10)];
+    }
+    let (lines, _) = project_lines(&s, 30);
+    let row = lines
+        .iter()
+        .map(|line| line.to_string())
+        .find(|line| line.contains('▸'))
+        .unwrap();
+    assert_eq!(row, "▸ abcdefghijklmnopqrstuv… 10 B");
+}
+
+#[test]
+fn a_zero_deps_bar_stays_empty() {
+    let s = test_state();
+    {
+        let mut scan = s.project_scan.lock().unwrap();
+        scan.project_targets = vec![project_tree("/work/tiny/target", 4)];
+    }
+    let (lines, _) = project_lines(&s, 40);
+    let deps = lines
+        .iter()
+        .map(|line| line.to_string())
+        .find(|line| line.contains("deps"))
+        .unwrap();
+    assert!(deps.contains('░'), "{deps}");
+    assert!(!deps.contains('█'), "{deps}");
+}
+
+#[test]
+fn tree_detail_lists_only_categories_that_hold_bytes() {
+    let mut tree = project_tree("/work/tiny/target", 100);
+    tree.breakdown.incremental = 40;
+    let text = tree_detail_lines(&tree).join("\n");
+    assert!(text.contains("incremental"), "{text}");
+    assert!(!text.contains("fingerprints"), "{text}");
 }

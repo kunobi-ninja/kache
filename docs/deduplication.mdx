@@ -31,13 +31,9 @@ Reflinks have independent inodes. A later write copies changed blocks instead of
 
 ## Monitor metrics
 
-The monitor separates:
+The Store tab's title shows physical blob bytes and the share of logical size that sharing saved. `kache stats` prints the same dedup line. While Projects is still walking target directories, that tab says `scanning…`.
 
-- `Dedup`: logical bytes avoided by content-addressed blob sharing
-- `Blobs`: physical blob bytes in the store
-- `Scan`: whether project target discovery is running or complete
-
-Run `kache clean --dry-run` to see what deleting each target directory frees and which ones a clean would remove. The live monitor stays focused on builds, store usage, and transfers.
+Run `kache clean --dry-run` to see what deleting each target directory frees and which ones a clean would remove.
 
 ## `dup` build events
 

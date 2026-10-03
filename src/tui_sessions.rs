@@ -151,6 +151,7 @@ impl Tally {
     /// Lookups that hit, over lookups alone. Passthroughs and probes never
     /// consulted the cache, so they are not in the denominator; folding them
     /// in would report a number no cache could move.
+    #[cfg(test)]
     pub(crate) fn hit_rate(&self) -> Option<f64> {
         let lookups = self.hits.saturating_add(self.compiled());
         (lookups > 0).then(|| self.hits as f64 * 100.0 / lookups as f64)

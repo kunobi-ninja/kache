@@ -1565,7 +1565,7 @@ async fn credentials_follow_the_daemons_startup_environment() {
         std::fs::write(
             &helper,
             format!(
-                "#!{}\nIFS= read -r response < \"$DOCKER_CONFIG/helper-response.json\" || :\nprintf '%s' \"$response\"\n",
+                "#!{}\nIFS= read -r registry || :\nIFS= read -r response < \"$DOCKER_CONFIG/helper-response.json\" || :\nprintf '%s' \"$response\"\n",
                 option_env!("KACHE_TEST_SHELL").unwrap_or("/bin/sh"),
             ),
         )

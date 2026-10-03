@@ -983,6 +983,10 @@ fn why_tab_says_when_it_cannot_explain_and_how_to_fix_that() {
         text.contains("the 1 have no earlier compile to diff"),
         "{text}"
     );
+    assert!(
+        text.contains("cannot name the crate that changed"),
+        "{text}"
+    );
 
     s.config.explain_miss = true;
     s.why_cache = None;
@@ -990,9 +994,14 @@ fn why_tab_says_when_it_cannot_explain_and_how_to_fix_that() {
         .iter()
         .map(|line| line.to_string())
         .collect();
+    let text = text.join("\n");
     assert!(
-        !text.join("\n").contains("explain_miss = true"),
-        "already on, so no hint"
+        !text.contains("explain_miss = true"),
+        "already on, so no hint: {text}"
+    );
+    assert!(
+        !text.contains("cannot name the crate that changed"),
+        "{text}"
     );
 }
 
@@ -2053,6 +2062,7 @@ fn build_tab_layout_thresholds() {
     let mut s = test_state();
     let screen = rendered_tab(&mut s, Tab::Build);
     assert!(!screen.contains("Builds ·"), "{screen}");
+    assert!(!screen.contains("In flight"), "{screen}");
 
     // The sparkline needs 30 content rows (31 with the tab bar).
     let mut s = populated_state();
@@ -2151,6 +2161,7 @@ fn why_counts_misses_in_english_and_says_when_capped() {
     assert!(text.contains("Misses by cause · 1 miss\n"), "{text}");
     assert!(!text.contains("Misses by cause · 1 misses"), "{text}");
     assert!(!text.contains("analyzed)"), "{text}");
+    assert!(!text.contains("older, not analyzed"), "{text}");
     assert!(!text.contains("none:"), "there is a miss: {text}");
     assert!(
         !text.contains("Passthroughs by reason"),
@@ -2396,6 +2407,17 @@ fn now_list_layout_and_styling() {
     }
     assert!(saw_zero && saw_saved, "{}", rows[other_y]);
 
+    // A real miss is white. The em dash and the zero are the muted ones.
+    let mut saw_miss = false;
+    for x in 0..buffer.area.width {
+        let cell = &buffer[(x, selected_y as u16)];
+        if cell.symbol() == "1" {
+            assert_eq!(cell.fg, Color::White, "misses at {x}: {cell:?}");
+            saw_miss = true;
+        }
+    }
+    assert!(saw_miss, "{}", rows[selected_y]);
+
     let narrow = rendered_lines(&mut s, Tab::Now, 70, 40);
     let header = narrow
         .iter()
@@ -2484,6 +2506,8 @@ fn now_pages_the_build_list_and_the_wheel_moves_three() {
     s.active_tab = Tab::Now;
     handle_key(&mut s, KeyCode::Char('j'));
     assert_eq!(s.selected_session.as_deref(), Some("id:s6"));
+    let pinned = rendered_tab(&mut s, Tab::Now);
+    assert!(!pinned.contains("following"), "{pinned}");
     handle_key(&mut s, KeyCode::Char('k'));
     assert_eq!(s.selected_session.as_deref(), Some("id:s7"));
     handle_key(&mut s, KeyCode::Char('k'));
@@ -2493,6 +2517,10 @@ fn now_pages_the_build_list_and_the_wheel_moves_three() {
     assert_eq!(s.selected_session.as_deref(), Some("id:s2"));
     handle_key(&mut s, KeyCode::Home);
     assert!(s.selected_session.is_none());
+    handle_key(&mut s, KeyCode::End);
+    assert_eq!(s.selected_session.as_deref(), Some("id:s0"));
+    handle_key(&mut s, KeyCode::PageUp);
+    assert_eq!(s.selected_session.as_deref(), Some("id:s5"));
     handle_key(&mut s, KeyCode::End);
     assert_eq!(s.selected_session.as_deref(), Some("id:s0"));
     let screen = rendered_tab(&mut s, Tab::Now);
@@ -2534,6 +2562,7 @@ fn project_tree(path: &str, size: u64) -> cli::TargetEntry {
 fn project_keys_move_between_trees() {
     let mut s = test_state();
     s.active_tab = Tab::Projects;
+    s.selected_project = 4;
     handle_key(&mut s, KeyCode::Down);
     assert_eq!(s.selected_project, 0);
 
@@ -2551,6 +2580,10 @@ fn project_keys_move_between_trees() {
     handle_key(&mut s, KeyCode::Down);
     assert_eq!(s.selected_project, 1);
     handle_key(&mut s, KeyCode::Char('k'));
+    assert_eq!(s.selected_project, 0);
+
+    s.selected_project = 100;
+    s.step_project(-1);
     assert_eq!(s.selected_project, 0);
 }
 
@@ -2676,4 +2709,165 @@ fn a_cold_miss_with_no_history_does_not_mention_explain_miss() {
     );
     assert!(!text.contains("explain_miss"), "{text}");
     assert!(!text.contains("Passthroughs in this build"), "{text}");
+}
+
+fn event_stats(
+    local_hits: usize,
+    prefetch_hits: usize,
+    remote_hits: usize,
+    dups: usize,
+    misses: usize,
+) -> daemon::EventStatsResponse {
+    daemon::EventStatsResponse {
+        local_hits,
+        prefetch_hits,
+        remote_hits,
+        dups,
+        misses,
+        errors: 0,
+        total_elapsed_ms: 0,
+        hit_elapsed_ms: 0,
+        miss_elapsed_ms: 0,
+        hit_compile_time_ms: 0,
+        miss_compile_time_ms: 0,
+        store_output_blobs: 0,
+        store_duplicate_blobs: 0,
+        store_new_blobs: 0,
+    }
+}
+
+#[test]
+fn count_hit_figure_is_blank_only_when_every_lookup_counter_is_zero() {
+    assert_eq!(count_hit_figure(&event_stats(0, 0, 0, 0, 0)), "\u{2014}");
+    // `*` binds tighter than `+`, so a product replaces only its two
+    // operands. One of those two has to be the only non-zero counter.
+    assert_eq!(count_hit_figure(&event_stats(2, 0, 0, 0, 0)), "100%");
+    assert_eq!(count_hit_figure(&event_stats(0, 3, 0, 0, 0)), "100%");
+    assert_eq!(count_hit_figure(&event_stats(0, 0, 3, 0, 0)), "100%");
+    assert_eq!(count_hit_figure(&event_stats(0, 0, 0, 3, 0)), "0%");
+    assert_eq!(count_hit_figure(&event_stats(3, 3, 0, 0, 0)), "100%");
+    assert_eq!(count_hit_figure(&event_stats(3, 0, 3, 0, 0)), "100%");
+    assert_eq!(count_hit_figure(&event_stats(3, 0, 0, 3, 0)), "50%");
+    assert_eq!(count_hit_figure(&event_stats(3, 0, 0, 0, 3)), "50%");
+}
+
+#[test]
+fn now_window_keeps_the_selection_away_from_the_edges() {
+    assert_eq!(now_window_start(10, 5), 3);
+    assert_eq!(now_window_start(4, 3), 0);
+}
+
+#[test]
+fn now_title_follows_only_while_a_build_is_on_screen() {
+    let mut s = test_state();
+    let screen = rendered_tab(&mut s, Tab::Now);
+    assert!(!screen.contains("following"), "{screen}");
+}
+
+#[test]
+fn a_hit_only_build_is_not_the_one_with_misses() {
+    let mut s = test_state();
+    s.push_event(quiet_passthrough("", 5));
+    s.push_event(session_event(
+        "a",
+        EventResult::LocalHit,
+        "/w/warm",
+        "warm",
+        400,
+    ));
+    s.refresh_sessions(chrono::Utc::now());
+    let screen = rendered_tab(&mut s, Tab::Build);
+    assert!(screen.contains("passed through"), "{screen}");
+    assert!(!screen.contains("is the build with"), "{screen}");
+}
+
+#[test]
+fn project_scroll_offset_keeps_the_selection_on_screen() {
+    assert_eq!(project_scroll_offset(10, 2, 5), 2);
+    assert_eq!(project_scroll_offset(5, 6, 10), 5);
+    assert_eq!(project_scroll_offset(0, 5, 5), 1);
+    assert_eq!(project_scroll_offset(2, 8, 5), 4);
+    assert_eq!(project_scroll_offset(0, 2, 10), 0);
+}
+
+#[test]
+fn project_selection_clamps_only_past_the_end() {
+    let mut s = test_state();
+    {
+        let mut scan = s.project_scan.lock().unwrap();
+        scan.project_targets = vec![
+            project_tree("/work/one/target", 10),
+            project_tree("/work/two/target", 20),
+        ];
+    }
+    s.selected_project = 0;
+    rendered_tab(&mut s, Tab::Projects);
+    assert_eq!(s.selected_project, 0);
+
+    s.selected_project = 99;
+    rendered_tab(&mut s, Tab::Projects);
+    assert_eq!(s.selected_project, 1);
+}
+
+#[test]
+fn project_lines_mark_and_anchor_the_selected_tree() {
+    let s = test_state();
+    {
+        let mut scan = s.project_scan.lock().unwrap();
+        scan.project_targets = vec![
+            project_tree("/work/alpha/target", 10),
+            project_tree("/work/beta/target", 20),
+        ];
+    }
+    let (lines, anchor) = project_lines(&s, 80);
+    let text: Vec<String> = lines.iter().map(|line| line.to_string()).collect();
+    let marked = text
+        .iter()
+        .position(|line| line.contains('▸'))
+        .unwrap_or_else(|| panic!("{}", text.join("\n")));
+    assert_eq!(anchor, marked);
+    assert!(text[marked].contains("alpha"), "{}", text[marked]);
+    assert!(!text[marked].contains("beta"), "{}", text[marked]);
+}
+
+#[test]
+fn project_row_reserves_the_size_and_clips_the_name() {
+    let s = test_state();
+    {
+        let mut scan = s.project_scan.lock().unwrap();
+        scan.project_targets = vec![project_tree("/work/abcdefghijklmnopqrstuvwxyz/target", 10)];
+    }
+    let (lines, _) = project_lines(&s, 30);
+    let row = lines
+        .iter()
+        .map(|line| line.to_string())
+        .find(|line| line.contains('▸'))
+        .unwrap();
+    assert_eq!(row, "▸ abcdefghijklmnopqrstuv… 10 B");
+}
+
+#[test]
+fn a_zero_deps_bar_stays_empty() {
+    let s = test_state();
+    {
+        let mut scan = s.project_scan.lock().unwrap();
+        scan.project_targets = vec![project_tree("/work/tiny/target", 4)];
+    }
+    let (lines, _) = project_lines(&s, 40);
+    let deps = lines
+        .iter()
+        .map(|line| line.to_string())
+        .find(|line| line.contains("deps"))
+        .unwrap();
+    assert!(deps.contains('░'), "{deps}");
+    assert!(!deps.contains('█'), "{deps}");
+}
+
+#[test]
+fn tree_detail_lists_only_categories_that_hold_bytes() {
+    let mut tree = project_tree("/work/tiny/target", 100);
+    tree.breakdown.incremental = 40;
+    let text = tree_detail_lines(&tree).join("\n");
+    assert!(text.contains("incremental"), "{text}");
+    assert!(!text.contains("fingerprints"), "{text}");
 }

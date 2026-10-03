@@ -502,16 +502,13 @@ impl AppState {
 
     fn step_project(&mut self, delta: isize) {
         let count = self.project_count();
-        if count == 0 {
+        let Some(last) = count.checked_sub(1) else {
             self.selected_project = 0;
             return;
-        }
-        let current = self.selected_project.min(count - 1);
-        self.selected_project = if delta < 0 {
-            current.saturating_sub(delta.unsigned_abs())
-        } else {
-            (current + delta as usize).min(count - 1)
         };
+        let current = self.selected_project.min(last);
+        let next = current as isize + delta;
+        self.selected_project = next.clamp(0, last as isize) as usize;
     }
 
     /// Read what the event log appended since the last tick: build events
@@ -1545,10 +1542,8 @@ fn draw_build_tab(frame: &mut Frame, state: &mut AppState, area: Rect) {
     .split(area);
 
     // A zero-height slot stays in the split, so the index is the slot, not
-    // the count of panels actually drawn.
-    if in_flight_rows > 0 {
-        draw_in_flight(frame, &in_flight, chunks[0]);
-    }
+    // the count of panels actually drawn. An empty slot clips to no cells.
+    draw_in_flight(frame, &in_flight, chunks[0]);
     draw_live_build(frame, state, chunks[1]);
     if show_spark {
         draw_sparkline(frame, state, chunks[2]);
@@ -2272,6 +2267,17 @@ fn draw_projects_tab(frame: &mut Frame, state: &mut AppState, area: Rect) {
     draw_projects_help(frame, state, chunks[1]);
 }
 
+/// Window start that keeps `anchor` on screen. `page` is at least 1.
+fn project_scroll_offset(offset: usize, anchor: usize, page: usize) -> usize {
+    let start = offset.min(anchor);
+    let end = start.saturating_add(page);
+    if anchor < end {
+        start
+    } else {
+        anchor.saturating_sub(page.saturating_sub(1))
+    }
+}
+
 fn draw_projects_body(frame: &mut Frame, state: &mut AppState, area: Rect) {
     let count = state.project_count();
     if count > 0 && state.selected_project >= count {
@@ -2283,14 +2289,7 @@ fn draw_projects_body(frame: &mut Frame, state: &mut AppState, area: Rect) {
     let inner = block.inner(area);
     let (lines, anchor) = project_lines(state, inner.width);
     let page = inner.height.max(1) as usize;
-    let offset = state.project_scroll.offset;
-    state.project_scroll.offset = if anchor < offset {
-        anchor
-    } else if anchor >= offset.saturating_add(page) {
-        anchor.saturating_sub(page.saturating_sub(1))
-    } else {
-        offset
-    };
+    state.project_scroll.offset = project_scroll_offset(state.project_scroll.offset, anchor, page);
     let range = state
         .project_scroll
         .visible_range(lines.len(), inner.height as usize);
@@ -2339,7 +2338,7 @@ fn project_lines(state: &AppState, width: u16) -> (Vec<Line<'static>>, usize) {
         lines.push(Line::styled("  scanning…", muted));
     }
     lines.push(Line::from(""));
-    let selected = state.selected_project.min(n - 1);
+    let selected = state.selected_project;
     let mut anchor = 0;
     let bar_width = 28.min(width.saturating_sub(16)).max(4);
     for (index, entry) in scan.project_targets.iter().enumerate() {
@@ -2754,10 +2753,8 @@ fn cause_row(
     let room = width.saturating_sub(cells(&prefix));
     if !examples.is_empty() && room > 12 {
         format!("{prefix}  {}", clip(examples, room.saturating_sub(2)))
-    } else if cells(&prefix) > width {
-        clip(&prefix, width)
     } else {
-        prefix
+        clip(&prefix, width)
     }
 }
 

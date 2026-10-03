@@ -923,7 +923,7 @@ jobs:
           echo "endpoint=$RUSTFS_ENDPOINT" >> "$GITHUB_OUTPUT"
           echo "access-key=$RUSTFS_ACCESS_KEY" >> "$GITHUB_OUTPUT"
           echo "secret-key=$RUSTFS_SECRET_KEY" >> "$GITHUB_OUTPUT"
-      - uses: kunobi-ninja/kache-action@ab8dcda2212b3930ee0018bfdaf8339c100ce169 # v1
+      - uses: kunobi-ninja/kache-action@1a33fb2ff51be23eb9e87abeae6edb65be78f71c # v1
         with:
           version: ${{ steps.binary.outputs.version }}
           s3-bucket: kache-action

@@ -718,7 +718,7 @@ fn terminal_output(mut command: std::process::Command, columns: u16) -> String {
                 &mut slave,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
-                &mut size,
+                &raw mut size,
             )
         },
         0

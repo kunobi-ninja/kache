@@ -1270,6 +1270,18 @@ impl Run {
             }
         }
         for declared in &prediction.inputs {
+            // An unmapped absolute input may name the recording checkout.
+            // Bind it to this package so a prediction from another checkout
+            // cannot replay a run keyed on that checkout's unchanged files.
+            // This extra field also stops entries written before the binding
+            // from matching, without discarding safely mapped recordings.
+            if Path::new(declared).is_absolute() {
+                fold(
+                    &mut hasher,
+                    "absolute_input_manifest_dir",
+                    self.environment.manifest_dir.as_os_str().as_encoded_bytes(),
+                );
+            }
             let path = PathBuf::from(self.environment.denormalize_str(declared));
             fold(&mut hasher, "input", declared.as_bytes());
             let excluded = if prediction.default_package {
@@ -3158,6 +3170,49 @@ mod tests {
             embedded_roots,
             rewrites_text: false,
         }
+    }
+
+    #[test]
+    fn unmapped_absolute_inputs_bind_to_the_package_but_not_the_target_dir() {
+        let mut lock = crate::test_support::process_state_test_lock();
+        let dir = lock.enter();
+        let config = crate::test_support::test_config(dir.as_path().join("cache"));
+        let run_in = |package: &str, target: &str| {
+            let package = dir.as_path().join(package);
+            std::fs::create_dir_all(&package).unwrap();
+            std::fs::write(package.join("input.h"), "same input").unwrap();
+            Run {
+                store: Store::open(&config).unwrap(),
+                config: config.clone(),
+                binary_hash: "aaaa".to_string(),
+                environment: environment(&dir.as_path().join(target), &package),
+                start: std::time::Instant::now(),
+            }
+        };
+        let a = run_in("a", "t1");
+        let a_other_target = run_in("a", "t2");
+        let b = run_in("b", "t3");
+        let mut prediction = prediction_with(Some(Vec::new()), true);
+        // A declaration stored verbatim in an old prediction. Its path and
+        // contents still name A even when B reads that prediction.
+        prediction.inputs = vec![
+            a.environment
+                .manifest_dir
+                .join("input.h")
+                .to_str()
+                .unwrap()
+                .to_string(),
+        ];
+        let key = a.action_key(&prediction).unwrap();
+        assert_eq!(key, a_other_target.action_key(&prediction).unwrap());
+        assert_ne!(key, b.action_key(&prediction).unwrap());
+
+        // Mapped declarations follow the current package and retain sharing.
+        prediction.inputs = vec!["${KACHE_MANIFEST_DIR}/input.h".to_string()];
+        let key = a.action_key(&prediction).unwrap();
+        assert_eq!(key, b.action_key(&prediction).unwrap());
+        std::fs::write(b.environment.manifest_dir.join("input.h"), "changed input").unwrap();
+        assert_ne!(key, b.action_key(&prediction).unwrap());
     }
 
     /// A result whose objects name registry sources restores in another

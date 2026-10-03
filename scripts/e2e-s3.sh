@@ -18,7 +18,12 @@ access_key=$RUSTFS_ACCESS_KEY
 secret_key=$RUSTFS_SECRET_KEY
 cleanup() {
   kill "$RUSTFS_PID" 2>/dev/null || true
-  wait "$RUSTFS_PID" 2>/dev/null || true
+  # RustFS is not this shell's child, so `wait` cannot see it exit. Removing
+  # its data while it still writes on the way down fails the run.
+  for _ in $(seq 100); do
+    kill -0 "$RUSTFS_PID" 2>/dev/null || break
+    sleep 0.1
+  done
   rm -rf "$RUSTFS_DATA" "$RUSTFS_LOG"
 }
 trap cleanup EXIT

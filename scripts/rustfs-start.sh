@@ -5,7 +5,8 @@
 # $KACHE_E2E_CACHE) and starts it in the background with an empty data
 # directory. Prints shell assignments for the caller to eval: RUSTFS_PID,
 # RUSTFS_DATA, RUSTFS_LOG, RUSTFS_ENDPOINT, RUSTFS_ACCESS_KEY and
-# RUSTFS_SECRET_KEY. The caller stops the server and removes its data.
+# RUSTFS_SECRET_KEY. The caller stops the server and removes its data. The
+# server is not the caller's child: wait for it with `kill -0`, not `wait`.
 #
 # Usage: rustfs=$(scripts/rustfs-start.sh BUCKET...) && eval "$rustfs"
 set -euo pipefail

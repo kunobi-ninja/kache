@@ -96,6 +96,15 @@ pub(super) fn file_bytes(files: &[(PathBuf, String)]) -> Result<u64> {
     Ok(total)
 }
 
+/// Bytes and entries `OUT_DIR` already takes from the shared cap: its regular
+/// files, and one entry per symlink.
+pub(super) fn out_dir_share(
+    files: &[(PathBuf, String)],
+    symlinks: &[Symlink],
+) -> Result<(u64, usize)> {
+    Ok((file_bytes(files)?, files.len() + symlinks.len()))
+}
+
 struct Budget {
     bytes_left: u64,
     entries_left: usize,
@@ -616,9 +625,15 @@ mod tests {
             paths("cargo:rustc-link-arg=-Lnative=/t/g\n"),
             vec!["/t/g".to_string()]
         );
+        // Absolute on the platform running the test: `/t` has no drive on Windows.
+        let archive = if cfg!(windows) {
+            r"C:\t\g\lib.a"
+        } else {
+            "/t/g/lib.a"
+        };
         assert_eq!(
-            paths("cargo:rustc-link-arg=/t/g/lib.a\n"),
-            vec!["/t/g/lib.a".to_string()]
+            paths(&format!("cargo:rustc-link-arg={archive}\n")),
+            vec![archive.to_string()]
         );
         assert!(paths("cargo:rustc-link-arg=-lfoo\n").is_empty());
         assert!(paths("cargo:rustc-link-arg=libfoo.a\n").is_empty());
@@ -697,6 +712,143 @@ mod tests {
         std::fs::write(&second, "cdef").unwrap();
         let files = [(first, "out/a".into()), (second, "out/b".into())];
         assert_eq!(file_bytes(&files).unwrap(), 6);
+    }
+
+    #[test]
+    fn out_dir_share_counts_each_file_and_symlink_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("a");
+        let second = dir.path().join("b");
+        std::fs::write(&first, "ab").unwrap();
+        std::fs::write(&second, "cdef").unwrap();
+        let files = [(first, "out/a".into()), (second, "out/b".into())];
+        let symlinks = [Symlink {
+            name: "lib.so".into(),
+            target: "lib.so.1".into(),
+        }];
+        assert_eq!(out_dir_share(&files, &symlinks).unwrap(), (6, 3));
+        assert_eq!(out_dir_share(&files, &[]).unwrap(), (6, 2));
+    }
+
+    #[test]
+    fn finish_orders_every_list_by_name() {
+        let mut contents = OutsideContents {
+            files: vec![
+                (PathBuf::from("b"), "outside/b".into()),
+                (PathBuf::from("a"), "outside/a".into()),
+            ],
+            directories: vec!["z".into(), "y".into()],
+            empty_files: vec![
+                EmptyFile {
+                    name: "n".into(),
+                    executable: false,
+                },
+                EmptyFile {
+                    name: "m".into(),
+                    executable: false,
+                },
+            ],
+            symlinks: vec![
+                Symlink {
+                    name: "t".into(),
+                    target: "x".into(),
+                },
+                Symlink {
+                    name: "s".into(),
+                    target: "x".into(),
+                },
+            ],
+        };
+        contents.finish();
+        let names = |list: Vec<&str>| list.into_iter().map(str::to_owned).collect::<Vec<_>>();
+        assert_eq!(
+            contents
+                .files
+                .iter()
+                .map(|file| file.1.clone())
+                .collect::<Vec<_>>(),
+            names(vec!["outside/a", "outside/b"])
+        );
+        assert_eq!(contents.directories, names(vec!["y", "z"]));
+        assert_eq!(
+            contents
+                .empty_files
+                .iter()
+                .map(|file| file.name.clone())
+                .collect::<Vec<_>>(),
+            names(vec!["m", "n"])
+        );
+        assert_eq!(
+            contents
+                .symlinks
+                .iter()
+                .map(|link| link.name.clone())
+                .collect::<Vec<_>>(),
+            names(vec!["s", "t"])
+        );
+    }
+
+    #[test]
+    fn a_leading_current_directory_is_dropped_from_a_relative_name() {
+        assert_eq!(
+            slash_relative(Path::new("./debug/gn_out")).unwrap(),
+            "debug/gn_out"
+        );
+        assert!(slash_relative(Path::new("../debug")).is_err());
+    }
+
+    /// Two spellings of the target directory: the file is relative to the one
+    /// that holds it, not to the first one listed.
+    #[test]
+    fn a_named_file_is_relative_to_the_target_spelling_that_holds_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut env = sample_env(dir.path());
+        let elsewhere = dir.path().join("a-much-longer-other-target");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        env.mappings.insert(0, (elsewhere, TARGET_DIR_PLACEHOLDER));
+        let lib = write_lib(dir.path());
+        let stdout = format!(
+            "cargo:rustc-link-search=native={}\n",
+            lib.parent().unwrap().display()
+        );
+        let contents = collect(&stdout, &env, 0, 0).unwrap();
+        assert_eq!(
+            contents
+                .files
+                .iter()
+                .map(|(_, name)| name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["outside/debug/gn_out/obj/librusty_v8.a"]
+        );
+    }
+
+    /// A named path that cannot be inspected fails the recording; only a
+    /// missing one is skipped.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_named_path_is_an_error_and_a_missing_one_is_not() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let env = sample_env(dir.path());
+        let locked = dir.path().join("target/debug/locked");
+        std::fs::create_dir_all(locked.join("inner")).unwrap();
+        let missing = format!(
+            "cargo:rustc-link-search=native={}\n",
+            dir.path().join("target/debug/absent").display()
+        );
+        assert!(paths_to_snapshot(&missing, &env).unwrap().is_empty());
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let unreadable = format!(
+            "cargo:rustc-link-search=native={}\n",
+            locked.join("inner").display()
+        );
+        let result = paths_to_snapshot(&unreadable, &env);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Root reads through any mode, so there is nothing to refuse.
+        if std::fs::read_dir(dir.path()).is_ok() && unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        assert!(result.is_err(), "{result:?}");
     }
 
     fn sample_env(root: &Path) -> Environment {

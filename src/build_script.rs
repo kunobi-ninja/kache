@@ -1486,8 +1486,7 @@ impl Run {
             empty_files,
             symlinks,
         } = collect_out_dir(&self.environment.out_dir)?;
-        let used_bytes = outside::file_bytes(&files)?;
-        let used_entries = files.len() + symlinks.len();
+        let (used_bytes, used_entries) = outside::out_dir_share(&files, &symlinks)?;
         let mut outside_outputs =
             outside::collect(stdout_text, &self.environment, used_bytes, used_entries)?;
         let has_outside = !outside_outputs.is_empty();
@@ -3633,7 +3632,17 @@ mod tests {
             meta.files.iter().all(|file| !file.name.contains("/deps/")),
             "deps is not stored"
         );
-        b.restore(&meta).unwrap();
+        let restored_bytes = b.restore(&meta).unwrap();
+        assert_eq!(
+            restored_bytes,
+            meta.files
+                .iter()
+                .filter(|file| file.name.starts_with(OUT_PREFIX)
+                    || file.name.starts_with(outside::PREFIX))
+                .map(|file| file.size)
+                .sum::<u64>(),
+            "the outside files count toward the restored size"
+        );
         let restored = dir.as_path().join("b/target/debug/gn_out/obj");
         assert_eq!(
             std::fs::read(restored.join("librusty_v8.a")).unwrap(),

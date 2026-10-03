@@ -10,7 +10,7 @@
 # This scenario wires the build-script compilers the way `kache init` does
 # (HOST_CC/HOST_CXX under Cargo [env], CC/CXX untouched), so both compiler
 # families are measured. The same subject at the previous commit is
-# bench-hk-pull, which measures the next-commit rebuild.
+# bench-hk-pull-perf, which measures the next-commit rebuild.
 name = "bench-hk"
 tags = ["suite:bench", "project:hk", "backend:kache", "lang:rust", "lang:cc"]
 
@@ -64,7 +64,7 @@ CC_KNOWN_WRAPPER_CUSTOM = "kache"
 kind   = "clone"
 repo   = "https://github.com/jdx/hk.git"
 # hk 1.56.1. Pinned by commit SHA so a repointed tag cannot read as a cache
-# change. bench-hk-pull seeds at this commit's parent and rebuilds this one.
+# change. bench-hk-pull-perf seeds at this commit's parent and rebuilds this one.
 ref    = "fc29ead1456ba7c1f62826c284126410a4014b00"
 objdir = "target"
 

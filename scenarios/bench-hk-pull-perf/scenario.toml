@@ -1,3 +1,7 @@
+# hk next-commit rebuild: cold at the parent commit, then the child in the
+# same worktree with the store warm. Predictions on, verification off.
+# The predictions-off and verify-always arms were removed once
+# input_predictions defaulted on (kunobi-ninja/kache#1000).
 name = "bench-hk-pull-perf"
 tags = ["suite:bench", "project:hk", "backend:kache", "lang:rust", "lang:cc", "scenario:pull"]
 requires = ["cargo", "rustc", "cc"]

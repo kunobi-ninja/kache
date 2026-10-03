@@ -41,7 +41,7 @@ on:
       scenario:
         description: "Which scenario(s) to run"
         type: choice
-        options: [all, hk-comparison, surrealdb, lance, opendal, kobe, cuda-oxide, cuda-oxide-patched, eza, aube, llvm, hk, hk-nopred, hk-pull, hk-pull-perf, hk-pull-nopred, hk-mbx, hk-pull-mbx, opendal-mbx, lance-mbx, surrealdb-mbx, firefox-sccache, firefox-mbx]
+        options: [all, hk-comparison, surrealdb, lance, opendal, kobe, cuda-oxide, cuda-oxide-patched, eza, aube, llvm, hk, hk-pull-perf, hk-mbx, hk-pull-mbx, opendal-mbx, lance-mbx, surrealdb-mbx, firefox-sccache, firefox-mbx]
         default: all
       extra_args:
         description: "Extra recipe arguments (hk/eza/aube: bench-short flags; other scenarios: --skip-clone, --retry)"
@@ -173,19 +173,14 @@ jobs:
           # pinned and runs only in the weekly reference (bench-sccache.yml);
           # under contention it took a third of the aube arm.
           hk='{"name":"hk","cmd":"bench-short hk 6 --context-samples 3 --contention-samples 3 --mbx mbx","dir":"bench-hk","timeout":120,"job_timeout":150,"min_free_gb":40,"runner":"kunobi-runners"}'
-          # hk with input predictions off: the control for the arm above, so
-          # the same nightly shows what predictions are worth (#1000).
-          hk_nopred='{"name":"hk-nopred","cmd":"bench hk-nopred --warm-same-tree","dir":"bench-hk-nopred","timeout":60,"job_timeout":90,"min_free_gb":40,"runner":"kunobi-runners"}'
-          # Same subject on the temporal axis: cold at the parent commit, then
-          # rebuild the child in the same worktree with the store warm.
-          hk_pull='{"name":"hk-pull","cmd":"bench hk-pull","dir":"bench-hk-pull","timeout":60,"job_timeout":90,"min_free_gb":40,"runner":"kunobi-runners"}'
           # The same hk shape through mbx, for a side-by-side comparison
           # (as firefox-sccache is for firefox). The workflow installs the
           # latest mbx release; the run records the version it measured.
           hk_mbx='{"name":"hk-mbx","cmd":"bench-mbx hk --warm-same-tree","dir":"bench-hk-mbx","timeout":60,"job_timeout":90,"min_free_gb":40,"runner":"kunobi-runners"}'
-          # Timing arms; hk-pull keeps exhaustive prediction verification.
+          # Next commit in the same worktree: cold at the parent, warm on the
+          # child. Predictions on, verification off. #1000 made that the
+          # default, so the predictions-off and verify-always arms are gone.
           hk_pull_perf='{"name":"hk-pull-perf","cmd":"bench hk-pull-perf","dir":"bench-hk-pull-perf","timeout":60,"job_timeout":90,"min_free_gb":40,"runner":"kunobi-runners"}'
-          hk_pull_nopred='{"name":"hk-pull-nopred","cmd":"bench hk-pull-nopred","dir":"bench-hk-pull-nopred","timeout":60,"job_timeout":90,"min_free_gb":40,"runner":"kunobi-runners"}'
           hk_pull_mbx='{"name":"hk-pull-mbx","cmd":"bench-mbx hk-pull","dir":"bench-hk-pull-mbx","timeout":60,"job_timeout":90,"min_free_gb":40,"runner":"kunobi-runners"}'
           # eza: the smallest subject and the only one built through a fat-LTO
           # release profile, so the final unit is one whole-program codegen
@@ -217,13 +212,10 @@ jobs:
             cuda-oxide)           inc="[$cuda_oxide]" ;;
             cuda-oxide-patched)   inc="[$cuda_oxide_patched]" ;;
             llvm)                 inc="[$llvm]" ;;
-            hk-comparison)       inc="[$hk,$hk_nopred,$hk_pull_perf,$hk_pull_nopred,$hk_pull_mbx]" ;;
+            hk-comparison)       inc="[$hk,$hk_pull_perf,$hk_pull_mbx]" ;;
             hk)                   inc="[$hk]" ;;
-            hk-nopred)            inc="[$hk_nopred]" ;;
-            hk-pull)              inc="[$hk_pull]" ;;
             hk-mbx)               inc="[$hk_mbx]" ;;
             hk-pull-perf)         inc="[$hk_pull_perf]" ;;
-            hk-pull-nopred)       inc="[$hk_pull_nopred]" ;;
             hk-pull-mbx)          inc="[$hk_pull_mbx]" ;;
             eza)                  inc="[$eza]" ;;
             aube)                 inc="[$aube]" ;;
@@ -244,7 +236,7 @@ jobs:
             # so the Linux matrix is EMPTY for them (an empty include
             # skips the `bench` job cleanly). Without this they'd fall to `*)`
             # and wastefully run the whole Linux `all` matrix alongside.
-            *)                    inc="[$surrealdb,$lance,$opendal,$kobe,$cuda_oxide,$cuda_oxide_patched,$llvm,$hk,$hk_nopred,$hk_pull,$hk_pull_perf,$hk_pull_nopred,$hk_pull_mbx,$eza,$aube,$surrealdb_mbx]" ;;
+            *)                    inc="[$surrealdb,$lance,$opendal,$kobe,$cuda_oxide,$cuda_oxide_patched,$llvm,$hk,$hk_pull_perf,$hk_pull_mbx,$eza,$aube,$surrealdb_mbx]" ;;
           esac
           if [ "$EVENT_NAME" = "schedule" ]; then
             inc="$(jq -c --argjson extra "[$firefox,$firefox_pull]" '. + $extra' <<<"$inc")"

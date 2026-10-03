@@ -14,9 +14,10 @@
 //! kache's build script), not a shell script: a shell drops environment
 //! variables whose names are not shell identifiers, and Cargo's `DEP_*`
 //! metadata variables can be spelled that way.
-//! kache then restores `OUT_DIR` and the script's stdout/stderr from the cache
-//! when the run's inputs match a recorded run, and otherwise runs the real
-//! script and records the result.
+//! kache then restores `OUT_DIR`, the files the script named under the target
+//! directory outside `OUT_DIR`, and the script's stdout/stderr when the run's
+//! inputs match a recorded run. Otherwise it runs the real script and records
+//! the result.
 //!
 //! The inputs are the ones Cargo itself uses to decide whether a script must
 //! rerun: the script binary, the environment Cargo provides, and the
@@ -26,6 +27,13 @@
 //! rules is no less correct than Cargo skipping the rerun, which is what it
 //! does with a warm target directory. Entries stay in the local store; they
 //! are never published to a remote.
+//!
+//! The named files are the link search paths and `-L` flags in the script's
+//! stdout. A directory Cargo fills itself (`deps`, `incremental`, `build`,
+//! `.fingerprint`, `examples`) is not part of the run, and a path outside the
+//! target directory is left where it is. Those files share `OUT_DIR`'s size
+//! cap. When they do not fit, the run is not recorded and a later checkout
+//! runs the script.
 
 use crate::args::RustcArgs;
 use crate::cache_key::FileHashStats;
@@ -41,6 +49,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 mod hermetic;
+mod outside;
 
 /// Set by the launcher to the path Cargo invoked, which is where the preserved
 /// binary lives beside.
@@ -1340,7 +1349,7 @@ impl Run {
         let manifest: Manifest =
             serde_json::from_slice(&std::fs::read(self.store.blob_path(&manifest.hash))?)?;
         anyhow::ensure!(
-            matches!(manifest.version, 1..=3),
+            matches!(manifest.version, 1..=outside::MANIFEST_VERSION),
             "unsupported build-script manifest"
         );
         let rewritten: BTreeSet<&str> = manifest.rewritten.iter().map(String::as_str).collect();
@@ -1401,6 +1410,7 @@ impl Run {
         for symlink in &manifest.symlinks {
             restore_symlink(out_dir, symlink)?;
         }
+        size += outside::restore(&self.store, &self.environment, meta, &manifest, &rewritten)?;
         replay(
             &self.environment.denormalize(manifest.stdout.as_bytes()),
             &self.environment.denormalize(manifest.stderr.as_bytes()),
@@ -1476,6 +1486,12 @@ impl Run {
             empty_files,
             symlinks,
         } = collect_out_dir(&self.environment.out_dir)?;
+        let (used_bytes, used_entries) = outside::out_dir_share(&files, &symlinks)?;
+        let mut outside_outputs =
+            outside::collect(stdout_text, &self.environment, used_bytes, used_entries)?;
+        let has_outside = !outside_outputs.is_empty();
+        let mut files = files;
+        files.extend(std::mem::take(&mut outside_outputs.files));
         let staging = tempfile::Builder::new()
             .prefix("kache-build-script-")
             .tempdir()?;
@@ -1495,21 +1511,23 @@ impl Run {
         let key = self.action_key(&prediction)?;
         let key_ms = key_start.elapsed().as_millis() as u64;
         let manifest = Manifest {
-            // Version 1 readers would restore the placeholders verbatim, and
-            // version 2 readers would leave the symlinks out.
-            version: if !symlinks.is_empty() {
-                3
-            } else if rewritten.is_empty() {
-                1
-            } else {
-                2
-            },
+            // Version 1 would restore placeholders verbatim, version 2 would
+            // leave symlinks out, and version 3 would replay a link search
+            // without the files it names outside OUT_DIR.
+            version: outside::manifest_version(
+                !symlinks.is_empty(),
+                !rewritten.is_empty(),
+                has_outside,
+            ),
             directories: manifest_dirs,
             empty_files,
             symlinks,
             stdout: String::from_utf8_lossy(&self.environment.normalize(stdout)).into_owned(),
             stderr: String::from_utf8_lossy(&self.environment.normalize(stderr)).into_owned(),
             rewritten,
+            outside_directories: outside_outputs.directories,
+            outside_empty_files: outside_outputs.empty_files,
+            outside_symlinks: outside_outputs.symlinks,
         };
         let manifest_path = staging.path().join(MANIFEST_NAME);
         std::fs::write(&manifest_path, serde_json::to_vec(&manifest)?)?;
@@ -1610,6 +1628,14 @@ struct Manifest {
     /// Symlinks that stay inside `OUT_DIR` (version 3).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     symlinks: Vec<Symlink>,
+    /// Directories under the target directory, outside `OUT_DIR`, that the
+    /// script named. Version 4. Absent on a manifest written before that.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    outside_directories: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    outside_empty_files: Vec<EmptyFile>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    outside_symlinks: Vec<Symlink>,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -3525,6 +3551,381 @@ mod tests {
         assert_eq!(std::fs::read(&link).unwrap(), b"\x7fELF\0");
     }
 
+    fn two_targets(dir: &Path) -> (Run, Run) {
+        let config = crate::test_support::test_config(dir.join("cache"));
+        let make = |name: &str| {
+            let environment = checkout_environment(&dir.join(name), &dir.join("cargo"));
+            std::fs::create_dir_all(&environment.manifest_dir).unwrap();
+            std::fs::write(environment.manifest_dir.join("build.rs"), "fn main() {}").unwrap();
+            Run {
+                store: Store::open(&config).unwrap(),
+                config: config.clone(),
+                binary_hash: "aaaa".to_string(),
+                environment,
+                start: std::time::Instant::now(),
+            }
+        };
+        (make("a/target"), make("b/target"))
+    }
+
+    /// A library the script names under the target directory, beside `OUT_DIR`,
+    /// is restored in the next checkout at that checkout's path. Cargo's `deps`
+    /// directory and a system directory named in the same stdout are not.
+    #[test]
+    fn a_named_library_outside_out_dir_is_restored_in_another_target() {
+        let mut lock = crate::test_support::process_state_test_lock();
+        let dir = lock.enter();
+        let (a, b) = two_targets(dir.as_path());
+        let obj = dir.as_path().join("a/target/debug/gn_out/obj");
+        let deps = dir.as_path().join("a/target/debug/deps");
+        std::fs::create_dir_all(&obj).unwrap();
+        std::fs::create_dir_all(&deps).unwrap();
+        let archive = b"!<arch>\nlib";
+        std::fs::write(obj.join("librusty_v8.a"), archive).unwrap();
+        std::fs::write(obj.join("note.txt"), format!("search={}\n", obj.display())).unwrap();
+        std::fs::write(deps.join("libcargo.a"), b"not-ours").unwrap();
+        std::fs::write(a.environment.out_dir.join("marker.txt"), "marker").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                obj.join("librusty_v8.a"),
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+        }
+        let stdout = format!(
+            "cargo:rerun-if-changed=build.rs\n\
+             cargo:rustc-link-search=native={}\n\
+             cargo:rustc-link-search=native={}\n\
+             cargo:rustc-link-search=/usr/lib\n",
+            obj.display(),
+            deps.display(),
+        );
+        let after = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+        a.record(stdout.as_bytes(), b"", 5, after).unwrap();
+
+        let prediction = b.prediction().unwrap().expect("the run was recorded");
+        let meta = b
+            .store
+            .get(&b.action_key(&prediction).unwrap())
+            .unwrap()
+            .expect("the same key in another target directory");
+        let manifest = stored_manifest(&b, &meta);
+        assert_eq!(
+            manifest.version, 4,
+            "older kache reruns instead of dangling"
+        );
+        assert!(
+            manifest
+                .stdout
+                .contains("${KACHE_TARGET_DIR}/debug/gn_out/obj")
+        );
+        assert!(!manifest.stdout.contains(obj.to_str().unwrap()));
+        assert!(
+            meta.files
+                .iter()
+                .any(|file| file.name == "outside/debug/gn_out/obj/librusty_v8.a"),
+            "the archive is stored"
+        );
+        assert!(
+            meta.files.iter().all(|file| !file.name.contains("/deps/")),
+            "deps is not stored"
+        );
+        let restored_bytes = b.restore(&meta).unwrap();
+        assert_eq!(
+            restored_bytes,
+            meta.files
+                .iter()
+                .filter(|file| file.name.starts_with(OUT_PREFIX)
+                    || file.name.starts_with(outside::PREFIX))
+                .map(|file| file.size)
+                .sum::<u64>(),
+            "the outside files count toward the restored size"
+        );
+        let restored = dir.as_path().join("b/target/debug/gn_out/obj");
+        assert_eq!(
+            std::fs::read(restored.join("librusty_v8.a")).unwrap(),
+            archive
+        );
+        assert_eq!(
+            std::fs::read_to_string(restored.join("note.txt")).unwrap(),
+            format!("search={}\n", restored.display())
+        );
+        assert_eq!(
+            std::fs::read_to_string(b.environment.out_dir.join("marker.txt")).unwrap(),
+            "marker"
+        );
+        assert!(
+            !dir.as_path()
+                .join("b/target/debug/deps/libcargo.a")
+                .exists()
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(restored.join("librusty_v8.a"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o111, 0o111, "the executable bit comes back");
+        }
+    }
+
+    #[test]
+    fn a_cargo_directory_or_a_stderr_path_is_not_part_of_the_recorded_run() {
+        let mut lock = crate::test_support::process_state_test_lock();
+        let dir = lock.enter();
+        let (a, b) = two_targets(dir.as_path());
+        let deps = dir.as_path().join("a/target/debug/deps");
+        std::fs::create_dir_all(&deps).unwrap();
+        std::fs::write(deps.join("libcargo.a"), b"not-ours").unwrap();
+        let after = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+        let stdout = format!(
+            "cargo:rerun-if-changed=build.rs\ncargo:rustc-link-search=native={}\n",
+            deps.display()
+        );
+        a.record(stdout.as_bytes(), b"", 5, after).unwrap();
+        let prediction = b.prediction().unwrap().expect("naming deps still records");
+        let meta = b
+            .store
+            .get(&b.action_key(&prediction).unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored_manifest(&b, &meta).version, 1);
+        b.restore(&meta).unwrap();
+        assert!(
+            !dir.as_path()
+                .join("b/target/debug/deps/libcargo.a")
+                .exists()
+        );
+
+        let (c, d) = two_targets(&dir.as_path().join("stderr"));
+        let obj = dir.as_path().join("stderr/a/target/debug/gn_out/obj");
+        std::fs::create_dir_all(&obj).unwrap();
+        std::fs::write(obj.join("librusty_v8.a"), b"arch").unwrap();
+        let stderr = format!("cargo:rustc-link-search={}\n", obj.display());
+        c.record(
+            b"cargo:rerun-if-changed=build.rs\n",
+            stderr.as_bytes(),
+            5,
+            after,
+        )
+        .unwrap();
+        let prediction = d.prediction().unwrap().unwrap();
+        let meta = d
+            .store
+            .get(&d.action_key(&prediction).unwrap())
+            .unwrap()
+            .unwrap();
+        assert!(
+            meta.files
+                .iter()
+                .all(|file| !file.name.starts_with("outside/")),
+            "stderr is not an instruction stream"
+        );
+        d.restore(&meta).unwrap();
+        assert!(
+            !dir.as_path()
+                .join("stderr/b/target/debug/gn_out/obj/librusty_v8.a")
+                .exists()
+        );
+    }
+
+    fn put_manifest(run: &Run, key: &str, json: &str) -> EntryMeta {
+        let path = run.environment.out_dir.join(MANIFEST_NAME);
+        std::fs::write(&path, json).unwrap();
+        run.store
+            .put_with_compile_time_independent(
+                key,
+                CRATE_NAME,
+                &["build-script".to_string()],
+                &[],
+                "",
+                "",
+                &[(path, MANIFEST_NAME.to_string())],
+                "",
+                "",
+                0,
+            )
+            .unwrap();
+        run.store.get(key).unwrap().unwrap()
+    }
+
+    #[test]
+    fn an_old_manifest_restores_without_outside_fields_or_a_target_directory() {
+        let mut lock = crate::test_support::process_state_test_lock();
+        let dir = lock.enter();
+        let out = dir.as_path().join("out");
+        std::fs::create_dir(&out).unwrap();
+        let config = crate::test_support::test_config(dir.as_path().join("cache"));
+        let run = Run {
+            store: Store::open(&config).unwrap(),
+            config,
+            binary_hash: "aaaa".to_string(),
+            environment: environment(&out, &dir.as_path().join("pkg")),
+            start: std::time::Instant::now(),
+        };
+        let meta = put_manifest(
+            &run,
+            "old",
+            r#"{"version":1,"directories":["gen"],"empty_files":[],"stdout":"cargo:rustc-cfg=x\n","stderr":""}"#,
+        );
+        run.restore(&meta).unwrap();
+        assert!(out.join("gen").is_dir());
+    }
+
+    #[test]
+    fn a_manifest_version_outside_the_known_range_is_refused() {
+        let mut lock = crate::test_support::process_state_test_lock();
+        let dir = lock.enter();
+        let config = crate::test_support::test_config(dir.as_path().join("cache"));
+        let run = Run {
+            store: Store::open(&config).unwrap(),
+            config,
+            binary_hash: "aaaa".to_string(),
+            environment: checkout_environment(
+                &dir.as_path().join("target"),
+                &dir.as_path().join("cargo"),
+            ),
+            start: std::time::Instant::now(),
+        };
+        for version in [0, 5] {
+            let meta = put_manifest(
+                &run,
+                &format!("v{version}"),
+                &format!(
+                    r#"{{"version":{version},"directories":[],"empty_files":[],"stdout":"","stderr":""}}"#
+                ),
+            );
+            let error = run.restore(&meta).unwrap_err().to_string();
+            assert!(error.contains("unsupported"), "{error}");
+        }
+    }
+
+    #[test]
+    fn a_missing_outside_blob_is_not_replayed() {
+        let mut lock = crate::test_support::process_state_test_lock();
+        let dir = lock.enter();
+        let (a, b) = two_targets(dir.as_path());
+        let obj = dir.as_path().join("a/target/debug/gn_out/obj");
+        std::fs::create_dir_all(&obj).unwrap();
+        std::fs::write(obj.join("librusty_v8.a"), b"arch").unwrap();
+        let stdout = format!(
+            "cargo:rerun-if-changed=build.rs\ncargo:rustc-link-search={}\n",
+            obj.display()
+        );
+        let after = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+        a.record(stdout.as_bytes(), b"", 5, after).unwrap();
+        let prediction = b.prediction().unwrap().unwrap();
+        let meta = b
+            .store
+            .get(&b.action_key(&prediction).unwrap())
+            .unwrap()
+            .unwrap();
+        let archive = meta
+            .files
+            .iter()
+            .find(|file| file.name == "outside/debug/gn_out/obj/librusty_v8.a")
+            .unwrap();
+        std::fs::remove_file(b.store.blob_path(&archive.hash)).unwrap();
+        let error = b.restore(&meta).unwrap_err().to_string();
+        assert!(error.contains("evicted"), "{error}");
+        assert!(
+            !dir.as_path()
+                .join("b/target/debug/gn_out/obj/librusty_v8.a")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn an_outside_path_in_a_cargo_directory_or_above_the_target_is_not_restored() {
+        let mut lock = crate::test_support::process_state_test_lock();
+        let dir = lock.enter();
+        let config = crate::test_support::test_config(dir.as_path().join("cache"));
+        let run = Run {
+            store: Store::open(&config).unwrap(),
+            config,
+            binary_hash: "aaaa".to_string(),
+            environment: checkout_environment(
+                &dir.as_path().join("target"),
+                &dir.as_path().join("cargo"),
+            ),
+            start: std::time::Instant::now(),
+        };
+        let manifest = |directories: &str| {
+            format!(
+                r#"{{"version":4,"directories":[],"empty_files":[],"stdout":"","stderr":"","outside_directories":[{directories}]}}"#
+            )
+        };
+        let deps = put_manifest(&run, "deps", &manifest(r#""debug/deps/smuggled""#));
+        let error = run.restore(&deps).unwrap_err().to_string();
+        assert!(error.contains("debug/deps/smuggled"), "{error}");
+        assert!(!dir.as_path().join("target/debug/deps/smuggled").exists());
+
+        let escape = put_manifest(&run, "escape", &manifest(r#""../escape""#));
+        let error = run.restore(&escape).unwrap_err().to_string();
+        assert!(error.contains("../escape"), "{error}");
+        assert!(!dir.as_path().join("escape").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_outside_symlink_that_leaves_its_tree_is_not_recorded() {
+        let mut lock = crate::test_support::process_state_test_lock();
+        let dir = lock.enter();
+        let (a, _) = two_targets(dir.as_path());
+        let obj = dir.as_path().join("a/target/debug/gn_out/obj");
+        std::fs::create_dir_all(&obj).unwrap();
+        std::fs::write(obj.join("librusty_v8.so.1"), b"so").unwrap();
+        std::os::unix::fs::symlink("/usr/lib/libz.so", obj.join("escape")).unwrap();
+        let stdout = format!(
+            "cargo:rerun-if-changed=build.rs\ncargo:rustc-link-search={}\n",
+            obj.display()
+        );
+        let after = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+        let error = a
+            .record(stdout.as_bytes(), b"", 5, after)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("escape"), "{error}");
+        assert!(a.prediction().unwrap().is_none(), "the run was not stored");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_outside_symlink_inside_its_tree_is_restored() {
+        let mut lock = crate::test_support::process_state_test_lock();
+        let dir = lock.enter();
+        let (a, b) = two_targets(dir.as_path());
+        let obj = dir.as_path().join("a/target/debug/gn_out/obj");
+        std::fs::create_dir_all(&obj).unwrap();
+        std::fs::write(obj.join("librusty_v8.so.1"), b"so").unwrap();
+        std::os::unix::fs::symlink("librusty_v8.so.1", obj.join("librusty_v8.so")).unwrap();
+        let stdout = format!(
+            "cargo:rerun-if-changed=build.rs\ncargo:rustc-link-search={}\n",
+            obj.display()
+        );
+        let after = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+        a.record(stdout.as_bytes(), b"", 5, after).unwrap();
+        let prediction = b.prediction().unwrap().unwrap();
+        let meta = b
+            .store
+            .get(&b.action_key(&prediction).unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored_manifest(&b, &meta).version, 4);
+        b.restore(&meta).unwrap();
+        let link = dir
+            .as_path()
+            .join("b/target/debug/gn_out/obj/librusty_v8.so");
+        assert_eq!(
+            std::fs::read_link(&link).unwrap(),
+            Path::new("librusty_v8.so.1")
+        );
+        assert_eq!(std::fs::read(&link).unwrap(), b"so");
+    }
+
     /// `d/a -> ..` and `d/a/c -> ../x` each stay inside when every directory
     /// above them is real, but the second, created through the first, is
     /// `out/c -> ../x`. Recording never descends through a link, so only a
@@ -3556,6 +3957,9 @@ mod tests {
             stderr: String::new(),
             rewritten: Vec::new(),
             symlinks: vec![link("d/a", ".."), link("d/a/c", "../x")],
+            outside_directories: Vec::new(),
+            outside_empty_files: Vec::new(),
+            outside_symlinks: Vec::new(),
         };
         let manifest_path = dir.as_path().join(MANIFEST_NAME);
         std::fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();

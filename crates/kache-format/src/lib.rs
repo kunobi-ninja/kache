@@ -150,8 +150,9 @@ pub fn is_safe_artifact_name(name: &str) -> bool {
 }
 
 /// A cached artifact's `name` as the local writers may commit it: one normal
-/// path component (`rustc` and `cc` outputs), or the build-script form
-/// `out/<relative>` that `build_script.rs` stores OUT_DIR contents under.
+/// path component (`rustc` and `cc` outputs), or a build-script tree
+/// `out/<relative>` (`OUT_DIR`) or `outside/<relative>` (a file under the
+/// target directory that the script named from outside `OUT_DIR`).
 ///
 /// [`is_safe_artifact_name`] intentionally stays single-component: it guards
 /// the untrusted boundaries (remote import, restore), where a name is joined
@@ -159,9 +160,9 @@ pub fn is_safe_artifact_name(name: &str) -> bool {
 /// corresponding predicate for the local writers, so `Store::put` and the
 /// index checks over committed metadata agree on what an entry may contain.
 /// Both reject everything `Path::join` could escape with: rooted paths, `..`,
-/// `.`, and the empty name — and `out/` is only accepted with a component
-/// after it. Every consumer of that form strips the prefix and re-validates
-/// the relative path (`build_script.rs::checked_relative`).
+/// `.`, and the empty name — and a tree prefix is only accepted with a
+/// component after it. Every consumer of that form strips the prefix and
+/// re-validates the relative path (`build_script.rs::checked_relative`).
 pub fn is_safe_stored_artifact_name(name: &str) -> bool {
     use std::path::Component;
     let mut components = Path::new(name).components();
@@ -172,7 +173,7 @@ pub fn is_safe_stored_artifact_name(name: &str) -> bool {
     if !tail.iter().all(|c| matches!(c, Component::Normal(_))) {
         return false;
     }
-    if first == std::ffi::OsStr::new("out") {
+    if first == std::ffi::OsStr::new("out") || first == std::ffi::OsStr::new("outside") {
         !tail.is_empty()
     } else {
         tail.is_empty()
@@ -279,26 +280,33 @@ mod tests {
         assert!(!is_safe_artifact_name("./a"));
         assert!(!is_safe_artifact_name(".."));
     }
-    /// The local writers store one normal component (`rustc`/`cc`), or the
-    /// build-script `out/<relative>` form (`build_script.rs`). Both are valid
-    /// committed metadata; everything `Path::join` could escape with is not.
+    /// The local writers store one normal component (`rustc`/`cc`), or a
+    /// build-script tree `out/<relative>` or `outside/<relative>`. Both are
+    /// valid committed metadata; everything `Path::join` could escape with
+    /// is not.
     #[test]
-    fn is_safe_stored_artifact_name_allows_only_the_out_prefix_beyond_one_component() {
+    fn is_safe_stored_artifact_name_allows_only_build_script_trees_beyond_one_component() {
         assert!(is_safe_stored_artifact_name("libfoo-abc123.rlib"));
         assert!(is_safe_stored_artifact_name("foo.d"));
         assert!(is_safe_stored_artifact_name("out/asm.s"));
         assert!(is_safe_stored_artifact_name("out/nested/asm.o"));
+        assert!(is_safe_stored_artifact_name(
+            "outside/debug/gn_out/obj/lib.a"
+        ));
         assert!(!is_safe_stored_artifact_name(""));
         assert!(!is_safe_stored_artifact_name("/etc/passwd"));
         assert!(!is_safe_stored_artifact_name("../escape"));
         assert!(!is_safe_stored_artifact_name(".."));
         assert!(!is_safe_stored_artifact_name("./a"));
         assert!(!is_safe_stored_artifact_name("a/b"));
-        // A directory the writer never names: `out/` always carries a file.
+        // A directory the writer never names: a tree prefix always carries a file.
         assert!(!is_safe_stored_artifact_name("out"));
         assert!(!is_safe_stored_artifact_name("out/"));
+        assert!(!is_safe_stored_artifact_name("outside"));
+        assert!(!is_safe_stored_artifact_name("outside/"));
         // The prefix does not license the traversal the strict predicate bans.
         assert!(!is_safe_stored_artifact_name("out/../escape"));
+        assert!(!is_safe_stored_artifact_name("outside/../escape"));
     }
     /// kunobi-ninja/kache#325: the lookup gate is superset-tolerant, skips empty
     /// (pre-gate) entries, and rejects genuinely-missing kinds.

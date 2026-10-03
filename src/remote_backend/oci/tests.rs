@@ -21,6 +21,11 @@ struct RegistryState {
     authorization: Option<String>,
     metadata_override: Option<(Bytes, bool)>,
     bad_manifest_digest: bool,
+    token_generation: Option<usize>,
+    token_requests: usize,
+    bad_published_digest: bool,
+    upload_location: Option<String>,
+    upload_query: Option<String>,
 }
 
 struct Registry {
@@ -96,6 +101,13 @@ async fn handle(
         .get("authorization")
         .and_then(|value| value.to_str().ok())
         .map(str::to_string);
+    let host = request
+        .headers()
+        .get("host")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
     let path = uri.path();
     let query: HashMap<_, _> = reqwest::Url::parse(&format!("http://registry{uri}"))
         .unwrap()
@@ -105,7 +117,56 @@ async fn handle(
     let body = to_bytes(request.into_body(), 16 << 20).await.unwrap();
     let mut state = shared.lock().unwrap();
     state.requests.push((method.clone(), path.to_string()));
-    if state.authorization.is_some() && state.authorization != authorization {
+    if path == "/v2/" && state.token_generation.is_some() {
+        return Response::builder()
+            .status(401)
+            .header(
+                "www-authenticate",
+                format!("Bearer realm=\"http://{host}/tokens\",service=\"registry\""),
+            )
+            .body(Body::empty())
+            .unwrap();
+    }
+    if path == "/tokens" {
+        assert_eq!(authorization.as_deref(), Some("Basic dXNlcjpwYXNz"));
+        assert!(matches!(
+            query.get("scope").map(String::as_str),
+            Some("repository:team/cache:pull" | "repository:team/cache:pull,push")
+        ));
+        state.token_requests += 1;
+        return response(
+            200,
+            serde_json::to_vec(
+                &serde_json::json!({"token":format!("issued-{}", state.token_generation.unwrap())}),
+            )
+            .unwrap(),
+        );
+    }
+    if path == "/incoming" {
+        assert!(
+            authorization.is_none(),
+            "credentials leaked to an upload host"
+        );
+        state.upload_query = uri.query().map(str::to_string);
+        let digest = ImageLayer::new(body, String::new(), None).sha256_digest();
+        return Response::builder()
+            .status(201)
+            .header("docker-content-digest", digest)
+            .body(Body::empty())
+            .unwrap();
+    }
+    if path == "/redirect-loop" {
+        return Response::builder()
+            .status(302)
+            .header("location", path)
+            .body(Body::empty())
+            .unwrap();
+    }
+    let required_auth = state
+        .token_generation
+        .map(|generation| format!("Bearer issued-{generation}"))
+        .or_else(|| state.authorization.clone());
+    if required_auth.is_some() && required_auth != authorization {
         return Response::builder()
             .status(401)
             .header("www-authenticate", "Basic realm=registry")
@@ -146,7 +207,11 @@ async fn handle(
                     "manifest published before blob"
                 );
             }
-            let digest = ImageLayer::new(body.clone(), String::new(), None).sha256_digest();
+            let digest = if state.bad_published_digest {
+                "sha256:wrong".into()
+            } else {
+                ImageLayer::new(body.clone(), String::new(), None).sha256_digest()
+            };
             state.manifests.insert(tag.to_string(), body);
             return Response::builder()
                 .status(201)
@@ -193,7 +258,13 @@ async fn handle(
         state.uploads.insert(id.clone(), Vec::new());
         return Response::builder()
             .status(202)
-            .header("location", format!("{path}{id}"))
+            .header(
+                "location",
+                state
+                    .upload_location
+                    .clone()
+                    .unwrap_or_else(|| format!("{path}{id}")),
+            )
             .header("range", "0-0")
             .body(Body::empty())
             .unwrap();
@@ -221,7 +292,14 @@ async fn handle(
             return Response::builder()
                 .status(201)
                 .header("location", format!("/v2/team/cache/blobs/{digest}"))
-                .header("docker-content-digest", digest)
+                .header(
+                    "docker-content-digest",
+                    if state.bad_published_digest {
+                        "sha256:wrong"
+                    } else {
+                        digest.as_str()
+                    },
+                )
                 .body(Body::empty())
                 .unwrap();
         }
@@ -243,14 +321,11 @@ async fn handle(
 
 #[test]
 fn keys_have_stable_tags_and_reject_ambiguous_paths() {
-    assert_eq!(
-        object_tag("hello"),
-        "kache-v1-ea8f163db38682925e4491c5e58d4bb3506ef8c14eb78a86e908c5624a67200f"
-    );
+    assert_eq!(object_tag("hello"), "kache-v2-b-aGVsbG8");
     assert_ne!(object_tag("a/b"), object_tag("a_b"));
     let key = "long/".repeat(500) + "object";
     validate_key(&key).unwrap();
-    assert_eq!(object_tag(&key).len(), 73);
+    assert_eq!(object_tag(&key).len(), 75);
     for key in [
         "", "/key", "key/", "a//b", "a/../b", "a/./b", "a\\b", "a\nb", " key",
     ] {
@@ -258,6 +333,403 @@ fn keys_have_stable_tags_and_reject_ambiguous_paths() {
     }
     assert!(validate_key(&"x".repeat(4096)).is_ok());
     assert!(validate_key(&"x".repeat(4097)).is_err());
+}
+
+#[test]
+fn short_and_digest_keys_are_recoverable_from_canonical_tags() {
+    for key in [
+        "plain/key".to_string(),
+        "unicode/é/🦀".to_string(),
+        "z".repeat(87),
+        format!(
+            "artifacts/v3/manifests/unicode_normalization/{}.json",
+            "a1".repeat(32)
+        ),
+        "a".repeat(63),
+        "a".repeat(64),
+        "a".repeat(65),
+        "a".repeat(128),
+    ] {
+        let tag = object_tag(&key);
+        assert!(tag.len() <= 128);
+        assert_eq!(tag_key(&tag).unwrap(), Some(key));
+    }
+    assert_eq!(object_tag(&"z".repeat(87)).len(), 127);
+    let long = object_tag(&"z".repeat(88));
+    assert!(long.starts_with("kache-v2-h-"));
+    assert_eq!(tag_key(&long).unwrap(), None);
+    let encode = |bytes: &[u8]| {
+        format!(
+            "kache-v2-b-{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+        )
+    };
+    assert_eq!(
+        tag_key(&encode(&[0])).unwrap_err().to_string(),
+        "truncated OCI object tag digest"
+    );
+    assert_eq!(
+        tag_key(&encode(&[0; 32])).unwrap_err().to_string(),
+        "truncated OCI object tag digest"
+    );
+    assert_eq!(tag_key(&encode(&[0; 33])).unwrap(), Some("0".repeat(64)));
+    assert_eq!(
+        tag_key(&encode(&[b'z'; 88])).unwrap_err().to_string(),
+        "OCI object tag too long"
+    );
+    assert_eq!(
+        tag_key(&encode(&[b'a'; 64])).unwrap_err().to_string(),
+        "noncanonical OCI object tag"
+    );
+    for invalid in [
+        encode(&[255]),
+        encode(b"a/../b"),
+        "kache-v2-b-!".to_string(),
+    ] {
+        assert!(tag_key(&invalid).is_err());
+    }
+    for byte in b"09af" {
+        assert!(is_lower_hex(*byte));
+    }
+    for byte in b"/:`gAF" {
+        assert!(!is_lower_hex(*byte));
+    }
+}
+
+#[test]
+fn only_repository_sha256_digests_are_accepted() {
+    validate_blob_digest(&format!("sha256:{}", "a".repeat(64))).unwrap();
+    for digest in [
+        format!("sha256:{}", "a".repeat(63)),
+        format!("sha256:{}", "a".repeat(65)),
+        format!("sha256:{}", "g".repeat(64)),
+        format!("sha256:{}", "A".repeat(64)),
+        format!("sha512:{}", "a".repeat(128)),
+        "sha256:../elsewhere".into(),
+    ] {
+        assert!(validate_blob_digest(&digest).is_err(), "{digest}");
+    }
+}
+
+#[tokio::test]
+async fn warm_requests_skip_auth_discovery_and_listing_skips_manifests() {
+    let registry = Registry::start().await;
+    let backend = registry.backend();
+    backend
+        .put("metadata/key", b"{}".to_vec(), Some("application/json"))
+        .await
+        .unwrap();
+    assert_eq!(registry.state.lock().unwrap().requests.len(), 6);
+    backend.get("metadata/key", Some(2)).await.unwrap().unwrap();
+    registry.state.lock().unwrap().requests.clear();
+    backend.get("metadata/key", Some(2)).await.unwrap().unwrap();
+    assert_eq!(registry.state.lock().unwrap().requests.len(), 1);
+    assert!(
+        registry.state.lock().unwrap().requests[0]
+            .1
+            .contains("/manifests/")
+    );
+    registry.state.lock().unwrap().requests.clear();
+    backend.put("packs/new", vec![7; 1024], None).await.unwrap();
+    assert_eq!(registry.state.lock().unwrap().requests.len(), 4);
+    assert!(
+        registry
+            .state
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .all(|(method, path)| *method != Method::PATCH && path != "/v2/")
+    );
+    registry.state.lock().unwrap().requests.clear();
+    backend.get("packs/new", Some(1024)).await.unwrap().unwrap();
+    assert_eq!(registry.state.lock().unwrap().requests.len(), 2);
+    for i in 0..8 {
+        backend
+            .put(&format!("packs/{i}"), vec![i; 1024], None)
+            .await
+            .unwrap();
+    }
+    registry.state.lock().unwrap().requests.clear();
+    assert_eq!(backend.list("metadata/").await.unwrap(), ["metadata/key"]);
+    assert_eq!(registry.state.lock().unwrap().requests.len(), 11);
+    assert!(
+        registry
+            .state
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .all(|(method, path)| *method == Method::GET && path.ends_with("/tags/list"))
+    );
+    registry.state.lock().unwrap().requests.clear();
+    backend.put("packs/new", vec![7; 1024], None).await.unwrap();
+    assert_eq!(registry.state.lock().unwrap().requests.len(), 2);
+}
+
+#[tokio::test]
+async fn embedded_json_has_a_small_cap_and_is_verified_before_writing() {
+    let registry = Registry::start().await;
+    let backend = registry.backend();
+    for size in [0, 16_384, 16_385] {
+        let key = format!("metadata/{size}");
+        backend
+            .put(&key, vec![b' '; size], Some("application/json"))
+            .await
+            .unwrap();
+        {
+            let state = registry.state.lock().unwrap();
+            let manifest: serde_json::Value =
+                serde_json::from_slice(&state.manifests[&object_tag(&key)]).unwrap();
+            assert_eq!(manifest["layers"][0].get("data").is_some(), size <= 16_384);
+        }
+        assert_eq!(
+            backend
+                .get(&key, Some(size as u64))
+                .await
+                .unwrap()
+                .unwrap()
+                .body
+                .len(),
+            size
+        );
+    }
+    backend
+        .put("bad", b"{}".to_vec(), Some("application/json"))
+        .await
+        .unwrap();
+    let original = registry.state.lock().unwrap().manifests[&object_tag("bad")].clone();
+    let mut oversized: serde_json::Value = serde_json::from_slice(&original).unwrap();
+    oversized["layers"][0]["size"] = 16_385.into();
+    registry.state.lock().unwrap().manifests.insert(
+        object_tag("bad"),
+        serde_json::to_vec(&oversized).unwrap().into(),
+    );
+    assert_eq!(
+        backend.get("bad", None).await.unwrap_err().to_string(),
+        "OCI embedded object too large"
+    );
+    for (value, message) in [
+        (serde_json::json!("!"), "invalid OCI embedded data"),
+        (
+            serde_json::json!("e30=".repeat(6000)),
+            "OCI embedded object too large",
+        ),
+        (serde_json::json!("eA=="), "truncated"),
+        (serde_json::json!("eHg="), "digest mismatch"),
+        (serde_json::json!(12), "invalid OCI embedded data"),
+    ] {
+        let mut manifest: serde_json::Value = serde_json::from_slice(&original).unwrap();
+        manifest["layers"][0]["data"] = value;
+        registry.state.lock().unwrap().manifests.insert(
+            object_tag("bad"),
+            serde_json::to_vec(&manifest).unwrap().into(),
+        );
+        let mut output = Vec::new();
+        let error = backend
+            .get_into("bad", Some(2), &mut output)
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains(message), "{error:#}");
+        assert!(output.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn expired_tokens_refresh_once_and_parallel_reads_share_the_replacement() {
+    let registry = Registry::start().await;
+    registry.state.lock().unwrap().token_generation = Some(1);
+    let backend = OciBackend::with_auth(
+        &registry.config,
+        RegistryAuth::Basic("user".into(), "pass".into()),
+    )
+    .unwrap();
+    backend
+        .put("key", b"{}".to_vec(), Some("application/json"))
+        .await
+        .unwrap();
+    backend.get("key", Some(2)).await.unwrap().unwrap();
+    assert_eq!(registry.state.lock().unwrap().token_requests, 2); // One per permission scope.
+    registry.state.lock().unwrap().token_generation = Some(2);
+    let reads = (0..8).map(|_| backend.get("key", Some(2)));
+    for result in futures::future::join_all(reads).await {
+        assert_eq!(result.unwrap().unwrap().body, "{}");
+    }
+    assert_eq!(registry.state.lock().unwrap().token_requests, 3);
+    backend
+        .put("other", b"{}".to_vec(), Some("application/json"))
+        .await
+        .unwrap();
+    assert_eq!(registry.state.lock().unwrap().token_requests, 4);
+    registry.state.lock().unwrap().requests.clear();
+    let invalid =
+        OciBackend::with_auth(&registry.config, RegistryAuth::Bearer("wrong".into())).unwrap();
+    assert!(invalid.head("key").await.is_err());
+    assert_eq!(registry.state.lock().unwrap().requests.len(), 2);
+}
+
+#[tokio::test]
+async fn uploaded_digests_are_checked_and_external_uploads_do_not_receive_credentials() {
+    let registry = Registry::start().await;
+    let backend = registry.backend();
+    registry.state.lock().unwrap().bad_published_digest = true;
+    assert!(
+        backend
+            .put("key", b"hello".to_vec(), None)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("published digest mismatch")
+    );
+    registry.state.lock().unwrap().bad_published_digest = false;
+    backend.put("key", b"hello".to_vec(), None).await.unwrap();
+    registry.state.lock().unwrap().bad_published_digest = true;
+    assert!(
+        backend
+            .put("key", b"hello".to_vec(), None)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("published digest mismatch")
+    );
+    registry.state.lock().unwrap().bad_published_digest = false;
+    let external = Registry::start().await;
+    registry.state.lock().unwrap().upload_location = Some(format!(
+        "http://{}/incoming?ticket=keep",
+        external.config.repository.split('/').next().unwrap()
+    ));
+    registry.state.lock().unwrap().authorization = Some("Basic dXNlcjpwYXNz".into());
+    let authenticated = OciBackend::with_auth(
+        &registry.config,
+        RegistryAuth::Basic("user".into(), "pass".into()),
+    )
+    .unwrap();
+    let digest = ImageLayer::new(b"external".as_slice(), String::new(), None).sha256_digest();
+    authenticated
+        .transport
+        .put_blob(Bytes::from_static(b"external"), &digest)
+        .await
+        .unwrap();
+    let query = external.state.lock().unwrap().upload_query.clone().unwrap();
+    assert!(query.contains("ticket=keep"));
+    assert!(query.contains("digest=sha256%3A"));
+    for location in [
+        "file:///tmp/object",
+        "http://user:secret@localhost/object",
+        "http://localhost/object#fragment",
+    ] {
+        registry.state.lock().unwrap().upload_location = Some(location.into());
+        assert_eq!(
+            authenticated
+                .transport
+                .put_blob(Bytes::from_static(b"invalid"), "sha256:unused")
+                .await
+                .unwrap_err()
+                .to_string(),
+            "invalid OCI upload Location"
+        );
+    }
+}
+
+#[tokio::test]
+async fn request_deadlines_and_redirects_preserve_transport_policy() {
+    let registry = Registry::start().await;
+    let backend = registry.backend();
+    let url = reqwest::Url::parse(&format!("{}/manifests/key", backend.base_url)).unwrap();
+    for metadata in [true, false] {
+        let request = backend
+            .transport
+            .build_request(
+                &Method::PUT,
+                &url,
+                &Some(Bytes::from_static(b"body")),
+                Some("application/octet-stream"),
+                metadata,
+                &Some("token".into()),
+            )
+            .unwrap();
+        assert_eq!(
+            request.timeout().copied(),
+            if metadata {
+                Some(std::time::Duration::from_secs(60))
+            } else {
+                None
+            }
+        );
+        assert_eq!(request.method(), Method::PUT);
+        assert_eq!(request.headers()["authorization"], "Bearer token");
+        assert_eq!(
+            request.headers()["content-type"],
+            "application/octet-stream"
+        );
+        assert_eq!(request.body().unwrap().as_bytes(), Some(b"body".as_slice()));
+    }
+    let redirect_url = format!(
+        "http://{}/redirect-loop",
+        registry.config.repository.split('/').next().unwrap()
+    );
+    let error = backend
+        .transport
+        .request(
+            Method::GET,
+            &redirect_url,
+            RegistryOperation::Pull,
+            None,
+            None,
+            true,
+        )
+        .await
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("too many OCI redirects"));
+    assert_eq!(
+        registry
+            .state
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .filter(|(_, path)| path == "/redirect-loop")
+            .count(),
+        10
+    );
+    let mut secure = registry.config.clone();
+    secure.insecure = false;
+    let secure = OciBackend::with_auth(&secure, RegistryAuth::Anonymous).unwrap();
+    let error = secure
+        .transport
+        .request(
+            Method::GET,
+            &redirect_url,
+            RegistryOperation::Pull,
+            None,
+            None,
+            true,
+        )
+        .await
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("requires HTTPS"));
+    let external = Registry::start().await;
+    external.state.lock().unwrap().authorization = Some("Bearer private".into());
+    let external_url = format!(
+        "http://{}/private",
+        external.config.repository.split('/').next().unwrap()
+    );
+    registry.state.lock().unwrap().requests.clear();
+    let response = backend
+        .transport
+        .request(
+            Method::GET,
+            &external_url,
+            RegistryOperation::Pull,
+            None,
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+    assert_eq!(external.state.lock().unwrap().requests.len(), 1);
+    assert!(registry.state.lock().unwrap().requests.is_empty());
 }
 
 #[tokio::test]
@@ -325,7 +797,7 @@ async fn objects_round_trip_over_oci_and_expose_their_artifact_format() {
         state
             .requests
             .iter()
-            .any(|(method, path)| *method == Method::PATCH && path.contains("/blobs/uploads/"))
+            .any(|(method, path)| *method == Method::PUT && path.contains("/blobs/uploads/"))
     );
 }
 
@@ -422,8 +894,9 @@ async fn reads_enforce_advertised_and_streamed_sizes_and_verify_digests() {
 async fn invalid_artifacts_and_pagination_are_rejected() {
     let registry = Registry::start().await;
     let backend = registry.backend();
-    backend.put("key", b"hello".to_vec(), None).await.unwrap();
-    let original = registry.state.lock().unwrap().manifests[&object_tag("key")].clone();
+    let key = "long/".repeat(30) + "key";
+    backend.put(&key, b"hello".to_vec(), None).await.unwrap();
+    let original = registry.state.lock().unwrap().manifests[&object_tag(&key)].clone();
     let edits: [fn(&mut OciImageManifest); 7] = [
         |manifest| manifest.schema_version = 1,
         |manifest| manifest.artifact_type = None,
@@ -445,10 +918,10 @@ async fn invalid_artifacts_and_pagination_are_rejected() {
             .lock()
             .unwrap()
             .manifests
-            .insert(object_tag("key"), original.clone());
-        registry.edit_manifest("key", edit);
-        assert!(backend.head("key").await.is_err());
-        assert!(backend.get("key", Some(5)).await.is_err());
+            .insert(object_tag(&key), original.clone());
+        registry.edit_manifest(&key, edit);
+        assert!(backend.head(&key).await.is_err());
+        assert!(backend.get(&key, Some(5)).await.is_err());
         assert!(backend.list("").await.is_err());
     }
     registry
@@ -456,7 +929,7 @@ async fn invalid_artifacts_and_pagination_are_rejected() {
         .lock()
         .unwrap()
         .manifests
-        .insert(object_tag("key"), original);
+        .insert(object_tag(&key), original);
     registry.state.lock().unwrap().repeat_page = true;
     assert!(
         backend
@@ -471,7 +944,7 @@ async fn invalid_artifacts_and_pagination_are_rejected() {
         "unrelated-tag".to_string(),
         Bytes::from_static(b"not a kache artifact"),
     );
-    assert_eq!(backend.list("").await.unwrap(), ["key"]);
+    assert_eq!(backend.list("").await.unwrap(), [key]);
 }
 
 #[tokio::test]

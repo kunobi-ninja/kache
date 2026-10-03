@@ -2,6 +2,7 @@
 
 use crate::config::Config;
 use crate::events::{self, BuildEvent};
+use crate::term;
 use crate::tui_sessions::{self, Session};
 use anyhow::Result;
 use std::collections::BTreeMap;
@@ -34,6 +35,8 @@ impl DiffBody {
 
     pub(crate) fn text(&self) -> String {
         let mut lines = vec![
+            term::heading("kache · build comparison"),
+            String::new(),
             format!("root {}", self.root),
             format!("misses {} -> {}", self.earlier_misses, self.later_misses),
             format!(

@@ -264,10 +264,10 @@ fn interactive_commands_refuse_captured_non_tty_output() {
 }
 
 #[test]
-fn json_rejects_unsupported_or_mutating_commands() {
+fn json_rejects_interactive_or_mutating_commands() {
     let e = env();
     e.cmd()
-        .args(["--json", "report"])
+        .args(["--json", "monitor"])
         .assert()
         .failure()
         .stderr(predicates::str::contains("is supported on"));
@@ -493,7 +493,10 @@ fn stats_announces_auto_start_and_warns_on_daemon_config_mismatch() {
                 "starting one inheriting this process's environment",
             )),
         )
-        .stdout(predicates::str::contains("of 1.0 GiB · "));
+        .stdout(
+            predicates::str::contains("1.0 GiB")
+                .and(predicates::str::contains("private cache budget")),
+        );
 
     // Same daemon, different CLI config: the daemon's cap still renders (it
     // is the value in effect), and the divergence is named on stderr.
@@ -504,7 +507,10 @@ fn stats_announces_auto_start_and_warns_on_daemon_config_mismatch() {
         .arg("stats")
         .assert()
         .success()
-        .stdout(predicates::str::contains("of 1.0 GiB · "))
+        .stdout(
+            predicates::str::contains("1.0 GiB")
+                .and(predicates::str::contains("private cache budget")),
+        )
         .stderr(
             predicates::str::contains("local_max_size=1.0 GiB")
                 .and(predicates::str::contains("says 2.0 GiB"))
@@ -527,7 +533,10 @@ fn stats_announces_auto_start_and_warns_on_daemon_config_mismatch() {
         .arg("stats")
         .assert()
         .success()
-        .stdout(predicates::str::contains("of 1.0 GiB · "))
+        .stdout(
+            predicates::str::contains("1.0 GiB")
+                .and(predicates::str::contains("private cache budget")),
+        )
         .stderr(predicates::str::contains("local_store="));
 
     // A probe session must not leave its daemon behind.
@@ -802,7 +811,7 @@ fn stats_reports_lifetime_totals_from_the_savings_ledger() {
     assert_eq!(lifetime["pruned_automatic_bytes"], 3072);
     assert_eq!(lifetime["pruned_requested_bytes"], 2048);
     e.cmd().arg("stats").assert().success().stdout(
-        predicates::str::contains("lifetime")
+        predicates::str::contains("Lifetime")
             .and(predicates::str::contains(
                 "compile work avoided over 10 hits",
             ))
@@ -819,6 +828,9 @@ fn machine_readable_commands_emit_one_json_document() {
     let commands: &[&[&str]] = &[
         &["--json", "list"],
         &["--json", "stats"],
+        &["stats", "--full", "--json"],
+        &["report", "--json"],
+        &["init", "--check", "--no-service", "--no-shell", "--json"],
         &["--json", "gc"],
         &["--json", "clean"],
         &["--json", "targets"],
@@ -842,8 +854,155 @@ fn machine_readable_commands_emit_one_json_document() {
         let value: serde_json::Value = serde_json::from_slice(&output.stdout)
             .unwrap_or_else(|error| panic!("{args:?} did not emit clean JSON: {error}"));
         assert_eq!(value["schema_version"], 1, "{args:?}");
+        assert_eq!(value["success"], true, "{args:?}");
         assert!(value["command"].is_string(), "{args:?}");
     }
+}
+
+#[test]
+fn json_failures_emit_one_document_and_nonzero_exit() {
+    let e = env();
+    for (args, exit, code) in [
+        (vec!["--json", "unknown-command"], 2, "invalid_arguments"),
+        (
+            vec!["stats", "--json", "--unknown-option"],
+            2,
+            "invalid_arguments",
+        ),
+        (
+            vec!["stats", "--json", "--since", "soon"],
+            1,
+            "command_failed",
+        ),
+        (vec!["init", "--json"], 1, "command_failed"),
+        (vec!["monitor", "--json"], 1, "command_failed"),
+        (
+            vec!["stats", "--json", "--format", "github"],
+            1,
+            "command_failed",
+        ),
+    ] {
+        let output = e.cmd().args(&args).output().unwrap();
+        assert_eq!(output.status.code(), Some(exit), "{args:?}: {output:?}");
+        let body: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(body["schema_version"], 1);
+        assert_eq!(body["success"], false);
+        assert_eq!(body["error"]["code"], code);
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .is_some_and(|message| !message.is_empty())
+        );
+        assert!(body["error"]["causes"].is_array());
+        assert!(body["command"].is_string());
+    }
+    let output = e
+        .cmd()
+        .args(["report", "--json", "--output"])
+        .arg(&e.home)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let body: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(body["command"], "report");
+    assert_eq!(body["success"], false);
+}
+
+#[test]
+fn json_init_previews_without_writes_and_applies_without_prompts() {
+    let e = env();
+    let args = ["init", "--json", "--no-service", "--no-shell"];
+    let preview = e.cmd().args(args).arg("--check").output().unwrap();
+    assert!(preview.status.success(), "{preview:?}");
+    let body: serde_json::Value = serde_json::from_slice(&preview.stdout).unwrap();
+    assert_eq!(body["command"], "init");
+    assert_eq!(body["preview"], true);
+    assert_eq!(body["steps"][0]["action"], "configure");
+    assert_eq!(
+        body["steps"][0]["paths"][0],
+        e.home.join(".cargo/config.toml").to_str().unwrap()
+    );
+    assert!(body["daemon_running"].is_null());
+    assert!(!e.home.join(".cargo/config.toml").exists());
+    assert!(!e.cache.join("daemon.sock").exists());
+    let applied = e.cmd().args(args).arg("--yes").output().unwrap();
+    assert!(applied.status.success(), "{applied:?}");
+    let body: serde_json::Value = serde_json::from_slice(&applied.stdout).unwrap();
+    assert_eq!(body["success"], true);
+    assert_eq!(body["preview"], false);
+    assert_eq!(body["cargo_configured"], true);
+    assert_eq!(body["daemon_running"], true);
+    assert_eq!(body["service_installed"], false);
+    assert!(e.home.join(".cargo/config.toml").exists());
+    assert!(!e.home.join(".bashrc").exists());
+    assert!(!String::from_utf8_lossy(&applied.stderr).contains("[Y/n]"));
+}
+
+#[test]
+fn redirected_human_output_has_no_ansi_sequences() {
+    let e = env();
+    for args in [
+        vec!["stats"],
+        vec!["doctor"],
+        vec!["daemon", "status"],
+        vec!["init", "--check"],
+    ] {
+        let output = e.cmd().args(&args).output().unwrap();
+        assert!(output.status.success(), "{args:?}: {output:?}");
+        assert!(!output.stdout.contains(&0x1b), "{args:?}: {output:?}");
+    }
+}
+
+#[test]
+fn json_report_file_returns_a_receipt_on_stdout() {
+    let e = env();
+    let path = e.home.join("report.json");
+    let output = e
+        .cmd()
+        .args(["stats", "--full", "--json", "--output"])
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let receipt: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(receipt["command"], "stats");
+    assert_eq!(receipt["output"], path.to_str().unwrap());
+    assert_eq!(receipt["format"], "json");
+    let report: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    assert!(report["summary"].is_object());
+}
+
+#[test]
+fn json_help_and_version_are_machine_readable() {
+    let e = env();
+    let output = e.cmd().args(["--json", "--help"]).output().unwrap();
+    assert!(output.status.success());
+    let help: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(help["command"], "help");
+    assert_eq!(help["cli"]["name"], "kache");
+    let commands = help["cli"]["subcommands"].as_array().unwrap();
+    assert!(commands.iter().any(|command| command["name"] == "init"));
+    assert!(
+        !commands
+            .iter()
+            .any(|command| command["name"] == "test-runner")
+    );
+    let init = commands
+        .iter()
+        .find(|command| command["name"] == "init")
+        .unwrap();
+    assert!(
+        init["arguments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|arg| arg["long"] == "yes")
+    );
+    let output = e.cmd().args(["--json", "--version"]).output().unwrap();
+    assert!(output.status.success());
+    let version: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(version["command"], "version");
+    assert!(version["version"].is_string());
 }
 
 #[test]
@@ -1632,7 +1791,7 @@ fn init_updates_a_login_service_that_runs_another_binary() {
         .write_stdin("y\ny\n")
         .assert()
         .success()
-        .stdout(predicates::str::contains("Update service?"))
+        .stdout(predicates::str::contains("Background service: update"))
         .stdout(predicates::str::contains("Service installed"));
     let updated = std::fs::read_to_string(&unit).unwrap();
     assert!(
@@ -1660,7 +1819,7 @@ fn init_continues_when_the_login_service_cannot_be_installed() {
         .stdout(predicates::str::contains(
             "Login service: not installed (systemctl --user daemon-reload failed: refused)",
         ))
-        .stdout(predicates::str::contains("Start daemon now?"));
+        .stdout(predicates::str::contains("Background cache: running"));
     assert!(e.home.join(".cargo/config.toml").exists());
     assert!(!e.home.join(".config/systemd/user/kache.service").exists());
 }
@@ -1717,12 +1876,9 @@ fn init_exports_the_test_runner_for_the_host() {
     );
     assert!(!e.home.join(".bashrc").exists());
 
-    // C/C++ no, test pacing yes, daemon no.
-    let out = init(&e, &["--no-service"], None, "n\ny\nn\n");
-    assert!(
-        out.contains("Pace test binaries in new terminals?"),
-        "{out}"
-    );
+    // One answer enables the shell setup and test pacing together.
+    let out = init(&e, &["--no-service"], None, "y\n");
+    assert_eq!(out.matches("[Y/n]").count(), 1, "{out}");
     assert!(
         out.contains("Test pacing: configured for new terminals"),
         "{out}"
@@ -1734,16 +1890,16 @@ fn init_exports_the_test_runner_for_the_host() {
     let saved = bashrc(&e);
     assert!(saved.contains("# >>> kache test runner >>>"), "{saved}");
     assert!(saved.contains(&export), "{saved}");
-    assert!(!saved.contains("kache compiler cache"), "{saved}");
+    assert!(saved.contains("kache compiler cache"), "{saved}");
     let profile = std::fs::read_to_string(e.home.join(".bash_profile")).unwrap();
     assert!(profile.contains(&export), "{profile}");
 
     // Nothing to change on a rerun; the terminal decides what init reports.
-    let out = init(&e, &["--no-service"], Some("kache test-runner"), "n\nn\n");
+    let out = init(&e, &["--no-service"], Some("kache test-runner"), "y\n");
     assert!(out.contains("Test pacing: active"), "{out}");
     assert!(!out.contains("Pace test binaries"), "{out}");
     assert!(!out.contains("pace test binaries."), "{out}");
-    let out = init(&e, &["--no-service"], Some("qemu-user"), "n\nn\n");
+    let out = init(&e, &["--no-service"], Some("qemu-user"), "y\n");
     assert!(
         out.contains(&format!("sets {var}=\"qemu-user\", which stays")),
         "{out}"
@@ -1751,8 +1907,8 @@ fn init_exports_the_test_runner_for_the_host() {
     assert_eq!(bashrc(&e), saved);
 
     let declined = env();
-    let out = init(&declined, &["--no-service"], None, "y\nn\nn\nn\n");
-    assert!(out.contains("Test pacing: skipped"), "{out}");
+    let out = init(&declined, &["--no-service"], None, "n\n");
+    assert!(out.contains("Setup cancelled"), "{out}");
     assert!(!bashrc(&declined).contains("kache test runner"));
 
     // No host triple, an unsupported shell, or a malformed block: no edit.
@@ -1773,7 +1929,7 @@ fn init_exports_the_test_runner_for_the_host() {
         .args(["init", "--no-service"])
         .env("RUSTC", &rustc)
         .env("SHELL", "/bin/tcsh")
-        .write_stdin("n\n");
+        .write_stdin("y\n");
     let out = command.assert().success().get_output().stdout.clone();
     let out = String::from_utf8(out).unwrap();
     assert!(
@@ -1785,7 +1941,7 @@ fn init_exports_the_test_runner_for_the_host() {
         "# >>> kache test runner >>>\nno end marker\n",
     )
     .unwrap();
-    let out = init(&other, &["--no-service"], None, "n\nn\n");
+    let out = init(&other, &["--no-service"], None, "y\n");
     assert!(out.contains("Test pacing changed no shell files."), "{out}");
     assert!(!bashrc(&other).contains(&export));
 }
@@ -1815,7 +1971,8 @@ fn init_saves_shell_setup_preserves_cargo_choices_and_is_idempotent() {
         .clone();
     let output = String::from_utf8(output).unwrap();
     assert!(output.contains("Replace sccache with Kache for Cargo builds?"));
-    assert!(output.contains("Cache cargo doc as well?"));
+    assert_eq!(output.matches("[Y/n]").count(), 2, "{output}");
+    assert!(!output.contains("Cache cargo doc as well?"));
     assert!(output.contains("Open a new terminal"));
     assert!(!output.contains("Setup complete"));
     assert!(!output.contains("PKGBUILD"));
@@ -1979,9 +2136,7 @@ fn init_repairs_each_half_of_terminal_setup_and_reports_activation() {
         .write_stdin("yes\nn\n")
         .assert()
         .success()
-        .stdout(predicates::str::contains(
-            "Protect Cargo targets and cache C/C++ in new terminals?",
-        ));
+        .stdout(predicates::str::contains("Apply this setup?"));
     assert!(std::fs::read_to_string(&rc).unwrap().ends_with(&configured));
     let repaired = std::fs::read_to_string(&rc).unwrap();
 
@@ -1991,9 +2146,7 @@ fn init_repairs_each_half_of_terminal_setup_and_reports_activation() {
         .write_stdin("y\nn\n")
         .assert()
         .success()
-        .stdout(predicates::str::contains(
-            "Protect Cargo targets and cache C/C++ in new terminals?",
-        ));
+        .stdout(predicates::str::contains("Apply this setup?"));
     assert_eq!(std::fs::read_to_string(&rc).unwrap(), repaired);
     assert_eq!(
         std::fs::canonicalize(shims.join("cc")).unwrap(),
@@ -2011,13 +2164,13 @@ fn init_repairs_each_half_of_terminal_setup_and_reports_activation() {
             .unwrap(),
         )
         .args(["init", "--no-service"])
-        .write_stdin("n\n")
+        .write_stdin("y\n")
         .assert()
         .success()
         .stdout(predicates::str::contains(
             "Cargo target protection and C/C++ caching: active",
         ))
-        .stdout(predicates::str::contains("Open a new terminal").not());
+        .stdout(predicates::str::contains("Open a new terminal to activate C/C++ caching.").not());
 
     std::fs::remove_file(shims.join("cc")).unwrap();
     std::fs::write(shims.join("cc"), "user-owned compiler").unwrap();
@@ -2041,7 +2194,7 @@ fn init_leaves_unsupported_shells_and_managed_dotfiles_alone() {
     e.cmd()
         .env("SHELL", "/bin/unsupported")
         .args(["init", "--no-service"])
-        .write_stdin("n\nn\n")
+        .write_stdin("y\n")
         .assert()
         .success()
         .stdout(predicates::str::contains("shell not supported"));
@@ -2051,7 +2204,7 @@ fn init_leaves_unsupported_shells_and_managed_dotfiles_alone() {
     std::os::unix::fs::symlink(&managed, e.home.join(".bashrc")).unwrap();
     e.cmd()
         .args(["init", "--no-service"])
-        .write_stdin("n\nn\n")
+        .write_stdin("y\n")
         .assert()
         .success()
         .stdout(predicates::str::contains("No shell files were changed."));

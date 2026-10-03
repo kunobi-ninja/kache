@@ -2,35 +2,209 @@
 //! column tables, and the number, byte, duration and path forms every command
 //! prints the same way. JSON output does not go through here.
 
+use std::io::IsTerminal;
 use std::path::Path;
 
-/// Blocks of `label   value   note` rows under a two-space indent, a blank
-/// line between blocks. Every block uses the same columns, so values and
-/// notes line up down the whole output. An empty note leaves no trailing
-/// space, and an empty block is skipped.
-pub(crate) fn sections(sections: &[Vec<(&str, String, String)>]) -> Vec<String> {
-    let all = || sections.iter().flatten();
-    let label_width = all().map(|(label, _, _)| width(label)).max().unwrap_or(0);
-    // Only a value with a note after it needs padding.
-    let value_width = all()
+/// Human messages go to stderr in JSON mode. JSON documents use
+/// `machine::emit` directly, so helpers cannot mix prose into stdout.
+macro_rules! human_println {
+    () => { $crate::term::print_line(format_args!("")) };
+    ($($args:tt)*) => { $crate::term::print_line(format_args!($($args)*)) };
+}
+pub(crate) use human_println;
+
+pub(crate) fn print_line(args: std::fmt::Arguments<'_>) {
+    let text = args.to_string();
+    if crate::machine::is_json() {
+        eprintln!("{}", strip_sgr(&text));
+    } else if Output::current().color {
+        println!("{text}");
+    } else {
+        println!("{}", strip_sgr(&text));
+    }
+}
+
+pub(crate) fn strip_sgr(text: &str) -> String {
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("\x1b[") {
+        out.push_str(&rest[..start]);
+        let code = &rest[start + 2..];
+        match code.find(|c: char| !c.is_ascii_digit() && c != ';') {
+            Some(end) if code.as_bytes()[end] == b'm' => rest = &code[end + 1..],
+            _ => {
+                out.push_str("\x1b[");
+                rest = code;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum Style {
+    Heading,
+    Value,
+    Muted,
+    Success,
+    Warning,
+    Error,
+}
+
+#[derive(Clone, Copy)]
+struct Output {
+    color: bool,
+    columns: Option<usize>,
+}
+
+impl Output {
+    fn current() -> Self {
+        let terminal = std::io::stdout().is_terminal();
+        Self {
+            color: use_color(
+                terminal,
+                std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty()),
+                std::env::var("TERM").ok().as_deref(),
+            ),
+            columns: terminal
+                .then(|| {
+                    crossterm::terminal::size()
+                        .ok()
+                        .map(|(w, _)| usize::from(w))
+                })
+                .flatten(),
+        }
+    }
+
+    fn paint(self, text: &str, style: Style) -> String {
+        if !self.color || text.is_empty() {
+            return strip_sgr(text);
+        }
+        let code = match style {
+            Style::Heading => "1;36",
+            Style::Value => "1",
+            Style::Muted => "2",
+            Style::Success => "32",
+            Style::Warning => "33",
+            Style::Error => "31",
+        };
+        format!("\x1b[{code}m{text}\x1b[0m")
+    }
+}
+
+fn use_color(terminal: bool, no_color: bool, term: Option<&str>) -> bool {
+    terminal && !no_color && term != Some("dumb")
+}
+
+pub(crate) fn paint(text: impl AsRef<str>, style: Style) -> String {
+    Output::current().paint(text.as_ref(), style)
+}
+
+pub(crate) fn heading(text: impl AsRef<str>) -> String {
+    paint(text, Style::Heading)
+}
+
+pub(crate) fn clap_styles() -> clap::builder::Styles {
+    use clap::builder::styling::AnsiColor;
+    clap::builder::Styles::styled()
+        .header(AnsiColor::Cyan.on_default().bold())
+        .usage(AnsiColor::Cyan.on_default().bold())
+        .literal(clap::builder::styling::Style::new().bold())
+        .placeholder(clap::builder::styling::Style::new())
+        .error(AnsiColor::Red.on_default().bold())
+}
+
+/// Each section gets a heading and its own columns. Long notes continue
+/// beneath the note column, or beneath the value on narrow terminals.
+pub(crate) type Row<'a> = (&'a str, String, String);
+pub(crate) type NamedSection<'a> = (&'a str, Vec<Row<'a>>);
+
+pub(crate) fn named_sections(sections: &[NamedSection<'_>]) -> Vec<String> {
+    let output = Output::current();
+    let mut lines = Vec::new();
+    for (name, rows) in sections.iter().filter(|(_, rows)| !rows.is_empty()) {
+        if !lines.is_empty() {
+            lines.push(String::new());
+        }
+        lines.push(output.paint(name, Style::Heading));
+        lines.extend(rows_with(rows, output));
+    }
+    lines
+}
+
+pub(crate) fn rows(rows: &[Row<'_>]) -> Vec<String> {
+    rows_with(rows, Output::current())
+}
+
+fn rows_with(rows: &[Row<'_>], output: Output) -> Vec<String> {
+    let label_width = rows
+        .iter()
+        .map(|(label, _, _)| width(label))
+        .max()
+        .unwrap_or(0);
+    let value_width = rows
+        .iter()
         .filter(|(_, _, note)| !note.is_empty())
         .map(|(_, value, _)| width(value))
         .max()
         .unwrap_or(0);
-    let mut lines = Vec::new();
-    for section in sections.iter().filter(|section| !section.is_empty()) {
-        if !lines.is_empty() {
-            lines.push(String::new());
-        }
-        for (label, value, note) in section {
-            let label = pad(label, label_width);
-            lines.push(if note.is_empty() {
-                format!("  {label}   {value}").trim_end().to_string()
+    rows.iter()
+        .flat_map(|(label, value, note)| {
+            let prefix = format!(
+                "  {}   {}",
+                pad(label, label_width),
+                output.paint(value, Style::Value)
+            );
+            if note.is_empty() {
+                return vec![prefix.trim_end().to_string()];
+            }
+            let note_column = 2 + label_width + 3 + value_width + 3;
+            let (indent, first) = match output.columns {
+                Some(columns) if note_column + 16 > columns => (2 + label_width + 3, false),
+                _ => (note_column, true),
+            };
+            let available = output
+                .columns
+                .map(|columns| columns.saturating_sub(indent).max(1));
+            let wrapped = wrap(note, available);
+            let mut lines = vec![if first {
+                format!(
+                    "{prefix}{}   {}",
+                    " ".repeat(value_width.saturating_sub(width(value))),
+                    output.paint(&wrapped[0], Style::Muted)
+                )
             } else {
-                format!("  {label}   {}   {note}", pad(value, value_width))
-            });
+                prefix
+            }];
+            let start = usize::from(first);
+            lines.extend(
+                wrapped[start..].iter().map(|line| {
+                    format!("{}{}", " ".repeat(indent), output.paint(line, Style::Muted))
+                }),
+            );
+            lines
+        })
+        .collect()
+}
+
+/// Wrap prose at spaces; keep paths and other indivisible values intact.
+fn wrap(text: &str, columns: Option<usize>) -> Vec<String> {
+    let Some(columns) = columns else {
+        return vec![text.to_owned()];
+    };
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    for word in text.split_whitespace() {
+        if !line.is_empty() && width(&line) + 1 + width(word) > columns {
+            lines.push(std::mem::take(&mut line));
         }
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str(word);
     }
+    lines.push(line);
     lines
 }
 
@@ -64,7 +238,7 @@ pub(crate) fn table(header: &[&str], align: &[Align], body: &[Vec<String>]) -> V
         }
         out.trim_end().to_string()
     };
-    let mut lines = vec![line(&mut header.iter().copied())];
+    let mut lines = vec![heading(line(&mut header.iter().copied()))];
     for row in body {
         lines.push(line(&mut row.iter().map(String::as_str)));
     }
@@ -123,7 +297,7 @@ fn home_path_in(path: &Path, home: Option<&Path>) -> String {
 }
 
 fn width(text: &str) -> usize {
-    text.chars().count()
+    ratatui::text::Span::raw(strip_sgr(text)).width()
 }
 
 fn pad(text: &str, to: usize) -> String {
@@ -139,30 +313,95 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sections_share_columns_and_skip_empty_blocks() {
-        let lines = sections(&[
-            vec![
-                ("Hit rate", "88.8%".into(), "3,018 of 3,398".into()),
-                ("Time saved", "~9 min".into(), String::new()),
-            ],
-            Vec::new(),
-            vec![
-                ("Daemon", "v0.28.1".into(), "epoch 7".into()),
-                ("Remote", "not configured".into(), String::new()),
-            ],
+    fn color_requires_a_capable_terminal_without_no_color() {
+        assert!(use_color(true, false, Some("xterm-256color")));
+        assert!(use_color(true, false, None));
+        assert!(!use_color(false, false, Some("xterm")));
+        assert!(!use_color(true, true, Some("xterm")));
+        assert!(!use_color(true, false, Some("dumb")));
+    }
+
+    #[test]
+    fn styled_rows_keep_alignment_and_wrap_notes() {
+        let output = Output {
+            color: true,
+            columns: Some(45),
+        };
+        let rows = vec![(
+            "Daemon",
+            output.paint("✓", Style::Success),
+            "running with the configured cache directory".into(),
+        )];
+        let lines = rows_with(&rows, output);
+        assert_eq!(
+            lines.iter().map(|line| strip_sgr(line)).collect::<Vec<_>>(),
+            [
+                "  Daemon   ✓   running with the configured",
+                "               cache directory",
+            ]
+        );
+        assert!(lines[0].contains("\x1b[32m✓\x1b[0m"));
+        assert!(lines[0].contains("\x1b[2m"));
+        assert!(lines.iter().all(|line| width(line) <= 45));
+        let narrow = rows_with(
+            &rows,
+            Output {
+                color: false,
+                columns: Some(24),
+            },
+        );
+        assert_eq!(narrow[0], "  Daemon   ✓");
+        assert_eq!(narrow[1], "           running with");
+        assert!(narrow.iter().all(|line| width(line) <= 24));
+    }
+
+    #[test]
+    fn plain_output_keeps_text_and_complete_paths() {
+        let plain = Output {
+            color: false,
+            columns: None,
+        };
+        assert_eq!(plain.paint("ready", Style::Success), "ready");
+        assert_eq!(
+            Output {
+                color: true,
+                columns: None
+            }
+            .paint("", Style::Value),
+            ""
+        );
+        assert_eq!(strip_sgr("\x1b[1;36mTitle\x1b[0m ✓"), "Title ✓");
+        assert_eq!(strip_sgr("a\x1b[2Jb"), "a\x1b[2Jb");
+        assert_eq!(strip_sgr("\x1b[31"), "\x1b[31");
+        assert_eq!(wrap("one two three", Some(7)), ["one two", "three"]);
+        assert_eq!(wrap("/a/very/long/path", Some(4)), ["/a/very/long/path"]);
+        assert_eq!(wrap("a  b", None), ["a  b"]);
+        assert_eq!(wrap("", Some(20)), [""]);
+        assert_eq!(width("缓存"), 4);
+        assert_eq!(width("\x1b[32m✓\x1b[0m"), 1);
+    }
+
+    #[test]
+    fn named_sections_skip_empty_groups_and_keep_local_columns() {
+        let lines = named_sections(&[
+            ("Empty", Vec::new()),
+            ("Builds", vec![("Hits", "1".into(), "cached".into())]),
+            (
+                "Services",
+                vec![("Daemon", "running".into(), String::new())],
+            ),
         ]);
         assert_eq!(
             lines,
             [
-                "  Hit rate     88.8%     3,018 of 3,398",
-                "  Time saved   ~9 min",
+                "Builds",
+                "  Hits   1   cached",
                 "",
-                "  Daemon       v0.28.1   epoch 7",
-                "  Remote       not configured",
+                "Services",
+                "  Daemon   running"
             ]
         );
-        assert!(sections(&[Vec::new()]).is_empty());
-        assert!(sections(&[]).is_empty());
+        assert!(named_sections(&[]).is_empty());
     }
 
     #[test]

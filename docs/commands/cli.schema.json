@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/kunobi-ninja/kache/blob/main/docs/commands/cli.schema.json",
+  "title": "Kache CLI document",
+  "description": "Common envelope for --json commands. Command-specific fields remain at the top level.",
+  "type": "object",
+  "required": ["schema_version", "command", "success"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "command": { "type": "string", "minLength": 1 },
+    "success": { "type": "boolean" },
+    "error": {
+      "type": "object",
+      "required": ["code", "message", "causes"],
+      "properties": {
+        "code": { "type": "string", "enum": ["invalid_arguments", "command_failed"] },
+        "message": { "type": "string", "minLength": 1 },
+        "causes": { "type": "array", "items": { "type": "string" } }
+      },
+      "additionalProperties": false
+    },
+    "next": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["argv", "why"],
+        "properties": {
+          "argv": { "type": "array", "minItems": 1, "items": { "type": "string" } },
+          "why": { "type": "string" }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "if": { "properties": { "success": { "const": false } } },
+  "then": { "required": ["error"] },
+  "else": { "not": { "required": ["error"] } },
+  "additionalProperties": true
+}

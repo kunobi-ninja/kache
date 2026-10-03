@@ -1,13 +1,31 @@
 //! Machine-readable CLI output, and the store-vs-disk split that output uses.
 //!
 //! Interactive surfaces (`kache monitor`, `kache config`, the `clean` selector)
-//! stay human. Agents get `--json` on the commands that diagnose and change
-//! disk: stats, gc, clean, doctor, why-miss, list, daemon status.
+//! stay human. Setup, reports, diagnostics and disk-management commands use
+//! one versioned document on stdout, including argument and command failures.
 
 use anyhow::Result;
 pub use kache_store::filesystem::*;
 use serde::Serialize;
 use std::path::Path;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+static JSON_MODE: AtomicBool = AtomicBool::new(false);
+static COMMAND: OnceLock<String> = OnceLock::new();
+
+pub(crate) fn configure(json: bool, command: String) {
+    JSON_MODE.store(json, Ordering::Relaxed);
+    let _ = COMMAND.set(command);
+}
+
+pub(crate) fn command() -> &'static str {
+    COMMAND.get().map(String::as_str).unwrap_or("cli")
+}
+
+pub(crate) fn is_json() -> bool {
+    JSON_MODE.load(Ordering::Relaxed)
+}
 
 /// JSON document version. Bump on breaking field/meaning changes; additive
 /// fields do not bump it.
@@ -45,9 +63,10 @@ pub struct NextAction {
 }
 
 #[derive(Debug, Serialize)]
-struct JsonDoc<T: Serialize> {
+struct JsonDoc<'a, T: Serialize> {
     schema_version: u32,
-    command: &'static str,
+    command: &'a str,
+    success: bool,
     #[serde(flatten)]
     body: T,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -55,16 +74,109 @@ struct JsonDoc<T: Serialize> {
 }
 
 /// Write one JSON document to stdout.
-pub fn emit<T: Serialize>(command: &'static str, body: T, next: Vec<NextAction>) -> Result<()> {
+pub fn emit<T: Serialize>(command: &str, body: T, next: Vec<NextAction>) -> Result<()> {
     let doc = JsonDoc {
         schema_version: SCHEMA_VERSION,
         command,
+        success: true,
         body,
         next,
     };
     serde_json::to_writer_pretty(std::io::stdout(), &doc)?;
     println!();
     Ok(())
+}
+
+/// Failures use the same stdout document contract as successful commands.
+pub(crate) fn emit_error(command: &str, code: &str, error: &anyhow::Error) -> Result<()> {
+    #[derive(Serialize)]
+    struct Failure<'a> {
+        code: &'a str,
+        message: String,
+        causes: Vec<String>,
+    }
+    #[derive(Serialize)]
+    struct Body<'a> {
+        error: Failure<'a>,
+    }
+    let doc = JsonDoc {
+        schema_version: SCHEMA_VERSION,
+        command,
+        success: false,
+        body: Body {
+            error: Failure {
+                code,
+                message: error.to_string(),
+                causes: error.chain().skip(1).map(ToString::to_string).collect(),
+            },
+        },
+        next: Vec::new(),
+    };
+    serde_json::to_writer_pretty(std::io::stdout(), &doc)?;
+    println!();
+    Ok(())
+}
+
+/// The command tree lets scripts discover syntax without parsing help prose.
+pub(crate) fn emit_help(mut command: clap::Command) -> Result<()> {
+    #[derive(Serialize)]
+    struct Argument {
+        name: String,
+        long: Option<String>,
+        short: Option<char>,
+        required: bool,
+        description: Option<String>,
+        values: Vec<String>,
+    }
+    #[derive(Serialize)]
+    struct Command {
+        name: String,
+        description: Option<String>,
+        usage: String,
+        arguments: Vec<Argument>,
+        subcommands: Vec<Command>,
+    }
+    fn describe(command: &mut clap::Command) -> Command {
+        let usage = command.render_usage().to_string();
+        Command {
+            name: command.get_name().to_owned(),
+            description: command.get_about().map(ToString::to_string),
+            usage,
+            arguments: command
+                .get_arguments()
+                .filter(|arg| !arg.is_hide_set())
+                .map(|arg| Argument {
+                    name: arg.get_id().to_string(),
+                    long: arg.get_long().map(str::to_owned),
+                    short: arg.get_short(),
+                    required: arg.is_required_set(),
+                    description: arg.get_help().map(ToString::to_string),
+                    values: arg
+                        .get_possible_values()
+                        .into_iter()
+                        .filter(|value| !value.is_hide_set())
+                        .map(|value| value.get_name().to_owned())
+                        .collect(),
+                })
+                .collect(),
+            subcommands: command
+                .get_subcommands_mut()
+                .filter(|command| !command.is_hide_set())
+                .map(describe)
+                .collect(),
+        }
+    }
+    #[derive(Serialize)]
+    struct Body {
+        cli: Command,
+    }
+    emit(
+        "help",
+        Body {
+            cli: describe(&mut command),
+        },
+        Vec::new(),
+    )
 }
 
 pub fn require_tty(is_tty: bool, command: &str, alternative: &str) -> Result<()> {

@@ -140,9 +140,16 @@ credential helpers. Without configured credentials, it connects anonymously.
 For a local HTTP registry, set `insecure = true`; HTTPS is the default.
 
 Each cache object is an OCI artifact with one layer. Tags use
-`kache-v1-<BLAKE3 of the object key>`; the manifest's
-`ninja.kunobi.kache.key` annotation records the original key. Listing scans tags
-and reads their manifests, so large caches cost more requests than S3 listings.
+the `kache-v2-` prefix and encode ordinary cache keys, including compressed hex
+digests. Listing recovers those keys from tag pages. Keys too long for an OCI
+tag use a hash instead; listing reads their manifests to recover the
+`ninja.kunobi.kache.key` annotation.
+
+JSON objects up to 16 KiB embed their bytes in the layer descriptor, so a warm
+read needs one manifest request. Larger objects need a manifest and a blob
+request. Registry auth is cached and refreshed on rejection. Uploads reuse
+existing blobs and use a monolithic transfer for new blobs.
+
 Keep cache artifacts in a dedicated repository and configure its retention
 policy to retain the cache tags.
 

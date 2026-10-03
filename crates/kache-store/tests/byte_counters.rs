@@ -19,6 +19,8 @@ fn restore_bytes_accumulate_for_each_materialization_method() {
         (reflinked_bytes(), hardlinked_bytes(), copied_bytes()),
         (65, 34, 19)
     );
+    assert_eq!(thread_reflinked_bytes(), 65);
+    assert_eq!(thread_copied_bytes(), 19);
 }
 
 #[test]

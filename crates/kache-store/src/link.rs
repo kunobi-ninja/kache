@@ -1036,10 +1036,51 @@ fn copy_file(src: &Path, dst: &Path, executable: bool) -> Result<()> {
 /// mode as a compiler output (`0666`). The kernel therefore applies the current
 /// umask and any inherited default ACL exactly where the final file will live.
 /// No metadata operation is performed through the final pathname.
+///
+/// When the filesystem can share extents, the cached bytes are cloned into that
+/// stage (or onto a new file in the same directory that then takes the stage's
+/// mode). The clone has its own inode. A hardlink of the blob is discarded and
+/// the bytes are copied instead, so a later rewrite cannot change the cache.
 pub struct PreparedWritableTarget {
-    staged: kache_fs::StagedFile,
+    stage: WritableStage,
     target: PathBuf,
     bytes: u64,
+    source: Option<PathBuf>,
+    reflinked: bool,
+}
+
+enum WritableStage {
+    Staged(kache_fs::StagedFile),
+    Cloned(ClonedFile),
+}
+
+/// A clone created under a temporary name. Dropping an unpublished clone
+/// removes that name and leaves the cache blob alone.
+struct ClonedFile {
+    path: PathBuf,
+}
+
+impl Drop for ClonedFile {
+    fn drop(&mut self) {
+        if !self.path.as_os_str().is_empty() {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+impl ClonedFile {
+    fn persist_noclobber(mut self, target: &Path) -> std::io::Result<()> {
+        fs::hard_link(&self.path, target)?;
+        let _ = fs::remove_file(&self.path);
+        self.path.clear();
+        Ok(())
+    }
+
+    fn replace(mut self, target: &Path) -> std::io::Result<()> {
+        fs::rename(&self.path, target)?;
+        self.path.clear();
+        Ok(())
+    }
 }
 
 impl PreparedWritableTarget {
@@ -1048,14 +1089,30 @@ impl PreparedWritableTarget {
     }
 
     pub fn publish(self) -> Result<()> {
-        let target = self.target;
-        self.staged.publish_new(&target).with_context(|| {
-            format!(
-                "publishing cc output without replacing {}",
-                target.display()
-            )
-        })?;
-        crate::opcounts::record_copied(self.bytes);
+        let PreparedWritableTarget {
+            stage,
+            target,
+            bytes,
+            source,
+            reflinked,
+        } = self;
+        match stage {
+            WritableStage::Staged(staged) => staged.publish_new(&target).with_context(|| {
+                format!(
+                    "publishing cc output without replacing {}",
+                    target.display()
+                )
+            })?,
+            WritableStage::Cloned(cloned) => {
+                cloned.persist_noclobber(&target).with_context(|| {
+                    format!(
+                        "publishing cc output without replacing {}",
+                        target.display()
+                    )
+                })?
+            }
+        }
+        record_published(reflinked, bytes, source.as_deref(), &target);
         Ok(())
     }
 
@@ -1065,12 +1122,34 @@ impl PreparedWritableTarget {
     /// regular file. Special paths retain the no-clobber path above and are
     /// handled by the selected compiler instead.
     pub fn publish_replacing(self) -> Result<()> {
-        let target = self.target;
-        self.staged
-            .replace(&target)
-            .with_context(|| format!("publishing cc output over {}", target.display()))?;
-        crate::opcounts::record_copied(self.bytes);
+        let PreparedWritableTarget {
+            stage,
+            target,
+            bytes,
+            source,
+            reflinked,
+        } = self;
+        match stage {
+            WritableStage::Staged(staged) => staged
+                .replace(&target)
+                .with_context(|| format!("publishing cc output over {}", target.display()))?,
+            WritableStage::Cloned(cloned) => cloned
+                .replace(&target)
+                .with_context(|| format!("publishing cc output over {}", target.display()))?,
+        }
+        record_published(reflinked, bytes, source.as_deref(), &target);
         Ok(())
+    }
+}
+
+fn record_published(reflinked: bool, bytes: u64, source: Option<&Path>, target: &Path) {
+    if reflinked {
+        if let Some(source) = source {
+            tracing::debug!("reflinked {} -> {}", source.display(), target.display());
+        }
+        crate::opcounts::record_reflinked(bytes);
+    } else {
+        crate::opcounts::record_copied(bytes);
     }
 }
 
@@ -1088,10 +1167,57 @@ pub fn prepare_writable_target_from_file(
     src: &Path,
     target: &Path,
 ) -> Result<PreparedWritableTarget> {
+    prepare_writable_target_from_file_via(
+        src,
+        target,
+        kache_fs::try_clone_extents_into,
+        kache_fs::try_reflink,
+    )
+}
+
+fn prepare_writable_target_from_file_via(
+    src: &Path,
+    target: &Path,
+    clone_into: fn(&Path, &fs::File) -> std::io::Result<()>,
+    clone_new: fn(&Path, &Path) -> std::io::Result<()>,
+) -> Result<PreparedWritableTarget> {
+    let bytes = fs::metadata(src)
+        .with_context(|| format!("reading cached cc artifact {}", src.display()))?
+        .len();
+    let mut staged = new_writable_staging_file(target)?;
+    if clone_into(src, staged.file_mut()).is_ok() {
+        return Ok(prepared_reflink(staged, target, src, bytes));
+    }
+    if let Some(cloned) = private_clone_file(src, target, clone_new)? {
+        let permissions = staged
+            .file_mut()
+            .metadata()
+            .with_context(|| format!("reading restore stage mode for {}", target.display()))?
+            .permissions();
+        if let Err(error) = fs::set_permissions(&cloned, permissions) {
+            let _ = fs::remove_file(&cloned);
+            tracing::debug!(
+                %error,
+                "cloned cc output kept the blob mode, restoring by copy: {} -> {}",
+                src.display(),
+                target.display()
+            );
+        } else {
+            return Ok(PreparedWritableTarget {
+                stage: WritableStage::Cloned(ClonedFile { path: cloned }),
+                target: target.to_path_buf(),
+                bytes,
+                source: Some(src.to_path_buf()),
+                reflinked: true,
+            });
+        }
+    }
+
+    rewind_stage(&mut staged)
+        .with_context(|| format!("rewinding cc restore stage for {}", target.display()))?;
     let mut source = fs::File::open(src)
         .with_context(|| format!("opening cached cc artifact {}", src.display()))?;
-    let mut staged = new_writable_staging_file(target)?;
-    let bytes = std::io::copy(&mut source, staged.writer()).with_context(|| {
+    let copied = std::io::copy(&mut source, staged.writer()).with_context(|| {
         format!(
             "copying cached cc artifact {} for {}",
             src.display(),
@@ -1099,10 +1225,121 @@ pub fn prepare_writable_target_from_file(
         )
     })?;
     Ok(PreparedWritableTarget {
-        staged,
+        stage: WritableStage::Staged(staged),
+        target: target.to_path_buf(),
+        bytes: copied,
+        source: None,
+        reflinked: false,
+    })
+}
+
+fn prepared_reflink(
+    staged: kache_fs::StagedFile,
+    target: &Path,
+    src: &Path,
+    bytes: u64,
+) -> PreparedWritableTarget {
+    PreparedWritableTarget {
+        stage: WritableStage::Staged(staged),
         target: target.to_path_buf(),
         bytes,
-    })
+        source: Some(src.to_path_buf()),
+        reflinked: true,
+    }
+}
+
+/// Clone `src` to a new file in `target`'s directory.
+///
+/// `None` means the caller should copy. A clone that shares `src`'s inode is
+/// removed when it is an extra name, and is not returned.
+fn private_clone_file(
+    src: &Path,
+    target: &Path,
+    clone_new: fn(&Path, &Path) -> std::io::Result<()>,
+) -> Result<Option<PathBuf>> {
+    let parent = stage_parent(target);
+    for _ in 0..8 {
+        let dest = temp_clone_path(parent);
+        match clone_new(src, &dest) {
+            Ok(()) => return Ok(accepted_private_clone(src, &dest)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(_) => return Ok(None),
+        }
+    }
+    Ok(None)
+}
+
+fn accepted_private_clone(src: &Path, dest: &Path) -> Option<PathBuf> {
+    let Ok(dst_meta) = fs::metadata(dest) else {
+        let _ = fs::remove_file(dest);
+        return None;
+    };
+    let Ok(src_meta) = fs::metadata(src) else {
+        // The clone moved the blob onto `dest`. Put that name back so the
+        // copy still has a source. Deleting `dest` would drop the only copy.
+        let _ = fs::rename(dest, src);
+        return None;
+    };
+    if !same_file(&src_meta, &dst_meta) {
+        return Some(dest.to_path_buf());
+    }
+    if link_count(&dst_meta) > 1 {
+        let _ = fs::remove_file(dest);
+    }
+    tracing::debug!(
+        "cc restore clone shared the blob inode, copying {} -> {}",
+        src.display(),
+        dest.display()
+    );
+    None
+}
+
+fn rewind_stage(staged: &mut kache_fs::StagedFile) -> std::io::Result<()> {
+    use std::io::{Seek, SeekFrom};
+    let file = staged.file_mut();
+    file.set_len(0)?;
+    file.seek(SeekFrom::Start(0))?;
+    Ok(())
+}
+
+fn stage_parent(target: &Path) -> &Path {
+    target
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+fn temp_clone_path(directory: &Path) -> PathBuf {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    directory.join(format!(".kache-cc-clone-{}-{n}", std::process::id()))
+}
+
+fn same_file(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        left.dev() == right.dev() && left.ino() == right.ino()
+    }
+    // Windows `Metadata` has no stable file index. Clones come from
+    // `try_reflink`, which creates a new file rather than a hardlink.
+    #[cfg(not(unix))]
+    {
+        let _ = (left, right);
+        false
+    }
+}
+
+fn link_count(meta: &fs::Metadata) -> u64 {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::MetadataExt::nlink(meta)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        1
+    }
 }
 
 /// Prepare transformed C/C++ bytes with the same absent-only guarantee.
@@ -1118,9 +1355,11 @@ pub fn prepare_writable_target_from_bytes(
         .write_all(content)
         .with_context(|| format!("writing staged cc output for {}", target.display()))?;
     Ok(PreparedWritableTarget {
-        staged,
+        stage: WritableStage::Staged(staged),
         target: target.to_path_buf(),
         bytes: content.len() as u64,
+        source: None,
+        reflinked: false,
     })
 }
 
@@ -2562,6 +2801,200 @@ mod tests {
         );
         fs::write(&output, b"changed").unwrap();
         assert_eq!(fs::read(&blob).unwrap(), b"cached object");
+    }
+
+    fn refuse_clone_into(_src: &Path, _dst: &fs::File) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "no in-place clone",
+        ))
+    }
+
+    fn refuse_clone_new(_src: &Path, _dst: &Path) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "no new clone",
+        ))
+    }
+
+    fn restore_deltas() -> (u64, u64) {
+        (
+            crate::opcounts::thread_copied_bytes(),
+            crate::opcounts::thread_reflinked_bytes(),
+        )
+    }
+
+    #[test]
+    fn in_place_clone_publishes_the_cloned_bytes() {
+        fn write_marker(_src: &Path, dst: &fs::File) -> std::io::Result<()> {
+            use std::io::{Seek, SeekFrom, Write};
+            if dst.metadata()?.len() != 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "stage already written",
+                ));
+            }
+            let mut out = dst.try_clone()?;
+            out.seek(SeekFrom::Start(0))?;
+            out.write_all(b"CLONED")?;
+            Ok(())
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let blob = dir.path().join("blob.o");
+        fs::write(&blob, b"cached object").unwrap();
+        let bytes = fs::metadata(&blob).unwrap().len();
+        let output = dir.path().join("output.o");
+        let (copied_before, reflinked_before) = restore_deltas();
+        prepare_writable_target_from_file_via(&blob, &output, write_marker, refuse_clone_new)
+            .unwrap()
+            .publish()
+            .unwrap();
+        assert_eq!(fs::read(&output).unwrap(), b"CLONED");
+        assert_eq!(fs::read(&blob).unwrap(), b"cached object");
+        let (copied, reflinked) = restore_deltas();
+        assert_eq!(copied, copied_before);
+        assert_eq!(reflinked, reflinked_before + bytes);
+
+        let occupied = dir.path().join("occupied.o");
+        fs::write(&occupied, b"keep").unwrap();
+        assert!(
+            prepare_writable_target_from_file_via(&blob, &occupied, write_marker, refuse_clone_new)
+                .unwrap()
+                .publish()
+                .is_err()
+        );
+        assert_eq!(fs::read(&occupied).unwrap(), b"keep");
+        assert_eq!(restore_deltas(), (copied_before, reflinked_before + bytes));
+        let leftovers: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name.to_string_lossy().starts_with(".kache-cc-"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn new_file_clone_is_private_writable_and_keeps_the_blob_mode() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        fn write_readonly(_src: &Path, dst: &Path) -> std::io::Result<()> {
+            fs::write(dst, b"CLONED-NEW")?;
+            fs::set_permissions(dst, fs::Permissions::from_mode(0o400))?;
+            Ok(())
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let blob = dir.path().join("blob.o");
+        fs::write(&blob, b"cached object").unwrap();
+        fs::set_permissions(&blob, fs::Permissions::from_mode(0o400)).unwrap();
+        let bytes = fs::metadata(&blob).unwrap().len();
+        let output = dir.path().join("output.o");
+        let (copied_before, reflinked_before) = restore_deltas();
+        prepare_writable_target_from_file_via(&blob, &output, refuse_clone_into, write_readonly)
+            .unwrap()
+            .publish()
+            .unwrap();
+
+        let restored = fs::metadata(&output).unwrap();
+        assert_eq!(fs::read(&output).unwrap(), b"CLONED-NEW");
+        assert_ne!(restored.ino(), fs::metadata(&blob).unwrap().ino());
+        assert_ne!(restored.permissions().mode() & 0o200, 0);
+        assert_eq!(
+            fs::metadata(&blob).unwrap().permissions().mode() & 0o777,
+            0o400
+        );
+        let (copied, reflinked) = restore_deltas();
+        assert_eq!(copied, copied_before);
+        assert_eq!(reflinked, reflinked_before + bytes);
+        fs::write(&output, b"changed").unwrap();
+        assert_eq!(fs::read(&blob).unwrap(), b"cached object");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_hardlinked_clone_is_copied_instead() {
+        use std::os::unix::fs::MetadataExt;
+
+        fn hardlink_blob(src: &Path, dst: &Path) -> std::io::Result<()> {
+            fs::hard_link(src, dst)
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let blob = dir.path().join("blob.o");
+        fs::write(&blob, b"cached object").unwrap();
+        let bytes = fs::metadata(&blob).unwrap().len();
+        let output = dir.path().join("output.o");
+        let (copied_before, reflinked_before) = restore_deltas();
+        prepare_writable_target_from_file_via(&blob, &output, refuse_clone_into, hardlink_blob)
+            .unwrap()
+            .publish()
+            .unwrap();
+
+        assert_eq!(fs::read(&output).unwrap(), b"cached object");
+        assert_ne!(
+            fs::metadata(&output).unwrap().ino(),
+            fs::metadata(&blob).unwrap().ino()
+        );
+        assert_eq!(fs::metadata(&blob).unwrap().nlink(), 1);
+        let (copied, reflinked) = restore_deltas();
+        assert_eq!(copied, copied_before + bytes);
+        assert_eq!(reflinked, reflinked_before);
+        fs::write(&output, b"changed").unwrap();
+        assert_eq!(fs::read(&blob).unwrap(), b"cached object");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_same_inode_clone_keeps_the_blobs_only_name() {
+        use std::os::unix::fs::MetadataExt;
+
+        fn rename_blob(src: &Path, dst: &Path) -> std::io::Result<()> {
+            fs::rename(src, dst)
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let blob = dir.path().join("blob.o");
+        fs::write(&blob, b"cached object").unwrap();
+        let inode = fs::metadata(&blob).unwrap().ino();
+        let bytes = fs::metadata(&blob).unwrap().len();
+        let output = dir.path().join("output.o");
+        let (copied_before, reflinked_before) = restore_deltas();
+        prepare_writable_target_from_file_via(&blob, &output, refuse_clone_into, rename_blob)
+            .unwrap()
+            .publish()
+            .unwrap();
+
+        let restored = fs::metadata(&blob).unwrap();
+        assert_eq!(restored.ino(), inode);
+        assert_eq!(restored.nlink(), 1);
+        assert_eq!(fs::read(&blob).unwrap(), b"cached object");
+        assert_eq!(fs::read(&output).unwrap(), b"cached object");
+        assert_ne!(fs::metadata(&output).unwrap().ino(), inode);
+        let (copied, reflinked) = restore_deltas();
+        assert_eq!(copied, copied_before + bytes);
+        assert_eq!(reflinked, reflinked_before);
+        fs::write(&output, b"changed").unwrap();
+        assert_eq!(fs::read(&blob).unwrap(), b"cached object");
+    }
+
+    #[test]
+    fn clone_failure_copies_the_blob() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob = dir.path().join("blob.o");
+        fs::write(&blob, b"cached object").unwrap();
+        let bytes = fs::metadata(&blob).unwrap().len();
+        let output = dir.path().join("output.o");
+        let (copied_before, reflinked_before) = restore_deltas();
+        prepare_writable_target_from_file_via(&blob, &output, refuse_clone_into, refuse_clone_new)
+            .unwrap()
+            .publish()
+            .unwrap();
+        assert_eq!(fs::read(&output).unwrap(), b"cached object");
+        let (copied, reflinked) = restore_deltas();
+        assert_eq!(copied, copied_before + bytes);
+        assert_eq!(reflinked, reflinked_before);
     }
 
     #[cfg(windows)]

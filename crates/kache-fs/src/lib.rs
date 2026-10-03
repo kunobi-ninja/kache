@@ -12,7 +12,7 @@ use std::path::Path;
 mod copy;
 #[cfg(windows)]
 pub use copy::windows_cluster_size;
-pub use copy::{copy_writable, set_writable_permissions, try_reflink};
+pub use copy::{copy_writable, set_writable_permissions, try_clone_extents_into, try_reflink};
 
 mod identity;
 pub use identity::{directory_identity, file_identity, handle_identity};

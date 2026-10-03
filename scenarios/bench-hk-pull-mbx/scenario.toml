@@ -1,4 +1,4 @@
-# Next-commit hk rebuild through mbx, matching bench-hk-pull.
+# Next-commit hk rebuild through mbx, matching bench-hk-pull-perf.
 name = "bench-hk-pull-mbx"
 tags = ["suite:bench", "project:hk", "backend:mbx", "lang:rust", "lang:cc"]
 

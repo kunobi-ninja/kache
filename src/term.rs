@@ -28,12 +28,14 @@ pub(crate) fn print_line(args: std::fmt::Arguments<'_>) {
 pub(crate) fn strip_sgr(text: &str) -> String {
     let mut out = String::new();
     let mut rest = text;
-    while let Some(start) = rest.find("\x1b[") {
-        out.push_str(&rest[..start]);
-        let code = &rest[start + 2..];
-        match code.find(|c: char| !c.is_ascii_digit() && c != ';') {
-            Some(end) if code.as_bytes()[end] == b'm' => rest = &code[end + 1..],
-            _ => {
+    while let Some((plain, code)) = rest.split_once("\x1b[") {
+        out.push_str(plain);
+        let after_sgr = code
+            .find(|c: char| !c.is_ascii_digit() && c != ';')
+            .and_then(|end| code[end..].strip_prefix('m'));
+        match after_sgr {
+            Some(after) => rest = after,
+            None => {
                 out.push_str("\x1b[");
                 rest = code;
             }
@@ -424,6 +426,12 @@ mod tests {
         assert_eq!(strip_sgr("\x1b[1;36mTitle\x1b[0m ✓"), "Title ✓");
         assert_eq!(strip_sgr("a\x1b[2Jb"), "a\x1b[2Jb");
         assert_eq!(strip_sgr("\x1b[31"), "\x1b[31");
+        assert_eq!(
+            strip_sgr("prefix\x1b[31mred\x1b[0m suffix"),
+            "prefixred suffix"
+        );
+        assert_eq!(strip_sgr("\x1b[mplain"), "plain");
+        assert_eq!(strip_sgr("a\x1b[2J\x1b[31mred\x1b[0m"), "a\x1b[2Jred");
         assert_eq!(wrap("one two three", Some(7)), ["one two", "three"]);
         assert_eq!(wrap("/a/very/long/path", Some(4)), ["/a/very/long/path"]);
         assert_eq!(wrap("a  b", None), ["a  b"]);

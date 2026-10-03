@@ -576,6 +576,29 @@ pub enum RemoteBackendConfig {
     S3(S3RemoteConfig),
     Filesystem(FilesystemRemoteConfig),
     Gcs(GcsRemoteConfig),
+    Oci(OciRemoteConfig),
+}
+
+/// OCI Distribution repository used for cache artifacts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OciRemoteConfig {
+    pub repository: String,
+    /// Use HTTP instead of HTTPS, for a local registry.
+    pub insecure: bool,
+}
+
+impl OciRemoteConfig {
+    pub(crate) fn reference(&self) -> Result<oci_client::Reference> {
+        let reference: oci_client::Reference =
+            self.repository.parse().context("invalid OCI repository")?;
+        let expected = format!("{}:latest", self.repository);
+        if reference.whole() != expected {
+            anyhow::bail!(
+                "OCI repository must include a registry host and repository, without a scheme, tag or digest"
+            );
+        }
+        Ok(reference)
+    }
 }
 
 /// A Google Cloud Storage remote. Credentials come from Application Default
@@ -641,6 +664,7 @@ impl RemoteConfig {
             RemoteBackendConfig::S3(_) => "s3",
             RemoteBackendConfig::Filesystem(_) => "filesystem",
             RemoteBackendConfig::Gcs(_) => "gcs",
+            RemoteBackendConfig::Oci(_) => "oci",
         }
     }
 
@@ -650,6 +674,7 @@ impl RemoteConfig {
             RemoteBackendConfig::S3(s3) => format!("s3://{}", s3.bucket),
             RemoteBackendConfig::Filesystem(fs) => format!("file://{}", fs.root.display()),
             RemoteBackendConfig::Gcs(gcs) => format!("gs://{}", gcs.bucket),
+            RemoteBackendConfig::Oci(oci) => format!("oci://{}", oci.repository),
         };
         if self.prefix.is_empty() {
             base
@@ -922,6 +947,10 @@ pub(crate) struct CacheFileConfig {
 pub(crate) struct RemoteFileConfig {
     #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
     pub(crate) _type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) repository: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) insecure: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) bucket: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2203,6 +2232,43 @@ impl Config {
         })
     }
 
+    fn load_oci_remote_config(remote: &RemoteFileConfig) -> Result<RemoteConfig> {
+        if [
+            &remote.bucket,
+            &remote.endpoint,
+            &remote.region,
+            &remote.profile,
+            &remote.user_agent,
+            &remote.path,
+            &remote.atomic_write_dir,
+        ]
+        .into_iter()
+        .any(|field| {
+            field
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+        }) {
+            anyhow::bail!(
+                "[cache.remote] type = \"oci\" takes repository, prefix and insecure only"
+            );
+        }
+        let repository = remote
+            .repository
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .context("[cache.remote] type = \"oci\" requires a non-empty repository")?;
+        let config = OciRemoteConfig {
+            repository: repository.to_string(),
+            insecure: remote.insecure.unwrap_or(false),
+        };
+        config.reference()?;
+        Ok(RemoteConfig {
+            prefix: resolve_remote_prefix(remote.prefix.as_deref().unwrap_or("artifacts"))?,
+            backend: RemoteBackendConfig::Oci(config),
+        })
+    }
+
     fn load_remote_config(file_config: &Result<FileConfig>) -> Result<Option<RemoteConfig>> {
         let ignore_env = Self::ignore_env_enabled(file_config);
         let file_remote = file_config
@@ -2228,6 +2294,15 @@ impl Config {
                 .any(|v| v.as_deref().is_some_and(|v| !v.trim().is_empty()))
         });
 
+        if let Some(remote) = file_remote {
+            if configured_type.as_deref() == Some("oci") {
+                return Self::load_oci_remote_config(remote).map(Some);
+            }
+            if remote.repository.is_some() || remote.insecure.is_some() {
+                anyhow::bail!("repository and insecure require [cache.remote] type = \"oci\"");
+            }
+        }
+
         if configured_type.as_deref() == Some("gcs") {
             return Self::load_gcs_remote_config(file_remote).map(Some);
         }
@@ -2251,7 +2326,7 @@ impl Config {
             }
             Some(other) => {
                 anyhow::bail!(
-                    "unsupported [cache.remote] type {other:?}; supported types are \"s3\", \"gcs\" and \"filesystem\""
+                    "unsupported [cache.remote] type {other:?}; supported types are \"s3\", \"gcs\", \"filesystem\" and \"oci\""
                 );
             }
             None if file_has_s3_fields && file_has_filesystem_fields => {

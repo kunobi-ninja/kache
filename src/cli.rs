@@ -6949,6 +6949,7 @@ fn remote_access_check(remote: &crate::config::RemoteConfig, pool_idle_secs: u64
     let region = match &remote.backend {
         crate::config::RemoteBackendConfig::S3(s3) => Some(s3.region.clone()),
         crate::config::RemoteBackendConfig::Filesystem(_)
+        | crate::config::RemoteBackendConfig::Oci(_)
         | crate::config::RemoteBackendConfig::Gcs(_) => None,
     };
     let key = crate::config::join_remote_key(&remote.prefix, "kache-doctor-probe");

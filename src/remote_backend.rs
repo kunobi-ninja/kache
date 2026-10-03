@@ -2,9 +2,11 @@
 //!
 //! The remote layout ([`crate::remote_layout`]) and manifest/shard sync
 //! ([`crate::remote`]) speak in opaque byte objects addressed by key. OpenDAL
-//! supplies the concrete S3 and shared-filesystem transports behind this seam.
+//! supplies S3, GCS, and shared-filesystem transports. The OCI transport uses
+//! a native registry client behind the same interface.
 
 mod download_memory;
+mod oci;
 
 use download_memory::{BudgetedBody, DOWNLOAD_MEMORY, DownloadMemory};
 
@@ -1300,6 +1302,9 @@ pub async fn create_backend(
                 format!("resolving filesystem remote root {}", config.root.display())
             })?);
             backend
+        }
+        RemoteBackendConfig::Oci(config) => {
+            return Ok(Arc::new(oci::OciBackend::new(config).await?));
         }
     };
 

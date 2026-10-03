@@ -105,8 +105,10 @@ fn build_fields(file_config: &FileConfig, env: &EnvOverrides) -> Vec<FormField> 
             })
         })
         .unwrap_or_default();
-    let filesystem_remote =
-        remote_type.eq_ignore_ascii_case("filesystem") || remote_type.eq_ignore_ascii_case("fs");
+    let filesystem_remote = matches!(
+        remote_type.to_ascii_lowercase().as_str(),
+        "filesystem" | "fs" | "oci"
+    );
 
     let default_dir = default_cache_dir().to_string_lossy().to_string();
     // Leak default_dir into a &'static str so FormField can hold it.
@@ -262,7 +264,34 @@ fn build_fields(file_config: &FileConfig, env: &EnvOverrides) -> Vec<FormField> 
             value: remote_type,
             env_var: "",
             env_value: None,
-            default_hint: "(s3 or filesystem)",
+            default_hint: "(s3, filesystem or oci)",
+            validation_error: None,
+            env_locked: false,
+        },
+        FormField {
+            key: "oci_repository",
+            label: "OCI repository",
+            kind: FieldKind::Text,
+            value: remote
+                .and_then(|r| r.repository.clone())
+                .unwrap_or_default(),
+            env_var: "",
+            env_value: None,
+            default_hint: "(registry.example.com/team/cache)",
+            validation_error: None,
+            env_locked: false,
+        },
+        FormField {
+            key: "oci_insecure",
+            label: "OCI use HTTP",
+            kind: FieldKind::Bool,
+            value: remote
+                .and_then(|r| r.insecure)
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+            env_var: "",
+            env_value: None,
+            default_hint: "false",
             validation_error: None,
             env_locked: false,
         },
@@ -437,11 +466,11 @@ fn build_sections() -> Vec<Section> {
         },
         Section {
             label: "Remote",
-            fields: 10..19,
+            fields: 10..21,
         },
         Section {
             label: "Advanced",
-            fields: 19..21,
+            fields: 21..23,
         },
     ]
 }
@@ -521,6 +550,8 @@ fn validate_cross_field(fields: &[FormField]) -> Vec<(usize, String)> {
         "fs_path",
         "fs_atomic_write_dir",
         "remote_prefix",
+        "oci_repository",
+        "oci_insecure",
     ]
     .iter()
     .any(|key| is_configured(key));
@@ -539,7 +570,10 @@ fn validate_cross_field(fields: &[FormField]) -> Vec<(usize, String)> {
         && has_configured_remote_fields
         && let Some(idx) = index("remote_type")
     {
-        errors.push((idx, "Backend type required (s3 or filesystem)".to_string()));
+        errors.push((
+            idx,
+            "Backend type required (s3, filesystem or oci)".to_string(),
+        ));
     }
 
     let effective_type = remote_type.as_deref().or({
@@ -553,6 +587,33 @@ fn validate_cross_field(fields: &[FormField]) -> Vec<(usize, String)> {
     });
 
     match effective_type {
+        Some("oci") => {
+            let repository = configured_value("oci_repository").unwrap_or("");
+            let config = crate::config::OciRemoteConfig {
+                repository: repository.to_string(),
+                insecure: false,
+            };
+            if let Err(error) = config.reference()
+                && let Some(idx) = index("oci_repository")
+            {
+                errors.push((idx, error.to_string()));
+            }
+            for key in [
+                "s3_bucket",
+                "s3_endpoint",
+                "s3_region",
+                "s3_profile",
+                "s3_user_agent",
+                "fs_path",
+                "fs_atomic_write_dir",
+            ] {
+                if is_configured(key)
+                    && let Some(idx) = index(key)
+                {
+                    errors.push((idx, "Field conflicts with OCI backend".to_string()));
+                }
+            }
+        }
         Some("s3") => {
             if !is_set("s3_bucket")
                 && let Some(idx) = index("s3_bucket")
@@ -613,11 +674,21 @@ fn validate_cross_field(fields: &[FormField]) -> Vec<(usize, String)> {
             if let Some(idx) = index("remote_type") {
                 errors.push((
                     idx,
-                    "Backend type must be \"s3\" or \"filesystem\"".to_string(),
+                    "Backend type must be \"s3\" or \"filesystem\" or \"oci\"".to_string(),
                 ));
             }
         }
         None => {}
+    }
+
+    if effective_type != Some("oci") {
+        for key in ["oci_repository", "oci_insecure"] {
+            if is_configured(key)
+                && let Some(idx) = index(key)
+            {
+                errors.push((idx, "OCI field requires OCI backend".to_string()));
+            }
+        }
     }
 
     errors
@@ -630,7 +701,7 @@ fn refresh_remote_env_scope(fields: &mut [FormField]) {
         .is_some_and(|field| {
             matches!(
                 field.value.trim().to_ascii_lowercase().as_str(),
-                "filesystem" | "fs"
+                "filesystem" | "fs" | "oci"
             )
         });
 
@@ -732,6 +803,8 @@ fn fields_to_file_config(fields: &[FormField], original: &FileConfig) -> FileCon
 
     let remote = if has_remote {
         Some(RemoteFileConfig {
+            repository: get("oci_repository"),
+            insecure: get_bool("oci_insecure"),
             // Not a form field: carried over so saving never drops it.
             pull_request_prefix: original
                 .cache
@@ -1330,13 +1403,110 @@ mod tests {
     fn test_build_fields_count() {
         let config = FileConfig::default();
         let fields = build_fields(&config, &empty_env());
-        assert_eq!(fields.len(), 21);
+        assert_eq!(fields.len(), 23);
 
         let sections = build_sections();
         assert_eq!(sections[0].fields, 0..3);
         assert_eq!(sections[1].fields, 3..10);
-        assert_eq!(sections[2].fields, 10..19);
-        assert_eq!(sections[3].fields, 19..21);
+        assert_eq!(sections[2].fields, 10..21);
+        assert_eq!(sections[3].fields, 21..23);
+    }
+
+    #[test]
+    fn oci_editor_validates_and_preserves_repository_and_http_setting() {
+        let original = FileConfig::default();
+        let mut env = empty_env();
+        env.s3_bucket = true;
+        env.s3_prefix = true;
+        let mut fields = build_fields(&original, &env);
+        for (key, value) in [
+            ("remote_type", "oci"),
+            ("oci_repository", "localhost:5000/team/cache"),
+            ("oci_insecure", "true"),
+        ] {
+            fields
+                .iter_mut()
+                .find(|field| field.key == key)
+                .unwrap()
+                .value = value.to_string();
+        }
+        refresh_remote_env_scope(&mut fields);
+        assert!(
+            !fields
+                .iter()
+                .find(|field| field.key == "s3_bucket")
+                .unwrap()
+                .env_locked
+        );
+        assert!(
+            !fields
+                .iter()
+                .find(|field| field.key == "remote_prefix")
+                .unwrap()
+                .env_locked
+        );
+        assert!(validate_cross_field(&fields).is_empty());
+        let saved = fields_to_file_config(&fields, &original);
+        let remote = saved.cache.as_ref().unwrap().remote.as_ref().unwrap();
+        assert_eq!(
+            remote.repository.as_deref(),
+            Some("localhost:5000/team/cache")
+        );
+        assert_eq!(remote.insecure, Some(true));
+        assert_eq!(remote._type.as_deref(), Some("oci"));
+        let reloaded = build_fields(&saved, &empty_env());
+        assert_eq!(
+            reloaded
+                .iter()
+                .find(|field| field.key == "oci_repository")
+                .unwrap()
+                .value,
+            "localhost:5000/team/cache"
+        );
+        assert_eq!(
+            reloaded
+                .iter()
+                .find(|field| field.key == "oci_insecure")
+                .unwrap()
+                .value,
+            "true"
+        );
+        fields
+            .iter_mut()
+            .find(|field| field.key == "oci_repository")
+            .unwrap()
+            .value
+            .clear();
+        assert!(
+            validate_cross_field(&fields)
+                .iter()
+                .any(|(idx, _)| fields[*idx].key == "oci_repository")
+        );
+        fields
+            .iter_mut()
+            .find(|field| field.key == "oci_repository")
+            .unwrap()
+            .value = "ghcr.io/team/cache".to_string();
+        fields
+            .iter_mut()
+            .find(|field| field.key == "s3_bucket")
+            .unwrap()
+            .value = "bucket".to_string();
+        assert!(
+            validate_cross_field(&fields)
+                .iter()
+                .any(|(_, message)| message.contains("conflicts with OCI"))
+        );
+        fields
+            .iter_mut()
+            .find(|field| field.key == "remote_type")
+            .unwrap()
+            .value = "s3".to_string();
+        assert!(
+            validate_cross_field(&fields)
+                .iter()
+                .any(|(_, message)| message.contains("requires OCI"))
+        );
     }
 
     #[test]
@@ -2027,6 +2197,8 @@ mod tests {
                     path: None,
                     atomic_write_dir: None,
                     pull_request_prefix: None,
+                    repository: None,
+                    insecure: None,
                 }),
             }),
         };

@@ -6,7 +6,7 @@
 
 # Kache
 
-Kache is a compiler cache for Rust, C/C++, and CUDA. It keys every compiler invocation by the content of its inputs, so a crate built once is restored instead of rebuilt in your next worktree, branch, or CI run. Outputs live in a local content-addressed store and can be shared through S3-compatible or filesystem remotes. Linux, macOS, and Windows are supported and release-tested.
+Kache is a compiler cache for Rust, C/C++, and CUDA. It keys every compiler invocation by the content of its inputs, so a crate built once is restored instead of rebuilt in your next worktree, branch, or CI run. Outputs live in a local content-addressed store and can be shared through S3-compatible storage, GCS, shared filesystems, or OCI registries. Linux, macOS, and Windows are supported and release-tested.
 
 Built by [Kunobi][kunobi-brand].
 
@@ -61,6 +61,7 @@ Hits, misses, and passthroughs are reported per unit, and `kache explain` says w
 | S3-compatible remote storage | Built in | Includes AWS S3, MinIO, and Cloudflare R2 |
 | Google Cloud Storage | Built in | Application Default Credentials, including GKE workload identity |
 | Filesystem remote storage | Built in | Useful for shared disks and CI volumes |
+| OCI registry remote storage | Built in | Stores cache objects as OCI artifacts |
 
 [![Bytes a second Firefox worktree adds to disk on APFS: about 3 GB for Kache, which reflinks the other 13.5 GB, against 16.7 GB for sccache, which writes an independent copy.](https://raw.githubusercontent.com/kunobi-ninja/kache/main/assets/worktree-cost.svg)][storage-chart]
 
@@ -123,6 +124,31 @@ region = "us-east-1"
 ```
 
 Credentials come from the standard AWS environment variables or credential chain. See [S3 setup](https://kunobi.ninja/docs/kache/remote-cache/s3-setup) and [filesystem setup](https://kunobi.ninja/docs/kache/remote-cache/filesystem-setup).
+
+To use an OCI registry, configure a repository without a tag or digest:
+
+```toml
+[cache.remote]
+type = "oci"
+repository = "ghcr.io/my-org/kache-cache"
+prefix = "artifacts"
+```
+
+Authenticate with `docker login` or `oras login`. Kache reads
+`$DOCKER_CONFIG/config.json` (default: `~/.docker/config.json`), including Docker
+credential helpers. Without configured credentials, it connects anonymously.
+For a local HTTP registry, set `insecure = true`; HTTPS is the default.
+
+Each cache object is an OCI artifact with one layer. Tags use
+`kache-v1-<BLAKE3 of the object key>`; the manifest's
+`ninja.kunobi.kache.key` annotation records the original key. Listing scans tags
+and reads their manifests, so large caches cost more requests than S3 listings.
+Keep cache artifacts in a dedicated repository and configure its retention
+policy to retain the cache tags.
+
+OCI does not guarantee conditional tag writes. Kache uses its ordinary-write
+fallback, so concurrent publishers can overwrite merged build metadata.
+Use a single publisher when that metadata must retain every update.
 
 ## Useful commands
 

@@ -2,6 +2,7 @@
 //! column tables, and the number, byte, duration and path forms every command
 //! prints the same way. JSON output does not go through here.
 
+#[cfg(not(test))]
 use std::io::IsTerminal;
 use std::path::Path;
 
@@ -59,6 +60,7 @@ struct Output {
 }
 
 impl Output {
+    #[cfg(not(test))]
     fn current() -> Self {
         let terminal = std::io::stdout().is_terminal();
         Self {
@@ -74,6 +76,16 @@ impl Output {
                         .map(|(w, _)| usize::from(w))
                 })
                 .flatten(),
+        }
+    }
+
+    // Renderer snapshots use fixed settings. Integration tests exercise the
+    // command binary in a real terminal, including color and width detection.
+    #[cfg(test)]
+    fn current() -> Self {
+        Self {
+            color: false,
+            columns: None,
         }
     }
 
@@ -311,6 +323,45 @@ fn pad_left(text: &str, to: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn help_styles_use_the_shared_heading_color() {
+        use clap::builder::styling::{AnsiColor, Color};
+        let styles = clap_styles();
+        assert_eq!(
+            styles.get_header().get_fg_color(),
+            Some(Color::Ansi(AnsiColor::Cyan))
+        );
+        assert_eq!(
+            styles.get_usage().get_fg_color(),
+            Some(Color::Ansi(AnsiColor::Cyan))
+        );
+    }
+
+    #[test]
+    fn notes_use_the_inline_column_at_exactly_sixteen_remaining_cells() {
+        let rows = [("A", "v".into(), "0123456789012345".into())];
+        assert_eq!(
+            rows_with(
+                &rows,
+                Output {
+                    color: false,
+                    columns: Some(26)
+                }
+            ),
+            ["  A   v   0123456789012345"]
+        );
+        assert_eq!(
+            rows_with(
+                &rows,
+                Output {
+                    color: false,
+                    columns: Some(25)
+                }
+            ),
+            ["  A   v", "      0123456789012345"]
+        );
+    }
 
     #[test]
     fn color_requires_a_capable_terminal_without_no_color() {

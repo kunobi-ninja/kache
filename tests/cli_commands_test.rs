@@ -213,7 +213,8 @@ fn unknown_subcommand_is_a_usage_error() {
         .arg("definitely-not-a-command")
         .assert()
         .failure()
-        .code(2);
+        .code(2)
+        .stdout(predicates::str::is_empty());
 }
 
 /// `kache test-runner` hands back the test binary's exit code, with the
@@ -576,6 +577,237 @@ fn report_emits_each_format() {
 }
 
 #[test]
+fn report_formats_and_full_index_diagnostics_are_distinct() {
+    let e = env();
+    let github = e
+        .cmd()
+        .args(["report", "--format", "github"])
+        .output()
+        .unwrap();
+    assert!(github.status.success());
+    let github = String::from_utf8(github.stdout).unwrap();
+    assert!(github.starts_with("### kache build cache\n"), "{github}");
+    assert!(!github.contains("Index diagnostics"), "{github}");
+    let text = e
+        .cmd()
+        .args(["report", "--format", "text"])
+        .output()
+        .unwrap();
+    assert!(text.status.success());
+    let text = String::from_utf8(text.stdout).unwrap();
+    assert!(text.contains("Index diagnostics"), "{text}");
+    assert!(!text.starts_with("### kache build cache\n"), "{text}");
+}
+
+#[test]
+fn doctor_human_groups_each_check_once() {
+    let e = env();
+    let output = e.cmd().arg("doctor").output().unwrap();
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).unwrap();
+    let setup = text.find("\nSetup\n").unwrap();
+    let storage = text.find("\nStorage\n").unwrap();
+    let services = text.find("\nServices\n").unwrap();
+    let rows = text
+        .lines()
+        .filter(|line| line.starts_with("  RUSTC_WRAPPER "))
+        .collect::<Vec<_>>();
+    assert_eq!(rows.len(), 1, "{text}");
+    assert!(text[setup..storage].contains(rows[0]), "{text}");
+    assert!(!text[storage..].contains(rows[0]), "{text}");
+    assert!(text[storage..services].contains("  Cache dir "), "{text}");
+    assert!(text[services..].contains("  Daemon version "), "{text}");
+}
+
+#[test]
+fn init_plan_matches_the_requested_components_and_keeps_prompt_lines_separate() {
+    let e = env();
+    let output = e
+        .cmd()
+        .args(["init", "--no-shell", "--no-service"])
+        .write_stdin("n\n")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.contains("[Y/n] \n  Setup cancelled."), "{text}");
+    assert!(!text.contains("  Shell "), "{text}");
+    assert!(!text.contains("  Service "), "{text}");
+    assert!(!e.home.join(".cargo").join("config.toml").exists());
+
+    let output = e
+        .cmd()
+        .args(["init", "--check", "--no-shell", "--json"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let plan: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let steps = plan["steps"].as_array().unwrap();
+    assert!(!steps.iter().any(|step| step["component"] == "shell"));
+    assert!(
+        steps
+            .iter()
+            .any(|step| step["component"] == "login_service")
+    );
+    let text = String::from_utf8(output.stderr).unwrap();
+    assert!(text.contains("  Service "), "{text}");
+    assert!(!text.contains("  Shell "), "{text}");
+}
+
+#[cfg(unix)]
+#[test]
+fn init_shell_plan_lists_only_the_shell_paths() {
+    let e = env();
+    let output = e
+        .cmd()
+        .args(["init", "--check", "--no-service", "--json"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let plan: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let steps = plan["steps"].as_array().unwrap();
+    assert!(
+        !steps
+            .iter()
+            .any(|step| step["component"] == "login_service")
+    );
+    let shell = steps
+        .iter()
+        .find(|step| step["component"] == "shell")
+        .unwrap();
+    let text = String::from_utf8(output.stderr).unwrap();
+    assert!(text.contains("  Shell "), "{text}");
+    assert!(!text.contains("  Service "), "{text}");
+    let shell_files = text
+        .lines()
+        .filter(|line| line.starts_with("  Shell file "))
+        .collect::<Vec<_>>();
+    let paths = shell["paths"].as_array().unwrap();
+    assert_eq!(shell_files.len(), paths.len(), "{text}");
+    for path in paths {
+        let path = std::path::Path::new(path.as_str().unwrap());
+        assert!(
+            shell_files
+                .iter()
+                .any(|line| line.contains(path.file_name().unwrap().to_str().unwrap())),
+            "{text}"
+        );
+    }
+    assert!(!e.home.join(".bashrc").exists());
+}
+
+#[cfg(unix)]
+fn terminal_output(mut command: std::process::Command, columns: u16) -> String {
+    use std::io::Read;
+    use std::os::fd::FromRawFd;
+    use std::os::unix::process::CommandExt;
+    use std::process::Stdio;
+    let (mut master, mut slave) = (-1, -1);
+    let mut size = libc::winsize {
+        ws_row: 24,
+        ws_col: columns,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    // SAFETY: openpty initializes both descriptors; size points to a valid
+    // winsize. Null name and termios request the platform defaults.
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut size,
+            )
+        },
+        0
+    );
+    // SAFETY: both descriptors are open and owned by this function. Close on
+    // exec prevents fixture children from retaining the master's descriptor.
+    unsafe {
+        assert_eq!(libc::fcntl(master, libc::F_SETFD, libc::FD_CLOEXEC), 0);
+        assert_eq!(libc::fcntl(slave, libc::F_SETFD, libc::FD_CLOEXEC), 0);
+    }
+    // SAFETY: each descriptor is transferred to exactly one owning File.
+    let (mut master, slave) = unsafe {
+        (
+            std::fs::File::from_raw_fd(master),
+            std::fs::File::from_raw_fd(slave),
+        )
+    };
+    // SAFETY: after fork, these system calls attach the child's session to its
+    // stdout terminal. No allocation or shared Rust state is accessed here.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1
+                || libc::ioctl(libc::STDOUT_FILENO, libc::TIOCSCTTY as _, 0) == -1
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let child = command
+        .stdin(Stdio::null())
+        .stdout(slave.try_clone().unwrap())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    drop(command);
+    drop(slave);
+    let mut bytes = Vec::new();
+    let mut buffer = [0; 4096];
+    loop {
+        match master.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(n) => bytes.extend_from_slice(&buffer[..n]),
+            Err(error) if error.raw_os_error() == Some(libc::EIO) => break,
+            Err(error) => panic!("reading terminal output: {error}"),
+        }
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    String::from_utf8(bytes).unwrap().replace("\r\n", "\n")
+}
+
+#[cfg(unix)]
+#[test]
+fn terminal_color_policy_and_wrapping_match_the_actual_command() {
+    let e = env();
+    for (no_color, term, colored) in [
+        (None, "xterm", true),
+        (Some(""), "xterm", true),
+        (Some("1"), "xterm", false),
+        (None, "dumb", false),
+    ] {
+        let mut command = kache_process_as(Path::new(KACHE_BIN), &e.home, &e.cache);
+        command
+            .args(["init", "--check", "--no-service", "--no-shell"])
+            .env_remove("NO_COLOR")
+            .env("TERM", term);
+        if let Some(no_color) = no_color {
+            command.env("NO_COLOR", no_color);
+        }
+        let text = terminal_output(command, 80);
+        assert_eq!(
+            text.contains('\x1b'),
+            colored,
+            "{no_color:?}, {term}: {text:?}"
+        );
+        assert!(text.contains("Setup plan"), "{text}");
+    }
+    let mut command = kache_process_as(Path::new(KACHE_BIN), &e.home, &e.cache);
+    command
+        .args(["init", "--check", "--no-service", "--no-shell"])
+        .env("NO_COLOR", "1")
+        .env("TERM", "xterm");
+    let text = terminal_output(command, 35);
+    assert!(text.contains("start or restart the\n"), "{text}");
+    assert!(text.contains("cache if needed"), "{text}");
+}
+
+#[test]
 fn report_json_on_empty_cache_is_valid_json() {
     let e = env();
     let out = e
@@ -920,7 +1152,7 @@ fn json_init_previews_without_writes_and_applies_without_prompts() {
     assert_eq!(body["steps"][0]["action"], "configure");
     assert_eq!(
         body["steps"][0]["paths"][0],
-        e.home.join(".cargo/config.toml").to_str().unwrap()
+        e.home.join(".cargo").join("config.toml").to_str().unwrap()
     );
     assert!(body["daemon_running"].is_null());
     assert!(!e.home.join(".cargo/config.toml").exists());

@@ -3967,6 +3967,31 @@ fn verify_reports_valid_entries_on_a_clean_store() {
 
 /// The `kache stats` row labelled `label` as `label | value | note`, the
 /// same form as [`row_text`].
+#[test]
+fn doctor_groups_each_label_by_its_component() {
+    for label in ["Daemon socket", "Service file", "Remote cache"] {
+        assert_eq!(doctor_section(label), "Services", "{label}");
+    }
+    for label in [
+        "Cache directory",
+        "Store index",
+        "Shard mount",
+        "Link layout",
+    ] {
+        assert_eq!(doctor_section(label), "Storage", "{label}");
+    }
+    assert_eq!(doctor_section("RUSTC_WRAPPER"), "Setup");
+    assert_eq!(doctor_section("Other"), "Setup");
+}
+
+#[test]
+fn login_service_configuration_covers_existing_and_new_installations() {
+    assert!(!login_service_configured(false, false));
+    assert!(login_service_configured(true, false));
+    assert!(login_service_configured(false, true));
+    assert!(login_service_configured(true, true));
+}
+
 fn stats_row(lines: &[String], label: &str) -> Option<String> {
     let line = lines.iter().find(|line| {
         line.strip_prefix("  ")

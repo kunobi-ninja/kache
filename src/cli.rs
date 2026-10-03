@@ -9210,13 +9210,20 @@ pub fn init(yes: bool, no_service: bool, no_shell: bool, check: bool) -> Result<
                 cargo_configured: cargo_ready,
                 shell_activation_required: shell_pending,
                 test_activation_required: tests_pending,
-                service_installed: service_installed || service_action_taken,
+                service_installed: login_service_configured(
+                    service_installed,
+                    service_action_taken,
+                ),
                 daemon_running: Some(is_daemon_reachable(&config)),
             },
             Vec::new(),
         )?;
     }
     Ok(())
+}
+
+fn login_service_configured(already_installed: bool, installed_now: bool) -> bool {
+    already_installed || installed_now
 }
 
 #[cfg(unix)]

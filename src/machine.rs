@@ -118,7 +118,7 @@ pub(crate) fn emit_error(command: &str, code: &str, error: &anyhow::Error) -> Re
 }
 
 /// The command tree lets scripts discover syntax without parsing help prose.
-pub(crate) fn emit_help(mut command: clap::Command) -> Result<()> {
+fn help_document(mut command: clap::Command) -> impl Serialize {
     #[derive(Serialize)]
     struct Argument {
         name: String,
@@ -166,14 +166,18 @@ pub(crate) fn emit_help(mut command: clap::Command) -> Result<()> {
                 .collect(),
         }
     }
+    describe(&mut command)
+}
+
+pub(crate) fn emit_help(command: clap::Command) -> Result<()> {
     #[derive(Serialize)]
-    struct Body {
-        cli: Command,
+    struct Body<T> {
+        cli: T,
     }
     emit(
         "help",
         Body {
-            cli: describe(&mut command),
+            cli: help_document(command),
         },
         Vec::new(),
     )
@@ -377,6 +381,42 @@ mod tests {
             .to_string();
         assert!(error.contains("kache config"), "{error}");
         assert!(error.contains("the alternative"), "{error}");
+    }
+
+    #[test]
+    fn help_document_omits_hidden_arguments_commands_and_values() {
+        use clap::builder::{PossibleValue, PossibleValuesParser};
+        let command = clap::Command::new("fixture")
+            .disable_help_flag(true)
+            .disable_help_subcommand(true)
+            .arg(
+                clap::Arg::new("mode")
+                    .long("mode")
+                    .short('m')
+                    .help("Choose a mode")
+                    .required(true)
+                    .value_parser(PossibleValuesParser::new([
+                        PossibleValue::new("visible"),
+                        PossibleValue::new("secret").hide(true),
+                    ])),
+            )
+            .arg(clap::Arg::new("internal").long("internal").hide(true))
+            .subcommand(clap::Command::new("shown").about("Visible command"))
+            .subcommand(clap::Command::new("hidden").hide(true));
+        let doc = serde_json::to_value(help_document(command)).unwrap();
+        assert_eq!(doc["name"], "fixture");
+        assert!(doc["usage"].as_str().unwrap().contains("--mode"));
+        assert_eq!(doc["arguments"].as_array().unwrap().len(), 1);
+        let arg = &doc["arguments"][0];
+        assert_eq!(arg["name"], "mode");
+        assert_eq!(arg["long"], "mode");
+        assert_eq!(arg["short"], "m");
+        assert_eq!(arg["required"], true);
+        assert_eq!(arg["description"], "Choose a mode");
+        assert_eq!(arg["values"], serde_json::json!(["visible"]));
+        assert_eq!(doc["subcommands"].as_array().unwrap().len(), 1);
+        assert_eq!(doc["subcommands"][0]["name"], "shown");
+        assert_eq!(doc["subcommands"][0]["description"], "Visible command");
     }
 
     fn empty_view() -> DiskView {

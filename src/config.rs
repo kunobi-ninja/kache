@@ -375,7 +375,8 @@ pub struct Config {
     /// `KACHE_PULL_REQUEST_PREFIX`, resolved only in a pull request job
     /// ([`crate::policy::pull_request_job`]). Protected-branch pushes never
     /// read it. `None` elsewhere, and in a pull request job without it, which
-    /// stays read-only.
+    /// stays read-only. OCI pull request jobs always stay read-only because
+    /// registry permissions apply to repositories rather than tag prefixes.
     pub pull_request_prefix: Option<String>,
     /// Opt-in too-new-input guard (kunobi-ninja/kache#324): when on, an
     /// invocation whose keyed inputs were modified at/after the build started is
@@ -2008,6 +2009,13 @@ impl Config {
             .unwrap_or_else(|| default_remote_key_listing(remote.as_ref()));
         let pull_request_prefix = if crate::policy::pull_request_job() {
             remote.as_ref().and_then(|remote| {
+                if matches!(remote.backend, RemoteBackendConfig::Oci(_)) {
+                    tracing::warn!(
+                        "OCI pull request jobs stay read-only: tags in one repository share \
+                         permissions, so pull_request_prefix cannot isolate writes"
+                    );
+                    return None;
+                }
                 let configured = env_or_ignored("KACHE_PULL_REQUEST_PREFIX", ignore_env)
                     .ok()
                     .or_else(|| {

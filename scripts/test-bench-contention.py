@@ -130,6 +130,47 @@ class ContentionTests(unittest.TestCase):
                 blob.stat().st_blocks * 512,
             )
 
+    def test_shared_extents_are_charged_once(self):
+        shared = bench.FIEMAP_EXTENT_SHARED | bench.FIEMAP_EXTENT_LAST
+        items = [
+            (1, 4096, [(100, 4096, shared)], True),
+            (1, 4096, [(100, 4096, shared)], True),
+            (1, 4096, [(100, 4096, shared)], True),
+        ]
+        allocated, resolved = bench.resolve_allocated(items)
+        self.assertTrue(resolved)
+        self.assertEqual(allocated, 4096)
+
+    def test_a_later_shared_extent_cannot_drive_the_charge_negative(self):
+        shared = bench.FIEMAP_EXTENT_SHARED | bench.FIEMAP_EXTENT_LAST
+        items = [
+            (1, 4096, [(100, 4096, shared)], True),
+            (1, 100, [(100, 4096, shared)], True),
+        ]
+        allocated, resolved = bench.resolve_allocated(items)
+        self.assertTrue(resolved)
+        self.assertEqual(allocated, 4096)
+
+    def test_private_extents_keep_their_block_count(self):
+        private = bench.FIEMAP_EXTENT_LAST
+        items = [
+            (1, 5000, [(100, 4096, private)], True),
+            (1, 100, [], False),
+        ]
+        allocated, resolved = bench.resolve_allocated(items)
+        self.assertTrue(resolved)
+        self.assertEqual(allocated, 5100)
+
+    def test_one_unmapped_file_keeps_the_block_sum(self):
+        shared = bench.FIEMAP_EXTENT_SHARED | bench.FIEMAP_EXTENT_LAST
+        items = [
+            (1, 4096, [(100, 4096, shared)], True),
+            (1, 4096, None, True),
+        ]
+        allocated, resolved = bench.resolve_allocated(items)
+        self.assertFalse(resolved)
+        self.assertEqual(allocated, 8192)
+
     def test_storage_missing_target_fails_instead_of_reporting_zero(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

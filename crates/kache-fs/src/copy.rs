@@ -20,6 +20,36 @@ pub fn try_reflink(src: &Path, dst: &Path) -> io::Result<()> {
     native_reflink(src, dst)
 }
 
+/// Share `src` data into an existing writable `dst` file.
+///
+/// The destination inode and directory entry stay in place, so a mode or ACL
+/// chosen at creation is kept. Failure leaves `dst` in place for the caller to
+/// overwrite. Platforms without an in-place clone return an error.
+pub fn try_clone_extents_into(src: &Path, dst: &fs::File) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+
+        let src_file = fs::File::open(src)?;
+        // Same request as `try_reflink`: FICLONE on btrfs and XFS with reflink.
+        const FICLONE: libc::c_ulong = 0x40049409;
+        let ret = unsafe { libc::ioctl(dst.as_raw_fd(), FICLONE as _, src_file.as_raw_fd()) };
+        if ret == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (src, dst);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "cloning into an existing file is not supported on this platform",
+        ))
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn native_reflink_macos(src: &Path, dst: &Path) -> io::Result<()> {
     use std::ffi::CString;
@@ -257,6 +287,24 @@ mod tests {
         assert_eq!(fs::metadata(&src).unwrap().len(), 256 * 1024);
         assert!(try_reflink(&dir.path().join("missing"), &dst).is_err());
         assert_eq!(fs::read(&dst).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn cloning_into_an_existing_file_keeps_that_file() {
+        let dir = TempDir::new("clone-into");
+        let src = dir.write("source", 128 * 1024);
+        let dst = dir.path().join("destination");
+        fs::write(&dst, b"keep").unwrap();
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&dst)
+            .unwrap();
+        match try_clone_extents_into(&src, &file) {
+            Ok(()) => assert_eq!(fs::metadata(&dst).unwrap().len(), 128 * 1024),
+            Err(_) => assert_eq!(fs::read(&dst).unwrap(), b"keep"),
+        }
+        assert!(dst.is_file());
     }
 
     #[test]

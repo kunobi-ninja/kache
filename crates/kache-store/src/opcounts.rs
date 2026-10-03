@@ -1,14 +1,21 @@
 //! Bytes materialized by the store and its consumers.
 
+use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static REFLINKED_BYTES: AtomicU64 = AtomicU64::new(0);
 static HARDLINKED_BYTES: AtomicU64 = AtomicU64::new(0);
 static COPIED_BYTES: AtomicU64 = AtomicU64::new(0);
 
+thread_local! {
+    static THREAD_REFLINKED: Cell<u64> = const { Cell::new(0) };
+    static THREAD_COPIED: Cell<u64> = const { Cell::new(0) };
+}
+
 /// Record `bytes` restored from cache by a CoW reflink.
 pub fn record_reflinked(bytes: u64) {
     REFLINKED_BYTES.fetch_add(bytes, Ordering::Relaxed);
+    THREAD_REFLINKED.with(|slot| slot.set(slot.get() + bytes));
 }
 
 /// Record `bytes` restored by a hardlink (reflink unavailable).
@@ -19,6 +26,7 @@ pub fn record_hardlinked(bytes: u64) {
 /// Record `bytes` restored by a full physical copy (no reflink, no hardlink).
 pub fn record_copied(bytes: u64) {
     COPIED_BYTES.fetch_add(bytes, Ordering::Relaxed);
+    THREAD_COPIED.with(|slot| slot.set(slot.get() + bytes));
 }
 
 /// Bytes restored by CoW reflink so far in this process.
@@ -34,6 +42,17 @@ pub fn hardlinked_bytes() -> u64 {
 /// Bytes restored by a full copy so far in this process.
 pub fn copied_bytes() -> u64 {
     COPIED_BYTES.load(Ordering::Relaxed)
+}
+
+/// Reflink bytes recorded on this thread. Other tests increment the process
+/// total concurrently; a restore test reads this instead.
+pub fn thread_reflinked_bytes() -> u64 {
+    THREAD_REFLINKED.with(Cell::get)
+}
+
+/// Copied bytes recorded on this thread.
+pub fn thread_copied_bytes() -> u64 {
+    THREAD_COPIED.with(Cell::get)
 }
 
 // ── Store-method byte counters ──────────────────────────────────────────────

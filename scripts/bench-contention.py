@@ -824,27 +824,142 @@ def write_report(args, data):
             )
         lines += [
             "",
-            "Mean allocated blocks after each batch, outside the timer. Hardlinks count once within each scope; the combined column deduplicates across cache and targets. Reflink extents are unresolved, so these are not exclusive physical disk bytes. Sources, Cargo home, runtime logs and cold snapshots are excluded. Cache-resident session logs are included and broken out in samples.json.",
+            "Mean allocated blocks after each batch, outside the timer. Hardlinks count once within each scope; the combined column deduplicates across cache and targets. On Linux a shared extent counts once when every regular file in the scope has a usable map; otherwise the figure stays on st_blocks. Sources, Cargo home, runtime logs and cold snapshots are excluded. Cache-resident session logs are included and broken out in samples.json.",
         ]
     if data.get("error"):
         lines += ["", f"INVALID MEASUREMENT: {data['error']}"]
     (args.output / "report.md").write_text("\n".join(lines) + "\n")
 
 
+# FIEMAP flags from Linux uapi. Lengths are usable only for this subset;
+# anything else (encoded, delayed, unaligned) discards the map.
+FIEMAP_EXTENT_LAST = 0x1
+FIEMAP_EXTENT_SHARED = 0x2000
+FIEMAP_ACCOUNTABLE_FLAGS = 0x3801
+_FIEMAP_EXTENTS_PER_PAGE = 128
+_FIEMAP_MAX_PAGES = 64
+_FS_IOC_FIEMAP = 0xC020660B
+
+
+def resolve_allocated(items):
+    """Bytes to charge for one scope.
+
+    Each item is `(device, blocks, extents, regular)`. `extents` is a list of
+    `(physical, length, flags)` or `None` when a regular file could not be
+    mapped. One unmapped regular file keeps the `st_blocks` sum. A shared
+    extent is charged on the first file that has it and subtracted from later
+    files, so clones count once while hardlinks stay on their single inode.
+    """
+    blocks_sum = sum(item[1] for item in items)
+    if any(regular and extents is None for _, _, extents, regular in items):
+        return blocks_sum, False
+    seen = set()
+    total = 0
+    for device, blocks, extents, regular in items:
+        if not regular or not any(
+            flags & FIEMAP_EXTENT_SHARED for _, _, flags in extents
+        ):
+            total += blocks
+            continue
+        charge = blocks
+        for physical, length, flags in extents:
+            if flags & FIEMAP_EXTENT_SHARED == 0:
+                continue
+            key = (device, physical, length)
+            if key in seen:
+                charge -= length
+            else:
+                seen.add(key)
+        if charge < 0:
+            charge = 0
+        total += charge
+    return total, True
+
+
+def linux_extent_map(path):
+    """Shared-extent map for a regular file, or `None` when it cannot be used."""
+    if sys.platform != "linux":
+        return None
+    import ctypes
+    import fcntl
+
+    class FiemapExtent(ctypes.Structure):
+        _fields_ = [
+            ("logical", ctypes.c_uint64),
+            ("physical", ctypes.c_uint64),
+            ("length", ctypes.c_uint64),
+            ("reserved64", ctypes.c_uint64 * 2),
+            ("flags", ctypes.c_uint32),
+            ("reserved", ctypes.c_uint32 * 3),
+        ]
+
+    class Fiemap(ctypes.Structure):
+        _fields_ = [
+            ("start", ctypes.c_uint64),
+            ("length", ctypes.c_uint64),
+            ("flags", ctypes.c_uint32),
+            ("mapped_extents", ctypes.c_uint32),
+            ("extent_count", ctypes.c_uint32),
+            ("reserved", ctypes.c_uint32),
+            ("extents", FiemapExtent * _FIEMAP_EXTENTS_PER_PAGE),
+        ]
+
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except OSError:
+        return None
+    try:
+        offset = 0
+        found = []
+        for _ in range(_FIEMAP_MAX_PAGES):
+            request = Fiemap()
+            request.start = offset
+            request.length = (1 << 64) - 1 - offset
+            request.flags = 1
+            request.extent_count = _FIEMAP_EXTENTS_PER_PAGE
+            try:
+                fcntl.ioctl(fd, _FS_IOC_FIEMAP, request, True)
+            except OSError:
+                return None
+            mapped = request.mapped_extents
+            if mapped > _FIEMAP_EXTENTS_PER_PAGE:
+                return None
+            if mapped == 0:
+                return found
+            for index in range(mapped):
+                extent = request.extents[index]
+                if extent.flags & ~FIEMAP_ACCOUNTABLE_FLAGS:
+                    return None
+                if extent.length == 0 or extent.logical < offset:
+                    return None
+                offset = extent.logical + extent.length
+                found.append((extent.physical, extent.length, extent.flags))
+                if extent.flags & FIEMAP_EXTENT_LAST:
+                    if index + 1 != mapped:
+                        return None
+                    return found
+            if offset == (1 << 64) - 1:
+                return None
+        return None
+    finally:
+        os.close(fd)
+
+
 def measure_storage(store, repos, backend):
     """Scan completed outputs without following symlinks or counting hardlinks twice.
 
-    Allocated bytes are st_blocks, including directories, not exclusive physical
-    usage: shared reflink extents and filesystem compression are not resolved.
-    Source, Cargo home, runtime diagnostics and cold snapshots are excluded.
+    Allocated bytes start as st_blocks. On Linux, a shared FIEMAP extent is
+    counted once across the inodes in the scope. An unusable map keeps the
+    st_blocks sum for the whole scope. Source, Cargo home, runtime diagnostics
+    and cold snapshots are excluded.
     """
     groups = {}
 
-    def add(group, identity, size, blocks, kind):
+    def add(group, identity, size, blocks, kind, path, regular):
         bucket = groups.setdefault(group, {"logical_bytes": 0, "paths": 0, "inodes": {}})
         bucket["logical_bytes"] += size
         bucket["paths"] += 1
-        bucket["inodes"][identity] = (size, blocks, kind)
+        bucket["inodes"][identity] = (size, blocks, kind, path, regular)
 
     def visit(path, scope, relative=()):
         info = path.lstat()
@@ -852,6 +967,7 @@ def measure_storage(store, repos, backend):
         size = 0 if kind == "directory" else info.st_size
         identity = (info.st_dev, info.st_ino)
         blocks = info.st_blocks * 512
+        regular = stat.S_ISREG(info.st_mode)
         categories = [scope, "cache_and_targets"]
         if scope == "cache":
             if backend == "kache" and relative[:2] == ("store", "blobs"):
@@ -866,7 +982,7 @@ def measure_storage(store, repos, backend):
                 component = "other"
             categories.append("cache_" + component)
         for group in categories:
-            add(group, identity, size, blocks, kind)
+            add(group, identity, size, blocks, kind, path, regular)
         if kind == "directory":
             for child in path.iterdir():
                 visit(child, scope, (*relative, child.name))
@@ -874,11 +990,35 @@ def measure_storage(store, repos, backend):
     visit(store, "cache")
     for repo in repos:
         visit(repo / "target", "targets")
+    sharing_resolved = True
+    allocated_by_group = {}
+    for name, bucket in groups.items():
+        items = []
+        for (device, _ino), record in bucket["inodes"].items():
+            _size, blocks, _kind, file_path, regular = record
+            extents = []
+            if regular and sys.platform == "linux":
+                extents = linux_extent_map(file_path)
+            elif regular:
+                extents = None
+            items.append((device, blocks, extents, regular))
+        allocated, resolved = resolve_allocated(items)
+        allocated_by_group[name] = allocated
+        sharing_resolved = sharing_resolved and resolved
+    if not sharing_resolved:
+        for name, bucket in groups.items():
+            allocated_by_group[name] = sum(
+                record[1] for record in bucket["inodes"].values()
+            )
     result = {
         "schema_version": 1,
         "point": "after_batch",
-        "allocation_method": "st_blocks_times_512_unique_device_inode",
-        "reflink_sharing_resolved": False,
+        "allocation_method": (
+            "st_blocks_minus_repeated_shared_extents"
+            if sharing_resolved and sys.platform == "linux"
+            else "st_blocks_times_512_unique_device_inode"
+        ),
+        "reflink_sharing_resolved": sharing_resolved and sys.platform == "linux",
         "symlinks_followed": False,
         "excluded": ["source", "cargo_home", "runtime", "cold_snapshot", "reports"],
         "groups": {},
@@ -888,7 +1028,7 @@ def measure_storage(store, repos, backend):
         result["groups"][name] = {
             "logical_bytes": bucket["logical_bytes"],
             "unique_logical_bytes": sum(entry[0] for entry in entries),
-            "allocated_bytes": sum(entry[1] for entry in entries),
+            "allocated_bytes": allocated_by_group[name],
             "paths": bucket["paths"],
             "unique_inodes": len(bucket["inodes"]),
         }

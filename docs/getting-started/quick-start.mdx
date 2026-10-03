@@ -99,7 +99,7 @@ kache init --no-shell    # leave shell startup files unchanged
 kache init --yes         # accept defaults without prompts
 ```
 
-Init asks before editing Cargo or shell configuration and backs up existing files. If you enable C/C++ caching or test pacing, open a new terminal afterward. For C/C++ you can instead run the activation command it prints. `--check` shows the planned changes without prompts or modifications.
+Init shows its plan and asks once before applying it, with a separate confirmation if another Cargo wrapper is set. It backs up existing files. Open a new terminal to activate C/C++ caching and test pacing; for C/C++ you can instead run the activation command it prints. `--check` shows the planned changes without prompts or modifications.
 
 After setup, keep using ordinary Cargo commands. Give concurrent worktrees separate target directories. Tools that build in temporary copies, such as cargo-mutants, need no extra setup; see [Mutation testing](/docs/getting-started/mutation-testing).
 

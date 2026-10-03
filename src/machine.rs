@@ -1,13 +1,31 @@
 //! Machine-readable CLI output, and the store-vs-disk split that output uses.
 //!
 //! Interactive surfaces (`kache monitor`, `kache config`, the `clean` selector)
-//! stay human. Agents get `--json` on the commands that diagnose and change
-//! disk: stats, gc, clean, doctor, why-miss, list, daemon status.
+//! stay human. Setup, reports, diagnostics and disk-management commands use
+//! one versioned document on stdout, including argument and command failures.
 
 use anyhow::Result;
 pub use kache_store::filesystem::*;
 use serde::Serialize;
 use std::path::Path;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+static JSON_MODE: AtomicBool = AtomicBool::new(false);
+static COMMAND: OnceLock<String> = OnceLock::new();
+
+pub(crate) fn configure(json: bool, command: String) {
+    JSON_MODE.store(json, Ordering::Relaxed);
+    let _ = COMMAND.set(command);
+}
+
+pub(crate) fn command() -> &'static str {
+    COMMAND.get().map(String::as_str).unwrap_or("cli")
+}
+
+pub(crate) fn is_json() -> bool {
+    JSON_MODE.load(Ordering::Relaxed)
+}
 
 /// JSON document version. Bump on breaking field/meaning changes; additive
 /// fields do not bump it.
@@ -45,9 +63,10 @@ pub struct NextAction {
 }
 
 #[derive(Debug, Serialize)]
-struct JsonDoc<T: Serialize> {
+struct JsonDoc<'a, T: Serialize> {
     schema_version: u32,
-    command: &'static str,
+    command: &'a str,
+    success: bool,
     #[serde(flatten)]
     body: T,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -55,16 +74,113 @@ struct JsonDoc<T: Serialize> {
 }
 
 /// Write one JSON document to stdout.
-pub fn emit<T: Serialize>(command: &'static str, body: T, next: Vec<NextAction>) -> Result<()> {
+pub fn emit<T: Serialize>(command: &str, body: T, next: Vec<NextAction>) -> Result<()> {
     let doc = JsonDoc {
         schema_version: SCHEMA_VERSION,
         command,
+        success: true,
         body,
         next,
     };
     serde_json::to_writer_pretty(std::io::stdout(), &doc)?;
     println!();
     Ok(())
+}
+
+/// Failures use the same stdout document contract as successful commands.
+pub(crate) fn emit_error(command: &str, code: &str, error: &anyhow::Error) -> Result<()> {
+    #[derive(Serialize)]
+    struct Failure<'a> {
+        code: &'a str,
+        message: String,
+        causes: Vec<String>,
+    }
+    #[derive(Serialize)]
+    struct Body<'a> {
+        error: Failure<'a>,
+    }
+    let doc = JsonDoc {
+        schema_version: SCHEMA_VERSION,
+        command,
+        success: false,
+        body: Body {
+            error: Failure {
+                code,
+                message: error.to_string(),
+                causes: error.chain().skip(1).map(ToString::to_string).collect(),
+            },
+        },
+        next: Vec::new(),
+    };
+    serde_json::to_writer_pretty(std::io::stdout(), &doc)?;
+    println!();
+    Ok(())
+}
+
+/// The command tree lets scripts discover syntax without parsing help prose.
+fn help_document(mut command: clap::Command) -> impl Serialize {
+    #[derive(Serialize)]
+    struct Argument {
+        name: String,
+        long: Option<String>,
+        short: Option<char>,
+        required: bool,
+        description: Option<String>,
+        values: Vec<String>,
+    }
+    #[derive(Serialize)]
+    struct Command {
+        name: String,
+        description: Option<String>,
+        usage: String,
+        arguments: Vec<Argument>,
+        subcommands: Vec<Command>,
+    }
+    fn describe(command: &mut clap::Command) -> Command {
+        let usage = command.render_usage().to_string();
+        Command {
+            name: command.get_name().to_owned(),
+            description: command.get_about().map(ToString::to_string),
+            usage,
+            arguments: command
+                .get_arguments()
+                .filter(|arg| !arg.is_hide_set())
+                .map(|arg| Argument {
+                    name: arg.get_id().to_string(),
+                    long: arg.get_long().map(str::to_owned),
+                    short: arg.get_short(),
+                    required: arg.is_required_set(),
+                    description: arg.get_help().map(ToString::to_string),
+                    values: arg
+                        .get_possible_values()
+                        .into_iter()
+                        .filter(|value| !value.is_hide_set())
+                        .map(|value| value.get_name().to_owned())
+                        .collect(),
+                })
+                .collect(),
+            subcommands: command
+                .get_subcommands_mut()
+                .filter(|command| !command.is_hide_set())
+                .map(describe)
+                .collect(),
+        }
+    }
+    describe(&mut command)
+}
+
+pub(crate) fn emit_help(command: clap::Command) -> Result<()> {
+    #[derive(Serialize)]
+    struct Body<T> {
+        cli: T,
+    }
+    emit(
+        "help",
+        Body {
+            cli: help_document(command),
+        },
+        Vec::new(),
+    )
 }
 
 pub fn require_tty(is_tty: bool, command: &str, alternative: &str) -> Result<()> {
@@ -265,6 +381,42 @@ mod tests {
             .to_string();
         assert!(error.contains("kache config"), "{error}");
         assert!(error.contains("the alternative"), "{error}");
+    }
+
+    #[test]
+    fn help_document_omits_hidden_arguments_commands_and_values() {
+        use clap::builder::{PossibleValue, PossibleValuesParser};
+        let command = clap::Command::new("fixture")
+            .disable_help_flag(true)
+            .disable_help_subcommand(true)
+            .arg(
+                clap::Arg::new("mode")
+                    .long("mode")
+                    .short('m')
+                    .help("Choose a mode")
+                    .required(true)
+                    .value_parser(PossibleValuesParser::new([
+                        PossibleValue::new("visible"),
+                        PossibleValue::new("secret").hide(true),
+                    ])),
+            )
+            .arg(clap::Arg::new("internal").long("internal").hide(true))
+            .subcommand(clap::Command::new("shown").about("Visible command"))
+            .subcommand(clap::Command::new("hidden").hide(true));
+        let doc = serde_json::to_value(help_document(command)).unwrap();
+        assert_eq!(doc["name"], "fixture");
+        assert!(doc["usage"].as_str().unwrap().contains("--mode"));
+        assert_eq!(doc["arguments"].as_array().unwrap().len(), 1);
+        let arg = &doc["arguments"][0];
+        assert_eq!(arg["name"], "mode");
+        assert_eq!(arg["long"], "mode");
+        assert_eq!(arg["short"], "m");
+        assert_eq!(arg["required"], true);
+        assert_eq!(arg["description"], "Choose a mode");
+        assert_eq!(arg["values"], serde_json::json!(["visible"]));
+        assert_eq!(doc["subcommands"].as_array().unwrap().len(), 1);
+        assert_eq!(doc["subcommands"][0]["name"], "shown");
+        assert_eq!(doc["subcommands"][0]["description"], "Visible command");
     }
 
     fn empty_view() -> DiskView {

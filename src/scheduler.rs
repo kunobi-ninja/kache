@@ -1475,6 +1475,8 @@ mod tests {
     }
 
     fn test_scheduler(dir: &Path, pool: u32) -> Scheduler {
+        // Slot-count fixtures must not depend on the host's memory pressure.
+        pressure::force(Some(false));
         Scheduler::open_with(dir, pool, Duration::from_secs(5), Duration::from_millis(10)).unwrap()
     }
 
@@ -2651,6 +2653,7 @@ mod tests {
     const BUDGET: Duration = Duration::from_millis(300);
 
     fn budget_scheduler(dir: &Path, pool: u32) -> Scheduler {
+        pressure::force(Some(false));
         Scheduler::open_with(dir, pool, BUDGET, Duration::from_millis(5)).unwrap()
     }
 
@@ -2674,6 +2677,7 @@ mod tests {
 
     #[test]
     fn memory_pressure_admits_a_compile_only_when_no_other_holds_a_slot() {
+        pressure::force(Some(false));
         let dir = temp_cache();
         let scheduler = Scheduler::open_with(
             dir.path(),

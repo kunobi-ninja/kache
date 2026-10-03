@@ -148,10 +148,10 @@ pub(crate) fn render(
     max_size: u64,
 ) -> Vec<String> {
     let latest = builds.latest;
-    let mut lines = vec![format!(
-        "kache explain · latest build of {}",
+    let mut lines = vec![term::heading(format!(
+        "kache · explain · latest build of {}",
         term::home_path(Path::new(&latest.root))
-    )];
+    ))];
     lines.push(String::new());
 
     let misses = analysis.misses_total;
@@ -176,7 +176,7 @@ pub(crate) fn render(
             String::new(),
         ));
     }
-    lines.extend(term::sections(&[rows]));
+    lines.extend(term::named_sections(&[("Builds", rows)]));
 
     let mut causes = analysis.causes.clone();
     causes.sort_by(|a, b| {
@@ -198,14 +198,14 @@ pub(crate) fn render(
             })
             .collect();
         lines.push(String::new());
-        lines.push("Why it missed, costliest first".to_string());
+        lines.push(term::heading("Why it missed, costliest first"));
         lines.extend(term::table(
             &["COMPILE", "COUNT", "WHY", "CRATES"],
             &[Align::Right, Align::Right, Align::Left, Align::Left],
             &body,
         ));
         lines.push(String::new());
-        lines.push("What would help".to_string());
+        lines.push(term::heading("What would help"));
         let mut seen = Vec::new();
         for group in &causes {
             let fix = fix(&group.cause, max_size);
@@ -559,7 +559,7 @@ mod tests {
         let analysis = tui_sessions::analyze_session(&events, builds.latest, &all);
         let lines = render(&builds, &analysis, &events, 5 << 30);
         let text = lines.join("\n");
-        assert_eq!(lines[0], "kache explain · latest build of /w");
+        assert_eq!(lines[0], "kache · explain · latest build of /w");
         assert!(
             text.contains("  Misses        2   1 in the build before"),
             "{text}"

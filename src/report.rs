@@ -3780,10 +3780,10 @@ pub fn format_text(report: &BuildReport) -> String {
     let total_hits = s.local_hits + s.prefetch_hits + s.remote_hits;
     let total_compiled = s.dups + s.misses;
 
-    let mut lines = vec![format!(
+    let mut lines = vec![term::heading(format!(
         "kache · last {} · full report",
         report.meta.window_label()
-    )];
+    ))];
     if let Some(session) = &report.meta.session {
         lines.push(format!("  {}", session.description()));
     }
@@ -3801,7 +3801,11 @@ pub fn format_text(report: &BuildReport) -> String {
         ),
     )];
     if let Some(w) = s.weighted_hit_rate_pct {
-        summary.push(("By cost", term::percent(w), "of compile time".into()));
+        summary.push((
+            "By time",
+            term::percent(w),
+            "compile time served from cache".into(),
+        ));
     }
     summary.push((
         "Time saved",
@@ -4000,7 +4004,11 @@ pub fn format_text(report: &BuildReport) -> String {
             ),
         ));
     }
-    lines.extend(term::sections(&[summary, network, storage]));
+    lines.extend(term::named_sections(&[
+        ("Builds", summary),
+        ("Remote transfers", network),
+        ("Storage", storage),
+    ]));
 
     // Where wrapper time went.
     let mut timing = vec![
@@ -4049,7 +4057,7 @@ pub fn format_text(report: &BuildReport) -> String {
         ));
     }
     lines.push(String::new());
-    lines.push("Timing".into());
+    lines.push(term::heading("Timing"));
     lines.extend(term::table(
         &["", "TOTAL", "AVERAGE", ""],
         &[Left, Right, Right, Left],
@@ -4075,7 +4083,7 @@ pub fn format_text(report: &BuildReport) -> String {
             .collect();
         if !body.is_empty() {
             lines.push(String::new());
-            lines.push("Download phases".into());
+            lines.push(term::heading("Download phases"));
             lines.extend(term::table(&["", "TIME"], &[Left, Right], &body));
         }
     }
@@ -4096,7 +4104,7 @@ pub fn format_text(report: &BuildReport) -> String {
             })
             .collect();
         lines.push(String::new());
-        lines.push("Not cached".into());
+        lines.push(term::heading("Not cached"));
         lines.extend(term::table(
             &["COUNT", "FAILED", "SLOWEST", "HOW", "WHY"],
             &[Right, Right, Right, Left, Left],
@@ -4123,7 +4131,7 @@ pub fn format_text(report: &BuildReport) -> String {
                 })
                 .collect();
             lines.push(String::new());
-            lines.push("Slowest not cached".into());
+            lines.push(term::heading("Slowest not cached"));
             lines.extend(term::table(
                 &["CRATE", "TIME", "EXIT", "WHY"],
                 &[Left, Right, Right, Left],
@@ -4152,7 +4160,7 @@ pub fn format_text(report: &BuildReport) -> String {
             })
             .collect();
         lines.push(String::new());
-        lines.push("Slowest misses".into());
+        lines.push(term::heading("Slowest misses"));
         lines.extend(term::table(
             &["CRATE", "COMPILE", "SIZE", ""],
             &[Left, Right, Right, Left],
@@ -4173,7 +4181,7 @@ pub fn format_text(report: &BuildReport) -> String {
             })
             .collect();
         lines.push(String::new());
-        lines.push("Most valuable hits".into());
+        lines.push(term::heading("Most valuable hits"));
         lines.extend(term::table(
             &["CRATE", "AVOIDED", "SIZE"],
             &[Left, Right, Right],
@@ -4189,13 +4197,13 @@ pub fn format_text(report: &BuildReport) -> String {
             .map(|err| vec![err.crate_name.clone(), local_time(&err.timestamp)])
             .collect();
         lines.push(String::new());
-        lines.push("Errors".into());
+        lines.push(term::heading("Errors"));
         lines.extend(term::table(&["CRATE", "WHEN"], &[Left, Left], &body));
     }
 
     if !report.suggestions.is_empty() {
         lines.push(String::new());
-        lines.push("Suggestions".into());
+        lines.push(term::heading("Suggestions"));
         for suggestion in &report.suggestions {
             lines.push(format!("  - {suggestion}"));
         }

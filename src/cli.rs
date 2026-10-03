@@ -1,4 +1,5 @@
 use crate::term;
+use crate::term::human_println as println;
 use anyhow::{Context, Result};
 use bytesize::ByteSize;
 use std::io::IsTerminal;
@@ -805,12 +806,19 @@ pub fn stats(
             lifetime: Option<crate::savings::Totals>,
             entries: usize,
             hit_rate_pct: f64,
+            weighted_hit_rate_pct: Option<f64>,
+            time_saved_ms: u64,
+            hit_elapsed_ms: u64,
+            miss_elapsed_ms: u64,
+            total_elapsed_ms: u64,
             local_hits: usize,
             prefetch_hits: usize,
             remote_hits: usize,
             dups: usize,
             misses: usize,
             daemon_connected: bool,
+            daemon_version: String,
+            daemon_epoch: u64,
             /// Whole hours, rounded down (0 for a sub-hour window). Kept for
             /// consumers that predate `since_secs`.
             hours: u64,
@@ -838,12 +846,19 @@ pub fn stats(
                 lifetime,
                 entries: snap.entry_count,
                 hit_rate_pct: hit_rate,
+                weighted_hit_rate_pct: compile_weighted_hit_rate(&snap.event_stats),
+                time_saved_ms: snap.event_stats.hit_compile_time_ms,
+                hit_elapsed_ms: snap.event_stats.hit_elapsed_ms,
+                miss_elapsed_ms: snap.event_stats.miss_elapsed_ms,
+                total_elapsed_ms: snap.event_stats.total_elapsed_ms,
                 local_hits: snap.event_stats.local_hits,
                 prefetch_hits: snap.event_stats.prefetch_hits,
                 remote_hits: snap.event_stats.remote_hits,
                 dups: snap.event_stats.dups,
                 misses: snap.event_stats.misses,
                 daemon_connected: snap.daemon_connected,
+                daemon_version: snap.daemon_version.clone(),
+                daemon_epoch: snap.daemon_build_epoch,
                 hours: window.hours(),
                 since_secs: window.secs(),
                 since: window.label(),
@@ -859,7 +874,9 @@ pub fn stats(
         ..Default::default()
     };
     extras.cache.extend(cloned_targets_row(&disk));
-    extras.cache.extend(machine_rows(&machine));
+    let mut compact_machine = machine.clone();
+    compact_machine.rowid_high_water.clear();
+    extras.cache.extend(machine_rows(&compact_machine));
     if let Some(path) = &host_config {
         extras
             .service
@@ -991,7 +1008,7 @@ fn machine_rows(machine: &crate::otel::MachineSnapshot) -> Vec<StatsRow> {
 }
 
 /// One `label   value   note` row of `kache stats`.
-pub(crate) type StatsRow = (&'static str, String, String);
+pub(crate) type StatsRow = term::Row<'static>;
 
 /// Rows `kache stats` adds to the snapshot's sections from its own reads.
 #[derive(Default)]
@@ -1023,12 +1040,15 @@ pub(crate) fn render_stats_with(
     cache.extend(extras.cache.iter().cloned());
     let mut service = service_rows(snap, config);
     service.extend(extras.service.iter().cloned());
-    let mut lines = vec![format!("kache · last {window}"), String::new()];
-    lines.extend(term::sections(&[
-        build_rows(snap),
-        extras.lifetime.clone(),
-        cache,
-        service,
+    let mut lines = vec![
+        term::heading(format!("kache · last {window}")),
+        String::new(),
+    ];
+    lines.extend(term::named_sections(&[
+        ("Builds", build_rows(snap)),
+        ("Lifetime", extras.lifetime.clone()),
+        ("Storage", cache),
+        ("Services", service),
     ]));
     lines
 }
@@ -1080,10 +1100,7 @@ fn lifetime_rows(
         return rows;
     }
     let since = totals.since.with_timezone(&chrono::Local).date_naive();
-    rows.insert(
-        0,
-        ("Since", since_label(since, today), "lifetime".to_string()),
-    );
+    rows.insert(0, ("Since", since_label(since, today), String::new()));
     rows
 }
 
@@ -1122,9 +1139,9 @@ fn build_rows(snap: &StatsSnapshot) -> Vec<StatsRow> {
     let mut rows = vec![("Hit rate", term::percent(count_hit_rate(es)), from_cache)];
     if let Some(weighted) = compile_weighted_hit_rate(es) {
         rows.push((
-            "By cost",
+            "By time",
             term::percent(weighted),
-            "of compile time".to_string(),
+            "compile time served from cache".to_string(),
         ));
     }
     rows.push(if es.hit_compile_time_ms > 0 {
@@ -1140,11 +1157,8 @@ fn build_rows(snap: &StatsSnapshot) -> Vec<StatsRow> {
         let miss_share = (es.miss_elapsed_ms as f64 / es.total_elapsed_ms as f64) * 100.0;
         rows.push((
             "Miss time",
-            term::percent(miss_share),
-            format!(
-                "of wrapper time ({})",
-                term::duration_ms(es.miss_elapsed_ms)
-            ),
+            term::duration_ms(es.miss_elapsed_ms),
+            format!("{} of wrapper time", term::percent(miss_share)),
         ));
     }
     rows
@@ -1177,15 +1191,18 @@ fn cache_rows(snap: &StatsSnapshot, config: &Config) -> Vec<StatsRow> {
         snap.max_size,
         crate::cache_fs::probe(&config.cache_dir).total_bytes,
     );
-    let mut rows = vec![(
-        "Cache",
-        term::bytes(snap.total_size),
-        format!(
-            "of {}{note} · {} entries",
-            term::bytes(snap.max_size),
-            term::count(snap.entry_count as u64)
+    let mut rows = vec![
+        (
+            "Cache",
+            term::bytes(snap.total_size),
+            format!("logical · {} entries", term::count(snap.entry_count as u64)),
         ),
-    )];
+        (
+            "Limit",
+            term::bytes(snap.max_size),
+            format!("private cache budget{note}"),
+        ),
+    ];
     for store in &snap.stores {
         if let Some(error) = &store.error {
             rows.push((
@@ -1255,7 +1272,7 @@ fn service_rows(snap: &StatsSnapshot, config: &Config) -> Vec<StatsRow> {
         rows.push((
             "Daemon",
             format!("v{}", snap.daemon_version),
-            format!("epoch {}{config_note}{mismatch}", snap.daemon_build_epoch),
+            format!("running{config_note}{mismatch}"),
         ));
     } else {
         rows.push(("Daemon", "offline".to_string(), String::new()));
@@ -1670,13 +1687,47 @@ pub fn report(
         "trace" | "perfetto" | "chrome-trace" => crate::report::format_trace_json(&report)?,
         "markdown" | "md" => crate::report::format_markdown(&report),
         "github" | "gh" => crate::report::format_github(&report),
-        _ => crate::report::format_text(&report),
+        _ => {
+            let mut text = crate::report::format_text(&report);
+            let mut machine = machine_snapshot(config);
+            machine.gc = None;
+            let diagnostics =
+                term::named_sections(&[("Index diagnostics", machine_rows(&machine))]);
+            if !diagnostics.is_empty() {
+                text.push_str("\n\n");
+                text.push_str(&diagnostics.join("\n"));
+            }
+            text
+        }
     };
 
     if let Some(path) = output {
-        std::fs::write(&path, &text)
+        std::fs::write(&path, term::strip_sgr(&text))
             .with_context(|| format!("writing report to {}", path.display()))?;
         eprintln!("Report written to {}", path.display());
+        if crate::machine::is_json() {
+            #[derive(serde::Serialize)]
+            struct Written {
+                output: std::path::PathBuf,
+                format: String,
+            }
+            crate::machine::emit(
+                crate::machine::command(),
+                Written {
+                    output: path,
+                    format: format.into(),
+                },
+                Vec::new(),
+            )?;
+        }
+    } else if crate::machine::is_json() {
+        // The standalone report already has schema_version. Keep all its
+        // fields while adding the common command and success metadata.
+        let mut body = serde_json::to_value(&report)?;
+        body.as_object_mut()
+            .context("report is not an object")?
+            .remove("schema_version");
+        crate::machine::emit(crate::machine::command(), body, Vec::new())?;
     } else {
         println!("{text}");
     }
@@ -3355,14 +3406,8 @@ pub fn list(
             return Ok(());
         }
 
-        let mut lines = vec![
-            format!(
-                "{:<30} {:<10} {:<8} {:>10} {:>6} {:>12} {:>12}  {}",
-                "Crate", "Type", "Profile", "Size", "Hits", "Created", "Accessed", "Stores"
-            ),
-            "-".repeat(92),
-        ];
-
+        let mut lines = vec![term::heading("kache · entries"), String::new()];
+        let mut body = Vec::new();
         for entry in &entries {
             let crate_type = if entry.crate_type.is_empty() {
                 "-"
@@ -3374,20 +3419,30 @@ pub fn list(
             } else {
                 &entry.profile
             };
-            lines.push(format!(
-                "{:<30} {:<10} {:<8} {:>10} {:>6} {:>12} {:>12}  {}",
-                entry.crate_name,
-                crate_type,
-                profile,
-                ByteSize(entry.size).to_string(),
-                entry.hit_count,
-                &entry.created_at[..10],
-                &entry.last_accessed[..10],
+            body.push(vec![
+                entry.crate_name.clone(),
+                crate_type.into(),
+                profile.into(),
+                term::bytes(entry.size),
+                term::count(entry.hit_count),
+                entry.created_at.chars().take(10).collect(),
+                entry.last_accessed.chars().take(10).collect(),
                 entry.store_locations(),
-            ));
+            ]);
         }
-
-        lines.push(format!("\n{} entries", entries.len()));
+        use term::Align::{Left, Right};
+        lines.extend(term::table(
+            &[
+                "CRATE", "TYPE", "PROFILE", "SIZE", "HITS", "CREATED", "ACCESSED", "STORES",
+            ],
+            &[Left, Left, Left, Right, Right, Left, Left, Left],
+            &body,
+        ));
+        lines.push(String::new());
+        lines.push(term::paint(
+            format!("{} entries", term::count(entries.len() as u64)),
+            term::Style::Muted,
+        ));
         write_paged(&lines, no_pager);
     }
 
@@ -6192,6 +6247,20 @@ fn doctor_link_layout(config: &Config, build_dir: &std::path::Path) -> Check {
     }
 }
 
+fn doctor_section(label: &str) -> &'static str {
+    if label.starts_with("Daemon") || label.starts_with("Service") || label.starts_with("Remote") {
+        "Services"
+    } else if label.starts_with("Cache")
+        || label.starts_with("Store")
+        || label.starts_with("Shard")
+        || label.starts_with("Link")
+    {
+        "Storage"
+    } else {
+        "Setup"
+    }
+}
+
 pub fn doctor(
     fix: bool,
     purge_sccache: bool,
@@ -6775,38 +6844,39 @@ pub fn doctor(
         return Ok(());
     }
 
-    println!();
-    println!("  kache v{version}    {rustc_version}");
-    println!();
-
-    let label_width = checks.iter().map(|c| c.label.len()).max().unwrap_or(0);
+    println!("{}", term::heading("kache · doctor"));
+    println!(
+        "{}\n",
+        term::paint(
+            format!("  v{version} · {rustc_version}"),
+            term::Style::Muted
+        )
+    );
 
     let check_results: Vec<(&str, bool)> = checks.iter().map(|c| (c.label, c.pass)).collect();
     let downgraded_daemon = daemon_footnote_needed(daemon_optional, &check_results);
-    for check in &checks {
-        let optional = check_is_optional(check.label);
-        // A failing optional check is informational, not a problem: render it
-        // with a neutral dimmed marker rather than the red ✗.
-        let icon = if check.pass {
-            "\x1b[32m✓\x1b[0m"
-        } else if optional {
-            "\x1b[2m•\x1b[0m"
-        } else {
-            "\x1b[31m✗\x1b[0m"
-        };
-        println!(
-            "  {icon} {:<width$}  {}",
-            check.label,
-            check.detail,
-            width = label_width,
-        );
-        if let Some(ref fix) = check.fix {
-            println!(
-                "    {:<width$}  \x1b[33m→ {fix}\x1b[0m",
-                "",
-                width = label_width,
-            );
+    for section in ["Setup", "Storage", "Services"] {
+        let mut rows = Vec::new();
+        for check in checks
+            .iter()
+            .filter(|check| doctor_section(check.label) == section)
+        {
+            let (icon, style) = if check.pass {
+                ("✓", term::Style::Success)
+            } else if check_is_optional(check.label) {
+                ("•", term::Style::Muted)
+            } else {
+                ("✗", term::Style::Error)
+            };
+            rows.push((check.label, term::paint(icon, style), check.detail.clone()));
+            if let Some(fix) = &check.fix {
+                rows.push(("", term::paint("→", term::Style::Warning), fix.clone()));
+            }
         }
+        for line in term::named_sections(&[(section, rows)]) {
+            println!("{line}");
+        }
+        println!();
     }
 
     println!();
@@ -8542,14 +8612,12 @@ static PROMPT_HAD_NO_INPUT: std::sync::atomic::AtomicBool =
 fn prompt_yes_no(question: &str, default_yes: bool, auto_yes: bool) -> Result<bool> {
     use std::io::{BufRead, Write};
 
-    let suffix = if default_yes { "[Y/n]" } else { "[y/N]" };
-    print!("  {question} {suffix} ");
-    std::io::stdout().flush().ok();
-
     if auto_yes {
-        println!("y");
         return Ok(true);
     }
+    let suffix = if default_yes { "[Y/n]" } else { "[y/N]" };
+    print!("  {} {suffix} ", term::paint(question, term::Style::Value));
+    std::io::stdout().flush().ok();
 
     let stdin = std::io::stdin();
     let mut line = String::new();
@@ -8559,6 +8627,9 @@ fn prompt_yes_no(question: &str, default_yes: bool, auto_yes: bool) -> Result<bo
         return Ok(false);
     }
     let trimmed = line.trim().to_ascii_lowercase();
+    if !stdin.is_terminal() {
+        println!();
+    }
     if trimmed.is_empty() {
         return Ok(default_yes);
     }
@@ -8765,11 +8836,11 @@ fn back_up_cargo_config(cargo_path: &std::path::Path, existing: &str) -> Result<
     Ok(())
 }
 
-/// Point `build.rustdoc` at the rustdoc shim, after asking and with a backup,
+/// Point `build.rustdoc` at the rustdoc shim with a backup,
 /// like the `rustc-wrapper` edit. Only a config whose wrapper is already
 /// `kache` is edited.
 #[cfg(unix)]
-fn configure_cargo_rustdoc(yes: bool, check: bool) -> Result<()> {
+fn configure_cargo_rustdoc(check: bool) -> Result<()> {
     let Some(shim_dir) = crate::compiler::shim::default_shim_dir() else {
         return Ok(());
     };
@@ -8805,10 +8876,6 @@ fn configure_cargo_rustdoc(yes: bool, check: bool) -> Result<()> {
         println!("    Would set build.rustdoc to {}", shim.display());
         return Ok(());
     }
-    if !prompt_yes_no("Cache cargo doc as well?", true, yes)? {
-        println!("  • cargo doc: skipped");
-        return Ok(());
-    }
     back_up_cargo_config(&cargo_path, &existing)?;
     let updated = apply_rustdoc_edit(&existing, shim_path);
     if let Err(error) = std::fs::write(&cargo_path, updated) {
@@ -8819,8 +8886,74 @@ fn configure_cargo_rustdoc(yes: bool, check: bool) -> Result<()> {
     Ok(())
 }
 
+#[derive(serde::Serialize)]
+struct SetupStep {
+    component: &'static str,
+    action: &'static str,
+    paths: Vec<std::path::PathBuf>,
+}
+
+#[derive(serde::Serialize)]
+struct SetupResult {
+    preview: bool,
+    steps: Vec<SetupStep>,
+    cargo_configured: bool,
+    shell_activation_required: bool,
+    test_activation_required: bool,
+    service_installed: bool,
+    daemon_running: Option<bool>,
+}
+
+fn setup_steps(
+    cargo_path: &std::path::Path,
+    cargo_ready: bool,
+    no_shell: bool,
+    no_service: bool,
+) -> Result<Vec<SetupStep>> {
+    let mut steps = vec![SetupStep {
+        component: "cargo",
+        action: if cargo_ready { "keep" } else { "configure" },
+        paths: vec![cargo_path.to_owned()],
+    }];
+    #[cfg(unix)]
+    if !no_shell {
+        if let Some((_, paths)) = shell_startup_files()? {
+            steps.push(SetupStep {
+                component: "shell",
+                action: "configure",
+                paths,
+            });
+        } else {
+            steps.push(SetupStep {
+                component: "shell",
+                action: "unsupported",
+                paths: Vec::new(),
+            });
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = no_shell;
+    if !no_service {
+        steps.push(SetupStep {
+            component: "login_service",
+            action: if crate::service::login_service_available() {
+                "configure"
+            } else {
+                "unavailable"
+            },
+            paths: crate::service::service_file_path().into_iter().collect(),
+        });
+    }
+    steps.push(SetupStep {
+        component: "daemon",
+        action: "ensure_running",
+        paths: Vec::new(),
+    });
+    Ok(steps)
+}
+
 pub fn init(yes: bool, no_service: bool, no_shell: bool, check: bool) -> Result<()> {
-    println!("\n  Set up Kache\n");
+    println!("{}\n", term::heading("kache · setup"));
     if check {
         println!("  Preview only. No files or services will change.\n");
     }
@@ -8834,6 +8967,61 @@ pub fn init(yes: bool, no_service: bool, no_shell: bool, check: bool) -> Result<
     };
     let env_missing = crate::cargo_env::missing_assignments_from_path(&cargo_path)?;
     let mut cargo_ready = plan == CargoWrapperPlan::AlreadySet && env_missing.is_empty();
+    let steps = setup_steps(&cargo_path, cargo_ready, no_shell, no_service)?;
+    let mut plan_rows = vec![
+        (
+            "Cargo",
+            "caching".into(),
+            "Rust and native dependencies".into(),
+        ),
+        ("Config", term::home_path(&cargo_path), String::new()),
+    ];
+    if !no_shell && cfg!(unix) {
+        plan_rows.push((
+            "Shell",
+            "new terminals".into(),
+            "C/C++ caching, Cargo target protection and test pacing".into(),
+        ));
+        plan_rows.push((
+            "Docs",
+            "caching".into(),
+            "cargo doc when build.rustdoc is unset".into(),
+        ));
+        for step in steps.iter().filter(|step| step.component == "shell") {
+            for path in &step.paths {
+                plan_rows.push(("Shell file", term::home_path(path), String::new()));
+            }
+        }
+    }
+    if !no_service {
+        plan_rows.push((
+            "Service",
+            "login".into(),
+            "start Kache at login when a login service is available".into(),
+        ));
+    }
+    plan_rows.push((
+        "Daemon",
+        "background".into(),
+        "start or restart the cache if needed".into(),
+    ));
+    for line in term::named_sections(&[("Setup plan", plan_rows)]) {
+        println!("{line}");
+    }
+    println!();
+    if !check && !prompt_yes_no("Apply this setup?", true, yes)? {
+        if PROMPT_HAD_NO_INPUT.load(std::sync::atomic::Ordering::Relaxed) {
+            anyhow::bail!(
+                "init changed nothing because stdin had no answers; rerun with --yes to accept the defaults"
+            );
+        }
+        println!("  Setup cancelled. No changes made.");
+        return Ok(());
+    }
+    println!(
+        "{}",
+        term::heading(if check { "Proposed changes" } else { "Setup" })
+    );
     if cargo_ready {
         println!("  ✓ Cargo caching: configured");
     } else {
@@ -8842,14 +9030,19 @@ pub fn init(yes: bool, no_service: bool, no_shell: bool, check: bool) -> Result<
             "    Config: {}",
             crate::wrapper_config::display_path(&cargo_path)
         );
-        let question = if let CargoWrapperPlan::Replace(old) = &plan {
-            format!("Replace {old} with Kache for Cargo builds?")
-        } else {
-            "Enable caching for Cargo builds?".into()
-        };
         if check {
             println!("    Would configure Cargo. Existing compiler choices are preserved.");
-        } else if prompt_yes_no(&question, true, yes)? {
+            if let CargoWrapperPlan::Replace(old) = &plan {
+                println!("    Would replace {old} with Kache for Cargo builds.");
+            }
+        } else if match &plan {
+            CargoWrapperPlan::Replace(old) => prompt_yes_no(
+                &format!("Replace {old} with Kache for Cargo builds?"),
+                true,
+                yes,
+            )?,
+            _ => true,
+        } {
             let wrapped = apply_cargo_wrapper_edit(&existing, &plan);
             let updated = crate::cargo_env::apply_cargo_env_edit(&wrapped, &env_missing);
             // Do not report success if a nonstandard existing wrapper could
@@ -8879,13 +9072,13 @@ pub fn init(yes: bool, no_service: bool, no_shell: bool, check: bool) -> Result<
     }
 
     #[cfg(unix)]
-    let shell_pending = init_compiler_setup(yes, no_shell, check)?;
+    let shell_pending = init_compiler_setup(no_shell, check)?;
     #[cfg(unix)]
     if !no_shell {
-        configure_cargo_rustdoc(yes, check)?;
+        configure_cargo_rustdoc(check)?;
     }
     #[cfg(unix)]
-    let tests_pending = init_test_runner(yes, no_shell, check)?;
+    let tests_pending = init_test_runner(no_shell, check)?;
     #[cfg(not(unix))]
     let (shell_pending, tests_pending) = {
         let _ = no_shell;
@@ -8910,7 +9103,7 @@ pub fn init(yes: bool, no_service: bool, no_shell: bool, check: bool) -> Result<
     } else if let Some(problem) = service_problem {
         println!("  \x1b[33m→\x1b[0m Background service: update to this Kache binary");
         println!("    {}", problem.detail());
-        if !check && prompt_yes_no("Update service?", true, yes)? {
+        if !check {
             service_action_taken = install_login_service();
         }
     } else if service_installed {
@@ -8920,7 +9113,7 @@ pub fn init(yes: bool, no_service: bool, no_shell: bool, check: bool) -> Result<
         );
     } else {
         println!("  \x1b[33m→\x1b[0m Background service: start Kache when you log in");
-        if !check && prompt_yes_no("Start Kache automatically at login?", true, yes)? {
+        if !check {
             service_action_taken = install_login_service();
         }
     }
@@ -8931,6 +9124,21 @@ pub fn init(yes: bool, no_service: bool, no_shell: bool, check: bool) -> Result<
     if check {
         println!("  Background cache: would check and start if needed.");
         println!("\n  Preview only. Run kache init to apply.\n");
+        if crate::machine::is_json() {
+            crate::machine::emit(
+                "init",
+                SetupResult {
+                    preview: true,
+                    steps,
+                    cargo_configured: cargo_ready,
+                    shell_activation_required: false,
+                    test_activation_required: false,
+                    service_installed,
+                    daemon_running: None,
+                },
+                Vec::new(),
+            )?;
+        }
         return Ok(());
     }
     let config = crate::config::Config::load().ok();
@@ -8958,10 +9166,7 @@ pub fn init(yes: bool, no_service: bool, no_shell: bool, check: bool) -> Result<
         // The shared coordinator drains this instance and uses its installed
         // manager only when that manager owns the configured runtime path.
         println!("  \x1b[33m→\x1b[0m Background cache: needs restart");
-        if !check
-            && prompt_yes_no("Restart daemon?", true, yes)?
-            && let Some(ref cfg) = config
-        {
+        if let Some(ref cfg) = config {
             match crate::daemon::restart(cfg)? {
                 true => println!("    \x1b[32m✓\x1b[0m Background cache: running"),
                 false => {
@@ -8972,13 +9177,11 @@ pub fn init(yes: bool, no_service: bool, no_shell: bool, check: bool) -> Result<
         }
     } else {
         println!("  \x1b[33m→\x1b[0m Background cache: not running");
-        if !check && prompt_yes_no("Start daemon now?", true, yes)? {
-            match crate::daemon::start_daemon_background()? {
-                true => println!("    \x1b[32m✓\x1b[0m Background cache: running"),
-                false => {
-                    println!("    \x1b[31m✗\x1b[0m daemon did not start within timeout");
-                    daemon_step_failed = true;
-                }
+        match crate::daemon::start_daemon_background()? {
+            true => println!("    \x1b[32m✓\x1b[0m Background cache: running"),
+            false => {
+                println!("    \x1b[31m✗\x1b[0m daemon did not start within timeout");
+                daemon_step_failed = true;
             }
         }
     }
@@ -8987,11 +9190,6 @@ pub fn init(yes: bool, no_service: bool, no_shell: bool, check: bool) -> Result<
     if daemon_step_failed {
         println!("  Background cache setup failed. Run kache doctor for details.\n");
         anyhow::bail!("init did not complete: daemon not reachable");
-    }
-    if !cargo_ready && PROMPT_HAD_NO_INPUT.load(std::sync::atomic::Ordering::Relaxed) {
-        anyhow::bail!(
-            "init changed nothing because stdin had no answers; rerun with --yes to accept the defaults"
-        );
     }
     if cargo_ready {
         println!("  Ready for Cargo builds. Use cargo as usual.");
@@ -9003,11 +9201,33 @@ pub fn init(yes: bool, no_service: bool, no_shell: bool, check: bool) -> Result<
         println!("  Open a new terminal to pace test binaries.");
     }
     println!("  Run kache doctor to check this terminal.\n");
+    if crate::machine::is_json() {
+        crate::machine::emit(
+            "init",
+            SetupResult {
+                preview: false,
+                steps,
+                cargo_configured: cargo_ready,
+                shell_activation_required: shell_pending,
+                test_activation_required: tests_pending,
+                service_installed: login_service_configured(
+                    service_installed,
+                    service_action_taken,
+                ),
+                daemon_running: Some(is_daemon_reachable(&config)),
+            },
+            Vec::new(),
+        )?;
+    }
     Ok(())
 }
 
+fn login_service_configured(already_installed: bool, installed_now: bool) -> bool {
+    already_installed || installed_now
+}
+
 #[cfg(unix)]
-fn init_compiler_setup(yes: bool, no_shell: bool, check: bool) -> Result<bool> {
+fn init_compiler_setup(no_shell: bool, check: bool) -> Result<bool> {
     use crate::init_shell::Edit;
     if no_shell {
         println!("  • Cargo target protection and C/C++ caching: skipped (--no-shell)");
@@ -9057,14 +9277,6 @@ fn init_compiler_setup(yes: bool, no_shell: bool, check: bool) -> Result<bool> {
         }
         if check {
             println!("    Would install Cargo and compiler links and save the shell setup.");
-            return Ok(false);
-        }
-        if !prompt_yes_no(
-            "Protect Cargo targets and cache C/C++ in new terminals?",
-            true,
-            yes,
-        )? {
-            println!("  • Cargo target protection and C/C++ caching: skipped");
             return Ok(false);
         }
         if !shims_ready {
@@ -9162,7 +9374,7 @@ fn test_pacing(current: Option<&str>) -> TestPacing {
 /// test-runner` looks that runner up and still runs the binary under it.
 /// Returns true when a new terminal is needed.
 #[cfg(unix)]
-fn init_test_runner(yes: bool, no_shell: bool, check: bool) -> Result<bool> {
+fn init_test_runner(no_shell: bool, check: bool) -> Result<bool> {
     use crate::init_shell::{Edit, TEST_RUNNER_BLOCK};
     if no_shell {
         println!("  • Test pacing: skipped (--no-shell)");
@@ -9202,10 +9414,6 @@ fn init_test_runner(yes: bool, no_shell: bool, check: bool) -> Result<bool> {
         }
         if check {
             println!("    Would set {var} in new terminals.");
-            return Ok(false);
-        }
-        if !prompt_yes_no("Pace test binaries in new terminals?", true, yes)? {
-            println!("  • Test pacing: skipped");
             return Ok(false);
         }
         for edit in &edits {

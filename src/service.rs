@@ -1,3 +1,4 @@
+use crate::term::{self, human_println as println};
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
@@ -967,6 +968,8 @@ pub fn status(json: bool) -> Result<()> {
         == Some(LEGACY_PLIST_NAME);
 
     if !json {
+        println!("{}\n", term::heading("kache · daemon"));
+        println!("{}", term::heading("Status"));
         // 0. Binary version (always shown)
         println!(
             "  kache:    v{} (epoch {})",
@@ -1057,6 +1060,7 @@ pub fn status(json: bool) -> Result<()> {
     }
 
     // 3. Socket path
+    println!("\n{}", term::heading("Runtime"));
     if let Some(ref cfg) = config {
         println!("  Socket:   {}", cfg.socket_path().display());
     }
@@ -1123,10 +1127,11 @@ fn format_service_line(
     supported: bool,
 ) -> Vec<String> {
     if let Some(path) = installed_path {
-        let mut lines = vec![format!(
-            "  Service:  \x1b[32minstalled\x1b[0m ({})",
-            path.display()
-        )];
+        let mut lines = term::rows(&[(
+            "Service",
+            term::paint("installed", term::Style::Success),
+            term::home_path(path),
+        )]);
         if legacy {
             lines.push(format!(
                 "            \x1b[33mlegacy label detected — run `kache daemon install` to migrate to {LABEL}\x1b[0m"
@@ -1134,12 +1139,24 @@ fn format_service_line(
         }
         lines
     } else if supported {
-        vec![
-            "  Service:  \x1b[33mnot installed\x1b[0m".to_string(),
-            "            run `kache daemon install` to set up".to_string(),
-        ]
+        term::rows(&[
+            (
+                "Service",
+                term::paint("not installed", term::Style::Warning),
+                String::new(),
+            ),
+            (
+                "",
+                String::new(),
+                "run `kache daemon install` to set up".into(),
+            ),
+        ])
     } else {
-        vec!["  Service:  \x1b[33munsupported platform\x1b[0m".to_string()]
+        term::rows(&[(
+            "Service",
+            term::paint("unsupported platform", term::Style::Muted),
+            String::new(),
+        )])
     }
 }
 
@@ -1157,16 +1174,26 @@ fn format_version_status(
         return Vec::new();
     }
     if daemon_epoch == my_epoch {
-        vec![format!(
-            "  Version:  \x1b[32mv{daemon_version} (epoch {daemon_epoch})\x1b[0m"
-        )]
-    } else {
-        vec![
-            format!(
-                "  Version:  \x1b[33mv{daemon_version} (epoch {daemon_epoch}) — binary is v{my_version} (epoch {my_epoch})\x1b[0m"
+        term::rows(&[(
+            "Version",
+            term::paint(
+                format!("v{daemon_version} (epoch {daemon_epoch})"),
+                term::Style::Success,
             ),
-            "            \x1b[33mauto-restart is pending\x1b[0m".to_string(),
-        ]
+            String::new(),
+        )])
+    } else {
+        term::rows(&[
+            (
+                "Version",
+                term::paint(
+                    format!("v{daemon_version} (epoch {daemon_epoch})"),
+                    term::Style::Warning,
+                ),
+                format!("binary is v{my_version} (epoch {my_epoch})"),
+            ),
+            ("", String::new(), "auto-restart is pending".into()),
+        ])
     }
 }
 

@@ -1473,7 +1473,7 @@ fn lifetime_rows_show_each_recorded_total() {
     let rows = lifetime_text(Some(&totals));
     assert_eq!(rows.len(), 4, "{rows:?}");
     assert!(rows[0].starts_with("Since | Sep "), "{rows:?}");
-    assert!(rows[0].ends_with(" | lifetime"), "{rows:?}");
+    assert!(rows[0].ends_with(" | "), "{rows:?}");
     assert_eq!(
         rows[1..],
         [
@@ -1549,7 +1549,11 @@ fn render_stats_places_the_lifetime_section_after_the_window() {
     };
     assert!(at("Time saved") < at("Since"), "{lines:#?}");
     assert!(at("Since") < at("Cache"), "{lines:#?}");
-    assert_eq!(lines[at("Since") - 1], "", "its own section: {lines:#?}");
+    assert_eq!(
+        lines[at("Since") - 1],
+        "Lifetime",
+        "its own section: {lines:#?}"
+    );
 }
 
 /// Dropping a table leaves its pages on the freelist until a compaction.
@@ -3963,6 +3967,31 @@ fn verify_reports_valid_entries_on_a_clean_store() {
 
 /// The `kache stats` row labelled `label` as `label | value | note`, the
 /// same form as [`row_text`].
+#[test]
+fn doctor_groups_each_label_by_its_component() {
+    for label in ["Daemon socket", "Service file", "Remote cache"] {
+        assert_eq!(doctor_section(label), "Services", "{label}");
+    }
+    for label in [
+        "Cache directory",
+        "Store index",
+        "Shard mount",
+        "Link layout",
+    ] {
+        assert_eq!(doctor_section(label), "Storage", "{label}");
+    }
+    assert_eq!(doctor_section("RUSTC_WRAPPER"), "Setup");
+    assert_eq!(doctor_section("Other"), "Setup");
+}
+
+#[test]
+fn login_service_configuration_covers_existing_and_new_installations() {
+    assert!(!login_service_configured(false, false));
+    assert!(login_service_configured(true, false));
+    assert!(login_service_configured(false, true));
+    assert!(login_service_configured(true, true));
+}
+
 fn stats_row(lines: &[String], label: &str) -> Option<String> {
     let line = lines.iter().find(|line| {
         line.strip_prefix("  ")
@@ -4008,16 +4037,20 @@ fn render_stats_rich_snapshot_covers_all_lines() {
     });
     let lines = render_stats(&snap, &config, SinceWindow::DEFAULT);
     let row = |label| stats_row(&lines, label).unwrap_or_else(|| panic!("{label}: {lines:#?}"));
-    assert!(row("Cache").starts_with("Cache | 4.9 KiB | of 9.8 KiB"));
+    assert_eq!(row("Cache"), "Cache | 4.9 KiB | logical · 3 entries");
+    assert!(row("Limit").starts_with("Limit | 9.8 KiB | private cache budget"));
     assert!(row("Dedup").starts_with("Dedup | 4 blobs | "));
     assert_eq!(
         row("Hit rate"),
         "Hit rate | 80.0% | 8 of 10 crates from cache"
     );
-    assert_eq!(row("By cost"), "By cost | 71.4% | of compile time");
+    assert_eq!(
+        row("By time"),
+        "By time | 71.4% | compile time served from cache"
+    );
     assert_eq!(
         row("Miss time"),
-        "Miss time | 30.0% | of wrapper time (300 ms)"
+        "Miss time | 300 ms | 30.0% of wrapper time"
     );
     assert_eq!(row("Time saved"), "Time saved | 5 s | compile work avoided");
     assert!(row("Daemon").starts_with("Daemon | v9.9.9 | "));
@@ -4414,7 +4447,7 @@ fn render_stats_prefetch_policy_labels_client_fallback_for_old_daemon() {
     );
     assert_eq!(
         stats_row(&out, "Daemon").unwrap(),
-        format!("Daemon | v | epoch {}", crate::daemon::build_epoch()),
+        "Daemon | v | running",
         "no daemon config path to show without a report"
     );
 }
@@ -4658,7 +4691,7 @@ fn render_stats_handles_zero_limits_and_zero_logical_dedup() {
     let out = render_stats(&snap, &config, window);
     assert_eq!(
         stats_row(&out, "Cache").unwrap(),
-        "Cache | 500 B | of 0 B · 0 entries"
+        "Cache | 500 B | logical · 0 entries"
     );
     assert_eq!(
         stats_row(&out, "Dedup").unwrap(),

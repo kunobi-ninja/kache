@@ -107,7 +107,7 @@ static MACOS_INFO_PLIST: [u8; include_bytes!("../assets/macos/Info.plist").len()
     *include_bytes!("../assets/macos/Info.plist");
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use std::io::IsTerminal;
 use std::path::PathBuf;
 
@@ -134,7 +134,7 @@ pub const VERSION: &str = {
 /// When invoked as RUSTC_WRAPPER (arg[1] is a path to rustc), kache acts as a
 /// transparent build cache. Otherwise, it provides CLI commands for cache management.
 #[derive(Parser)]
-#[command(name = "kache", version = VERSION, about)]
+#[command(name = "kache", version = VERSION, about = "Cache Cargo and C/C++ builds; inspect saved time and disk use", styles = term::clap_styles(), after_help = "Start with kache init. Keep using cargo as usual.\nUse kache stats for a summary or kache monitor for live activity.")]
 pub(crate) struct Cli {
     /// Machine-readable JSON on stdout, on commands that support it
     #[arg(long, global = true)]
@@ -626,6 +626,8 @@ fn command_supports_json(command: &Option<Commands>) -> bool {
                 | Commands::Stats { .. }
                 | Commands::Explain { .. }
                 | Commands::Diff { .. }
+                | Commands::Init { shims: None, .. }
+                | Commands::Report { .. }
                 | Commands::Daemon { command: None }
                 | Commands::Daemon {
                     command: Some(DaemonCommands::Status),
@@ -928,11 +930,67 @@ fn main() -> Result<()> {
     }
 
     // CLI mode: parse subcommands
-    let cli = Cli::parse();
+    let matches = match Cli::command().try_get_matches_from(&raw_args) {
+        Ok(matches) => matches,
+        Err(error) => {
+            let json = raw_args
+                .iter()
+                .skip(1)
+                .take_while(|arg| *arg != "--")
+                .any(|arg| arg == "--json");
+            if json && error.kind() == clap::error::ErrorKind::DisplayHelp {
+                machine::emit_help(Cli::command())?;
+                return Ok(());
+            }
+            if json && error.kind() == clap::error::ErrorKind::DisplayVersion {
+                machine::emit(
+                    "version",
+                    serde_json::json!({ "version": VERSION }),
+                    Vec::new(),
+                )?;
+                return Ok(());
+            }
+            if json && error.use_stderr() {
+                machine::emit_error(
+                    "cli",
+                    "invalid_arguments",
+                    &anyhow::anyhow!(error.to_string()),
+                )?;
+                eprint!("{error}");
+                std::process::exit(2);
+            }
+            error.exit();
+        }
+    };
+    let cli = Cli::from_arg_matches(&matches)?;
+    let json = cli.json;
+    let mut names = Vec::new();
+    let mut matched = &matches;
+    while let Some((name, args)) = matched.subcommand() {
+        names.push(name);
+        matched = args;
+    }
+    let command = if names.is_empty() {
+        "cli".into()
+    } else {
+        names.join("-")
+    };
+    machine::configure(json, command.clone());
+    if let Err(error) = run_cli(cli, readiness) {
+        if json {
+            machine::emit_error(&command, "command_failed", &error)?;
+        }
+        eprintln!("{} {error:#}", term::paint("error:", term::Style::Error));
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+fn run_cli(cli: Cli, readiness: Option<kunobi_daemon::readiness::channel::Notifier>) -> Result<()> {
     let json = cli.json;
     if json && !command_supports_json(&cli.command) {
         anyhow::bail!(
-            "`--json` is supported on stats, clean, doctor, explain, list, and daemon status."
+            "`--json` is supported on init, stats, report, clean, gc, doctor, explain, diff, list, targets, and daemon status."
         );
     }
 
@@ -1052,7 +1110,14 @@ fn main() -> Result<()> {
             no_shell,
             check,
             ..
-        }) => cli::init(yes, no_service, no_shell, check),
+        }) => {
+            if json && !yes && !check {
+                anyhow::bail!(
+                    "`kache init --json` needs `--check` to preview or `--yes` to apply setup."
+                );
+            }
+            cli::init(yes, no_service, no_shell, check)
+        }
         Some(Commands::Doctor {
             fix,
             purge_sccache,
@@ -1150,7 +1215,7 @@ fn main() -> Result<()> {
             let window = parse_since_window(&since)?;
             cli::report(
                 &config,
-                &format,
+                &report_format(Some(format), json)?,
                 window,
                 report::ReportFilter { root, last_build },
                 output,
@@ -1179,7 +1244,7 @@ fn main() -> Result<()> {
                 redact,
             );
             if full {
-                let format = report_format(format, json);
+                let format = report_format(format, json)?;
                 let window = parse_since_window(&since)?;
                 return cli::report(
                     &config,
@@ -1717,8 +1782,17 @@ fn stats_wants_full(
 
 /// The full report's format: the one asked for, else JSON under `--json`,
 /// else text.
-fn report_format(format: Option<String>, json: bool) -> String {
-    format.unwrap_or_else(|| if json { "json" } else { "text" }.to_string())
+fn report_format(format: Option<String>, json: bool) -> Result<String> {
+    if json {
+        anyhow::ensure!(
+            format
+                .as_deref()
+                .is_none_or(|format| format == "json" || format == "text"),
+            "`--json` cannot be combined with a different `--format`."
+        );
+        return Ok("json".into());
+    }
+    Ok(format.unwrap_or_else(|| "text".into()))
 }
 
 /// Parse a `--since` value, or fail loudly. Falling back to the default on a
@@ -1878,9 +1952,18 @@ mod tests {
 
     #[test]
     fn report_format_prefers_an_explicit_name() {
-        assert_eq!(report_format(None, false), "text");
-        assert_eq!(report_format(None, true), "json");
-        assert_eq!(report_format(Some("md".to_string()), true), "md");
+        assert_eq!(report_format(None, false).unwrap(), "text");
+        assert_eq!(report_format(None, true).unwrap(), "json");
+        assert_eq!(report_format(Some("md".to_string()), false).unwrap(), "md");
+        assert_eq!(
+            report_format(Some("text".to_string()), true).unwrap(),
+            "json"
+        );
+        assert_eq!(
+            report_format(Some("json".to_string()), true).unwrap(),
+            "json"
+        );
+        assert!(report_format(Some("md".to_string()), true).is_err());
     }
 
     #[test]

@@ -2212,6 +2212,8 @@ pub enum DepInfoMode {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use super::*;
 
     #[test]
@@ -2817,6 +2819,34 @@ mod tests {
         ))
     }
 
+    thread_local! {
+        static CLONE_CALLS: Cell<u32> = const { Cell::new(0) };
+    }
+
+    fn reset_clone_calls() {
+        CLONE_CALLS.with(|calls| calls.set(0));
+    }
+
+    fn clone_calls() -> u32 {
+        CLONE_CALLS.with(Cell::get)
+    }
+
+    fn count_clone_call() -> u32 {
+        CLONE_CALLS.with(|calls| {
+            let next = calls.get() + 1;
+            calls.set(next);
+            next
+        })
+    }
+
+    fn clone_names(dir: &Path) -> Vec<String> {
+        fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".kache-cc-clone-"))
+            .collect()
+    }
+
     fn restore_deltas() -> (u64, u64) {
         (
             crate::opcounts::thread_copied_bytes(),
@@ -2976,6 +3006,161 @@ mod tests {
         assert_eq!(copied, copied_before + bytes);
         assert_eq!(reflinked, reflinked_before);
         fs::write(&output, b"changed").unwrap();
+        assert_eq!(fs::read(&blob).unwrap(), b"cached object");
+    }
+
+    #[test]
+    fn replacing_a_clone_overwrites_the_existing_output() {
+        fn write_clone(_src: &Path, dest: &Path) -> std::io::Result<()> {
+            fs::write(dest, b"CLONED-REPLACE")
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let blob = dir.path().join("blob.o");
+        fs::write(&blob, b"cached object").unwrap();
+        let output = dir.path().join("output.o");
+        fs::write(&output, b"previous output").unwrap();
+        prepare_writable_target_from_file_via(&blob, &output, refuse_clone_into, write_clone)
+            .unwrap()
+            .publish_replacing()
+            .unwrap();
+        assert_eq!(fs::read(&output).unwrap(), b"CLONED-REPLACE");
+        assert!(clone_names(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn an_unpublished_clone_is_removed() {
+        fn write_clone(_src: &Path, dest: &Path) -> std::io::Result<()> {
+            fs::write(dest, b"CLONED-TEMP")
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let blob = dir.path().join("blob.o");
+        fs::write(&blob, b"cached object").unwrap();
+        let output = dir.path().join("output.o");
+        drop(
+            prepare_writable_target_from_file_via(&blob, &output, refuse_clone_into, write_clone)
+                .unwrap(),
+        );
+        assert!(
+            clone_names(dir.path()).is_empty(),
+            "dropping an unpublished clone must remove its temporary name"
+        );
+        assert!(!output.exists());
+    }
+
+    #[test]
+    fn a_busy_clone_name_is_retried() {
+        fn exists_then_clone(_src: &Path, dest: &Path) -> std::io::Result<()> {
+            if count_clone_call() == 1 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "name taken",
+                ));
+            }
+            fs::write(dest, b"CLONED-RETRY")
+        }
+
+        reset_clone_calls();
+        let dir = tempfile::tempdir().unwrap();
+        let blob = dir.path().join("blob.o");
+        fs::write(&blob, b"cached object").unwrap();
+        let output = dir.path().join("output.o");
+        prepare_writable_target_from_file_via(&blob, &output, refuse_clone_into, exists_then_clone)
+            .unwrap()
+            .publish()
+            .unwrap();
+        assert_eq!(fs::read(&output).unwrap(), b"CLONED-RETRY");
+        assert_eq!(clone_calls(), 2);
+    }
+
+    #[test]
+    fn a_clone_error_is_not_retried() {
+        fn deny_clone(_src: &Path, _dest: &Path) -> std::io::Result<()> {
+            count_clone_call();
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "denied",
+            ))
+        }
+
+        reset_clone_calls();
+        let dir = tempfile::tempdir().unwrap();
+        let blob = dir.path().join("blob.o");
+        fs::write(&blob, b"cached object").unwrap();
+        let bytes = fs::metadata(&blob).unwrap().len();
+        let output = dir.path().join("output.o");
+        let (copied_before, reflinked_before) = restore_deltas();
+        prepare_writable_target_from_file_via(&blob, &output, refuse_clone_into, deny_clone)
+            .unwrap()
+            .publish()
+            .unwrap();
+        assert_eq!(fs::read(&output).unwrap(), b"cached object");
+        assert_eq!(clone_calls(), 1);
+        let (copied, reflinked) = restore_deltas();
+        assert_eq!(copied, copied_before + bytes);
+        assert_eq!(reflinked, reflinked_before);
+    }
+
+    #[test]
+    fn a_clone_is_created_in_the_output_directory() {
+        fn write_beside(src: &Path, dest: &Path) -> std::io::Result<()> {
+            if dest.parent() != src.parent() {
+                return Err(std::io::Error::other(
+                    "clone was not created beside the output",
+                ));
+            }
+            fs::write(dest, b"CLONED-BESIDE")
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let blob = dir.path().join("blob.o");
+        fs::write(&blob, b"cached object").unwrap();
+        let output = dir.path().join("output.o");
+        prepare_writable_target_from_file_via(&blob, &output, refuse_clone_into, write_beside)
+            .unwrap()
+            .publish()
+            .unwrap();
+        assert_eq!(fs::read(&output).unwrap(), b"CLONED-BESIDE");
+    }
+
+    #[test]
+    fn a_failed_in_place_clone_does_not_keep_partial_bytes() {
+        fn write_junk_then_fail(_src: &Path, dst: &fs::File) -> std::io::Result<()> {
+            use std::io::Write;
+            dst.try_clone()?.write_all(b"JUNKJUNKJUNKJUNKJUNK")?;
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "partial clone",
+            ))
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let blob = dir.path().join("blob.o");
+        fs::write(&blob, b"cached object").unwrap();
+        let output = dir.path().join("output.o");
+        prepare_writable_target_from_file_via(
+            &blob,
+            &output,
+            write_junk_then_fail,
+            refuse_clone_new,
+        )
+        .unwrap()
+        .publish()
+        .unwrap();
+        assert_eq!(fs::read(&output).unwrap(), b"cached object");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_lone_inode_is_not_removed_when_it_is_the_clone_dest() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let blob = dir.path().join("blob.o");
+        fs::write(&blob, b"cached object").unwrap();
+        assert!(accepted_private_clone(&blob, &blob).is_none());
+        assert_eq!(fs::metadata(&blob).unwrap().nlink(), 1);
         assert_eq!(fs::read(&blob).unwrap(), b"cached object");
     }
 

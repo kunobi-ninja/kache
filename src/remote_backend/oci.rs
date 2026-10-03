@@ -2,7 +2,7 @@
 //! keys are encoded in tags for cheap listing; long keys use hashed tags and
 //! manifest annotations. Reads validate the manifest's original key binding.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
@@ -25,6 +25,7 @@ use super::{GetObject, GetTransfer, RemoteBackend};
 use crate::config::{OciRemoteConfig, normalize_remote_prefix};
 
 const TAG_PREFIX: &str = "kache-v2-";
+const LEGACY_TAG_PREFIX: &str = "kache-v1-";
 const KEY_ANNOTATION: &str = "ninja.kunobi.kache.key";
 const ARTIFACT_TYPE: &str = "application/vnd.kache.cache-object.v1";
 const EMPTY_CONFIG_TYPE: &str = "application/vnd.oci.empty.v1+json";
@@ -34,6 +35,7 @@ const MAX_EMBEDDED_BYTES: usize = 16 << 10;
 // 87 binary bytes encode to 116 characters; the tag prefix adds 11.
 const MAX_TAG_KEY_BYTES: usize = 87;
 
+mod auth;
 mod transport;
 
 pub(super) struct OciBackend {
@@ -45,21 +47,24 @@ pub(super) struct OciBackend {
 impl OciBackend {
     pub(super) async fn new(config: &OciRemoteConfig) -> Result<Self> {
         let repository = config.reference()?;
-        let registry = repository.resolve_registry().to_string();
-        let directory = std::env::var_os("DOCKER_CONFIG")
-            .map(std::path::PathBuf::from)
-            .or_else(|| dirs::home_dir().map(|home| home.join(".docker")))
-            .context("cannot find Docker credential config directory")?;
-        let auth = tokio::task::spawn_blocking(move || load_credentials(&directory, &registry))
-            .await
-            .context("loading OCI credentials")??;
-        Self::with_auth(config, auth)
+        let source = auth::CredentialSource::from_environment()?;
+        // Validate the provider before starting a daemon with unusable auth.
+        source.load(repository.resolve_registry()).await?;
+        Self::with_credentials(config, source)
     }
 
+    #[cfg(test)]
     fn with_auth(config: &OciRemoteConfig, auth: RegistryAuth) -> Result<Self> {
+        Self::with_credentials(config, auth::CredentialSource::Fixed(auth))
+    }
+
+    fn with_credentials(
+        config: &OciRemoteConfig,
+        credentials: auth::CredentialSource,
+    ) -> Result<Self> {
         super::ensure_rustls_provider();
         let repository = config.reference()?;
-        let transport = transport::Transport::new(config, auth)?;
+        let transport = transport::Transport::new(config, credentials)?;
         let base_url = format!(
             "{}://{}/v2/{}",
             if config.insecure { "http" } else { "https" },
@@ -71,6 +76,16 @@ impl OciBackend {
             transport,
             base_url,
         })
+    }
+
+    async fn object_manifest(
+        &self,
+        key: &str,
+    ) -> Result<Option<(OciImageManifest, Option<String>)>> {
+        if let Some(manifest) = self.manifest(&object_tag(key)).await? {
+            return Ok(Some(manifest));
+        }
+        self.manifest(&legacy_object_tag(key)).await
     }
 
     async fn manifest(&self, tag: &str) -> Result<Option<(OciImageManifest, Option<String>)>> {
@@ -201,6 +216,13 @@ fn object_tag(key: &str) -> String {
     }
 }
 
+fn legacy_object_tag(key: &str) -> String {
+    format!(
+        "{LEGACY_TAG_PREFIX}{}",
+        blake3::hash(key.as_bytes()).to_hex()
+    )
+}
+
 fn tag_key(tag: &str) -> Result<Option<String>> {
     let Some(encoded) = tag.strip_prefix(&format!("{TAG_PREFIX}b-")) else {
         return Ok(None);
@@ -293,9 +315,11 @@ fn credentials(
         Ok(DockerCredential::IdentityToken(token)) => Ok(RegistryAuth::Bearer(token)),
         Err(CredentialRetrievalError::NoCredentialConfigured) => Ok(RegistryAuth::Anonymous),
         // Helper output can contain credentials. Do not include it in errors.
-        Err(_) => {
-            anyhow::bail!("cannot read OCI credentials from Docker config or credential helper")
-        }
+        Err(_) => Err(Error::new(
+            ErrorKind::PermissionDenied,
+            "cannot read OCI credentials from Docker config or credential helper",
+        )
+        .into()),
     }
 }
 
@@ -379,7 +403,7 @@ fn registry_error(error: OciDistributionError) -> anyhow::Error {
 impl RemoteBackend for OciBackend {
     async fn head(&self, key: &str) -> Result<bool> {
         validate_key(key)?;
-        let Some((manifest, _)) = self.manifest(&object_tag(key)).await? else {
+        let Some((manifest, _)) = self.object_manifest(key).await? else {
             return Ok(false);
         };
         object_descriptor(&manifest, key)?;
@@ -410,7 +434,7 @@ impl RemoteBackend for OciBackend {
     ) -> Result<Option<GetTransfer>> {
         validate_key(key)?;
         let started = Instant::now();
-        let Some((manifest, embedded)) = self.manifest(&object_tag(key)).await? else {
+        let Some((manifest, embedded)) = self.object_manifest(key).await? else {
             return Ok(None);
         };
         let descriptor = object_descriptor(&manifest, key)?;
@@ -556,7 +580,7 @@ impl RemoteBackend for OciBackend {
     // Unsupported defaults avoid pretending HEAD followed by PUT is atomic.
 
     async fn list(&self, prefix: &str) -> Result<Vec<String>> {
-        let mut keys = Vec::new();
+        let mut keys = BTreeSet::new();
         let mut seen = HashSet::new();
         let mut key_bytes = 0_usize;
         let mut last: Option<String> = None;
@@ -588,18 +612,19 @@ impl RemoteBackend for OciBackend {
                 }
                 key_bytes = key_bytes.saturating_add(tag.len());
                 check_list_limits(seen.len(), key_bytes)?;
-                if !tag.starts_with(TAG_PREFIX) {
+                let legacy = tag.starts_with(LEGACY_TAG_PREFIX);
+                if !legacy && !tag.starts_with(TAG_PREFIX) {
                     continue;
                 }
                 if let Some(key) = tag_key(tag)? {
                     key_bytes = key_bytes.saturating_add(key.len());
                     check_list_limits(seen.len(), key_bytes)?;
                     if key.starts_with(prefix) {
-                        keys.push(key);
+                        keys.insert(key);
                     }
                     continue;
                 }
-                if !tag.starts_with(&format!("{TAG_PREFIX}h-")) {
+                if !legacy && !tag.starts_with(&format!("{TAG_PREFIX}h-")) {
                     anyhow::bail!("invalid OCI object tag");
                 }
                 let remaining = super::LIST_TOTAL_TIMEOUT
@@ -617,12 +642,17 @@ impl RemoteBackend for OciBackend {
                     .and_then(|map| map.get(KEY_ANNOTATION))
                     .context("OCI cache artifact missing key annotation")?;
                 validate_key(key)?;
-                if object_tag(key) != *tag {
+                let expected_tag = if legacy {
+                    legacy_object_tag(key)
+                } else {
+                    object_tag(key)
+                };
+                if expected_tag != *tag {
                     anyhow::bail!("OCI cache tag does not match its key annotation");
                 }
                 object_descriptor(&manifest, key)?;
                 if key.starts_with(prefix) {
-                    keys.push(key.clone());
+                    keys.insert(key.clone());
                 }
                 key_bytes = key_bytes.saturating_add(key.len());
                 check_list_limits(seen.len(), key_bytes)?;
@@ -631,7 +661,7 @@ impl RemoteBackend for OciBackend {
             // page size than requested.
             last = page.tags.last().cloned();
         }
-        Ok(keys)
+        Ok(keys.into_iter().collect())
     }
 
     fn describe(&self, key: &str) -> String {

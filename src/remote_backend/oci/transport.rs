@@ -7,16 +7,19 @@ use tokio::sync::Mutex;
 pub(super) struct Transport {
     auth_client: Client,
     repository: Reference,
-    credentials: RegistryAuth,
+    credentials: auth::CredentialSource,
     http: reqwest::Client,
     base: reqwest::Url,
-    pull: Mutex<Option<Option<String>>>,
-    push: Mutex<Option<Option<String>>>,
+    pull: Mutex<Option<RegistryAuth>>,
+    push: Mutex<Option<RegistryAuth>>,
     config_uploaded: Mutex<bool>,
 }
 
 impl Transport {
-    pub(super) fn new(config: &OciRemoteConfig, credentials: RegistryAuth) -> Result<Self> {
+    pub(super) fn new(
+        config: &OciRemoteConfig,
+        credentials: auth::CredentialSource,
+    ) -> Result<Self> {
         let repository = config.reference()?;
         let base = reqwest::Url::parse(&format!(
             "{}://{}/v2/{}/",
@@ -54,8 +57,8 @@ impl Transport {
     async fn token(
         &self,
         operation: RegistryOperation,
-        rejected: Option<&Option<String>>,
-    ) -> Result<Option<String>> {
+        rejected: Option<&RegistryAuth>,
+    ) -> Result<RegistryAuth> {
         let cache = match operation {
             RegistryOperation::Pull => &self.pull,
             RegistryOperation::Push => &self.push,
@@ -68,13 +71,18 @@ impl Transport {
         {
             return Ok(current.clone());
         }
+        let credentials = self
+            .credentials
+            .load(self.repository.resolve_registry())
+            .await?;
         let token = self
             .auth_client
-            .auth(&self.repository, &self.credentials, operation)
+            .auth(&self.repository, &credentials, operation)
             .await
             .map_err(registry_error)?;
-        *cache = Some(token.clone());
-        Ok(token)
+        let authorization = token.map(RegistryAuth::Bearer).unwrap_or(credentials);
+        *cache = Some(authorization.clone());
+        Ok(authorization)
     }
 
     pub(super) async fn request(
@@ -91,7 +99,7 @@ impl Transport {
         let mut token = if same_origin {
             self.token(operation, None).await?
         } else {
-            None
+            RegistryAuth::Anonymous
         };
         let response = self
             .http
@@ -117,7 +125,7 @@ impl Transport {
         body: &Option<Bytes>,
         content_type: Option<&str>,
         metadata: bool,
-        token: &Option<String>,
+        token: &RegistryAuth,
     ) -> Result<reqwest::Request> {
         let request = self.http.request(method.clone(), url.clone()).header(
             "accept",
@@ -125,12 +133,14 @@ impl Transport {
         );
         let request = if url.origin() != self.base.origin() {
             request
-        } else if let Some(token) = token {
-            request.bearer_auth(token)
-        } else if let RegistryAuth::Basic(username, password) = &self.credentials {
-            request.basic_auth(username, Some(password))
         } else {
-            request
+            match token {
+                RegistryAuth::Bearer(token) => request.bearer_auth(token),
+                RegistryAuth::Basic(username, password) => {
+                    request.basic_auth(username, Some(password))
+                }
+                RegistryAuth::Anonymous => request,
+            }
         };
         let request = if let Some(body) = &body {
             request.body(body.clone())

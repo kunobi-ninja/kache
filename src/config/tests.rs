@@ -5194,3 +5194,18 @@ fn target_file_sharing_is_on_unless_turned_off() {
     let _ignored = NamedEnvGuard::set("KACHE_AUTO_SHARE_TARGET_FILES", "0");
     assert!(Config::load().unwrap().auto_share_target_files);
 }
+
+#[test]
+fn oci_pull_request_jobs_stay_readonly_even_with_a_separate_tag_prefix() {
+    let remote = "[cache.remote]\ntype = \"oci\"\nrepository = \"ghcr.io/team/cache\"\nprefix = \"artifacts\"\n\
+                  pull_request_prefix = \"artifacts-pr\"\n";
+    for event in ["pull_request", "pull_request_target"] {
+        let config = load_in_ci(event, "false", remote);
+        assert!(config.remote.is_some());
+        assert!(config.remote_readonly);
+        assert_eq!(config.pull_request_prefix, None);
+    }
+    let trusted = load_in_ci("push", "true", remote);
+    assert!(!trusted.remote_readonly);
+    assert_eq!(trusted.pull_request_prefix, None);
+}

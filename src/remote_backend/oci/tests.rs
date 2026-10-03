@@ -18,11 +18,13 @@ struct RegistryState {
     tags_status: Option<u16>,
     blob_override: Option<(Bytes, bool)>,
     repeat_page: bool,
+    page_size: usize,
     authorization: Option<String>,
     metadata_override: Option<(Bytes, bool)>,
     bad_manifest_digest: bool,
     token_generation: Option<usize>,
     token_requests: usize,
+    token_authorization: Option<String>,
     bad_published_digest: bool,
     upload_location: Option<String>,
     upload_query: Option<String>,
@@ -128,7 +130,16 @@ async fn handle(
             .unwrap();
     }
     if path == "/tokens" {
-        assert_eq!(authorization.as_deref(), Some("Basic dXNlcjpwYXNz"));
+        if authorization.as_deref()
+            != Some(
+                state
+                    .token_authorization
+                    .as_deref()
+                    .unwrap_or("Basic dXNlcjpwYXNz"),
+            )
+        {
+            return registry_failure(401);
+        }
         assert!(matches!(
             query.get("scope").map(String::as_str),
             Some("repository:team/cache:pull" | "repository:team/cache:pull,push")
@@ -244,7 +255,7 @@ async fn handle(
             .manifests
             .keys()
             .filter(|tag| state.repeat_page || query.get("last").is_none_or(|last| *tag > last))
-            .take(1)
+            .take(state.page_size.max(1))
             .cloned()
             .collect(); // Registry imposes a smaller page size than requested.
         return response(
@@ -645,7 +656,7 @@ async fn request_deadlines_and_redirects_preserve_transport_policy() {
                 &Some(Bytes::from_static(b"body")),
                 Some("application/octet-stream"),
                 metadata,
-                &Some("token".into()),
+                &RegistryAuth::Bearer("token".into()),
             )
             .unwrap();
         assert_eq!(
@@ -1012,6 +1023,10 @@ fn docker_credentials_support_passwords_tokens_and_anonymous_access_without_leak
     }))
     .unwrap_err();
     assert!(!format!("{error:#}").contains("secret"));
+    assert_eq!(
+        crate::remote_resilience::classify_remote_error(&error),
+        crate::remote_resilience::RemoteErrorClass::Authentication
+    );
     let credential = docker_credential::get_credential_from_reader(
         std::io::Cursor::new(r#"{"auths":{"ghcr.io":{"auth":"dXNlcjpwYXNz"}}}"#),
         "ghcr.io",
@@ -1318,4 +1333,265 @@ async fn cache_pack_upload_and_restore_use_the_existing_layout() {
     let restored: EntryMeta =
         serde_json::from_slice(&std::fs::read(output.join("meta.json")).unwrap()).unwrap();
     assert_eq!(restored, meta);
+}
+
+#[tokio::test]
+async fn legacy_objects_remain_readable_and_listing_deduplicates_versions() {
+    let registry = Registry::start().await;
+    let backend = registry.backend();
+    backend.put("old/key", b"old".to_vec(), None).await.unwrap();
+    {
+        let mut state = registry.state.lock().unwrap();
+        let body = state.manifests.remove(&object_tag("old/key")).unwrap();
+        state.manifests.insert(legacy_object_tag("old/key"), body);
+    }
+    assert!(backend.head("old/key").await.unwrap());
+    assert_eq!(
+        backend.get("old/key", Some(3)).await.unwrap().unwrap().body,
+        "old"
+    );
+    assert!(!backend.head("absent").await.unwrap());
+    assert!(backend.get("absent", Some(3)).await.unwrap().is_none());
+    assert_eq!(backend.list("old/").await.unwrap(), ["old/key"]);
+    backend.put("old/key", b"new".to_vec(), None).await.unwrap();
+    assert_eq!(
+        backend.get("old/key", Some(3)).await.unwrap().unwrap().body,
+        "new"
+    );
+    assert_eq!(backend.list("").await.unwrap(), ["old/key"]);
+    let bytes = registry.state.lock().unwrap().manifests[&legacy_object_tag("old/key")].clone();
+    registry
+        .state
+        .lock()
+        .unwrap()
+        .manifests
+        .insert(legacy_object_tag("wrong"), bytes);
+    assert!(
+        backend
+            .list("")
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("does not match")
+    );
+}
+
+#[tokio::test]
+async fn docker_credentials_are_reloaded_when_a_daemons_auth_expires() {
+    for bearer_tokens in [false, true] {
+        let registry = Registry::start().await;
+        let directory = tempfile::tempdir().unwrap();
+        let host = registry.config.repository.split('/').next().unwrap();
+        let configure = |password: &str| {
+            let encoded =
+                base64::engine::general_purpose::STANDARD.encode(format!("user:{password}"));
+            std::fs::write(
+                directory.path().join("config.json"),
+                serde_json::to_vec(&serde_json::json!({"auths":{host:{"auth":encoded}}})).unwrap(),
+            )
+            .unwrap();
+        };
+        configure("pass");
+        {
+            let mut state = registry.state.lock().unwrap();
+            if bearer_tokens {
+                state.token_generation = Some(1);
+            } else {
+                state.authorization = Some("Basic dXNlcjpwYXNz".into());
+            }
+        }
+        let backend = OciBackend::with_credentials(
+            &registry.config,
+            auth::CredentialSource::Docker(directory.path().into()),
+        )
+        .unwrap();
+        backend
+            .put("key", b"{}".to_vec(), Some("application/json"))
+            .await
+            .unwrap();
+        assert_eq!(
+            backend.get("key", Some(2)).await.unwrap().unwrap().body,
+            "{}"
+        );
+        configure("renewed");
+        let new_auth = format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode("user:renewed")
+        );
+        {
+            let mut state = registry.state.lock().unwrap();
+            if bearer_tokens {
+                state.token_generation = Some(2);
+                state.token_authorization = Some(new_auth);
+            } else {
+                state.authorization = Some(new_auth);
+            }
+        }
+        // Reuse the same backend, as a running daemon does after rotation.
+        assert_eq!(
+            backend.get("key", Some(2)).await.unwrap().unwrap().body,
+            "{}"
+        );
+        backend
+            .put("other", b"{}".to_vec(), Some("application/json"))
+            .await
+            .unwrap();
+        assert!(backend.head("other").await.unwrap());
+        if bearer_tokens {
+            assert_eq!(registry.state.lock().unwrap().token_requests, 4);
+        }
+        std::fs::write(
+            directory.path().join("config.json"),
+            "secret malformed credentials",
+        )
+        .unwrap();
+        registry.state.lock().unwrap().authorization = Some("rejected".into());
+        registry.state.lock().unwrap().token_generation = None;
+        let error = backend.head("key").await.unwrap_err();
+        assert!(format!("{error:#}").contains("cannot read OCI credentials"));
+        assert!(!format!("{error:#}").contains("secret"));
+    }
+}
+
+#[tokio::test]
+async fn ten_thousand_keys_are_listed_without_fetching_object_manifests() {
+    let registry = Registry::start().await;
+    {
+        let mut state = registry.state.lock().unwrap();
+        state.page_size = 100;
+        for index in 0..10_000 {
+            let prefix = if index % 2 == 0 { "artifacts" } else { "other" };
+            let key = format!(
+                "{prefix}/v3/{}.pack",
+                blake3::hash(index.to_string().as_bytes()).to_hex()
+            );
+            state.manifests.insert(object_tag(&key), Bytes::new());
+        }
+    }
+    let started = Instant::now();
+    let keys = registry.backend().list("artifacts/").await.unwrap();
+    assert_eq!(keys.len(), 5_000);
+    assert!(keys.iter().all(|key| key.starts_with("artifacts/")));
+    let state = registry.state.lock().unwrap();
+    assert_eq!(state.requests.len(), 102); // Initial auth, 100 pages, final empty page.
+    assert!(
+        state
+            .requests
+            .iter()
+            .all(|(method, path)| method == Method::GET
+                && (path == "/v2/" || path.ends_with("/tags/list")))
+    );
+    eprintln!(
+        "OCI LIST: 10000 tags, 5000 matching keys, 102 HTTP requests, {} ms",
+        started.elapsed().as_millis()
+    );
+}
+
+// The child runs only this test, so environment reads and the helper's PATH
+// cannot race the other tests that change the parent process environment.
+#[cfg(unix)]
+#[tokio::test]
+async fn credentials_follow_the_daemons_startup_environment() {
+    use std::os::unix::fs::PermissionsExt;
+    const MODE: &str = "KACHE_OCI_TEST_CREDENTIAL_MODE";
+    if let Ok(mode) = std::env::var(MODE) {
+        let registry = Registry::start().await;
+        let directory = std::path::PathBuf::from(std::env::var_os("DOCKER_CONFIG").unwrap());
+        let host = registry.config.repository.split('/').next().unwrap();
+        let response = directory.join("helper-response.json");
+        let set_helper_secret = |password: &str| {
+            std::fs::write(
+                &response,
+                serde_json::to_vec(&serde_json::json!({"Username":"user", "Secret":password}))
+                    .unwrap(),
+            )
+            .unwrap();
+        };
+        if mode == "helper" {
+            std::fs::write(
+                directory.join("config.json"),
+                serde_json::to_vec(&serde_json::json!({"credHelpers":{host:"kache-test"}}))
+                    .unwrap(),
+            )
+            .unwrap();
+            set_helper_secret("pass");
+        } else {
+            // Environment credentials take precedence even over a broken file.
+            std::fs::write(directory.join("config.json"), "invalid Docker config").unwrap();
+        }
+        if mode == "token" {
+            registry.state.lock().unwrap().authorization = Some("Bearer token".into());
+        } else {
+            registry.state.lock().unwrap().token_generation = Some(1);
+        }
+        let backend = OciBackend::new(&registry.config).await.unwrap();
+        backend
+            .put("key", b"{}".to_vec(), Some("application/json"))
+            .await
+            .unwrap();
+        assert_eq!(
+            backend.get("key", Some(2)).await.unwrap().unwrap().body,
+            "{}"
+        );
+        if mode == "helper" {
+            set_helper_secret("renewed");
+            {
+                let mut state = registry.state.lock().unwrap();
+                state.token_generation = Some(2);
+                state.token_authorization = Some(format!(
+                    "Basic {}",
+                    base64::engine::general_purpose::STANDARD.encode("user:renewed")
+                ));
+            }
+            assert_eq!(
+                backend.get("key", Some(2)).await.unwrap().unwrap().body,
+                "{}"
+            );
+            backend
+                .put("other", b"{}".to_vec(), Some("application/json"))
+                .await
+                .unwrap();
+            assert_eq!(registry.state.lock().unwrap().token_requests, 4);
+        }
+        return;
+    }
+    for mode in ["token", "basic", "helper"] {
+        let directory = tempfile::tempdir().unwrap();
+        let helper = directory.path().join("docker-credential-kache-test");
+        std::fs::write(
+            &helper,
+            "#!/bin/sh\n/bin/cat \"$DOCKER_CONFIG/helper-response.json\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "remote_backend::oci::tests::credentials_follow_the_daemons_startup_environment",
+                "--nocapture",
+            ])
+            .env(MODE, mode)
+            .env("DOCKER_CONFIG", directory.path())
+            .env("PATH", directory.path())
+            .env_remove("KACHE_OCI_TOKEN")
+            .env_remove("KACHE_OCI_USERNAME")
+            .env_remove("KACHE_OCI_PASSWORD");
+        if mode == "token" {
+            command.env("KACHE_OCI_TOKEN", "token");
+        } else if mode == "basic" {
+            command
+                .env("KACHE_OCI_USERNAME", "user")
+                .env("KACHE_OCI_PASSWORD", "pass");
+        }
+        let output = tokio::task::spawn_blocking(move || command.output().unwrap())
+            .await
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{mode}: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }

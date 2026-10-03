@@ -642,8 +642,8 @@ mod tests {
             vec!["/t/g".to_string()]
         );
         assert_eq!(
-            paths("cargo:rustc-link-arg-bin=app=/t/lib.a\n"),
-            vec!["/t/lib.a".to_string()]
+            paths(&format!("cargo:rustc-link-arg-bin=app={archive}\n")),
+            vec![archive.to_string()]
         );
         assert!(paths("cargo:rustc-link-arg-bin=app\n").is_empty());
         for directive in [
@@ -655,8 +655,8 @@ mod tests {
             "rustc-link-arg-examples",
             "rustc-link-arg-benches",
         ] {
-            let stdout = format!("cargo:{directive}=/t/lib.a\n");
-            assert_eq!(paths(&stdout), vec!["/t/lib.a".to_string()], "{directive}");
+            let stdout = format!("cargo:{directive}={archive}\n");
+            assert_eq!(paths(&stdout), vec![archive.to_string()], "{directive}");
         }
     }
 

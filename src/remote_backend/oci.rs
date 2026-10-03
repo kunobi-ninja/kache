@@ -227,7 +227,8 @@ fn tag_key(tag: &str) -> Result<Option<String>> {
     let Some(encoded) = tag.strip_prefix(&format!("{TAG_PREFIX}b-")) else {
         return Ok(None);
     };
-    if tag.len() > 128 {
+    // The codec emits at most 127 bytes, below OCI's 128-byte ceiling.
+    if tag.len() > 127 {
         anyhow::bail!("OCI object tag too long");
     }
     let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD

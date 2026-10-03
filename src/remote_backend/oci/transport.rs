@@ -160,6 +160,25 @@ impl Transport {
         Ok(request.build()?)
     }
 
+    pub(super) fn upload_url(
+        &self,
+        response_url: &reqwest::Url,
+        location: &str,
+        digest: &str,
+    ) -> Result<reqwest::Url> {
+        let mut upload = response_url.join(location)?;
+        if !matches!(upload.scheme(), "http" | "https")
+            || (self.base.scheme() == "https" && upload.scheme() != "https")
+            || !upload.username().is_empty()
+            || upload.password().is_some()
+            || upload.fragment().is_some()
+        {
+            anyhow::bail!("invalid OCI upload Location");
+        }
+        upload.query_pairs_mut().append_pair("digest", digest);
+        Ok(upload)
+    }
+
     pub(super) async fn ensure_config(&self, data: Bytes, digest: &str) -> Result<()> {
         let mut uploaded = self.config_uploaded.lock().await;
         if !*uploaded {
@@ -203,16 +222,7 @@ impl Transport {
             .get("location")
             .context("OCI upload missing Location")?
             .to_str()?;
-        let mut upload = response.url().join(location)?;
-        if !matches!(upload.scheme(), "http" | "https")
-            || (self.base.scheme() == "https" && upload.scheme() != "https")
-            || !upload.username().is_empty()
-            || upload.password().is_some()
-            || upload.fragment().is_some()
-        {
-            anyhow::bail!("invalid OCI upload Location");
-        }
-        upload.query_pairs_mut().append_pair("digest", digest);
+        let upload = self.upload_url(response.url(), location, digest)?;
         drop(response);
         // Kache already owns the complete compressed body. A monolithic PUT
         // saves the separate PATCH used by a chunked upload.

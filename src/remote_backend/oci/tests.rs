@@ -562,10 +562,14 @@ async fn expired_tokens_refresh_once_and_parallel_reads_share_the_replacement() 
     backend.get("key", Some(2)).await.unwrap().unwrap();
     assert_eq!(registry.state.lock().unwrap().token_requests, 2); // One per permission scope.
     registry.state.lock().unwrap().token_generation = Some(2);
-    let reads = (0..8).map(|_| backend.get("key", Some(2)));
-    for result in futures::future::join_all(reads).await {
-        assert_eq!(result.unwrap().unwrap().body, "{}");
-    }
+    // Release bodies before joining; another test may need the entire budget.
+    let reads = (0..8).map(|_| async {
+        assert_eq!(
+            backend.get("key", Some(2)).await.unwrap().unwrap().body,
+            "{}"
+        );
+    });
+    futures::future::join_all(reads).await;
     assert_eq!(registry.state.lock().unwrap().token_requests, 3);
     backend
         .put("other", b"{}".to_vec(), Some("application/json"))
@@ -1560,7 +1564,10 @@ async fn credentials_follow_the_daemons_startup_environment() {
         let helper = directory.path().join("docker-credential-kache-test");
         std::fs::write(
             &helper,
-            "#!/bin/sh\n/bin/cat \"$DOCKER_CONFIG/helper-response.json\"\n",
+            format!(
+                "#!{}\nIFS= read -r response < \"$DOCKER_CONFIG/helper-response.json\" || :\nprintf '%s' \"$response\"\n",
+                option_env!("KACHE_TEST_SHELL").unwrap_or("/bin/sh"),
+            ),
         )
         .unwrap();
         std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -1594,4 +1601,79 @@ async fn credentials_follow_the_daemons_startup_environment() {
             String::from_utf8_lossy(&output.stderr)
         );
     }
+}
+
+#[test]
+fn upload_locations_keep_https_and_reject_each_credential_component() {
+    let make_transport = |insecure| {
+        transport::Transport::new(
+            &OciRemoteConfig {
+                repository: "registry.example/team/cache".into(),
+                insecure,
+            },
+            auth::CredentialSource::Fixed(RegistryAuth::Anonymous),
+        )
+        .unwrap()
+    };
+    super::super::ensure_rustls_provider();
+    let secure = make_transport(false);
+    let insecure = make_transport(true);
+    let response =
+        reqwest::Url::parse("https://registry.example/v2/team/cache/blobs/uploads/").unwrap();
+    let digest = "sha256:test";
+    assert_eq!(
+        secure
+            .upload_url(&response, "/upload?ticket=value", digest)
+            .unwrap()
+            .as_str(),
+        "https://registry.example/upload?ticket=value&digest=sha256%3Atest"
+    );
+    assert!(
+        insecure
+            .upload_url(&response, "http://registry.example/upload", digest)
+            .is_ok()
+    );
+    assert!(
+        insecure
+            .upload_url(&response, "https://registry.example/upload", digest)
+            .is_ok()
+    );
+    for location in [
+        "http://registry.example/upload",
+        "https://user@registry.example/upload",
+        "https://:password@registry.example/upload",
+        "https://user:password@registry.example/upload",
+        "https://registry.example/upload#fragment",
+        "file:///tmp/upload",
+    ] {
+        assert_eq!(
+            secure
+                .upload_url(&response, location, digest)
+                .unwrap_err()
+                .to_string(),
+            "invalid OCI upload Location",
+            "{location}"
+        );
+    }
+    assert!(
+        secure
+            .upload_url(&response, "http://[invalid", digest)
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn failed_manifest_publication_cannot_report_a_successful_upload() {
+    use crate::remote_resilience::{RemoteErrorClass, classify_remote_error};
+    let registry = Registry::start().await;
+    registry.state.lock().unwrap().manifest_status = Some(503);
+    let error = registry
+        .backend()
+        .put("key", b"payload".to_vec(), None)
+        .await
+        .unwrap_err();
+    assert_eq!(classify_remote_error(&error), RemoteErrorClass::Transient);
+    let state = registry.state.lock().unwrap();
+    assert!(state.manifests.is_empty());
+    assert!(!state.blobs.is_empty());
 }

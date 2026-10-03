@@ -164,6 +164,24 @@ mod tests {
     fn pressure_takes_the_whole_pool() {
         assert_eq!(weight(2, 8, false), 2);
         assert_eq!(weight(2, 8, true), 8);
+        // An ask that is already the whole pool stays there either way.
+        assert_eq!(weight(8, 8, false), 8);
+        assert_eq!(weight(8, 8, true), 8);
+        assert_eq!(weight(1, 1, false), 1);
+        assert_eq!(weight(1, 1, true), 1);
+    }
+
+    #[test]
+    fn a_forced_answer_replaces_the_machine_until_cleared() {
+        let _lock = crate::test_support::process_state_test_lock();
+        set_enabled(true);
+        let live = under_pressure();
+        force(Some(!live));
+        assert_eq!(now(), !live, "the pin replaces whatever the machine says");
+        force(Some(live));
+        assert_eq!(now(), live);
+        force(None);
+        assert_eq!(now(), live, "clearing the pin reads the machine again");
     }
 
     #[test]

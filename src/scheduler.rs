@@ -1456,6 +1456,24 @@ mod tests {
         tempfile::tempdir().unwrap()
     }
 
+    /// Pin this thread's pressure answer until drop. Slot counts depend on it,
+    /// and the live kernel value changes with the machine. Other tests run on
+    /// their own threads and keep their own pin.
+    struct PinnedPressure;
+
+    impl PinnedPressure {
+        fn new(pressured: bool) -> Self {
+            pressure::force(Some(pressured));
+            Self
+        }
+    }
+
+    impl Drop for PinnedPressure {
+        fn drop(&mut self) {
+            pressure::force(None);
+        }
+    }
+
     fn test_scheduler(dir: &Path, pool: u32) -> Scheduler {
         Scheduler::open_with(dir, pool, Duration::from_secs(5), Duration::from_millis(10)).unwrap()
     }
@@ -2336,6 +2354,7 @@ mod tests {
 
     #[test]
     fn permits_in_use_counts_held_slots() {
+        let _calm = PinnedPressure::new(false);
         let dir = temp_cache();
         assert_eq!(
             permits_in_use(dir.path()),
@@ -2370,6 +2389,23 @@ mod tests {
         );
         let files = fs::read_dir(permits_dir(&scheduler.root)).unwrap().count();
         assert_eq!(files, 4, "the probe must not add slot files");
+        drop(_calm);
+
+        let _pressured = PinnedPressure::new(true);
+        let dir = temp_cache();
+        let scheduler = test_scheduler(dir.path(), 4);
+        let one = scheduler.acquire_permit(1).unwrap();
+        assert_eq!(
+            permits_in_use(dir.path()),
+            Some(4),
+            "under pressure an ask of one locks the whole pool"
+        );
+        drop(one);
+        assert_eq!(permits_in_use(dir.path()), Some(0));
+        let two = scheduler.acquire_permit(2).unwrap();
+        assert_eq!(permits_in_use(dir.path()), Some(4));
+        drop(two);
+        assert_eq!(permits_in_use(dir.path()), Some(0));
     }
 
     #[test]
@@ -2646,7 +2682,13 @@ mod tests {
             Duration::from_millis(5),
         )
         .unwrap();
+        let _pin = PinnedPressure::new(false);
         let held = scheduler.acquire_permit(1).unwrap();
+        assert_eq!(
+            held._slots.len(),
+            1,
+            "a calm compile takes the one slot it asked for"
+        );
         pressure::force(Some(true));
         assert!(
             scheduler.acquire_permit(1).is_none(),
@@ -2660,7 +2702,7 @@ mod tests {
         let first = scheduler.acquire_permit(1).unwrap();
         let second = scheduler.acquire_permit(1).unwrap();
         assert_eq!(first._slots.len() + second._slots.len(), 2);
-        pressure::force(None);
+        drop(_pin);
     }
 
     #[test]
@@ -2902,73 +2944,107 @@ mod tests {
 
     #[test]
     fn heavy_compiles_take_their_full_weight_without_tests() {
-        let dir = temp_cache();
-        let scheduler = budget_scheduler(dir.path(), 4);
-        let _permit = scheduler.acquire_permit(3).unwrap();
-        assert_eq!(permits_in_use(dir.path()), Some(3));
-        assert!(
-            !tests_dir(&scheduler.root).exists(),
-            "compiles alone leave no test state"
-        );
+        // Calm: the ask is the count. Pressured: the same ask locks the pool.
+        for (pressured, held) in [(false, 3), (true, 4)] {
+            let _pin = PinnedPressure::new(pressured);
+            let dir = temp_cache();
+            let scheduler = budget_scheduler(dir.path(), 4);
+            let _permit = scheduler.acquire_permit(3).unwrap();
+            assert_eq!(
+                permits_in_use(dir.path()),
+                Some(held),
+                "pressured={pressured}"
+            );
+            assert!(
+                !tests_dir(&scheduler.root).exists(),
+                "compiles alone leave no test state"
+            );
+        }
     }
 
     #[test]
     fn covered_misses_skip_the_permit_but_join_the_flight() {
-        let dir = temp_cache();
-        let scheduler = budget_scheduler(dir.path(), 2);
-        fs::create_dir_all(tests_dir(&scheduler.root)).unwrap();
-        let marker = tests_dir(&scheduler.root).join("1");
-        let identity = FlightIdentity::rustc("nested", &["lib".into()], false).with_key("k");
+        // A covered miss stays at zero slots either way. An uncovered miss
+        // takes its weight when calm and the whole pool under pressure.
+        for (pressured, uncovered) in [(false, 1), (true, 2)] {
+            let _pin = PinnedPressure::new(pressured);
+            let dir = temp_cache();
+            let scheduler = budget_scheduler(dir.path(), 2);
+            fs::create_dir_all(tests_dir(&scheduler.root)).unwrap();
+            let marker = tests_dir(&scheduler.root).join("1");
+            let identity = FlightIdentity::rustc("nested", &["lib".into()], false).with_key("k");
 
-        let BeginMiss::Compile(covered) =
-            scheduler.begin_miss(&identity, "nested", false, Some(&marker))
-        else {
-            panic!("the first miss owns the flight");
-        };
-        assert!(covered._flight.is_some(), "a covered miss joins the flight");
-        assert!(covered._permit.is_none(), "a covered miss takes no permit");
-        assert_eq!(permits_in_use(dir.path()), Some(0));
-        drop(covered);
+            let BeginMiss::Compile(covered) =
+                scheduler.begin_miss(&identity, "nested", false, Some(&marker))
+            else {
+                panic!("the first miss owns the flight");
+            };
+            assert!(covered._flight.is_some(), "a covered miss joins the flight");
+            assert!(covered._permit.is_none(), "a covered miss takes no permit");
+            assert_eq!(permits_in_use(dir.path()), Some(0), "pressured={pressured}");
+            drop(covered);
 
-        let BeginMiss::Compile(uncovered) = scheduler.begin_miss(&identity, "nested", false, None)
-        else {
-            panic!("the first miss owns the flight");
-        };
-        assert!(uncovered._flight.is_some());
-        assert!(
-            uncovered._permit.is_some(),
-            "an uncovered miss takes a permit"
-        );
-        assert_eq!(permits_in_use(dir.path()), Some(1));
+            let BeginMiss::Compile(uncovered_miss) =
+                scheduler.begin_miss(&identity, "nested", false, None)
+            else {
+                panic!("the first miss owns the flight");
+            };
+            assert!(uncovered_miss._flight.is_some());
+            assert!(
+                uncovered_miss._permit.is_some(),
+                "an uncovered miss takes a permit"
+            );
+            assert_eq!(
+                permits_in_use(dir.path()),
+                Some(uncovered),
+                "pressured={pressured}"
+            );
+        }
     }
 
     /// A compile that runs before its key takes a pool slot and no flight,
     /// unless the scheduler is off or a test lease covers it.
     #[test]
     fn a_keyless_compile_takes_a_permit_and_no_flight() {
+        for (pressured, held) in [(false, 1), (true, 2)] {
+            let _pin = PinnedPressure::new(pressured);
+            let dir = temp_cache();
+            let scheduler = budget_scheduler(dir.path(), 2);
+
+            let guard = scheduler.keyless_compile("c_unit", false, None);
+            assert!(guard._permit.is_some(), "a keyless compile takes a permit");
+            assert!(guard._flight.is_none(), "its discovery flight dedupes it");
+            assert_eq!(
+                permits_in_use(dir.path()),
+                Some(held),
+                "pressured={pressured}"
+            );
+            drop(guard);
+            assert_eq!(permits_in_use(dir.path()), Some(0));
+
+            fs::create_dir_all(tests_dir(&scheduler.root)).unwrap();
+            let marker = tests_dir(&scheduler.root).join("1");
+            let covered = scheduler.keyless_compile("c_unit", false, Some(&marker));
+            assert!(
+                covered._permit.is_none(),
+                "a covered compile takes no permit"
+            );
+            assert_eq!(permits_in_use(dir.path()), Some(0), "pressured={pressured}");
+        }
+
         let dir = temp_cache();
-        let scheduler = budget_scheduler(dir.path(), 2);
-
-        let guard = scheduler.keyless_compile("c_unit", false, None);
-        assert!(guard._permit.is_some(), "a keyless compile takes a permit");
-        assert!(guard._flight.is_none(), "its discovery flight dedupes it");
-        assert_eq!(permits_in_use(dir.path()), Some(1));
-        drop(guard);
-        assert_eq!(permits_in_use(dir.path()), Some(0));
-
-        fs::create_dir_all(tests_dir(&scheduler.root)).unwrap();
-        let marker = tests_dir(&scheduler.root).join("1");
-        let covered = scheduler.keyless_compile("c_unit", false, Some(&marker));
-        assert!(
-            covered._permit.is_none(),
-            "a covered compile takes no permit"
-        );
-
         let disabled = begin_keyless_compile(dir.path(), false, "c_unit", false, None);
         assert!(disabled.is_empty());
+        {
+            let _calm = PinnedPressure::new(false);
+            let enabled = begin_keyless_compile(dir.path(), true, "c_unit", false, None);
+            assert!(!enabled.is_empty());
+            assert_eq!(permits_in_use(dir.path()), Some(UNMEASURED_COMPILE_WEIGHT));
+        }
+        let _pressured = PinnedPressure::new(true);
         let enabled = begin_keyless_compile(dir.path(), true, "c_unit", false, None);
         assert!(!enabled.is_empty());
-        assert!(permits_in_use(dir.path()).is_some_and(|held| held >= 1));
+        assert_eq!(permits_in_use(dir.path()), Some(default_pool_size()));
     }
 
     #[test]

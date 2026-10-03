@@ -3,8 +3,9 @@
 
 Reads one path per line on stdin and prints `key=true|false` lines for
 `$GITHUB_OUTPUT`. A file matches the first category whose pattern fits it;
-anything unmatched is `code`, which turns every group on. `--all` turns
-every group on without reading stdin (pushes, tags, API failures).
+anything unmatched is `code`, which turns on every group but `nix`. `--all`
+turns every group on without reading stdin (pushes, tags, API failures), so
+`main` still builds the Nix package on every push.
 
 Groups:
   check  Check (Linux): fmt, clippy, coverage tests, helm lint, the perf gate
@@ -12,7 +13,11 @@ Groups:
   tests  the platform and hardening matrix: cargo test (macOS/Windows),
          mutation testing, Kani, dependency audit, CUDA and CoW jobs.
   e2e    the E2E smoke scenarios on the three platforms.
-  nix    the Nix package builds.
+  nix    the Nix package builds. They compile every dependency and run the
+         whole test suite again inside the Nix sandbox, about 35 minutes on
+         the shared macOS runner, so a pull request runs them only when it
+         changes what the package is built from: dependencies, toolchain,
+         Cargo configuration, packaging, or the CI definition itself.
 """
 
 import re
@@ -50,6 +55,18 @@ CATEGORIES = (
     ),
     ("scenarios", (r"^scenarios/",), ("check", "e2e")),
     (
+        "build-inputs",
+        (
+            r"^Cargo\.(toml|lock)$",
+            r"^crates/[^/]+/Cargo\.toml$",
+            r"^rust-toolchain\.toml$",
+            r"^\.cargo/config\.toml$",
+            r"^\.github/workflows/ci\.yml$",
+            r"^scripts/(test-)?ci-changes\.py$",
+        ),
+        GROUPS,
+    ),
+    (
         "packaging",
         (
             r"^packaging/",
@@ -68,7 +85,7 @@ def category(path):
     for name, patterns, groups in CATEGORIES:
         if any(re.search(pattern, path) for pattern in patterns):
             return name, groups
-    return "code", GROUPS
+    return "code", ("check", "tests", "e2e")
 
 
 def decide(paths):

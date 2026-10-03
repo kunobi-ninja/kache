@@ -35,7 +35,9 @@ jobs:
     # mapping lives in scripts/ci-changes.py (tested by
     # scripts/test-ci-changes.py in Repository consistency): docs run
     # nothing, bench scripts only Check (Linux), scenarios add the E2E arms,
-    # packaging adds the Nix builds, and any other file runs everything.
+    # packaging and the files the package is built from (dependencies,
+    # toolchain, Cargo config, this file) add the Nix builds, and any other
+    # file runs everything except the Nix builds, which main runs on push.
     # Pushes and tags always run everything, as does a failed file listing.
     # A skipped required job still satisfies branch protection.
     outputs:

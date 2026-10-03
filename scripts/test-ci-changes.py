@@ -36,32 +36,44 @@ class ChangeTests(unittest.TestCase):
         )
         self.assertEqual(self.groups(), NONE, "an empty pull request runs nothing")
 
-    def test_rust_and_unknown_files_run_everything(self):
+    def test_what_the_package_is_built_from_runs_everything(self):
+        for path in (
+            "Cargo.lock",
+            "Cargo.toml",
+            "crates/kache-store/Cargo.toml",
+            "rust-toolchain.toml",
+            ".cargo/config.toml",
+            ".github/workflows/ci.yml",
+            "scripts/ci-changes.py",
+            "scripts/test-ci-changes.py",
+        ):
+            self.assertEqual(self.groups(path), ALL, path)
+
+    def test_rust_and_unknown_files_run_everything_but_nix(self):
+        """The Nix package builds again on the push to main; a pull request
+        that only changes code does not wait 35 minutes for it."""
+        code = {**ALL, "nix": False}
         for path in (
             "src/cache_key.rs",
             "crates/kache-store/src/lib.rs",
             "tests/integration_test.rs",
-            "Cargo.lock",
-            "rust-toolchain.toml",
-            ".cargo/config.toml",
             ".config/nextest.toml",
             "Justfile",
             "mise.toml",
             "deny.toml",
             "test-projects/hello/Cargo.toml",
             "fuzz/Cargo.toml",
-            ".github/workflows/ci.yml",
             ".github/workflows/fuzz.yml",
             ".github/actions/setup-pgp-kms-signing/action.yml",
             ".github/tests/workflow-policy.mjs",
             "scripts/with-test-resources.sh",
-            "scripts/ci-changes.py",
-            "scripts/test-ci-changes.py",
             "scripts/something-new.sh",
             "flake.nix.bak",
             "docs.rs",
         ):
-            self.assertEqual(self.groups(path), ALL, path)
+            self.assertEqual(self.groups(path), code, path)
+        # Code beside a dependency change still gets the Nix build.
+        self.assertEqual(self.groups("src/cache_key.rs", "Cargo.lock"), ALL)
 
     def test_bench_scripts_run_only_the_linux_check(self):
         self.assertEqual(
@@ -82,9 +94,12 @@ class ChangeTests(unittest.TestCase):
             {"check": True, "tests": False, "e2e": False, "nix": False},
         )
 
-    def test_an_unrelated_workflow_still_runs_everything(self):
+    def test_an_unrelated_workflow_still_runs_as_code(self):
         """The `bench*` rule must not swallow workflows that only start alike."""
-        self.assertEqual(self.groups(".github/workflows/benchmark-release.yml"), ALL)
+        self.assertEqual(
+            self.groups(".github/workflows/benchmark-release.yml"),
+            {**ALL, "nix": False},
+        )
 
     def test_scenarios_run_check_and_e2e(self):
         self.assertEqual(
@@ -116,7 +131,9 @@ class ChangeTests(unittest.TestCase):
             self.groups("scenarios/x/scenario.toml", "flake.lock", "README.md"),
             {"check": True, "tests": False, "e2e": True, "nix": True},
         )
-        self.assertEqual(self.groups("README.md", "src/main.rs"), ALL)
+        self.assertEqual(
+            self.groups("README.md", "src/main.rs"), {**ALL, "nix": False}
+        )
 
     def test_categories_are_reported_per_path(self):
         _, labelled = ci.decide(["README.md", "src/main.rs", "scenarios/a/b"])

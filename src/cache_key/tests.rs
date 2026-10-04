@@ -3523,6 +3523,25 @@ fn external_target_predictions_guard_sources_and_generated_inputs() {
     }
 }
 
+#[cfg(windows)]
+#[test]
+fn external_target_predictions_accept_mixed_manifest_separators() {
+    let dir = tempfile::tempdir().unwrap();
+    let (root, mut args) = workspace_invocation(dir.path(), "source/checkout", "kt");
+    let target = dir.path().join("output/target");
+    std::fs::create_dir_all(target.join("debug/deps")).unwrap();
+    args.out_dir = Some(target.join("debug/deps"));
+    let vars = manifest_vars(&root.join("kt"));
+    // GetCurrentDirectory uses backslashes without canonicalize's verbatim
+    // prefix, while Cargo's manifest path may contain forward slashes.
+    let cwd = PathBuf::from(root.to_str().unwrap().replace('/', "\\"));
+    assert!(suffix_within(cwd.as_os_str(), &root, 0).is_none());
+    let roots = workspace_roots_in(&args, &vars, &cwd).unwrap();
+    assert_eq!(roots.root, root);
+    assert_eq!(roots.cwd, "");
+    assert_eq!(roots.canonical_root, std::fs::canonicalize(&cwd).unwrap());
+}
+
 #[cfg(unix)]
 #[test]
 fn external_target_predictions_keep_cargos_symlinked_source_spelling() {

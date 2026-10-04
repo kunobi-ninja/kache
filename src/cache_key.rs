@@ -1990,11 +1990,13 @@ fn workspace_roots_in(
     let target = args.target_dir()?;
     suffix_within(manifest_dir.as_os_str(), &root, 0)?;
     let canonical_root = std::fs::canonicalize(&root).ok()?;
-    // The working directory may be spelled through either root: on macOS
-    // `current_dir` reports `/private/var/...` for a root Cargo spells
-    // `/var/...`.
-    let cwd = suffix_within(current_dir.as_os_str(), &root, 0)
-        .or_else(|| suffix_within(current_dir.as_os_str(), &canonical_root, 0))?;
+    // Cargo and the working directory can use different spellings: macOS
+    // resolves `/var` to `/private/var`, and Windows canonicalization adds
+    // a verbatim prefix and normalizes separators.
+    let cwd = suffix_within(current_dir.as_os_str(), &root, 0).or_else(|| {
+        let canonical_cwd = std::fs::canonicalize(current_dir).ok()?;
+        suffix_within(canonical_cwd.as_os_str(), &canonical_root, 0)
+    })?;
     Some(WorkspaceRoots {
         cwd,
         canonical_root,

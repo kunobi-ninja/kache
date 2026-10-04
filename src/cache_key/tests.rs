@@ -3456,6 +3456,99 @@ fn a_linker_or_search_path_in_the_checkout_does_not_split_the_identity() {
 }
 
 #[test]
+fn external_targets_keep_predictions_anchored_to_the_source_workspace() {
+    let dir = tempfile::tempdir().unwrap();
+    let (root, mut args) = workspace_invocation(dir.path(), "source", "kt");
+    let other = dir.path().join("shared-output");
+    let target = other.join("target");
+    std::fs::create_dir_all(target.join("debug/deps")).unwrap();
+    std::fs::write(other.join("Cargo.toml"), "[workspace]\n").unwrap();
+    args.out_dir = Some(target.join("debug/deps"));
+    assert_eq!(args.verified_workspace_root(&root), None);
+
+    let vars = manifest_vars(&root.join("kt"));
+    let roots = workspace_roots_in(&args, &vars, &root).unwrap();
+    assert_eq!(roots.root, root);
+    assert_eq!(roots.target, target);
+    assert_eq!(roots.cwd, "");
+    assert!(workspace_roots_in(&args, &manifest_vars(&other), &root).is_none());
+    assert!(workspace_roots_in(&args, &vars, &root.join("kt")).is_none());
+    std::fs::remove_file(root.join("Cargo.toml")).unwrap();
+    assert!(workspace_roots_in(&args, &vars, &root).is_none());
+}
+
+#[test]
+fn external_target_predictions_guard_sources_and_generated_inputs() {
+    let dir = tempfile::tempdir().unwrap();
+    let (root, mut args) = workspace_invocation(dir.path(), "source", "kt");
+    let target = dir.path().join("output/target");
+    let out = target.join("debug/build/kt-1/out");
+    std::fs::create_dir_all(target.join("debug/deps")).unwrap();
+    std::fs::create_dir_all(&out).unwrap();
+    let source = root.join("kt/src/lib.rs");
+    std::fs::write(&source, "pub fn value() {}\n").unwrap();
+    let generated = out.join("generated.rs");
+    std::fs::write(&generated, "pub const VALUE: u8 = 1;\n").unwrap();
+    args.out_dir = Some(target.join("debug/deps"));
+    let mut vars = manifest_vars(&root.join("kt"));
+    vars.push(("OUT_DIR".into(), out.clone().into_os_string()));
+    let roots = workspace_roots_in(&args, &vars, &root).unwrap();
+    let hasher = FileHasher::new();
+    let digest = || workspace_tree_digest(&roots, &hasher).unwrap();
+    let original = digest();
+    std::fs::write(target.join("debug/deps/unrelated.rlib"), "output").unwrap();
+    assert_eq!(digest(), original);
+    std::fs::create_dir_all(root.join("assets")).unwrap();
+    std::fs::write(root.join("assets/new.txt"), "macro input").unwrap();
+    assert_ne!(digest(), original);
+    std::fs::remove_dir_all(root.join("assets")).unwrap();
+    assert_eq!(digest(), original);
+    std::fs::write(&generated, "pub const VALUE: u8 = 2;\n").unwrap();
+    assert_ne!(digest(), original);
+
+    let closure = DepInfo {
+        source_files: vec![source.clone(), generated.clone()],
+        env_deps: vec![],
+    };
+    assert!(workspace_portable_prediction(&closure, &roots, Some("tree")).is_some());
+    for external in [
+        target.join("debug/deps/unrelated.rlib"),
+        dir.path().join("outside.rs"),
+    ] {
+        let closure = DepInfo {
+            source_files: vec![source.clone(), external],
+            env_deps: vec![],
+        };
+        assert!(workspace_portable_prediction(&closure, &roots, Some("tree")).is_none());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn external_target_predictions_keep_cargos_symlinked_source_spelling() {
+    let dir = tempfile::tempdir().unwrap();
+    let (root, mut args) = workspace_invocation(dir.path(), "source", "kt");
+    let alias = dir.path().join("alias");
+    std::os::unix::fs::symlink(&root, &alias).unwrap();
+    let target = dir.path().join("output/target");
+    std::fs::create_dir_all(target.join("debug/deps")).unwrap();
+    std::fs::write(root.join("kt/src/lib.rs"), "pub fn value() {}\n").unwrap();
+    args.out_dir = Some(target.join("debug/deps"));
+    args.source_file = Some(alias.join("kt/src/lib.rs"));
+    let vars = manifest_vars(&alias.join("kt"));
+    let cwd = std::fs::canonicalize(&root).unwrap();
+    let roots = workspace_roots_in(&args, &vars, &cwd).unwrap();
+    assert_eq!(roots.root, alias);
+    assert_eq!(roots.canonical_root, std::fs::canonicalize(&root).unwrap());
+    assert_eq!(roots.cwd, "");
+    let closure = DepInfo {
+        source_files: vec![alias.join("kt/src/lib.rs")],
+        env_deps: vec![],
+    };
+    assert!(workspace_portable_prediction(&closure, &roots, Some("tree")).is_some());
+}
+
+#[test]
 fn only_linker_paths_under_the_root_are_made_neutral() {
     let roots = workspace_test_roots();
     let args = |args: &[&str]| args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();

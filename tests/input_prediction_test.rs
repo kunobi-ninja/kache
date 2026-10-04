@@ -749,16 +749,11 @@ fn a_registry_unit_reading_past_its_package_keeps_the_record_local() {
     }
 }
 
-/// Only a registry package is the same files in every checkout. The writer
-/// checks that twice, in the relocated identity and again when it looks for
-/// the registry root, so this test fails only when both checks go. A unit
-/// test pins the reader's check on its own.
+/// A standalone package uses its compiler working directory as the source
+/// root when the two target directories live outside it.
 #[test]
-fn a_workspace_unit_keeps_its_out_dir_record_local() {
-    let unit = OutDirUnit::new("ws/kt", false);
-    let warm = build_a_then_b(&unit, |_, _| {});
-    assert_eq!(warm.dep_info_runs, 1);
-    assert_eq!(warm.result, "local_hit");
+fn a_standalone_package_predicts_with_external_targets() {
+    predicts_in_another_target(OutDirUnit::new("ws/kt", false));
 }
 
 /// Two checkouts of one Cargo workspace, `<root>/<checkout>`, each with its
@@ -771,6 +766,7 @@ struct WorkspaceUnit {
     lib: String,
     files: Vec<(String, String)>,
     proc_macro: Option<PathBuf>,
+    external_targets: bool,
 }
 
 impl WorkspaceUnit {
@@ -791,6 +787,24 @@ impl WorkspaceUnit {
             lib,
             files: vec![("assets/shared.txt".into(), "shared\n".into())],
             proc_macro,
+            external_targets: false,
+        }
+    }
+
+    fn with_external_targets(mut self) -> Self {
+        self.external_targets = true;
+        self
+    }
+
+    fn target(&self, checkout: &Path) -> PathBuf {
+        if self.external_targets {
+            self.root
+                .path()
+                .join("outputs")
+                .join(checkout.file_name().unwrap())
+                .join("target")
+        } else {
+            checkout.join("target")
         }
     }
 
@@ -815,7 +829,7 @@ impl WorkspaceUnit {
         for (path, content) in &self.files {
             write(path, content);
         }
-        let target = checkout.join("target");
+        let target = self.target(&checkout);
         std::fs::create_dir_all(target.join("debug/deps")).unwrap();
         std::fs::create_dir_all(out_dir_in(&target)).unwrap();
         std::fs::write(out_dir_in(&target).join("gen.rs"), GENERATED).unwrap();
@@ -857,7 +871,7 @@ impl WorkspaceUnit {
         verify: Option<&str>,
         extra: &[&str],
     ) -> LastEvent {
-        let target = checkout.join("target");
+        let target = self.target(checkout);
         let deps = target.join("debug/deps");
         let mut args: Vec<String> = vec![
             rustc_path(),
@@ -942,6 +956,33 @@ fn workspace_unit_predicts_in_another_checkout(unit: WorkspaceUnit) {
     assert_eq!(verified.dep_info_runs, 1);
     assert_eq!(verified.prediction_mismatches, 0);
     assert_eq!(verified.cache_key, off.cache_key);
+}
+
+#[test]
+fn workspace_predictions_relocate_between_external_targets() {
+    for with_macro in [false, true] {
+        workspace_unit_predicts_in_another_checkout(
+            WorkspaceUnit::new(with_macro).with_external_targets(),
+        );
+    }
+}
+
+#[test]
+fn external_target_predictions_reject_changed_generated_inputs() {
+    let unit = WorkspaceUnit::new(true).with_external_targets();
+    let warm = unit.build_a_then_b(|checkout| {
+        std::fs::write(
+            out_dir_in(&unit.target(checkout)).join("gen.rs"),
+            "pub const GENERATED: u32 = 123;\n",
+        )
+        .unwrap();
+    });
+    assert_ne!(warm.result, "local_hit");
+    assert_eq!(warm.compiler_runs, 1);
+    let checkout = unit.root.path().join("b");
+    let off = unit.build(&checkout, false, None);
+    assert_eq!(off.result, "local_hit");
+    assert_eq!(off.cache_key, warm.cache_key);
 }
 
 /// A second checkout whose tree differs rejects the first one's record. The

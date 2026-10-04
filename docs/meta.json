@@ -3,6 +3,7 @@
   "root": true,
   "pages": [
     "index",
+    "compatibility",
     "getting-started",
     "how-it-works",
     "daemon",

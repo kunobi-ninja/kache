@@ -1,0 +1,16 @@
+---
+title: Compatibility
+description: Kache 1.x interfaces and upgrade behavior
+---
+
+Kache 1.x keeps documented CLI commands, options, and configuration keys compatible. Removing an interface or changing its meaning requires a major release. New commands, options, and configuration keys can appear in minor releases.
+
+For scripts, use the documented JSON output and check `schema_version`. Fields may be added within a schema version; consumers should ignore fields they do not use. Removing fields or changing their meaning requires a new schema version and a major Kache release. Human-readable output can change between releases. See the [command reference](/docs/commands/reference) for JSON schemas and exit codes.
+
+The published `kache-core`, `kache-format`, `kache-fs`, `kache-shims`, and `kache-store` crates follow the same major-version compatibility rule for their public Rust APIs. Public struct fields, enum variants, and trait methods are part of those APIs.
+
+Cache contents are disposable compiler outputs. Cache-key recipes and private storage layouts can change during 1.x; an upgrade may cause misses and rebuilds. The JSON CLI contract does not make raw cache files or event logs stable interfaces.
+
+The [planner service and Helm chart](/docs/remote-service) remain previews. Their deployment, authentication, and HA behavior can change even when their versions track the CLI release.
+
+Building the 1.0 CLI from source requires Rust 1.95 or newer. The repository pins Rust 1.99 for development and release builds. Published crates declare their own minimum Rust versions.

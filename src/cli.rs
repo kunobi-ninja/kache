@@ -7244,6 +7244,27 @@ async fn sync_inner(
     .await
 }
 
+/// List the requested crate prefixes within the same limit as sync transfers.
+async fn list_remote_crates(
+    remote: &dyn crate::cache_remote::CacheRemote,
+    crates: &std::collections::HashSet<String>,
+    concurrency: u32,
+) -> Result<std::collections::HashMap<String, String>> {
+    use futures::{StreamExt, TryStreamExt};
+
+    futures::stream::iter(crates.iter().map(|crate_name| async move {
+        remote
+            .list_keys_for_crates(&std::collections::HashSet::from([crate_name.clone()]))
+            .await
+    }))
+    .buffer_unordered((concurrency as usize).max(1))
+    .try_fold(std::collections::HashMap::new(), |mut keys, listed| async {
+        keys.extend(listed);
+        Ok(keys)
+    })
+    .await
+}
+
 /// The remote-driven body of `sync`, with the backend injected so tests can
 /// drive it against a mock. Lists remote keys, diffs against the local store,
 /// then (unless `dry_run`) pulls missing artifacts and pushes local-only ones.
@@ -7281,8 +7302,7 @@ async fn sync_with_client(
                 "Listing remote keys for {} workspace crates...",
                 crates.len()
             );
-            let keys = remote_cache
-                .list_keys_for_crates(crates)
+            let keys = list_remote_crates(remote_cache, crates, config.s3_concurrency)
                 .await
                 .context("listing remote keys for workspace crates")?;
             eprintln!(" {} keys", keys.len());
@@ -7292,8 +7312,7 @@ async fn sync_with_client(
             && !crates.is_empty()
         {
             eprint!("Listing remote keys for {} crates...", crates.len());
-            let keys = remote_cache
-                .list_keys_for_crates(crates)
+            let keys = list_remote_crates(remote_cache, crates, config.s3_concurrency)
                 .await
                 .context("listing remote keys for dependency crates")?;
             eprintln!(" {} keys", keys.len());

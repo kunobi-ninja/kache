@@ -3466,10 +3466,7 @@ async fn scoped_listing_merges_every_requested_crates_keys() {
         ("b".repeat(64), "foo".to_string()),
         ("c".repeat(64), "bar".to_string()),
     ]);
-    for (key, name) in expected
-        .iter()
-        .chain([("d".repeat(64), "unrelated".to_string())].iter())
-    {
+    for (key, name) in &expected {
         backend
             .seed(
                 &format!("prefix/v3/manifests/{name}/{key}.json"),
@@ -3477,6 +3474,12 @@ async fn scoped_listing_merges_every_requested_crates_keys() {
             )
             .await;
     }
+    backend
+        .seed(
+            &format!("prefix/v3/manifests/unrelated/{}.json", "d".repeat(64)),
+            b"{}".to_vec(),
+        )
+        .await;
     let cache_remote = as_cache_remote(as_remote_backend(&backend), &remote);
     let crates = std::collections::HashSet::from(["foo".into(), "bar".into()]);
     assert_eq!(

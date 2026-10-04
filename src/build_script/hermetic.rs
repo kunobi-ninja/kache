@@ -293,6 +293,7 @@ pub(super) fn run(
         0,
         StorePutResult::default(),
         0,
+        0,
     );
     Ok(Some(0))
 }
@@ -313,6 +314,7 @@ fn restore(run: &Run, sandbox: &Sandbox, record: &Record, key: &str, key_ms: u64
         restore_start.elapsed().as_millis() as u64,
         0,
         StorePutResult::default(),
+        0,
         0,
     );
     Ok(())

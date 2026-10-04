@@ -467,6 +467,7 @@ fn run_cached(real: &Path, argv: &[std::ffi::OsString]) -> Result<i32> {
                         0,
                         StorePutResult::default(),
                         size,
+                        meta.compile_time_ms,
                     );
                     return Ok(0);
                 }
@@ -1553,7 +1554,17 @@ impl Run {
         )?;
         let store_ms = store_start.elapsed().as_millis() as u64;
         self.record_prediction(&prediction)?;
-        self.log(EventResult::Miss, &key, key_ms, 0, 0, store_ms, put, size);
+        self.log(
+            EventResult::Miss,
+            &key,
+            key_ms,
+            0,
+            0,
+            store_ms,
+            put,
+            size,
+            compile_ms,
+        );
         Ok(())
     }
 
@@ -1568,6 +1579,7 @@ impl Run {
         store_ms: u64,
         put: StorePutResult,
         size: u64,
+        compile_ms: u64,
     ) {
         let root = crate::wrapper::build_script_event_root(
             &self.environment.out_dir,
@@ -1578,6 +1590,7 @@ impl Run {
             &self.config,
             EventInputs::new(&root, CRATE_NAME, result, elapsed_ms)
                 .package(package_name())
+                .compile_time_ms(compile_ms)
                 .size(size)
                 .keyed(key, key_ms, FileHashStats::default())
                 .lookup_ms(lookup_ms)
@@ -3448,14 +3461,29 @@ mod tests {
         ]
         .concat();
 
-        let a = run_in("a/target");
+        let mut a = run_in("a/target");
+        a.start = std::time::Instant::now() - std::time::Duration::from_secs(2);
         let out = &a.environment.out_dir;
         std::fs::create_dir_all(out.join("lib/pkgconfig")).unwrap();
         std::fs::write(out.join("lib/pkgconfig/z.pc"), pc(out)).unwrap();
         std::fs::write(out.join("lib/adler32.o"), &object).unwrap();
         let after_the_run = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
-        a.record(b"cargo:rerun-if-changed=build.rs\n", b"", 5, after_the_run)
-            .unwrap();
+        a.record(
+            b"cargo:rerun-if-changed=build.rs\n",
+            b"",
+            1_300,
+            after_the_run,
+        )
+        .unwrap();
+
+        let events = crate::events::read_events(&config.event_log_path()).unwrap();
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(event.crate_name, CRATE_NAME);
+        assert_eq!(event.result, EventResult::Miss);
+        assert_eq!(event.compile_time_ms, 1_300);
+        assert!(event.elapsed_ms >= 2_000);
+        assert_eq!(event.overhead_ms(), event.elapsed_ms - 1_300);
 
         let b = run_in("b/target");
         let prediction = b
@@ -3472,6 +3500,8 @@ mod tests {
             .get(&b.action_key(&prediction).unwrap())
             .unwrap()
             .expect("the same key in another target directory");
+        assert_eq!(event.cache_key, meta.cache_key);
+        assert_eq!(meta.compile_time_ms, 1_300);
         assert_eq!(stored_manifest(&b, &meta).version, 2);
         b.restore(&meta).unwrap();
         let out = &b.environment.out_dir;

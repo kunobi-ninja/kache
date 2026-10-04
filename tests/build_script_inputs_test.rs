@@ -53,6 +53,7 @@ fn fixture(root: &Path, changed: bool) {
         &root.join("crates/b/build.rs"),
         r#"use std::path::PathBuf;
 fn main() {
+    std::thread::sleep(std::time::Duration::from_millis(50));
     let manifest = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap());
     let directory = manifest.join("../a/src").canonicalize().unwrap();
     let mode = std::env::var("DECLARATION_MODE").unwrap();
@@ -144,6 +145,11 @@ fn check_declarations(mode: &str) {
         recorded.iter().any(|event| event["result"] == "miss"),
         "the first run must be recorded: {recorded:?}"
     );
+    let miss = recorded
+        .iter()
+        .find(|event| event["result"] == "miss")
+        .unwrap();
+    assert!(miss["compile_time_ms"].as_u64().unwrap() >= 50);
     assert_current(&target);
 
     // The fix must retain cache hits across target directories in one checkout.
@@ -153,6 +159,12 @@ fn check_declarations(mode: &str) {
         restored.iter().any(|event| event["result"] == "local_hit"),
         "the same checkout should restore its run: {restored:?}"
     );
+    let hit = restored
+        .iter()
+        .find(|event| event["result"] == "local_hit")
+        .unwrap();
+    assert_eq!(hit["cache_key"], miss["cache_key"]);
+    assert_eq!(hit["compile_time_ms"], miss["compile_time_ms"]);
     assert_current(&target);
 
     let target = root.join("t3");

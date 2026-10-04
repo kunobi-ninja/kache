@@ -405,7 +405,11 @@ pub(crate) fn client_epoch_is_newer(client_epoch: u64, daemon_epoch: u64) -> boo
 
 /// Whether `pid` may still be running (see [`alive_from_state`]).
 fn process_is_alive(pid: u32) -> bool {
-    alive_from_state(pid, || kunobi_daemon::local::process_state(pid))
+    alive_from_state(pid, || {
+        kunobi_daemon::local::process_state(
+            kunobi_daemon::ProcessId::new(pid).expect("alive_from_state rejects PID zero"),
+        )
+    })
 }
 
 /// Whether a process the OS reports as `state` may still be running. A state

@@ -4,8 +4,8 @@ use kunobi_daemon::{
     ServiceIdentity,
     admission::{Admission, Limits, Pool},
     control::ControlService,
-    local::Duplex,
-    transport::SplitIo,
+    local::{Duplex, peer::PeerCredentials},
+    peer::{Policy, SameUser},
     wire::{self, operation},
 };
 
@@ -105,9 +105,8 @@ pub(super) async fn serve(config: &Config, lifecycle: Arc<Lifecycle>) -> Result<
                         if crate::transport::require_self_peer(crate::transport::peer_euid(&stream)).is_err() { return; }
                         #[cfg(windows)]
                         {
-                            use interprocess::local_socket::traits::StreamCommon as _;
-                            let Some(pid) = stream.peer_creds().ok().and_then(|creds| creds.pid()) else { return; };
-                            if kunobi_daemon::local::windows::verify_process_user(pid).is_err() { return; }
+                            let Ok(credentials) = stream.credentials() else { return; };
+                            if SameUser.grant(&credentials).is_err() { return; }
                         }
                         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
                         let _ = handler.serve(&stream, &offer, deadline).await;
@@ -144,31 +143,19 @@ pub(super) fn request(
         version == wire::VERSION,
         "unsupported lifecycle control version {version}"
     );
-    let stream = connect(&endpoint(config), deadline)?;
-    let pid = stream.peer_pid().context("reading lifecycle peer PID")?;
-    anyhow::ensure!(
-        pid == state.pid,
-        "lifecycle peer differs from advertised process"
-    );
-    let (read, write) = stream.split().context("splitting lifecycle socket")?;
-    let mut session = wire::Session::connect(SplitIo { read, write }, &offer(config)?)
-        .context("negotiating lifecycle control")?;
-    let request = wire::Control {
-        operation,
-        ..Default::default()
-    };
-    session
-        .send(&request)
-        .context("sending lifecycle control")?;
-    let health = wire::Health::from_response(
-        &session.receive().context("receiving lifecycle control")?,
-        &request,
-    )?;
-    anyhow::ensure!(
-        health.process_id == pid,
-        "health response differs from OS peer"
-    );
-    anyhow::ensure!(Instant::now() < deadline, "late lifecycle response");
+    let expected = kunobi_daemon::ProcessId::new(state.pid)
+        .context("lifecycle advertisement has an invalid PID")?;
+    let endpoint = crate::transport::daemon_endpoint(&endpoint(config));
+    let offer = offer(config)?;
+    let health = match operation {
+        operation::HEALTH => {
+            kunobi_daemon::client::health(&endpoint, &offer, Some(expected), deadline)
+        }
+        operation::DRAIN => {
+            kunobi_daemon::client::drain(&endpoint, &offer, Some(expected), deadline)
+        }
+        _ => anyhow::bail!("unsupported lifecycle operation {operation}"),
+    }?;
     Ok(Some(health))
 }
 
@@ -180,8 +167,11 @@ type Local = kunobi_daemon::local::PlatformDuplex;
 
 fn connect(path: &Path, deadline: Instant) -> Result<Local> {
     let stream = Local::connect_once_until(&crate::transport::daemon_endpoint(path), deadline)?;
-    stream
-        .verify_peer_user()
+    let credentials = stream
+        .credentials()
+        .context("reading lifecycle peer credentials")?;
+    SameUser
+        .grant(&credentials)
         .context("authenticating lifecycle peer")?;
     let remaining = deadline.saturating_duration_since(Instant::now());
     anyhow::ensure!(!remaining.is_zero(), "lifecycle deadline expired");
@@ -389,11 +379,12 @@ mod tests {
         .await
         .unwrap()
         .expect_err("identity mismatch must not become a retryable startup observation");
-        assert!(
-            failure
-                .to_string()
-                .contains("differs from advertised process")
-        );
+        assert!(matches!(
+            failure.downcast_ref::<kunobi_daemon::client::RequestError>(),
+            Some(kunobi_daemon::client::RequestError::Peer(
+                kunobi_daemon::peer::Rejected::OtherProcess { .. }
+            ))
+        ));
         assert!(lifecycle.accepting_calls());
         let other = super::super::tests::test_config(&root.path().join("another-cache"));
         assert!(wire::negotiate(&offer(&config).unwrap(), &offer(&other).unwrap()).is_err());

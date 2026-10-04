@@ -4,6 +4,6 @@
 # compiler. The channel is an exact version: a point release must not move CI
 # without a commit here.
 [toolchain]
-channel = "1.98.0"
+channel = "1.99.0"
 components = ["rustfmt", "clippy"]
 profile = "minimal"

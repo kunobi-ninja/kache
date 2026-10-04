@@ -14,7 +14,7 @@ It describes both projects as they are today and does not rank their speed. Test
 | Primary workflow | Local-first cache with optional explicit remote synchronization | Client-server compiler cache with local and remote storage |
 | Rust setup | `kache init` | `RUSTC_WRAPPER=sccache` |
 | C/C++ setup | `kache init` (PATH compiler-name shims on Unix) or `CC="kache cc"` | Prefix wrapper (`sccache gcc`); no ccache-style PATH farm |
-| Remote backends | S3-compatible storage and filesystem paths | S3, Redis, Memcached, GCS, Azure, GitHub Actions, WebDAV, and others listed by sccache |
+| Remote backends | S3-compatible storage, GCS, filesystem paths, and OCI registries | S3, Redis, Memcached, GCS, Azure, GitHub Actions, WebDAV, and others listed by sccache |
 | Inspection | `monitor`, `stats`, `explain`, `list`, and `doctor` | `--show-stats`, logs, and server commands |
 | Remote transfer | On-demand restore plus `sync`, manifests, and prefetch | Remote access is part of normal server operation |
 | Rust executables | Cacheable by default on Linux and macOS | Rust crates that invoke the system linker are not cached, according to the sccache README |

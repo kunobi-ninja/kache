@@ -496,7 +496,7 @@ fn stats_announces_auto_start_and_warns_on_daemon_config_mismatch() {
         )
         .stdout(
             predicates::str::contains("1.0 GiB")
-                .and(predicates::str::contains("private cache budget")),
+                .and(predicates::str::contains("registered blob budget")),
         );
 
     // Same daemon, different CLI config: the daemon's cap still renders (it
@@ -510,7 +510,7 @@ fn stats_announces_auto_start_and_warns_on_daemon_config_mismatch() {
         .success()
         .stdout(
             predicates::str::contains("1.0 GiB")
-                .and(predicates::str::contains("private cache budget")),
+                .and(predicates::str::contains("registered blob budget")),
         )
         .stderr(
             predicates::str::contains("local_max_size=1.0 GiB")
@@ -536,7 +536,7 @@ fn stats_announces_auto_start_and_warns_on_daemon_config_mismatch() {
         .success()
         .stdout(
             predicates::str::contains("1.0 GiB")
-                .and(predicates::str::contains("private cache budget")),
+                .and(predicates::str::contains("registered blob budget")),
         )
         .stderr(predicates::str::contains("local_store="));
 

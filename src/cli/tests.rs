@@ -4037,9 +4037,12 @@ fn render_stats_rich_snapshot_covers_all_lines() {
     });
     let lines = render_stats(&snap, &config, SinceWindow::DEFAULT);
     let row = |label| stats_row(&lines, label).unwrap_or_else(|| panic!("{label}: {lines:#?}"));
-    assert_eq!(row("Cache"), "Cache | 4.9 KiB | logical · 3 entries");
-    assert!(row("Limit").starts_with("Limit | 9.8 KiB | private cache budget"));
-    assert!(row("Dedup").starts_with("Dedup | 4 blobs | "));
+    assert_eq!(row("Cache"), "Cache | 2.0 KiB | blob bytes · 3 entries");
+    assert!(row("Limit").starts_with("Limit | 9.8 KiB | registered blob budget"));
+    assert_eq!(
+        row("Dedup"),
+        "Dedup | 4 blobs | 4.0 KiB logical, 50.0% saved"
+    );
     assert_eq!(
         row("Hit rate"),
         "Hit rate | 80.0% | 8 of 10 crates from cache"
@@ -4059,6 +4062,93 @@ fn render_stats_rich_snapshot_covers_all_lines() {
         "matching epoch -> no mismatch note"
     );
     assert!(row("Remote").starts_with("Remote | s3://"));
+}
+
+#[test]
+fn render_stats_cache_fallback_labels_logical_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = save_manifest_config(dir.path().join("cache"), None);
+    let snap = StatsSnapshot {
+        total_size: 8192,
+        blob_stats: None,
+        ..Default::default()
+    };
+    let lines = render_stats(&snap, &config, SinceWindow::DEFAULT);
+    assert_eq!(
+        stats_row(&lines, "Cache").unwrap(),
+        "Cache | 8.0 KiB | logical (blob size unavailable) · 0 entries"
+    );
+}
+
+#[test]
+fn render_stats_cache_preserves_logical_size_without_registered_blobs() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = save_manifest_config(dir.path().join("cache"), None);
+    let snap = StatsSnapshot {
+        total_size: 8192,
+        blob_stats: Some(crate::store::BlobStats {
+            total_logical_size: 8192,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let lines = render_stats(&snap, &config, SinceWindow::DEFAULT);
+    assert_eq!(
+        stats_row(&lines, "Cache").unwrap(),
+        "Cache | 0 B | blob bytes · 0 entries"
+    );
+    assert_eq!(
+        stats_row(&lines, "Dedup").unwrap(),
+        "Dedup | 0 blobs | 8.0 KiB logical, 0.0% saved"
+    );
+}
+
+#[test]
+fn render_stats_cache_shards_use_blob_bytes_and_label_missing_metadata() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = save_manifest_config(dir.path().join("cache"), None);
+    let snap = StatsSnapshot {
+        stores: vec![
+            crate::store_view::StoreSummary {
+                path: "/cache-one".into(),
+                bytes: 8192,
+                max_size: 4096,
+                entries: 2,
+                blob_stats: Some(crate::store::BlobStats {
+                    total_blob_size: 1024,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            crate::store_view::StoreSummary {
+                path: "/cache-two".into(),
+                bytes: 2048,
+                max_size: 4096,
+                entries: 1,
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    let stores = cache_rows(&snap, &config)
+        .into_iter()
+        .filter(|row| row.0 == "Store")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        stores,
+        vec![
+            (
+                "Store",
+                "1.0 KiB".into(),
+                "blob bytes · of 4.0 KiB · 2 entries · /cache-one".into()
+            ),
+            (
+                "Store",
+                "2.0 KiB".into(),
+                "logical (blob size unavailable) · of 4.0 KiB · 1 entries · /cache-two".into()
+            ),
+        ]
+    );
 }
 
 #[test]
@@ -4691,11 +4781,11 @@ fn render_stats_handles_zero_limits_and_zero_logical_dedup() {
     let out = render_stats(&snap, &config, window);
     assert_eq!(
         stats_row(&out, "Cache").unwrap(),
-        "Cache | 500 B | logical · 0 entries"
+        "Cache | 500 B | blob bytes · 0 entries"
     );
     assert_eq!(
         stats_row(&out, "Dedup").unwrap(),
-        "Dedup | 2 blobs | 500 B on disk, 0.0% saved"
+        "Dedup | 2 blobs | 0 B logical, 0.0% saved"
     );
     // #897: the title names the requested window, not a hardcoded 24h.
     assert_eq!(out[0], "kache · last 15m");

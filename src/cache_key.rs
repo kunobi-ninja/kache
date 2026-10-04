@@ -1956,11 +1956,10 @@ impl WorkspaceRoots {
 }
 
 /// This invocation's workspace, when its package is a workspace or path
-/// package inside the workspace Cargo builds and the target directory is
-/// that workspace's own.
+/// package inside the workspace Cargo builds.
 ///
 /// `None` for a registry package (see [`relocated_key_inputs`]), a package
-/// outside the workspace, a target directory elsewhere, and any root that
+/// outside the workspace, and any root that
 /// cannot be canonicalized: those units keep checkout-local records.
 fn workspace_roots(
     args: &RustcArgs,
@@ -1970,8 +1969,9 @@ fn workspace_roots(
 }
 
 /// [`workspace_roots`] for rustc running in `current_dir`. The root is
-/// [`RustcArgs::verified_workspace_root`]: absolute, the parent of the target
-/// directory, and holding a manifest.
+/// [`RustcArgs::verified_workspace_root`] for an in-workspace target, or
+/// Cargo's compiler working directory when it holds a manifest. An external
+/// target's parent is never treated as a source root.
 fn workspace_roots_in(
     args: &RustcArgs,
     vars: &[(std::ffi::OsString, std::ffi::OsString)],
@@ -1981,15 +1981,22 @@ fn workspace_roots_in(
     if is_registry_package(manifest_dir) {
         return None;
     }
-    let root = args.verified_workspace_root(current_dir)?;
+    let root = args.verified_workspace_root(current_dir).or_else(|| {
+        manifest_dir
+            .ancestors()
+            .find(|root| root.join("Cargo.toml").is_file() && same_dir(root, current_dir))
+            .map(Path::to_path_buf)
+    })?;
     let target = args.target_dir()?;
     suffix_within(manifest_dir.as_os_str(), &root, 0)?;
     let canonical_root = std::fs::canonicalize(&root).ok()?;
-    // The working directory may be spelled through either root: on macOS
-    // `current_dir` reports `/private/var/...` for a root Cargo spells
-    // `/var/...`.
-    let cwd = suffix_within(current_dir.as_os_str(), &root, 0)
-        .or_else(|| suffix_within(current_dir.as_os_str(), &canonical_root, 0))?;
+    // Cargo and the working directory can use different spellings: macOS
+    // resolves `/var` to `/private/var`, and Windows canonicalization adds
+    // a verbatim prefix and normalizes separators.
+    let cwd = suffix_within(current_dir.as_os_str(), &root, 0).or_else(|| {
+        let canonical_cwd = std::fs::canonicalize(current_dir).ok()?;
+        suffix_within(canonical_cwd.as_os_str(), &canonical_root, 0)
+    })?;
     Some(WorkspaceRoots {
         cwd,
         canonical_root,
@@ -2220,7 +2227,8 @@ fn workspace_tree_digest_within(
     file_hasher: &FileHasher<'_>,
     max_entries: usize,
 ) -> Option<String> {
-    let target = suffix_within(workspace.target.as_os_str(), &workspace.root, 0)?;
+    let target =
+        suffix_within(workspace.target.as_os_str(), &workspace.root, 0).unwrap_or_default();
     let target = target.trim_start_matches(['/', '\\']);
     let skipped = [target, ".git"];
     let mut roots = vec![(workspace.root.clone(), &b"workspace"[..], &skipped[..])];

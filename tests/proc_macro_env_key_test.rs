@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
 mod common;
-use common::{build_kache, isolated_config_path, kache_binary};
+use common::{build_kache, hermetic_command, isolated_config_path, kache_binary};
 
 /// The env var the test proc macro branches on. Named `KACHE_TEST_*` so it is
 /// obvious in a process listing that it belongs to this suite.
@@ -123,8 +123,11 @@ fn compile_consumer(
     out_dir: &Path,
     mode: Option<&str>,
 ) -> PathBuf {
-    let mut command = std::process::Command::new(kache_binary());
+    let config_path = isolated_config_path(cache_dir);
+    let mut command = hermetic_command(kache_binary(), cache_dir, Some(&config_path));
     command
+        .current_dir(consumer_src.parent().unwrap())
+        .env_remove("CARGO_MANIFEST_DIR")
         .args([
             rustc_path().as_str(),
             "--crate-name",
@@ -140,8 +143,6 @@ fn compile_consumer(
             &format!("pmenv={}", pm_dylib.display()),
             consumer_src.to_str().unwrap(),
         ])
-        .env("KACHE_CACHE_DIR", cache_dir)
-        .env("KACHE_CONFIG", isolated_config_path(cache_dir))
         .env("KACHE_LOG", "kache=info")
         .env_remove("RUSTC_WRAPPER")
         .env_remove("CARGO_BUILD_RUSTC_WRAPPER");
@@ -163,10 +164,9 @@ fn compile_consumer(
 /// `(compiled, local_hits)` from `kache report` over this isolated cache dir.
 /// A `dup` is still a compiler run, so it counts as compiled.
 fn compiled_hit_counts(cache_dir: &Path) -> (u64, u64) {
-    let output = std::process::Command::new(kache_binary())
+    let config_path = isolated_config_path(cache_dir);
+    let output = hermetic_command(kache_binary(), cache_dir, Some(&config_path))
         .args(["report", "--format", "json", "--since", "1h"])
-        .env("KACHE_CACHE_DIR", cache_dir)
-        .env("KACHE_CONFIG", isolated_config_path(cache_dir))
         .output()
         .expect("failed to run kache report");
     assert!(output.status.success(), "kache report failed");
@@ -207,7 +207,7 @@ fn declared_env_var_separates_proc_macro_expansions() {
     // artifact — the #635 failure.
     std::fs::write(
         isolated_config_path(cache_dir.path()),
-        format!("[cache]\nkey_env_vars = [\"{MODE_VAR}\"]\n"),
+        format!("[cache]\nlocal_only = true\nkey_env_vars = [\"{MODE_VAR}\"]\n"),
     )
     .unwrap();
 

@@ -136,13 +136,33 @@ prefix = "artifacts"
 
 Authenticate with `docker login` or `oras login`. Kache reads
 `$DOCKER_CONFIG/config.json` (default: `~/.docker/config.json`), including Docker
-credential helpers. Without configured credentials, it connects anonymously.
+credential helpers. Helpers and the config file are read again when registry
+auth expires. Without configured credentials, it connects anonymously.
+
+For CI, set `KACHE_OCI_USERNAME` and `KACHE_OCI_PASSWORD`, or set
+`KACHE_OCI_TOKEN` alone. Environment credentials take precedence over Docker
+config. Daemons inherit credentials at startup; restart after changing their
+environment. Set credentials in the installed service's environment when it
+runs independently of your shell. Keep secrets out of `config.toml`.
+
+OCI pull request jobs remain read-only even with `pull_request_prefix`: registry
+permissions apply to repositories, so separate tag prefixes cannot isolate
+writes.
+
 For a local HTTP registry, set `insecure = true`; HTTPS is the default.
 
 Each cache object is an OCI artifact with one layer. Tags use
-`kache-v1-<BLAKE3 of the object key>`; the manifest's
-`ninja.kunobi.kache.key` annotation records the original key. Listing scans tags
-and reads their manifests, so large caches cost more requests than S3 listings.
+the `kache-v2-` prefix and encode ordinary cache keys, including compressed hex
+digests. Listing recovers those keys from tag pages. Keys too long for an OCI
+tag use a hash instead; listing reads their manifests to recover the
+`ninja.kunobi.kache.key` annotation. Existing `kache-v1-` artifacts remain
+readable and appear once in listings when both tag versions exist.
+
+JSON objects up to 16 KiB embed their bytes in the layer descriptor, so a warm
+read needs one manifest request. Larger objects need a manifest and a blob
+request. Registry auth is cached and refreshed on rejection. Uploads reuse
+existing blobs and use a monolithic transfer for new blobs.
+
 Keep cache artifacts in a dedicated repository and configure its retention
 policy to retain the cache tags.
 

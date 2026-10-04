@@ -3227,6 +3227,7 @@ struct TestBackend {
     inner: crate::remote_backend::OpenDalBackend,
     calls: std::sync::Mutex<BackendCalls>,
     fail_put: bool,
+    listing: Option<Arc<ControlledListing>>,
 }
 
 impl TestBackend {
@@ -3235,6 +3236,7 @@ impl TestBackend {
             inner: crate::remote_backend::memory_backend(),
             calls: std::sync::Mutex::new(BackendCalls::default()),
             fail_put: false,
+            listing: None,
         })
     }
 
@@ -3243,6 +3245,7 @@ impl TestBackend {
             inner: crate::remote_backend::memory_backend(),
             calls: std::sync::Mutex::new(BackendCalls::default()),
             fail_put: true,
+            listing: None,
         })
     }
 
@@ -3301,12 +3304,185 @@ impl crate::remote_backend::RemoteBackend for TestBackend {
 
     async fn list(&self, prefix: &str) -> Result<Vec<String>> {
         self.calls.lock().unwrap().lists.push(prefix.to_string());
+        let _active = if let Some(listing) = &self.listing {
+            listing
+                .active
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let active = ActiveListing(listing);
+            listing.started.add_permits(1);
+            listing.release.acquire().await.unwrap().forget();
+            if listing.fail {
+                anyhow::bail!("injected LIST failure for {prefix}");
+            }
+            Some(active)
+        } else {
+            None
+        };
         crate::remote_backend::RemoteBackend::list(&self.inner, prefix).await
     }
 
     fn describe(&self, key: &str) -> String {
         crate::remote_backend::RemoteBackend::describe(&self.inner, key)
     }
+}
+
+struct ControlledListing {
+    active: std::sync::atomic::AtomicUsize,
+    started: tokio::sync::Semaphore,
+    release: tokio::sync::Semaphore,
+    fail: bool,
+}
+
+struct ActiveListing<'a>(&'a ControlledListing);
+
+impl Drop for ActiveListing<'_> {
+    fn drop(&mut self) {
+        self.0
+            .active
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+fn controlled_listing(fail: bool) -> (Arc<TestBackend>, Arc<ControlledListing>) {
+    let listing = Arc::new(ControlledListing {
+        active: std::sync::atomic::AtomicUsize::new(0),
+        started: tokio::sync::Semaphore::new(0),
+        release: tokio::sync::Semaphore::new(0),
+        fail,
+    });
+    let mut backend = TestBackend::memory();
+    Arc::get_mut(&mut backend).unwrap().listing = Some(listing.clone());
+    (backend, listing)
+}
+
+#[tokio::test]
+async fn scoped_sync_lists_overlap_within_the_configured_limit() {
+    use std::sync::atomic::Ordering::SeqCst;
+    for (concurrency, batches) in [
+        (0, vec![1, 1, 1]),
+        (1, vec![1, 1, 1]),
+        (2, vec![2, 1]),
+        (8, vec![3]),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = save_manifest_config(dir.path().to_path_buf(), Some(test_remote_cfg()));
+        config.s3_concurrency = concurrency;
+        let store = Store::open(&config).unwrap();
+        let remote = test_remote_cfg();
+        let crates = std::collections::HashSet::from(["foo".into(), "bar".into(), "baz".into()]);
+        let (backend, listing) = controlled_listing(false);
+        let cache_remote = as_cache_remote(as_remote_backend(&backend), &remote);
+        for (name, key) in [
+            ("foo", "a".repeat(64)),
+            ("bar", "b".repeat(64)),
+            ("baz", "c".repeat(64)),
+            ("unrelated", "d".repeat(64)),
+        ] {
+            backend
+                .seed(
+                    &format!("prefix/v3/manifests/{name}/{key}.json"),
+                    b"{}".to_vec(),
+                )
+                .await;
+        }
+        // Exercise both Cargo.lock and workspace filtering through the CLI path.
+        for workspace in [false, true] {
+            backend.calls.lock().unwrap().lists.clear();
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                let (result, ()) = tokio::join!(
+                    sync_with_client(
+                        &cache_remote,
+                        &config,
+                        &store,
+                        Some(&crates),
+                        true,
+                        false,
+                        true,
+                        false,
+                        Some(&crates),
+                        workspace,
+                        false
+                    ),
+                    async {
+                        for &batch in &batches {
+                            listing.started.acquire_many(batch).await.unwrap().forget();
+                            assert_eq!(listing.active.load(SeqCst), batch as usize);
+                            listing.release.add_permits(batch as usize);
+                        }
+                    }
+                );
+                result.unwrap();
+            })
+            .await
+            .expect("scoped listing must fill and release each configured batch");
+            let calls = backend.list_calls();
+            assert_eq!(calls.len(), 3);
+            for name in &crates {
+                assert!(calls.contains(&format!("prefix/v3/manifests/{name}/")));
+            }
+            assert_eq!(listing.active.load(SeqCst), 0);
+        }
+        let keys = list_remote_crates(
+            &cache_remote,
+            &std::collections::HashSet::new(),
+            concurrency,
+        )
+        .await
+        .unwrap();
+        assert!(keys.is_empty());
+        assert_eq!(backend.list_calls().len(), 3);
+    }
+}
+
+#[tokio::test]
+async fn scoped_listing_propagates_failures_and_drops_cancelled_requests() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let remote = test_remote_cfg();
+    let crates = std::collections::HashSet::from(["foo".into(), "bar".into(), "baz".into()]);
+    let (backend, listing) = controlled_listing(true);
+    let cache_remote = as_cache_remote(as_remote_backend(&backend), &remote);
+    let result = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        let (result, ()) = tokio::join!(list_remote_crates(&cache_remote, &crates, 2), async {
+            listing.started.acquire_many(2).await.unwrap().forget();
+            assert_eq!(listing.active.load(SeqCst), 2);
+            // Only one request completes: returning its error must cancel the other.
+            listing.release.add_permits(1);
+        });
+        result
+    })
+    .await
+    .expect("a failed LIST must not wait for the other requests");
+    assert!(format!("{:#}", result.unwrap_err()).contains("injected LIST failure"));
+    assert_eq!(listing.active.load(SeqCst), 0);
+    assert_eq!(backend.list_calls().len(), 2);
+}
+
+#[tokio::test]
+async fn scoped_listing_merges_every_requested_crates_keys() {
+    let remote = test_remote_cfg();
+    let backend = TestBackend::memory();
+    let expected = std::collections::HashMap::from([
+        ("a".repeat(64), "foo".to_string()),
+        ("b".repeat(64), "foo".to_string()),
+        ("c".repeat(64), "bar".to_string()),
+    ]);
+    for (key, name) in expected
+        .iter()
+        .chain([("d".repeat(64), "unrelated".to_string())].iter())
+    {
+        backend
+            .seed(
+                &format!("prefix/v3/manifests/{name}/{key}.json"),
+                b"{}".to_vec(),
+            )
+            .await;
+    }
+    let cache_remote = as_cache_remote(as_remote_backend(&backend), &remote);
+    let crates = std::collections::HashSet::from(["foo".into(), "bar".into()]);
+    assert_eq!(
+        list_remote_crates(&cache_remote, &crates, 2).await.unwrap(),
+        expected
+    );
 }
 
 #[tokio::test]

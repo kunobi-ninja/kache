@@ -310,6 +310,9 @@ fn replacement_executable() -> Result<PathBuf> {
 }
 
 fn transient(error: &anyhow::Error) -> bool {
+    if let Some(control) = error.downcast_ref::<kunobi_daemon::client::RequestError>() {
+        return control.is_transient();
+    }
     error.chain().any(|error| {
         matches!(
             error.downcast_ref::<kunobi_daemon::local::ConnectError>(),
@@ -375,6 +378,33 @@ fn written_since(path: &Path, start: u64) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn control_failures_keep_the_shared_clients_retry_decision() {
+        use kunobi_daemon::{client::RequestError, local::ConnectError, peer::Rejected};
+        let unavailable =
+            anyhow::Error::from(RequestError::Unavailable(ConnectError::ConnectTimeout))
+                .context("observing lifecycle");
+        assert!(transient(&unavailable));
+        for failure in [
+            RequestError::Peer(Rejected::OtherUser),
+            RequestError::Credentials(std::io::ErrorKind::TimedOut.into()),
+            RequestError::Protocol(std::io::ErrorKind::UnexpectedEof.into()),
+            RequestError::Protocol(std::io::ErrorKind::ConnectionReset.into()),
+            RequestError::Unavailable(ConnectError::PermissionDenied),
+            RequestError::Unavailable(ConnectError::Failed(std::io::ErrorKind::InvalidInput)),
+            RequestError::Late,
+        ] {
+            let error = anyhow::Error::from(failure).context("observing lifecycle");
+            assert!(!transient(&error), "{error:?} must remain terminal");
+        }
+        assert!(
+            transient(&anyhow::Error::from(std::io::Error::from(
+                std::io::ErrorKind::UnexpectedEof,
+            ))),
+            "legacy connection closure remains retryable"
+        );
+    }
 
     #[test]
     fn unit_tests_never_start_the_test_binary_as_a_daemon() {
@@ -487,7 +517,7 @@ mod tests {
         command.args(["-c", "while [ ! -e \"$1\" ]; do sleep 0.05; done", "sh"]);
         command.arg(&release);
         let child = command.spawn().unwrap();
-        let pid = child.id() as libc::pid_t;
+        let pid = child.id().get() as libc::pid_t;
         let mut replacement = driver(&config);
         replacement.child = Some(child);
         drop(replacement);

@@ -3,7 +3,7 @@ title: Kache
 description: A local-first compiler cache for Rust, C/C++ and CUDA builds
 ---
 
-Kache stores compiler outputs by content and reuses them across builds, repositories, and worktrees. The local cache works on its own. S3-compatible and filesystem remotes are optional.
+Kache stores compiler outputs by content and reuses them across builds, repositories, and worktrees. The local cache works on its own. Optional remotes use S3-compatible storage, GCS, shared filesystems, or OCI registries.
 
 ## Get started
 
@@ -21,7 +21,7 @@ kache init
 
 Keep running `cargo build` as usual; Kache now caches the compiler outputs.
 
-`kache init` sets Cargo's `rustc-wrapper` and installs a login service for the background cache. It asks before each change and backs up files it edits. On Unix, once the compiler shims are installed, it also points `build.rustdoc` at the `rustdoc` link.
+`kache init` shows a setup plan and asks once before applying it. Replacing another Cargo wrapper requires a separate confirmation. It configures Cargo's `rustc-wrapper`, installs a login service for the background cache, and backs up files it edits. On Unix, once the compiler shims are installed, it also points `build.rustdoc` at the `rustdoc` link.
 
 [Other install methods](/docs/getting-started/installation) include Homebrew, APT, winget, and Nix. The [quick start](/docs/getting-started/quick-start) shows how to confirm cache hits. For a comparison with sccache, read [Kache or sccache?](/docs/getting-started/comparison).
 
@@ -35,7 +35,7 @@ Keep running `cargo build` as usual; Kache now caches the compiler outputs.
 | CUDA object compilation | Single-source `nvcc -c` and `-dc` |
 | Rust documentation | Unix, for Cargo's per-crate and finalize rustdoc invocations. Not cached on Windows |
 | Local cache | Content-addressed storage with automatic garbage collection |
-| Remote cache | S3-compatible and filesystem backends |
+| Remote cache | S3-compatible storage, GCS, filesystems, and OCI registries |
 | Build visibility | Live monitor, stats, miss explanations, and reports |
 
 Kache passes unsupported compiler invocations through unchanged. A passthrough is not a cache hit or miss; inspect its reason in the monitor's Why tab or debug logs.
@@ -59,7 +59,7 @@ Benchmark numbers count only when the individual job succeeds and its self-check
     PATH shims for Make and PKGBUILD, and what is cached.
   </Card>
   <Card title="Remote cache" href="/docs/remote-cache/s3-setup">
-    Share entries through S3-compatible or filesystem storage.
+    Configure S3-compatible storage for shared cache entries.
   </Card>
   <Card title="Command reference" href="/docs/commands/reference">
     Exact commands and common flags.

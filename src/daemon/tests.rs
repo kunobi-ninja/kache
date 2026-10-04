@@ -998,21 +998,15 @@ async fn test_shutdown_request_sets_flag_and_stores_notify_permit() {
         .expect("stop request must wake a later drain observer");
 }
 
-struct GatedHeadBackend {
-    head_started: Arc<Notify>,
-    release_head: Arc<tokio::sync::Semaphore>,
+struct GatedMissBackend {
+    get_started: Arc<Notify>,
+    release_get: Arc<tokio::sync::Semaphore>,
 }
 
 #[async_trait::async_trait]
-impl crate::remote_backend::RemoteBackend for GatedHeadBackend {
+impl crate::remote_backend::RemoteBackend for GatedMissBackend {
     async fn head(&self, _key: &str) -> Result<bool> {
-        self.head_started.notify_one();
-        let _release = self
-            .release_head
-            .acquire()
-            .await
-            .expect("test gate stays open");
-        Ok(false)
+        panic!("exact-key restore must not issue HEAD");
     }
 
     async fn get(
@@ -1020,7 +1014,13 @@ impl crate::remote_backend::RemoteBackend for GatedHeadBackend {
         _key: &str,
         _max_bytes: Option<u64>,
     ) -> Result<Option<crate::remote_backend::GetObject>> {
-        panic!("a missing HEAD result must not issue GET");
+        self.get_started.notify_one();
+        let _release = self
+            .release_get
+            .acquire()
+            .await
+            .expect("test gate stays open");
+        Ok(None)
     }
 
     async fn put(&self, _key: &str, _body: Vec<u8>, _content_type: Option<&str>) -> Result<()> {
@@ -1032,7 +1032,7 @@ impl crate::remote_backend::RemoteBackend for GatedHeadBackend {
     }
 
     fn describe(&self, key: &str) -> String {
-        format!("gated-head://test/{key}")
+        format!("gated-miss://test/{key}")
     }
 }
 
@@ -1048,11 +1048,11 @@ async fn accept_loop_drains_in_flight_response_and_shutdown_ack() {
     let socket_path = config.socket_path();
     std::fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
 
-    let head_started = Arc::new(Notify::new());
-    let release_head = Arc::new(tokio::sync::Semaphore::new(0));
-    let backend: Arc<dyn crate::remote_backend::RemoteBackend> = Arc::new(GatedHeadBackend {
-        head_started: head_started.clone(),
-        release_head: release_head.clone(),
+    let get_started = Arc::new(Notify::new());
+    let release_get = Arc::new(tokio::sync::Semaphore::new(0));
+    let backend: Arc<dyn crate::remote_backend::RemoteBackend> = Arc::new(GatedMissBackend {
+        get_started: get_started.clone(),
+        release_get: release_get.clone(),
     });
     let daemon = Arc::new(Daemon::new(config.clone()));
     daemon.signal_warming_complete();
@@ -1094,9 +1094,9 @@ async fn accept_loop_drains_in_flight_response_and_shutdown_ack() {
         )
         .await
     });
-    tokio::time::timeout(Duration::from_secs(1), head_started.notified())
+    tokio::time::timeout(Duration::from_secs(1), get_started.notified())
         .await
-        .expect("remote request reached gated HEAD");
+        .expect("remote request reached gated GET");
 
     let shutdown_socket = socket_path.clone();
     let shutdown_client = tokio::spawn(async move {
@@ -1136,7 +1136,7 @@ async fn accept_loop_drains_in_flight_response_and_shutdown_ack() {
         "draining daemon must reject new speculative tasks"
     );
 
-    release_head.add_permits(1);
+    release_get.add_permits(1);
     let remote_response = tokio::time::timeout(Duration::from_secs(1), remote_client)
         .await
         .expect("in-flight response was written after gate release")
@@ -6160,8 +6160,7 @@ async fn test_batch_remote_check_remote_path_with_injected_mock() {
 
 #[tokio::test]
 async fn test_remote_check_failure_records_v3_transfer_timestamps() {
-    // Injected mock: HEAD 200 (entry exists) then a garbage pack body for the
-    // GET, so download_entry fails. Covers handle_remote_check's HIT branch +
+    // Injected mock: a garbage pack GET, so download_entry fails. Covers handle_remote_check's HIT branch +
     // download claim/semaphore + download_entry attempt + the error path.
     let dir = tempfile::tempdir().unwrap();
     let mut config = test_config(dir.path());
@@ -8081,7 +8080,7 @@ async fn packed_import_error_marks_the_pack_failed_without_entry_validation_erro
 
 #[tokio::test]
 async fn test_remote_check_success_records_v3_transfer_timestamps() {
-    // HEAD 200 then a VALID pack GET: handle_remote_check downloads, extracts,
+    // a VALID pack GET: handle_remote_check downloads, extracts,
     // and imports the entry, returning found=true. Covers the HIT SUCCESS
     // path (download_entry + import_restored_entry).
     let dir = tempfile::tempdir().unwrap();
@@ -10157,7 +10156,7 @@ async fn test_wait_for_warming_multiple_waiters() {
 // consult it.
 
 #[tokio::test]
-async fn test_handle_remote_check_skips_head_when_probe_circuit_is_open() {
+async fn test_handle_remote_check_skips_get_when_probe_circuit_is_open() {
     let dir = tempfile::tempdir().unwrap();
     let mut config = test_config(dir.path());
     config.remote = Some(crate::config::RemoteConfig::test_s3("test", "artifacts"));
@@ -10198,6 +10197,12 @@ async fn test_handle_remote_check_authoritative_key_cache_skips_s3() {
     config.remote = Some(crate::config::RemoteConfig::test_s3("test", "artifacts"));
     let daemon = Daemon::new(config);
     daemon.signal_warming_complete();
+    assert!(
+        daemon
+            .remote_backend
+            .set(Arc::new(PanicOnGetBackend))
+            .is_ok()
+    );
 
     // Populate with a *different* key so the cache is fresh and authoritative
     // but the requested key is a known absence.
@@ -10232,6 +10237,153 @@ async fn test_handle_remote_check_authoritative_key_cache_skips_s3() {
             .suppressed_ops(crate::remote_resilience::RemoteDirection::Read),
         0
     );
+}
+
+// A restore backend with no manifest lookup and a gate for concurrent demand.
+struct DirectRestoreBackend {
+    inner: Arc<dyn crate::remote_backend::RemoteBackend>,
+    gets: std::sync::atomic::AtomicU64,
+    started: tokio::sync::Semaphore,
+    release: Option<tokio::sync::Semaphore>,
+}
+
+#[async_trait::async_trait]
+impl crate::remote_backend::RemoteBackend for DirectRestoreBackend {
+    async fn head(&self, _key: &str) -> Result<bool> {
+        panic!("exact-key restore must not issue HEAD");
+    }
+
+    async fn get(
+        &self,
+        key: &str,
+        max_bytes: Option<u64>,
+    ) -> Result<Option<crate::remote_backend::GetObject>> {
+        self.gets.fetch_add(1, Ordering::Relaxed);
+        self.started.add_permits(1);
+        if let Some(release) = &self.release {
+            release.acquire().await.unwrap().forget();
+        }
+        self.inner.get(key, max_bytes).await
+    }
+
+    async fn put(&self, _key: &str, _body: Vec<u8>, _content_type: Option<&str>) -> Result<()> {
+        panic!("restore must not upload");
+    }
+
+    async fn list(&self, _prefix: &str) -> Result<Vec<String>> {
+        panic!("exact-key restore must not list");
+    }
+
+    fn describe(&self, key: &str) -> String {
+        self.inner.describe(key)
+    }
+}
+
+#[tokio::test]
+async fn direct_restore_fetches_one_pack_without_a_listing_manifest() {
+    for knowledge in [None, Some(true), Some(false)] {
+        let dir = tempfile::tempdir().unwrap();
+        let req = check_request(dir.path(), "direct-get-hit");
+        let inner = test_remote_backend();
+        put_test_object(
+            &inner,
+            &test_pack_object_key(&req.key, "serde"),
+            &build_entry_pack(&req.key, "serde"),
+        )
+        .await;
+        let backend = Arc::new(DirectRestoreBackend {
+            inner,
+            gets: 0.into(),
+            started: tokio::sync::Semaphore::new(0),
+            release: None,
+        });
+        let mut config = test_config(dir.path());
+        config.remote = Some(test_remote_config());
+        // A listing with refresh disabled is not authoritative for misses.
+        config.remote_key_cache_refresh_secs = 0;
+        let daemon = Daemon::new(config);
+        daemon.signal_warming_complete();
+        assert!(daemon.remote_backend.set(backend.clone()).is_ok());
+        if let Some(present) = knowledge {
+            let indexed = if present {
+                req.key.clone()
+            } else {
+                "a".repeat(64)
+            };
+            daemon
+                .key_cache
+                .populate(HashMap::from([(indexed, "serde".into())]))
+                .await;
+        }
+        assert_eq!(daemon.key_cache.check(&req.key).await, knowledge);
+        let response = daemon.handle_remote_check(&req).await;
+        assert!(response.ok, "{response:?}");
+        assert_eq!(response.found, Some(true), "knowledge: {knowledge:?}");
+        assert_eq!(backend.gets.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            daemon
+                .transfer_counters
+                .remote_check_roundtrips
+                .load(Ordering::Relaxed),
+            1
+        );
+        {
+            let transfers = daemon.recent_transfers.lock().unwrap();
+            assert_eq!(transfers.len(), 1);
+            assert_eq!(transfers[0].head_ms, 0);
+            assert_eq!(transfers[0].request_count, 1);
+            assert!(transfers[0].ok);
+        }
+        assert!(daemon.downloading.read().await.is_empty());
+        assert_eq!(daemon.negative_keys.len(), 0);
+        assert!(
+            daemon
+                .with_import_store(dir.path(), |store| Ok(store.contains(&req.key)))
+                .unwrap()
+        );
+    }
+}
+
+#[tokio::test]
+async fn direct_restore_coalesces_simultaneous_unknown_key_hits() {
+    let dir = tempfile::tempdir().unwrap();
+    let req = check_request(dir.path(), "direct-get-dedup");
+    let inner = test_remote_backend();
+    put_test_object(
+        &inner,
+        &test_pack_object_key(&req.key, "serde"),
+        &build_entry_pack(&req.key, "serde"),
+    )
+    .await;
+    let backend = Arc::new(DirectRestoreBackend {
+        inner,
+        gets: 0.into(),
+        started: tokio::sync::Semaphore::new(0),
+        release: Some(tokio::sync::Semaphore::new(0)),
+    });
+    let daemon = Arc::new(resilience_test_daemon(dir.path(), backend.clone()));
+    let leader_daemon = daemon.clone();
+    let leader_req = req.clone();
+    let leader = tokio::spawn(async move { leader_daemon.handle_remote_check(&leader_req).await });
+    tokio::time::timeout(Duration::from_secs(2), backend.started.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    let follower = daemon.handle_remote_check(&req);
+    tokio::pin!(follower);
+    // RemoteCheck's singleflight is claimed before its first await, so one
+    // poll parks this follower behind the blocked leader.
+    assert!(futures::poll!(&mut follower).is_pending());
+    assert_eq!(backend.gets.load(Ordering::Relaxed), 1);
+    backend.release.as_ref().unwrap().add_permits(1);
+    assert_eq!(leader.await.unwrap().found, Some(true));
+    let response = tokio::time::timeout(Duration::from_secs(2), follower)
+        .await
+        .unwrap();
+    assert_eq!(response.found, Some(true));
+    assert_eq!(backend.gets.load(Ordering::Relaxed), 1);
+    assert!(daemon.downloading.read().await.is_empty());
 }
 
 // ── Remote resilience tests (#327, #564) ──────────────────────
@@ -10297,15 +10449,23 @@ impl crate::remote_backend::RemoteBackend for StallingGetBackend {
     }
 }
 
-/// Backend whose HEAD fails with the given error class on every call.
-struct FailingHeadBackend {
+/// Backend whose GET fails with the given error class on every call.
+struct FailingGetBackend {
     timeout: bool,
     calls: std::sync::atomic::AtomicU64,
 }
 
 #[async_trait::async_trait]
-impl crate::remote_backend::RemoteBackend for FailingHeadBackend {
+impl crate::remote_backend::RemoteBackend for FailingGetBackend {
     async fn head(&self, _key: &str) -> Result<bool> {
+        panic!("exact-key restore must not issue HEAD");
+    }
+
+    async fn get(
+        &self,
+        _key: &str,
+        _max_bytes: Option<u64>,
+    ) -> Result<Option<crate::remote_backend::GetObject>> {
         self.calls
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if self.timeout {
@@ -10321,14 +10481,6 @@ impl crate::remote_backend::RemoteBackend for FailingHeadBackend {
         }
     }
 
-    async fn get(
-        &self,
-        _key: &str,
-        _max_bytes: Option<u64>,
-    ) -> Result<Option<crate::remote_backend::GetObject>> {
-        Ok(None)
-    }
-
     async fn put(&self, _key: &str, _body: Vec<u8>, _content_type: Option<&str>) -> Result<()> {
         Ok(())
     }
@@ -10338,7 +10490,7 @@ impl crate::remote_backend::RemoteBackend for FailingHeadBackend {
     }
 
     fn describe(&self, key: &str) -> String {
-        format!("failing-head://test/{key}")
+        format!("failing-get://test/{key}")
     }
 }
 
@@ -10383,7 +10535,7 @@ async fn test_negative_cache_second_check_skips_s3_and_upload_invalidates() {
         .transfer_counters
         .remote_check_roundtrips
         .load(Ordering::Relaxed);
-    assert_eq!(roundtrips_after_first, 1, "first check pays one HEAD");
+    assert_eq!(roundtrips_after_first, 1, "first check pays one GET");
     assert_eq!(daemon.negative_keys.len(), 1, "definitive miss remembered");
 
     let resp = daemon.handle_remote_check(&req).await;
@@ -10508,7 +10660,7 @@ async fn test_restore_deadline_returns_miss_instead_of_hanging() {
 #[tokio::test]
 async fn expired_remote_check_queued_by_handler_limiter_never_reaches_backend() {
     let dir = tempfile::tempdir().unwrap();
-    let backend = Arc::new(FailingHeadBackend {
+    let backend = Arc::new(FailingGetBackend {
         timeout: false,
         calls: 0.into(),
     });
@@ -10557,7 +10709,7 @@ async fn expired_remote_check_queued_by_handler_limiter_never_reaches_backend() 
     assert_eq!(
         backend.calls.load(Ordering::Relaxed),
         0,
-        "an expired request must not start HEAD after leaving the handler queue"
+        "an expired request must not start GET after leaving the handler queue"
     );
     server
         .await
@@ -10609,14 +10761,14 @@ async fn test_do_upload_suppressed_while_degraded() {
     );
 }
 
-/// #327/#564: HEAD has exactly one daemon attempt for every soft failure;
+/// #327/#564: GET has exactly one daemon attempt for every soft failure;
 /// neither transient failures nor timeouts are negative-cached.
 #[tokio::test]
-async fn test_head_failure_classes_drive_retries_and_skip_negative_cache() {
+async fn test_get_failure_classes_drive_retries_and_skip_negative_cache() {
     // Transient: one attempt. Retry ownership must not be nested under the
     // daemon's semaphore/deadline/breaker boundary.
     let dir = tempfile::tempdir().unwrap();
-    let transient = Arc::new(FailingHeadBackend {
+    let transient = Arc::new(FailingGetBackend {
         timeout: false,
         calls: 0.into(),
     });
@@ -10639,7 +10791,7 @@ async fn test_head_failure_classes_drive_retries_and_skip_negative_cache() {
     // Timeout: exactly one attempt, and three such checks degrade the
     // breaker so the fourth never reaches the backend.
     let dir = tempfile::tempdir().unwrap();
-    let timeouts = Arc::new(FailingHeadBackend {
+    let timeouts = Arc::new(FailingGetBackend {
         timeout: true,
         calls: 0.into(),
     });
@@ -10978,7 +11130,7 @@ async fn test_demand_does_not_wait_behind_unstarted_prefetch_candidates() {
 
     let client = test_remote_backend();
     for key in [&stalled_key, &demanded_key] {
-        // The manifest object is what the demand path's HEAD probe looks for.
+        // The manifest makes the entry discoverable to bulk sync.
         put_test_object(&client, &test_manifest_object_key(key, "serde"), b"{}").await;
         put_test_object(
             &client,

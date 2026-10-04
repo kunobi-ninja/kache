@@ -371,7 +371,6 @@ pub(crate) enum RemoteDirection {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RemoteOperation {
-    DemandHead,
     DemandGet,
     UploadHead,
     UploadPut,
@@ -392,7 +391,6 @@ impl RemoteOperation {
 
     fn label(self) -> &'static str {
         match self {
-            Self::DemandHead => "demand HEAD",
             Self::DemandGet => "demand GET",
             Self::UploadHead => "upload HEAD",
             Self::UploadPut => "upload PUT",
@@ -1532,7 +1530,7 @@ mod tests {
         let probe = breaker
             .try_acquire(RemoteOperation::DemandGet)
             .expect("cooldown elapsed");
-        assert!(breaker.try_acquire(RemoteOperation::DemandHead).is_none());
+        assert!(breaker.try_acquire(RemoteOperation::ManifestGet).is_none());
         assert_eq!(breaker.suppressed_ops(RemoteDirection::Read), 1);
         probe.success();
         assert!(!breaker.is_direction_degraded(RemoteDirection::Read));
@@ -1559,7 +1557,7 @@ mod tests {
         }
 
         let probe = breaker
-            .try_acquire(RemoteOperation::DemandHead)
+            .try_acquire(RemoteOperation::DemandGet)
             .expect("elapsed cooldown must admit one probe");
         let probe_epoch = probe.epoch;
         assert!(matches!(
@@ -1714,11 +1712,6 @@ mod tests {
     #[test]
     fn every_remote_operation_has_the_expected_direction_and_label() {
         for (operation, direction, label) in [
-            (
-                RemoteOperation::DemandHead,
-                RemoteDirection::Read,
-                "demand HEAD",
-            ),
             (
                 RemoteOperation::DemandGet,
                 RemoteDirection::Read,

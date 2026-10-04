@@ -4434,8 +4434,7 @@ impl Daemon {
         }
 
         let cn = &req.crate_name;
-        let mut needs_head_probe = false;
-        let mut head_ms = 0u64;
+        let head_ms = 0u64;
         let mut semaphore_wait_ms = 0u64;
 
         // Negative-result cache (#564): a definitive remote miss recorded
@@ -4456,29 +4455,17 @@ impl Daemon {
             .begin_observation(&req.key)
             .expect("validated remote-check key must admit a knowledge epoch");
 
-        // Check key cache first (no semaphore needed for in-memory lookup)
-        match self.key_cache.check(&req.key).await {
-            Some(false) => {
-                let authoritative = key_cache_miss_is_authoritative(
-                    self.config.remote_key_cache_refresh_secs,
-                    self.key_cache.age().await,
-                );
-                if authoritative {
-                    tracing::debug!("key cache: {} not found (skipping remote)", &req.key);
-                    return Response::found(false);
-                }
-                tracing::debug!(
-                    "key cache: {} not found but cache is stale, falling through to HEAD",
-                    &req.key
-                );
-                needs_head_probe = true;
-            }
-            Some(true) => {
-                tracing::debug!("key cache: {} found, skipping HEAD", &req.key);
-                // Skip HEAD, go straight to download
-            }
-            None => {
-                needs_head_probe = true;
+        // A fresh authoritative index can answer a miss without transport.
+        // Otherwise fetch the known pack key directly; a GET 404 is definitive
+        // and the restore verifies the pack before publishing it locally.
+        if self.key_cache.check(&req.key).await == Some(false) {
+            let authoritative = key_cache_miss_is_authoritative(
+                self.config.remote_key_cache_refresh_secs,
+                self.key_cache.age().await,
+            );
+            if authoritative {
+                tracing::debug!("key cache: {} not found (skipping remote)", &req.key);
+                return Response::found(false);
             }
         }
 
@@ -4498,72 +4485,6 @@ impl Daemon {
         };
         let plan = crate::remote_plan::RemotePlanner::new(&self.config)
             .plan(crate::remote_plan::RemoteWorkload::RestoreCheck);
-
-        if needs_head_probe {
-            let Some(breaker_permit) = self.remote_breaker.try_acquire(RemoteOperation::DemandHead)
-            else {
-                self.transfer_counters
-                    .downloads_suppressed
-                    .fetch_add(1, Ordering::Relaxed);
-                return Response::found(false);
-            };
-            let semaphore_start = Instant::now();
-            let semaphore_permit = match deadline
-                .run("demand HEAD queue", async {
-                    self.s3_semaphore
-                        .acquire()
-                        .await
-                        .map_err(|_| anyhow::anyhow!("remote semaphore closed"))
-                })
-                .await
-            {
-                Ok(permit) => permit,
-                Err(error) => {
-                    let class = classify_remote_error(&error);
-                    breaker_permit.failure(class, &format!("{error:#}"));
-                    return Response::found(false);
-                }
-            };
-            semaphore_wait_ms =
-                semaphore_wait_ms.saturating_add(semaphore_start.elapsed().as_millis() as u64);
-            let head_start = Instant::now();
-            // Exactly one retry layer: the daemon issues one transport call.
-            // In particular, there is no backoff sleep while the S3 permit is
-            // held; a later request can retry after breaker policy admits it.
-            let exists = deadline
-                .run("demand HEAD", remote_cache.exists_entry(&req.key, cn))
-                .await;
-            head_ms += head_start.elapsed().as_millis() as u64;
-            drop(semaphore_permit);
-            self.transfer_counters
-                .remote_check_roundtrips
-                .fetch_add(1, Ordering::Relaxed);
-            match exists {
-                Ok(false) => {
-                    breaker_permit.success();
-                    // A HEAD `false` is S3's definitive 404 answer — exactly
-                    // what the negative cache exists to remember (#564).
-                    self.negative_keys.record_miss(&knowledge);
-                    return Response::found(false);
-                }
-                Ok(true) => {
-                    breaker_permit.success();
-                    if self.negative_keys.record_present(&knowledge) {
-                        self.key_cache
-                            .insert(req.key.clone(), Some(cn.as_str()))
-                            .await;
-                    }
-                }
-                Err(e) => {
-                    let class = classify_remote_error(&e);
-                    let error = format!("remote exists check failed ({class:?}): {e:#}");
-                    breaker_permit.failure(class, &error);
-                    // Never negative-cache a soft failure: a timeout or 5xx
-                    // says nothing about whether the key exists.
-                    return Response::found(false);
-                }
-            }
-        }
 
         // Download dedup — atomically claim this key. Exactly one task per key
         // is the leader that performs the download; everyone else receives the

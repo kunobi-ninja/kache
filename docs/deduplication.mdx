@@ -31,7 +31,15 @@ Reflinks have independent inodes. A later write copies changed blocks instead of
 
 ## Monitor metrics
 
-The Store tab's title shows physical blob bytes and the share of logical size that sharing saved. `kache stats` prints the same dedup line. While Projects is still walking target directories, that tab says `scanning…`.
+The monitor's Store tab shows registered blob bytes and the share of logical
+size saved by sharing. While Projects is walking target directories, that tab
+says `scanning…`.
+
+In `kache stats`, Cache and Store show registered blob bytes; Limit is the
+registered blob budget. Dedup shows logical output bytes and the percentage
+saved. If blob inventory is unavailable, the size is labeled as logical.
+Registered bytes describe the cache's index, rather than all space allocated
+on disk or the additional blocks occupied by restored worktrees.
 
 Run `kache clean --dry-run` to see what deleting each target directory frees and which ones a clean would remove.
 

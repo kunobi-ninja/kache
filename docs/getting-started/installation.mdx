@@ -4,7 +4,7 @@ description: Install Kache from a release, package manager, crates.io, or Nix
 ---
 
 ```bash
-cargo install kache
+cargo install kache --locked
 kache init
 ```
 
@@ -15,7 +15,7 @@ kache init
 <Tabs items={["cargo install", "cargo-binstall"]}>
   <Tab value="cargo install">
     ```bash
-    cargo install kache
+    cargo install kache --locked
     ```
 
     Cargo builds Kache with your local Rust toolchain, which must be Rust 1.95 or newer.
@@ -96,7 +96,7 @@ nix profile install github:kunobi-ninja/kache/stable
 Pin a release tag when updates must be explicit:
 
 ```bash
-nix profile install github:kunobi-ninja/kache/v0.26.3
+nix profile install github:kunobi-ninja/kache/v0.28.1
 ```
 
 The flake also exports an overlay, NixOS module, and nix-darwin module. See the repository [`flake.nix`](https://github.com/kunobi-ninja/kache/blob/main/flake.nix) for their current names and options.
@@ -114,7 +114,7 @@ The package includes `cargo`, `cc`, `c++`, `gcc`, `g++`, `clang`, `clang++`, and
 }
 ```
 
-Keep the real compilers later in `PATH`. The compiler shims cover C and C++; Rust still uses `RUSTC_WRAPPER`. Point `build.rustdoc` at the `rustdoc` link to cache `cargo doc`. The Cargo shim protects targets while Cargo commands run. Nix builds the symlinks, so no `kache init --shims` step is needed. The existing `${kache}/lib/kache` path remains available.
+Keep the real compilers later in `PATH`. The compiler shims cover C and C++; Rust still uses `RUSTC_WRAPPER`. Point `build.rustdoc` at the `rustdoc` link for the [supported rustdoc mode](/docs/getting-started/rustdoc). Plain `cargo doc` passes through. The Cargo shim protects targets while Cargo commands run. Nix builds the symlinks, so no `kache init --shims` step is needed. The existing `${kache}/lib/kache` path remains available.
 
 ## Supported release targets
 
@@ -142,7 +142,7 @@ If you have not run it yet, enable Kache with `kache init`. The [quick start](/d
 ```bash
 git clone https://github.com/kunobi-ninja/kache
 cd kache
-cargo install --path .
+cargo install --path . --locked
 ```
 
 A git checkout builds with the toolchain pinned in `rust-toolchain.toml`, which rustup installs on first use.

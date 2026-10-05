@@ -1,11 +1,13 @@
 {
   "title": "Remote cache",
   "pages": [
+    "overview",
     "s3-setup",
     "gcs-setup",
     "filesystem-setup",
-    "bounding",
+    "oci-setup",
+    "ci",
     "sync",
-    "ci"
+    "bounding"
   ]
 }

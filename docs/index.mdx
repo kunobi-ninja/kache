@@ -1,29 +1,52 @@
 ---
 title: Kache
-description: A local-first compiler cache for Rust, C/C++ and CUDA builds
+description: Install Kache, verify reuse, and find the guide for your workflow
 ---
 
-Kache stores compiler outputs by content and reuses them across builds, repositories, and worktrees. The local cache works on its own. Optional remotes use S3-compatible storage, GCS, shared filesystems, or OCI registries.
+Kache reuses matching compiler outputs for Rust, C/C++, and CUDA. Keep using your
+build tools; Kache restores eligible work from a shared local store and compiles
+the rest. Optional remote storage shares that work between machines.
 
-## Get started
-
-Install Kache:
-
-```bash
-cargo install kache
-```
-
-Then enable it:
+## Start with a local build
 
 ```bash
+cargo install kache --locked
 kache init
+cargo build
 ```
 
-Keep running `cargo build` as usual; Kache now caches the compiler outputs.
+You need Rust 1.95 or newer to install through Cargo. Prebuilt packages are
+available in the [installation guide](/docs/getting-started/installation).
+`kache init` shows its setup plan before applying changes.
 
-`kache init` shows a setup plan and asks once before applying it. Replacing another Cargo wrapper requires a separate confirmation. It configures Cargo's `rustc-wrapper`, installs a login service for the background cache, and backs up files it edits. On Unix, once the compiler shims are installed, it also points `build.rustdoc` at the `rustdoc` link.
+A fresh cache needs a build to fill it. If Cargo already has up-to-date outputs,
+it skips the compiler and Kache has nothing to restore. Follow the
+[quick start](/docs/getting-started/quick-start) to verify reuse in two worktrees
+with separate target directories.
 
-[Other install methods](/docs/getting-started/installation) include Homebrew, APT, winget, and Nix. The [quick start](/docs/getting-started/quick-start) shows how to confirm cache hits. For a comparison with sccache, read [Kache or sccache?](/docs/getting-started/comparison).
+## Set up your workflow
+
+| Task | Guide |
+| --- | --- |
+| Cache Make, CMake, or build-script C/C++ | [C and C++](/docs/getting-started/c-cpp) |
+| Cache CUDA object compilations | [CUDA](/docs/getting-started/cuda) |
+| Cache Rust documentation | [Rustdoc](/docs/getting-started/rustdoc) |
+| Use Kache with cargo-mutants | [Mutation testing](/docs/getting-started/mutation-testing) |
+| Share work between machines | [Remote cache](/docs/remote-cache/overview) |
+| Configure GitHub Actions or another CI | [CI setup](/docs/remote-cache/ci) |
+| Change storage limits or build policy | [Configuration](/docs/getting-started/configuration) |
+
+## Understand a build
+
+Start with [Troubleshooting](/docs/getting-started/troubleshooting) if a build
+has unexpected misses or no hits. Use [Monitor](/docs/monitor) to inspect live
+activity and [the full report](/docs/commands/reference#the-full-report) to save
+a build's results.
+
+For the details, read [cache keys](/docs/how-it-works/cache-key),
+[build-script inputs](/docs/how-it-works/build-scripts),
+[concurrent builds](/docs/how-it-works/limits), and
+[storage deduplication](/docs/deduplication).
 
 ## Current support
 
@@ -33,45 +56,23 @@ Keep running `cargo build` as usual; Kache now caches the compiler outputs.
 | Rust executables | Enabled by default on Linux and macOS; disabled by default on Windows |
 | C and C++ object compilation | GCC, Clang, Apple Clang, and clang-cl. MSVC `cl.exe` is not cached |
 | CUDA object compilation | Single-source `nvcc -c` and `-dc` |
-| Rust documentation | Unix, for Cargo's per-crate and finalize rustdoc invocations. Not cached on Windows |
+| Rust documentation | Unix with compatible Cargo versions and [unstable rustdoc flags](/docs/getting-started/rustdoc). Rust 1.99 and Windows pass through |
 | Local cache | Content-addressed storage with automatic garbage collection |
 | Remote cache | S3-compatible storage, GCS, filesystems, and OCI registries |
 | Build visibility | Live monitor, stats, miss explanations, and reports |
 
 Kache passes unsupported compiler invocations through unchanged. A passthrough is not a cache hit or miss; inspect its reason in the monitor's Why tab or debug logs.
 
-## Tested nightly on real projects
+## Reference and measurements
 
-The [nightly benchmark workflow](https://github.com/kunobi-ninja/kache/actions/workflows/bench.yml) runs cold/warm builds of Firefox, LLVM, SurrealDB, Lance, OpenDAL, cuda-oxide, and eza on Linux. Separate workflows build Firefox on Windows every night and compare Firefox with sccache once a week. Reports, traces, and logs are retained for 30 days.
-
-Benchmark numbers count only when the individual job succeeds and its self-checking verdict is `ok`.
-
-## Go further
-
-<Cards>
-  <Card title="Install" href="/docs/getting-started/installation">
-    Packages, binaries, source builds, and platform notes.
-  </Card>
-  <Card title="Quick start" href="/docs/getting-started/quick-start">
-    Enable Kache for a project or across Cargo builds.
-  </Card>
-  <Card title="C and C++" href="/docs/getting-started/c-cpp">
-    PATH shims for Make and PKGBUILD, and what is cached.
-  </Card>
-  <Card title="Remote cache" href="/docs/remote-cache/s3-setup">
-    Configure S3-compatible storage for shared cache entries.
-  </Card>
-  <Card title="Command reference" href="/docs/commands/reference">
-    Exact commands and common flags.
-  </Card>
-  <Card title="How it works" href="/docs/how-it-works/architecture">
-    Cache keys, storage, daemon behavior, and correctness boundaries.
-  </Card>
-  <Card title="Benchmarks" href="/docs/benchmarks">
-    Nightly real-project runs, local scenarios, reports, and traces.
-  </Card>
-</Cards>
+- [Command reference](/docs/commands/reference): commands, flags, and report formats.
+- [Compatibility](/docs/compatibility): supported platforms and upgrade contracts.
+- [Architecture](/docs/how-it-works/architecture): wrapper, store, daemon, and planner.
+- [Daemon lifecycle](/docs/daemon/lifecycle): services, restarts, and environment changes.
+- [Benchmarks](/docs/benchmarks): real-project workloads, measurements, and validation.
+- [Kache or sccache?](/docs/getting-started/comparison): capabilities and tradeoffs.
 
 ## Feedback
 
-If Kache behaves differently from these docs, [open a bug report](https://github.com/kunobi-ninja/kache/issues/new?template=bug_report.md). For a missing compiler, remote backend, or workflow, [open a feature request](https://github.com/kunobi-ninja/kache/issues/new?template=feature_request.md).
+If Kache behaves differently from these docs, [open a bug report](https://github.com/kunobi-ninja/kache/issues/new?template=bug_report.md).
+For a missing compiler, remote backend, or workflow, [request a feature](https://github.com/kunobi-ninja/kache/issues/new?template=feature_request.md).

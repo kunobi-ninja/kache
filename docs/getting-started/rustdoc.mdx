@@ -1,0 +1,56 @@
+---
+title: Rust documentation
+description: Cache Cargo's per-crate documentation and shared search index on Unix
+---
+
+Kache can cache Rust documentation on Linux and macOS with Cargo versions that split rustdoc
+into per-crate and shared-index steps. This requires unstable Cargo flags.
+Plain `cargo doc` runs through the real rustdoc without caching.
+
+## Toolchain compatibility
+
+Cargo 1.99 emits `--write-doc-meta-dir` and `--read-doc-meta-dir` for these flags.
+The current Kache adapter does not support those arguments, so documentation
+passes through on Rust 1.99. The cached modes below use the older
+`--merge=none` and `--merge=finalize` interface. Check the recorded result
+before assuming a documentation build was cached.
+
+## Enable the rustdoc wrapper
+
+Run `kache init` on Unix. It installs compiler shims and sets Cargo's
+`build.rustdoc` to the `rustdoc` shim. For Nix-managed shims or manual setup,
+point `build.rustdoc` at that shim yourself; see
+[Installation](/docs/getting-started/installation#nix).
+
+Then build documentation:
+
+```bash
+RUSTC_BOOTSTRAP=1 cargo doc -Z rustdoc-depinfo -Z rustdoc-mergeable-info
+```
+
+`RUSTC_BOOTSTRAP=1` enables the unstable flags on a stable toolchain for this
+command. If you already use nightly, run:
+
+```bash
+cargo +nightly doc -Z rustdoc-depinfo -Z rustdoc-mergeable-info
+```
+
+These flags depend on your Cargo and rustdoc versions. If the toolchain rejects
+them, use ordinary `cargo doc`; documentation still builds, without caching.
+
+## Verify reuse
+
+Use the same source, toolchain, and documentation options in a second worktree
+with a fresh target directory. Inspect `kache stats --last-build` for rustdoc
+hits. Cargo skipping documentation already present in its target directory is
+not a cache hit. The [quick start](/docs/getting-started/quick-start) shows how
+to create the two worktrees.
+
+## What is cached
+
+Compatible Cargo versions run rustdoc with `--merge=none` for each crate, then `--merge=finalize`
+for the shared search index. Kache caches both as output archives. Other
+rustdoc modes pass through.
+
+Windows has no Kache compiler shim generator, so this setup does not cache
+`cargo doc` there.

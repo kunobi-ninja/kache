@@ -67,6 +67,8 @@ kache stats --full --last-build --root "$kache_trial/second"
 
 A session can include nearby or concurrent Cargo commands in one root; it is not an exact Cargo invocation ID. Only completed, retained compiler events appear. See the [command reference](/docs/commands/reference#the-full-report) for the selection rules.
 
+Kache can also [seed registry build outputs](/docs/getting-started/configuration#new-checkouts) into a new target directory. Cargo may then skip those units; they do not appear as compiler cache hits.
+
 Compiler work avoided is an aggregate estimate, not elapsed build time saved. This example demonstrates reuse; a speed comparison needs repeated measurements of the same workload. Rust hits also do not prove that C or C++ compilations were cached.
 
 If the second build misses, run `kache explain` from that worktree, or `kache explain <crate>`, using a Rust crate name from the report. It compares the latest recorded key material for that crate. When that worktree has no earlier build of the crate and both builds ran with `[cache] explain_miss` on, it compares with the first worktree's build instead. Check the reported input changes and the [cache limits](/docs/how-it-works/limits).
@@ -102,6 +104,8 @@ kache init --yes         # accept defaults without prompts
 Init shows its plan and asks once before applying it, with a separate confirmation if another Cargo wrapper is set. It backs up existing files. Open a new terminal to activate C/C++ caching and test pacing; for C/C++ you can instead run the activation command it prints. `--check` shows the planned changes without prompts or modifications.
 
 After setup, keep using ordinary Cargo commands. Give concurrent worktrees separate target directories. Tools that build in temporary copies, such as cargo-mutants, need no extra setup; see [Mutation testing](/docs/getting-started/mutation-testing).
+
+For Rust documentation, follow the [rustdoc setup](/docs/getting-started/rustdoc); it requires unstable Cargo flags.
 
 ## Executables and incremental builds
 

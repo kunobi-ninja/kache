@@ -14,18 +14,18 @@ Without `--since`, the monitor lists the last hour of builds. The figures on the
 
 <video src="https://raw.githubusercontent.com/kunobi-ninja/kache/main/assets/monitor.webm" aria-label="kache monitor following a build, then the Why, Projects, and Store tabs" autoPlay loop muted playsInline controls />
 
-The recording above is the previous layout.
-
 ## Now
 
 The monitor opens on Now.
 
 | Figure | Meaning |
 | --- | --- |
-| Store size | Registered blob bytes, with the configured cap under it |
+| Store size | Logical output bytes, with the configured store cap under it |
 | Hit % | Lookups that hit, over lookups |
 | Time saved | Compile time restored from the cache over the last 24 hours |
 | Builds | How many builds are in the list below |
+
+The Now size counts logical output bytes. The Store tab shows deduplicated blob bytes, and `kache stats` uses those registered blob bytes for its Cache and Store rows. The cap applies to registered blob bytes.
 
 Under the figures: the share of compile time that came back from the cache, and the share of lookup time that was a miss. Remote is one line. When the daemon reports `not configured` or `local-only`, that line reads `remote is off`.
 

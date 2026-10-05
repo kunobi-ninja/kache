@@ -32,7 +32,7 @@ Add `s3-endpoint` for R2, Ceph, or MinIO. Prefer workload identity or IAM roles 
 
 ## Who may write
 
-A write credential for an S3 or filesystem remote can overwrite or delete objects.
+Treat write credentials for any remote as trusted build credentials. The permissions they grant depend on the backend.
 
 On GitHub Actions and GitLab CI, Kache suppresses remote writes unless the job is a **push to a protected branch**. Pull requests, merge requests, tags, unprotected branches, `workflow_dispatch`, and scheduled runs are read-only even if the job has a write credential. `KACHE_REMOTE_READONLY=0` does not turn that off.
 
@@ -49,6 +49,10 @@ GitHub withholds secrets and OIDC tokens from fork pull-request jobs, so those r
 Pull-request jobs can still restore entries a trusted branch already published.
 
 ### A prefix for pull requests
+
+OCI pull requests stay read-only even with `pull_request_prefix`. Registry
+permissions cover the repository, so tag prefixes cannot isolate writes.
+See [OCI setup](/docs/remote-cache/oci-setup). The example below uses S3.
 
 Read-only pull requests never reuse their own work: each push recompiles what the pull request changed, even when the previous push built it. Give pull requests a prefix of their own and they can:
 

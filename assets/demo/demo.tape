@@ -8,7 +8,7 @@ Output ../demo.webm
 Set Shell "bash"
 Set FontSize 16
 Set Width 1000
-Set Height 640
+Set Height 360
 Set Theme "Catppuccin Mocha"
 Set Padding 16
 Set TypingSpeed 30ms
@@ -33,7 +33,7 @@ Type "KACHE_PROGRESS=hits cargo build --locked"
 Enter
 Wait
 Sleep 2500ms
-Type "clear && kache stats --last-build | head -12"
+Type "clear && kache stats --last-build | head -6"
 Enter
 Wait
 Sleep 6s

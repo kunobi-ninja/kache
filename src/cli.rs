@@ -1194,13 +1194,25 @@ fn cache_rows(snap: &StatsSnapshot, config: &Config) -> Vec<StatsRow> {
     let mut rows = vec![
         (
             "Cache",
-            term::bytes(snap.total_size),
-            format!("logical · {} entries", term::count(snap.entry_count as u64)),
+            term::bytes(
+                snap.blob_stats
+                    .as_ref()
+                    .map_or(snap.total_size, |stats| stats.total_blob_size),
+            ),
+            format!(
+                "{} · {} entries",
+                if snap.blob_stats.is_some() {
+                    "blob bytes"
+                } else {
+                    "logical (blob size unavailable)"
+                },
+                term::count(snap.entry_count as u64)
+            ),
         ),
         (
             "Limit",
             term::bytes(snap.max_size),
-            format!("private cache budget{note}"),
+            format!("registered blob budget{note}"),
         ),
     ];
     for store in &snap.stores {
@@ -1213,9 +1225,19 @@ fn cache_rows(snap: &StatsSnapshot, config: &Config) -> Vec<StatsRow> {
         } else if snap.stores.len() > 1 {
             rows.push((
                 "Store",
-                term::bytes(store.bytes),
+                term::bytes(
+                    store
+                        .blob_stats
+                        .as_ref()
+                        .map_or(store.bytes, |stats| stats.total_blob_size),
+                ),
                 format!(
-                    "of {} · {} entries · {}",
+                    "{} · of {} · {} entries · {}",
+                    if store.blob_stats.is_some() {
+                        "blob bytes"
+                    } else {
+                        "logical (blob size unavailable)"
+                    },
                     term::bytes(store.max_size),
                     term::count(store.entries as u64),
                     term::home_path(&store.path)
@@ -1226,7 +1248,7 @@ fn cache_rows(snap: &StatsSnapshot, config: &Config) -> Vec<StatsRow> {
     if let Some(blob_stats) = snap
         .blob_stats
         .as_ref()
-        .filter(|stats| stats.total_blobs > 0)
+        .filter(|stats| stats.total_blobs > 0 || stats.total_logical_size > 0)
     {
         let savings_pct = if blob_stats.total_logical_size > 0 {
             blob_stats.savings as f64 / blob_stats.total_logical_size as f64 * 100.0
@@ -1237,8 +1259,8 @@ fn cache_rows(snap: &StatsSnapshot, config: &Config) -> Vec<StatsRow> {
             "Dedup",
             format!("{} blobs", term::count(blob_stats.total_blobs as u64)),
             format!(
-                "{} on disk, {savings_pct:.1}% saved",
-                term::bytes(blob_stats.total_blob_size)
+                "{} logical, {savings_pct:.1}% saved",
+                term::bytes(blob_stats.total_logical_size)
             ),
         ));
     }

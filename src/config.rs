@@ -510,6 +510,11 @@ pub struct Config {
     /// default. Set via `KACHE_SEED_NEW_TARGETS=0`/`=false` or `[cache]
     /// seed_new_targets = false` to disable.
     pub seed_new_targets: bool,
+    /// Run cached build scripts with `OUT_DIR` in a shared directory named by
+    /// their inputs, so a run is shared across target directories (Unix).
+    /// Off by default. Set via `KACHE_BUILD_SCRIPT_HERMETIC=1`/`=true` or
+    /// `[cache] build_script_hermetic = true`.
+    pub build_script_hermetic: bool,
     /// Storage-layout advisories (kunobi-ninja/kache#551): when on (the
     /// default), a cache hit restored by COPY because the storage *layout*
     /// prevents zero-copy dedup — no copy-on-write on the volume, cache and
@@ -874,6 +879,8 @@ pub(crate) struct CacheFileConfig {
     pub(crate) auto_clean_unused_units_days: Option<u64>,
     /// See [`Config::seed_new_targets`].
     pub(crate) seed_new_targets: Option<bool>,
+    /// See [`Config::build_script_hermetic`].
+    pub(crate) build_script_hermetic: Option<bool>,
     /// Namespace-first GC compatibility mode. See [`Config::gc_evict_shared`].
     pub(crate) gc_evict_shared: Option<bool>,
     /// Storage-layout advisory toggle. See [`Config::storage_layout_advice`].
@@ -1293,6 +1300,7 @@ const IGNORE_ENV_GATED_VARS: &[&str] = &[
     "KACHE_SCHEDULER_MEMORY_PRESSURE",
     "KACHE_AUTO_CLEAN_UNUSED_UNITS_DAYS",
     "KACHE_SEED_NEW_TARGETS",
+    "KACHE_BUILD_SCRIPT_HERMETIC",
     "KACHE_STORAGE_LAYOUT_ADVICE",
     "KACHE_HEARTBEAT_SECS",
     "KACHE_EXPLAIN_MISS",
@@ -1410,6 +1418,7 @@ const ENV_FILE_KEYS: &[(&str, &str)] = &[
         "cache.auto_clean_unused_units_days",
     ),
     ("KACHE_SEED_NEW_TARGETS", "cache.seed_new_targets"),
+    ("KACHE_BUILD_SCRIPT_HERMETIC", "cache.build_script_hermetic"),
     ("KACHE_STORAGE_LAYOUT_ADVICE", "cache.storage_layout_advice"),
     ("KACHE_HEARTBEAT_SECS", "cache.heartbeat_secs"),
     ("KACHE_EXPLAIN_MISS", "cache.explain_miss"),
@@ -1967,6 +1976,7 @@ impl Config {
         let scheduler_memory_pressure = Self::scheduler_memory_pressure_enabled(&file_config);
         let auto_clean_unused_units_days = Self::auto_clean_unused_units_days(&file_config);
         let seed_new_targets = Self::seed_new_targets_enabled(&file_config);
+        let build_script_hermetic = Self::build_script_hermetic_enabled(&file_config);
         let gc_evict_shared = Self::gc_evict_shared_enabled(&file_config);
         let storage_layout_advice = Self::storage_layout_advice_enabled(&file_config);
         let volume_stores = Self::load_volume_stores(&file_config, explicit_max_size);
@@ -2073,6 +2083,7 @@ impl Config {
             scheduler_memory_pressure,
             auto_clean_unused_units_days,
             seed_new_targets,
+            build_script_hermetic,
             gc_evict_shared,
             storage_layout_advice,
             volume_stores,
@@ -2736,6 +2747,22 @@ impl Config {
             .and_then(|c| c.cache.as_ref())
             .and_then(|c| c.seed_new_targets)
             .unwrap_or(true)
+    }
+
+    /// Hermetic build-script runs, off by default.
+    /// `KACHE_BUILD_SCRIPT_HERMETIC=1`/`=true` turns them on and any other
+    /// value off (env wins), else `[cache] build_script_hermetic`, else off.
+    fn build_script_hermetic_enabled(file_config: &Result<FileConfig>) -> bool {
+        let ignore_env = Self::ignore_env_enabled(file_config);
+        if let Ok(v) = env_or_ignored("KACHE_BUILD_SCRIPT_HERMETIC", ignore_env) {
+            return v == "1" || v == "true";
+        }
+        file_config
+            .as_ref()
+            .ok()
+            .and_then(|c| c.cache.as_ref())
+            .and_then(|c| c.build_script_hermetic)
+            .unwrap_or(false)
     }
 
     /// Unused-unit cleanup age in days, `30` by default.

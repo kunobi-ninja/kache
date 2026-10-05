@@ -70,7 +70,8 @@ Entries stay in the local store: `kache sync` never uploads them.
 
 ## Hermetic runs
 
-Set `KACHE_BUILD_SCRIPT_HERMETIC=1` (Unix, not as root) to share runs through
+Set `KACHE_BUILD_SCRIPT_HERMETIC=1`, or `[cache] build_script_hermetic = true`
+(Unix, not as root), to share runs through
 one `OUT_DIR` path instead. The script runs with `OUT_DIR` in a directory named by its
 key, under `out-dirs/v2/` in the cache directory, so every target directory that
 shares the key sees the same path. Values the script derives from `OUT_DIR`

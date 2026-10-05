@@ -439,7 +439,7 @@ fn run_cached(real: &Path, argv: &[std::ffi::OsString]) -> Result<i32> {
 
     let prediction = run.prediction()?;
     if let Some(prediction) = &prediction
-        && hermetic::enabled()
+        && run.config.build_script_hermetic
         && let Some(code) = hermetic::run(&run, real, argv, prediction)?
     {
         return Ok(code);

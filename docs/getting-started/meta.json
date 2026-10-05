@@ -3,10 +3,12 @@
   "pages": [
     "installation",
     "quick-start",
-    "comparison",
     "c-cpp",
     "cuda",
-    "mutation-testing",
-    "configuration"
+    "rustdoc",
+    "troubleshooting",
+    "comparison",
+    "configuration",
+    "mutation-testing"
   ]
 }

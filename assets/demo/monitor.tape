@@ -30,5 +30,7 @@ Type "3"
 Sleep 3500ms
 Type "4"
 Sleep 3500ms
+Type "5"
+Sleep 3500ms
 Type "q"
 Sleep 800ms

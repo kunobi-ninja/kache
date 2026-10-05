@@ -40,6 +40,6 @@ The daemon uploads new entries in the background, dependencies included. `kache 
 
 All scheduled operations drain before the command exits. Any transfer or import failure makes the command nonzero unless `--allow-partial` is set.
 
-`cache.s3_concurrency` / `KACHE_S3_CONCURRENCY` (default 16) controls parallel operations for both S3 and filesystem remotes.
+`cache.s3_concurrency` / `KACHE_S3_CONCURRENCY` (default 16) controls parallel operations for all remote backends.
 
 Use `--dry-run` to inspect the planned crate names and truncated keys. Object sizes are not available from the listing plan.

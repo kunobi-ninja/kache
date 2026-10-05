@@ -30,7 +30,23 @@ tapes build on each other's state: run them in the order above, and re-run
 | Tape | Shows |
 | --- | --- |
 | `init.tape` | `kache init --check`, then `kache init` answering its prompts, then `kache doctor`. HOME and CARGO_HOME point into the demo root, so nothing on the recording machine changes. |
-| `demo.tape` | The crate is built cold off screen. On screen: the same commit in a second worktree with an empty target directory, every crate a hit, then `kache stats --last-build`. |
+| `demo.tape` | The crate is built cold off screen. On screen: the same commit in a second worktree with an empty target directory, the application restores from cache and Cargo can reuse seeded dependency outputs, then `kache stats --last-build`. |
 | `why-miss.tape` | One source edit, one recompile, and `kache explain` naming the key that changed. |
-| `monitor.tape` | `kache monitor` following a build in a third worktree, then the Why, Projects, and Store tabs. |
+| `monitor.tape` | `kache monitor` following a build in a third worktree, then the Build, Why, Projects, and Store tabs. |
 | `clean.tape` | `kache clean --dry-run` listing the target directories Kache tracks, what deleting each frees, and what a clean would remove. |
+
+The README cache-hit and monitor recordings were refreshed from the Kache
+1.0.0 source build on Rust 1.99.0. They demonstrate reuse and the dashboard;
+use the benchmark reports for performance measurements.
+
+## Still images
+
+The README uses PNG frames when the reader prefers reduced motion. After
+regenerating the recordings, capture a readable frame from each:
+
+```sh
+ffmpeg -ss 8 -i ../demo.webm -frames:v 1 -update 1 ../demo.png
+ffmpeg -ss 8 -i ../monitor.webm -frames:v 1 -update 1 ../monitor.png
+```
+
+Check the frames before committing; adjust the timestamp if the scene moved.

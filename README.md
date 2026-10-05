@@ -2,238 +2,139 @@
 [![Bench](https://github.com/kunobi-ninja/kache/actions/workflows/bench.yml/badge.svg)](https://github.com/kunobi-ninja/kache/actions/workflows/bench.yml)
 [![Crates.io](https://img.shields.io/crates/v/kache.svg)](https://crates.io/crates/kache)
 [![Documentation](https://img.shields.io/badge/docs-kunobi.ninja-blue)][docs-badge]
-[![Product page](https://img.shields.io/badge/product-kunobi.ninja-orange)][product-badge]
 
 # Kache
 
-Kache is a compiler cache for Rust, C/C++, and CUDA. It keys every compiler invocation by the content of its inputs, so a crate built once is restored instead of rebuilt in your next worktree, branch, or CI run. Outputs live in a local content-addressed store and can be shared through S3-compatible storage, GCS, shared filesystems, or OCI registries. Linux, macOS, and Windows are supported and release-tested.
+**Build once. Reuse the work.**
+
+Kache is a compiler cache for Rust, C/C++, and CUDA on Linux, macOS, and Windows.
+It restores matching compiler outputs across worktrees and CI runs, so you spend
+less time rebuilding and less disk space storing the same bytes.
 
 Built by [Kunobi][kunobi-brand].
 
-[Benchmarks][nav-benchmarks] · [Kache vs sccache][nav-comparison] · [CI setup][nav-ci]
+[Get started][first-reuse] · [Benchmarks][nav-benchmarks] · [Kache vs sccache][nav-comparison] · [CI setup][nav-ci]
 
-[![Diagram of four Firefox worktrees sharing cached build outputs through reflinks.](https://raw.githubusercontent.com/kunobi-ninja/kache/main/assets/store-worktrees.svg)][hero-image]
-
-[See how Kache shares build outputs across worktrees →][hero-details]
-
-## Install
+## Install and keep using Cargo
 
 ```bash
-cargo install kache
+cargo install kache --locked
 kache init
+cargo build
 ```
 
-Your Cargo commands do not change.
+`kache init` shows the changes before applying them. It configures Cargo's compiler
+wrapper and offers a background service. On Unix it also sets up C/C++ compiler
+shims. Run `kache init --check` for a preview.
 
-`kache init` sets `rustc-wrapper` in Cargo's config. On Unix it also adds the `[env]` keys for build-script C and C++. Run `kache init --check` to preview the changes, or `kache init --no-service` to skip the OS service.
+Cargo installation needs Rust 1.95 or newer. Prefer a prebuilt package?
+[Homebrew, APT, Windows packages, mise, and Nix →](https://kunobi.ninja/docs/kache/getting-started/installation)
 
-![kache init previewing its changes, applying them, and kache doctor passing every check.](https://raw.githubusercontent.com/kunobi-ninja/kache/main/assets/init.gif)
+## See it reuse a build
 
-`cargo install` needs Rust 1.95 or newer. Prebuilt packages exist for Homebrew, APT, AUR, winget, Scoop, Chocolatey, mise, and Nix. Release builds cover x86_64 and ARM on Linux, macOS, and Windows. See [Install Kache](https://kunobi.ninja/docs/kache/getting-started/installation) for each channel.
+Build the same revision in two worktrees with separate target directories.
+The second can restore compatible outputs from the first.
+[Try the walkthrough][first-reuse].
 
-## See your first cache hit
+<picture>
+  <source media="(prefers-reduced-motion: reduce)" srcset="assets/demo.png">
+  <img src="assets/demo.gif" alt="A recorded demo of a second worktree restoring cached crates, followed by its build report.">
+</picture>
 
-After `kache init`, [build the same revision in two temporary worktrees][first-reuse]. Each gets its own target directory, so your existing build outputs stay in place. The second tree's report lists the hits and a bypass reason for every unit that still compiled.
+[View the still image](assets/demo.png).
 
-![A second worktree of the same commit building from cache hits, then the build report showing 42 of 42 crates cached.](https://raw.githubusercontent.com/kunobi-ninja/kache/main/assets/demo.gif)
+A new cache needs a build to fill it. Reuse requires matching inputs, toolchain,
+and build settings. Unsupported compiler invocations run normally.
+[What can be cached →](https://kunobi.ninja/docs/kache#current-support)
 
-## How it works
+## Why use Kache?
 
-Kache has three parts: a compiler wrapper, a local store, and an optional daemon.
+- Reuse eligible Rust libraries, executables, and build scripts across worktrees.
+  It also caches GCC, Clang, clang-cl, and single-source CUDA object compilations.
+- Keep identical output bytes once in a cache with a disk budget. On filesystems
+  with copy-on-write cloning, restored outputs share disk blocks with the cache.
+- Run builds together. Compiles with the same cache key share one in-flight
+  build, while the scheduler paces compiler processes.
+- Share work through S3-compatible storage, Google Cloud Storage, a shared
+  filesystem, or an OCI registry. The local cache works on its own.
+- See what happened. Inspect hits and misses, then ask `kache explain` what changed.
 
-- The wrapper parses each `rustc`, `rustdoc`, `cc`, `c++`, or `nvcc` invocation, hashes the inputs that change the output, and normalizes the machine-local paths that do not. Two worktrees of the same revision produce the same key.
-- Wrappers that reach the same key at the same time join one flight, so the compiler runs once per key on a machine, however many Cargo processes ask for it.
-- The store keeps outputs as content-addressed blobs. Identical bytes are stored once. Restores use copy-on-write clones where the filesystem supports them, so a second worktree costs little disk.
-- The daemon serves remote lookups after a local miss and uploads new entries in the background.
+[![Four Firefox worktrees sharing cached outputs through copy-on-write clones.](https://raw.githubusercontent.com/kunobi-ninja/kache/main/assets/store-worktrees.svg)][hero-image]
 
-Hits, misses, and passthroughs are reported per unit, and `kache explain` says what changed. [Read the architecture →](https://kunobi.ninja/docs/kache/how-it-works/architecture)
+Rust executables and build-script runs are cached by default on Linux and macOS.
+See [platform support and caching limits](https://kunobi.ninja/docs/kache#current-support)
+for Windows and other workload details.
 
-## What Kache caches
+## Less disk per worktree
 
-| Workload | Status | Notes |
-| --- | --- | --- |
-| Rust libraries and build scripts | Supported | Run `kache init`. Build-script runs are cached on Linux and macOS |
-| Rust executables | Supported on Linux and macOS | Disabled by default on Windows |
-| C and C++ object files | Supported | GCC, Clang, Apple Clang, and clang-cl. Build scripts via `kache init`; other builds via shims or `CC`/`CXX` |
-| CUDA object files | Supported | Single-source `nvcc -c` and `-dc` via `CUDACXX="kache nvcc"` or a CMake launcher |
-| Rust documentation | Unix | `cargo doc` with `RUSTC_BOOTSTRAP=1` and `-Z rustdoc-depinfo -Z rustdoc-mergeable-info`. Windows has no compiler shims, so `cargo doc` is not cached there |
-| Local storage | Built in | Content-addressed store with garbage collection |
-| S3-compatible remote storage | Built in | Includes AWS S3, MinIO, and Cloudflare R2 |
-| Google Cloud Storage | Built in | Application Default Credentials, including GKE workload identity |
-| Filesystem remote storage | Built in | Useful for shared disks and CI volumes |
-| OCI registry remote storage | Built in | Stores cache objects as OCI artifacts |
+[![A measured second Firefox worktree adds about 3 GB with Kache on APFS, compared with 16.7 GB with sccache.](https://raw.githubusercontent.com/kunobi-ninja/kache/main/assets/worktree-cost.svg)][storage-chart]
 
-[![Bytes a second Firefox worktree adds to disk on APFS: about 3 GB for Kache, which reflinks the other 13.5 GB, against 16.7 GB for sccache, which writes an independent copy.](https://raw.githubusercontent.com/kunobi-ninja/kache/main/assets/worktree-cost.svg)][storage-chart]
+In a Firefox 151 benchmark with Kache 0.7.0 on macOS/APFS, the second worktree
+added about 3 GB of new data. [Read the measurements and methodology →][storage-report]
 
-In a Firefox 151 benchmark with Kache 0.7.0 on macOS/APFS, the second worktree added about 3 GB of new data. [Read the measurements and methodology →][storage-report]
+Nightly workflows measure cold and warm builds of real projects, including
+Firefox, LLVM, and SurrealDB. [Browse the benchmark reports][benchmark-guide]
+to see the workload, platform, and validation behind each result.
 
-For a comparison with sccache, read [Kache or sccache?](https://kunobi.ninja/docs/kache/getting-started/comparison).
+## Watch a build and explain a miss
 
-## Tested nightly on real projects
+```bash
+kache monitor             # live build and cache activity
+kache stats --last-build  # latest recorded build session
+kache explain             # why the latest build missed
+kache doctor              # check your setup
+```
 
-The scheduled [benchmark workflow](https://github.com/kunobi-ninja/kache/actions/workflows/bench.yml) runs real cold and warm builds of Firefox, LLVM, SurrealDB, Lance, OpenDAL, cuda-oxide, and eza on Linux. Separate workflows build Firefox on Windows every night and compare Firefox with sccache once a week. It also measures how much of a Firefox build survives a source update.
+<picture>
+  <source media="(prefers-reduced-motion: reduce)" srcset="assets/monitor.png">
+  <img src="assets/monitor.gif" alt="Kache's monitor showing builds, miss explanations, projects, and stored outputs.">
+</picture>
 
-Each run checks its own measurement validity and uploads reports, traces, and logs for 30 days. Treat timing or hit-rate numbers as evidence only when the individual job succeeds and its benchmark verdict is `ok`.
+[View the still image](assets/monitor.png).
 
-[See the benchmark setup and report guide →][benchmark-guide]
+[See the current dashboard and controls →](https://kunobi.ninja/docs/kache/monitor)
 
-## CI
+## Add it to CI
 
-The official action installs Kache and wires it into the build:
+Install your Rust toolchain, then add the official action before your build:
 
 ```yaml
 - uses: kunobi-ninja/kache-action@v1
-
 - run: cargo build --locked
 ```
 
-See the [CI guide](https://kunobi.ninja/docs/kache/remote-cache/ci) for GitHub Actions and shell-based CI examples.
+The action can persist the local store through GitHub's cache service.
+For remote storage, credentials, and pull-request policy, follow the [CI guide][nav-ci].
 
-## C and C++
+## Find your next step
 
-On Unix, `kache init` creates compiler-name shims and offers to add their directory to `PATH` in your zsh, bash, or fish startup file. Make, CMake, autotools, and Arch PKGBUILDs that call `gcc` by name then go through Kache, with no `CC=` edit or shell wrapper.
+| I want to… | Guide |
+| --- | --- |
+| Confirm my first cache hits | [Quick start][first-reuse] |
+| Cache Make, CMake, or CUDA builds | [C/C++](https://kunobi.ninja/docs/kache/getting-started/c-cpp) · [CUDA](https://kunobi.ninja/docs/kache/getting-started/cuda) |
+| Share a cache between machines | [Remote cache](https://kunobi.ninja/docs/kache/remote-cache/overview) |
+| Change storage limits or build policy | [Configuration](https://kunobi.ninja/docs/kache/getting-started/configuration) |
+| Investigate unexpected misses | [Troubleshooting](https://kunobi.ninja/docs/kache/getting-started/troubleshooting) |
+| Understand cache keys and correctness | [How it works](https://kunobi.ninja/docs/kache/how-it-works/architecture) |
+| Look up a command or flag | [Command reference](https://kunobi.ninja/docs/kache/commands/reference) |
 
-For managed dotfiles or another shell, set it up by hand:
+## Help improve Kache
 
-```bash
-kache init --shims
-export PATH="$HOME/.local/lib/kache/shims:$PATH"
-```
+[Report a bug](https://github.com/kunobi-ninja/kache/issues/new?template=bug_report.md),
+[request a feature](https://github.com/kunobi-ninja/kache/issues/new?template=feature_request.md),
+or read [CONTRIBUTING.md](.github/CONTRIBUTING.md) to contribute.
 
-APT and AUR packages install `/usr/lib/kache`. Nix packages include the same symlinks in `${kache}/shims` and `${kache}/lib/kache`; see the [Nix configuration example](https://kunobi.ninja/docs/kache/getting-started/installation#nix).
+For Kubernetes and GitOps, [Kunobi Desktop][kunobi-desktop] lets you inspect
+clusters and manage Flux and Argo CD.
 
-For `makepkg`, put the same assignment in `~/.makepkg.conf`. `kache init` also links versioned compilers on `PATH`, such as `clang-19`. Wrap target-prefixed names with `kache init --shims --from-path`.
-
-Kache inspects the real compiler invocation. Unsupported or unsafe invocations pass through. See [C and C++](https://kunobi.ninja/docs/kache/getting-started/c-cpp).
-
-## Storage and remotes
-
-The default local cache is:
-
-- Linux: `$XDG_CACHE_HOME/kache` or `~/.cache/kache`
-- macOS: `~/Library/Caches/kache`
-- Windows: `%LOCALAPPDATA%\kache`
-
-Open the configuration editor with `kache config`, or edit the TOML file directly. A minimal S3-compatible remote looks like this:
-
-```toml
-[cache.remote]
-type = "s3"
-bucket = "my-build-cache"
-region = "us-east-1"
-```
-
-Credentials come from the standard AWS environment variables or credential chain. See [S3 setup](https://kunobi.ninja/docs/kache/remote-cache/s3-setup) and [filesystem setup](https://kunobi.ninja/docs/kache/remote-cache/filesystem-setup).
-
-To use an OCI registry, configure a repository without a tag or digest:
-
-```toml
-[cache.remote]
-type = "oci"
-repository = "ghcr.io/my-org/kache-cache"
-prefix = "artifacts"
-```
-
-Authenticate with `docker login` or `oras login`. Kache reads
-`$DOCKER_CONFIG/config.json` (default: `~/.docker/config.json`), including Docker
-credential helpers. Helpers and the config file are read again when registry
-auth expires. Without configured credentials, it connects anonymously.
-
-For CI, set `KACHE_OCI_USERNAME` and `KACHE_OCI_PASSWORD`, or set
-`KACHE_OCI_TOKEN` alone. Environment credentials take precedence over Docker
-config. Daemons inherit credentials at startup; restart after changing their
-environment. Set credentials in the installed service's environment when it
-runs independently of your shell. Keep secrets out of `config.toml`.
-
-OCI pull request jobs remain read-only even with `pull_request_prefix`: registry
-permissions apply to repositories, so separate tag prefixes cannot isolate
-writes.
-
-For a local HTTP registry, set `insecure = true`; HTTPS is the default.
-
-Each cache object is an OCI artifact with one layer. Tags use
-the `kache-v2-` prefix and encode ordinary cache keys, including compressed hex
-digests. Listing recovers those keys from tag pages. Keys too long for an OCI
-tag use a hash instead; listing reads their manifests to recover the
-`ninja.kunobi.kache.key` annotation. Existing `kache-v1-` artifacts remain
-readable and appear once in listings when both tag versions exist.
-
-JSON objects up to 16 KiB embed their bytes in the layer descriptor, so a warm
-read needs one manifest request. Larger objects need a manifest and a blob
-request. Registry auth is cached and refreshed on rejection. Uploads reuse
-existing blobs and use a monolithic transfer for new blobs.
-
-Keep cache artifacts in a dedicated repository and configure its retention
-policy to retain the cache tags.
-
-OCI does not guarantee conditional tag writes. Kache uses its ordinary-write
-fallback, so concurrent publishers can overwrite merged build metadata.
-Use a single publisher when that metadata must retain every update.
-
-## Useful commands
-
-```bash
-kache monitor                 # live build and cache activity
-kache stats                   # hit rate, time saved, cache size
-kache stats --last-build      # hits, misses, and bypass reasons of the latest build
-kache stats --full --redact   # full report without cache keys and paths, for sharing
-kache explain                 # why the latest build missed, costliest cause first
-kache doctor                  # setup and integrity checks
-kache explain <crate>         # what changed in one crate's key
-kache list                    # inspect cached entries
-kache clean --dry-run         # target dirs, what each frees, what a clean removes
-kache clean --orphans --yes   # remove the targets of deleted worktrees
-kache clean --cache           # empty the cache (the daemon keeps it under its limit)
-kache sync                    # pull from and push to the configured remote
-kache daemon status           # inspect the background service
-```
-
-![kache monitor following a build, then the Why, Projects, and Store tabs.](https://raw.githubusercontent.com/kunobi-ninja/kache/main/assets/monitor.gif)
-
-Run `kache help <command>` for exact flags. The [command reference](https://kunobi.ninja/docs/kache/commands/reference) covers every top-level command.
-
-To pass one build through without changing the setup, run it with `KACHE_DISABLED=1`.
-
-## Documentation
-
-- [Product page](https://kunobi.ninja/product/kache)
-- [Install Kache](https://kunobi.ninja/docs/kache/getting-started/installation)
-- [Quick start](https://kunobi.ninja/docs/kache/getting-started/quick-start)
-- [C and C++](https://kunobi.ninja/docs/kache/getting-started/c-cpp)
-- [Configuration](https://kunobi.ninja/docs/kache/getting-started/configuration)
-- [How cache keys work](https://kunobi.ninja/docs/kache/how-it-works/cache-key)
-- [Daemon lifecycle](https://kunobi.ninja/docs/kache/daemon/lifecycle)
-- [Benchmarks](https://kunobi.ninja/docs/kache/benchmarks)
-
-## Also from Kunobi
-
-For Kubernetes and GitOps, [Kunobi Desktop][kunobi-desktop] lets you inspect clusters and manage Flux and Argo CD.
-
-## Questions and gaps
-
-- [Open a bug report](https://github.com/kunobi-ninja/kache/issues/new?template=bug_report.md) when Kache behaves differently from the documentation.
-- [Request a feature](https://github.com/kunobi-ninja/kache/issues/new?template=feature_request.md) for a missing compiler, remote backend, or build workflow.
-
-## Development
-
-```bash
-git clone https://github.com/kunobi-ninja/kache.git
-cd kache
-cargo test --workspace --all-features
-```
-
-See [CONTRIBUTING.md](.github/CONTRIBUTING.md) before opening a pull request.
-
-Kache is licensed under the [Apache License 2.0](LICENSE).
+Licensed under [Apache 2.0](LICENSE).
 
 [docs-badge]: https://kunobi.ninja/docs/kache?utm_source=github&utm_medium=readme&utm_campaign=kache&utm_content=docs_badge
-[product-badge]: https://kunobi.ninja/product/kache?utm_source=github&utm_medium=readme&utm_campaign=kache&utm_content=product_badge
 [kunobi-brand]: https://kunobi.ninja/?utm_source=github&utm_medium=readme&utm_campaign=kache&utm_content=brand
 [nav-benchmarks]: https://kunobi.ninja/docs/kache/benchmarks?utm_source=github&utm_medium=readme&utm_campaign=kache&utm_content=nav_benchmarks
 [nav-comparison]: https://kunobi.ninja/docs/kache/getting-started/comparison?utm_source=github&utm_medium=readme&utm_campaign=kache&utm_content=nav_comparison
 [nav-ci]: https://kunobi.ninja/docs/kache/remote-cache/ci?utm_source=github&utm_medium=readme&utm_campaign=kache&utm_content=nav_ci
 [hero-image]: https://kunobi.ninja/product/kache?utm_source=github&utm_medium=readme&utm_campaign=kache&utm_content=hero_image
-[hero-details]: https://kunobi.ninja/product/kache?utm_source=github&utm_medium=readme&utm_campaign=kache&utm_content=hero_details
 [storage-chart]: https://kunobi.ninja/blog/kache-storage-worktrees?utm_source=github&utm_medium=readme&utm_campaign=kache&utm_content=storage_chart
 [storage-report]: https://kunobi.ninja/blog/kache-storage-worktrees?utm_source=github&utm_medium=readme&utm_campaign=kache&utm_content=storage_report
 [benchmark-guide]: https://kunobi.ninja/docs/kache/benchmarks?utm_source=github&utm_medium=readme&utm_campaign=kache&utm_content=benchmark_guide

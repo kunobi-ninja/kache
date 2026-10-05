@@ -1,0 +1,52 @@
+---
+title: Remote cache
+description: Choose a backend and share compiler outputs between machines
+---
+
+A remote lets one machine reuse compatible outputs another has published.
+Kache checks the local store first. After a local miss, the daemon can download
+an exact matching entry; it uploads new entries in the background.
+
+You do not need a remote for local builds or reuse between worktrees on one machine.
+
+## Choose a backend
+
+| You already have… | Use | Setup |
+| --- | --- | --- |
+| An S3-compatible bucket, including AWS S3, R2, or MinIO | `s3` | [S3 setup](/docs/remote-cache/s3-setup) |
+| A Google Cloud Storage bucket | `gcs` | [GCS setup](/docs/remote-cache/gcs-setup) |
+| A directory mounted on each machine | `filesystem` | [Filesystem setup](/docs/remote-cache/filesystem-setup) |
+| An OCI registry such as GHCR | `oci` | [OCI setup](/docs/remote-cache/oci-setup) |
+
+Follow the selected guide to configure `[cache.remote]` and credentials, then run:
+
+```bash
+kache doctor
+cargo build --locked
+kache daemon stop
+```
+
+`doctor` checks the remote configuration and access. The build uses the daemon
+for remote lookups and background uploads. `daemon stop` drains queued uploads
+before exit, which matters on an ephemeral runner.
+
+## Control who publishes
+
+Use [CI setup](/docs/remote-cache/ci) for write policy and credential examples.
+On GitHub Actions and GitLab CI, remote writes normally require a push to a
+protected branch. An optional pull-request prefix permits isolated writes on
+supported backends. OCI pull requests remain read-only because registry tag
+prefixes cannot isolate write permissions.
+
+A remote contains compiler outputs. Only give write access to jobs and people
+you trust to produce those outputs.
+
+## Manage an existing remote
+
+- [Sync](/docs/remote-cache/sync) explains explicit pulls and pushes without the daemon.
+- [Bounding storage](/docs/remote-cache/bounding) covers retention outside the local store.
+- [Configuration](/docs/getting-started/configuration#remote-settings) lists settings and defaults.
+- [Daemon lifecycle](/docs/daemon/lifecycle) explains services, credentials, and config changes.
+
+The optional [planner service](/docs/remote-service) ranks entries for prefetch.
+Start with a storage backend; exact-key lookups work without that service.

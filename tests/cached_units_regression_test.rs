@@ -1335,6 +1335,69 @@ fn build_scripts_run_with_zero_ar_date_on_macos() {
     }
 }
 
+/// A build script that declares `rerun-if-env-changed=OUT_DIR`, as ring 0.17
+/// does, still shares one hermetic run across target directories: the run sees
+/// the sandbox's `OUT_DIR`, never Cargo's.
+#[test]
+fn a_declared_out_dir_does_not_split_a_hermetic_run() {
+    let fx = fixture_from(|root| {
+        let write = |relative: &str, content: &str| {
+            let path = root.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, content).unwrap();
+        };
+        write(
+            "Cargo.toml",
+            "[package]\nname = \"declares\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        );
+        write(
+            "build.rs",
+            r#"fn main() {
+    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-env-changed=OUT_DIR");
+    let out = std::env::var("OUT_DIR").unwrap();
+    std::fs::write(std::path::Path::new(&out).join("value.rs"), "const VALUE: u8 = 7;\n").unwrap();
+}
+"#,
+        );
+        write(
+            "src/main.rs",
+            r#"include!(concat!(env!("OUT_DIR"), "/value.rs"));
+fn main() {
+    println!("{VALUE}");
+}
+"#,
+        );
+    });
+    let hermetic = [("KACHE_BUILD_SCRIPT_HERMETIC", "1")];
+    for (name, expected) in [
+        ("first", "miss"),
+        ("second", "miss"),
+        ("third-with-a-longer-name", "local_hit"),
+    ] {
+        let target = target(&fx, name);
+        let mark = event_count(&fx.cache);
+        let output = run(&mut cargo(
+            "run",
+            &fx.workspace,
+            &fx.home,
+            &fx.cache,
+            &target,
+            &hermetic,
+        ));
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "7",
+            "{name}"
+        );
+        assert_eq!(
+            results_for(&events_since(&fx.cache, mark), "build_script_run"),
+            vec![expected],
+            "{name}: the first run records the declarations, the second seals, the third links"
+        );
+    }
+}
+
 /// A build script that derives values from its `OUT_DIR` path (its length, a
 /// sum of its bytes) leaves no path in its outputs, so only a hermetic run can
 /// share it: the script sees the same `OUT_DIR` in every target directory,

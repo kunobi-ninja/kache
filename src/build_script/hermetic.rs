@@ -320,6 +320,26 @@ fn restore(run: &Run, sandbox: &Sandbox, record: &Record, key: &str, key_ms: u64
     Ok(())
 }
 
+/// Folds the variables the script declared with `rerun-if-env-changed`.
+/// `OUT_DIR` is folded by name only: the run sees the sandbox's, which this
+/// key names, not the per-target one Cargo set.
+fn fold_declared_env(
+    hasher: &mut blake3::Hasher,
+    names: &[String],
+    value_of: impl Fn(&str) -> Option<std::ffi::OsString>,
+) {
+    for name in names {
+        fold(hasher, "env_name", name.as_bytes());
+        if name == "OUT_DIR" {
+            continue;
+        }
+        match value_of(name) {
+            Some(value) => fold(hasher, "env_value", value.as_encoded_bytes()),
+            None => fold(hasher, "env_absent", b""),
+        }
+    }
+}
+
 /// The run's key: the regular action key's inputs, as the script sees them.
 /// Nothing is normalized: a root the script can see is in the key, except
 /// `OUT_DIR`, which a hermetic run replaces with the same path for every key.
@@ -359,13 +379,7 @@ pub(super) fn key(run: &Run, prediction: &Prediction, below_target: &Path) -> Re
             fold(&mut hasher, "cargo_env_path_state", state.as_bytes());
         }
     }
-    for name in &prediction.env {
-        fold(&mut hasher, "env_name", name.as_bytes());
-        match std::env::var_os(name) {
-            Some(value) => fold(&mut hasher, "env_value", value.as_encoded_bytes()),
-            None => fold(&mut hasher, "env_absent", b""),
-        }
-    }
+    fold_declared_env(&mut hasher, &prediction.env, |name| std::env::var_os(name));
     for declared in &prediction.inputs {
         let path = PathBuf::from(run.environment.denormalize_str(declared));
         fold(&mut hasher, "input", path.as_os_str().as_encoded_bytes());
@@ -786,6 +800,36 @@ pub(crate) mod test_support {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    /// A declared `OUT_DIR` keys by its name, never by the per-target value
+    /// Cargo set; any other declared value still keys.
+    #[test]
+    fn a_declared_out_dir_keys_by_name_only() {
+        let digest = |names: &[&str], out_dir: &str, other: &str| {
+            let names: Vec<String> = names.iter().map(|name| name.to_string()).collect();
+            let mut hasher = blake3::Hasher::new();
+            fold_declared_env(&mut hasher, &names, |name| match name {
+                "OUT_DIR" => Some(out_dir.into()),
+                "OTHER" => Some(other.into()),
+                _ => None,
+            });
+            hasher.finalize()
+        };
+        let both = ["OUT_DIR", "OTHER"];
+        assert_eq!(
+            digest(&both, "/a/target/debug/build/x-1/out", "v"),
+            digest(&both, "/b/target/debug/build/x-1/out", "v")
+        );
+        assert_ne!(digest(&both, "/a/out", "v"), digest(&both, "/a/out", "w"));
+        assert_ne!(
+            digest(&both, "/a/out", "v"),
+            digest(&["OTHER"], "/a/out", "v")
+        );
+        assert_ne!(
+            digest(&["UNSET"], "/a/out", "v"),
+            digest(&[], "/a/out", "v")
+        );
+    }
 
     /// Seeding links a new target's `OUT_DIR` to the run the donor's links
     /// to only where a hermetic run of that unit would link it, only in this

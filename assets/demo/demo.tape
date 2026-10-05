@@ -2,8 +2,8 @@
 # commit is built in a second worktree with an empty target directory.
 # See prepare.sh for the workspace; KACHE_DEMO_ROOT selects where it lives.
 
-Output ../demo.gif
-Output ../demo.webm
+Output ../demo-36381adc.gif
+Output ../demo-36381adc.webm
 
 Set Shell "bash"
 Set FontSize 16

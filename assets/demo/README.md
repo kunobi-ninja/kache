@@ -45,8 +45,14 @@ The README uses PNG frames when the reader prefers reduced motion. After
 regenerating the recordings, capture a readable frame from each:
 
 ```sh
-ffmpeg -ss 8 -i ../demo.webm -frames:v 1 -update 1 ../demo.png
-ffmpeg -ss 8 -i ../monitor.webm -frames:v 1 -update 1 ../monitor.png
+ffmpeg -ss 8 -i ../demo-36381adc.webm -frames:v 1 -update 1 ../demo-36381adc.png
+ffmpeg -ss 8 -i ../monitor-9dd7cee8.webm -frames:v 1 -update 1 ../monitor-9dd7cee8.png
 ```
 
 Check the frames before committing; adjust the timestamp if the scene moved.
+
+When replacing a recording, give its GIF, WebM, and PNG files a new content
+suffix and update the tapes and links. GitHub can keep serving an older image
+when its URL stays the same.
+
+Keep the original asset names while published docs still link to them.

@@ -1,8 +1,8 @@
 # kache monitor while a build runs in a third worktree.
 # Runs after demo.tape.
 
-Output ../monitor.gif
-Output ../monitor.webm
+Output ../monitor-9dd7cee8.gif
+Output ../monitor-9dd7cee8.webm
 
 Set Shell "bash"
 Set FontSize 16

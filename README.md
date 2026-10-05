@@ -15,17 +15,19 @@ Built by [Kunobi][kunobi-brand].
 
 [Get started][first-reuse] · [Benchmarks][nav-benchmarks] · [Kache vs sccache][nav-comparison] · [CI setup][nav-ci]
 
-## Install and keep using Cargo
+## Install
 
 ```bash
 cargo install kache --locked
 kache init
-cargo build
 ```
 
 `kache init` shows the changes before applying them. It configures Cargo's compiler
 wrapper and offers a background service. On Unix it also sets up C/C++ compiler
 shims. Run `kache init --check` for a preview.
+
+Then use Cargo as usual in your project. Kache caches eligible compiler work
+automatically.
 
 Cargo installation needs Rust 1.95 or newer. Prefer a prebuilt package?
 [Homebrew, APT, Windows packages, mise, and Nix →](https://kunobi.ninja/docs/kache/getting-started/installation)
@@ -37,11 +39,11 @@ The second can restore compatible outputs from the first.
 [Try the walkthrough][first-reuse].
 
 <picture>
-  <source media="(prefers-reduced-motion: reduce)" srcset="assets/demo.png">
-  <img src="assets/demo.gif" alt="A recorded demo of a second worktree restoring cached crates, followed by its build report.">
+  <source media="(prefers-reduced-motion: reduce)" srcset="assets/demo-36381adc.png">
+  <img src="assets/demo-36381adc.gif" alt="A recorded demo of a second worktree restoring cached crates, followed by its build report.">
 </picture>
 
-[View the still image](assets/demo.png).
+[View the still image](assets/demo-36381adc.png).
 
 A new cache needs a build to fill it. Reuse requires matching inputs, toolchain,
 and build settings. Unsupported compiler invocations run normally.
@@ -86,11 +88,11 @@ kache doctor              # check your setup
 ```
 
 <picture>
-  <source media="(prefers-reduced-motion: reduce)" srcset="assets/monitor.png">
-  <img src="assets/monitor.gif" alt="Kache's monitor showing builds, miss explanations, projects, and stored outputs.">
+  <source media="(prefers-reduced-motion: reduce)" srcset="assets/monitor-9dd7cee8.png">
+  <img src="assets/monitor-9dd7cee8.gif" alt="Kache's monitor showing builds, miss explanations, projects, and stored outputs.">
 </picture>
 
-[View the still image](assets/monitor.png).
+[View the still image](assets/monitor-9dd7cee8.png).
 
 [See the current dashboard and controls →](https://kunobi.ninja/docs/kache/monitor)
 

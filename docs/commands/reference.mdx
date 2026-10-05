@@ -324,6 +324,8 @@ The payload also carries this host's shared cache: registered blob bytes (`kache
 
 ## `kache explain`
 
+With `[cache] explain_miss = true`, `kache explain <crate>` names compiler-reported environment variables that differ from the prior build of that unit. It compares normalized value hashes, so the log keeps variable names without their values. Older events without these hashes cannot supply the hints. The same hints appear in the JSON report.
+
 ```bash
 kache explain
 kache explain --root "$PWD"

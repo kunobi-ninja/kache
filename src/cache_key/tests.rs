@@ -14064,3 +14064,43 @@ mod properties {
         }
     }
 }
+
+#[test]
+fn environment_detail_hashes_follow_the_normalized_key_inputs() {
+    let _lock = key_test_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("lib.rs");
+    std::fs::write(&source, "pub fn f() {}").unwrap();
+    let args = RustcArgs::parse(&[
+        "rustc".into(),
+        "--crate-name".into(),
+        "example".into(),
+        source.to_str().unwrap().into(),
+    ])
+    .unwrap();
+    let hashed = |pairs: Vec<(String, String)>| {
+        provide_dep_info(
+            DepInfo {
+                source_files: vec![source.clone()],
+                env_deps: pairs,
+            },
+            None,
+        );
+        let (key, outputs) = compute_cache_key_with_outputs(
+            &args,
+            &FileHasher::new(),
+            &PathNormalizer::empty(),
+            &KeyEnv::default(),
+        );
+        key.unwrap();
+        outputs.env_deps.unwrap()
+    };
+    let first = hashed(vec![("BUILD_MODE".into(), "private-first-value".into())]);
+    let second = hashed(vec![("BUILD_MODE".into(), "private-second-value".into())]);
+    assert_eq!(
+        first["BUILD_MODE"],
+        blake3::hash(b"private-first-value").to_hex()[..16]
+    );
+    assert_ne!(first["BUILD_MODE"], second["BUILD_MODE"]);
+    assert!(hashed(Vec::new()).is_empty());
+}

@@ -92,6 +92,8 @@ pub struct BuildEvent {
     /// 20 = per-key first-demand timestamps and remote-check wait.
     /// 21 = daemon publication and its background store time.
     /// 22 = typed miss reason and the C/C++ object output.
+    /// 23 = per-phase restore/store copy fallback counters.
+    /// 24 = per-variable hashes of compiler-reported environment inputs.
     #[serde(default)]
     pub schema: u32,
     /// Build session this event belongs to (kunobi-ninja/kache#583 P0.5).
@@ -303,6 +305,10 @@ pub struct BuildEvent {
     /// passthroughs.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub key_fields: std::collections::BTreeMap<String, String>,
+    /// Normalized environment-input hashes under `explain_miss`. `None`
+    /// means unrecorded; an empty map means no compiler-reported variables.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_env_deps: Option<std::collections::BTreeMap<String, String>>,
     /// On a miss with `[cache] explain_miss` on: the key groups whose digests
     /// changed vs this crate's last hit in the same build tree.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1705,6 +1711,7 @@ impl BuildEvent {
             key_fields: Default::default(),
             key_diff: Vec::new(),
             key_externs: Default::default(),
+            key_env_deps: None,
             key_externs_recorded: false,
             unit_id: String::new(),
             extern_units: Default::default(),
@@ -1868,6 +1875,7 @@ mod tests {
             key_fields: Default::default(),
             key_diff: Vec::new(),
             key_externs: Default::default(),
+            key_env_deps: None,
             key_externs_recorded: false,
             unit_id: String::new(),
             extern_units: Default::default(),

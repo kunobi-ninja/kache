@@ -23,6 +23,7 @@ pub(super) struct MissDiagnosis {
     /// Set when the miss was compared with another checkout of the project,
     /// because its own build tree had no earlier build of the crate.
     pub checkout: Option<CheckoutComparison>,
+    pub hints: Vec<String>,
 }
 
 impl MissDiagnosis {
@@ -61,8 +62,19 @@ impl MissDiagnosis {
             dependency_chain,
             dependency_recording_missing,
             checkout: None,
+            hints: Vec::new(),
         }
     }
+}
+
+/// Suggestions from observed input differences, without exposing values or
+/// recommending path normalization for variables that affect compiled output.
+pub(super) fn env_hints(names: &[String]) -> Vec<String> {
+    names.iter().map(|name| match name.as_str() {
+        "CARGO_MANIFEST_DIR" => "CARGO_MANIFEST_DIR differs: this crate embeds its checkout path; Kache keeps those builds separate".to_string(),
+        "OUT_DIR" => "OUT_DIR differs: this crate reads its build-script output path; compare the generated files and their paths before changing cache-key settings".to_string(),
+        _ => format!("{name} differs: use the same value in both builds if they should produce the same output"),
+    }).collect()
 }
 
 #[cfg(test)]
@@ -76,6 +88,24 @@ mod tests {
             "cache_key": "same-key", "schema": 14
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn hints_name_observed_variables_without_suggesting_unsafe_normalization() {
+        let hints = env_hints(&[
+            "CARGO_MANIFEST_DIR".into(),
+            "OUT_DIR".into(),
+            "BUILD_MODE".into(),
+        ]);
+        assert_eq!(
+            hints,
+            [
+                "CARGO_MANIFEST_DIR differs: this crate embeds its checkout path; Kache keeps those builds separate",
+                "OUT_DIR differs: this crate reads its build-script output path; compare the generated files and their paths before changing cache-key settings",
+                "BUILD_MODE differs: use the same value in both builds if they should produce the same output",
+            ]
+        );
+        assert!(env_hints(&[]).is_empty());
     }
 
     #[test]

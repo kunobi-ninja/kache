@@ -288,6 +288,27 @@ pub fn compare_checkout(events: &[BuildEvent], miss_index: usize) -> Option<Chec
     })
 }
 
+/// Variable names whose normalized values differ from the same baseline used
+/// by the dependency diagnosis. Older events cannot establish such a diff.
+pub(crate) fn changed_env_inputs(events: &[BuildEvent], miss_index: usize) -> Vec<String> {
+    let Some(compiled) = events.get(miss_index) else {
+        return Vec::new();
+    };
+    let Some((baseline_index, _)) = top_baseline(events, miss_index) else {
+        return Vec::new();
+    };
+    let baseline = &events[baseline_index];
+    let (Some(current), Some(previous)) = (&compiled.key_env_deps, &baseline.key_env_deps) else {
+        return Vec::new();
+    };
+    let names: std::collections::BTreeSet<_> = current.keys().chain(previous.keys()).collect();
+    names
+        .into_iter()
+        .filter(|name| current.get(*name) != previous.get(*name))
+        .cloned()
+        .collect()
+}
+
 /// Baseline of the compile a walk starts from, and whether it is in another
 /// checkout.
 ///
@@ -897,6 +918,50 @@ mod tests {
             .collect();
         e.key_externs_recorded = true;
         e
+    }
+
+    #[test]
+    fn environment_diffs_use_the_units_authoritative_baseline() {
+        let values = |pairs: &[(&str, &str)]| {
+            Some(
+                pairs
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+            )
+        };
+        let mut donor = event("app", EventResult::LocalHit, 1, &[]);
+        donor.cache_key = "one".into();
+        donor.unit_id = "unit".into();
+        donor.key_env_deps = values(&[("SAME", "s"), ("CHANGED", "old"), ("REMOVED", "r")]);
+        let mut current = donor.clone();
+        current.ts = ts(3);
+        current.root = "/other".into();
+        current.cache_key = "two".into();
+        current.key_env_deps = values(&[("SAME", "s"), ("CHANGED", "new"), ("ADDED", "a")]);
+        assert_eq!(
+            changed_env_inputs(&[donor.clone(), current.clone()], 1),
+            ["ADDED", "CHANGED", "REMOVED"]
+        );
+        let mut same_tree = current.clone();
+        same_tree.ts = ts(2);
+        same_tree.result = EventResult::LocalHit;
+        let events = [donor.clone(), same_tree, current.clone()];
+        assert!(
+            changed_env_inputs(&events, 2).is_empty(),
+            "prefer same tree over the other checkout"
+        );
+        assert!(changed_env_inputs(&events, 99).is_empty());
+        assert!(changed_env_inputs(&events, 0).is_empty());
+        donor.key_env_deps = None;
+        assert!(changed_env_inputs(&[donor.clone(), current.clone()], 1).is_empty());
+        donor.key_env_deps = values(&[]);
+        assert_eq!(
+            changed_env_inputs(&[donor.clone(), current.clone()], 1),
+            ["ADDED", "CHANGED", "SAME"]
+        );
+        current.key_env_deps = None;
+        assert!(changed_env_inputs(&[donor, current], 1).is_empty());
     }
 
     /// An event from a build where the digests were not recorded at all —

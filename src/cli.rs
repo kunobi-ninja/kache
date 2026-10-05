@@ -1985,6 +1985,10 @@ pub fn why_miss(config: &Config, crate_name: &str, json: bool) -> Result<()> {
     );
     diagnosis.checkout =
         miss_index.and_then(|index| crate::miss_chain::compare_checkout(&all_events, index));
+    if let Some(index) = miss_index {
+        diagnosis.hints =
+            miss_diagnosis::env_hints(&crate::miss_chain::changed_env_inputs(&all_events, index));
+    }
     if json {
         return why_miss_json(crate_name, miss, &stored, &inventory.stores, &diagnosis);
     }
@@ -2099,6 +2103,9 @@ pub fn why_miss(config: &Config, crate_name: &str, json: bool) -> Result<()> {
     // Render the dependency analysis shared with JSON output.
     print_checkout_comparison(&diagnosis);
     print_extern_chain(&diagnosis);
+    for hint in &diagnosis.hints {
+        println!("  hint: {hint}");
+    }
 
     // ── Recent event history ──────────────────────────────────────────
     println!("\n  Recent events:");
@@ -2389,6 +2396,7 @@ fn why_miss_json(
         dependency_chain: &'a Option<crate::miss_chain::Chain>,
         dependency_recording_missing: bool,
         checkout_comparison: &'a Option<crate::miss_chain::CheckoutComparison>,
+        hints: &'a [String],
     }
 
     crate::machine::emit(
@@ -2410,6 +2418,7 @@ fn why_miss_json(
             dependency_chain: &diagnosis.dependency_chain,
             dependency_recording_missing: diagnosis.dependency_recording_missing,
             checkout_comparison: &diagnosis.checkout,
+            hints: &diagnosis.hints,
         },
         Vec::new(),
     )

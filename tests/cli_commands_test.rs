@@ -3660,6 +3660,7 @@ fn write_checkout_builds(e: &Env, builds: &[(&str, &str, &str)]) {
                     "result": "miss", "elapsed_ms": 1, "size": 1,
                     "cache_key": key, "schema": 19, "root": root,
                     "key_fields": {"env_deps": env_deps, "sources": "s"},
+                    "key_env_deps": {"BUILD_MODE": env_deps},
                     "key_externs_recorded": true, "key_externs": externs,
                     "unit_id": format!("u{name}"), "extern_units": extern_units
                 })
@@ -3717,6 +3718,10 @@ fn why_miss_compares_a_second_checkout_with_the_first() {
     );
     assert_eq!(value["checkout_comparison"]["verdict"], "own_inputs");
     assert_eq!(value["checkout_comparison"]["groups"][0], "env_deps");
+    assert_eq!(
+        value["hints"][0],
+        "BUILD_MODE differs: use the same value in both builds if they should produce the same output"
+    );
     // `leaf` has no dependencies: its digests were recorded, just empty.
     assert_eq!(value["dependency_recording_missing"], false);
 
@@ -3930,6 +3935,84 @@ fn the_target_info_probe_seeds_a_new_checkout() {
              tracked targets: {}",
             String::from_utf8_lossy(&tracked.stdout)
         );
+    }
+    for (name, configuration, intermediate) in [
+        (
+            "configured-target",
+            "[build]\ntarget-dir='custom'\n",
+            "custom",
+        ),
+        (
+            "configured-build",
+            "[build]\ntarget-dir='outputs'\nbuild-dir='{workspace-root}/intermediate'\n",
+            "intermediate",
+        ),
+    ] {
+        let checkout = root.path().join(name);
+        std::fs::create_dir_all(checkout.join(".cargo")).unwrap();
+        std::fs::write(checkout.join(".cargo/config.toml"), configuration).unwrap();
+        probe(&checkout, "1");
+        assert!(
+            marker(&checkout.join(intermediate)).is_dir(),
+            "{name} was not seeded"
+        );
+        assert!(
+            !checkout.join("target").exists(),
+            "{name} seeded the default target"
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        // A fake Cargo preserves the lockfile and invokes the real wrapper's
+        // probe. This tests the Cargo-to-wrapper transport, not Cargo itself.
+        let fake = root.path().join("fake-cargo");
+        std::fs::write(&fake, "#!/bin/sh\nif [ \"$1\" = -V ]; then echo 'cargo 1.99.0'; exit 0; fi\nexec \"$KACHE_TEST_BINARY\" rustc - --crate-name ___ --print=file-names --crate-type lib\n").unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let shim = root.path().join("shim/cargo");
+        std::fs::create_dir_all(shim.parent().unwrap()).unwrap();
+        symlink(KACHE_BIN, &shim).unwrap();
+        for (name, program, prefix, intermediate) in [
+            ("cargo-shim-target", shim.as_path(), vec![], "custom"),
+            (
+                "cargo-proxy-build",
+                Path::new(KACHE_BIN),
+                vec!["cargo", "--"],
+                "target",
+            ),
+        ] {
+            let checkout = root.path().join(name);
+            std::fs::create_dir_all(&checkout).unwrap();
+            std::fs::write(checkout.join("Cargo.toml"), manifest).unwrap();
+            std::fs::write(checkout.join("Cargo.lock"), lock).unwrap();
+            let command = kache_process_as(program, &e.home, &e.cache);
+            let mut command = Command::from_std(command);
+            command
+                .current_dir(&checkout)
+                .env("KACHE_REAL_CARGO", &fake)
+                .env("KACHE_TEST_BINARY", KACHE_BIN)
+                .env_remove("CARGO_TARGET_DIR")
+                .env_remove("CARGO_BUILD_TARGET_DIR")
+                .env_remove("CARGO_BUILD_BUILD_DIR")
+                .args(prefix)
+                .args(["check", "--target-dir=custom"])
+                .write_stdin("")
+                .assert()
+                .success();
+            assert!(
+                marker(&checkout.join(intermediate)).is_dir(),
+                "{name} was not seeded"
+            );
+            let unused = if intermediate == "custom" {
+                "target"
+            } else {
+                "custom"
+            };
+            assert!(
+                !checkout.join(unused).exists(),
+                "{name} seeded the output directory instead of intermediates"
+            );
+        }
     }
     let off = root.path().join("off");
     probe(&off, "0");

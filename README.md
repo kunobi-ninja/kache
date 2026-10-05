@@ -108,6 +108,17 @@ Install your Rust toolchain, then add the official action before your build:
 The action can persist the local store through GitHub's cache service.
 For remote storage, credentials, and pull-request policy, follow the [CI guide][nav-ci].
 
+## Star History
+
+<a href="https://www.star-history.com/?repos=kunobi-ninja%2Fkache&type=date&legend=top-left">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=kunobi-ninja/kache&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=kunobi-ninja/kache&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=kunobi-ninja/kache&type=date&legend=top-left" />
+ </picture>
+</a>
+
+
 ## Find your next step
 
 | I want to… | Guide |
@@ -125,9 +136,6 @@ For remote storage, credentials, and pull-request policy, follow the [CI guide][
 [Report a bug](https://github.com/kunobi-ninja/kache/issues/new?template=bug_report.md),
 [request a feature](https://github.com/kunobi-ninja/kache/issues/new?template=feature_request.md),
 or read [CONTRIBUTING.md](.github/CONTRIBUTING.md) to contribute.
-
-For Kubernetes and GitOps, [Kunobi Desktop][kunobi-desktop] lets you inspect
-clusters and manage Flux and Argo CD.
 
 Licensed under [Apache 2.0](LICENSE).
 

@@ -3102,6 +3102,42 @@ fn evict_counts_an_entry_it_fails_to_remove() {
 }
 
 #[test]
+fn disk_pressure_stops_before_scanning_and_between_removals_below_the_size_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut store, _) = store_with_one_evictable_entry(dir.path(), "first");
+    let (other, _) = store_with_one_evictable_entry(dir.path(), "second");
+    drop(other);
+    store.config.max_size = u64::MAX;
+    assert_eq!(store.evict().unwrap().entries_evicted, 0);
+    assert_eq!(
+        store
+            .evict_for_disk_pressure(|| true)
+            .unwrap()
+            .entries_evicted,
+        0
+    );
+    assert!(store.contains("first") && store.contains("second"));
+
+    let mut checks = 0;
+    let stats = store
+        .evict_for_disk_pressure(|| {
+            checks += 1;
+            checks >= 3
+        })
+        .unwrap();
+    assert_eq!(stats.entries_evicted, 1);
+    assert_eq!(checks, 3);
+    assert_eq!(store.list_entries("last_accessed").unwrap().len(), 1);
+    assert_eq!(
+        store
+            .evict_for_disk_pressure(|| false)
+            .unwrap()
+            .entries_evicted,
+        1
+    );
+}
+
+#[test]
 fn evict_counts_lock_contention_apart_from_bad_data() {
     let dir = tempfile::tempdir().unwrap();
     let (store, config) = store_with_one_evictable_entry(dir.path(), "busy");
@@ -3260,6 +3296,12 @@ fn evict_leaves_an_entry_whose_blob_is_still_hardlinked_outside() {
     assert!(store.contains("kept"), "entry remains restorable");
     assert!(blob.is_file(), "store name remains");
 
+    let pressure = store.evict_for_disk_pressure(|| false).unwrap();
+    assert_eq!(pressure.entries_evicted, 0);
+    assert_eq!(pressure.entries_unreclaimable, 1);
+    assert!(store.contains("kept"));
+    assert!(retainer.is_file());
+
     store.config.gc_evict_shared = true;
     let stats = store.evict().unwrap();
     assert_eq!(stats.entries_evicted, 1);
@@ -3405,6 +3447,10 @@ fn durable_upload_intent_pins_payload_across_every_eviction_policy_until_retired
 
     let size = store.evict().unwrap();
     assert!(size.entries_pinned >= 1);
+    assert!(store.contains(&pending_key));
+
+    let pressure = store.evict_for_disk_pressure(|| false).unwrap();
+    assert!(pressure.entries_pinned >= 1);
     assert!(store.contains(&pending_key));
 
     let age = store.evict_older_than(24).unwrap();
@@ -4058,6 +4104,10 @@ fn an_automatic_sweep_keeps_what_the_remote_just_delivered() {
     assert!(!store.contains("built_key"), "the sweep still frees space");
     assert_eq!(automatic.entries_import_pinned, 1);
     assert_eq!(automatic.entries_pinned, 1, "counted as held back too");
+
+    let pressure = store.evict_for_disk_pressure(|| false).unwrap();
+    assert_eq!(pressure.entries_import_pinned, 1);
+    assert!(store.contains("imported_key"));
 
     let requested = store.evict().unwrap();
     assert!(!store.contains("imported_key"), "`kache gc` can reclaim it");

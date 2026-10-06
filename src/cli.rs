@@ -3923,6 +3923,7 @@ pub fn run_auto_gc_worker(config: &Config, retry_delay: std::time::Duration) {
 /// checked before spawning, but a daemon that acknowledged the hint too late
 /// may have swept since, and the first sweep may have cleared the pressure.
 fn auto_gc_worker_sweep(config: &Config) -> Option<crate::store::GcStats> {
+    crate::disk_recovery::run(config);
     let size = Store::open(config)
         .and_then(|store| store.physical_size())
         .ok()?;

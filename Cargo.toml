@@ -183,7 +183,12 @@ assets = [
 # so the farm matches SHIM_NAMES in this binary. prerm removes those links.
 maintainer-scripts = "packaging/debian/"
 
+[profile.dev]
+debug = 0
+strip = "symbols"
+
 [profile.release]
+debug = 0
 lto = "fat"
 codegen-units = 1
 strip = "symbols"

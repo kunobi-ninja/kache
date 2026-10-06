@@ -6573,6 +6573,7 @@ impl Daemon {
 
     /// One shard's size-pressure sweep, under that shard's `gc.lock`.
     fn sweep_shard_under_size_pressure(&self, shard: &Config) -> Result<()> {
+        crate::disk_recovery::run(shard);
         let store = Store::open(shard)?;
         let Some(_gc_lock) = store.try_gc_lock()? else {
             tracing::debug!(
@@ -6589,6 +6590,7 @@ impl Daemon {
     /// `gc.lock`, the store is under the trigger, or the backoff holds; each
     /// costs a lock attempt and one size query.
     fn sweep_main_under_size_pressure(&self) -> Result<()> {
+        crate::disk_recovery::run(&self.config);
         let Some((_gc_lock, size)) = self.with_store(|store| {
             let Some(lock) = store.try_gc_lock()? else {
                 return Ok(None);

@@ -29,6 +29,13 @@ just install   # installs to $CARGO_HOME/bin (default ~/.cargo/bin) and register
 
 ## Development workflow
 
+Development and test builds omit debug information and strip symbols. To
+inspect Kache with a debugger or get symbolized backtraces, override both:
+
+```sh
+CARGO_PROFILE_DEV_DEBUG=2 CARGO_PROFILE_DEV_STRIP=none cargo build
+```
+
 All common tasks live in the `Justfile` — prefer these over raw `cargo` commands:
 
 ```sh

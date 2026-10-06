@@ -532,7 +532,7 @@ fn auto_gc_wanted(config: &Config, store: &Store) -> bool {
     };
     // A `[cache.volumes]` shard is judged against its own budget and backoff.
     let swept = config.for_store_dir(store.cache_dir(), crate::volume_gc::filesystem_bytes);
-    if !auto_gc_sweep_due(&swept, total) {
+    if !auto_gc_sweep_due(&swept, total) && !crate::disk_recovery::wanted(&swept) {
         let now_str = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs().to_string())
@@ -551,7 +551,7 @@ fn auto_gc_wanted(config: &Config, store: &Store) -> bool {
     }
 
     tracing::info!(
-        "auto-gc: store size {} exceeds max {} (+{}% slack), triggering background GC",
+        "auto-gc: cache or disk pressure, triggering background GC (store {}, max {}, slack {}%)",
         total,
         swept.max_size,
         AUTO_GC_SLACK_PERCENT

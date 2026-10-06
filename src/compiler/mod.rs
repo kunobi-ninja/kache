@@ -2450,19 +2450,25 @@ mod shim_tests {
         assert_eq!(names, vec!["gcc-15".to_string()]);
     }
 
-    /// Guard that restores PATH even if the test panics; process env is
-    /// global and a leaked PATH would corrupt every later test.
+    /// Runs one fixture below alone in a child test process. The fixtures put
+    /// a `cc` that is this test binary first on PATH, so any test in the same
+    /// process that spawns `cc` meanwhile would run the test harness instead.
     #[cfg(unix)]
-    struct PathForTest(Option<std::ffi::OsString>);
-
-    #[cfg(unix)]
-    impl Drop for PathForTest {
-        fn drop(&mut self) {
-            match self.0.take() {
-                Some(previous) => unsafe { std::env::set_var("PATH", previous) },
-                None => unsafe { std::env::remove_var("PATH") },
-            }
-        }
+    fn run_path_fixture(name: &str) {
+        // The child inherits the environment, so take it while no config
+        // test has swapped `KACHE_CONFIG`.
+        let _lock = crate::config::tests::config_path_lock();
+        let fixture = format!("compiler::shim_tests::{name}");
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--ignored", "--exact", &fixture, "--test-threads=1"])
+            .output()
+            .expect("spawn PATH fixture");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "{fixture} did not pass:\nstdout:\n{stdout}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     /// Drives the LIVE wiring against a real PATH, not the injected core.
@@ -2475,9 +2481,15 @@ mod shim_tests {
     #[cfg(unix)]
     #[test]
     fn live_resolution_finds_the_real_compiler_behind_a_real_shim() {
+        run_path_fixture("live_resolution_behind_a_real_shim_fixture");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "run in a child process by live_resolution_finds_the_real_compiler_behind_a_real_shim"]
+    fn live_resolution_behind_a_real_shim_fixture() {
         use std::os::unix::fs::PermissionsExt;
 
-        let _lock = crate::config::tests::config_path_lock();
         let dir = tempfile::tempdir().unwrap();
         let shim_dir = dir.path().join("shims");
         let real_dir = dir.path().join("real");
@@ -2493,7 +2505,7 @@ mod shim_tests {
         let exe = std::env::current_exe().unwrap();
         std::os::unix::fs::symlink(&exe, shim_dir.join("cc")).unwrap();
 
-        let _path = PathForTest(std::env::var_os("PATH"));
+        // SAFETY: this fixture runs alone in its own process.
         unsafe {
             std::env::set_var(
                 "PATH",
@@ -2528,14 +2540,20 @@ mod shim_tests {
     #[cfg(unix)]
     #[test]
     fn live_resolution_reports_when_only_the_shim_is_on_path() {
-        let _lock = crate::config::tests::config_path_lock();
+        run_path_fixture("live_resolution_with_only_the_shim_fixture");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "run in a child process by live_resolution_reports_when_only_the_shim_is_on_path"]
+    fn live_resolution_with_only_the_shim_fixture() {
         let dir = tempfile::tempdir().unwrap();
         let shim_dir = dir.path().join("shims");
         std::fs::create_dir_all(&shim_dir).unwrap();
         let exe = std::env::current_exe().unwrap();
         std::os::unix::fs::symlink(&exe, shim_dir.join("cc")).unwrap();
 
-        let _path = PathForTest(std::env::var_os("PATH"));
+        // SAFETY: this fixture runs alone in its own process.
         unsafe { std::env::set_var("PATH", format!("{}", shim_dir.display())) };
 
         assert_eq!(resolve_real_compiler_from_env("cc"), None);

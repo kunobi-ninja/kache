@@ -4614,6 +4614,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         shadow: Option<&ShadowSelection>,
         durable_upload_keys: &std::collections::HashSet<String>,
         held: &std::collections::HashMap<String, u64>,
+        stop: &mut dyn FnMut() -> bool,
     ) -> GcStats {
         let mut stats = GcStats::default();
         let mut eviction_writes = std::time::Duration::ZERO;
@@ -4633,6 +4634,9 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         });
 
         for key in order {
+            if stop() {
+                break;
+            }
             if let Some(target) = target
                 && current_size <= target
             {
@@ -4747,6 +4751,16 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         stop_at: Option<(u64, u64)>,
         origin: SweepOrigin,
     ) -> Result<GcStats> {
+        self.evict_with_stop(policy, stop_at, origin, &mut || false)
+    }
+
+    fn evict_with_stop(
+        &self,
+        policy: &dyn crate::eviction::EvictionPolicy,
+        stop_at: Option<(u64, u64)>,
+        origin: SweepOrigin,
+        stop: &mut dyn FnMut() -> bool,
+    ) -> Result<GcStats> {
         let candidates = self.eviction_candidates_for(origin)?;
         let order = policy.select(&candidates);
         if order.is_empty() {
@@ -4801,6 +4815,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             shadow.as_ref(),
             &durable_upload_keys,
             &held,
+            stop,
         );
         stats.bytes_held = bytes_held;
         stats.entries_unreclaimable += held.len();
@@ -4895,6 +4910,22 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         )
     }
 
+    /// Reclaim eligible entries even below the cache size budget. The caller
+    /// holds `gc.lock` and stops on measured free space or a work deadline.
+    /// Recent accesses, imports, upload intents and external retainers keep
+    /// the same protection as other automatic sweeps.
+    pub fn evict_for_disk_pressure(&self, mut stop: impl FnMut() -> bool) -> Result<GcStats> {
+        if stop() {
+            return Ok(GcStats::default());
+        }
+        self.evict_with_stop(
+            &crate::eviction::SizePressurePolicy,
+            None,
+            SweepOrigin::Automatic,
+            &mut stop,
+        )
+    }
+
     /// Evict entries older than the given duration.
     pub fn evict_older_than(&self, hours: u64) -> Result<GcStats> {
         self.evict_with(
@@ -4935,6 +4966,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             None,
             &durable_upload_keys,
             &std::collections::HashMap::new(),
+            &mut || false,
         ))
     }
 

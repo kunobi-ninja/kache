@@ -3017,6 +3017,40 @@ fn put_upload_evict_entry(
     store.set_last_accessed_for_test(key, last_used);
 }
 
+#[test]
+#[cfg(unix)]
+fn disk_pressure_reaches_main_and_shards_below_budget_and_respects_locks_and_backoff() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(&dir.path().join("main"));
+    config.max_size = u64::MAX;
+    let main = Store::open(&config).unwrap();
+    config.auto_recover_min_free_bytes = kache_fs::volume_usage(&config.cache_dir).unwrap().total;
+    let (shard_config, shard) = add_budgeted_shard(&mut config, dir.path(), "shard", u64::MAX);
+    put_upload_evict_entry(&main, dir.path(), "main_old", 200, false);
+    put_upload_evict_entry(&main, dir.path(), "main_recent", 200, true);
+    put_upload_evict_entry(&shard, dir.path(), "shard_old", 200, false);
+    let held = shard.try_gc_lock().unwrap().unwrap();
+    let daemon = Daemon::new(config.clone());
+    daemon.maybe_evict_after_upload();
+    assert!(!main.contains("main_old"));
+    assert!(main.contains("main_recent"));
+    assert!(shard.contains("shard_old"));
+    assert!(!crate::disk_recovery::wanted(&config));
+    assert!(crate::disk_recovery::wanted(&shard_config));
+    let report = crate::report::read_gc_stats(&config.cache_dir).unwrap();
+    assert_eq!(report.entries_evicted, 1);
+    assert_eq!(report.entries_pinned, 1);
+    drop(held);
+    daemon.maybe_evict_after_upload();
+    assert!(!shard.contains("shard_old"));
+    put_upload_evict_entry(&main, dir.path(), "later", 200, false);
+    daemon.maybe_evict_after_upload();
+    assert!(
+        main.contains("later"),
+        "the persistent recovery interval holds"
+    );
+}
+
 /// Hardlink `key`'s blob into a stand-in target directory, which then
 /// holds its blocks.
 fn hold_in_target_dir(store: &Store, dir: &std::path::Path, key: &str) {

@@ -491,9 +491,9 @@ pub struct Config {
     /// `KACHE_AUTO_CLEAN_IDLE_TARGETS_DAYS` or `[cache]
     /// auto_clean_idle_targets_days`.
     pub auto_clean_idle_targets_days: u64,
-    /// Minimum free bytes to maintain on a target's volume by removing build
-    /// units unused for a day, then targets idle for at least a day. Zero
-    /// (the default) disables it.
+    /// Minimum free bytes on a store or target volume. During builds, auto-GC
+    /// reclaims eligible store entries; quiet target cleanup removes units
+    /// unused for a day, then targets idle for a day. Zero disables recovery.
     pub auto_recover_min_free_bytes: u64,
     /// Under memory pressure, admit a compile only when no other compile
     /// holds a scheduler slot. On by default. Set via
@@ -2817,7 +2817,7 @@ impl Config {
             .unwrap_or(0)
     }
 
-    /// Free-space threshold for daemon target recovery; off by default.
+    /// Free-space threshold for store and target recovery; off by default.
     fn auto_recover_min_free_bytes(file_config: &Result<FileConfig>) -> u64 {
         let ignore_env = Self::ignore_env_enabled(file_config);
         env_or_ignored("KACHE_AUTO_RECOVER_MIN_FREE_BYTES", ignore_env)

@@ -526,6 +526,46 @@ fn auto_gc_wanted_fires_only_over_budget_and_respects_throttle() {
 }
 
 #[test]
+#[cfg(unix)]
+fn disk_pressure_hints_even_below_cache_budget_and_the_detached_worker_recovers() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = crate::test_support::test_config(dir.path().to_path_buf());
+    config.max_size = u64::MAX;
+    let store = Store::open(&config).unwrap();
+    let source = dir.path().join("old.rlib");
+    std::fs::write(&source, b"old artifact").unwrap();
+    store
+        .put(
+            "old",
+            "old",
+            &["lib".into()],
+            &[],
+            "host",
+            "dev",
+            &[(source.clone(), "old.rlib".into())],
+            "",
+            "",
+        )
+        .unwrap();
+    store.remove_clone_for_test(&source);
+    store.set_last_accessed_for_test("old", "-1 hour");
+    config.auto_recover_min_free_bytes = kache_fs::volume_usage(dir.path()).unwrap().total;
+    config.auto_gc = false;
+    assert!(!auto_gc_wanted(&config, &store));
+    crate::disk_recovery::run(&config);
+    assert!(store.contains("old"));
+    config.auto_gc = true;
+    assert!(auto_gc_wanted(&config, &store));
+    crate::cli::run_auto_gc_worker(&config, std::time::Duration::ZERO);
+    assert!(!store.contains("old"));
+    expire_auto_gc_stamp(&config);
+    assert!(
+        !auto_gc_wanted(&config, &store),
+        "recovery backs off separately from cache size"
+    );
+}
+
+#[test]
 fn auto_gc_wanted_respects_disable_and_slack() {
     let dir = tempfile::tempdir().unwrap();
     let mut cfg = test_config(dir.path().to_path_buf());

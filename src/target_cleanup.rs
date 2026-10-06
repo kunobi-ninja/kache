@@ -952,7 +952,7 @@ mod tests {
         let store = Store::open(&pressure).unwrap();
         let (_, target) = tracked_target(&store, root.path(), "idle");
         std::fs::write(target.join("debug/artifact"), vec![7; 64 * 1024]).unwrap();
-        assert!(crate::cli::target_reclaimable_bytes(&target) >= 64 * 1024);
+        assert!(crate::cli::target_reclaimable_bytes(&target) > 0);
         pressure.auto_recover_min_free_bytes = kache_fs::volume_usage(&target).unwrap().total - 1;
         let later = unix_now_secs() + 2 * DAY_SECS;
         let lock = std::fs::File::create(target.join("debug/.cargo-lock")).unwrap();

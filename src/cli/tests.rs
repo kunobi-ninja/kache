@@ -7158,7 +7158,13 @@ fn target_rows_report_each_worktree_and_sort_by_what_frees_most() {
         let target = dir.path().join("targets").join(name);
         std::fs::create_dir_all(&workspace).unwrap();
         std::fs::create_dir_all(target.join("debug/deps")).unwrap();
-        std::fs::write(target.join("debug/deps/libx.rlib"), vec![1u8; bytes]).unwrap();
+        // Repeated bytes compress to the same allocation for both sizes on ZFS.
+        let mut artifact = vec![0; bytes];
+        blake3::Hasher::new()
+            .update(name.as_bytes())
+            .finalize_xof()
+            .fill(&mut artifact);
+        std::fs::write(target.join("debug/deps/libx.rlib"), artifact).unwrap();
         std::fs::write(target.join("CACHEDIR.TAG"), CARGO_CACHEDIR_TAG).unwrap();
         store.remember_target_root(&target, &workspace).unwrap();
         targets.push((workspace, target));
@@ -7198,7 +7204,10 @@ fn target_rows_report_each_worktree_and_sort_by_what_frees_most() {
     assert!(rows[0].path.ends_with("large") && rows[1].path.ends_with("small"));
     assert_eq!(rows[0].state, TargetState::WorktreeDeleted);
     assert_eq!(rows[1].state, TargetState::Live);
-    assert!(rows[0].reclaimable_bytes >= 64 * 1024, "{rows:?}");
+    assert!(
+        rows[0].reclaimable_bytes > rows[1].reclaimable_bytes,
+        "{rows:?}"
+    );
     assert!(
         rows.iter().all(|row| row
             .idle_seconds

@@ -116,10 +116,7 @@ pub(crate) fn new_target(
     if elsewhere {
         return None;
     }
-    let workspace_root = cwd
-        .ancestors()
-        .find(|dir| dir.join("Cargo.lock").is_file() && dir.join("Cargo.toml").is_file())?
-        .to_path_buf();
+    let workspace_root = workspace_root(cwd)?.to_path_buf();
     let target_dir = match target_env.filter(|value| !value.is_empty()) {
         Some(value) => cwd.join(value),
         None => workspace_root.join("target"),
@@ -128,6 +125,11 @@ pub(crate) fn new_target(
         target_dir,
         workspace_root,
     })
+}
+
+fn workspace_root(cwd: &Path) -> Option<&Path> {
+    cwd.ancestors()
+        .find(|dir| dir.join("Cargo.lock").is_file() && dir.join("Cargo.toml").is_file())
 }
 
 /// Whether Cargo has built in `target_dir`: it cached its compiler probe
@@ -763,10 +765,7 @@ pub(crate) fn before_probe(config: &crate::config::Config, args: &[String]) {
     let Ok(cwd) = std::env::current_dir() else {
         return;
     };
-    let workspace = cwd
-        .ancestors()
-        .find(|dir| dir.join("Cargo.lock").is_file() && dir.join("Cargo.toml").is_file());
-    let Some(workspace) = workspace else {
+    let Some(workspace) = workspace_root(&cwd) else {
         return;
     };
     let target_env = placement::override_target()
@@ -983,6 +982,16 @@ source = "git+https://example.com/gitdep#abc"
         std::fs::create_dir_all(&member).unwrap();
         write(&member.join("Cargo.toml"), "");
         assert_eq!(new_target(&member, None, false), Some(checkout.clone()));
+        assert_eq!(
+            workspace_root(&member),
+            Some(checkout.workspace_root.as_path())
+        );
+        let lock_only = checkout.workspace_root.join("lock-only");
+        write(&lock_only.join("Cargo.lock"), LOCK);
+        assert_eq!(
+            workspace_root(&lock_only),
+            Some(checkout.workspace_root.as_path())
+        );
         assert_eq!(new_target(&checkout.workspace_root, None, true), None);
         let env = std::ffi::OsString::from("elsewhere/t");
         assert_eq!(

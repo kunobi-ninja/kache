@@ -226,6 +226,16 @@ mod tests {
     }
 
     #[test]
+    fn configuration_read_errors_stay_unseeded() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join(".cargo");
+        // A directory at the config path fails to read on every platform,
+        // including privileged test runners where permission denial does not.
+        std::fs::create_dir_all(home.join("config.toml")).unwrap();
+        assert_eq!(resolve(temp.path(), temp.path(), &home, None, None), None);
+    }
+
+    #[test]
     fn cargo_flags_override_inherited_paths_without_reading_program_arguments() {
         let args = |values: &[&str]| values.iter().map(OsString::from).collect::<Vec<_>>();
         assert_eq!(

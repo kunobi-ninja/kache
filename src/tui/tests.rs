@@ -1478,6 +1478,7 @@ fn sample_build_event(
         key_fields: Default::default(),
         key_diff: Vec::new(),
         key_externs: Default::default(),
+        key_env_deps: None,
         key_externs_recorded: false,
         unit_id: String::new(),
         extern_units: Default::default(),

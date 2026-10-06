@@ -744,6 +744,9 @@ pub struct KeyOutputs {
     /// Per-group digests of the key, for the event log and `explain_miss`
     /// (kunobi-ninja/kache#131). Set only once the whole key was hashed.
     pub fields: Option<BTreeMap<String, String>>,
+    /// Hashes of normalized compiler-reported environment values, keyed by
+    /// variable name. Values are never written to the event log.
+    pub env_deps: Option<BTreeMap<String, String>>,
     /// Per-extern artifact digests (kunobi-ninja/kache#609).
     ///
     /// The `externs` group digest says only THAT some dependency's artifact
@@ -2698,6 +2701,7 @@ fn compute_key_into(
         let aliased_out_dir = crate::out_dir_alias::active_alias();
         let env_dep_paths = EnvDepPaths::new(out_dir.as_deref(), &dep_info.source_files);
         let mut bakes_out_dir = false;
+        let mut env_fields = BTreeMap::new();
         for (var, val) in &dep_info.env_deps {
             let value = EnvDepValue::new(val);
             let normalized_env_dep = normalize_env_dep_value_with_hasher(
@@ -2712,6 +2716,11 @@ fn compute_key_into(
             bakes_out_dir |= env_dep_bakes_out_dir(var, normalized_env_dep.decision, || {
                 env_dep_paths.value_is_under_out_dir(&value)
             });
+            env_fields.insert(
+                var.clone(),
+                blake3::hash(normalized_env_dep.value.as_bytes()).to_hex()[..KEY_FIELD_HEX]
+                    .to_string(),
+            );
             fold_field(&mut hasher, b"env_dep_var:", var.as_bytes());
             fold_field(
                 &mut hasher,
@@ -2726,6 +2735,7 @@ fn compute_key_into(
                 normalized_env_dep.decision.as_str()
             );
         }
+        out.env_deps = Some(env_fields);
         out.bakes_out_dir = bakes_out_dir;
     }
 

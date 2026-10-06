@@ -43,6 +43,8 @@
 //! the build uses, and `debug` is the one `build`, `check`, `test` and
 //! `clippy` share.
 
+mod placement;
+
 use std::collections::{BTreeSet, HashMap};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -103,7 +105,7 @@ pub(crate) struct NewTarget {
 /// The target directory a probe in `cwd` is for, when it is one this can
 /// seed: the workspace is the nearest directory up from `cwd` holding
 /// `Cargo.toml` and `Cargo.lock`, and the target directory is
-/// `target_env` (`CARGO_TARGET_DIR`) or `<workspace>/target`. `None` when
+/// `target_env` (the resolved intermediate directory) or `<workspace>/target`. `None` when
 /// `elsewhere` says configuration moves the target or build directory, and
 /// when Cargo has already built there.
 pub(crate) fn new_target(
@@ -114,10 +116,7 @@ pub(crate) fn new_target(
     if elsewhere {
         return None;
     }
-    let workspace_root = cwd
-        .ancestors()
-        .find(|dir| dir.join("Cargo.lock").is_file() && dir.join("Cargo.toml").is_file())?
-        .to_path_buf();
+    let workspace_root = workspace_root(cwd)?.to_path_buf();
     let target_dir = match target_env.filter(|value| !value.is_empty()) {
         Some(value) => cwd.join(value),
         None => workspace_root.join("target"),
@@ -126,6 +125,11 @@ pub(crate) fn new_target(
         target_dir,
         workspace_root,
     })
+}
+
+fn workspace_root(cwd: &Path) -> Option<&Path> {
+    cwd.ancestors()
+        .find(|dir| dir.join("Cargo.lock").is_file() && dir.join("Cargo.toml").is_file())
 }
 
 /// Whether Cargo has built in `target_dir`: it cached its compiler probe
@@ -138,24 +142,6 @@ fn built(target_dir: &Path) -> bool {
     ]
     .iter()
     .any(|path| path.exists())
-}
-
-/// Whether Cargo configuration found from `cwd` sets `build.target-dir` or
-/// `build.build-dir`, which this does not follow.
-pub(crate) fn configured_elsewhere(cwd: &Path, cargo_home: &Path) -> bool {
-    let mut dirs: Vec<PathBuf> = cwd.ancestors().map(|dir| dir.join(".cargo")).collect();
-    dirs.push(cargo_home.to_path_buf());
-    dirs.iter().any(|dir| {
-        ["config", "config.toml"].iter().any(|name| {
-            std::fs::read_to_string(dir.join(name))
-                .ok()
-                .and_then(|text| text.parse::<toml::Table>().ok())
-                .and_then(|table| table.get("build").cloned())
-                .is_some_and(|build| {
-                    build.get("target-dir").is_some() || build.get("build-dir").is_some()
-                })
-        })
-    })
 }
 
 /// The registry and git packages in a lockfile: those with a `source`, less
@@ -558,6 +544,15 @@ pub(crate) struct Seeded {
     pub(crate) donor: Option<PathBuf>,
 }
 
+/// Editor and check targets reuse only the same lane in another checkout.
+fn seed_lane(directory: &Path) -> &str {
+    match directory.file_name().and_then(OsStr::to_str) {
+        Some("check") => "check",
+        Some("rust-analyzer") => "rust-analyzer",
+        _ => "build",
+    }
+}
+
 /// Copy the registry units `target` needs from the first donor, most recent
 /// first, built by the `rustc -vV` in `rustc_version` that has any. A link
 /// to a hermetic run is linked again only into `cache_dir`. Stops at
@@ -595,7 +590,10 @@ pub(crate) fn seed(
         if Instant::now() >= deadline {
             break;
         }
-        if donor.target_dir == target.target_dir || !donor_built_by(donor, rustc_version) {
+        if donor.target_dir == target.target_dir
+            || seed_lane(&donor.target_dir) != seed_lane(&target.target_dir)
+            || !donor_built_by(donor, rustc_version)
+        {
             continue;
         }
         let from = donor.target_dir.join(PROFILE);
@@ -741,11 +739,13 @@ fn file_name(path: &Path) -> String {
         .unwrap_or_default()
 }
 
-/// Whether Cargo puts this build's units somewhere other than its target
-/// directory: `CARGO_BUILD_BUILD_DIR` is set, or a Cargo config names a
-/// target or build directory.
-fn builds_elsewhere(build_dir_env: bool, cwd: &Path, cargo_home: &Path) -> bool {
-    build_dir_env || configured_elsewhere(cwd, cargo_home)
+/// Pass Cargo's explicit target selection to its compiler wrappers.
+pub(crate) fn configure_cargo_seed(
+    command: &mut std::process::Command,
+    args: &[std::ffi::OsString],
+    isolated_build_dir: bool,
+) {
+    placement::configure(command, args, isolated_build_dir);
 }
 
 /// Whether this rustc invocation should ask for a seed: seeding is on and
@@ -765,14 +765,24 @@ pub(crate) fn before_probe(config: &crate::config::Config, args: &[String]) {
     let Ok(cwd) = std::env::current_dir() else {
         return;
     };
-    let target_env =
-        std::env::var_os("CARGO_TARGET_DIR").or_else(|| std::env::var_os("CARGO_BUILD_TARGET_DIR"));
-    let elsewhere = builds_elsewhere(
-        std::env::var_os("CARGO_BUILD_BUILD_DIR").is_some(),
+    let Some(workspace) = workspace_root(&cwd) else {
+        return;
+    };
+    let target_env = placement::override_target()
+        .or_else(|| std::env::var_os("CARGO_TARGET_DIR"))
+        .or_else(|| std::env::var_os("CARGO_BUILD_TARGET_DIR"));
+    let build_env =
+        placement::override_build().or_else(|| std::env::var_os("CARGO_BUILD_BUILD_DIR"));
+    let Some(directory) = placement::resolve(
         &cwd,
+        workspace,
         &crate::cli::cargo_home_dir(),
-    );
-    let Some(target) = new_target(&cwd, target_env.as_deref(), elsewhere) else {
+        target_env.as_deref(),
+        build_env.as_deref(),
+    ) else {
+        return;
+    };
+    let Some(target) = new_target(&cwd, Some(directory.as_os_str()), false) else {
         return;
     };
     let Some(version) = rustc_version(args.first().map(String::as_str)) else {
@@ -921,18 +931,6 @@ source = "git+https://example.com/gitdep#abc"
     }
 
     #[test]
-    fn a_build_dir_from_the_environment_or_a_config_moves_the_build() {
-        let dir = tempfile::tempdir().unwrap();
-        let cwd = dir.path().join("work");
-        let home = dir.path().join("cargo-home");
-        std::fs::create_dir_all(&cwd).unwrap();
-        assert!(!builds_elsewhere(false, &cwd, &home));
-        assert!(builds_elsewhere(true, &cwd, &home), "CARGO_BUILD_BUILD_DIR");
-        write(&home.join("config.toml"), "[build]\nbuild-dir = \"/b\"\n");
-        assert!(builds_elsewhere(false, &cwd, &home), "a Cargo config");
-    }
-
-    #[test]
     fn only_the_target_info_probe_asks_for_a_seed_and_only_when_enabled() {
         let probe = args("rustc - --crate-name ___ --print=file-names --crate-type bin");
         assert!(asks_for_seed(true, &probe));
@@ -984,6 +982,16 @@ source = "git+https://example.com/gitdep#abc"
         std::fs::create_dir_all(&member).unwrap();
         write(&member.join("Cargo.toml"), "");
         assert_eq!(new_target(&member, None, false), Some(checkout.clone()));
+        assert_eq!(
+            workspace_root(&member),
+            Some(checkout.workspace_root.as_path())
+        );
+        let lock_only = checkout.workspace_root.join("lock-only");
+        write(&lock_only.join("Cargo.lock"), LOCK);
+        assert_eq!(
+            workspace_root(&lock_only),
+            Some(checkout.workspace_root.as_path())
+        );
         assert_eq!(new_target(&checkout.workspace_root, None, true), None);
         let env = std::ffi::OsString::from("elsewhere/t");
         assert_eq!(
@@ -1008,27 +1016,6 @@ source = "git+https://example.com/gitdep#abc"
     }
 
     #[test]
-    fn notices_configuration_that_moves_the_target() {
-        let dir = tempfile::tempdir().unwrap();
-        let cwd = dir.path().join("ws/pkg");
-        let home = dir.path().join("home");
-        std::fs::create_dir_all(&cwd).unwrap();
-        assert!(!configured_elsewhere(&cwd, &home));
-        write(&home.join("config.toml"), "[build]\njobs = 2\n");
-        assert!(!configured_elsewhere(&cwd, &home));
-        write(&home.join("config.toml"), "not toml [");
-        assert!(!configured_elsewhere(&cwd, &home));
-        write(&home.join("config.toml"), "[build]\nbuild-dir = 'b'\n");
-        assert!(configured_elsewhere(&cwd, &home));
-        std::fs::remove_file(home.join("config.toml")).unwrap();
-        write(
-            &dir.path().join("ws/.cargo/config"),
-            "[build]\ntarget-dir = 't'\n",
-        );
-        assert!(configured_elsewhere(&cwd, &home));
-    }
-
-    #[test]
     fn copies_only_packages_with_a_source() {
         let packages = registry_packages(LOCK);
         assert_eq!(
@@ -1044,6 +1031,50 @@ source = "git+https://example.com/gitdep#abc"
         assert!(registry_packages("not toml [").is_empty());
         assert!(registry_packages("version = 3\n").is_empty());
         assert!(registry_packages("[[package]]\nsource = \"x\"\n").is_empty());
+    }
+
+    #[test]
+    fn seeds_editor_and_check_targets_only_from_the_matching_lane() {
+        let dir = tempfile::tempdir().unwrap();
+        for lane in ["check", "rust-analyzer"] {
+            for layout in [Layout::Shared, Layout::PerUnit] {
+                let label = format!("{lane}-{layout:?}");
+                let wrong = donor(dir.path(), &format!("wrong-{label}"), layout);
+                let mut matching = donor(dir.path(), &format!("matching-{label}"), layout);
+                let old = matching.target_dir.clone();
+                matching.target_dir = matching.workspace_root.join("elsewhere").join(lane);
+                std::fs::create_dir_all(matching.target_dir.parent().unwrap()).unwrap();
+                std::fs::rename(&old, &matching.target_dir).unwrap();
+                let mut target = checkout(dir.path(), &format!("new-{label}"));
+                target.target_dir = target.target_dir.join(lane);
+                let result = seed(
+                    &target,
+                    VERSION,
+                    &[wrong, matching.clone()],
+                    Path::new(NO_CACHE),
+                    later(),
+                );
+                assert_eq!(result.donor, Some(matching.workspace_root.clone()));
+                assert_eq!(result.units, 1);
+                assert!(
+                    marker(
+                        &target.target_dir.join(PROFILE),
+                        layout,
+                        &Unit {
+                            package: "dep".into(),
+                            hash: HASH.into()
+                        }
+                    )
+                    .is_dir()
+                );
+                assert!(!target.workspace_root.join("target/debug").exists());
+                let regular = checkout(dir.path(), &format!("regular-{label}"));
+                assert_eq!(
+                    seed(&regular, VERSION, &[matching], Path::new(NO_CACHE), later()),
+                    Seeded::default()
+                );
+            }
+        }
     }
 
     #[test]

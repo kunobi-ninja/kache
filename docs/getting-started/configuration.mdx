@@ -260,7 +260,11 @@ What is copied:
 - A relative symlink inside a unit's directory (`build/<pkg>/<hash>/`, or `build/<pkg>-<hash>/` and `.fingerprint/<pkg>-<hash>/` in the shared layout) is copied as a link when its target climbs no higher than that directory with leading `..` and then only descends. Files in the shared `deps/` directory are copied one at a time, and a symlink that is itself the copied file is not kept, so a link there such as `libfoo.so -> libfoo.so.1` keeps its unit from being copied.
 - A build script's `OUT_DIR` that a hermetic run (`KACHE_BUILD_SCRIPT_HERMETIC=1`) left as a link to its shared directory in this cache is linked to the same directory, which then counts as in use by the new target. A unit holding any other symlink is not copied.
 
-A unit whose build script recorded a path into the other checkout, other than its own `OUT_DIR`, is not copied. Nothing is copied while a build holds either target directory's lock, when no daemon is running, or when `build.target-dir`, `build.build-dir` or `CARGO_BUILD_BUILD_DIR` moves the target. `CARGO_TARGET_DIR` is followed. A `--target-dir` given on Cargo's command line is not visible to the wrapper; the units then land in `<workspace>/target`, unused. Set `cache.seed_new_targets = false` or `KACHE_SEED_NEW_TARGETS=0` to turn it off.
+Kache follows `build.target-dir`, `build.build-dir`, `CARGO_TARGET_DIR`, `CARGO_BUILD_TARGET_DIR`, and `CARGO_BUILD_BUILD_DIR`. File paths follow Cargo's config precedence and relative-path rules. Build-directory templates support `{workspace-root}` and `{cargo-cache-home}`. Check targets named `check` and editor targets named `rust-analyzer` use a donor with the same directory name.
+
+The Cargo shim and `kache cargo -- …` also pass `--target-dir` to the wrapper. They skip seeding for invocations with `--config`, `--manifest-path`, `-C`, or `-Z`. A compiler wrapper used without the Cargo shim cannot see those command-line options; use Cargo's configuration or environment variables to select a seedable directory.
+
+A unit whose build script or output files name the donor checkout, other than its own `OUT_DIR`, is not copied. Nothing is copied while a build holds either profile's lock or when no daemon is running. Config includes, unknown build-directory templates, and unreadable or invalid configuration are left unseeded. Set `cache.seed_new_targets = false` or `KACHE_SEED_NEW_TARGETS=0` to turn seeding off.
 
 When the cache already holds a checkout's dependencies, seeding copies the same units it would otherwise restore one compiler call at a time.
 

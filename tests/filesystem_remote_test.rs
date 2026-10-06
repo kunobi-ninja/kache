@@ -1272,14 +1272,21 @@ fn fresh_client_builds_after_a_published_row(tamper: impl FnOnce(&Path)) -> serd
     tamper(&rows[0]);
 
     let beta = Client::with_predictions(shared.path());
+    assert!(!beta.cache_dir.join("store").exists(), "beta starts empty");
     beta.start_daemon();
     beta.compile_workspace_member(&b);
     let event = crate_event(&beta.report(), "kt").clone();
     assert_eq!(event["cache_key"], cache_key.as_str(), "{event}");
     assert!(
-        event["result"] == "remote_hit" || event["result"] == "prefetch_hit",
-        "the remote must serve it: {event}"
+        matches!(
+            event["result"].as_str(),
+            Some("remote_hit" | "prefetch_hit" | "local_hit")
+        ),
+        "the published artifacts must serve the empty client: {event}"
     );
+    // A negative remote reply can coincide with a validated local entry;
+    // acquire_entry reports that as local_hit. Neither path may compile.
+    assert_eq!(event["compiler_runs"], 0, "nothing may recompile: {event}");
     event
 }
 

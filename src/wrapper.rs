@@ -7368,6 +7368,7 @@ pub(crate) fn write_event(config: &Config, event: &BuildEvent) {
 #[derive(Clone, Default)]
 pub(crate) struct KeyEventRecord {
     fields: Option<std::collections::BTreeMap<String, String>>,
+    env_deps: Option<std::collections::BTreeMap<String, String>>,
     externs: Option<std::collections::BTreeMap<String, String>>,
     extern_units: Option<std::collections::BTreeMap<String, String>>,
     unit_id: Option<String>,
@@ -7385,6 +7386,7 @@ impl KeyEventRecord {
     fn absorb(&mut self, outputs: &crate::cache_key::KeyOutputs) {
         if let Some(fields) = &outputs.fields {
             self.fields = Some(fields.clone());
+            self.env_deps = outputs.env_deps.clone();
         }
         self.externs = outputs.externs.clone();
         self.extern_units = outputs.extern_units.clone();
@@ -7432,6 +7434,11 @@ pub(crate) fn build_event_details(config: &Config, inputs: EventInputs<'_>) -> B
 
     // What this compile's key computations recorded for the event (empty for
     // cc and for passthroughs that computed no key; kunobi-ninja/kache#131).
+    let key_env_deps = if config.explain_miss {
+        recorded.env_deps
+    } else {
+        None
+    };
     let key_fields = recorded.fields.unwrap_or_default();
     // Persisted only under `explain_miss` (#609). Unlike `key_diff`,
     // this rides HITS too — the chain walk diffs a miss against the last hit,
@@ -7473,7 +7480,7 @@ pub(crate) fn build_event_details(config: &Config, inputs: EventInputs<'_>) -> B
         compile_time_ms,
         size,
         cache_key: cache_key.to_string(),
-        schema: 23,
+        schema: 24,
         demands: crate::demand::take(),
         session_id,
         key_ms,
@@ -7527,6 +7534,7 @@ pub(crate) fn build_event_details(config: &Config, inputs: EventInputs<'_>) -> B
         fallback_attempt,
         exit_code,
         key_fields,
+        key_env_deps,
         key_diff,
         key_externs,
         key_externs_recorded,

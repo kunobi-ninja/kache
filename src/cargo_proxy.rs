@@ -95,7 +95,8 @@ pub(crate) fn run(cargo_args: Vec<OsString>) -> Result<()> {
 pub(crate) fn run_shim(cargo_args: Vec<OsString>) -> Result<()> {
     let cargo = real_cargo_program(true)?;
     let mut command = Command::new(&cargo);
-    command.args(cargo_args);
+    command.args(&cargo_args);
+    crate::target_seed::configure_cargo_seed(&mut command, &cargo_args, false);
     run_cargo_with_target_protection(command, &cargo)
 }
 
@@ -174,6 +175,15 @@ fn run_with_source(cargo_args: Vec<OsString>) -> Result<()> {
     if let Some(flags) = &overrides.encoded_rustflags {
         command.env("CARGO_ENCODED_RUSTFLAGS", flags);
     }
+
+    crate::target_seed::configure_cargo_seed(
+        &mut command,
+        &cargo_args,
+        overrides
+            .config
+            .iter()
+            .any(|value| value == WORKTREE_BUILD_DIR_CONFIG),
+    );
 
     run_cargo_with_target_protection(command, &cargo)
 }

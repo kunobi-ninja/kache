@@ -92,6 +92,7 @@ mod tests {
             scheduler_memory_pressure: true,
             auto_clean_unused_units_days: 0,
             seed_new_targets: false,
+            build_script_hermetic: false,
             gc_evict_shared: false,
             storage_layout_advice: true,
             heartbeat_secs: 30,

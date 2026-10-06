@@ -123,6 +123,16 @@ fn write_config(cache: &Path) -> PathBuf {
     config
 }
 
+/// [`write_config`] with hermetic build-script runs on, as `KACHE_CONFIG` for
+/// [`cargo`]'s `env`. The fixture config sets `ignore_env`, so the setting has
+/// to come from the file.
+fn write_hermetic_config(cache: &Path) -> String {
+    let base = std::fs::read_to_string(write_config(cache)).unwrap();
+    let config = cache.join("config-hermetic.toml");
+    std::fs::write(&config, format!("{base}build_script_hermetic = true\n")).unwrap();
+    config.to_string_lossy().into_owned()
+}
+
 /// `cargo <subcommand>` on the workspace through kache, with its own target
 /// directory and the shared cache directory.
 fn cargo(
@@ -1369,7 +1379,8 @@ fn main() {
 "#,
         );
     });
-    let hermetic = [("KACHE_BUILD_SCRIPT_HERMETIC", "1")];
+    let hermetic_config = write_hermetic_config(&fx.cache);
+    let hermetic = [("KACHE_CONFIG", hermetic_config.as_str())];
     for (name, expected) in [
         ("first", "miss"),
         ("second", "miss"),
@@ -1443,7 +1454,8 @@ fn main() {
 "#,
         );
     });
-    let hermetic = [("KACHE_BUILD_SCRIPT_HERMETIC", "1")];
+    let hermetic_config = write_hermetic_config(&fx.cache);
+    let hermetic = [("KACHE_CONFIG", hermetic_config.as_str())];
     for (name, expected, linked) in [
         ("first", "miss", false),
         ("second", "miss", true),

@@ -2141,6 +2141,7 @@ mod tests {
                 scheduler_memory_pressure: None,
                 auto_clean_unused_units_days: None,
                 seed_new_targets: None,
+                build_script_hermetic: None,
                 gc_evict_shared: Some(true),
                 storage_layout_advice: None,
                 heartbeat_secs: None,

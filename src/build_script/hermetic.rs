@@ -32,7 +32,8 @@
 //! Every link is recorded beside the sandbox, including the ones seeding
 //! makes in a new target directory (see [`crate::target_seed`]), and
 //! [`sweep`] removes a run once no recorded `OUT_DIR` links to it and none
-//! has for a while. Off unless `KACHE_BUILD_SCRIPT_HERMETIC=1`.
+//! has for a while. Off unless `KACHE_BUILD_SCRIPT_HERMETIC=1` or `[cache]
+//! build_script_hermetic = true` (see [`crate::config::Config::build_script_hermetic`]).
 
 use super::{
     MAX_INPUT_FILES, Prediction, Run, ZERO_AR_DATE_ENV, fold, input_state, input_state_as,
@@ -46,7 +47,6 @@ use anyhow::{Context, Result};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-const ENABLE_ENV: &str = "KACHE_BUILD_SCRIPT_HERMETIC";
 /// Under the cache directory, beside the shared empty `OUT_DIR`s (`v1`).
 const ROOT: &str = "out-dirs/v2";
 /// In the sandbox: the record of a sealed run. Written last.
@@ -54,10 +54,6 @@ const SEALED: &str = ".kache-sealed";
 /// In the sandbox: where the script binary runs from.
 const BIN: &str = ".kache-bin";
 const RECORD_VERSION: u32 = 1;
-
-pub(super) fn enabled() -> bool {
-    std::env::var_os(ENABLE_ENV).is_some_and(|value| value == "1" || value == "true")
-}
 
 /// What a sealed run printed. Its paths name the shared `OUT_DIR`.
 #[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1412,25 +1408,5 @@ mod tests {
             live_referrers(&unreadable).is_err(),
             "an unreadable record is an error, not an empty one"
         );
-    }
-
-    #[test]
-    fn enabled_only_when_asked() {
-        let _lock = crate::test_support::process_state_test_lock();
-        let saved = std::env::var_os(ENABLE_ENV);
-        let mut seen = Vec::new();
-        for value in [None, Some("0"), Some("1"), Some("true"), Some("yes")] {
-            // SAFETY: the process-state lock serialises environment edits.
-            match value {
-                Some(value) => unsafe { std::env::set_var(ENABLE_ENV, value) },
-                None => unsafe { std::env::remove_var(ENABLE_ENV) },
-            }
-            seen.push(enabled());
-        }
-        match saved {
-            Some(value) => unsafe { std::env::set_var(ENABLE_ENV, value) },
-            None => unsafe { std::env::remove_var(ENABLE_ENV) },
-        }
-        assert_eq!(seen, [false, false, true, true, false]);
     }
 }

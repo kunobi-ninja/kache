@@ -436,7 +436,7 @@ fn open_primary_and_fallback_skips_fallback_when_unmapped() {
     let (_, fallback) =
         super::open_primary_and_fallback(&cfg, Path::new("/unmapped/out.rlib")).unwrap();
     assert!(
-        fallback.is_none(),
+        fallback.is_empty(),
         "the main store must not open itself as a fallback"
     );
 }
@@ -449,15 +449,21 @@ fn lookup_local_entry_prefers_primary_then_falls_back() {
     let primary = Store::open(&primary_cfg).unwrap();
     let fallback = Store::open(&main_cfg).unwrap();
     put_test_entry(&fallback, dir.path(), "vol-fallback-key");
-    let miss = super::lookup_local_entry(&primary, Some(&fallback), "no-such-key").unwrap();
+    let miss = super::lookup_local_entry(&primary, std::slice::from_ref(&fallback), "no-such-key")
+        .unwrap();
     assert!(miss.is_none());
-    let hit = super::lookup_local_entry(&primary, Some(&fallback), "vol-fallback-key")
-        .unwrap()
-        .expect("fallback must serve a key the shard does not have");
+    let hit = super::lookup_local_entry(
+        &primary,
+        std::slice::from_ref(&fallback),
+        "vol-fallback-key",
+    )
+    .unwrap()
+    .expect("fallback must serve a key the shard does not have");
     assert_eq!(hit.1.crate_name, "test-crate");
     put_test_entry(&primary, dir.path(), "vol-primary-key");
     let primary_hit =
-        super::lookup_local_entry(&primary, Some(&fallback), "vol-primary-key").unwrap();
+        super::lookup_local_entry(&primary, std::slice::from_ref(&fallback), "vol-primary-key")
+            .unwrap();
     assert!(primary_hit.is_some());
 }
 
@@ -1543,6 +1549,12 @@ fn compile_before_key_needs_a_local_store() {
         "fallback store"
     );
     config.fallback = None;
+    config.readonly_store = Some(PathBuf::from("/srv/host-store"));
+    assert!(
+        !deferral_allowed(&config, &cargo_like, false, None),
+        "a read-only store may hold the entry: key before compiling"
+    );
+    config.readonly_store = None;
     config.remote = Some(crate::config::RemoteConfig::test_s3("bucket", "artifacts"));
     assert!(
         !deferral_allowed(&config, &cargo_like, false, None),
@@ -6423,7 +6435,7 @@ fn local_hit_demand_reaches_event_without_remote_wait() {
     put_test_entry(&store, dir.path(), "local-demand-key");
     let before = chrono::Utc::now().timestamp_millis() as u64;
     assert!(
-        lookup_local_entry(&store, None, "local-demand-key")
+        lookup_local_entry(&store, &[], "local-demand-key")
             .unwrap()
             .is_some()
     );
@@ -9367,4 +9379,120 @@ fn a_passthrough_reason_is_classified_on_the_event() {
             .get("miss_reason")
             .is_none()
     );
+}
+
+// ---- read-only store ------------------------------------------------------
+
+/// `readonly_store` adds the other store, opened read-only, after this
+/// process's own; never this process's own store, and nothing when unset or
+/// when it cannot be opened.
+#[test]
+fn readonly_store_is_opened_read_only_after_the_own_store() {
+    let host = tempfile::tempdir().unwrap();
+    let host_store = Store::open(&test_config(host.path().to_path_buf())).unwrap();
+    let job = tempfile::tempdir().unwrap();
+    let mut cfg = test_config(job.path().to_path_buf());
+    let route = Path::new("/unmapped/out.rlib");
+
+    cfg.readonly_store = Some(host.path().to_path_buf());
+    let (primary, fallbacks) = super::open_primary_and_fallback(&cfg, route).unwrap();
+    assert!(
+        !primary.is_read_only(),
+        "the job's own store stays the one it writes"
+    );
+    assert_eq!(fallbacks.len(), 1);
+    assert!(fallbacks[0].is_read_only());
+
+    cfg.readonly_store = Some(job.path().to_path_buf());
+    let (_, fallbacks) = super::open_primary_and_fallback(&cfg, route).unwrap();
+    assert!(
+        fallbacks.is_empty(),
+        "a store is never its own read-only fallback"
+    );
+
+    cfg.readonly_store = Some(host.path().join("missing"));
+    let (_, fallbacks) = super::open_primary_and_fallback(&cfg, route).unwrap();
+    assert!(
+        fallbacks.is_empty(),
+        "a store that cannot be opened is no tier"
+    );
+    assert!(!host.path().join("missing").exists());
+
+    cfg.readonly_store = None;
+    let (_, fallbacks) = super::open_primary_and_fallback(&cfg, route).unwrap();
+    assert!(fallbacks.is_empty());
+    drop(host_store);
+}
+
+/// The own store answers first; the read-only store serves what it lacks.
+#[test]
+fn lookup_local_entry_reads_the_readonly_store_last() {
+    let dir = tempfile::tempdir().unwrap();
+    let own = Store::open(&test_config(dir.path().join("own"))).unwrap();
+    let host_cfg = test_config(dir.path().join("host"));
+    let host = Store::open(&host_cfg).unwrap();
+    put_test_entry(&host, dir.path(), "host-key");
+    put_test_entry(&host, dir.path(), "both-key");
+    put_test_entry(&own, dir.path(), "both-key");
+    let readonly = [Store::open_read_only(&host_cfg).unwrap()];
+
+    let (store, _) = super::lookup_local_entry(&own, &readonly, "host-key")
+        .unwrap()
+        .expect("served from the read-only store");
+    assert!(store.is_read_only());
+    let (store, _) = super::lookup_local_entry(&own, &readonly, "both-key")
+        .unwrap()
+        .expect("served from the own store");
+    assert!(!store.is_read_only());
+    assert!(
+        super::lookup_local_entry(&own, &readonly, "no-key")
+            .unwrap()
+            .is_none()
+    );
+}
+
+/// A hit from a read-only store is restored as a private copy: the target
+/// never shares the other store's blob inode, even for an rlib, which a hit
+/// from the own store hardlinks.
+#[cfg(unix)]
+#[test]
+fn a_read_only_store_restores_by_copy() {
+    use std::os::unix::fs::MetadataExt;
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path().join("cache"));
+    let owner = Store::open(&config).unwrap();
+    let hash = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    create_blob(&owner, hash, b"rlib bytes");
+    let readonly = Store::open_read_only(&config).unwrap();
+    let cached = cached_file("libfoo.rlib", hash);
+    let platform = platform::current();
+    let restore = |store: &Store, target: &Path| {
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        materialize_cached_artifact(
+            store,
+            &cached,
+            target,
+            ArtifactKind::Library,
+            None,
+            dir.path(),
+            dir.path(),
+            None,
+            &[],
+            &*platform,
+            "test restore",
+            None,
+        )
+        .unwrap();
+    };
+    let blob = owner.blob_path(hash);
+
+    let from_readonly = dir.path().join("t1").join("libfoo.rlib");
+    restore(&readonly, &from_readonly);
+    assert_eq!(std::fs::read(&from_readonly).unwrap(), b"rlib bytes");
+    assert_ne!(
+        std::fs::metadata(&from_readonly).unwrap().ino(),
+        std::fs::metadata(&blob).unwrap().ino(),
+        "a read-only store's blob is never hardlinked into a target"
+    );
+    assert_eq!(std::fs::metadata(&blob).unwrap().nlink(), 1);
 }

@@ -1148,6 +1148,8 @@ pub struct ArtifactStore<P: ArtifactPolicy> {
     /// Write slice and pause for eviction sweeps: [`EVICTION_WRITE_SLICE`]
     /// and [`EVICTION_WRITE_PAUSE`] outside tests.
     eviction_pacing: (Duration, Duration),
+    /// Opened by [`Self::open_read_only`]: lookups and restores only.
+    read_only: bool,
 }
 
 /// How recently an entry must have been accessed for eviction to treat it as
@@ -2112,6 +2114,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             config: config.clone(),
             db,
             eviction_pacing: (EVICTION_WRITE_SLICE, EVICTION_WRITE_PAUSE),
+            read_only: false,
         };
 
         // A quarantined index comes back empty, but the blobs and every entry's
@@ -2140,6 +2143,114 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         }
 
         Ok(store)
+    }
+
+    /// Open another process's store for lookups and restores only. Nothing is
+    /// written: not the index, its `-wal` or `-shm`, a blob, an entry or a
+    /// directory. This is for a store on a read-only mount, such as a CI
+    /// container given the host's store through a `:ro` volume, where
+    /// [`Self::open`] fails because it creates directories and opens the index
+    /// read-write.
+    ///
+    /// A WAL-mode index is opened only while its owner keeps `index.db-wal` and
+    /// `index.db-shm` in place. A read-only connection on a writable directory
+    /// would create them, so a store whose owner has gone is refused instead.
+    ///
+    /// On such a store [`Self::get`] stamps no hit and evicts or migrates
+    /// nothing (a damaged or legacy entry is a miss), and every method that
+    /// would change the store returns an error. The thread's durability policy,
+    /// which [`Self::open`] sets, is left alone.
+    pub fn open_read_only(config: impl Into<Config>) -> Result<Self> {
+        let config = config.into();
+        let db_path = config.index_db_path();
+        let mut header = [0u8; 20];
+        {
+            use std::io::Read;
+            let mut file = fs::File::open(&db_path)
+                .with_context(|| format!("read-only store: no index at {}", db_path.display()))?;
+            file.read_exact(&mut header).with_context(|| {
+                format!(
+                    "read-only store: reading the header of {}",
+                    db_path.display()
+                )
+            })?;
+        }
+        // Byte 18 of the SQLite header is the file format write version: 2 is WAL.
+        if header[18] == 2 {
+            for suffix in ["-wal", "-shm"] {
+                let mut side = db_path.clone().into_os_string();
+                side.push(suffix);
+                let side = PathBuf::from(side);
+                if !side.is_file() {
+                    anyhow::bail!(
+                        "read-only store: {} is in WAL mode and {} is missing, so its owner is not \
+                         running; a read-only open would create it",
+                        db_path.display(),
+                        side.display()
+                    );
+                }
+            }
+        }
+        let db = open_index_db_readonly(&db_path)?;
+        db.busy_timeout(Duration::from_secs(2))?;
+        // An index that cannot be read fails here, once, not as a miss per unit.
+        db.query_row("SELECT 1 FROM entries LIMIT 1", [], |_| Ok(()))
+            .optional()
+            .with_context(|| format!("read-only store: querying {}", db_path.display()))?;
+        Ok(Self {
+            policy: std::marker::PhantomData,
+            config,
+            db,
+            eviction_pacing: (EVICTION_WRITE_SLICE, EVICTION_WRITE_PAUSE),
+            read_only: true,
+        })
+    }
+
+    /// Whether this store was opened by [`Self::open_read_only`].
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
+    }
+
+    fn refuse_write(&self, what: &str) -> Result<()> {
+        if self.read_only {
+            anyhow::bail!(
+                "read-only store {}: refusing to {what}",
+                self.config.cache_dir.display()
+            );
+        }
+        Ok(())
+    }
+
+    /// [`Self::get`] on a read-only store: the same checks. What the read-write
+    /// path would repair (evict a damaged entry, migrate a legacy one) is a
+    /// miss, and no hit is stamped.
+    fn get_read_only(&self, cache_key: &str) -> Result<Option<EntryMeta>> {
+        if !self.contains(cache_key) {
+            return Ok(None);
+        }
+        let entry_dir = self.entry_dir(cache_key);
+        // The owner may evict the entry between the two reads: a miss.
+        let Ok(content) = fs::read_to_string(entry_dir.join("meta.json")) else {
+            return Ok(None);
+        };
+        let meta: EntryMeta = serde_json::from_str(&content).context("parsing entry meta.json")?;
+        if meta.files.iter().any(|f| entry_dir.join(&f.name).exists()) {
+            return Ok(None);
+        }
+        let verify_content =
+            !self.entry_is_durable(cache_key) || should_verify_this_restore(verify_restores_mode());
+        for cached_file in &meta.files {
+            let blob = self.blob_path(&cached_file.hash);
+            if validate_blob_metadata(&blob, cached_file.size).is_err() {
+                return Ok(None);
+            }
+            if verify_content
+                && !matches!(crate::file_hash::hash_file(&blob), Ok(ref h) if *h == cached_file.hash)
+            {
+                return Ok(None);
+            }
+        }
+        Ok(Some(meta))
     }
 
     /// Persistent-cache lookup for one file's content hash — DB read only, no
@@ -2241,6 +2352,9 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
 
     /// Load metadata for a cached entry and record a hit.
     pub fn get(&self, cache_key: &str) -> Result<Option<EntryMeta>> {
+        if self.read_only {
+            return self.get_read_only(cache_key);
+        }
         if !self.contains(cache_key) {
             // If we previously evicted this key, this miss is the demand
             // signal an eviction policy needs and a live-store snapshot can
@@ -2523,6 +2637,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         compile_time_ms: u64,
         allow_source_hardlinks: bool,
     ) -> Result<StorePutResult> {
+        self.refuse_write("store an entry")?;
         let entry_dir = self.entry_dir(cache_key);
 
         // Phase 1: stage every output into a private snapshot and hash THE
@@ -2735,6 +2850,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     /// store and records them in the `blobs` table, leaving only
     /// `meta.json` in the entry directory.
     pub fn import_downloaded_entry(&self, cache_key: &str) -> Result<()> {
+        self.refuse_write("import an entry")?;
         let entry_dir = self.entry_dir(cache_key);
         let meta_path = entry_dir.join("meta.json");
         let content = fs::read_to_string(&meta_path).context("reading downloaded meta.json")?;
@@ -2902,6 +3018,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     /// serialized with Store publishers and preserves any committed generation
     /// that won the race.
     pub fn import_restored_entry(&self, cache_key: &str) -> Result<()> {
+        self.refuse_write("import an entry")?;
         match self.import_downloaded_entry(cache_key) {
             Ok(()) => Ok(()),
             Err(import_error) => match self.discard_uncommitted_restored_entry(cache_key) {
@@ -2995,6 +3112,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         &self,
         entries: &[VerifiedRestoredEntry],
     ) -> Result<usize> {
+        self.refuse_write("import entries")?;
         let mut cache_keys = std::collections::HashSet::new();
         for entry in entries {
             if !kache_format::is_valid_cache_key(&entry.cache_key)
@@ -3423,6 +3541,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     /// recovery cost hours. `doctor --verify --checksums` remains the surface
     /// for content verification.
     pub fn rebuild_index_from_store(&self) -> Result<RebuildStats> {
+        self.refuse_write("rebuild the index")?;
         let store_dir = self.config.store_dir();
         let mut stats = RebuildStats::default();
 
@@ -4205,6 +4324,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     /// with no row for (crate name, unit) holds no key the unit can produce;
     /// the crate-presence probe behind deferred discovery reads it.
     pub fn record_entry_unit(&self, cache_key: &str, unit: &str) -> Result<()> {
+        self.refuse_write("record a unit")?;
         if unit.is_empty() {
             return Ok(());
         }
@@ -4885,6 +5005,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
 
     /// [`Self::evict`] for a sweep started by `origin`.
     pub fn evict_for(&self, origin: SweepOrigin) -> Result<GcStats> {
+        self.refuse_write("evict")?;
         let target = crate::eviction::eviction_target(self.config.max_size);
         // Trigger, budget, and stop condition are all physical bytes on disk
         // (`SUM(blobs.size)`), not the logical `SUM(entries.size)`: on a
@@ -4915,6 +5036,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     /// Recent accesses, imports, upload intents and external retainers keep
     /// the same protection as other automatic sweeps.
     pub fn evict_for_disk_pressure(&self, mut stop: impl FnMut() -> bool) -> Result<GcStats> {
+        self.refuse_write("evict")?;
         if stop() {
             return Ok(GcStats::default());
         }
@@ -4928,6 +5050,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
 
     /// Evict entries older than the given duration.
     pub fn evict_older_than(&self, hours: u64) -> Result<GcStats> {
+        self.refuse_write("evict")?;
         self.evict_with(
             &crate::eviction::OlderThanPolicy { hours },
             None,
@@ -4943,6 +5066,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     /// discard a still-reachable cache merely because its metadata predates
     /// this field. `kache gc --stale-schema` is the user's opt-in boundary.
     pub fn evict_stale_key_schemas(&self, current_schema: u32) -> Result<GcStats> {
+        self.refuse_write("evict")?;
         let keys = {
             let mut stmt = self.db.prepare(
                 "SELECT cache_key FROM entries
@@ -4986,6 +5110,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
 
     /// [`Self::evict_duplicate_entries`] for a sweep started by `origin`.
     pub fn evict_duplicate_entries_for(&self, origin: SweepOrigin) -> Result<GcStats> {
+        self.refuse_write("evict")?;
         let size_before = self.physical_size()?;
         if !crate::eviction::over_eviction_trigger(size_before, self.config.max_size) {
             return Ok(GcStats {
@@ -5561,6 +5686,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         after_meta_read: impl FnOnce(),
         before_dir_cleanup: impl FnOnce(),
     ) -> Result<GuardedRemoval> {
+        self.refuse_write("remove an entry")?;
         // Boxed so the republication-retry loop below stays non-generic; the
         // production closures are zero-sized, so no allocation happens.
         let mut after_meta_read: Option<Box<dyn FnOnce() + '_>> = Some(Box::new(after_meta_read));
@@ -6012,6 +6138,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     /// at worst lands stranded — the refuse-removal / miss / re-put
     /// path that already recovers it.
     pub fn clear(&self) -> Result<()> {
+        self.refuse_write("clear the store")?;
         let drop_index_rows = || -> Result<()> {
             let tx = self.db.unchecked_transaction()?;
             tx.execute("DELETE FROM entries", [])?;
@@ -6165,6 +6292,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
 
     /// Bulk-migrate all legacy entries' artifacts into the blob store.
     pub fn migrate_to_blobs(&self, progress: impl Fn(usize, usize)) -> Result<MigrationStats> {
+        self.refuse_write("migrate entries")?;
         let store_dir = self.config.store_dir();
         let mut stats = MigrationStats::default();
 

@@ -12125,3 +12125,263 @@ fn lists_indexed_blobs_from_a_size_up() {
     );
     assert!(store.blobs_at_least(u64::MAX).unwrap().is_empty());
 }
+
+// ---- read-only store ------------------------------------------------------
+
+/// Every path under `dir` with its length, mtime and bytes. `index.db-shm` is
+/// compared by presence and length only: it is the WAL index in shared memory,
+/// and inside one process a second connection maps it through the owner's
+/// writable mapping.
+fn ro_tree_snapshot(dir: &Path) -> Vec<(PathBuf, u64, Option<std::time::SystemTime>, Vec<u8>)> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for e in fs::read_dir(&d).unwrap() {
+            let p = e.unwrap().path();
+            let m = fs::symlink_metadata(&p).unwrap();
+            if m.is_dir() {
+                out.push((p.clone(), 0, Some(m.modified().unwrap()), Vec::new()));
+                stack.push(p);
+            } else if p.to_string_lossy().ends_with("-shm") {
+                out.push((p.clone(), m.len(), None, Vec::new()));
+            } else {
+                let bytes = fs::read(&p).unwrap();
+                out.push((p.clone(), m.len(), Some(m.modified().unwrap()), bytes));
+            }
+        }
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+fn ro_put(store: &Store, src: &Path, key: &str, bytes: &[u8]) {
+    let out = src.join(format!("{key}.rlib"));
+    fs::write(&out, bytes).unwrap();
+    store
+        .put(
+            key,
+            "ro_crate",
+            &["lib".to_string()],
+            &[],
+            "x86_64-unknown-linux-gnu",
+            "dev",
+            &[(out, format!("lib{key}.rlib"))],
+            "",
+            "",
+        )
+        .unwrap();
+}
+
+/// A read-only store serves a committed entry, refuses every method that would
+/// change the store, and leaves the store directory byte for byte as it was.
+#[test]
+fn read_only_store_serves_hits_and_writes_nothing() {
+    let _env_lock = crate::test_support::process_state_test_lock();
+    let _verify = EnvVarGuard::set("KACHE_VERIFY_RESTORES", "always");
+    let dir = tempfile::tempdir().unwrap();
+    let src = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let owner = Store::open(&config).unwrap();
+    ro_put(&owner, src.path(), "rokey1", b"read-only bytes");
+    // An old stamp: a read-write hit would write a new one.
+    owner.set_last_accessed_for_test("rokey1", "-1 hour");
+    let before = ro_tree_snapshot(dir.path());
+
+    let ro = Store::open_read_only(&config).unwrap();
+    assert!(ro.is_read_only());
+    assert!(!owner.is_read_only());
+    let meta = ro
+        .get("rokey1")
+        .unwrap()
+        .expect("a committed entry is a hit");
+    assert_eq!(meta.crate_name, "ro_crate");
+    assert!(ro.get("absent").unwrap().is_none());
+
+    let other = src.path().join("other.rlib");
+    fs::write(&other, b"x").unwrap();
+    let refusals: Vec<(&str, bool)> = vec![
+        (
+            "put",
+            ro.put(
+                "rokey2",
+                "c",
+                &["lib".to_string()],
+                &[],
+                "t",
+                "dev",
+                &[(other.clone(), "libc.rlib".to_string())],
+                "",
+                "",
+            )
+            .is_err(),
+        ),
+        (
+            "import_downloaded_entry",
+            ro.import_downloaded_entry("rokey1").is_err(),
+        ),
+        (
+            "import_restored_entry",
+            ro.import_restored_entry("rokey1").is_err(),
+        ),
+        (
+            "import_verified_restored_entries",
+            ro.import_verified_restored_entries(&[]).is_err(),
+        ),
+        (
+            "rebuild_index_from_store",
+            ro.rebuild_index_from_store().is_err(),
+        ),
+        (
+            "record_entry_unit",
+            ro.record_entry_unit("rokey1", "unit").is_err(),
+        ),
+        ("remove_entry", ro.remove_entry("rokey1").is_err()),
+        ("evict", ro.evict().is_err()),
+        (
+            "evict_for_disk_pressure",
+            ro.evict_for_disk_pressure(|| false).is_err(),
+        ),
+        ("evict_older_than", ro.evict_older_than(0).is_err()),
+        (
+            "evict_stale_key_schemas",
+            ro.evict_stale_key_schemas(0).is_err(),
+        ),
+        (
+            "evict_duplicate_entries",
+            ro.evict_duplicate_entries().is_err(),
+        ),
+        ("clear", ro.clear().is_err()),
+        ("migrate_to_blobs", ro.migrate_to_blobs(|_, _| {}).is_err()),
+    ];
+    for (name, refused) in refusals {
+        assert!(refused, "{name} must be refused on a read-only store");
+    }
+    // The file-hash memo writers are best-effort; on a read-only connection
+    // they write nothing.
+    ro.record_known_file_hash(&other, "00");
+    drop(ro);
+
+    assert_eq!(
+        ro_tree_snapshot(dir.path()),
+        before,
+        "a read-only store wrote to the store directory"
+    );
+    assert!(owner.contains("rokey1"));
+    assert!(!owner.contains("rokey2"));
+}
+
+#[test]
+fn read_only_store_sees_entries_committed_after_it_opened() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let owner = Store::open(&config).unwrap();
+    ro_put(&owner, src.path(), "early", b"1");
+    let ro = Store::open_read_only(&config).unwrap();
+    assert!(ro.get("late").unwrap().is_none());
+    ro_put(&owner, src.path(), "late", b"2");
+    assert!(
+        ro.get("late").unwrap().is_some(),
+        "a later commit of the owner is visible"
+    );
+}
+
+#[test]
+fn read_only_store_refuses_without_a_live_index_and_creates_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("nope");
+    assert!(Store::open_read_only(test_config(&missing)).is_err());
+    assert!(!missing.exists(), "no directory is created");
+
+    let config = test_config(dir.path());
+    {
+        let owner = Store::open(&config).unwrap();
+        ro_put(&owner, src.path(), "k", b"bytes");
+    }
+    // The owner has gone: its index has no live -wal and -shm.
+    for side in ["index.db-wal", "index.db-shm"] {
+        let _ = fs::remove_file(dir.path().join(side));
+    }
+    let before = ro_tree_snapshot(dir.path());
+    let err = Store::open_read_only(&config)
+        .err()
+        .expect("refused")
+        .to_string();
+    assert!(err.contains("WAL mode"), "{err}");
+    assert_eq!(
+        ro_tree_snapshot(dir.path()),
+        before,
+        "the refusal created nothing"
+    );
+}
+
+/// A blob of the wrong size is a miss, and the entry is not evicted.
+#[test]
+fn read_only_store_treats_a_truncated_blob_as_a_miss_and_evicts_nothing() {
+    use std::os::unix::fs::PermissionsExt;
+    let _env_lock = crate::test_support::process_state_test_lock();
+    let _verify = EnvVarGuard::remove("KACHE_VERIFY_RESTORES");
+    let dir = tempfile::tempdir().unwrap();
+    let src = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let owner = Store::open(&config).unwrap();
+    ro_put(&owner, src.path(), "dmg", b"artifact-bytes");
+    let meta = owner.stored_meta("dmg").unwrap();
+    let blob = owner.blob_path(&meta.files[0].hash);
+    fs::set_permissions(&blob, fs::Permissions::from_mode(0o644)).unwrap();
+    fs::write(&blob, b"short").unwrap();
+
+    let ro = Store::open_read_only(&config).unwrap();
+    assert!(ro.get("dmg").unwrap().is_none(), "a damaged blob is a miss");
+    assert!(owner.contains("dmg"), "and the entry is not evicted");
+    assert_eq!(fs::read(&blob).unwrap(), b"short", "nor the blob touched");
+}
+
+/// A blob of the right size with other bytes is a miss when restores are
+/// verified, and served when they are not, as on the read-write path.
+#[test]
+fn read_only_store_verifies_content_as_configured() {
+    use std::os::unix::fs::PermissionsExt;
+    let _env_lock = crate::test_support::process_state_test_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let src = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let owner = Store::open(&config).unwrap();
+    ro_put(&owner, src.path(), "flip", b"artifact-bytes");
+    let meta = owner.stored_meta("flip").unwrap();
+    let blob = owner.blob_path(&meta.files[0].hash);
+    fs::set_permissions(&blob, fs::Permissions::from_mode(0o644)).unwrap();
+    fs::write(&blob, b"ARTIFACT-BYTES").unwrap();
+    let ro = Store::open_read_only(&config).unwrap();
+    {
+        let _verify = EnvVarGuard::set("KACHE_VERIFY_RESTORES", "always");
+        assert!(
+            ro.get("flip").unwrap().is_none(),
+            "verified: other bytes are a miss"
+        );
+    }
+    let _verify = EnvVarGuard::set("KACHE_VERIFY_RESTORES", "off");
+    assert!(
+        ro.get("flip").unwrap().is_some(),
+        "unverified: the size check passes"
+    );
+}
+
+/// An entry still in the legacy layout (artifacts beside `meta.json`) would be
+/// migrated by a read-write hit. Read-only, it is a miss and stays as it is.
+#[test]
+fn read_only_store_treats_a_legacy_entry_as_a_miss() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let owner = Store::open(&config).unwrap();
+    ro_put(&owner, src.path(), "legacy", b"artifact-bytes");
+    let meta = owner.stored_meta("legacy").unwrap();
+    let beside = owner.entry_dir("legacy").join(&meta.files[0].name);
+    fs::write(&beside, b"artifact-bytes").unwrap();
+
+    let ro = Store::open_read_only(&config).unwrap();
+    assert!(ro.get("legacy").unwrap().is_none());
+    assert!(beside.exists(), "nothing was migrated");
+}

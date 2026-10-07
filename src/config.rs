@@ -370,6 +370,13 @@ pub struct Config {
     /// this on. `KACHE_REMOTE_READONLY=0` does not disable that. See
     /// [`crate::policy`].
     pub remote_readonly: bool,
+    /// Another local store this process only reads, after its own: the
+    /// directory that holds that store's `index.db`. For a CI container given
+    /// the host's store through a read-only mount. A hit there is restored by
+    /// copy and nothing is written to that store. Set via
+    /// `KACHE_READONLY_STORE` or `[cache] readonly_store`; env wins over the
+    /// file, and an empty value turns it off.
+    pub readonly_store: Option<PathBuf>,
     /// The prefix this pull request job writes to and reads from after the
     /// base prefix: `[cache.remote] pull_request_prefix` or
     /// `KACHE_PULL_REQUEST_PREFIX`, resolved only in a pull request job
@@ -833,6 +840,8 @@ pub(crate) struct CacheFileConfig {
     pub(crate) local_store: Option<String>,
     /// Job/process-lifetime state, separate from the persistent local store.
     pub(crate) runtime_dir: Option<String>,
+    /// Another store read after the local one. See [`Config::readonly_store`].
+    pub(crate) readonly_store: Option<String>,
     pub(crate) local_max_size: Option<String>,
     pub(crate) remote: Option<RemoteFileConfig>,
     pub(crate) planner: Option<PlannerFileConfig>,
@@ -1249,6 +1258,7 @@ fn normalize_base_dirs(raw: impl IntoIterator<Item = String>) -> Result<Vec<Stri
 const IGNORE_ENV_GATED_VARS: &[&str] = &[
     "KACHE_CACHE_DIR",
     "KACHE_RUNTIME_DIR",
+    "KACHE_READONLY_STORE",
     "KACHE_MAX_SIZE",
     "KACHE_CACHE_EXECUTABLES",
     "KACHE_CACHE_CC_LINKS",
@@ -1321,6 +1331,7 @@ const IGNORE_ENV_GATED_VARS: &[&str] = &[
 const ENV_FILE_KEYS: &[(&str, &str)] = &[
     ("KACHE_CACHE_DIR", "cache.local_store"),
     ("KACHE_RUNTIME_DIR", "cache.runtime_dir"),
+    ("KACHE_READONLY_STORE", "cache.readonly_store"),
     ("KACHE_MAX_SIZE", "cache.local_max_size"),
     ("KACHE_CACHE_EXECUTABLES", "cache.cache_executables"),
     ("KACHE_CACHE_CC_LINKS", "cache.cache_cc_links"),
@@ -1518,6 +1529,18 @@ impl Config {
                     .ok_or(())
             })
             .unwrap_or_else(|_| default_cache_dir());
+
+        let readonly_store = env_or_ignored("KACHE_READONLY_STORE", ignore_env)
+            .ok()
+            .or_else(|| {
+                file_config
+                    .as_ref()
+                    .ok()
+                    .and_then(|c| c.cache.as_ref())
+                    .and_then(|c| c.readonly_store.clone())
+            })
+            .filter(|s| !s.is_empty())
+            .map(|s| shellexpand(&s));
 
         // Keep the historical single-directory layout unless explicitly split.
         // Resolve this once alongside `cache_dir`: wrappers and their daemon must
@@ -2063,6 +2086,7 @@ impl Config {
             disabled,
             local_only,
             remote_readonly,
+            readonly_store,
             pull_request_prefix,
             modified_input_guard,
             input_predictions,

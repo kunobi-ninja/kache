@@ -499,6 +499,7 @@ mod tests {
         remote: Option<crate::config::RemoteConfig>,
     ) -> Config {
         Config {
+            readonly_store: None,
             remote_error: None,
             socket_path_override: None,
             fallback: None,

@@ -3602,6 +3602,7 @@ fn save_manifest_config(
         cc_extra_allowlist_flags: Vec::new(),
         local_only: false,
         remote_readonly: false,
+        readonly_store: None,
         pull_request_prefix: None,
         modified_input_guard: false,
         input_predictions: false,

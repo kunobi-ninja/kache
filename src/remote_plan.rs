@@ -66,6 +66,7 @@ mod tests {
 
     fn test_config() -> Config {
         Config {
+            readonly_store: None,
             fallback: None,
             key_salt: None,
             cc_extra_allowlist_flags: Vec::new(),

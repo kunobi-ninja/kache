@@ -12536,7 +12536,7 @@ fn read_only_hash_memo_writers_leave_the_index_and_timeout_untouched() {
         owner.file_hash_lookup(&artifact),
         crate::file_hash::FileHashLookup::NeedsHash(_)
     ));
-    let timeout: u64 = ro
+    let timeout: i64 = ro
         .db
         .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
         .unwrap();

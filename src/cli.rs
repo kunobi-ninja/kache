@@ -4735,8 +4735,9 @@ pub fn clean(
         }
         CleanScope::Tracked(selection) => (std::env::current_dir()?, Some(*selection)),
     };
+    let preview = dry_run || (json && !yes);
     let (mut targets, skipped, orphans) = if let Some(selection) = selection {
-        tracked_target_entries(config, selection)?
+        tracked_target_entries(config, selection, preview)?
     } else {
         let mut targets = Vec::new();
         find_target_dirs_in(&root, &mut targets);
@@ -5591,12 +5592,26 @@ pub(crate) fn workspace_is_gone(workspace_root: &std::path::Path) -> bool {
 fn tracked_target_entries(
     config: &Config,
     selection: TrackedSelection,
+    preview: bool,
 ) -> Result<(
     Vec<TargetEntry>,
     Vec<CleanSkipped>,
     std::collections::HashSet<std::path::PathBuf>,
 )> {
     let store = Store::open(config)?;
+    // Both explicit dry runs and JSON previews keep registry rows.
+    let forget = |path: &std::path::Path| {
+        if preview {
+            Ok(())
+        } else {
+            store.forget_target_root(path)
+        }
+    };
+    let registry_action = if preview {
+        "would be removed"
+    } else {
+        "removed"
+    };
     // Every tracked root: an orphan qualifies however recently it was seen.
     let tracked = store.tracked_target_roots(0)?;
     let now = kache_store::markers::now_epoch_secs() as i64;
@@ -5620,8 +5635,10 @@ fn tracked_target_entries(
             continue;
         }
         if !tracked.path.exists() {
-            skipped.push(skip("path no longer exists; registry entry removed"));
-            store.forget_target_root(&tracked.path)?;
+            skipped.push(skip(&format!(
+                "path no longer exists; registry entry {registry_action}"
+            )));
+            forget(&tracked.path)?;
             continue;
         }
         if cwd.starts_with(&tracked.workspace_root) {
@@ -5630,12 +5647,14 @@ fn tracked_target_entries(
         }
         if !crate::machine::target_root_is_safe(&tracked.path, &tracked.workspace_root) {
             skipped.push(skip("path is no longer a safe derived target directory"));
-            store.forget_target_root(&tracked.path)?;
+            forget(&tracked.path)?;
             continue;
         }
         if crate::machine::directory_identity(&tracked.path) != Some(tracked.identity) {
-            skipped.push(skip("directory identity changed; registry entry removed"));
-            store.forget_target_root(&tracked.path)?;
+            skipped.push(skip(&format!(
+                "directory identity changed; registry entry {registry_action}"
+            )));
+            forget(&tracked.path)?;
             continue;
         }
 

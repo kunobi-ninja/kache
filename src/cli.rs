@@ -4728,7 +4728,7 @@ pub fn clean(
         CleanScope::Tracked(selection) => (std::env::current_dir()?, Some(*selection)),
     };
     let (mut targets, skipped, orphans) = if let Some(selection) = selection {
-        tracked_target_entries(config, selection)?
+        tracked_target_entries(config, selection, dry_run)?
     } else {
         let mut targets = Vec::new();
         find_target_dirs_in(&root, &mut targets);
@@ -5583,12 +5583,21 @@ pub(crate) fn workspace_is_gone(workspace_root: &std::path::Path) -> bool {
 fn tracked_target_entries(
     config: &Config,
     selection: TrackedSelection,
+    dry_run: bool,
 ) -> Result<(
     Vec<TargetEntry>,
     Vec<CleanSkipped>,
     std::collections::HashSet<std::path::PathBuf>,
 )> {
     let store = Store::open(config)?;
+    // A dry run reports what it would forget and keeps the row.
+    let forget = |path: &std::path::Path| {
+        if dry_run {
+            Ok(())
+        } else {
+            store.forget_target_root(path)
+        }
+    };
     // Every tracked root: an orphan qualifies however recently it was seen.
     let tracked = store.tracked_target_roots(0)?;
     let now = kache_store::markers::now_epoch_secs() as i64;
@@ -5613,7 +5622,7 @@ fn tracked_target_entries(
         }
         if !tracked.path.exists() {
             skipped.push(skip("path no longer exists; registry entry removed"));
-            store.forget_target_root(&tracked.path)?;
+            forget(&tracked.path)?;
             continue;
         }
         if cwd.starts_with(&tracked.workspace_root) {
@@ -5622,12 +5631,12 @@ fn tracked_target_entries(
         }
         if !crate::machine::target_root_is_safe(&tracked.path, &tracked.workspace_root) {
             skipped.push(skip("path is no longer a safe derived target directory"));
-            store.forget_target_root(&tracked.path)?;
+            forget(&tracked.path)?;
             continue;
         }
         if crate::machine::directory_identity(&tracked.path) != Some(tracked.identity) {
             skipped.push(skip("directory identity changed; registry entry removed"));
-            store.forget_target_root(&tracked.path)?;
+            forget(&tracked.path)?;
             continue;
         }
 

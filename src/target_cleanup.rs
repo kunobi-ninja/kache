@@ -96,7 +96,9 @@ pub(crate) fn reason(config: &Config, orphaned: bool, idle_secs: i64) -> Option<
 /// is unknown, which keeps it from every time-based rule.
 pub(crate) fn idle_secs(cache_dir: &Path, tracked: &TrackedTargetRoot, now: i64) -> Option<i64> {
     if tracked.discovered {
-        idle_secs_local(tracked)?;
+        if !watch_counts(crate::cache_fs::probe(&tracked.path).is_local) {
+            return None;
+        }
         let unused = crate::unit_prune::unused_since(cache_dir, &tracked.path);
         return watched_idle(tracked, now, unused);
     }
@@ -211,18 +213,18 @@ pub(crate) fn sweep(config: &Config, now: u64) -> anyhow::Result<Swept> {
                 store.forget_target_root(&tracked.path)?;
                 continue;
             }
-            // A build holding it could keep a fingerprint from being armed.
-            if intact(&tracked) && !crate::cli::target_in_use(&tracked.path) {
-                let found = SystemTime::UNIX_EPOCH
-                    + Duration::from_secs(u64::try_from(tracked.first_seen).unwrap_or(0));
+            if should_watch(intact(&tracked), crate::cli::target_in_use(&tracked.path)) {
+                let found = found_at(tracked.first_seen);
                 crate::unit_prune::watch(&config.cache_dir, &tracked.path, at, found);
             }
         }
         let Some(idle) = idle_secs(&config.cache_dir, &tracked, now) else {
             continue;
         };
-        let orphaned =
-            !tracked.discovered && crate::cli::workspace_is_gone(&tracked.workspace_root);
+        let orphaned = orphaned(
+            &tracked,
+            crate::cli::workspace_is_gone(&tracked.workspace_root),
+        );
         let intact = intact(&tracked);
         let Some(reason) = reason(config, orphaned, idle) else {
             if let Some(window) = window.filter(|_| intact && !tracked.discovered) {
@@ -293,7 +295,10 @@ pub(crate) fn plan(config: &Config, tracked: &TrackedTargetRoot, now: u64) -> Pl
         return Plan::default();
     };
     let intact = intact(tracked);
-    let orphaned = !tracked.discovered && crate::cli::workspace_is_gone(&tracked.workspace_root);
+    let orphaned = orphaned(
+        tracked,
+        crate::cli::workspace_is_gone(&tracked.workspace_root),
+    );
     let reason = reason(config, orphaned, idle);
     if let Some(reason) = reason.filter(|_| intact && !crate::cli::target_in_use(&tracked.path)) {
         return Plan {
@@ -376,7 +381,7 @@ fn prune_under_pressure(
         };
         let pruned =
             crate::unit_prune::prune(&config.cache_dir, &tracked.path, PRESSURE_UNIT_WINDOW, at);
-        if pruned.used > 0 {
+        if kept_used(&pruned) {
             used.insert(tracked.path.clone());
         }
         if pruned.units == 0 {
@@ -407,16 +412,33 @@ struct PressureCandidate {
 /// compiling, which records it again, so it goes by the last build through
 /// kache alone; a discovered one holding none has nothing to observe and
 /// never qualifies.
-fn observed_idle(tracked: &TrackedTargetRoot, now: i64, unused: Option<SystemTime>) -> Option<i64> {
+fn observed_idle(
+    tracked: &TrackedTargetRoot,
+    now: i64,
+    unused: Option<SystemTime>,
+    local: bool,
+    has_units: bool,
+) -> Option<i64> {
     if tracked.discovered {
-        idle_secs_local(tracked)?;
-        return watched_idle(tracked, now, unused);
+        return local.then(|| watched_idle(tracked, now, unused)).flatten();
     }
     let recorded = now.saturating_sub(tracked.last_seen).max(0);
-    if crate::unit_prune::profiles(&tracked.path).is_empty() {
+    if !has_units {
         return Some(recorded);
     }
     Some(watched_idle(tracked, now, unused)?.min(recorded))
+}
+
+/// The filesystem facts [`observed_idle`] judges `tracked` by: whether a
+/// watch counts there, and whether it holds any unit.
+fn observed_idle_at(
+    tracked: &TrackedTargetRoot,
+    now: i64,
+    unused: Option<SystemTime>,
+) -> Option<i64> {
+    let local = watch_counts(crate::cache_fs::probe(&tracked.path).is_local);
+    let has_units = !crate::unit_prune::profiles(&tracked.path).is_empty();
+    observed_idle(tracked, now, unused, local, has_units)
 }
 
 /// Seconds since `unused`, the arming no build has used `tracked` since; for
@@ -433,9 +455,33 @@ fn watched_idle(tracked: &TrackedTargetRoot, now: i64, unused: Option<SystemTime
     Some(now.saturating_sub(since).max(0))
 }
 
-/// `Some(())` when `tracked` is on a local filesystem, where a watch counts.
-fn idle_secs_local(tracked: &TrackedTargetRoot) -> Option<()> {
-    (crate::cache_fs::probe(&tracked.path).is_local == Some(true)).then_some(())
+/// Whether a watch counts on a filesystem whose locality probe said
+/// `is_local`: only on one known to be local, where Cargo locks its build
+/// directories.
+fn watch_counts(is_local: Option<bool>) -> bool {
+    is_local == Some(true)
+}
+
+/// Whether to watch a discovered target: it is still the recorded target
+/// directory, and no build holds it, which could keep a fingerprint unarmed.
+fn should_watch(intact: bool, in_use: bool) -> bool {
+    intact && !in_use
+}
+
+/// When a target first seen at `first_seen` (Unix seconds) was found.
+fn found_at(first_seen: i64) -> SystemTime {
+    SystemTime::UNIX_EPOCH + Duration::from_secs(u64::try_from(first_seen).unwrap_or(0))
+}
+
+/// Whether a target whose workspace `gone` counts as orphaned: only a recorded
+/// one, since Git discovery saw no build there.
+fn orphaned(tracked: &TrackedTargetRoot, gone: bool) -> bool {
+    !tracked.discovered && gone
+}
+
+/// Whether pressure pruning kept a unit because a build used it.
+fn kept_used(pruned: &crate::unit_prune::Pruned) -> bool {
+    pruned.used > 0
 }
 
 /// The daemon's whole-target pressure policy, also used by `kache targets`
@@ -451,7 +497,7 @@ fn pressure_eligible_with(
     now: i64,
     unused: Option<SystemTime>,
 ) -> bool {
-    observed_idle(tracked, now, unused).is_some_and(|idle| idle >= DAY_SECS as i64)
+    observed_idle_at(tracked, now, unused).is_some_and(|idle| idle >= DAY_SECS as i64)
         && under_pressure(config, tracked)
         && intact(tracked)
         && !crate::cli::target_in_use(&tracked.path)
@@ -485,7 +531,7 @@ fn recover_under_pressure(
         if reclaimable == 0 {
             continue;
         }
-        let idle = observed_idle(&tracked, now, since).unwrap_or(0);
+        let idle = observed_idle_at(&tracked, now, since).unwrap_or(0);
         candidates.push(PressureCandidate {
             path: tracked.path,
             workspace_root: tracked.workspace_root,
@@ -1046,6 +1092,110 @@ mod tests {
         .unwrap();
         assert!(sweep(&idle, later).unwrap().removed.is_empty());
         assert!(store.tracked_target_roots(0).unwrap().is_empty());
+    }
+
+    fn row(discovered: bool, first_seen: i64, last_seen: i64) -> TrackedTargetRoot {
+        TrackedTargetRoot {
+            path: PathBuf::from("/w/target"),
+            workspace_root: PathBuf::from("/w"),
+            first_seen,
+            last_seen,
+            identity: crate::machine::PathIdentity {
+                device: 1,
+                inode: 2,
+            },
+            rustc: None,
+            discovered,
+        }
+    }
+
+    fn at(secs: i64) -> Option<SystemTime> {
+        Some(SystemTime::UNIX_EPOCH + Duration::from_secs(secs as u64))
+    }
+
+    #[test]
+    fn the_watch_decisions() {
+        assert!(watch_counts(Some(true)));
+        assert!(!watch_counts(Some(false)));
+        assert!(!watch_counts(None), "an unknown filesystem does not count");
+
+        assert!(should_watch(true, false));
+        assert!(!should_watch(false, false), "not the recorded target");
+        assert!(!should_watch(true, true), "a build holds it");
+
+        assert_eq!(
+            found_at(100),
+            SystemTime::UNIX_EPOCH + Duration::from_secs(100)
+        );
+        assert_eq!(found_at(-5), SystemTime::UNIX_EPOCH);
+
+        assert!(orphaned(&row(false, 0, 0), true));
+        assert!(!orphaned(&row(false, 0, 0), false));
+        assert!(!orphaned(&row(true, 0, 0), true), "discovery saw no build");
+
+        let mut pruned = crate::unit_prune::Pruned::default();
+        assert!(!kept_used(&pruned));
+        pruned.used = 1;
+        assert!(kept_used(&pruned));
+    }
+
+    #[test]
+    fn a_watch_counts_from_when_it_began_after_the_target_was_found() {
+        let now = 10_000;
+        // Discovered: an arming before the directory was found is someone
+        // else's; at or after, idle runs from the arming.
+        assert_eq!(watched_idle(&row(true, 5_000, 0), now, at(4_999)), None);
+        assert_eq!(
+            watched_idle(&row(true, 5_000, 0), now, at(5_000)),
+            Some(5_000)
+        );
+        assert_eq!(watched_idle(&row(true, 5_000, 0), now, None), None);
+        // Recorded targets are not judged by when they were found.
+        assert_eq!(
+            watched_idle(&row(false, 5_000, 0), now, at(4_000)),
+            Some(6_000)
+        );
+    }
+
+    #[test]
+    fn observed_idle_needs_evidence_for_every_target_holding_units() {
+        let now = 10_000;
+        let discovered = row(true, 1_000, 1_000);
+        assert_eq!(
+            observed_idle(&discovered, now, at(2_000), true, true),
+            Some(8_000)
+        );
+        assert_eq!(
+            observed_idle(&discovered, now, at(2_000), false, true),
+            None,
+            "not local"
+        );
+        assert_eq!(
+            observed_idle(&discovered, now, None, true, false),
+            None,
+            "nothing observed"
+        );
+
+        let recorded = row(false, 1_000, 7_000);
+        assert_eq!(
+            observed_idle(&recorded, now, None, true, false),
+            Some(3_000),
+            "no units"
+        );
+        assert_eq!(
+            observed_idle(&recorded, now, None, true, true),
+            None,
+            "units, never armed"
+        );
+        assert_eq!(
+            observed_idle(&recorded, now, at(2_000), true, true),
+            Some(3_000),
+            "the later of both"
+        );
+        assert_eq!(
+            observed_idle(&recorded, now, at(8_000), true, true),
+            Some(2_000)
+        );
     }
 
     /// A target under `root` known only through Git discovery, holding one

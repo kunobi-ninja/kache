@@ -86,6 +86,7 @@ impl Fixture {
         RustcHitContext {
             config: &self.config,
             compiler: &self.compiler,
+            memo_store: &self.store,
             args: &self.args,
             crate_name: "foo",
             event_root: "/consumer",
@@ -412,4 +413,40 @@ fn remote_misses_and_failed_restores_do_not_complete_hits() {
             "{mode}"
         );
     }
+}
+
+#[test]
+fn readonly_hit_records_restored_output_hashes_in_the_primary_store() {
+    let _lock = crate::test_support::process_state_test_lock();
+    let fixture = Fixture::new();
+    let content = vec![42; 65536];
+    let hash = blake3::hash(&content).to_hex().to_string();
+    create_blob(&fixture.store, &hash, &content);
+    let mut meta = fixture.meta.clone();
+    meta.files[0].hash = hash.clone();
+    meta.files[0].size = content.len() as u64;
+    let readonly = Store::open_read_only(&fixture.config).unwrap();
+    let primary = Store::open(&test_config(fixture.dir.path().join("primary"))).unwrap();
+    let mut hit = fixture.context();
+    hit.memo_store = &primary;
+    hit.restore_and_finish(
+        &readonly,
+        &meta,
+        EventResult::LocalHit,
+        CACHE_KEY,
+        0,
+        FileHashStats::default(),
+        0,
+        None,
+        &fixture.key(),
+        &key_record(),
+    )
+    .unwrap();
+    let output = fixture.args.out_dir.as_ref().unwrap().join("libfoo.rmeta");
+    assert!(matches!(primary.file_hash_lookup(&output),
+        crate::cache_key::FileHashLookup::Hit(found) if found == hash));
+    assert!(matches!(
+        fixture.store.file_hash_lookup(&output),
+        crate::cache_key::FileHashLookup::NeedsHash(_)
+    ));
 }

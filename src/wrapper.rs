@@ -860,25 +860,24 @@ fn volume_cache_dirs_match(routed: &Path, main: &Path) -> bool {
     routed == main
 }
 
-/// Open the volume shard (or main store) plus an optional main-store fallback.
-fn open_primary_and_fallback(config: &Config, route: &Path) -> Result<(Store, Option<Store>)> {
+/// Open the volume shard (or main store) plus the stores read after it: the
+/// main store when the route maps to a shard, then [`Config::readonly_store`].
+fn open_primary_and_fallback(config: &Config, route: &Path) -> Result<(Store, Vec<Store>)> {
     crate::link::set_mapped_target(config.volume_store_for(route).is_some());
     let routed = config.routed_for_path(route);
     let primary = Store::open(&routed)?;
-    if volume_cache_dirs_match(&routed.cache_dir, &config.cache_dir) {
-        return Ok((primary, None));
-    }
-    let fallback = match Store::open(config) {
-        Ok(store) => Some(store),
-        Err(e) => {
-            tracing::warn!(
+    let mut fallbacks = Vec::new();
+    if !volume_cache_dirs_match(&routed.cache_dir, &config.cache_dir) {
+        match Store::open(config) {
+            Ok(store) => fallbacks.push(store),
+            Err(e) => tracing::warn!(
                 "main store unavailable for volume-shard fallback ({}): {e:#}",
                 config.cache_dir.display()
-            );
-            None
+            ),
         }
-    };
-    Ok((primary, fallback))
+    }
+    fallbacks.extend(open_readonly_store(config));
+    Ok((primary, fallbacks))
 }
 
 /// Retry budget for a busy store index, including time spent in lookups.
@@ -949,22 +948,38 @@ fn lookup_or_miss_with_clock<T>(
     None
 }
 
-/// Local lookup: volume shard first, then the main store. The returned
-/// store is the one whose blobs must be restored.
+/// The store named by [`Config::readonly_store`], opened read-only, or `None`
+/// when none is set, when it is this process's own store, or when it cannot be
+/// opened that way (said at warn level).
+fn open_readonly_store(config: &Config) -> Option<Store> {
+    let dir = config.readonly_store.as_ref()?;
+    if *dir == config.cache_dir {
+        return None;
+    }
+    let mut readonly = config.clone();
+    readonly.cache_dir = dir.clone();
+    match Store::open_read_only(&readonly) {
+        Ok(store) => Some(store),
+        Err(e) => {
+            tracing::warn!("read-only store {} unavailable: {e:#}", dir.display());
+            None
+        }
+    }
+}
+
+/// Local lookup: volume shard first, then the main store, then the read-only
+/// store. The returned store is the one whose blobs must be restored.
 fn lookup_local_entry<'a>(
     primary: &'a Store,
-    fallback: Option<&'a Store>,
+    fallbacks: &'a [Store],
     cache_key: &str,
 ) -> Result<Option<(&'a Store, crate::store::EntryMeta)>> {
     crate::demand::record(cache_key);
     let _trace = crate::phase_trace::phase("lookup");
-    if let Some(meta) = primary.get(cache_key)? {
-        return Ok(Some((primary, meta)));
-    }
-    if let Some(fallback) = fallback
-        && let Some(meta) = fallback.get(cache_key)?
-    {
-        return Ok(Some((fallback, meta)));
+    for store in std::iter::once(primary).chain(fallbacks) {
+        if let Some(meta) = store.get(cache_key)? {
+            return Ok(Some((store, meta)));
+        }
     }
     Ok(None)
 }
@@ -1177,7 +1192,7 @@ pub fn run_nvcc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     // ── Local cache lookup ───────────────────────────────────────
     let lookup_start = std::time::Instant::now();
     let lookup = lookup_or_miss(&crate_name, LOOKUP_BUSY_BUDGET, std::thread::sleep, || {
-        lookup_local_entry(&store, None, &cache_key)
+        lookup_local_entry(&store, &[], &cache_key)
     });
     let lookup_ms = lookup_start.elapsed().as_millis() as u64;
     let mut lookup_rejection = String::new();
@@ -1809,7 +1824,7 @@ fn run_cc_inner(
     drop(trace_preflight);
 
     let trace_store_open = crate::phase_trace::phase("store_open");
-    let (store, fallback_store) =
+    let (store, fallback_stores) =
         match open_primary_and_fallback(config, &volume_route_path_cc(&parsed)) {
             Ok(pair) => {
                 drop(trace_store_open);
@@ -1832,7 +1847,7 @@ fn run_cc_inner(
         compiler,
         parsed,
         store,
-        fallback_store,
+        fallback_stores,
         crate_name,
         event_root,
         start,
@@ -1847,7 +1862,7 @@ struct CcStoreInvocation {
     compiler: CcCompiler,
     parsed: crate::compiler::cc::CcArgs,
     store: Store,
-    fallback_store: Option<Store>,
+    fallback_stores: Vec<Store>,
     crate_name: String,
     event_root: String,
     start: std::time::Instant,
@@ -1863,7 +1878,7 @@ fn run_cc_with_store(
         compiler,
         parsed,
         store,
-        fallback_store,
+        fallback_stores,
         crate_name,
         event_root,
         start,
@@ -1902,6 +1917,7 @@ fn run_cc_with_store(
             && config.deferred_discovery
             && config.remote.is_none()
             && config.fallback.is_none()
+            && config.readonly_store.is_none()
             && crate::compiler::cc::cc_direct_key_eligible(parsed) =>
         {
             crate::compiler::cc::CcKeyDiscovery::Deferrable
@@ -1972,7 +1988,7 @@ fn run_cc_with_store(
         None
     } else {
         let lookup = lookup_or_miss(crate_name, LOOKUP_BUSY_BUDGET, std::thread::sleep, || {
-            lookup_local_entry(store, fallback_store.as_ref(), &cache_key)
+            lookup_local_entry(store, fallback_stores, &cache_key)
         });
         drop(trace_lookup);
         lookup
@@ -1997,51 +2013,56 @@ fn run_cc_with_store(
             let trace_restore = crate::phase_trace::phase("restore");
             let restored = restore_cc_from_cache(hit_store, parsed, &meta);
             drop(trace_restore);
-            if let Err(e) = restored {
+            if let Err(e) = &restored {
                 if e.downcast_ref::<PartialCcRestore>().is_some() {
-                    return Err(e);
+                    return restored.map(|()| 0);
                 }
                 tracing::warn!(
                     "restoring cc cache hit for {} failed: {} — recompiling",
                     crate_name,
                     e
                 );
-                return cc_passthrough_with_event(
-                    config,
-                    parsed,
+                if !hit_store.is_read_only() {
+                    return cc_passthrough_with_event(
+                        config,
+                        parsed,
+                        crate_name,
+                        event_root,
+                        start,
+                        format!("restore failed: {e}"),
+                    );
+                }
+                lookup_rejection = format!("read-only restore failed: {e}");
+            }
+            if restored.is_ok() {
+                let restore_ms = restore_start.elapsed().as_millis() as u64;
+                tracing::debug!(
+                    "cc local cache hit for {} ({})",
                     crate_name,
-                    event_root,
-                    start,
-                    format!("restore failed: {e}"),
+                    &cache_key[..16]
                 );
-            }
-            let restore_ms = restore_start.elapsed().as_millis() as u64;
-            tracing::debug!(
-                "cc local cache hit for {} ({})",
-                crate_name,
-                &cache_key[..16]
-            );
-            let trace_report = crate::phase_trace::phase("event_report");
-            HitCompletion {
-                event_root,
-                crate_name,
-                result: EventResult::LocalHit,
-                cache_key: &cache_key,
-                start,
-                key_ms,
-                key_hash_stats: FileHashStats::default(),
-                lookup_ms,
-                restore_ms,
-                key_record: KeyEventRecord::default(),
-                object_output: recorded_object_output(parsed.object_output_path()),
-            }
-            .report(config, &meta);
-            drop(trace_report);
+                let trace_report = crate::phase_trace::phase("event_report");
+                HitCompletion {
+                    event_root,
+                    crate_name,
+                    result: EventResult::LocalHit,
+                    cache_key: &cache_key,
+                    start,
+                    key_ms,
+                    key_hash_stats: FileHashStats::default(),
+                    lookup_ms,
+                    restore_ms,
+                    key_record: KeyEventRecord::default(),
+                    object_output: recorded_object_output(parsed.object_output_path()),
+                }
+                .report(config, &meta);
+                drop(trace_report);
 
-            let _trace = crate::phase_trace::phase("memo_commit");
-            compiler.commit_preprocess_memo(&file_hasher);
+                let _trace = crate::phase_trace::phase("memo_commit");
+                compiler.commit_preprocess_memo(&file_hasher);
 
-            return Ok(0);
+                return Ok(0);
+            }
         }
     }
 
@@ -3407,12 +3428,12 @@ fn run_parsed_rustc(
         }
     }
     let rustc_route = volume_route_path_rustc(args);
-    let mut fallback_store = None;
+    let mut fallback_stores = Vec::new();
     let trace_store_open = crate::phase_trace::phase("store_open");
     let store = if args.is_primary || (config.clean_incremental && args.incremental.is_some()) {
         match open_primary_and_fallback(config, &rustc_route) {
-            Ok((primary, fallback)) => {
-                fallback_store = fallback;
+            Ok((primary, fallbacks)) => {
+                fallback_stores = fallbacks;
                 Some(primary)
             }
             Err(e) => {
@@ -3637,6 +3658,7 @@ fn run_parsed_rustc(
     let hit_context = RustcHitContext {
         config,
         compiler,
+        memo_store: &store,
         args,
         crate_name,
         event_root: &event_root,
@@ -3694,7 +3716,7 @@ fn run_parsed_rustc(
         let lookup_start = std::time::Instant::now();
         let lookup_result =
             lookup_or_miss(crate_name, LOOKUP_BUSY_BUDGET, std::thread::sleep, || {
-                lookup_local_entry(&store, fallback_store.as_ref(), &cache_key)
+                lookup_local_entry(&store, &fallback_stores, &cache_key)
             });
         lookup_ms = lookup_ms.saturating_add(lookup_start.elapsed().as_millis() as u64);
 
@@ -3713,7 +3735,7 @@ fn run_parsed_rustc(
                 let _ = hit_store.remove_entry(&cache_key);
             } else {
                 tracing::debug!("local cache hit for {} ({})", crate_name, &cache_key[..16]);
-                if let Err(e) = hit_context.restore_and_finish(
+                match hit_context.restore_and_finish(
                     hit_store,
                     &meta,
                     EventResult::LocalHit,
@@ -3725,28 +3747,35 @@ fn run_parsed_rustc(
                     &key_outputs,
                     &key_record,
                 ) {
-                    tracing::warn!(
-                        "restoring local cache hit for {} failed: {} — recompiling",
-                        crate_name,
-                        e
-                    );
-                    return passthrough_with_event(
-                        config,
-                        args,
-                        crate_name,
-                        &event_root,
-                        start,
-                        format!("restore failed: {e}"),
-                        key_record,
-                    );
+                    Ok(()) => {
+                        observe_adaptive_hit(
+                            adaptive_unit.as_ref(),
+                            adaptive_key_fields.as_ref(),
+                            &cache_key,
+                        );
+                        return Ok(0);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "restoring local cache hit for {} failed: {} — recompiling",
+                            crate_name,
+                            e
+                        );
+                        if !hit_store.is_read_only() {
+                            return passthrough_with_event(
+                                config,
+                                args,
+                                crate_name,
+                                &event_root,
+                                start,
+                                format!("restore failed: {e}"),
+                                key_record,
+                            );
+                        }
+                        // A host entry cannot be evicted here. Compile through
+                        // the normal miss path so the job learns its own entry.
+                    }
                 }
-                observe_adaptive_hit(
-                    adaptive_unit.as_ref(),
-                    adaptive_key_fields.as_ref(),
-                    &cache_key,
-                );
-
-                return Ok(0);
             }
         }
 
@@ -5016,6 +5045,14 @@ fn materialize_cached_artifact(
     };
 
     let strategy = restore_link_strategy(kind, cached_file.executable, shared_loadable);
+    // A fresh transformed file can keep its original mode. Only the blob path
+    // needs a private inode when it belongs to another process's store.
+    let blob_strategy =
+        if store.is_read_only() && strategy == link::LinkStrategy::ExecutableHardlink {
+            link::LinkStrategy::Copy
+        } else {
+            strategy
+        };
     let rewrote_content = transformed.is_some();
     match transformed {
         Some(content) => {
@@ -5028,15 +5065,23 @@ fn materialize_cached_artifact(
         None => {
             // A large executable may already sit beside its destination,
             // copied by the daemon while the build ran (crate::prestage).
-            let staged = take_prestaged(strategy, cached_file, target_path);
-            if !staged {
-                link::link_to_target(&store_path, target_path, strategy).with_context(|| {
-                    format!(
-                        "{context}: linking {} -> {}",
-                        store_path.display(),
-                        target_path.display()
-                    )
-                })?;
+            if store.is_read_only() && blob_strategy == link::LinkStrategy::Hardlink {
+                link::prepare_writable_target_from_file(&store_path, target_path)?
+                    .publish_replacing()
+                    .with_context(|| format!("{context}: copying {}", target_path.display()))?;
+            } else {
+                let staged = take_prestaged(blob_strategy, cached_file, target_path);
+                if !staged {
+                    link::link_to_target(&store_path, target_path, blob_strategy).with_context(
+                        || {
+                            format!(
+                                "{context}: linking {} -> {}",
+                                store_path.display(),
+                                target_path.display()
+                            )
+                        },
+                    )?;
+                }
             }
             // A link/clone keeps the blob's old mtime, so it must be
             // re-stamped to read as "written now" — through the same clock
@@ -5595,6 +5640,7 @@ fn deferral_allowed(
         && config.deferred_discovery
         && config.remote.is_none()
         && config.fallback.is_none()
+        && config.readonly_store.is_none()
         && !adaptive
         && extra_inputs.is_none()
 }
@@ -6266,10 +6312,24 @@ fn rewrite_emit_value(value: &str, staging: &Path) -> String {
         .join(",")
 }
 
+#[cfg(test)]
 fn restore_from_cache(
     config: &Config,
     compiler: &RustcCompiler,
     store: &Store,
+    args: &RustcArgs,
+    meta: &crate::store::EntryMeta,
+    extra_inputs: Option<&crate::extra_inputs::ExtraInputsSnapshot>,
+) -> Result<()> {
+    restore_from_cache_with_memo_store(config, compiler, store, store, args, meta, extra_inputs)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn restore_from_cache_with_memo_store(
+    config: &Config,
+    compiler: &RustcCompiler,
+    store: &Store,
+    memo_store: &Store,
     args: &RustcArgs,
     meta: &crate::store::EntryMeta,
     extra_inputs: Option<&crate::extra_inputs::ExtraInputsSnapshot>,
@@ -6513,7 +6573,7 @@ fn restore_from_cache(
         restored_paths.push((cached_file.name.clone(), target_path));
     }
 
-    record_known_file_hashes(store, &exact_restores);
+    record_known_file_hashes(memo_store, &exact_restores);
 
     maybe_verify_restored_hit(compiler, args, &restored_paths);
 

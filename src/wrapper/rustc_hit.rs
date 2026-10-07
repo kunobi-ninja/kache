@@ -1,6 +1,7 @@
 use super::{
     Config, EntryMeta, EventResult, FileHashStats, HitCompletion, KeyEventRecord, RustcArgs,
-    RustcCompiler, Store, clean_incremental_dir, record_input_prediction, restore_from_cache,
+    RustcCompiler, Store, clean_incremental_dir, record_input_prediction,
+    restore_from_cache_with_memo_store,
 };
 use anyhow::Result;
 use std::time::Instant;
@@ -9,6 +10,7 @@ use std::time::Instant;
 pub(super) struct RustcHitContext<'a> {
     pub config: &'a Config,
     pub compiler: &'a RustcCompiler,
+    pub memo_store: &'a Store,
     pub args: &'a RustcArgs,
     pub crate_name: &'a str,
     pub event_root: &'a str,
@@ -35,10 +37,11 @@ impl RustcHitContext<'_> {
         key_record: &KeyEventRecord,
     ) -> Result<()> {
         let restore_start = Instant::now();
-        restore_from_cache(
+        restore_from_cache_with_memo_store(
             self.config,
             self.compiler,
             store,
+            self.memo_store,
             self.args,
             meta,
             self.extra_inputs,

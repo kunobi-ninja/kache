@@ -12125,3 +12125,464 @@ fn lists_indexed_blobs_from_a_size_up() {
     );
     assert!(store.blobs_at_least(u64::MAX).unwrap().is_empty());
 }
+
+// ---- read-only store ------------------------------------------------------
+
+/// Every path under `dir` with its length, mtime and bytes. `index.db-shm` is
+/// compared by presence and length only: it is the WAL index in shared memory,
+/// and inside one process a second connection maps it through the owner's
+/// writable mapping.
+fn ro_tree_snapshot(dir: &Path) -> Vec<(PathBuf, u64, Option<std::time::SystemTime>, Vec<u8>)> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for e in fs::read_dir(&d).unwrap() {
+            let p = e.unwrap().path();
+            let m = fs::symlink_metadata(&p).unwrap();
+            if m.is_dir() {
+                out.push((p.clone(), 0, Some(m.modified().unwrap()), Vec::new()));
+                stack.push(p);
+            } else if p.to_string_lossy().ends_with("-shm") {
+                out.push((p.clone(), m.len(), None, Vec::new()));
+            } else {
+                let bytes = fs::read(&p).unwrap();
+                out.push((p.clone(), m.len(), Some(m.modified().unwrap()), bytes));
+            }
+        }
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+fn ro_put(store: &Store, src: &Path, key: &str, bytes: &[u8]) {
+    let out = src.join(format!("{key}.rlib"));
+    fs::write(&out, bytes).unwrap();
+    store
+        .put(
+            key,
+            "ro_crate",
+            &["lib".to_string()],
+            &[],
+            "x86_64-unknown-linux-gnu",
+            "dev",
+            &[(out, format!("lib{key}.rlib"))],
+            "",
+            "",
+        )
+        .unwrap();
+}
+
+/// A read-only store serves a committed entry, refuses every method that would
+/// change the store, and leaves the store directory byte for byte as it was.
+#[test]
+fn read_only_store_serves_hits_and_writes_nothing() {
+    let _env_lock = crate::test_support::process_state_test_lock();
+    let _verify = EnvVarGuard::set("KACHE_VERIFY_RESTORES", "always");
+    let dir = tempfile::tempdir().unwrap();
+    let src = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let owner = Store::open(&config).unwrap();
+    ro_put(&owner, src.path(), "rokey1", b"read-only bytes");
+    // An old stamp: a read-write hit would write a new one.
+    owner.set_last_accessed_for_test("rokey1", "-1 hour");
+    let before = ro_tree_snapshot(dir.path());
+
+    let ro = Store::open_read_only(&config).unwrap();
+    assert!(ro.is_read_only());
+    assert!(!owner.is_read_only());
+    let meta = ro
+        .get("rokey1")
+        .unwrap()
+        .expect("a committed entry is a hit");
+    assert_eq!(meta.crate_name, "ro_crate");
+    assert!(ro.get("absent").unwrap().is_none());
+
+    let other = src.path().join("other.rlib");
+    fs::write(&other, b"x").unwrap();
+    // Assert each result immediately. Collecting these booleans in one
+    // expression keeps borrowed Result temporaries alive until its end:
+    // a successful try_gc_lock would then deadlock acquire_gc_lock.
+    // Start with a nonblocking filesystem operation so a missing refusal
+    // fails before any SQL write or blocking maintenance path.
+    assert!(
+        ro.try_lock("new-key").is_err(),
+        "try_lock must be refused on a read-only store"
+    );
+    assert!(
+        ro.put(
+            "rokey2",
+            "c",
+            &["lib".to_string()],
+            &[],
+            "t",
+            "dev",
+            &[(other.clone(), "libc.rlib".to_string())],
+            "",
+            "",
+        )
+        .is_err(),
+        "put must be refused on a read-only store"
+    );
+    assert!(
+        ro.import_downloaded_entry("rokey1").is_err(),
+        "import_downloaded_entry must be refused on a read-only store"
+    );
+    assert!(
+        ro.import_restored_entry("rokey1").is_err(),
+        "import_restored_entry must be refused on a read-only store"
+    );
+    assert!(
+        ro.import_verified_restored_entries(&[]).is_err(),
+        "import_verified_restored_entries must be refused on a read-only store"
+    );
+    assert!(
+        ro.rebuild_index_from_store().is_err(),
+        "rebuild_index_from_store must be refused on a read-only store"
+    );
+    assert!(
+        ro.record_entry_unit("rokey1", "unit").is_err(),
+        "record_entry_unit must be refused on a read-only store"
+    );
+    assert!(
+        ro.remove_entry("rokey1").is_err(),
+        "remove_entry must be refused on a read-only store"
+    );
+    assert!(
+        ro.evict().is_err(),
+        "evict must be refused on a read-only store"
+    );
+    assert!(
+        ro.evict_for_disk_pressure(|| false).is_err(),
+        "evict_for_disk_pressure must be refused on a read-only store"
+    );
+    assert!(
+        ro.evict_older_than(0).is_err(),
+        "evict_older_than must be refused on a read-only store"
+    );
+    assert!(
+        ro.evict_stale_key_schemas(0).is_err(),
+        "evict_stale_key_schemas must be refused on a read-only store"
+    );
+    assert!(
+        ro.evict_duplicate_entries().is_err(),
+        "evict_duplicate_entries must be refused on a read-only store"
+    );
+    assert!(
+        ro.clear().is_err(),
+        "clear must be refused on a read-only store"
+    );
+    assert!(
+        ro.migrate_to_blobs(|_, _| {}).is_err(),
+        "migrate_to_blobs must be refused on a read-only store"
+    );
+    assert!(
+        ro.claim_build("new-key").is_err(),
+        "claim_build must be refused on a read-only store"
+    );
+    assert!(
+        ro.try_gc_lock().is_err(),
+        "try_gc_lock must be refused on a read-only store"
+    );
+    assert!(
+        ro.acquire_gc_lock().is_err(),
+        "acquire_gc_lock must be refused on a read-only store"
+    );
+    assert!(
+        ro.try_durability_flush_lock().is_err(),
+        "durability lock must be refused on a read-only store"
+    );
+    assert!(
+        ro.flush_durability(1).is_err(),
+        "flush_durability must be refused on a read-only store"
+    );
+    assert!(
+        ro.flush_entry_durability("rokey1").is_err(),
+        "flush_entry_durability must be refused on a read-only store"
+    );
+    assert!(
+        ro.reconcile_blob_index().is_err(),
+        "reconcile_blob_index must be refused on a read-only store"
+    );
+    assert!(
+        ro.reconcile_blob_index_dropping_unverifiable().is_err(),
+        "reconcile dropping must be refused on a read-only store"
+    );
+    assert!(
+        ro.sweep_orphan_blobs(Duration::ZERO).is_err(),
+        "sweep_orphan_blobs must be refused on a read-only store"
+    );
+    assert!(
+        ro.sweep_stale_key_locks(Duration::ZERO, 1).is_err(),
+        "sweep_stale_key_locks must be refused on a read-only store"
+    );
+    assert!(
+        ro.backfill_content_hashes().is_err(),
+        "backfill_content_hashes must be refused on a read-only store"
+    );
+    assert!(
+        ro.backfill_compile_times().is_err(),
+        "backfill_compile_times must be refused on a read-only store"
+    );
+    assert!(
+        ro.backfill_entry_blobs().is_err(),
+        "backfill_entry_blobs must be refused on a read-only store"
+    );
+    assert!(
+        ro.prune_tombstones(0).is_err(),
+        "prune_tombstones must be refused on a read-only store"
+    );
+    assert!(
+        ro.remember_incremental_dir(src.path()).is_err(),
+        "remember_incremental_dir must be refused on a read-only store"
+    );
+    assert!(
+        ro.remember_target_root(src.path(), src.path()).is_err(),
+        "remember_target_root must be refused on a read-only store"
+    );
+    assert!(
+        ro.remember_discovered_target_root(src.path(), src.path())
+            .is_err(),
+        "remember_discovered_target_root must be refused on a read-only store"
+    );
+    assert!(
+        ro.forget_target_root(src.path()).is_err(),
+        "forget_target_root must be refused on a read-only store"
+    );
+    assert!(
+        ro.clean_registered_incremental_dirs().is_err(),
+        "clean_registered_incremental_dirs must be refused on a read-only store"
+    );
+    // The file-hash memo writers are best-effort; on a read-only connection
+    // they write nothing.
+    ro.record_known_file_hash(&other, "00");
+    drop(ro);
+
+    assert_eq!(
+        ro_tree_snapshot(dir.path()),
+        before,
+        "a read-only store wrote to the store directory"
+    );
+    assert!(owner.contains("rokey1"));
+    assert!(!owner.contains("rokey2"));
+}
+
+#[test]
+fn read_only_store_sees_entries_committed_after_it_opened() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let owner = Store::open(&config).unwrap();
+    ro_put(&owner, src.path(), "early", b"1");
+    let ro = Store::open_read_only(&config).unwrap();
+    assert!(ro.get("late").unwrap().is_none());
+    ro_put(&owner, src.path(), "late", b"2");
+    assert!(
+        ro.get("late").unwrap().is_some(),
+        "a later commit of the owner is visible"
+    );
+}
+
+#[test]
+fn read_only_store_refuses_without_a_live_index_and_creates_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("nope");
+    assert!(Store::open_read_only(test_config(&missing)).is_err());
+    assert!(!missing.exists(), "no directory is created");
+
+    let config = test_config(dir.path());
+    {
+        let owner = Store::open(&config).unwrap();
+        ro_put(&owner, src.path(), "k", b"bytes");
+    }
+    // The owner has gone: its index has no live -wal and -shm.
+    for side in ["index.db-wal", "index.db-shm"] {
+        let _ = fs::remove_file(dir.path().join(side));
+    }
+    let before = ro_tree_snapshot(dir.path());
+    let err = Store::open_read_only(&config)
+        .err()
+        .expect("refused")
+        .to_string();
+    assert!(err.contains("WAL mode"), "{err}");
+    assert_eq!(
+        ro_tree_snapshot(dir.path()),
+        before,
+        "the refusal created nothing"
+    );
+}
+
+/// A blob of the wrong size is a miss, and the entry is not evicted.
+#[cfg(unix)]
+#[test]
+fn read_only_store_treats_a_truncated_blob_as_a_miss_and_evicts_nothing() {
+    use std::os::unix::fs::PermissionsExt;
+    let _env_lock = crate::test_support::process_state_test_lock();
+    let _verify = EnvVarGuard::remove("KACHE_VERIFY_RESTORES");
+    let dir = tempfile::tempdir().unwrap();
+    let src = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let owner = Store::open(&config).unwrap();
+    ro_put(&owner, src.path(), "dmg", b"artifact-bytes");
+    let meta = owner.stored_meta("dmg").unwrap();
+    let blob = owner.blob_path(&meta.files[0].hash);
+    fs::set_permissions(&blob, fs::Permissions::from_mode(0o644)).unwrap();
+    fs::write(&blob, b"short").unwrap();
+
+    let ro = Store::open_read_only(&config).unwrap();
+    assert!(ro.get("dmg").unwrap().is_none(), "a damaged blob is a miss");
+    assert!(owner.contains("dmg"), "and the entry is not evicted");
+    assert_eq!(fs::read(&blob).unwrap(), b"short", "nor the blob touched");
+}
+
+/// A blob of the right size with other bytes is a miss when restores are
+/// verified, and served when they are not, as on the read-write path.
+#[cfg(unix)]
+#[test]
+fn read_only_store_verifies_content_as_configured() {
+    use std::os::unix::fs::PermissionsExt;
+    let _env_lock = crate::test_support::process_state_test_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let src = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let owner = Store::open(&config).unwrap();
+    ro_put(&owner, src.path(), "flip", b"artifact-bytes");
+    let meta = owner.stored_meta("flip").unwrap();
+    let blob = owner.blob_path(&meta.files[0].hash);
+    fs::set_permissions(&blob, fs::Permissions::from_mode(0o644)).unwrap();
+    fs::write(&blob, b"ARTIFACT-BYTES").unwrap();
+    let ro = Store::open_read_only(&config).unwrap();
+    {
+        let _verify = EnvVarGuard::set("KACHE_VERIFY_RESTORES", "always");
+        assert!(
+            ro.get("flip").unwrap().is_none(),
+            "verified: other bytes are a miss"
+        );
+    }
+    let _verify = EnvVarGuard::set("KACHE_VERIFY_RESTORES", "off");
+    assert!(
+        ro.get("flip").unwrap().is_some(),
+        "unverified: the size check passes"
+    );
+}
+
+/// An entry still in the legacy layout (artifacts beside `meta.json`) would be
+/// migrated by a read-write hit. Read-only, it is a miss and stays as it is.
+#[test]
+fn read_only_store_treats_a_legacy_entry_as_a_miss() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let owner = Store::open(&config).unwrap();
+    ro_put(&owner, src.path(), "legacy", b"artifact-bytes");
+    let meta = owner.stored_meta("legacy").unwrap();
+    let beside = owner.entry_dir("legacy").join(&meta.files[0].name);
+    fs::write(&beside, b"artifact-bytes").unwrap();
+
+    let ro = Store::open_read_only(&config).unwrap();
+    assert!(ro.get("legacy").unwrap().is_none());
+    assert!(beside.exists(), "nothing was migrated");
+}
+
+#[test]
+fn read_only_maintenance_preserves_files_and_registered_incremental_directories() {
+    let dir = tempfile::tempdir().unwrap();
+    let incremental = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let owner = Store::open(&config).unwrap();
+    let state = incremental.path().join("state");
+    fs::write(&state, b"incremental state").unwrap();
+    owner.remember_incremental_dir(incremental.path()).unwrap();
+    fs::create_dir_all(owner.staging_dir()).unwrap();
+    let staging = owner.staging_dir().join("abandoned.tmp");
+    fs::write(&staging, b"staged bytes").unwrap();
+    let stale_lock = owner.entry_dir("stale-key").with_extension("lock");
+    drop(owner.try_lock("stale-key").unwrap().unwrap());
+    let old = filetime::FileTime::from_unix_time(0, 0);
+    filetime::set_file_mtime(&staging, old).unwrap();
+    filetime::set_file_mtime(&stale_lock, old).unwrap();
+    // Apply fixture timestamps before readonly permissions for Windows.
+    let mut perms = fs::metadata(&staging).unwrap().permissions();
+    perms.set_readonly(true);
+    fs::set_permissions(&staging, perms).unwrap();
+    let before = ro_tree_snapshot(dir.path());
+    let ro = Store::open_read_only(&config).unwrap();
+
+    assert!(ro.clean_registered_incremental_dirs().is_err());
+    assert_eq!(fs::read(&state).unwrap(), b"incremental state");
+    let registry_count: i64 = owner
+        .db
+        .query_row("SELECT COUNT(*) FROM incremental_dirs", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(registry_count, 1);
+    let sweep = ro.sweep_stale_staging(Duration::ZERO);
+    assert_eq!(
+        (sweep.scanned, sweep.removed, sweep.bytes_reclaimed),
+        (0, 0, 0)
+    );
+    assert_eq!(ro.sweep_housekeeping(), HousekeepingStats::default());
+    assert!(stale_lock.exists());
+    assert!(fs::metadata(&staging).unwrap().permissions().readonly());
+    assert_eq!(ro_tree_snapshot(dir.path()), before);
+    // Keep Windows TempDir cleanup independent of the test's readonly file.
+    drop(ro);
+    drop(owner);
+    fs::remove_file(&staging)
+        .or_else(|_| {
+            let mut permissions = fs::metadata(&staging)?.permissions();
+            #[allow(clippy::permissions_set_readonly_false)]
+            permissions.set_readonly(false);
+            fs::set_permissions(&staging, permissions)?;
+            fs::remove_file(&staging)
+        })
+        .unwrap();
+}
+
+#[test]
+fn read_only_store_treats_malformed_metadata_as_a_miss() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let owner = Store::open(&config).unwrap();
+    ro_put(&owner, src.path(), "malformed", b"artifact bytes");
+    let metadata = owner.entry_dir("malformed").join("meta.json");
+    fs::write(&metadata, b"{broken JSON").unwrap();
+    let ro = Store::open_read_only(&config).unwrap();
+    assert!(ro.get("malformed").unwrap().is_none());
+    assert!(owner.contains("malformed"));
+    assert_eq!(fs::read(&metadata).unwrap(), b"{broken JSON");
+}
+
+#[test]
+fn read_only_hash_memo_writers_leave_the_index_and_timeout_untouched() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let owner = Store::open(&config).unwrap();
+    let ro = Store::open_read_only(&config).unwrap();
+    let artifact = src.path().join("large.rlib");
+    fs::write(&artifact, vec![42; 65536]).unwrap();
+    let crate::file_hash::FileHashLookup::NeedsHash(fingerprint) = ro.file_hash_lookup(&artifact)
+    else {
+        panic!("a new large file should need hashing");
+    };
+    let hash = crate::file_hash::hash_file(&artifact).unwrap();
+    let before = ro_tree_snapshot(dir.path());
+    ro.file_hash_record(&fingerprint, &hash);
+    ro.record_verified_file_hash(&fingerprint, &hash);
+    ro.record_verified_file_hashes(&[(fingerprint, &hash)]);
+    ro.record_verified_file_hashes(&[]);
+    ro.record_known_file_hash(&artifact, &hash);
+    assert!(matches!(
+        owner.file_hash_lookup(&artifact),
+        crate::file_hash::FileHashLookup::NeedsHash(_)
+    ));
+    let timeout: i64 = ro
+        .db
+        .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(timeout, 2000);
+    assert_eq!(ro_tree_snapshot(dir.path()), before);
+}

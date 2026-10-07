@@ -2113,6 +2113,7 @@ mod tests {
             }),
             workspace: None,
             cache: Some(CacheFileConfig {
+                readonly_store: None,
                 bypass_env: None,
                 bypass_argv: None,
                 bypass_crates: None,

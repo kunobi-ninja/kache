@@ -13718,6 +13718,106 @@ async fn upload_retirement_waits_for_the_enqueue_guard() {
     assert!(daemon.pending_uploads.read().await.is_empty());
 }
 
+#[tokio::test]
+async fn a_slow_upload_retirement_flush_does_not_block_other_uploads() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let mut jobs = Vec::new();
+    for name in ["slow-retirement", "upload-during-flush"] {
+        let key = test_cache_key(name);
+        seed_store_entry(&config, &key, "serde", dir.path());
+        jobs.push(
+            persist_upload_job(
+                &config,
+                &UploadJob {
+                    key,
+                    entry_dir: String::new(),
+                    crate_name: "serde".into(),
+                    client_epoch: 0,
+                },
+            )
+            .unwrap(),
+        );
+    }
+    let daemon = Arc::new(Daemon::new(config.clone()));
+    let retired_key = jobs[0].key.clone();
+    daemon.pending_uploads.write().await.insert(retired_key.clone());
+    let (flush_started_tx, flush_started_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let worker_daemon = daemon.clone();
+    let worker_key = retired_key.clone();
+    let worker = tokio::spawn(async move {
+        worker_daemon
+            .retire_upload_job_with(&worker_key, move |parent| {
+                flush_started_tx.send(()).unwrap();
+                release_rx.recv().context("test flush release dropped")?;
+                crate::atomic::fsync_dir(&parent).context("flushing upload spool removal")
+            })
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), flush_started_rx)
+        .await
+        .expect("retirement must reach its directory flush")
+        .unwrap();
+    assert!(!upload_spool_path(&config, &retired_key).exists());
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let next_job = jobs.pop().unwrap();
+    let next_key = next_job.key.clone();
+    let response = tokio::time::timeout(
+        Duration::from_secs(1),
+        daemon.enqueue_upload_job(tx, next_job),
+    )
+    .await;
+    // Always release the simulated disk stall before asserting the result.
+    release_tx.send(()).unwrap();
+    worker.await.unwrap().unwrap();
+    assert!(
+        response
+            .expect("another upload must enqueue while the flush is stalled")
+            .ok
+    );
+    assert_eq!(rx.try_recv().unwrap().key, next_key);
+    let pending = daemon.pending_uploads.read().await;
+    assert!(!pending.contains(&retired_key));
+    assert!(pending.contains(&next_key));
+    assert!(upload_spool_path(&config, &next_key).is_file());
+}
+
+#[tokio::test]
+async fn upload_retirement_reports_flush_errors_and_skips_already_missing_intents() {
+    for exists in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let key = test_cache_key("retirement-flush-error");
+        fs::create_dir_all(config.upload_spool_dir()).unwrap();
+        if exists {
+            fs::write(upload_spool_path(&config, &key), b"intent").unwrap();
+        }
+        let daemon = Daemon::new(config.clone());
+        daemon.pending_uploads.write().await.insert(key.clone());
+        let flushes = Arc::new(AtomicU64::new(0));
+        let worker_flushes = flushes.clone();
+        let result = daemon
+            .retire_upload_job_with(&key, move |_| {
+                worker_flushes.fetch_add(1, Ordering::Relaxed);
+                anyhow::bail!("injected retirement flush failure")
+            })
+            .await;
+        if exists {
+            assert!(
+                format!("{:#}", result.unwrap_err()).contains("injected retirement flush failure")
+            );
+            assert_eq!(flushes.load(Ordering::Relaxed), 1);
+        } else {
+            result.expect("a missing intent requires no flush");
+            assert_eq!(flushes.load(Ordering::Relaxed), 0);
+        }
+        assert!(!upload_spool_path(&config, &key).exists());
+        assert!(daemon.pending_uploads.read().await.is_empty());
+    }
+}
+
 struct TransientThenTerminalUploadBackend {
     heads: AtomicU64,
     first_failure: tokio::sync::Semaphore,

@@ -71,7 +71,9 @@ Transient remote errors keep their upload intents for retries and restart
 replay. A terminal failure, including rejected credentials or invalid remote
 configuration, removes the intent and abandons automatic reupload. The local
 cache entry remains until GC evicts it; fixing credentials later does not
-replay an intent that has already been retired.
+replay an intent that has already been retired. This also abandons duplicate
+requests folded into that in-flight upload. A request arriving after retirement
+creates a new intent if the local entry still exists.
 
 ## Idle shutdown
 

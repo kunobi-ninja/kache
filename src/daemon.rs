@@ -772,23 +772,25 @@ async fn persist_upload_job_async(config: &Config, job: &UploadJob) -> Result<Up
         .context("upload intent publication task failed")?
 }
 
-fn remove_upload_job(config: &Config, key: &str) -> Result<()> {
+fn unlink_upload_job(config: &Config, key: &str) -> Result<Option<PathBuf>> {
     let path = upload_spool_path(config, key);
     match std::fs::remove_file(&path) {
-        Ok(()) => {
-            if let Some(parent) = path.parent() {
-                crate::atomic::fsync_dir(parent).context("flushing upload spool removal")?;
-            }
-            Ok(())
-        }
+        Ok(()) => Ok(path.parent().map(Path::to_path_buf)),
         Err(error) => {
             if upload_spool_error_is_not_found(&error) {
-                Ok(())
+                Ok(None)
             } else {
                 Err(error).with_context(|| format!("removing {}", path.display()))
             }
         }
     }
+}
+
+fn remove_upload_job(config: &Config, key: &str) -> Result<()> {
+    if let Some(parent) = unlink_upload_job(config, key)? {
+        crate::atomic::fsync_dir(&parent).context("flushing upload spool removal")?;
+    }
+    Ok(())
 }
 
 fn load_upload_jobs(config: &Config) -> Result<Vec<UploadJob>> {
@@ -3973,10 +3975,30 @@ impl Daemon {
     }
 
     async fn retire_upload_job(&self, key: &str) -> Result<()> {
-        let mut pending = self.pending_uploads.write().await;
-        let result = remove_upload_job(&self.config, key);
-        pending.remove(key);
-        result
+        self.retire_upload_job_with(key, |parent| {
+            crate::atomic::fsync_dir(&parent).context("flushing upload spool removal")
+        })
+        .await
+    }
+
+    async fn retire_upload_job_with<F>(&self, key: &str, flush: F) -> Result<()>
+    where
+        F: FnOnce(PathBuf) -> Result<()> + Send + 'static,
+    {
+        let parent = {
+            let mut pending = self.pending_uploads.write().await;
+            let result = unlink_upload_job(&self.config, key);
+            pending.remove(key);
+            result?
+        };
+        // Only unlink must be ordered against enqueue. A slow directory flush
+        // must neither hold the shared pending lock nor block a Tokio worker.
+        if let Some(parent) = parent {
+            tokio::task::spawn_blocking(move || flush(parent))
+                .await
+                .context("upload intent removal flush task failed")??;
+        }
+        Ok(())
     }
 
     /// Execute an upload directly (used by upload queue workers).

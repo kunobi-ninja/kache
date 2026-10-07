@@ -7310,7 +7310,7 @@ fn a_freshly_built_target_is_offered_once_its_worktree_is_deleted() {
     let target = std::path::absolute(&target).unwrap();
 
     let (live, _, _) =
-        tracked_target_entries(&config, TrackedSelection::StaleOrOrphaned(24)).unwrap();
+        tracked_target_entries(&config, TrackedSelection::StaleOrOrphaned(24), false).unwrap();
     assert!(live.is_empty(), "seen just now and the worktree is there");
 
     std::fs::remove_dir_all(&workspace).unwrap();
@@ -7318,7 +7318,7 @@ fn a_freshly_built_target_is_offered_once_its_worktree_is_deleted() {
         TrackedSelection::StaleOrOrphaned(24),
         TrackedSelection::Orphaned,
     ] {
-        let (targets, _, orphans) = tracked_target_entries(&config, selection).unwrap();
+        let (targets, _, orphans) = tracked_target_entries(&config, selection, false).unwrap();
         assert_eq!(
             targets.iter().map(|t| t.path.clone()).collect::<Vec<_>>(),
             std::slice::from_ref(&target)

@@ -1601,16 +1601,13 @@ fn daemon_identity(state: &AppState) -> String {
     let snap = &state.stats_snapshot;
     let daemon = if !state.stats_loaded {
         "daemon: checking".to_string()
-    } else if snap.daemon_connected && !snap.daemon_version.is_empty() {
-        let epoch = snap.daemon_build_epoch;
-        let mine = crate::daemon::build_epoch();
-        if epoch == mine {
-            format!("daemon v{} (epoch {epoch})", snap.daemon_version)
+    } else if snap.daemon_connected {
+        if snap.daemon_version.is_empty() {
+            "daemon: release unknown".to_owned()
+        } else if crate::daemon::client_version_is_newer(version, &snap.daemon_version) {
+            format!("daemon v{} (upgrade available)", snap.daemon_version)
         } else {
-            format!(
-                "daemon v{} (epoch {epoch}, restart pending)",
-                snap.daemon_version
-            )
+            format!("daemon v{}", snap.daemon_version)
         }
     } else {
         "daemon offline".to_string()

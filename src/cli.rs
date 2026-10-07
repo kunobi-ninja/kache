@@ -1272,12 +1272,12 @@ fn service_rows(snap: &StatsSnapshot, config: &Config) -> Vec<StatsRow> {
     let mut rows: Vec<StatsRow> = Vec::new();
     // Daemon status
     if snap.daemon_connected {
-        let my_epoch = crate::daemon::build_epoch();
-        let mismatch = if snap.daemon_build_epoch != my_epoch {
-            " · a different build than this kache, restart pending"
-        } else {
-            ""
-        };
+        let mismatch =
+            if crate::daemon::client_version_is_newer(crate::VERSION, &snap.daemon_version) {
+                " · older release; upgrade available"
+            } else {
+                ""
+            };
         // Name the config file the daemon loaded (#689): the store cap and
         // policy lines describe THAT file, which need not be the one this
         // invocation resolved.
@@ -1293,7 +1293,11 @@ fn service_rows(snap: &StatsSnapshot, config: &Config) -> Vec<StatsRow> {
             .unwrap_or_default();
         rows.push((
             "Daemon",
-            format!("v{}", snap.daemon_version),
+            if snap.daemon_version.is_empty() {
+                "release unknown".into()
+            } else {
+                format!("v{}", snap.daemon_version)
+            },
             format!("running{config_note}{mismatch}"),
         ));
     } else {
@@ -6076,32 +6080,7 @@ fn daemon_footnote_needed(daemon_optional: bool, results: &[(&str, bool)]) -> bo
             .any(|(label, pass)| !pass && DAEMON_CHECK_LABELS.contains(label))
 }
 
-/// Wording for the "Daemon version" check, as `(pass, detail, fix hint)`.
-///
-/// Split out of [`doctor`] because the interesting part is the mid-upgrade
-/// states, and those are the ones a live run is least likely to catch. `daemon`
-/// is the version and build epoch of a daemon that answered; `starting_epoch` is
-/// the build epoch of one that holds the run lock but has not bound its socket
-/// yet. Both absent means nothing is running.
-///
-/// `doctor` reports these states rather than repairing them: restarting a stale
-/// daemon costs an 8s wait for the replacement to come up, which is `--fix`'s
-/// job, not a diagnostic's (kunobi-ninja/kache#720).
-///
-/// Build epochs are executable mtimes, and `0` means "could not be read". Two
-/// builds are therefore only ever *ordered* through
-/// [`crate::daemon::client_epoch_is_newer`], which rejects a zero on either side
-/// and rejects equal epochs. Everything it declines to order is genuinely
-/// unknown, and gets said so rather than guessed: telling someone their binary is
-/// stale on the strength of an unreadable mtime sends them to reinstall a kache
-/// that was fine.
-/// Whether `doctor` should replace a daemon left over from before an upgrade.
-///
-/// The one-line answer to the bug this all started from: only under `--fix`.
-/// Restarting costs the 8s the replacement needs to bind its socket, and a
-/// diagnostic that silently spends it — then reports the state it just
-/// invalidated — is what made a routine upgrade look like a broken install
-/// (kunobi-ninja/kache#720).
+/// Only doctor --fix may replace an older daemon release.
 fn should_restart_stale_daemon(fix_requested: bool, daemon_is_stale: bool) -> bool {
     fix_requested && daemon_is_stale
 }
@@ -6126,92 +6105,43 @@ fn stale_restart_note(outcome: &anyhow::Result<bool>) -> Option<String> {
     }
 }
 
+/// Report the daemon release without inferring order from build timestamps.
 fn daemon_version_check(
-    daemon: Option<(&str, u64)>,
-    starting_epoch: Option<u64>,
+    daemon: Option<&str>,
+    starting: bool,
     my_version: &str,
-    my_epoch: u64,
     startup_log: &str,
 ) -> (bool, String, Option<String>) {
-    match (daemon, starting_epoch) {
-        (Some((version, epoch)), _) if epoch > 0 && version == my_version && epoch == my_epoch => {
-            (true, format!("v{version} (epoch {epoch})"), None)
-        }
-        // Left running across an upgrade: the common case, and the one worth
-        // naming outright so the version pair does not read as a corrupt install.
-        //
-        // Reading its stats is what tells the daemon it is stale — it schedules
-        // a graceful restart on any request from a newer binary — so by the time
-        // this prints, the handoff is already under way. It exits cleanly, which
-        // launchd's `SuccessfulExit=false` and systemd's `Restart=on-failure`
-        // both decline to act on, so something has to start the replacement.
-        (Some((version, epoch)), _) if crate::daemon::client_epoch_is_newer(my_epoch, epoch) => (
-            false,
-            format!(
-                "daemon v{version} (epoch {epoch}) predates binary v{my_version} \
-                 (epoch {my_epoch}) — it is shutting down now"
+    use std::cmp::Ordering;
+    match daemon {
+        Some(version) => match crate::daemon::compare_daemon_version(my_version, version) {
+            Some(Ordering::Equal) => (true, format!("v{version}"), None),
+            Some(Ordering::Greater) => (
+                false,
+                format!("daemon v{version} predates binary v{my_version}; it remains active"),
+                Some("`kache doctor --fix` or `kache daemon start` to upgrade".into()),
             ),
-            Some(
-                "the next build starts the replacement; `kache doctor --fix` or \
-                 `kache daemon start` to do it now"
-                    .into(),
+            Some(Ordering::Less) => (
+                true,
+                format!("daemon v{version} is newer than binary v{my_version}"),
+                None,
             ),
-        ),
-        // The daemon is the newer build: an old binary is on PATH, and
-        // restarting the daemon would be the wrong advice.
-        (Some((version, epoch)), _) if crate::daemon::client_epoch_is_newer(epoch, my_epoch) => (
-            false,
-            format!(
-                "daemon v{version} (epoch {epoch}) is newer than binary v{my_version} \
-                 (epoch {my_epoch})"
+            None => (
+                true,
+                format!("daemon release unknown ({version}); automatic upgrade disabled"),
+                None,
             ),
-            Some("this binary is the stale one — reinstall kache or fix PATH".into()),
-        ),
-        // Mismatched, but in no determinable order: an unreadable mtime on either
-        // side, or one build epoch carrying two version strings. Say that much and
-        // no more — the two arms above are the ones that name a culprit, and
-        // naming the wrong one sends someone to reinstall a working install.
-        (Some((version, epoch)), _) => (
-            false,
-            format!(
-                "daemon v{version} (epoch {epoch}) does not match binary v{my_version} \
-                 (epoch {my_epoch}), and their build order cannot be determined"
-            ),
-            // Deliberately not "restart the daemon": in an unordered state the
-            // daemon may be the newer build, and restarting it through this
-            // binary would downgrade it.
-            Some("work out which kache build should be running, then restart from that one".into()),
-        ),
-        // Nothing answered, but a daemon is on its way up. Reporting "not
-        // reachable → start the daemon" here is what made a routine upgrade look
-        // like a broken install.
-        //
-        // Passing: the check asks whether the daemon matches this binary, and the
-        // coordinator file answers yes. Not yet accepting connections is what the
-        // detail says, not a fault to count against the install.
-        //
-        // Phrased around the epoch, not the version: coordinator state carries no
-        // version string, and one mtime second can carry two of them, so the
-        // matching build is all this state actually establishes.
-        (None, Some(epoch)) if epoch > 0 && epoch == my_epoch => (
+        },
+        None if starting => (
             true,
-            format!("a daemon of this build (epoch {epoch}) is starting — not serving yet"),
+            "a daemon is starting; release not yet reported".into(),
             None,
         ),
-        (None, Some(epoch)) => (
-            false,
-            format!(
-                "a daemon (epoch {epoch}) is starting; this binary is v{my_version} \
-                 (epoch {my_epoch})"
-            ),
-            Some("re-run `kache doctor` in a moment".into()),
-        ),
-        (None, None) => (
+        None => (
             false,
             "daemon not reachable".into(),
             Some(format!(
-                "start daemon with `kache daemon start` or `kache daemon install`; \
-                 if it does not start, the reason is in {startup_log}"
+                "start daemon with `kache daemon start` or `kache daemon install`; if it does not start, the reason is in {startup_log}"
             )),
         ),
     }
@@ -6684,13 +6614,12 @@ pub fn doctor(
     let my_version = crate::VERSION;
     let mut healthy_daemon_reachable = false;
     if let Some(ref cfg) = config {
-        let my_epoch = crate::daemon::build_epoch();
         let mut stats = crate::daemon::send_stats_request_without_restart(cfg, false).ok();
 
         let is_stale = |stats: &Option<crate::daemon::StatsResponse>| {
             stats
                 .as_ref()
-                .is_some_and(|s| crate::daemon::client_epoch_is_newer(my_epoch, s.build_epoch))
+                .is_some_and(|s| crate::daemon::client_version_is_newer(my_version, &s.version))
         };
 
         if should_restart_stale_daemon(fix, is_stale(&stats)) {
@@ -6709,10 +6638,9 @@ pub fn doctor(
         healthy_daemon_reachable = stats.is_some();
 
         let (pass, detail, fix_hint) = daemon_version_check(
-            stats.as_ref().map(|s| (s.version.as_str(), s.build_epoch)),
-            crate::daemon::starting_daemon_epoch(cfg),
+            stats.as_ref().map(|s| s.version.as_str()),
+            crate::daemon::starting_daemon_epoch(cfg).is_some(),
             my_version,
-            my_epoch,
             &crate::service::startup_log(cfg).to_string(),
         );
         checks.push(Check {

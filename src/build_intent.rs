@@ -106,12 +106,12 @@ fn discover_with_context(
 
 pub fn into_build_started_request(
     intent: BuildIntent,
-    client_epoch: u64,
     session_id: String,
 ) -> crate::daemon::BuildStartedRequest {
     crate::daemon::BuildStartedRequest {
         intent,
-        client_epoch,
+        client_epoch: 0,
+        client_version: Some(crate::VERSION.to_owned()),
         session_id,
     }
 }
@@ -620,7 +620,7 @@ mod tests {
             lock_path: None,
         };
 
-        let req = into_build_started_request(intent, 42, "sess-test".into());
+        let req = into_build_started_request(intent, "sess-test".into());
         assert_eq!(req.intent.crate_names, vec!["serde", "tokio"]);
         assert_eq!(req.intent.namespace.as_deref(), Some("x86_64/hash/release"));
         assert_eq!(req.intent.cargo_lock_deps.len(), 1);
@@ -628,7 +628,8 @@ mod tests {
             req.intent.identity_key.as_deref(),
             Some("id/abcd/x86_64-unknown-linux-gnu/release")
         );
-        assert_eq!(req.client_epoch, 42);
+        assert_eq!(req.client_epoch, 0);
+        assert_eq!(req.client_version.as_deref(), Some(crate::VERSION));
     }
 
     #[test]

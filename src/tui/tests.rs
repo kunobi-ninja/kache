@@ -1564,7 +1564,11 @@ fn store_names_the_daemon_and_now_leaves_the_version_off() {
 
     let store = rendered_tab(&mut state, Tab::Store);
     assert!(store.contains("9.9.9"), "{store}");
-    assert!(store.contains("restart pending"), "{store}");
+    assert!(!store.contains("upgrade available"), "{store}");
+    state.stats_snapshot.daemon_version = "0.0.1".into();
+    let store = rendered_tab(&mut state, Tab::Store);
+    assert!(store.contains("upgrade available"), "{store}");
+    state.stats_snapshot.daemon_version = "9.9.9".into();
 
     state.stats_snapshot.daemon_build_epoch = crate::daemon::build_epoch();
     let store = rendered_tab(&mut state, Tab::Store);

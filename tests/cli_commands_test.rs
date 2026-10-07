@@ -1775,7 +1775,7 @@ fn init_rejects_unavailable_daemon_replacement() {
         // this test process, which owns the old daemon's run lock.
         drop(listener);
         let response = serde_json::json!({
-            "ok": true, "health": { "version": "old", "build_epoch": 1 }
+            "ok": true, "health": { "version": "0.0.1", "build_epoch": 1 }
         });
         writeln!(stream, "{response}").unwrap();
     });
@@ -1823,7 +1823,7 @@ fn init_upgrade_keeps_the_service_manager_in_charge() {
         drop(listener);
         writeln!(
             stream,
-            "{{\"ok\":true,\"health\":{{\"version\":\"old\",\"build_epoch\":1}}}}"
+            "{{\"ok\":true,\"health\":{{\"version\":\"0.0.1\",\"build_epoch\":1}}}}"
         )
         .unwrap();
     });
@@ -4123,4 +4123,52 @@ fn diff_is_quiet_when_the_sessions_match() {
         .success()
         .stdout(predicates::str::contains("EXCESS").not())
         .stdout(predicates::str::contains("misses 1 -> 1"));
+}
+
+/// Copying a release changes its mtime, not the daemon release it requires.
+#[test]
+fn same_release_copy_keeps_the_running_daemon() {
+    let e = env();
+    e.cmd().args(["daemon", "start"]).assert().success();
+    let status = || {
+        let out = e
+            .cmd()
+            .args(["daemon", "status", "--json"])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(value["daemon_running"], true, "{value}");
+        let socket = Path::new(value["socket"].as_str().unwrap());
+        let state: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(socket.with_extension("state.json")).unwrap())
+                .unwrap();
+        state["pid"].as_u64().unwrap()
+    };
+    let before = status();
+    let copied = e.home.join(if cfg!(windows) {
+        "kache-copy.exe"
+    } else {
+        "kache-copy"
+    });
+    std::fs::copy(KACHE_BIN, &copied).unwrap();
+    filetime::set_file_mtime(
+        &copied,
+        filetime::FileTime::from_unix_time(2_000_000_000, 0),
+    )
+    .unwrap();
+    kache_as(&copied, &e.home, &e.cache)
+        .args(["daemon", "start"])
+        .assert()
+        .success();
+    kache_as(&copied, &e.home, &e.cache)
+        .arg("stats")
+        .assert()
+        .success();
+    kache_as(&copied, &e.home, &e.cache)
+        .arg("doctor")
+        .assert()
+        .success();
+    let after = status();
+    assert_eq!(before, after, "same release must retain the daemon PID");
 }

@@ -539,148 +539,41 @@ fn daemon_footnote_only_for_downgraded_daemon_failures() {
 
 // ── Daemon version reporting (kunobi-ninja/kache#720) ──────────────────
 
-/// The upgrade window: a daemon from before the upgrade is still answering.
-/// It must read as an upgrade left to finish, not as a version conflict, and
-/// the hint must point at the flag that actually restarts it.
 #[test]
-fn daemon_version_check_names_the_pending_upgrade() {
-    let (pass, detail, fix) = daemon_version_check(
-        Some(("0.13.0", 100)),
-        None,
-        "0.14.0",
-        200,
-        "/run/kache/daemon.log",
-    );
-    assert!(!pass);
-    assert!(detail.contains("predates"), "{detail}");
-    assert!(
-        detail.contains("0.13.0") && detail.contains("0.14.0"),
-        "{detail}"
-    );
-    assert!(detail.contains("shutting down"), "{detail}");
-    assert!(fix.unwrap().contains("doctor --fix"));
-}
-
-/// Epochs are executable mtimes and `0` means unreadable, so several
-/// mismatches are genuinely unordered. Guessing a culprit there sends someone
-/// to reinstall a working kache, so every one of them must decline to.
-#[test]
-fn daemon_version_check_does_not_invent_an_order_it_cannot_determine() {
-    for (daemon, my_version, my_epoch, case) in [
-        (("0.13.0", 0), "0.14.0", 200, "daemon epoch unreadable"),
-        (("0.13.0", 200), "0.14.0", 0, "binary epoch unreadable"),
-        (("0.13.0", 0), "0.14.0", 0, "neither epoch readable"),
+fn daemon_version_check_reports_release_order_and_unknown_legacy_versions() {
+    for (daemon, client, pass, message, fix) in [
+        ("0.13.0", "0.14.0", false, "remains active", true),
+        ("0.14.0", "0.13.0", true, "newer than binary", false),
         (
-            ("0.13.0", 200),
-            "0.14.0",
-            200,
-            "one build, two version strings",
+            "0.14.0+build.1",
+            "0.14.0+build.2",
+            true,
+            "v0.14.0+build.1",
+            false,
         ),
+        ("", "0.14.0", true, "unknown", false),
+        ("legacy", "0.14.0", true, "unknown", false),
+        ("0.14.0", "development", true, "unknown", false),
     ] {
-        let (pass, detail, fix) = daemon_version_check(
-            Some(daemon),
-            None,
-            my_version,
-            my_epoch,
-            "/run/kache/daemon.log",
-        );
-        assert!(!pass, "{case}: {detail}");
-        assert!(detail.contains("cannot be determined"), "{case}: {detail}");
-        let fix = fix.unwrap();
-        assert!(
-            !fix.contains("this binary is the stale one"),
-            "{case}: {fix}"
-        );
+        let (actual, detail, hint) =
+            daemon_version_check(Some(daemon), false, client, "/run/kache/daemon.log");
+        assert_eq!(actual, pass, "{detail}");
+        assert!(detail.contains(message), "{detail}");
+        assert_eq!(hint.is_some(), fix, "{hint:?}");
+        if let Some(hint) = hint {
+            assert!(hint.contains("doctor --fix"));
+        }
+        assert!(!detail.contains("shutting down"));
     }
-
-    // Equal version strings and unreadable epochs are not evidence of the
-    // same build either — that pair must not pass.
-    let (pass, detail, _) = daemon_version_check(
-        Some(("0.14.0", 0)),
-        None,
-        "0.14.0",
-        0,
-        "/run/kache/daemon.log",
-    );
-    assert!(!pass, "{detail}");
 }
 
-/// The other direction — an old binary against a newer daemon — must not
-/// advise restarting the daemon, which would downgrade it.
 #[test]
-fn daemon_version_check_blames_the_binary_when_the_daemon_is_newer() {
-    let (pass, detail, fix) = daemon_version_check(
-        Some(("0.14.0", 200)),
-        None,
-        "0.13.0",
-        100,
-        "/run/kache/daemon.log",
-    );
-    assert!(!pass);
-    assert!(detail.contains("newer than binary"), "{detail}");
-    let fix = fix.unwrap();
-    assert!(fix.contains("this binary is the stale one"), "{fix}");
-    assert!(!fix.contains("daemon start"), "{fix}");
-}
-
-/// Matching build: the only passing state, and it stays terse.
-#[test]
-fn daemon_version_check_passes_on_identical_build() {
-    let (pass, detail, fix) = daemon_version_check(
-        Some(("0.14.0", 200)),
-        None,
-        "0.14.0",
-        200,
-        "/run/kache/daemon.log",
-    );
+fn daemon_version_check_reports_pending_start_without_guessing_the_release() {
+    let (pass, detail, hint) = daemon_version_check(None, true, "0.14.0", "/run/kache/daemon.log");
     assert!(pass);
-    assert_eq!(detail, "v0.14.0 (epoch 200)");
-    assert!(fix.is_none());
-}
-
-/// Same version string, different build — a locally rebuilt daemon is stale
-/// even though the version reads identical.
-#[test]
-fn daemon_version_check_catches_same_version_different_build() {
-    let (pass, detail, _) = daemon_version_check(
-        Some(("0.14.0", 100)),
-        None,
-        "0.14.0",
-        200,
-        "/run/kache/daemon.log",
-    );
-    assert!(!pass, "{detail}");
-    assert!(detail.contains("predates"), "{detail}");
-}
-
-/// The window that made a routine upgrade look like a broken install: no
-/// daemon answers yet because the replacement is still binding its socket.
-/// Reporting "not reachable → start the daemon" there is actively wrong, and
-/// so is counting a healthy transient against the install — the coordinator
-/// file says the right build is coming up, which is what this check asks.
-#[test]
-fn daemon_version_check_reports_a_daemon_that_is_still_starting() {
-    let (pass, detail, fix) =
-        daemon_version_check(None, Some(200), "0.14.0", 200, "/run/kache/daemon.log");
-    assert!(pass, "{detail}");
-    assert!(detail.contains("starting"), "{detail}");
-    assert!(fix.is_none());
-    // Coordinator state has no version string, so none may be asserted here.
-    assert!(!detail.contains("v0.14.0"), "{detail}");
-
-    // A starting daemon of some other build gets named as such rather than
-    // silently claimed to be this one.
-    let (pass, detail, _) =
-        daemon_version_check(None, Some(100), "0.14.0", 200, "/run/kache/daemon.log");
-    assert!(!pass, "{detail}");
-    assert!(detail.contains("epoch 100"), "{detail}");
-    assert!(detail.contains("0.14.0"), "{detail}");
-
-    // An unreadable epoch on both sides is not a match, so it must not pass
-    // through the equality arm.
-    let (pass, detail, _) =
-        daemon_version_check(None, Some(0), "0.14.0", 0, "/run/kache/daemon.log");
-    assert!(!pass, "{detail}");
+    assert!(detail.contains("starting"));
+    assert!(!detail.contains("v0.14.0"));
+    assert!(hint.is_none());
 }
 
 /// The behaviour this whole change exists for: a plain `doctor` run reports
@@ -714,8 +607,7 @@ fn stale_restart_note_never_claims_a_replacement_that_may_not_exist() {
 /// Nothing answering and nothing coming up keeps the original wording.
 #[test]
 fn daemon_version_check_reports_an_absent_daemon() {
-    let (pass, detail, fix) =
-        daemon_version_check(None, None, "0.14.0", 200, "/run/kache/daemon.log");
+    let (pass, detail, fix) = daemon_version_check(None, false, "0.14.0", "/run/kache/daemon.log");
     assert!(!pass);
     assert_eq!(detail, "daemon not reachable");
     let fix = fix.unwrap();
@@ -727,15 +619,10 @@ fn daemon_version_check_reports_an_absent_daemon() {
 /// `Starting` record must not relabel a reachable daemon as starting.
 #[test]
 fn daemon_version_check_prefers_the_daemon_that_answered() {
-    let (pass, detail, _) = daemon_version_check(
-        Some(("0.14.0", 200)),
-        Some(100),
-        "0.14.0",
-        200,
-        "/run/kache/daemon.log",
-    );
+    let (pass, detail, _) =
+        daemon_version_check(Some("0.14.0"), true, "0.14.0", "/run/kache/daemon.log");
     assert!(pass, "{detail}");
-    assert_eq!(detail, "v0.14.0 (epoch 200)");
+    assert_eq!(detail, "v0.14.0");
 }
 
 // ── Eviction reporting (kunobi-ninja/kache#509) ────────────────────────
@@ -4223,7 +4110,7 @@ fn render_stats_rich_snapshot_covers_all_lines() {
     snap.entry_count = 3;
     snap.daemon_connected = true;
     snap.daemon_version = "9.9.9".to_string();
-    snap.daemon_build_epoch = crate::daemon::build_epoch(); // matches -> no mismatch
+    snap.daemon_build_epoch = crate::daemon::build_epoch(); // timestamps do not determine release order
     snap.event_stats.local_hits = 8;
     snap.event_stats.misses = 2;
     snap.event_stats.total_elapsed_ms = 1000;
@@ -4739,7 +4626,7 @@ fn render_stats_prefetch_policy_labels_client_fallback_for_old_daemon() {
     );
     assert_eq!(
         stats_row(&out, "Daemon").unwrap(),
-        "Daemon | v | running",
+        "Daemon | release unknown | running",
         "no daemon config path to show without a report"
     );
 }
@@ -4902,13 +4789,13 @@ fn render_stats_daemon_mismatch_and_local_only() {
 
     let mut snap = StatsSnapshot::default();
     snap.daemon_connected = true;
-    snap.daemon_version = "1.0.0".to_string();
-    snap.daemon_build_epoch = crate::daemon::build_epoch().wrapping_add(1); // mismatch
+    snap.daemon_version = "0.0.1".to_string();
+    snap.daemon_build_epoch = crate::daemon::build_epoch().wrapping_add(1);
     let out = render_stats(&snap, &config, SinceWindow::DEFAULT);
     assert!(
         stats_row(&out, "Daemon")
             .unwrap()
-            .ends_with(" · a different build than this kache, restart pending")
+            .ends_with(" · older release; upgrade available")
     );
     assert!(
         stats_row(&out, "Remote")

@@ -234,9 +234,8 @@ const FILE_HASH_MEMORY_CACHE_CAP: usize = 4096;
 /// rows, and an hour outlasts any put still in flight.
 pub(crate) const ORPHAN_BLOB_GRACE: Duration = Duration::from_secs(3600);
 
-/// Compute a "build epoch" from the executable's mtime.
-/// This changes every time `cargo build` produces a new binary,
-/// giving us a cheap way to detect when the daemon is running stale code.
+/// Executable mtime used to distinguish coordinator records during cleanup.
+/// It is not a release version and must not determine replacement policy.
 pub fn build_epoch() -> u64 {
     static BUILD_EPOCH: OnceLock<u64> = OnceLock::new();
 
@@ -397,10 +396,16 @@ fn daemon_state_is_recent(state: &DaemonCoordState) -> bool {
         .is_some_and(|age_ms| age_ms <= DAEMON_COORD_STALE_AFTER.as_millis() as u64)
 }
 
-/// Whether `client_epoch` is a strictly newer build than `daemon_epoch`. A zero
-/// on either side means "unknown", never "older".
-pub(crate) fn client_epoch_is_newer(client_epoch: u64, daemon_epoch: u64) -> bool {
-    client_epoch > 0 && daemon_epoch > 0 && client_epoch > daemon_epoch
+/// Compare release precedence, ignoring build metadata. Missing or malformed
+/// versions are unknown and cannot authorize an automatic replacement.
+pub(crate) fn compare_daemon_version(client: &str, daemon: &str) -> Option<std::cmp::Ordering> {
+    let client = semver::Version::parse(client).ok()?;
+    let daemon = semver::Version::parse(daemon).ok()?;
+    Some(client.cmp_precedence(&daemon))
+}
+
+pub(crate) fn client_version_is_newer(client: &str, daemon: &str) -> bool {
+    compare_daemon_version(client, daemon) == Some(std::cmp::Ordering::Greater)
 }
 
 /// Whether `pid` may still be running (see [`alive_from_state`]).
@@ -523,15 +528,15 @@ impl Request {
         )
     }
 
-    /// The client binary's build epoch, for the requests that carry one. A
-    /// client newer than the daemon makes it schedule a restart.
-    fn client_epoch(&self) -> u64 {
+    /// Only a declared newer release may request replacement after admission.
+    fn client_version(&self) -> Option<&str> {
         match self {
-            Request::Upload(job) => job.client_epoch,
-            Request::Stats(req) => req.client_epoch,
-            Request::BuildStarted(req) => req.client_epoch,
-            Request::PublishCc(req) => req.client_epoch,
-            _ => 0,
+            Request::Upload(job) => job.client_version.as_deref(),
+            Request::Stats(req) => req.client_version.as_deref(),
+            Request::BuildStarted(req) => req.client_version.as_deref(),
+            Request::CompileStarted(req) => req.client_version.as_deref(),
+            Request::PublishCc(req) => req.client_version.as_deref(),
+            _ => None,
         }
     }
 }
@@ -542,9 +547,12 @@ pub struct UploadJob {
     pub entry_dir: String,
     #[serde(default)]
     pub crate_name: String,
-    /// Client binary mtime — lets the daemon detect when it's running stale code.
+    /// Legacy timestamp field; new clients send zero to avoid restarting old daemons.
     #[serde(default)]
     pub client_epoch: u64,
+    /// Release requesting an upgrade. Absent from legacy and read-only requests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_version: Option<String>,
 }
 
 /// How long the daemon spends fetching one prediction row. A row saves one
@@ -617,6 +625,7 @@ fn normalize_upload_job(config: &Config, job: &UploadJob) -> Result<UploadJob> {
         entry_dir: config.store_dir().join(&job.key).display().to_string(),
         crate_name: job.crate_name.clone(),
         client_epoch: job.client_epoch,
+        client_version: job.client_version.clone(),
     })
 }
 
@@ -719,10 +728,10 @@ fn persist_upload_job(config: &Config, job: &UploadJob) -> Result<UploadJob> {
         crate::atomic::fsync_dir,
     )?;
     if let Some(mut existing) = existing_upload_job(config, &normalized.key)? {
-        // The durable first winner stays byte-for-byte unchanged, but the live
-        // wire request must carry this caller's epoch so a newer wrapper can
-        // still trigger stale-daemon replacement.
+        // The durable first winner stays unchanged; the live request carries
+        // this caller's release so a newer wrapper can request replacement.
         existing.client_epoch = normalized.client_epoch;
+        existing.client_version = normalized.client_version.clone();
         return Ok(existing);
     }
 
@@ -733,6 +742,7 @@ fn persist_upload_job(config: &Config, job: &UploadJob) -> Result<UploadJob> {
     // Another publisher may have won while this process waited for GC.
     if let Some(mut existing) = existing_upload_job(config, &normalized.key)? {
         existing.client_epoch = normalized.client_epoch;
+        existing.client_version = normalized.client_version.clone();
         return Ok(existing);
     }
     // This check and the first durable publication are one critical section
@@ -760,6 +770,7 @@ fn persist_upload_job(config: &Config, job: &UploadJob) -> Result<UploadJob> {
         let mut existing = existing_upload_job(config, &normalized.key)?
             .context("upload intent winner disappeared")?;
         existing.client_epoch = normalized.client_epoch;
+        existing.client_version = normalized.client_version.clone();
         Ok(existing)
     }
 }
@@ -1054,9 +1065,12 @@ pub struct StatsRequest {
     /// `event_hours` when present, so `--since 15m` is a 15 minute window.
     #[serde(default)]
     pub event_secs: Option<u64>,
-    /// Client binary mtime — lets the daemon detect when it's running stale code.
+    /// Legacy timestamp field; new clients send zero to avoid restarting old daemons.
     #[serde(default)]
     pub client_epoch: u64,
+    /// Release requesting an upgrade. Absent from legacy and read-only requests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_version: Option<String>,
 }
 
 impl StatsRequest {
@@ -1216,9 +1230,12 @@ impl PackPrefetchContext {
 pub struct BuildStartedRequest {
     #[serde(default)]
     pub intent: kache_core::BuildIntent,
-    /// Client binary mtime — lets the daemon detect when it's running stale code.
+    /// Legacy timestamp field; new clients send zero to avoid restarting old daemons.
     #[serde(default)]
     pub client_epoch: u64,
+    /// Release requesting an upgrade. Absent from legacy and read-only requests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_version: Option<String>,
     /// Build session id minted by the wrapper that won the session-marker
     /// lock (kunobi-ninja/kache#583 P0.5). Empty from legacy wrappers.
     #[serde(default)]
@@ -1246,9 +1263,12 @@ pub struct CompileStartedRequest {
     /// (lazily, on the first heartbeat tick).
     #[serde(default)]
     pub typical_ms: Option<u64>,
-    /// Client binary mtime — lets the daemon detect when it's running stale code.
+    /// Legacy timestamp field; new clients send zero to avoid restarting old daemons.
     #[serde(default)]
     pub client_epoch: u64,
+    /// Release requesting an upgrade. Absent from legacy and read-only requests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_version: Option<String>,
 }
 
 /// Remove a finished compile from the in-flight registry (fire-and-forget
@@ -1267,7 +1287,10 @@ pub struct CompileFinishedRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DaemonHealth {
+    #[serde(default)]
     pub version: String,
+    /// Retired timestamp field. Zero prevents legacy clients from inferring an upgrade.
+    #[serde(default)]
     pub build_epoch: u64,
 }
 
@@ -1290,6 +1313,7 @@ pub struct StatsResponse {
     pub recent_summaries: Vec<crate::events::BuildSummaryEvent>,
     #[serde(default)]
     pub version: String,
+    /// Retired timestamp field. Zero prevents legacy clients from inferring an upgrade.
     #[serde(default)]
     pub build_epoch: u64,
     /// GC request semantics supported by this daemon. Version 2 means the
@@ -2723,7 +2747,6 @@ pub(crate) struct Daemon {
     /// crashed wrapper must not leave a ghost entry forever.
     in_flight_compiles: std::sync::Mutex<HashMap<u32, CompileStartedRequest>>,
     version: String,
-    build_epoch: u64,
     /// What this daemon actually loaded, reported in every stats response so
     /// daemon-backed CLI reads can render the daemon's view and name a
     /// CLI/daemon config divergence (kunobi-ninja/kache#689).
@@ -2844,7 +2867,6 @@ impl Daemon {
             active_plan: Arc::new(std::sync::Mutex::new(None)),
             in_flight_compiles: std::sync::Mutex::new(HashMap::new()),
             version: VERSION.to_string(),
-            build_epoch: build_epoch(),
             effective_config: EffectiveConfig::capture(&config, provenance),
             transfer_counters: TransferCounters::new(),
             recent_transfers: std::sync::Mutex::new(std::collections::VecDeque::new()),
@@ -3549,7 +3571,7 @@ impl Daemon {
         Response {
             health: Some(DaemonHealth {
                 version: self.version.clone(),
-                build_epoch: self.build_epoch,
+                build_epoch: 0,
             }),
             ..Response::ok()
         }
@@ -3628,7 +3650,7 @@ impl Daemon {
             blob_stats: Some(inventory.blob_stats),
             recent_summaries,
             version: self.version.clone(),
-            build_epoch: self.build_epoch,
+            build_epoch: 0,
             gc_policy_version: GC_POLICY_PROTOCOL_VERSION,
             pending_uploads,
             active_downloads,
@@ -8528,8 +8550,11 @@ async fn handle_connection_started_at(
         let start = Instant::now();
         let parsed = serde_json::from_str::<Request>(&line);
 
-        // Extract client_epoch from fire-and-forget requests for staleness detection.
-        let client_epoch = parsed.as_ref().map_or(0, Request::client_epoch);
+        let client_version = parsed
+            .as_ref()
+            .ok()
+            .and_then(Request::client_version)
+            .map(str::to_owned);
 
         if parsed.as_ref().is_ok_and(Request::is_build_activity) {
             daemon.request_clock.touch(Instant::now());
@@ -8597,14 +8622,17 @@ async fn handle_connection_started_at(
         };
         let elapsed = start.elapsed();
 
-        // If the client binary is newer than this daemon, schedule a graceful restart.
-        // The daemon finishes processing in-flight work, then exits so launchd/systemd
-        // restarts it with the updated binary.
-        if client_epoch_is_newer(client_epoch, daemon.build_epoch) && lifecycle.accepting_calls() {
+        // Accepted work keeps its response and existing drain guarantees.
+        // Legacy epochs are ignored: rebuilding a client is not an upgrade.
+        if client_version
+            .as_deref()
+            .is_some_and(|version| client_version_is_newer(version, &daemon.version))
+            && lifecycle.accepting_calls()
+        {
             tracing::info!(
-                daemon_epoch = daemon.build_epoch,
-                client_epoch,
-                "client binary is newer than daemon, scheduling restart"
+                daemon_version = daemon.version,
+                client_version,
+                "newer client release requested daemon replacement"
             );
             lifecycle.start_drain();
             // Wake the accept loop so the restart starts now (issue #288).
@@ -8702,7 +8730,8 @@ pub fn send_upload_job(
         key: key.to_string(),
         entry_dir: entry_dir.to_string_lossy().into_owned(),
         crate_name: crate_name.to_string(),
-        client_epoch: build_epoch(),
+        client_epoch: 0,
+        client_version: Some(VERSION.to_owned()),
     };
     // Durability precedes the fire-and-forget socket write. If the daemon is
     // absent or restarts after accepting bytes, startup replay still sees the
@@ -9016,10 +9045,8 @@ fn hash_files_results_from_response_line(resp_str: &str) -> Result<Vec<HashFileR
 
 /// Send a build-started hint to the daemon. Non-blocking, fire-and-forget.
 ///
-/// The request carries `client_epoch` (our binary mtime) so the daemon can
-/// detect when it's running stale code and self-restart. This replaces the
-/// previous stats-request-based version check, avoiding an extra round-trip
-/// that was prone to timeouts during daemon startup.
+/// The declared client release lets a daemon finish accepted work and drain
+/// for a newer release without adding a readiness round trip to the build.
 pub fn send_build_started(config: &Config, req: BuildStartedRequest) {
     let socket_path = config.socket_path();
     let crate_count = req.intent.crate_names.len();
@@ -9174,7 +9201,7 @@ pub fn send_compile_finished(socket_path: &std::path::Path, pid: u32, started_at
 pub fn send_health_request(config: &Config) -> Result<DaemonHealth> {
     let health = fetch_daemon_health(config)?;
     anyhow::ensure!(
-        !client_epoch_is_newer(build_epoch(), health.build_epoch),
+        !client_version_is_newer(VERSION, &health.version),
         "daemon needs an upgrade"
     );
     Ok(health)
@@ -9215,17 +9242,8 @@ pub fn send_stats_request(
     send_stats_request_options(config, include_entries, false, sort_by, window)
 }
 
-/// Read the daemon's stats without starting or waiting for a replacement.
-///
-/// Not the same as side-effect-free, and deliberately not named that way: the
-/// request still carries this binary's build epoch, so an older daemon schedules
-/// its own graceful shutdown after answering, exactly as it does for any other
-/// client. What this variant drops is the *client* side of that handoff —
-/// [`send_stats_request`] spawns the replacement and blocks up to
-/// [`DAEMON_START_TIMEOUT`] waiting for it to bind its socket.
-///
-/// `doctor` reads through this variant because a pending upgrade is something to
-/// describe, not something to stall on (kunobi-ninja/kache#720).
+/// Read stats without requesting a drain, starting a daemon, or waiting for a
+/// replacement. Legacy daemons also receive epoch zero, meaning unknown.
 pub fn send_stats_request_without_restart(
     config: &Config,
     include_entries: bool,
@@ -9237,6 +9255,7 @@ pub fn send_stats_request_without_restart(
         None,
         None,
         STATS_READ_TIMEOUT,
+        false,
     )
 }
 
@@ -9247,7 +9266,6 @@ pub(crate) fn send_stats_request_options(
     sort_by: Option<&str>,
     window: Option<crate::since::SinceWindow>,
 ) -> Result<StatsResponse> {
-    let client_epoch = build_epoch();
     let stats = fetch_stats(
         config,
         include_entries,
@@ -9255,12 +9273,13 @@ pub(crate) fn send_stats_request_options(
         sort_by,
         window,
         STATS_READ_TIMEOUT,
+        true,
     )?;
 
     refresh_stale_response(
         stats,
-        client_epoch,
-        |stats| stats.build_epoch,
+        VERSION,
+        |stats| &stats.version,
         || restart_daemon_for_stale_client(config),
         || {
             fetch_stats(
@@ -9270,6 +9289,7 @@ pub(crate) fn send_stats_request_options(
                 sort_by,
                 window,
                 STATS_REFETCH_TIMEOUT,
+                true,
             )
         },
     )
@@ -9277,24 +9297,27 @@ pub(crate) fn send_stats_request_options(
 
 fn refresh_stale_response<T>(
     stats: T,
-    client_epoch: u64,
-    epoch: impl Fn(&T) -> u64,
+    client_version: &str,
+    version: impl Fn(&T) -> &str,
     restart: impl FnOnce() -> Result<bool>,
     refetch: impl FnOnce() -> Result<T>,
 ) -> Result<T> {
-    if !client_epoch_is_newer(client_epoch, epoch(&stats)) {
+    if !client_version_is_newer(client_version, version(&stats)) {
         return Ok(stats);
     }
     tracing::info!(
-        daemon_epoch = epoch(&stats),
-        client_epoch,
-        "stale daemon detected, restarting"
+        daemon_version = version(&stats),
+        client_version,
+        "older daemon release detected, replacing"
     );
     anyhow::ensure!(restart()?, "replacement daemon did not become ready");
     let fresh = refetch().context("reading replacement daemon response")?;
     anyhow::ensure!(
-        !client_epoch_is_newer(client_epoch, epoch(&fresh)),
-        "replacement daemon is still older than this client"
+        matches!(
+            compare_daemon_version(client_version, version(&fresh)),
+            Some(std::cmp::Ordering::Equal | std::cmp::Ordering::Less)
+        ),
+        "replacement daemon did not report the required release version"
     );
     Ok(fresh)
 }
@@ -9307,6 +9330,7 @@ fn fetch_stats(
     sort_by: Option<&str>,
     window: Option<crate::since::SinceWindow>,
     read_timeout: Duration,
+    request_upgrade: bool,
 ) -> Result<StatsResponse> {
     let req = Request::Stats(StatsRequest {
         include_entries,
@@ -9316,7 +9340,8 @@ fn fetch_stats(
         // answer with a superset of a sub-hour window rather than nothing.
         event_hours: window.map(|w| w.secs().div_ceil(3600)),
         event_secs: window.map(crate::since::SinceWindow::secs),
-        client_epoch: build_epoch(),
+        client_epoch: 0,
+        client_version: request_upgrade.then(|| VERSION.to_owned()),
     });
 
     let resp_str = send_request_with_timeout(&config.socket_path(), &req, read_timeout)?;

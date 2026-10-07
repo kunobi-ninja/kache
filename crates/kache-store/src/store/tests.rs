@@ -12454,14 +12454,15 @@ fn read_only_maintenance_preserves_files_and_registered_incremental_directories(
     fs::create_dir_all(owner.staging_dir()).unwrap();
     let staging = owner.staging_dir().join("abandoned.tmp");
     fs::write(&staging, b"staged bytes").unwrap();
-    let mut perms = fs::metadata(&staging).unwrap().permissions();
-    perms.set_readonly(true);
-    fs::set_permissions(&staging, perms).unwrap();
     let stale_lock = owner.entry_dir("stale-key").with_extension("lock");
     drop(owner.try_lock("stale-key").unwrap().unwrap());
     let old = filetime::FileTime::from_unix_time(0, 0);
     filetime::set_file_mtime(&staging, old).unwrap();
     filetime::set_file_mtime(&stale_lock, old).unwrap();
+    // Apply fixture timestamps before readonly permissions for Windows.
+    let mut perms = fs::metadata(&staging).unwrap().permissions();
+    perms.set_readonly(true);
+    fs::set_permissions(&staging, perms).unwrap();
     let before = ro_tree_snapshot(dir.path());
     let ro = Store::open_read_only(&config).unwrap();
 

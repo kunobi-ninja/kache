@@ -499,19 +499,71 @@ fn lookup_or_miss_waits_for_a_busy_index() {
 }
 
 /// An index that stays busy past the budget is a miss (`None`, the remapped
-/// compile path), never a passthrough. The pauses double, stop growing at
-/// 500 ms and add up to exactly the budget.
+/// compile path), never a passthrough. Without lookup overhead, the pauses
+/// double, stop growing at 500 ms and add up to exactly the budget.
 #[test]
 fn lookup_or_miss_gives_a_busy_index_up_as_a_miss_after_the_budget() {
     let mut naps = Vec::new();
-    let found = super::lookup_or_miss(
+    let clock = std::cell::Cell::new(std::time::Duration::ZERO);
+    let found = super::lookup_or_miss_with_clock(
         "kt",
         std::time::Duration::from_secs(2),
-        |nap| naps.push(nap),
+        || clock.get(),
+        |nap| {
+            naps.push(nap);
+            clock.set(clock.get() + nap);
+        },
         || -> Result<Option<&str>> { Err(busy_index_error()) },
     );
     assert_eq!(found, None);
     assert_eq!(naps, millis(&[20, 40, 80, 160, 320, 500, 500, 380]));
+}
+
+/// SQLite's busy timeout is part of the retry budget. A lookup that blocks
+/// for five seconds must not get thirty seconds of sleeps on top.
+#[test]
+fn lookup_retry_budget_counts_time_inside_the_lookup() {
+    let clock = std::cell::Cell::new(std::time::Duration::ZERO);
+    let mut calls = 0;
+    let mut naps = Vec::new();
+    let found = super::lookup_or_miss_with_clock(
+        "kt",
+        std::time::Duration::from_secs(30),
+        || clock.get(),
+        |nap| {
+            naps.push(nap);
+            clock.set(clock.get() + nap);
+        },
+        || -> Result<Option<&str>> {
+            calls += 1;
+            clock.set(clock.get() + std::time::Duration::from_secs(5));
+            Err(busy_index_error())
+        },
+    );
+    assert_eq!(found, None);
+    assert_eq!(calls, 6);
+    assert_eq!(naps, millis(&[20, 40, 80, 160, 320]));
+    // The last in-flight lookup may finish after the retry deadline.
+    assert_eq!(clock.get(), std::time::Duration::from_millis(30_620));
+}
+
+#[test]
+fn lookup_retry_does_not_start_another_attempt_at_the_deadline() {
+    let clock = std::cell::Cell::new(std::time::Duration::ZERO);
+    let mut calls = 0;
+    let found = super::lookup_or_miss_with_clock(
+        "kt",
+        std::time::Duration::from_millis(20),
+        || clock.get(),
+        |nap| clock.set(clock.get() + nap),
+        || -> Result<Option<&str>> {
+            calls += 1;
+            Err(busy_index_error())
+        },
+    );
+    assert_eq!(found, None);
+    assert_eq!(calls, 1);
+    assert_eq!(clock.get(), std::time::Duration::from_millis(20));
 }
 
 /// Any other lookup error is a miss at once: there is nothing to wait for.

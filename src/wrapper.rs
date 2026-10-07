@@ -881,8 +881,9 @@ fn open_primary_and_fallback(config: &Config, route: &Path) -> Result<(Store, Op
     Ok((primary, fallback))
 }
 
-/// How long a lookup waits for a busy store index before the unit is compiled
-/// as a miss.
+/// Retry budget for a busy store index, including time spent in lookups.
+/// An in-flight lookup is not interrupted: each blocked SQLite statement may
+/// still spend its five-second busy timeout before the unit becomes a miss.
 const LOOKUP_BUSY_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
 /// First pause after a lookup finds the index busy. It doubles up to
 /// [`LOOKUP_BUSY_PAUSE_MAX`].
@@ -906,33 +907,46 @@ const LOOKUP_BUSY_PAUSE_MAX: std::time::Duration = std::time::Duration::from_mil
 ///
 /// A busy index is retried with doubling pauses until `budget` is spent. Any
 /// other error, or a busy index past the budget, returns `None`, and the unit
-/// takes the ordinary miss path with the path remap. `pause` is the sleep; it
-/// is a parameter so tests own the clock.
+/// takes the ordinary miss path with the path remap. The budget includes
+/// lookup execution and sleep, but cannot interrupt an in-flight lookup.
 fn lookup_or_miss<T>(
     crate_name: &str,
     budget: std::time::Duration,
+    pause: impl FnMut(std::time::Duration),
+    lookup: impl FnMut() -> Result<Option<T>>,
+) -> Option<T> {
+    let start = std::time::Instant::now();
+    lookup_or_miss_with_clock(crate_name, budget, || start.elapsed(), pause, lookup)
+}
+
+fn lookup_or_miss_with_clock<T>(
+    crate_name: &str,
+    budget: std::time::Duration,
+    mut elapsed: impl FnMut() -> std::time::Duration,
     mut pause: impl FnMut(std::time::Duration),
     mut lookup: impl FnMut() -> Result<Option<T>>,
 ) -> Option<T> {
-    let mut waited = std::time::Duration::ZERO;
     let mut step = LOOKUP_BUSY_PAUSE;
-    loop {
+    let error = loop {
         let error = match lookup() {
             Ok(found) => return found,
             Err(error) => error,
         };
-        let left = budget.saturating_sub(waited);
+        let left = budget.saturating_sub(elapsed());
         if left.is_zero() || !crate::blob_heal::is_index_busy(&error) {
-            tracing::warn!(
-                "local store lookup failed for {crate_name} after waiting {waited:?} for a busy index: {error:#}; compiling it as a miss"
-            );
-            return None;
+            break error;
         }
-        let nap = step.min(left);
-        pause(nap);
-        waited += nap;
+        pause(step.min(left));
+        if elapsed() >= budget {
+            break error;
+        }
         step = (step * 2).min(LOOKUP_BUSY_PAUSE_MAX);
-    }
+    };
+    tracing::warn!(
+        "local store lookup failed for {crate_name} after {:?}: {error:#}; compiling it as a miss",
+        elapsed()
+    );
+    None
 }
 
 /// Local lookup: volume shard first, then the main store. The returned
@@ -3888,15 +3902,7 @@ fn run_parsed_rustc(
                     crate_name,
                     e
                 );
-                return passthrough_with_event(
-                    config,
-                    args,
-                    crate_name,
-                    &event_root,
-                    start,
-                    format!("build claim failed: {e}"),
-                    key_record,
-                );
+                (None, None)
             }
             Ok(BuildClaim::Contended) => {
                 // Another process is building this key — wait for it
@@ -3946,19 +3952,6 @@ fn run_parsed_rustc(
         );
         return Ok(0);
     }
-
-    let Some(lock) = lock else {
-        tracing::warn!("wait for {} failed, compiling ourselves", crate_name);
-        return passthrough_with_event(
-            config,
-            args,
-            crate_name,
-            &event_root,
-            start,
-            "build lock wait failed",
-            key_record,
-        );
-    };
 
     // 4. Compile
     tracing::debug!(
@@ -4272,6 +4265,23 @@ fn run_parsed_rustc(
         complete_extra_inputs_dep_info(args, snapshot)
             .context("completing extra_inputs dep-info before cache publication")?;
     }
+
+    // A failed claim or peer wait must keep the normal remapped compile,
+    // but publication requires ownership of the key's build lock.
+    let Some(lock) = lock else {
+        let elapsed = start.elapsed().as_millis() as u64;
+        log_event(
+            config,
+            EventInputs::new(&event_root, crate_name, EventResult::Skipped, elapsed)
+                .compile_time_ms(compile_time_ms)
+                .keyed(&cache_key, key_ms, key_hash_stats)
+                .lookup_ms(lookup_ms)
+                .key_record(key_record),
+        );
+        print_progress(crate_name, EventResult::Skipped, elapsed, 0);
+        clean_incremental_dir(config, args);
+        return Ok(result.exit_code);
+    };
 
     let store_start = std::time::Instant::now();
     let trace_store = crate::phase_trace::phase("store");

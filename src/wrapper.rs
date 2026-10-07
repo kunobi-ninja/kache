@@ -860,25 +860,24 @@ fn volume_cache_dirs_match(routed: &Path, main: &Path) -> bool {
     routed == main
 }
 
-/// Open the volume shard (or main store) plus an optional main-store fallback.
-fn open_primary_and_fallback(config: &Config, route: &Path) -> Result<(Store, Option<Store>)> {
+/// Open the volume shard (or main store) plus the stores read after it: the
+/// main store when the route maps to a shard, then [`Config::readonly_store`].
+fn open_primary_and_fallback(config: &Config, route: &Path) -> Result<(Store, Vec<Store>)> {
     crate::link::set_mapped_target(config.volume_store_for(route).is_some());
     let routed = config.routed_for_path(route);
     let primary = Store::open(&routed)?;
-    if volume_cache_dirs_match(&routed.cache_dir, &config.cache_dir) {
-        return Ok((primary, None));
-    }
-    let fallback = match Store::open(config) {
-        Ok(store) => Some(store),
-        Err(e) => {
-            tracing::warn!(
+    let mut fallbacks = Vec::new();
+    if !volume_cache_dirs_match(&routed.cache_dir, &config.cache_dir) {
+        match Store::open(config) {
+            Ok(store) => fallbacks.push(store),
+            Err(e) => tracing::warn!(
                 "main store unavailable for volume-shard fallback ({}): {e:#}",
                 config.cache_dir.display()
-            );
-            None
+            ),
         }
-    };
-    Ok((primary, fallback))
+    }
+    fallbacks.extend(open_readonly_store(config));
+    Ok((primary, fallbacks))
 }
 
 /// Retry budget for a busy store index, including time spent in lookups.
@@ -949,22 +948,38 @@ fn lookup_or_miss_with_clock<T>(
     None
 }
 
-/// Local lookup: volume shard first, then the main store. The returned
-/// store is the one whose blobs must be restored.
+/// The store named by [`Config::readonly_store`], opened read-only, or `None`
+/// when none is set, when it is this process's own store, or when it cannot be
+/// opened that way (said at warn level).
+fn open_readonly_store(config: &Config) -> Option<Store> {
+    let dir = config.readonly_store.as_ref()?;
+    if *dir == config.cache_dir {
+        return None;
+    }
+    let mut readonly = config.clone();
+    readonly.cache_dir = dir.clone();
+    match Store::open_read_only(&readonly) {
+        Ok(store) => Some(store),
+        Err(e) => {
+            tracing::warn!("read-only store {} unavailable: {e:#}", dir.display());
+            None
+        }
+    }
+}
+
+/// Local lookup: volume shard first, then the main store, then the read-only
+/// store. The returned store is the one whose blobs must be restored.
 fn lookup_local_entry<'a>(
     primary: &'a Store,
-    fallback: Option<&'a Store>,
+    fallbacks: &'a [Store],
     cache_key: &str,
 ) -> Result<Option<(&'a Store, crate::store::EntryMeta)>> {
     crate::demand::record(cache_key);
     let _trace = crate::phase_trace::phase("lookup");
-    if let Some(meta) = primary.get(cache_key)? {
-        return Ok(Some((primary, meta)));
-    }
-    if let Some(fallback) = fallback
-        && let Some(meta) = fallback.get(cache_key)?
-    {
-        return Ok(Some((fallback, meta)));
+    for store in std::iter::once(primary).chain(fallbacks) {
+        if let Some(meta) = store.get(cache_key)? {
+            return Ok(Some((store, meta)));
+        }
     }
     Ok(None)
 }
@@ -1177,7 +1192,7 @@ pub fn run_nvcc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     // ── Local cache lookup ───────────────────────────────────────
     let lookup_start = std::time::Instant::now();
     let lookup = lookup_or_miss(&crate_name, LOOKUP_BUSY_BUDGET, std::thread::sleep, || {
-        lookup_local_entry(&store, None, &cache_key)
+        lookup_local_entry(&store, &[], &cache_key)
     });
     let lookup_ms = lookup_start.elapsed().as_millis() as u64;
     let mut lookup_rejection = String::new();
@@ -1809,7 +1824,7 @@ fn run_cc_inner(
     drop(trace_preflight);
 
     let trace_store_open = crate::phase_trace::phase("store_open");
-    let (store, fallback_store) =
+    let (store, fallback_stores) =
         match open_primary_and_fallback(config, &volume_route_path_cc(&parsed)) {
             Ok(pair) => {
                 drop(trace_store_open);
@@ -1832,7 +1847,7 @@ fn run_cc_inner(
         compiler,
         parsed,
         store,
-        fallback_store,
+        fallback_stores,
         crate_name,
         event_root,
         start,
@@ -1847,7 +1862,7 @@ struct CcStoreInvocation {
     compiler: CcCompiler,
     parsed: crate::compiler::cc::CcArgs,
     store: Store,
-    fallback_store: Option<Store>,
+    fallback_stores: Vec<Store>,
     crate_name: String,
     event_root: String,
     start: std::time::Instant,
@@ -1863,7 +1878,7 @@ fn run_cc_with_store(
         compiler,
         parsed,
         store,
-        fallback_store,
+        fallback_stores,
         crate_name,
         event_root,
         start,
@@ -1972,7 +1987,7 @@ fn run_cc_with_store(
         None
     } else {
         let lookup = lookup_or_miss(crate_name, LOOKUP_BUSY_BUDGET, std::thread::sleep, || {
-            lookup_local_entry(store, fallback_store.as_ref(), &cache_key)
+            lookup_local_entry(store, fallback_stores, &cache_key)
         });
         drop(trace_lookup);
         lookup
@@ -3407,12 +3422,12 @@ fn run_parsed_rustc(
         }
     }
     let rustc_route = volume_route_path_rustc(args);
-    let mut fallback_store = None;
+    let mut fallback_stores = Vec::new();
     let trace_store_open = crate::phase_trace::phase("store_open");
     let store = if args.is_primary || (config.clean_incremental && args.incremental.is_some()) {
         match open_primary_and_fallback(config, &rustc_route) {
-            Ok((primary, fallback)) => {
-                fallback_store = fallback;
+            Ok((primary, fallbacks)) => {
+                fallback_stores = fallbacks;
                 Some(primary)
             }
             Err(e) => {
@@ -3694,7 +3709,7 @@ fn run_parsed_rustc(
         let lookup_start = std::time::Instant::now();
         let lookup_result =
             lookup_or_miss(crate_name, LOOKUP_BUSY_BUDGET, std::thread::sleep, || {
-                lookup_local_entry(&store, fallback_store.as_ref(), &cache_key)
+                lookup_local_entry(&store, &fallback_stores, &cache_key)
             });
         lookup_ms = lookup_ms.saturating_add(lookup_start.elapsed().as_millis() as u64);
 
@@ -5015,7 +5030,13 @@ fn materialize_cached_artifact(
         }
     };
 
-    let strategy = restore_link_strategy(kind, cached_file.executable, shared_loadable);
+    // A read-only store's blobs belong to another process: never share their
+    // inode, so nothing later done to the restored file can reach that store.
+    let strategy = if store.is_read_only() {
+        link::LinkStrategy::Copy
+    } else {
+        restore_link_strategy(kind, cached_file.executable, shared_loadable)
+    };
     let rewrote_content = transformed.is_some();
     match transformed {
         Some(content) => {
@@ -5595,6 +5616,7 @@ fn deferral_allowed(
         && config.deferred_discovery
         && config.remote.is_none()
         && config.fallback.is_none()
+        && config.readonly_store.is_none()
         && !adaptive
         && extra_inputs.is_none()
 }

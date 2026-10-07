@@ -102,6 +102,7 @@ fn test_config() -> Config {
         DEFAULT_REMOTE_RESTORE_TIMEOUT_SECS, DEFAULT_S3_POOL_IDLE_SECS,
     };
     Config {
+        readonly_store: None,
         fallback: None,
         key_salt: None,
         cc_extra_allowlist_flags: Vec::new(),

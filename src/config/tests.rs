@@ -2351,6 +2351,7 @@ fn test_file_config_roundtrip() {
         paths: None,
         workspace: None,
         cache: Some(CacheFileConfig {
+            readonly_store: None,
             bypass_env: None,
             bypass_argv: None,
             bypass_crates: None,
@@ -2892,6 +2893,7 @@ fn test_env_overrides_detect() {
 #[test]
 fn test_config_store_dir() {
     let config = Config {
+        readonly_store: None,
         fallback: None,
         key_salt: None,
         cc_extra_allowlist_flags: Vec::new(),
@@ -2969,6 +2971,7 @@ fn test_config_store_dir() {
 #[test]
 fn test_config_index_db_path() {
     let config = Config {
+        readonly_store: None,
         fallback: None,
         key_salt: None,
         cc_extra_allowlist_flags: Vec::new(),
@@ -3042,6 +3045,7 @@ fn test_config_index_db_path() {
 #[test]
 fn test_config_event_log_path() {
     let config = Config {
+        readonly_store: None,
         fallback: None,
         key_salt: None,
         cc_extra_allowlist_flags: Vec::new(),
@@ -3134,6 +3138,7 @@ fn test_config_socket_path() {
     let _lock = config_path_lock();
     let _env_guard = set_env_for_test("KACHE_SOCKET_PATH", None);
     let config = Config {
+        readonly_store: None,
         fallback: None,
         key_salt: None,
         cc_extra_allowlist_flags: Vec::new(),
@@ -3226,6 +3231,65 @@ fn test_config_socket_path() {
             PathBuf::from("/tmp/kache-runtime/daemon.sock")
         );
     }
+}
+
+#[test]
+fn readonly_store_resolves_env_file_empty_and_ignore_env() {
+    let _lock = config_path_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("config.toml");
+    let cache_dir = dir.path().join("cache");
+    let file_store = dir.path().join("file-store");
+    let env_store = dir.path().join("env-store");
+    let _config = set_kache_config_for_test(&config_path);
+    let _cache_env = set_env_for_test("KACHE_CACHE_DIR", None);
+    let _readonly_env = set_env_for_test("KACHE_READONLY_STORE", None);
+
+    std::fs::write(
+        &config_path,
+        format!("[cache]\nlocal_store = {:?}\n", cache_dir.to_string_lossy()),
+    )
+    .unwrap();
+    assert_eq!(
+        Config::load().unwrap().readonly_store,
+        None,
+        "off by default"
+    );
+
+    std::fs::write(
+        &config_path,
+        format!(
+            "[cache]\nlocal_store = {:?}\nreadonly_store = {:?}\n",
+            cache_dir.to_string_lossy(),
+            file_store.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    assert_eq!(
+        Config::load().unwrap().readonly_store,
+        Some(file_store.clone())
+    );
+
+    unsafe { std::env::set_var("KACHE_READONLY_STORE", &env_store) };
+    assert_eq!(Config::load().unwrap().readonly_store, Some(env_store));
+    unsafe { std::env::set_var("KACHE_READONLY_STORE", "") };
+    assert_eq!(
+        Config::load().unwrap().readonly_store,
+        None,
+        "empty turns it off"
+    );
+
+    std::fs::write(
+        &config_path,
+        format!(
+            "[cache]\nlocal_store = {:?}\nreadonly_store = {:?}\nignore_env = true\n",
+            cache_dir.to_string_lossy(),
+            file_store.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    assert_eq!(Config::load().unwrap().readonly_store, Some(file_store));
+    unsafe { std::env::remove_var("KACHE_READONLY_STORE") };
 }
 
 #[test]
@@ -3805,6 +3869,7 @@ fn test_save_and_load_file_config() {
         paths: None,
         workspace: None,
         cache: Some(CacheFileConfig {
+            readonly_store: None,
             bypass_env: None,
             bypass_argv: None,
             bypass_crates: None,

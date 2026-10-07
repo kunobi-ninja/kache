@@ -7328,6 +7328,35 @@ fn a_freshly_built_target_is_offered_once_its_worktree_is_deleted() {
 }
 
 #[test]
+fn an_orphans_dry_run_keeps_a_missing_target_registered() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = crate::test_support::test_config(dir.path().join("cache"));
+    let store = Store::open(&config).unwrap();
+    let workspace = dir.path().join("worktrees/feature");
+    let target = dir.path().join("targets/feature");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::create_dir_all(target.join("debug")).unwrap();
+    std::fs::write(
+        target.join("CACHEDIR.TAG"),
+        "Signature: 8a477f597d28d172789f06886806bc55",
+    )
+    .unwrap();
+    store.remember_target_root(&target, &workspace).unwrap();
+    assert_eq!(store.tracked_target_roots(0).unwrap().len(), 1);
+    std::fs::remove_dir_all(&workspace).unwrap();
+    std::fs::remove_dir_all(&target).unwrap();
+
+    let orphans = CleanScope::Tracked(TrackedSelection::Orphaned);
+    clean(&config, true, false, false, orphans).unwrap();
+
+    assert_eq!(
+        store.tracked_target_roots(0).unwrap().len(),
+        1,
+        "a dry run must not forget the registry row"
+    );
+}
+
+#[test]
 fn remove_targets_refuses_a_directory_replaced_after_scan() {
     let root = tempfile::tempdir().unwrap();
     let target = root.path().join("proj/target");

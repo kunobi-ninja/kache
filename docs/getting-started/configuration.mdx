@@ -215,6 +215,8 @@ The equivalent environment setting is `KACHE_READONLY_STORE=/kache-host`. The va
 - Its owner must keep the WAL side files available. A WAL-mode index without `index.db-wal` and `index.db-shm` is skipped with a warning. A read-only mount is required to prevent SQLite from creating side files if the owner removes them during an open. The connection alone cannot enforce that protection on a writable mount.
 - With a read-only store set, a unit with no record in the local store is keyed before it compiles, so it can still hit there.
 
+The read-only path is used as configured. `KACHE_TRUST_DOMAIN` isolates your writable store and runtime, but does not change this path. Mount a store that the job is allowed to read for its trust domain.
+
 The local store is not designed for sharing across machines. To share between machines, use a [remote](#remote-settings).
 
 ### Daemon index maintenance

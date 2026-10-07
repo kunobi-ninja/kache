@@ -1917,6 +1917,7 @@ fn run_cc_with_store(
             && config.deferred_discovery
             && config.remote.is_none()
             && config.fallback.is_none()
+            && config.readonly_store.is_none()
             && crate::compiler::cc::cc_direct_key_eligible(parsed) =>
         {
             crate::compiler::cc::CcKeyDiscovery::Deferrable

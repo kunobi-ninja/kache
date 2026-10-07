@@ -35,9 +35,13 @@ fn compile(cache: &Path, config: &Path, source: &Path, out: &Path) {
 }
 
 fn last_event(cache: &Path) -> serde_json::Value {
+    last_event_for(cache, "readonly_probe")
+}
+
+fn last_event_for(cache: &Path, crate_name: &str) -> serde_json::Value {
     std::fs::read_to_string(cache.join("events.jsonl")).unwrap().lines()
         .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-        .rfind(|event| event["crate_name"] == "readonly_probe")
+        .rfind(|event| event["crate_name"] == crate_name)
         .expect("a compiler event")
 }
 
@@ -97,4 +101,46 @@ fn rejected_readonly_hits_are_recompiled_and_cached_locally() {
         assert_eq!(std::fs::read(&metadata).unwrap(), original_metadata);
         drop(owner);
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn empty_job_store_uses_the_readonly_cc_hit_before_compiling() {
+    build_kache();
+    let root = tempfile::tempdir().unwrap();
+    let work = root.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    std::fs::write(work.join("readonly_probe.c"), "int answer(void) { return 42; }\n").unwrap();
+    let host = root.path().join("host-cache");
+    let job = root.path().join("job-cache");
+    let prefix_map = format!("-ffile-prefix-map={}=/readonly-probe", work.display());
+    let compile_cc = |cache: &Path, config: &Path| {
+        let output = hermetic_command(kache_binary(), cache, Some(config))
+            .current_dir(&work)
+            .args(["cc", "-c", "readonly_probe.c", "-o", "readonly_probe.o", &prefix_map])
+            .output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    };
+    let host_config = write_config(&host, None);
+    compile_cc(&host, &host_config);
+    let cold = last_event_for(&host, "readonly_probe.c");
+    assert_eq!(cold["result"], "miss", "{cold}");
+    assert_eq!(cold["preprocessor_runs"], 0,
+        "the host must exercise compile-before-key; otherwise this test cannot catch the gate regression: {cold}");
+    assert_eq!(cold["compiler_runs"], 1, "{cold}");
+    let expected_object = std::fs::read(work.join("readonly_probe.o")).unwrap();
+    std::fs::remove_file(work.join("readonly_probe.o")).unwrap();
+    let owner = rusqlite::Connection::open(host.join("index.db")).unwrap();
+    let entries: usize = owner.query_row("SELECT COUNT(*) FROM entries", [], |row| row.get(0)).unwrap();
+    assert_eq!(entries, 1);
+    assert!(host.join("index.db-wal").exists());
+    assert!(host.join("index.db-shm").exists());
+    let job_config = write_config(&job, Some(&host));
+    compile_cc(&job, &job_config);
+    let hit = last_event_for(&job, "readonly_probe.c");
+    assert_eq!(hit["cache_key"], cold["cache_key"]);
+    assert_eq!(hit["result"], "local_hit", "{hit}");
+    assert_eq!(hit["compiler_runs"], 0, "{hit}");
+    assert_eq!(std::fs::read(work.join("readonly_probe.o")).unwrap(), expected_object);
+    drop(owner);
 }

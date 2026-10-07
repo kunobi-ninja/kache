@@ -13594,11 +13594,17 @@ async fn a_permanently_failed_upload_retires_its_intent_so_gc_holds_the_size_lim
         daemon.remote_backend.set(Arc::new(PutFailBackend)).is_ok(),
         "inject mock backend"
     );
+    daemon.pending_uploads.write().await.insert(key.clone());
     let resp = run_upload_job(&daemon, &job).await;
     assert!(!resp.ok, "the remote refuses the PUT: {resp:?}");
     assert!(
         !upload_spool_path(&config, &key).exists(),
         "a terminal failure must retire the intent"
+    );
+    assert!(daemon.pending_uploads.read().await.is_empty());
+    assert!(
+        Store::open(&config).unwrap().contains(&key),
+        "retiring an intent does not remove its local cache entry"
     );
 
     let store = Store::open(&config).unwrap();
@@ -13609,4 +13615,200 @@ async fn a_permanently_failed_upload_retires_its_intent_so_gc_holds_the_size_lim
         store.physical_size().unwrap() <= config.max_size,
         "the store is back under its size limit"
     );
+}
+
+#[tokio::test]
+async fn enqueue_republishes_an_intent_retired_after_initial_persistence() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let key = test_cache_key("retirement-race");
+    seed_store_entry(&config, &key, "serde", dir.path());
+    let job = persist_upload_job(
+        &config,
+        &UploadJob {
+            key: key.clone(),
+            entry_dir: String::new(),
+            crate_name: "serde".into(),
+            client_epoch: 0,
+        },
+    )
+    .unwrap();
+    let daemon = Daemon::new(config.clone());
+    daemon.pending_uploads.write().await.insert(key.clone());
+    // A second handler reused the old intent, then waited while the worker
+    // retired that intent and cleared its pending marker.
+    let stale_job = persist_upload_job(&config, &job).unwrap();
+    daemon.retire_upload_job(&key).await.unwrap();
+    assert!(!upload_spool_path(&config, &key).exists());
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let resp = daemon.enqueue_upload_job(tx, stale_job).await;
+    assert!(resp.ok, "a new upload may enqueue after retirement: {resp:?}");
+    let queued = rx.try_recv().expect("a new upload was queued");
+    assert_eq!(queued.key, key);
+    assert!(
+        upload_spool_path(&config, &key).is_file(),
+        "acknowledging the new upload must leave a durable intent"
+    );
+    assert!(daemon.pending_uploads.read().await.contains(&key));
+}
+
+#[tokio::test]
+async fn enqueue_refuses_a_retired_intent_if_gc_has_removed_the_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let key = test_cache_key("evicted-retirement-race");
+    seed_store_entry(&config, &key, "serde", dir.path());
+    let stale_job = persist_upload_job(
+        &config,
+        &UploadJob {
+            key: key.clone(),
+            entry_dir: String::new(),
+            crate_name: "serde".into(),
+            client_epoch: 0,
+        },
+    )
+    .unwrap();
+    let daemon = Daemon::new(config.clone());
+    daemon.retire_upload_job(&key).await.unwrap();
+    Store::open(&config).unwrap().remove_entry(&key).unwrap();
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let response = daemon.enqueue_upload_job(tx, stale_job).await;
+    assert!(!response.ok, "an evicted entry cannot be re-published");
+    assert!(response.error.unwrap().contains("local cache entry missing"));
+    assert!(rx.try_recv().is_err(), "an unreplayable job must not queue");
+    assert!(!upload_spool_path(&config, &key).exists());
+    assert!(daemon.pending_uploads.read().await.is_empty());
+}
+
+#[tokio::test]
+async fn upload_retirement_waits_for_the_enqueue_guard() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let key = test_cache_key("serialized-retirement");
+    seed_store_entry(&config, &key, "serde", dir.path());
+    persist_upload_job(
+        &config,
+        &UploadJob {
+            key: key.clone(),
+            entry_dir: String::new(),
+            crate_name: "serde".into(),
+            client_epoch: 0,
+        },
+    )
+    .unwrap();
+    let daemon = Arc::new(Daemon::new(config.clone()));
+    let mut enqueue_guard = daemon.pending_uploads.write().await;
+    enqueue_guard.insert(key.clone());
+    let worker_daemon = daemon.clone();
+    let worker_key = key.clone();
+    let mut worker = tokio::spawn(async move { worker_daemon.retire_upload_job(&worker_key).await });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), &mut worker)
+            .await
+            .is_err(),
+        "retirement must wait until enqueue leaves its critical section"
+    );
+    assert!(upload_spool_path(&config, &key).is_file());
+    assert!(enqueue_guard.contains(&key));
+    drop(enqueue_guard);
+    worker.await.unwrap().unwrap();
+    assert!(!upload_spool_path(&config, &key).exists());
+    assert!(daemon.pending_uploads.read().await.is_empty());
+}
+
+struct TransientThenTerminalUploadBackend {
+    heads: AtomicU64,
+    first_failure: tokio::sync::Semaphore,
+}
+
+#[async_trait::async_trait]
+impl crate::remote_backend::RemoteBackend for TransientThenTerminalUploadBackend {
+    async fn head(&self, _key: &str) -> Result<bool> {
+        if self.heads.fetch_add(1, Ordering::Relaxed) == 0 {
+            self.first_failure.add_permits(1);
+            let error = std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "temporary upload refusal",
+            );
+            return Err(error.into());
+        }
+        anyhow::bail!("terminal upload refusal")
+    }
+
+    async fn get(
+        &self,
+        _key: &str,
+        _max_bytes: Option<u64>,
+    ) -> Result<Option<crate::remote_backend::GetObject>> {
+        panic!("upload test must not GET");
+    }
+
+    async fn put(&self, _key: &str, _body: Vec<u8>, _content_type: Option<&str>) -> Result<()> {
+        panic!("failed upload HEAD must not PUT");
+    }
+
+    async fn list(&self, _prefix: &str) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+
+    fn describe(&self, key: &str) -> String {
+        format!("upload-failure-sequence://test/{key}")
+    }
+}
+
+#[tokio::test]
+async fn retried_upload_keeps_its_intent_until_cancellation_or_a_terminal_outcome() {
+    for cancel in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = Arc::new(TransientThenTerminalUploadBackend {
+            heads: AtomicU64::new(0),
+            first_failure: tokio::sync::Semaphore::new(0),
+        });
+        let daemon = Arc::new(resilience_test_daemon(dir.path(), backend.clone()));
+        let key = test_cache_key("retry-upload-retirement");
+        seed_store_entry(&daemon.config, &key, "serde", dir.path());
+        let job = persist_upload_job(
+            &daemon.config,
+            &UploadJob {
+                key: key.clone(),
+                entry_dir: String::new(),
+                crate_name: "serde".into(),
+                client_epoch: 0,
+            },
+        )
+        .unwrap();
+        daemon.pending_uploads.write().await.insert(key.clone());
+        let worker_daemon = daemon.clone();
+        let worker = tokio::spawn(async move { run_upload_job(&worker_daemon, &job).await });
+        tokio::time::timeout(Duration::from_secs(2), backend.first_failure.acquire())
+            .await
+            .expect("the first upload attempt must start")
+            .unwrap()
+            .forget();
+        assert!(upload_spool_path(&daemon.config, &key).is_file());
+        assert!(daemon.pending_uploads.read().await.contains(&key));
+        assert!(!worker.is_finished(), "a transient error must keep retrying");
+
+        if cancel {
+            worker.abort();
+            assert!(worker.await.unwrap_err().is_cancelled());
+            assert!(
+                upload_spool_path(&daemon.config, &key).is_file(),
+                "shutdown during retry must preserve the intent for replay"
+            );
+        } else {
+            let response = tokio::time::timeout(Duration::from_secs(10), worker)
+                .await
+                .expect("the second attempt must finish")
+                .unwrap();
+            assert!(!response.ok);
+            assert!(response.error.unwrap().contains("terminal upload refusal"));
+            assert_eq!(backend.heads.load(Ordering::Relaxed), 2);
+            assert!(!upload_spool_path(&daemon.config, &key).exists());
+            assert!(daemon.pending_uploads.read().await.is_empty());
+        }
+        assert!(Store::open(&daemon.config).unwrap().contains(&key));
+    }
 }

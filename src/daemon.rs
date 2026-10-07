@@ -764,6 +764,14 @@ fn persist_upload_job(config: &Config, job: &UploadJob) -> Result<UploadJob> {
     }
 }
 
+async fn persist_upload_job_async(config: &Config, job: &UploadJob) -> Result<UploadJob> {
+    let config = config.clone();
+    let job = job.clone();
+    tokio::task::spawn_blocking(move || persist_upload_job(&config, &job))
+        .await
+        .context("upload intent publication task failed")?
+}
+
 fn remove_upload_job(config: &Config, key: &str) -> Result<()> {
     let path = upload_spool_path(config, key);
     match std::fs::remove_file(&path) {
@@ -3906,38 +3914,16 @@ impl Daemon {
         // concurrent sweep can hold it for seconds) plus store open and
         // `std::fs` work — park it on the blocking pool like the other
         // store-touching handlers (#281) instead of an async worker.
-        let persist_config = self.config.clone();
-        let persist_job = job.clone();
-        let normalized_job = match tokio::task::spawn_blocking(move || {
-            persist_upload_job(&persist_config, &persist_job)
-        })
-        .await
-        {
-            Ok(Ok(job)) => job,
-            Ok(Err(error)) => {
-                return Response::err(format!("persisting upload intent failed: {error:#}"));
-            }
+        let normalized_job = match persist_upload_job_async(&self.config, job).await {
+            Ok(job) => job,
             Err(error) => {
-                return Response::err(format!("persisting upload intent failed: {error}"));
+                return Response::err(format!("persisting upload intent failed: {error:#}"));
             }
         };
 
         // If upload buffer is set up (server mode), push to it for async processing
         if let Some(tx) = self.upload_tx() {
-            // Dedup: skip if this key is already queued or in-flight
-            {
-                let mut pending = self.pending_uploads.write().await;
-                if !pending.insert(job.key.clone()) {
-                    return Response::ok(); // already pending
-                }
-            }
-            return match tx.send(normalized_job) {
-                Ok(()) => Response::ok(),
-                Err(_) => {
-                    self.pending_uploads.write().await.remove(&job.key);
-                    Response::err("upload queue closed")
-                }
-            };
+            return self.enqueue_upload_job(tx, normalized_job).await;
         }
 
         if self.upload_queue_closed.load(Ordering::Relaxed) {
@@ -3948,6 +3934,49 @@ impl Daemon {
         // breaker admission and semaphore acquisition so callers can never
         // hold a permit while waiting for breaker recovery/retry.
         self.do_upload(&normalized_job).await
+    }
+
+    async fn enqueue_upload_job(
+        &self,
+        tx: tokio::sync::mpsc::UnboundedSender<UploadJob>,
+        mut job: UploadJob,
+    ) -> Response {
+        loop {
+            let mut pending = self.pending_uploads.write().await;
+            if pending.contains(&job.key) {
+                return Response::ok();
+            }
+            // A previous worker may have retired the intent after this handler
+            // persisted it. Re-publish outside the shared lock, then check again
+            // before enqueueing. Retirement holds this same lock through unlink.
+            if !upload_spool_path(&self.config, &job.key).exists() {
+                drop(pending);
+                job = match persist_upload_job_async(&self.config, &job).await {
+                    Ok(job) => job,
+                    Err(error) => {
+                        return Response::err(format!(
+                            "persisting upload intent failed: {error:#}"
+                        ));
+                    }
+                };
+                continue;
+            }
+            pending.insert(job.key.clone());
+            return match tx.send(job) {
+                Ok(()) => Response::ok(),
+                Err(error) => {
+                    pending.remove(&error.0.key);
+                    Response::err("upload queue closed")
+                }
+            };
+        }
+    }
+
+    async fn retire_upload_job(&self, key: &str) -> Result<()> {
+        let mut pending = self.pending_uploads.write().await;
+        let result = remove_upload_job(&self.config, key);
+        pending.remove(key);
+        result
     }
 
     /// Execute an upload directly (used by upload queue workers).
@@ -7105,16 +7134,23 @@ async fn run_upload_job(daemon: &Daemon, job: &UploadJob) -> Response {
         // each permit before returning a retryable outcome.
         tokio::time::sleep(UPLOAD_RETRY_DELAY).await;
     };
-    daemon.pending_uploads.write().await.remove(&job.key);
-    if let Err(error) = remove_upload_job(&daemon.config, &job.key) {
-        tracing::warn!("failed to retire finished upload intent: {error:#}");
-    }
-    if !resp.ok {
-        tracing::warn!(
-            "upload worker: {} failed: {}",
-            job.key,
-            resp.error.as_deref().unwrap_or("unknown")
-        );
+    match daemon.retire_upload_job(&job.key).await {
+        Ok(()) => {
+            if let Some(error) = resp.error.as_deref() {
+                tracing::warn!(
+                    "upload worker: {} failed: {error}; upload intent retired, \
+                     automatic reupload abandoned; local entry retained until GC",
+                    job.key
+                );
+            }
+        }
+        Err(error) => {
+            tracing::warn!(
+                key = job.key,
+                upload_error = resp.error.as_deref(),
+                "failed to retire finished upload intent: {error:#}"
+            );
+        }
     }
     resp
 }

@@ -13563,3 +13563,50 @@ fn a_shutdown_warns_only_about_hand_offs_left_unstored() {
         Some("publish worker stalled at shutdown; 1 queued hand-offs were not stored")
     );
 }
+
+/// A permanently failed upload retires its durable intent. The intent pins its
+/// entry against eviction, so a kept one holds the store above its size limit
+/// for as long as the remote refuses writes; retired, GC brings the store back
+/// under the limit.
+#[tokio::test]
+async fn a_permanently_failed_upload_retires_its_intent_so_gc_holds_the_size_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path());
+    config.remote = Some(test_remote_config());
+    config.max_size = 1;
+    let key = test_cache_key("denied-upload");
+    seed_store_entry(&config, &key, "serde", dir.path());
+    // Only the store keeps the bytes (no source hardlink holds the blob).
+    std::fs::remove_dir_all(dir.path().join(format!("{key}-src"))).unwrap();
+    let job = persist_upload_job(
+        &config,
+        &UploadJob {
+            key: key.clone(),
+            entry_dir: String::new(),
+            crate_name: "serde".into(),
+            client_epoch: 0,
+        },
+    )
+    .unwrap();
+
+    let daemon = Daemon::new(config.clone());
+    assert!(
+        daemon.remote_backend.set(Arc::new(PutFailBackend)).is_ok(),
+        "inject mock backend"
+    );
+    let resp = run_upload_job(&daemon, &job).await;
+    assert!(!resp.ok, "the remote refuses the PUT: {resp:?}");
+    assert!(
+        !upload_spool_path(&config, &key).exists(),
+        "a terminal failure must retire the intent"
+    );
+
+    let store = Store::open(&config).unwrap();
+    store.set_last_accessed_for_test(&key, "-1 hour");
+    store.evict().unwrap();
+    assert!(!store.contains(&key), "GC may now evict the entry");
+    assert!(
+        store.physical_size().unwrap() <= config.max_size,
+        "the store is back under its size limit"
+    );
+}

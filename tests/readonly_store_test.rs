@@ -2,11 +2,11 @@
 use std::path::{Path, PathBuf};
 
 mod common;
-use common::{build_kache, hermetic_command, kache_binary};
+use common::{build_kache, hermetic_command, isolated_config_path, kache_binary};
 
 fn write_config(cache: &Path, readonly: Option<&Path>) -> PathBuf {
     std::fs::create_dir_all(cache).unwrap();
-    let path = cache.join("config.toml");
+    let path = isolated_config_path(cache);
     let quote = |path: &Path| toml::Value::String(path.to_string_lossy().into_owned());
     let fallback = readonly
         .map(|dir| format!("readonly_store = {}\n", quote(dir)))

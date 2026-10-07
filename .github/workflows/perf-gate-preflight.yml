@@ -59,6 +59,7 @@ jobs:
       - name: Report eligibility
         env:
           HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
           THIS_REPO: ${{ github.repository }}
           PR_TITLE: ${{ github.event.pull_request.title }}
           HAS_BENCH_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'bench') }}
@@ -72,8 +73,11 @@ jobs:
               echo "This pull request comes from a fork (\`$HEAD_REPO\`), so the"
               echo "performance gate will not run: the benchmark needs a self-hosted"
               echo "runner, and fork code must not execute on one. A maintainer can"
-              echo "get numbers by pushing the same commits to a branch in"
-              echo "\`$THIS_REPO\`."
+              echo "adopt it on a \`review-contribution/\` branch for hosted validation."
+            elif [[ "$HEAD_REF" == review-contribution/* ]]; then
+              echo
+              echo "This branch adopts external code. Contribution review uses hosted"
+              echo "validation; self-hosted benchmarks stay disabled."
             elif [ "$IS_DRAFT" = "true" ] && [ "$HAS_BENCH_LABEL" != "true" ] && [[ "$PR_TITLE" != *"[bench]"* ]]; then
               echo
               echo "This pull request is a draft, so the performance gate is skipped."

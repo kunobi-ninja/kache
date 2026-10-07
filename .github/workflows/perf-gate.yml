@@ -35,11 +35,10 @@ name: Perf gate
 #   4. Only then does `measure` start on the self-hosted runner, checking out
 #      the head SHA the API confirmed.
 #
-# Same-repo-only is the conservative line: a branch in this repository can only
-# be pushed by someone who already has write access, which is the same trust
-# boundary `ci.yml`'s tag-gated release job relies on. Runner-group policy must
-# enforce that boundary independently — this file is not the only thing standing
-# between a fork and a private runner.
+# Adopted contributions remain external-derived code. Branches under
+# review-contribution/ use hosted validation throughout review, even after
+# becoming ready or receiving the bench label. Runner-group policy must also
+# enforce access independently of this workflow.
 on:
   # zizmor: ignore[dangerous-triggers]
   # Justification: `workflow_run` is the only trigger that guarantees this file
@@ -137,6 +136,7 @@ jobs:
           pr_json="$(gh api "repos/$REPO/pulls/$PR")"
           head_repo="$(jq -r '.head.repo.full_name // empty' <<<"$pr_json")"
           head_sha="$(jq -r '.head.sha // empty' <<<"$pr_json")"
+          head_ref="$(jq -r '.head.ref // empty' <<<"$pr_json")"
           base_ref="$(jq -r '.base.ref // empty' <<<"$pr_json")"
           state="$(jq -r '.state // empty' <<<"$pr_json")"
           expanded="$(jq -r '((.title | contains("[bench]")) or any(.labels[]; .name == "bench"))' <<<"$pr_json")"
@@ -162,6 +162,12 @@ jobs:
 
           [ "$head_repo" = "$REPO" ] || skip \
             "PR #$PR comes from a fork ($head_repo). Fork code is never run on the self-hosted benchmark runner."
+          [ -n "$head_ref" ] || skip "PR #$PR has no head branch."
+          case "$head_ref" in
+            review-contribution/*)
+              skip "PR #$PR adopts external code. Contribution review uses hosted validation; self-hosted benchmarks are disabled."
+              ;;
+          esac
           [ "$head_sha" = "$TRIGGER_SHA" ] || skip \
             "PR #$PR is now at $head_sha but this run was triggered for $TRIGGER_SHA — a newer push supersedes it."
           [ "$state" = "open" ] || skip "PR #$PR is $state."

@@ -219,7 +219,11 @@ fn rustc_corrupt_entry_recompiles_with_the_normal_path_remap() {
     let last = report["all_events"].as_array().unwrap().last().unwrap();
     assert_eq!(last["cache_key"], key);
     assert_eq!(last["result"], "skipped");
-    assert!(last["passthrough_reason"].as_str().is_none_or(str::is_empty));
+    assert!(
+        last["passthrough_reason"]
+            .as_str()
+            .is_none_or(str::is_empty)
+    );
     assert_eq!(
         std::fs::read(&meta).unwrap(),
         b"corrupt metadata",

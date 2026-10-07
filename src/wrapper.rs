@@ -5047,13 +5047,12 @@ fn materialize_cached_artifact(
     let strategy = restore_link_strategy(kind, cached_file.executable, shared_loadable);
     // A fresh transformed file can keep its original mode. Only the blob path
     // needs a private inode when it belongs to another process's store.
-    let blob_strategy = if store.is_read_only()
-        && strategy == link::LinkStrategy::ExecutableHardlink
-    {
-        link::LinkStrategy::Copy
-    } else {
-        strategy
-    };
+    let blob_strategy =
+        if store.is_read_only() && strategy == link::LinkStrategy::ExecutableHardlink {
+            link::LinkStrategy::Copy
+        } else {
+            strategy
+        };
     let rewrote_content = transformed.is_some();
     match transformed {
         Some(content) => {
@@ -5073,13 +5072,15 @@ fn materialize_cached_artifact(
             } else {
                 let staged = take_prestaged(blob_strategy, cached_file, target_path);
                 if !staged {
-                    link::link_to_target(&store_path, target_path, blob_strategy).with_context(|| {
-                        format!(
-                            "{context}: linking {} -> {}",
-                            store_path.display(),
-                            target_path.display()
-                        )
-                    })?;
+                    link::link_to_target(&store_path, target_path, blob_strategy).with_context(
+                        || {
+                            format!(
+                                "{context}: linking {} -> {}",
+                                store_path.display(),
+                                target_path.display()
+                            )
+                        },
+                    )?;
                 }
             }
             // A link/clone keeps the blob's old mtime, so it must be

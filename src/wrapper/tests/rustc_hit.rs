@@ -430,12 +430,23 @@ fn readonly_hit_records_restored_output_hashes_in_the_primary_store() {
     let mut hit = fixture.context();
     hit.memo_store = &primary;
     hit.restore_and_finish(
-        &readonly, &meta, EventResult::LocalHit, CACHE_KEY, 0,
-        FileHashStats::default(), 0, None, &fixture.key(), &key_record(),
-    ).unwrap();
+        &readonly,
+        &meta,
+        EventResult::LocalHit,
+        CACHE_KEY,
+        0,
+        FileHashStats::default(),
+        0,
+        None,
+        &fixture.key(),
+        &key_record(),
+    )
+    .unwrap();
     let output = fixture.args.out_dir.as_ref().unwrap().join("libfoo.rmeta");
     assert!(matches!(primary.file_hash_lookup(&output),
         crate::cache_key::FileHashLookup::Hit(found) if found == hash));
-    assert!(matches!(fixture.store.file_hash_lookup(&output),
-        crate::cache_key::FileHashLookup::NeedsHash(_)));
+    assert!(matches!(
+        fixture.store.file_hash_lookup(&output),
+        crate::cache_key::FileHashLookup::NeedsHash(_)
+    ));
 }

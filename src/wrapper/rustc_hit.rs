@@ -1,6 +1,7 @@
 use super::{
     Config, EntryMeta, EventResult, FileHashStats, HitCompletion, KeyEventRecord, RustcArgs,
-    RustcCompiler, Store, clean_incremental_dir, record_input_prediction, restore_from_cache_with_memo_store,
+    RustcCompiler, Store, clean_incremental_dir, record_input_prediction,
+    restore_from_cache_with_memo_store,
 };
 use anyhow::Result;
 use std::time::Instant;

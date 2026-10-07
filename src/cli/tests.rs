@@ -1919,6 +1919,27 @@ fn a_successful_eviction_reports_bytes_and_still_flags_pinned_entries() {
 }
 
 #[test]
+fn an_unsuccessful_eviction_still_flags_pinned_entries_when_clones_remain() {
+    let mut stats = gc_stats(0, 7, 0);
+    stats.entries_unreclaimable = 2;
+    let msg = describe_eviction(&stats, false);
+    assert!(
+        msg.contains("7 more entries"),
+        "must report the 7 pinned entries even when clones retain others: {msg}"
+    );
+
+    stats.entries_pinned = 0;
+    let msg = describe_eviction(&stats, false);
+    assert!(!msg.contains(" more "), "{msg}");
+}
+
+#[test]
+fn a_successful_eviction_without_pinned_entries_has_no_pinned_note() {
+    let msg = describe_eviction(&gc_stats(3, 0, 1024), false);
+    assert!(!msg.contains(" more "), "{msg}");
+}
+
+#[test]
 fn fully_retained_eviction_has_a_cleanup_path() {
     let mut stats = gc_stats(0, 0, 0);
     stats.entries_unreclaimable = 1;

@@ -98,3 +98,8 @@ quota and eviction policy apply; an evicted entry causes a normal cold build.
 
 Store GC is left disabled because `nix flake check` does not create permanent
 roots for its outputs. Collecting them before saving would lose those builds.
+
+Adopted external PRs use `review-contribution/` branches. The trusted perf-gate
+authorization reads the branch from the GitHub API and excludes that prefix
+from self-hosted measurements, including ready PRs and bench requests. Keep
+the prefix until the contribution merges; ordinary hosted checks still run.

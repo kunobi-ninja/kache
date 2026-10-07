@@ -13643,7 +13643,10 @@ async fn enqueue_republishes_an_intent_retired_after_initial_persistence() {
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let resp = daemon.enqueue_upload_job(tx, stale_job).await;
-    assert!(resp.ok, "a new upload may enqueue after retirement: {resp:?}");
+    assert!(
+        resp.ok,
+        "a new upload may enqueue after retirement: {resp:?}"
+    );
     let queued = rx.try_recv().expect("a new upload was queued");
     assert_eq!(queued.key, key);
     assert!(
@@ -13676,7 +13679,12 @@ async fn enqueue_refuses_a_retired_intent_if_gc_has_removed_the_entry() {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let response = daemon.enqueue_upload_job(tx, stale_job).await;
     assert!(!response.ok, "an evicted entry cannot be re-published");
-    assert!(response.error.unwrap().contains("local cache entry missing"));
+    assert!(
+        response
+            .error
+            .unwrap()
+            .contains("local cache entry missing")
+    );
     assert!(rx.try_recv().is_err(), "an unreplayable job must not queue");
     assert!(!upload_spool_path(&config, &key).exists());
     assert!(daemon.pending_uploads.read().await.is_empty());
@@ -13703,7 +13711,8 @@ async fn upload_retirement_waits_for_the_enqueue_guard() {
     enqueue_guard.insert(key.clone());
     let worker_daemon = daemon.clone();
     let worker_key = key.clone();
-    let mut worker = tokio::spawn(async move { worker_daemon.retire_upload_job(&worker_key).await });
+    let mut worker =
+        tokio::spawn(async move { worker_daemon.retire_upload_job(&worker_key).await });
     assert!(
         tokio::time::timeout(Duration::from_millis(50), &mut worker)
             .await
@@ -13741,7 +13750,11 @@ async fn a_slow_upload_retirement_flush_does_not_block_other_uploads() {
     }
     let daemon = Arc::new(Daemon::new(config.clone()));
     let retired_key = jobs[0].key.clone();
-    daemon.pending_uploads.write().await.insert(retired_key.clone());
+    daemon
+        .pending_uploads
+        .write()
+        .await
+        .insert(retired_key.clone());
     let (flush_started_tx, flush_started_rx) = tokio::sync::oneshot::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
     let worker_daemon = daemon.clone();
@@ -13889,7 +13902,10 @@ async fn retried_upload_keeps_its_intent_until_cancellation_or_a_terminal_outcom
             .forget();
         assert!(upload_spool_path(&daemon.config, &key).is_file());
         assert!(daemon.pending_uploads.read().await.contains(&key));
-        assert!(!worker.is_finished(), "a transient error must keep retrying");
+        assert!(
+            !worker.is_finished(),
+            "a transient error must keep retrying"
+        );
 
         if cancel {
             worker.abort();

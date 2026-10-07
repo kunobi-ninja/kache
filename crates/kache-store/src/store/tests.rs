@@ -12199,117 +12199,159 @@ fn read_only_store_serves_hits_and_writes_nothing() {
 
     let other = src.path().join("other.rlib");
     fs::write(&other, b"x").unwrap();
-    let refusals: Vec<(&str, bool)> = vec![
-        (
-            "put",
-            ro.put(
-                "rokey2",
-                "c",
-                &["lib".to_string()],
-                &[],
-                "t",
-                "dev",
-                &[(other.clone(), "libc.rlib".to_string())],
-                "",
-                "",
-            )
+    // Assert each result immediately. Collecting these booleans in one
+    // expression keeps borrowed Result temporaries alive until its end:
+    // a successful try_gc_lock would then deadlock acquire_gc_lock.
+    // Start with a nonblocking filesystem operation so a missing refusal
+    // fails before any SQL write or blocking maintenance path.
+    assert!(
+        ro.try_lock("new-key").is_err(),
+        "try_lock must be refused on a read-only store"
+    );
+    assert!(
+        ro.put(
+            "rokey2",
+            "c",
+            &["lib".to_string()],
+            &[],
+            "t",
+            "dev",
+            &[(other.clone(), "libc.rlib".to_string())],
+            "",
+            "",
+        )
+        .is_err(),
+        "put must be refused on a read-only store"
+    );
+    assert!(
+        ro.import_downloaded_entry("rokey1").is_err(),
+        "import_downloaded_entry must be refused on a read-only store"
+    );
+    assert!(
+        ro.import_restored_entry("rokey1").is_err(),
+        "import_restored_entry must be refused on a read-only store"
+    );
+    assert!(
+        ro.import_verified_restored_entries(&[]).is_err(),
+        "import_verified_restored_entries must be refused on a read-only store"
+    );
+    assert!(
+        ro.rebuild_index_from_store().is_err(),
+        "rebuild_index_from_store must be refused on a read-only store"
+    );
+    assert!(
+        ro.record_entry_unit("rokey1", "unit").is_err(),
+        "record_entry_unit must be refused on a read-only store"
+    );
+    assert!(
+        ro.remove_entry("rokey1").is_err(),
+        "remove_entry must be refused on a read-only store"
+    );
+    assert!(
+        ro.evict().is_err(),
+        "evict must be refused on a read-only store"
+    );
+    assert!(
+        ro.evict_for_disk_pressure(|| false).is_err(),
+        "evict_for_disk_pressure must be refused on a read-only store"
+    );
+    assert!(
+        ro.evict_older_than(0).is_err(),
+        "evict_older_than must be refused on a read-only store"
+    );
+    assert!(
+        ro.evict_stale_key_schemas(0).is_err(),
+        "evict_stale_key_schemas must be refused on a read-only store"
+    );
+    assert!(
+        ro.evict_duplicate_entries().is_err(),
+        "evict_duplicate_entries must be refused on a read-only store"
+    );
+    assert!(
+        ro.clear().is_err(),
+        "clear must be refused on a read-only store"
+    );
+    assert!(
+        ro.migrate_to_blobs(|_, _| {}).is_err(),
+        "migrate_to_blobs must be refused on a read-only store"
+    );
+    assert!(
+        ro.claim_build("new-key").is_err(),
+        "claim_build must be refused on a read-only store"
+    );
+    assert!(
+        ro.try_gc_lock().is_err(),
+        "try_gc_lock must be refused on a read-only store"
+    );
+    assert!(
+        ro.acquire_gc_lock().is_err(),
+        "acquire_gc_lock must be refused on a read-only store"
+    );
+    assert!(
+        ro.try_durability_flush_lock().is_err(),
+        "durability lock must be refused on a read-only store"
+    );
+    assert!(
+        ro.flush_durability(1).is_err(),
+        "flush_durability must be refused on a read-only store"
+    );
+    assert!(
+        ro.flush_entry_durability("rokey1").is_err(),
+        "flush_entry_durability must be refused on a read-only store"
+    );
+    assert!(
+        ro.reconcile_blob_index().is_err(),
+        "reconcile_blob_index must be refused on a read-only store"
+    );
+    assert!(
+        ro.reconcile_blob_index_dropping_unverifiable().is_err(),
+        "reconcile dropping must be refused on a read-only store"
+    );
+    assert!(
+        ro.sweep_orphan_blobs(Duration::ZERO).is_err(),
+        "sweep_orphan_blobs must be refused on a read-only store"
+    );
+    assert!(
+        ro.sweep_stale_key_locks(Duration::ZERO, 1).is_err(),
+        "sweep_stale_key_locks must be refused on a read-only store"
+    );
+    assert!(
+        ro.backfill_content_hashes().is_err(),
+        "backfill_content_hashes must be refused on a read-only store"
+    );
+    assert!(
+        ro.backfill_compile_times().is_err(),
+        "backfill_compile_times must be refused on a read-only store"
+    );
+    assert!(
+        ro.backfill_entry_blobs().is_err(),
+        "backfill_entry_blobs must be refused on a read-only store"
+    );
+    assert!(
+        ro.prune_tombstones(0).is_err(),
+        "prune_tombstones must be refused on a read-only store"
+    );
+    assert!(
+        ro.remember_incremental_dir(src.path()).is_err(),
+        "remember_incremental_dir must be refused on a read-only store"
+    );
+    assert!(
+        ro.remember_target_root(src.path(), src.path()).is_err(),
+        "remember_target_root must be refused on a read-only store"
+    );
+    assert!(
+        ro.remember_discovered_target_root(src.path(), src.path())
             .is_err(),
-        ),
-        (
-            "import_downloaded_entry",
-            ro.import_downloaded_entry("rokey1").is_err(),
-        ),
-        (
-            "import_restored_entry",
-            ro.import_restored_entry("rokey1").is_err(),
-        ),
-        (
-            "import_verified_restored_entries",
-            ro.import_verified_restored_entries(&[]).is_err(),
-        ),
-        (
-            "rebuild_index_from_store",
-            ro.rebuild_index_from_store().is_err(),
-        ),
-        (
-            "record_entry_unit",
-            ro.record_entry_unit("rokey1", "unit").is_err(),
-        ),
-        ("remove_entry", ro.remove_entry("rokey1").is_err()),
-        ("evict", ro.evict().is_err()),
-        (
-            "evict_for_disk_pressure",
-            ro.evict_for_disk_pressure(|| false).is_err(),
-        ),
-        ("evict_older_than", ro.evict_older_than(0).is_err()),
-        (
-            "evict_stale_key_schemas",
-            ro.evict_stale_key_schemas(0).is_err(),
-        ),
-        (
-            "evict_duplicate_entries",
-            ro.evict_duplicate_entries().is_err(),
-        ),
-        ("clear", ro.clear().is_err()),
-        ("migrate_to_blobs", ro.migrate_to_blobs(|_, _| {}).is_err()),
-        ("try_lock", ro.try_lock("new-key").is_err()),
-        ("claim_build", ro.claim_build("new-key").is_err()),
-        ("try_gc_lock", ro.try_gc_lock().is_err()),
-        ("acquire_gc_lock", ro.acquire_gc_lock().is_err()),
-        ("durability lock", ro.try_durability_flush_lock().is_err()),
-        ("flush_durability", ro.flush_durability(1).is_err()),
-        (
-            "flush_entry_durability",
-            ro.flush_entry_durability("rokey1").is_err(),
-        ),
-        ("reconcile_blob_index", ro.reconcile_blob_index().is_err()),
-        (
-            "reconcile dropping",
-            ro.reconcile_blob_index_dropping_unverifiable().is_err(),
-        ),
-        (
-            "sweep_orphan_blobs",
-            ro.sweep_orphan_blobs(Duration::ZERO).is_err(),
-        ),
-        (
-            "sweep_stale_key_locks",
-            ro.sweep_stale_key_locks(Duration::ZERO, 1).is_err(),
-        ),
-        (
-            "backfill_content_hashes",
-            ro.backfill_content_hashes().is_err(),
-        ),
-        (
-            "backfill_compile_times",
-            ro.backfill_compile_times().is_err(),
-        ),
-        ("backfill_entry_blobs", ro.backfill_entry_blobs().is_err()),
-        ("prune_tombstones", ro.prune_tombstones(0).is_err()),
-        (
-            "remember_incremental_dir",
-            ro.remember_incremental_dir(src.path()).is_err(),
-        ),
-        (
-            "remember_target_root",
-            ro.remember_target_root(src.path(), src.path()).is_err(),
-        ),
-        (
-            "remember_discovered_target_root",
-            ro.remember_discovered_target_root(src.path(), src.path())
-                .is_err(),
-        ),
-        (
-            "forget_target_root",
-            ro.forget_target_root(src.path()).is_err(),
-        ),
-        (
-            "clean_registered_incremental_dirs",
-            ro.clean_registered_incremental_dirs().is_err(),
-        ),
-    ];
-    for (name, refused) in refusals {
-        assert!(refused, "{name} must be refused on a read-only store");
-    }
+        "remember_discovered_target_root must be refused on a read-only store"
+    );
+    assert!(
+        ro.forget_target_root(src.path()).is_err(),
+        "forget_target_root must be refused on a read-only store"
+    );
+    assert!(
+        ro.clean_registered_incremental_dirs().is_err(),
+        "clean_registered_incremental_dirs must be refused on a read-only store"
+    );
     // The file-hash memo writers are best-effort; on a read-only connection
     // they write nothing.
     ro.record_known_file_hash(&other, "00");

@@ -218,8 +218,9 @@ fn rustc_corrupt_entry_recompiles_with_the_normal_path_remap() {
         cold_bytes,
         "a failed claim must compile with the cached path remap"
     );
-    let report = kache_report(cache.path());
-    let last = report["all_events"].as_array().unwrap().last().unwrap();
+    // The report omits skipped compiles; inspect the raw event instead.
+    let events = std::fs::read_to_string(cache.path().join("events.jsonl")).unwrap();
+    let last: serde_json::Value = serde_json::from_str(events.lines().last().unwrap()).unwrap();
     assert_eq!(last["cache_key"], key);
     assert_eq!(last["result"], "skipped");
     assert!(

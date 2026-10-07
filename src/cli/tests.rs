@@ -7357,6 +7357,86 @@ fn an_orphans_dry_run_keeps_a_missing_target_registered() {
 }
 
 #[test]
+fn tracked_clean_json_previews_keep_missing_targets_registered() {
+    for selection in [
+        TrackedSelection::Orphaned,
+        TrackedSelection::StaleOrOrphaned(24),
+    ] {
+        for (dry_run, yes, json, expected_rows) in [
+            (false, false, true, 1),
+            (true, true, true, 1),
+            (true, true, false, 1),
+            (false, true, true, 0),
+            (false, true, false, 0),
+            (false, false, false, 0),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let config = crate::test_support::test_config(dir.path().join("cache"));
+            let store = Store::open(&config).unwrap();
+            let workspace = dir.path().join("worktrees/feature");
+            let target = dir.path().join("targets/feature");
+            std::fs::create_dir_all(&workspace).unwrap();
+            std::fs::create_dir_all(target.join("debug")).unwrap();
+            std::fs::write(target.join("CACHEDIR.TAG"), CARGO_CACHEDIR_TAG).unwrap();
+            store.remember_target_root(&target, &workspace).unwrap();
+            std::fs::remove_dir_all(&workspace).unwrap();
+            std::fs::remove_dir_all(&target).unwrap();
+
+            clean(&config, dry_run, yes, json, CleanScope::Tracked(selection)).unwrap();
+
+            assert_eq!(
+                store.tracked_target_roots(0).unwrap().len(),
+                expected_rows,
+                "dry_run={dry_run}, yes={yes}, json={json}, selection={selection:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn tracked_clean_says_when_registry_removal_is_only_a_preview() {
+    for missing in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::test_support::test_config(dir.path().join("cache"));
+        let store = Store::open(&config).unwrap();
+        let workspace = dir.path().join("worktrees/feature");
+        let target = dir.path().join("targets/feature");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(target.join("debug")).unwrap();
+        std::fs::write(target.join("CACHEDIR.TAG"), CARGO_CACHEDIR_TAG).unwrap();
+        store.remember_target_root(&target, &workspace).unwrap();
+        std::fs::remove_dir_all(&workspace).unwrap();
+        let reason = if missing {
+            std::fs::remove_dir_all(&target).unwrap();
+            "path no longer exists"
+        } else {
+            std::fs::rename(&target, target.with_file_name("old-feature")).unwrap();
+            std::fs::create_dir_all(target.join("debug")).unwrap();
+            std::fs::write(target.join("CACHEDIR.TAG"), CARGO_CACHEDIR_TAG).unwrap();
+            "directory identity changed"
+        };
+
+        let (_, skipped, _) =
+            tracked_target_entries(&config, TrackedSelection::Orphaned, true).unwrap();
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(
+            skipped[0].reason,
+            format!("{reason}; registry entry would be removed")
+        );
+        assert_eq!(store.tracked_target_roots(0).unwrap().len(), 1);
+
+        let (_, skipped, _) =
+            tracked_target_entries(&config, TrackedSelection::Orphaned, false).unwrap();
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(
+            skipped[0].reason,
+            format!("{reason}; registry entry removed")
+        );
+        assert!(store.tracked_target_roots(0).unwrap().is_empty());
+    }
+}
+
+#[test]
 fn remove_targets_refuses_a_directory_replaced_after_scan() {
     let root = tempfile::tempdir().unwrap();
     let target = root.path().join("proj/target");

@@ -1100,14 +1100,79 @@ mod tests {
     /// even when a remote is configured.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn only_an_entry_marked_for_the_remote_is_queued_for_upload() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut config = crate::test_support::test_config(dir.path().join("cache"));
+        const CHILD_ROOT: &str = "KACHE_TEST_REMOTE_PUBLISH_ROOT";
+        let Some(root) = std::env::var_os(CHILD_ROOT) else {
+            // A stuck publish_one owns a blocking task that runtime teardown
+            // cannot cancel. Keep the worker in a process we can kill and reap.
+            let dir = tempfile::tempdir().unwrap();
+            let log_path = dir.path().join("publisher.log");
+            let log = std::fs::File::create(&log_path).unwrap();
+            struct FixtureChild(std::process::Child);
+            impl Drop for FixtureChild {
+                fn drop(&mut self) {
+                    if !matches!(self.0.try_wait(), Ok(Some(_))) {
+                        let _ = self.0.kill();
+                    }
+                    let _ = self.0.wait();
+                }
+            }
+            let mut child = FixtureChild(
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "daemon_publish::tests::only_an_entry_marked_for_the_remote_is_queued_for_upload",
+                        "--nocapture",
+                        "--test-threads=1",
+                    ])
+                    .env(CHILD_ROOT, dir.path())
+                    .current_dir(dir.path())
+                    .stdout(log.try_clone().unwrap())
+                    .stderr(log)
+                    .spawn()
+                    .unwrap(),
+            );
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            loop {
+                match child.0.try_wait() {
+                    Ok(Some(status)) => {
+                        child.0.wait().unwrap();
+                        let log = std::fs::read(&log_path).unwrap();
+                        let log = String::from_utf8_lossy(&log);
+                        assert!(
+                            status.success(),
+                            "remote publish fixture failed: {status}\n{log}"
+                        );
+                        assert_eq!(
+                            std::fs::read(dir.path().join("publisher-complete")).unwrap(),
+                            b"ok",
+                            "the child must finish the upload assertions"
+                        );
+                        return;
+                    }
+                    Ok(None) if std::time::Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    result => {
+                        let killed = child.0.kill();
+                        let waited = child.0.wait();
+                        let log = std::fs::read(&log_path).unwrap_or_default();
+                        let log = String::from_utf8_lossy(&log);
+                        panic!(
+                            "remote publish fixture did not finish: {result:?}; \
+                             kill: {killed:?}; wait: {waited:?}\n{log}"
+                        );
+                    }
+                }
+            }
+        };
+        let dir = PathBuf::from(root);
+        let mut config = crate::test_support::test_config(dir.join("cache"));
         config.remote = Some(crate::config::RemoteConfig::test_s3("bucket", "artifacts"));
         let daemon = Arc::new(Daemon::new(config.clone()));
         let (upload_tx, mut uploads) = tokio::sync::mpsc::unbounded_channel();
         daemon.set_upload_tx(upload_tx);
         for (label, publishes_to_remote) in [("local-only", false), ("shared", true)] {
-            let mut request = handoff_request(&config, &key(label), dir.path());
+            let mut request = handoff_request(&config, &key(label), &dir);
             request.publishes_to_remote = publishes_to_remote;
             let (daemon, config) = (Arc::clone(&daemon), config.clone());
             tokio::task::spawn_blocking(move || {
@@ -1132,6 +1197,7 @@ mod tests {
         let queued = uploads.try_recv().expect("the shared entry is queued");
         assert_eq!(queued.key, key("shared"));
         assert!(uploads.try_recv().is_err(), "the local-only entry is not");
+        std::fs::write(dir.join("publisher-complete"), b"ok").unwrap();
     }
 
     /// The wrapper's side and the daemon's connection handler, over a real

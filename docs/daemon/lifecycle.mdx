@@ -67,6 +67,14 @@ compiler fallback itself. Upload intents it has accepted survive shutdown in
 the spool, and `kunobi-daemon` never owns or cancels them. Each program that
 uses `kunobi-daemon` decides how to export its lifecycle observations.
 
+Transient remote errors keep their upload intents for retries and restart
+replay. A terminal failure, including rejected credentials or invalid remote
+configuration, removes the intent and abandons automatic reupload. The local
+cache entry remains until GC evicts it; fixing credentials later does not
+replay an intent that has already been retired. This also abandons duplicate
+requests folded into that in-flight upload. A request arriving after retirement
+creates a new intent if the local entry still exists.
+
 ## Idle shutdown
 
 Idle shutdown is off by default. Set a timeout in seconds to turn it on:

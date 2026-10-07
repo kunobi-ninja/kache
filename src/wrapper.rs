@@ -881,6 +881,60 @@ fn open_primary_and_fallback(config: &Config, route: &Path) -> Result<(Store, Op
     Ok((primary, fallback))
 }
 
+/// How long a lookup waits for a busy store index before the unit is compiled
+/// as a miss.
+const LOOKUP_BUSY_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+/// First pause after a lookup finds the index busy. It doubles up to
+/// [`LOOKUP_BUSY_PAUSE_MAX`].
+const LOOKUP_BUSY_PAUSE: std::time::Duration = std::time::Duration::from_millis(20);
+/// Longest pause between two lookups of a busy index.
+const LOOKUP_BUSY_PAUSE_MAX: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Run a local lookup, waiting out a busy index, and treat a lookup that
+/// still fails as a miss.
+///
+/// A failed lookup used to send the unit to a passthrough compile. A
+/// passthrough runs the compiler with the caller's arguments only, so its
+/// output lacks the path remap every cached compile gets
+/// (`--remap-path-prefix` for rustc, the prefix maps for cc and nvcc) and
+/// carries absolute paths that the cached entry for the same key does not.
+/// Dependents fold those bytes into their own keys (rustc `externs`, a native
+/// archive's digest), so one passthrough makes every unit above it miss for as
+/// long as that target directory lives. The usual cause is an index that
+/// another process holds for longer than the connection's busy timeout, for
+/// example an eviction sweep.
+///
+/// A busy index is retried with doubling pauses until `budget` is spent. Any
+/// other error, or a busy index past the budget, returns `None`, and the unit
+/// takes the ordinary miss path with the path remap. `pause` is the sleep; it
+/// is a parameter so tests own the clock.
+fn lookup_or_miss<T>(
+    crate_name: &str,
+    budget: std::time::Duration,
+    mut pause: impl FnMut(std::time::Duration),
+    mut lookup: impl FnMut() -> Result<Option<T>>,
+) -> Option<T> {
+    let mut waited = std::time::Duration::ZERO;
+    let mut step = LOOKUP_BUSY_PAUSE;
+    loop {
+        let error = match lookup() {
+            Ok(found) => return found,
+            Err(error) => error,
+        };
+        let left = budget.saturating_sub(waited);
+        if left.is_zero() || !crate::blob_heal::is_index_busy(&error) {
+            tracing::warn!(
+                "local store lookup failed for {crate_name} after waiting {waited:?} for a busy index: {error:#}; compiling it as a miss"
+            );
+            return None;
+        }
+        let nap = step.min(left);
+        pause(nap);
+        waited += nap;
+        step = (step * 2).min(LOOKUP_BUSY_PAUSE_MAX);
+    }
+}
+
 /// Local lookup: volume shard first, then the main store. The returned
 /// store is the one whose blobs must be restored.
 fn lookup_local_entry<'a>(
@@ -1108,20 +1162,9 @@ pub fn run_nvcc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
 
     // ── Local cache lookup ───────────────────────────────────────
     let lookup_start = std::time::Instant::now();
-    let lookup = match lookup_local_entry(&store, None, &cache_key) {
-        Ok(lookup) => lookup,
-        Err(e) => {
-            tracing::warn!("nvcc local store lookup failed for {crate_name}: {e} — recompiling");
-            return nvcc_passthrough_with_event(
-                config,
-                &parsed,
-                &crate_name,
-                &event_root,
-                start,
-                format!("store lookup failed: {e}"),
-            );
-        }
-    };
+    let lookup = lookup_or_miss(&crate_name, LOOKUP_BUSY_BUDGET, std::thread::sleep, || {
+        lookup_local_entry(&store, None, &cache_key)
+    });
     let lookup_ms = lookup_start.elapsed().as_millis() as u64;
     let mut lookup_rejection = String::new();
     if let Some((hit_store, meta)) = lookup {
@@ -1914,27 +1957,11 @@ fn run_cc_with_store(
     let lookup = if precompiled.is_some() {
         None
     } else {
-        match lookup_local_entry(store, fallback_store.as_ref(), &cache_key) {
-            Ok(lookup) => {
-                drop(trace_lookup);
-                lookup
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "cc local store lookup failed for {}: {} — recompiling",
-                    crate_name,
-                    e
-                );
-                return cc_passthrough_with_event(
-                    config,
-                    parsed,
-                    crate_name,
-                    event_root,
-                    start,
-                    format!("store lookup failed: {e}"),
-                );
-            }
-        }
+        let lookup = lookup_or_miss(crate_name, LOOKUP_BUSY_BUDGET, std::thread::sleep, || {
+            lookup_local_entry(store, fallback_store.as_ref(), &cache_key)
+        });
+        drop(trace_lookup);
+        lookup
     };
     let lookup_ms = lookup_start.elapsed().as_millis() as u64;
     let mut lookup_rejection = String::new();
@@ -3651,25 +3678,10 @@ fn run_parsed_rustc(
     while precompiled.is_none() {
         // 1. Check local store (volume shard, then main)
         let lookup_start = std::time::Instant::now();
-        let lookup_result = match lookup_local_entry(&store, fallback_store.as_ref(), &cache_key) {
-            Ok(result) => result,
-            Err(e) => {
-                tracing::warn!(
-                    "local store lookup failed for {}: {} — recompiling",
-                    crate_name,
-                    e
-                );
-                return passthrough_with_event(
-                    config,
-                    args,
-                    crate_name,
-                    &event_root,
-                    start,
-                    format!("store lookup failed: {e}"),
-                    key_record,
-                );
-            }
-        };
+        let lookup_result =
+            lookup_or_miss(crate_name, LOOKUP_BUSY_BUDGET, std::thread::sleep, || {
+                lookup_local_entry(&store, fallback_store.as_ref(), &cache_key)
+            });
         lookup_ms = lookup_ms.saturating_add(lookup_start.elapsed().as_millis() as u64);
 
         // A closure that came from a record is already recorded; re-writing it on

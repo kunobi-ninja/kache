@@ -6393,8 +6393,12 @@ fn hash_static_lib_ignores_legacy_namespaces() {
         path: format!("static-ar-v6\0{}", fingerprint.path),
         ..fingerprint.clone()
     };
-    let current_key = FileFingerprint {
+    let legacy_v7_key = FileFingerprint {
         path: format!("static-ar-v7\0{}", fingerprint.path),
+        ..fingerprint.clone()
+    };
+    let current_key = FileFingerprint {
+        path: format!("static-ar-v8\0{}", fingerprint.path),
         ..fingerprint
     };
     let cache = fh.cache.as_ref().expect("persistent cache opens");
@@ -6415,6 +6419,10 @@ fn hash_static_lib_ignores_legacy_namespaces() {
         .put(&legacy_v6_key, "legacy-path-bound-blank-longname-sentinel")
         .unwrap();
 
+    cache
+        .put(&legacy_v7_key, "legacy-path-bound-bsd-elf-sentinel")
+        .unwrap();
+
     let computed = fh.hash_static_lib(&lib).unwrap();
     assert!(computed.starts_with("gnu-ar-v2:"));
     assert_ne!(computed, "legacy-whole-file-sentinel");
@@ -6423,6 +6431,7 @@ fn hash_static_lib_ignores_legacy_namespaces() {
     assert_ne!(computed, "legacy-unguarded-macho-sentinel");
     assert_ne!(computed, "legacy-path-bound-dwarf-sentinel");
     assert_ne!(computed, "legacy-path-bound-blank-longname-sentinel");
+    assert_ne!(computed, "legacy-path-bound-bsd-elf-sentinel");
     fh.flush_memo_as_if_settled();
     assert_eq!(cache.get(&current_key).unwrap(), Some(computed.clone()));
     assert_eq!(fh.hash_static_lib(&lib).unwrap(), computed);
@@ -6641,8 +6650,8 @@ fn hash_static_lib_memo_rows_are_per_use() {
     let fingerprint = FileFingerprint::from_path(&lib).unwrap();
     let cache = fh.cache.as_ref().expect("persistent cache opens");
     for (namespace, expected) in [
-        ("static-ar-v7-bundled", &bundled),
-        ("static-ar-v7", &linked),
+        ("static-ar-v8-bundled", &bundled),
+        ("static-ar-v8", &linked),
     ] {
         let key = FileFingerprint {
             path: format!("{namespace}\0{}", fingerprint.path),
@@ -6670,7 +6679,7 @@ fn hash_static_lib_memo_threshold_is_exclusive() {
         fh.flush_memo_as_if_settled();
         let fingerprint = FileFingerprint::from_path(&lib).unwrap();
         let key = FileFingerprint {
-            path: format!("static-ar-v7\0{}", fingerprint.path),
+            path: format!("static-ar-v8\0{}", fingerprint.path),
             ..fingerprint
         };
         let expected = memoized.then_some(hash);

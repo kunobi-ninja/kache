@@ -1092,6 +1092,15 @@ fn machine_readable_commands_emit_one_json_document() {
 }
 
 #[test]
+fn gc_json_has_an_entries_failed_field() {
+    let e = env();
+    let output = e.cmd().args(["--json", "gc"]).output().unwrap();
+    assert!(output.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(value["entries_failed"].is_u64(), "{value}");
+}
+
+#[test]
 fn json_failures_emit_one_document_and_nonzero_exit() {
     let e = env();
     for (args, exit, code) in [

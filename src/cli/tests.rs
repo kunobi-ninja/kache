@@ -7078,6 +7078,7 @@ fn a_target_says_what_the_next_pass_does_to_it() {
         units: Pruned {
             units: 1,
             bytes: 2048,
+            ..Pruned::default()
         },
     };
     assert_eq!(
@@ -7089,6 +7090,7 @@ fn a_target_says_what_the_next_pass_does_to_it() {
         units: Pruned {
             units: 3,
             bytes: 1024,
+            ..Pruned::default()
         },
     };
     assert_eq!(

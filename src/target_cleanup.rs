@@ -14,6 +14,13 @@
 //! `[cache] auto_clean_unused_units_days` (30 by default; see
 //! [`crate::unit_prune`]).
 //!
+//! A target found only through Git, which no build through kache has used,
+//! is watched instead: on a local filesystem that shows reads, each check arms
+//! its units' fingerprints, and it counts as idle from then until a build
+//! reads or writes one (see [`idle_secs`]). It then goes by the idle and
+//! low-disk rules as a whole; its units are not pruned, and the
+//! deleted-workspace rule is for recorded targets.
+//!
 //! With `[cache] auto_recover_min_free_bytes` set, a volume below that floor
 //! first loses the units no build used for a day, from every target on it;
 //! only then do whole targets idle for a day go, largest first, until the
@@ -79,6 +86,21 @@ pub(crate) fn reason(config: &Config, orphaned: bool, idle_secs: i64) -> Option<
     }
     let days = config.auto_clean_idle_targets_days;
     (days > 0 && idle >= days.saturating_mul(DAY_SECS)).then_some(Reason::Idle)
+}
+
+/// Seconds since a build last used `tracked` at `now`: since the build that
+/// recorded it, or for a target found only through Git, since kache began
+/// watching it with no build using it (see [`crate::unit_prune::unused_since`]).
+/// A watch counts only on a local filesystem and when it began after this
+/// directory was found, so a replaced directory starts over. `None` when that
+/// is unknown, which keeps it from every time-based rule.
+pub(crate) fn idle_secs(cache_dir: &Path, tracked: &TrackedTargetRoot, now: i64) -> Option<i64> {
+    if tracked.discovered {
+        idle_secs_local(tracked)?;
+        let unused = crate::unit_prune::unused_since(cache_dir, &tracked.path);
+        return watched_idle(tracked, now, unused);
+    }
+    Some(now.saturating_sub(tracked.last_seen).max(0))
 }
 
 /// Whether a periodic check at `now` should run: cleanup is on, an hour has
@@ -187,14 +209,23 @@ pub(crate) fn sweep(config: &Config, now: u64) -> anyhow::Result<Swept> {
                 .is_some_and(|identity| identity != tracked.identity);
             if missing_with_parent || replaced {
                 store.forget_target_root(&tracked.path)?;
+                continue;
             }
-            continue;
+            // A build holding it could keep a fingerprint from being armed.
+            if intact(&tracked) && !crate::cli::target_in_use(&tracked.path) {
+                let found = SystemTime::UNIX_EPOCH
+                    + Duration::from_secs(u64::try_from(tracked.first_seen).unwrap_or(0));
+                crate::unit_prune::watch(&config.cache_dir, &tracked.path, at, found);
+            }
         }
-        let orphaned = crate::cli::workspace_is_gone(&tracked.workspace_root);
-        let idle = now.saturating_sub(tracked.last_seen);
+        let Some(idle) = idle_secs(&config.cache_dir, &tracked, now) else {
+            continue;
+        };
+        let orphaned =
+            !tracked.discovered && crate::cli::workspace_is_gone(&tracked.workspace_root);
         let intact = intact(&tracked);
         let Some(reason) = reason(config, orphaned, idle) else {
-            if let Some(window) = window.filter(|_| intact) {
+            if let Some(window) = window.filter(|_| intact && !tracked.discovered) {
                 let pruned = crate::unit_prune::prune(&config.cache_dir, &tracked.path, window, at);
                 if pruned.units > 0 {
                     swept.pruned.push((tracked.path, pruned));
@@ -221,8 +252,18 @@ pub(crate) fn sweep(config: &Config, now: u64) -> anyhow::Result<Swept> {
             ),
         }
     }
-    prune_under_pressure(config, &store, at, &mut swept)?;
-    recover_under_pressure(config, &store, now, &mut swept)?;
+    // Pruning re-arms what it keeps, which would hide how long a target went
+    // unused; note that first.
+    let unused: std::collections::HashMap<PathBuf, Option<SystemTime>> = store
+        .tracked_target_roots(0)?
+        .into_iter()
+        .map(|tracked| {
+            let since = crate::unit_prune::unused_since(&config.cache_dir, &tracked.path);
+            (tracked.path, since)
+        })
+        .collect();
+    let used = prune_under_pressure(config, &store, at, &mut swept)?;
+    recover_under_pressure(config, &store, now, &unused, &used, &mut swept)?;
     Ok(swept)
 }
 
@@ -246,14 +287,14 @@ pub(crate) struct Plan {
 /// What [`sweep`] would do to `tracked` at `now`, from the same checks,
 /// without changing anything.
 pub(crate) fn plan(config: &Config, tracked: &TrackedTargetRoot, now: u64) -> Plan {
-    if tracked.discovered {
-        return Plan::default();
-    }
     let at = SystemTime::UNIX_EPOCH + Duration::from_secs(now);
     let now = i64::try_from(now).unwrap_or(i64::MAX);
+    let Some(idle) = idle_secs(&config.cache_dir, tracked, now) else {
+        return Plan::default();
+    };
     let intact = intact(tracked);
-    let orphaned = crate::cli::workspace_is_gone(&tracked.workspace_root);
-    let reason = reason(config, orphaned, now.saturating_sub(tracked.last_seen));
+    let orphaned = !tracked.discovered && crate::cli::workspace_is_gone(&tracked.workspace_root);
+    let reason = reason(config, orphaned, idle);
     if let Some(reason) = reason.filter(|_| intact && !crate::cli::target_in_use(&tracked.path)) {
         return Plan {
             remove: Some(reason),
@@ -274,9 +315,11 @@ pub(crate) fn plan(config: &Config, tracked: &TrackedTargetRoot, now: u64) -> Pl
             && pressure_eligible(config, tracked, now)
             && crate::cli::target_reclaimable_bytes(&tracked.path) > 0)
             .then_some(Reason::Pressure),
-        units: window.map_or_else(Default::default, |window| {
-            crate::unit_prune::preview(&config.cache_dir, &tracked.path, window, at)
-        }),
+        units: window
+            .filter(|_| !tracked.discovered)
+            .map_or_else(Default::default, |window| {
+                crate::unit_prune::preview(&config.cache_dir, &tracked.path, window, at)
+            }),
     }
 }
 
@@ -301,7 +344,7 @@ fn unit_plan_window(
 /// configured free-space floor.
 fn under_pressure(config: &Config, tracked: &TrackedTargetRoot) -> bool {
     let floor = config.auto_recover_min_free_bytes;
-    if floor == 0 || tracked.discovered {
+    if floor == 0 {
         return false;
     }
     let Some(true) = crate::cache_fs::probe(&tracked.path).is_local else {
@@ -313,14 +356,19 @@ fn under_pressure(config: &Config, tracked: &TrackedTargetRoot) -> bool {
 
 /// On a volume below the floor, remove the units no build used for a day
 /// from each target on it, until the volume is back above the floor.
+/// Returns the targets in which pruning found a unit a build had used since
+/// the last arming: whatever the earlier snapshot said, those are in use.
 fn prune_under_pressure(
     config: &Config,
     store: &Store,
     at: SystemTime,
     swept: &mut Swept,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<std::collections::HashSet<PathBuf>> {
+    let mut used = std::collections::HashSet::new();
     for tracked in store.tracked_target_roots(0)? {
-        if !under_pressure(config, &tracked) || !intact(&tracked) {
+        // A discovered target goes whole: pruning would re-arm it and reset
+        // the watch that decides whether it may go.
+        if tracked.discovered || !under_pressure(config, &tracked) || !intact(&tracked) {
             continue;
         }
         let Some(before) = kache_fs::volume_usage(&tracked.path) else {
@@ -328,6 +376,9 @@ fn prune_under_pressure(
         };
         let pruned =
             crate::unit_prune::prune(&config.cache_dir, &tracked.path, PRESSURE_UNIT_WINDOW, at);
+        if pruned.used > 0 {
+            used.insert(tracked.path.clone());
+        }
         if pruned.units == 0 {
             continue;
         }
@@ -336,7 +387,7 @@ fn prune_under_pressure(
         swept.reclaimed.push((tracked.path.clone(), freed));
         swept.pruned.push((tracked.path, pruned));
     }
-    Ok(())
+    Ok(used)
 }
 
 struct PressureCandidate {
@@ -347,10 +398,60 @@ struct PressureCandidate {
     idle: i64,
 }
 
+/// How long `tracked` has gone unused as kache has observed it, for the
+/// free-space rule. A build that compiles nothing leaves `last_seen` alone but
+/// still reads the units' fingerprints, so a target holding units must also
+/// have gone unused since they were last armed (`unused`, from
+/// [`crate::unit_prune::unused_since`]); one never armed, or read since, does
+/// not qualify. A recorded target holding no unit cannot be used without
+/// compiling, which records it again, so it goes by the last build through
+/// kache alone; a discovered one holding none has nothing to observe and
+/// never qualifies.
+fn observed_idle(tracked: &TrackedTargetRoot, now: i64, unused: Option<SystemTime>) -> Option<i64> {
+    if tracked.discovered {
+        idle_secs_local(tracked)?;
+        return watched_idle(tracked, now, unused);
+    }
+    let recorded = now.saturating_sub(tracked.last_seen).max(0);
+    if crate::unit_prune::profiles(&tracked.path).is_empty() {
+        return Some(recorded);
+    }
+    Some(watched_idle(tracked, now, unused)?.min(recorded))
+}
+
+/// Seconds since `unused`, the arming no build has used `tracked` since; for
+/// a discovered target only when that arming came after it was found.
+fn watched_idle(tracked: &TrackedTargetRoot, now: i64, unused: Option<SystemTime>) -> Option<i64> {
+    let since = unused?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    let since = i64::try_from(since).ok()?;
+    if tracked.discovered && since < tracked.first_seen {
+        return None;
+    }
+    Some(now.saturating_sub(since).max(0))
+}
+
+/// `Some(())` when `tracked` is on a local filesystem, where a watch counts.
+fn idle_secs_local(tracked: &TrackedTargetRoot) -> Option<()> {
+    (crate::cache_fs::probe(&tracked.path).is_local == Some(true)).then_some(())
+}
+
 /// The daemon's whole-target pressure policy, also used by `kache targets`
 /// to preview which paths it may remove on its next quiet pass.
 pub(crate) fn pressure_eligible(config: &Config, tracked: &TrackedTargetRoot, now: i64) -> bool {
-    now.saturating_sub(tracked.last_seen) >= DAY_SECS as i64
+    let unused = crate::unit_prune::unused_since(&config.cache_dir, &tracked.path);
+    pressure_eligible_with(config, tracked, now, unused)
+}
+
+fn pressure_eligible_with(
+    config: &Config,
+    tracked: &TrackedTargetRoot,
+    now: i64,
+    unused: Option<SystemTime>,
+) -> bool {
+    observed_idle(tracked, now, unused).is_some_and(|idle| idle >= DAY_SECS as i64)
         && under_pressure(config, tracked)
         && intact(tracked)
         && !crate::cli::target_in_use(&tracked.path)
@@ -366,6 +467,8 @@ fn recover_under_pressure(
     config: &Config,
     store: &Store,
     now: i64,
+    unused: &std::collections::HashMap<PathBuf, Option<SystemTime>>,
+    used: &std::collections::HashSet<PathBuf>,
     swept: &mut Swept,
 ) -> anyhow::Result<()> {
     let floor = config.auto_recover_min_free_bytes;
@@ -374,19 +477,21 @@ fn recover_under_pressure(
     }
     let mut candidates = Vec::new();
     for tracked in store.tracked_target_roots(0)? {
-        if !pressure_eligible(config, &tracked, now) {
+        let since = unused.get(&tracked.path).copied().flatten();
+        if used.contains(&tracked.path) || !pressure_eligible_with(config, &tracked, now, since) {
             continue;
         }
         let reclaimable = crate::cli::target_reclaimable_bytes(&tracked.path);
         if reclaimable == 0 {
             continue;
         }
+        let idle = observed_idle(&tracked, now, since).unwrap_or(0);
         candidates.push(PressureCandidate {
             path: tracked.path,
             workspace_root: tracked.workspace_root,
             identity: tracked.identity,
             reclaimable,
-            idle: now.saturating_sub(tracked.last_seen),
+            idle,
         });
     }
     candidates.sort_by_key(|candidate| {
@@ -941,6 +1046,176 @@ mod tests {
         .unwrap();
         assert!(sweep(&idle, later).unwrap().removed.is_empty());
         assert!(store.tracked_target_roots(0).unwrap().is_empty());
+    }
+
+    /// A target under `root` known only through Git discovery, holding one
+    /// unit Cargo built long ago.
+    #[cfg(unix)]
+    fn discovered_with_unit(store: &Store, root: &Path, name: &str) -> PathBuf {
+        let (workspace, target) = tracked_target(store, root, name);
+        store.forget_target_root(&target).unwrap();
+        store
+            .remember_discovered_target_root(&target, &workspace)
+            .unwrap();
+        let fingerprint = target.join("debug/.fingerprint/serde-0123456789abcdef");
+        std::fs::create_dir_all(&fingerprint).unwrap();
+        std::fs::write(fingerprint.join("lib-serde"), "fp").unwrap();
+        let old = filetime::FileTime::from_unix_time((unix_now_secs() - 100 * DAY_SECS) as i64, 0);
+        filetime::set_file_times(fingerprint.join("lib-serde"), old, old).unwrap();
+        filetime::set_file_mtime(&fingerprint, old).unwrap();
+        target
+    }
+
+    /// Whether this machine's temp filesystem shows reads, which watching needs.
+    #[cfg(unix)]
+    fn reads_show(dir: &Path) -> bool {
+        crate::unit_prune::reads_visible(dir)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_target_found_only_through_git_is_removed_after_a_watched_idle_window() {
+        let root = tempfile::tempdir().unwrap();
+        if !reads_show(root.path()) {
+            return;
+        }
+        let cache = tempfile::tempdir().unwrap();
+        let policy = config(cache.path(), true, 30);
+        let store = Store::open(&policy).unwrap();
+        let unused = discovered_with_unit(&store, root.path(), "unused");
+        let used = discovered_with_unit(&store, root.path(), "used");
+        let now = unix_now_secs();
+        assert_eq!(
+            idle_secs(cache.path(), &root_of(&store, &unused), now as i64),
+            None
+        );
+
+        // The first check only starts watching, however old the units are.
+        assert!(sweep(&policy, now).unwrap().removed.is_empty());
+        assert_eq!(
+            idle_secs(cache.path(), &root_of(&store, &unused), now as i64),
+            Some(0)
+        );
+
+        // A build that compiles nothing still reads the fingerprint.
+        let read = filetime::FileTime::from_unix_time(now as i64 + 60, 0);
+        let fingerprint = used.join("debug/.fingerprint/serde-0123456789abcdef/lib-serde");
+        filetime::set_file_atime(&fingerprint, read).unwrap();
+
+        let later = now + 31 * DAY_SECS;
+        assert_eq!(
+            plan(&policy, &root_of(&store, &unused), later).remove,
+            Some(Reason::Idle)
+        );
+        assert_eq!(plan(&policy, &root_of(&store, &used), later).remove, None);
+        let swept = sweep(&policy, later).unwrap();
+        assert_eq!(swept.removed, vec![(unused.clone(), Reason::Idle)]);
+        assert!(!unused.exists());
+        assert!(used.join("debug").exists());
+        assert_eq!(tracked(&store), vec![used.clone()]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_target_found_only_through_git_goes_whole_under_disk_pressure() {
+        let root = tempfile::tempdir().unwrap();
+        if !reads_show(root.path()) {
+            return;
+        }
+        let cache = tempfile::tempdir().unwrap();
+        let mut policy = config(cache.path(), true, 0);
+        let store = Store::open(&policy).unwrap();
+        let target = discovered_with_unit(&store, root.path(), "pressed");
+        std::fs::write(target.join("debug/artifact"), vec![7; 64 * 1024]).unwrap();
+        policy.auto_recover_min_free_bytes = kache_fs::volume_usage(&target).unwrap().total - 1;
+        let now = unix_now_secs();
+
+        // Watched first; its units are never pruned on their own.
+        let first = sweep(&policy, now).unwrap();
+        assert!(
+            first.removed.is_empty() && first.pruned.is_empty(),
+            "{first:?}"
+        );
+        let later = now + 2 * DAY_SECS;
+        assert_eq!(
+            plan(&policy, &root_of(&store, &target), later).remove,
+            Some(Reason::Pressure)
+        );
+        let swept = sweep(&policy, later).unwrap();
+        assert_eq!(swept.removed, vec![(target.clone(), Reason::Pressure)]);
+        assert!(swept.pruned.is_empty(), "{swept:?}");
+        assert!(!target.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_recorded_target_used_without_compiling_survives_disk_pressure() {
+        let root = tempfile::tempdir().unwrap();
+        if !reads_show(root.path()) {
+            return;
+        }
+        let cache = tempfile::tempdir().unwrap();
+        let mut policy = config(cache.path(), true, 0);
+        let store = Store::open(&policy).unwrap();
+        let mut targets = Vec::new();
+        for name in ["unused", "used"] {
+            let target = discovered_with_unit(&store, root.path(), name);
+            let workspace = root.path().join(name);
+            store.forget_target_root(&target).unwrap();
+            store.remember_target_root(&target, &workspace).unwrap();
+            std::fs::write(target.join("debug/artifact"), vec![7; 64 * 1024]).unwrap();
+            targets.push(target);
+        }
+        let [unused, used] = [&targets[0], &targets[1]];
+        age(&store, 2 * DAY_SECS);
+        policy.auto_recover_min_free_bytes = kache_fs::volume_usage(unused).unwrap().total - 1;
+        let now = unix_now_secs();
+
+        // Never armed: `last_seen` alone does not show the target went unused.
+        assert!(sweep(&policy, now).unwrap().removed.is_empty());
+
+        // A build that compiles nothing reads the fingerprint, without
+        // refreshing `last_seen`.
+        let read = filetime::FileTime::from_unix_time(now as i64 + 60, 0);
+        let fingerprint = used.join("debug/.fingerprint/serde-0123456789abcdef/lib-serde");
+        filetime::set_file_atime(&fingerprint, read).unwrap();
+
+        let swept = sweep(&policy, now + 2 * DAY_SECS).unwrap();
+        let removed: Vec<_> = swept.removed.iter().map(|(path, _)| path.clone()).collect();
+        assert_eq!(removed, vec![unused.clone()], "{swept:?}");
+        assert!(used.join("debug").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_target_found_only_through_git_is_never_orphaned() {
+        // Discovery found it in a worktree; the deleted-workspace rule needs a
+        // recorded build, so only the idle rule can take it.
+        let root = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let policy = config(cache.path(), true, 0);
+        let store = Store::open(&policy).unwrap();
+        let target = discovered_with_unit(&store, root.path(), "gone");
+        std::fs::rename(
+            root.path().join("gone/target"),
+            root.path().join("gone-target"),
+        )
+        .unwrap();
+        let moved = root.path().join("gone-target");
+        store.forget_target_root(&target).unwrap();
+        store
+            .remember_discovered_target_root(&moved, &root.path().join("gone"))
+            .unwrap();
+        std::fs::remove_dir_all(root.path().join("gone")).unwrap();
+        let now = unix_now_secs();
+        assert!(sweep(&policy, now).unwrap().removed.is_empty());
+        assert!(
+            sweep(&policy, now + 2 * DAY_SECS)
+                .unwrap()
+                .removed
+                .is_empty()
+        );
+        assert!(moved.exists());
     }
 
     #[cfg(unix)]

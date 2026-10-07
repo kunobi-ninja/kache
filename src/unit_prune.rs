@@ -54,6 +54,9 @@ const ARMED_DIR: &str = "unit-prune";
 pub(crate) struct Pruned {
     pub(crate) units: usize,
     pub(crate) bytes: u64,
+    /// Units kept because a build read or wrote them since the last arming.
+    #[serde(skip)]
+    pub(crate) used: usize,
 }
 
 /// Whether reading a file in `dir` whose access time is older than its
@@ -239,6 +242,66 @@ pub(crate) fn profiles(target_dir: &Path) -> Vec<PathBuf> {
     profiles
 }
 
+/// Since when no build has used `target_dir`, as kache has watched it: the
+/// moment [`watch`] or [`prune`] last armed it, when no unit's fingerprint has
+/// been read or written since. Cargo reads the fingerprint of every unit a
+/// build uses, even one that compiles nothing. `None` when it was never
+/// armed, holds no unit, or a unit was used since. Reads only.
+pub(crate) fn unused_since(cache_dir: &Path, target_dir: &Path) -> Option<SystemTime> {
+    let armed = read_armed(&armed_record(cache_dir, target_dir))?;
+    let units: Vec<Unit> = profiles(target_dir)
+        .iter()
+        .flat_map(|profile| units(profile))
+        .collect();
+    let unused = !units.is_empty()
+        && !units
+            .iter()
+            .any(|unit| used_since(&unit.fingerprint(), armed));
+    unused.then_some(armed)
+}
+
+/// Watch `target_dir` so a later [`unused_since`] shows whether a build used
+/// it: arm it at `now`, but no earlier than `not_before`, unless it has gone
+/// unused since an arming at or after `not_before`. Every profile is armed
+/// under Cargo's locks, and the arming is recorded only when none was held.
+/// Like [`prune`], it needs a local filesystem that shows reads; elsewhere it
+/// forgets any earlier watch, so the target never counts as unused.
+pub(crate) fn watch(cache_dir: &Path, target_dir: &Path, now: SystemTime, not_before: SystemTime) {
+    let Ok(Some(_reservation)) = crate::target_use::try_exclusive(cache_dir) else {
+        return;
+    };
+    let record = armed_record(cache_dir, target_dir);
+    let local = matches!(
+        crate::cache_fs::classify(&crate::cache_fs::probe(target_dir)),
+        crate::cache_fs::CacheFsVerdict::Local
+    );
+    if !can_prune(local, || reads_visible(target_dir)) {
+        let _ = std::fs::remove_file(&record);
+        return;
+    }
+    if unused_since(cache_dir, target_dir).is_some_and(|since| since >= not_before) {
+        return;
+    }
+    let mut held = Vec::new();
+    for profile in profiles(target_dir) {
+        let Some(locks) = hold(&profile) else {
+            return;
+        };
+        held.push((profile, locks));
+    }
+    for (profile, _locks) in &held {
+        for unit in units(profile) {
+            arm(&unit.fingerprint());
+        }
+    }
+    if let Err(error) = write_armed(&record, now.max(not_before)) {
+        tracing::debug!(
+            "could not record when {} was armed: {error:#}",
+            target_dir.display()
+        );
+    }
+}
+
 /// Where the moment `target_dir` was armed is recorded.
 fn armed_record(cache_dir: &Path, target_dir: &Path) -> PathBuf {
     let digest = blake3::hash(target_dir.as_os_str().as_encoded_bytes()).to_hex();
@@ -301,6 +364,8 @@ pub(crate) fn prune(
         crate::cache_fs::CacheFsVerdict::Local
     );
     if !can_prune(local, || reads_visible(target_dir)) {
+        // An arming here would no longer show reads: forget it.
+        let _ = std::fs::remove_file(armed_record(cache_dir, target_dir));
         return Pruned::default();
     }
     judge(cache_dir, target_dir, window, now)
@@ -316,11 +381,16 @@ fn can_prune(local: bool, reads: impl FnOnce() -> bool) -> bool {
 /// part of [`prune`] after the filesystem was found to show reads.
 fn judge(cache_dir: &Path, target_dir: &Path, window: Duration, now: SystemTime) -> Pruned {
     let record = armed_record(cache_dir, target_dir);
-    let pruned = match step(read_armed(&record), now, window) {
+    let (pruned, complete) = match step(read_armed(&record), now, window) {
         Step::Wait => return Pruned::default(),
         Step::Arm => sweep(target_dir, None),
         Step::Judge(armed) => sweep(target_dir, Some(armed)),
     };
+    // A profile a build held was neither judged nor armed; recording the
+    // arming would vouch for it, so the next check tries again.
+    if !complete {
+        return pruned;
+    }
     if let Err(error) = write_armed(&record, now) {
         tracing::debug!(
             "could not record when {} was armed: {error:#}",
@@ -352,6 +422,8 @@ pub(crate) fn preview(
             if let Some((_, bytes)) = stale(&unit, &outputs, armed) {
                 unused.units += 1;
                 unused.bytes += bytes;
+            } else {
+                unused.used += 1;
             }
         }
     }
@@ -369,11 +441,14 @@ fn stale(unit: &Unit, outputs: &Outputs, armed: SystemTime) -> Option<(Vec<PathB
 }
 
 /// Under each profile's locks, remove the units not used since `armed` (none
-/// when `None`) and arm the rest.
-fn sweep(target_dir: &Path, armed: Option<SystemTime>) -> Pruned {
+/// when `None`) and arm the rest. `false` when a build held a profile, which
+/// was skipped.
+fn sweep(target_dir: &Path, armed: Option<SystemTime>) -> (Pruned, bool) {
     let mut pruned = Pruned::default();
+    let mut complete = true;
     for profile in profiles(target_dir) {
         let Some(_locks) = hold(&profile) else {
+            complete = false;
             continue;
         };
         let outputs = outputs(&profile);
@@ -385,10 +460,13 @@ fn sweep(target_dir: &Path, armed: Option<SystemTime>) -> Pruned {
                 }
                 continue;
             }
+            if armed.is_some() {
+                pruned.used += 1;
+            }
             arm(&unit.fingerprint());
         }
     }
-    pruned
+    (pruned, complete)
 }
 
 /// Cargo locks this process holds, released when dropped.
@@ -520,6 +598,48 @@ mod tests {
             write(&unit.join("fingerprint/lib-serde"), "fp");
             write(&unit.join("out/libserde.rlib"), "rlib-bytes");
         }
+    }
+
+    #[test]
+    fn a_watched_target_is_unused_until_a_build_reads_or_writes_a_unit() {
+        for layout in [shared_profile as fn(&Path), per_unit_profile] {
+            let cache = tempfile::tempdir().unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let target = dir.path().join("target");
+            layout(&target.join("debug"));
+            assert_eq!(unused_since(cache.path(), &target), None, "never armed");
+
+            set_times(&target, ago(40));
+            let armed = SystemTime::now() - Duration::from_secs(3);
+            sweep(&target, None);
+            write_armed(&armed_record(cache.path(), &target), armed).unwrap();
+            let since = unused_since(cache.path(), &target).unwrap();
+            assert!(
+                since <= armed && armed.duration_since(since).unwrap() < Duration::from_secs(2)
+            );
+
+            // A build that compiles nothing still reads every fingerprint.
+            let fingerprint = unit_named(&target.join("debug"), NEW).fingerprint();
+            for file in entries(&fingerprint) {
+                let now = filetime::FileTime::now();
+                filetime::set_file_atime(&file, now).unwrap();
+            }
+            assert_eq!(
+                unused_since(cache.path(), &target),
+                None,
+                "read since armed"
+            );
+        }
+    }
+
+    #[test]
+    fn a_target_without_units_is_never_unused() {
+        let cache = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        write(&target.join("debug/deps/libplain.rlib"), "keep");
+        write_armed(&armed_record(cache.path(), &target), ago(40)).unwrap();
+        assert_eq!(unused_since(cache.path(), &target), None);
     }
 
     fn unit_named(profile: &Path, hash: &str) -> Unit {
@@ -748,7 +868,11 @@ mod tests {
             let parts = old.parts(&outputs(&profile));
             let bytes: u64 = parts.iter().map(|part| size(part)).sum();
             let pruned = judge(&cache, &target, window, SystemTime::now());
-            assert_eq!(pruned, Pruned { units: 1, bytes }, "per_unit={per_unit}");
+            assert_eq!(
+                (pruned.units, pruned.bytes),
+                (1, bytes),
+                "per_unit={per_unit}"
+            );
             for part in &parts {
                 assert!(!part.exists(), "{}", part.display());
             }
@@ -853,12 +977,15 @@ mod tests {
                 .open(profile.join(name))
                 .unwrap();
             lock.lock().unwrap();
-            assert_eq!(sweep(dir.path(), Some(ago(5))), Pruned::default(), "{name}");
+            let (pruned, complete) = sweep(dir.path(), Some(ago(5)));
+            assert_eq!(pruned, Pruned::default(), "{name}");
+            assert!(!complete, "a held profile is reported: {name}");
             assert_eq!(units(&profile).len(), 2);
             // A fork elsewhere in the suite can hold a duplicate past the drop.
             lock.unlock().unwrap();
         }
-        assert_eq!(sweep(dir.path(), Some(ago(5))).units, 2);
+        let (pruned, complete) = sweep(dir.path(), Some(ago(5)));
+        assert_eq!((pruned.units, complete), (2, true));
     }
 
     #[cfg(unix)]

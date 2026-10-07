@@ -504,19 +504,24 @@ fn lookup_or_miss_waits_for_a_busy_index() {
 #[test]
 fn lookup_or_miss_gives_a_busy_index_up_as_a_miss_after_the_budget() {
     let mut naps = Vec::new();
+    let expected_naps = millis(&[20, 40, 80, 160, 320, 500, 500, 380]);
     let clock = std::cell::Cell::new(std::time::Duration::ZERO);
     let found = super::lookup_or_miss_with_clock(
         "kt",
         std::time::Duration::from_secs(2),
         || clock.get(),
         |nap| {
+            // Check before advancing fake time: a shrinking delay can reach
+            // zero and otherwise leave the retry loop running forever.
+            assert_eq!(nap, expected_naps[naps.len()], "retry backoff changed");
             naps.push(nap);
             clock.set(clock.get() + nap);
         },
         || -> Result<Option<&str>> { Err(busy_index_error()) },
     );
     assert_eq!(found, None);
-    assert_eq!(naps, millis(&[20, 40, 80, 160, 320, 500, 500, 380]));
+    assert_eq!(naps, expected_naps);
+    assert_eq!(clock.get(), std::time::Duration::from_secs(2));
 }
 
 /// SQLite's busy timeout is part of the retry budget. A lookup that blocks

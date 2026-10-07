@@ -377,7 +377,8 @@ pub struct Config {
     /// Another local store this process only reads, after its own: the
     /// directory that holds that store's `index.db`. For a CI container given
     /// the host's store through a read-only mount. A hit there is restored by
-    /// copy and nothing is written to that store. Set via
+    /// private copy. The mount must enforce filesystem protection because
+    /// SQLite can create WAL side files on a writable mount. Set via
     /// `KACHE_READONLY_STORE` or `[cache] readonly_store`; env wins over the
     /// file, and an empty value turns it off.
     pub readonly_store: Option<PathBuf>,

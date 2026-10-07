@@ -9621,7 +9621,7 @@ fn lookup_local_entry_reads_the_readonly_store_last() {
 #[cfg(unix)]
 #[test]
 fn a_read_only_store_restores_by_copy() {
-    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let dir = tempfile::tempdir().unwrap();
     let config = test_config(dir.path().join("cache"));
     let owner = Store::open(&config).unwrap();
@@ -9659,4 +9659,49 @@ fn a_read_only_store_restores_by_copy() {
         "a read-only store's blob is never hardlinked into a target"
     );
     assert_eq!(std::fs::metadata(&blob).unwrap().nlink(), 1);
+    let mode = std::fs::metadata(&from_readonly).unwrap().permissions().mode();
+    assert_eq!(mode & 0o111, 0, "an rlib must not become executable");
+    assert_ne!(mode & 0o200, 0, "a private copy must be writable");
+    std::fs::write(&from_readonly, b"changed target").unwrap();
+    assert_eq!(std::fs::read(&blob).unwrap(), b"rlib bytes");
+}
+
+#[cfg(unix)]
+#[test]
+fn readonly_restore_keeps_executable_and_transformed_file_modes() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path().join("cache"));
+    let owner = Store::open(&config).unwrap();
+    let readonly = Store::open_read_only(&config).unwrap();
+    let platform = platform::current();
+    for (name, content, kind, shared_loadable, executable) in [
+        ("build-script", b"binary bytes".as_slice(), ArtifactKind::Executable, None, true),
+        ("shared-build-script", b"shared binary".as_slice(), ArtifactKind::Executable, Some(ArtifactKind::Executable), true),
+        ("foo.d", b"foo: __kache_cwd__/src/lib.rs\n".as_slice(), ArtifactKind::DepInfo, None, false),
+    ] {
+        let hash = blake3::hash(content).to_hex().to_string();
+        create_blob(&owner, &hash, content);
+        let blob = owner.blob_path(&hash);
+        std::fs::set_permissions(&blob, std::fs::Permissions::from_mode(if executable { 0o555 } else { 0o444 })).unwrap();
+        let mut cached = cached_file(name, &hash);
+        cached.size = content.len() as u64;
+        cached.executable = executable;
+        let target = dir.path().join(name);
+        let result = materialize_cached_artifact(
+            &readonly, &cached, &target, kind, shared_loadable,
+            dir.path(), dir.path(), None, &[], &*platform, "test restore", None,
+        ).unwrap();
+        let target_meta = std::fs::metadata(&target).unwrap();
+        assert_ne!(target_meta.ino(), std::fs::metadata(&blob).unwrap().ino());
+        assert_eq!(target_meta.permissions().mode() & 0o111 != 0, executable);
+        assert_ne!(target_meta.permissions().mode() & 0o200, 0);
+        if kind == ArtifactKind::DepInfo {
+            assert_eq!(result, RestoredBytes::Rewritten);
+            assert!(!std::fs::read_to_string(&target).unwrap().contains("__kache_cwd__"));
+        } else {
+            assert_eq!(std::fs::read(&target).unwrap(), content);
+        }
+        assert_eq!(std::fs::read(&blob).unwrap(), content);
+    }
 }

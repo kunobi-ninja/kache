@@ -200,7 +200,7 @@ GC skips a shard whose store dir has no `index.db`: a missing directory, an unmo
 
 ### Read-only store
 
-Set `readonly_store` to read another store on the same machine after your own, without writing to it. The usual case is a CI container that mounts the build host's store read-only:
+Set `readonly_store` to read another store on the same machine after your own. Mount that store read-only, for example by giving a CI container the build host's store through a `:ro` volume:
 
 ```toml title="~/.config/kache/config.toml"
 [cache]
@@ -209,10 +209,10 @@ readonly_store = "/kache-host"
 
 The equivalent environment setting is `KACHE_READONLY_STORE=/kache-host`. The value is the directory that holds that store's `index.db`. An empty value turns it off.
 
-- Lookups ask the local store first (a volume shard, then the main store), then the read-only store.
+- Rust and C/C++ lookups ask the local store first (a volume shard, then the main store), then the read-only store. NVCC currently uses its own local and remote stores.
 - A hit there is restored as a private copy (a reflink where the filesystem supports it), never a hardlink into that store.
-- Nothing is written to that store: no index row, hit stamp, blob or directory. A damaged or legacy entry there is a miss, not evicted or migrated.
-- Its owner must be running. A WAL-mode index without its `index.db-wal` and `index.db-shm` is refused, because a read-only open would create them. A store that cannot be opened is skipped with a warning.
+- Kache skips index writes, hit stamps and maintenance there. A damaged or legacy entry is a miss. A rejected hit compiles and caches in your own writable store.
+- Its owner must keep the WAL side files available. A WAL-mode index without `index.db-wal` and `index.db-shm` is skipped with a warning. A read-only mount is required to prevent SQLite from creating side files if the owner removes them during an open. The connection alone cannot enforce that protection on a writable mount.
 - With a read-only store set, a unit with no record in the local store is keyed before it compiles, so it can still hit there.
 
 The local store is not designed for sharing across machines. To share between machines, use a [remote](#remote-settings).

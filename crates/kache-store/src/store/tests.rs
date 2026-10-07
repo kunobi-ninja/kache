@@ -12252,6 +12252,26 @@ fn read_only_store_serves_hits_and_writes_nothing() {
         ),
         ("clear", ro.clear().is_err()),
         ("migrate_to_blobs", ro.migrate_to_blobs(|_, _| {}).is_err()),
+        ("try_lock", ro.try_lock("new-key").is_err()),
+        ("claim_build", ro.claim_build("new-key").is_err()),
+        ("try_gc_lock", ro.try_gc_lock().is_err()),
+        ("acquire_gc_lock", ro.acquire_gc_lock().is_err()),
+        ("durability lock", ro.try_durability_flush_lock().is_err()),
+        ("flush_durability", ro.flush_durability(1).is_err()),
+        ("flush_entry_durability", ro.flush_entry_durability("rokey1").is_err()),
+        ("reconcile_blob_index", ro.reconcile_blob_index().is_err()),
+        ("reconcile dropping", ro.reconcile_blob_index_dropping_unverifiable().is_err()),
+        ("sweep_orphan_blobs", ro.sweep_orphan_blobs(Duration::ZERO).is_err()),
+        ("sweep_stale_key_locks", ro.sweep_stale_key_locks(Duration::ZERO, 1).is_err()),
+        ("backfill_content_hashes", ro.backfill_content_hashes().is_err()),
+        ("backfill_compile_times", ro.backfill_compile_times().is_err()),
+        ("backfill_entry_blobs", ro.backfill_entry_blobs().is_err()),
+        ("prune_tombstones", ro.prune_tombstones(0).is_err()),
+        ("remember_incremental_dir", ro.remember_incremental_dir(src.path()).is_err()),
+        ("remember_target_root", ro.remember_target_root(src.path(), src.path()).is_err()),
+        ("remember_discovered_target_root", ro.remember_discovered_target_root(src.path(), src.path()).is_err()),
+        ("forget_target_root", ro.forget_target_root(src.path()).is_err()),
+        ("clean_registered_incremental_dirs", ro.clean_registered_incremental_dirs().is_err()),
     ];
     for (name, refused) in refusals {
         assert!(refused, "{name} must be refused on a read-only store");
@@ -12317,6 +12337,7 @@ fn read_only_store_refuses_without_a_live_index_and_creates_nothing() {
 }
 
 /// A blob of the wrong size is a miss, and the entry is not evicted.
+#[cfg(unix)]
 #[test]
 fn read_only_store_treats_a_truncated_blob_as_a_miss_and_evicts_nothing() {
     use std::os::unix::fs::PermissionsExt;
@@ -12340,6 +12361,7 @@ fn read_only_store_treats_a_truncated_blob_as_a_miss_and_evicts_nothing() {
 
 /// A blob of the right size with other bytes is a miss when restores are
 /// verified, and served when they are not, as on the read-write path.
+#[cfg(unix)]
 #[test]
 fn read_only_store_verifies_content_as_configured() {
     use std::os::unix::fs::PermissionsExt;
@@ -12384,4 +12406,91 @@ fn read_only_store_treats_a_legacy_entry_as_a_miss() {
     let ro = Store::open_read_only(&config).unwrap();
     assert!(ro.get("legacy").unwrap().is_none());
     assert!(beside.exists(), "nothing was migrated");
+}
+
+#[test]
+fn read_only_maintenance_preserves_files_and_registered_incremental_directories() {
+    let dir = tempfile::tempdir().unwrap();
+    let incremental = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let owner = Store::open(&config).unwrap();
+    let state = incremental.path().join("state");
+    fs::write(&state, b"incremental state").unwrap();
+    owner.remember_incremental_dir(incremental.path()).unwrap();
+    fs::create_dir_all(owner.staging_dir()).unwrap();
+    let staging = owner.staging_dir().join("abandoned.tmp");
+    fs::write(&staging, b"staged bytes").unwrap();
+    let mut perms = fs::metadata(&staging).unwrap().permissions();
+    perms.set_readonly(true);
+    fs::set_permissions(&staging, perms).unwrap();
+    let stale_lock = owner.entry_dir("stale-key").with_extension("lock");
+    drop(owner.try_lock("stale-key").unwrap().unwrap());
+    let old = filetime::FileTime::from_unix_time(0, 0);
+    filetime::set_file_mtime(&staging, old).unwrap();
+    filetime::set_file_mtime(&stale_lock, old).unwrap();
+    let before = ro_tree_snapshot(dir.path());
+    let ro = Store::open_read_only(&config).unwrap();
+
+    assert!(ro.clean_registered_incremental_dirs().is_err());
+    assert_eq!(fs::read(&state).unwrap(), b"incremental state");
+    let registry_count: i64 = owner.db.query_row(
+        "SELECT COUNT(*) FROM incremental_dirs", [], |row| row.get(0)
+    ).unwrap();
+    assert_eq!(registry_count, 1);
+    let sweep = ro.sweep_stale_staging(Duration::ZERO);
+    assert_eq!((sweep.scanned, sweep.removed, sweep.bytes_reclaimed), (0, 0, 0));
+    assert_eq!(ro.sweep_housekeeping(), HousekeepingStats::default());
+    assert!(stale_lock.exists());
+    assert!(fs::metadata(&staging).unwrap().permissions().readonly());
+    assert_eq!(ro_tree_snapshot(dir.path()), before);
+    // Keep Windows TempDir cleanup independent of the test's readonly file.
+    drop(ro);
+    drop(owner);
+    fs::remove_file(&staging).or_else(|_| {
+        let mut permissions = fs::metadata(&staging)?.permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        permissions.set_readonly(false);
+        fs::set_permissions(&staging, permissions)?;
+        fs::remove_file(&staging)
+    }).unwrap();
+}
+
+#[test]
+fn read_only_store_treats_malformed_metadata_as_a_miss() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let owner = Store::open(&config).unwrap();
+    ro_put(&owner, src.path(), "malformed", b"artifact bytes");
+    let metadata = owner.entry_dir("malformed").join("meta.json");
+    fs::write(&metadata, b"{broken JSON").unwrap();
+    let ro = Store::open_read_only(&config).unwrap();
+    assert!(ro.get("malformed").unwrap().is_none());
+    assert!(owner.contains("malformed"));
+    assert_eq!(fs::read(&metadata).unwrap(), b"{broken JSON");
+}
+
+#[test]
+fn read_only_hash_memo_writers_leave_the_index_and_timeout_untouched() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let owner = Store::open(&config).unwrap();
+    let ro = Store::open_read_only(&config).unwrap();
+    let artifact = src.path().join("large.rlib");
+    fs::write(&artifact, vec![42; 65536]).unwrap();
+    let crate::file_hash::FileHashLookup::NeedsHash(fingerprint) = ro.file_hash_lookup(&artifact) else {
+        panic!("a new large file should need hashing");
+    };
+    let hash = crate::file_hash::hash_file(&artifact).unwrap();
+    let before = ro_tree_snapshot(dir.path());
+    ro.file_hash_record(&fingerprint, &hash);
+    ro.record_verified_file_hash(&fingerprint, &hash);
+    ro.record_verified_file_hashes(&[(fingerprint, &hash)]);
+    ro.record_verified_file_hashes(&[]);
+    ro.record_known_file_hash(&artifact, &hash);
+    assert!(matches!(owner.file_hash_lookup(&artifact), crate::file_hash::FileHashLookup::NeedsHash(_)));
+    let timeout: u64 = ro.db.query_row("PRAGMA busy_timeout", [], |row| row.get(0)).unwrap();
+    assert_eq!(timeout, 2000);
+    assert_eq!(ro_tree_snapshot(dir.path()), before);
 }

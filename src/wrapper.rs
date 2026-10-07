@@ -2012,51 +2012,56 @@ fn run_cc_with_store(
             let trace_restore = crate::phase_trace::phase("restore");
             let restored = restore_cc_from_cache(hit_store, parsed, &meta);
             drop(trace_restore);
-            if let Err(e) = restored {
+            if let Err(e) = &restored {
                 if e.downcast_ref::<PartialCcRestore>().is_some() {
-                    return Err(e);
+                    return restored.map(|()| 0);
                 }
                 tracing::warn!(
                     "restoring cc cache hit for {} failed: {} — recompiling",
                     crate_name,
                     e
                 );
-                return cc_passthrough_with_event(
-                    config,
-                    parsed,
+                if !hit_store.is_read_only() {
+                    return cc_passthrough_with_event(
+                        config,
+                        parsed,
+                        crate_name,
+                        event_root,
+                        start,
+                        format!("restore failed: {e}"),
+                    );
+                }
+                lookup_rejection = format!("read-only restore failed: {e}");
+            }
+            if restored.is_ok() {
+                let restore_ms = restore_start.elapsed().as_millis() as u64;
+                tracing::debug!(
+                    "cc local cache hit for {} ({})",
                     crate_name,
-                    event_root,
-                    start,
-                    format!("restore failed: {e}"),
+                    &cache_key[..16]
                 );
-            }
-            let restore_ms = restore_start.elapsed().as_millis() as u64;
-            tracing::debug!(
-                "cc local cache hit for {} ({})",
-                crate_name,
-                &cache_key[..16]
-            );
-            let trace_report = crate::phase_trace::phase("event_report");
-            HitCompletion {
-                event_root,
-                crate_name,
-                result: EventResult::LocalHit,
-                cache_key: &cache_key,
-                start,
-                key_ms,
-                key_hash_stats: FileHashStats::default(),
-                lookup_ms,
-                restore_ms,
-                key_record: KeyEventRecord::default(),
-                object_output: recorded_object_output(parsed.object_output_path()),
-            }
-            .report(config, &meta);
-            drop(trace_report);
+                let trace_report = crate::phase_trace::phase("event_report");
+                HitCompletion {
+                    event_root,
+                    crate_name,
+                    result: EventResult::LocalHit,
+                    cache_key: &cache_key,
+                    start,
+                    key_ms,
+                    key_hash_stats: FileHashStats::default(),
+                    lookup_ms,
+                    restore_ms,
+                    key_record: KeyEventRecord::default(),
+                    object_output: recorded_object_output(parsed.object_output_path()),
+                }
+                .report(config, &meta);
+                drop(trace_report);
 
-            let _trace = crate::phase_trace::phase("memo_commit");
-            compiler.commit_preprocess_memo(&file_hasher);
+                let _trace = crate::phase_trace::phase("memo_commit");
+                compiler.commit_preprocess_memo(&file_hasher);
 
-            return Ok(0);
+                return Ok(0);
+            }
         }
     }
 
@@ -3652,6 +3657,7 @@ fn run_parsed_rustc(
     let hit_context = RustcHitContext {
         config,
         compiler,
+        memo_store: &store,
         args,
         crate_name,
         event_root: &event_root,
@@ -3728,7 +3734,7 @@ fn run_parsed_rustc(
                 let _ = hit_store.remove_entry(&cache_key);
             } else {
                 tracing::debug!("local cache hit for {} ({})", crate_name, &cache_key[..16]);
-                if let Err(e) = hit_context.restore_and_finish(
+                match hit_context.restore_and_finish(
                     hit_store,
                     &meta,
                     EventResult::LocalHit,
@@ -3740,28 +3746,35 @@ fn run_parsed_rustc(
                     &key_outputs,
                     &key_record,
                 ) {
-                    tracing::warn!(
-                        "restoring local cache hit for {} failed: {} — recompiling",
-                        crate_name,
-                        e
-                    );
-                    return passthrough_with_event(
-                        config,
-                        args,
-                        crate_name,
-                        &event_root,
-                        start,
-                        format!("restore failed: {e}"),
-                        key_record,
-                    );
+                    Ok(()) => {
+                        observe_adaptive_hit(
+                            adaptive_unit.as_ref(),
+                            adaptive_key_fields.as_ref(),
+                            &cache_key,
+                        );
+                        return Ok(0);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "restoring local cache hit for {} failed: {} — recompiling",
+                            crate_name,
+                            e
+                        );
+                        if !hit_store.is_read_only() {
+                            return passthrough_with_event(
+                                config,
+                                args,
+                                crate_name,
+                                &event_root,
+                                start,
+                                format!("restore failed: {e}"),
+                                key_record,
+                            );
+                        }
+                        // A host entry cannot be evicted here. Compile through
+                        // the normal miss path so the job learns its own entry.
+                    }
                 }
-                observe_adaptive_hit(
-                    adaptive_unit.as_ref(),
-                    adaptive_key_fields.as_ref(),
-                    &cache_key,
-                );
-
-                return Ok(0);
             }
         }
 
@@ -5030,12 +5043,15 @@ fn materialize_cached_artifact(
         }
     };
 
-    // A read-only store's blobs belong to another process: never share their
-    // inode, so nothing later done to the restored file can reach that store.
-    let strategy = if store.is_read_only() {
+    let strategy = restore_link_strategy(kind, cached_file.executable, shared_loadable);
+    // A fresh transformed file can keep its original mode. Only the blob path
+    // needs a private inode when it belongs to another process's store.
+    let blob_strategy = if store.is_read_only()
+        && strategy == link::LinkStrategy::ExecutableHardlink
+    {
         link::LinkStrategy::Copy
     } else {
-        restore_link_strategy(kind, cached_file.executable, shared_loadable)
+        strategy
     };
     let rewrote_content = transformed.is_some();
     match transformed {
@@ -5049,15 +5065,21 @@ fn materialize_cached_artifact(
         None => {
             // A large executable may already sit beside its destination,
             // copied by the daemon while the build ran (crate::prestage).
-            let staged = take_prestaged(strategy, cached_file, target_path);
-            if !staged {
-                link::link_to_target(&store_path, target_path, strategy).with_context(|| {
-                    format!(
-                        "{context}: linking {} -> {}",
-                        store_path.display(),
-                        target_path.display()
-                    )
-                })?;
+            if store.is_read_only() && blob_strategy == link::LinkStrategy::Hardlink {
+                link::prepare_writable_target_from_file(&store_path, target_path)?
+                    .publish_replacing()
+                    .with_context(|| format!("{context}: copying {}", target_path.display()))?;
+            } else {
+                let staged = take_prestaged(blob_strategy, cached_file, target_path);
+                if !staged {
+                    link::link_to_target(&store_path, target_path, blob_strategy).with_context(|| {
+                        format!(
+                            "{context}: linking {} -> {}",
+                            store_path.display(),
+                            target_path.display()
+                        )
+                    })?;
+                }
             }
             // A link/clone keeps the blob's old mtime, so it must be
             // re-stamped to read as "written now" — through the same clock
@@ -6288,10 +6310,24 @@ fn rewrite_emit_value(value: &str, staging: &Path) -> String {
         .join(",")
 }
 
+#[cfg(test)]
 fn restore_from_cache(
     config: &Config,
     compiler: &RustcCompiler,
     store: &Store,
+    args: &RustcArgs,
+    meta: &crate::store::EntryMeta,
+    extra_inputs: Option<&crate::extra_inputs::ExtraInputsSnapshot>,
+) -> Result<()> {
+    restore_from_cache_with_memo_store(config, compiler, store, store, args, meta, extra_inputs)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn restore_from_cache_with_memo_store(
+    config: &Config,
+    compiler: &RustcCompiler,
+    store: &Store,
+    memo_store: &Store,
     args: &RustcArgs,
     meta: &crate::store::EntryMeta,
     extra_inputs: Option<&crate::extra_inputs::ExtraInputsSnapshot>,
@@ -6535,7 +6571,7 @@ fn restore_from_cache(
         restored_paths.push((cached_file.name.clone(), target_path));
     }
 
-    record_known_file_hashes(store, &exact_restores);
+    record_known_file_hashes(memo_store, &exact_restores);
 
     maybe_verify_restored_hit(compiler, args, &restored_paths);
 

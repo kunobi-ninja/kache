@@ -11247,6 +11247,14 @@ async fn test_demand_does_not_wait_behind_unstarted_prefetch_candidates() {
 
 // ── Upload queue tests ────────────────────────────────────────
 
+async fn queued_upload_response(daemon: &Daemon, job: &UploadJob) -> Response {
+    // These fixtures have no competing GC. A persisted intent must not keep
+    // publication retrying instead of acknowledging the queued upload.
+    tokio::time::timeout(Duration::from_secs(5), daemon.handle_upload(job))
+        .await
+        .expect("a queued upload acknowledgement must finish")
+}
+
 #[tokio::test]
 async fn test_handle_upload_with_queue_returns_immediately() {
     let dir = tempfile::tempdir().unwrap();
@@ -11266,7 +11274,7 @@ async fn test_handle_upload_with_queue_returns_immediately() {
     seed_store_entry(&daemon.config, &job.key, "serde", dir.path());
 
     // Should return ok immediately (queued, not executed)
-    let resp = daemon.handle_upload(&job).await;
+    let resp = queued_upload_response(&daemon, &job).await;
     assert!(resp.ok);
     assert!(resp.error.is_none());
     assert!(
@@ -11295,7 +11303,7 @@ async fn test_handle_upload_queue_closed() {
         client_epoch: 0,
     };
     seed_store_entry(&daemon.config, &job.key, "serde", dir.path());
-    let resp = daemon.handle_upload(&job).await;
+    let resp = queued_upload_response(&daemon, &job).await;
     assert!(!resp.ok);
     assert!(resp.error.as_deref().unwrap().contains("queue closed"));
 }
@@ -11306,7 +11314,7 @@ async fn test_handle_upload_dedup() {
     let mut config = test_config(dir.path());
     config.remote = Some(crate::config::RemoteConfig::test_s3("test", "artifacts"));
 
-    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<UploadJob>();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<UploadJob>();
     let daemon = Daemon::new(config);
     daemon.set_upload_tx(tx);
 
@@ -11319,12 +11327,30 @@ async fn test_handle_upload_dedup() {
     seed_store_entry(&daemon.config, &job.key, "serde", dir.path());
 
     // First send succeeds and queues
-    let resp1 = daemon.handle_upload(&job).await;
+    let resp1 = queued_upload_response(&daemon, &job).await;
     assert!(resp1.ok);
+    let intent_bytes = fs::read(upload_spool_path(&daemon.config, &job.key)).unwrap();
+    let queued = rx.try_recv().expect("the first upload must queue");
+    assert_eq!(queued.key, job.key);
+    assert_eq!(queued.client_epoch, 0);
 
     // Second send with same key is deduped (returns ok, not queued again)
-    let resp2 = daemon.handle_upload(&job).await;
+    let mut duplicate = job.clone();
+    duplicate.client_epoch = 7;
+    let resp2 = queued_upload_response(&daemon, &duplicate).await;
     assert!(resp2.ok);
+    assert!(matches!(
+        rx.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+    let pending = daemon.pending_uploads.read().await;
+    assert_eq!(pending.len(), 1);
+    assert!(pending.contains(&job.key));
+    assert_eq!(
+        fs::read(upload_spool_path(&daemon.config, &job.key)).unwrap(),
+        intent_bytes,
+        "a duplicate must preserve the original durable intent"
+    );
 }
 
 #[tokio::test]

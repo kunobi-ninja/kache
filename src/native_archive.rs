@@ -56,7 +56,14 @@
 //! header size INCLUDES those bytes. The path-derived `cc` name therefore
 //! lives inside the member data itself. The exact stored name bytes (including
 //! encoding/padding), parsed timestamp, and object DATA are all hashed.
-//! - only structurally valid, known Mach-O `MH_OBJECT` files without STABS
+//! - structurally valid ELF relocatable objects, through the same gate as GNU
+//!   members. BSD `ar` (macOS `ar`, `llvm-ar --format=bsd`) also packs ELF
+//!   objects, and some crates ship such archives prebuilt: `cortex-m` 0.7
+//!   copies `bin/<target>.a` (a `#1/` name, no ranlib, one ELF object) into
+//!   `OUT_DIR` and links it as `static=cortex-m`. An ELF link records no
+//!   `archive(member)` path, so the content digest is as portable here as in
+//!   the GNU arm;
+//! - structurally valid, known Mach-O `MH_OBJECT` files without STABS
 //!   or embedded compiler bitcode/LTO. DWARF (`__DWARF,__debug_*` /
 //!   `__apple_*`, S_ATTR_DEBUG) is hashed like any other member bytes, so a
 //!   path a compiler left in `DW_AT_comp_dir` is identity-bearing, never a
@@ -394,8 +401,16 @@ fn bsd_archive_identity(bytes: &[u8]) -> Option<ArchiveIdentity> {
             // for an invocation that links the archive itself (see the module
             // docs). Hashing the content is safe only after a bounded,
             // fail-closed Mach-O inspection proves this is a known MH_OBJECT
-            // without STABS or bitcode.
-            if parse_known_no_debug_macho_object(content)? {
+            // without STABS or bitcode. An ELF member passes the GNU arm's
+            // relocatable-object gate instead; anything else falls back.
+            let dwarf = if has_macho_magic(content) {
+                parse_known_no_debug_macho_object(content)?
+            } else if is_known_elf_relocatable_object(content) {
+                false
+            } else {
+                return None;
+            };
+            if dwarf {
                 macho_dwarf_members = true;
             }
             // The exact stored name was committed above; frame the object
@@ -3185,6 +3200,65 @@ mod tests {
             assert!(portable_static_archive_hash(&archive).is_none());
             let gnu_archive = raw_archive(&[("derived-name.o/", object)]);
             assert!(portable_static_archive_hash(&gnu_archive).is_none());
+        }
+    }
+
+    /// The layout `cortex-m` 0.7 ships in `bin/<target>.a`: a BSD archive
+    /// (`#1/28` inline name, no ranlib) around one ELF relocatable object. It
+    /// used to take the path-bound fallback, so the rlib that bundles it, and
+    /// every unit above that rlib, keyed on the build directory.
+    #[test]
+    fn bsd_archive_of_an_elf_object_hashes_structurally() {
+        let object = elf_object(b"thumb asm shim");
+        let archive = bsd_archive(&[("bin/thumbv7em-none-eabihf.o", 28, &object)]);
+        let identity =
+            portable_static_archive_identity(&archive).expect("the BSD arm takes an ELF member");
+        assert!(
+            identity.digest.starts_with("bsd-ar-v2:"),
+            "{}",
+            identity.digest
+        );
+        assert!(!identity.macho_dwarf_members);
+
+        let other_content = bsd_archive(&[(
+            "bin/thumbv7em-none-eabihf.o",
+            28,
+            &elf_object(b"another shim"),
+        )]);
+        assert_ne!(
+            portable_static_archive_hash(&other_content).as_deref(),
+            Some(identity.digest.as_str()),
+            "member content is identity-bearing"
+        );
+        let other_name = bsd_archive(&[("bin/thumbv7m-none-eabi.o", 28, &object)]);
+        assert_ne!(
+            portable_static_archive_hash(&other_name).as_deref(),
+            Some(identity.digest.as_str()),
+            "member names are identity-bearing"
+        );
+        let gnu = raw_archive(&[("shim.o/", &object)]);
+        assert_ne!(
+            portable_static_archive_hash(&gnu).as_deref(),
+            Some(identity.digest.as_str()),
+            "BSD and GNU framings never collide"
+        );
+    }
+
+    /// A BSD archive applies the GNU arm's ELF gate: bitcode carriers, LTO
+    /// sections, non-relocatable ELF and unknown payloads still fall back.
+    #[test]
+    fn bsd_archive_keeps_the_elf_gate() {
+        let mut executable = elf_object(b"ordinary object");
+        executable[16..18].copy_from_slice(&2_u16.to_le_bytes()); // ET_EXEC
+        for object in [
+            elf_object_with_section(b".llvmbc", b"bitcode"),
+            elf_object_with_section(b".gnu.lto_.opts", b"bitcode"),
+            elf_object_with_section_type(b".data", SHT_LLVM_LTO, b"bitcode"),
+            executable,
+            b"not an object file".to_vec(),
+        ] {
+            let archive = bsd_archive(&[("derived-name.o", 16, &object)]);
+            assert!(portable_static_archive_hash(&archive).is_none());
         }
     }
 

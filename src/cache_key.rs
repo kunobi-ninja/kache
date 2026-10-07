@@ -3649,8 +3649,8 @@ impl StaticLibUse {
     /// never share a row.
     fn memo_namespace(self) -> &'static str {
         match self {
-            Self::Bundled => "static-ar-v7-bundled",
-            Self::Linked => "static-ar-v7",
+            Self::Bundled => "static-ar-v8-bundled",
+            Self::Linked => "static-ar-v8",
         }
     }
 }
@@ -7183,12 +7183,13 @@ impl<'db> FileHasher<'db> {
         // things — `hash` stores plain blake3, this stores a structural or
         // path-bound archive digest). This restores the warm-build fast path the whole-file
         // hasher had: an unchanged large `static=` archive (e.g. rocksdb) is not
-        // re-read on every incremental build. `v7`: v1/v2 rows used older
+        // re-read on every incremental build. `v8`: v1/v2 rows used older
         // identity definitions, v3 predates the fail-closed ELF gate, v4
         // predates the GCC Mach-O LTO gate, v5 predates admitting
         // DWARF-bearing Mach-O members, and v6 predates accepting the blank
         // `//` header GNU `ar` writes (a v5 or v6 row would keep serving the
-        // path-bound digest of an unchanged archive). None may be served
+        // path-bound digest of an unchanged archive). v7 predates accepting
+        // ELF members in BSD archives. None may be served
         // after the final archive hardening. Bundled and linked uses get
         // separate rows because a DWARF archive hashes differently for each.
         let key = FileFingerprint {

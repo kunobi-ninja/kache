@@ -7081,6 +7081,44 @@ fn start_manifest_warming(daemon: &Arc<Daemon>) -> Option<tokio::task::JoinHandl
     }
 }
 
+/// One upload worker job, start to finish: retried while its outcome is
+/// retryable, then its durable intent retired.
+///
+/// A successful upload retires the intent itself. Every other terminal outcome
+/// (a permanent error such as a denied PUT, a missing local entry, read-only
+/// mode) must retire it here: the intent pins its entry against every eviction
+/// policy, and nothing retries it until the daemon restarts, where a permanent
+/// error fails it again. Kept, such intents hold the store above its size
+/// limit for as long as the remote refuses.
+async fn run_upload_job(daemon: &Daemon, job: &UploadJob) -> Response {
+    let resp = loop {
+        let response = daemon.do_upload(job).await;
+        if upload_result_is_terminal(response.error.as_deref()) {
+            break response;
+        }
+        tracing::debug!(
+            key = key_prefix(&job.key),
+            retry_after_secs = UPLOAD_RETRY_DELAY.as_secs(),
+            "durable upload deferred"
+        );
+        // No S3 permit is held here: `do_upload` owns and releases
+        // each permit before returning a retryable outcome.
+        tokio::time::sleep(UPLOAD_RETRY_DELAY).await;
+    };
+    daemon.pending_uploads.write().await.remove(&job.key);
+    if let Err(error) = remove_upload_job(&daemon.config, &job.key) {
+        tracing::warn!("failed to retire finished upload intent: {error:#}");
+    }
+    if !resp.ok {
+        tracing::warn!(
+            "upload worker: {} failed: {}",
+            job.key,
+            resp.error.as_deref().unwrap_or("unknown")
+        );
+    }
+    resp
+}
+
 fn upload_result_is_terminal(error: Option<&str>) -> bool {
     !error.is_some_and(|error| error.starts_with("retryable:"))
 }
@@ -7195,28 +7233,7 @@ async fn server_main(
         let d = daemon.clone();
         upload_handles.push(tokio::spawn(async move {
             while let Some(job) = rx.lock().await.recv().await {
-                let resp = loop {
-                    let response = d.do_upload(&job).await;
-                    if upload_result_is_terminal(response.error.as_deref()) {
-                        break response;
-                    }
-                    tracing::debug!(
-                        key = key_prefix(&job.key),
-                        retry_after_secs = UPLOAD_RETRY_DELAY.as_secs(),
-                        "durable upload deferred"
-                    );
-                    // No S3 permit is held here: `do_upload` owns and releases
-                    // each permit before returning a retryable outcome.
-                    tokio::time::sleep(UPLOAD_RETRY_DELAY).await;
-                };
-                d.pending_uploads.write().await.remove(&job.key);
-                if !resp.ok {
-                    tracing::warn!(
-                        "upload worker: {} failed: {}",
-                        job.key,
-                        resp.error.as_deref().unwrap_or("unknown")
-                    );
-                }
+                run_upload_job(&d, &job).await;
             }
         }));
     }

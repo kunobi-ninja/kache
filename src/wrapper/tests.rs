@@ -461,6 +461,170 @@ fn lookup_local_entry_prefers_primary_then_falls_back() {
     assert!(primary_hit.is_some());
 }
 
+fn busy_index_error() -> anyhow::Error {
+    anyhow::Error::new(rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+        Some("database is locked".to_string()),
+    ))
+}
+
+fn millis(values: &[u64]) -> Vec<std::time::Duration> {
+    values
+        .iter()
+        .map(|&ms| std::time::Duration::from_millis(ms))
+        .collect()
+}
+
+/// A busy index is waited for. The lookup answers once the other writer lets
+/// go, so the unit is the hit it would have been.
+#[test]
+fn lookup_or_miss_waits_for_a_busy_index() {
+    let mut calls = 0;
+    let mut naps = Vec::new();
+    let found = super::lookup_or_miss(
+        "kt",
+        std::time::Duration::from_secs(30),
+        |nap| naps.push(nap),
+        || {
+            calls += 1;
+            if calls <= 3 {
+                Err(busy_index_error().context("reading entry"))
+            } else {
+                Ok(Some("entry"))
+            }
+        },
+    );
+    assert_eq!(found, Some("entry"));
+    assert_eq!(naps, millis(&[20, 40, 80]));
+}
+
+/// An index that stays busy past the budget is a miss (`None`, the remapped
+/// compile path), never a passthrough. Without lookup overhead, the pauses
+/// double, stop growing at 500 ms and add up to exactly the budget.
+#[test]
+fn lookup_or_miss_gives_a_busy_index_up_as_a_miss_after_the_budget() {
+    let mut naps = Vec::new();
+    let expected_naps = millis(&[20, 40, 80, 160, 320, 500, 500, 380]);
+    let clock = std::cell::Cell::new(std::time::Duration::ZERO);
+    let found = super::lookup_or_miss_with_clock(
+        "kt",
+        std::time::Duration::from_secs(2),
+        || clock.get(),
+        |nap| {
+            // Check before advancing fake time: a shrinking delay can reach
+            // zero and otherwise leave the retry loop running forever.
+            assert_eq!(nap, expected_naps[naps.len()], "retry backoff changed");
+            naps.push(nap);
+            clock.set(clock.get() + nap);
+        },
+        || -> Result<Option<&str>> { Err(busy_index_error()) },
+    );
+    assert_eq!(found, None);
+    assert_eq!(naps, expected_naps);
+    assert_eq!(clock.get(), std::time::Duration::from_secs(2));
+}
+
+/// SQLite's busy timeout is part of the retry budget. A lookup that blocks
+/// for five seconds must not get thirty seconds of sleeps on top.
+#[test]
+fn lookup_retry_budget_counts_time_inside_the_lookup() {
+    let clock = std::cell::Cell::new(std::time::Duration::ZERO);
+    let mut calls = 0;
+    let mut naps = Vec::new();
+    let found = super::lookup_or_miss_with_clock(
+        "kt",
+        std::time::Duration::from_secs(30),
+        || clock.get(),
+        |nap| {
+            naps.push(nap);
+            clock.set(clock.get() + nap);
+        },
+        || -> Result<Option<&str>> {
+            calls += 1;
+            clock.set(clock.get() + std::time::Duration::from_secs(5));
+            Err(busy_index_error())
+        },
+    );
+    assert_eq!(found, None);
+    assert_eq!(calls, 6);
+    assert_eq!(naps, millis(&[20, 40, 80, 160, 320]));
+    // The last in-flight lookup may finish after the retry deadline.
+    assert_eq!(clock.get(), std::time::Duration::from_millis(30_620));
+}
+
+#[test]
+fn lookup_retry_does_not_start_another_attempt_at_the_deadline() {
+    let clock = std::cell::Cell::new(std::time::Duration::ZERO);
+    let mut calls = 0;
+    let found = super::lookup_or_miss_with_clock(
+        "kt",
+        std::time::Duration::from_millis(20),
+        || clock.get(),
+        |nap| clock.set(clock.get() + nap),
+        || -> Result<Option<&str>> {
+            calls += 1;
+            Err(busy_index_error())
+        },
+    );
+    assert_eq!(found, None);
+    assert_eq!(calls, 1);
+    assert_eq!(clock.get(), std::time::Duration::from_millis(20));
+}
+
+/// Any other lookup error is a miss at once: there is nothing to wait for.
+#[test]
+fn lookup_or_miss_turns_any_other_error_into_a_miss_without_waiting() {
+    let mut naps = 0;
+    let found = super::lookup_or_miss(
+        "kt",
+        std::time::Duration::from_secs(30),
+        |_| naps += 1,
+        || -> Result<Option<&str>> { Err(anyhow::anyhow!("Permission denied (os error 13)")) },
+    );
+    assert_eq!(found, None);
+    assert_eq!(naps, 0);
+}
+
+/// The real failure: another connection holds the index's write lock while a
+/// hit refreshes its access stamp. `Store::get` fails with `SQLITE_BUSY` after
+/// the connection's busy timeout; on its own that error used to make the unit
+/// a passthrough. Through `lookup_or_miss` the lookup is tried again once the
+/// writer commits, and the entry is served.
+#[test]
+fn a_hit_behind_a_held_index_write_lock_is_served_after_the_writer_commits() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(dir.path().join("store"));
+    let store = Store::open(&cfg).unwrap();
+    put_test_entry(&store, dir.path(), "held-key");
+    let writer = rusqlite::Connection::open(cfg.cache_dir.join("index.db")).unwrap();
+    // An old stamp makes the hit write a new one.
+    writer
+        .execute(
+            "UPDATE entries SET last_accessed = datetime('now', '-1 hour') WHERE cache_key = ?1",
+            ["held-key"],
+        )
+        .unwrap();
+    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+    // One pause means the first lookup failed as busy; the pause commits.
+    let mut writer = Some(writer);
+    let mut naps = 0;
+    let found = super::lookup_or_miss(
+        "held",
+        std::time::Duration::from_secs(30),
+        |_| {
+            naps += 1;
+            if let Some(writer) = writer.take() {
+                writer.execute_batch("COMMIT").unwrap();
+            }
+        },
+        || super::lookup_local_entry(&store, None, "held-key"),
+    );
+    let (_, meta) = found.expect("served once the writer commits");
+    assert_eq!(meta.crate_name, "test-crate");
+    assert_eq!(naps, 1);
+}
+
 /// Store a small entry so the store has a nonzero size.
 fn put_test_entry(store: &Store, dir: &std::path::Path, key: &str) {
     let src = dir.join(format!("{key}.o"));

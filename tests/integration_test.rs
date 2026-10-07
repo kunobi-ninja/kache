@@ -159,6 +159,82 @@ fn test_rust_restored_outputs_allow_build_without_wrapper() {
     }
 }
 
+/// A bad entry fails both lookup and claim re-check. The replacement compile
+/// must still carry the same path remap, and must not publish without a claim.
+#[test]
+fn rustc_corrupt_entry_recompiles_with_the_normal_path_remap() {
+    let project = TempDir::new_in(common::scratch_dir()).unwrap();
+    let cache = TempDir::new_in(common::scratch_dir()).unwrap();
+    let source = project.path().join("lib.rs");
+    let output_dir = project.path().join("out");
+    std::fs::create_dir(&output_dir).unwrap();
+    std::fs::write(&source, "pub const SOURCE_PATH: &str = file!();\n").unwrap();
+    let run = || {
+        let output = hermetic_command(
+            kache_binary(),
+            cache.path(),
+            Some(&isolated_config_path(cache.path())),
+        )
+        // Exercise the key-first claim failure, rather than compiling before
+        // discovery where the ordinary remaps are already applied.
+        .env("KACHE_DEFERRED_DISCOVERY", "0")
+        .args([
+            "rustc",
+            "--edition",
+            "2024",
+            "--crate-type",
+            "lib",
+            "--crate-name",
+            "lookup_error",
+            "--emit=link",
+            "-g",
+            "--out-dir",
+        ])
+        .arg(&output_dir)
+        .arg(&source)
+        .current_dir(project.path())
+        .output()
+        .expect("run rustc through kache");
+        assert!(
+            output.status.success(),
+            "compile failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    run();
+    let artifact = output_dir.join("liblookup_error.rlib");
+    let cold_bytes = std::fs::read(&artifact).unwrap();
+    let report = kache_report(cache.path());
+    let cold = report["all_events"].as_array().unwrap().last().unwrap();
+    assert_eq!(cold["result"], "miss", "cold compile must publish an entry");
+    let key = cold["cache_key"].as_str().unwrap().to_owned();
+    let meta = cache.path().join("store").join(&key).join("meta.json");
+    std::fs::write(&meta, b"corrupt metadata").unwrap();
+    std::fs::remove_file(&artifact).unwrap();
+
+    run();
+    assert_eq!(
+        std::fs::read(&artifact).unwrap(),
+        cold_bytes,
+        "a failed claim must compile with the cached path remap"
+    );
+    // The report omits skipped compiles; inspect the raw event instead.
+    let events = std::fs::read_to_string(cache.path().join("events.jsonl")).unwrap();
+    let last: serde_json::Value = serde_json::from_str(events.lines().last().unwrap()).unwrap();
+    assert_eq!(last["cache_key"], key);
+    assert_eq!(last["result"], "skipped");
+    assert!(
+        last["passthrough_reason"]
+            .as_str()
+            .is_none_or(str::is_empty)
+    );
+    assert_eq!(
+        std::fs::read(&meta).unwrap(),
+        b"corrupt metadata",
+        "a compile without a build claim must not publish over the entry"
+    );
+}
+
 fn kache_report(cache_dir: &Path) -> serde_json::Value {
     let output = hermetic_command(
         kache_binary(),

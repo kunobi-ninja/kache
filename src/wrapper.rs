@@ -881,6 +881,74 @@ fn open_primary_and_fallback(config: &Config, route: &Path) -> Result<(Store, Op
     Ok((primary, fallback))
 }
 
+/// Retry budget for a busy store index, including time spent in lookups.
+/// An in-flight lookup is not interrupted: each blocked SQLite statement may
+/// still spend its five-second busy timeout before the unit becomes a miss.
+const LOOKUP_BUSY_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+/// First pause after a lookup finds the index busy. It doubles up to
+/// [`LOOKUP_BUSY_PAUSE_MAX`].
+const LOOKUP_BUSY_PAUSE: std::time::Duration = std::time::Duration::from_millis(20);
+/// Longest pause between two lookups of a busy index.
+const LOOKUP_BUSY_PAUSE_MAX: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Run a local lookup, waiting out a busy index, and treat a lookup that
+/// still fails as a miss.
+///
+/// A failed lookup used to send the unit to a passthrough compile. A
+/// passthrough runs the compiler with the caller's arguments only, so its
+/// output lacks the path remap every cached compile gets
+/// (`--remap-path-prefix` for rustc, the prefix maps for cc and nvcc) and
+/// carries absolute paths that the cached entry for the same key does not.
+/// Dependents fold those bytes into their own keys (rustc `externs`, a native
+/// archive's digest), so one passthrough makes every unit above it miss for as
+/// long as that target directory lives. The usual cause is an index that
+/// another process holds for longer than the connection's busy timeout, for
+/// example an eviction sweep.
+///
+/// A busy index is retried with doubling pauses until `budget` is spent. Any
+/// other error, or a busy index past the budget, returns `None`, and the unit
+/// takes the ordinary miss path with the path remap. The budget includes
+/// lookup execution and sleep, but cannot interrupt an in-flight lookup.
+fn lookup_or_miss<T>(
+    crate_name: &str,
+    budget: std::time::Duration,
+    pause: impl FnMut(std::time::Duration),
+    lookup: impl FnMut() -> Result<Option<T>>,
+) -> Option<T> {
+    let start = std::time::Instant::now();
+    lookup_or_miss_with_clock(crate_name, budget, || start.elapsed(), pause, lookup)
+}
+
+fn lookup_or_miss_with_clock<T>(
+    crate_name: &str,
+    budget: std::time::Duration,
+    mut elapsed: impl FnMut() -> std::time::Duration,
+    mut pause: impl FnMut(std::time::Duration),
+    mut lookup: impl FnMut() -> Result<Option<T>>,
+) -> Option<T> {
+    let mut step = LOOKUP_BUSY_PAUSE;
+    let error = loop {
+        let error = match lookup() {
+            Ok(found) => return found,
+            Err(error) => error,
+        };
+        let left = budget.saturating_sub(elapsed());
+        if left.is_zero() || !crate::blob_heal::is_index_busy(&error) {
+            break error;
+        }
+        pause(step.min(left));
+        if elapsed() >= budget {
+            break error;
+        }
+        step = (step * 2).min(LOOKUP_BUSY_PAUSE_MAX);
+    };
+    tracing::warn!(
+        "local store lookup failed for {crate_name} after {:?}: {error:#}; compiling it as a miss",
+        elapsed()
+    );
+    None
+}
+
 /// Local lookup: volume shard first, then the main store. The returned
 /// store is the one whose blobs must be restored.
 fn lookup_local_entry<'a>(
@@ -1108,20 +1176,9 @@ pub fn run_nvcc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
 
     // ── Local cache lookup ───────────────────────────────────────
     let lookup_start = std::time::Instant::now();
-    let lookup = match lookup_local_entry(&store, None, &cache_key) {
-        Ok(lookup) => lookup,
-        Err(e) => {
-            tracing::warn!("nvcc local store lookup failed for {crate_name}: {e} — recompiling");
-            return nvcc_passthrough_with_event(
-                config,
-                &parsed,
-                &crate_name,
-                &event_root,
-                start,
-                format!("store lookup failed: {e}"),
-            );
-        }
-    };
+    let lookup = lookup_or_miss(&crate_name, LOOKUP_BUSY_BUDGET, std::thread::sleep, || {
+        lookup_local_entry(&store, None, &cache_key)
+    });
     let lookup_ms = lookup_start.elapsed().as_millis() as u64;
     let mut lookup_rejection = String::new();
     if let Some((hit_store, meta)) = lookup {
@@ -1914,27 +1971,11 @@ fn run_cc_with_store(
     let lookup = if precompiled.is_some() {
         None
     } else {
-        match lookup_local_entry(store, fallback_store.as_ref(), &cache_key) {
-            Ok(lookup) => {
-                drop(trace_lookup);
-                lookup
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "cc local store lookup failed for {}: {} — recompiling",
-                    crate_name,
-                    e
-                );
-                return cc_passthrough_with_event(
-                    config,
-                    parsed,
-                    crate_name,
-                    event_root,
-                    start,
-                    format!("store lookup failed: {e}"),
-                );
-            }
-        }
+        let lookup = lookup_or_miss(crate_name, LOOKUP_BUSY_BUDGET, std::thread::sleep, || {
+            lookup_local_entry(store, fallback_store.as_ref(), &cache_key)
+        });
+        drop(trace_lookup);
+        lookup
     };
     let lookup_ms = lookup_start.elapsed().as_millis() as u64;
     let mut lookup_rejection = String::new();
@@ -3651,25 +3692,10 @@ fn run_parsed_rustc(
     while precompiled.is_none() {
         // 1. Check local store (volume shard, then main)
         let lookup_start = std::time::Instant::now();
-        let lookup_result = match lookup_local_entry(&store, fallback_store.as_ref(), &cache_key) {
-            Ok(result) => result,
-            Err(e) => {
-                tracing::warn!(
-                    "local store lookup failed for {}: {} — recompiling",
-                    crate_name,
-                    e
-                );
-                return passthrough_with_event(
-                    config,
-                    args,
-                    crate_name,
-                    &event_root,
-                    start,
-                    format!("store lookup failed: {e}"),
-                    key_record,
-                );
-            }
-        };
+        let lookup_result =
+            lookup_or_miss(crate_name, LOOKUP_BUSY_BUDGET, std::thread::sleep, || {
+                lookup_local_entry(&store, fallback_store.as_ref(), &cache_key)
+            });
         lookup_ms = lookup_ms.saturating_add(lookup_start.elapsed().as_millis() as u64);
 
         // A closure that came from a record is already recorded; re-writing it on
@@ -3876,15 +3902,7 @@ fn run_parsed_rustc(
                     crate_name,
                     e
                 );
-                return passthrough_with_event(
-                    config,
-                    args,
-                    crate_name,
-                    &event_root,
-                    start,
-                    format!("build claim failed: {e}"),
-                    key_record,
-                );
+                (None, None)
             }
             Ok(BuildClaim::Contended) => {
                 // Another process is building this key — wait for it
@@ -3934,19 +3952,6 @@ fn run_parsed_rustc(
         );
         return Ok(0);
     }
-
-    let Some(lock) = lock else {
-        tracing::warn!("wait for {} failed, compiling ourselves", crate_name);
-        return passthrough_with_event(
-            config,
-            args,
-            crate_name,
-            &event_root,
-            start,
-            "build lock wait failed",
-            key_record,
-        );
-    };
 
     // 4. Compile
     tracing::debug!(
@@ -4260,6 +4265,23 @@ fn run_parsed_rustc(
         complete_extra_inputs_dep_info(args, snapshot)
             .context("completing extra_inputs dep-info before cache publication")?;
     }
+
+    // A failed claim or peer wait must keep the normal remapped compile,
+    // but publication requires ownership of the key's build lock.
+    let Some(lock) = lock else {
+        let elapsed = start.elapsed().as_millis() as u64;
+        log_event(
+            config,
+            EventInputs::new(&event_root, crate_name, EventResult::Skipped, elapsed)
+                .compile_time_ms(compile_time_ms)
+                .keyed(&cache_key, key_ms, key_hash_stats)
+                .lookup_ms(lookup_ms)
+                .key_record(key_record),
+        );
+        print_progress(crate_name, EventResult::Skipped, elapsed, 0);
+        clean_incremental_dir(config, args);
+        return Ok(result.exit_code);
+    };
 
     let store_start = std::time::Instant::now();
     let trace_store = crate::phase_trace::phase("store");

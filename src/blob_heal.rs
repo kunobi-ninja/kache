@@ -133,13 +133,16 @@ fn is_backing_off(failed_at: Option<u64>, now: u64) -> bool {
 }
 
 /// Index contention is not a failed repair: nothing was read, and the next
-/// check may find the index free.
-fn is_index_busy(error: &anyhow::Error) -> bool {
+/// check may find the index free. The SQLite error may sit under `context`
+/// layers, so the whole chain is searched.
+pub(crate) fn is_index_busy(error: &anyhow::Error) -> bool {
     use rusqlite::ErrorCode::{DatabaseBusy, DatabaseLocked};
-    error
-        .downcast_ref::<rusqlite::Error>()
-        .and_then(rusqlite::Error::sqlite_error_code)
-        .is_some_and(|code| matches!(code, DatabaseBusy | DatabaseLocked))
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<rusqlite::Error>()
+            .and_then(rusqlite::Error::sqlite_error_code)
+            .is_some_and(|code| matches!(code, DatabaseBusy | DatabaseLocked))
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -467,6 +470,9 @@ mod tests {
         ));
         assert!(!is_index_busy(&sqlite(rusqlite::ffi::SQLITE_CORRUPT)));
         assert!(!is_index_busy(&anyhow::anyhow!("entry abc: parsing")));
+        assert!(is_index_busy(
+            &sqlite(rusqlite::ffi::SQLITE_BUSY).context("reading entry abc")
+        ));
     }
 
     #[test]

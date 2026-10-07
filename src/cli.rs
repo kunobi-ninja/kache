@@ -2581,6 +2581,14 @@ fn held_bytes_note(bytes_held: u64) -> String {
 pub(crate) fn describe_eviction(stats: &crate::store::GcStats, over_limit: bool) -> String {
     let grace_secs = crate::store::EVICTION_IDLE_GRACE.as_secs();
     let plural = |n: usize| if n == 1 { "entry" } else { "entries" };
+    let pinned_note = |n: usize| {
+        format!(
+            "\n  {n} more {} accessed within the last {grace_secs}s or awaiting a durable \
+             remote upload and left in place; run it again once builds and uploads \
+             are idle.",
+            plural(n),
+        )
+    };
 
     if stats.entries_evicted > 0 {
         let mut msg = format!(
@@ -2601,13 +2609,7 @@ pub(crate) fn describe_eviction(stats: &crate::store::GcStats, over_limit: bool)
             ));
         }
         if stats.entries_pinned > 0 {
-            msg.push_str(&format!(
-                "\n  {} more {} accessed within the last {grace_secs}s or awaiting a durable \
-                 remote upload and left in place; run it again once builds and uploads \
-                 are idle.",
-                stats.entries_pinned,
-                plural(stats.entries_pinned),
-            ));
+            msg.push_str(&pinned_note(stats.entries_pinned));
         }
         if stats.entries_unreclaimable > 0 {
             msg.push_str(&format!(
@@ -2622,7 +2624,7 @@ pub(crate) fn describe_eviction(stats: &crate::store::GcStats, over_limit: bool)
     }
 
     if stats.entries_unreclaimable > 0 {
-        return format!(
+        let mut msg = format!(
             " nothing reclaimable on disk.\n  {} {}{} cloned into build outputs \
              (same bytes as target/, not extra).\n  Remove stale outputs with \
              `kache clean --stale 14d --dry-run`, then run it again.",
@@ -2630,6 +2632,10 @@ pub(crate) fn describe_eviction(stats: &crate::store::GcStats, over_limit: bool)
             plural(stats.entries_unreclaimable),
             held_bytes_note(stats.bytes_held),
         );
+        if stats.entries_pinned > 0 {
+            msg.push_str(&pinned_note(stats.entries_pinned));
+        }
+        return msg;
     }
 
     // Nothing evicted. Say why, because this is the case that reads as a bug.
@@ -4014,6 +4020,7 @@ fn emit_gc_json(config: &Config, skipped: bool, stats: &crate::store::GcStats) -
         disk_bytes_reclaimed: u64,
         entries_pinned: usize,
         entries_unreclaimable: usize,
+        entries_failed: usize,
     }
     let next = crate::machine::next_after_gc(
         &disk,
@@ -4032,6 +4039,7 @@ fn emit_gc_json(config: &Config, skipped: bool, stats: &crate::store::GcStats) -
             disk_bytes_reclaimed: stats.disk_bytes_reclaimed,
             entries_pinned: stats.entries_pinned,
             entries_unreclaimable: stats.entries_unreclaimable,
+            entries_failed: stats.entries_failed,
         },
         next,
     )

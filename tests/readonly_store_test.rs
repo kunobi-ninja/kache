@@ -105,7 +105,7 @@ fn rejected_readonly_hits_are_recompiled_and_cached_locally() {
         let original_metadata = std::fs::read(&metadata).unwrap();
         // Keep the WAL side files alive while the job opens its reader.
         let owner = rusqlite::Connection::open(host.join("index.db")).unwrap();
-        let entries: usize = owner
+        let entries: i64 = owner
             .query_row("SELECT COUNT(*) FROM entries", [], |row| row.get(0))
             .unwrap();
         assert_eq!(entries, 1);
@@ -176,7 +176,7 @@ fn empty_job_store_uses_the_readonly_cc_hit_before_compiling() {
     let expected_object = std::fs::read(work.join("readonly_probe.o")).unwrap();
     std::fs::remove_file(work.join("readonly_probe.o")).unwrap();
     let owner = rusqlite::Connection::open(host.join("index.db")).unwrap();
-    let entries: usize = owner
+    let entries: i64 = owner
         .query_row("SELECT COUNT(*) FROM entries", [], |row| row.get(0))
         .unwrap();
     assert_eq!(entries, 1);

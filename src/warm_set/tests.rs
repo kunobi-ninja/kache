@@ -632,3 +632,32 @@ async fn staged_files_disappearing_before_publish_or_import_are_failures() {
         );
     }
 }
+
+#[test]
+fn publication_preserves_an_existing_directory_and_reports_other_filesystem_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let incoming = dir.path().join("incoming");
+    let destination = dir.path().join("destination");
+    std::fs::create_dir(&incoming).unwrap();
+    std::fs::write(incoming.join("artifact"), b"incoming bytes").unwrap();
+    std::fs::create_dir(&destination).unwrap();
+    std::fs::write(destination.join("artifact"), b"existing bytes").unwrap();
+    assert!(!publish_staged_entry(&incoming, &destination).unwrap());
+    assert_eq!(
+        std::fs::read(destination.join("artifact")).unwrap(),
+        b"existing bytes"
+    );
+    assert_eq!(
+        std::fs::read(incoming.join("artifact")).unwrap(),
+        b"incoming bytes"
+    );
+    let missing = dir.path().join("missing");
+    assert!(publish_staged_entry(&missing, &dir.path().join("absent")).is_err());
+    let fresh = dir.path().join("fresh");
+    assert!(publish_staged_entry(&incoming, &fresh).unwrap());
+    assert_eq!(
+        std::fs::read(fresh.join("artifact")).unwrap(),
+        b"incoming bytes"
+    );
+    assert!(!incoming.exists());
+}

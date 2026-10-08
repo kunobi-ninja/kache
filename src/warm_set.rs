@@ -314,15 +314,15 @@ async fn replay(
                 // An existing committed generation is a nonempty directory;
                 // rename cannot replace it, including a publication after the
                 // recheck above. Never remove the destination on this path.
-                match std::fs::rename(&incoming, &destination) {
-                    Ok(()) => match store.import_restored_entry(&entry.cache_key) {
+                match publish_staged_entry(&incoming, &destination) {
+                    Ok(true) => match store.import_restored_entry(&entry.cache_key) {
                         Ok(()) => summary.restored += 1,
                         Err(error) => {
                             summary.record_failure();
                             eprintln!("Cannot import {}: {error:#}", entry.cache_key);
                         }
                     },
-                    Err(_) if destination.exists() => summary.record_busy(),
+                    Ok(false) => summary.record_busy(),
                     Err(error) => {
                         summary.record_failure();
                         eprintln!("Cannot publish {}: {error}", entry.cache_key);
@@ -336,6 +336,14 @@ async fn replay(
         }
     }
     Ok(summary)
+}
+
+fn publish_staged_entry(incoming: &Path, destination: &Path) -> std::io::Result<bool> {
+    match std::fs::rename(incoming, destination) {
+        Ok(()) => Ok(true),
+        Err(_) if destination.exists() => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 /// The restore pipeline's transport cap is narrowed to the remaining total.

@@ -45,7 +45,7 @@ fn daemon_free_report_reads_mature_evidence_after_last_wal_owner_closes() {
     let db = rusqlite::Connection::open(index).unwrap();
     assert_eq!(
         db.query_row("SELECT count(*) FROM eviction_tombstones", [], |r| r
-            .get::<_, u64>(0))
+            .get::<_, i64>(0))
             .unwrap(),
         1
     );

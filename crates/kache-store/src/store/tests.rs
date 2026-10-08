@@ -12586,3 +12586,43 @@ fn read_only_hash_memo_writers_leave_the_index_and_timeout_untouched() {
     assert_eq!(timeout, 2000);
     assert_eq!(ro_tree_snapshot(dir.path()), before);
 }
+
+#[test]
+fn duplicate_eviction_does_not_probe_unselected_held_entries() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path());
+    config.max_size = 100;
+    let store = Store::open(&config).unwrap();
+    let held = put_idle_entry(&store, dir.path(), "held_duplicate", 200);
+    put_idle_entry(&store, dir.path(), "new_duplicate", 60);
+    let unrelated = put_idle_entry(&store, dir.path(), "unrelated", 50);
+    for (blob, target) in [(held, "held-target.rlib"), (unrelated, "other-target.rlib")] {
+        fs::hard_link(blob, dir.path().join(target)).unwrap();
+    }
+    store.db.execute_batch(
+        "UPDATE entries SET content_hash = 'duplicate-group' WHERE cache_key IN ('held_duplicate', 'new_duplicate');
+         UPDATE entries SET last_accessed = datetime('now', '-2 hours') WHERE cache_key = 'held_duplicate';"
+    ).unwrap();
+    let stats = store.evict_duplicate_entries().unwrap();
+    assert_eq!(
+        stats.bytes_held, 0,
+        "duplicates must not run the whole-store probe: {stats:?}"
+    );
+    assert_eq!(
+        stats.entries_unreclaimable, 1,
+        "only the selected duplicate is inspected: {stats:?}"
+    );
+    assert_eq!(stats.entries_evicted, 0);
+    assert_eq!(store.entry_count().unwrap(), 3);
+
+    let size = store.evict().unwrap();
+    assert_eq!(size.bytes_held, 250);
+    assert_eq!(size.entries_unreclaimable, 2);
+    assert_eq!(size.entries_evicted, 0, "held bytes leave the size budget");
+
+    let age = store.evict_older_than(0).unwrap();
+    assert_eq!(age.bytes_held, 0);
+    assert_eq!(age.entries_unreclaimable, 2);
+    assert_eq!(age.entries_evicted, 1);
+}
+

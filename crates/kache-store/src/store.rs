@@ -4898,15 +4898,17 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         &self,
         policy: &dyn crate::eviction::EvictionPolicy,
         stop_at: Option<(u64, u64)>,
+        probe_held_bytes: bool,
         origin: SweepOrigin,
     ) -> Result<GcStats> {
-        self.evict_with_stop(policy, stop_at, origin, &mut || false)
+        self.evict_with_stop(policy, stop_at, probe_held_bytes, origin, &mut || false)
     }
 
     fn evict_with_stop(
         &self,
         policy: &dyn crate::eviction::EvictionPolicy,
         stop_at: Option<(u64, u64)>,
+        probe_held_bytes: bool,
         origin: SweepOrigin,
         stop: &mut dyn FnMut() -> bool,
     ) -> Result<GcStats> {
@@ -4932,8 +4934,9 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             selected_compile_time_ms = cost_ms,
             "gc: eviction selection"
         );
-        // Only a size-driven sweep has a byte budget for held bytes to leave.
-        let held = if stop_at.is_some() {
+        // Duplicate eviction has a byte budget too, but only the size pass
+        // probes the whole store for external retainers.
+        let held = if probe_held_bytes {
             self.held_by_live_files(&candidates)?
         } else {
             std::collections::HashMap::new()
@@ -5056,6 +5059,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         self.evict_with(
             &crate::eviction::SizePressurePolicy,
             Some((size_before, target)),
+            true,
             origin,
         )
     }
@@ -5072,6 +5076,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         self.evict_with_stop(
             &crate::eviction::SizePressurePolicy,
             None,
+            false,
             SweepOrigin::Automatic,
             &mut stop,
         )
@@ -5083,6 +5088,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         self.evict_with(
             &crate::eviction::OlderThanPolicy { hours },
             None,
+            false,
             SweepOrigin::Requested,
         )
     }
@@ -5153,6 +5159,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                 size_before,
                 crate::eviction::eviction_target(self.config.max_size),
             )),
+            false,
             origin,
         )
     }

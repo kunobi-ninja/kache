@@ -238,6 +238,8 @@ pub struct CcArgs {
     pub language_override: Option<String>,
     /// Detected compiler driver family (selects the flag dialect).
     pub family: ToolFamily,
+    /// Path ownership captured at parse time for portable dependency sidecars.
+    pub(crate) depinfo_roots: Vec<(PathBuf, String, u8)>,
 }
 
 /// Source file extensions the parser recognizes as C-family input.
@@ -653,6 +655,7 @@ impl CcArgs {
             depinfo: None,
             language_override: None,
             family,
+            depinfo_roots: Vec::new(),
         };
 
         // Walk argv through a table-driven parser so spelling variants
@@ -1066,7 +1069,8 @@ impl CcArgs {
     /// probe record instead of re-resolving per file.
     pub fn config_args(&self) -> Vec<String> {
         let mut out = Vec::new();
-        let mut iter = self.rest.iter();
+        let probe_args = self.probe_args();
+        let mut iter = probe_args.iter();
         // Per-TU noise to drop from the probe-memo key. GnuDialect drops
         // the dep-target flags (`-MT`/`-MF`/`-MQ`) and their values; the
         // cl dialect must NOT — there `-MT`/`-MD` are CRT-selection
@@ -1099,6 +1103,39 @@ impl CcArgs {
         }
         out
     }
+
+    /// Terminal formatting must not enter the resolved cc1 tokens either.
+    /// Keep the original argv for preprocessing and compiler execution.
+    fn probe_args(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut rest = self.rest.as_slice();
+        while let Some((arg, tail)) = rest.split_first() {
+            if arg == "-Xclang"
+                && let Some((inner, remaining)) = tail.split_first()
+            {
+                if !cc_terminal_diagnostic_flag(inner) {
+                    out.extend([arg.clone(), inner.clone()]);
+                }
+                rest = remaining;
+                continue;
+            }
+            let consumed =
+                parse_cc_arg_at(rest, 0, self.family.dialect()).map_or(1, |parsed| parsed.consumed);
+            let (args, remaining) = rest.split_at(consumed);
+            if !cc_terminal_diagnostic_flag(arg) {
+                out.extend_from_slice(args);
+            }
+            rest = remaining;
+        }
+        out
+    }
+}
+
+fn cc_terminal_diagnostic_flag(arg: &str) -> bool {
+    matches!(
+        arg,
+        "-fcolor-diagnostics" | "-fno-color-diagnostics" | "-fansi-escape-codes"
+    ) || arg.starts_with("-fdiagnostics-")
 }
 
 pub(crate) fn output_path_requires_compiler_semantics(path: &Path) -> bool {
@@ -1340,6 +1377,7 @@ const CC_SOURCE_SENTINEL: &str = "/kache/cc-source";
 /// old raw name still fails the coverage gate once, is evicted, and is replaced
 /// with a normalized entry without a store-wide cache-version bump.
 pub(crate) const CC_DEPINFO_STORE_NAME: &str = "__kache_cc_depinfo.d";
+pub(crate) const CC_OBJECT_STORE_NAME: &str = "__kache_cc_object.o";
 /// Target for a user-declared `KACHE_BASE_DIR` (ccache `CCACHE_BASEDIR`
 /// analog). Shares the spelling with the rustc `<BASE_DIR>` target (same
 /// concept, compiler-independent) and stays distinct from the derived roots so
@@ -4870,7 +4908,11 @@ fn cc_preprocess_memo_key(
     // Likewise the argv: `-I` and the source path carry the checkout root.
     // The maps are folded below, so two trees agree here only when they agree
     // about what the mapping means.
-    for arg in build_preprocess_args(parsed) {
+    // Compile-first lookup also needs the same read-set memo when only
+    // terminal formatting changes; otherwise it compiles before finding a hit.
+    let mut memo_parsed = parsed.clone();
+    memo_parsed.rest = parsed.probe_args();
+    for arg in build_preprocess_args(&memo_parsed) {
         let mapped = apply_cc_prefix_maps_to_bytes(arg.into_bytes(), prefix_maps);
         fold_cc_memo_field(&mut hasher, b"arg", &mapped);
     }
@@ -6331,7 +6373,7 @@ impl CcCompiler {
 
     fn cache_key_for_link(&self, parsed: &CcArgs, ctx: &KeyCtx<'_, '_>) -> Result<String> {
         let mut hasher = blake3::Hasher::new();
-        hasher.update(b"cc_link_key_version:1\n");
+        hasher.update(b"cc_link_key_version:2\n");
         let program_name = Path::new(&parsed.program)
             .file_name()
             .and_then(|n| n.to_str())
@@ -6698,7 +6740,14 @@ impl Compiler for CcCompiler {
     }
 
     fn parse(&self, args: &[String]) -> Result<CcArgs> {
-        CcArgs::parse(args)
+        let mut parsed = CcArgs::parse(args)?;
+        parsed.depinfo_roots = crate::path_normalizer::PathNormalizer::from_env(None)
+            .with_base_dirs(&self.base_dirs)
+            .depinfo_source_roots()
+            .into_iter()
+            .map(|root| (root.root, root.depinfo_sentinel, root.priority))
+            .collect();
+        Ok(parsed)
     }
 
     fn refuse_reasons(&self, parsed: &CcArgs) -> Vec<RefuseReason> {
@@ -6785,6 +6834,8 @@ impl CcCompiler {
         hasher.update(b"cc_key_version:");
         hasher.update(crate::cache_key::CACHE_KEY_VERSION.to_string().as_bytes());
         hasher.update(b"\n");
+        // Older entries can retain donor paths outside the source/object root.
+        hasher.update(b"cc_artifact_schema:2\n");
         tracing::trace!(
             target: "kache::cache_key",
             "[key:{}] cc_key_version={}",
@@ -6851,6 +6902,7 @@ impl CcCompiler {
         // the driver's fully-expanded `-cc1` line). One probe per build
         // per flag set; the rest of the build reads the record.
         let config_args = parsed.config_args();
+        let probe_args = parsed.probe_args();
         // Per-TU paths to blank from the shared probe record's resolved
         // tokens, so the record is invariant across the build's TUs and
         // parallel builds don't race on whose paths it holds (#keyrace).
@@ -6861,7 +6913,7 @@ impl CcCompiler {
             &crate::probe::CcProber,
             &crate::probe::ProbeRequest {
                 compiler: &parsed.program,
-                args: &parsed.rest,
+                args: &probe_args,
                 key_args: &config_args,
                 per_tu_paths: &per_tu_paths,
                 // Sentinel Windows paths only for gnu/clang (objects are
@@ -7703,10 +7755,14 @@ fn discover_cc_output_artifacts(parsed: &CcArgs) -> ArtifactSet {
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_default();
+    let (kind, store_name) = match parsed.mode {
+        CompileMode::Compile => (ArtifactKind::Object, CC_OBJECT_STORE_NAME.to_string()),
+        _ => (classify_by_filename(&object_name), object_name),
+    };
     let mut outputs = vec![Artifact {
         path: object.clone(),
-        kind: classify_by_filename(&object_name),
-        store_name: object_name,
+        kind,
+        store_name,
         required: true,
     }];
     if parsed.mode == CompileMode::Link {

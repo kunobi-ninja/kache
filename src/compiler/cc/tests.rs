@@ -198,6 +198,139 @@ fn config_args_keeps_crt_flags_under_cl_strips_dep_under_gnu() {
     assert!(cl_md.config_args().iter().any(|a| a == "-MD"));
 }
 
+#[test]
+fn probe_args_strip_terminal_formatting_and_preserve_operands() {
+    for driver in ["clang", "clang-cl"] {
+        for flag in [
+            "-fcolor-diagnostics",
+            "-fno-color-diagnostics",
+            "-fansi-escape-codes",
+            "-fdiagnostics-color=always",
+            "-fdiagnostics-format=msvc",
+        ] {
+            let parsed = CcArgs::parse(&s(&[driver, "-c", flag, "a.c", "-O2"])).unwrap();
+            assert_eq!(parsed.probe_args(), s(&["-c", "a.c", "-O2"]));
+            assert_eq!(parsed.config_args(), s(&["-c", "-O2"]));
+            assert!(parsed.rest.iter().any(|arg| arg == flag));
+        }
+    }
+    let parsed = CcArgs::parse(&s(&[
+        "clang",
+        "-c",
+        "-Xclang",
+        "-fansi-escape-codes",
+        "-Xclang",
+        "-ffp-contract=off",
+        "-I",
+        "-fcolor-diagnostics",
+        "-o",
+        "-fansi-escape-codes",
+        "a.c",
+        "-Xclang",
+    ]))
+    .unwrap();
+    assert_eq!(
+        parsed.probe_args(),
+        s(&[
+            "-c",
+            "-Xclang",
+            "-ffp-contract=off",
+            "-I",
+            "-fcolor-diagnostics",
+            "-o",
+            "-fansi-escape-codes",
+            "a.c",
+            "-Xclang",
+        ])
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn terminal_formatting_shares_cc_keys_with_cold_and_warm_probes() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("unit.c");
+    fs::write(&source, "int x;\n").unwrap();
+    let fake_cc =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mock_cc_diagnostics.sh");
+    let compiler = CcCompiler::new();
+    let file_hasher = crate::cache_key::FileHasher::new();
+    let path_normalizer = crate::path_normalizer::PathNormalizer::empty();
+    let parse = |flags: &[&str]| {
+        let mut args = vec![
+            fake_cc.to_string_lossy().into_owned(),
+            "-c".into(),
+            source.to_string_lossy().into_owned(),
+        ];
+        args.extend(flags.iter().map(|flag| flag.to_string()));
+        compiler.parse(&args).unwrap()
+    };
+    let key = |flags: &[&str], cache: &Path| {
+        compiler
+            .cache_key(
+                &parse(flags),
+                &KeyCtx {
+                    file_hasher: &file_hasher,
+                    path_normalizer: &path_normalizer,
+                    cache_dir: cache,
+                    key_salt: None,
+                    key_env_vars: &[],
+                    extra_inputs_digest: None,
+                },
+            )
+            .unwrap()
+    };
+    let warm = dir.path().join("warm");
+    let baseline = key(&[], &warm);
+    for (index, flag) in [
+        "-fcolor-diagnostics",
+        "-fno-color-diagnostics",
+        "-fdiagnostics-color=always",
+        "-fansi-escape-codes",
+    ]
+    .iter()
+    .enumerate()
+    {
+        assert_eq!(
+            key(&[flag], &dir.path().join(format!("cold-{index}"))),
+            baseline
+        );
+        assert_eq!(key(&[flag], &warm), baseline);
+    }
+    assert_ne!(key(&["-ffp-contract=off"], &warm), baseline);
+}
+
+#[test]
+fn terminal_formatting_shares_the_compile_first_read_set_memo() {
+    let _lock = crate::test_support::process_state_test_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("unit.c");
+    fs::write(&source, "int x;\n").unwrap();
+    let fake_cc =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mock_cc_diagnostics.sh");
+    let memo = |flags: &[&str]| {
+        let mut args = vec![
+            fake_cc.to_string_lossy().into_owned(),
+            "-c".into(),
+            source.to_string_lossy().into_owned(),
+        ];
+        args.extend(flags.iter().map(|flag| flag.to_string()));
+        let parsed = CcArgs::parse(&args).unwrap();
+        cc_preprocess_memo_key(&parsed, &[], "fake clang 1.0").unwrap()
+    };
+    let baseline = memo(&[]);
+    for flag in [
+        "-fcolor-diagnostics",
+        "-fno-color-diagnostics",
+        "-fansi-escape-codes",
+        "-fdiagnostics-color=always",
+    ] {
+        assert_eq!(memo(&[flag]), baseline);
+    }
+    assert_eq!(memo(&["-Xclang", "-fansi-escape-codes"]), baseline);
+    assert_ne!(memo(&["-ffp-contract=off"]), baseline);
+}
+
 /// The probe-memo key must carry the separated `--param` VALUE.
 ///
 /// `--param` is `CapturedByProbe` (#580), so its codegen effect is keyed
@@ -2608,6 +2741,75 @@ fn discover_cc_link_sidecars_finds_a_map_next_to_the_binary() {
             .iter()
             .map(|a| &a.path)
             .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn compile_output_role_survives_arbitrary_filename_extensions() {
+    let dir = tempfile::tempdir().unwrap();
+    for name in [
+        "unit.wasm",
+        "unit.o",
+        "unit.obj",
+        "unit.d",
+        "unit.i",
+        "unit.bin",
+        "unit",
+    ] {
+        let output = dir.path().join(name);
+        fs::write(&output, b"object bytes").unwrap();
+        let parsed = CcArgs::parse(&s(&[
+            "clang",
+            "-c",
+            "unit.c",
+            "-o",
+            output.to_str().unwrap(),
+        ]))
+        .unwrap();
+        let artifacts = discover_cc_output_artifacts(&parsed);
+        assert_eq!(artifacts.outputs().len(), 1);
+        assert_eq!(artifacts.outputs()[0].path, output);
+        assert_eq!(artifacts.outputs()[0].kind, ArtifactKind::Object);
+        assert_eq!(artifacts.outputs()[0].store_name, "__kache_cc_object.o");
+        assert_eq!(
+            classify_by_filename(&artifacts.outputs()[0].store_name),
+            ArtifactKind::Object
+        );
+    }
+    let wasm = dir.path().join("linked.wasm");
+    fs::write(&wasm, b"linked wasm").unwrap();
+    let link = CcArgs::parse(&s(&["clang", "unit.o", "-o", wasm.to_str().unwrap()])).unwrap();
+    let artifacts = discover_cc_output_artifacts(&link);
+    assert_eq!(artifacts.outputs()[0].kind, ArtifactKind::WasmModule);
+    assert_eq!(artifacts.outputs()[0].store_name, "linked.wasm");
+    let preprocess =
+        CcArgs::parse(&s(&["clang", "-E", "unit.c", "-o", wasm.to_str().unwrap()])).unwrap();
+    assert_eq!(
+        discover_cc_output_artifacts(&preprocess).outputs()[0].store_name,
+        "linked.wasm"
+    );
+}
+
+#[test]
+fn compiler_parse_captures_configured_depinfo_roots() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_string_lossy().into_owned();
+    let compiler = CcCompiler::new().with_base_dirs(vec![root.clone()]);
+    let parsed = compiler
+        .parse(&s(&["clang", "-c", "generated.c", "-MD"]))
+        .unwrap();
+    assert!(
+        parsed
+            .depinfo_roots
+            .iter()
+            .any(|(path, sentinel, _)| path == Path::new(&root)
+                && sentinel == "__kache_base_dir_0__/")
+    );
+    assert!(
+        CcArgs::parse(&s(&["clang", "-c", "generated.c", "-MD"]))
+            .unwrap()
+            .depinfo_roots
+            .is_empty()
     );
 }
 

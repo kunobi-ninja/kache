@@ -1621,6 +1621,7 @@ fn restore_nvcc_from_cache(
             &target,
             kind,
             &depinfo_anchor,
+            &[],
         )?);
     }
     publish_prepared_cc_artifacts(prepared)
@@ -2288,6 +2289,7 @@ fn run_cc_with_store(
             &result.artifacts,
             depinfo_anchor.as_deref(),
             staging_dir.as_deref(),
+            &parsed.depinfo_roots,
         ) {
             Ok(prepared) => {
                 let stdout = if crate::compiler::cc::cc_expansion_is_stdout(parsed) {
@@ -2786,6 +2788,7 @@ fn prepare_cc_cached_artifact(
     target: &Path,
     kind: ArtifactKind,
     depinfo_anchor: &Path,
+    depinfo_roots: &[(PathBuf, String, u8)],
 ) -> Result<link::PreparedWritableTarget> {
     let transforms: Vec<_> = plan_post_restore(kind)
         .into_iter()
@@ -2814,6 +2817,18 @@ fn prepare_cc_cached_artifact(
 
     let mut content = std::fs::read(&blob)
         .with_context(|| format!("cc restore: reading blob {}", blob.display()))?;
+    if kind == ArtifactKind::DepInfo {
+        let text = std::str::from_utf8(&content).context("cc restore: dep-info is not UTF-8")?;
+        content = link::rewrite_rustc_depinfo_content_with_configured_roots(
+            text,
+            depinfo_anchor,
+            depinfo_anchor,
+            None,
+            depinfo_roots,
+            link::DepInfoMode::Expand,
+        )
+        .into_bytes();
+    }
     for action in transforms {
         content = action.transform(content, depinfo_anchor);
     }
@@ -2824,6 +2839,10 @@ fn prepare_cc_cached_artifact(
 fn apply_cc_post_publish_actions(published: &[(PathBuf, ArtifactKind)]) -> Result<()> {
     let host = platform::current();
     for (path, kind) in published {
+        // Clones retain the donor blob's timestamp. Make must see every hit
+        // as a fresh compiler write, including replacement of existing files.
+        link::touch_mtime_write_clock(path)
+            .with_context(|| format!("cc restore: stamping {}", path.display()))?;
         for action in plan_post_restore(*kind) {
             if action.is_content_transform() {
                 continue;
@@ -2834,6 +2853,33 @@ fn apply_cc_post_publish_actions(published: &[(PathBuf, ArtifactKind)]) -> Resul
         }
     }
     Ok(())
+}
+
+/// All finalization happens after publication, so any failure must stop the
+/// caller from invoking the compiler over the restored outputs.
+fn finalize_cc_restore(
+    published: &[(PathBuf, ArtifactKind)],
+    parsed: &crate::compiler::cc::CcArgs,
+) -> Result<()> {
+    let finish = || -> Result<()> {
+        apply_cc_post_publish_actions(published)?;
+        #[cfg(unix)]
+        if parsed.mode == crate::compiler::cc::CompileMode::Link
+            && let Some(output) = parsed.object_output_path()
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&output)
+                .with_context(|| format!("cc restore: stat {}", output.display()))?
+                .permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&output, permissions)
+                .with_context(|| format!("cc restore: chmod +x {}", output.display()))?;
+        }
+        #[cfg(not(unix))]
+        let _ = parsed;
+        Ok(())
+    };
+    finish().context(PartialCcRestore)
 }
 
 fn publish_prepared_cc_artifacts(prepared: Vec<link::PreparedWritableTarget>) -> Result<()> {
@@ -3002,24 +3048,12 @@ fn restore_cc_from_cache(
             &target,
             kind,
             &depinfo_anchor,
+            &parsed.depinfo_roots,
         )?);
         published_kinds.push((target, kind));
     }
     publish_prepared_cc_artifacts(prepared)?;
-    apply_cc_post_publish_actions(&published_kinds)?;
-    #[cfg(unix)]
-    if parsed.mode == crate::compiler::cc::CompileMode::Link
-        && let Some(output) = parsed.object_output_path()
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut permissions = std::fs::metadata(&output)
-            .with_context(|| format!("cc restore: stat {}", output.display()))?
-            .permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&output, permissions)
-            .with_context(|| format!("cc restore: chmod +x {}", output.display()))?;
-    }
-    Ok(())
+    finalize_cc_restore(&published_kinds, parsed)
 }
 
 /// After a local miss, ask the daemon for an exact remote entry.
@@ -4572,7 +4606,7 @@ fn prepare_cc_store_files(
     artifacts: &ArtifactSet,
     depinfo_anchor: Option<&Path>,
 ) -> Result<PreparedCcStoreFiles> {
-    prepare_cc_store_files_in(artifacts, depinfo_anchor, None)
+    prepare_cc_store_files_in(artifacts, depinfo_anchor, None, &[])
 }
 
 /// [`prepare_cc_store_files`] with the snapshots in `staging_dir` when one
@@ -4583,6 +4617,7 @@ fn prepare_cc_store_files_in(
     artifacts: &ArtifactSet,
     depinfo_anchor: Option<&Path>,
     staging_dir: Option<&Path>,
+    depinfo_roots: &[(PathBuf, String, u8)],
 ) -> Result<PreparedCcStoreFiles> {
     use std::io::{Read, Write};
 
@@ -4610,6 +4645,14 @@ fn prepare_cc_store_files_in(
                 })?;
             let normalized =
                 link::rewrite_depinfo_content(&content, anchor, link::DepInfoMode::Relativize);
+            let normalized = link::rewrite_rustc_depinfo_content_with_configured_roots(
+                &normalized,
+                anchor,
+                anchor,
+                None,
+                depinfo_roots,
+                link::DepInfoMode::Relativize,
+            );
             std::fs::write(&staged, normalized.as_bytes())
                 .context("cc store: writing normalized dep-info staging file")?;
         } else if artifact.kind == ArtifactKind::DebugBundle

@@ -1236,8 +1236,9 @@ mod tests {
         assert_eq!(
             list_reports(&backend, "artifacts", "org/repo")
                 .await
-                .unwrap(),
-            [key.clone()]
+                .unwrap()
+                .as_slice(),
+            std::slice::from_ref(&key)
         );
         backend.listing = vec![key.clone(); 1024];
         assert_eq!(

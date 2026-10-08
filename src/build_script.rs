@@ -481,7 +481,7 @@ fn run_cached(real: &Path, argv: &[std::ffi::OsString]) -> Result<i32> {
     // Only a run that starts from an empty OUT_DIR produces a state worth
     // recording: a rerun over leftovers would snapshot the leftovers too.
     let out_dir_was_empty = directory_is_empty(&run.environment.out_dir);
-    let first = ScriptRun::start(real, argv)?;
+    let first = ScriptRun::start(real, argv, &run)?;
     if !first.succeeded() || !out_dir_was_empty {
         first.replay();
         if first.succeeded() {
@@ -508,7 +508,7 @@ fn run_cached(real: &Path, argv: &[std::ffi::OsString]) -> Result<i32> {
     clear_directory(&run.environment.out_dir)?;
     // The first run's writes must fall before the second run's floor.
     std::thread::sleep(FS_CLOCK_TICK * 2);
-    let second = ScriptRun::start(real, argv)?;
+    let second = ScriptRun::start(real, argv, &run)?;
     second.replay();
     if !second.succeeded() {
         return Ok(second.exit_code());
@@ -528,10 +528,12 @@ struct ScriptRun {
     output: std::process::Output,
     compile_ms: u64,
     started: std::time::SystemTime,
+    tools: ToolSnapshot,
 }
 
 impl ScriptRun {
-    fn start(real: &Path, argv: &[std::ffi::OsString]) -> Result<Self> {
+    fn start(real: &Path, argv: &[std::ffi::OsString], run: &Run) -> Result<Self> {
+        let tools = run.tool_snapshot()?;
         let started = write_floor(std::time::SystemTime::now());
         let compile_start = std::time::Instant::now();
         let output = real_command(real, argv)
@@ -541,6 +543,7 @@ impl ScriptRun {
             output,
             compile_ms: compile_start.elapsed().as_millis() as u64,
             started,
+            tools,
         })
     }
 
@@ -1176,6 +1179,17 @@ fn path_only_tool(
     )))
 }
 
+/// Portable key material and the local identity captured before execution.
+/// The fingerprint's resolved path also detects retargeted intermediate links.
+#[derive(Debug, PartialEq, Eq)]
+struct ToolState {
+    normalized: String,
+    digest: String,
+    identity: kache_store::file_hash::FileFingerprint,
+}
+
+type ToolSnapshot = BTreeMap<String, ToolState>;
+
 /// The variables Cargo gives a build script that decide whether it reruns.
 fn cargo_environment_names() -> std::collections::BTreeSet<String> {
     const FIXED: &[&str] = &[
@@ -1252,7 +1266,11 @@ impl Run {
     /// The key a recorded run is stored under: everything Cargo would compare
     /// before deciding the script need not rerun, plus the host it ran on.
     fn action_key(&self, prediction: &Prediction) -> Result<String> {
-        self.action_key_with(prediction, std::env::var_os(ZERO_AR_DATE_ENV))
+        self.action_key_with(
+            prediction,
+            std::env::var_os(ZERO_AR_DATE_ENV),
+            &self.tool_snapshot()?,
+        )
     }
 
     /// [`Self::action_key`], given the `ZERO_AR_DATE` the script inherits.
@@ -1260,6 +1278,7 @@ impl Run {
         &self,
         prediction: &Prediction,
         inherited_zero_ar_date: Option<std::ffi::OsString>,
+        tools: &ToolSnapshot,
     ) -> Result<String> {
         let mut hasher = blake3::Hasher::new();
         fold(&mut hasher, "kind", b"kache-build-script-action-v1");
@@ -1275,17 +1294,9 @@ impl Run {
         let mut budget = MAX_INPUT_FILES;
         for (name, value) in cargo_environment(&self.environment) {
             fold(&mut hasher, "cargo_env_name", name.as_bytes());
-            if let Ok(raw) = std::env::var(&name)
-                && let Some((normalized, digest)) = path_only_tool(
-                    &name,
-                    &raw,
-                    &self.environment,
-                    &self.config.path_only_env_vars,
-                    &file_hasher,
-                )?
-            {
-                fold(&mut hasher, "cargo_env_value", normalized.as_bytes());
-                fold(&mut hasher, "cargo_env_tool_digest", digest.as_bytes());
+            if let Some(tool) = tools.get(&name) {
+                fold(&mut hasher, "cargo_env_value", tool.normalized.as_bytes());
+                fold(&mut hasher, "cargo_env_tool_digest", tool.digest.as_bytes());
                 continue;
             }
             match value {
@@ -1317,19 +1328,9 @@ impl Run {
             fold(&mut hasher, "env_name", name.as_bytes());
             match std::env::var_os(name) {
                 Some(value) => {
-                    let tool = match value.to_str() {
-                        Some(value) => path_only_tool(
-                            name,
-                            value,
-                            &self.environment,
-                            &self.config.path_only_env_vars,
-                            &file_hasher,
-                        )?,
-                        None => None,
-                    };
-                    if let Some((normalized, digest)) = tool {
-                        fold(&mut hasher, "env_value", normalized.as_bytes());
-                        fold(&mut hasher, "env_tool_digest", digest.as_bytes());
+                    if let Some(tool) = tools.get(name) {
+                        fold(&mut hasher, "env_value", tool.normalized.as_bytes());
+                        fold(&mut hasher, "env_tool_digest", tool.digest.as_bytes());
                     } else {
                         fold(
                             &mut hasher,
@@ -1481,12 +1482,41 @@ impl Run {
         Ok(size)
     }
 
+    fn tool_snapshot(&self) -> Result<ToolSnapshot> {
+        let mut tools = ToolSnapshot::new();
+        let file_hasher = self.store.file_hasher();
+        for name in ["RUSTC_LINKER", "RUSTC", "RUSTDOC"] {
+            let Ok(value) = std::env::var(name) else {
+                continue;
+            };
+            if let Some((normalized, digest)) = path_only_tool(
+                name,
+                &value,
+                &self.environment,
+                &self.config.path_only_env_vars,
+                &file_hasher,
+            )? {
+                let resolved = std::fs::canonicalize(&value)?;
+                tools.insert(
+                    name.to_string(),
+                    ToolState {
+                        normalized,
+                        digest,
+                        identity: kache_store::file_hash::FileFingerprint::from_path(&resolved)?,
+                    },
+                );
+            }
+        }
+        Ok(tools)
+    }
+
     fn record_run(&self, script: &ScriptRun) -> Result<()> {
-        self.record(
+        self.record_with_tools(
             &script.output.stdout,
             &script.output.stderr,
             script.compile_ms,
             script.started,
+            &script.tools,
         )
     }
 
@@ -1514,12 +1544,24 @@ impl Run {
         format!("{UNSETTLED_PREFIX}{}", self.identity())
     }
 
+    #[cfg(test)]
     fn record(
         &self,
         stdout: &[u8],
         stderr: &[u8],
         compile_ms: u64,
         started: std::time::SystemTime,
+    ) -> Result<()> {
+        self.record_with_tools(stdout, stderr, compile_ms, started, &self.tool_snapshot()?)
+    }
+
+    fn record_with_tools(
+        &self,
+        stdout: &[u8],
+        stderr: &[u8],
+        compile_ms: u64,
+        started: std::time::SystemTime,
+        tools: &ToolSnapshot,
     ) -> Result<()> {
         let stdout_text =
             std::str::from_utf8(stdout).context("build-script stdout is not UTF-8")?;
@@ -1541,28 +1583,6 @@ impl Run {
             };
             if modified_since(&path, &excluded, started)? {
                 return Err(InputsChanged.into());
-            }
-        }
-        // Opted-in tools are implicit file inputs, even when a script only
-        // declares an environment watch. Never store an old run under the
-        // digest of a tool edited during execution. Check links and targets.
-        let file_hasher = self.store.file_hasher();
-        for name in ["RUSTC_LINKER", "RUSTC", "RUSTDOC"] {
-            if let Ok(value) = std::env::var(name)
-                && path_only_tool(
-                    name,
-                    &value,
-                    &self.environment,
-                    &self.config.path_only_env_vars,
-                    &file_hasher,
-                )?
-                .is_some()
-            {
-                let path = Path::new(&value);
-                let resolved = std::fs::canonicalize(path)?;
-                if modified_since(path, &[], started)? || modified_since(&resolved, &[], started)? {
-                    return Err(InputsChanged.into());
-                }
             }
         }
         let OutDirContents {
@@ -1593,7 +1613,13 @@ impl Run {
             !rewritten.is_empty(),
         );
         let key_start = std::time::Instant::now();
-        let key = self.action_key(&prediction)?;
+        // Use the pre-execution tool bytes for the key. Recheck after output
+        // staging so an edit or link retarget cannot label old outputs with a
+        // new tool's digest, even when it preserves the target's old mtime.
+        let key = self.action_key_with(&prediction, std::env::var_os(ZERO_AR_DATE_ENV), tools)?;
+        if self.tool_snapshot()? != *tools {
+            return Err(InputsChanged.into());
+        }
         let key_ms = key_start.elapsed().as_millis() as u64;
         let manifest = Manifest {
             // Version 1 would restore placeholders verbatim, version 2 would
@@ -2608,43 +2634,66 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_tool_edited_during_a_run_is_not_recorded_under_its_new_digest() {
-        let _lock = crate::test_support::process_state_test_lock();
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join("checkout");
+    fn run_with_path_only_linker(dir: &Path) -> Run {
+        let root = dir.join("checkout");
         std::fs::create_dir_all(root.join("build")).unwrap();
         std::fs::create_dir_all(root.join("crate")).unwrap();
-        let mut config = crate::test_support::test_config(dir.path().join("cache"));
+        let mut config = crate::test_support::test_config(dir.join("cache"));
         config.path_only_env_vars.push("RUSTC_LINKER".into());
         let mut env = environment(&root.join("target/out"), &root.join("crate"));
-        env.base_dirs.push(root.clone());
+        env.base_dirs.push(root);
         std::fs::create_dir_all(&env.out_dir).unwrap();
         std::fs::write(env.out_dir.join("result"), b"old-tool-result").unwrap();
-        let run = Run {
+        Run {
             store: Store::open(&config).unwrap(),
             config,
             binary_hash: "aaaa".into(),
             environment: env,
             start: std::time::Instant::now(),
-        };
-        let tool = root.join("build/linker");
-        std::fs::write(&tool, b"new-tool").unwrap();
+        }
+    }
+
+    const TOOL_STDOUT: &[u8] =
+        b"cargo:rerun-if-changed=build.rs\ncargo:rerun-if-env-changed=RUSTC_LINKER\n";
+
+    #[test]
+    fn tool_keys_use_the_execution_snapshot_and_refuse_edits_before_recording() {
+        let _lock = crate::test_support::process_state_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let run = run_with_path_only_linker(dir.path());
+        let tool = run.environment.base_dirs[0].join("build/linker");
+        std::fs::write(&tool, b"old-tool").unwrap();
         let saved = std::env::var_os("RUSTC_LINKER");
         // SAFETY: environment edits are serialized by the process-state lock.
-        unsafe {
-            std::env::set_var("RUSTC_LINKER", &tool);
-        }
-        let now = std::time::SystemTime::now();
-        let stdout = b"cargo:rerun-if-changed=build.rs\ncargo:rerun-if-env-changed=RUSTC_LINKER\n";
+        unsafe { std::env::set_var("RUSTC_LINKER", &tool) };
+        let tools = run.tool_snapshot().unwrap();
+        let mut prediction = prediction_with(Some(Vec::new()), true);
+        prediction.env.push("RUSTC_LINKER".into());
+        let key_before = run.action_key_with(&prediction, None, &tools).unwrap();
+        let old = filetime::FileTime::from_unix_time(1, 0);
+        // This can happen during execution or while its outputs are staged.
+        // Preserving mtime cannot hide the new digest and local fingerprint.
+        std::fs::write(&tool, b"new-tool").unwrap();
+        filetime::set_file_mtime(&tool, old).unwrap();
+        assert_eq!(
+            run.action_key_with(&prediction, None, &tools).unwrap(),
+            key_before
+        );
+        let current = run.tool_snapshot().unwrap();
+        assert_ne!(
+            run.action_key_with(&prediction, None, &current).unwrap(),
+            key_before
+        );
+        let settled = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
         assert!(
-            run.record(stdout, b"", 1, now - std::time::Duration::from_secs(60))
+            run.record_with_tools(TOOL_STDOUT, b"", 1, settled, &tools)
                 .unwrap_err()
                 .is::<InputsChanged>()
         );
         assert!(run.prediction().unwrap().is_none());
-        let settled = now + std::time::Duration::from_secs(60);
-        run.record(stdout, b"", 1, settled).unwrap();
+        assert_eq!(run.store.entry_count().unwrap(), 0);
+        run.record_with_tools(TOOL_STDOUT, b"", 1, settled, &current)
+            .unwrap();
         let prediction = run.prediction().unwrap().unwrap();
         assert!(
             run.store
@@ -2652,30 +2701,94 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
-        #[cfg(unix)]
-        {
-            let link = root.join("build/link");
-            std::os::unix::fs::symlink(&tool, &link).unwrap();
-            let old =
-                filetime::FileTime::from_system_time(now - std::time::Duration::from_secs(120));
-            filetime::set_symlink_file_times(&link, old, old).unwrap();
-            unsafe {
-                std::env::set_var("RUSTC_LINKER", &link);
+        // SAFETY: the process-state lock is still held.
+        unsafe {
+            match saved {
+                Some(value) => std::env::set_var("RUSTC_LINKER", value),
+                None => std::env::remove_var("RUSTC_LINKER"),
             }
-            assert!(
-                run.record(stdout, b"", 1, now - std::time::Duration::from_secs(60))
-                    .unwrap_err()
-                    .is::<InputsChanged>()
-            );
-            // A retargeted link is also a changed input even if its target is old.
-            filetime::set_file_mtime(&tool, old).unwrap();
-            filetime::set_symlink_file_times(&link, old, filetime::FileTime::now()).unwrap();
-            assert!(
-                run.record(stdout, b"", 1, now - std::time::Duration::from_secs(60))
-                    .unwrap_err()
-                    .is::<InputsChanged>()
-            );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retargeted_tool_links_and_ancestor_links_invalidate_recording_even_with_identical_bytes() {
+        let _lock = crate::test_support::process_state_test_lock();
+        let saved = std::env::var_os("RUSTC_LINKER");
+        for ancestor in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let run = run_with_path_only_linker(dir.path());
+            let build = run.environment.base_dirs[0].join("build");
+            let old_dir = build.join("old");
+            let new_dir = build.join("new");
+            let old = filetime::FileTime::from_unix_time(1, 0);
+            for root in [&old_dir, &new_dir] {
+                std::fs::create_dir(root).unwrap();
+                std::fs::write(root.join("linker"), b"same-tool").unwrap();
+                filetime::set_file_mtime(root.join("linker"), old).unwrap();
+            }
+            let middle = build.join("middle");
+            let tool = if ancestor {
+                std::os::unix::fs::symlink(&old_dir, &middle).unwrap();
+                middle.join("linker")
+            } else {
+                std::os::unix::fs::symlink(old_dir.join("linker"), &middle).unwrap();
+                let outer = build.join("linker");
+                std::os::unix::fs::symlink(&middle, &outer).unwrap();
+                filetime::set_symlink_file_times(&outer, old, old).unwrap();
+                outer
+            };
+            // SAFETY: the process-state lock is held.
+            unsafe { std::env::set_var("RUSTC_LINKER", &tool) };
+            let tools = run.tool_snapshot().unwrap();
+            std::fs::remove_file(&middle).unwrap();
+            let target = if ancestor {
+                new_dir
+            } else {
+                new_dir.join("linker")
+            };
+            std::os::unix::fs::symlink(target, &middle).unwrap();
+            let current = run.tool_snapshot().unwrap();
+            assert_eq!(tools["RUSTC_LINKER"].digest, current["RUSTC_LINKER"].digest);
+            assert_ne!(tools, current, "local identity must detect a link retarget");
+            let settled = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+            assert!(
+                run.record_with_tools(TOOL_STDOUT, b"", 1, settled, &tools)
+                    .unwrap_err()
+                    .is::<InputsChanged>()
+            );
+            assert_eq!(run.store.entry_count().unwrap(), 0);
+            assert!(run.prediction().unwrap().is_none());
+        }
+        // SAFETY: the process-state lock is still held.
+        unsafe {
+            match saved {
+                Some(value) => std::env::set_var("RUSTC_LINKER", value),
+                None => std::env::remove_var("RUSTC_LINKER"),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn script_execution_captures_tools_before_the_script_can_edit_them() {
+        use std::os::unix::fs::PermissionsExt;
+        let _lock = crate::test_support::process_state_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let run = run_with_path_only_linker(dir.path());
+        let tool = run.environment.base_dirs[0].join("build/linker");
+        std::fs::write(&tool, b"old-tool").unwrap();
+        let saved = std::env::var_os("RUSTC_LINKER");
+        // SAFETY: the process-state lock serializes environment edits.
+        unsafe { std::env::set_var("RUSTC_LINKER", &tool) };
+        let script = dir.path().join("script");
+        std::fs::write(&script, b"#!/bin/sh\nprintf 'new-tool' > \"$RUSTC_LINKER\"\nprintf 'cargo:rerun-if-changed=build.rs\\ncargo:rerun-if-env-changed=RUSTC_LINKER\\n'\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let first = ScriptRun::start(&script, &[], &run).unwrap();
+        assert!(first.succeeded());
+        assert_ne!(first.tools, run.tool_snapshot().unwrap());
+        assert!(run.record_run(&first).unwrap_err().is::<InputsChanged>());
+        assert_eq!(run.store.entry_count().unwrap(), 0);
         // SAFETY: the process-state lock is still held.
         unsafe {
             match saved {
@@ -4487,8 +4600,12 @@ mod tests {
             rewrites_text: false,
         };
         values.map(|value| {
-            run.action_key_with(&prediction, value.map(Into::into))
-                .unwrap()
+            run.action_key_with(
+                &prediction,
+                value.map(Into::into),
+                &run.tool_snapshot().unwrap(),
+            )
+            .unwrap()
         })
     }
 

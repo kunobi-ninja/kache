@@ -5,8 +5,14 @@ case "$1" in
   -###)
     shift
     printf '"clang" "-cc1"' >&2
-    for arg do printf ' "%s"' "$arg" >&2; done
-    printf '\n' >&2
+    source=''
+    for arg do
+      case "$arg" in
+        *.c) source="$arg" ;;
+        *) printf ' "%s"' "$arg" >&2 ;;
+      esac
+    done
+    printf ' "%s"\n' "$source" >&2
     ;;
   *) printf 'preprocessed unit\n' ;;
 esac

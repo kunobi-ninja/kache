@@ -879,9 +879,9 @@ pub enum GcRequestMode {
     ExplicitAge,
 }
 
-/// Who started a daemon sweep. It decides only the size pass: a requested
-/// `kache gc` always runs it, the timer asks the shared trigger and backoff
-/// like every other automatic driver.
+/// Who started a daemon sweep. A requested `kache gc` waits for the lock
+/// and runs its size pass; the timer skips a busy lock and follows the
+/// shared trigger and backoff.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GcDriver {
     Requested,

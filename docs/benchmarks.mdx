@@ -259,15 +259,21 @@ Contention appears as its own report section and as `bench-hk-contention` or
 results under `contention/` and includes the statistics in `summary.json`.
 Missing backend reports or failed builds invalidate the suite.
 
-Normal PRs run one contention batch per arm. Expanded PRs and nightly use two
-cold seeds and six warm batches, matching the isolated-build sample counts.
-Every warm batch restores its cold snapshot and clears all targets. A new
-cold seed is measured every third sample, and arm order alternates.
-The six warm pairs use the same timing gate as isolated builds; two cold
-samples remain inconclusive. More duplicate Kache key compilations, or more
-warm misses or passthroughs than the base, fail independently of elapsed time.
+PRs measure six fresh cold contention seeds and six warm batches per Kache
+arm. mbx runs once normally and six times with the `bench` label. Cold
+samples alternate arm order. Cold duplicate compilation counts vary with
+overlap: a one-sided paired sign test must fall below 0.05 / 3, sharing the
+false-positive budget across hk, eza and aube. Tied counts carry no directional
+evidence. A single pair remains inconclusive. The report shows the number of
+pairs, the probability and the decision.
 
-Use `--contention-samples 12` with `bench-short` for a longer local comparison,
+Warm increases in duplicate compilations, misses or passthroughs still fail
+immediately. Both cold and warm contention timing use the paired timing gate.
+Nightly and local runs keep the default fresh cold seed every third sample;
+these smaller cold samples may remain inconclusive.
+
+Use `--contention-samples 6 --contention-cold-every 1` with `bench-short`
+for six fresh cold pairs in a local comparison,
 or `--skip-contention` to focus on isolated builds. To run only contention
 with all three tools, add `--sccache /path/to/sccache --mbx /path/to/mbx` to the
 standalone command. Compiler invocation and internal wait counters come from

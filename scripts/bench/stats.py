@@ -5,6 +5,8 @@ import random
 import statistics
 
 PHASES = ("cold", "warm_same_tree", "warm")
+# Three subjects each test cold duplicate growth in the PR gate.
+COUNT_GROWTH_ALPHA = 0.05 / 3
 
 
 def positive(value):
@@ -140,6 +142,29 @@ def summarize(records):
     return {"statistics": stats, "comparisons": comparisons, "failures": failures}
 
 
+def paired_count_growth(base, head):
+    """One-sided paired sign test; equal counts carry no directional evidence."""
+    deltas = [h - b for b, h in zip(base, head, strict=True)]
+    positive = sum(delta > 0 for delta in deltas)
+    nonzero = sum(delta != 0 for delta in deltas)
+    probability = (
+        sum(math.comb(nonzero, k) for k in range(positive, nonzero + 1))
+        / 2**nonzero
+        if nonzero
+        else 1.0
+    )
+    return {
+        "n": len(deltas),
+        "median_delta": statistics.median(deltas),
+        "positive_pairs": positive,
+        "nonzero_pairs": nonzero,
+        "p_value": probability,
+        "outcome": "regression"
+        if probability < COUNT_GROWTH_ALPHA
+        else "inconclusive",
+    }
+
+
 def contention_comparison(records):
     pairs = {
         arm: {(r["sample"], r["phase"]): r for r in records if r["arm"] == arm}
@@ -160,11 +185,22 @@ def contention_comparison(records):
         comparisons.append({"phase": "contention_" + phase, "n": len(keys), **change})
         if change["outcome"] == "regression":
             failures.append(f"contention {phase}: paired timing regression")
+        if phase == "cold":
+            growth = paired_count_growth(
+                [base[key]["events"]["duplicate_key_compiles"] for key in keys],
+                [head[key]["events"]["duplicate_key_compiles"] for key in keys],
+            )
+            comparisons[-1]["duplicate_key_compiles"] = growth
+            if growth["outcome"] == "regression":
+                failures.append("contention cold: repeated duplicate key compile growth")
         for key in keys:
             b, h = base[key]["events"], head[key]["events"]
-            # Cold hit/miss counts vary with overlap. Duplicate compilation of
-            # the same key is the useful cold correctness signal.
-            if h["duplicate_key_compiles"] > b["duplicate_key_compiles"]:
+            # Cold work varies with overlap and needs repeated paired evidence.
+            # A warm cache must not add compiles, misses or passthroughs.
+            if (
+                phase == "warm"
+                and h["duplicate_key_compiles"] > b["duplicate_key_compiles"]
+            ):
                 failures.append(
                     f"contention {phase} sample {key[0]}: duplicate key compiles increased"
                 )

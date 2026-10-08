@@ -635,7 +635,9 @@ else:
             self.assertEqual(export.call_args.args[0][:3], ["/mbx", "cache", "trace"])
 
     def test_repeated_warm_batches_restore_cold_snapshots_and_alternate_arms(self):
-        for cold_every, samples in ((1, 3), (3, 6)):
+        for cold_every, samples, context in (
+            (1, 3, None), (3, 6, None), (1, 6, 1), (3, 6, 1)
+        ):
             with (
                 self.subTest(cold_every=cold_every),
                 tempfile.TemporaryDirectory() as directory,
@@ -648,6 +650,7 @@ else:
                     output=root,
                     project="hk",
                     samples=samples,
+                    context_samples=context,
                     cold_every=cold_every,
                     order_seed=0,
                     keep_work=False,
@@ -656,6 +659,8 @@ else:
                     ("base", Path("/base/kache"), 1, "kache"),
                     ("head", Path("/head/kache"), 1, "kache"),
                 ]
+                if context is not None:
+                    arms.append(("mbx", Path("/mbx"), 1, "mbx"))
                 data = {"records": []}
 
                 def clone(command, **kwargs):
@@ -711,7 +716,11 @@ else:
                         list(range(samples)),
                     )
                 for sample in range(samples):
-                    expected = ["base", "head"] if sample % 2 == 0 else ["head", "base"]
+                    order = arms if sample % 2 == 0 else list(reversed(arms))
+                    expected = [
+                        arm for arm, _, _, backend in order
+                        if backend == "kache" or sample < context
+                    ]
                     self.assertEqual(
                         [
                             r["arm"]
@@ -719,6 +728,11 @@ else:
                             if r["sample"] == sample and r["phase"] == "warm"
                         ],
                         expected,
+                    )
+                if context is not None:
+                    self.assertEqual(
+                        [(r["sample"], r["phase"]) for r in records if r["arm"] == "mbx"],
+                        [(0, "cold"), (0, "warm")],
                     )
                 self.assertEqual(list(work.iterdir()), [mirror])
 

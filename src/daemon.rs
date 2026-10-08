@@ -8875,13 +8875,19 @@ const GC_REQUEST_TIMEOUT: Duration = Duration::from_secs(3600);
 
 /// Send a GC request to the daemon. Auto-starts daemon if needed.
 pub fn send_gc_request(config: &Config, max_age_hours: Option<u64>) -> Result<GcRequestOutcome> {
-    send_gc_request_with_timeout(config, max_age_hours, GC_REQUEST_TIMEOUT)
+    send_gc_request_with_timeout(
+        config,
+        max_age_hours,
+        GC_REQUEST_TIMEOUT,
+        start_daemon_background,
+    )
 }
 
 fn send_gc_request_with_timeout(
     config: &Config,
     max_age_hours: Option<u64>,
     read_timeout: Duration,
+    mut start: impl FnMut() -> Result<bool>,
 ) -> Result<GcRequestOutcome> {
     let socket_path = config.socket_path();
 
@@ -8892,7 +8898,7 @@ fn send_gc_request_with_timeout(
     match send_stats_request(config, false, None, None) {
         Ok(stats) => require_gc_policy_support(&stats)?,
         Err(_) => {
-            require_daemon_started(start_daemon_background()?)?;
+            require_daemon_started(start()?)?;
             let stats = send_stats_request(config, false, None, None)
                 .context("probing GC policy support after daemon start")?;
             require_gc_policy_support(&stats)?;
@@ -8917,7 +8923,7 @@ fn send_gc_request_with_timeout(
         Err(error) if error.is::<DaemonConnectionFailure>() => {
             // The daemon may have exited after the capability probe. Any
             // replacement must pass the same pre-mutation check before retry.
-            require_daemon_started(start_daemon_background()?)?;
+            require_daemon_started(start()?)?;
             let stats = send_stats_request(config, false, None, None)
                 .context("probing GC policy support before retry")?;
             require_gc_policy_support(&stats)?;

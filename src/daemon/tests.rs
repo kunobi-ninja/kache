@@ -14274,7 +14274,9 @@ async fn timed_out_gc_request_is_never_sent_again() {
         drop(stream);
     });
     let error = tokio::task::spawn_blocking(move || {
-        send_gc_request_with_timeout(&config, Some(24), Duration::from_millis(75))
+        send_gc_request_with_timeout(&config, Some(24), Duration::from_millis(75), || {
+            panic!("an accepted GC request cannot start another daemon")
+        })
     })
     .await
     .unwrap()
@@ -14592,4 +14594,59 @@ async fn async_daemon_transport_marks_connection_failures_before_send() {
     .await
     .unwrap_err();
     assert!(error.is::<DaemonConnectionFailure>());
+}
+
+#[tokio::test]
+async fn gc_retries_when_the_probed_daemon_disappears_before_send() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let socket = config.socket_path();
+    std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+    let listener = bind_listener(&socket);
+    let daemon = Arc::new(Daemon::new(config.clone()));
+    let first_daemon = daemon.clone();
+    let first_server = tokio::spawn(async move {
+        let stream = listener.accept().await.unwrap();
+        // The connected stats probe can finish after the listener disappears.
+        // Its response therefore proves that the next connect must be retried.
+        drop(listener);
+        handle_connection(stream, &first_daemon, &Arc::new(Lifecycle::default()))
+            .await
+            .unwrap();
+    });
+    let runtime = tokio::runtime::Handle::current();
+    let calls = Arc::new(AtomicU64::new(0));
+    let starter_calls = calls.clone();
+    let (server_tx, server_rx) = std::sync::mpsc::channel();
+    let outcome = tokio::task::spawn_blocking(move || {
+        send_gc_request_with_timeout(&config, Some(17), Duration::from_secs(2), || {
+            starter_calls.fetch_add(1, Ordering::SeqCst);
+            let listener = bind_listener(&socket);
+            let daemon = daemon.clone();
+            let server = runtime.spawn(async move {
+                for _ in 0..2 {
+                    let stream = listener.accept().await.unwrap();
+                    handle_connection(stream, &daemon, &Arc::new(Lifecycle::default()))
+                        .await
+                        .unwrap();
+                }
+            });
+            server_tx.send(server).unwrap();
+            Ok(true)
+        })
+    })
+    .await
+    .unwrap()
+    .expect("a pre-send connection failure safely restarts and retries GC");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(!outcome.skipped);
+    assert_eq!(outcome.breakdown.unwrap().mode, GcRequestMode::ExplicitAge);
+    first_server.await.unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        server_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
 }

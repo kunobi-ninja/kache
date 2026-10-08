@@ -148,12 +148,30 @@ pub fn producer_context(
     }
 }
 
-pub fn context_path(runtime_dir: &Path, session_id: &str, root: &str) -> std::path::PathBuf {
+fn context_path(runtime_dir: &Path, session_id: &str, root: &str) -> std::path::PathBuf {
     // Hash local path components too; old clients may use non-hex session ids.
     let session = blake3::hash(session_id.as_bytes()).to_hex();
     runtime_dir
         .join("build-report-contexts")
         .join(format!("{}-{}.json", session, root_hash(root)))
+}
+
+/// Avoid probing the compiler or hashing the lockfile for every warm invocation.
+pub fn capture_context_once(
+    runtime_dir: &Path,
+    session_id: &str,
+    root: &str,
+    capture: impl FnOnce() -> ProducerContext,
+) -> Result<()> {
+    if context_path(runtime_dir, session_id, root).exists() {
+        return Ok(());
+    }
+    let context = capture();
+    ensure!(
+        context.session_id == session_id && context.root == root,
+        "producer capture scope mismatch"
+    );
+    persist_context(runtime_dir, &context)
 }
 
 /// Atomic, create-only local snapshot. Later invocations cannot relabel a session.
@@ -439,6 +457,9 @@ pub async fn upload_report(
 
 /// Discovery never returns nested namespaces or arbitrary object keys. A large
 /// namespace is refused instead of silently selecting an arbitrary partial set.
+// The next replay consumer uses this API; standalone report publication has no
+// reader command. Keep it compiled and exercised by restart tests in the interim.
+#[allow(dead_code)]
 pub async fn list_reports(
     backend: &dyn RemoteBackend,
     prefix: &str,
@@ -473,6 +494,7 @@ fn valid_report_filename(name: &str) -> bool {
     safe_component(session) && hex64(root)
 }
 
+#[allow(dead_code)] // Reader API for replay/index reconstruction.
 pub async fn download_report(
     backend: &dyn RemoteBackend,
     prefix: &str,
@@ -690,10 +712,34 @@ mod tests {
         assert!(read_context(dir.path(), "one", "/work").unwrap().is_none());
         persist_context(dir.path(), &context).unwrap();
         context.commit = Some("later-daemon".into());
+        capture_context_once(dir.path(), "one", "/work", || {
+            panic!("warm invocation probed producer metadata again")
+        })
+        .unwrap();
         persist_context(dir.path(), &context).unwrap();
         let restored = read_context(dir.path(), "one", "/work").unwrap().unwrap();
         assert_eq!(restored.commit.as_deref(), Some("first"));
         assert!(read_context(dir.path(), "one", "/other").unwrap().is_none());
+        assert!(
+            capture_context_once(dir.path(), "one", "/other", || context.clone())
+                .unwrap_err()
+                .to_string()
+                .contains("capture scope mismatch")
+        );
+        capture_context_once(dir.path(), "two", "/work", || {
+            let mut next = context.clone();
+            next.session_id = "two".into();
+            next
+        })
+        .unwrap();
+        assert_eq!(
+            read_context(dir.path(), "two", "/work")
+                .unwrap()
+                .unwrap()
+                .commit
+                .as_deref(),
+            Some("later-daemon")
+        );
         std::fs::write(
             context_path(dir.path(), "one", "/work"),
             serde_json::to_vec(&context).unwrap(),

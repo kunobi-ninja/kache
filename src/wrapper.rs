@@ -7808,21 +7808,22 @@ fn explain_miss_diff(
 /// its own compile (kunobi-ninja/kache#698).
 fn capture_build_report_context(config: &Config, args: &RustcArgs, root: &str, now: u64) {
     let session_id = session_id_for_event(config, root, now);
-    if session_id.is_empty()
-        || crate::build_reports::context_path(&config.runtime_dir, &session_id, root).exists()
-    {
+    if session_id.is_empty() {
         return;
     }
-    let lock_path = Path::new(root).join("Cargo.lock");
-    let context = crate::build_reports::producer_context(
-        &session_id,
-        root,
-        args,
-        Some(&lock_path),
-        now.saturating_mul(1000),
-        |name| std::env::var(name).ok(),
-    );
-    if let Err(error) = crate::build_reports::persist_context(&config.runtime_dir, &context) {
+    if let Err(error) =
+        crate::build_reports::capture_context_once(&config.runtime_dir, &session_id, root, || {
+            let lock_path = Path::new(root).join("Cargo.lock");
+            crate::build_reports::producer_context(
+                &session_id,
+                root,
+                args,
+                Some(&lock_path),
+                now.saturating_mul(1000),
+                |name| std::env::var(name).ok(),
+            )
+        })
+    {
         tracing::warn!("cannot capture build report producer context: {error}");
     }
 }

@@ -101,14 +101,13 @@ fn hook_script(command: &str, owner: &str) -> String {
 
 fn read_journal(directory: &Path) -> Result<Option<Journal>> {
     let path = directory.join(JOURNAL);
-    match std::fs::symlink_metadata(&path) {
-        Ok(meta) => ensure!(
-            meta.is_file() && !meta.file_type().is_symlink(),
-            "Kache hook record is not a regular file"
-        ),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
-    }
+    let Some(meta) = existing_metadata(&path)? else {
+        return Ok(None);
+    };
+    ensure!(
+        meta.is_file() && !meta.file_type().is_symlink(),
+        "Kache hook record is not a regular file"
+    );
     let journal: Journal = serde_json::from_slice(&std::fs::read(path)?)?;
     ensure!(
         !journal.owner.is_empty()
@@ -119,6 +118,14 @@ fn read_journal(directory: &Path) -> Result<Option<Journal>> {
     Ok(Some(journal))
 }
 
+fn existing_metadata(path: &Path) -> Result<Option<std::fs::Metadata>> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => Ok(Some(meta)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn verified_hooks(directory: &Path, journal: &Journal, owner: &str) -> Result<()> {
     ensure!(
         journal.owner == owner,
@@ -126,19 +133,15 @@ fn verified_hooks(directory: &Path, journal: &Journal, owner: &str) -> Result<()
     );
     for name in NAMES {
         let path = directory.join(name);
-        match std::fs::symlink_metadata(&path) {
-            Ok(meta) => {
-                ensure!(
-                    meta.is_file() && !meta.file_type().is_symlink(),
-                    "{name} is no longer a regular Kache hook"
-                );
-                ensure!(
-                    blake3::hash(&std::fs::read(path)?).to_hex().as_str() == journal.hooks[name],
-                    "{name} was modified; retaining it"
-                );
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
+        if let Some(meta) = existing_metadata(&path)? {
+            ensure!(
+                meta.is_file() && !meta.file_type().is_symlink(),
+                "{name} is no longer a regular Kache hook"
+            );
+            ensure!(
+                blake3::hash(&std::fs::read(path)?).to_hex().as_str() == journal.hooks[name],
+                "{name} was modified; retaining it"
+            );
         }
     }
     Ok(())
@@ -158,10 +161,8 @@ fn install_in(directory: &Path, owner: &str, script: &str) -> Result<()> {
         return Ok(());
     }
     for name in NAMES {
-        match std::fs::symlink_metadata(directory.join(name)) {
-            Ok(_) => bail!("{name} already exists; retaining the repository's hook"),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
+        if existing_metadata(&directory.join(name))?.is_some() {
+            bail!("{name} already exists; retaining the repository's hook");
         }
     }
     let digest = blake3::hash(script.as_bytes()).to_hex().to_string();
@@ -222,14 +223,18 @@ fn uninstall_in(directory: &Path, owner: &str) -> Result<()> {
     };
     verified_hooks(directory, &journal, owner)?;
     for name in NAMES {
-        match std::fs::remove_file(directory.join(name)) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
+        remove_owned_hook(&directory.join(name))?;
     }
     std::fs::remove_file(directory.join(JOURNAL))?;
     Ok(())
+}
+
+fn remove_owned_hook(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
 }
 
 #[cfg(test)]
@@ -342,7 +347,25 @@ mod tests {
         let invalid_directory = dir.path().join("invalid\0directory");
         let error = std::fs::symlink_metadata(invalid_directory.join("post-checkout")).unwrap_err();
         assert_ne!(error.kind(), std::io::ErrorKind::NotFound);
+        assert!(existing_metadata(&invalid_directory).is_err());
+        assert!(read_journal(&invalid_directory).is_err());
         assert!(verified_hooks(&invalid_directory, &journal, "owner").is_err());
+    }
+
+    #[test]
+    fn filesystem_helpers_distinguish_existing_missing_and_unremovable_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let hook = dir.path().join("hook");
+        assert!(existing_metadata(&hook).unwrap().is_none());
+        remove_owned_hook(&hook).unwrap();
+        std::fs::write(&hook, "managed hook").unwrap();
+        assert!(existing_metadata(&hook).unwrap().unwrap().is_file());
+        remove_owned_hook(&hook).unwrap();
+        assert!(!hook.exists());
+        std::fs::create_dir(&hook).unwrap();
+        assert!(existing_metadata(&hook).unwrap().unwrap().is_dir());
+        assert!(remove_owned_hook(&hook).is_err());
+        assert!(hook.is_dir());
     }
 
     #[test]

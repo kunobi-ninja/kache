@@ -408,6 +408,7 @@ fn volume_route_path_cc_uses_output_parent() {
         depinfo: None,
         language_override: None,
         family: crate::compiler::cc::ToolFamily::Gnu,
+        depinfo_roots: Vec::new(),
     };
     assert_eq!(
         super::volume_route_path_cc(&parsed),
@@ -3140,6 +3141,169 @@ fn restore_cc_object_is_writable_private_and_keeps_blob_immutable() {
         b"cached object"
     );
     assert!(blob_meta.permissions().readonly());
+}
+
+#[test]
+fn cc_post_publish_stamps_old_outputs_as_fresh_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let old = filetime::FileTime::from_unix_time(1, 0);
+    let object = dir.path().join("unit.o");
+    let depinfo = dir.path().join("unit.d");
+    std::fs::write(&object, b"object").unwrap();
+    std::fs::write(&depinfo, b"unit.o: unit.c\n").unwrap();
+    filetime::set_file_mtime(&object, old).unwrap();
+    filetime::set_file_mtime(&depinfo, old).unwrap();
+    let source = dir.path().join("unit.c");
+    std::fs::write(&source, b"int x;\n").unwrap();
+    let source_mtime = std::fs::metadata(&source).unwrap().modified().unwrap();
+
+    apply_cc_post_publish_actions(&[
+        (object.clone(), ArtifactKind::Object),
+        (depinfo.clone(), ArtifactKind::DepInfo),
+    ])
+    .unwrap();
+    for path in [&object, &depinfo] {
+        assert!(std::fs::metadata(path).unwrap().modified().unwrap() >= source_mtime);
+    }
+    assert_eq!(std::fs::read(&object).unwrap(), b"object");
+    assert_eq!(std::fs::read(&depinfo).unwrap(), b"unit.o: unit.c\n");
+    assert!(
+        apply_cc_post_publish_actions(&[(dir.path().join("missing.o"), ArtifactKind::Object)])
+            .is_err()
+    );
+}
+
+#[test]
+fn cc_restore_stamps_new_and_replaced_outputs_without_redating_blobs() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&test_config(dir.path().join("cache"))).unwrap();
+    let hash = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+    create_blob(&store, hash, b"cached object");
+    let blob = store.blob_path(hash);
+    let old = filetime::FileTime::from_unix_time(1, 0);
+    filetime::set_file_mtime(&blob, old).unwrap();
+    let source = dir.path().join("unit.c");
+    std::fs::write(&source, b"int x;\n").unwrap();
+    let source_mtime = std::fs::metadata(&source).unwrap().modified().unwrap();
+    let meta = entry_meta("cc-clock", vec![cached_file("unit.o", hash)], &[]);
+    for (index, existing) in [false, true].into_iter().enumerate() {
+        let output = dir.path().join(format!("unit-{index}.wasm"));
+        if existing {
+            std::fs::write(&output, b"old object").unwrap();
+            filetime::set_file_mtime(&output, old).unwrap();
+        }
+        let parsed = CcCompiler::new()
+            .parse(&s(&[
+                "clang",
+                "-c",
+                source.to_str().unwrap(),
+                "-o",
+                output.to_str().unwrap(),
+            ]))
+            .unwrap();
+        assert_eq!(cc_cache_entry_rejection_reason(&parsed, &meta), None);
+        restore_cc_from_cache(&store, &parsed, &meta).unwrap();
+        assert_eq!(std::fs::read(&output).unwrap(), b"cached object");
+        assert!(std::fs::metadata(&output).unwrap().modified().unwrap() >= source_mtime);
+        assert_eq!(
+            filetime::FileTime::from_last_modification_time(&std::fs::metadata(&blob).unwrap()),
+            old
+        );
+    }
+}
+
+#[test]
+fn cc_generated_source_depinfo_rebases_headers_outside_the_build_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&test_config(dir.path().join("cache"))).unwrap();
+    let producer = dir.path().join("producer");
+    let consumer = dir.path().join("consumer");
+    let producer_build = producer.join("obj/sub");
+    let consumer_build = consumer.join("obj/sub");
+    std::fs::create_dir_all(&producer_build).unwrap();
+    std::fs::create_dir_all(&consumer_build).unwrap();
+    let depfile = producer_build.join("gen.o.pp");
+    let object = producer_build.join("gen.wasm");
+    let header = producer.join("src/inc/header with space.h");
+    let external = dir.path().join("sdk/header.h");
+    let original = format!(
+        "gen.wasm: gen.c {} {}\n{}:\n",
+        header.display().to_string().replace(' ', "\\ "),
+        external.display(),
+        header.display().to_string().replace(' ', "\\ ")
+    );
+    std::fs::write(&object, b"wasm object").unwrap();
+    std::fs::write(&depfile, &original).unwrap();
+    let artifacts = ArtifactSet::new(vec![
+        crate::compiler::Artifact {
+            path: object,
+            store_name: "__kache_cc_object.o".into(),
+            kind: ArtifactKind::Object,
+            required: true,
+        },
+        crate::compiler::Artifact {
+            path: depfile.clone(),
+            store_name: "__kache_cc_depinfo.d".into(),
+            kind: ArtifactKind::DepInfo,
+            required: true,
+        },
+    ]);
+
+    // Both the legacy KACHE_BASE_DIR and configured [paths].base_dirs use
+    // distinct ownership sentinels. No live process environment is needed.
+    for sentinel in ["__kache_base_dir__/", "__kache_base_dir_0__/"] {
+        let roots = vec![(producer.clone(), sentinel.to_string(), 5)];
+        let prepared =
+            prepare_cc_store_files_in(&artifacts, Some(&producer_build), None, &roots).unwrap();
+        let stored = std::fs::read_to_string(&prepared.files[1].0).unwrap();
+        assert!(stored.contains(sentinel));
+        assert!(!stored.contains(producer.to_str().unwrap()));
+        assert!(stored.contains(external.to_str().unwrap()));
+        assert_eq!(std::fs::read_to_string(&depfile).unwrap(), original);
+        let files = prepared
+            .files
+            .iter()
+            .map(|(path, name)| {
+                let bytes = std::fs::read(path).unwrap();
+                let hash = blake3::hash(&bytes).to_hex().to_string();
+                create_blob(&store, &hash, &bytes);
+                cached_file(name, &hash)
+            })
+            .collect();
+        let meta = entry_meta("cc-generated", files, &[]);
+        let restored_object = consumer_build.join("gen.wasm");
+        let restored_depfile = consumer_build.join("gen.o.pp");
+        let mut parsed = crate::compiler::cc::CcArgs::parse(&s(&[
+            "clang",
+            "-c",
+            consumer_build.join("gen.c").to_str().unwrap(),
+            "-o",
+            restored_object.to_str().unwrap(),
+            "-MD",
+            "-MP",
+            "-MF",
+            restored_depfile.to_str().unwrap(),
+        ]))
+        .unwrap();
+        parsed.depinfo_roots = vec![(consumer.clone(), sentinel.to_string(), 5)];
+        assert_eq!(cc_cache_entry_rejection_reason(&parsed, &meta), None);
+        restore_cc_from_cache(&store, &parsed, &meta).unwrap();
+        assert_eq!(std::fs::read(&restored_object).unwrap(), b"wasm object");
+        let restored = std::fs::read_to_string(&restored_depfile).unwrap();
+        let expected_header = consumer
+            .join("src/inc/header with space.h")
+            .display()
+            .to_string()
+            .replace(' ', "\\ ");
+        assert_eq!(
+            restored,
+            format!(
+                "gen.wasm: gen.c {expected_header} {}\n{expected_header}:\n",
+                external.display()
+            )
+        );
+        assert!(!restored.contains("__kache_"));
+    }
 }
 
 #[test]

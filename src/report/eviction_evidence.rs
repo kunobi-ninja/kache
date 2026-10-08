@@ -1,11 +1,8 @@
 //! Store-wide observations have their own horizon, independent of build events.
-use super::Config;
-use crate::store::Store;
-use crate::store_view::StoreSummary;
 use kache_store::EvictionHorizonEvidence;
 use serde::{Deserialize, Serialize};
 
-const HORIZON_SECS: u64 = 604_800;
+pub(super) const HORIZON_SECS: u64 = 604_800;
 const LIMITATIONS: &[&str] = &[
     "All-store observations tagged with value-density shadow decisions, independent of the build-event window and root filter.",
     "Latest live eviction and first shadow-only sweep per key; repeated evictions overwrite history and cohorts can overlap.",
@@ -33,35 +30,23 @@ pub struct StoreEvidence {
 }
 
 pub(super) fn collect(
-    config: &Config,
-    stores: &[StoreSummary],
+    observations: Vec<Result<EvictionHorizonEvidence, String>>,
     as_of: i64,
 ) -> EvictionEvidenceReport {
-    let stores = stores
-        .iter()
+    let stores = observations
+        .into_iter()
         .enumerate()
-        .map(|(store_index, summary)| {
-            let mut store_config = kache_store::config::Config::from(config);
-            store_config.cache_dir = summary.path.clone();
-            let result = Store::open_read_only(store_config)
-                .map_err(|_| "read-only index unavailable")
-                .and_then(|store| {
-                    store
-                        .eviction_horizon_evidence(as_of, HORIZON_SECS)
-                        .map_err(|_| "eviction observations unavailable")
-                });
-            match result {
-                Ok(evidence) => StoreEvidence {
-                    store_index,
-                    evidence: Some(evidence),
-                    error: None,
-                },
-                Err(error) => StoreEvidence {
-                    store_index,
-                    evidence: None,
-                    error: Some(error.into()),
-                },
-            }
+        .map(|(store_index, result)| match result {
+            Ok(evidence) => StoreEvidence {
+                store_index,
+                evidence: Some(evidence),
+                error: None,
+            },
+            Err(error) => StoreEvidence {
+                store_index,
+                evidence: None,
+                error: Some(error),
+            },
         })
         .collect();
     EvictionEvidenceReport {

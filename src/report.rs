@@ -1219,7 +1219,13 @@ pub fn generate_report_with_filter(
     // independent of machine speed. A missing/unreadable store degrades
     // to zeroed dedup stats rather than failing the whole report.
     let restored_bytes = stats.reflinked_bytes + stats.hardlinked_bytes + stats.copied_bytes;
-    let inventory = crate::store_view::read(config, false, "name").unwrap_or_default();
+    let inventory =
+        crate::store_view::read_report(config, now.timestamp(), eviction_evidence::HORIZON_SECS)
+            .unwrap_or_default();
+    let eviction_evidence = Some(eviction_evidence::collect(
+        inventory.eviction_evidence,
+        now.timestamp(),
+    ));
     let blob_stats = inventory.blob_stats;
     let stores = inventory.stores;
     let accounting_consistent = stores.iter().all(|s| {
@@ -1267,12 +1273,6 @@ pub fn generate_report_with_filter(
         dedup_saved_bytes: blob_stats.savings,
         accounting_consistent,
     };
-
-    let eviction_evidence = Some(eviction_evidence::collect(
-        config,
-        &storage.stores,
-        now.timestamp(),
-    ));
 
     Ok(BuildReport {
         eviction_evidence,

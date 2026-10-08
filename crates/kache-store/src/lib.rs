@@ -6,6 +6,7 @@ mod blob_validation;
 mod cc_memo;
 pub mod config;
 pub mod eviction;
+mod eviction_evidence;
 pub mod file_hash;
 pub mod filesystem;
 mod index_compaction;
@@ -18,6 +19,7 @@ mod store;
 mod test_support;
 
 pub use blob_drift::{BlobRefcountDrift, blob_refcount_drift};
+pub use eviction_evidence::{EvictionEvidenceCohort, EvictionHorizonEvidence};
 pub use store::*;
 
 /// Compiler-owned rules applied when publishing an entry. Implementations must

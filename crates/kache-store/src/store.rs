@@ -5622,6 +5622,16 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         Ok(row)
     }
 
+    /// Fixed-horizon observations from the latest live tombstone and first
+    /// shadow-only decision per key. Does not change eviction or access state.
+    pub fn eviction_horizon_evidence(
+        &self,
+        as_of_unix_secs: i64,
+        horizon_secs: u64,
+    ) -> Result<crate::EvictionHorizonEvidence> {
+        crate::eviction_evidence::read(&self.db, as_of_unix_secs, horizon_secs)
+    }
+
     /// Note that a key was requested after being evicted — the observation the
     /// live store cannot provide, since the entries it evicted are precisely
     /// the ones missing from it (kunobi-ninja/kache#594).

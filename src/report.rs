@@ -9,6 +9,8 @@ use crate::daemon::{TransferDirection, TransferEvent};
 use crate::events::{self, BuildEvent, EventResult};
 use crate::since::SinceWindow;
 
+mod eviction_evidence;
+
 // ── Data Model ──────────────────────────────────────────────────────────────
 
 /// `gc_stats.json`: the last GC run, whichever driver ran it. Files written
@@ -310,6 +312,8 @@ pub const REPORT_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct BuildReport {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eviction_evidence: Option<eviction_evidence::EvictionEvidenceReport>,
     pub schema_version: u32,
     pub meta: ReportMeta,
     pub summary: ReportSummary,
@@ -1264,7 +1268,14 @@ pub fn generate_report_with_filter(
         accounting_consistent,
     };
 
+    let eviction_evidence = Some(eviction_evidence::collect(
+        config,
+        &storage.stores,
+        now.timestamp(),
+    ));
+
     Ok(BuildReport {
+        eviction_evidence,
         schema_version: REPORT_SCHEMA_VERSION,
         meta: ReportMeta {
             kache_version: crate::VERSION.to_string(),
@@ -3274,6 +3285,10 @@ pub fn format_markdown(report: &BuildReport) -> String {
         lines.push(String::new());
     }
 
+    if let Some(evidence) = &report.eviction_evidence {
+        lines.extend(eviction_evidence::lines(evidence));
+    }
+
     lines.join("\n")
 }
 
@@ -4225,6 +4240,10 @@ pub fn format_text(report: &BuildReport) -> String {
         for suggestion in &report.suggestions {
             lines.push(format!("  - {suggestion}"));
         }
+    }
+
+    if let Some(evidence) = &report.eviction_evidence {
+        lines.extend(eviction_evidence::lines(evidence));
     }
 
     lines.join("\n")

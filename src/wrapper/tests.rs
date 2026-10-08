@@ -3173,6 +3173,56 @@ fn cc_post_publish_stamps_old_outputs_as_fresh_writes() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn cc_link_finalization_errors_prevent_compiler_fallback() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("linked");
+    let parsed = crate::compiler::cc::CcArgs::parse(&s(&[
+        "clang",
+        "unit.o",
+        "-o",
+        output.to_str().unwrap(),
+    ]))
+    .unwrap();
+    // A publication race may remove the linker output before final chmod.
+    let error = finalize_cc_restore(&[], &parsed).unwrap_err();
+    assert!(error.downcast_ref::<PartialCcRestore>().is_some());
+    assert!(format!("{error:#}").contains("cc restore: stat"));
+
+    std::fs::write(&output, b"executable").unwrap();
+    std::fs::set_permissions(&output, std::fs::Permissions::from_mode(0o600)).unwrap();
+    finalize_cc_restore(&[(output.clone(), ArtifactKind::Executable)], &parsed).unwrap();
+    assert_eq!(
+        std::fs::metadata(&output).unwrap().permissions().mode() & 0o777,
+        0o755
+    );
+    assert_eq!(std::fs::read(&output).unwrap(), b"executable");
+
+    let compile = crate::compiler::cc::CcArgs::parse(&s(&[
+        "clang",
+        "-c",
+        "unit.c",
+        "-o",
+        output.to_str().unwrap(),
+    ]))
+    .unwrap();
+    std::fs::set_permissions(&output, std::fs::Permissions::from_mode(0o600)).unwrap();
+    finalize_cc_restore(&[(output.clone(), ArtifactKind::Object)], &compile).unwrap();
+    assert_eq!(
+        std::fs::metadata(&output).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let error = finalize_cc_restore(
+        &[(dir.path().join("missing.o"), ArtifactKind::Object)],
+        &compile,
+    )
+    .unwrap_err();
+    assert!(error.downcast_ref::<PartialCcRestore>().is_some());
+}
+
 #[test]
 fn cc_restore_stamps_new_and_replaced_outputs_without_redating_blobs() {
     let dir = tempfile::tempdir().unwrap();

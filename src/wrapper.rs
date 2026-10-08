@@ -2855,6 +2855,33 @@ fn apply_cc_post_publish_actions(published: &[(PathBuf, ArtifactKind)]) -> Resul
     Ok(())
 }
 
+/// All finalization happens after publication, so any failure must stop the
+/// caller from invoking the compiler over the restored outputs.
+fn finalize_cc_restore(
+    published: &[(PathBuf, ArtifactKind)],
+    parsed: &crate::compiler::cc::CcArgs,
+) -> Result<()> {
+    let finish = || -> Result<()> {
+        apply_cc_post_publish_actions(published)?;
+        #[cfg(unix)]
+        if parsed.mode == crate::compiler::cc::CompileMode::Link
+            && let Some(output) = parsed.object_output_path()
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&output)
+                .with_context(|| format!("cc restore: stat {}", output.display()))?
+                .permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&output, permissions)
+                .with_context(|| format!("cc restore: chmod +x {}", output.display()))?;
+        }
+        #[cfg(not(unix))]
+        let _ = parsed;
+        Ok(())
+    };
+    finish().context(PartialCcRestore)
+}
+
 fn publish_prepared_cc_artifacts(prepared: Vec<link::PreparedWritableTarget>) -> Result<()> {
     publish_prepared_cc_artifacts_with(prepared, |_, _| Ok(()))
 }
@@ -3026,20 +3053,7 @@ fn restore_cc_from_cache(
         published_kinds.push((target, kind));
     }
     publish_prepared_cc_artifacts(prepared)?;
-    apply_cc_post_publish_actions(&published_kinds).context(PartialCcRestore)?;
-    #[cfg(unix)]
-    if parsed.mode == crate::compiler::cc::CompileMode::Link
-        && let Some(output) = parsed.object_output_path()
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut permissions = std::fs::metadata(&output)
-            .with_context(|| format!("cc restore: stat {}", output.display()))?
-            .permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&output, permissions)
-            .with_context(|| format!("cc restore: chmod +x {}", output.display()))?;
-    }
-    Ok(())
+    finalize_cc_restore(&published_kinds, parsed)
 }
 
 /// After a local miss, ask the daemon for an exact remote entry.

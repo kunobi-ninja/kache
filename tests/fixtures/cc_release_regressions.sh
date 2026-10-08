@@ -89,14 +89,14 @@ MAKEFILE
   ;;
 1462)
   printf 'int f(void) { return 1; }\n' > a.c
-  target=()
+  compile=("$kache_binary" "$cc_binary")
   if "$cc_binary" --print-targets | grep -q wasm32; then
-    target=(--target=wasm32-wasip1)
+    compile+=(--target=wasm32-wasip1)
   fi
-  "$kache_binary" "$cc_binary" "${target[@]}" -c a.c -o a.wasm > first.log 2>&1
+  "${compile[@]}" -c a.c -o a.wasm > first.log 2>&1
   cp a.wasm expected.wasm
   rm a.wasm
-  "$kache_binary" "$cc_binary" "${target[@]}" -c a.c -o a.wasm > restored.log 2>&1
+  "${compile[@]}" -c a.c -o a.wasm > restored.log 2>&1
   cmp expected.wasm a.wasm || fail 'restored compile output differs'
   hit restored.log
   ;;

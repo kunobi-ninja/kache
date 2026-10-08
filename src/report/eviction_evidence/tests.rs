@@ -79,3 +79,28 @@ fn json_and_full_formats_include_limits_and_old_reports_deserialize() {
     let old: super::super::BuildReport = serde_json::from_value(old).unwrap();
     assert!(old.eviction_evidence.is_none());
 }
+
+#[test]
+fn distinct_cohorts_and_missing_cost_remain_visible() {
+    let mut evidence = EvictionHorizonEvidence::default();
+    evidence.live_shadow_agreed.mature = 2;
+    evidence.live_shadow_agreed.unknown_compile_cost = 1;
+    evidence.live_shadow_kept.immature = 3;
+    evidence.shadow_only.invalid = 4;
+    let report = EvictionEvidenceReport {
+        horizon_secs: 604800,
+        as_of_unix_secs: 900000,
+        limitations: vec![],
+        stores: vec![StoreEvidence {
+            store_index: 5,
+            evidence: Some(evidence),
+            error: None,
+        }],
+    };
+    let text = lines(&report).join("\n");
+    assert!(text.contains("Store 5 live/shadow agreed: 2 mature, 0 immature, 0 invalid"));
+    assert!(text.contains("Store 5 live/shadow kept: 0 mature, 3 immature, 0 invalid"));
+    assert!(text.contains("Store 5 shadow only: 0 mature, 0 immature, 4 invalid"));
+    assert!(text.contains("unknown cost 1"));
+    assert!(text.contains("0–0ms (unavailable)"));
+}

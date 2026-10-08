@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 const HORIZON_SECS: u64 = 604_800;
 const LIMITATIONS: &[&str] = &[
-    "All-store observations, independent of the build-event window and root filter.",
+    "All-store observations tagged with value-density shadow decisions, independent of the build-event window and root filter.",
     "Latest live eviction and first shadow-only sweep per key; repeated evictions overwrite history and cohorts can overlap.",
     "Immature and invalid observations are excluded from demand and cost totals. Retained rows are not a complete sweep history.",
     "Live demand counts first recorded post-eviction requests. Read-only clients and overwritten records can hide demand; absence of a stamp does not prove obsolescence.",

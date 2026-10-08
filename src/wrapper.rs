@@ -7807,9 +7807,6 @@ fn explain_miss_diff(
 /// out a backoff before trying again, since the wrapper that tries holds up
 /// its own compile (kunobi-ninja/kache#698).
 fn capture_build_report_context(config: &Config, args: &RustcArgs, root: &str, now: u64) {
-    if config.remote.is_none() {
-        return;
-    }
     let session_id = session_id_for_event(config, root, now);
     if session_id.is_empty()
         || crate::build_reports::context_path(&config.runtime_dir, &session_id, root).exists()

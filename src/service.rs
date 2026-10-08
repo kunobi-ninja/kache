@@ -997,7 +997,7 @@ pub fn status(json: bool) -> Result<()> {
     let daemon_stats = if running {
         config
             .as_ref()
-            .and_then(|cfg| crate::daemon::send_stats_request(cfg, false, None, None).ok())
+            .and_then(|cfg| crate::daemon::send_stats_request_without_restart(cfg, false).ok())
     } else {
         None
     };
@@ -1083,10 +1083,7 @@ pub fn status(json: bool) -> Result<()> {
 
     // 5. Daemon version check
     if let Some(stats) = daemon_stats.as_ref() {
-        let my_epoch = crate::daemon::build_epoch();
-        for line in
-            format_version_status(&stats.version, stats.build_epoch, crate::VERSION, my_epoch)
-        {
+        for line in format_version_status(&stats.version, crate::VERSION) {
             println!("{line}");
         }
         // The config file the DAEMON loaded (kunobi-ninja/kache#689) — not
@@ -1160,41 +1157,32 @@ fn format_service_line(
     }
 }
 
-/// Format the daemon version line(s) for `status`. Returns no lines when the
-/// daemon reported no version; a single green line when its build epoch matches
-/// the running binary; or a yellow mismatch line plus a pending-restart note
-/// otherwise. Pure (no I/O) so the branches are unit-testable without a daemon.
-fn format_version_status(
-    daemon_version: &str,
-    daemon_epoch: u64,
-    my_version: &str,
-    my_epoch: u64,
-) -> Vec<String> {
-    if daemon_version.is_empty() {
-        return Vec::new();
-    }
-    if daemon_epoch == my_epoch {
-        term::rows(&[(
-            "Version",
-            term::paint(
-                format!("v{daemon_version} (epoch {daemon_epoch})"),
+/// Report release differences without inferring an upgrade from file timestamps.
+fn format_version_status(daemon_version: &str, my_version: &str) -> Vec<String> {
+    let (label, style, note) =
+        match crate::daemon::compare_daemon_version(my_version, daemon_version) {
+            Some(std::cmp::Ordering::Equal) => (
+                format!("v{daemon_version}"),
                 term::Style::Success,
+                String::new(),
             ),
-            String::new(),
-        )])
-    } else {
-        term::rows(&[
-            (
-                "Version",
-                term::paint(
-                    format!("v{daemon_version} (epoch {daemon_epoch})"),
-                    term::Style::Warning,
-                ),
-                format!("binary is v{my_version} (epoch {my_epoch})"),
+            Some(std::cmp::Ordering::Greater) => (
+                format!("v{daemon_version}"),
+                term::Style::Warning,
+                format!("binary is v{my_version}; upgrade available"),
             ),
-            ("", String::new(), "auto-restart is pending".into()),
-        ])
-    }
+            Some(std::cmp::Ordering::Less) => (
+                format!("v{daemon_version}"),
+                term::Style::Success,
+                format!("binary is v{my_version}; newer daemon retained"),
+            ),
+            None => (
+                "unknown".into(),
+                term::Style::Warning,
+                "automatic upgrade disabled".into(),
+            ),
+        };
+    term::rows(&[("Version", term::paint(label, style), note)])
 }
 
 /// Extract the executable path from a service file.
@@ -1838,21 +1826,18 @@ WantedBy=default.target
     }
 
     #[test]
-    fn test_format_version_status_matched_mismatched_and_empty() {
-        // Empty version -> no lines.
-        assert!(format_version_status("", 0, "1.2.3", 0).is_empty());
-
-        // Matching epoch -> a single green "up to date" line.
-        let same = format_version_status("1.2.3", 42, "1.2.3", 42);
-        assert_eq!(same.len(), 1);
-        assert!(same[0].contains("v1.2.3 (epoch 42)"));
-
-        // Mismatched epoch -> a yellow mismatch line + a pending-restart note.
-        let diff = format_version_status("1.2.3", 10, "1.2.4", 99);
-        assert_eq!(diff.len(), 2);
-        assert!(diff[0].contains("v1.2.3 (epoch 10)"));
-        assert!(diff[0].contains("binary is v1.2.4 (epoch 99)"));
-        assert!(diff[1].contains("auto-restart is pending"));
+    fn version_status_reports_releases_without_pending_restart_claims() {
+        for (daemon, expected) in [
+            ("", "unknown"),
+            ("1.2.3+build.2", "v1.2.3+build.2"),
+            ("1.2.2", "upgrade available"),
+            ("1.3.0", "newer daemon retained"),
+        ] {
+            let lines = format_version_status(daemon, "1.2.3+build.1");
+            assert_eq!(lines.len(), 1);
+            assert!(lines[0].contains(expected), "{lines:?}");
+            assert!(!lines[0].contains("restart is pending"));
+        }
     }
 
     #[test]

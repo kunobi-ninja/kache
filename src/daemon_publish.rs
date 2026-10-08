@@ -71,9 +71,12 @@ pub(crate) struct HandoffFile {
 /// A wrapper's request that the daemon store a cc compile it has finished.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) struct PublishCcRequest {
-    /// Client binary mtime — lets the daemon detect when it's running stale code.
+    /// Legacy timestamp field; new clients send zero to avoid restarting old daemons.
     #[serde(default)]
     pub client_epoch: u64,
+    /// Release requesting an upgrade. Absent from legacy and read-only requests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_version: Option<String>,
     pub cache_key: String,
     pub crate_name: String,
     pub target: String,
@@ -482,7 +485,8 @@ fn enqueue_upload(daemon: &Arc<Daemon>, config: &Config, request: &PublishCcRequ
             .to_string_lossy()
             .into_owned(),
         crate_name: request.crate_name.clone(),
-        client_epoch: crate::daemon::build_epoch(),
+        client_epoch: 0,
+        client_version: Some(crate::VERSION.to_owned()),
     };
     let daemon = Arc::clone(daemon);
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
@@ -1011,6 +1015,7 @@ mod tests {
         let files = snapshot_for_handoff(config, &[(object, "a.o".to_string())]).unwrap();
         PublishCcRequest {
             client_epoch: 0,
+            client_version: None,
             cache_key: key.to_string(),
             crate_name: "a.c".to_string(),
             target: "x86_64".to_string(),
@@ -1228,7 +1233,8 @@ mod tests {
             })
         };
         let mut request = handoff_request(&config, &key("socket"), dir.path());
-        request.client_epoch = crate::daemon::build_epoch() + 1;
+        request.client_epoch = 0;
+        request.client_version = Some("999.0.0".into());
         let outcome = {
             let (config, request) = (config.clone(), request.clone());
             tokio::task::spawn_blocking(move || {
@@ -1703,6 +1709,7 @@ mod tests {
         let config = crate::test_support::test_config(dir.path().join("cache"));
         let request = PublishCcRequest {
             client_epoch: 0,
+            client_version: None,
             cache_key: "k".repeat(64),
             crate_name: "a.c".to_string(),
             target: String::new(),

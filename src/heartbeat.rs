@@ -155,6 +155,7 @@ fn monitor_loop(
             started_at_ms,
             typical_ms: None,
             client_epoch: 0,
+            client_version: None,
         },
     );
     run_ticks(ctx, crate_name, pid, started_at_ms, stop, wake_rx);
@@ -207,6 +208,7 @@ fn run_ticks(
                     started_at_ms,
                     typical_ms: typical.map(|s| s * 1000),
                     client_epoch: 0,
+                    client_version: None,
                 },
             );
         }

@@ -563,6 +563,7 @@ fn planned_candidates_upgrade_the_tracked_session_in_place() {
             ..Default::default()
         },
         client_epoch: 0,
+        client_version: None,
         session_id: "session".into(),
     };
     daemon.ensure_active_session(&req);
@@ -595,6 +596,7 @@ fn active_session_updates_in_place_and_summarizes_on_replacement() {
             ..Default::default()
         },
         client_epoch: 0,
+        client_version: None,
         session_id: session.to_string(),
     };
 
@@ -789,6 +791,7 @@ fn in_flight_registry_upserts_prunes_and_snapshots() {
         started_at_ms: now.saturating_sub(10_000),
         typical_ms: None,
         client_epoch: 0,
+        client_version: None,
     });
     // Upsert: the first-tick refresh with typical_ms replaces, not duplicates.
     daemon.handle_compile_started(CompileStartedRequest {
@@ -798,6 +801,7 @@ fn in_flight_registry_upserts_prunes_and_snapshots() {
         started_at_ms: now.saturating_sub(10_000),
         typical_ms: Some(471_000),
         client_epoch: 0,
+        client_version: None,
     });
     // An entry older than the max age is pruned even with a live pid
     // (PID reuse must not resurrect ghosts).
@@ -808,6 +812,7 @@ fn in_flight_registry_upserts_prunes_and_snapshots() {
         started_at_ms: now.saturating_sub(IN_FLIGHT_MAX_AGE_MS + 60_000),
         typical_ms: None,
         client_epoch: 0,
+        client_version: None,
     });
 
     let snapshot = daemon.in_flight_snapshot();
@@ -848,6 +853,7 @@ fn compile_started_wire_tags_and_stats_default() {
         started_at_ms: 2,
         typical_ms: None,
         client_epoch: 0,
+        client_version: None,
     });
     let wire = serde_json::to_string(&req).unwrap();
     assert!(wire.contains("\"compile_started\""), "{wire}");
@@ -1265,6 +1271,7 @@ async fn test_send_request_with_timeout_bounds_unresponsive_daemon() {
         event_hours: None,
         event_secs: None,
         client_epoch: 0,
+        client_version: None,
     });
     let client_socket_path = socket_path.clone();
     let started = Instant::now();
@@ -1536,17 +1543,23 @@ fn key_cache_periodic_refresh_disabled_truth_table() {
 }
 
 #[test]
-fn requests_that_carry_a_client_epoch_report_it() {
+fn requests_accept_legacy_epochs_and_report_optional_release_versions() {
     for line in [
         r#"{"upload":{"key":"k","entry_dir":"d","client_epoch":7}}"#,
         r#"{"stats":{"include_entries":false,"sort_by":null,"event_hours":null,"client_epoch":7}}"#,
         r#"{"build_started":{"client_epoch":7}}"#,
     ] {
         let request: Request = serde_json::from_str(line).unwrap();
-        assert_eq!(request.client_epoch(), 7, "{line}");
+        assert_eq!(request.client_version(), None, "{line}");
+        let mut value: serde_json::Value = serde_json::from_str(line).unwrap();
+        value.as_object_mut().unwrap().values_mut().next().unwrap()["client_version"] =
+            "1.2.3".into();
+        let request: Request = serde_json::from_value(value).unwrap();
+        assert_eq!(request.client_version(), Some("1.2.3"));
     }
     let publish = Request::PublishCc(Box::new(crate::daemon_publish::PublishCcRequest {
         client_epoch: 7,
+        client_version: None,
         cache_key: "k".to_string(),
         crate_name: "a.c".to_string(),
         target: "x86_64".to_string(),
@@ -1558,8 +1571,80 @@ fn requests_that_carry_a_client_epoch_report_it() {
         event: crate::events::BuildEvent::new_for_test("a.c", crate::events::EventResult::Miss),
         memo: None,
     }));
-    assert_eq!(publish.client_epoch(), 7);
-    assert_eq!(Request::Health.client_epoch(), 0);
+    assert_eq!(publish.client_version(), None);
+    assert_eq!(Request::Health.client_version(), None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn request_release_controls_drain_and_legacy_timestamps_do_not() {
+    for (version, should_drain) in [
+        (None, false),
+        (Some(VERSION.to_owned()), false),
+        (Some(format!("{VERSION}+rebuilt")), false),
+        (Some("0.0.1".into()), false),
+        (Some("legacy".into()), false),
+        (Some("999.0.0".into()), true),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let daemon = Arc::new(Daemon::new(config.clone()));
+        let lifecycle = Arc::new(Lifecycle::default());
+        let listener = bind_listener(&config.socket_path());
+        let (serving, control) = (daemon.clone(), lifecycle.clone());
+        let server = tokio::spawn(async move {
+            let stream = listener.accept().await.unwrap();
+            handle_connection(stream, &serving, &control).await.unwrap();
+        });
+        let response = client_roundtrip(
+            &config.socket_path(),
+            &Request::CompileStarted(CompileStartedRequest {
+                crate_name: "release-test".into(),
+                root: String::new(),
+                pid: 1234,
+                started_at_ms: 1,
+                typical_ms: None,
+                client_epoch: u64::MAX,
+                client_version: version.clone(),
+            }),
+        )
+        .await;
+        server.await.unwrap();
+        assert!(response.ok, "{response:?}");
+        assert_eq!(!lifecycle.accepting_calls(), should_drain, "{version:?}");
+        assert_eq!(
+            daemon.in_flight_compiles.lock().unwrap().len(),
+            1,
+            "accepted work must survive"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn diagnostic_stats_send_no_upgrade_metadata_to_legacy_daemons() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let listener = bind_listener(&config.socket_path());
+    let server = tokio::spawn(async move {
+        let stream = listener.accept().await.unwrap();
+        let mut line = String::new();
+        BufReader::new(&stream).read_line(&mut line).await.unwrap();
+        let value: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(value["stats"]["client_epoch"], 0);
+        assert!(value["stats"].get("client_version").is_none());
+        let response = Response {
+            stats: Some(stats_at_version("0.0.1")),
+            ..Response::ok()
+        };
+        let line = format!("{}\n", serde_json::to_string(&response).unwrap());
+        (&stream).write_all(line.as_bytes()).await.unwrap();
+    });
+    let stats =
+        tokio::task::spawn_blocking(move || send_stats_request_without_restart(&config, false))
+            .await
+            .unwrap()
+            .unwrap();
+    server.await.unwrap();
+    assert_eq!(stats.version, "0.0.1");
 }
 
 #[test]
@@ -1631,6 +1716,7 @@ async fn server_main_binds_socket_and_handles_shutdown() {
         &Request::BuildStarted(BuildStartedRequest {
             intent: kache_core::BuildIntent::default(),
             client_epoch: 0,
+            client_version: None,
             session_id: "binary-drain-session".into(),
         }),
     )
@@ -1677,6 +1763,7 @@ fn test_request_upload_serde() {
         entry_dir: "/tmp/store/abc123".into(),
         crate_name: String::new(),
         client_epoch: 0,
+        client_version: None,
     });
     let json = serde_json::to_string(&req).unwrap();
     let parsed: Request = serde_json::from_str(&json).unwrap();
@@ -1717,12 +1804,32 @@ async fn readiness_requires_a_successful_compatible_health_response() {
         (
             Response {
                 health: Some(DaemonHealth {
-                    version: "old".into(),
+                    version: "0.0.1".into(),
                     build_epoch: 1,
                 }),
                 ..Response::ok()
             },
             false,
+        ),
+        (
+            Response {
+                health: Some(DaemonHealth {
+                    version: String::new(),
+                    build_epoch: 1,
+                }),
+                ..Response::ok()
+            },
+            true,
+        ),
+        (
+            Response {
+                health: Some(DaemonHealth {
+                    version: "999.0.0".into(),
+                    build_epoch: 1,
+                }),
+                ..Response::ok()
+            },
+            true,
         ),
     ] {
         let dir = tempfile::tempdir().unwrap();
@@ -1823,13 +1930,29 @@ fn key_prefix_is_multibyte_safe() {
 }
 
 #[test]
-fn client_epoch_comparison_ignores_zero_and_detects_newer() {
-    // Branch: stale-daemon epoch predicate.
-    assert!(!client_epoch_is_newer(0, 10));
-    assert!(!client_epoch_is_newer(10, 0));
-    assert!(!client_epoch_is_newer(10, 10));
-    assert!(!client_epoch_is_newer(9, 10));
-    assert!(client_epoch_is_newer(11, 10));
+fn release_precedence_ignores_build_metadata_and_unknown_versions() {
+    for (client, daemon, newer) in [
+        ("1.0.0", "0.9.0", true),
+        ("1.0.1", "1.0.0", true),
+        ("1.0.0", "1.0.0-rc.1", true),
+        ("1.0.0-rc.2", "1.0.0-rc.1", true),
+        ("1.0.0+new", "1.0.0+old", false),
+        ("1.0.0-rc.1", "1.0.0", false),
+        ("1.0.0", "2.0.0", false),
+        ("1.0.0", "", false),
+        ("legacy", "1.0.0", false),
+        ("1.0.0", "legacy", false),
+    ] {
+        assert_eq!(
+            client_version_is_newer(client, daemon),
+            newer,
+            "{client} vs {daemon}"
+        );
+    }
+    assert_eq!(
+        serde_json::from_str::<DaemonHealth>("{}").unwrap().version,
+        ""
+    );
 }
 
 #[test]
@@ -3641,6 +3764,7 @@ fn test_handle_request_sync_rejects_upload() {
         entry_dir: "/tmp".into(),
         crate_name: String::new(),
         client_epoch: 0,
+        client_version: None,
     });
     let resp = daemon.handle_request_sync(&req);
     assert!(!resp.ok);
@@ -3676,6 +3800,7 @@ async fn test_handle_upload_no_remote() {
         entry_dir: "/tmp".into(),
         crate_name: "serde".into(),
         client_epoch: 0,
+        client_version: None,
     };
     let resp = daemon.handle_upload(&job).await;
     assert!(!resp.ok);
@@ -3716,6 +3841,7 @@ async fn test_handle_upload_remote_readonly() {
         entry_dir: "/tmp".into(),
         crate_name: "serde".into(),
         client_epoch: 0,
+        client_version: None,
     };
     let resp = daemon.handle_upload(&job).await;
     assert!(resp.ok);
@@ -3982,6 +4108,7 @@ fn test_stats_request_serde() {
         event_hours: Some(48),
         event_secs: None,
         client_epoch: 0,
+        client_version: None,
     });
     let json = serde_json::to_string(&req).unwrap();
     let parsed: Request = serde_json::from_str(&json).unwrap();
@@ -4204,6 +4331,7 @@ fn handle_stats_filters_on_event_secs_over_event_hours() {
         event_hours,
         event_secs,
         client_epoch: 0,
+        client_version: None,
     };
 
     let narrow = daemon
@@ -4234,6 +4362,7 @@ fn stats_request_window_prefers_secs_then_hours_then_default() {
         event_hours,
         event_secs,
         client_epoch: 0,
+        client_version: None,
     };
     assert_eq!(request(Some(24), Some(900)).window().secs(), 900);
     assert_eq!(request(Some(2), None).window().secs(), 7200);
@@ -4268,6 +4397,7 @@ fn test_handle_stats_empty_store() {
         event_hours: Some(24),
         event_secs: None,
         client_epoch: 0,
+        client_version: None,
     });
     assert!(resp.ok);
     let stats = resp.stats.unwrap();
@@ -4306,6 +4436,7 @@ fn test_handle_stats_empty_store() {
         event_hours: Some(24),
         event_secs: None,
         client_epoch: 0,
+        client_version: None,
     });
     let ids = with_summaries
         .stats
@@ -4506,6 +4637,7 @@ fn test_handle_stats_with_store_entries() {
         event_hours: Some(24),
         event_secs: None,
         client_epoch: 0,
+        client_version: None,
     });
     assert!(resp.ok);
     let stats = resp.stats.unwrap();
@@ -4530,6 +4662,7 @@ fn test_handle_request_sync_dispatches_stats() {
         event_hours: None,
         event_secs: None,
         client_epoch: 0,
+        client_version: None,
     });
     let resp = daemon.handle_request_sync(&req);
     assert!(resp.ok);
@@ -4537,12 +4670,11 @@ fn test_handle_request_sync_dispatches_stats() {
 }
 
 #[test]
-fn readiness_reply_requires_success_and_identity() {
+fn readiness_reply_requires_success_but_allows_missing_release_metadata() {
     for response in [
         "",
         r#"{"ok":false,"health":{"version":"v1","build_epoch":7}}"#,
         r#"{"ok":true}"#,
-        r#"{"ok":true,"health":{"version":"v1"}}"#,
     ] {
         assert!(parse_daemon_health(response).is_err(), "{response}");
     }
@@ -4553,6 +4685,12 @@ fn readiness_reply_requires_success_and_identity() {
             build_epoch: 7
         }
     );
+    for response in [
+        r#"{"ok":true,"health":{}}"#,
+        r#"{"ok":true,"health":{"version":"v1"}}"#,
+    ] {
+        assert_eq!(parse_daemon_health(response).unwrap().build_epoch, 0);
+    }
     assert_eq!(
         serde_json::to_string(&Request::Health).unwrap(),
         r#""health""#
@@ -4594,7 +4732,7 @@ async fn readiness_roundtrip_does_not_wait_for_the_store() {
         .unwrap()
         .unwrap();
     assert_eq!(health.version, VERSION);
-    assert_eq!(health.build_epoch, build_epoch());
+    assert_eq!(health.build_epoch, 0);
     assert_eq!(
         daemon.handle_request_sync(&Request::Health).health,
         Some(health)
@@ -4639,10 +4777,10 @@ fn daemon_runtime_exits_while_aborted_maintenance_is_blocked() {
     run_daemon_runtime(runtime, async { Ok(()) }).unwrap();
 }
 
-fn stats_at_epoch(epoch: u64) -> StatsResponse {
+fn stats_at_version(version: &str) -> StatsResponse {
     serde_json::from_value(serde_json::json!({
         "total_size": 0, "max_size": 0, "entry_count": 0,
-        "entries": null, "build_epoch": epoch,
+        "entries": null, "version": version, "build_epoch": 999,
         "events": { "local_hits": 0, "remote_hits": 0, "misses": 0, "errors": 0,
                     "total_elapsed_ms": 0 }
     }))
@@ -4650,14 +4788,20 @@ fn stats_at_epoch(epoch: u64) -> StatsResponse {
 }
 
 #[test]
-fn stats_refresh_preserves_current_or_unknown_epoch_without_restart() {
-    for (client, daemon) in [(20, 20), (20, 21), (0, 10), (20, 0)] {
-        let stats = stats_at_epoch(daemon);
+fn stats_refresh_preserves_current_or_unknown_release_without_restart() {
+    for (client, daemon) in [
+        ("2.0.0", "2.0.0+rebuild"),
+        ("2.0.0", "2.1.0"),
+        ("", "1.0.0"),
+        ("2.0.0", ""),
+        ("2.0.0", "legacy"),
+    ] {
+        let stats = stats_at_version(daemon);
         assert_eq!(
             refresh_stale_response(
                 stats.clone(),
                 client,
-                |stats| stats.build_epoch,
+                |stats| &stats.version,
                 || panic!("current daemon must not restart"),
                 || panic!("current daemon must not refetch"),
             )
@@ -4669,12 +4813,12 @@ fn stats_refresh_preserves_current_or_unknown_epoch_without_restart() {
 
 #[test]
 fn stats_refresh_returns_only_the_replacement_response() {
-    let fresh = stats_at_epoch(20);
+    let fresh = stats_at_version("2.0.0");
     let mut restarted = false;
     let result = refresh_stale_response(
-        stats_at_epoch(10),
-        20,
-        |stats| stats.build_epoch,
+        stats_at_version("1.0.0"),
+        "2.0.0",
+        |stats| &stats.version,
         || {
             restarted = true;
             Ok(true)
@@ -4690,9 +4834,9 @@ fn stats_refresh_returns_only_the_replacement_response() {
 fn stats_refresh_rejects_failed_restart_without_refetch() {
     for restart in [Ok(false), Err(anyhow::anyhow!("spawn failed"))] {
         let error = refresh_stale_response(
-            stats_at_epoch(10),
-            20,
-            |stats| stats.build_epoch,
+            stats_at_version("1.0.0"),
+            "2.0.0",
+            |stats| &stats.version,
             || restart,
             || panic!("failed restart must not refetch"),
         )
@@ -4707,9 +4851,9 @@ fn stats_refresh_rejects_failed_restart_without_refetch() {
 #[test]
 fn stats_refresh_rejects_missing_or_still_stale_replacement() {
     let error = refresh_stale_response(
-        stats_at_epoch(10),
-        20,
-        |stats| stats.build_epoch,
+        stats_at_version("1.0.0"),
+        "2.0.0",
+        |stats| &stats.version,
         || Ok(true),
         || Err(anyhow::anyhow!("socket closed")),
     )
@@ -4719,16 +4863,16 @@ fn stats_refresh_rejects_missing_or_still_stale_replacement() {
         "reading replacement daemon response: socket closed"
     );
     let error = refresh_stale_response(
-        stats_at_epoch(10),
-        20,
-        |stats| stats.build_epoch,
+        stats_at_version("1.0.0"),
+        "2.0.0",
+        |stats| &stats.version,
         || Ok(true),
-        || Ok(stats_at_epoch(10)),
+        || Ok(stats_at_version("1.0.0")),
     )
     .unwrap_err();
     assert_eq!(
         error.to_string(),
-        "replacement daemon is still older than this client"
+        "replacement daemon did not report the required release version"
     );
 }
 
@@ -4760,6 +4904,7 @@ async fn test_socket_stats_roundtrip() {
             event_hours: Some(24),
             event_secs: None,
             client_epoch: 0,
+            client_version: None,
         }),
     )
     .await;
@@ -4960,6 +5105,7 @@ async fn test_socket_build_started_roundtrip_without_remote() {
                 lock_path: None,
             },
             client_epoch: 0,
+            client_version: None,
             session_id: String::new(),
         }),
     )
@@ -5065,6 +5211,7 @@ async fn test_socket_stats_roundtrip_with_populated_store() {
             event_hours: Some(24),
             event_secs: None,
             client_epoch: 0,
+            client_version: None,
         }),
     )
     .await;
@@ -5114,6 +5261,8 @@ async fn test_send_stats_request_client_roundtrip() {
     server.await.unwrap();
 
     assert_eq!(stats.entry_count, 1);
+    assert_eq!(stats.build_epoch, 0);
+    assert_eq!(stats.version, VERSION);
     assert_eq!(stats.entries.unwrap()[0].crate_name, "serde");
 }
 
@@ -5165,6 +5314,7 @@ async fn test_send_gc_request_rejects_old_daemon_before_mutation() {
         event_hours: None,
         event_secs: None,
         client_epoch: build_epoch(),
+        client_version: None,
     });
     let mut response_value = serde_json::to_value(response).unwrap();
     response_value
@@ -6004,6 +6154,7 @@ async fn test_do_upload_skips_when_entry_already_in_remote() {
             entry_dir: dir.path().join("entry").to_string_lossy().into_owned(),
             crate_name: "serde".into(),
             client_epoch: 0,
+            client_version: None,
         })
         .await;
 
@@ -6040,6 +6191,7 @@ async fn test_do_upload_uploads_when_not_in_remote_records_v3_transfer_timestamp
             entry_dir: entry_dir.to_string_lossy().into_owned(),
             crate_name: "serde".into(),
             client_epoch: 0,
+            client_version: None,
         })
         .await;
 
@@ -6084,6 +6236,7 @@ async fn test_do_upload_failure_records_v3_transfer_timestamps() {
             entry_dir: entry_dir.to_string_lossy().into_owned(),
             crate_name: "serde".into(),
             client_epoch: 0,
+            client_version: None,
         })
         .await;
 
@@ -6125,6 +6278,7 @@ async fn test_handle_build_started_falls_back_to_local_planning() {
             lock_path: None,
         },
         client_epoch: 0,
+        client_version: None,
         session_id: "cold-session".into(),
     };
     let resp = daemon.handle_build_started(&req).await;
@@ -9100,6 +9254,7 @@ async fn shutdown_prefetch_finalizes_a_short_session_without_waiting_for_inactiv
     daemon.ensure_active_session(&BuildStartedRequest {
         intent: kache_core::BuildIntent::default(),
         client_epoch: 0,
+        client_version: None,
         session_id: "short-session".into(),
     });
     daemon.finalize_inactive_plan(300_000);
@@ -9193,6 +9348,7 @@ fn shutdown_prefetch_rejects_new_sessions_and_empty_session_ids() {
         daemon.ensure_active_session(&BuildStartedRequest {
             intent: kache_core::BuildIntent::default(),
             client_epoch: 0,
+            client_version: None,
             session_id: session.into(),
         });
         assert!(daemon.active_plan.lock().unwrap().is_none());
@@ -9201,6 +9357,7 @@ fn shutdown_prefetch_rejects_new_sessions_and_empty_session_ids() {
     daemon.ensure_active_session(&BuildStartedRequest {
         intent: kache_core::BuildIntent::default(),
         client_epoch: 0,
+        client_version: None,
         session_id: "too-late".into(),
     });
     assert!(daemon.active_plan.lock().unwrap().is_none());
@@ -10768,6 +10925,7 @@ async fn test_do_upload_suppressed_while_degraded() {
         entry_dir: dir.path().join("entry").to_string_lossy().into_owned(),
         crate_name: "serde".into(),
         client_epoch: 0,
+        client_version: None,
     };
     seed_store_entry(&daemon.config, &job.key, "serde", dir.path());
     let durable_job = persist_upload_job(&daemon.config, &job).unwrap();
@@ -11271,6 +11429,7 @@ async fn test_handle_upload_with_queue_returns_immediately() {
         entry_dir: "/tmp/test".into(),
         crate_name: "serde".into(),
         client_epoch: 0,
+        client_version: None,
     };
     seed_store_entry(&daemon.config, &job.key, "serde", dir.path());
 
@@ -11302,6 +11461,7 @@ async fn test_handle_upload_queue_closed() {
         entry_dir: "/tmp/test".into(),
         crate_name: "serde".into(),
         client_epoch: 0,
+        client_version: None,
     };
     seed_store_entry(&daemon.config, &job.key, "serde", dir.path());
     let resp = queued_upload_response(&daemon, &job).await;
@@ -11324,6 +11484,7 @@ async fn test_handle_upload_dedup() {
         entry_dir: "/tmp/test".into(),
         crate_name: "serde".into(),
         client_epoch: 0,
+        client_version: None,
     };
     seed_store_entry(&daemon.config, &job.key, "serde", dir.path());
 
@@ -11392,6 +11553,7 @@ async fn test_handle_upload_after_queue_close_rejects_without_direct_upload() {
         entry_dir: "/tmp/test".into(),
         crate_name: "serde".into(),
         client_epoch: 0,
+        client_version: None,
     };
     seed_store_entry(&daemon.config, &job.key, "serde", dir.path());
     let resp = daemon.handle_upload(&job).await;
@@ -11445,6 +11607,7 @@ fn upload_spool_paths_and_normalization_are_config_derived() {
             entry_dir: "/untrusted/client/path".into(),
             crate_name: "serde".into(),
             client_epoch: 17,
+            client_version: None,
         },
     )
     .unwrap();
@@ -11468,6 +11631,7 @@ fn upload_job_normalization_rejects_each_untrusted_component() {
             entry_dir: "/ignored".into(),
             crate_name: "serde".into(),
             client_epoch: 0,
+            client_version: None,
         },
     )
     .unwrap_err();
@@ -11480,6 +11644,7 @@ fn upload_job_normalization_rejects_each_untrusted_component() {
             entry_dir: "/ignored".into(),
             crate_name: "../serde".into(),
             client_epoch: 0,
+            client_version: None,
         },
     )
     .unwrap_err();
@@ -11509,6 +11674,7 @@ fn existing_upload_intent_accepts_the_exact_size_limit_only() {
         entry_dir: "/hostile/serialized/path".into(),
         crate_name: "serde".into(),
         client_epoch: 23,
+        client_version: None,
     };
     let mut exact = serde_json::to_vec(&job).unwrap();
     assert!(exact.len() < UPLOAD_SPOOL_MAX_BYTES as usize);
@@ -11647,6 +11813,7 @@ fn upload_intent_loading_filters_each_invalid_shape_and_normalizes_paths() {
         entry_dir: "/hostile/replayed/path".into(),
         crate_name: "serde".into(),
         client_epoch: 31,
+        client_version: None,
     };
     let mut exact_bytes = serde_json::to_vec(&exact_job).unwrap();
     exact_bytes.resize(UPLOAD_SPOOL_MAX_BYTES as usize, b' ');
@@ -11658,6 +11825,7 @@ fn upload_intent_loading_filters_each_invalid_shape_and_normalizes_paths() {
         entry_dir: "/ignored".into(),
         crate_name: "serde".into(),
         client_epoch: 0,
+        client_version: None,
     };
     let mut oversized_bytes = serde_json::to_vec(&oversized_job).unwrap();
     oversized_bytes.resize(UPLOAD_SPOOL_MAX_BYTES as usize + 1, b' ');
@@ -11672,6 +11840,7 @@ fn upload_intent_loading_filters_each_invalid_shape_and_normalizes_paths() {
         entry_dir: "/ignored".into(),
         crate_name: "serde".into(),
         client_epoch: 0,
+        client_version: None,
     };
     fs::write(
         upload_spool_path(&config, &mismatched_file_key),
@@ -11685,6 +11854,7 @@ fn upload_intent_loading_filters_each_invalid_shape_and_normalizes_paths() {
         entry_dir: "/ignored".into(),
         crate_name: "../serde".into(),
         client_epoch: 0,
+        client_version: None,
     };
     fs::write(
         upload_spool_path(&config, &invalid_crate_key),
@@ -11715,6 +11885,7 @@ fn durable_upload_intent_replays_after_restart_and_normalizes_paths() {
         entry_dir: "/untrusted/client/path".into(),
         crate_name: "serde".into(),
         client_epoch: 7,
+        client_version: None,
     };
     seed_store_entry(&config, &key, "serde", dir.path());
 
@@ -11745,6 +11916,7 @@ fn duplicate_upload_intent_persistence_reuses_one_valid_create_only_winner() {
         entry_dir: "/wrapper/path".into(),
         crate_name: "serde".into(),
         client_epoch: 7,
+        client_version: Some("1.0.0".into()),
     };
     let first = persist_upload_job(&config, &first_job).unwrap();
     let path = upload_spool_path(&config, &key);
@@ -11752,12 +11924,13 @@ fn duplicate_upload_intent_persistence_reuses_one_valid_create_only_winner() {
 
     // Models the daemon persisting the wrapper's already-durable request.
     // Durable bytes keep the first winner, while the live return carries
-    // the current caller epoch needed for stale-daemon replacement.
+    // the current caller release needed for daemon replacement.
     let second = persist_upload_job(
         &config,
         &UploadJob {
             entry_dir: "/daemon/path".into(),
             client_epoch: 99,
+            client_version: Some("2.0.0".into()),
             ..first_job
         },
     )
@@ -11766,6 +11939,7 @@ fn duplicate_upload_intent_persistence_reuses_one_valid_create_only_winner() {
     assert_eq!(second.entry_dir, first.entry_dir);
     assert_eq!(second.crate_name, first.crate_name);
     assert_eq!(second.client_epoch, 99);
+    assert_eq!(second.client_version.as_deref(), Some("2.0.0"));
     assert_eq!(fs::read(&path).unwrap(), first_bytes);
     assert_eq!(fs::read_dir(config.upload_spool_dir()).unwrap().count(), 1);
     assert_eq!(load_upload_jobs(&config).unwrap(), vec![first]);
@@ -11783,6 +11957,7 @@ fn first_upload_intent_requires_a_committed_local_payload() {
             entry_dir: "/missing".into(),
             crate_name: "serde".into(),
             client_epoch: 0,
+            client_version: None,
         },
     )
     .unwrap_err();
@@ -11804,6 +11979,7 @@ fn first_upload_intent_publication_serializes_with_gc_in_both_orders() {
         entry_dir: "/ignored".into(),
         crate_name: "serde".into(),
         client_epoch: 0,
+        client_version: None,
     };
     let path = upload_spool_path(&config, &key);
     let publisher_config = config.clone();
@@ -11851,6 +12027,7 @@ async fn upload_pipeline_drain_deadline_includes_a_blocked_enqueue_task() {
         entry_dir: "/unused".into(),
         crate_name: "serde".into(),
         client_epoch: 0,
+        client_version: None,
     };
     let (worker_tx, _worker_rx) = tokio::sync::mpsc::channel::<UploadJob>(1);
     worker_tx.send(job.clone()).await.unwrap();
@@ -11990,6 +12167,7 @@ fn test_build_started_request_serde() {
             lock_path: None,
         },
         client_epoch: 0,
+        client_version: None,
         session_id: String::new(),
     });
     let json = serde_json::to_string(&req).unwrap();
@@ -12007,6 +12185,7 @@ fn test_build_started_request_empty_serde() {
     let req = Request::BuildStarted(BuildStartedRequest {
         intent: kache_core::BuildIntent::default(),
         client_epoch: 0,
+        client_version: None,
         session_id: String::new(),
     });
     let json = serde_json::to_string(&req).unwrap();
@@ -12042,6 +12221,7 @@ async fn test_send_build_started_client_roundtrip() {
                     ..Default::default()
                 },
                 client_epoch: 0,
+                client_version: None,
                 session_id: String::new(),
             },
         )
@@ -12192,6 +12372,7 @@ async fn test_handle_build_started_no_remote() {
             ..Default::default()
         },
         client_epoch: 0,
+        client_version: None,
         session_id: String::new(),
     };
     let resp = daemon.handle_build_started(&req).await;
@@ -12219,6 +12400,7 @@ async fn test_handle_build_started_prefetch_disabled_is_a_no_op() {
                 ..Default::default()
             },
             client_epoch: 0,
+            client_version: None,
             session_id: "disabled-prefetch".into(),
         })
         .await;
@@ -12279,6 +12461,7 @@ async fn do_nothing_cancels_identity_resolution_started_with_planner_lookup() {
             ..Default::default()
         },
         client_epoch: 0,
+        client_version: None,
         session_id: "do-nothing".into(),
     };
 
@@ -12345,6 +12528,7 @@ async fn execute_cancels_pending_identity_before_artifact_prefetch_runs() {
             ..Default::default()
         },
         client_epoch: 0,
+        client_version: None,
         session_id: "execute".into(),
     };
 
@@ -12436,6 +12620,7 @@ async fn execute_failure_retries_cancelled_identity_through_ordinary_fallback() 
             ..Default::default()
         },
         client_epoch: 0,
+        client_version: None,
         session_id: "execute-failure".into(),
     };
     let executor_backend = backend.clone();
@@ -12511,6 +12696,7 @@ async fn speculative_identity_does_not_consume_half_open_read_probe() {
             ..Default::default()
         },
         client_epoch: 0,
+        client_version: None,
         session_id: "half-open-do-nothing".into(),
     };
 
@@ -12596,6 +12782,7 @@ async fn aborting_build_started_cancels_identity_lookup_and_releases_permit() {
             ..Default::default()
         },
         client_epoch: 0,
+        client_version: None,
         session_id: "cancelled-handler".into(),
     };
 
@@ -12691,6 +12878,7 @@ async fn planner_selected_fallback_uses_reserve_while_lookahead_is_saturated() {
             &BuildStartedRequest {
                 intent: intent.clone(),
                 client_epoch: 0,
+                client_version: None,
                 session_id: "reserved-fallback".into(),
             },
             async {
@@ -13116,6 +13304,7 @@ async fn identity_first_handler_fallback_reuses_manifest_candidates() {
             ..Default::default()
         },
         client_epoch: 0,
+        client_version: None,
         session_id: "identity-first-fallback".into(),
     };
 
@@ -13156,6 +13345,7 @@ fn test_handle_request_sync_rejects_build_started() {
             ..Default::default()
         },
         client_epoch: 0,
+        client_version: None,
         session_id: String::new(),
     });
     let resp = daemon.handle_request_sync(&req);
@@ -13612,6 +13802,7 @@ async fn a_permanently_failed_upload_retires_its_intent_so_gc_holds_the_size_lim
             entry_dir: String::new(),
             crate_name: "serde".into(),
             client_epoch: 0,
+            client_version: None,
         },
     )
     .unwrap();
@@ -13657,6 +13848,7 @@ async fn enqueue_republishes_an_intent_retired_after_initial_persistence() {
             entry_dir: String::new(),
             crate_name: "serde".into(),
             client_epoch: 0,
+            client_version: None,
         },
     )
     .unwrap();
@@ -13696,6 +13888,7 @@ async fn enqueue_refuses_a_retired_intent_if_gc_has_removed_the_entry() {
             entry_dir: String::new(),
             crate_name: "serde".into(),
             client_epoch: 0,
+            client_version: None,
         },
     )
     .unwrap();
@@ -13730,6 +13923,7 @@ async fn upload_retirement_waits_for_the_enqueue_guard() {
             entry_dir: String::new(),
             crate_name: "serde".into(),
             client_epoch: 0,
+            client_version: None,
         },
     )
     .unwrap();
@@ -13770,6 +13964,7 @@ async fn a_slow_upload_retirement_flush_does_not_block_other_uploads() {
                     entry_dir: String::new(),
                     crate_name: "serde".into(),
                     client_epoch: 0,
+                    client_version: None,
                 },
             )
             .unwrap(),
@@ -13916,6 +14111,7 @@ async fn retried_upload_keeps_its_intent_until_cancellation_or_a_terminal_outcom
                 entry_dir: String::new(),
                 crate_name: "serde".into(),
                 client_epoch: 0,
+                client_version: None,
             },
         )
         .unwrap();

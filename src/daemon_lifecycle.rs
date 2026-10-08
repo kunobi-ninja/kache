@@ -70,7 +70,7 @@ pub(super) fn current(config: &Config, deadline: Instant) -> Result<Option<Daemo
 fn observe(config: &Config, deadline: Instant) -> Result<ObservedOwner> {
     match lifecycle_control::health(config, deadline) {
         Ok(Some(health)) => {
-            if client_epoch_is_newer(build_epoch(), health.revision) {
+            if client_version_is_newer(VERSION, &health.build) {
                 return Ok(ObservedOwner::AbsentOrOutdated);
             }
             return Ok(if health.ready && !health.draining {
@@ -91,15 +91,11 @@ fn observe(config: &Config, deadline: Instant) -> Result<ObservedOwner> {
         Err(error) => return Err(error),
     }
     // This legacy record plus a held lock permits waiting, never claiming ready.
-    Ok(
-        if starting_daemon_epoch(config)
-            .is_some_and(|epoch| !client_epoch_is_newer(build_epoch(), epoch))
-        {
-            ObservedOwner::Pending
-        } else {
-            ObservedOwner::AbsentOrOutdated
-        },
-    )
+    Ok(if starting_daemon_epoch(config).is_some() {
+        ObservedOwner::Pending
+    } else {
+        ObservedOwner::AbsentOrOutdated
+    })
 }
 
 pub(super) fn current_socket(socket: &Path, deadline: Instant) -> Result<Option<DaemonHealth>> {
@@ -120,7 +116,7 @@ pub(super) fn current_socket(socket: &Path, deadline: Instant) -> Result<Option<
     let Some(health) = response.health.filter(|_| response.ok) else {
         return Ok(None);
     };
-    Ok((!client_epoch_is_newer(build_epoch(), health.build_epoch)).then_some(health))
+    Ok((!client_version_is_newer(VERSION, &health.version)).then_some(health))
 }
 
 struct KacheReplacement<'a> {

@@ -4483,7 +4483,8 @@ fn hand_off_cc_store(
     );
     drop(trace_event);
     let request = PublishCcRequest {
-        client_epoch: crate::daemon::build_epoch(),
+        client_epoch: 0,
+        client_version: Some(crate::VERSION.to_owned()),
         cache_key: handoff.cache_key.to_string(),
         crate_name: handoff.crate_name.to_string(),
         target: handoff.target.to_string(),
@@ -7809,11 +7810,7 @@ fn maybe_trigger_prefetch_with(
 
     crate::daemon::send_build_started(
         config,
-        crate::build_intent::into_build_started_request(
-            build_intent,
-            crate::daemon::build_epoch(),
-            session_id.clone(),
-        ),
+        crate::build_intent::into_build_started_request(build_intent, session_id.clone()),
     );
     write_locked_marker(&lock_file, &session_id);
     PrefetchTrigger::Sent

@@ -42,7 +42,11 @@ On current macOS releases, the first connection to a LAN cache endpoint may ask 
 
 ## Updates and config changes
 
-The daemon records the running binary's build epoch. A newer client asks an older daemon to drain and exit. The service manager restarts installed services; otherwise later background work starts a fresh daemon.
+Kache compares semantic release versions when deciding whether to replace a daemon. A client from a newer release can request a drain and replacement. Rebuilding or copying the same release does not request an upgrade. Build metadata such as `+local` does not affect release precedence. An older client keeps a newer daemon running.
+
+Legacy clients and daemons can omit release metadata. Missing or invalid versions disable automatic replacement; timestamps do not establish release order. New clients send zero in the legacy timestamp field, and new daemons report zero there, so older peers cannot mistake a copy or rebuild for an upgrade. Protocol and cache-format checks still apply.
+
+`kache doctor` reads daemon stats without requesting a drain. Use `kache doctor --fix` to replace a daemon from an older release. Use `kache daemon restart` to load a local rebuild with the same version, or to replace a daemon whose release cannot be determined.
 
 The daemon also fingerprints the active config file and restarts after it changes. `kache daemon start` and automatic starts drop the remote settings from the environment (`KACHE_S3_BUCKET`, `KACHE_S3_ENDPOINT`, `KACHE_S3_REGION`, `KACHE_S3_PREFIX`, `KACHE_S3_PROFILE`, `KACHE_S3_USER_AGENT`, `KACHE_LOCAL_ONLY`, `KACHE_REMOTE_READONLY`), so set these in the config file. Other environment is fixed when the process starts. An installed service uses its stored environment. To try remote variables from a shell, run `kache daemon run` in the foreground.
 

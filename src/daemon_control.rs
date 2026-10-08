@@ -76,12 +76,7 @@ pub(super) async fn serve(config: &Config, lifecycle: Arc<Lifecycle>) -> Result<
         .await?
         .context("control endpoint already owned")?;
     let socket = SocketCleanupGuard::new(&path)?;
-    let service = Arc::new(ControlService::new(
-        lifecycle,
-        0,
-        VERSION.into(),
-        build_epoch(),
-    ));
+    let service = Arc::new(ControlService::new(lifecycle, 0, VERSION.into(), 0));
     let offer = offer(config)?;
     let handler = Arc::clone(&service);
     let stop = Arc::new(Notify::new());
@@ -287,7 +282,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(health.version, VERSION);
-        assert_eq!(health.build_epoch, build_epoch());
+        assert_eq!(health.build_epoch, 0);
         let pending = lifecycle.begin().unwrap();
         assert!(
             query(&config, operation::HEALTH)

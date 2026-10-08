@@ -9452,11 +9452,6 @@ impl std::fmt::Display for DaemonConnectionFailure {
 
 impl std::error::Error for DaemonConnectionFailure {}
 
-/// Send a request to the daemon, return the response line.
-fn send_request(socket_path: &Path, req: &Request) -> Result<String> {
-    send_request_with_timeout(socket_path, req, std::time::Duration::from_secs(30))
-}
-
 /// Send a request to the daemon with a configurable read timeout.
 pub(crate) fn send_request_with_timeout(
     socket_path: &Path,

@@ -3358,6 +3358,7 @@ fn run_parsed_rustc(
 ) -> Result<i32> {
     let crate_name = args.crate_name.as_deref().unwrap_or("unknown");
     let event_root = rustc_event_root(args);
+    capture_build_report_context(config, args, &event_root, now_epoch_secs());
     // What this invocation's keys record for its event. The keyed flow a
     // deferred compile re-enters continues the record its first key started.
     let mut key_record = precompiled
@@ -7805,6 +7806,30 @@ fn explain_miss_diff(
 /// hanging on a git dependency, say) is recorded too, and later compiles wait
 /// out a backoff before trying again, since the wrapper that tries holds up
 /// its own compile (kunobi-ninja/kache#698).
+fn capture_build_report_context(config: &Config, args: &RustcArgs, root: &str, now: u64) {
+    if config.remote.is_none() {
+        return;
+    }
+    let session_id = session_id_for_event(config, root, now);
+    if session_id.is_empty()
+        || crate::build_reports::context_path(&config.runtime_dir, &session_id, root).exists()
+    {
+        return;
+    }
+    let lock_path = Path::new(root).join("Cargo.lock");
+    let context = crate::build_reports::producer_context(
+        &session_id,
+        root,
+        args,
+        Some(&lock_path),
+        now.saturating_mul(1000),
+        |name| std::env::var(name).ok(),
+    );
+    if let Err(error) = crate::build_reports::persist_context(&config.runtime_dir, &context) {
+        tracing::warn!("cannot capture build report producer context: {error}");
+    }
+}
+
 fn maybe_trigger_prefetch(config: &Config, args: &RustcArgs) {
     maybe_trigger_prefetch_with(config, args, now_epoch_secs(), || {
         crate::build_intent::discover(Some(args))
@@ -7875,19 +7900,6 @@ fn maybe_trigger_prefetch_with(
         write_locked_marker(&lock_file, &record);
         return PrefetchTrigger::DiscoveryFailed;
     };
-
-    let report_context = crate::build_reports::producer_context(
-        &session_id,
-        &root,
-        args,
-        build_intent.lock_path.as_deref().map(Path::new),
-        now.saturating_mul(1000),
-        |name| std::env::var(name).ok(),
-    );
-    if let Err(error) = crate::build_reports::persist_context(&config.runtime_dir, &report_context)
-    {
-        tracing::warn!("cannot capture build report producer context: {error}");
-    }
 
     let shard_prefetch_enabled =
         build_intent.namespace.is_some() && !build_intent.cargo_lock_deps.is_empty();

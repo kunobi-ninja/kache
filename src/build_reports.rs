@@ -148,7 +148,7 @@ pub fn producer_context(
     }
 }
 
-fn context_path(runtime_dir: &Path, session_id: &str, root: &str) -> std::path::PathBuf {
+pub fn context_path(runtime_dir: &Path, session_id: &str, root: &str) -> std::path::PathBuf {
     // Hash local path components too; old clients may use non-hex session ids.
     let session = blake3::hash(session_id.as_bytes()).to_hex();
     runtime_dir

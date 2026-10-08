@@ -272,7 +272,10 @@ impl Fixture {
             "producer must compile cold: {events}"
         );
         producer.configure(Some(remote.path()), 32);
-        assert_success(&producer.kache(project.path(), &["sync", "--push"]));
+        // Push the whole isolated producer store, without sync's implicit
+        // workspace-package filter narrowing rustc's normalized crate names.
+        let producer_store = producer.root.path().to_path_buf();
+        assert_success(&producer.kache(&producer_store, &["sync", "--push"]));
         assert_success(
             &producer.kache(project.path(), &["save-manifest", "--namespace", NAMESPACE]),
         );

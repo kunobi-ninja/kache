@@ -8001,23 +8001,49 @@ fn get_workspace_crate_names(manifest_path: &str) -> Result<Vec<String>> {
     let metadata: serde_json::Value =
         serde_json::from_slice(&output.stdout).context("parsing cargo metadata")?;
 
-    let packages = metadata
+    Ok(workspace_crate_names(&metadata))
+}
+
+/// Events use compiler crate names, including explicitly named Cargo targets.
+fn workspace_crate_names(metadata: &serde_json::Value) -> Vec<String> {
+    metadata
         .get("packages")
-        .and_then(serde_json::Value::as_array);
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .flat_map(|package| {
+            package
+                .get("targets")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+        })
+        .filter_map(|target| target.get("name").and_then(serde_json::Value::as_str))
+        .map(|name| name.replace('-', "_"))
+        .collect()
+}
 
-    let names: Vec<String> = match packages {
-        Some(pkgs) => pkgs
-            .iter()
-            .filter_map(|p| {
-                p.get("name")
-                    .and_then(serde_json::Value::as_str)
-                    .map(String::from)
-            })
-            .collect(),
-        None => Vec::new(),
-    };
-
-    Ok(names)
+#[cfg(test)]
+#[test]
+fn workspace_sync_matches_hyphenated_and_custom_compiler_target_names() {
+    let metadata = serde_json::json!({"packages": [
+        {"name":"package-label", "targets":[
+            {"name":"warm-dep"}, {"name":"custom_library"}, {"name":"tool-app"},
+            {}, {"name":1}
+        ]},
+        {"name":"no-targets"}
+    ]});
+    assert_eq!(
+        workspace_crate_names(&metadata),
+        ["warm_dep", "custom_library", "tool_app"]
+    );
+    for malformed in [
+        serde_json::json!({}),
+        serde_json::json!({"packages":null}),
+        serde_json::json!({"packages":[{"targets":null}]}),
+    ] {
+        assert!(workspace_crate_names(&malformed).is_empty());
+    }
 }
 
 /// Parse Cargo.lock to extract all crate names (direct + transitive dependencies).

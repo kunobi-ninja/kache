@@ -195,15 +195,19 @@ fn install_in(directory: &Path, owner: &str, script: &str) -> Result<()> {
         Ok::<_, anyhow::Error>(())
     })();
     if result.is_err() {
-        // Roll back only files this attempt created whose bytes still match.
-        for name in created {
-            let path = directory.join(name);
-            if std::fs::read(&path).is_ok_and(|bytes| bytes == script.as_bytes()) {
-                let _ = std::fs::remove_file(path);
-            }
-        }
+        rollback_created_hooks(directory, &created, script);
     }
     result
+}
+
+fn rollback_created_hooks(directory: &Path, created: &[&str], script: &str) {
+    // Roll back only files this attempt created whose bytes still match.
+    for name in created {
+        let path = directory.join(name);
+        if std::fs::read(&path).is_ok_and(|bytes| bytes == script.as_bytes()) {
+            let _ = std::fs::remove_file(path);
+        }
+    }
 }
 
 pub(super) fn uninstall() -> Result<()> {
@@ -305,6 +309,62 @@ mod tests {
             "new script"
         );
         assert!(install_in(dir.path(), "owner", "other options").is_err());
+    }
+
+    #[test]
+    fn a_missing_managed_hook_requires_uninstall_and_does_not_block_removal() {
+        let dir = tempfile::tempdir().unwrap();
+        install_in(dir.path(), "owner", "managed script").unwrap();
+        std::fs::remove_file(dir.path().join("post-checkout")).unwrap();
+        let record = std::fs::read(dir.path().join(JOURNAL)).unwrap();
+        let error = install_in(dir.path(), "owner", "managed script").unwrap_err();
+        assert!(error.to_string().contains("missing files"), "{error:#}");
+        assert!(!dir.path().join("post-checkout").exists());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("post-merge")).unwrap(),
+            "managed script"
+        );
+        assert_eq!(std::fs::read(dir.path().join(JOURNAL)).unwrap(), record);
+
+        uninstall_in(dir.path(), "owner").unwrap();
+        for name in NAMES {
+            assert!(!dir.path().join(name).exists());
+        }
+        assert!(!dir.path().join(JOURNAL).exists());
+        uninstall_in(dir.path(), "owner").unwrap();
+    }
+
+    #[test]
+    fn unexpected_filesystem_errors_do_not_look_like_missing_hooks() {
+        let dir = tempfile::tempdir().unwrap();
+        install_in(dir.path(), "owner", "managed script").unwrap();
+        let journal = read_journal(dir.path()).unwrap().unwrap();
+        let invalid_directory = dir.path().join("invalid\0directory");
+        let error = std::fs::symlink_metadata(invalid_directory.join("post-checkout")).unwrap_err();
+        assert_ne!(error.kind(), std::io::ErrorKind::NotFound);
+        assert!(verified_hooks(&invalid_directory, &journal, "owner").is_err());
+    }
+
+    #[test]
+    fn failed_install_rolls_back_its_unchanged_files_and_retains_edits() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("post-checkout"), "managed script").unwrap();
+        std::fs::write(dir.path().join("post-merge"), "user edited script").unwrap();
+        std::fs::write(dir.path().join("pre-commit"), "unrelated hook").unwrap();
+        rollback_created_hooks(
+            dir.path(),
+            &["post-checkout", "post-merge", "missing-hook"],
+            "managed script",
+        );
+        assert!(!dir.path().join("post-checkout").exists());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("post-merge")).unwrap(),
+            "user edited script"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("pre-commit")).unwrap(),
+            "unrelated hook"
+        );
     }
 
     #[test]

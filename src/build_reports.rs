@@ -452,7 +452,8 @@ pub fn validate_report(report: &BuildReport) -> Result<()> {
     for entry in &report.entries {
         ensure!(hex64(&entry.cache_key), "invalid report cache key");
         ensure!(
-            safe_component(&entry.crate_name),
+            safe_component(&entry.crate_name)
+                && crate::cache_key::is_valid_crate_name(&entry.crate_name),
             "unsafe report crate name"
         );
         ensure!(
@@ -1055,11 +1056,15 @@ mod tests {
             "dir/crate",
             "dir\\crate",
             "crate:stream",
+            "foo..cpp",
         ] {
             let mut invalid = valid.clone();
             invalid.entries[0].crate_name = name.into();
             assert!(validate_report(&invalid).is_err(), "{name:?}");
         }
+        let mut too_long = valid.clone();
+        too_long.entries[0].crate_name = "a".repeat(129);
+        assert!(validate_report(&too_long).is_err());
         let mut source = valid.clone();
         source.entries[0].crate_name = "foo.cpp".into();
         validate_report(&source).unwrap();

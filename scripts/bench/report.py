@@ -158,10 +158,13 @@ def head_vs_base(projects):
             comparison = next(
                 (c for c in summary["comparisons"] if c["phase"] == key), None
             )
+            verdict = change(comparison)
+            if comparison and comparison.get("duplicate_key_compiles", {}).get("outcome") == "regression":
+                verdict += "; duplicate compiles regressed"
             cells += [
                 seconds(by_arm["base"]["median_ms"]) if "base" in by_arm else "—",
                 seconds(by_arm["head"]["median_ms"]) if "head" in by_arm else "—",
-                change(comparison),
+                verdict,
             ]
         lines.append("| " + " | ".join(cells) + " |")
     pairs = [c["n"] for p in compared for c in p["summary"]["comparisons"]]
@@ -222,7 +225,7 @@ def contention(projects):
     first = measured[0].get("contention", {})
     if "parallelism" in first:
         body.append(
-            f"Six Cargo jobs, {first['parallelism']} at once, each with {first['jobs_per_build']} Cargo jobs and its own empty target directory. Each tool shares one store across the six jobs. Every warm batch starts from its cold seed, and a new seed is measured every {first['cold_every']} samples."
+            f"Six Cargo jobs, {first['parallelism']} at once, each with {first['jobs_per_build']} Cargo jobs and its own empty target directory. Each tool shares one store across the six jobs. Every warm batch starts from its cold seed, and fresh cold seeds are measured {'every sample' if first['cold_every'] == 1 else 'every ' + str(first['cold_every']) + ' samples'}."
         )
     counters = []
     for p in measured:
@@ -337,7 +340,7 @@ def comparison_detail(projects):
         body.append("| Cold contention duplicate compiles | " + " | ".join(cells) + " |")
     body += [
         "",
-        f"Head and base run as paired samples; positive changes are slower. Parentheses hold the 95% bootstrap interval. A timing regression needs at least {MIN_PAIRS} pairs, an interval entirely above +5% and a median change above 250 ms; an improvement is the mirror image. Cold duplicate compiles vary with overlap: growth needs a one-sided paired sign test below {COUNT_GROWTH_ALPHA:.4f} (0.05 across three subjects). Warm increases in duplicate compiles, misses or passthroughs fail immediately. `samples.json` in the run artifacts has source and tool versions, run order and raw reports.",
+        f"Head and base run as paired samples; positive changes are slower. Parentheses hold the 95% bootstrap interval. A timing regression needs at least {MIN_PAIRS} pairs, an interval entirely above +5% and a median change above 250 ms; an improvement is the mirror image. Cold duplicate compiles vary with overlap: growth needs a one-sided paired sign test below {COUNT_GROWTH_ALPHA:.4f} (0.05 across three subjects). With six cold pairs, all six must grow; a tie or decrease leaves the count result inconclusive. Warm increases in duplicate compiles, misses or passthroughs fail immediately. `samples.json` in the run artifacts has source and tool versions, run order and raw reports.",
     ]
     return details("Paired comparison", body)
 

@@ -260,17 +260,19 @@ results under `contention/` and includes the statistics in `summary.json`.
 Missing backend reports or failed builds invalidate the suite.
 
 PRs measure six fresh cold contention seeds and six warm batches per Kache
-arm. mbx runs once normally and six times with the `bench` label. Cold
+arm. mbx runs once normally and six cold/warm pairs with the `bench` label. Cold
 samples alternate arm order. Cold duplicate compilation counts vary with
 overlap: a one-sided paired sign test must fall below 0.05 / 3, sharing the
 false-positive budget across hk, eza and aube. Tied counts carry no directional
-evidence. A single pair remains inconclusive. The report shows the number of
-pairs, the probability and the decision.
+evidence. With six pairs, every pair must grow to fail this check; one tie or
+one decrease leaves it inconclusive. The report shows the number of pairs,
+the probability and the decision.
 
 Warm increases in duplicate compilations, misses or passthroughs still fail
 immediately. Both cold and warm contention timing use the paired timing gate.
-Nightly and local runs keep the default fresh cold seed every third sample;
-these smaller cold samples may remain inconclusive.
+Nightly runs have no base arm and report counts without a regression verdict.
+Local runs keep a fresh cold seed every third sample by default; fewer than
+six non-tied cold pairs cannot establish duplicate growth.
 
 Use `--contention-samples 6 --contention-cold-every 1` with `bench-short`
 for six fresh cold pairs in a local comparison,

@@ -131,7 +131,7 @@ def run_contention(args, arms, timeout=None):
     # Only a run's deadline bounds the whole stage; it can take longer than the
     # isolated engine's timeout.
     print(
-        f"{args.project}: contention, {samples} warm batches and {math.ceil(samples / cold_every)} cold seeds per arm; see contention.log",
+        f"{args.project}: contention, {samples} warm batches and {math.ceil(samples / cold_every)} cold seeds per Kache arm; reference tools take {context_samples} batches; see contention.log",
         flush=True,
     )
     with (args.output / "contention.log").open("w") as stream:

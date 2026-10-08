@@ -92,6 +92,15 @@ class ContentionCountTests(unittest.TestCase):
         self.assertIn("1/1 non-tied pairs grew (1 measured), p=0.5000, inconclusive", text)
         self.assertEqual(failures, [])
 
+    def test_headline_exposes_count_failure_with_inconclusive_timing(self):
+        comparisons, failures = stats.contention_comparison(records([0] * 6, [40] * 6))
+        project = {"name": "aube", "summary": {
+            "comparisons": comparisons, "statistics": [],
+            "contention": {"statistics": []},
+        }}
+        self.assertTrue(failures)
+        self.assertIn("duplicate compiles regressed", "\n".join(report.head_vs_base([project])))
+
     def test_ci_sampling_rejects_sustained_cold_growth(self):
         # The workflow test supplies values from its real authorization and
         # measurement steps. Running this directly uses the ordinary CI shape.

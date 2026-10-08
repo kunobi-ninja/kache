@@ -302,8 +302,9 @@ include the Cargo command, selected packages/features and relevant flags in
 that digest. Kache does not infer it from one compiler invocation.
 `CARGO_BUILD_TARGET` can supply the declared target instead. The wrapper captures
 these labels, the actual compiler's verbose-version hash, profile and full
-lockfile digest at the session's first wrapped invocation, including builds with
-no remote or automatic prefetch. Host build scripts
+lockfile digest at the session's first wrapped invocation when a repository or
+namespace label is declared, including builds with no remote or automatic
+prefetch. Unlabelled builds keep unknown compatibility facts. Host build scripts
 and proc macros do not establish a cross build's target.
 
 Missing producer facts remain unknown; a later daemon never fills them from its

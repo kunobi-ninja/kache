@@ -7803,6 +7803,9 @@ fn capture_build_report_context(config: &Config, args: &RustcArgs, root: &str, n
     if !args.is_primary {
         return;
     }
+    if !crate::build_reports::producer_is_declared(|name| std::env::var(name).ok()) {
+        return;
+    }
     let session_id = session_id_for_event(config, root, now);
     if session_id.is_empty() {
         return;

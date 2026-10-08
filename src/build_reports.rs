@@ -130,6 +130,12 @@ fn nonempty(lookup: &impl Fn(&str) -> Option<String>, name: &str) -> Option<Stri
         .filter(|value| !value.is_empty())
 }
 
+/// Ordinary local builds must not gain compiler probes before their fast paths.
+pub fn producer_is_declared(lookup: impl Fn(&str) -> Option<String>) -> bool {
+    nonempty(&lookup, "KACHE_NAMESPACE").is_some()
+        || nonempty(&lookup, "KACHE_REPOSITORY").is_some()
+}
+
 pub fn producer_facts(
     args: &crate::args::RustcArgs,
     lock_path: Option<&Path>,
@@ -839,6 +845,14 @@ mod tests {
 
     #[test]
     fn producer_context_captures_declared_cross_target_and_full_lock_identity() {
+        assert!(!producer_is_declared(|_| None));
+        assert!(!producer_is_declared(|_| Some("  ".into())));
+        assert!(producer_is_declared(
+            |name| (name == "KACHE_NAMESPACE").then(|| "org/repo".into())
+        ));
+        assert!(producer_is_declared(
+            |name| (name == "KACHE_REPOSITORY").then(|| "repo".into())
+        ));
         let dir = tempfile::tempdir().unwrap();
         let lock = dir.path().join("Cargo.lock");
         std::fs::write(&lock, "producer lock contents").unwrap();

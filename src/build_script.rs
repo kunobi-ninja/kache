@@ -1543,6 +1543,28 @@ impl Run {
                 return Err(InputsChanged.into());
             }
         }
+        // Opted-in tools are implicit file inputs, even when a script only
+        // declares an environment watch. Never store an old run under the
+        // digest of a tool edited during execution. Check links and targets.
+        let file_hasher = self.store.file_hasher();
+        for name in ["RUSTC_LINKER", "RUSTC", "RUSTDOC"] {
+            if let Ok(value) = std::env::var(name)
+                && path_only_tool(
+                    name,
+                    &value,
+                    &self.environment,
+                    &self.config.path_only_env_vars,
+                    &file_hasher,
+                )?
+                .is_some()
+            {
+                let path = Path::new(&value);
+                let resolved = std::fs::canonicalize(path)?;
+                if modified_since(path, &[], started)? || modified_since(&resolved, &[], started)? {
+                    return Err(InputsChanged.into());
+                }
+            }
+        }
         let OutDirContents {
             files,
             directories: manifest_dirs,
@@ -2580,6 +2602,83 @@ mod tests {
         // SAFETY: the process-state lock is still held.
         unsafe {
             match original {
+                Some(value) => std::env::set_var("RUSTC_LINKER", value),
+                None => std::env::remove_var("RUSTC_LINKER"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_tool_edited_during_a_run_is_not_recorded_under_its_new_digest() {
+        let _lock = crate::test_support::process_state_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("checkout");
+        std::fs::create_dir_all(root.join("build")).unwrap();
+        std::fs::create_dir_all(root.join("crate")).unwrap();
+        let mut config = crate::test_support::test_config(dir.path().join("cache"));
+        config.path_only_env_vars.push("RUSTC_LINKER".into());
+        let mut env = environment(&root.join("target/out"), &root.join("crate"));
+        env.base_dirs.push(root.clone());
+        std::fs::create_dir_all(&env.out_dir).unwrap();
+        std::fs::write(env.out_dir.join("result"), b"old-tool-result").unwrap();
+        let run = Run {
+            store: Store::open(&config).unwrap(),
+            config,
+            binary_hash: "aaaa".into(),
+            environment: env,
+            start: std::time::Instant::now(),
+        };
+        let tool = root.join("build/linker");
+        std::fs::write(&tool, b"new-tool").unwrap();
+        let saved = std::env::var_os("RUSTC_LINKER");
+        // SAFETY: environment edits are serialized by the process-state lock.
+        unsafe {
+            std::env::set_var("RUSTC_LINKER", &tool);
+        }
+        let now = std::time::SystemTime::now();
+        let stdout = b"cargo:rerun-if-changed=build.rs\ncargo:rerun-if-env-changed=RUSTC_LINKER\n";
+        assert!(
+            run.record(stdout, b"", 1, now - std::time::Duration::from_secs(60))
+                .unwrap_err()
+                .is::<InputsChanged>()
+        );
+        assert!(run.prediction().unwrap().is_none());
+        let settled = now + std::time::Duration::from_secs(60);
+        run.record(stdout, b"", 1, settled).unwrap();
+        let prediction = run.prediction().unwrap().unwrap();
+        assert!(
+            run.store
+                .get(&run.action_key(&prediction).unwrap())
+                .unwrap()
+                .is_some()
+        );
+        #[cfg(unix)]
+        {
+            let link = root.join("build/link");
+            std::os::unix::fs::symlink(&tool, &link).unwrap();
+            let old =
+                filetime::FileTime::from_system_time(now - std::time::Duration::from_secs(120));
+            filetime::set_symlink_file_times(&link, old, old).unwrap();
+            unsafe {
+                std::env::set_var("RUSTC_LINKER", &link);
+            }
+            assert!(
+                run.record(stdout, b"", 1, now - std::time::Duration::from_secs(60))
+                    .unwrap_err()
+                    .is::<InputsChanged>()
+            );
+            // A retargeted link is also a changed input even if its target is old.
+            filetime::set_file_mtime(&tool, old).unwrap();
+            filetime::set_symlink_file_times(&link, old, filetime::FileTime::now()).unwrap();
+            assert!(
+                run.record(stdout, b"", 1, now - std::time::Duration::from_secs(60))
+                    .unwrap_err()
+                    .is::<InputsChanged>()
+            );
+        }
+        // SAFETY: the process-state lock is still held.
+        unsafe {
+            match saved {
                 Some(value) => std::env::set_var("RUSTC_LINKER", value),
                 None => std::env::remove_var("RUSTC_LINKER"),
             }

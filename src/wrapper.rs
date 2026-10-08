@@ -7816,9 +7816,16 @@ fn capture_build_report_context(config: &Config, args: &RustcArgs, root: &str, n
     if session_id.is_empty() {
         return;
     }
-    if let Err(error) =
-        crate::build_reports::capture_context_once(&config.runtime_dir, &session_id, root, || {
-            let lock_path = Path::new(root).join("Cargo.lock");
+    let lock_path = Path::new(root).join("Cargo.lock");
+    let facts = crate::build_reports::producer_facts(args, Some(&lock_path), |name| {
+        std::env::var(name).ok()
+    });
+    if let Err(error) = crate::build_reports::capture_context_once(
+        &config.runtime_dir,
+        &session_id,
+        root,
+        &facts,
+        || {
             crate::build_reports::producer_context(
                 &session_id,
                 root,
@@ -7827,8 +7834,8 @@ fn capture_build_report_context(config: &Config, args: &RustcArgs, root: &str, n
                 now.saturating_mul(1000),
                 |name| std::env::var(name).ok(),
             )
-        })
-    {
+        },
+    ) {
         tracing::warn!("cannot capture build report producer context: {error}");
     }
 }

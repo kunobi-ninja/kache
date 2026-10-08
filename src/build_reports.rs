@@ -44,6 +44,26 @@ pub struct ProducerContext {
     pub parent_commits: Vec<String>,
     pub captured_at_ms: u64,
     pub ci_started_at_ms: Option<u64>,
+    #[serde(default)]
+    pub facts: Option<ProducerFacts>,
+}
+
+/// Local comparison facts. Fingerprints avoid repeated compiler probes and
+/// full lockfile hashing on warm hits. A mismatch invalidates compatibility.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProducerFacts {
+    pub namespace: String,
+    pub repository: Option<String>,
+    pub target: Option<String>,
+    pub profile: Option<String>,
+    pub build_shape: Option<String>,
+    pub commit: Option<String>,
+    pub git_ref: Option<String>,
+    pub parent_commits: Vec<String>,
+    pub ci_started_at_ms: Option<u64>,
+    pub compiler_stamp: Option<crate::cache_key::FileFingerprint>,
+    pub compiler_selector: Option<String>,
+    pub lock_stamp: Option<crate::cache_key::FileFingerprint>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -110,7 +130,39 @@ fn nonempty(lookup: &impl Fn(&str) -> Option<String>, name: &str) -> Option<Stri
         .filter(|value| !value.is_empty())
 }
 
-/// Capture at the producer, before sending BuildStarted. Never called in daemon
+pub fn producer_facts(
+    args: &crate::args::RustcArgs,
+    lock_path: Option<&Path>,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> ProducerFacts {
+    let namespace = nonempty(&lookup, "KACHE_NAMESPACE");
+    let compiler = crate::compiler::resolve_program_on_path(&args.rustc.to_string_lossy());
+    ProducerFacts {
+        namespace: namespace.clone().unwrap_or_else(|| "unscoped".into()),
+        repository: nonempty(&lookup, "KACHE_REPOSITORY").or(namespace),
+        target: nonempty(&lookup, "KACHE_BUILD_TARGET")
+            .or_else(|| nonempty(&lookup, "CARGO_BUILD_TARGET")),
+        profile: Some(crate::identity::profile_from_rustc_args(args))
+            .filter(|profile| profile != "unknown"),
+        build_shape: nonempty(&lookup, "KACHE_BUILD_SHAPE"),
+        commit: nonempty(&lookup, "GITHUB_SHA").or_else(|| nonempty(&lookup, "CI_COMMIT_SHA")),
+        git_ref: nonempty(&lookup, "GITHUB_REF")
+            .or_else(|| nonempty(&lookup, "CI_COMMIT_REF_NAME")),
+        parent_commits: nonempty(&lookup, "KACHE_PARENT_COMMITS")
+            .map(|value| value.split_whitespace().map(str::to_owned).collect())
+            .unwrap_or_default(),
+        ci_started_at_ms: nonempty(&lookup, "KACHE_CI_STARTED_AT_MS")
+            .and_then(|value| value.parse().ok()),
+        compiler_stamp: compiler
+            .as_deref()
+            .and_then(|path| crate::cache_key::FileFingerprint::from_path(path).ok()),
+        compiler_selector: crate::cache_key::rustc_version_fingerprint(&args.rustc),
+        lock_stamp: lock_path
+            .and_then(|path| crate::cache_key::FileFingerprint::from_path(path).ok()),
+    }
+}
+
+/// Capture at the producer's first real invocation. Never called in daemon
 /// publication. Session target is declared because a host build-script unit
 /// cannot identify the target of the surrounding cross build.
 pub fn producer_context(
@@ -121,30 +173,25 @@ pub fn producer_context(
     captured_at_ms: u64,
     lookup: impl Fn(&str) -> Option<String>,
 ) -> ProducerContext {
-    let namespace = nonempty(&lookup, "KACHE_NAMESPACE");
+    let facts = producer_facts(args, lock_path, lookup);
     ProducerContext {
         session_id: session_id.to_owned(),
         root: root.to_owned(),
-        namespace: namespace.clone().unwrap_or_else(|| "unscoped".into()),
+        namespace: facts.namespace.clone(),
         identity: BuildIdentity {
-            repository: nonempty(&lookup, "KACHE_REPOSITORY").or(namespace),
-            target: nonempty(&lookup, "KACHE_BUILD_TARGET")
-                .or_else(|| nonempty(&lookup, "CARGO_BUILD_TARGET")),
+            repository: facts.repository.clone(),
+            target: facts.target.clone(),
             toolchain_hash: toolchain_hash(&args.rustc),
-            profile: Some(crate::identity::profile_from_rustc_args(args))
-                .filter(|profile| profile != "unknown"),
-            build_shape: nonempty(&lookup, "KACHE_BUILD_SHAPE"),
+            profile: facts.profile.clone(),
+            build_shape: facts.build_shape.clone(),
             lock_digest: lock_path.and_then(lock_digest),
         },
-        commit: nonempty(&lookup, "GITHUB_SHA").or_else(|| nonempty(&lookup, "CI_COMMIT_SHA")),
-        git_ref: nonempty(&lookup, "GITHUB_REF")
-            .or_else(|| nonempty(&lookup, "CI_COMMIT_REF_NAME")),
-        parent_commits: nonempty(&lookup, "KACHE_PARENT_COMMITS")
-            .map(|value| value.split_whitespace().map(str::to_owned).collect())
-            .unwrap_or_default(),
+        commit: facts.commit.clone(),
+        git_ref: facts.git_ref.clone(),
+        parent_commits: facts.parent_commits.clone(),
         captured_at_ms,
-        ci_started_at_ms: nonempty(&lookup, "KACHE_CI_STARTED_AT_MS")
-            .and_then(|value| value.parse().ok()),
+        ci_started_at_ms: facts.ci_started_at_ms,
+        facts: Some(facts),
     }
 }
 
@@ -161,17 +208,38 @@ pub fn capture_context_once(
     runtime_dir: &Path,
     session_id: &str,
     root: &str,
+    facts: &ProducerFacts,
     capture: impl FnOnce() -> ProducerContext,
 ) -> Result<()> {
-    if context_path(runtime_dir, session_id, root).exists() {
+    let invalid = context_path(runtime_dir, session_id, root).with_extension("invalid");
+    if invalid.exists() {
         return Ok(());
     }
-    let context = capture();
-    ensure!(
-        context.session_id == session_id && context.root == root,
-        "producer capture scope mismatch"
-    );
-    persist_context(runtime_dir, &context)
+    let context = match read_context(runtime_dir, session_id, root)? {
+        Some(context) => context,
+        None => {
+            let context = capture();
+            ensure!(
+                context.session_id == session_id && context.root == root,
+                "producer capture scope mismatch"
+            );
+            persist_context(runtime_dir, &context)?;
+            // Compare the winner when concurrent first invocations raced.
+            read_context(runtime_dir, session_id, root)?.context("producer context disappeared")?
+        }
+    };
+    if context.facts.as_ref() != Some(facts) {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(invalid)
+        {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
 }
 
 /// Atomic, create-only local snapshot. Later invocations cannot relabel a session.
@@ -206,11 +274,21 @@ pub fn read_context(
         bytes.len() as u64 <= MAX_REPORT_BYTES,
         "report context exceeds size limit"
     );
-    let context: ProducerContext = serde_json::from_slice(&bytes)?;
+    let mut context: ProducerContext = serde_json::from_slice(&bytes)?;
     ensure!(
         context.session_id == session_id && context.root == root,
         "report context scope mismatch"
     );
+    if context_path(runtime_dir, session_id, root)
+        .with_extension("invalid")
+        .exists()
+    {
+        context.identity = BuildIdentity::default();
+        context.commit = None;
+        context.git_ref = None;
+        context.parent_commits.clear();
+        context.ci_started_at_ms = None;
+    }
     Ok(Some(context))
 }
 
@@ -571,6 +649,7 @@ mod tests {
             parent_commits: vec!["parent-one".into(), "parent-two".into()],
             captured_at_ms: 900,
             ci_started_at_ms: Some(800),
+            facts: Some(ProducerFacts::default()),
         };
         persist_context(dir.path(), &context).unwrap();
         let mut foreign = event("one", "/other", 'b', 1300, 10);
@@ -708,11 +787,13 @@ mod tests {
             parent_commits: vec![],
             captured_at_ms: 1,
             ci_started_at_ms: None,
+            facts: Some(ProducerFacts::default()),
         };
         assert!(read_context(dir.path(), "one", "/work").unwrap().is_none());
         persist_context(dir.path(), &context).unwrap();
         context.commit = Some("later-daemon".into());
-        capture_context_once(dir.path(), "one", "/work", || {
+        let facts = ProducerFacts::default();
+        capture_context_once(dir.path(), "one", "/work", &facts, || {
             panic!("warm invocation probed producer metadata again")
         })
         .unwrap();
@@ -721,12 +802,12 @@ mod tests {
         assert_eq!(restored.commit.as_deref(), Some("first"));
         assert!(read_context(dir.path(), "one", "/other").unwrap().is_none());
         assert!(
-            capture_context_once(dir.path(), "one", "/other", || context.clone())
+            capture_context_once(dir.path(), "one", "/other", &facts, || context.clone())
                 .unwrap_err()
                 .to_string()
                 .contains("capture scope mismatch")
         );
-        capture_context_once(dir.path(), "two", "/work", || {
+        capture_context_once(dir.path(), "two", "/work", &facts, || {
             let mut next = context.clone();
             next.session_id = "two".into();
             next
@@ -835,6 +916,125 @@ mod tests {
     }
 
     #[test]
+    fn identity_drift_in_one_session_becomes_unknown_without_relabeling_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let original_facts = ProducerFacts {
+            namespace: "org/repo".into(),
+            repository: Some("repo".into()),
+            target: Some("target".into()),
+            profile: Some("debug".into()),
+            build_shape: Some("shape-a".into()),
+            commit: Some("first-commit".into()),
+            git_ref: Some("first-ref".into()),
+            parent_commits: vec!["first-parent".into()],
+            ci_started_at_ms: Some(800),
+            ..ProducerFacts::default()
+        };
+        let original = ProducerContext {
+            session_id: "one".into(),
+            root: "/work".into(),
+            namespace: "org/repo".into(),
+            identity: BuildIdentity {
+                repository: Some("repo".into()),
+                target: Some("target".into()),
+                profile: Some("debug".into()),
+                build_shape: Some("shape-a".into()),
+                toolchain_hash: Some("a".repeat(64)),
+                lock_digest: Some("b".repeat(64)),
+            },
+            commit: Some("first-commit".into()),
+            git_ref: Some("first-ref".into()),
+            parent_commits: vec!["first-parent".into()],
+            captured_at_ms: 900,
+            ci_started_at_ms: Some(800),
+            facts: Some(original_facts.clone()),
+        };
+        let stamp = crate::cache_key::FileFingerprint {
+            path: "changed".into(),
+            size: 1,
+            mtime_ns: 1,
+            ctime_ns: 2,
+            inode: 3,
+        };
+        let mut variants = Vec::new();
+        let mut changed = original_facts.clone();
+        changed.profile = Some("release".into());
+        variants.push(changed);
+        let mut changed = original_facts.clone();
+        changed.build_shape = Some("shape-b".into());
+        variants.push(changed);
+        let mut changed = original_facts.clone();
+        changed.target = Some("other-target".into());
+        variants.push(changed);
+        let mut changed = original_facts.clone();
+        changed.repository = Some("other-repo".into());
+        variants.push(changed);
+        let mut changed = original_facts.clone();
+        changed.namespace = "other-namespace".into();
+        variants.push(changed);
+        let mut changed = original_facts.clone();
+        changed.compiler_stamp = Some(stamp.clone());
+        variants.push(changed);
+        let mut changed = original_facts.clone();
+        changed.compiler_selector = Some("other-toolchain".into());
+        variants.push(changed);
+        let mut changed = original_facts.clone();
+        changed.lock_stamp = Some(stamp);
+        variants.push(changed);
+        let mut changed = original_facts.clone();
+        changed.commit = Some("second-commit".into());
+        variants.push(changed);
+        for changed in variants {
+            let runtime = tempfile::tempdir_in(dir.path()).unwrap();
+            capture_context_once(runtime.path(), "one", "/work", &original_facts, || {
+                original.clone()
+            })
+            .unwrap();
+            let path = context_path(runtime.path(), "one", "/work");
+            let immutable_bytes = std::fs::read(&path).unwrap();
+            capture_context_once(runtime.path(), "one", "/work", &changed, || {
+                panic!("must not probe again")
+            })
+            .unwrap();
+            let mixed = collect_reports(
+                &[
+                    event("one", "/work", 'a', 1200, 200),
+                    event("one", "/work", 'b', 1500, 100),
+                ],
+                None,
+                runtime.path(),
+                None,
+            )
+            .unwrap()
+            .remove(0);
+            assert_eq!(mixed.identity, BuildIdentity::default());
+            assert_eq!(mixed.commit, None);
+            assert_eq!(mixed.git_ref, None);
+            assert!(mixed.parent_commits.is_empty());
+            assert_eq!(mixed.entries.len(), 2);
+            assert!(
+                mixed
+                    .entries
+                    .iter()
+                    .all(|entry| entry.ci_start_offset_ms.is_none())
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), immutable_bytes);
+            // Invalid remains invalid even if a later command returns to shape A.
+            capture_context_once(runtime.path(), "one", "/work", &original_facts, || {
+                panic!("already invalid")
+            })
+            .unwrap();
+            assert_eq!(
+                read_context(runtime.path(), "one", "/work")
+                    .unwrap()
+                    .unwrap()
+                    .identity,
+                BuildIdentity::default()
+            );
+        }
+    }
+
+    #[test]
     fn untrusted_report_validation_rejects_bad_paths_keys_schema_and_timing() {
         let valid = report();
         for namespace in [
@@ -919,7 +1119,13 @@ mod tests {
         upload_report(&backend, "artifacts", &report).await.unwrap();
         upload_report(&backend, "artifacts", &report).await.unwrap();
         let key = object_key("artifacts", &report).unwrap();
-        let before = backend.get(&key, None).await.unwrap().unwrap().body;
+        let before = backend
+            .get(&key, None)
+            .await
+            .unwrap()
+            .unwrap()
+            .body
+            .to_vec();
         let mut changed = report.clone();
         changed.commit = Some("later".into());
         assert!(
@@ -929,7 +1135,16 @@ mod tests {
                 .to_string()
                 .contains("conflict")
         );
-        assert_eq!(backend.get(&key, None).await.unwrap().unwrap().body, before);
+        assert_eq!(
+            backend
+                .get(&key, None)
+                .await
+                .unwrap()
+                .unwrap()
+                .body
+                .as_ref(),
+            before
+        );
         assert_eq!(
             download_report(&backend, "artifacts", "org/repo", &key)
                 .await

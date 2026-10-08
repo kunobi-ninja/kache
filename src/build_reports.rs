@@ -272,6 +272,10 @@ pub fn persist_context(runtime_dir: &Path, context: &ProducerContext) -> Result<
     let mut file = tempfile::NamedTempFile::new_in(parent)?;
     serde_json::to_writer(&mut file, context)?;
     file.flush()?;
+    persist_context_snapshot(file, &path)
+}
+
+fn persist_context_snapshot(file: tempfile::NamedTempFile, path: &Path) -> Result<()> {
     match file.persist_noclobber(path) {
         Ok(_) => Ok(()),
         Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
@@ -755,6 +759,25 @@ mod tests {
         mark_context_invalid(&marker).unwrap();
         assert_eq!(std::fs::read(&marker).unwrap(), b"already invalid");
         assert!(mark_context_invalid(&dir.path().join("missing/parent/marker")).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn disappearing_snapshot_directory_is_not_an_existing_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("contexts");
+        std::fs::create_dir(&parent).unwrap();
+        let file = tempfile::NamedTempFile::new_in(&parent).unwrap();
+        let snapshot = parent.join("session.json");
+        // Cache cleanup can remove the runtime directory while a first
+        // producer prepares its snapshot. Only a competing snapshot is benign.
+        std::fs::rename(&parent, dir.path().join("removed-contexts")).unwrap();
+        let error = persist_context_snapshot(file, &snapshot).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        assert!(!snapshot.exists());
     }
 
     #[test]

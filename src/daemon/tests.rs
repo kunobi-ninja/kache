@@ -400,9 +400,9 @@ fn env_only_remote_warns_but_a_file_configured_remote_does_not() {
     drop(restore_config);
 }
 
-/// The stripped list must stay exactly the set of variables that decide a
-/// remote. A new `KACHE_S3_*` knob added without updating the list would
-/// silently reintroduce the lottery for that setting.
+/// The stripped list covers remote selection. Write restrictions remain
+/// inherited so daemon publication cannot bypass a read-only caller.
+/// A new `KACHE_S3_*` selector must also be stripped.
 #[test]
 fn ambient_remote_env_list_covers_every_remote_deciding_var() {
     let documented = [
@@ -413,7 +413,6 @@ fn ambient_remote_env_list_covers_every_remote_deciding_var() {
         "KACHE_S3_PROFILE",
         "KACHE_S3_USER_AGENT",
         "KACHE_LOCAL_ONLY",
-        "KACHE_REMOTE_READONLY",
     ];
     assert_eq!(
         AMBIENT_REMOTE_ENV_VARS, &documented,

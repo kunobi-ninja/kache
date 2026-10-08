@@ -113,27 +113,6 @@ impl V3Remote {
             .await
     }
 
-    #[allow(dead_code)] // Replay/index consumers follow durable report publication.
-    pub async fn list_build_reports(&self, namespace: &str) -> Result<Vec<String>> {
-        crate::build_reports::list_reports(self.backend.as_ref(), &self.remote.prefix, namespace)
-            .await
-    }
-
-    #[allow(dead_code)] // Replay/index consumers follow durable report publication.
-    pub async fn get_build_report(
-        &self,
-        namespace: &str,
-        key: &str,
-    ) -> Result<Option<crate::build_reports::BuildReport>> {
-        crate::build_reports::download_report(
-            self.backend.as_ref(),
-            &self.remote.prefix,
-            namespace,
-            key,
-        )
-        .await
-    }
-
     fn layout(&self) -> RemoteLayout<'_> {
         RemoteLayout::new(self.backend.as_ref(), &self.remote)
     }

@@ -247,17 +247,21 @@ pub fn capture_context_once(
         }
     };
     if context.facts.as_ref() != Some(facts) {
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(invalid)
-        {
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error.into()),
-        }
+        mark_context_invalid(&invalid)?;
     }
     Ok(())
+}
+
+fn mark_context_invalid(path: &Path) -> Result<()> {
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// Atomic, create-only local snapshot. Later invocations cannot relabel a session.
@@ -737,6 +741,20 @@ mod tests {
                 .to_string()
                 .contains("size limit")
         );
+    }
+
+    #[test]
+    fn racing_context_invalidations_preserve_the_first_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("context.invalid");
+        mark_context_invalid(&marker).unwrap();
+        assert_eq!(std::fs::read(&marker).unwrap(), b"");
+        std::fs::write(&marker, b"already invalid").unwrap();
+        // A producer that checked before another invalidated the same session
+        // must accept the existing marker without replacing it.
+        mark_context_invalid(&marker).unwrap();
+        assert_eq!(std::fs::read(&marker).unwrap(), b"already invalid");
+        assert!(mark_context_invalid(&dir.path().join("missing/parent/marker")).is_err());
     }
 
     #[test]

@@ -205,6 +205,7 @@ async fn total_body_budget_covers_streamed_and_buffered_gets_and_cannot_be_refun
     inner.put("second", b"12".to_vec(), None).await.unwrap();
     let backend = BudgetedBackend::new(inner.clone(), 5);
     assert!(backend.head("first").await.unwrap());
+    assert!(!backend.head("absent").await.unwrap());
     assert_eq!(backend.list("").await.unwrap().len(), 2);
     assert!(backend.describe("first").contains("first"));
     let mut sink = Vec::new();

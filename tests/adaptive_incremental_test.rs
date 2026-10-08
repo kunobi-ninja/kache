@@ -503,6 +503,7 @@ exit 0
             .env("RELEASE_FILE", &release)
             .env("CONTENDER_FILE", &contender)
             .env("CARGO_PRIMARY_PACKAGE", "1")
+            .env("KACHE_NAMESPACE", "declared-adaptive-fixture")
             .env("CARGO_INCREMENTAL", "1")
             .env("KACHE_CACHE_EXECUTABLES", "0")
             .env("KACHE_LOG", "kache=warn")

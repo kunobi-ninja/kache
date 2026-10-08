@@ -209,6 +209,10 @@ fn context_path(runtime_dir: &Path, session_id: &str, root: &str) -> std::path::
         .join(format!("{}-{}.json", session, root_hash(root)))
 }
 
+pub fn context_exists(runtime_dir: &Path, session_id: &str, root: &str) -> bool {
+    context_path(runtime_dir, session_id, root).exists()
+}
+
 /// Avoid probing the compiler or hashing the lockfile for every warm invocation.
 pub fn capture_context_once(
     runtime_dir: &Path,

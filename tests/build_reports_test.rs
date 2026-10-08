@@ -222,6 +222,8 @@ fn compiler_queries_do_not_poison_offline_producer_identity() {
     std::fs::create_dir_all(&release).unwrap();
     let changed = command()
         .env("KACHE_BUILD_SHAPE", "different-shape")
+        .env_remove("KACHE_NAMESPACE")
+        .env_remove("KACHE_REPOSITORY")
         .arg(&rustc)
         .args([
             "--crate-name",

@@ -3358,7 +3358,6 @@ fn run_parsed_rustc(
 ) -> Result<i32> {
     let crate_name = args.crate_name.as_deref().unwrap_or("unknown");
     let event_root = rustc_event_root(args);
-    capture_build_report_context(config, args, &event_root, now_epoch_secs());
     // What this invocation's keys record for its event. The keyed flow a
     // deferred compile re-enters continues the record its first key started.
     let mut key_record = precompiled
@@ -3610,6 +3609,9 @@ fn run_parsed_rustc(
         );
     };
 
+    // Passthrough and managed incremental routes have already returned. Only
+    // cache-eligible invocations establish report metadata before lookup.
+    capture_build_report_context(config, args, &event_root, now_epoch_secs());
     let keyed = match compute_rustc_cache_key(
         config,
         compiler,
@@ -7803,11 +7805,12 @@ fn capture_build_report_context(config: &Config, args: &RustcArgs, root: &str, n
     if !args.is_primary {
         return;
     }
-    if !crate::build_reports::producer_is_declared(|name| std::env::var(name).ok()) {
-        return;
-    }
+    let declared = crate::build_reports::producer_is_declared(|name| std::env::var(name).ok());
     let session_id = session_id_for_event(config, root, now);
     if session_id.is_empty() {
+        return;
+    }
+    if !declared && !crate::build_reports::context_exists(&config.runtime_dir, &session_id, root) {
         return;
     }
     let lock_path = Path::new(root).join("Cargo.lock");

@@ -289,6 +289,8 @@ pub struct Config {
     /// Set via `KACHE_PATH_ONLY_ENV_VARS` (comma/space-separated) or
     /// `[cache] path_only_env_vars`. Empty (the default) leaves only built-in
     /// OUT_DIR normalization.
+    /// For build-script runs, plain RUSTC_LINKER/RUSTC/RUSTDOC entries also
+    /// normalize tool paths under KACHE_BASE_DIR and key their file contents.
     pub path_only_env_vars: Vec<String>,
     /// Crate names whose eligible Cargo-primary compiles bypass the artifact
     /// cache with policy-owned rustc incremental state, regardless of the

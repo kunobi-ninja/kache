@@ -36,7 +36,9 @@ Treat write credentials for any remote as trusted build credentials. The permiss
 
 On GitHub Actions and GitLab CI, Kache suppresses remote writes unless the job is a **push to a protected branch**. Pull requests, merge requests, tags, unprotected branches, `workflow_dispatch`, and scheduled runs are read-only even if the job has a write credential. `KACHE_REMOTE_READONLY=0` does not turn that off.
 
-A laptop or other non-CI process is left as configured, so `kache sync --push` still works locally. Set `remote_readonly = true` under `[cache]` there when you want reads without writes. `KACHE_REMOTE_READONLY=1` affects only the process that reads it: a daemon that a build starts drops it.
+A laptop or other non-CI process is left as configured, so `kache sync --push` still works locally. Set `remote_readonly = true` under `[cache]` there when you want reads without writes.
+
+An automatically started daemon inherits `KACHE_REMOTE_READONLY=1` and keeps writes disabled for its lifetime. Before a later writable build needs to upload, clear the flag and run `kache daemon restart` from the writable environment. An installed service uses its stored environment; update that environment before restarting it.
 
 ```yaml
 # Optional: make the read-only intent explicit in pull-request jobs.

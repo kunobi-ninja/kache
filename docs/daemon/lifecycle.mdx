@@ -48,7 +48,9 @@ Legacy clients and daemons can omit release metadata. Missing or invalid version
 
 `kache doctor` reads daemon stats without requesting a drain. Use `kache doctor --fix` to replace a daemon from an older release. Use `kache daemon restart` to load a local rebuild with the same version, or to replace a daemon whose release cannot be determined.
 
-The daemon also fingerprints the active config file and restarts after it changes. `kache daemon start` and automatic starts drop the remote settings from the environment (`KACHE_S3_BUCKET`, `KACHE_S3_ENDPOINT`, `KACHE_S3_REGION`, `KACHE_S3_PREFIX`, `KACHE_S3_PROFILE`, `KACHE_S3_USER_AGENT`, `KACHE_LOCAL_ONLY`, `KACHE_REMOTE_READONLY`), so set these in the config file. Other environment is fixed when the process starts. An installed service uses its stored environment. To try remote variables from a shell, run `kache daemon run` in the foreground.
+The daemon also fingerprints the active config file and restarts after it changes. `kache daemon start` and automatic starts drop the settings that select the remote from the environment (`KACHE_S3_BUCKET`, `KACHE_S3_ENDPOINT`, `KACHE_S3_REGION`, `KACHE_S3_PREFIX`, `KACHE_S3_PROFILE`, `KACHE_S3_USER_AGENT`, `KACHE_LOCAL_ONLY`), so set these in the config file. To try remote variables from a shell, run `kache daemon run` in the foreground.
+
+`KACHE_REMOTE_READONLY` remains inherited so a daemon started by a read-only build cannot publish remote data. That restriction lasts for the daemon's lifetime. To enable uploads after clearing the flag, run `kache daemon restart` from the writable environment. Other environment is also fixed when the process starts. An installed service uses its stored environment; update that environment before restarting it.
 
 ## Shared lifecycle
 

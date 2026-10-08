@@ -14297,6 +14297,10 @@ fn an_unconnected_request_can_be_retried_safely() {
     )
     .unwrap_err();
     assert!(error.is::<DaemonConnectionFailure>());
+    assert_eq!(
+        error.to_string(),
+        "daemon connection failed before sending request"
+    );
 }
 
 struct ReadOnlyConsumerBackend {
@@ -14445,5 +14449,21 @@ fn an_auto_spawn_preserves_the_explicit_read_only_write_restriction() {
             .unwrap()
             .1,
         Some(std::ffi::OsStr::new("1"))
+    );
+}
+
+#[test]
+fn a_local_only_build_hint_does_not_start_a_daemon() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    send_build_started_with(
+        &config,
+        BuildStartedRequest {
+            intent: kache_core::BuildIntent::default(),
+            session_id: "local".into(),
+            client_epoch: 0,
+            client_version: None,
+        },
+        || panic!("a local-only build must not start a remote daemon"),
     );
 }

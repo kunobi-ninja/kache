@@ -394,6 +394,22 @@ embeds it in crate metadata, and every crate's sources live under it, so the
 checks above would pass for a value that does change the artifact. Kache warns
 when a list names it and ignores the entry.
 
+Build scripts can also share runs when a linker wrapper lives in each
+checkout. Set `KACHE_BASE_DIR` to the checkout root and opt the tool variable
+into normalization:
+
+```toml
+[cache]
+path_only_env_vars = ["RUSTC_LINKER"]
+```
+
+For build-script runs, plain `RUSTC_LINKER`, `RUSTC`, and `RUSTDOC` entries
+normalize a tool path under `KACHE_BASE_DIR` and hash the tool file's contents.
+Different tool bytes still produce different keys. Use this only when moving
+the tool between identical checkouts does not change its behavior. A wrapper
+that reads other files must declare those inputs with `cargo:rerun-if-changed`.
+Other variables and crate-scoped entries keep their existing behavior.
+
 Registry crates that bake an empty `OUT_DIR` need no entry. On Unix, Kache
 compiles a registry proc macro whose `OUT_DIR` is empty, or a registry lib that
 only proc macros link, against `<cache>/out-dirs/v1/d/<pkg>-<hash>/out`: an

@@ -440,19 +440,21 @@ fn stale(unit: &Unit, outputs: &Outputs, armed: SystemTime) -> Option<(Vec<PathB
     Some((parts, bytes))
 }
 
-/// Under each profile's locks, remove the units not used since `armed` (none
-/// when `None`) and arm the rest. `false` when a build held a profile, which
-/// was skipped.
+/// Hold every profile before removing or re-arming units. A partial pass must
+/// not reset a used unit's access time while keeping the old arming record.
+/// `false` when any profile is busy, with every unit left untouched.
 fn sweep(target_dir: &Path, armed: Option<SystemTime>) -> (Pruned, bool) {
     let mut pruned = Pruned::default();
-    let mut complete = true;
+    let mut held = Vec::new();
     for profile in profiles(target_dir) {
-        let Some(_locks) = hold(&profile) else {
-            complete = false;
-            continue;
+        let Some(locks) = hold(&profile) else {
+            return (pruned, false);
         };
-        let outputs = outputs(&profile);
-        for unit in units(&profile) {
+        held.push((profile, locks));
+    }
+    for (profile, _locks) in &held {
+        let outputs = outputs(profile);
+        for unit in units(profile) {
             if let Some((parts, bytes)) = armed.and_then(|armed| stale(&unit, &outputs, armed)) {
                 if remove(&parts).is_ok() {
                     pruned.units += 1;
@@ -466,7 +468,7 @@ fn sweep(target_dir: &Path, armed: Option<SystemTime>) -> (Pruned, bool) {
             arm(&unit.fingerprint());
         }
     }
-    (pruned, complete)
+    (pruned, true)
 }
 
 /// Cargo locks this process holds, released when dropped.
@@ -986,6 +988,57 @@ mod tests {
         }
         let (pruned, complete) = sweep(dir.path(), Some(ago(5)));
         assert_eq!((pruned.units, complete), (2, true));
+    }
+
+    #[test]
+    fn a_busy_profile_preserves_recent_use_in_every_profile() {
+        for per_unit in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let cache = dir.path().join("cache");
+            let target = dir.path().join("target");
+            for name in ["debug", "release"] {
+                let profile = target.join(name);
+                if per_unit {
+                    per_unit_profile(&profile);
+                } else {
+                    shared_profile(&profile);
+                }
+            }
+            set_times(&target, ago(60));
+            let window = Duration::from_secs(30 * DAY);
+            judge(&cache, &target, window, ago(40));
+            let record = armed_record(&cache, &target);
+            let armed = read_armed(&record).unwrap();
+            // Whichever profile is visited first must retain its evidence
+            // when a later profile is held by Cargo.
+            let ordered = profiles(&target);
+            let used = unit_named(&ordered[0], NEW);
+            read_now(&used);
+            let before: Vec<_> = entries(&used.fingerprint())
+                .iter()
+                .map(|file| std::fs::metadata(file).unwrap().accessed().unwrap())
+                .collect();
+            let locks = hold(&ordered[1]).unwrap();
+            assert_eq!(
+                judge(&cache, &target, window, SystemTime::now()),
+                Pruned::default()
+            );
+            assert_eq!(read_armed(&record), Some(armed));
+            assert_eq!(
+                entries(&used.fingerprint())
+                    .iter()
+                    .map(|file| std::fs::metadata(file).unwrap().accessed().unwrap())
+                    .collect::<Vec<_>>(),
+                before,
+                "a skipped pass must retain recent use"
+            );
+            assert_eq!(units(&ordered[0]).len(), 2);
+            drop(locks);
+            let pruned = judge(&cache, &target, window, SystemTime::now());
+            assert_eq!((pruned.units, pruned.used), (3, 1));
+            assert_eq!(units(&ordered[0]), vec![used]);
+            assert!(units(&ordered[1]).is_empty());
+        }
     }
 
     #[cfg(unix)]

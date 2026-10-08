@@ -400,9 +400,9 @@ fn env_only_remote_warns_but_a_file_configured_remote_does_not() {
     drop(restore_config);
 }
 
-/// The stripped list must stay exactly the set of variables that decide a
-/// remote. A new `KACHE_S3_*` knob added without updating the list would
-/// silently reintroduce the lottery for that setting.
+/// The stripped list covers remote selection. Write restrictions remain
+/// inherited so daemon publication cannot bypass a read-only caller.
+/// A new `KACHE_S3_*` selector must also be stripped.
 #[test]
 fn ambient_remote_env_list_covers_every_remote_deciding_var() {
     let documented = [
@@ -413,7 +413,6 @@ fn ambient_remote_env_list_covers_every_remote_deciding_var() {
         "KACHE_S3_PROFILE",
         "KACHE_S3_USER_AGENT",
         "KACHE_LOCAL_ONLY",
-        "KACHE_REMOTE_READONLY",
     ];
     assert_eq!(
         AMBIENT_REMOTE_ENV_VARS, &documented,
@@ -2733,10 +2732,16 @@ fn test_handle_gc_reports_lock_skip() {
     let _gc_lock = store.try_gc_lock().unwrap().expect("gc lock");
     let daemon = Daemon::new(config);
 
-    let resp = daemon.handle_gc(&GcRequest::automatic(daemon.config.gc_max_age_hours));
-    assert!(resp.ok);
-    assert!(resp.skipped);
-    assert_eq!(resp.evicted, Some(0));
+    let report = daemon
+        .run_gc(
+            GcPolicy::Automatic {
+                max_age_hours: daemon.config.gc_max_age_hours,
+            },
+            GcDriver::Periodic,
+        )
+        .unwrap();
+    assert!(report.total.skipped);
+    assert_eq!(report.total.entries_evicted, 0);
 }
 
 #[test]
@@ -3356,12 +3361,12 @@ fn gc_takes_each_stores_lock_on_its_own() {
     let daemon = Daemon::new(config);
     let policy = GcPolicy::Automatic { max_age_hours: 0 };
 
-    let report = daemon.run_gc(policy, GcDriver::Requested).unwrap();
+    let report = daemon.run_gc(policy, GcDriver::Periodic).unwrap();
     assert!(report.total.skipped);
     assert!(shard.contains("shard_entry"), "the shard's lock is held");
 
     drop(shard_lock);
-    let report = daemon.run_gc(policy, GcDriver::Requested).unwrap();
+    let report = daemon.run_gc(policy, GcDriver::Periodic).unwrap();
     assert!(report.total.skipped);
     assert!(!shard.contains("shard_entry"), "only the main lock is held");
 }
@@ -4043,7 +4048,7 @@ fn test_send_request_to_nonexistent_socket() {
     let socket_path = dir.path().join("nonexistent.sock");
 
     let req = Request::Gc(GcRequest::automatic(0));
-    let result = send_request(&socket_path, &req);
+    let result = send_request_with_timeout(&socket_path, &req, Duration::from_secs(30));
     assert!(result.is_err());
 }
 
@@ -12207,7 +12212,10 @@ async fn test_send_build_started_client_roundtrip() {
     let listener = bind_listener(&socket_path);
     let daemon = Arc::new(Daemon::new(config.clone()));
     let server = tokio::spawn(async move {
-        let stream = listener.accept().await.expect("accept");
+        let stream = tokio::time::timeout(Duration::from_secs(10), listener.accept())
+            .await
+            .expect("the build-started client must send its hint")
+            .expect("accept");
         let _ = handle_connection(stream, &daemon, &Arc::new(Lifecycle::default())).await;
     });
 
@@ -14150,4 +14158,501 @@ async fn retried_upload_keeps_its_intent_until_cancellation_or_a_terminal_outcom
         }
         assert!(Store::open(&daemon.config).unwrap().contains(&key));
     }
+}
+
+#[tokio::test]
+async fn upload_workers_receive_while_another_job_is_stalled() {
+    let (sender, receiver) = tokio::sync::mpsc::channel(8);
+    let receiver = Arc::new(tokio::sync::Mutex::new(receiver));
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut workers = Vec::new();
+    for _ in 0..4 {
+        let receiver = receiver.clone();
+        let release = release.clone();
+        let started = started_tx.clone();
+        workers.push(tokio::spawn(async move {
+            while let Some(job) = next_upload_job(&receiver).await {
+                started.send(job.key).unwrap();
+                release.acquire().await.unwrap().forget();
+            }
+        }));
+    }
+    drop(started_tx);
+    for index in 0..8 {
+        sender
+            .send(UploadJob {
+                key: index.to_string(),
+                entry_dir: String::new(),
+                crate_name: "serde".into(),
+                client_epoch: 0,
+                client_version: None,
+            })
+            .await
+            .unwrap();
+    }
+    drop(sender);
+    let mut seen = HashSet::new();
+    for _ in 0..4 {
+        let key = tokio::time::timeout(Duration::from_secs(2), started_rx.recv())
+            .await
+            .expect("all four workers must receive before any upload completes")
+            .unwrap();
+        assert!(seen.insert(key));
+    }
+    assert!(
+        receiver.try_lock().is_ok(),
+        "uploads cannot retain the receiver lock"
+    );
+    release.add_permits(8);
+    for worker in workers {
+        tokio::time::timeout(Duration::from_secs(2), worker)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    while let Some(key) = started_rx.recv().await {
+        assert!(seen.insert(key));
+    }
+    assert_eq!(seen.len(), 8, "every queued job is processed exactly once");
+    assert!(next_upload_job(&receiver).await.is_none());
+}
+
+#[test]
+fn requested_age_gc_waits_for_an_automatic_sweep_and_keeps_its_policy() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    seed_store_entry(&config, "aged-entry", "serde", dir.path());
+    let store = Store::open(&config).unwrap();
+    store.remove_clone_for_test(&dir.path().join("aged-entry-src/libfoo.rlib"));
+    store.set_last_accessed_for_test("aged-entry", "-48 hours");
+    let held = store.acquire_gc_lock().unwrap();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let daemon = Daemon::new(config);
+        started_tx.send(()).unwrap();
+        done_tx
+            .send(daemon.handle_gc(&GcRequest::explicit_age(24)))
+            .unwrap();
+    });
+    started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert!(
+        done_rx.recv_timeout(Duration::from_millis(100)).is_err(),
+        "explicit GC must wait for the automatic sweep"
+    );
+    drop(held);
+    let response = done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    worker.join().unwrap();
+    assert!(response.ok);
+    assert!(!response.skipped);
+    assert_eq!(response.gc.unwrap().mode, GcRequestMode::ExplicitAge);
+    assert!(!store.contains("aged-entry"));
+}
+
+#[tokio::test]
+async fn timed_out_gc_request_is_never_sent_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let socket = config.socket_path();
+    std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+    let listener = bind_listener(&socket);
+    let daemon = Arc::new(Daemon::new(config.clone()));
+    let server = tokio::spawn(async move {
+        let stream = listener.accept().await.unwrap();
+        handle_connection(stream, &daemon, &Arc::new(Lifecycle::default()))
+            .await
+            .unwrap();
+        let stream = listener.accept().await.unwrap();
+        let mut line = String::new();
+        BufReader::new(&stream).read_line(&mut line).await.unwrap();
+        let request: Request = serde_json::from_str(&line).unwrap();
+        assert!(matches!(request, Request::GcV2(_)));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), listener.accept())
+                .await
+                .is_err(),
+            "accepted GC must not be retried or capability-probed again"
+        );
+        drop(stream);
+    });
+    let error = tokio::task::spawn_blocking(move || {
+        send_gc_request_with_timeout(&config, Some(24), Duration::from_millis(75), || {
+            panic!("an accepted GC request cannot start another daemon")
+        })
+    })
+    .await
+    .unwrap()
+    .err()
+    .expect("the daemon never replies to GC");
+    assert!(format!("{error:#}").contains("request was not resent"));
+    assert!(!error.is::<DaemonConnectionFailure>());
+    server.await.unwrap();
+    assert_eq!(GC_REQUEST_TIMEOUT, Duration::from_secs(60 * 60));
+}
+
+#[test]
+fn an_unconnected_request_can_be_retried_safely() {
+    let dir = tempfile::tempdir().unwrap();
+    let error = send_request_with_timeout(
+        &dir.path().join("missing.sock"),
+        &Request::Health,
+        Duration::from_secs(1),
+    )
+    .unwrap_err();
+    assert!(error.is::<DaemonConnectionFailure>());
+    assert_eq!(
+        error.to_string(),
+        "daemon connection failed before sending request"
+    );
+}
+
+struct ReadOnlyConsumerBackend {
+    inner: Arc<dyn crate::remote_backend::RemoteBackend>,
+    writes: AtomicU64,
+}
+
+#[async_trait::async_trait]
+impl crate::remote_backend::RemoteBackend for ReadOnlyConsumerBackend {
+    async fn head(&self, key: &str) -> Result<bool> {
+        self.inner.head(key).await
+    }
+    async fn get(
+        &self,
+        key: &str,
+        max_bytes: Option<u64>,
+    ) -> Result<Option<crate::remote_backend::GetObject>> {
+        self.inner.get(key, max_bytes).await
+    }
+    async fn put(&self, _key: &str, _body: Vec<u8>, _content_type: Option<&str>) -> Result<()> {
+        self.writes.fetch_add(1, Ordering::SeqCst);
+        anyhow::bail!("read-only consumer attempted a write")
+    }
+    async fn put_if_absent(
+        &self,
+        _key: &str,
+        _body: Vec<u8>,
+        _content_type: Option<&str>,
+    ) -> Result<crate::remote_backend::PutIfAbsentResult> {
+        self.writes.fetch_add(1, Ordering::SeqCst);
+        anyhow::bail!("read-only consumer attempted a conditional write")
+    }
+    async fn list(&self, prefix: &str) -> Result<Vec<String>> {
+        self.inner.list(prefix).await
+    }
+    fn describe(&self, key: &str) -> String {
+        self.inner.describe(key)
+    }
+}
+
+#[tokio::test]
+async fn a_stopped_read_only_gcs_consumer_starts_for_reads_without_uploading() {
+    assert_read_only_consumer_can_restore(true).await;
+    assert_read_only_consumer_can_restore(false).await;
+}
+
+async fn assert_read_only_consumer_can_restore(daemon_readonly: bool) {
+    let donor = tempfile::tempdir().unwrap();
+    let consumer = tempfile::tempdir().unwrap();
+    let mut config = test_config(consumer.path());
+    let remote = crate::config::RemoteConfig {
+        prefix: "amh/v1".into(),
+        backend: crate::config::RemoteBackendConfig::Gcs(crate::config::GcsRemoteConfig {
+            bucket: "consumer-fixture".into(),
+            endpoint: None,
+        }),
+    };
+    config.remote = Some(remote.clone());
+    config.remote_readonly = true;
+    config.prefetch_enabled = false;
+    let key = test_cache_key("readonly-cold-restore");
+    let donor_config = test_config(donor.path());
+    seed_store_entry(&donor_config, &key, "serde", donor.path());
+    let backend = test_remote_backend();
+    crate::remote_layout::RemoteLayout::new(backend.as_ref(), &remote)
+        .upload_entry_until(
+            &key,
+            "serde",
+            &donor_config.store_dir().join(&key),
+            &Store::open(&donor_config).unwrap().blobs_dir(),
+            3,
+            None,
+        )
+        .await
+        .unwrap();
+    let shard = crate::remote::Shard {
+        version: 3,
+        entries: vec![crate::remote::ShardEntry {
+            cache_key: key.clone(),
+            crate_name: "serde".into(),
+            compile_time_ms: Some(1234),
+            artifact_size: Some(5678),
+        }],
+    };
+    put_test_object(
+        &backend,
+        &crate::remote::shard_object_key(&remote.prefix, "workspace", "abc"),
+        &serde_json::to_vec(&shard).unwrap(),
+    )
+    .await;
+    let backend = Arc::new(ReadOnlyConsumerBackend {
+        inner: backend,
+        writes: AtomicU64::new(0),
+    });
+    let mut daemon_config = config.clone();
+    daemon_config.remote_readonly = daemon_readonly;
+    let daemon = Arc::new(Daemon::new(daemon_config));
+    daemon.set_remote_backend_for_test(backend.clone());
+    daemon.signal_warming_complete();
+    let socket = config.socket_path();
+    assert!(
+        !crate::transport::is_reachable(&socket),
+        "consumer starts without a daemon"
+    );
+    let runtime = tokio::runtime::Handle::current();
+    let server_daemon = daemon.clone();
+    let starter_config = config.clone();
+    let starter_calls = Arc::new(AtomicU64::new(0));
+    let calls = starter_calls.clone();
+    let (server_tx, server_rx) = std::sync::mpsc::channel();
+    let client = tokio::task::spawn_blocking(move || {
+        let request = || BuildStartedRequest {
+            intent: kache_core::BuildIntent {
+                identity_key: Some("id/readonly-fixture".into()),
+                ..Default::default()
+            },
+            session_id: "readonly-fixture".into(),
+            client_epoch: 0,
+            client_version: None,
+        };
+        send_build_started_with(&config, request(), move || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            let socket = starter_config.socket_path();
+            std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+            let listener = bind_listener(&socket);
+            let server = runtime.spawn(async move {
+                while let Ok(stream) = listener.accept().await {
+                    let _ =
+                        handle_connection(stream, &server_daemon, &Arc::new(Lifecycle::default()))
+                            .await;
+                }
+            });
+            server_tx.send(server).unwrap();
+            Ok(true)
+        });
+        send_build_started_with(&config, request(), || {
+            panic!("live daemon needs no startup probe")
+        });
+        let result =
+            send_remote_check(&config, &key, &config.store_dir().join(&key), "serde", None)
+                .expect("read-only consumers can ask the daemon for remote entries");
+        assert!(result.found);
+        let store = Store::open(&config).unwrap();
+        assert!(store.contains(&key));
+        send_upload_job(&config, &key, &store.entry_dir(&key), "serde").unwrap();
+        assert!(load_upload_jobs(&config).unwrap().is_empty());
+    });
+    client.await.unwrap();
+    {
+        let plan = daemon.active_plan.lock().unwrap();
+        let plan = plan.as_ref().expect("read-only session is still tracked");
+        assert_eq!(
+            plan.identity_key, None,
+            "a writable daemon cannot auto-publish a read-only caller's identity"
+        );
+    }
+    daemon.finalize_inactive_plan(0);
+    assert!(daemon.active_plan.lock().unwrap().is_none());
+    let restored_shard = daemon
+        .download_planner_shard("workspace", "abc")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        restored_shard.entries, shard.entries,
+        "read-only consumers still read planner shards"
+    );
+    let server = server_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    server.abort();
+    assert_eq!(starter_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(backend.writes.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        daemon
+            .transfer_counters
+            .uploads_completed
+            .load(Ordering::Relaxed),
+        0
+    );
+}
+
+#[test]
+fn an_auto_spawn_preserves_the_explicit_read_only_write_restriction() {
+    let mut command = std::process::Command::new("kache");
+    command.env("KACHE_REMOTE_READONLY", "1");
+    strip_ambient_remote_env(&mut command);
+    assert_eq!(
+        command
+            .get_envs()
+            .find(|(name, _)| *name == "KACHE_REMOTE_READONLY")
+            .unwrap()
+            .1,
+        Some(std::ffi::OsStr::new("1"))
+    );
+}
+
+#[test]
+fn a_local_only_build_hint_does_not_start_a_daemon() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    send_build_started_with(
+        &config,
+        BuildStartedRequest {
+            intent: kache_core::BuildIntent::default(),
+            session_id: "local".into(),
+            client_epoch: 0,
+            client_version: None,
+        },
+        || panic!("a local-only build must not start a remote daemon"),
+    );
+}
+
+#[tokio::test]
+async fn a_writable_build_hint_keeps_its_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path());
+    config.remote = Some(test_remote_config());
+    let socket = config.socket_path();
+    std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+    let listener = bind_listener(&socket);
+    let server = tokio::spawn(async move {
+        let stream = tokio::time::timeout(Duration::from_secs(10), listener.accept())
+            .await
+            .expect("the writable build hint must reach the daemon")
+            .unwrap();
+        let mut line = String::new();
+        BufReader::new(stream).read_line(&mut line).await.unwrap();
+        let request: Request = serde_json::from_str(&line).unwrap();
+        let Request::BuildStarted(request) = request else {
+            panic!("expected build hint")
+        };
+        assert_eq!(request.intent.identity_key.as_deref(), Some("id/writer"));
+    });
+    tokio::task::spawn_blocking(move || {
+        send_build_started_with(
+            &config,
+            BuildStartedRequest {
+                intent: kache_core::BuildIntent {
+                    identity_key: Some("id/writer".into()),
+                    ..Default::default()
+                },
+                session_id: "writer".into(),
+                client_epoch: 0,
+                client_version: None,
+            },
+            || panic!("live daemon does not need startup"),
+        )
+    })
+    .await
+    .unwrap();
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn async_daemon_transport_reads_the_actual_response() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let socket = config.socket_path();
+    std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+    let listener = bind_listener(&socket);
+    let daemon = Arc::new(Daemon::new(config));
+    let server = tokio::spawn(async move {
+        let stream = listener.accept().await.unwrap();
+        handle_connection(stream, &daemon, &Arc::new(Lifecycle::default()))
+            .await
+            .unwrap();
+    });
+    let line = format!("{}\n", serde_json::to_string(&Request::Health).unwrap());
+    let response = tokio::time::timeout(
+        Duration::from_secs(2),
+        send_request_with_async_transport(&socket, line, Duration::from_secs(2)),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let response: Response = serde_json::from_str(&response).unwrap();
+    assert!(response.ok);
+    assert_eq!(response.health.unwrap().version, VERSION);
+    tokio::time::timeout(Duration::from_secs(2), server)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn async_daemon_transport_marks_connection_failures_before_send() {
+    let dir = tempfile::tempdir().unwrap();
+    let line = format!("{}\n", serde_json::to_string(&Request::Health).unwrap());
+    let error = send_request_with_async_transport(
+        &dir.path().join("missing.sock"),
+        line,
+        Duration::from_secs(1),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.is::<DaemonConnectionFailure>());
+}
+
+#[tokio::test]
+async fn gc_retries_when_the_probed_daemon_disappears_before_send() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let socket = config.socket_path();
+    std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+    let listener = bind_listener(&socket);
+    let daemon = Arc::new(Daemon::new(config.clone()));
+    let first_daemon = daemon.clone();
+    let first_server = tokio::spawn(async move {
+        let stream = listener.accept().await.unwrap();
+        // The connected stats probe can finish after the listener disappears.
+        // Its response therefore proves that the next connect must be retried.
+        drop(listener);
+        handle_connection(stream, &first_daemon, &Arc::new(Lifecycle::default()))
+            .await
+            .unwrap();
+    });
+    let runtime = tokio::runtime::Handle::current();
+    let calls = Arc::new(AtomicU64::new(0));
+    let starter_calls = calls.clone();
+    let (server_tx, server_rx) = std::sync::mpsc::channel();
+    let outcome = tokio::task::spawn_blocking(move || {
+        send_gc_request_with_timeout(&config, Some(17), Duration::from_secs(2), || {
+            starter_calls.fetch_add(1, Ordering::SeqCst);
+            let listener = bind_listener(&socket);
+            let daemon = daemon.clone();
+            let server = runtime.spawn(async move {
+                for _ in 0..2 {
+                    let stream = listener.accept().await.unwrap();
+                    handle_connection(stream, &daemon, &Arc::new(Lifecycle::default()))
+                        .await
+                        .unwrap();
+                }
+            });
+            server_tx.send(server).unwrap();
+            Ok(true)
+        })
+    })
+    .await
+    .unwrap()
+    .expect("a pre-send connection failure safely restarts and retries GC");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(!outcome.skipped);
+    assert_eq!(outcome.breakdown.unwrap().mode, GcRequestMode::ExplicitAge);
+    first_server.await.unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        server_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
 }

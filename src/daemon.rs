@@ -879,9 +879,9 @@ pub enum GcRequestMode {
     ExplicitAge,
 }
 
-/// Who started a daemon sweep. It decides only the size pass: a requested
-/// `kache gc` always runs it, the timer asks the shared trigger and backoff
-/// like every other automatic driver.
+/// Who started a daemon sweep. A requested `kache gc` waits for the lock
+/// and runs its size pass; the timer skips a busy lock and follows the
+/// shared trigger and backoff.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GcDriver {
     Requested,
@@ -6767,18 +6767,21 @@ impl Daemon {
         let start = Instant::now();
         let mode = policy.mode();
         // Cross-process GC mutual exclusion (kunobi-ninja/kache#326): if another
-        // GC driver (a manual `kache gc`, a second daemon) holds gc.lock, skip
-        // this run rather than double-scan and contend. Held until run_gc returns.
+        // GC driver holds gc.lock, automatic sweeps skip. Requested sweeps
+        // wait so a startup sweep cannot discard the requested age policy.
         // GC may scan and remove thousands of entries. Use its own connection
         // so daemon lookups and uploads can still reach the main Store mutex.
         // SQLite and gc.lock continue to serialize the actual writes.
         let gc_store = Store::open(config)?;
-        let _gc_lock = match gc_store.try_gc_lock()? {
-            Some(lock) => lock,
-            None => {
-                tracing::info!("gc.lock held by another GC; skipping this run");
-                return Ok(GcRunReport::skipped(mode));
-            }
+        let _gc_lock = match driver {
+            GcDriver::Requested => gc_store.acquire_gc_lock()?,
+            GcDriver::Periodic => match gc_store.try_gc_lock()? {
+                Some(lock) => lock,
+                None => {
+                    tracing::info!("gc.lock held by another GC; skipping this run");
+                    return Ok(GcRunReport::skipped(mode));
+                }
+            },
         };
         let (dedup_stats, evict_stats, age_evict_stats, incremental_cleaned, orphan_stats) =
             (|| -> Result<_> {
@@ -7199,6 +7202,13 @@ async fn run_upload_job(daemon: &Daemon, job: &UploadJob) -> Response {
     resp
 }
 
+/// Drop the shared receiver guard before the worker starts network or GC work.
+async fn next_upload_job(
+    receiver: &tokio::sync::Mutex<tokio::sync::mpsc::Receiver<UploadJob>>,
+) -> Option<UploadJob> {
+    receiver.lock().await.recv().await
+}
+
 fn upload_result_is_terminal(error: Option<&str>) -> bool {
     !error.is_some_and(|error| error.starts_with("retryable:"))
 }
@@ -7312,7 +7322,7 @@ async fn server_main(
         let rx = worker_rx.clone();
         let d = daemon.clone();
         upload_handles.push(tokio::spawn(async move {
-            while let Some(job) = rx.lock().await.recv().await {
+            while let Some(job) = next_upload_job(&rx).await {
                 run_upload_job(&d, &job).await;
             }
         }));
@@ -8861,8 +8871,24 @@ fn gc_hint_accepted(reply: Result<String>) -> bool {
         .is_some_and(|resp| resp.ok)
 }
 
+const GC_REQUEST_TIMEOUT: Duration = Duration::from_secs(3600);
+
 /// Send a GC request to the daemon. Auto-starts daemon if needed.
 pub fn send_gc_request(config: &Config, max_age_hours: Option<u64>) -> Result<GcRequestOutcome> {
+    send_gc_request_with_timeout(
+        config,
+        max_age_hours,
+        GC_REQUEST_TIMEOUT,
+        start_daemon_background,
+    )
+}
+
+fn send_gc_request_with_timeout(
+    config: &Config,
+    max_age_hours: Option<u64>,
+    read_timeout: Duration,
+    mut start: impl FnMut() -> Result<bool>,
+) -> Result<GcRequestOutcome> {
     let socket_path = config.socket_path();
 
     // Capability-check before mutation. New clients send v2 fields that an
@@ -8872,7 +8898,7 @@ pub fn send_gc_request(config: &Config, max_age_hours: Option<u64>) -> Result<Gc
     match send_stats_request(config, false, None, None) {
         Ok(stats) => require_gc_policy_support(&stats)?,
         Err(_) => {
-            require_daemon_started(start_daemon_background()?)?;
+            require_daemon_started(start()?)?;
             let stats = send_stats_request(config, false, None, None)
                 .context("probing GC policy support after daemon start")?;
             require_gc_policy_support(&stats)?;
@@ -8887,23 +8913,26 @@ pub fn send_gc_request(config: &Config, max_age_hours: Option<u64>) -> Result<Gc
     });
 
     let try_send = |path: &Path| -> Result<Response> {
-        let resp_str = send_request(path, &req)?;
+        let resp_str = send_request_with_timeout(path, &req, read_timeout)?;
         let resp: Response = serde_json::from_str(&resp_str)?;
         Ok(resp)
     };
 
     match try_send(&socket_path) {
         Ok(resp) => gc_outcome_from_response(resp),
-        Err(_) => {
+        Err(error) if error.is::<DaemonConnectionFailure>() => {
             // The daemon may have exited after the capability probe. Any
             // replacement must pass the same pre-mutation check before retry.
-            require_daemon_started(start_daemon_background()?)?;
+            require_daemon_started(start()?)?;
             let stats = send_stats_request(config, false, None, None)
                 .context("probing GC policy support before retry")?;
             require_gc_policy_support(&stats)?;
             let resp = try_send(&socket_path)?;
             gc_outcome_from_response(resp)
         }
+        // A write or read failure may follow an accepted request. Its sweep
+        // keeps running; replaying it can repeat eviction or discard its policy.
+        Err(error) => Err(error.context("GC outcome unknown; request was not resent")),
     }
 }
 
@@ -9043,11 +9072,25 @@ fn hash_files_results_from_response_line(resp_str: &str) -> Result<Vec<HashFileR
     Ok(resp.hash_results.unwrap_or_default())
 }
 
-/// Send a build-started hint to the daemon. Non-blocking, fire-and-forget.
+/// Send the once-per-session build hint, starting the daemon when needed.
+/// Read-only consumers need the same daemon reads as writable builds.
 ///
 /// The declared client release lets a daemon finish accepted work and drain
-/// for a newer release without adding a readiness round trip to the build.
+/// for a newer release. A running daemon needs no readiness round trip.
 pub fn send_build_started(config: &Config, req: BuildStartedRequest) {
+    send_build_started_with(config, req, start_daemon_background);
+}
+
+fn send_build_started_with(
+    config: &Config,
+    mut req: BuildStartedRequest,
+    start: impl FnOnce() -> Result<bool>,
+) {
+    if config.remote_readonly {
+        // Older writable daemons publish this identity when the session ends.
+        // Omit it for read-only callers; key and shard reads remain available.
+        req.intent.identity_key = None;
+    }
     let socket_path = config.socket_path();
     let crate_count = req.intent.crate_names.len();
 
@@ -9057,8 +9100,19 @@ pub fn send_build_started(config: &Config, req: BuildStartedRequest) {
         Ok(()) => {
             tracing::debug!("build-started hint sent for {} crates", crate_count);
         }
-        Err(e) => {
-            tracing::debug!("build-started hint: daemon unreachable ({e}), skipping");
+        Err(error) => {
+            if config.remote.is_none() {
+                return;
+            }
+            tracing::debug!("build-started hint: starting daemon after {error:#}");
+            match start() {
+                Ok(true) => {
+                    if let Err(error) = send_request_fire_and_forget(&socket_path, &req) {
+                        tracing::debug!("build-started hint after startup failed: {error:#}");
+                    }
+                }
+                result => tracing::debug!("build-started daemon startup failed: {result:?}"),
+            }
         }
     }
 }
@@ -9393,10 +9447,16 @@ pub(crate) fn restart_daemon_for_stale_client(config: &Config) -> Result<bool> {
     restart(config)
 }
 
-/// Send a request to the daemon, return the response line.
-fn send_request(socket_path: &Path, req: &Request) -> Result<String> {
-    send_request_with_timeout(socket_path, req, std::time::Duration::from_secs(30))
+#[derive(Debug)]
+struct DaemonConnectionFailure;
+
+impl std::fmt::Display for DaemonConnectionFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("daemon connection failed before sending request")
+    }
 }
+
+impl std::error::Error for DaemonConnectionFailure {}
 
 /// Send a request to the daemon with a configurable read timeout.
 pub(crate) fn send_request_with_timeout(
@@ -9427,7 +9487,8 @@ fn send_request_with_socket_timeout(
 
     let name = socket_name(socket_path)?;
     let mut stream = SyncStream::connect(name)
-        .with_context(|| format!("connecting to daemon socket {}", socket_path.display()))?;
+        .with_context(|| format!("connecting to daemon socket {}", socket_path.display()))
+        .context(DaemonConnectionFailure)?;
 
     // Best-effort timeouts: supported on Unix (UDS), not on Windows (named pipes).
     let _ = stream.set_recv_timeout(Some(read_timeout));
@@ -9502,7 +9563,7 @@ fn send_request_with_async_timeout_blocking(
     })
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 async fn send_request_with_async_transport(
     socket_path: &Path,
     line: String,
@@ -9511,7 +9572,8 @@ async fn send_request_with_async_transport(
     let name = socket_name(socket_path)?;
     let mut stream = TokioStream::connect(name)
         .await
-        .with_context(|| format!("connecting to daemon socket {}", socket_path.display()))?;
+        .with_context(|| format!("connecting to daemon socket {}", socket_path.display()))
+        .context(DaemonConnectionFailure)?;
 
     stream
         .write_all(line.as_bytes())
@@ -9548,7 +9610,8 @@ fn send_request_fire_and_forget(socket_path: &Path, req: &Request) -> Result<()>
 
     let name = socket_name(socket_path)?;
     let mut stream = SyncStream::connect(name)
-        .with_context(|| format!("connecting to daemon socket {}", socket_path.display()))?;
+        .with_context(|| format!("connecting to daemon socket {}", socket_path.display()))
+        .context(DaemonConnectionFailure)?;
 
     let _ = stream.set_send_timeout(Some(std::time::Duration::from_secs(5)));
 
@@ -9602,6 +9665,8 @@ pub(crate) fn existing_daemon_run_lock_is_held(socket_path: &Path) -> Result<boo
 
 /// Environment variables that decide the daemon's REMOTE, stripped from an
 /// auto-spawned daemon's environment (kunobi-ninja/kache#706).
+/// `KACHE_REMOTE_READONLY` remains inherited: it restricts writes rather than
+/// selecting the remote, including automatic manifest publication.
 ///
 /// A background daemon outlives the build that happened to start it and serves
 /// every later build on the machine, so inheriting these makes its remote a
@@ -9629,7 +9694,6 @@ const AMBIENT_REMOTE_ENV_VARS: &[&str] = &[
     "KACHE_S3_PROFILE",
     "KACHE_S3_USER_AGENT",
     "KACHE_LOCAL_ONLY",
-    "KACHE_REMOTE_READONLY",
 ];
 
 /// Warn when this build's environment is the ONLY place a remote is

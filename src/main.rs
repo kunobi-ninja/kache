@@ -2155,6 +2155,7 @@ mod tests {
                 "monitor",
                 "explain",
                 "list",
+                "prefetch",
                 "sync",
                 "login",
                 "logout",

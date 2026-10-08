@@ -183,6 +183,7 @@ async fn select_report(
     deadline: Instant,
 ) -> Result<Option<BuildReport>> {
     let timeout = crate::remote_resilience::RemoteDeadline::from_instant(Some(deadline));
+    timeout.check("warm-set discovery")?;
     let keys = timeout
         .run(
             "warm-set discovery",
@@ -191,6 +192,7 @@ async fn select_report(
         .await?;
     let mut selected: Option<BuildReport> = None;
     for key in keys {
+        timeout.check("warm-set report")?;
         let report = timeout
             .run(
                 "warm-set report",

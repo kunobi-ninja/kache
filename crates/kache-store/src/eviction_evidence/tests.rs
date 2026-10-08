@@ -207,3 +207,73 @@ fn evidence_query_is_read_only_and_rejects_invalid_horizons() {
         1
     );
 }
+
+#[test]
+fn a_request_at_the_eviction_instant_is_valid_recorded_demand() {
+    let db = database();
+    live(&db, "instant", 100, Some(100), true, 1 << 30, 700);
+    let c = read(&db, 200, 100).unwrap().live_shadow_agreed;
+    assert_eq!(
+        (c.invalid, c.mature, c.demand_within_horizon_lower),
+        (0, 1, 1)
+    );
+    assert_eq!(c.demanded_gross_compile_cost_ms_lower, 700);
+}
+
+#[test]
+fn shadow_proofs_respect_each_timestamp_and_counter_boundary() {
+    // Isolate each observation so swapping in-window/out-of-window rows
+    // cannot leave an aggregate demand total unchanged.
+    for (stamp, hits, expected) in [
+        (99, 6, 0),
+        (100, 6, 1),
+        (200, 6, 1),
+        (201, 6, 0),
+        (150, 5, 0),
+        (150, 1, 0),
+    ] {
+        let db = database();
+        shadow(&db, "only", 100, 5);
+        hit(&db, "only", stamp, hits);
+        let c = read(&db, 300, 100).unwrap().shadow_only;
+        assert_eq!(
+            c.demand_within_horizon_lower, expected,
+            "hit stamp={stamp}, hits={hits}"
+        );
+        assert_eq!(c.demand_within_horizon_upper, 1);
+        assert_eq!(c.demanded_gross_compile_cost_ms_lower, expected * 500);
+    }
+    for (stamp, hits, expected) in [
+        (199, 6, 1),
+        (200, 6, 1),
+        (201, 6, 0),
+        (200, 5, 0),
+        (200, 4, 0),
+    ] {
+        let db = database();
+        shadow(&db, "only", 100, 5);
+        live(&db, "only", stamp, None, true, 100, 700);
+        db.execute("UPDATE eviction_tombstones SET hit_count=?1", [hits])
+            .unwrap();
+        let c = read(&db, 300, 100).unwrap().shadow_only;
+        assert_eq!(
+            c.demand_within_horizon_lower, expected,
+            "eviction stamp={stamp}, hits={hits}"
+        );
+        assert_eq!(c.demand_within_horizon_upper, 1);
+        assert_eq!(c.demanded_gross_compile_cost_ms_lower, expected * 500);
+    }
+}
+
+#[test]
+fn logical_gib_normalization_changes_both_cost_bounds() {
+    let mut c = EvictionEvidenceCohort {
+        known_cost_logical_bytes: 2_147_483_648,
+        demanded_gross_compile_cost_ms_lower: 900,
+        demanded_gross_compile_cost_ms_upper: 1800,
+        ..Default::default()
+    };
+    assert_eq!(c.demanded_cost_ms_per_logical_gib(), Some((450.0, 900.0)));
+    c.known_cost_logical_bytes = 536_870_912;
+    assert_eq!(c.demanded_cost_ms_per_logical_gib(), Some((1800.0, 3600.0)));
+}

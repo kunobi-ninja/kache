@@ -9557,7 +9557,7 @@ fn send_request_with_async_timeout_blocking(
     })
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 async fn send_request_with_async_transport(
     socket_path: &Path,
     line: String,

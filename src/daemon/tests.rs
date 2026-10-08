@@ -14548,3 +14548,48 @@ async fn a_writable_build_hint_keeps_its_identity() {
     .unwrap();
     server.await.unwrap();
 }
+
+#[tokio::test]
+async fn async_daemon_transport_reads_the_actual_response() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let socket = config.socket_path();
+    std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+    let listener = bind_listener(&socket);
+    let daemon = Arc::new(Daemon::new(config));
+    let server = tokio::spawn(async move {
+        let stream = listener.accept().await.unwrap();
+        handle_connection(stream, &daemon, &Arc::new(Lifecycle::default()))
+            .await
+            .unwrap();
+    });
+    let line = format!("{}\n", serde_json::to_string(&Request::Health).unwrap());
+    let response = tokio::time::timeout(
+        Duration::from_secs(2),
+        send_request_with_async_transport(&socket, line, Duration::from_secs(2)),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let response: Response = serde_json::from_str(&response).unwrap();
+    assert!(response.ok);
+    assert_eq!(response.health.unwrap().version, VERSION);
+    tokio::time::timeout(Duration::from_secs(2), server)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn async_daemon_transport_marks_connection_failures_before_send() {
+    let dir = tempfile::tempdir().unwrap();
+    let line = format!("{}\n", serde_json::to_string(&Request::Health).unwrap());
+    let error = send_request_with_async_transport(
+        &dir.path().join("missing.sock"),
+        line,
+        Duration::from_secs(1),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.is::<DaemonConnectionFailure>());
+}

@@ -101,6 +101,8 @@ class DeadlineReached(Exception):
 def run_contention(args, arms, timeout=None):
     output = args.output.resolve() / "contention"
     samples = getattr(args, "contention_samples", None) or args.samples
+    cold_every = getattr(args, "contention_cold_every", 3)
+    context_samples = min(getattr(args, "context_samples", None) or samples, samples)
     command = [
         sys.executable,
         str(CONTENTION_SCRIPT),
@@ -111,7 +113,9 @@ def run_contention(args, arms, timeout=None):
         "--samples",
         str(samples),
         "--cold-every",
-        "3",
+        str(cold_every),
+        "--context-samples",
+        str(context_samples),
         "--order-seed",
         str(args.order_seed),
         "--output",
@@ -127,7 +131,7 @@ def run_contention(args, arms, timeout=None):
     # Only a run's deadline bounds the whole stage; it can take longer than the
     # isolated engine's timeout.
     print(
-        f"{args.project}: contention, {samples} warm batches and {math.ceil(samples / 3)} cold seeds per arm; see contention.log",
+        f"{args.project}: contention, {samples} warm batches and {math.ceil(samples / cold_every)} cold seeds per Kache arm; reference tools take {context_samples} batches; see contention.log",
         flush=True,
     )
     with (args.output / "contention.log").open("w") as stream:
@@ -149,7 +153,8 @@ def run_contention(args, arms, timeout=None):
         for sample in range(samples)
         for arm, _, _ in arms
         for phase in ("cold", "warm")
-        if phase == "warm" or sample % 3 == 0
+        if (phase == "warm" or sample % cold_every == 0)
+        and (arm in VERDICT_ARMS or sample < context_samples)
     }
     actual = [(r["sample"], r["arm"], r["phase"]) for r in data["records"]]
     if data.get("error") or set(actual) != expected or len(actual) != len(expected):
@@ -561,7 +566,14 @@ def main():
         "--contention-samples",
         type=int,
         choices=range(1, 21),
-        help="warm batches per arm; defaults to --samples, with a fresh cold seed every third sample",
+        help="warm batches of Kache per arm; defaults to --samples",
+    )
+    parser.add_argument(
+        "--contention-cold-every",
+        type=int,
+        choices=range(1, 21),
+        default=3,
+        help="fresh cold contention seed every N warm batches; use 1 for paired cold verdicts",
     )
     parser.add_argument(
         "--context-samples",

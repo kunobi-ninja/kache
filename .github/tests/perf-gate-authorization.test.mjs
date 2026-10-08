@@ -108,7 +108,7 @@ test("an ordinary ready same-repository PR remains eligible", () => {
     base_ref: "main",
     samples: "6",
     context_samples: "1",
-    contention_samples: "1",
+    contention_samples: "6",
   });
 });
 
@@ -151,3 +151,33 @@ test("quarantine applies to the branch prefix rather than an interior substring"
   pr.head.ref = "feature/review-contribution/cache-fix";
   assert.equal(authorization(pr).outputs.eligible, "true");
 });
+
+for (const [name, overrides] of [
+  ["ordinary", {}],
+  ["expanded", { labels: [{ name: "bench" }] }],
+]) {
+  test(`${name} CI can reject sustained cold duplicate growth`, () => {
+    const outputs = authorization(pullRequest(overrides)).outputs;
+    const measure = workflow.jobs.measure.steps.find(
+      (step) => step.name === "Measure repeated samples",
+    );
+    const coldEvery = measure.run.match(/--contention-cold-every (\d+)/)?.[1];
+    assert.ok(coldEvery, "measurement must pass a cold contention cadence");
+    assert.equal(measure.env.BENCH_CONTENTION_SAMPLES, "${{ needs.authorize.outputs.contention_samples }}");
+    assert.match(measure.run, /--contention-samples "\$BENCH_CONTENTION_SAMPLES"/);
+    const result = spawnSync("python3", [
+      "-m", "unittest", "bench.tests.test_contention_counts.ContentionCountTests.test_ci_sampling_rejects_sustained_cold_growth",
+    ], {
+      encoding: "utf8", timeout: 10_000,
+      env: {
+        PATH: process.env.PATH,
+        PYTHONPATH: path.resolve(import.meta.dirname, "../../scripts"),
+        PERF_TEST_CONTENTION_SAMPLES: outputs.contention_samples,
+        PERF_TEST_COLD_EVERY: coldEvery,
+        PERF_TEST_CONTEXT_SAMPLES: outputs.context_samples,
+      },
+    });
+    assert.ifError(result.error);
+    assert.equal(result.status, 0, result.stdout + result.stderr);
+  });
+}

@@ -1,9 +1,9 @@
 name: Perf gate
 
 # hk, eza and aube, Kache head/base plus mbx on each subject's runner.
-# Six paired Kache runs normally (six warm pairs, two cold seeds), with mbx and
-# contention measured once; the bench label or [bench] title measures both and
-# contention six times, including same-repo drafts. sccache is pinned and runs
+# Six paired isolated Kache runs (six warm pairs, two cold seeds), plus six
+# cold and warm contention pairs. mbx is measured once; the bench label or
+# [bench] title repeats mbx six times, including same-repo drafts. sccache runs
 # only in the weekly reference (bench-sccache.yml).
 # The instrument and policy come from the default branch. Only the two Kache
 # binaries vary with the PR. The published perf-gate/warm status remains optional.
@@ -141,15 +141,14 @@ jobs:
           state="$(jq -r '.state // empty' <<<"$pr_json")"
           expanded="$(jq -r '((.title | contains("[bench]")) or any(.labels[]; .name == "bench"))' <<<"$pr_json")"
           # Six paired runs of this PR against its base give the paired test
-          # enough to rule on the warm builds. Other tools and contention are
-          # context, so a normal run measures them once; the bench label
-          # measures everything six times.
+          # enough to rule on warm builds. Contention also needs six fresh
+          # cold pairs to test duplicate growth. mbx is context and runs once
+          # unless the bench label requests repeated reference measurements.
           samples=6
           context_samples=1
-          contention_samples=1
+          contention_samples=6
           if [ "$expanded" = "true" ]; then
             context_samples=6
-            contention_samples=6
           fi
           draft="$(jq -r '.draft' <<<"$pr_json")"
 
@@ -199,10 +198,9 @@ jobs:
     # request off the single reserved-node runner the heavy benchmarks queue
     # on.
     runs-on: ${{ fromJSON(vars.PERF_RUNNER_LINUX || (github.repository == 'kunobi-ninja/kache' && '"kunobi-runners"')) }}
-    # Six builds of the subject (three phases x two commits) plus two builds of
-    # kache itself. Normal runs land well inside this; the cap exists so a stall
-    # is killed in an hour rather than at GitHub's 6h default.
-    timeout-minutes: 100
+    # Six fresh cold contention pairs plus warm and isolated measurements,
+    # with time outside the measurement step for both Kache builds and uploads.
+    timeout-minutes: 160
     permissions:
       contents: read
     defaults:
@@ -387,7 +385,7 @@ jobs:
             "http.https://github.com/.extraheader" "AUTHORIZATION: basic $header"
 
       - name: Measure repeated samples
-        timeout-minutes: 60
+        timeout-minutes: 120
         env:
           BENCH_PROJECT: ${{ matrix.project }}
           BENCH_SAMPLES: ${{ needs.authorize.outputs.samples }}
@@ -403,11 +401,12 @@ jobs:
           set -euo pipefail
           # Five minutes inside the step limit above, so a run that runs out
           # of time stops itself and reports what it finished.
-          export BENCH_DEADLINE_AT=$(( $(date +%s) + 55 * 60 ))
+          export BENCH_DEADLINE_AT=$(( $(date +%s) + 115 * 60 ))
           status=0
           python3 "$RUNNER_TEMP/instrument/bench-short.py" \
             --project "$BENCH_PROJECT" --samples "$BENCH_SAMPLES" --order-seed "$ORDER_SEED" \
             --context-samples "$BENCH_CONTEXT_SAMPLES" --contention-samples "$BENCH_CONTENTION_SAMPLES" \
+            --contention-cold-every 1 \
             --engine "$RUNNER_TEMP/instrument/kache-scenario" \
             --scenarios "$RUNNER_TEMP/instrument/scenarios" \
             --kache "$RUNNER_TEMP/head/kache" --base "$RUNNER_TEMP/base/kache" \

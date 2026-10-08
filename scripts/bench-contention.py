@@ -1108,10 +1108,13 @@ def write_scenario_files(repo, files):
 
 def run_batches(args, arms, mirror, work, data):
     workload = getattr(args, "workload", JOBS)
+    context_samples = getattr(args, "context_samples", None) or args.samples
     for sample in range(args.samples):
         for arm, binary, scheduler, backend in (
             arms if (sample + args.order_seed) % 2 == 0 else list(reversed(arms))
         ):
+            if backend != "kache" and sample >= context_samples:
+                continue
             cell = work / f"{sample // args.cold_every:02d}-{arm}"
             cold = sample % args.cold_every == 0
             if cold:
@@ -1174,7 +1177,11 @@ def run_batches(args, arms, mirror, work, data):
                 for repo in repos:
                     remove_owned_tree(repo / "target")
                 remove_owned_tree(store)
-                if (sample + 1) % args.cold_every == 0 or sample + 1 == args.samples:
+                if (
+                    (sample + 1) % args.cold_every == 0
+                    or sample + 1 == args.samples
+                    or (backend != "kache" and sample + 1 == context_samples)
+                ):
                     remove_owned_tree(cell)
 
 
@@ -1191,6 +1198,12 @@ def main():
         choices=range(1, 21),
         default=1,
         help="measure a fresh cold seed every N warm samples",
+    )
+    parser.add_argument(
+        "--context-samples",
+        type=int,
+        choices=range(1, 21),
+        help="batches of sccache and mbx; defaults to --samples",
     )
     parser.add_argument("--parallelism", type=int, choices=range(1, 7), default=6)
     parser.add_argument("--jobs-per-build", type=int, default=4)
@@ -1266,6 +1279,7 @@ def main():
         "revision": source["ref"],
         "machine": machine(),
         "samples": args.samples,
+        "context_samples": args.context_samples or args.samples,
         "cold_every": args.cold_every,
         "parallelism": args.parallelism,
         "jobs_per_build": args.jobs_per_build,

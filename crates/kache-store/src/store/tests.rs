@@ -12626,3 +12626,109 @@ fn duplicate_eviction_does_not_probe_unselected_held_entries() {
     assert_eq!(age.entries_evicted, 1);
 }
 
+#[test]
+fn quarantine_suffix_matches_only_timestamp_pid_and_sqlite_sidecars() {
+    for suffix in ["0-1", "123-456", "123-456-wal", "123-456-shm"] {
+        assert!(is_quarantine_suffix(suffix), "{suffix}");
+    }
+    for suffix in [
+        "",
+        "123",
+        "-123",
+        "123-",
+        "123-x",
+        "x-123",
+        "123-456-journal",
+        "123-456-wal-wal",
+        "1-2-extra",
+    ] {
+        assert!(!is_quarantine_suffix(suffix), "{suffix}");
+    }
+}
+
+#[test]
+fn full_clear_removes_quarantined_files_and_preserves_live_index_and_other_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let store = Store::open(&config).unwrap();
+    let db_path = config.index_db_path();
+    let quarantine = db_path.with_file_name("index.db.corrupt-123-456");
+    fs::write(&quarantine, b"corrupt").unwrap();
+    let wal = index_sidecar_path(&quarantine, "-wal");
+    let shm = index_sidecar_path(&quarantine, "-shm");
+    fs::write(&wal, b"wal copy").unwrap();
+    fs::write(&shm, b"shm").unwrap();
+    let preserved = [
+        "other.db.corrupt-123-456",
+        "index.db.corrupt-not-a-quarantine",
+        "index.db.corrupt-123-456-journal",
+        "index.db.recovery-lock",
+    ];
+    for name in preserved {
+        fs::write(config.cache_dir.join(name), b"keep").unwrap();
+    }
+    let directory = config.cache_dir.join("index.db.corrupt-987-654");
+    fs::create_dir(&directory).unwrap();
+    #[cfg(unix)]
+    let symlink = {
+        let path = config.cache_dir.join("index.db.corrupt-777-888");
+        std::os::unix::fs::symlink(&db_path, &path).unwrap();
+        path
+    };
+    let files = quarantined_index_files(&db_path).unwrap();
+    assert_eq!(
+        files,
+        vec![
+            QuarantinedIndexFile {
+                path: quarantine.clone(),
+                bytes: 7
+            },
+            QuarantinedIndexFile {
+                path: shm.clone(),
+                bytes: 3
+            },
+            QuarantinedIndexFile {
+                path: wal.clone(),
+                bytes: 8
+            },
+        ]
+    );
+    store.evict_older_than(0).unwrap();
+    assert_eq!(
+        quarantined_index_files(&db_path).unwrap(),
+        files,
+        "ordinary GC retains forensic copies"
+    );
+    store.clear().unwrap();
+    assert!(quarantined_index_files(&db_path).unwrap().is_empty());
+    for path in [quarantine, wal, shm] {
+        assert!(!path.exists());
+    }
+    assert!(db_path.is_file());
+    assert_eq!(store.entry_count().unwrap(), 0);
+    for name in preserved {
+        assert_eq!(fs::read(config.cache_dir.join(name)).unwrap(), b"keep");
+    }
+    assert!(directory.is_dir());
+    #[cfg(unix)]
+    assert!(
+        fs::symlink_metadata(symlink)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+}
+
+#[test]
+fn quarantine_listing_reports_io_errors_and_tolerates_absent_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    assert!(
+        quarantined_index_files(&dir.path().join("missing/index.db"))
+            .unwrap()
+            .is_empty()
+    );
+    let parent = dir.path().join("not-a-directory");
+    fs::write(&parent, "file").unwrap();
+    assert!(quarantined_index_files(&parent.join("index.db")).is_err());
+    assert!(quarantined_index_files(Path::new("/")).is_err());
+}

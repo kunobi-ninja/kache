@@ -2048,6 +2048,65 @@ fn quarantine_corrupt_index(db_path: &Path) -> Result<PathBuf> {
     Ok(quarantine)
 }
 
+/// One retained corrupt index file, including WAL/SHM sidecars.
+#[derive(Debug, PartialEq, Eq)]
+pub struct QuarantinedIndexFile {
+    pub path: PathBuf,
+    pub bytes: u64,
+}
+
+/// List forensic copies without opening or modifying the index. Ordinary GC
+/// leaves these copies intact; an explicit full cache clear removes them.
+pub fn quarantined_index_files(db_path: &Path) -> Result<Vec<QuarantinedIndexFile>> {
+    let parent = db_path.parent().context("index path has no parent")?;
+    let prefix = format!(
+        "{}.corrupt-",
+        db_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .context("invalid index filename")?
+    );
+    let entries = match fs::read_dir(parent) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut files = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(suffix) = name.to_str().and_then(|n| n.strip_prefix(&prefix)) else {
+            continue;
+        };
+        if !is_quarantine_suffix(suffix) {
+            continue;
+        }
+        // Do not follow links or delete similarly named directories.
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if metadata.is_file() {
+            files.push(QuarantinedIndexFile {
+                path: entry.path(),
+                bytes: metadata.len(),
+            });
+        }
+    }
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(files)
+}
+
+fn is_quarantine_suffix(suffix: &str) -> bool {
+    let suffix = suffix
+        .strip_suffix("-wal")
+        .or_else(|| suffix.strip_suffix("-shm"))
+        .unwrap_or(suffix);
+    let Some((millis, pid)) = suffix.split_once('-') else {
+        return false;
+    };
+    [millis, pid]
+        .into_iter()
+        .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
 /// The path of a SQLite sidecar (`-wal` / `-shm`): the suffix is appended to the
 /// whole DB filename, not its extension.
 fn index_sidecar_path(db_path: &Path, suffix: &str) -> PathBuf {
@@ -6162,7 +6221,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         );
     }
 
-    /// Clear the entire store.
+    /// Clear the entire store, including retained corrupt index copies.
     ///
     /// Index rows drop first, in one transaction: once it commits no
     /// reader can begin a restore from a purged entry, and the
@@ -6202,7 +6261,15 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                 }
             }
         }
-        drop_index_rows()
+        drop_index_rows()?;
+        for file in quarantined_index_files(&self.config.index_db_path())? {
+            match fs::remove_file(&file.path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
     }
 
     /// Recursively make all files in a directory writable so they can be deleted.

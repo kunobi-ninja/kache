@@ -4558,7 +4558,12 @@ pub fn clean_cache(
     json: bool,
 ) -> Result<()> {
     let (entries, bytes) = cache_counts(&Store::open(config)?, &what)?;
-    match cache_action(what, entries, bytes, dry_run, json)? {
+    let quarantine_notice = cache_quarantine_notice(config, &what)?;
+    let action = cache_action(what, entries, bytes, dry_run, json)?;
+    if let Some(notice) = quarantine_notice {
+        println!("{notice}");
+    }
+    match action {
         CacheAction::Say(text) => {
             println!("{text}");
             Ok(())
@@ -4581,6 +4586,23 @@ pub fn clean_cache(
             purge(config, crate_name.as_deref())
         }
     }
+}
+
+/// Full cache removal includes forensic copies; show this before confirmation.
+fn cache_quarantine_notice(config: &Config, what: &CacheClean) -> Result<Option<String>> {
+    if !matches!(what, CacheClean::All) {
+        return Ok(None);
+    }
+    let files = crate::store::quarantined_index_files(&config.index_db_path())?;
+    if files.is_empty() {
+        return Ok(None);
+    }
+    let bytes: u64 = files.iter().map(|file| file.bytes).sum();
+    Ok(Some(format!(
+        "Full cache removal also deletes {} quarantined index files ({}). Save these copies first if needed for investigation.",
+        files.len(),
+        term::bytes(bytes)
+    )))
 }
 
 /// The entries a cache clean is about, and their bytes: one crate's, or
@@ -6236,6 +6258,34 @@ fn doctor_link_layout(config: &Config, build_dir: &std::path::Path) -> Check {
     }
 }
 
+fn doctor_index_quarantines(config: &Config) -> Check {
+    match crate::store::quarantined_index_files(&config.index_db_path()) {
+        Ok(files) if files.is_empty() => Check {
+            label: "Store quarantine",
+            pass: true,
+            detail: "no retained corrupt index files".to_string(),
+            fix: None,
+        },
+        Ok(files) => Check {
+            label: "Store quarantine",
+            pass: false,
+            detail: format!(
+                "{} files ({}) retained in {} after index corruption",
+                files.len(),
+                ByteSize(files.iter().map(|file| file.bytes).sum::<u64>()),
+                config.cache_dir.display()
+            ),
+            fix: Some("save the index.db.corrupt-* files if needed for investigation; `kache clean --cache` removes them along with all cached artifacts".to_string()),
+        },
+        Err(error) => Check {
+            label: "Store quarantine",
+            pass: false,
+            detail: format!("could not inspect retained corrupt index files: {error}"),
+            fix: Some(format!("ensure {} is readable", config.cache_dir.display())),
+        },
+    }
+}
+
 fn doctor_section(label: &str) -> &'static str {
     if label.starts_with("Daemon") || label.starts_with("Service") || label.starts_with("Remote") {
         "Services"
@@ -6486,6 +6536,8 @@ pub fn doctor(
                 )),
             }),
         }
+
+        checks.push(doctor_index_quarantines(cfg));
 
         if let Ok(view) = crate::store_view::read(cfg, false, "name") {
             checks.push(Check {

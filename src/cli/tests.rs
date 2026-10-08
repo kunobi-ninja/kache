@@ -7827,3 +7827,80 @@ fn doctor_reads_cross_checkout_misses_from_the_event_log() {
         "1 miss in /second differs from the build in /first"
     );
 }
+
+#[test]
+fn doctor_and_full_clean_report_quarantined_indexes_without_deleting_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = crate::test_support::test_config(dir.path().join("cache"));
+    let absent = doctor_index_quarantines(&config);
+    assert!(absent.pass);
+    assert_eq!(absent.detail, "no retained corrupt index files");
+    assert!(absent.fix.is_none());
+    assert!(
+        cache_quarantine_notice(&config, &CacheClean::All)
+            .unwrap()
+            .is_none()
+    );
+    fs::create_dir_all(&config.cache_dir).unwrap();
+    for (name, bytes) in [
+        ("index.db.corrupt-123-456", 1000),
+        ("index.db.corrupt-123-456-wal", 2000),
+    ] {
+        fs::write(config.cache_dir.join(name), vec![0; bytes]).unwrap();
+    }
+    let check = doctor_index_quarantines(&config);
+    assert!(!check.pass);
+    assert_eq!(check.label, "Store quarantine");
+    assert_eq!(doctor_section(check.label), "Storage");
+    assert_eq!(
+        check.detail,
+        format!(
+            "2 files ({}) retained in {} after index corruption",
+            ByteSize(3000),
+            config.cache_dir.display()
+        )
+    );
+    assert!(check.fix.unwrap().contains("`kache clean --cache`"));
+    let notice = cache_quarantine_notice(&config, &CacheClean::All)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        notice,
+        format!(
+            "Full cache removal also deletes 2 quarantined index files ({}). Save these copies first if needed for investigation.",
+            term::bytes(3000)
+        )
+    );
+    for what in [
+        CacheClean::Crate("serde".to_string()),
+        CacheClean::OlderThan(24),
+        CacheClean::StaleSchema,
+    ] {
+        assert!(cache_quarantine_notice(&config, &what).unwrap().is_none());
+    }
+    assert_eq!(
+        crate::store::quarantined_index_files(&config.index_db_path())
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
+#[test]
+fn doctor_quarantine_inspection_reports_unreadable_cache_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = crate::test_support::test_config(dir.path().join("cache"));
+    fs::write(&config.cache_dir, b"not a directory").unwrap();
+    let check = doctor_index_quarantines(&config);
+    assert!(!check.pass);
+    assert!(
+        check
+            .detail
+            .starts_with("could not inspect retained corrupt index files: ")
+    );
+    assert_eq!(
+        check.fix,
+        Some(format!("ensure {} is readable", config.cache_dir.display()))
+    );
+    assert!(cache_quarantine_notice(&config, &CacheClean::All).is_err());
+}

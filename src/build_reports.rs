@@ -797,7 +797,9 @@ mod tests {
             facts: Some(ProducerFacts::default()),
         };
         assert!(read_context(dir.path(), "one", "/work").unwrap().is_none());
+        assert!(!context_exists(dir.path(), "one", "/work"));
         persist_context(dir.path(), &context).unwrap();
+        assert!(context_exists(dir.path(), "one", "/work"));
         context.commit = Some("later-daemon".into());
         let facts = ProducerFacts::default();
         capture_context_once(dir.path(), "one", "/work", &facts, || {
@@ -1052,6 +1054,21 @@ mod tests {
     #[test]
     fn untrusted_report_validation_rejects_bad_paths_keys_schema_and_timing() {
         let valid = report();
+        let at_namespace_cap = format!(
+            "{}/{}/{}",
+            "a".repeat(200),
+            "b".repeat(200),
+            "c".repeat(110)
+        );
+        let mut boundary = valid.clone();
+        boundary.namespace = at_namespace_cap.clone();
+        validate_report(&boundary).unwrap();
+        boundary.namespace.push('c');
+        assert!(validate_report(&boundary).is_err());
+        boundary.namespace = "a".repeat(201);
+        assert!(validate_report(&boundary).is_err());
+        boundary.namespace = "é".into();
+        assert!(validate_report(&boundary).is_err());
         for namespace in [
             "",
             "../repo",

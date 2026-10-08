@@ -154,8 +154,31 @@ fn compiler_queries_do_not_poison_offline_producer_identity() {
             .env_remove("CI");
         command
     };
-    let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
-    let probe = command().arg(&rustc).arg("--print=cfg").output().unwrap();
+    let selected_rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+    let sysroot = std::process::Command::new(&selected_rustc)
+        .args(["--print", "sysroot"])
+        .output()
+        .unwrap();
+    assert!(
+        sysroot.status.success(),
+        "{}",
+        String::from_utf8_lossy(&sysroot.stderr)
+    );
+    // Windows deliberately leaves a bare executable's version-cache selector
+    // unknown. Use the selected toolchain's concrete compiler for this fixture.
+    let rustc = Path::new(std::str::from_utf8(&sysroot.stdout).unwrap().trim())
+        .join("bin")
+        .join(format!("rustc{}", std::env::consts::EXE_SUFFIX));
+    assert!(
+        rustc.is_file(),
+        "selected compiler missing: {}",
+        rustc.display()
+    );
+    let probe = command()
+        .arg(&selected_rustc)
+        .arg("--print=cfg")
+        .output()
+        .unwrap();
     assert!(
         probe.status.success(),
         "{}",

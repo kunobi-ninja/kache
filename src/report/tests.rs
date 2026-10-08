@@ -4183,3 +4183,47 @@ fn suggestions_name_three_distinct_misses_only_above_the_share() {
     let repeated = suggest(81, 19, 4, 0, &["a", "a"]);
     assert_eq!(repeated.matches("`a`").count(), 1, "{repeated}");
 }
+
+#[test]
+fn report_shortens_rustc_json_without_changing_stored_reason() {
+    let mut event = test_event("c", EventResult::Passthrough, 1, 0, 0, "k");
+    let prefix = "uncacheable|dep-info pre-pass failed (exit 1): ";
+    let diagnostic = serde_json::json!({
+        "message": "cannot find type `JmapError`\n in this scope",
+        "$message_type": "diagnostic",
+        "code": { "code": "E0433" },
+        "rendered": "long compiler output",
+        "spans": [{ "file_name": "src/lib.rs", "line_start": 99 }]
+    });
+    let original = format!("{prefix}{diagnostic}");
+    event.passthrough_reason = original.clone();
+    let expected = format!("{prefix}cannot find type `JmapError` in this scope");
+    assert_eq!(bypass_reason(&event), expected);
+    assert_eq!(to_bypass_detail(&event).reason, expected);
+    assert_eq!(
+        build_bypass_analysis(&[event.clone()], 10).reasons[0].reason,
+        expected
+    );
+    assert_eq!(event.passthrough_reason, original);
+}
+
+#[test]
+fn report_preserves_non_diagnostic_and_invalid_json_reasons() {
+    for reason in [
+        r#"prefix: {"$message_type":"artifact","message":"artifact ready"}"#,
+        r#"prefix: {"message":"missing type"}"#,
+        r#"prefix: {"$message_type":"diagnostic"}"#,
+        r#"prefix: {"$message_type":"diagnostic","message":42}"#,
+        r#"prefix: {"$message_type":"diagnostic","message":" \n "}"#,
+        r#"prefix: {"$message_type":"diagnostic","message":"truncated"#,
+        "plain compiler error",
+    ] {
+        assert_eq!(concise_diagnostic_reason(reason), None, "{reason}");
+    }
+    assert_eq!(
+        concise_diagnostic_reason(
+            r#"path/{crate}: {"$message_type":"diagnostic","message":"failed"}"#
+        ),
+        Some("path/{crate}: failed".to_string())
+    );
+}

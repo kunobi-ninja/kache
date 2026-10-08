@@ -1934,8 +1934,26 @@ fn bypass_reason(e: &BuildEvent) -> String {
     if reason.is_empty() {
         "unknown".to_string()
     } else {
-        reason.to_string()
+        concise_diagnostic_reason(reason).unwrap_or_else(|| reason.to_string())
     }
+}
+
+/// Shorten rustc JSON in report rows while leaving the event and compiler
+/// replay text intact. Other JSON payloads and malformed diagnostics retain
+/// their original reason.
+fn concise_diagnostic_reason(reason: &str) -> Option<String> {
+    reason.match_indices('{').find_map(|(start, _)| {
+        let diagnostic: serde_json::Value = serde_json::from_str(&reason[start..]).ok()?;
+        if diagnostic.get("$message_type")?.as_str()? != "diagnostic" {
+            return None;
+        }
+        let message = diagnostic.get("message")?.as_str()?;
+        let message = message.split_whitespace().collect::<Vec<_>>().join(" ");
+        if message.is_empty() {
+            return None;
+        }
+        Some(format!("{}{message}", &reason[..start]))
+    })
 }
 
 /// Coarse category of a passthrough reason — the `category` half of the

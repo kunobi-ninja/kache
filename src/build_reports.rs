@@ -780,6 +780,23 @@ mod tests {
         assert!(!snapshot.exists());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_context_is_not_reported_as_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = context_path(dir.path(), "one", "/work");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&path, &path).unwrap();
+        let error = read_context(dir.path(), "one", "/work").unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .unwrap()
+                .raw_os_error(),
+            Some(libc::ELOOP)
+        );
+    }
+
     #[test]
     fn zero_duration_and_epoch_clamping_preserve_valid_observations() {
         let dir = tempfile::tempdir().unwrap();

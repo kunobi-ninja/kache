@@ -1,7 +1,8 @@
 //! Store-wide observations have their own horizon, independent of build events.
 use super::Config;
+use crate::store::Store;
 use crate::store_view::StoreSummary;
-use kache_store::{EvictionHorizonEvidence, Store};
+use kache_store::EvictionHorizonEvidence;
 use serde::{Deserialize, Serialize};
 
 const HORIZON_SECS: u64 = 604_800;

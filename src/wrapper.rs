@@ -7800,11 +7800,6 @@ fn explain_miss_diff(
 }
 
 fn capture_build_report_context(config: &Config, args: &RustcArgs, root: &str, now: u64) {
-    // Cargo's --print probes have no build profile and must not freeze the
-    // real compile's session metadata as unknown.
-    if !args.is_primary {
-        return;
-    }
     let declared = crate::build_reports::producer_is_declared(|name| std::env::var(name).ok());
     let session_id = session_id_for_event(config, root, now);
     if session_id.is_empty() {

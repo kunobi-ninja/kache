@@ -62,6 +62,16 @@ struct ReplaySummary {
     budget_exhausted: bool,
 }
 
+impl ReplaySummary {
+    fn record_local(&mut self) {
+        self.local += 1;
+    }
+
+    fn record_busy(&mut self) {
+        self.busy += 1;
+    }
+}
+
 fn option_or_env(option: &Option<String>, name: &str) -> Option<String> {
     option
         .clone()
@@ -201,12 +211,16 @@ async fn select_report(
             .await;
         match report {
             Ok(Some(report)) if compatible(&report.identity, expected) => {
-                if selected.as_ref().is_none_or(|prior| {
-                    (report.finished_at_ms, &report.session_id, &report.root_hash)
-                        > (prior.finished_at_ms, &prior.session_id, &prior.root_hash)
-                }) {
-                    selected = Some(report);
-                }
+                selected = Some(match selected {
+                    None => report,
+                    Some(prior) => std::cmp::max_by(prior, report, |a, b| {
+                        (a.finished_at_ms, &a.session_id, &a.root_hash).cmp(&(
+                            b.finished_at_ms,
+                            &b.session_id,
+                            &b.root_hash,
+                        ))
+                    }),
+                });
             }
             Ok(_) => {}
             Err(error) => {
@@ -250,7 +264,7 @@ async fn replay(
     let mut started = 0;
     for (index, entry) in entries.iter().enumerate() {
         if store.contains(&entry.cache_key) {
-            summary.local += 1;
+            summary.record_local();
             continue;
         }
         if started >= max_keys
@@ -262,17 +276,17 @@ async fn replay(
             break;
         }
         let Some(_lock) = store.try_lock(&entry.cache_key)? else {
-            summary.busy += 1;
+            summary.record_busy();
             continue;
         };
         // A compiler may have committed while this command acquired the lock.
         if store.contains(&entry.cache_key) {
-            summary.local += 1;
+            summary.record_local();
             continue;
         }
         let destination = store.entry_dir(&entry.cache_key);
         if destination.exists() {
-            summary.busy += 1;
+            summary.record_busy();
             continue;
         }
         let staging = tempfile::Builder::new()
@@ -295,7 +309,7 @@ async fn replay(
                     .downloaded_bytes
                     .saturating_add(download.compressed_bytes);
                 if destination.exists() {
-                    summary.busy += 1;
+                    summary.record_busy();
                     continue;
                 }
                 // An existing committed generation is a nonempty directory;
@@ -309,7 +323,7 @@ async fn replay(
                             eprintln!("Cannot import {}: {error:#}", entry.cache_key);
                         }
                     },
-                    Err(_) if destination.exists() => summary.busy += 1,
+                    Err(_) if destination.exists() => summary.record_busy(),
                     Err(error) => {
                         summary.failed += 1;
                         eprintln!("Cannot publish {}: {error}", entry.cache_key);

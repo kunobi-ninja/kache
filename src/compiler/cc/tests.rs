@@ -2622,6 +2622,7 @@ fn closed_set_m_flags_are_raw_keyed_issue_826() {
 
 #[test]
 fn cache_key_for_link_changes_when_an_object_changes() {
+    let _lock = crate::test_support::process_state_test_lock();
     let dir = tempfile::tempdir().unwrap();
     let a = dir.path().join("a.o");
     let b = dir.path().join("b.o");

@@ -166,11 +166,23 @@ def aggregate_events(events):
         raise ValueError("no Kache build events were recorded")
     results = Counter(event["result"] for event in builds)
     totals = {key: sum(event.get(key, 0) for event in builds) for key in TOTALS}
-    compiled_keys = Counter(
-        event["cache_key"]
-        for event in builds
-        if event.get("cache_key") and event.get("compiler_runs", 0)
-    )
+    compiled_keys = {}
+    for event in builds:
+        if event.get("cache_key") and event.get("compiler_runs", 0):
+            compiled_keys.setdefault(event["cache_key"], []).append(event)
+    duplicates = [
+        {
+            "cache_key": key,
+            "crate_name": events[0]["crate_name"],
+            "compiles": len(events),
+            "results": dict(Counter(event["result"] for event in events)),
+            "skip_reasons": dict(Counter(
+                event.get("skip_reason") or "unknown"
+                for event in events if event["result"] == "skipped"
+            )),
+        }
+        for key, events in sorted(compiled_keys.items()) if len(events) > 1
+    ]
     by_unit = {}
     for event in builds:
         unit = by_unit.setdefault(event["crate_name"], Counter())
@@ -185,7 +197,8 @@ def aggregate_events(events):
             for e in builds
         ),
         **totals,
-        "duplicate_key_compiles": sum(count - 1 for count in compiled_keys.values()),
+        "duplicate_key_compiles": sum(len(events) - 1 for events in compiled_keys.values()),
+        "duplicate_compiles": duplicates,
         "by_unit": by_unit,
     }
 

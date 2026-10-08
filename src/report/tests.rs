@@ -448,6 +448,7 @@ fn test_event(
         restore_copy_exclusive_bytes: 0,
         restore_copy_other_bytes: 0,
         passthrough_reason: String::new(),
+        skip_reason: String::new(),
         store_error: String::new(),
         store_handed_off: false,
         daemon_store_ms: 0,

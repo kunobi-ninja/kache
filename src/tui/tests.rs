@@ -1468,6 +1468,7 @@ fn sample_build_event(
         restore_copy_other_bytes: 0,
         root: String::new(),
         passthrough_reason: "linker invocation".to_string(),
+        skip_reason: String::new(),
         store_error: String::new(),
         store_handed_off: false,
         daemon_store_ms: 0,

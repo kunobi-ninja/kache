@@ -94,6 +94,7 @@ pub struct BuildEvent {
     /// 22 = typed miss reason and the C/C++ object output.
     /// 23 = per-phase restore/store copy fallback counters.
     /// 24 = per-variable hashes of compiler-reported environment inputs.
+    /// 25 = reasons for compiled results that were not stored.
     #[serde(default)]
     pub schema: u32,
     /// Build session this event belongs to (kunobi-ninja/kache#583 P0.5).
@@ -252,6 +253,9 @@ pub struct BuildEvent {
     /// Why kache passed the invocation through instead of caching it.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub passthrough_reason: String,
+    /// Why a successful compile did not publish an entry. Empty in older logs.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub skip_reason: String,
     /// Why `Store::put` failed, when the compiler ran and produced outputs that
     /// were then not cached (kunobi-ninja/kache#629).
     ///
@@ -1700,6 +1704,7 @@ impl BuildEvent {
             restore_copy_exclusive_bytes: 0,
             restore_copy_other_bytes: 0,
             passthrough_reason: String::new(),
+            skip_reason: String::new(),
             store_error: String::new(),
             store_handed_off: false,
             daemon_store_ms: 0,
@@ -1864,6 +1869,7 @@ mod tests {
             restore_copy_exclusive_bytes: 0,
             restore_copy_other_bytes: 0,
             passthrough_reason: String::new(),
+            skip_reason: String::new(),
             store_error: String::new(),
             store_handed_off: false,
             daemon_store_ms: 0,
@@ -2095,6 +2101,24 @@ mod tests {
         assert_eq!(legacy.flight_wait_ms, 0);
         assert_eq!(legacy.permit_wait_ms, 0);
         assert_eq!(legacy.wait_ms(), 0);
+    }
+
+    #[test]
+    fn skip_reason_round_trips_and_defaults_for_older_events() {
+        let mut event = BuildEvent::new_for_test("lib", EventResult::Skipped);
+        event.skip_reason = "peer-already-committed".into();
+        let mut value = serde_json::to_value(&event).unwrap();
+        let current: BuildEvent = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(current.skip_reason, "peer-already-committed");
+        value.as_object_mut().unwrap().remove("skip_reason");
+        let legacy: BuildEvent = serde_json::from_value(value).unwrap();
+        assert!(legacy.skip_reason.is_empty());
+        assert!(
+            serde_json::to_value(legacy)
+                .unwrap()
+                .get("skip_reason")
+                .is_none()
+        );
     }
 
     #[test]

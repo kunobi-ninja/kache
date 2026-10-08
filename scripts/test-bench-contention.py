@@ -429,6 +429,36 @@ else:
             with self.assertRaisesRegex(ValueError, "no Kache build events"):
                 bench.aggregate_events(events)
 
+    def test_duplicate_compiles_keep_skip_reasons_and_render_legacy_unknowns(self):
+        from bench.report import contention
+
+        events = [
+            {"crate_name": "lib", "cache_key": "abc123", "result": "miss", "compiler_runs": 1},
+            {"crate_name": "lib", "cache_key": "abc123", "result": "skipped", "compiler_runs": 1,
+             "skip_reason": "peer-already-committed"},
+            {"crate_name": "lib", "cache_key": "abc123", "result": "skipped", "compiler_runs": 1},
+            {"crate_name": "lib", "cache_key": "abc123", "result": "local_hit", "compiler_runs": 0},
+        ]
+        aggregate = bench.aggregate_events(events)
+        self.assertEqual(aggregate["duplicate_key_compiles"], 2)
+        self.assertEqual(aggregate["duplicate_compiles"], [{
+            "cache_key": "abc123", "crate_name": "lib", "compiles": 3,
+            "results": {"miss": 1, "skipped": 2},
+            "skip_reasons": {"peer-already-committed": 1, "unknown": 1},
+        }])
+        project = {
+            "name": "demo", "summary": {"contention": {"statistics": []}},
+            "contention": {"records": [{"arm": "head", "phase": "cold", "sample": 0, "events": aggregate}]},
+        }
+        report = "\n".join(contention([project]))
+        self.assertIn("| demo | head | cold | 0 | lib | abc123 | 3 |", report)
+        self.assertIn("peer-already-committed (1), unknown (1)", report)
+        aggregate["duplicate_compiles"][0]["skip_reasons"] = {"bad | reason\n<text>": 1}
+        report = "\n".join(contention([project]))
+        self.assertIn("bad &#124; reason &lt;text&gt;", report)
+        project["contention"]["records"][0]["events"].pop("duplicate_compiles")
+        self.assertNotIn("Skip reasons", "\n".join(contention([project])))
+
     def test_arms_share_all_controls_except_scheduler_and_binary(self):
         args = SimpleNamespace(
             output=Path("/bench"), jobs_per_build=4, toolchain="1.97.1"

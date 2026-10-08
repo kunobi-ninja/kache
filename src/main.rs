@@ -3,6 +3,7 @@ mod blob_heal;
 mod build_script;
 use kache_store::atomic;
 mod build_intent;
+mod build_reports;
 mod cache_fs;
 mod cache_key;
 mod cargo_env;
@@ -92,6 +93,8 @@ mod tui_sessions;
 mod unit_prune;
 mod verify_compare;
 mod volume_gc;
+mod warm_set;
+mod warm_set_toolchain;
 mod worktree_discovery;
 mod wrapper;
 mod wrapper_config;
@@ -357,6 +360,10 @@ enum Commands {
         #[arg(long)]
         allow_partial: bool,
     },
+
+    /// Restore a compatible ordered warm set before a Cargo build
+    #[command(display_order = 24)]
+    Prefetch(crate::warm_set::Options),
 
     /// Save a build manifest for future prefetch warming
     #[command(hide = true)]
@@ -1158,6 +1165,7 @@ fn run_cli(cli: Cli, readiness: Option<kunobi_daemon::readiness::channel::Notifi
             workspace,
             allow_partial,
         ),
+        Some(Commands::Prefetch(options)) => crate::warm_set::run(&config, &options),
         Some(Commands::SaveManifest {
             manifest_key,
             namespace,
@@ -2147,6 +2155,7 @@ mod tests {
                 "monitor",
                 "explain",
                 "list",
+                "prefetch",
                 "sync",
                 "login",
                 "logout",

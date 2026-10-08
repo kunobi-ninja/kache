@@ -379,9 +379,11 @@ async fn bounded_replay_restores_packs_skips_local_and_locked_entries_and_summar
 
 /// Exercise an independent publisher that does not participate in the replay
 /// lock, as an older client or a restore path on another process may do.
+type DownloadInterference = Box<dyn Fn(&Path) -> Result<()> + Send + Sync>;
+
 struct InterferingRemote {
     inner: crate::cache_remote::V3Remote,
-    after_download: Box<dyn Fn(&Path) -> Result<()> + Send + Sync>,
+    after_download: DownloadInterference,
 }
 
 #[async_trait]

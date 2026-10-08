@@ -28,6 +28,7 @@ pub(crate) struct StoreView {
     pub entries: Vec<StatsEntry>,
     pub blob_stats: BlobStats,
     pub stores: Vec<StoreSummary>,
+    pub eviction_evidence: Vec<Result<kache_store::EvictionHorizonEvidence, String>>,
 }
 
 fn identity(path: &Path) -> PathBuf {
@@ -51,22 +52,53 @@ pub(crate) fn read(config: &Config, include_entries: bool, sort: &str) -> Result
     read_with_main(config, &main, include_entries, sort)
 }
 
+/// Collect report observations while the existing inventory handles are open.
+/// The evidence query itself makes no writes or additional store opens.
+pub(crate) fn read_report(config: &Config, as_of: i64, horizon: u64) -> Result<StoreView> {
+    let main = Store::open(config)?;
+    read_with_evidence(config, &main, false, "name", Some((as_of, horizon)))
+}
+
 pub(crate) fn read_with_main(
     config: &Config,
     main: &Store,
     include_entries: bool,
     sort: &str,
 ) -> Result<StoreView> {
+    read_with_evidence(config, main, include_entries, sort, None)
+}
+
+fn read_with_evidence(
+    config: &Config,
+    main: &Store,
+    include_entries: bool,
+    sort: &str,
+    snapshot: Option<(i64, u64)>,
+) -> Result<StoreView> {
     let shards = shard_configs(config);
     // Keep the ordinary single-store stats path on COUNT/SUM queries.
     let collect_entries = include_entries || !shards.is_empty();
     let mut view = StoreView::default();
     let mut by_key = BTreeMap::new();
-    add_store(&mut view, &mut by_key, config, main, collect_entries)?;
+    add_store(
+        &mut view,
+        &mut by_key,
+        config,
+        main,
+        collect_entries,
+        snapshot,
+    )?;
     for shard in shards {
         let result = if crate::volume_gc::shard_has_index(&shard.cache_dir) {
             Store::open(&shard).and_then(|store| {
-                add_store(&mut view, &mut by_key, &shard, &store, collect_entries)
+                add_store(
+                    &mut view,
+                    &mut by_key,
+                    &shard,
+                    &store,
+                    collect_entries,
+                    snapshot,
+                )
             })
         } else {
             Err(anyhow::anyhow!(
@@ -74,6 +106,9 @@ pub(crate) fn read_with_main(
             ))
         };
         if let Err(error) = result {
+            if snapshot.is_some() {
+                view.eviction_evidence.push(Err("index unavailable".into()));
+            }
             view.stores.push(StoreSummary {
                 path: shard.cache_dir,
                 max_size: shard.max_size,
@@ -106,6 +141,7 @@ fn add_store(
     config: &Config,
     store: &Store,
     collect_entries: bool,
+    snapshot: Option<(i64, u64)>,
 ) -> Result<()> {
     // Complete all fallible reads before contributing this store's totals.
     let bytes = store.total_size()?;
@@ -143,6 +179,13 @@ fn add_store(
     view.blob_stats.total_blob_size += blobs.total_blob_size;
     view.blob_stats.total_logical_size += blobs.total_logical_size;
     view.blob_stats.savings += blobs.savings;
+    if let Some((as_of, horizon)) = snapshot {
+        view.eviction_evidence.push(
+            store
+                .eviction_horizon_evidence(as_of, horizon)
+                .map_err(|_| "eviction observations unavailable".into()),
+        );
+    }
     view.stores.push(StoreSummary {
         path: config.cache_dir.clone(),
         bytes,

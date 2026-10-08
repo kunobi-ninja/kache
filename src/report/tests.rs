@@ -2711,7 +2711,8 @@ fn render_network_and_error_sections_with_all_optional_fields() {
             "missing observed throughput label: {rendered}"
         );
         assert!(
-            lower.contains("66.7 mb/s") && !lower.contains("unavailable"),
+            lower.contains("66.7 mb/s")
+                && !lower.contains("| observed wall-span throughput | unavailable"),
             "nonzero observed span must render the measured rate: {rendered}"
         );
         assert!(

@@ -636,6 +636,108 @@ async fn staged_files_disappearing_before_publish_or_import_are_failures() {
     }
 }
 
+async fn assert_alternate_pack_is_rejected(pack_key: &str, pack_crate: &str) {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("alternate-source");
+    std::fs::write(&source, b"compiled alternate unit").unwrap();
+    let producer_config = crate::test_support::test_config(dir.path().join("producer"));
+    let producer = Store::open(&producer_config).unwrap();
+    put(&producer, pack_key, pack_crate, &source);
+    let backend: Arc<dyn RemoteBackend> = Arc::new(memory_backend());
+    let remote = crate::config::RemoteConfig::test_s3("bucket", "cache");
+    let client = crate::cache_remote::V3Remote::new(backend.clone(), remote);
+    client
+        .upload_entry(
+            pack_key,
+            pack_crate,
+            &producer.entry_dir(pack_key),
+            &producer_config.store_dir().join("blobs"),
+            3,
+            None,
+        )
+        .await
+        .unwrap();
+    let requested = "a".repeat(64);
+    let alternate = backend
+        .get(
+            &format!("cache/v3/packs/{pack_crate}/{pack_key}.tar.zst"),
+            Some(1 << 20),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .body
+        .to_vec();
+    // Serve a valid, hash-verified alternate unit at the requested object key.
+    backend
+        .put(
+            &format!("cache/v3/packs/alpha/{requested}.tar.zst"),
+            alternate,
+            None,
+        )
+        .await
+        .unwrap();
+    let config = crate::test_support::test_config(dir.path().join("consumer"));
+    let consumer = Store::open(&config).unwrap();
+    let retained = "c".repeat(64);
+    put(&consumer, &retained, "alpha", &source);
+    let retained_meta = std::fs::read(consumer.entry_dir(&retained).join("meta.json")).unwrap();
+    assert_eq!(consumer.entry_count().unwrap(), 1);
+    let r = report(
+        "session",
+        10,
+        &[(&requested, "alpha"), (&retained, "alpha")],
+    );
+    let summary = replay(
+        &client,
+        &config,
+        &r,
+        10,
+        Instant::now() + Duration::from_secs(10),
+        &AtomicU64::new(1_000_000),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        (
+            summary.restored,
+            summary.local,
+            summary.busy,
+            summary.failed
+        ),
+        (0, 1, 0, 1),
+        "alternate pack must not be imported: {pack_key}/{pack_crate}"
+    );
+    assert!(summary.downloaded_bytes > 0);
+    assert!(!consumer.contains(&requested));
+    assert!(!consumer.entry_dir(&requested).exists());
+    assert_eq!(consumer.entry_count().unwrap(), 1, "no new index rows");
+    assert!(consumer.contains(&retained));
+    assert_eq!(
+        std::fs::read(consumer.entry_dir(&retained).join("meta.json")).unwrap(),
+        retained_meta
+    );
+    assert!(
+        !std::fs::read_dir(config.store_dir())
+            .unwrap()
+            .any(|entry| entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("warm-set-"))
+    );
+}
+
+#[tokio::test]
+async fn replay_rejects_pack_with_different_cache_key() {
+    assert_alternate_pack_is_rejected(&"b".repeat(64), "alpha").await;
+}
+
+#[tokio::test]
+async fn replay_rejects_pack_with_different_crate_name() {
+    assert_alternate_pack_is_rejected(&"a".repeat(64), "beta").await;
+}
+
 #[test]
 fn publication_preserves_an_existing_directory_and_reports_other_filesystem_errors() {
     let dir = tempfile::tempdir().unwrap();

@@ -300,6 +300,37 @@ fn terminal_formatting_shares_cc_keys_with_cold_and_warm_probes() {
     assert_ne!(key(&["-ffp-contract=off"], &warm), baseline);
 }
 
+#[test]
+fn terminal_formatting_shares_the_compile_first_read_set_memo() {
+    let _lock = crate::test_support::process_state_test_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("unit.c");
+    fs::write(&source, "int x;\n").unwrap();
+    let fake_cc =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mock_cc_diagnostics.sh");
+    let memo = |flags: &[&str]| {
+        let mut args = vec![
+            fake_cc.to_string_lossy().into_owned(),
+            "-c".into(),
+            source.to_string_lossy().into_owned(),
+        ];
+        args.extend(flags.iter().map(|flag| flag.to_string()));
+        let parsed = CcArgs::parse(&args).unwrap();
+        cc_preprocess_memo_key(&parsed, &[], "fake clang 1.0").unwrap()
+    };
+    let baseline = memo(&[]);
+    for flag in [
+        "-fcolor-diagnostics",
+        "-fno-color-diagnostics",
+        "-fansi-escape-codes",
+        "-fdiagnostics-color=always",
+    ] {
+        assert_eq!(memo(&[flag]), baseline);
+    }
+    assert_eq!(memo(&["-Xclang", "-fansi-escape-codes"]), baseline);
+    assert_ne!(memo(&["-ffp-contract=off"]), baseline);
+}
+
 /// The probe-memo key must carry the separated `--param` VALUE.
 ///
 /// `--param` is `CapturedByProbe` (#580), so its codegen effect is keyed

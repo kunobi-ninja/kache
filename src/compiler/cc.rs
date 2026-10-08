@@ -4907,7 +4907,11 @@ fn cc_preprocess_memo_key(
     // Likewise the argv: `-I` and the source path carry the checkout root.
     // The maps are folded below, so two trees agree here only when they agree
     // about what the mapping means.
-    for arg in build_preprocess_args(parsed) {
+    // Compile-first lookup also needs the same read-set memo when only
+    // terminal formatting changes; otherwise it compiles before finding a hit.
+    let mut memo_parsed = parsed.clone();
+    memo_parsed.rest = parsed.probe_args();
+    for arg in build_preprocess_args(&memo_parsed) {
         let mapped = apply_cc_prefix_maps_to_bytes(arg.into_bytes(), prefix_maps);
         fold_cc_memo_field(&mut hasher, b"arg", &mapped);
     }

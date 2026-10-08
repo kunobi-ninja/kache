@@ -14343,6 +14343,11 @@ impl crate::remote_backend::RemoteBackend for ReadOnlyConsumerBackend {
 
 #[tokio::test]
 async fn a_stopped_read_only_gcs_consumer_starts_for_reads_without_uploading() {
+    assert_read_only_consumer_can_restore(true).await;
+    assert_read_only_consumer_can_restore(false).await;
+}
+
+async fn assert_read_only_consumer_can_restore(daemon_readonly: bool) {
     let donor = tempfile::tempdir().unwrap();
     let consumer = tempfile::tempdir().unwrap();
     let mut config = test_config(consumer.path());
@@ -14371,11 +14376,28 @@ async fn a_stopped_read_only_gcs_consumer_starts_for_reads_without_uploading() {
         )
         .await
         .unwrap();
+    let shard = crate::remote::Shard {
+        version: 3,
+        entries: vec![crate::remote::ShardEntry {
+            cache_key: key.clone(),
+            crate_name: "serde".into(),
+            compile_time_ms: Some(1234),
+            artifact_size: Some(5678),
+        }],
+    };
+    put_test_object(
+        &backend,
+        &crate::remote::shard_object_key(&remote.prefix, "workspace", "abc"),
+        &serde_json::to_vec(&shard).unwrap(),
+    )
+    .await;
     let backend = Arc::new(ReadOnlyConsumerBackend {
         inner: backend,
         writes: AtomicU64::new(0),
     });
-    let daemon = Arc::new(Daemon::new(config.clone()));
+    let mut daemon_config = config.clone();
+    daemon_config.remote_readonly = daemon_readonly;
+    let daemon = Arc::new(Daemon::new(daemon_config));
     daemon.set_remote_backend_for_test(backend.clone());
     daemon.signal_warming_complete();
     let socket = config.socket_path();
@@ -14391,7 +14413,10 @@ async fn a_stopped_read_only_gcs_consumer_starts_for_reads_without_uploading() {
     let (server_tx, server_rx) = std::sync::mpsc::channel();
     let client = tokio::task::spawn_blocking(move || {
         let request = || BuildStartedRequest {
-            intent: kache_core::BuildIntent::default(),
+            intent: kache_core::BuildIntent {
+                identity_key: Some("id/readonly-fixture".into()),
+                ..Default::default()
+            },
             session_id: "readonly-fixture".into(),
             client_epoch: 0,
             client_version: None,
@@ -14424,6 +14449,25 @@ async fn a_stopped_read_only_gcs_consumer_starts_for_reads_without_uploading() {
         assert!(load_upload_jobs(&config).unwrap().is_empty());
     });
     client.await.unwrap();
+    {
+        let plan = daemon.active_plan.lock().unwrap();
+        let plan = plan.as_ref().expect("read-only session is still tracked");
+        assert_eq!(
+            plan.identity_key, None,
+            "a writable daemon cannot auto-publish a read-only caller's identity"
+        );
+    }
+    daemon.finalize_inactive_plan(0);
+    assert!(daemon.active_plan.lock().unwrap().is_none());
+    let restored_shard = daemon
+        .download_planner_shard("workspace", "abc")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        restored_shard.entries, shard.entries,
+        "read-only consumers still read planner shards"
+    );
     let server = server_rx.recv_timeout(Duration::from_secs(2)).unwrap();
     server.abort();
     assert_eq!(starter_calls.load(Ordering::SeqCst), 1);
@@ -14466,4 +14510,42 @@ fn a_local_only_build_hint_does_not_start_a_daemon() {
         },
         || panic!("a local-only build must not start a remote daemon"),
     );
+}
+
+#[tokio::test]
+async fn a_writable_build_hint_keeps_its_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path());
+    config.remote = Some(test_remote_config());
+    let socket = config.socket_path();
+    std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+    let listener = bind_listener(&socket);
+    let server = tokio::spawn(async move {
+        let stream = listener.accept().await.unwrap();
+        let mut line = String::new();
+        BufReader::new(stream).read_line(&mut line).await.unwrap();
+        let request: Request = serde_json::from_str(&line).unwrap();
+        let Request::BuildStarted(request) = request else {
+            panic!("expected build hint")
+        };
+        assert_eq!(request.intent.identity_key.as_deref(), Some("id/writer"));
+    });
+    tokio::task::spawn_blocking(move || {
+        send_build_started_with(
+            &config,
+            BuildStartedRequest {
+                intent: kache_core::BuildIntent {
+                    identity_key: Some("id/writer".into()),
+                    ..Default::default()
+                },
+                session_id: "writer".into(),
+                client_epoch: 0,
+                client_version: None,
+            },
+            || panic!("live daemon does not need startup"),
+        )
+    })
+    .await
+    .unwrap();
+    server.await.unwrap();
 }

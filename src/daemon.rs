@@ -9077,9 +9077,14 @@ pub fn send_build_started(config: &Config, req: BuildStartedRequest) {
 
 fn send_build_started_with(
     config: &Config,
-    req: BuildStartedRequest,
+    mut req: BuildStartedRequest,
     start: impl FnOnce() -> Result<bool>,
 ) {
+    if config.remote_readonly {
+        // Older writable daemons publish this identity when the session ends.
+        // Omit it for read-only callers; key and shard reads remain available.
+        req.intent.identity_key = None;
+    }
     let socket_path = config.socket_path();
     let crate_count = req.intent.crate_names.len();
 

@@ -119,3 +119,86 @@ fn save_manifest_retains_session_history_and_rehydrates_without_local_state() {
     assert_eq!(rebuilt[1]["session_id"], "session-two");
     assert_eq!(rebuilt[1]["entries"][0]["cache_key"], "c".repeat(64));
 }
+
+#[test]
+fn compiler_queries_do_not_poison_offline_producer_identity() {
+    let scratch = tempfile::tempdir().unwrap();
+    let cache = scratch.path().join("client");
+    let remote = scratch.path().join("remote");
+    let workspace = scratch.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let out = workspace.join("target/debug/deps");
+    std::fs::create_dir_all(&out).unwrap();
+    std::fs::write(
+        workspace.join("Cargo.toml"),
+        "[package]\nname=\"fixture\"\nversion=\"0.1.0\"\n",
+    )
+    .unwrap();
+    std::fs::write(workspace.join("Cargo.lock"), "fixture lock contents").unwrap();
+    std::fs::write(workspace.join("lib.rs"), "pub fn value() -> u32 { 42 }\n").unwrap();
+    let config = scratch.path().join("config.toml");
+    let path = |path: &Path| toml::Value::String(path.to_string_lossy().into_owned()).to_string();
+    std::fs::write(&config, format!("[cache]\nignore_env=true\nlocal_only=true\nlocal_store={}\nruntime_dir={}\nprefetch_enabled=false\n[cache.remote]\ntype=\"filesystem\"\npath={}\nprefix=\"artifacts\"\n", path(&cache), path(&cache), path(&remote))).unwrap();
+    let binary = Path::new(env!("CARGO_BIN_EXE_kache"));
+    let command = || {
+        let mut command = common::hermetic_command(binary, &cache, Some(&config));
+        command
+            .current_dir(&workspace)
+            .env("KACHE_NAMESPACE", "org/repo")
+            .env("KACHE_BUILD_SHAPE", "declared-fixture-shape")
+            .env("KACHE_BUILD_TARGET", "declared-target")
+            .env_remove("KACHE_DISABLED")
+            .env_remove("GITHUB_ACTIONS")
+            .env_remove("GITLAB_CI")
+            .env_remove("CI");
+        command
+    };
+    let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+    let probe = command().arg(&rustc).arg("--print=cfg").output().unwrap();
+    assert!(
+        probe.status.success(),
+        "{}",
+        String::from_utf8_lossy(&probe.stderr)
+    );
+    assert!(
+        !cache.join("build-report-contexts").exists(),
+        "query froze unknown producer facts"
+    );
+    let compile = command()
+        .arg(&rustc)
+        .args(["--crate-name", "fixture", "--crate-type=lib", "--out-dir"])
+        .arg(&out)
+        .arg("lib.rs")
+        .output()
+        .unwrap();
+    assert!(
+        compile.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let contexts = std::fs::read_dir(cache.join("build-report-contexts"))
+        .unwrap()
+        .map(|entry| {
+            serde_json::from_slice::<Value>(&std::fs::read(entry.unwrap().path()).unwrap()).unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(contexts.len(), 1);
+    assert_eq!(contexts[0]["identity"]["profile"], "debug");
+    assert_eq!(contexts[0]["identity"]["target"], "declared-target");
+    assert_eq!(
+        contexts[0]["identity"]["build_shape"],
+        "declared-fixture-shape"
+    );
+    assert_eq!(contexts[0]["identity"]["repository"], "org/repo");
+    assert_eq!(
+        contexts[0]["identity"]["lock_digest"],
+        blake3::hash(b"fixture lock contents").to_hex().to_string()
+    );
+    assert_eq!(
+        contexts[0]["identity"]["toolchain_hash"]
+            .as_str()
+            .unwrap()
+            .len(),
+        64
+    );
+}

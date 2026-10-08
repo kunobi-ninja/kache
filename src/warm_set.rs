@@ -10,7 +10,6 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
-use serde::Serialize;
 use tokio::io::AsyncWrite;
 
 use crate::build_reports::{BuildIdentity, BuildReport};
@@ -50,9 +49,8 @@ pub(crate) struct Options {
     uninstall_hooks: bool,
 }
 
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Default)]
 struct ReplaySummary {
-    session_id: String,
     restored: usize,
     local: usize,
     busy: usize,
@@ -257,10 +255,7 @@ async fn replay(
     crate::build_reports::validate_report(report)?;
     let store = Store::open(config)?;
     let entries = ordered_entries(report);
-    let mut summary = ReplaySummary {
-        session_id: report.session_id.clone(),
-        ..Default::default()
-    };
+    let mut summary = ReplaySummary::default();
     let mut started = 0;
     for (index, entry) in entries.iter().enumerate() {
         if store.contains(&entry.cache_key) {

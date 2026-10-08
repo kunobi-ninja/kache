@@ -111,6 +111,15 @@ async fn discovery_selects_latest_matching_report_and_ignores_newer_incompatible
             .await
             .unwrap();
     }
+    let corrupt = report("corrupt", 40, &[(&key, "alpha")]);
+    backend
+        .put(
+            &crate::build_reports::object_key("cache", &corrupt).unwrap(),
+            b"{".to_vec(),
+            None,
+        )
+        .await
+        .unwrap();
     let selected = select_report(
         backend.as_ref(),
         "cache",
@@ -157,6 +166,35 @@ async fn discovery_selects_latest_matching_report_and_ignores_newer_incompatible
         .await
         .is_err()
     );
+}
+
+#[tokio::test]
+async fn equal_finish_times_use_session_and_root_for_deterministic_selection() {
+    let backend = memory_backend();
+    let key = "d".repeat(64);
+    let mut earlier_session = report("alpha", 20, &[(&key, "alpha")]);
+    earlier_session.root_hash = "f".repeat(64);
+    let mut earlier_root = report("zulu", 20, &[(&key, "alpha")]);
+    earlier_root.root_hash = "1".repeat(64);
+    let mut winner = earlier_root.clone();
+    winner.root_hash = "a".repeat(64);
+    for r in [&winner, &earlier_session, &earlier_root] {
+        crate::build_reports::upload_report(&backend, "cache", r)
+            .await
+            .unwrap();
+    }
+    let selected = select_report(
+        &backend,
+        "cache",
+        "fixture",
+        &identity(),
+        Instant::now() + Duration::from_secs(10),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(selected.session_id, "zulu");
+    assert_eq!(selected.root_hash, "a".repeat(64));
 }
 
 #[tokio::test]

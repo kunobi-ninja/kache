@@ -636,6 +636,115 @@ mod tests {
         .remove(0)
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn toolchain_identity_requires_full_readable_host_version() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let version = "rustc 1.99.0\nhost: x86_64-unknown-linux-gnu\nrelease: 1.99.0";
+        let expected = blake3::hash(version.as_bytes()).to_hex().to_string();
+        for (index, (stdout, identity)) in [
+            (format!("  {version}\n").into_bytes(), Some(expected)),
+            (b"rustc 1.99.0\nrelease: 1.99.0\n".to_vec(), None),
+            (
+                format!("{version}\ncommit-hash: \u{fffd}\n").into_bytes(),
+                None,
+            ),
+            (
+                [version.as_bytes(), b"\ncommit-hash: \xff\n"].concat(),
+                None,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let compiler = dir.path().join(format!("rustc-{index}"));
+            std::fs::write(&compiler, "#!/bin/sh\nexec /bin/cat \"${0}.version\"\n").unwrap();
+            std::fs::set_permissions(&compiler, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::write(compiler.with_extension("version"), stdout).unwrap();
+            assert_eq!(toolchain_hash(&compiler), identity, "version case {index}");
+        }
+    }
+
+    #[test]
+    fn context_size_limit_accepts_exact_cap_and_rejects_trailing_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let context = ProducerContext {
+            session_id: "one".into(),
+            root: "/work".into(),
+            namespace: "org/repo".into(),
+            identity: BuildIdentity::default(),
+            commit: None,
+            git_ref: None,
+            parent_commits: vec![],
+            captured_at_ms: 0,
+            ci_started_at_ms: None,
+            facts: None,
+        };
+        persist_context(dir.path(), &context).unwrap();
+        let path = context_path(dir.path(), "one", "/work");
+        let mut bytes = serde_json::to_vec(&context).unwrap();
+        bytes.resize(8_388_608, b' ');
+        std::fs::write(&path, &bytes).unwrap();
+        assert_eq!(
+            read_context(dir.path(), "one", "/work").unwrap(),
+            Some(context)
+        );
+        bytes.push(b' ');
+        std::fs::write(&path, bytes).unwrap();
+        assert!(
+            read_context(dir.path(), "one", "/work")
+                .unwrap_err()
+                .to_string()
+                .contains("size limit")
+        );
+    }
+
+    #[test]
+    fn zero_duration_and_epoch_clamping_preserve_valid_observations() {
+        let dir = tempfile::tempdir().unwrap();
+        for (finish, elapsed, expected_start, expected_finish) in
+            [(0, 0, 0, 0), (-1, 0, 0, 0), (50, 50, 0, 50)]
+        {
+            let reports = collect_reports(
+                &[event("one", "/work", 'a', finish, elapsed)],
+                None,
+                dir.path(),
+                None,
+            )
+            .unwrap();
+            assert_eq!(reports[0].started_at_ms, expected_start);
+            assert_eq!(reports[0].finished_at_ms, expected_finish);
+            assert_eq!(reports[0].entries[0].start_offset_ms, 0);
+            assert_eq!(reports[0].entries[0].ci_start_offset_ms, None);
+        }
+        let oversized_elapsed = event("one", "/work", 'a', 50, 51);
+        assert_eq!(event_start(&oversized_elapsed), 0);
+        assert!(collect_reports(&[oversized_elapsed], None, dir.path(), None).is_err());
+    }
+
+    #[test]
+    fn report_filenames_require_both_safe_session_and_full_root_hash() {
+        let hash = "a".repeat(64);
+        assert!(valid_report_filename(&format!("session-one-{hash}.json")));
+        for session in [
+            "",
+            ".",
+            "..",
+            "nested/session",
+            "path\\session",
+            "space session",
+        ] {
+            assert!(
+                !valid_report_filename(&format!("{session}-{hash}.json")),
+                "{session:?}"
+            );
+        }
+        assert!(!valid_report_filename("session.json"));
+        assert!(!valid_report_filename(&format!("session-{hash}.json.bak")));
+    }
+
     #[test]
     fn ordered_report_retains_repeats_timings_and_exact_scope() {
         let dir = tempfile::tempdir().unwrap();
@@ -861,6 +970,9 @@ mod tests {
         ));
         let dir = tempfile::tempdir().unwrap();
         let lock = dir.path().join("Cargo.lock");
+        assert_eq!(lock_digest(&lock), None);
+        std::fs::write(&lock, []).unwrap();
+        assert_eq!(lock_digest(&lock), None);
         std::fs::write(&lock, "producer lock contents").unwrap();
         let args = crate::args::RustcArgs::parse(&[
             dir.path()

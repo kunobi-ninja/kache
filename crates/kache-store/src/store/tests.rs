@@ -12764,3 +12764,33 @@ fn quarantine_cleanup_tolerates_peer_removal_and_reports_other_errors() {
         "cleanup must not delete a replacement directory"
     );
 }
+
+#[test]
+fn eviction_horizon_public_api_reads_existing_observations_without_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let owner = Store::open(&config).unwrap();
+    owner.db.execute("INSERT INTO eviction_tombstones(cache_key,evicted_at,policy,size,hit_count,idle_hours,compile_time_ms,demanded_at,shadow_policy,shadow_would_evict) VALUES ('old',datetime(100,'unixepoch'),'lru',1073741824,0,0,900,datetime(150,'unixepoch'),'value-density',1)",[]).unwrap();
+    let reader = Store::open_read_only(&config).unwrap();
+    let changes = reader.db.total_changes();
+    let report = reader.eviction_horizon_evidence(200, 100).unwrap();
+    assert_eq!(report.as_of_unix_secs, 200);
+    assert_eq!(report.horizon_secs, 100);
+    assert_eq!(report.live_shadow_agreed.mature, 1);
+    assert_eq!(
+        report
+            .live_shadow_agreed
+            .demanded_gross_compile_cost_ms_lower,
+        900
+    );
+    assert_eq!(reader.db.total_changes(), changes);
+    assert!(reader.eviction_horizon_evidence(200, 0).is_err());
+    assert_eq!(
+        owner
+            .db
+            .query_row("SELECT count(*) FROM eviction_tombstones", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+}

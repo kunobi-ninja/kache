@@ -4172,3 +4172,63 @@ fn same_release_copy_keeps_the_running_daemon() {
     let after = status();
     assert_eq!(before, after, "same release must retain the daemon PID");
 }
+
+#[test]
+fn quarantine_backups_are_reported_and_only_removed_by_confirmed_full_clean() {
+    let e = env();
+    let names = [
+        "index.db.corrupt-123-456",
+        "index.db.corrupt-123-456-wal",
+        "index.db.corrupt-123-456-shm",
+    ];
+    for name in names {
+        std::fs::write(e.cache.join(name), b"saved evidence").unwrap();
+    }
+    let output = e.cmd().args(["--json", "doctor"]).output().unwrap();
+    assert!(output.status.success());
+    let body: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let check = body["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["label"] == "Store quarantine")
+        .expect("doctor lists forensic copies");
+    assert_eq!(check["pass"], false);
+    assert!(
+        check["detail"]
+            .as_str()
+            .unwrap()
+            .starts_with("3 files (42 B) retained in ")
+    );
+    assert!(
+        check["fix"]
+            .as_str()
+            .unwrap()
+            .contains("`kache clean --cache`")
+    );
+    for args in [
+        vec!["clean", "--cache", "--dry-run"],
+        vec!["clean", "--cache"],
+        vec!["clean", "--crate", "missing", "--yes"],
+    ] {
+        e.cmd().args(args).assert().success();
+        for name in names {
+            assert_eq!(
+                std::fs::read(e.cache.join(name)).unwrap(),
+                b"saved evidence"
+            );
+        }
+    }
+    e.cmd()
+        .args(["clean", "--cache", "--yes"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(
+            "Full cache removal also deletes 3 quarantined index files (42 B).",
+        ));
+    for name in names {
+        assert!(!e.cache.join(name).exists());
+    }
+    assert!(e.cache.join("index.db").is_file());
+    e.cmd().args(["--json", "list"]).assert().success();
+}

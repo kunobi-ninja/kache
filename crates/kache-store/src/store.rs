@@ -2048,6 +2048,78 @@ fn quarantine_corrupt_index(db_path: &Path) -> Result<PathBuf> {
     Ok(quarantine)
 }
 
+/// One retained corrupt index file, including WAL/SHM sidecars.
+#[derive(Debug, PartialEq, Eq)]
+pub struct QuarantinedIndexFile {
+    pub path: PathBuf,
+    pub bytes: u64,
+}
+
+/// List forensic copies without opening or modifying the index. Ordinary GC
+/// leaves these copies intact; an explicit full cache clear removes them.
+pub fn quarantined_index_files(db_path: &Path) -> Result<Vec<QuarantinedIndexFile>> {
+    let parent = db_path.parent().context("index path has no parent")?;
+    let prefix = format!(
+        "{}.corrupt-",
+        db_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .context("invalid index filename")?
+    );
+    let entries = match fs::read_dir(parent) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut files = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(suffix) = name.to_str().and_then(|n| n.strip_prefix(&prefix)) else {
+            continue;
+        };
+        if !is_quarantine_suffix(suffix) {
+            continue;
+        }
+        // Do not follow links or delete similarly named directories.
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if metadata.is_file() {
+            files.push(QuarantinedIndexFile {
+                path: entry.path(),
+                bytes: metadata.len(),
+            });
+        }
+    }
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(files)
+}
+
+/// Another explicit cleaner may unlink a listed copy before we reach it.
+/// Missing copies are already cleaned; other failures must reach the caller.
+fn remove_quarantined_index_files(files: &[QuarantinedIndexFile]) -> Result<()> {
+    for file in files {
+        match fs::remove_file(&file.path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
+fn is_quarantine_suffix(suffix: &str) -> bool {
+    let suffix = suffix
+        .strip_suffix("-wal")
+        .or_else(|| suffix.strip_suffix("-shm"))
+        .unwrap_or(suffix);
+    let Some((millis, pid)) = suffix.split_once('-') else {
+        return false;
+    };
+    [millis, pid]
+        .into_iter()
+        .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
 /// The path of a SQLite sidecar (`-wal` / `-shm`): the suffix is appended to the
 /// whole DB filename, not its extension.
 fn index_sidecar_path(db_path: &Path, suffix: &str) -> PathBuf {
@@ -4898,15 +4970,17 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         &self,
         policy: &dyn crate::eviction::EvictionPolicy,
         stop_at: Option<(u64, u64)>,
+        probe_held_bytes: bool,
         origin: SweepOrigin,
     ) -> Result<GcStats> {
-        self.evict_with_stop(policy, stop_at, origin, &mut || false)
+        self.evict_with_stop(policy, stop_at, probe_held_bytes, origin, &mut || false)
     }
 
     fn evict_with_stop(
         &self,
         policy: &dyn crate::eviction::EvictionPolicy,
         stop_at: Option<(u64, u64)>,
+        probe_held_bytes: bool,
         origin: SweepOrigin,
         stop: &mut dyn FnMut() -> bool,
     ) -> Result<GcStats> {
@@ -4932,8 +5006,9 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             selected_compile_time_ms = cost_ms,
             "gc: eviction selection"
         );
-        // Only a size-driven sweep has a byte budget for held bytes to leave.
-        let held = if stop_at.is_some() {
+        // Duplicate eviction has a byte budget too, but only the size pass
+        // probes the whole store for external retainers.
+        let held = if probe_held_bytes {
             self.held_by_live_files(&candidates)?
         } else {
             std::collections::HashMap::new()
@@ -5056,6 +5131,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         self.evict_with(
             &crate::eviction::SizePressurePolicy,
             Some((size_before, target)),
+            true,
             origin,
         )
     }
@@ -5072,6 +5148,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         self.evict_with_stop(
             &crate::eviction::SizePressurePolicy,
             None,
+            false,
             SweepOrigin::Automatic,
             &mut stop,
         )
@@ -5083,6 +5160,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         self.evict_with(
             &crate::eviction::OlderThanPolicy { hours },
             None,
+            false,
             SweepOrigin::Requested,
         )
     }
@@ -5153,6 +5231,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                 size_before,
                 crate::eviction::eviction_target(self.config.max_size),
             )),
+            false,
             origin,
         )
     }
@@ -6155,7 +6234,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         );
     }
 
-    /// Clear the entire store.
+    /// Clear the entire store, including retained corrupt index copies.
     ///
     /// Index rows drop first, in one transaction: once it commits no
     /// reader can begin a restore from a purged entry, and the
@@ -6195,7 +6274,8 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                 }
             }
         }
-        drop_index_rows()
+        drop_index_rows()?;
+        remove_quarantined_index_files(&quarantined_index_files(&self.config.index_db_path())?)
     }
 
     /// Recursively make all files in a directory writable so they can be deleted.

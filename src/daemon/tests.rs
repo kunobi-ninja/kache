@@ -12212,7 +12212,10 @@ async fn test_send_build_started_client_roundtrip() {
     let listener = bind_listener(&socket_path);
     let daemon = Arc::new(Daemon::new(config.clone()));
     let server = tokio::spawn(async move {
-        let stream = listener.accept().await.expect("accept");
+        let stream = tokio::time::timeout(Duration::from_secs(10), listener.accept())
+            .await
+            .expect("the build-started client must send its hint")
+            .expect("accept");
         let _ = handle_connection(stream, &daemon, &Arc::new(Lifecycle::default())).await;
     });
 
@@ -14522,7 +14525,10 @@ async fn a_writable_build_hint_keeps_its_identity() {
     std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
     let listener = bind_listener(&socket);
     let server = tokio::spawn(async move {
-        let stream = listener.accept().await.unwrap();
+        let stream = tokio::time::timeout(Duration::from_secs(10), listener.accept())
+            .await
+            .expect("the writable build hint must reach the daemon")
+            .unwrap();
         let mut line = String::new();
         BufReader::new(stream).read_line(&mut line).await.unwrap();
         let request: Request = serde_json::from_str(&line).unwrap();

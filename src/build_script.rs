@@ -2536,10 +2536,7 @@ mod tests {
         assert_eq!(identical[0], identical[1]);
         assert_eq!(
             identical[0].as_ref().unwrap().0,
-            format!(
-                "${{KACHE_BASE_DIR}}/{}",
-                Path::new("build").join("linker").display()
-            )
+            "${KACHE_BASE_DIR}/build/linker"
         );
         std::fs::write(roots[1].join("build/linker"), b"exec ld \"$@\"\n").unwrap();
         let changed = states("RUSTC_LINKER", &allowlist);

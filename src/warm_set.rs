@@ -3,12 +3,13 @@
 mod hooks;
 
 use std::collections::HashSet;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use async_trait::async_trait;
 use tokio::io::AsyncWrite;
 
@@ -311,6 +312,13 @@ async fn replay(
                     summary.record_busy();
                     continue;
                 }
+                if let Err(error) =
+                    validate_staged_binding(&incoming, &entry.cache_key, &entry.crate_name)
+                {
+                    summary.record_failure();
+                    eprintln!("Cannot verify {}: {error:#}", entry.cache_key);
+                    continue;
+                }
                 // An existing committed generation is a nonempty directory;
                 // rename cannot replace it, including a publication after the
                 // recheck above. Never remove the destination on this path.
@@ -336,6 +344,27 @@ async fn replay(
         }
     }
     Ok(summary)
+}
+
+fn validate_staged_binding(incoming: &Path, cache_key: &str, crate_name: &str) -> Result<()> {
+    let file = std::fs::File::open(incoming.join("meta.json"))?;
+    let mut bytes = Vec::new();
+    file.take(crate::build_reports::MAX_REPORT_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    ensure!(
+        (bytes.len() as u64) <= crate::build_reports::MAX_REPORT_BYTES,
+        "staged entry metadata exceeds size limit"
+    );
+    let meta: crate::store::EntryMeta = serde_json::from_slice(&bytes)?;
+    ensure!(
+        meta.cache_key == cache_key,
+        "staged entry cache-key mismatch"
+    );
+    ensure!(
+        meta.crate_name == crate_name,
+        "staged entry crate-name mismatch"
+    );
+    Ok(())
 }
 
 fn publish_staged_entry(incoming: &Path, destination: &Path) -> std::io::Result<bool> {

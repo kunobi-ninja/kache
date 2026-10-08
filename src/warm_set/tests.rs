@@ -559,6 +559,13 @@ async fn staged_files_disappearing_before_publish_or_import_are_failures() {
     let dir = tempfile::tempdir().unwrap();
     let source = dir.path().join("source");
     std::fs::write(&source, b"verified compiled bytes").unwrap();
+    let candidate_hash = blake3::hash(b"verified compiled bytes")
+        .to_hex()
+        .to_string();
+    let retained_source = dir.path().join("retained-source");
+    let retained_bytes = b"existing independent compiled unit";
+    std::fs::write(&retained_source, retained_bytes).unwrap();
+    let retained_hash = blake3::hash(retained_bytes).to_hex().to_string();
     let producer_config = crate::test_support::test_config(dir.path().join("producer"));
     let producer = Store::open(&producer_config).unwrap();
     let key = "e".repeat(64);
@@ -577,20 +584,22 @@ async fn staged_files_disappearing_before_publish_or_import_are_failures() {
         )
         .await
         .unwrap();
-    for remove_whole_entry in [true, false] {
-        let config = crate::test_support::test_config(
-            dir.path().join(format!("consumer-{remove_whole_entry}")),
-        );
+    for missing in ["entry", "meta.json", "libalpha.rlib"] {
+        let config =
+            crate::test_support::test_config(dir.path().join(format!("consumer-{missing}")));
         let consumer = Store::open(&config).unwrap();
         let retained = "a".repeat(64);
-        put(&consumer, &retained, "alpha", &source);
+        put(&consumer, &retained, "alpha", &retained_source);
+        assert!(!consumer.blob_path(&candidate_hash).exists());
         let client = InterferingRemote {
             inner: crate::cache_remote::V3Remote::new(backend.clone(), remote.clone()),
             after_download: Box::new(move |entry| {
-                if remove_whole_entry {
+                if missing == "entry" {
+                    assert!(entry.is_dir());
                     std::fs::remove_dir_all(entry)?;
                 } else {
-                    std::fs::remove_file(entry.join("meta.json"))?;
+                    assert!(entry.join(missing).is_file());
+                    std::fs::remove_file(entry.join(missing))?;
                 }
                 Ok(())
             }),
@@ -614,7 +623,7 @@ async fn staged_files_disappearing_before_publish_or_import_are_failures() {
                 summary.failed
             ),
             (0, 1, 0, 1),
-            "disappearing stage is a failure: {remove_whole_entry}"
+            "disappearing stage is a failure: {missing}"
         );
         assert!(summary.downloaded_bytes > 0);
         assert!(!consumer.contains(&key));
@@ -624,6 +633,10 @@ async fn staged_files_disappearing_before_publish_or_import_are_failures() {
         );
         assert!(consumer.contains(&retained));
         assert!(consumer.entry_dir(&retained).join("meta.json").is_file());
+        assert_eq!(
+            std::fs::read(consumer.blob_path(&retained_hash)).unwrap(),
+            retained_bytes
+        );
         assert!(
             !std::fs::read_dir(config.store_dir())
                 .unwrap()
@@ -736,6 +749,35 @@ async fn replay_rejects_pack_with_different_cache_key() {
 #[tokio::test]
 async fn replay_rejects_pack_with_different_crate_name() {
     assert_alternate_pack_is_rejected(&"a".repeat(64), "beta").await;
+}
+
+#[test]
+fn staged_binding_requires_readable_metadata_within_the_exact_size_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source");
+    std::fs::write(&source, b"compiled unit").unwrap();
+    let config = crate::test_support::test_config(dir.path().join("store"));
+    let store = Store::open(&config).unwrap();
+    let key = "a".repeat(64);
+    put(&store, &key, "alpha", &source);
+    let incoming = store.entry_dir(&key);
+    let path = incoming.join("meta.json");
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes.resize(8_388_608, b' ');
+    std::fs::write(&path, &bytes).unwrap();
+    validate_staged_binding(&incoming, &key, "alpha").unwrap();
+    bytes.push(b' ');
+    std::fs::write(&path, bytes).unwrap();
+    assert!(
+        validate_staged_binding(&incoming, &key, "alpha")
+            .unwrap_err()
+            .to_string()
+            .contains("size limit")
+    );
+    std::fs::write(&path, b"{").unwrap();
+    assert!(validate_staged_binding(&incoming, &key, "alpha").is_err());
+    std::fs::remove_file(&path).unwrap();
+    assert!(validate_staged_binding(&incoming, &key, "alpha").is_err());
 }
 
 #[test]

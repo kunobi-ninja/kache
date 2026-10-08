@@ -145,6 +145,7 @@ fn compiler_queries_do_not_poison_offline_producer_identity() {
         command
             .current_dir(&workspace)
             .env("KACHE_NAMESPACE", "org/repo")
+            .env("KACHE_REPOSITORY", "org/repo")
             .env("KACHE_BUILD_SHAPE", "declared-fixture-shape")
             .env("KACHE_BUILD_TARGET", "declared-target")
             .env_remove("KACHE_DISABLED")

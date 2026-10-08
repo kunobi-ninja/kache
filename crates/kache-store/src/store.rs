@@ -2094,6 +2094,19 @@ pub fn quarantined_index_files(db_path: &Path) -> Result<Vec<QuarantinedIndexFil
     Ok(files)
 }
 
+/// Another explicit cleaner may unlink a listed copy before we reach it.
+/// Missing copies are already cleaned; other failures must reach the caller.
+fn remove_quarantined_index_files(files: &[QuarantinedIndexFile]) -> Result<()> {
+    for file in files {
+        match fs::remove_file(&file.path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
 fn is_quarantine_suffix(suffix: &str) -> bool {
     let suffix = suffix
         .strip_suffix("-wal")
@@ -6262,14 +6275,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             }
         }
         drop_index_rows()?;
-        for file in quarantined_index_files(&self.config.index_db_path())? {
-            match fs::remove_file(&file.path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.into()),
-            }
-        }
-        Ok(())
+        remove_quarantined_index_files(&quarantined_index_files(&self.config.index_db_path())?)
     }
 
     /// Recursively make all files in a directory writable so they can be deleted.

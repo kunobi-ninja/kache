@@ -12732,3 +12732,35 @@ fn quarantine_listing_reports_io_errors_and_tolerates_absent_cache() {
     assert!(quarantined_index_files(&parent.join("index.db")).is_err());
     assert!(quarantined_index_files(Path::new("/")).is_err());
 }
+
+#[test]
+fn quarantine_cleanup_tolerates_peer_removal_and_reports_other_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("index.db");
+    let first = dir.path().join("index.db.corrupt-123-456");
+    let second = dir.path().join("index.db.corrupt-123-456-wal");
+    fs::write(&first, b"old index").unwrap();
+    fs::write(&second, b"old wal").unwrap();
+    let listed = quarantined_index_files(&db).unwrap();
+    assert_eq!(listed.len(), 2);
+    // A peer completed part of its cleanup after this pass listed the copies.
+    fs::remove_file(&first).unwrap();
+    remove_quarantined_index_files(&listed).unwrap();
+    assert!(
+        !second.exists(),
+        "a disappeared copy must not abort the remaining removals"
+    );
+
+    fs::write(&first, b"old index").unwrap();
+    let listed = quarantined_index_files(&db).unwrap();
+    fs::remove_file(&first).unwrap();
+    fs::create_dir(&first).unwrap();
+    assert!(
+        remove_quarantined_index_files(&listed).is_err(),
+        "only NotFound may be ignored"
+    );
+    assert!(
+        first.is_dir(),
+        "cleanup must not delete a replacement directory"
+    );
+}

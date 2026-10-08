@@ -205,7 +205,9 @@ fn rollback_created_hooks(directory: &Path, created: &[&str], script: &str) {
     // Roll back only files this attempt created whose bytes still match.
     for name in created {
         let path = directory.join(name);
-        if std::fs::read(&path).is_ok_and(|bytes| bytes == script.as_bytes()) {
+        let regular =
+            existing_metadata(&path).is_ok_and(|meta| meta.is_some_and(|meta| meta.is_file()));
+        if regular && std::fs::read(&path).is_ok_and(|bytes| bytes == script.as_bytes()) {
             let _ = std::fs::remove_file(path);
         }
     }
@@ -374,9 +376,16 @@ mod tests {
         std::fs::write(dir.path().join("post-checkout"), "managed script").unwrap();
         std::fs::write(dir.path().join("post-merge"), "user edited script").unwrap();
         std::fs::write(dir.path().join("pre-commit"), "unrelated hook").unwrap();
+        std::fs::create_dir(dir.path().join("created-directory")).unwrap();
         rollback_created_hooks(
             dir.path(),
-            &["post-checkout", "post-merge", "missing-hook"],
+            &[
+                "post-checkout",
+                "post-merge",
+                "missing-hook",
+                "created-directory",
+                "invalid\0hook",
+            ],
             "managed script",
         );
         assert!(!dir.path().join("post-checkout").exists());
@@ -388,6 +397,28 @@ mod tests {
             std::fs::read_to_string(dir.path().join("pre-commit")).unwrap(),
             "unrelated hook"
         );
+        assert!(dir.path().join("created-directory").is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rollback_retains_a_replacement_symlink_with_the_same_script_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("foreign-target");
+        let hook = dir.path().join("post-checkout");
+        std::fs::write(&target, "managed script").unwrap();
+        std::fs::write(&hook, "managed script").unwrap();
+        std::fs::remove_file(&hook).unwrap();
+        std::os::unix::fs::symlink(&target, &hook).unwrap();
+        rollback_created_hooks(dir.path(), &["post-checkout"], "managed script");
+        assert!(
+            std::fs::symlink_metadata(&hook)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read_link(&hook).unwrap(), target);
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "managed script");
     }
 
     #[test]

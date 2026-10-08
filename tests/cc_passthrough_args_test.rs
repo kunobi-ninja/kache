@@ -205,6 +205,47 @@ fn cacheable_cc_command(root: &std::path::Path) -> Command {
 }
 
 #[test]
+fn cc_admission_reports_a_skip_reason_and_recompiles_until_admitted() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    fs::write(root.join("kache.toml"), "").unwrap();
+    fs::write(root.join("unit.c"), "int value(void) { return 42; }\n").unwrap();
+
+    for (threshold, result, reason) in [
+        ("18446744073709551615", "skipped", "admission-threshold"),
+        ("18446744073709551615", "skipped", "admission-threshold"),
+        ("0", "miss", ""),
+        ("0", "local_hit", ""),
+    ] {
+        let _ = fs::remove_file(root.join("unit.o"));
+        let output = cacheable_cc_command(&root)
+            .args(["cc", "-c", "unit.c", "-o", "unit.o"])
+            .env("KACHE_MIN_STORE_COMPILE_MS", threshold)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{result}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(root.join("unit.o").is_file());
+        let events = fs::read_to_string(root.join("cache/events.jsonl")).unwrap();
+        let event: serde_json::Value =
+            serde_json::from_str(events.lines().last().unwrap()).unwrap();
+        assert_eq!(event["result"], result, "{event}");
+        assert_eq!(
+            event
+                .get("skip_reason")
+                .and_then(|value| value.as_str())
+                .unwrap_or(""),
+            reason,
+            "{event}"
+        );
+        assert_eq!(event["compiler_runs"], u32::from(result != "local_hit"));
+    }
+}
+
+#[test]
 fn deferred_cc_does_not_publish_inputs_changed_during_the_compile() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().canonicalize().unwrap();

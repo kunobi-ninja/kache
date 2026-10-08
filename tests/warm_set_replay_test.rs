@@ -474,10 +474,8 @@ fn missing_inputs_are_noops_and_zero_budgets_fail_before_import() {
         ),
     ] {
         fixture.consumer.configure(Some(fixture.remote.path()), 32);
-        let mut config: toml::Value = std::fs::read_to_string(&fixture.consumer.config)
-            .unwrap()
-            .parse()
-            .unwrap();
+        let mut config: toml::Value =
+            toml::from_str(&std::fs::read_to_string(&fixture.consumer.config).unwrap()).unwrap();
         config["cache"][field] = value;
         std::fs::write(&fixture.consumer.config, toml::to_string(&config).unwrap()).unwrap();
         let output = fixture.prefetch(&[]);

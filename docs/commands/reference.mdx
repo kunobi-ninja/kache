@@ -34,6 +34,7 @@ These are for CI, scripts and integrations, and are not listed by `kache --help`
 | Command | Purpose |
 | --- | --- |
 | `cargo` | Run Cargo with duplicate Cargo-home rustflags collapsed |
+| `prefetch` | Restore a compatible ordered warm set before building |
 | `save-manifest` | Publish build metadata for later prefetch |
 | `telemetry` | Write cache counters and this machine's shared-cache state as OTLP JSON for Kartero |
 | `test-runner` | Run a test binary as Cargo's target runner, paced by the scheduler |
@@ -194,6 +195,55 @@ Options:
 | `--allow-partial` | Exit successfully despite reported transfer/import failures |
 
 See [Sync](/docs/remote-cache/sync) for filtering semantics.
+
+## `kache prefetch`
+
+Restore the most recent compatible session report before starting Cargo:
+
+```bash
+kache prefetch --namespace my-org/my-repo --build-shape my-config-digest
+cargo build
+```
+
+The producer must have used the same namespace, repository label, declared build
+shape, target, profile, compiler version and full `Cargo.lock` digest, then
+published its report with `kache save-manifest`. Run `kache sync --push` first
+when the build used a local-only cache. Reports record observed compiler events;
+a reported pack may still be missing from the remote.
+
+`--namespace`, `--repository` and `--build-shape` can use `KACHE_NAMESPACE`,
+`KACHE_REPOSITORY` and `KACHE_BUILD_SHAPE`. Repository defaults to the namespace.
+`--target` defaults to the selected compiler's host; pass it for cross builds.
+`--profile` defaults to `debug`; `--rustc` selects the compiler, otherwise `RUSTC`
+or `rustc` on PATH is used. Missing labels, a missing lockfile or no compatible
+report produce an explained no-op. `--dry-run` prints keys in replay order.
+
+The command waits for local import before returning. It replays each key once,
+in its first observed order, and skips local entries and busy keys. Downloads
+use the existing verified pack reader and an owned staging directory. A failed
+pack is reported without discarding successful imports or replacing another
+publisher's entry; partial failures return a nonzero exit status.
+
+`KACHE_PREFETCH_MAX_KEYS`, `KACHE_PREFETCH_MAX_BYTES` and
+`KACHE_PREFETCH_DEADLINE_SECS` must be finite and nonzero. The byte cap covers
+compressed artifact bodies; discovery is separately limited to 1,024 reports
+of at most 8 MiB each. Failed artifact transfers conservatively consume their
+admitted byte allowance. Downloads run one at a time, within the configured
+concurrency ceiling. The deadline covers discovery and downloads; local import
+still finishes before the command returns. Automatic prefetch can be disabled
+while using this explicit command.
+
+Install optional Git hooks with the same replay options:
+
+```bash
+kache prefetch --namespace my-org/my-repo --build-shape my-config-digest --install-hooks
+kache prefetch --uninstall-hooks
+```
+
+Installation respects `core.hooksPath` and refuses existing hooks. The
+post-checkout and post-merge hooks are bound to their repository and leave Git
+successful when optional warming fails. Uninstallation removes only unchanged
+hooks recorded by Kache; edited hooks are retained.
 
 ## `kache save-manifest`
 

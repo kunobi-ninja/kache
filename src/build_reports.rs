@@ -535,9 +535,6 @@ pub async fn upload_report(
 
 /// Discovery never returns nested namespaces or arbitrary object keys. A large
 /// namespace is refused instead of silently selecting an arbitrary partial set.
-// The next replay consumer uses this API; standalone report publication has no
-// reader command. Keep it compiled and exercised by restart tests in the interim.
-#[allow(dead_code)]
 pub async fn list_reports(
     backend: &dyn RemoteBackend,
     prefix: &str,
@@ -572,7 +569,6 @@ fn valid_report_filename(name: &str) -> bool {
     safe_component(session) && hex64(root)
 }
 
-#[allow(dead_code)] // Reader API for replay/index reconstruction.
 pub async fn download_report(
     backend: &dyn RemoteBackend,
     prefix: &str,

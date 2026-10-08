@@ -373,10 +373,12 @@ fn explicit_replay_finishes_before_cargo_and_repeated_replay_skips_local_entries
     let mut fixture = Fixture::new();
     let dry_run = fixture.prefetch(&["--dry-run"]);
     assert_success(&dry_run);
-    assert_eq!(
-        String::from_utf8(dry_run.stdout).unwrap().lines().count(),
-        2
-    );
+    assert_eq!(String::from_utf8_lossy(&dry_run.stdout).lines().count(), 2);
+    let environment_defaults = fixture
+        .consumer
+        .kache(fixture.project.path(), &["prefetch", "--dry-run"]);
+    assert_success(&environment_defaults);
+    assert_eq!(environment_defaults.stdout, dry_run.stdout);
     fixture.assert_empty();
     assert_success(&fixture.prefetch(&[]));
     for entry in fixture.report["entries"].as_array().unwrap() {
@@ -424,6 +426,71 @@ fn explicit_replay_finishes_before_cargo_and_repeated_replay_skips_local_entries
         "explicit replay must avoid both real compiles: {report}"
     );
     assert!(target.join("debug/libwarm_fixture.rlib").is_file());
+}
+
+#[test]
+fn missing_inputs_are_noops_and_zero_budgets_fail_before_import() {
+    let mut fixture = Fixture::new();
+    for missing in ["KACHE_NAMESPACE", "KACHE_BUILD_SHAPE"] {
+        let mut command = fixture.consumer.command(kache_binary());
+        command.arg("prefetch").env_remove(missing);
+        let output = fixture.consumer.execute(command, fixture.project.path());
+        assert_success(&output);
+        assert!(String::from_utf8_lossy(&output.stderr).contains("supply --namespace"));
+        fixture.assert_empty();
+    }
+
+    fixture.consumer.configure(None, 32);
+    let output = fixture.prefetch(&[]);
+    assert_success(&output);
+    assert!(String::from_utf8_lossy(&output.stderr).contains("no remote cache"));
+    fixture.assert_empty();
+    fixture.consumer.configure(Some(fixture.remote.path()), 32);
+
+    let lock = fixture.project.path().join("Cargo.lock");
+    let contents = std::fs::read(&lock).unwrap();
+    std::fs::remove_file(&lock).unwrap();
+    let output = fixture.prefetch(&[]);
+    std::fs::write(lock, contents).unwrap();
+    assert_success(&output);
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Cargo.lock is missing"));
+    fixture.assert_empty();
+
+    for (field, value, message) in [
+        (
+            "prefetch_max_keys",
+            toml::Value::Integer(0),
+            "key and byte budgets",
+        ),
+        (
+            "prefetch_max_bytes",
+            toml::Value::String("0B".into()),
+            "key and byte budgets",
+        ),
+        (
+            "prefetch_deadline_secs",
+            toml::Value::Integer(0),
+            "finite KACHE_PREFETCH_DEADLINE_SECS",
+        ),
+    ] {
+        fixture.consumer.configure(Some(fixture.remote.path()), 32);
+        let mut config: toml::Value = std::fs::read_to_string(&fixture.consumer.config)
+            .unwrap()
+            .parse()
+            .unwrap();
+        config["cache"][field] = value;
+        std::fs::write(&fixture.consumer.config, toml::to_string(&config).unwrap()).unwrap();
+        let output = fixture.prefetch(&[]);
+        assert!(
+            !output.status.success(),
+            "zero {field} accepted: {output:?}"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(message),
+            "{output:?}"
+        );
+        fixture.assert_empty();
+    }
 }
 
 #[test]

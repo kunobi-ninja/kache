@@ -7876,6 +7876,19 @@ fn maybe_trigger_prefetch_with(
         return PrefetchTrigger::DiscoveryFailed;
     };
 
+    let report_context = crate::build_reports::producer_context(
+        &session_id,
+        &root,
+        args,
+        build_intent.lock_path.as_deref().map(Path::new),
+        now.saturating_mul(1000),
+        |name| std::env::var(name).ok(),
+    );
+    if let Err(error) = crate::build_reports::persist_context(&config.runtime_dir, &report_context)
+    {
+        tracing::warn!("cannot capture build report producer context: {error}");
+    }
+
     let shard_prefetch_enabled =
         build_intent.namespace.is_some() && !build_intent.cargo_lock_deps.is_empty();
 

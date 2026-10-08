@@ -228,6 +228,47 @@ without conditional writes, including filesystem remotes, get the merged
 manifest written plainly, so two jobs finishing at the same moment can still
 drop each other's entries there. Shards merge the same way.
 
+`save-manifest` also writes immutable session reports under
+`_manifests/build-reports/v1/<namespace>/<session>-<root-hash>.json`. Each report
+keeps invocations in event-log order, including repeated cache keys, timestamps,
+compile cost and offsets from the earliest observed invocation. It records
+`observed` artifacts: a compiler event does not prove that a background upload
+finished. The legacy merged manifest remains available to existing planners.
+
+Set producer labels before the build to make its report eligible for exact
+warm-set replay:
+
+```bash
+export KACHE_NAMESPACE=my-org/my-repo
+export KACHE_REPOSITORY=my-org/my-repo # defaults to KACHE_NAMESPACE
+export KACHE_BUILD_TARGET=x86_64-unknown-linux-gnu
+export KACHE_BUILD_SHAPE=my-config-digest
+cargo build
+kache save-manifest
+```
+
+`KACHE_BUILD_SHAPE` is a caller-declared digest of the build configuration:
+include the Cargo command, selected packages/features and relevant flags in
+that digest. Kache does not infer it from one compiler invocation.
+`CARGO_BUILD_TARGET` can supply the declared target instead. The wrapper captures
+these labels, the actual compiler's verbose-version hash, profile and full
+lockfile digest when it sends the session's first build hint. Host build scripts
+and proc macros do not establish a cross build's target.
+
+Missing producer facts remain unknown; a later daemon never fills them from its
+own environment. Reports without a namespace use `unscoped`. Root paths are
+hashed before publication. `GITHUB_SHA`/`CI_COMMIT_SHA` and the corresponding ref
+are captured from the producer. Optional `KACHE_PARENT_COMMITS` supplies
+whitespace-separated parent commits; `KACHE_CI_STARTED_AT_MS` supplies a known CI
+start timestamp for per-entry CI offsets.
+
+The first published snapshot for a session/root stays unchanged. Repeating the
+same snapshot succeeds; changed observations for that object return a conflict.
+Reports require atomic create-only writes from the remote. Reading them caps
+each object at 8 MiB, each report at 50,000 entries and discovery at 1,024 objects
+per namespace. Rebuilding an index from these reports preserves session history
+and invocation order without the original local event log.
+
 ## `kache daemon`
 
 ```bash

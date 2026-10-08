@@ -3,6 +3,7 @@ mod blob_heal;
 mod build_script;
 use kache_store::atomic;
 mod build_intent;
+mod build_reports;
 mod cache_fs;
 mod cache_key;
 mod cargo_env;

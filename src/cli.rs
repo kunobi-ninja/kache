@@ -7712,6 +7712,12 @@ fn save_manifest_impl(
         .filter(|value| !value.is_empty())
         .map(String::from)
         .or(env_namespace);
+    let reports = crate::build_reports::collect_reports(
+        &events,
+        session_id,
+        &config.runtime_dir,
+        effective_namespace.as_deref(),
+    )?;
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -7746,6 +7752,9 @@ fn save_manifest_impl(
                 commit.as_deref(),
             )
             .await?;
+        }
+        for report in &reports {
+            remote_cache.put_build_report(report).await?;
         }
         Ok::<(), anyhow::Error>(())
     })?;

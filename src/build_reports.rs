@@ -1,0 +1,978 @@
+//! Immutable observations of one build session, separate from planner manifests.
+//!
+//! Reports describe compiler events, not successful asynchronous artifact uploads.
+//! A missing compatibility fact remains unknown; consumers must not infer it from
+//! the legacy manifest key or from a long-lived daemon's environment.
+
+use std::collections::BTreeMap;
+use std::io::{Read, Write};
+use std::path::Path;
+
+use anyhow::{Context, Result, bail, ensure};
+use serde::{Deserialize, Serialize};
+
+use crate::events::{BuildEvent, EventResult};
+use crate::remote_backend::{PutIfAbsentResult, RemoteBackend};
+
+pub const REPORT_SCHEMA: u32 = 1;
+pub const MAX_REPORT_BYTES: u64 = 8 << 20;
+pub const MAX_REPORT_ENTRIES: usize = 50_000;
+pub const MAX_REPORT_KEYS: usize = 1_024;
+const REPORT_PREFIX: &str = "_manifests/build-reports/v1";
+
+/// Producer facts. Labels and build shape are caller declarations, not proofs.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BuildIdentity {
+    pub repository: Option<String>,
+    pub target: Option<String>,
+    pub toolchain_hash: Option<String>,
+    pub profile: Option<String>,
+    pub build_shape: Option<String>,
+    pub lock_digest: Option<String>,
+}
+
+/// Local-only producer snapshot. The root path never leaves the machine.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProducerContext {
+    pub session_id: String,
+    pub root: String,
+    pub namespace: String,
+    pub identity: BuildIdentity,
+    pub commit: Option<String>,
+    pub git_ref: Option<String>,
+    /// Unknown ancestry is empty, rather than guessed from the daemon checkout.
+    pub parent_commits: Vec<String>,
+    pub captured_at_ms: u64,
+    pub ci_started_at_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReportEntry {
+    pub cache_key: String,
+    pub crate_name: String,
+    pub result: EventResult,
+    pub started_at_ms: u64,
+    pub finished_at_ms: u64,
+    pub start_offset_ms: u64,
+    pub ci_start_offset_ms: Option<u64>,
+    pub elapsed_ms: u64,
+    pub compile_time_ms: u64,
+    pub artifact_size: u64,
+    pub event_schema: u32,
+    pub demands: Vec<kache_core::timeline::KeyDemand>,
+    pub artifact_status: ArtifactStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactStatus {
+    Observed,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BuildReport {
+    pub schema: u32,
+    pub session_id: String,
+    pub root_hash: String,
+    pub namespace: String,
+    pub identity: BuildIdentity,
+    pub commit: Option<String>,
+    pub git_ref: Option<String>,
+    pub parent_commits: Vec<String>,
+    /// Earliest observed invocation start, not a claim about Cargo/CI start.
+    pub started_at_ms: u64,
+    pub finished_at_ms: u64,
+    pub producer_captured_at_ms: Option<u64>,
+    /// Ordered event-log observations. Repeated cache keys are retained.
+    pub entries: Vec<ReportEntry>,
+}
+
+pub fn toolchain_hash(rustc: &Path) -> Option<String> {
+    crate::cache_key::rustc_version_text(rustc)
+        .filter(|version| {
+            !version.contains('\u{fffd}') && crate::cache_key::rustc_host_triple(version).is_some()
+        })
+        .map(|version| blake3::hash(version.as_bytes()).to_hex().to_string())
+}
+
+pub fn lock_digest(lock_path: &Path) -> Option<String> {
+    let bytes = std::fs::read(lock_path).ok()?;
+    (!bytes.is_empty()).then(|| blake3::hash(&bytes).to_hex().to_string())
+}
+
+pub fn root_hash(root: &str) -> String {
+    blake3::hash(root.as_bytes()).to_hex().to_string()
+}
+
+fn nonempty(lookup: &impl Fn(&str) -> Option<String>, name: &str) -> Option<String> {
+    lookup(name)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// Capture at the producer, before sending BuildStarted. Never called in daemon
+/// publication. Session target is declared because a host build-script unit
+/// cannot identify the target of the surrounding cross build.
+pub fn producer_context(
+    session_id: &str,
+    root: &str,
+    args: &crate::args::RustcArgs,
+    lock_path: Option<&Path>,
+    captured_at_ms: u64,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> ProducerContext {
+    let namespace = nonempty(&lookup, "KACHE_NAMESPACE");
+    ProducerContext {
+        session_id: session_id.to_owned(),
+        root: root.to_owned(),
+        namespace: namespace.clone().unwrap_or_else(|| "unscoped".into()),
+        identity: BuildIdentity {
+            repository: nonempty(&lookup, "KACHE_REPOSITORY").or(namespace),
+            target: nonempty(&lookup, "KACHE_BUILD_TARGET")
+                .or_else(|| nonempty(&lookup, "CARGO_BUILD_TARGET")),
+            toolchain_hash: toolchain_hash(&args.rustc),
+            profile: Some(crate::identity::profile_from_rustc_args(args))
+                .filter(|profile| profile != "unknown"),
+            build_shape: nonempty(&lookup, "KACHE_BUILD_SHAPE"),
+            lock_digest: lock_path.and_then(lock_digest),
+        },
+        commit: nonempty(&lookup, "GITHUB_SHA").or_else(|| nonempty(&lookup, "CI_COMMIT_SHA")),
+        git_ref: nonempty(&lookup, "GITHUB_REF")
+            .or_else(|| nonempty(&lookup, "CI_COMMIT_REF_NAME")),
+        parent_commits: nonempty(&lookup, "KACHE_PARENT_COMMITS")
+            .map(|value| value.split_whitespace().map(str::to_owned).collect())
+            .unwrap_or_default(),
+        captured_at_ms,
+        ci_started_at_ms: nonempty(&lookup, "KACHE_CI_STARTED_AT_MS")
+            .and_then(|value| value.parse().ok()),
+    }
+}
+
+fn context_path(runtime_dir: &Path, session_id: &str, root: &str) -> std::path::PathBuf {
+    // Hash local path components too; old clients may use non-hex session ids.
+    let session = blake3::hash(session_id.as_bytes()).to_hex();
+    runtime_dir
+        .join("build-report-contexts")
+        .join(format!("{}-{}.json", session, root_hash(root)))
+}
+
+/// Atomic, create-only local snapshot. Later invocations cannot relabel a session.
+pub fn persist_context(runtime_dir: &Path, context: &ProducerContext) -> Result<()> {
+    let path = context_path(runtime_dir, &context.session_id, &context.root);
+    let parent = path.parent().context("report context directory")?;
+    std::fs::create_dir_all(parent)?;
+    let mut file = tempfile::NamedTempFile::new_in(parent)?;
+    serde_json::to_writer(&mut file, context)?;
+    file.flush()?;
+    match file.persist_noclobber(path) {
+        Ok(_) => Ok(()),
+        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(error.error.into()),
+    }
+}
+
+pub fn read_context(
+    runtime_dir: &Path,
+    session_id: &str,
+    root: &str,
+) -> Result<Option<ProducerContext>> {
+    let path = context_path(runtime_dir, session_id, root);
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let mut bytes = Vec::new();
+    file.take(MAX_REPORT_BYTES + 1).read_to_end(&mut bytes)?;
+    ensure!(
+        bytes.len() as u64 <= MAX_REPORT_BYTES,
+        "report context exceeds size limit"
+    );
+    let context: ProducerContext = serde_json::from_slice(&bytes)?;
+    ensure!(
+        context.session_id == session_id && context.root == root,
+        "report context scope mismatch"
+    );
+    Ok(Some(context))
+}
+
+/// Split by session AND root before projecting fields or deduplicating anything.
+pub fn collect_reports(
+    events: &[BuildEvent],
+    session: Option<&str>,
+    runtime_dir: &Path,
+    namespace: Option<&str>,
+) -> Result<Vec<BuildReport>> {
+    let mut groups: BTreeMap<(&str, &str), Vec<&BuildEvent>> = BTreeMap::new();
+    for event in events {
+        if event.session_id.is_empty()
+            || event.root.is_empty()
+            || session.is_some_and(|session| event.session_id != session)
+            || event.crate_name == crate::build_script::CRATE_NAME
+            || event.cache_key.is_empty()
+            || !matches!(
+                event.result,
+                EventResult::LocalHit
+                    | EventResult::PrefetchHit
+                    | EventResult::RemoteHit
+                    | EventResult::Dup
+                    | EventResult::Miss
+            )
+        {
+            continue;
+        }
+        groups
+            .entry((&event.session_id, &event.root))
+            .or_default()
+            .push(event);
+    }
+    groups
+        .into_iter()
+        .map(|((session_id, root), events)| {
+            let context = read_context(runtime_dir, session_id, root)?;
+            let started_at_ms = events
+                .iter()
+                .map(|event| event_start(event))
+                .min()
+                .context("empty report")?;
+            let finished_at_ms = events
+                .iter()
+                .map(|event| event_finish(event))
+                .max()
+                .context("empty report")?;
+            let ci_start = context
+                .as_ref()
+                .and_then(|context| context.ci_started_at_ms);
+            let report = BuildReport {
+                schema: REPORT_SCHEMA,
+                session_id: session_id.to_owned(),
+                root_hash: root_hash(root),
+                namespace: namespace
+                    .map(str::to_owned)
+                    .or_else(|| context.as_ref().map(|context| context.namespace.clone()))
+                    .unwrap_or_else(|| "unscoped".into()),
+                identity: context
+                    .as_ref()
+                    .map(|context| context.identity.clone())
+                    .unwrap_or_default(),
+                commit: context.as_ref().and_then(|context| context.commit.clone()),
+                git_ref: context.as_ref().and_then(|context| context.git_ref.clone()),
+                parent_commits: context
+                    .as_ref()
+                    .map(|context| context.parent_commits.clone())
+                    .unwrap_or_default(),
+                started_at_ms,
+                finished_at_ms,
+                producer_captured_at_ms: context.as_ref().map(|context| context.captured_at_ms),
+                entries: events
+                    .into_iter()
+                    .map(|event| {
+                        let started = event_start(event);
+                        ReportEntry {
+                            cache_key: event.cache_key.clone(),
+                            crate_name: event.crate_name.clone(),
+                            result: event.result,
+                            started_at_ms: started,
+                            finished_at_ms: event_finish(event),
+                            start_offset_ms: started.saturating_sub(started_at_ms),
+                            ci_start_offset_ms: ci_start.and_then(|base| started.checked_sub(base)),
+                            elapsed_ms: event.elapsed_ms,
+                            compile_time_ms: event.compile_time_ms,
+                            artifact_size: event.size,
+                            event_schema: event.schema,
+                            demands: event.demands.clone(),
+                            artifact_status: ArtifactStatus::Observed,
+                        }
+                    })
+                    .collect(),
+            };
+            validate_report(&report)?;
+            Ok(report)
+        })
+        .collect()
+}
+
+fn event_finish(event: &BuildEvent) -> u64 {
+    u64::try_from(event.ts.timestamp_millis()).unwrap_or_default()
+}
+
+fn event_start(event: &BuildEvent) -> u64 {
+    event_finish(event).saturating_sub(event.elapsed_ms)
+}
+
+fn safe_component(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 200
+        && value != "."
+        && value != ".."
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_.-".contains(&byte))
+}
+
+fn validate_namespace(namespace: &str) -> Result<()> {
+    ensure!(
+        namespace.len() <= 512 && namespace.split('/').all(safe_component),
+        "unsafe report namespace"
+    );
+    Ok(())
+}
+
+fn hex64(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+pub fn validate_report(report: &BuildReport) -> Result<()> {
+    ensure!(
+        report.schema == REPORT_SCHEMA,
+        "unsupported build report schema"
+    );
+    validate_namespace(&report.namespace)?;
+    ensure!(
+        safe_component(&report.session_id),
+        "unsafe report session id"
+    );
+    ensure!(hex64(&report.root_hash), "invalid report root hash");
+    ensure!(
+        !report.entries.is_empty() && report.entries.len() <= MAX_REPORT_ENTRIES,
+        "invalid report entry count"
+    );
+    ensure!(
+        report.started_at_ms <= report.finished_at_ms,
+        "invalid report time range"
+    );
+    for digest in [
+        &report.identity.toolchain_hash,
+        &report.identity.lock_digest,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        ensure!(hex64(digest), "invalid report identity digest");
+    }
+    for entry in &report.entries {
+        ensure!(hex64(&entry.cache_key), "invalid report cache key");
+        ensure!(
+            safe_component(&entry.crate_name),
+            "unsafe report crate name"
+        );
+        ensure!(
+            entry.started_at_ms >= report.started_at_ms
+                && entry.finished_at_ms <= report.finished_at_ms
+                && entry.started_at_ms <= entry.finished_at_ms,
+            "entry outside report time range"
+        );
+        ensure!(
+            entry.start_offset_ms == entry.started_at_ms - report.started_at_ms,
+            "invalid report entry offset"
+        );
+        ensure!(
+            entry.elapsed_ms == entry.finished_at_ms - entry.started_at_ms,
+            "invalid report elapsed time"
+        );
+        ensure!(
+            matches!(
+                entry.result,
+                EventResult::LocalHit
+                    | EventResult::PrefetchHit
+                    | EventResult::RemoteHit
+                    | EventResult::Dup
+                    | EventResult::Miss
+            ),
+            "uncacheable report entry"
+        );
+    }
+    Ok(())
+}
+
+pub fn discovery_prefix(prefix: &str, namespace: &str) -> Result<String> {
+    validate_namespace(namespace)?;
+    Ok(crate::config::join_remote_key(
+        prefix,
+        &format!("{REPORT_PREFIX}/{namespace}/"),
+    ))
+}
+
+pub fn object_key(prefix: &str, report: &BuildReport) -> Result<String> {
+    validate_report(report)?;
+    Ok(format!(
+        "{}{}-{}.json",
+        discovery_prefix(prefix, &report.namespace)?,
+        report.session_id,
+        report.root_hash
+    ))
+}
+
+pub async fn upload_report(
+    backend: &dyn RemoteBackend,
+    prefix: &str,
+    report: &BuildReport,
+) -> Result<()> {
+    let key = object_key(prefix, report)?;
+    let bytes = serde_json::to_vec(report)?;
+    ensure!(
+        bytes.len() as u64 <= MAX_REPORT_BYTES,
+        "build report exceeds size limit"
+    );
+    match backend
+        .put_if_absent(&key, bytes.clone(), Some("application/json"))
+        .await?
+    {
+        PutIfAbsentResult::Created => Ok(()),
+        PutIfAbsentResult::AlreadyExists => {
+            let stored = backend
+                .get(&key, Some(MAX_REPORT_BYTES))
+                .await?
+                .context("existing build report disappeared")?;
+            ensure!(
+                stored.body.as_ref() == bytes,
+                "immutable build report conflict: {key}"
+            );
+            Ok(())
+        }
+        PutIfAbsentResult::Unsupported => bail!("remote cannot create immutable build reports"),
+    }
+}
+
+/// Discovery never returns nested namespaces or arbitrary object keys. A large
+/// namespace is refused instead of silently selecting an arbitrary partial set.
+pub async fn list_reports(
+    backend: &dyn RemoteBackend,
+    prefix: &str,
+    namespace: &str,
+) -> Result<Vec<String>> {
+    let scope = discovery_prefix(prefix, namespace)?;
+    let keys = backend.list(&scope).await?;
+    ensure!(
+        keys.len() <= MAX_REPORT_KEYS,
+        "build report discovery exceeds key limit"
+    );
+    let mut scoped = Vec::new();
+    for key in keys {
+        let Some(name) = key.strip_prefix(&scope) else {
+            bail!("report listing escaped namespace")
+        };
+        if valid_report_filename(name) {
+            scoped.push(key);
+        }
+    }
+    scoped.sort();
+    Ok(scoped)
+}
+
+fn valid_report_filename(name: &str) -> bool {
+    let Some(stem) = name.strip_suffix(".json") else {
+        return false;
+    };
+    let Some((session, root)) = stem.rsplit_once('-') else {
+        return false;
+    };
+    safe_component(session) && hex64(root)
+}
+
+pub async fn download_report(
+    backend: &dyn RemoteBackend,
+    prefix: &str,
+    namespace: &str,
+    key: &str,
+) -> Result<Option<BuildReport>> {
+    let scope = discovery_prefix(prefix, namespace)?;
+    ensure!(
+        key.strip_prefix(&scope).is_some_and(valid_report_filename),
+        "report key outside namespace"
+    );
+    let Some(object) = backend.get(key, Some(MAX_REPORT_BYTES)).await? else {
+        return Ok(None);
+    };
+    ensure!(
+        object.body.len() as u64 <= MAX_REPORT_BYTES,
+        "build report exceeds size limit"
+    );
+    let report: BuildReport = serde_json::from_slice(&object.body)?;
+    ensure!(
+        object_key(prefix, &report)? == key && report.namespace == namespace,
+        "report object scope mismatch"
+    );
+    Ok(Some(report))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{TimeZone, Utc};
+
+    fn event(session: &str, root: &str, key: char, finish: i64, elapsed: u64) -> BuildEvent {
+        let mut event = BuildEvent::new_for_test("serde", EventResult::Miss);
+        event.session_id = session.into();
+        event.root = root.into();
+        event.cache_key = key.to_string().repeat(64);
+        event.ts = Utc.timestamp_millis_opt(finish).unwrap();
+        event.elapsed_ms = elapsed;
+        event.compile_time_ms = elapsed / 2;
+        event.size = 4321;
+        event.schema = 25;
+        event
+    }
+
+    fn report() -> BuildReport {
+        let dir = tempfile::tempdir().unwrap();
+        collect_reports(
+            &[event("one", "/work", 'a', 1200, 200)],
+            None,
+            dir.path(),
+            Some("org/repo"),
+        )
+        .unwrap()
+        .remove(0)
+    }
+
+    #[test]
+    fn ordered_report_retains_repeats_timings_and_exact_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let context = ProducerContext {
+            session_id: "one".into(),
+            root: "/work".into(),
+            namespace: "org/repo".into(),
+            identity: BuildIdentity {
+                repository: Some("org/repo".into()),
+                target: Some("wasm32-unknown-unknown".into()),
+                toolchain_hash: Some("c".repeat(64)),
+                profile: Some("release".into()),
+                build_shape: Some("test-features-a".into()),
+                lock_digest: Some("d".repeat(64)),
+            },
+            commit: Some("producer-commit".into()),
+            git_ref: Some("refs/heads/producer".into()),
+            parent_commits: vec!["parent-one".into(), "parent-two".into()],
+            captured_at_ms: 900,
+            ci_started_at_ms: Some(800),
+        };
+        persist_context(dir.path(), &context).unwrap();
+        let mut foreign = event("one", "/other", 'b', 1300, 10);
+        foreign.crate_name = "foreign".into();
+        let mut hit = event("one", "/work", 'a', 1600, 10);
+        hit.result = EventResult::LocalHit;
+        hit.compile_time_ms = 700;
+        let mut ignored = event("one", "/work", 'f', 1700, 10);
+        ignored.result = EventResult::Error;
+        let events = vec![
+            event("one", "/work", 'a', 1200, 200),
+            foreign,
+            hit,
+            event("two", "/work", 'e', 1800, 10),
+            ignored,
+        ];
+        let reports = collect_reports(&events, Some("one"), dir.path(), None).unwrap();
+        assert_eq!(reports.len(), 2);
+        let observed = reports
+            .iter()
+            .find(|report| report.root_hash == root_hash("/work"))
+            .unwrap();
+        assert_eq!(observed.identity, context.identity);
+        assert_eq!(observed.commit, context.commit);
+        assert_eq!(observed.git_ref, context.git_ref);
+        assert_eq!(observed.parent_commits, context.parent_commits);
+        assert_eq!(observed.namespace, "org/repo");
+        assert_eq!(observed.producer_captured_at_ms, Some(900));
+        assert_eq!(
+            (observed.started_at_ms, observed.finished_at_ms),
+            (1000, 1600)
+        );
+        assert_eq!(observed.entries.len(), 2);
+        let first = &observed.entries[0];
+        let second = &observed.entries[1];
+        assert_eq!(first.cache_key, second.cache_key);
+        assert_eq!(
+            (
+                first.started_at_ms,
+                first.finished_at_ms,
+                first.start_offset_ms,
+                first.ci_start_offset_ms
+            ),
+            (1000, 1200, 0, Some(200))
+        );
+        assert_eq!(
+            (
+                second.started_at_ms,
+                second.finished_at_ms,
+                second.start_offset_ms,
+                second.ci_start_offset_ms
+            ),
+            (1590, 1600, 590, Some(790))
+        );
+        assert_eq!(
+            (
+                first.elapsed_ms,
+                first.compile_time_ms,
+                first.artifact_size,
+                first.event_schema
+            ),
+            (200, 100, 4321, 25)
+        );
+        assert_eq!(
+            (second.result, second.compile_time_ms),
+            (EventResult::LocalHit, 700)
+        );
+        assert_eq!(first.artifact_status, ArtifactStatus::Observed);
+        let unknown = reports
+            .iter()
+            .find(|report| report.root_hash != root_hash("/work"))
+            .unwrap();
+        assert_eq!(unknown.identity, BuildIdentity::default());
+        assert_eq!(unknown.commit, None);
+        assert_eq!(unknown.entries.len(), 1);
+        assert!(!serde_json::to_string(observed).unwrap().contains("/work"));
+    }
+
+    #[test]
+    fn collection_excludes_legacy_uncacheable_and_local_build_script_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut events = vec![
+            event("", "/work", 'a', 100, 1),
+            event("one", "", 'a', 100, 1),
+        ];
+        let mut empty_key = event("one", "/work", 'a', 100, 1);
+        empty_key.cache_key.clear();
+        events.push(empty_key);
+        let mut script = event("one", "/work", 'a', 100, 1);
+        script.crate_name = crate::build_script::CRATE_NAME.into();
+        events.push(script);
+        for result in [
+            EventResult::Error,
+            EventResult::Passthrough,
+            EventResult::Skipped,
+        ] {
+            let mut item = event("one", "/work", 'a', 100, 1);
+            item.result = result;
+            events.push(item);
+        }
+        assert!(
+            collect_reports(&events, None, dir.path(), None)
+                .unwrap()
+                .is_empty()
+        );
+        for result in [
+            EventResult::LocalHit,
+            EventResult::PrefetchHit,
+            EventResult::RemoteHit,
+            EventResult::Dup,
+            EventResult::Miss,
+        ] {
+            let mut item = event("one", "/work", 'a', 100, 1);
+            item.result = result;
+            events.push(item);
+        }
+        assert_eq!(
+            collect_reports(&events, None, dir.path(), None).unwrap()[0]
+                .entries
+                .len(),
+            5
+        );
+    }
+
+    #[test]
+    fn local_context_is_atomic_first_writer_and_checks_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut context = ProducerContext {
+            session_id: "one".into(),
+            root: "/work".into(),
+            namespace: "producer".into(),
+            identity: BuildIdentity::default(),
+            commit: Some("first".into()),
+            git_ref: None,
+            parent_commits: vec![],
+            captured_at_ms: 1,
+            ci_started_at_ms: None,
+        };
+        assert!(read_context(dir.path(), "one", "/work").unwrap().is_none());
+        persist_context(dir.path(), &context).unwrap();
+        context.commit = Some("later-daemon".into());
+        persist_context(dir.path(), &context).unwrap();
+        let restored = read_context(dir.path(), "one", "/work").unwrap().unwrap();
+        assert_eq!(restored.commit.as_deref(), Some("first"));
+        assert!(read_context(dir.path(), "one", "/other").unwrap().is_none());
+        std::fs::write(
+            context_path(dir.path(), "one", "/work"),
+            serde_json::to_vec(&context).unwrap(),
+        )
+        .unwrap();
+        context.root = "/foreign".into();
+        std::fs::write(
+            context_path(dir.path(), "one", "/work"),
+            serde_json::to_vec(&context).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            read_context(dir.path(), "one", "/work")
+                .unwrap_err()
+                .to_string()
+                .contains("scope mismatch")
+        );
+    }
+
+    #[test]
+    fn producer_context_captures_declared_cross_target_and_full_lock_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("Cargo.lock");
+        std::fs::write(&lock, "producer lock contents").unwrap();
+        let args = crate::args::RustcArgs::parse(&[
+            dir.path()
+                .join("missing-rustc")
+                .to_string_lossy()
+                .into_owned(),
+            "--out-dir".into(),
+            dir.path()
+                .join("target/debug/deps")
+                .to_string_lossy()
+                .into_owned(),
+        ])
+        .unwrap();
+        let values = BTreeMap::from([
+            ("KACHE_NAMESPACE", "org/repo"),
+            ("KACHE_BUILD_TARGET", "wasm32-unknown-unknown"),
+            ("CARGO_BUILD_TARGET", "other-target"),
+            ("KACHE_BUILD_SHAPE", "declared-shape"),
+            ("GITHUB_SHA", "producer-commit"),
+            ("GITHUB_REF", "refs/heads/producer"),
+            ("KACHE_PARENT_COMMITS", "parent-a parent-b"),
+            ("KACHE_CI_STARTED_AT_MS", "1000"),
+        ]);
+        let captured = producer_context("one", "/work", &args, Some(&lock), 2000, |name| {
+            values.get(name).map(|value| (*value).to_owned())
+        });
+        assert_eq!(captured.identity.repository.as_deref(), Some("org/repo"));
+        assert_eq!(
+            captured.identity.target.as_deref(),
+            Some("wasm32-unknown-unknown")
+        );
+        assert_eq!(captured.identity.profile.as_deref(), Some("debug"));
+        assert_eq!(
+            captured.identity.build_shape.as_deref(),
+            Some("declared-shape")
+        );
+        assert_eq!(captured.identity.toolchain_hash, None);
+        assert_eq!(
+            captured.identity.lock_digest,
+            Some(blake3::hash(b"producer lock contents").to_hex().to_string())
+        );
+        assert_eq!(captured.commit.as_deref(), Some("producer-commit"));
+        assert_eq!(captured.git_ref.as_deref(), Some("refs/heads/producer"));
+        assert_eq!(captured.parent_commits, ["parent-a", "parent-b"]);
+        assert_eq!(captured.ci_started_at_ms, Some(1000));
+        assert_eq!(captured.captured_at_ms, 2000);
+        let unknown = producer_context("one", "/work", &args, None, 0, |_| None);
+        assert_eq!(unknown.namespace, "unscoped");
+        assert_eq!(unknown.identity.target, None);
+        assert_eq!(unknown.identity.repository, None);
+        assert_eq!(unknown.identity.build_shape, None);
+        assert_eq!(unknown.identity.lock_digest, None);
+        assert_eq!(unknown.commit, None);
+        let fallback = producer_context("one", "/work", &args, None, 0, |name| match name {
+            "CARGO_BUILD_TARGET" => Some("fallback-target".into()),
+            "KACHE_REPOSITORY" => Some("explicit-repo".into()),
+            "CI_COMMIT_SHA" => Some("gitlab-commit".into()),
+            "CI_COMMIT_REF_NAME" => Some("gitlab-ref".into()),
+            "KACHE_CI_STARTED_AT_MS" => Some("invalid".into()),
+            _ => None,
+        });
+        assert_eq!(fallback.identity.target.as_deref(), Some("fallback-target"));
+        assert_eq!(
+            fallback.identity.repository.as_deref(),
+            Some("explicit-repo")
+        );
+        assert_eq!(fallback.commit.as_deref(), Some("gitlab-commit"));
+        assert_eq!(fallback.git_ref.as_deref(), Some("gitlab-ref"));
+        assert_eq!(fallback.ci_started_at_ms, None);
+    }
+
+    #[test]
+    fn untrusted_report_validation_rejects_bad_paths_keys_schema_and_timing() {
+        let valid = report();
+        for namespace in [
+            "",
+            "../repo",
+            "org//repo",
+            "/org",
+            "org/",
+            "org\\repo",
+            ".",
+            "..",
+        ] {
+            let mut invalid = valid.clone();
+            invalid.namespace = namespace.into();
+            assert!(validate_report(&invalid).is_err(), "{namespace:?}");
+        }
+        for name in [
+            "",
+            ".",
+            "..",
+            "../crate",
+            "dir/crate",
+            "dir\\crate",
+            "crate:stream",
+        ] {
+            let mut invalid = valid.clone();
+            invalid.entries[0].crate_name = name.into();
+            assert!(validate_report(&invalid).is_err(), "{name:?}");
+        }
+        let mut source = valid.clone();
+        source.entries[0].crate_name = "foo.cpp".into();
+        validate_report(&source).unwrap();
+        for key in [
+            "a".repeat(63),
+            "a".repeat(65),
+            "z".repeat(64),
+            "A".repeat(64),
+        ] {
+            let mut invalid = valid.clone();
+            invalid.entries[0].cache_key = key;
+            assert!(validate_report(&invalid).is_err());
+        }
+        let mut invalid = valid.clone();
+        invalid.schema += 1;
+        assert!(validate_report(&invalid).is_err());
+        let mut invalid = valid.clone();
+        invalid.session_id = "../../bad".into();
+        assert!(validate_report(&invalid).is_err());
+        let mut invalid = valid.clone();
+        invalid.root_hash.clear();
+        assert!(validate_report(&invalid).is_err());
+        let mut invalid = valid.clone();
+        invalid.entries.clear();
+        assert!(validate_report(&invalid).is_err());
+        let mut invalid = valid.clone();
+        invalid.entries[0].start_offset_ms = 1;
+        assert!(validate_report(&invalid).is_err());
+        let mut invalid = valid.clone();
+        invalid.entries[0].elapsed_ms += 1;
+        assert!(validate_report(&invalid).is_err());
+        let mut invalid = valid.clone();
+        invalid.entries[0].started_at_ms -= 1;
+        assert!(validate_report(&invalid).is_err());
+        let mut invalid = valid.clone();
+        invalid.entries[0].finished_at_ms += 1;
+        assert!(validate_report(&invalid).is_err());
+        let mut invalid = valid.clone();
+        invalid.identity.toolchain_hash = Some("bad".into());
+        assert!(validate_report(&invalid).is_err());
+        let mut invalid = valid.clone();
+        invalid.identity.lock_digest = Some("bad".into());
+        assert!(validate_report(&invalid).is_err());
+        assert_eq!(MAX_REPORT_BYTES, 8_388_608);
+        assert_eq!(MAX_REPORT_ENTRIES, 50_000);
+        assert_eq!(MAX_REPORT_KEYS, 1024);
+    }
+
+    #[tokio::test]
+    async fn immutable_reports_retry_identically_and_reject_changed_snapshots() {
+        let backend = crate::remote_backend::memory_backend();
+        let report = report();
+        upload_report(&backend, "artifacts", &report).await.unwrap();
+        upload_report(&backend, "artifacts", &report).await.unwrap();
+        let key = object_key("artifacts", &report).unwrap();
+        let before = backend.get(&key, None).await.unwrap().unwrap().body;
+        let mut changed = report.clone();
+        changed.commit = Some("later".into());
+        assert!(
+            upload_report(&backend, "artifacts", &changed)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("conflict")
+        );
+        assert_eq!(backend.get(&key, None).await.unwrap().unwrap().body, before);
+        assert_eq!(
+            download_report(&backend, "artifacts", "org/repo", &key)
+                .await
+                .unwrap(),
+            Some(report)
+        );
+        assert!(
+            download_report(&backend, "artifacts", "other", &key)
+                .await
+                .is_err()
+        );
+        assert!(
+            download_report(&backend, "artifacts", "org/repo", &format!("{key}/nested"))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn filesystem_history_rehydrates_order_and_matrix_variants_without_local_index() {
+        use crate::config::{FilesystemRemoteConfig, RemoteBackendConfig, RemoteConfig};
+        let remote_dir = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        let config = RemoteConfig {
+            prefix: "artifacts".into(),
+            backend: RemoteBackendConfig::Filesystem(FilesystemRemoteConfig {
+                root: remote_dir.path().into(),
+                atomic_write_dir: remote_dir.path().join(".staging"),
+            }),
+        };
+        let backend = crate::remote_backend::create_backend(&config, 30)
+            .await
+            .unwrap();
+        let first = collect_reports(
+            &[
+                event("one", "/work", 'a', 1200, 200),
+                event("one", "/work", 'b', 1300, 10),
+                event("one", "/work", 'a', 1600, 2),
+            ],
+            None,
+            runtime.path(),
+            Some("org/repo"),
+        )
+        .unwrap()
+        .remove(0);
+        let mut second = first.clone();
+        second.session_id = "two".into();
+        second.commit = Some("different-commit".into());
+        second.identity.profile = Some("release".into());
+        second.identity.build_shape = Some("different-shape".into());
+        for item in [&first, &second] {
+            upload_report(backend.as_ref(), &config.prefix, item)
+                .await
+                .unwrap();
+        }
+        let mut index = vec![first.clone(), second.clone()];
+        index.clear();
+        drop(backend);
+        // New backend/client: neither the event log nor an index is consulted.
+        let restarted = crate::remote_backend::create_backend(&config, 30)
+            .await
+            .unwrap();
+        for key in list_reports(restarted.as_ref(), &config.prefix, "org/repo")
+            .await
+            .unwrap()
+        {
+            index.push(
+                download_report(restarted.as_ref(), &config.prefix, "org/repo", &key)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            );
+        }
+        assert_eq!(index, vec![first, second]);
+        let scoped = discovery_prefix(&config.prefix, "org/repo").unwrap();
+        restarted
+            .put(
+                &format!("{scoped}nested/untrusted.json"),
+                b"{}".to_vec(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            list_reports(restarted.as_ref(), &config.prefix, "org/repo")
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+}

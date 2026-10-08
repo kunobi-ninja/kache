@@ -201,4 +201,87 @@ fn compiler_queries_do_not_poison_offline_producer_identity() {
             .len(),
         64
     );
+    assert!(
+        contexts[0]["facts"]["compiler_selector"]
+            .as_str()
+            .unwrap()
+            .starts_with("rustc-ver-")
+    );
+    assert!(
+        contexts[0]["facts"]["compiler_stamp"]["size"]
+            .as_i64()
+            .unwrap()
+            > 0
+    );
+    assert_eq!(contexts[0]["facts"]["lock_stamp"]["size"], 21);
+
+    // The five-minute marker intentionally coalesces adjacent commands. A
+    // different declaration in that same session must make replay ineligible.
+    let release = workspace.join("target/release/deps");
+    std::fs::create_dir_all(&release).unwrap();
+    let changed = command()
+        .env("KACHE_BUILD_SHAPE", "different-shape")
+        .arg(&rustc)
+        .args([
+            "--crate-name",
+            "fixture_two",
+            "--crate-type=lib",
+            "--out-dir",
+        ])
+        .arg(&release)
+        .arg("lib.rs")
+        .output()
+        .unwrap();
+    assert!(
+        changed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&changed.stderr)
+    );
+    let invalid = std::fs::read_dir(cache.join("build-report-contexts"))
+        .unwrap()
+        .filter(|entry| {
+            entry
+                .as_ref()
+                .unwrap()
+                .path()
+                .extension()
+                .is_some_and(|extension| extension == "invalid")
+        })
+        .count();
+    assert_eq!(
+        invalid, 1,
+        "changed producer facts retained stale compatibility"
+    );
+    let config_text = std::fs::read_to_string(&config).unwrap();
+    std::fs::write(&config, config_text.replace("local_only=true\n", "")).unwrap();
+    let published = common::hermetic_command(binary, &cache, Some(&config))
+        .current_dir(&workspace)
+        .args(["save-manifest", "--manifest-key", "mixed-session"])
+        .env_remove("KACHE_NAMESPACE")
+        .env_remove("GITHUB_ACTIONS")
+        .env_remove("GITLAB_CI")
+        .env_remove("CI")
+        .output()
+        .unwrap();
+    assert!(
+        published.status.success(),
+        "{}",
+        String::from_utf8_lossy(&published.stderr)
+    );
+    let reports = std::fs::read_dir(remote.join("artifacts/_manifests/build-reports/v1/org/repo"))
+        .unwrap()
+        .map(|entry| {
+            serde_json::from_slice::<Value>(&std::fs::read(entry.unwrap().path()).unwrap()).unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0]["entries"].as_array().unwrap().len(), 2);
+    assert!(
+        reports[0]["identity"]
+            .as_object()
+            .unwrap()
+            .values()
+            .all(Value::is_null)
+    );
+    assert!(reports[0]["commit"].is_null());
 }

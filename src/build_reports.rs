@@ -1085,6 +1085,14 @@ mod tests {
         let mut invalid = valid.clone();
         invalid.entries.clear();
         assert!(validate_report(&invalid).is_err());
+        let mut at_cap = valid.clone();
+        at_cap.entries.resize(50_000, valid.entries[0].clone());
+        validate_report(&at_cap).unwrap();
+        at_cap.entries.push(valid.entries[0].clone());
+        assert!(validate_report(&at_cap).is_err());
+        let mut invalid = valid.clone();
+        invalid.started_at_ms = invalid.finished_at_ms + 1;
+        assert!(validate_report(&invalid).is_err());
         let mut invalid = valid.clone();
         invalid.entries[0].start_offset_ms = 1;
         assert!(validate_report(&invalid).is_err());
@@ -1096,6 +1104,12 @@ mod tests {
         assert!(validate_report(&invalid).is_err());
         let mut invalid = valid.clone();
         invalid.entries[0].finished_at_ms += 1;
+        assert!(validate_report(&invalid).is_err());
+        let mut invalid = valid.clone();
+        invalid.entries[0].started_at_ms = invalid.entries[0].finished_at_ms + 1;
+        assert!(validate_report(&invalid).is_err());
+        let mut invalid = valid.clone();
+        invalid.entries[0].result = EventResult::Error;
         assert!(validate_report(&invalid).is_err());
         let mut invalid = valid.clone();
         invalid.identity.toolchain_hash = Some("bad".into());
@@ -1156,6 +1170,165 @@ mod tests {
             download_report(&backend, "artifacts", "org/repo", &format!("{key}/nested"))
                 .await
                 .is_err()
+        );
+    }
+
+    struct UnsupportedBackend {
+        inner: crate::remote_backend::OpenDalBackend,
+        listing: Vec<String>,
+        untrusted_body: Option<Vec<u8>>,
+    }
+
+    #[async_trait::async_trait]
+    impl RemoteBackend for UnsupportedBackend {
+        async fn head(&self, key: &str) -> Result<bool> {
+            self.inner.head(key).await
+        }
+        async fn get(
+            &self,
+            key: &str,
+            max: Option<u64>,
+        ) -> Result<Option<crate::remote_backend::GetObject>> {
+            if let Some(body) = &self.untrusted_body {
+                assert_eq!(max, Some(8_388_608));
+                return Ok(Some(crate::remote_backend::GetObject {
+                    body: bytes::Bytes::copy_from_slice(body),
+                    request_ms: 0,
+                    body_ms: 0,
+                }));
+            }
+            self.inner.get(key, max).await
+        }
+        async fn put(&self, _: &str, _: Vec<u8>, _: Option<&str>) -> Result<()> {
+            bail!("immutable reports must never fall back to plain PUT")
+        }
+        async fn list(&self, _: &str) -> Result<Vec<String>> {
+            Ok(self.listing.clone())
+        }
+        fn describe(&self, key: &str) -> String {
+            key.to_owned()
+        }
+    }
+
+    #[tokio::test]
+    async fn immutable_transport_and_discovery_fail_closed_at_boundaries() {
+        let observed = report();
+        let scope = discovery_prefix("artifacts", "org/repo").unwrap();
+        let key = object_key("artifacts", &observed).unwrap();
+        let mut backend = UnsupportedBackend {
+            inner: crate::remote_backend::memory_backend(),
+            listing: vec![key.clone()],
+            untrusted_body: None,
+        };
+        assert!(
+            upload_report(&backend, "artifacts", &observed)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("cannot create immutable")
+        );
+        assert!(!backend.head(&key).await.unwrap());
+        assert_eq!(
+            list_reports(&backend, "artifacts", "org/repo")
+                .await
+                .unwrap(),
+            [key.clone()]
+        );
+        backend.listing = vec![key.clone(); 1024];
+        assert_eq!(
+            list_reports(&backend, "artifacts", "org/repo")
+                .await
+                .unwrap()
+                .len(),
+            1024
+        );
+        backend.listing.push(key.clone());
+        assert!(
+            list_reports(&backend, "artifacts", "org/repo")
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("key limit")
+        );
+        backend.listing = vec!["artifacts/outside.json".into()];
+        assert!(
+            list_reports(&backend, "artifacts", "org/repo")
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("escaped namespace")
+        );
+        backend.listing = [
+            "nested/report.json",
+            "one-not-a-root.json",
+            "bad.txt",
+            "../report.json",
+        ]
+        .into_iter()
+        .map(|name| format!("{scope}{name}"))
+        .collect();
+        assert!(
+            list_reports(&backend, "artifacts", "org/repo")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            download_report(&backend, "artifacts", "org/repo", &key)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let mut wrong_namespace = observed.clone();
+        wrong_namespace.namespace = "other".into();
+        let mut wrong_session = observed.clone();
+        wrong_session.session_id = "other-session".into();
+        let mut wrong_root = observed.clone();
+        wrong_root.root_hash = "f".repeat(64);
+        for mislabelled in [wrong_namespace, wrong_session, wrong_root] {
+            backend
+                .inner
+                .put(&key, serde_json::to_vec(&mislabelled).unwrap(), None)
+                .await
+                .unwrap();
+            assert!(
+                download_report(&backend, "artifacts", "org/repo", &key)
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("scope mismatch")
+            );
+        }
+        backend
+            .inner
+            .put(&key, vec![b' '; 8_388_609], None)
+            .await
+            .unwrap();
+        assert!(
+            download_report(&backend, "artifacts", "org/repo", &key)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("too large")
+        );
+        let mut unbounded = serde_json::to_vec(&observed).unwrap();
+        unbounded.resize(8_388_609, b' ');
+        backend.untrusted_body = Some(unbounded);
+        assert!(
+            download_report(&backend, "artifacts", "org/repo", &key)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("size limit")
+        );
+        let mut oversized = observed;
+        oversized.identity.build_shape = Some("x".repeat(8_388_608));
+        assert!(
+            upload_report(&backend, "artifacts", &oversized)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("size limit")
         );
     }
 

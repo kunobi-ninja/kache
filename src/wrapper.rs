@@ -7797,15 +7797,6 @@ fn explain_miss_diff(
     changed
 }
 
-/// Send the daemon a prefetch hint once per build session.
-///
-/// The session itself comes from [`session_id_for_event`], so it exists with
-/// or without a remote. A separate `.prefetch` marker records which session
-/// the hint went out for, and a flock on it keeps N parallel rustc
-/// invocations from all sending one. A failed discovery (cargo metadata
-/// hanging on a git dependency, say) is recorded too, and later compiles wait
-/// out a backoff before trying again, since the wrapper that tries holds up
-/// its own compile (kunobi-ninja/kache#698).
 fn capture_build_report_context(config: &Config, args: &RustcArgs, root: &str, now: u64) {
     // Cargo's --print probes have no build profile and must not freeze the
     // real compile's session metadata as unknown.
@@ -7840,6 +7831,15 @@ fn capture_build_report_context(config: &Config, args: &RustcArgs, root: &str, n
     }
 }
 
+/// Send the daemon a prefetch hint once per build session.
+///
+/// The session itself comes from [`session_id_for_event`], so it exists with
+/// or without a remote. A separate `.prefetch` marker records which session
+/// the hint went out for, and a flock on it keeps N parallel rustc
+/// invocations from all sending one. A failed discovery (cargo metadata
+/// hanging on a git dependency, say) is recorded too, and later compiles wait
+/// out a backoff before trying again, since the wrapper that tries holds up
+/// its own compile (kunobi-ninja/kache#698).
 fn maybe_trigger_prefetch(config: &Config, args: &RustcArgs) {
     maybe_trigger_prefetch_with(config, args, now_epoch_secs(), || {
         crate::build_intent::discover(Some(args))

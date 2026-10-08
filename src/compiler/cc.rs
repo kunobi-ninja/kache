@@ -1108,23 +1108,24 @@ impl CcArgs {
     /// Keep the original argv for preprocessing and compiler execution.
     fn probe_args(&self) -> Vec<String> {
         let mut out = Vec::new();
-        let mut index = 0;
-        while let Some(arg) = self.rest.get(index) {
+        let mut rest = self.rest.as_slice();
+        while let Some((arg, tail)) = rest.split_first() {
             if arg == "-Xclang"
-                && let Some(inner) = self.rest.get(index + 1)
+                && let Some((inner, remaining)) = tail.split_first()
             {
                 if !cc_terminal_diagnostic_flag(inner) {
-                    out.extend_from_slice(&self.rest[index..index + 2]);
+                    out.extend([arg.clone(), inner.clone()]);
                 }
-                index += 2;
+                rest = remaining;
                 continue;
             }
-            let consumed = parse_cc_arg_at(&self.rest, index, self.family.dialect())
-                .map_or(1, |parsed| parsed.consumed);
+            let consumed =
+                parse_cc_arg_at(rest, 0, self.family.dialect()).map_or(1, |parsed| parsed.consumed);
+            let (args, remaining) = rest.split_at(consumed);
             if !cc_terminal_diagnostic_flag(arg) {
-                out.extend_from_slice(&self.rest[index..index + consumed]);
+                out.extend_from_slice(args);
             }
-            index += consumed;
+            rest = remaining;
         }
         out
     }

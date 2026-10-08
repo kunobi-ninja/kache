@@ -115,6 +115,14 @@ pub fn toolchain_hash(rustc: &Path) -> Option<String> {
         .map(|version| blake3::hash(version.as_bytes()).to_hex().to_string())
 }
 
+fn stable_toolchain_hash(rustc: &Path, facts: &ProducerFacts) -> Option<String> {
+    // A session can span multiple Cargo commands. Without both comparison
+    // facts, a later compiler change could retain the first invocation's label.
+    facts.compiler_stamp.as_ref()?;
+    facts.compiler_selector.as_ref()?;
+    toolchain_hash(rustc)
+}
+
 pub fn lock_digest(lock_path: &Path) -> Option<String> {
     let bytes = std::fs::read(lock_path).ok()?;
     (!bytes.is_empty()).then(|| blake3::hash(&bytes).to_hex().to_string())
@@ -187,7 +195,7 @@ pub fn producer_context(
         identity: BuildIdentity {
             repository: facts.repository.clone(),
             target: facts.target.clone(),
-            toolchain_hash: toolchain_hash(&args.rustc),
+            toolchain_hash: stable_toolchain_hash(&args.rustc, &facts),
             profile: facts.profile.clone(),
             build_shape: facts.build_shape.clone(),
             lock_digest: lock_path.and_then(lock_digest),
@@ -664,7 +672,37 @@ mod tests {
             std::fs::set_permissions(&compiler, std::fs::Permissions::from_mode(0o755)).unwrap();
             std::fs::write(compiler.with_extension("version"), stdout).unwrap();
             assert_eq!(toolchain_hash(&compiler), identity, "version case {index}");
+            let facts = ProducerFacts {
+                compiler_stamp: Some(
+                    crate::cache_key::FileFingerprint::from_path(&compiler).unwrap(),
+                ),
+                compiler_selector: Some("known-selector".into()),
+                ..ProducerFacts::default()
+            };
+            assert_eq!(stable_toolchain_hash(&compiler, &facts), identity);
+            let mut missing_stamp = facts.clone();
+            missing_stamp.compiler_stamp = None;
+            assert_eq!(stable_toolchain_hash(&compiler, &missing_stamp), None);
+            let mut missing_selector = facts;
+            missing_selector.compiler_selector = None;
+            assert_eq!(stable_toolchain_hash(&compiler, &missing_selector), None);
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_bare_compiler_keeps_replay_identity_unknown() {
+        let args = crate::args::RustcArgs::parse(&[
+            "rustc".into(),
+            "--out-dir".into(),
+            "target/debug/deps".into(),
+        ])
+        .unwrap();
+        let context = producer_context("one", "/work", &args, None, 0, |name| {
+            (name == "KACHE_NAMESPACE").then(|| "org/repo".into())
+        });
+        assert_eq!(context.identity.toolchain_hash, None);
+        assert_eq!(context.facts.unwrap().compiler_selector, None);
     }
 
     #[test]

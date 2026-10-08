@@ -314,6 +314,10 @@ are captured from the producer. Optional `KACHE_PARENT_COMMITS` supplies
 whitespace-separated parent commits; `KACHE_CI_STARTED_AT_MS` supplies a known CI
 start timestamp for per-entry CI offsets.
 
+An unresolved compiler fingerprint leaves the report's toolchain identity unknown.
+On Windows, use Cargo's full compiler path to record a replayable identity; a bare
+`rustc` name still records observations.
+
 The existing inactivity-based session marker can span adjacent Cargo commands.
 If producer labels, profile, compiler selection or lockfile change within that
 session, its compatibility facts and commit context become unknown. Observations

@@ -378,15 +378,13 @@ async fn bounded_replay_restores_packs_skips_local_and_locked_entries_and_summar
 
 /// Exercise an independent publisher that does not participate in the replay
 /// lock, as an older client or a restore path on another process may do.
-struct CompetingPublicationRemote {
+struct InterferingRemote {
     inner: crate::cache_remote::V3Remote,
-    consumer: Config,
-    source: PathBuf,
-    published: std::sync::atomic::AtomicBool,
+    after_download: Box<dyn Fn(&Path) -> Result<()> + Send + Sync>,
 }
 
 #[async_trait]
-impl CacheRemote for CompetingPublicationRemote {
+impl CacheRemote for InterferingRemote {
     async fn exists_entry(&self, key: &str, name: &str) -> Result<bool> {
         self.inner.exists_entry(key, name).await
     }
@@ -399,21 +397,12 @@ impl CacheRemote for CompetingPublicationRemote {
         blobs_dir: &Path,
         deadline: Option<Instant>,
     ) -> Result<crate::remote::DownloadResult> {
-        {
-            let competing = Store::open(&self.consumer)?;
-            assert!(!competing.entry_dir(key).exists());
-            assert!(
-                competing.try_lock(key)?.is_none(),
-                "replay must own the key lock"
-            );
-            put(&competing, key, name, &self.source);
-            assert!(competing.contains(key));
-            self.published.store(true, Ordering::SeqCst);
-        }
-        // This real V3 download produces valid but different staging bytes.
-        self.inner
+        let result = self
+            .inner
             .download_entry(key, name, entry_dir, blobs_dir, deadline)
-            .await
+            .await?;
+        (self.after_download)(entry_dir)?;
+        Ok(result)
     }
 
     async fn download_entry_observed(
@@ -490,11 +479,24 @@ async fn a_generation_published_during_download_is_preserved_as_busy() {
         .await
         .unwrap();
     let consumer_config = crate::test_support::test_config(dir.path().join("consumer"));
-    let client = CompetingPublicationRemote {
+    let published = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let observed = published.clone();
+    let competing_config = consumer_config.clone();
+    let competing_key = key.clone();
+    let client = InterferingRemote {
         inner,
-        consumer: consumer_config.clone(),
-        source: competing_source,
-        published: std::sync::atomic::AtomicBool::new(false),
+        after_download: Box::new(move |_| {
+            let competing = Store::open(&competing_config)?;
+            assert!(!competing.entry_dir(&competing_key).exists());
+            assert!(
+                competing.try_lock(&competing_key)?.is_none(),
+                "replay must own the key lock"
+            );
+            put(&competing, &competing_key, "alpha", &competing_source);
+            assert!(competing.contains(&competing_key));
+            observed.store(true, Ordering::SeqCst);
+            Ok(())
+        }),
     };
     let r = report("session", 10, &[(&key, "alpha")]);
     let remaining = AtomicU64::new(1_000_000);
@@ -509,7 +511,7 @@ async fn a_generation_published_during_download_is_preserved_as_busy() {
     .await
     .unwrap();
     assert!(
-        client.published.load(Ordering::SeqCst),
+        published.load(Ordering::SeqCst),
         "the competing publication must actually occur"
     );
     assert_eq!(
@@ -547,4 +549,86 @@ async fn a_generation_published_during_download_is_preserved_as_busy() {
             .any(|name| name.to_string_lossy().starts_with("warm-set-")),
         "discarded incoming staging directory must be removed"
     );
+}
+
+#[tokio::test]
+async fn staged_files_disappearing_before_publish_or_import_are_failures() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source");
+    std::fs::write(&source, b"verified compiled bytes").unwrap();
+    let producer_config = crate::test_support::test_config(dir.path().join("producer"));
+    let producer = Store::open(&producer_config).unwrap();
+    let key = "e".repeat(64);
+    put(&producer, &key, "alpha", &source);
+    let backend: Arc<dyn RemoteBackend> = Arc::new(memory_backend());
+    let remote = crate::config::RemoteConfig::test_s3("bucket", "cache");
+    let uploader = crate::cache_remote::V3Remote::new(backend.clone(), remote.clone());
+    uploader
+        .upload_entry(
+            &key,
+            "alpha",
+            &producer.entry_dir(&key),
+            &producer_config.store_dir().join("blobs"),
+            3,
+            None,
+        )
+        .await
+        .unwrap();
+    for remove_whole_entry in [true, false] {
+        let config = crate::test_support::test_config(
+            dir.path().join(format!("consumer-{remove_whole_entry}")),
+        );
+        let consumer = Store::open(&config).unwrap();
+        let retained = "a".repeat(64);
+        put(&consumer, &retained, "alpha", &source);
+        let client = InterferingRemote {
+            inner: crate::cache_remote::V3Remote::new(backend.clone(), remote.clone()),
+            after_download: Box::new(move |entry| {
+                if remove_whole_entry {
+                    std::fs::remove_dir_all(entry)?;
+                } else {
+                    std::fs::remove_file(entry.join("meta.json"))?;
+                }
+                Ok(())
+            }),
+        };
+        let r = report("session", 10, &[(&key, "alpha"), (&retained, "alpha")]);
+        let summary = replay(
+            &client,
+            &config,
+            &r,
+            10,
+            Instant::now() + Duration::from_secs(10),
+            &AtomicU64::new(1_000_000),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            (
+                summary.restored,
+                summary.local,
+                summary.busy,
+                summary.failed
+            ),
+            (0, 1, 0, 1),
+            "disappearing stage is a failure: {remove_whole_entry}"
+        );
+        assert!(summary.downloaded_bytes > 0);
+        assert!(!consumer.contains(&key));
+        assert!(
+            !consumer.entry_dir(&key).exists(),
+            "failed extraction must be discarded"
+        );
+        assert!(consumer.contains(&retained));
+        assert!(consumer.entry_dir(&retained).join("meta.json").is_file());
+        assert!(
+            !std::fs::read_dir(config.store_dir())
+                .unwrap()
+                .any(|entry| entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("warm-set-"))
+        );
+    }
 }

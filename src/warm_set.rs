@@ -68,6 +68,10 @@ impl ReplaySummary {
     fn record_busy(&mut self) {
         self.busy += 1;
     }
+
+    fn record_failure(&mut self) {
+        self.failed += 1;
+    }
 }
 
 fn option_or_env(option: &Option<String>, name: &str) -> Option<String> {
@@ -314,19 +318,19 @@ async fn replay(
                     Ok(()) => match store.import_restored_entry(&entry.cache_key) {
                         Ok(()) => summary.restored += 1,
                         Err(error) => {
-                            summary.failed += 1;
+                            summary.record_failure();
                             eprintln!("Cannot import {}: {error:#}", entry.cache_key);
                         }
                     },
                     Err(_) if destination.exists() => summary.record_busy(),
                     Err(error) => {
-                        summary.failed += 1;
+                        summary.record_failure();
                         eprintln!("Cannot publish {}: {error}", entry.cache_key);
                     }
                 }
             }
             Err(error) => {
-                summary.failed += 1;
+                summary.record_failure();
                 eprintln!("Cannot restore {}: {error:#}", entry.cache_key);
             }
         }

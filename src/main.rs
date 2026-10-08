@@ -1165,7 +1165,7 @@ fn run_cli(cli: Cli, readiness: Option<kunobi_daemon::readiness::channel::Notifi
             workspace,
             allow_partial,
         ),
-        Some(Commands::Prefetch(options)) => crate::warm_set::run(&config, options),
+        Some(Commands::Prefetch(options)) => crate::warm_set::run(&config, &options),
         Some(Commands::SaveManifest {
             manifest_key,
             namespace,

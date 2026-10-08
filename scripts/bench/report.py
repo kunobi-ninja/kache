@@ -6,6 +6,7 @@ Kache head against its merge base first, and folds every other table away.
 """
 
 import argparse
+import html
 import json
 import sys
 from pathlib import Path
@@ -255,6 +256,25 @@ def contention(projects):
             *counters,
             "Medians per batch. Waits add up overlapping events across jobs, so they are not wall-clock savings.",
         ]
+    duplicates = []
+    for project in measured:
+        for record in project.get("contention", {}).get("records", []):
+            for entry in record.get("events", {}).get("duplicate_compiles", []):
+                reasons = ", ".join(
+                    f"{reason} ({n})" for reason, n in sorted(entry["skip_reasons"].items())
+                ) or "—"
+                cells = [project["name"], record["arm"], record["phase"],
+                         str(record["sample"]), entry["crate_name"],
+                         entry["cache_key"][:16], str(entry["compiles"]), reasons]
+                duplicates.append("| " + " | ".join(
+                    html.escape(cell).replace("|", "&#124;").replace("\n", " ")
+                    for cell in cells
+                ) + " |")
+    if duplicates:
+        body += ["", "| Project | Arm | Phase | Sample | Crate | Key | Compiles | Skip reasons |",
+                 "| --- | --- | --- | ---: | --- | --- | ---: | --- |",
+                 *duplicates,
+                 "Counts describe each batch. Unknown means the wrapper did not report a skip reason."]
     return details("All tools, contention", body)
 
 

@@ -674,6 +674,15 @@ fn event_result_for_store_put(put: StorePutResult) -> EventResult {
     }
 }
 
+/// A compile that ran without the key's lock cannot publish its result.
+fn compiled_without_lock_reason(peer_committed: bool) -> &'static str {
+    if peer_committed {
+        "peer-already-committed"
+    } else {
+        "build-lock-unavailable"
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CcStoreDecision {
     admission_skipped: bool,
@@ -1420,6 +1429,11 @@ pub fn run_nvcc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
             .store_put(store_put)
             .store_error(store_error)
             .lookup_rejection(lookup_rejection)
+            .skip_reason(if event_result == EventResult::Skipped {
+                "admission-threshold"
+            } else {
+                ""
+            })
             .object_output(&recorded_object_output(parsed.object_output_path())),
     );
     print_progress(&crate_name, event_result, elapsed, size);
@@ -2399,6 +2413,11 @@ fn run_cc_with_store(
             .store_put(store_put)
             .store_error(store_error)
             .lookup_rejection(lookup_rejection)
+            .skip_reason(if event_result == EventResult::Skipped {
+                "admission-threshold"
+            } else {
+                ""
+            })
             .object_output(&recorded_object_output(parsed.object_output_path())),
     );
     print_progress(crate_name, event_result, elapsed, size);
@@ -3946,6 +3965,7 @@ fn run_parsed_rustc(
         }
     };
 
+    let peer_committed = committed.is_some();
     if let Some(meta) = committed.filter(|_| precompiled.is_none()) {
         if let Err(e) = hit_context.restore_and_finish(
             &store,
@@ -4063,6 +4083,7 @@ fn run_parsed_rustc(
         log_event(
             config,
             EventInputs::new(&event_root, crate_name, EventResult::Skipped, elapsed)
+                .skip_reason("inputs-changed")
                 .keyed(&cache_key, key_ms, key_hash_stats)
                 .lookup_ms(lookup_ms)
                 .key_record(key_record),
@@ -4079,6 +4100,7 @@ fn run_parsed_rustc(
         log_event(
             config,
             EventInputs::new(&event_root, crate_name, EventResult::Skipped, elapsed)
+                .skip_reason("out-dir-alias-changed")
                 .compile_time_ms(compile_time_ms)
                 .keyed(&cache_key, key_ms, key_hash_stats)
                 .lookup_ms(lookup_ms)
@@ -4115,6 +4137,7 @@ fn run_parsed_rustc(
         log_event(
             config,
             EventInputs::new(&event_root, crate_name, EventResult::Skipped, elapsed)
+                .skip_reason(format!("missing-output: {missing}"))
                 .compile_time_ms(compile_time_ms)
                 .keyed(&cache_key, key_ms, key_hash_stats)
                 .lookup_ms(lookup_ms)
@@ -4147,6 +4170,7 @@ fn run_parsed_rustc(
         log_event(
             config,
             EventInputs::new(&event_root, crate_name, EventResult::Skipped, elapsed)
+                .skip_reason(reason)
                 .compile_time_ms(compile_time_ms)
                 .keyed(&cache_key, key_ms, key_hash_stats)
                 .lookup_ms(lookup_ms)
@@ -4171,6 +4195,7 @@ fn run_parsed_rustc(
         log_event(
             config,
             EventInputs::new(&event_root, crate_name, EventResult::Skipped, elapsed)
+                .skip_reason("admission-threshold")
                 .compile_time_ms(compile_time_ms)
                 .keyed(&cache_key, key_ms, key_hash_stats)
                 .lookup_ms(lookup_ms)
@@ -4275,6 +4300,7 @@ fn run_parsed_rustc(
             log_event(
                 config,
                 EventInputs::new(&event_root, crate_name, EventResult::Skipped, elapsed)
+                    .skip_reason(format!("dep-info-staging: {error:#}"))
                     .compile_time_ms(compile_time_ms)
                     .keyed(&cache_key, key_ms, key_hash_stats)
                     .lookup_ms(lookup_ms)
@@ -4302,6 +4328,7 @@ fn run_parsed_rustc(
         log_event(
             config,
             EventInputs::new(&event_root, crate_name, EventResult::Skipped, elapsed)
+                .skip_reason(compiled_without_lock_reason(peer_committed))
                 .compile_time_ms(compile_time_ms)
                 .keyed(&cache_key, key_ms, key_hash_stats)
                 .lookup_ms(lookup_ms)
@@ -5574,6 +5601,7 @@ fn compile_before_key(
             log_event(
                 config,
                 EventInputs::new(ctx.event_root, crate_name, EventResult::Skipped, elapsed)
+                    .skip_reason("missing-dep-info")
                     .compile_time_ms(compile_time_ms)
                     .keyed("", key_ms, key_hash_stats)
                     .key_record(key_record),
@@ -6977,6 +7005,7 @@ fn passthrough_with_event<R: Into<String>>(
         log_event(
             config,
             EventInputs::new(root, crate_name, EventResult::Skipped, elapsed)
+                .skip_reason(reason)
                 .key_record(key_record),
         );
         print_progress(crate_name, EventResult::Skipped, elapsed, 0);
@@ -7163,7 +7192,7 @@ fn cc_precompiled_skipped(
     let elapsed = start.elapsed().as_millis() as u64;
     log_event(
         config,
-        EventInputs::new(root, crate_name, EventResult::Skipped, elapsed),
+        EventInputs::new(root, crate_name, EventResult::Skipped, elapsed).skip_reason(reason),
     );
     print_progress(crate_name, EventResult::Skipped, elapsed, 0);
     Ok(exit_code)
@@ -7240,6 +7269,7 @@ pub(crate) struct EventInputs<'a> {
     store_ms: u64,
     store_put: StorePutResult,
     passthrough_reason: String,
+    skip_reason: String,
     object_output: String,
     package: String,
     store_error: String,
@@ -7272,6 +7302,7 @@ impl<'a> EventInputs<'a> {
             store_ms: 0,
             store_put: StorePutResult::default(),
             passthrough_reason: String::new(),
+            skip_reason: String::new(),
             object_output: String::new(),
             package: String::new(),
             store_error: String::new(),
@@ -7356,6 +7387,11 @@ impl<'a> EventInputs<'a> {
 
     pub(crate) fn passthrough_reason(mut self, reason: String) -> Self {
         self.passthrough_reason = reason;
+        self
+    }
+
+    pub(crate) fn skip_reason(mut self, reason: impl Into<String>) -> Self {
+        self.skip_reason = reason.into();
         self
     }
 
@@ -7496,6 +7532,7 @@ pub(crate) fn build_event_details(config: &Config, inputs: EventInputs<'_>) -> B
         store_ms,
         store_put,
         passthrough_reason,
+        skip_reason,
         object_output,
         package,
         store_error,
@@ -7563,7 +7600,7 @@ pub(crate) fn build_event_details(config: &Config, inputs: EventInputs<'_>) -> B
         compile_time_ms,
         size,
         cache_key: cache_key.to_string(),
-        schema: 24,
+        schema: 25,
         demands: crate::demand::take(),
         session_id,
         key_ms,
@@ -7605,6 +7642,7 @@ pub(crate) fn build_event_details(config: &Config, inputs: EventInputs<'_>) -> B
         restore_copy_exclusive_bytes: crate::opcounts::restore_copy_exclusive_bytes(),
         restore_copy_other_bytes: crate::opcounts::restore_copy_other_bytes(),
         passthrough_reason,
+        skip_reason,
         miss_reason,
         object_output,
         package,

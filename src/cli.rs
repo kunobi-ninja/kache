@@ -4760,8 +4760,29 @@ fn unit_target_intact(root: &crate::store::TrackedTargetRoot) -> bool {
         && crate::machine::directory_identity(&root.path) == Some(root.identity)
 }
 
+fn unit_cleanup_roots(
+    roots: Vec<crate::store::TrackedTargetRoot>,
+    selected: Option<&std::path::Path>,
+) -> Vec<crate::store::TrackedTargetRoot> {
+    roots
+        .into_iter()
+        .filter(|root| unit_target_matches(root, selected) && unit_target_intact(root))
+        .collect()
+}
+
+fn unit_cleanup_ready(
+    root: &crate::store::TrackedTargetRoot,
+    plan: &crate::target_liveness::Plan,
+) -> bool {
+    plan.status == "ready" && unit_target_intact(root)
+}
+
 fn unit_preview(dry_run: bool, yes: bool, json: bool) -> bool {
     dry_run || (json && !yes)
+}
+
+fn unit_cleanup_needs_confirmation(preview: bool, units: usize) -> bool {
+    !preview && units > 0
 }
 
 fn render_unit_plan(path: &str, plan: &crate::target_liveness::Plan) -> String {
@@ -4789,6 +4810,19 @@ pub(crate) fn clean_units(
     yes: bool,
     json: bool,
 ) -> Result<()> {
+    clean_units_with_output(config, path, dry_run, yes, json, &mut |line| {
+        println!("{line}")
+    })
+}
+
+fn clean_units_with_output(
+    config: &Config,
+    path: Option<std::path::PathBuf>,
+    dry_run: bool,
+    yes: bool,
+    json: bool,
+    human_output: &mut impl FnMut(String),
+) -> Result<()> {
     let selected = path
         .map(|path| {
             std::fs::canonicalize(&path)
@@ -4796,11 +4830,7 @@ pub(crate) fn clean_units(
         })
         .transpose()?;
     let store = Store::open(config)?;
-    let roots: Vec<_> = store
-        .tracked_target_roots(0)?
-        .into_iter()
-        .filter(|root| unit_target_matches(root, selected.as_deref()) && unit_target_intact(root))
-        .collect();
+    let roots = unit_cleanup_roots(store.tracked_target_roots(0)?, selected.as_deref());
     let mut rows: Vec<_> = roots
         .iter()
         .map(|root| UnitCleanRow {
@@ -4814,16 +4844,13 @@ pub(crate) fn clean_units(
     let preview = unit_preview(dry_run, yes, json);
     if !json {
         if rows.is_empty() {
-            println!(
-                "No intact tracked target matches. Capture one with KACHE_TARGET_LIVENESS=1 kache cargo check."
-            );
+            human_output("No intact tracked target matches. Capture one with KACHE_TARGET_LIVENESS=1 kache cargo check.".into());
         }
         for row in &rows {
-            println!("{}", render_unit_plan(&row.path, &row.plan));
+            human_output(render_unit_plan(&row.path, &row.plan));
         }
     }
-    if !preview
-        && units > 0
+    if unit_cleanup_needs_confirmation(preview, units)
         && confirm_removal_with(
             &format!("Remove {units} obsolete build units?"),
             yes,
@@ -4832,7 +4859,7 @@ pub(crate) fn clean_units(
         )?
     {
         for (root, row) in roots.iter().zip(&mut rows) {
-            if row.plan.status == "ready" && unit_target_intact(root) {
+            if unit_cleanup_ready(root, &row.plan) {
                 row.removed = crate::target_liveness::prune(
                     config,
                     &root.path,
@@ -4861,7 +4888,10 @@ pub(crate) fn clean_units(
     if !preview {
         let removed: usize = rows.iter().map(|row| row.removed.units).sum();
         let bytes: u64 = rows.iter().map(|row| row.removed.bytes).sum();
-        println!("Removed {removed} obsolete units ({}).", ByteSize(bytes));
+        human_output(format!(
+            "Removed {removed} obsolete units ({}).",
+            ByteSize(bytes)
+        ));
     }
     Ok(())
 }

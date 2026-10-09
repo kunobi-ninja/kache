@@ -2335,8 +2335,10 @@ fn run_cc_with_store(
                         lookup_ms,
                         lookup_rejection: &lookup_rejection,
                         store_start,
+                        // Publication already requires a successful compile with
+                        // observed outputs; reuse that proof for the handoff.
                         rebuilt: RebuiltArtifacts::observed(
-                            result.exit_code == 0,
+                            store_candidate,
                             &result.artifacts,
                             rebuilt_package.clone(),
                         ),

@@ -331,11 +331,7 @@ impl Capture {
                     }
                 }
             }
-            if !mapped
-                || artifact["target"]["kind"]
-                    .as_array()
-                    .is_some_and(|k| k.iter().any(|v| v == "custom-build" || v == "bin"))
-            {
+            if needs_package_protection(mapped, &artifact["target"]["kind"]) {
                 protected_packages.insert(package);
             }
         }
@@ -390,7 +386,7 @@ impl Capture {
         for (unit, fingerprint, mut parts) in inventory {
             // A modern unit owns its fingerprint as a child. Rename the
             // parent once rather than stage overlapping paths.
-            parts.retain(|p| !matches!(&unit, Unit::PerUnit { dir } if p != dir));
+            retain_owned_parts(&unit, &mut parts);
             let (package, mut known) = known_library(&unit)?;
             let profile = match &unit {
                 Unit::Shared { profile, .. } => profile.as_path(),
@@ -414,14 +410,13 @@ impl Capture {
                 known,
             });
         }
-        for (path, stamp) in &inputs {
-            if !path.starts_with(&self.workspace) && !self.before.contains_key(path) {
-                ensure!(
-                    path.starts_with(&target) || stamp.modified <= self.started,
-                    "external input changed during compilation"
-                );
-            }
-        }
+        validate_discovered_inputs(
+            &inputs,
+            &self.before,
+            &self.workspace,
+            &target,
+            self.started,
+        )?;
         let mut receipt = Receipt {
             schema: SCHEMA,
             target,
@@ -439,21 +434,8 @@ impl Capture {
         };
         // Other successfully observed command variants remain protected while
         // their shared source state is unchanged.
-        if let Ok(previous) = read_receipt(&self.config, &receipt.target)
-            && previous.inputs == receipt.inputs
-            && previous.environment == receipt.environment
-        {
-            let live: BTreeMap<_, _> = previous
-                .units
-                .iter()
-                .filter(|u| u.live)
-                .map(|u| (&u.fingerprint, &u.snapshot))
-                .collect();
-            for unit in &mut receipt.units {
-                unit.live |= live
-                    .get(&unit.fingerprint)
-                    .is_some_and(|s| **s == unit.snapshot);
-            }
+        if let Ok(previous) = read_receipt(&self.config, &receipt.target) {
+            preserve_previous_live_units(&mut receipt, &previous);
         }
         let record = receipt_path(&self.config, &receipt.target);
         std::fs::create_dir_all(record.parent().context("receipt parent")?)?;
@@ -463,6 +445,55 @@ impl Capture {
         crate::store::Store::open(&self.config)?
             .remember_target_root(&receipt.target, &receipt.workspace)
     }
+}
+
+fn needs_package_protection(mapped: bool, kinds: &serde_json::Value) -> bool {
+    !mapped
+        || kinds
+            .as_array()
+            .is_some_and(|k| k.iter().any(|v| v == "custom-build" || v == "bin"))
+}
+
+fn preserve_previous_live_units(receipt: &mut Receipt, previous: &Receipt) {
+    if previous.inputs != receipt.inputs || previous.environment != receipt.environment {
+        return;
+    }
+    let live: BTreeMap<_, _> = previous
+        .units
+        .iter()
+        .filter(|u| u.live)
+        .map(|u| (&u.fingerprint, &u.snapshot))
+        .collect();
+    for unit in &mut receipt.units {
+        unit.live |= live
+            .get(&unit.fingerprint)
+            .is_some_and(|s| **s == unit.snapshot);
+    }
+}
+
+fn retain_owned_parts(unit: &Unit, parts: &mut Vec<PathBuf>) {
+    parts.retain(|p| !matches!(unit, Unit::PerUnit { dir } if p != dir));
+}
+
+/// Inputs first observed after Cargo exits need evidence that they predate
+/// compilation. Generated target outputs and the prechecked workspace are
+/// handled by their own inventory checks.
+fn validate_discovered_inputs(
+    inputs: &Snapshot,
+    before: &Snapshot,
+    workspace: &Path,
+    target: &Path,
+    started: SystemTime,
+) -> Result<()> {
+    for (path, stamp) in inputs {
+        if !path.starts_with(workspace) && !before.contains_key(path) {
+            ensure!(
+                path.starts_with(target) || stamp.modified <= started,
+                "external input changed during compilation"
+            );
+        }
+    }
+    Ok(())
 }
 
 fn cargo_subcommand(args: &[String]) -> Option<&str> {
@@ -523,8 +554,15 @@ fn package_name(manifest: &Path) -> Result<String> {
 }
 
 fn environment_digest() -> String {
+    environment_digest_from(std::env::vars_os())
+}
+
+fn environment_digest_from(
+    vars: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+) -> String {
     let mut hasher = blake3::Hasher::new();
-    let mut vars: Vec<_> = std::env::vars_os()
+    let mut vars: Vec<_> = vars
+        .into_iter()
         .filter(|(k, _)| {
             let k = k.to_string_lossy();
             (!k.starts_with("KACHE_") || k == "KACHE_REAL_CARGO")
@@ -807,7 +845,7 @@ fn validated(config: &Config, target: &Path, workspace: &Path) -> Result<Receipt
                     .into_iter()
                     .filter(|p| p.exists())
                     .collect();
-                parts.retain(|p| !matches!(&unit, Unit::PerUnit { dir } if p != dir));
+                retain_owned_parts(&unit, &mut parts);
                 (fingerprint, parts)
             })
         })
@@ -901,6 +939,10 @@ pub(crate) fn preview_window(
             ..Plan::default()
         };
     }
+    summarize_receipt(&receipt, window, now)
+}
+
+fn summarize_receipt(receipt: &Receipt, window: Option<Duration>, now: SystemTime) -> Plan {
     let mut plan = Plan {
         status: "ready".into(),
         command: receipt.command.clone(),
@@ -956,10 +998,7 @@ pub(crate) fn prune(
         serde_json::to_vec(&receipt)? == serde_json::to_vec(&receipt_again)?,
         "receipt changed"
     );
-    let mut pruned = Pruned {
-        used: receipt.units.iter().filter(|u| u.live).count(),
-        ..Pruned::default()
-    };
+    let mut pruned = protected_counts(&receipt);
     let mut removed = Vec::new();
     let mut staged_units: Vec<(&ObservedUnit, StagedParts)> = Vec::new();
     for unit in &receipt.units {
@@ -988,35 +1027,24 @@ pub(crate) fn prune(
     }
     // Revalidate the batch once, keeping source and inventory work linear in
     // the number of units rather than repeating a workspace walk per unit.
-    let unchanged = validated(config, target, workspace).is_ok()
-        && staged_units
-            .iter()
-            .all(|(unit, staged)| staged_snapshot(unit, staged).is_ok_and(|s| s == unit.snapshot));
+    let unchanged =
+        staged_batch_unchanged(validated(config, target, workspace).is_ok(), &staged_units);
     if !unchanged {
         for (_, staged) in &staged_units {
             rollback(staged);
         }
         bail!("Cargo inputs or staged outputs changed during cleanup");
     }
-    for (index, (unit, staged)) in staged_units.iter().enumerate() {
-        if let Err(error) = delete_staged(staged, &mut removed) {
-            for (_, later) in &staged_units[index + 1..] {
-                rollback(later);
-            }
-            log_removed(
-                config,
-                target,
-                workspace,
-                &removed,
-                pruned,
-                "cleanup-interrupted",
-            )?;
-            return Err(error);
-        }
-        pruned.units += 1;
-        pruned.bytes = pruned
-            .bytes
-            .saturating_add(unit.snapshot.values().map(|s| s.len).sum::<u64>());
+    if let Err(error) = delete_staged_units(&staged_units, &mut removed, &mut pruned) {
+        log_removed(
+            config,
+            target,
+            workspace,
+            &removed,
+            pruned,
+            "cleanup-interrupted",
+        )?;
+        return Err(error);
     }
     log_removed(
         config,
@@ -1027,6 +1055,45 @@ pub(crate) fn prune(
         "outside-observed-cargo-live-set",
     )?;
     Ok(pruned)
+}
+
+fn staged_batch_unchanged(
+    inputs_unchanged: bool,
+    staged_units: &[(&ObservedUnit, StagedParts)],
+) -> bool {
+    inputs_unchanged
+        && staged_units
+            .iter()
+            .all(|(unit, staged)| staged_snapshot(unit, staged).is_ok_and(|s| s == unit.snapshot))
+}
+
+fn protected_counts(receipt: &Receipt) -> Pruned {
+    Pruned {
+        used: receipt.units.iter().filter(|u| u.live).count(),
+        ..Pruned::default()
+    }
+}
+
+fn delete_staged_units(
+    staged_units: &[(&ObservedUnit, StagedParts)],
+    removed: &mut Vec<String>,
+    pruned: &mut Pruned,
+) -> Result<()> {
+    let mut remaining = staged_units;
+    while let Some(((unit, staged), later)) = remaining.split_first() {
+        remaining = later;
+        if let Err(error) = delete_staged(staged, removed) {
+            for (_, later) in remaining {
+                rollback(later);
+            }
+            return Err(error);
+        }
+        pruned.units += 1;
+        pruned.bytes = pruned
+            .bytes
+            .saturating_add(unit.snapshot.values().map(|s| s.len).sum::<u64>());
+    }
+    Ok(())
 }
 
 fn staged_snapshot(unit: &ObservedUnit, staged: &[(PathBuf, PathBuf)]) -> Result<Snapshot> {
@@ -1156,6 +1223,347 @@ mod tests {
     }
 
     #[test]
+    fn newly_observed_external_inputs_must_predate_compilation() {
+        let workspace = Path::new("workspace");
+        let target = Path::new("build-output");
+        let started = SystemTime::UNIX_EPOCH + Duration::from_secs(20);
+        let stamp = |seconds| Stamp {
+            len: 7,
+            modified: SystemTime::UNIX_EPOCH + Duration::from_secs(seconds),
+            digest: Some("observed-content".into()),
+        };
+        let snapshot =
+            |path: &str, seconds| Snapshot::from([(PathBuf::from(path), stamp(seconds))]);
+        let before = Snapshot::new();
+        for seconds in [19, 20] {
+            assert!(
+                validate_discovered_inputs(
+                    &snapshot("external/input.rs", seconds),
+                    &before,
+                    workspace,
+                    target,
+                    started
+                )
+                .is_ok()
+            );
+        }
+        assert!(
+            validate_discovered_inputs(
+                &snapshot("external/input.rs", 21),
+                &before,
+                workspace,
+                target,
+                started
+            )
+            .is_err()
+        );
+        assert!(
+            validate_discovered_inputs(
+                &snapshot("workspace/src/lib.rs", 21),
+                &before,
+                workspace,
+                target,
+                started
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_discovered_inputs(
+                &snapshot("build-output/generated.rs", 21),
+                &before,
+                workspace,
+                target,
+                started
+            )
+            .is_ok()
+        );
+        let prior = snapshot("external/input.rs", 21);
+        assert!(validate_discovered_inputs(&prior, &prior, workspace, target, started).is_ok());
+    }
+
+    fn receipt_for_test(units: Vec<ObservedUnit>) -> Receipt {
+        Receipt {
+            schema: SCHEMA,
+            target: PathBuf::from("/target"),
+            workspace: PathBuf::from("/workspace"),
+            device: 1,
+            inode: 2,
+            recorded: SystemTime::UNIX_EPOCH,
+            command: vec![
+                "kache".into(),
+                "cargo".into(),
+                "check".into(),
+                "--offline".into(),
+            ],
+            environment: "stable".into(),
+            inputs: Snapshot::new(),
+            units,
+        }
+    }
+
+    #[test]
+    fn unmapped_artifacts_and_executable_targets_protect_the_whole_package() {
+        assert!(!needs_package_protection(true, &serde_json::json!(["lib"])));
+        assert!(needs_package_protection(false, &serde_json::json!(["lib"])));
+        assert!(needs_package_protection(true, &serde_json::json!(["bin"])));
+        assert!(needs_package_protection(
+            true,
+            &serde_json::json!(["custom-build"])
+        ));
+        assert!(!needs_package_protection(true, &serde_json::Value::Null));
+    }
+
+    #[test]
+    fn prior_live_variants_remain_live_only_with_matching_inputs_environment_and_outputs() {
+        let previous = receipt_for_test(vec![unit(true, true, 1)]);
+        let mut receipt = receipt_for_test(vec![unit(false, true, 1)]);
+        preserve_previous_live_units(&mut receipt, &previous);
+        assert!(receipt.units[0].live);
+        for changed_inputs in [false, true] {
+            let mut receipt = receipt_for_test(vec![unit(false, true, 1)]);
+            if changed_inputs {
+                receipt.inputs = unit(false, true, 1).snapshot;
+            } else {
+                receipt.environment = "changed".into();
+            }
+            preserve_previous_live_units(&mut receipt, &previous);
+            assert!(!receipt.units[0].live);
+        }
+        let mut changed_outputs = receipt_for_test(vec![unit(false, true, 2)]);
+        preserve_previous_live_units(&mut changed_outputs, &previous);
+        assert!(!changed_outputs.units[0].live);
+        let mut current_live = receipt_for_test(vec![unit(true, true, 1)]);
+        let previous_unused = receipt_for_test(vec![unit(false, true, 1)]);
+        preserve_previous_live_units(&mut current_live, &previous_unused);
+        assert!(
+            current_live.units[0].live,
+            "a previous command cannot clear current liveness"
+        );
+        let mut different_unit = receipt_for_test(vec![unit(false, true, 1)]);
+        different_unit.units[0].fingerprint =
+            PathBuf::from("/target/debug/.fingerprint/another-unit");
+        preserve_previous_live_units(&mut different_unit, &previous);
+        assert!(!different_unit.units[0].live);
+    }
+
+    #[test]
+    fn environment_snapshot_hashes_cargo_selection_and_build_inputs_but_ignores_display_state() {
+        let digest = |vars: &[(&str, &str)]| {
+            environment_digest_from(vars.iter().map(|(key, value)| {
+                (
+                    std::ffi::OsString::from(*key),
+                    std::ffi::OsString::from(*value),
+                )
+            }))
+        };
+        let stable = digest(&[
+            ("PATH", "/toolchain"),
+            ("KACHE_REAL_CARGO", "/cargo-a"),
+            ("KACHE_LOG", "warn"),
+            ("TERM", "xterm"),
+        ]);
+        assert_eq!(
+            stable,
+            digest(&[
+                ("TERM", "dumb"),
+                ("KACHE_LOG", "off"),
+                ("KACHE_REAL_CARGO", "/cargo-a"),
+                ("PATH", "/toolchain")
+            ])
+        );
+        assert_ne!(
+            stable,
+            digest(&[("PATH", "/toolchain"), ("KACHE_REAL_CARGO", "/cargo-b")])
+        );
+        assert_ne!(
+            stable,
+            digest(&[("PATH", "/new-toolchain"), ("KACHE_REAL_CARGO", "/cargo-a")])
+        );
+        assert_ne!(
+            stable,
+            digest(&[
+                ("PATH", "/toolchain"),
+                ("KACHE_REAL_CARGO", "/cargo-a"),
+                ("RUSTFLAGS", "--cfg changed")
+            ])
+        );
+        assert_ne!(digest(&[("AB", "C")]), digest(&[("A", "BC")]));
+        assert_ne!(
+            digest(&[("A", "B"), ("C", "D")]),
+            digest(&[("A", "BC"), ("D", "")])
+        );
+    }
+
+    #[test]
+    fn modern_units_own_the_parent_once_while_shared_units_keep_each_part() {
+        let dir = PathBuf::from("/target/debug/build/pkg/0123456789abcdef");
+        let mut parts = vec![
+            dir.clone(),
+            dir.join("fingerprint"),
+            dir.join("output.rlib"),
+        ];
+        retain_owned_parts(&Unit::PerUnit { dir: dir.clone() }, &mut parts);
+        assert_eq!(parts, vec![dir]);
+        let shared = Unit::Shared {
+            profile: PathBuf::from("/target/debug"),
+            package: "pkg".into(),
+            hash: "0123456789abcdef".into(),
+        };
+        let mut parts = vec![
+            shared.fingerprint(),
+            PathBuf::from("/target/debug/deps/libpkg-0123456789abcdef.rlib"),
+        ];
+        let expected = parts.clone();
+        retain_owned_parts(&shared, &mut parts);
+        assert_eq!(parts, expected);
+    }
+
+    #[test]
+    fn receipt_summary_counts_live_unknown_young_changed_and_removable_units() {
+        let dir = tempfile::tempdir().unwrap();
+        let fingerprint = dir.path().join("fingerprint");
+        std::fs::create_dir_all(&fingerprint).unwrap();
+        std::fs::write(fingerprint.join("lib-pkg.json"), "{}").unwrap();
+        let old = filetime::FileTime::from_unix_time(1, 0);
+        filetime::set_file_mtime(fingerprint.join("lib-pkg.json"), old).unwrap();
+        filetime::set_file_mtime(&fingerprint, old).unwrap();
+        let snapshot = output_snapshot(std::slice::from_ref(&fingerprint), &fingerprint).unwrap();
+        let removable = ObservedUnit {
+            fingerprint: fingerprint.clone(),
+            parts: vec![fingerprint],
+            snapshot,
+            live: false,
+            known: true,
+        };
+        let young_fingerprint = dir.path().join("young-fingerprint");
+        std::fs::create_dir_all(&young_fingerprint).unwrap();
+        std::fs::write(young_fingerprint.join("lib-pkg.json"), "{}").unwrap();
+        let young = ObservedUnit {
+            snapshot: output_snapshot(std::slice::from_ref(&young_fingerprint), &young_fingerprint)
+                .unwrap(),
+            fingerprint: young_fingerprint.clone(),
+            parts: vec![young_fingerprint],
+            live: false,
+            known: true,
+        };
+        let changed_fingerprint = dir.path().join("changed-fingerprint");
+        std::fs::create_dir_all(&changed_fingerprint).unwrap();
+        let changed_file = changed_fingerprint.join("lib-pkg.json");
+        std::fs::write(&changed_file, "{}").unwrap();
+        filetime::set_file_mtime(&changed_file, old).unwrap();
+        filetime::set_file_mtime(&changed_fingerprint, old).unwrap();
+        let changed = ObservedUnit {
+            snapshot: output_snapshot(
+                std::slice::from_ref(&changed_fingerprint),
+                &changed_fingerprint,
+            )
+            .unwrap(),
+            fingerprint: changed_fingerprint.clone(),
+            parts: vec![changed_fingerprint],
+            live: false,
+            known: true,
+        };
+        std::fs::write(changed_file, "changed fingerprint contents").unwrap();
+        let now = SystemTime::now();
+        let window = Some(Duration::from_secs(20));
+        assert!(!eligible(&young, window, now));
+        assert_eq!(
+            output_snapshot(&young.parts, &young.fingerprint).unwrap(),
+            young.snapshot
+        );
+        assert!(eligible(&changed, window, now));
+        assert_ne!(
+            output_snapshot(&changed.parts, &changed.fingerprint).unwrap(),
+            changed.snapshot
+        );
+        let receipt = receipt_for_test(vec![
+            unit(true, true, 1),
+            unit(false, false, 1),
+            young,
+            changed,
+            removable,
+        ]);
+        let plan = summarize_receipt(&receipt, Some(Duration::from_secs(20)), now);
+        assert_eq!(plan.status, "ready");
+        assert_eq!(plan.command, ["kache", "cargo", "check", "--offline"]);
+        assert_eq!(plan.protected, 1);
+        assert_eq!(plan.unknown, 3);
+        assert_eq!(plan.units, 1);
+        assert!(plan.bytes > 0);
+    }
+
+    #[test]
+    fn protected_counts_report_live_units_to_disk_pressure_policy() {
+        let receipt = receipt_for_test(vec![
+            unit(true, true, 1),
+            unit(true, false, 1),
+            unit(false, true, 1),
+        ]);
+        let counts = protected_counts(&receipt);
+        assert_eq!(counts.used, 2);
+        assert_eq!(counts.units, 0);
+        assert_eq!(counts.bytes, 0);
+    }
+
+    #[test]
+    fn interrupted_batch_restores_later_units_and_reports_only_completed_removals() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = unit(false, true, 1);
+        let later = unit(false, true, 1);
+        let original = dir.path().join("later-original");
+        let aside = dir.path().join("later-aside");
+        std::fs::write(&aside, "later unit must survive").unwrap();
+        let staged = vec![
+            (
+                &first,
+                vec![(
+                    dir.path().join("missing-original"),
+                    dir.path().join("missing-aside"),
+                )],
+            ),
+            (&later, vec![(original.clone(), aside.clone())]),
+        ];
+        let mut removed = Vec::new();
+        let mut pruned = Pruned {
+            used: 2,
+            ..Default::default()
+        };
+        assert!(delete_staged_units(&staged, &mut removed, &mut pruned).is_err());
+        assert!(removed.is_empty());
+        assert_eq!(pruned.units, 0);
+        assert_eq!(pruned.bytes, 0);
+        assert_eq!(pruned.used, 2);
+        assert_eq!(
+            std::fs::read(&original).unwrap(),
+            b"later unit must survive"
+        );
+        assert!(!aside.exists());
+        let completed = dir.path().join("completed-aside");
+        std::fs::write(&completed, "completed").unwrap();
+        let mut removed = Vec::new();
+        let mut pruned = Pruned::default();
+        delete_staged_units(
+            &[(
+                &first,
+                vec![(dir.path().join("completed-original"), completed.clone())],
+            )],
+            &mut removed,
+            &mut pruned,
+        )
+        .unwrap();
+        assert!(!completed.exists());
+        assert_eq!(pruned.units, 1);
+        assert_eq!(pruned.bytes, 7);
+        assert_eq!(
+            removed,
+            [dir.path()
+                .join("completed-original")
+                .to_string_lossy()
+                .into_owned()]
+        );
+    }
+
+    #[test]
     fn cargo_argument_scope_handles_overrides_and_toolchain_selectors() {
         let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         let a = args(&[
@@ -1166,6 +1574,13 @@ mod tests {
             "--target-dir=out",
         ]);
         assert_eq!(cargo_subcommand(&a), Some("check"));
+        for flag in ["--config", "--color", "--manifest-path"] {
+            assert_eq!(
+                cargo_subcommand(&args(&[flag, "value", "check"])),
+                Some("check"),
+                "{flag}"
+            );
+        }
         assert_eq!(argument(&a, "--target-dir"), Some("out"));
         assert_eq!(argument(&a, "--manifest-path"), None);
         assert_eq!(
@@ -1525,6 +1940,8 @@ mod tests {
                 })
                 .collect();
             assert_eq!(staged_snapshot(&unit, &staged).unwrap(), snapshot);
+            assert!(staged_batch_unchanged(true, &[(&unit, staged.clone())]));
+            assert!(!staged_batch_unchanged(false, &[(&unit, staged.clone())]));
             let staged_output = if modern {
                 staged[0].1.join("output.rlib")
             } else {
@@ -1532,6 +1949,8 @@ mod tests {
             };
             std::fs::write(&staged_output, "changed-output").unwrap();
             assert_ne!(staged_snapshot(&unit, &staged).unwrap(), snapshot);
+            assert!(!staged_batch_unchanged(true, &[(&unit, staged.clone())]));
+            assert!(!staged_batch_unchanged(false, &[(&unit, staged.clone())]));
             rollback(&staged);
             assert_eq!(std::fs::read(&output).unwrap(), b"changed-output");
             assert!(fingerprint.exists());

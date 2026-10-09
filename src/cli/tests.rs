@@ -8025,3 +8025,123 @@ fn clean_units_without_a_receipt_keeps_files_in_preview_and_confirmed_modes() {
         .is_err()
     );
 }
+
+#[test]
+fn unit_cleanup_excludes_other_workspaces_and_replaced_selected_targets() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = crate::test_support::test_config(dir.path().join("cache"));
+    let store = Store::open(&config).unwrap();
+    let first_workspace = dir.path().join("first");
+    let first_target = first_workspace.join("target");
+    let other_workspace = dir.path().join("other");
+    let other_target = other_workspace.join("target");
+    for (workspace, target) in [
+        (&first_workspace, &first_target),
+        (&other_workspace, &other_target),
+    ] {
+        std::fs::create_dir_all(target.join("debug")).unwrap();
+        std::fs::write(target.join("CACHEDIR.TAG"), CARGO_CACHEDIR_TAG).unwrap();
+        std::fs::write(workspace.join("Cargo.toml"), "[workspace]\n").unwrap();
+        store.remember_target_root(target, workspace).unwrap();
+    }
+    let roots = store.tracked_target_roots(0).unwrap();
+    assert_eq!(unit_cleanup_roots(roots.clone(), None).len(), 2);
+    for selected in [&first_target, &first_workspace] {
+        let selected_roots = unit_cleanup_roots(roots.clone(), Some(selected));
+        assert_eq!(
+            selected_roots.len(),
+            1,
+            "an intact target in another workspace must remain excluded"
+        );
+        assert_eq!(selected_roots[0].path, first_target);
+    }
+    assert!(unit_cleanup_roots(roots.clone(), Some(dir.path())).is_empty());
+
+    // The selected path now names a different directory, even though Cargo's
+    // marker remains present. The old tracked identity cannot authorize it.
+    std::fs::rename(&first_target, first_workspace.join("retained-old-target")).unwrap();
+    std::fs::create_dir_all(first_target.join("debug")).unwrap();
+    std::fs::write(first_target.join("CACHEDIR.TAG"), CARGO_CACHEDIR_TAG).unwrap();
+    assert!(unit_cleanup_roots(roots.clone(), Some(&first_target)).is_empty());
+    let retained = unit_cleanup_roots(roots, None);
+    assert_eq!(retained.len(), 1);
+    assert_eq!(retained[0].path, other_target);
+}
+
+#[test]
+fn unit_cleanup_human_messages_do_not_leak_into_json_or_claim_preview_removal() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = crate::test_support::test_config(dir.path().join("cache"));
+    for (dry_run, yes, json, expected_count, removal_summary) in [
+        (true, true, true, 0, false),
+        (false, false, true, 0, false),
+        (false, true, true, 0, false),
+        (true, true, false, 1, false),
+        (false, true, false, 2, true),
+    ] {
+        let mut messages = Vec::new();
+        clean_units_with_output(&config, None, dry_run, yes, json, &mut |line| {
+            messages.push(line)
+        })
+        .unwrap();
+        assert_eq!(
+            messages.len(),
+            expected_count,
+            "dry_run={dry_run} yes={yes} json={json}"
+        );
+        assert_eq!(
+            messages.iter().any(|line| line.starts_with("Removed ")),
+            removal_summary
+        );
+        if !json {
+            assert!(messages[0].starts_with("No intact tracked target matches."));
+        }
+    }
+}
+
+#[test]
+fn unit_cleanup_requires_both_ready_evidence_and_current_target_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path().join("workspace");
+    let target = workspace.join("target");
+    std::fs::create_dir_all(target.join("debug")).unwrap();
+    std::fs::write(target.join("CACHEDIR.TAG"), CARGO_CACHEDIR_TAG).unwrap();
+    std::fs::write(workspace.join("Cargo.toml"), "[workspace]\n").unwrap();
+    let config = crate::test_support::test_config(dir.path().join("cache"));
+    let store = Store::open(&config).unwrap();
+    store.remember_target_root(&target, &workspace).unwrap();
+    let root = store.tracked_target_roots(0).unwrap().pop().unwrap();
+    let ready = crate::target_liveness::Plan {
+        status: "ready".into(),
+        units: 1,
+        ..Default::default()
+    };
+    let unavailable = crate::target_liveness::Plan {
+        status: "receipt unavailable".into(),
+        units: 1,
+        ..Default::default()
+    };
+    assert!(unit_cleanup_ready(&root, &ready));
+    assert!(!unit_cleanup_ready(&root, &unavailable));
+    std::fs::rename(&target, workspace.join("retained-old-target")).unwrap();
+    std::fs::create_dir_all(target.join("debug")).unwrap();
+    std::fs::write(target.join("CACHEDIR.TAG"), CARGO_CACHEDIR_TAG).unwrap();
+    assert!(!unit_cleanup_ready(&root, &ready));
+    assert!(!unit_cleanup_ready(&root, &unavailable));
+}
+
+#[test]
+fn unit_cleanup_confirmation_requires_candidates_and_nonpreview_mode() {
+    for (preview, units, expected) in [
+        (false, 0, false),
+        (false, 1, true),
+        (true, 0, false),
+        (true, 1, false),
+    ] {
+        assert_eq!(
+            unit_cleanup_needs_confirmation(preview, units),
+            expected,
+            "preview={preview} units={units}"
+        );
+    }
+}

@@ -1017,6 +1017,13 @@ fn receipt_cleanup_skips_busy_profiles_and_corrupted_receipts() {
     lock.lock().unwrap();
     let busy = fixture.clean(&["--json", "--yes"], "alpha");
     assert_eq!(busy["targets"][0]["plan"]["status"], "busy", "{busy}");
+    let receipt: Value =
+        serde_json::from_slice(&std::fs::read(fixture.receipt_path()).unwrap()).unwrap();
+    assert_eq!(
+        busy["targets"][0]["plan"]["command"], receipt["command"],
+        "a busy plan must preserve the recorded command"
+    );
+    assert_eq!(busy["targets"][0]["plan"]["command"][0], "kache");
     assert_eq!(busy["targets"][0]["removed"]["units"], 0);
     assert_eq!(receipt_target_files(&fixture.target), before);
     lock.unlock().unwrap();

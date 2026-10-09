@@ -297,32 +297,39 @@ fn start_cargo_stdout_reader() -> io::Result<(SyncSender<ChildStdout>, Receiver<
             let Ok(stdout) = input.recv() else {
                 return;
             };
-            let mut reader = BufReader::with_capacity(8192, stdout);
-            loop {
-                match reader.fill_buf() {
-                    Ok([]) => {
-                        let _ = sender.send(CargoStdoutMessage::Finished);
-                        return;
-                    }
-                    Ok(bytes) => {
-                        let count = bytes.len();
-                        if sender
-                            .send(CargoStdoutMessage::Bytes(bytes.to_vec()))
-                            .is_err()
-                        {
-                            return;
-                        }
-                        reader.consume(count);
-                    }
-                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                    Err(error) => {
-                        let _ = sender.send(CargoStdoutMessage::Failed(error));
-                        return;
-                    }
-                }
-            }
+            read_cargo_stdout(BufReader::with_capacity(8192, stdout), sender);
         })?;
     Ok((ready, messages))
+}
+
+fn read_cargo_stdout(mut reader: impl BufRead, sender: SyncSender<CargoStdoutMessage>) {
+    loop {
+        match reader.fill_buf() {
+            Ok([]) => {
+                let _ = sender.send(CargoStdoutMessage::Finished);
+                return;
+            }
+            Ok(bytes) => {
+                let count = bytes.len();
+                if sender
+                    .send(CargoStdoutMessage::Bytes(bytes.to_vec()))
+                    .is_err()
+                {
+                    return;
+                }
+                reader.consume(count);
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => {
+                let _ = sender.send(CargoStdoutMessage::Failed(error));
+                return;
+            }
+        }
+    }
+}
+
+fn cargo_drain_expired(exited_at: Option<Instant>, now: Instant) -> bool {
+    exited_at.is_some_and(|at| now.saturating_duration_since(at) >= CARGO_DRAIN_TIMEOUT)
 }
 
 fn drain_cargo_stdout(
@@ -369,7 +376,7 @@ fn drain_cargo_stdout(
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
-        if exited_at.is_some_and(|at| at.elapsed() >= CARGO_DRAIN_TIMEOUT) {
+        if cargo_drain_expired(exited_at, Instant::now()) {
             capture.observe(INVALID_CARGO_STREAM);
             // Preserve the nonprotocol tail, but do not certify a partial stream.
             if let Err(error) = writer.write_all(&output.line) {
@@ -1030,6 +1037,108 @@ mod tests {
     }
 
     #[test]
+    fn cargo_stdout_reader_retries_interruption_and_reports_other_errors() {
+        struct FaultingReader {
+            next: usize,
+            bytes: Vec<u8>,
+        }
+        impl io::Read for FaultingReader {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                unreachable!("the reader uses BufRead")
+            }
+        }
+        impl BufRead for FaultingReader {
+            fn fill_buf(&mut self) -> io::Result<&[u8]> {
+                let phase = self.next;
+                self.next += 1;
+                match phase {
+                    0 => Err(io::ErrorKind::Interrupted.into()),
+                    1 => Ok(&self.bytes),
+                    2 => Err(io::ErrorKind::BrokenPipe.into()),
+                    _ => Ok(&[]),
+                }
+            }
+            fn consume(&mut self, amount: usize) {
+                assert_eq!(amount, self.bytes.len());
+            }
+        }
+        let (sender, messages) = mpsc::sync_channel(8);
+        read_cargo_stdout(
+            FaultingReader {
+                next: 0,
+                bytes: b"one\n".to_vec(),
+            },
+            sender,
+        );
+        assert!(
+            matches!(messages.try_recv().unwrap(), CargoStdoutMessage::Bytes(bytes) if bytes == b"one\n")
+        );
+        assert!(
+            matches!(messages.try_recv().unwrap(), CargoStdoutMessage::Failed(error) if error.kind() == io::ErrorKind::BrokenPipe)
+        );
+        assert!(matches!(
+            messages.try_recv(),
+            Err(mpsc::TryRecvError::Disconnected)
+        ));
+        let (sender, messages) = mpsc::sync_channel(8);
+        read_cargo_stdout(io::Cursor::new(b"complete\n"), sender);
+        assert!(
+            matches!(messages.try_recv().unwrap(), CargoStdoutMessage::Bytes(bytes) if bytes == b"complete\n")
+        );
+        assert!(matches!(
+            messages.try_recv().unwrap(),
+            CargoStdoutMessage::Finished
+        ));
+    }
+
+    #[test]
+    fn cargo_stdout_drain_waits_until_two_seconds_after_exit() {
+        let at = Instant::now();
+        assert!(!cargo_drain_expired(None, at + Duration::from_secs(10)));
+        assert!(!cargo_drain_expired(Some(at), at));
+        assert!(!cargo_drain_expired(
+            Some(at),
+            at + Duration::from_secs(2) - Duration::from_nanos(1)
+        ));
+        assert!(cargo_drain_expired(Some(at), at + Duration::from_secs(2)));
+        assert!(cargo_drain_expired(
+            Some(at),
+            at + Duration::from_secs(2) + Duration::from_nanos(1)
+        ));
+    }
+
+    #[test]
+    fn cargo_human_output_replays_rendered_diagnostics_on_stderr() {
+        const CHILD: &str = "KACHE_TEST_RENDERED_DIAGNOSTIC_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let mut output = CargoOutput::new(true);
+            let mut forwarded = Vec::new();
+            output.push(
+                b"{\"reason\":\"compiler-message\",\"message\":{\"rendered\":\"error: receipt diagnostic\\n\"}}\n",
+                &mut known_protocol,
+                &mut forwarded,
+            ).unwrap();
+            assert!(forwarded.is_empty());
+            return;
+        }
+        let child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "cargo_proxy::tests::cargo_human_output_replays_rendered_diagnostics_on_stderr",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            child.status.success(),
+            "{}",
+            String::from_utf8_lossy(&child.stdout)
+        );
+        assert_eq!(child.stderr, b"error: receipt diagnostic\n");
+    }
+
+    #[test]
     fn cargo_stdout_explicit_json_remains_byte_identical_across_chunk_boundaries() {
         let original = b"{\"reason\":\"compiler-artifact\",\"filenames\":[\"a.rlib\"]}\r\nplain stdout\n{\"reason\":\"build-finished\",\"success\":true}\nunterminated\xff";
         let mut output = CargoOutput::new(false);
@@ -1073,8 +1182,11 @@ mod tests {
 
     #[test]
     fn cargo_stdout_oversized_line_is_bounded_forwarded_and_invalidates_once() {
-        for human in [false, true] {
-            let mut original = vec![b'x'; MAX_CARGO_PROTOCOL_LINE + 31];
+        for (human, length) in [false, true]
+            .into_iter()
+            .flat_map(|human| [4_194_335, 4_202_527].map(|length| (human, length)))
+        {
+            let mut original = vec![b'x'; length];
             original.extend_from_slice(b"\n{\"reason\":\"build-finished\"}\n");
             let mut output = CargoOutput::new(human);
             let mut forwarded = Vec::new();
@@ -1097,7 +1209,7 @@ mod tests {
             assert_eq!(protocol_lines, 1);
             assert!(!output.oversized);
             if human {
-                assert_eq!(forwarded, original[..MAX_CARGO_PROTOCOL_LINE + 32]);
+                assert_eq!(forwarded, original[..length + 1]);
             } else {
                 assert_eq!(forwarded, original);
             }

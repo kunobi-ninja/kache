@@ -53,13 +53,13 @@ The region defaults to `us-east-1`. Kache does not read `AWS_REGION` or `AWS_DEF
 Kache checks these sources in order:
 
 1. `KACHE_S3_ACCESS_KEY` and `KACHE_S3_SECRET_KEY`
-2. standard AWS credential environment variables
-3. the selected shared profile
-4. legacy inline SSO or `credential_process`
-5. environment-based web identity
-6. ECS/task credentials, then EC2 instance credentials
+2. `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`, with `AWS_SESSION_TOKEN` when it is set
+3. the selected profile, or the `default` profile when none is selected: its keys, legacy inline SSO settings, then `credential_process`
+4. only when no profile is selected: environment-based web identity, then ECS/task credentials, then EC2 instance credentials
 
 Both explicit `KACHE_S3_*` credential variables are required. If only one is present, Kache warns and continues down the standard credential chain. There is no session-token variable for them, so pass temporary credentials through `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and `AWS_SESSION_TOKEN`.
+
+Setting `AWS_ACCESS_KEY_ID` without `AWS_SECRET_ACCESS_KEY`, or the reverse, is an error: S3 requests fail with a message that names the missing variable, and Kache tries no other source. An empty variable counts as unset.
 
 These environment variables override the fields of an S3 remote; a `gcs`, `oci` or `filesystem` remote ignores them:
 
@@ -76,9 +76,34 @@ These environment variables override the fields of an S3 remote; a `gcs`, `oci` 
 
 For a persistent daemon, put remote settings in the config file or service definition. A daemon Kache starts in the background drops the six variables above and `KACHE_LOCAL_ONLY` from the environment it inherits, and keeps the rest, including credentials, `AWS_PROFILE` and `AWS_ENDPOINT_URL_S3`. `kache stats` warns when the daemon's configuration differs from this shell's, and its `Remote` row shows the remote the daemon uses.
 
+### Selected profile
+
+The remote's `profile` setting (or `KACHE_S3_PROFILE`) selects a profile, and so does an `AWS_PROFILE` that is not empty. The setting wins when both are present. Kache then loads credentials from that profile only, after the explicit keys in steps 1 and 2.
+
+If the selected profile cannot supply credentials, S3 requests fail. Kache does not fall back to web identity, ECS or EC2 instance credentials: on a build machine with an instance role, a mistyped profile name would otherwise sign every request as that role. `kache doctor` fails its `Remote access` check with the profile, the setting that selected it, and the cause when Kache can tell:
+
+- the profile is not defined in the config or credentials file
+- one of those files cannot be read
+- the profile uses a form Kache does not support, listed under [Compatibility boundaries](#compatibility-boundaries)
+- its SSO token has expired, or its `credential_process` failed
+
+Kache also logs the reason as a warning when it first appears and whenever it changes, so it shows in the daemon's log.
+
+On an EC2 machine where `AWS_PROFILE` names a profile without credentials, such as one that only sets `region` for the AWS CLI, unset `AWS_PROFILE` in Kache's environment so it uses the instance role.
+
+Kache logs which source supplied the credentials at info level, in `kache.log` and the daemon's log, when it first signs with that source and whenever the source changes. A passing `Remote access` check names the source too, for example `credentials from EC2 instance metadata accepted`.
+
+### Behind a proxy
+
+Kache asks for ECS and EC2 instance credentials through the HTTP client it uses for S3, and that client honors `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY`. A metadata request sent through a proxy does not reach this machine's metadata service. When a proxy is set, exclude the metadata addresses:
+
+```bash
+export NO_PROXY=169.254.169.254,169.254.170.2
+```
+
 ## Compatibility boundaries
 
-The S3 implementation signs with SigV4. It does not currently load SigV4a/Multi-Region Access Point settings, assume-role profiles using `source_profile` or `credential_source`, modern `[sso-session]` profiles, or profile-based web identity. Resolve those credentials before starting Kache or use `credential_process`.
+The S3 implementation signs with SigV4. It does not currently load SigV4a/Multi-Region Access Point settings, assume-role profiles using `source_profile` or `credential_source`, modern `[sso-session]` profiles, or profile-based web identity. Resolve those credentials before starting Kache or use `credential_process`. When the selected profile is one of these, `kache doctor` says which.
 
 `AWS_ENDPOINT_URL_S3` is accepted when no Kache endpoint is set. An endpoint stored only inside an AWS shared profile is not loaded; copy it to `cache.remote.endpoint` or `KACHE_S3_ENDPOINT`.
 

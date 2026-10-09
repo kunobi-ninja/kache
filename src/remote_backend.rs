@@ -7,10 +7,13 @@
 
 mod download_memory;
 mod oci;
+mod s3_credentials;
 
 use download_memory::{BudgetedBody, DOWNLOAD_MEMORY, DownloadMemory};
+pub(crate) use s3_credentials::CredentialFailure;
+use s3_credentials::{CredentialStatus, KacheCredentialProvider};
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -27,16 +30,8 @@ use opendal_http_transport_reqwest::ReqwestTransport;
 use opendal_service_fs::Fs;
 use opendal_service_gcs::Gcs;
 use opendal_service_s3::S3;
-use reqsign_aws_v4::{
-    AssumeRoleWithWebIdentityCredentialProvider, Credential, DefaultCredentialProvider,
-    ECSCredentialProvider, EnvCredentialProvider, IMDSv2CredentialProvider,
-    ProcessCredentialProvider, ProfileCredentialProvider, SSOCredentialProvider,
-    StaticCredentialProvider,
-};
-use reqsign_core::{
-    CommandExecute, Context as SigningContext, Env, OsEnv, ProvideCredential,
-    ProvideCredentialChain,
-};
+use reqsign_aws_v4::Credential;
+use reqsign_core::{CommandExecute, ProvideCredential, ProvideCredentialChain};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 use crate::config::{
@@ -196,6 +191,12 @@ pub trait RemoteBackend: Send + Sync {
 
     /// Where `key` lives, for logs and errors.
     fn describe(&self, key: &str) -> String;
+
+    /// Where the credentials of the last signed request came from, for
+    /// `kache doctor`. `None` when the transport does not track it.
+    fn credential_source(&self) -> Option<String> {
+        None
+    }
 }
 
 /// OpenDAL-backed object transport.
@@ -215,6 +216,8 @@ pub struct OpenDalBackend {
     /// missing key without `s3:ListBucket`; GCS does not, so there a refusal
     /// stays an error.
     refusal_may_be_absence: bool,
+    /// What the S3 credential chain last did, for the S3 backend only.
+    credentials: Option<Arc<CredentialStatus>>,
 }
 
 impl OpenDalBackend {
@@ -227,6 +230,7 @@ impl OpenDalBackend {
             refusal_reported: AtomicBool::new(false),
             region: None,
             refusal_may_be_absence: true,
+            credentials: None,
         }
     }
 
@@ -320,12 +324,26 @@ impl OpenDalBackend {
 
     fn contextual_error(&self, operation: &str, key: &str, error: opendal::Error) -> anyhow::Error {
         let explanation = explain_opendal_failure(&error, self.region.as_deref());
-        let error =
+        let credentials = self.credential_failure(&error);
+        let mut error =
             anyhow::Error::new(error).context(format!("{operation} {}", self.describe(key)));
+        if let Some(failure) = credentials {
+            error = error.context(failure);
+        }
         match explanation {
             Some(explanation) => error.context(explanation),
             None => error,
         }
+    }
+
+    /// Why the credential chain stopped, when that is why `error` was never
+    /// sent. OpenDAL reports only that signing failed.
+    fn credential_failure(&self, error: &opendal::Error) -> Option<CredentialFailure> {
+        let status = self.credentials.as_ref()?;
+        if !signing_failed(error) {
+            return None;
+        }
+        status.failure()
     }
 
     fn validate_key(&self, operation: &str, key: &str, list_prefix: bool) -> Result<()> {
@@ -708,6 +726,17 @@ impl RemoteBackend for OpenDalBackend {
             format!("{}/{}", self.root_description, key)
         }
     }
+
+    fn credential_source(&self) -> Option<String> {
+        self.credentials.as_ref()?.source()
+    }
+}
+
+/// Whether `error` came from signing the request, which happens before it is
+/// sent.
+fn signing_failed(error: &opendal::Error) -> bool {
+    std::iter::successors(std::error::Error::source(error), |cause| cause.source())
+        .any(|cause| cause.is::<reqsign_core::Error>())
 }
 
 /// A stream that ends before its advertised length has not delivered the object.
@@ -819,11 +848,15 @@ pub(crate) fn plain_http_remote_endpoint(endpoint: &str) -> bool {
 }
 
 /// What a failed remote request most likely means, in terms a user can act
-/// on, when the store said. `region` is the configured S3 region.
+/// on, when the store or the credential chain said. `region` is the
+/// configured S3 region.
 pub(crate) fn explain_remote_failure(
     error: &anyhow::Error,
     region: Option<&str>,
 ) -> Option<String> {
+    if let Some(failure) = error.downcast_ref::<CredentialFailure>() {
+        return Some(failure.fix());
+    }
     error
         .chain()
         .find_map(|cause| cause.downcast_ref::<opendal::Error>())
@@ -906,65 +939,6 @@ fn ensure_rustls_provider() {
     // before constructing the S3 transport; the operation is process-wide and
     // idempotent.
     let _ = rustls::crypto::ring::default_provider().install_default();
-}
-
-/// Override only `AWS_PROFILE`, preserving every other process environment
-/// value and the platform home-directory lookup.
-#[derive(Debug, Clone)]
-struct ProfileSelectingEnv<E> {
-    inner: E,
-    profile: String,
-}
-
-impl<E: Env> Env for ProfileSelectingEnv<E> {
-    fn var(&self, key: &str) -> Option<String> {
-        if key == "AWS_PROFILE" {
-            Some(self.profile.clone())
-        } else {
-            self.inner.var(key)
-        }
-    }
-
-    fn vars(&self) -> HashMap<String, String> {
-        let mut vars = self.inner.vars();
-        vars.insert("AWS_PROFILE".to_string(), self.profile.clone());
-        vars
-    }
-
-    fn home_dir(&self) -> Option<PathBuf> {
-        self.inner.home_dir()
-    }
-}
-
-/// OpenDAL exposes a custom credential chain but does not expose the selected
-/// profile or command executor on its S3 builder. Wrap reqsign's default
-/// provider so Kache can preserve both behaviors without mutating the process
-/// environment.
-#[derive(Debug)]
-struct KacheCredentialProvider {
-    inner: DefaultCredentialProvider,
-    profile: Option<String>,
-}
-
-impl KacheCredentialProvider {
-    fn new(profile: Option<String>, region: &str) -> Self {
-        // Keep the AWS SDK's broad precedence: environment credentials first,
-        // then all selected-profile providers, then workload identity/roles.
-        let chain = ProvideCredentialChain::new()
-            .push(EnvCredentialProvider::new())
-            .push(ProfileCredentialProvider::default())
-            .push(SSOCredentialProvider::default())
-            .push(ProcessCredentialProvider::default())
-            .push(
-                AssumeRoleWithWebIdentityCredentialProvider::new().with_region(region.to_string()),
-            )
-            .push(ECSCredentialProvider::default())
-            .push(IMDSv2CredentialProvider::default());
-        Self {
-            inner: DefaultCredentialProvider::with_chain(chain),
-            profile,
-        }
-    }
 }
 
 /// Re-lex reqsign's `credential_process` tokens and execute the result directly.
@@ -1084,7 +1058,7 @@ impl CommandExecute for KacheCommandExecute {
         let (program, args) = relex_credential_command(program, args)
             .map_err(|error| reqsign_core::Error::config_invalid(format!("{error:#}")))?;
 
-        // `ProfileSelectingEnv` only redirects reqsign's own in-process reads. The
+        // The profile sources read the selected profile in-process. The
         // credential helper is a separate process that inherits this one's
         // environment, so without this it sees the ambient `AWS_PROFILE` and can
         // return credentials for a different account than the one Kache asked for.
@@ -1110,29 +1084,61 @@ impl CommandExecute for KacheCommandExecute {
     }
 }
 
-impl ProvideCredential for KacheCredentialProvider {
-    type Credential = Credential;
-
-    async fn provide_credential(
-        &self,
-        context: &SigningContext,
-    ) -> reqsign_core::Result<Option<Self::Credential>> {
-        let context = context.clone().with_command_execute(KacheCommandExecute {
-            profile: self.profile.clone(),
-        });
-        if let Some(profile) = &self.profile {
-            let context = context.with_env(ProfileSelectingEnv {
-                inner: OsEnv,
-                profile: profile.clone(),
-            });
-            self.inner.provide_credential(&context).await
-        } else {
-            self.inner.provide_credential(&context).await
+/// `KACHE_S3_ACCESS_KEY` and `KACHE_S3_SECRET_KEY`, when both are set.
+fn kache_s3_keys() -> Option<Credential> {
+    let access_key = std::env::var("KACHE_S3_ACCESS_KEY").ok();
+    let secret_key = std::env::var("KACHE_S3_SECRET_KEY").ok();
+    match (access_key, secret_key) {
+        (Some(access_key_id), Some(secret_access_key)) => Some(Credential {
+            access_key_id,
+            secret_access_key,
+            session_token: None,
+            expires_in: None,
+        }),
+        (Some(_), None) => {
+            tracing::warn!(
+                "KACHE_S3_ACCESS_KEY is set but KACHE_S3_SECRET_KEY is missing — ignoring partial credentials"
+            );
+            None
         }
+        (None, Some(_)) => {
+            tracing::warn!(
+                "KACHE_S3_SECRET_KEY is set but KACHE_S3_ACCESS_KEY is missing — ignoring partial credentials"
+            );
+            None
+        }
+        (None, None) => None,
     }
 }
 
-fn create_s3_operator(config: &S3RemoteConfig, pool_idle_secs: u64) -> Result<Operator> {
+/// The S3 backend, signing with `kache_keys` when given and otherwise with
+/// the credential chain.
+fn s3_backend(
+    config: &S3RemoteConfig,
+    pool_idle_secs: u64,
+    kache_keys: Option<Credential>,
+) -> Result<OpenDalBackend> {
+    let status = Arc::new(CredentialStatus::default());
+    let credentials = KacheCredentialProvider::new(
+        kache_keys,
+        config.profile.clone(),
+        s3_credentials::ambient_sources(&config.region),
+        Arc::clone(&status),
+    );
+    let mut backend = OpenDalBackend::new(
+        create_s3_operator(config, pool_idle_secs, credentials)?,
+        format!("s3://{}", config.bucket),
+    );
+    backend.region = Some(config.region.clone());
+    backend.credentials = Some(status);
+    Ok(backend)
+}
+
+fn create_s3_operator(
+    config: &S3RemoteConfig,
+    pool_idle_secs: u64,
+    credentials: impl ProvideCredential<Credential = Credential>,
+) -> Result<Operator> {
     // reqwest is compiled with rustls-no-provider. Installing ring here keeps
     // direct library/test callers safe; the operation is idempotent when
     // another Kache HTTP client already installed it.
@@ -1175,26 +1181,9 @@ fn create_s3_operator(config: &S3RemoteConfig, pool_idle_secs: u64) -> Result<Op
         builder = builder.endpoint(&endpoint);
     }
 
-    let mut credential_chain = ProvideCredentialChain::new().push(KacheCredentialProvider::new(
-        config.profile.clone(),
-        &config.region,
-    ));
-    let access_key = std::env::var("KACHE_S3_ACCESS_KEY").ok();
-    let secret_key = std::env::var("KACHE_S3_SECRET_KEY").ok();
-    match (access_key.as_deref(), secret_key.as_deref()) {
-        (Some(access_key), Some(secret_key)) => {
-            credential_chain =
-                credential_chain.push_front(StaticCredentialProvider::new(access_key, secret_key));
-        }
-        (Some(_), None) => tracing::warn!(
-            "KACHE_S3_ACCESS_KEY is set but KACHE_S3_SECRET_KEY is missing — ignoring partial credentials"
-        ),
-        (None, Some(_)) => tracing::warn!(
-            "KACHE_S3_SECRET_KEY is set but KACHE_S3_ACCESS_KEY is missing — ignoring partial credentials"
-        ),
-        (None, None) => {}
-    }
-    builder = builder.credential_provider_chain(credential_chain);
+    // OpenDAL takes only a reqsign chain, which skips a provider that fails.
+    // Kache's chain is its one provider and decides itself when to stop.
+    builder = builder.credential_provider_chain(ProvideCredentialChain::new().push(credentials));
 
     let operator = Operator::new(builder)
         .context("building OpenDAL S3 operator")?
@@ -1273,14 +1262,7 @@ pub async fn create_backend(
     pool_idle_secs: u64,
 ) -> Result<Arc<dyn RemoteBackend>> {
     let backend = match &remote.backend {
-        RemoteBackendConfig::S3(config) => {
-            let mut backend = OpenDalBackend::new(
-                create_s3_operator(config, pool_idle_secs)?,
-                format!("s3://{}", config.bucket),
-            );
-            backend.region = Some(config.region.clone());
-            backend
-        }
+        RemoteBackendConfig::S3(config) => s3_backend(config, pool_idle_secs, kache_s3_keys())?,
         RemoteBackendConfig::Gcs(config) => {
             let mut backend = OpenDalBackend::new(
                 create_gcs_operator(config, pool_idle_secs)?,
@@ -2198,7 +2180,7 @@ mod tests {
             profile: Some("team".to_string()),
             user_agent: Some("custom-ua/1.0".to_string()),
         };
-        create_s3_operator(&config, 30).expect("S3 operator builds without network I/O");
+        s3_backend(&config, 30, None).expect("S3 backend builds without network I/O");
     }
 
     #[tokio::test]
@@ -2827,14 +2809,11 @@ mod tests {
         }
     }
 
-    /// The in-process `ProfileSelectingEnv` does not reach a `credential_process`
-    /// child, which is a separate process inheriting this one's environment. A
-    /// helper that shells out to AWS tooling would otherwise resolve the ambient
-    /// profile and return credentials for the wrong account.
-    /// The in-process `ProfileSelectingEnv` does not reach a `credential_process`
-    /// child, which is a separate process inheriting this one's environment. A
-    /// helper that shells out to AWS tooling would otherwise resolve the ambient
-    /// profile and return credentials for the wrong account.
+    /// The profile the chain selects in-process does not reach a
+    /// `credential_process` child, which is a separate process inheriting this
+    /// one's environment. A helper that shells out to AWS tooling would
+    /// otherwise resolve the ambient profile and return credentials for the
+    /// wrong account.
     ///
     /// Reads the ambient value rather than setting one: mutating process env from a
     /// test races every other test in the binary, and CI may already export
@@ -3030,64 +3009,48 @@ mod tests {
         }
     }
 
-    #[test]
-    fn explicit_profile_overrides_only_the_profile_environment_value() {
-        let env = ProfileSelectingEnv {
-            inner: reqsign_core::StaticEnv {
-                home_dir: Some(PathBuf::from("/home/test")),
-                envs: HashMap::from([
-                    ("AWS_PROFILE".to_string(), "ambient".to_string()),
-                    ("AWS_REGION".to_string(), "eu-west-1".to_string()),
-                ]),
-            },
-            profile: "selected".to_string(),
-        };
-
-        assert_eq!(env.var("AWS_PROFILE").as_deref(), Some("selected"));
-        assert_eq!(env.var("AWS_REGION").as_deref(), Some("eu-west-1"));
-        assert_eq!(env.home_dir(), Some(PathBuf::from("/home/test")));
+    struct ScopedEnvVar {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
     }
 
-    #[tokio::test]
-    async fn s3_wire_sends_custom_user_agent() {
-        let (endpoint, requests) = mock_http_server(vec![http_response("404 Not Found", "")]).await;
-
-        struct ScopedEnvVar {
-            key: &'static str,
-            previous: Option<std::ffi::OsString>,
+    impl ScopedEnvVar {
+        fn set(key: &'static str, val: &str) -> Self {
+            let previous = std::env::var_os(key);
+            unsafe { std::env::set_var(key, val) };
+            Self { key, previous }
         }
+    }
 
-        impl ScopedEnvVar {
-            fn set(key: &'static str, val: &str) -> Self {
-                let previous = std::env::var_os(key);
-                unsafe { std::env::set_var(key, val) };
-                Self { key, previous }
+    impl Drop for ScopedEnvVar {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(previous) => unsafe { std::env::set_var(self.key, previous) },
+                None => unsafe { std::env::remove_var(self.key) },
             }
         }
+    }
 
-        impl Drop for ScopedEnvVar {
-            fn drop(&mut self) {
-                match &self.previous {
-                    Some(previous) => unsafe { std::env::set_var(self.key, previous) },
-                    None => unsafe { std::env::remove_var(self.key) },
-                }
-            }
-        }
-
+    /// An S3 backend whose requests go to `endpoint`, signed with the
+    /// `KACHE_S3_*` keys read the way `create_backend` reads them.
+    fn backend_with_kache_keys(endpoint: String, user_agent: Option<&str>) -> OpenDalBackend {
         let config = S3RemoteConfig {
             bucket: "bucket".to_string(),
             endpoint: Some(endpoint),
             region: "us-east-1".to_string(),
             profile: None,
-            user_agent: Some("kache-custom-agent/9.9".to_string()),
+            user_agent: user_agent.map(str::to_string),
         };
-        let operator = {
-            let _lock = crate::test_support::process_state_test_lock();
-            let _access = ScopedEnvVar::set("KACHE_S3_ACCESS_KEY", "mock-access-key");
-            let _secret = ScopedEnvVar::set("KACHE_S3_SECRET_KEY", "mock-secret-key");
-            create_s3_operator(&config, 30).unwrap()
-        };
-        let backend = OpenDalBackend::new(operator, "s3://bucket".to_string());
+        let _lock = crate::test_support::process_state_test_lock();
+        let _access = ScopedEnvVar::set("KACHE_S3_ACCESS_KEY", "mock-access-key");
+        let _secret = ScopedEnvVar::set("KACHE_S3_SECRET_KEY", "mock-secret-key");
+        s3_backend(&config, 30, kache_s3_keys()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn s3_wire_sends_custom_user_agent() {
+        let (endpoint, requests) = mock_http_server(vec![http_response("404 Not Found", "")]).await;
+        let backend = backend_with_kache_keys(endpoint, Some("kache-custom-agent/9.9"));
 
         assert!(
             backend
@@ -3103,6 +3066,117 @@ mod tests {
                 .to_ascii_lowercase()
                 .starts_with("user-agent: kache-custom-agent/9.9")),
             "expected custom User-Agent header in request: {request_text}"
+        );
+    }
+
+    /// `kache doctor` names the source of the credentials the probe signed with.
+    #[tokio::test]
+    async fn s3_backend_names_the_credentials_it_signed_with() {
+        let (endpoint, requests) = mock_http_server(vec![http_response("404 Not Found", "")]).await;
+        let backend = backend_with_kache_keys(endpoint, None);
+        assert_eq!(backend.credential_source(), None, "nothing is signed yet");
+
+        assert!(backend.get("key", Some(1024)).await.unwrap().is_none());
+        assert_eq!(
+            backend.credential_source().as_deref(),
+            Some("KACHE_S3_ACCESS_KEY and KACHE_S3_SECRET_KEY")
+        );
+        let requests = requests.await.unwrap();
+        assert!(
+            requests[0].contains("Credential=mock-access-key/"),
+            "{}",
+            requests[0]
+        );
+    }
+
+    #[test]
+    fn a_backend_without_a_credential_chain_names_no_source() {
+        assert_eq!(GetOnly.credential_source(), None);
+        assert_eq!(memory_backend().credential_source(), None);
+    }
+
+    fn partial_keys() -> CredentialFailure {
+        CredentialFailure::PartialEnvironmentKeys {
+            present: "AWS_ACCESS_KEY_ID",
+            missing: "AWS_SECRET_ACCESS_KEY",
+        }
+    }
+
+    /// A credential chain that always stops, recording why as Kache's does.
+    #[derive(Debug)]
+    struct StoppedChain(Arc<CredentialStatus>);
+
+    impl ProvideCredential for StoppedChain {
+        type Credential = Credential;
+
+        async fn provide_credential(
+            &self,
+            _context: &reqsign_core::Context,
+        ) -> reqsign_core::Result<Option<Credential>> {
+            self.0.failed(&partial_keys());
+            Err(reqsign_core::Error::config_invalid(
+                partial_keys().to_string(),
+            ))
+        }
+    }
+
+    /// OpenDAL reports only that signing failed. The request error must say
+    /// why, and the request must not go out unsigned.
+    #[tokio::test]
+    async fn a_stopped_credential_chain_names_its_reason_in_the_request_error() {
+        // A signed or unsigned GET would get this miss and succeed.
+        let (endpoint, _requests) =
+            mock_http_server(vec![http_response("404 Not Found", "")]).await;
+        let config = S3RemoteConfig {
+            bucket: "bucket".to_string(),
+            endpoint: Some(endpoint),
+            region: "us-east-1".to_string(),
+            profile: None,
+            user_agent: None,
+        };
+        let status = Arc::new(CredentialStatus::default());
+        let operator = create_s3_operator(&config, 30, StoppedChain(Arc::clone(&status))).unwrap();
+        let mut backend = OpenDalBackend::new(operator, "s3://bucket".to_string());
+        backend.credentials = Some(status);
+
+        let error = backend
+            .get("key", Some(1024))
+            .await
+            .expect_err("no credentials, no request");
+        assert_eq!(
+            error.downcast_ref::<CredentialFailure>(),
+            Some(&partial_keys())
+        );
+        let text = format!("{error:#}");
+        assert!(
+            text.starts_with(
+                "AWS_ACCESS_KEY_ID is set without AWS_SECRET_ACCESS_KEY: GET s3://bucket/key: "
+            ),
+            "{text}"
+        );
+        assert_eq!(
+            explain_remote_failure(&error, Some("us-east-1")).as_deref(),
+            Some("set both AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY, or neither")
+        );
+    }
+
+    /// A failure the chain recorded is not blamed for an error that did not
+    /// come from signing.
+    #[test]
+    fn a_recorded_credential_failure_stays_out_of_unrelated_errors() {
+        let status = Arc::new(CredentialStatus::default());
+        status.failed(&partial_keys());
+        let mut backend = memory_backend();
+        backend.credentials = Some(status);
+
+        let error = backend.contextual_error(
+            "GET",
+            "key",
+            opendal::Error::new(ErrorKind::Unexpected, "connection reset"),
+        );
+        assert!(
+            error.downcast_ref::<CredentialFailure>().is_none(),
+            "{error:#}"
         );
     }
 }

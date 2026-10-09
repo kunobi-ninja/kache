@@ -332,8 +332,9 @@ fn stats_names_the_host_config_only_when_in_effect() {
 /// wins over it.
 #[test]
 fn remote_access_reports_the_explained_cause() {
-    let ok = remote_access_from(Ok(()), None);
+    let ok = remote_access_from(Ok(()), None, None);
     assert!(ok.pass);
+    assert_eq!(ok.detail, "reachable; credentials accepted");
     assert_eq!(ok.fix, None);
 
     let expired: anyhow::Error = opendal::Error::new(
@@ -341,16 +342,51 @@ fn remote_access_reports_the_explained_cause() {
         r#"S3Error { code: "ExpiredToken" }"#,
     )
     .into();
-    let failed = remote_access_from(Err(expired), Some("us-east-1"));
+    let failed = remote_access_from(Err(expired), Some("us-east-1"), None);
     assert!(!failed.pass);
     assert!(failed.fix.unwrap().contains("expired"));
 
-    let unknown = remote_access_from(Err(anyhow::anyhow!("connection refused")), None);
+    let unknown = remote_access_from(Err(anyhow::anyhow!("connection refused")), None, None);
     assert!(!unknown.pass);
     assert!(unknown.detail.contains("connection refused"));
     assert_eq!(
         unknown.fix.as_deref(),
         Some("check the endpoint, bucket, region and credentials")
+    );
+}
+
+/// The remote line says whose credentials the store accepted, so an
+/// instance role in use is visible. A chain that stopped is reported by its
+/// reason alone.
+#[test]
+fn remote_access_names_the_credential_source_and_a_stopped_chain() {
+    let ok = remote_access_from(Ok(()), None, Some("EC2 instance metadata"));
+    assert!(ok.pass);
+    assert_eq!(
+        ok.detail,
+        "reachable; credentials from EC2 instance metadata accepted"
+    );
+
+    let failure = crate::remote_backend::CredentialFailure::Profile {
+        name: "build-cache".to_string(),
+        selected_by: "AWS_PROFILE",
+        problem: "it is not defined in /aws/config or /aws/credentials".to_string(),
+    };
+    let stopped = anyhow::Error::new(opendal::Error::new(
+        opendal::ErrorKind::Unexpected,
+        "signing http request",
+    ))
+    .context("GET s3://bucket/kache-doctor-probe")
+    .context(failure.clone());
+    let failed = remote_access_from(Err(stopped), Some("us-east-1"), None);
+    assert!(!failed.pass);
+    assert_eq!(failed.detail, failure.to_string());
+    assert_eq!(
+        failed.fix.as_deref(),
+        Some(
+            "fix the profile, or unset AWS_PROFILE so kache can use web identity, ECS or EC2 \
+             instance credentials"
+        )
     );
 }
 

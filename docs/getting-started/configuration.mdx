@@ -512,7 +512,7 @@ Workspace rules are accepted only from the `.kache.toml` beside the active Cargo
 | `KACHE_REMOTE_RESTORE_TIMEOUT_SECS` | `cache.remote_restore_timeout_secs` | `300` | Daemon operation deadline; wrapper demand remains capped at three seconds |
 | `KACHE_REMOTE_NEGATIVE_TTL_SECS` | `cache.remote_negative_ttl_secs` | `60` | Cache definitive remote 404 results |
 
-Credentials resolve from explicit `KACHE_S3_ACCESS_KEY` and `KACHE_S3_SECRET_KEY`, standard AWS variables, the selected AWS profile, web identity, container credentials, then instance credentials.
+Credentials resolve from explicit `KACHE_S3_ACCESS_KEY` and `KACHE_S3_SECRET_KEY`, standard AWS variables, then the AWS profile. Web identity, container credentials and instance credentials follow only when no profile is selected. A selected profile that cannot supply credentials makes S3 requests fail; see [Selected profile](/docs/remote-cache/s3-setup#selected-profile).
 
 The `KACHE_S3_*` connection settings apply to S3. GCS and OCI require an explicit
 `cache.remote.type` and take their connection settings from TOML:

@@ -1348,15 +1348,20 @@ fn service_rows(snap: &StatsSnapshot, config: &Config) -> Vec<StatsRow> {
         Some(eff) => eff.remote_readonly == Some(true),
         None => config.remote_readonly,
     };
+    // The Remote row stays the bare description: kache-action compares the
+    // rest of that line with the remote it configured.
     rows.push((
         "Remote",
         format!("{remote_status}{remote_source}"),
-        if daemon_has_remote && remote_readonly {
-            "read-only".to_string()
-        } else {
-            String::new()
-        },
+        String::new(),
     ));
+    if daemon_has_remote && remote_readonly {
+        rows.push((
+            "Uploads",
+            "off".to_string(),
+            "the daemon is read-only and skips remote writes".to_string(),
+        ));
+    }
 
     // Remote resilience (kunobi-ninja/kache#327, #564): breaker state and
     // negative-cache effectiveness (hits avoided vs. round trips paid). Shown

@@ -4802,7 +4802,11 @@ fn stats_show_a_read_only_daemon_to_a_writable_process() {
     let out = render_stats(&snap, &writable, SinceWindow::DEFAULT);
     assert_eq!(
         stats_row(&out, "Remote").unwrap(),
-        "Remote | s3://bucket/prefix | read-only"
+        "Remote | s3://bucket/prefix | "
+    );
+    assert_eq!(
+        stats_row(&out, "Uploads").unwrap(),
+        "Uploads | off | the daemon is read-only and skips remote writes"
     );
     let warnings = config_mismatch_warnings(&writable, &provenance, &eff);
     assert_eq!(warnings.len(), 1, "{warnings:?}");
@@ -4811,9 +4815,19 @@ fn stats_show_a_read_only_daemon_to_a_writable_process() {
         "{warnings:?}"
     );
 
-    // A read-only process sends no uploads, so a writable daemon is no loss.
+    // A pull request job under kache-action: both sides read-only. The
+    // action fails the job unless the Remote line holds exactly the remote it
+    // configured.
     let mut read_only = writable.clone();
     read_only.remote_readonly = true;
+    let out = render_stats(&snap, &read_only, SinceWindow::DEFAULT);
+    assert_eq!(
+        action_remote_value(&out).as_deref(),
+        Some("s3://bucket/prefix")
+    );
+    assert!(stats_row(&out, "Uploads").is_some());
+
+    // A read-only process sends no uploads, so a writable daemon is no loss.
     eff.remote_readonly = Some(false);
     assert!(config_mismatch_warnings(&read_only, &provenance, &eff).is_empty());
 
@@ -4826,6 +4840,21 @@ fn stats_show_a_read_only_daemon_to_a_writable_process() {
         stats_row(&out, "Remote").unwrap(),
         "Remote | s3://bucket/prefix | "
     );
+    assert!(stats_row(&out, "Uploads").is_none());
+}
+
+/// What kache-action reads from `kache stats`: the rest of the first line
+/// whose `Remote` label is followed by a colon or at least two spaces.
+fn action_remote_value(lines: &[String]) -> Option<String> {
+    lines.iter().find_map(|line| {
+        let rest = line.trim_start().strip_prefix("Remote")?;
+        let value = match rest.strip_prefix(':') {
+            Some(value) => value,
+            None if rest.starts_with("  ") => rest,
+            None => return None,
+        };
+        Some(value.trim().to_string())
+    })
 }
 
 #[test]

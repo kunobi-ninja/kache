@@ -1989,11 +1989,16 @@ fn a_record_is_only_consulted_for_an_eligible_invocation() {
         "a proc-macro dependency with no package to digest is refused before any lookup"
     );
     if get_rustc_version(Path::new("rustc")).is_ok() {
+        let mut tree = Some(TreeGuard {
+            digest: "earlier".to_string(),
+            walks: Vec::new(),
+        });
         assert_eq!(
-            predicted_key_inputs(&plain, &on, &mut None),
+            predicted_key_inputs(&plain, &on, &mut tree),
             Err(Rejection::NoRecord),
             "an eligible invocation with nothing recorded falls back"
         );
+        assert!(tree.is_none(), "only a guard this lookup took comes back");
     }
     let elsewhere = dir.path().join("elsewhere");
     let _path_unit =
@@ -3581,11 +3586,11 @@ fn an_rlib_only_member_is_predicted_only_under_the_workspace_guard() {
     );
 }
 
-/// A process that waited on a discovery flight checks the owner's record
-/// against the digest it took before the wait, the one its own record will
-/// carry.
+/// A process that waited on a discovery flight digests the tree again. The
+/// owner's record carries the digest from before its compile, and the tree
+/// may have changed while the owner compiled.
 #[test]
-fn a_flight_waiter_checks_records_against_the_digest_taken_before_the_wait() {
+fn a_flight_waiter_digests_the_tree_again() {
     let mut lock = key_test_lock();
     if get_rustc_version(Path::new("rustc")).is_err() {
         return;
@@ -3609,14 +3614,18 @@ fn a_flight_waiter_checks_records_against_the_digest_taken_before_the_wait() {
     hasher.record_input_prediction(&identity, Some("kt"), &closure, Some("before".into()));
     let mut tree = Some(TreeGuard {
         digest: "before".to_string(),
+        walks: Vec::new(),
     });
-    assert_eq!(predicted_key_inputs(&args, &hasher, &mut tree), Ok(closure));
-    assert_eq!(tree.map(|guard| guard.digest).as_deref(), Some("before"));
     assert_eq!(
-        predicted_key_inputs(&args, &hasher, &mut None),
+        predicted_key_inputs(&args, &hasher, &mut tree),
         Err(Rejection::TreeChanged),
-        "a digest taken now"
+        "the guard from before the wait is not used again"
     );
+    let now = tree.expect("the guard is taken again").digest;
+    hasher.record_input_prediction(&identity, Some("kt"), &closure, Some(now.clone()));
+    let mut tree = None;
+    assert_eq!(predicted_key_inputs(&args, &hasher, &mut tree), Ok(closure));
+    assert_eq!(tree.map(|guard| guard.digest), Some(now));
 }
 
 /// This checkout's rows keep the guard while it covers the closure. They are
@@ -4336,6 +4345,41 @@ fn a_vendored_package_is_guarded_by_itself_not_the_workspace() {
     let vendored = digest(&roots);
     roots.vendored_package = None;
     assert_ne!(digest(&roots), vendored, "not the workspace digest");
+}
+
+/// A vendored unit's guard walks the files at the top of each directory
+/// between the package and the workspace root, which its digest reads, and
+/// not the directories beside the package.
+#[test]
+fn a_vendored_guard_moves_with_a_file_at_the_top_of_an_ancestor() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("w");
+    write_file(&root.join("Cargo.toml"), "[workspace]\n");
+    write_file(&root.join(".env"), "A=1");
+    write_file(&root.join("docs/a.md"), "");
+    write_file(
+        &root.join("third_party/rust/foo/.cargo-checksum.json"),
+        "{}",
+    );
+    write_file(&root.join("third_party/rust/foo/src/lib.rs"), "");
+    write_file(&root.join("third_party/rust/bar/src/lib.rs"), "");
+    let roots = WorkspaceRoots {
+        root: root.clone(),
+        cwd: String::new(),
+        canonical_root: root.canonicalize().unwrap(),
+        target: root.join("target"),
+        canonical_target: root.join("target"),
+        out_dir: None,
+        vendored_package: Some(root.join("third_party/rust/foo")),
+    };
+    let hasher = FileHasher::new();
+    let taken = tree_guard_of(&hasher, || workspace_tree_digest(&roots, &hasher)).unwrap();
+    assert!(taken.held());
+    write_file(&root.join("docs/b.md"), "");
+    write_file(&root.join("third_party/rust/bar/src/more.rs"), "");
+    assert!(taken.held(), "the rest of the tree");
+    std::fs::remove_file(root.join(".env")).unwrap();
+    assert!(!taken.held(), "a file at the top of the workspace");
 }
 
 #[test]
@@ -12321,6 +12365,48 @@ fn a_settled_tree_digest_is_memoised_under_its_stamp() {
     let (changed, read) = digest_at(settled + crate::tree_stamp::TreeStamp::SETTLE);
     assert!(changed.is_some_and(|changed| changed != fresh));
     assert_eq!(read, 2);
+}
+
+/// A guard holds while the trees it read keep their stamps. A file removed
+/// and put back with the same bytes and times leaves the digest as it was,
+/// not the stamp: the file has a new inode and change time.
+#[test]
+fn a_tree_guard_holds_until_its_tree_moves() {
+    let dir = tempfile::tempdir().unwrap();
+    let memo = dir.path().join("memo");
+    let tree = dir.path().join("tree");
+    let file = tree.join("a.txt");
+    write_file(&file, "a");
+    let old = filetime::FileTime::from_unix_time(1_000_000_000, 0);
+    filetime::set_file_mtime(&file, old).unwrap();
+    // Past any timestamp tick, so the file put back below gets a new one.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let hasher = FileHasher::new();
+    let guard = || {
+        tree_guard_of(&hasher, || {
+            let roots = vec![TreeRoot::new(tree.clone(), b"workspace", &[])];
+            tree_digest_memoised(roots, &hasher, 10, &memo, std::time::SystemTime::now())
+        })
+        .unwrap()
+    };
+    let taken = guard();
+    assert!(taken.held());
+    write_file(&dir.path().join("elsewhere.txt"), "");
+    assert!(taken.held(), "outside the tree");
+
+    std::fs::remove_file(&file).unwrap();
+    assert!(!taken.held(), "a file removed");
+    write_file(&file, "a");
+    filetime::set_file_mtime(&file, old).unwrap();
+    assert_eq!(guard().digest, taken.digest, "the same bytes");
+    #[cfg(unix)]
+    assert!(!taken.held(), "put back with the same bytes and times");
+    assert!(guard().held());
+    let unwalked = TreeGuard {
+        digest: taken.digest,
+        walks: Vec::new(),
+    };
+    assert!(!unwalked.held(), "nothing to walk again");
 }
 
 /// A file a tree guard reads is not a key input: a save anywhere in the

@@ -201,9 +201,7 @@ fn a_registry_unit_reading_its_out_dir_records_a_relocated_row() {
 
     let key = |dep_info, tree: &str| crate::cache_key::KeyOutputs {
         dep_info: Some(dep_info),
-        tree_guard: Some(crate::cache_key::TreeGuard {
-            digest: tree.to_string(),
-        }),
+        tree_guard: Some(crate::cache_key::TreeGuard::stamping(tree, &out)),
         ..Default::default()
     };
     record_input_prediction(
@@ -282,9 +280,7 @@ fn a_workspace_units_rows_carry_the_guard_only_while_it_covers_the_closure() {
             source_files: sources,
             env_deps: Vec::new(),
         }),
-        tree_guard: Some(crate::cache_key::TreeGuard {
-            digest: "tree".to_string(),
-        }),
+        tree_guard: Some(crate::cache_key::TreeGuard::stamping("tree", &root)),
         ..Default::default()
     };
     let trees = || {
@@ -304,6 +300,78 @@ fn a_workspace_units_rows_carry_the_guard_only_while_it_covers_the_closure() {
         &key(vec![lib, base.join("outside.txt")]),
     );
     assert_eq!(trees(), (None, None), "a file outside the workspace");
+}
+
+/// A guard is recorded only while the trees it read have not moved since it
+/// was taken: rustc reports what it saw later, and a listed file removed in
+/// between would be missing from the closure while the digest matches again
+/// once the file is back.
+#[test]
+fn a_record_keeps_no_guard_once_its_tree_moved() {
+    if std::process::Command::new("rustc")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("skipped: no rustc");
+        return;
+    }
+    let mut lock = crate::test_support::process_state_test_lock();
+    let base = lock.enter();
+    let mut config = test_config(base.join("cache"));
+    config.input_predictions = true;
+    let store = Store::open(&config).unwrap();
+    let root = base.join("w");
+    std::fs::create_dir_all(root.join("kt/src")).unwrap();
+    std::fs::create_dir_all(root.join("target/debug/deps")).unwrap();
+    std::fs::write(root.join("Cargo.toml"), "[workspace]\n").unwrap();
+    std::fs::write(root.join("kt/src/lib.rs"), "").unwrap();
+    std::fs::write(root.join("kt/a.txt"), "a").unwrap();
+    std::env::set_current_dir(&root).unwrap();
+    let manifest_dir = root.join("kt");
+    let _manifest = crate::config::tests::set_env_for_test(
+        "CARGO_MANIFEST_DIR",
+        Some(manifest_dir.as_os_str()),
+    );
+    let _out = crate::config::tests::set_env_for_test("OUT_DIR", None);
+    let deps = root.join("target/debug/deps");
+    let args = rustc_args(&[
+        "rustc",
+        "--crate-name",
+        "kt",
+        "kt/src/lib.rs",
+        "--out-dir",
+        deps.to_str().unwrap(),
+    ]);
+    let dep_info = crate::cache_key::DepInfo {
+        source_files: vec![PathBuf::from("kt/src/lib.rs")],
+        env_deps: Vec::new(),
+    };
+    let local = crate::cache_key::rustc_prediction_identity(&args).unwrap();
+    let shared = crate::cache_key::rustc_shared_prediction_identity(&args).unwrap();
+    let (portable, _) = crate::cache_key::workspace_record(&args, &dep_info, Some("tree")).unwrap();
+    let record = |guard: crate::cache_key::TreeGuard| {
+        let key = crate::cache_key::KeyOutputs {
+            dep_info: Some(dep_info.clone()),
+            tree_guard: Some(guard),
+            ..Default::default()
+        };
+        record_input_prediction(&config, Some(&store), &args, true, &key);
+        let hasher = store.file_hasher();
+        let tree = |identity: &str| hasher.input_prediction(identity).unwrap().tree;
+        (
+            tree(&local),
+            tree(&shared),
+            hasher.portable_prediction(&portable).map(|row| row.tree),
+        )
+    };
+
+    let taken = crate::cache_key::TreeGuard::stamping("before", &root);
+    std::fs::remove_file(root.join("kt/a.txt")).unwrap();
+    assert_eq!(record(taken), (None, None, None), "a file removed since");
+    let taken = crate::cache_key::TreeGuard::stamping("after", &root);
+    let after = Some("after".to_string());
+    assert_eq!(record(taken), (after.clone(), after.clone(), after));
 }
 
 fn eligible_incremental_args(temp: &tempfile::TempDir, crate_name: &str) -> RustcArgs {

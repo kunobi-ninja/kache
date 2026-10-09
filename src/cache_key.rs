@@ -802,10 +802,116 @@ pub struct KeyOutputs {
 }
 
 /// The tree guard a key computation took before rustc ran: a digest of the
-/// files a proc macro could read ([`needs_tree_guard`]).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// files a proc macro could read ([`needs_tree_guard`]), and the stat walks
+/// behind it, so a record can check that the trees have not moved since
+/// ([`TreeGuard::held`]).
+#[derive(Debug, Clone)]
 pub struct TreeGuard {
     pub digest: String,
+    walks: Vec<GuardWalk>,
+}
+
+impl TreeGuard {
+    /// Does every tree this guard read still have the stamp it had? The
+    /// closure rustc reports is what it saw during the compile, after the
+    /// digest was taken. A listed file removed meanwhile is missing from the
+    /// closure, and once it is back the digest matches again; its stamp does
+    /// not, as it has a new inode or new times. A guard with no walk to
+    /// repeat does not hold.
+    pub(crate) fn held(&self) -> bool {
+        let _trace = crate::phase_trace::phase("tree_recheck");
+        let held = !self.walks.is_empty()
+            && self.walks.iter().all(|walk| {
+                stamp_roots(&walk.roots, walk.max_entries)
+                    .is_ok_and(|stamp| stamp.digest == walk.stamp)
+            });
+        crate::phase_trace::decision("tree_recheck", if held { "held" } else { "moved" });
+        held
+    }
+}
+
+#[cfg(test)]
+impl TreeGuard {
+    /// A guard carrying `digest`, with a walk of `root` as it is now.
+    pub(crate) fn stamping(digest: &str, root: &Path) -> Self {
+        let roots = vec![TreeRoot::new(root.to_path_buf(), b"root", &[]).walked()];
+        let stamp = stamp_roots(&roots, CRATE_TREE_MAX_ENTRIES)
+            .expect("a tree to stamp")
+            .digest;
+        Self {
+            digest: digest.to_string(),
+            walks: vec![GuardWalk {
+                roots,
+                max_entries: CRATE_TREE_MAX_ENTRIES,
+                stamp,
+            }],
+        }
+    }
+}
+
+/// One stat walk behind a tree guard: the roots it covered, the entry budget
+/// of each, and the stamp it gave.
+#[derive(Debug, Clone)]
+struct GuardWalk {
+    roots: Vec<WalkedRoot>,
+    max_entries: usize,
+    stamp: String,
+}
+
+/// One root of a [`GuardWalk`], as [`crate::tree_stamp::Stamper::walk`]
+/// takes it.
+#[derive(Debug, Clone)]
+struct WalkedRoot {
+    path: PathBuf,
+    role: Vec<u8>,
+    excluded: Vec<PathBuf>,
+    rules: crate::tree_stamp::StampRules,
+}
+
+/// Why [`stamp_roots`] gave no stamp.
+#[derive(Debug)]
+enum StampRefusal {
+    /// The root at this index alone holds more entries than the budget.
+    TooLarge(usize),
+    /// The roots together hold more, or one could not be walked.
+    Refused,
+}
+
+/// One stat walk over `roots`, each of them and all of them together within
+/// `max_entries`.
+fn stamp_roots(
+    roots: &[WalkedRoot],
+    max_entries: usize,
+) -> std::result::Result<crate::tree_stamp::TreeStamp, StampRefusal> {
+    let mut stamper = crate::tree_stamp::Stamper::new();
+    let mut total = 0usize;
+    for (index, root) in roots.iter().enumerate() {
+        let mut budget = max_entries;
+        stamper.label(&root.role);
+        match stamper.walk(&root.path, &root.excluded, root.rules, &mut budget) {
+            crate::tree_stamp::WalkOutcome::Fits => total += max_entries - budget,
+            crate::tree_stamp::WalkOutcome::TooLarge => return Err(StampRefusal::TooLarge(index)),
+            crate::tree_stamp::WalkOutcome::Unreadable => return Err(StampRefusal::Refused),
+        }
+    }
+    if total > max_entries {
+        return Err(StampRefusal::Refused);
+    }
+    Ok(stamper.finish())
+}
+
+/// `digest`, a tree digest computed with `file_hasher`, as a guard with the
+/// walks behind it.
+fn tree_guard_of(
+    file_hasher: &FileHasher<'_>,
+    digest: impl FnOnce() -> Option<String>,
+) -> Option<TreeGuard> {
+    file_hasher.take_tree_walks();
+    let digest = digest()?;
+    Some(TreeGuard {
+        digest,
+        walks: file_hasher.take_tree_walks(),
+    })
 }
 
 /// The native archives a key hashed, with the unit's native search dirs.
@@ -951,6 +1057,15 @@ impl<'a> TreeRoot<'a> {
             skip_build_dirs: self.skips_build_dirs,
         }
     }
+
+    fn walked(&self) -> WalkedRoot {
+        WalkedRoot {
+            path: self.path.clone(),
+            role: self.role.to_vec(),
+            excluded: self.excluded(),
+            rules: self.stamp_rules(),
+        }
+    }
 }
 
 fn tree_digest(
@@ -993,7 +1108,8 @@ const TREE_DIGEST_VERSION: &[u8] = b"kache-crate-tree-v1\n";
 /// [`OVERSIZED_TREE_TTL`]: a workspace root can be a whole monorepo. When the
 /// roots have the stamp a digest was recorded under, that digest is the
 /// answer; otherwise every file is read, and the digest is recorded once the
-/// tree has settled ([`crate::tree_stamp::TreeStamp::settled_at`]).
+/// tree has settled ([`crate::tree_stamp::TreeStamp::settled_at`]). The walk
+/// goes to `file_hasher` for the guard ([`tree_guard_of`]).
 fn tree_digest_memoised(
     roots: Vec<TreeRoot<'_>>,
     file_hasher: &FileHasher<'_>,
@@ -1001,8 +1117,6 @@ fn tree_digest_memoised(
     memo_dir: &Path,
     now: std::time::SystemTime,
 ) -> Option<String> {
-    let mut stamper = crate::tree_stamp::Stamper::new();
-    let mut total = 0usize;
     for root in &roots {
         let marker = oversized_tree_marker(memo_dir, &root.path, max_entries);
         let recent = std::fs::metadata(&marker)
@@ -1014,32 +1128,29 @@ fn tree_digest_memoised(
         if recent {
             return None;
         }
-        let mut budget = max_entries;
-        stamper.label(root.role);
-        match stamper.walk(
-            &root.path,
-            &root.excluded(),
-            root.stamp_rules(),
-            &mut budget,
-        ) {
-            crate::tree_stamp::WalkOutcome::Fits => total += max_entries - budget,
-            crate::tree_stamp::WalkOutcome::TooLarge => {
-                let _ = std::fs::create_dir_all(marker.parent()?)
-                    .and_then(|()| std::fs::write(&marker, b""));
-                return None;
-            }
-            crate::tree_stamp::WalkOutcome::Unreadable => return None,
+    }
+    let walked: Vec<WalkedRoot> = roots.iter().map(TreeRoot::walked).collect();
+    let stamp = match stamp_roots(&walked, max_entries) {
+        Ok(stamp) => stamp,
+        Err(StampRefusal::TooLarge(index)) => {
+            let marker = oversized_tree_marker(memo_dir, &walked[index].path, max_entries);
+            let _ = std::fs::create_dir_all(marker.parent()?)
+                .and_then(|()| std::fs::write(&marker, b""));
+            return None;
         }
-    }
-    if total > max_entries {
-        return None;
-    }
-    let stamp = stamper.finish();
+        Err(StampRefusal::Refused) => return None,
+    };
+    let walk = GuardWalk {
+        roots: walked,
+        max_entries,
+        stamp: stamp.digest.clone(),
+    };
     let memo = tree_digest_memo(memo_dir, &roots);
     if let Some(digest) = crate::tree_stamp::memoised_digest(&memo, &stamp.digest)
         .filter(|digest| digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit()))
     {
         crate::phase_trace::decision("tree_memo", "hit");
+        file_hasher.note_tree_walk(walk);
         return Some(digest);
     }
     crate::phase_trace::decision("tree_memo", "miss");
@@ -1064,6 +1175,7 @@ fn tree_digest_memoised(
     if stamp.settled_at(now) {
         crate::tree_stamp::record_digest(&memo, &stamp.digest, &digest);
     }
+    file_hasher.note_tree_walk(walk);
     Some(digest)
 }
 
@@ -1748,6 +1860,7 @@ fn predicted_key_inputs(
     tree_guard: &mut Option<TreeGuard>,
 ) -> std::result::Result<DepInfo, Rejection> {
     let _trace = crate::phase_trace::phase("prediction_validate");
+    *tree_guard = None;
     if !file_hasher.uses_input_predictions() {
         return Err(Rejection::Disabled);
     }
@@ -1757,30 +1870,22 @@ fn predicted_key_inputs(
     // A unit under the tree guard is predictable only while the record carries
     // the tree digest and the digest still matches. The tree is the package
     // for a registry or vendored unit and the whole workspace for any other
-    // workspace or path one. Computed once here and handed back in
-    // `tree_guard`, because the same digest is what a record made from this
-    // invocation has to carry. A guard already there was taken before a
-    // discovery-flight wait (see `resolve_key_inputs`), and is the one the
-    // record will carry.
+    // workspace or path one. Computed here and handed back in `tree_guard`,
+    // because the same digest is what a record made from this invocation has
+    // to carry.
     let tree = if needs_tree_guard(&args.externs, manifest_dir) {
-        let digest = match tree_guard.as_ref() {
-            Some(guard) => guard.digest.clone(),
-            None => {
-                let _trace = crate::phase_trace::phase(if workspace.is_some() {
-                    "workspace_tree"
-                } else {
-                    "crate_tree"
-                });
-                match &workspace {
-                    Some(workspace) => workspace_tree_digest(workspace, file_hasher),
-                    None => crate_tree_digest(file_hasher),
-                }
-                .ok_or(Rejection::NotEligible)?
-            }
-        };
-        *tree_guard = Some(TreeGuard {
-            digest: digest.clone(),
+        let _trace = crate::phase_trace::phase(if workspace.is_some() {
+            "workspace_tree"
+        } else {
+            "crate_tree"
         });
+        let guard = tree_guard_of(file_hasher, || match &workspace {
+            Some(workspace) => workspace_tree_digest(workspace, file_hasher),
+            None => crate_tree_digest(file_hasher),
+        })
+        .ok_or(Rejection::NotEligible)?;
+        let digest = guard.digest.clone();
+        *tree_guard = Some(guard);
         Some(digest)
     } else {
         None
@@ -1880,11 +1985,12 @@ fn relocated_key_inputs(
         Some(tree) => tree,
         None => {
             let _trace = crate::phase_trace::phase("out_dir_tree");
-            let digest =
-                out_dir_tree_digest(Path::new(&out_dir), file_hasher).ok_or(Rejection::NoRecord)?;
-            *tree_guard = Some(TreeGuard {
-                digest: digest.clone(),
-            });
+            let guard = tree_guard_of(file_hasher, || {
+                out_dir_tree_digest(Path::new(&out_dir), file_hasher)
+            })
+            .ok_or(Rejection::NoRecord)?;
+            let digest = guard.digest.clone();
+            *tree_guard = Some(guard);
             digest
         }
     };
@@ -2317,6 +2423,29 @@ fn ancestor_top_digest(directory: &Path, file_hasher: &FileHasher<'_>) -> Option
         .collect::<std::io::Result<_>>()
         .ok()?;
     entries.sort_by_key(std::fs::DirEntry::file_name);
+    // The guard's walk of the files and symlinks read here. A dot-directory's
+    // own digest walks that directory.
+    let mut excluded: Vec<PathBuf> = entries
+        .iter()
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .map(std::fs::DirEntry::path)
+        .collect();
+    excluded.push(directory.join(".git"));
+    let top = vec![WalkedRoot {
+        path: directory.to_path_buf(),
+        role: b"ancestor".to_vec(),
+        excluded,
+        rules: crate::tree_stamp::StampRules {
+            link_text: true,
+            skip_build_dirs: false,
+        },
+    }];
+    let stamp = stamp_roots(&top, CRATE_TREE_MAX_ENTRIES).ok()?;
+    file_hasher.note_tree_walk(GuardWalk {
+        roots: top,
+        max_entries: CRATE_TREE_MAX_ENTRIES,
+        stamp: stamp.digest,
+    });
     let mut hasher = blake3::Hasher::new();
     for entry in entries {
         let name = entry.file_name();
@@ -2436,7 +2565,8 @@ fn resolve_key_inputs(
             *file_hasher.discovery_flight.borrow_mut() = flight.lock;
             // The previous owner may have published while this process
             // waited; a flight taken at once had no owner to publish. The
-            // tree digest taken before the wait is used again.
+            // tree is digested again: the owner's record carries the digest
+            // from before its compile, and the tree may have changed since.
             if flight.waited {
                 prediction = predicted_key_inputs(args, file_hasher, &mut out.tree_guard);
             }
@@ -6410,6 +6540,9 @@ pub struct FileHasher<'db> {
     /// 380 ms. Each row keeps the time its file was observed, which alone
     /// decides whether it may be written.
     pending_memo: RefCell<Vec<(ObservedFingerprint, String)>>,
+    /// The stat walks behind the tree digests computed since the last
+    /// [`FileHasher::take_tree_walks`] (see [`tree_guard_of`]).
+    tree_walks: RefCell<Vec<GuardWalk>>,
 }
 
 impl Drop for FileHasher<'_> {
@@ -6519,6 +6652,7 @@ impl FileHasher<'static> {
             too_new: TooNewGuard::default(),
             guard_inputs: RefCell::new(Vec::new()),
             pending_memo: RefCell::new(Vec::new()),
+            tree_walks: RefCell::new(Vec::new()),
         }
     }
 
@@ -6538,6 +6672,7 @@ impl FileHasher<'static> {
                 too_new: TooNewGuard::default(),
                 guard_inputs: RefCell::new(Vec::new()),
                 pending_memo: RefCell::new(Vec::new()),
+                tree_walks: RefCell::new(Vec::new()),
             },
             Err(e) => {
                 tracing::debug!(
@@ -6613,6 +6748,7 @@ impl<'db> FileHasher<'db> {
             too_new: TooNewGuard::default(),
             guard_inputs: RefCell::new(Vec::new()),
             pending_memo: RefCell::new(Vec::new()),
+            tree_walks: RefCell::new(Vec::new()),
         }
     }
 
@@ -6639,6 +6775,14 @@ impl<'db> FileHasher<'db> {
 
     pub(crate) fn take_discovery_flight(&self) -> Option<crate::store::StoreLock> {
         self.discovery_flight.borrow_mut().take()
+    }
+
+    fn note_tree_walk(&self, walk: GuardWalk) {
+        self.tree_walks.borrow_mut().push(walk);
+    }
+
+    fn take_tree_walks(&self) -> Vec<GuardWalk> {
+        std::mem::take(&mut *self.tree_walks.borrow_mut())
     }
 
     /// May key computation derive its inputs from a record? Only when it was

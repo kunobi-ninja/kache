@@ -5938,8 +5938,17 @@ fn record_input_prediction(
         return;
     };
     // Present exactly when the key was computed under the tree guard; the
-    // record must carry it or the guard will never accept the record.
-    let tree = key.tree_guard.as_ref().map(|guard| guard.digest.clone());
+    // record must carry it or the guard will never accept the record. Only
+    // while the trees it read have not moved since: rustc reported what it
+    // saw after the digest was taken, and a listed file removed meanwhile
+    // and put back since would leave a closure without it under a digest
+    // that matches again. Without the guard, a guarded unit's rows are not
+    // used, and its rows for other checkouts are not written.
+    let tree = key
+        .tree_guard
+        .as_ref()
+        .filter(|guard| guard.held())
+        .map(|guard| guard.digest.clone());
     let registry = crate::cache_key::registry_src_of(&std::env::vars_os().collect::<Vec<_>>());
     // A workspace or path unit gets a row another checkout of the workspace
     // can use, when the guard was taken before rustc ran (kunobi-ninja/kache#1005).

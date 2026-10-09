@@ -21,7 +21,8 @@
 //!     input carries a stamp from after the build started,
 //!   - a unit that expands a proc macro through an rlib that re-exports it
 //!     misses once a file appears in the directory the macro lists, in its
-//!     own target directory and in another one.
+//!     own target directory and in another one, and a listed file removed
+//!     while it builds leaves no record that its return would match.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -842,6 +843,11 @@ const SCAN_LIB: &str = "facade::scan!();\npub fn count() -> usize { ASSETS.len()
 /// rustc. A unit that expands the macro through the rlib names only the rlib
 /// on its command line. Returns both artifacts.
 fn build_facade(root: &Path) -> Vec<PathBuf> {
+    build_facade_with(root, SCAN_MACRO)
+}
+
+/// [`build_facade`] with `scan` as the macro's source.
+fn build_facade_with(root: &Path, scan: &str) -> Vec<PathBuf> {
     let out = root.join("facade-out");
     std::fs::create_dir_all(&out).unwrap();
     let rustc = |args: &[&str], source: &Path| {
@@ -857,7 +863,7 @@ fn build_facade(root: &Path) -> Vec<PathBuf> {
         assert!(status.success(), "building {} failed", source.display());
     };
     let scan_source = root.join("scan.rs");
-    std::fs::write(&scan_source, SCAN_MACRO).unwrap();
+    std::fs::write(&scan_source, scan).unwrap();
     rustc(
         &["--crate-name", "scan", "--crate-type", "proc-macro"],
         &scan_source,
@@ -1056,8 +1062,13 @@ impl WorkspaceUnit {
 
     /// The member linking only `facade`, an rlib that re-exports
     /// [`SCAN_MACRO`], and expanding the macro through it.
-    fn with_facade(mut self) -> Self {
-        self.facade = build_facade(self.root.path());
+    fn with_facade(self) -> Self {
+        self.with_facade_macro(SCAN_MACRO)
+    }
+
+    /// [`Self::with_facade`], with `scan` as the macro's source.
+    fn with_facade_macro(mut self, scan: &str) -> Self {
+        self.facade = build_facade_with(self.root.path(), scan);
         self.lib = SCAN_LIB.to_string();
         self
     }
@@ -1466,6 +1477,62 @@ fn a_file_added_where_a_re_exported_macro_lists_misses() {
     assert_ne!(compiled.cache_key, added.cache_key);
     assert_eq!(compiled.dep_info_runs, 0);
     assert_eq!(compiled.compiler_runs, 1);
+}
+
+/// [`SCAN_MACRO`], except that it first removes `assets/a.txt`, once, when a
+/// `remove-a` file sits next to the checkout: the file is gone after the
+/// wrapper took its digest of the tree and before the macro lists it.
+const REMOVING_SCAN_MACRO: &str = r#"extern crate proc_macro;
+#[proc_macro]
+pub fn scan(_input: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+    let manifest_dir = std::path::Path::new(&manifest_dir);
+    let assets = manifest_dir.join("assets");
+    let marker = manifest_dir.join("../../remove-a");
+    if marker.exists() {
+        let _ = std::fs::remove_file(assets.join("a.txt"));
+        let _ = std::fs::remove_file(&marker);
+    }
+    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(assets)
+        .map(|entries| entries.flatten().map(|entry| entry.path()).collect())
+        .unwrap_or_default();
+    files.sort();
+    let mut code = String::from("pub const ASSETS: &[&str] = &[");
+    for file in files {
+        code.push_str(&format!("include_str!({:?}),", file.display().to_string()));
+    }
+    code.push_str("];");
+    code.parse().unwrap()
+}
+"#;
+
+/// A listed file removed while the unit builds, and put back byte for byte
+/// afterwards, leaves a closure without it under a digest that matches
+/// again. The record of that build keeps no guard, so the next build
+/// discovers its closure and keys as the pre-pass does.
+#[test]
+fn a_file_removed_while_the_unit_builds_leaves_no_guarded_record() {
+    build_kache();
+    let unit = WorkspaceUnit::new(false)
+        .with_facade_macro(REMOVING_SCAN_MACRO)
+        .with_file("kt/assets/a.txt", "a\n");
+    let a = unit.checkout("a");
+    assert_eq!(unit.build(&a, true, None).result, "miss");
+
+    // A new file keeps this build off the first record.
+    std::fs::write(a.join("kt/assets/b.txt"), "b\n").unwrap();
+    std::fs::write(unit.root.path().join("remove-a"), "").unwrap();
+    let removed = unit.build(&a, true, None);
+    assert_eq!(removed.result, "miss");
+    assert!(!a.join("kt/assets/a.txt").exists(), "the macro removed it");
+
+    std::fs::write(a.join("kt/assets/a.txt"), "a\n").unwrap();
+    let restored = unit.build(&a, true, None);
+    assert_eq!(restored.result, "miss");
+    assert_ne!(restored.cache_key, removed.cache_key);
+    let off = unit.build(&a, false, None);
+    assert_eq!(off.result, "local_hit");
+    assert_eq!(off.cache_key, restored.cache_key);
 }
 
 /// The macro finds a first file whether its directory was empty or missing

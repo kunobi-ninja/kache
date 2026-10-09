@@ -510,14 +510,8 @@ fn auto_gc_wanted(config: &Config, store: &Store) -> bool {
         return false;
     }
     let stamp = auto_gc_stamp_path(&config.cache_dir);
-    if let Ok(meta) = std::fs::metadata(&stamp) {
-        match meta.modified().ok().and_then(|m| m.elapsed().ok()) {
-            Some(age) if age < AUTO_GC_CHECK_INTERVAL => return false,
-            // `elapsed()` errs when the mtime is in the future (clock skew /
-            // another process just touched it) — treat as fresh and skip.
-            None => return false,
-            _ => {}
-        }
+    if !auto_gc_check_due(&stamp) {
+        return false;
     }
 
     // Physical on-disk bytes, not the logical per-entry sum: the logical
@@ -542,11 +536,7 @@ fn auto_gc_wanted(config: &Config, store: &Store) -> bool {
     }
 
     // Exceeded threshold — claim this check slot before spawning GC
-    let now_str = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs().to_string())
-        .unwrap_or_default();
-    if std::fs::write(&stamp, now_str).is_err() {
+    if !claim_auto_gc_check(config, &stamp) {
         return false;
     }
 
@@ -556,6 +546,42 @@ fn auto_gc_wanted(config: &Config, store: &Store) -> bool {
         swept.max_size,
         AUTO_GC_SLACK_PERCENT
     );
+    true
+}
+
+/// Whether the check interval has passed since a check last claimed `stamp`.
+fn auto_gc_check_due(stamp: &Path) -> bool {
+    if let Ok(meta) = std::fs::metadata(stamp) {
+        match meta.modified().ok().and_then(|m| m.elapsed().ok()) {
+            Some(age) if age < AUTO_GC_CHECK_INTERVAL => return false,
+            // `elapsed()` errs when the mtime is in the future (clock skew /
+            // another process just touched it) — treat as fresh and skip.
+            None => return false,
+            _ => {}
+        }
+    }
+    true
+}
+
+/// Claim the check slot by rewriting `stamp`. Without a free-space floor, a
+/// stamp that cannot be written drops the check, as it always has. With one,
+/// the volume is likely full, which is what recovery is for: only the
+/// stamp's mtime is ever read, so it is moved to now where that works, and
+/// the check goes ahead either way.
+fn claim_auto_gc_check(config: &Config, stamp: &Path) -> bool {
+    let now_str = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs().to_string())
+        .unwrap_or_default();
+    if std::fs::write(stamp, now_str).is_ok() {
+        return true;
+    }
+    if config.auto_recover_min_free_bytes == 0 {
+        return false;
+    }
+    if let Err(e) = filetime::set_file_mtime(stamp, filetime::FileTime::now()) {
+        tracing::debug!("auto-gc: could not touch {}: {e}", stamp.display());
+    }
     true
 }
 
@@ -571,6 +597,50 @@ pub(crate) fn maybe_spawn_auto_gc(config: &Config, store: &Store) {
     );
 }
 
+/// After a put that failed. One the volume refused for lack of space never
+/// reaches [`maybe_spawn_auto_gc`], which follows only a put that succeeded,
+/// so with a free-space floor set this asks for recovery itself. It skips
+/// the store size query and keeps the check interval.
+pub(crate) fn maybe_recover_after_failed_put(
+    config: &Config,
+    store: &Store,
+    error: &anyhow::Error,
+) {
+    if !is_storage_full(error) || !recovery_wanted_after_full_put(config, store) {
+        return;
+    }
+    tracing::info!(
+        "auto-gc: the volume of {} is full, requesting recovery",
+        store.cache_dir().display()
+    );
+    request_auto_gc(config, crate::daemon::send_gc_hint, spawn_auto_gc_worker);
+}
+
+/// Whether `error` says the volume ran out of space, at any depth of its
+/// context chain: `ENOSPC` from a file, or `SQLITE_FULL` from the index.
+fn is_storage_full(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::StorageFull)
+            || cause
+                .downcast_ref::<rusqlite::Error>()
+                .and_then(rusqlite::Error::sqlite_error_code)
+                == Some(rusqlite::ErrorCode::DiskFull)
+    })
+}
+
+/// Whether the store a put found full should be recovered now: recovery is
+/// on and due for it, and no check has claimed this interval. Claims it.
+fn recovery_wanted_after_full_put(config: &Config, store: &Store) -> bool {
+    let swept = config.for_store_dir(store.cache_dir(), crate::volume_gc::filesystem_bytes);
+    let stamp = auto_gc_stamp_path(&config.cache_dir);
+    if !crate::disk_recovery::wanted(&swept) || !auto_gc_check_due(&stamp) {
+        return false;
+    }
+    claim_auto_gc_check(config, &stamp)
+}
+
 /// A running daemon owns automatic eviction, so it gets a hint and nothing is
 /// spawned. With no daemon, or one that does not know the hint, the detached
 /// worker sweeps. The throttle stamp covers both, so a build sends at most
@@ -584,6 +654,15 @@ fn run_auto_gc_check(
     if !auto_gc_wanted(config, store) {
         return;
     }
+    request_auto_gc(config, hint_daemon, spawn_worker);
+}
+
+/// Hint a running daemon, or spawn the worker when no daemon takes the hint.
+fn request_auto_gc(
+    config: &Config,
+    hint_daemon: impl FnOnce(&Config) -> bool,
+    spawn_worker: impl FnOnce(&Config),
+) {
     if hint_daemon(config) {
         tracing::info!("auto-gc: handed the sweep to the daemon");
         return;
@@ -1404,6 +1483,7 @@ pub fn run_nvcc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
                     tracing::warn!(
                         "failed to store nvcc cache entry for {crate_name}: {store_error}"
                     );
+                    maybe_recover_after_failed_put(config, &store, &e);
                 }
             },
             Err(e) => {
@@ -2391,6 +2471,7 @@ fn run_cc_with_store(
                             crate_name,
                             store_error
                         );
+                        maybe_recover_after_failed_put(config, store, &e);
                     }
                 }
             }
@@ -4456,6 +4537,7 @@ fn run_parsed_rustc(
                 crate_name,
                 store_error
             );
+            maybe_recover_after_failed_put(config, &store, &e);
         }
     }
     drop(trace_store);

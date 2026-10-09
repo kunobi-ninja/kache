@@ -1188,6 +1188,94 @@ fn auto_gc_check_does_nothing_under_the_trigger() {
     assert_eq!(called.load(Ordering::SeqCst), 0);
 }
 
+/// A volume too full to rewrite the throttle stamp still gets its sweep
+/// once a free-space floor is set. Without a floor the check gives up, as
+/// it always has.
+#[test]
+fn an_unwritable_stamp_drops_the_check_only_without_a_floor() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = test_config(dir.path().to_path_buf());
+    cfg.max_size = 1024;
+    let store = Store::open(&cfg).unwrap();
+    put_test_entry(&store, dir.path(), "over-budget");
+    // A directory in the stamp's place refuses the write, as a full volume
+    // would, but still takes a new mtime.
+    let stamp = auto_gc_stamp_path(&cfg.cache_dir);
+    std::fs::create_dir(&stamp).unwrap();
+    let expired = std::time::SystemTime::now() - AUTO_GC_CHECK_INTERVAL * 2;
+    filetime::set_file_mtime(&stamp, filetime::FileTime::from_system_time(expired)).unwrap();
+    assert!(
+        !auto_gc_wanted(&cfg, &store),
+        "no floor: dropped, as before"
+    );
+
+    cfg.auto_recover_min_free_bytes = 1;
+    assert!(auto_gc_wanted(&cfg, &store));
+    assert!(
+        !auto_gc_wanted(&cfg, &store),
+        "the touched stamp keeps the interval"
+    );
+
+    // Neither written nor touched: every check goes ahead.
+    #[cfg(unix)]
+    {
+        std::fs::remove_dir(&stamp).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("missing/stamp"), &stamp).unwrap();
+        assert!(auto_gc_wanted(&cfg, &store));
+        assert!(auto_gc_wanted(&cfg, &store));
+    }
+}
+
+/// A put that finds the volume full never reaches the check after a stored
+/// entry, so it asks for recovery itself: only with a free-space floor set,
+/// and once per check interval.
+#[test]
+#[cfg(unix)]
+fn a_put_refused_for_lack_of_space_asks_for_recovery() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = test_config(dir.path().to_path_buf());
+    let store = Store::open(&cfg).unwrap();
+    let daemon =
+        RemoteCheckReplyDaemon::with_reply(cfg.socket_path(), serde_json::json!({ "ok": true }));
+    wait_until_reachable(&cfg.socket_path());
+    let full = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::StorageFull))
+        .context("copying out.o into store staging");
+    let denied = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+
+    maybe_recover_after_failed_put(&cfg, &store, &full);
+    assert_eq!(daemon.request_count(), 0, "no floor: nothing new");
+
+    cfg.auto_recover_min_free_bytes = kache_fs::volume_usage(dir.path()).unwrap().total;
+    maybe_recover_after_failed_put(&cfg, &store, &denied);
+    assert_eq!(daemon.request_count(), 0, "not a full volume");
+    maybe_recover_after_failed_put(&cfg, &store, &full);
+    assert_eq!(daemon.request_count(), 1);
+    maybe_recover_after_failed_put(&cfg, &store, &full);
+    assert_eq!(daemon.request_count(), 1, "one request per check interval");
+}
+
+#[test]
+fn only_a_volume_out_of_space_counts_as_full() {
+    let io = |kind| anyhow::Error::new(std::io::Error::from(kind));
+    assert!(is_storage_full(
+        &io(std::io::ErrorKind::StorageFull).context("copying out.o into store staging")
+    ));
+    assert!(!is_storage_full(&io(std::io::ErrorKind::PermissionDenied)));
+    let sqlite = |code| {
+        anyhow::Error::new(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(code),
+            None,
+        ))
+    };
+    assert!(is_storage_full(
+        &sqlite(rusqlite::ffi::SQLITE_FULL).context("registering the entry")
+    ));
+    assert!(!is_storage_full(&sqlite(rusqlite::ffi::SQLITE_BUSY)));
+    assert!(!is_storage_full(&anyhow::anyhow!(
+        "refusing to cache zero-byte artifact"
+    )));
+}
+
 /// Another driver's fruitless sweep holds the worker back as well.
 #[test]
 fn auto_gc_worker_waits_out_a_backoff_another_driver_left() {

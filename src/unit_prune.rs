@@ -19,6 +19,8 @@
 //! neither read nor written since, and arms the rest again. It does nothing
 //! on a filesystem where reads never move an access time (`noatime`), or on
 //! one that is not local, where Cargo does not lock its build directories.
+//! When the probe for reads cannot run, as on a full volume, the target
+//! keeps its arming and waits for the next pass.
 //!
 //! Both of Cargo's layouts are handled (see [`crate::cargo_layout`]):
 //!
@@ -43,7 +45,7 @@ use std::time::{Duration, SystemTime};
 /// version, and the build and artifact locks from 1.100.
 const LOCKS: [&str; 3] = [".cargo-lock", ".cargo-build-lock", ".cargo-artifact-lock"];
 
-/// Name of the file [`reads_visible`] reads.
+/// Name of the file [`probe_reads`] reads.
 const PROBE: &str = ".kache-atime-probe";
 
 /// Directory under the cache dir holding when each target was armed.
@@ -61,7 +63,9 @@ pub(crate) struct Pruned {
 
 /// Whether reading a file in `dir` whose access time is older than its
 /// modification time moves the access time, which is what arming relies on.
-pub(crate) fn reads_visible(dir: &Path) -> bool {
+/// An error means the probe could not run: a full volume refuses its file,
+/// which says nothing about reads.
+fn probe_reads(dir: &Path) -> std::io::Result<bool> {
     let probe = dir.join(format!("{PROBE}-{}", std::process::id()));
     let moved = (|| -> std::io::Result<bool> {
         std::fs::write(&probe, b"probe")?;
@@ -71,7 +75,13 @@ pub(crate) fn reads_visible(dir: &Path) -> bool {
         Ok(moved_past(accessed, armed))
     })();
     let _ = std::fs::remove_file(&probe);
-    moved.unwrap_or(false)
+    moved
+}
+
+/// [`probe_reads`], counting a probe that could not run as no.
+#[cfg(test)]
+pub(crate) fn reads_visible(dir: &Path) -> bool {
+    probe_reads(dir).unwrap_or(false)
 }
 
 /// Whether `accessed` is later than the `armed` access time: a read moved it.
@@ -267,16 +277,22 @@ pub(crate) fn unused_since(cache_dir: &Path, target_dir: &Path) -> Option<System
 /// Like [`prune`], it needs a local filesystem that shows reads; elsewhere it
 /// forgets any earlier watch, so the target never counts as unused.
 pub(crate) fn watch(cache_dir: &Path, target_dir: &Path, now: SystemTime, not_before: SystemTime) {
+    watch_with(cache_dir, target_dir, now, not_before, shows_reads);
+}
+
+/// [`watch`], asking `shows_reads` whether arming works in `target_dir`.
+fn watch_with(
+    cache_dir: &Path,
+    target_dir: &Path,
+    now: SystemTime,
+    not_before: SystemTime,
+    shows_reads: impl FnOnce(&Path) -> std::io::Result<bool>,
+) {
     let Ok(Some(_reservation)) = crate::target_use::try_exclusive(cache_dir) else {
         return;
     };
     let record = armed_record(cache_dir, target_dir);
-    let local = matches!(
-        crate::cache_fs::classify(&crate::cache_fs::probe(target_dir)),
-        crate::cache_fs::CacheFsVerdict::Local
-    );
-    if !can_prune(local, || reads_visible(target_dir)) {
-        let _ = std::fs::remove_file(&record);
+    if !can_arm(&record, target_dir, shows_reads) {
         return;
     }
     if unused_since(cache_dir, target_dir).is_some_and(|since| since >= not_before) {
@@ -356,25 +372,69 @@ pub(crate) fn prune(
     window: Duration,
     now: SystemTime,
 ) -> Pruned {
+    prune_with(cache_dir, target_dir, window, now, shows_reads)
+}
+
+/// [`prune`], asking `shows_reads` whether arming works in `target_dir`.
+fn prune_with(
+    cache_dir: &Path,
+    target_dir: &Path,
+    window: Duration,
+    now: SystemTime,
+    shows_reads: impl FnOnce(&Path) -> std::io::Result<bool>,
+) -> Pruned {
     let Ok(Some(_reservation)) = crate::target_use::try_exclusive(cache_dir) else {
         return Pruned::default();
     };
-    let local = matches!(
-        crate::cache_fs::classify(&crate::cache_fs::probe(target_dir)),
-        crate::cache_fs::CacheFsVerdict::Local
-    );
-    if !can_prune(local, || reads_visible(target_dir)) {
-        // An arming here would no longer show reads: forget it.
-        let _ = std::fs::remove_file(armed_record(cache_dir, target_dir));
+    if !can_arm(
+        &armed_record(cache_dir, target_dir),
+        target_dir,
+        shows_reads,
+    ) {
         return Pruned::default();
     }
     judge(cache_dir, target_dir, window, now)
 }
 
+/// Whether this pass may arm `target_dir`, by `shows_reads`. Where reads do
+/// not show, an arming would no longer vouch for anything, so its `record`
+/// is forgotten. A probe that could not run, as on a full volume, says
+/// nothing about reads: the target waits for the next pass with its record.
+fn can_arm(
+    record: &Path,
+    target_dir: &Path,
+    shows_reads: impl FnOnce(&Path) -> std::io::Result<bool>,
+) -> bool {
+    match shows_reads(target_dir) {
+        Ok(true) => true,
+        Ok(false) => {
+            let _ = std::fs::remove_file(record);
+            false
+        }
+        Err(error) => {
+            tracing::debug!(
+                "skipping {} this pass: cannot tell whether reads show there: {error}",
+                target_dir.display()
+            );
+            false
+        }
+    }
+}
+
+/// [`can_prune`] for `target_dir`: the filesystem's locality, then the probe.
+/// An error means the probe could not run.
+fn shows_reads(target_dir: &Path) -> std::io::Result<bool> {
+    let local = matches!(
+        crate::cache_fs::classify(&crate::cache_fs::probe(target_dir)),
+        crate::cache_fs::CacheFsVerdict::Local
+    );
+    can_prune(local, || probe_reads(target_dir))
+}
+
 /// Pruning needs a local filesystem, where Cargo locks its build
 /// directories, that also shows reads. `reads` is only asked when local.
-fn can_prune(local: bool, reads: impl FnOnce() -> bool) -> bool {
-    local && reads()
+fn can_prune(local: bool, reads: impl FnOnce() -> std::io::Result<bool>) -> std::io::Result<bool> {
+    Ok(local && reads()?)
 }
 
 /// Arm `target_dir`, wait out `window`, then remove what was not used; the
@@ -678,6 +738,11 @@ mod tests {
         }
         assert!(entries(dir.path()).is_empty(), "the probe is removed");
         assert!(!reads_visible(&dir.path().join("missing")));
+        assert_eq!(
+            probe_reads(&dir.path().join("missing")).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound,
+            "a probe that cannot run is not a probe that saw no read"
+        );
         let armed = filetime::FileTime::from_unix_time(1_000, 0);
         assert!(moved_past(
             filetime::FileTime::from_unix_time(1_001, 0),
@@ -938,12 +1003,15 @@ mod tests {
 
     #[test]
     fn needs_a_local_filesystem_that_shows_reads() {
-        assert!(can_prune(true, || true));
-        assert!(!can_prune(true, || false));
-        assert!(!can_prune(false, || true));
-        assert!(!can_prune(false, || panic!(
-            "not asked off a local filesystem"
-        )));
+        assert!(can_prune(true, || Ok(true)).unwrap());
+        assert!(!can_prune(true, || Ok(false)).unwrap());
+        assert!(!can_prune(false, || Ok(true)).unwrap());
+        assert!(!can_prune(false, || panic!("not asked off a local filesystem")).unwrap());
+        let full = || Err(std::io::Error::from(std::io::ErrorKind::StorageFull));
+        assert_eq!(
+            can_prune(true, full).unwrap_err().kind(),
+            std::io::ErrorKind::StorageFull
+        );
     }
 
     #[test]
@@ -956,6 +1024,11 @@ mod tests {
             prune(&cache, &missing, window, SystemTime::now()),
             Pruned::default()
         );
+        assert_eq!(
+            read_armed(&armed_record(&cache, &missing)),
+            None,
+            "a missing target is never armed"
+        );
         let target = dir.path().join("target");
         per_unit_profile(&target.join("debug"));
         set_times(&target, ago(60));
@@ -963,6 +1036,46 @@ mod tests {
         let armed = read_armed(&armed_record(&cache, &target));
         // Arming happens only where reads show, and only then is it recorded.
         assert_eq!(armed.is_some(), reads_visible(&target));
+    }
+
+    #[test]
+    fn a_probe_that_cannot_run_keeps_the_arming() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        let target = dir.path().join("target");
+        let profile = target.join("debug");
+        per_unit_profile(&profile);
+        set_times(&target, ago(60));
+        let record = armed_record(&cache, &target);
+        write_armed(&record, ago(40)).unwrap();
+        let armed = read_armed(&record);
+        let window = Duration::from_secs(30 * DAY);
+        let now = SystemTime::now();
+        // A full volume refuses the probe's file.
+        let full = |_: &Path| -> std::io::Result<bool> {
+            Err(std::io::Error::from(std::io::ErrorKind::StorageFull))
+        };
+        // Judged now, both units would go, and a watch would arm again.
+        assert_eq!(
+            prune_with(&cache, &target, window, now, full),
+            Pruned::default()
+        );
+        assert_eq!(read_armed(&record), armed, "prune kept the arming");
+        assert_eq!(units(&profile).len(), 2, "prune skipped the target");
+        watch_with(&cache, &target, now, ago(30), full);
+        assert_eq!(read_armed(&record), armed, "watch kept the arming");
+
+        // Reads that do not show still forget it.
+        let hidden = |_: &Path| -> std::io::Result<bool> { Ok(false) };
+        watch_with(&cache, &target, now, ago(30), hidden);
+        assert_eq!(read_armed(&record), None);
+        write_armed(&record, ago(40)).unwrap();
+        assert_eq!(
+            prune_with(&cache, &target, window, now, hidden),
+            Pruned::default()
+        );
+        assert_eq!(read_armed(&record), None);
+        assert_eq!(units(&profile).len(), 2);
     }
 
     #[test]

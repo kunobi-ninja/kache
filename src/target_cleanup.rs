@@ -33,7 +33,9 @@
 use crate::config::Config;
 use crate::maintenance::{Trigger, is_quiet, unix_now_secs};
 use crate::store::{Store, TrackedTargetRoot};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime};
 
 /// How often a quiet machine is checked.
@@ -56,6 +58,21 @@ fn last_check(cache_dir: &Path) -> u64 {
         .ok()
         .and_then(|text| text.trim().parse().ok())
         .unwrap_or(0)
+}
+
+/// When this process last checked each cache dir whose record it could not
+/// write. On a full volume every write of the record fails; this keeps the
+/// process to the same hourly pace.
+static UNRECORDED: Mutex<BTreeMap<PathBuf, u64>> = Mutex::new(BTreeMap::new());
+
+fn unrecorded() -> MutexGuard<'static, BTreeMap<PathBuf, u64>> {
+    UNRECORDED.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// This process's last check of `cache_dir` without a record, `0` when
+/// there is none.
+fn last_unrecorded(cache_dir: &Path) -> u64 {
+    unrecorded().get(cache_dir).copied().unwrap_or(0)
 }
 
 /// Why a target directory was removed.
@@ -125,12 +142,16 @@ pub(crate) fn due(
         || config.auto_clean_idle_targets_days > 0
         || config.auto_clean_unused_units_days > 0
         || config.auto_recover_min_free_bytes > 0;
-    // A clock set back behind the record does not stop the checks.
-    let waited = last == 0 || now < last || now - last >= INTERVAL.as_secs();
     enabled
         && matches!(trigger, Trigger::Periodic(_))
-        && waited
+        && waited(last, now)
         && is_quiet(permits, trigger.idle_for())
+}
+
+/// Whether an hour has passed since a check at `last`, `0` for none. A clock
+/// set back behind it does not stop the checks.
+fn waited(last: u64, now: u64) -> bool {
+    last == 0 || now < last || now - last >= INTERVAL.as_secs()
 }
 
 /// The maintenance step. Logs what it removed.
@@ -140,14 +161,19 @@ pub(crate) fn due(
 pub(crate) fn run(config: &Config, trigger: Trigger<'_>) -> bool {
     let now = unix_now_secs();
     let permits = crate::scheduler::permits_in_use(&config.cache_dir);
-    if !due(config, trigger, permits, last_check(&config.cache_dir), now) {
+    if !due(config, trigger, permits, last_check(&config.cache_dir), now)
+        || !waited(last_unrecorded(&config.cache_dir), now)
+    {
         return false;
     }
     let record = config.cache_dir.join(LAST_CHECK_FILE);
-    // The record is what keeps the checks hourly.
+    // A full volume refuses the record just when cleanup is needed most:
+    // clean anyway, and keep this process hourly from memory instead.
     if let Err(error) = crate::atomic::atomic_replace(&record, now.to_string().as_bytes()) {
-        tracing::warn!("skipping target directory cleanup: cannot record the time: {error:#}");
-        return false;
+        tracing::warn!(
+            "cannot record the target directory cleanup time, cleaning anyway: {error:#}"
+        );
+        unrecorded().insert(config.cache_dir.clone(), now);
     }
     match sweep(config, now) {
         Ok(swept) => {
@@ -1759,22 +1785,34 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn skips_the_check_when_the_time_cannot_be_recorded() {
+    fn cleans_hourly_when_the_time_cannot_be_recorded() {
         use std::os::unix::fs::PermissionsExt;
         let root = tempfile::tempdir().unwrap();
         let cache = tempfile::tempdir().unwrap();
         let orphans = config(cache.path(), true, 0);
         let store = Store::open(&orphans).unwrap();
+        let quiet = RequestClock::idle();
         let gone = orphan(&store, root.path(), "gone");
         age(&store, DAY_SECS);
-        // The record's path is taken by a directory.
+        // The record's path is taken by a directory, so every write of the
+        // record fails, as on a full volume.
         std::fs::create_dir(cache.path().join(LAST_CHECK_FILE)).unwrap();
         std::fs::set_permissions(
             cache.path().join(LAST_CHECK_FILE),
             std::fs::Permissions::from_mode(0o755),
         )
         .unwrap();
-        run(&orphans, Trigger::Periodic(&RequestClock::idle()));
-        assert!(gone.exists());
+        assert!(run(&orphans, Trigger::Periodic(&quiet)));
+        assert!(!gone.exists(), "cleaned without a record");
+
+        // This process keeps the hour without the record.
+        let next = orphan(&store, root.path(), "next");
+        age(&store, DAY_SECS);
+        assert!(!run(&orphans, Trigger::Periodic(&quiet)));
+        assert!(next.exists());
+        let hour_ago = unix_now_secs() - INTERVAL.as_secs();
+        unrecorded().insert(orphans.cache_dir.clone(), hour_ago);
+        assert!(run(&orphans, Trigger::Periodic(&quiet)));
+        assert!(!next.exists(), "the next hour cleans");
     }
 }

@@ -355,6 +355,37 @@ async fn a_failing_credential_process_stops_the_chain() {
     assert_eq!(role.calls(), 0);
 }
 
+/// A `credential_process` child gets the profile the chain reads as its
+/// `AWS_PROFILE`, so a helper that calls AWS tooling answers for that
+/// profile. The helper here returns the variable as its key ID. The child
+/// inherits this process's environment, not the signing context's, so only
+/// the chain can set it.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_credential_process_gets_the_profile_the_chain_reads() {
+    let home = AwsHome::new(None, None);
+    let script = home.path().join("whoami.sh");
+    std::fs::write(
+        &script,
+        r#"printf '{"Version":1,"AccessKeyId":"%s","SecretAccessKey":"secret"}' "$AWS_PROFILE""#,
+    )
+    .unwrap();
+    std::fs::write(
+        home.config(),
+        format!(
+            "[profile build]\ncredential_process = sh {}\n",
+            script.display()
+        ),
+    )
+    .unwrap();
+    let credential = chain(None, Some("build"), &InstanceRole::default())
+        .provide_credential(&home.context(&[]))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(credential.access_key_id, "build");
+}
+
 #[tokio::test]
 async fn an_expired_sso_token_stops_the_chain() {
     let home = AwsHome::new(

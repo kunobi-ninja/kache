@@ -868,11 +868,7 @@ fn validated(config: &Config, target: &Path, workspace: &Path) -> Result<Receipt
                     .any(|c| c == std::path::Component::ParentDir),
                 "parent traversal in unit path"
             );
-            for parent in part.ancestors().take_while(|p| *p != target) {
-                if let Ok(metadata) = std::fs::symlink_metadata(parent) {
-                    ensure!(!metadata.is_symlink(), "symlink in unit path");
-                }
-            }
+            reject_symlink_ancestors(part, &target)?;
         }
         ensure!(
             unit.fingerprint.starts_with(&target),
@@ -892,6 +888,15 @@ fn validated(config: &Config, target: &Path, workspace: &Path) -> Result<Receipt
         }
     }
     Ok(receipt)
+}
+
+fn reject_symlink_ancestors(part: &Path, target: &Path) -> Result<()> {
+    for parent in part.ancestors().take_while(|p| *p != target) {
+        if let Ok(metadata) = std::fs::symlink_metadata(parent) {
+            ensure!(!metadata.is_symlink(), "symlink in unit path");
+        }
+    }
+    Ok(())
 }
 
 fn eligible(unit: &ObservedUnit, window: Option<Duration>, now: SystemTime) -> bool {
@@ -1220,6 +1225,60 @@ mod tests {
             },
         );
         assert!(!eligible(&multiple, Some(Duration::from_secs(10)), now));
+    }
+
+    #[test]
+    fn preview_without_a_receipt_reports_unavailable_and_a_capture_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        let target = workspace.join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(workspace.join("Cargo.toml"), "[workspace]\n").unwrap();
+        std::fs::write(
+            target.join("CACHEDIR.TAG"),
+            "Signature: 8a477f597d28d172789f06886806bc55",
+        )
+        .unwrap();
+        let config = crate::test_support::test_config(dir.path().join("cache"));
+        let plan = preview(&config, &target, &workspace);
+        assert!(plan.status.starts_with("unavailable: "), "{plan:?}");
+        assert_eq!(
+            plan.command,
+            ["KACHE_TARGET_LIVENESS=1", "kache", "cargo", "check"]
+        );
+        assert_eq!(
+            (plan.units, plan.bytes, plan.protected, plan.unknown),
+            (0, 0, 0, 0)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unit_paths_reject_symlinks_at_the_leaf_and_each_ancestor() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        let actual = target.join("debug/actual");
+        std::fs::create_dir_all(&actual).unwrap();
+        let file = actual.join("output.rlib");
+        std::fs::write(&file, "artifact").unwrap();
+        assert!(reject_symlink_ancestors(&file, &target).is_ok());
+        assert!(reject_symlink_ancestors(&actual.join("missing"), &target).is_ok());
+        let alias = target.join("debug/alias");
+        std::os::unix::fs::symlink(&actual, &alias).unwrap();
+        for part in [
+            alias.clone(),
+            alias.join("output.rlib"),
+            alias.join("missing"),
+        ] {
+            assert!(
+                reject_symlink_ancestors(&part, &target).is_err(),
+                "{}",
+                part.display()
+            );
+        }
+        let linked_file = actual.join("linked.rlib");
+        std::os::unix::fs::symlink(&file, &linked_file).unwrap();
+        assert!(reject_symlink_ancestors(&linked_file, &target).is_err());
     }
 
     #[test]

@@ -373,7 +373,6 @@ fn variables_cargo_sets_on_rustc_count_by_name_only() {
         "CARGO_TARGET_TMPDIR",
         "CARGO_SBOM_PATH",
         "OUT_DIR",
-        "BUILD_OUT_DIR",
         "CARGO_PKG_NAME",
         "CARGO_BIN_EXE_app",
         DYLIB_PATH,
@@ -387,6 +386,7 @@ fn variables_cargo_sets_on_rustc_count_by_name_only() {
         "OUT_DIRX",
         "CARGO_ENCODED_RUSTFLAGS",
         "TAURI_CONFIG",
+        "ASSET_OUT_DIR",
     ] {
         assert!(!set_by_cargo(name), "{name}");
     }
@@ -394,6 +394,60 @@ fn variables_cargo_sets_on_rustc_count_by_name_only() {
         set_by_cargo("out_dir"),
         cfg!(windows),
         "variable names compare as the platform compares them"
+    );
+}
+
+/// Cargo sets `<script>_OUT_DIR` only for a package with several build
+/// scripts, to the `OUT_DIR` of each. A variable of the user's that is merely
+/// named that way, such as `WRY_ANDROID_KOTLIN_FILES_OUT_DIR`, counts by value.
+#[test]
+fn a_variable_named_like_an_out_dir_counts_by_value_unless_it_holds_one() {
+    let fixture = Fixture::new();
+    fixture.declare("cargo:rerun-if-env-changed=ASSET_OUT_DIR\n");
+    let aaa = fixture.digest(&[("ASSET_OUT_DIR", "aaa")]);
+    assert_ne!(fixture.digest(&[("ASSET_OUT_DIR", "bbb")]), aaa);
+    assert_ne!(fixture.digest(&[]), aaa, "set is not unset");
+
+    let digest = |name: &str, out_dir: PathBuf| {
+        fixture.declare(&format!("cargo:rerun-if-env-changed={name}\n"));
+        fixture.digest(&[(name, out_dir.to_str().unwrap())])
+    };
+    let script = |profile: &str, unit: &str| {
+        fixture
+            .root
+            .join("target")
+            .join(profile)
+            .join("build")
+            .join(unit)
+            .join("out")
+    };
+    assert_eq!(
+        digest("ASSET_OUT_DIR", script("debug", "app-1111111111111111")),
+        digest("ASSET_OUT_DIR", script("debug", "app-2222222222222222")),
+        "another OUT_DIR of the package counts by name"
+    );
+    for (why, first, second) in [
+        (
+            "another package's OUT_DIR",
+            script("debug", "other-1111111111111111"),
+            script("debug", "other-2222222222222222"),
+        ),
+        (
+            "an OUT_DIR of another profile",
+            script("release", "app-1111111111111111"),
+            script("release", "app-2222222222222222"),
+        ),
+    ] {
+        assert_ne!(
+            digest("ASSET_OUT_DIR", first),
+            digest("ASSET_OUT_DIR", second),
+            "{why}"
+        );
+    }
+    assert_ne!(
+        digest("ASSETS", script("debug", "app-1111111111111111")),
+        digest("ASSETS", script("debug", "app-2222222222222222")),
+        "a name without the suffix"
     );
 }
 
@@ -416,11 +470,13 @@ fn the_cargo_home_is_found_as_cargo_finds_it() {
 #[test]
 fn names_no_process_can_hold_read_as_unset() {
     let var = vars(&[("", "empty"), ("A=B", "eq"), ("A", "1")]);
-    assert_eq!(env_state("", &var), EnvState::Unset);
-    assert_eq!(env_state("A=B", &var), EnvState::Unset);
-    assert_eq!(env_state("A\0B", &var), EnvState::Unset);
-    assert_eq!(env_state("A", &var), EnvState::Set(b"1".to_vec()));
-    assert_eq!(env_state("B", &var), EnvState::Unset);
+    let located = Fixture::new().located();
+    let state = |name| env_state(name, &var, &located);
+    assert_eq!(state(""), EnvState::Unset);
+    assert_eq!(state("A=B"), EnvState::Unset);
+    assert_eq!(state("A\0B"), EnvState::Unset);
+    assert_eq!(state("A"), EnvState::Set(b"1".to_vec()));
+    assert_eq!(state("B"), EnvState::Unset);
 }
 
 #[test]

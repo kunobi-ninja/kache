@@ -301,7 +301,7 @@ pub(crate) fn resolve(located: &Located, resolver: &Resolver<'_, '_>) -> Result<
         .map(|name| {
             (
                 crate::cache_key::env_name_key_bytes(OsStr::new(name)),
-                env_state(name, resolver.var),
+                env_state(name, resolver.var, located),
             )
         })
         .collect();
@@ -459,7 +459,7 @@ impl Roots {
     }
 }
 
-fn env_state(name: &str, var: &dyn Fn(&str) -> Option<OsString>) -> EnvState {
+fn env_state(name: &str, var: &dyn Fn(&str) -> Option<OsString>, located: &Located) -> EnvState {
     if set_by_cargo(name) {
         return EnvState::SetByCargo;
     }
@@ -468,6 +468,7 @@ fn env_state(name: &str, var: &dyn Fn(&str) -> Option<OsString>) -> EnvState {
         return EnvState::Unset;
     }
     match var(name) {
+        Some(value) if is_script_out_dir(name, &value, located) => EnvState::SetByCargo,
         Some(value) => EnvState::Set(crate::cache_key::env_os_key_bytes(&value)),
         None => EnvState::Unset,
     }
@@ -484,7 +485,23 @@ fn set_by_cargo(name: &str) -> bool {
     SET_BY_CARGO.contains(&name.as_str())
         || name.starts_with("CARGO_PKG_")
         || name.starts_with("CARGO_BIN_EXE_")
-        || name.ends_with("_OUT_DIR")
+}
+
+/// Whether `name` holds the `OUT_DIR` of one of the package's build scripts,
+/// as Cargo sets `<script>_OUT_DIR` for a package with several (an unstable
+/// feature): another `OUT_DIR` of the package in the same profile. Any other
+/// variable named that way is the user's, and counts by its value.
+fn is_script_out_dir(name: &str, value: &OsStr, located: &Located) -> bool {
+    let suffixed = if cfg!(windows) {
+        name.to_ascii_uppercase().ends_with("_OUT_DIR")
+    } else {
+        name.ends_with("_OUT_DIR")
+    };
+    let value = Path::new(value);
+    suffixed
+        && crate::cargo_layout::out_dir_unit_name(value, &located.package).is_some()
+        && crate::cargo_layout::out_dir_profile(value)
+            == crate::cargo_layout::out_dir_profile(&located.out_dir)
 }
 
 fn digest(paths: &BTreeMap<Vec<u8>, String>, vars: &BTreeMap<Vec<u8>, EnvState>) -> String {

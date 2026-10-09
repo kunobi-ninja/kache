@@ -151,6 +151,20 @@ fn build(
     cache: &Path,
     mode: Option<&str>,
 ) -> BTreeMap<String, Value> {
+    let env: Vec<(&str, &str)> = mode.map(|mode| ("APP_MODE", mode)).into_iter().collect();
+    build_units(workspace, target, cache, &UNITS, &env)
+}
+
+/// Builds `workspace` into `target` with `env` set and `APP_MODE` unset
+/// unless `env` sets it, and returns the newest event of each of `units`
+/// this build wrote.
+fn build_units(
+    workspace: &Path,
+    target: &Path,
+    cache: &Path,
+    units: &[&str],
+    env: &[(&str, &str)],
+) -> BTreeMap<String, Value> {
     let mut command = hermetic_command("cargo", cache, Some(&isolated_config_path(cache)));
     command
         .args(["build", "--offline", "--quiet", "--workspace"])
@@ -159,14 +173,13 @@ fn build(
         .env("CARGO_TARGET_DIR", target)
         .env("CARGO_INCREMENTAL", "0")
         .env("KACHE_CACHE_EXECUTABLES", "1")
+        .env_remove("APP_MODE")
         .env_remove("KACHE_BASE_DIR")
         .env_remove("KACHE_DISABLED")
+        .env_remove("KACHE_DEFERRED_DISCOVERY")
         .env_remove("RUSTC_WORKSPACE_WRAPPER")
-        .env_remove("CARGO_ENCODED_RUSTFLAGS");
-    match mode {
-        Some(mode) => command.env("APP_MODE", mode),
-        None => command.env_remove("APP_MODE"),
-    };
+        .env_remove("CARGO_ENCODED_RUSTFLAGS")
+        .envs(env.iter().copied());
     let log = cache.join("events.jsonl");
     let before = std::fs::read_to_string(&log).unwrap_or_default().len();
     let output = command.output().unwrap();
@@ -179,7 +192,7 @@ fn build(
     for line in std::fs::read_to_string(log).unwrap()[before..].lines() {
         let event: Value = serde_json::from_str(line).unwrap();
         if let Some(name) = event["crate_name"].as_str()
-            && UNITS.contains(&name)
+            && units.contains(&name)
         {
             latest.insert(name.to_string(), event);
         }
@@ -307,4 +320,72 @@ fn declared_inputs_of_a_packages_build_script_key_its_units() {
         outputs(&target),
         ["v2:unset", "v2:unset", "v2:unset", "a.txt,b.txt"].map(String::from)
     );
+}
+
+/// The key folds the declared inputs as they were before the compile. A
+/// macro that rewrites its declared file while it expands, then reads it,
+/// leaves an artifact that key does not describe, so it must not be stored.
+#[test]
+fn a_declared_input_that_moves_during_the_compile_is_not_stored() {
+    build_kache();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let cache = root.join("cache");
+    let _daemon = CacheGuard(cache.clone());
+    let checkout = root.join("checkout");
+    write(
+        &checkout.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"pm\", \"live\"]\nresolver = \"2\"\n",
+    );
+    package(&checkout, "pm", "", "[lib]\nproc-macro = true\n");
+    write(
+        &checkout.join("pm/src/lib.rs"),
+        r#"use proc_macro::TokenStream;
+
+#[proc_macro]
+pub fn rewrite(_input: TokenStream) -> TokenStream {
+    let manifest = std::env::var_os("CARGO_MANIFEST_DIR").expect("manifest dir");
+    let path = std::path::PathBuf::from(manifest).join("data/value.txt");
+    std::fs::write(&path, "rewritten\n").expect("write");
+    let value = std::fs::read_to_string(&path).expect("value");
+    format!("{:?}", value.trim()).parse().unwrap()
+}
+"#,
+    );
+    package(&checkout, "live", "pm = { path = \"../pm\" }\n", "");
+    write(
+        &checkout.join("live/build.rs"),
+        "fn main() { println!(\"cargo:rerun-if-changed=data/value.txt\"); }\n",
+    );
+    write(
+        &checkout.join("live/src/lib.rs"),
+        "pub const VALUE: &str = pm::rewrite!();\n",
+    );
+    let value = checkout.join("live/data/value.txt");
+    write(&value, "v1\n");
+    let target = root.join("target");
+
+    // A fresh cache compiles before the key and keys from what the compile
+    // wrote, with the inputs resolved before it.
+    let first = build_units(&checkout, &target, &cache, &["live"], &[]);
+    assert_eq!(result(&first, "live"), "skipped", "{}", first["live"]);
+    assert_eq!(
+        first["live"]["skip_reason"], "build-script-inputs-changed",
+        "{}",
+        first["live"]
+    );
+    // The original content keys the same and finds nothing stored, whether
+    // the compile runs before the key or after a pre-pass.
+    for deferred in ["1", "0"] {
+        edit(&value, "v1\n");
+        let again = build_units(
+            &checkout,
+            &target,
+            &cache,
+            &["live"],
+            &[("KACHE_DEFERRED_DISCOVERY", deferred)],
+        );
+        assert_eq!(key(&again, "live"), key(&first, "live"), "{deferred}");
+        assert_eq!(result(&again, "live"), "skipped", "{}", again["live"]);
+    }
 }

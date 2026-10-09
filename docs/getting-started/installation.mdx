@@ -86,6 +86,8 @@ kache init
 
 ## Nix
 
+The flake builds for x86_64-linux, aarch64-linux and aarch64-darwin. On Intel macOS, use Homebrew, a release binary or `cargo install`.
+
 The `stable` branch follows released versions:
 
 ```bash
@@ -96,10 +98,10 @@ nix profile install github:kunobi-ninja/kache/stable
 Pin a release tag when updates must be explicit:
 
 ```bash
-nix profile install github:kunobi-ninja/kache/v0.28.1
+nix profile install github:kunobi-ninja/kache/v1.0.0
 ```
 
-The flake also exports an overlay, NixOS module, and nix-darwin module. See the repository [`flake.nix`](https://github.com/kunobi-ninja/kache/blob/main/flake.nix) for their current names and options.
+The flake also exports `overlays.default`, `nixosModules.default` and `darwinModules.default`. The module's `services.kache` options are defined in [`packaging/nix/module.nix`](https://github.com/kunobi-ninja/kache/blob/main/packaging/nix/module.nix). `enable` installs Kache, writes `settings` to `/etc/kache/config.toml` and sets `KACHE_CONFIG`. `rustcWrapper`, on by default, sets `RUSTC_WRAPPER`. `daemon.enable` runs the daemon as a systemd or launchd user service. The module does not put the shims on `PATH`; use the example below for that.
 
 The package includes `cargo`, `cc`, `c++`, `gcc`, `g++`, `clang`, `clang++`, and `rustdoc` symlinks in `${kache}/shims`. With this flake's `overlays.default` applied, enable them in your NixOS configuration:
 
@@ -125,6 +127,10 @@ Keep the real compilers later in `PATH`. The compiler shims cover C and C++; Rus
 | Windows, MSVC | x86_64, ARM64 |
 
 Other Rust-supported targets may work through `cargo install`, but they are not release-tested targets.
+
+## Shell completions
+
+The official AUR packages install completions for Bash, Zsh, Fish and Elvish. For other installs, generate a script with [`kache completions <shell>`](/docs/commands/reference#kache-completions) and save it where your shell loads completions.
 
 ## Verify the install
 

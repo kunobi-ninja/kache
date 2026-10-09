@@ -14,7 +14,7 @@ bucket = "my-build-cache"
 region = "eu-west-1"
 ```
 
-The region defaults to `us-east-1`. Set the actual bucket region for AWS.
+The region defaults to `us-east-1`. Kache does not read `AWS_REGION` or `AWS_DEFAULT_REGION`, so set the bucket's region in `region` or `KACHE_S3_REGION`. With a wrong region, `kache doctor` fails the remote check and, when S3 reports it, names the bucket's actual region.
 
 <Tabs items={["AWS S3", "Cloudflare R2", "Ceph or MinIO"]}>
   <Tab value="AWS S3">
@@ -59,9 +59,9 @@ Kache checks these sources in order:
 5. environment-based web identity
 6. ECS/task credentials, then EC2 instance credentials
 
-Both explicit `KACHE_S3_*` credential variables are required. If only one is present, Kache warns and continues down the standard credential chain.
+Both explicit `KACHE_S3_*` credential variables are required. If only one is present, Kache warns and continues down the standard credential chain. There is no session-token variable for them, so pass temporary credentials through `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and `AWS_SESSION_TOKEN`.
 
-The configuration fields also have environment overrides:
+These environment variables override the fields of an S3 remote; a `gcs`, `oci` or `filesystem` remote ignores them:
 
 | Environment | TOML field |
 | --- | --- |
@@ -72,7 +72,9 @@ The configuration fields also have environment overrides:
 | `KACHE_S3_PROFILE` | `profile` |
 | `KACHE_S3_USER_AGENT` | `user_agent` |
 
-For a persistent daemon, put remote settings in the config file or service definition. An auto-started daemon does not take per-build remote variables from the build that started it. `kache doctor` and `kache stats` report mismatches between client and daemon configuration.
+`KACHE_S3_BUCKET` alone configures an S3 remote, and a `KACHE_S3_BUCKET` that is set but empty turns off the bucket the config file names.
+
+For a persistent daemon, put remote settings in the config file or service definition. A daemon Kache starts in the background drops the six variables above and `KACHE_LOCAL_ONLY` from the environment it inherits, and keeps the rest, including credentials, `AWS_PROFILE` and `AWS_ENDPOINT_URL_S3`. `kache stats` warns when the daemon's configuration differs from this shell's, and its `Remote` row shows the remote the daemon uses.
 
 ## Compatibility boundaries
 

@@ -3,7 +3,7 @@ title: Bound a remote
 description: Let the store expire old objects; Kache never deletes remotely
 ---
 
-A remote cache grows until the store removes old objects, through an S3 lifecycle rule or a prune job run by the owner of a shared directory. Kache reads and writes remote objects and never deletes them, so a policy can run at any time without pausing builds.
+A remote cache grows until the store removes old objects: a lifecycle rule on S3 or GCS, a retention policy on an OCI registry, or a prune job run by the owner of a shared directory. Kache reads and writes remote objects and never deletes them, so a policy can run at any time without pausing builds.
 
 ## What the layout needs from a policy
 
@@ -12,22 +12,18 @@ A remote cache grows until the store removes old objects, through an S3 lifecycl
 {prefix}/v3/packs/{crate}/{key}.tar.zst       ... and the pack it describes
 {prefix}/v3/predictions/...                   input prediction rows
 {prefix}/_manifests/...                       build manifests and shards
-{prefix}/v4/prefetch/catalogs/...             prefetch catalogs
-{prefix}/v4/prefetch/packs/...                content-addressed prefetch packs
-{prefix}/v4/prefetch/pack-meta/...            metadata for those packs
 ```
 
-Three rules keep the store consistent under expiry:
+Two rules keep the store consistent under expiry:
 
 - Expire `v3/manifests/` and `v3/packs/` with the same age. A manifest and its pack are written together and neither is rewritten, so they age together. A manifest that outlives its pack is a miss; a pack that outlives its manifest is unreachable garbage.
-- Expire `v4/prefetch/catalogs/` sooner than `v4/prefetch/packs/` and `pack-meta/`. Packs are shared between catalog generations, so a live catalog must never point at an expired pack.
 - Expire by age since the object was written. Kache never rewrites an entry's manifest or pack, so a hot entry expires too and is uploaded again on the next miss. Build manifests and prediction rows are written again each time they are used, so they expire only when idle. An expired prediction row costs one dep-info pre-pass. Pick an age longer than the interval at which your builds change.
 
 An expired object is a miss. With `cache.remote_key_listing` on, the daemon's remote key index can report an object present for up to `cache.remote_key_cache_refresh_secs` after it expired; the fetch then misses and the crate compiles as usual.
 
 ## S3 lifecycle rules
 
-Thirty days for artifacts and fourteen for catalogs is a reasonable start. Every provider below applies the rule on its own schedule, usually once a day.
+Thirty days is a reasonable start. Every provider below applies the rule on its own schedule, usually once a day.
 
 **AWS S3**
 
@@ -35,10 +31,7 @@ Thirty days for artifacts and fourteen for catalogs is a reasonable start. Every
 {
   "Rules": [
     { "ID": "kache-v3", "Status": "Enabled", "Filter": { "Prefix": "artifacts/v3/" }, "Expiration": { "Days": 30 } },
-    { "ID": "kache-manifests", "Status": "Enabled", "Filter": { "Prefix": "artifacts/_manifests/" }, "Expiration": { "Days": 30 } },
-    { "ID": "kache-prefetch-catalogs", "Status": "Enabled", "Filter": { "Prefix": "artifacts/v4/prefetch/catalogs/" }, "Expiration": { "Days": 14 } },
-    { "ID": "kache-prefetch-packs", "Status": "Enabled", "Filter": { "Prefix": "artifacts/v4/prefetch/packs/" }, "Expiration": { "Days": 30 } },
-    { "ID": "kache-prefetch-pack-meta", "Status": "Enabled", "Filter": { "Prefix": "artifacts/v4/prefetch/pack-meta/" }, "Expiration": { "Days": 30 } }
+    { "ID": "kache-manifests", "Status": "Enabled", "Filter": { "Prefix": "artifacts/_manifests/" }, "Expiration": { "Days": 30 } }
   ]
 }
 ```
@@ -49,6 +42,8 @@ aws s3api put-bucket-lifecycle-configuration --bucket my-kache --lifecycle-confi
 
 Replace `artifacts/` with your `cache.remote.prefix`. Add an `AbortIncompleteMultipartUpload` rule if your bucket receives multipart uploads from other tools; Kache uploads each object in one request.
 
+On a versioned bucket, also add a `NoncurrentVersionExpiration` rule. There, `Expiration` only hides the current version behind a delete marker, and every rewrite of a build manifest, shard or prediction row keeps the old version, so no space is freed until noncurrent versions expire.
+
 **Cloudflare R2**
 
 R2 supports object lifecycle rules per prefix with the same expiry-by-age semantics. Create one rule per prefix above from the bucket's settings in the dashboard, or with Wrangler.
@@ -58,10 +53,28 @@ R2 supports object lifecycle rules per prefix with the same expiry-by-age semant
 ```bash
 mc ilm rule add --prefix "artifacts/v3/" --expire-days 30 myminio/my-kache
 mc ilm rule add --prefix "artifacts/_manifests/" --expire-days 30 myminio/my-kache
-mc ilm rule add --prefix "artifacts/v4/prefetch/catalogs/" --expire-days 14 myminio/my-kache
-mc ilm rule add --prefix "artifacts/v4/prefetch/packs/" --expire-days 30 myminio/my-kache
-mc ilm rule add --prefix "artifacts/v4/prefetch/pack-meta/" --expire-days 30 myminio/my-kache
 ```
+
+## Google Cloud Storage
+
+```json title="lifecycle.json"
+{
+  "lifecycle": {
+    "rule": [
+      { "action": { "type": "Delete" },
+        "condition": { "age": 30, "matchesPrefix": ["artifacts/v3/", "artifacts/_manifests/"] } }
+    ]
+  }
+}
+```
+
+```bash
+gcloud storage buckets update gs://my-kache --lifecycle-file=lifecycle.json
+```
+
+## OCI registry
+
+Kache never deletes tags, so expire them with the registry's retention policy or a scheduled cleanup job. Every object is its own tag, named from an encoding or a hash of its whole key, so tag patterns cannot reliably tell entry manifests, packs and build manifests apart. Give every `kache-v2-` and `kache-v1-` tag the same age.
 
 ## Filesystem remote
 
@@ -72,9 +85,6 @@ The owner of the shared directory runs one prune job on one machine. Age by modi
 root=/mnt/shared-kache/artifacts
 # v3: manifests and packs in one pass, same age, so pairs go together.
 find "$root/v3" "$root/_manifests" -type f -mtime +30 -delete
-# v4: catalogs before the packs they reference.
-find "$root/v4/prefetch/catalogs" -type f -mtime +14 -delete
-find "$root/v4/prefetch/packs" "$root/v4/prefetch/pack-meta" -type f -mtime +30 -delete
 find "$root" -mindepth 1 -type d -empty -not -path '*/.kache-tmp*' -delete
 ```
 

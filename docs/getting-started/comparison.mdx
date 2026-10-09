@@ -11,7 +11,7 @@ It describes both projects as they are today and does not rank their speed. Test
 
 | Question | Kache | sccache |
 | --- | --- | --- |
-| Primary workflow | Local-first cache with optional explicit remote synchronization | Client-server compiler cache with local and remote storage |
+| Primary workflow | Local-first cache; an optional remote is read after a local miss and written in the background | Client-server compiler cache with local and remote storage |
 | Rust setup | `kache init` | `RUSTC_WRAPPER=sccache` |
 | C/C++ setup | `kache init` (PATH compiler-name shims on Unix) or `CC="kache cc"` | Prefix wrapper (`sccache gcc`); no ccache-style PATH farm |
 | Remote backends | S3-compatible storage, GCS, filesystem paths, and OCI registries | S3, Redis, Memcached, GCS, Azure, GitHub Actions, WebDAV, and others listed by sccache |
@@ -25,7 +25,7 @@ It describes both projects as they are today and does not rank their speed. Test
 
 - You want cache entries shared across local worktrees without a remote.
 - You want to inspect individual events and ask why a compile missed.
-- You want explicit pull, push, manifest, and prefetch controls for CI.
+- You want explicit pull and push steps in CI (`kache sync --pull`, `kache sync --push`) and prefetch you can tune or turn off.
 - Caching eligible Rust executable and linker outputs matters to your workload.
 - You want one `PATH` change to cache Make/CMake/PKGBUILD object compiles without wrapping `CC` in a shell.
 
@@ -74,10 +74,15 @@ with the direct compiler if it fails. Kache does not start, stop, or change the
 server during this check. A server that starts after the check can still inherit
 its launcher's sandbox, so the retry is still needed. Use `KACHE_FALLBACK=off` to disable the fallback for a build.
 
-Build events and JSON report bypass details include `fallback_attempt` with the
-wrapper, outcome, status, and diagnostic reason. The final `route` and `exit_code`
-show whether direct compilation followed and whether it succeeded.
+Build events and JSON report bypass details include `fallback_attempt` with
+`wrapper`, `outcome`, `exit_code`, and `detail`. In the JSON report, the bypass
+detail's `route` (`fallback` or `direct`) and `exit_code` show whether direct
+compilation followed and whether it succeeded. A build event carries
+`fallback: true` when Kache kept the wrapper's result, and its `exit_code` is
+the final status.
 
-Invocations using standard input/output, preprocessor stdout, or an unexpanded
-response file go directly to the compiler. This prevents a failed fallback from
-consuming input or leaving partial stdout that cannot be replayed safely.
+Invocations that read standard input or write standard output, preprocessor-only
+runs (`-E`, `-M`, `-MM`, `/E`, `/EP`), and invocations with an unexpanded
+response file (`@file`) go directly to the compiler, and Kache prints the same
+warning for them. This prevents a failed fallback from consuming input or
+leaving partial output that cannot be replayed safely.

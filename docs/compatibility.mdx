@@ -13,4 +13,4 @@ Cache contents are disposable compiler outputs. Cache-key recipes and private st
 
 The [planner service and Helm chart](/docs/remote-service) remain previews. Their deployment, authentication, and HA behavior can change even when their versions track the CLI release.
 
-Building the 1.0 CLI from source requires Rust 1.95 or newer. The repository pins Rust 1.99 for development and release builds. Published crates declare their own minimum Rust versions.
+Building the CLI from source requires Rust 1.95 or newer, the `rust-version` in its `Cargo.toml`. The repository pins Rust 1.99 for development and release builds. Published crates declare their own minimum Rust versions.

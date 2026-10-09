@@ -51,21 +51,27 @@ nvcc -dlink build/kernel.o build/helper.o -o build/device-link.o
 
 ## Remote sharing
 
-`nvcc` objects are portable across machines and checkouts: Kache injects host `-ffile-prefix-map` rules (via `-Xcompiler`) that strip clone-local roots, and pins `SOURCE_DATE_EPOCH` so `__DATE__` / `__TIME__` are stable. The same source built at two different absolute paths produces the same key. Disable path normalization with `KACHE_NVCC_PATH_NORMALIZE=0` (keys become machine-local).
+On a miss Kache adds host `-ffile-prefix-map` rules through `-Xcompiler`, so the object does not name the checkout. The rules map the build directory, the source's directory, the output's directory, and any `[paths] base_dirs` roots to fixed names, and header paths in the key use the same names. `KACHE_BASE_DIR` does not apply to `nvcc`.
+
+Flag values are keyed as written, so an absolute path inside a flag, such as `-I/home/me/project/include` or an absolute `-MF` path, gives each checkout its own key. Use relative paths in flags, or build from the same absolute path, to share entries. If an object still contains one of the mapped roots, Kache uses it for that build but does not store it. `KACHE_NVCC_PATH_NORMALIZE=0` turns path normalization off, which makes keys specific to the machine's paths.
+
+On a miss Kache runs `nvcc` with `SOURCE_DATE_EPOCH=0`, unless the build exports its own value, so `__DATE__` and `__TIME__` do not change between rebuilds. Set `KACHE_NVCC_SOURCE_DATE_EPOCH=passthrough` to stop Kache from setting it. The value is not part of the `nvcc` key, so a hit restores the object with the date it was first built with.
 
 ## What passes through
 
 Anything Kache does not model runs the real `nvcc` uncached, including:
 
 - link and device-link (`-dlink`) modes, `--lib`, multi-source compiles;
-- standalone `-ptx` / `-cubin` / `-fatbin` / `--optix-ir` emission;
+- standalone `-ptx` / `-cubin` / `-fatbin` / `--optix-ir` emission, and preprocessing (`-E`);
 - device debug (`-G`);
 - machine-resolved values (`-march=native`, `-arch=native`, …). One key must never cover different objects, so these refuse even when allow-listed;
-- dependency generation without an explicit output (`-M`, `-MM`) or without `-MF` (`-MD`, `-MMD` alone). Combine `-MD`/`-MMD` with `-MF <file>` instead;
+- dependency generation without an explicit output (`-M`, `-MM`, `--generate-dependencies`), the `-MP` and `-MG` modifiers, and `-MD`/`-MMD` without `-MF`. Combine `-MD`/`-MMD` with `-MF <file>` and leave out `-MP` and `-MG`;
 - compiles without `-o`;
 - `-keep` / `--save-temps`, profiling (`--time`), response files (`@file`);
-- any flag outside the built-in table (see below).
+- any flag outside the built-in table (see below). Common examples are `--generate-code=…` (the long spelling of `-gencode`), `-ccbin` and `--compiler-bindir`, `-lineinfo`, `--use_fast_math`, `-Xcudafe`, and `--extended-lambda`. Run the build with `KACHE_LOG=kache=debug` to see which flag blocked caching.
 
-To cache a flag that Kache does not model but you know is safe, add it to the extra allow-list (`[cc] extra_allowlist_flags` or `KACHE_CC_EXTRA_ALLOWLIST_FLAGS`), which the `nvcc` adapter also honors. List explicit flag values. Flags that hide preprocessor inputs (`-Xcompiler -I…`, `-Xcompiler -D…`) stay refused: they would escape dependency tracking.
+To cache a flag that Kache does not model but you know is safe, add it to the extra allow-list (`[cc] extra_allowlist_flags` or `KACHE_CC_EXTRA_ALLOWLIST_FLAGS`), which the `nvcc` adapter also honors. Flags that hide preprocessor inputs (`-Xcompiler -I…`, `-Xcompiler -D…`) stay refused: they would escape dependency tracking.
+
+For `nvcc`, an allow-list entry matches the flag itself or the flag followed by `=value`, so `-ccbin` covers `-ccbin=/usr/bin/g++-12`. A value passed as a separate argument (`-ccbin g++-12`) counts as another unknown argument, so use the `=` form.
 
 `NVCC_PREPEND_FLAGS` / `NVCC_APPEND_FLAGS` codegen tuning (`-O2`, `-gencode …`) is cached normally. Values that would change what is built or hide inputs (`-G`, `-I…`, `-march=native`) pass through uncached instead.

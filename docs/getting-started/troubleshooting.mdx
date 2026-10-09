@@ -3,21 +3,28 @@ title: Troubleshooting
 description: Find why a build has no hits, unexpected misses, or no remote activity
 ---
 
-Start in the affected project:
+Start at the root of the affected workspace:
 
 ```bash
 kache doctor
-kache stats --last-build
-kache explain
+kache stats --last-build --root "$PWD"
+kache explain --root "$PWD"
 ```
 
 `doctor` checks setup and cache access. Stats show the latest recorded build
-session; `explain` compares recorded inputs to find miss causes.
+session; `explain` compares recorded inputs to find miss causes. `--root` names
+the directory that holds the build's target directory, which is the workspace
+for the default `target/`. Without it, both commands describe the newest build
+Kache recorded, from any project.
 
 ## A build shows no hits
 
 First check whether Cargo ran any compiler work. A second build in an already
-populated target directory can finish without invoking Kache at all.
+populated target directory can finish without invoking Kache at all. A new
+target directory can also start populated: by default Kache seeds it with the
+registry and git dependency units another checkout built with the same `rustc`,
+and Cargo skips them. Those units count as neither hits nor misses. Set
+`KACHE_SEED_NEW_TARGETS=0` for a build that sends every crate through the cache.
 
 Use the [two-worktree walkthrough](/docs/getting-started/quick-start) to test
 reuse with separate target directories. Keep the revision, toolchain, profile,
@@ -25,8 +32,9 @@ and features the same. A fresh store needs the first build to populate it.
 
 If Cargo compiles but Kache records no events, run `kache doctor` in the same
 shell or agent environment as the build. Check that Cargo uses the configured
-wrapper. For C/C++, check that compiler shims are active or that the build uses
-`CC`/`CXX`; see [C and C++ setup](/docs/getting-started/c-cpp).
+wrapper. For C/C++, check that `kache doctor` reports the compiler shims as
+active in that shell, or that `CC`/`CXX` name Kache as in the
+[prefix method](/docs/getting-started/c-cpp#prefix-method).
 
 ## Some units always compile
 
@@ -37,9 +45,10 @@ kache stats --full --last-build --format markdown --output kache-report.md
 ```
 
 A passthrough means the invocation was outside the caching policy. It is
-counted separately from a miss. Rust executables are disabled by default on
-Windows; C/C++ flags and compiler modes also affect eligibility. Check
-[current support](/docs#current-support) and the relevant compiler guide.
+counted separately from a miss. Rust executables, including test binaries and
+build scripts, are not cached by default on Windows; C/C++ flags and compiler
+modes also affect eligibility. Check [current support](/docs#current-support)
+and the relevant compiler guide.
 
 For a Rust crate that misses, use its name from the report:
 
@@ -60,12 +69,21 @@ private incremental state. See [Executables and incremental builds](/docs/gettin
 ```bash
 kache daemon status
 kache doctor
+kache stats
 ```
 
 Compiler-driven remote reads and uploads need the daemon. Without it, local
-caching and compilation continue. Follow the [remote setup guide](/docs/remote-cache/overview)
-for your backend, then check [daemon lifecycle](/docs/daemon/lifecycle) for
-service environment and configuration changes.
+caching and compilation continue. `doctor` tests the remote with this shell's
+configuration and credentials, which can differ from the daemon's. `kache stats`
+shows what the daemon uses: the remote it loaded or why it is misconfigured, and
+a warning when it read a different config file than this shell. Its Resilience
+row shows `DEGRADED` after three timeouts or transient remote errors in a row.
+Builds then compile locally and uploads wait in the queue; the daemon tries the
+remote again every 45 seconds until it answers.
+
+Follow the [remote setup guide](/docs/remote-cache/overview) for your backend,
+then check [daemon lifecycle](/docs/daemon/lifecycle) for service environment
+and configuration changes.
 
 A read-only CI job can restore entries but cannot publish new work. Review
 [CI write policy](/docs/remote-cache/ci#who-may-write) before treating absent
@@ -82,6 +100,12 @@ kache clean --dry-run
 ```
 
 This previews tracked target directories and what removing each can free.
+Inside targets you still use, the daemon removes build units no build has read
+for 30 days (`auto_clean_unused_units_days`). To trim obsolete units sooner,
+record a successful build with `KACHE_TARGET_LIVENESS=1 kache cargo check`,
+then preview `kache clean --units target --dry-run`. See
+[Recorded-command cleanup](/docs/getting-started/configuration#recorded-command-cleanup).
+
 Read [Deduplication](/docs/deduplication) before comparing logical sizes with
 allocated disk space, and [Bounding storage](/docs/remote-cache/bounding)
 for remote retention.

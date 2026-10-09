@@ -121,10 +121,17 @@ impl CredentialStatus {
 }
 
 /// One credential source, and the name logs and `kache doctor` give it.
-#[derive(Debug)]
 pub(super) struct CredentialSource {
     name: String,
     provider: Box<dyn ProvideCredentialDyn<Credential = Credential>>,
+}
+
+/// The name alone: the EC2 metadata provider keeps its session token in its
+/// own `Debug`.
+impl std::fmt::Debug for CredentialSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.name, f)
+    }
 }
 
 impl CredentialSource {
@@ -173,7 +180,6 @@ fn profile_sources(selected: Option<&str>) -> Vec<CredentialSource> {
 }
 
 /// Kache's S3 credential chain.
-#[derive(Debug)]
 pub(super) struct KacheCredentialProvider {
     /// `KACHE_S3_ACCESS_KEY` and `KACHE_S3_SECRET_KEY`, preferred over every
     /// other source.
@@ -229,6 +235,18 @@ impl KacheCredentialProvider {
                 Ok(first_credential(&context, sources).await)
             }
         }
+    }
+}
+
+/// Names only. OpenDAL's reqsign chain logs this before each attempt, at
+/// debug level, and after an error, at warn.
+impl std::fmt::Debug for KacheCredentialProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KacheCredentialProvider")
+            .field("kache_keys", &self.kache_keys.is_some())
+            .field("profile", &self.profile)
+            .field("ambient", &self.ambient)
+            .finish_non_exhaustive()
     }
 }
 

@@ -476,6 +476,24 @@ fn ambient_sources_try_web_identity_then_ecs_then_ec2() {
     );
 }
 
+/// OpenDAL's reqsign chain logs this chain's `Debug` before each attempt, so
+/// it names the sources and leaves out their state: the EC2 metadata source
+/// keeps its session token there.
+#[test]
+fn debug_names_the_sources_without_their_state() {
+    let chain = KacheCredentialProvider::new(
+        Some(key("AKIAKACHE")),
+        Some("team".to_string()),
+        ambient_sources("us-east-1"),
+        Arc::default(),
+    );
+    assert_eq!(
+        format!("{chain:?}"),
+        "KacheCredentialProvider { kache_keys: true, profile: Some(\"team\"), ambient: \
+         [\"web identity token\", \"ECS container credentials\", \"EC2 instance metadata\"], .. }"
+    );
+}
+
 #[test]
 fn credentials_that_load_again_clear_the_failure() {
     let status = CredentialStatus::default();

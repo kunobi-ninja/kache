@@ -4553,6 +4553,7 @@ fn effective_config_like(config: &Config) -> crate::daemon::EffectiveConfig {
         remote_key_listing: config.remote_key_listing,
         remote_description: config.remote.as_ref().map(|remote| remote.describe()),
         local_only: config.local_only,
+        remote_readonly: Some(config.remote_readonly),
         remote_error: config.remote_error.clone(),
         remote_key_cache_refresh_secs: config.remote_key_cache_refresh_secs,
         socket_path: config.socket_path().display().to_string(),
@@ -4779,6 +4780,52 @@ fn render_stats_remote_state_prefers_daemon_effective() {
         "Remote | s3://daemon-bucket/artifacts | "
     );
     assert!(!out.join("\n").contains("client config"), "{out:#?}");
+}
+
+/// A daemon keeps the read-only mode of the build that started it, so stats
+/// show the daemon's mode and warn the writable process it skips.
+#[test]
+#[allow(clippy::field_reassign_with_default)]
+fn stats_show_a_read_only_daemon_to_a_writable_process() {
+    let dir = tempfile::tempdir().unwrap();
+    let writable = save_manifest_config(dir.path().join("cache"), Some(test_remote_cfg()));
+    let provenance = crate::config::ConfigFileProvenance {
+        path: "/daemon-home/.config/kache/config.toml".into(),
+        fingerprint: "daemon-fingerprint".to_string(),
+    };
+    let mut snap = StatsSnapshot::default();
+    snap.daemon_connected = true;
+    let mut eff = effective_config_like(&writable);
+    eff.remote_readonly = Some(true);
+    snap.daemon_effective_config = Some(eff.clone());
+
+    let out = render_stats(&snap, &writable, SinceWindow::DEFAULT);
+    assert_eq!(
+        stats_row(&out, "Remote").unwrap(),
+        "Remote | s3://bucket/prefix | read-only"
+    );
+    let warnings = config_mismatch_warnings(&writable, &provenance, &eff);
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(
+        warnings[0].contains("skips this process's uploads"),
+        "{warnings:?}"
+    );
+
+    // A read-only process sends no uploads, so a writable daemon is no loss.
+    let mut read_only = writable.clone();
+    read_only.remote_readonly = true;
+    eff.remote_readonly = Some(false);
+    assert!(config_mismatch_warnings(&read_only, &provenance, &eff).is_empty());
+
+    // A daemon too old to report its mode claims nothing either way.
+    eff.remote_readonly = None;
+    snap.daemon_effective_config = Some(eff.clone());
+    assert!(config_mismatch_warnings(&writable, &provenance, &eff).is_empty());
+    let out = render_stats(&snap, &writable, SinceWindow::DEFAULT);
+    assert_eq!(
+        stats_row(&out, "Remote").unwrap(),
+        "Remote | s3://bucket/prefix | "
+    );
 }
 
 #[test]
@@ -7525,6 +7572,42 @@ async fn save_manifest_skipped_when_remote_readonly() {
     // a remote client or making any calls.
     save_manifest(&config, Some("mykey"), None)
         .expect("save_manifest should succeed by doing nothing");
+}
+
+/// The end-of-job publish warns a writable job whose daemon is read-only,
+/// and asks the daemon only when the job could upload at all and published
+/// a manifest.
+#[test]
+fn save_manifest_warns_a_writable_job_about_a_read_only_daemon() {
+    let dir = tempfile::tempdir().unwrap();
+    let writable = save_manifest_config(dir.path().join("writable"), Some(test_remote_cfg()));
+    let warning =
+        readonly_daemon_warning(&writable, true, || Some(true)).expect("writable job warns");
+    assert!(warning.contains("kache daemon restart"), "{warning}");
+    for daemon_readonly in [Some(false), None] {
+        assert_eq!(
+            readonly_daemon_warning(&writable, true, || daemon_readonly),
+            None
+        );
+    }
+    assert_eq!(
+        readonly_daemon_warning(&writable, false, || panic!(
+            "no manifest, nothing to warn about"
+        )),
+        None
+    );
+
+    let mut read_only = writable.clone();
+    read_only.remote_readonly = true;
+    let local = save_manifest_config(dir.path().join("local"), None);
+    for config in [&read_only, &local] {
+        assert_eq!(
+            readonly_daemon_warning(config, true, || {
+                panic!("a job that cannot upload must not ask")
+            }),
+            None
+        );
+    }
 }
 
 #[test]

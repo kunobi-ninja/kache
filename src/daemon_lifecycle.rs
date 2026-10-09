@@ -77,6 +77,7 @@ fn observe(config: &Config, deadline: Instant) -> Result<ObservedOwner> {
                 ObservedOwner::Ready(DaemonHealth {
                     version: health.build,
                     build_epoch: health.revision,
+                    remote_readonly: None,
                 })
             } else {
                 ObservedOwner::Pending

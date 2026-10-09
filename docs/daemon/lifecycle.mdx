@@ -50,7 +50,11 @@ Legacy clients and daemons can omit release metadata. A missing or invalid versi
 
 The daemon also fingerprints the active config file and restarts after it changes. `kache daemon start` and automatic starts drop the settings that select the remote from the environment (`KACHE_S3_BUCKET`, `KACHE_S3_ENDPOINT`, `KACHE_S3_REGION`, `KACHE_S3_PREFIX`, `KACHE_S3_PROFILE`, `KACHE_S3_USER_AGENT`, `KACHE_LOCAL_ONLY`), so set these in the config file. To try remote variables from a shell, run `kache daemon run` in the foreground.
 
-`KACHE_REMOTE_READONLY` remains inherited so a daemon started by a read-only build cannot publish remote data. That restriction lasts for the daemon's lifetime. To enable uploads after clearing the flag, run `kache daemon restart` from the writable environment. Other environment is also fixed when the process starts. An installed service uses its stored environment; update that environment before restarting it.
+`KACHE_REMOTE_READONLY` remains inherited so a daemon started by a read-only build cannot publish remote data. The CI variables that make pull request and other untrusted jobs read-only are inherited too. That restriction lasts for the daemon's lifetime. To enable uploads after clearing the flag, run `kache daemon restart` from the writable environment. Other environment is also fixed when the process starts. An installed service uses its stored environment; update that environment before restarting it.
+
+A writable build can still reach a read-only daemon that shares its runtime directory, for example when a pull request job started the daemon on a runner that keeps it between jobs. kache-action gives each job its own runtime directory, so its jobs are not affected. The build succeeds, but the daemon skips its uploads and logs a warning, at most once every five minutes. `kache stats` marks the remote `read-only` and warns when run from a writable environment, and `kache doctor` reports it as an issue. `kache save-manifest` prints a warning after it publishes a manifest, so the CI job's log shows it.
+
+Rust uploads skipped this way stay queued, and GC keeps their entries while they wait. A writable daemon uploads them when it starts; a daemon that starts read-only drops them from the queue. C/C++ compiles handed to a read-only daemon are stored locally but never queued.
 
 ### Switching to or from 1.0.x
 

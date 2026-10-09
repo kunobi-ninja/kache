@@ -38,7 +38,7 @@ On GitHub Actions and GitLab CI, Kache suppresses remote writes unless the job i
 
 A laptop or other non-CI process is left as configured, so `kache sync --push` still works locally. Set `remote_readonly = true` under `[cache]` there when you want reads without writes.
 
-An automatically started daemon inherits `KACHE_REMOTE_READONLY=1` and keeps writes disabled for its lifetime. Before a later writable build needs to upload, clear the flag and run `kache daemon restart` from the writable environment. An installed service uses its stored environment; update that environment before restarting it.
+An automatically started daemon inherits `KACHE_REMOTE_READONLY=1` and keeps writes disabled for its lifetime. A daemon that a pull request or other read-only CI job starts stays read-only the same way. Before a later writable build needs to upload, clear the flag and run `kache daemon restart` from the writable environment. An installed service uses its stored environment; update that environment before restarting it. A writable job that reaches a read-only daemon gets a warning from `kache save-manifest`, `kache stats` and `kache doctor`; see [Daemon lifecycle](/docs/daemon/lifecycle#updates-and-config-changes).
 
 ```yaml
 # Optional: make the read-only intent explicit in pull-request jobs.

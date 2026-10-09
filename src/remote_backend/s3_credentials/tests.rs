@@ -149,23 +149,38 @@ async fn a_missing_selected_profile_stops_before_the_instance_role() {
     }
 }
 
-/// Without a selected profile the chain goes on past the default profile to
-/// web identity, ECS and EC2, as it always has. An empty `AWS_PROFILE`
-/// selects nothing.
+/// Without a selected profile the chain reads the default profile, then goes
+/// on to web identity, ECS and EC2, as it always has. An empty `AWS_PROFILE`
+/// selects nothing, so the default profile is still read.
 #[tokio::test]
 async fn without_a_selected_profile_the_chain_reaches_the_instance_role() {
-    let home = AwsHome::new(Some("[profile other]\nregion = eu-west-1\n"), None);
+    let no_keys = AwsHome::new(Some("[profile other]\nregion = eu-west-1\n"), None);
+    let default_keys = AwsHome::new(
+        None,
+        Some("[default]\naws_access_key_id = AKIADEFAULT\naws_secret_access_key = secret\n"),
+    );
+    let cases = [
+        (&no_keys, "AKIAINSTANCE", "instance role", 1),
+        (
+            &default_keys,
+            "AKIADEFAULT",
+            "AWS profile \"default\" (static keys)",
+            0,
+        ),
+    ];
     for vars in [&[][..], &[("AWS_PROFILE", "")]] {
-        let role = InstanceRole::default();
-        let chain = chain(None, None, &role);
-        let credential = chain
-            .provide_credential(&home.context(vars))
-            .await
-            .unwrap()
-            .expect("the instance role has credentials");
-        assert_eq!(credential.access_key_id, "AKIAINSTANCE");
-        assert_eq!(role.calls(), 1);
-        assert_eq!(chain.status.source().as_deref(), Some("instance role"));
+        for (home, key_id, source, role_calls) in cases {
+            let role = InstanceRole::default();
+            let chain = chain(None, None, &role);
+            let credential = chain
+                .provide_credential(&home.context(vars))
+                .await
+                .unwrap()
+                .expect("a source has credentials");
+            assert_eq!(credential.access_key_id, key_id, "{vars:?}");
+            assert_eq!(role.calls(), role_calls);
+            assert_eq!(chain.status.source().as_deref(), Some(source));
+        }
     }
 }
 
@@ -370,20 +385,28 @@ async fn a_credential_process_gets_the_profile_the_chain_reads() {
         r#"printf '{"Version":1,"AccessKeyId":"%s","SecretAccessKey":"secret"}' "$AWS_PROFILE""#,
     )
     .unwrap();
+    let process = format!("credential_process = sh {}\n", script.display());
     std::fs::write(
         home.config(),
-        format!(
-            "[profile build]\ncredential_process = sh {}\n",
-            script.display()
-        ),
+        format!("[default]\n{process}[profile build]\n{process}"),
     )
     .unwrap();
-    let credential = chain(None, Some("build"), &InstanceRole::default())
-        .provide_credential(&home.context(&[]))
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(credential.access_key_id, "build");
+    let cases = [
+        (Some("build"), &[][..], "build"),
+        // An empty AWS_PROFILE selects nothing, and the child would inherit
+        // it in place of the default profile the chain reads.
+        (None, &[("AWS_PROFILE", "")][..], "default"),
+    ];
+    for (configured, vars, expected) in cases {
+        let role = InstanceRole::default();
+        let credential = chain(None, configured, &role)
+            .provide_credential(&home.context(vars))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(credential.access_key_id, expected, "{vars:?}");
+        assert_eq!(role.calls(), 0);
+    }
 }
 
 #[tokio::test]

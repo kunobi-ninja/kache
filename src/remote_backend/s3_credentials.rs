@@ -161,21 +161,24 @@ pub(super) fn ambient_sources(region: &str) -> Vec<CredentialSource> {
     ]
 }
 
-/// The sources that read a shared profile: the selected one, or the default.
-fn profile_sources(selected: Option<&str>) -> Vec<CredentialSource> {
-    let name = |kind: &str| format!("AWS profile \"{}\" ({kind})", selected.unwrap_or("default"));
-    let mut keys = ProfileCredentialProvider::new();
-    let mut sso = SSOCredentialProvider::new();
-    let mut process = ProcessCredentialProvider::new();
-    if let Some(profile) = selected {
-        keys = keys.with_profile(profile);
-        sso = sso.with_profile(profile);
-        process = process.with_profile(profile);
-    }
+/// The sources that read the shared profile `profile`. Each is given the name
+/// outright: left to itself, it reads an empty `AWS_PROFILE` as a profile
+/// named "".
+fn profile_sources(profile: &str) -> Vec<CredentialSource> {
+    let name = |kind: &str| format!("AWS profile \"{profile}\" ({kind})");
     vec![
-        CredentialSource::new(name("static keys"), keys),
-        CredentialSource::new(name("SSO"), sso),
-        CredentialSource::new(name("credential_process"), process),
+        CredentialSource::new(
+            name("static keys"),
+            ProfileCredentialProvider::new().with_profile(profile),
+        ),
+        CredentialSource::new(
+            name("SSO"),
+            SSOCredentialProvider::new().with_profile(profile),
+        ),
+        CredentialSource::new(
+            name("credential_process"),
+            ProcessCredentialProvider::new().with_profile(profile),
+        ),
     ]
 }
 
@@ -218,13 +221,23 @@ impl KacheCredentialProvider {
             return Ok(Some((credential, ENVIRONMENT_KEYS.to_string())));
         }
         let selected = selected_profile(self.profile.as_deref(), context);
+        // A `credential_process` child inherits this process's environment.
+        // In place of an empty `AWS_PROFILE`, which it could read as a
+        // profile named "", it gets the default profile the chain reads.
+        let child_profile = match &selected {
+            Some(selected) => Some(selected.name.clone()),
+            None => context
+                .env_var("AWS_PROFILE")
+                .filter(|name| name.is_empty())
+                .map(|_| "default".to_string()),
+        };
         let context = context.clone().with_command_execute(KacheCommandExecute {
-            profile: selected.as_ref().map(|selected| selected.name.clone()),
+            profile: child_profile,
         });
         match selected {
             Some(selected) => selected.resolve(&context).await.map(Some),
             None => {
-                let default_profile = profile_sources(None);
+                let default_profile = profile_sources("default");
                 let sources = default_profile.iter().chain(&self.ambient);
                 Ok(first_credential(&context, sources).await)
             }
@@ -323,7 +336,7 @@ impl SelectedProfile {
         self,
         context: &SigningContext,
     ) -> Result<(Credential, String), CredentialFailure> {
-        for source in profile_sources(Some(&self.name)) {
+        for source in profile_sources(&self.name) {
             match source.provider.provide_credential_dyn(context).await {
                 Ok(Some(credential)) => return Ok((credential, source.name)),
                 Ok(None) => {}

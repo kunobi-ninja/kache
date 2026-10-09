@@ -1045,7 +1045,7 @@ fn shlex_split(input: &str) -> Option<Vec<String>> {
 
 #[derive(Debug, Clone, Default)]
 struct KacheCommandExecute {
-    /// Profile to hand the child, when Kache selected one explicitly.
+    /// `AWS_PROFILE` for the child. `None` keeps the inherited value.
     profile: Option<String>,
 }
 

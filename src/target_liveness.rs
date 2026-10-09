@@ -787,10 +787,12 @@ fn receipt_path(config: &Config, target: &Path) -> PathBuf {
 
 fn read_receipt(config: &Config, target: &Path) -> Result<Receipt> {
     let path = receipt_path(config, target);
-    ensure!(
-        !std::fs::symlink_metadata(&path)?.is_symlink(),
-        "symlink receipt"
-    );
+    let meta = match std::fs::symlink_metadata(&path) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => bail!("no receipt yet"),
+        Err(error) => return Err(error.into()),
+    };
+    ensure!(!meta.is_symlink(), "symlink receipt");
     ensure!(
         std::fs::metadata(&path)?.len() <= MAX_RECEIPT,
         "receipt too large"
@@ -1232,7 +1234,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let workspace = dir.path().join("workspace");
         let target = workspace.join("target");
-        std::fs::create_dir_all(&target).unwrap();
+        // A Cargo profile dir makes it a safe target root, so the preview
+        // gets as far as looking for the receipt.
+        std::fs::create_dir_all(target.join("debug")).unwrap();
         std::fs::write(workspace.join("Cargo.toml"), "[workspace]\n").unwrap();
         std::fs::write(
             target.join("CACHEDIR.TAG"),
@@ -1241,7 +1245,7 @@ mod tests {
         .unwrap();
         let config = crate::test_support::test_config(dir.path().join("cache"));
         let plan = preview(&config, &target, &workspace);
-        assert!(plan.status.starts_with("unavailable: "), "{plan:?}");
+        assert_eq!(plan.status, "unavailable: no receipt yet", "{plan:?}");
         assert_eq!(
             plan.command,
             ["KACHE_TARGET_LIVENESS=1", "kache", "cargo", "check"]

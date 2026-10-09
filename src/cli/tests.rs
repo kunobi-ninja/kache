@@ -7032,6 +7032,21 @@ fn a_target_says_what_the_next_pass_does_to_it() {
 }
 
 #[test]
+fn the_targets_table_says_nothing_about_unit_cleanup_unless_it_is_on() {
+    let mut off = row("/wt/a", TargetState::Live, 1024);
+    off.unit_cleanup.status = "off".into();
+    let rendered = render_targets(&[off.clone(), row("/wt/b", TargetState::Live, 1024)]).join("\n");
+    assert!(!rendered.contains("unit cleanup"), "{rendered}");
+
+    off.unit_cleanup.status = "unavailable: no receipt yet".into();
+    let rendered = render_targets(&[off]).join("\n");
+    assert!(
+        rendered.contains("(unit cleanup: unavailable: no receipt yet)"),
+        "{rendered}"
+    );
+}
+
+#[test]
 fn the_targets_table_totals_and_points_at_deleted_worktrees() {
     let one = render_targets(&[row("/wt/a", TargetState::Live, 1024)]).join("\n");
     assert!(
@@ -7136,6 +7151,11 @@ fn target_rows_report_each_worktree_and_sort_by_what_frees_most() {
     );
     assert_eq!(rows[1].profiles, ["debug"]);
     assert!(rows.iter().all(|row| row.next_pass.remove.is_none()));
+    // Target liveness is off by default, so no row previews receipt cleanup.
+    assert!(
+        rows.iter().all(|row| row.unit_cleanup.status == "off"),
+        "{rows:?}"
+    );
     #[cfg(unix)]
     {
         let mut pressure = config.clone();

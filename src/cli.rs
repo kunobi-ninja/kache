@@ -5439,11 +5439,16 @@ fn target_rows(config: &Config, now: i64) -> Result<Vec<TargetRow>> {
                 .map(|idle| idle as u64),
             discovered: tracked.discovered,
             next_pass,
-            unit_cleanup: crate::target_liveness::preview(
-                config,
-                &tracked.path,
-                &tracked.workspace_root,
-            ),
+            // Receipts exist only for builds with target_liveness on, and
+            // validating one reads every fingerprint, so skip it otherwise.
+            unit_cleanup: if config.target_liveness {
+                crate::target_liveness::preview(config, &tracked.path, &tracked.workspace_root)
+            } else {
+                crate::target_liveness::Plan {
+                    status: "off".into(),
+                    ..Default::default()
+                }
+            },
             profiles,
             apparent_bytes: stats.total_bytes,
             reclaimable_bytes: stats.estimated_reclaimable_bytes,
@@ -5465,17 +5470,14 @@ fn format_idle(seconds: u64) -> String {
 }
 
 fn unit_cleanup_note(plan: &crate::target_liveness::Plan) -> String {
-    if plan.status == "ready" {
-        if plan.units > 0 {
-            format!(
-                "  ({} obsolete units: kache clean --units --dry-run)",
-                plan.units
-            )
-        } else {
-            String::new()
-        }
-    } else {
-        format!("  (unit cleanup: {})", plan.status)
+    match plan.status.as_str() {
+        "" | "off" => String::new(),
+        "ready" if plan.units > 0 => format!(
+            "  ({} obsolete units: kache clean --units --dry-run)",
+            plan.units
+        ),
+        "ready" => String::new(),
+        status => format!("  (unit cleanup: {status})"),
     }
 }
 

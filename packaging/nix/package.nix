@@ -65,7 +65,7 @@ rustPlatform.buildRustPackage {
     ulimit -n 4096 2>/dev/null || true
   '';
 
-  # Credential-helper fixtures use the build shell and its builtins.
+  # Shell fixtures use the build shell and its builtins.
   env.KACHE_TEST_SHELL = stdenv.shell;
 
   # Avoid bootstrapping loop: don't let kache wrap itself during build

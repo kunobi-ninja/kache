@@ -88,6 +88,7 @@ mod timeline;
 mod timeline_client;
 mod toolchain_dylib;
 mod transport;
+mod tree_stamp;
 mod tui;
 mod tui_sessions;
 mod unit_prune;

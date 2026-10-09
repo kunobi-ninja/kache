@@ -41,6 +41,7 @@ use crate::compiler_store::StoreHashExt as _;
 use crate::config::Config;
 use crate::events::EventResult;
 use crate::store::{EntryMeta, Store, StorePutResult, link};
+use crate::tree_stamp::{memoised_digest, record_digest, tree_stamp};
 use crate::wrapper::EventInputs;
 use anyhow::{Context, Result};
 use std::collections::{BTreeMap, BTreeSet};
@@ -2192,101 +2193,10 @@ fn hash_directory(
     Ok(format!("dir:{}", hasher.finalize().to_hex()))
 }
 
-/// A digest of every entry under `path` by name, kind, size, modification
-/// and change time, from one stat walk. Symlinks contribute their link text
-/// only, so a tree with a symlink to something outside it is not memoised.
-/// `None` when the tree is larger than the budget or holds a symlink.
-struct TreeStamp {
-    digest: String,
-    /// The newest modification time seen in the walk.
-    newest: std::time::SystemTime,
-}
-
-impl TreeStamp {
-    /// Coarse filesystem clocks make a stamp taken within this window of its
-    /// newest write ambiguous.
-    const SETTLE: std::time::Duration = std::time::Duration::from_secs(2);
-
-    fn settled_at(&self, now: std::time::SystemTime) -> bool {
-        now.duration_since(self.newest)
-            .is_ok_and(|age| age >= Self::SETTLE)
-    }
-}
-
-fn tree_stamp(path: &Path, excluded: &[PathBuf], budget: usize) -> Option<TreeStamp> {
-    let mut hasher = blake3::Hasher::new();
-    let mut newest = std::time::SystemTime::UNIX_EPOCH;
-    let mut remaining = budget;
-    let mut pending = vec![path.to_path_buf()];
-    while let Some(directory) = pending.pop() {
-        let mut entries: Vec<_> = std::fs::read_dir(&directory)
-            .ok()?
-            .collect::<std::io::Result<_>>()
-            .ok()?;
-        entries.sort_by_key(std::fs::DirEntry::file_name);
-        for entry in entries {
-            let child = entry.path();
-            if excluded.contains(&child) {
-                continue;
-            }
-            remaining = remaining.checked_sub(1)?;
-            let metadata = std::fs::symlink_metadata(&child).ok()?;
-            if metadata.file_type().is_symlink() {
-                return None;
-            }
-            fold(
-                &mut hasher,
-                "entry",
-                child
-                    .strip_prefix(path)
-                    .ok()?
-                    .as_os_str()
-                    .as_encoded_bytes(),
-            );
-            hasher.update(if metadata.is_dir() { b"dir" } else { b"fil" });
-            fold_metadata_stamp(&mut hasher, &metadata);
-            if let Ok(modified) = metadata.modified()
-                && modified > newest
-            {
-                newest = modified;
-            }
-            if metadata.is_dir() {
-                pending.push(child);
-            }
-        }
-    }
-    Some(TreeStamp {
-        digest: hasher.finalize().to_hex().to_string(),
-        newest,
-    })
-}
-
 /// Where tree digests are memoised: under the configured cache directory
 /// once a run has loaded its configuration, else the environment's or the
 /// default one.
 static TREE_MEMO_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-
-/// Size and times of one entry, plus the inode where the platform has one.
-fn fold_metadata_stamp(hasher: &mut blake3::Hasher, metadata: &std::fs::Metadata) {
-    hasher.update(&metadata.len().to_le_bytes());
-    for time in [metadata.modified().ok(), metadata.created().ok()] {
-        let nanos = time
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map_or(0, |d| d.as_nanos());
-        hasher.update(&nanos.to_le_bytes());
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        for value in [
-            metadata.ctime() as u64,
-            metadata.ctime_nsec() as u64,
-            metadata.ino(),
-        ] {
-            hasher.update(&value.to_le_bytes());
-        }
-    }
-}
 
 /// A file's bytes when it may be text: `None` once its first block holds a
 /// NUL, so object files and archives are not read in full.
@@ -2325,13 +2235,11 @@ fn tree_memo_path(path: &Path, text: Option<&Environment>) -> PathBuf {
 }
 
 fn tree_digest_memo(path: &Path, text: Option<&Environment>, stamp: &str) -> Option<String> {
-    let memo = std::fs::read_to_string(tree_memo_path(path, text)).ok()?;
-    let (recorded_stamp, digest) = memo.trim_end().split_once('\n')?;
-    (recorded_stamp == stamp && digest.starts_with("dir:")).then(|| digest.to_string())
+    memoised_digest(&tree_memo_path(path, text), stamp).filter(|digest| digest.starts_with("dir:"))
 }
 
 fn record_tree_digest_memo(path: &Path, text: Option<&Environment>, stamp: &str, digest: &str) {
-    crate::probe_memo::write_atomic(&tree_memo_path(path, text), &format!("{stamp}\n{digest}"));
+    record_digest(&tree_memo_path(path, text), stamp, digest);
 }
 
 #[cfg(test)]
@@ -4824,6 +4732,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_tree_digest_is_memoised_by_its_stamp_and_forgets_on_change() {
+        use crate::tree_stamp::TreeStamp;
         let _lock = crate::test_support::process_state_test_lock();
         let dir = tempfile::tempdir().unwrap();
         let cache = dir.path().join("cache");

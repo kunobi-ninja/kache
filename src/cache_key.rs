@@ -1050,13 +1050,15 @@ impl<'a> TreeRoot<'a> {
             .collect()
     }
 
-    /// The fold never follows a link, so the stamp may record its text. The
-    /// root's own times show a name that came and went while the fold ran.
+    /// The fold never follows a link, so the stamp may record its text, and
+    /// it counts what it cannot read as unreadable. The root's own times show
+    /// a name that came and went while the fold ran.
     fn stamp_rules(&self) -> crate::tree_stamp::StampRules {
         crate::tree_stamp::StampRules {
             link_text: true,
             skip_build_dirs: self.skips_build_dirs,
             root_metadata: true,
+            unreadable_entries: true,
         }
     }
 
@@ -1159,9 +1161,10 @@ fn tree_digest_memoised(
     let mut hasher = blake3::Hasher::new();
     hasher.update(TREE_DIGEST_VERSION);
     let mut budget = max_entries;
+    let mut read_every_file = true;
     for root in &roots {
         fold_field(&mut hasher, b"root:", root.role);
-        crate_tree_fold(
+        read_every_file &= crate_tree_fold(
             &root.path,
             &root.path,
             &root.excluded(),
@@ -1172,7 +1175,11 @@ fn tree_digest_memoised(
         )?;
     }
     let digest = hasher.finalize().to_hex().to_string();
-    memoise_tree_digest(&memo, &walk, &stamp, &digest, now);
+    // The stamp shows a directory becoming listable, but not a file becoming
+    // readable where there is no change time.
+    if read_every_file {
+        memoise_tree_digest(&memo, &walk, &stamp, &digest, now);
+    }
     file_hasher.note_tree_walk(walk);
     Some(digest)
 }
@@ -1250,7 +1257,10 @@ fn registry_src_root(manifest_dir: &Path) -> Option<&Path> {
 /// Fold the entries under `directory` by path, kind and content. A symlink
 /// counts by its text and is not followed. With `skips_build_dirs`, a
 /// directory below `root` that Cargo tagged as its build directory counts by
-/// its tag alone.
+/// its tag alone. Below `root`, what cannot be read counts as unreadable: a
+/// proc macro this process starts cannot read it either. `Some(false)` when
+/// that includes a file: where there is no change time, a file that becomes
+/// readable keeps its stamp.
 fn crate_tree_fold(
     root: &Path,
     directory: &Path,
@@ -1259,15 +1269,22 @@ fn crate_tree_fold(
     file_hasher: &FileHasher<'_>,
     hasher: &mut blake3::Hasher,
     budget: &mut usize,
-) -> Option<()> {
-    let mut entries: Vec<_> = std::fs::read_dir(directory)
-        .ok()?
-        .collect::<std::io::Result<_>>()
-        .ok()?;
+) -> Option<bool> {
+    let listed = std::fs::read_dir(directory)
+        .and_then(|entries| entries.collect::<std::io::Result<Vec<_>>>());
+    let mut entries = match listed {
+        Ok(entries) => entries,
+        Err(_) if directory != root => {
+            fold_field(hasher, b"unreadable:", b"");
+            return Some(true);
+        }
+        Err(_) => return None,
+    };
     entries.sort_by_key(std::fs::DirEntry::file_name);
     if skips_build_dirs && directory != root {
         crate::tree_stamp::keep_only_build_tag(&mut entries);
     }
+    let mut read_every_file = true;
     for entry in entries {
         let path = entry.path();
         if excluded.contains(&path) {
@@ -1276,13 +1293,20 @@ fn crate_tree_fold(
         *budget = budget.checked_sub(1)?;
         let relative = path.strip_prefix(root).ok()?;
         fold_field(hasher, b"path:", relative.as_os_str().as_encoded_bytes());
-        let metadata = std::fs::symlink_metadata(&path).ok()?;
+        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+            fold_field(hasher, b"unreadable:", b"");
+            continue;
+        };
         if metadata.file_type().is_symlink() {
-            let target = std::fs::read_link(&path).ok()?;
-            fold_field(hasher, b"symlink:", target.as_os_str().as_encoded_bytes());
+            match std::fs::read_link(&path) {
+                Ok(target) => {
+                    fold_field(hasher, b"symlink:", target.as_os_str().as_encoded_bytes());
+                }
+                Err(_) => fold_field(hasher, b"unreadable:", b""),
+            }
         } else if metadata.is_dir() {
             fold_field(hasher, b"dir:", b"");
-            crate_tree_fold(
+            read_every_file &= crate_tree_fold(
                 root,
                 &path,
                 excluded,
@@ -1292,16 +1316,18 @@ fn crate_tree_fold(
                 budget,
             )?;
         } else if metadata.is_file() {
-            fold_field(
-                hasher,
-                b"file:",
-                file_hasher.hash_unkeyed(&path).ok()?.as_bytes(),
-            );
+            match file_hasher.hash_unkeyed(&path) {
+                Ok(hash) => fold_field(hasher, b"file:", hash.as_bytes()),
+                Err(_) => {
+                    fold_field(hasher, b"unreadable:", b"");
+                    read_every_file = false;
+                }
+            }
         } else {
             fold_field(hasher, b"other:", b"");
         }
     }
-    Some(())
+    Some(read_every_file)
 }
 
 thread_local! {
@@ -2458,6 +2484,7 @@ fn ancestor_top_digest(directory: &Path, file_hasher: &FileHasher<'_>) -> Option
             link_text: true,
             skip_build_dirs: false,
             root_metadata: false,
+            unreadable_entries: true,
         },
     }];
     let stamp = stamp_roots(&top, CRATE_TREE_MAX_ENTRIES).ok()?;
@@ -2476,26 +2503,40 @@ fn ancestor_top_digest(directory: &Path, file_hasher: &FileHasher<'_>) -> Option
             continue;
         }
         let path = entry.path();
-        let metadata = std::fs::symlink_metadata(&path).ok()?;
-        let content = if metadata.file_type().is_symlink() {
-            // Where it points, and what a read through it would find.
-            let target = std::fs::read_link(&path).ok()?;
-            let found = if path.is_file() {
-                file_hasher.hash_unkeyed(&path).ok()?
-            } else {
-                String::new()
-            };
-            format!("symlink:{}:{found}", target.display())
-        } else if metadata.is_file() {
-            format!("file:{}", file_hasher.hash_unkeyed(&path).ok()?)
-        } else if metadata.is_dir() && name.as_encoded_bytes().starts_with(b".") && name != ".git" {
-            let roots = vec![TreeRoot::new(path.clone(), b"dot_dir", &[])];
-            format!(
-                "dir:{}",
-                tree_digest(roots, file_hasher, CRATE_TREE_MAX_ENTRIES)?
-            )
-        } else {
-            continue;
+        // What this process cannot read, a macro it starts cannot read either.
+        let unreadable = || "unreadable".to_string();
+        let content = match std::fs::symlink_metadata(&path) {
+            Err(_) => unreadable(),
+            Ok(metadata) if metadata.file_type().is_symlink() => match std::fs::read_link(&path) {
+                // Where it points, and what a read through it would find.
+                Ok(target) => {
+                    let found = if path.is_file() {
+                        file_hasher
+                            .hash_unkeyed(&path)
+                            .unwrap_or_else(|_| unreadable())
+                    } else {
+                        String::new()
+                    };
+                    format!("symlink:{}:{found}", target.display())
+                }
+                Err(_) => unreadable(),
+            },
+            Ok(metadata) if metadata.is_file() => match file_hasher.hash_unkeyed(&path) {
+                Ok(hash) => format!("file:{hash}"),
+                Err(_) => unreadable(),
+            },
+            Ok(metadata)
+                if metadata.is_dir()
+                    && name.as_encoded_bytes().starts_with(b".")
+                    && name != ".git" =>
+            {
+                let roots = vec![TreeRoot::new(path.clone(), b"dot_dir", &[])];
+                format!(
+                    "dir:{}",
+                    tree_digest(roots, file_hasher, CRATE_TREE_MAX_ENTRIES)?
+                )
+            }
+            Ok(_) => continue,
         };
         fold_field(&mut hasher, b"name:", name.as_encoded_bytes());
         fold_field(&mut hasher, b"entry:", content.as_bytes());

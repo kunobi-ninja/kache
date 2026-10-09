@@ -1535,6 +1535,38 @@ fn a_file_removed_while_the_unit_builds_leaves_no_guarded_record() {
     assert_eq!(off.cache_key, restored.cache_key);
 }
 
+/// A directory the build cannot read, such as a database's data directory
+/// mounted into the workspace, counts as unreadable in the workspace guard
+/// instead of keeping every workspace unit from predicting: a proc macro
+/// cannot read it either.
+#[cfg(unix)]
+#[test]
+fn an_unreadable_directory_in_the_workspace_keeps_predictions() {
+    use std::os::unix::fs::PermissionsExt;
+    struct Readable(PathBuf);
+    impl Drop for Readable {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+    build_kache();
+    let unit = WorkspaceUnit::new(false)
+        .with_facade()
+        .with_file("kt/assets/a.txt", "a\n")
+        .with_file("pgdata/PG_VERSION", "16\n");
+    let a = unit.checkout("a");
+    let pgdata = Readable(a.join("pgdata"));
+    std::fs::set_permissions(&pgdata.0, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::read_dir(&pgdata.0).is_ok() {
+        eprintln!("skipped: this user reads past permissions");
+        return;
+    }
+    assert_eq!(unit.build(&a, true, None).result, "miss");
+    let warm = unit.build(&a, true, None);
+    assert_eq!(warm.result, "local_hit");
+    assert_eq!(warm.dep_info_runs, 0, "the record applies");
+}
+
 /// The macro finds a first file whether its directory was empty or missing
 /// when the record was made.
 #[test]

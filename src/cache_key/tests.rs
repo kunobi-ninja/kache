@@ -4382,6 +4382,49 @@ fn a_vendored_guard_moves_with_a_file_at_the_top_of_an_ancestor() {
     assert!(!taken.held(), "a file at the top of the workspace");
 }
 
+/// A file at the top of an ancestor that the build cannot read counts as
+/// unreadable in a vendored unit's guard, as it does in the workspace guard.
+#[cfg(unix)]
+#[test]
+fn a_vendored_guard_counts_an_unreadable_ancestor_file_as_unreadable() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("w");
+    write_file(&root.join("Cargo.toml"), "[workspace]\n");
+    write_file(&root.join(".env"), "A=1");
+    write_file(
+        &root.join("third_party/rust/foo/.cargo-checksum.json"),
+        "{}",
+    );
+    write_file(&root.join("third_party/rust/foo/src/lib.rs"), "");
+    let roots = WorkspaceRoots {
+        root: root.clone(),
+        cwd: String::new(),
+        canonical_root: root.canonicalize().unwrap(),
+        target: root.join("target"),
+        canonical_target: root.join("target"),
+        out_dir: None,
+        vendored_package: Some(root.join("third_party/rust/foo")),
+    };
+    let hasher = FileHasher::new();
+    let readable = workspace_tree_digest(&roots, &hasher).unwrap();
+    let env = root.join(".env");
+    struct Readable(PathBuf);
+    impl Drop for Readable {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o644));
+        }
+    }
+    let _env = Readable(env.clone());
+    std::fs::set_permissions(&env, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::read(&env).is_ok() {
+        eprintln!("skipped: this user reads past permissions");
+        return;
+    }
+    let unreadable = workspace_tree_digest(&roots, &hasher).expect("a file it cannot read");
+    assert_ne!(unreadable, readable);
+}
+
 #[test]
 fn same_dir_is_equal_spelling_or_one_place() {
     let dir = tempfile::tempdir().unwrap();
@@ -12365,6 +12408,57 @@ fn a_settled_tree_digest_is_memoised_under_its_stamp() {
     let (changed, read) = digest_at(settled + crate::tree_stamp::TreeStamp::SETTLE);
     assert!(changed.is_some_and(|changed| changed != fresh));
     assert_eq!(read, 2);
+}
+
+/// What the tree guard cannot read counts as unreadable instead of
+/// withholding the digest: a proc macro the build starts cannot read it
+/// either. A file it cannot read keeps the digest out of the memo, since only
+/// a change time would show the file becoming readable.
+#[cfg(unix)]
+#[test]
+fn what_the_tree_guard_cannot_read_counts_as_unreadable() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let memo = dir.path().join("memo");
+    let tree = dir.path().join("tree");
+    write_file(&tree.join("src/lib.rs"), "");
+    write_file(&tree.join("pgdata/PG_VERSION"), "16");
+    write_file(&tree.join("secret.env"), "A=1");
+    struct Mode(PathBuf, u32);
+    impl Drop for Mode {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(self.1));
+        }
+    }
+    let _pgdata = Mode(tree.join("pgdata"), 0o755);
+    let _secret = Mode(tree.join("secret.env"), 0o644);
+    let mode = |path: &str, mode| {
+        std::fs::set_permissions(tree.join(path), std::fs::Permissions::from_mode(mode)).unwrap();
+    };
+    let roots = || vec![TreeRoot::new(tree.clone(), b"workspace", &[])];
+    let hasher = FileHasher::new();
+    let settled = || std::time::SystemTime::now() + crate::tree_stamp::TreeStamp::SETTLE * 2;
+    let digest = || tree_digest_memoised(roots(), &hasher, 10, &memo, settled());
+    let readable = digest().unwrap();
+
+    mode("pgdata", 0o000);
+    if std::fs::read_dir(tree.join("pgdata")).is_ok() {
+        eprintln!("skipped: this user reads past permissions");
+        return;
+    }
+    let unlisted = digest().expect("a directory it cannot list");
+    assert_ne!(unlisted, readable);
+    mode("pgdata", 0o755);
+    assert_eq!(digest().as_ref(), Some(&readable));
+
+    mode("secret.env", 0o000);
+    let file = tree_digest_memo(&memo, &roots());
+    let _ = std::fs::remove_file(&file);
+    let unread = digest().expect("a file it cannot read");
+    assert_ne!(unread, readable);
+    assert!(!file.exists(), "not memoised");
+    mode("secret.env", 0o644);
+    assert_eq!(digest(), Some(readable));
 }
 
 /// A digest is memoised only while the tree still has the stamp it had

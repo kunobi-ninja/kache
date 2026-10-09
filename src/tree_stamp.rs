@@ -39,6 +39,12 @@ pub(crate) struct StampRules {
     /// Stamp the root's own metadata too, so a name created and removed
     /// again directly under it still changes the stamp.
     pub(crate) root_metadata: bool,
+    /// Below the root, stamp what cannot be read as unreadable instead of
+    /// refusing the tree: a directory that cannot be listed, an entry that
+    /// cannot be stat'ed or a link that cannot be read. Only for a digest
+    /// that does the same. A process cannot read it either, and once it can,
+    /// the walk lists or stats it and the stamp changes.
+    pub(crate) unreadable_entries: bool,
 }
 
 /// How a walk over one root ended.
@@ -47,7 +53,8 @@ pub(crate) enum WalkOutcome {
     Fits,
     /// More entries than the budget.
     TooLarge,
-    /// A directory or entry could not be read, or a symlink the rules refuse.
+    /// A directory or entry could not be read and the rules do not stamp it
+    /// as unreadable, or a symlink the rules refuse.
     Unreadable,
 }
 
@@ -90,11 +97,23 @@ impl Stamper {
         }
         let mut pending = vec![root.to_path_buf()];
         while let Some(directory) = pending.pop() {
-            let Ok(entries) = std::fs::read_dir(&directory) else {
-                return WalkOutcome::Unreadable;
-            };
-            let Ok(mut entries) = entries.collect::<std::io::Result<Vec<_>>>() else {
-                return WalkOutcome::Unreadable;
+            let listed = std::fs::read_dir(&directory)
+                .and_then(|entries| entries.collect::<std::io::Result<Vec<_>>>());
+            let mut entries = match listed {
+                Ok(entries) => entries,
+                // Its own entry is stamped; what it holds is not known.
+                Err(_) if rules.unreadable_entries && directory != root => {
+                    let Ok(relative) = directory.strip_prefix(root) else {
+                        return WalkOutcome::Unreadable;
+                    };
+                    fold(
+                        &mut self.hasher,
+                        "unlisted",
+                        relative.as_os_str().as_encoded_bytes(),
+                    );
+                    continue;
+                }
+                Err(_) => return WalkOutcome::Unreadable,
             };
             entries.sort_by_key(std::fs::DirEntry::file_name);
             if rules.skip_build_dirs && directory != root {
@@ -109,20 +128,32 @@ impl Stamper {
                     return WalkOutcome::TooLarge;
                 };
                 *budget = left;
-                let Ok(metadata) = std::fs::symlink_metadata(&child) else {
-                    return WalkOutcome::Unreadable;
-                };
                 let Ok(relative) = child.strip_prefix(root) else {
                     return WalkOutcome::Unreadable;
                 };
-                let link = if metadata.file_type().is_symlink() {
-                    match std::fs::read_link(&child) {
-                        Ok(target) if rules.link_text => Some(target),
-                        _ => return WalkOutcome::Unreadable,
+                let read = std::fs::symlink_metadata(&child).and_then(|metadata| {
+                    let link = metadata
+                        .file_type()
+                        .is_symlink()
+                        .then(|| std::fs::read_link(&child))
+                        .transpose()?;
+                    Ok((metadata, link))
+                });
+                let (metadata, link) = match read {
+                    Ok(read) => read,
+                    Err(_) if rules.unreadable_entries => {
+                        fold(
+                            &mut self.hasher,
+                            "unreadable",
+                            relative.as_os_str().as_encoded_bytes(),
+                        );
+                        continue;
                     }
-                } else {
-                    None
+                    Err(_) => return WalkOutcome::Unreadable,
                 };
+                if link.is_some() && !rules.link_text {
+                    return WalkOutcome::Unreadable;
+                }
                 fold(
                     &mut self.hasher,
                     "entry",
@@ -386,6 +417,64 @@ mod tests {
         let after = stamp(root_too);
         assert_ne!(after.digest, with_root);
         assert!(!after.settled_at(now), "the root's write is the newest");
+    }
+
+    /// A directory that cannot be listed, or an entry that cannot be stat'ed,
+    /// refuses the tree unless the rules stamp it as unreadable.
+    #[cfg(unix)]
+    #[test]
+    fn what_cannot_be_read_is_stamped_as_unreadable_or_refuses_the_tree() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir.path().join("src/lib.rs"), "");
+        write(&dir.path().join("data/PG_VERSION"), "16");
+        let data = dir.path().join("data");
+        struct Readable<'a>(&'a Path);
+        impl Drop for Readable<'_> {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(self.0, std::fs::Permissions::from_mode(0o755));
+            }
+        }
+        let _restore = Readable(&data);
+        let mode = |mode| std::fs::set_permissions(&data, std::fs::Permissions::from_mode(mode));
+        mode(0o000).unwrap();
+        if std::fs::read_dir(&data).is_ok() {
+            eprintln!("skipped: this user reads past permissions");
+            return;
+        }
+        let unreadable = StampRules {
+            unreadable_entries: true,
+            ..StampRules::default()
+        };
+        assert_eq!(
+            walk(dir.path(), StampRules::default(), 10).0,
+            WalkOutcome::Unreadable
+        );
+        let (outcome, unlisted, spent) = walk(dir.path(), unreadable, 10);
+        assert_eq!(
+            (outcome, spent),
+            (WalkOutcome::Fits, 3),
+            "`src`, its file, `data`"
+        );
+
+        // Listed, but its entries cannot be stat'ed.
+        mode(0o444).unwrap();
+        assert_eq!(
+            walk(dir.path(), StampRules::default(), 10).0,
+            WalkOutcome::Unreadable
+        );
+        let (outcome, unstated, spent) = walk(dir.path(), unreadable, 10);
+        assert_eq!((outcome, spent), (WalkOutcome::Fits, 4));
+        assert_ne!(unstated, unlisted);
+
+        mode(0o755).unwrap();
+        let (outcome, readable, _) = walk(dir.path(), unreadable, 10);
+        assert_eq!(outcome, WalkOutcome::Fits);
+        assert_ne!(readable, unstated);
+        assert_eq!(
+            walk(dir.path(), StampRules::default(), 10).0,
+            WalkOutcome::Fits
+        );
     }
 
     /// Below the root, a directory Cargo tagged counts by its tag alone. The

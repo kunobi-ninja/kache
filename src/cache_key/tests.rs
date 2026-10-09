@@ -11148,6 +11148,36 @@ fn too_new_guard_flags_inputs_modified_after_build_start() {
     );
 }
 
+/// A write after the start can carry a stamp below it, so the guard counts
+/// from one stamp window early, and the margin moves that start earlier
+/// still.
+#[test]
+fn the_too_new_guard_allows_for_coarse_file_clocks_and_keeps_its_margin() {
+    let start = 1_700_000_000_250_000_000_i64;
+    let flagged = |margin_ns: i64, stamp_ns: i64| {
+        let mut hasher = FileHasher::new();
+        hasher.arm_too_new_guard(start, margin_ns);
+        hasher.note_too_new(&FileFingerprint {
+            path: "/src/lib.rs".to_string(),
+            size: 1,
+            mtime_ns: stamp_ns,
+            ctime_ns: stamp_ns,
+            inode: 1,
+        });
+        hasher.too_new()
+    };
+    let edge = start - FINE_STAMP_WINDOW_NS;
+    assert!(flagged(0, edge));
+    assert!(!flagged(0, edge - 1));
+    assert!(
+        flagged(0, 1_699_999_999_000_000_000),
+        "a whole-second stamp 1.25 s before the start"
+    );
+    let margin = 5_000_000_000;
+    assert!(flagged(margin, edge - margin));
+    assert!(!flagged(margin, edge - margin - 1));
+}
+
 #[test]
 fn guarded_inputs_record_only_while_armed() {
     let dir = tempfile::tempdir().unwrap();

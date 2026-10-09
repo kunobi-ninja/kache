@@ -188,6 +188,47 @@ pub fn scratch_dir() -> PathBuf {
     dir
 }
 
+/// Wait until a compile started after this returns counts every file the
+/// caller has written as written before it.
+///
+/// Kache counts an input stamped up to one window before an invocation's
+/// start as written during it (`kache_store::file_hash::stamp_written_since`),
+/// and a compile that ran before its key does not store then. The window is
+/// 20 ms where stamps keep a fraction of a second, which this always waits,
+/// and two seconds for a whole-second stamp found under `dirs`. A stamp in
+/// the future cannot be waited out and is left to the test.
+#[allow(dead_code)]
+pub fn settle_writes(dirs: &[&Path]) {
+    use kache_store::file_hash::{
+        FINE_STAMP_WINDOW_NS, metadata_ctime_ns, metadata_mtime_ns, stamp_window_ns, wall_clock_ns,
+    };
+    fn collect(path: &Path, stamps: &mut Vec<i64>) {
+        let Ok(link) = std::fs::symlink_metadata(path) else {
+            return;
+        };
+        if link.is_dir() {
+            for entry in std::fs::read_dir(path).into_iter().flatten().flatten() {
+                collect(&entry.path(), stamps);
+            }
+        } else if let Ok(metadata) = std::fs::metadata(path) {
+            stamps.extend([metadata_mtime_ns(&metadata), metadata_ctime_ns(&metadata)]);
+        }
+    }
+    let now = wall_clock_ns();
+    let mut stamps = Vec::new();
+    for dir in dirs {
+        collect(dir, &mut stamps);
+    }
+    let settled_at = stamps
+        .into_iter()
+        .filter(|&stamp| stamp <= now)
+        .map(|stamp| stamp.saturating_add(stamp_window_ns(stamp)))
+        .fold(now.saturating_add(FINE_STAMP_WINDOW_NS), i64::max)
+        .saturating_add(1);
+    let wait = u64::try_from(settled_at.saturating_sub(now)).unwrap_or(0);
+    std::thread::sleep(Duration::from_nanos(wait));
+}
+
 /// The lock a live daemon holds for its whole lifetime, under `runtime_dir`.
 /// It is released only after the daemon's shutdown drain, so it is the one
 /// signal that works for Unix sockets and Windows named pipes alike.

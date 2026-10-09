@@ -2056,7 +2056,8 @@ fn key_inputs_changed_excuses_skewed_clocks_but_not_real_changes() {
 /// A dep-info source written since the invocation began refuses its store
 /// with the modified-input guard off, unless a fingerprint of that file taken
 /// before the compile still matches it. An extern whose ctime moved, as store
-/// ingest moves it on a filesystem without reflinks, does not.
+/// ingest moves it on a filesystem without reflinks, does not. A write can
+/// carry a stamp a clock tick below the start.
 #[test]
 fn a_source_written_during_the_compile_refuses_a_key_derived_after_it() {
     use crate::cache_key::FileFingerprint;
@@ -2074,12 +2075,13 @@ fn a_source_written_during_the_compile_refuses_a_key_derived_after_it() {
         .map(|path| fingerprint(path).path)
         .collect();
     let before_writes = [fingerprint(&source), fingerprint(&module)];
-    let start = before_writes
+    let last_write = before_writes
         .iter()
         .map(|input| input.mtime_ns.max(input.ctime_ns))
         .max()
-        .unwrap()
-        + 1;
+        .unwrap();
+    // Past every stamp window, and off a whole second.
+    let start = (last_write / 1_000_000_000 + 3) * 1_000_000_000 + 500_000_000;
     let at = |input: &FileFingerprint, ns: i64| FileFingerprint {
         mtime_ns: ns,
         ctime_ns: ns,
@@ -2106,6 +2108,20 @@ fn a_source_written_during_the_compile_refuses_a_key_derived_after_it() {
     let unrecorded = sources_written_since(&[fingerprint(&source)], &sources, start);
     assert_eq!(unrecorded.len(), 1, "{unrecorded:?}");
     assert_eq!(unrecorded[0].path, fingerprint(&module).path);
+
+    let edge = at(
+        &fingerprint(&module),
+        start - crate::cache_key::FINE_STAMP_WINDOW_NS,
+    );
+    assert_eq!(
+        sources_written_since(&[fingerprint(&source), edge.clone()], &sources, start),
+        [edge]
+    );
+    let below = at(
+        &fingerprint(&module),
+        start - crate::cache_key::FINE_STAMP_WINDOW_NS - 1,
+    );
+    assert!(sources_written_since(&[fingerprint(&source), below], &sources, start).is_empty());
 
     #[cfg(unix)]
     {

@@ -6012,7 +6012,8 @@ fn should_skip_cache_store_for_input_race(
 }
 
 /// The emitted dep-info's files whose fingerprint, taken after the compile,
-/// shows a write at or after the invocation began. Only a write to one of
+/// shows a write at or after the invocation began, allowing for coarse file
+/// clocks ([`crate::cache_key::stamp_written_since`]). Only a write to one of
 /// these can make a key derived after the compile disagree with what rustc
 /// read. A source the hasher left no fingerprint for counts as written, since
 /// nothing shows otherwise. Externs and native libraries stay out: Cargo does
@@ -6030,7 +6031,7 @@ fn sources_written_since(
         .iter()
         .filter(|input| {
             sources.contains(&input.path)
-                && (input.mtime_ns >= invocation_start_ns || input.ctime_ns >= invocation_start_ns)
+                && crate::cache_key::stamp_written_since(input, invocation_start_ns)
         })
         .cloned()
         .collect();

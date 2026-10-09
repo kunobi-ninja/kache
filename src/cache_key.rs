@@ -6200,10 +6200,11 @@ impl Drop for FileHasher<'_> {
 }
 
 /// Optional "too-new input" guard (kunobi-ninja/kache#324). When armed, any
-/// hashed input whose mtime/ctime falls within `margin_ns` of the build's start
-/// is flagged: its content at hash time may differ from what the compiler reads,
-/// so the wrapper treats the invocation as non-cacheable (it still looks up, but
-/// refuses to store). Disabled when `invocation_start_ns == 0` (the default).
+/// hashed input whose stamp shows a write at or after `margin_ns` before the
+/// build's start ([`stamp_written_since`]) is flagged: its content at hash
+/// time may differ from what the compiler reads, so the wrapper treats the
+/// invocation as non-cacheable (it still looks up, but refuses to store).
+/// Disabled when `invocation_start_ns == 0` (the default).
 #[derive(Default)]
 struct TooNewGuard {
     invocation_start_ns: i64,
@@ -6385,8 +6386,10 @@ impl<'db> FileHasher<'db> {
     }
 
     /// Arm the too-new-input guard (kunobi-ninja/kache#324): flag any subsequently
-    /// hashed input whose mtime/ctime is within `margin_ns` of `invocation_start_ns`
-    /// (the build's wall-clock start). A `start` of 0 leaves the guard disabled.
+    /// hashed input whose stamp shows a write at or after `margin_ns` before
+    /// `invocation_start_ns` (the build's wall-clock start), allowing for coarse
+    /// file clocks ([`stamp_written_since`]). A `start` of 0 leaves the guard
+    /// disabled.
     pub fn arm_too_new_guard(&mut self, invocation_start_ns: i64, margin_ns: i64) {
         self.too_new.invocation_start_ns = invocation_start_ns;
         self.too_new.margin_ns = margin_ns;
@@ -6435,8 +6438,11 @@ impl<'db> FileHasher<'db> {
 
     fn note_too_new(&self, fingerprint: &FileFingerprint) {
         if self.too_new.invocation_start_ns > 0 {
-            let threshold = self.too_new.invocation_start_ns - self.too_new.margin_ns;
-            if fingerprint.mtime_ns >= threshold || fingerprint.ctime_ns >= threshold {
+            let since = self
+                .too_new
+                .invocation_start_ns
+                .saturating_sub(self.too_new.margin_ns);
+            if stamp_written_since(fingerprint, since) {
                 self.too_new.saw_too_new.set(true);
             }
         }

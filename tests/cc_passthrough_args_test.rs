@@ -13,6 +13,9 @@
 use std::fs;
 use std::process::Command;
 
+#[allow(dead_code)]
+mod common;
+
 fn kache_binary() -> &'static str {
     env!("CARGO_BIN_EXE_kache")
 }
@@ -187,6 +190,7 @@ fn deferred_cc_reuses_setup_and_still_invalidates_changed_headers() {
 }
 
 fn cacheable_cc_command(root: &std::path::Path) -> Command {
+    common::settle_writes(&[root]);
     let mut command = Command::new(kache_binary());
     command
         .current_dir(root)

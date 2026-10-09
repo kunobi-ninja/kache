@@ -30,6 +30,38 @@ pub fn stamp_is_settled(fingerprint: &FileFingerprint, observed_ns: i64) -> bool
     observed_ns.saturating_sub(changed) >= HASH_SETTLE_NS
 }
 
+/// How far below the wall-clock time of a write its stamp can read where
+/// stamps keep whole seconds: HFS+, ext3 and ext4 with 128-byte inodes
+/// truncate to the second, FAT to two.
+pub const WHOLE_SECOND_STAMP_WINDOW_NS: i64 = 2_000_000_000;
+
+/// The same where stamps keep a fraction of a second. They still come from
+/// a clock that can trail the wall clock by a tick: a Linux jiffy (up to
+/// 10 ms) or the 15.6 ms Windows timer.
+pub const FINE_STAMP_WINDOW_NS: i64 = 20_000_000;
+
+/// Whether `fingerprint` shows a write at or after `since_ns` on the wall
+/// clock. A write made after `since_ns` can carry a stamp below it, so each
+/// of mtime and ctime counts from one window earlier: two seconds for a
+/// time on a whole second, 20 ms otherwise. Each time gets its own window
+/// because FAT keeps a two-second write time beside the 10 ms creation
+/// time that stands in for ctime on Windows.
+pub fn stamp_written_since(fingerprint: &FileFingerprint, since_ns: i64) -> bool {
+    [fingerprint.mtime_ns, fingerprint.ctime_ns]
+        .into_iter()
+        .any(|stamp| stamp >= since_ns.saturating_sub(stamp_window_ns(stamp)))
+}
+
+/// The window for one stamp: [`WHOLE_SECOND_STAMP_WINDOW_NS`] for a time on
+/// a whole second, else [`FINE_STAMP_WINDOW_NS`].
+pub fn stamp_window_ns(stamp_ns: i64) -> i64 {
+    if stamp_ns.rem_euclid(1_000_000_000) == 0 {
+        WHOLE_SECOND_STAMP_WINDOW_NS
+    } else {
+        FINE_STAMP_WINDOW_NS
+    }
+}
+
 /// The wall clock in nanoseconds since the Unix epoch, 0 before it.
 pub fn wall_clock_ns() -> i64 {
     std::time::SystemTime::now()
@@ -838,6 +870,29 @@ mod tests {
         assert!(stamp_is_settled(&file, changed + HASH_SETTLE_NS));
         // A clock behind the file (network filesystems) is not settled.
         assert!(!stamp_is_settled(&file, changed - 1));
+    }
+
+    #[test]
+    fn a_write_counts_from_one_stamp_window_before_the_start() {
+        assert_eq!(WHOLE_SECOND_STAMP_WINDOW_NS, 2_000_000_000);
+        assert_eq!(FINE_STAMP_WINDOW_NS, 20_000_000);
+        let both = |ns| stamp("/s.rs", ns, ns);
+        let whole = 1_700_000_000_000_000_000;
+        assert!(stamp_written_since(&both(whole), whole + 2_000_000_000));
+        assert!(!stamp_written_since(&both(whole), whole + 2_000_000_001));
+        let fine = whole + 123_456_789;
+        assert!(stamp_written_since(&both(fine), fine + 20_000_000));
+        assert!(!stamp_written_since(&both(fine), fine + 20_000_001));
+        // Each time keeps its own window: a two-second FAT write time beside
+        // a 10 ms creation time, and an old whole-second mtime restored over
+        // a fresh ctime.
+        let long_ago = whole - 60_000_000_000;
+        let fat = stamp("/s.rs", whole, long_ago + 7);
+        assert!(stamp_written_since(&fat, whole + 2_000_000_000));
+        assert!(!stamp_written_since(&fat, whole + 2_000_000_001));
+        let restored = stamp("/s.rs", long_ago, fine);
+        assert!(stamp_written_since(&restored, fine + 20_000_000));
+        assert!(!stamp_written_since(&restored, fine + 20_000_001));
     }
 
     #[test]

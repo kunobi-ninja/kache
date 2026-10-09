@@ -25,7 +25,7 @@ use std::time::{Duration, SystemTime};
 use tempfile::TempDir;
 
 mod common;
-use common::{build_kache, isolated_config_path, kache_binary};
+use common::{build_kache, isolated_config_path, kache_binary, settle_writes};
 
 fn rustc_path() -> String {
     std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string())
@@ -159,6 +159,7 @@ fn run_kache_compiler_with(
         );
     }
     let config_path = write_test_config(cache_dir, predictions);
+    settle_writes(&[src.parent().expect("a source in a directory")]);
     let output = std::process::Command::new(kache_binary())
         .args(&args)
         .env("KACHE_CACHE_DIR", cache_dir)
@@ -743,6 +744,10 @@ fn kache_rustc_in(
     envs: &[(&str, &std::ffi::OsStr)],
     verify: Option<&str>,
 ) -> LastEvent {
+    let read: Vec<&Path> = std::iter::once(package)
+        .chain(envs.iter().map(|(_, dir)| Path::new(dir)))
+        .collect();
+    settle_writes(&read);
     let mut command = std::process::Command::new(kache_binary());
     command
         .args(args)
@@ -1074,6 +1079,7 @@ impl WorkspaceUnit {
         }
         args.extend(extra.iter().map(|arg| arg.to_string()));
         let config_path = write_test_config(&self.cache, predictions);
+        settle_writes(&[checkout, &target]);
         let mut command = std::process::Command::new(kache_binary());
         command
             .args(&args)

@@ -2,7 +2,7 @@
 use std::path::{Path, PathBuf};
 
 mod common;
-use common::{build_kache, hermetic_command, isolated_config_path, kache_binary};
+use common::{build_kache, hermetic_command, isolated_config_path, kache_binary, settle_writes};
 
 fn write_config(cache: &Path, readonly: Option<&Path>) -> PathBuf {
     std::fs::create_dir_all(cache).unwrap();
@@ -23,6 +23,7 @@ fn write_config(cache: &Path, readonly: Option<&Path>) -> PathBuf {
 
 fn compile(cache: &Path, config: &Path, source: &Path, out: &Path) {
     std::fs::create_dir_all(out).unwrap();
+    settle_writes(&[source.parent().expect("a source in a directory")]);
     let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into());
     let output = hermetic_command(kache_binary(), cache, Some(config))
         .args([
@@ -63,6 +64,7 @@ fn last_event_for(cache: &Path, crate_name: &str) -> serde_json::Value {
 #[cfg(unix)]
 fn compile_cc(work: &Path, cache: &Path, config: &Path) {
     let prefix_map = format!("-ffile-prefix-map={}=/readonly-probe", work.display());
+    settle_writes(&[work]);
     let output = hermetic_command(kache_binary(), cache, Some(config))
         .current_dir(work)
         .args([

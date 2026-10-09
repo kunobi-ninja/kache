@@ -6388,6 +6388,36 @@ pub(crate) struct Check {
     fix: Option<String>,
 }
 
+/// Doctor's "Remote writes" check. A daemon keeps the write mode it started
+/// with, so it can skip the uploads of a writable process; the daemon is asked
+/// only when this process could upload.
+fn remote_writes_check(
+    forced_reason: Option<String>,
+    remote_readonly: bool,
+    daemon_readonly: impl FnOnce() -> Option<bool>,
+) -> Check {
+    let daemon_skips_uploads = !remote_readonly && daemon_readonly() == Some(true);
+    let detail = if let Some(reason) = forced_reason {
+        format!("read-only — {reason}")
+    } else if remote_readonly {
+        "read-only (KACHE_REMOTE_READONLY or cache.remote_readonly)".to_string()
+    } else if daemon_skips_uploads {
+        "read-write here, but the daemon is read-only and skips uploads".to_string()
+    } else {
+        "read-write".to_string()
+    };
+    Check {
+        label: "Remote writes",
+        pass: !daemon_skips_uploads,
+        detail,
+        fix: daemon_skips_uploads.then(|| {
+            "run `kache daemon restart` from this environment; an installed service takes the \
+             setting from its own environment and config"
+                .to_string()
+        }),
+    }
+}
+
 pub(crate) fn doctor_shards(config: &Config) -> Vec<Check> {
     crate::store_view::shard_configs(config)
         .iter()
@@ -6779,29 +6809,11 @@ pub fn doctor(
             detail: remote.describe(),
             fix: None,
         });
-        // A daemon keeps the write mode it started with, so it can skip the
-        // uploads of a writable process.
-        let daemon_skips_uploads =
-            !cfg.remote_readonly && crate::daemon::daemon_remote_readonly(cfg) == Some(true);
-        let writes = if let Some(forced) = crate::policy::forced_remote_readonly() {
-            format!("read-only — {}", forced.reason)
-        } else if cfg.remote_readonly {
-            "read-only (KACHE_REMOTE_READONLY or cache.remote_readonly)".to_string()
-        } else if daemon_skips_uploads {
-            "read-write here, but the daemon is read-only and skips uploads".to_string()
-        } else {
-            "read-write".to_string()
-        };
-        checks.push(Check {
-            label: "Remote writes",
-            pass: !daemon_skips_uploads,
-            detail: writes,
-            fix: daemon_skips_uploads.then(|| {
-                "run `kache daemon restart` from this environment; an installed service takes \
-                 the setting from its own environment and config"
-                    .to_string()
-            }),
-        });
+        checks.push(remote_writes_check(
+            crate::policy::forced_remote_readonly().map(|forced| forced.reason),
+            cfg.remote_readonly,
+            || crate::daemon::daemon_remote_readonly(cfg),
+        ));
         let access = remote_access_check(remote, cfg.s3_pool_idle_secs);
         checks.push(Check {
             label: "Remote access",

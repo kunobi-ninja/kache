@@ -1344,6 +1344,23 @@ mod tests {
         assert!(validate_discovered_inputs(&prior, &prior, workspace, target, started).is_ok());
     }
 
+    /// A receipt that cannot be read for a reason other than its absence is
+    /// not reported as missing.
+    #[cfg(unix)]
+    #[test]
+    fn only_a_missing_receipt_reads_as_no_receipt_yet() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::test_support::test_config(dir.path().join("cache"));
+        let target = dir.path().join("target");
+        let missing = read_receipt(&config, &target).unwrap_err();
+        assert_eq!(missing.to_string(), "no receipt yet");
+
+        std::fs::create_dir_all(&config.cache_dir).unwrap();
+        std::fs::write(config.cache_dir.join("target-liveness"), b"a file").unwrap();
+        let unreadable = read_receipt(&config, &target).unwrap_err();
+        assert_ne!(unreadable.to_string(), "no receipt yet", "{unreadable:#}");
+    }
+
     fn receipt_for_test(units: Vec<ObservedUnit>) -> Receipt {
         Receipt {
             schema: SCHEMA,

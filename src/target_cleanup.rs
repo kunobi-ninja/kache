@@ -270,7 +270,7 @@ pub(crate) fn sweep(config: &Config, now: u64) -> anyhow::Result<Swept> {
     // unused; note that first. Only the free-space floor reads it, and the
     // walk reads every armed target's fingerprints.
     let mut unused = std::collections::HashMap::<PathBuf, Option<SystemTime>>::new();
-    if config.auto_recover_min_free_bytes > 0 {
+    if recovers_free_space(config) {
         for tracked in store.tracked_target_roots(0)? {
             let since = crate::unit_prune::unused_since(&config.cache_dir, &tracked.path);
             unused.insert(tracked.path, since);
@@ -520,7 +520,12 @@ fn watch_counts(is_local: Option<bool>) -> bool {
 /// Whether discovered targets are watched at all: only the idle rule and the
 /// free-space floor read the watch, and both are off by default.
 fn watches_discovered(config: &Config) -> bool {
-    config.auto_clean_idle_targets_days > 0 || config.auto_recover_min_free_bytes > 0
+    config.auto_clean_idle_targets_days > 0 || recovers_free_space(config)
+}
+
+/// Whether a free-space floor is set.
+fn recovers_free_space(config: &Config) -> bool {
+    config.auto_recover_min_free_bytes > 0
 }
 
 /// Whether to watch a discovered target: it is still the recorded target
@@ -1221,8 +1226,10 @@ mod tests {
         let mut policy = config(dir.path(), true, 0);
         policy.auto_clean_unused_units_days = 30;
         assert!(!watches_discovered(&policy), "off by default");
+        assert!(!recovers_free_space(&policy));
         policy.auto_recover_min_free_bytes = 1;
         assert!(watches_discovered(&policy), "the free-space floor");
+        assert!(recovers_free_space(&policy));
         assert!(watches_discovered(&config(dir.path(), false, 1)), "idle");
 
         assert_eq!(

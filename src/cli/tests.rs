@@ -4843,6 +4843,41 @@ fn stats_show_a_read_only_daemon_to_a_writable_process() {
     assert!(stats_row(&out, "Uploads").is_none());
 }
 
+/// Doctor flags a writable process whose daemon is read-only, and asks the
+/// daemon only when this process could upload.
+#[test]
+fn doctor_flags_a_read_only_daemon_for_a_writable_process() {
+    let check = remote_writes_check(None, false, || Some(true));
+    assert!(!check.pass, "{}", check.detail);
+    assert!(
+        check.detail.contains("daemon is read-only"),
+        "{}",
+        check.detail
+    );
+    assert!(
+        check
+            .fix
+            .as_deref()
+            .is_some_and(|fix| fix.contains("kache daemon restart"))
+    );
+    for daemon in [Some(false), None] {
+        let check = remote_writes_check(None, false, || daemon);
+        assert!(check.pass, "{daemon:?}");
+        assert_eq!(check.detail, "read-write");
+        assert!(check.fix.is_none());
+    }
+    for forced in [None, Some("pull request".to_string())] {
+        let check = remote_writes_check(forced.clone(), true, || {
+            panic!("a process that cannot upload must not ask the daemon")
+        });
+        assert!(check.pass);
+        assert!(check.detail.starts_with("read-only"), "{}", check.detail);
+        if let Some(reason) = forced {
+            assert!(check.detail.contains(&reason), "{}", check.detail);
+        }
+    }
+}
+
 /// What kache-action reads from `kache stats`: the rest of the first line
 /// whose `Remote` label is followed by a colon or at least two spaces.
 fn action_remote_value(lines: &[String]) -> Option<String> {

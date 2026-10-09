@@ -127,7 +127,7 @@ pub(crate) enum Unit {
 }
 
 impl Unit {
-    fn fingerprint(&self) -> PathBuf {
+    pub(crate) fn fingerprint(&self) -> PathBuf {
         match self {
             Unit::PerUnit { dir } => dir.join("fingerprint"),
             Unit::Shared {
@@ -142,7 +142,7 @@ impl Unit {
 
     /// Everything the unit owns, fingerprint first. `outputs` indexes a
     /// shared layout's `deps/` and `examples/` by hash.
-    fn parts(&self, outputs: &Outputs) -> Vec<PathBuf> {
+    pub(crate) fn parts(&self, outputs: &Outputs) -> Vec<PathBuf> {
         match self {
             Unit::PerUnit { dir } => vec![dir.join("fingerprint"), dir.clone()],
             Unit::Shared {
@@ -170,7 +170,7 @@ impl Unit {
 
 /// A shared layout's `deps/` and `examples/` entries by the hash in their
 /// name, each with the name before the hash.
-type Outputs = HashMap<String, Vec<(String, PathBuf)>>;
+pub(crate) type Outputs = HashMap<String, Vec<(String, PathBuf)>>;
 
 /// Split `name` at its `-<16 hex>` unit hash, the hash followed by the end
 /// or a `.`: `libserde-0123456789abcdef.rlib` is `("libserde", hash)`.
@@ -183,7 +183,7 @@ pub(crate) fn hashed_name(name: &str) -> Option<(&str, &str)> {
     })
 }
 
-fn outputs(profile: &Path) -> Outputs {
+pub(crate) fn outputs(profile: &Path) -> Outputs {
     let mut outputs = Outputs::new();
     for dir in ["deps", "examples"] {
         for entry in entries(&profile.join(dir)) {
@@ -472,7 +472,7 @@ fn sweep(target_dir: &Path, armed: Option<SystemTime>) -> (Pruned, bool) {
 }
 
 /// Cargo locks this process holds, released when dropped.
-struct Held(Vec<std::fs::File>);
+pub(crate) struct Held(Vec<std::fs::File>);
 
 impl Drop for Held {
     fn drop(&mut self) {
@@ -486,7 +486,7 @@ impl Drop for Held {
 
 /// Take every Cargo lock of `profile` without waiting, creating any that is
 /// missing. `None` while a build holds one.
-fn hold(profile: &Path) -> Option<Held> {
+pub(crate) fn hold(profile: &Path) -> Option<Held> {
     let mut held = Held(Vec::new());
     for name in LOCKS {
         let file = std::fs::OpenOptions::new()

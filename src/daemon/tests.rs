@@ -1335,6 +1335,7 @@ pub(super) fn test_config(dir: &Path) -> Config {
         cache_executables: false,
         cache_cc_links: false,
         trust_codegen_backends: false,
+        target_liveness: false,
         clean_incremental: false,
         preserve_incremental: false,
         adaptive_incremental: true,

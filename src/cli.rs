@@ -4739,6 +4739,133 @@ fn path_was_removed(path: &std::path::Path) -> bool {
     !path.exists()
 }
 
+#[derive(serde::Serialize)]
+struct UnitCleanRow {
+    path: String,
+    workspace: String,
+    plan: crate::target_liveness::Plan,
+    removed: crate::unit_prune::Pruned,
+}
+
+fn unit_target_matches(
+    root: &crate::store::TrackedTargetRoot,
+    selected: Option<&std::path::Path>,
+) -> bool {
+    selected.is_none_or(|path| path == root.path || path == root.workspace_root)
+}
+
+fn unit_target_intact(root: &crate::store::TrackedTargetRoot) -> bool {
+    root.workspace_root.is_dir()
+        && crate::machine::target_root_is_safe(&root.path, &root.workspace_root)
+        && crate::machine::directory_identity(&root.path) == Some(root.identity)
+}
+
+fn unit_preview(dry_run: bool, yes: bool, json: bool) -> bool {
+    dry_run || (json && !yes)
+}
+
+fn render_unit_plan(path: &str, plan: &crate::target_liveness::Plan) -> String {
+    if plan.status == "ready" {
+        format!(
+            "{path}: {} obsolete units ({}), {} live and {} unknown units kept",
+            plan.units,
+            ByteSize(plan.bytes),
+            plan.protected,
+            plan.unknown
+        )
+    } else {
+        format!(
+            "{path}: {}; everything kept. Capture a receipt with KACHE_TARGET_LIVENESS=1 kache cargo check",
+            plan.status
+        )
+    }
+}
+
+/// Remove only units excluded by an intact receipt for the recorded Cargo command.
+pub(crate) fn clean_units(
+    config: &Config,
+    path: Option<std::path::PathBuf>,
+    dry_run: bool,
+    yes: bool,
+    json: bool,
+) -> Result<()> {
+    let selected = path
+        .map(|path| {
+            std::fs::canonicalize(&path)
+                .with_context(|| format!("cannot select {}", path.display()))
+        })
+        .transpose()?;
+    let store = Store::open(config)?;
+    let roots: Vec<_> = store
+        .tracked_target_roots(0)?
+        .into_iter()
+        .filter(|root| unit_target_matches(root, selected.as_deref()) && unit_target_intact(root))
+        .collect();
+    let mut rows: Vec<_> = roots
+        .iter()
+        .map(|root| UnitCleanRow {
+            path: root.path.display().to_string(),
+            workspace: root.workspace_root.display().to_string(),
+            plan: crate::target_liveness::preview(config, &root.path, &root.workspace_root),
+            removed: Default::default(),
+        })
+        .collect();
+    let units: usize = rows.iter().map(|row| row.plan.units).sum();
+    let preview = unit_preview(dry_run, yes, json);
+    if !json {
+        if rows.is_empty() {
+            println!(
+                "No intact tracked target matches. Capture one with KACHE_TARGET_LIVENESS=1 kache cargo check."
+            );
+        }
+        for row in &rows {
+            println!("{}", render_unit_plan(&row.path, &row.plan));
+        }
+    }
+    if !preview
+        && units > 0
+        && confirm_removal_with(
+            &format!("Remove {units} obsolete build units?"),
+            yes,
+            std::io::stdin().is_terminal(),
+            |question| prompt_yes_no(question, false, false),
+        )?
+    {
+        for (root, row) in roots.iter().zip(&mut rows) {
+            if row.plan.status == "ready" && unit_target_intact(root) {
+                row.removed = crate::target_liveness::prune(
+                    config,
+                    &root.path,
+                    &root.workspace_root,
+                    None,
+                    std::time::SystemTime::now(),
+                )?;
+            }
+        }
+    }
+    if json {
+        #[derive(serde::Serialize)]
+        struct Body {
+            preview: bool,
+            targets: Vec<UnitCleanRow>,
+        }
+        return crate::machine::emit(
+            "clean",
+            Body {
+                preview,
+                targets: rows,
+            },
+            Vec::new(),
+        );
+    }
+    if !preview {
+        let removed: usize = rows.iter().map(|row| row.removed.units).sum();
+        let bytes: u64 = rows.iter().map(|row| row.removed.bytes).sum();
+        println!("Removed {removed} obsolete units ({}).", ByteSize(bytes));
+    }
+    Ok(())
+}
+
 /// Find and remove target directories, either below cwd or from the bounded
 /// machine-local registry populated by the compiler wrapper.
 pub fn clean(
@@ -5216,6 +5343,7 @@ pub(crate) struct TargetRow {
     discovered: bool,
     /// What the daemon's next quiet pass would do to this target.
     next_pass: crate::target_cleanup::Plan,
+    unit_cleanup: crate::target_liveness::Plan,
     profiles: Vec<String>,
     /// Bytes its files add up to, counting shared blocks in full.
     apparent_bytes: u64,
@@ -5281,6 +5409,11 @@ fn target_rows(config: &Config, now: i64) -> Result<Vec<TargetRow>> {
                 .map(|idle| idle as u64),
             discovered: tracked.discovered,
             next_pass,
+            unit_cleanup: crate::target_liveness::preview(
+                config,
+                &tracked.path,
+                &tracked.workspace_root,
+            ),
             profiles,
             apparent_bytes: stats.total_bytes,
             reclaimable_bytes: stats.estimated_reclaimable_bytes,
@@ -5298,6 +5431,21 @@ fn format_idle(seconds: u64) -> String {
         s if s >= 3_600 => format!("{}h", s / 3_600),
         s if s >= 60 => format!("{}m", s / 60),
         s => format!("{s}s"),
+    }
+}
+
+fn unit_cleanup_note(plan: &crate::target_liveness::Plan) -> String {
+    if plan.status == "ready" {
+        if plan.units > 0 {
+            format!(
+                "  ({} obsolete units: kache clean --units --dry-run)",
+                plan.units
+            )
+        } else {
+            String::new()
+        }
+    } else {
+        format!("  (unit cleanup: {})", plan.status)
     }
 }
 
@@ -5327,8 +5475,9 @@ fn render_targets(rows: &[TargetRow]) -> Vec<String> {
             ""
         };
         let next_pass = next_pass_note(&row.next_pass);
+        let units = unit_cleanup_note(&row.unit_cleanup);
         lines.push(format!(
-            "  {:>10}  {:>10}  {:>5}  {}{deleted}{discovered}{next_pass}",
+            "  {:>10}  {:>10}  {:>5}  {}{deleted}{discovered}{next_pass}{units}",
             ByteSize(row.reclaimable_bytes).to_string(),
             ByteSize(row.apparent_bytes).to_string(),
             row.idle_seconds

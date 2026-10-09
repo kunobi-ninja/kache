@@ -8,8 +8,11 @@
 
 use anyhow::{Context, Result, bail};
 use std::ffi::{OsStr, OsString};
+use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{ChildStdout, Command, ExitStatus, Stdio};
+use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::time::{Duration, Instant};
 
 const ENCODED_SEPARATOR: char = '\x1f';
 const WORKTREE_BUILD_DIR_CONFIG: &str = "build.build-dir=\"{workspace-root}/target\"";
@@ -192,7 +195,7 @@ fn run_cargo_with_target_protection(command: Command, cargo: &Path) -> Result<()
     let config = crate::config::Config::load().context("loading the cache configuration")?;
     let target_use = crate::target_use::shared(&config.cache_dir)
         .context("protecting target directories while Cargo runs")?;
-    run_cargo_guarded(command, cargo, target_use)
+    run_cargo_guarded(command, cargo, target_use, &config)
 }
 
 fn real_cargo_program(shimmed: bool) -> Result<PathBuf> {
@@ -207,23 +210,280 @@ fn real_cargo_program(shimmed: bool) -> Result<PathBuf> {
     resolve_cargo_program(&program, &cwd)
 }
 
+/// Maximum retained Cargo protocol line. Longer stdout still reaches the user,
+/// but cannot establish a complete artifact receipt.
+const MAX_CARGO_PROTOCOL_LINE: usize = 4 * 1024 * 1024;
+const INVALID_CARGO_STREAM: &[u8] = b"\0kache-invalid-cargo-stream\n";
+const CARGO_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Stay alive with the lease until Cargo and everything it runs has exited.
 fn run_cargo_guarded(
     mut command: Command,
     cargo: &Path,
     _lease: crate::target_use::Lease,
+    config: &crate::config::Config,
 ) -> Result<()> {
+    let mut capture = crate::target_liveness::Capture::prepare(&command, cargo, config);
+    // Start the reader before changing Cargo's stdout mode. If the OS cannot
+    // create a thread, Cargo retains its ordinary output and execution path.
+    let reader = if capture.is_some() {
+        match start_cargo_stdout_reader() {
+            Ok(reader) => Some(reader),
+            Err(error) => {
+                tracing::warn!(%error, "target liveness stdout capture unavailable");
+                capture = None;
+                None
+            }
+        }
+    } else {
+        None
+    };
+    if let Some(capture) = &capture {
+        if capture.human_output() {
+            command.arg("--message-format=json-render-diagnostics");
+        }
+        command.stdout(Stdio::piped());
+    }
     let mut child = command
         .spawn()
         .with_context(|| format!("running Cargo program {cargo:?}"))?;
     crate::test_runner::signals::forward_to(child.id());
-    let status = child.wait().context("waiting for Cargo")?;
+    let status = match (capture.as_mut(), reader) {
+        (Some(capture), Some((ready, messages))) => match child.stdout.take() {
+            Some(stdout) => {
+                if ready.send(stdout).is_ok() {
+                    drain_cargo_stdout(&mut child, capture, messages)?
+                } else {
+                    capture.observe(INVALID_CARGO_STREAM);
+                    child.wait().context("waiting for Cargo")?
+                }
+            }
+            None => {
+                capture.observe(INVALID_CARGO_STREAM);
+                child.wait().context("waiting for Cargo")?
+            }
+        },
+        _ => child.wait().context("waiting for Cargo")?,
+    };
+    if let Some(capture) = capture
+        && let Err(error) = capture.finish(status.success())
+    {
+        tracing::warn!(%error, "target liveness receipt not recorded");
+    }
     std::process::exit(crate::test_runner::finish(
         crate::test_runner::exit_disposition(
             status.code(),
             crate::test_runner::signals::of(&status),
         ),
     ));
+}
+
+enum CargoStdoutMessage {
+    Bytes(Vec<u8>),
+    Finished,
+    Failed(io::Error),
+}
+
+/// Both channels and the reader buffer are bounded. Dropping the receiver
+/// releases a blocked send; a descendant retaining the pipe never delays the
+/// Cargo exit path because the reader is not joined.
+fn start_cargo_stdout_reader() -> io::Result<(SyncSender<ChildStdout>, Receiver<CargoStdoutMessage>)>
+{
+    let (ready, input) = mpsc::sync_channel::<ChildStdout>(1);
+    let (sender, messages) = mpsc::sync_channel(8);
+    let _reader = std::thread::Builder::new()
+        .name("cargo-stdout".into())
+        .spawn(move || {
+            let Ok(stdout) = input.recv() else {
+                return;
+            };
+            let mut reader = BufReader::with_capacity(8192, stdout);
+            loop {
+                match reader.fill_buf() {
+                    Ok([]) => {
+                        let _ = sender.send(CargoStdoutMessage::Finished);
+                        return;
+                    }
+                    Ok(bytes) => {
+                        let count = bytes.len();
+                        if sender
+                            .send(CargoStdoutMessage::Bytes(bytes.to_vec()))
+                            .is_err()
+                        {
+                            return;
+                        }
+                        reader.consume(count);
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(error) => {
+                        let _ = sender.send(CargoStdoutMessage::Failed(error));
+                        return;
+                    }
+                }
+            }
+        })?;
+    Ok((ready, messages))
+}
+
+fn drain_cargo_stdout(
+    child: &mut std::process::Child,
+    capture: &mut crate::target_liveness::Capture,
+    messages: Receiver<CargoStdoutMessage>,
+) -> Result<ExitStatus> {
+    let mut status = None;
+    let mut exited_at = None;
+    let mut output = CargoOutput::new(capture.human_output());
+    let stdout = io::stdout();
+    let mut writer = stdout.lock();
+    loop {
+        if status.is_none()
+            && let Some(exited) = child.try_wait().context("checking Cargo status")?
+        {
+            status = Some(exited);
+            exited_at = Some(Instant::now());
+        }
+        match messages.recv_timeout(Duration::from_millis(25)) {
+            Ok(CargoStdoutMessage::Bytes(bytes)) => {
+                if let Err(error) =
+                    output.push(&bytes, &mut |line| capture.observe(line), &mut writer)
+                {
+                    capture.observe(INVALID_CARGO_STREAM);
+                    tracing::debug!(%error, "forwarding Cargo stdout failed");
+                }
+            }
+            Ok(CargoStdoutMessage::Finished) => {
+                if let Err(error) = output.finish(&mut |line| capture.observe(line), &mut writer) {
+                    capture.observe(INVALID_CARGO_STREAM);
+                    tracing::debug!(%error, "forwarding Cargo stdout tail failed");
+                }
+                break;
+            }
+            Ok(CargoStdoutMessage::Failed(error)) => {
+                capture.observe(INVALID_CARGO_STREAM);
+                tracing::warn!(%error, "reading Cargo stdout failed");
+                break;
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                capture.observe(INVALID_CARGO_STREAM);
+                break;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+        if exited_at.is_some_and(|at| at.elapsed() >= CARGO_DRAIN_TIMEOUT) {
+            capture.observe(INVALID_CARGO_STREAM);
+            // Preserve the nonprotocol tail, but do not certify a partial stream.
+            if let Err(error) = writer.write_all(&output.line) {
+                tracing::debug!(%error, "forwarding incomplete Cargo stdout failed");
+            }
+            tracing::warn!(
+                "Cargo exited while a descendant retained its stdout; receipt not recorded"
+            );
+            break;
+        }
+    }
+    match status {
+        Some(status) => Ok(status),
+        None => child.wait().context("waiting for Cargo"),
+    }
+}
+
+struct CargoOutput {
+    line: Vec<u8>,
+    oversized: bool,
+    human: bool,
+}
+
+impl CargoOutput {
+    fn new(human: bool) -> Self {
+        Self {
+            line: Vec::new(),
+            oversized: false,
+            human,
+        }
+    }
+
+    /// Incremental bounded framing. An oversized line is streamed unchanged
+    /// until its newline, then framing resumes for subsequent records.
+    fn push(
+        &mut self,
+        bytes: &[u8],
+        observe: &mut impl FnMut(&[u8]) -> bool,
+        writer: &mut impl Write,
+    ) -> io::Result<()> {
+        let mut error = None;
+        for part in bytes.split_inclusive(|byte| *byte == b'\n') {
+            let result = if self.oversized {
+                self.oversized = !part.ends_with(b"\n");
+                writer.write_all(part)
+            } else if part.len() > MAX_CARGO_PROTOCOL_LINE.saturating_sub(self.line.len()) {
+                observe(INVALID_CARGO_STREAM);
+                let result = writer
+                    .write_all(&self.line)
+                    .and_then(|_| writer.write_all(part));
+                self.line.clear();
+                self.oversized = !part.ends_with(b"\n");
+                result
+            } else {
+                self.line.extend_from_slice(part);
+                if part.ends_with(b"\n") {
+                    self.emit(observe, writer)
+                } else {
+                    Ok(())
+                }
+            };
+            if let Err(failed) = result {
+                error.get_or_insert(failed);
+            }
+        }
+        match error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    fn finish(
+        &mut self,
+        observe: &mut impl FnMut(&[u8]) -> bool,
+        writer: &mut impl Write,
+    ) -> io::Result<()> {
+        if self.line.is_empty() {
+            Ok(())
+        } else {
+            self.emit(observe, writer)
+        }
+    }
+
+    fn emit(
+        &mut self,
+        observe: &mut impl FnMut(&[u8]) -> bool,
+        writer: &mut impl Write,
+    ) -> io::Result<()> {
+        let protocol = observe(&self.line);
+        let result = if self.human && protocol {
+            replay_rendered_cargo_diagnostic(&self.line);
+            Ok(())
+        } else {
+            writer.write_all(&self.line)
+        };
+        self.line.clear();
+        result
+    }
+}
+
+fn rendered_cargo_diagnostic(line: &[u8]) -> Option<String> {
+    let message = serde_json::from_slice::<serde_json::Value>(line).ok()?;
+    if message["reason"] != "compiler-message" {
+        return None;
+    }
+    message["message"]["rendered"].as_str().map(str::to_string)
+}
+
+fn replay_rendered_cargo_diagnostic(line: &[u8]) {
+    if let Some(rendered) = rendered_cargo_diagnostic(line)
+        && let Err(error) = io::stderr().lock().write_all(rendered.as_bytes())
+    {
+        tracing::debug!(%error, "forwarding rendered Cargo diagnostic failed");
+    }
 }
 
 fn resolve_cargo_program(program: &OsStr, cwd: &Path) -> Result<PathBuf> {
@@ -757,6 +1017,159 @@ fn revalidate_sources(sources: &[ConfigSource]) -> std::result::Result<(), Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn known_protocol(line: &[u8]) -> bool {
+        serde_json::from_slice::<serde_json::Value>(line)
+            .ok()
+            .is_some_and(|value| {
+                matches!(
+                    value["reason"].as_str(),
+                    Some("compiler-artifact" | "build-finished" | "compiler-message")
+                )
+            })
+    }
+
+    #[test]
+    fn cargo_stdout_explicit_json_remains_byte_identical_across_chunk_boundaries() {
+        let original = b"{\"reason\":\"compiler-artifact\",\"filenames\":[\"a.rlib\"]}\r\nplain stdout\n{\"reason\":\"build-finished\",\"success\":true}\nunterminated\xff";
+        let mut output = CargoOutput::new(false);
+        let mut forwarded = Vec::new();
+        let mut observed = Vec::new();
+        let mut observe = |line: &[u8]| {
+            observed.push(line.to_vec());
+            known_protocol(line)
+        };
+        for chunk in original.chunks(7) {
+            output.push(chunk, &mut observe, &mut forwarded).unwrap();
+        }
+        output.finish(&mut observe, &mut forwarded).unwrap();
+        assert_eq!(forwarded, original);
+        assert_eq!(observed.len(), 4);
+        assert_eq!(observed.last().unwrap(), b"unterminated\xff");
+        assert!(output.line.is_empty());
+    }
+
+    #[test]
+    fn cargo_stdout_injected_human_mode_suppresses_only_recognized_protocol() {
+        let original = b"ordinary stdout\n{\"reason\":\"compiler-artifact\"}\n{\"reason\":\"future-reason\"}\n{\"reason\":\"compiler-message\",\"message\":{\"rendered\":null}}\n{\"reason\":\"build-finished\"}";
+        let mut output = CargoOutput::new(true);
+        let mut forwarded = Vec::new();
+        let mut observed = Vec::new();
+        let mut observe = |line: &[u8]| {
+            observed.push(line.to_vec());
+            known_protocol(line)
+        };
+        for chunk in original.chunks(3) {
+            output.push(chunk, &mut observe, &mut forwarded).unwrap();
+        }
+        output.finish(&mut observe, &mut forwarded).unwrap();
+        assert_eq!(
+            forwarded,
+            b"ordinary stdout\n{\"reason\":\"future-reason\"}\n"
+        );
+        assert_eq!(observed.len(), 5);
+        assert!(output.line.is_empty());
+    }
+
+    #[test]
+    fn cargo_stdout_oversized_line_is_bounded_forwarded_and_invalidates_once() {
+        for human in [false, true] {
+            let mut original = vec![b'x'; MAX_CARGO_PROTOCOL_LINE + 31];
+            original.extend_from_slice(b"\n{\"reason\":\"build-finished\"}\n");
+            let mut output = CargoOutput::new(human);
+            let mut forwarded = Vec::new();
+            let mut invalidations = 0;
+            let mut protocol_lines = 0;
+            let mut observe = |line: &[u8]| {
+                if line == INVALID_CARGO_STREAM {
+                    invalidations += 1;
+                    return false;
+                }
+                protocol_lines += 1;
+                known_protocol(line)
+            };
+            for chunk in original.chunks(8192) {
+                output.push(chunk, &mut observe, &mut forwarded).unwrap();
+                assert!(output.line.len() <= 4_194_304);
+            }
+            output.finish(&mut observe, &mut forwarded).unwrap();
+            assert_eq!(invalidations, 1);
+            assert_eq!(protocol_lines, 1);
+            assert!(!output.oversized);
+            if human {
+                assert_eq!(forwarded, original[..MAX_CARGO_PROTOCOL_LINE + 32]);
+            } else {
+                assert_eq!(forwarded, original);
+            }
+        }
+    }
+
+    #[test]
+    fn cargo_stdout_exact_line_limit_is_observed_without_invalidation() {
+        let mut bytes = vec![b'x'; 4_194_303];
+        bytes.push(b'\n');
+        let mut output = CargoOutput::new(false);
+        let mut forwarded = Vec::new();
+        let mut observations = 0;
+        let mut observe = |line: &[u8]| {
+            assert_ne!(line, INVALID_CARGO_STREAM);
+            assert_eq!(line.len(), 4_194_304);
+            observations += 1;
+            false
+        };
+        for chunk in bytes.chunks(8192) {
+            output.push(chunk, &mut observe, &mut forwarded).unwrap();
+        }
+        output.finish(&mut observe, &mut forwarded).unwrap();
+        assert_eq!(forwarded, bytes);
+        assert_eq!(observations, 1);
+    }
+
+    #[test]
+    fn cargo_stdout_write_failure_still_observes_and_drains_remaining_records() {
+        struct BrokenOutput;
+        impl io::Write for BrokenOutput {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed"))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut output = CargoOutput::new(false);
+        let mut observed = Vec::new();
+        let mut observe = |line: &[u8]| {
+            observed.push(line.to_vec());
+            false
+        };
+        assert!(
+            output
+                .push(b"one\ntwo\n", &mut observe, &mut BrokenOutput)
+                .is_err()
+        );
+        assert!(output.line.is_empty());
+        assert!(output.finish(&mut observe, &mut BrokenOutput).is_ok());
+        assert_eq!(observed, vec![b"one\n".to_vec(), b"two\n".to_vec()]);
+    }
+
+    #[test]
+    fn cargo_rendered_diagnostic_requires_compiler_message_and_string() {
+        assert_eq!(
+            rendered_cargo_diagnostic(
+                br#"{"reason":"compiler-message","message":{"rendered":"error: failure\n"}}"#
+            )
+            .as_deref(),
+            Some("error: failure\n")
+        );
+        for bytes in [
+            br#"{"reason":"compiler-message","message":{"rendered":null}}"#.as_slice(),
+            br#"{"reason":"compiler-artifact","message":{"rendered":"do not render"}}"#.as_slice(),
+            b"plain stdout".as_slice(),
+            b"\xff".as_slice(),
+        ] {
+            assert!(rendered_cargo_diagnostic(bytes).is_none());
+        }
+    }
 
     #[test]
     fn command_gate_accepts_only_unambiguous_builtin_build_and_check() {

@@ -76,6 +76,19 @@ pub struct BuildEvent {
     pub size: u64,
     #[serde(default)]
     pub cache_key: String,
+    /// Cargo package name captured from the compiler invocation, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rebuilt_package: Option<String>,
+    /// Kache's cache/input key for this successful compilation. This is not
+    /// Cargo's on-disk final freshness fingerprint; unkeyed compiles omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rebuilt_fingerprint: Option<String>,
+    /// Primary observed compiler output; never an inferred output directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rebuilt_path: Option<String>,
+    /// Complete observed compiler output set, excluding Kache's store staging.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rebuilt_paths: Vec<String>,
     /// Event schema version: 0 = legacy, 1 = prefetch-aware,
     /// 2 = compile-cost-aware, 3 = op-count-aware, 4 = probe-count-aware,
     /// 5 = passthrough details, 6 = file-hash cache metrics,
@@ -95,6 +108,7 @@ pub struct BuildEvent {
     /// 23 = per-phase restore/store copy fallback counters.
     /// 24 = per-variable hashes of compiler-reported environment inputs.
     /// 25 = reasons for compiled results that were not stored.
+    /// 26 = successful compilation outputs and captured package identity.
     #[serde(default)]
     pub schema: u32,
     /// Build session this event belongs to (kunobi-ninja/kache#583 P0.5).
@@ -578,6 +592,52 @@ pub const HEARTBEAT_EVENT_TAG: &str = "heartbeat";
 
 /// Current [`HeartbeatEvent::schema`] version.
 pub const HEARTBEAT_SCHEMA: u32 = 1;
+
+pub const CLEANUP_EVENT_TAG: &str = "target-cleanup";
+pub const CLEANUP_SCHEMA: u32 = 1;
+
+/// A completed target cleanup. Separate from compiler events so maintenance
+/// work cannot count as a compile, cache miss or build-time saving.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CleanupEvent {
+    pub event: String,
+    pub schema: u32,
+    pub ts: DateTime<Utc>,
+    pub target: String,
+    pub root: String,
+    pub removed_paths: Vec<String>,
+    pub removed_units: u64,
+    pub removed_bytes: u64,
+    pub reason: String,
+}
+
+impl CleanupEvent {
+    pub fn new(
+        target: String,
+        root: String,
+        removed_paths: Vec<String>,
+        removed_units: u64,
+        removed_bytes: u64,
+        reason: String,
+    ) -> Self {
+        Self {
+            event: CLEANUP_EVENT_TAG.to_string(),
+            schema: CLEANUP_SCHEMA,
+            ts: Utc::now(),
+            target,
+            root,
+            removed_paths,
+            removed_units,
+            removed_bytes,
+            reason,
+        }
+    }
+}
+
+/// Append maintenance evidence with the same lock as compiler events.
+pub fn log_cleanup(event_log_path: &Path, event: &CleanupEvent) -> Result<()> {
+    append_json_line(event_log_path, event)
+}
 
 /// One parsed line of the event log, for consumers that want the full mixed
 /// stream (`kache monitor`). Existing [`BuildEvent`]-only readers keep their
@@ -1669,6 +1729,10 @@ impl BuildEvent {
             compile_time_ms,
             size,
             cache_key: cache_key.to_string(),
+            rebuilt_package: None,
+            rebuilt_fingerprint: None,
+            rebuilt_path: None,
+            rebuilt_paths: Vec::new(),
             schema: 8,
             key_ms: 0,
             key_hash_hits: 0,
@@ -1834,6 +1898,10 @@ mod tests {
             compile_time_ms: 250,
             size: 3145728,
             cache_key: "abc123".to_string(),
+            rebuilt_package: None,
+            rebuilt_fingerprint: None,
+            rebuilt_path: None,
+            rebuilt_paths: Vec::new(),
             schema: 8,
             key_ms: 0,
             key_hash_hits: 0,
@@ -3076,5 +3144,76 @@ mod tests {
             actual_polled.len(),
             actual_polled.last()
         );
+    }
+}
+
+#[cfg(test)]
+mod cleanup_and_rebuild_tests {
+    use super::*;
+
+    #[test]
+    fn cleanup_round_trip_does_not_count_as_a_build() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        let cleanup = CleanupEvent::new(
+            "/work/target".into(),
+            "/work".into(),
+            vec!["/work/target/debug/deps/stale.rlib".into()],
+            2,
+            4097,
+            "unreachable".into(),
+        );
+        log_cleanup(&path, &cleanup).unwrap();
+        let raw = fs::read_to_string(&path).unwrap();
+        let json: serde_json::Value = serde_json::from_str(raw.trim()).unwrap();
+        assert_eq!(json["event"], "target-cleanup");
+        assert_eq!(json["schema"], 1);
+        assert_eq!(json["target"], "/work/target");
+        assert_eq!(json["root"], "/work");
+        assert_eq!(json["removed_units"], 2);
+        assert_eq!(json["removed_bytes"], 4097);
+        assert_eq!(json["reason"], "unreachable");
+        assert_eq!(
+            json["removed_paths"][0],
+            "/work/target/debug/deps/stale.rlib"
+        );
+        assert_eq!(
+            serde_json::from_str::<CleanupEvent>(raw.trim()).unwrap(),
+            cleanup
+        );
+        assert!(serde_json::from_str::<BuildEvent>(raw.trim()).is_err());
+        assert!(parse_event_line(raw.trim()).is_none());
+        assert!(read_events(&path).unwrap().is_empty());
+        let build = BuildEvent::new_for_test("current", EventResult::LocalHit);
+        log_event(&path, &build).unwrap();
+        assert_eq!(read_events(&path).unwrap(), vec![build]);
+        assert_eq!(fs::read_to_string(path).unwrap().lines().count(), 2);
+    }
+
+    #[test]
+    fn legacy_build_event_omits_rebuilt_claims_and_new_fields_round_trip() {
+        let event = BuildEvent::new_for_test("example", EventResult::Miss);
+        let legacy = serde_json::to_value(&event).unwrap();
+        for field in [
+            "rebuilt_package",
+            "rebuilt_fingerprint",
+            "rebuilt_path",
+            "rebuilt_paths",
+        ] {
+            assert!(legacy.get(field).is_none());
+        }
+        let restored: BuildEvent = serde_json::from_value(legacy).unwrap();
+        assert!(restored.rebuilt_package.is_none());
+        assert!(restored.rebuilt_fingerprint.is_none());
+        assert!(restored.rebuilt_path.is_none());
+        assert!(restored.rebuilt_paths.is_empty());
+        let mut rebuilt = event;
+        rebuilt.schema = 26;
+        rebuilt.rebuilt_package = Some("package-name".into());
+        rebuilt.rebuilt_fingerprint = Some("input-key".into());
+        rebuilt.rebuilt_path = Some("/target/example".into());
+        rebuilt.rebuilt_paths = vec!["/target/example".into(), "/target/example.d".into()];
+        let raw = serde_json::to_string(&rebuilt).unwrap();
+        assert_eq!(serde_json::from_str::<BuildEvent>(&raw).unwrap(), rebuilt);
     }
 }

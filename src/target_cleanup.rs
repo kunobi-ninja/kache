@@ -228,7 +228,7 @@ pub(crate) fn sweep(config: &Config, now: u64) -> anyhow::Result<Swept> {
         let intact = intact(&tracked);
         let Some(reason) = reason(config, orphaned, idle) else {
             if let Some(window) = window.filter(|_| intact && !tracked.discovered) {
-                let pruned = crate::unit_prune::prune(&config.cache_dir, &tracked.path, window, at);
+                let pruned = prune_units(config, &tracked, window, at);
                 if pruned.units > 0 {
                     swept.pruned.push((tracked.path, pruned));
                 }
@@ -323,8 +323,52 @@ pub(crate) fn plan(config: &Config, tracked: &TrackedTargetRoot, now: u64) -> Pl
         units: window
             .filter(|_| !tracked.discovered)
             .map_or_else(Default::default, |window| {
-                crate::unit_prune::preview(&config.cache_dir, &tracked.path, window, at)
+                preview_units(config, tracked, window, at)
             }),
+    }
+}
+
+fn prune_units(
+    config: &Config,
+    tracked: &TrackedTargetRoot,
+    window: Duration,
+    at: SystemTime,
+) -> crate::unit_prune::Pruned {
+    if config.target_liveness {
+        crate::target_liveness::prune(
+            config,
+            &tracked.path,
+            &tracked.workspace_root,
+            Some(window),
+            at,
+        )
+        .unwrap_or_default()
+    } else {
+        crate::unit_prune::prune(&config.cache_dir, &tracked.path, window, at)
+    }
+}
+
+fn preview_units(
+    config: &Config,
+    tracked: &TrackedTargetRoot,
+    window: Duration,
+    at: SystemTime,
+) -> crate::unit_prune::Pruned {
+    if config.target_liveness {
+        let plan = crate::target_liveness::preview_window(
+            config,
+            &tracked.path,
+            &tracked.workspace_root,
+            Some(window),
+            at,
+        );
+        crate::unit_prune::Pruned {
+            units: plan.units,
+            bytes: plan.bytes,
+            used: plan.protected,
+        }
+    } else {
+        crate::unit_prune::preview(&config.cache_dir, &tracked.path, window, at)
     }
 }
 
@@ -379,8 +423,7 @@ fn prune_under_pressure(
         let Some(before) = kache_fs::volume_usage(&tracked.path) else {
             continue;
         };
-        let pruned =
-            crate::unit_prune::prune(&config.cache_dir, &tracked.path, PRESSURE_UNIT_WINDOW, at);
+        let pruned = prune_units(config, &tracked, PRESSURE_UNIT_WINDOW, at);
         if kept_used(&pruned) {
             used.insert(tracked.path.clone());
         }
@@ -667,6 +710,39 @@ mod tests {
         config.auto_clean_orphaned_targets = orphans;
         config.auto_clean_idle_targets_days = days;
         config
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn precise_cleanup_keeps_units_without_receipts_instead_of_falling_back_to_atime() {
+        let dir = tempfile::tempdir().unwrap();
+        if !crate::unit_prune::reads_visible(dir.path()) {
+            return;
+        }
+        let mut policy = config(&dir.path().join("cache"), false, 0);
+        let store = Store::open(&policy).unwrap();
+        let (_, target) = tracked_target(&store, dir.path(), "live");
+        let unit = old_unit(&target, "0123456789abcdef");
+        let tracked = root_of(&store, &target);
+        let now = unix_now_secs();
+        let window = Duration::from_secs(30 * DAY_SECS);
+        let armed = SystemTime::UNIX_EPOCH + Duration::from_secs(now - 40 * DAY_SECS);
+        assert_eq!(prune_units(&policy, &tracked, window, armed).units, 0);
+        let at = SystemTime::UNIX_EPOCH + Duration::from_secs(now);
+        assert_eq!(preview_units(&policy, &tracked, window, at).units, 1);
+        policy.target_liveness = true;
+        assert_eq!(
+            preview_units(&policy, &tracked, window, at),
+            Default::default()
+        );
+        assert_eq!(
+            prune_units(&policy, &tracked, window, at),
+            Default::default()
+        );
+        assert!(unit.exists());
+        policy.target_liveness = false;
+        assert_eq!(prune_units(&policy, &tracked, window, at).units, 1);
+        assert!(!unit.exists());
     }
 
     /// A workspace under `root` with a Cargo target directory kache tracks.

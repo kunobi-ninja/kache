@@ -78,6 +78,7 @@ use compiler_store as store;
 mod store_view;
 mod target_cleanup;
 mod target_dedup;
+mod target_liveness;
 mod target_seed;
 mod target_use;
 mod term;
@@ -202,6 +203,10 @@ enum Commands {
         /// the ones kache tracks
         #[arg(value_name = "DIR", conflicts_with_all = ["cache", "crate_name"])]
         path: Option<PathBuf>,
+
+        /// Remove obsolete units in live targets using a recorded Cargo command
+        #[arg(long, visible_alias = "artifacts", conflicts_with_all = ["cache", "crate_name", "stale", "orphans", "stale_schema"])]
+        units: bool,
 
         /// Show what would be removed and what kache keeps, and remove nothing
         #[arg(long, short = 'n')]
@@ -1074,8 +1079,12 @@ fn run_cli(cli: Cli, readiness: Option<kunobi_daemon::readiness::channel::Notifi
             all,
             crate_name,
             stale_schema,
+            units,
             tracked: _,
         }) => {
+            if units {
+                return cli::clean_units(&config, path, dry_run, yes, json);
+            }
             let stale_hours = stale
                 .as_deref()
                 .map(|value| {
@@ -2036,6 +2045,29 @@ mod tests {
         assert!(parse(&["--cache", "--all", "--stale", "7d"]).is_err());
         for hidden in ["gc", "purge", "targets", "report"] {
             assert!(Cli::try_parse_from(["kache", hidden]).is_ok(), "{hidden}");
+        }
+    }
+
+    #[test]
+    fn clean_units_accepts_preview_and_apply_but_rejects_other_scopes() {
+        for spelling in ["--units", "--artifacts"] {
+            let parsed =
+                Cli::try_parse_from(["kache", "clean", spelling, "target", "--dry-run", "--json"])
+                    .unwrap();
+            assert!(
+                matches!(parsed.command, Some(Commands::Clean { units: true, dry_run: true, ref path, .. }) if path == &Some(PathBuf::from("target")))
+            );
+            assert!(Cli::try_parse_from(["kache", "clean", spelling, "--yes"]).is_ok());
+            for arguments in [
+                vec!["--cache"],
+                vec!["--crate", "serde"],
+                vec!["--stale", "1d"],
+                vec!["--orphans"],
+                vec!["--cache", "--stale-schema"],
+            ] {
+                let args = ["kache", "clean", spelling].into_iter().chain(arguments);
+                assert!(Cli::try_parse_from(args).is_err());
+            }
         }
     }
 

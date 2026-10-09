@@ -213,6 +213,7 @@ pub(crate) fn test_config(cache_dir: PathBuf) -> crate::config::Config {
         cache_executables: false,
         cache_cc_links: false,
         trust_codegen_backends: false,
+        target_liveness: false,
         clean_incremental: true,
         preserve_incremental: false,
         adaptive_incremental: true,

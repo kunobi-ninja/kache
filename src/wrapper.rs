@@ -1063,6 +1063,7 @@ fn wrapper_entry() -> std::time::Instant {
 /// restore failure recompiles via passthrough (nvcc always rewrites
 /// `-o` outputs fresh, so no partial-restore abort).
 pub fn run_nvcc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
+    let rebuilt_package = KeyEnv::capture().var("CARGO_PKG_NAME");
     let _trace = crate::phase_trace::start("nvcc", wrapper_args);
     let start = wrapper_entry();
     let invocation_start_ns = std::time::SystemTime::now()
@@ -1421,6 +1422,7 @@ pub fn run_nvcc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     log_event(
         config,
         EventInputs::new(&event_root, &crate_name, event_result, elapsed)
+            .rebuilt(result.exit_code == 0, &result.artifacts, rebuilt_package)
             .compile_time_ms(compile_time_ms)
             .size(size)
             .keyed(&cache_key, key_ms, FileHashStats::default())
@@ -1734,6 +1736,7 @@ thread_local! {
     /// passthrough taken on that path returns the compile's exit code
     /// instead of running the compiler a second time.
     static CC_PRECOMPILED_EXIT: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
+    static CC_PRECOMPILED_REBUILT: std::cell::RefCell<RebuiltArtifacts> = std::cell::RefCell::new(RebuiltArtifacts::default());
 }
 
 fn run_cc_inner(
@@ -1901,6 +1904,7 @@ fn run_cc_with_store(
     } = invocation;
     let start = *start;
     let invocation_start_ns = *invocation_start_ns;
+    let rebuilt_package = KeyEnv::capture().var("CARGO_PKG_NAME");
     // Compute the cache key (runs `cc -E -P` for the preprocessor
     // hash). On any failure — preprocessor error, missing compiler —
     // fall back to passthrough, which runs the real compiler and
@@ -2331,6 +2335,11 @@ fn run_cc_with_store(
                         lookup_ms,
                         lookup_rejection: &lookup_rejection,
                         store_start,
+                        rebuilt: RebuiltArtifacts::observed(
+                            result.exit_code == 0,
+                            &result.artifacts,
+                            rebuilt_package.clone(),
+                        ),
                         memo: handoff_memo,
                     };
                     match hand_off_cc_store(config, store, &mut _build_lock, handoff) {
@@ -2407,6 +2416,7 @@ fn run_cc_with_store(
     log_event(
         config,
         EventInputs::new(event_root, crate_name, event_result, elapsed)
+            .rebuilt(result.exit_code == 0, &result.artifacts, rebuilt_package)
             .compile_time_ms(compile_time_ms)
             .size(size)
             .keyed(&cache_key, key_ms, FileHashStats::default())
@@ -4100,6 +4110,9 @@ fn run_parsed_rustc(
         return Ok(result.exit_code);
     }
 
+    let rebuilt =
+        RebuiltArtifacts::observed(true, &result.artifacts, key_env.var("CARGO_PKG_NAME"));
+
     // too-new-input guard (kunobi-ninja/kache#324): if any keyed input was
     // modified within this build window, the hashes feeding the cache key are
     // racy versus what rustc actually read — refuse to store (the compile
@@ -4120,6 +4133,7 @@ fn run_parsed_rustc(
         log_event(
             config,
             EventInputs::new(&event_root, crate_name, EventResult::Skipped, elapsed)
+                .rebuilt_observed(rebuilt.clone())
                 .skip_reason("inputs-changed")
                 .keyed(&cache_key, key_ms, key_hash_stats)
                 .lookup_ms(lookup_ms)
@@ -4137,6 +4151,7 @@ fn run_parsed_rustc(
         log_event(
             config,
             EventInputs::new(&event_root, crate_name, EventResult::Skipped, elapsed)
+                .rebuilt_observed(rebuilt.clone())
                 .skip_reason("out-dir-alias-changed")
                 .compile_time_ms(compile_time_ms)
                 .keyed(&cache_key, key_ms, key_hash_stats)
@@ -4174,6 +4189,7 @@ fn run_parsed_rustc(
         log_event(
             config,
             EventInputs::new(&event_root, crate_name, EventResult::Skipped, elapsed)
+                .rebuilt_observed(rebuilt.clone())
                 .skip_reason(format!("missing-output: {missing}"))
                 .compile_time_ms(compile_time_ms)
                 .keyed(&cache_key, key_ms, key_hash_stats)
@@ -4207,6 +4223,7 @@ fn run_parsed_rustc(
         log_event(
             config,
             EventInputs::new(&event_root, crate_name, EventResult::Skipped, elapsed)
+                .rebuilt_observed(rebuilt.clone())
                 .skip_reason(reason)
                 .compile_time_ms(compile_time_ms)
                 .keyed(&cache_key, key_ms, key_hash_stats)
@@ -4232,6 +4249,7 @@ fn run_parsed_rustc(
         log_event(
             config,
             EventInputs::new(&event_root, crate_name, EventResult::Skipped, elapsed)
+                .rebuilt_observed(rebuilt.clone())
                 .skip_reason("admission-threshold")
                 .compile_time_ms(compile_time_ms)
                 .keyed(&cache_key, key_ms, key_hash_stats)
@@ -4337,6 +4355,7 @@ fn run_parsed_rustc(
             log_event(
                 config,
                 EventInputs::new(&event_root, crate_name, EventResult::Skipped, elapsed)
+                    .rebuilt_observed(rebuilt.clone())
                     .skip_reason(format!("dep-info-staging: {error:#}"))
                     .compile_time_ms(compile_time_ms)
                     .keyed(&cache_key, key_ms, key_hash_stats)
@@ -4365,6 +4384,7 @@ fn run_parsed_rustc(
         log_event(
             config,
             EventInputs::new(&event_root, crate_name, EventResult::Skipped, elapsed)
+                .rebuilt_observed(rebuilt.clone())
                 .skip_reason(compiled_without_lock_reason(peer_committed))
                 .compile_time_ms(compile_time_ms)
                 .keyed(&cache_key, key_ms, key_hash_stats)
@@ -4444,6 +4464,7 @@ fn run_parsed_rustc(
     log_event(
         config,
         EventInputs::new(&event_root, crate_name, event_result, elapsed)
+            .rebuilt_observed(rebuilt)
             .compile_time_ms(compile_time_ms)
             .size(size)
             .keyed(&cache_key, key_ms, key_hash_stats)
@@ -4489,6 +4510,7 @@ struct CcHandoff<'a> {
     lookup_ms: u64,
     lookup_rejection: &'a str,
     store_start: std::time::Instant,
+    rebuilt: RebuiltArtifacts,
     /// The read-set memo for the daemon to record with the entry.
     memo: Option<crate::daemon_publish::CcMemoHandoff>,
 }
@@ -4538,6 +4560,7 @@ fn hand_off_cc_store(
             EventResult::Miss,
             elapsed,
         )
+        .rebuilt_observed(handoff.rebuilt.clone())
         .compile_time_ms(handoff.compile_time_ms)
         .size(handoff.size)
         .keyed(handoff.cache_key, handoff.key_ms, FileHashStats::default())
@@ -5647,6 +5670,7 @@ fn compile_before_key(
             log_event(
                 config,
                 EventInputs::new(ctx.event_root, crate_name, EventResult::Skipped, elapsed)
+                    .rebuilt(true, &result.artifacts, ctx.key_env.var("CARGO_PKG_NAME"))
                     .skip_reason("missing-dep-info")
                     .compile_time_ms(compile_time_ms)
                     .keyed("", key_ms, key_hash_stats)
@@ -5657,6 +5681,10 @@ fn compile_before_key(
         }
     };
     let exit_code = result.exit_code;
+    PRECOMPILED_REBUILT.with(|cell| {
+        *cell.borrow_mut() =
+            RebuiltArtifacts::observed(true, &result.artifacts, ctx.key_env.var("CARGO_PKG_NAME"))
+    });
     PRECOMPILED_EXIT.with(|cell| cell.set(Some(exit_code)));
     let stored = run_parsed_rustc(
         config,
@@ -5678,6 +5706,7 @@ fn compile_before_key(
         }),
     );
     PRECOMPILED_EXIT.with(|cell| cell.set(None));
+    PRECOMPILED_REBUILT.with(|cell| *cell.borrow_mut() = RebuiltArtifacts::default());
     // Whatever the store step reported, the compile succeeded and its
     // outputs are in place.
     stored.or(Ok(exit_code))
@@ -6931,6 +6960,7 @@ fn adaptive_incremental_with_event<R: Into<String>>(
     let compiler_args = lease.compiler_args(args);
     let compile_start = std::time::Instant::now();
     let compiler = RustcCompiler::new().with_base_dirs(config.base_dirs.clone());
+    let rebuilt_package = KeyEnv::capture().var("CARGO_PKG_NAME");
     let compile = if kind == crate::incremental_policy::LeaseKind::Immediate {
         compiler.execute_passthrough_preserving_incremental(args, &compiler_args)
     } else {
@@ -6977,6 +7007,7 @@ fn adaptive_incremental_with_event<R: Into<String>>(
             EventResult::Passthrough,
             start.elapsed().as_millis() as u64,
         )
+        .rebuilt(result.exit_code == 0, &result.artifacts, rebuilt_package)
         .compile_time_ms(compile_time_ms)
         .keyed(cache_key, key_ms, key_hash_stats)
         .lookup_ms(lookup_ms)
@@ -6992,6 +7023,7 @@ thread_local! {
     /// compiler already ran and printed its diagnostics (with the artifact
     /// notifications Cargo pipelines on), so no branch may run it again.
     static PRECOMPILED_EXIT: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
+    static PRECOMPILED_REBUILT: std::cell::RefCell<RebuiltArtifacts> = std::cell::RefCell::new(RebuiltArtifacts::default());
 }
 
 /// Category of the passthrough reason for a rustc compile kache could not
@@ -7051,6 +7083,7 @@ fn passthrough_with_event<R: Into<String>>(
         log_event(
             config,
             EventInputs::new(root, crate_name, EventResult::Skipped, elapsed)
+                .rebuilt_observed(PRECOMPILED_REBUILT.with(|cell| cell.borrow().clone()))
                 .skip_reason(reason)
                 .key_record(key_record),
         );
@@ -7145,6 +7178,7 @@ fn cc_compile_before_key(
     file_hasher: &crate::cache_key::FileHasher<'_>,
     flight: Option<crate::store::StoreLock>,
 ) -> Result<i32> {
+    let rebuilt_package = KeyEnv::capture().var("CARGO_PKG_NAME");
     let CcStoreInvocation {
         compiler,
         parsed,
@@ -7200,6 +7234,7 @@ fn cc_compile_before_key(
         return Ok(result.exit_code);
     }
     let exit_code = result.exit_code;
+    let rebuilt = RebuiltArtifacts::observed(true, &result.artifacts, rebuilt_package);
     if inputs.is_none() {
         return cc_precompiled_skipped(
             config,
@@ -7208,8 +7243,10 @@ fn cc_compile_before_key(
             start,
             "the compile left no usable read set".to_string(),
             exit_code,
+            rebuilt,
         );
     }
+    CC_PRECOMPILED_REBUILT.with(|cell| *cell.borrow_mut() = rebuilt);
     CC_PRECOMPILED_EXIT.with(|cell| cell.set(Some(exit_code)));
     let stored = run_cc_with_store(
         config,
@@ -7222,10 +7259,12 @@ fn cc_compile_before_key(
         }),
     );
     CC_PRECOMPILED_EXIT.with(|cell| cell.set(None));
+    CC_PRECOMPILED_REBUILT.with(|cell| *cell.borrow_mut() = RebuiltArtifacts::default());
     stored.or(Ok(exit_code))
 }
 
 /// The compile ran; whatever stopped the store, its exit code stands.
+#[allow(clippy::too_many_arguments)]
 fn cc_precompiled_skipped(
     config: &Config,
     crate_name: &str,
@@ -7233,12 +7272,15 @@ fn cc_precompiled_skipped(
     start: std::time::Instant,
     reason: String,
     exit_code: i32,
+    rebuilt: RebuiltArtifacts,
 ) -> Result<i32> {
     tracing::debug!("{crate_name}: compiled, not stored: {reason}");
     let elapsed = start.elapsed().as_millis() as u64;
     log_event(
         config,
-        EventInputs::new(root, crate_name, EventResult::Skipped, elapsed).skip_reason(reason),
+        EventInputs::new(root, crate_name, EventResult::Skipped, elapsed)
+            .rebuilt_observed(rebuilt)
+            .skip_reason(reason),
     );
     print_progress(crate_name, EventResult::Skipped, elapsed, 0);
     Ok(exit_code)
@@ -7253,7 +7295,15 @@ fn cc_passthrough_with_event<R: Into<String>>(
     reason: R,
 ) -> Result<i32> {
     if let Some(exit_code) = CC_PRECOMPILED_EXIT.with(std::cell::Cell::get) {
-        return cc_precompiled_skipped(config, crate_name, root, start, reason.into(), exit_code);
+        return cc_precompiled_skipped(
+            config,
+            crate_name,
+            root,
+            start,
+            reason.into(),
+            exit_code,
+            CC_PRECOMPILED_REBUILT.with(|cell| cell.borrow().clone()),
+        );
     }
     let output = cc_passthrough(config, parsed)?;
     log_event(
@@ -7279,7 +7329,15 @@ fn cc_direct_passthrough_with_event<R: Into<String>>(
     reason: R,
 ) -> Result<i32> {
     if let Some(exit_code) = CC_PRECOMPILED_EXIT.with(std::cell::Cell::get) {
-        return cc_precompiled_skipped(config, crate_name, root, start, reason.into(), exit_code);
+        return cc_precompiled_skipped(
+            config,
+            crate_name,
+            root,
+            start,
+            reason.into(),
+            exit_code,
+            CC_PRECOMPILED_REBUILT.with(|cell| cell.borrow().clone()),
+        );
     }
     let output = cc_direct_passthrough(config, parsed)?;
     log_event(
@@ -7294,6 +7352,53 @@ fn cc_direct_passthrough_with_event<R: Into<String>>(
         .object_output(&recorded_object_output(parsed.object_output_path())),
     );
     Ok(output.exit_code)
+}
+
+/// Compiler outputs already observed by the execution adapter.
+#[derive(Clone, Debug, Default)]
+struct RebuiltArtifacts {
+    package: Option<String>,
+    primary: Option<String>,
+    paths: Vec<String>,
+}
+
+impl RebuiltArtifacts {
+    fn observed(success: bool, artifacts: &ArtifactSet, package: Option<String>) -> Self {
+        if !success || artifacts.is_empty() {
+            return Self::default();
+        }
+        let outputs: Vec<_> = artifacts
+            .outputs()
+            .iter()
+            .filter(|artifact| artifact.kind != ArtifactKind::DebugBundle)
+            .collect();
+        if outputs.is_empty() {
+            return Self::default();
+        }
+        let primary = outputs
+            .iter()
+            .find(|artifact| {
+                matches!(
+                    artifact.kind,
+                    ArtifactKind::Executable
+                        | ArtifactKind::Metadata
+                        | ArtifactKind::Library
+                        | ArtifactKind::DynamicLibrary
+                        | ArtifactKind::WasmModule
+                        | ArtifactKind::Object
+                )
+            })
+            .or_else(|| outputs.first())
+            .map(|artifact| artifact.path.to_string_lossy().into_owned());
+        Self {
+            package: package.filter(|package| !package.is_empty()),
+            primary,
+            paths: outputs
+                .iter()
+                .map(|artifact| artifact.path.to_string_lossy().into_owned())
+                .collect(),
+        }
+    }
 }
 
 /// What one event records about the invocation it describes, besides this
@@ -7324,6 +7429,7 @@ pub(crate) struct EventInputs<'a> {
     exit_code: Option<i32>,
     fallback_attempt: Option<crate::fallback::Attempt>,
     key_record: KeyEventRecord,
+    rebuilt: RebuiltArtifacts,
 }
 
 impl<'a> EventInputs<'a> {
@@ -7357,7 +7463,36 @@ impl<'a> EventInputs<'a> {
             exit_code: None,
             fallback_attempt: None,
             key_record: KeyEventRecord::default(),
+            rebuilt: RebuiltArtifacts::default(),
         }
+    }
+
+    /// Record only a successful compiler execution with observed artifacts.
+    /// The caller supplies invocation identity, never the logging process's env.
+    pub(crate) fn rebuilt(
+        mut self,
+        success: bool,
+        artifacts: &ArtifactSet,
+        package: Option<String>,
+    ) -> Self {
+        self.rebuilt = RebuiltArtifacts::observed(
+            success
+                && !matches!(
+                    self.result,
+                    EventResult::LocalHit
+                        | EventResult::PrefetchHit
+                        | EventResult::RemoteHit
+                        | EventResult::Error
+                ),
+            artifacts,
+            package,
+        );
+        self
+    }
+
+    fn rebuilt_observed(mut self, rebuilt: RebuiltArtifacts) -> Self {
+        self.rebuilt = rebuilt;
+        self
     }
 
     /// A compile run without caching, as `output` reports it.
@@ -7587,6 +7722,7 @@ pub(crate) fn build_event_details(config: &Config, inputs: EventInputs<'_>) -> B
         exit_code,
         fallback_attempt,
         key_record: recorded,
+        rebuilt,
     } = inputs;
     // Session attribution (#583 P0.5): join or open the root's build session
     // and refresh the marker so the 5-minute window measures inactivity. Both
@@ -7646,7 +7782,12 @@ pub(crate) fn build_event_details(config: &Config, inputs: EventInputs<'_>) -> B
         compile_time_ms,
         size,
         cache_key: cache_key.to_string(),
-        schema: 25,
+        rebuilt_package: rebuilt.package,
+        rebuilt_fingerprint: (!rebuilt.paths.is_empty() && !cache_key.is_empty())
+            .then(|| cache_key.to_string()),
+        rebuilt_path: rebuilt.primary,
+        rebuilt_paths: rebuilt.paths,
+        schema: 26,
         demands: crate::demand::take(),
         session_id,
         key_ms,

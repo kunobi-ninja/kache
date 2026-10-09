@@ -1487,6 +1487,7 @@ pub fn run(config: &crate::config::Config, args: &[String]) -> Result<i32> {
         key_salt: config.key_salt.as_deref(),
         key_env_vars: &config.key_env_vars,
         extra_inputs_digest: None,
+        build_script_inputs_digest: None,
     };
     let cache_key = match RustdocCompiler.cache_key(&parsed, &ctx) {
         Ok(key) => key,

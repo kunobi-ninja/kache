@@ -182,6 +182,10 @@ pub struct KeyCtx<'a, 'db> {
     /// Rustc folds it into the key; other compiler families currently resolve
     /// their own declaration because Cargo dep-info completion is Rust-only.
     pub extra_inputs_digest: Option<&'a str>,
+    /// Digest of the inputs the unit's own build script declared (see
+    /// [`crate::build_script_inputs`]). Rustc only; `None` leaves the key
+    /// byte-identical to an out-of-scope unit's.
+    pub build_script_inputs_digest: Option<&'a str>,
 }
 
 /// Categorization of a compiler output file.

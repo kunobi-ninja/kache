@@ -276,6 +276,7 @@ fn terminal_formatting_shares_cc_keys_with_cold_and_warm_probes() {
                     key_salt: None,
                     key_env_vars: &[],
                     extra_inputs_digest: None,
+                    build_script_inputs_digest: None,
                 },
             )
             .unwrap()
@@ -2653,6 +2654,7 @@ fn cache_key_for_link_changes_when_an_object_changes() {
         key_salt: None,
         key_env_vars: &[],
         extra_inputs_digest: None,
+        build_script_inputs_digest: None,
     };
     let first = compiler.cache_key(&parsed, &ctx).unwrap();
     fs::write(&a, b"obj-a-v2").unwrap();
@@ -3141,6 +3143,7 @@ fn wa_debug_prefix_map_changes_cache_key_issue_644() {
         key_salt: None,
         key_env_vars: &[],
         extra_inputs_digest: None,
+        build_script_inputs_digest: None,
     };
 
     let key_a = compiler.cache_key(&parse("/mapped-a"), &ctx).unwrap();
@@ -3729,6 +3732,7 @@ fn cache_key_refuses_probe_captured_flags_without_resolved_invocation() {
             key_salt: None,
             key_env_vars: &[],
             extra_inputs_digest: None,
+            build_script_inputs_digest: None,
         };
 
         let err = compiler.cache_key(&parsed, &ctx).unwrap_err().to_string();
@@ -7074,6 +7078,7 @@ fn shadowing_header_changes_cc_cache_key() {
         key_salt: None,
         key_env_vars: &[],
         extra_inputs_digest: None,
+        build_script_inputs_digest: None,
     };
     let before = compiler.cache_key(&parse(), &ctx).unwrap();
     fs::write(first.join("header.h"), "#define A 2\n").unwrap();

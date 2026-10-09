@@ -6701,6 +6701,7 @@ fn seed_nvcc_entry(
         key_salt: config.key_salt.as_deref(),
         key_env_vars: &config.key_env_vars,
         extra_inputs_digest: None,
+        build_script_inputs_digest: None,
     };
     let key = compiler.cache_key(&parsed, &ctx).unwrap();
     (store, parsed, key)
@@ -10335,6 +10336,7 @@ fn a_rederived_key_holds_no_discovery_flight() {
         Some(&store),
         &KeyEnv::default(),
         None,
+        None,
         &mut key_record,
     )
     .unwrap();
@@ -10356,6 +10358,7 @@ fn a_rederived_key_holds_no_discovery_flight() {
         Some(&store),
         &KeyEnv::default(),
         Some("extra-inputs-digest"),
+        None,
         &mut KeyEventRecord::default(),
     )
     .unwrap();
@@ -10363,6 +10366,174 @@ fn a_rederived_key_holds_no_discovery_flight() {
         with_extra_inputs.cache_key, keyed.cache_key,
         "the re-derived key keeps the extra inputs"
     );
+}
+
+/// A predicted key that missed is re-derived, or keyed from the closure a
+/// running compile emits and stopped on a hit. Both keys fold the build
+/// script's declared inputs, and fold them the same way, so the probe can
+/// never match an entry stored without them.
+#[test]
+fn the_stop_on_hit_probe_and_the_rederived_key_fold_the_declared_inputs() {
+    if std::process::Command::new("rustc")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("skipped: no rustc");
+        return;
+    }
+    let _lock = crate::test_support::process_state_test_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path().join("cache"));
+    config.input_predictions = true;
+    let store = Store::open(&config).unwrap();
+    let lib = dir.path().join("src/lib.rs");
+    std::fs::create_dir_all(lib.parent().unwrap()).unwrap();
+    std::fs::write(&lib, "pub fn v() {}\n").unwrap();
+    let out = dir.path().join("target/debug/deps");
+    std::fs::create_dir_all(&out).unwrap();
+    let args = RustcCompiler::new()
+        .parse(&s(&[
+            "rustc",
+            "--crate-name",
+            "kt",
+            lib.to_str().unwrap(),
+            "--crate-type",
+            "lib",
+            "--emit=dep-info,metadata",
+            "--out-dir",
+            out.to_str().unwrap(),
+        ]))
+        .unwrap();
+    let compiler = RustcCompiler::new();
+    let key_env = KeyEnv::default();
+    let declared = BuildScriptInputs {
+        snapshot: Some(crate::build_script_inputs::Snapshot::with_digest(
+            "declared",
+        )),
+        ..BuildScriptInputs::default()
+    };
+    let undeclared = BuildScriptInputs::default();
+    let probe = |inputs: &BuildScriptInputs| {
+        let ctx = CompileFirst {
+            config: &config,
+            compiler: &compiler,
+            args: &args,
+            start: std::time::Instant::now(),
+            invocation_start_ns: 0,
+            extra_inputs: None,
+            extra_inputs_hash_stats: FileHashStats::default(),
+            extra_inputs_too_new: false,
+            extra_inputs_key_ms: 0,
+            build_script_inputs: inputs,
+            workspace_root: None,
+            store: &store,
+            key_env: &key_env,
+            crate_name: "kt",
+            event_root: "root",
+        };
+        let closure = crate::cache_key::DepInfo {
+            source_files: vec![lib.clone()],
+            env_deps: Vec::new(),
+        };
+        stop_on_hit_key(&ctx, closure, None).unwrap().cache_key
+    };
+    let rederive = |digest: Option<&str>| {
+        recompute_key_without_prediction(
+            &config,
+            &compiler,
+            &args,
+            None,
+            0,
+            Some(&store),
+            &key_env,
+            None,
+            digest,
+            &mut KeyEventRecord::default(),
+        )
+        .unwrap()
+        .cache_key
+    };
+    let probed = probe(&declared);
+    assert_ne!(probed, probe(&undeclared));
+    assert_eq!(probe(&undeclared), rederive(None));
+    assert_eq!(probed, rederive(Some("declared")));
+}
+
+/// The key folded a build script's declared inputs before the compile. When
+/// they read differently afterwards, the result is not stored.
+#[test]
+fn declared_inputs_that_moved_during_the_compile_are_caught() {
+    let _lock = crate::test_support::process_state_test_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let config = test_config(root.join("cache"));
+    let store = Store::open(&config).unwrap();
+    let package = root.join("app");
+    std::fs::create_dir_all(package.join("data")).unwrap();
+    std::fs::write(package.join("data/value.txt"), "v1").unwrap();
+    let out_dir = root.join("target/debug/build/app-0123456789abcdef/out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let stdout = out_dir.with_file_name("output");
+    std::fs::write(&stdout, "cargo:rerun-if-changed=data/value.txt\n").unwrap();
+    let deps = root.join("target/debug/deps");
+    let args = RustcCompiler::new()
+        .parse(&s(&[
+            "rustc",
+            "--crate-name",
+            "app",
+            "src/lib.rs",
+            "--out-dir",
+            deps.to_str().unwrap(),
+        ]))
+        .unwrap();
+    let vars: std::collections::HashMap<&str, OsString> = [
+        ("OUT_DIR", out_dir.clone().into_os_string()),
+        ("CARGO_MANIFEST_DIR", package.clone().into_os_string()),
+        ("CARGO_PKG_NAME", OsString::from("app")),
+    ]
+    .into_iter()
+    .collect();
+    let located =
+        crate::build_script_inputs::locate(&args, &|name| vars.get(name).cloned(), None, false)
+            .expect("the unit's own build script");
+    let before = |located: crate::build_script_inputs::Located| {
+        let mut hasher = store.file_hasher();
+        hasher.arm_too_new_guard(1, 0);
+        let crate::build_script_inputs::Resolved::Folded(snapshot) =
+            resolve_located_build_script_inputs(&config, &args, &located, &hasher, None).unwrap()
+        else {
+            panic!("the declared inputs fold");
+        };
+        BuildScriptInputs {
+            located: Some(located),
+            snapshot: Some(snapshot),
+            ..BuildScriptInputs::default()
+        }
+    };
+    let moved = |inputs: &BuildScriptInputs| {
+        build_script_inputs_moved(&config, &args, &store, inputs, None)
+    };
+    assert!(
+        !moved(&BuildScriptInputs::default()),
+        "nothing folded, nothing to check"
+    );
+    let snapshot = before(located.clone());
+    assert!(!moved(&snapshot), "nothing changed");
+    std::fs::write(package.join("data/value.txt"), "v2").unwrap();
+    assert!(moved(&snapshot), "a declared file changed");
+
+    let snapshot = before(located.clone());
+    std::fs::remove_file(&stdout).unwrap();
+    assert!(moved(&snapshot), "Cargo's record of the run went away");
+    std::fs::write(&stdout, "cargo:rerun-if-changed=data/value.txt\n").unwrap();
+
+    let snapshot = before(located);
+    std::fs::File::create(&stdout)
+        .unwrap()
+        .set_len(64 << 20)
+        .unwrap();
+    assert!(moved(&snapshot), "the record can no longer be read");
 }
 
 /// A hit restores a unit without its incremental state, so it counts as the

@@ -90,6 +90,23 @@ impl Stamper {
         rules: StampRules,
         budget: &mut usize,
     ) -> WalkOutcome {
+        self.walk_skipping(
+            root,
+            &|child, _| excluded.iter().any(|path| path == child),
+            rules,
+            budget,
+        )
+    }
+
+    /// [`Self::walk`], leaving out every entry `skips` names by its path and
+    /// its listing entry, wherever it appears below `root`.
+    pub(crate) fn walk_skipping(
+        &mut self,
+        root: &Path,
+        skips: &dyn Fn(&Path, &std::fs::DirEntry) -> bool,
+        rules: StampRules,
+        budget: &mut usize,
+    ) -> WalkOutcome {
         if rules.root_metadata {
             let Ok(metadata) = std::fs::metadata(root) else {
                 return WalkOutcome::Unreadable;
@@ -124,7 +141,7 @@ impl Stamper {
             }
             for entry in entries {
                 let child = entry.path();
-                if excluded.contains(&child)
+                if skips(&child, &entry)
                     || rules.top_files_only && entry.file_type().is_ok_and(|kind| kind.is_dir())
                 {
                     continue;
@@ -205,16 +222,6 @@ impl Stamper {
     }
 }
 
-/// The stamp of one tree that holds no symlink, as a build script's declared
-/// directory must: its digest reads through links. `None` when the tree is
-/// larger than the budget, unreadable, or holds a symlink.
-pub(crate) fn tree_stamp(path: &Path, excluded: &[PathBuf], budget: usize) -> Option<TreeStamp> {
-    let mut stamper = Stamper::new();
-    let mut remaining = budget;
-    (stamper.walk(path, excluded, StampRules::default(), &mut remaining) == WalkOutcome::Fits)
-        .then(|| stamper.finish())
-}
-
 /// The file Cargo writes into a build directory it creates.
 const BUILD_TAG: &str = "CACHEDIR.TAG";
 
@@ -253,7 +260,7 @@ fn fold(hasher: &mut blake3::Hasher, label: &str, value: &[u8]) {
 }
 
 /// Size and times of one entry, plus the inode where the platform has one.
-fn fold_metadata_stamp(hasher: &mut blake3::Hasher, metadata: &std::fs::Metadata) {
+pub(crate) fn fold_metadata_stamp(hasher: &mut blake3::Hasher, metadata: &std::fs::Metadata) {
     hasher.update(&metadata.len().to_le_bytes());
     for time in [metadata.modified().ok(), metadata.created().ok()] {
         let nanos = time
@@ -293,6 +300,17 @@ mod tests {
 
     const CARGO_TAG: &str = "Signature: 8a477f597d28d172789f06886806bc55\n\
          # This file is a cache directory tag created by cargo.\n";
+
+    /// The stamp of one tree under the default rules, which hold no
+    /// symlink, as a build script's declared directory must: its digest
+    /// reads through links. `None` when the tree is larger than the budget,
+    /// unreadable, or holds a symlink.
+    fn tree_stamp(path: &Path, excluded: &[PathBuf], budget: usize) -> Option<TreeStamp> {
+        let mut stamper = Stamper::new();
+        let mut remaining = budget;
+        (stamper.walk(path, excluded, StampRules::default(), &mut remaining) == WalkOutcome::Fits)
+            .then(|| stamper.finish())
+    }
 
     fn walk(root: &Path, rules: StampRules, budget: usize) -> (WalkOutcome, String, usize) {
         let mut stamper = Stamper::new();

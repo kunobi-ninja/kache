@@ -1278,6 +1278,7 @@ pub fn run_nvcc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         key_salt: config.key_salt.as_deref(),
         key_env_vars: &config.key_env_vars,
         extra_inputs_digest: None,
+        build_script_inputs_digest: None,
     };
     let cache_key = match compiler.cache_key(&parsed, &key_ctx) {
         Ok(k) => k,
@@ -2036,6 +2037,7 @@ fn run_cc_with_store(
         key_salt: config.key_salt.as_deref(),
         key_env_vars: &config.key_env_vars,
         extra_inputs_digest: None,
+        build_script_inputs_digest: None,
     };
     let mut captured_inputs_changed = false;
     let discovery = match precompiled.as_mut().and_then(|pre| pre.inputs.take()) {
@@ -3349,6 +3351,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         extra_inputs_key_ms,
         extra_inputs_guard_inputs,
         None,
+        None,
     )?;
 
     if exit == 0 {
@@ -3437,6 +3440,171 @@ pub(crate) fn complete_extra_inputs_dep_info(
         })
 }
 
+/// What the key folds from the inputs the unit's own build script declared
+/// (see [`crate::build_script_inputs`]). Resolved before the compile and
+/// carried into the keyed flow a deferred compile re-enters.
+#[derive(Default)]
+struct BuildScriptInputs {
+    located: Option<crate::build_script_inputs::Located>,
+    snapshot: Option<crate::build_script_inputs::Snapshot>,
+    key_ms: u64,
+    hash_stats: FileHashStats,
+}
+
+impl BuildScriptInputs {
+    fn digest(&self) -> Option<&str> {
+        self.snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.digest.as_str())
+    }
+}
+
+/// Resolve the inputs the unit's own build script declared. The store's
+/// hasher memoises their content, and its guard keeps each file's
+/// fingerprint for the check after the compile (see
+/// [`build_script_inputs_moved`]). An error means the unit cannot be keyed
+/// without risking a stale hit.
+fn resolve_build_script_inputs(
+    config: &Config,
+    args: &RustcArgs,
+    store: &Store,
+    invocation_start_ns: i64,
+    workspace_root: Option<&Path>,
+    cwd: Option<&Path>,
+) -> Result<BuildScriptInputs> {
+    let _trace = crate::phase_trace::phase("build_script_inputs");
+    let start = std::time::Instant::now();
+    let Some(located) = crate::build_script_inputs::locate(
+        args,
+        &|name: &str| std::env::var_os(name),
+        cwd,
+        crate::out_dir_alias::active_alias().is_some(),
+    ) else {
+        return Ok(BuildScriptInputs::default());
+    };
+    let mut file_hasher = store.file_hasher_with_daemon(config.socket_path());
+    file_hasher.arm_too_new_guard(invocation_start_ns, 0);
+    let resolved =
+        resolve_located_build_script_inputs(config, args, &located, &file_hasher, workspace_root)?;
+    let crate_name = args.crate_name.as_deref().unwrap_or("unknown");
+    let snapshot = match resolved {
+        crate::build_script_inputs::Resolved::Folded(snapshot) => {
+            // Counts only: a declared variable may hold a secret.
+            tracing::trace!(
+                "[key:{crate_name}] build_script_inputs package_mode={} paths={} vars={} -> {}",
+                snapshot.package_mode,
+                snapshot.paths,
+                snapshot.vars,
+                &snapshot.digest[..16],
+            );
+            Some(snapshot)
+        }
+        crate::build_script_inputs::Resolved::Unrecorded => None,
+        crate::build_script_inputs::Resolved::PackageTooLarge => {
+            warn_build_script_package_too_large(config, &located);
+            None
+        }
+    };
+    Ok(BuildScriptInputs {
+        located: Some(located),
+        snapshot,
+        key_ms: start.elapsed().as_millis() as u64,
+        hash_stats: file_hasher.stats(),
+    })
+}
+
+/// [`crate::build_script_inputs::resolve`] with the roots this invocation
+/// leaves out of walked trees, spelling outside paths as the key does.
+fn resolve_located_build_script_inputs(
+    config: &Config,
+    args: &RustcArgs,
+    located: &crate::build_script_inputs::Located,
+    file_hasher: &FileHasher<'_>,
+    workspace_root: Option<&Path>,
+) -> Result<crate::build_script_inputs::Resolved> {
+    let excluded = crate::build_script_inputs::excluded_roots(args.target_dir(), &config.cache_dir);
+    let normalizer = std::cell::OnceCell::new();
+    let outside = |path: &Path| {
+        let normalizer = normalizer.get_or_init(|| {
+            crate::path_normalizer::PathNormalizer::from_env(workspace_root)
+                .with_target_dir(args.target_dir().as_deref())
+                .with_base_dirs(&config.base_dirs)
+        });
+        crate::cache_key::source_path_identity(path, normalizer)
+    };
+    crate::build_script_inputs::resolve(
+        located,
+        &crate::build_script_inputs::Resolver {
+            file_hasher,
+            var: &|name: &str| std::env::var_os(name),
+            cache_dir: &config.cache_dir,
+            excluded: &excluded,
+            outside: &outside,
+            max_entries: crate::build_script_inputs::MAX_ENTRIES,
+        },
+    )
+}
+
+/// Whether the inputs the key folded moved while the unit compiled: a
+/// resolve after the compile must give the same snapshot, and one that
+/// cannot counts as moved.
+fn build_script_inputs_moved(
+    config: &Config,
+    args: &RustcArgs,
+    store: &Store,
+    before: &BuildScriptInputs,
+    workspace_root: Option<&Path>,
+) -> bool {
+    let (Some(located), Some(snapshot)) = (&before.located, &before.snapshot) else {
+        return false;
+    };
+    let _trace = crate::phase_trace::phase("build_script_inputs_verify");
+    let crate_name = args.crate_name.as_deref().unwrap_or("unknown");
+    let file_hasher = store.file_hasher_with_daemon(config.socket_path());
+    match resolve_located_build_script_inputs(config, args, located, &file_hasher, workspace_root) {
+        Ok(crate::build_script_inputs::Resolved::Folded(now)) if !snapshot.moved_since(&now) => {
+            false
+        }
+        Ok(_) => {
+            tracing::warn!(
+                "not caching {crate_name}: inputs its build script declared changed while it compiled"
+            );
+            true
+        }
+        Err(error) => {
+            tracing::warn!(
+                "not caching {crate_name}: inputs its build script declared could not be read after the compile: {error:#}"
+            );
+            true
+        }
+    }
+}
+
+/// Say, once per session and package, that the package's units are keyed
+/// without its files.
+fn warn_build_script_package_too_large(
+    config: &Config,
+    located: &crate::build_script_inputs::Located,
+) {
+    let package = blake3::hash(located.manifest_dir.as_os_str().as_encoded_bytes()).to_hex();
+    let marker = warn_marker_path(
+        &format!("build-script-package-{}", &package[..16]),
+        &config.cache_dir,
+    );
+    warn_once_per_session_to(
+        &marker,
+        WARN_SESSION_SECS,
+        &format!(
+            "[kache] {}: its build script declares no inputs and the package holds more than {} \
+             entries, so its units are keyed without the package's files. Print \
+             cargo:rerun-if-changed for the files its macros read.",
+            located.package,
+            crate::build_script_inputs::MAX_ENTRIES,
+        ),
+        WarnSink::Log,
+    );
+}
+
 fn extra_inputs_changed_during_compile(
     config: &Config,
     args: &RustcArgs,
@@ -3481,6 +3649,7 @@ fn run_parsed_rustc(
     extra_inputs_too_new: bool,
     extra_inputs_key_ms: u64,
     extra_inputs_guard_inputs: Vec<crate::cache_key::ObservedFingerprint>,
+    build_script_inputs: Option<&BuildScriptInputs>,
     mut precompiled: Option<Precompiled>,
 ) -> Result<i32> {
     let crate_name = args.crate_name.as_deref().unwrap_or("unknown");
@@ -3736,6 +3905,47 @@ fn run_parsed_rustc(
         );
     };
 
+    // Resolved once, before anything compiles. A deferred compile re-enters
+    // with this snapshot instead of reading inputs it may have changed.
+    let resolved_build_script_inputs;
+    let build_script_inputs = match build_script_inputs {
+        Some(carried) => carried,
+        None => {
+            resolved_build_script_inputs = match resolve_build_script_inputs(
+                config,
+                args,
+                &store,
+                invocation_start_ns,
+                workspace_root.as_deref(),
+                current_dir.as_deref(),
+            ) {
+                Ok(resolved) => resolved,
+                Err(e) => {
+                    tracing::warn!("not caching {crate_name}: {e:#}");
+                    return rustc_direct_passthrough_with_event(
+                        config,
+                        args,
+                        crate_name,
+                        &event_root,
+                        start,
+                        &format!("{UNCACHEABLE_REASON}build-script inputs: {e:#}"),
+                        key_record,
+                    );
+                }
+            };
+            &resolved_build_script_inputs
+        }
+    };
+    // The declared inputs have their own check after the compile (see
+    // `build_script_inputs_moved`), so only their cost joins the key's.
+    let (inputs_key_ms, inputs_hash_stats, inputs_too_new) = combine_key_measurements(
+        extra_inputs_key_ms,
+        build_script_inputs.key_ms,
+        extra_inputs_hash_stats,
+        build_script_inputs.hash_stats,
+        extra_inputs_too_new,
+        false,
+    );
     let keyed = match compute_rustc_cache_key(
         config,
         compiler,
@@ -3746,9 +3956,10 @@ fn run_parsed_rustc(
         &key_env,
         ExtraInputsKey {
             digest: extra_inputs.and_then(crate::extra_inputs::ExtraInputsSnapshot::digest),
-            hash_stats: extra_inputs_hash_stats,
-            too_new: extra_inputs_too_new,
-            key_ms: extra_inputs_key_ms,
+            build_script_inputs: build_script_inputs.digest(),
+            hash_stats: inputs_hash_stats,
+            too_new: inputs_too_new,
+            key_ms: inputs_key_ms,
             guard_inputs: extra_inputs_guard_inputs,
         },
         match precompiled
@@ -3804,6 +4015,7 @@ fn run_parsed_rustc(
         extra_inputs_hash_stats,
         extra_inputs_too_new,
         extra_inputs_key_ms,
+        build_script_inputs,
         workspace_root: workspace_root.as_deref(),
         store: &store,
         key_env: &key_env,
@@ -4052,6 +4264,7 @@ fn run_parsed_rustc(
             Some(&store),
             &key_env,
             extra_inputs.and_then(crate::extra_inputs::ExtraInputsSnapshot::digest),
+            build_script_inputs.digest(),
             &mut key_record,
         ) {
             Ok(recomputed) => {
@@ -4266,6 +4479,31 @@ fn run_parsed_rustc(
             EventInputs::new(&event_root, crate_name, EventResult::Skipped, elapsed)
                 .rebuilt_observed(rebuilt.clone())
                 .skip_reason("inputs-changed")
+                .keyed(&cache_key, key_ms, key_hash_stats)
+                .lookup_ms(lookup_ms)
+                .key_record(key_record),
+        );
+        print_progress(crate_name, EventResult::Skipped, elapsed, 0);
+        drop(lock);
+        return Ok(result.exit_code);
+    }
+
+    // The key folded the build script's declared inputs as they were before
+    // the compile. A macro may have read them after they moved.
+    if build_script_inputs_moved(
+        config,
+        args,
+        &store,
+        build_script_inputs,
+        workspace_root.as_deref(),
+    ) {
+        let elapsed = start.elapsed().as_millis() as u64;
+        log_event(
+            config,
+            EventInputs::new(&event_root, crate_name, EventResult::Skipped, elapsed)
+                .rebuilt_observed(rebuilt.clone())
+                .skip_reason("build-script-inputs-changed")
+                .compile_time_ms(compile_time_ms)
                 .keyed(&cache_key, key_ms, key_hash_stats)
                 .lookup_ms(lookup_ms)
                 .key_record(key_record),
@@ -5657,11 +5895,39 @@ struct CompileFirst<'a> {
     extra_inputs_hash_stats: FileHashStats,
     extra_inputs_too_new: bool,
     extra_inputs_key_ms: u64,
+    /// Resolved before the compile; every key the compile re-enters with
+    /// folds it.
+    build_script_inputs: &'a BuildScriptInputs,
     workspace_root: Option<&'a Path>,
     store: &'a Store,
     key_env: &'a KeyEnv,
     crate_name: &'a str,
     event_root: &'a str,
+}
+
+/// The key a compile stopped on a hit is looked up under: the closure the
+/// compile emitted, with the build script's declared inputs. Extra inputs
+/// never reach a deferred compile (see [`deferral_allowed`]).
+fn stop_on_hit_key(
+    ctx: &CompileFirst<'_>,
+    dep_info: crate::cache_key::DepInfo,
+    tree: Option<crate::cache_key::TreeGuard>,
+) -> Result<ComputedKey> {
+    compute_rustc_cache_key(
+        ctx.config,
+        ctx.compiler,
+        ctx.args,
+        ctx.workspace_root,
+        ctx.invocation_start_ns,
+        Some(ctx.store),
+        ctx.key_env,
+        ExtraInputsKey {
+            build_script_inputs: ctx.build_script_inputs.digest(),
+            ..ExtraInputsKey::default()
+        },
+        KeyDiscovery::Emitted(dep_info, tree),
+        &mut KeyEventRecord::default(),
+    )
 }
 
 /// Compile before the key is known, then key from the dep-info the compile
@@ -5714,19 +5980,7 @@ fn compile_before_key(
             let Some(dep_info) = emitted_dep_info(args) else {
                 return true;
             };
-            let mut record = KeyEventRecord::default();
-            let keyed = compute_rustc_cache_key(
-                config,
-                compiler,
-                args,
-                ctx.workspace_root,
-                invocation_start_ns,
-                Some(ctx.store),
-                ctx.key_env,
-                ExtraInputsKey::default(),
-                KeyDiscovery::Emitted(dep_info.clone(), tree.clone()),
-                &mut record,
-            );
+            let keyed = stop_on_hit_key(ctx, dep_info.clone(), tree.clone());
             let stored = keyed
                 .ok()
                 .is_some_and(|keyed| ctx.store.get(&keyed.cache_key).ok().flatten().is_some());
@@ -5759,6 +6013,7 @@ fn compile_before_key(
             extra_inputs_too_new,
             extra_inputs_key_ms,
             guard_inputs,
+            Some(ctx.build_script_inputs),
             None,
         );
     }
@@ -5838,6 +6093,7 @@ fn compile_before_key(
         extra_inputs_too_new,
         extra_inputs_key_ms,
         guard_inputs,
+        Some(ctx.build_script_inputs),
         Some(Precompiled {
             result,
             compile_time_ms,
@@ -6162,10 +6418,13 @@ fn discovery_flight_dir(config: &Config, discovery: &KeyDiscovery) -> Option<Pat
         .then(|| config.cache_dir.clone())
 }
 
-/// What resolving the invocation's extra inputs contributes to its key.
+/// What resolving the invocation's extra inputs, and its build script's
+/// declared inputs, contributes to its key.
 #[derive(Default)]
 struct ExtraInputsKey<'a> {
     digest: Option<&'a str>,
+    /// See [`crate::build_script_inputs`].
+    build_script_inputs: Option<&'a str>,
     hash_stats: FileHashStats,
     too_new: bool,
     key_ms: u64,
@@ -6192,6 +6451,7 @@ fn compute_rustc_cache_key(
 ) -> Result<ComputedKey> {
     let ExtraInputsKey {
         digest: extra_inputs_digest,
+        build_script_inputs: build_script_inputs_digest,
         hash_stats: extra_inputs_hash_stats,
         too_new: extra_inputs_too_new,
         key_ms: extra_inputs_key_ms,
@@ -6245,6 +6505,7 @@ fn compute_rustc_cache_key(
         key_salt: config.key_salt.as_deref(),
         key_env_vars: &config.key_env_vars,
         extra_inputs_digest,
+        build_script_inputs_digest,
     };
     let (cache_key, outputs) = compiler.cache_key_in(args, &key_ctx, key_env);
     key_record.absorb(&outputs);
@@ -6356,6 +6617,7 @@ fn recompute_key_without_prediction(
     store: Option<&Store>,
     key_env: &KeyEnv,
     extra_inputs_digest: Option<&str>,
+    build_script_inputs_digest: Option<&str>,
     key_record: &mut KeyEventRecord,
 ) -> Result<ComputedKey> {
     let mut without = config.clone();
@@ -6370,6 +6632,7 @@ fn recompute_key_without_prediction(
         key_env,
         ExtraInputsKey {
             digest: extra_inputs_digest,
+            build_script_inputs: build_script_inputs_digest,
             ..ExtraInputsKey::default()
         },
         KeyDiscovery::Rederived,

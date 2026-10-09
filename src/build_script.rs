@@ -48,17 +48,15 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-mod declarations;
+pub(crate) mod declarations;
 mod hermetic;
-mod inputs;
+pub(crate) mod inputs;
 mod outside;
 
-#[cfg(test)]
-use crate::tree_stamp::tree_stamp;
 use declarations::parse_declarations;
-#[cfg(test)]
-use inputs::tree_digest_memo;
 use inputs::{TREE_MEMO_DIR, input_state, input_state_as};
+#[cfg(test)]
+use inputs::{tree_digest_memo, tree_stamp};
 
 /// Set by the launcher to the path Cargo invoked, which is where the preserved
 /// binary lives beside.
@@ -1191,7 +1189,7 @@ fn cargo_environment_names() -> std::collections::BTreeSet<String> {
     names
 }
 
-fn fold(hasher: &mut blake3::Hasher, label: &str, value: &[u8]) {
+pub(crate) fn fold(hasher: &mut blake3::Hasher, label: &str, value: &[u8]) {
     hasher.update(&(label.len() as u64).to_le_bytes());
     hasher.update(label.as_bytes());
     hasher.update(&(value.len() as u64).to_le_bytes());

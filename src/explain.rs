@@ -136,6 +136,7 @@ fn input_words(group: &str) -> &str {
         "link" => "its linker or link inputs changed",
         "remap" => "its path remapping changed",
         "crate" => "its name, edition or crate type changed",
+        "build_script_inputs" => "a file or variable its build script declared changed",
         other => other,
     }
 }
@@ -529,6 +530,7 @@ mod tests {
             ("link", "linker"),
             ("remap", "remapping"),
             ("crate", "edition"),
+            ("build_script_inputs", "build script declared"),
         ] {
             assert!(input_words(group).contains(words), "{group}");
         }

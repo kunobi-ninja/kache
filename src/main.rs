@@ -1,6 +1,7 @@
 mod args;
 mod blob_heal;
 mod build_script;
+mod build_script_inputs;
 use kache_store::atomic;
 mod build_intent;
 mod cache_fs;

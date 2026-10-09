@@ -549,7 +549,7 @@ pub(crate) fn env_os_key_bytes(value: &std::ffi::OsStr) -> Vec<u8> {
 /// fallback for an unpaired surrogate keeps the raw units; it can only cost a
 /// miss, and getting there at all means the name is not a real Windows name.
 /// Both arms emit UTF-16LE so the two encodings can never be confused.
-fn env_name_key_bytes(name: &std::ffi::OsStr) -> Vec<u8> {
+pub(crate) fn env_name_key_bytes(name: &std::ffi::OsStr) -> Vec<u8> {
     #[cfg(windows)]
     {
         use std::os::windows::ffi::OsStrExt;
@@ -681,7 +681,7 @@ impl KeyFold for GroupedHasher {
 /// Hex-prefix length persisted per key-field group — enough to make an
 /// accidental collision between "changed" and "unchanged" implausible while
 /// keeping the per-event cost ~a couple hundred bytes.
-const KEY_FIELD_HEX: usize = 16;
+pub(crate) const KEY_FIELD_HEX: usize = 16;
 
 /// A blake3 hasher that TEES every update into the current key-field group's
 /// sub-hasher alongside the main key hasher (kunobi-ninja/kache#131). The
@@ -946,7 +946,7 @@ pub const EXTERN_UNREADABLE: &str = "(sysroot)";
 /// Cap on entries digested for the tree guard. A crate directory past this is
 /// a build tree or a monorepo root, and the pre-pass stays cheaper than
 /// digesting it.
-const CRATE_TREE_MAX_ENTRIES: usize = 20_000;
+pub(crate) const CRATE_TREE_MAX_ENTRIES: usize = 20_000;
 
 /// A content digest of everything under the crate directory and its
 /// `OUT_DIR`, the two places a proc macro reads from by convention
@@ -1090,7 +1090,7 @@ fn tree_digest(
 /// How long a root that ran past its entry budget is taken to still be past
 /// it. The answer only ever withholds a digest, which leaves the unit on the
 /// pre-pass, so a stale answer costs a shortcut, never a wrong key.
-const OVERSIZED_TREE_TTL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+pub(crate) const OVERSIZED_TREE_TTL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 
 /// The marker recording that `root` holds more than `max_entries` entries.
 fn oversized_tree_marker(memo_dir: &Path, root: &Path, max_entries: usize) -> PathBuf {
@@ -1430,7 +1430,10 @@ pub fn dep_info_from_emitted(path: &Path, source_file: &Path) -> Result<DepInfo>
 /// symlink would merge two spellings even though rustc may embed them
 /// differently through `file!()` or debug info. An unmodeled spelling stays
 /// deliberately path-local through an opaque, lossless-OS-byte digest.
-fn source_path_identity(file: &Path, path_normalizer: &PathNormalizer) -> Result<Vec<u8>> {
+pub(crate) fn source_path_identity(
+    file: &Path,
+    path_normalizer: &PathNormalizer,
+) -> Result<Vec<u8>> {
     if let Some(identity) = path_normalizer.source_path_identity(file) {
         return Ok(identity);
     }
@@ -2402,7 +2405,7 @@ pub(crate) fn is_vendored_package(manifest_dir: &Path) -> bool {
 /// an absolute path too, so the source must also sit inside the package, as
 /// a vendored crate's always does. The lint cap Cargo gives non-path packages is required
 /// too; `cargo -vv` omits it, and the unit then keeps the workspace guard.
-fn vendored_source(args: &RustcArgs, manifest_dir: &Path, current_dir: &Path) -> bool {
+pub(crate) fn vendored_source(args: &RustcArgs, manifest_dir: &Path, current_dir: &Path) -> bool {
     args.cargo_capped_lints()
         && args
             .source_file

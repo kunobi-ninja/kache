@@ -1450,13 +1450,27 @@ pub fn run_nvcc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         std::io::stdout(),
         std::io::stderr(),
     );
+    // The key hashed every input before nvcc ran; one written since may not
+    // be what the object was built from.
+    file_hasher.recheck_guarded_inputs();
+    let inputs_changed = file_hasher.too_new();
+    if inputs_changed {
+        tracing::debug!(
+            "nvcc: {crate_name} read an input modified during the build; not storing it"
+        );
+    }
 
-    // Only store a clean compile that produced its object. Anything
-    // else returns the exit code and lets the build see the failure.
+    // Only store a clean compile that produced its object from inputs that
+    // held still. A failed compile returns its exit code and lets the build
+    // see the failure.
     let store_start = std::time::Instant::now();
     let mut store_put = StorePutResult::default();
     let mut store_error = String::new();
-    let store_candidate = should_store_cc_result(result.exit_code, !result.artifacts.is_empty());
+    let store_candidate = cc_store_candidate(
+        should_store_cc_result(result.exit_code, !result.artifacts.is_empty()),
+        inputs_changed,
+        false,
+    );
     // nvcc entries are portable by construction (prefix-mapped objects,
     // pinned epoch, rewritten dep-info), so every stored entry may
     // publish to a writable remote.
@@ -2008,8 +2022,10 @@ fn run_cc_with_store(
     // surfaces the real diagnostic.
     let key_start = std::time::Instant::now();
     let mut file_hasher = store.file_hasher();
-    // Memo publication always uses the too-new guard: a header modified while
-    // preprocessing cannot safely describe the captured expansion.
+    // Flag inputs written since this invocation began. Neither arm stores an
+    // entry or a memo once one is flagged: a deferred compile fingerprints
+    // what it read afterwards, and a key taken first is rechecked once the
+    // compile has run.
     file_hasher.arm_too_new_guard(invocation_start_ns, 0);
     let path_normalizer = crate::path_normalizer::PathNormalizer::empty();
     let key_ctx = KeyCtx {
@@ -2307,12 +2323,6 @@ fn run_cc_with_store(
             // capture ran on the outer hasher; this one saw only what the
             // key hashed afterwards, so both verdicts count.
             let changed = captured_inputs_changed || file_hasher.too_new();
-            if changed {
-                tracing::debug!(
-                    "cc: {} read an input modified during the build; not storing it",
-                    crate_name
-                );
-            }
             (pre.result, pre.compile_time_ms, changed)
         }
         None => {
@@ -2343,9 +2353,18 @@ fn run_cc_with_store(
                 std::io::stdout(),
                 std::io::stderr(),
             );
-            (result, compile_time_ms, false)
+            // The key hashed the read set before the compile ran; an input
+            // written since may not hold the bytes the compiler read.
+            file_hasher.recheck_guarded_inputs();
+            (result, compile_time_ms, file_hasher.too_new())
         }
     };
+    if inputs_changed {
+        tracing::debug!(
+            "cc: {} read an input modified during the build; not storing it",
+            crate_name
+        );
+    }
 
     // Only store on a clean compile that actually produced its
     // object file. A failed compile (exit != 0) or one whose output

@@ -6179,10 +6179,12 @@ pub struct FileHasher<'db> {
     env_dep_uses: RefCell<HashMap<(String, String), SourceEnvDepUse>>,
     stats: FileHashStatsCells,
     too_new: TooNewGuard,
-    /// Fingerprints of every file hashed while the too-new guard was armed,
-    /// with the time each was observed. Drained after the compile so the
-    /// wrapper can prove clock-independently that none of them changed
-    /// mid-build (see [`FileHasher::guarded_inputs_unchanged_since_hash`]).
+    /// Fingerprints of every file hashed, or proved by a memo's stamp, while
+    /// the too-new guard was armed, with the time each was observed. Checked
+    /// again after the compile so the wrapper can prove clock-independently
+    /// that none of them changed mid-build (see
+    /// [`FileHasher::recheck_guarded_inputs`] and
+    /// [`FileHasher::guarded_inputs_unchanged_since_hash`]).
     guard_inputs: RefCell<Vec<ObservedFingerprint>>,
     /// Memo rows for files hashed in this process, written in one transaction
     /// by [`FileHasher::flush_memo`] (and on drop). One autocommit write per
@@ -6265,6 +6267,18 @@ thread_local! {
 pub(crate) fn set_before_read(hook: Option<BeforeRead>) {
     BEFORE_READ.with(|slot| *slot.borrow_mut() = hook);
 }
+
+/// A file's raw blake3 and its blake3 with the prefix maps applied, both
+/// from one read, so the raw one shows which bytes the mapped one is of.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CcContentHashes {
+    pub(crate) raw: String,
+    pub(crate) mapped: String,
+}
+
+/// Why [`FileHasher::cc_inputs_hide_assembler_input`] gave no verdict: the
+/// scan read other bytes than the input was fingerprinted with.
+pub(crate) const CC_INPUT_CHANGED_WHILE_SCANNED: &str = "an input changed while it was scanned";
 
 impl FileHasher<'static> {
     pub fn new() -> Self {
@@ -6464,6 +6478,26 @@ impl<'db> FileHasher<'db> {
         })
     }
 
+    /// Stat again every input taken in while the guard was armed, hashed or
+    /// proved by a memo's stamp, and trip the guard if one no longer matches
+    /// the fingerprint it had then or is gone. A key taken before the compile
+    /// read these files; one written since may not hold the bytes the
+    /// compiler read.
+    pub(crate) fn recheck_guarded_inputs(&self) {
+        let guarded = self.guard_inputs.borrow();
+        let distinct: std::collections::HashSet<&FileFingerprint> = guarded
+            .iter()
+            .map(|observed| &observed.fingerprint)
+            .collect();
+        let changed = distinct.into_iter().any(|hashed| {
+            !FileFingerprint::from_path(Path::new(&hashed.path))
+                .is_ok_and(|current| current == *hashed)
+        });
+        if changed {
+            self.too_new.saw_too_new.set(true);
+        }
+    }
+
     fn note_too_new(&self, fingerprint: &FileFingerprint) {
         if self.too_new.invocation_start_ns > 0 {
             let since = self
@@ -6620,19 +6654,6 @@ impl<'db> FileHasher<'db> {
         }
     }
 
-    /// Reuse a preprocessor-output hash only when every source and header the
-    /// probe read still holds the same bytes.
-    ///
-    /// Metadata first, because identical metadata needs no read. When it
-    /// differs the file is hashed and compared, so bytes that merely moved
-    /// (another worktree, a fresh checkout) or were rewritten unchanged (a
-    /// build script regenerating a header) still hit.
-    ///
-    /// The too-new guard deliberately does not apply. It exists because
-    /// metadata cannot tell a file written a moment ago from one still being
-    /// written; a content hash can, because a file that changes afterwards
-    /// simply fails the next comparison. Any database, decoding, or metadata
-    /// uncertainty is still a miss.
     /// Whether any memo is recorded under `memo_key`, whatever its inputs
     /// say now. Decides between compiling first (nothing recorded) and
     /// rediscovering the read set with the preprocessor (a stale record).
@@ -6642,11 +6663,24 @@ impl<'db> FileHasher<'db> {
             .is_some_and(|cache| matches!(cache.get_cc_preprocess_memo(memo_key), Ok(Some(_))))
     }
 
+    /// Reuse a preprocessor-output hash only when every source and header the
+    /// probe read still holds the same bytes.
+    ///
+    /// Metadata first, because identical metadata needs no read. When it
+    /// differs the file is hashed and compared, so bytes that merely moved
+    /// (another worktree, a fresh checkout) or were rewritten unchanged (a
+    /// build script regenerating a header) still hit.
+    ///
+    /// A recent write alone does not refuse the hit. A recorded stamp is
+    /// trusted only because it had settled when it was taken, so any later
+    /// write has moved it; an input observed sooner was recorded without a
+    /// stamp and is compared by content every time. Any database, decoding,
+    /// or metadata uncertainty is still a miss.
     pub(crate) fn cc_preprocess_memo_lookup(
         &self,
         memo_key: &str,
         resolve: impl Fn(&str) -> Vec<PathBuf>,
-        mapped_content: &impl Fn(&Path) -> Option<String>,
+        mapped_content: &impl Fn(&Path) -> Option<CcContentHashes>,
     ) -> Option<(String, Vec<PathBuf>)> {
         let cache = self.cache.as_ref()?;
         let record = match cache.get_cc_preprocess_memo(memo_key) {
@@ -6690,14 +6724,15 @@ impl<'db> FileHasher<'db> {
 
     /// Does this input still hold the bytes the memo was recorded against?
     ///
-    /// Identical metadata answers yes without a read. Otherwise the file is
-    /// hashed through the ordinary content cache, so a header shared by many
+    /// Identical metadata answers yes without a read; a row recorded without
+    /// a stamp matches no file's metadata. Otherwise the file is hashed
+    /// through the ordinary content cache, so a header shared by many
     /// translation units is read once per build rather than once per unit.
     fn memo_input_is_unchanged(
         &self,
         expected: &CcPreprocessMemoInput,
         resolve: &impl Fn(&str) -> Vec<PathBuf>,
-        mapped_content: &impl Fn(&Path) -> Option<String>,
+        mapped_content: &impl Fn(&Path) -> Option<CcContentHashes>,
     ) -> Option<PathBuf> {
         // Only where THIS invocation resolves the recorded name. The path the
         // recording checkout used is not a candidate on its own merit: it may
@@ -6709,14 +6744,17 @@ impl<'db> FileHasher<'db> {
         let candidates = resolve(&expected.name);
 
         for path in &candidates {
-            let Ok(current) = FileFingerprint::from_path(path) else {
+            let Ok(current) = ObservedFingerprint::from_path(path) else {
                 continue;
             };
-            self.note_too_new(&current);
+            self.note_too_new(&current.fingerprint);
             // Cheapest first: identical metadata needs no read, identical raw
             // bytes come from the content cache, and only a file differing in
             // both is read through the maps.
-            if current == expected.fingerprint {
+            if current.fingerprint == expected.fingerprint {
+                // Unhashed, so registered here: the recheck after a compile
+                // has to cover it like any input the key hashed.
+                self.guard_input(&current);
                 return Some(path.clone());
             }
             if self
@@ -6726,7 +6764,7 @@ impl<'db> FileHasher<'db> {
                 return Some(path.clone());
             }
             if !expected.mapped.is_empty()
-                && mapped_content(path).is_some_and(|mapped| mapped == expected.mapped)
+                && mapped_content(path).is_some_and(|read| read.mapped == expected.mapped)
             {
                 return Some(path.clone());
             }
@@ -6739,25 +6777,25 @@ impl<'db> FileHasher<'db> {
         None
     }
 
-    /// Capture the source/header metadata and contents observed immediately
-    /// after a full preprocess probe. The caller revalidates this snapshot
-    /// after a successful compile or restore before committing it.
-    ///
-    /// Hashing here is what the memo is validated against later. It is not
-    /// free on a cold build, but every hash goes through the content cache,
-    /// so a header included by many translation units is read once.
-    /// Fingerprint every file a preprocessor run read, under its mapped name.
+    /// Fingerprint every file a preprocessor run or a compile read, under its
+    /// mapped name. The caller revalidates this snapshot after a successful
+    /// compile or restore before committing it.
     ///
     /// The raw content hash comes from the file-hash memo by stamp. The
     /// mapped hash (the bytes with this invocation's prefix maps applied) is
     /// memoised by raw hash and map set in the same index, so the headers a
     /// build's translation units share are read and rewritten once per map
-    /// set rather than once per unit; `maps_key` names the map set.
+    /// set rather than once per unit; `maps_key` names the map set. A mapped
+    /// hash is learned only from a read whose raw hash is the content hash:
+    /// a file written between the two reads fails the whole capture.
+    ///
+    /// Every input carries the wall clock read before its stamp was taken.
+    /// The store keeps a stamp only if it had settled by then.
     pub(crate) fn cc_preprocess_fingerprints(
         &self,
         paths: &[(String, PathBuf)],
         maps_key: &str,
-        mapped_content: &impl Fn(&Path) -> Option<String>,
+        mapped_content: &impl Fn(&Path) -> Option<CcContentHashes>,
     ) -> Option<Vec<CcPreprocessMemoInput>> {
         if paths.is_empty() {
             return None;
@@ -6784,7 +6822,7 @@ impl<'db> FileHasher<'db> {
             stamped.push((name, path, observed));
         }
         let memoised = self.memoised_hashes(stamped.iter().map(|(_, _, stamp)| &stamp.fingerprint));
-        let mut pending: Vec<(String, FileFingerprint, String, PathBuf)> =
+        let mut pending: Vec<(String, ObservedFingerprint, String, PathBuf)> =
             Vec::with_capacity(stamped.len());
         for (name, path, observed) in stamped {
             let content = match self.header_hash(path, &observed, &memoised) {
@@ -6797,7 +6835,7 @@ impl<'db> FileHasher<'db> {
                     return None;
                 }
             };
-            pending.push((name.clone(), observed.fingerprint, content, path.clone()));
+            pending.push((name.clone(), observed, content, path.clone()));
         }
         let memo = self.cache.as_ref().filter(|_| !maps_key.is_empty());
         let known = match memo {
@@ -6815,21 +6853,31 @@ impl<'db> FileHasher<'db> {
         let mut known = known;
         let mut learned: Vec<(String, String)> = Vec::new();
         let mut inputs = Vec::with_capacity(pending.len());
-        for (name, fingerprint, content, path) in pending {
+        for (name, observed, content, path) in pending {
             let mapped = match known.get(&content) {
                 Some(mapped) => mapped.clone(),
                 None => {
-                    let mapped = mapped_content(&path)?;
-                    known.insert(content.clone(), mapped.clone());
-                    learned.push((content.clone(), mapped.clone()));
-                    mapped
+                    let read = mapped_content(&path)?;
+                    if read.raw != content {
+                        // Written since it was hashed: the mapped hash is of
+                        // other bytes than the content hash names.
+                        tracing::debug!(
+                            "cc preprocess memo input {} changed while it was fingerprinted",
+                            path.display()
+                        );
+                        return None;
+                    }
+                    known.insert(content.clone(), read.mapped.clone());
+                    learned.push((content.clone(), read.mapped.clone()));
+                    read.mapped
                 }
             };
             inputs.push(CcPreprocessMemoInput {
                 name,
-                fingerprint,
+                fingerprint: observed.fingerprint,
                 content,
                 mapped,
+                observed_ns: observed.observed_ns,
             });
         }
         if let Some(cache) = memo
@@ -6845,12 +6893,18 @@ impl<'db> FileHasher<'db> {
     /// The first input whose raw text hides a file the assembler would read,
     /// scanning each distinct content once: the verdict is memoised by raw
     /// content hash, so a header shared by many units is read once. `scan`
-    /// returns `None` for a file it cannot read (skipped, not recorded),
-    /// `Some(None)` for a clean file, `Some(Some(construct))` otherwise.
+    /// reads a file once and returns the raw hash of those bytes with
+    /// `None` for clean text or the construct found; `None` for a file it
+    /// cannot read (skipped, not recorded).
+    ///
+    /// A verdict counts only for the bytes the input was fingerprinted
+    /// with. When the scan read others, nothing is recorded and the inputs
+    /// are reported as [`CC_INPUT_CHANGED_WHILE_SCANNED`], since no verdict
+    /// covers what the key holds.
     pub(crate) fn cc_inputs_hide_assembler_input(
         &self,
         inputs: &[CcPreprocessMemoInput],
-        scan: &impl Fn(&Path) -> Option<Option<&'static str>>,
+        scan: &impl Fn(&Path) -> Option<(String, Option<&'static str>)>,
     ) -> Option<String> {
         let _trace = crate::phase_trace::phase("cc_asm_scan");
         let known = match &self.cache {
@@ -6870,9 +6924,13 @@ impl<'db> FileHasher<'db> {
             let verdict = match known.get(&input.content) {
                 Some(construct) => construct.clone(),
                 None => {
-                    let Some(scanned) = scan(Path::new(&input.fingerprint.path)) else {
+                    let Some((raw, scanned)) = scan(Path::new(&input.fingerprint.path)) else {
                         continue;
                     };
+                    if raw != input.content {
+                        found.get_or_insert_with(|| CC_INPUT_CHANGED_WHILE_SCANNED.to_string());
+                        continue;
+                    }
                     let construct = scanned.unwrap_or("").to_string();
                     known.insert(input.content.clone(), construct.clone());
                     learned.push((input.content.clone(), construct.clone()));
@@ -6894,18 +6952,19 @@ impl<'db> FileHasher<'db> {
     /// Commit a pending preprocessor memo after proving its inputs held the
     /// same bytes through the successful compiler/restore boundary.
     ///
-    /// An input written during this build no longer blocks the record. What
-    /// it was blocking is a torn read, and a torn read is caught where it
-    /// matters: the recorded hash is of whatever bytes were there, so the
-    /// finished file simply fails the next comparison and the expansion is
-    /// recomputed. Refusing to record instead meant a fresh checkout — every
-    /// CI runner, every new worktree — could never memoise anything at all.
+    /// An input written during this build does not block the record; the
+    /// store decides what its stamp may prove. A stamp that had settled when
+    /// the input was observed moves on any later write. One taken sooner can
+    /// survive a second write in the same timestamp tick, so the input is
+    /// recorded by content alone and every lookup compares that content: a
+    /// torn or rewritten file misses there. Refusing the record instead would
+    /// keep a fresh checkout from memoising anything.
     pub(crate) fn cc_preprocess_memo_record_if_unchanged(
         &self,
         memo_key: &str,
         preprocessed_hash: &str,
         inputs: &[CcPreprocessMemoInput],
-        mapped_content: &impl Fn(&Path) -> Option<String>,
+        mapped_content: &impl Fn(&Path) -> Option<CcContentHashes>,
     ) {
         let Some(cache) = &self.cache else {
             return;

@@ -1788,8 +1788,12 @@ fn initialize_db(db: &Connection) -> rusqlite::Result<()> {
 ///    delivered for the job still running (#1008).
 /// 7: `target_roots.rustc`, the compiler a tracked target was built by.
 /// 8: `target_roots.discovered`, separating Git discovery from build activity.
-/// 9: `file_hashes.rule` (`file_hash::FILE_HASH_RULE`). Adding it empties
-///    the table once; rows an older release writes later are never served.
+/// 9: `file_hashes.rule` (`file_hash::FILE_HASH_RULE`), and for the C/C++
+///    memo `cc_memo_inputs.proof`, `cc_mapped_hashes.rule` and
+///    `cc_asm_scans.rule` (`cc_memo::CC_MEMO_RULE`). Adding them empties
+///    those tables once. The columns decide that, not this number, which an
+///    older release stamps back each time it opens the index; nothing such
+///    a release records is served.
 const INDEX_SCHEMA_GENERATION: i64 = 9;
 
 /// Raise the refcount of every blob `cache_key` maps to at least the

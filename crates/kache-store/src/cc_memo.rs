@@ -1,21 +1,83 @@
 //! Shared C/C++ memo inputs. Artifact keys and input validation stay compiler-owned.
 
-use crate::file_hash::{FileFingerprint, FileHashCache};
+use crate::file_hash::{FileFingerprint, FileHashCache, stamp_is_settled};
 use rusqlite::{Connection, Transaction, TransactionBehavior, params};
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CcPreprocessMemoInput {
     pub name: String,
+    /// For a row read back whose stamp was never proven, `size` is -1,
+    /// which no file has.
     #[serde(flatten)]
     pub fingerprint: FileFingerprint,
     pub content: String,
     #[serde(default)]
     pub mapped: String,
+    /// Wall clock read just before `fingerprint` was taken. 0 when unknown:
+    /// an input read back from the index, or one sent by an older wrapper.
+    #[serde(default)]
+    pub observed_ns: i64,
 }
 
 impl CcPreprocessMemoInput {
     pub fn local_path(&self) -> &str {
         &self.fingerprint.path
+    }
+
+    /// Whether `fingerprint` had settled when it was taken, so that any later
+    /// write moves it (see [`stamp_is_settled`]). Only such a stamp may stand
+    /// in for the content on a later lookup.
+    pub fn stamp_settled(&self) -> bool {
+        stamp_is_settled(&self.fingerprint, self.observed_ns)
+    }
+}
+
+/// The size an input row records in place of a stamp that had not settled
+/// when it was taken. No file has it, so no lookup matches the row by stamp
+/// and the content is compared instead. A row whose stamp has no matching
+/// proof reads back with it too.
+pub const UNPROVEN_SIZE: i64 = -1;
+
+/// The rule the C/C++ memo's rows are recorded under. Lookups serve a
+/// mapped hash or an assembler verdict only at this rule or a later one,
+/// and trust an input row's stamp only while the row's proof matches it.
+/// A release from before these columns writes neither, so nothing it
+/// records is served, before an upgrade or after it.
+///
+/// 1: a stamp is recorded only if it had settled when it was observed,
+///    and a mapped hash or a verdict only from the bytes behind its
+///    content hash.
+pub const CC_MEMO_RULE: i64 = 1;
+
+/// What an input row's `proof` holds for `stamp` under [`CC_MEMO_RULE`].
+///
+/// An older release records the same bytes under the same name by
+/// rewriting the shared row's stamp in place, and leaves `proof` alone. A
+/// stamp it wrote, possibly one taken moments after a write, then no longer
+/// matches the proof and proves nothing. One it rewrote unchanged still
+/// does: this release saw that stamp settle.
+fn stamp_proof(stamp: &FileFingerprint) -> i64 {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&CC_MEMO_RULE.to_le_bytes());
+    hasher.update(stamp.path.as_bytes());
+    hasher.update(&[0]);
+    for value in [stamp.size, stamp.mtime_ns, stamp.ctime_ns, stamp.inode] {
+        hasher.update(&value.to_le_bytes());
+    }
+    let mut proof = [0; 8];
+    proof.copy_from_slice(&hasher.finalize().as_bytes()[..8]);
+    i64::from_le_bytes(proof)
+}
+
+/// The stamp an input row read back with no proof stands for: one that
+/// matches no file.
+fn unproven(path: String) -> FileFingerprint {
+    FileFingerprint {
+        path,
+        size: UNPROVEN_SIZE,
+        mtime_ns: 0,
+        ctime_ns: 0,
+        inode: 0,
     }
 }
 
@@ -61,6 +123,7 @@ pub(crate) fn ensure_schema(db: &Connection) -> rusqlite::Result<()> {
                 mtime_ns INTEGER NOT NULL,
                 ctime_ns INTEGER NOT NULL,
                 inode INTEGER NOT NULL,
+                proof INTEGER,
                 UNIQUE(name, content, mapped)
              );
              CREATE TABLE cc_memo_input_refs (
@@ -84,12 +147,80 @@ pub(crate) fn ensure_mapped_hash_schema(db: &Connection) -> rusqlite::Result<()>
             content TEXT NOT NULL,
             maps TEXT NOT NULL,
             mapped TEXT NOT NULL,
+            rule INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY(content, maps)
          ) WITHOUT ROWID;
          CREATE TABLE IF NOT EXISTS cc_asm_scans (
             content TEXT PRIMARY KEY,
-            construct TEXT NOT NULL
+            construct TEXT NOT NULL,
+            rule INTEGER NOT NULL DEFAULT 0
          ) WITHOUT ROWID;",
+    )
+}
+
+/// The columns [`CC_MEMO_RULE`] reads, as `ALTER TABLE` adds them to a
+/// table from before them.
+const RULE_COLUMNS: [(&str, &str, &str); 3] = [
+    ("cc_memo_inputs", "proof", "proof INTEGER"),
+    (
+        "cc_mapped_hashes",
+        "rule",
+        "rule INTEGER NOT NULL DEFAULT 0",
+    ),
+    ("cc_asm_scans", "rule", "rule INTEGER NOT NULL DEFAULT 0"),
+];
+
+fn has_column(db: &Connection, table: &str, column: &str) -> rusqlite::Result<bool> {
+    db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2)",
+        params![table, column],
+        |row| row.get(0),
+    )
+}
+
+fn has_rule_columns(db: &Connection) -> rusqlite::Result<bool> {
+    for (table, column, _) in RULE_COLUMNS {
+        if !has_column(db, table, column)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Add the columns [`CC_MEMO_RULE`] reads to tables from before them, and
+/// [`purge`] the memo once as they arrive. Checked again under the write
+/// lock, so the purge runs once however many processes open the index
+/// together. Gated on the columns rather than the index generation, which
+/// an older release stamps back over a newer one each time it opens the
+/// index; no older release drops these columns.
+pub(crate) fn ensure_rule(db: &Connection) -> rusqlite::Result<()> {
+    if has_rule_columns(db)? {
+        return Ok(());
+    }
+    let tx = Transaction::new_unchecked(db, TransactionBehavior::Immediate)?;
+    if !has_rule_columns(&tx)? {
+        for (table, column, definition) in RULE_COLUMNS {
+            if !has_column(&tx, table, column)? {
+                tx.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {definition}"))?;
+            }
+        }
+        purge(&tx)?;
+    }
+    tx.commit()
+}
+
+/// Forget every C/C++ memo, with the mapped hashes and assembler verdicts
+/// beside them. [`ensure_rule`] runs this once for rows an older kache
+/// recorded: it trusted a stamp however soon after a write it was taken,
+/// and it learned a mapped hash or a verdict from a second read without
+/// checking that read saw the bytes behind the content hash.
+fn purge(db: &Connection) -> rusqlite::Result<()> {
+    db.execute_batch(
+        "DELETE FROM cc_memo_input_refs;
+         DELETE FROM cc_preprocess_memos;
+         DELETE FROM cc_memo_inputs;
+         DELETE FROM cc_mapped_hashes;
+         DELETE FROM cc_asm_scans;",
     )
 }
 
@@ -98,7 +229,8 @@ pub(crate) fn ensure_mapped_hash_schema(db: &Connection) -> rusqlite::Result<()>
 const MEMO_LOOKUP_CHUNK: usize = 256;
 
 impl FileHashCache<'_> {
-    /// Memoised mapped hashes for `contents` under the map set `maps`.
+    /// Memoised mapped hashes for `contents` under the map set `maps`,
+    /// recorded under `CC_MEMO_RULE` or a later rule.
     pub fn get_cc_mapped_hashes(
         &self,
         maps: &str,
@@ -112,7 +244,7 @@ impl FileHashCache<'_> {
             let placeholders = vec!["?"; chunk.len()].join(",");
             let mut stmt = self.db().prepare_cached(&format!(
                 "SELECT content, mapped FROM cc_mapped_hashes
-                 WHERE maps = ?1 AND content IN ({placeholders})"
+                 WHERE maps = ?1 AND content IN ({placeholders}) AND rule >= {CC_MEMO_RULE}"
             ))?;
             let args = std::iter::once(maps).chain(chunk.iter().copied());
             let rows = stmt.query_map(rusqlite::params_from_iter(args), |row| {
@@ -127,7 +259,8 @@ impl FileHashCache<'_> {
     }
 
     /// Memoised assembler scans for `contents`: the construct found, or an
-    /// empty string for a clean file.
+    /// empty string for a clean file. Only verdicts recorded under
+    /// `CC_MEMO_RULE` or a later rule count.
     pub fn get_cc_asm_scans(
         &self,
         contents: &[&str],
@@ -136,7 +269,8 @@ impl FileHashCache<'_> {
         for chunk in contents.chunks(MEMO_LOOKUP_CHUNK) {
             let placeholders = vec!["?"; chunk.len()].join(",");
             let mut stmt = self.db().prepare_cached(&format!(
-                "SELECT content, construct FROM cc_asm_scans WHERE content IN ({placeholders})"
+                "SELECT content, construct FROM cc_asm_scans
+                 WHERE content IN ({placeholders}) AND rule >= {CC_MEMO_RULE}"
             ))?;
             let rows = stmt
                 .query_map(rusqlite::params_from_iter(chunk.iter().copied()), |row| {
@@ -150,16 +284,20 @@ impl FileHashCache<'_> {
         Ok(found)
     }
 
-    /// Record assembler scans from this invocation, in one transaction.
+    /// Record assembler scans from this invocation, in one transaction. A
+    /// verdict an older rule recorded is replaced.
     pub fn put_cc_asm_scans(&self, pairs: &[(String, String)]) -> rusqlite::Result<()> {
         if pairs.is_empty() {
             return Ok(());
         }
         let tx = Transaction::new_unchecked(self.db(), TransactionBehavior::Immediate)?;
         {
-            let mut put = tx.prepare_cached(
-                "INSERT OR IGNORE INTO cc_asm_scans(content, construct) VALUES (?1, ?2)",
-            )?;
+            let mut put = tx.prepare_cached(&format!(
+                "INSERT INTO cc_asm_scans(content, construct, rule) VALUES (?1, ?2, {CC_MEMO_RULE})
+                 ON CONFLICT(content) DO UPDATE SET
+                 construct = excluded.construct, rule = excluded.rule
+                 WHERE cc_asm_scans.rule < excluded.rule"
+            ))?;
             for (content, construct) in pairs {
                 put.execute(params![content, construct])?;
             }
@@ -167,7 +305,8 @@ impl FileHashCache<'_> {
         tx.commit()
     }
 
-    /// Record mapped hashes computed this invocation, in one transaction.
+    /// Record mapped hashes computed this invocation, in one transaction. A
+    /// mapped hash an older rule recorded is replaced.
     pub fn put_cc_mapped_hashes(
         &self,
         maps: &str,
@@ -178,9 +317,13 @@ impl FileHashCache<'_> {
         }
         let tx = Transaction::new_unchecked(self.db(), TransactionBehavior::Immediate)?;
         {
-            let mut put = tx.prepare_cached(
-                "INSERT OR IGNORE INTO cc_mapped_hashes(content, maps, mapped) VALUES (?1, ?2, ?3)",
-            )?;
+            let mut put = tx.prepare_cached(&format!(
+                "INSERT INTO cc_mapped_hashes(content, maps, mapped, rule)
+                 VALUES (?1, ?2, ?3, {CC_MEMO_RULE})
+                 ON CONFLICT(content, maps) DO UPDATE SET
+                 mapped = excluded.mapped, rule = excluded.rule
+                 WHERE cc_mapped_hashes.rule < excluded.rule"
+            ))?;
             for (content, mapped) in pairs {
                 put.execute(params![content, maps, mapped])?;
             }
@@ -197,7 +340,7 @@ impl FileHashCache<'_> {
         let mut stmt = self.db().prepare_cached(
             "SELECT m.preprocessed_hash, m.input_count, m.last_used <= unixepoch() - 86400,
                     i.id, i.name, i.content, i.mapped, i.local_path,
-                    i.size, i.mtime_ns, i.ctime_ns, i.inode
+                    i.size, i.mtime_ns, i.ctime_ns, i.inode, i.proof
              FROM cc_preprocess_memos m
              LEFT JOIN cc_memo_input_refs r ON r.memo_id = m.id
              LEFT JOIN cc_memo_inputs i ON i.id = r.input_id
@@ -218,23 +361,34 @@ impl FileHashCache<'_> {
                     needs_touch: row.get(2)?,
                 });
             }
+            let stamp = FileFingerprint {
+                path: row.get(7)?,
+                size: row.get(8)?,
+                mtime_ns: row.get(9)?,
+                ctime_ns: row.get(10)?,
+                inode: row.get(11)?,
+            };
+            let proven = row.get::<_, Option<i64>>(12)? == Some(stamp_proof(&stamp));
             result.as_mut().unwrap().inputs.push(CcPreprocessMemoInput {
                 name: row.get(4)?,
                 content: row.get(5)?,
                 mapped: row.get(6)?,
-                fingerprint: FileFingerprint {
-                    path: row.get(7)?,
-                    size: row.get(8)?,
-                    mtime_ns: row.get(9)?,
-                    ctime_ns: row.get(10)?,
-                    inode: row.get(11)?,
-                },
+                fingerprint: if proven { stamp } else { unproven(stamp.path) },
+                observed_ns: 0,
             });
         }
         // A damaged/incomplete reference set cannot stand in for the full closure.
         Ok(result.filter(|memo| expected_count > 0 && memo.inputs.len() as i64 == expected_count))
     }
 
+    /// Record `inputs` as the read set behind `preprocessed_hash`.
+    ///
+    /// Input rows are shared by every memo that read the same bytes under
+    /// the same name. An input whose stamp had settled when it was observed
+    /// gives the row its stamp, and the proof that lets a lookup trust it.
+    /// One observed sooner never does: a second write in the same timestamp
+    /// tick keeps the stamp and changes the bytes, so the row keeps the
+    /// stamp it has, or starts with none.
     pub fn put_cc_preprocess_memo_inputs(
         &self,
         memo_key: &str,
@@ -253,11 +407,18 @@ impl FileHashCache<'_> {
         tx.execute("DELETE FROM cc_memo_input_refs WHERE memo_id = ?1", [id])?;
         {
             let mut put = tx.prepare_cached(
-                "INSERT INTO cc_memo_inputs(name, content, mapped, local_path, size, mtime_ns, ctime_ns, inode)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                "INSERT INTO cc_memo_inputs(name, content, mapped, local_path, size, mtime_ns, ctime_ns, inode, proof)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
                  ON CONFLICT(name, content, mapped) DO UPDATE SET
                  local_path = excluded.local_path, size = excluded.size,
-                 mtime_ns = excluded.mtime_ns, ctime_ns = excluded.ctime_ns, inode = excluded.inode
+                 mtime_ns = excluded.mtime_ns, ctime_ns = excluded.ctime_ns, inode = excluded.inode,
+                 proof = excluded.proof
+                 RETURNING id",
+            )?;
+            let mut put_unproven = tx.prepare_cached(
+                "INSERT INTO cc_memo_inputs(name, content, mapped, local_path, size, mtime_ns, ctime_ns, inode)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 0, 0, 0)
+                 ON CONFLICT(name, content, mapped) DO UPDATE SET name = excluded.name
                  RETURNING id",
             )?;
             let mut reference = tx.prepare_cached(
@@ -265,19 +426,33 @@ impl FileHashCache<'_> {
             )?;
             for input in inputs {
                 let stamp = &input.fingerprint;
-                let input_id: i64 = put.query_row(
-                    params![
-                        input.name,
-                        input.content,
-                        input.mapped,
-                        stamp.path,
-                        stamp.size,
-                        stamp.mtime_ns,
-                        stamp.ctime_ns,
-                        stamp.inode
-                    ],
-                    |row| row.get(0),
-                )?;
+                let input_id: i64 = if input.stamp_settled() {
+                    put.query_row(
+                        params![
+                            input.name,
+                            input.content,
+                            input.mapped,
+                            stamp.path,
+                            stamp.size,
+                            stamp.mtime_ns,
+                            stamp.ctime_ns,
+                            stamp.inode,
+                            stamp_proof(stamp)
+                        ],
+                        |row| row.get(0),
+                    )?
+                } else {
+                    put_unproven.query_row(
+                        params![
+                            input.name,
+                            input.content,
+                            input.mapped,
+                            stamp.path,
+                            UNPROVEN_SIZE
+                        ],
+                        |row| row.get(0),
+                    )?
+                };
                 reference.execute(params![id, input_id])?;
             }
         }
@@ -337,6 +512,11 @@ impl FileHashCache<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::file_hash::HASH_SETTLE_NS;
+
+    /// Observed long after any stamp these tests write, so they count as
+    /// settled.
+    const SETTLED: i64 = 10 * HASH_SETTLE_NS;
 
     fn input(name: &str, content: &str) -> CcPreprocessMemoInput {
         CcPreprocessMemoInput {
@@ -350,7 +530,15 @@ mod tests {
                 ctime_ns: 30,
                 inode: 40,
             },
+            observed_ns: SETTLED,
         }
+    }
+
+    /// `input` as a lookup reads it back: the index keeps no observation
+    /// time.
+    fn read_back(mut input: CcPreprocessMemoInput) -> CcPreprocessMemoInput {
+        input.observed_ns = 0;
+        input
     }
 
     fn count(cache: &FileHashCache<'_>, table: &str) -> i64 {
@@ -386,7 +574,7 @@ mod tests {
         assert_eq!(count(&cache, "cc_memo_input_refs"), 2);
         let memo = cache.get_cc_preprocess_memo("a").unwrap().unwrap();
         assert_eq!(memo.preprocessed_hash, "hash-a");
-        assert_eq!(memo.inputs, vec![moved.clone()]);
+        assert_eq!(memo.inputs, vec![read_back(moved.clone())]);
         assert!(!memo.needs_touch);
         let second = input("shared.h", "two");
         cache
@@ -396,13 +584,248 @@ mod tests {
         let cache = FileHashCache::open(&path).unwrap();
         assert_eq!(
             cache.get_cc_preprocess_memo("a").unwrap().unwrap().inputs,
-            vec![second]
+            vec![read_back(second)]
         );
         let b = cache.get_cc_preprocess_memo("b").unwrap().unwrap();
         assert_eq!(b.preprocessed_hash, "hash-b");
-        assert_eq!(b.inputs, vec![moved]);
+        assert_eq!(b.inputs, vec![read_back(moved)]);
         assert_eq!(count(&cache, "cc_memo_inputs"), 2);
         assert!(cache.get_cc_preprocess_memo("absent").unwrap().is_none());
+    }
+
+    /// A stamp taken less than the settle window after its file changed is
+    /// never recorded: the memo keeps the input's bytes and no stamp, and a
+    /// row another memo proved keeps its own stamp.
+    #[test]
+    fn an_unsettled_stamp_is_never_recorded_nor_shared() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = FileHashCache::open(&dir.path().join("index.db")).unwrap();
+        let just_before_settling = |input: &CcPreprocessMemoInput| {
+            let changed = input.fingerprint.mtime_ns.max(input.fingerprint.ctime_ns);
+            changed + HASH_SETTLE_NS - 1
+        };
+
+        let mut fresh = input("fresh.h", "f");
+        fresh.observed_ns = just_before_settling(&fresh);
+        cache
+            .put_cc_preprocess_memo_inputs("fresh", "h", std::slice::from_ref(&fresh))
+            .unwrap();
+        let recorded = cache.get_cc_preprocess_memo("fresh").unwrap().unwrap();
+        let recorded = &recorded.inputs[0];
+        assert_eq!(recorded.fingerprint.size, UNPROVEN_SIZE);
+        assert_eq!(recorded.fingerprint.path, fresh.fingerprint.path);
+        assert_eq!(
+            (&recorded.content, &recorded.mapped),
+            (&fresh.content, &fresh.mapped)
+        );
+
+        let proven = input("shared.h", "s");
+        cache
+            .put_cc_preprocess_memo_inputs("a", "h", std::slice::from_ref(&proven))
+            .unwrap();
+        let mut elsewhere = proven.clone();
+        elsewhere.fingerprint = FileFingerprint {
+            path: "/other/shared.h".into(),
+            size: 10,
+            mtime_ns: 50,
+            ctime_ns: 60,
+            inode: 41,
+        };
+        elsewhere.observed_ns = just_before_settling(&elsewhere);
+        cache
+            .put_cc_preprocess_memo_inputs("b", "h", std::slice::from_ref(&elsewhere))
+            .unwrap();
+        assert_eq!(count(&cache, "cc_memo_inputs"), 2, "one row per bytes");
+        for key in ["a", "b"] {
+            assert_eq!(
+                cache.get_cc_preprocess_memo(key).unwrap().unwrap().inputs,
+                vec![read_back(proven.clone())],
+                "{key}: the unsettled stamp replaced the proven one"
+            );
+        }
+
+        // One tick later the same observation is proof and takes the row.
+        elsewhere.observed_ns += 1;
+        cache
+            .put_cc_preprocess_memo_inputs("b", "h", std::slice::from_ref(&elsewhere))
+            .unwrap();
+        assert_eq!(
+            cache.get_cc_preprocess_memo("a").unwrap().unwrap().inputs,
+            vec![read_back(elsewhere)]
+        );
+    }
+
+    /// A hand-off from a wrapper that predates observation times carries
+    /// none, and its stamps count as unsettled.
+    #[test]
+    fn an_input_without_an_observation_time_is_unsettled() {
+        let mut json = serde_json::to_value(input("a.h", "a")).unwrap();
+        json.as_object_mut().unwrap().remove("observed_ns");
+        let old: CcPreprocessMemoInput = serde_json::from_value(json).unwrap();
+        assert_eq!(old.observed_ns, 0);
+        assert!(!old.stamp_settled());
+        assert!(input("a.h", "a").stamp_settled());
+    }
+
+    /// How 1.0.0 records a memo: it rewrites the stamp of each input row
+    /// its bytes share and names no proof.
+    fn record_as_older_release(
+        cache: &FileHashCache<'_>,
+        memo_key: &str,
+        inputs: &[CcPreprocessMemoInput],
+    ) {
+        let db = cache.db();
+        let memo: i64 = db
+            .query_row(
+                "INSERT INTO cc_preprocess_memos(memo_key, preprocessed_hash, input_count)
+                 VALUES (?1, 'older', 0) ON CONFLICT(memo_key) DO UPDATE SET
+                 preprocessed_hash = excluded.preprocessed_hash, last_used = unixepoch()
+                 RETURNING id",
+                [memo_key],
+                |row| row.get(0),
+            )
+            .unwrap();
+        db.execute("DELETE FROM cc_memo_input_refs WHERE memo_id = ?1", [memo])
+            .unwrap();
+        for input in inputs {
+            let stamp = &input.fingerprint;
+            let id: i64 = db
+                .query_row(
+                    "INSERT INTO cc_memo_inputs(name, content, mapped, local_path, size, mtime_ns, ctime_ns, inode)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                     ON CONFLICT(name, content, mapped) DO UPDATE SET
+                     local_path = excluded.local_path, size = excluded.size,
+                     mtime_ns = excluded.mtime_ns, ctime_ns = excluded.ctime_ns, inode = excluded.inode
+                     RETURNING id",
+                    params![
+                        input.name,
+                        input.content,
+                        input.mapped,
+                        stamp.path,
+                        stamp.size,
+                        stamp.mtime_ns,
+                        stamp.ctime_ns,
+                        stamp.inode
+                    ],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            db.execute(
+                "INSERT OR IGNORE INTO cc_memo_input_refs(memo_id, input_id) VALUES (?1, ?2)",
+                params![memo, id],
+            )
+            .unwrap();
+        }
+        db.execute(
+            "UPDATE cc_preprocess_memos SET input_count =
+             (SELECT count(*) FROM cc_memo_input_refs WHERE memo_id = ?1) WHERE id = ?1",
+            [memo],
+        )
+        .unwrap();
+    }
+
+    /// An older release that records the same bytes rewrites the shared
+    /// row's stamp in place. A stamp it changed proves nothing until this
+    /// release records one again; one it rewrote unchanged still does. A row
+    /// only the older release wrote never proves its input.
+    #[test]
+    fn a_stamp_an_older_release_rewrote_proves_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = FileHashCache::open(&dir.path().join("index.db")).unwrap();
+        let stamp_of = |memo_key: &str| {
+            cache
+                .get_cc_preprocess_memo(memo_key)
+                .unwrap()
+                .unwrap()
+                .inputs[0]
+                .fingerprint
+                .clone()
+        };
+        let proven = input("shared.h", "s");
+        cache
+            .put_cc_preprocess_memo_inputs("a", "h", std::slice::from_ref(&proven))
+            .unwrap();
+        assert_eq!(stamp_of("a"), proven.fingerprint);
+
+        record_as_older_release(&cache, "older", std::slice::from_ref(&proven));
+        assert_eq!(stamp_of("a"), proven.fingerprint, "rewritten unchanged");
+
+        for field in 0..5 {
+            cache
+                .put_cc_preprocess_memo_inputs("a", "h", std::slice::from_ref(&proven))
+                .unwrap();
+            assert_eq!(stamp_of("a"), proven.fingerprint, "field {field}");
+            let mut rewritten = proven.clone();
+            let stamp = &mut rewritten.fingerprint;
+            match field {
+                0 => stamp.path = "/other/shared.h".into(),
+                1 => stamp.size += 1,
+                2 => stamp.mtime_ns += 1,
+                3 => stamp.ctime_ns += 1,
+                _ => stamp.inode += 1,
+            }
+            record_as_older_release(&cache, "older", std::slice::from_ref(&rewritten));
+            assert_eq!(
+                stamp_of("a"),
+                unproven(rewritten.fingerprint.path.clone()),
+                "field {field}"
+            );
+            cache
+                .put_cc_preprocess_memo_inputs("a", "h", std::slice::from_ref(&rewritten))
+                .unwrap();
+            assert_eq!(stamp_of("a"), rewritten.fingerprint, "field {field}");
+        }
+
+        let other = input("other.h", "o");
+        record_as_older_release(&cache, "older", std::slice::from_ref(&other));
+        assert_eq!(stamp_of("older"), unproven(other.fingerprint.path));
+    }
+
+    /// A mapped hash or verdict an older release recorded is never served,
+    /// and this release's put replaces it. The older release only ever
+    /// inserts, so it leaves what this release recorded alone.
+    #[test]
+    fn a_mapped_hash_or_verdict_an_older_release_recorded_is_never_served() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = FileHashCache::open(&dir.path().join("index.db")).unwrap();
+        // The statements 1.0.0 records them with.
+        let record_as_older_release = |value: &str| {
+            cache
+                .db()
+                .execute(
+                    "INSERT OR IGNORE INTO cc_mapped_hashes(content, maps, mapped)
+                     VALUES ('c', 'maps', ?1)",
+                    [value],
+                )
+                .unwrap();
+            cache
+                .db()
+                .execute(
+                    "INSERT OR IGNORE INTO cc_asm_scans(content, construct) VALUES ('c', ?1)",
+                    [value],
+                )
+                .unwrap();
+        };
+        record_as_older_release("older");
+        assert!(
+            cache
+                .get_cc_mapped_hashes("maps", &["c"])
+                .unwrap()
+                .is_empty()
+        );
+        assert!(cache.get_cc_asm_scans(&["c"]).unwrap().is_empty());
+
+        cache
+            .put_cc_mapped_hashes("maps", &[("c".into(), "current".into())])
+            .unwrap();
+        cache
+            .put_cc_asm_scans(&[("c".into(), String::new())])
+            .unwrap();
+        record_as_older_release("older again");
+        let mapped = cache.get_cc_mapped_hashes("maps", &["c"]).unwrap();
+        assert_eq!(mapped.get("c").map(String::as_str), Some("current"));
+        let verdicts = cache.get_cc_asm_scans(&["c"]).unwrap();
+        assert_eq!(verdicts.get("c").map(String::as_str), Some(""));
     }
 
     #[test]
@@ -680,7 +1103,7 @@ mod tests {
         );
         let memo = cache.get_cc_preprocess_memo("unit").unwrap().unwrap();
         assert_eq!(memo.preprocessed_hash, "old");
-        assert_eq!(memo.inputs, vec![input("old.h", "old")]);
+        assert_eq!(memo.inputs, vec![read_back(input("old.h", "old"))]);
         assert_eq!(count(&cache, "cc_memo_inputs"), 1);
         assert_eq!(count(&cache, "cc_memo_input_refs"), 1);
     }
@@ -770,7 +1193,7 @@ mod tests {
             .unwrap();
         let memo = cache.get_cc_preprocess_memo("json").unwrap().unwrap();
         assert_eq!(memo.preprocessed_hash, "hash-j");
-        assert_eq!(memo.inputs, vec![input("a.h", "one")]);
+        assert_eq!(memo.inputs, vec![read_back(input("a.h", "one"))]);
         assert!(
             cache
                 .put_cc_preprocess_memo("bad", "hash-b", "not json")

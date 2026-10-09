@@ -68,6 +68,162 @@ fn index_ddl_runs_once_per_schema_generation() {
     );
 }
 
+/// An index from before the C/C++ memo's rule columns holds memos an older
+/// release recorded under the old rules. The first open adds the columns
+/// and drops every memo, mapped hash and assembler verdict. An older
+/// release that opens the index later stamps its own generation back and
+/// records rows the old way: the next open drops nothing, keeps serving
+/// what this release recorded, and serves nothing the older release wrote.
+#[test]
+fn the_cc_memo_rule_columns_arrive_once_and_older_rows_are_never_served() {
+    const MEMO_TABLES: [&str; 5] = [
+        "cc_preprocess_memos",
+        "cc_memo_inputs",
+        "cc_memo_input_refs",
+        "cc_mapped_hashes",
+        "cc_asm_scans",
+    ];
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("index.db");
+    let stamp = |mtime_ns| crate::file_hash::FileFingerprint {
+        path: "/checkout/a.h".into(),
+        size: 1,
+        mtime_ns,
+        ctime_ns: mtime_ns,
+        inode: 1,
+    };
+    // The statements 1.0.0 records a memo, a mapped hash and a verdict with.
+    let record_as_older_release = |db: &Connection, memo_key: &str, mtime_ns: i64| {
+        let memo: i64 = db
+            .query_row(
+                "INSERT INTO cc_preprocess_memos(memo_key, preprocessed_hash, input_count)
+                 VALUES (?1, 'older', 0) ON CONFLICT(memo_key) DO UPDATE SET
+                 preprocessed_hash = excluded.preprocessed_hash, last_used = unixepoch()
+                 RETURNING id",
+                params![memo_key],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let input: i64 = db
+            .query_row(
+                "INSERT INTO cc_memo_inputs(name, content, mapped, local_path, size, mtime_ns, ctime_ns, inode)
+                 VALUES ('a.h', 'c', 'm', '/checkout/a.h', 1, ?1, ?1, 1)
+                 ON CONFLICT(name, content, mapped) DO UPDATE SET
+                 local_path = excluded.local_path, size = excluded.size,
+                 mtime_ns = excluded.mtime_ns, ctime_ns = excluded.ctime_ns, inode = excluded.inode
+                 RETURNING id",
+                params![mtime_ns],
+                |row| row.get(0),
+            )
+            .unwrap();
+        db.execute(
+            "INSERT OR IGNORE INTO cc_memo_input_refs(memo_id, input_id) VALUES (?1, ?2)",
+            params![memo, input],
+        )
+        .unwrap();
+        db.execute(
+            "UPDATE cc_preprocess_memos SET input_count =
+             (SELECT count(*) FROM cc_memo_input_refs WHERE memo_id = ?1) WHERE id = ?1",
+            params![memo],
+        )
+        .unwrap();
+        db.execute_batch(
+            "INSERT OR IGNORE INTO cc_mapped_hashes(content, maps, mapped)
+                 VALUES ('c', 'maps', 'older'), ('c2', 'maps', 'older');
+             INSERT OR IGNORE INTO cc_asm_scans(content, construct)
+                 VALUES ('c', 'older'), ('c2', 'older');",
+        )
+        .unwrap();
+    };
+    let rows = |db: &Connection| {
+        MEMO_TABLES.map(|table| {
+            db.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap()
+        })
+    };
+    let generation = |db: &Connection| -> i64 {
+        db.query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap()
+    };
+
+    let db = open_index_db(&path).unwrap();
+    db.execute_batch(
+        "ALTER TABLE cc_memo_inputs DROP COLUMN proof;
+         ALTER TABLE cc_mapped_hashes DROP COLUMN rule;
+         ALTER TABLE cc_asm_scans DROP COLUMN rule;",
+    )
+    .unwrap();
+    record_as_older_release(&db, "memo", 1);
+    db.pragma_update(None, "user_version", 8_i64).unwrap();
+    assert_eq!(rows(&db), [1, 1, 1, 2, 2]);
+    drop(db);
+
+    let db = open_index_db(&path).unwrap();
+    assert_eq!(generation(&db), INDEX_SCHEMA_GENERATION);
+    assert_eq!(
+        rows(&db),
+        [0; 5],
+        "rows from before the columns are dropped"
+    );
+    let cache = crate::file_hash::FileHashCache::Borrowed(&db);
+    let input = crate::file_hash::CcPreprocessMemoInput {
+        name: "a.h".into(),
+        fingerprint: stamp(1),
+        content: "c".into(),
+        mapped: "m".into(),
+        observed_ns: 10 * crate::file_hash::HASH_SETTLE_NS,
+    };
+    cache
+        .put_cc_preprocess_memo_inputs("memo", "current", std::slice::from_ref(&input))
+        .unwrap();
+    cache
+        .put_cc_mapped_hashes("maps", &[("c".into(), "current".into())])
+        .unwrap();
+    cache
+        .put_cc_asm_scans(&[("c".into(), String::new())])
+        .unwrap();
+    db.pragma_update(None, "user_version", 8_i64).unwrap();
+    record_as_older_release(&db, "older-memo", 1);
+    drop(db);
+
+    let db = open_index_db(&path).unwrap();
+    assert_eq!(
+        generation(&db),
+        INDEX_SCHEMA_GENERATION,
+        "the schema ran again"
+    );
+    assert_eq!(
+        rows(&db),
+        [2, 1, 2, 2, 2],
+        "nothing was dropped the second time"
+    );
+    let cache = crate::file_hash::FileHashCache::Borrowed(&db);
+    let memo = cache.get_cc_preprocess_memo("memo").unwrap().unwrap();
+    assert_eq!(memo.preprocessed_hash, "current");
+    assert_eq!(
+        memo.inputs[0].fingerprint,
+        stamp(1),
+        "rewritten unchanged, the stamp still proves the input"
+    );
+    let found = cache.get_cc_mapped_hashes("maps", &["c", "c2"]).unwrap();
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found["c"], "current");
+    let verdicts = cache.get_cc_asm_scans(&["c", "c2"]).unwrap();
+    assert_eq!(verdicts.len(), 1, "{verdicts:?}");
+    assert_eq!(verdicts["c"], "");
+
+    // The older release saw the shared input again with a later stamp.
+    record_as_older_release(&db, "older-memo", 7);
+    let memo = cache.get_cc_preprocess_memo("memo").unwrap().unwrap();
+    assert_eq!(
+        memo.inputs[0].fingerprint.size,
+        crate::cc_memo::UNPROVEN_SIZE
+    );
+    assert_eq!(memo.inputs[0].fingerprint.path, "/checkout/a.h");
+}
+
 /// An index stamped at generation 3 predates the crate-name index, and
 /// the stamp alone must not keep it from gaining one.
 #[test]

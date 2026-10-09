@@ -321,6 +321,76 @@ exit "$status"
     }
 }
 
+/// A key taken before the compile hashed `value.h`, and the header was
+/// saved before the compiler read it. The object holds the new value under
+/// the old header's key, so neither the entry nor the memo may be stored.
+#[test]
+fn key_first_cc_does_not_store_an_input_changed_before_the_compile_read_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    fs::write(root.join("kache.toml"), "").unwrap();
+    fs::write(
+        root.join("unit.c"),
+        "#include \"value.h\"\nint value(void) { return VALUE; }\n",
+    )
+    .unwrap();
+    fs::write(root.join("value.h"), "#define VALUE 42\n").unwrap();
+    fs::write(
+        root.join("main.c"),
+        "int value(void); int main(void) { return value(); }\n",
+    )
+    .unwrap();
+    let compiler = root.join("cc");
+    kache_fs::testutil::write_executable(
+        &compiler,
+        r#"#!/bin/sh
+for argument in "$@"; do
+    case "$argument" in -###|--version|-E) exec cc "$@" ;; esac
+done
+case " $* " in *" unit.c "*) printf '#define VALUE 17\n' > value.h ;; esac
+exec cc "$@"
+"#,
+    );
+    let output = cacheable_cc_command(&root)
+        .arg(&compiler)
+        .args(["-c", "unit.c", "-o", "unit.o"])
+        .env("KACHE_DEFERRED_DISCOVERY", "0")
+        .env("KACHE_LOG", "kache=debug")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(last_cc_event(&root)["preprocessor_runs"], 1, "keyed first");
+    assert!(
+        Command::new("cc")
+            .args(["main.c", "unit.o", "-o", "check-value"])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert_eq!(
+        Command::new(root.join("check-value"))
+            .status()
+            .unwrap()
+            .code(),
+        Some(17),
+        "the compile read the saved header"
+    );
+    let db = rusqlite::Connection::open(root.join("cache/index.db")).unwrap();
+    for table in ["entries", "cc_preprocess_memos"] {
+        let count: i64 = db
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0, "a changed input must not populate {table}");
+    }
+}
+
 fn last_cc_event(root: &std::path::Path) -> serde_json::Value {
     let events = fs::read_to_string(root.join("cache/events.jsonl")).unwrap();
     serde_json::from_str(events.lines().last().unwrap()).unwrap()

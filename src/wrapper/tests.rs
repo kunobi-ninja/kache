@@ -6340,6 +6340,48 @@ fn nvcc_miss_then_hit_round_trips_object_and_depinfo() {
     assert_eq!(spool_intent_count(&config), 0);
 }
 
+/// The key hashes every input before nvcc runs. A header saved in between
+/// may not be what the object was built from, so the compile is not
+/// stored: with the old header back, the next run compiles again.
+#[cfg(unix)]
+#[test]
+fn nvcc_does_not_store_a_compile_whose_input_changed_after_keying() {
+    let _lock = crate::test_support::process_state_test_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let (work, nvcc, count, _) = setup_nvcc_case(&dir, None, None, 0, 0);
+    let header = work.join("inc").join("h.h");
+    let original = std::fs::read(&header).unwrap();
+    // A driver that saves the header on its way into the compile.
+    let driver = dir.path().join("driver");
+    std::fs::create_dir_all(&driver).unwrap();
+    let saving = driver.join("nvcc");
+    let shell =
+        crate::compiler::resolve_program_on_path("sh").expect("sh must be available on PATH");
+    kache_fs::testutil::write_executable(
+        &saving,
+        format!(
+            "#!{sh}\n\
+             case \"$1\" in --version|--dryrun|-M) ;; *) printf '#define LATE 1\\n' > \"{header}\" ;; esac\n\
+             exec \"{nvcc}\" \"$@\"\n",
+            sh = shell.display(),
+            header = header.display(),
+            nvcc = nvcc.display(),
+        ),
+    );
+    let config = test_config(dir.path().join("cache"));
+    let _daemon = RemoteCheckReplyDaemon::spawn(config.socket_path(), false);
+    let argv = nvcc_compile_argv(&saving, &work, &[]);
+
+    assert_eq!(run_nvcc(&config, &argv).unwrap(), 0);
+    std::fs::write(&header, &original).unwrap();
+    assert_eq!(run_nvcc(&config, &argv).unwrap(), 0);
+    assert_eq!(
+        std::fs::read_to_string(&count).unwrap(),
+        "run\nrun\n",
+        "the first compile was stored under the old header's key"
+    );
+}
+
 /// A dep-info the entry lacks evicts and recompiles: an object-only
 /// entry cannot satisfy `-MF`, and the recompiled entry (object +
 /// dep-info) hits afterwards.
@@ -10651,6 +10693,8 @@ fn cc_successful_compile_and_handoff_preserve_actual_rebuilt_outputs() {
     let source = dir.path().join("observed.c");
     let object = dir.path().join("observed.o");
     std::fs::write(&source, "int observed(void) { return 7; }\n").unwrap();
+    // A key-first store refuses a source written just before it started.
+    crate::test_support::settle_writes(&[&source]);
     let cc = crate::compiler::resolve_program_on_path("cc")
         .expect("the test runner requires a C compiler");
     let mut config = test_config(dir.path().join("cache"));

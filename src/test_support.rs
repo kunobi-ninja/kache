@@ -261,6 +261,23 @@ pub(crate) fn output_retrying_etxtbsy(
 #[cfg(unix)]
 const ETXTBSY_RETRIES: usize = 50;
 
+/// Wait until no write made to `paths` so far can count as one made since a
+/// build that starts afterwards ([`crate::cache_key::stamp_written_since`]).
+/// The unit-test side of `tests/common`'s `settle_writes`.
+pub(crate) fn settle_writes(paths: &[&std::path::Path]) {
+    use crate::cache_key::{FileFingerprint, stamp_clock_ns, stamp_window_ns};
+    let settled_at = paths
+        .iter()
+        .filter_map(|path| FileFingerprint::from_path(path).ok())
+        .flat_map(|stamp| [stamp.mtime_ns, stamp.ctime_ns])
+        .map(|stamp| stamp.saturating_add(stamp_window_ns(stamp)))
+        .max()
+        .unwrap_or(0);
+    while stamp_clock_ns() <= settled_at {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{cwd_dir, process_state_test_lock};

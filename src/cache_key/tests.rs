@@ -10669,14 +10669,13 @@ fn mapped_hashes_are_memoised_by_content_and_map_set() {
     std::fs::write(&copy, &body).unwrap();
     std::fs::write(&other, format!("{body}#define OTHER 2\n")).unwrap();
     let reads = std::cell::Cell::new(0usize);
-    let counting = |path: &Path| -> Option<String> {
+    let counting = |path: &Path| -> Option<CcContentHashes> {
         reads.set(reads.get() + 1);
         let bytes = std::fs::read(path).ok()?;
-        Some(
-            blake3::hash(&[b"mapped:".as_slice(), &bytes].concat())
-                .to_hex()
-                .to_string(),
-        )
+        Some(content_hashes(
+            &bytes,
+            &[b"mapped:".as_slice(), &bytes].concat(),
+        ))
     };
     let name = |path: &Path| (path.to_string_lossy().into_owned(), path.to_path_buf());
 
@@ -10743,21 +10742,24 @@ fn assembler_scans_are_memoised_by_content() {
     )
     .unwrap();
     let scans = std::cell::Cell::new(0usize);
-    let scan = |path: &Path| -> Option<Option<&'static str>> {
+    let scan = |path: &Path| -> Option<(String, Option<&'static str>)> {
         scans.set(scans.get() + 1);
         let text = std::fs::read_to_string(path).ok()?;
-        Some(text.contains(".incbin").then_some(".incbin"))
+        Some((
+            blake3::hash(text.as_bytes()).to_hex().to_string(),
+            text.contains(".incbin").then_some(".incbin"),
+        ))
     };
     let name = |path: &Path| (path.to_string_lossy().into_owned(), path.to_path_buf());
     let hasher = FileHasher::persistent(&db);
     let inputs = hasher
-        .cc_preprocess_fingerprints(&[name(&clean), name(&twin)], "", &|_| Some(String::new()))
+        .cc_preprocess_fingerprints(&[name(&clean), name(&twin)], "", &no_mapping)
         .unwrap();
     assert_eq!(hasher.cc_inputs_hide_assembler_input(&inputs, &scan), None);
     assert_eq!(scans.get(), 1, "twins share one scan");
     let later = FileHasher::persistent(&db);
     let inputs = later
-        .cc_preprocess_fingerprints(&[name(&clean), name(&pasted)], "", &|_| Some(String::new()))
+        .cc_preprocess_fingerprints(&[name(&clean), name(&pasted)], "", &no_mapping)
         .unwrap();
     assert_eq!(
         later
@@ -10890,8 +10892,18 @@ fn cc_preprocess_memo_requires_every_input_fingerprint_to_match() {
 }
 
 /// Tests that do not exercise prefix maps hash contents as they are.
-fn no_mapping(path: &Path) -> Option<String> {
-    hash_file(path).ok()
+fn no_mapping(path: &Path) -> Option<CcContentHashes> {
+    let bytes = std::fs::read(path).ok()?;
+    Some(content_hashes(&bytes, &bytes))
+}
+
+/// What `mapped_content` returns for one read of `bytes` that the maps
+/// rewrote to `mapped`.
+fn content_hashes(bytes: &[u8], mapped: &[u8]) -> CcContentHashes {
+    CcContentHashes {
+        raw: blake3::hash(bytes).to_hex().to_string(),
+        mapped: blake3::hash(mapped).to_hex().to_string(),
+    }
 }
 
 /// A resolver for tests that record and read in one place: the recorded
@@ -10922,13 +10934,12 @@ fn cc_preprocess_memo_compares_contents_as_the_expansion_sees_them() {
     // The maps each tree would use: its own root onto one shared sentinel.
     let map_under = |root: &std::path::Path| {
         let root = root.to_string_lossy().into_owned();
-        move |path: &Path| -> Option<String> {
+        move |path: &Path| -> Option<CcContentHashes> {
             let text = std::fs::read_to_string(path).ok()?;
-            Some(
-                blake3::hash(text.replace(&root, "<root>").as_bytes())
-                    .to_hex()
-                    .to_string(),
-            )
+            Some(content_hashes(
+                text.as_bytes(),
+                text.replace(&root, "<root>").as_bytes(),
+            ))
         }
     };
 
@@ -11096,6 +11107,207 @@ fn cc_preprocess_memo_survives_new_metadata_for_unchanged_bytes() {
         None,
         "changed bytes must force a fresh preprocess"
     );
+}
+
+/// A stamp taken less than the settle window after its file changed can
+/// survive a second write in the same timestamp tick. The memo does not
+/// record it, so a lookup reads that input instead of trusting metadata;
+/// the same stamp observed once settled is trusted.
+#[test]
+fn a_stamp_observed_before_it_settled_never_answers_a_lookup() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("idx.sqlite");
+    let digest = "e".repeat(64);
+    let record = |file: &str, observed_later_ns: i64| {
+        let path = dir.path().join(file);
+        std::fs::write(&path, "#define H 1\n").unwrap();
+        let hasher = FileHasher::persistent(&db);
+        let mut inputs = hasher
+            .cc_preprocess_fingerprints(
+                &[(path.to_string_lossy().into_owned(), path.clone())],
+                "",
+                &no_mapping,
+            )
+            .unwrap();
+        inputs[0].observed_ns += observed_later_ns;
+        hasher.cc_preprocess_memo_record_if_unchanged(file, &digest, &inputs, &no_mapping);
+        let recorded = hasher
+            .cache
+            .as_ref()
+            .unwrap()
+            .get_cc_preprocess_memo(file)
+            .unwrap()
+            .expect("the memo is recorded either way");
+        (inputs.remove(0), recorded.inputs[0].fingerprint.clone())
+    };
+    let reads_on_lookup = |file: &str| {
+        let hasher = FileHasher::persistent(&db);
+        let hit = hasher
+            .cc_preprocess_memo_lookup(file, no_remap, &no_mapping)
+            .map(|(hash, _)| hash);
+        assert_eq!(hit.as_deref(), Some(digest.as_str()), "{file}");
+        hasher.stats().cache_misses
+    };
+
+    let (fresh, stored) = record("fresh.h", 0);
+    assert!(!fresh.stamp_settled(), "the file was just written");
+    assert_ne!(stored, fresh.fingerprint, "the stamp is not recorded");
+    assert_eq!(reads_on_lookup("fresh.h"), 1, "the content is compared");
+
+    let (settled, stored) = record("settled.h", HASH_SETTLE_NS);
+    assert!(settled.stamp_settled());
+    assert_eq!(stored, settled.fingerprint);
+    assert_eq!(
+        reads_on_lookup("settled.h"),
+        0,
+        "matching metadata needs no read"
+    );
+}
+
+/// A memo hit proves an input by its settled stamp without hashing it. A
+/// key-first compile's recheck still has to cover that input.
+#[test]
+fn an_input_a_memo_hit_proved_by_stamp_is_rechecked() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("idx.sqlite");
+    let header = dir.path().join("h.h");
+    std::fs::write(&header, "#define H 1\n").unwrap();
+    let names = [(header.to_string_lossy().into_owned(), header.clone())];
+    let recorder = FileHasher::persistent(&db);
+    let mut inputs = recorder
+        .cc_preprocess_fingerprints(&names, "", &no_mapping)
+        .unwrap();
+    inputs[0].observed_ns += HASH_SETTLE_NS;
+    recorder.cc_preprocess_memo_record_if_unchanged(
+        "memo-key",
+        &"f".repeat(64),
+        &inputs,
+        &no_mapping,
+    );
+
+    let mut hasher = FileHasher::persistent(&db);
+    hasher.arm_too_new_guard(i64::MAX, 0);
+    assert!(
+        hasher
+            .cc_preprocess_memo_lookup("memo-key", no_remap, &no_mapping)
+            .is_some()
+    );
+    assert_eq!(hasher.stats().cache_misses, 0, "proved by its stamp");
+    std::fs::write(&header, "#define H 22\n").unwrap();
+    hasher.recheck_guarded_inputs();
+    assert!(hasher.too_new());
+}
+
+/// The mapped hash comes from a second read of the file. A save landing
+/// between the content hash and that read must not pair the old content
+/// with the new bytes' mapping: the capture fails and nothing is learned.
+#[test]
+fn a_mapped_hash_of_other_bytes_is_never_learned() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("idx.sqlite");
+    let header = dir.path().join("h.h");
+    std::fs::write(&header, "#define H 1\n").unwrap();
+    let names = [(header.to_string_lossy().into_owned(), header.clone())];
+    let old = blake3::hash(b"#define H 1\n").to_hex().to_string();
+    let new = blake3::hash(b"#define H 22\n").to_hex().to_string();
+    let saved_in_between = |path: &Path| {
+        std::fs::write(path, "#define H 22\n").unwrap();
+        no_mapping(path)
+    };
+
+    let hasher = FileHasher::persistent(&db);
+    assert_eq!(
+        hasher.cc_preprocess_fingerprints(&names, "maps", &saved_in_between),
+        None
+    );
+    let learned = |hasher: &FileHasher<'_>| {
+        hasher
+            .cache
+            .as_ref()
+            .unwrap()
+            .get_cc_mapped_hashes("maps", &[&old, &new])
+            .unwrap()
+    };
+    assert!(learned(&hasher).is_empty(), "{:?}", learned(&hasher));
+
+    // One read that matches the content hash is learned.
+    let later = FileHasher::persistent(&db);
+    let inputs = later
+        .cc_preprocess_fingerprints(&names, "maps", &no_mapping)
+        .unwrap();
+    assert_eq!(inputs[0].content, new);
+    assert_eq!(
+        learned(&later),
+        HashMap::from([(new.clone(), inputs[0].mapped.clone())])
+    );
+}
+
+/// The assembler scan reads the file again too. A verdict on bytes saved
+/// since the fingerprint is not recorded, and it does not clear the inputs.
+#[test]
+fn an_assembler_verdict_on_other_bytes_is_never_learned() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("idx.sqlite");
+    let header = dir.path().join("h.h");
+    std::fs::write(&header, "#define H 1\n").unwrap();
+    let names = [(header.to_string_lossy().into_owned(), header.clone())];
+    let hasher = FileHasher::persistent(&db);
+    let inputs = hasher
+        .cc_preprocess_fingerprints(&names, "", &no_mapping)
+        .unwrap();
+    let scanned_after_a_save = |path: &Path| {
+        std::fs::write(path, "#define H 22\n").unwrap();
+        let bytes = std::fs::read(path).ok()?;
+        Some((blake3::hash(&bytes).to_hex().to_string(), None))
+    };
+
+    assert_eq!(
+        hasher
+            .cc_inputs_hide_assembler_input(&inputs, &scanned_after_a_save)
+            .as_deref(),
+        Some(CC_INPUT_CHANGED_WHILE_SCANNED)
+    );
+    assert!(
+        hasher
+            .cache
+            .as_ref()
+            .unwrap()
+            .get_cc_asm_scans(&[&inputs[0].content])
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// A key taken before the compile hashed its inputs. One rewritten or
+/// removed before the recheck trips the guard; untouched ones do not.
+#[test]
+fn rechecking_guarded_inputs_flags_one_written_since_it_was_hashed() {
+    let dir = tempfile::tempdir().unwrap();
+    let kept = dir.path().join("kept.h");
+    let rewritten = dir.path().join("rewritten.h");
+    let removed = dir.path().join("removed.h");
+    for path in [&kept, &rewritten, &removed] {
+        std::fs::write(path, "#define H 1\n").unwrap();
+    }
+    let checked = |paths: &[&PathBuf], after_hashing: &dyn Fn()| {
+        let mut hasher = FileHasher::new();
+        // Armed, but no stamp is new enough to trip it by the clock.
+        hasher.arm_too_new_guard(i64::MAX, 0);
+        for path in paths {
+            hasher.hash(path).unwrap();
+        }
+        after_hashing();
+        hasher.recheck_guarded_inputs();
+        hasher.too_new()
+    };
+
+    assert!(!checked(&[&kept, &rewritten], &|| {}));
+    assert!(checked(&[&kept, &rewritten], &|| {
+        std::fs::write(&rewritten, "#define H 22\n").unwrap();
+    }));
+    assert!(checked(&[&kept, &removed], &|| {
+        std::fs::remove_file(&removed).unwrap();
+    }));
 }
 
 #[test]
@@ -11292,9 +11504,8 @@ fn a_file_rewritten_between_the_stat_and_the_read_counts_as_written() {
         })));
         let hash = if header {
             let headers = vec![("input.h".to_string(), file.clone())];
-            let mapped = |path: &Path| std::fs::read_to_string(path).ok();
             hasher
-                .cc_preprocess_fingerprints(&headers, "maps", &mapped)
+                .cc_preprocess_fingerprints(&headers, "maps", &no_mapping)
                 .map(|inputs| inputs[0].content.clone())
         } else {
             hasher.hash(&file).ok()
@@ -11490,7 +11701,7 @@ fn a_units_headers_come_from_one_memo_lookup_once_settled() {
         .collect();
     let db = rusqlite::Connection::open_in_memory().unwrap();
     ensure_file_hash_cache_schema(&db).unwrap();
-    let mapped = |path: &Path| std::fs::read_to_string(path).ok();
+    let mapped = no_mapping;
 
     let mut first = FileHasher::from_cache(FileHashCache::Borrowed(&db));
     first.arm_too_new_guard(1, 0);
@@ -11540,7 +11751,7 @@ fn an_unarmed_guard_keeps_no_headers_for_revalidation() {
     let path = dir.path().join("h.h");
     std::fs::write(&path, "#define H 1\n").unwrap();
     let headers = vec![("h.h".to_string(), path)];
-    let mapped = |path: &Path| std::fs::read_to_string(path).ok();
+    let mapped = no_mapping;
 
     let hasher = FileHasher::new();
     hasher

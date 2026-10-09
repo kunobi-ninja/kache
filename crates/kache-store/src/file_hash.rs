@@ -623,6 +623,7 @@ pub fn ensure_file_hash_cache_schema(db: &Connection) -> rusqlite::Result<()> {
         }
     }
     ensure_file_hashes_rule(db)?;
+    crate::cc_memo::ensure_rule(db)?;
     ensure_input_predictions_last_used(db, unix_now())
 }
 

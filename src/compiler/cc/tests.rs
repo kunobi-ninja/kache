@@ -4153,21 +4153,27 @@ fn cc_mapped_content_hash_digests_the_mapped_bytes() {
     ];
     let hash_a = cc_mapped_content_hash(&a, &maps).unwrap();
     let hash_b = cc_mapped_content_hash(&b, &maps).unwrap();
-    assert_eq!(hash_a.len(), 64, "a blake3 digest, not a placeholder");
     assert_eq!(
-        hash_a, hash_b,
+        hash_a.mapped.len(),
+        64,
+        "a blake3 digest, not a placeholder"
+    );
+    assert_eq!(
+        hash_a.mapped, hash_b.mapped,
         "contents the maps make equal must hash equal"
     );
+    // The raw digest names the bytes the mapped one was taken from.
+    assert_eq!(hash_a.raw, crate::cache_key::hash_file(&a).unwrap());
+    assert_eq!(hash_b.raw, crate::cache_key::hash_file(&b).unwrap());
     // The digest is of the MAPPED bytes, so it is not the raw digest.
     assert_ne!(
-        hash_a,
-        crate::cache_key::hash_file(&a).unwrap(),
+        hash_a.mapped, hash_a.raw,
         "mapping must actually change what is hashed"
     );
     // And two files the maps do not reconcile stay apart.
     assert_ne!(
-        hash_a,
-        cc_mapped_content_hash(&b, &[]).unwrap(),
+        hash_a.mapped,
+        cc_mapped_content_hash(&b, &[]).unwrap().mapped,
         "without the maps the two contents differ"
     );
     assert_eq!(
@@ -7383,6 +7389,7 @@ fn direct_inputs_digest_follows_names_and_content_only() {
             ctime_ns: 3,
             inode: 4,
         },
+        observed_ns: 0,
     };
     let base = cc_direct_inputs_digest(&[input("a.c", "1"), input("b.h", "2")]);
     assert_eq!(base.len(), 64);
@@ -7956,7 +7963,8 @@ fn remembered_prefix_maps_follow_the_configured_base_dirs() {
 }
 
 /// Only a memo captured from the compile's own read set goes to the
-/// daemon; one from a preceding expansion stays on the revalidating path.
+/// daemon; one from a preceding expansion stays on the revalidating path,
+/// and so does one with a stamp observed before it settled.
 #[test]
 fn only_a_captured_memo_is_handed_to_the_daemon_and_discarding_forgets_it() {
     let input = crate::cache_key::CcPreprocessMemoInput {
@@ -7970,6 +7978,7 @@ fn only_a_captured_memo_is_handed_to_the_daemon_and_discarding_forgets_it() {
             ctime_ns: 3,
             inode: 4,
         },
+        observed_ns: 3 + crate::cache_key::HASH_SETTLE_NS,
     };
     let pending = |captured| PendingCcPreprocessMemo {
         memo_key: "k".repeat(64),
@@ -7995,6 +8004,22 @@ fn only_a_captured_memo_is_handed_to_the_daemon_and_discarding_forgets_it() {
     assert_eq!(memo.inputs, vec![input.clone()]);
     // Handing it over leaves it pending until the daemon has taken it.
     assert!(compiler.pending_preprocess_memo.borrow().is_some());
+
+    // A daemon from an older release would record any stamp it is given.
+    let mut unsettled = input.clone();
+    unsettled.name = "b.h".to_string();
+    unsettled.observed_ns -= 1;
+    compiler
+        .pending_preprocess_memo
+        .replace(Some(PendingCcPreprocessMemo {
+            fingerprints: vec![input.clone(), unsettled],
+            ..pending(true)
+        }));
+    assert!(compiler.captured_preprocess_memo().is_none());
+    assert!(
+        compiler.pending_preprocess_memo.borrow().is_some(),
+        "the wrapper records it itself"
+    );
 
     compiler.discard_preprocess_memo();
     assert!(compiler.pending_preprocess_memo.borrow().is_none());

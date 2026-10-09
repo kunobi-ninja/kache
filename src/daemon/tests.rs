@@ -1647,6 +1647,64 @@ async fn diagnostic_stats_send_no_upgrade_metadata_to_legacy_daemons() {
     assert_eq!(stats.version, "0.0.1");
 }
 
+/// 1.0.x orders daemons by this value, so it must be the running
+/// executable's modification time, not just any non-zero number.
+#[test]
+fn the_build_epoch_is_the_executables_mtime() {
+    let modified = std::fs::metadata(std::env::current_exe().unwrap())
+        .unwrap()
+        .modified()
+        .unwrap()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    assert_eq!(build_epoch(), modified);
+}
+
+/// A 1.0.x daemon drains only when `client_epoch` is newer than its own
+/// executable, so requests that may ask for an upgrade carry the real mtime
+/// beside the release.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn upgrade_requests_carry_the_executable_mtime_for_legacy_daemons() {
+    assert_ne!(build_epoch(), 0, "the test binary has a readable mtime");
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let key = test_cache_key("legacy-daemon-epoch");
+    seed_store_entry(&config, &key, "serde", dir.path());
+    let listener = bind_listener(&config.socket_path());
+    let server = tokio::spawn(async move {
+        let mut requests = Vec::new();
+        // The upload is fire-and-forget; the stats read waits for a reply.
+        for reply in [None, Some(stats_at_version(VERSION))] {
+            let stream = listener.accept().await.unwrap();
+            let mut line = String::new();
+            BufReader::new(&stream).read_line(&mut line).await.unwrap();
+            requests.push(serde_json::from_str::<serde_json::Value>(&line).unwrap());
+            if let Some(stats) = reply {
+                let response = Response {
+                    stats: Some(stats),
+                    ..Response::ok()
+                };
+                let line = format!("{}\n", serde_json::to_string(&response).unwrap());
+                (&stream).write_all(line.as_bytes()).await.unwrap();
+            }
+        }
+        requests
+    });
+    let client = config.clone();
+    tokio::task::spawn_blocking(move || {
+        send_upload_job(&client, &key, Path::new("/tmp/test"), "serde").unwrap();
+        send_stats_request(&client, false, None, None).unwrap();
+    })
+    .await
+    .unwrap();
+    let requests = server.await.unwrap();
+    for (request, kind) in requests.iter().zip(["upload", "stats"]) {
+        assert_eq!(request[kind]["client_epoch"], build_epoch(), "{request}");
+        assert_eq!(request[kind]["client_version"], VERSION, "{request}");
+    }
+}
+
 #[test]
 fn only_build_requests_count_as_activity() {
     assert!(!Request::Shutdown.is_build_activity());
@@ -4738,7 +4796,9 @@ async fn readiness_roundtrip_does_not_wait_for_the_store() {
         .unwrap()
         .unwrap();
     assert_eq!(health.version, VERSION);
-    assert_eq!(health.build_epoch, 0);
+    // 1.0.x clients replace a daemon whose epoch is older than their binary.
+    assert_ne!(build_epoch(), 0, "the test binary has a readable mtime");
+    assert_eq!(health.build_epoch, build_epoch());
     assert_eq!(
         daemon.handle_request_sync(&Request::Health).health,
         Some(health)
@@ -5267,7 +5327,7 @@ async fn test_send_stats_request_client_roundtrip() {
     server.await.unwrap();
 
     assert_eq!(stats.entry_count, 1);
-    assert_eq!(stats.build_epoch, 0);
+    assert_eq!(stats.build_epoch, build_epoch());
     assert_eq!(stats.version, VERSION);
     assert_eq!(stats.entries.unwrap()[0].crate_name, "serde");
 }

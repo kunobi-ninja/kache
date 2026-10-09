@@ -234,8 +234,9 @@ const FILE_HASH_MEMORY_CACHE_CAP: usize = 4096;
 /// rows, and an hour outlasts any put still in flight.
 pub(crate) const ORPHAN_BLOB_GRACE: Duration = Duration::from_secs(3600);
 
-/// Executable mtime used to distinguish coordinator records during cleanup.
-/// It is not a release version and must not determine replacement policy.
+/// Executable mtime. Coordinator records use it to tell daemons apart. The
+/// legacy epoch fields carry it because 1.0.x and earlier decide replacement
+/// by it; this release decides on the release version alone.
 pub fn build_epoch() -> u64 {
     static BUILD_EPOCH: OnceLock<u64> = OnceLock::new();
 
@@ -547,7 +548,8 @@ pub struct UploadJob {
     pub entry_dir: String,
     #[serde(default)]
     pub crate_name: String,
-    /// Legacy timestamp field; new clients send zero to avoid restarting old daemons.
+    /// Client executable mtime. Daemons from 1.0.x and earlier drain when it
+    /// is newer than their own; later daemons ignore it.
     #[serde(default)]
     pub client_epoch: u64,
     /// Release requesting an upgrade. Absent from legacy and read-only requests.
@@ -1065,7 +1067,9 @@ pub struct StatsRequest {
     /// `event_hours` when present, so `--since 15m` is a 15 minute window.
     #[serde(default)]
     pub event_secs: Option<u64>,
-    /// Legacy timestamp field; new clients send zero to avoid restarting old daemons.
+    /// Client executable mtime, or zero for reads that must not request a
+    /// drain. Daemons from 1.0.x and earlier drain when it is newer than their
+    /// own; later daemons ignore it.
     #[serde(default)]
     pub client_epoch: u64,
     /// Release requesting an upgrade. Absent from legacy and read-only requests.
@@ -1230,7 +1234,8 @@ impl PackPrefetchContext {
 pub struct BuildStartedRequest {
     #[serde(default)]
     pub intent: kache_core::BuildIntent,
-    /// Legacy timestamp field; new clients send zero to avoid restarting old daemons.
+    /// Client executable mtime. Daemons from 1.0.x and earlier drain when it
+    /// is newer than their own; later daemons ignore it.
     #[serde(default)]
     pub client_epoch: u64,
     /// Release requesting an upgrade. Absent from legacy and read-only requests.
@@ -1263,7 +1268,7 @@ pub struct CompileStartedRequest {
     /// (lazily, on the first heartbeat tick).
     #[serde(default)]
     pub typical_ms: Option<u64>,
-    /// Legacy timestamp field; new clients send zero to avoid restarting old daemons.
+    /// No release drains on this field; clients send zero.
     #[serde(default)]
     pub client_epoch: u64,
     /// Release requesting an upgrade. Absent from legacy and read-only requests.
@@ -1289,7 +1294,8 @@ pub struct CompileFinishedRequest {
 pub struct DaemonHealth {
     #[serde(default)]
     pub version: String,
-    /// Retired timestamp field. Zero prevents legacy clients from inferring an upgrade.
+    /// Daemon executable mtime. Clients from 1.0.x and earlier replace a daemon
+    /// whose executable is older than theirs; later clients only display it.
     #[serde(default)]
     pub build_epoch: u64,
 }
@@ -1313,7 +1319,8 @@ pub struct StatsResponse {
     pub recent_summaries: Vec<crate::events::BuildSummaryEvent>,
     #[serde(default)]
     pub version: String,
-    /// Retired timestamp field. Zero prevents legacy clients from inferring an upgrade.
+    /// Daemon executable mtime. Clients from 1.0.x and earlier replace a daemon
+    /// whose executable is older than theirs; later clients only display it.
     #[serde(default)]
     pub build_epoch: u64,
     /// GC request semantics supported by this daemon. Version 2 means the
@@ -3571,7 +3578,7 @@ impl Daemon {
         Response {
             health: Some(DaemonHealth {
                 version: self.version.clone(),
-                build_epoch: 0,
+                build_epoch: build_epoch(),
             }),
             ..Response::ok()
         }
@@ -3650,7 +3657,7 @@ impl Daemon {
             blob_stats: Some(inventory.blob_stats),
             recent_summaries,
             version: self.version.clone(),
-            build_epoch: 0,
+            build_epoch: build_epoch(),
             gc_policy_version: GC_POLICY_PROTOCOL_VERSION,
             pending_uploads,
             active_downloads,
@@ -8740,7 +8747,7 @@ pub fn send_upload_job(
         key: key.to_string(),
         entry_dir: entry_dir.to_string_lossy().into_owned(),
         crate_name: crate_name.to_string(),
-        client_epoch: 0,
+        client_epoch: build_epoch(),
         client_version: Some(VERSION.to_owned()),
     };
     // Durability precedes the fire-and-forget socket write. If the daemon is
@@ -9394,7 +9401,7 @@ fn fetch_stats(
         // answer with a superset of a sub-hour window rather than nothing.
         event_hours: window.map(|w| w.secs().div_ceil(3600)),
         event_secs: window.map(crate::since::SinceWindow::secs),
-        client_epoch: 0,
+        client_epoch: if request_upgrade { build_epoch() } else { 0 },
         client_version: request_upgrade.then(|| VERSION.to_owned()),
     });
 

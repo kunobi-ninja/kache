@@ -44,13 +44,24 @@ On current macOS releases, the first connection to a LAN cache endpoint may ask 
 
 Kache compares semantic release versions when deciding whether to replace a daemon. A client from a newer release can request a drain and replacement. Rebuilding or copying the same release does not request an upgrade. Build metadata such as `+local` does not affect release precedence. An older client keeps a newer daemon running.
 
-Legacy clients and daemons can omit release metadata. Missing or invalid versions disable automatic replacement; timestamps do not establish release order. New clients send zero in the legacy timestamp field, and new daemons report zero there, so older peers cannot mistake a copy or rebuild for an upgrade. Protocol and cache-format checks still apply.
+Legacy clients and daemons can omit release metadata. A missing or invalid version never triggers a replacement by release. Kache 1.0.x and earlier compare binary modification times instead, as described below. Protocol and cache-format checks still apply.
 
 `kache doctor` reads daemon stats without requesting a drain. Use `kache doctor --fix` to replace a daemon from an older release. Use `kache daemon restart` to load a local rebuild with the same version, or to replace a daemon whose release cannot be determined.
 
 The daemon also fingerprints the active config file and restarts after it changes. `kache daemon start` and automatic starts drop the settings that select the remote from the environment (`KACHE_S3_BUCKET`, `KACHE_S3_ENDPOINT`, `KACHE_S3_REGION`, `KACHE_S3_PREFIX`, `KACHE_S3_PROFILE`, `KACHE_S3_USER_AGENT`, `KACHE_LOCAL_ONLY`), so set these in the config file. To try remote variables from a shell, run `kache daemon run` in the foreground.
 
 `KACHE_REMOTE_READONLY` remains inherited so a daemon started by a read-only build cannot publish remote data. That restriction lasts for the daemon's lifetime. To enable uploads after clearing the flag, run `kache daemon restart` from the writable environment. Other environment is also fixed when the process starts. An installed service uses its stored environment; update that environment before restarting it.
+
+### Switching to or from 1.0.x
+
+Kache 1.0.x and earlier compare the modification times of the `kache` binaries instead of releases. Later releases still send and report that time, so the binary that is newer on disk can retire the other release's daemon:
+
+- After an upgrade from 1.0.x, the old daemon drains on the next build that uploads, prefetches or hands it a C/C++ compile.
+- After a downgrade to 1.0.x, 1.0.x commands that check the daemon replace the newer one, for example `kache stats`, `kache monitor`, `kache daemon start` or `kache doctor --fix`. Builds and plain `kache doctor` do not, although `kache doctor` from 1.0.x says the daemon is shutting down and that the next build replaces it.
+
+Run `kache daemon restart` to switch right away, or when the binary you switched to is not newer on disk. Nix store paths are an example: they all share one modification time.
+
+Use one release at a time. When both stay in use, for example because one project pins 1.0.x, and the 1.0.x binary is newer on disk, each release's commands replace the other's daemon: 1.0.x by modification time, later releases by version. With a `kache monitor` from each release open, that happens on every poll. Remove the old binary or stop using it.
 
 ## Shared lifecycle
 

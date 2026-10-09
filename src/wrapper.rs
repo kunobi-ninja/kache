@@ -4569,7 +4569,7 @@ fn hand_off_cc_store(
     );
     drop(trace_event);
     let request = PublishCcRequest {
-        client_epoch: 0,
+        client_epoch: crate::daemon::build_epoch(),
         client_version: Some(crate::VERSION.to_owned()),
         cache_key: handoff.cache_key.to_string(),
         crate_name: handoff.crate_name.to_string(),

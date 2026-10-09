@@ -71,7 +71,8 @@ pub(crate) struct HandoffFile {
 /// A wrapper's request that the daemon store a cc compile it has finished.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) struct PublishCcRequest {
-    /// Legacy timestamp field; new clients send zero to avoid restarting old daemons.
+    /// Client executable mtime. Daemons from 1.0.x and earlier drain when it
+    /// is newer than their own; later daemons ignore it.
     #[serde(default)]
     pub client_epoch: u64,
     /// Release requesting an upgrade. Absent from legacy and read-only requests.

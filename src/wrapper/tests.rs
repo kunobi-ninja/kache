@@ -5576,6 +5576,42 @@ fn a_declined_hand_off_publishes_when_the_holder_releases_without_storing() {
     );
 }
 
+/// A 1.0.x daemon drains only for a newer executable mtime in `client_epoch`;
+/// later daemons read `client_version`. The offer carries both.
+#[cfg(unix)]
+#[test]
+fn cc_hand_off_carries_the_executable_mtime_and_release() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path().join("cache"));
+    let store = Store::open(&config).unwrap();
+    let daemon = RemoteCheckReplyDaemon::with_reply(
+        config.socket_path(),
+        serde_json::json!({"ok": false, "error": "test daemon declines publication"}),
+    );
+    let key = blake3::hash(b"cc-handoff-epoch").to_hex().to_string();
+    let object = dir.path().join("foo.o");
+    std::fs::write(&object, b"object bytes").unwrap();
+    let files = vec![(object, "foo.o".to_string())];
+
+    let mut lock = None;
+    let outcome = hand_off_cc_store(
+        &config,
+        &store,
+        &mut lock,
+        cc_handoff(&key, &files, std::time::Instant::now()),
+    );
+
+    assert!(matches!(outcome, CcHandoffOutcome::Publish));
+    let requests = daemon.recorded.lock().unwrap();
+    let request = requests
+        .iter()
+        .find_map(|value| value.get("publish_cc_v2"))
+        .expect("the hand-off must reach the daemon");
+    assert_ne!(crate::daemon::build_epoch(), 0);
+    assert_eq!(request["client_epoch"], crate::daemon::build_epoch());
+    assert_eq!(request["client_version"], crate::VERSION);
+}
+
 /// A holder that outlasts the wait is a peer compiling the same key; the
 /// wrapper leaves the key to it instead of blocking on the whole compile.
 #[test]

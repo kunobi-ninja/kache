@@ -39,12 +39,34 @@ revalidates their recorded inputs and falls back to dependency discovery when
 the record cannot be used. Set `KACHE_INPUT_PREDICTIONS=0` or
 `[cache] input_predictions = false` to disable predictions.
 
-A record made in another checkout of the same workspace is used only while
-the files a proc macro could read are what the recording build saw. For a
-workspace crate that is the whole workspace, less the target directory and
-`.git`, up to 20,000 entries; past that, those crates use dependency
-discovery. A vendored crate (one `cargo vendor` copied into the tree, as
-Firefox does under `third_party/rust`) is guarded by its own package, its
+A proc macro can list a directory and include each file in it, so a new file
+can change a crate's output while every input Kache recorded stays the same.
+The macro need not be a direct dependency: `sqlx::migrate!` and
+`include_dir!` reach their macro crates through a library that re-exports
+them. A record for a workspace or path crate is therefore used only while the
+workspace and the crate's `OUT_DIR` hold what the recording build saw. This
+applies in the crate's own checkout as well as in another target directory or
+checkout. The check leaves out the target directory, `.git`, and the contents
+of any other directory Cargo tagged as a target directory. An unchanged
+workspace costs one stat of each entry; Kache reads the files again after a
+change.
+
+The check has costs:
+
+- After any change in the workspace, each crate runs dependency discovery
+  once on the next build that would otherwise restore it, such as a build
+  after `cargo clean`, in a new target directory, or on CI with a restored
+  cache.
+- A workspace of more than 20,000 entries is not checked, so its crates
+  always use dependency discovery.
+- A crate that reads a file outside the workspace, in a target directory
+  other than its `OUT_DIR`, or through a symlinked directory always uses
+  dependency discovery.
+
+A registry crate is the same files wherever it is built, so it is checked
+against its package and `OUT_DIR` only when it has a proc-macro dependency of
+its own. A vendored crate (one `cargo vendor` copied into the tree, as Firefox
+does under `third_party/rust`) is checked against its own package, its
 `OUT_DIR`, and the files and dot-directories at the top of each directory
 between it and the workspace root, so it shares records at any tree size.
 

@@ -6856,8 +6856,13 @@ impl CcCompiler {
         hasher.update(b"cc_key_version:");
         hasher.update(crate::cache_key::CACHE_KEY_VERSION.to_string().as_bytes());
         hasher.update(b"\n");
-        // Older entries can retain donor paths outside the source/object root.
-        hasher.update(b"cc_artifact_schema:2\n");
+        // 2: older entries can retain donor paths outside the source/object
+        //    root.
+        // 3: older entries can hold an object built from other bytes than
+        //    their key names: keyed from a memo stamp or a mapped hash taken
+        //    from a racy read, or from an input saved before a key-first
+        //    compile read it.
+        hasher.update(b"cc_artifact_schema:3\n");
         tracing::trace!(
             target: "kache::cache_key",
             "[key:{}] cc_key_version={}",

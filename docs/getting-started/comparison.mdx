@@ -86,3 +86,11 @@ runs (`-E`, `-M`, `-MM`, `/E`, `/EP`), and invocations with an unexpanded
 response file (`@file`) go directly to the compiler, and Kache prints the same
 warning for them. This prevents a failed fallback from consuming input or
 leaving partial output that cannot be replayed safely.
+
+A Rust compile whose Kache key holds inputs the fallback does not know also
+goes directly to the compiler when Kache does not cache it: a crate with
+[extra inputs](/docs/getting-started/configuration#hidden-compile-time-inputs),
+and a unit of a workspace or path package whose build script declares a path
+or a variable (see
+[Build scripts](/docs/how-it-works/build-scripts#declared-inputs-in-the-rust-key)).
+The fallback could otherwise restore an artifact built from older inputs.

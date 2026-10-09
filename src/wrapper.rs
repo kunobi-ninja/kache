@@ -1267,6 +1267,8 @@ pub fn run_nvcc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     // the real diagnostic.
     let key_start = std::time::Instant::now();
     let mut file_hasher = store.file_hasher();
+    // Checked after the compile: an input written since this invocation
+    // began keeps the object from being stored.
     file_hasher.arm_too_new_guard(invocation_start_ns, 0);
     let path_normalizer = crate::path_normalizer::PathNormalizer::empty();
     let key_ctx = KeyCtx {
@@ -1452,8 +1454,7 @@ pub fn run_nvcc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     );
     // The key hashed every input before nvcc ran; one written since may not
     // be what the object was built from.
-    file_hasher.recheck_guarded_inputs();
-    let inputs_changed = file_hasher.too_new();
+    let inputs_changed = file_hasher.inputs_changed_since_keyed();
     if inputs_changed {
         tracing::debug!(
             "nvcc: {crate_name} read an input modified during the build; not storing it"
@@ -2022,10 +2023,10 @@ fn run_cc_with_store(
     // surfaces the real diagnostic.
     let key_start = std::time::Instant::now();
     let mut file_hasher = store.file_hasher();
-    // Flag inputs written since this invocation began. Neither arm stores an
-    // entry or a memo once one is flagged: a deferred compile fingerprints
-    // what it read afterwards, and a key taken first is rechecked once the
-    // compile has run.
+    // Flag inputs written since this invocation began. A deferred compile
+    // fingerprints what it read afterwards and stores neither an entry nor
+    // a memo once one is flagged. A key taken first is checked again once
+    // the compile has run (`FileHasher::inputs_changed_since_keyed`).
     file_hasher.arm_too_new_guard(invocation_start_ns, 0);
     let path_normalizer = crate::path_normalizer::PathNormalizer::empty();
     let key_ctx = KeyCtx {
@@ -2355,8 +2356,8 @@ fn run_cc_with_store(
             );
             // The key hashed the read set before the compile ran; an input
             // written since may not hold the bytes the compiler read.
-            file_hasher.recheck_guarded_inputs();
-            (result, compile_time_ms, file_hasher.too_new())
+            let changed = file_hasher.inputs_changed_since_keyed();
+            (result, compile_time_ms, changed)
         }
     };
     if inputs_changed {

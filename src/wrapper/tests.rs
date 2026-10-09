@@ -6382,6 +6382,72 @@ fn nvcc_does_not_store_a_compile_whose_input_changed_after_keying() {
     );
 }
 
+/// A header saved between `nvcc -M` and the key's read of it matches the
+/// key's fingerprint through the compile; only its stamp, from after the
+/// build started, shows the save. Neither run is stored, though both save
+/// the same bytes.
+#[cfg(unix)]
+#[test]
+fn nvcc_does_not_store_a_compile_whose_header_was_saved_while_keyed() {
+    let _lock = crate::test_support::process_state_test_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let (work, nvcc, count, _) = setup_nvcc_case(&dir, None, None, 0, 0);
+    let header = work.join("inc").join("h.h");
+    let driver = dir.path().join("driver");
+    std::fs::create_dir_all(&driver).unwrap();
+    let saving = driver.join("nvcc");
+    let shell =
+        crate::compiler::resolve_program_on_path("sh").expect("sh must be available on PATH");
+    kache_fs::testutil::write_executable(
+        &saving,
+        format!(
+            "#!{sh}\n\
+             if [ \"$1\" = -M ]; then\n\
+             \"{nvcc}\" \"$@\"; status=$?\n\
+             printf '#define LATE 1\\n' > \"{header}\"\n\
+             exit \"$status\"\n\
+             fi\n\
+             exec \"{nvcc}\" \"$@\"\n",
+            sh = shell.display(),
+            header = header.display(),
+            nvcc = nvcc.display(),
+        ),
+    );
+    let config = test_config(dir.path().join("cache"));
+    let _daemon = RemoteCheckReplyDaemon::spawn(config.socket_path(), false);
+    let argv = nvcc_compile_argv(&saving, &work, &[]);
+
+    assert_eq!(run_nvcc(&config, &argv).unwrap(), 0);
+    assert_eq!(run_nvcc(&config, &argv).unwrap(), 0);
+    assert_eq!(std::fs::read_to_string(&count).unwrap(), "run\nrun\n");
+}
+
+/// A header stamped an hour ahead, as a skewed file server leaves it, was
+/// not written during the build: the compile is stored and the next run
+/// hits.
+#[cfg(unix)]
+#[test]
+fn nvcc_stores_a_compile_whose_header_is_stamped_ahead_of_the_clock() {
+    let _lock = crate::test_support::process_state_test_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let (work, _nvcc, count, argv) = setup_nvcc_case(&dir, None, None, 0, 0);
+    let ahead = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+    filetime::set_file_mtime(
+        work.join("inc").join("h.h"),
+        filetime::FileTime::from_system_time(ahead),
+    )
+    .unwrap();
+    // Only the future mtime may stand out: the writes and the ctime the
+    // mtime change left are from before the build.
+    crate::test_support::settle_writes(&[&work]);
+    let config = test_config(dir.path().join("cache"));
+    let _daemon = RemoteCheckReplyDaemon::spawn(config.socket_path(), false);
+
+    assert_eq!(run_nvcc(&config, &argv).unwrap(), 0);
+    assert_eq!(run_nvcc(&config, &argv).unwrap(), 0);
+    assert_eq!(std::fs::read_to_string(&count).unwrap(), "run\n");
+}
+
 /// A dep-info the entry lacks evicts and recompiles: an object-only
 /// entry cannot satisfy `-MF`, and the recompiled entry (object +
 /// dep-info) hits afterwards.

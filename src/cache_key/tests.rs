@@ -11165,7 +11165,9 @@ fn a_stamp_observed_before_it_settled_never_answers_a_lookup() {
 }
 
 /// A memo hit proves an input by its settled stamp without hashing it. A
-/// key-first compile's recheck still has to cover that input.
+/// key-first compile's check still covers that input: it reads it again
+/// when the invocation started before the stamp settled, and flags it once
+/// it is rewritten.
 #[test]
 fn an_input_a_memo_hit_proved_by_stamp_is_rechecked() {
     let dir = tempfile::tempdir().unwrap();
@@ -11184,18 +11186,108 @@ fn an_input_a_memo_hit_proved_by_stamp_is_rechecked() {
         &inputs,
         &no_mapping,
     );
-
     let mut hasher = FileHasher::persistent(&db);
-    hasher.arm_too_new_guard(i64::MAX, 0);
+    // After the write, past the window that counts it as one made during
+    // the build, but before its stamp settled: a peer recorded the memo
+    // while this invocation was still keying.
+    hasher.arm_too_new_guard(past_the_write(&inputs[0].fingerprint), 0);
     assert!(
         hasher
             .cc_preprocess_memo_lookup("memo-key", no_remap, &no_mapping)
             .is_some()
     );
     assert_eq!(hasher.stats().cache_misses, 0, "proved by its stamp");
+    assert!(
+        !hasher.inputs_changed_since_keyed(),
+        "read again, it holds the bytes the memo proved"
+    );
     std::fs::write(&header, "#define H 22\n").unwrap();
-    hasher.recheck_guarded_inputs();
-    assert!(hasher.too_new());
+    assert!(hasher.inputs_changed_since_keyed());
+}
+
+/// A stamp that had not settled when the invocation started can survive a
+/// second write in the same timestamp tick, so a key-first check reads
+/// that input again instead of trusting its stat. A row memoised for the
+/// stamp with other bytes' hash stands in for such a write here. A settled
+/// stamp is trusted without a read.
+#[test]
+fn a_key_first_check_reads_again_only_an_input_fresh_at_the_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = rusqlite::Connection::open_in_memory().unwrap();
+    ensure_file_hash_cache_schema(&db).unwrap();
+    let header = dir.path().join("big.h");
+    std::fs::write(&header, "x".repeat(MIN_PERSISTED_HASH_BYTES as usize)).unwrap();
+    let stamp = FileFingerprint::from_path(&header).unwrap();
+    let stale = "0".repeat(64);
+    FileHashCache::Borrowed(&db).put(&stamp, &stale).unwrap();
+    let changed = stamp.mtime_ns.max(stamp.ctime_ns);
+    let checked = |start_ns: i64| {
+        let mut hasher = FileHasher::from_cache(FileHashCache::Borrowed(&db));
+        hasher.arm_too_new_guard(start_ns, 0);
+        assert_eq!(hasher.hash(&header).unwrap(), stale, "the key's hash");
+        assert!(!hasher.too_new(), "written before the build");
+        hasher.inputs_changed_since_keyed()
+    };
+
+    assert!(
+        checked(past_the_write(&stamp)),
+        "a fresh input is read again"
+    );
+    assert!(
+        !checked(changed + HASH_SETTLE_NS),
+        "a settled stamp is trusted without a read"
+    );
+}
+
+/// A write between the preprocessor's read and the key's own leaves a
+/// stat after the compile matching what the key saw; only its stamp, from
+/// after the invocation started, shows it. A stamp ahead of the clock when
+/// the key read the file was not made during the build by this host's
+/// clock, so it refuses nothing while the file holds the bytes the key
+/// hashed.
+#[test]
+fn a_key_first_check_refuses_a_stamp_from_the_build_but_not_one_ahead_of_the_clock() {
+    let dir = tempfile::tempdir().unwrap();
+    let header = dir.path().join("h.h");
+    std::fs::write(&header, "#define H 1\n").unwrap();
+    let checked = |start_ns: i64| {
+        let mut hasher = FileHasher::new();
+        hasher.arm_too_new_guard(start_ns, 0);
+        hasher.hash(&header).unwrap();
+        (hasher.too_new(), hasher.inputs_changed_since_keyed())
+    };
+
+    let written = FileFingerprint::from_path(&header).unwrap();
+    assert_eq!(
+        checked(written.mtime_ns.min(written.ctime_ns)),
+        (true, true),
+        "written after the invocation started"
+    );
+    // File clocks can trail the start, so a stamp just below it may be
+    // from a write made after it.
+    assert_eq!(
+        checked(written.mtime_ns.max(written.ctime_ns) + 1),
+        (true, true),
+        "stamped just before the invocation started"
+    );
+
+    let ahead = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+    filetime::set_file_mtime(&header, filetime::FileTime::from_system_time(ahead)).unwrap();
+    let skewed = FileFingerprint::from_path(&header).unwrap();
+    // Changed before the invocation started, modified an hour from now.
+    let start = skewed.ctime_ns + stamp_window_ns(skewed.ctime_ns) + 1;
+    assert_eq!(checked(start), (true, false));
+}
+
+/// The earliest start a write with `stamp` counts as made before
+/// ([`stamp_written_since`]).
+fn past_the_write(stamp: &FileFingerprint) -> i64 {
+    [stamp.mtime_ns, stamp.ctime_ns]
+        .into_iter()
+        .map(|stamp| stamp + stamp_window_ns(stamp))
+        .max()
+        .unwrap()
+        + 1
 }
 
 /// The mapped hash comes from a second read of the file. A save landing
@@ -11279,9 +11371,9 @@ fn an_assembler_verdict_on_other_bytes_is_never_learned() {
 }
 
 /// A key taken before the compile hashed its inputs. One rewritten or
-/// removed before the recheck trips the guard; untouched ones do not.
+/// removed before the check is flagged; untouched ones are not.
 #[test]
-fn rechecking_guarded_inputs_flags_one_written_since_it_was_hashed() {
+fn a_key_first_check_flags_an_input_written_since_it_was_hashed() {
     let dir = tempfile::tempdir().unwrap();
     let kept = dir.path().join("kept.h");
     let rewritten = dir.path().join("rewritten.h");
@@ -11297,8 +11389,7 @@ fn rechecking_guarded_inputs_flags_one_written_since_it_was_hashed() {
             hasher.hash(path).unwrap();
         }
         after_hashing();
-        hasher.recheck_guarded_inputs();
-        hasher.too_new()
+        hasher.inputs_changed_since_keyed()
     };
 
     assert!(!checked(&[&kept, &rewritten], &|| {}));

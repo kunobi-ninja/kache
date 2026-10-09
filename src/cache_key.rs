@@ -6183,7 +6183,7 @@ pub struct FileHasher<'db> {
     /// the too-new guard was armed, with the time each was observed. Checked
     /// again after the compile so the wrapper can prove clock-independently
     /// that none of them changed mid-build (see
-    /// [`FileHasher::recheck_guarded_inputs`] and
+    /// [`FileHasher::inputs_changed_since_keyed`] and
     /// [`FileHasher::guarded_inputs_unchanged_since_hash`]).
     guard_inputs: RefCell<Vec<ObservedFingerprint>>,
     /// Memo rows for files hashed in this process, written in one transaction
@@ -6212,6 +6212,13 @@ struct TooNewGuard {
     invocation_start_ns: i64,
     margin_ns: i64,
     saw_too_new: Cell<bool>,
+    /// Tripped by a stamp no later than the wall clock read after its stat:
+    /// a write since the start by this host's clock. A stamp still ahead of
+    /// the clock then was not written during the build here; it comes from
+    /// a skewed file clock or a future-dated file. Only a key taken before
+    /// the compile tells the two apart
+    /// ([`FileHasher::inputs_changed_since_keyed`]).
+    saw_write_since_start: Cell<bool>,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -6478,24 +6485,40 @@ impl<'db> FileHasher<'db> {
         })
     }
 
-    /// Stat again every input taken in while the guard was armed, hashed or
-    /// proved by a memo's stamp, and trip the guard if one no longer matches
-    /// the fingerprint it had then or is gone. A key taken before the compile
-    /// read these files; one written since may not hold the bytes the
-    /// compiler read.
-    pub(crate) fn recheck_guarded_inputs(&self) {
+    /// Whether a compile that ran after this key may have read other bytes
+    /// than the key hashed. Ask once the compile has run.
+    ///
+    /// A stamp written since the invocation started refuses: a save between
+    /// the preprocessor's read and the key's changes the read set while
+    /// every file the key hashed still matches what it saw. A stamp ahead of
+    /// the clock when the key took it does not refuse on its own (see
+    /// `saw_write_since_start`). Every input the key took in, hashed or
+    /// proved by a memo's stamp, must then still match a fresh stat. One
+    /// whose stamp had not settled when the invocation started is read again
+    /// as well, since a second write in the same timestamp tick keeps the
+    /// stamp; only such fresh files pay a read.
+    pub(crate) fn inputs_changed_since_keyed(&self) -> bool {
+        if self.too_new.saw_write_since_start.get() {
+            return true;
+        }
+        let start_ns = self.too_new.invocation_start_ns;
         let guarded = self.guard_inputs.borrow();
+        let recent = self.recent_hashes.borrow();
         let distinct: std::collections::HashSet<&FileFingerprint> = guarded
             .iter()
             .map(|observed| &observed.fingerprint)
             .collect();
-        let changed = distinct.into_iter().any(|hashed| {
-            !FileFingerprint::from_path(Path::new(&hashed.path))
-                .is_ok_and(|current| current == *hashed)
-        });
-        if changed {
-            self.too_new.saw_too_new.set(true);
-        }
+        distinct.into_iter().any(|keyed| {
+            let path = Path::new(&keyed.path);
+            let holds_hashed_bytes = || {
+                recent.get(path).is_some_and(|hashed| {
+                    hashed.fingerprint.as_ref() == Some(keyed)
+                        && hash_file(path).is_ok_and(|bytes| bytes == hashed.hash)
+                })
+            };
+            !FileFingerprint::from_path(path).is_ok_and(|current| current == *keyed)
+                || (!stamp_is_settled(keyed, start_ns) && !holds_hashed_bytes())
+        })
     }
 
     fn note_too_new(&self, fingerprint: &FileFingerprint) {
@@ -6506,6 +6529,17 @@ impl<'db> FileHasher<'db> {
                 .saturating_sub(self.too_new.margin_ns);
             if stamp_written_since(fingerprint, since) {
                 self.too_new.saw_too_new.set(true);
+                // Read after the stat: a write before it cannot carry a later
+                // stamp by this host's clock.
+                let now_ns = wall_clock_ns();
+                if [fingerprint.mtime_ns, fingerprint.ctime_ns]
+                    .into_iter()
+                    .any(|stamp| {
+                        stamp >= since.saturating_sub(stamp_window_ns(stamp)) && stamp <= now_ns
+                    })
+                {
+                    self.too_new.saw_write_since_start.set(true);
+                }
             }
         }
     }
@@ -6752,9 +6786,17 @@ impl<'db> FileHasher<'db> {
             // bytes come from the content cache, and only a file differing in
             // both is read through the maps.
             if current.fingerprint == expected.fingerprint {
-                // Unhashed, so registered here: the recheck after a compile
-                // has to cover it like any input the key hashed.
+                // Unhashed, so registered here with the bytes its stamp
+                // proves: the recheck after a compile has to cover it like
+                // any input the key hashed.
                 self.guard_input(&current);
+                self.recent_hashes.borrow_mut().insert(
+                    absolute_path(path),
+                    RecentHash {
+                        hash: expected.content.clone(),
+                        fingerprint: Some(current.fingerprint),
+                    },
+                );
                 return Some(path.clone());
             }
             if self
@@ -6956,9 +6998,11 @@ impl<'db> FileHasher<'db> {
     /// store decides what its stamp may prove. A stamp that had settled when
     /// the input was observed moves on any later write. One taken sooner can
     /// survive a second write in the same timestamp tick, so the input is
-    /// recorded by content alone and every lookup compares that content: a
-    /// torn or rewritten file misses there. Refusing the record instead would
-    /// keep a fresh checkout from memoising anything.
+    /// recorded by content alone and every lookup compares that content. For
+    /// a file of 64 KiB or more the comparison goes through the file-hash
+    /// memo, which answers by stamp, so it is only as fresh as that memo's
+    /// rows. Refusing the record instead would keep a fresh checkout from
+    /// memoising anything.
     pub(crate) fn cc_preprocess_memo_record_if_unchanged(
         &self,
         memo_key: &str,

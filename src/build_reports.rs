@@ -676,7 +676,9 @@ mod tests {
         .enumerate()
         {
             let compiler = dir.path().join(format!("rustc-{index}"));
-            std::fs::write(&compiler, "#!/bin/sh\nexec /bin/cat \"${0}.version\"\n").unwrap();
+            // `cat` from PATH: Nix's build sandbox has /bin/sh and nothing
+            // else in /bin.
+            std::fs::write(&compiler, "#!/bin/sh\nexec cat \"${0}.version\"\n").unwrap();
             std::fs::set_permissions(&compiler, std::fs::Permissions::from_mode(0o755)).unwrap();
             std::fs::write(compiler.with_extension("version"), stdout).unwrap();
             assert_eq!(toolchain_hash(&compiler), identity, "version case {index}");

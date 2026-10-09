@@ -4652,6 +4652,25 @@ fn test_daemon_reuses_store_handle() {
     assert_eq!(first, second);
 }
 
+/// A request for `file` as it is on disk, and the clock at which its stamp
+/// settles: [`crate::cache_key::HASH_SETTLE_NS`] after its last change.
+fn hash_files_request(file: &Path) -> (HashFilesRequest, i64) {
+    let metadata = std::fs::metadata(file).unwrap();
+    let mtime_ns = crate::cache_key::metadata_mtime_ns(&metadata);
+    let ctime_ns = crate::cache_key::metadata_ctime_ns(&metadata);
+    let req = HashFilesRequest {
+        files: vec![HashFileRequest {
+            path: file.to_string_lossy().into_owned(),
+            size: i64::try_from(metadata.len()).unwrap(),
+            mtime_ns,
+            ctime_ns,
+            inode: crate::cache_key::metadata_inode(&metadata),
+        }],
+    };
+    let settles_at = mtime_ns.max(ctime_ns) + crate::cache_key::HASH_SETTLE_NS;
+    (req, settles_at)
+}
+
 #[test]
 fn test_handle_hash_files_uses_memory_cache() {
     let dir = tempfile::tempdir().unwrap();
@@ -4660,18 +4679,9 @@ fn test_handle_hash_files_uses_memory_cache() {
 
     let file = dir.path().join("large.rlib");
     std::fs::write(&file, vec![7u8; 70 * 1024]).unwrap();
-    let metadata = std::fs::metadata(&file).unwrap();
-    let req = HashFilesRequest {
-        files: vec![HashFileRequest {
-            path: file.to_string_lossy().into_owned(),
-            size: i64::try_from(metadata.len()).unwrap(),
-            mtime_ns: crate::cache_key::metadata_mtime_ns(&metadata),
-            ctime_ns: crate::cache_key::metadata_ctime_ns(&metadata),
-            inode: crate::cache_key::metadata_inode(&metadata),
-        }],
-    };
+    let (req, settles_at) = hash_files_request(&file);
 
-    let first = daemon.handle_hash_files(&req);
+    let first = daemon.handle_hash_files_at(&req, || settles_at);
     assert!(first.ok);
     let first_result = &first.hash_results.as_ref().unwrap()[0];
     assert!(first_result.hash.is_some());
@@ -4686,6 +4696,46 @@ fn test_handle_hash_files_uses_memory_cache() {
     assert_eq!(second_result.bytes_hashed, 0);
 }
 
+/// A stamp still inside the settle window when the daemon observes it gets
+/// its hash back, but neither cache keeps it: a second write in the same
+/// timestamp tick would leave the stamp as it is. From the moment the
+/// stamp settles, both keep it.
+#[test]
+fn handle_hash_files_remembers_a_hash_only_if_its_stamp_had_settled() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let file = dir.path().join("fresh.rlib");
+    std::fs::write(&file, vec![5u8; 70 * 1024]).unwrap();
+    let (req, settles_at) = hash_files_request(&file);
+    let expected = crate::cache_key::hash_file(&file).unwrap();
+    let memoised = || {
+        crate::store::Store::open(&config)
+            .unwrap()
+            .file_hash_lookup(&file)
+    };
+
+    let daemon = Daemon::new(config.clone());
+    for attempt in ["first", "again"] {
+        let resp = daemon.handle_hash_files_at(&req, || settles_at - 1);
+        let result = &resp.hash_results.as_ref().unwrap()[0];
+        assert_eq!(result.hash.as_deref(), Some(expected.as_str()), "{attempt}");
+        assert!(!result.cache_hit, "{attempt}: neither cache kept it");
+        assert!(result.bytes_hashed > 0, "{attempt}");
+    }
+    assert!(matches!(
+        memoised(),
+        crate::cache_key::FileHashLookup::NeedsHash(_)
+    ));
+
+    daemon.handle_hash_files_at(&req, || settles_at);
+    let resp = daemon.handle_hash_files_at(&req, || settles_at);
+    assert!(resp.hash_results.as_ref().unwrap()[0].cache_hit);
+    assert!(matches!(
+        memoised(),
+        crate::cache_key::FileHashLookup::Hit(hash) if hash == expected
+    ));
+}
+
 /// #281: the lock-narrowed HashFiles path (cache lookup under the store
 /// lock, blake3 outside it, record under the lock) must preserve the
 /// PERSISTENT cache. A second daemon with a fresh in-memory cache but the
@@ -4698,21 +4748,12 @@ fn handle_hash_files_persistent_cache_hit_across_daemons() {
 
     let file = dir.path().join("big.rlib");
     std::fs::write(&file, vec![3u8; 80 * 1024]).unwrap(); // ≥ 64 KiB → cacheable
-    let metadata = std::fs::metadata(&file).unwrap();
-    let req = HashFilesRequest {
-        files: vec![HashFileRequest {
-            path: file.to_string_lossy().into_owned(),
-            size: i64::try_from(metadata.len()).unwrap(),
-            mtime_ns: crate::cache_key::metadata_mtime_ns(&metadata),
-            ctime_ns: crate::cache_key::metadata_ctime_ns(&metadata),
-            inode: crate::cache_key::metadata_inode(&metadata),
-        }],
-    };
+    let (req, settles_at) = hash_files_request(&file);
     let expected = crate::cache_key::hash_file(&file).unwrap();
 
     // Daemon A: cold — persistent-cache miss, computes and records.
     let a = Daemon::new(config.clone());
-    let ra = a.handle_hash_files(&req);
+    let ra = a.handle_hash_files_at(&req, || settles_at);
     let ra = &ra.hash_results.as_ref().unwrap()[0];
     assert_eq!(ra.hash.as_deref(), Some(expected.as_str()));
     assert!(!ra.cache_hit, "first hash is a persistent-cache miss");

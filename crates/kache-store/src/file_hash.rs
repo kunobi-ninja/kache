@@ -8,7 +8,8 @@ use std::path::{Path, PathBuf};
 
 pub const MIN_PERSISTED_HASH_BYTES: i64 = 64 * 1024;
 
-/// How long a file must have been left alone before its hash may be memoised.
+/// How long a file must have been left alone, when it was read, before its
+/// hash may be memoised.
 ///
 /// A memo row is trusted whenever the stamp matches. A file written, hashed and
 /// then written again inside one timestamp tick keeps the same stamp with
@@ -16,15 +17,50 @@ pub const MIN_PERSISTED_HASH_BYTES: i64 = 64 * 1024;
 /// old hash to every later lookup. Filesystems tick coarsely: HFS+ in whole
 /// seconds, FAT in two, ext4 at the kernel's coarse clock. Two seconds after
 /// the last change, a further write lands on a later tick and changes the
-/// stamp, so a row recorded then cannot be stale this way.
+/// stamp, so bytes read after a stat taken then belong to that stamp.
 pub const HASH_SETTLE_NS: i64 = 2_000_000_000;
 
 /// Whether `fingerprint`'s file last changed at least [`HASH_SETTLE_NS`]
-/// before `now_ns`. The ctime counts as well as the mtime: tools that restore
-/// an old mtime after writing cannot hold the ctime back.
-pub fn stamp_is_settled(fingerprint: &FileFingerprint, now_ns: i64) -> bool {
+/// before `observed_ns`, the wall clock read before the stat that produced
+/// it. A later time, such as when a row is written, says nothing about the
+/// bytes already read. The ctime counts as well as the mtime: tools that
+/// restore an old mtime after writing cannot hold the ctime back.
+pub fn stamp_is_settled(fingerprint: &FileFingerprint, observed_ns: i64) -> bool {
     let changed = fingerprint.mtime_ns.max(fingerprint.ctime_ns);
-    now_ns.saturating_sub(changed) >= HASH_SETTLE_NS
+    observed_ns.saturating_sub(changed) >= HASH_SETTLE_NS
+}
+
+/// The wall clock in nanoseconds since the Unix epoch, 0 before it.
+pub fn wall_clock_ns() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            i64::try_from(elapsed.as_nanos()).unwrap_or(i64::MAX)
+        })
+}
+
+/// A fingerprint and the wall clock read before the file was stat'ed and
+/// read, so a later check can ask whether its stamp had settled by then.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservedFingerprint {
+    pub fingerprint: FileFingerprint,
+    pub observed_ns: i64,
+}
+
+impl ObservedFingerprint {
+    /// Read the clock, then stat `path`.
+    pub fn from_path(path: &Path) -> Result<Self> {
+        let observed_ns = wall_clock_ns();
+        Ok(Self {
+            fingerprint: FileFingerprint::from_path(path)?,
+            observed_ns,
+        })
+    }
+
+    /// [`stamp_is_settled`] at the time this fingerprint was observed.
+    pub fn settled(&self) -> bool {
+        stamp_is_settled(&self.fingerprint, self.observed_ns)
+    }
 }
 
 /// Paths per lookup statement, well under SQLite's bound-parameter limit.

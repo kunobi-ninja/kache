@@ -1770,9 +1770,20 @@ fn initialize_db(db: &Connection) -> rusqlite::Result<()> {
         .execute_batch("ALTER TABLE target_roots ADD COLUMN discovered INTEGER NOT NULL DEFAULT 0");
 
     crate::file_hash::ensure_file_hash_cache_schema(db)?;
+    if file_hashes_predate_settled_reads(generation) {
+        db.execute_batch("DELETE FROM file_hashes")?;
+    }
     db.pragma_update(None, "user_version", INDEX_SCHEMA_GENERATION)?;
 
     Ok(())
+}
+
+/// Whether an index at `generation` may hold file hash rows read before
+/// their file's stamp had settled (`file_hash::stamp_is_settled`). A row's
+/// `updated_at` cannot tell: a hasher wrote its rows when it flushed, often
+/// a whole compile after the read, and the daemon wrote them with no check.
+fn file_hashes_predate_settled_reads(generation: i64) -> bool {
+    generation < 9
 }
 
 /// The `user_version` an index carries once every statement of
@@ -1788,7 +1799,9 @@ fn initialize_db(db: &Connection) -> rusqlite::Result<()> {
 ///    delivered for the job still running (#1008).
 /// 7: `target_roots.rustc`, the compiler a tracked target was built by.
 /// 8: `target_roots.discovered`, separating Git discovery from build activity.
-const INDEX_SCHEMA_GENERATION: i64 = 8;
+/// 9: `file_hashes` emptied once. Older rows may have been read before their
+///    stamp settled.
+const INDEX_SCHEMA_GENERATION: i64 = 9;
 
 /// Raise the refcount of every blob `cache_key` maps to at least the
 /// references all mappings hold on it. Run before giving this key's

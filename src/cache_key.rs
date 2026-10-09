@@ -6188,8 +6188,9 @@ pub struct FileHasher<'db> {
     /// by [`FileHasher::flush_memo`] (and on drop). One autocommit write per
     /// file made every hit in a six-job cold cell wait for the index's write
     /// lock behind the misses' store transactions: 6 ms of hashing became
-    /// 380 ms.
-    pending_memo: RefCell<Vec<(FileFingerprint, String)>>,
+    /// 380 ms. Each row keeps the time its file was observed, which alone
+    /// decides whether it may be written.
+    pending_memo: RefCell<Vec<(ObservedFingerprint, String)>>,
 }
 
 impl Drop for FileHasher<'_> {
@@ -6284,38 +6285,19 @@ impl FileHasher<'static> {
 }
 
 impl<'db> FileHasher<'db> {
-    /// Write every memo row hashed so far in one transaction. The rows are an
-    /// optimisation, so a busy index (another process holds the write lock
-    /// for longer than the short wait here) drops them rather than stalling
-    /// a hit; the next process hashes those files again.
+    /// Write every memo row hashed so far in one transaction.
+    ///
+    /// A file that had changed within [`HASH_SETTLE_NS`] of when it was
+    /// observed is left out: its hash was right for this process, but a
+    /// second write in the same timestamp tick would leave a row that no
+    /// stamp check could catch. Flushing later does not change that, since
+    /// the bytes were read back then. The rows are an optimisation, so a busy
+    /// index (another process holds the write lock for longer than the short
+    /// wait here) drops them rather than stalling a hit; the next process
+    /// hashes those files again.
     pub fn flush_memo(&self) {
-        let now_ns = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |elapsed| {
-                i64::try_from(elapsed.as_nanos()).unwrap_or(i64::MAX)
-            });
-        self.flush_memo_at(now_ns);
-    }
-
-    /// [`flush_memo`](Self::flush_memo) with the clock supplied. A file that
-    /// changed within [`HASH_SETTLE_NS`] of `now_ns` is left out:
-    /// its hash was right for this process, but a second write in the same
-    /// timestamp tick would leave a row that no stamp check could catch.
-    /// Flush as if every pending file had been left alone for the settle
-    /// window, for tests that write a file and then expect its row.
-    #[cfg(test)]
-    pub(crate) fn flush_memo_as_if_settled(&self) {
-        let now_ns = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |elapsed| {
-                i64::try_from(elapsed.as_nanos()).unwrap_or(i64::MAX)
-            });
-        self.flush_memo_at(now_ns.saturating_add(HASH_SETTLE_NS));
-    }
-
-    pub(crate) fn flush_memo_at(&self, now_ns: i64) {
         let mut pending = std::mem::take(&mut *self.pending_memo.borrow_mut());
-        pending.retain(|(fingerprint, _)| stamp_is_settled(fingerprint, now_ns));
+        pending.retain(|(observed, _)| observed.settled());
         if pending.is_empty() {
             return;
         }
@@ -6327,8 +6309,8 @@ impl<'db> FileHasher<'db> {
         let _ = db.busy_timeout(std::time::Duration::from_millis(100));
         let written = (|| -> rusqlite::Result<()> {
             db.execute_batch("BEGIN IMMEDIATE")?;
-            for (fingerprint, hash) in &pending {
-                if let Err(error) = cache.put(fingerprint, hash) {
+            for (observed, hash) in &pending {
+                if let Err(error) = cache.put(&observed.fingerprint, hash) {
                     let _ = db.execute_batch("ROLLBACK");
                     return Err(error);
                 }
@@ -6342,6 +6324,16 @@ impl<'db> FileHasher<'db> {
                 "file hash memo not written (index busy): {error}"
             );
         }
+    }
+
+    /// Flush as if every pending file had been observed one settle window
+    /// later, for tests that write a file and then expect its row.
+    #[cfg(test)]
+    pub(crate) fn flush_memo_as_if_settled(&self) {
+        for (observed, _) in self.pending_memo.borrow_mut().iter_mut() {
+            observed.observed_ns = observed.observed_ns.saturating_add(HASH_SETTLE_NS);
+        }
+        self.flush_memo();
     }
 
     pub(crate) fn from_cache(cache: FileHashCache<'db>) -> Self {
@@ -6741,11 +6733,11 @@ impl<'db> FileHasher<'db> {
         // unit reads a couple of hundred headers, most of them the same ones
         // its neighbours read; opening and hashing each again cost more than
         // the compile's own header work did on macOS.
-        let mut stamped: Vec<(&String, &PathBuf, FileFingerprint)> =
+        let mut stamped: Vec<(&String, &PathBuf, ObservedFingerprint)> =
             Vec::with_capacity(paths.len());
         for (name, path) in paths {
-            let fingerprint = match FileFingerprint::from_path(path) {
-                Ok(fingerprint) => fingerprint,
+            let observed = match ObservedFingerprint::from_path(path) {
+                Ok(observed) => observed,
                 Err(error) => {
                     tracing::debug!(
                         "cc preprocess memo input {} could not be fingerprinted: {error}",
@@ -6754,14 +6746,14 @@ impl<'db> FileHasher<'db> {
                     return None;
                 }
             };
-            self.note_too_new(&fingerprint);
-            stamped.push((name, path, fingerprint));
+            self.note_too_new(&observed.fingerprint);
+            stamped.push((name, path, observed));
         }
-        let memoised = self.memoised_hashes(stamped.iter().map(|(_, _, stamp)| stamp));
+        let memoised = self.memoised_hashes(stamped.iter().map(|(_, _, stamp)| &stamp.fingerprint));
         let mut pending: Vec<(String, FileFingerprint, String, PathBuf)> =
             Vec::with_capacity(stamped.len());
-        for (name, path, fingerprint) in stamped {
-            let content = match self.header_hash(path, &fingerprint, &memoised) {
+        for (name, path, observed) in stamped {
+            let content = match self.header_hash(path, &observed, &memoised) {
                 Ok(content) => content,
                 Err(error) => {
                     tracing::debug!(
@@ -6771,7 +6763,7 @@ impl<'db> FileHasher<'db> {
                     return None;
                 }
             };
-            pending.push((name.clone(), fingerprint, content, path.clone()));
+            pending.push((name.clone(), observed.fingerprint, content, path.clone()));
         }
         let memo = self.cache.as_ref().filter(|_| !maps_key.is_empty());
         let known = match memo {
@@ -7002,8 +6994,8 @@ impl<'db> FileHasher<'db> {
             return Ok((hash, after));
         };
 
-        let fingerprint = match FileFingerprint::from_path(path) {
-            Ok(fingerprint) => fingerprint,
+        let observed = match ObservedFingerprint::from_path(path) {
+            Ok(observed) => observed,
             Err(e) => {
                 tracing::debug!(
                     "file hash cache metadata lookup failed for {}: {e}",
@@ -7012,29 +7004,30 @@ impl<'db> FileHasher<'db> {
                 return hash_file(path).map(|hash| (hash, None));
             }
         };
+        let fingerprint = &observed.fingerprint;
 
-        self.note_too_new(&fingerprint);
+        self.note_too_new(fingerprint);
 
         if fingerprint.size < MIN_PERSISTED_HASH_BYTES {
             let hash = hash_file(path)?;
             self.record_miss(fingerprint.size);
-            return Ok((hash, Some(fingerprint)));
+            return Ok((hash, Some(observed.fingerprint)));
         }
 
-        if let Some(prefetched) = self.prefetched.borrow().get(&fingerprint) {
+        if let Some(prefetched) = self.prefetched.borrow().get(fingerprint) {
             if prefetched.cache_hit {
                 self.record_hit();
             } else {
                 self.record_miss_count();
                 self.record_miss_bytes(prefetched.bytes_hashed);
             }
-            return Ok((prefetched.hash.clone(), Some(fingerprint)));
+            return Ok((prefetched.hash.clone(), Some(observed.fingerprint)));
         }
 
-        match cache.get(&fingerprint) {
+        match cache.get(fingerprint) {
             Ok(Some(hash)) => {
                 self.record_hit();
-                return Ok((hash, Some(fingerprint)));
+                return Ok((hash, Some(observed.fingerprint)));
             }
             Ok(None) => {}
             Err(e) => {
@@ -7046,8 +7039,8 @@ impl<'db> FileHasher<'db> {
         self.record_miss(fingerprint.size);
         self.pending_memo
             .borrow_mut()
-            .push((fingerprint.clone(), hash.clone()));
-        Ok((hash, Some(fingerprint)))
+            .push((observed.clone(), hash.clone()));
+        Ok((hash, Some(observed.fingerprint)))
     }
 
     /// Classify how this source uses `var` (see [`source_env_dep_use`]).
@@ -7171,8 +7164,11 @@ impl<'db> FileHasher<'db> {
             }
             return compute_static_lib_hash(path, usage);
         };
-        let fingerprint = match FileFingerprint::from_path(path) {
-            Ok(fp) => fp,
+        let ObservedFingerprint {
+            fingerprint,
+            observed_ns,
+        } = match ObservedFingerprint::from_path(path) {
+            Ok(observed) => observed,
             Err(e) => {
                 tracing::debug!(
                     "static-lib hash metadata lookup failed for {}: {e}",
@@ -7223,7 +7219,13 @@ impl<'db> FileHasher<'db> {
         }
         let hash = compute_static_lib_hash(path, usage)?;
         self.record_miss(size);
-        self.pending_memo.borrow_mut().push((key, hash.clone()));
+        self.pending_memo.borrow_mut().push((
+            ObservedFingerprint {
+                fingerprint: key,
+                observed_ns,
+            },
+            hash.clone(),
+        ));
         Ok(hash)
     }
 
@@ -7249,17 +7251,19 @@ impl<'db> FileHasher<'db> {
     /// Unlike [`hash`](Self::hash), small files are memoised too: a header
     /// is read by every unit that includes it, so the lookup is paid back
     /// many times. [`flush_memo`](Self::flush_memo) still holds back any file
-    /// changed too recently to trust its stamp. The bookkeeping matches
-    /// `hash`, so the too-new guard and later revalidation see these files.
+    /// changed too recently, when `observed`, to trust its stamp. The
+    /// bookkeeping matches `hash`, so the too-new guard and later
+    /// revalidation see these files.
     fn header_hash(
         &self,
         path: &Path,
-        fingerprint: &FileFingerprint,
+        observed: &ObservedFingerprint,
         memoised: &HashMap<String, String>,
     ) -> Result<String> {
         if self.cache.is_none() {
             return self.hash(path);
         }
+        let fingerprint = &observed.fingerprint;
         let prefetched = self.prefetched.borrow().get(fingerprint).map(|prefetched| {
             (
                 prefetched.hash.clone(),
@@ -7283,7 +7287,7 @@ impl<'db> FileHasher<'db> {
             self.record_miss(fingerprint.size);
             self.pending_memo
                 .borrow_mut()
-                .push((fingerprint.clone(), hash.clone()));
+                .push((observed.clone(), hash.clone()));
             hash
         };
         self.guard_input(fingerprint);

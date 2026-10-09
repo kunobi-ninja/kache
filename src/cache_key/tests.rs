@@ -11400,28 +11400,46 @@ fn an_unarmed_guard_keeps_no_headers_for_revalidation() {
     assert!(hasher.take_guarded_inputs().is_empty());
 }
 
+/// A row's fate is fixed when its file is observed. Both rows here are
+/// flushed decades after their stamp from the epoch; only the one observed
+/// a full settle window after it is written.
 #[test]
-fn flushing_on_the_real_clock_keeps_a_long_settled_stamp() {
+fn a_row_observed_inside_the_settle_window_is_never_memoised_however_late_the_flush() {
     let db = rusqlite::Connection::open_in_memory().unwrap();
     ensure_file_hash_cache_schema(&db).unwrap();
-    // Last changed at the epoch: settled by any clock this runs under.
-    let stamp = FileFingerprint {
-        path: "/old/header.h".to_string(),
+    let stamp = |path: &str| FileFingerprint {
+        path: path.to_string(),
         size: 12,
         mtime_ns: 1,
         ctime_ns: 1,
         inode: 7,
     };
     let hasher = FileHasher::from_cache(FileHashCache::Borrowed(&db));
-    hasher
-        .pending_memo
-        .borrow_mut()
-        .push((stamp.clone(), "hash".to_string()));
+    for (path, observed_ns) in [
+        ("/early.h", HASH_SETTLE_NS),
+        ("/settled.h", 1 + HASH_SETTLE_NS),
+    ] {
+        hasher.pending_memo.borrow_mut().push((
+            ObservedFingerprint {
+                fingerprint: stamp(path),
+                observed_ns,
+            },
+            format!("hash of {path}"),
+        ));
+    }
     hasher.flush_memo();
 
     let reader = FileHasher::from_cache(FileHashCache::Borrowed(&db));
-    let memo = reader.memoised_hashes(std::iter::once(&stamp));
-    assert_eq!(memo.get("/old/header.h").map(String::as_str), Some("hash"));
+    let memo = reader.memoised_hashes([stamp("/early.h"), stamp("/settled.h")].iter());
+    assert_eq!(
+        memo.get("/early.h"),
+        None,
+        "observed one nanosecond inside the window"
+    );
+    assert_eq!(
+        memo.get("/settled.h").map(String::as_str),
+        Some("hash of /settled.h")
+    );
 }
 
 #[test]
@@ -11432,22 +11450,14 @@ fn a_file_changed_within_the_settle_window_is_hashed_but_not_memoised() {
     let db = rusqlite::Connection::open_in_memory().unwrap();
     ensure_file_hash_cache_schema(&db).unwrap();
     let hasher = FileHasher::from_cache(FileHashCache::Borrowed(&db));
-    let hash = hasher.hash(&file).unwrap();
+    assert_eq!(hasher.hash(&file).unwrap(), hash_file(&file).unwrap());
     hasher.flush_memo();
     let stamp = FileFingerprint::from_path(&file).unwrap();
-    let cache = FileHashCache::Borrowed(&db);
     assert_eq!(
-        cache.get(&stamp).unwrap(),
+        FileHashCache::Borrowed(&db).get(&stamp).unwrap(),
         None,
         "a second write in this timestamp tick could reuse this stamp"
     );
-    // Once settled, the same flush records it.
-    hasher
-        .pending_memo
-        .borrow_mut()
-        .push((stamp.clone(), hash.clone()));
-    hasher.flush_memo_as_if_settled();
-    assert_eq!(cache.get(&stamp).unwrap(), Some(hash));
 }
 
 #[test]

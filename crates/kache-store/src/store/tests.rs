@@ -132,6 +132,44 @@ fn index_from_generation_four_gains_the_unit_column() {
     assert_eq!(generation, INDEX_SCHEMA_GENERATION);
 }
 
+/// File hash rows from before generation 9 may have been read before their
+/// stamp settled. An older index drops them once; a current one keeps what
+/// it memoises from then on.
+#[test]
+fn an_index_from_before_generation_nine_drops_its_file_hashes_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("index.db");
+    let rows = |db: &Connection| -> i64 {
+        db.query_row("SELECT count(*) FROM file_hashes", [], |row| row.get(0))
+            .unwrap()
+    };
+    let memoise = |db: &Connection, file: &str| {
+        db.execute(
+            "INSERT INTO file_hashes (path, size, mtime_ns, hash) VALUES (?1, 1, 1, 'h')",
+            params![file],
+        )
+        .unwrap();
+    };
+    let db = open_index_db(&path).unwrap();
+    memoise(&db, "/old");
+    db.pragma_update(None, "user_version", 8_i64).unwrap();
+    drop(db);
+
+    let db = open_index_db(&path).unwrap();
+    assert_eq!(rows(&db), 0, "generation 8 rows are dropped");
+    memoise(&db, "/new");
+    drop(db);
+    let db = open_index_db(&path).unwrap();
+    assert_eq!(rows(&db), 1, "a current index keeps its rows");
+
+    assert!(file_hashes_predate_settled_reads(8));
+    assert!(!file_hashes_predate_settled_reads(9));
+    assert!(
+        !file_hashes_predate_settled_reads(10),
+        "a newer index memoised under the same rule"
+    );
+}
+
 /// A put never learns its unit; the wrapper records it afterwards, and
 /// an empty unit leaves the row alone.
 #[test]

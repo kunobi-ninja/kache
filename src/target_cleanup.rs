@@ -719,7 +719,14 @@ fn remove(
     now: i64,
     cache_dir: &Path,
 ) -> std::io::Result<bool> {
-    remove_after_rename(target, expected, now, cache_dir, |_| {})
+    remove_after_rename(
+        target,
+        expected,
+        now,
+        cache_dir,
+        |_| {},
+        |aside| std::fs::remove_dir_all(aside),
+    )
 }
 
 fn remove_after_rename(
@@ -728,8 +735,9 @@ fn remove_after_rename(
     now: i64,
     cache_dir: &Path,
     after_rename: impl FnOnce(&Path),
+    delete: impl FnOnce(&Path) -> std::io::Result<()>,
 ) -> std::io::Result<bool> {
-    let Some(_reservation) = crate::target_use::try_exclusive(cache_dir)? else {
+    let Some(reservation) = crate::target_use::try_exclusive(cache_dir)? else {
         return Ok(false);
     };
     if crate::machine::directory_identity(target) != Some(expected) {
@@ -753,7 +761,10 @@ fn remove_after_rename(
         }
         return Ok(false);
     }
-    std::fs::remove_dir_all(&aside)?;
+    // A build that starts now gets a new directory and never sees this one,
+    // so it need not wait for the deletion.
+    drop(reservation);
+    delete(&aside)?;
     Ok(true)
 }
 
@@ -1772,14 +1783,47 @@ mod tests {
         std::fs::write(target.join("artifact"), b"original").unwrap();
         let identity = crate::machine::directory_identity(&target).unwrap();
         let cache = tempfile::tempdir().unwrap();
-        let removed = remove_after_rename(&target, identity, 7, cache.path(), |aside| {
-            std::fs::rename(aside, &saved).unwrap();
-            std::fs::create_dir(aside).unwrap();
-        })
+        let removed = remove_after_rename(
+            &target,
+            identity,
+            7,
+            cache.path(),
+            |aside| {
+                std::fs::rename(aside, &saved).unwrap();
+                std::fs::create_dir(aside).unwrap();
+            },
+            |aside| std::fs::remove_dir_all(aside),
+        )
         .unwrap();
         assert!(!removed);
         assert_eq!(std::fs::read(saved.join("artifact")).unwrap(), b"original");
         assert!(target.is_dir());
+    }
+
+    #[test]
+    fn builds_need_not_wait_while_a_renamed_target_is_deleted() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("target");
+        std::fs::create_dir_all(target.join("debug")).unwrap();
+        let identity = crate::machine::directory_identity(&target).unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let mut deleted_unlocked = false;
+        let removed = remove_after_rename(
+            &target,
+            identity,
+            7,
+            cache.path(),
+            |_| {},
+            |aside| {
+                deleted_unlocked = crate::target_use::try_exclusive(cache.path())?.is_some();
+                std::fs::remove_dir_all(aside)
+            },
+        )
+        .unwrap();
+        assert!(removed);
+        assert!(deleted_unlocked, "the deletion held builds back");
+        assert!(!target.exists());
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
     }
 
     #[cfg(unix)]

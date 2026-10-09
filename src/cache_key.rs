@@ -1050,11 +1050,13 @@ impl<'a> TreeRoot<'a> {
             .collect()
     }
 
-    /// The fold never follows a link, so the stamp may record its text.
+    /// The fold never follows a link, so the stamp may record its text. The
+    /// root's own times show a name that came and went while the fold ran.
     fn stamp_rules(&self) -> crate::tree_stamp::StampRules {
         crate::tree_stamp::StampRules {
             link_text: true,
             skip_build_dirs: self.skips_build_dirs,
+            root_metadata: true,
         }
     }
 
@@ -1170,13 +1172,30 @@ fn tree_digest_memoised(
         )?;
     }
     let digest = hasher.finalize().to_hex().to_string();
-    // A tree written in the last moments could be written again within the
-    // same timestamp tick, keeping its stamp with other bytes.
-    if stamp.settled_at(now) {
-        crate::tree_stamp::record_digest(&memo, &stamp.digest, &digest);
-    }
+    memoise_tree_digest(&memo, &walk, &stamp, &digest, now);
     file_hasher.note_tree_walk(walk);
     Some(digest)
+}
+
+/// Record `digest` at `memo` under `stamp`, the stamp `walk` gave before the
+/// files were read. A tree written in the last moments could be written
+/// again within the same timestamp tick, keeping its stamp with other bytes,
+/// so it has to have settled. A tree that moved while it was read has a
+/// digest of no state it was in, so the walk has to give the same stamp
+/// again.
+fn memoise_tree_digest(
+    memo: &Path,
+    walk: &GuardWalk,
+    stamp: &crate::tree_stamp::TreeStamp,
+    digest: &str,
+    now: std::time::SystemTime,
+) {
+    if stamp.settled_at(now)
+        && stamp_roots(&walk.roots, walk.max_entries)
+            .is_ok_and(|again| again.digest == stamp.digest)
+    {
+        crate::tree_stamp::record_digest(memo, &stamp.digest, digest);
+    }
 }
 
 /// Where the digest of `roots` is memoised: one file per set of roots, so
@@ -2438,6 +2457,7 @@ fn ancestor_top_digest(directory: &Path, file_hasher: &FileHasher<'_>) -> Option
         rules: crate::tree_stamp::StampRules {
             link_text: true,
             skip_build_dirs: false,
+            root_metadata: false,
         },
     }];
     let stamp = stamp_roots(&top, CRATE_TREE_MAX_ENTRIES).ok()?;

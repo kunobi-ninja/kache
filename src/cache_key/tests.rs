@@ -12367,6 +12367,51 @@ fn a_settled_tree_digest_is_memoised_under_its_stamp() {
     assert_eq!(read, 2);
 }
 
+/// A digest is memoised only while the tree still has the stamp it had
+/// before its files were read. A name that came and went directly under the
+/// root meanwhile leaves every entry as it was, and moves the root's times.
+#[test]
+fn a_tree_that_moved_while_it_was_read_is_not_memoised() {
+    let dir = tempfile::tempdir().unwrap();
+    let memo = dir.path().join("memo");
+    let tree = dir.path().join("tree");
+    write_file(&tree.join("a.txt"), "a");
+    let old = filetime::FileTime::from_unix_time(1_000_000_000, 0);
+    filetime::set_file_mtime(tree.join("a.txt"), old).unwrap();
+    filetime::set_file_mtime(&tree, old).unwrap();
+    let roots = vec![TreeRoot::new(tree.clone(), b"workspace", &[])];
+    let file = tree_digest_memo(&memo, &roots);
+    let walked = |roots: &[TreeRoot<'_>]| {
+        let walked: Vec<WalkedRoot> = roots.iter().map(TreeRoot::walked).collect();
+        let stamp = stamp_roots(&walked, 10).unwrap();
+        let walk = GuardWalk {
+            roots: walked,
+            max_entries: 10,
+            stamp: stamp.digest.clone(),
+        };
+        (walk, stamp)
+    };
+    let digest = "d".repeat(64);
+    let now = std::time::SystemTime::now();
+
+    let (walk, stamp) = walked(&roots);
+    write_file(&tree.join("transient.txt"), "t");
+    std::fs::remove_file(tree.join("transient.txt")).unwrap();
+    memoise_tree_digest(&file, &walk, &stamp, &digest, now);
+    assert!(
+        !file.exists(),
+        "a name came and went while the files were read"
+    );
+
+    let (walk, stamp) = walked(&roots);
+    let settled = std::time::SystemTime::now() + crate::tree_stamp::TreeStamp::SETTLE;
+    memoise_tree_digest(&file, &walk, &stamp, &digest, settled);
+    assert_eq!(
+        crate::tree_stamp::memoised_digest(&file, &stamp.digest),
+        Some(digest)
+    );
+}
+
 /// A guard holds while the trees it read keep their stamps. A file removed
 /// and put back with the same bytes and times leaves the digest as it was,
 /// not the stamp: the file has a new inode and change time.

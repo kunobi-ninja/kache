@@ -36,6 +36,9 @@ pub(crate) struct StampRules {
     /// Below the root, walk only the tag of a directory Cargo tagged as its
     /// build directory (see [`keep_only_build_tag`]).
     pub(crate) skip_build_dirs: bool,
+    /// Stamp the root's own metadata too, so a name created and removed
+    /// again directly under it still changes the stamp.
+    pub(crate) root_metadata: bool,
 }
 
 /// How a walk over one root ended.
@@ -77,6 +80,14 @@ impl Stamper {
         rules: StampRules,
         budget: &mut usize,
     ) -> WalkOutcome {
+        if rules.root_metadata {
+            let Ok(metadata) = std::fs::metadata(root) else {
+                return WalkOutcome::Unreadable;
+            };
+            self.hasher.update(b"top");
+            fold_metadata_stamp(&mut self.hasher, &metadata);
+            self.saw(&metadata);
+        }
         let mut pending = vec![root.to_path_buf()];
         while let Some(directory) = pending.pop() {
             let Ok(entries) = std::fs::read_dir(&directory) else {
@@ -132,17 +143,22 @@ impl Stamper {
                     }
                 }
                 fold_metadata_stamp(&mut self.hasher, &metadata);
-                if let Ok(modified) = metadata.modified()
-                    && modified > self.newest
-                {
-                    self.newest = modified;
-                }
+                self.saw(&metadata);
                 if metadata.is_dir() {
                     pending.push(child);
                 }
             }
         }
         WalkOutcome::Fits
+    }
+
+    /// Keep the newest modification time.
+    fn saw(&mut self, metadata: &std::fs::Metadata) {
+        if let Ok(modified) = metadata.modified()
+            && modified > self.newest
+        {
+            self.newest = modified;
+        }
     }
 
     pub(crate) fn finish(self) -> TreeStamp {
@@ -332,6 +348,44 @@ mod tests {
         std::fs::remove_file(dir.path().join("link")).unwrap();
         std::os::unix::fs::symlink("b", dir.path().join("link")).unwrap();
         assert_ne!(walk(dir.path(), text, 10).1, before, "retargeted");
+    }
+
+    /// A name created and removed again directly under the root leaves every
+    /// entry as it was, and only the root's own times show it.
+    #[test]
+    fn a_name_that_came_and_went_under_the_root_moves_its_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a");
+        write(&file, "a");
+        let old = filetime::FileTime::from_unix_time(1_000_000_000, 0);
+        filetime::set_file_mtime(&file, old).unwrap();
+        filetime::set_file_mtime(dir.path(), old).unwrap();
+        let root_too = StampRules {
+            root_metadata: true,
+            ..StampRules::default()
+        };
+        let stamp = |rules| {
+            let mut stamper = Stamper::new();
+            let mut left = 10;
+            assert_eq!(
+                stamper.walk(dir.path(), &[], rules, &mut left),
+                WalkOutcome::Fits
+            );
+            assert_eq!(left, 9, "the root is no entry");
+            stamper.finish()
+        };
+        let entries = stamp(StampRules::default()).digest;
+        let with_root = stamp(root_too).digest;
+
+        write(&dir.path().join("transient"), "");
+        std::fs::remove_file(dir.path().join("transient")).unwrap();
+        let now = SystemTime::now();
+        let after = stamp(StampRules::default());
+        assert_eq!(after.digest, entries);
+        assert!(after.settled_at(now));
+        let after = stamp(root_too);
+        assert_ne!(after.digest, with_root);
+        assert!(!after.settled_at(now), "the root's write is the newest");
     }
 
     /// Below the root, a directory Cargo tagged counts by its tag alone. The

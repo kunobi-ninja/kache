@@ -25,6 +25,7 @@ The exact set depends on the invocation. It can include:
 - macOS SDK identity (version and build) and `MACOSX_DEPLOYMENT_TARGET`, when set, for host-loaded Darwin outputs
 - for native Windows MSVC links: the linker, the MSVC, SDK and UCRT environment for the architecture, and the import and static libraries
 - configured salt, extra inputs, and declared environment inputs
+- for a workspace or path package with a build script, the files and variables that script declares with `cargo:rerun-if-changed` and `cargo:rerun-if-env-changed`
 
 Host-loaded Linux and macOS links, and native Windows MSVC links, pass through if those inputs cannot be resolved, so no host receives a binary built against inputs the key did not record. Links for rustc-bundled self-contained WebAssembly targets (`wasm32-unknown-unknown`, the WASI family, `wasm32v1-none`, `wasm64-unknown-unknown`) are cached. Links with `-C link-self-contained=no`, links for a WebAssembly custom target spec or emscripten, and links for any other WebAssembly target that needs an external toolchain pass through. Libraries and metadata for these targets still cache.
 
@@ -185,7 +186,9 @@ Crates from the registry or Git appear under `/kache/.cargo` on every platform. 
 
 ## Inputs the compiler does not report
 
-Use these controls only for a real hidden input:
+A proc macro can read files and environment variables rustc never reports. Tauri's `generate_context!` reads `tauri.conf.json` and `TAURI_CONFIG`; an asset embedder lists a directory. When the package's own build script declares those inputs with `cargo:rerun-if-changed` or `cargo:rerun-if-env-changed`, Cargo reruns the script after a change and recompiles the package. Kache keys every Rust unit of a workspace or path package on what its build script declared, so that recompile misses instead of restoring the artifact built from the old inputs. A script that declares nothing makes the package's own files other than Rust sources the input, as Cargo does. [Build scripts](/docs/how-it-works/build-scripts#declared-inputs-in-the-rust-key) describes what is keyed and what is not.
+
+For an input no build script declares, or one another package's build script declares, use these controls:
 
 - `cache.key_salt` or `KACHE_KEY_SALT` for an opaque toolchain boundary
 - crate `kache.toml` for files read during compilation but absent from dep-info

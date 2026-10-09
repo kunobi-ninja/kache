@@ -471,7 +471,7 @@ Values are hashed exactly and are not written to event logs. A value that change
 
 ## Hidden compile-time inputs
 
-Some macros read files that rustc does not report. Put `kache.toml` without a leading dot next to the crate manifest:
+Some macros read files that rustc does not report. If the package's build script already declares them with `cargo:rerun-if-changed`, Kache keys them without a declaration of its own (see [Build scripts](/docs/how-it-works/build-scripts#declared-inputs-in-the-rust-key)). Otherwise put `kache.toml` without a leading dot next to the crate manifest:
 
 ```toml title="crates/db/kache.toml"
 extra_inputs = [

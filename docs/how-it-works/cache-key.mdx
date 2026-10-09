@@ -47,9 +47,10 @@ them. A record for a workspace or path crate is therefore used only while the
 workspace and the crate's `OUT_DIR` hold what the recording build saw. This
 applies in the crate's own checkout as well as in another target directory or
 checkout. The check leaves out the target directory, `.git`, and the contents
-of any other directory Cargo tagged as a target directory. An unchanged
-workspace costs one stat of each entry; Kache reads the files again after a
-change.
+of any other directory Cargo tagged as a target directory. An entry Kache
+cannot read counts by its name, since a proc macro cannot read it either.
+Checking an unchanged workspace costs one stat of each entry, and writing a
+record stats each entry again; Kache reads the files again after a change.
 
 The check has costs:
 
@@ -57,11 +58,27 @@ The check has costs:
   once on the next build that would otherwise restore it, such as a build
   after `cargo clean`, in a new target directory, or on CI with a restored
   cache.
+- With adaptive incremental mode, the build that starts incremental
+  compilation of a crate you are editing, and the first edit after a hit,
+  run dependency discovery before compiling. On a large crate that takes
+  roughly half as long as an incremental check.
+- A record written while files in the workspace change does not carry the
+  check, so its crate runs dependency discovery again on the next build,
+  even if the files end up unchanged.
 - A workspace of more than 20,000 entries is not checked, so its crates
   always use dependency discovery.
 - A crate that reads a file outside the workspace, in a target directory
   other than its `OUT_DIR`, or through a symlinked directory always uses
   dependency discovery.
+
+The check does not see:
+
+- A directory a macro lists outside the workspace, or through a symlinked
+  directory, that held no file the crate read when the record was made. A
+  file added there goes unseen.
+- On Windows, a listed file removed and put back with its old size and
+  modification time while the crate compiles. On Linux and macOS its new
+  inode and change time show it.
 
 A registry crate is the same files wherever it is built, so it is checked
 against its package and `OUT_DIR` only when it has a proc-macro dependency of

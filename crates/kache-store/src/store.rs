@@ -4647,6 +4647,26 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         Ok(())
     }
 
+    /// [`Self::forget_target_root`], only while the row still records
+    /// `identity`. A build may record a new directory at `path` after the
+    /// caller read the row; that row stays.
+    pub fn forget_target_root_with_identity(
+        &self,
+        path: &Path,
+        identity: crate::filesystem::PathIdentity,
+    ) -> Result<()> {
+        self.refuse_write("forget a target root")?;
+        self.db.execute(
+            "DELETE FROM target_roots WHERE path = ?1 AND device = ?2 AND inode = ?3",
+            params![
+                path.to_string_lossy(),
+                identity.device.to_string(),
+                identity.inode.to_string(),
+            ],
+        )?;
+        Ok(())
+    }
+
     /// Remove registered incremental directories and prune stale registry rows.
     pub fn clean_registered_incremental_dirs(&self) -> Result<usize> {
         self.refuse_write("clean incremental directories")?;

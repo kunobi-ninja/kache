@@ -4323,6 +4323,51 @@ fn target_root_registry_is_local_bounded_provenance_with_identity() {
 }
 
 #[test]
+fn forgetting_by_identity_keeps_a_row_recorded_for_a_new_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let store = Store::open(&config).unwrap();
+    let workspace = dir.path().join("workspace");
+    let target = workspace.join("target");
+    let tagged = |target: &Path| {
+        std::fs::create_dir_all(target.join("debug")).unwrap();
+        std::fs::write(
+            target.join("CACHEDIR.TAG"),
+            "Signature: 8a477f597d28d172789f06886806bc55",
+        )
+        .unwrap();
+    };
+    tagged(&target);
+    store.remember_target_root(&target, &workspace).unwrap();
+    let removed = store.tracked_target_roots(0).unwrap().remove(0).identity;
+    // Moved aside, the old directory keeps its inode while a build records
+    // a new one at the same path.
+    std::fs::rename(&target, workspace.join("aside")).unwrap();
+    tagged(&target);
+    store.remember_target_root(&target, &workspace).unwrap();
+    let current = store.tracked_target_roots(0).unwrap().remove(0).identity;
+    assert_ne!(current, removed);
+    let elsewhere = crate::filesystem::PathIdentity {
+        device: current.device.wrapping_add(1),
+        inode: current.inode,
+    };
+    for stale in [removed, elsewhere] {
+        store
+            .forget_target_root_with_identity(&target, stale)
+            .unwrap();
+        assert_eq!(
+            store.tracked_target_roots(0).unwrap().len(),
+            1,
+            "{stale:?} forgot the row for {current:?}"
+        );
+    }
+    store
+        .forget_target_root_with_identity(&target, current)
+        .unwrap();
+    assert!(store.tracked_target_roots(0).unwrap().is_empty());
+}
+
+#[test]
 fn discovered_target_remains_unbuilt_until_a_real_build_uses_it() {
     let dir = tempfile::tempdir().unwrap();
     let config = test_config(dir.path());
@@ -12347,6 +12392,20 @@ fn read_only_store_serves_hits_and_writes_nothing() {
     assert!(
         ro.forget_target_root(src.path()).is_err(),
         "forget_target_root must be refused on a read-only store"
+    );
+    let identity = crate::filesystem::PathIdentity {
+        device: 1,
+        inode: 2,
+    };
+    // SQLite refuses the write too; the store must refuse it first.
+    let refused = ro
+        .forget_target_root_with_identity(src.path(), identity)
+        .unwrap_err();
+    assert!(
+        refused
+            .to_string()
+            .contains("refusing to forget a target root"),
+        "forget_target_root_with_identity must be refused on a read-only store: {refused:#}"
     );
     assert!(
         ro.clean_registered_incremental_dirs().is_err(),

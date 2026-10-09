@@ -73,6 +73,10 @@ const SHIM_DIR: &str = ".kache-build-script-shims";
 const LAUNCHER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/build-script-launcher"));
 const PREDICTION_SCHEMA: u32 = 1;
 const PREDICTION_PREFIX: &str = "build-script:";
+/// Folded first into every action key. A v1 key also matched runs recorded
+/// before kache stored the files a script names outside `OUT_DIR`, and
+/// restoring one replayed a link search into an empty directory.
+const ACTION_KIND: &[u8] = b"kache-build-script-action-v2";
 /// Marks a script binary that writes into its inputs on every run.
 const UNSETTLED_PREFIX: &str = "unsettled:";
 const MANIFEST_NAME: &str = "kache-build-script.json";
@@ -1280,8 +1284,19 @@ impl Run {
         inherited_zero_ar_date: Option<std::ffi::OsString>,
         tools: &ToolSnapshot,
     ) -> Result<String> {
+        self.action_key_as(ACTION_KIND, prediction, inherited_zero_ar_date, tools)
+    }
+
+    /// [`Self::action_key_with`] under `kind` in place of [`ACTION_KIND`].
+    fn action_key_as(
+        &self,
+        kind: &[u8],
+        prediction: &Prediction,
+        inherited_zero_ar_date: Option<std::ffi::OsString>,
+        tools: &ToolSnapshot,
+    ) -> Result<String> {
         let mut hasher = blake3::Hasher::new();
-        fold(&mut hasher, "kind", b"kache-build-script-action-v1");
+        fold(&mut hasher, "kind", kind);
         fold(
             &mut hasher,
             "key_version",
@@ -4197,8 +4212,44 @@ mod tests {
         run.store.get(key).unwrap().unwrap()
     }
 
+    /// Before 1.0, kache stored a script's link search into a directory
+    /// beside `OUT_DIR` but not the files there (manifest versions 1 to 3).
+    /// After `cargo clean` or in a new worktree, restoring that run made
+    /// rustc search an empty directory. Today's key does not find such a
+    /// run, so the script runs and is recorded with its files.
     #[test]
-    fn an_old_manifest_restores_without_outside_fields_or_a_target_directory() {
+    fn a_run_recorded_without_its_outside_files_is_not_found() {
+        let mut lock = crate::test_support::process_state_test_lock();
+        let dir = lock.enter();
+        let (a, b) = two_targets(dir.as_path());
+        let prediction = recorded_prediction(
+            vec!["${KACHE_MANIFEST_DIR}/build.rs".to_string()],
+            Vec::new(),
+            false,
+            Vec::new(),
+            false,
+        );
+        let tools = a.tool_snapshot().unwrap();
+        let before = a
+            .action_key_as(b"kache-build-script-action-v1", &prediction, None, &tools)
+            .unwrap();
+        put_manifest(
+            &a,
+            &before,
+            r#"{"version":1,"directories":[],"empty_files":[],"stdout":"cargo:rustc-link-search=native=${KACHE_TARGET_DIR}/debug/gn_out/obj\n","stderr":""}"#,
+        );
+        assert!(
+            b.store.get(&before).unwrap().is_some(),
+            "the old run is stored"
+        );
+        let key = b.action_key_with(&prediction, None, &tools).unwrap();
+        assert!(b.store.get(&key).unwrap().is_none());
+    }
+
+    /// A run with nothing outside `OUT_DIR`, no symlink and no rewritten text
+    /// still records version 1, without the fields later versions added.
+    #[test]
+    fn a_version_one_manifest_restores_without_outside_fields_or_a_target_directory() {
         let mut lock = crate::test_support::process_state_test_lock();
         let dir = lock.enter();
         let out = dir.as_path().join("out");

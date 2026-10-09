@@ -11153,7 +11153,8 @@ fn too_new_guard_flags_inputs_modified_after_build_start() {
 /// still.
 #[test]
 fn the_too_new_guard_allows_for_coarse_file_clocks_and_keeps_its_margin() {
-    let start = 1_700_000_000_250_000_000_i64;
+    // Off any 10 ms boundary, so every stamp below gets the fine window.
+    let start = 1_700_000_000_250_000_007_i64;
     let flagged = |margin_ns: i64, stamp_ns: i64| {
         let mut hasher = FileHasher::new();
         hasher.arm_too_new_guard(start, margin_ns);

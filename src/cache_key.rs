@@ -6414,9 +6414,9 @@ impl<'db> FileHasher<'db> {
 
     /// Arm the too-new-input guard (kunobi-ninja/kache#324): flag any subsequently
     /// hashed input whose stamp shows a write at or after `margin_ns` before
-    /// `invocation_start_ns` (the build's wall-clock start), allowing for coarse
-    /// file clocks ([`stamp_written_since`]). A `start` of 0 leaves the guard
-    /// disabled.
+    /// `invocation_start_ns` (the build's start, read from [`stamp_clock_ns`]),
+    /// allowing for coarse file clocks ([`stamp_written_since`]). A `start` of
+    /// 0 leaves the guard disabled.
     pub fn arm_too_new_guard(&mut self, invocation_start_ns: i64, margin_ns: i64) {
         self.too_new.invocation_start_ns = invocation_start_ns;
         self.too_new.margin_ns = margin_ns;

@@ -88,18 +88,25 @@ starts at once: rustc writes its dep-info right after macro expansion, Kache
 keys from it there, and if that key is stored it stops rustc and restores the
 entry. A predicted key that missed is re-derived from the running compile the
 same way. Every input in that closure is checked against the build's start
-time; an input written during the compile leaves the result unstored. Peers of
-the same unit in other target directories wait for this compile as they would
-for a pre-pass. Crates with extra inputs keep the pre-pass, and so does every
-Rust unit when the scheduler is off (`KACHE_SCHEDULER=0`).
+time. An input written during the compile leaves the result unstored, and so
+does one written so shortly before the build started that its recorded write
+time cannot tell the two apart: within the same kernel clock tick (1 to 10 ms)
+on Linux, 1 ms on macOS, 20 ms on other systems, and 2 seconds on file systems
+that keep whole seconds, such as HFS+ and FAT. Peers of the same unit in other
+target directories wait for this compile as they would for a pre-pass.
+Crates with extra inputs keep the pre-pass, and so does every Rust unit when
+the scheduler is off (`KACHE_SCHEDULER=0`).
 `[cache] deferred_discovery = false` or `KACHE_DEFERRED_DISCOVERY=0` restores
 the pre-pass everywhere.
 
 A C or C++ compile without a recorded read set does the same: it compiles
 with a dependency file and keys from the digest of the files that compile
-read, instead of preprocessing first. An input written while that compile ran
-leaves its result unstored. A record whose files changed is rediscovered with
-the preprocessor, which yields the same key.
+read, instead of preprocessing first. An input written while that compile ran,
+or within the same margin before it started, leaves its result unstored and
+records no read set, so the unit's next build compiles first again. A unit
+whose input a build step rewrites right before every compile is therefore not
+cached. A record whose files changed is rediscovered with the preprocessor,
+which yields the same key.
 
 ## Path normalization
 

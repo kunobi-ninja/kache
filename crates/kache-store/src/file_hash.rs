@@ -30,36 +30,70 @@ pub fn stamp_is_settled(fingerprint: &FileFingerprint, observed_ns: i64) -> bool
     observed_ns.saturating_sub(changed) >= HASH_SETTLE_NS
 }
 
-/// How far below the wall-clock time of a write its stamp can read where
-/// stamps keep whole seconds: HFS+, ext3 and ext4 with 128-byte inodes
-/// truncate to the second, FAT to two.
-pub const WHOLE_SECOND_STAMP_WINDOW_NS: i64 = 2_000_000_000;
+/// How far below [`stamp_clock_ns`], read just before a write, the write's
+/// stamp can fall where stamps keep a fraction of a second. Linux stamps
+/// files from the coarse clock that function reads there, and macOS from
+/// the wall clock, so the margin only covers stamps kept in microseconds.
+/// Elsewhere stamps can trail the wall clock by a timer tick: 15.6 ms on
+/// Windows.
+pub const FINE_STAMP_WINDOW_NS: i64 = if cfg!(any(
+    target_os = "linux",
+    target_os = "android",
+    target_vendor = "apple"
+)) {
+    1_000_000
+} else {
+    20_000_000
+};
 
-/// The same where stamps keep a fraction of a second. They still come from
-/// a clock that can trail the wall clock by a tick: a Linux jiffy (up to
-/// 10 ms) or the 15.6 ms Windows timer.
-pub const FINE_STAMP_WINDOW_NS: i64 = 20_000_000;
+/// Added to that for a stamp on a 10 ms boundary: exFAT keeps its times in
+/// 10 ms steps, and FAT its creation time, which Windows reports as ctime.
+pub const CENTISECOND_STAMP_GRAIN_NS: i64 = 10_000_000;
 
-/// Whether `fingerprint` shows a write at or after `since_ns` on the wall
-/// clock. A write made after `since_ns` can carry a stamp below it, so each
-/// of mtime and ctime counts from one window earlier: two seconds for a
-/// time on a whole second, 20 ms otherwise. Each time gets its own window
-/// because FAT keeps a two-second write time beside the 10 ms creation
-/// time that stands in for ctime on Windows.
+/// Added for a stamp on a whole second: HFS+, ext3 and ext4 with 128-byte
+/// inodes truncate to the second, FAT its write time to two.
+pub const WHOLE_SECOND_STAMP_GRAIN_NS: i64 = 2_000_000_000;
+
+/// Whether `fingerprint` shows a write at or after `since_ns`, a time read
+/// from [`stamp_clock_ns`]. A write made after `since_ns` can carry a stamp
+/// below it, so each of mtime and ctime counts from its own window earlier
+/// ([`stamp_window_ns`]); FAT keeps a two-second write time beside a 10 ms
+/// creation time. A stamp set by another machine's clock, over a network
+/// filesystem or a VM share, is only as close as the two clocks are.
 pub fn stamp_written_since(fingerprint: &FileFingerprint, since_ns: i64) -> bool {
     [fingerprint.mtime_ns, fingerprint.ctime_ns]
         .into_iter()
         .any(|stamp| stamp >= since_ns.saturating_sub(stamp_window_ns(stamp)))
 }
 
-/// The window for one stamp: [`WHOLE_SECOND_STAMP_WINDOW_NS`] for a time on
-/// a whole second, else [`FINE_STAMP_WINDOW_NS`].
+/// The window for one stamp: [`FINE_STAMP_WINDOW_NS`], plus the grain its
+/// value shows it was truncated to.
 pub fn stamp_window_ns(stamp_ns: i64) -> i64 {
-    if stamp_ns.rem_euclid(1_000_000_000) == 0 {
-        WHOLE_SECOND_STAMP_WINDOW_NS
+    let grain = if stamp_ns.rem_euclid(1_000_000_000) == 0 {
+        WHOLE_SECOND_STAMP_GRAIN_NS
+    } else if stamp_ns.rem_euclid(CENTISECOND_STAMP_GRAIN_NS) == 0 {
+        CENTISECOND_STAMP_GRAIN_NS
     } else {
-        FINE_STAMP_WINDOW_NS
+        0
+    };
+    grain + FINE_STAMP_WINDOW_NS
+}
+
+/// Now, on the clock file stamps are taken from: the kernel's coarse
+/// realtime clock on Linux, which trails the wall clock by up to a tick,
+/// and the wall clock elsewhere. A start that stamps are later checked
+/// against with [`stamp_written_since`] is read from it.
+pub fn stamp_clock_ns() -> i64 {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        // SAFETY: an all-zero timespec is valid, and the call only fills it.
+        let mut now: libc::timespec = unsafe { std::mem::zeroed() };
+        if unsafe { libc::clock_gettime(libc::CLOCK_REALTIME_COARSE, &mut now) } == 0 {
+            let elapsed = std::time::Duration::new(now.tv_sec as u64, now.tv_nsec as u32);
+            return i64::try_from(elapsed.as_nanos()).unwrap_or(i64::MAX);
+        }
     }
+    wall_clock_ns()
 }
 
 /// The wall clock in nanoseconds since the Unix epoch, 0 before it.
@@ -926,25 +960,56 @@ mod tests {
 
     #[test]
     fn a_write_counts_from_one_stamp_window_before_the_start() {
-        assert_eq!(WHOLE_SECOND_STAMP_WINDOW_NS, 2_000_000_000);
-        assert_eq!(FINE_STAMP_WINDOW_NS, 20_000_000);
+        let fine = if cfg!(any(
+            target_os = "linux",
+            target_os = "android",
+            target_vendor = "apple"
+        )) {
+            1_000_000
+        } else {
+            20_000_000
+        };
+        assert_eq!(FINE_STAMP_WINDOW_NS, fine);
         let both = |ns| stamp("/s.rs", ns, ns);
         let whole = 1_700_000_000_000_000_000;
-        assert!(stamp_written_since(&both(whole), whole + 2_000_000_000));
-        assert!(!stamp_written_since(&both(whole), whole + 2_000_000_001));
-        let fine = whole + 123_456_789;
-        assert!(stamp_written_since(&both(fine), fine + 20_000_000));
-        assert!(!stamp_written_since(&both(fine), fine + 20_000_001));
+        let whole_window = 2_000_000_000 + fine;
+        assert!(stamp_written_since(&both(whole), whole + whole_window));
+        assert!(!stamp_written_since(&both(whole), whole + whole_window + 1));
+        let centi = whole + 120_000_000;
+        let centi_window = 10_000_000 + fine;
+        assert!(stamp_written_since(&both(centi), centi + centi_window));
+        assert!(!stamp_written_since(&both(centi), centi + centi_window + 1));
+        let precise = whole + 123_456_789;
+        assert!(stamp_written_since(&both(precise), precise + fine));
+        assert!(!stamp_written_since(&both(precise), precise + fine + 1));
         // Each time keeps its own window: a two-second FAT write time beside
-        // a 10 ms creation time, and an old whole-second mtime restored over
-        // a fresh ctime.
+        // an old 10 ms creation time, and an old whole-second mtime restored
+        // over a fresh ctime.
         let long_ago = whole - 60_000_000_000;
-        let fat = stamp("/s.rs", whole, long_ago + 7);
-        assert!(stamp_written_since(&fat, whole + 2_000_000_000));
-        assert!(!stamp_written_since(&fat, whole + 2_000_000_001));
-        let restored = stamp("/s.rs", long_ago, fine);
-        assert!(stamp_written_since(&restored, fine + 20_000_000));
-        assert!(!stamp_written_since(&restored, fine + 20_000_001));
+        let fat = stamp("/s.rs", whole, long_ago + 30_000_000);
+        assert!(stamp_written_since(&fat, whole + whole_window));
+        assert!(!stamp_written_since(&fat, whole + whole_window + 1));
+        let restored = stamp("/s.rs", long_ago, precise);
+        assert!(stamp_written_since(&restored, precise + fine));
+        assert!(!stamp_written_since(&restored, precise + fine + 1));
+    }
+
+    /// The window covers how far this platform's stamps trail
+    /// [`stamp_clock_ns`]: a write made right after reading it counts as
+    /// written since then.
+    #[test]
+    fn a_write_right_after_the_stamp_clock_counts_as_written_since() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("f");
+        for round in 0..500 {
+            let since = stamp_clock_ns();
+            std::fs::write(&file, round.to_string()).unwrap();
+            let written = FileFingerprint::from_path(&file).unwrap();
+            assert!(
+                stamp_written_since(&written, since),
+                "round {round}: {written:?} since {since}"
+            );
+        }
     }
 
     #[test]

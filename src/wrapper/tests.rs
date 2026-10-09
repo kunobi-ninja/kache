@@ -2081,8 +2081,9 @@ fn a_source_written_during_the_compile_refuses_a_key_derived_after_it() {
         .map(|input| input.mtime_ns.max(input.ctime_ns))
         .max()
         .unwrap();
-    // Past every stamp window, and off a whole second.
-    let start = (last_write / 1_000_000_000 + 3) * 1_000_000_000 + 500_000_000;
+    // Past every stamp window, and off any 10 ms boundary, so the stamps
+    // below get the fine window.
+    let start = (last_write / 1_000_000_000 + 3) * 1_000_000_000 + 500_000_007;
     let at = |input: &FileFingerprint, ns: i64| FileFingerprint {
         mtime_ns: ns,
         ctime_ns: ns,

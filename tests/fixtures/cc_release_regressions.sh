@@ -23,7 +23,8 @@ cd "$repro_root"
 fail() { printf 'FAIL #%s: %s\n' "$issue" "$*" >&2; exit 1; }
 hit() { grep -q 'cc local cache hit' "$1" || fail "expected cache hit in $1"; }
 # Kache does not store a compile that starts within one stamp window of a
-# write to its inputs: 20 ms, or two seconds where stamps keep whole seconds.
+# write to its inputs: 1 ms on Linux and macOS, 20 ms elsewhere, and about
+# two seconds where stamps keep whole seconds.
 settle() { sleep 2.1; }
 
 case "$issue" in

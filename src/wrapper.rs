@@ -1164,10 +1164,7 @@ pub fn run_nvcc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     let rebuilt_package = KeyEnv::capture().var("CARGO_PKG_NAME");
     let _trace = crate::phase_trace::start("nvcc", wrapper_args);
     let start = wrapper_entry();
-    let invocation_start_ns = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_nanos() as i64)
-        .unwrap_or(0);
+    let invocation_start_ns = crate::cache_key::stamp_clock_ns();
     crate::link::set_windows_hardlink_restore(config.windows_hardlink);
     crate::link::set_shared_hardlink_restores(config.shared_hardlink_restores);
     crate::link::set_storage_layout_advice(config.storage_layout_advice);
@@ -1816,10 +1813,7 @@ fn nvcc_try_remote_hit(
 pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     let _trace = crate::phase_trace::start("cc", wrapper_args);
     let start = wrapper_entry();
-    let invocation_start_ns = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_nanos() as i64)
-        .unwrap_or(0);
+    let invocation_start_ns = crate::cache_key::stamp_clock_ns();
     run_cc_inner(config, wrapper_args, start, invocation_start_ns)
 }
 
@@ -3274,12 +3268,9 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     crate::link::set_layout_advice_to_log(true);
     crate::link::set_cow_warn_marker(warn_marker_path("cow", &config.cache_dir));
     warn_nonlocal_cache_fs_once(config);
-    // Wall-clock build-start (ns since epoch) for the too-new-input guard;
-    // compared against keyed inputs' mtime/ctime (kunobi-ninja/kache#324).
-    let invocation_start_ns = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as i64)
-        .unwrap_or(0);
+    // Build start (ns since epoch) for the too-new-input guard, on the clock
+    // keyed inputs' mtime/ctime come from (kunobi-ninja/kache#324).
+    let invocation_start_ns = crate::cache_key::stamp_clock_ns();
 
     // Parse the rustc arguments (wrapper_args[0] is the rustc path).
     // Routed through the Compiler trait — see src/compiler/mod.rs. RustcArgs

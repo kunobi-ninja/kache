@@ -163,9 +163,10 @@ pub(crate) enum Resolved {
     /// Cargo recorded no stdout for the run, as for a script a `links`
     /// override replaces: nothing to fold.
     Unrecorded,
-    /// The script declares nothing and its package holds more entries than
-    /// a digest may walk.
-    PackageTooLarge,
+    /// The script declares nothing and its package cannot be digested, for
+    /// the reason given: more entries than a walk may take, or an entry the
+    /// walk cannot read.
+    PackageUnkeyed(String),
 }
 
 /// A unit's declared inputs as they were when resolved.
@@ -229,11 +230,14 @@ enum EnvState {
 
 /// Resolve the inputs `located`'s script declared.
 ///
-/// Fails when a declared path cannot be read, or the declared paths hold
-/// more entries than `max_entries`: the unit must not be keyed without
-/// them. A package too large to digest degrades to no fold instead
-/// ([`Resolved::PackageTooLarge`]); Cargo would rerun its script on any
-/// edit, and kache keys it as it did before.
+/// What rustc could not read either counts as such: a path through a file
+/// as missing, an entry the user may not search as unreadable, a symlink
+/// back into a directory being walked as a cycle. Fails when a declared
+/// path cannot be read otherwise, or the declared paths hold more entries
+/// than `max_entries`: the unit must not be keyed without them. A package
+/// that cannot be digested degrades to no fold instead
+/// ([`Resolved::PackageUnkeyed`]); Cargo would rerun its script on any edit,
+/// and kache keys it as it did before.
 pub(crate) fn resolve(located: &Located, resolver: &Resolver<'_, '_>) -> Result<Resolved> {
     let root_output = located.stdout.with_file_name("root-output");
     let records = vec![fingerprint(&located.stdout), fingerprint(&root_output)];
@@ -253,6 +257,7 @@ pub(crate) fn resolve(located: &Located, resolver: &Resolver<'_, '_>) -> Result<
         excluded: resolver.excluded,
         skip_metadata: true,
         other_entries: true,
+        unreachable_entries: true,
         stop_when_too_large: true,
         memo: Some((resolver.cache_dir, "build-script-inputs-v1")),
         stamps: Some(&trees),
@@ -286,11 +291,17 @@ pub(crate) fn resolve(located: &Located, resolver: &Resolver<'_, '_>) -> Result<
             Ok(state) => {
                 paths.insert(b"package".to_vec(), state);
             }
-            Err(error) if error.is::<TooManyInputs>() => return Ok(Resolved::PackageTooLarge),
+            Err(error) if error.is::<TooManyInputs>() => {
+                return Ok(Resolved::PackageUnkeyed(format!(
+                    "the package holds more than {} entries",
+                    resolver.max_entries
+                )));
+            }
+            // Cargo's own walk of a package recovers from what it cannot
+            // read, so a script that declares nothing does not cost caching.
             Err(error) => {
-                return Err(error.context(format!(
-                    "digesting package {}",
-                    located.manifest_dir.display()
+                return Ok(Resolved::PackageUnkeyed(format!(
+                    "kache could not read the package: {error:#}"
                 )));
             }
         }

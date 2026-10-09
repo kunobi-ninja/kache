@@ -761,7 +761,8 @@ fn declared_paths_past_the_budget_fail_but_a_large_package_degrades() {
     // The package, its manifest, `src` and `assets` cost four once the
     // assets are gone; with them it costs nine.
     fixture.declare("cargo:rustc-cfg=x\n");
-    assert_eq!(fixture.resolve(&[], 4).unwrap(), Resolved::PackageTooLarge);
+    let too_large = Resolved::PackageUnkeyed("the package holds more than 4 entries".to_string());
+    assert_eq!(fixture.resolve(&[], 4).unwrap(), too_large);
     let marker = oversized_marker(&fixture.cache, &fixture.package, 4);
     assert!(marker.is_file(), "a package found too large is remembered");
     for index in 0..5 {
@@ -769,7 +770,7 @@ fn declared_paths_past_the_budget_fail_but_a_large_package_degrades() {
     }
     assert_eq!(
         fixture.resolve(&[], 4).unwrap(),
-        Resolved::PackageTooLarge,
+        too_large,
         "and not walked again for a while"
     );
     let stale = filetime::FileTime::from_system_time(
@@ -795,26 +796,82 @@ fn an_oversized_record_is_refused() {
     assert!(fixture.resolve(&[], 100).is_ok());
 }
 
+/// In a worktree `.git` is a file, so a declared `.git/HEAD` runs through a
+/// file. Cargo counts a path it cannot stat as missing, and so does the key.
+#[test]
+fn a_declared_path_through_a_file_is_missing() {
+    let fixture = Fixture::new();
+    fixture.declare("cargo:rerun-if-changed=.git/HEAD\ncargo:rerun-if-changed=.git/refs\n");
+    let absent = fixture.digest(&[]);
+    fixture.write(".git", "gitdir: /elsewhere/.git/worktrees/app\n");
+    assert_eq!(fixture.digest(&[]), absent);
+    std::fs::remove_file(fixture.package.join(".git")).unwrap();
+    fixture.write(".git/HEAD", "ref: refs/heads/main\n");
+    assert_ne!(fixture.digest(&[]), absent, "a checkout with its own .git");
+}
+
 #[cfg(unix)]
 #[test]
-fn an_unreadable_directory_fails_declared_or_not() {
+fn what_no_process_of_the_user_can_read_counts_as_unreadable() {
     use std::os::unix::fs::PermissionsExt;
     let fixture = Fixture::new();
-    let locked = fixture.package.join("locked");
-    std::fs::create_dir_all(locked.join("inner")).unwrap();
-    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
-    if std::fs::read_dir(&locked).is_ok() {
+    let locked = fixture.write("locked/inner.txt", "1");
+    let locked = locked.parent().unwrap();
+    let mode = |mode| std::fs::set_permissions(locked, std::fs::Permissions::from_mode(mode));
+    mode(0o000).unwrap();
+    if std::fs::read_dir(locked).is_ok() {
         // Root reads anything.
-        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        mode(0o755).unwrap();
         return;
     }
-    fixture.declare("cargo:rerun-if-changed=locked\n");
-    let declared = fixture.resolve(&[], 100);
+    let resolve = || {
+        fixture.declare("cargo:rerun-if-changed=locked\n");
+        let declared = fixture.resolve(&[], 100);
+        fixture.declare("cargo:rustc-cfg=x\n");
+        (declared, fixture.resolve(&[], 100))
+    };
+    let locked_before = resolve();
+    mode(0o755).unwrap();
+    let open = resolve();
+    // What changes behind the lock, as in a Docker volume owned by another
+    // user, does not count.
+    fixture.write("locked/inner.txt", "2");
+    mode(0o000).unwrap();
+    let locked_after = resolve();
+    // rustc can open a file by name in a directory it may search.
+    mode(0o100).unwrap();
+    let searchable = resolve();
+    mode(0o755).unwrap();
+
+    let digest = |resolved: Result<Resolved>| match resolved.unwrap() {
+        Resolved::Folded(snapshot) => snapshot.digest,
+        other => panic!("expected a digest, got {other:?}"),
+    };
+    let (declared, package) = (digest(locked_before.0), digest(locked_before.1));
+    assert_eq!(digest(locked_after.0), declared, "declared");
+    assert_eq!(digest(locked_after.1), package, "the package");
+    assert_ne!(digest(open.0), declared, "a readable directory counts");
+    assert_ne!(digest(open.1), package);
+    assert!(searchable.0.is_err(), "a declared path fails");
+    assert!(
+        matches!(
+            searchable.1.unwrap(),
+            Resolved::PackageUnkeyed(why) if why.starts_with("kache could not read the package")
+        ),
+        "the package is left out, as when it is too large"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_package_that_links_to_itself_is_keyed() {
+    let fixture = Fixture::new();
+    fixture.write("data.txt", "v1");
+    std::os::unix::fs::symlink(".", fixture.package.join("self")).unwrap();
     fixture.declare("cargo:rustc-cfg=x\n");
-    let package = fixture.resolve(&[], 100);
-    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
-    assert!(declared.is_err());
-    assert!(package.is_err(), "an unreadable package is not too large");
+    let base = fixture.digest(&[]);
+    fixture.write("data.txt", "v2");
+    assert_ne!(fixture.digest(&[]), base);
 }
 
 #[test]

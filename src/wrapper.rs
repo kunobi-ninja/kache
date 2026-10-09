@@ -3500,8 +3500,8 @@ fn resolve_build_script_inputs(
             Some(snapshot)
         }
         crate::build_script_inputs::Resolved::Unrecorded => None,
-        crate::build_script_inputs::Resolved::PackageTooLarge => {
-            warn_build_script_package_too_large(config, &located);
+        crate::build_script_inputs::Resolved::PackageUnkeyed(why) => {
+            warn_build_script_package_unkeyed(config, &located, &why);
             None
         }
     };
@@ -3581,10 +3581,11 @@ fn build_script_inputs_moved(
 }
 
 /// Say, once per session and package, that the package's units are keyed
-/// without its files.
-fn warn_build_script_package_too_large(
+/// without its files, and `why`.
+fn warn_build_script_package_unkeyed(
     config: &Config,
     located: &crate::build_script_inputs::Located,
+    why: &str,
 ) {
     let package = blake3::hash(located.manifest_dir.as_os_str().as_encoded_bytes()).to_hex();
     let marker = warn_marker_path(
@@ -3595,11 +3596,10 @@ fn warn_build_script_package_too_large(
         &marker,
         WARN_SESSION_SECS,
         &format!(
-            "[kache] {}: its build script declares no inputs and the package holds more than {} \
-             entries, so its units are keyed without the package's files. Print \
-             cargo:rerun-if-changed for the files its macros read.",
+            "[kache] {}: its build script declares no inputs and {why}, so its units are keyed \
+             without the package's files. Print cargo:rerun-if-changed for the files its macros \
+             read.",
             located.package,
-            crate::build_script_inputs::MAX_ENTRIES,
         ),
         WarnSink::Log,
     );

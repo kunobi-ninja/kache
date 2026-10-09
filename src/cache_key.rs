@@ -1060,6 +1060,7 @@ impl<'a> TreeRoot<'a> {
             root_metadata: true,
             unreadable_entries: true,
             top_files_only: false,
+            unsearchable_dirs: false,
         }
     }
 
@@ -2484,6 +2485,7 @@ fn ancestor_top_digest(directory: &Path, file_hasher: &FileHasher<'_>) -> Option
             root_metadata: false,
             unreadable_entries: true,
             top_files_only: true,
+            unsearchable_dirs: false,
         },
     }];
     let stamp = stamp_roots(&top, CRATE_TREE_MAX_ENTRIES).ok()?;

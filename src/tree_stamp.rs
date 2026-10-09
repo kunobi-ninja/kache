@@ -48,6 +48,11 @@ pub(crate) struct StampRules {
     /// Stamp only the entries directly under the root that are not
     /// directories.
     pub(crate) top_files_only: bool,
+    /// Below the root, pass over a directory the user may neither list nor
+    /// search ([`unsearchable`]): a process the user runs cannot reach what
+    /// it holds either, and its own entry is stamped already. Any other
+    /// error still refuses the tree.
+    pub(crate) unsearchable_dirs: bool,
 }
 
 /// How a walk over one root ended.
@@ -131,6 +136,13 @@ impl Stamper {
                         "unlisted",
                         relative.as_os_str().as_encoded_bytes(),
                     );
+                    continue;
+                }
+                Err(error)
+                    if rules.unsearchable_dirs
+                        && directory != root
+                        && unsearchable(&directory, &error) =>
+                {
                     continue;
                 }
                 Err(_) => return WalkOutcome::Unreadable,
@@ -220,6 +232,13 @@ impl Stamper {
             newest: self.newest,
         }
     }
+}
+
+/// Whether listing `dir` failed because the user may neither list nor
+/// search it, so nothing in it can be reached by name either.
+pub(crate) fn unsearchable(dir: &Path, error: &std::io::Error) -> bool {
+    let denied = |error: &std::io::Error| error.kind() == std::io::ErrorKind::PermissionDenied;
+    denied(error) && std::fs::symlink_metadata(dir.join(".")).is_err_and(|error| denied(&error))
 }
 
 /// The file Cargo writes into a build directory it creates.

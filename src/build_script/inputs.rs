@@ -2,13 +2,15 @@
 //! directory's listing, a symlink's target and referent, or its absence.
 //! Large directories are digested once per stamp of their entries' metadata.
 //!
-//! The run cache walks a tree leaving out only the paths it names. The
-//! rustc key's walks (see [`crate::build_script_inputs`]) also leave out
-//! VCS metadata and Cargo's own directories, and keep their memo apart.
+//! The run cache walks a tree leaving out only the paths it names, and
+//! fails on anything it cannot read. The rustc key's walks (see
+//! [`crate::build_script_inputs`]) also leave out VCS metadata and Cargo's
+//! own directories, digest what rustc could not read either instead of
+//! failing, and keep their memo apart.
 
 use super::{Environment, fold};
 use crate::tree_stamp::{
-    StampRules, Stamper, TreeStamp, WalkOutcome, memoised_digest, record_digest,
+    StampRules, Stamper, TreeStamp, WalkOutcome, memoised_digest, record_digest, unsearchable,
 };
 use anyhow::Result;
 use std::cell::RefCell;
@@ -44,6 +46,11 @@ pub(crate) struct Walk<'a> {
     pub(crate) skip_rust_and_packages: bool,
     /// Digest a socket, FIFO or device as `other` instead of failing.
     pub(crate) other_entries: bool,
+    /// Digest what rustc, running as the same user, cannot reach either,
+    /// instead of failing: a path through a file as `missing`, an entry the
+    /// user may not search as `unreadable`, and a symlink to a directory the
+    /// walk is inside as a `cycle`. Cargo's own walks recover the same way.
+    pub(crate) unreachable_entries: bool,
     /// Fail when a tree's stamp walk runs past the budget, before hashing
     /// any of it.
     pub(crate) stop_when_too_large: bool,
@@ -119,7 +126,16 @@ pub(super) fn input_state_as(
         excluded,
         ..Walk::default()
     };
-    walked_state(path, &walk, file_hasher, budget, symlink_depth, text)
+    let within = &mut Within::default();
+    walked_state(
+        path,
+        &walk,
+        file_hasher,
+        budget,
+        symlink_depth,
+        text,
+        within,
+    )
 }
 
 /// [`input_state`] under `walk`, for a path at the top of a walk.
@@ -129,7 +145,38 @@ pub(crate) fn state_in(
     file_hasher: &crate::cache_key::FileHasher<'_>,
     budget: &mut usize,
 ) -> Result<String> {
-    walked_state(path, walk, file_hasher, budget, 0, None)
+    let within = &mut Within::default();
+    walked_state(path, walk, file_hasher, budget, 0, None, within)
+}
+
+/// The directories a walk is inside, outermost first, to tell a symlink that
+/// leads back into one of them. Their real paths are looked up only when a
+/// symlink needs them.
+#[derive(Default)]
+struct Within(Vec<(PathBuf, std::cell::OnceCell<Option<PathBuf>>)>);
+
+impl Within {
+    /// Whether `referent` is a directory the walk is inside, so following a
+    /// symlink to it would walk the same tree again without end.
+    fn holds(&self, referent: &Path) -> bool {
+        let Ok(referent) = std::fs::canonicalize(referent) else {
+            return false;
+        };
+        self.0.iter().any(|(dir, real)| {
+            real.get_or_init(|| std::fs::canonicalize(dir).ok())
+                .as_ref()
+                == Some(&referent)
+        })
+    }
+}
+
+/// Whether hashing a file failed because the user may not read it.
+fn read_denied(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied)
+    })
 }
 
 /// [`input_state_as`] under `walk`. Each entry costs one from `budget`.
@@ -140,6 +187,7 @@ fn walked_state(
     budget: &mut usize,
     symlink_depth: usize,
     text: Option<&Environment>,
+    within: &mut Within,
 ) -> Result<String> {
     anyhow::ensure!(*budget > 0, TooManyInputs);
     *budget -= 1;
@@ -147,6 +195,19 @@ fn walked_state(
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Ok("missing".to_string());
+        }
+        // Cargo counts any path it cannot stat as missing. A component that
+        // is a file (`.git` in a worktree) means there is nothing there; a
+        // directory on the way the user may not search hides what is.
+        Err(error)
+            if walk.unreachable_entries && error.kind() == std::io::ErrorKind::NotADirectory =>
+        {
+            return Ok("missing".to_string());
+        }
+        Err(error)
+            if walk.unreachable_entries && error.kind() == std::io::ErrorKind::PermissionDenied =>
+        {
+            return Ok("unreadable".to_string());
         }
         Err(error) => return Err(error.into()),
     };
@@ -161,14 +222,19 @@ fn walked_state(
         } else {
             path.parent().unwrap_or(Path::new("")).join(&target)
         };
-        let referent = walked_state(
-            &resolved,
-            walk,
-            file_hasher,
-            budget,
-            symlink_depth + 1,
-            text,
-        )?;
+        let referent = if walk.unreachable_entries && within.holds(&resolved) {
+            "cycle".to_string()
+        } else {
+            walked_state(
+                &resolved,
+                walk,
+                file_hasher,
+                budget,
+                symlink_depth + 1,
+                text,
+                within,
+            )?
+        };
         return Ok(format!("symlink:{}:{referent}", target.to_string_lossy()));
     }
     if metadata.is_file() {
@@ -179,7 +245,13 @@ fn walked_state(
         {
             return Ok(format!("text:{}", blake3::hash(&normalized).to_hex()));
         }
-        return Ok(format!("file:{}", file_hasher.hash(path)?));
+        return match file_hasher.hash(path) {
+            Ok(hash) => Ok(format!("file:{hash}")),
+            Err(error) if walk.unreachable_entries && read_denied(&error) => {
+                Ok("unreadable".to_string())
+            }
+            Err(error) => Err(error),
+        };
     }
     if metadata.is_dir() {
         // A declared directory (a vendored C library, the package itself) can
@@ -212,7 +284,15 @@ fn walked_state(
             stamps: None,
             ..*walk
         };
-        let digest = hash_directory(path, &below, file_hasher, budget, symlink_depth, text)?;
+        let digest = hash_directory(
+            path,
+            &below,
+            file_hasher,
+            budget,
+            symlink_depth,
+            text,
+            within,
+        )?;
         // Filesystem timestamps are coarse (a kernel tick on Linux), so a
         // same-size rewrite within the tick of the last write would keep the
         // stamp. A tree touched in the last seconds is hashed again next time
@@ -240,16 +320,58 @@ fn hash_directory(
     budget: &mut usize,
     symlink_depth: usize,
     text: Option<&Environment>,
+    within: &mut Within,
 ) -> Result<String> {
-    let mut entries: Vec<_> = std::fs::read_dir(path)?.collect::<std::io::Result<_>>()?;
+    let listing = match std::fs::read_dir(path) {
+        Ok(listing) => listing,
+        Err(error) if walk.unreachable_entries && unsearchable(path, &error) => {
+            return Ok("unreadable".to_string());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let mut entries: Vec<_> = listing.collect::<std::io::Result<_>>()?;
     entries.sort_by_key(std::fs::DirEntry::file_name);
+    within
+        .0
+        .push((path.to_path_buf(), std::cell::OnceCell::new()));
+    let digest = hash_entries(
+        &entries,
+        walk,
+        file_hasher,
+        budget,
+        symlink_depth,
+        text,
+        within,
+    );
+    within.0.pop();
+    digest
+}
+
+/// The digest of a directory's `entries`, sorted by name.
+fn hash_entries(
+    entries: &[std::fs::DirEntry],
+    walk: &Walk<'_>,
+    file_hasher: &crate::cache_key::FileHasher<'_>,
+    budget: &mut usize,
+    symlink_depth: usize,
+    text: Option<&Environment>,
+    within: &mut Within,
+) -> Result<String> {
     let mut hasher = blake3::Hasher::new();
     for entry in entries {
         let child = entry.path();
-        if walk.skips(&child, &entry) {
+        if walk.skips(&child, entry) {
             continue;
         }
-        let state = walked_state(&child, walk, file_hasher, budget, symlink_depth, text)?;
+        let state = walked_state(
+            &child,
+            walk,
+            file_hasher,
+            budget,
+            symlink_depth,
+            text,
+            within,
+        )?;
         // Like Cargo's list of a package's files, the package digest counts a
         // directory only through what is left in it: adding `tests/` with
         // Rust files alone changes nothing.
@@ -290,10 +412,16 @@ pub(super) fn tree_stamp(path: &Path, excluded: &[PathBuf], budget: usize) -> Op
 fn tree_stamp_in(path: &Path, walk: &Walk<'_>, budget: usize) -> Result<TreeStamp, Unstamped> {
     let mut stamper = Stamper::new();
     let mut remaining = budget;
+    // What a directory below the top hides from the user, it hides from
+    // rustc too; its own metadata is in the stamp already.
+    let rules = StampRules {
+        unsearchable_dirs: walk.unreachable_entries,
+        ..StampRules::default()
+    };
     match stamper.walk_skipping(
         path,
         &|child, entry| walk.skips(child, entry),
-        StampRules::default(),
+        rules,
         &mut remaining,
     ) {
         WalkOutcome::Fits => Ok(stamper.finish()),
@@ -549,5 +677,208 @@ mod tests {
             Some(digest),
             "a settled tree is memoised in its namespace"
         );
+    }
+
+    /// Sets the mode of `path` and restores it when dropped, so the scratch
+    /// directory can be removed.
+    #[cfg(unix)]
+    struct Mode(PathBuf);
+
+    #[cfg(unix)]
+    impl Mode {
+        fn set(path: &Path, mode: u32) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+            Self(path.to_path_buf())
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for Mode {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    /// Whether file modes bind this process. Root reads anything.
+    #[cfg(unix)]
+    fn modes_bind(dir: &Path) -> bool {
+        let probe = dir.join("probe");
+        std::fs::create_dir(&probe).unwrap();
+        let _mode = Mode::set(&probe, 0o000);
+        std::fs::read_dir(&probe).is_err()
+    }
+
+    /// A walk that recovers, with its memo kept in `cache`.
+    #[cfg(unix)]
+    fn recovering(cache: &Path) -> Walk<'_> {
+        Walk {
+            unreachable_entries: true,
+            memo: Some((cache, "test")),
+            ..Walk::default()
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_recovering_walk_reads_what_rustc_cannot_reach_either() {
+        let dir = tempfile::tempdir().unwrap();
+        if !modes_bind(dir.path()) {
+            return;
+        }
+        let cache = dir.path().join("cache");
+        let root = dir.path().join("tree");
+        write(&root.join("file"), "x");
+        write(&root.join("locked/inner.txt"), "inner");
+        write(&root.join("sealed.txt"), "sealed");
+        let hasher = crate::cache_key::FileHasher::new();
+        let walk = recovering(&cache);
+        let run_cache = Walk::default();
+        let state = |path: &Path, walk: &Walk<'_>| state_in(path, walk, &hasher, &mut 100);
+
+        assert_eq!(state(&root.join("file/child"), &walk).unwrap(), "missing");
+        let readable = state(&root, &walk).unwrap();
+        {
+            let _locked = Mode::set(&root.join("locked"), 0o000);
+            let _sealed = Mode::set(&root.join("sealed.txt"), 0o000);
+            for (path, why) in [
+                (root.join("locked"), "a directory the user may not search"),
+                (root.join("locked/inner.txt"), "a path below it"),
+                (root.join("sealed.txt"), "a file the user may not read"),
+            ] {
+                assert_eq!(state(&path, &walk).unwrap(), "unreadable", "{why}");
+            }
+            assert_ne!(state(&root, &walk).unwrap(), readable);
+            for path in [root.join("locked"), root.join("sealed.txt")] {
+                assert!(
+                    state(&path, &run_cache).is_err(),
+                    "the run cache refuses {}",
+                    path.display()
+                );
+            }
+        }
+        assert!(
+            state(&root.join("file/child"), &run_cache).is_err(),
+            "the run cache refuses a path through a file"
+        );
+        let _searchable = Mode::set(&root.join("locked"), 0o100);
+        assert!(
+            state(&root.join("locked"), &walk).is_err(),
+            "rustc can reach what is in a directory it may search but not list"
+        );
+    }
+
+    #[test]
+    fn only_a_permission_error_reads_a_file_as_unreadable() {
+        let error = |kind| anyhow::Error::from(std::io::Error::from(kind)).context("hashing");
+        assert!(read_denied(&error(std::io::ErrorKind::PermissionDenied)));
+        assert!(!read_denied(&error(std::io::ErrorKind::Other)));
+        assert!(!read_denied(&anyhow::anyhow!("permission denied")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_stamp_passes_over_a_directory_below_its_top_that_no_one_can_search() {
+        let dir = tempfile::tempdir().unwrap();
+        if !modes_bind(dir.path()) {
+            return;
+        }
+        let cache = dir.path().join("cache");
+        let root = dir.path().join("tree");
+        write(&root.join("a.txt"), "a");
+        std::fs::create_dir(root.join("locked")).unwrap();
+        let walk = recovering(&cache);
+        {
+            let _locked = Mode::set(&root.join("locked"), 0o000);
+            assert!(tree_stamp_in(&root, &walk, 100).is_ok());
+            assert_eq!(
+                tree_stamp_in(&root, &Walk::default(), 100).err(),
+                Some(Unstamped::Unstampable),
+                "the run cache's walk"
+            );
+            assert_eq!(
+                tree_stamp_in(&root.join("locked"), &walk, 100).err(),
+                Some(Unstamped::Unstampable),
+                "the top of the walk"
+            );
+        }
+        let _searchable = Mode::set(&root.join("locked"), 0o100);
+        assert_eq!(
+            tree_stamp_in(&root, &walk, 100).err(),
+            Some(Unstamped::Unstampable),
+            "a directory that can be searched but not listed"
+        );
+    }
+
+    /// An empty directory and a locked one would stamp alike, so a locked
+    /// top has no stamp and never finds the memo of its empty past.
+    #[cfg(unix)]
+    #[test]
+    fn a_locked_directory_does_not_read_the_memo_of_its_empty_past() {
+        let dir = tempfile::tempdir().unwrap();
+        if !modes_bind(dir.path()) {
+            return;
+        }
+        let cache = dir.path().join("cache");
+        let empty = dir.path().join("empty");
+        std::fs::create_dir(&empty).unwrap();
+        let walk = recovering(&cache);
+        let hasher = crate::cache_key::FileHasher::new();
+        let open = state_in(&empty, &walk, &hasher, &mut 10).unwrap();
+        assert_eq!(open, empty_directory());
+        let _locked = Mode::set(&empty, 0o000);
+        assert_eq!(
+            state_in(&empty, &walk, &hasher, &mut 10).unwrap(),
+            "unreadable"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_to_a_directory_the_walk_is_in_is_a_cycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        let tree = dir.path().join("tree");
+        let shared = dir.path().join("shared");
+        write(&tree.join("a.txt"), "a");
+        write(&shared.join("data/d.txt"), "d");
+        write(&shared.join("other.txt"), "1");
+        std::os::unix::fs::symlink(".", tree.join("self")).unwrap();
+        std::os::unix::fs::symlink(shared.join("data"), tree.join("data")).unwrap();
+        std::os::unix::fs::symlink("..", shared.join("data/up")).unwrap();
+        let hasher = crate::cache_key::FileHasher::new();
+        let walk = recovering(&cache);
+        let state = |path: &Path| state_in(path, &walk, &hasher, &mut 1000).unwrap();
+
+        let before = state(&tree);
+        // `tree/data/up` leads to `shared`, which the walk is not inside, so
+        // what is there counts even though `shared/data` is reached twice.
+        write(&shared.join("other.txt"), "2");
+        assert_ne!(state(&tree), before, "a file reached through two links");
+        // A link at the top is followed once: it is not inside its target yet.
+        let linked = state(&tree.join("self"));
+        write(&tree.join("a.txt"), "b");
+        assert_ne!(state(&tree.join("self")), linked);
+        assert!(
+            state_in(&tree, &Walk::default(), &hasher, &mut 1000).is_err(),
+            "the run cache refuses a cycle"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_beside_a_walked_directory_walks_it_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        let tree = dir.path().join("tree");
+        write(&tree.join("a/f.txt"), "f");
+        std::os::unix::fs::symlink("a", tree.join("b")).unwrap();
+        let hasher = crate::cache_key::FileHasher::new();
+        let mut budget = 100;
+        state_in(&tree, &recovering(&cache), &hasher, &mut budget).unwrap();
+        // The tree, `a`, `a/f.txt`, `b`, and `a` with `f.txt` again through
+        // `b`: a walk is inside `a` only while it walks `a`.
+        assert_eq!(100 - budget, 6);
     }
 }

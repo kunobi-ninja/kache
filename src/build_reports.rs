@@ -676,9 +676,25 @@ mod tests {
         .enumerate()
         {
             let compiler = dir.path().join(format!("rustc-{index}"));
-            std::fs::write(&compiler, "#!/bin/sh\nexec /bin/cat \"${0}.version\"\n").unwrap();
+            let version_bytes = stdout
+                .iter()
+                .map(|byte| format!("\\0{byte:03o}"))
+                .collect::<String>();
+            std::fs::write(
+                &compiler,
+                format!(
+                    "#!{}\nprintf '%b' '{version_bytes}'\n",
+                    option_env!("KACHE_TEST_SHELL").unwrap_or("/bin/sh"),
+                ),
+            )
+            .unwrap();
             std::fs::set_permissions(&compiler, std::fs::Permissions::from_mode(0o755)).unwrap();
-            std::fs::write(compiler.with_extension("version"), stdout).unwrap();
+            let output = std::process::Command::new(&compiler)
+                .args(["--version", "--verbose"])
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "version case {index}");
+            assert_eq!(output.stdout, stdout, "version case {index}");
             assert_eq!(toolchain_hash(&compiler), identity, "version case {index}");
             let facts = ProducerFacts {
                 compiler_stamp: Some(

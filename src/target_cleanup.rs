@@ -231,7 +231,11 @@ pub(crate) fn unit_window(days: u64) -> Option<Duration> {
 /// running build holds is kept for the next check.
 pub(crate) fn sweep(config: &Config, now: u64) -> anyhow::Result<Swept> {
     let store = Store::open(config)?;
-    crate::worktree_discovery::discover(&store)?;
+    // A full volume refuses the registry's writes, which is no reason to
+    // skip the cleanup that frees space.
+    if let Err(error) = crate::worktree_discovery::discover(&store) {
+        tracing::warn!("could not record targets in sibling worktrees: {error:#}");
+    }
     let window = unit_window(config.auto_clean_unused_units_days);
     let at = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(now);
     let now = i64::try_from(now).unwrap_or(i64::MAX);
@@ -243,7 +247,7 @@ pub(crate) fn sweep(config: &Config, now: u64) -> anyhow::Result<Swept> {
             let replaced = crate::machine::directory_identity(&tracked.path)
                 .is_some_and(|identity| identity != tracked.identity);
             if missing_with_parent || replaced {
-                store.forget_target_root(&tracked.path)?;
+                forget(&store, &tracked.path);
                 continue;
             }
             // No rule could remove it: leave its fingerprints and Cargo
@@ -274,7 +278,7 @@ pub(crate) fn sweep(config: &Config, now: u64) -> anyhow::Result<Swept> {
             continue;
         };
         if !intact {
-            store.forget_target_root(&tracked.path)?;
+            forget(&store, &tracked.path);
             continue;
         }
         if crate::cli::target_in_use(&tracked.path) {
@@ -282,7 +286,7 @@ pub(crate) fn sweep(config: &Config, now: u64) -> anyhow::Result<Swept> {
         }
         match remove(&tracked.path, tracked.identity, now, &config.cache_dir) {
             Ok(true) => {
-                store.forget_target_root(&tracked.path)?;
+                forget(&store, &tracked.path);
                 swept.removed.push((tracked.path, reason));
             }
             Ok(false) => {}
@@ -305,6 +309,17 @@ pub(crate) fn sweep(config: &Config, now: u64) -> anyhow::Result<Swept> {
     let used = prune_under_pressure(config, &store, at, &mut swept)?;
     recover_under_pressure(config, &store, now, &unused, &used, &mut swept)?;
     Ok(swept)
+}
+
+/// Drop `path` from the target registry. A full volume can refuse the
+/// write; the stale row that leaves is no reason to end the pass.
+fn forget(store: &Store, path: &Path) {
+    if let Err(error) = store.forget_target_root(path) {
+        tracing::warn!(
+            "could not forget target directory {}: {error:#}",
+            path.display()
+        );
+    }
 }
 
 /// Still the recorded, derived target directory, and not a source tree.
@@ -663,7 +678,7 @@ fn recover_under_pressure(
         }
         match remove(&candidate.path, candidate.identity, now, &config.cache_dir) {
             Ok(true) => {
-                store.forget_target_root(&candidate.path)?;
+                forget(store, &candidate.path);
                 let freed = kache_fs::volume_usage(parent)
                     .map_or(0, |after| after.free.saturating_sub(before.free));
                 record_stalled_volume(&mut stalled_volumes, candidate.identity.device, freed);
@@ -1596,6 +1611,128 @@ mod tests {
         }
         assert_eq!(swept.removed, vec![(target.clone(), Reason::Pressure)]);
         assert!(!target.exists());
+    }
+
+    /// Make every insert into and delete from the target registry fail, as a
+    /// full volume refuses them.
+    #[cfg(unix)]
+    fn refuse_registry_writes(store: &Store) {
+        store
+            .file_hash_cache()
+            .db()
+            .execute_batch(
+                "CREATE TRIGGER full_insert BEFORE INSERT ON target_roots
+                 BEGIN SELECT RAISE(ABORT, 'database or disk is full'); END;
+                 CREATE TRIGGER full_delete BEFORE DELETE ON target_roots
+                 BEGIN SELECT RAISE(ABORT, 'database or disk is full'); END;",
+            )
+            .unwrap();
+    }
+
+    /// A workspace in a Git repository whose target a build recorded, and a
+    /// sibling worktree holding a target for discovery to record. `false`
+    /// without Git.
+    #[cfg(unix)]
+    fn sibling_worktree_target(store: &Store, root: &Path) -> bool {
+        let repo = root.join("repo");
+        let sibling = root.join("sibling");
+        std::fs::create_dir_all(&repo).unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .output()
+        };
+        let Ok(init) = git(&["init", "-q"]) else {
+            return false;
+        };
+        let commit = [
+            "-c",
+            "user.name=Kache Test",
+            "-c",
+            "user.email=kache@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "base",
+        ];
+        let add = [
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            sibling.to_str().unwrap(),
+        ];
+        for output in [init, git(&commit).unwrap(), git(&add).unwrap()] {
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        for workspace in [&repo, &sibling] {
+            std::fs::write(workspace.join("Cargo.toml"), "[workspace]\n").unwrap();
+            std::fs::create_dir_all(workspace.join("target/debug")).unwrap();
+            std::fs::write(
+                workspace.join("target/CACHEDIR.TAG"),
+                "Signature: 8a477f597d28d172789f06886806bc55\n",
+            )
+            .unwrap();
+        }
+        store
+            .remember_target_root(&repo.join("target"), &repo)
+            .unwrap();
+        true
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_registry_that_refuses_writes_does_not_end_the_pass() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let orphans = config(cache.path(), true, 0);
+        let store = Store::open(&orphans).unwrap();
+        // Discovery fails to record the sibling's target.
+        sibling_worktree_target(&store, root.path());
+        // Each of these rows is forgotten: a discovered target gone with its
+        // parent left, a target that is no longer one, and the removed ones.
+        let gone = discovered_with_unit(&store, root.path(), "gone");
+        std::fs::remove_dir_all(&gone).unwrap();
+        let untagged = orphan(&store, root.path(), "untagged");
+        std::fs::remove_file(untagged.join("CACHEDIR.TAG")).unwrap();
+        let first = orphan(&store, root.path(), "first");
+        let second = orphan(&store, root.path(), "second");
+        age(&store, DAY_SECS);
+        let rows = tracked(&store);
+        refuse_registry_writes(&store);
+
+        let swept = sweep(&orphans, unix_now_secs()).unwrap();
+        let mut removed: Vec<_> = swept.removed.into_iter().map(|(path, _)| path).collect();
+        removed.sort();
+        assert_eq!(removed, vec![first.clone(), second.clone()]);
+        assert!(!first.exists() && !second.exists());
+        assert_eq!(tracked(&store), rows, "no row was written");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pressure_recovery_goes_on_when_the_registry_refuses_writes() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let mut pressure = config(cache.path(), false, 0);
+        let store = Store::open(&pressure).unwrap();
+        let (_, target) = tracked_target(&store, root.path(), "idle");
+        std::fs::write(target.join("debug/artifact"), vec![7; 64 * 1024]).unwrap();
+        pressure.auto_recover_min_free_bytes = kache_fs::volume_usage(&target).unwrap().total - 1;
+        refuse_registry_writes(&store);
+        let swept = sweep(&pressure, unix_now_secs() + 2 * DAY_SECS).unwrap();
+        assert_eq!(swept.removed, vec![(target.clone(), Reason::Pressure)]);
+        assert!(!target.exists());
+        assert_eq!(tracked(&store), vec![target], "the row stays");
     }
 
     #[test]

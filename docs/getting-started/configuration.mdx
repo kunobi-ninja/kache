@@ -329,7 +329,7 @@ With `target_liveness` enabled, automatic unused-unit cleanup and its disk-press
 
 The receipt uses successful stable Cargo `build`/`check` JSON output, including artifacts Cargo marked Fresh. Cleanup keeps those live units and removes only known units outside that recorded command's scope. It does not depend on file access times. After cleaning an already-fresh workspace, repeating the same recorded Cargo command stays fresh. A different feature set, profile or command may need units that were removed.
 
-Recording and validation scan the workspace inputs and fingerprint/output inventories only when this mode is enabled. Source walks stop at 32,768 entries or 128 MiB; oversized inputs and split build directories retain their units.
+Recording and validation scan workspace inputs, build-script package inputs and fingerprint/output inventories only when this mode is enabled. Source walks stop at 32,768 entries or 128 MiB; oversized inputs and split build directories retain their units.
 
 Missing, changed or incomplete evidence keeps the units. Unsupported layouts, symlinks and held build locks also prevent removal. Other profiles and unknown units are kept. Run the supported Cargo command again to refresh a receipt after changing sources, manifests, configuration or the toolchain. Existing private Cargo files alone are not a complete build graph.
 

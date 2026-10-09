@@ -711,6 +711,9 @@ fn receipt_cleanup_removes_old_feature_units_and_keeps_next_check_fresh() {
         json["targets"][0]["plan"]["units"].as_u64().unwrap() > 0,
         "{json}"
     );
+    assert!(json["targets"][0]["plan"]["bytes"].as_u64().unwrap() > 0);
+    assert!(json["targets"][0]["plan"]["protected"].as_u64().unwrap() > 0);
+    let planned_bytes = json["targets"][0]["plan"]["bytes"].clone();
     // Access time is intentionally misleading for every fingerprint file.
     for unit in std::fs::read_dir(target.join("debug/.fingerprint")).unwrap() {
         for file in std::fs::read_dir(unit.unwrap().path()).unwrap() {
@@ -724,6 +727,7 @@ fn receipt_cleanup_removes_old_feature_units_and_keeps_next_check_fresh() {
     let clean = run(&["clean", "--artifacts", "--json", "--yes"], true);
     let json: Value = serde_json::from_slice(&clean.stdout).unwrap();
     assert_eq!(json["preview"], false);
+    assert_eq!(json["targets"][0]["removed"]["bytes"], planned_bytes);
     assert!(
         json["targets"][0]["removed"]["units"].as_u64().unwrap() > 0,
         "{json}"
@@ -753,6 +757,7 @@ fn receipt_cleanup_removes_old_feature_units_and_keeps_next_check_fresh() {
         .filter(|e| e["event"] == "target-cleanup")
         .collect();
     assert_eq!(cleanup.len(), 1);
+    assert_eq!(cleanup[0]["removed_bytes"], planned_bytes);
     assert_eq!(
         cleanup[0]["removed_units"],
         json["targets"][0]["removed"]["units"]
@@ -1196,4 +1201,74 @@ fn receipt_cleanup_rejects_a_changed_custom_cargo_executable() {
     assert_ne!(changed["targets"][0]["plan"]["status"], "ready");
     assert_eq!(changed["targets"][0]["plan"]["units"], 0);
     assert_eq!(receipt_target_files(&fixture.target), files);
+}
+
+#[test]
+fn receipt_cleanup_tracks_default_build_script_inputs_outside_the_workspace() {
+    let fixture = ReceiptAcceptance::new();
+    let input = fixture.dependency.join("default-input.txt");
+    std::fs::write(&input, "old input").unwrap();
+    std::fs::write(
+        fixture.dependency.join("build.rs"),
+        "fn main() { let input = std::fs::read_to_string(\"default-input.txt\").unwrap(); println!(\"cargo:rustc-env=DEFAULT_INPUT={input}\"); }\n",
+    ).unwrap();
+    for _ in 0..2 {
+        fixture.run(&["cargo", "--", "check", "--offline"], true, "alpha");
+    }
+    let preview = fixture.clean(&["--json"], "alpha");
+    assert_eq!(
+        preview["targets"][0]["plan"]["status"], "ready",
+        "{preview}"
+    );
+    let warm = fixture.run(
+        &["cargo", "--", "check", "--offline", "--message-format=json"],
+        true,
+        "alpha",
+    );
+    let artifacts: Vec<Value> = String::from_utf8(warm.stdout)
+        .unwrap()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|record| record["reason"] == "compiler-artifact")
+        .collect();
+    assert!(!artifacts.is_empty());
+    assert!(artifacts.iter().all(|artifact| artifact["fresh"] == true));
+    let files = receipt_target_files(&fixture.target);
+    std::fs::write(input, "changed default input").unwrap();
+    let changed = fixture.clean(&["--json", "--yes"], "alpha");
+    assert_ne!(
+        changed["targets"][0]["plan"]["status"], "ready",
+        "{changed}"
+    );
+    assert_eq!(changed["targets"][0]["removed"]["units"], 0);
+    assert_eq!(receipt_target_files(&fixture.target), files);
+}
+
+#[test]
+fn receipt_cleanup_preserves_units_in_unobserved_profiles() {
+    let fixture = ReceiptAcceptance::new();
+    fixture.run(
+        &[
+            "cargo",
+            "--",
+            "check",
+            "--offline",
+            "--release",
+            "--features",
+            "old",
+        ],
+        false,
+        "alpha",
+    );
+    fixture.capture();
+    let before = receipt_target_files(&fixture.target.join("release"));
+    assert!(!before.is_empty());
+    let preview = fixture.clean(&["--json"], "alpha");
+    assert!(preview["targets"][0]["plan"]["unknown"].as_u64().unwrap() > 0);
+    let cleaned = fixture.clean(&["--json", "--yes"], "alpha");
+    assert!(cleaned["targets"][0]["removed"]["units"].as_u64().unwrap() > 0);
+    assert_eq!(
+        receipt_target_files(&fixture.target.join("release")),
+        before
+    );
 }

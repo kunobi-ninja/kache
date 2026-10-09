@@ -365,6 +365,14 @@ impl Capture {
             protected_packages.insert(package);
             let stdout = crate::cargo_layout::build_script_stdout(&out).context("script stdout")?;
             insert_file(&mut inputs, &stdout, true)?;
+            // Cargo can watch the whole package when a build script supplies
+            // no rerun directives. Keep a conservative package inventory too.
+            walk(
+                &mut inputs,
+                manifest.parent().context("script package directory")?,
+                &[target.clone(), self.config.cache_dir.clone()],
+                true,
+            )?;
             for line in std::fs::read_to_string(stdout)?.lines() {
                 let line = line
                     .strip_prefix("cargo::")
@@ -1294,7 +1302,6 @@ mod tests {
         assert!(checked_root(&link, dir.path()).is_err());
         assert_eq!(std::fs::read(source).unwrap(), b"keep");
     }
-    // Insert inside target_liveness::tests (the module already imports super::*).
     fn capture_for_test(dir: &Path) -> Capture {
         Capture {
             config: crate::test_support::test_config(dir.to_path_buf()),

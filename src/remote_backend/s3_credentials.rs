@@ -11,8 +11,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use reqsign_aws_v4::{
     AssumeRoleWithWebIdentityCredentialProvider, Credential, ECSCredentialProvider,
-    EnvCredentialProvider, IMDSv2CredentialProvider, ProcessCredentialProvider,
-    ProfileCredentialProvider, SSOCredentialProvider,
+    IMDSv2CredentialProvider, ProcessCredentialProvider, ProfileCredentialProvider,
+    SSOCredentialProvider,
 };
 use reqsign_core::{Context as SigningContext, ProvideCredential, ProvideCredentialDyn};
 
@@ -214,13 +214,7 @@ impl KacheCredentialProvider {
         if let Some(credential) = &self.kache_keys {
             return Ok(Some((credential.clone(), KACHE_KEYS.to_string())));
         }
-        if let Some(failure) = partial_environment_keys(context) {
-            return Err(failure);
-        }
-        if let Ok(Some(credential)) = EnvCredentialProvider::new()
-            .provide_credential(context)
-            .await
-        {
+        if let Some(credential) = environment_keys(context)? {
             return Ok(Some((credential, ENVIRONMENT_KEYS.to_string())));
         }
         let selected = selected_profile(self.profile.as_deref(), context);
@@ -271,22 +265,30 @@ impl ProvideCredential for KacheCredentialProvider {
     }
 }
 
-/// A key ID without its secret, or the reverse, is a mistake to report rather
-/// than a reason to try the next source. An empty variable counts as unset.
-fn partial_environment_keys(context: &SigningContext) -> Option<CredentialFailure> {
+/// `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`, with `AWS_SESSION_TOKEN`.
+/// An empty variable counts as unset, so a pair of empty ones leaves the
+/// later sources to sign. A key ID without its secret, or the reverse, is a
+/// mistake to report rather than a reason to try the next source.
+fn environment_keys(context: &SigningContext) -> Result<Option<Credential>, CredentialFailure> {
     const KEY_ID: &str = "AWS_ACCESS_KEY_ID";
     const SECRET: &str = "AWS_SECRET_ACCESS_KEY";
-    let set = |name: &str| context.env_var(name).is_some_and(|value| !value.is_empty());
-    match (set(KEY_ID), set(SECRET)) {
-        (true, false) => Some(CredentialFailure::PartialEnvironmentKeys {
+    let var = |name: &str| context.env_var(name).filter(|value| !value.is_empty());
+    match (var(KEY_ID), var(SECRET)) {
+        (Some(access_key_id), Some(secret_access_key)) => Ok(Some(Credential {
+            access_key_id,
+            secret_access_key,
+            session_token: var("AWS_SESSION_TOKEN"),
+            expires_in: None,
+        })),
+        (Some(_), None) => Err(CredentialFailure::PartialEnvironmentKeys {
             present: KEY_ID,
             missing: SECRET,
         }),
-        (false, true) => Some(CredentialFailure::PartialEnvironmentKeys {
+        (None, Some(_)) => Err(CredentialFailure::PartialEnvironmentKeys {
             present: SECRET,
             missing: KEY_ID,
         }),
-        (true, true) | (false, false) => None,
+        (None, None) => Ok(None),
     }
 }
 

@@ -170,7 +170,8 @@ async fn without_a_selected_profile_the_chain_reaches_the_instance_role() {
 }
 
 /// A key ID without its secret, or the reverse, is refused instead of
-/// skipped. An empty key ID counts as unset.
+/// skipped. An empty variable counts as unset, so a pair of empty ones, as
+/// CI gives a fork's pull request for its secrets, hides no later source.
 #[tokio::test]
 async fn a_key_id_without_a_secret_is_refused() {
     let home = AwsHome::new(None, None);
@@ -199,12 +200,42 @@ async fn a_key_id_without_a_secret_is_refused() {
         assert_eq!(role.calls(), 0, "no later source may be asked");
     }
 
-    let role = InstanceRole::default();
-    let credential = chain(None, None, &role)
-        .provide_credential(&home.context(&[("AWS_ACCESS_KEY_ID", "")]))
-        .await
-        .unwrap();
-    assert_eq!(credential.unwrap().access_key_id, "AKIAINSTANCE");
+    for vars in [
+        &[("AWS_ACCESS_KEY_ID", "")][..],
+        &[("AWS_ACCESS_KEY_ID", ""), ("AWS_SECRET_ACCESS_KEY", "")],
+    ] {
+        let role = InstanceRole::default();
+        let credential = chain(None, None, &role)
+            .provide_credential(&home.context(vars))
+            .await
+            .unwrap();
+        assert_eq!(
+            credential.unwrap().access_key_id,
+            "AKIAINSTANCE",
+            "{vars:?}"
+        );
+        assert_eq!(role.calls(), 1);
+    }
+}
+
+/// `AWS_SESSION_TOKEN` goes with the environment keys. An empty one is left
+/// out, where it would be sent as an empty token header.
+#[tokio::test]
+async fn an_empty_session_token_is_left_out() {
+    let home = AwsHome::new(None, None);
+    for (token, expected) in [("token", Some("token")), ("", None)] {
+        let credential = chain(None, None, &InstanceRole::default())
+            .provide_credential(&home.context(&[
+                ("AWS_ACCESS_KEY_ID", "AKIAENV"),
+                ("AWS_SECRET_ACCESS_KEY", "secret"),
+                ("AWS_SESSION_TOKEN", token),
+            ]))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(credential.access_key_id, "AKIAENV");
+        assert_eq!(credential.session_token.as_deref(), expected, "{token:?}");
+    }
 }
 
 /// Explicit keys still come before the selected profile, so a missing profile

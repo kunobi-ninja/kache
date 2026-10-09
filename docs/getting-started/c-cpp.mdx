@@ -3,13 +3,13 @@ title: C/C++ caching
 description: Cache supported GCC, Clang, and clang-cl object compilations
 ---
 
-Kache caches conservative, single-source C and C++ object compilations. If it cannot prove that an invocation is safe to cache, it runs the real compiler unchanged.
+Kache caches conservative, single-source C and C++ object compilations. If it cannot prove that an invocation is safe to cache, it runs the real compiler unchanged, or hands the invocation to a configured [fallback wrapper](/docs/getting-started/comparison#use-sccache-as-a-fallback).
 
 ## Cargo build scripts
 
 `kache init` covers both rustc and the objects a build script compiles through the `cc` crate. Without it, put a shim on `PATH`.
 
-On Unix, `kache init` sets `HOST_CC` and `HOST_CXX` in Cargo's config, and `CC_KNOWN_WRAPPER_CUSTOM=kache`. On Windows it sets only `CC_KNOWN_WRAPPER_CUSTOM`, so choose clang-cl through `CC` as shown under [Prefix method](#prefix-method). Init never sets `CC` or `CXX`, so `cargo build --target` keeps the cross compiler the `cc` crate would have found.
+On Unix, `kache init` sets `HOST_CC` and `HOST_CXX` in Cargo's config, and `CC_KNOWN_WRAPPER_CUSTOM=kache`. It adds each key only when Cargo's `[env]` table does not set it already, so an existing `HOST_CC` keeps its value and still decides which compiler build scripts run. On Windows it sets only `CC_KNOWN_WRAPPER_CUSTOM`, so choose clang-cl through `CC` as shown under [Prefix method](#prefix-method). Init never sets `CC` or `CXX`, so `cargo build --target` keeps the cross compiler the `cc` crate would have found.
 
 PATH shims also cover C code in Cargo builds when the crate invokes `cc` or `gcc` from `PATH` without `HOST_CC`.
 
@@ -43,28 +43,29 @@ The APT and AUR packages also install `/usr/lib/kache` with links for the unvers
 export PATH="/usr/lib/kache:$PATH"
 ```
 
-Nix packages include the same symlinks in `${kache}/shims`, also available at `${kache}/lib/kache`. Add that directory to `PATH` using the [Nix configuration example](/docs/getting-started/installation#nix); no `kache install-shims` step is needed.
+Nix packages include the same symlinks in `${kache}/shims`, also available at `${kache}/lib/kache`. Add that directory to `PATH` using the [Nix configuration example](/docs/getting-started/installation#nix); no `kache init --shims` step is needed.
 
 The packaged directories hold no versioned compilers such as `clang-19`. `kache init` links those in `~/.local/lib/kache/shims`.
 
-`kache init --shims` creates `cargo`, `cc`, `c++`, `gcc`, `g++`, `clang`, `clang++`, and `rustdoc`. It also links each versioned C and C++ compiler on `PATH`, such as `clang-19`, `clang++-19`, and `gcc-13`. It matches them by name and runs none of them. Keep the real compilers later in `PATH`. When Kache looks for the real compiler it skips any entry that resolves to itself or to a binary named `kache`. It also skips every entry in a directory that holds a `.kache-shims` file. The packages write that file, and `kache init --shims` does when the directory holds only Kache links, so one Kache install on `PATH` never runs another as the compiler. Keep the shim directory for shims only.
+`kache init --shims` creates `cargo`, `cc`, `c++`, `gcc`, `g++`, `clang`, `clang++`, and `rustdoc`. The `cargo` link runs your real Cargo and holds off Kache's target cleanup until the command exits. The `rustdoc` link serves [documentation caching](/docs/getting-started/rustdoc). Init also links each versioned C and C++ compiler on `PATH`, such as `clang-19`, `clang++-19`, and `gcc-13`. It matches them by name and runs none of them. Keep the real compilers later in `PATH`. When Kache looks for the real compiler it skips any entry that resolves to itself or to a binary named `kache`. It also skips every entry in a directory that holds a `.kache-shims` file. The packages write that file, and `kache init --shims` does when the directory holds only Kache links, so one Kache install on `PATH` never runs another as the compiler. Keep the shim directory for shims only.
 
-After installing another compiler version, run `kache init` again to link it. It does not remove links: after uninstalling a version, delete its link from the shim directory. Until then, that name runs Kache, which reports that no real compiler is behind the shim.
+After installing another compiler version, run `kache init` (or `kache init --shims`) again to link it. A rerun also removes a versioned link, such as `gcc-14`, once no real compiler of that name is left on `PATH`. Until you rerun it, that name runs Kache, which reports that no real compiler is behind the shim. A rerun removes only Kache links, only in a directory Kache owns, and never the unversioned names.
 
-Target-prefixed names (`x86_64-pc-linux-gnu-gcc`) work if you create them by hand or scan `PATH`:
+Target-prefixed names (`x86_64-pc-linux-gnu-gcc`) work if you create them by hand or let Kache scan `PATH`:
 
 ```bash
 kache init --shims --from-path
-kache init --shims --force
 ```
 
-Omitting the directory uses `~/.local/lib/kache/shims`. `--from-path` adds a symlink for every compiler-shaped name already on `PATH` that is not Kache itself. `--canonical-only` links only the unversioned names.
+Omitting the directory uses `~/.local/lib/kache/shims`. `--from-path` also links every other compiler on `PATH` that is not Kache itself, including target-prefixed names. To find them it runs each program whose name it does not recognize once, as `<program> -E -P -x c <temporary file>`, and remembers the answer per binary. `--canonical-only` links only the unversioned names.
+
+Add `--force` to replace existing entries in the shim directory that Kache would otherwise skip.
 
 Each shim is a native symlink to the `kache` binary. Do not wrap Kache in a shell script; that would spawn a shell per compile.
 
 Kache is a larger process than ccache. On a tree of many tiny `.c` files, measure both before replacing ccache.
 
-`kache doctor` checks the current terminal's PATH and reports the shims as active, broken, installed but not first on PATH, or not installed. If init saved shell setup but doctor still reports inactive shims, open a new terminal or run the activation command. Init cannot change its parent shell's environment.
+`kache doctor` checks the current terminal's PATH and reports the shims as active, broken, installed but not first on PATH, or not installed. Under "Stale shims" it also lists versioned links in `~/.local/lib/kache/shims` that have no real compiler behind them on `PATH`. If init saved shell setup but doctor still reports inactive shims, open a new terminal or run the activation command. Init cannot change its parent shell's environment.
 
 ### Upgrades
 
@@ -102,19 +103,28 @@ Windows has no shim generator yet. Use `CC`/`CXX`, or copy `kache.exe` to `gcc.e
 
 ## Cached invocations
 
-Supported shapes compile one source into one object:
+Supported shapes compile one source into one object, or preprocess one source to a file or, with no `-o`, to standard output:
 
 ```bash
 cc -c src/foo.c -o build/foo.o
 c++ -c src/foo.cpp -o build/foo.o
+cc -E src/foo.c -o build/foo.i
 clang-cl /c foo.c /Fofoo.obj
 ```
 
+The source can be C, C++, Objective-C, Objective-C++, or assembly that goes through the preprocessor (`.S`, `.sx`).
+
 The key includes the content of the source and of every header the compile reads, the compiler identity, modeled code-generation options, and normalized paths. Header changes therefore invalidate the entry.
 
-Kache learns the read set without a separate preprocessor run. The first time it sees an invocation it compiles right away and asks GCC or Clang for a dependency file alongside the object. A caller's own `-MD` file serves when present. Kache then fingerprints the files the compile read and keys from their digest. Peers compiling the same unit in other build directories wait for that record instead of compiling too. When a record exists but a file in it changed, Kache runs the preprocessor to rediscover the read set. It derives the same key a compile would, so it still finds an entry stored from an earlier state of the tree. A read set that includes a file the assembler opens on its own, or a file modified while the build ran, is compiled and not cached. `KACHE_DEFERRED_DISCOVERY=0` keeps the preprocessor as the discovery on every miss.
+Kache can learn a GCC or Clang compile's read set without a separate preprocessor run. The first time it sees an invocation it compiles right away and asks the compiler for a dependency file alongside the object. A caller's own `-MD` file serves when present. Kache then fingerprints the files the compile read and keys from their digest. Peers compiling the same unit in other build directories wait for that record instead of compiling too.
 
-Kache recognizes GCC, Clang, Apple Clang, clang-cl, versioned names such as `gcc-13`, and target-prefixed compiler names. It can probe other wrapper names to identify the underlying compiler family.
+With a remote, a fallback wrapper, or a [read-only store](/docs/getting-started/configuration#read-only-store) configured, Kache runs the preprocessor first instead, so it can look up an existing entry before compiling. clang-cl, a caller that asks for `-MMD`, and some out-of-tree build layouts also take the preprocessor path.
+
+When a record exists but a file in it changed, Kache runs the preprocessor to rediscover the read set. It derives the same key a compile would, so it still finds an entry stored from an earlier state of the tree. A read set that includes a file the assembler opens on its own, or a file modified while the build ran, is compiled and not cached. `KACHE_DEFERRED_DISCOVERY=0` or `[cache] deferred_discovery = false` keeps the preprocessor as the discovery on every miss.
+
+On a miss Kache compiles with `SOURCE_DATE_EPOCH=0` unless the build exports its own value, so objects that use `__DATE__` or `__TIME__` stay identical between rebuilds and show the Unix epoch date. Set `KACHE_CC_SOURCE_DATE_EPOCH=passthrough` to stop Kache from setting it.
+
+Kache recognizes GCC, Clang, Apple Clang, clang-cl, versioned names such as `gcc-13`, target-prefixed compiler names, and cargo-zigbuild's `zigcc-*` wrappers. It can probe other wrapper names to identify the underlying compiler family.
 
 ## Preprocessor memos
 
@@ -128,11 +138,15 @@ Upgrading from the JSON memo format discards those memos once; units rediscover 
 
 ## Portability
 
-GCC and Clang entries can be reused across worktrees when source and build paths normalize cleanly. Set `KACHE_BASE_DIR` when the automatic roots do not cover a container mount or out-of-tree layout:
+GCC and Clang entries can be reused across worktrees when source and build paths normalize cleanly. On a miss Kache adds `-ffile-prefix-map` rules that map the checkout and Cargo's build directories to fixed names such as `/kache/cc-root`, so debug info and `__FILE__` in those objects name the fixed path.
+
+When the automatic roots do not cover a container mount or out-of-tree layout, set `KACHE_BASE_DIR` for one extra root, or list roots under `[paths] base_dirs` in the config file so everyone on the project uses the same rules:
 
 ```bash
 KACHE_BASE_DIR="$PWD" cmake --build build
 ```
+
+`KACHE_CC_PATH_NORMALIZE=0` turns the mapping off, and keys then depend on absolute paths. clang-cl ignores `-ffile-prefix-map`, so clang-cl keys always keep absolute paths and its entries are reused only from the same paths. When a miss traces to another checkout, `kache explain` names the setting to change.
 
 A configured remote publishes GCC and Clang objects the same way it publishes Rust entries. clang-cl debug objects stay on the machine because CodeView records paths that clang-cl does not remap.
 
@@ -141,7 +155,9 @@ A configured remote publishes GCC and Clang objects the same way it publishes Ru
 Kache currently passes through:
 
 - link and whole-program steps, unless `KACHE_CACHE_CC_LINKS` or `[cache] cache_cc_links` is on
+- assembly output (`-S`) and output to standard output (`-o -`)
 - multi-source or multi-architecture invocations
+- `-x` languages other than C, C++, Objective-C, Objective-C++, and assembly, such as `-x cuda` and `-x hip`, and `.cu` sources given to `cc` or `clang` (see [CUDA](/docs/getting-started/cuda) for `nvcc`)
 - response files
 - precompiled headers and modules
 - coverage and split-DWARF builds
@@ -163,7 +179,7 @@ You can opt a known-safe flag into the local model:
 
 ```toml title=".kache.toml"
 [cc]
-extra_allowlist_flags = ["-ffunction-sections"]
+extra_allowlist_flags = ["-fno-plt"]
 ```
 
 Kache folds the spelling into the key. Do not allow flags whose meaning depends on the host, such as `-march=native`.

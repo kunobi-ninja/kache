@@ -5,15 +5,17 @@ description: How Kache paces concurrent compiler processes without wrapping Carg
 
 ## Several Cargo builds at once
 
-Kache is a compiler wrapper, not a build frontend. Keep running `cargo`. Give each live build its own `CARGO_TARGET_DIR` (or `kache cargo`) so Cargo's fingerprints stay isolated.
+Kache is a compiler wrapper, not a build frontend. Keep running `cargo`. Give each live build its own `CARGO_TARGET_DIR` so Cargo's fingerprints stay isolated.
+
+Worktrees that share one target directory can run `kache cargo -- build` or `kache cargo -- check` instead: on Cargo 1.91 or newer it keeps each worktree's intermediate build state in that worktree's own `target/`, and final artifacts still go to the shared directory. Other Cargo commands, commands with `--config`, `-C` or `-Z`, and projects that already set a build directory keep Cargo's own layout.
 
 After a local and remote miss, the wrapper joins a machine-wide flight for its cache key, then takes a memory-weighted permit before the per-key build lock. Only compiles with the same key wait for each other. Two build scripts, two versions of a crate, or two `parser.c` files from different grammars compile in parallel. Warm predictions and passthroughs skip discovery coordination. An eligible Rust unit without a valid input prediction first waits for a peer discovering the same invocation, then validates the resulting prediction and computes its own key. Sources and environment remain local; only dependency paths beneath Cargo target directories can share an identity.
 
-The permit pool size is `std::thread::available_parallelism()`, with a floor of 1. Unmeasured compiles occupy one slot. Unmeasured rustc invocations that run the system linker (binaries, dylibs, cdylibs, and proc macros) occupy two. A library compile is not a link, even though Cargo asks it to emit `link`. On Unix, a real compile records the child's peak RSS by crate name. Later invocations of that crate occupy `ceil(rss / 512 MiB)` slots, clamped to the pool.
+The permit pool size is `std::thread::available_parallelism()`, with a floor of 1. Unmeasured compiles occupy one slot. Unmeasured rustc invocations that run the system linker (binaries, dylibs, cdylibs, and proc macros) occupy two. A library compile is not a link, even though Cargo asks it to emit `link`. On Unix, a real compile records the child's peak RSS by crate name. Later invocations of that crate occupy `ceil(rss / slot)` slots, clamped to the pool. A slot is the machine's memory divided by the pool size, and never less than 512 MiB. On Linux the memory is the smaller of physical memory and the cgroup's `memory.max`. Where the memory cannot be read, a slot is 512 MiB.
 
 The memory estimate cannot see what else is running: builds outside Kache, an editor, a browser. So the scheduler also checks whether the machine is short of memory. Under memory pressure a compile asks for the whole pool: it waits for the other compiles to finish, so they run one after another until pressure eases. Slots held by running tests still count against that as usual, so a test waiting on a compile cannot stall it. On macOS, pressure is the kernel's pressure level at warning or critical. On Linux it is memory PSI, some task stalled on memory for at least 10% of the last ten seconds, read from the process's cgroup when it has its own `memory.pressure` and from the host otherwise. Other systems report no pressure. Set `cache.scheduler_memory_pressure = false` or `KACHE_SCHEDULER_MEMORY_PRESSURE=0` to turn the check off.
 
-If the scheduler directory cannot be used, compilation continues without a permit. Set `KACHE_SCHEDULER=0` or `[cache] scheduler = false` to turn it off.
+If the scheduler directory cannot be used, compilation continues without a permit. A compile that has waited 30 minutes for a peer's compile or for free slots also continues without one. Set `KACHE_SCHEDULER=0` or `[cache] scheduler = false` to turn the scheduler off.
 
 Two cargo processes that miss the same crate still share one real compile when the first stores an entry the second can restore. Distinct target directories remain required.
 

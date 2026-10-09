@@ -52,8 +52,8 @@ For the details, read [cache keys](/docs/how-it-works/cache-key),
 
 | Area | Support |
 | --- | --- |
-| Rust libraries and build scripts | Linux, macOS, and Windows. Build-script runs are cached on Linux and macOS |
-| Rust executables | Enabled by default on Linux and macOS; disabled by default on Windows |
+| Rust libraries | Linux, macOS, and Windows |
+| Rust executables, test binaries and build scripts | Cached by default on Linux and macOS, off by default on Windows (`cache_executables`). Build-script runs are cached on Linux and macOS |
 | C and C++ object compilation | GCC, Clang, Apple Clang, and clang-cl. MSVC `cl.exe` is not cached |
 | CUDA object compilation | Single-source `nvcc -c` and `-dc` |
 | Rust documentation | Unix with compatible Cargo versions and [unstable rustdoc flags](/docs/getting-started/rustdoc). Rust 1.99 and Windows pass through |
@@ -61,12 +61,12 @@ For the details, read [cache keys](/docs/how-it-works/cache-key),
 | Remote cache | S3-compatible storage, GCS, filesystems, and OCI registries |
 | Build visibility | Live monitor, stats, miss explanations, and reports |
 
-Kache passes unsupported compiler invocations through unchanged. A passthrough is not a cache hit or miss; inspect its reason in the monitor's Why tab or debug logs.
+Kache passes unsupported compiler invocations through unchanged. A passthrough is not a cache hit or miss. Its reason appears in the monitor's Why tab and in the Not cached section of `kache stats --full`.
 
 ## Reference and measurements
 
 - [Command reference](/docs/commands/reference): commands, flags, and report formats.
-- [Compatibility](/docs/compatibility): supported platforms and upgrade contracts.
+- [Compatibility](/docs/compatibility): what stays stable across 1.x releases, and the Rust version needed to build from source.
 - [Architecture](/docs/how-it-works/architecture): wrapper, store, daemon, and planner.
 - [Daemon lifecycle](/docs/daemon/lifecycle): services, restarts, and environment changes.
 - [Benchmarks](/docs/benchmarks): real-project workloads, measurements, and validation.

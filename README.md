@@ -30,7 +30,7 @@ Then use Cargo as usual in your project. Kache caches eligible compiler work
 automatically.
 
 Cargo installation needs Rust 1.95 or newer. Prefer a prebuilt package?
-[Homebrew, APT, Windows packages, mise, and Nix →](https://kunobi.ninja/docs/kache/getting-started/installation)
+[Homebrew, APT, AUR, Windows packages, mise, and Nix →](https://kunobi.ninja/docs/kache/getting-started/installation)
 
 ## See it reuse a build
 

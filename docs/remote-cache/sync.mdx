@@ -21,7 +21,7 @@ Pull and push use different scopes:
 
 - Pull normally lists crates from `Cargo.lock` in the current directory. With no usable lockfile it falls back to listing the full remote.
 - `--workspace` lists only Cargo workspace members and fails if it cannot resolve the workspace. It conflicts with `--all`.
-- Inside a Cargo workspace, push uploads only workspace members, from `cargo metadata --no-deps`. With no `Cargo.toml` in the directory and no `--manifest-path`, it uploads every local entry. Build-script runs are never pushed.
+- Inside a Cargo workspace, push uploads only the workspace members' targets, from `cargo metadata --no-deps`. It uploads every local entry when the directory has no `Cargo.toml` and no `--manifest-path` is given, and also when `cargo metadata` fails on `./Cargo.toml` (Kache prints a warning). With `--manifest-path`, a failed `cargo metadata` uploads nothing. Build-script runs are never pushed. With remote writes off (`remote_readonly` or the [CI write policy](/docs/remote-cache/ci#who-may-write)), push uploads nothing.
 - `--manifest-path` selects the workspace for push and for `--workspace` pulls.
 
 Narrowing the initial pull does not disable on-demand dependency restores during a later daemon-backed build.
@@ -34,11 +34,11 @@ cargo build --release
 kache daemon stop
 ```
 
-The daemon uploads new entries in the background, dependencies included. `kache daemon stop` lets it finish its queued uploads before it exits. Inside a Cargo workspace, `kache sync --push` uploads only that workspace's own crates. Use it when you run without the daemon and those crates are what you want to publish.
+The daemon uploads new entries in the background, dependencies included. `kache daemon stop` gives its upload queue up to 30 seconds before it exits; see [CI setup](/docs/remote-cache/ci#other-ci-systems) for what happens to the rest. Inside a Cargo workspace, `kache sync --push` uploads only that workspace's own crates. Use it when you run without the daemon and those crates are what you want to publish.
 
 ## Failure behavior
 
-All scheduled operations drain before the command exits. Any transfer or import failure makes the command nonzero unless `--allow-partial` is set.
+All scheduled operations drain before the command exits. Any transfer or import failure makes the command nonzero unless `--allow-partial` is set. `--allow-partial` covers transfers and imports only. A remote Kache cannot connect to, or a listing that fails, still fails the command.
 
 `cache.s3_concurrency` / `KACHE_S3_CONCURRENCY` (default 16) controls parallel operations for all remote backends.
 

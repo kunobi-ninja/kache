@@ -22,15 +22,21 @@ The service in [`crates/kache-service`](https://github.com/kunobi-ninja/kache/tr
 
 The client rewrites an endpoint configured with the older `/v2/prefetch-plan` path to `/v1`. When no useful candidates exist, the service returns a fallback disposition and the client uses its normal planner.
 
-Planner state is stored in an embedded SQLite database, at the path given by `--db-path` / `KACHE_PLANNER_DB_PATH`. `kache save-manifest` writes manifests to the configured remote; it does not post them directly to this service. Current deployments seed or ingest that data separately.
+Planner state is stored in an embedded SQLite database, at the path given by `--db-path` / `KACHE_PLANNER_DB_PATH`. Build manifests go to the configured remote, never to this service: the daemon publishes one when a build session ends with remote writes on, and `kache save-manifest` publishes on demand.
+
+To load planner state, start the service with `--seed-state-file` (`KACHE_PLANNER_SEED_STATE_FILE`, chart value `planner.seedStateFile`). It replaces the planner state with that JSON file at every start. Build timelines are stored as sent and do not feed plans.
 
 ## Run locally
 
 ```bash
-cargo run -p kache-service
+cargo run -p kache-service -- --db-path ./planner.db
 ```
 
-The default bind address is `0.0.0.0:8080` and the default database path is `/var/lib/kache/planner.db`. Override them with `--bind` / `KACHE_PLANNER_BIND` and `--db-path` / `KACHE_PLANNER_DB_PATH`.
+Without `--db-path` the service creates `/var/lib/kache/planner.db`, which fails for a user who cannot write to `/var/lib`.
+
+The default bind address is `0.0.0.0:8080`. Override it with `--bind` / `KACHE_PLANNER_BIND`, and the database path with `--db-path` / `KACHE_PLANNER_DB_PATH`.
+
+Other flags: `--planner-name` (`KACHE_PLANNER_NAME`, default `planner`) and `--seed-state-file` (`KACHE_PLANNER_SEED_STATE_FILE`). `--timeline-max-compressed-bytes` (`KACHE_TIMELINE_MAX_COMPRESSED_BYTES`, default 8 MiB) and `--timeline-max-decoded-bytes` (`KACHE_TIMELINE_MAX_DECODED_BYTES`, default 32 MiB) cap the size of build timeline bodies. Leader election uses `--ha-enabled` (`KACHE_HA_ENABLED`), `--ha-namespace` (`KACHE_HA_NAMESPACE`, default the pod's namespace) and `--ha-lease-name` (`KACHE_HA_LEASE_NAME`, default `kache-service`). `KACHE_LOG` sets the log filter, default `kache_service=info`.
 
 To require a bearer token, see [Authentication](#authentication).
 
@@ -44,7 +50,7 @@ With no provider configured, the planner accepts anonymous requests. Configure a
 | Kunobi login (OIDC) | `--oidc-issuer` (`KACHE_PLANNER_OIDC_ISSUER`), `--oidc-client-id` (`KACHE_PLANNER_OIDC_CLIENT_ID`) | run `kache login` once |
 | GitHub Actions OIDC | `--github-oidc-audience` (`KACHE_PLANNER_GITHUB_AUDIENCE`), `--github-owner` (`KACHE_PLANNER_GITHUB_OWNERS`, comma list) | job has `permissions: id-token: write` |
 
-**Kunobi login.** Register a public OAuth client (PKCE, no secret) with redirect URI `http://localhost:8329/callback` and scopes `openid profile email offline_access`. Enable the device grant for `kache login --device`. The client id is the accepted token audience. The service advertises the issuer and client id at `/.well-known/kunobi-auth`, which is how `kache login` finds them.
+**Kunobi login.** Register a public OAuth client (PKCE, no secret) with redirect URI `http://localhost:8329/callback` and scopes `openid profile email offline_access`. Enable the device grant for `kache login --device`. The client id is the accepted token audience. The service advertises the issuer and client id at `/.well-known/kunobi-auth`, which is how `kache login` finds them. Set `--oidc-issuer` and `--oidc-client-id` together; the service refuses to start with only one. It fetches the issuer's keys from `<issuer>/.well-known/jwks.json` and accepts RS256 tokens only, so an issuer that publishes its keys elsewhere does not work.
 
 **GitHub Actions.** Tokens must carry the configured audience, and their `repository_owner` claim must match one of the `--github-owner` values (case-insensitive). The service refuses to start with an audience but no owner, since that would trust every repository on GitHub. The Kache client fetches the job's token itself when `ACTIONS_ID_TOKEN_REQUEST_URL` is present. Its audience is the planner's base URL (for example `https://kache.example.com`), which binds the token to this planner so no other endpoint can replay it. Set the service's `--github-oidc-audience` to that URL.
 
@@ -77,6 +83,10 @@ export KACHE_PLANNER_ENDPOINT=http://kache-service.namespace.svc.cluster.local:8
 export KACHE_PLANNER_TOKEN=secret-if-required
 ```
 
+The same settings live in TOML under `[cache.planner]` as `endpoint`, `token` and `timeout_ms` (default 750 ms).
+
+A plain `http://` URL like the one above carries only `KACHE_PLANNER_TOKEN`. Kache sends GitHub Actions tokens and Kunobi sessions only over HTTPS or to a loopback address, so clients that use those providers need the HTTPS Ingress URL, which is also the value for `auth.githubOidc.audience`.
+
 To reach it from outside the cluster, enable the Ingress:
 
 ```yaml title="values.yaml"
@@ -88,15 +98,11 @@ ingress:
     cert-manager.io/cluster-issuer: letsencrypt
   tls:
     enabled: true
-service:
-  appProtocol: kubernetes.io/h2c
 ```
 
-Build sessions use one HTTP/2 stream per build, so set `service.appProtocol` to `kubernetes.io/h2c` behind an Ingress. The service speaks HTTP/1.1 and HTTP/2 on the same port.
+The service speaks HTTP/1.1 only, so leave `service.appProtocol` empty. An Ingress told that the backend speaks `kubernetes.io/h2c` sends HTTP/2 that the service cannot answer.
 
 The Ingress does not add authentication. Configure [a provider](#authentication) before you expose the service beyond a trusted network.
-
-The equivalent TOML is under `[cache.planner]`.
 
 ## Persistence and HA
 
@@ -119,4 +125,6 @@ ha:
   leaseName: kache-service
 ```
 
-Followers remain live but not ready. If replicas share one embedded database, the volume must support their mount pattern; otherwise keep one replica.
+Followers stay live but report not ready, so the Service routes requests to the leader.
+
+`pvc` storage has a single writer: the chart refuses a `replicaCount` above 1 with it and upgrades with the `Recreate` strategy, so the planner is briefly down during an upgrade. For several replicas, keep the default `ephemeral` storage. Each replica then has its own database, and a replica that becomes leader starts from the seed file when one is set, otherwise from whatever its own database holds.

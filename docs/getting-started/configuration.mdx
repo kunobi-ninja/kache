@@ -10,7 +10,7 @@ Kache resolves settings in this order:
 3. [host config](#host-config)
 4. built-in default
 
-`KACHE_DISABLED`, `KACHE_CONFIG`, `KACHE_HOST_CONFIG`, `KACHE_SOCKET_PATH`, logging controls, progress controls, and credentials are operational settings. They do not all have TOML equivalents.
+Some settings exist only as environment variables, among them `KACHE_DISABLED`, `KACHE_CONFIG`, `KACHE_HOST_CONFIG`, `KACHE_SOCKET_PATH`, `KACHE_TRUST_DOMAIN`, the logging and progress controls, and the S3 and OCI credentials. Where the tables below list one, its TOML key is `none`.
 
 ## Config file
 
@@ -26,7 +26,13 @@ Or edit TOML directly. Kache chooses the first file in this order:
 2. the nearest `.kache.toml`, walking up from the current directory
 3. `$XDG_CONFIG_HOME/kache/config.toml` or `~/.config/kache/config.toml`
 
-The editor covers common fields and preserves advanced tables it does not expose.
+Kache reads only that one file, plus the [host config](#host-config); a `.kache.toml` does not merge with your user config.
+
+Each process walks up from its own current directory. Cargo compiles packages under the workspace root from the workspace root, but compiles registry and git dependencies, and runs their build scripts, from each package's source directory under `$CARGO_HOME`, so those compiles do not see your project's `.kache.toml`. A daemon that a build starts resolves its file from the directory of the compile that started it, which can be a dependency's source directory. To apply a setting to every compile and to the daemon, put it in your user config or the host config, or point `KACHE_CONFIG` at the file.
+
+If the chosen file is not valid TOML, or a key has the wrong type, Kache ignores the whole file, and the host config with it, and runs on environment variables and defaults without a warning. Size keys (`local_max_size`, `event_log_max_size`, `prefetch_max_bytes`) take quoted strings such as `"50GiB"`.
+
+The editor covers common fields and keeps the other settings Kache knows. Saving rewrites the whole file: comments and keys Kache does not recognize are dropped, and a file that does not parse is replaced. The editor asks before it first overwrites an existing file.
 
 ```toml title="~/.config/kache/config.toml"
 [cache]
@@ -38,7 +44,7 @@ bucket = "my-build-cache"
 region = "us-east-1"
 ```
 
-Use `type = "filesystem"` with `path = "/mnt/kache"` for a shared filesystem remote. Only `s3` and `filesystem` are compiled remote backends.
+Use `type = "filesystem"` with `path = "/mnt/kache"` for a shared filesystem remote. Kache also supports `gcs` and `oci` remotes; see [Remote settings](#remote-settings).
 
 ### Host config
 
@@ -52,9 +58,9 @@ local_max_size = "200GiB"
 ```
 
 - `[cache.remote]`, `[cache.planner]` and `[cache.volumes]` are replaced whole. If the chosen file declares one, none of the host file's keys for it apply.
-- A remote set only through `KACHE_S3_*` variables also replaces the host remote, as long as the chosen file declares no `[cache.remote]`. The same goes for `KACHE_PLANNER_*` and `[cache.planner]`, so a host planner token is never sent to an endpoint the environment picked.
+- A remote set only through `KACHE_S3_*` variables also replaces the host remote, as long as the chosen file declares no `[cache.remote]`. The same goes for `KACHE_PLANNER_*` and `[cache.planner]`, so a host planner token is never sent to an endpoint the environment picked. A daemon started by a build, `kache daemon start` or `kache daemon restart` does not inherit the variables that select the remote, so it uses the host remote; Kache warns when it starts one that way.
 - The host file never contributes `[workspace]` declarations. Those belong to a project's `.kache.toml`.
-- The host file cannot set `ignore_env`. Kache ignores it with a warning, so environment variables always win over both files.
+- The host file cannot set `ignore_env`. Kache ignores it with a warning, so the host file can never turn environment overrides off. Only the chosen file can; see [Pin file-backed settings](#pin-file-backed-settings).
 - A host file that cannot be read or parsed is ignored with a warning. `kache doctor` reports it, and lists each host key with whatever overrides it.
 - `KACHE_HOST_CONFIG` reads another path instead. An empty value turns the host layer off.
 - `kache config` edits the chosen file, never the host file.
@@ -64,12 +70,12 @@ local_max_size = "200GiB"
 | Environment | TOML key | Default | Purpose |
 | --- | --- | --- | --- |
 | `KACHE_CACHE_DIR` | `cache.local_store` | OS cache directory | Persistent store |
-| `KACHE_TRUST_DOMAIN` | none | unset | Isolate the local store under `$KACHE_CACHE_DIR/<label>/`. One path component (`[A-Za-z0-9._-]`). Invalid labels are ignored. Do not set this on public or fork jobs. |
+| `KACHE_TRUST_DOMAIN` | none | unset | Isolate the local store under `<cache dir>/<label>/`; a runtime dir left at its default moves with it. The label is one path component of up to 64 characters from `[A-Za-z0-9._-]`, and not `.` or `..`. Invalid labels are ignored with a warning. Do not set this on public or fork jobs. |
 | `KACHE_RUNTIME_DIR` | `cache.runtime_dir` | local store | Socket, locks, logs, state, and session markers |
 | `KACHE_READONLY_STORE` | `cache.readonly_store` | unset | Another store on this machine to read after the local one, never written. See [Read-only store](#read-only-store). |
 | none | `cache.volumes` | unset | Volume-local store shards, e.g. `[cache.volumes] "D:" = "D:/kache-store"`. Builds on a mapped volume share inodes there instead of copying across mounts. Unmapped volumes use the main store. GC sweeps each shard with its own budget; see [Volume shards](#volume-shards). |
 | `KACHE_SOCKET_PATH` | none | `<runtime_dir>/daemon.sock` | Absolute daemon endpoint override |
-| `KACHE_MAX_SIZE` | `cache.local_max_size` | 5% of the cache disk, floored at 5GiB and capped at 100GiB | Registered blob bytes allowed before GC. An explicit size always wins. `none` is not allowed. |
+| `KACHE_MAX_SIZE` | `cache.local_max_size` | 5% of the cache disk, rounded to the nearest GiB, floored at 5GiB and capped at 100GiB; 50GiB when the disk size cannot be read | Registered blob bytes allowed before GC. An explicit size always wins. `none` is not allowed. |
 | `KACHE_AUTO_GC` | `cache.auto_gc` | `true` | Spawn throttled background GC under size pressure |
 | `KACHE_GC_MAX_AGE_HOURS` | `cache.gc_max_age_hours` | `0` | Automatic age retention; `0` disables it |
 | `KACHE_GC_EVICT_SHARED` | `cache.gc_evict_shared` | `false` | Restore namespace-first GC for entries retained by build outputs |
@@ -81,13 +87,13 @@ local_max_size = "200GiB"
 | `KACHE_TARGET_LIVENESS` | `cache.target_liveness` | `false` | Record successful Cargo build/check commands for exact-scope unit cleanup; see [Recorded-command cleanup](#recorded-command-cleanup). |
 | `KACHE_AUTO_CLEAN_UNUSED_UNITS_DAYS` | `cache.auto_clean_unused_units_days` | `30` | Let the daemon remove, from target directories still in use, build units no build has used for this many days; `0` disables it. See [Unused build units](#unused-build-units). |
 | `KACHE_SEED_NEW_TARGETS` | `cache.seed_new_targets` | `true` | Copy another checkout's registry build units into a target directory Cargo has not built yet. See [New checkouts](#new-checkouts). |
-| `KACHE_MIN_STORE_COMPILE_MS` | `cache.min_store_compile_ms` | `0` | Skip local retention for faster compiles; `0` stores all eligible results |
+| `KACHE_MIN_STORE_COMPILE_MS` | `cache.min_store_compile_ms` | `0` | Do not store results whose compile took less than this many milliseconds; `0` stores all eligible results. Ignored for a result that publishes to a writable remote, because the upload reads the local entry |
 | `KACHE_COMPRESSION_LEVEL` | `cache.compression_level` | `3` | Zstd level, clamped to 1 through 22 |
 | none | `cache.event_log_max_size` | `64MiB` | Rotate the event log after this size. Rotation keeps the build in progress, up to half this size |
 | none | `cache.event_log_keep_lines` | `1000` | Minimum lines retained when the event log rotates |
 | `KACHE_DISABLED` | none | `false` | Pass all compiler work through when set to `1` or `true` |
 | `KACHE_LOCAL_ONLY` | `cache.local_only` | `false` | Ignore all remote and planner configuration while keeping local caching |
-| `KACHE_REMOTE_READONLY` | `cache.remote_readonly` | `false` | Allow remote reads but suppress remote writes. Untrusted CI (pull requests, tags, unprotected branches) also forces this on; `=0` does not turn that off. |
+| `KACHE_REMOTE_READONLY` | `cache.remote_readonly` | `false` | Allow remote reads but suppress remote writes. On GitHub Actions and GitLab CI, every job except a push to a protected branch is also forced read-only, and `=0` does not turn that off. A pull request job with `pull_request_prefix` set writes under that prefix instead, unless this setting is on or the remote is OCI. See [Who may write](/docs/remote-cache/ci#who-may-write). |
 | `KACHE_SCHEDULER` | `cache.scheduler` | `true` | Pace real compiler processes across concurrent builds after a miss. Hits and passthroughs never wait. `0` or `false` turns it off. With the [test runner](#test-runner), it paces test binaries too. |
 | `KACHE_SCHEDULER_MEMORY_PRESSURE` | `cache.scheduler_memory_pressure` | `true` | Under memory pressure, run compiles one after another. See [Limits](/docs/how-it-works/limits). |
 
@@ -97,7 +103,7 @@ On macOS the default store is `~/Library/Caches/kache`; on Linux it is `$XDG_CAC
 
 Several `cargo test` runs on one machine each start a test thread per CPU. `kache test-runner` makes test binaries wait for slots in the scheduler's pool instead, the same pool compiles use.
 
-On Unix, `kache init` offers to turn it on for every project. It adds this line to your shell startup file, with your machine's target in the name:
+On Unix, `kache init` turns it on for every project unless you pass `--no-shell`. It adds this line to your shell startup file, with your machine's target in the name:
 
 ```bash
 [ -n "${CARGO_TARGET_AARCH64_APPLE_DARWIN_RUNNER-}" ] || CARGO_TARGET_AARCH64_APPLE_DARWIN_RUNNER='kache test-runner'; export CARGO_TARGET_AARCH64_APPLE_DARWIN_RUNNER
@@ -161,7 +167,7 @@ Every automatic sweep records the store size it ended at, whichever of the three
 
 `auto-gc-backoff.json` also keeps the bytes the last sweep found held by target directories. For 6 hours the trigger compares the store size minus those bytes with 110% of `local_max_size`, so a store over budget only on held bytes starts no sweep. Deleting a worktree frees what it held without changing the store size; after 6 hours the trigger uses the full size again, and the next sweep measures anew.
 
-Automatic sweeps also keep entries downloaded from the remote in the last 6 hours, whether a build has used them yet or not. A CI job that imports a warm set and then runs several cargo commands keeps that set for the whole job; without this, an upload between two commands could evict what the next command needs. If those entries alone keep the store over budget, the sweep stops and backs off as described above. `kache gc` does not keep them.
+Automatic sweeps also keep entries downloaded from the remote in the last 6 hours, whether a build has used them yet or not. A CI job that downloads entries from the remote and then runs several cargo commands keeps them for the whole job; without this, an upload between two commands could evict what the next command needs. If those entries alone keep the store over budget, the sweep stops and backs off as described above. `kache gc` does not keep them.
 
 A sweep pauses for 150 ms after every 50 ms of index writes, and after each removal that finds a build holding the index write lock, so the sweep does not hold up builds that are storing entries.
 
@@ -500,6 +506,7 @@ Workspace rules are accepted only from the `.kache.toml` beside the active Cargo
 | `KACHE_S3_USER_AGENT` | `cache.remote.user_agent` | none | Custom HTTP User-Agent |
 | none | `cache.remote.path` | none | Filesystem remote root |
 | none | `cache.remote.atomic_write_dir` | `<path>/.kache-tmp` | Same-filesystem staging directory |
+| `KACHE_PULL_REQUEST_PREFIX` | `cache.remote.pull_request_prefix` | none | In a pull request job (a GitHub `pull_request` event or a GitLab merge request pipeline), read this prefix after `prefix` and write only here. It must differ from `prefix`, and neither may contain the other. OCI remotes stay read-only. See [A prefix for pull requests](/docs/remote-cache/ci#a-prefix-for-pull-requests). |
 | `KACHE_S3_CONCURRENCY` | `cache.s3_concurrency` | `16` | Concurrent operations for all remote backends |
 | `KACHE_S3_POOL_IDLE_SECS` | `cache.s3_pool_idle_secs` | `300` | S3 connection pool idle time |
 | `KACHE_REMOTE_RESTORE_TIMEOUT_SECS` | `cache.remote_restore_timeout_secs` | `300` | Daemon operation deadline; wrapper demand remains capped at three seconds |
@@ -530,12 +537,13 @@ See [Remote cache](/docs/remote-cache/overview) for setup guides and credential 
 | `KACHE_REMOTE_KEY_LISTING` | `cache.remote_key_listing` | `false` for S3, GCS, and OCI; `true` for a filesystem remote | List the remote's keys, for the fallback planner's key index and packed-prefetch catalogs; on S3 this needs `s3:ListBucket` |
 | `KACHE_REMOTE_KEY_CACHE_REFRESH_SECS` | `cache.remote_key_cache_refresh_secs` | `60` | Refresh the remote key index while listing is on; `0` means initial load only |
 | `KACHE_PREFETCH_MAX_KEYS` | `cache.prefetch_max_keys` | `2000` | Entries allowed per plan; `0` is unlimited |
-| `KACHE_PREFETCH_MAX_BYTES` | `cache.prefetch_max_bytes` | `2GiB` | Compressed bytes allowed per plan; in-flight downloads may finish |
+| `KACHE_PREFETCH_MAX_BYTES` | `cache.prefetch_max_bytes` | `2GiB` | Compressed bytes allowed per plan; `0` is unlimited. In-flight downloads may finish. In TOML the value is a quoted size, such as `"4GiB"` or `"0"` |
 | `KACHE_PREFETCH_DEADLINE_SECS` | `cache.prefetch_deadline_secs` | `300` | Time during which a plan may start downloads; `0` disables the deadline |
 | `KACHE_PLANNER_ENDPOINT` | `cache.planner.endpoint` | none | Planner service URL |
 | `KACHE_PLANNER_TIMEOUT_MS` | `cache.planner.timeout_ms` | `750` | Planner request timeout |
 | `KACHE_PLANNER_TOKEN` | `cache.planner.token` | none | Bearer token |
 | `KACHE_NAMESPACE` | none | none | Shard namespace used by manifest upload and prefetch |
+| `KACHE_MIN_COMPILE_MS` | none | `1000` | Manifest prefetch skips entries whose recorded compile time is below this many milliseconds, because recompiling them costs less than downloading. Read by the daemon |
 
 On a long-lived runner with a warm local store, speculative prefetch may be unnecessary:
 
@@ -551,10 +559,10 @@ Exact remote lookup and background upload continue to work.
 A planner that requires authentication gets a bearer from the first of these that applies:
 
 1. `KACHE_PLANNER_TOKEN` / `cache.planner.token`, when set.
-2. In GitHub Actions, the job's OIDC ID token. Its audience is the planner's base URL, so no other endpoint can replay it. The job needs `permissions: id-token: write`, and the planner must trust the repository's owner.
+2. A workload token. In GitHub Actions, Kache requests the job's OIDC ID token with the planner's base URL as its audience, so no other endpoint can replay it; the job needs `permissions: id-token: write`. Otherwise it sends a GitLab CI ID token from `KUNOBI_ID_TOKEN`, or a Kubernetes service-account token read from the file named by `KUNOBI_SA_TOKEN_FILE`. Kache does not choose the audience of those two, so set it to the planner's base URL where you mint them. The planner must trust the token; of these, `kache-service` accepts only GitHub Actions tokens, from the repository owners it lists.
 3. Your Kunobi session. Run `kache login` once: it trusts this planner and stores a session that the daemon refreshes from then on. The session is kept per planner client, so it never replaces another Kunobi tool's login.
 
-Kache sends the OIDC token and the session only to a planner reached over HTTPS (or on loopback), and the session only to a planner you logged in to. A planner URL picked up from a project's config therefore cannot collect your credentials. Use `kache login --device` on a machine without a browser, and `kache logout` to revoke it.
+Kache sends a workload token and the session only to a planner reached over HTTPS (or on loopback), and the session only to a planner you logged in to. A planner URL picked up from a project's config therefore cannot collect your credentials. Use `kache login --device` on a machine without a browser, and `kache logout` to revoke it.
 
 A build never prompts for a login. Without a usable bearer the planner answers 401 and Kache plans locally, the same as when the planner is unreachable. If the planner's login issuer changes after you first trusted it, `kache login` refuses; run `kache login --retrust` when the change is expected.
 
@@ -610,9 +618,10 @@ Every GC driver (the daemon's sweep and its eviction after an upload, the auto-G
 | `KACHE_SHARED_HARDLINK_RESTORES` | `cache.shared_hardlink_restores` | `false` | Let every target directory hardlink the same store blob on filesystems without reflink. Only for single-use target directories (a CI job's tree): the restore-time mtime stamp on a shared inode re-dates the artifact in every other tree that links it. |
 | `KACHE_PROGRESS` | none | off | `hits` or `verbose` compiler progress |
 | `KACHE_LOG` | none | CLI: `kache=warn`; wrapper: off | Stderr tracing filter |
-| `KACHE_LOG_FILE` | none | CLI/daemon: `kache=info`; wrapper: off | File tracing filter and wrapper opt-in |
+| `KACHE_LOG_FILE` | none | CLI/daemon: `kache=info`; wrapper: off | File tracing filter and wrapper opt-in. The file is `~/Library/Logs/kache/kache.log` on macOS and `kache.log` in the default store directory elsewhere, even when `KACHE_CACHE_DIR` or `cache.local_store` moves the store. A process that starts while it is over 5 MiB truncates it |
 | `KACHE_EVENT_ROOT` | none | detected | Root attached to events for report filtering |
 | `KACHE_PAGER` | none | platform pager | Pager command for `kache list` |
+| `KACHE_MAX_DIAGNOSTICS_BYTES` | none | unset | Cap, in bytes, on the compiler diagnostics stored with an entry. Unset stores them in full, so a hit replays exactly what the compile printed. Above the cap they are truncated with a marker |
 
 ## Pin file-backed settings
 
@@ -623,6 +632,6 @@ Set `cache.ignore_env` in a controlled project config to ignore environment over
 ignore_env = true
 ```
 
-It does not suppress `KACHE_DISABLED`, `KACHE_CONFIG`, `KACHE_HOST_CONFIG`, `KACHE_SOCKET_PATH`, credentials, logging, progress, or other environment-only controls. Kache warns when it ignores a set variable.
+It does not suppress `KACHE_DISABLED`, `KACHE_CONFIG`, `KACHE_HOST_CONFIG`, `KACHE_SOCKET_PATH`, `KACHE_TRUST_DOMAIN`, S3 and OCI credentials, logging, progress, or other environment-only controls. It does suppress `KACHE_PLANNER_TOKEN`, which has a TOML key. Kache warns when it ignores a set variable.
 
-The daemon reads configuration at startup and watches the active config file and the host config. File changes trigger a graceful restart. Environment changes require starting a new daemon from that environment; an installed service uses its service definition, not your current shell.
+The daemon reads configuration at startup and watches the active config file and the host config. When either changes, the daemon drains and exits, and the next start loads the new settings. Other settings come from the environment the daemon started with. A daemon started by a build, `kache daemon start` or `kache daemon restart` drops the variables that select the remote (`KACHE_S3_BUCKET`, `KACHE_S3_ENDPOINT`, `KACHE_S3_REGION`, `KACHE_S3_PREFIX`, `KACHE_S3_PROFILE`, `KACHE_S3_USER_AGENT` and `KACHE_LOCAL_ONLY`), so set those in the config file, or run `kache daemon run` from that environment. An installed service uses its service definition, not your current shell. See [Updates and config changes](/docs/daemon/lifecycle#updates-and-config-changes).

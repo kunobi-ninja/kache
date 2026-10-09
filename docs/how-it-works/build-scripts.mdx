@@ -21,16 +21,32 @@ shell would drop: Cargo spells a `links` dependency's metadata keys as the
 script printed them, so Tauri's `cargo:core:window__...` arrives as
 `DEP_TAURI_CORE:WINDOW__...`.
 
+The launcher runs a copy of Kache pinned in the profile directory under
+`.kache-build-script-shims/`, a hardlink where the filesystem allows one. After
+an upgrade, existing launchers keep running the copy they were installed with
+until their script is rebuilt or the target directory is cleaned. If that copy
+is gone, the launcher runs the script directly, uncached.
+
+On macOS, Kache runs the script with `ZERO_AR_DATE=1` unless the variable is
+already set, so archives the script builds with `ar` or `libtool` come out the
+same on every run.
+
 ## What a run is keyed on
 
 Kache reuses Cargo's own rule for when a build script must rerun. A recorded run
 is restored only when all of these match:
 
 - the script binary's content hash;
-- the environment Cargo provides (`CARGO_*`, `DEP_*`, `TARGET`, `HOST`,
-  `PROFILE`, `OPT_LEVEL`, `DEBUG`, `RUSTC`, `PKG_CONFIG_*`), with the
-  checkout, target and Cargo home roots replaced by placeholders, and the
-  content behind every `DEP_*` path;
+- the values of these variables: `CARGO_CFG_*`, `CARGO_FEATURE_*`,
+  `CARGO_PKG_*`, `DEP_*`, `CARGO_ENCODED_RUSTFLAGS`, `CARGO_MANIFEST_DIR`,
+  `CARGO_MANIFEST_LINKS`, `CARGO_MANIFEST_PATH`, `TARGET`, `HOST`, `PROFILE`,
+  `OPT_LEVEL`, `DEBUG`, `RUSTC`, `RUSTC_LINKER`, `RUSTDOC`, `PKG_CONFIG_PATH`,
+  `PKG_CONFIG_LIBDIR`, `PKG_CONFIG_SYSROOT_DIR` and `PKG_CONFIG_ALLOW_CROSS`,
+  with `OUT_DIR`, the package directory, the target directory and the Cargo
+  home replaced by placeholders. A `DEP_*` value that names an existing
+  absolute path is also keyed by what is there. `NUM_JOBS` and the jobserver
+  variables are left out;
+- on macOS, the `ZERO_AR_DATE` value the script runs with;
 - the values of every variable the script declared with
   `cargo:rerun-if-env-changed`;
 - the content of every path the script declared with `cargo:rerun-if-changed`
@@ -42,14 +58,43 @@ is restored only when all of these match:
   binds the run to its package directory. Such runs can be reused across
   target directories in one checkout. Use a package-relative declaration
   to share them across checkouts;
-- the `OUT_DIR` path, when anything the script wrote spells a machine-local
-  root;
+- for each machine-local root a recorded file spells and Kache could not
+  rewrite, that root's value. A UTF-8 text file in which every path starts at
+  `OUT_DIR`, the package directory, the target directory or the Cargo home
+  (web and Git URLs aside) is stored with placeholders and written back with
+  the current paths, so it does not tie the run to them. Any other file that
+  names one of those roots, or `KACHE_BASE_DIR`, ties the run to that root:
+  objects that name registry sources restore wherever the Cargo home is the
+  same, and a file that names its own `OUT_DIR` restores only under that
+  `OUT_DIR`;
 - the operating system and architecture, and the configured key salt.
 
-A hit empties `OUT_DIR`, restores the recorded files, directories, modes and
-symlinks, and replays the recorded stdout and stderr with the current paths
-substituted.
+Two settings let more runs match across checkouts. A keyed variable that uses
+`KACHE_BASE_DIR` as the source of a path prefix map
+(`-ffile-prefix-map=<checkout>=.`, its `-fdebug-`, `-fmacro-` and `-fprofile-`
+forms, or `--remap-path-prefix`) keys that flag the same in every checkout;
+`KACHE_BASE_DIR` anywhere else in a value gets no special treatment. With
+`RUSTC`, `RUSTC_LINKER` or `RUSTDOC` listed in `cache.path_only_env_vars`, a
+tool under `KACHE_BASE_DIR` is keyed by its path below that directory and by
+its contents, and a run during which the tool changes is not recorded. See
+[Cache-key controls](/docs/getting-started/configuration#cache-key-controls).
+
+A hit empties `OUT_DIR` and restores the recorded files, directories,
+executable bits and symlinks. It also writes back what the script named under
+the target directory, outside `OUT_DIR`, as a link search path or linker input
+(`cargo:rustc-link-search=<target>/debug/gn_out/obj`, a `-L` in
+`rustc-link-arg` or `rustc-flags`, or an absolute file in `rustc-link-arg`), so
+the replayed line finds its library. Directories Cargo fills itself (`deps`,
+`incremental`, `build`, `.fingerprint`, `examples`) and paths outside the
+target directory are not recorded. Then it replays the recorded stdout and
+stderr with the current paths substituted.
 Entries stay in the local store: `kache sync` never uploads them.
+
+Runs appear in build reports (`kache stats --full`) as `build_script_run`, with
+the package name. A restored run is a `local_hit` and a recorded one a `miss`.
+When Kache bypasses the cache or does not record a successful run, the event is
+a `passthrough` whose reason says `build-script cache bypassed` or
+`build-script run not recorded`, with the cause.
 
 ## What is not cached
 
@@ -61,11 +106,16 @@ Entries stay in the local store: `kache sync` never uploads them.
   more on the tree it left and records that run instead; Cargo sees only the
   second run's output. A script whose second run writes into its inputs again
   is not run twice after that.
-- An `OUT_DIR` over 1 GiB, with more than 50,000 non-empty files and symlinks
-  together, or with a symlink whose target is absolute or does not follow
-  this rule: climb no higher than `OUT_DIR` with leading `..`, then only
-  descend. A link that follows it, such as `libfoo.so -> libfoo.so.1`, is
-  recorded and restored as a link, on Unix.
+- An `OUT_DIR` and named target files that together pass 1 GiB or 50,000
+  non-empty files and symlinks, a named target path that is itself a symlink,
+  or a symlink in `OUT_DIR` or a named directory whose target is absolute or
+  does not follow this rule: climb no higher than that directory with leading
+  `..`, then only descend. A link that follows it, such as
+  `libfoo.so -> libfoo.so.1`, is recorded and restored as a link, on Unix.
+- A run whose stdout is not UTF-8, or whose `OUT_DIR` holds a name that is not
+  UTF-8 or an entry other than a file, directory or symlink.
+- A script whose declared inputs add up to more than 100,000 files and
+  directories.
 - Windows, where no launcher is installed.
 
 ## Hermetic runs
@@ -79,10 +129,14 @@ shares the key sees the same path. Values the script derives from `OUT_DIR`
 The regular cache cannot check for such values.
 
 - The key covers everything the regular key does, with every value as the
-  script sees it rather than with roots replaced, except `OUT_DIR`.
-- The script runs from a copy of its binary beside that `OUT_DIR`, with
-  `CARGO_TARGET_DIR` pointing at the same directory and without `PWD` and
-  `OLDPWD`.
+  script sees it rather than with roots replaced. `OUT_DIR` counts only by
+  where it sits below the target directory, and
+  `cargo:rerun-if-env-changed=OUT_DIR` by its name.
+- The key's directory repeats the layout below the target directory, with
+  `OUT_DIR` at the same place. The script runs from a copy of its binary in
+  that directory, with `CARGO_TARGET_DIR` set to it, without `PWD` and
+  `OLDPWD`, and with entries under the real target directory removed from
+  `LD_LIBRARY_PATH`, `DYLD_LIBRARY_PATH` and `DYLD_FALLBACK_LIBRARY_PATH`.
 - A run is kept only when it succeeds, declares the inputs its key was computed
   from, leaves them unchanged, writes nothing outside `OUT_DIR`, and creates
   only relative symlinks that climb no higher than `OUT_DIR` with leading `..`
@@ -114,20 +168,24 @@ read-only `OUT_DIR`. A target directory seeded from one built with hermetic
 runs has these links too, even if it never builds with
 `KACHE_BUILD_SCRIPT_HERMETIC=1`.
 
-A run that cannot be kept is remembered per key, so its script runs once, as
-usual, on later builds instead of twice.
+A run that cannot be kept is remembered per key for seven days, or until the
+cache is emptied, so its script runs once, as usual, on later builds instead of
+twice.
 
 ## Limits
 
-Without hermetic runs, a result is restored in another target directory when
-nothing it wrote spells a machine-local root. A value the script derives from
-such a root without spelling it is restored unchanged, and can be wrong there.
+Without hermetic runs, a result restores in another target directory when each
+recorded file that names a machine-local root is text Kache rewrote, or that
+root has the same value there, such as a Cargo home both checkouts share. A
+value the script derives from a root without spelling it, such as its length or
+a hash, is restored unchanged and can be wrong there.
 
 The key covers what Cargo compares. It does not cover state a script probes
 without declaring it: system libraries, `pkg-config` results, or tools found on
 `PATH`. Cargo has the same blind spot with a warm target directory; with Kache
-it also survives `cargo clean`. Side effects outside `OUT_DIR` and the package
-directory are not replayed either.
+it also survives `cargo clean`. Side effects outside `OUT_DIR` and the target
+files a script names as link inputs, such as files it writes into its package
+directory, are not replayed either.
 
 Set `KACHE_BUILD_SCRIPT_CACHE=0` to run every build script. Existing launchers
 then run the preserved binary directly.

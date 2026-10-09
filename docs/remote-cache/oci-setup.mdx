@@ -21,7 +21,12 @@ auth expires. Without configured credentials, it connects anonymously.
 
 For CI, set `KACHE_OCI_USERNAME` and `KACHE_OCI_PASSWORD`, or set
 `KACHE_OCI_TOKEN` alone. Environment credentials take precedence over Docker
-config. Daemons inherit credentials at startup; restart after changing their
+config. Any other combination, or an empty value, is an error, and the remote
+stays unusable, reads included, until it is fixed; `kache doctor` reports it.
+Leave the variables unset rather than empty, for example in fork pull request
+jobs that do not receive the secret.
+
+Daemons inherit credentials at startup; restart after changing their
 environment. Set credentials in the installed service's environment when it
 runs independently of your shell. Keep secrets out of `config.toml`.
 
@@ -37,8 +42,12 @@ OCI does not guarantee conditional tag writes. Kache uses its ordinary-write
 fallback, so concurrent publishers can overwrite merged build metadata.
 Use a single publisher when that metadata must retain every update.
 
-Keep cache artifacts in a dedicated repository and configure its retention
-policy to retain the cache tags.
+Keep cache artifacts in a dedicated repository. Kache never deletes tags, so
+the repository grows until a retention policy removes them. Every object is its
+own tag, named from an encoding or a hash of its whole key, so a tag rule cannot
+reliably give entry manifests, packs and build manifests different ages: expire
+every `kache-v2-` and `kache-v1-` tag at the same age. See
+[Bound a remote](/docs/remote-cache/bounding).
 
 ## Local HTTP registry
 
@@ -52,6 +61,11 @@ digests. Listing recovers those keys from tag pages. Keys too long for an OCI
 tag use a hash instead; listing reads their manifests to recover the
 `ninja.kunobi.kache.key` annotation. Existing `kache-v1-` artifacts remain
 readable and appear once in listings when both tag versions exist.
+
+Registries cannot list by prefix, so every listing reads the whole tag list,
+100 tags per request. A default `kache sync --pull` lists once per crate in
+`Cargo.lock` and repeats that walk for each one. `kache sync --pull --all`
+lists once, but downloads every entry in the repository.
 
 JSON objects up to 16 KiB embed their bytes in the layer descriptor, so a warm
 read needs one manifest request. Larger objects need a manifest and a blob

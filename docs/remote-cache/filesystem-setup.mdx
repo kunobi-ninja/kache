@@ -14,6 +14,8 @@ prefix = "artifacts"
 
 Use an absolute path mounted consistently on every machine. Keep `cache.local_store` on local storage; the local SQLite store is not designed for cross-machine sharing.
 
+A filesystem remote is listed by default (`cache.remote_key_listing` defaults to `true` here). With prefetch on, each machine's daemon walks `<prefix>/v3/manifests/` when it starts and again every `cache.remote_key_cache_refresh_secs` (60 seconds). On a large network share, set `remote_key_listing = false` under `[cache]`, or raise the interval. Exact lookups and uploads do not need listing.
+
 ## Trust and permissions
 
 Every writer to the mount is trusted. A filesystem remote is not an isolation boundary. Use directory permissions or choose S3 with access policy when clients are not mutually trusted.
@@ -33,10 +35,11 @@ atomic_write_dir = "/mnt/shared-kache/.staging"
 
 The staging directory must:
 
+- be an absolute path
 - be on the same filesystem as `path`
 - sit outside the object subtree `<prefix>/v3/`
 
-Kache rejects a configuration that cannot provide atomic final renames.
+Kache rejects a relative path, or one inside `<prefix>/v3/`, when it loads the configuration. On Unix it also refuses a staging directory on another filesystem when it opens the remote. Windows has no such check, so a cross-volume staging directory makes every write fail instead.
 
 ## Layout
 
@@ -50,7 +53,7 @@ Kache rejects a configuration that cannot provide atomic final renames.
     └── _manifests/
 ```
 
-Filesystem prefixes cannot contain `:`.
+Filesystem prefixes cannot contain `:`, and no path segment may end in a dot or a space. Windows strips those characters, so the same share would name different files from different machines.
 
 The [v3 download limits](/docs/remote-cache/s3-setup#object-layout-and-policy) also apply to shared folders: 8 GiB compressed and 8 GiB extracted per entry. Compiler invocations recompile when a remote entry exceeds either limit.
 

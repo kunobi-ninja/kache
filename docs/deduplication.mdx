@@ -20,8 +20,10 @@ Entries refer to blobs through metadata and the SQLite index. Identical bytes sh
 Kache uses the first of these methods that applies to an artifact:
 
 1. copy-on-write clone on APFS, ReFS, btrfs, or reflink-capable XFS
-2. one exclusive Unix hardlink carrier for immutable `.rlib` and `.rmeta` artifacts, and on Linux for proc-macro libraries and build-script binaries
+2. on Unix, a hardlink to the blob for a Rust output that is neither an executable nor a loadable library, such as an `.rlib` or `.rmeta`, and on Linux also for proc-macro libraries and build-script binaries. Only one target directory may link a given blob; later restores copy it.
 3. byte copy
+
+C/C++ objects and the files a cached build script wrote are cloned onto their own inode or copied, never hardlinked. So is anything restored from a `cache.readonly_store`. `[cache] shared_hardlink_restores = true` lets every target directory hardlink the same blob; use it only for target directories nothing reads after the job, such as a CI job's.
 
 Other executable and loadable outputs use clone or copy, never the hardlink fallback, because signing, stripping, or another consumer may modify them. On Linux, proc-macro libraries and build-script binaries share the blob's inode when the blob is read-only and executable, since nothing rewrites them after a restore. A blob without every execute bit, such as one imported from a remote cache, is copied. Windows copies on non-CoW volumes unless the unsafe `windows_hardlink` option is enabled.
 
@@ -29,17 +31,33 @@ Restored reflinks and copies are writable by their owner, so a later compiler in
 
 Reflinks have independent inodes. A later write copies changed blocks instead of modifying the store blob.
 
+## Sharing existing target files
+
+A large compiler output in a target directory can be a byte-for-byte copy of a blob the store already holds, for example when another worktree compiled the same artifact. With `cache.auto_share_target_files` on (the default), the daemon replaces such files with clones of the blob, a little at a time while the machine is idle. Each file keeps its path, mode and modification time, so Cargo still sees it as fresh.
+
+This needs a filesystem with copy-on-write clones. It never hardlinks, and it skips files on a different volume from the store. Only files of 64 KiB or more with an `.rlib`, `.rmeta`, `.so`, `.dylib`, `.a`, `.o`, `.dll`, `.lib`, `.exe` or `.pdb` extension are compared.
+
+`kache targets share` reports the matches, and `kache targets share --apply` clones them now. See [Target directory cleanup](/docs/getting-started/configuration#target-directory-cleanup).
+
 ## Monitor metrics
 
-The monitor's Store tab shows registered blob bytes and the share of logical
-size saved by sharing. While Projects is walking target directories, that tab
-says `scanning…`.
+The monitor's Store tab title shows the entries' logical size, the registered
+blob bytes, and the share of logical size that sharing saved. The Projects tab
+shows how much of each target directory is already cached, and says
+`scanning…` while it walks them.
 
 In `kache stats`, Cache and Store show registered blob bytes; Limit is the
 registered blob budget. Dedup shows logical output bytes and the percentage
 saved. If blob inventory is unavailable, the size is labeled as logical.
 Registered bytes describe the cache's index, rather than all space allocated
 on disk or the additional blocks occupied by restored worktrees.
+
+When target directories share blocks with the store, through clones or
+hardlinks, or filesystem snapshots still hold some, `kache stats` adds an
+`On disk` row: the bytes only the store holds, the part also cloned into
+`target/` directories, and the part only snapshots hold. Clone detection is
+reliable on macOS, depends on the filesystem on Linux, and is not available on
+Windows.
 
 For obsolete units inside an active target, record a successful command with `KACHE_TARGET_LIVENESS=1 kache cargo check`, then preview `kache clean --units target --dry-run`. Cleanup keeps that command's live and Fresh artifacts; missing or changed evidence preserves the units. See [Recorded-command cleanup](/docs/getting-started/configuration#recorded-command-cleanup).
 

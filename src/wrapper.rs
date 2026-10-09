@@ -3166,8 +3166,8 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     crate::link::set_layout_advice_to_log(true);
     crate::link::set_cow_warn_marker(warn_marker_path("cow", &config.cache_dir));
     warn_nonlocal_cache_fs_once(config);
-    // Wall-clock build-start (ns since epoch) for the optional too-new-input
-    // guard; compared against keyed inputs' mtime/ctime (kunobi-ninja/kache#324).
+    // Wall-clock build-start (ns since epoch) for the too-new-input guard;
+    // compared against keyed inputs' mtime/ctime (kunobi-ninja/kache#324).
     let invocation_start_ns = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as i64)
@@ -3679,6 +3679,8 @@ fn run_parsed_rustc(
         mut key_hash_stats,
         mut key_too_new,
         mut guard_inputs,
+        hashed_after_compile,
+        written_sources,
     } = keyed;
     let compile_first = CompileFirst {
         config,
@@ -4115,19 +4117,29 @@ fn run_parsed_rustc(
     let rebuilt =
         RebuiltArtifacts::observed(true, &result.artifacts, key_env.var("CARGO_PKG_NAME"));
 
-    // too-new-input guard (kunobi-ninja/kache#324): if any keyed input was
-    // modified within this build window, the hashes feeding the cache key are
-    // racy versus what rustc actually read — refuse to store (the compile
-    // already ran and is in place; we just don't cache it). Off by default;
-    // the lookup above still ran, so a sound prior entry can still be served.
-    // A tripped wall-clock flag is excused when post-compile verification
-    // proves no guarded input changed: the flag also fires across clock
+    // too-new-input guard (kunobi-ninja/kache#324): if a keyed input was
+    // modified within this build window, the hashes feeding the cache key may
+    // not be what rustc read, so refuse to store (the compile already ran and
+    // is in place; we just don't cache it). The lookup above still ran, so a
+    // sound prior entry can still be served. A key derived after the compile
+    // always refuses a written dep-info source; any keyed input refuses only
+    // with `modified_input_guard`. A tripped wall-clock flag is excused when
+    // fingerprints prove no input changed: the flag also fires across clock
     // domains where nothing is actually racy.
     let extra_inputs_racy = args.is_primary
         && extra_inputs_changed_during_compile(config, args, extra_inputs, invocation_start_ns);
-    let key_inputs_changed = key_inputs_changed_during_compile(key_too_new, &guard_inputs);
+    let sources_changed = emitted_sources_changed_during_compile(&written_sources, &guard_inputs);
+    let key_inputs_changed = config.modified_input_guard && {
+        let hashed: Vec<_> = guard_inputs
+            .iter()
+            .chain(hashed_after_compile.iter().flatten())
+            .cloned()
+            .collect();
+        key_inputs_changed_during_compile(key_too_new, &hashed)
+    };
     if should_skip_cache_store_for_input_race(
         extra_inputs_racy,
+        sources_changed,
         config.modified_input_guard,
         key_inputs_changed,
     ) {
@@ -5486,10 +5498,17 @@ struct ComputedKey {
     key_ms: u64,
     key_hash_stats: FileHashStats,
     key_too_new: bool,
-    /// Fingerprints hashed for the key (plus the extra-inputs resolve) while
-    /// the too-new guard was armed, carried past the compile for
-    /// clock-independent verification.
+    /// Fingerprints taken before the compile while the too-new guard was
+    /// armed: the extra-inputs resolve, and the key's own when the key came
+    /// first. Carried past the compile for clock-independent verification.
     guard_inputs: Vec<crate::cache_key::FileFingerprint>,
+    /// `Some` for a key derived from the dep-info a compile emitted: the
+    /// fingerprints its inputs had when hashed, after rustc read them. They
+    /// say nothing about what the compile saw.
+    hashed_after_compile: Option<Vec<crate::cache_key::FileFingerprint>>,
+    /// The emitted dep-info's files that `hashed_after_compile` shows written
+    /// since the invocation began (see [`sources_written_since`]).
+    written_sources: Vec<crate::cache_key::FileFingerprint>,
 }
 
 /// A compile that ran before its key was known (deferred discovery), handed
@@ -5872,12 +5891,71 @@ fn publish_prediction(
     }
 }
 
+/// Whether an input race refuses the store: changed extra inputs or a
+/// changed source of a key derived after the compile always do, any other
+/// changed keyed input only with `modified_input_guard`.
 fn should_skip_cache_store_for_input_race(
     extra_inputs_racy: bool,
+    sources_changed: bool,
     modified_input_guard: bool,
-    key_too_new: bool,
+    key_inputs_changed: bool,
 ) -> bool {
-    extra_inputs_racy || (modified_input_guard && key_too_new)
+    extra_inputs_racy || sources_changed || (modified_input_guard && key_inputs_changed)
+}
+
+/// The emitted dep-info's files whose fingerprint, taken after the compile,
+/// shows a write at or after the invocation began. Only a write to one of
+/// these can make a key derived after the compile disagree with what rustc
+/// read. A source the hasher left no fingerprint for counts as written, since
+/// nothing shows otherwise. Externs and native libraries stay out: Cargo does
+/// not rewrite them while it builds a dependent, and store ingest links and
+/// chmods them, which moves their ctime without changing a byte.
+fn sources_written_since(
+    hashed: &[crate::cache_key::FileFingerprint],
+    sources: &std::collections::HashSet<String>,
+    invocation_start_ns: i64,
+) -> Vec<crate::cache_key::FileFingerprint> {
+    if invocation_start_ns <= 0 {
+        return Vec::new();
+    }
+    let mut written: Vec<_> = hashed
+        .iter()
+        .filter(|input| {
+            sources.contains(&input.path)
+                && (input.mtime_ns >= invocation_start_ns || input.ctime_ns >= invocation_start_ns)
+        })
+        .cloned()
+        .collect();
+    let recorded: std::collections::HashSet<&str> =
+        hashed.iter().map(|input| input.path.as_str()).collect();
+    written.extend(
+        sources
+            .iter()
+            .filter(|source| !recorded.contains(source.as_str()))
+            .map(|source| crate::cache_key::FileFingerprint {
+                path: source.clone(),
+                size: 0,
+                mtime_ns: invocation_start_ns,
+                ctime_ns: invocation_start_ns,
+                inode: 0,
+            }),
+    );
+    written
+}
+
+/// Whether a source written during the compile may not be what rustc read.
+/// Each one is excused only by a fingerprint of the same file taken before
+/// the compile (`before`) that still matches it.
+fn emitted_sources_changed_during_compile(
+    written: &[crate::cache_key::FileFingerprint],
+    before: &[crate::cache_key::FileFingerprint],
+) -> bool {
+    written.iter().any(|input| {
+        !before.iter().any(|earlier| {
+            earlier.path == input.path
+                && FileHasher::guarded_inputs_unchanged_since_hash(std::slice::from_ref(earlier))
+        })
+    })
 }
 
 /// Whether keyed inputs actually changed during the compile. A tripped
@@ -5885,7 +5963,7 @@ fn should_skip_cache_store_for_input_race(
 /// clock runs ahead of the host (NFS skew, future-stamped checkouts). When
 /// every guarded input still matches its hash-time fingerprint with a strong
 /// identity, nothing changed and the store refusal is excused. Anything else
-/// — a mismatch, a missing file, a weak identity — keeps the refusal.
+/// (a mismatch, a missing file, a weak identity) keeps the refusal.
 fn key_inputs_changed_during_compile(
     key_too_new: bool,
     guard_inputs: &[crate::cache_key::FileFingerprint],
@@ -5921,10 +5999,11 @@ enum KeyDiscovery {
     /// dep-info as a JSON artifact, so the wrapper can key from it and stop
     /// the compile on a hit.
     Deferrable { stop_on_hit: bool },
-    /// The compile already ran; this is its emitted closure. The too-new
-    /// guard is armed regardless of configuration: an input written during
-    /// the compile must not be keyed as if the compiler had read it. The tree
-    /// digest is the one the deferred computation took before the compile.
+    /// The compile already ran; this is its emitted closure. A source written
+    /// since the invocation began refuses the store regardless of
+    /// configuration: it must not be keyed as if the compiler had read it.
+    /// The tree digest is the one the deferred computation took before the
+    /// compile.
     Emitted(crate::cache_key::DepInfo, Option<String>),
     /// Run the pre-pass again for a predicted key that missed. The caller
     /// may hold this unit's discovery flight, and that lock is not
@@ -5987,6 +6066,7 @@ fn compute_rustc_cache_key(
     if let KeyDiscovery::Emitted(dep_info, tree) = discovery {
         crate::cache_key::provide_dep_info(dep_info, tree);
     }
+    let emitted_sources = crate::cache_key::provided_dep_info_sources();
     let mut file_hasher = match store {
         Some(store) => store.file_hasher_with_daemon(config.socket_path()),
         None => crate::cache_key::FileHasher::new().with_daemon(config.socket_path()),
@@ -6046,6 +6126,8 @@ fn compute_rustc_cache_key(
                 key_hash_stats: file_hasher.stats(),
                 key_too_new: false,
                 guard_inputs: extra_inputs_guard_inputs,
+                hashed_after_compile: None,
+                written_sources: Vec::new(),
             });
         }
         Err(error) => {
@@ -6055,7 +6137,18 @@ fn compute_rustc_cache_key(
     };
     crate::cache_key::set_defer_discovery(false);
     let key_hash_stats = file_hasher.stats();
-    extra_inputs_guard_inputs.extend(file_hasher.take_guarded_inputs());
+    // An emitted closure was hashed after rustc read it, so its fingerprints
+    // say nothing about what the compile saw.
+    let hashed = file_hasher.take_guarded_inputs();
+    let written_sources = emitted_sources
+        .map(|sources| sources_written_since(&hashed, &sources, invocation_start_ns))
+        .unwrap_or_default();
+    let hashed_after_compile = if emitted {
+        Some(hashed)
+    } else {
+        extra_inputs_guard_inputs.extend(hashed);
+        None
+    };
     let (key_ms, key_hash_stats, key_too_new) = combine_key_measurements(
         key_start.elapsed().as_millis() as u64,
         extra_inputs_key_ms,
@@ -6075,6 +6168,8 @@ fn compute_rustc_cache_key(
         key_hash_stats,
         key_too_new,
         guard_inputs: extra_inputs_guard_inputs,
+        hashed_after_compile,
+        written_sources,
     })
 }
 

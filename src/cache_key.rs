@@ -863,9 +863,13 @@ fn crate_tree_digest_in(
     if !is_registry_package(&manifest_dir) {
         return None;
     }
-    let mut roots = vec![(manifest_dir, &b"manifest_dir"[..], MANIFEST_DIR_SKIPPED)];
+    let mut roots = vec![TreeRoot::new(
+        manifest_dir,
+        b"manifest_dir",
+        MANIFEST_DIR_SKIPPED,
+    )];
     if let Some(out_dir) = out_dir {
-        roots.push((out_dir, &b"out_dir"[..], &[]));
+        roots.push(TreeRoot::new(out_dir, b"out_dir", &[]));
     }
     tree_digest(roots, file_hasher, CRATE_TREE_MAX_ENTRIES)
 }
@@ -888,15 +892,62 @@ const OUT_DIR_TREE_MAX_ENTRIES: usize = 256;
 /// record says which generated files were read, not what else was generated.
 pub(crate) fn out_dir_tree_digest(out_dir: &Path, file_hasher: &FileHasher<'_>) -> Option<String> {
     tree_digest(
-        vec![(out_dir.to_path_buf(), &b"out_dir"[..], &[])],
+        vec![TreeRoot::new(out_dir.to_path_buf(), b"out_dir", &[])],
         file_hasher,
         OUT_DIR_TREE_MAX_ENTRIES,
     )
 }
 
-/// Each root comes with the names directly under it to skip.
+/// One directory a tree digest folds.
+struct TreeRoot<'a> {
+    path: PathBuf,
+    /// What the directory is to the unit. Roots are named by role, not by
+    /// path: the identity the record is filed under already knows the path,
+    /// and the guard is about content.
+    role: &'a [u8],
+    /// Names directly under the root that the digest leaves out.
+    skipped: &'a [&'a str],
+    /// Leave out what a directory below the root holds, its tag aside, when
+    /// Cargo tagged it as a build directory: a stale `target`, or the target
+    /// directory of another build.
+    skips_build_dirs: bool,
+}
+
+impl<'a> TreeRoot<'a> {
+    fn new(path: PathBuf, role: &'a [u8], skipped: &'a [&'a str]) -> Self {
+        Self {
+            path,
+            role,
+            skipped,
+            skips_build_dirs: false,
+        }
+    }
+
+    fn skipping_build_dirs(self) -> Self {
+        Self {
+            skips_build_dirs: true,
+            ..self
+        }
+    }
+
+    fn excluded(&self) -> Vec<PathBuf> {
+        self.skipped
+            .iter()
+            .map(|name| self.path.join(name))
+            .collect()
+    }
+
+    /// The fold never follows a link, so the stamp may record its text.
+    fn stamp_rules(&self) -> crate::tree_stamp::StampRules {
+        crate::tree_stamp::StampRules {
+            link_text: true,
+            skip_build_dirs: self.skips_build_dirs,
+        }
+    }
+}
+
 fn tree_digest(
-    roots: Vec<(PathBuf, &[u8], &[&str])>,
+    roots: Vec<TreeRoot<'_>>,
     file_hasher: &FileHasher<'_>,
     max_entries: usize,
 ) -> Option<String> {
@@ -924,21 +975,29 @@ fn oversized_tree_marker(memo_dir: &Path, root: &Path, max_entries: usize) -> Pa
         .join(&hasher.finalize().to_hex()[..32])
 }
 
-/// [`tree_digest`] with its "too large" memo in `memo_dir`. A workspace root
-/// can be a whole monorepo: every unit used to walk and hash the first
-/// `max_entries` entries of it, only to find it too large and discard the
-/// work. Now each root is counted first, without reading a file, and one that
-/// alone runs past the budget is remembered for [`OVERSIZED_TREE_TTL`].
+/// The version of [`crate_tree_fold`]'s digest, which a memoised digest is
+/// recorded for.
+const TREE_DIGEST_VERSION: &[u8] = b"kache-crate-tree-v1\n";
+
+/// [`tree_digest`] with its memos in `memo_dir`.
+///
+/// One stat walk stamps every root and enforces the budget without reading a
+/// file. A root that alone runs past the budget is remembered for
+/// [`OVERSIZED_TREE_TTL`]: a workspace root can be a whole monorepo. When the
+/// roots have the stamp a digest was recorded under, that digest is the
+/// answer; otherwise every file is read, and the digest is recorded once the
+/// tree has settled ([`crate::tree_stamp::TreeStamp::settled_at`]).
 fn tree_digest_memoised(
-    roots: Vec<(PathBuf, &[u8], &[&str])>,
+    roots: Vec<TreeRoot<'_>>,
     file_hasher: &FileHasher<'_>,
     max_entries: usize,
     memo_dir: &Path,
     now: std::time::SystemTime,
 ) -> Option<String> {
+    let mut stamper = crate::tree_stamp::Stamper::new();
     let mut total = 0usize;
-    for (root, _, skipped) in &roots {
-        let marker = oversized_tree_marker(memo_dir, root, max_entries);
+    for root in &roots {
+        let marker = oversized_tree_marker(memo_dir, &root.path, max_entries);
         let recent = std::fs::metadata(&marker)
             .and_then(|metadata| metadata.modified())
             .is_ok_and(|marked| {
@@ -948,77 +1007,83 @@ fn tree_digest_memoised(
         if recent {
             return None;
         }
-        let excluded: Vec<PathBuf> = skipped.iter().map(|name| root.join(name)).collect();
         let mut budget = max_entries;
-        match count_tree_entries(root, &excluded, &mut budget) {
-            TreeCount::Fits => total += max_entries - budget,
-            TreeCount::TooLarge => {
+        stamper.label(root.role);
+        match stamper.walk(
+            &root.path,
+            &root.excluded(),
+            root.stamp_rules(),
+            &mut budget,
+        ) {
+            crate::tree_stamp::WalkOutcome::Fits => total += max_entries - budget,
+            crate::tree_stamp::WalkOutcome::TooLarge => {
                 let _ = std::fs::create_dir_all(marker.parent()?)
                     .and_then(|()| std::fs::write(&marker, b""));
                 return None;
             }
-            TreeCount::Unreadable => return None,
+            crate::tree_stamp::WalkOutcome::Unreadable => return None,
         }
     }
     if total > max_entries {
         return None;
     }
+    let stamp = stamper.finish();
+    let memo = tree_digest_memo(memo_dir, &roots);
+    if let Some(digest) = crate::tree_stamp::memoised_digest(&memo, &stamp.digest)
+        .filter(|digest| digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit()))
+    {
+        crate::phase_trace::decision("tree_memo", "hit");
+        return Some(digest);
+    }
+    crate::phase_trace::decision("tree_memo", "miss");
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"kache-crate-tree-v1\n");
+    hasher.update(TREE_DIGEST_VERSION);
     let mut budget = max_entries;
-    // Roots are named by role, not by path: the identity the record is filed
-    // under already knows the path, and the guard is about content.
-    for (root, role, skipped) in roots {
-        fold_field(&mut hasher, b"root:", role);
-        let excluded: Vec<PathBuf> = skipped.iter().map(|name| root.join(name)).collect();
+    for root in &roots {
+        fold_field(&mut hasher, b"root:", root.role);
         crate_tree_fold(
-            &root,
-            &root,
-            &excluded,
+            &root.path,
+            &root.path,
+            &root.excluded(),
+            root.skips_build_dirs,
             file_hasher,
             &mut hasher,
             &mut budget,
         )?;
     }
-    Some(hasher.finalize().to_hex().to_string())
-}
-
-enum TreeCount {
-    Fits,
-    TooLarge,
-    Unreadable,
-}
-
-/// Count the entries under `directory` against `budget`, as
-/// [`crate_tree_fold`] spends it, reading directories but no file: a
-/// symlink counts once and is not followed.
-fn count_tree_entries(directory: &Path, excluded: &[PathBuf], budget: &mut usize) -> TreeCount {
-    let Ok(entries) = std::fs::read_dir(directory) else {
-        return TreeCount::Unreadable;
-    };
-    for entry in entries {
-        let Ok(entry) = entry else {
-            return TreeCount::Unreadable;
-        };
-        let path = entry.path();
-        if excluded.contains(&path) {
-            continue;
-        }
-        let Some(left) = budget.checked_sub(1) else {
-            return TreeCount::TooLarge;
-        };
-        *budget = left;
-        let Ok(file_type) = entry.file_type() else {
-            return TreeCount::Unreadable;
-        };
-        if file_type.is_dir() {
-            match count_tree_entries(&path, excluded, budget) {
-                TreeCount::Fits => {}
-                other => return other,
-            }
-        }
+    let digest = hasher.finalize().to_hex().to_string();
+    // A tree written in the last moments could be written again within the
+    // same timestamp tick, keeping its stamp with other bytes.
+    if stamp.settled_at(now) {
+        crate::tree_stamp::record_digest(&memo, &stamp.digest, &digest);
     }
-    TreeCount::Fits
+    Some(digest)
+}
+
+/// Where the digest of `roots` is memoised: one file per set of roots, so
+/// every unit without an `OUT_DIR` in a workspace shares one.
+fn tree_digest_memo(memo_dir: &Path, roots: &[TreeRoot<'_>]) -> PathBuf {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(TREE_DIGEST_VERSION);
+    for root in roots {
+        fold_field(
+            &mut hasher,
+            b"path:",
+            root.path.as_os_str().as_encoded_bytes(),
+        );
+        fold_field(&mut hasher, b"role:", root.role);
+        for name in root.skipped {
+            fold_field(&mut hasher, b"skipped:", name.as_bytes());
+        }
+        fold_field(
+            &mut hasher,
+            b"build_dirs:",
+            if root.skips_build_dirs { b"1" } else { b"0" },
+        );
+    }
+    memo_dir
+        .join("tree-digests")
+        .join(&hasher.finalize().to_hex()[..32])
 }
 
 /// Is `manifest_dir` an extracted registry package (`<CARGO_HOME>/registry/src/<index>/<pkg>`)?
@@ -1044,10 +1109,15 @@ fn registry_src_root(manifest_dir: &Path) -> Option<&Path> {
     manifest_dir.parent()?.parent()
 }
 
+/// Fold the entries under `directory` by path, kind and content. A symlink
+/// counts by its text and is not followed. With `skips_build_dirs`, a
+/// directory below `root` that Cargo tagged as its build directory counts by
+/// its tag alone.
 fn crate_tree_fold(
     root: &Path,
     directory: &Path,
     excluded: &[PathBuf],
+    skips_build_dirs: bool,
     file_hasher: &FileHasher<'_>,
     hasher: &mut blake3::Hasher,
     budget: &mut usize,
@@ -1057,6 +1127,9 @@ fn crate_tree_fold(
         .collect::<std::io::Result<_>>()
         .ok()?;
     entries.sort_by_key(std::fs::DirEntry::file_name);
+    if skips_build_dirs && directory != root {
+        crate::tree_stamp::keep_only_build_tag(&mut entries);
+    }
     for entry in entries {
         let path = entry.path();
         if excluded.contains(&path) {
@@ -1071,9 +1144,21 @@ fn crate_tree_fold(
             fold_field(hasher, b"symlink:", target.as_os_str().as_encoded_bytes());
         } else if metadata.is_dir() {
             fold_field(hasher, b"dir:", b"");
-            crate_tree_fold(root, &path, excluded, file_hasher, hasher, budget)?;
+            crate_tree_fold(
+                root,
+                &path,
+                excluded,
+                skips_build_dirs,
+                file_hasher,
+                hasher,
+                budget,
+            )?;
         } else if metadata.is_file() {
-            fold_field(hasher, b"file:", file_hasher.hash(&path).ok()?.as_bytes());
+            fold_field(
+                hasher,
+                b"file:",
+                file_hasher.hash_unkeyed(&path).ok()?.as_bytes(),
+            );
         } else {
             fold_field(hasher, b"other:", b"");
         }
@@ -2168,13 +2253,13 @@ fn vendored_package_digest(
     workspace_root: &Path,
     file_hasher: &FileHasher<'_>,
 ) -> Option<String> {
-    let mut roots = vec![(
+    let mut roots = vec![TreeRoot::new(
         package.to_path_buf(),
-        &b"vendored_package"[..],
+        b"vendored_package",
         MANIFEST_DIR_SKIPPED,
     )];
     if let Some(out_dir) = out_dir {
-        roots.push((out_dir.to_path_buf(), &b"out_dir"[..], &[]));
+        roots.push(TreeRoot::new(out_dir.to_path_buf(), b"out_dir", &[]));
     }
     let package_digest = tree_digest(roots, file_hasher, CRATE_TREE_MAX_ENTRIES)?;
     let mut hasher = blake3::Hasher::new();
@@ -2216,15 +2301,15 @@ fn ancestor_top_digest(directory: &Path, file_hasher: &FileHasher<'_>) -> Option
             // Where it points, and what a read through it would find.
             let target = std::fs::read_link(&path).ok()?;
             let found = if path.is_file() {
-                file_hasher.hash(&path).ok()?
+                file_hasher.hash_unkeyed(&path).ok()?
             } else {
                 String::new()
             };
             format!("symlink:{}:{found}", target.display())
         } else if metadata.is_file() {
-            format!("file:{}", file_hasher.hash(&path).ok()?)
+            format!("file:{}", file_hasher.hash_unkeyed(&path).ok()?)
         } else if metadata.is_dir() && name.as_encoded_bytes().starts_with(b".") && name != ".git" {
-            let roots = vec![(path.clone(), &b"dot_dir"[..], &[][..])];
+            let roots = vec![TreeRoot::new(path.clone(), b"dot_dir", &[])];
             format!(
                 "dir:{}",
                 tree_digest(roots, file_hasher, CRATE_TREE_MAX_ENTRIES)?
@@ -2248,9 +2333,10 @@ fn workspace_tree_digest_within(
         suffix_within(workspace.target.as_os_str(), &workspace.root, 0).unwrap_or_default();
     let target = target.trim_start_matches(['/', '\\']);
     let skipped = [target, ".git"];
-    let mut roots = vec![(workspace.root.clone(), &b"workspace"[..], &skipped[..])];
+    let mut roots =
+        vec![TreeRoot::new(workspace.root.clone(), b"workspace", &skipped).skipping_build_dirs()];
     if let Some(out_dir) = &workspace.out_dir {
-        roots.push((out_dir.clone(), &b"out_dir"[..], &[][..]));
+        roots.push(TreeRoot::new(out_dir.clone(), b"out_dir", &[]));
     }
     tree_digest(roots, file_hasher, max_entries)
 }
@@ -5771,7 +5857,8 @@ pub(crate) fn same_tree_guard(
 
 /// A workspace unit's record for another checkout and the identity to file it
 /// under (kunobi-ninja/kache#1005), or `None` when the unit or its closure is
-/// not relocatable. `tree` is the workspace guard taken before rustc ran.
+/// not relocatable, or the guard does not see every file the closure names
+/// ([`guard_covers`]). `tree` is the workspace guard taken before rustc ran.
 pub(crate) fn workspace_record(
     args: &RustcArgs,
     dep_info: &DepInfo,
@@ -5780,6 +5867,9 @@ pub(crate) fn workspace_record(
     let vars: Vec<_> = std::env::vars_os().collect();
     let workspace = workspace_roots(args, &vars)?;
     let record = workspace_portable_prediction(dep_info, &workspace, tree)?;
+    if !guard_covers(&dep_info.source_files, &workspace) {
+        return None;
+    }
     let identity = workspace_prediction_identity(args, vars, &workspace)?;
     let named = [
         workspace.root.as_path(),
@@ -5793,6 +5883,86 @@ pub(crate) fn workspace_record(
         return None;
     }
     Some((identity, record))
+}
+
+/// Does the workspace guard see every file of `sources`? It sees a file its
+/// walk reaches: one under `OUT_DIR`, or under the workspace root and outside
+/// the target directory, with no symlinked directory on the way (the walk
+/// does not follow one) and no directory Cargo tagged as its build directory
+/// (the walk leaves those out). A relative source must stay inside the root.
+/// A macro that lists a directory the guard does not see could find a new
+/// file there with the digest unchanged.
+fn guard_covers(sources: &[PathBuf], workspace: &WorkspaceRoots) -> bool {
+    let mut entered = HashMap::new();
+    sources.iter().all(|source| {
+        guard_place(source, workspace).is_some_and(|(root, below, skips_build_dirs)| {
+            walk_reaches(root, &below, skips_build_dirs, &mut entered)
+        })
+    })
+}
+
+/// The root the guard's walk reaches `source` from, the path below it, and
+/// whether that walk leaves Cargo's build directories out. `None` for a
+/// source no walk reaches: outside the workspace, under the target
+/// directory, or relative and leaving the root.
+fn guard_place<'a>(
+    source: &Path,
+    workspace: &'a WorkspaceRoots,
+) -> Option<(&'a Path, String, bool)> {
+    if !source.has_root() {
+        workspace_relative_source(source, workspace)?;
+        let below = format!("{}/{}", workspace.cwd, source.to_str()?);
+        return Some((&workspace.root, below, true));
+    }
+    match workspace_portable_value(source.as_os_str(), workspace)? {
+        Portable::OutDir(below) => Some((workspace.out_dir.as_deref()?, below, false)),
+        Portable::Workspace(below) => Some((&workspace.root, below, true)),
+        Portable::Literal(_) | Portable::Registry(_) => None,
+    }
+}
+
+/// Does a walk from `root` that follows no symlink reach the file at
+/// `below`, a lexical path inside `root`? With `skips_build_dirs`, not
+/// through a directory Cargo tagged as its build directory either.
+/// `entered` keeps the answer for each directory checked.
+fn walk_reaches(
+    root: &Path,
+    below: &str,
+    skips_build_dirs: bool,
+    entered: &mut HashMap<(PathBuf, bool), bool>,
+) -> bool {
+    use std::path::Component;
+    let components: Vec<Component<'_>> = Path::new(below)
+        .components()
+        .filter(|component| matches!(component, Component::Normal(_) | Component::ParentDir))
+        .collect();
+    let Some((_, directories)) = components.split_last() else {
+        return true;
+    };
+    let mut directory = root.to_path_buf();
+    let mut depth = 0usize;
+    for component in directories {
+        if *component == Component::ParentDir {
+            let Some(up) = depth.checked_sub(1) else {
+                return false;
+            };
+            depth = up;
+            directory.pop();
+            continue;
+        }
+        directory.push(component);
+        depth += 1;
+        let walked = *entered
+            .entry((directory.clone(), skips_build_dirs))
+            .or_insert_with(|| {
+                std::fs::symlink_metadata(&directory).is_ok_and(|metadata| metadata.is_dir())
+                    && !(skips_build_dirs && crate::tree_stamp::holds_cargo_build_tag(&directory))
+            });
+        if !walked {
+            return false;
+        }
+    }
+    true
 }
 
 /// The closure with every source written relative to `OUT_DIR` or the
@@ -7093,7 +7263,7 @@ impl<'db> FileHasher<'db> {
     /// Hash a file's contents, using the persistent cache when available.
     pub fn hash(&self, path: &Path) -> Result<String> {
         let _trace = crate::phase_trace::phase("input_hash");
-        let (hash, observed) = self.hash_inner(path)?;
+        let (hash, observed) = self.hash_inner(path, true)?;
         if let Some(observed) = &observed {
             self.guard_input(observed);
         }
@@ -7107,7 +7277,24 @@ impl<'db> FileHasher<'db> {
         Ok(hash)
     }
 
-    fn hash_inner(&self, path: &Path) -> Result<(String, Option<ObservedFingerprint>)> {
+    /// Hash a file that is not a key input, such as one a tree guard reads,
+    /// through the persistent cache. It neither trips the too-new guard nor
+    /// joins the inputs checked again after the compile: a file saved
+    /// anywhere in the workspace while a unit builds must not keep that unit
+    /// out of the store. Its memo row follows the same rules as a key
+    /// input's: none for a stamp that had not settled when it was observed,
+    /// or that moved while the file was read under the guard.
+    pub(crate) fn hash_unkeyed(&self, path: &Path) -> Result<String> {
+        let _trace = crate::phase_trace::phase("input_hash");
+        self.hash_inner(path, false).map(|(hash, _)| hash)
+    }
+
+    /// With `keyed`, the file is a key input and the too-new guard sees it.
+    fn hash_inner(
+        &self,
+        path: &Path,
+        keyed: bool,
+    ) -> Result<(String, Option<ObservedFingerprint>)> {
         let Some(cache) = &self.cache else {
             // Read before any stat and before the bytes, so it is no later
             // than whichever stamp is returned.
@@ -7116,7 +7303,7 @@ impl<'db> FileHasher<'db> {
                 fingerprint,
                 observed_ns,
             };
-            if self.too_new.invocation_start_ns == 0 {
+            if !keyed || self.too_new.invocation_start_ns == 0 {
                 let hash = hash_file(path)?;
                 return Ok((hash, FileFingerprint::from_path(path).ok().map(observed)));
             }
@@ -7131,7 +7318,7 @@ impl<'db> FileHasher<'db> {
             };
             self.note_too_new(&before.fingerprint);
             let hash = read_file_hash(path)?;
-            let (observed, _) = self.restat_after_read(path, before);
+            let (observed, _) = self.restat_after_read(path, before, true);
             return Ok((hash, Some(observed)));
         };
 
@@ -7147,12 +7334,14 @@ impl<'db> FileHasher<'db> {
         };
         let fingerprint = &observed.fingerprint;
 
-        self.note_too_new(fingerprint);
+        if keyed {
+            self.note_too_new(fingerprint);
+        }
 
         if fingerprint.size < MIN_PERSISTED_HASH_BYTES {
             let hash = read_file_hash(path)?;
             self.record_miss(fingerprint.size);
-            let (observed, _) = self.restat_after_read(path, observed);
+            let (observed, _) = self.restat_after_read(path, observed, keyed);
             return Ok((hash, Some(observed)));
         }
 
@@ -7181,7 +7370,7 @@ impl<'db> FileHasher<'db> {
 
         let hash = read_file_hash(path)?;
         self.record_miss(fingerprint.size);
-        let (observed, unchanged) = self.restat_after_read(path, observed);
+        let (observed, unchanged) = self.restat_after_read(path, observed, keyed);
         if unchanged {
             self.pending_memo
                 .borrow_mut()
@@ -7192,15 +7381,17 @@ impl<'db> FileHasher<'db> {
 
     /// Stat `path` again after reading the bytes `before` was taken for, when
     /// the guard is armed. A write between the two stats means the bytes may
-    /// belong to neither stamp: the input counts as too new, and `before`,
-    /// which no longer matches the file, stays among the guarded inputs so
-    /// that no later check can excuse it. Returns the fingerprint to report
-    /// for the read, the later one when they differ (still observed when
-    /// `before` was), and whether they agreed.
+    /// belong to neither stamp. A key input (`keyed`) then counts as too new,
+    /// and `before`, which no longer matches the file, stays among the
+    /// guarded inputs so that no later check can excuse it; any other file
+    /// only loses its memo row. Returns the fingerprint to report for the
+    /// read, the later one when they differ (still observed when `before`
+    /// was), and whether they agreed.
     fn restat_after_read(
         &self,
         path: &Path,
         before: ObservedFingerprint,
+        keyed: bool,
     ) -> (ObservedFingerprint, bool) {
         if self.too_new.invocation_start_ns == 0 {
             return (before, true);
@@ -7208,8 +7399,10 @@ impl<'db> FileHasher<'db> {
         match FileFingerprint::from_path(path) {
             Ok(after) if after == before.fingerprint => (before, true),
             Ok(after) => {
-                self.too_new.saw_too_new.set(true);
-                self.guard_input(&before);
+                if keyed {
+                    self.too_new.saw_too_new.set(true);
+                    self.guard_input(&before);
+                }
                 let observed_ns = before.observed_ns;
                 (
                     ObservedFingerprint {
@@ -7221,7 +7414,9 @@ impl<'db> FileHasher<'db> {
             }
             // Gone since the read: `before` fails any later check.
             Err(_) => {
-                self.too_new.saw_too_new.set(true);
+                if keyed {
+                    self.too_new.saw_too_new.set(true);
+                }
                 (before, false)
             }
         }
@@ -7469,7 +7664,7 @@ impl<'db> FileHasher<'db> {
         } else {
             let hash = read_file_hash(path)?;
             self.record_miss(fingerprint.size);
-            let (reported, unchanged) = self.restat_after_read(path, observed.clone());
+            let (reported, unchanged) = self.restat_after_read(path, observed.clone(), true);
             if unchanged {
                 self.pending_memo
                     .borrow_mut()

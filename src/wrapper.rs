@@ -2820,13 +2820,9 @@ fn cc_event_root_in(
 /// The tag's text is checked, because other tools also write `CACHEDIR.TAG`.
 fn cargo_workspace_of(dir: &Path) -> Option<PathBuf> {
     dir.ancestors()
-        .find(|ancestor| is_cargo_cachedir_tag(&ancestor.join("CACHEDIR.TAG")))
+        .find(|ancestor| crate::tree_stamp::is_cargo_build_tag(&ancestor.join("CACHEDIR.TAG")))
         .and_then(Path::parent)
         .map(Path::to_path_buf)
-}
-
-fn is_cargo_cachedir_tag(path: &Path) -> bool {
-    std::fs::read_to_string(path).is_ok_and(|tag| tag.contains("created by cargo"))
 }
 
 /// The workspace of the build script a compiler runs under, from the

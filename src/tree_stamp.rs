@@ -7,10 +7,8 @@
 
 use std::path::{Path, PathBuf};
 
-/// A digest of every entry under `path` by name, kind, size, modification
-/// and change time, from one stat walk. Symlinks contribute their link text
-/// only, so a tree with a symlink to something outside it is not memoised.
-/// `None` when the tree is larger than the budget or holds a symlink.
+/// A digest of every entry a [`Stamper`] walked: name, kind, size,
+/// modification and change time, and the link text of a symlink.
 pub(crate) struct TreeStamp {
     pub(crate) digest: String,
     /// The newest modification time seen in the walk.
@@ -28,52 +26,171 @@ impl TreeStamp {
     }
 }
 
-pub(crate) fn tree_stamp(path: &Path, excluded: &[PathBuf], budget: usize) -> Option<TreeStamp> {
-    let mut hasher = blake3::Hasher::new();
-    let mut newest = std::time::SystemTime::UNIX_EPOCH;
-    let mut remaining = budget;
-    let mut pending = vec![path.to_path_buf()];
-    while let Some(directory) = pending.pop() {
-        let mut entries: Vec<_> = std::fs::read_dir(&directory)
-            .ok()?
-            .collect::<std::io::Result<_>>()
-            .ok()?;
-        entries.sort_by_key(std::fs::DirEntry::file_name);
-        for entry in entries {
-            let child = entry.path();
-            if excluded.contains(&child) {
-                continue;
-            }
-            remaining = remaining.checked_sub(1)?;
-            let metadata = std::fs::symlink_metadata(&child).ok()?;
-            if metadata.file_type().is_symlink() {
-                return None;
-            }
-            fold(
-                &mut hasher,
-                "entry",
-                child
-                    .strip_prefix(path)
-                    .ok()?
-                    .as_os_str()
-                    .as_encoded_bytes(),
-            );
-            hasher.update(if metadata.is_dir() { b"dir" } else { b"fil" });
-            fold_metadata_stamp(&mut hasher, &metadata);
-            if let Ok(modified) = metadata.modified()
-                && modified > newest
-            {
-                newest = modified;
-            }
-            if metadata.is_dir() {
-                pending.push(child);
-            }
+/// How a stamp walk treats symlinks and Cargo's build directories.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct StampRules {
+    /// Fold a symlink's text instead of refusing the tree. Only for a digest
+    /// that does not read through a link either: one that does could change
+    /// with the link's target while the stamp stays the same.
+    pub(crate) link_text: bool,
+    /// Below the root, walk only the tag of a directory Cargo tagged as its
+    /// build directory (see [`keep_only_build_tag`]).
+    pub(crate) skip_build_dirs: bool,
+}
+
+/// How a walk over one root ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WalkOutcome {
+    Fits,
+    /// More entries than the budget.
+    TooLarge,
+    /// A directory or entry could not be read, or a symlink the rules refuse.
+    Unreadable,
+}
+
+/// One stat walk over one or more roots, folded into one [`TreeStamp`].
+pub(crate) struct Stamper {
+    hasher: blake3::Hasher,
+    newest: std::time::SystemTime,
+}
+
+impl Stamper {
+    pub(crate) fn new() -> Self {
+        Self {
+            hasher: blake3::Hasher::new(),
+            newest: std::time::SystemTime::UNIX_EPOCH,
         }
     }
-    Some(TreeStamp {
-        digest: hasher.finalize().to_hex().to_string(),
-        newest,
-    })
+
+    /// Mark the start of the next root, so an entry cannot move from one
+    /// root to another with the stamp unchanged.
+    pub(crate) fn label(&mut self, label: &[u8]) {
+        fold(&mut self.hasher, "root", label);
+    }
+
+    /// Fold every entry under `root` but `excluded`, spending one of
+    /// `budget` per entry. A symlink is not followed.
+    pub(crate) fn walk(
+        &mut self,
+        root: &Path,
+        excluded: &[PathBuf],
+        rules: StampRules,
+        budget: &mut usize,
+    ) -> WalkOutcome {
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(directory) = pending.pop() {
+            let Ok(entries) = std::fs::read_dir(&directory) else {
+                return WalkOutcome::Unreadable;
+            };
+            let Ok(mut entries) = entries.collect::<std::io::Result<Vec<_>>>() else {
+                return WalkOutcome::Unreadable;
+            };
+            entries.sort_by_key(std::fs::DirEntry::file_name);
+            if rules.skip_build_dirs && directory != root {
+                keep_only_build_tag(&mut entries);
+            }
+            for entry in entries {
+                let child = entry.path();
+                if excluded.contains(&child) {
+                    continue;
+                }
+                let Some(left) = budget.checked_sub(1) else {
+                    return WalkOutcome::TooLarge;
+                };
+                *budget = left;
+                let Ok(metadata) = std::fs::symlink_metadata(&child) else {
+                    return WalkOutcome::Unreadable;
+                };
+                let Ok(relative) = child.strip_prefix(root) else {
+                    return WalkOutcome::Unreadable;
+                };
+                let link = if metadata.file_type().is_symlink() {
+                    match std::fs::read_link(&child) {
+                        Ok(target) if rules.link_text => Some(target),
+                        _ => return WalkOutcome::Unreadable,
+                    }
+                } else {
+                    None
+                };
+                fold(
+                    &mut self.hasher,
+                    "entry",
+                    relative.as_os_str().as_encoded_bytes(),
+                );
+                match &link {
+                    Some(target) => {
+                        self.hasher.update(b"lnk");
+                        fold(
+                            &mut self.hasher,
+                            "link",
+                            target.as_os_str().as_encoded_bytes(),
+                        );
+                    }
+                    None => {
+                        self.hasher
+                            .update(if metadata.is_dir() { b"dir" } else { b"fil" });
+                    }
+                }
+                fold_metadata_stamp(&mut self.hasher, &metadata);
+                if let Ok(modified) = metadata.modified()
+                    && modified > self.newest
+                {
+                    self.newest = modified;
+                }
+                if metadata.is_dir() {
+                    pending.push(child);
+                }
+            }
+        }
+        WalkOutcome::Fits
+    }
+
+    pub(crate) fn finish(self) -> TreeStamp {
+        TreeStamp {
+            digest: self.hasher.finalize().to_hex().to_string(),
+            newest: self.newest,
+        }
+    }
+}
+
+/// The stamp of one tree that holds no symlink, as a build script's declared
+/// directory must: its digest reads through links. `None` when the tree is
+/// larger than the budget, unreadable, or holds a symlink.
+pub(crate) fn tree_stamp(path: &Path, excluded: &[PathBuf], budget: usize) -> Option<TreeStamp> {
+    let mut stamper = Stamper::new();
+    let mut remaining = budget;
+    (stamper.walk(path, excluded, StampRules::default(), &mut remaining) == WalkOutcome::Fits)
+        .then(|| stamper.finish())
+}
+
+/// The file Cargo writes into a build directory it creates.
+const BUILD_TAG: &str = "CACHEDIR.TAG";
+
+/// Keep only the tag of a directory Cargo tagged as its build directory: the
+/// rest is build output. Other tools write `CACHEDIR.TAG` too, so the text
+/// is checked, and a directory with another tag keeps every entry.
+pub(crate) fn keep_only_build_tag(entries: &mut Vec<std::fs::DirEntry>) {
+    let tagged = entries.iter().any(|entry| {
+        entry.file_name() == BUILD_TAG
+            && entry.file_type().is_ok_and(|kind| kind.is_file())
+            && is_cargo_build_tag(&entry.path())
+    });
+    if tagged {
+        entries.retain(|entry| entry.file_name() == BUILD_TAG);
+    }
+}
+
+/// Did Cargo tag `directory` as its build directory? The same answer
+/// [`keep_only_build_tag`] gives from a listing.
+pub(crate) fn holds_cargo_build_tag(directory: &Path) -> bool {
+    let tag = directory.join(BUILD_TAG);
+    std::fs::symlink_metadata(&tag).is_ok_and(|metadata| metadata.is_file())
+        && is_cargo_build_tag(&tag)
+}
+
+/// Is the `CACHEDIR.TAG` at `path` the one Cargo writes?
+pub(crate) fn is_cargo_build_tag(path: &Path) -> bool {
+    std::fs::read_to_string(path).is_ok_and(|tag| tag.contains("created by cargo"))
 }
 
 fn fold(hasher: &mut blake3::Hasher, label: &str, value: &[u8]) {
@@ -115,4 +232,183 @@ pub(crate) fn memoised_digest(memo: &Path, stamp: &str) -> Option<String> {
 /// Record `digest` at `memo` under `stamp`.
 pub(crate) fn record_digest(memo: &Path, stamp: &str, digest: &str) {
     crate::probe_memo::write_atomic(memo, &format!("{stamp}\n{digest}"));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    const CARGO_TAG: &str = "Signature: 8a477f597d28d172789f06886806bc55\n\
+         # This file is a cache directory tag created by cargo.\n";
+
+    fn walk(root: &Path, rules: StampRules, budget: usize) -> (WalkOutcome, String, usize) {
+        let mut stamper = Stamper::new();
+        let mut left = budget;
+        let outcome = stamper.walk(root, &[], rules, &mut left);
+        (outcome, stamper.finish().digest, budget - left)
+    }
+
+    fn write(path: &Path, content: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, content).unwrap();
+    }
+
+    #[test]
+    fn a_stamp_settles_one_window_after_its_newest_write() {
+        let newest = UNIX_EPOCH + Duration::from_secs(1_000);
+        let stamp = TreeStamp {
+            digest: String::new(),
+            newest,
+        };
+        assert!(stamp.settled_at(newest + TreeStamp::SETTLE));
+        assert!(stamp.settled_at(newest + TreeStamp::SETTLE * 3));
+        assert!(!stamp.settled_at(newest + TreeStamp::SETTLE - Duration::from_nanos(1)));
+        assert!(
+            !stamp.settled_at(newest - Duration::from_secs(1)),
+            "a clock behind the write"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir.path().join("a"), "a");
+        let fresh = tree_stamp(dir.path(), &[], 10).unwrap();
+        assert!(
+            !fresh.settled_at(SystemTime::now()),
+            "the walk keeps the newest write it saw"
+        );
+    }
+
+    #[test]
+    fn a_rewrite_changes_the_stamp_and_the_budget_counts_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir.path().join("sub/a"), "a");
+        let (outcome, before, spent) = walk(dir.path(), StampRules::default(), 2);
+        assert_eq!(
+            (outcome, spent),
+            (WalkOutcome::Fits, 2),
+            "`sub` and `sub/a`"
+        );
+        assert_eq!(
+            walk(dir.path(), StampRules::default(), 1).0,
+            WalkOutcome::TooLarge
+        );
+        assert_eq!(walk(dir.path(), StampRules::default(), 2).1, before);
+
+        let file = dir.path().join("sub/a");
+        let old = filetime::FileTime::from_unix_time(1_000_000_000, 0);
+        filetime::set_file_mtime(&file, old).unwrap();
+        let aged = walk(dir.path(), StampRules::default(), 2).1;
+        assert_ne!(aged, before, "a new modification time");
+        std::fs::write(&file, "bb").unwrap();
+        filetime::set_file_mtime(&file, old).unwrap();
+        assert_ne!(
+            walk(dir.path(), StampRules::default(), 2).1,
+            aged,
+            "a rewrite that keeps the modification time"
+        );
+        assert!(tree_stamp(&dir.path().join("missing"), &[], 2).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_is_stamped_by_its_text_or_refuses_the_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir.path().join("a"), "a");
+        write(&dir.path().join("b"), "b");
+        std::os::unix::fs::symlink("a", dir.path().join("link")).unwrap();
+        let text = StampRules {
+            link_text: true,
+            ..StampRules::default()
+        };
+        let (outcome, before, _) = walk(dir.path(), text, 10);
+        assert_eq!(outcome, WalkOutcome::Fits);
+        assert_eq!(
+            walk(dir.path(), StampRules::default(), 10).0,
+            WalkOutcome::Unreadable,
+            "a digest that reads through links cannot be stamped"
+        );
+        assert!(tree_stamp(dir.path(), &[], 10).is_none());
+
+        std::fs::remove_file(dir.path().join("link")).unwrap();
+        std::os::unix::fs::symlink("b", dir.path().join("link")).unwrap();
+        assert_ne!(walk(dir.path(), text, 10).1, before, "retargeted");
+    }
+
+    /// Below the root, a directory Cargo tagged counts by its tag alone. The
+    /// root itself and a directory with another tool's tag are walked.
+    #[test]
+    fn a_cargo_build_dir_is_stamped_by_its_tag_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("w");
+        write(&root.join("src/lib.rs"), "");
+        write(&root.join("old-target/CACHEDIR.TAG"), CARGO_TAG);
+        write(&root.join("old-target/debug/a"), "");
+        let skip = StampRules {
+            skip_build_dirs: true,
+            ..StampRules::default()
+        };
+        let (outcome, before, spent) = walk(&root, skip, 10);
+        assert_eq!(outcome, WalkOutcome::Fits);
+        assert_eq!(spent, 4, "`src`, `src/lib.rs`, `old-target` and its tag");
+        assert_eq!(walk(&root, StampRules::default(), 10).2, 6);
+
+        write(&root.join("old-target/debug/b"), "");
+        assert_eq!(walk(&root, skip, 10).1, before, "build output");
+        write(&root.join("old-target/CACHEDIR.TAG"), "Signature: x\n");
+        assert_eq!(walk(&root, skip, 10).2, 7, "another tool's tag is walked");
+
+        write(&root.join("CACHEDIR.TAG"), CARGO_TAG);
+        assert_eq!(walk(&root, skip, 10).2, 8, "the root is always walked");
+    }
+
+    #[test]
+    fn only_cargos_tag_marks_a_build_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!holds_cargo_build_tag(dir.path()));
+        write(&dir.path().join("CACHEDIR.TAG"), "Signature: x\n");
+        assert!(!holds_cargo_build_tag(dir.path()));
+        write(&dir.path().join("CACHEDIR.TAG"), CARGO_TAG);
+        assert!(holds_cargo_build_tag(dir.path()));
+        let listed = |path: &Path| {
+            let mut entries: Vec<_> = std::fs::read_dir(path)
+                .unwrap()
+                .collect::<std::io::Result<_>>()
+                .unwrap();
+            keep_only_build_tag(&mut entries);
+            entries.len()
+        };
+        write(&dir.path().join("x"), "");
+        assert_eq!(listed(dir.path()), 1);
+        let directory_tag = dir.path().join("dirtag");
+        std::fs::create_dir_all(directory_tag.join("CACHEDIR.TAG")).unwrap();
+        assert!(!holds_cargo_build_tag(&directory_tag));
+        write(&directory_tag.join("y"), "");
+        assert_eq!(listed(&directory_tag), 2, "a directory named like the tag");
+        #[cfg(unix)]
+        {
+            let linked = dir.path().join("linked");
+            std::fs::create_dir_all(&linked).unwrap();
+            std::os::unix::fs::symlink(
+                dir.path().join("CACHEDIR.TAG"),
+                linked.join("CACHEDIR.TAG"),
+            )
+            .unwrap();
+            write(&linked.join("z"), "");
+            assert!(
+                !holds_cargo_build_tag(&linked),
+                "a link to a tag is not one"
+            );
+            assert_eq!(listed(&linked), 2);
+        }
+    }
+
+    #[test]
+    fn a_memoised_digest_needs_its_stamp() {
+        let dir = tempfile::tempdir().unwrap();
+        let memo = dir.path().join("memo/tree");
+        assert_eq!(memoised_digest(&memo, "s1"), None);
+        record_digest(&memo, "s1", "d1");
+        assert_eq!(memoised_digest(&memo, "s1").as_deref(), Some("d1"));
+        assert_eq!(memoised_digest(&memo, "s2"), None);
+    }
 }

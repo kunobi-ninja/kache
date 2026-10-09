@@ -3756,6 +3756,126 @@ fn a_workspace_record_needs_the_guard_and_every_source_inside() {
     );
 }
 
+/// What Cargo writes into a target directory it creates.
+const CARGO_BUILD_TAG: &str = "Signature: 8a477f597d28d172789f06886806bc55\n\
+     # This file is a cache directory tag created by cargo.\n";
+
+fn write_file(path: &Path, content: &str) {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, content).unwrap();
+}
+
+/// The guard sees a file only where its walk goes: not through a symlinked
+/// directory, nor into a directory Cargo tagged as its build directory,
+/// except below `OUT_DIR`, which the walk reads whole.
+#[test]
+fn the_guard_sees_only_the_files_its_walk_reaches() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("w");
+    let out = dir.path().join("out");
+    for file in ["kt/src/lib.rs", "assets/a.txt", "stale/x.rs"] {
+        write_file(&root.join(file), "");
+    }
+    write_file(&root.join("stale/CACHEDIR.TAG"), CARGO_BUILD_TAG);
+    write_file(&out.join("gen.rs"), "");
+    write_file(&out.join("nested/y.rs"), "");
+    write_file(&out.join("nested/CACHEDIR.TAG"), CARGO_BUILD_TAG);
+    write_file(&dir.path().join("outside/o.txt"), "");
+    let canonical_root = root.canonicalize().unwrap();
+    let roots = WorkspaceRoots {
+        root: root.clone(),
+        cwd: String::new(),
+        canonical_target: canonical_root.join("target"),
+        canonical_root: canonical_root.clone(),
+        target: root.join("target"),
+        out_dir: Some(out.clone()),
+        vendored_package: None,
+    };
+    let covers = |sources: &[PathBuf]| guard_covers(sources, &roots);
+    let relative = PathBuf::from;
+    assert!(covers(&[
+        relative("kt/src/lib.rs"),
+        relative("kt/src/../../assets/a.txt"),
+        root.join("assets/a.txt"),
+        canonical_root.join("assets/a.txt"),
+        out.join("gen.rs"),
+        out.join("nested/y.rs"),
+    ]));
+    for (source, why) in [
+        (relative("../outside/o.txt"), "relative, leaving the root"),
+        (dir.path().join("outside/o.txt"), "outside the workspace"),
+        (
+            root.join("target/debug/deps/libx.rlib"),
+            "the target directory",
+        ),
+        (root.join("stale/x.rs"), "a Cargo build directory"),
+        (
+            relative("stale/x.rs"),
+            "relative, into a Cargo build directory",
+        ),
+        (root.join("kt/missing/x.rs"), "no such directory"),
+    ] {
+        assert!(!covers(&[relative("kt/src/lib.rs"), source]), "{why}");
+    }
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(dir.path().join("outside"), root.join("linked")).unwrap();
+        assert!(
+            !covers(&[root.join("linked/o.txt")]),
+            "through a symlinked directory"
+        );
+    }
+    let mut entered = HashMap::new();
+    assert!(walk_reaches(&root, "/top.txt", true, &mut entered));
+    assert!(walk_reaches(
+        &root,
+        "/kt/src/../src/lib.rs",
+        true,
+        &mut entered
+    ));
+    assert!(!walk_reaches(
+        &root,
+        "/../w/kt/src/lib.rs",
+        true,
+        &mut entered
+    ));
+}
+
+/// A record for another checkout is only made when the guard sees every file
+/// the closure names.
+#[test]
+fn a_workspace_record_needs_every_source_where_the_guard_walks() {
+    let mut lock = key_test_lock();
+    if get_rustc_version(Path::new("rustc")).is_err() {
+        return;
+    }
+    let base = lock.enter();
+    let (root, args) = workspace_invocation(&base, "w", "kt");
+    std::env::set_current_dir(&root).unwrap();
+    write_file(&root.join("kt/src/lib.rs"), "");
+    write_file(&root.join("stale/x.rs"), "");
+    write_file(&root.join("stale/CACHEDIR.TAG"), CARGO_BUILD_TAG);
+    let manifest_dir = root.join("kt");
+    let _manifest = crate::config::tests::set_env_for_test(
+        "CARGO_MANIFEST_DIR",
+        Some(manifest_dir.as_os_str()),
+    );
+    let _out = crate::config::tests::set_env_for_test("OUT_DIR", None);
+    let closure = |sources: &[&str]| DepInfo {
+        source_files: sources.iter().map(PathBuf::from).collect(),
+        env_deps: Vec::new(),
+    };
+    assert!(workspace_record(&args, &closure(&["kt/src/lib.rs"]), Some("tree")).is_some());
+    assert!(
+        workspace_record(
+            &args,
+            &closure(&["kt/src/lib.rs", "stale/x.rs"]),
+            Some("tree")
+        )
+        .is_none()
+    );
+}
+
 #[test]
 fn a_workspace_entry_resolves_only_where_this_invocation_has_a_workspace() {
     let record = PortablePrediction {
@@ -3828,6 +3948,56 @@ fn the_workspace_guard_covers_everything_but_target_and_git() {
     write("assets/a.txt", "a\n");
     write("target/debug/build/kt-1/out/gen.rs", "// other\n");
     assert_ne!(digest(), baseline, "OUT_DIR, though it lies under target");
+}
+
+/// A directory Cargo tagged as its build directory, such as a stale `target`
+/// left in the tree while the build writes elsewhere, counts by its tag
+/// alone: its output neither changes the guard nor fills the budget.
+/// `OUT_DIR` and a registry package are read whole.
+#[test]
+fn a_cargo_build_dir_in_the_workspace_counts_by_its_tag() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("w");
+    let out = dir.path().join("out");
+    for file in [
+        "Cargo.toml",
+        "kt/src/lib.rs",
+        "stale/debug/a",
+        "stale/debug/b",
+    ] {
+        write_file(&root.join(file), "");
+    }
+    write_file(&root.join("stale/CACHEDIR.TAG"), CARGO_BUILD_TAG);
+    write_file(&out.join("gen.rs"), "");
+    write_file(&out.join("nested/CACHEDIR.TAG"), CARGO_BUILD_TAG);
+    let roots = WorkspaceRoots {
+        root: root.clone(),
+        cwd: String::new(),
+        canonical_root: root.clone(),
+        target: dir.path().join("target"),
+        canonical_target: dir.path().join("target"),
+        out_dir: Some(out.clone()),
+        vendored_package: None,
+    };
+    let hasher = FileHasher::new();
+    let digest = |budget| workspace_tree_digest_within(&roots, &hasher, budget);
+    // `Cargo.toml`, `kt`, `kt/src`, `kt/src/lib.rs`, `stale` and its tag,
+    // then `gen.rs`, `nested` and its tag.
+    let baseline = digest(9).unwrap();
+    assert_eq!(digest(8), None);
+    write_file(&root.join("stale/debug/c"), "");
+    assert_eq!(digest(9).as_ref(), Some(&baseline), "build output");
+    write_file(&out.join("nested/x"), "");
+    assert_eq!(digest(9), None, "OUT_DIR is read whole");
+    assert!(digest(10).is_some_and(|changed| changed != baseline));
+
+    let package = dir.path().join("registry/src/index-1/kt-1.0.0");
+    write_file(&package.join("src/lib.rs"), "");
+    write_file(&package.join("stale/CACHEDIR.TAG"), CARGO_BUILD_TAG);
+    let registry = || crate_tree_digest_in(package.clone(), None, &hasher).unwrap();
+    let before = registry();
+    write_file(&package.join("stale/debug/a"), "");
+    assert_ne!(registry(), before, "a registry package is read whole");
 }
 
 #[test]
@@ -11636,13 +11806,62 @@ fn a_file_removed_after_its_read_counts_as_too_new() {
     let before = ObservedFingerprint::from_path(&file).unwrap();
     assert!(!hasher.too_new());
     std::fs::remove_file(&file).unwrap();
-    let (reported, unchanged) = hasher.restat_after_read(&file, before.clone());
+    let (reported, unchanged) = hasher.restat_after_read(&file, before.clone(), true);
     assert!(!unchanged);
     assert!(hasher.too_new());
     assert_eq!(reported, before);
     assert!(!FileHasher::guarded_inputs_unchanged_since_hash(
         std::slice::from_ref(&reported)
     ));
+}
+
+/// A file that is no key input, such as one a tree guard reads, is stat'ed
+/// again after its read like a key input, but a write or removal between the
+/// two stats only costs its memo row: the too-new guard stays quiet and no
+/// guarded input is kept.
+#[test]
+fn an_unkeyed_file_moved_while_it_is_read_trips_nothing_and_leaves_no_row() {
+    let small = 16;
+    let large = usize::try_from(MIN_PERSISTED_HASH_BYTES).unwrap() + 16;
+    for size in [small, large] {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("asset.txt");
+        std::fs::write(&file, vec![b'a'; size]).unwrap();
+        let first = FileFingerprint::from_path(&file).unwrap();
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        ensure_file_hash_cache_schema(&db).unwrap();
+        let mut hasher = FileHasher::from_cache(FileHashCache::Borrowed(&db));
+        hasher.arm_too_new_guard(1, 0);
+        set_before_read(Some(Box::new(move |path: &Path| {
+            std::fs::write(path, vec![b'b'; size + 1]).unwrap();
+        })));
+        let hash = hasher.hash_unkeyed(&file).unwrap();
+        set_before_read(None);
+
+        assert_eq!(hash, hash_file(&file).unwrap(), "size={size}");
+        assert!(!hasher.too_new(), "size={size}");
+        assert!(hasher.take_guarded_inputs().is_empty(), "size={size}");
+        assert!(hasher.pending_memo.borrow().is_empty(), "size={size}");
+        hasher.flush_memo_as_if_settled();
+        let second = FileFingerprint::from_path(&file).unwrap();
+        let memo = FileHashCache::Borrowed(&db);
+        assert_eq!(memo.get(&first).unwrap(), None, "size={size}");
+        assert_eq!(memo.get(&second).unwrap(), None, "size={size}");
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("asset.txt");
+    std::fs::write(&file, b"a").unwrap();
+    let mut hasher = FileHasher::new();
+    hasher.arm_too_new_guard(1, 0);
+    let before = ObservedFingerprint::from_path(&file).unwrap();
+    std::fs::remove_file(&file).unwrap();
+    assert_eq!(
+        hasher.restat_after_read(&file, before.clone(), false),
+        (before, false)
+    );
+    assert!(!hasher.too_new());
+    assert!(hasher.take_guarded_inputs().is_empty());
 }
 
 /// Each guarded input keeps the wall clock read before its stat, so a later
@@ -11710,7 +11929,7 @@ fn an_oversized_tree_is_counted_not_hashed_and_remembered() {
         std::fs::write(tree.join("sub").join(format!("f{i}")), b"x").unwrap();
     }
     // Five entries: `sub` and its four files.
-    let roots = || vec![(tree.clone(), &b"workspace"[..], &[][..])];
+    let roots = || vec![TreeRoot::new(tree.clone(), b"workspace", &[])];
     let now = std::time::SystemTime::now();
     let hasher = FileHasher::new();
 
@@ -11769,14 +11988,105 @@ fn tree_budgets_add_up_across_roots_and_skip_exclusions() {
     let skipped: &[&str] = &["target"];
     let roots = || {
         vec![
-            (first.clone(), &b"workspace"[..], skipped),
-            (second.clone(), &b"out_dir"[..], &[][..]),
+            TreeRoot::new(first.clone(), b"workspace", skipped),
+            TreeRoot::new(second.clone(), b"out_dir", &[]),
         ]
     };
     assert!(tree_digest_memoised(roots(), &hasher, 5, &memo, now).is_none());
     assert!(!oversized_tree_marker(&memo, &first, 5).exists());
     assert!(!oversized_tree_marker(&memo, &second, 5).exists());
     assert!(tree_digest_memoised(roots(), &hasher, 6, &memo, now).is_some());
+}
+
+/// A settled tree's digest is memoised under its stamp, and the next unit
+/// reads no file. A tree written just now is not memoised, a changed tree is
+/// read again, and a memo that does not hold a digest is ignored.
+#[test]
+fn a_settled_tree_digest_is_memoised_under_its_stamp() {
+    let dir = tempfile::tempdir().unwrap();
+    let memo = dir.path().join("memo");
+    let tree = dir.path().join("tree");
+    write_file(&tree.join("src/lib.rs"), "pub fn a() {}\n");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("src/lib.rs", tree.join("lib.rs")).unwrap();
+    let roots = || vec![TreeRoot::new(tree.clone(), b"workspace", &[])];
+    let db = rusqlite::Connection::open_in_memory().unwrap();
+    ensure_file_hash_cache_schema(&db).unwrap();
+    // The digest, and how many files were read for it.
+    let digest_at = |now: std::time::SystemTime| {
+        let hasher = FileHasher::from_cache(FileHashCache::Borrowed(&db));
+        let digest = tree_digest_memoised(roots(), &hasher, 10, &memo, now);
+        (digest, hasher.stats().cache_misses)
+    };
+    let now = std::time::SystemTime::now();
+    let settled = now + crate::tree_stamp::TreeStamp::SETTLE;
+
+    let (fresh, read) = digest_at(now);
+    let fresh = fresh.expect("a symlink counts by its text");
+    assert_eq!(read, 1);
+    let file = tree_digest_memo(&memo, &roots());
+    assert!(!file.exists(), "a tree written just now is not memoised");
+    assert_eq!(digest_at(settled), (Some(fresh.clone()), 1));
+    assert_eq!(
+        digest_at(settled),
+        (Some(fresh.clone()), 0),
+        "the memo answers"
+    );
+
+    let recorded = std::fs::read_to_string(&file).unwrap();
+    let (stamp, _) = recorded.split_once('\n').unwrap();
+    for (digest, why) in [("g".repeat(64), "not hex"), ("a".repeat(63), "too short")] {
+        std::fs::write(&file, format!("{stamp}\n{digest}")).unwrap();
+        assert_eq!(digest_at(settled), (Some(fresh.clone()), 1), "{why}");
+    }
+    let trusted = "a".repeat(64);
+    std::fs::write(&file, format!("{stamp}\n{trusted}")).unwrap();
+    assert_eq!(
+        digest_at(settled),
+        (Some(trusted), 0),
+        "trusted under its stamp"
+    );
+
+    write_file(&tree.join("src/new.rs"), "");
+    let (changed, read) = digest_at(settled + crate::tree_stamp::TreeStamp::SETTLE);
+    assert!(changed.is_some_and(|changed| changed != fresh));
+    assert_eq!(read, 2);
+}
+
+/// A file a tree guard reads is not a key input: a save anywhere in the
+/// workspace while a unit builds must not keep that unit out of the store.
+#[test]
+fn a_tree_file_never_trips_the_too_new_guard() {
+    let dir = tempfile::tempdir().unwrap();
+    let tree = dir.path().join("tree");
+    let file = tree.join("f");
+    write_file(&file, "x");
+    filetime::set_file_mtime(&file, filetime::FileTime::from_unix_time(2_000_000_000, 0)).unwrap();
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as i64;
+    let db = rusqlite::Connection::open_in_memory().unwrap();
+    ensure_file_hash_cache_schema(&db).unwrap();
+    for cached in [false, true] {
+        let mut hasher = if cached {
+            FileHasher::from_cache(FileHashCache::Borrowed(&db))
+        } else {
+            FileHasher::new()
+        };
+        hasher.arm_too_new_guard(now_ns, 0);
+        let roots = vec![TreeRoot::new(tree.clone(), b"workspace", &[])];
+        let memo = dir.path().join("memo");
+        let now = std::time::SystemTime::now();
+        assert!(tree_digest_memoised(roots, &hasher, 10, &memo, now).is_some());
+        assert!(!hasher.too_new(), "cached={cached}");
+        assert!(hasher.take_guarded_inputs().is_empty(), "cached={cached}");
+        hasher.hash(&file).unwrap();
+        assert!(
+            hasher.too_new(),
+            "a key input still trips it, cached={cached}"
+        );
+    }
 }
 
 #[test]

@@ -11219,7 +11219,7 @@ fn guarded_inputs_reject_changed_or_missing_files() {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("input.rs");
     std::fs::write(&file, b"pub fn x() {}").unwrap();
-    let recorded = FileFingerprint::from_path(&file).unwrap();
+    let recorded = ObservedFingerprint::from_path(&file).unwrap();
 
     std::fs::write(&file, b"pub fn x() { 1 }").unwrap();
     assert!(
@@ -11239,12 +11239,35 @@ fn guarded_inputs_reject_weak_identity() {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("input.rs");
     std::fs::write(&file, b"pub fn x() {}").unwrap();
-    let mut recorded = FileFingerprint::from_path(&file).unwrap();
-    recorded.inode = 0;
+    let mut recorded = ObservedFingerprint::from_path(&file).unwrap();
+    recorded.fingerprint.inode = 0;
     assert!(
         !FileHasher::guarded_inputs_unchanged_since_hash(std::slice::from_ref(&recorded)),
         "without an inode a replace-by-rename is invisible, so verification must fail closed"
     );
+}
+
+/// Each guarded input keeps the wall clock read before its stat, so a later
+/// check can ask whether its stamp had settled by then.
+#[test]
+fn guarded_inputs_keep_when_they_were_observed() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("input.rs");
+    std::fs::write(&file, b"pub fn x() {}").unwrap();
+    let db = dir.path().join("index.db");
+    for mut hasher in [FileHasher::new(), FileHasher::persistent(&db)] {
+        hasher.arm_too_new_guard(1, 0);
+        let before = wall_clock_ns();
+        hasher.hash(&file).unwrap();
+        let after = wall_clock_ns();
+        let [input] = hasher.take_guarded_inputs().try_into().unwrap();
+        assert!((before..=after).contains(&input.observed_ns), "{input:?}");
+        assert_eq!(
+            input.fingerprint,
+            FileFingerprint::from_path(&file).unwrap()
+        );
+        assert!(!input.settled(), "written a moment ago");
+    }
 }
 
 #[cfg(unix)]

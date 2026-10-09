@@ -2022,14 +2022,14 @@ fn input_race_store_suppression_truth_table() {
 
 #[test]
 fn key_inputs_changed_excuses_skewed_clocks_but_not_real_changes() {
-    use crate::cache_key::FileFingerprint;
+    use crate::cache_key::ObservedFingerprint;
 
     // No tripped flag: nothing to excuse, whatever was recorded.
     assert!(!key_inputs_changed_during_compile(false, &[]));
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("input.rs");
     std::fs::write(&file, b"pub fn x() {}").unwrap();
-    let recorded = FileFingerprint::from_path(&file).unwrap();
+    let recorded = ObservedFingerprint::from_path(&file).unwrap();
     assert!(!key_inputs_changed_during_compile(
         false,
         std::slice::from_ref(&recorded)
@@ -2055,12 +2055,13 @@ fn key_inputs_changed_excuses_skewed_clocks_but_not_real_changes() {
 /// A key derived after the compile hashed its inputs after rustc read them.
 /// A dep-info source written since the invocation began refuses its store
 /// with the modified-input guard off, unless a fingerprint of that file taken
-/// before the compile still matches it. An extern whose ctime moved, as store
-/// ingest moves it on a filesystem without reflinks, does not. A write can
-/// carry a stamp a clock tick below the start.
+/// before the compile still matches it and had settled when it was taken. An
+/// extern whose ctime moved, as store ingest moves it on a filesystem without
+/// reflinks, does not. A write can carry a stamp a clock tick below the
+/// start.
 #[test]
 fn a_source_written_during_the_compile_refuses_a_key_derived_after_it() {
-    use crate::cache_key::FileFingerprint;
+    use crate::cache_key::{FileFingerprint, ObservedFingerprint};
 
     let dir = tempfile::tempdir().unwrap();
     let source = dir.path().join("lib.rs");
@@ -2087,25 +2088,33 @@ fn a_source_written_during_the_compile_refuses_a_key_derived_after_it() {
         ctime_ns: ns,
         ..input.clone()
     };
+    // What the key hashed after the compile.
+    let hashed_after = |fingerprint: FileFingerprint| ObservedFingerprint {
+        fingerprint,
+        observed_ns: start + 10,
+    };
 
     // Only the extern moved: nothing the compile read was written.
     let hashed = [
-        fingerprint(&source),
-        fingerprint(&module),
-        at(&fingerprint(&rmeta), start + 5),
+        hashed_after(fingerprint(&source)),
+        hashed_after(fingerprint(&module)),
+        hashed_after(at(&fingerprint(&rmeta), start + 5)),
     ];
     assert!(sources_written_since(&hashed, &sources, start).is_empty());
 
     // A written source with no fingerprint from before the compile refuses,
     // although its own fingerprint matches the file.
-    let hashed = [fingerprint(&source), at(&fingerprint(&module), start + 5)];
+    let hashed = [
+        hashed_after(fingerprint(&source)),
+        hashed_after(at(&fingerprint(&module), start + 5)),
+    ];
     let written = sources_written_since(&hashed, &sources, start);
     assert_eq!(written.len(), 1, "{written:?}");
     assert!(emitted_sources_changed_during_compile(&written, &[]));
     assert!(sources_written_since(&hashed, &sources, 0).is_empty());
 
     // A source the hasher recorded nothing for counts as written.
-    let unrecorded = sources_written_since(&[fingerprint(&source)], &sources, start);
+    let unrecorded = sources_written_since(&[hashed_after(fingerprint(&source))], &sources, start);
     assert_eq!(unrecorded.len(), 1, "{unrecorded:?}");
     assert_eq!(unrecorded[0].path, fingerprint(&module).path);
 
@@ -2113,25 +2122,45 @@ fn a_source_written_during_the_compile_refuses_a_key_derived_after_it() {
         &fingerprint(&module),
         start - crate::cache_key::FINE_STAMP_WINDOW_NS,
     );
-    assert_eq!(
-        sources_written_since(&[fingerprint(&source), edge.clone()], &sources, start),
-        [edge]
-    );
+    let edge_hashed = [
+        hashed_after(fingerprint(&source)),
+        hashed_after(edge.clone()),
+    ];
+    assert_eq!(sources_written_since(&edge_hashed, &sources, start), [edge]);
     let below = at(
         &fingerprint(&module),
         start - crate::cache_key::FINE_STAMP_WINDOW_NS - 1,
     );
-    assert!(sources_written_since(&[fingerprint(&source), below], &sources, start).is_empty());
+    let below_hashed = [hashed_after(fingerprint(&source)), hashed_after(below)];
+    assert!(sources_written_since(&below_hashed, &sources, start).is_empty());
 
     #[cfg(unix)]
     {
-        // A fingerprint from before the compile that still matches excuses
-        // it: a skewed clock, not a race.
-        let earlier = [fingerprint(&module)];
+        // Taken before the compile, `late` nanoseconds after the stamp
+        // settled.
+        let taken = |path: &Path, late: i64| {
+            let fingerprint = fingerprint(path);
+            let changed = fingerprint.mtime_ns.max(fingerprint.ctime_ns);
+            ObservedFingerprint {
+                fingerprint,
+                observed_ns: changed + crate::cache_key::HASH_SETTLE_NS + late,
+            }
+        };
+        // A settled fingerprint that still matches excuses it: a skewed
+        // clock, not a race.
+        let earlier = [taken(&module, 0)];
         assert!(!emitted_sources_changed_during_compile(&written, &earlier));
+        // One taken inside the window does not: a write in the same tick
+        // would have kept it matching.
+        assert!(emitted_sources_changed_during_compile(
+            &written,
+            &[taken(&module, -1)]
+        ));
         // One of another file does not.
-        let other = [fingerprint(&source)];
-        assert!(emitted_sources_changed_during_compile(&written, &other));
+        assert!(emitted_sources_changed_during_compile(
+            &written,
+            &[taken(&source, 0)]
+        ));
         // A file rewritten since its earlier fingerprint refuses.
         std::fs::write(&module, b"pub fn g() { 1 }").unwrap();
         assert!(emitted_sources_changed_during_compile(&written, &earlier));
@@ -9940,7 +9969,9 @@ fn a_key_from_emitted_dep_info_always_arms_the_too_new_guard() {
     assert!(keyed.guard_inputs.is_empty(), "{:?}", keyed.guard_inputs);
     let hashed = keyed.hashed_after_compile.expect("a key after the compile");
     assert!(
-        hashed.iter().any(|input| Path::new(&input.path) == lib),
+        hashed
+            .iter()
+            .any(|input| Path::new(&input.fingerprint.path) == lib),
         "{hashed:?}"
     );
     assert!(

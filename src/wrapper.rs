@@ -3473,7 +3473,7 @@ fn run_parsed_rustc(
     extra_inputs_hash_stats: FileHashStats,
     extra_inputs_too_new: bool,
     extra_inputs_key_ms: u64,
-    extra_inputs_guard_inputs: Vec<crate::cache_key::FileFingerprint>,
+    extra_inputs_guard_inputs: Vec<crate::cache_key::ObservedFingerprint>,
     mut precompiled: Option<Precompiled>,
 ) -> Result<i32> {
     let crate_name = args.crate_name.as_deref().unwrap_or("unknown");
@@ -5609,11 +5609,11 @@ struct ComputedKey {
     /// Fingerprints taken before the compile while the too-new guard was
     /// armed: the extra-inputs resolve, and the key's own when the key came
     /// first. Carried past the compile for clock-independent verification.
-    guard_inputs: Vec<crate::cache_key::FileFingerprint>,
+    guard_inputs: Vec<crate::cache_key::ObservedFingerprint>,
     /// `Some` for a key derived from the dep-info a compile emitted: the
     /// fingerprints its inputs had when hashed, after rustc read them. They
     /// say nothing about what the compile saw.
-    hashed_after_compile: Option<Vec<crate::cache_key::FileFingerprint>>,
+    hashed_after_compile: Option<Vec<crate::cache_key::ObservedFingerprint>>,
     /// The emitted dep-info's files that `hashed_after_compile` shows written
     /// since the invocation began (see [`sources_written_since`]).
     written_sources: Vec<crate::cache_key::FileFingerprint>,
@@ -5661,7 +5661,7 @@ fn compile_before_key(
     ctx: &CompileFirst<'_>,
     stop_on_hit: bool,
     tree_digest: Option<String>,
-    guard_inputs: Vec<crate::cache_key::FileFingerprint>,
+    guard_inputs: Vec<crate::cache_key::ObservedFingerprint>,
     key_record: KeyEventRecord,
     key_ms: u64,
     key_hash_stats: FileHashStats,
@@ -6020,7 +6020,7 @@ fn should_skip_cache_store_for_input_race(
 /// not rewrite them while it builds a dependent, and store ingest links and
 /// chmods them, which moves their ctime without changing a byte.
 fn sources_written_since(
-    hashed: &[crate::cache_key::FileFingerprint],
+    hashed: &[crate::cache_key::ObservedFingerprint],
     sources: &std::collections::HashSet<String>,
     invocation_start_ns: i64,
 ) -> Vec<crate::cache_key::FileFingerprint> {
@@ -6029,14 +6029,17 @@ fn sources_written_since(
     }
     let mut written: Vec<_> = hashed
         .iter()
+        .map(|input| &input.fingerprint)
         .filter(|input| {
             sources.contains(&input.path)
                 && crate::cache_key::stamp_written_since(input, invocation_start_ns)
         })
         .cloned()
         .collect();
-    let recorded: std::collections::HashSet<&str> =
-        hashed.iter().map(|input| input.path.as_str()).collect();
+    let recorded: std::collections::HashSet<&str> = hashed
+        .iter()
+        .map(|input| input.fingerprint.path.as_str())
+        .collect();
     written.extend(
         sources
             .iter()
@@ -6054,14 +6057,17 @@ fn sources_written_since(
 
 /// Whether a source written during the compile may not be what rustc read.
 /// Each one is excused only by a fingerprint of the same file taken before
-/// the compile (`before`) that still matches it.
+/// the compile (`before`) that still matches it and whose stamp had settled
+/// when it was taken. A write in the same tick as an unsettled stamp keeps
+/// the stamp, so a match would prove nothing.
 fn emitted_sources_changed_during_compile(
     written: &[crate::cache_key::FileFingerprint],
-    before: &[crate::cache_key::FileFingerprint],
+    before: &[crate::cache_key::ObservedFingerprint],
 ) -> bool {
     written.iter().any(|input| {
         !before.iter().any(|earlier| {
-            earlier.path == input.path
+            earlier.fingerprint.path == input.path
+                && earlier.settled()
                 && FileHasher::guarded_inputs_unchanged_since_hash(std::slice::from_ref(earlier))
         })
     })
@@ -6075,7 +6081,7 @@ fn emitted_sources_changed_during_compile(
 /// (a mismatch, a missing file, a weak identity) keeps the refusal.
 fn key_inputs_changed_during_compile(
     key_too_new: bool,
-    guard_inputs: &[crate::cache_key::FileFingerprint],
+    guard_inputs: &[crate::cache_key::ObservedFingerprint],
 ) -> bool {
     key_too_new && !FileHasher::guarded_inputs_unchanged_since_hash(guard_inputs)
 }
@@ -6135,7 +6141,7 @@ struct ExtraInputsKey<'a> {
     hash_stats: FileHashStats,
     too_new: bool,
     key_ms: u64,
-    guard_inputs: Vec<crate::cache_key::FileFingerprint>,
+    guard_inputs: Vec<crate::cache_key::ObservedFingerprint>,
 }
 
 /// Compute the rustc cache key. With `store` present the hasher is backed by

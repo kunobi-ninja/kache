@@ -6179,11 +6179,11 @@ pub struct FileHasher<'db> {
     env_dep_uses: RefCell<HashMap<(String, String), SourceEnvDepUse>>,
     stats: FileHashStatsCells,
     too_new: TooNewGuard,
-    /// Fingerprints of every file hashed while the too-new guard was armed.
-    /// Drained after the compile so the wrapper can prove clock-independently
-    /// that none of them changed mid-build (see
-    /// [`FileHasher::guarded_inputs_unchanged_since_hash`]).
-    guard_inputs: RefCell<Vec<FileFingerprint>>,
+    /// Fingerprints of every file hashed while the too-new guard was armed,
+    /// with the time each was observed. Drained after the compile so the
+    /// wrapper can prove clock-independently that none of them changed
+    /// mid-build (see [`FileHasher::guarded_inputs_unchanged_since_hash`]).
+    guard_inputs: RefCell<Vec<ObservedFingerprint>>,
     /// Memo rows for files hashed in this process, written in one transaction
     /// by [`FileHasher::flush_memo`] (and on drop). One autocommit write per
     /// file made every hit in a six-job cold cell wait for the index's write
@@ -6400,18 +6400,18 @@ impl<'db> FileHasher<'db> {
         self.too_new.saw_too_new.get()
     }
 
-    /// Keep `fingerprint` for the post-compile revalidation, when the guard
-    /// is armed.
-    fn guard_input(&self, fingerprint: &FileFingerprint) {
+    /// Keep `observed` for the post-compile revalidation, when the guard is
+    /// armed.
+    fn guard_input(&self, observed: &ObservedFingerprint) {
         if self.too_new.invocation_start_ns > 0 {
-            self.guard_inputs.borrow_mut().push(fingerprint.clone());
+            self.guard_inputs.borrow_mut().push(observed.clone());
         }
     }
 
     /// Drain the fingerprints hashed while the guard was armed. The wrapper
     /// carries them past the compile and hands them to
     /// [`FileHasher::guarded_inputs_unchanged_since_hash`].
-    pub fn take_guarded_inputs(&self) -> Vec<FileFingerprint> {
+    pub fn take_guarded_inputs(&self) -> Vec<ObservedFingerprint> {
         std::mem::take(&mut *self.guard_inputs.borrow_mut())
     }
 
@@ -6425,11 +6425,12 @@ impl<'db> FileHasher<'db> {
     /// Fails closed: an empty set, a missing or changed file, or an input
     /// without an inode (non-Unix, where replace-by-rename is invisible)
     /// never excuses a tripped guard.
-    pub fn guarded_inputs_unchanged_since_hash(inputs: &[FileFingerprint]) -> bool {
+    pub fn guarded_inputs_unchanged_since_hash(inputs: &[ObservedFingerprint]) -> bool {
         if inputs.is_empty() {
             return false;
         }
-        inputs.iter().all(|expected| {
+        inputs.iter().all(|input| {
+            let expected = &input.fingerprint;
             expected.inode != 0
                 && FileFingerprint::from_path(Path::new(&expected.path))
                     .is_ok_and(|current| current == *expected)
@@ -6965,25 +6966,32 @@ impl<'db> FileHasher<'db> {
     /// Hash a file's contents, using the persistent cache when available.
     pub fn hash(&self, path: &Path) -> Result<String> {
         let _trace = crate::phase_trace::phase("input_hash");
-        let (hash, fingerprint) = self.hash_inner(path)?;
-        if let Some(fingerprint) = &fingerprint {
-            self.guard_input(fingerprint);
+        let (hash, observed) = self.hash_inner(path)?;
+        if let Some(observed) = &observed {
+            self.guard_input(observed);
         }
         self.recent_hashes.borrow_mut().insert(
             absolute_path(path),
             RecentHash {
                 hash: hash.clone(),
-                fingerprint,
+                fingerprint: observed.map(|observed| observed.fingerprint),
             },
         );
         Ok(hash)
     }
 
-    fn hash_inner(&self, path: &Path) -> Result<(String, Option<FileFingerprint>)> {
+    fn hash_inner(&self, path: &Path) -> Result<(String, Option<ObservedFingerprint>)> {
         let Some(cache) = &self.cache else {
+            // Read before any stat and before the bytes, so it is no later
+            // than whichever stamp is returned.
+            let observed_ns = wall_clock_ns();
+            let observed = |fingerprint| ObservedFingerprint {
+                fingerprint,
+                observed_ns,
+            };
             if self.too_new.invocation_start_ns == 0 {
                 let hash = hash_file(path)?;
-                return Ok((hash, FileFingerprint::from_path(path).ok()));
+                return Ok((hash, FileFingerprint::from_path(path).ok().map(observed)));
             }
             let before = FileFingerprint::from_path(path).ok();
             if let Some(fingerprint) = &before {
@@ -6997,7 +7005,7 @@ impl<'db> FileHasher<'db> {
             if before != after {
                 self.too_new.saw_too_new.set(true);
             }
-            return Ok((hash, after));
+            return Ok((hash, after.map(observed)));
         };
 
         let observed = match ObservedFingerprint::from_path(path) {
@@ -7017,7 +7025,7 @@ impl<'db> FileHasher<'db> {
         if fingerprint.size < MIN_PERSISTED_HASH_BYTES {
             let hash = hash_file(path)?;
             self.record_miss(fingerprint.size);
-            return Ok((hash, Some(observed.fingerprint)));
+            return Ok((hash, Some(observed)));
         }
 
         if let Some(prefetched) = self.prefetched.borrow().get(fingerprint) {
@@ -7027,13 +7035,13 @@ impl<'db> FileHasher<'db> {
                 self.record_miss_count();
                 self.record_miss_bytes(prefetched.bytes_hashed);
             }
-            return Ok((prefetched.hash.clone(), Some(observed.fingerprint)));
+            return Ok((prefetched.hash.clone(), Some(observed)));
         }
 
         match cache.get(fingerprint) {
             Ok(Some(hash)) => {
                 self.record_hit();
-                return Ok((hash, Some(observed.fingerprint)));
+                return Ok((hash, Some(observed)));
             }
             Ok(None) => {}
             Err(e) => {
@@ -7046,7 +7054,7 @@ impl<'db> FileHasher<'db> {
         self.pending_memo
             .borrow_mut()
             .push((observed.clone(), hash.clone()));
-        Ok((hash, Some(observed.fingerprint)))
+        Ok((hash, Some(observed)))
     }
 
     /// Classify how this source uses `var` (see [`source_env_dep_use`]).
@@ -7296,7 +7304,7 @@ impl<'db> FileHasher<'db> {
                 .push((observed.clone(), hash.clone()));
             hash
         };
-        self.guard_input(fingerprint);
+        self.guard_input(observed);
         self.recent_hashes.borrow_mut().insert(
             absolute_path(path),
             RecentHash {

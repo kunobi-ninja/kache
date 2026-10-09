@@ -645,8 +645,17 @@ fn source_snapshot(workspace: &Path, target: &Path, cache: &Path) -> Result<Snap
             }
         }
     }
-    for variable in ["CARGO", "RUSTC"] {
-        let program = std::env::var(variable).unwrap_or_else(|_| variable.to_ascii_lowercase());
+    for (variable, default) in [
+        ("CARGO", Some("cargo")),
+        ("RUSTC", Some("rustc")),
+        ("KACHE_REAL_CARGO", None),
+    ] {
+        let Some(program) = std::env::var(variable)
+            .ok()
+            .or_else(|| default.map(str::to_owned))
+        else {
+            continue;
+        };
         if let Some(path) = crate::compiler::resolve_program_on_path(&program) {
             insert_file(&mut snapshot, &path.canonicalize()?, false)?;
         }

@@ -1157,3 +1157,43 @@ fn receipt_cleanup_rejects_parent_directory_paths_in_a_receipt() {
     );
     assert_eq!(receipt_target_files(&fixture.target), before);
 }
+
+#[test]
+fn receipt_cleanup_rejects_a_changed_custom_cargo_executable() {
+    let fixture = ReceiptAcceptance::new();
+    let cargo = fixture._dir.path().join("custom-cargo");
+    let real_cargo = env!("CARGO").replace('\'', "'\\''");
+    let script = format!("#!/bin/sh\nexec '{real_cargo}' \"$@\"\n");
+    kache_fs::testutil::write_executable(&cargo, &script);
+    let run = |args: &[&str]| {
+        let output = proxied_cargo(&fixture.home, &fixture.cache, &fixture.target)
+            .current_dir(&fixture.project)
+            .args(args)
+            .env("KACHE_REAL_CARGO", &cargo)
+            .env("KACHE_TARGET_LIVENESS", "1")
+            .env("KACHE_AUTO_GC", "0")
+            .env("RECEIPT_BUILD_VALUE", "alpha")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    };
+    for _ in 0..2 {
+        run(&["cargo", "--", "check", "--offline"]);
+    }
+    let before = run(&["clean", "--units", "--json"]);
+    let before: Value = serde_json::from_slice(&before.stdout).unwrap();
+    assert_eq!(before["targets"][0]["plan"]["status"], "ready", "{before}");
+    assert!(before["targets"][0]["plan"]["units"].as_u64().unwrap() > 0);
+    let files = receipt_target_files(&fixture.target);
+    std::fs::write(&cargo, format!("{script}# updated executable\n")).unwrap();
+    let changed = run(&["clean", "--units", "--json", "--yes"]);
+    let changed: Value = serde_json::from_slice(&changed.stdout).unwrap();
+    assert_ne!(changed["targets"][0]["plan"]["status"], "ready");
+    assert_eq!(changed["targets"][0]["plan"]["units"], 0);
+    assert_eq!(receipt_target_files(&fixture.target), files);
+}

@@ -201,7 +201,9 @@ fn a_registry_unit_reading_its_out_dir_records_a_relocated_row() {
 
     let key = |dep_info, tree: &str| crate::cache_key::KeyOutputs {
         dep_info: Some(dep_info),
-        tree_digest: Some(tree.to_string()),
+        tree_guard: Some(crate::cache_key::TreeGuard {
+            digest: tree.to_string(),
+        }),
         ..Default::default()
     };
     record_input_prediction(
@@ -280,7 +282,9 @@ fn a_workspace_units_rows_carry_the_guard_only_while_it_covers_the_closure() {
             source_files: sources,
             env_deps: Vec::new(),
         }),
-        tree_digest: Some("tree".to_string()),
+        tree_guard: Some(crate::cache_key::TreeGuard {
+            digest: "tree".to_string(),
+        }),
         ..Default::default()
     };
     let trees = || {

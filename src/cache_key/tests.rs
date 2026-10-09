@@ -3503,7 +3503,7 @@ fn an_rlib_only_member_is_predicted_only_under_the_workspace_guard() {
         predicted_key_inputs(&args, &local, &mut tree),
         Err(Rejection::NoRecord)
     );
-    let guard = tree.expect("an rlib-only member is digested");
+    let guard = tree.expect("an rlib-only member is digested").digest;
     let identity = rustc_prediction_identity(&args).unwrap();
     local.record_input_prediction(&identity, Some("kt"), &inside, None);
     assert_eq!(
@@ -3607,9 +3607,11 @@ fn a_flight_waiter_checks_records_against_the_digest_taken_before_the_wait() {
     };
     let identity = rustc_prediction_identity(&args).unwrap();
     hasher.record_input_prediction(&identity, Some("kt"), &closure, Some("before".into()));
-    let mut tree = Some("before".to_string());
+    let mut tree = Some(TreeGuard {
+        digest: "before".to_string(),
+    });
     assert_eq!(predicted_key_inputs(&args, &hasher, &mut tree), Ok(closure));
-    assert_eq!(tree.as_deref(), Some("before"));
+    assert_eq!(tree.map(|guard| guard.digest).as_deref(), Some("before"));
     assert_eq!(
         predicted_key_inputs(&args, &hasher, &mut None),
         Err(Rejection::TreeChanged),
@@ -4981,7 +4983,7 @@ fn a_registry_unit_reads_a_relocated_record_under_its_out_dir_guard() {
         Err(Rejection::NoRecord)
     );
     assert_eq!(
-        tree.as_deref(),
+        tree.map(|guard| guard.digest).as_deref(),
         Some(guard.as_str()),
         "a cold build records the guard it saw before compiling"
     );
@@ -5007,7 +5009,7 @@ fn a_registry_unit_reads_a_relocated_record_under_its_out_dir_guard() {
         dep_info.env_deps,
         vec![("OUT_DIR".to_string(), out.display().to_string())]
     );
-    assert_eq!(tree, Some(guard));
+    assert_eq!(tree.map(|guard| guard.digest), Some(guard));
 
     std::fs::write(out.join("extra.rs"), "").unwrap();
     assert_eq!(
@@ -5303,7 +5305,7 @@ fn emitted_closure_keeps_the_precompile_tree_guard() {
     // A macro input changed during compilation. Recording the newer tree
     // would make the old emitted closure appear valid for those new files.
     std::fs::write(package.join("macro-input.txt"), "changed").unwrap();
-    provide_dep_info(closure.clone(), deferred_outputs.tree_digest);
+    provide_dep_info(closure.clone(), deferred_outputs.tree_guard);
     let (key, outputs) = compute_cache_key_with_outputs(
         &args,
         &hasher,
@@ -5311,7 +5313,7 @@ fn emitted_closure_keeps_the_precompile_tree_guard() {
         &KeyEnv::default(),
     );
     key.unwrap();
-    let tree = outputs.tree_digest;
+    let tree = outputs.tree_guard.map(|guard| guard.digest);
     assert_eq!(tree.as_deref(), Some(original_tree.as_str()));
     let identity = rustc_prediction_identity(&args).unwrap();
     hasher.record_input_prediction(&identity, Some("guarded"), &closure, tree);
@@ -5334,7 +5336,7 @@ fn emitted_closure_keeps_the_precompile_tree_guard() {
         &KeyEnv::default(),
     );
     key.unwrap();
-    assert!(outputs.tree_digest.is_none());
+    assert!(outputs.tree_guard.is_none());
 }
 
 /// A row this build cannot vouch for reads as absent. The cost of that is
@@ -14680,7 +14682,7 @@ fn a_guarded_record_is_refused_when_the_tree_changed() {
     let current = predicted_key_inputs(&with_macro, &on, &mut current_tree);
     assert_ne!(current, Err(Rejection::TreeChanged), "{current:?}");
     assert_ne!(current, Err(Rejection::NoRecord), "{current:?}");
-    assert_eq!(current_tree, Some(tree));
+    assert_eq!(current_tree.map(|guard| guard.digest), Some(tree));
 
     std::fs::write(package.join("extra.txt"), "read by the macro").unwrap();
     assert_eq!(

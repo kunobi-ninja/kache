@@ -785,11 +785,11 @@ pub struct KeyOutputs {
     /// succeeded. `None` when the invocation has no source file, or the
     /// computation stopped before the closure was resolved.
     pub dep_info: Option<DepInfo>,
-    /// The tree digest a guarded computation used: the workspace or package
+    /// The tree guard a guarded computation used: the workspace or package
     /// tree of a unit under the tree guard ([`needs_tree_guard`]), or the
     /// `OUT_DIR` guard of a registry unit that looked for a relocated record.
-    /// A record made from this invocation must carry it.
-    pub tree_digest: Option<String>,
+    /// A record made from this invocation must carry its digest.
+    pub tree_guard: Option<TreeGuard>,
     /// Did the key keep an OUT_DIR path (OUT_DIR itself, or a value under it)
     /// as a literal? A lib whose key does is one whose consumers are worth
     /// recording (see `out_dir_alias`).
@@ -799,6 +799,13 @@ pub struct KeyOutputs {
     /// slow way before anything reaches the remote, the scheduler or the
     /// store.
     pub used_prediction: bool,
+}
+
+/// The tree guard a key computation took before rustc ran: a digest of the
+/// files a proc macro could read ([`needs_tree_guard`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TreeGuard {
+    pub digest: String,
 }
 
 /// The native archives a key hashed, with the unit's native search dirs.
@@ -1175,7 +1182,7 @@ thread_local! {
     static COMPILE_WHILE_KEYING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// A closure handed in by the wrapper after such a compile: the next key
     /// computation uses it instead of a record or a pre-pass.
-    static PROVIDED_DEP_INFO: std::cell::RefCell<Option<(DepInfo, Option<String>)>> = const { std::cell::RefCell::new(None) };
+    static PROVIDED_DEP_INFO: std::cell::RefCell<Option<(DepInfo, Option<TreeGuard>)>> = const { std::cell::RefCell::new(None) };
 }
 
 /// The key stopped before discovering the closure, and the wrapper compiles
@@ -1214,11 +1221,11 @@ pub fn set_compile_while_keying(allowed: bool) {
 
 /// Use `dep_info` for the next key computed on this thread.
 ///
-/// `tree` is the tree digest the deferred computation took before the
-/// compile ([`KeyOutputs::tree_digest`]). It rides with the emitted closure,
+/// `tree` is the tree guard the deferred computation took before the
+/// compile ([`KeyOutputs::tree_guard`]). It rides with the emitted closure,
 /// so a changed tree still rejects that prediction rather than blessing old
 /// inputs with a new digest.
-pub fn provide_dep_info(dep_info: DepInfo, tree: Option<String>) {
+pub fn provide_dep_info(dep_info: DepInfo, tree: Option<TreeGuard>) {
     PROVIDED_DEP_INFO.with(|cell| *cell.borrow_mut() = Some((dep_info, tree)));
 }
 
@@ -1738,7 +1745,7 @@ fn closures_agree(predicted: &DepInfo, discovered: &DepInfo) -> bool {
 fn predicted_key_inputs(
     args: &RustcArgs,
     file_hasher: &FileHasher<'_>,
-    tree_digest: &mut Option<String>,
+    tree_guard: &mut Option<TreeGuard>,
 ) -> std::result::Result<DepInfo, Rejection> {
     let _trace = crate::phase_trace::phase("prediction_validate");
     if !file_hasher.uses_input_predictions() {
@@ -1751,13 +1758,13 @@ fn predicted_key_inputs(
     // the tree digest and the digest still matches. The tree is the package
     // for a registry or vendored unit and the whole workspace for any other
     // workspace or path one. Computed once here and handed back in
-    // `tree_digest`, because the same digest is what a record made from this
-    // invocation has to carry. A digest already there was taken before a
+    // `tree_guard`, because the same digest is what a record made from this
+    // invocation has to carry. A guard already there was taken before a
     // discovery-flight wait (see `resolve_key_inputs`), and is the one the
     // record will carry.
     let tree = if needs_tree_guard(&args.externs, manifest_dir) {
-        let digest = match tree_digest.clone() {
-            Some(digest) => digest,
+        let digest = match tree_guard.as_ref() {
+            Some(guard) => guard.digest.clone(),
             None => {
                 let _trace = crate::phase_trace::phase(if workspace.is_some() {
                     "workspace_tree"
@@ -1771,7 +1778,9 @@ fn predicted_key_inputs(
                 .ok_or(Rejection::NotEligible)?
             }
         };
-        *tree_digest = Some(digest.clone());
+        *tree_guard = Some(TreeGuard {
+            digest: digest.clone(),
+        });
         Some(digest)
     } else {
         None
@@ -1793,7 +1802,7 @@ fn predicted_key_inputs(
     else {
         return match &workspace {
             Some(workspace) => workspace_key_inputs(args, file_hasher, workspace, vars, tree),
-            None => relocated_key_inputs(args, file_hasher, tree, tree_digest),
+            None => relocated_key_inputs(args, file_hasher, tree, tree_guard),
         };
     };
     if let Some(tree) = &tree {
@@ -1850,14 +1859,14 @@ fn keep_remote_plain_row(
 /// `OUT_DIR` relocated to this one.
 ///
 /// The guard is `tree` for a proc-macro dependent and a digest of `OUT_DIR`
-/// otherwise. It goes into `tree_digest` before the lookup, so a record made
+/// otherwise. It goes into `tree_guard` before the lookup, so a record made
 /// from this invocation, after a deferred compile included, carries the
 /// digest taken before rustc ran. Only this row is checked against it.
 fn relocated_key_inputs(
     args: &RustcArgs,
     file_hasher: &FileHasher<'_>,
     tree: Option<String>,
-    tree_digest: &mut Option<String>,
+    tree_guard: &mut Option<TreeGuard>,
 ) -> std::result::Result<DepInfo, Rejection> {
     let vars: Vec<_> = std::env::vars_os().collect();
     let out_dir = env_var_in(&vars, "OUT_DIR")
@@ -1866,14 +1875,19 @@ fn relocated_key_inputs(
     let registry = registry_src_of(&vars);
     let identity = relocatable_prediction_identity(args, vars).ok_or(Rejection::NoRecord)?;
     let out_dir = out_dir.ok_or(Rejection::NoRecord)?;
+    // A `tree` is already in `tree_guard`.
     let guard = match tree {
         Some(tree) => tree,
         None => {
             let _trace = crate::phase_trace::phase("out_dir_tree");
-            out_dir_tree_digest(Path::new(&out_dir), file_hasher).ok_or(Rejection::NoRecord)?
+            let digest =
+                out_dir_tree_digest(Path::new(&out_dir), file_hasher).ok_or(Rejection::NoRecord)?;
+            *tree_guard = Some(TreeGuard {
+                digest: digest.clone(),
+            });
+            digest
         }
     };
-    *tree_digest = Some(guard.clone());
     let places = Places {
         out_dir: Some(&out_dir),
         workspace: None,
@@ -2401,13 +2415,13 @@ fn resolve_key_inputs(
     out: &mut KeyOutputs,
 ) -> Result<Option<DepInfo>> {
     if let Some((provided, tree)) = PROVIDED_DEP_INFO.with(|cell| cell.borrow_mut().take()) {
-        out.tree_digest = tree;
+        out.tree_guard = tree;
         crate::phase_trace::decision("prediction", "emitted");
         tracing::trace!("[key:{}] inputs=emitted-dep-info", crate_name);
         return Ok(Some(provided));
     }
     if args.source_file.is_some() {
-        let mut prediction = predicted_key_inputs(args, file_hasher, &mut out.tree_digest);
+        let mut prediction = predicted_key_inputs(args, file_hasher, &mut out.tree_guard);
         // Whether this process holds the unit's discovery flight. Only the
         // holder may compile before keying: a peer that also found nothing
         // would compile the same unit a second time instead of waiting for
@@ -2424,7 +2438,7 @@ fn resolve_key_inputs(
             // waited; a flight taken at once had no owner to publish. The
             // tree digest taken before the wait is used again.
             if flight.waited {
-                prediction = predicted_key_inputs(args, file_hasher, &mut out.tree_digest);
+                prediction = predicted_key_inputs(args, file_hasher, &mut out.tree_guard);
             }
         }
         match prediction {

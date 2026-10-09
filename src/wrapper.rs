@@ -3753,7 +3753,7 @@ fn run_parsed_rustc(
         },
         match precompiled
             .as_mut()
-            .and_then(|pre| Some((pre.dep_info.take()?, pre.tree_digest.take())))
+            .and_then(|pre| Some((pre.dep_info.take()?, pre.tree_guard.take())))
         {
             Some((dep_info, tree)) => KeyDiscovery::Emitted(dep_info, tree),
             None if deferral_allowed(config, args, adaptive_unit.is_some(), extra_inputs) => {
@@ -3818,7 +3818,7 @@ fn run_parsed_rustc(
         return compile_before_key(
             &compile_first,
             stop_on_hit,
-            key_outputs.tree_digest,
+            key_outputs.tree_guard,
             guard_inputs,
             key_record,
             key_ms,
@@ -4033,7 +4033,7 @@ fn run_parsed_rustc(
             return compile_before_key(
                 &compile_first,
                 true,
-                key_outputs.tree_digest,
+                key_outputs.tree_guard,
                 guard_inputs,
                 key_record,
                 key_ms,
@@ -5633,9 +5633,9 @@ struct Precompiled {
     compile_time_ms: u64,
     /// Taken by the key computation; `None` afterwards.
     dep_info: Option<crate::cache_key::DepInfo>,
-    /// The tree digest the deferred key took before the compile, handed to
+    /// The tree guard the deferred key took before the compile, handed to
     /// the key with `dep_info`.
-    tree_digest: Option<String>,
+    tree_guard: Option<crate::cache_key::TreeGuard>,
     /// What the deferred key recorded for the event. The keyed flow the
     /// compile re-enters continues this record.
     key_record: KeyEventRecord,
@@ -5662,12 +5662,12 @@ struct CompileFirst<'a> {
 /// Compile before the key is known, then key from the dep-info the compile
 /// wrote and store as usual (re-entering [`run_parsed_rustc`] with the
 /// result). With `stop_on_hit`, key as soon as rustc reports that dep-info
-/// and stop the compile if the key is stored. `tree_digest` is the digest
+/// and stop the compile if the key is stored. `tree_guard` is the guard
 /// taken before the compile.
 fn compile_before_key(
     ctx: &CompileFirst<'_>,
     stop_on_hit: bool,
-    tree_digest: Option<String>,
+    tree_guard: Option<crate::cache_key::TreeGuard>,
     guard_inputs: Vec<crate::cache_key::ObservedFingerprint>,
     key_record: KeyEventRecord,
     key_ms: u64,
@@ -5704,7 +5704,7 @@ fn compile_before_key(
     // in time, without a second rustc.
     let mut hit_closure = None;
     let executed = if stop_on_hit {
-        let tree = tree_digest.clone();
+        let tree = tree_guard.clone();
         let mut on_dep_info = || {
             let Some(dep_info) = emitted_dep_info(args) else {
                 return true;
@@ -5837,7 +5837,7 @@ fn compile_before_key(
             result,
             compile_time_ms,
             dep_info: Some(dep_info),
-            tree_digest,
+            tree_guard,
             key_record,
         }),
     );
@@ -5939,7 +5939,7 @@ fn record_input_prediction(
     };
     // Present exactly when the key was computed under the tree guard; the
     // record must carry it or the guard will never accept the record.
-    let tree = key.tree_digest.clone();
+    let tree = key.tree_guard.as_ref().map(|guard| guard.digest.clone());
     let registry = crate::cache_key::registry_src_of(&std::env::vars_os().collect::<Vec<_>>());
     // A workspace or path unit gets a row another checkout of the workspace
     // can use, when the guard was taken before rustc ran (kunobi-ninja/kache#1005).
@@ -6128,9 +6128,12 @@ enum KeyDiscovery {
     /// The compile already ran; this is its emitted closure. A source written
     /// since the invocation began refuses the store regardless of
     /// configuration: it must not be keyed as if the compiler had read it.
-    /// The tree digest is the one the deferred computation took before the
+    /// The tree guard is the one the deferred computation took before the
     /// compile.
-    Emitted(crate::cache_key::DepInfo, Option<String>),
+    Emitted(
+        crate::cache_key::DepInfo,
+        Option<crate::cache_key::TreeGuard>,
+    ),
     /// Run the pre-pass again for a predicted key that missed. The caller
     /// may hold this unit's discovery flight, and that lock is not
     /// re-entrant, so this computation joins no flight.

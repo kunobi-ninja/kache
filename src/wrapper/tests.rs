@@ -1216,42 +1216,116 @@ fn an_unwritable_stamp_drops_the_check_only_without_a_floor() {
         "the touched stamp keeps the interval"
     );
 
-    // Neither written nor touched: every check goes ahead.
+    // Neither written nor touched: an empty stamp takes its place, and that
+    // keeps the interval.
     #[cfg(unix)]
     {
         std::fs::remove_dir(&stamp).unwrap();
         std::os::unix::fs::symlink(dir.path().join("missing/stamp"), &stamp).unwrap();
         assert!(auto_gc_wanted(&cfg, &store));
-        assert!(auto_gc_wanted(&cfg, &store));
+        assert!(
+            !auto_gc_wanted(&cfg, &store),
+            "the new stamp keeps the interval"
+        );
     }
 }
 
-/// A put that finds the volume full never reaches the check after a stored
-/// entry, so it asks for recovery itself: only with a free-space floor set,
-/// and once per check interval.
+/// A stamp that can be neither written, touched nor replaced drops the
+/// check even with a floor: one that claimed nothing would go ahead after
+/// every put.
+#[cfg(unix)]
+#[test]
+fn a_stamp_that_cannot_be_claimed_drops_the_check() {
+    use std::os::unix::fs::PermissionsExt;
+    // SAFETY: plain libc call with no arguments.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = test_config(dir.path().join("cache"));
+    cfg.auto_recover_min_free_bytes = 1;
+    let sealed = dir.path().join("sealed");
+    std::fs::create_dir(&sealed).unwrap();
+    let mode = |mode| std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(mode));
+    mode(0o555).unwrap();
+    let claimed = claim_auto_gc_check(&cfg, &sealed.join("auto-gc-check.stamp"));
+    mode(0o755).unwrap();
+    assert!(!claimed);
+}
+
+/// Run [`after_store_with`] after `failure`, with a daemon that takes the
+/// hint when `daemon` is set. Returns the hints sent and the workers spawned.
+fn follow_up(
+    cfg: &Config,
+    store: &Store,
+    failure: Option<&anyhow::Error>,
+    daemon: bool,
+) -> (usize, usize) {
+    let hints = AtomicUsize::new(0);
+    let spawned = AtomicUsize::new(0);
+    after_store_with(
+        cfg,
+        store,
+        failure,
+        |_: &Config| {
+            hints.fetch_add(1, Ordering::SeqCst);
+            daemon
+        },
+        |_: &Config| {
+            spawned.fetch_add(1, Ordering::SeqCst);
+        },
+    );
+    (hints.into_inner(), spawned.into_inner())
+}
+
+#[test]
+fn a_stored_entry_gets_the_size_check() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = test_config(dir.path().to_path_buf());
+    cfg.max_size = 1024;
+    let store = Store::open(&cfg).unwrap();
+    put_test_entry(&store, dir.path(), "over-budget");
+    assert_eq!(follow_up(&cfg, &store, None, true), (1, 0));
+    assert_eq!(follow_up(&cfg, &store, None, true), (0, 0), "fresh stamp");
+}
+
+/// Staging or a put that the volume refused for lack of space stored
+/// nothing, so no size check follows it. It asks for recovery instead: only
+/// with a free-space floor set, once per check interval, and spawning
+/// nothing when the daemon takes the hint.
 #[test]
 #[cfg(unix)]
-fn a_put_refused_for_lack_of_space_asks_for_recovery() {
+fn a_store_refused_for_lack_of_space_asks_for_recovery() {
     let dir = tempfile::tempdir().unwrap();
     let mut cfg = test_config(dir.path().to_path_buf());
     let store = Store::open(&cfg).unwrap();
-    let daemon =
-        RemoteCheckReplyDaemon::with_reply(cfg.socket_path(), serde_json::json!({ "ok": true }));
-    wait_until_reachable(&cfg.socket_path());
     let full = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::StorageFull))
         .context("copying out.o into store staging");
     let denied = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
-
-    maybe_recover_after_failed_put(&cfg, &store, &full);
-    assert_eq!(daemon.request_count(), 0, "no floor: nothing new");
+    assert_eq!(
+        follow_up(&cfg, &store, Some(&full), true),
+        (0, 0),
+        "no floor"
+    );
 
     cfg.auto_recover_min_free_bytes = kache_fs::volume_usage(dir.path()).unwrap().total;
-    maybe_recover_after_failed_put(&cfg, &store, &denied);
-    assert_eq!(daemon.request_count(), 0, "not a full volume");
-    maybe_recover_after_failed_put(&cfg, &store, &full);
-    assert_eq!(daemon.request_count(), 1);
-    maybe_recover_after_failed_put(&cfg, &store, &full);
-    assert_eq!(daemon.request_count(), 1, "one request per check interval");
+    assert_eq!(
+        follow_up(&cfg, &store, Some(&denied), true),
+        (0, 0),
+        "not a full volume"
+    );
+    assert_eq!(follow_up(&cfg, &store, Some(&full), true), (1, 0));
+    assert_eq!(
+        follow_up(&cfg, &store, Some(&full), true),
+        (0, 0),
+        "one request per check interval"
+    );
+    expire_auto_gc_stamp(&cfg);
+    assert_eq!(
+        follow_up(&cfg, &store, Some(&full), false),
+        (1, 1),
+        "no daemon: the worker"
+    );
 }
 
 #[test]

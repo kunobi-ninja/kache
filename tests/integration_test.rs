@@ -3214,7 +3214,7 @@ cache_executables = true
     )
     .unwrap();
 
-    // Second build creates a second entry and triggers put() -> maybe_spawn_auto_gc
+    // Second build creates a second entry and triggers put() -> after_store
     let output = hermetic_command("cargo", cache_dir.path(), Some(&config_path))
         .args(["build"])
         .current_dir(test_project.path())

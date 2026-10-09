@@ -503,8 +503,8 @@ fn auto_gc_stamp_path(cache_dir: &Path) -> PathBuf {
 /// Decide whether a background GC should be spawned: auto-GC enabled, the
 /// throttle interval elapsed, and the store over `max_size` plus slack.
 /// Touches the stamp *before* the size query so concurrent wrappers don't
-/// stampede on the SQLite `SUM`. Split from [`maybe_spawn_auto_gc`] so the
-/// decision is unit-testable without spawning processes.
+/// stampede on the SQLite `SUM`. Split from [`after_store`] so the decision
+/// is unit-testable without spawning processes.
 fn auto_gc_wanted(config: &Config, store: &Store) -> bool {
     if !config.auto_gc {
         return false;
@@ -565,9 +565,11 @@ fn auto_gc_check_due(stamp: &Path) -> bool {
 
 /// Claim the check slot by rewriting `stamp`. Without a free-space floor, a
 /// stamp that cannot be written drops the check, as it always has. With one,
-/// the volume is likely full, which is what recovery is for: only the
-/// stamp's mtime is ever read, so it is moved to now where that works, and
-/// the check goes ahead either way.
+/// the volume is likely full, which is what recovery is for. Only the
+/// stamp's mtime is ever read, so moving it to now claims the slot too, and
+/// so does an empty stamp put in its place, which needs no data block. When
+/// none of that works the check is dropped, since one that claims nothing
+/// would go ahead after every put.
 fn claim_auto_gc_check(config: &Config, stamp: &Path) -> bool {
     let now_str = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -579,41 +581,57 @@ fn claim_auto_gc_check(config: &Config, stamp: &Path) -> bool {
     if config.auto_recover_min_free_bytes == 0 {
         return false;
     }
-    if let Err(e) = filetime::set_file_mtime(stamp, filetime::FileTime::now()) {
-        tracing::debug!("auto-gc: could not touch {}: {e}", stamp.display());
+    if filetime::set_file_mtime(stamp, filetime::FileTime::now()).is_ok() {
+        return true;
     }
-    true
+    let _ = std::fs::remove_file(stamp);
+    match std::fs::File::create_new(stamp) {
+        Ok(_) => true,
+        Err(e) => {
+            tracing::debug!("auto-gc: could not claim {}: {e}", stamp.display());
+            false
+        }
+    }
 }
 
-/// After a store: if [`auto_gc_wanted`] says so, get a sweep started without
-/// waiting for it.
-pub(crate) fn maybe_spawn_auto_gc(config: &Config, store: &Store) {
-    let _trace = crate::phase_trace::phase("auto_gc_check");
-    run_auto_gc_check(
+/// Follow up an attempt to store an entry, without blocking the compile.
+/// `failure` is why staging or the put failed, `None` once the entry is
+/// stored. A stored entry grew the store, so [`auto_gc_wanted`] decides
+/// whether to start a sweep. One the volume refused for lack of space stored
+/// nothing, so with a free-space floor set it asks for recovery itself, once
+/// per check interval and without the store size query.
+pub(crate) fn after_store(config: &Config, store: &Store, failure: Option<&anyhow::Error>) {
+    after_store_with(
         config,
         store,
+        failure,
         crate::daemon::send_gc_hint,
         spawn_auto_gc_worker,
     );
 }
 
-/// After a put that failed. One the volume refused for lack of space never
-/// reaches [`maybe_spawn_auto_gc`], which follows only a put that succeeded,
-/// so with a free-space floor set this asks for recovery itself. It skips
-/// the store size query and keeps the check interval.
-pub(crate) fn maybe_recover_after_failed_put(
+/// [`after_store`], hinting the daemon with `hint_daemon` and starting the
+/// worker with `spawn_worker` (see [`run_auto_gc_check`]).
+fn after_store_with(
     config: &Config,
     store: &Store,
-    error: &anyhow::Error,
+    failure: Option<&anyhow::Error>,
+    hint_daemon: impl FnOnce(&Config) -> bool,
+    spawn_worker: impl FnOnce(&Config),
 ) {
-    if !is_storage_full(error) || !recovery_wanted_after_full_put(config, store) {
+    let _trace = crate::phase_trace::phase("auto_gc_check");
+    let Some(error) = failure else {
+        run_auto_gc_check(config, store, hint_daemon, spawn_worker);
+        return;
+    };
+    if !is_storage_full(error) || !space_recovery_wanted(config, store) {
         return;
     }
     tracing::info!(
         "auto-gc: the volume of {} is full, requesting recovery",
         store.cache_dir().display()
     );
-    request_auto_gc(config, crate::daemon::send_gc_hint, spawn_auto_gc_worker);
+    request_auto_gc(config, hint_daemon, spawn_worker);
 }
 
 /// Whether `error` says the volume ran out of space, at any depth of its
@@ -630,9 +648,10 @@ fn is_storage_full(error: &anyhow::Error) -> bool {
     })
 }
 
-/// Whether the store a put found full should be recovered now: recovery is
-/// on and due for it, and no check has claimed this interval. Claims it.
-fn recovery_wanted_after_full_put(config: &Config, store: &Store) -> bool {
+/// Whether the store whose volume refused a write should be recovered now:
+/// recovery is on and due for it, and no check has claimed this interval.
+/// Claims it.
+fn space_recovery_wanted(config: &Config, store: &Store) -> bool {
     let swept = config.for_store_dir(store.cache_dir(), crate::volume_gc::filesystem_bytes);
     let stamp = auto_gc_stamp_path(&config.cache_dir);
     if !crate::disk_recovery::wanted(&swept) || !auto_gc_check_due(&stamp) {
@@ -1458,39 +1477,43 @@ pub fn run_nvcc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         let depinfo_anchor = nvcc_depinfo_rewrite_root(&parsed);
         let target = crate::compiler::nvcc::nvcc_target_label(&parsed.deferred_flags);
         match prepare_cc_store_files(&result.artifacts, depinfo_anchor.as_deref()) {
-            Ok(prepared) => match store.put_with_compile_time_independent(
-                &cache_key,
-                &crate_name,
-                &[], // crate_types: n/a for nvcc objects
-                &[], // features: n/a
-                &target,
-                "", // profile: n/a (opt level is in the key)
-                &prepared.files,
-                &result.stdout,
-                &result.stderr,
-                compile_time_ms,
-            ) {
-                Ok(put) => {
-                    store_put = put;
-                    // Store grew — throttled size check + detached background GC if over
-                    // budget (kunobi-ninja/kache#497). Never blocks the compile path.
-                    maybe_spawn_auto_gc(config, &store);
-                    flush_or_hand_off_durability(config, &store, &cache_key);
-                    maybe_enqueue_upload(config, &store, &cache_key, &crate_name, true);
+            Ok(prepared) => {
+                let put = store.put_with_compile_time_independent(
+                    &cache_key,
+                    &crate_name,
+                    &[], // crate_types: n/a for nvcc objects
+                    &[], // features: n/a
+                    &target,
+                    "", // profile: n/a (opt level is in the key)
+                    &prepared.files,
+                    &result.stdout,
+                    &result.stderr,
+                    compile_time_ms,
+                );
+                // A stored entry grew the store: throttled size check and a detached
+                // background GC if over budget (kunobi-ninja/kache#497). A put refused
+                // for lack of space asks for recovery. Neither blocks the compile.
+                after_store(config, &store, put.as_ref().err());
+                match put {
+                    Ok(put) => {
+                        store_put = put;
+                        flush_or_hand_off_durability(config, &store, &cache_key);
+                        maybe_enqueue_upload(config, &store, &cache_key, &crate_name, true);
+                    }
+                    Err(e) => {
+                        store_error = store_error_for_event(&e);
+                        tracing::warn!(
+                            "failed to store nvcc cache entry for {crate_name}: {store_error}"
+                        );
+                    }
                 }
-                Err(e) => {
-                    store_error = store_error_for_event(&e);
-                    tracing::warn!(
-                        "failed to store nvcc cache entry for {crate_name}: {store_error}"
-                    );
-                    maybe_recover_after_failed_put(config, &store, &e);
-                }
-            },
+            }
             Err(e) => {
                 store_error = store_error_for_event(&e);
                 tracing::warn!(
                     "failed to prepare nvcc cache entry for {crate_name}: {store_error}"
                 );
+                after_store(config, &store, Some(&e));
             }
         }
     }
@@ -2438,7 +2461,7 @@ fn run_cc_with_store(
                         }
                     }
                 }
-                match store.put_with_compile_time_independent(
+                let put = store.put_with_compile_time_independent(
                     &cache_key,
                     crate_name,
                     &[], // crate_types: n/a for cc objects
@@ -2449,12 +2472,14 @@ fn run_cc_with_store(
                     stdout,
                     &result.stderr,
                     compile_time_ms,
-                ) {
+                );
+                // A stored entry grew the store: throttled size check and a detached
+                // background GC if over budget (kunobi-ninja/kache#497). A put refused
+                // for lack of space asks for recovery. Neither blocks the compile.
+                after_store(config, store, put.as_ref().err());
+                match put {
                     Ok(result) => {
                         store_put = result;
-                        // Store grew — throttled size check + detached background GC if over
-                        // budget (kunobi-ninja/kache#497). Never blocks the compile path.
-                        maybe_spawn_auto_gc(config, store);
                         flush_or_hand_off_durability(config, store, &cache_key);
                         maybe_enqueue_upload(
                             config,
@@ -2471,7 +2496,6 @@ fn run_cc_with_store(
                             crate_name,
                             store_error
                         );
-                        maybe_recover_after_failed_put(config, store, &e);
                     }
                 }
             }
@@ -2482,6 +2506,9 @@ fn run_cc_with_store(
                     crate_name,
                     store_error
                 );
+                // Staging copies whole objects onto the cache volume when the
+                // daemon publishes, so this is where a full one shows first.
+                after_store(config, store, Some(&e));
             }
         }
     }
@@ -4443,6 +4470,7 @@ fn run_parsed_rustc(
                 "not caching {}: dep-info could not be staged safely: {error:#}",
                 crate_name
             );
+            after_store(config, &store, Some(&error));
             let elapsed = start.elapsed().as_millis() as u64;
             log_event(
                 config,
@@ -4492,7 +4520,7 @@ fn run_parsed_rustc(
     let trace_store = crate::phase_trace::phase("store");
     let mut store_put = StorePutResult::default();
     let mut store_error = String::new();
-    match store.put_with_compile_time(
+    let put = store.put_with_compile_time(
         &cache_key,
         crate_name,
         &args.crate_types,
@@ -4503,7 +4531,12 @@ fn run_parsed_rustc(
         &result.stdout,
         &result.stderr,
         compile_time_ms,
-    ) {
+    );
+    // A stored entry grew the store: throttled size check and a detached
+    // background GC if over budget (kunobi-ninja/kache#497). A put refused for
+    // lack of space asks for recovery. Neither blocks the compile.
+    after_store(config, &store, put.as_ref().err());
+    match put {
         Ok(result) => {
             store_put = result;
             if let Some(unit) = args.get_codegen_opt("metadata")
@@ -4520,9 +4553,6 @@ fn run_parsed_rustc(
                     shared_inode_loadable(args, platform::current().may_share_restored_loadables());
                 remember_prestaged_executables(config, compiler, args, &output_dir, shared, &meta);
             }
-            // Store grew — throttled size check + detached background GC if over
-            // budget (kunobi-ninja/kache#497). Never blocks the compile path.
-            maybe_spawn_auto_gc(config, &store);
             flush_or_hand_off_durability(config, &store, &cache_key);
         }
         // Name the crate, as the cc path already does: a failed store leaves that
@@ -4537,7 +4567,6 @@ fn run_parsed_rustc(
                 crate_name,
                 store_error
             );
-            maybe_recover_after_failed_put(config, &store, &e);
         }
     }
     drop(trace_store);

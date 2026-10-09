@@ -421,6 +421,9 @@ fn publish_one(daemon: &Arc<Daemon>, config: &Config, store: &Store, job: Publis
         &request.stderr,
         request.compile_time_ms,
     );
+    // As after a wrapper's put: a size check after a stored entry, recovery
+    // after one refused for lack of space.
+    crate::wrapper::after_store(config, store, put.as_ref().err());
     match put {
         Ok(put) => {
             event.result = if put.is_full_dup() {
@@ -441,7 +444,6 @@ fn publish_one(daemon: &Arc<Daemon>, config: &Config, store: &Store, job: Publis
             {
                 tracing::debug!("daemon could not record the cc memo: {error}");
             }
-            crate::wrapper::maybe_spawn_auto_gc(config, store);
             if request.publishes_to_remote && config.remote.is_some() {
                 enqueue_upload(daemon, config, &request);
             }

@@ -149,17 +149,21 @@ impl<'db> FileHashCache<'db> {
         }
     }
 
+    /// The memoised hash for `fingerprint`: a row whose whole stamp matches,
+    /// recorded under [`FILE_HASH_RULE`] or a later rule.
     pub fn get(&self, fingerprint: &FileFingerprint) -> rusqlite::Result<Option<String>> {
         self.db()
             .query_row(
                 "SELECT hash FROM file_hashes
-                 WHERE path = ?1 AND size = ?2 AND mtime_ns = ?3 AND ctime_ns = ?4 AND inode = ?5",
+                 WHERE path = ?1 AND size = ?2 AND mtime_ns = ?3 AND ctime_ns = ?4 AND inode = ?5
+                   AND rule >= ?6",
                 params![
                     fingerprint.path,
                     fingerprint.size,
                     fingerprint.mtime_ns,
                     fingerprint.ctime_ns,
-                    fingerprint.inode
+                    fingerprint.inode,
+                    FILE_HASH_RULE
                 ],
                 |row| row.get(0),
             )
@@ -182,7 +186,7 @@ impl<'db> FileHashCache<'db> {
             let placeholders = vec!["?"; chunk.len()].join(",");
             let mut stmt = self.db().prepare_cached(&format!(
                 "SELECT path, size, mtime_ns, ctime_ns, inode, hash FROM file_hashes
-                 WHERE path IN ({placeholders})"
+                 WHERE path IN ({placeholders}) AND rule >= {FILE_HASH_RULE}"
             ))?;
             let rows = stmt.query_map(
                 rusqlite::params_from_iter(chunk.iter().map(|f| f.path.as_str())),
@@ -212,15 +216,16 @@ impl<'db> FileHashCache<'db> {
     pub fn put(&self, fingerprint: &FileFingerprint, hash: &str) -> rusqlite::Result<()> {
         self.db().execute(
             "INSERT OR REPLACE INTO file_hashes
-             (path, size, mtime_ns, ctime_ns, inode, hash, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'))",
+             (path, size, mtime_ns, ctime_ns, inode, hash, updated_at, rule)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'), ?7)",
             params![
                 fingerprint.path,
                 fingerprint.size,
                 fingerprint.mtime_ns,
                 fingerprint.ctime_ns,
                 fingerprint.inode,
-                hash
+                hash,
+                FILE_HASH_RULE
             ],
         )?;
         Ok(())
@@ -364,17 +369,24 @@ impl<'db> FileHashCache<'db> {
     /// primary key index: 27% smaller on a real 1.3-million-row table
     /// (kunobi-ninja/kache#1206). Copying takes the write lock for about a
     /// second per million rows, so it runs from the GC sweep after the prune,
-    /// never when a build opens the index. Returns whether it rebuilt.
+    /// never when a build opens the index. Returns whether it rebuilt. A
+    /// table without a `rule` column copies its rows at rule 0, which no
+    /// lookup serves.
     pub fn rebuild_file_hashes_without_rowid(&self) -> rusqlite::Result<bool> {
         let tx = Transaction::new_unchecked(self.db(), TransactionBehavior::Immediate)?;
         if !file_hashes_has_rowid(&tx)? {
             return Ok(false);
         }
+        let rule = if file_hashes_have_rule(&tx)? {
+            "rule"
+        } else {
+            "0"
+        };
         tx.execute_batch(&format!(
             "CREATE TABLE file_hashes_rebuilt ({FILE_HASHES_COLUMNS}) WITHOUT ROWID;
              INSERT INTO file_hashes_rebuilt
-                 (path, size, mtime_ns, ctime_ns, inode, hash, updated_at)
-                 SELECT path, size, mtime_ns, ctime_ns, inode, hash, updated_at
+                 (path, size, mtime_ns, ctime_ns, inode, hash, updated_at, rule)
+                 SELECT path, size, mtime_ns, ctime_ns, inode, hash, updated_at, {rule}
                  FROM file_hashes;
              DROP TABLE file_hashes;
              ALTER TABLE file_hashes_rebuilt RENAME TO file_hashes;
@@ -474,7 +486,8 @@ fn ensure_input_predictions_last_used(db: &Connection, now: i64) -> rusqlite::Re
 }
 
 /// The columns of `file_hashes`, for the table a new store creates and for
-/// the rebuild of an older one.
+/// the rebuild of an older one. `rule` is the [`FILE_HASH_RULE`] the writer
+/// followed; a release from before the column leaves it at 0.
 const FILE_HASHES_COLUMNS: &str = "
     path       TEXT PRIMARY KEY,
     size       INTEGER NOT NULL,
@@ -482,7 +495,45 @@ const FILE_HASHES_COLUMNS: &str = "
     ctime_ns   INTEGER NOT NULL DEFAULT 0,
     inode      INTEGER NOT NULL DEFAULT 0,
     hash       TEXT NOT NULL,
-    updated_at TEXT NOT NULL DEFAULT (datetime('now'))";
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    rule       INTEGER NOT NULL DEFAULT 0";
+
+/// The rule a `file_hashes` row was recorded under. Lookups serve only rows
+/// at this rule or a later one, which may only add conditions. Rows from a
+/// release that predates the `rule` column, written before an upgrade or by
+/// that release afterwards, read as 0 and are never served.
+///
+/// 1: a hash read from a file is memoised only if the file's stamp had
+///    settled when it was read ([`stamp_is_settled`]).
+pub const FILE_HASH_RULE: i64 = 1;
+
+fn file_hashes_have_rule(db: &Connection) -> rusqlite::Result<bool> {
+    db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('file_hashes') WHERE name = 'rule')",
+        [],
+        |row| row.get(0),
+    )
+}
+
+/// Add `rule` to a `file_hashes` table from before it, emptying the table:
+/// its rows were recorded under no known rule, and some without checking
+/// that the file had settled. Checked again under the write lock, so the
+/// rows go once however many processes open the index together. Gated on
+/// the column rather than the index generation, which an older release
+/// stamps back over a newer one each time it opens the index.
+fn ensure_file_hashes_rule(db: &Connection) -> rusqlite::Result<()> {
+    if file_hashes_have_rule(db)? {
+        return Ok(());
+    }
+    let tx = Transaction::new_unchecked(db, TransactionBehavior::Immediate)?;
+    if !file_hashes_have_rule(&tx)? {
+        tx.execute_batch(
+            "ALTER TABLE file_hashes ADD COLUMN rule INTEGER NOT NULL DEFAULT 0;
+             DELETE FROM file_hashes;",
+        )?;
+    }
+    tx.commit()
+}
 
 /// Whether `file_hashes` is still the rowid table older stores created. A
 /// rowid table keys its rows by a hidden integer, so `path` sits in the table
@@ -537,6 +588,7 @@ pub fn ensure_file_hash_cache_schema(db: &Connection) -> rusqlite::Result<()> {
             return Err(e);
         }
     }
+    ensure_file_hashes_rule(db)?;
     ensure_input_predictions_last_used(db, unix_now())
 }
 
@@ -925,6 +977,85 @@ mod tests {
             !found.contains_key("/moved.h"),
             "a changed stamp reads as absent"
         );
+    }
+
+    /// How 1.0.0 records a row: it names no `rule`.
+    fn record_as_older_release(db: &Connection, fingerprint: &FileFingerprint, hash: &str) {
+        db.execute(
+            "INSERT OR REPLACE INTO file_hashes
+             (path, size, mtime_ns, ctime_ns, inode, hash, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'))",
+            params![
+                fingerprint.path,
+                fingerprint.size,
+                fingerprint.mtime_ns,
+                fingerprint.ctime_ns,
+                fingerprint.inode,
+                hash
+            ],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_row_an_older_release_records_is_never_served() {
+        let db = Connection::open_in_memory().unwrap();
+        ensure_file_hash_cache_schema(&db).unwrap();
+        let cache = FileHashCache::Borrowed(&db);
+        let current = stamp("/current.h", 1, 1);
+        let older = stamp("/older.h", 1, 1);
+        cache.put(&current, "h-current").unwrap();
+        record_as_older_release(&db, &older, "h-older");
+
+        assert_eq!(cache.get(&current).unwrap().as_deref(), Some("h-current"));
+        assert_eq!(cache.get(&older).unwrap(), None);
+        let found = cache.get_many(&[&current, &older]).unwrap();
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found["/current.h"], "h-current");
+
+        // Rewritten by the older release, the current row is gone too.
+        record_as_older_release(&db, &current, "h-older");
+        assert_eq!(cache.get(&current).unwrap(), None);
+    }
+
+    #[test]
+    fn the_rule_column_arrives_once_and_takes_the_older_rows_with_it() {
+        for table in [
+            ROWID_FILE_HASHES.to_string(),
+            format!("{ROWID_FILE_HASHES} WITHOUT ROWID"),
+        ] {
+            let db = Connection::open_in_memory().unwrap();
+            db.execute_batch(&table).unwrap();
+            record_as_older_release(&db, &stamp("/older.h", 1, 1), "h-older");
+            ensure_file_hash_cache_schema(&db).unwrap();
+            assert!(file_hashes_have_rule(&db).unwrap(), "{table}");
+            let rows = || -> i64 {
+                db.query_row("SELECT count(*) FROM file_hashes", [], |row| row.get(0))
+                    .unwrap()
+            };
+            assert_eq!(rows(), 0, "{table}");
+
+            let cache = FileHashCache::Borrowed(&db);
+            cache.put(&stamp("/current.h", 1, 1), "h-current").unwrap();
+            ensure_file_hash_cache_schema(&db).unwrap();
+            assert_eq!(rows(), 1, "{table}: once");
+        }
+    }
+
+    #[test]
+    fn rebuilding_without_rowid_keeps_each_rows_rule() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(ROWID_FILE_HASHES).unwrap();
+        ensure_file_hash_cache_schema(&db).unwrap();
+        let cache = FileHashCache::Borrowed(&db);
+        let current = stamp("/current.h", 1, 1);
+        let older = stamp("/older.h", 1, 1);
+        cache.put(&current, "h-current").unwrap();
+        record_as_older_release(&db, &older, "h-older");
+
+        assert!(cache.rebuild_file_hashes_without_rowid().unwrap());
+        assert_eq!(cache.get(&current).unwrap().as_deref(), Some("h-current"));
+        assert_eq!(cache.get(&older).unwrap(), None);
     }
 
     #[test]

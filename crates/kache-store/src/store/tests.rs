@@ -132,42 +132,73 @@ fn index_from_generation_four_gains_the_unit_column() {
     assert_eq!(generation, INDEX_SCHEMA_GENERATION);
 }
 
-/// File hash rows from before generation 9 may have been read before their
-/// stamp settled. An older index drops them once; a current one keeps what
-/// it memoises from then on.
+/// An index from before `file_hashes.rule` loses its file hash rows once,
+/// when the column arrives. An older release that opens the index later
+/// stamps its own generation back and records rows without a rule: the next
+/// open keeps the rows this release memoised and never serves the older
+/// release's.
 #[test]
-fn an_index_from_before_generation_nine_drops_its_file_hashes_once() {
+fn an_older_release_reopening_the_index_does_not_empty_the_file_hash_memo() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("index.db");
-    let rows = |db: &Connection| -> i64 {
-        db.query_row("SELECT count(*) FROM file_hashes", [], |row| row.get(0))
-            .unwrap()
+    let stamp = |file: &str| crate::file_hash::FileFingerprint {
+        path: file.to_string(),
+        size: 1,
+        mtime_ns: 1,
+        ctime_ns: 1,
+        inode: 1,
     };
-    let memoise = |db: &Connection, file: &str| {
+    // The statement 1.0.0 records a row with.
+    let record_as_older_release = |db: &Connection, file: &str| {
         db.execute(
-            "INSERT INTO file_hashes (path, size, mtime_ns, hash) VALUES (?1, 1, 1, 'h')",
+            "INSERT OR REPLACE INTO file_hashes
+             (path, size, mtime_ns, ctime_ns, inode, hash, updated_at)
+             VALUES (?1, 1, 1, 1, 1, 'older', datetime('now'))",
             params![file],
         )
         .unwrap();
     };
+    let rows = |db: &Connection| -> i64 {
+        db.query_row("SELECT count(*) FROM file_hashes", [], |row| row.get(0))
+            .unwrap()
+    };
+    let served = |db: &Connection, file: &str| {
+        crate::file_hash::FileHashCache::Borrowed(db)
+            .get(&stamp(file))
+            .unwrap()
+    };
+
     let db = open_index_db(&path).unwrap();
-    memoise(&db, "/old");
+    db.execute_batch(
+        "DROP TABLE file_hashes;
+         CREATE TABLE file_hashes (
+             path TEXT PRIMARY KEY, size INTEGER NOT NULL, mtime_ns INTEGER NOT NULL,
+             ctime_ns INTEGER NOT NULL DEFAULT 0, inode INTEGER NOT NULL DEFAULT 0,
+             hash TEXT NOT NULL, updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+         ) WITHOUT ROWID;",
+    )
+    .unwrap();
+    record_as_older_release(&db, "/before-upgrade");
     db.pragma_update(None, "user_version", 8_i64).unwrap();
     drop(db);
 
     let db = open_index_db(&path).unwrap();
-    assert_eq!(rows(&db), 0, "generation 8 rows are dropped");
-    memoise(&db, "/new");
+    assert_eq!(rows(&db), 0, "rows from before the column are dropped");
+    crate::file_hash::FileHashCache::Borrowed(&db)
+        .put(&stamp("/memoised"), "current")
+        .unwrap();
+    db.pragma_update(None, "user_version", 8_i64).unwrap();
+    record_as_older_release(&db, "/older-release");
     drop(db);
-    let db = open_index_db(&path).unwrap();
-    assert_eq!(rows(&db), 1, "a current index keeps its rows");
 
-    assert!(file_hashes_predate_settled_reads(8));
-    assert!(!file_hashes_predate_settled_reads(9));
-    assert!(
-        !file_hashes_predate_settled_reads(10),
-        "a newer index memoised under the same rule"
-    );
+    let db = open_index_db(&path).unwrap();
+    let generation: i64 = db
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(generation, INDEX_SCHEMA_GENERATION, "the schema ran again");
+    assert_eq!(rows(&db), 2, "nothing was dropped the second time");
+    assert_eq!(served(&db, "/memoised").as_deref(), Some("current"));
+    assert_eq!(served(&db, "/older-release"), None);
 }
 
 /// A put never learns its unit; the wrapper records it afterwards, and

@@ -83,7 +83,11 @@ pub fn run(args: &[OsString]) -> i32 {
     let env = TestEnv::capture();
     let config = crate::config::Config::load().ok();
     let cache_dir = config.as_ref().map(|config| config.cache_dir.as_path());
-    let target_use = match cache_dir.map(crate::target_use::shared).transpose() {
+    let test_args = args[1..].iter().map(OsString::as_os_str);
+    let target_use = match cache_dir
+        .map(|dir| crate::target_use::shared_for(dir, test_args))
+        .transpose()
+    {
         Ok(lease) => lease,
         Err(error) => {
             eprintln!("kache test-runner: cannot protect target directory: {error}");

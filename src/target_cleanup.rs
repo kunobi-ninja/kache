@@ -1883,7 +1883,7 @@ mod tests {
         let target = root.path().join("target");
         std::fs::create_dir_all(target.join("debug")).unwrap();
         let identity = crate::machine::directory_identity(&target).unwrap();
-        let command = crate::target_use::shared(root.path()).unwrap();
+        let command = crate::target_use::shared(root.path(), &mut std::io::sink()).unwrap();
         assert!(!remove(&target, identity, 7, root.path()).unwrap());
         assert!(target.exists());
         drop(command);

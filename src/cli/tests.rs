@@ -7074,7 +7074,7 @@ fn remove_targets_keeps_a_target_while_cargo_is_running() {
         estimated_reclaimable: 10,
         apparent_gap: 0,
     }];
-    let command = crate::target_use::shared(root.path()).unwrap();
+    let command = crate::target_use::shared(root.path(), &mut std::io::sink()).unwrap();
     let mut skipped = Vec::new();
     assert_eq!(
         remove_targets(&to_remove, root.path(), root.path(), true, &mut skipped).0,

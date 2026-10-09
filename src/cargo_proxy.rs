@@ -193,7 +193,7 @@ fn run_with_source(cargo_args: Vec<OsString>) -> Result<()> {
 
 fn run_cargo_with_target_protection(command: Command, cargo: &Path) -> Result<()> {
     let config = crate::config::Config::load().context("loading the cache configuration")?;
-    let target_use = crate::target_use::shared(&config.cache_dir)
+    let target_use = crate::target_use::shared_for(&config.cache_dir, command.get_args())
         .context("protecting target directories while Cargo runs")?;
     run_cargo_guarded(command, cargo, target_use, &config)
 }

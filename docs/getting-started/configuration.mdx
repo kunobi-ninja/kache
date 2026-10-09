@@ -265,7 +265,7 @@ Builds through Kache record the target directories they use; `kache clean --dry-
 
 It applies the same checks as `kache clean --yes`. A directory is removed only while it is still the Cargo target directory that was recorded, never when it holds a `Cargo.toml` or `.git`, and never while a running Cargo command or test holds it. The daemon renames it aside and checks once more before deleting it, so a build that starts at that moment gets a new directory. A workspace counts as deleted only when looking it up finds nothing; a permission or network error does not count. The daemon log names each directory it removes and why.
 
-Put Kache's `cargo` shim before the real Cargo on `PATH` to keep targets through `cargo test`, `cargo nextest`, and `cargo run`. The shim runs the real Cargo with the original arguments. The test runner also protects the target while a test binary runs. Cleanup skips targets while any such command is active.
+Put Kache's `cargo` shim before the real Cargo on `PATH` to keep targets through `cargo test`, `cargo nextest`, and `cargo run`. The shim runs the real Cargo with the original arguments. The test runner also protects the target while a test binary runs. Cleanup skips targets while any such command is active. A command that starts while a cleanup is deleting waits until it finishes and says so on stderr.
 
 The daemon also asks Git for the other worktrees of repositories it has seen in a build. It records default Cargo targets found there, including sibling worktrees outside the original directory. A custom target path is known only after Kache sees a build use it. By default the daemon neither watches nor removes a Git-discovered target, and `kache targets` shows its idle time as unknown.
 

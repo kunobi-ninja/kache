@@ -60,6 +60,8 @@ Pass Cargo arguments after `--`. Kache runs Cargo and holds the lock that keeps 
 
 Other commands, such as `test`, run without these changes.
 
+If `kache clean` or the daemon's target cleanup holds that lock when Cargo starts, Kache prints `kache: waiting for target cleanup (pid 4242) to finish` on stderr and starts Cargo once the cleanup releases the lock. Cargo's `-q` or `--quiet` hides the line. A test run through `kache test-runner` waits the same way.
+
 ## `kache list`
 
 ```bash

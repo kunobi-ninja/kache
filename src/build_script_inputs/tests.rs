@@ -796,6 +796,25 @@ fn an_oversized_record_is_refused() {
     assert!(fixture.resolve(&[], 100).is_ok());
 }
 
+#[test]
+fn a_script_declares_inputs_when_it_prints_a_path_or_a_variable() {
+    let fixture = Fixture::new();
+    let located = fixture.located();
+    assert!(!declares_inputs(&located), "no record of the run");
+    for (stdout, declares) in [
+        ("cargo:rustc-cfg=x\n", false),
+        ("cargo:rerun-if-changed=data/value.txt\n", true),
+        ("cargo::rerun-if-env-changed=APP_MODE\n", true),
+        ("cargo:rerun-if-changed=\n", true),
+    ] {
+        fixture.declare(stdout);
+        assert_eq!(declares_inputs(&located), declares, "{stdout:?}");
+    }
+    let stdout = std::fs::File::create(fixture.stdout()).unwrap();
+    stdout.set_len(MAX_STDOUT_BYTES + 1).unwrap();
+    assert!(declares_inputs(&located), "a record that cannot be read");
+}
+
 /// In a worktree `.git` is a file, so a declared `.git/HEAD` runs through a
 /// file. Cargo counts a path it cannot stat as missing, and so does the key.
 #[test]

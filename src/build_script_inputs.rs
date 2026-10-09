@@ -400,6 +400,19 @@ fn oversized_marker(cache_dir: &Path, manifest_dir: &Path, max_entries: usize) -
         .join(&hasher.finalize().to_hex()[..32])
 }
 
+/// Whether `located`'s script declared any input, by Cargo's record of the
+/// run alone. A record that cannot be read counts as declaring some.
+pub(crate) fn declares_inputs(located: &Located) -> bool {
+    match read_record(&located.stdout) {
+        Ok(Some(stdout)) => {
+            let declared = cargo_declarations(&stdout, None);
+            !declared.paths.is_empty() || !declared.env.is_empty()
+        }
+        Ok(None) => false,
+        Err(_) => true,
+    }
+}
+
 /// A file Cargo wrote for the run, or `None` when there is none.
 fn read_record(path: &Path) -> Result<Option<Vec<u8>>> {
     let metadata = match std::fs::metadata(path) {

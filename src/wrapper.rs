@@ -3320,17 +3320,24 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     let extra_inputs_too_new = extra_inputs_hasher.too_new();
     let extra_inputs_guard_inputs = extra_inputs_hasher.take_guarded_inputs();
     let extra_inputs_key_ms = extra_inputs_key_start.elapsed().as_millis() as u64;
-    // A fallback cache does not know Kache's extra-input digest. If Kache
-    // declines an invocation, delegating it could restore the exact stale
-    // artifact this declaration is meant to prevent. Keep the fallback for
-    // ordinary crates, but use a plain compiler passthrough for this one.
+    // A fallback cache does not know Kache's extra-input digest, nor the
+    // inputs the unit's own build script declared. If Kache declines an
+    // invocation, delegating it could restore the exact stale artifact those
+    // inputs are keyed to prevent. Keep the fallback for ordinary crates, but
+    // use a plain compiler passthrough for these.
+    let drop_fallback = config.fallback.is_some()
+        && (extra_inputs.is_some() || build_script_declares_inputs(&args));
+    let drop_incremental = extra_inputs.is_some() && config.preserve_incremental;
     let mut safe_extra_inputs_config = None;
-    if extra_inputs.is_some() && (config.fallback.is_some() || config.preserve_incremental) {
+    if drop_fallback || drop_incremental {
         let mut safe = config.clone();
-        if safe.fallback.take().is_some() {
-            tracing::debug!("disabling fallback cache for active extra_inputs crate {crate_name}");
+        if drop_fallback {
+            tracing::debug!(
+                "disabling fallback cache for {crate_name}: its key holds inputs the fallback does not know"
+            );
+            safe.fallback = None;
         }
-        if safe.preserve_incremental {
+        if drop_incremental {
             tracing::debug!(
                 "disabling preserved incremental state for active extra_inputs crate {crate_name}"
             );
@@ -3365,6 +3372,20 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         crate::build_script::install_shim(&args);
     }
     Ok(exit)
+}
+
+/// Whether the unit's own build script declared inputs its key folds (see
+/// [`crate::build_script_inputs`]), judged before any route that can hand
+/// the compile to a fallback cache.
+fn build_script_declares_inputs(args: &RustcArgs) -> bool {
+    let cwd = std::env::current_dir().ok();
+    crate::build_script_inputs::locate(
+        args,
+        &|name: &str| std::env::var_os(name),
+        cwd.as_deref(),
+        crate::out_dir_alias::active_alias().is_some(),
+    )
+    .is_some_and(|located| crate::build_script_inputs::declares_inputs(&located))
 }
 
 /// Event root for a build-script run: the workspace whose target holds its

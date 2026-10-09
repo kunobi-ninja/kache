@@ -389,3 +389,76 @@ pub fn rewrite(_input: TokenStream) -> TokenStream {
         assert_eq!(result(&again, "live"), "skipped", "{}", again["live"]);
     }
 }
+
+fn script(path: &Path, body: &str) {
+    kache_fs::testutil::write_executable(path, format!("#!/bin/sh\n{body}\n"));
+}
+
+/// A fallback cache keys without the inputs a package's build script
+/// declares. A unit whose script declares some never reaches it, even on a
+/// route kache does not cache; a unit whose script declares nothing keeps it.
+#[test]
+fn a_unit_with_declared_inputs_never_reaches_a_fallback_cache() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let cache = root.join("cache");
+    let _daemon = CacheGuard(cache.clone());
+    let rustc = root.join("rustc");
+    let fallback = root.join("fallback");
+    let calls = root.join("calls");
+    script(
+        &rustc,
+        r#"
+for arg in "$@"; do
+  if [ "$arg" = "-vV" ]; then
+    printf 'rustc 1.98.0\nbinary: rustc\ncommit-hash: fake\ncommit-date: 2026-09-01\nhost: x86_64-unknown-linux-gnu\nrelease: 1.98.0\nLLVM version: 22.1.0\n'
+    exit 0
+  fi
+done
+printf 'direct\n' >> "$TEST_CALLS"
+"#,
+    );
+    script(&fallback, r#"printf 'fallback\n' >> "$TEST_CALLS""#);
+    let package = root.join("app");
+    write(&package.join("src/main.rs"), "fn main() {}\n");
+    let out_dir = root.join("target/debug/build/app-0123456789abcdef/out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let deps = root.join("target/debug/deps");
+    std::fs::create_dir_all(&deps).unwrap();
+    let compile = |stdout: &str| {
+        std::fs::write(out_dir.with_file_name("output"), stdout).unwrap();
+        let output = hermetic_command(kache_binary(), &cache, Some(&isolated_config_path(&cache)))
+            .arg(&rustc)
+            .args(["--crate-name", "app", "src/main.rs", "--crate-type", "bin"])
+            .args(["--emit=link", "--out-dir"])
+            .arg(&deps)
+            .current_dir(&package)
+            .env("KACHE_FALLBACK", &fallback)
+            .env("KACHE_CACHE_EXECUTABLES", "false")
+            .env("KACHE_REMOTE", "")
+            .env_remove("KACHE_DISABLED")
+            .env("OUT_DIR", &out_dir)
+            .env("CARGO_MANIFEST_DIR", &package)
+            .env("CARGO_PKG_NAME", "app")
+            .env("TEST_CALLS", &calls)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let called = std::fs::read_to_string(&calls).unwrap();
+        std::fs::remove_file(&calls).unwrap();
+        called
+    };
+    assert_eq!(
+        compile("cargo:rerun-if-changed=data/value.txt\n"),
+        "direct\n"
+    );
+    assert_eq!(
+        compile("cargo:rustc-cfg=x\n"),
+        "fallback\n",
+        "a script that declares nothing"
+    );
+}

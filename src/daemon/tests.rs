@@ -926,6 +926,7 @@ fn compile_started_wire_tags_and_stats_default() {
             remote_key_listing: false,
             remote_description: None,
             local_only: false,
+            remote_readonly: Some(true),
             remote_error: None,
             remote_key_cache_refresh_secs: 60,
             socket_path: "/c/daemon.sock".into(),
@@ -945,7 +946,12 @@ fn compile_started_wire_tags_and_stats_default() {
     old_effective_obj.remove("remote_key_cache_refresh_secs");
     old_effective_obj.remove("remote_key_listing");
     old_effective_obj.remove("runtime_dir");
+    old_effective_obj.remove("remote_readonly");
     let parsed_effective: EffectiveConfig = serde_json::from_value(old_effective).unwrap();
+    assert_eq!(
+        parsed_effective.remote_readonly, None,
+        "an older daemon's write mode is unknown, not writable"
+    );
     assert!(
         parsed_effective.remote_key_listing,
         "an older daemon listed whenever prefetch was on"
@@ -1647,6 +1653,64 @@ async fn diagnostic_stats_send_no_upgrade_metadata_to_legacy_daemons() {
     assert_eq!(stats.version, "0.0.1");
 }
 
+/// 1.0.x orders daemons by this value, so it must be the running
+/// executable's modification time, not just any non-zero number.
+#[test]
+fn the_build_epoch_is_the_executables_mtime() {
+    let modified = std::fs::metadata(std::env::current_exe().unwrap())
+        .unwrap()
+        .modified()
+        .unwrap()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    assert_eq!(build_epoch(), modified);
+}
+
+/// A 1.0.x daemon drains only when `client_epoch` is newer than its own
+/// executable, so requests that may ask for an upgrade carry the real mtime
+/// beside the release.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn upgrade_requests_carry_the_executable_mtime_for_legacy_daemons() {
+    assert_ne!(build_epoch(), 0, "the test binary has a readable mtime");
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let key = test_cache_key("legacy-daemon-epoch");
+    seed_store_entry(&config, &key, "serde", dir.path());
+    let listener = bind_listener(&config.socket_path());
+    let server = tokio::spawn(async move {
+        let mut requests = Vec::new();
+        // The upload is fire-and-forget; the stats read waits for a reply.
+        for reply in [None, Some(stats_at_version(VERSION))] {
+            let stream = listener.accept().await.unwrap();
+            let mut line = String::new();
+            BufReader::new(&stream).read_line(&mut line).await.unwrap();
+            requests.push(serde_json::from_str::<serde_json::Value>(&line).unwrap());
+            if let Some(stats) = reply {
+                let response = Response {
+                    stats: Some(stats),
+                    ..Response::ok()
+                };
+                let line = format!("{}\n", serde_json::to_string(&response).unwrap());
+                (&stream).write_all(line.as_bytes()).await.unwrap();
+            }
+        }
+        requests
+    });
+    let client = config.clone();
+    tokio::task::spawn_blocking(move || {
+        send_upload_job(&client, &key, Path::new("/tmp/test"), "serde").unwrap();
+        send_stats_request(&client, false, None, None).unwrap();
+    })
+    .await
+    .unwrap();
+    let requests = server.await.unwrap();
+    for (request, kind) in requests.iter().zip(["upload", "stats"]) {
+        assert_eq!(request[kind]["client_epoch"], build_epoch(), "{request}");
+        assert_eq!(request[kind]["client_version"], VERSION, "{request}");
+    }
+}
+
 #[test]
 fn only_build_requests_count_as_activity() {
     assert!(!Request::Shutdown.is_build_activity());
@@ -1796,6 +1860,7 @@ async fn readiness_requires_a_successful_compatible_health_response() {
                 health: Some(DaemonHealth {
                     version: VERSION.into(),
                     build_epoch: build_epoch(),
+                    remote_readonly: None,
                 }),
                 ..Response::ok()
             },
@@ -1806,6 +1871,7 @@ async fn readiness_requires_a_successful_compatible_health_response() {
                 health: Some(DaemonHealth {
                     version: "0.0.1".into(),
                     build_epoch: 1,
+                    remote_readonly: None,
                 }),
                 ..Response::ok()
             },
@@ -1816,6 +1882,7 @@ async fn readiness_requires_a_successful_compatible_health_response() {
                 health: Some(DaemonHealth {
                     version: String::new(),
                     build_epoch: 1,
+                    remote_readonly: None,
                 }),
                 ..Response::ok()
             },
@@ -1826,6 +1893,7 @@ async fn readiness_requires_a_successful_compatible_health_response() {
                 health: Some(DaemonHealth {
                     version: "999.0.0".into(),
                     build_epoch: 1,
+                    remote_readonly: None,
                 }),
                 ..Response::ok()
             },
@@ -3858,6 +3926,119 @@ async fn test_handle_upload_remote_readonly() {
     assert!(resp_do.error.is_none());
 }
 
+#[test]
+fn a_rate_limited_warning_reopens_after_its_window() {
+    let start = Instant::now();
+    let every = Duration::from_secs(300);
+    let mut last = None;
+    assert!(warn_window_open(&mut last, start, every));
+    assert!(!warn_window_open(
+        &mut last,
+        start + every - Duration::from_secs(1),
+        every
+    ));
+    assert!(warn_window_open(&mut last, start + every, every));
+    assert!(!warn_window_open(&mut last, start + every, every));
+}
+
+/// A writable build's uploads that reach a read-only daemon are still
+/// acknowledged and skipped. The first skip warns; later ones in the window
+/// do not. (Capturing the log races other tests over tracing's callsite
+/// cache, so this reads the window the warning claims.)
+#[tokio::test]
+async fn a_read_only_daemon_warns_once_about_skipped_uploads() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path());
+    config.remote = Some(test_remote_config());
+    config.remote_readonly = true;
+    let jobs: Vec<UploadJob> = ["first-readonly-skip", "second-readonly-skip"]
+        .into_iter()
+        .map(|label| UploadJob {
+            key: test_cache_key(label),
+            entry_dir: "/tmp".into(),
+            crate_name: "serde".into(),
+            client_epoch: 0,
+            client_version: None,
+        })
+        .collect();
+
+    // A live request, then startup replay of queued intents.
+    for replay in [false, true] {
+        let daemon = Daemon::new(config.clone());
+        let mut first_warning = None;
+        for job in &jobs {
+            let response = if replay {
+                daemon.do_upload(job).await
+            } else {
+                daemon.handle_upload(job).await
+            };
+            assert!(response.ok && response.error.is_none(), "{response:?}");
+            let warned_at = *daemon.readonly_skip_warned.lock().unwrap();
+            assert!(warned_at.is_some(), "replay={replay}: a skip must warn");
+            assert!(
+                first_warning.is_none() || first_warning == warned_at,
+                "replay={replay}: a second skip in the window warned again"
+            );
+            first_warning = warned_at;
+        }
+    }
+    let message = readonly_upload_skip_message();
+    assert!(message.contains("kache daemon restart"), "{message}");
+}
+
+/// Stats carry whether the daemon skips uploads, so `kache stats` can warn
+/// a writable process. A daemon from before the field reads as unknown.
+#[test]
+fn stats_carry_the_daemon_write_mode() {
+    let dir = tempfile::tempdir().unwrap();
+    let provenance = crate::config::ConfigFileProvenance {
+        path: dir.path().join("config.toml"),
+        fingerprint: "fingerprint".to_string(),
+    };
+    let mut config = test_config(dir.path());
+    for readonly in [true, false] {
+        config.remote_readonly = readonly;
+        let captured = EffectiveConfig::capture(&config, &provenance);
+        assert_eq!(captured.remote_readonly, Some(readonly));
+    }
+    let mut older = serde_json::to_value(EffectiveConfig::capture(&config, &provenance)).unwrap();
+    older.as_object_mut().unwrap().remove("remote_readonly");
+    let older: EffectiveConfig = serde_json::from_value(older).unwrap();
+    assert_eq!(older.remote_readonly, None);
+}
+
+/// `kache save-manifest` learns the daemon's write mode from one health
+/// round trip; no daemon reads as unknown.
+#[tokio::test]
+async fn a_health_probe_reports_whether_the_daemon_skips_uploads() {
+    for readonly in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.remote_readonly = readonly;
+        let socket = config.socket_path();
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let listener = bind_listener(&socket);
+        let daemon = Arc::new(Daemon::new(config.clone()));
+        let server = tokio::spawn(async move {
+            let stream = listener.accept().await.unwrap();
+            handle_connection(stream, &daemon, &Arc::new(Lifecycle::default()))
+                .await
+                .unwrap();
+        });
+        let probed = tokio::task::spawn_blocking(move || daemon_remote_readonly(&config))
+            .await
+            .unwrap();
+        assert_eq!(probed, Some(readonly));
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    assert_eq!(daemon_remote_readonly(&test_config(dir.path())), None);
+}
+
 #[tokio::test]
 async fn test_handle_remote_check_no_remote() {
     let dir = tempfile::tempdir().unwrap();
@@ -4430,6 +4611,7 @@ fn test_handle_stats_empty_store() {
     );
     assert!(eff.started_at_ms > 0, "startup capture stamps a time");
     assert!(eff.config_fingerprint.is_some());
+    assert_eq!(eff.remote_readonly, Some(false));
     assert!(
         !eff.config_path.is_empty(),
         "resolved config path is always reportable, even when the file is absent"
@@ -4688,7 +4870,8 @@ fn readiness_reply_requires_success_but_allows_missing_release_metadata() {
         parse_daemon_health(r#"{"ok":true,"health":{"version":"v1","build_epoch":7}}"#).unwrap(),
         DaemonHealth {
             version: "v1".into(),
-            build_epoch: 7
+            build_epoch: 7,
+            remote_readonly: None,
         }
     );
     for response in [
@@ -4738,7 +4921,9 @@ async fn readiness_roundtrip_does_not_wait_for_the_store() {
         .unwrap()
         .unwrap();
     assert_eq!(health.version, VERSION);
-    assert_eq!(health.build_epoch, 0);
+    // 1.0.x clients replace a daemon whose epoch is older than their binary.
+    assert_ne!(build_epoch(), 0, "the test binary has a readable mtime");
+    assert_eq!(health.build_epoch, build_epoch());
     assert_eq!(
         daemon.handle_request_sync(&Request::Health).health,
         Some(health)
@@ -5267,7 +5452,7 @@ async fn test_send_stats_request_client_roundtrip() {
     server.await.unwrap();
 
     assert_eq!(stats.entry_count, 1);
-    assert_eq!(stats.build_epoch, 0);
+    assert_eq!(stats.build_epoch, build_epoch());
     assert_eq!(stats.version, VERSION);
     assert_eq!(stats.entries.unwrap()[0].crate_name, "serde");
 }
@@ -5607,6 +5792,8 @@ async fn a_read_only_or_absent_remote_takes_no_prediction_row() {
         backend.list("").await.unwrap().is_empty(),
         "a read-only remote gets nothing"
     );
+    // Only a writable build sends a row, so the skip warns.
+    assert!(daemon.readonly_skip_warned_at().is_some());
 
     let mut absent = test_config(dir.path());
     absent.remote = None;
@@ -5616,6 +5803,19 @@ async fn a_read_only_or_absent_remote_takes_no_prediction_row() {
         .await;
     assert!(reply.ok);
     assert_eq!(reply.prediction, None);
+    assert!(
+        daemon
+            .handle_prediction_publish(PredictionPublishRequest {
+                identity: ROW_IDENTITY.to_string(),
+                row: test_prediction_row(),
+            })
+            .ok
+    );
+    assert_eq!(
+        daemon.readonly_skip_warned_at(),
+        None,
+        "no remote is not read-only"
+    );
 }
 
 #[tokio::test]

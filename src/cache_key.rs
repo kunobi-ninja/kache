@@ -1144,6 +1144,20 @@ pub fn dep_info_provided() -> bool {
     PROVIDED_DEP_INFO.with(|cell| cell.borrow().is_some())
 }
 
+/// The files of the closure [`provide_dep_info`] left for the next key,
+/// spelled as [`FileFingerprint`] records their paths.
+pub fn provided_dep_info_sources() -> Option<std::collections::HashSet<String>> {
+    PROVIDED_DEP_INFO.with(|cell| {
+        cell.borrow().as_ref().map(|(dep_info, _)| {
+            dep_info
+                .source_files
+                .iter()
+                .map(|path| absolute_path(path).to_string_lossy().into_owned())
+                .collect()
+        })
+    })
+}
+
 /// The closure rustc wrote to `path` during the compile whose crate root is
 /// `source_file`: the same content the pre-pass reads from its own output.
 pub fn dep_info_from_emitted(path: &Path, source_file: &Path) -> Result<DepInfo> {
@@ -7660,14 +7674,6 @@ fn unescape_env_dep_value(s: &str) -> String {
 /// `None` when it cannot be run.
 pub(crate) fn rustc_version_text(rustc: &Path) -> Option<String> {
     get_rustc_version(rustc).ok()
-}
-
-/// The rustup-aware version-cache selector without probing the compiler.
-pub(crate) fn rustc_version_fingerprint(rustc: &Path) -> Option<String> {
-    tool_version_cache_path(rustc, "rustc-ver")?
-        .file_name()?
-        .to_str()
-        .map(str::to_owned)
 }
 
 fn get_rustc_version(rustc: &Path) -> Result<String> {

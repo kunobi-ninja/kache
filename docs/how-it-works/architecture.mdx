@@ -11,14 +11,16 @@ For an eligible compiler invocation, the wrapper:
 
 1. parses the compiler arguments and discovers inputs
 2. computes a BLAKE3 cache key
-3. checks the local store
+3. checks the local store: the `[cache.volumes]` shard that holds the output directory, if one does, then the main store, then a configured [read-only store](/docs/getting-started/configuration#read-only-store)
 4. asks the daemon for an exact remote result after a local miss
 5. on a miss, joins a machine-wide flight, takes a memory-weighted permit and a per-key lock, and checks locally again
 6. runs the compiler if the entry is still absent
 7. stores outputs as content-addressed blobs
 8. queues a remote upload when a writable remote is configured
 
-The second local check prevents duplicate work when another process fills the same key while this process waits for the lock. Hits and passthroughs never join a flight or wait for a permit. See [Limits](/docs/how-it-works/limits).
+On a machine with no remote, fallback wrapper or read-only store, a unit with no usable input record can start compiling before its key is known. Kache then keys it from the dependency file the compile writes. See [Misses without a record](/docs/how-it-works/cache-key#misses-without-a-record).
+
+The second local check prevents duplicate work when another process fills the same key while this process waits for the lock. Hits and passthroughs never join a compile flight. A unit with no usable input record can still wait while another process discovers the same unit's inputs, and a compile that starts before its key is known holds a permit while it runs; either can end as a hit. See [Limits](/docs/how-it-works/limits).
 
 | Result | Compiler ran | Meaning |
 | --- | ---: | --- |
@@ -27,7 +29,9 @@ The second local check prevents duplicate work when another process fills the sa
 | `remote_hit` | No | Exact remote lookup downloaded the entry |
 | `miss` | Yes | The key and at least one output blob were new |
 | `dup` | Yes | The key was new but all output blobs already existed |
-| `passthrough` | Yes | Policy declined to cache the invocation |
+| `error` | Yes | The compiler failed; nothing was stored |
+| `skipped` | Yes | The compile ran but its result was not stored, for example because a requested output was missing, the compile was faster than `cache.min_store_compile_ms`, or another process held the key's lock |
+| `passthrough` | Yes | Kache did not cache the invocation: policy declined it, or the key, the store or a restore failed |
 
 An entry that prefetch imported before the compile asked for it logs `local_hit`. Build timelines mark such units with the prefetch delivery and its timing.
 
@@ -52,9 +56,14 @@ A miss stores its outputs without waiting for an fsync. The daemon flushes the n
 The daemon owns remote work and periodic maintenance:
 
 - exact remote checks and downloads
+- storing finished C/C++ compiles that wrappers hand over (`cache.daemon_publish`)
 - background uploads and durable upload replay
-- speculative prefetch
+- speculative prefetch, and fetching and publishing input records on the remote
+- seeding a new checkout's target directory with registry units another checkout built (`cache.seed_new_targets`)
+- copying large executables beside their destinations while the rest of a build runs
+- flushing entries stored without an fsync, every two seconds
 - scheduled garbage collection
+- index upkeep, target-directory cleanup and target-file sharing when the machine is quiet
 - monitor statistics that require live transfer state
 
 The wrapper connects through `<runtime_dir>/daemon.sock` on Unix or a named pipe on Windows. A daemon failure does not break compilation: local caching continues and remote work is skipped or deferred.
@@ -63,16 +72,24 @@ See [Daemon overview](/docs/daemon/overview) and [Lifecycle](/docs/daemon/lifecy
 
 ## Interception boundary
 
-As `RUSTC_WRAPPER`, Kache sees rustc and workspace-wrapper invocations. It does not wrap Cargo itself or arbitrary tools. Rust link work driven by rustc can be cached when the artifact policy allows it; an independently invoked linker is outside this path.
+As `RUSTC_WRAPPER`, Kache sees rustc and workspace-wrapper invocations, and caches the Clippy ones among them. On Unix, after rustc builds a build script, Kache puts a launcher in its place, so Cargo runs the script through Kache too; see [Build scripts](/docs/how-it-works/build-scripts). Rust link work driven by rustc can be cached when the artifact policy allows it (`cache.cache_executables`, on by default on Linux and macOS); an independently invoked linker is outside this path.
 
-C/C++ caching is separate. Kache must be invoked as the compiler wrapper (`kache cc`) or through a compiler-name shim on `PATH` (`kache init --shims`). Supported object compilations use the same local store and remote pipeline as rustc. clang-cl debug objects stay machine-local. See [C and C++](/docs/getting-started/c-cpp).
+On Unix, `kache init` also adds a shim directory to the front of `PATH` and sets `kache test-runner` as Cargo's runner for the host, both through your shell startup files. The `cargo` shim runs the real Cargo and marks its target directories in use while it runs, so cleanup leaves them alone; it caches nothing. The `rustdoc` shim, which init sets as `build.rustdoc` when that is unset, caches the modes described in [Rust documentation](/docs/getting-started/rustdoc). The test runner makes test binaries wait for the compile scheduler's slots. Apart from these and the C, C++ and CUDA compilers below, Kache wraps no other tools.
+
+C/C++ caching is separate. Kache must be invoked as the compiler wrapper (`kache cc`) or through a compiler-name shim on `PATH` (`kache init --shims`, Unix only). Supported object compilations use the same local store and remote pipeline as rustc. clang-cl debug objects stay machine-local. See [C and C++](/docs/getting-started/c-cpp).
+
+CUDA goes through `kache nvcc` (`CUDACXX="kache nvcc"`, `NVCC="kache nvcc"` or `CMAKE_CUDA_COMPILER_LAUNCHER=kache`). It caches single-source object compiles in the main store and shares them through the remote. It takes no scheduler permit and does not read volume shards or the read-only store. See [CUDA](/docs/getting-started/cuda).
 
 ## Planner
 
 Without a planner service, the daemon prefetches from a ranked list: the identity
-manifest for this lockfile + target + profile, then lockfile shards, then local
-history, then crate-name guesses. With `cache.planner.endpoint` or
-`KACHE_PLANNER_ENDPOINT`, it first asks the preview planner for ranked
-candidates. A fallback response returns the client to its local planning path.
+manifest for this lockfile, target and profile (or, when none exists, the
+manifest of one of the last three committed revisions of `Cargo.lock`, newest
+first), then lockfile shards, then local history, then other keys stored under
+the same crate names. That last source needs the daemon to list the remote,
+which `cache.remote_key_listing` turns on; it is on by default only for
+filesystem remotes. With `cache.planner.endpoint` or `KACHE_PLANNER_ENDPOINT`,
+the daemon first asks the preview planner for ranked candidates. A fallback
+response returns the client to its local planning path.
 
 The planner does not affect local correctness or exact-key lookup. See [Remote service](/docs/remote-service).

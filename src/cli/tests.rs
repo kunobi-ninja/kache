@@ -4553,6 +4553,7 @@ fn effective_config_like(config: &Config) -> crate::daemon::EffectiveConfig {
         remote_key_listing: config.remote_key_listing,
         remote_description: config.remote.as_ref().map(|remote| remote.describe()),
         local_only: config.local_only,
+        remote_readonly: Some(config.remote_readonly),
         remote_error: config.remote_error.clone(),
         remote_key_cache_refresh_secs: config.remote_key_cache_refresh_secs,
         socket_path: config.socket_path().display().to_string(),
@@ -4779,6 +4780,116 @@ fn render_stats_remote_state_prefers_daemon_effective() {
         "Remote | s3://daemon-bucket/artifacts | "
     );
     assert!(!out.join("\n").contains("client config"), "{out:#?}");
+}
+
+/// A daemon keeps the read-only mode of the build that started it, so stats
+/// show the daemon's mode and warn the writable process it skips.
+#[test]
+#[allow(clippy::field_reassign_with_default)]
+fn stats_show_a_read_only_daemon_to_a_writable_process() {
+    let dir = tempfile::tempdir().unwrap();
+    let writable = save_manifest_config(dir.path().join("cache"), Some(test_remote_cfg()));
+    let provenance = crate::config::ConfigFileProvenance {
+        path: "/daemon-home/.config/kache/config.toml".into(),
+        fingerprint: "daemon-fingerprint".to_string(),
+    };
+    let mut snap = StatsSnapshot::default();
+    snap.daemon_connected = true;
+    let mut eff = effective_config_like(&writable);
+    eff.remote_readonly = Some(true);
+    snap.daemon_effective_config = Some(eff.clone());
+
+    let out = render_stats(&snap, &writable, SinceWindow::DEFAULT);
+    assert_eq!(
+        stats_row(&out, "Remote").unwrap(),
+        "Remote | s3://bucket/prefix | "
+    );
+    assert_eq!(
+        stats_row(&out, "Uploads").unwrap(),
+        "Uploads | off | the daemon is read-only and skips remote writes"
+    );
+    let warnings = config_mismatch_warnings(&writable, &provenance, &eff);
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(
+        warnings[0].contains("skips this process's uploads"),
+        "{warnings:?}"
+    );
+
+    // A pull request job under kache-action: both sides read-only. The
+    // action fails the job unless the Remote line holds exactly the remote it
+    // configured.
+    let mut read_only = writable.clone();
+    read_only.remote_readonly = true;
+    let out = render_stats(&snap, &read_only, SinceWindow::DEFAULT);
+    assert_eq!(
+        action_remote_value(&out).as_deref(),
+        Some("s3://bucket/prefix")
+    );
+    assert!(stats_row(&out, "Uploads").is_some());
+
+    // A read-only process sends no uploads, so a writable daemon is no loss.
+    eff.remote_readonly = Some(false);
+    assert!(config_mismatch_warnings(&read_only, &provenance, &eff).is_empty());
+
+    // A daemon too old to report its mode claims nothing either way.
+    eff.remote_readonly = None;
+    snap.daemon_effective_config = Some(eff.clone());
+    assert!(config_mismatch_warnings(&writable, &provenance, &eff).is_empty());
+    let out = render_stats(&snap, &writable, SinceWindow::DEFAULT);
+    assert_eq!(
+        stats_row(&out, "Remote").unwrap(),
+        "Remote | s3://bucket/prefix | "
+    );
+    assert!(stats_row(&out, "Uploads").is_none());
+}
+
+/// Doctor flags a writable process whose daemon is read-only, and asks the
+/// daemon only when this process could upload.
+#[test]
+fn doctor_flags_a_read_only_daemon_for_a_writable_process() {
+    let check = remote_writes_check(None, false, || Some(true));
+    assert!(!check.pass, "{}", check.detail);
+    assert!(
+        check.detail.contains("daemon is read-only"),
+        "{}",
+        check.detail
+    );
+    assert!(
+        check
+            .fix
+            .as_deref()
+            .is_some_and(|fix| fix.contains("kache daemon restart"))
+    );
+    for daemon in [Some(false), None] {
+        let check = remote_writes_check(None, false, || daemon);
+        assert!(check.pass, "{daemon:?}");
+        assert_eq!(check.detail, "read-write");
+        assert!(check.fix.is_none());
+    }
+    for forced in [None, Some("pull request".to_string())] {
+        let check = remote_writes_check(forced.clone(), true, || {
+            panic!("a process that cannot upload must not ask the daemon")
+        });
+        assert!(check.pass);
+        assert!(check.detail.starts_with("read-only"), "{}", check.detail);
+        if let Some(reason) = forced {
+            assert!(check.detail.contains(&reason), "{}", check.detail);
+        }
+    }
+}
+
+/// What kache-action reads from `kache stats`: the rest of the first line
+/// whose `Remote` label is followed by a colon or at least two spaces.
+fn action_remote_value(lines: &[String]) -> Option<String> {
+    lines.iter().find_map(|line| {
+        let rest = line.trim_start().strip_prefix("Remote")?;
+        let value = match rest.strip_prefix(':') {
+            Some(value) => value,
+            None if rest.starts_with("  ") => rest,
+            None => return None,
+        };
+        Some(value.trim().to_string())
+    })
 }
 
 #[test]
@@ -7032,6 +7143,21 @@ fn a_target_says_what_the_next_pass_does_to_it() {
 }
 
 #[test]
+fn the_targets_table_says_nothing_about_unit_cleanup_unless_it_is_on() {
+    let mut off = row("/wt/a", TargetState::Live, 1024);
+    off.unit_cleanup.status = "off".into();
+    let rendered = render_targets(&[off.clone(), row("/wt/b", TargetState::Live, 1024)]).join("\n");
+    assert!(!rendered.contains("unit cleanup"), "{rendered}");
+
+    off.unit_cleanup.status = "unavailable: no receipt yet".into();
+    let rendered = render_targets(&[off]).join("\n");
+    assert!(
+        rendered.contains("(unit cleanup: unavailable: no receipt yet)"),
+        "{rendered}"
+    );
+}
+
+#[test]
 fn the_targets_table_totals_and_points_at_deleted_worktrees() {
     let one = render_targets(&[row("/wt/a", TargetState::Live, 1024)]).join("\n");
     assert!(
@@ -7136,6 +7262,11 @@ fn target_rows_report_each_worktree_and_sort_by_what_frees_most() {
     );
     assert_eq!(rows[1].profiles, ["debug"]);
     assert!(rows.iter().all(|row| row.next_pass.remove.is_none()));
+    // Target liveness is off by default, so no row previews receipt cleanup.
+    assert!(
+        rows.iter().all(|row| row.unit_cleanup.status == "off"),
+        "{rows:?}"
+    );
     #[cfg(unix)]
     {
         let mut pressure = config.clone();
@@ -7505,6 +7636,42 @@ async fn save_manifest_skipped_when_remote_readonly() {
     // a remote client or making any calls.
     save_manifest(&config, Some("mykey"), None)
         .expect("save_manifest should succeed by doing nothing");
+}
+
+/// The end-of-job publish warns a writable job whose daemon is read-only,
+/// and asks the daemon only when the job could upload at all and published
+/// a manifest.
+#[test]
+fn save_manifest_warns_a_writable_job_about_a_read_only_daemon() {
+    let dir = tempfile::tempdir().unwrap();
+    let writable = save_manifest_config(dir.path().join("writable"), Some(test_remote_cfg()));
+    let warning =
+        readonly_daemon_warning(&writable, true, || Some(true)).expect("writable job warns");
+    assert!(warning.contains("kache daemon restart"), "{warning}");
+    for daemon_readonly in [Some(false), None] {
+        assert_eq!(
+            readonly_daemon_warning(&writable, true, || daemon_readonly),
+            None
+        );
+    }
+    assert_eq!(
+        readonly_daemon_warning(&writable, false, || panic!(
+            "no manifest, nothing to warn about"
+        )),
+        None
+    );
+
+    let mut read_only = writable.clone();
+    read_only.remote_readonly = true;
+    let local = save_manifest_config(dir.path().join("local"), None);
+    for config in [&read_only, &local] {
+        assert_eq!(
+            readonly_daemon_warning(config, true, || {
+                panic!("a job that cannot upload must not ask")
+            }),
+            None
+        );
+    }
 }
 
 #[test]

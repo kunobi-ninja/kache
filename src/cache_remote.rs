@@ -108,11 +108,6 @@ impl V3Remote {
         Self { backend, remote }
     }
 
-    pub async fn put_build_report(&self, report: &crate::build_reports::BuildReport) -> Result<()> {
-        crate::build_reports::upload_report(self.backend.as_ref(), &self.remote.prefix, report)
-            .await
-    }
-
     fn layout(&self) -> RemoteLayout<'_> {
         RemoteLayout::new(self.backend.as_ref(), &self.remote)
     }

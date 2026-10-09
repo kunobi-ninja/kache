@@ -819,6 +819,10 @@ pub fn stats(
             daemon_connected: bool,
             daemon_version: String,
             daemon_epoch: u64,
+            /// Whether the daemon skips remote uploads. Absent when no daemon
+            /// answered or it predates the field.
+            #[serde(skip_serializing_if = "Option::is_none")]
+            daemon_remote_readonly: Option<bool>,
             /// Whole hours, rounded down (0 for a sub-hour window). Kept for
             /// consumers that predate `since_secs`.
             hours: u64,
@@ -859,6 +863,10 @@ pub fn stats(
                 daemon_connected: snap.daemon_connected,
                 daemon_version: snap.daemon_version.clone(),
                 daemon_epoch: snap.daemon_build_epoch,
+                daemon_remote_readonly: snap
+                    .daemon_effective_config
+                    .as_ref()
+                    .and_then(|eff| eff.remote_readonly),
                 hours: window.hours(),
                 since_secs: window.secs(),
                 since: window.label(),
@@ -1334,11 +1342,26 @@ fn service_rows(snap: &StatsSnapshot, config: &Config) -> Vec<StatsRow> {
             },
         ),
     };
+    // A daemon keeps the read-only setting it started with, so its mode can
+    // differ from this process's.
+    let remote_readonly = match &snap.daemon_effective_config {
+        Some(eff) => eff.remote_readonly == Some(true),
+        None => config.remote_readonly,
+    };
+    // The Remote row stays the bare description: kache-action compares the
+    // rest of that line with the remote it configured.
     rows.push((
         "Remote",
         format!("{remote_status}{remote_source}"),
         String::new(),
     ));
+    if daemon_has_remote && remote_readonly {
+        rows.push((
+            "Uploads",
+            "off".to_string(),
+            "the daemon is read-only and skips remote writes".to_string(),
+        ));
+    }
 
     // Remote resilience (kunobi-ninja/kache#327, #564): breaker state and
     // negative-cache effectiveness (hits avoided vs. round trips paid). Shown
@@ -1628,6 +1651,14 @@ pub(crate) fn config_mismatch_warnings(
             "warning: {daemon_side} has remote_key_cache_refresh_secs={}; {client_side} says {} \
              — {remedy}",
             eff.remote_key_cache_refresh_secs, config.remote_key_cache_refresh_secs,
+        ));
+    }
+    // Only this direction loses uploads: read-only clients never send any.
+    if eff.remote_readonly == Some(true) && config.remote.is_some() && !config.remote_readonly {
+        warnings.push(format!(
+            "warning: {daemon_side} is read-only; {client_side} is writable, so the daemon skips \
+             this process's uploads. Run `kache daemon restart` from this environment; an \
+             installed service takes the setting from its own environment and config"
         ));
     }
     warnings
@@ -5435,15 +5466,20 @@ fn target_rows(config: &Config, now: i64) -> Result<Vec<TargetRow>> {
             } else {
                 TargetState::Live
             },
-            idle_seconds: crate::target_cleanup::idle_secs(&config.cache_dir, tracked, now)
+            idle_seconds: crate::target_cleanup::idle_secs(config, tracked, now)
                 .map(|idle| idle as u64),
             discovered: tracked.discovered,
             next_pass,
-            unit_cleanup: crate::target_liveness::preview(
-                config,
-                &tracked.path,
-                &tracked.workspace_root,
-            ),
+            // Receipts exist only for builds with target_liveness on, and
+            // validating one reads every fingerprint, so skip it otherwise.
+            unit_cleanup: if config.target_liveness {
+                crate::target_liveness::preview(config, &tracked.path, &tracked.workspace_root)
+            } else {
+                crate::target_liveness::Plan {
+                    status: "off".into(),
+                    ..Default::default()
+                }
+            },
             profiles,
             apparent_bytes: stats.total_bytes,
             reclaimable_bytes: stats.estimated_reclaimable_bytes,
@@ -5465,17 +5501,14 @@ fn format_idle(seconds: u64) -> String {
 }
 
 fn unit_cleanup_note(plan: &crate::target_liveness::Plan) -> String {
-    if plan.status == "ready" {
-        if plan.units > 0 {
-            format!(
-                "  ({} obsolete units: kache clean --units --dry-run)",
-                plan.units
-            )
-        } else {
-            String::new()
-        }
-    } else {
-        format!("  (unit cleanup: {})", plan.status)
+    match plan.status.as_str() {
+        "" | "off" => String::new(),
+        "ready" if plan.units > 0 => format!(
+            "  ({} obsolete units: kache clean --units --dry-run)",
+            plan.units
+        ),
+        "ready" => String::new(),
+        status => format!("  (unit cleanup: {status})"),
     }
 }
 
@@ -6355,6 +6388,36 @@ pub(crate) struct Check {
     fix: Option<String>,
 }
 
+/// Doctor's "Remote writes" check. A daemon keeps the write mode it started
+/// with, so it can skip the uploads of a writable process; the daemon is asked
+/// only when this process could upload.
+fn remote_writes_check(
+    forced_reason: Option<String>,
+    remote_readonly: bool,
+    daemon_readonly: impl FnOnce() -> Option<bool>,
+) -> Check {
+    let daemon_skips_uploads = !remote_readonly && daemon_readonly() == Some(true);
+    let detail = if let Some(reason) = forced_reason {
+        format!("read-only — {reason}")
+    } else if remote_readonly {
+        "read-only (KACHE_REMOTE_READONLY or cache.remote_readonly)".to_string()
+    } else if daemon_skips_uploads {
+        "read-write here, but the daemon is read-only and skips uploads".to_string()
+    } else {
+        "read-write".to_string()
+    };
+    Check {
+        label: "Remote writes",
+        pass: !daemon_skips_uploads,
+        detail,
+        fix: daemon_skips_uploads.then(|| {
+            "run `kache daemon restart` from this environment; an installed service takes the \
+             setting from its own environment and config"
+                .to_string()
+        }),
+    }
+}
+
 pub(crate) fn doctor_shards(config: &Config) -> Vec<Check> {
     crate::store_view::shard_configs(config)
         .iter()
@@ -6746,19 +6809,11 @@ pub fn doctor(
             detail: remote.describe(),
             fix: None,
         });
-        let writes = if let Some(forced) = crate::policy::forced_remote_readonly() {
-            format!("read-only — {}", forced.reason)
-        } else if cfg.remote_readonly {
-            "read-only (KACHE_REMOTE_READONLY or cache.remote_readonly)".to_string()
-        } else {
-            "read-write".to_string()
-        };
-        checks.push(Check {
-            label: "Remote writes",
-            pass: true,
-            detail: writes,
-            fix: None,
-        });
+        checks.push(remote_writes_check(
+            crate::policy::forced_remote_readonly().map(|forced| forced.reason),
+            cfg.remote_readonly,
+            || crate::daemon::daemon_remote_readonly(cfg),
+        ));
         let access = remote_access_check(remote, cfg.s3_pool_idle_secs);
         checks.push(Check {
             label: "Remote access",
@@ -7819,7 +7874,33 @@ pub fn save_manifest(
     manifest_key: Option<&str>,
     namespace: Option<&str>,
 ) -> Result<()> {
-    save_manifest_impl(config, manifest_key, namespace, None, true, true)
+    let published = save_manifest_impl(config, manifest_key, namespace, None, true, true)?;
+    if let Some(warning) = readonly_daemon_warning(config, published, || {
+        crate::daemon::daemon_remote_readonly(config)
+    }) {
+        eprintln!("{warning}");
+    }
+    Ok(())
+}
+
+/// The end-of-job warning for a writable job that published a manifest while
+/// its daemon is read-only: the daemon skipped the job's uploads, so the
+/// manifest can list artifacts the remote lacks. Only then is the daemon asked.
+fn readonly_daemon_warning(
+    config: &Config,
+    published: bool,
+    daemon_readonly: impl FnOnce() -> Option<bool>,
+) -> Option<&'static str> {
+    (published
+        && config.remote.is_some()
+        && !config.remote_readonly
+        && daemon_readonly() == Some(true))
+    .then_some(
+        "warning: the kache daemon is read-only and skips this job's uploads, so the remote \
+             may lack artifacts this manifest lists. Run `kache daemon restart` from this \
+             environment; an installed service takes the setting from its own environment and \
+             config.",
+    )
 }
 
 pub(crate) fn save_manifest_auto_for_session(
@@ -7838,6 +7919,7 @@ pub(crate) fn save_manifest_auto_for_session(
         false,
         false,
     )
+    .map(|_| ())
 }
 
 /// Shards are content-addressed under the first published key only. Later
@@ -7847,6 +7929,7 @@ fn shard_namespace_for_publish_key(index: usize, namespace: Option<&str>) -> Opt
     if index == 0 { namespace } else { None }
 }
 
+/// `true` when a manifest was published.
 fn save_manifest_impl(
     config: &Config,
     manifest_key: Option<&str>,
@@ -7854,10 +7937,10 @@ fn save_manifest_impl(
     session_id: Option<&str>,
     announce: bool,
     allow_env_namespace: bool,
-) -> Result<()> {
+) -> Result<bool> {
     if config.remote_readonly {
         tracing::debug!("skipping manifest save (read-only mode)");
-        return Ok(());
+        return Ok(false);
     }
 
     let remote = config
@@ -7872,7 +7955,7 @@ fn save_manifest_impl(
         if announce {
             eprintln!("No build events found, skipping manifest save");
         }
-        return Ok(());
+        return Ok(false);
     }
 
     let keys = match manifest_key {
@@ -7891,12 +7974,6 @@ fn save_manifest_impl(
         .filter(|value| !value.is_empty())
         .map(String::from)
         .or(env_namespace);
-    let reports = crate::build_reports::collect_reports(
-        &events,
-        session_id,
-        &config.runtime_dir,
-        effective_namespace.as_deref(),
-    )?;
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -7932,9 +8009,6 @@ fn save_manifest_impl(
             )
             .await?;
         }
-        for report in &reports {
-            remote_cache.put_build_report(report).await?;
-        }
         Ok::<(), anyhow::Error>(())
     })?;
 
@@ -7944,7 +8018,7 @@ fn save_manifest_impl(
             published.join("', '")
         );
     }
-    Ok(())
+    Ok(true)
 }
 
 /// Collapse build events into deduplicated manifest entries.

@@ -418,7 +418,10 @@ fn target_cleanup_defaults_and_env_precedence() {
     let config = Config::load().unwrap();
     assert!(config.auto_clean_orphaned_targets);
     assert_eq!(config.auto_clean_idle_targets_days, 0);
-    assert_eq!(config.auto_recover_min_free_bytes, 10 << 30);
+    assert_eq!(
+        config.auto_recover_min_free_bytes, 0,
+        "free-space recovery is opt-in"
+    );
 
     std::fs::write(
         &config_path,
@@ -429,13 +432,6 @@ fn target_cleanup_defaults_and_env_precedence() {
     assert!(!config.auto_clean_orphaned_targets);
     assert_eq!(config.auto_clean_idle_targets_days, 30);
     assert_eq!(config.auto_recover_min_free_bytes, 1 << 30);
-
-    std::fs::write(&config_path, "[cache]\nauto_recover_min_free_bytes = 0\n").unwrap();
-    let config = Config::load().unwrap();
-    assert_eq!(
-        config.auto_recover_min_free_bytes, 0,
-        "0 turns recovery off"
-    );
 
     let _on = NamedEnvGuard::set("KACHE_AUTO_CLEAN_ORPHANED_TARGETS", "1");
     let _days = NamedEnvGuard::set("KACHE_AUTO_CLEAN_IDLE_TARGETS_DAYS", "7");

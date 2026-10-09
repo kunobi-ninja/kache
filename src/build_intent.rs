@@ -110,7 +110,7 @@ pub fn into_build_started_request(
 ) -> crate::daemon::BuildStartedRequest {
     crate::daemon::BuildStartedRequest {
         intent,
-        client_epoch: 0,
+        client_epoch: crate::daemon::build_epoch(),
         client_version: Some(crate::VERSION.to_owned()),
         session_id,
     }
@@ -628,7 +628,9 @@ mod tests {
             req.intent.identity_key.as_deref(),
             Some("id/abcd/x86_64-unknown-linux-gnu/release")
         );
-        assert_eq!(req.client_epoch, 0);
+        // A 1.0.x daemon drains only for a newer executable mtime here.
+        assert_ne!(crate::daemon::build_epoch(), 0);
+        assert_eq!(req.client_epoch, crate::daemon::build_epoch());
         assert_eq!(req.client_version.as_deref(), Some(crate::VERSION));
     }
 

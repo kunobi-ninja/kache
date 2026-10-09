@@ -9,17 +9,21 @@ Plain `cargo doc` runs through the real rustdoc without caching.
 
 ## Toolchain compatibility
 
-Cargo 1.99 emits `--write-doc-meta-dir` and `--read-doc-meta-dir` for these flags.
-The current Kache adapter does not support those arguments, so documentation
-passes through on Rust 1.99. The cached modes below use the older
-`--merge=none` and `--merge=finalize` interface. Check the recorded result
-before assuming a documentation build was cached.
+Cargo 1.99 emits `--write-doc-meta-dir` and `--read-doc-meta-dir` for these
+flags, and current nightly toolchains are newer than 1.99. Kache does not
+support those arguments yet, so documentation passes through on Rust 1.99 and
+on any newer toolchain that passes them. Only an older Cargo that still uses
+`--merge=none` and `--merge=finalize` reaches the cached modes below. Check the
+recorded result before assuming a documentation build was cached.
 
 ## Enable the rustdoc wrapper
 
-Run `kache init` on Unix. It installs compiler shims and sets Cargo's
-`build.rustdoc` to the `rustdoc` shim. For Nix-managed shims or manual setup,
-point `build.rustdoc` at that shim yourself; see
+Run `kache init` on Unix. It installs compiler shims and points Cargo's
+`build.rustdoc` at the `rustdoc` shim in `~/.local/lib/kache/shims`. It does
+this only when Cargo's `rustc-wrapper` is Kache and `build.rustdoc` is not set.
+An existing value stays, and `kache init --no-shell` skips the step.
+`kache doctor` reports the setting under "cargo doc". For Nix-managed shims or
+manual setup, point `build.rustdoc` at the `rustdoc` shim yourself; see
 [Installation](/docs/getting-started/installation#nix).
 
 Then build documentation:

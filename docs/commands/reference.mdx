@@ -7,11 +7,13 @@ Run `kache <command> --help` for the exact syntax in your installed version.
 
 Human output uses section headings, aligned values and status colors. Colors are disabled when stdout is redirected, `NO_COLOR` is nonempty, or `TERM=dumb`. Long summary notes wrap to the terminal width; paths remain complete.
 
-`--json` emits one versioned JSON document for `init`, `list`, `stats`, `report`, `clean`, `gc`, `doctor`, `explain`, `diff`, `targets`, and `daemon status`. It works before or after the command. `clean --json` is a preview unless `--yes` is also present. Use `init --json --check` to preview setup, or `init --json --yes` to apply it without prompts.
+`--json` emits one versioned JSON document for `init`, `list`, `stats`, `report`, `clean`, `gc`, `doctor`, `explain`, `diff`, `targets`, and `daemon status`. It works before or after the command. Use `init --json --check` to preview setup, or `init --json --yes` to apply it without prompts. `init --shims` has no JSON form. `doctor --json` only reports; combined with `--fix`, `--purge-sccache`, `--verify`, `--checksums` or `--repair` it exits with an error.
+
+`clean --json` and `clean --units --json` preview target removal unless `--yes` is also present. The cache forms have no JSON preview. With `--dry-run` they print the preview as text on stderr and no JSON document. `clean --cache --json` and `clean --crate <name> --json` are refused even with `--yes`. `clean --cache --stale <age> --json` and `clean --cache --stale-schema --json` evict at once and print a `gc` document.
 
 Every document includes `schema_version`, `command`, and `success`. Successful commands keep their existing fields and may include `next`, an array of suggested commands with `argv` and `why`. Failures include `error.code`, `error.message`, and `error.causes`, and exit nonzero: 2 for argument errors, 1 for command failures. Progress and warnings go to stderr. `success` means the command completed; diagnostic findings remain in the command's fields, such as `issues` for doctor.
 
-The envelope is documented in [`cli.schema.json`](https://github.com/kunobi-ninja/kache/blob/main/docs/commands/cli.schema.json). Byte counts and durations stay numeric rather than formatted strings. `stats --json` includes count and compile-time hit rates, time saved, wrapper timings, daemon identity, and storage diagnostics. `stats --full --json` and `report --json` add the envelope fields to the full report. Explicit `--format json` keeps the standalone report schema. With `--json --output`, stdout contains a file receipt. `--json --help` describes the command tree and flags; `--json --version` reports the version.
+The envelope is documented in [`cli.schema.json`](https://github.com/kunobi-ninja/kache/blob/main/docs/commands/cli.schema.json). Byte counts and durations stay numeric rather than formatted strings. `stats --json` includes count and compile-time hit rates, time saved, wrapper timings, daemon identity, and storage diagnostics. `stats --full --json` and `report --json` add the envelope fields to the full report. Explicit `--format json` keeps the standalone report schema. With `--json --output`, stdout contains a file receipt. `--json --help` describes the whole visible command tree and its flags, whichever command it follows; hidden commands and flags are left out. `--json --version` reports the version.
 
 | Command | Purpose |
 | --- | --- |
@@ -34,24 +36,29 @@ These are for CI, scripts and integrations, and are not listed by `kache --help`
 | Command | Purpose |
 | --- | --- |
 | `cargo` | Run Cargo with duplicate Cargo-home rustflags collapsed |
-| `prefetch` | Restore a compatible ordered warm set before building |
 | `save-manifest` | Publish build metadata for later prefetch |
-| `telemetry` | Write cache counters and this machine's shared-cache state as OTLP JSON for Kartero |
+| `telemetry` | Write cache counters and this machine's shared-cache state as OTLP JSON for Kartero (`write`), or send build timeline records to the planner service (`push`) |
 | `test-runner` | Run a test binary as Cargo's target runner, paced by the scheduler |
 | `report` | Same report as `kache stats --full`, kept for scripts |
-| `gc`, `purge`, `targets` | What `kache clean` does now, kept for scripts |
+| `gc`, `purge`, `targets` | What `kache clean` does now (`targets` lists what `kache clean --dry-run` shows), kept for scripts |
+| `targets share` | Find target files that duplicate stored blobs; `--apply` replaces them with clones. See [Sharing target files](#sharing-target-files) |
 | `install-shims` | What `kache init --shims` does, kept for scripts |
-| `diff` | The miss counts of the latest build against the one before; exits 1 when they grew. Kept for scripts |
+| `diff` | Misses and the share of unexplained misses in the latest build against the one before; exits 1 when either grew. Kept for scripts |
 | `why-miss` | The earlier name of `kache explain` |
 
 ## `kache cargo`
 
 ```bash
 kache cargo -- build
-kache cargo -- test --workspace
+kache cargo -- check --workspace
 ```
 
-Pass Cargo arguments after `--`. On Cargo 1.91 or newer, this command can keep intermediate worktree state separate while coordinating a shared final target directory.
+Pass Cargo arguments after `--`. Kache runs Cargo and holds the lock that keeps `kache clean` and the daemon from deleting target directories until Cargo exits. For `build` and `check` without `-C`, `-Z` or `--config`, it also:
+
+- passes `build.rustflags` once when an ancestor `.cargo` directory links to `$CARGO_HOME`, which would make Cargo read the same flags twice. Any `RUSTFLAGS`-style variable turns this off.
+- on Cargo 1.91 or newer, sets `build.build-dir` to `{workspace-root}/target` unless `CARGO_BUILD_BUILD_DIR` or a `build.build-dir` setting exists. Each worktree then keeps its own intermediate files while final artifacts go to the shared target directory.
+
+Other commands, such as `test`, run without these changes.
 
 ## `kache list`
 
@@ -76,15 +83,17 @@ kache clean --orphans --yes
 kache clean ~/src --dry-run
 ```
 
-`clean` frees disk space. Without a directory it works from the target directories Kache knows: the ones builds through Kache used, and the default targets of sibling Git worktrees of those repositories. It selects targets whose worktree or workspace has been deleted, and targets no build has used for 14 days. `--stale` changes that window; `--orphans` selects only deleted worktrees, however recently they were built. A workspace counts as deleted only while the directory that held it still exists, so an unmounted volume does not.
+`clean` frees disk space. Without a directory it works from the target directories that builds through Kache used. It selects targets whose worktree or workspace has been deleted, and targets no build has used for 14 days. `--stale` changes that window; `--orphans` selects only deleted worktrees, however recently they were built. A workspace counts as deleted only while the directory that held it still exists, so an unmounted volume does not.
 
-`--dry-run` lists what the clean would remove and every target it keeps: what deleting each frees, what it holds on disk, how long since a build used it, and what the daemon's next quiet pass would do to it. It ends with the cache's size and the command that removes the selection. The freeable estimate leaves out blocks a target shares with the store or with other hardlinks, so it is what the clean gives back. Without `--dry-run` or `--yes`, a selector opens. `--json` describes the selection and removes nothing unless `--yes` is also set.
+`--dry-run` lists what the clean would remove and every target it keeps: what deleting each frees, what it holds on disk, how long since a build used it, and what the daemon's next quiet pass would do to it. It ends with the cache's size and the command that removes the selection. The freeable estimate leaves out blocks a target shares with the store or with other hardlinks, so it is what the clean gives back. `--dry-run` also lists the default targets of sibling Git worktrees, marked "found through Git", but `kache clean` skips them because Kache has not seen a build use them.
 
-Given a directory, `clean` looks for `target/` directories under it instead, including worktrees under `.worktrees/` and `.claude/`; other hidden directories are skipped. Sizes cover every profile, custom profiles and `<triple>/<profile>` directories included.
+Without `--dry-run` or `--yes`, a selector opens in a terminal. Without a terminal the command fails and suggests `--dry-run` or `--json`. `--json` describes the selection and removes nothing unless `--yes` is also set.
 
-Cleanup rechecks each directory's identity and removes only the derived target directory. It skips paths that are missing, moved, replaced or unsafe, and targets of the current workspace. A target in use by a running Cargo command or test is skipped in every mode. Kache checks Cargo's `.cargo-lock` and its own command lock before deleting it.
+Given a directory, `clean` looks under it for `target/` directories that sit next to a `Cargo.toml`, including worktrees under `.worktrees/` and `.claude/`. Other hidden directories and `node_modules` are skipped. Sizes cover every profile, custom profiles and `<triple>/<profile>` directories included.
 
-The daemon removes tracked targets on its own: those whose workspace was deleted, idle ones when configured, and idle ones when free disk space falls below 10 GiB. See [Target directory cleanup](/docs/getting-started/configuration#target-directory-cleanup).
+Removal rechecks each directory's identity and skips one that changed since the scan. For tracked targets it also skips paths that are missing, moved or no longer a derived target directory, and targets of the current workspace. A directory you name gets no such filter, so `kache clean . --yes` at a workspace root removes that workspace's `target/`. A target is skipped in every mode while a running build holds its `.cargo-lock`. While any Cargo command started through Kache (`kache cargo` or the `cargo` shim) or any `kache test-runner` test is running, the clean skips every target.
+
+The daemon removes tracked targets on its own, on a quiet machine at most once an hour: a target whose workspace was deleted, once no build has used it for a day (`auto_clean_orphaned_targets`, on by default); idle ones when `auto_clean_idle_targets_days` is set; and, when `auto_recover_min_free_bytes` is set, idle ones while free disk space is below that floor. See [Target directory cleanup](/docs/getting-started/configuration#target-directory-cleanup).
 
 ### Obsolete units in live targets
 
@@ -105,7 +114,9 @@ kache clean --cache --dry-run
 kache clean --cache
 ```
 
-`--cache` empties the local cache instead of removing target directories. It asks first, and without a terminal it removes nothing unless `--yes` is set. You rarely need it: the daemon evicts entries on its own to keep the cache under `cache.local_max_size`, least valuable first. For scripts, `--cache --stale 30d` evicts entries older than that, `--cache --stale-schema` removes entries created with old or unrecorded key schemas, and `--crate serde` removes one crate's entries.
+`--cache` empties the main store instead of removing target directories; volume shards keep their entries. It asks first, and without a terminal it removes nothing unless `--yes` is set. It also deletes the index files kept after index corruption, and says how many before it asks. It removes hermetic build-script runs that no target directory links to. It forgets the tracked target directories too, so `kache clean` finds a target again only after a build uses it.
+
+You rarely need `--cache`: the daemon evicts entries on its own to keep the cache under `cache.local_max_size`, starting with stale, rarely hit entries that free the most space. For scripts, `--cache --stale 30d` evicts entries older than that and `--cache --stale-schema` removes entries created with old or unrecorded key schemas, both without asking; `--crate serde` removes one crate's entries after asking.
 
 Eviction affects only the local store. It also sweeps each `[cache.volumes]` shard against that shard's own budget; see [Configuration: Volume shards](/docs/getting-started/configuration#volume-shards). `--stale-schema` sweeps only the main store.
 
@@ -125,9 +136,9 @@ kache targets share --apply
 kache targets share --apply target/
 ```
 
-`targets share` reads the tracked target directories, or the directories named after it, for files that are full copies of blobs in the store. A file whose length matches no stored blob is finished after a `stat`. A file that differs in its first or last block is finished after those two reads. Only a file that survives both is hashed, and only once. A later run trusts that stamp and does not read the file again. A file whose length matches no stored blob is finished after a `stat`. A file that differs in its first or last block is finished after those two reads. Only a file that survives both is hashed, and only once. A later run trusts that stamp and does not read the file again.
+`targets share` reads the tracked target directories, or the directories named after it, for compiler outputs of at least 64 KiB (`.rlib`, `.rmeta`, `.so`, `.dylib`, `.a`, `.o`, `.dll`, `.lib`, `.exe`, `.pdb`) that are full copies of blobs in the store. A file whose length matches no stored blob is finished after a `stat`. A file that differs from the blob in its first or last 4 KiB is finished after those two reads. Only a file that survives both is hashed. Kache stores that hash with the file's path, size, modification and change times and inode, so a later run reads nothing from an unchanged file.
 
-`--apply` replaces a proven match with a clone of the stored blob. The replacement keeps the file's mode and modification time. The pass takes the profile's `.cargo-lock` and skips a target a running build holds. It does not hardlink, it does not copy a file onto another volume, and it does not enter `incremental/` or `.fingerprint/`. Without `--apply` it only reports.
+`--apply` replaces a proven match with a clone of the stored blob. Cloning needs a filesystem that supports file clones (reflinks). On other filesystems every match stays in place and is counted as failed. The replacement keeps the file's mode and modification time. The pass takes the profile's `.cargo-lock` and skips a target a running build holds. It does not hardlink, it does not copy a file onto another volume, and it does not enter `incremental/` or `.fingerprint/`. Without `--apply` it only reports.
 
 With `cache.auto_share_target_files` on (the default), the daemon runs one short slice of the same pass, with `--apply`, while the machine is idle. The slice stops when a compile starts. A check that already repaired the index or swept targets does not also run the slice.
 
@@ -141,11 +152,11 @@ kache init --no-shell
 kache init --yes
 ```
 
-`--check` reports proposed changes without writing. `--no-service` skips login-service installation. `--no-shell` skips the C/C++ shell setup; Cargo's native dependencies are still configured. When the service cannot be installed, such as on a Linux host without a systemd user session or a Windows account that Task Scheduler refuses, init reports why and starts the daemon directly.
+`--check` reports proposed changes without writing. `--no-service` skips login-service installation. `--no-shell` leaves shell startup files alone: no shim directory on `PATH` (C/C++ compilers, `cargo` and `rustdoc`), no `build.rustdoc` edit and no test pacing. Cargo's native dependencies are still configured through `[env]`. When the service cannot be installed, such as on a Linux host without a systemd user session or a Windows account that Task Scheduler refuses, init reports why and starts the daemon directly.
 
 Init shows a setup plan and asks once before applying it. Replacing another Cargo wrapper requires a separate confirmation. `--yes` accepts both. If stdin has no answers, init exits with an error before changing files or services. Besides `rustc-wrapper`, init adds `HOST_CC` / `HOST_CXX` / `CC_KNOWN_WRAPPER_CUSTOM` under Cargo `[env]` when those keys are absent. On Windows it adds only `CC_KNOWN_WRAPPER_CUSTOM`. It never sets `CC` or `CXX`.
 
-On Unix, when the compiler shims are installed, init sets `build.rustdoc` to the absolute `rustdoc` link in that directory, and backs up the Cargo config first. Cargo then runs `cargo doc` through Kache. Documentation caching requires compatible unstable Cargo flags; Rust 1.99 currently passes through. See [Rust documentation](/docs/getting-started/rustdoc) for setup and compatibility. Init does not replace a `build.rustdoc` value you already set. Windows has no compiler shims, so `cargo doc` is not cached there.
+On Unix, when `build.rustc-wrapper` is `kache` and `~/.local/lib/kache/shims` holds a `rustdoc` link, init sets `build.rustdoc` to that link and backs up the Cargo config first. Cargo then runs `cargo doc` through Kache. Documentation caching requires compatible unstable Cargo flags; Rust 1.99 currently passes through. See [Rust documentation](/docs/getting-started/rustdoc) for setup and compatibility. Init does not replace a `build.rustdoc` value you already set. `--no-shell` skips this edit. Windows has no compiler shims, so `cargo doc` is not cached there.
 
 On Unix, init also configures test pacing: it exports `CARGO_TARGET_<HOST>_RUNNER="kache test-runner"` from the same shell startup files the C/C++ setup edits, so `cargo test` in every project waits for the scheduler's slots. A value you already export stays. `--no-shell` skips both edits. See [Test runner](/docs/getting-started/configuration#test-runner).
 
@@ -157,7 +168,9 @@ kache init --shims --from-path
 kache init --shims --force
 ```
 
-Unix only. `kache init` offers to create them; `kache init --shims` creates only them. It makes `cargo`, `cc`, `c++`, `gcc`, `g++`, `clang`, `clang++`, and `rustdoc` symlinks to Kache. The farm is `~/.local/lib/kache/shims` unless a directory follows `--shims`, as in `kache init --shims /usr/lib/kache`. It also links each versioned C and C++ compiler on `PATH` (`clang-19`, `clang++-19`, `gcc-13`), matched by name without running it; `--canonical-only` leaves those out. The hidden `kache install-shims` does the same, for older scripts. `--from-path` also wraps every other compiler name on `PATH`, such as target-prefixed drivers. Put the directory before the real compilers in `PATH`. If the directory then holds only Kache links, Kache also writes a `.kache-shims` marker. When Kache looks for the real compiler, it skips everything in a marked directory. A directory that also holds other files, such as a real compiler, is left unmarked.
+Unix only. `kache init` offers to create them; `kache init --shims` creates only them. It makes `cargo`, `cc`, `c++`, `gcc`, `g++`, `clang`, `clang++`, and `rustdoc` symlinks to Kache. The `cargo` link runs the real Cargo (`KACHE_REAL_CARGO`, else the next `cargo` on `PATH`) and holds the lock that keeps `kache clean` and the daemon from deleting target directories until it exits. `kache init` calls this Cargo target protection.
+
+The farm is `~/.local/lib/kache/shims` unless a directory follows `--shims`, as in `kache init --shims /usr/lib/kache`. It also links each versioned C and C++ compiler on `PATH` (`clang-19`, `clang++-19`, `gcc-13`), matched by name without running it; `--canonical-only` leaves those out. The hidden `kache install-shims` does the same, for older scripts. `--from-path` also wraps every other compiler name on `PATH`, such as target-prefixed drivers. Put the directory before the real compilers in `PATH`. If the directory then holds only Kache links, Kache also writes a `.kache-shims` marker. When Kache looks for the real compiler, it skips everything in a marked directory. A directory that also holds other files, such as a real compiler, is left unmarked.
 
 The links point at a path that survives upgrades when one reaches the running binary: Homebrew's `opt` link, a Nix profile, mise's `latest` alias, or a `kache` on `PATH` outside version directories. Without `--force`, existing entries are kept, except in a directory Kache created, marked, or filled only with Kache links. There a rerun replaces Kache links whose target is missing or not executable, and moves Kache links into a version directory to the upgrade-safe path. Other links are kept. See [C and C++](/docs/getting-started/c-cpp#upgrades).
 
@@ -171,9 +184,9 @@ kache doctor --checksums
 kache doctor --repair
 ```
 
-- `--fix` repairs supported setup issues and can migrate sccache configuration.
-- `--purge-sccache` also removes sccache data and requires `--fix`.
-- `--verify` checks entries, blobs, and metadata.
+- `--fix` migrates from sccache: it stops a running sccache server, replaces `sccache` with `kache` in `$CARGO_HOME/config.toml`, and prints the lines to change in your shell startup files. It does not set up other missing pieces such as `rustc-wrapper` or the shims; run `kache init` for those.
+- `--purge-sccache` also deletes the sccache cache directory (`~/Library/Caches/Mozilla.sccache` on macOS, `~/.cache/sccache` on Linux) and runs `cargo uninstall sccache` when sccache was installed with Cargo. It requires `--fix`.
+- `--verify` checks entries, blobs, and metadata. It exits 1 while corrupted entries or index mismatches remain, so a scheduled job can gate on it. Orphan blobs do not count.
 - `--checksums` also hashes blob contents and implies `--verify`.
 - `--repair` removes corrupted entries, reconciles the index with the entries on disk, reclaims orphan blobs, prunes stale C/C++ memos, input predictions and old file hashes, and compacts a large, sparse index when disk space allows. It implies `--verify`.
 
@@ -198,7 +211,7 @@ Options:
 
 | Flag | Effect |
 | --- | --- |
-| `--manifest-path <PATH>` | Select Cargo manifest for push-side workspace filtering |
+| `--manifest-path <PATH>` | Cargo manifest whose workspace members filter what is pushed and, with `--workspace`, what is pulled. Defaults to `./Cargo.toml` when it exists; without one, pushes are not filtered and `--workspace` fails |
 | `--pull` | Skip uploads |
 | `--push` | Skip downloads |
 | `--dry-run` | Plan without transfer |
@@ -208,55 +221,6 @@ Options:
 
 See [Sync](/docs/remote-cache/sync) for filtering semantics.
 
-## `kache prefetch`
-
-Restore the most recent compatible session report before starting Cargo:
-
-```bash
-kache prefetch --namespace my-org/my-repo --build-shape my-config-digest
-cargo build
-```
-
-The producer must have used the same namespace, repository label, declared build
-shape, target, profile, compiler version and full `Cargo.lock` digest, then
-published its report with `kache save-manifest`. Run `kache sync --push` first
-when the build used a local-only cache. Reports record observed compiler events;
-a reported pack may still be missing from the remote.
-
-`--namespace`, `--repository` and `--build-shape` can use `KACHE_NAMESPACE`,
-`KACHE_REPOSITORY` and `KACHE_BUILD_SHAPE`. Repository defaults to the namespace.
-`--target` defaults to the selected compiler's host; pass it for cross builds.
-`--profile` defaults to `debug`; `--rustc` selects the compiler, otherwise `RUSTC`
-or `rustc` on PATH is used. Missing labels, a missing lockfile or no compatible
-report produce an explained no-op. `--dry-run` prints keys in replay order.
-
-The command waits for local import before returning. It replays each key once,
-in its first observed order, and skips local entries and busy keys. Downloads
-use the existing verified pack reader and an owned staging directory. A failed
-pack is reported without discarding successful imports or replacing another
-publisher's entry; partial failures return a nonzero exit status.
-
-`KACHE_PREFETCH_MAX_KEYS`, `KACHE_PREFETCH_MAX_BYTES` and
-`KACHE_PREFETCH_DEADLINE_SECS` must be finite and nonzero. The byte cap covers
-compressed artifact bodies; discovery is separately limited to 1,024 reports
-of at most 8 MiB each. Failed artifact transfers conservatively consume their
-admitted byte allowance. Downloads run one at a time, within the configured
-concurrency ceiling. The deadline covers discovery and downloads; local import
-still finishes before the command returns. Automatic prefetch can be disabled
-while using this explicit command.
-
-Install optional Git hooks with the same replay options:
-
-```bash
-kache prefetch --namespace my-org/my-repo --build-shape my-config-digest --install-hooks
-kache prefetch --uninstall-hooks
-```
-
-Installation respects `core.hooksPath` and refuses existing hooks. The
-post-checkout and post-merge hooks are bound to their repository and leave Git
-successful when optional warming fails. Uninstallation removes only unchanged
-hooks recorded by Kache; edited hooks are retained.
-
 ## `kache save-manifest`
 
 ```bash
@@ -265,12 +229,20 @@ kache save-manifest --manifest-key x86_64-linux-release
 kache save-manifest --namespace x86_64-unknown-linux-gnu/rustc-hash/release
 ```
 
-Without `--manifest-key`, Kache publishes an identity key
-(`id/<lock-digest>/<target>/<profile>` when `Cargo.lock` and a profile are
-known) and the host target triple so older prefetch still finds the file.
-`KACHE_MANIFEST_KEY` or `--manifest-key` writes a single key. A namespace plus
-`Cargo.lock` also publishes content-addressed shards. Build-script runs are left
-out: they stay in the local store, so no other machine could fetch them.
+Without `--manifest-key` or `KACHE_MANIFEST_KEY`, Kache publishes under the
+host target triple. When `Cargo.lock` exists and `KACHE_PROFILE` or `PROFILE`
+names the profile, it also publishes under an identity key,
+`id/<lock-digest>/<host-triple>/<profile>`. `--manifest-key` or
+`KACHE_MANIFEST_KEY` writes a single key. A namespace from `--namespace` or
+`KACHE_NAMESPACE`, plus `Cargo.lock`, also publishes content-addressed shards.
+
+The manifest lists each cache key in the retained event log once, from every
+build the log still holds. Build-script runs are left out: they stay in the
+local store, so no other machine could fetch them.
+
+With a remote configured, the daemon also publishes a build session's identity
+manifest when the session goes idle or a newer one replaces it; daemon
+shutdown publishes nothing.
 
 When the remote has no manifest for the current lockfile, the planner tries
 the manifests of up to three earlier committed revisions of `Cargo.lock`
@@ -281,66 +253,19 @@ skipped.
 
 CI jobs that share a key, such as tests and lints on the same lockfile, target
 and profile, add to one manifest rather than replacing each other. Entries from
-the same commit (`GITHUB_SHA` or `CI_COMMIT_SHA`) stay together, entries from
-an earlier commit are dropped when a later one publishes, and entries whose
-commit is unknown are kept for an hour. On S3 the update is a conditional
-write: a job that loses a race reads the manifest again and retries, and after
-five tries it fails and leaves the manifest as the other jobs wrote it. Stores
-without conditional writes, including filesystem remotes, get the merged
-manifest written plainly, so two jobs finishing at the same moment can still
-drop each other's entries there. Shards merge the same way.
+the publisher's commit (`GITHUB_SHA` or `CI_COMMIT_SHA`) stay together and
+entries from any other known commit are dropped, so a rerun of an older
+commit's job also drops a newer commit's entries. When either commit is
+unknown, a stored entry stays for an hour after it was last published. A merged
+manifest keeps at most 50,000 entries, putting the publishing job's entries
+first.
 
-`save-manifest` also writes immutable session reports under
-`_manifests/build-reports/v1/<namespace>/<session>-<root-hash>.json`. Each report
-keeps invocations in event-log order, including repeated cache keys, timestamps,
-compile cost and offsets from the earliest observed invocation. It records
-`observed` artifacts: a compiler event does not prove that a background upload
-finished. The legacy merged manifest remains available to existing planners.
-
-Set producer labels before the build to make its report eligible for exact
-warm-set replay:
-
-```bash
-export KACHE_NAMESPACE=my-org/my-repo
-export KACHE_REPOSITORY=my-org/my-repo # defaults to KACHE_NAMESPACE
-export KACHE_BUILD_TARGET=x86_64-unknown-linux-gnu
-export KACHE_BUILD_SHAPE=my-config-digest
-cargo build
-kache save-manifest
-```
-
-`KACHE_BUILD_SHAPE` is a caller-declared digest of the build configuration:
-include the Cargo command, selected packages/features and relevant flags in
-that digest. Kache does not infer it from one compiler invocation.
-`CARGO_BUILD_TARGET` can supply the declared target instead. The wrapper captures
-these labels, the actual compiler's verbose-version hash, profile and full
-lockfile digest at the session's first cache-eligible wrapped invocation when a
-repository or namespace label is declared, including builds with no remote or automatic
-prefetch. Unlabelled builds keep unknown compatibility facts. Host build scripts
-and proc macros do not establish a cross build's target.
-
-Missing producer facts remain unknown; a later daemon never fills them from its
-own environment. Reports without a namespace use `unscoped`. Root paths are
-hashed before publication. `GITHUB_SHA`/`CI_COMMIT_SHA` and the corresponding ref
-are captured from the producer. Optional `KACHE_PARENT_COMMITS` supplies
-whitespace-separated parent commits; `KACHE_CI_STARTED_AT_MS` supplies a known CI
-start timestamp for per-entry CI offsets.
-
-An unresolved compiler fingerprint leaves the report's toolchain identity unknown.
-On Windows, use Cargo's full compiler path to record a replayable identity; a bare
-`rustc` name still records observations.
-
-The existing inactivity-based session marker can span adjacent Cargo commands.
-If producer labels, profile, compiler selection or lockfile change within that
-session, its compatibility facts and commit context become unknown. Observations
-stay ordered, but exact replay must reject that mixed session.
-
-The first published snapshot for a session/root stays unchanged. Repeating the
-same snapshot succeeds; changed observations for that object return a conflict.
-Reports require atomic create-only writes from the remote. Reading them caps
-each object at 8 MiB, each report at 50,000 entries and discovery at 1,024 objects
-per namespace. Rebuilding an index from these reports preserves session history
-and invocation order without the original local event log.
+On S3 the update is a conditional write: a job that loses a race reads the
+manifest again and retries, and after five tries it fails and leaves the
+manifest as the other jobs wrote it. Stores without conditional writes,
+including filesystem remotes, get the merged manifest written plainly, so two
+jobs finishing at the same moment can still drop each other's entries there.
+Shards merge the same way.
 
 ## `kache daemon`
 
@@ -365,7 +290,7 @@ kache monitor
 kache monitor --since 7d
 ```
 
-`--since` takes the same forms as `kache stats`. Without it, the monitor loads the last hour.
+`--since` takes the same forms as `kache stats`. Without it, the monitor loads the last hour. It needs a terminal; scripts use `kache stats --json`.
 
 See [Monitor](/docs/monitor).
 
@@ -401,10 +326,10 @@ kache stats --format trace --output trace.json
 | Flag | Default | Values or purpose |
 | --- | --- | --- |
 | `--full` | off | The full report instead of the summary. `--format`, `--output`, `--top`, `--record`, and `--redact` imply it |
-| `--format` | `text` | `json`, `trace`, `perfetto`, `chrome-trace`, `markdown`, `github`, `text`; `--json` alone gives `json` |
+| `--format` | `text` | `json`, `trace` (also `perfetto`, `chrome-trace`), `markdown` (`md`), `github` (`gh`), `text`. An unknown value prints text. `--json` gives `json`, and combining it with a format other than `json` or `text` is an error |
 | `--since` | `24h` | Event window; same forms as `kache stats` (`15m`, `2h`, `7d`, bare hours) |
 | `--last-build` | off | Latest recorded activity session; conflicts with `--since` |
-| `--root` | all roots | Include events from one build tree |
+| `--root` | all roots | Only events from that build tree and the trees below it. Remote transfers are left out because the transfer log records no root. On `stats` it needs `--full` or `--last-build` |
 | `--output`, `-o` | stdout | Write to a file |
 | `--top` | `10` | Number of ranked entries |
 | `--redact` | off | Replace cache keys, roots, object keys, and object paths with `redacted` |
@@ -425,7 +350,7 @@ Every report format totals the wrapper's phases per crate: startup, key computat
 
 In the trace output each crate slice carries these numbers in its `args`. It nests one `X` slice per phase on the same lane, in this order: `startup`, `key` (with `dep-info` as its child), `lookup`, `wait`, `compile` on compiled crates, then `restore` or `store`. Phase offsets accumulate from the crate slice's start in that order; the wrapper records durations, not start times, so a phase sits where it lands in the sum. The gap after the last phase is the unattributed remainder. Durations are whole milliseconds, so a phase under 1 ms has no slice. A remote transfer that has both a start and a finish follows the crate slices as an async `b`/`e` pair with category `kache.transfer`.
 
-`--redact` applies to every format. The session line in `telemetry/sessions.jsonl` is written first, so the machine keeps the keys. Empty fields stay empty. Store-error text is left as recorded. A C or C++ row can also carry `object_output`, the path named with `-o`. A build-script row carries `package`.
+`--redact` applies to every format. The `telemetry/sessions.jsonl` line is written before redaction, so its root hash comes from the real root. The line holds no cache keys. Empty fields stay empty. Store-error text is left as recorded. A C or C++ row can also carry `object_output`, the path named with `-o`. A build-script row carries `package`.
 
 ## `kache telemetry`
 
@@ -467,7 +392,7 @@ Without a crate, `explain` reads the latest recorded build and says why it misse
 | no earlier compile | The first build of the crate in this tree, or older history was rotated away |
 | unexplained | Nothing recorded why; `[cache] explain_miss = true` records it from the next build |
 
-The report ends with the command that explains the costliest crate, and the one that writes the build's timeline as a Perfetto trace. `--root` limits it to builds of one tree. It exits 0; the hidden `kache diff` prints only the miss counts and exits 1 when the latest build missed more, for scripts that gate on that. `kache why-miss` is the same command under its earlier name.
+The report ends with the command that explains the costliest crate, and the one that writes the build's timeline as a Perfetto trace. `--root` limits it to builds of one tree. It exits 0; the hidden `kache diff` prints the miss counts and unexplained shares of the two builds and exits 1 when either grew, for scripts that gate on that. `kache why-miss` is the same command under its earlier name.
 
 ### One crate
 
@@ -505,16 +430,24 @@ kache telemetry push --session SESSION_ID --label prefetch=off
 ```
 
 The default selects the latest session. `--all` selects every retained session;
-`--session` selects one ID. `--label KEY=VALUE` is repeatable. Configure the
-service through `KACHE_PLANNER_ENDPOINT` and its credentials. Upload failures
-print a warning without failing a completed build.
+`--session` selects one ID. `--label KEY=VALUE` is repeatable. Set the service
+with `KACHE_PLANNER_ENDPOINT` or `[cache.planner] endpoint`, and its
+credentials. A record that fails to upload prints a warning and the command
+still exits 0, so a CI post-step does not fail a finished job. With no service
+configured, it says how many records it would send.
 
-Timeline schema 5 records the session, plan, candidate source, and zero-based
+Timeline schema 7 records the session, plan, candidate source and zero-based
 rank for ordinary prefetch downloads. Transfers retain `completed`,
-`not_found`, `error`, and `import_error` outcomes. The origin stays with a
-download even if another build starts before it finishes. A local-hit unit
-and its prefetched transfer can therefore be joined by cache key inside the
-correct session.
+`not_found`, `error` and `import_error` outcomes. The origin stays with a
+download even if another build starts before it finishes.
+
+When a prefetch delivered a unit's key in the same session, the unit carries a
+`prefetch` object: the plan origin and rank, when the GET started, when the
+entry was imported, its compressed bytes, and `timing` against the key's first
+demand (`before_demand`, `in_flight` or `after_demand`). A `local_hit` with
+`before_demand` timing is a prefetched local hit. The session summary counts
+consumed, useful and in-flight prefetch keys and bytes, plus `get_not_found`,
+`get_errors` and `get_cancelled`.
 
 Each unit also carries `demands`, one observation per cache key looked up by
 the wrapper. `first_demand_at_ms` is the first lookup's Unix timestamp in
@@ -534,14 +467,14 @@ drain.
 `kache stats` marks incomplete summaries as partial totals. Forced termination
 can prevent the final write.
 
-Upgrade the service before sending schema 5 records. The updated service also
-accepts schemas 1 through 4. Wrapper events before schema 20 have no demand
+Upgrade the service before sending schema 7 records. The updated service also
+accepts schemas 1 through 6. Wrapper events before schema 20 have no demand
 observations. Current demand transfers and older logs still require a unique
 key or time-window match; ambiguous transfers remain unattributed.
 Prefetch records each ordinary entry GET, catalog GET, pack GET and LIST once.
-Background index and explicit warm-all LISTs retain the origin captured before
-their async work. A completed LIST stays completed if later local index work
-is cancelled; its result count and completion time describe the backend call.
+Background index LISTs retain the origin captured before their async work. A
+completed LIST stays completed if later local index work is cancelled; its
+result count and completion time describe the backend call.
 `accounting.operation` distinguishes GET from LIST; `request_count` counts
 backend invocations, excluding SDK retries and LIST pages. `requests_complete`
 states whether that count is known. LIST records include `list_result_count`
@@ -605,7 +538,7 @@ Forgets the stored planner session and asks the identity provider to revoke it.
 runner = ["kache", "test-runner"]
 ```
 
-Cargo runs each test binary as `kache test-runner <binary> <args>`. The binary waits for slots in the scheduler's pool, then runs with its arguments, stdin, exit code and signals unchanged. Cargo is the caller, so the command is not listed in `kache --help`. See [Test runner](/docs/getting-started/configuration#test-runner).
+Cargo runs each test binary as `kache test-runner <binary> <args>`. A test binary waits for slots in the scheduler's pool, then runs with its arguments, stdin, exit code and signals unchanged. Binaries without Cargo's hash suffix (`cargo run` targets, doctests), `--list` and `--bench` runs start at once, as does everything when the scheduler is off. Cargo is the caller, so the command is not listed in `kache --help`. See [Test runner](/docs/getting-started/configuration#test-runner).
 
 ## `kache completions`
 
@@ -617,6 +550,6 @@ kache completions fish > ~/.config/fish/completions/kache.fish
 
 Supported shells are Bash, Elvish, Fish, PowerShell, and Zsh.
 
-### Inspecting volume shards
+## Volume shards
 
-With `[cache.volumes]`, `stats` and `report` sum bytes across stores and count unique cache keys. `list` and `explain` identify each entry's store directories. `doctor --verify` checks every copy, including copies in shards; missing shards are reported without creating them. See [Volume shards](/docs/getting-started/configuration#volume-shards).
+With `[cache.volumes]`, `stats` and `report` sum bytes across stores and count unique cache keys. `list` and `explain` show each entry's store directories. `doctor` reports a shard with no index without creating it. `doctor --verify` checks every copy, shards included, and stops with an error at a shard that has no index. See [Volume shards](/docs/getting-started/configuration#volume-shards).

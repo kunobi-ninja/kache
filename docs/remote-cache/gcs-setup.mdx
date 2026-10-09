@@ -12,7 +12,7 @@ bucket = "acme-build-cache"
 prefix = "artifacts"
 ```
 
-`type = "gcs"` is required. The remote takes `bucket`, `prefix` (default `artifacts`) and `endpoint`. Region, profile and the filesystem settings do not apply.
+`type = "gcs"` is required. The remote takes `bucket`, `prefix` (default `artifacts`) and `endpoint`, from the config file only: the `KACHE_S3_*` overrides for bucket, endpoint, region, prefix, profile and user agent do not apply. Setting `region`, `profile`, `user_agent`, `path` or `atomic_write_dir` is an error; Kache logs why and builds without the remote.
 
 ## Credentials
 
@@ -24,11 +24,11 @@ Kache uses Application Default Credentials, in this order:
 
 On GitHub Actions, `google-github-actions/auth` with workload identity federation sets `GOOGLE_APPLICATION_CREDENTIALS` for the job.
 
-Readers need `storage.objects.get`. Writers also need `storage.objects.create`. The role `roles/storage.objectViewer` covers readers and `roles/storage.objectCreator` plus the viewer role covers writers. Listing (`cache.remote_key_listing = true`, `kache sync`) also needs `storage.objects.list`.
+Readers need `storage.objects.get`. Writers also need `storage.objects.create`, plus `storage.objects.delete` to replace the build manifests, shards and prediction rows Kache rewrites. `roles/storage.objectViewer` covers readers. `roles/storage.objectCreator` cannot replace objects, so give writers `roles/storage.objectUser`. Listing (`cache.remote_key_listing = true`, `kache sync`) also needs `storage.objects.list`.
 
 ## Behaviour
 
-Uploads are create-only (`ifGenerationMatch=0`): an existing object is never replaced. Build manifests and shards merge, but GCS offers no entity-tag precondition through the client Kache uses, so two jobs finishing at the same moment can still drop each other's manifest entries.
+Entry packs and their manifests are written create-only (`ifGenerationMatch=0`), so an existing entry is never replaced. Build manifests, shards and prediction rows are replaced in place. Build manifests and shards merge before the write, but GCS offers no entity-tag precondition through the client Kache uses, so two jobs finishing at the same moment can still drop each other's manifest entries.
 
 A refused read is reported as an error, not a miss.
 

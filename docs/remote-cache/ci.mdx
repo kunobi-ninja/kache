@@ -34,17 +34,21 @@ Add `s3-endpoint` for R2, Ceph, or MinIO. Prefer workload identity or IAM roles 
 
 Treat write credentials for any remote as trusted build credentials. The permissions they grant depend on the backend.
 
-On GitHub Actions and GitLab CI, Kache suppresses remote writes unless the job is a **push to a protected branch**. Pull requests, merge requests, tags, unprotected branches, `workflow_dispatch`, and scheduled runs are read-only even if the job has a write credential. `KACHE_REMOTE_READONLY=0` does not turn that off.
+On GitHub Actions and GitLab CI, Kache suppresses remote writes unless the job is a **push to a protected branch**. Pull requests, merge requests, tags, unprotected branches, `workflow_dispatch`, and scheduled runs are read-only even if the job has a write credential, and `KACHE_REMOTE_READONLY=0` does not turn that off. The one exception is a pull request job with a prefix of its own, described below.
 
-A laptop or other non-CI process is left as configured, so `kache sync --push` still works locally. Set `remote_readonly = true` under `[cache]` there when you want reads without writes.
+A push counts as protected only when GitHub sets `GITHUB_REF_PROTECTED=true` or GitLab sets `CI_COMMIT_REF_PROTECTED=true`, so a branch the CI system does not report as protected never publishes, even the default branch. When a push does not publish, the `Remote writes` row of `kache doctor` says why.
 
-An automatically started daemon inherits `KACHE_REMOTE_READONLY=1` and keeps writes disabled for its lifetime. Before a later writable build needs to upload, clear the flag and run `kache daemon restart` from the writable environment. An installed service uses its stored environment; update that environment before restarting it.
+Kache recognizes only GitHub Actions (`GITHUB_ACTIONS`) and GitLab CI (`GITLAB_CI`). Every other process is left as configured, including jobs on other CI systems: they write whenever their credentials allow, so give their pull request jobs read-only credentials or set `KACHE_REMOTE_READONLY=1`. On a laptop `kache sync --push` still works; set `remote_readonly = true` under `[cache]` there when you want reads without writes.
+
+An automatically started daemon inherits `KACHE_REMOTE_READONLY=1` and keeps writes disabled for its lifetime. A daemon that a pull request or other read-only CI job starts stays read-only the same way. Before a later writable build needs to upload, clear the flag and run `kache daemon restart` from the writable environment. An installed service uses its stored environment; update that environment before restarting it. A writable job that reaches a read-only daemon gets a warning from `kache save-manifest`, `kache stats` and `kache doctor`; see [Daemon lifecycle](/docs/daemon/lifecycle#updates-and-config-changes).
 
 ```yaml
 # Optional: make the read-only intent explicit in pull-request jobs.
 env:
   KACHE_REMOTE_READONLY: "1"
 ```
+
+Leave this out of jobs that use `pull_request_prefix`. An explicit `KACHE_REMOTE_READONLY=1` or `remote_readonly = true` keeps a pull request job read-only even when it has a prefix of its own.
 
 GitHub withholds secrets and OIDC tokens from fork pull-request jobs, so those runs cannot publish unless you also pass a write credential another way. Same-repository pull requests do receive secrets; the CI policy above is what stops them writing.
 
@@ -71,7 +75,7 @@ pull_request_prefix = "artifacts-pr"
 - reads the base prefix first and the pull request prefix for what the base lacks;
 - writes entries, build manifests, shards and prediction rows only under the pull request prefix.
 
-Every other job ignores the setting: protected-branch pushes never read the pull request prefix, and tags, unprotected branches and `pull_request_target` jobs stay read-only. The pull request prefix must differ from `prefix`, and neither may contain the other; otherwise the job stays read-only and Kache logs why.
+Every other job ignores the setting: protected-branch pushes never read the pull request prefix, and tags, unprotected branches and `pull_request_target` jobs stay read-only. The pull request prefix must differ from `prefix`, neither may contain the other, and `prefix` must not be empty, because an empty prefix contains every other. Otherwise the job stays read-only and Kache logs why.
 
 A pull request job with a prefix runs its own daemon. Its socket and upload queue carry a name derived from the prefix (`daemon-pr-<hash>.sock`, `upload-queue-pr-<hash>`), so it never hands uploads to a protected-branch job's daemon or reads through one. It still must not share a local store with trusted jobs: an artifact it compiles there would be a local hit for the next trusted build. Keep pull request jobs off the persistent disk described in [Ephemeral and persistent runners](#ephemeral-and-persistent-runners).
 
@@ -103,14 +107,18 @@ Install Kache and write the remote to its config file before the first build. Th
 mkdir -p ~/.config/kache
 printf '[cache.remote]\ntype = "s3"\nbucket = "my-build-cache"\nregion = "eu-west-1"\n' > ~/.config/kache/config.toml
 
-kache init --yes
+kache init --yes --no-service
 cargo build --locked
 kache daemon stop
 ```
 
-`~/.config/kache/config.toml` is the default path. If the job sets `KACHE_CONFIG` or `XDG_CONFIG_HOME`, write the file there instead.
+Kache reads one config file: `KACHE_CONFIG` if set, else the nearest `.kache.toml` in or above the working directory, else `$XDG_CONFIG_HOME/kache/config.toml` or `~/.config/kache/config.toml`. If the repository has a `.kache.toml`, the file written above is ignored. Point `KACHE_CONFIG` at the file you write instead (it then replaces the repository's file for this job), or put the remote in the runner's `/etc/kache/config.toml`, which applies when the `.kache.toml` declares no `[cache.remote]`. See [Config file](/docs/getting-started/configuration#config-file).
 
-`kache daemon stop` lets the daemon finish its queued uploads before it exits, so run it before the runner goes away. `kache sync --push` does not replace it: inside a Cargo workspace it uploads only the workspace's own crates, without their dependencies. The daemon keeps credentials from the environment, so they can stay in `KACHE_S3_ACCESS_KEY` and `KACHE_S3_SECRET_KEY`, the runner's secret store, or the standard cloud identity chain. Use `--allow-partial` only when cache failure must not fail the job.
+`--no-service` keeps the daemon out of a login service. Without it, `init` installs one on macOS, on Windows and on Linux hosts with a systemd user session, and that daemon runs with the service's environment instead of the job's credentials.
+
+`kache daemon stop` lets the daemon work through its upload queue before it exits, so run it before the runner goes away. The daemon gives the queue 30 seconds. Uploads still queued after that stay in the store's upload queue and go out the next time a daemon starts on that store, so they are lost on a runner that discards its store. The command waits up to 35 seconds and fails if the daemon is still draining. It also fails when no daemon is running.
+
+`kache sync --push` does not replace the daemon: inside a Cargo workspace it uploads only the workspace's own crates, without their dependencies. The daemon keeps credentials from the environment, so they can stay in `KACHE_S3_ACCESS_KEY` and `KACHE_S3_SECRET_KEY`, the runner's secret store, or the standard cloud identity chain. Use `--allow-partial` only when cache failure must not fail the job.
 
 ## Ephemeral and persistent runners
 
@@ -125,11 +133,13 @@ This keeps exact remote reads and uploads.
 
 Concurrent jobs may share a persistent local store, but each job should have a distinct `KACHE_RUNTIME_DIR` for sockets, locks, event logs, and session state. kache-action already gives each job its own runtime directory. For a trusted disk that persists across jobs, set `node-cache: true` and `cache-dir` on the action.
 
+A job that should read a shared store without writing to it can mount it read-only and set `KACHE_READONLY_STORE` to the directory that holds its `index.db`. Kache checks it after the job's own store and restores hits from it by copy. See [Read-only store](/docs/getting-started/configuration#read-only-store).
+
 On a trusted builder that keeps a disk across jobs, point `KACHE_CACHE_DIR` at that disk and set `KACHE_TRUST_DOMAIN` to one label for the trust domain (for example `github.kunobi-ninja.kache`). Kache stores under `$KACHE_CACHE_DIR/<label>/`. Keep `KACHE_RUNTIME_DIR` on the job's scratch disk so sockets die with the pod. Do not mount that disk or export `KACHE_TRUST_DOMAIN` on public or fork jobs. An unusable label leaves `KACHE_CACHE_DIR` unchanged.
 
 ## Progress and reports
 
-Kache is quiet in compiler-wrapper mode by default because Cargo keeps a compiler's stderr and replays it when the unit is fresh. `KACHE_PROGRESS` turns on progress lines. From a terminal they go straight to it, out of Cargo's reach. In CI there is no terminal, so they go to stderr, and a later Cargo command in the same job can replay a line for a unit Kache did not run again.
+Kache is quiet in compiler-wrapper mode by default because Cargo keeps a compiler's stderr and replays it when the unit is fresh. `KACHE_PROGRESS` turns on progress lines. From a terminal on Linux or macOS they go straight to it, out of Cargo's reach. On Windows and in CI they go to stderr, where Cargo keeps them, so a later Cargo command can replay a line for a unit Kache did not run again.
 
 ```yaml
 env:

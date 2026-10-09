@@ -71,7 +71,8 @@ pub(crate) struct HandoffFile {
 /// A wrapper's request that the daemon store a cc compile it has finished.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) struct PublishCcRequest {
-    /// Legacy timestamp field; new clients send zero to avoid restarting old daemons.
+    /// Client executable mtime. Daemons from 1.0.x and earlier drain when it
+    /// is newer than their own; later daemons ignore it.
     #[serde(default)]
     pub client_epoch: u64,
     /// Release requesting an upgrade. Absent from legacy and read-only requests.
@@ -475,6 +476,7 @@ fn discard_handoff_files(request: &PublishCcRequest) {
 /// intent first, then the daemon's own upload pipeline.
 fn enqueue_upload(daemon: &Arc<Daemon>, config: &Config, request: &PublishCcRequest) {
     if config.remote_readonly {
+        daemon.warn_readonly_upload_skipped();
         return;
     }
     let job = UploadJob {
@@ -1031,6 +1033,45 @@ mod tests {
 
     fn key(label: &str) -> String {
         blake3::hash(label.as_bytes()).to_hex().to_string()
+    }
+
+    /// A read-only daemon stores every C/C++ compile handed to it and queues
+    /// none for upload. Only a writable client marks its compile for the
+    /// remote, so only that skip warns.
+    #[test]
+    fn a_read_only_daemon_warns_only_about_a_writable_clients_compile() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = crate::test_support::test_config(dir.path().join("cache"));
+        config.remote = Some(crate::config::RemoteConfig::test_s3("bucket", "prefix"));
+        config.remote_readonly = true;
+        config.auto_gc = false;
+        let store = Store::open(&config).unwrap();
+        for (label, writable_client) in [("read-only client", false), ("writable client", true)] {
+            let daemon = Arc::new(Daemon::new(config.clone()));
+            let mut request = handoff_request(&config, &key(label), dir.path());
+            request.publishes_to_remote = writable_client;
+            let cache_key = request.cache_key.clone();
+            let BuildClaim::Acquired(lock) = store.claim_build(&cache_key).unwrap() else {
+                panic!("fresh key");
+            };
+            publish_one(
+                &daemon,
+                &config,
+                &store,
+                PublishJob {
+                    request,
+                    _lock: lock,
+                },
+            );
+            assert!(store.get(&cache_key).unwrap().is_some(), "{label}: stored");
+            assert_eq!(
+                daemon.readonly_skip_warned_at().is_some(),
+                writable_client,
+                "{label}"
+            );
+        }
+        let queued = std::fs::read_dir(config.upload_spool_dir()).map_or(0, Iterator::count);
+        assert_eq!(queued, 0, "nothing is queued for upload");
     }
 
     /// The worker stores what the handler accepted: the entry is committed

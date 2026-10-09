@@ -76,7 +76,14 @@ pub(super) async fn serve(config: &Config, lifecycle: Arc<Lifecycle>) -> Result<
         .await?
         .context("control endpoint already owned")?;
     let socket = SocketCleanupGuard::new(&path)?;
-    let service = Arc::new(ControlService::new(lifecycle, 0, VERSION.into(), 0));
+    // 1.0.x clients replace a daemon whose revision is older than their own
+    // executable mtime; later clients compare the release in `build`.
+    let service = Arc::new(ControlService::new(
+        lifecycle,
+        0,
+        VERSION.into(),
+        build_epoch(),
+    ));
     let offer = offer(config)?;
     let handler = Arc::clone(&service);
     let stop = Arc::new(Notify::new());
@@ -282,7 +289,8 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(health.version, VERSION);
-        assert_eq!(health.build_epoch, 0);
+        assert_ne!(build_epoch(), 0, "the test binary has a readable mtime");
+        assert_eq!(health.build_epoch, build_epoch());
         let pending = lifecycle.begin().unwrap();
         assert!(
             query(&config, operation::HEALTH)

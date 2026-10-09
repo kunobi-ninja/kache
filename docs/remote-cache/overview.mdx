@@ -26,9 +26,15 @@ cargo build --locked
 kache daemon stop
 ```
 
-`doctor` checks the remote configuration and access. The build uses the daemon
-for remote lookups and background uploads. `daemon stop` drains queued uploads
-before exit, which matters on an ephemeral runner.
+`doctor` shows the remote and checks that it answers a read. It never tries a
+write, and on S3 a read that the bucket policy refuses counts as a miss, so a
+passing check does not prove that a job can publish.
+
+The build uses the daemon for remote lookups and background uploads.
+`daemon stop` gives queued uploads up to 30 seconds before the daemon exits,
+which matters on an ephemeral runner.
+[CI setup](/docs/remote-cache/ci#other-ci-systems) covers what happens to the
+rest.
 
 ## Control who publishes
 

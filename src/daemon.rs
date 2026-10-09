@@ -234,8 +234,9 @@ const FILE_HASH_MEMORY_CACHE_CAP: usize = 4096;
 /// rows, and an hour outlasts any put still in flight.
 pub(crate) const ORPHAN_BLOB_GRACE: Duration = Duration::from_secs(3600);
 
-/// Executable mtime used to distinguish coordinator records during cleanup.
-/// It is not a release version and must not determine replacement policy.
+/// Executable mtime. Coordinator records use it to tell daemons apart. The
+/// legacy epoch fields carry it because 1.0.x and earlier decide replacement
+/// by it; this release decides on the release version alone.
 pub fn build_epoch() -> u64 {
     static BUILD_EPOCH: OnceLock<u64> = OnceLock::new();
 
@@ -547,7 +548,8 @@ pub struct UploadJob {
     pub entry_dir: String,
     #[serde(default)]
     pub crate_name: String,
-    /// Legacy timestamp field; new clients send zero to avoid restarting old daemons.
+    /// Client executable mtime. Daemons from 1.0.x and earlier drain when it
+    /// is newer than their own; later daemons ignore it.
     #[serde(default)]
     pub client_epoch: u64,
     /// Release requesting an upgrade. Absent from legacy and read-only requests.
@@ -1065,7 +1067,9 @@ pub struct StatsRequest {
     /// `event_hours` when present, so `--since 15m` is a 15 minute window.
     #[serde(default)]
     pub event_secs: Option<u64>,
-    /// Legacy timestamp field; new clients send zero to avoid restarting old daemons.
+    /// Client executable mtime, or zero for reads that must not request a
+    /// drain. Daemons from 1.0.x and earlier drain when it is newer than their
+    /// own; later daemons ignore it.
     #[serde(default)]
     pub client_epoch: u64,
     /// Release requesting an upgrade. Absent from legacy and read-only requests.
@@ -1230,7 +1234,8 @@ impl PackPrefetchContext {
 pub struct BuildStartedRequest {
     #[serde(default)]
     pub intent: kache_core::BuildIntent,
-    /// Legacy timestamp field; new clients send zero to avoid restarting old daemons.
+    /// Client executable mtime. Daemons from 1.0.x and earlier drain when it
+    /// is newer than their own; later daemons ignore it.
     #[serde(default)]
     pub client_epoch: u64,
     /// Release requesting an upgrade. Absent from legacy and read-only requests.
@@ -1263,7 +1268,7 @@ pub struct CompileStartedRequest {
     /// (lazily, on the first heartbeat tick).
     #[serde(default)]
     pub typical_ms: Option<u64>,
-    /// Legacy timestamp field; new clients send zero to avoid restarting old daemons.
+    /// No release drains on this field; clients send zero.
     #[serde(default)]
     pub client_epoch: u64,
     /// Release requesting an upgrade. Absent from legacy and read-only requests.
@@ -1289,9 +1294,14 @@ pub struct CompileFinishedRequest {
 pub struct DaemonHealth {
     #[serde(default)]
     pub version: String,
-    /// Retired timestamp field. Zero prevents legacy clients from inferring an upgrade.
+    /// Daemon executable mtime. Clients from 1.0.x and earlier replace a daemon
+    /// whose executable is older than theirs; later clients only display it.
     #[serde(default)]
     pub build_epoch: u64,
+    /// Whether the daemon skips remote uploads. `None` from older daemons and
+    /// from the lifecycle control endpoint, which does not carry it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_readonly: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1313,7 +1323,8 @@ pub struct StatsResponse {
     pub recent_summaries: Vec<crate::events::BuildSummaryEvent>,
     #[serde(default)]
     pub version: String,
-    /// Retired timestamp field. Zero prevents legacy clients from inferring an upgrade.
+    /// Daemon executable mtime. Clients from 1.0.x and earlier replace a daemon
+    /// whose executable is older than theirs; later clients only display it.
     #[serde(default)]
     pub build_epoch: u64,
     /// GC request semantics supported by this daemon. Version 2 means the
@@ -1424,6 +1435,11 @@ pub struct EffectiveConfig {
     /// Whether the daemon started in strict local-only mode.
     #[serde(default)]
     pub local_only: bool,
+    /// Whether the daemon skips remote uploads. A daemon keeps the read-only
+    /// setting it started with, so a writable build can still reach a
+    /// read-only daemon. `None` from daemons that predate the field.
+    #[serde(default)]
+    pub remote_readonly: Option<bool>,
     /// Why a configured remote was unusable, when configuration degraded to
     /// local-only operation. This is the same user-facing reason the daemon
     /// logs; credentials are never included.
@@ -1468,6 +1484,7 @@ impl EffectiveConfig {
             remote_key_listing: config.remote_key_listing,
             remote_description: config.remote.as_ref().map(|remote| remote.describe()),
             local_only: config.local_only,
+            remote_readonly: Some(config.remote_readonly),
             remote_error: config.remote_error.clone(),
             remote_key_cache_refresh_secs: config.remote_key_cache_refresh_secs,
             socket_path: config.socket_path().display().to_string(),
@@ -2759,6 +2776,33 @@ pub(crate) struct Daemon {
     request_clock: Arc<crate::maintenance::RequestClock>,
     /// Set while a hinted sweep is queued or running; further hints coalesce.
     gc_hint_pending: AtomicBool,
+    /// When this read-only daemon last warned that it skipped a writable
+    /// build's upload.
+    readonly_skip_warned: Mutex<Option<Instant>>,
+}
+
+/// Whether a rate-limited warning may fire at `now`. Records `now` when it may.
+fn warn_window_open(last: &mut Option<Instant>, now: Instant, every: Duration) -> bool {
+    if last.is_some_and(|at| now.saturating_duration_since(at) < every) {
+        return false;
+    }
+    *last = Some(now);
+    true
+}
+
+/// What a read-only daemon logs when a writable build's upload reaches it.
+/// The daemon keeps the read-only setting of the build that started it, so
+/// on a shared runner a pull request job can leave one behind.
+fn readonly_upload_skip_message() -> String {
+    let reason = crate::policy::forced_remote_readonly().map_or_else(
+        || "KACHE_REMOTE_READONLY or cache.remote_readonly".to_string(),
+        |forced| forced.reason,
+    );
+    format!(
+        "skipping uploads from writable builds: this daemon started read-only ({reason}) and \
+         stays read-only until it restarts. Run `kache daemon restart` from a writable \
+         environment; an installed service takes the setting from its own environment and config"
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -2873,6 +2917,7 @@ impl Daemon {
             file_hash_cache: Arc::new(Mutex::new(HashMap::new())),
             request_clock: Arc::new(crate::maintenance::RequestClock::new()),
             gc_hint_pending: AtomicBool::new(false),
+            readonly_skip_warned: Mutex::new(None),
             config,
         }
     }
@@ -3571,7 +3616,8 @@ impl Daemon {
         Response {
             health: Some(DaemonHealth {
                 version: self.version.clone(),
-                build_epoch: 0,
+                build_epoch: build_epoch(),
+                remote_readonly: Some(self.config.remote_readonly),
             }),
             ..Response::ok()
         }
@@ -3650,7 +3696,7 @@ impl Daemon {
             blob_stats: Some(inventory.blob_stats),
             recent_summaries,
             version: self.version.clone(),
-            build_epoch: 0,
+            build_epoch: build_epoch(),
             gc_policy_version: GC_POLICY_PROTOCOL_VERSION,
             pending_uploads,
             active_downloads,
@@ -3913,6 +3959,31 @@ impl Daemon {
         }
     }
 
+    /// Read-only clients never send uploads, so one reaching a read-only
+    /// daemon comes from a writable build whose upload is skipped. Warn at
+    /// most once per window, not once per artifact.
+    pub(crate) fn warn_readonly_upload_skipped(&self) {
+        let due = warn_window_open(
+            &mut self
+                .readonly_skip_warned
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            Instant::now(),
+            Duration::from_secs(crate::wrapper::WARN_SESSION_SECS),
+        );
+        if due {
+            tracing::warn!("{}", readonly_upload_skip_message());
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn readonly_skip_warned_at(&self) -> Option<Instant> {
+        *self
+            .readonly_skip_warned
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// Handle an upload job. If the upload queue is available, pushes to it (non-blocking).
     /// Otherwise falls back to direct upload (used in tests).
     pub async fn handle_upload(&self, job: &UploadJob) -> Response {
@@ -3923,6 +3994,7 @@ impl Daemon {
             return Response::err("invalid crate name");
         }
         if self.config.remote_readonly {
+            self.warn_readonly_upload_skipped();
             tracing::debug!(
                 crate_name = job.crate_name,
                 key = key_prefix(&job.key),
@@ -4033,6 +4105,8 @@ impl Daemon {
             return Response::err("invalid crate name");
         }
         if self.config.remote_readonly {
+            // Reached by startup replay: the queued intent is then retired.
+            self.warn_readonly_upload_skipped();
             tracing::debug!(
                 crate_name = job.crate_name,
                 key = key_short,
@@ -4351,6 +4425,11 @@ impl Daemon {
     /// or a read-only one, the same gate artifact uploads use.
     fn handle_prediction_publish(self: &Arc<Self>, req: PredictionPublishRequest) -> Response {
         if !publishes_predictions(&self.config) {
+            // Read-only clients send no rows, so this one is a writable
+            // build's.
+            if self.config.remote_readonly {
+                self.warn_readonly_upload_skipped();
+            }
             return Response::ok();
         }
         if !prediction_identity_is_acceptable(&req.identity) {
@@ -8740,7 +8819,7 @@ pub fn send_upload_job(
         key: key.to_string(),
         entry_dir: entry_dir.to_string_lossy().into_owned(),
         crate_name: crate_name.to_string(),
-        client_epoch: 0,
+        client_epoch: build_epoch(),
         client_version: Some(VERSION.to_owned()),
     };
     // Durability precedes the fire-and-forget socket write. If the daemon is
@@ -9269,6 +9348,7 @@ fn fetch_daemon_health(config: &Config) -> Result<DaemonHealth> {
         return Ok(DaemonHealth {
             version: health.build,
             build_epoch: health.revision,
+            remote_readonly: None,
         });
     }
     let response = send_request_with_timeout(
@@ -9277,6 +9357,20 @@ fn fetch_daemon_health(config: &Config) -> Result<DaemonHealth> {
         Duration::from_secs(2),
     )?;
     parse_daemon_health(&response)
+}
+
+/// Whether the daemon at `config`'s socket skips remote uploads, from one
+/// legacy health round trip. The handler answers without touching the store,
+/// so this stays cheap. `None` when no daemon answers or it predates the
+/// field. Never starts, drains or replaces a daemon.
+pub(crate) fn daemon_remote_readonly(config: &Config) -> Option<bool> {
+    let response = send_request_with_timeout(
+        &config.socket_path(),
+        &Request::Health,
+        Duration::from_secs(2),
+    )
+    .ok()?;
+    parse_daemon_health(&response).ok()?.remote_readonly
 }
 
 fn parse_daemon_health(response: &str) -> Result<DaemonHealth> {
@@ -9394,7 +9488,7 @@ fn fetch_stats(
         // answer with a superset of a sub-hour window rather than nothing.
         event_hours: window.map(|w| w.secs().div_ceil(3600)),
         event_secs: window.map(crate::since::SinceWindow::secs),
-        client_epoch: 0,
+        client_epoch: if request_upgrade { build_epoch() } else { 0 },
         client_version: request_upgrade.then(|| VERSION.to_owned()),
     });
 

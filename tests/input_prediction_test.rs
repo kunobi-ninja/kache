@@ -22,7 +22,8 @@
 //!   - a unit that expands a proc macro through an rlib that re-exports it
 //!     misses once a file appears in the directory the macro lists, in its
 //!     own target directory and in another one, and a listed file removed
-//!     while it builds leaves no record that its return would match.
+//!     while it builds leaves no record that its return would match,
+//!   - a record re-derived after a predicted key missed keeps that guard.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -1565,6 +1566,68 @@ fn an_unreadable_directory_in_the_workspace_keeps_predictions() {
     let warm = unit.build(&a, true, None);
     assert_eq!(warm.result, "local_hit");
     assert_eq!(warm.dep_info_runs, 0, "the record applies");
+}
+
+/// `facade` built again with another item into `target`'s `deps`, so its
+/// rlib differs while it re-exports the same macro.
+fn rebuild_facade(root: &Path, scan: &Path, target: &Path) {
+    let out = root.join("facade-out-2");
+    std::fs::create_dir_all(&out).unwrap();
+    let source = root.join("facade-2.rs");
+    std::fs::write(
+        &source,
+        "pub use scan::scan;\npub fn extra() -> u32 { 42 }\n",
+    )
+    .unwrap();
+    let status = std::process::Command::new(rustc_path())
+        .args([
+            "--crate-name",
+            "facade",
+            "--crate-type",
+            "rlib",
+            "--edition",
+            "2021",
+        ])
+        .arg("--extern")
+        .arg(format!("scan={}", scan.display()))
+        .arg("--out-dir")
+        .arg(&out)
+        .arg(&source)
+        .env_remove("RUSTC_WRAPPER")
+        .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
+        .status()
+        .expect("run rustc to rebuild facade");
+    assert!(status.success(), "rebuilding facade failed");
+    std::fs::copy(
+        out.join("libfacade.rlib"),
+        target.join("debug/deps/libfacade.rlib"),
+    )
+    .unwrap();
+}
+
+/// A predicted key that misses because a linked rlib changed is re-derived
+/// with the pre-pass. The record that re-derivation writes keeps the tree
+/// guard the first key took, so the next build predicts again.
+#[test]
+fn a_re_derived_record_keeps_the_tree_guard() {
+    build_kache();
+    let unit = WorkspaceUnit::new(false)
+        .with_facade()
+        .with_file("kt/assets/a.txt", "a\n");
+    let a = unit.checkout("a");
+    assert_eq!(unit.build(&a, true, None).result, "miss");
+    assert_eq!(unit.build(&a, true, None).dep_info_runs, 0);
+
+    rebuild_facade(unit.root.path(), &unit.facade[0], &unit.target(&a));
+    let changed = unit.build(&a, true, None);
+    assert_eq!(changed.result, "miss");
+    assert_eq!(changed.dep_info_runs, 1, "the predicted key is re-derived");
+    let next = unit.build(&a, true, None);
+    assert_eq!(next.result, "local_hit");
+    assert_eq!(
+        next.dep_info_runs, 0,
+        "the re-derived record keeps the guard"
+    );
 }
 
 /// The macro finds a first file whether its directory was empty or missing

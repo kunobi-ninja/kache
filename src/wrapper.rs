@@ -4056,7 +4056,12 @@ fn run_parsed_rustc(
         ) {
             Ok(recomputed) => {
                 cache_key = recomputed.cache_key;
+                // The re-derivation runs with predictions off and takes no
+                // tree guard. The one the first computation took, before
+                // anything ran, is the one the record carries.
+                let first_guard = key_outputs.tree_guard.take();
                 key_outputs = recomputed.outputs;
+                key_outputs.tree_guard = key_outputs.tree_guard.take().or(first_guard);
                 // Accumulate rather than replace: the first computation's
                 // measurements already include the extra-inputs resolve, and
                 // this second pass is real time this invocation spent.

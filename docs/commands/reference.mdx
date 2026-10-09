@@ -34,7 +34,6 @@ These are for CI, scripts and integrations, and are not listed by `kache --help`
 | Command | Purpose |
 | --- | --- |
 | `cargo` | Run Cargo with duplicate Cargo-home rustflags collapsed |
-| `prefetch` | Restore a compatible ordered warm set before building |
 | `save-manifest` | Publish build metadata for later prefetch |
 | `telemetry` | Write cache counters and this machine's shared-cache state as OTLP JSON for Kartero |
 | `test-runner` | Run a test binary as Cargo's target runner, paced by the scheduler |
@@ -208,55 +207,6 @@ Options:
 
 See [Sync](/docs/remote-cache/sync) for filtering semantics.
 
-## `kache prefetch`
-
-Restore the most recent compatible session report before starting Cargo:
-
-```bash
-kache prefetch --namespace my-org/my-repo --build-shape my-config-digest
-cargo build
-```
-
-The producer must have used the same namespace, repository label, declared build
-shape, target, profile, compiler version and full `Cargo.lock` digest, then
-published its report with `kache save-manifest`. Run `kache sync --push` first
-when the build used a local-only cache. Reports record observed compiler events;
-a reported pack may still be missing from the remote.
-
-`--namespace`, `--repository` and `--build-shape` can use `KACHE_NAMESPACE`,
-`KACHE_REPOSITORY` and `KACHE_BUILD_SHAPE`. Repository defaults to the namespace.
-`--target` defaults to the selected compiler's host; pass it for cross builds.
-`--profile` defaults to `debug`; `--rustc` selects the compiler, otherwise `RUSTC`
-or `rustc` on PATH is used. Missing labels, a missing lockfile or no compatible
-report produce an explained no-op. `--dry-run` prints keys in replay order.
-
-The command waits for local import before returning. It replays each key once,
-in its first observed order, and skips local entries and busy keys. Downloads
-use the existing verified pack reader and an owned staging directory. A failed
-pack is reported without discarding successful imports or replacing another
-publisher's entry; partial failures return a nonzero exit status.
-
-`KACHE_PREFETCH_MAX_KEYS`, `KACHE_PREFETCH_MAX_BYTES` and
-`KACHE_PREFETCH_DEADLINE_SECS` must be finite and nonzero. The byte cap covers
-compressed artifact bodies; discovery is separately limited to 1,024 reports
-of at most 8 MiB each. Failed artifact transfers conservatively consume their
-admitted byte allowance. Downloads run one at a time, within the configured
-concurrency ceiling. The deadline covers discovery and downloads; local import
-still finishes before the command returns. Automatic prefetch can be disabled
-while using this explicit command.
-
-Install optional Git hooks with the same replay options:
-
-```bash
-kache prefetch --namespace my-org/my-repo --build-shape my-config-digest --install-hooks
-kache prefetch --uninstall-hooks
-```
-
-Installation respects `core.hooksPath` and refuses existing hooks. The
-post-checkout and post-merge hooks are bound to their repository and leave Git
-successful when optional warming fails. Uninstallation removes only unchanged
-hooks recorded by Kache; edited hooks are retained.
-
 ## `kache save-manifest`
 
 ```bash
@@ -289,58 +239,6 @@ five tries it fails and leaves the manifest as the other jobs wrote it. Stores
 without conditional writes, including filesystem remotes, get the merged
 manifest written plainly, so two jobs finishing at the same moment can still
 drop each other's entries there. Shards merge the same way.
-
-`save-manifest` also writes immutable session reports under
-`_manifests/build-reports/v1/<namespace>/<session>-<root-hash>.json`. Each report
-keeps invocations in event-log order, including repeated cache keys, timestamps,
-compile cost and offsets from the earliest observed invocation. It records
-`observed` artifacts: a compiler event does not prove that a background upload
-finished. The legacy merged manifest remains available to existing planners.
-
-Set producer labels before the build to make its report eligible for exact
-warm-set replay:
-
-```bash
-export KACHE_NAMESPACE=my-org/my-repo
-export KACHE_REPOSITORY=my-org/my-repo # defaults to KACHE_NAMESPACE
-export KACHE_BUILD_TARGET=x86_64-unknown-linux-gnu
-export KACHE_BUILD_SHAPE=my-config-digest
-cargo build
-kache save-manifest
-```
-
-`KACHE_BUILD_SHAPE` is a caller-declared digest of the build configuration:
-include the Cargo command, selected packages/features and relevant flags in
-that digest. Kache does not infer it from one compiler invocation.
-`CARGO_BUILD_TARGET` can supply the declared target instead. The wrapper captures
-these labels, the actual compiler's verbose-version hash, profile and full
-lockfile digest at the session's first cache-eligible wrapped invocation when a
-repository or namespace label is declared, including builds with no remote or automatic
-prefetch. Unlabelled builds keep unknown compatibility facts. Host build scripts
-and proc macros do not establish a cross build's target.
-
-Missing producer facts remain unknown; a later daemon never fills them from its
-own environment. Reports without a namespace use `unscoped`. Root paths are
-hashed before publication. `GITHUB_SHA`/`CI_COMMIT_SHA` and the corresponding ref
-are captured from the producer. Optional `KACHE_PARENT_COMMITS` supplies
-whitespace-separated parent commits; `KACHE_CI_STARTED_AT_MS` supplies a known CI
-start timestamp for per-entry CI offsets.
-
-An unresolved compiler fingerprint leaves the report's toolchain identity unknown.
-On Windows, use Cargo's full compiler path to record a replayable identity; a bare
-`rustc` name still records observations.
-
-The existing inactivity-based session marker can span adjacent Cargo commands.
-If producer labels, profile, compiler selection or lockfile change within that
-session, its compatibility facts and commit context become unknown. Observations
-stay ordered, but exact replay must reject that mixed session.
-
-The first published snapshot for a session/root stays unchanged. Repeating the
-same snapshot succeeds; changed observations for that object return a conflict.
-Reports require atomic create-only writes from the remote. Reading them caps
-each object at 8 MiB, each report at 50,000 entries and discovery at 1,024 objects
-per namespace. Rebuilding an index from these reports preserves session history
-and invocation order without the original local event log.
 
 ## `kache daemon`
 

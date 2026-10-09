@@ -7662,14 +7662,6 @@ pub(crate) fn rustc_version_text(rustc: &Path) -> Option<String> {
     get_rustc_version(rustc).ok()
 }
 
-/// The rustup-aware version-cache selector without probing the compiler.
-pub(crate) fn rustc_version_fingerprint(rustc: &Path) -> Option<String> {
-    tool_version_cache_path(rustc, "rustc-ver")?
-        .file_name()?
-        .to_str()
-        .map(str::to_owned)
-}
-
 fn get_rustc_version(rustc: &Path) -> Result<String> {
     let _trace = crate::phase_trace::phase("compiler_identity");
     if let Some(cached) = read_tool_version_cache(rustc, "rustc-ver") {

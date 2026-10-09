@@ -233,6 +233,75 @@ fn a_registry_unit_reading_its_out_dir_records_a_relocated_row() {
     );
 }
 
+/// A workspace unit's rows in this checkout, the local one and the shared
+/// one, carry the workspace guard only while it covers the closure: a macro
+/// could list the directory of a file the guard does not see.
+#[test]
+fn a_workspace_units_rows_carry_the_guard_only_while_it_covers_the_closure() {
+    if std::process::Command::new("rustc")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("skipped: no rustc");
+        return;
+    }
+    let mut lock = crate::test_support::process_state_test_lock();
+    let base = lock.enter();
+    let mut config = test_config(base.join("cache"));
+    config.input_predictions = true;
+    let store = Store::open(&config).unwrap();
+    let root = base.join("w");
+    std::fs::create_dir_all(root.join("kt/src")).unwrap();
+    std::fs::create_dir_all(root.join("target/debug/deps")).unwrap();
+    std::fs::write(root.join("Cargo.toml"), "[workspace]\n").unwrap();
+    std::fs::write(root.join("kt/src/lib.rs"), "").unwrap();
+    std::fs::write(base.join("outside.txt"), "").unwrap();
+    std::env::set_current_dir(&root).unwrap();
+    let manifest_dir = root.join("kt");
+    let _manifest = crate::config::tests::set_env_for_test(
+        "CARGO_MANIFEST_DIR",
+        Some(manifest_dir.as_os_str()),
+    );
+    let _out = crate::config::tests::set_env_for_test("OUT_DIR", None);
+    let deps = root.join("target/debug/deps");
+    let args = rustc_args(&[
+        "rustc",
+        "--crate-name",
+        "kt",
+        "kt/src/lib.rs",
+        "--out-dir",
+        deps.to_str().unwrap(),
+    ]);
+    let local = crate::cache_key::rustc_prediction_identity(&args).unwrap();
+    let shared = crate::cache_key::rustc_shared_prediction_identity(&args).unwrap();
+    let key = |sources: Vec<PathBuf>| crate::cache_key::KeyOutputs {
+        dep_info: Some(crate::cache_key::DepInfo {
+            source_files: sources,
+            env_deps: Vec::new(),
+        }),
+        tree_digest: Some("tree".to_string()),
+        ..Default::default()
+    };
+    let trees = || {
+        let hasher = store.file_hasher();
+        let tree = |identity: &str| hasher.input_prediction(identity).unwrap().tree;
+        (tree(&local), tree(&shared))
+    };
+    let lib = PathBuf::from("kt/src/lib.rs");
+    record_input_prediction(&config, Some(&store), &args, true, &key(vec![lib.clone()]));
+    let guarded = Some("tree".to_string());
+    assert_eq!(trees(), (guarded.clone(), guarded));
+    record_input_prediction(
+        &config,
+        Some(&store),
+        &args,
+        true,
+        &key(vec![lib, base.join("outside.txt")]),
+    );
+    assert_eq!(trees(), (None, None), "a file outside the workspace");
+}
+
 fn eligible_incremental_args(temp: &tempfile::TempDir, crate_name: &str) -> RustcArgs {
     let profile = temp.path().join("target/debug");
     let out_dir = profile.join("deps");

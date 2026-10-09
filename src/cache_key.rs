@@ -785,10 +785,10 @@ pub struct KeyOutputs {
     /// succeeded. `None` when the invocation has no source file, or the
     /// computation stopped before the closure was resolved.
     pub dep_info: Option<DepInfo>,
-    /// The tree digest a guarded computation used: the crate tree of a
-    /// proc-macro-dependent unit, or the `OUT_DIR` guard of a unit that
-    /// looked for a relocated or workspace record. A record made from this
-    /// invocation must carry it.
+    /// The tree digest a guarded computation used: the workspace or package
+    /// tree of a unit under the tree guard ([`needs_tree_guard`]), or the
+    /// `OUT_DIR` guard of a registry unit that looked for a relocated record.
+    /// A record made from this invocation must carry it.
     pub tree_digest: Option<String>,
     /// Did the key keep an OUT_DIR path (OUT_DIR itself, or a value under it)
     /// as a literal? A lib whose key does is one whose consumers are worth
@@ -1355,16 +1355,19 @@ const RELOCATABLE_PREDICTION_PREFIX: &str = "shared-out-dir-v1:";
 
 /// May a unit's record be shared across target directories?
 ///
-/// A unit with no proc-macro dependency can: its closure is everything it
-/// reads. A registry unit with one can too, because a macro there reads its
-/// package and `OUT_DIR`, and the record carries a digest of both that the
-/// reader checks before use. The target paths that differ between checkouts
-/// only reach the key as extern content, which the key hashes.
+/// A unit with no proc-macro dependency of its own can. A workspace unit's
+/// row carries the workspace guard ([`needs_tree_guard`]), which also covers
+/// a macro an rlib re-exports, and a registry package holds the same files
+/// in every checkout. A registry unit with a proc-macro dependency can too,
+/// because a macro there reads its package and `OUT_DIR`, and the record
+/// carries a digest of both that the reader checks before use. The target
+/// paths that differ between checkouts only reach the key as extern content,
+/// which the key hashes.
 fn shared_prediction_eligible(
     externs: &[crate::args::ExternDep],
     manifest_dir: Option<&Path>,
 ) -> bool {
-    prediction_applies(externs) || manifest_dir.is_some_and(is_registry_package)
+    !has_dylib_extern(externs) || manifest_dir.is_some_and(is_registry_package)
 }
 
 /// The value of `name` in an environment snapshot.
@@ -1743,23 +1746,35 @@ fn predicted_key_inputs(
     }
     let vars: Vec<_> = std::env::vars_os().collect();
     let workspace = workspace_roots(args, &vars);
-    // A unit with a proc-macro dependency is only predictable under the tree
-    // guard: the record must carry the tree digest and it must still match.
-    // The tree is the package for a registry or vendored unit and the whole
-    // workspace for any other workspace one. Computed once here and handed back in `tree_digest`,
-    // because the same digest is what a record made from this invocation has
-    // to carry.
-    let tree = if prediction_applies(&args.externs) {
-        None
-    } else {
-        let _trace = crate::phase_trace::phase("crate_tree");
-        let digest = match &workspace {
-            Some(workspace) => workspace_tree_digest(workspace, file_hasher),
-            None => crate_tree_digest(file_hasher),
-        }
-        .ok_or(Rejection::NotEligible)?;
+    let manifest_dir = env_var_in(&vars, "CARGO_MANIFEST_DIR").map(Path::new);
+    // A unit under the tree guard is predictable only while the record carries
+    // the tree digest and the digest still matches. The tree is the package
+    // for a registry or vendored unit and the whole workspace for any other
+    // workspace or path one. Computed once here and handed back in
+    // `tree_digest`, because the same digest is what a record made from this
+    // invocation has to carry. A digest already there was taken before a
+    // discovery-flight wait (see `resolve_key_inputs`), and is the one the
+    // record will carry.
+    let tree = if needs_tree_guard(&args.externs, manifest_dir) {
+        let digest = match tree_digest.clone() {
+            Some(digest) => digest,
+            None => {
+                let _trace = crate::phase_trace::phase(if workspace.is_some() {
+                    "workspace_tree"
+                } else {
+                    "crate_tree"
+                });
+                match &workspace {
+                    Some(workspace) => workspace_tree_digest(workspace, file_hasher),
+                    None => crate_tree_digest(file_hasher),
+                }
+                .ok_or(Rejection::NotEligible)?
+            }
+        };
         *tree_digest = Some(digest.clone());
         Some(digest)
+    } else {
+        None
     };
     let identity = rustc_prediction_identity(args).ok_or(Rejection::Disabled)?;
     let shared = rustc_shared_prediction_identity(args);
@@ -1777,9 +1792,7 @@ fn predicted_key_inputs(
         })
     else {
         return match &workspace {
-            Some(workspace) => {
-                workspace_key_inputs(args, file_hasher, workspace, vars, tree, tree_digest)
-            }
+            Some(workspace) => workspace_key_inputs(args, file_hasher, workspace, vars, tree),
             None => relocated_key_inputs(args, file_hasher, tree, tree_digest),
         };
     };
@@ -1789,6 +1802,13 @@ fn predicted_key_inputs(
             Some(_) => return Err(Rejection::TreeChanged),
             None => return Err(Rejection::NoRecord),
         }
+    }
+    // The digest only vouches for files its walk sees. A shared row written
+    // before this check carries the digest whatever its closure names.
+    if let Some(workspace) = &workspace
+        && !guard_covers(&record.sources, workspace)
+    {
+        return Err(Rejection::NoRecord);
     }
     let validated = validate_prediction(
         &record,
@@ -1964,31 +1984,28 @@ pub(crate) fn is_portable_identity(identity: &str) -> bool {
 /// a record made in another checkout of the same workspace, with its sources
 /// written relative to the workspace root and `OUT_DIR`.
 ///
-/// The guard is a digest of the whole workspace (less the target directory
-/// and `.git`) and of `OUT_DIR`, taken before rustc runs. A record is used
-/// only when both are byte for byte what the recorder had, so a macro that
-/// scans the workspace, even one reached through an rlib rather than a
-/// direct proc-macro dependency, finds the same files here.
+/// The guard is `tree`, the digest of the whole workspace (less the target
+/// directory and `.git`) and of `OUT_DIR` that the caller took before rustc
+/// runs. A record is used only when both are byte for byte what the recorder
+/// had, so a macro that scans the workspace, even one reached through an
+/// rlib rather than a direct proc-macro dependency, finds the same files
+/// here.
 fn workspace_key_inputs(
     args: &RustcArgs,
     file_hasher: &FileHasher<'_>,
     workspace: &WorkspaceRoots,
     vars: Vec<(std::ffi::OsString, std::ffi::OsString)>,
     tree: Option<String>,
-    tree_digest: &mut Option<String>,
 ) -> std::result::Result<DepInfo, Rejection> {
     let identity =
         workspace_prediction_identity(args, vars, workspace).ok_or(Rejection::NoRecord)?;
-    let guard = match tree {
-        Some(tree) => tree,
-        None => {
-            let _trace = crate::phase_trace::phase("workspace_tree");
-            workspace_tree_digest(workspace, file_hasher).ok_or(Rejection::NoRecord)?
-        }
-    };
-    *tree_digest = Some(guard.clone());
+    let guard = tree.ok_or(Rejection::NoRecord)?;
     let places = workspace.places().ok_or(Rejection::NoRecord)?;
-    portable_key_inputs(file_hasher, &identity, args, &guard, &places)
+    let dep_info = portable_key_inputs(file_hasher, &identity, args, &guard, &places)?;
+    if !guard_covers(&dep_info.source_files, workspace) {
+        return Err(Rejection::NoRecord);
+    }
+    Ok(dep_info)
 }
 
 /// For each of `args`, the argument with the workspace root in a linker path
@@ -2345,7 +2362,7 @@ fn workspace_tree_digest_within(
 /// until it has published a successful prediction and artifacts; this caller
 /// then validates the record and computes its own complete key as usual.
 fn prediction_discovery_identity(args: &RustcArgs, file_hasher: &FileHasher<'_>) -> Option<String> {
-    if !file_hasher.uses_input_predictions() || !prediction_applies(&args.externs) {
+    if !file_hasher.uses_input_predictions() || has_dylib_extern(&args.externs) {
         return None;
     }
     rustc_shared_prediction_identity(args).or_else(|| rustc_prediction_identity(args))
@@ -2404,7 +2421,8 @@ fn resolve_key_inputs(
             owns_flight = flight.lock.is_some();
             *file_hasher.discovery_flight.borrow_mut() = flight.lock;
             // The previous owner may have published while this process
-            // waited; a flight taken at once had no owner to publish.
+            // waited; a flight taken at once had no owner to publish. The
+            // tree digest taken before the wait is used again.
             if flight.waited {
                 prediction = predicted_key_inputs(args, file_hasher, &mut out.tree_digest);
             }
@@ -5574,14 +5592,15 @@ pub(crate) struct InputPrediction {
     /// (OUT_DIR-like values collapse to a sentinel), so the raw value is the
     /// only signal that an included file moved.
     pub(crate) env_deps: Vec<(String, String)>,
-    /// Digest of the crate's own tree ([`crate_tree_digest`]) when the unit
-    /// depends on a proc macro. Such a macro can read any file under the crate
+    /// The tree digest of a unit under the tree guard ([`needs_tree_guard`]):
+    /// the workspace for a workspace or path unit, the package for a registry
+    /// unit with a proc-macro dependency. A macro can read any file there
     /// without it entering the closure, so the closure alone cannot say
     /// whether the record still applies; the tree can. Absent on records made
-    /// for units that need no such guard, and on rows written before it
-    /// existed, which the guard then treats as unusable. A unit with no proc
-    /// macro may carry its `OUT_DIR` guard here, which nothing checks on this
-    /// row.
+    /// for units that need no such guard, on rows whose closure the guard
+    /// does not cover, and on rows written before it existed, which the
+    /// guard then treats as unusable. A registry unit with no proc macro may
+    /// carry its `OUT_DIR` guard here, which nothing checks on this row.
     #[serde(default)]
     pub(crate) tree: Option<String>,
 }
@@ -5831,24 +5850,29 @@ fn relocatable_record_in(
         .then_some((identity, record))
 }
 
-/// Is this invocation a workspace or path unit whose records the workspace
-/// guard covers ([`workspace_roots`])?
-pub(crate) fn is_workspace_unit(args: &RustcArgs) -> bool {
-    workspace_roots(args, &std::env::vars_os().collect::<Vec<_>>()).is_some()
+/// The guard this checkout's own rows carry, the local row and the shared
+/// one ([`same_tree_guard`]).
+pub(crate) fn same_checkout_guard(
+    args: &RustcArgs,
+    dep_info: &DepInfo,
+    tree: Option<String>,
+) -> Option<String> {
+    let workspace = workspace_roots(args, &std::env::vars_os().collect::<Vec<_>>());
+    same_tree_guard(
+        tree,
+        workspace.is_some(),
+        workspace.is_some_and(|workspace| guard_covers(&dep_info.source_files, &workspace)),
+    )
 }
 
-/// The guard this checkout's own row carries. A workspace unit whose closure
-/// reaches past the workspace (`relocatable` false) keeps none: the guard
-/// covers the workspace only, so a macro that scans a directory outside it
-/// could find a new file there with the guard unchanged. Without a guard, a
-/// row of a unit with a proc-macro dependency is never used, and that unit
-/// keeps the pre-pass.
-pub(crate) fn same_tree_guard(
-    tree: Option<String>,
-    workspace_unit: bool,
-    relocatable: bool,
-) -> Option<String> {
-    if workspace_unit && !relocatable {
+/// A workspace unit whose closure the guard does not cover (`covered` false,
+/// see [`guard_covers`]) keeps no guard: a macro that scans a directory the
+/// guard does not see could find a new file there with the guard unchanged.
+/// Without a guard, the row of a workspace unit is never used, and the unit
+/// keeps discovering its closure. This checkout's rows are never relocated,
+/// so a generated file naming the checkout costs nothing here.
+fn same_tree_guard(tree: Option<String>, workspace_unit: bool, covered: bool) -> Option<String> {
+    if workspace_unit && !covered {
         None
     } else {
         tree
@@ -6103,21 +6127,30 @@ impl Rejection {
     }
 }
 
-/// Is this invocation the shape a prediction is sound for?
+/// Must this unit's records carry a tree digest that still matches?
 ///
-/// A proc macro can scan the filesystem and emit `include_str!` per entry, so
-/// a file can enter the closure with nothing already in the closure changing.
+/// A proc macro can list a directory and emit `include_str!` per entry, so a
+/// file can enter the closure with nothing already in the closure changing.
 /// The pre-pass sees the new file; a prediction would not, and would derive
-/// the stored key: a false hit. Cargo does not make this assumption either —
-/// it recompiles when a build script's `rerun-if-changed` directory fires
-/// even if the bytes are identical.
+/// the stored key: a false hit. The tree digest is what sees the new file.
 ///
-/// The test is how cargo hands rustc a proc macro: as a dynamic library.
-/// `dylib` crate-type dependencies get swept in too, which is
-/// over-conservative and safe. This was the scoping rule of the closed
-/// kunobi-ninja/kache#334, where it left 84% of units eligible.
-pub(crate) fn prediction_applies(externs: &[crate::args::ExternDep]) -> bool {
-    !externs.iter().any(|ext| {
+/// The macro need not be a direct dependency: an rlib can re-export one
+/// (`sqlx::migrate!`, `include_dir!`), and rustc is told only about the rlib.
+/// So every workspace or path unit takes the guard, whatever it links. A
+/// registry unit takes it only with a proc-macro dependency of its own
+/// ([`has_dylib_extern`]): its package is the same files wherever it is
+/// built. A unit with no `CARGO_MANIFEST_DIR` keeps the dynamic-library
+/// rule. A unit that takes the guard but has no tree to digest is not
+/// predicted.
+fn needs_tree_guard(externs: &[crate::args::ExternDep], manifest_dir: Option<&Path>) -> bool {
+    has_dylib_extern(externs) || manifest_dir.is_some_and(|dir| !is_registry_package(dir))
+}
+
+/// Does the unit depend on a dynamic library? Cargo hands rustc each
+/// proc-macro dependency as one. `dylib` crate-type dependencies get swept in
+/// too, which only costs a guard they did not need.
+fn has_dylib_extern(externs: &[crate::args::ExternDep]) -> bool {
+    externs.iter().any(|ext| {
         ext.path.as_deref().is_some_and(|path| {
             path.file_name()
                 .and_then(|name| name.to_str())

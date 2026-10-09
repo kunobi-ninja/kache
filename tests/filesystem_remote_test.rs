@@ -129,6 +129,9 @@ impl Client {
             .env_remove("KACHE_SOCKET_PATH")
             .env_remove("RUSTC_WRAPPER")
             .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
+            // Cargo sets this test's own package. A compile that is a
+            // package sets its own (`compile_unit`); the rest are bare rustc.
+            .env_remove("CARGO_MANIFEST_DIR")
             // These tests publish to a hermetic filesystem remote. CI runners
             // set GITHUB_ACTIONS/GITLAB_CI, which would force remote_readonly
             // and skip the upload the suite is proving.

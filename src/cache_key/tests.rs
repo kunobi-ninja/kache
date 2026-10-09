@@ -1512,7 +1512,9 @@ fn prediction_verification_reads_the_snapshot() {
     if get_rustc_version(Path::new("rustc")).is_err() {
         return;
     }
-    // Cargo and nextest set kache's own OUT_DIR on the test process.
+    // Cargo and nextest set kache's own package and OUT_DIR on the test
+    // process; this is a bare rustc unit.
+    let _manifest = crate::config::tests::set_env_for_test("CARGO_MANIFEST_DIR", None);
     let _out = crate::config::tests::set_env_for_test("OUT_DIR", None);
     let dir = tempfile::tempdir().unwrap();
     let source = dir.path().join("lib.rs");
@@ -1955,6 +1957,9 @@ fn a_unit_the_store_never_held_defers_even_when_its_name_is_taken() {
 #[test]
 fn a_record_is_only_consulted_for_an_eligible_invocation() {
     let _lock = key_test_lock();
+    // Cargo sets the test process's own package and OUT_DIR.
+    let _manifest = crate::config::tests::set_env_for_test("CARGO_MANIFEST_DIR", None);
+    let _out = crate::config::tests::set_env_for_test("OUT_DIR", None);
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("index.db");
     let parse = |args: &[&str]| {
@@ -1981,7 +1986,7 @@ fn a_record_is_only_consulted_for_an_eligible_invocation() {
     assert_eq!(
         predicted_key_inputs(&with_macro, &on, &mut None),
         Err(Rejection::NotEligible),
-        "a proc-macro dependency outside a registry package is refused before any lookup"
+        "a proc-macro dependency with no package to digest is refused before any lookup"
     );
     if get_rustc_version(Path::new("rustc")).is_ok() {
         assert_eq!(
@@ -1990,14 +1995,21 @@ fn a_record_is_only_consulted_for_an_eligible_invocation() {
             "an eligible invocation with nothing recorded falls back"
         );
     }
+    let elsewhere = dir.path().join("elsewhere");
+    let _path_unit =
+        crate::config::tests::set_env_for_test("CARGO_MANIFEST_DIR", Some(elsewhere.as_os_str()));
+    assert_eq!(
+        predicted_key_inputs(&plain, &on, &mut None),
+        Err(Rejection::NotEligible),
+        "a path package with no workspace to digest is refused before any lookup"
+    );
 }
 
-/// A proc macro can scan a directory and emit `include_str!` per entry, so
-/// a file can join the closure with nothing already in it changing. The
-/// pre-pass sees it; a prediction would not. Cargo hands rustc a proc
-/// macro as a dynamic library, and that is the test.
+/// Cargo hands rustc each proc-macro dependency as a dynamic library. That
+/// finds a unit's own macros, not one an rlib re-exports, so it decides only
+/// whether a registry unit needs the tree guard ([`needs_tree_guard`]).
 #[test]
-fn predictions_do_not_apply_to_units_with_a_dynamic_library_dependency() {
+fn a_dynamic_library_extern_is_how_cargo_hands_over_a_proc_macro() {
     let dep = |path: &str| crate::args::ExternDep {
         name: "dep".to_string(),
         path: Some(PathBuf::from(path)),
@@ -2006,14 +2018,8 @@ fn predictions_do_not_apply_to_units_with_a_dynamic_library_dependency() {
         dep("/t/debug/deps/libserde-1.rlib"),
         dep("/t/debug/deps/libcore-2.rmeta"),
     ];
-    assert!(
-        prediction_applies(&plain),
-        "rlib and rmeta dependencies cannot scan the filesystem"
-    );
-    assert!(
-        prediction_applies(&[]),
-        "a unit with no dependencies is eligible"
-    );
+    assert!(!has_dylib_extern(&plain), "rlib and rmeta dependencies");
+    assert!(!has_dylib_extern(&[]), "no dependencies");
 
     for macro_lib in [
         "/t/debug/deps/libmy_macro-3.so",
@@ -2022,18 +2028,61 @@ fn predictions_do_not_apply_to_units_with_a_dynamic_library_dependency() {
     ] {
         let mut with_macro = plain.clone();
         with_macro.push(dep(macro_lib));
-        assert!(
-            !prediction_applies(&with_macro),
-            "{macro_lib} may generate includes the record cannot know about"
-        );
+        assert!(has_dylib_extern(&with_macro), "{macro_lib}");
     }
 
     // A dependency cargo passed without a path tells us nothing either way
     // and must not be read as a proc macro.
-    assert!(prediction_applies(&[crate::args::ExternDep {
+    assert!(!has_dylib_extern(&[crate::args::ExternDep {
         name: "std".to_string(),
         path: None,
     }]));
+}
+
+/// A macro an rlib re-exports (`sqlx::migrate!`, `include_dir!`) reaches
+/// rustc through the rlib alone, so every workspace or path unit takes the
+/// guard. A registry package is the same files wherever it is built.
+#[test]
+fn every_workspace_or_path_unit_takes_the_tree_guard() {
+    let dep = |path: &str| crate::args::ExternDep {
+        name: "dep".to_string(),
+        path: Some(PathBuf::from(path)),
+    };
+    let rlib = [dep("/t/debug/deps/libfacade-1.rlib")];
+    let proc_macro = [dep("/t/debug/deps/libscan-2.so")];
+    let member = Path::new("/w/kt");
+    let registry = Path::new("/h/registry/src/index-1/kt-1.0.0");
+    for (externs, manifest_dir, guarded, why) in [
+        (&rlib[..], Some(member), true, "a member that links an rlib"),
+        (&[][..], Some(member), true, "a member with no dependency"),
+        (
+            &proc_macro[..],
+            Some(member),
+            true,
+            "a member with a proc macro",
+        ),
+        (
+            &rlib[..],
+            Some(registry),
+            false,
+            "a registry unit that links an rlib",
+        ),
+        (
+            &proc_macro[..],
+            Some(registry),
+            true,
+            "a registry unit with a proc macro",
+        ),
+        (
+            &rlib[..],
+            None,
+            false,
+            "no package: the dynamic-library rule",
+        ),
+        (&proc_macro[..], None, true, "no package, with a proc macro"),
+    ] {
+        assert_eq!(needs_tree_guard(externs, manifest_dir), guarded, "{why}");
+    }
 }
 
 /// `src/foo.rs` and `src/foo/mod.rs` both answer `mod foo;`, and rustc
@@ -3351,7 +3400,7 @@ fn workspace_test_roots() -> WorkspaceRoots {
 }
 
 #[test]
-fn a_workspace_row_keeps_its_guard_only_while_the_closure_stays_inside() {
+fn a_workspace_row_keeps_its_guard_only_while_the_guard_covers_the_closure() {
     let tree = || Some("tree".to_string());
     assert_eq!(same_tree_guard(tree(), true, true), tree());
     assert_eq!(same_tree_guard(tree(), true, false), None);
@@ -3396,6 +3445,222 @@ fn manifest_vars(manifest_dir: &Path) -> Vec<(std::ffi::OsString, std::ffi::OsSt
         "CARGO_MANIFEST_DIR".into(),
         manifest_dir.as_os_str().to_owned(),
     )]
+}
+
+/// The member `kt` of a workspace at `base/w`, linking only an rlib that may
+/// re-export a proc macro, as Cargo runs it from the workspace root.
+fn rlib_only_member(base: &Path) -> (PathBuf, RustcArgs) {
+    let (root, args) = workspace_invocation(base, "w", "kt");
+    let deps = root.join("target/debug/deps");
+    let mut argv = args.all_args.clone();
+    argv.insert(0, "rustc".to_string());
+    argv.extend([
+        "--extern".to_string(),
+        format!(
+            "facade={}",
+            deps.join("libfacade-0123456789abcdef.rlib").display()
+        ),
+    ]);
+    (root, RustcArgs::parse(&argv).unwrap())
+}
+
+/// A member that links only an rlib, which may re-export a macro that lists
+/// a directory, is predicted only under the workspace guard. A row without
+/// the digest or with another one is refused, and so is a row whose closure
+/// the guard does not cover: this checkout's, the shared one, or one made in
+/// another checkout.
+#[test]
+fn an_rlib_only_member_is_predicted_only_under_the_workspace_guard() {
+    let mut lock = key_test_lock();
+    if get_rustc_version(Path::new("rustc")).is_err() {
+        return;
+    }
+    let base = lock.enter();
+    let (root, args) = rlib_only_member(&base);
+    std::env::set_current_dir(&root).unwrap();
+    write_file(&root.join("kt/src/lib.rs"), "facade::scan!();\n");
+    write_file(&root.join("kt/assets/a.txt"), "a");
+    write_file(&root.join("stale/x.txt"), "x");
+    write_file(&root.join("stale/CACHEDIR.TAG"), CARGO_BUILD_TAG);
+    write_file(&base.join("outside.txt"), "o");
+    let manifest_dir = root.join("kt");
+    let _manifest = crate::config::tests::set_env_for_test(
+        "CARGO_MANIFEST_DIR",
+        Some(manifest_dir.as_os_str()),
+    );
+    let _out = crate::config::tests::set_env_for_test("OUT_DIR", None);
+    let hasher = |name: &str| FileHasher::persistent(&base.join(name)).with_input_predictions(true);
+    let closure = |sources: &[PathBuf]| DepInfo {
+        source_files: sources.to_vec(),
+        env_deps: Vec::new(),
+    };
+    let lib = PathBuf::from("kt/src/lib.rs");
+    let inside = closure(&[lib.clone(), root.join("kt/assets/a.txt")]);
+
+    let local = hasher("local.db");
+    let mut tree = None;
+    assert_eq!(
+        predicted_key_inputs(&args, &local, &mut tree),
+        Err(Rejection::NoRecord)
+    );
+    let guard = tree.expect("an rlib-only member is digested");
+    let identity = rustc_prediction_identity(&args).unwrap();
+    local.record_input_prediction(&identity, Some("kt"), &inside, None);
+    assert_eq!(
+        predicted_key_inputs(&args, &local, &mut None),
+        Err(Rejection::NoRecord),
+        "a row without the digest"
+    );
+    local.record_input_prediction(&identity, Some("kt"), &inside, Some("other".into()));
+    assert_eq!(
+        predicted_key_inputs(&args, &local, &mut None),
+        Err(Rejection::TreeChanged)
+    );
+    local.record_input_prediction(&identity, Some("kt"), &inside, Some(guard.clone()));
+    assert_eq!(
+        predicted_key_inputs(&args, &local, &mut None),
+        Ok(inside.clone())
+    );
+    write_file(&root.join("kt/assets/b.txt"), "b");
+    assert_eq!(
+        predicted_key_inputs(&args, &local, &mut None),
+        Err(Rejection::TreeChanged),
+        "a file joins the directory a macro lists"
+    );
+    std::fs::remove_file(root.join("kt/assets/b.txt")).unwrap();
+    for uncovered in [base.join("outside.txt"), root.join("stale/x.txt")] {
+        let leaves = closure(&[lib.clone(), uncovered.clone()]);
+        local.record_input_prediction(&identity, Some("kt"), &leaves, Some(guard.clone()));
+        assert_eq!(
+            predicted_key_inputs(&args, &local, &mut None),
+            Err(Rejection::NoRecord),
+            "{}",
+            uncovered.display()
+        );
+    }
+
+    // A shared row written before the coverage rule carries the digest
+    // whatever its closure names.
+    let shared_rows = hasher("shared.db");
+    let shared = rustc_shared_prediction_identity(&args).unwrap();
+    let leaves = closure(&[lib.clone(), base.join("outside.txt")]);
+    shared_rows.record_input_prediction(&shared, Some("kt"), &leaves, Some(guard.clone()));
+    assert_eq!(
+        predicted_key_inputs(&args, &shared_rows, &mut None),
+        Err(Rejection::NoRecord)
+    );
+    shared_rows.record_input_prediction(&shared, Some("kt"), &inside, Some(guard.clone()));
+    assert_eq!(
+        predicted_key_inputs(&args, &shared_rows, &mut None),
+        Ok(inside.clone())
+    );
+
+    let portable_rows = hasher("portable.db");
+    let vars: Vec<_> = std::env::vars_os().collect();
+    let roots = workspace_roots(&args, &vars).unwrap();
+    let portable = workspace_prediction_identity(&args, vars, &roots).unwrap();
+    let record = |below: &str| PortablePrediction {
+        schema: PORTABLE_PREDICTION_SCHEMA,
+        sources: vec![
+            Portable::Literal("kt/src/lib.rs".to_string()),
+            Portable::Workspace(below.to_string()),
+        ],
+        env_deps: Vec::new(),
+        tree: guard.clone(),
+    };
+    portable_rows.record_portable_prediction(&portable, Some("kt"), &record("/stale/x.txt"));
+    assert_eq!(
+        predicted_key_inputs(&args, &portable_rows, &mut None),
+        Err(Rejection::NoRecord),
+        "a row from another checkout naming a file in a Cargo build directory"
+    );
+    portable_rows.record_portable_prediction(&portable, Some("kt"), &record("/kt/assets/a.txt"));
+    assert_eq!(
+        predicted_key_inputs(&args, &portable_rows, &mut None),
+        Ok(inside)
+    );
+}
+
+/// A process that waited on a discovery flight checks the owner's record
+/// against the digest it took before the wait, the one its own record will
+/// carry.
+#[test]
+fn a_flight_waiter_checks_records_against_the_digest_taken_before_the_wait() {
+    let mut lock = key_test_lock();
+    if get_rustc_version(Path::new("rustc")).is_err() {
+        return;
+    }
+    let base = lock.enter();
+    let (root, args) = rlib_only_member(&base);
+    std::env::set_current_dir(&root).unwrap();
+    write_file(&root.join("kt/src/lib.rs"), "");
+    let manifest_dir = root.join("kt");
+    let _manifest = crate::config::tests::set_env_for_test(
+        "CARGO_MANIFEST_DIR",
+        Some(manifest_dir.as_os_str()),
+    );
+    let _out = crate::config::tests::set_env_for_test("OUT_DIR", None);
+    let hasher = FileHasher::persistent(&base.join("index.db")).with_input_predictions(true);
+    let closure = DepInfo {
+        source_files: vec![PathBuf::from("kt/src/lib.rs")],
+        env_deps: Vec::new(),
+    };
+    let identity = rustc_prediction_identity(&args).unwrap();
+    hasher.record_input_prediction(&identity, Some("kt"), &closure, Some("before".into()));
+    let mut tree = Some("before".to_string());
+    assert_eq!(predicted_key_inputs(&args, &hasher, &mut tree), Ok(closure));
+    assert_eq!(tree.as_deref(), Some("before"));
+    assert_eq!(
+        predicted_key_inputs(&args, &hasher, &mut None),
+        Err(Rejection::TreeChanged),
+        "a digest taken now"
+    );
+}
+
+/// This checkout's rows keep the guard while it covers the closure. They are
+/// never relocated, so a generated file naming the checkout costs nothing
+/// here, though it keeps the row for other checkouts out.
+#[test]
+fn this_checkouts_rows_keep_the_guard_while_it_covers_the_closure() {
+    let mut lock = key_test_lock();
+    if get_rustc_version(Path::new("rustc")).is_err() {
+        return;
+    }
+    let base = lock.enter();
+    let (root, args) = rlib_only_member(&base);
+    std::env::set_current_dir(&root).unwrap();
+    write_file(&root.join("kt/src/lib.rs"), "");
+    let out = root.join("target/debug/build/kt-1/out");
+    write_file(
+        &out.join("gen.rs"),
+        &format!("// generated in {}\n", root.display()),
+    );
+    write_file(&base.join("outside.txt"), "o");
+    let manifest_dir = root.join("kt");
+    let _manifest = crate::config::tests::set_env_for_test(
+        "CARGO_MANIFEST_DIR",
+        Some(manifest_dir.as_os_str()),
+    );
+    let _out = crate::config::tests::set_env_for_test("OUT_DIR", Some(out.as_os_str()));
+    let tree = || Some("tree".to_string());
+    let closure = |extra: PathBuf| DepInfo {
+        source_files: vec![PathBuf::from("kt/src/lib.rs"), extra],
+        env_deps: Vec::new(),
+    };
+    let generated = closure(out.join("gen.rs"));
+    assert_eq!(same_checkout_guard(&args, &generated, tree()), tree());
+    assert!(workspace_record(&args, &generated, Some("tree")).is_none());
+    let outside = closure(base.join("outside.txt"));
+    assert_eq!(same_checkout_guard(&args, &outside, tree()), None);
+
+    let registry = base.join("home/registry/src/index-1/kt-1.0.0");
+    let _registry =
+        crate::config::tests::set_env_for_test("CARGO_MANIFEST_DIR", Some(registry.as_os_str()));
+    assert_eq!(
+        same_checkout_guard(&args, &outside, tree()),
+        tree(),
+        "a registry unit keeps its own guard"
+    );
 }
 
 #[test]
@@ -4656,6 +4921,9 @@ fn a_workspace_unit_never_reads_a_relocated_record() {
     let package = dir.path().join("w/kt");
     std::fs::create_dir_all(package.join("src")).unwrap();
     std::fs::write(package.join("src/lib.rs"), "include!(\"x\");\n").unwrap();
+    // A path package built from its own directory, as Cargo builds one.
+    std::fs::write(package.join("Cargo.toml"), "[package]\n").unwrap();
+    std::env::set_current_dir(&package).unwrap();
     let target = dir.path().join("b/target");
     let out = target.join("debug/build/kt-1/out");
     std::fs::create_dir_all(&out).unwrap();
@@ -4795,7 +5063,7 @@ fn an_aliased_out_dir_takes_the_shared_row(macro_dep: bool) {
     };
     let args_a = args_in(&target_a);
     let args_b = args_in(&target_b);
-    assert_eq!(prediction_applies(&args_a.externs), !macro_dep);
+    assert_eq!(has_dylib_extern(&args_a.externs), macro_dep);
     let shared = |args: &RustcArgs, out_dir: &Path| {
         rustc_shared_prediction_identity_in(args, vars(out_dir)).unwrap()
     };

@@ -218,12 +218,15 @@ fn source_churn_adapts_then_returns_to_exact_cache_hits() {
     assert_eq!(first["result"], "miss", "event: {first:#}");
     assert_eq!(first["compiler_runs"], 1);
 
+    // The edit changes the package's tree, so the record no longer applies
+    // and the seed discovers its closure once. It must not run a second
+    // pass to re-derive a key.
     let seed = build(2);
     assert_passthrough(&seed, "adaptive seed");
     assert_eq!(seed["compiler_runs"], 1);
     assert_eq!(
-        seed["dep_info_runs"], 0,
-        "a seed must not re-derive a missed prediction: {seed:#}"
+        seed["dep_info_runs"], 1,
+        "a seed discovers its closure once: {seed:#}"
     );
     assert!(!seed["fallback"].as_bool().unwrap_or(false));
 
@@ -282,8 +285,8 @@ fn source_churn_adapts_then_returns_to_exact_cache_hits() {
     assert_passthrough(&after_hit, "adaptive seed");
     assert_eq!(after_hit["compiler_runs"], 1);
     assert_eq!(
-        after_hit["dep_info_runs"], 0,
-        "the first edit after a hit must skip re-derivation: {after_hit:#}"
+        after_hit["dep_info_runs"], 1,
+        "the first edit after a hit discovers its closure once: {after_hit:#}"
     );
 
     // The predicted key may select incremental compilation, but must not

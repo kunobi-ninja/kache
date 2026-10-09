@@ -5944,15 +5944,13 @@ fn record_input_prediction(
     // A workspace or path unit gets a row another checkout of the workspace
     // can use, when the guard was taken before rustc ran (kunobi-ninja/kache#1005).
     let workspace = crate::cache_key::workspace_record(args, dep_info, tree.as_deref());
+    // This checkout's rows, local and shared, carry the same guard.
+    let guard = crate::cache_key::same_checkout_guard(args, dep_info, tree.clone());
     file_hasher.record_input_prediction(
         &identity,
         args.crate_name.as_deref(),
         dep_info,
-        crate::cache_key::same_tree_guard(
-            tree.clone(),
-            crate::cache_key::is_workspace_unit(args),
-            workspace.is_some(),
-        ),
+        guard.clone(),
     );
     if let Some((identity, record)) = workspace {
         file_hasher.record_portable_prediction(&identity, args.crate_name.as_deref(), &record);
@@ -5970,12 +5968,12 @@ fn record_input_prediction(
                 &identity,
                 args.crate_name.as_deref(),
                 dep_info,
-                tree.clone(),
+                guard.clone(),
             );
             // A registry unit's row serves any machine whose Cargo home has
             // the same path.
             if let Some(registry) = &registry {
-                let row = crate::cache_key::InputPrediction::from_dep_info(dep_info, tree);
+                let row = crate::cache_key::InputPrediction::from_dep_info(dep_info, guard);
                 publish_prediction(
                     config,
                     &identity,

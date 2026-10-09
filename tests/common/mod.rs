@@ -107,6 +107,29 @@ fn bootstrap_kache() -> Result<PathBuf, String> {
     Ok(bin)
 }
 
+/// A proc macro that lists `$CARGO_MANIFEST_DIR/assets`, which may be
+/// missing, and includes each file it finds, as `sqlx::migrate!` and
+/// `include_dir!` do. rustc reports the files it included, never the
+/// directory it listed.
+#[allow(dead_code)]
+pub const SCAN_MACRO: &str = r#"extern crate proc_macro;
+#[proc_macro]
+pub fn scan(_input: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+    let assets = std::path::Path::new(&manifest_dir).join("assets");
+    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(assets)
+        .map(|entries| entries.flatten().map(|entry| entry.path()).collect())
+        .unwrap_or_default();
+    files.sort();
+    let mut code = String::from("pub const ASSETS: &[&str] = &[");
+    for file in files {
+        code.push_str(&format!("include_str!({:?}),", file.display().to_string()));
+    }
+    code.push_str("];");
+    code.parse().unwrap()
+}
+"#;
+
 /// Keeps tests off the developer's real `~/.config/kache/config.toml`.
 pub fn isolated_config_path(cache_dir: &Path) -> PathBuf {
     cache_dir.join("config.toml")

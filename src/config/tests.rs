@@ -299,6 +299,52 @@ fn gc_max_age_is_opt_in_and_obeys_env_precedence() {
 }
 
 #[test]
+fn target_liveness_is_opt_in_with_file_env_and_ignore_env_precedence() {
+    let _lock = config_path_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("config.toml");
+    let _config = set_kache_config_for_test(&config_path);
+    let _missing = NamedEnvGuard::remove("KACHE_TARGET_LIVENESS");
+    assert!(!Config::load().unwrap().target_liveness);
+    std::fs::write(&config_path, "[cache]\ntarget_liveness = true\n").unwrap();
+    assert!(Config::load().unwrap().target_liveness);
+    for value in ["0", "false", "FALSE", "garbage"] {
+        let _override = NamedEnvGuard::set("KACHE_TARGET_LIVENESS", value);
+        assert!(!Config::load().unwrap().target_liveness, "{value}");
+    }
+    std::fs::write(&config_path, "[cache]\ntarget_liveness = false\n").unwrap();
+    for value in ["1", "true", "TRUE"] {
+        let _override = NamedEnvGuard::set("KACHE_TARGET_LIVENESS", value);
+        assert!(Config::load().unwrap().target_liveness, "{value}");
+    }
+    let _override = NamedEnvGuard::set("KACHE_TARGET_LIVENESS", "1");
+    std::fs::write(
+        &config_path,
+        "[cache]\nignore_env = true\ntarget_liveness = false\n",
+    )
+    .unwrap();
+    assert!(!Config::load().unwrap().target_liveness);
+    std::fs::write(
+        &config_path,
+        "[cache]\nignore_env = true\ntarget_liveness = true\n",
+    )
+    .unwrap();
+    let _disabled = NamedEnvGuard::set("KACHE_TARGET_LIVENESS", "0");
+    assert!(Config::load().unwrap().target_liveness);
+}
+
+#[test]
+fn target_liveness_is_a_typed_file_key_alongside_unknown_keys() {
+    let file: FileConfig =
+        toml::from_str("[cache]\ntarget_liveness = true\nfuture_setting = 4\n").unwrap();
+    assert_eq!(file.cache.as_ref().unwrap().target_liveness, Some(true));
+    let roundtrip: FileConfig = toml::from_str(&toml::to_string(&file).unwrap()).unwrap();
+    assert_eq!(roundtrip.cache.unwrap().target_liveness, Some(true));
+    assert!(toml::from_str::<FileConfig>("[cache]\ntarget_liveness = 'yes'\n").is_err());
+    assert!(ENV_FILE_KEYS.contains(&("KACHE_TARGET_LIVENESS", "cache.target_liveness")));
+}
+
+#[test]
 fn gc_evict_shared_is_opt_in_and_obeys_env_precedence() {
     let _lock = config_path_lock();
     let dir = tempfile::tempdir().unwrap();
@@ -2394,6 +2440,7 @@ fn test_file_config_roundtrip() {
             cache_executables: Some(true),
             cache_cc_links: None,
             trust_codegen_backends: None,
+            target_liveness: Some(true),
             clean_incremental: Some(false),
             preserve_incremental: Some(true),
             adaptive_incremental: Some(false),
@@ -2941,6 +2988,7 @@ fn test_config_store_dir() {
         cache_executables: false,
         cache_cc_links: false,
         trust_codegen_backends: false,
+        target_liveness: false,
         clean_incremental: true,
         preserve_incremental: false,
         adaptive_incremental: true,
@@ -3019,6 +3067,7 @@ fn test_config_index_db_path() {
         cache_executables: false,
         cache_cc_links: false,
         trust_codegen_backends: false,
+        target_liveness: false,
         clean_incremental: true,
         preserve_incremental: false,
         adaptive_incremental: true,
@@ -3093,6 +3142,7 @@ fn test_config_event_log_path() {
         cache_executables: false,
         cache_cc_links: false,
         trust_codegen_backends: false,
+        target_liveness: false,
         clean_incremental: true,
         preserve_incremental: false,
         adaptive_incremental: true,
@@ -3186,6 +3236,7 @@ fn test_config_socket_path() {
         cache_executables: false,
         cache_cc_links: false,
         trust_codegen_backends: false,
+        target_liveness: false,
         clean_incremental: true,
         preserve_incremental: false,
         adaptive_incremental: true,
@@ -3912,6 +3963,7 @@ fn test_save_and_load_file_config() {
             cache_executables: Some(true),
             cache_cc_links: None,
             trust_codegen_backends: None,
+            target_liveness: None,
             clean_incremental: None,
             preserve_incremental: None,
             adaptive_incremental: None,

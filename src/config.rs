@@ -165,6 +165,9 @@ pub struct Config {
     /// file only, not libraries it loads at run time.
     /// `KACHE_TRUST_CODEGEN_BACKENDS` or `[cache] trust_codegen_backends`.
     pub trust_codegen_backends: bool,
+    /// Capture Cargo liveness receipts for exact-scope unit cleanup. Off by default.
+    /// `KACHE_TARGET_LIVENESS` or `[cache] target_liveness`.
+    pub target_liveness: bool,
     pub clean_incremental: bool,
     /// Keep rustc incremental compilation for Cargo mutation workloads by
     /// bypassing artifact caching and isolating their incremental state.
@@ -912,6 +915,7 @@ pub(crate) struct CacheFileConfig {
     pub(crate) cache_executables: Option<bool>,
     pub(crate) cache_cc_links: Option<bool>,
     pub(crate) trust_codegen_backends: Option<bool>,
+    pub(crate) target_liveness: Option<bool>,
     pub(crate) clean_incremental: Option<bool>,
     pub(crate) preserve_incremental: Option<bool>,
     pub(crate) adaptive_incremental: Option<bool>,
@@ -1271,6 +1275,7 @@ const IGNORE_ENV_GATED_VARS: &[&str] = &[
     "KACHE_CACHE_EXECUTABLES",
     "KACHE_CACHE_CC_LINKS",
     "KACHE_TRUST_CODEGEN_BACKENDS",
+    "KACHE_TARGET_LIVENESS",
     "KACHE_CLEAN_INCREMENTAL",
     "KACHE_PRESERVE_INCREMENTAL",
     "KACHE_ADAPTIVE_INCREMENTAL",
@@ -1347,6 +1352,7 @@ const ENV_FILE_KEYS: &[(&str, &str)] = &[
         "KACHE_TRUST_CODEGEN_BACKENDS",
         "cache.trust_codegen_backends",
     ),
+    ("KACHE_TARGET_LIVENESS", "cache.target_liveness"),
     ("KACHE_CLEAN_INCREMENTAL", "cache.clean_incremental"),
     ("KACHE_PRESERVE_INCREMENTAL", "cache.preserve_incremental"),
     ("KACHE_ADAPTIVE_INCREMENTAL", "cache.adaptive_incremental"),
@@ -1628,6 +1634,17 @@ impl Config {
                     .ok()
                     .and_then(|c| c.cache.as_ref())
                     .and_then(|c| c.trust_codegen_backends)
+                    .unwrap_or(false)
+            });
+
+        let target_liveness = env_or_ignored("KACHE_TARGET_LIVENESS", ignore_env)
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or_else(|_| {
+                file_config
+                    .as_ref()
+                    .ok()
+                    .and_then(|c| c.cache.as_ref())
+                    .and_then(|c| c.target_liveness)
                     .unwrap_or(false)
             });
 
@@ -2126,6 +2143,7 @@ impl Config {
             cache_executables,
             cache_cc_links,
             trust_codegen_backends,
+            target_liveness,
             clean_incremental,
             preserve_incremental,
             adaptive_incremental,

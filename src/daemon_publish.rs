@@ -1059,6 +1059,12 @@ mod tests {
             }],
         };
         request.memo = Some(memo.clone());
+        request.event.schema = 26;
+        request.event.rebuilt_package = Some("native-package".into());
+        request.event.rebuilt_fingerprint = Some(request.cache_key.clone());
+        request.event.rebuilt_path = Some("/actual/compiler/a.o".into());
+        request.event.rebuilt_paths =
+            vec!["/actual/compiler/a.o".into(), "/actual/compiler/a.d".into()];
         let snapshot = PathBuf::from(&request.files[0].path);
         let response = daemon.handle_publish_cc(request.clone()).await;
         assert!(response.ok, "{:?}", response.error);
@@ -1090,6 +1096,11 @@ mod tests {
         let events = std::fs::read_to_string(config.event_log_path()).unwrap();
         let event: BuildEvent = serde_json::from_str(events.lines().last().unwrap()).unwrap();
         assert!(event.store_handed_off);
+        assert_eq!(event.schema, 26);
+        assert_eq!(event.rebuilt_package, request.event.rebuilt_package);
+        assert_eq!(event.rebuilt_fingerprint, request.event.rebuilt_fingerprint);
+        assert_eq!(event.rebuilt_path, request.event.rebuilt_path);
+        assert_eq!(event.rebuilt_paths, request.event.rebuilt_paths);
         assert_eq!(event.result, EventResult::Miss);
         assert_eq!(event.store_new_blobs, 1);
         assert!(event.store_error.is_empty());

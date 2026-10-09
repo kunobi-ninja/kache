@@ -86,6 +86,18 @@ Cleanup rechecks each directory's identity and removes only the derived target d
 
 The daemon removes tracked targets on its own: those whose workspace was deleted, idle ones when configured, and idle ones when free disk space falls below 10 GiB. See [Target directory cleanup](/docs/getting-started/configuration#target-directory-cleanup).
 
+### Obsolete units in live targets
+
+```bash
+KACHE_TARGET_LIVENESS=1 kache cargo check
+kache clean --units target --dry-run
+kache clean --units target --yes
+```
+
+`--units` (also `--artifacts`) removes known obsolete build units from intact tracked targets. A path selects the target directory or its workspace. Without a path it selects all live tracked targets. It cannot be combined with `--cache`, `--crate`, `--stale`, `--orphans` or `--stale-schema`.
+
+A successful supported Cargo `build` or `check` command supplies the receipt, including its Fresh artifacts. Cleanup preserves the recorded command's live units, other profiles and unknown units. Missing or changed evidence keeps everything. The preview explains why a target cannot be cleaned and how to capture a receipt. It asks before removal; `--yes` confirms, `--json` previews unless confirmed, and `--dry-run` always previews. See [Recorded-command cleanup](/docs/getting-started/configuration#recorded-command-cleanup) for the scope and safety checks.
+
 ### The cache
 
 ```bash
@@ -406,6 +418,8 @@ A session can span concurrent or nearby Cargo commands. This flag does not ident
 The session report includes cache hits, misses, bypass reasons, restored bytes and the observed compiler wall span. Compile work avoided is an aggregate estimate, not elapsed build time saved. Remote transfer totals and GC are omitted because those logs cannot identify the selected session. Store inventory and deduplication totals still describe the whole cache.
 
 JSON exposes the selection in `meta.session` (`root`, optional `session_id`, `inferred`, `inactivity_secs`); trace output carries it as `session`. In session reports, `since_secs` and `since_hours` describe the lookback to the first retained compiler start; `meta.session` defines the selection.
+
+Raw compiler events at schema 26 add `rebuilt_package`, `rebuilt_fingerprint`, `rebuilt_path` and `rebuilt_paths` when an actual successful compile produced outputs. Unknown package metadata is omitted. `rebuilt_fingerprint` is Kache's input cache key, not Cargo's on-disk freshness hash. Cache restores and Fresh Cargo artifacts do not report a rebuild. Tagged cleanup records report removed units separately from compiler `BuildEvent` records.
 
 Every report format totals the wrapper's phases per crate: startup, key computation, lookup, scheduler wait, restore or store, and the unattributed remainder. Startup runs from process start to wrapper entry. Key computation splits out the rustc dep-info pre-pass by time and run count. Scheduler wait is the flight join plus permit acquisition. Unattributed is wrapper overhead minus every measured phase, where overhead excludes the compile on a compiled crate and is the whole wrapper time on a hit. Events written by wrappers before schema 17 report zero startup, dep-info and wait time.
 

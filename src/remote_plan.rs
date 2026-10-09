@@ -92,6 +92,7 @@ mod tests {
             auto_recover_min_free_bytes: 0,
             scheduler_memory_pressure: true,
             auto_clean_unused_units_days: 0,
+            target_liveness: false,
             seed_new_targets: false,
             build_script_hermetic: false,
             gc_evict_shared: false,

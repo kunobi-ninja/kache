@@ -41,6 +41,8 @@ saved. If blob inventory is unavailable, the size is labeled as logical.
 Registered bytes describe the cache's index, rather than all space allocated
 on disk or the additional blocks occupied by restored worktrees.
 
+For obsolete units inside an active target, record a successful command with `KACHE_TARGET_LIVENESS=1 kache cargo check`, then preview `kache clean --units target --dry-run`. Cleanup keeps that command's live and Fresh artifacts; missing or changed evidence preserves the units. See [Recorded-command cleanup](/docs/getting-started/configuration#recorded-command-cleanup).
+
 Run `kache clean --dry-run` to see what deleting each target directory frees and which ones a clean would remove.
 
 ## `dup` build events

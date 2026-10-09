@@ -658,3 +658,624 @@ fn cargo_proxy_isolates_fingerprints_while_sharing_final_target_and_kache() {
     assert_eq!(events[2]["compiler_runs"], 0, "events: {events:#?}");
     assert_eq!(events[0]["cache_key"], events[2]["cache_key"]);
 }
+
+/// A fresh unit is protected by Cargo's graph even with an ancient atime.
+/// Feature variants that predate the observation may be collected.
+#[test]
+fn receipt_cleanup_removes_old_feature_units_and_keeps_next_check_fresh() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    let project = dir.path().join("project");
+    let target = project.join("target");
+    let cache = dir.path().join("cache");
+    std::fs::create_dir_all(project.join("src")).unwrap();
+    std::fs::create_dir_all(home.join(".cargo")).unwrap();
+    std::fs::write(
+        project.join("Cargo.toml"),
+        "[package]\nname='liveness_fixture'\nversion='0.1.0'\nedition='2024'\n[features]\nold=[]\n",
+    )
+    .unwrap();
+    std::fs::write(project.join("src/lib.rs"), "pub fn answer() -> u8 { 42 }\n").unwrap();
+    let run = |args: &[&str], enabled: bool| {
+        let mut command = proxied_cargo(&home, &cache, &target);
+        let output = command
+            .current_dir(&project)
+            .args(args)
+            .env("KACHE_REAL_CARGO", env!("CARGO"))
+            .env("KACHE_TARGET_LIVENESS", if enabled { "1" } else { "0" })
+            .env("KACHE_AUTO_GC", "0")
+            .env("KACHE_LOG", "warn")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        eprintln!("{}", String::from_utf8_lossy(&output.stderr));
+        output
+    };
+    run(
+        &["cargo", "--", "check", "--offline", "--features", "old"],
+        false,
+    );
+    run(&["cargo", "--", "check", "--offline"], true);
+    // Cargo may materialize its own metadata during the first observation.
+    run(&["cargo", "--", "check", "--offline"], true);
+    let inspect = run(&["clean", "--units", "--json"], true);
+    let json: Value = serde_json::from_slice(&inspect.stdout).unwrap();
+    assert_eq!(json["preview"], true);
+    assert_eq!(json["targets"].as_array().unwrap().len(), 1, "{json}");
+    assert_eq!(json["targets"][0]["plan"]["status"], "ready", "{json}");
+    assert!(
+        json["targets"][0]["plan"]["units"].as_u64().unwrap() > 0,
+        "{json}"
+    );
+    assert!(json["targets"][0]["plan"]["bytes"].as_u64().unwrap() > 0);
+    assert!(json["targets"][0]["plan"]["protected"].as_u64().unwrap() > 0);
+    let planned_bytes = json["targets"][0]["plan"]["bytes"].clone();
+    // Access time is intentionally misleading for every fingerprint file.
+    for unit in std::fs::read_dir(target.join("debug/.fingerprint")).unwrap() {
+        for file in std::fs::read_dir(unit.unwrap().path()).unwrap() {
+            filetime::set_file_atime(
+                file.unwrap().path(),
+                filetime::FileTime::from_unix_time(1, 0),
+            )
+            .unwrap();
+        }
+    }
+    let clean = run(&["clean", "--artifacts", "--json", "--yes"], true);
+    let json: Value = serde_json::from_slice(&clean.stdout).unwrap();
+    assert_eq!(json["preview"], false);
+    assert_eq!(json["targets"][0]["removed"]["bytes"], planned_bytes);
+    assert!(
+        json["targets"][0]["removed"]["units"].as_u64().unwrap() > 0,
+        "{json}"
+    );
+    let warm = run(
+        &["cargo", "--", "check", "--offline", "--message-format=json"],
+        true,
+    );
+    let records: Vec<Value> = String::from_utf8(warm.stdout)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    let artifacts: Vec<_> = records
+        .iter()
+        .filter(|r| r["reason"] == "compiler-artifact")
+        .collect();
+    assert!(!artifacts.is_empty());
+    assert!(artifacts.iter().all(|a| a["fresh"] == true), "{records:?}");
+    let events: Vec<Value> = std::fs::read_to_string(cache.join("events.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    let cleanup: Vec<_> = events
+        .iter()
+        .filter(|e| e["event"] == "target-cleanup")
+        .collect();
+    assert_eq!(cleanup.len(), 1);
+    assert_eq!(cleanup[0]["removed_bytes"], planned_bytes);
+    assert_eq!(
+        cleanup[0]["removed_units"],
+        json["targets"][0]["removed"]["units"]
+    );
+    // A source edit invalidates evidence rather than authorizing a rebuild.
+    std::fs::write(project.join("src/lib.rs"), "pub fn answer() -> u8 { 43 }\n").unwrap();
+    let changed = run(&["clean", "--units", "--json", "--yes"], true);
+    let changed: Value = serde_json::from_slice(&changed.stdout).unwrap();
+    assert_eq!(changed["targets"][0]["plan"]["units"], 0);
+    assert_ne!(changed["targets"][0]["plan"]["status"], "ready");
+}
+
+struct ReceiptAcceptance {
+    _dir: tempfile::TempDir,
+    home: std::path::PathBuf,
+    project: std::path::PathBuf,
+    target: std::path::PathBuf,
+    cache: std::path::PathBuf,
+    dependency: std::path::PathBuf,
+    script_input: std::path::PathBuf,
+}
+
+impl ReceiptAcceptance {
+    fn new() -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let project = dir.path().join("project");
+        let target = project.join("target");
+        let cache = dir.path().join("cache");
+        let dependency = dir.path().join("external-dependency");
+        let script_input = dir.path().join("external-input.txt");
+        std::fs::create_dir_all(project.join("src")).unwrap();
+        std::fs::create_dir_all(dependency.join("src")).unwrap();
+        std::fs::create_dir_all(home.join(".cargo")).unwrap();
+        std::fs::write(
+            project.join("Cargo.toml"),
+            "[package]\nname='receipt_acceptance'\nversion='0.1.0'\nedition='2024'\n\
+             [dependencies]\nexternal_dep={path='../external-dependency'}\n\
+             [features]\nold=['external_dep/old']\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dependency.join("Cargo.toml"),
+            "[package]\nname='external_dep'\nversion='0.1.0'\nedition='2024'\n[features]\nold=[]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dependency.join("src/lib.rs"),
+            "pub fn answer() -> u8 { 42 }\n",
+        )
+        .unwrap();
+        std::fs::write(&script_input, "alpha").unwrap();
+        std::fs::create_dir_all(dir.path().join("external-watch")).unwrap();
+        std::fs::write(dir.path().join("external-watch/first.txt"), "watched").unwrap();
+        std::fs::write(
+            project.join("src/lib.rs"),
+            "include!(concat!(env!(\"OUT_DIR\"), \"/generated.rs\"));\n\
+             pub fn answer() -> u8 { external_dep::answer() }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            project.join("build.rs"),
+            "fn main() {\n\
+             println!(\"cargo:rerun-if-changed=../external-input.txt\");\n\
+             println!(\"cargo:rerun-if-changed=../external-watch\");\n\
+             println!(\"cargo:rerun-if-env-changed=RECEIPT_BUILD_VALUE\");\n\
+             let input = std::fs::read_to_string(\"../external-input.txt\").unwrap();\n\
+             let env = std::env::var(\"RECEIPT_BUILD_VALUE\").unwrap();\n\
+             let output = std::path::PathBuf::from(std::env::var_os(\"OUT_DIR\").unwrap());\n\
+             std::fs::write(output.join(\"generated.rs\"), format!(\"pub const GENERATED: &str = {:?};\\n\", input + &env)).unwrap();\n\
+             }\n",
+        )
+        .unwrap();
+        let fixture = Self {
+            _dir: dir,
+            home,
+            project,
+            target,
+            cache,
+            dependency,
+            script_input,
+        };
+        fixture.run(
+            &["cargo", "--", "check", "--offline", "--features", "old"],
+            false,
+            "alpha",
+        );
+        fixture.capture();
+        fixture
+    }
+
+    fn run(&self, args: &[&str], enabled: bool, environment: &str) -> Output {
+        let output = proxied_cargo(&self.home, &self.cache, &self.target)
+            .current_dir(&self.project)
+            .args(args)
+            .env("KACHE_REAL_CARGO", env!("CARGO"))
+            .env("KACHE_TARGET_LIVENESS", if enabled { "1" } else { "0" })
+            .env("KACHE_AUTO_GC", "0")
+            .env("RECEIPT_BUILD_VALUE", environment)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    }
+
+    fn capture(&self) {
+        // The first successful command can create Cargo's own metadata.
+        for _ in 0..2 {
+            self.run(&["cargo", "--", "check", "--offline"], true, "alpha");
+        }
+        let preview = self.clean(&["--json"], "alpha");
+        assert_eq!(preview["targets"].as_array().unwrap().len(), 1, "{preview}");
+        assert_eq!(
+            preview["targets"][0]["plan"]["status"], "ready",
+            "{preview}"
+        );
+        assert!(
+            preview["targets"][0]["plan"]["units"].as_u64().unwrap() > 0,
+            "fixture must contain proven obsolete dependency units: {preview}"
+        );
+    }
+
+    fn receipt_path(&self) -> std::path::PathBuf {
+        let receipts: Vec<_> = std::fs::read_dir(self.cache.join("target-liveness"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(receipts.len(), 1);
+        receipts.into_iter().next().unwrap()
+    }
+
+    fn clean(&self, flags: &[&str], environment: &str) -> Value {
+        let args: Vec<_> = ["clean", "--units"]
+            .into_iter()
+            .chain(flags.iter().copied())
+            .collect();
+        serde_json::from_slice(&self.run(&args, true, environment).stdout).unwrap()
+    }
+}
+
+fn receipt_target_files(target: &Path) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+    let mut result = std::collections::BTreeMap::new();
+    let mut pending = vec![target.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        for entry in std::fs::read_dir(directory).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_dir() {
+                pending.push(entry.path());
+            } else {
+                result.insert(entry.path(), std::fs::read(entry.path()).unwrap());
+            }
+        }
+    }
+    result
+}
+
+#[test]
+fn receipt_cleanup_preserves_live_build_script_and_external_dependency_units() {
+    let fixture = ReceiptAcceptance::new();
+    let cleaned = fixture.clean(&["--json", "--yes"], "alpha");
+    assert!(
+        cleaned["targets"][0]["removed"]["units"].as_u64().unwrap() > 0,
+        "{cleaned}"
+    );
+    let warm = fixture.run(
+        &["cargo", "--", "check", "--offline", "--message-format=json"],
+        true,
+        "alpha",
+    );
+    let records: Vec<Value> = String::from_utf8(warm.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let artifacts: Vec<_> = records
+        .iter()
+        .filter(|record| record["reason"] == "compiler-artifact")
+        .collect();
+    assert!(
+        artifacts
+            .iter()
+            .any(|record| record["target"]["name"] == "external_dep")
+    );
+    assert!(artifacts.iter().any(|record| {
+        record["target"]["kind"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|kind| kind == "custom-build")
+    }));
+    assert!(
+        artifacts.iter().all(|record| record["fresh"] == true),
+        "all live units, including the build script and path dependency, must stay fresh: {records:?}"
+    );
+    let generated: Vec<_> = receipt_target_files(&fixture.target)
+        .into_iter()
+        .filter(|(path, _)| path.file_name().is_some_and(|name| name == "generated.rs"))
+        .collect();
+    assert!(
+        !generated.is_empty(),
+        "build script outputs must survive cleanup"
+    );
+    assert!(
+        generated
+            .iter()
+            .all(|(_, contents)| String::from_utf8_lossy(contents).contains("alphaalpha"))
+    );
+}
+
+#[test]
+fn receipt_cleanup_keeps_outputs_after_external_inputs_or_environment_change() {
+    let fixture = ReceiptAcceptance::new();
+    let unchanged = receipt_target_files(&fixture.target);
+    let environment = fixture.clean(&["--json", "--yes"], "beta");
+    assert_ne!(
+        environment["targets"][0]["plan"]["status"], "ready",
+        "{environment}"
+    );
+    assert_eq!(environment["targets"][0]["removed"]["units"], 0);
+    assert_eq!(receipt_target_files(&fixture.target), unchanged);
+
+    std::fs::write(
+        fixture.dependency.join("src/lib.rs"),
+        "pub fn answer() -> u8 { 43 }\n",
+    )
+    .unwrap();
+    let dependency = fixture.clean(&["--json", "--yes"], "alpha");
+    assert_ne!(
+        dependency["targets"][0]["plan"]["status"], "ready",
+        "{dependency}"
+    );
+    assert_eq!(dependency["targets"][0]["removed"]["units"], 0);
+    assert_eq!(receipt_target_files(&fixture.target), unchanged);
+    fixture.capture();
+
+    let before_script_change = receipt_target_files(&fixture.target);
+    std::fs::write(&fixture.script_input, "bravo").unwrap();
+    let script = fixture.clean(&["--json", "--yes"], "alpha");
+    assert_ne!(script["targets"][0]["plan"]["status"], "ready", "{script}");
+    assert_eq!(script["targets"][0]["removed"]["units"], 0);
+    assert_eq!(receipt_target_files(&fixture.target), before_script_change);
+}
+
+#[test]
+fn receipt_cleanup_skips_busy_profiles_and_corrupted_receipts() {
+    let fixture = ReceiptAcceptance::new();
+    let before = receipt_target_files(&fixture.target);
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(fixture.target.join("debug/.cargo-lock"))
+        .unwrap();
+    lock.lock().unwrap();
+    let busy = fixture.clean(&["--json", "--yes"], "alpha");
+    assert_eq!(busy["targets"][0]["plan"]["status"], "busy", "{busy}");
+    let receipt: Value =
+        serde_json::from_slice(&std::fs::read(fixture.receipt_path()).unwrap()).unwrap();
+    assert_eq!(
+        busy["targets"][0]["plan"]["command"], receipt["command"],
+        "a busy plan must preserve the recorded command"
+    );
+    assert_eq!(busy["targets"][0]["plan"]["command"][0], "kache");
+    assert_eq!(busy["targets"][0]["removed"]["units"], 0);
+    assert_eq!(receipt_target_files(&fixture.target), before);
+    lock.unlock().unwrap();
+
+    let receipts: Vec<_> = std::fs::read_dir(fixture.cache.join("target-liveness"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(receipts.len(), 1);
+    std::fs::write(&receipts[0], b"{broken JSON").unwrap();
+    let invalid = fixture.clean(&["--json", "--yes"], "alpha");
+    assert_ne!(
+        invalid["targets"][0]["plan"]["status"], "ready",
+        "{invalid}"
+    );
+    assert_eq!(invalid["targets"][0]["removed"]["units"], 0);
+    assert_eq!(receipt_target_files(&fixture.target), before);
+}
+
+#[test]
+fn receipt_cleanup_json_preview_and_dry_run_preserve_target_inventory() {
+    let fixture = ReceiptAcceptance::new();
+    let before = receipt_target_files(&fixture.target);
+    for flags in [&["--json"][..], &["--json", "--yes", "--dry-run"][..]] {
+        let preview = fixture.clean(flags, "alpha");
+        assert_eq!(preview["preview"], true);
+        assert_eq!(
+            preview["targets"][0]["plan"]["status"], "ready",
+            "{preview}"
+        );
+        assert!(
+            preview["targets"][0]["plan"]["units"].as_u64().unwrap() > 0,
+            "{preview}"
+        );
+        assert_eq!(preview["targets"][0]["removed"]["units"], 0);
+        assert_eq!(receipt_target_files(&fixture.target), before);
+    }
+}
+
+#[test]
+fn receipt_cleanup_rejects_workspace_configuration_and_unreported_source_changes() {
+    let fixture = ReceiptAcceptance::new();
+    for (relative, appended) in [
+        ("src/unused_module.rs", "pub fn unused() {}\n"),
+        ("Cargo.toml", "\n# manifest changed\n"),
+        ("Cargo.lock", "\n# lockfile changed\n"),
+        (".cargo/config.toml", "[build]\njobs=1\n"),
+    ] {
+        let path = fixture.project.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let original = std::fs::read(&path).unwrap_or_default();
+        let mut changed = original;
+        changed.extend_from_slice(appended.as_bytes());
+        let before = receipt_target_files(&fixture.target);
+        std::fs::write(&path, changed).unwrap();
+        let result = fixture.clean(&["--json", "--yes"], "alpha");
+        assert_ne!(
+            result["targets"][0]["plan"]["status"], "ready",
+            "{relative}: {result}"
+        );
+        assert_eq!(result["targets"][0]["removed"]["units"], 0);
+        assert_eq!(receipt_target_files(&fixture.target), before, "{relative}");
+        fixture.capture();
+    }
+}
+
+#[test]
+fn receipt_cleanup_rejects_new_external_build_script_inputs() {
+    let fixture = ReceiptAcceptance::new();
+    let before = receipt_target_files(&fixture.target);
+    std::fs::write(
+        fixture._dir.path().join("external-watch/new.txt"),
+        "new input",
+    )
+    .unwrap();
+    let result = fixture.clean(&["--json", "--yes"], "alpha");
+    assert_ne!(result["targets"][0]["plan"]["status"], "ready", "{result}");
+    assert_eq!(result["targets"][0]["removed"]["units"], 0);
+    assert_eq!(receipt_target_files(&fixture.target), before);
+}
+
+#[test]
+fn receipt_cleanup_keeps_outputs_when_a_live_fingerprint_changes() {
+    let fixture = ReceiptAcceptance::new();
+    let receipt: Value =
+        serde_json::from_slice(&std::fs::read(fixture.receipt_path()).unwrap()).unwrap();
+    let unit = receipt["units"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|unit| {
+            unit["live"] == true
+                && unit["fingerprint"]
+                    .as_str()
+                    .unwrap()
+                    .contains("external_dep")
+        })
+        .unwrap();
+    let fingerprint = Path::new(unit["fingerprint"].as_str().unwrap());
+    let file = std::fs::read_dir(fingerprint)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("lib-")
+                && path.extension().is_none()
+        })
+        .unwrap();
+    std::fs::write(&file, "changed freshness evidence").unwrap();
+    let before = receipt_target_files(&fixture.target);
+    let result = fixture.clean(&["--json", "--yes"], "alpha");
+    assert_ne!(result["targets"][0]["plan"]["status"], "ready", "{result}");
+    assert_eq!(result["targets"][0]["removed"]["units"], 0);
+    assert_eq!(receipt_target_files(&fixture.target), before);
+}
+
+#[test]
+fn receipt_cleanup_rejects_parent_directory_paths_in_a_receipt() {
+    let fixture = ReceiptAcceptance::new();
+    let outside = fixture.project.join("valuable.txt");
+    std::fs::write(&outside, "must survive hostile receipt paths").unwrap();
+    fixture.capture();
+    let receipt_path = fixture.receipt_path();
+    let mut receipt: Value =
+        serde_json::from_slice(&std::fs::read(&receipt_path).unwrap()).unwrap();
+    let unit = receipt["units"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|unit| unit["live"] == false && unit["known"] == true)
+        .unwrap();
+    unit["parts"] = serde_json::json!([fixture.target.join("../valuable.txt")]);
+    std::fs::write(receipt_path, serde_json::to_vec(&receipt).unwrap()).unwrap();
+    let before = receipt_target_files(&fixture.target);
+    let result = fixture.clean(&["--json", "--yes"], "alpha");
+    assert_ne!(result["targets"][0]["plan"]["status"], "ready", "{result}");
+    assert_eq!(result["targets"][0]["removed"]["units"], 0);
+    assert_eq!(
+        std::fs::read_to_string(outside).unwrap(),
+        "must survive hostile receipt paths"
+    );
+    assert_eq!(receipt_target_files(&fixture.target), before);
+}
+
+#[test]
+fn receipt_cleanup_rejects_a_changed_custom_cargo_executable() {
+    let fixture = ReceiptAcceptance::new();
+    let cargo = fixture._dir.path().join("custom-cargo");
+    let real_cargo = env!("CARGO").replace('\'', "'\\''");
+    let script = format!("#!/bin/sh\nexec '{real_cargo}' \"$@\"\n");
+    kache_fs::testutil::write_executable(&cargo, &script);
+    let run = |args: &[&str]| {
+        let output = proxied_cargo(&fixture.home, &fixture.cache, &fixture.target)
+            .current_dir(&fixture.project)
+            .args(args)
+            .env("KACHE_REAL_CARGO", &cargo)
+            .env("KACHE_TARGET_LIVENESS", "1")
+            .env("KACHE_AUTO_GC", "0")
+            .env("RECEIPT_BUILD_VALUE", "alpha")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    };
+    for _ in 0..2 {
+        run(&["cargo", "--", "check", "--offline"]);
+    }
+    let before = run(&["clean", "--units", "--json"]);
+    let before: Value = serde_json::from_slice(&before.stdout).unwrap();
+    assert_eq!(before["targets"][0]["plan"]["status"], "ready", "{before}");
+    assert!(before["targets"][0]["plan"]["units"].as_u64().unwrap() > 0);
+    let files = receipt_target_files(&fixture.target);
+    std::fs::write(&cargo, format!("{script}# updated executable\n")).unwrap();
+    let changed = run(&["clean", "--units", "--json", "--yes"]);
+    let changed: Value = serde_json::from_slice(&changed.stdout).unwrap();
+    assert_ne!(changed["targets"][0]["plan"]["status"], "ready");
+    assert_eq!(changed["targets"][0]["plan"]["units"], 0);
+    assert_eq!(receipt_target_files(&fixture.target), files);
+}
+
+#[test]
+fn receipt_cleanup_tracks_default_build_script_inputs_outside_the_workspace() {
+    let fixture = ReceiptAcceptance::new();
+    let input = fixture.dependency.join("default-input.txt");
+    std::fs::write(&input, "old input").unwrap();
+    std::fs::write(
+        fixture.dependency.join("build.rs"),
+        "fn main() { let input = std::fs::read_to_string(\"default-input.txt\").unwrap(); println!(\"cargo:rustc-env=DEFAULT_INPUT={input}\"); }\n",
+    ).unwrap();
+    for _ in 0..2 {
+        fixture.run(&["cargo", "--", "check", "--offline"], true, "alpha");
+    }
+    let preview = fixture.clean(&["--json"], "alpha");
+    assert_eq!(
+        preview["targets"][0]["plan"]["status"], "ready",
+        "{preview}"
+    );
+    let warm = fixture.run(
+        &["cargo", "--", "check", "--offline", "--message-format=json"],
+        true,
+        "alpha",
+    );
+    let artifacts: Vec<Value> = String::from_utf8(warm.stdout)
+        .unwrap()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|record| record["reason"] == "compiler-artifact")
+        .collect();
+    assert!(!artifacts.is_empty());
+    assert!(artifacts.iter().all(|artifact| artifact["fresh"] == true));
+    let files = receipt_target_files(&fixture.target);
+    std::fs::write(input, "changed default input").unwrap();
+    let changed = fixture.clean(&["--json", "--yes"], "alpha");
+    assert_ne!(
+        changed["targets"][0]["plan"]["status"], "ready",
+        "{changed}"
+    );
+    assert_eq!(changed["targets"][0]["removed"]["units"], 0);
+    assert_eq!(receipt_target_files(&fixture.target), files);
+}
+
+#[test]
+fn receipt_cleanup_preserves_units_in_unobserved_profiles() {
+    let fixture = ReceiptAcceptance::new();
+    fixture.run(
+        &[
+            "cargo",
+            "--",
+            "check",
+            "--offline",
+            "--release",
+            "--features",
+            "old",
+        ],
+        false,
+        "alpha",
+    );
+    fixture.capture();
+    let before = receipt_target_files(&fixture.target.join("release"));
+    assert!(!before.is_empty());
+    let preview = fixture.clean(&["--json"], "alpha");
+    assert!(preview["targets"][0]["plan"]["unknown"].as_u64().unwrap() > 0);
+    let cleaned = fixture.clean(&["--json", "--yes"], "alpha");
+    assert!(cleaned["targets"][0]["removed"]["units"].as_u64().unwrap() > 0);
+    assert_eq!(
+        receipt_target_files(&fixture.target.join("release")),
+        before
+    );
+}

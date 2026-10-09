@@ -4593,9 +4593,11 @@ if [ -n "$incremental" ]; then
     mkdir -p "$incremental"
     printf 'state' > "$incremental/state.bin"
 fi
+printf 'metadata' > '{}'
 exit 0
 "#,
-            argv_dump.display()
+            argv_dump.display(),
+            deps.join("libadaptive_fixture-1234abcd.rmeta").display()
         ),
     );
 
@@ -4650,6 +4652,14 @@ exit 0
     assert_eq!(event.passthrough_reason, "adaptive passthrough");
     assert_eq!(event.exit_code, Some(0));
     assert_eq!(event.cache_key, "adaptive-key");
+    let rebuilt = deps
+        .join("libadaptive_fixture-1234abcd.rmeta")
+        .to_string_lossy()
+        .into_owned();
+    assert_eq!(event.rebuilt_path.as_deref(), Some(rebuilt.as_str()));
+    assert_eq!(event.rebuilt_paths, vec![rebuilt]);
+    assert_eq!(event.rebuilt_fingerprint.as_deref(), Some("adaptive-key"));
+
     assert_eq!((event.key_ms, event.lookup_ms), (3, 4));
     assert_eq!(
         event.key_fields.get("args").map(String::as_str),
@@ -5014,6 +5024,8 @@ fn isolate_daemon_autostart(dir: &Path) -> (TestEnvGuard, TestEnvGuard) {
 struct RemoteCheckReplyDaemon {
     stop: Arc<AtomicBool>,
     requests: Arc<AtomicUsize>,
+    #[cfg(unix)]
+    recorded: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
     handle: Option<std::thread::JoinHandle<()>>,
     socket_path: PathBuf,
 }
@@ -5046,6 +5058,10 @@ impl RemoteCheckReplyDaemon {
             .expect("bind fake remote-check daemon");
         let stop = Arc::new(AtomicBool::new(false));
         let requests = Arc::new(AtomicUsize::new(0));
+        #[cfg(unix)]
+        let recorded = Arc::new(std::sync::Mutex::new(Vec::new()));
+        #[cfg(unix)]
+        let recorded_thread = Arc::clone(&recorded);
         let stop_thread = Arc::clone(&stop);
         let requests_thread = Arc::clone(&requests);
         let handle = std::thread::spawn(move || {
@@ -5076,6 +5092,10 @@ impl RemoteCheckReplyDaemon {
                     continue;
                 }
                 requests_thread.fetch_add(1, Ordering::SeqCst);
+                #[cfg(unix)]
+                if let Ok(request) = serde_json::from_slice(&buf) {
+                    recorded_thread.lock().unwrap().push(request);
+                }
                 std::thread::sleep(delay);
                 let _ = stream.write_all(body.as_bytes());
             }
@@ -5083,6 +5103,8 @@ impl RemoteCheckReplyDaemon {
         Self {
             stop,
             requests,
+            #[cfg(unix)]
+            recorded,
             handle: Some(handle),
             socket_path,
         }
@@ -5435,6 +5457,7 @@ fn cc_handoff<'a>(
         lookup_ms: 0,
         lookup_rejection: "",
         store_start: now,
+        rebuilt: RebuiltArtifacts::default(),
         memo: None,
     }
 }
@@ -5483,12 +5506,13 @@ fn a_declined_hand_off_yields_to_a_peer_that_took_the_key() {
 
     // No daemon: the offer is declined and the key is the peer's.
     let mut lock = None;
-    let outcome = hand_off_cc_store(
-        &config,
-        &store,
-        &mut lock,
-        cc_handoff(&key, &files, std::time::Instant::now()),
+    let mut handoff = cc_handoff(&key, &files, std::time::Instant::now());
+    handoff.rebuilt = RebuiltArtifacts::observed(
+        true,
+        &rebuilt_test_artifacts(),
+        Some("native-package".into()),
     );
+    let outcome = hand_off_cc_store(&config, &store, &mut lock, handoff);
     peer.join().unwrap();
 
     assert!(matches!(outcome, CcHandoffOutcome::Done));
@@ -5497,6 +5521,20 @@ fn a_declined_hand_off_yields_to_a_peer_that_took_the_key() {
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].result, EventResult::Miss);
     assert!(!events[0].store_handed_off);
+    assert_eq!(
+        events[0].rebuilt_path.as_deref(),
+        Some("/actual/deps/libexample.rlib")
+    );
+    assert_eq!(events[0].rebuilt_package.as_deref(), Some("native-package"));
+    assert_eq!(events[0].rebuilt_fingerprint.as_deref(), Some(key.as_str()));
+    assert_eq!(
+        events[0].rebuilt_paths,
+        vec![
+            "/actual/deps/example.d",
+            "/actual/deps/libexample.rlib",
+            "/actual/deps/libexample.rmeta"
+        ]
+    );
 }
 
 /// The daemon claims the key before it accepts the receipt. When the wrapper
@@ -5966,6 +6004,18 @@ fn nvcc_miss_then_hit_round_trips_object_and_depinfo() {
     assert_eq!(events.len(), 2);
     assert_eq!(events[0].result, EventResult::Miss);
     assert_eq!(events[1].result, EventResult::LocalHit);
+    let object = work.join("kernel.o").to_string_lossy().into_owned();
+    let depinfo = work.join("kernel.d").to_string_lossy().into_owned();
+    assert_eq!(events[0].rebuilt_path.as_deref(), Some(object.as_str()));
+    assert_eq!(events[0].rebuilt_paths, vec![object, depinfo]);
+    assert_eq!(
+        events[0].rebuilt_fingerprint.as_deref(),
+        Some(events[0].cache_key.as_str())
+    );
+    assert!(events[1].rebuilt_path.is_none());
+    assert!(events[1].rebuilt_paths.is_empty());
+    assert!(events[1].rebuilt_package.is_none());
+    assert!(events[1].rebuilt_fingerprint.is_none());
     // No remote configured: nothing is queued for upload.
     assert_eq!(spool_intent_count(&config), 0);
 }
@@ -6304,6 +6354,14 @@ fn nvcc_failed_compile_stores_nothing() {
         "run\nrun\n",
         "failures must never store"
     );
+    let events = crate::events::read_events(&config.event_log_path()).unwrap();
+    assert_eq!(events.len(), 2);
+    for event in events {
+        assert!(event.rebuilt_package.is_none());
+        assert!(event.rebuilt_fingerprint.is_none());
+        assert!(event.rebuilt_path.is_none());
+        assert!(event.rebuilt_paths.is_empty());
+    }
 }
 
 /// A failing key (here: `-M` exits) passes through to a live
@@ -6488,6 +6546,16 @@ fn nvcc_admission_skipped_when_too_cheap() {
             .iter()
             .all(|e| e.skip_reason == "admission-threshold")
     );
+    let object = work.join("kernel.o").to_string_lossy().into_owned();
+    let depinfo = work.join("kernel.d").to_string_lossy().into_owned();
+    for event in events {
+        assert_eq!(event.rebuilt_path.as_deref(), Some(object.as_str()));
+        assert_eq!(event.rebuilt_paths, vec![object.clone(), depinfo.clone()]);
+        assert_eq!(
+            event.rebuilt_fingerprint.as_deref(),
+            Some(event.cache_key.as_str())
+        );
+    }
 }
 
 /// Compiling over an output that still shares a read-only cache
@@ -6856,7 +6924,7 @@ fn local_hit_demand_reaches_event_without_remote_wait() {
     );
     let events = crate::events::read_events(&config.event_log_path()).unwrap();
     assert_eq!(events.len(), 1);
-    assert_eq!(events[0].schema, 25);
+    assert_eq!(events[0].schema, 26);
     let demands = &events[0].demands;
     assert_eq!(demands.len(), 1);
     assert_eq!(demands[0].cache_key, "local-demand-key");
@@ -6905,7 +6973,7 @@ fn log_event_with_store_stats_persists_timing_hash_and_store_fields() {
     assert_eq!(event.compile_time_ms, 20);
     assert_eq!(event.size, 30);
     assert_eq!(event.cache_key, "cache-key");
-    assert_eq!(event.schema, 25);
+    assert_eq!(event.schema, 26);
     assert_eq!(event.key_ms, 40);
     assert_eq!(event.key_hash_hits, 4);
     assert_eq!(event.key_hash_misses, 5);
@@ -7023,7 +7091,7 @@ fn log_event_records_the_wrapper_phase_accumulators() {
 
     let events = crate::events::read_events(&config.event_log_path()).unwrap();
     let event = &events[0];
-    assert_eq!(event.schema, 25);
+    assert_eq!(event.schema, 26);
     // Whatever other tests add is real time, far under the next band.
     for (name, value, floor, fed) in [
         ("startup_ms", event.startup_ms, before[0], STARTUP_MS),
@@ -7148,7 +7216,7 @@ fn log_event_persists_same_key_lookup_rejection() {
     let event = &events[0];
     assert_eq!(event.result, EventResult::Miss);
     assert_eq!(event.cache_key, "same-key");
-    assert_eq!(event.schema, 25);
+    assert_eq!(event.schema, 26);
     assert_eq!(
         event.lookup_rejection,
         "matching entry lacks dep-info required by this invocation"
@@ -7176,7 +7244,7 @@ fn log_event_persists_verify_compare_class_on_hit() {
             .keyed("hit-key", 0, FileHashStats::default()),
     );
     let events = crate::events::read_events(&config.event_log_path()).unwrap();
-    assert_eq!(events[0].schema, 25);
+    assert_eq!(events[0].schema, 26);
     assert_eq!(events[0].result, EventResult::LocalHit);
     assert!(
         events[0].verify_compare.is_empty(),
@@ -7194,7 +7262,7 @@ fn log_event_persists_verify_compare_class_on_hit() {
     );
     let events = crate::events::read_events(&config.event_log_path()).unwrap();
     assert_eq!(events.len(), 2);
-    assert_eq!(events[1].schema, 25);
+    assert_eq!(events[1].schema, 26);
     assert_eq!(
         events[1].verify_compare,
         "content: libfoo.rlib (byte mismatch)"
@@ -9773,7 +9841,7 @@ fn a_passthrough_reason_is_classified_on_the_event() {
         EventInputs::new("/repo", "foo.c", EventResult::Passthrough, 10)
             .passthrough_reason("unsupported|cc link mode".to_string()),
     );
-    assert_eq!(event.schema, 25);
+    assert_eq!(event.schema, 26);
     assert_eq!(event.miss_reason, crate::events::MissReason::Unsupported);
     let hit = super::build_event_details(
         &config,
@@ -9987,4 +10055,339 @@ fn readonly_restore_keeps_executable_and_transformed_file_modes() {
         }
         assert_eq!(std::fs::read(&blob).unwrap(), content);
     }
+}
+
+fn rebuilt_test_artifacts() -> ArtifactSet {
+    ArtifactSet::new(vec![
+        crate::compiler::Artifact {
+            path: PathBuf::from("/actual/deps/example.d"),
+            store_name: "staged-dep-info.d".into(),
+            kind: ArtifactKind::DepInfo,
+            required: true,
+        },
+        crate::compiler::Artifact {
+            path: PathBuf::from("/actual/deps/libexample.rlib"),
+            store_name: "staged-library.rlib".into(),
+            kind: ArtifactKind::Library,
+            required: true,
+        },
+        crate::compiler::Artifact {
+            path: PathBuf::from("/actual/deps/libexample.rmeta"),
+            store_name: "staged-metadata.rmeta".into(),
+            kind: ArtifactKind::Metadata,
+            required: true,
+        },
+    ])
+}
+
+#[test]
+fn rebuilt_event_uses_actual_outputs_for_success_even_without_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path().join("cache"));
+    let artifacts = rebuilt_test_artifacts();
+    for result in [
+        EventResult::Miss,
+        EventResult::Dup,
+        EventResult::Skipped,
+        EventResult::Passthrough,
+    ] {
+        let event = build_event_details(
+            &config,
+            EventInputs::new("/repo", "example", result, 10)
+                .keyed("observed-input-key", 0, FileHashStats::default())
+                .store_error("cannot store".into())
+                .rebuilt(true, &artifacts, Some("cargo-package-name".into())),
+        );
+        assert_eq!(event.schema, 26);
+        assert_eq!(event.rebuilt_package.as_deref(), Some("cargo-package-name"));
+        assert_eq!(
+            event.rebuilt_fingerprint.as_deref(),
+            Some("observed-input-key")
+        );
+        assert_eq!(
+            event.rebuilt_path.as_deref(),
+            Some("/actual/deps/libexample.rlib")
+        );
+        assert_eq!(
+            event.rebuilt_paths,
+            vec![
+                "/actual/deps/example.d",
+                "/actual/deps/libexample.rlib",
+                "/actual/deps/libexample.rmeta"
+            ]
+        );
+        assert_eq!(event.store_error, "cannot store");
+        let serialized = serde_json::to_value(&event).unwrap();
+        assert_eq!(serialized["rebuilt_path"], "/actual/deps/libexample.rlib");
+        assert_eq!(serialized["rebuilt_fingerprint"], "observed-input-key");
+    }
+}
+
+#[test]
+fn rebuilt_event_omits_claims_for_hits_failures_and_unobserved_outputs() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path().join("cache"));
+    let artifacts = rebuilt_test_artifacts();
+    for (result, success, outputs) in [
+        (EventResult::LocalHit, true, &artifacts),
+        (EventResult::RemoteHit, true, &artifacts),
+        (EventResult::PrefetchHit, true, &artifacts),
+        (EventResult::Error, true, &artifacts),
+        (EventResult::Miss, false, &artifacts),
+        (EventResult::Miss, true, &ArtifactSet::default()),
+    ] {
+        let event = build_event_details(
+            &config,
+            EventInputs::new("/repo", "example", result, 1)
+                .keyed("key", 0, FileHashStats::default())
+                .rebuilt(success, outputs, Some("package".into())),
+        );
+        assert!(event.rebuilt_package.is_none());
+        assert!(event.rebuilt_fingerprint.is_none());
+        assert!(event.rebuilt_path.is_none());
+        assert!(event.rebuilt_paths.is_empty());
+        let json = serde_json::to_value(event).unwrap();
+        for field in [
+            "rebuilt_package",
+            "rebuilt_fingerprint",
+            "rebuilt_path",
+            "rebuilt_paths",
+        ] {
+            assert!(json.get(field).is_none(), "{field}: {json}");
+        }
+    }
+    // Build-script execution only supplies package attribution, never outputs.
+    let event = build_event_details(
+        &config,
+        EventInputs::new("/repo", "build-script", EventResult::Miss, 1).package("package".into()),
+    );
+    assert_eq!(event.package, "package");
+    assert!(event.rebuilt_paths.is_empty());
+}
+
+#[test]
+fn rebuilt_event_keeps_unknown_package_and_unkeyed_fingerprint_absent() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path().join("cache"));
+    let event = build_event_details(
+        &config,
+        EventInputs::new("/repo", "source.c", EventResult::Miss, 1).rebuilt(
+            true,
+            &rebuilt_test_artifacts(),
+            None,
+        ),
+    );
+    assert!(event.rebuilt_package.is_none());
+    assert!(event.rebuilt_fingerprint.is_none());
+    assert!(event.rebuilt_path.is_some());
+    let outputs = ArtifactSet::new(vec![crate::compiler::Artifact {
+        path: PathBuf::from("/staging/temp.dsym.tar"),
+        store_name: "bundle.tar".into(),
+        kind: ArtifactKind::DebugBundle,
+        required: false,
+    }]);
+    let event = build_event_details(
+        &config,
+        EventInputs::new("/repo", "example", EventResult::Miss, 1)
+            .keyed("key", 0, FileHashStats::default())
+            .rebuilt(true, &outputs, Some(String::new())),
+    );
+    assert!(event.rebuilt_paths.is_empty());
+    assert!(event.rebuilt_path.is_none());
+    assert!(event.rebuilt_package.is_none());
+    assert!(event.rebuilt_fingerprint.is_none());
+}
+
+#[test]
+fn rebuilt_cc_and_nvcc_primary_is_observed_object_not_depinfo() {
+    for suffix in [".o", ".obj", ".ptx"] {
+        let object = format!("/compiler/result{suffix}");
+        let outputs = ArtifactSet::new(vec![
+            crate::compiler::Artifact {
+                path: PathBuf::from("/compiler/result.d"),
+                store_name: "result.d".into(),
+                kind: ArtifactKind::DepInfo,
+                required: true,
+            },
+            crate::compiler::Artifact {
+                path: PathBuf::from(&object),
+                store_name: "result".into(),
+                kind: ArtifactKind::Object,
+                required: true,
+            },
+        ]);
+        let rebuilt = RebuiltArtifacts::observed(true, &outputs, Some("native-package".into()));
+        assert_eq!(rebuilt.primary.as_deref(), Some(object.as_str()));
+        assert_eq!(
+            rebuilt.paths,
+            vec!["/compiler/result.d".to_string(), object]
+        );
+        assert_eq!(rebuilt.package.as_deref(), Some("native-package"));
+    }
+}
+
+#[test]
+fn rebuilt_primary_handles_each_linked_artifact_kind_and_metadata_only() {
+    for kind in [
+        ArtifactKind::Executable,
+        ArtifactKind::DynamicLibrary,
+        ArtifactKind::WasmModule,
+        ArtifactKind::Metadata,
+        ArtifactKind::Other("llvm-ir"),
+    ] {
+        let outputs = ArtifactSet::new(vec![crate::compiler::Artifact {
+            path: PathBuf::from("/actual/output"),
+            store_name: "store-name".into(),
+            kind,
+            required: true,
+        }]);
+        let rebuilt = RebuiltArtifacts::observed(true, &outputs, Some(String::new()));
+        assert_eq!(rebuilt.primary.as_deref(), Some("/actual/output"));
+        assert_eq!(rebuilt.paths, vec!["/actual/output"]);
+        assert!(rebuilt.package.is_none());
+    }
+}
+
+#[test]
+fn rebuilt_metadata_is_primary_in_a_check_without_link_outputs() {
+    let all = rebuilt_test_artifacts();
+    let outputs = ArtifactSet::new(
+        all.outputs()
+            .iter()
+            .filter(|a| a.kind != ArtifactKind::Library)
+            .cloned()
+            .collect(),
+    );
+    let rebuilt = RebuiltArtifacts::observed(true, &outputs, None);
+    assert_eq!(
+        rebuilt.primary.as_deref(),
+        Some("/actual/deps/libexample.rmeta")
+    );
+    assert_eq!(
+        rebuilt.paths,
+        vec!["/actual/deps/example.d", "/actual/deps/libexample.rmeta"]
+    );
+}
+
+#[test]
+fn cc_publication_candidate_requires_success_before_recording_handoff_outputs() {
+    let artifacts = rebuilt_test_artifacts();
+    for (exit, has_outputs, inputs_changed, peer_committed, publishes) in [
+        (0, true, false, false, true),
+        (1, true, false, false, false),
+        (0, false, false, false, false),
+        (0, true, true, false, false),
+        (0, true, false, true, false),
+    ] {
+        let clean = should_store_cc_result(exit, has_outputs);
+        let candidate = cc_store_candidate(clean, inputs_changed, peer_committed);
+        assert_eq!(cc_store_decision(candidate, true).should_store, publishes);
+        let rebuilt =
+            RebuiltArtifacts::observed(candidate, &artifacts, Some("native-package".into()));
+        if publishes {
+            assert_eq!(
+                rebuilt.primary.as_deref(),
+                Some("/actual/deps/libexample.rlib")
+            );
+            assert_eq!(
+                rebuilt.paths,
+                vec![
+                    "/actual/deps/example.d",
+                    "/actual/deps/libexample.rlib",
+                    "/actual/deps/libexample.rmeta"
+                ]
+            );
+            assert_eq!(rebuilt.package.as_deref(), Some("native-package"));
+        } else {
+            assert!(rebuilt.paths.is_empty());
+            assert!(rebuilt.primary.is_none());
+            assert!(rebuilt.package.is_none());
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn cc_successful_compile_and_handoff_preserve_actual_rebuilt_outputs() {
+    let _lock = crate::test_support::process_state_test_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("observed.c");
+    let object = dir.path().join("observed.o");
+    std::fs::write(&source, "int observed(void) { return 7; }\n").unwrap();
+    let cc = crate::compiler::resolve_program_on_path("cc")
+        .expect("the test runner requires a C compiler");
+    let mut config = test_config(dir.path().join("cache"));
+    config.deferred_discovery = false;
+    config.daemon_publish = true;
+    std::fs::create_dir_all(&config.cache_dir).unwrap();
+    let run_lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(config.socket_path().with_extension("run.lock"))
+        .unwrap();
+    run_lock.lock().unwrap();
+    let daemon = RemoteCheckReplyDaemon::with_reply(
+        config.socket_path(),
+        serde_json::json!({"ok":false,"error":"test daemon declines publication"}),
+    );
+    let argv = vec![
+        cc.display().to_string(),
+        "-c".into(),
+        source.display().to_string(),
+        "-o".into(),
+        object.display().to_string(),
+    ];
+    assert_eq!(run_cc(&config, &argv).unwrap(), 0);
+    let events = crate::events::read_events(&config.event_log_path()).unwrap();
+    assert_eq!(events.len(), 1);
+    let path = object.to_string_lossy().into_owned();
+    assert_eq!(events[0].rebuilt_path.as_deref(), Some(path.as_str()));
+    assert_eq!(events[0].rebuilt_paths, vec![path.clone()]);
+    assert_eq!(
+        events[0].rebuilt_fingerprint.as_deref(),
+        Some(events[0].cache_key.as_str())
+    );
+    let requests = daemon.recorded.lock().unwrap();
+    let request = requests
+        .iter()
+        .find_map(|value| value.get("publish_cc_v2"))
+        .expect("a successful eligible C compile must offer its outputs to the daemon");
+    assert_eq!(request["event"]["rebuilt_path"], path);
+    assert_eq!(request["event"]["rebuilt_paths"], serde_json::json!([path]));
+    assert_eq!(
+        request["event"]["rebuilt_fingerprint"],
+        request["cache_key"]
+    );
+    drop(requests);
+    run_lock.unlock().unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn cc_failed_compile_does_not_claim_rebuilt_outputs_or_publish_handoff() {
+    let _lock = crate::test_support::process_state_test_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("broken.c");
+    let object = dir.path().join("broken.o");
+    std::fs::write(&source, "this is invalid C source @\n").unwrap();
+    let cc = crate::compiler::resolve_program_on_path("cc")
+        .expect("the test runner requires a C compiler");
+    let mut config = test_config(dir.path().join("cache"));
+    config.deferred_discovery = false;
+    let argv = vec![
+        cc.display().to_string(),
+        "-c".into(),
+        source.display().to_string(),
+        "-o".into(),
+        object.display().to_string(),
+    ];
+    assert_ne!(run_cc(&config, &argv).unwrap(), 0);
+    let events = crate::events::read_events(&config.event_log_path()).unwrap();
+    assert_eq!(events.len(), 1);
+    assert!(events[0].rebuilt_path.is_none());
+    assert!(events[0].rebuilt_paths.is_empty());
+    assert!(events[0].rebuilt_fingerprint.is_none());
+    assert!(events[0].rebuilt_package.is_none());
+    assert!(!object.exists());
 }

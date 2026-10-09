@@ -78,6 +78,7 @@ local_max_size = "200GiB"
 | `KACHE_AUTO_SHARE_TARGET_FILES` | `cache.auto_share_target_files` | `true` | Let the daemon replace target files that are full copies of stored blobs with clones of those blobs. See [Target directory cleanup](#target-directory-cleanup). |
 | `KACHE_AUTO_CLEAN_IDLE_TARGETS_DAYS` | `cache.auto_clean_idle_targets_days` | `0` | Let the daemon also remove target directories no build has used for this many days; `0` disables it |
 | `KACHE_AUTO_RECOVER_MIN_FREE_BYTES` | `cache.auto_recover_min_free_bytes` | 10 GiB | Below this many free bytes, reclaim eligible cache entries during builds and clean unused targets when idle; `0` disables recovery |
+| `KACHE_TARGET_LIVENESS` | `cache.target_liveness` | `false` | Record successful Cargo build/check commands for exact-scope unit cleanup; see [Recorded-command cleanup](#recorded-command-cleanup). |
 | `KACHE_AUTO_CLEAN_UNUSED_UNITS_DAYS` | `cache.auto_clean_unused_units_days` | `30` | Let the daemon remove, from target directories still in use, build units no build has used for this many days; `0` disables it. See [Unused build units](#unused-build-units). |
 | `KACHE_SEED_NEW_TARGETS` | `cache.seed_new_targets` | `true` | Copy another checkout's registry build units into a target directory Cargo has not built yet. See [New checkouts](#new-checkouts). |
 | `KACHE_MIN_STORE_COMPILE_MS` | `cache.min_store_compile_ms` | `0` | Skip local retention for faster compiles; `0` stores all eligible results |
@@ -306,6 +307,33 @@ A target directory in regular use still collects dead weight. A lockfile update,
 Cargo reads the fingerprint of every unit a build uses, even when nothing needs compiling, but a filesystem records only some reads. macOS and Linux's default `relatime` both record a read when the file's access time is older than its modification time. So the first check of a target directory sets each fingerprint's access time just below its modification time and notes the moment. Once the configured days have passed, every unit whose fingerprint was neither read nor written since is removed, and the rest are set up again for the next period. Cargo looks only at modification times, so this changes nothing it relies on.
 
 Nothing is removed on a filesystem where reads never change an access time (`noatime`), or on a network filesystem, where Cargo does not lock its build directories. A profile a running build holds is skipped, and all of Cargo's locks in it are held while its units are removed. Each unit's fingerprint goes before its outputs, so a removal cut short leaves outputs Cargo rebuilds. A unit that is needed after all is restored from the cache or compiled again. The daemon log reports how many units and bytes each target directory lost.
+
+### Recorded-command cleanup
+
+Enable receipts for an active workspace, then preview its obsolete build units:
+
+```bash
+KACHE_TARGET_LIVENESS=1 kache cargo check
+kache clean --units target --dry-run
+kache clean --units target --yes
+```
+
+Persist the setting to capture future supported commands through `kache cargo` or the installed Cargo shim:
+
+```toml
+[cache]
+target_liveness = true
+```
+
+With `target_liveness` enabled, automatic unused-unit cleanup and its disk-pressure pass use these receipts instead of access-time evidence. An unavailable receipt keeps the units; these passes do not fall back to access-time pruning. Whole-target deletion keeps its existing idle and deleted-workspace rules.
+
+The receipt uses successful stable Cargo `build`/`check` JSON output, including artifacts Cargo marked Fresh. Cleanup keeps those live units and removes only known units outside that recorded command's scope. It does not depend on file access times. After cleaning an already-fresh workspace, repeating the same recorded Cargo command stays fresh. A different feature set, profile or command may need units that were removed.
+
+Recording and validation scan workspace inputs, build-script package inputs and fingerprint/output inventories only when this mode is enabled. Source walks stop at 32,768 entries or 128 MiB; oversized inputs and split build directories retain their units.
+
+Missing, changed or incomplete evidence keeps the units. Unsupported layouts, symlinks and held build locks also prevent removal. Other profiles and unknown units are kept. Run the supported Cargo command again to refresh a receipt after changing sources, manifests, configuration or the toolchain. Existing private Cargo files alone are not a complete build graph.
+
+`kache clean --artifacts` is an alias for `--units`. A path selects an intact tracked target directory or its workspace; without a path, the command previews or cleans all live tracked targets. `--json` previews unless paired with `--yes`, and `--dry-run` always removes nothing. `kache targets --json` includes each target's unit-cleanup plan.
 
 ## Compiler policy
 

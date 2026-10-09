@@ -31,7 +31,10 @@
 //! - A build script whose recorded output names the other checkout, other
 //!   than its own `OUT_DIR` (which Cargo rewrites), is not copied. Files
 //!   under that script's `out/` are copied unchanged, so one that names
-//!   the other checkout keeps the unit out too.
+//!   the other checkout keeps the unit out too, and so does an `out/` that
+//!   is not read in full within [`OUT_SCAN_BYTES`] and the deadline. A
+//!   checkout path with `\` separators also counts when written with `/`,
+//!   as CMake writes it on Windows.
 //! - The other checkout must have been built by the same `rustc`: the one
 //!   kache recorded while building into it, else the one Cargo's rustc info
 //!   cache names (Cargo does not write that cache when it cannot fingerprint
@@ -78,10 +81,11 @@ const PROFILE: &str = "debug";
 /// Where a unit is copied before it is renamed into place.
 const STAGING: &str = ".kache-seeding-";
 
-/// Largest build-script output file searched for a donor path. Caches such
-/// as `CMakeCache.txt` sit well under this. A bigger file is left unread so
-/// one object cannot spend the seeding deadline.
-const OUT_FILE_SCAN_LIMIT: u64 = 1 << 20;
+/// Bytes of a build script's `out/` read per unit while looking for a donor
+/// path. A unit whose files add up to more is not seeded: the unread bytes
+/// could name the donor. In kache's own debug build the largest `out/`,
+/// zstd-sys's, is under 5 MiB.
+const OUT_SCAN_BYTES: u64 = 32 << 20;
 
 /// Is `args` (the compiler and its arguments) Cargo's target-info probe?
 pub(crate) fn is_target_info_probe(args: &[String]) -> bool {
@@ -279,22 +283,29 @@ fn names_the_donor(profile: &Path, layout: Layout, unit: &Unit, donor: &Donor) -
         "" => output.into_owned(),
         out_dir => output.replace(out_dir, ""),
     };
-    [&donor.target_dir, &donor.workspace_root]
+    donor_needles(donor)
         .iter()
-        .any(|path| rest.contains(path.to_string_lossy().as_ref()))
+        .any(|needle| rest.contains(needle.as_str()))
 }
 
-/// Whether a file under the build script's `out/` names the donor.
+/// Whether a file under the build script's `out/` names the donor, or the
+/// scan could not read all of them.
 ///
 /// Cargo rewrites `OUT_DIR` only when it replays the script's stdout. A
 /// cache written into `out/` (cmake's `CMakeCache.txt` records
 /// `OUT_DIR/build`) still contains the other checkout's path, and copying
 /// it makes the script fail in the new target. The scan runs only when the
 /// script's stdout record exists, so a compiler unit's `out/` is the
-/// artifact itself and is still copied. A file larger than
-/// [`OUT_FILE_SCAN_LIMIT`] is not read. An unreadable file, or a directory
-/// that cannot be listed, keeps the unit out.
-fn out_dir_names_the_donor(profile: &Path, layout: Layout, unit: &Unit, donor: &Donor) -> bool {
+/// artifact itself and is still copied. Files adding up to more than
+/// [`OUT_SCAN_BYTES`], the deadline passing during the scan, an unreadable
+/// file and a directory that cannot be listed each keep the unit out.
+fn out_dir_names_the_donor(
+    profile: &Path,
+    layout: Layout,
+    unit: &Unit,
+    donor: &Donor,
+    deadline: Instant,
+) -> bool {
     let stdout = match layout {
         Layout::PerUnit => profile
             .join("build")
@@ -310,7 +321,12 @@ fn out_dir_names_the_donor(profile: &Path, layout: Layout, unit: &Unit, donor: &
         return false;
     }
     let needles = donor_needles(donor);
-    directory_names_the_donor(&build_script_out_dir(profile, layout, unit), &needles)
+    OutScan {
+        needles: &needles,
+        bytes_left: OUT_SCAN_BYTES,
+        deadline,
+    }
+    .keeps_out(&build_script_out_dir(profile, layout, unit))
 }
 
 /// `out/` of a build script: `<unit>/out` since Cargo 1.100, and
@@ -329,41 +345,83 @@ fn build_script_out_dir(profile: &Path, layout: Layout, unit: &Unit) -> PathBuf 
     }
 }
 
+/// The donor's directories as a file may spell them: as the platform does,
+/// and, for a path with `\` separators, with `/` instead, which is how
+/// CMake writes `C:/Users/me/ws/target` on Windows.
 fn donor_needles(donor: &Donor) -> Vec<String> {
-    [&donor.target_dir, &donor.workspace_root]
-        .into_iter()
-        .map(|path| path.to_string_lossy().into_owned())
-        .filter(|text| !text.is_empty())
-        .collect()
-}
-
-fn directory_names_the_donor(dir: &Path, needles: &[String]) -> bool {
-    let listed = match std::fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(_) => return dir.exists(),
-    };
-    listed.flatten().any(|entry| {
-        let path = entry.path();
-        std::fs::symlink_metadata(&path).is_ok_and(|metadata| {
-            if metadata.is_dir() {
-                directory_names_the_donor(&path, needles)
-            } else {
-                metadata.is_file() && file_names_the_donor(&path, metadata.len(), needles)
-            }
-        })
-    })
-}
-
-fn file_names_the_donor(path: &Path, len: u64, needles: &[String]) -> bool {
-    if len > OUT_FILE_SCAN_LIMIT {
-        return false;
+    let mut needles = Vec::new();
+    for path in [&donor.target_dir, &donor.workspace_root] {
+        let native = path.to_string_lossy().into_owned();
+        if native.is_empty() {
+            continue;
+        }
+        let forward = native.replace('\\', "/");
+        if forward != native {
+            needles.push(forward);
+        }
+        needles.push(native);
     }
-    let Ok(bytes) = std::fs::read(path) else {
-        return true;
-    };
     needles
-        .iter()
-        .any(|needle| crate::build_script::find_bytes(&bytes, needle.as_bytes()).is_some())
+}
+
+/// A walk of a build script's `out/` for the donor's paths.
+struct OutScan<'a> {
+    needles: &'a [String],
+    /// What the unit's files may still add up to.
+    bytes_left: u64,
+    deadline: Instant,
+}
+
+impl OutScan<'_> {
+    /// Whether what is under `dir` keeps the unit out: a file names the
+    /// donor, or something was left unread. Symbolic links are not followed.
+    fn keeps_out(&mut self, dir: &Path) -> bool {
+        let listed = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(_) => return dir.exists(),
+        };
+        for entry in listed {
+            if Instant::now() >= self.deadline {
+                return true;
+            }
+            let Ok(entry) = entry else {
+                return true;
+            };
+            let path = entry.path();
+            let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+                return true;
+            };
+            let keeps_out = if metadata.is_dir() {
+                self.keeps_out(&path)
+            } else {
+                metadata.is_file() && self.file_keeps_out(&path, metadata.len())
+            };
+            if keeps_out {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Whether the file at `path`, `len` bytes long, names the donor or does
+    /// not fit in what is left of the budget. At most `len` bytes are read.
+    fn file_keeps_out(&mut self, path: &Path, len: u64) -> bool {
+        use std::io::Read as _;
+        if len > self.bytes_left {
+            return true;
+        }
+        self.bytes_left -= len;
+        let mut bytes = Vec::with_capacity(len as usize);
+        if std::fs::File::open(path)
+            .and_then(|file| file.take(len).read_to_end(&mut bytes))
+            .is_err()
+        {
+            return true;
+        }
+        self.needles
+            .iter()
+            .any(|needle| crate::build_script::find_bytes(&bytes, needle.as_bytes()).is_some())
+    }
 }
 
 /// The files in a shared-layout donor's `deps/`, by the unit hash their name
@@ -619,7 +677,7 @@ pub(crate) fn seed(
                         }
                         if marker(&to, layout, unit).exists()
                             || names_the_donor(&from, layout, unit, donor)
-                            || out_dir_names_the_donor(&from, layout, unit, donor)
+                            || out_dir_names_the_donor(&from, layout, unit, donor, deadline)
                         {
                             continue;
                         }
@@ -1396,7 +1454,7 @@ source = "git+https://example.com/gitdep#abc"
                 "{layout:?}: stdout only names OUT_DIR"
             );
             assert!(
-                out_dir_names_the_donor(&from, layout, &dep, &donor),
+                out_dir_names_the_donor(&from, layout, &dep, &donor, later()),
                 "{layout:?}"
             );
             let new = checkout(dir.path(), "b");
@@ -1429,7 +1487,7 @@ source = "git+https://example.com/gitdep#abc"
             let cache = "portable-cache\n";
             write(&cmake_cache(&from, layout), cache);
             assert!(
-                !out_dir_names_the_donor(&from, layout, &dep, &donor),
+                !out_dir_names_the_donor(&from, layout, &dep, &donor, later()),
                 "{layout:?}"
             );
             let new = checkout(dir.path(), "b");
@@ -1457,7 +1515,7 @@ source = "git+https://example.com/gitdep#abc"
     }
 
     #[test]
-    fn each_donor_path_is_enough_and_a_long_file_is_not_read() {
+    fn each_donor_path_is_enough_and_an_unread_file_keeps_the_unit_out() {
         for layout in [Layout::PerUnit, Layout::Shared] {
             let dir = tempfile::tempdir().unwrap();
             let donor = donor(dir.path(), "a", layout);
@@ -1471,24 +1529,24 @@ source = "git+https://example.com/gitdep#abc"
             named.workspace_root = PathBuf::from("/needle-workspace");
             write(&cache, "see /needle-workspace/src\n");
             assert!(
-                out_dir_names_the_donor(&from, layout, &dep, &named),
+                out_dir_names_the_donor(&from, layout, &dep, &named, later()),
                 "{layout:?} workspace"
             );
             write(&cache, "see /needle-target/debug\n");
             assert!(
-                out_dir_names_the_donor(&from, layout, &dep, &named),
+                out_dir_names_the_donor(&from, layout, &dep, &named, later()),
                 "{layout:?} target"
             );
             write(&cache, "see /neither\n");
             assert!(
-                !out_dir_names_the_donor(&from, layout, &dep, &named),
+                !out_dir_names_the_donor(&from, layout, &dep, &named, later()),
                 "{layout:?}"
             );
             // Longer than both needles, and neither needle is in it. A
             // shorter miss makes `windows` empty, so `==` and `!=` agree.
             write(&cache, "xxxx see /neither xxxxxxxxx\n");
             assert!(
-                !out_dir_names_the_donor(&from, layout, &dep, &named),
+                !out_dir_names_the_donor(&from, layout, &dep, &named, later()),
                 "{layout:?}: a longer file that names neither path"
             );
 
@@ -1497,30 +1555,15 @@ source = "git+https://example.com/gitdep#abc"
             blank.workspace_root.clear();
             write(&cache, "x\n");
             assert!(
-                !out_dir_names_the_donor(&from, layout, &dep, &blank),
+                !out_dir_names_the_donor(&from, layout, &dep, &blank, later()),
                 "{layout:?} empty"
             );
 
             let needle = donor.target_dir.to_string_lossy().into_owned();
-            let mut exact = vec![b'a'; 1024 * 1024];
-            exact[..needle.len()].copy_from_slice(needle.as_bytes());
-            std::fs::write(&cache, &exact).unwrap();
-            assert!(
-                out_dir_names_the_donor(&from, layout, &dep, &donor),
-                "{layout:?}: a file at the scan limit is read"
-            );
-            let mut over = vec![b'a'; 1024 * 1024 + 1];
-            over[..needle.len()].copy_from_slice(needle.as_bytes());
-            std::fs::write(&cache, &over).unwrap();
-            assert!(
-                !out_dir_names_the_donor(&from, layout, &dep, &donor),
-                "{layout:?}: a longer file is not read"
-            );
-
             std::fs::remove_file(script_stdout(&from, layout)).unwrap();
             write(&cache, &format!("{needle}\n"));
             assert!(
-                !out_dir_names_the_donor(&from, layout, &dep, &donor),
+                !out_dir_names_the_donor(&from, layout, &dep, &donor, later()),
                 "{layout:?}: no script record, so out/ is the unit's artifact"
             );
 
@@ -1536,14 +1579,14 @@ source = "git+https://example.com/gitdep#abc"
                     "{layout:?}: mode 000 must be unreadable here"
                 );
                 assert!(
-                    out_dir_names_the_donor(&from, layout, &dep, &donor),
+                    out_dir_names_the_donor(&from, layout, &dep, &donor, later()),
                     "{layout:?}: an unreadable output file is not copied"
                 );
                 std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o644)).unwrap();
 
                 std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o000)).unwrap();
                 assert!(
-                    out_dir_names_the_donor(&from, layout, &dep, &donor),
+                    out_dir_names_the_donor(&from, layout, &dep, &donor, later()),
                     "{layout:?}: an unlisted out/ is not copied"
                 );
                 std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -1554,10 +1597,127 @@ source = "git+https://example.com/gitdep#abc"
                 let link = out.join("linked-cache");
                 std::os::unix::fs::symlink(&outside, &link).unwrap();
                 assert!(
-                    !out_dir_names_the_donor(&from, layout, &dep, &donor),
+                    !out_dir_names_the_donor(&from, layout, &dep, &donor, later()),
                     "{layout:?}: a symlink is not followed"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn a_donor_path_with_backslashes_is_also_searched_with_forward_slashes() {
+        let needles = |target: &str, workspace: &str| {
+            donor_needles(&Donor {
+                target_dir: PathBuf::from(target),
+                workspace_root: PathBuf::from(workspace),
+                rustc: None,
+            })
+        };
+        assert_eq!(
+            needles(r"C:\Users\me\ws-a\target", r"C:\Users\me\ws-a"),
+            [
+                "C:/Users/me/ws-a/target",
+                r"C:\Users\me\ws-a\target",
+                "C:/Users/me/ws-a",
+                r"C:\Users\me\ws-a",
+            ]
+        );
+        assert_eq!(needles("/ws-a/target", "/ws-a"), ["/ws-a/target", "/ws-a"]);
+        assert!(needles("", "").is_empty());
+    }
+
+    /// CMake on Windows writes the build directory into `CMakeCache.txt` as
+    /// `D:/target/ws-a/debug/...`, and a script can print it that way. Either
+    /// keeps the unit out. The match is on text, so this runs on every
+    /// platform.
+    #[test]
+    fn a_forward_slash_spelling_of_a_windows_donor_keeps_the_unit_out() {
+        for layout in [Layout::PerUnit, Layout::Shared] {
+            let dir = tempfile::tempdir().unwrap();
+            let donor = donor(dir.path(), "a", layout);
+            let from = donor.target_dir.join(PROFILE);
+            let dep = unit("dep", HASH);
+            let mut windows = donor.clone();
+            windows.target_dir = PathBuf::from(r"D:\target\ws-a");
+            windows.workspace_root = PathBuf::from(r"C:\Users\me\ws-a");
+            let stdout = script_stdout(&from, layout);
+            let cache = cmake_cache(&from, layout);
+
+            write(&stdout, "cargo:rustc-cfg=x\n");
+            write(&cache, "CMAKE_HOME_DIRECTORY:INTERNAL=C:/Users/me/vendor\n");
+            assert!(
+                !names_the_donor(&from, layout, &dep, &windows),
+                "{layout:?}"
+            );
+            assert!(
+                !out_dir_names_the_donor(&from, layout, &dep, &windows, later()),
+                "{layout:?}"
+            );
+
+            write(
+                &cache,
+                "CMAKE_CACHEFILE_DIR:INTERNAL=D:/target/ws-a/debug/build/dep/out/build\n",
+            );
+            assert!(
+                out_dir_names_the_donor(&from, layout, &dep, &windows, later()),
+                "{layout:?}: the target directory"
+            );
+            write(
+                &cache,
+                "CMAKE_HOME_DIRECTORY:INTERNAL=C:/Users/me/ws-a/vendor\n",
+            );
+            assert!(
+                out_dir_names_the_donor(&from, layout, &dep, &windows, later()),
+                "{layout:?}: the workspace"
+            );
+
+            write(
+                &stdout,
+                "cargo:rustc-link-search=native=D:/target/ws-a/debug/gn_out/obj\n",
+            );
+            assert!(names_the_donor(&from, layout, &dep, &windows), "{layout:?}");
+        }
+    }
+
+    /// Every file under `out/` counts toward one budget. A unit whose files
+    /// add up to it is read; a byte more, or the deadline passing first,
+    /// keeps the unit out unread.
+    #[test]
+    fn an_out_dir_past_the_scan_budget_or_the_deadline_keeps_the_unit_out() {
+        for layout in [Layout::PerUnit, Layout::Shared] {
+            let dir = tempfile::tempdir().unwrap();
+            let donor = donor(dir.path(), "a", layout);
+            let from = donor.target_dir.join(PROFILE);
+            let dep = unit("dep", HASH);
+            write(&script_stdout(&from, layout), "cargo:rustc-cfg=x\n");
+            let out = build_script_out_dir(&from, layout, &dep);
+            write(&out.join("first.o"), "first");
+            let cache = cmake_cache(&from, layout);
+            write(&cache, "");
+            let others: u64 = walk(&out)
+                .iter()
+                .map(|file| std::fs::metadata(file).unwrap().len())
+                .sum();
+            // Sparse: zeros that name nothing, without writing 32 MiB.
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&cache)
+                .unwrap();
+            file.set_len(OUT_SCAN_BYTES - others).unwrap();
+            assert!(
+                !out_dir_names_the_donor(&from, layout, &dep, &donor, later()),
+                "{layout:?}: at the budget, read and clean"
+            );
+            file.set_len(OUT_SCAN_BYTES - others + 1).unwrap();
+            assert!(
+                out_dir_names_the_donor(&from, layout, &dep, &donor, later()),
+                "{layout:?}: a byte past the budget"
+            );
+            file.set_len(0).unwrap();
+            assert!(
+                out_dir_names_the_donor(&from, layout, &dep, &donor, Instant::now()),
+                "{layout:?}: the deadline passed"
+            );
         }
     }
 

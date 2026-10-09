@@ -304,7 +304,7 @@ Kache follows `build.target-dir`, `build.build-dir`, `CARGO_TARGET_DIR`, `CARGO_
 
 The Cargo shim and `kache cargo -- …` also pass `--target-dir` to the wrapper. They skip seeding for invocations with `--config`, `--manifest-path`, `-C`, or `-Z`. A compiler wrapper used without the Cargo shim cannot see those command-line options; use Cargo's configuration or environment variables to select a seedable directory.
 
-A unit whose build script or output files name the donor checkout, other than its own `OUT_DIR`, is not copied. Nothing is copied while a build holds either profile's lock or when no daemon is running. Config includes, unknown build-directory templates, and unreadable or invalid configuration are left unseeded. Set `cache.seed_new_targets = false` or `KACHE_SEED_NEW_TARGETS=0` to turn seeding off.
+A unit whose build script or output files name the donor checkout, other than its own `OUT_DIR`, is not copied. A Windows path also counts when written with forward slashes, as CMake writes it in `CMakeCache.txt`. A build script whose output files add up to more than 32 MiB, or are not all read before the deadline, is not copied either. Nothing is copied while a build holds either profile's lock or when no daemon is running. Config includes, unknown build-directory templates, and unreadable or invalid configuration are left unseeded. Set `cache.seed_new_targets = false` or `KACHE_SEED_NEW_TARGETS=0` to turn seeding off.
 
 When the cache already holds a checkout's dependencies, seeding copies the same units it would otherwise restore one compiler call at a time.
 

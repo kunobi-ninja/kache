@@ -124,10 +124,6 @@ pub(crate) const DEFAULT_EVENT_LOG_MAX_SIZE: u64 = 64 * 1024 * 1024;
 /// Default for [`Config::auto_clean_unused_units_days`].
 pub(crate) const DEFAULT_UNUSED_UNITS_DAYS: u64 = 30;
 
-/// Free space below which builds reclaim cache entries and quiet cleanup
-/// removes unused units and targets: 10 GiB.
-pub(crate) const DEFAULT_RECOVER_MIN_FREE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
-
 #[derive(Debug, Clone)]
 pub struct Config {
     pub cache_dir: PathBuf,
@@ -510,8 +506,9 @@ pub struct Config {
     pub auto_clean_idle_targets_days: u64,
     /// Minimum free bytes on a store or target volume. During builds, auto-GC
     /// reclaims eligible store entries; quiet target cleanup removes units
-    /// unused for a day, then targets idle for a day. 10 GiB by default; zero
-    /// disables recovery.
+    /// unused for a day, then targets idle for a day. Default `0`, disabled.
+    /// Set via `KACHE_AUTO_RECOVER_MIN_FREE_BYTES` or `[cache]
+    /// auto_recover_min_free_bytes`.
     pub auto_recover_min_free_bytes: u64,
     /// Under memory pressure, admit a compile only when no other compile
     /// holds a scheduler slot. On by default. Set via
@@ -2867,8 +2864,9 @@ impl Config {
             .unwrap_or(0)
     }
 
-    /// Free-space threshold for store and target recovery,
-    /// [`DEFAULT_RECOVER_MIN_FREE_BYTES`] by default.
+    /// Free-space threshold for store and target recovery, `0` (off) by
+    /// default. `KACHE_AUTO_RECOVER_MIN_FREE_BYTES` (env wins), else
+    /// `[cache] auto_recover_min_free_bytes`.
     fn auto_recover_min_free_bytes(file_config: &Result<FileConfig>) -> u64 {
         let ignore_env = Self::ignore_env_enabled(file_config);
         env_or_ignored("KACHE_AUTO_RECOVER_MIN_FREE_BYTES", ignore_env)
@@ -2881,7 +2879,7 @@ impl Config {
                     .and_then(|c| c.cache.as_ref())
                     .and_then(|c| c.auto_recover_min_free_bytes)
             })
-            .unwrap_or(DEFAULT_RECOVER_MIN_FREE_BYTES)
+            .unwrap_or(0)
     }
 
     /// Preserve externally retained entries by default. The opt-in restores

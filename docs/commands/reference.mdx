@@ -83,7 +83,7 @@ Given a directory, `clean` looks for `target/` directories under it instead, inc
 
 Cleanup rechecks each directory's identity and removes only the derived target directory. It skips paths that are missing, moved, replaced or unsafe, and targets of the current workspace. A target in use by a running Cargo command or test is skipped in every mode. Kache checks Cargo's `.cargo-lock` and its own command lock before deleting it.
 
-The daemon removes tracked targets on its own: those whose workspace was deleted, idle ones when configured, and idle ones when free disk space falls below 10 GiB. See [Target directory cleanup](/docs/getting-started/configuration#target-directory-cleanup).
+On its own, the daemon removes tracked targets whose workspace was deleted. When configured, it also removes idle ones: after a set number of days, or when free disk space falls below a floor. See [Target directory cleanup](/docs/getting-started/configuration#target-directory-cleanup).
 
 ### Obsolete units in live targets
 

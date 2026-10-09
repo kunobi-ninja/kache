@@ -5435,7 +5435,7 @@ fn target_rows(config: &Config, now: i64) -> Result<Vec<TargetRow>> {
             } else {
                 TargetState::Live
             },
-            idle_seconds: crate::target_cleanup::idle_secs(&config.cache_dir, tracked, now)
+            idle_seconds: crate::target_cleanup::idle_secs(config, tracked, now)
                 .map(|idle| idle as u64),
             discovered: tracked.discovered,
             next_pass,

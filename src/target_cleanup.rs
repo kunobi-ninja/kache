@@ -15,11 +15,14 @@
 //! [`crate::unit_prune`]).
 //!
 //! A target found only through Git, which no build through kache has used,
-//! is watched instead: on a local filesystem that shows reads, each check arms
-//! its units' fingerprints, and it counts as idle from then until a build
-//! reads or writes one (see [`idle_secs`]). It then goes by the idle and
-//! low-disk rules as a whole; its units are not pruned, and the
-//! deleted-workspace rule is for recorded targets.
+//! is watched instead while the idle rule or the free-space floor is on: on a
+//! local filesystem that shows reads, each check arms its units'
+//! fingerprints, and it counts as idle from then until a build reads or
+//! writes one (see [`idle_secs`]). It then goes by those rules as a whole;
+//! its units are not pruned, and the deleted-workspace rule is for recorded
+//! targets. With both rules off, the default, this cleanup leaves it alone
+//! and its idle time is unknown. Target-file sharing
+//! ([`crate::target_dedup`]) still replaces copies of stored blobs in it.
 //!
 //! With `[cache] auto_recover_min_free_bytes` set, a volume below that floor
 //! first loses the units no build used for a day, from every target on it;
@@ -91,15 +94,19 @@ pub(crate) fn reason(config: &Config, orphaned: bool, idle_secs: i64) -> Option<
 /// Seconds since a build last used `tracked` at `now`: since the build that
 /// recorded it, or for a target found only through Git, since kache began
 /// watching it with no build using it (see [`crate::unit_prune::unused_since`]).
-/// A watch counts only on a local filesystem and when it began after this
-/// directory was found, so a replaced directory starts over. `None` when that
-/// is unknown, which keeps it from every time-based rule.
-pub(crate) fn idle_secs(cache_dir: &Path, tracked: &TrackedTargetRoot, now: i64) -> Option<i64> {
+/// A watch counts only on a local filesystem, when it began after this
+/// directory was found, so a replaced directory starts over, and while a rule
+/// watches discovered targets, so a record left from an earlier watch does
+/// not. `None` when that is unknown, which keeps it from every time-based
+/// rule.
+pub(crate) fn idle_secs(config: &Config, tracked: &TrackedTargetRoot, now: i64) -> Option<i64> {
     if tracked.discovered {
-        if !watch_counts(crate::cache_fs::probe(&tracked.path).is_local) {
+        if !watches_discovered(config)
+            || !watch_counts(crate::cache_fs::probe(&tracked.path).is_local)
+        {
             return None;
         }
-        let unused = crate::unit_prune::unused_since(cache_dir, &tracked.path);
+        let unused = crate::unit_prune::unused_since(&config.cache_dir, &tracked.path);
         return watched_idle(tracked, now, unused);
     }
     Some(now.saturating_sub(tracked.last_seen).max(0))
@@ -213,12 +220,17 @@ pub(crate) fn sweep(config: &Config, now: u64) -> anyhow::Result<Swept> {
                 store.forget_target_root(&tracked.path)?;
                 continue;
             }
+            // No rule could remove it: leave its fingerprints and Cargo
+            // locks alone.
+            if !watches_discovered(config) {
+                continue;
+            }
             if should_watch(intact(&tracked), crate::cli::target_in_use(&tracked.path)) {
                 let found = found_at(tracked.first_seen);
                 crate::unit_prune::watch(&config.cache_dir, &tracked.path, at, found);
             }
         }
-        let Some(idle) = idle_secs(&config.cache_dir, &tracked, now) else {
+        let Some(idle) = idle_secs(config, &tracked, now) else {
             continue;
         };
         let orphaned = orphaned(
@@ -255,15 +267,15 @@ pub(crate) fn sweep(config: &Config, now: u64) -> anyhow::Result<Swept> {
         }
     }
     // Pruning re-arms what it keeps, which would hide how long a target went
-    // unused; note that first.
-    let unused: std::collections::HashMap<PathBuf, Option<SystemTime>> = store
-        .tracked_target_roots(0)?
-        .into_iter()
-        .map(|tracked| {
+    // unused; note that first. Only the free-space floor reads it, and the
+    // walk reads every armed target's fingerprints.
+    let mut unused = std::collections::HashMap::<PathBuf, Option<SystemTime>>::new();
+    if config.auto_recover_min_free_bytes > 0 {
+        for tracked in store.tracked_target_roots(0)? {
             let since = crate::unit_prune::unused_since(&config.cache_dir, &tracked.path);
-            (tracked.path, since)
-        })
-        .collect();
+            unused.insert(tracked.path, since);
+        }
+    }
     let used = prune_under_pressure(config, &store, at, &mut swept)?;
     recover_under_pressure(config, &store, now, &unused, &used, &mut swept)?;
     Ok(swept)
@@ -291,7 +303,7 @@ pub(crate) struct Plan {
 pub(crate) fn plan(config: &Config, tracked: &TrackedTargetRoot, now: u64) -> Plan {
     let at = SystemTime::UNIX_EPOCH + Duration::from_secs(now);
     let now = i64::try_from(now).unwrap_or(i64::MAX);
-    let Some(idle) = idle_secs(&config.cache_dir, tracked, now) else {
+    let Some(idle) = idle_secs(config, tracked, now) else {
         return Plan::default();
     };
     let intact = intact(tracked);
@@ -503,6 +515,12 @@ fn watched_idle(tracked: &TrackedTargetRoot, now: i64, unused: Option<SystemTime
 /// directories.
 fn watch_counts(is_local: Option<bool>) -> bool {
     is_local == Some(true)
+}
+
+/// Whether discovered targets are watched at all: only the idle rule and the
+/// free-space floor read the watch, and both are off by default.
+fn watches_discovered(config: &Config) -> bool {
+    config.auto_clean_idle_targets_days > 0 || config.auto_recover_min_free_bytes > 0
 }
 
 /// Whether to watch a discovered target: it is still the recorded target
@@ -1199,6 +1217,14 @@ mod tests {
         assert!(!should_watch(false, false), "not the recorded target");
         assert!(!should_watch(true, true), "a build holds it");
 
+        let dir = tempfile::tempdir().unwrap();
+        let mut policy = config(dir.path(), true, 0);
+        policy.auto_clean_unused_units_days = 30;
+        assert!(!watches_discovered(&policy), "off by default");
+        policy.auto_recover_min_free_bytes = 1;
+        assert!(watches_discovered(&policy), "the free-space floor");
+        assert!(watches_discovered(&config(dir.path(), false, 1)), "idle");
+
         assert_eq!(
             found_at(100),
             SystemTime::UNIX_EPOCH + Duration::from_secs(100)
@@ -1300,6 +1326,52 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn a_target_found_only_through_git_is_left_alone_by_default() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        // The defaults: the deleted-workspace rule and unit pruning on, the
+        // idle rule and the free-space floor off.
+        let mut policy = config(cache.path(), true, 0);
+        policy.auto_clean_unused_units_days = 30;
+        let store = Store::open(&policy).unwrap();
+        let target = discovered_with_unit(&store, root.path(), "sibling");
+        let profile = target.join("debug");
+        let fingerprint = profile.join(".fingerprint/serde-0123456789abcdef/lib-serde");
+        let state = || {
+            let mut names: Vec<_> = std::fs::read_dir(&profile)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect();
+            names.sort();
+            let accessed = std::fs::metadata(&fingerprint).unwrap().accessed().unwrap();
+            (names, accessed)
+        };
+        let before = state();
+        let now = unix_now_secs();
+        for at in [now, now + 40 * DAY_SECS] {
+            assert_eq!(sweep(&policy, at).unwrap(), Swept::default());
+        }
+        assert_eq!(state(), before, "no Cargo lock created, nothing armed");
+        let tracked = root_of(&store, &target);
+        assert_eq!(idle_secs(&policy, &tracked, now as i64), None);
+
+        // A rule that can remove it starts the watch.
+        if !reads_show(root.path()) {
+            return;
+        }
+        policy.auto_recover_min_free_bytes = 1;
+        assert!(sweep(&policy, now).unwrap().removed.is_empty());
+        assert!(profile.join(".cargo-lock").exists());
+        assert_eq!(idle_secs(&policy, &tracked, now as i64), Some(0));
+
+        // The watch's record stays when the rule is turned off again, but no
+        // longer counts.
+        policy.auto_recover_min_free_bytes = 0;
+        assert_eq!(idle_secs(&policy, &tracked, now as i64), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn a_target_found_only_through_git_is_removed_after_a_watched_idle_window() {
         let root = tempfile::tempdir().unwrap();
         if !reads_show(root.path()) {
@@ -1312,14 +1384,14 @@ mod tests {
         let used = discovered_with_unit(&store, root.path(), "used");
         let now = unix_now_secs();
         assert_eq!(
-            idle_secs(cache.path(), &root_of(&store, &unused), now as i64),
+            idle_secs(&policy, &root_of(&store, &unused), now as i64),
             None
         );
 
         // The first check only starts watching, however old the units are.
         assert!(sweep(&policy, now).unwrap().removed.is_empty());
         assert_eq!(
-            idle_secs(cache.path(), &root_of(&store, &unused), now as i64),
+            idle_secs(&policy, &root_of(&store, &unused), now as i64),
             Some(0)
         );
 

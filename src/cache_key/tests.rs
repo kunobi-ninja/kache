@@ -11247,6 +11247,101 @@ fn guarded_inputs_reject_weak_identity() {
     );
 }
 
+/// A file rewritten after the hasher's stat and before its read may have
+/// been read as either version. With the guard armed, every read path stats
+/// the file again: the input counts as too new, the later fingerprint is the
+/// one reported, so a barrier sees the write, and the earlier one stays among
+/// the guarded inputs, so no excuse accepts the input. Nothing is memoised.
+#[test]
+fn a_file_rewritten_between_the_stat_and_the_read_counts_as_written() {
+    let small = 16;
+    let large = usize::try_from(MIN_PERSISTED_HASH_BYTES).unwrap() + 16;
+    // (store-backed, header capture, size)
+    for (store_backed, header, size) in [
+        (false, false, small),
+        (true, false, small),
+        (true, false, large),
+        (true, true, small),
+    ] {
+        let case = format!("store_backed={store_backed} header={header} size={size}");
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("input.h");
+        std::fs::write(&file, vec![b'a'; size]).unwrap();
+        let first = FileFingerprint::from_path(&file).unwrap();
+        // Past every window of the first write's stamps.
+        let start = [first.mtime_ns, first.ctime_ns]
+            .into_iter()
+            .map(|stamp| stamp + stamp_window_ns(stamp))
+            .max()
+            .unwrap()
+            + 1;
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        ensure_file_hash_cache_schema(&db).unwrap();
+        let mut hasher = if store_backed {
+            FileHasher::from_cache(FileHashCache::Borrowed(&db))
+        } else {
+            FileHasher::new()
+        };
+        hasher.arm_too_new_guard(start, 0);
+        set_before_read(Some(Box::new(move |path: &Path| {
+            while wall_clock_ns() <= start + 30_000_000 {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            std::fs::write(path, vec![b'b'; size + 1]).unwrap();
+        })));
+        let hash = if header {
+            let headers = vec![("input.h".to_string(), file.clone())];
+            let mapped = |path: &Path| std::fs::read_to_string(path).ok();
+            hasher
+                .cc_preprocess_fingerprints(&headers, "maps", &mapped)
+                .map(|inputs| inputs[0].content.clone())
+        } else {
+            hasher.hash(&file).ok()
+        };
+        set_before_read(None);
+
+        let second = FileFingerprint::from_path(&file).unwrap();
+        assert_eq!(hash, Some(hash_file(&file).unwrap()), "{case}");
+        assert!(hasher.too_new(), "{case}");
+        assert!(!stamp_written_since(&first, start), "{case}");
+        assert!(stamp_written_since(&second, start), "{case}");
+        let guarded = hasher.take_guarded_inputs();
+        let kept: Vec<_> = guarded.iter().map(|input| &input.fingerprint).collect();
+        assert!(kept.contains(&&second), "{case}: {guarded:?}");
+        assert!(kept.contains(&&first), "{case}: {guarded:?}");
+        assert!(
+            !FileHasher::guarded_inputs_unchanged_since_hash(&guarded),
+            "{case}"
+        );
+        assert!(hasher.pending_memo.borrow().is_empty(), "{case}");
+        hasher.flush_memo_as_if_settled();
+        let memo = FileHashCache::Borrowed(&db);
+        assert_eq!(memo.get(&first).unwrap(), None, "{case}");
+        assert_eq!(memo.get(&second).unwrap(), None, "{case}");
+    }
+}
+
+/// A file gone by the second stat counts as too new; the stamp from before
+/// the read is reported and fails any later check.
+#[test]
+fn a_file_removed_after_its_read_counts_as_too_new() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("input.rs");
+    std::fs::write(&file, b"pub fn x() {}").unwrap();
+    let mut hasher = FileHasher::new();
+    hasher.arm_too_new_guard(1, 0);
+    let before = ObservedFingerprint::from_path(&file).unwrap();
+    assert!(!hasher.too_new());
+    std::fs::remove_file(&file).unwrap();
+    let (reported, unchanged) = hasher.restat_after_read(&file, before.clone());
+    assert!(!unchanged);
+    assert!(hasher.too_new());
+    assert_eq!(reported, before);
+    assert!(!FileHasher::guarded_inputs_unchanged_since_hash(
+        std::slice::from_ref(&reported)
+    ));
+}
+
 /// Each guarded input keeps the wall clock read before its stat, so a later
 /// check can ask whether its stamp had settled by then.
 #[test]

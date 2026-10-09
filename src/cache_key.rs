@@ -6239,6 +6239,33 @@ struct RecentHash {
     fingerprint: Option<FileFingerprint>,
 }
 
+/// [`hash_file`], for a read that follows a stat of the same file.
+fn read_file_hash(path: &Path) -> Result<String> {
+    #[cfg(test)]
+    BEFORE_READ.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook(path);
+        }
+    });
+    hash_file(path)
+}
+
+/// Run by [`read_file_hash`] before it reads, so a test can write to a file
+/// between a hasher's stat and its read.
+#[cfg(test)]
+pub(crate) type BeforeRead = Box<dyn FnMut(&Path)>;
+
+#[cfg(test)]
+thread_local! {
+    static BEFORE_READ: std::cell::RefCell<Option<BeforeRead>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_before_read(hook: Option<BeforeRead>) {
+    BEFORE_READ.with(|slot| *slot.borrow_mut() = hook);
+}
+
 impl FileHasher<'static> {
     pub fn new() -> Self {
         FileHasher {
@@ -6993,19 +7020,19 @@ impl<'db> FileHasher<'db> {
                 let hash = hash_file(path)?;
                 return Ok((hash, FileFingerprint::from_path(path).ok().map(observed)));
             }
-            let before = FileFingerprint::from_path(path).ok();
-            if let Some(fingerprint) = &before {
-                self.note_too_new(fingerprint);
-            }
-            let hash = hash_file(path)?;
-            let after = FileFingerprint::from_path(path).ok();
-            if let Some(fingerprint) = &after {
-                self.note_too_new(fingerprint);
-            }
-            if before != after {
-                self.too_new.saw_too_new.set(true);
-            }
-            return Ok((hash, after.map(observed)));
+            let Ok(before) = FileFingerprint::from_path(path).map(observed) else {
+                // No stamp before the read: whatever follows it is too new.
+                let hash = read_file_hash(path)?;
+                let after = FileFingerprint::from_path(path).ok();
+                if after.is_some() {
+                    self.too_new.saw_too_new.set(true);
+                }
+                return Ok((hash, after.map(observed)));
+            };
+            self.note_too_new(&before.fingerprint);
+            let hash = read_file_hash(path)?;
+            let (observed, _) = self.restat_after_read(path, before);
+            return Ok((hash, Some(observed)));
         };
 
         let observed = match ObservedFingerprint::from_path(path) {
@@ -7023,11 +7050,14 @@ impl<'db> FileHasher<'db> {
         self.note_too_new(fingerprint);
 
         if fingerprint.size < MIN_PERSISTED_HASH_BYTES {
-            let hash = hash_file(path)?;
+            let hash = read_file_hash(path)?;
             self.record_miss(fingerprint.size);
+            let (observed, _) = self.restat_after_read(path, observed);
             return Ok((hash, Some(observed)));
         }
 
+        // A hash from the daemon or the memo belongs to this stamp; no read
+        // here can fall between the stat and the bytes.
         if let Some(prefetched) = self.prefetched.borrow().get(fingerprint) {
             if prefetched.cache_hit {
                 self.record_hit();
@@ -7049,12 +7079,52 @@ impl<'db> FileHasher<'db> {
             }
         }
 
-        let hash = hash_file(path)?;
+        let hash = read_file_hash(path)?;
         self.record_miss(fingerprint.size);
-        self.pending_memo
-            .borrow_mut()
-            .push((observed.clone(), hash.clone()));
+        let (observed, unchanged) = self.restat_after_read(path, observed);
+        if unchanged {
+            self.pending_memo
+                .borrow_mut()
+                .push((observed.clone(), hash.clone()));
+        }
         Ok((hash, Some(observed)))
+    }
+
+    /// Stat `path` again after reading the bytes `before` was taken for, when
+    /// the guard is armed. A write between the two stats means the bytes may
+    /// belong to neither stamp: the input counts as too new, and `before`,
+    /// which no longer matches the file, stays among the guarded inputs so
+    /// that no later check can excuse it. Returns the fingerprint to report
+    /// for the read, the later one when they differ (still observed when
+    /// `before` was), and whether they agreed.
+    fn restat_after_read(
+        &self,
+        path: &Path,
+        before: ObservedFingerprint,
+    ) -> (ObservedFingerprint, bool) {
+        if self.too_new.invocation_start_ns == 0 {
+            return (before, true);
+        }
+        match FileFingerprint::from_path(path) {
+            Ok(after) if after == before.fingerprint => (before, true),
+            Ok(after) => {
+                self.too_new.saw_too_new.set(true);
+                self.guard_input(&before);
+                let observed_ns = before.observed_ns;
+                (
+                    ObservedFingerprint {
+                        fingerprint: after,
+                        observed_ns,
+                    },
+                    false,
+                )
+            }
+            // Gone since the read: `before` fails any later check.
+            Err(_) => {
+                self.too_new.saw_too_new.set(true);
+                (before, false)
+            }
+        }
     }
 
     /// Classify how this source uses `var` (see [`source_env_dep_use`]).
@@ -7285,31 +7355,34 @@ impl<'db> FileHasher<'db> {
                 prefetched.bytes_hashed,
             )
         });
-        let hash = if let Some((hash, cache_hit, bytes_hashed)) = prefetched {
+        let (hash, reported) = if let Some((hash, cache_hit, bytes_hashed)) = prefetched {
             if cache_hit {
                 self.record_hit();
             } else {
                 self.record_miss_count();
                 self.record_miss_bytes(bytes_hashed);
             }
-            hash
+            (hash, observed.clone())
         } else if let Some(hash) = memoised.get(&fingerprint.path) {
             self.record_hit();
-            hash.clone()
+            (hash.clone(), observed.clone())
         } else {
-            let hash = hash_file(path)?;
+            let hash = read_file_hash(path)?;
             self.record_miss(fingerprint.size);
-            self.pending_memo
-                .borrow_mut()
-                .push((observed.clone(), hash.clone()));
-            hash
+            let (reported, unchanged) = self.restat_after_read(path, observed.clone());
+            if unchanged {
+                self.pending_memo
+                    .borrow_mut()
+                    .push((observed.clone(), hash.clone()));
+            }
+            (hash, reported)
         };
-        self.guard_input(observed);
+        self.guard_input(&reported);
         self.recent_hashes.borrow_mut().insert(
             absolute_path(path),
             RecentHash {
                 hash: hash.clone(),
-                fingerprint: Some(fingerprint.clone()),
+                fingerprint: Some(reported.fingerprint),
             },
         );
         Ok(hash)

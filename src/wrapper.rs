@@ -6070,6 +6070,12 @@ fn emitted_sources_changed_during_compile(
 /// every guarded input still matches its hash-time fingerprint with a strong
 /// identity, nothing changed and the store refusal is excused. Anything else
 /// (a mismatch, a missing file, a weak identity) keeps the refusal.
+///
+/// Unlike the compile-first excuse, a fingerprint here need not have settled
+/// when it was taken: requiring that would refuse every input stamped ahead
+/// of the host clock again, the case this excuse exists for. The cost is
+/// that a second write of the same size inside the stamp's tick, between the
+/// hash and the compiler's read, keeps the fingerprint and is excused.
 fn key_inputs_changed_during_compile(
     key_too_new: bool,
     guard_inputs: &[crate::cache_key::ObservedFingerprint],

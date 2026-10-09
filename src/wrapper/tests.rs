@@ -1835,20 +1835,26 @@ fn configured_rustc_depinfo_roots_cover_every_restorable_anchor() {
 
 #[test]
 fn input_race_store_suppression_truth_table() {
-    for (extra_inputs_racy, guard_enabled, key_too_new, expected) in [
-        (false, false, false, false),
-        (false, false, true, false),
-        (false, true, false, false),
-        (false, true, true, true),
-        (true, false, false, true),
-        (true, false, true, true),
-        (true, true, false, true),
-        (true, true, true, true),
-    ] {
-        assert_eq!(
-            should_skip_cache_store_for_input_race(extra_inputs_racy, guard_enabled, key_too_new,),
-            expected
-        );
+    for extra_inputs_racy in [false, true] {
+        for sources_changed in [false, true] {
+            for guard_enabled in [false, true] {
+                for key_inputs_changed in [false, true] {
+                    assert_eq!(
+                        should_skip_cache_store_for_input_race(
+                            extra_inputs_racy,
+                            sources_changed,
+                            guard_enabled,
+                            key_inputs_changed,
+                        ),
+                        extra_inputs_racy
+                            || sources_changed
+                            || (guard_enabled && key_inputs_changed),
+                        "racy={extra_inputs_racy} sources={sources_changed} \
+                         guard={guard_enabled} changed={key_inputs_changed}"
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -1881,6 +1887,76 @@ fn key_inputs_changed_excuses_skewed_clocks_but_not_real_changes() {
             true,
             std::slice::from_ref(&recorded)
         ));
+    }
+}
+
+/// A key derived after the compile hashed its inputs after rustc read them.
+/// A dep-info source written since the invocation began refuses its store
+/// with the modified-input guard off, unless a fingerprint of that file taken
+/// before the compile still matches it. An extern whose ctime moved, as store
+/// ingest moves it on a filesystem without reflinks, does not.
+#[test]
+fn a_source_written_during_the_compile_refuses_a_key_derived_after_it() {
+    use crate::cache_key::FileFingerprint;
+
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("lib.rs");
+    let module = dir.path().join("a.rs");
+    let rmeta = dir.path().join("libdep.rmeta");
+    std::fs::write(&source, b"mod a;").unwrap();
+    std::fs::write(&module, b"pub fn g() {}").unwrap();
+    std::fs::write(&rmeta, b"metadata").unwrap();
+    let fingerprint = |path: &Path| FileFingerprint::from_path(path).unwrap();
+    let sources: std::collections::HashSet<String> = [&source, &module]
+        .iter()
+        .map(|path| fingerprint(path).path)
+        .collect();
+    let before_writes = [fingerprint(&source), fingerprint(&module)];
+    let start = before_writes
+        .iter()
+        .map(|input| input.mtime_ns.max(input.ctime_ns))
+        .max()
+        .unwrap()
+        + 1;
+    let at = |input: &FileFingerprint, ns: i64| FileFingerprint {
+        mtime_ns: ns,
+        ctime_ns: ns,
+        ..input.clone()
+    };
+
+    // Only the extern moved: nothing the compile read was written.
+    let hashed = [
+        fingerprint(&source),
+        fingerprint(&module),
+        at(&fingerprint(&rmeta), start + 5),
+    ];
+    assert!(sources_written_since(&hashed, &sources, start).is_empty());
+
+    // A written source with no fingerprint from before the compile refuses,
+    // although its own fingerprint matches the file.
+    let hashed = [fingerprint(&source), at(&fingerprint(&module), start + 5)];
+    let written = sources_written_since(&hashed, &sources, start);
+    assert_eq!(written.len(), 1, "{written:?}");
+    assert!(emitted_sources_changed_during_compile(&written, &[]));
+    assert!(sources_written_since(&hashed, &sources, 0).is_empty());
+
+    // A source the hasher recorded nothing for counts as written.
+    let unrecorded = sources_written_since(&[fingerprint(&source)], &sources, start);
+    assert_eq!(unrecorded.len(), 1, "{unrecorded:?}");
+    assert_eq!(unrecorded[0].path, fingerprint(&module).path);
+
+    #[cfg(unix)]
+    {
+        // A fingerprint from before the compile that still matches excuses
+        // it: a skewed clock, not a race.
+        let earlier = [fingerprint(&module)];
+        assert!(!emitted_sources_changed_during_compile(&written, &earlier));
+        // One of another file does not.
+        let other = [fingerprint(&source)];
+        assert!(emitted_sources_changed_during_compile(&written, &other));
+        // A file rewritten since its earlier fingerprint refuses.
+        std::fs::write(&module, b"pub fn g() { 1 }").unwrap();
+        assert!(emitted_sources_changed_during_compile(&written, &earlier));
     }
 }
 
@@ -9617,7 +9693,8 @@ fn hold_scheduler_flight_fixture() {
 
 /// A key derived from the emitted dep-info arms the too-new guard even
 /// with the modified-input guard off: the compile already ran, so an input
-/// written since it started may not match what rustc read.
+/// written since it started may not match what rustc read. The fingerprints
+/// it takes are no evidence from before the compile.
 #[test]
 fn a_key_from_emitted_dep_info_always_arms_the_too_new_guard() {
     if std::process::Command::new("rustc")
@@ -9681,6 +9758,20 @@ fn a_key_from_emitted_dep_info_always_arms_the_too_new_guard() {
     assert!(
         keyed.key_too_new,
         "a source written after the invocation started is too new"
+    );
+    assert!(keyed.guard_inputs.is_empty(), "{:?}", keyed.guard_inputs);
+    let hashed = keyed.hashed_after_compile.expect("a key after the compile");
+    assert!(
+        hashed.iter().any(|input| Path::new(&input.path) == lib),
+        "{hashed:?}"
+    );
+    assert!(
+        keyed
+            .written_sources
+            .iter()
+            .any(|input| Path::new(&input.path) == lib),
+        "the written source is found by its dep-info path: {:?}",
+        keyed.written_sources
     );
 }
 

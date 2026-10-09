@@ -392,10 +392,14 @@ pub struct Config {
     /// registry permissions apply to repositories rather than tag prefixes.
     pub pull_request_prefix: Option<String>,
     /// Opt-in too-new-input guard (kunobi-ninja/kache#324): when on, an
-    /// invocation whose keyed inputs were modified at/after the build started is
-    /// looked up but NOT stored (its hashes are racy relative to what the
-    /// compiler reads). Off by default. Set via `KACHE_MODIFIED_INPUT_GUARD=1`/
-    /// `=true` or `[cache] modified_input_guard`; env wins over the file.
+    /// invocation whose keyed inputs were modified at/after the build started
+    /// is looked up but NOT stored (its hashes are racy relative to what the
+    /// compiler reads). Off by default. A key derived after the compile, from
+    /// the dep-info it emitted, always refuses a source modified since the
+    /// build started; this option extends the check to the other keyed inputs
+    /// and to keys taken before the compile. Set via
+    /// `KACHE_MODIFIED_INPUT_GUARD=1`/`=true` or `[cache] modified_input_guard`;
+    /// env wins over the file.
     pub modified_input_guard: bool,
     /// Input-set predictions: each eligible rustc invocation remembers
     /// the source closure its dep-info pre-pass discovered, and a later build

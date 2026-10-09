@@ -16,9 +16,12 @@
 //!     while that `OUT_DIR` holds the same files,
 //!   - a registry proc macro that compiles against the shared read-only
 //!     `OUT_DIR` does too, with or without a proc macro of its own to
-//!     expand, and keys as the pre-pass would.
+//!     expand, and keys as the pre-pass would,
+//!   - a result keyed from the compile's own dep-info is not stored while an
+//!     input carries a stamp from after the build started.
 
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 use tempfile::TempDir;
 
 mod common;
@@ -109,8 +112,28 @@ fn run_kache_rustc_with(
     verify: Option<&str>,
     invocation: Invocation,
 ) -> std::process::Output {
+    run_kache_compiler_with(
+        &rustc_path(),
+        cache_dir,
+        out_dir,
+        src,
+        predictions,
+        verify,
+        invocation,
+    )
+}
+
+fn run_kache_compiler_with(
+    compiler: &str,
+    cache_dir: &Path,
+    out_dir: &Path,
+    src: &Path,
+    predictions: bool,
+    verify: Option<&str>,
+    invocation: Invocation,
+) -> std::process::Output {
     let mut args: Vec<String> = vec![
-        rustc_path(),
+        compiler.to_string(),
         "--crate-name".into(),
         "kt".into(),
         "--crate-type".into(),
@@ -329,6 +352,160 @@ fn a_stale_record_is_re_derived_from_the_running_compile() {
     assert_eq!(checked.result, "local_hit");
     assert_eq!(checked.dep_info_runs, 1);
     assert_eq!(checked.cache_key, grown.cache_key);
+}
+
+/// The latest raw `kt` event. `kache report` leaves out skipped compiles.
+fn last_raw_event(cache_dir: &Path) -> serde_json::Value {
+    std::fs::read_to_string(cache_dir.join("events.jsonl"))
+        .expect("events.jsonl")
+        .lines()
+        .rev()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|event| event["crate_name"] == "kt")
+        .expect("a kt event")
+}
+
+/// Store entries under the key `event` names.
+fn entries_for(cache_dir: &Path, event: &serde_json::Value) -> i64 {
+    let key = event["cache_key"].as_str().expect("a keyed event");
+    rusqlite::Connection::open(cache_dir.join("index.db"))
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM entries WHERE cache_key = ?1",
+            [key],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+/// The race itself: a source saved after rustc read it and before Kache
+/// hashed it. A `rustc` stand-in runs the real compiler and then rewrites
+/// `a.rs` once, so the artifacts hold the old function while the key is
+/// derived from the new one. Nothing may be stored under that key, and the
+/// next build of the new content must compile instead of restoring the old.
+#[cfg(unix)]
+#[test]
+fn a_source_saved_while_rustc_ran_is_not_restored_for_its_new_content() {
+    use std::os::unix::fs::PermissionsExt;
+
+    build_kache();
+    let (work, cache, out, src) = fixture();
+    let (cache_dir, out_dir) = (cache.path(), out.path());
+    let module = work.path().join("a.rs");
+    let sysroot = std::process::Command::new(rustc_path())
+        .args(["--print", "sysroot"])
+        .output()
+        .expect("rustc --print sysroot");
+    let real = PathBuf::from(String::from_utf8(sysroot.stdout).unwrap().trim())
+        .join("bin")
+        .join("rustc");
+    let armed = work.path().join("armed");
+    let bin = work.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let stand_in = bin.join("rustc");
+    std::fs::write(
+        &stand_in,
+        format!(
+            "#!/bin/sh\n\"{real}\" \"$@\"\nstatus=$?\n\
+             case \" $* \" in *\" --crate-name kt \"*)\n\
+             if [ -e \"{armed}\" ]; then rm -f \"{armed}\"; \
+             printf 'pub fn g() -> u32 {{ 42 }}\\n' > \"{module}\"; fi ;;\nesac\n\
+             exit $status\n",
+            real = real.display(),
+            armed = armed.display(),
+            module = module.display(),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&stand_in, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let compiler = stand_in.to_str().unwrap();
+
+    std::fs::write(&armed, b"").unwrap();
+    run_kache_compiler_with(
+        compiler,
+        cache_dir,
+        out_dir,
+        &src,
+        true,
+        None,
+        Invocation::Cargo,
+    );
+    assert!(!armed.exists(), "the stand-in rewrote a.rs after compiling");
+    assert_eq!(
+        std::fs::read_to_string(&module).unwrap(),
+        "pub fn g() -> u32 { 42 }\n"
+    );
+    let raced = last_raw_event(cache_dir);
+    assert_eq!(raced["result"], "skipped", "{raced}");
+    assert_eq!(raced["skip_reason"], "inputs-changed", "{raced}");
+    assert_eq!(entries_for(cache_dir, &raced), 0);
+
+    // A fresh target with the new content compiles it.
+    let fresh = TempDir::new().unwrap();
+    run_kache_compiler_with(
+        compiler,
+        cache_dir,
+        fresh.path(),
+        &src,
+        true,
+        None,
+        Invocation::Cargo,
+    );
+    let next = last_raw_event(cache_dir);
+    assert_eq!(next["result"], "miss", "{next}");
+    assert_eq!(next["cache_key"], raced["cache_key"], "{next}");
+}
+
+/// A key derived after the compile hashes its inputs after rustc read them,
+/// so an input stamped at or after the build's start leaves the result
+/// unstored, with the modified-input guard off. A future stamp stands in for
+/// a save made while rustc ran. Both ways a unit compiles before its key
+/// refuse: with no record, and when a predicted key missed.
+#[test]
+fn a_too_new_input_leaves_a_compile_first_result_unstored() {
+    build_kache();
+    let (work, cache, out, src) = fixture();
+    let (cache_dir, out_dir) = (cache.path(), out.path());
+    let module = work.path().join("a.rs");
+    let stamp = |at: SystemTime| {
+        std::fs::File::options()
+            .write(true)
+            .open(&module)
+            .unwrap()
+            .set_modified(at)
+            .unwrap();
+    };
+    let hour = Duration::from_secs(3600);
+
+    stamp(SystemTime::now() + hour);
+    run_kache_rustc_as_cargo(cache_dir, out_dir, &src, true);
+    let cold = last_raw_event(cache_dir);
+    assert_eq!(cold["result"], "skipped", "{cold}");
+    assert_eq!(cold["skip_reason"], "inputs-changed", "{cold}");
+    assert_eq!(cold["dep_info_runs"], 0, "compiled before keying: {cold}");
+    assert!(
+        out_dir.join("libkt.rlib").is_file(),
+        "the compile succeeded"
+    );
+    assert_eq!(entries_for(cache_dir, &cold), 0);
+
+    // Stamped in the past, the same build stores and records its closure.
+    stamp(SystemTime::now() - hour);
+    run_kache_rustc_as_cargo(cache_dir, out_dir, &src, true);
+    let stored = last_raw_event(cache_dir);
+    assert_eq!(stored["result"], "miss", "{stored}");
+    assert_eq!(entries_for(cache_dir, &stored), 1);
+
+    // An edit misses the predicted key, and the compile re-derives it.
+    std::fs::write(&module, b"pub fn g() -> u32 { 40 }\n").unwrap();
+    stamp(SystemTime::now() + hour);
+    run_kache_rustc_as_cargo(cache_dir, out_dir, &src, true);
+    let rederived = last_raw_event(cache_dir);
+    assert_eq!(rederived["result"], "skipped", "{rederived}");
+    assert_eq!(rederived["skip_reason"], "inputs-changed", "{rederived}");
+    assert_eq!(rederived["dep_info_runs"], 0, "{rederived}");
+    assert_ne!(rederived["cache_key"], stored["cache_key"]);
+    assert_eq!(entries_for(cache_dir, &rederived), 0);
 }
 
 /// A shadowing sibling that rustc rejects must never restore: the

@@ -256,26 +256,44 @@ def contention(projects):
             *counters,
             "Medians per batch. Waits add up overlapping events across jobs, so they are not wall-clock savings.",
         ]
-    duplicates = []
-    for project in measured:
+    duplicates = duplicate_compiles_by_reason(measured)
+    if duplicates:
+        body += ["", "| Project | Arm | Phase | Skip reason | Extra compiles | Batches | Most repeated crates |",
+                 "| --- | --- | --- | --- | ---: | ---: | --- |",
+                 *duplicates,
+                 "Extra compiles are summed over the batches. Unknown means the wrapper did not report a skip "
+                 "reason, and not skipped means both compiles finished without one. Every key is in the subject's "
+                 "perf-gate artifact, in contention/<batch>/events.jsonl."]
+    return details("All tools, contention", body)
+
+
+def duplicate_compiles_by_reason(projects, crates_shown=5):
+    """One row per project, arm, phase and skip reason, so a reason shows up once."""
+    groups = {}
+    for project in projects:
         for record in project.get("contention", {}).get("records", []):
             for entry in record.get("events", {}).get("duplicate_compiles", []):
-                reasons = ", ".join(
-                    f"{reason} ({n})" for reason, n in sorted(entry["skip_reasons"].items())
-                ) or "—"
-                cells = [project["name"], record["arm"], record["phase"],
-                         str(record["sample"]), entry["crate_name"],
-                         entry["cache_key"][:16], str(entry["compiles"]), reasons]
-                duplicates.append("| " + " | ".join(
-                    html.escape(cell).replace("|", "&#124;").replace("\n", " ")
-                    for cell in cells
-                ) + " |")
-    if duplicates:
-        body += ["", "| Project | Arm | Phase | Sample | Crate | Key | Compiles | Skip reasons |",
-                 "| --- | --- | --- | ---: | --- | --- | ---: | --- |",
-                 *duplicates,
-                 "Counts describe each batch. Unknown means the wrapper did not report a skip reason."]
-    return details("All tools, contention", body)
+                reasons = entry["skip_reasons"] or {"not skipped": entry["compiles"] - 1}
+                for reason, extra in reasons.items():
+                    group = groups.setdefault(
+                        (project["name"], record["arm"], record["phase"], reason),
+                        {"extra": 0, "batches": set(), "crates": {}},
+                    )
+                    group["extra"] += extra
+                    group["batches"].add(record["sample"])
+                    crates = group["crates"]
+                    crates[entry["crate_name"]] = crates.get(entry["crate_name"], 0) + extra
+    rows = []
+    for (name, arm, phase, reason), group in sorted(groups.items()):
+        crates = sorted(group["crates"].items(), key=lambda item: (-item[1], item[0]))
+        shown = ", ".join(f"{crate} ({extra})" for crate, extra in crates[:crates_shown])
+        if len(crates) > crates_shown:
+            shown += f", {len(crates) - crates_shown} more"
+        cells = [name, arm, phase, reason, str(group["extra"]), str(len(group["batches"])), shown]
+        rows.append("| " + " | ".join(
+            html.escape(cell).replace("|", "&#124;").replace("\n", " ") for cell in cells
+        ) + " |")
+    return rows
 
 
 def disk_use(projects):

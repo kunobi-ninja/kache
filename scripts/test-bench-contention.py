@@ -451,13 +451,36 @@ else:
             "contention": {"records": [{"arm": "head", "phase": "cold", "sample": 0, "events": aggregate}]},
         }
         report = "\n".join(contention([project]))
-        self.assertIn("| demo | head | cold | 0 | lib | abc123 | 3 |", report)
-        self.assertIn("peer-already-committed (1), unknown (1)", report)
+        self.assertIn("| demo | head | cold | peer-already-committed | 1 | 1 | lib (1) |", report)
+        self.assertIn("| demo | head | cold | unknown | 1 | 1 | lib (1) |", report)
+        self.assertNotIn("abc123", report)
         aggregate["duplicate_compiles"][0]["skip_reasons"] = {"bad | reason\n<text>": 1}
         report = "\n".join(contention([project]))
         self.assertIn("bad &#124; reason &lt;text&gt;", report)
         project["contention"]["records"][0]["events"].pop("duplicate_compiles")
-        self.assertNotIn("Skip reasons", "\n".join(contention([project])))
+        self.assertNotIn("Skip reason", "\n".join(contention([project])))
+
+    def test_duplicate_compiles_group_by_reason_across_batches_and_crates(self):
+        from bench.report import duplicate_compiles_by_reason
+
+        def entry(crate, reasons, compiles=2):
+            return {"cache_key": crate * 4, "crate_name": crate, "compiles": compiles,
+                    "results": {}, "skip_reasons": reasons}
+
+        def record(sample, entries, arm="head", phase="cold"):
+            return {"arm": arm, "phase": phase, "sample": sample, "events": {"duplicate_compiles": entries}}
+
+        project = {"name": "demo", "contention": {"records": [
+            record(0, [entry("a", {"peer-already-committed": 1}), entry("b", {"peer-already-committed": 1})]),
+            record(1, [entry("a", {"peer-already-committed": 1}), entry("c", {}, compiles=3)]),
+            record(0, [entry("a", {"peer-already-committed": 1})], arm="base"),
+        ]}}
+        rows = duplicate_compiles_by_reason([project], crates_shown=1)
+        self.assertEqual(rows, [
+            "| demo | base | cold | peer-already-committed | 1 | 1 | a (1) |",
+            "| demo | head | cold | not skipped | 2 | 1 | c (2) |",
+            "| demo | head | cold | peer-already-committed | 3 | 2 | a (2), 1 more |",
+        ])
 
     def test_arms_share_all_controls_except_scheduler_and_binary(self):
         args = SimpleNamespace(

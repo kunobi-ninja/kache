@@ -4602,10 +4602,16 @@ mod tests {
             Some(digest.as_str())
         );
         std::fs::write(out.join("b.o"), "b").unwrap();
-        assert_eq!(
-            tree_stamp(&root, &excluded, 100).unwrap().digest,
-            stamp.digest
-        );
+        // Armed, a fresh hasher reads each file through the hook.
+        let mut fresh = crate::cache_key::FileHasher::new();
+        fresh.arm_too_new_guard(1, 0);
+        let reads = std::rc::Rc::new(std::cell::Cell::new(0));
+        let counted = reads.clone();
+        crate::cache_key::set_before_read(Some(Box::new(move |_| counted.set(counted.get() + 1))));
+        let again = input_state(&root, &excluded, &fresh, &mut budget, 0);
+        crate::cache_key::set_before_read(None);
+        assert_eq!(again.unwrap(), digest);
+        assert_eq!(reads.get(), 0, "the memo answers without a read");
         unsafe { std::env::remove_var("KACHE_CACHE_DIR") };
     }
 

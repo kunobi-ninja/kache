@@ -570,3 +570,144 @@ fn the_modified_input_guard_refuses_a_save_after_a_key_taken_first() {
     assert_eq!(lib_event["result"], "miss", "event: {lib_event:#}");
     assert_eq!(printed, "1", "the revert compiled");
 }
+
+/// A rustc that, before each compile of `$FLIGHT_CRATE` (not the dep-info
+/// pre-pass), appends to `$FLIGHT_LOG` what `$FLIGHT_PROBE` prints for
+/// `$FLIGHT_DIR`. Every other unit of the fixture depends on that crate, so
+/// no other wrapper runs then.
+#[cfg(unix)]
+const FLIGHT_RUSTC: &str = r#"#!/bin/sh
+case " $* " in
+  *" --crate-name $FLIGHT_CRATE "*)
+    case " $* " in
+      *" --emit=dep-info,"*) "$FLIGHT_PROBE" "$FLIGHT_DIR" >> "$FLIGHT_LOG" ;;
+    esac
+    ;;
+esac
+exec "$REAL_RUSTC" "$@"
+"#;
+
+/// Prints how many files in the directory it is given another process holds
+/// locked, as a peer joining one of those discovery flights finds them.
+#[cfg(unix)]
+const FLIGHT_PROBE: &str = r#"fn main() {
+    let dir = std::env::args().nth(1).expect("a directory");
+    let held = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(entry.path())
+                .is_ok_and(|file| file.try_lock().is_err())
+        })
+        .count();
+    println!("{held}");
+}
+"#;
+
+/// A peer in another checkout that finds no record for a unit waits on the
+/// unit's discovery flight for the entry and the record its holder leaves.
+/// A seed leaves neither, so it releases the flight before it compiles,
+/// while a compile whose result is stored keeps holding it.
+#[cfg(unix)]
+#[test]
+fn a_seed_releases_the_discovery_flight_before_it_compiles() {
+    use std::os::unix::fs::PermissionsExt;
+    let checkout = tempfile::tempdir().unwrap();
+    let project = checkout_path(checkout.path());
+    let cache = tempfile::tempdir().unwrap();
+    let tools = tempfile::tempdir().unwrap();
+    let target = project.join("target");
+    create_workspace(&project);
+    let probe = tools.path().join("probe");
+    let probe_source = tools.path().join("probe.rs");
+    fs::write(&probe_source, FLIGHT_PROBE).unwrap();
+    let compiled = Command::new(real_rustc())
+        .args(["--edition", "2021", "-o"])
+        .arg(&probe)
+        .arg(&probe_source)
+        .output()
+        .expect("failed to compile the flight probe");
+    assert!(
+        compiled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    let shim = tools.path().join("rustc");
+    fs::write(&shim, FLIGHT_RUSTC).unwrap();
+    fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).unwrap();
+    let log = tools.path().join("held");
+    let future = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+        + 3_600;
+    // This build's event for the library, and how many flights another
+    // process held when the library's compile started.
+    let build = |mtime: Option<i64>, answer: u64, env: &[(&str, &str)]| {
+        let source = project.join("lib/src/lib.rs");
+        fs::write(&source, format!("pub fn answer() -> u64 {{ {answer} }}\n")).unwrap();
+        if let Some(mtime) = mtime {
+            filetime::set_file_mtime(&source, FileTime::from_unix_time(mtime, 0)).unwrap();
+        }
+        settle_writes(&[&project]);
+        let before = crate_events(cache.path(), "adaptive_lib").len();
+        let probed = fs::read_to_string(&log).unwrap_or_default().lines().count();
+        let output = build_command(&project, cache.path(), &target, "adaptive-app")
+            .env("RUSTC", &shim)
+            .env("REAL_RUSTC", real_rustc())
+            .env("FLIGHT_CRATE", "adaptive_lib")
+            .env("FLIGHT_PROBE", &probe)
+            .env("FLIGHT_DIR", cache.path().join("scheduler/discovery"))
+            .env("FLIGHT_LOG", &log)
+            .envs(env.iter().copied())
+            .output()
+            .expect("failed to build the workspace fixture");
+        assert!(
+            output.status.success(),
+            "workspace build failed for variant {answer}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+        let events = crate_events(cache.path(), "adaptive_lib");
+        assert_eq!(events.len(), before + 1, "library events: {events:#?}");
+        let held: Vec<String> = fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .skip(probed)
+            .map(String::from)
+            .collect();
+        assert_eq!(held.len(), 1, "one compile of the library: {held:?}");
+        (events[before].clone(), held[0].clone())
+    };
+
+    // No policy state: the library holds the flight it found no record
+    // under while it compiles before its key, and stores the result.
+    let (lib, held) = build(None, 1, &[]);
+    assert_eq!(lib["result"], "miss", "event: {lib:#}");
+    assert_eq!(lib["dep_info_runs"], 0, "event: {lib:#}");
+    assert_eq!(held, "1", "a compile before the key holds the flight");
+
+    // The edit voids the record, so the key comes from the pre-pass under
+    // the flight, and then the library seeds.
+    let (lib, held) = build(Some(future), 2, &[]);
+    assert_passthrough(&lib, "adaptive seed");
+    assert_eq!(lib["dep_info_runs"], 1, "event: {lib:#}");
+    assert_eq!(held, "0", "the seed released the flight");
+
+    // With no lane to seed and no compile before the key, the library
+    // compiles after both lookups miss, and stores the result.
+    let (lib, held) = build(
+        Some(future + 1),
+        3,
+        &[
+            ("KACHE_ADAPTIVE_INCREMENTAL", "0"),
+            ("KACHE_DEFERRED_DISCOVERY", "0"),
+        ],
+    );
+    assert_eq!(lib["result"], "miss", "event: {lib:#}");
+    assert_eq!(lib["dep_info_runs"], 1, "event: {lib:#}");
+    assert_eq!(held, "1", "a keyed miss holds the flight");
+}

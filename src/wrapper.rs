@@ -4070,7 +4070,7 @@ fn run_parsed_rustc(
         mut cache_key,
         deferred,
         stop_on_hit,
-        discovery_flight: _discovery_flight,
+        discovery_flight,
         predicted,
         outputs: mut key_outputs,
         mut key_ms,
@@ -4099,7 +4099,7 @@ fn run_parsed_rustc(
     };
     if deferred {
         // No record and nowhere else the entry could be: compile now, then
-        // key from what rustc emitted. `_discovery_flight` stays held across
+        // key from what rustc emitted. `discovery_flight` stays held across
         // the recursion so peers wait for this compile.
         tracing::debug!("no closure record for {crate_name}; compiling before keying");
         return compile_before_key(
@@ -4301,6 +4301,10 @@ fn run_parsed_rustc(
         if let (Some(unit), Some(fields)) = (adaptive_unit.as_ref(), adaptive_key_fields.as_ref())
             && let Some(lease) = unit.try_seed(&cache_key, fields)
         {
+            // A seed stores no entry and records no closure, so a peer
+            // waiting on this unit's discovery flight would wait for nothing.
+            // Release it before the seed waits for a permit and compiles.
+            drop(discovery_flight);
             return adaptive_incremental_with_event(
                 config,
                 args,
@@ -5933,6 +5937,10 @@ struct ComputedKey {
     /// With `deferred`: an entry could exist, so the compile keys from its
     /// dep-info as soon as rustc writes it and stops on a hit.
     stop_on_hit: bool,
+    /// The unit's discovery flight, when this computation joined one. The
+    /// invocation holds it until it has stored its entry and recorded its
+    /// closure, which peers discovering the same unit wait for. A seed
+    /// leaves neither, so it releases the flight before it compiles.
     discovery_flight: Option<crate::store::StoreLock>,
     /// Did this key come from a recorded closure rather than the pre-pass?
     /// The caller owes it a re-derivation before the key may reach anything

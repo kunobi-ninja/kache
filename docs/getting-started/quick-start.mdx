@@ -111,7 +111,7 @@ For Rust documentation, follow the [rustdoc setup](/docs/getting-started/rustdoc
 
 Kache caches eligible Rust executables by default on Linux and macOS: binaries, test binaries and build scripts, which Cargo compiles as executables. The default is off on Windows because executable debug information still refers to an external PDB path, so all three compile without the cache there. Override the policy with `KACHE_CACHE_EXECUTABLES` or `cache.cache_executables`.
 
-Normal artifact-cached builds strip Cargo's incremental directory argument. Adaptive incremental mode, enabled by default, notices a Cargo unit you are editing (a build of it, then a miss in the same target where only its sources or dependencies changed) and gives it isolated incremental state. After 15 minutes without a build of that unit, Kache checks the cache again before using it. Use `KACHE_ADAPTIVE_INCREMENTAL=0` to turn that off or `KACHE_PRESERVE_INCREMENTAL=1` to force the incremental path for diagnostics.
+Normal artifact-cached builds strip Cargo's incremental directory argument. Adaptive incremental mode, enabled by default, notices a Cargo unit you are editing (a build of it, then a miss in the same target where only its sources or dependencies changed) and gives it isolated incremental state. After 15 minutes without a build of that unit, Kache checks the cache again before using it. A compile error keeps that state, so the fix still compiles incrementally, as it does with plain Cargo. Kache discards the state when rustc crashes or reports a problem with its incremental files, and after an interrupted build. Use `KACHE_ADAPTIVE_INCREMENTAL=0` to turn that off or `KACHE_PRESERVE_INCREMENTAL=1` to force the incremental path for diagnostics.
 
 ## Temporarily disable caching
 

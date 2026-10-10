@@ -36,6 +36,8 @@ To skip the learning step for every crate Cargo builds incrementally, normally y
 KACHE_INCREMENTAL_CRATES=my_crate cargo mutants
 ```
 
+A mutant that fails to compile keeps the crate's incremental state, so the next mutant still compiles incrementally.
+
 ## What to expect
 
 - The baseline build in each copy can reuse entries your ordinary `cargo test` runs stored, as long as the flags match.

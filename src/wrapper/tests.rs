@@ -8559,6 +8559,51 @@ fn bundle_audit_credits_only_what_the_rlib_carries() {
     );
 }
 
+#[test]
+fn bundle_audit_deduplicates_resolved_archives() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let foo = out.join("libfoo.a");
+    let bar = out.join("libbar.a");
+    std::fs::write(&foo, ar_archive(&["util.o"])).unwrap();
+    std::fs::write(&bar, ar_archive(&["util.o"])).unwrap();
+    let alias = out.join("../out/libfoo.a");
+    let lib = rustc_args(&["rustc", "src/lib.rs", "--crate-type", "lib"]);
+    let artifacts = rlib_artifacts(
+        dir.path(),
+        &[("lib.rmeta", b"xx"), ("util.o", b"xx"), ("util.o", b"xx")],
+    );
+    for duplicate in [foo.clone(), alias] {
+        let native = keyed_native(
+            vec![foo.clone()],
+            vec![(foo.clone(), false), (duplicate, false)],
+            vec![out.clone()],
+        );
+        assert_eq!(bundle_credits(&native.bundled).unwrap(), ["util.o"]);
+        assert_eq!(
+            unaudited_native_bundle(&lib, &artifacts, &native).unwrap(),
+            Some("util.o".to_string()),
+            "one archive cannot cover another archive's same-named member"
+        );
+    }
+    let distinct = keyed_native(
+        vec![foo.clone(), bar.clone()],
+        vec![(foo.clone(), false), (bar, false)],
+        vec![out],
+    );
+    assert_eq!(
+        bundle_credits(&distinct.bundled).unwrap(),
+        ["util.o", "util.o"]
+    );
+    assert_eq!(
+        unaudited_native_bundle(&lib, &artifacts, &distinct).unwrap(),
+        None
+    );
+    let packed = keyed_native(vec![], vec![(foo.clone(), true), (foo, true)], vec![]);
+    assert_eq!(bundle_credits(&packed.bundled).unwrap(), ["libfoo.a"]);
+}
+
 /// rustc writes `raw-dylib` imports into the rlib as import-library
 /// members named after the DLL; an import library in the `-L` dirs holds
 /// members of the same names, and neither is a bundled archive.

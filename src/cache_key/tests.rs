@@ -7439,12 +7439,15 @@ fn native_dylib_content_does_not_change_key() {
     let libdir = dir.path().join("out");
     std::fs::create_dir_all(&libdir).unwrap();
     let lib = libdir.join("libfoo.so");
-    std::fs::write(&lib, b"so v1").unwrap();
+    let mut bytes = apple_install_name::tests::dylib("@rpath/libfoo.so", false, true);
+    bytes.extend_from_slice(b"code v1");
+    std::fs::write(&lib, &bytes).unwrap();
     let search = format!("native={}", libdir.display());
     let flags = ["-L", search.as_str(), "-l", "dylib=foo"];
 
     let k1 = key_of(&flag_base(&source, &flags));
-    std::fs::write(&lib, b"so v2 changed").unwrap();
+    bytes.extend_from_slice(b"changed code");
+    std::fs::write(&lib, &bytes).unwrap();
     let k2 = key_of(&flag_base(&source, &flags));
     assert_eq!(k1, k2, "a dynamic lib's content must not key the consumer");
 }
@@ -7673,6 +7676,233 @@ fn fold_inputs(
         &FileHasher::new(),
     )?;
     Ok((hasher.finalize().to_hex().to_string(), keyed))
+}
+
+#[test]
+fn apple_dynamic_install_names_bind_link_keys() {
+    let tree = native_tree();
+    let normalizer = PathNormalizer::empty();
+    let context = unix_context("aarch64-apple-darwin", &normalizer);
+    let stub = tree.out.join("libfoo.tbd");
+    for crate_type in ["bin", "test", "dylib", "cdylib", "proc-macro"] {
+        // Downstream argv can omit -l: the dependency's rlib carries it.
+        for extra in [
+            vec![],
+            vec!["-lfoo"],
+            vec!["-ldylib=foo"],
+            vec!["-ldylib=foo", "-Ctarget-feature=+crt-static"],
+        ] {
+            let argv = unit_args(crate_type, &tree.deps, &extra);
+            std::fs::write(
+                &stub,
+                "--- !tapi-tbd\ninstall-name: '/target/one/libfoo.dylib'\n...\n",
+            )
+            .unwrap();
+            let before = fold_inputs(&argv, std::slice::from_ref(&tree.out), &[], &context)
+                .unwrap()
+                .0;
+            std::fs::write(
+                &stub,
+                "--- !tapi-tbd\ninstall-name: '/target/two/libfoo.dylib'\n...\n",
+            )
+            .unwrap();
+            let after = fold_inputs(&argv, std::slice::from_ref(&tree.out), &[], &context)
+                .unwrap()
+                .0;
+            assert_ne!(
+                before, after,
+                "{crate_type} {extra:?}: install names reach the linked output"
+            );
+        }
+    }
+}
+
+#[test]
+fn apple_dylib_and_framework_install_names_bind_link_keys() {
+    let tree = native_tree();
+    let normalizer = PathNormalizer::empty();
+    let context = unix_context("aarch64-apple-darwin", &normalizer);
+    let bundle = tree.out.join("Foo.framework");
+    std::fs::create_dir(&bundle).unwrap();
+    for file in [tree.out.join("libfoo.dylib"), bundle.join("Foo")] {
+        let framework = file.parent() == Some(bundle.as_path());
+        let native = if framework {
+            vec![]
+        } else {
+            vec![tree.out.clone()]
+        };
+        let frameworks = if framework {
+            vec![tree.out.clone()]
+        } else {
+            vec![]
+        };
+        let argv = unit_args("bin", &tree.deps, &[]);
+        let fold = || {
+            fold_inputs(&argv, &native, &frameworks, &context)
+                .unwrap()
+                .0
+        };
+        std::fs::write(
+            &file,
+            apple_install_name::tests::dylib("/target/one/libfoo.dylib", false, true),
+        )
+        .unwrap();
+        let before = fold();
+        std::fs::write(
+            &file,
+            apple_install_name::tests::dylib("/target/two/libfoo.dylib", false, true),
+        )
+        .unwrap();
+        assert_ne!(before, fold(), "{}", file.display());
+        std::fs::remove_file(file).unwrap();
+    }
+}
+
+#[test]
+fn apple_dynamic_scan_ignores_non_library_entries() {
+    let tree = native_tree();
+    let normalizer = PathNormalizer::empty();
+    let context = unix_context("aarch64-apple-darwin", &normalizer);
+    let argv = unit_args("bin", &tree.deps, &[]);
+    let fold = || {
+        fold_inputs(&argv, std::slice::from_ref(&tree.out), &[], &context)
+            .unwrap()
+            .0
+    };
+    let before = fold();
+    std::fs::write(tree.out.join("README.txt"), "native library build notes").unwrap();
+    assert_eq!(before, fold());
+    std::fs::create_dir(tree.out.join("generated.dylib")).unwrap();
+    assert_eq!(before, fold());
+}
+
+#[test]
+fn apple_dynamic_scan_preserves_system_and_nonlinking_units() {
+    let tree = native_tree();
+    let normalizer = PathNormalizer::empty();
+    let context = unix_context("aarch64-apple-darwin", &normalizer);
+    let stub = tree.out.join("libfoo.tbd");
+    std::fs::write(stub, "unsupported stub").unwrap();
+    for crate_type in ["rlib", "staticlib"] {
+        let argv = unit_args(crate_type, &tree.deps, &[]);
+        assert!(fold_inputs(&argv, std::slice::from_ref(&tree.out), &[], &context).is_ok());
+    }
+    let system = NativeLinkContext {
+        system_dirs: vec![resolved_path(&tree.out)],
+        ..unix_context("aarch64-apple-darwin", &normalizer)
+    };
+    let argv = unit_args("bin", &tree.deps, &[]);
+    assert!(fold_inputs(&argv, std::slice::from_ref(&tree.out), &[], &system).is_ok());
+    assert!(fold_inputs(&argv, std::slice::from_ref(&tree.out), &[], &context).is_err());
+}
+
+#[test]
+fn apple_relative_install_names_share_across_directories() {
+    let tree = native_tree();
+    let normalizer = PathNormalizer::empty();
+    let context = unix_context("aarch64-apple-darwin", &normalizer);
+    let argv = unit_args("bin", &tree.deps, &[]);
+    for name in [
+        "@rpath/libfoo.dylib",
+        "@loader_path/libfoo.dylib",
+        "@executable_path/libfoo.dylib",
+    ] {
+        let stub = format!("--- !tapi-tbd\ninstall-name: '{name}'\n...\n");
+        std::fs::write(tree.out.join("libfoo.tbd"), &stub).unwrap();
+        std::fs::write(tree.elsewhere.join("libfoo.tbd"), &stub).unwrap();
+        assert_eq!(
+            fold_inputs(&argv, std::slice::from_ref(&tree.out), &[], &context)
+                .unwrap()
+                .0,
+            fold_inputs(&argv, std::slice::from_ref(&tree.elsewhere), &[], &context)
+                .unwrap()
+                .0
+        );
+    }
+}
+
+#[test]
+fn apple_verbatim_extensionless_dylib_install_name_is_keyed() {
+    let tree = native_tree();
+    let normalizer = PathNormalizer::empty();
+    let context = unix_context("aarch64-apple-darwin", &normalizer);
+    let path = tree.out.join("foo");
+    for flag in ["-ldylib:+verbatim=foo", "-Clink-arg=-l:foo"] {
+        let argv = unit_args("bin", &tree.deps, &[flag]);
+        std::fs::write(
+            &path,
+            apple_install_name::tests::dylib("/target/one/foo", false, true),
+        )
+        .unwrap();
+        let before = fold_inputs(&argv, std::slice::from_ref(&tree.out), &[], &context)
+            .unwrap()
+            .0;
+        std::fs::write(
+            &path,
+            apple_install_name::tests::dylib("/target/two/foo", false, true),
+        )
+        .unwrap();
+        assert_ne!(
+            before,
+            fold_inputs(&argv, std::slice::from_ref(&tree.out), &[], &context)
+                .unwrap()
+                .0
+        );
+    }
+}
+
+#[test]
+fn apple_verbatim_system_dylib_install_name_is_not_keyed() {
+    let tree = native_tree();
+    let normalizer = PathNormalizer::empty();
+    let context = NativeLinkContext {
+        system_dirs: vec![resolved_path(&tree.out)],
+        ..unix_context("aarch64-apple-darwin", &normalizer)
+    };
+    let path = tree.out.join("foo");
+    for flag in ["-ldylib:+verbatim=foo", "-Clink-arg=-l:foo"] {
+        let argv = unit_args("bin", &tree.deps, &[flag]);
+        let fold = || {
+            fold_inputs(&argv, std::slice::from_ref(&tree.out), &[], &context)
+                .unwrap()
+                .0
+        };
+        std::fs::write(
+            &path,
+            apple_install_name::tests::dylib("/system/one/foo", false, true),
+        )
+        .unwrap();
+        let before = fold();
+        std::fs::write(
+            &path,
+            apple_install_name::tests::dylib("/system/two/foo", false, true),
+        )
+        .unwrap();
+        assert_eq!(before, fold(), "{flag}");
+    }
+}
+
+#[cfg(not(windows))]
+#[test]
+fn linux_embedded_rpath_is_keyed_raw() {
+    let _lock = key_test_lock();
+    let key = |root: &str| {
+        let normalizer = PathNormalizer::empty().with_target_dir(Some(Path::new(root)));
+        let path = format!("{root}/native");
+        assert_eq!(normalizer.normalize(&path), "<TARGET>/native");
+        let mut args = RustcArgs::parse(&unit_args(
+            "bin",
+            Path::new("/out"),
+            &[
+                "--target=x86_64-unknown-linux-gnu",
+                &format!("-Clink-arg=-Wl,-rpath,{path}"),
+            ],
+        ))
+        .unwrap();
+        args.source_file = None;
+        compute_cache_key(&args, &FileHasher::new(), &normalizer, &KeyEnv::default()).unwrap()
+    };
+    assert_ne!(key("/one"), key("/two"));
 }
 
 /// Whether rewriting `file` with new `ar` bytes changes the fold.
@@ -8737,6 +8967,41 @@ fn rlib_bundle_follows_bundle_and_packing() {
     assert_eq!(rlib_bundle(&spec("static:-bundle=foo"), true, false), None);
     assert_eq!(rlib_bundle(&spec("static=foo"), false, false), None);
     assert_eq!(rlib_bundle(&spec("foo"), true, false), None);
+}
+
+#[test]
+fn rlib_bundle_uses_one_effective_spec_per_library() {
+    let tree = native_tree();
+    let archive = tree.elsewhere.join("libfoo.a");
+    std::fs::write(&archive, b"archive").unwrap();
+    let normalizer = PathNormalizer::empty();
+    let context = unix_context("x86_64-unknown-linux-gnu", &normalizer);
+    let dirs = [tree.elsewhere.clone()];
+    for (specs, packed) in [
+        (vec!["static=foo"], Some(false)),
+        (vec!["static=foo", "static=foo"], Some(false)),
+        (vec!["static=foo", "dylib=foo"], None),
+        (vec!["dylib=foo", "static=foo"], Some(false)),
+        (vec!["static=foo", "foo"], Some(false)),
+        (vec!["static=foo", "static:-bundle=foo"], None),
+        (
+            vec!["static:-bundle=foo", "static:+bundle=foo"],
+            Some(false),
+        ),
+        (vec!["static=foo", "static:+whole-archive=foo"], Some(true)),
+    ] {
+        let extra: Vec<&str> = specs.iter().flat_map(|spec| ["-l", *spec]).collect();
+        let (_, native) =
+            fold_inputs(&unit_args("rlib", &tree.deps, &extra), &dirs, &[], &context).unwrap();
+        let expected: Vec<BundledArchive> = packed
+            .map(|packed| BundledArchive {
+                path: archive.clone(),
+                packed,
+            })
+            .into_iter()
+            .collect();
+        assert_eq!(native.bundled, expected, "{specs:?}");
+    }
 }
 
 /// The bundle-audit marker keys rlibs with a native dir apart from

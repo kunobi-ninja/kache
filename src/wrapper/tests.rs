@@ -6380,6 +6380,9 @@ fn setup_nvcc_case(
         m_exit_code,
     );
     let argv = nvcc_compile_argv(&nvcc, &work, &[]);
+    // A key-first nvcc store is refused for an input stamped within a stamp
+    // window of the start, a coarse clock tick on Linux.
+    crate::test_support::settle_writes(&[&work]);
     (work, nvcc, count, argv)
 }
 
@@ -6657,6 +6660,7 @@ fn nvcc_remote_absent_daemon_falls_through_to_compile() {
         0,
         0,
     );
+    crate::test_support::settle_writes(&[&work]);
 
     let _isolated = isolate_daemon_autostart(dir.path());
     let mut config = test_config(dir.path().join("cache"));
@@ -6868,6 +6872,7 @@ fn nvcc_try_remote_hit_restores_on_found() {
         0,
         0,
     );
+    crate::test_support::settle_writes(&[&work]);
 
     let mut config = test_config(dir.path().join("cache"));
     config.remote = Some(crate::config::RemoteConfig::test_s3("bucket", "artifacts"));
@@ -6983,6 +6988,7 @@ fn nvcc_header_and_flag_edits_bust_the_key() {
         0,
         0,
     );
+    crate::test_support::settle_writes(&[&work]);
 
     let config = test_config(dir.path().join("cache"));
     let _daemon = RemoteCheckReplyDaemon::spawn(config.socket_path(), false);
@@ -6998,6 +7004,7 @@ fn nvcc_header_and_flag_edits_bust_the_key() {
     assert_eq!(std::fs::read_to_string(&count).unwrap(), "run\n");
 
     std::fs::write(work.join("inc").join("h.h"), "#pragma once\n// edit\n").unwrap();
+    crate::test_support::settle_writes(&[&work]);
     assert_eq!(run_nvcc(&config, &argv).unwrap(), 0);
     assert_eq!(
         std::fs::read_to_string(&count).unwrap(),
@@ -7094,6 +7101,7 @@ fn nvcc_admission_skipped_when_too_cheap() {
         0,
         0,
     );
+    crate::test_support::settle_writes(&[&work]);
 
     let mut config = test_config(dir.path().join("cache"));
     config.min_store_compile_ms = u64::MAX;
@@ -7221,6 +7229,7 @@ fn nvcc_restore_fails_closed_on_missing_blob() {
         0,
         0,
     );
+    crate::test_support::settle_writes(&[&work]);
 
     let config = test_config(dir.path().join("cache"));
     let _daemon = RemoteCheckReplyDaemon::spawn(config.socket_path(), false);

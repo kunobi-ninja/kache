@@ -8,10 +8,11 @@
 //! directory without the learning step. Every decision is target-local and
 //! protected by a cross-process lock held for the complete compiler invocation.
 //!
-//! A compile error keeps the private state: rustc publishes a session only
-//! after a compile without errors and never changes a published one. A crash,
-//! a signal, an unknown exit or an error about rustc's incremental files
-//! resets the unit (see [`compile_outcome`]).
+//! A compile error keeps the private state. rustc compiles in a copy of its
+//! newest finalized session, finalizes the copy only after codegen succeeds,
+//! and never changes a finalized session. A crash, a signal, an unknown exit
+//! or an error about rustc's incremental files resets the unit (see
+//! [`compile_outcome`]).
 
 use crate::args::RustcArgs;
 use serde::{Deserialize, Serialize};
@@ -99,7 +100,10 @@ pub(crate) enum CompileOutcome {
     Success,
     /// rustc exited 1 without blaming its incremental files: compile or lint
     /// errors, a linker error, its own Ctrl-C exit, or a Windows forced
-    /// termination. None of these changes the newest finalized session.
+    /// termination. rustc finalizes a session only after codegen succeeds, and
+    /// nothing later in the process changes it. The newest finalized session
+    /// is then the previous one or, after a linker error or a late exit, a new
+    /// and complete one.
     CompileError,
     /// An internal compiler error (101), a signal, any other status, a spawn
     /// or pipe failure, or an error about the incremental files.
@@ -594,9 +598,9 @@ impl Lease {
         let keep = match outcome {
             // A success that wrote no incremental files proves nothing reusable.
             CompileOutcome::Success => nonempty_real_directory(&self.unit.rustc_dir),
-            // rustc publishes a session only after a compile without errors and
-            // never changes a published one. An empty directory is kept too: an
-            // active lease still requires files.
+            // The newest finalized session is complete whenever rustc exits 1
+            // (see `CompileOutcome::CompileError`). An empty directory is kept
+            // too: an active lease still requires files.
             CompileOutcome::CompileError => true,
             CompileOutcome::Abnormal => false,
         };

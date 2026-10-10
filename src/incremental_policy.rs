@@ -314,7 +314,7 @@ impl AdaptiveUnit {
         let mut busy = state;
         busy.active_leases += 1;
         busy.in_flight = true;
-        if !self.store_state(&busy) {
+        if !self.store_state(&busy, true) {
             reset_locked(self);
             return None;
         }
@@ -354,7 +354,7 @@ impl AdaptiveUnit {
             in_flight: false,
         });
         busy.in_flight = true;
-        if !self.store_state(&busy) {
+        if !self.store_state(&busy, true) {
             reset_locked(self);
             return None;
         }
@@ -404,7 +404,7 @@ impl AdaptiveUnit {
             last_used_secs: now,
             in_flight: true,
         };
-        if !self.store_state(&busy) {
+        if !self.store_state(&busy, true) {
             reset_locked(self);
             return None;
         }
@@ -447,7 +447,7 @@ impl AdaptiveUnit {
             last_used_secs: now,
             in_flight: false,
         };
-        let stored = self.store_state(&learning);
+        let stored = self.store_state(&learning, false);
         drop(lock);
         stored
     }
@@ -528,14 +528,31 @@ impl AdaptiveUnit {
         LoadedState::Valid(state)
     }
 
-    fn store_state(&self, state: &DiskState) -> bool {
+    /// Write `state`. Lease writes and the reset marker are `durable`; an
+    /// observation is not, since it is written only after [`reset_locked`]
+    /// removed the private rustc state.
+    fn store_state(&self, state: &DiskState, durable: bool) -> bool {
         if !valid_state(state, &self.unit_key) || unsafe_file(&self.state_path) {
             return false;
         }
         let Ok(bytes) = serde_json::to_vec(state) else {
             return false;
         };
-        crate::atomic::atomic_replace(&self.state_path, &bytes).is_ok()
+        crate::atomic::atomic_replace_deferrable(&self.state_path, &bytes, durable).is_ok()
+    }
+
+    /// The state every lease resets, written before private rustc state is
+    /// removed (see [`reset_locked`]).
+    fn in_flight_marker(&self) -> DiskState {
+        DiskState {
+            schema: STATE_SCHEMA,
+            unit_key: self.unit_key.clone(),
+            phase: Phase::Learning,
+            observation: None,
+            active_leases: 0,
+            last_used_secs: 0,
+            in_flight: true,
+        }
     }
 }
 
@@ -604,7 +621,7 @@ impl Lease {
         };
 
         match next {
-            Some(state) if self.unit.store_state(&state) => true,
+            Some(state) if self.unit.store_state(&state, true) => true,
             None => remove_path_safely(&self.unit.state_path),
             Some(_) => {
                 reset_locked(&self.unit);
@@ -812,9 +829,13 @@ fn strip_incremental_refs(args: &[String]) -> Vec<&String> {
 }
 
 fn reset_locked(unit: &AdaptiveUnit) -> bool {
-    // Keep the in-flight/corrupt state marker when private rustc state could
-    // not be removed. Deleting the marker first would make a later immediate
-    // lease treat that possibly partial directory as reusable.
+    // Removing private rustc state can fail or stop part-way, for example on
+    // Ctrl-C. Mark the unit in flight first, durably, so what survives is a
+    // state every lease resets, never an old active one beside a partial
+    // directory. The marker stays when the removal fails.
+    if !definitely_missing(&unit.rustc_dir) {
+        let _ = unit.store_state(&unit.in_flight_marker(), true);
+    }
     if !remove_path_safely(&unit.rustc_dir) {
         return false;
     }
@@ -838,16 +859,14 @@ fn remove_path_safely(path: &Path) -> bool {
     }
 }
 
+/// Create `path` unless it exists. A directory another process created first
+/// counts, so concurrent first builds do not lose the unit's lock. A symlink
+/// never counts.
 fn ensure_real_directory(path: &Path) -> bool {
-    match fs::symlink_metadata(path) {
-        Ok(meta) => meta.is_dir(),
-        Err(error) => match error.kind() {
-            std::io::ErrorKind::NotFound => match fs::create_dir(path) {
-                Ok(()) => real_directory(path),
-                Err(_) => false,
-            },
-            _ => false,
-        },
+    match fs::create_dir(path) {
+        Ok(()) => real_directory(path),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => real_directory(path),
+        Err(_) => false,
     }
 }
 
@@ -1572,7 +1591,7 @@ mod tests {
         let mut invalid = read_state(&unit);
         invalid.schema += 1;
 
-        assert!(!unit.store_state(&invalid));
+        assert!(!unit.store_state(&invalid, true));
         assert_eq!(fs::read(&unit.state_path).unwrap(), original);
     }
 
@@ -1699,6 +1718,45 @@ mod tests {
         assert!(unit.try_immediate_at(11).is_none());
     }
 
+    /// An active unit leaves its edit loop through an observation, which
+    /// removes its rustc state first. A removal that fails part-way, or that
+    /// Ctrl-C cuts short, must not leave the old active state beside what
+    /// remains: the next build would lease a partial session.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_rustc_removal_never_leaves_a_leasable_state() {
+        use std::os::unix::fs::PermissionsExt;
+        // Root unlinks through mode 0500, which would void the simulation.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipping: running as root, chmod 0500 does not deny unlinks");
+            return;
+        }
+        let (_temp, _args, unit) = fixture();
+        activate(&unit, 10);
+        let stuck = unit.rustc_dir.join("s-stuck");
+        fs::create_dir(&stuck).unwrap();
+        fs::write(stuck.join("work-product.o"), b"object").unwrap();
+        fs::set_permissions(&stuck, fs::Permissions::from_mode(0o500)).unwrap();
+
+        let observed = unit.observe_build_at(
+            &cache_key("hit"),
+            &fields("stable", "source-c", "extern-a"),
+            12,
+        );
+        let leased = unit.try_active_at(13);
+        fs::set_permissions(&stuck, fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(!observed, "the removal failed, so nothing was observed");
+        assert!(
+            nonempty_real_directory(&unit.rustc_dir),
+            "the simulation must leave part of the rustc state behind"
+        );
+        assert!(
+            leased.is_none(),
+            "a partial rustc directory must not be leased"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn symlinked_managed_paths_fail_closed() {
@@ -1794,6 +1852,10 @@ mod tests {
         assert!(ensure_real_directory(&missing));
         assert!(real_directory(&missing));
         assert!(!definitely_missing(&missing));
+        assert!(
+            ensure_real_directory(&missing),
+            "a directory that already exists, as when another build created it first, counts"
+        );
         assert!(!ensure_real_directory(&regular));
 
         assert!(safe_absolute_path(&regular));

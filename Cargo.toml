@@ -1,6 +1,6 @@
 [package]
 name = "kache"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2024"
 description = "Compiler cache for Rust, C/C++ and CUDA, with S3, GCS, shared-filesystem and OCI remotes."
 license = "Apache-2.0"
@@ -38,10 +38,10 @@ resolver = "3"
 [dependencies]
 foldhash = "0.2"
 kunobi-daemon = { version = "0.9.0", features = ["wire-async", "local-async", "launch"] }
-kache-format = { version = "1.0.0", path = "crates/kache-format" }
-kache-fs = { version = "1.0.0", path = "crates/kache-fs" }
-kache-store = { version = "1.0.0", path = "crates/kache-store" }
-kache-shims = { version = "1.0.0", path = "crates/kache-shims" }
+kache-format = { version = "1.1.0", path = "crates/kache-format" }
+kache-fs = { version = "1.1.0", path = "crates/kache-fs" }
+kache-store = { version = "1.1.0", path = "crates/kache-store" }
+kache-shims = { version = "1.1.0", path = "crates/kache-shims" }
 blake3 = "1"
 bytes = "1"
 # OpenDAL publishes its modules as separate crates. Depending on only the
@@ -64,7 +64,7 @@ reqsign-aws-v4 = { version = "=3.3.1", default-features = false }
 reqsign-core = { version = "=3.3.2", default-features = false }
 # Direct dep so OpenDAL/reqwest can use ring without reintroducing aws-lc.
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
-kache-core = { version = "1.0.0", path = "crates/kache-core", default-features = false, features = ["planning"] }
+kache-core = { version = "1.1.0", path = "crates/kache-core", default-features = false, features = ["planning"] }
 async-trait = "0.1"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "process", "fs", "io-util", "net", "time", "signal", "sync"] }
 serde = { version = "1", features = ["derive"] }
@@ -133,8 +133,8 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [dev-dependencies]
-kache-store = { version = "1.0.0", path = "crates/kache-store", features = ["test-support"] }
-kache-fs = { version = "1.0.0", path = "crates/kache-fs", features = ["testing"] }
+kache-store = { version = "1.1.0", path = "crates/kache-store", features = ["test-support"] }
+kache-fs = { version = "1.1.0", path = "crates/kache-fs", features = ["testing"] }
 assert_cmd = "2"
 axum = "0.8"
 predicates = "3"

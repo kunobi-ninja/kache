@@ -198,6 +198,14 @@ pub(crate) fn ensure_rule(db: &Connection) -> rusqlite::Result<()> {
     if has_rule_columns(db)? {
         return Ok(());
     }
+    add_rule_columns(db)
+}
+
+/// The part of [`ensure_rule`] that runs under the write lock, once a look
+/// without it found a column missing. Another process may have added the
+/// columns since and recorded rows under them, so it looks again before it
+/// purges.
+fn add_rule_columns(db: &Connection) -> rusqlite::Result<()> {
     let tx = Transaction::new_unchecked(db, TransactionBehavior::Immediate)?;
     if !has_rule_columns(&tx)? {
         for (table, column, definition) in RULE_COLUMNS {
@@ -549,6 +557,57 @@ mod tests {
                 row.get(0)
             })
             .unwrap()
+    }
+
+    /// Every process that opens an older index looks for the rule columns
+    /// before it takes the write lock, and each that finds one missing goes
+    /// on to take it. Only the first may purge: by the time a later one holds
+    /// the lock, the columns are there and the rows under them are current.
+    #[test]
+    fn the_purge_runs_once_however_many_openers_found_a_column_missing() {
+        const MEMO_TABLES: [&str; 5] = [
+            "cc_preprocess_memos",
+            "cc_memo_inputs",
+            "cc_memo_input_refs",
+            "cc_mapped_hashes",
+            "cc_asm_scans",
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let cache = FileHashCache::open(&dir.path().join("index.db")).unwrap();
+        let record = |cache: &FileHashCache<'_>| {
+            cache
+                .put_cc_preprocess_memo_inputs("memo", "hash", &[input("a.h", "one")])
+                .unwrap();
+            cache
+                .put_cc_mapped_hashes("maps", &[("one".into(), "mapped".into())])
+                .unwrap();
+            cache
+                .put_cc_asm_scans(&[("one".into(), String::new())])
+                .unwrap();
+        };
+        let rows = |cache: &FileHashCache<'_>| MEMO_TABLES.map(|table| count(cache, table));
+        record(&cache);
+        cache
+            .db()
+            .execute_batch(
+                "ALTER TABLE cc_memo_inputs DROP COLUMN proof;
+                 ALTER TABLE cc_mapped_hashes DROP COLUMN rule;
+                 ALTER TABLE cc_asm_scans DROP COLUMN rule;",
+            )
+            .unwrap();
+        assert!(!has_rule_columns(cache.db()).unwrap());
+
+        // The first opener to take the lock adds the columns and purges.
+        ensure_rule(cache.db()).unwrap();
+        assert!(has_rule_columns(cache.db()).unwrap());
+        assert_eq!(rows(&cache), [0; 5]);
+
+        // A second opener found a column missing before that, and takes the
+        // lock only now, after rows were recorded under the columns.
+        record(&cache);
+        assert_eq!(rows(&cache), [1; 5]);
+        add_rule_columns(cache.db()).unwrap();
+        assert_eq!(rows(&cache), [1; 5], "the purge runs once");
     }
 
     #[test]

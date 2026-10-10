@@ -74,6 +74,42 @@ fn a_predicted_key_owes_a_rederivation_until_it_has_had_one() {
     assert!(!owes_rederivation(false, true));
 }
 
+/// Once both lookups missed and no incremental lane took the miss, a key
+/// taken before the compile is kept only where the compile cannot run first:
+/// a guess on a linking unit, which is re-derived through the pre-pass, and
+/// the discovered key of a unit that never keyed first for a lane.
+#[test]
+fn a_miss_no_lane_took_compiles_before_its_key_unless_that_key_must_stay() {
+    // (deferral allowed, stop on hit allowed, owes a re-derivation, keyed first)
+    let cases = [
+        // A guess re-derives from the running compile, which can stop.
+        ((true, true, true, false), Some(true)),
+        ((true, true, true, true), Some(true)),
+        // A linking compile cannot stop, so a guess takes the pre-pass first.
+        ((true, false, true, false), None),
+        ((true, false, true, true), None),
+        // The lane a unit keyed first for declined: compile first, linking
+        // or not.
+        ((true, true, false, true), Some(true)),
+        ((true, false, false, true), Some(false)),
+        // Any other discovered key is the one the compile runs under.
+        ((true, true, false, false), None),
+        ((true, false, false, false), None),
+    ];
+    for ((deferral, stop, owes, keyed_first), expected) in cases {
+        assert_eq!(
+            compile_before_key_after_miss(deferral, stop, owes, keyed_first),
+            expected,
+            "deferral {deferral}, stop on hit {stop}, owes {owes}, keyed first {keyed_first}"
+        );
+        assert_eq!(
+            compile_before_key_after_miss(false, stop, owes, keyed_first),
+            None,
+            "nothing compiles before its key where deferral is off"
+        );
+    }
+}
+
 #[test]
 fn only_a_fresh_closure_is_worth_recording() {
     assert!(

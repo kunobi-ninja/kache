@@ -3777,15 +3777,17 @@ fn run_parsed_rustc(
         .project_rules
         .user_bypass_reason(crate_name, &args.all_args);
     let skip_user_facing = args.is_user_facing_executable() && !config.cache_executables;
+    // Read before the key takes the closure a stopped compile left.
+    let reentered = reentered_after_deferred_compile(
+        precompiled.is_some(),
+        crate::cache_key::dep_info_provided(),
+    );
 
     if incremental_fast_path_allowed(
         unit_refuses_caching(!refuse.is_empty(), untrusted_codegen_backend.is_some()),
         excluded_source.is_some() || user_bypass.is_some(),
         skip_user_facing,
-        reentered_after_deferred_compile(
-            precompiled.is_some(),
-            crate::cache_key::dep_info_provided(),
-        ),
+        reentered,
     ) {
         if force_incremental {
             if let Some(lease) = adaptive_unit.as_ref().and_then(AdaptiveUnit::try_immediate) {
@@ -3986,7 +3988,9 @@ fn run_parsed_rustc(
         false,
     );
     // Taken after the fast path, which resets corrupt or interrupted state:
-    // a unit left without state has no lane its key could open.
+    // a unit left without state has no lane its key could open. When no lane
+    // takes its miss, such a unit compiles before keying again after all
+    // ([`compile_before_key_after_miss`]).
     let keys_first = managed_unit_keys_first(
         adaptive_unit.is_some(),
         force_incremental,
@@ -4153,6 +4157,13 @@ fn run_parsed_rustc(
     let mut lookup_ms = 0_u64;
     let mut record_closure = should_record_closure(predicted, false);
     let mut rederived = false;
+    // A unit that keyed first only so that its miss could take an
+    // incremental lane. A re-entry keys from the closure of a compile it
+    // stopped, and never compiles before its key again.
+    let keyed_first = keys_first && !reentered;
+    let may_defer = deferral_allowed(config, args, false, extra_inputs);
+    // `Some(stop_on_hit)` once the miss is to compile before its key.
+    let mut compile_then_key = None;
     while precompiled.is_none() {
         // 1. Check local store (volume shard, then main)
         let lookup_start = std::time::Instant::now();
@@ -4280,23 +4291,12 @@ fn run_parsed_rustc(
             );
         }
 
-        if !owes_rederivation(predicted, rederived) {
+        // Every incremental lane has declined by now.
+        let owes = owes_rederivation(predicted, rederived);
+        compile_then_key =
+            compile_before_key_after_miss(may_defer, stop_on_hit_allowed(args), owes, keyed_first);
+        if compile_then_key.is_some() || !owes {
             break;
-        }
-        // A predicted key missed and must be re-derived before anything is
-        // stored. The compile writes the same closure the pre-pass would, at
-        // the same point, so start it and key from that instead.
-        if deferral_allowed(config, args, keys_first, extra_inputs) && stop_on_hit_allowed(args) {
-            tracing::debug!("{crate_name}: predicted key missed; compiling while re-deriving");
-            return compile_before_key(
-                &compile_first,
-                true,
-                key_outputs.tree_guard,
-                guard_inputs,
-                key_record,
-                key_ms,
-                key_hash_stats,
-            );
         }
         rederived = true;
         record_closure = should_record_closure(predicted, rederived);
@@ -4350,8 +4350,26 @@ fn run_parsed_rustc(
         if cache_key == previous_key {
             // The prediction was right. Both lookups already answered for
             // this key; asking again would be the same two misses.
+            compile_then_key = compile_before_key_after_miss(
+                may_defer,
+                stop_on_hit_allowed(args),
+                false,
+                keyed_first,
+            );
             break;
         }
+    }
+    if let Some(stop_on_hit) = compile_then_key {
+        tracing::debug!("{crate_name}: no lane took the miss; compiling before keying again");
+        return compile_before_key(
+            &compile_first,
+            stop_on_hit,
+            key_outputs.tree_guard,
+            guard_inputs,
+            key_record,
+            key_ms,
+            key_hash_stats,
+        );
     }
 
     // 3. Cache miss — join the machine-wide flight, take a permit, then
@@ -6636,6 +6654,36 @@ fn compute_rustc_cache_key(
 /// argument for a remote entry as for a local one.
 fn owes_rederivation(predicted: bool, already_rederived: bool) -> bool {
     predicted && !already_rederived
+}
+
+/// Does a miss that no incremental lane took compile before its key after
+/// all, and may that compile stop on a hit? `Some(stop_on_hit)` if so.
+/// `deferral_allowed` is [`deferral_allowed`] for a unit that need not key
+/// first.
+///
+/// A predicted key must be re-derived before anything is stored, and the
+/// running compile writes the closure the pre-pass would. A compile that
+/// links cannot stop on a hit, so a guess is re-derived through the pre-pass
+/// first, where a lookup can still find the entry under the real key.
+///
+/// A unit that keyed first did so only so that its miss could take an
+/// incremental lane, and none did. Its key was taken before the compile, and
+/// by default only a key from the compile's own closure is checked for a
+/// source written while the compile runs, so once the key is no longer a
+/// guess this unit compiles first as well, whether or not it links.
+fn compile_before_key_after_miss(
+    deferral_allowed: bool,
+    stop_on_hit_allowed: bool,
+    owes_rederivation: bool,
+    keyed_first: bool,
+) -> Option<bool> {
+    if !deferral_allowed {
+        return None;
+    }
+    if owes_rederivation {
+        return stop_on_hit_allowed.then_some(true);
+    }
+    keyed_first.then_some(stop_on_hit_allowed)
 }
 
 /// Should this invocation write what it discovered back to the record?

@@ -138,7 +138,12 @@ Crates with extra inputs keep the pre-pass, and so does every Rust unit when
 the scheduler is off (`KACHE_SCHEDULER=0`). A unit with
 [adaptive incremental](/docs/getting-started/quick-start#executables-and-incremental-builds)
 state keeps it too, because its key decides whether a miss compiles
-incrementally, and so does a crate listed in `KACHE_INCREMENTAL_CRATES`.
+incrementally, and so does a crate listed in `KACHE_INCREMENTAL_CRATES`. When
+such a unit misses and no incremental lane takes the compile, Kache compiles
+before keying again from the closure the compile emits, so a source written
+during the compile leaves the result unstored. For a unit that links, a
+predicted key is first re-derived with the pre-pass, because that compile
+cannot be stopped on a hit.
 `[cache] deferred_discovery = false` or `KACHE_DEFERRED_DISCOVERY=0` restores
 the pre-pass everywhere.
 

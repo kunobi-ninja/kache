@@ -217,7 +217,7 @@ pub fn scratch_dir() -> PathBuf {
 /// Kache counts an input stamped up to one window before an invocation's
 /// start as written during it (`kache_store::file_hash::stamp_written_since`),
 /// and a compile that ran before its key does not store then. The window is
-/// 1 ms on Linux and macOS and 20 ms elsewhere where stamps keep a fraction
+/// 1 ms on Linux, macOS and Windows and 20 ms elsewhere where stamps keep a fraction
 /// of a second, which this always waits, and about two seconds for a
 /// whole-second stamp found under `dirs`. A stamp in the future cannot be
 /// waited out and is left to the test.

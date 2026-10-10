@@ -32,14 +32,15 @@ pub fn stamp_is_settled(fingerprint: &FileFingerprint, observed_ns: i64) -> bool
 
 /// How far below [`stamp_clock_ns`], read just before a write, the write's
 /// stamp can fall where stamps keep a fraction of a second. Linux stamps
-/// files from the coarse clock that function reads there, and macOS from
-/// the wall clock, so the margin only covers stamps kept in microseconds.
-/// Elsewhere stamps can trail the wall clock by a timer tick: 15.6 ms on
-/// Windows.
+/// files from the coarse clock that function reads there, Windows from the
+/// system time it reads there, and macOS from the wall clock, so the margin
+/// only covers stamps kept in microseconds. Elsewhere stamps can trail the
+/// wall clock by a timer tick.
 pub const FINE_STAMP_WINDOW_NS: i64 = if cfg!(any(
     target_os = "linux",
     target_os = "android",
-    target_vendor = "apple"
+    target_vendor = "apple",
+    windows
 )) {
     1_000_000
 } else {
@@ -80,9 +81,11 @@ pub fn stamp_window_ns(stamp_ns: i64) -> i64 {
 }
 
 /// Now, on the clock file stamps are taken from: the kernel's coarse
-/// realtime clock on Linux, which trails the wall clock by up to a tick,
-/// and the wall clock elsewhere. A start that stamps are later checked
-/// against with [`stamp_written_since`] is read from it.
+/// realtime clock on Linux and the system time on Windows, which both trail
+/// the wall clock by up to a timer tick, and the wall clock elsewhere. A
+/// start that stamps are later checked against with [`stamp_written_since`]
+/// is read from it.
+#[cfg_attr(windows, allow(unreachable_code))]
 pub fn stamp_clock_ns() -> i64 {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
@@ -93,7 +96,38 @@ pub fn stamp_clock_ns() -> i64 {
             return i64::try_from(elapsed.as_nanos()).unwrap_or(i64::MAX);
         }
     }
+    #[cfg(windows)]
+    {
+        return windows_system_time_ns();
+    }
     wall_clock_ns()
+}
+
+/// The system time NTFS stamps files with. `SystemTime::now` reads the
+/// precise clock, which runs up to a timer tick ahead of it, so a file
+/// written just after that read could carry a stamp below it.
+#[cfg(windows)]
+fn windows_system_time_ns() -> i64 {
+    let mut now = windows_sys::Win32::Foundation::FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    // SAFETY: the call only fills the FILETIME it is given.
+    unsafe { windows_sys::Win32::System::SystemInformation::GetSystemTimeAsFileTime(&mut now) };
+    filetime_to_unix_ns(now.dwHighDateTime, now.dwLowDateTime)
+}
+
+/// A Windows FILETIME, 100 ns intervals since 1601, in nanoseconds since the
+/// Unix epoch, 0 before it.
+#[cfg(any(windows, test))]
+fn filetime_to_unix_ns(high: u32, low: u32) -> i64 {
+    const UNIX_EPOCH_INTERVALS: u64 = 116_444_736_000_000_000;
+    let intervals = (u64::from(high) << 32) + u64::from(low);
+    intervals
+        .checked_sub(UNIX_EPOCH_INTERVALS)
+        .map_or(0, |since| {
+            i64::try_from(u128::from(since) * 100).unwrap_or(i64::MAX)
+        })
 }
 
 /// The wall clock in nanoseconds since the Unix epoch, 0 before it.
@@ -979,7 +1013,8 @@ mod tests {
         let fine = if cfg!(any(
             target_os = "linux",
             target_os = "android",
-            target_vendor = "apple"
+            target_vendor = "apple",
+            windows
         )) {
             1_000_000
         } else {
@@ -1008,6 +1043,44 @@ mod tests {
         let restored = stamp("/s.rs", long_ago, precise);
         assert!(stamp_written_since(&restored, precise + fine));
         assert!(!stamp_written_since(&restored, precise + fine + 1));
+    }
+
+    #[test]
+    fn a_filetime_counts_from_the_unix_epoch_in_nanoseconds() {
+        let split = |intervals: u64| ((intervals >> 32) as u32, intervals as u32);
+        let epoch = 116_444_736_000_000_000_u64;
+        let at = |intervals: u64| {
+            let (high, low) = split(intervals);
+            filetime_to_unix_ns(high, low)
+        };
+        assert_eq!(at(epoch), 0);
+        assert_eq!(at(epoch + 1), 100);
+        assert_eq!(at(epoch - 1), 0);
+        // 2026-10-10T00:00:00Z: both halves carry bits.
+        assert_eq!(
+            at(epoch + 1_791_590_400 * 10_000_000),
+            1_791_590_400_000_000_000
+        );
+        assert_eq!(filetime_to_unix_ns(u32::MAX, u32::MAX), i64::MAX);
+    }
+
+    /// The start a build reads must not run ahead of the stamp a file written
+    /// after it gets: with the precise clock, NTFS stamps trailed it by up to
+    /// a timer tick, past the 1 ms window.
+    #[cfg(windows)]
+    #[test]
+    fn a_file_written_after_the_stamp_clock_counts_as_written_since() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("written.rs");
+        for round in 0..200 {
+            let start = stamp_clock_ns();
+            std::fs::write(&path, round.to_string()).unwrap();
+            let written = FileFingerprint::from_path(&path).unwrap();
+            assert!(
+                stamp_written_since(&written, start),
+                "round {round}: {written:?} before {start}"
+            );
+        }
     }
 
     /// The window covers how far this platform's stamps trail

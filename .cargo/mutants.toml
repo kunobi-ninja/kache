@@ -329,6 +329,10 @@ exclude_re = [
     "windows_pattern_has_ambiguous_root",
     "windows_path_uses_device_namespace",
     "windows_kache_processes",
+    # `windows_system_time_ns` is `#[cfg(windows)]`: this lane never compiles it.
+    # Its conversion, `filetime_to_unix_ns`, is `#[cfg(any(windows, test))]`
+    # and stays in scope here; the Windows lane runs the stamp-clock test.
+    "windows_system_time_ns",
     "replace && with \\|\\| in find_daemon_pids",
     "replace != with == in find_daemon_pids",
     "query_windows_file_identity",

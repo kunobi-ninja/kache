@@ -136,7 +136,7 @@ same way. Every input in that closure is checked against the build's start
 time. An input written during the compile leaves the result unstored, and so
 does one written so shortly before the build started that its recorded write
 time cannot tell the two apart: within the same kernel clock tick (1 to 10 ms)
-on Linux, 1 ms on macOS, 20 ms on other systems, and 2 seconds on file systems
+on Linux, 1 ms on macOS and Windows, 20 ms on other systems, and 2 seconds on file systems
 that keep whole seconds, such as HFS+ and FAT. Peers of the same unit in other
 target directories wait for this compile as they would for a pre-pass.
 Crates with extra inputs keep the pre-pass, and so does every Rust unit when

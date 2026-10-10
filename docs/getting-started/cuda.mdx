@@ -38,7 +38,7 @@ nvcc -dc src/kernel.cu -o build/kernel.o
 nvcc -dlink build/kernel.o build/helper.o -o build/device-link.o
 ```
 
-`nvcc` is a driver: one `-c` invocation fans out to the device frontend, one compiler pair per GPU architecture, the fatbinary bundler, and the host C++ compiler. Kache caches the whole invocation as one entry. On a miss it runs `nvcc` end to end and stores the final object, unless a file the key hashed was modified while the build ran, or just before it by the margin file times can trail the clock: within the same kernel clock tick on Linux, 1 ms on macOS, 20 ms on other systems, and 2 seconds on file systems that keep whole seconds, such as HFS+ and FAT. A timestamp that is in the future when Kache reads the file counts as clock skew, not a change. On a hit it restores the object (and the `-MF` dep-info sidecar, when requested) and skips the toolchain.
+`nvcc` is a driver: one `-c` invocation fans out to the device frontend, one compiler pair per GPU architecture, the fatbinary bundler, and the host C++ compiler. Kache caches the whole invocation as one entry. On a miss it runs `nvcc` end to end and stores the final object, unless a file the key hashed was modified while the build ran, or just before it by the margin file times can trail the clock: within the same kernel clock tick on Linux, 1 ms on macOS and Windows, 20 ms on other systems, and 2 seconds on file systems that keep whole seconds, such as HFS+ and FAT. A timestamp that is in the future when Kache reads the file counts as clock skew, not a change. On a hit it restores the object (and the `-MF` dep-info sidecar, when requested) and skips the toolchain.
 
 ### Why the key is sound
 

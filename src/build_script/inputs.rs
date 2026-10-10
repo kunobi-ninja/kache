@@ -398,7 +398,7 @@ enum Unstamped {
     Unstampable,
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(super) fn tree_stamp(path: &Path, excluded: &[PathBuf], budget: usize) -> Option<TreeStamp> {
     let walk = Walk {
         excluded,
@@ -479,7 +479,7 @@ fn tree_memo_path(path: &Path, memo: Option<(&Path, &str)>, text: Option<&Enviro
     .join(format!("tree-{}.txt", &name[..24]))
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(super) fn tree_digest_memo(
     path: &Path,
     text: Option<&Environment>,

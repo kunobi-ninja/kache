@@ -266,6 +266,7 @@ const ETXTBSY_RETRIES: usize = 50;
 /// ([`crate::cache_key::stamp_written_since`]). A stamp ahead of the clock
 /// is no write and is not waited for. The unit-test side of
 /// `tests/common`'s `settle_writes`.
+#[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) fn settle_writes(paths: &[&std::path::Path]) {
     use crate::cache_key::{
         FINE_STAMP_WINDOW_NS, FileFingerprint, stamp_clock_ns, stamp_window_ns, wall_clock_ns,

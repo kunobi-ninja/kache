@@ -55,7 +55,7 @@ mod outside;
 
 use declarations::parse_declarations;
 use inputs::{TREE_MEMO_DIR, input_state, input_state_as};
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use inputs::{tree_digest_memo, tree_stamp};
 
 /// Set by the launcher to the path Cargo invoked, which is where the preserved

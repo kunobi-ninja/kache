@@ -11738,6 +11738,13 @@ fn an_input_a_memo_hit_proved_by_stamp_is_rechecked() {
 /// that input again instead of trusting its stat. A row memoised for the
 /// stamp with other bytes' hash stands in for such a write here. A settled
 /// stamp is trusted without a read.
+///
+/// The modification time is an hour ahead of the clock, so neither start
+/// counts the file as written during the build, whatever grain the
+/// filesystem keeps its times in. A file written just before the start
+/// would not do where times are whole seconds: its write window there is
+/// longer than the settle window, so no start leaves it outside the one and
+/// inside the other.
 #[test]
 fn a_key_first_check_reads_again_only_an_input_fresh_at_the_start() {
     let dir = tempfile::tempdir().unwrap();
@@ -11745,24 +11752,28 @@ fn a_key_first_check_reads_again_only_an_input_fresh_at_the_start() {
     ensure_file_hash_cache_schema(&db).unwrap();
     let header = dir.path().join("big.h");
     std::fs::write(&header, "x".repeat(MIN_PERSISTED_HASH_BYTES as usize)).unwrap();
+    let ahead = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+    filetime::set_file_mtime(&header, filetime::FileTime::from_system_time(ahead)).unwrap();
     let stamp = FileFingerprint::from_path(&header).unwrap();
     let stale = "0".repeat(64);
     FileHashCache::Borrowed(&db).put(&stamp, &stale).unwrap();
-    let changed = stamp.mtime_ns.max(stamp.ctime_ns);
     let checked = |start_ns: i64| {
         let mut hasher = FileHasher::from_cache(FileHashCache::Borrowed(&db));
         hasher.arm_too_new_guard(start_ns, 0);
         assert_eq!(hasher.hash(&header).unwrap(), stale, "the key's hash");
-        assert!(!hasher.too_new(), "written before the build");
+        assert!(
+            !hasher.too_new.saw_write_since_start.get(),
+            "not written during the build"
+        );
         hasher.inputs_changed_since_keyed()
     };
 
+    // Past the change time's own window: only the modification time is
+    // fresh at this start.
+    let fresh = stamp.ctime_ns + stamp_window_ns(stamp.ctime_ns) + 1;
+    assert!(checked(fresh), "a fresh input is read again");
     assert!(
-        checked(past_the_write(&stamp)),
-        "a fresh input is read again"
-    );
-    assert!(
-        !checked(changed + HASH_SETTLE_NS),
+        !checked(stamp.mtime_ns + HASH_SETTLE_NS),
         "a settled stamp is trusted without a read"
     );
 }

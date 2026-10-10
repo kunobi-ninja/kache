@@ -6097,7 +6097,7 @@ fn adaptive_compile_before_key(
     let compiler_args = lease.compiler_args(ctx.args);
     let mut hit_closure = None;
     let mut observed = None;
-    let mut lookup_ms = 0;
+    let mut lookup_ms = 0_u64;
     let compile_start = std::time::Instant::now();
     let mut on_dep_info = || {
         let Some(dep_info) = emitted_dep_info(ctx.args) else {
@@ -6110,7 +6110,7 @@ fn adaptive_compile_before_key(
         };
         let lookup_start = std::time::Instant::now();
         let stored = ctx.store.get(&keyed.cache_key);
-        lookup_ms += lookup_start.elapsed().as_millis() as u64;
+        lookup_ms = lookup_ms.saturating_add(lookup_start.elapsed().as_millis() as u64);
         (key_ms, key_hash_stats, _) = combine_key_measurements(
             key_ms,
             keyed.key_ms,

@@ -109,6 +109,7 @@ fn run_cargo(
         .env("CARGO_TARGET_DIR", target_dir)
         .env("CARGO_INCREMENTAL", "1")
         .env("KACHE_ADAPTIVE_INCREMENTAL", "1")
+        .env("KACHE_SCHEDULER", "1")
         .env("FALLBACK_MARKER", project.join("fallback-used"))
         .env("KACHE_LOG", "kache=debug")
         .env_remove("RUSTC_WORKSPACE_WRAPPER")
@@ -549,6 +550,11 @@ fn local_source_churn_seeds_from_emitted_dep_info_without_a_pre_pass() {
     assert_passthrough(&seed, "adaptive seed");
     assert_eq!(seed["compiler_runs"], 1, "event: {seed:#}");
     assert_eq!(seed["dep_info_runs"], 0, "event: {seed:#}");
+    assert_eq!(
+        seed["rebuilt_package"], "adaptive-fixture",
+        "event: {seed:#}"
+    );
+    assert!(!seed["rebuilt_paths"].as_array().unwrap().is_empty());
     assert!(
         newest_finalized_session(&policy_root).is_some(),
         "the cold seed did not publish a private rustc session",
@@ -599,6 +605,13 @@ fn local_learning_cache_hit_discards_the_provisional_graph() {
     assert_eq!(first["result"], "miss", "event: {first:#}");
     assert_eq!(first["compiler_runs"], 1, "event: {first:#}");
     assert_no_private_graph(&policy_root);
+    let weight = cache
+        .path()
+        .join("scheduler/weights")
+        .join(blake3::hash(b"adaptive_fixture").to_hex().as_str());
+    let initial_rss: u64 = fs::read_to_string(&weight).unwrap().parse().unwrap();
+    assert!(initial_rss > 1024, "the first compile did not record RSS");
+    fs::remove_file(&weight).unwrap();
 
     // The changed mtime invalidates the learned closure; the cleared Cargo
     // fingerprint forces a build. The compiler must stop at the exact hit.
@@ -607,6 +620,10 @@ fn local_learning_cache_hit_discards_the_provisional_graph() {
     assert_eq!(restored["dep_info_runs"], 1, "event: {restored:#}");
     assert_eq!(restored["compiler_runs"], 0, "event: {restored:#}");
     assert_no_private_graph(&policy_root);
+    assert!(
+        !weight.exists(),
+        "an interrupted cache-hit compile recorded an incomplete RSS sample",
+    );
 
     let seed = build(2);
     assert_passthrough(&seed, "adaptive seed");
@@ -616,6 +633,43 @@ fn local_learning_cache_hit_discards_the_provisional_graph() {
         newest_finalized_session(&policy_root).is_some(),
         "a cache hit prevented the next edit from seeding private state",
     );
+}
+
+#[test]
+fn local_empty_cache_entry_does_not_stop_the_cold_compile() {
+    let project = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let target = project.path().join("target");
+    let policy_root = target.join("debug/incremental.kache-auto");
+    create_fixture(project.path());
+
+    let first_mtime = past_mtime();
+    let first = build_variant_impl(project.path(), cache.path(), &target, None, first_mtime, 1);
+    assert_eq!(first["result"], "miss", "event: {first:#}");
+    let metadata_path = cache
+        .path()
+        .join("store")
+        .join(first["cache_key"].as_str().unwrap())
+        .join("meta.json");
+    let mut metadata: Value = serde_json::from_slice(&fs::read(&metadata_path).unwrap()).unwrap();
+    assert!(!metadata["files"].as_array().unwrap().is_empty());
+    metadata["files"] = serde_json::json!([]);
+    fs::write(&metadata_path, serde_json::to_vec(&metadata).unwrap()).unwrap();
+
+    // The store can read this metadata, but it has no artifact to restore.
+    // Cold discovery must finish compilation and discard unqualified state.
+    let compiled = build_variant_impl(
+        project.path(),
+        cache.path(),
+        &target,
+        None,
+        first_mtime + 1,
+        1,
+    );
+    assert_passthrough(&compiled, "adaptive seed");
+    assert_eq!(compiled["compiler_runs"], 1, "event: {compiled:#}");
+    assert_eq!(compiled["dep_info_runs"], 0, "event: {compiled:#}");
+    assert_no_private_graph(&policy_root);
 }
 
 #[test]
@@ -703,6 +757,10 @@ fn local_failed_cold_seed_keeps_the_next_fix_on_the_seed_lane() {
     assert_eq!(failed_seed["exit_code"], 1, "event: {failed_seed:#}");
     assert_eq!(failed_seed["compiler_runs"], 1, "event: {failed_seed:#}");
     assert_eq!(failed_seed["dep_info_runs"], 0, "event: {failed_seed:#}");
+    assert!(
+        failed_seed.get("rebuilt_paths").is_none(),
+        "event: {failed_seed:#}"
+    );
 
     let fixed = build(2);
     assert_passthrough(&fixed, "adaptive seed");

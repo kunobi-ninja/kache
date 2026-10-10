@@ -3698,6 +3698,33 @@ fn only_a_package_inside_the_workspace_is_a_workspace_unit() {
     );
 }
 
+/// Cargo's legacy layout compiles a build script one level below where a
+/// library goes. Its guard leaves out the same target directory as every
+/// other unit's, and so shares their memo.
+#[test]
+fn a_build_script_compile_leaves_out_the_whole_target_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let (root, mut args) = workspace_invocation(dir.path(), "a", "build_script_build");
+    let vars = manifest_vars(&root.join("kt"));
+    let target_of =
+        |args: &RustcArgs| workspace_roots_in(args, &vars, &root).map(|roots| roots.target);
+    for out_dir in [
+        "target/debug/build/kt-0123456789abcdef",
+        "target/debug/build/kt/0123456789abcdef/out",
+    ] {
+        args.out_dir = Some(root.join(out_dir));
+        assert_eq!(target_of(&args), Some(root.join("target")), "{out_dir}");
+    }
+    args.target = Some("x86_64-unknown-linux-gnu".to_string());
+    args.out_dir =
+        Some(root.join("target/x86_64-unknown-linux-gnu/debug/build/kt/0123456789abcdef/out"));
+    assert_eq!(
+        target_of(&args),
+        Some(root.join("target")),
+        "a cross-compiled library in the per-unit layout"
+    );
+}
+
 #[test]
 fn a_linker_or_search_path_in_the_checkout_does_not_split_the_identity() {
     let dir = tempfile::tempdir().unwrap();

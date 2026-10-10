@@ -2412,6 +2412,22 @@ fn workspace_roots(
     workspace_roots_in(args, vars, &std::env::current_dir().ok()?)
 }
 
+/// The target directory of `args`, which a workspace unit's guard leaves
+/// out. Cargo's legacy layout compiles a build script into
+/// `<profile>/build/<unit>`, where [`RustcArgs::target_dir`] reads the
+/// profile directory.
+fn workspace_target_dir(args: &RustcArgs) -> Option<PathBuf> {
+    let build_script_profile = args
+        .out_dir
+        .as_deref()
+        .filter(|dir| crate::cargo_layout::per_unit_out_dir(dir).is_none())
+        .and_then(crate::cargo_layout::build_script_dir_profile);
+    match build_script_profile {
+        Some(profile) => profile.parent().map(Path::to_path_buf),
+        None => args.target_dir(),
+    }
+}
+
 /// [`workspace_roots`] for rustc running in `current_dir`. The root is
 /// [`RustcArgs::verified_workspace_root`] for an in-workspace target, or
 /// Cargo's compiler working directory when it holds a manifest. An external
@@ -2431,7 +2447,7 @@ fn workspace_roots_in(
             .find(|root| root.join("Cargo.toml").is_file() && same_dir(root, current_dir))
             .map(Path::to_path_buf)
     })?;
-    let target = args.target_dir()?;
+    let target = workspace_target_dir(args)?;
     suffix_within(manifest_dir.as_os_str(), &root, 0)?;
     let canonical_root = std::fs::canonicalize(&root).ok()?;
     // Cargo and the working directory can use different spellings: macOS

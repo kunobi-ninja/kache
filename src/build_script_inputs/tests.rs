@@ -478,7 +478,11 @@ fn names_no_process_can_hold_read_as_unset() {
     assert_eq!(state(""), EnvState::Unset);
     assert_eq!(state("A=B"), EnvState::Unset);
     assert_eq!(state("A\0B"), EnvState::Unset);
-    assert_eq!(state("A"), EnvState::Set(b"1".to_vec()));
+    // A value counts by its platform encoding, UTF-16LE on Windows.
+    assert_eq!(
+        state("A"),
+        EnvState::Set(crate::cache_key::env_os_key_bytes(OsStr::new("1")))
+    );
     assert_eq!(state("B"), EnvState::Unset);
 }
 

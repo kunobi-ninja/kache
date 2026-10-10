@@ -352,7 +352,9 @@ mod tests {
         };
         assert!(stamp.settled_at(newest + TreeStamp::SETTLE));
         assert!(stamp.settled_at(newest + TreeStamp::SETTLE * 3));
-        assert!(!stamp.settled_at(newest + TreeStamp::SETTLE - Duration::from_nanos(1)));
+        // Not a nanosecond: Windows keeps time in 100 ns ticks, and
+        // subtracting less than one leaves the time as it was.
+        assert!(!stamp.settled_at(newest + TreeStamp::SETTLE - Duration::from_millis(1)));
         assert!(
             !stamp.settled_at(newest - Duration::from_secs(1)),
             "a clock behind the write"

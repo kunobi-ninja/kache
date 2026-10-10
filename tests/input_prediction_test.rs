@@ -1359,6 +1359,22 @@ fn a_workspace_unit_with_a_proc_macro_predicts_in_its_own_checkout() {
     assert_eq!(warm.dep_info_runs, 0);
 }
 
+/// A cache inside the workspace, as GitLab CI requires of cached paths, is
+/// not part of the workspace guard: the store writes to it while the unit
+/// compiles, and the record must still carry the guard.
+#[test]
+fn a_cache_inside_the_workspace_keeps_the_record_guarded() {
+    build_kache();
+    let mut unit = WorkspaceUnit::new(false);
+    let a = unit.checkout("a");
+    unit.cache = a.join(".cache/kache");
+    std::fs::create_dir_all(&unit.cache).unwrap();
+    assert_eq!(unit.build(&a, true, None).result, "miss");
+    let warm = unit.build(&a, true, None);
+    assert_eq!(warm.result, "local_hit");
+    assert_eq!(warm.dep_info_runs, 0, "the record kept its guard");
+}
+
 /// A file the closure does not name, anywhere in the workspace, could be one
 /// a macro reads, so B's extra file keeps A's record out.
 #[test]

@@ -1048,6 +1048,9 @@ struct TreeRoot<'a> {
     /// Cargo tagged it as a build directory: a stale `target`, or the target
     /// directory of another build.
     skips_build_dirs: bool,
+    /// Kache's own directories below the root ([`own_dirs_within`]), left out
+    /// wherever they lie.
+    own: Vec<PathBuf>,
 }
 
 impl<'a> TreeRoot<'a> {
@@ -1057,6 +1060,7 @@ impl<'a> TreeRoot<'a> {
             role,
             skipped,
             skips_build_dirs: false,
+            own: Vec::new(),
         }
     }
 
@@ -1071,6 +1075,7 @@ impl<'a> TreeRoot<'a> {
         self.skipped
             .iter()
             .map(|name| self.path.join(name))
+            .chain(self.own.iter().cloned())
             .collect()
     }
 
@@ -1141,12 +1146,15 @@ const TREE_DIGEST_VERSION: &[u8] = b"kache-crate-tree-v1\n";
 /// tree has settled ([`crate::tree_stamp::TreeStamp::settled_at`]). The walk
 /// goes to `file_hasher` for the guard ([`tree_guard_of`]).
 fn tree_digest_memoised(
-    roots: Vec<TreeRoot<'_>>,
+    mut roots: Vec<TreeRoot<'_>>,
     file_hasher: &FileHasher<'_>,
     max_entries: usize,
     memo_dir: &Path,
     now: std::time::SystemTime,
 ) -> Option<String> {
+    for root in &mut roots {
+        root.own = own_dirs_within(&root.path, &file_hasher.own_dirs);
+    }
     for root in &roots {
         let marker = oversized_tree_marker(memo_dir, &root.path, max_entries);
         let recent = std::fs::metadata(&marker)
@@ -1255,6 +1263,28 @@ fn tree_digest_memo(memo_dir: &Path, roots: &[TreeRoot<'_>]) -> PathBuf {
     memo_dir
         .join("tree-digests")
         .join(&hasher.finalize().to_hex()[..32])
+}
+
+/// The directories of `own`, Kache's cache and runtime directories, that lie
+/// below `root`, spelled as a walk of `root` meets them. A build writes to
+/// them while units compile, and GitLab CI caches only paths inside the
+/// project, so a guard that walked them would move with every store and
+/// could run past its budget. A directory spelled through a link is matched
+/// by its resolved path.
+fn own_dirs_within(root: &Path, own: &[PathBuf]) -> Vec<PathBuf> {
+    if own.is_empty() {
+        return Vec::new();
+    }
+    let resolved_root = std::fs::canonicalize(root).ok();
+    own.iter()
+        .filter_map(|dir| {
+            let rest = dir
+                .strip_prefix(root)
+                .ok()
+                .or_else(|| dir.strip_prefix(resolved_root.as_deref()?).ok())?;
+            (!rest.as_os_str().is_empty()).then(|| root.join(rest))
+        })
+        .collect()
 }
 
 /// Is `manifest_dir` an extracted registry package (`<CARGO_HOME>/registry/src/<index>/<pkg>`)?
@@ -2520,6 +2550,7 @@ fn ancestor_top_digest(directory: &Path, file_hasher: &FileHasher<'_>) -> Option
         max_entries: CRATE_TREE_MAX_ENTRIES,
         stamp: stamp.digest,
     });
+    let own = own_dirs_within(directory, &file_hasher.own_dirs);
     let mut hasher = blake3::Hasher::new();
     for entry in entries {
         let name = entry.file_name();
@@ -2530,6 +2561,10 @@ fn ancestor_top_digest(directory: &Path, file_hasher: &FileHasher<'_>) -> Option
             continue;
         }
         let path = entry.path();
+        // Kache's own cache or runtime directory changes while units build.
+        if own.contains(&path) {
+            continue;
+        }
         // What this process cannot read, a macro it starts cannot read either.
         let unreadable = || "unreadable".to_string();
         let content = match std::fs::symlink_metadata(&path) {
@@ -6631,6 +6666,9 @@ pub struct FileHasher<'db> {
     /// The stat walks behind the tree digests computed since the last
     /// [`FileHasher::take_tree_walks`] (see [`tree_guard_of`]).
     tree_walks: RefCell<Vec<GuardWalk>>,
+    /// Kache's own directories, in each spelling, which tree guards leave
+    /// out ([`FileHasher::with_own_dirs`]).
+    own_dirs: Vec<PathBuf>,
 }
 
 impl Drop for FileHasher<'_> {
@@ -6741,6 +6779,7 @@ impl FileHasher<'static> {
             guard_inputs: RefCell::new(Vec::new()),
             pending_memo: RefCell::new(Vec::new()),
             tree_walks: RefCell::new(Vec::new()),
+            own_dirs: Vec::new(),
         }
     }
 
@@ -6761,6 +6800,7 @@ impl FileHasher<'static> {
                 guard_inputs: RefCell::new(Vec::new()),
                 pending_memo: RefCell::new(Vec::new()),
                 tree_walks: RefCell::new(Vec::new()),
+                own_dirs: Vec::new(),
             },
             Err(e) => {
                 tracing::debug!(
@@ -6837,6 +6877,7 @@ impl<'db> FileHasher<'db> {
             guard_inputs: RefCell::new(Vec::new()),
             pending_memo: RefCell::new(Vec::new()),
             tree_walks: RefCell::new(Vec::new()),
+            own_dirs: Vec::new(),
         }
     }
 
@@ -6858,6 +6899,18 @@ impl<'db> FileHasher<'db> {
 
     pub(crate) fn with_prediction_flights(mut self, cache_dir: Option<PathBuf>) -> Self {
         self.prediction_flight_dir = cache_dir;
+        self
+    }
+
+    /// Leave `dirs`, Kache's own cache and runtime directories, out of every
+    /// tree a guard walks ([`own_dirs_within`]). Each counts as spelled and as
+    /// resolved, as the declared build-script inputs leave them out
+    /// ([`crate::build_script_inputs::excluded_roots`]).
+    pub(crate) fn with_own_dirs<'p>(mut self, dirs: impl IntoIterator<Item = &'p Path>) -> Self {
+        for dir in dirs {
+            self.own_dirs
+                .extend(crate::build_script_inputs::excluded_roots(None, dir));
+        }
         self
     }
 

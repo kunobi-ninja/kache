@@ -6547,7 +6547,12 @@ fn compute_rustc_cache_key(
         None => crate::cache_key::FileHasher::new().with_daemon(config.socket_path()),
     }
     .with_input_predictions(config.input_predictions)
-    .with_prediction_flights(flight_dir);
+    .with_prediction_flights(flight_dir)
+    .with_own_dirs(
+        [config.cache_dir.as_path(), config.runtime_dir.as_path()]
+            .into_iter()
+            .chain(store.map(Store::cache_dir)),
+    );
     if config.modified_input_guard || emitted {
         // Flag keyed inputs touched at/after this invocation started — their
         // content at hash time may differ from what rustc reads, so we'll look

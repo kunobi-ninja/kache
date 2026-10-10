@@ -4418,6 +4418,31 @@ fn vendored_workspace(root: &Path) -> WorkspaceRoots {
     }
 }
 
+/// A vendored unit's guard reads the dot-directories at the top of each
+/// ancestor, but not Kache's own cache there: it changes while units build.
+#[test]
+fn a_vendored_guard_leaves_out_kaches_cache_at_an_ancestor() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("w");
+    let roots = vendored_workspace(&root);
+    let cache = root.join(".kache");
+    write_file(&cache.join("index.db"), "a");
+    let hasher = FileHasher::new().with_own_dirs([cache.as_path()]);
+    let taken = tree_guard_of(&hasher, || workspace_tree_digest(&roots, &hasher)).unwrap();
+    write_file(&cache.join("index.db"), "ab");
+    assert!(taken.held(), "the store moved");
+    let again = tree_guard_of(&hasher, || workspace_tree_digest(&roots, &hasher)).unwrap();
+    assert_eq!(again.digest, taken.digest);
+    let counted = FileHasher::new();
+    let before = workspace_tree_digest(&roots, &counted).unwrap();
+    write_file(&cache.join("index.db"), "abc");
+    assert_ne!(
+        workspace_tree_digest(&roots, &counted).unwrap(),
+        before,
+        "another dot-directory there counts"
+    );
+}
+
 /// A file or dot-directory that came and went at the top of an ancestor
 /// while the unit compiled leaves the digest as it was, so a record could
 /// pair that digest with output a macro made from it. The ancestor's own
@@ -12460,6 +12485,60 @@ fn tree_budgets_add_up_across_roots_and_skip_exclusions() {
     assert!(!oversized_tree_marker(&memo, &first, 5).exists());
     assert!(!oversized_tree_marker(&memo, &second, 5).exists());
     assert!(tree_digest_memoised(roots(), &hasher, 6, &memo, now).is_some());
+}
+
+/// Kache's cache and runtime directories inside a guarded tree, as GitLab CI
+/// requires of cached paths, are left out: the build writes to them while a
+/// unit compiles, and a large store would run the walk past its budget. A
+/// directory given through another spelling is found by its resolved path.
+#[test]
+fn kaches_own_directories_are_left_out_of_a_guarded_tree() {
+    let dir = tempfile::tempdir().unwrap();
+    let memo = dir.path().join("memo");
+    let root = dir.path().join("w");
+    let cache = root.join(".cache/kache");
+    let runtime = root.join("run");
+    write_file(&root.join("kt/src/lib.rs"), "");
+    write_file(&cache.join("index.db"), "a");
+    write_file(&runtime.join("events.jsonl"), "");
+    let roots = || vec![TreeRoot::new(root.clone(), b"workspace", &[])];
+    let now = std::time::SystemTime::now();
+    let guard_with = |hasher: &FileHasher<'_>| {
+        tree_guard_of(hasher, || {
+            // `kt`, `kt/src`, `kt/src/lib.rs` and `.cache`.
+            tree_digest_memoised(roots(), hasher, 4, &memo, now)
+        })
+    };
+    let hasher = FileHasher::new().with_own_dirs([cache.as_path(), runtime.as_path()]);
+    let taken = guard_with(&hasher).expect("the cache does not count toward the budget");
+    write_file(&cache.join("index.db"), "ab");
+    write_file(&cache.join("blobs/x"), "x");
+    write_file(&runtime.join("events.jsonl"), "{}\n");
+    assert!(taken.held(), "the store and the event log moved");
+    assert_eq!(
+        guard_with(&hasher).map(|guard| guard.digest),
+        Some(taken.digest.clone())
+    );
+    #[cfg(unix)]
+    {
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&root, &link).unwrap();
+        let linked = FileHasher::new().with_own_dirs([
+            link.join(".cache/kache").as_path(),
+            link.join("run").as_path(),
+        ]);
+        assert_eq!(
+            guard_with(&linked).map(|guard| guard.digest),
+            Some(taken.digest.clone()),
+            "the directories given through a link"
+        );
+    }
+    write_file(&root.join("kt/src/lib.rs"), "pub fn a() {}\n");
+    assert!(!taken.held(), "the workspace itself still counts");
+    assert!(
+        guard_with(&FileHasher::new()).is_none(),
+        "counted, the cache runs the walk past its budget"
+    );
 }
 
 /// A settled tree's digest is memoised under its stamp, and the next unit

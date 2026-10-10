@@ -1154,7 +1154,7 @@ fn oversized_roots_marker(memo_dir: &Path, roots: &[WalkedRoot], max_entries: us
 
 /// Whether `marker` was written less than [`OVERSIZED_TREE_TTL`] before
 /// `now`. A marker from the future counts as fresh.
-fn marked_recently(marker: &Path, now: std::time::SystemTime) -> bool {
+pub(crate) fn marked_recently(marker: &Path, now: std::time::SystemTime) -> bool {
     std::fs::metadata(marker)
         .and_then(|metadata| metadata.modified())
         .is_ok_and(|marked| {

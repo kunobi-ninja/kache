@@ -386,14 +386,7 @@ fn package_state(
         &located.manifest_dir,
         resolver.max_entries,
     );
-    let recent = std::fs::metadata(&marker)
-        .and_then(|metadata| metadata.modified())
-        .is_ok_and(|marked| {
-            marked
-                .elapsed()
-                .map_or(true, |age| age < crate::cache_key::OVERSIZED_TREE_TTL)
-        });
-    if recent {
+    if crate::cache_key::marked_recently(&marker, std::time::SystemTime::now()) {
         return Err(TooManyInputs.into());
     }
     let walk = Walk {

@@ -872,13 +872,10 @@ fn remove_path_safely(path: &Path) -> bool {
 
 /// Create `path` unless it exists. A directory another process created first
 /// counts, so concurrent first builds do not lose the unit's lock. A symlink
-/// never counts.
+/// never counts. Whatever the creation returned, only the path decides.
 fn ensure_real_directory(path: &Path) -> bool {
-    match fs::create_dir(path) {
-        Ok(()) => real_directory(path),
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => real_directory(path),
-        Err(_) => false,
-    }
+    let _ = fs::create_dir(path);
+    real_directory(path)
 }
 
 fn real_directory(path: &Path) -> bool {

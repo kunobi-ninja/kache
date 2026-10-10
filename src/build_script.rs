@@ -4572,6 +4572,43 @@ mod tests {
         unsafe { std::env::remove_var("KACHE_CACHE_DIR") };
     }
 
+    /// The memo is recorded under the stamp of what the walk reads, without
+    /// what it excludes: a write there keeps the stamp, and so the memo.
+    #[cfg(unix)]
+    #[test]
+    fn a_tree_digest_memo_is_stamped_without_what_the_walk_excludes() {
+        let _lock = crate::test_support::process_state_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        // SAFETY: the process-state lock serialises environment edits.
+        unsafe { std::env::set_var("KACHE_CACHE_DIR", dir.path().join("cache")) };
+        let root = dir.path().join("lib");
+        let out = root.join("out");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(root.join("src/a.c"), "int a;").unwrap();
+        std::fs::write(out.join("a.o"), "a").unwrap();
+        let old = filetime::FileTime::from_unix_time(1_000_000_000, 0);
+        for entry in [root.join("src/a.c"), root.join("src"), root.clone()] {
+            filetime::set_file_mtime(&entry, old).unwrap();
+        }
+        let excluded = [out.clone()];
+        let hasher = crate::cache_key::FileHasher::new();
+        let mut budget = 100;
+
+        let digest = input_state(&root, &excluded, &hasher, &mut budget, 0).unwrap();
+        let stamp = tree_stamp(&root, &excluded, 100).unwrap();
+        assert_eq!(
+            tree_digest_memo(&root, None, &stamp.digest).as_deref(),
+            Some(digest.as_str())
+        );
+        std::fs::write(out.join("b.o"), "b").unwrap();
+        assert_eq!(
+            tree_stamp(&root, &excluded, 100).unwrap().digest,
+            stamp.digest
+        );
+        unsafe { std::env::remove_var("KACHE_CACHE_DIR") };
+    }
+
     /// A run the cache gave up on still leaves an event, so the next build's
     /// miss has a cause in the report. The reason keeps only the outermost
     /// context: one cause is one reason, whatever paths its chain names.

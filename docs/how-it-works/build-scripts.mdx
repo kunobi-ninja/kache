@@ -154,7 +154,13 @@ depends on its package, as in Cargo. Kache then keys the package's files other
 than Rust sources, which the compile reports itself when it reads them, and
 leaves out sub-packages. Every directory walk leaves out VCS metadata (`.git`,
 `.hg`, `.jj`, `.svn`), directories holding Cargo's `CACHEDIR.TAG`, the target
-directory and the Kache cache directory.
+directory, and Kache's own cache and runtime directories. It also leaves out
+what Cargo writes in its home: the downloads in `registry` and `git`, its
+`.global-cache` record and lock files, and what `cargo install` adds. A CI job
+may keep Kache's cache and Cargo's home inside the project, as GitLab requires
+for cached paths. The rest of Cargo's home counts, so with the home in the
+project's `.cargo`, `.cargo/config.toml` is still one of the root package's
+files.
 
 What rustc could not read either counts as such. rustc runs as the same user
 as Kache, so a file the user may not read, or a directory the user may

@@ -77,7 +77,10 @@ impl Fixture {
         let var = |name: &str| env.get(name).cloned();
         let mut file_hasher = FileHasher::new();
         file_hasher.arm_too_new_guard(1, 0);
-        let excluded = excluded_roots(Some(self.root.join("target")), &self.cache);
+        // What the wrapper leaves out: the cache, and what Cargo writes in
+        // its home.
+        let mut excluded = excluded_roots(Some(self.root.join("target")), [self.cache.as_path()]);
+        excluded.extend(cargo_home(&var).map_or_else(Vec::new, |home| cargo_home_writes(&home)));
         let outside = |path: &Path| Ok(format!("outside:{}", path.display()).into_bytes());
         resolve(
             &self.located(),
@@ -666,6 +669,62 @@ fn a_script_that_declares_nothing_is_keyed_by_its_packages_other_files() {
     assert_ne!(fixture.digest(&[]), edited, "a package file was added");
 }
 
+/// With Cargo's home in the package, as GitLab CI keeps it to cache Cargo's
+/// downloads, what Cargo writes there is not one of the package's files: its
+/// downloads, its record of their use and the files SQLite keeps beside it,
+/// its locks, and what `cargo install` adds. The rest of the home is: its
+/// `config.toml` is the package's own.
+#[test]
+fn what_cargo_writes_in_a_home_inside_the_package_is_left_out() {
+    let fixture = Fixture::new();
+    fixture.declare("cargo:rustc-cfg=x\n");
+    fixture.write(".cargo/config.toml", "[build]\n");
+    let home = fixture.package.join(".cargo");
+    let vars = [("CARGO_HOME", home.to_str().unwrap())];
+    let base = fixture.digest(&vars);
+    for written in [
+        "registry/cache/index/dep-1.0.0.crate",
+        "git/db/dep-0123456789abcdef/HEAD",
+        ".global-cache",
+        ".global-cache-journal",
+        ".global-cache-wal",
+        ".global-cache-shm",
+        ".package-cache",
+        ".package-cache-mutate",
+        "bin/cargo-tool",
+        ".crates.toml",
+        ".crates2.json",
+    ] {
+        fixture.write(&format!(".cargo/{written}"), written);
+        assert_eq!(fixture.digest(&vars), base, "{written} is Cargo's");
+    }
+    fixture.write(".cargo/config.toml", "[build]\njobs = 2\n");
+    assert_ne!(
+        fixture.digest(&vars),
+        base,
+        "the home's configuration counts"
+    );
+}
+
+/// Cargo's home given through a link: what Cargo writes there is named below
+/// the resolved home as well, before Cargo writes it, as a walk of the real
+/// tree would meet it.
+#[cfg(unix)]
+#[test]
+fn what_cargo_writes_is_named_below_the_resolved_home_too() {
+    let dir = tempfile::tempdir().unwrap();
+    let real = scratch(&dir);
+    let home = real.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let link = real.join("link");
+    std::os::unix::fs::symlink(&home, &link).unwrap();
+    let writes = cargo_home_writes(&link);
+    for name in CARGO_HOME_WRITES {
+        assert!(writes.contains(&link.join(name)), "{name} as spelled");
+        assert!(writes.contains(&home.join(name)), "{name} as resolved");
+    }
+}
+
 #[test]
 fn an_empty_declared_path_watches_the_package_too() {
     let fixture = Fixture::new();
@@ -982,20 +1041,29 @@ fn excluded_roots_name_each_spelling() {
     let real = dir.path().canonicalize().unwrap();
     let target = real.join("target");
     let cache = real.join("cache");
-    std::fs::create_dir_all(&target).unwrap();
-    std::fs::create_dir_all(&cache).unwrap();
+    let runtime = real.join("runtime");
+    for dir in [&target, &cache, &runtime] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
     assert_eq!(
-        excluded_roots(Some(target.clone()), &cache),
-        [target.clone(), cache.clone()]
+        excluded_roots(Some(target.clone()), [cache.as_path(), runtime.as_path()]),
+        [target.clone(), cache.clone(), runtime.clone()]
     );
-    assert_eq!(excluded_roots(None, &cache), std::slice::from_ref(&cache));
+    assert_eq!(
+        excluded_roots(None, [cache.as_path()]),
+        std::slice::from_ref(&cache)
+    );
     #[cfg(unix)]
     {
         let link = real.join("link");
         std::os::unix::fs::symlink(&real, &link).unwrap();
+        let linked_runtime = link.join("runtime");
         assert_eq!(
-            excluded_roots(Some(link.join("target")), &cache),
-            [target, link.join("target"), cache]
+            excluded_roots(
+                Some(link.join("target")),
+                [cache.as_path(), linked_runtime.as_path()]
+            ),
+            [target, link.join("target"), cache, runtime, linked_runtime]
         );
     }
 }

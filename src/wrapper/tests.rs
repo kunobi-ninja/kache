@@ -10862,7 +10862,8 @@ fn declared_inputs_that_moved_during_the_compile_are_caught() {
         let mut hasher = store.file_hasher();
         hasher.arm_too_new_guard(1, 0);
         let crate::build_script_inputs::Resolved::Folded(snapshot) =
-            resolve_located_build_script_inputs(&config, &args, &located, &hasher, None).unwrap()
+            resolve_located_build_script_inputs(&config, &args, &store, &located, &hasher, None)
+                .unwrap()
         else {
             panic!("the declared inputs fold");
         };

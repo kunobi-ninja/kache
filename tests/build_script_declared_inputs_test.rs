@@ -20,7 +20,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 mod common;
-use common::{build_kache, hermetic_command, isolated_config_path, kache_binary, stop_daemon};
+use common::{
+    build_kache, hermetic_command, isolated_config_path, kache_binary, settle_writes, stop_daemon,
+};
 
 /// The units whose keys the declared inputs reach.
 const UNITS: [&str; 5] = ["app", "app_cli", "app2", "app3", "app4"];
@@ -388,6 +390,92 @@ pub fn rewrite(_input: TokenStream) -> TokenStream {
         assert_eq!(key(&again, "live"), key(&first, "live"), "{deferred}");
         assert_eq!(result(&again, "live"), "skipped", "{}", again["live"]);
     }
+}
+
+/// GitLab CI caches only paths inside the project, so a job that caches
+/// Cargo's downloads puts CARGO_HOME there, inside the root package, and
+/// Cargo writes to it on ordinary runs. A unit whose script declares nothing
+/// is keyed by its package's files, and what Cargo writes in its home is not
+/// one of them. The rest of the home is: with the home in the package's
+/// `.cargo`, its `config.toml` is the package's own. Any other file counts
+/// too.
+#[test]
+fn what_cargo_writes_in_a_home_inside_the_package_is_not_one_of_its_files() {
+    build_kache();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let cache = root.join("cache");
+    let _daemon = CacheGuard(cache.clone());
+    let package = root.join("app");
+    write(
+        &package.join("Cargo.toml"),
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+    );
+    write(
+        &package.join("src/lib.rs"),
+        "pub fn answer() -> u32 { 42 }\n",
+    );
+    write(&package.join("README.md"), "app\n");
+    let home = package.join(".cargo");
+    write(&home.join(".global-cache"), "first run");
+    write(&home.join("config.toml"), "[build]\n");
+    let out_dir = package.join("target/debug/build/app-0123456789abcdef/out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    // The script printed nothing, so its package is its input.
+    std::fs::write(out_dir.with_file_name("output"), "").unwrap();
+    let deps = package.join("target/debug/deps");
+    std::fs::create_dir_all(&deps).unwrap();
+    let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+    let compile = || {
+        settle_writes(&[&package]);
+        let output = hermetic_command(kache_binary(), &cache, Some(&isolated_config_path(&cache)))
+            .arg(&rustc)
+            .args(["--crate-name", "app", "--edition=2021", "src/lib.rs"])
+            .args(["--crate-type", "lib", "--emit=dep-info,metadata,link"])
+            .args(["-C", "metadata=0123456789abcdef", "--out-dir"])
+            .arg(&deps)
+            .current_dir(&package)
+            .env("CARGO_HOME", &home)
+            .env("CARGO_MANIFEST_DIR", &package)
+            .env("CARGO_PKG_NAME", "app")
+            .env("OUT_DIR", &out_dir)
+            .env_remove("KACHE_DISABLED")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let log = std::fs::read_to_string(cache.join("events.jsonl")).unwrap();
+        let event = log
+            .lines()
+            .rev()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .find(|event| event["crate_name"] == "app")
+            .expect("an event for app");
+        (
+            event["result"].as_str().unwrap().to_string(),
+            event["cache_key"].as_str().unwrap().to_string(),
+        )
+    };
+
+    let (cold, key) = compile();
+    assert_eq!(cold, "miss");
+    // What Cargo records there when a build uses downloaded crates, a
+    // download, and what `cargo install` adds.
+    write(&home.join(".global-cache"), "second run");
+    write(&home.join("registry/cache/index/dep-1.0.0.crate"), "dep");
+    write(&home.join("bin/cargo-tool"), "tool");
+    assert_eq!(compile(), ("local_hit".to_string(), key.clone()));
+    write(&home.join("config.toml"), "[build]\njobs = 2\n");
+    let (configured, configured_key) = compile();
+    assert_ne!(configured_key, key, "the home's configuration counts");
+    assert_ne!(configured, "local_hit");
+    write(&package.join("README.md"), "app, edited\n");
+    let (edited, edited_key) = compile();
+    assert_ne!(edited_key, configured_key, "a package file still counts");
+    assert_ne!(edited, "local_hit");
 }
 
 fn script(path: &Path, body: &str) {

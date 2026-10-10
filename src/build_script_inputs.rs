@@ -16,7 +16,11 @@
 //! Cargo itself sets on the rustc command, which counts by name only. A
 //! script that declares nothing, or declares the empty path, depends on its
 //! package: its files other than Rust sources (the compile reports the ones
-//! it reads), less sub-packages, target directories and VCS metadata.
+//! it reads), less sub-packages, target directories and VCS metadata. Every
+//! walk also leaves out what a build writes while units compile: Kache's own
+//! directories and what Cargo itself writes in its home
+//! ([`CARGO_HOME_WRITES`]). The rest of the home counts, its configuration
+//! among it.
 //!
 //! Only workspace and path packages are in scope. Cargo treats paths under
 //! its home as immutable, and the variables `cc` and `pkg-config` declare
@@ -138,6 +142,34 @@ fn under_cargo_home(home: &Path, path: &Path) -> bool {
     path.starts_with(home.join("registry")) || path.starts_with(home.join("git"))
 }
 
+/// What Cargo itself writes in its home: its downloads, its record of when
+/// it last used each one (with the files SQLite keeps beside it while it
+/// writes), its locks, and what `cargo install` adds. Anything else there is
+/// the user's, such as `config.toml`, which is the project's own when the
+/// home is the project's `.cargo`.
+const CARGO_HOME_WRITES: [&str; 11] = [
+    "registry",
+    "git",
+    ".global-cache",
+    ".global-cache-journal",
+    ".global-cache-wal",
+    ".global-cache-shm",
+    ".package-cache",
+    ".package-cache-mutate",
+    "bin",
+    ".crates.toml",
+    ".crates2.json",
+];
+
+/// [`CARGO_HOME_WRITES`] in `home`, below the home as spelled and as
+/// resolved, so an entry Cargo has not written yet is named both ways too.
+pub(crate) fn cargo_home_writes(home: &Path) -> Vec<PathBuf> {
+    excluded_roots(None, [home])
+        .into_iter()
+        .flat_map(|home| CARGO_HOME_WRITES.map(|name| home.join(name)))
+        .collect()
+}
+
 /// What resolving a unit's declared inputs reads besides the unit.
 pub(crate) struct Resolver<'a, 'db> {
     /// Hashes declared files. The fingerprints it guards go into the snapshot.
@@ -145,8 +177,9 @@ pub(crate) struct Resolver<'a, 'db> {
     pub(crate) var: &'a dyn Fn(&str) -> Option<OsString>,
     /// Holds the tree memo and the marker of a package too large to digest.
     pub(crate) cache_dir: &'a Path,
-    /// Left out of every tree: the target directory and the cache, in each
-    /// spelling.
+    /// Left out of every tree, in each spelling: the target directory,
+    /// Kache's own directories ([`excluded_roots`]) and what Cargo writes in
+    /// its home ([`cargo_home_writes`]).
     pub(crate) excluded: &'a [PathBuf],
     /// Spells a path outside the package and `OUT_DIR`, as the key spells a
     /// source there.
@@ -548,10 +581,16 @@ fn digest(paths: &BTreeMap<Vec<u8>, String>, vars: &BTreeMap<Vec<u8>, EnvState>)
 }
 
 /// What every walk leaves out besides VCS metadata and Cargo's tagged
-/// directories: the target directory and the cache, raw and canonical.
-pub(crate) fn excluded_roots(target_dir: Option<PathBuf>, cache_dir: &Path) -> Vec<PathBuf> {
+/// directories: the target directory and `dirs`, raw and canonical.
+pub(crate) fn excluded_roots<'p>(
+    target_dir: Option<PathBuf>,
+    dirs: impl IntoIterator<Item = &'p Path>,
+) -> Vec<PathBuf> {
     let mut excluded = Vec::new();
-    for root in target_dir.into_iter().chain([cache_dir.to_path_buf()]) {
+    for root in target_dir
+        .into_iter()
+        .chain(dirs.into_iter().map(Path::to_path_buf))
+    {
         if let Ok(canonical) = std::fs::canonicalize(&root)
             && canonical != root
         {

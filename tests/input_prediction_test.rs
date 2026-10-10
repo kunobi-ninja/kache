@@ -1407,9 +1407,10 @@ fn a_cache_inside_the_workspace_keeps_the_record_guarded_under_a_trust_domain() 
 }
 
 /// Cargo's home inside the workspace, where GitLab CI keeps it to cache
-/// Cargo's downloads, is not part of the workspace guard: Cargo records
-/// there when builds use downloaded crates, and the record must still
-/// apply.
+/// Cargo's downloads. What Cargo writes there is not part of the workspace
+/// guard: Cargo records there when builds use downloaded crates, and the
+/// record must still apply. The rest of the home is: with the home in the
+/// workspace's `.cargo`, its `config.toml` is the workspace's.
 #[test]
 fn a_cargo_home_inside_the_workspace_keeps_the_record_guarded() {
     build_kache();
@@ -1418,12 +1419,20 @@ fn a_cargo_home_inside_the_workspace_keeps_the_record_guarded() {
     let home = a.join(".cargo");
     std::fs::create_dir_all(&home).unwrap();
     std::fs::write(home.join(".global-cache"), "first run").unwrap();
+    std::fs::write(home.join("config.toml"), "[build]\n").unwrap();
     unit.env.push(("CARGO_HOME", home.clone().into()));
     assert_eq!(unit.build(&a, true, None).result, "miss");
     std::fs::write(home.join(".global-cache"), "second run").unwrap();
     let warm = unit.build(&a, true, None);
     assert_eq!(warm.result, "local_hit");
     assert_eq!(warm.dep_info_runs, 0, "the record kept its guard");
+    std::fs::write(home.join("config.toml"), "[build]\njobs = 2\n").unwrap();
+    let configured = unit.build(&a, true, None);
+    assert_eq!(configured.result, "local_hit");
+    assert_eq!(
+        configured.dep_info_runs, 1,
+        "the home's configuration is part of the guard"
+    );
 }
 
 /// A file the closure does not name, anywhere in the workspace, could be one

@@ -3532,8 +3532,14 @@ fn resolve_build_script_inputs(
     };
     let mut file_hasher = store.file_hasher_with_daemon(config.socket_path());
     file_hasher.arm_too_new_guard(invocation_start_ns, 0);
-    let resolved =
-        resolve_located_build_script_inputs(config, args, &located, &file_hasher, workspace_root)?;
+    let resolved = resolve_located_build_script_inputs(
+        config,
+        args,
+        store,
+        &located,
+        &file_hasher,
+        workspace_root,
+    )?;
     let crate_name = args.crate_name.as_deref().unwrap_or("unknown");
     let snapshot = match resolved {
         crate::build_script_inputs::Resolved::Folded(snapshot) => {
@@ -3566,11 +3572,13 @@ fn resolve_build_script_inputs(
 fn resolve_located_build_script_inputs(
     config: &Config,
     args: &RustcArgs,
+    store: &Store,
     located: &crate::build_script_inputs::Located,
     file_hasher: &FileHasher<'_>,
     workspace_root: Option<&Path>,
 ) -> Result<crate::build_script_inputs::Resolved> {
-    let excluded = crate::build_script_inputs::excluded_roots(args.target_dir(), &config.cache_dir);
+    let mut excluded = crate::build_script_inputs::excluded_roots(args.target_dir(), []);
+    excluded.extend(written_while_building(config, Some(store)));
     let normalizer = std::cell::OnceCell::new();
     let outside = |path: &Path| {
         let normalizer = normalizer.get_or_init(|| {
@@ -3609,7 +3617,14 @@ fn build_script_inputs_moved(
     let _trace = crate::phase_trace::phase("build_script_inputs_verify");
     let crate_name = args.crate_name.as_deref().unwrap_or("unknown");
     let file_hasher = store.file_hasher_with_daemon(config.socket_path());
-    match resolve_located_build_script_inputs(config, args, located, &file_hasher, workspace_root) {
+    match resolve_located_build_script_inputs(
+        config,
+        args,
+        store,
+        located,
+        &file_hasher,
+        workspace_root,
+    ) {
         Ok(crate::build_script_inputs::Resolved::Folded(now)) if !snapshot.moved_since(&now) => {
             false
         }
@@ -6498,6 +6513,35 @@ fn discovery_flight_dir(config: &Config, discovery: &KeyDiscovery) -> Option<Pat
         .then(|| config.cache_dir.clone())
 }
 
+/// What Kache and Cargo write as a project builds, which the tree guard and
+/// the walks of declared build-script inputs leave out wherever it lies
+/// inside a tree, each as spelled and as resolved: Kache's cache, runtime and
+/// probe directories, the store the unit's outputs route to, and what Cargo
+/// itself writes in its home ([`crate::build_script_inputs::cargo_home_writes`]).
+/// GitLab CI caches only paths inside the project, so a job keeps Kache's
+/// cache and Cargo's home there, and Cargo records in its home when builds
+/// use downloaded crates. The rest of Cargo's home still counts: with the
+/// home in the project's `.cargo`, its `config.toml` is the project's. Under
+/// a trust domain the probe directory, which holds the tree memos, stays in
+/// the base cache directory, outside the domain's own cache.
+fn written_while_building(config: &Config, store: Option<&Store>) -> Vec<PathBuf> {
+    let probe_dir = crate::config::probe_memo_dir();
+    let mut written = crate::build_script_inputs::excluded_roots(
+        None,
+        [
+            config.cache_dir.as_path(),
+            config.runtime_dir.as_path(),
+            probe_dir.as_path(),
+        ]
+        .into_iter()
+        .chain(store.map(Store::cache_dir)),
+    );
+    if let Some(home) = crate::build_script_inputs::cargo_home(&|name| std::env::var_os(name)) {
+        written.extend(crate::build_script_inputs::cargo_home_writes(&home));
+    }
+    written
+}
+
 /// What resolving the invocation's extra inputs, and its build script's
 /// declared inputs, contributes to its key.
 #[derive(Default)]
@@ -6550,29 +6594,13 @@ fn compute_rustc_cache_key(
         crate::cache_key::provide_dep_info(dep_info, tree);
     }
     let emitted_sources = crate::cache_key::provided_dep_info_sources();
-    // Written while units build, so tree guards leave them out. Under a
-    // trust domain the tree memos stay in the base cache's probe directory,
-    // outside the domain's own cache. Cargo records in its home when builds
-    // use downloaded crates, and GitLab CI keeps that home inside the
-    // project as well.
-    let probe_dir = crate::config::probe_memo_dir();
-    let cargo_home = crate::build_script_inputs::cargo_home(&|name| std::env::var_os(name));
     let mut file_hasher = match store {
         Some(store) => store.file_hasher_with_daemon(config.socket_path()),
         None => crate::cache_key::FileHasher::new().with_daemon(config.socket_path()),
     }
     .with_input_predictions(config.input_predictions)
     .with_prediction_flights(flight_dir)
-    .with_own_dirs(
-        [
-            config.cache_dir.as_path(),
-            config.runtime_dir.as_path(),
-            probe_dir.as_path(),
-        ]
-        .into_iter()
-        .chain(store.map(Store::cache_dir))
-        .chain(cargo_home.as_deref()),
-    );
+    .with_own_dirs(written_while_building(config, store));
     if config.modified_input_guard || emitted {
         // Flag keyed inputs touched at/after this invocation started — their
         // content at hash time may differ from what rustc reads, so we'll look

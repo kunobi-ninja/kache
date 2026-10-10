@@ -4427,7 +4427,7 @@ fn a_vendored_guard_leaves_out_kaches_cache_at_an_ancestor() {
     let roots = vendored_workspace(&root);
     let cache = root.join(".kache");
     write_file(&cache.join("index.db"), "a");
-    let hasher = FileHasher::new().with_own_dirs([cache.as_path()]);
+    let hasher = FileHasher::new().with_own_dirs([cache.clone()]);
     let taken = tree_guard_of(&hasher, || workspace_tree_digest(&roots, &hasher)).unwrap();
     write_file(&cache.join("index.db"), "ab");
     assert!(taken.held(), "the store moved");
@@ -12526,7 +12526,7 @@ fn kaches_own_directories_are_left_out_of_a_guarded_tree() {
             tree_digest_memoised(roots(), hasher, 4, &memo, now)
         })
     };
-    let hasher = FileHasher::new().with_own_dirs([cache.as_path(), runtime.as_path()]);
+    let hasher = FileHasher::new().with_own_dirs([cache.clone(), runtime.clone()]);
     let taken = guard_with(&hasher).expect("the cache does not count toward the budget");
     write_file(&cache.join("index.db"), "ab");
     write_file(&cache.join("blobs/x"), "x");
@@ -12540,10 +12540,13 @@ fn kaches_own_directories_are_left_out_of_a_guarded_tree() {
     {
         let link = dir.path().join("link");
         std::os::unix::fs::symlink(&root, &link).unwrap();
-        let linked = FileHasher::new().with_own_dirs([
-            link.join(".cache/kache").as_path(),
-            link.join("run").as_path(),
-        ]);
+        let linked = FileHasher::new().with_own_dirs(crate::build_script_inputs::excluded_roots(
+            None,
+            [
+                link.join(".cache/kache").as_path(),
+                link.join("run").as_path(),
+            ],
+        ));
         assert_eq!(
             guard_with(&linked).map(|guard| guard.digest),
             Some(taken.digest.clone()),

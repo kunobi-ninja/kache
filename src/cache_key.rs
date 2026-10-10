@@ -1050,8 +1050,8 @@ struct TreeRoot<'a> {
     /// Cargo tagged it as a build directory: a stale `target`, or the target
     /// directory of another build.
     skips_build_dirs: bool,
-    /// Kache's own directories and Cargo's home below the root
-    /// ([`own_dirs_within`]), left out wherever they lie.
+    /// Kache's own directories, and what Cargo writes in its home, below the
+    /// root ([`own_dirs_within`]), left out wherever they lie.
     own: Vec<PathBuf>,
 }
 
@@ -1310,12 +1310,12 @@ fn tree_digest_memo(memo_dir: &Path, roots: &[TreeRoot<'_>]) -> PathBuf {
         .join(&hasher.finalize().to_hex()[..32])
 }
 
-/// The directories of `own`, Kache's own directories and Cargo's home, that
-/// lie below `root`, spelled as a walk of `root` meets them. A build writes to
-/// them while units compile, and GitLab CI caches only paths inside the
-/// project, so a guard that walked them would move with every store and
-/// could run past its budget. A directory spelled through a link is matched
-/// by its resolved path.
+/// The paths of `own`, Kache's own directories and what Cargo writes in its
+/// home, that lie below `root`, spelled as a walk of `root` meets them. A
+/// build writes to them while units compile, and GitLab CI caches only paths
+/// inside the project, so a guard that walked them would move with every
+/// store and could run past its budget. A path spelled through a link is
+/// matched by its resolved path.
 fn own_dirs_within(root: &Path, own: &[PathBuf]) -> Vec<PathBuf> {
     if own.is_empty() {
         return Vec::new();
@@ -2606,7 +2606,8 @@ fn ancestor_top_digest(directory: &Path, file_hasher: &FileHasher<'_>) -> Option
             continue;
         }
         let path = entry.path();
-        // Kache's own directories and Cargo's home change while units build.
+        // Kache's own directories, and what Cargo writes in its home, change
+        // while units build.
         if own.contains(&path) {
             continue;
         }
@@ -6711,8 +6712,8 @@ pub struct FileHasher<'db> {
     /// The stat walks behind the tree digests computed since the last
     /// [`FileHasher::take_tree_walks`] (see [`tree_guard_of`]).
     tree_walks: RefCell<Vec<GuardWalk>>,
-    /// Kache's own directories and Cargo's home, in each spelling, which tree
-    /// guards leave out ([`FileHasher::with_own_dirs`]).
+    /// Kache's own directories and what Cargo writes in its home, in each
+    /// spelling, which tree guards leave out ([`FileHasher::with_own_dirs`]).
     own_dirs: Vec<PathBuf>,
 }
 
@@ -6947,16 +6948,13 @@ impl<'db> FileHasher<'db> {
         self
     }
 
-    /// Leave `dirs` out of every tree a guard walks ([`own_dirs_within`]):
-    /// Kache's cache, runtime and probe directories, and Cargo's home, all
-    /// written while units build. Each counts as spelled and as resolved, as
-    /// the declared build-script inputs leave the cache out
-    /// ([`crate::build_script_inputs::excluded_roots`]).
-    pub(crate) fn with_own_dirs<'p>(mut self, dirs: impl IntoIterator<Item = &'p Path>) -> Self {
-        for dir in dirs {
-            self.own_dirs
-                .extend(crate::build_script_inputs::excluded_roots(None, dir));
-        }
+    /// Leave `paths` out of every tree a guard walks ([`own_dirs_within`]):
+    /// Kache's cache, runtime and probe directories, and what Cargo writes in
+    /// its home. Each comes in every spelling a walk may meet it by
+    /// ([`crate::build_script_inputs::excluded_roots`]), and the declared
+    /// build-script inputs leave out the same paths.
+    pub(crate) fn with_own_dirs(mut self, paths: impl IntoIterator<Item = PathBuf>) -> Self {
+        self.own_dirs.extend(paths);
         self
     }
 

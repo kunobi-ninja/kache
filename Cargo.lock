@@ -2251,7 +2251,7 @@ dependencies = [
 
 [[package]]
 name = "kache"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -2319,7 +2319,7 @@ dependencies = [
 
 [[package]]
 name = "kache-core"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2331,7 +2331,7 @@ dependencies = [
 
 [[package]]
 name = "kache-e2e"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2346,7 +2346,7 @@ dependencies = [
 
 [[package]]
 name = "kache-format"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2354,7 +2354,7 @@ dependencies = [
 
 [[package]]
 name = "kache-fs"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "libc",
  "serde",
@@ -2365,11 +2365,11 @@ dependencies = [
 
 [[package]]
 name = "kache-proofs"
-version = "1.0.0"
+version = "1.1.0"
 
 [[package]]
 name = "kache-service"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2397,7 +2397,7 @@ dependencies = [
 
 [[package]]
 name = "kache-shims"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "kache-fs",
  "libc",
@@ -2407,7 +2407,7 @@ dependencies = [
 
 [[package]]
 name = "kache-store"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "blake3",

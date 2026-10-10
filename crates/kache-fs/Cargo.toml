@@ -1,6 +1,6 @@
 [package]
 name = "kache-fs"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2024"
 rust-version = "1.95"
 description = "Filesystem measurements, file identity, native cloning and copying."

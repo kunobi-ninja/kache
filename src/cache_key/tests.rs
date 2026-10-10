@@ -12456,7 +12456,8 @@ fn an_oversized_tree_is_counted_not_hashed_and_remembered() {
 }
 
 /// Roots that each fit but together run past the budget withhold the digest
-/// without marking either, and an excluded directory does not count.
+/// without marking either, and are remembered together, so the next unit
+/// does not walk them again. An excluded directory does not count.
 #[test]
 fn tree_budgets_add_up_across_roots_and_skip_exclusions() {
     let dir = tempfile::tempdir().unwrap();
@@ -12485,6 +12486,22 @@ fn tree_budgets_add_up_across_roots_and_skip_exclusions() {
     assert!(!oversized_tree_marker(&memo, &first, 5).exists());
     assert!(!oversized_tree_marker(&memo, &second, 5).exists());
     assert!(tree_digest_memoised(roots(), &hasher, 6, &memo, now).is_some());
+
+    std::fs::remove_file(second.join("f2")).unwrap();
+    assert!(
+        tree_digest_memoised(roots(), &hasher, 5, &memo, now).is_none(),
+        "remembered together while fresh"
+    );
+    let first_alone = vec![TreeRoot::new(first.clone(), b"workspace", skipped)];
+    assert!(
+        tree_digest_memoised(first_alone, &hasher, 5, &memo, now).is_some(),
+        "the first root alone is not remembered"
+    );
+    let later = now + OVERSIZED_TREE_TTL + std::time::Duration::from_secs(1);
+    assert!(
+        tree_digest_memoised(roots(), &hasher, 5, &memo, later).is_some(),
+        "a stale marker counts the roots again"
+    );
 }
 
 /// Kache's cache and runtime directories inside a guarded tree, as GitLab CI

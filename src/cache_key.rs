@@ -873,8 +873,10 @@ struct WalkedRoot {
 enum StampRefusal {
     /// The root at this index alone holds more entries than the budget.
     TooLarge(usize),
-    /// The roots together hold more, or one could not be walked.
-    Refused,
+    /// Each root fits, but together they hold more.
+    TooLargeTogether,
+    /// A root could not be walked.
+    Unwalkable,
 }
 
 /// One stat walk over `roots`, each of them and all of them together within
@@ -899,11 +901,11 @@ fn stamp_roots(
         match stamper.walk(&root.path, &root.excluded, root.rules, &mut budget) {
             crate::tree_stamp::WalkOutcome::Fits => total += max_entries - budget,
             crate::tree_stamp::WalkOutcome::TooLarge => return Err(StampRefusal::TooLarge(index)),
-            crate::tree_stamp::WalkOutcome::Unreadable => return Err(StampRefusal::Refused),
+            crate::tree_stamp::WalkOutcome::Unreadable => return Err(StampRefusal::Unwalkable),
         }
     }
     if total > max_entries {
-        return Err(StampRefusal::Refused);
+        return Err(StampRefusal::TooLargeTogether);
     }
     Ok(stamper.finish())
 }
@@ -1132,6 +1134,42 @@ fn oversized_tree_marker(memo_dir: &Path, root: &Path, max_entries: usize) -> Pa
         .join(&hasher.finalize().to_hex()[..32])
 }
 
+/// The marker recording that `roots` together hold more than `max_entries`
+/// entries, though each of them fits: a workspace and a unit's `OUT_DIR`.
+fn oversized_roots_marker(memo_dir: &Path, roots: &[WalkedRoot], max_entries: usize) -> PathBuf {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"kache-oversized-roots-v1\n");
+    for root in roots {
+        fold_field(
+            &mut hasher,
+            b"root:",
+            root.path.as_os_str().as_encoded_bytes(),
+        );
+    }
+    hasher.update(&max_entries.to_le_bytes());
+    memo_dir
+        .join("oversized-trees")
+        .join(&hasher.finalize().to_hex()[..32])
+}
+
+/// Whether `marker` was written less than [`OVERSIZED_TREE_TTL`] before
+/// `now`. A marker from the future counts as fresh.
+fn marked_recently(marker: &Path, now: std::time::SystemTime) -> bool {
+    std::fs::metadata(marker)
+        .and_then(|metadata| metadata.modified())
+        .is_ok_and(|marked| {
+            now.duration_since(marked)
+                .map_or(true, |age| age < OVERSIZED_TREE_TTL)
+        })
+}
+
+/// Write `marker`, if it can be written.
+fn write_marker(marker: &Path) {
+    if let Some(parent) = marker.parent() {
+        let _ = std::fs::create_dir_all(parent).and_then(|()| std::fs::write(marker, b""));
+    }
+}
+
 /// The version of [`crate_tree_fold`]'s digest, which a memoised digest is
 /// recorded for.
 const TREE_DIGEST_VERSION: &[u8] = b"kache-crate-tree-v1\n";
@@ -1140,7 +1178,8 @@ const TREE_DIGEST_VERSION: &[u8] = b"kache-crate-tree-v1\n";
 ///
 /// One stat walk stamps every root and enforces the budget without reading a
 /// file. A root that alone runs past the budget is remembered for
-/// [`OVERSIZED_TREE_TTL`]: a workspace root can be a whole monorepo. When the
+/// [`OVERSIZED_TREE_TTL`]: a workspace root can be a whole monorepo. So are
+/// roots that only together run past it, without marking either one. When the
 /// roots have the stamp a digest was recorded under, that digest is the
 /// answer; otherwise every file is read, and the digest is recorded once the
 /// tree has settled ([`crate::tree_stamp::TreeStamp::settled_at`]). The walk
@@ -1155,28 +1194,34 @@ fn tree_digest_memoised(
     for root in &mut roots {
         root.own = own_dirs_within(&root.path, &file_hasher.own_dirs);
     }
-    for root in &roots {
-        let marker = oversized_tree_marker(memo_dir, &root.path, max_entries);
-        let recent = std::fs::metadata(&marker)
-            .and_then(|metadata| metadata.modified())
-            .is_ok_and(|marked| {
-                now.duration_since(marked)
-                    .map_or(true, |age| age < OVERSIZED_TREE_TTL)
-            });
-        if recent {
-            return None;
-        }
+    if roots.iter().any(|root| {
+        marked_recently(
+            &oversized_tree_marker(memo_dir, &root.path, max_entries),
+            now,
+        )
+    }) {
+        return None;
     }
     let walked: Vec<WalkedRoot> = roots.iter().map(TreeRoot::walked).collect();
+    let together = oversized_roots_marker(memo_dir, &walked, max_entries);
+    if marked_recently(&together, now) {
+        return None;
+    }
     let stamp = match stamp_roots(&walked, max_entries) {
         Ok(stamp) => stamp,
         Err(StampRefusal::TooLarge(index)) => {
-            let marker = oversized_tree_marker(memo_dir, &walked[index].path, max_entries);
-            let _ = std::fs::create_dir_all(marker.parent()?)
-                .and_then(|()| std::fs::write(&marker, b""));
+            write_marker(&oversized_tree_marker(
+                memo_dir,
+                &walked[index].path,
+                max_entries,
+            ));
             return None;
         }
-        Err(StampRefusal::Refused) => return None,
+        Err(StampRefusal::TooLargeTogether) => {
+            write_marker(&together);
+            return None;
+        }
+        Err(StampRefusal::Unwalkable) => return None,
     };
     let walk = GuardWalk {
         roots: walked,

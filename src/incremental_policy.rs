@@ -837,9 +837,15 @@ fn reset_locked(unit: &AdaptiveUnit) -> bool {
     // Removing private rustc state can fail or stop part-way, for example on
     // Ctrl-C. Mark the unit in flight first, durably, so what survives is a
     // state every lease resets, never an old active one beside a partial
-    // directory. The marker stays when the removal fails.
-    if !definitely_missing(&unit.rustc_dir) {
-        let _ = unit.store_state(&unit.in_flight_marker(), true);
+    // directory. The marker stays when the removal fails. Without the marker
+    // nothing is removed: a whole directory beside its own state is safe to
+    // lease. A state path that is not a regular file needs no marker, because
+    // every lease already treats it as corrupt.
+    if !definitely_missing(&unit.rustc_dir)
+        && !unsafe_file(&unit.state_path)
+        && !unit.store_state(&unit.in_flight_marker(), true)
+    {
+        return false;
     }
     if !remove_path_safely(&unit.rustc_dir) {
         return false;
@@ -1784,6 +1790,60 @@ mod tests {
             leased.is_none(),
             "a partial rustc directory must not be leased"
         );
+    }
+
+    /// Without its in-flight marker a reset removes nothing, so a removal cut
+    /// short can never leave part of the rustc state beside an active state.
+    #[cfg(unix)]
+    #[test]
+    fn a_reset_that_cannot_mark_the_unit_removes_nothing() {
+        use std::os::unix::fs::PermissionsExt;
+        // Root writes through mode 0500, which would void the simulation.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipping: running as root, chmod 0500 does not deny writes");
+            return;
+        }
+        let (_temp, _args, unit) = fixture();
+        activate(&unit, 10);
+        let active = fs::read(&unit.state_path).unwrap();
+        // The marker is written through a temporary file beside state.json.
+        // rustc/ itself stays writable.
+        fs::set_permissions(&unit.unit_dir, fs::Permissions::from_mode(0o500)).unwrap();
+        let observed = unit.observe_build_at(
+            &cache_key("hit"),
+            &fields("stable", "source-c", "extern-a"),
+            12,
+        );
+        fs::set_permissions(&unit.unit_dir, fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(!observed, "the marker failed, so nothing was observed");
+        assert_eq!(fs::read(&unit.state_path).unwrap(), active);
+        assert!(
+            unit.rustc_dir.join("dep-graph.bin").is_file(),
+            "rustc/ must stay whole beside the state it belongs to"
+        );
+        let lease = unit
+            .try_active_at(13)
+            .expect("a whole rustc directory may still be leased");
+        assert!(lease.finish_at(CompileOutcome::Success, 14));
+    }
+
+    /// Every lease treats a state path that is not a regular file as corrupt,
+    /// so a reset removes it, and any rustc state, without a marker.
+    #[test]
+    fn a_reset_removes_a_state_path_that_is_not_a_file() {
+        for rustc_state in [false, true] {
+            let (_temp, _args, unit) = fixture();
+            assert!(unit.ensure_layout());
+            fs::create_dir(&unit.state_path).unwrap();
+            if rustc_state {
+                fs::create_dir(&unit.rustc_dir).unwrap();
+                fs::write(unit.rustc_dir.join("dep-graph.bin"), b"old").unwrap();
+            }
+            assert!(unit.reset(), "rustc state: {rustc_state}");
+            assert!(!path_exists(&unit.state_path), "rustc state: {rustc_state}");
+            assert!(!path_exists(&unit.rustc_dir), "rustc state: {rustc_state}");
+        }
     }
 
     #[cfg(unix)]

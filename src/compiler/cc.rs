@@ -4839,9 +4839,45 @@ fn cc_memo_env_is_keyed(name: &OsStr) -> bool {
     CC_MEMO_KEYED_ENV.contains(&name) || cc_memo_env_pattern_is_keyed(name)
 }
 
+/// The schema line of every C/C++ compile key ([`CcCompiler::cache_key_with`]).
+///
+/// 2: older entries can retain donor paths outside the source/object root.
+/// 3: older entries can hold an object built from other bytes than their
+///    key names: keyed from a memo stamp or a mapped hash taken from a racy
+///    read, or from an input saved before a key-first compile read it.
+const CC_ARTIFACT_SCHEMA: &[u8] = b"cc_artifact_schema:3\n";
+
+/// The schema of [`cc_preprocess_memo_key`].
+///
+/// v4: the probe now runs with the compile's prefix maps, and path-bound
+/// expansions are never recorded. A v3 record may hold the mapped hash of
+/// one of those, which would give another checkout its key (#1004).
+/// v5: TUs whose expansion `.incbin`s or `.include`s a file are refused. A
+/// v4 record of one would skip the probe that refuses it (#1015).
+/// v6: inputs, mapped hashes and assembler verdicts follow the settle and
+/// single-read rules. A release that records v5 memos rewrites a memo row
+/// in place when it records the same key again, and nothing in the row says
+/// which release wrote it, so the two never share a key.
+const CC_PREPROCESS_MEMO_SCHEMA: &[u8] = b"cc-preprocess-memo-v6";
+
 /// Local identity for a preprocessor invocation. The environment is included
 /// as selected by [`cc_memo_env_is_keyed`].
 fn cc_preprocess_memo_key(
+    parsed: &CcArgs,
+    prefix_maps: &[CcPrefixMap],
+    compiler_version: &str,
+) -> Option<String> {
+    cc_preprocess_memo_key_as(
+        CC_PREPROCESS_MEMO_SCHEMA,
+        parsed,
+        prefix_maps,
+        compiler_version,
+    )
+}
+
+/// [`cc_preprocess_memo_key`] under `schema`.
+fn cc_preprocess_memo_key_as(
+    schema: &[u8],
     parsed: &CcArgs,
     prefix_maps: &[CcPrefixMap],
     compiler_version: &str,
@@ -4851,16 +4887,7 @@ fn cc_preprocess_memo_key(
     let compiler_path = super::resolve_program_on_path(&parsed.program)?;
     let compiler_metadata = std::fs::metadata(&compiler_path).ok()?;
     let mut hasher = blake3::Hasher::new();
-    // v4: the probe now runs with the compile's prefix maps, and path-bound
-    // expansions are never recorded. A v3 record may hold the mapped hash of
-    // one of those, which would give another checkout its key (#1004).
-    // v5: TUs whose expansion `.incbin`s or `.include`s a file are refused. A
-    // v4 record of one would skip the probe that refuses it (#1015).
-    // v6: inputs, mapped hashes and assembler verdicts follow the settle and
-    // single-read rules. A release that records v5 memos rewrites a memo
-    // row in place when it records the same key again, and nothing in the
-    // row says which release wrote it, so the two never share a key.
-    fold_cc_memo_field(&mut hasher, b"schema", b"cc-preprocess-memo-v6");
+    fold_cc_memo_field(&mut hasher, b"schema", schema);
     fold_cc_memo_field(
         &mut hasher,
         b"compiler-program",
@@ -6829,6 +6856,17 @@ impl CcCompiler {
         ctx: &KeyCtx<'_, '_>,
         discovery: CcKeyDiscovery,
     ) -> Result<CcKeyOutcome> {
+        self.cache_key_under(CC_ARTIFACT_SCHEMA, parsed, ctx, discovery)
+    }
+
+    /// [`Self::cache_key_with`], with the compile key under `artifact_schema`.
+    fn cache_key_under(
+        &self,
+        artifact_schema: &[u8],
+        parsed: &CcArgs,
+        ctx: &KeyCtx<'_, '_>,
+        discovery: CcKeyDiscovery,
+    ) -> Result<CcKeyOutcome> {
         if parsed.mode == CompileMode::Link {
             return self.cache_key_for_link(parsed, ctx).map(CcKeyOutcome::Key);
         }
@@ -6856,13 +6894,7 @@ impl CcCompiler {
         hasher.update(b"cc_key_version:");
         hasher.update(crate::cache_key::CACHE_KEY_VERSION.to_string().as_bytes());
         hasher.update(b"\n");
-        // 2: older entries can retain donor paths outside the source/object
-        //    root.
-        // 3: older entries can hold an object built from other bytes than
-        //    their key names: keyed from a memo stamp or a mapped hash taken
-        //    from a racy read, or from an input saved before a key-first
-        //    compile read it.
-        hasher.update(b"cc_artifact_schema:3\n");
+        hasher.update(artifact_schema);
         tracing::trace!(
             target: "kache::cache_key",
             "[key:{}] cc_key_version={}",

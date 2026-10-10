@@ -301,6 +301,55 @@ fn terminal_formatting_shares_cc_keys_with_cold_and_warm_probes() {
     assert_ne!(key(&["-ffp-contract=off"], &warm), baseline);
 }
 
+/// Entries stored before the input race fixes can hold an object built from
+/// other bytes than their key names, so no key of this release may be the
+/// one those builds computed under artifact schema 2. Unix only: the key
+/// runs the stand-in compiler, a shell script.
+#[cfg(unix)]
+#[test]
+fn a_key_from_before_the_input_race_fixes_is_never_todays() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("unit.c");
+    fs::write(&source, "int x;\n").unwrap();
+    let fake_cc =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mock_cc_diagnostics.sh");
+    let compiler = CcCompiler::new();
+    let file_hasher = crate::cache_key::FileHasher::new();
+    let path_normalizer = crate::path_normalizer::PathNormalizer::empty();
+    let parsed = compiler
+        .parse(&[
+            fake_cc.to_string_lossy().into_owned(),
+            "-c".into(),
+            source.to_string_lossy().into_owned(),
+        ])
+        .unwrap();
+    let ctx = KeyCtx {
+        file_hasher: &file_hasher,
+        path_normalizer: &path_normalizer,
+        cache_dir: &dir.path().join("cache"),
+        key_salt: None,
+        key_env_vars: &[],
+        extra_inputs_digest: None,
+        build_script_inputs_digest: None,
+    };
+    let key = |outcome: Result<CcKeyOutcome>| match outcome.unwrap() {
+        CcKeyOutcome::Key(key) => key,
+        CcKeyOutcome::Deferred(_) => panic!("an expansion key is never deferred"),
+    };
+    let today = key(compiler.cache_key_with(&parsed, &ctx, CcKeyDiscovery::Expansion));
+    assert_eq!(
+        today,
+        key(compiler.cache_key_with(&parsed, &ctx, CcKeyDiscovery::Expansion))
+    );
+    let before = key(compiler.cache_key_under(
+        b"cc_artifact_schema:2\n",
+        &parsed,
+        &ctx,
+        CcKeyDiscovery::Expansion,
+    ));
+    assert_ne!(today, before);
+}
+
 #[test]
 fn terminal_formatting_shares_the_compile_first_read_set_memo() {
     let _lock = crate::test_support::process_state_test_lock();
@@ -4113,6 +4162,35 @@ fn fold_cc_memo_field_changes_and_separates_hashes() {
 
     assert_ne!(first.finalize(), blake3::Hasher::new().finalize());
     assert_ne!(first.finalize(), second.finalize());
+}
+
+/// A release that records v5 memos rewrites a memo row in place when it
+/// records the same key, and the row does not say which release wrote it.
+/// Rows recorded before the settle and single-read rules must never answer
+/// a lookup of this release, so its keys are never the v5 ones.
+#[test]
+fn a_memo_key_from_before_the_settle_rules_is_never_todays() {
+    // The key folds the working directory and keyed variables, which other
+    // tests change under this lock.
+    let _lock = crate::test_support::process_state_test_lock();
+    let compiler = std::env::current_exe()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let parsed = CcArgs::parse(&[compiler, "-c".to_string(), "memo-source.c".to_string()]).unwrap();
+    let today = cc_preprocess_memo_key(&parsed, &[], "test compiler version").unwrap();
+    assert_eq!(
+        today,
+        cc_preprocess_memo_key(&parsed, &[], "test compiler version").unwrap()
+    );
+    let before = cc_preprocess_memo_key_as(
+        b"cc-preprocess-memo-v5",
+        &parsed,
+        &[],
+        "test compiler version",
+    )
+    .unwrap();
+    assert_ne!(today, before);
 }
 
 #[test]

@@ -2229,6 +2229,46 @@ fn key_inputs_changed_excuses_skewed_clocks_but_not_real_changes() {
     }
 }
 
+/// A save that lands after a key taken before the compile, and before rustc
+/// reads the file, trips no wall-clock flag: the stamp was old when the key
+/// read it. With the guard on, the moved fingerprint refuses the store by
+/// itself. A link to the file moves only its change time and does not.
+#[test]
+fn a_keyed_input_moved_since_the_key_refuses_without_a_tripped_flag() {
+    use crate::cache_key::ObservedFingerprint;
+
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("input.rs");
+    std::fs::write(&file, b"pub fn x() {}").unwrap();
+    // Old, so the save below gets another write time on any clock.
+    filetime::set_file_mtime(&file, filetime::FileTime::from_unix_time(1_000_000, 0)).unwrap();
+    let recorded = ObservedFingerprint::from_path(&file).unwrap();
+    let changed = || key_inputs_changed_during_compile(false, std::slice::from_ref(&recorded));
+    assert!(!changed(), "nothing moved");
+    #[cfg(unix)]
+    {
+        std::fs::hard_link(&file, dir.path().join("linked.rs")).unwrap();
+        assert!(!changed(), "a new link changes no byte");
+        // Same size and write time, another inode.
+        let replacement = dir.path().join("replacement.rs");
+        std::fs::write(&replacement, b"pub fn z() {}").unwrap();
+        filetime::set_file_mtime(
+            &replacement,
+            filetime::FileTime::from_unix_time(1_000_000, 0),
+        )
+        .unwrap();
+        std::fs::rename(&replacement, &file).unwrap();
+        assert!(changed(), "a replacement with the same size and write time");
+        std::fs::remove_file(&file).unwrap();
+        std::fs::rename(dir.path().join("linked.rs"), &file).unwrap();
+        assert!(!changed(), "the original file is back");
+    }
+    std::fs::write(&file, b"pub fn y() {}").unwrap();
+    assert!(changed(), "a save of the same length moved the write time");
+    std::fs::remove_file(&file).unwrap();
+    assert!(changed(), "a file gone since the key read it");
+}
+
 /// A key derived after the compile hashed its inputs after rustc read them.
 /// A dep-info source written since the invocation began refuses its store
 /// with the modified-input guard off, unless a fingerprint of that file taken

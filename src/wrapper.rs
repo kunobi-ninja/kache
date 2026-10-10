@@ -4525,7 +4525,8 @@ fn run_parsed_rustc(
     // is in place; we just don't cache it). The lookup above still ran, so a
     // sound prior entry can still be served. A key derived after the compile
     // always refuses a written dep-info source; any keyed input refuses only
-    // with `modified_input_guard`. A tripped wall-clock flag is excused when
+    // with `modified_input_guard`, which also refuses an input that moved
+    // after the key read it. A tripped wall-clock flag is excused when
     // fingerprints prove no input changed: the flag also fires across clock
     // domains where nothing is actually racy.
     let extra_inputs_racy = args.is_primary
@@ -6420,12 +6421,18 @@ fn emitted_sources_changed_during_compile(
     })
 }
 
-/// Whether keyed inputs actually changed during the compile. A tripped
-/// wall-clock flag alone is not proof: it also fires when the filesystem
-/// clock runs ahead of the host (NFS skew, future-stamped checkouts). When
-/// every guarded input still matches its hash-time fingerprint with a strong
-/// identity, nothing changed and the store refusal is excused. Anything else
-/// (a mismatch, a missing file, a weak identity) keeps the refusal.
+/// Whether keyed inputs actually changed during the compile. An input whose
+/// size, write time or inode moved since the key read it changed, whatever
+/// the clocks say: a save that lands after the key and before rustc reads
+/// the file trips no wall-clock flag, since the stamp was old when the key
+/// read it ([`FileHasher::guarded_inputs_moved_since_hash`]).
+///
+/// A tripped wall-clock flag alone is not proof: it also fires when the
+/// filesystem clock runs ahead of the host (NFS skew, future-stamped
+/// checkouts). When every guarded input still matches its hash-time
+/// fingerprint with a strong identity, nothing changed and the store refusal
+/// is excused. Anything else (a mismatch, a missing file, a weak identity)
+/// keeps the refusal.
 ///
 /// Unlike the compile-first excuse, a fingerprint here need not have settled
 /// when it was taken: requiring that would refuse every input stamped ahead
@@ -6436,7 +6443,8 @@ fn key_inputs_changed_during_compile(
     key_too_new: bool,
     guard_inputs: &[crate::cache_key::ObservedFingerprint],
 ) -> bool {
-    key_too_new && !FileHasher::guarded_inputs_unchanged_since_hash(guard_inputs)
+    FileHasher::guarded_inputs_moved_since_hash(guard_inputs)
+        || (key_too_new && !FileHasher::guarded_inputs_unchanged_since_hash(guard_inputs))
 }
 
 fn combine_key_measurements(

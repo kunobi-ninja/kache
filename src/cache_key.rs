@@ -7029,6 +7029,27 @@ impl<'db> FileHasher<'db> {
         })
     }
 
+    /// Whether any guarded input visibly changed since it was hashed: it is
+    /// gone, or its size, write time or inode differ from the fingerprint
+    /// taken then. Unlike [`Self::guarded_inputs_unchanged_since_hash`] this
+    /// needs no strong identity, as it only reports what it sees change.
+    ///
+    /// The change time does not count: linking a dependency's output
+    /// elsewhere, as store ingest and Cargo's uplift do while its dependents
+    /// compile, moves it and leaves the bytes alone. So a rewrite that keeps
+    /// the size and write time is missed, and on Windows, where fingerprints
+    /// carry no inode, so is a replacement with the same size and write time.
+    pub fn guarded_inputs_moved_since_hash(inputs: &[ObservedFingerprint]) -> bool {
+        inputs.iter().any(|input| {
+            let expected = &input.fingerprint;
+            FileFingerprint::from_path(Path::new(&expected.path)).map_or(true, |current| {
+                current.size != expected.size
+                    || current.mtime_ns != expected.mtime_ns
+                    || current.inode != expected.inode
+            })
+        })
+    }
+
     /// Whether a compile that ran after this key may have read other bytes
     /// than the key hashed. Ask once the compile has run.
     ///

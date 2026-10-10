@@ -325,6 +325,8 @@ struct RaceWorkspace {
     cache: tempfile::TempDir,
     tools: tempfile::TempDir,
     project: PathBuf,
+    /// Set for every build, after the defaults.
+    env: Vec<(&'static str, &'static str)>,
 }
 
 #[cfg(unix)]
@@ -367,7 +369,13 @@ impl RaceWorkspace {
             cache: tempfile::tempdir().unwrap(),
             tools,
             project,
+            env: Vec::new(),
         }
+    }
+
+    fn with_env(mut self, name: &'static str, value: &'static str) -> Self {
+        self.env.push((name, value));
+        self
     }
 
     /// Run `cargo build -p race-app` with `RACE_FLAG=flag`, the app's
@@ -388,7 +396,8 @@ impl RaceWorkspace {
         settle_writes(&[&self.project]);
         let target = self.project.join("target");
         let before = crate_events(self.cache.path(), crate_name).len();
-        let output = build_command(&self.project, self.cache.path(), &target, "race-app")
+        let mut command = build_command(&self.project, self.cache.path(), &target, "race-app");
+        command
             .env("RUSTC", self.tools.path().join("rustc"))
             .env("REAL_RUSTC", real_rustc())
             .env("RACE_CRATE", crate_name)
@@ -396,8 +405,8 @@ impl RaceWorkspace {
             .env("RACE_NEXT", &next)
             .env("RACE_FLAG", flag)
             .env("KACHE_CACHE_EXECUTABLES", "1")
-            .output()
-            .expect("failed to build the race fixture");
+            .envs(self.env.iter().copied());
+        let output = command.output().expect("failed to build the race fixture");
         assert!(
             output.status.success(),
             "race fixture build failed\nstderr:\n{}",
@@ -523,4 +532,41 @@ fn a_save_while_a_binary_re_derives_its_key_is_not_stored() {
     let (printed, app_event) = build(None);
     assert_eq!(app_event["result"], "miss", "event: {app_event:#}");
     assert_eq!(printed, "old", "the revert compiled");
+}
+
+/// With deferred discovery off, every unit keys before it compiles. The
+/// modified-input guard then refuses the store when a keyed input moved
+/// after the key read it, though its stamp was old at that point, so no
+/// wall-clock flag tripped.
+#[cfg(unix)]
+#[test]
+fn the_modified_input_guard_refuses_a_save_after_a_key_taken_first() {
+    let lib = |answer: u64| {
+        format!(
+            "pub fn answer() -> u64 {{ {answer} }}\n\
+             pub fn flag() -> &'static str {{ option_env!(\"RACE_FLAG\").unwrap_or(\"none\") }}\n"
+        )
+    };
+    let fixture = RaceWorkspace::new(
+        &lib(1),
+        "fn main() { print!(\"{}\", race_lib::answer()); }\n",
+    )
+    .with_env("KACHE_DEFERRED_DISCOVERY", "0")
+    .with_env("KACHE_ADAPTIVE_INCREMENTAL", "0")
+    .with_env("KACHE_MODIFIED_INPUT_GUARD", "1");
+    let build = |flag, save: Option<&str>| fixture.build(flag, "race_lib", "lib/src/lib.rs", save);
+
+    let (printed, lib_event) = build("a", None);
+    assert_eq!(printed, "1");
+    assert_eq!(lib_event["result"], "miss", "event: {lib_event:#}");
+
+    // The flag makes Cargo rebuild the library and keeps its record out.
+    let (printed, lib_event) = build("b", Some(&lib(2)));
+    assert_eq!(printed, "2", "rustc read the saved source");
+    assert_unstored_after_a_save(&lib_event);
+
+    fs::write(fixture.project.join("lib/src/lib.rs"), lib(1)).unwrap();
+    let (printed, lib_event) = build("b", None);
+    assert_eq!(lib_event["result"], "miss", "event: {lib_event:#}");
+    assert_eq!(printed, "1", "the revert compiled");
 }

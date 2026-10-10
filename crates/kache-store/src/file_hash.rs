@@ -1028,6 +1028,26 @@ mod tests {
         }
     }
 
+    /// Once the stamp clock has moved a window past a write, the write no
+    /// longer counts as one made since.
+    #[test]
+    fn a_write_stops_counting_once_the_stamp_clock_passes_its_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("f");
+        std::fs::write(&file, "x").unwrap();
+        let written = FileFingerprint::from_path(&file).unwrap();
+        // The widest window, for a whole-second stamp, is about two seconds.
+        let give_up = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while stamp_written_since(&written, stamp_clock_ns()) {
+            assert!(
+                std::time::Instant::now() < give_up,
+                "the stamp clock never passed {written:?}: {}",
+                stamp_clock_ns()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
     #[test]
     fn a_recent_ctime_holds_back_a_file_whose_mtime_was_restored() {
         // `touch -r`, `cp -p` and rsync write new bytes, then put an old mtime
@@ -1036,6 +1056,45 @@ mod tests {
         let old = now - 10 * HASH_SETTLE_NS;
         assert!(!stamp_is_settled(&stamp("/h.h", old, now - 1), now));
         assert!(stamp_is_settled(&stamp("/h.h", old, old), now));
+    }
+
+    /// An observation carries the wall clock read while it was taken, in
+    /// the nanoseconds since the epoch that stamps are kept in.
+    #[test]
+    fn an_observation_carries_the_wall_clock_it_was_taken_at() {
+        let since_epoch = || {
+            let elapsed = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap();
+            i64::try_from(elapsed.as_nanos()).unwrap()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("f");
+        std::fs::write(&file, "x").unwrap();
+        let before = since_epoch();
+        let observed = ObservedFingerprint::from_path(&file).unwrap();
+        let after = since_epoch();
+        assert!(
+            (before..=after).contains(&observed.observed_ns),
+            "{observed:?} outside {before}..={after}"
+        );
+        assert_eq!(
+            observed.fingerprint,
+            FileFingerprint::from_path(&file).unwrap()
+        );
+    }
+
+    /// Settled when observed, not when asked: a stamp observed a moment
+    /// before its window closed stays unsettled however long ago that was.
+    #[test]
+    fn an_observation_is_settled_by_the_time_it_was_taken() {
+        let changed = 1_000_000_000_000;
+        let observed_at = |observed_ns| ObservedFingerprint {
+            fingerprint: stamp("/h.h", changed, changed),
+            observed_ns,
+        };
+        assert!(!observed_at(changed + HASH_SETTLE_NS - 1).settled());
+        assert!(observed_at(changed + HASH_SETTLE_NS).settled());
     }
 
     #[test]

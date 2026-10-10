@@ -715,6 +715,42 @@ mod tests {
         );
     }
 
+    /// No file can match a row recorded without a stamp: not by the stamp a
+    /// lookup reads back, nor by the columns an older release reads without
+    /// the proof. Windows reports inode 0, and 0 for times before 1970, so
+    /// only the size rules such a file out, and no file's size is negative.
+    #[test]
+    fn a_row_recorded_without_a_stamp_matches_no_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = FileHashCache::open(&dir.path().join("index.db")).unwrap();
+        let mut unsettled = input("fresh.h", "f");
+        // Observed the moment it last changed.
+        unsettled.observed_ns = unsettled.fingerprint.ctime_ns;
+        cache
+            .put_cc_preprocess_memo_inputs("fresh", "h", std::slice::from_ref(&unsettled))
+            .unwrap();
+        let memo = cache.get_cc_preprocess_memo("fresh").unwrap().unwrap();
+        let columns = cache
+            .db()
+            .query_row(
+                "SELECT local_path, size, mtime_ns, ctime_ns, inode FROM cc_memo_inputs",
+                [],
+                |row| {
+                    Ok(FileFingerprint {
+                        path: row.get(0)?,
+                        size: row.get(1)?,
+                        mtime_ns: row.get(2)?,
+                        ctime_ns: row.get(3)?,
+                        inode: row.get(4)?,
+                    })
+                },
+            )
+            .unwrap();
+        for stamp in [&memo.inputs[0].fingerprint, &columns] {
+            assert!(stamp.size < 0, "{stamp:?}");
+        }
+    }
+
     /// A hand-off from a wrapper that predates observation times carries
     /// none, and its stamps count as unsettled.
     #[test]

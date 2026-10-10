@@ -12690,9 +12690,10 @@ fn each_root_of_a_tree_digest_is_memoised_alone() {
     assert!(!again.held(), "the workspace moved");
 }
 
-/// A memo answers while every entry has the stamp it was recorded under. A
-/// new target directory moves only the root's own times, and changes nothing
-/// the digest reads; a guard taken before still sees it.
+/// On Unix a memo answers while every entry has the stamp it was recorded
+/// under. A new target directory moves only the root's own times, and
+/// changes nothing the digest reads; a guard taken before still sees it.
+#[cfg(unix)]
 #[test]
 fn a_tree_memo_outlives_a_new_target_directory() {
     let dir = tempfile::tempdir().unwrap();
@@ -12723,6 +12724,54 @@ fn a_tree_memo_outlives_a_new_target_directory() {
     assert_eq!((again.digest.as_str(), read), (taken.digest.as_str(), 0));
     assert!(!taken.held(), "the root's own times moved");
     assert!(again.held());
+}
+
+/// A file directly under the root, put back with other bytes of the same
+/// size and its old times, is read again. Where an entry's stamp has no inode
+/// or change time, only the root's own times show it: NTFS gives a name
+/// recreated within 15 s its old creation time.
+#[test]
+fn a_file_put_back_under_the_root_with_its_old_times_is_read_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let memo = dir.path().join("memo");
+    let root = dir.path().join("w");
+    let file = root.join("schema.sql");
+    write_file(&file, "a");
+    let old = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
+    filetime::set_file_mtime(&file, filetime::FileTime::from_system_time(old)).unwrap();
+    filetime::set_file_mtime(&root, filetime::FileTime::from_system_time(old)).unwrap();
+    let db = rusqlite::Connection::open_in_memory().unwrap();
+    ensure_file_hash_cache_schema(&db).unwrap();
+    // The digest, and how many files were read for it.
+    let digest = || {
+        let hasher = FileHasher::from_cache(FileHashCache::Borrowed(&db));
+        let settled = std::time::SystemTime::now() + crate::tree_stamp::TreeStamp::SETTLE;
+        let roots = vec![TreeRoot::new(root.clone(), b"workspace", &[])];
+        let digest = tree_digest_memoised(roots, &hasher, 10, &memo, settled).unwrap();
+        (digest, hasher.stats().cache_misses)
+    };
+    let (taken, read) = digest();
+    assert_eq!(read, 1);
+    assert_eq!(digest(), (taken.clone(), 0), "the memo answers");
+
+    #[cfg(windows)]
+    let created = std::fs::metadata(&file).unwrap().created().unwrap();
+    // Past any timestamp tick, so the file put back gets a new change time.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    std::fs::remove_file(&file).unwrap();
+    write_file(&file, "b");
+    let times = std::fs::FileTimes::new().set_modified(old);
+    // The creation time NTFS gives back within 15 s.
+    #[cfg(windows)]
+    let times = std::os::windows::fs::FileTimesExt::set_created(times, created);
+    std::fs::File::options()
+        .write(true)
+        .open(&file)
+        .and_then(|file| file.set_times(times))
+        .unwrap();
+    let (again, read) = digest();
+    assert_eq!(read, 1);
+    assert_ne!(again, taken);
 }
 
 /// One root's digest is the one 1.0 records, so 1.0 records of such units
@@ -12912,7 +12961,7 @@ fn a_tree_that_moved_while_it_was_read_is_not_memoised() {
     let settled = std::time::SystemTime::now() + crate::tree_stamp::TreeStamp::SETTLE;
     memoise_tree_digest(&file, &walk, &stamp, &digest, settled);
     assert_eq!(
-        crate::tree_stamp::memoised_digest(&file, &stamp.entries),
+        crate::tree_stamp::memoised_digest(&file, stamp.memo_key()),
         Some(digest)
     );
 }

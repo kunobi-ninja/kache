@@ -1197,9 +1197,10 @@ const TREE_ROOTS_VERSION: &[u8] = b"kache-crate-tree-roots-v1\n";
 /// roots that only together run past it, without marking either one.
 ///
 /// Each root is memoised alone: a new target directory gives every `OUT_DIR`
-/// a new stamp, and the workspace beside it keeps its memo. While a root's
-/// entries have the stamp its digest was recorded under, that digest is the
-/// answer; otherwise every file in it is read, and the digest is recorded
+/// a new stamp, and the workspace beside it keeps its memo. While a root has
+/// the stamp its digest was recorded under
+/// ([`crate::tree_stamp::TreeStamp::memo_key`]), that digest is the answer;
+/// otherwise every file in it is read, and the digest is recorded
 /// once the root has settled ([`crate::tree_stamp::TreeStamp::settled_at`]).
 /// Several roots' digests fold into one. The walks go to `file_hasher` for
 /// the guard ([`tree_guard_of`]).
@@ -1279,8 +1280,8 @@ fn tree_digest_memoised(
 }
 
 /// The digest of `root`, which `walk` stamped as `stamp`: the memoised one
-/// while the root's entries have the stamp it was recorded under, otherwise
-/// a read of every file in it within `budget` entries.
+/// while the root has the stamp it was recorded under, otherwise a read of
+/// every file in it within `budget` entries.
 fn root_digest(
     root: &TreeRoot<'_>,
     walk: &GuardWalk,
@@ -1291,7 +1292,7 @@ fn root_digest(
     now: std::time::SystemTime,
 ) -> Option<String> {
     let memo = tree_digest_memo(memo_dir, root);
-    if let Some(digest) = crate::tree_stamp::memoised_digest(&memo, &stamp.entries)
+    if let Some(digest) = crate::tree_stamp::memoised_digest(&memo, stamp.memo_key())
         .filter(|digest| digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit()))
     {
         crate::phase_trace::decision("tree_memo", "hit");
@@ -1319,7 +1320,7 @@ fn root_digest(
     Some(digest)
 }
 
-/// Record `digest` at `memo` under the entries of `stamp`, the stamp `walk`
+/// Record `digest` at `memo` under the memo key of `stamp`, the stamp `walk`
 /// gave before the files were read. A tree written in the last moments could
 /// be written again within the same timestamp tick, keeping its stamp with
 /// other bytes, so it has to have settled. A tree that moved while it was
@@ -1327,9 +1328,9 @@ fn root_digest(
 /// stamp again, the root's own times included: they show a name that came
 /// and went meanwhile.
 ///
-/// A lookup needs only the same entries. The root's own times also move
-/// when a name it leaves out, such as the target directory, is created or
-/// removed, and every entry the digest read stays as it was.
+/// On Unix a lookup needs only the same entries. The root's own times also
+/// move when a name it leaves out, such as the target directory, is created
+/// or removed, and every entry the digest read stays as it was.
 fn memoise_tree_digest(
     memo: &Path,
     walk: &GuardWalk,
@@ -1338,7 +1339,7 @@ fn memoise_tree_digest(
     now: std::time::SystemTime,
 ) {
     if stamp.settled_at(now) && walk.holds() {
-        crate::tree_stamp::record_digest(memo, &stamp.entries, digest);
+        crate::tree_stamp::record_digest(memo, stamp.memo_key(), digest);
     }
 }
 

@@ -27,6 +27,19 @@ impl TreeStamp {
         now.duration_since(self.newest)
             .is_ok_and(|age| age >= Self::SETTLE)
     }
+
+    /// The stamp a memo is filed and found under. Where an entry's stamp holds
+    /// its inode and change time (Unix), [`Self::entries`]: a file replaced
+    /// directly under a root shows in its own entry. Elsewhere
+    /// [`Self::digest`], as only the root's own times may show it: NTFS gives
+    /// a name recreated within 15 s its old creation time.
+    pub(crate) fn memo_key(&self) -> &str {
+        if cfg!(unix) {
+            &self.entries
+        } else {
+            &self.digest
+        }
+    }
 }
 
 /// How a stamp walk treats symlinks and Cargo's build directories.

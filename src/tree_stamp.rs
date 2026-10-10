@@ -45,6 +45,9 @@ pub(crate) struct StampRules {
     /// that does the same. A process cannot read it either, and once it can,
     /// the walk lists or stats it and the stamp changes.
     pub(crate) unreadable_entries: bool,
+    /// Stamp only the entries directly under the root that are not
+    /// directories.
+    pub(crate) top_files_only: bool,
 }
 
 /// How a walk over one root ended.
@@ -121,7 +124,9 @@ impl Stamper {
             }
             for entry in entries {
                 let child = entry.path();
-                if excluded.contains(&child) {
+                if excluded.contains(&child)
+                    || rules.top_files_only && entry.file_type().is_ok_and(|kind| kind.is_dir())
+                {
                     continue;
                 }
                 let Some(left) = budget.checked_sub(1) else {
@@ -175,7 +180,7 @@ impl Stamper {
                 }
                 fold_metadata_stamp(&mut self.hasher, &metadata);
                 self.saw(&metadata);
-                if metadata.is_dir() {
+                if metadata.is_dir() && !rules.top_files_only {
                     pending.push(child);
                 }
             }
@@ -475,6 +480,26 @@ mod tests {
             walk(dir.path(), StampRules::default(), 10).0,
             WalkOutcome::Fits
         );
+    }
+
+    /// Only the files and links directly under the root count, and a
+    /// directory there counts neither by itself nor by what it holds.
+    #[test]
+    fn a_top_files_walk_stamps_the_files_under_the_root() {
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir.path().join(".env"), "A=1");
+        write(&dir.path().join("docs/a.md"), "");
+        let top = StampRules {
+            top_files_only: true,
+            ..StampRules::default()
+        };
+        let (outcome, before, spent) = walk(dir.path(), top, 10);
+        assert_eq!((outcome, spent), (WalkOutcome::Fits, 1), "`.env` alone");
+        write(&dir.path().join("docs/b.md"), "");
+        write(&dir.path().join("pkg/src/lib.rs"), "");
+        assert_eq!(walk(dir.path(), top, 10).1, before);
+        write(&dir.path().join("Cargo.toml"), "");
+        assert_ne!(walk(dir.path(), top, 10).1, before);
     }
 
     /// Below the root, a directory Cargo tagged counts by its tag alone. The

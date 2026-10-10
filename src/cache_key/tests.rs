@@ -4377,6 +4377,7 @@ fn a_vendored_guard_moves_with_a_file_at_the_top_of_an_ancestor() {
     assert!(taken.held());
     write_file(&root.join("docs/b.md"), "");
     write_file(&root.join("third_party/rust/bar/src/more.rs"), "");
+    write_file(&root.join("third_party/rust/baz/src/lib.rs"), "");
     assert!(taken.held(), "the rest of the tree");
     std::fs::remove_file(root.join(".env")).unwrap();
     assert!(!taken.held(), "a file at the top of the workspace");

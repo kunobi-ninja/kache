@@ -1059,6 +1059,7 @@ impl<'a> TreeRoot<'a> {
             skip_build_dirs: self.skips_build_dirs,
             root_metadata: true,
             unreadable_entries: true,
+            top_files_only: false,
         }
     }
 
@@ -2470,21 +2471,16 @@ fn ancestor_top_digest(directory: &Path, file_hasher: &FileHasher<'_>) -> Option
     entries.sort_by_key(std::fs::DirEntry::file_name);
     // The guard's walk of the files and symlinks read here. A dot-directory's
     // own digest walks that directory.
-    let mut excluded: Vec<PathBuf> = entries
-        .iter()
-        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
-        .map(std::fs::DirEntry::path)
-        .collect();
-    excluded.push(directory.join(".git"));
     let top = vec![WalkedRoot {
         path: directory.to_path_buf(),
         role: b"ancestor".to_vec(),
-        excluded,
+        excluded: vec![directory.join(".git")],
         rules: crate::tree_stamp::StampRules {
             link_text: true,
             skip_build_dirs: false,
             root_metadata: false,
             unreadable_entries: true,
+            top_files_only: true,
         },
     }];
     let stamp = stamp_roots(&top, CRATE_TREE_MAX_ENTRIES).ok()?;

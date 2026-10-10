@@ -131,6 +131,8 @@ prefetch_enabled = false
 
 This keeps exact remote reads and uploads.
 
+A job that keeps its target directory between runs, on a persistent runner or through a cached `target/`, should set `KACHE_ADAPTIVE_INCREMENTAL=0` or `CARGO_INCREMENTAL=0`. Otherwise [adaptive incremental mode](/docs/getting-started/quick-start#executables-and-incremental-builds) treats each workspace member or path dependency that changed since the previous run, and the local crates that depend on it, as code you are editing: a debug build compiles them incrementally and neither stores nor uploads them.
+
 Concurrent jobs may share a persistent local store, but each job should have a distinct `KACHE_RUNTIME_DIR` for sockets, locks, event logs, and session state. kache-action already gives each job its own runtime directory. For a trusted disk that persists across jobs, set `node-cache: true` and `cache-dir` on the action.
 
 A job that should read a shared store without writing to it can mount it read-only and set `KACHE_READONLY_STORE` to the directory that holds its `index.db`. Kache checks it after the job's own store and restores hits from it by copy. See [Read-only store](/docs/getting-started/configuration#read-only-store).

@@ -17,6 +17,9 @@ pub enum IncrementalMode {
 /// Result of running rustc.
 pub struct CompileResult {
     pub exit_code: i32,
+    /// A Unix signal ended the compiler. `exit_code` then reads 1, as for a
+    /// compile error.
+    pub signaled: bool,
     pub stdout: String,
     /// Complete compiler stderr, retained for cache storage.
     pub stderr: String,
@@ -274,6 +277,7 @@ pub fn run_rustc(
 
     Ok(CompileResult {
         exit_code,
+        signaled: status.code().is_none(),
         stdout,
         stderr: stderr.into_owned(),
         pending_stderr: forwarding_metadata
@@ -1017,6 +1021,7 @@ mod tests {
         ] {
             let result = CompileResult {
                 exit_code: 0,
+                signaled: false,
                 stdout: String::new(),
                 stderr: "complete stderr".to_owned(),
                 pending_stderr: pending.map(str::to_owned),

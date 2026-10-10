@@ -2416,7 +2416,7 @@ fn incremental_force_list_requires_incremental_and_managed_layout() {
         !compiler_args.iter().any(|arg| arg.ends_with(&original)),
         "the original Cargo incremental path must never reach rustc"
     );
-    assert!(!lease.finish(false));
+    assert!(!lease.finish(CompileOutcome::Abnormal));
 }
 
 #[test]
@@ -5112,6 +5112,152 @@ exit 0
             .any(|arg| arg.starts_with("--remap-path-prefix")),
         "an immediate passthrough unexpectedly injected remap arguments: {argv:?}"
     );
+}
+
+/// The lease sees how rustc really ended on both execute paths: a compile
+/// error keeps the private state, and anything abnormal resets it.
+#[cfg(unix)]
+#[test]
+fn adaptive_compile_resets_rustc_state_only_after_an_abnormal_exit() {
+    use std::os::unix::fs::PermissionsExt;
+    const TYPE_ERROR: &str = r"printf 'error[E0308]: mismatched types\n' >&2; exit 1";
+
+    let dir = tempfile::tempdir().unwrap();
+    let profile = dir.path().join("target/debug");
+    let deps = profile.join("deps");
+    let incremental = profile.join("incremental");
+    std::fs::create_dir_all(&deps).unwrap();
+    std::fs::create_dir(&incremental).unwrap();
+    let source = dir.path().join("lib.rs");
+    let rustc = dir.path().join("rustc");
+    let ending = dir.path().join("rustc.ending");
+    std::fs::write(&source, "pub fn answer() -> u8 { 42 }\n").unwrap();
+    // The unit key includes the compiler's size and mtime, so the script stays
+    // fixed: it writes into its private directory, then runs a case's ending.
+    kache_fs::testutil::write_executable(
+        &rustc,
+        r#"#!/bin/sh
+for arg in "$@"; do
+    case "$arg" in
+        -Cincremental=*) incremental=${arg#-Cincremental=} ;;
+    esac
+done
+printf 'state' > "$incremental/state.bin"
+. "$0.ending"
+"#,
+    );
+    let mut args = RustcArgs::parse(&[
+        rustc.display().to_string(),
+        "--crate-name".to_string(),
+        "adaptive_fixture".to_string(),
+        "--crate-type".to_string(),
+        "lib".to_string(),
+        source.display().to_string(),
+        "--out-dir".to_string(),
+        deps.display().to_string(),
+        "--emit=metadata".to_string(),
+        "-Cextra-filename=-1234abcd".to_string(),
+        format!("-Cincremental={}", incremental.display()),
+    ])
+    .unwrap();
+    args.is_primary = true;
+    let config = test_config(dir.path().join("cache"));
+    let unit = AdaptiveUnit::eligible(&args, true, &adaptive_policy_guard(&config)).unwrap();
+    let root = dir.path().display().to_string();
+
+    let end_with = |script: &str| std::fs::write(&ending, script).unwrap();
+    let compile = |lease: Lease| {
+        adaptive_incremental_with_event(
+            &config,
+            &args,
+            "adaptive_fixture",
+            &root,
+            std::time::Instant::now(),
+            lease,
+            "adaptive passthrough",
+            None,
+            KeyEventRecord::default(),
+        )
+    };
+    let last_exit_code = || {
+        crate::events::read_events(&config.event_log_path())
+            .unwrap()
+            .last()
+            .and_then(|event| event.exit_code)
+    };
+    // A reset removes rustc/ and state.json but leaves the unit directory.
+    let state_kept = || {
+        let units = profile.join("incremental.kache-auto/v1");
+        let unit_dir = std::fs::read_dir(units).unwrap().next().unwrap().unwrap();
+        unit_dir.path().join("rustc/state.bin").is_file()
+    };
+
+    for (script, exit, kept) in [
+        ("exit 0", 0, true),
+        (TYPE_ERROR, 1, true),
+        (
+            r"printf 'warning: hard linking files in the incremental compilation cache failed\n' >&2; printf 'error[E0308]: mismatched types\n' >&2; exit 1",
+            1,
+            true,
+        ),
+        ("exit 101", 101, false),
+        // Cargo still sees 1 for a signal.
+        ("kill -KILL $$", 1, false),
+        (
+            r"printf 'error: incremental compilation: could not create session directory lock file\n' >&2; exit 1",
+            1,
+            false,
+        ),
+    ] {
+        end_with(script);
+        assert_eq!(
+            compile(unit.try_immediate().unwrap()).unwrap(),
+            exit,
+            "{script}"
+        );
+        assert_eq!(last_exit_code(), Some(exit), "{script}");
+        assert_eq!(state_kept(), kept, "{script}");
+    }
+
+    end_with("exit 0");
+    assert_eq!(compile(unit.try_immediate().unwrap()).unwrap(), 0);
+    assert!(state_kept());
+    // A mode change leaves the size and mtime, and so the unit, alone.
+    std::fs::set_permissions(&rustc, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(
+        compile(unit.try_immediate().unwrap()).is_err(),
+        "the passthrough retry cannot spawn the compiler either"
+    );
+    assert!(!state_kept(), "a spawn failure must reset the unit");
+    std::fs::set_permissions(&rustc, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    // The seed and active lanes run rustc through the other execute path.
+    let key = |label: &str| blake3::hash(label.as_bytes()).to_hex().to_string();
+    let fields = |sources: &str| {
+        std::collections::BTreeMap::from(
+            [
+                ("args", "stable"),
+                ("compiler", "compiler"),
+                ("externs", "extern-a"),
+                ("sources", sources),
+            ]
+            .map(|(name, value)| (name.to_string(), value.to_string())),
+        )
+    };
+    assert!(unit.observe_build(&key("first"), &fields("source-a")));
+    end_with("exit 0");
+    let seed = unit.try_seed(&key("second"), &fields("source-b")).unwrap();
+    assert_eq!(compile(seed).unwrap(), 0);
+    end_with(TYPE_ERROR);
+    assert_eq!(compile(unit.try_active().unwrap()).unwrap(), 1);
+    assert!(state_kept());
+    end_with("kill -KILL $$");
+    let active = unit
+        .try_active()
+        .expect("a compile error keeps the unit active");
+    assert_eq!(compile(active).unwrap(), 1);
+    assert!(!state_kept());
+    assert!(unit.try_active().is_none());
 }
 
 #[test]

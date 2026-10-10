@@ -120,6 +120,7 @@ impl Compiler for RustdocCompiler {
         let output = spawn(parsed)?;
         Ok(super::CompileResult {
             exit_code: exit_code(&output.status),
+            signaled: output.status.code().is_none(),
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
             pending_stderr: None,

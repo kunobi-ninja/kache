@@ -17,7 +17,7 @@ use crate::compiler::{
 };
 use crate::config::Config;
 use crate::events::{self, BuildEvent, EventResult};
-use crate::incremental_policy::{AdaptiveUnit, Lease};
+use crate::incremental_policy::{AdaptiveUnit, CompileOutcome, Lease, compile_outcome};
 use crate::key_env::KeyEnv;
 use crate::link;
 use crate::maintenance::unix_now_secs;
@@ -7493,7 +7493,8 @@ fn adaptive_incremental_with_event<R: Into<String>>(
     let result = match compile {
         Ok(result) => result,
         Err(error) => {
-            let _ = lease.finish(false);
+            // rustc never ran, or a pipe failure made kache kill it mid-session.
+            let _ = lease.finish(CompileOutcome::Abnormal);
             tracing::warn!("adaptive incremental compiler spawn failed for {crate_name}: {error}");
             return passthrough_with_event(
                 config,
@@ -7514,10 +7515,12 @@ fn adaptive_incremental_with_event<R: Into<String>>(
         std::io::stderr(),
     );
     after_rustc_exit(result.exit_code, &result.stderr, &args.externs);
-    let reusable = lease.finish(result.exit_code == 0);
+    let outcome = compile_outcome(result.exit_code, result.signaled, &result.stderr);
+    let kept = lease.finish(outcome);
     tracing::debug!(
         ?kind,
-        reusable,
+        ?outcome,
+        kept,
         "adaptive incremental compiler lease finished"
     );
 

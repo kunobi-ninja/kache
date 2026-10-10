@@ -2033,7 +2033,7 @@ fn compile_before_key_needs_a_local_store() {
     config.deferred_discovery = true;
     assert!(
         !deferral_allowed(&config, &cargo_like, true, None),
-        "adaptive unit"
+        "a managed unit that must key first"
     );
     config.fallback = Some("sccache".to_string());
     assert!(
@@ -2446,6 +2446,38 @@ fn force_list_never_retries_through_adaptive_seed_policy() {
 }
 
 #[test]
+fn only_a_unit_that_can_take_an_incremental_lane_keys_first() {
+    for (managed, force_listed, policy_state, expected) in [
+        (false, true, true, false),
+        (true, false, false, false),
+        (true, true, false, true),
+        (true, false, true, true),
+    ] {
+        assert_eq!(
+            managed_unit_keys_first(managed, force_listed, policy_state),
+            expected,
+            "managed={managed} force_listed={force_listed} policy_state={policy_state}"
+        );
+    }
+}
+
+#[test]
+fn both_deferred_compile_reentries_are_recognized() {
+    for (precompiled, emitted_closure_waiting, expected) in [
+        (false, false, false),
+        (true, false, true),
+        (false, true, true),
+        (true, true, true),
+    ] {
+        assert_eq!(
+            reentered_after_deferred_compile(precompiled, emitted_closure_waiting),
+            expected,
+            "precompiled={precompiled} emitted_closure_waiting={emitted_closure_waiting}"
+        );
+    }
+}
+
+#[test]
 fn force_list_hidden_inputs_and_cache_exclusions_fail_closed() {
     let temp = tempfile::tempdir().unwrap();
     let mut config = test_config(temp.path().join("cache"));
@@ -2454,10 +2486,14 @@ fn force_list_hidden_inputs_and_cache_exclusions_fail_closed() {
     let args = eligible_incremental_args(&temp, "tap_lib");
 
     assert!(managed_incremental_unit(&config, &args, true, || true).is_none());
-    assert!(incremental_fast_path_allowed(false, false, false));
-    assert!(!incremental_fast_path_allowed(false, true, false));
-    assert!(!incremental_fast_path_allowed(false, false, true));
-    assert!(!incremental_fast_path_allowed(true, false, false));
+    assert!(incremental_fast_path_allowed(false, false, false, false));
+    assert!(!incremental_fast_path_allowed(false, true, false, false));
+    assert!(!incremental_fast_path_allowed(false, false, true, false));
+    assert!(!incremental_fast_path_allowed(true, false, false, false));
+    assert!(
+        !incremental_fast_path_allowed(false, false, false, true),
+        "a re-entry after a deferred compile must not start a second compile"
+    );
     // Either refusal alone keeps a unit off the fast path.
     assert!(!unit_refuses_caching(false, false));
     assert!(unit_refuses_caching(true, false));

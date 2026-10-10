@@ -277,6 +277,13 @@ impl AdaptiveUnit {
         self.observe_build_at(cache_key, fields, now_secs())
     }
 
+    /// Whether policy state exists that a seed on this invocation could use.
+    /// Only a state file that is definitely missing reads as none, so an
+    /// unreadable one keeps the unit keying first.
+    pub(crate) fn has_policy_state(&self) -> bool {
+        !definitely_missing(&self.state_path)
+    }
+
     /// A cache hit disproves the need for automatic passthrough. Remove both
     /// policy state and its private rustc state while holding the unit lock.
     pub(crate) fn reset(&self) -> bool {
@@ -1581,6 +1588,25 @@ mod tests {
 
         assert!(unit.reset());
         assert!(!unit.state_path.exists());
+    }
+
+    #[test]
+    fn only_recorded_policy_state_can_seed() {
+        let (_temp, _args, unit) = fixture();
+        assert!(!unit.has_policy_state());
+        assert!(
+            unit.try_seed_at(
+                &cache_key("second"),
+                &fields("stable", "source-b", "extern-a"),
+                101,
+            )
+            .is_none(),
+            "without state no seed can run, so the compile need not wait for its key"
+        );
+        teach(&unit, 100);
+        assert!(unit.has_policy_state());
+        assert!(unit.reset());
+        assert!(!unit.has_policy_state());
     }
 
     #[test]

@@ -177,6 +177,15 @@ fn adaptive_seed_allowed(config: &Config, args: &RustcArgs) -> bool {
     adaptive_mode_enabled(config) && !force_incremental_requested(config, args)
 }
 
+/// Whether a managed unit must key before it compiles. Without recorded
+/// policy state no seed can run, so a unit that is not force-listed may
+/// compile first; a force-listed unit keeps keying first. A managed unit that
+/// is not force-listed implies adaptive mode is on, so the seed policy adds
+/// nothing here.
+fn managed_unit_keys_first(managed: bool, force_listed: bool, policy_state: bool) -> bool {
+    managed && (force_listed || policy_state)
+}
+
 /// Build the one safety-checked unit used by both adaptive and force-list
 /// incremental compiles. Declared inputs are checked only after the narrow
 /// Cargo layout is known to be eligible; rejecting them also clears any old
@@ -202,12 +211,23 @@ where
     Some(unit)
 }
 
+/// Whether the pre-key incremental lanes may run. Never on a re-entry after a
+/// deferred compile: that compile already ran, and with a result it already
+/// reached Cargo, so no lane may start a second one.
 fn incremental_fast_path_allowed(
     has_refuse_reasons: bool,
     source_excluded: bool,
     skip_user_facing: bool,
+    reentered: bool,
 ) -> bool {
-    !has_refuse_reasons && !source_excluded && !skip_user_facing
+    !has_refuse_reasons && !source_excluded && !skip_user_facing && !reentered
+}
+
+/// Whether this is the keyed flow [`compile_before_key`] re-entered: with the
+/// compile's result after a miss, or with its emitted closure after it
+/// stopped the compile on a hit.
+fn reentered_after_deferred_compile(precompiled: bool, emitted_closure_waiting: bool) -> bool {
+    precompiled || emitted_closure_waiting
 }
 
 /// Whether this unit is refused caching outright: the compiler's own refusal
@@ -3768,6 +3788,10 @@ fn run_parsed_rustc(
         unit_refuses_caching(!refuse.is_empty(), untrusted_codegen_backend.is_some()),
         excluded_source.is_some() || user_bypass.is_some(),
         skip_user_facing,
+        reentered_after_deferred_compile(
+            precompiled.is_some(),
+            crate::cache_key::dep_info_provided(),
+        ),
     ) {
         if force_incremental {
             if let Some(lease) = adaptive_unit.as_ref().and_then(AdaptiveUnit::try_immediate) {
@@ -3967,6 +3991,15 @@ fn run_parsed_rustc(
         extra_inputs_too_new,
         false,
     );
+    // Taken after the fast path, which resets corrupt or interrupted state:
+    // a unit left without state has no lane its key could open.
+    let keys_first = managed_unit_keys_first(
+        adaptive_unit.is_some(),
+        force_incremental,
+        adaptive_unit
+            .as_ref()
+            .is_some_and(AdaptiveUnit::has_policy_state),
+    );
     let keyed = match compute_rustc_cache_key(
         config,
         compiler,
@@ -3988,7 +4021,7 @@ fn run_parsed_rustc(
             .and_then(|pre| Some((pre.dep_info.take()?, pre.tree_guard.take())))
         {
             Some((dep_info, tree)) => KeyDiscovery::Emitted(dep_info, tree),
-            None if deferral_allowed(config, args, adaptive_unit.is_some(), extra_inputs) => {
+            None if deferral_allowed(config, args, keys_first, extra_inputs) => {
                 KeyDiscovery::Deferrable {
                     stop_on_hit: stop_on_hit_allowed(args),
                 }
@@ -4259,9 +4292,7 @@ fn run_parsed_rustc(
         // A predicted key missed and must be re-derived before anything is
         // stored. The compile writes the same closure the pre-pass would, at
         // the same point, so start it and key from that instead.
-        if deferral_allowed(config, args, adaptive_unit.is_some(), extra_inputs)
-            && stop_on_hit_allowed(args)
-        {
+        if deferral_allowed(config, args, keys_first, extra_inputs) && stop_on_hit_allowed(args) {
             tracing::debug!("{crate_name}: predicted key missed; compiling while re-deriving");
             return compile_before_key(
                 &compile_first,
@@ -6145,15 +6176,15 @@ fn emitted_dep_info(args: &RustcArgs) -> Option<crate::cache_key::DepInfo> {
     crate::cache_key::dep_info_from_emitted(&path, args.source_file.as_deref()?).ok()
 }
 
-/// Compile-before-key is only sound where the miss is certain from the local
-/// store alone: no remote to consult, no fallback store, no adaptive
-/// incremental unit and no extra-inputs declaration, the last two keying more
-/// than the closure. The key computation then defers only when it can prove
-/// the miss: no closure record for the unit, or no entry for the crate.
+/// Compile-before-key needs a miss the local store can prove, or a compile it
+/// can stop on a hit. That rules out a remote, a fallback store, a read-only
+/// host store, an extra-inputs declaration (whose key covers more than the
+/// closure), and a managed unit that must key first
+/// ([`managed_unit_keys_first`]) so a miss can take its incremental lane.
 fn deferral_allowed(
     config: &Config,
     args: &RustcArgs,
-    adaptive: bool,
+    keys_first: bool,
     extra_inputs: Option<&crate::extra_inputs::ExtraInputsSnapshot>,
 ) -> bool {
     // The compile must emit the dep-info the key is derived from afterwards
@@ -6163,7 +6194,7 @@ fn deferral_allowed(
         && config.remote.is_none()
         && config.fallback.is_none()
         && config.readonly_store.is_none()
-        && !adaptive
+        && !keys_first
         && extra_inputs.is_none()
 }
 

@@ -152,11 +152,13 @@ pub fn run_rustc(
         }
     }
 
-    // Normal artifact-cache compiles disable incremental compilation because
-    // the cache subsumes it and mixed ownership is prone to APFS dep-graph
-    // failures. Adaptive compiles preserve only a path that Kache isolated and
-    // locked before this call. CARGO_INCREMENTAL=0 alone would be too late:
-    // Cargo already put the codegen flag in argv before the wrapper runs.
+    // Normal artifact-cache compiles disable incremental compilation: the key
+    // leaves the flag out, so a stored artifact must come from a compile
+    // without it, and mixed ownership is prone to APFS dep-graph failures. A
+    // unit someone is editing gets incremental state from the adaptive lanes
+    // instead, which preserve only a path Kache isolated and locked before
+    // this call. CARGO_INCREMENTAL=0 alone would be too late: Cargo already
+    // put the codegen flag in argv before the wrapper runs.
     let compiler_args = match incremental_mode {
         IncrementalMode::Strip => strip_incremental_flags(args),
         IncrementalMode::PreserveIsolated => args.iter().collect(),

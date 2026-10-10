@@ -4873,7 +4873,7 @@ fn run_parsed_rustc(
 
     record_input_prediction(config, Some(&store), args, record_closure, &key_outputs);
 
-    // 7. Clean incremental dir, as with kache's caching, incremental compilation is redundant
+    // 7. Remove Cargo's own incremental directory; see `clean_incremental_dir`.
     clean_incremental_dir(config, args);
 
     let elapsed = start.elapsed().as_millis() as u64;
@@ -8918,8 +8918,11 @@ pub(crate) fn prune_session_markers(
 /// The build-session inactivity window (shared by trigger + attribution).
 pub(crate) const BUILD_SESSION_SECS: u64 = 300;
 
-/// Remove the incremental compilation directory for this crate.
-/// With kache caching, incremental compilation is redundant and the dirs waste disk space.
+/// Remove the directory passed as `-C incremental`. Cargo passes
+/// `<profile>/incremental`, which every unit of the profile shares. Normal
+/// compiles strip the flag, so what is there comes from builds without Kache
+/// and only takes disk space. Adaptive and preserved state live in sibling
+/// directories and stay.
 fn clean_incremental_dir(config: &Config, args: &RustcArgs) {
     if incremental_cleanup_enabled(config)
         && let Some(incr_dir) = &args.incremental

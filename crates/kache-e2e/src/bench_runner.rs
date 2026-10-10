@@ -1507,10 +1507,11 @@ fn build(
         // Profile env first so the benchmark baseline below always wins.
         .envs(profile.build_env(kache))
         .env("RUSTC_WRAPPER", kache)
-        // Incremental is redundant once a compile cache is in play (kache
-        // already excludes -Cincremental from the key); off keeps the
-        // build dir lean and removes a measurement-noise source. Injected
-        // for every scenario (Firefox also sets it via mozconfig).
+        // Every phase builds from scratch, so incremental state would only
+        // add disk writes and measurement noise. With it off, Cargo passes
+        // no -C incremental and no unit takes Kache's adaptive incremental
+        // lanes. Injected for every scenario (Firefox also sets it via
+        // mozconfig).
         .env("CARGO_INCREMENTAL", "0");
     match cache_backend {
         CacheBackend::Kache => {

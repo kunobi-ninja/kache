@@ -18,14 +18,19 @@
 //!     `OUT_DIR` does too, with or without a proc macro of its own to
 //!     expand, and keys as the pre-pass would,
 //!   - a result keyed from the compile's own dep-info is not stored while an
-//!     input carries a stamp from after the build started.
+//!     input carries a stamp from after the build started,
+//!   - a unit that expands a proc macro through an rlib that re-exports it
+//!     misses once a file appears in the directory the macro lists, in its
+//!     own target directory and in another one, and a listed file removed
+//!     while it builds leaves no record that its return would match,
+//!   - a record re-derived after a predicted key missed keeps that guard.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 use tempfile::TempDir;
 
 mod common;
-use common::{build_kache, isolated_config_path, kache_binary};
+use common::{SCAN_MACRO, build_kache, isolated_config_path, kache_binary, settle_writes};
 
 fn rustc_path() -> String {
     std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string())
@@ -38,16 +43,31 @@ fn toml_path(path: &Path) -> String {
 /// Hermetic config for exactly one flag setting. The flag travels in the
 /// file because `ignore_env` neutralizes `KACHE_*` overrides by design.
 fn write_test_config(cache_dir: &Path, predictions: bool) -> PathBuf {
+    write_test_config_with(cache_dir, cache_dir, None, predictions)
+}
+
+/// [`write_test_config`] with Kache's runtime directory at `runtime_dir`
+/// and, with `shard`, a `[cache.volumes]` store for the outputs below a root.
+fn write_test_config_with(
+    cache_dir: &Path,
+    runtime_dir: &Path,
+    shard: Option<(&Path, &Path)>,
+    predictions: bool,
+) -> PathBuf {
     let config_path = isolated_config_path(cache_dir);
-    std::fs::write(
-        &config_path,
-        format!(
-            "[cache]\nlocal_only = true\nignore_env = true\ninput_predictions = {predictions}\nlocal_store = {}\nruntime_dir = {}\n",
-            toml_path(cache_dir),
-            toml_path(cache_dir)
-        ),
-    )
-    .unwrap();
+    let mut config = format!(
+        "[cache]\nlocal_only = true\nignore_env = true\ninput_predictions = {predictions}\nlocal_store = {}\nruntime_dir = {}\n",
+        toml_path(cache_dir),
+        toml_path(runtime_dir)
+    );
+    if let Some((root, store)) = shard {
+        config.push_str(&format!(
+            "[cache.volumes]\n{} = {}\n",
+            toml_path(root),
+            toml_path(store)
+        ));
+    }
+    std::fs::write(&config_path, config).unwrap();
     config_path
 }
 fn run_kache_rustc_predict(
@@ -159,12 +179,15 @@ fn run_kache_compiler_with(
         );
     }
     let config_path = write_test_config(cache_dir, predictions);
+    settle_writes(&[src.parent().expect("a source in a directory")]);
     let output = std::process::Command::new(kache_binary())
         .args(&args)
         .env("KACHE_CACHE_DIR", cache_dir)
         .env("KACHE_CONFIG", config_path)
         .env("KACHE_INT_SET", "x")
         .env_remove("KACHE_INT_UNSET")
+        // Cargo sets this test's own package; these are bare rustc units.
+        .env_remove("CARGO_MANIFEST_DIR")
         .env_remove("KACHE_DISABLED")
         .env_remove("KACHE_NAMESPACE")
         .env_remove("KACHE_BASE_DIR")
@@ -214,6 +237,11 @@ fn summary_local_hits(cache_dir: &Path) -> u64 {
 
 /// The most recent `kt` event from `kache report`.
 fn last_event(cache_dir: &Path) -> LastEvent {
+    last_event_with(cache_dir, &[])
+}
+
+/// [`last_event`], with `env` set for the report as it was for the build.
+fn last_event_with(cache_dir: &Path, env: &[(&str, std::ffi::OsString)]) -> LastEvent {
     let output = std::process::Command::new(kache_binary())
         .args(["report", "--format", "json", "--since", "1h"])
         .env("KACHE_CACHE_DIR", cache_dir)
@@ -224,6 +252,7 @@ fn last_event(cache_dir: &Path) -> LastEvent {
         .env_remove("KACHE_SOCKET_PATH")
         .env_remove("KACHE_ACTIVE")
         .env_remove("KACHE_FAMILY_PROBE_ACTIVE")
+        .envs(env.iter().map(|(name, value)| (name, value)))
         .output()
         .expect("failed to run kache report");
     assert!(output.status.success(), "kache report failed");
@@ -594,6 +623,7 @@ fn predictions_sibling_shadow_fails_closed() {
         .env("KACHE_CONFIG", config_path)
         .env("KACHE_INT_SET", "x")
         .env_remove("KACHE_INT_UNSET")
+        .env_remove("CARGO_MANIFEST_DIR")
         .env_remove("KACHE_DISABLED")
         .env_remove("KACHE_NAMESPACE")
         .env_remove("KACHE_BASE_DIR")
@@ -636,6 +666,8 @@ struct OutDirUnit {
     cache: PathBuf,
     package: PathBuf,
     proc_macro: Option<PathBuf>,
+    /// Copied into every target's `deps`; the unit then links `facade`.
+    facade: Vec<PathBuf>,
 }
 
 impl OutDirUnit {
@@ -661,7 +693,14 @@ impl OutDirUnit {
             cache,
             package,
             proc_macro,
+            facade: Vec::new(),
         }
+    }
+
+    /// The unit linking `facade`, which re-exports [`SCAN_MACRO`].
+    fn with_facade(mut self) -> Self {
+        self.facade = build_facade(self.root.path());
+        self
     }
 
     /// The unit with `content` at `path`, relative to the package.
@@ -682,6 +721,7 @@ impl OutDirUnit {
         if let Some(proc_macro) = &self.proc_macro {
             std::fs::copy(proc_macro, self.macro_in(&target)).unwrap();
         }
+        copy_into_deps(&self.facade, &target);
         target
     }
 
@@ -716,6 +756,10 @@ impl OutDirUnit {
             args.push("--extern".into());
             args.push(format!("pm={}", self.macro_in(target).display()));
         }
+        if !self.facade.is_empty() {
+            args.push("--extern".into());
+            args.push(format!("facade={}", deps.join("libfacade.rlib").display()));
+        }
         let config_path = write_test_config(&self.cache, predictions);
         let out_dir = out_dir_in(target);
         let envs = [
@@ -743,6 +787,10 @@ fn kache_rustc_in(
     envs: &[(&str, &std::ffi::OsStr)],
     verify: Option<&str>,
 ) -> LastEvent {
+    let read: Vec<&Path> = std::iter::once(package)
+        .chain(envs.iter().map(|(_, dir)| Path::new(dir)))
+        .collect();
+    settle_writes(&read);
     let mut command = std::process::Command::new(kache_binary());
     command
         .args(args)
@@ -808,6 +856,69 @@ fn build_proc_macro(root: &Path) -> PathBuf {
         .filter_map(|entry| entry.ok().map(|entry| entry.path()))
         .find(|path| path.extension().is_some_and(|e| e == extension))
         .unwrap_or_else(|| panic!("no proc-macro {extension} in {}", out.display()))
+}
+
+/// A crate that expands [`SCAN_MACRO`] through `facade`, which re-exports it.
+const SCAN_LIB: &str = "facade::scan!();\npub fn count() -> usize { ASSETS.len() }\n";
+
+/// [`SCAN_MACRO`] and `facade`, an rlib that re-exports it, built with plain
+/// rustc. A unit that expands the macro through the rlib names only the rlib
+/// on its command line. Returns both artifacts.
+fn build_facade(root: &Path) -> Vec<PathBuf> {
+    build_facade_with(root, SCAN_MACRO)
+}
+
+/// [`build_facade`] with `scan` as the macro's source.
+fn build_facade_with(root: &Path, scan: &str) -> Vec<PathBuf> {
+    let out = root.join("facade-out");
+    std::fs::create_dir_all(&out).unwrap();
+    let rustc = |args: &[&str], source: &Path| {
+        let status = std::process::Command::new(rustc_path())
+            .args(args)
+            .args(["--edition", "2021", "--out-dir"])
+            .arg(&out)
+            .arg(source)
+            .env_remove("RUSTC_WRAPPER")
+            .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
+            .status()
+            .expect("run rustc to build the scan fixture");
+        assert!(status.success(), "building {} failed", source.display());
+    };
+    let scan_source = root.join("scan.rs");
+    std::fs::write(&scan_source, scan).unwrap();
+    rustc(
+        &["--crate-name", "scan", "--crate-type", "proc-macro"],
+        &scan_source,
+    );
+    let extension = std::env::consts::DLL_EXTENSION;
+    let scan = std::fs::read_dir(&out)
+        .unwrap()
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .find(|path| path.extension().is_some_and(|e| e == extension))
+        .unwrap_or_else(|| panic!("no proc-macro {extension} in {}", out.display()));
+    let facade_source = root.join("facade.rs");
+    std::fs::write(&facade_source, "pub use scan::scan;\n").unwrap();
+    rustc(
+        &[
+            "--crate-name",
+            "facade",
+            "--crate-type",
+            "rlib",
+            "--extern",
+            &format!("scan={}", scan.display()),
+        ],
+        &facade_source,
+    );
+    vec![scan, out.join("libfacade.rlib")]
+}
+
+/// Copy `artifacts` byte for byte into `target`'s `deps`.
+fn copy_into_deps(artifacts: &[PathBuf], target: &Path) {
+    for artifact in artifacts {
+        let deps = target.join("debug/deps");
+        std::fs::create_dir_all(&deps).unwrap();
+        std::fs::copy(artifact, deps.join(artifact.file_name().unwrap())).unwrap();
+    }
 }
 
 /// A registry unit built in a second target directory derives its closure
@@ -943,7 +1054,15 @@ struct WorkspaceUnit {
     lib: String,
     files: Vec<(String, String)>,
     proc_macro: Option<PathBuf>,
+    /// Copied into every target's `deps`; the member then links `facade`.
+    facade: Vec<PathBuf>,
     external_targets: bool,
+    /// Set for every build and report, after the rest.
+    env: Vec<(&'static str, std::ffi::OsString)>,
+    /// Kache's runtime directory, when it is not the cache directory.
+    runtime: Option<PathBuf>,
+    /// A `[cache.volumes]` store for each target, apart from the cache.
+    shard: Option<PathBuf>,
 }
 
 impl WorkspaceUnit {
@@ -964,8 +1083,31 @@ impl WorkspaceUnit {
             lib,
             files: vec![("assets/shared.txt".into(), "shared\n".into())],
             proc_macro,
+            facade: Vec::new(),
             external_targets: false,
+            env: Vec::new(),
+            runtime: None,
+            shard: None,
         }
+    }
+
+    /// The member linking only `facade`, an rlib that re-exports
+    /// [`SCAN_MACRO`], and expanding the macro through it.
+    fn with_facade(self) -> Self {
+        self.with_facade_macro(SCAN_MACRO)
+    }
+
+    /// [`Self::with_facade`], with `scan` as the macro's source.
+    fn with_facade_macro(mut self, scan: &str) -> Self {
+        self.facade = build_facade_with(self.root.path(), scan);
+        self.lib = SCAN_LIB.to_string();
+        self
+    }
+
+    /// Every checkout also gets `content` at `path`.
+    fn with_file(mut self, path: &str, content: &str) -> Self {
+        self.files.push((path.to_string(), content.to_string()));
+        self
     }
 
     fn with_external_targets(mut self) -> Self {
@@ -1006,14 +1148,19 @@ impl WorkspaceUnit {
         for (path, content) in &self.files {
             write(path, content);
         }
-        let target = self.target(&checkout);
-        std::fs::create_dir_all(target.join("debug/deps")).unwrap();
-        std::fs::create_dir_all(out_dir_in(&target)).unwrap();
-        std::fs::write(out_dir_in(&target).join("gen.rs"), GENERATED).unwrap();
-        if let Some(proc_macro) = &self.proc_macro {
-            std::fs::copy(proc_macro, self.macro_in(&target)).unwrap();
-        }
+        self.prepare_target(&self.target(&checkout));
         checkout
+    }
+
+    /// `target` the way Cargo leaves it before compiling `kt`.
+    fn prepare_target(&self, target: &Path) {
+        std::fs::create_dir_all(target.join("debug/deps")).unwrap();
+        std::fs::create_dir_all(out_dir_in(target)).unwrap();
+        std::fs::write(out_dir_in(target).join("gen.rs"), GENERATED).unwrap();
+        if let Some(proc_macro) = &self.proc_macro {
+            std::fs::copy(proc_macro, self.macro_in(target)).unwrap();
+        }
+        copy_into_deps(&self.facade, target);
     }
 
     fn macro_in(&self, target: &Path) -> PathBuf {
@@ -1048,7 +1195,18 @@ impl WorkspaceUnit {
         verify: Option<&str>,
         extra: &[&str],
     ) -> LastEvent {
-        let target = self.target(checkout);
+        self.build_in(checkout, &self.target(checkout), predictions, verify, extra)
+    }
+
+    /// [`Self::build_with`] into `target`.
+    fn build_in(
+        &self,
+        checkout: &Path,
+        target: &Path,
+        predictions: bool,
+        verify: Option<&str>,
+        extra: &[&str],
+    ) -> LastEvent {
         let deps = target.join("debug/deps");
         let mut args: Vec<String> = vec![
             rustc_path(),
@@ -1070,10 +1228,20 @@ impl WorkspaceUnit {
         ];
         if self.proc_macro.is_some() {
             args.push("--extern".into());
-            args.push(format!("pm={}", self.macro_in(&target).display()));
+            args.push(format!("pm={}", self.macro_in(target).display()));
+        }
+        if !self.facade.is_empty() {
+            args.push("--extern".into());
+            args.push(format!("facade={}", deps.join("libfacade.rlib").display()));
         }
         args.extend(extra.iter().map(|arg| arg.to_string()));
-        let config_path = write_test_config(&self.cache, predictions);
+        let config_path = write_test_config_with(
+            &self.cache,
+            self.runtime.as_deref().unwrap_or(&self.cache),
+            self.shard.as_deref().map(|shard| (target, shard)),
+            predictions,
+        );
+        settle_writes(&[checkout, target]);
         let mut command = std::process::Command::new(kache_binary());
         command
             .args(&args)
@@ -1081,7 +1249,7 @@ impl WorkspaceUnit {
             .env("KACHE_CACHE_DIR", &self.cache)
             .env("KACHE_CONFIG", config_path)
             .env("CARGO_MANIFEST_DIR", checkout.join("kt"))
-            .env("OUT_DIR", out_dir_in(&target))
+            .env("OUT_DIR", out_dir_in(target))
             .env_remove("KACHE_DISABLED")
             .env_remove("KACHE_NAMESPACE")
             .env_remove("KACHE_BASE_DIR")
@@ -1094,13 +1262,14 @@ impl WorkspaceUnit {
             Some(mode) => command.env("KACHE_VERIFY_INPUT_PREDICTIONS", mode),
             None => command.env_remove("KACHE_VERIFY_INPUT_PREDICTIONS"),
         };
+        command.envs(self.env.iter().map(|(name, value)| (name, value)));
         let output = command.output().expect("failed to run kache rustc");
         assert!(
             output.status.success(),
             "kache rustc failed.\nargs: {args:?}\nstderr: {}",
             String::from_utf8_lossy(&output.stderr),
         );
-        last_event(&self.cache)
+        last_event_with(&self.cache, &self.env)
     }
 
     /// Build in checkout A, let `prepare` edit checkout B, and return B's
@@ -1226,6 +1395,104 @@ fn a_workspace_unit_with_a_proc_macro_predicts_in_its_own_checkout() {
     assert_eq!(warm.dep_info_runs, 0);
 }
 
+/// A cache inside the workspace, as GitLab CI requires of cached paths, is
+/// not part of the workspace guard: the store writes to it while the unit
+/// compiles, and the record must still carry the guard.
+#[test]
+fn a_cache_inside_the_workspace_keeps_the_record_guarded() {
+    build_kache();
+    let mut unit = WorkspaceUnit::new(false);
+    let a = unit.checkout("a");
+    unit.cache = a.join(".cache/kache");
+    std::fs::create_dir_all(&unit.cache).unwrap();
+    assert_eq!(unit.build(&a, true, None).result, "miss");
+    let warm = unit.build(&a, true, None);
+    assert_eq!(warm.result, "local_hit");
+    assert_eq!(warm.dep_info_runs, 0, "the record kept its guard");
+}
+
+/// Kache's cache, its runtime directory and the store a volume routes the
+/// targets to, each inside the workspace and apart from the others. A build
+/// writes to all three while units compile, and the workspace guard leaves
+/// each of them out on its own.
+#[test]
+fn kaches_own_directories_apart_inside_the_workspace_keep_the_record_guarded() {
+    build_kache();
+    let mut unit = WorkspaceUnit::new(false);
+    let a = unit.checkout("a");
+    let own = a.join(".cache");
+    unit.cache = own.join("kache");
+    let runtime = own.join("runtime");
+    let shard = own.join("shard");
+    for dir in [&unit.cache, &runtime, &shard] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    unit.runtime = Some(runtime.clone());
+    unit.shard = Some(shard.clone());
+    assert_eq!(unit.build(&a, true, None).result, "miss");
+    assert!(
+        shard.join("index.db").is_file(),
+        "the shard holds the store"
+    );
+    // What another build writes to each meanwhile.
+    for dir in [&unit.cache, &runtime, &shard] {
+        std::fs::write(dir.join("written-by-another-build"), "x").unwrap();
+    }
+    let warm = unit.build(&a, true, None);
+    assert_eq!(warm.result, "local_hit");
+    assert_eq!(warm.dep_info_runs, 0, "the record kept its guard");
+}
+
+/// Under a trust domain the store sits in a directory of its own, and the
+/// tree memos stay in the probe directory beside it. With the cache inside
+/// the workspace, neither is part of the workspace guard.
+#[test]
+fn a_cache_inside_the_workspace_keeps_the_record_guarded_under_a_trust_domain() {
+    build_kache();
+    let mut unit = WorkspaceUnit::new(false);
+    let a = unit.checkout("a");
+    unit.cache = a.join(".cache/kache");
+    std::fs::create_dir_all(&unit.cache).unwrap();
+    unit.env.push(("KACHE_TRUST_DOMAIN", "ci".into()));
+    assert_eq!(unit.build(&a, true, None).result, "miss");
+    // A tree memo another unit wrote.
+    let probes = unit.cache.join("probes");
+    std::fs::create_dir_all(&probes).unwrap();
+    std::fs::write(probes.join("another-unit"), "memo").unwrap();
+    let warm = unit.build(&a, true, None);
+    assert_eq!(warm.result, "local_hit");
+    assert_eq!(warm.dep_info_runs, 0, "the record kept its guard");
+}
+
+/// Cargo's home inside the workspace, where GitLab CI keeps it to cache
+/// Cargo's downloads. What Cargo writes there is not part of the workspace
+/// guard: Cargo records there when builds use downloaded crates, and the
+/// record must still apply. The rest of the home is: with the home in the
+/// workspace's `.cargo`, its `config.toml` is the workspace's.
+#[test]
+fn a_cargo_home_inside_the_workspace_keeps_the_record_guarded() {
+    build_kache();
+    let mut unit = WorkspaceUnit::new(false);
+    let a = unit.checkout("a");
+    let home = a.join(".cargo");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(home.join(".global-cache"), "first run").unwrap();
+    std::fs::write(home.join("config.toml"), "[build]\n").unwrap();
+    unit.env.push(("CARGO_HOME", home.clone().into()));
+    assert_eq!(unit.build(&a, true, None).result, "miss");
+    std::fs::write(home.join(".global-cache"), "second run").unwrap();
+    let warm = unit.build(&a, true, None);
+    assert_eq!(warm.result, "local_hit");
+    assert_eq!(warm.dep_info_runs, 0, "the record kept its guard");
+    std::fs::write(home.join("config.toml"), "[build]\njobs = 2\n").unwrap();
+    let configured = unit.build(&a, true, None);
+    assert_eq!(configured.result, "local_hit");
+    assert_eq!(
+        configured.dep_info_runs, 1,
+        "the home's configuration is part of the guard"
+    );
+}
+
 /// A file the closure does not name, anywhere in the workspace, could be one
 /// a macro reads, so B's extra file keeps A's record out.
 #[test]
@@ -1310,6 +1577,261 @@ fn a_registry_unit_with_a_macro_predicts_in_its_own_target() {
     let warm = unit.build(&a, true, None);
     assert_eq!(warm.result, "local_hit");
     assert_eq!(warm.dep_info_runs, 0);
+}
+
+/// A member that expands a proc macro through an rlib that re-exports it
+/// names only the rlib, yet the macro lists a directory. A file added there
+/// changes nothing the closure names, and must still miss: the workspace
+/// guard sees it. The pre-pass, with predictions off, gives the same key.
+#[test]
+fn a_file_added_where_a_re_exported_macro_lists_misses() {
+    build_kache();
+    let unit = WorkspaceUnit::new(false)
+        .with_facade()
+        .with_file("kt/assets/a.txt", "a\n");
+    let a = unit.checkout("a");
+    let cold = unit.build(&a, true, None);
+    assert_eq!(cold.result, "miss");
+    let warm = unit.build(&a, true, None);
+    assert_eq!(warm.result, "local_hit");
+    assert_eq!(warm.dep_info_runs, 0, "an unchanged tree keeps its record");
+
+    std::fs::write(a.join("kt/assets/b.txt"), "b\n").unwrap();
+    let added = unit.build(&a, true, None);
+    assert_eq!(added.result, "miss");
+    assert_ne!(added.cache_key, cold.cache_key);
+    assert_eq!(added.dep_info_runs, 1);
+    let off = unit.build(&a, false, None);
+    assert_eq!(off.result, "local_hit");
+    assert_eq!(off.cache_key, added.cache_key);
+
+    // Invoked as Cargo invokes it, the compile discovers the closure.
+    std::fs::write(a.join("kt/assets/c.txt"), "c\n").unwrap();
+    let compiled = unit.build_as_cargo(&a);
+    assert_eq!(compiled.result, "miss");
+    assert_ne!(compiled.cache_key, added.cache_key);
+    assert_eq!(compiled.dep_info_runs, 0);
+    assert_eq!(compiled.compiler_runs, 1);
+}
+
+/// [`SCAN_MACRO`], except that it first removes `assets/a.txt`, once, when a
+/// `remove-a` file sits next to the checkout: the file is gone after the
+/// wrapper took its digest of the tree and before the macro lists it.
+const REMOVING_SCAN_MACRO: &str = r#"extern crate proc_macro;
+#[proc_macro]
+pub fn scan(_input: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+    let manifest_dir = std::path::Path::new(&manifest_dir);
+    let assets = manifest_dir.join("assets");
+    let marker = manifest_dir.join("../../remove-a");
+    if marker.exists() {
+        let _ = std::fs::remove_file(assets.join("a.txt"));
+        let _ = std::fs::remove_file(&marker);
+    }
+    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(assets)
+        .map(|entries| entries.flatten().map(|entry| entry.path()).collect())
+        .unwrap_or_default();
+    files.sort();
+    let mut code = String::from("pub const ASSETS: &[&str] = &[");
+    for file in files {
+        code.push_str(&format!("include_str!({:?}),", file.display().to_string()));
+    }
+    code.push_str("];");
+    code.parse().unwrap()
+}
+"#;
+
+/// A listed file removed while the unit builds, and put back byte for byte
+/// afterwards, leaves a closure without it under a digest that matches
+/// again. The record of that build keeps no guard, so the next build
+/// discovers its closure and keys as the pre-pass does.
+#[test]
+fn a_file_removed_while_the_unit_builds_leaves_no_guarded_record() {
+    build_kache();
+    let unit = WorkspaceUnit::new(false)
+        .with_facade_macro(REMOVING_SCAN_MACRO)
+        .with_file("kt/assets/a.txt", "a\n");
+    let a = unit.checkout("a");
+    assert_eq!(unit.build(&a, true, None).result, "miss");
+
+    // A new file keeps this build off the first record.
+    std::fs::write(a.join("kt/assets/b.txt"), "b\n").unwrap();
+    std::fs::write(unit.root.path().join("remove-a"), "").unwrap();
+    let removed = unit.build(&a, true, None);
+    assert_eq!(removed.result, "miss");
+    assert!(!a.join("kt/assets/a.txt").exists(), "the macro removed it");
+
+    std::fs::write(a.join("kt/assets/a.txt"), "a\n").unwrap();
+    let restored = unit.build(&a, true, None);
+    assert_eq!(restored.result, "miss");
+    assert_ne!(restored.cache_key, removed.cache_key);
+    let off = unit.build(&a, false, None);
+    assert_eq!(off.result, "local_hit");
+    assert_eq!(off.cache_key, restored.cache_key);
+}
+
+/// A directory the build cannot read, such as a database's data directory
+/// mounted into the workspace, counts as unreadable in the workspace guard
+/// instead of keeping every workspace unit from predicting: a proc macro
+/// cannot read it either.
+#[cfg(unix)]
+#[test]
+fn an_unreadable_directory_in_the_workspace_keeps_predictions() {
+    use std::os::unix::fs::PermissionsExt;
+    struct Readable(PathBuf);
+    impl Drop for Readable {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+    build_kache();
+    let unit = WorkspaceUnit::new(false)
+        .with_facade()
+        .with_file("kt/assets/a.txt", "a\n")
+        .with_file("pgdata/PG_VERSION", "16\n");
+    let a = unit.checkout("a");
+    let pgdata = Readable(a.join("pgdata"));
+    std::fs::set_permissions(&pgdata.0, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::read_dir(&pgdata.0).is_ok() {
+        eprintln!("skipped: this user reads past permissions");
+        return;
+    }
+    assert_eq!(unit.build(&a, true, None).result, "miss");
+    let warm = unit.build(&a, true, None);
+    assert_eq!(warm.result, "local_hit");
+    assert_eq!(warm.dep_info_runs, 0, "the record applies");
+}
+
+/// `facade` built again with another item into `target`'s `deps`, so its
+/// rlib differs while it re-exports the same macro.
+fn rebuild_facade(root: &Path, scan: &Path, target: &Path) {
+    let out = root.join("facade-out-2");
+    std::fs::create_dir_all(&out).unwrap();
+    let source = root.join("facade-2.rs");
+    std::fs::write(
+        &source,
+        "pub use scan::scan;\npub fn extra() -> u32 { 42 }\n",
+    )
+    .unwrap();
+    let status = std::process::Command::new(rustc_path())
+        .args([
+            "--crate-name",
+            "facade",
+            "--crate-type",
+            "rlib",
+            "--edition",
+            "2021",
+        ])
+        .arg("--extern")
+        .arg(format!("scan={}", scan.display()))
+        .arg("--out-dir")
+        .arg(&out)
+        .arg(&source)
+        .env_remove("RUSTC_WRAPPER")
+        .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
+        .status()
+        .expect("run rustc to rebuild facade");
+    assert!(status.success(), "rebuilding facade failed");
+    std::fs::copy(
+        out.join("libfacade.rlib"),
+        target.join("debug/deps/libfacade.rlib"),
+    )
+    .unwrap();
+}
+
+/// A predicted key that misses because a linked rlib changed is re-derived
+/// with the pre-pass. The record that re-derivation writes keeps the tree
+/// guard the first key took, so the next build predicts again.
+#[test]
+fn a_re_derived_record_keeps_the_tree_guard() {
+    build_kache();
+    let unit = WorkspaceUnit::new(false)
+        .with_facade()
+        .with_file("kt/assets/a.txt", "a\n");
+    let a = unit.checkout("a");
+    assert_eq!(unit.build(&a, true, None).result, "miss");
+    assert_eq!(unit.build(&a, true, None).dep_info_runs, 0);
+
+    rebuild_facade(unit.root.path(), &unit.facade[0], &unit.target(&a));
+    let changed = unit.build(&a, true, None);
+    assert_eq!(changed.result, "miss");
+    assert_eq!(changed.dep_info_runs, 1, "the predicted key is re-derived");
+    let next = unit.build(&a, true, None);
+    assert_eq!(next.result, "local_hit");
+    assert_eq!(
+        next.dep_info_runs, 0,
+        "the re-derived record keeps the guard"
+    );
+}
+
+/// The macro finds a first file whether its directory was empty or missing
+/// when the record was made.
+#[test]
+fn a_re_exported_macro_finds_the_first_file_of_an_empty_or_new_directory() {
+    build_kache();
+    for empty_dir in [true, false] {
+        let unit = WorkspaceUnit::new(false).with_facade();
+        let a = unit.checkout("a");
+        if empty_dir {
+            std::fs::create_dir_all(a.join("kt/assets")).unwrap();
+        }
+        let cold = unit.build(&a, true, None);
+        assert_eq!(cold.result, "miss");
+        std::fs::create_dir_all(a.join("kt/assets")).unwrap();
+        std::fs::write(a.join("kt/assets/first.txt"), "first\n").unwrap();
+        let first = unit.build(&a, true, None);
+        assert_eq!(first.result, "miss", "empty_dir={empty_dir}");
+        assert_ne!(first.cache_key, cold.cache_key, "empty_dir={empty_dir}");
+    }
+}
+
+/// A second target directory of the same checkout reads the first one's
+/// shared row, and the shared row carries the workspace guard too.
+#[test]
+fn a_shared_row_is_refused_once_a_listed_file_is_added() {
+    build_kache();
+    let unit = WorkspaceUnit::new(false)
+        .with_facade()
+        .with_file("kt/assets/a.txt", "a\n")
+        .with_external_targets();
+    let a = unit.checkout("a");
+    let first = unit.root.path().join("outputs/first/target");
+    let second = unit.root.path().join("outputs/second/target");
+    unit.prepare_target(&first);
+    unit.prepare_target(&second);
+    let cold = unit.build_in(&a, &first, true, None, &[]);
+    assert_eq!(cold.result, "miss");
+    let shared = unit.build_in(&a, &second, true, None, &[]);
+    assert_eq!(shared.result, "local_hit");
+    assert_eq!(
+        shared.dep_info_runs, 0,
+        "the second target uses the shared row"
+    );
+
+    std::fs::write(a.join("kt/assets/b.txt"), "b\n").unwrap();
+    let added = unit.build_in(&a, &second, true, None, &[]);
+    assert_eq!(added.result, "miss");
+    assert_ne!(added.cache_key, cold.cache_key);
+}
+
+/// A registry package is never edited in place, so a registry unit that
+/// links only an rlib takes no tree guard and keeps predicting: a file added
+/// to its package goes unseen.
+#[test]
+fn a_registry_unit_that_links_an_rlib_takes_no_tree_guard() {
+    build_kache();
+    let unit = OutDirUnit::new(REGISTRY_PACKAGE, false)
+        .with_facade()
+        .with_file("assets/a.txt", "a\n")
+        .with_file("src/lib.rs", SCAN_LIB);
+    let a = unit.target("a");
+    let cold = unit.build(&a, true, None);
+    assert_eq!(cold.result, "miss");
+    std::fs::write(unit.package.join("assets/b.txt"), "b\n").unwrap();
+    let warm = unit.build(&a, true, None);
+    assert_eq!(warm.result, "local_hit");
+    assert_eq!(warm.dep_info_runs, 0);
+    assert_eq!(warm.cache_key, cold.cache_key);
 }
 
 /// A registry proc macro that expands to its `OUT_DIR`, with a build script

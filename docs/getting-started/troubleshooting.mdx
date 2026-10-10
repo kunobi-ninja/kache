@@ -64,6 +64,14 @@ and [build-script inputs](/docs/how-it-works/build-scripts).
 Adaptive incremental mode can also compile a unit you are editing using its
 private incremental state. See [Executables and incremental builds](/docs/getting-started/quick-start#executables-and-incremental-builds).
 
+## A crate fails only with Kache
+
+If one crate keeps failing with an error that goes away with
+`KACHE_DISABLED=1`, the incremental state Kache keeps for it may be damaged.
+Delete `target/<profile>/incremental.kache-auto` or run `cargo clean`.
+`cargo clean -p` does not remove that directory, and
+`KACHE_ADAPTIVE_INCREMENTAL=0` only skips it until you turn the mode back on.
+
 ## The remote is quiet
 
 ```bash

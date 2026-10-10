@@ -19,6 +19,8 @@
 //! neither read nor written since, and arms the rest again. It does nothing
 //! on a filesystem where reads never move an access time (`noatime`), or on
 //! one that is not local, where Cargo does not lock its build directories.
+//! When the probe for reads cannot run, as on a full volume, the target
+//! keeps its arming and waits for the next pass.
 //!
 //! Both of Cargo's layouts are handled (see [`crate::cargo_layout`]):
 //!
@@ -43,7 +45,7 @@ use std::time::{Duration, SystemTime};
 /// version, and the build and artifact locks from 1.100.
 const LOCKS: [&str; 3] = [".cargo-lock", ".cargo-build-lock", ".cargo-artifact-lock"];
 
-/// Name of the file [`reads_visible`] reads.
+/// Name of the file [`probe_reads`] reads.
 const PROBE: &str = ".kache-atime-probe";
 
 /// Directory under the cache dir holding when each target was armed.
@@ -61,7 +63,9 @@ pub(crate) struct Pruned {
 
 /// Whether reading a file in `dir` whose access time is older than its
 /// modification time moves the access time, which is what arming relies on.
-pub(crate) fn reads_visible(dir: &Path) -> bool {
+/// An error means the probe could not run: a full volume refuses its file,
+/// which says nothing about reads.
+fn probe_reads(dir: &Path) -> std::io::Result<bool> {
     let probe = dir.join(format!("{PROBE}-{}", std::process::id()));
     let moved = (|| -> std::io::Result<bool> {
         std::fs::write(&probe, b"probe")?;
@@ -71,7 +75,13 @@ pub(crate) fn reads_visible(dir: &Path) -> bool {
         Ok(moved_past(accessed, armed))
     })();
     let _ = std::fs::remove_file(&probe);
-    moved.unwrap_or(false)
+    moved
+}
+
+/// [`probe_reads`], counting a probe that could not run as no.
+#[cfg(test)]
+pub(crate) fn reads_visible(dir: &Path) -> bool {
+    probe_reads(dir).unwrap_or(false)
 }
 
 /// Whether `accessed` is later than the `armed` access time: a read moved it.
@@ -264,19 +274,36 @@ pub(crate) fn unused_since(cache_dir: &Path, target_dir: &Path) -> Option<System
 /// it: arm it at `now`, but no earlier than `not_before`, unless it has gone
 /// unused since an arming at or after `not_before`. Every profile is armed
 /// under Cargo's locks, and the arming is recorded only when none was held.
-/// Like [`prune`], it needs a local filesystem that shows reads; elsewhere it
-/// forgets any earlier watch, so the target never counts as unused.
+/// The earlier record goes first ([`forget_armed`]); where it cannot, nothing
+/// is armed. Like [`prune`], it needs a local filesystem that shows reads;
+/// elsewhere it forgets any earlier watch, so the target never counts as
+/// unused.
 pub(crate) fn watch(cache_dir: &Path, target_dir: &Path, now: SystemTime, not_before: SystemTime) {
+    watch_with(
+        cache_dir,
+        target_dir,
+        now,
+        not_before,
+        shows_reads,
+        write_armed,
+    );
+}
+
+/// [`watch`], asking `shows_reads` whether arming works in `target_dir` and
+/// recording the arming with `write`.
+fn watch_with(
+    cache_dir: &Path,
+    target_dir: &Path,
+    now: SystemTime,
+    not_before: SystemTime,
+    shows_reads: impl FnOnce(&Path) -> std::io::Result<bool>,
+    write: impl FnOnce(&Path, SystemTime) -> anyhow::Result<()>,
+) {
     let Ok(Some(_reservation)) = crate::target_use::try_exclusive(cache_dir) else {
         return;
     };
     let record = armed_record(cache_dir, target_dir);
-    let local = matches!(
-        crate::cache_fs::classify(&crate::cache_fs::probe(target_dir)),
-        crate::cache_fs::CacheFsVerdict::Local
-    );
-    if !can_prune(local, || reads_visible(target_dir)) {
-        let _ = std::fs::remove_file(&record);
+    if !can_arm(&record, target_dir, shows_reads) {
         return;
     }
     if unused_since(cache_dir, target_dir).is_some_and(|since| since >= not_before) {
@@ -289,12 +316,15 @@ pub(crate) fn watch(cache_dir: &Path, target_dir: &Path, now: SystemTime, not_be
         };
         held.push((profile, locks));
     }
+    if !forget_armed(&record) {
+        return;
+    }
     for (profile, _locks) in &held {
         for unit in units(profile) {
             arm(&unit.fingerprint());
         }
     }
-    if let Err(error) = write_armed(&record, now.max(not_before)) {
+    if let Err(error) = write(&record, now.max(not_before)) {
         tracing::debug!(
             "could not record when {} was armed: {error:#}",
             target_dir.display()
@@ -323,6 +353,23 @@ fn write_armed(record: &Path, at: SystemTime) -> anyhow::Result<()> {
         .map_or(0, |since| since.as_secs());
     std::fs::create_dir_all(record.parent().unwrap_or(record))?;
     crate::atomic::atomic_replace(record, seconds.to_string().as_bytes())
+}
+
+/// Remove `record` before the units it vouches for are armed again. Arming
+/// erases the reads that show a unit was used since the recorded moment, so
+/// a record that outlived it would count those units as unused. Writing the
+/// new record can fail where removing the old one works: a full APFS volume
+/// refuses to rename onto an existing file. `false` when it stays, and then
+/// nothing may be armed.
+fn forget_armed(record: &Path) -> bool {
+    match std::fs::remove_file(record) {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        Err(error) => {
+            tracing::debug!("cannot replace {}: {error}", record.display());
+            false
+        }
+    }
 }
 
 /// What to do with a target armed at `armed`, at `now`, for `window`.
@@ -356,42 +403,101 @@ pub(crate) fn prune(
     window: Duration,
     now: SystemTime,
 ) -> Pruned {
+    prune_with(cache_dir, target_dir, window, now, shows_reads)
+}
+
+/// [`prune`], asking `shows_reads` whether arming works in `target_dir`.
+fn prune_with(
+    cache_dir: &Path,
+    target_dir: &Path,
+    window: Duration,
+    now: SystemTime,
+    shows_reads: impl FnOnce(&Path) -> std::io::Result<bool>,
+) -> Pruned {
     let Ok(Some(_reservation)) = crate::target_use::try_exclusive(cache_dir) else {
         return Pruned::default();
     };
-    let local = matches!(
-        crate::cache_fs::classify(&crate::cache_fs::probe(target_dir)),
-        crate::cache_fs::CacheFsVerdict::Local
-    );
-    if !can_prune(local, || reads_visible(target_dir)) {
-        // An arming here would no longer show reads: forget it.
-        let _ = std::fs::remove_file(armed_record(cache_dir, target_dir));
+    if !can_arm(
+        &armed_record(cache_dir, target_dir),
+        target_dir,
+        shows_reads,
+    ) {
         return Pruned::default();
     }
     judge(cache_dir, target_dir, window, now)
 }
 
+/// Whether this pass may arm `target_dir`, by `shows_reads`. Where reads do
+/// not show, an arming would no longer vouch for anything, so its `record`
+/// is forgotten. A probe that could not run, as on a full volume, says
+/// nothing about reads: the target waits for the next pass with its record.
+fn can_arm(
+    record: &Path,
+    target_dir: &Path,
+    shows_reads: impl FnOnce(&Path) -> std::io::Result<bool>,
+) -> bool {
+    match shows_reads(target_dir) {
+        Ok(true) => true,
+        Ok(false) => {
+            let _ = std::fs::remove_file(record);
+            false
+        }
+        Err(error) => {
+            tracing::debug!(
+                "skipping {} this pass: cannot tell whether reads show there: {error}",
+                target_dir.display()
+            );
+            false
+        }
+    }
+}
+
+/// [`can_prune`] for `target_dir`: the filesystem's locality, then the probe.
+/// An error means the probe could not run.
+fn shows_reads(target_dir: &Path) -> std::io::Result<bool> {
+    let local = matches!(
+        crate::cache_fs::classify(&crate::cache_fs::probe(target_dir)),
+        crate::cache_fs::CacheFsVerdict::Local
+    );
+    can_prune(local, || probe_reads(target_dir))
+}
+
 /// Pruning needs a local filesystem, where Cargo locks its build
 /// directories, that also shows reads. `reads` is only asked when local.
-fn can_prune(local: bool, reads: impl FnOnce() -> bool) -> bool {
-    local && reads()
+fn can_prune(local: bool, reads: impl FnOnce() -> std::io::Result<bool>) -> std::io::Result<bool> {
+    Ok(local && reads()?)
 }
 
 /// Arm `target_dir`, wait out `window`, then remove what was not used; the
 /// part of [`prune`] after the filesystem was found to show reads.
 fn judge(cache_dir: &Path, target_dir: &Path, window: Duration, now: SystemTime) -> Pruned {
+    judge_with(cache_dir, target_dir, window, now, write_armed)
+}
+
+/// [`judge`], recording the arming with `write`.
+fn judge_with(
+    cache_dir: &Path,
+    target_dir: &Path,
+    window: Duration,
+    now: SystemTime,
+    write: impl FnOnce(&Path, SystemTime) -> anyhow::Result<()>,
+) -> Pruned {
     let record = armed_record(cache_dir, target_dir);
-    let (pruned, complete) = match step(read_armed(&record), now, window) {
+    let armed = match step(read_armed(&record), now, window) {
         Step::Wait => return Pruned::default(),
-        Step::Arm => sweep(target_dir, None),
-        Step::Judge(armed) => sweep(target_dir, Some(armed)),
+        Step::Arm => None,
+        Step::Judge(armed) => Some(armed),
     };
-    // A profile a build held was neither judged nor armed; recording the
-    // arming would vouch for it, so the next check tries again.
+    // The old record goes before anything is armed again. A profile a build
+    // held was neither judged nor armed, and with an old record that would
+    // not go, nothing was armed: recording now would vouch for units never
+    // armed, so the next check tries again.
+    let (pruned, complete) = sweep(target_dir, armed, || forget_armed(&record));
     if !complete {
         return pruned;
     }
-    if let Err(error) = write_armed(&record, now) {
+    // On failure no record is left, and the next check arms from scratch.
+    if let Err(error) = write(&record, now) {
         tracing::debug!(
             "could not record when {} was armed: {error:#}",
             target_dir.display()
@@ -442,8 +548,14 @@ fn stale(unit: &Unit, outputs: &Outputs, armed: SystemTime) -> Option<(Vec<PathB
 
 /// Hold every profile before removing or re-arming units. A partial pass must
 /// not reset a used unit's access time while keeping the old arming record.
-/// `false` when any profile is busy, with every unit left untouched.
-fn sweep(target_dir: &Path, armed: Option<SystemTime>) -> (Pruned, bool) {
+/// `false` when any profile is busy, with every unit left untouched. The
+/// unused units go next; then `before_arming` decides whether the rest are
+/// armed again, and `false` from it leaves them as they are.
+fn sweep(
+    target_dir: &Path,
+    armed: Option<SystemTime>,
+    before_arming: impl FnOnce() -> bool,
+) -> (Pruned, bool) {
     let mut pruned = Pruned::default();
     let mut held = Vec::new();
     for profile in profiles(target_dir) {
@@ -452,6 +564,7 @@ fn sweep(target_dir: &Path, armed: Option<SystemTime>) -> (Pruned, bool) {
         };
         held.push((profile, locks));
     }
+    let mut kept = Vec::new();
     for (profile, _locks) in &held {
         let outputs = outputs(profile);
         for unit in units(profile) {
@@ -465,8 +578,14 @@ fn sweep(target_dir: &Path, armed: Option<SystemTime>) -> (Pruned, bool) {
             if armed.is_some() {
                 pruned.used += 1;
             }
-            arm(&unit.fingerprint());
+            kept.push(unit.fingerprint());
         }
+    }
+    if !before_arming() {
+        return (pruned, false);
+    }
+    for fingerprint in kept {
+        arm(&fingerprint);
     }
     (pruned, true)
 }
@@ -613,7 +732,7 @@ mod tests {
 
             set_times(&target, ago(40));
             let armed = SystemTime::now() - Duration::from_secs(3);
-            sweep(&target, None);
+            sweep(&target, None, || true);
             write_armed(&armed_record(cache.path(), &target), armed).unwrap();
             let since = unused_since(cache.path(), &target).unwrap();
             assert!(
@@ -678,6 +797,11 @@ mod tests {
         }
         assert!(entries(dir.path()).is_empty(), "the probe is removed");
         assert!(!reads_visible(&dir.path().join("missing")));
+        assert_eq!(
+            probe_reads(&dir.path().join("missing")).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound,
+            "a probe that cannot run is not a probe that saw no read"
+        );
         let armed = filetime::FileTime::from_unix_time(1_000, 0);
         assert!(moved_past(
             filetime::FileTime::from_unix_time(1_001, 0),
@@ -938,12 +1062,15 @@ mod tests {
 
     #[test]
     fn needs_a_local_filesystem_that_shows_reads() {
-        assert!(can_prune(true, || true));
-        assert!(!can_prune(true, || false));
-        assert!(!can_prune(false, || true));
-        assert!(!can_prune(false, || panic!(
-            "not asked off a local filesystem"
-        )));
+        assert!(can_prune(true, || Ok(true)).unwrap());
+        assert!(!can_prune(true, || Ok(false)).unwrap());
+        assert!(!can_prune(false, || Ok(true)).unwrap());
+        assert!(!can_prune(false, || panic!("not asked off a local filesystem")).unwrap());
+        let full = || Err(std::io::Error::from(std::io::ErrorKind::StorageFull));
+        assert_eq!(
+            can_prune(true, full).unwrap_err().kind(),
+            std::io::ErrorKind::StorageFull
+        );
     }
 
     #[test]
@@ -956,6 +1083,11 @@ mod tests {
             prune(&cache, &missing, window, SystemTime::now()),
             Pruned::default()
         );
+        assert_eq!(
+            read_armed(&armed_record(&cache, &missing)),
+            None,
+            "a missing target is never armed"
+        );
         let target = dir.path().join("target");
         per_unit_profile(&target.join("debug"));
         set_times(&target, ago(60));
@@ -963,6 +1095,181 @@ mod tests {
         let armed = read_armed(&armed_record(&cache, &target));
         // Arming happens only where reads show, and only then is it recorded.
         assert_eq!(armed.is_some(), reads_visible(&target));
+    }
+
+    #[test]
+    fn a_probe_that_cannot_run_keeps_the_arming() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        let target = dir.path().join("target");
+        let profile = target.join("debug");
+        per_unit_profile(&profile);
+        set_times(&target, ago(60));
+        let record = armed_record(&cache, &target);
+        write_armed(&record, ago(40)).unwrap();
+        let armed = read_armed(&record);
+        let window = Duration::from_secs(30 * DAY);
+        let now = SystemTime::now();
+        // A full volume refuses the probe's file.
+        let full = |_: &Path| -> std::io::Result<bool> {
+            Err(std::io::Error::from(std::io::ErrorKind::StorageFull))
+        };
+        // Judged now, both units would go, and a watch would arm again.
+        assert_eq!(
+            prune_with(&cache, &target, window, now, full),
+            Pruned::default()
+        );
+        assert_eq!(read_armed(&record), armed, "prune kept the arming");
+        assert_eq!(units(&profile).len(), 2, "prune skipped the target");
+        watch_with(&cache, &target, now, ago(30), full, write_armed);
+        assert_eq!(read_armed(&record), armed, "watch kept the arming");
+
+        // Reads that do not show still forget it.
+        let hidden = |_: &Path| -> std::io::Result<bool> { Ok(false) };
+        watch_with(&cache, &target, now, ago(30), hidden, write_armed);
+        assert_eq!(read_armed(&record), None);
+        write_armed(&record, ago(40)).unwrap();
+        assert_eq!(
+            prune_with(&cache, &target, window, now, hidden),
+            Pruned::default()
+        );
+        assert_eq!(read_armed(&record), None);
+        assert_eq!(units(&profile).len(), 2);
+    }
+
+    /// Write `record` the way a full APFS volume does: a new file goes in,
+    /// but nothing is renamed onto one that exists.
+    fn write_where_free(record: &Path, at: SystemTime) -> anyhow::Result<()> {
+        if record.exists() {
+            return Err(std::io::Error::from(std::io::ErrorKind::StorageFull).into());
+        }
+        write_armed(record, at)
+    }
+
+    fn write_nothing(_: &Path, _: SystemTime) -> anyhow::Result<()> {
+        Err(std::io::Error::from(std::io::ErrorKind::StorageFull).into())
+    }
+
+    #[test]
+    fn an_arming_never_keeps_an_older_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        let target = dir.path().join("target");
+        let profile = target.join("debug");
+        per_unit_profile(&profile);
+        set_times(&target, ago(60));
+        let window = Duration::from_secs(30 * DAY);
+        let hour = Duration::from_secs(3600);
+        judge(&cache, &target, window, ago(40));
+        let used = unit_named(&profile, NEW);
+        read_now(&used);
+
+        let now = SystemTime::now();
+        let pruned = judge_with(&cache, &target, window, now, write_where_free);
+        assert_eq!((pruned.units, pruned.used), (1, 1));
+        // `used` was armed again under the new record. Judged an hour on
+        // against the old one, it would look unused and go.
+        assert_eq!(
+            judge(&cache, &target, window, now + hour),
+            Pruned::default()
+        );
+        assert_eq!(units(&profile), vec![used.clone()]);
+
+        // With no record written at all, none is left: the next check arms
+        // from scratch.
+        read_now(&used);
+        let later = now + window;
+        let pruned = judge_with(&cache, &target, window, later, write_nothing);
+        assert_eq!((pruned.units, pruned.used), (0, 1));
+        assert_eq!(read_armed(&armed_record(&cache, &target)), None);
+        assert_eq!(
+            judge(&cache, &target, window, later + hour),
+            Pruned::default()
+        );
+        assert_eq!(units(&profile), vec![used]);
+    }
+
+    #[test]
+    fn a_watch_never_keeps_an_older_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        let target = dir.path().join("target");
+        let profile = target.join("debug");
+        per_unit_profile(&profile);
+        set_times(&target, ago(60));
+        let shows = |_: &Path| -> std::io::Result<bool> { Ok(true) };
+        watch_with(&cache, &target, ago(10), ago(20), shows, write_armed);
+        let first = unused_since(&cache, &target).unwrap();
+        let used = unit_named(&profile, NEW);
+        read_now(&used);
+
+        let now = SystemTime::now();
+        watch_with(&cache, &target, now, ago(20), shows, write_where_free);
+        let since = unused_since(&cache, &target).unwrap();
+        assert!(since > first, "idle from the new arming, not the old");
+
+        read_now(&used);
+        watch_with(&cache, &target, now, ago(20), shows, write_nothing);
+        assert_eq!(unused_since(&cache, &target), None, "no record is left");
+    }
+
+    #[test]
+    fn units_that_stay_are_not_armed_while_the_old_record_stays() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        let profile = target.join("debug");
+        per_unit_profile(&profile);
+        set_times(&target, ago(60));
+        sweep(&target, None, || true);
+        let used = unit_named(&profile, NEW);
+        read_now(&used);
+        let armed = ago(40);
+        let (pruned, complete) = sweep(&target, Some(armed), || false);
+        assert_eq!((pruned.units, pruned.used, complete), (1, 1, false));
+        assert!(
+            used_since(&used.fingerprint(), armed),
+            "the read still shows"
+        );
+        assert_eq!(units(&profile), vec![used]);
+    }
+
+    /// The record directory turned read-only after an arming was recorded:
+    /// the old record can be neither replaced nor removed.
+    #[cfg(unix)]
+    #[test]
+    fn a_record_that_cannot_be_removed_keeps_the_reads_it_judges_by() {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: plain libc call with no arguments.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        let target = dir.path().join("target");
+        let profile = target.join("debug");
+        per_unit_profile(&profile);
+        set_times(&target, ago(60));
+        let window = Duration::from_secs(30 * DAY);
+        judge(&cache, &target, window, ago(40));
+        let record = armed_record(&cache, &target);
+        let armed = read_armed(&record);
+        let used = unit_named(&profile, NEW);
+        read_now(&used);
+        let records = record.parent().unwrap();
+        let mode = |mode| std::fs::set_permissions(records, std::fs::Permissions::from_mode(mode));
+        mode(0o555).unwrap();
+        let now = SystemTime::now();
+        let pruned = judge(&cache, &target, window, now);
+        let shows = |_: &Path| -> std::io::Result<bool> { Ok(true) };
+        watch_with(&cache, &target, now, ago(50), shows, write_armed);
+        mode(0o755).unwrap();
+        assert_eq!((pruned.units, pruned.used), (1, 1));
+        assert_eq!(read_armed(&record), armed);
+        assert_eq!(unused_since(&cache, &target), None, "watch armed nothing");
+
+        let pruned = judge(&cache, &target, window, now + Duration::from_secs(3600));
+        assert_eq!((pruned.units, pruned.used), (0, 1));
+        assert_eq!(units(&profile), vec![used]);
     }
 
     #[test]
@@ -979,14 +1286,14 @@ mod tests {
                 .open(profile.join(name))
                 .unwrap();
             lock.lock().unwrap();
-            let (pruned, complete) = sweep(dir.path(), Some(ago(5)));
+            let (pruned, complete) = sweep(dir.path(), Some(ago(5)), || true);
             assert_eq!(pruned, Pruned::default(), "{name}");
             assert!(!complete, "a held profile is reported: {name}");
             assert_eq!(units(&profile).len(), 2);
             // A fork elsewhere in the suite can hold a duplicate past the drop.
             lock.unlock().unwrap();
         }
-        let (pruned, complete) = sweep(dir.path(), Some(ago(5)));
+        let (pruned, complete) = sweep(dir.path(), Some(ago(5)), || true);
         assert_eq!((pruned.units, complete), (2, true));
     }
 

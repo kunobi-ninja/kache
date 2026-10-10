@@ -107,6 +107,29 @@ fn bootstrap_kache() -> Result<PathBuf, String> {
     Ok(bin)
 }
 
+/// A proc macro that lists `$CARGO_MANIFEST_DIR/assets`, which may be
+/// missing, and includes each file it finds, as `sqlx::migrate!` and
+/// `include_dir!` do. rustc reports the files it included, never the
+/// directory it listed.
+#[allow(dead_code)]
+pub const SCAN_MACRO: &str = r#"extern crate proc_macro;
+#[proc_macro]
+pub fn scan(_input: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+    let assets = std::path::Path::new(&manifest_dir).join("assets");
+    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(assets)
+        .map(|entries| entries.flatten().map(|entry| entry.path()).collect())
+        .unwrap_or_default();
+    files.sort();
+    let mut code = String::from("pub const ASSETS: &[&str] = &[");
+    for file in files {
+        code.push_str(&format!("include_str!({:?}),", file.display().to_string()));
+    }
+    code.push_str("];");
+    code.parse().unwrap()
+}
+"#;
+
 /// Keeps tests off the developer's real `~/.config/kache/config.toml`.
 pub fn isolated_config_path(cache_dir: &Path) -> PathBuf {
     cache_dir.join("config.toml")
@@ -186,6 +209,53 @@ pub fn scratch_dir() -> PathBuf {
     };
     std::fs::create_dir_all(&dir).expect("creating scratch dir");
     dir
+}
+
+/// Wait until a compile started after this returns counts every file the
+/// caller has written as written before it.
+///
+/// Kache counts an input stamped up to one window before an invocation's
+/// start as written during it (`kache_store::file_hash::stamp_written_since`),
+/// and a compile that ran before its key does not store then. The window is
+/// 1 ms on Linux, macOS and Windows and 20 ms elsewhere where stamps keep a fraction
+/// of a second, which this always waits, and about two seconds for a
+/// whole-second stamp found under `dirs`. A stamp in the future cannot be
+/// waited out and is left to the test.
+#[allow(dead_code)]
+pub fn settle_writes(dirs: &[&Path]) {
+    use kache_store::file_hash::{
+        FINE_STAMP_WINDOW_NS, metadata_ctime_ns, metadata_mtime_ns, stamp_clock_ns,
+        stamp_window_ns, wall_clock_ns,
+    };
+    fn collect(path: &Path, stamps: &mut Vec<i64>) {
+        let Ok(link) = std::fs::symlink_metadata(path) else {
+            return;
+        };
+        if link.is_dir() {
+            for entry in std::fs::read_dir(path).into_iter().flatten().flatten() {
+                collect(&entry.path(), stamps);
+            }
+        } else if let Ok(metadata) = std::fs::metadata(path) {
+            stamps.extend([metadata_mtime_ns(&metadata), metadata_ctime_ns(&metadata)]);
+        }
+    }
+    let now = wall_clock_ns();
+    let mut stamps = Vec::new();
+    for dir in dirs {
+        collect(dir, &mut stamps);
+    }
+    let settled_at = stamps
+        .into_iter()
+        .filter(|&stamp| stamp <= now)
+        .map(|stamp| stamp.saturating_add(stamp_window_ns(stamp)))
+        .fold(
+            stamp_clock_ns().saturating_add(FINE_STAMP_WINDOW_NS),
+            i64::max,
+        );
+    // Kache reads its start from the same clock.
+    while stamp_clock_ns() <= settled_at {
+        std::thread::sleep(Duration::from_millis(1));
+    }
 }
 
 /// The lock a live daemon holds for its whole lifetime, under `runtime_dir`.

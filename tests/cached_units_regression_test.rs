@@ -17,7 +17,7 @@ use tempfile::TempDir;
 
 #[allow(dead_code)]
 mod common;
-use common::{hermetic_command, kache_binary};
+use common::{SCAN_MACRO, hermetic_command, kache_binary};
 
 /// A workspace with the unit shapes the cache treats differently: a plain
 /// library, a library with a build script (an `OUT_DIR`), a proc-macro and a
@@ -389,6 +389,99 @@ fn record_less_misses_key_from_the_emitted_dep_info() {
         .collect();
     assert_eq!(field(leaf[0], "result"), "miss", "a changed module misses");
     assert_ne!(field(leaf[0], "cache_key"), cold_key);
+}
+
+/// A workspace whose `app` lists `app/assets` through `scan::scan!`, a proc
+/// macro it reaches only through `facade`, an rlib that re-exports it, as
+/// `sqlx::migrate!` reaches `sqlx-macros` through `sqlx`.
+fn write_scanning_workspace(root: &Path) {
+    let write = |relative: &str, content: &str| {
+        let path = root.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, content).unwrap();
+    };
+    write(
+        "Cargo.toml",
+        "[workspace]\nmembers = [\"scan\", \"facade\", \"app\"]\nresolver = \"2\"\n",
+    );
+    write(
+        "scan/Cargo.toml",
+        "[package]\nname = \"scan\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\nproc-macro = true\n",
+    );
+    write("scan/src/lib.rs", SCAN_MACRO);
+    write(
+        "facade/Cargo.toml",
+        "[package]\nname = \"facade\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nscan = { path = \"../scan\" }\n",
+    );
+    write("facade/src/lib.rs", "pub use scan::scan;\n");
+    write(
+        "app/Cargo.toml",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nfacade = { path = \"../facade\" }\n",
+    );
+    write(
+        "app/src/lib.rs",
+        "facade::scan!();\npub fn count() -> usize { ASSETS.len() }\n",
+    );
+    write(
+        "app/src/main.rs",
+        "fn main() { println!(\"{}\", app::count()); }\n",
+    );
+    write("app/assets/0001.sql", "select 1;\n");
+    let old = filetime::FileTime::from_unix_time(1_600_000_000, 0);
+    for entry in walkdir(root) {
+        let _ = filetime::set_file_mtime(&entry, old);
+    }
+}
+
+/// A file added where `app`'s macro lists changes nothing `app`'s closure
+/// names, and Cargo hands `app` only the rlib that re-exports the macro. The
+/// next build after removing the target directory, or into a new one, must
+/// compile `app` again rather than restore what counted one file.
+#[test]
+fn a_file_added_where_a_re_exported_macro_lists_is_compiled_in() {
+    for fresh_target in [false, true] {
+        let fx = fixture_from(write_scanning_workspace);
+        let first = target(&fx, "first");
+        run(&mut cargo(
+            "build",
+            &fx.workspace,
+            &fx.home,
+            &fx.cache,
+            &first,
+            &[],
+        ));
+        let count = |target: &Path| {
+            let output = Command::new(target.join("debug/app")).output().unwrap();
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        assert_eq!(count(&first), "1");
+
+        std::fs::write(fx.workspace.join("app/assets/0002.sql"), "select 2;\n").unwrap();
+        let next = if fresh_target {
+            target(&fx, "second")
+        } else {
+            std::fs::remove_dir_all(&first).unwrap();
+            first.clone()
+        };
+        let mark = event_count(&fx.cache);
+        run(&mut cargo(
+            "build",
+            &fx.workspace,
+            &fx.home,
+            &fx.cache,
+            &next,
+            &[],
+        ));
+        let app = results_for(&events_since(&fx.cache, mark), "app")
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        assert!(
+            !app.is_empty() && !app.iter().any(|result| result == "local_hit"),
+            "fresh_target={fresh_target}: {app:?}"
+        );
+        assert_eq!(count(&next), "2", "fresh_target={fresh_target}");
+    }
 }
 
 /// A build-script run is restored from the store with its OUT_DIR intact and

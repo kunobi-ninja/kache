@@ -261,6 +261,43 @@ pub(crate) fn output_retrying_etxtbsy(
 #[cfg(unix)]
 const ETXTBSY_RETRIES: usize = 50;
 
+/// Wait until no write made so far to `paths`, or to any file under them,
+/// can count as one made since a build that starts afterwards
+/// ([`crate::cache_key::stamp_written_since`]). A stamp ahead of the clock
+/// is no write and is not waited for. The unit-test side of
+/// `tests/common`'s `settle_writes`.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn settle_writes(paths: &[&std::path::Path]) {
+    use crate::cache_key::{
+        FINE_STAMP_WINDOW_NS, FileFingerprint, stamp_clock_ns, stamp_window_ns, wall_clock_ns,
+    };
+    fn collect(path: &std::path::Path, stamps: &mut Vec<i64>) {
+        if path.is_dir() {
+            for entry in std::fs::read_dir(path).into_iter().flatten().flatten() {
+                collect(&entry.path(), stamps);
+            }
+        } else if let Ok(stamp) = FileFingerprint::from_path(path) {
+            stamps.extend([stamp.mtime_ns, stamp.ctime_ns]);
+        }
+    }
+    let now = wall_clock_ns();
+    let mut stamps = Vec::new();
+    for path in paths {
+        collect(path, &mut stamps);
+    }
+    let settled_at = stamps
+        .into_iter()
+        .filter(|&stamp| stamp <= now)
+        .map(|stamp| stamp.saturating_add(stamp_window_ns(stamp)))
+        .fold(
+            stamp_clock_ns().saturating_add(FINE_STAMP_WINDOW_NS),
+            i64::max,
+        );
+    while stamp_clock_ns() <= settled_at {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{cwd_dir, process_state_test_lock};

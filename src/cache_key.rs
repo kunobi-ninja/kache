@@ -549,7 +549,7 @@ pub(crate) fn env_os_key_bytes(value: &std::ffi::OsStr) -> Vec<u8> {
 /// fallback for an unpaired surrogate keeps the raw units; it can only cost a
 /// miss, and getting there at all means the name is not a real Windows name.
 /// Both arms emit UTF-16LE so the two encodings can never be confused.
-fn env_name_key_bytes(name: &std::ffi::OsStr) -> Vec<u8> {
+pub(crate) fn env_name_key_bytes(name: &std::ffi::OsStr) -> Vec<u8> {
     #[cfg(windows)]
     {
         use std::os::windows::ffi::OsStrExt;
@@ -681,7 +681,7 @@ impl KeyFold for GroupedHasher {
 /// Hex-prefix length persisted per key-field group — enough to make an
 /// accidental collision between "changed" and "unchanged" implausible while
 /// keeping the per-event cost ~a couple hundred bytes.
-const KEY_FIELD_HEX: usize = 16;
+pub(crate) const KEY_FIELD_HEX: usize = 16;
 
 /// A blake3 hasher that TEES every update into the current key-field group's
 /// sub-hasher alongside the main key hasher (kunobi-ninja/kache#131). The
@@ -785,11 +785,11 @@ pub struct KeyOutputs {
     /// succeeded. `None` when the invocation has no source file, or the
     /// computation stopped before the closure was resolved.
     pub dep_info: Option<DepInfo>,
-    /// The tree digest a guarded computation used: the crate tree of a
-    /// proc-macro-dependent unit, or the `OUT_DIR` guard of a unit that
-    /// looked for a relocated or workspace record. A record made from this
-    /// invocation must carry it.
-    pub tree_digest: Option<String>,
+    /// The tree guard a guarded computation used: the workspace or package
+    /// tree of a unit under the tree guard ([`needs_tree_guard`]), or the
+    /// `OUT_DIR` guard of a registry unit that looked for a relocated record.
+    /// A record made from this invocation must carry its digest.
+    pub tree_guard: Option<TreeGuard>,
     /// Did the key keep an OUT_DIR path (OUT_DIR itself, or a value under it)
     /// as a literal? A lib whose key does is one whose consumers are worth
     /// recording (see `out_dir_alias`).
@@ -799,6 +799,145 @@ pub struct KeyOutputs {
     /// slow way before anything reaches the remote, the scheduler or the
     /// store.
     pub used_prediction: bool,
+}
+
+/// The tree guard a key computation took before rustc ran: a digest of the
+/// files a proc macro could read ([`needs_tree_guard`]), and the stat walks
+/// behind it, so a record can check that the trees have not moved since
+/// ([`TreeGuard::held`]).
+#[derive(Debug, Clone)]
+pub struct TreeGuard {
+    pub digest: String,
+    walks: Vec<GuardWalk>,
+}
+
+impl TreeGuard {
+    /// Does every tree this guard read still have the stamp it had? The
+    /// closure rustc reports is what it saw during the compile, after the
+    /// digest was taken. A listed file removed meanwhile is missing from the
+    /// closure, and once it is back the digest matches again; its stamp does
+    /// not, as it has a new inode or new times. A guard with no walk to
+    /// repeat does not hold.
+    pub(crate) fn held(&self) -> bool {
+        let _trace = crate::phase_trace::phase("tree_recheck");
+        let held = !self.walks.is_empty()
+            && self.walks.iter().all(|walk| {
+                stamp_roots(&walk.roots, walk.max_entries)
+                    .is_ok_and(|stamp| stamp.digest == walk.stamp)
+            });
+        crate::phase_trace::decision("tree_recheck", if held { "held" } else { "moved" });
+        held
+    }
+}
+
+#[cfg(test)]
+impl TreeGuard {
+    /// A guard carrying `digest`, with a walk of `root` as it is now.
+    pub(crate) fn stamping(digest: &str, root: &Path) -> Self {
+        let roots = vec![TreeRoot::new(root.to_path_buf(), b"root", &[]).walked()];
+        let stamp = stamp_roots(&roots, CRATE_TREE_MAX_ENTRIES)
+            .expect("a tree to stamp")
+            .digest;
+        Self {
+            digest: digest.to_string(),
+            walks: vec![GuardWalk {
+                roots,
+                max_entries: CRATE_TREE_MAX_ENTRIES,
+                stamp,
+            }],
+        }
+    }
+}
+
+/// One stat walk behind a tree guard: the roots it covered, the entry budget
+/// of each, and the stamp it gave.
+#[derive(Debug, Clone)]
+struct GuardWalk {
+    roots: Vec<WalkedRoot>,
+    max_entries: usize,
+    stamp: String,
+}
+
+/// One root of a [`GuardWalk`], as [`crate::tree_stamp::Stamper::walk`]
+/// takes it.
+#[derive(Debug, Clone)]
+struct WalkedRoot {
+    path: PathBuf,
+    role: Vec<u8>,
+    excluded: Vec<PathBuf>,
+    rules: crate::tree_stamp::StampRules,
+}
+
+/// Why [`stamp_roots`] gave no stamp.
+#[derive(Debug)]
+enum StampRefusal {
+    /// The root at this index alone holds more entries than the budget.
+    TooLarge(usize),
+    /// Each root fits, but together they hold more.
+    TooLargeTogether,
+    /// A root could not be walked.
+    Unwalkable,
+}
+
+/// One stat walk over `roots`, each of them and all of them together within
+/// `max_entries`.
+fn stamp_roots(
+    roots: &[WalkedRoot],
+    max_entries: usize,
+) -> std::result::Result<crate::tree_stamp::TreeStamp, StampRefusal> {
+    #[cfg(test)]
+    BEFORE_STAMP.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            for root in roots {
+                hook(&root.path);
+            }
+        }
+    });
+    let mut stamper = crate::tree_stamp::Stamper::new();
+    let mut total = 0usize;
+    for (index, root) in roots.iter().enumerate() {
+        let mut budget = max_entries;
+        stamper.label(&root.role);
+        match stamper.walk(&root.path, &root.excluded, root.rules, &mut budget) {
+            crate::tree_stamp::WalkOutcome::Fits => total += max_entries - budget,
+            crate::tree_stamp::WalkOutcome::TooLarge => return Err(StampRefusal::TooLarge(index)),
+            crate::tree_stamp::WalkOutcome::Unreadable => return Err(StampRefusal::Unwalkable),
+        }
+    }
+    if total > max_entries {
+        return Err(StampRefusal::TooLargeTogether);
+    }
+    Ok(stamper.finish())
+}
+
+/// Run by [`stamp_roots`] with each root before it walks, so a test can
+/// change a tree just before it is stamped.
+#[cfg(test)]
+type BeforeStamp = Box<dyn FnMut(&Path)>;
+
+#[cfg(test)]
+thread_local! {
+    static BEFORE_STAMP: std::cell::RefCell<Option<BeforeStamp>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn set_before_stamp(hook: Option<BeforeStamp>) {
+    BEFORE_STAMP.with(|slot| *slot.borrow_mut() = hook);
+}
+
+/// `digest`, a tree digest computed with `file_hasher`, as a guard with the
+/// walks behind it.
+fn tree_guard_of(
+    file_hasher: &FileHasher<'_>,
+    digest: impl FnOnce() -> Option<String>,
+) -> Option<TreeGuard> {
+    file_hasher.take_tree_walks();
+    let digest = digest()?;
+    Some(TreeGuard {
+        digest,
+        walks: file_hasher.take_tree_walks(),
+    })
 }
 
 /// The native archives a key hashed, with the unit's native search dirs.
@@ -833,7 +972,7 @@ pub const EXTERN_UNREADABLE: &str = "(sysroot)";
 /// Cap on entries digested for the tree guard. A crate directory past this is
 /// a build tree or a monorepo root, and the pre-pass stays cheaper than
 /// digesting it.
-const CRATE_TREE_MAX_ENTRIES: usize = 20_000;
+pub(crate) const CRATE_TREE_MAX_ENTRIES: usize = 20_000;
 
 /// A content digest of everything under the crate directory and its
 /// `OUT_DIR`, the two places a proc macro reads from by convention
@@ -863,9 +1002,13 @@ fn crate_tree_digest_in(
     if !is_registry_package(&manifest_dir) {
         return None;
     }
-    let mut roots = vec![(manifest_dir, &b"manifest_dir"[..], MANIFEST_DIR_SKIPPED)];
+    let mut roots = vec![TreeRoot::new(
+        manifest_dir,
+        b"manifest_dir",
+        MANIFEST_DIR_SKIPPED,
+    )];
     if let Some(out_dir) = out_dir {
-        roots.push((out_dir, &b"out_dir"[..], &[]));
+        roots.push(TreeRoot::new(out_dir, b"out_dir", &[]));
     }
     tree_digest(roots, file_hasher, CRATE_TREE_MAX_ENTRIES)
 }
@@ -888,15 +1031,82 @@ const OUT_DIR_TREE_MAX_ENTRIES: usize = 256;
 /// record says which generated files were read, not what else was generated.
 pub(crate) fn out_dir_tree_digest(out_dir: &Path, file_hasher: &FileHasher<'_>) -> Option<String> {
     tree_digest(
-        vec![(out_dir.to_path_buf(), &b"out_dir"[..], &[])],
+        vec![TreeRoot::new(out_dir.to_path_buf(), b"out_dir", &[])],
         file_hasher,
         OUT_DIR_TREE_MAX_ENTRIES,
     )
 }
 
-/// Each root comes with the names directly under it to skip.
+/// One directory a tree digest folds.
+struct TreeRoot<'a> {
+    path: PathBuf,
+    /// What the directory is to the unit. Roots are named by role, not by
+    /// path: the identity the record is filed under already knows the path,
+    /// and the guard is about content.
+    role: &'a [u8],
+    /// Names directly under the root that the digest leaves out.
+    skipped: &'a [&'a str],
+    /// Leave out what a directory below the root holds, its tag aside, when
+    /// Cargo tagged it as a build directory: a stale `target`, or the target
+    /// directory of another build.
+    skips_build_dirs: bool,
+    /// Kache's own directories, and what Cargo writes in its home, below the
+    /// root ([`own_dirs_within`]), left out wherever they lie.
+    own: Vec<PathBuf>,
+}
+
+impl<'a> TreeRoot<'a> {
+    fn new(path: PathBuf, role: &'a [u8], skipped: &'a [&'a str]) -> Self {
+        Self {
+            path,
+            role,
+            skipped,
+            skips_build_dirs: false,
+            own: Vec::new(),
+        }
+    }
+
+    fn skipping_build_dirs(self) -> Self {
+        Self {
+            skips_build_dirs: true,
+            ..self
+        }
+    }
+
+    fn excluded(&self) -> Vec<PathBuf> {
+        self.skipped
+            .iter()
+            .map(|name| self.path.join(name))
+            .chain(self.own.iter().cloned())
+            .collect()
+    }
+
+    /// The fold never follows a link, so the stamp may record its text, and
+    /// it counts what it cannot read as unreadable. The root's own times show
+    /// a name that came and went while the fold ran.
+    fn stamp_rules(&self) -> crate::tree_stamp::StampRules {
+        crate::tree_stamp::StampRules {
+            link_text: true,
+            skip_build_dirs: self.skips_build_dirs,
+            root_metadata: true,
+            unreadable_entries: true,
+            top_files_only: false,
+            unsearchable_dirs: false,
+        }
+    }
+
+    fn walked(&self) -> WalkedRoot {
+        WalkedRoot {
+            path: self.path.clone(),
+            role: self.role.to_vec(),
+            excluded: self.excluded(),
+            rules: self.stamp_rules(),
+        }
+    }
+}
+
 fn tree_digest(
-    roots: Vec<(PathBuf, &[u8], &[&str])>,
+    roots: Vec<TreeRoot<'_>>,
     file_hasher: &FileHasher<'_>,
     max_entries: usize,
 ) -> Option<String> {
@@ -912,7 +1122,7 @@ fn tree_digest(
 /// How long a root that ran past its entry budget is taken to still be past
 /// it. The answer only ever withholds a digest, which leaves the unit on the
 /// pre-pass, so a stale answer costs a shortcut, never a wrong key.
-const OVERSIZED_TREE_TTL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+pub(crate) const OVERSIZED_TREE_TTL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 
 /// The marker recording that `root` holds more than `max_entries` entries.
 fn oversized_tree_marker(memo_dir: &Path, root: &Path, max_entries: usize) -> PathBuf {
@@ -924,101 +1134,202 @@ fn oversized_tree_marker(memo_dir: &Path, root: &Path, max_entries: usize) -> Pa
         .join(&hasher.finalize().to_hex()[..32])
 }
 
-/// [`tree_digest`] with its "too large" memo in `memo_dir`. A workspace root
-/// can be a whole monorepo: every unit used to walk and hash the first
-/// `max_entries` entries of it, only to find it too large and discard the
-/// work. Now each root is counted first, without reading a file, and one that
-/// alone runs past the budget is remembered for [`OVERSIZED_TREE_TTL`].
+/// The marker recording that `roots` together hold more than `max_entries`
+/// entries, though each of them fits: a workspace and a unit's `OUT_DIR`.
+fn oversized_roots_marker(memo_dir: &Path, roots: &[WalkedRoot], max_entries: usize) -> PathBuf {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"kache-oversized-roots-v1\n");
+    for root in roots {
+        fold_field(
+            &mut hasher,
+            b"root:",
+            root.path.as_os_str().as_encoded_bytes(),
+        );
+    }
+    hasher.update(&max_entries.to_le_bytes());
+    memo_dir
+        .join("oversized-trees")
+        .join(&hasher.finalize().to_hex()[..32])
+}
+
+/// Whether `marker` was written less than [`OVERSIZED_TREE_TTL`] before
+/// `now`. A marker from the future counts as fresh.
+pub(crate) fn marked_recently(marker: &Path, now: std::time::SystemTime) -> bool {
+    std::fs::metadata(marker)
+        .and_then(|metadata| metadata.modified())
+        .is_ok_and(|marked| {
+            now.duration_since(marked)
+                .map_or(true, |age| age < OVERSIZED_TREE_TTL)
+        })
+}
+
+/// Write `marker`, if it can be written.
+fn write_marker(marker: &Path) {
+    if let Some(parent) = marker.parent() {
+        let _ = std::fs::create_dir_all(parent).and_then(|()| std::fs::write(marker, b""));
+    }
+}
+
+/// The version of [`crate_tree_fold`]'s digest, which a memoised digest is
+/// recorded for.
+const TREE_DIGEST_VERSION: &[u8] = b"kache-crate-tree-v1\n";
+
+/// [`tree_digest`] with its memos in `memo_dir`.
+///
+/// One stat walk stamps every root and enforces the budget without reading a
+/// file. A root that alone runs past the budget is remembered for
+/// [`OVERSIZED_TREE_TTL`]: a workspace root can be a whole monorepo. So are
+/// roots that only together run past it, without marking either one. When the
+/// roots have the stamp a digest was recorded under, that digest is the
+/// answer; otherwise every file is read, and the digest is recorded once the
+/// tree has settled ([`crate::tree_stamp::TreeStamp::settled_at`]). The walk
+/// goes to `file_hasher` for the guard ([`tree_guard_of`]).
 fn tree_digest_memoised(
-    roots: Vec<(PathBuf, &[u8], &[&str])>,
+    mut roots: Vec<TreeRoot<'_>>,
     file_hasher: &FileHasher<'_>,
     max_entries: usize,
     memo_dir: &Path,
     now: std::time::SystemTime,
 ) -> Option<String> {
-    let mut total = 0usize;
-    for (root, _, skipped) in &roots {
-        let marker = oversized_tree_marker(memo_dir, root, max_entries);
-        let recent = std::fs::metadata(&marker)
-            .and_then(|metadata| metadata.modified())
-            .is_ok_and(|marked| {
-                now.duration_since(marked)
-                    .map_or(true, |age| age < OVERSIZED_TREE_TTL)
-            });
-        if recent {
-            return None;
-        }
-        let excluded: Vec<PathBuf> = skipped.iter().map(|name| root.join(name)).collect();
-        let mut budget = max_entries;
-        match count_tree_entries(root, &excluded, &mut budget) {
-            TreeCount::Fits => total += max_entries - budget,
-            TreeCount::TooLarge => {
-                let _ = std::fs::create_dir_all(marker.parent()?)
-                    .and_then(|()| std::fs::write(&marker, b""));
-                return None;
-            }
-            TreeCount::Unreadable => return None,
-        }
+    for root in &mut roots {
+        root.own = own_dirs_within(&root.path, &file_hasher.own_dirs);
     }
-    if total > max_entries {
+    if roots.iter().any(|root| {
+        marked_recently(
+            &oversized_tree_marker(memo_dir, &root.path, max_entries),
+            now,
+        )
+    }) {
         return None;
     }
+    let walked: Vec<WalkedRoot> = roots.iter().map(TreeRoot::walked).collect();
+    let together = oversized_roots_marker(memo_dir, &walked, max_entries);
+    if marked_recently(&together, now) {
+        return None;
+    }
+    let stamp = match stamp_roots(&walked, max_entries) {
+        Ok(stamp) => stamp,
+        Err(StampRefusal::TooLarge(index)) => {
+            write_marker(&oversized_tree_marker(
+                memo_dir,
+                &walked[index].path,
+                max_entries,
+            ));
+            return None;
+        }
+        Err(StampRefusal::TooLargeTogether) => {
+            write_marker(&together);
+            return None;
+        }
+        Err(StampRefusal::Unwalkable) => return None,
+    };
+    let walk = GuardWalk {
+        roots: walked,
+        max_entries,
+        stamp: stamp.digest.clone(),
+    };
+    let memo = tree_digest_memo(memo_dir, &roots);
+    if let Some(digest) = crate::tree_stamp::memoised_digest(&memo, &stamp.digest)
+        .filter(|digest| digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit()))
+    {
+        crate::phase_trace::decision("tree_memo", "hit");
+        file_hasher.note_tree_walk(walk);
+        return Some(digest);
+    }
+    crate::phase_trace::decision("tree_memo", "miss");
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"kache-crate-tree-v1\n");
+    hasher.update(TREE_DIGEST_VERSION);
     let mut budget = max_entries;
-    // Roots are named by role, not by path: the identity the record is filed
-    // under already knows the path, and the guard is about content.
-    for (root, role, skipped) in roots {
-        fold_field(&mut hasher, b"root:", role);
-        let excluded: Vec<PathBuf> = skipped.iter().map(|name| root.join(name)).collect();
-        crate_tree_fold(
-            &root,
-            &root,
-            &excluded,
+    let mut read_every_file = true;
+    for root in &roots {
+        fold_field(&mut hasher, b"root:", root.role);
+        read_every_file &= crate_tree_fold(
+            &root.path,
+            &root.path,
+            &root.excluded(),
+            root.skips_build_dirs,
             file_hasher,
             &mut hasher,
             &mut budget,
         )?;
     }
-    Some(hasher.finalize().to_hex().to_string())
-}
-
-enum TreeCount {
-    Fits,
-    TooLarge,
-    Unreadable,
-}
-
-/// Count the entries under `directory` against `budget`, as
-/// [`crate_tree_fold`] spends it, reading directories but no file: a
-/// symlink counts once and is not followed.
-fn count_tree_entries(directory: &Path, excluded: &[PathBuf], budget: &mut usize) -> TreeCount {
-    let Ok(entries) = std::fs::read_dir(directory) else {
-        return TreeCount::Unreadable;
-    };
-    for entry in entries {
-        let Ok(entry) = entry else {
-            return TreeCount::Unreadable;
-        };
-        let path = entry.path();
-        if excluded.contains(&path) {
-            continue;
-        }
-        let Some(left) = budget.checked_sub(1) else {
-            return TreeCount::TooLarge;
-        };
-        *budget = left;
-        let Ok(file_type) = entry.file_type() else {
-            return TreeCount::Unreadable;
-        };
-        if file_type.is_dir() {
-            match count_tree_entries(&path, excluded, budget) {
-                TreeCount::Fits => {}
-                other => return other,
-            }
-        }
+    let digest = hasher.finalize().to_hex().to_string();
+    // The stamp shows a directory becoming listable, but not a file becoming
+    // readable where there is no change time.
+    if read_every_file {
+        memoise_tree_digest(&memo, &walk, &stamp, &digest, now);
     }
-    TreeCount::Fits
+    file_hasher.note_tree_walk(walk);
+    Some(digest)
+}
+
+/// Record `digest` at `memo` under `stamp`, the stamp `walk` gave before the
+/// files were read. A tree written in the last moments could be written
+/// again within the same timestamp tick, keeping its stamp with other bytes,
+/// so it has to have settled. A tree that moved while it was read has a
+/// digest of no state it was in, so the walk has to give the same stamp
+/// again.
+fn memoise_tree_digest(
+    memo: &Path,
+    walk: &GuardWalk,
+    stamp: &crate::tree_stamp::TreeStamp,
+    digest: &str,
+    now: std::time::SystemTime,
+) {
+    if stamp.settled_at(now)
+        && stamp_roots(&walk.roots, walk.max_entries)
+            .is_ok_and(|again| again.digest == stamp.digest)
+    {
+        crate::tree_stamp::record_digest(memo, &stamp.digest, digest);
+    }
+}
+
+/// Where the digest of `roots` is memoised: one file per set of roots, so
+/// every unit without an `OUT_DIR` in a workspace shares one.
+fn tree_digest_memo(memo_dir: &Path, roots: &[TreeRoot<'_>]) -> PathBuf {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(TREE_DIGEST_VERSION);
+    for root in roots {
+        fold_field(
+            &mut hasher,
+            b"path:",
+            root.path.as_os_str().as_encoded_bytes(),
+        );
+        fold_field(&mut hasher, b"role:", root.role);
+        for name in root.skipped {
+            fold_field(&mut hasher, b"skipped:", name.as_bytes());
+        }
+        fold_field(
+            &mut hasher,
+            b"build_dirs:",
+            if root.skips_build_dirs { b"1" } else { b"0" },
+        );
+    }
+    memo_dir
+        .join("tree-digests")
+        .join(&hasher.finalize().to_hex()[..32])
+}
+
+/// The paths of `own`, Kache's own directories and what Cargo writes in its
+/// home, that lie below `root`, spelled as a walk of `root` meets them. A
+/// build writes to them while units compile, and GitLab CI caches only paths
+/// inside the project, so a guard that walked them would move with every
+/// store and could run past its budget. A path spelled through a link is
+/// matched by its resolved path.
+fn own_dirs_within(root: &Path, own: &[PathBuf]) -> Vec<PathBuf> {
+    if own.is_empty() {
+        return Vec::new();
+    }
+    let resolved_root = std::fs::canonicalize(root).ok();
+    own.iter()
+        .filter_map(|dir| {
+            let rest = dir
+                .strip_prefix(root)
+                .ok()
+                .or_else(|| dir.strip_prefix(resolved_root.as_deref()?).ok())?;
+            (!rest.as_os_str().is_empty()).then(|| root.join(rest))
+        })
+        .collect()
 }
 
 /// Is `manifest_dir` an extracted registry package (`<CARGO_HOME>/registry/src/<index>/<pkg>`)?
@@ -1044,19 +1355,37 @@ fn registry_src_root(manifest_dir: &Path) -> Option<&Path> {
     manifest_dir.parent()?.parent()
 }
 
+/// Fold the entries under `directory` by path, kind and content. A symlink
+/// counts by its text and is not followed. With `skips_build_dirs`, a
+/// directory below `root` that Cargo tagged as its build directory counts by
+/// its tag alone. Below `root`, what cannot be read counts as unreadable: a
+/// proc macro this process starts cannot read it either. `Some(false)` when
+/// that includes a file: where there is no change time, a file that becomes
+/// readable keeps its stamp.
 fn crate_tree_fold(
     root: &Path,
     directory: &Path,
     excluded: &[PathBuf],
+    skips_build_dirs: bool,
     file_hasher: &FileHasher<'_>,
     hasher: &mut blake3::Hasher,
     budget: &mut usize,
-) -> Option<()> {
-    let mut entries: Vec<_> = std::fs::read_dir(directory)
-        .ok()?
-        .collect::<std::io::Result<_>>()
-        .ok()?;
+) -> Option<bool> {
+    let listed = std::fs::read_dir(directory)
+        .and_then(|entries| entries.collect::<std::io::Result<Vec<_>>>());
+    let mut entries = match listed {
+        Ok(entries) => entries,
+        Err(_) if directory != root => {
+            fold_field(hasher, b"unreadable:", b"");
+            return Some(true);
+        }
+        Err(_) => return None,
+    };
     entries.sort_by_key(std::fs::DirEntry::file_name);
+    if skips_build_dirs && directory != root {
+        crate::tree_stamp::keep_only_build_tag(&mut entries);
+    }
+    let mut read_every_file = true;
     for entry in entries {
         let path = entry.path();
         if excluded.contains(&path) {
@@ -1065,20 +1394,41 @@ fn crate_tree_fold(
         *budget = budget.checked_sub(1)?;
         let relative = path.strip_prefix(root).ok()?;
         fold_field(hasher, b"path:", relative.as_os_str().as_encoded_bytes());
-        let metadata = std::fs::symlink_metadata(&path).ok()?;
+        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+            fold_field(hasher, b"unreadable:", b"");
+            continue;
+        };
         if metadata.file_type().is_symlink() {
-            let target = std::fs::read_link(&path).ok()?;
-            fold_field(hasher, b"symlink:", target.as_os_str().as_encoded_bytes());
+            match std::fs::read_link(&path) {
+                Ok(target) => {
+                    fold_field(hasher, b"symlink:", target.as_os_str().as_encoded_bytes());
+                }
+                Err(_) => fold_field(hasher, b"unreadable:", b""),
+            }
         } else if metadata.is_dir() {
             fold_field(hasher, b"dir:", b"");
-            crate_tree_fold(root, &path, excluded, file_hasher, hasher, budget)?;
+            read_every_file &= crate_tree_fold(
+                root,
+                &path,
+                excluded,
+                skips_build_dirs,
+                file_hasher,
+                hasher,
+                budget,
+            )?;
         } else if metadata.is_file() {
-            fold_field(hasher, b"file:", file_hasher.hash(&path).ok()?.as_bytes());
+            match file_hasher.hash_unkeyed(&path) {
+                Ok(hash) => fold_field(hasher, b"file:", hash.as_bytes()),
+                Err(_) => {
+                    fold_field(hasher, b"unreadable:", b"");
+                    read_every_file = false;
+                }
+            }
         } else {
             fold_field(hasher, b"other:", b"");
         }
     }
-    Some(())
+    Some(read_every_file)
 }
 
 thread_local! {
@@ -1090,7 +1440,7 @@ thread_local! {
     static COMPILE_WHILE_KEYING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// A closure handed in by the wrapper after such a compile: the next key
     /// computation uses it instead of a record or a pre-pass.
-    static PROVIDED_DEP_INFO: std::cell::RefCell<Option<(DepInfo, Option<String>)>> = const { std::cell::RefCell::new(None) };
+    static PROVIDED_DEP_INFO: std::cell::RefCell<Option<(DepInfo, Option<TreeGuard>)>> = const { std::cell::RefCell::new(None) };
 }
 
 /// The key stopped before discovering the closure, and the wrapper compiles
@@ -1129,11 +1479,11 @@ pub fn set_compile_while_keying(allowed: bool) {
 
 /// Use `dep_info` for the next key computed on this thread.
 ///
-/// `tree` is the tree digest the deferred computation took before the
-/// compile ([`KeyOutputs::tree_digest`]). It rides with the emitted closure,
+/// `tree` is the tree guard the deferred computation took before the
+/// compile ([`KeyOutputs::tree_guard`]). It rides with the emitted closure,
 /// so a changed tree still rejects that prediction rather than blessing old
 /// inputs with a new digest.
-pub fn provide_dep_info(dep_info: DepInfo, tree: Option<String>) {
+pub fn provide_dep_info(dep_info: DepInfo, tree: Option<TreeGuard>) {
     PROVIDED_DEP_INFO.with(|cell| *cell.borrow_mut() = Some((dep_info, tree)));
 }
 
@@ -1180,7 +1530,10 @@ pub fn dep_info_from_emitted(path: &Path, source_file: &Path) -> Result<DepInfo>
 /// symlink would merge two spellings even though rustc may embed them
 /// differently through `file!()` or debug info. An unmodeled spelling stays
 /// deliberately path-local through an opaque, lossless-OS-byte digest.
-fn source_path_identity(file: &Path, path_normalizer: &PathNormalizer) -> Result<Vec<u8>> {
+pub(crate) fn source_path_identity(
+    file: &Path,
+    path_normalizer: &PathNormalizer,
+) -> Result<Vec<u8>> {
     if let Some(identity) = path_normalizer.source_path_identity(file) {
         return Ok(identity);
     }
@@ -1270,16 +1623,19 @@ const RELOCATABLE_PREDICTION_PREFIX: &str = "shared-out-dir-v1:";
 
 /// May a unit's record be shared across target directories?
 ///
-/// A unit with no proc-macro dependency can: its closure is everything it
-/// reads. A registry unit with one can too, because a macro there reads its
-/// package and `OUT_DIR`, and the record carries a digest of both that the
-/// reader checks before use. The target paths that differ between checkouts
-/// only reach the key as extern content, which the key hashes.
+/// A unit with no proc-macro dependency of its own can. A workspace unit's
+/// row carries the workspace guard ([`needs_tree_guard`]), which also covers
+/// a macro an rlib re-exports, and a registry package holds the same files
+/// in every checkout. A registry unit with a proc-macro dependency can too,
+/// because a macro there reads its package and `OUT_DIR`, and the record
+/// carries a digest of both that the reader checks before use. The target
+/// paths that differ between checkouts only reach the key as extern content,
+/// which the key hashes.
 fn shared_prediction_eligible(
     externs: &[crate::args::ExternDep],
     manifest_dir: Option<&Path>,
 ) -> bool {
-    prediction_applies(externs) || manifest_dir.is_some_and(is_registry_package)
+    !has_dylib_extern(externs) || manifest_dir.is_some_and(is_registry_package)
 }
 
 /// The value of `name` in an environment snapshot.
@@ -1650,31 +2006,38 @@ fn closures_agree(predicted: &DepInfo, discovered: &DepInfo) -> bool {
 fn predicted_key_inputs(
     args: &RustcArgs,
     file_hasher: &FileHasher<'_>,
-    tree_digest: &mut Option<String>,
+    tree_guard: &mut Option<TreeGuard>,
 ) -> std::result::Result<DepInfo, Rejection> {
     let _trace = crate::phase_trace::phase("prediction_validate");
+    *tree_guard = None;
     if !file_hasher.uses_input_predictions() {
         return Err(Rejection::Disabled);
     }
     let vars: Vec<_> = std::env::vars_os().collect();
     let workspace = workspace_roots(args, &vars);
-    // A unit with a proc-macro dependency is only predictable under the tree
-    // guard: the record must carry the tree digest and it must still match.
-    // The tree is the package for a registry or vendored unit and the whole
-    // workspace for any other workspace one. Computed once here and handed back in `tree_digest`,
+    let manifest_dir = env_var_in(&vars, "CARGO_MANIFEST_DIR").map(Path::new);
+    // A unit under the tree guard is predictable only while the record carries
+    // the tree digest and the digest still matches. The tree is the package
+    // for a registry or vendored unit and the whole workspace for any other
+    // workspace or path one. Computed here and handed back in `tree_guard`,
     // because the same digest is what a record made from this invocation has
     // to carry.
-    let tree = if prediction_applies(&args.externs) {
-        None
-    } else {
-        let _trace = crate::phase_trace::phase("crate_tree");
-        let digest = match &workspace {
+    let tree = if needs_tree_guard(&args.externs, manifest_dir) {
+        let _trace = crate::phase_trace::phase(if workspace.is_some() {
+            "workspace_tree"
+        } else {
+            "crate_tree"
+        });
+        let guard = tree_guard_of(file_hasher, || match &workspace {
             Some(workspace) => workspace_tree_digest(workspace, file_hasher),
             None => crate_tree_digest(file_hasher),
-        }
+        })
         .ok_or(Rejection::NotEligible)?;
-        *tree_digest = Some(digest.clone());
+        let digest = guard.digest.clone();
+        *tree_guard = Some(guard);
         Some(digest)
+    } else {
+        None
     };
     let identity = rustc_prediction_identity(args).ok_or(Rejection::Disabled)?;
     let shared = rustc_shared_prediction_identity(args);
@@ -1692,10 +2055,8 @@ fn predicted_key_inputs(
         })
     else {
         return match &workspace {
-            Some(workspace) => {
-                workspace_key_inputs(args, file_hasher, workspace, vars, tree, tree_digest)
-            }
-            None => relocated_key_inputs(args, file_hasher, tree, tree_digest),
+            Some(workspace) => workspace_key_inputs(args, file_hasher, workspace, vars, tree),
+            None => relocated_key_inputs(args, file_hasher, tree, tree_guard),
         };
     };
     if let Some(tree) = &tree {
@@ -1704,6 +2065,13 @@ fn predicted_key_inputs(
             Some(_) => return Err(Rejection::TreeChanged),
             None => return Err(Rejection::NoRecord),
         }
+    }
+    // The digest only vouches for files its walk sees. A shared row written
+    // before this check carries the digest whatever its closure names.
+    if let Some(workspace) = &workspace
+        && !guard_covers(&record.sources, workspace)
+    {
+        return Err(Rejection::NoRecord);
     }
     let validated = validate_prediction(
         &record,
@@ -1745,14 +2113,14 @@ fn keep_remote_plain_row(
 /// `OUT_DIR` relocated to this one.
 ///
 /// The guard is `tree` for a proc-macro dependent and a digest of `OUT_DIR`
-/// otherwise. It goes into `tree_digest` before the lookup, so a record made
+/// otherwise. It goes into `tree_guard` before the lookup, so a record made
 /// from this invocation, after a deferred compile included, carries the
 /// digest taken before rustc ran. Only this row is checked against it.
 fn relocated_key_inputs(
     args: &RustcArgs,
     file_hasher: &FileHasher<'_>,
     tree: Option<String>,
-    tree_digest: &mut Option<String>,
+    tree_guard: &mut Option<TreeGuard>,
 ) -> std::result::Result<DepInfo, Rejection> {
     let vars: Vec<_> = std::env::vars_os().collect();
     let out_dir = env_var_in(&vars, "OUT_DIR")
@@ -1761,14 +2129,20 @@ fn relocated_key_inputs(
     let registry = registry_src_of(&vars);
     let identity = relocatable_prediction_identity(args, vars).ok_or(Rejection::NoRecord)?;
     let out_dir = out_dir.ok_or(Rejection::NoRecord)?;
+    // A `tree` is already in `tree_guard`.
     let guard = match tree {
         Some(tree) => tree,
         None => {
             let _trace = crate::phase_trace::phase("out_dir_tree");
-            out_dir_tree_digest(Path::new(&out_dir), file_hasher).ok_or(Rejection::NoRecord)?
+            let guard = tree_guard_of(file_hasher, || {
+                out_dir_tree_digest(Path::new(&out_dir), file_hasher)
+            })
+            .ok_or(Rejection::NoRecord)?;
+            let digest = guard.digest.clone();
+            *tree_guard = Some(guard);
+            digest
         }
     };
-    *tree_digest = Some(guard.clone());
     let places = Places {
         out_dir: Some(&out_dir),
         workspace: None,
@@ -1879,31 +2253,28 @@ pub(crate) fn is_portable_identity(identity: &str) -> bool {
 /// a record made in another checkout of the same workspace, with its sources
 /// written relative to the workspace root and `OUT_DIR`.
 ///
-/// The guard is a digest of the whole workspace (less the target directory
-/// and `.git`) and of `OUT_DIR`, taken before rustc runs. A record is used
-/// only when both are byte for byte what the recorder had, so a macro that
-/// scans the workspace, even one reached through an rlib rather than a
-/// direct proc-macro dependency, finds the same files here.
+/// The guard is `tree`, the digest of the whole workspace (less the target
+/// directory and `.git`) and of `OUT_DIR` that the caller took before rustc
+/// runs. A record is used only when both are byte for byte what the recorder
+/// had, so a macro that scans the workspace, even one reached through an
+/// rlib rather than a direct proc-macro dependency, finds the same files
+/// here.
 fn workspace_key_inputs(
     args: &RustcArgs,
     file_hasher: &FileHasher<'_>,
     workspace: &WorkspaceRoots,
     vars: Vec<(std::ffi::OsString, std::ffi::OsString)>,
     tree: Option<String>,
-    tree_digest: &mut Option<String>,
 ) -> std::result::Result<DepInfo, Rejection> {
     let identity =
         workspace_prediction_identity(args, vars, workspace).ok_or(Rejection::NoRecord)?;
-    let guard = match tree {
-        Some(tree) => tree,
-        None => {
-            let _trace = crate::phase_trace::phase("workspace_tree");
-            workspace_tree_digest(workspace, file_hasher).ok_or(Rejection::NoRecord)?
-        }
-    };
-    *tree_digest = Some(guard.clone());
+    let guard = tree.ok_or(Rejection::NoRecord)?;
     let places = workspace.places().ok_or(Rejection::NoRecord)?;
-    portable_key_inputs(file_hasher, &identity, args, &guard, &places)
+    let dep_info = portable_key_inputs(file_hasher, &identity, args, &guard, &places)?;
+    if !guard_covers(&dep_info.source_files, workspace) {
+        return Err(Rejection::NoRecord);
+    }
+    Ok(dep_info)
 }
 
 /// For each of `args`, the argument with the workspace root in a linker path
@@ -2134,7 +2505,7 @@ pub(crate) fn is_vendored_package(manifest_dir: &Path) -> bool {
 /// an absolute path too, so the source must also sit inside the package, as
 /// a vendored crate's always does. The lint cap Cargo gives non-path packages is required
 /// too; `cargo -vv` omits it, and the unit then keeps the workspace guard.
-fn vendored_source(args: &RustcArgs, manifest_dir: &Path, current_dir: &Path) -> bool {
+pub(crate) fn vendored_source(args: &RustcArgs, manifest_dir: &Path, current_dir: &Path) -> bool {
     args.cargo_capped_lints()
         && args
             .source_file
@@ -2168,13 +2539,13 @@ fn vendored_package_digest(
     workspace_root: &Path,
     file_hasher: &FileHasher<'_>,
 ) -> Option<String> {
-    let mut roots = vec![(
+    let mut roots = vec![TreeRoot::new(
         package.to_path_buf(),
-        &b"vendored_package"[..],
+        b"vendored_package",
         MANIFEST_DIR_SKIPPED,
     )];
     if let Some(out_dir) = out_dir {
-        roots.push((out_dir.to_path_buf(), &b"out_dir"[..], &[]));
+        roots.push(TreeRoot::new(out_dir.to_path_buf(), b"out_dir", &[]));
     }
     let package_digest = tree_digest(roots, file_hasher, CRATE_TREE_MAX_ENTRIES)?;
     let mut hasher = blake3::Hasher::new();
@@ -2196,11 +2567,35 @@ fn vendored_package_digest(
 /// `directory`, by name and content. A symlink to a file counts by its
 /// target and by the content read through it.
 fn ancestor_top_digest(directory: &Path, file_hasher: &FileHasher<'_>) -> Option<String> {
+    // The guard's walk of the files and symlinks read here, and of the
+    // directory's own times, taken before the listing: a name that appears
+    // after the stamp, or comes and goes before the record is written, moves
+    // those times. A dot-directory's own digest walks that directory.
+    let top = vec![WalkedRoot {
+        path: directory.to_path_buf(),
+        role: b"ancestor".to_vec(),
+        excluded: vec![directory.join(".git")],
+        rules: crate::tree_stamp::StampRules {
+            link_text: true,
+            skip_build_dirs: false,
+            root_metadata: true,
+            unreadable_entries: true,
+            top_files_only: true,
+            unsearchable_dirs: false,
+        },
+    }];
+    let stamp = stamp_roots(&top, CRATE_TREE_MAX_ENTRIES).ok()?;
     let mut entries: Vec<_> = std::fs::read_dir(directory)
         .ok()?
         .collect::<std::io::Result<_>>()
         .ok()?;
     entries.sort_by_key(std::fs::DirEntry::file_name);
+    file_hasher.note_tree_walk(GuardWalk {
+        roots: top,
+        max_entries: CRATE_TREE_MAX_ENTRIES,
+        stamp: stamp.digest,
+    });
+    let own = own_dirs_within(directory, &file_hasher.own_dirs);
     let mut hasher = blake3::Hasher::new();
     for entry in entries {
         let name = entry.file_name();
@@ -2211,26 +2606,45 @@ fn ancestor_top_digest(directory: &Path, file_hasher: &FileHasher<'_>) -> Option
             continue;
         }
         let path = entry.path();
-        let metadata = std::fs::symlink_metadata(&path).ok()?;
-        let content = if metadata.file_type().is_symlink() {
-            // Where it points, and what a read through it would find.
-            let target = std::fs::read_link(&path).ok()?;
-            let found = if path.is_file() {
-                file_hasher.hash(&path).ok()?
-            } else {
-                String::new()
-            };
-            format!("symlink:{}:{found}", target.display())
-        } else if metadata.is_file() {
-            format!("file:{}", file_hasher.hash(&path).ok()?)
-        } else if metadata.is_dir() && name.as_encoded_bytes().starts_with(b".") && name != ".git" {
-            let roots = vec![(path.clone(), &b"dot_dir"[..], &[][..])];
-            format!(
-                "dir:{}",
-                tree_digest(roots, file_hasher, CRATE_TREE_MAX_ENTRIES)?
-            )
-        } else {
+        // Kache's own directories, and what Cargo writes in its home, change
+        // while units build.
+        if own.contains(&path) {
             continue;
+        }
+        // What this process cannot read, a macro it starts cannot read either.
+        let unreadable = || "unreadable".to_string();
+        let content = match std::fs::symlink_metadata(&path) {
+            Err(_) => unreadable(),
+            Ok(metadata) if metadata.file_type().is_symlink() => match std::fs::read_link(&path) {
+                // Where it points, and what a read through it would find.
+                Ok(target) => {
+                    let found = if path.is_file() {
+                        file_hasher
+                            .hash_unkeyed(&path)
+                            .unwrap_or_else(|_| unreadable())
+                    } else {
+                        String::new()
+                    };
+                    format!("symlink:{}:{found}", target.display())
+                }
+                Err(_) => unreadable(),
+            },
+            Ok(metadata) if metadata.is_file() => match file_hasher.hash_unkeyed(&path) {
+                Ok(hash) => format!("file:{hash}"),
+                Err(_) => unreadable(),
+            },
+            Ok(metadata)
+                if metadata.is_dir()
+                    && name.as_encoded_bytes().starts_with(b".")
+                    && name != ".git" =>
+            {
+                let roots = vec![TreeRoot::new(path.clone(), b"dot_dir", &[])];
+                format!(
+                    "dir:{}",
+                    tree_digest(roots, file_hasher, CRATE_TREE_MAX_ENTRIES)?
+                )
+            }
+            Ok(_) => continue,
         };
         fold_field(&mut hasher, b"name:", name.as_encoded_bytes());
         fold_field(&mut hasher, b"entry:", content.as_bytes());
@@ -2248,9 +2662,10 @@ fn workspace_tree_digest_within(
         suffix_within(workspace.target.as_os_str(), &workspace.root, 0).unwrap_or_default();
     let target = target.trim_start_matches(['/', '\\']);
     let skipped = [target, ".git"];
-    let mut roots = vec![(workspace.root.clone(), &b"workspace"[..], &skipped[..])];
+    let mut roots =
+        vec![TreeRoot::new(workspace.root.clone(), b"workspace", &skipped).skipping_build_dirs()];
     if let Some(out_dir) = &workspace.out_dir {
-        roots.push((out_dir.clone(), &b"out_dir"[..], &[][..]));
+        roots.push(TreeRoot::new(out_dir.clone(), b"out_dir", &[]));
     }
     tree_digest(roots, file_hasher, max_entries)
 }
@@ -2259,7 +2674,7 @@ fn workspace_tree_digest_within(
 /// until it has published a successful prediction and artifacts; this caller
 /// then validates the record and computes its own complete key as usual.
 fn prediction_discovery_identity(args: &RustcArgs, file_hasher: &FileHasher<'_>) -> Option<String> {
-    if !file_hasher.uses_input_predictions() || !prediction_applies(&args.externs) {
+    if !file_hasher.uses_input_predictions() || has_dylib_extern(&args.externs) {
         return None;
     }
     rustc_shared_prediction_identity(args).or_else(|| rustc_prediction_identity(args))
@@ -2298,13 +2713,13 @@ fn resolve_key_inputs(
     out: &mut KeyOutputs,
 ) -> Result<Option<DepInfo>> {
     if let Some((provided, tree)) = PROVIDED_DEP_INFO.with(|cell| cell.borrow_mut().take()) {
-        out.tree_digest = tree;
+        out.tree_guard = tree;
         crate::phase_trace::decision("prediction", "emitted");
         tracing::trace!("[key:{}] inputs=emitted-dep-info", crate_name);
         return Ok(Some(provided));
     }
     if args.source_file.is_some() {
-        let mut prediction = predicted_key_inputs(args, file_hasher, &mut out.tree_digest);
+        let mut prediction = predicted_key_inputs(args, file_hasher, &mut out.tree_guard);
         // Whether this process holds the unit's discovery flight. Only the
         // holder may compile before keying: a peer that also found nothing
         // would compile the same unit a second time instead of waiting for
@@ -2318,9 +2733,11 @@ fn resolve_key_inputs(
             owns_flight = flight.lock.is_some();
             *file_hasher.discovery_flight.borrow_mut() = flight.lock;
             // The previous owner may have published while this process
-            // waited; a flight taken at once had no owner to publish.
+            // waited; a flight taken at once had no owner to publish. The
+            // tree is digested again: the owner's record carries the digest
+            // from before its compile, and the tree may have changed since.
             if flight.waited {
-                prediction = predicted_key_inputs(args, file_hasher, &mut out.tree_digest);
+                prediction = predicted_key_inputs(args, file_hasher, &mut out.tree_guard);
             }
         }
         match prediction {
@@ -5488,14 +5905,15 @@ pub(crate) struct InputPrediction {
     /// (OUT_DIR-like values collapse to a sentinel), so the raw value is the
     /// only signal that an included file moved.
     pub(crate) env_deps: Vec<(String, String)>,
-    /// Digest of the crate's own tree ([`crate_tree_digest`]) when the unit
-    /// depends on a proc macro. Such a macro can read any file under the crate
+    /// The tree digest of a unit under the tree guard ([`needs_tree_guard`]):
+    /// the workspace for a workspace or path unit, the package for a registry
+    /// unit with a proc-macro dependency. A macro can read any file there
     /// without it entering the closure, so the closure alone cannot say
     /// whether the record still applies; the tree can. Absent on records made
-    /// for units that need no such guard, and on rows written before it
-    /// existed, which the guard then treats as unusable. A unit with no proc
-    /// macro may carry its `OUT_DIR` guard here, which nothing checks on this
-    /// row.
+    /// for units that need no such guard, on rows whose closure the guard
+    /// does not cover, and on rows written before it existed, which the
+    /// guard then treats as unusable. A registry unit with no proc macro may
+    /// carry its `OUT_DIR` guard here, which nothing checks on this row.
     #[serde(default)]
     pub(crate) tree: Option<String>,
 }
@@ -5745,24 +6163,29 @@ fn relocatable_record_in(
         .then_some((identity, record))
 }
 
-/// Is this invocation a workspace or path unit whose records the workspace
-/// guard covers ([`workspace_roots`])?
-pub(crate) fn is_workspace_unit(args: &RustcArgs) -> bool {
-    workspace_roots(args, &std::env::vars_os().collect::<Vec<_>>()).is_some()
+/// The guard this checkout's own rows carry, the local row and the shared
+/// one ([`same_tree_guard`]).
+pub(crate) fn same_checkout_guard(
+    args: &RustcArgs,
+    dep_info: &DepInfo,
+    tree: Option<String>,
+) -> Option<String> {
+    let workspace = workspace_roots(args, &std::env::vars_os().collect::<Vec<_>>());
+    same_tree_guard(
+        tree,
+        workspace.is_some(),
+        workspace.is_some_and(|workspace| guard_covers(&dep_info.source_files, &workspace)),
+    )
 }
 
-/// The guard this checkout's own row carries. A workspace unit whose closure
-/// reaches past the workspace (`relocatable` false) keeps none: the guard
-/// covers the workspace only, so a macro that scans a directory outside it
-/// could find a new file there with the guard unchanged. Without a guard, a
-/// row of a unit with a proc-macro dependency is never used, and that unit
-/// keeps the pre-pass.
-pub(crate) fn same_tree_guard(
-    tree: Option<String>,
-    workspace_unit: bool,
-    relocatable: bool,
-) -> Option<String> {
-    if workspace_unit && !relocatable {
+/// A workspace unit whose closure the guard does not cover (`covered` false,
+/// see [`guard_covers`]) keeps no guard: a macro that scans a directory the
+/// guard does not see could find a new file there with the guard unchanged.
+/// Without a guard, the row of a workspace unit is never used, and the unit
+/// keeps discovering its closure. This checkout's rows are never relocated,
+/// so a generated file naming the checkout costs nothing here.
+fn same_tree_guard(tree: Option<String>, workspace_unit: bool, covered: bool) -> Option<String> {
+    if workspace_unit && !covered {
         None
     } else {
         tree
@@ -5771,7 +6194,8 @@ pub(crate) fn same_tree_guard(
 
 /// A workspace unit's record for another checkout and the identity to file it
 /// under (kunobi-ninja/kache#1005), or `None` when the unit or its closure is
-/// not relocatable. `tree` is the workspace guard taken before rustc ran.
+/// not relocatable, or the guard does not see every file the closure names
+/// ([`guard_covers`]). `tree` is the workspace guard taken before rustc ran.
 pub(crate) fn workspace_record(
     args: &RustcArgs,
     dep_info: &DepInfo,
@@ -5780,6 +6204,9 @@ pub(crate) fn workspace_record(
     let vars: Vec<_> = std::env::vars_os().collect();
     let workspace = workspace_roots(args, &vars)?;
     let record = workspace_portable_prediction(dep_info, &workspace, tree)?;
+    if !guard_covers(&dep_info.source_files, &workspace) {
+        return None;
+    }
     let identity = workspace_prediction_identity(args, vars, &workspace)?;
     let named = [
         workspace.root.as_path(),
@@ -5793,6 +6220,86 @@ pub(crate) fn workspace_record(
         return None;
     }
     Some((identity, record))
+}
+
+/// Does the workspace guard see every file of `sources`? It sees a file its
+/// walk reaches: one under `OUT_DIR`, or under the workspace root and outside
+/// the target directory, with no symlinked directory on the way (the walk
+/// does not follow one) and no directory Cargo tagged as its build directory
+/// (the walk leaves those out). A relative source must stay inside the root.
+/// A macro that lists a directory the guard does not see could find a new
+/// file there with the digest unchanged.
+fn guard_covers(sources: &[PathBuf], workspace: &WorkspaceRoots) -> bool {
+    let mut entered = HashMap::new();
+    sources.iter().all(|source| {
+        guard_place(source, workspace).is_some_and(|(root, below, skips_build_dirs)| {
+            walk_reaches(root, &below, skips_build_dirs, &mut entered)
+        })
+    })
+}
+
+/// The root the guard's walk reaches `source` from, the path below it, and
+/// whether that walk leaves Cargo's build directories out. `None` for a
+/// source no walk reaches: outside the workspace, under the target
+/// directory, or relative and leaving the root.
+fn guard_place<'a>(
+    source: &Path,
+    workspace: &'a WorkspaceRoots,
+) -> Option<(&'a Path, String, bool)> {
+    if !source.has_root() {
+        workspace_relative_source(source, workspace)?;
+        let below = format!("{}/{}", workspace.cwd, source.to_str()?);
+        return Some((&workspace.root, below, true));
+    }
+    match workspace_portable_value(source.as_os_str(), workspace)? {
+        Portable::OutDir(below) => Some((workspace.out_dir.as_deref()?, below, false)),
+        Portable::Workspace(below) => Some((&workspace.root, below, true)),
+        Portable::Literal(_) | Portable::Registry(_) => None,
+    }
+}
+
+/// Does a walk from `root` that follows no symlink reach the file at
+/// `below`, a lexical path inside `root`? With `skips_build_dirs`, not
+/// through a directory Cargo tagged as its build directory either.
+/// `entered` keeps the answer for each directory checked.
+fn walk_reaches(
+    root: &Path,
+    below: &str,
+    skips_build_dirs: bool,
+    entered: &mut HashMap<(PathBuf, bool), bool>,
+) -> bool {
+    use std::path::Component;
+    let components: Vec<Component<'_>> = Path::new(below)
+        .components()
+        .filter(|component| matches!(component, Component::Normal(_) | Component::ParentDir))
+        .collect();
+    let Some((_, directories)) = components.split_last() else {
+        return true;
+    };
+    let mut directory = root.to_path_buf();
+    let mut depth = 0usize;
+    for component in directories {
+        if *component == Component::ParentDir {
+            let Some(up) = depth.checked_sub(1) else {
+                return false;
+            };
+            depth = up;
+            directory.pop();
+            continue;
+        }
+        directory.push(component);
+        depth += 1;
+        let walked = *entered
+            .entry((directory.clone(), skips_build_dirs))
+            .or_insert_with(|| {
+                std::fs::symlink_metadata(&directory).is_ok_and(|metadata| metadata.is_dir())
+                    && !(skips_build_dirs && crate::tree_stamp::holds_cargo_build_tag(&directory))
+            });
+        if !walked {
+            return false;
+        }
+    }
+    true
 }
 
 /// The closure with every source written relative to `OUT_DIR` or the
@@ -5933,21 +6440,30 @@ impl Rejection {
     }
 }
 
-/// Is this invocation the shape a prediction is sound for?
+/// Must this unit's records carry a tree digest that still matches?
 ///
-/// A proc macro can scan the filesystem and emit `include_str!` per entry, so
-/// a file can enter the closure with nothing already in the closure changing.
+/// A proc macro can list a directory and emit `include_str!` per entry, so a
+/// file can enter the closure with nothing already in the closure changing.
 /// The pre-pass sees the new file; a prediction would not, and would derive
-/// the stored key: a false hit. Cargo does not make this assumption either —
-/// it recompiles when a build script's `rerun-if-changed` directory fires
-/// even if the bytes are identical.
+/// the stored key: a false hit. The tree digest is what sees the new file.
 ///
-/// The test is how cargo hands rustc a proc macro: as a dynamic library.
-/// `dylib` crate-type dependencies get swept in too, which is
-/// over-conservative and safe. This was the scoping rule of the closed
-/// kunobi-ninja/kache#334, where it left 84% of units eligible.
-pub(crate) fn prediction_applies(externs: &[crate::args::ExternDep]) -> bool {
-    !externs.iter().any(|ext| {
+/// The macro need not be a direct dependency: an rlib can re-export one
+/// (`sqlx::migrate!`, `include_dir!`), and rustc is told only about the rlib.
+/// So every workspace or path unit takes the guard, whatever it links. A
+/// registry unit takes it only with a proc-macro dependency of its own
+/// ([`has_dylib_extern`]): its package is the same files wherever it is
+/// built. A unit with no `CARGO_MANIFEST_DIR` keeps the dynamic-library
+/// rule. A unit that takes the guard but has no tree to digest is not
+/// predicted.
+fn needs_tree_guard(externs: &[crate::args::ExternDep], manifest_dir: Option<&Path>) -> bool {
+    has_dylib_extern(externs) || manifest_dir.is_some_and(|dir| !is_registry_package(dir))
+}
+
+/// Does the unit depend on a dynamic library? Cargo hands rustc each
+/// proc-macro dependency as one. `dylib` crate-type dependencies get swept in
+/// too, which only costs a guard they did not need.
+fn has_dylib_extern(externs: &[crate::args::ExternDep]) -> bool {
+    externs.iter().any(|ext| {
         ext.path.as_deref().is_some_and(|path| {
             path.file_name()
                 .and_then(|name| name.to_str())
@@ -6179,17 +6695,26 @@ pub struct FileHasher<'db> {
     env_dep_uses: RefCell<HashMap<(String, String), SourceEnvDepUse>>,
     stats: FileHashStatsCells,
     too_new: TooNewGuard,
-    /// Fingerprints of every file hashed while the too-new guard was armed.
-    /// Drained after the compile so the wrapper can prove clock-independently
+    /// Fingerprints of every file hashed, or proved by a memo's stamp, while
+    /// the too-new guard was armed, with the time each was observed. Checked
+    /// again after the compile so the wrapper can prove clock-independently
     /// that none of them changed mid-build (see
+    /// [`FileHasher::inputs_changed_since_keyed`] and
     /// [`FileHasher::guarded_inputs_unchanged_since_hash`]).
-    guard_inputs: RefCell<Vec<FileFingerprint>>,
+    guard_inputs: RefCell<Vec<ObservedFingerprint>>,
     /// Memo rows for files hashed in this process, written in one transaction
     /// by [`FileHasher::flush_memo`] (and on drop). One autocommit write per
     /// file made every hit in a six-job cold cell wait for the index's write
     /// lock behind the misses' store transactions: 6 ms of hashing became
-    /// 380 ms.
-    pending_memo: RefCell<Vec<(FileFingerprint, String)>>,
+    /// 380 ms. Each row keeps the time its file was observed, which alone
+    /// decides whether it may be written.
+    pending_memo: RefCell<Vec<(ObservedFingerprint, String)>>,
+    /// The stat walks behind the tree digests computed since the last
+    /// [`FileHasher::take_tree_walks`] (see [`tree_guard_of`]).
+    tree_walks: RefCell<Vec<GuardWalk>>,
+    /// Kache's own directories and what Cargo writes in its home, in each
+    /// spelling, which tree guards leave out ([`FileHasher::with_own_dirs`]).
+    own_dirs: Vec<PathBuf>,
 }
 
 impl Drop for FileHasher<'_> {
@@ -6199,15 +6724,23 @@ impl Drop for FileHasher<'_> {
 }
 
 /// Optional "too-new input" guard (kunobi-ninja/kache#324). When armed, any
-/// hashed input whose mtime/ctime falls within `margin_ns` of the build's start
-/// is flagged: its content at hash time may differ from what the compiler reads,
-/// so the wrapper treats the invocation as non-cacheable (it still looks up, but
-/// refuses to store). Disabled when `invocation_start_ns == 0` (the default).
+/// hashed input whose stamp shows a write at or after `margin_ns` before the
+/// build's start ([`stamp_written_since`]) is flagged: its content at hash
+/// time may differ from what the compiler reads, so the wrapper treats the
+/// invocation as non-cacheable (it still looks up, but refuses to store).
+/// Disabled when `invocation_start_ns == 0` (the default).
 #[derive(Default)]
 struct TooNewGuard {
     invocation_start_ns: i64,
     margin_ns: i64,
     saw_too_new: Cell<bool>,
+    /// Tripped by a stamp no later than the wall clock read after its stat:
+    /// a write since the start by this host's clock. A stamp still ahead of
+    /// the clock then was not written during the build here; it comes from
+    /// a skewed file clock or a future-dated file. Only a key taken before
+    /// the compile tells the two apart
+    /// ([`FileHasher::inputs_changed_since_keyed`]).
+    saw_write_since_start: Cell<bool>,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -6237,6 +6770,45 @@ struct RecentHash {
     fingerprint: Option<FileFingerprint>,
 }
 
+/// [`hash_file`], for a read that follows a stat of the same file.
+fn read_file_hash(path: &Path) -> Result<String> {
+    #[cfg(test)]
+    BEFORE_READ.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook(path);
+        }
+    });
+    hash_file(path)
+}
+
+/// Run by [`read_file_hash`] before it reads, so a test can write to a file
+/// between a hasher's stat and its read.
+#[cfg(test)]
+pub(crate) type BeforeRead = Box<dyn FnMut(&Path)>;
+
+#[cfg(test)]
+thread_local! {
+    static BEFORE_READ: std::cell::RefCell<Option<BeforeRead>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_before_read(hook: Option<BeforeRead>) {
+    BEFORE_READ.with(|slot| *slot.borrow_mut() = hook);
+}
+
+/// A file's raw blake3 and its blake3 with the prefix maps applied, both
+/// from one read, so the raw one shows which bytes the mapped one is of.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CcContentHashes {
+    pub(crate) raw: String,
+    pub(crate) mapped: String,
+}
+
+/// Why [`FileHasher::cc_inputs_hide_assembler_input`] gave no verdict: the
+/// scan read other bytes than the input was fingerprinted with.
+pub(crate) const CC_INPUT_CHANGED_WHILE_SCANNED: &str = "an input changed while it was scanned";
+
 impl FileHasher<'static> {
     pub fn new() -> Self {
         FileHasher {
@@ -6252,6 +6824,8 @@ impl FileHasher<'static> {
             too_new: TooNewGuard::default(),
             guard_inputs: RefCell::new(Vec::new()),
             pending_memo: RefCell::new(Vec::new()),
+            tree_walks: RefCell::new(Vec::new()),
+            own_dirs: Vec::new(),
         }
     }
 
@@ -6271,6 +6845,8 @@ impl FileHasher<'static> {
                 too_new: TooNewGuard::default(),
                 guard_inputs: RefCell::new(Vec::new()),
                 pending_memo: RefCell::new(Vec::new()),
+                tree_walks: RefCell::new(Vec::new()),
+                own_dirs: Vec::new(),
             },
             Err(e) => {
                 tracing::debug!(
@@ -6284,38 +6860,19 @@ impl FileHasher<'static> {
 }
 
 impl<'db> FileHasher<'db> {
-    /// Write every memo row hashed so far in one transaction. The rows are an
-    /// optimisation, so a busy index (another process holds the write lock
-    /// for longer than the short wait here) drops them rather than stalling
-    /// a hit; the next process hashes those files again.
+    /// Write every memo row hashed so far in one transaction.
+    ///
+    /// A file that had changed within [`HASH_SETTLE_NS`] of when it was
+    /// observed is left out: its hash was right for this process, but a
+    /// second write in the same timestamp tick would leave a row that no
+    /// stamp check could catch. Flushing later does not change that, since
+    /// the bytes were read back then. The rows are an optimisation, so a busy
+    /// index (another process holds the write lock for longer than the short
+    /// wait here) drops them rather than stalling a hit; the next process
+    /// hashes those files again.
     pub fn flush_memo(&self) {
-        let now_ns = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |elapsed| {
-                i64::try_from(elapsed.as_nanos()).unwrap_or(i64::MAX)
-            });
-        self.flush_memo_at(now_ns);
-    }
-
-    /// [`flush_memo`](Self::flush_memo) with the clock supplied. A file that
-    /// changed within [`HASH_SETTLE_NS`] of `now_ns` is left out:
-    /// its hash was right for this process, but a second write in the same
-    /// timestamp tick would leave a row that no stamp check could catch.
-    /// Flush as if every pending file had been left alone for the settle
-    /// window, for tests that write a file and then expect its row.
-    #[cfg(test)]
-    pub(crate) fn flush_memo_as_if_settled(&self) {
-        let now_ns = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |elapsed| {
-                i64::try_from(elapsed.as_nanos()).unwrap_or(i64::MAX)
-            });
-        self.flush_memo_at(now_ns.saturating_add(HASH_SETTLE_NS));
-    }
-
-    pub(crate) fn flush_memo_at(&self, now_ns: i64) {
         let mut pending = std::mem::take(&mut *self.pending_memo.borrow_mut());
-        pending.retain(|(fingerprint, _)| stamp_is_settled(fingerprint, now_ns));
+        pending.retain(|(observed, _)| observed.settled());
         if pending.is_empty() {
             return;
         }
@@ -6327,8 +6884,8 @@ impl<'db> FileHasher<'db> {
         let _ = db.busy_timeout(std::time::Duration::from_millis(100));
         let written = (|| -> rusqlite::Result<()> {
             db.execute_batch("BEGIN IMMEDIATE")?;
-            for (fingerprint, hash) in &pending {
-                if let Err(error) = cache.put(fingerprint, hash) {
+            for (observed, hash) in &pending {
+                if let Err(error) = cache.put(&observed.fingerprint, hash) {
                     let _ = db.execute_batch("ROLLBACK");
                     return Err(error);
                 }
@@ -6337,11 +6894,18 @@ impl<'db> FileHasher<'db> {
         })();
         let _ = db.busy_timeout(std::time::Duration::from_millis(5000));
         if let Err(error) = written {
-            tracing::debug!(
-                rows = pending.len(),
-                "file hash memo not written (index busy): {error}"
-            );
+            tracing::debug!(rows = pending.len(), "file hash memo not written: {error}");
         }
+    }
+
+    /// Flush as if every pending file had been observed one settle window
+    /// later, for tests that write a file and then expect its row.
+    #[cfg(test)]
+    pub(crate) fn flush_memo_as_if_settled(&self) {
+        for (observed, _) in self.pending_memo.borrow_mut().iter_mut() {
+            observed.observed_ns = observed.observed_ns.saturating_add(HASH_SETTLE_NS);
+        }
+        self.flush_memo();
     }
 
     pub(crate) fn from_cache(cache: FileHashCache<'db>) -> Self {
@@ -6358,6 +6922,8 @@ impl<'db> FileHasher<'db> {
             too_new: TooNewGuard::default(),
             guard_inputs: RefCell::new(Vec::new()),
             pending_memo: RefCell::new(Vec::new()),
+            tree_walks: RefCell::new(Vec::new()),
+            own_dirs: Vec::new(),
         }
     }
 
@@ -6382,8 +6948,26 @@ impl<'db> FileHasher<'db> {
         self
     }
 
+    /// Leave `paths` out of every tree a guard walks ([`own_dirs_within`]):
+    /// Kache's cache, runtime and probe directories, and what Cargo writes in
+    /// its home. Each comes in every spelling a walk may meet it by
+    /// ([`crate::build_script_inputs::excluded_roots`]), and the declared
+    /// build-script inputs leave out the same paths.
+    pub(crate) fn with_own_dirs(mut self, paths: impl IntoIterator<Item = PathBuf>) -> Self {
+        self.own_dirs.extend(paths);
+        self
+    }
+
     pub(crate) fn take_discovery_flight(&self) -> Option<crate::store::StoreLock> {
         self.discovery_flight.borrow_mut().take()
+    }
+
+    fn note_tree_walk(&self, walk: GuardWalk) {
+        self.tree_walks.borrow_mut().push(walk);
+    }
+
+    fn take_tree_walks(&self) -> Vec<GuardWalk> {
+        std::mem::take(&mut *self.tree_walks.borrow_mut())
     }
 
     /// May key computation derive its inputs from a record? Only when it was
@@ -6393,8 +6977,10 @@ impl<'db> FileHasher<'db> {
     }
 
     /// Arm the too-new-input guard (kunobi-ninja/kache#324): flag any subsequently
-    /// hashed input whose mtime/ctime is within `margin_ns` of `invocation_start_ns`
-    /// (the build's wall-clock start). A `start` of 0 leaves the guard disabled.
+    /// hashed input whose stamp shows a write at or after `margin_ns` before
+    /// `invocation_start_ns` (the build's start, read from [`stamp_clock_ns`]),
+    /// allowing for coarse file clocks ([`stamp_written_since`]). A `start` of
+    /// 0 leaves the guard disabled.
     pub fn arm_too_new_guard(&mut self, invocation_start_ns: i64, margin_ns: i64) {
         self.too_new.invocation_start_ns = invocation_start_ns;
         self.too_new.margin_ns = margin_ns;
@@ -6405,18 +6991,18 @@ impl<'db> FileHasher<'db> {
         self.too_new.saw_too_new.get()
     }
 
-    /// Keep `fingerprint` for the post-compile revalidation, when the guard
-    /// is armed.
-    fn guard_input(&self, fingerprint: &FileFingerprint) {
+    /// Keep `observed` for the post-compile revalidation, when the guard is
+    /// armed.
+    fn guard_input(&self, observed: &ObservedFingerprint) {
         if self.too_new.invocation_start_ns > 0 {
-            self.guard_inputs.borrow_mut().push(fingerprint.clone());
+            self.guard_inputs.borrow_mut().push(observed.clone());
         }
     }
 
     /// Drain the fingerprints hashed while the guard was armed. The wrapper
     /// carries them past the compile and hands them to
     /// [`FileHasher::guarded_inputs_unchanged_since_hash`].
-    pub fn take_guarded_inputs(&self) -> Vec<FileFingerprint> {
+    pub fn take_guarded_inputs(&self) -> Vec<ObservedFingerprint> {
         std::mem::take(&mut *self.guard_inputs.borrow_mut())
     }
 
@@ -6430,22 +7016,94 @@ impl<'db> FileHasher<'db> {
     /// Fails closed: an empty set, a missing or changed file, or an input
     /// without an inode (non-Unix, where replace-by-rename is invisible)
     /// never excuses a tripped guard.
-    pub fn guarded_inputs_unchanged_since_hash(inputs: &[FileFingerprint]) -> bool {
+    pub fn guarded_inputs_unchanged_since_hash(inputs: &[ObservedFingerprint]) -> bool {
         if inputs.is_empty() {
             return false;
         }
-        inputs.iter().all(|expected| {
+        inputs.iter().all(|input| {
+            let expected = &input.fingerprint;
             expected.inode != 0
                 && FileFingerprint::from_path(Path::new(&expected.path))
                     .is_ok_and(|current| current == *expected)
         })
     }
 
+    /// Whether any guarded input visibly changed since it was hashed: it is
+    /// gone, or its size, write time or inode differ from the fingerprint
+    /// taken then. Unlike [`Self::guarded_inputs_unchanged_since_hash`] this
+    /// needs no strong identity, as it only reports what it sees change.
+    ///
+    /// The change time does not count: linking a dependency's output
+    /// elsewhere, as store ingest and Cargo's uplift do while its dependents
+    /// compile, moves it and leaves the bytes alone. So a rewrite that keeps
+    /// the size and write time is missed, and on Windows, where fingerprints
+    /// carry no inode, so is a replacement with the same size and write time.
+    pub fn guarded_inputs_moved_since_hash(inputs: &[ObservedFingerprint]) -> bool {
+        inputs.iter().any(|input| {
+            let expected = &input.fingerprint;
+            FileFingerprint::from_path(Path::new(&expected.path)).map_or(true, |current| {
+                current.size != expected.size
+                    || current.mtime_ns != expected.mtime_ns
+                    || current.inode != expected.inode
+            })
+        })
+    }
+
+    /// Whether a compile that ran after this key may have read other bytes
+    /// than the key hashed. Ask once the compile has run.
+    ///
+    /// A stamp written since the invocation started refuses: a save between
+    /// the preprocessor's read and the key's changes the read set while
+    /// every file the key hashed still matches what it saw. A stamp ahead of
+    /// the clock when the key took it does not refuse on its own (see
+    /// `saw_write_since_start`). Every input the key took in, hashed or
+    /// proved by a memo's stamp, must then still match a fresh stat. One
+    /// whose stamp had not settled when the invocation started is read again
+    /// as well, since a second write in the same timestamp tick keeps the
+    /// stamp; only such fresh files pay a read.
+    pub(crate) fn inputs_changed_since_keyed(&self) -> bool {
+        if self.too_new.saw_write_since_start.get() {
+            return true;
+        }
+        let start_ns = self.too_new.invocation_start_ns;
+        let guarded = self.guard_inputs.borrow();
+        let recent = self.recent_hashes.borrow();
+        let distinct: std::collections::HashSet<&FileFingerprint> = guarded
+            .iter()
+            .map(|observed| &observed.fingerprint)
+            .collect();
+        distinct.into_iter().any(|keyed| {
+            let path = Path::new(&keyed.path);
+            let holds_hashed_bytes = || {
+                recent.get(path).is_some_and(|hashed| {
+                    hashed.fingerprint.as_ref() == Some(keyed)
+                        && hash_file(path).is_ok_and(|bytes| bytes == hashed.hash)
+                })
+            };
+            !FileFingerprint::from_path(path).is_ok_and(|current| current == *keyed)
+                || (!stamp_is_settled(keyed, start_ns) && !holds_hashed_bytes())
+        })
+    }
+
     fn note_too_new(&self, fingerprint: &FileFingerprint) {
         if self.too_new.invocation_start_ns > 0 {
-            let threshold = self.too_new.invocation_start_ns - self.too_new.margin_ns;
-            if fingerprint.mtime_ns >= threshold || fingerprint.ctime_ns >= threshold {
+            let since = self
+                .too_new
+                .invocation_start_ns
+                .saturating_sub(self.too_new.margin_ns);
+            if stamp_written_since(fingerprint, since) {
                 self.too_new.saw_too_new.set(true);
+                // Read after the stat: a write before it cannot carry a later
+                // stamp by this host's clock.
+                let now_ns = wall_clock_ns();
+                if [fingerprint.mtime_ns, fingerprint.ctime_ns]
+                    .into_iter()
+                    .any(|stamp| {
+                        stamp >= since.saturating_sub(stamp_window_ns(stamp)) && stamp <= now_ns
+                    })
+                {
+                    self.too_new.saw_write_since_start.set(true);
+                }
             }
         }
     }
@@ -6594,19 +7252,6 @@ impl<'db> FileHasher<'db> {
         }
     }
 
-    /// Reuse a preprocessor-output hash only when every source and header the
-    /// probe read still holds the same bytes.
-    ///
-    /// Metadata first, because identical metadata needs no read. When it
-    /// differs the file is hashed and compared, so bytes that merely moved
-    /// (another worktree, a fresh checkout) or were rewritten unchanged (a
-    /// build script regenerating a header) still hit.
-    ///
-    /// The too-new guard deliberately does not apply. It exists because
-    /// metadata cannot tell a file written a moment ago from one still being
-    /// written; a content hash can, because a file that changes afterwards
-    /// simply fails the next comparison. Any database, decoding, or metadata
-    /// uncertainty is still a miss.
     /// Whether any memo is recorded under `memo_key`, whatever its inputs
     /// say now. Decides between compiling first (nothing recorded) and
     /// rediscovering the read set with the preprocessor (a stale record).
@@ -6616,11 +7261,24 @@ impl<'db> FileHasher<'db> {
             .is_some_and(|cache| matches!(cache.get_cc_preprocess_memo(memo_key), Ok(Some(_))))
     }
 
+    /// Reuse a preprocessor-output hash only when every source and header the
+    /// probe read still holds the same bytes.
+    ///
+    /// Metadata first, because identical metadata needs no read. When it
+    /// differs the file is hashed and compared, so bytes that merely moved
+    /// (another worktree, a fresh checkout) or were rewritten unchanged (a
+    /// build script regenerating a header) still hit.
+    ///
+    /// A recent write alone does not refuse the hit. A recorded stamp is
+    /// trusted only because it had settled when it was taken, so any later
+    /// write has moved it; an input observed sooner was recorded without a
+    /// stamp and is compared by content every time. Any database, decoding,
+    /// or metadata uncertainty is still a miss.
     pub(crate) fn cc_preprocess_memo_lookup(
         &self,
         memo_key: &str,
         resolve: impl Fn(&str) -> Vec<PathBuf>,
-        mapped_content: &impl Fn(&Path) -> Option<String>,
+        mapped_content: &impl Fn(&Path) -> Option<CcContentHashes>,
     ) -> Option<(String, Vec<PathBuf>)> {
         let cache = self.cache.as_ref()?;
         let record = match cache.get_cc_preprocess_memo(memo_key) {
@@ -6664,14 +7322,15 @@ impl<'db> FileHasher<'db> {
 
     /// Does this input still hold the bytes the memo was recorded against?
     ///
-    /// Identical metadata answers yes without a read. Otherwise the file is
-    /// hashed through the ordinary content cache, so a header shared by many
+    /// Identical metadata answers yes without a read; a row recorded without
+    /// a stamp matches no file's metadata. Otherwise the file is hashed
+    /// through the ordinary content cache, so a header shared by many
     /// translation units is read once per build rather than once per unit.
     fn memo_input_is_unchanged(
         &self,
         expected: &CcPreprocessMemoInput,
         resolve: &impl Fn(&str) -> Vec<PathBuf>,
-        mapped_content: &impl Fn(&Path) -> Option<String>,
+        mapped_content: &impl Fn(&Path) -> Option<CcContentHashes>,
     ) -> Option<PathBuf> {
         // Only where THIS invocation resolves the recorded name. The path the
         // recording checkout used is not a candidate on its own merit: it may
@@ -6683,14 +7342,25 @@ impl<'db> FileHasher<'db> {
         let candidates = resolve(&expected.name);
 
         for path in &candidates {
-            let Ok(current) = FileFingerprint::from_path(path) else {
+            let Ok(current) = ObservedFingerprint::from_path(path) else {
                 continue;
             };
-            self.note_too_new(&current);
+            self.note_too_new(&current.fingerprint);
             // Cheapest first: identical metadata needs no read, identical raw
             // bytes come from the content cache, and only a file differing in
             // both is read through the maps.
-            if current == expected.fingerprint {
+            if current.fingerprint == expected.fingerprint {
+                // Unhashed, so registered here with the bytes its stamp
+                // proves: the recheck after a compile has to cover it like
+                // any input the key hashed.
+                self.guard_input(&current);
+                self.recent_hashes.borrow_mut().insert(
+                    absolute_path(path),
+                    RecentHash {
+                        hash: expected.content.clone(),
+                        fingerprint: Some(current.fingerprint),
+                    },
+                );
                 return Some(path.clone());
             }
             if self
@@ -6700,7 +7370,7 @@ impl<'db> FileHasher<'db> {
                 return Some(path.clone());
             }
             if !expected.mapped.is_empty()
-                && mapped_content(path).is_some_and(|mapped| mapped == expected.mapped)
+                && mapped_content(path).is_some_and(|read| read.mapped == expected.mapped)
             {
                 return Some(path.clone());
             }
@@ -6713,25 +7383,25 @@ impl<'db> FileHasher<'db> {
         None
     }
 
-    /// Capture the source/header metadata and contents observed immediately
-    /// after a full preprocess probe. The caller revalidates this snapshot
-    /// after a successful compile or restore before committing it.
-    ///
-    /// Hashing here is what the memo is validated against later. It is not
-    /// free on a cold build, but every hash goes through the content cache,
-    /// so a header included by many translation units is read once.
-    /// Fingerprint every file a preprocessor run read, under its mapped name.
+    /// Fingerprint every file a preprocessor run or a compile read, under its
+    /// mapped name. The caller revalidates this snapshot after a successful
+    /// compile or restore before committing it.
     ///
     /// The raw content hash comes from the file-hash memo by stamp. The
     /// mapped hash (the bytes with this invocation's prefix maps applied) is
     /// memoised by raw hash and map set in the same index, so the headers a
     /// build's translation units share are read and rewritten once per map
-    /// set rather than once per unit; `maps_key` names the map set.
+    /// set rather than once per unit; `maps_key` names the map set. A mapped
+    /// hash is learned only from a read whose raw hash is the content hash:
+    /// a file written between the two reads fails the whole capture.
+    ///
+    /// Every input carries the wall clock read before its stamp was taken.
+    /// The store keeps a stamp only if it had settled by then.
     pub(crate) fn cc_preprocess_fingerprints(
         &self,
         paths: &[(String, PathBuf)],
         maps_key: &str,
-        mapped_content: &impl Fn(&Path) -> Option<String>,
+        mapped_content: &impl Fn(&Path) -> Option<CcContentHashes>,
     ) -> Option<Vec<CcPreprocessMemoInput>> {
         if paths.is_empty() {
             return None;
@@ -6741,11 +7411,11 @@ impl<'db> FileHasher<'db> {
         // unit reads a couple of hundred headers, most of them the same ones
         // its neighbours read; opening and hashing each again cost more than
         // the compile's own header work did on macOS.
-        let mut stamped: Vec<(&String, &PathBuf, FileFingerprint)> =
+        let mut stamped: Vec<(&String, &PathBuf, ObservedFingerprint)> =
             Vec::with_capacity(paths.len());
         for (name, path) in paths {
-            let fingerprint = match FileFingerprint::from_path(path) {
-                Ok(fingerprint) => fingerprint,
+            let observed = match ObservedFingerprint::from_path(path) {
+                Ok(observed) => observed,
                 Err(error) => {
                     tracing::debug!(
                         "cc preprocess memo input {} could not be fingerprinted: {error}",
@@ -6754,14 +7424,14 @@ impl<'db> FileHasher<'db> {
                     return None;
                 }
             };
-            self.note_too_new(&fingerprint);
-            stamped.push((name, path, fingerprint));
+            self.note_too_new(&observed.fingerprint);
+            stamped.push((name, path, observed));
         }
-        let memoised = self.memoised_hashes(stamped.iter().map(|(_, _, stamp)| stamp));
-        let mut pending: Vec<(String, FileFingerprint, String, PathBuf)> =
+        let memoised = self.memoised_hashes(stamped.iter().map(|(_, _, stamp)| &stamp.fingerprint));
+        let mut pending: Vec<(String, ObservedFingerprint, String, PathBuf)> =
             Vec::with_capacity(stamped.len());
-        for (name, path, fingerprint) in stamped {
-            let content = match self.header_hash(path, &fingerprint, &memoised) {
+        for (name, path, observed) in stamped {
+            let content = match self.header_hash(path, &observed, &memoised) {
                 Ok(content) => content,
                 Err(error) => {
                     tracing::debug!(
@@ -6771,7 +7441,7 @@ impl<'db> FileHasher<'db> {
                     return None;
                 }
             };
-            pending.push((name.clone(), fingerprint, content, path.clone()));
+            pending.push((name.clone(), observed, content, path.clone()));
         }
         let memo = self.cache.as_ref().filter(|_| !maps_key.is_empty());
         let known = match memo {
@@ -6789,21 +7459,31 @@ impl<'db> FileHasher<'db> {
         let mut known = known;
         let mut learned: Vec<(String, String)> = Vec::new();
         let mut inputs = Vec::with_capacity(pending.len());
-        for (name, fingerprint, content, path) in pending {
+        for (name, observed, content, path) in pending {
             let mapped = match known.get(&content) {
                 Some(mapped) => mapped.clone(),
                 None => {
-                    let mapped = mapped_content(&path)?;
-                    known.insert(content.clone(), mapped.clone());
-                    learned.push((content.clone(), mapped.clone()));
-                    mapped
+                    let read = mapped_content(&path)?;
+                    if read.raw != content {
+                        // Written since it was hashed: the mapped hash is of
+                        // other bytes than the content hash names.
+                        tracing::debug!(
+                            "cc preprocess memo input {} changed while it was fingerprinted",
+                            path.display()
+                        );
+                        return None;
+                    }
+                    known.insert(content.clone(), read.mapped.clone());
+                    learned.push((content.clone(), read.mapped.clone()));
+                    read.mapped
                 }
             };
             inputs.push(CcPreprocessMemoInput {
                 name,
-                fingerprint,
+                fingerprint: observed.fingerprint,
                 content,
                 mapped,
+                observed_ns: observed.observed_ns,
             });
         }
         if let Some(cache) = memo
@@ -6819,12 +7499,18 @@ impl<'db> FileHasher<'db> {
     /// The first input whose raw text hides a file the assembler would read,
     /// scanning each distinct content once: the verdict is memoised by raw
     /// content hash, so a header shared by many units is read once. `scan`
-    /// returns `None` for a file it cannot read (skipped, not recorded),
-    /// `Some(None)` for a clean file, `Some(Some(construct))` otherwise.
+    /// reads a file once and returns the raw hash of those bytes with
+    /// `None` for clean text or the construct found; `None` for a file it
+    /// cannot read (skipped, not recorded).
+    ///
+    /// A verdict counts only for the bytes the input was fingerprinted
+    /// with. When the scan read others, nothing is recorded and the inputs
+    /// are reported as [`CC_INPUT_CHANGED_WHILE_SCANNED`], since no verdict
+    /// covers what the key holds.
     pub(crate) fn cc_inputs_hide_assembler_input(
         &self,
         inputs: &[CcPreprocessMemoInput],
-        scan: &impl Fn(&Path) -> Option<Option<&'static str>>,
+        scan: &impl Fn(&Path) -> Option<(String, Option<&'static str>)>,
     ) -> Option<String> {
         let _trace = crate::phase_trace::phase("cc_asm_scan");
         let known = match &self.cache {
@@ -6844,9 +7530,13 @@ impl<'db> FileHasher<'db> {
             let verdict = match known.get(&input.content) {
                 Some(construct) => construct.clone(),
                 None => {
-                    let Some(scanned) = scan(Path::new(&input.fingerprint.path)) else {
+                    let Some((raw, scanned)) = scan(Path::new(&input.fingerprint.path)) else {
                         continue;
                     };
+                    if raw != input.content {
+                        found.get_or_insert_with(|| CC_INPUT_CHANGED_WHILE_SCANNED.to_string());
+                        continue;
+                    }
                     let construct = scanned.unwrap_or("").to_string();
                     known.insert(input.content.clone(), construct.clone());
                     learned.push((input.content.clone(), construct.clone()));
@@ -6868,18 +7558,21 @@ impl<'db> FileHasher<'db> {
     /// Commit a pending preprocessor memo after proving its inputs held the
     /// same bytes through the successful compiler/restore boundary.
     ///
-    /// An input written during this build no longer blocks the record. What
-    /// it was blocking is a torn read, and a torn read is caught where it
-    /// matters: the recorded hash is of whatever bytes were there, so the
-    /// finished file simply fails the next comparison and the expansion is
-    /// recomputed. Refusing to record instead meant a fresh checkout — every
-    /// CI runner, every new worktree — could never memoise anything at all.
+    /// An input written during this build does not block the record; the
+    /// store decides what its stamp may prove. A stamp that had settled when
+    /// the input was observed moves on any later write. One taken sooner can
+    /// survive a second write in the same timestamp tick, so the input is
+    /// recorded by content alone and every lookup compares that content. For
+    /// a file of 64 KiB or more the comparison goes through the file-hash
+    /// memo, which answers by stamp, so it is only as fresh as that memo's
+    /// rows. Refusing the record instead would keep a fresh checkout from
+    /// memoising anything.
     pub(crate) fn cc_preprocess_memo_record_if_unchanged(
         &self,
         memo_key: &str,
         preprocessed_hash: &str,
         inputs: &[CcPreprocessMemoInput],
-        mapped_content: &impl Fn(&Path) -> Option<String>,
+        mapped_content: &impl Fn(&Path) -> Option<CcContentHashes>,
     ) {
         let Some(cache) = &self.cache else {
             return;
@@ -6967,43 +7660,67 @@ impl<'db> FileHasher<'db> {
     /// Hash a file's contents, using the persistent cache when available.
     pub fn hash(&self, path: &Path) -> Result<String> {
         let _trace = crate::phase_trace::phase("input_hash");
-        let (hash, fingerprint) = self.hash_inner(path)?;
-        if let Some(fingerprint) = &fingerprint {
-            self.guard_input(fingerprint);
+        let (hash, observed) = self.hash_inner(path, true)?;
+        if let Some(observed) = &observed {
+            self.guard_input(observed);
         }
         self.recent_hashes.borrow_mut().insert(
             absolute_path(path),
             RecentHash {
                 hash: hash.clone(),
-                fingerprint,
+                fingerprint: observed.map(|observed| observed.fingerprint),
             },
         );
         Ok(hash)
     }
 
-    fn hash_inner(&self, path: &Path) -> Result<(String, Option<FileFingerprint>)> {
+    /// Hash a file that is not a key input, such as one a tree guard reads,
+    /// through the persistent cache. It neither trips the too-new guard nor
+    /// joins the inputs checked again after the compile: a file saved
+    /// anywhere in the workspace while a unit builds must not keep that unit
+    /// out of the store. Its memo row follows the same rules as a key
+    /// input's: none for a stamp that had not settled when it was observed,
+    /// or that moved while the file was read under the guard.
+    pub(crate) fn hash_unkeyed(&self, path: &Path) -> Result<String> {
+        let _trace = crate::phase_trace::phase("input_hash");
+        self.hash_inner(path, false).map(|(hash, _)| hash)
+    }
+
+    /// With `keyed`, the file is a key input and the too-new guard sees it.
+    fn hash_inner(
+        &self,
+        path: &Path,
+        keyed: bool,
+    ) -> Result<(String, Option<ObservedFingerprint>)> {
         let Some(cache) = &self.cache else {
-            if self.too_new.invocation_start_ns == 0 {
+            // Read before any stat and before the bytes, so it is no later
+            // than whichever stamp is returned.
+            let observed_ns = wall_clock_ns();
+            let observed = |fingerprint| ObservedFingerprint {
+                fingerprint,
+                observed_ns,
+            };
+            if !keyed || self.too_new.invocation_start_ns == 0 {
                 let hash = hash_file(path)?;
-                return Ok((hash, FileFingerprint::from_path(path).ok()));
+                return Ok((hash, FileFingerprint::from_path(path).ok().map(observed)));
             }
-            let before = FileFingerprint::from_path(path).ok();
-            if let Some(fingerprint) = &before {
-                self.note_too_new(fingerprint);
-            }
-            let hash = hash_file(path)?;
-            let after = FileFingerprint::from_path(path).ok();
-            if let Some(fingerprint) = &after {
-                self.note_too_new(fingerprint);
-            }
-            if before != after {
-                self.too_new.saw_too_new.set(true);
-            }
-            return Ok((hash, after));
+            let Ok(before) = FileFingerprint::from_path(path).map(observed) else {
+                // No stamp before the read: whatever follows it is too new.
+                let hash = read_file_hash(path)?;
+                let after = FileFingerprint::from_path(path).ok();
+                if after.is_some() {
+                    self.too_new.saw_too_new.set(true);
+                }
+                return Ok((hash, after.map(observed)));
+            };
+            self.note_too_new(&before.fingerprint);
+            let hash = read_file_hash(path)?;
+            let (observed, _) = self.restat_after_read(path, before, true);
+            return Ok((hash, Some(observed)));
         };
 
-        let fingerprint = match FileFingerprint::from_path(path) {
-            Ok(fingerprint) => fingerprint,
+        let observed = match ObservedFingerprint::from_path(path) {
+            Ok(observed) => observed,
             Err(e) => {
                 tracing::debug!(
                     "file hash cache metadata lookup failed for {}: {e}",
@@ -7012,29 +7729,35 @@ impl<'db> FileHasher<'db> {
                 return hash_file(path).map(|hash| (hash, None));
             }
         };
+        let fingerprint = &observed.fingerprint;
 
-        self.note_too_new(&fingerprint);
-
-        if fingerprint.size < MIN_PERSISTED_HASH_BYTES {
-            let hash = hash_file(path)?;
-            self.record_miss(fingerprint.size);
-            return Ok((hash, Some(fingerprint)));
+        if keyed {
+            self.note_too_new(fingerprint);
         }
 
-        if let Some(prefetched) = self.prefetched.borrow().get(&fingerprint) {
+        if fingerprint.size < MIN_PERSISTED_HASH_BYTES {
+            let hash = read_file_hash(path)?;
+            self.record_miss(fingerprint.size);
+            let (observed, _) = self.restat_after_read(path, observed, keyed);
+            return Ok((hash, Some(observed)));
+        }
+
+        // A hash from the daemon or the memo belongs to this stamp; no read
+        // here can fall between the stat and the bytes.
+        if let Some(prefetched) = self.prefetched.borrow().get(fingerprint) {
             if prefetched.cache_hit {
                 self.record_hit();
             } else {
                 self.record_miss_count();
                 self.record_miss_bytes(prefetched.bytes_hashed);
             }
-            return Ok((prefetched.hash.clone(), Some(fingerprint)));
+            return Ok((prefetched.hash.clone(), Some(observed)));
         }
 
-        match cache.get(&fingerprint) {
+        match cache.get(fingerprint) {
             Ok(Some(hash)) => {
                 self.record_hit();
-                return Ok((hash, Some(fingerprint)));
+                return Ok((hash, Some(observed)));
             }
             Ok(None) => {}
             Err(e) => {
@@ -7042,12 +7765,58 @@ impl<'db> FileHasher<'db> {
             }
         }
 
-        let hash = hash_file(path)?;
+        let hash = read_file_hash(path)?;
         self.record_miss(fingerprint.size);
-        self.pending_memo
-            .borrow_mut()
-            .push((fingerprint.clone(), hash.clone()));
-        Ok((hash, Some(fingerprint)))
+        let (observed, unchanged) = self.restat_after_read(path, observed, keyed);
+        if unchanged {
+            self.pending_memo
+                .borrow_mut()
+                .push((observed.clone(), hash.clone()));
+        }
+        Ok((hash, Some(observed)))
+    }
+
+    /// Stat `path` again after reading the bytes `before` was taken for, when
+    /// the guard is armed. A write between the two stats means the bytes may
+    /// belong to neither stamp. A key input (`keyed`) then counts as too new,
+    /// and `before`, which no longer matches the file, stays among the
+    /// guarded inputs so that no later check can excuse it; any other file
+    /// only loses its memo row. Returns the fingerprint to report for the
+    /// read, the later one when they differ (still observed when `before`
+    /// was), and whether they agreed.
+    fn restat_after_read(
+        &self,
+        path: &Path,
+        before: ObservedFingerprint,
+        keyed: bool,
+    ) -> (ObservedFingerprint, bool) {
+        if self.too_new.invocation_start_ns == 0 {
+            return (before, true);
+        }
+        match FileFingerprint::from_path(path) {
+            Ok(after) if after == before.fingerprint => (before, true),
+            Ok(after) => {
+                if keyed {
+                    self.too_new.saw_too_new.set(true);
+                    self.guard_input(&before);
+                }
+                let observed_ns = before.observed_ns;
+                (
+                    ObservedFingerprint {
+                        fingerprint: after,
+                        observed_ns,
+                    },
+                    false,
+                )
+            }
+            // Gone since the read: `before` fails any later check.
+            Err(_) => {
+                if keyed {
+                    self.too_new.saw_too_new.set(true);
+                }
+                (before, false)
+            }
+        }
     }
 
     /// Classify how this source uses `var` (see [`source_env_dep_use`]).
@@ -7171,8 +7940,11 @@ impl<'db> FileHasher<'db> {
             }
             return compute_static_lib_hash(path, usage);
         };
-        let fingerprint = match FileFingerprint::from_path(path) {
-            Ok(fp) => fp,
+        let ObservedFingerprint {
+            fingerprint,
+            observed_ns,
+        } = match ObservedFingerprint::from_path(path) {
+            Ok(observed) => observed,
             Err(e) => {
                 tracing::debug!(
                     "static-lib hash metadata lookup failed for {}: {e}",
@@ -7223,7 +7995,13 @@ impl<'db> FileHasher<'db> {
         }
         let hash = compute_static_lib_hash(path, usage)?;
         self.record_miss(size);
-        self.pending_memo.borrow_mut().push((key, hash.clone()));
+        self.pending_memo.borrow_mut().push((
+            ObservedFingerprint {
+                fingerprint: key,
+                observed_ns,
+            },
+            hash.clone(),
+        ));
         Ok(hash)
     }
 
@@ -7249,17 +8027,19 @@ impl<'db> FileHasher<'db> {
     /// Unlike [`hash`](Self::hash), small files are memoised too: a header
     /// is read by every unit that includes it, so the lookup is paid back
     /// many times. [`flush_memo`](Self::flush_memo) still holds back any file
-    /// changed too recently to trust its stamp. The bookkeeping matches
-    /// `hash`, so the too-new guard and later revalidation see these files.
+    /// changed too recently, when `observed`, to trust its stamp. The
+    /// bookkeeping matches `hash`, so the too-new guard and later
+    /// revalidation see these files.
     fn header_hash(
         &self,
         path: &Path,
-        fingerprint: &FileFingerprint,
+        observed: &ObservedFingerprint,
         memoised: &HashMap<String, String>,
     ) -> Result<String> {
         if self.cache.is_none() {
             return self.hash(path);
         }
+        let fingerprint = &observed.fingerprint;
         let prefetched = self.prefetched.borrow().get(fingerprint).map(|prefetched| {
             (
                 prefetched.hash.clone(),
@@ -7267,31 +8047,34 @@ impl<'db> FileHasher<'db> {
                 prefetched.bytes_hashed,
             )
         });
-        let hash = if let Some((hash, cache_hit, bytes_hashed)) = prefetched {
+        let (hash, reported) = if let Some((hash, cache_hit, bytes_hashed)) = prefetched {
             if cache_hit {
                 self.record_hit();
             } else {
                 self.record_miss_count();
                 self.record_miss_bytes(bytes_hashed);
             }
-            hash
+            (hash, observed.clone())
         } else if let Some(hash) = memoised.get(&fingerprint.path) {
             self.record_hit();
-            hash.clone()
+            (hash.clone(), observed.clone())
         } else {
-            let hash = hash_file(path)?;
+            let hash = read_file_hash(path)?;
             self.record_miss(fingerprint.size);
-            self.pending_memo
-                .borrow_mut()
-                .push((fingerprint.clone(), hash.clone()));
-            hash
+            let (reported, unchanged) = self.restat_after_read(path, observed.clone(), true);
+            if unchanged {
+                self.pending_memo
+                    .borrow_mut()
+                    .push((observed.clone(), hash.clone()));
+            }
+            (hash, reported)
         };
-        self.guard_input(fingerprint);
+        self.guard_input(&reported);
         self.recent_hashes.borrow_mut().insert(
             absolute_path(path),
             RecentHash {
                 hash: hash.clone(),
-                fingerprint: Some(fingerprint.clone()),
+                fingerprint: Some(reported.fingerprint),
             },
         );
         Ok(hash)

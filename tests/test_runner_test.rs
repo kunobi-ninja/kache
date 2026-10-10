@@ -318,6 +318,63 @@ fn an_unscheduled_test_holds_target_protection_until_exit() {
     lock.unlock().unwrap();
 }
 
+#[test]
+fn a_test_waiting_for_target_cleanup_says_so_unless_cargo_is_quiet() {
+    const WAITING: &str = "kache: waiting for target cleanup to finish\n";
+    for quiet in [false, true] {
+        let fixture = Fixture::new();
+        fs::create_dir_all(fixture.cache()).unwrap();
+        // Held the way `kache clean` and the daemon hold it while they delete.
+        let cleanup = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(fixture.cache().join("target-use.lock"))
+            .unwrap();
+        cleanup.lock().unwrap();
+        let started = fixture.path().join("started");
+        let stderr = fixture.path().join("stderr");
+        let mut command = fixture.runner(&fixture.probe(), "started");
+        // `cargo test -q` passes the test binary `--quiet`.
+        command
+            .args(quiet.then_some("--quiet"))
+            .env("KACHE_SCHEDULER", "0")
+            .stdout(Stdio::null())
+            .stderr(fs::File::create(&stderr).unwrap());
+        for (name, _) in std::env::vars_os() {
+            let name_text = name.to_string_lossy();
+            if name_text.starts_with("KACHE_S3_") || name_text.starts_with("AWS_") {
+                command.env_remove(&name);
+            }
+        }
+        let mut child = command.spawn().unwrap();
+        if quiet {
+            std::thread::sleep(Duration::from_millis(500));
+        } else {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !fs::read_to_string(&stderr).unwrap().contains(WAITING) {
+                assert!(
+                    child.try_wait().unwrap().is_none(),
+                    "the runner exited without waiting"
+                );
+                assert!(Instant::now() < deadline, "the runner never said it waits");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        assert!(
+            !started.exists(),
+            "quiet={quiet}: the test started while cleanup held the lock"
+        );
+
+        cleanup.unlock().unwrap();
+        assert!(child.wait().unwrap().success(), "quiet={quiet}");
+        assert!(started.exists(), "quiet={quiet}: the test never started");
+        let said = fs::read_to_string(&stderr).unwrap();
+        assert_eq!(said.matches(WAITING).count(), usize::from(!quiet), "{said}");
+    }
+}
+
 /// `kache init` exports `CARGO_TARGET_<HOST>_RUNNER`, which Cargo ranks
 /// above the project's own runner. The test still runs under that runner.
 #[test]

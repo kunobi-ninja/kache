@@ -118,6 +118,98 @@ a `passthrough` whose reason says `build-script cache bypassed` or
   directories.
 - Windows, where no launcher is installed.
 
+## Declared inputs in the Rust key
+
+A proc macro can read files and variables rustc never reports, and Cargo
+recompiles every unit of a package after an input its build script declared
+changes. For a workspace or path package, Kache folds the inputs the
+package's own build script declared into the key of each of its Rust units:
+libraries, binaries, tests, examples, benches and proc-macro crates. A macro
+that reaches a unit through a re-export, as Tauri's `generate_context!`
+reaches an app through `tauri`, is covered as well, because the inputs belong
+to the package rather than to the macro.
+
+Kache reads the stdout Cargo recorded for the run, by Cargo's rules,
+including the move to the current `OUT_DIR` when the target directory moved,
+and keys:
+
+- each `cargo:rerun-if-changed` path, resolved against the package directory
+  as Cargo resolves it. A file counts by its content, a directory by the names
+  and contents of everything in it, a symlink by its target and what it points
+  to, and a missing path as missing. A path through a file counts as missing
+  too, as in Cargo: in a git worktree `.git` is a file, so a declared
+  `.git/HEAD` is missing there. A path in the package or in `OUT_DIR` is named
+  by its place there, so another checkout or target directory gets the same
+  key. A path under the Cargo home's `registry` or `git` directory counts by
+  name only, since Cargo treats those as immutable;
+- each `cargo:rerun-if-env-changed` variable, by its exact value or as unset.
+  A variable Cargo itself sets on the rustc command, such as `OUT_DIR`,
+  `CARGO_MANIFEST_DIR` or `CARGO_PKG_VERSION`, counts by name only. A variable
+  whose name ends in `_OUT_DIR` counts by name only when it holds another
+  `OUT_DIR` of the package, as Cargo sets it for a package with several build
+  scripts; otherwise it counts by value like any other.
+
+A script that declares nothing, or prints an empty `cargo:rerun-if-changed=`,
+depends on its package, as in Cargo. Kache then keys the package's files other
+than Rust sources, which the compile reports itself when it reads them, and
+leaves out sub-packages. Every directory walk leaves out VCS metadata (`.git`,
+`.hg`, `.jj`, `.svn`), directories holding Cargo's `CACHEDIR.TAG`, the target
+directory, and Kache's own cache and runtime directories. It also leaves out
+what Cargo writes in its home: the downloads in `registry` and `git`, its
+`.global-cache` record and lock files, and what `cargo install` adds. A CI job
+may keep Kache's cache and Cargo's home inside the project, as GitLab requires
+for cached paths. The rest of Cargo's home counts, so with the home in the
+project's `.cargo`, `.cargo/config.toml` is still one of the root package's
+files.
+
+What rustc could not read either counts as such. rustc runs as the same user
+as Kache, so a file the user may not read, or a directory the user may
+neither list nor search (a Docker volume owned by another user, say), counts
+as unreadable, and changes inside it do not move the key. A symlink to a
+directory the walk is already inside, such as `self -> .`, counts as a cycle
+instead of being followed again.
+
+The inputs are read again after a compile. When anything Kache keyed changed
+while rustc ran, the result is not stored, and the event is `skipped` with the
+reason `build-script-inputs-changed`.
+
+A unit compiles without Kache and without a fallback wrapper when its declared
+paths hold more than 20,000 entries or cannot be read for another reason, such
+as a directory the user may search but not list. Its passthrough reason
+starts with `uncacheable|build-script inputs:`. A package whose script declares
+nothing, and that holds more than 20,000 entries or cannot be walked, is keyed
+without its files; with `KACHE_LOG=warn`, Kache says so once per session.
+Printing `cargo:rerun-if-changed` for `build.rs` and for each file the
+package's macros read keys such a package precisely.
+
+A unit whose script declares a path or a variable never goes to a configured
+[fallback wrapper](/docs/getting-started/comparison#use-sccache-as-a-fallback),
+which would key it without them. When Kache does not cache such a unit, rustc
+runs directly.
+
+Each unit pays for this on every compile Cargo asks for. Kache reads Cargo's
+record of the run and checks each declared file. A declared directory, or the
+package of a script that declares nothing, costs one stat per entry, plus a
+hash of each file the first time Kache sees the tree and after it changes.
+After a compile that missed, the check runs again. On an Apple M5 Pro, a
+package of 10,000 small files added about 45 ms to each unit's key on a warm
+cache and about 0.5 s on the first build in a checkout. A script that prints
+`cargo:rerun-if-changed` for `build.rs` and for the files its macros read
+avoids the package walk.
+
+This does not cover:
+
+- inputs another package's build script declares, such as a proc-macro
+  crate's own script, or a registry crate's variable that its re-exported
+  macro reads. Declare those with
+  [extra inputs](/docs/getting-started/configuration#hidden-compile-time-inputs)
+  or `cache.key_env_vars`;
+- reads no build script declares;
+- registry, Git and vendored packages. Their sources are versioned, and the
+  tool variables their scripts declare (`CC`, `CFLAGS`, `PKG_CONFIG_PATH`)
+  would split their keys between machines;
+- `rustdoc` output.
+
 ## Hermetic runs
 
 Set `KACHE_BUILD_SCRIPT_HERMETIC=1`, or `[cache] build_script_hermetic = true`

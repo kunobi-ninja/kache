@@ -1,6 +1,7 @@
 mod args;
 mod blob_heal;
 mod build_script;
+mod build_script_inputs;
 use kache_store::atomic;
 mod build_intent;
 mod cache_fs;
@@ -88,6 +89,7 @@ mod timeline;
 mod timeline_client;
 mod toolchain_dylib;
 mod transport;
+mod tree_stamp;
 mod tui;
 mod tui_sessions;
 mod unit_prune;

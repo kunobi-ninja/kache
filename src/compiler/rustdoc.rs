@@ -120,6 +120,7 @@ impl Compiler for RustdocCompiler {
         let output = spawn(parsed)?;
         Ok(super::CompileResult {
             exit_code: exit_code(&output.status),
+            signaled: output.status.code().is_none(),
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
             pending_stderr: None,
@@ -1487,6 +1488,7 @@ pub fn run(config: &crate::config::Config, args: &[String]) -> Result<i32> {
         key_salt: config.key_salt.as_deref(),
         key_env_vars: &config.key_env_vars,
         extra_inputs_digest: None,
+        build_script_inputs_digest: None,
     };
     let cache_key = match RustdocCompiler.cache_key(&parsed, &ctx) {
         Ok(key) => key,

@@ -110,8 +110,20 @@ impl RustcCompiler {
         ctx: &KeyCtx<'_, '_>,
         env: &KeyEnv,
     ) -> (Result<String>, KeyOutputs) {
-        let (key, outputs) =
+        let (key, mut outputs) =
             compute_cache_key_with_outputs(parsed, ctx.file_hasher, ctx.path_normalizer, env);
+        // The group `kache explain` names when only declared inputs moved.
+        if let (Some(fields), Some(digest)) =
+            (outputs.fields.as_mut(), ctx.build_script_inputs_digest)
+        {
+            fields.insert(
+                "build_script_inputs".to_string(),
+                digest
+                    .get(..crate::cache_key::KEY_FIELD_HEX)
+                    .unwrap_or(digest)
+                    .to_string(),
+            );
+        }
         (key.map(|key| finish_key(parsed, ctx, key)), outputs)
     }
 
@@ -299,11 +311,16 @@ impl Compiler for RustcCompiler {
     }
 }
 
-/// Fold the configured extra inputs, key env vars and salt into `key`.
+/// Fold the configured extra inputs, the build script's declared inputs, key
+/// env vars and salt into `key`.
 fn finish_key(parsed: &RustcArgs, ctx: &KeyCtx<'_, '_>, key: String) -> String {
     let crate_name = parsed.crate_name.as_deref().unwrap_or("unknown");
     let key = match ctx.extra_inputs_digest {
         Some(digest) => crate::cache_key::fold_labeled(key, "extra_inputs", digest),
+        None => key,
+    };
+    let key = match ctx.build_script_inputs_digest {
+        Some(digest) => crate::cache_key::fold_labeled(key, "build_script_inputs", digest),
         None => key,
     };
     let key = crate::cache_key::apply_key_env_vars(key, ctx.key_env_vars, crate_name);
@@ -1618,6 +1635,7 @@ mod tests {
             key_salt: None,
             key_env_vars: &[],
             extra_inputs_digest: None,
+            build_script_inputs_digest: None,
         };
         let compiler = RustcCompiler::new();
         let env = KeyEnv::capture();
@@ -1634,5 +1652,109 @@ mod tests {
             compiler.cache_key_in(&parsed, &salted, &env).0.unwrap(),
             plain
         );
+    }
+
+    /// The declared inputs fold after the extra inputs under their own
+    /// label, and a unit without them keeps its key byte for byte.
+    #[test]
+    fn finish_key_folds_build_script_inputs_under_their_own_label() {
+        let parsed = RustcArgs::parse(&s(&["rustc", "--crate-name", "k", "lib.rs"])).unwrap();
+        let file_hasher = crate::cache_key::FileHasher::new();
+        let path_normalizer = crate::path_normalizer::PathNormalizer::empty();
+        let base = KeyCtx {
+            file_hasher: &file_hasher,
+            path_normalizer: &path_normalizer,
+            cache_dir: std::path::Path::new("/cache"),
+            key_salt: None,
+            key_env_vars: &[],
+            extra_inputs_digest: None,
+            build_script_inputs_digest: None,
+        };
+        let key = "0".repeat(64);
+        assert_eq!(finish_key(&parsed, &base, key.clone()), key);
+        let declared = KeyCtx {
+            build_script_inputs_digest: Some("d1"),
+            ..base
+        };
+        let folded = finish_key(&parsed, &declared, key.clone());
+        assert_eq!(
+            folded,
+            crate::cache_key::fold_labeled(key.clone(), "build_script_inputs", "d1")
+        );
+        let extra = KeyCtx {
+            extra_inputs_digest: Some("d1"),
+            ..base
+        };
+        assert_ne!(folded, finish_key(&parsed, &extra, key.clone()));
+        let both = KeyCtx {
+            extra_inputs_digest: Some("e1"),
+            build_script_inputs_digest: Some("d1"),
+            ..base
+        };
+        assert_eq!(
+            finish_key(&parsed, &both, key.clone()),
+            crate::cache_key::fold_labeled(
+                crate::cache_key::fold_labeled(key, "extra_inputs", "e1"),
+                "build_script_inputs",
+                "d1"
+            )
+        );
+    }
+
+    /// `kache explain` sees the declared inputs as their own key group.
+    #[test]
+    fn the_declared_inputs_are_a_key_group() {
+        let _lock = crate::test_support::process_state_test_lock();
+        if std::process::Command::new("rustc")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        std::fs::write(&source, "pub fn f() {}\n").unwrap();
+        let parsed = RustcArgs::parse(&s(&[
+            "rustc",
+            "--crate-name",
+            "k",
+            source.to_str().unwrap(),
+            "--emit=dep-info,metadata",
+        ]))
+        .unwrap();
+        let file_hasher = crate::cache_key::FileHasher::new();
+        let path_normalizer = crate::path_normalizer::PathNormalizer::empty();
+        let ctx = KeyCtx {
+            file_hasher: &file_hasher,
+            path_normalizer: &path_normalizer,
+            cache_dir: dir.path(),
+            key_salt: None,
+            key_env_vars: &[],
+            extra_inputs_digest: None,
+            build_script_inputs_digest: None,
+        };
+        let env = KeyEnv::capture();
+        let compiler = RustcCompiler::new();
+        let (plain, outputs) = compiler.cache_key_in(&parsed, &ctx, &env);
+        let fields = outputs.fields.expect("the whole key was hashed");
+        assert!(!fields.contains_key("build_script_inputs"));
+        let digest = "0123456789abcdef0123456789abcdef";
+        let declared = KeyCtx {
+            build_script_inputs_digest: Some(digest),
+            ..ctx
+        };
+        let (key, outputs) = compiler.cache_key_in(&parsed, &declared, &env);
+        let declared_fields = outputs.fields.expect("the whole key was hashed");
+        assert_eq!(
+            declared_fields
+                .get("build_script_inputs")
+                .map(String::as_str),
+            Some("0123456789abcdef")
+        );
+        assert_ne!(key.unwrap(), plain.unwrap());
+        let mut others = declared_fields.clone();
+        others.remove("build_script_inputs");
+        assert_eq!(others, fields, "no other group moves");
     }
 }

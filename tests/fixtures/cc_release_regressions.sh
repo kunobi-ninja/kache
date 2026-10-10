@@ -22,6 +22,10 @@ cd "$repro_root"
 
 fail() { printf 'FAIL #%s: %s\n' "$issue" "$*" >&2; exit 1; }
 hit() { grep -q 'cc local cache hit' "$1" || fail "expected cache hit in $1"; }
+# Kache does not store a compile that starts within one stamp window of a
+# write to its inputs: 1 ms on Linux, macOS and Windows, 20 ms elsewhere, and about
+# two seconds where stamps keep whole seconds.
+settle() { sleep 2.1; }
 
 case "$issue" in
 1459)
@@ -35,6 +39,7 @@ app: a.o main.c
 	$(CC_BIN) main.c a.o -o app
 MAKEFILE
   build() { make KACHE_BIN="$kache_binary" CC_BIN="$cc_binary" "$@"; }
+  settle
   build > initial.log 2>&1
   test "$(./app)" = 1 || fail 'initial binary returned the wrong value'
   sleep 1
@@ -57,6 +62,7 @@ MAKEFILE
 gen.o: gen.c
 -include gen.o.pp
 MAKEFILE
+    settle
     (
       cd "$tree/obj/sub"
       KACHE_BASE_DIR="$repro_root/$tree" "$kache_binary" "$cc_binary" \
@@ -82,6 +88,7 @@ MAKEFILE
   ;;
 1461)
   printf 'int f(void) { return 1; }\n' > a.c
+  settle
   "$kache_binary" "$cc_binary" -c a.c -o plain.o > plain.log 2>&1
   "$kache_binary" "$cc_binary" -fcolor-diagnostics -c a.c -o colored.o > colored.log 2>&1
   cmp plain.o colored.o || fail 'diagnostic formatting changed object bytes'
@@ -93,6 +100,7 @@ MAKEFILE
   if "$cc_binary" --print-targets | grep -q wasm32; then
     compile+=(--target=wasm32-wasip1)
   fi
+  settle
   "${compile[@]}" -c a.c -o a.wasm > first.log 2>&1
   cp a.wasm expected.wasm
   rm a.wasm

@@ -106,6 +106,90 @@ fn cargo_shim_holds_target_lease_for_whole_test() {
 }
 
 #[test]
+fn cargo_shim_says_it_waits_for_target_cleanup_unless_quiet() {
+    const WAITING: &str = "kache: waiting for target cleanup to finish\n";
+    for quiet in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        let cache = dir.path().join("cache");
+        let shims = dir.path().join("shims");
+        let real = dir.path().join("real");
+        let started = dir.path().join("started");
+        let stdout = dir.path().join("stdout");
+        let stderr = dir.path().join("stderr");
+        for path in [&project, &cache, &shims, &real] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        std::fs::write(project.join("Cargo.toml"), "[workspace]\n").unwrap();
+        std::os::unix::fs::symlink(KACHE_BIN, shims.join("cargo")).unwrap();
+        kache_fs::testutil::write_executable(&real.join("cargo"), "#!/bin/sh\n: > \"$STARTED\"\n");
+        // Held the way `kache clean` and the daemon hold it while they delete.
+        let cleanup = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(cache.join("target-use.lock"))
+            .unwrap();
+        cleanup.lock().unwrap();
+
+        let base_path = std::env::var_os("PATH").unwrap();
+        let path = std::env::join_paths(
+            [shims.clone(), real.clone()]
+                .into_iter()
+                .chain(std::env::split_paths(&base_path)),
+        )
+        .unwrap();
+        let mut command = hermetic_command(shims.join("cargo"), &cache, None);
+        command
+            .arg("build")
+            .args(quiet.then_some("-q"))
+            .current_dir(&project)
+            .env("PATH", path)
+            .env("STARTED", &started)
+            .env("KACHE_LOG", "off")
+            .env_remove("KACHE_REAL_CARGO")
+            .stdout(std::fs::File::create(&stdout).unwrap())
+            .stderr(std::fs::File::create(&stderr).unwrap());
+        for (name, _) in std::env::vars_os() {
+            let name_text = name.to_string_lossy();
+            if name_text.starts_with("KACHE_S3_") || name_text.starts_with("AWS_") {
+                command.env_remove(&name);
+            }
+        }
+        let mut child = command.spawn().unwrap();
+        if quiet {
+            std::thread::sleep(Duration::from_millis(500));
+        } else {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while !std::fs::read_to_string(&stderr).unwrap().contains(WAITING) {
+                assert!(
+                    child.try_wait().unwrap().is_none(),
+                    "the shim exited without waiting"
+                );
+                assert!(Instant::now() < deadline, "the shim never said it waits");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        assert!(
+            !started.exists(),
+            "quiet={quiet}: Cargo started while cleanup held the lock"
+        );
+
+        cleanup.unlock().unwrap();
+        assert!(child.wait().unwrap().success(), "quiet={quiet}");
+        assert!(started.exists(), "quiet={quiet}: Cargo never started");
+        let said = std::fs::read_to_string(&stderr).unwrap();
+        assert_eq!(said.matches(WAITING).count(), usize::from(!quiet), "{said}");
+        assert_eq!(
+            std::fs::read_to_string(&stdout).unwrap(),
+            "",
+            "quiet={quiet}"
+        );
+    }
+}
+
+#[test]
 fn canonical_cargo_home_alias_keeps_existing_cargo_unit_fresh() {
     let dir = tempfile::tempdir().unwrap();
     let home = dir.path().join("home");

@@ -143,7 +143,7 @@ fn run_fake_compiler(
         .env("ARGV_DUMP", &argv_dump)
         .env("INCREMENTAL_ENV_DUMP", &env_dump)
         .env("CARGO_INCREMENTAL", "1")
-        .env("CARGO_PRIMARY_PACKAGE", "1")
+        .env_remove("CARGO_PRIMARY_PACKAGE")
         .env("KACHE_CACHE_DIR", dir.path().join("cache"))
         .env("KACHE_CONFIG", dir.path().join("missing-config.toml"))
         .env("KACHE_LOG", "kache=debug");

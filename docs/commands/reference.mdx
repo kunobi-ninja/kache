@@ -60,6 +60,8 @@ Pass Cargo arguments after `--`. Kache runs Cargo and holds the lock that keeps 
 
 Other commands, such as `test`, run without these changes.
 
+If `kache clean` or the daemon's target cleanup holds that lock when Cargo starts, Kache prints `kache: waiting for target cleanup (pid 4242) to finish` on stderr and starts Cargo once the cleanup releases the lock. Cargo's `-q` or `--quiet` hides the line. A test run through `kache test-runner` waits the same way.
+
 ## `kache list`
 
 ```bash
@@ -194,7 +196,7 @@ kache doctor --repair
 
 Doctor also reports, for information, how many misses in the latest build differ from the same crates built in another checkout ("Other checkouts"); `kache explain` says what to set. It reports where the running binary is installed ("Install path"), whether the C/C++ shims are active, broken, not first on `PATH` or not installed, and whether the login service runs a binary that no longer exists, is not executable, or is a different file from the running Kache. Run `kache daemon install` to fix the last one.
 
-With a remote configured, `kache doctor` also asks it for an object that is never written. A miss passes: the store answered and accepted the credentials. A failure names the likely cause when the store says, such as expired credentials, a secret key that does not match, a clock too far from the store's, the bucket's real region, or a bucket that does not exist. An S3 endpoint that uses plain `http://` to another machine fails its own check.
+With a remote configured, `kache doctor` also asks it for an object that is never written. A miss passes: the store answered and accepted the credentials. A failure names the likely cause when the store says, such as expired credentials, a secret key that does not match, a clock too far from the store's, the bucket's real region, or a bucket that does not exist. An S3 endpoint that uses plain `http://` to another machine fails its own check. For S3, a pass names where the credentials came from, and a selected AWS profile that cannot supply credentials fails the check with the profile and the cause.
 
 ## `kache sync`
 

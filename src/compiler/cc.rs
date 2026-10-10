@@ -4839,9 +4839,45 @@ fn cc_memo_env_is_keyed(name: &OsStr) -> bool {
     CC_MEMO_KEYED_ENV.contains(&name) || cc_memo_env_pattern_is_keyed(name)
 }
 
+/// The schema line of every C/C++ compile key ([`CcCompiler::cache_key_with`]).
+///
+/// 2: older entries can retain donor paths outside the source/object root.
+/// 3: older entries can hold an object built from other bytes than their
+///    key names: keyed from a memo stamp or a mapped hash taken from a racy
+///    read, or from an input saved before a key-first compile read it.
+const CC_ARTIFACT_SCHEMA: &[u8] = b"cc_artifact_schema:3\n";
+
+/// The schema of [`cc_preprocess_memo_key`].
+///
+/// v4: the probe now runs with the compile's prefix maps, and path-bound
+/// expansions are never recorded. A v3 record may hold the mapped hash of
+/// one of those, which would give another checkout its key (#1004).
+/// v5: TUs whose expansion `.incbin`s or `.include`s a file are refused. A
+/// v4 record of one would skip the probe that refuses it (#1015).
+/// v6: inputs, mapped hashes and assembler verdicts follow the settle and
+/// single-read rules. A release that records v5 memos rewrites a memo row
+/// in place when it records the same key again, and nothing in the row says
+/// which release wrote it, so the two never share a key.
+const CC_PREPROCESS_MEMO_SCHEMA: &[u8] = b"cc-preprocess-memo-v6";
+
 /// Local identity for a preprocessor invocation. The environment is included
 /// as selected by [`cc_memo_env_is_keyed`].
 fn cc_preprocess_memo_key(
+    parsed: &CcArgs,
+    prefix_maps: &[CcPrefixMap],
+    compiler_version: &str,
+) -> Option<String> {
+    cc_preprocess_memo_key_as(
+        CC_PREPROCESS_MEMO_SCHEMA,
+        parsed,
+        prefix_maps,
+        compiler_version,
+    )
+}
+
+/// [`cc_preprocess_memo_key`] under `schema`.
+fn cc_preprocess_memo_key_as(
+    schema: &[u8],
     parsed: &CcArgs,
     prefix_maps: &[CcPrefixMap],
     compiler_version: &str,
@@ -4851,12 +4887,7 @@ fn cc_preprocess_memo_key(
     let compiler_path = super::resolve_program_on_path(&parsed.program)?;
     let compiler_metadata = std::fs::metadata(&compiler_path).ok()?;
     let mut hasher = blake3::Hasher::new();
-    // v4: the probe now runs with the compile's prefix maps, and path-bound
-    // expansions are never recorded. A v3 record may hold the mapped hash of
-    // one of those, which would give another checkout its key (#1004).
-    // v5: TUs whose expansion `.incbin`s or `.include`s a file are refused. A
-    // v4 record of one would skip the probe that refuses it (#1015).
-    fold_cc_memo_field(&mut hasher, b"schema", b"cc-preprocess-memo-v5");
+    fold_cc_memo_field(&mut hasher, b"schema", schema);
     fold_cc_memo_field(
         &mut hasher,
         b"compiler-program",
@@ -5190,14 +5221,6 @@ fn cc_mapped_path(path: &Path, prefix_maps: &[CcPrefixMap]) -> String {
     String::from_utf8_lossy(&apply_cc_prefix_maps_to_bytes(text, prefix_maps)).into_owned()
 }
 
-/// blake3 of a file's contents with the prefix maps applied.
-///
-/// The expansion is hashed this way, so an input has to be compared this way
-/// too. A `-sys` crate's generated config header names its own build
-/// directory: the raw bytes differ between two checkouts, the mapped bytes do
-/// not, and the expansion each produces is identical. Comparing raw bytes
-/// alone therefore made the memo stricter than the key it feeds. `None` when
-/// the file cannot be read, which the caller treats as "cannot reuse".
 /// Identity of a map set for the mapped-hash memo: every `from => to` pair,
 /// ordered by source. Two invocations with the same pairs rewrite bytes the
 /// same way, whatever order the pairs were derived in.
@@ -5220,10 +5243,27 @@ fn cc_prefix_maps_key(prefix_maps: &[CcPrefixMap]) -> String {
     hasher.finalize().to_hex().to_string()
 }
 
-fn cc_mapped_content_hash(path: &Path, prefix_maps: &[CcPrefixMap]) -> Option<String> {
+/// blake3 of a file's contents with the prefix maps applied, and of the
+/// contents as read, from one read.
+///
+/// The expansion is hashed this way, so an input has to be compared this way
+/// too. A `-sys` crate's generated config header names its own build
+/// directory: the raw bytes differ between two checkouts, the mapped bytes do
+/// not, and the expansion each produces is identical. Comparing raw bytes
+/// alone therefore made the memo stricter than the key it feeds. The raw hash
+/// tells the caller which bytes the mapped one is of. `None` when the file
+/// cannot be read, which the caller treats as "cannot reuse".
+fn cc_mapped_content_hash(
+    path: &Path,
+    prefix_maps: &[CcPrefixMap],
+) -> Option<crate::cache_key::CcContentHashes> {
     let bytes = std::fs::read(path).ok()?;
+    let raw = blake3::hash(&bytes).to_hex().to_string();
     let mapped = apply_cc_prefix_maps_to_bytes(bytes, prefix_maps);
-    Some(blake3::hash(&mapped).to_hex().to_string())
+    Some(crate::cache_key::CcContentHashes {
+        raw,
+        mapped: blake3::hash(&mapped).to_hex().to_string(),
+    })
 }
 
 /// Candidate real paths a mapped spelling could name in this invocation.
@@ -6462,10 +6502,19 @@ impl CcCompiler {
     /// to revalidate. Only meaningful when the memo came from a capture:
     /// an expansion's inputs predate the compile and stay on the
     /// revalidating [`Self::commit_preprocess_memo`] path.
+    ///
+    /// Only a memo whose every stamp had settled when observed travels. A
+    /// daemon from an older release records whatever stamp it is given; the
+    /// wrapper's own store records an unsettled input by content alone.
     pub(crate) fn captured_preprocess_memo(&self) -> Option<crate::daemon_publish::CcMemoHandoff> {
         let pending = self.pending_preprocess_memo.borrow();
         let pending = pending.as_ref()?;
-        if !pending.captured {
+        if !pending.captured
+            || !pending
+                .fingerprints
+                .iter()
+                .all(crate::cache_key::CcPreprocessMemoInput::stamp_settled)
+        {
             return None;
         }
         Some(crate::daemon_publish::CcMemoHandoff {
@@ -6807,6 +6856,17 @@ impl CcCompiler {
         ctx: &KeyCtx<'_, '_>,
         discovery: CcKeyDiscovery,
     ) -> Result<CcKeyOutcome> {
+        self.cache_key_under(CC_ARTIFACT_SCHEMA, parsed, ctx, discovery)
+    }
+
+    /// [`Self::cache_key_with`], with the compile key under `artifact_schema`.
+    fn cache_key_under(
+        &self,
+        artifact_schema: &[u8],
+        parsed: &CcArgs,
+        ctx: &KeyCtx<'_, '_>,
+        discovery: CcKeyDiscovery,
+    ) -> Result<CcKeyOutcome> {
         if parsed.mode == CompileMode::Link {
             return self.cache_key_for_link(parsed, ctx).map(CcKeyOutcome::Key);
         }
@@ -6834,8 +6894,7 @@ impl CcCompiler {
         hasher.update(b"cc_key_version:");
         hasher.update(crate::cache_key::CACHE_KEY_VERSION.to_string().as_bytes());
         hasher.update(b"\n");
-        // Older entries can retain donor paths outside the source/object root.
-        hasher.update(b"cc_artifact_schema:2\n");
+        hasher.update(artifact_schema);
         tracing::trace!(
             target: "kache::cache_key",
             "[key:{}] cc_key_version={}",
@@ -7502,12 +7561,20 @@ impl CcCompiler {
         )?;
         // After the fingerprints: the scan is memoised by the content hash
         // they carry, so a header shared by every unit is read once.
-        if let Some(construct) = file_hasher.cc_inputs_hide_assembler_input(&inputs, &|path| {
+        if let Some(found) = file_hasher.cc_inputs_hide_assembler_input(&inputs, &|path| {
             let bytes = fs::read(path).ok()?;
-            Some(cc_raw_assembler_hidden_input(&bytes))
+            Some((
+                blake3::hash(&bytes).to_hex().to_string(),
+                cc_raw_assembler_hidden_input(&bytes),
+            ))
         }) {
+            let why = if found == crate::cache_key::CC_INPUT_CHANGED_WHILE_SCANNED {
+                found
+            } else {
+                format!("the assembler may read a file the key cannot see (`{found}`)")
+            };
             tracing::debug!(
-                "cc: {} not keyed from its read set: the assembler may read a file the key cannot see (`{construct}`)",
+                "cc: {} not keyed from its read set: {why}",
                 cc_trace_name(parsed)
             );
             return None;
@@ -7607,6 +7674,7 @@ impl CcCompiler {
         Ok((
             CompileResult {
                 exit_code,
+                signaled: output.status.code().is_none(),
                 stdout: String::from_utf8_lossy(&output.stdout).to_string(),
                 stderr: String::from_utf8_lossy(&output.stderr).to_string(),
                 pending_stderr: None,

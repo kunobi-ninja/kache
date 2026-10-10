@@ -66,12 +66,9 @@ mk_add_options "export RUSTC_WRAPPER={kache}"
 # than a silent wrong-artifact restore.
 mk_add_options "export KACHE_CACHE_EXECUTABLES=1"
 
-# Incremental compilation is redundant once a compile cache is in
-# play — kache treats it so (it cleans incremental dirs) and
-# Firefox itself disables it for sccache/buildcache. Off here keeps
-# the objdir lean and removes a measurement-noise source. (Not a
-# correctness fix: kache already excludes -Cincremental from the
-# cache key.)
+# Every phase builds from scratch, so incremental state would only add
+# disk writes and measurement noise. With it off, Cargo passes no
+# -C incremental and no unit takes Kache's adaptive incremental lanes.
 mk_add_options "export CARGO_INCREMENTAL=0"
 
 # Per-clone objdir so the two builds never collide.

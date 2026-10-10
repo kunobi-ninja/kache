@@ -13,6 +13,9 @@
 use std::fs;
 use std::process::Command;
 
+#[allow(dead_code)]
+mod common;
+
 fn kache_binary() -> &'static str {
     env!("CARGO_BIN_EXE_kache")
 }
@@ -187,6 +190,7 @@ fn deferred_cc_reuses_setup_and_still_invalidates_changed_headers() {
 }
 
 fn cacheable_cc_command(root: &std::path::Path) -> Command {
+    common::settle_writes(&[root]);
     let mut command = Command::new(kache_binary());
     command
         .current_dir(root)
@@ -315,6 +319,207 @@ exit "$status"
             .unwrap();
         assert_eq!(count, 0, "a changed input must not populate {table}");
     }
+}
+
+/// A key taken before the compile hashed `value.h`, and the header was
+/// saved before the compiler read it. The object holds the new value under
+/// the old header's key, so neither the entry nor the memo may be stored.
+#[test]
+fn key_first_cc_does_not_store_an_input_changed_before_the_compile_read_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    fs::write(root.join("kache.toml"), "").unwrap();
+    fs::write(
+        root.join("unit.c"),
+        "#include \"value.h\"\nint value(void) { return VALUE; }\n",
+    )
+    .unwrap();
+    fs::write(root.join("value.h"), "#define VALUE 42\n").unwrap();
+    fs::write(
+        root.join("main.c"),
+        "int value(void); int main(void) { return value(); }\n",
+    )
+    .unwrap();
+    let compiler = root.join("cc");
+    kache_fs::testutil::write_executable(
+        &compiler,
+        r#"#!/bin/sh
+for argument in "$@"; do
+    case "$argument" in -###|--version|-E) exec cc "$@" ;; esac
+done
+case " $* " in *" unit.c "*) printf '#define VALUE 17\n' > value.h ;; esac
+exec cc "$@"
+"#,
+    );
+    let output = cacheable_cc_command(&root)
+        .arg(&compiler)
+        .args(["-c", "unit.c", "-o", "unit.o"])
+        .env("KACHE_DEFERRED_DISCOVERY", "0")
+        .env("KACHE_LOG", "kache=debug")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(last_cc_event(&root)["preprocessor_runs"], 1, "keyed first");
+    assert!(
+        Command::new("cc")
+            .args(["main.c", "unit.o", "-o", "check-value"])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert_eq!(
+        Command::new(root.join("check-value"))
+            .status()
+            .unwrap()
+            .code(),
+        Some(17),
+        "the compile read the saved header"
+    );
+    let db = rusqlite::Connection::open(root.join("cache/index.db")).unwrap();
+    for table in ["entries", "cc_preprocess_memos"] {
+        let count: i64 = db
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0, "a changed input must not populate {table}");
+    }
+}
+
+/// A key taken before the compile hashes the files the preprocessor
+/// reported. A header saved between that read and the key's own changes
+/// which files the compile reads, while every file the key hashed stays as
+/// the key saw it. Only the header's stamp, from after the build started,
+/// shows the save. Stored, the object would come back after an edit to the
+/// header it now includes.
+#[test]
+fn key_first_cc_does_not_store_a_header_saved_while_it_was_keyed() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    fs::write(root.join("kache.toml"), "").unwrap();
+    fs::write(
+        root.join("unit.c"),
+        "#include \"value.h\"\nint value(void) { return VALUE; }\n",
+    )
+    .unwrap();
+    fs::write(root.join("value.h"), "#include \"a.h\"\n").unwrap();
+    fs::write(root.join("a.h"), "#define VALUE 1\n").unwrap();
+    fs::write(root.join("b.h"), "#define VALUE 2\n").unwrap();
+    fs::write(
+        root.join("main.c"),
+        "int value(void); int main(void) { return value(); }\n",
+    )
+    .unwrap();
+    let compiler = root.join("cc");
+    kache_fs::testutil::write_executable(
+        &compiler,
+        r#"#!/bin/sh
+for argument in "$@"; do
+    case "$argument" in
+        -###|--version) exec cc "$@" ;;
+        -E) cc "$@"; status=$?; printf '#include "b.h"\n' > value.h; exit "$status" ;;
+    esac
+done
+exec cc "$@"
+"#,
+    );
+
+    for (phase, expected) in [("saved while keyed", 2), ("included header edited", 3)] {
+        if expected == 3 {
+            fs::write(root.join("b.h"), "#define VALUE 3\n").unwrap();
+        }
+        let _ = fs::remove_file(root.join("unit.o"));
+        let output = cacheable_cc_command(&root)
+            .arg(&compiler)
+            .args(["-c", "unit.c", "-o", "unit.o"])
+            .env("KACHE_DEFERRED_DISCOVERY", "0")
+            .env("KACHE_LOG", "kache=debug")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{phase}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            last_cc_event(&root)["preprocessor_runs"],
+            1,
+            "{phase}: keyed first"
+        );
+        assert!(
+            Command::new("cc")
+                .args(["main.c", "unit.o", "-o", "check-value"])
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert_eq!(
+            Command::new(root.join("check-value"))
+                .status()
+                .unwrap()
+                .code(),
+            Some(expected),
+            "{phase}"
+        );
+        for table in ["entries", "cc_preprocess_memos"] {
+            assert_eq!(index_rows(&root, table), 0, "{phase}: {table}");
+        }
+    }
+}
+
+/// A header stamped an hour ahead, as a skewed file server or a
+/// future-dated checkout leaves it, was not written during the build. A
+/// key taken before the compile stores the result, and the next run hits.
+#[test]
+fn key_first_cc_caches_a_header_stamped_ahead_of_the_clock() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    fs::write(root.join("kache.toml"), "").unwrap();
+    fs::write(
+        root.join("unit.c"),
+        "#include \"value.h\"\nint value(void) { return VALUE; }\n",
+    )
+    .unwrap();
+    fs::write(root.join("value.h"), "#define VALUE 42\n").unwrap();
+    let ahead = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+    filetime::set_file_mtime(
+        root.join("value.h"),
+        filetime::FileTime::from_system_time(ahead),
+    )
+    .unwrap();
+
+    for expected in ["miss", "local_hit"] {
+        let _ = fs::remove_file(root.join("unit.o"));
+        let output = cacheable_cc_command(&root)
+            .args(["cc", "-c", "unit.c", "-o", "unit.o"])
+            .env("KACHE_DEFERRED_DISCOVERY", "0")
+            .env("KACHE_LOG", "kache=debug")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{expected}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(root.join("unit.o").is_file(), "{expected}");
+        let event = last_cc_event(&root);
+        assert_eq!(event["result"], expected, "{event}");
+    }
+}
+
+fn index_rows(root: &std::path::Path, table: &str) -> i64 {
+    rusqlite::Connection::open(root.join("cache/index.db"))
+        .unwrap()
+        .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+            row.get(0)
+        })
+        .unwrap()
 }
 
 fn last_cc_event(root: &std::path::Path) -> serde_json::Value {

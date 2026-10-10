@@ -74,6 +74,42 @@ fn a_predicted_key_owes_a_rederivation_until_it_has_had_one() {
     assert!(!owes_rederivation(false, true));
 }
 
+/// Once both lookups missed and no incremental lane took the miss, a key
+/// taken before the compile is kept only where the compile cannot run first:
+/// a guess on a linking unit, which is re-derived through the pre-pass, and
+/// the discovered key of a unit that never keyed first for a lane.
+#[test]
+fn a_miss_no_lane_took_compiles_before_its_key_unless_that_key_must_stay() {
+    // (deferral allowed, stop on hit allowed, owes a re-derivation, keyed first)
+    let cases = [
+        // A guess re-derives from the running compile, which can stop.
+        ((true, true, true, false), Some(true)),
+        ((true, true, true, true), Some(true)),
+        // A linking compile cannot stop, so a guess takes the pre-pass first.
+        ((true, false, true, false), None),
+        ((true, false, true, true), None),
+        // The lane a unit keyed first for declined: compile first, linking
+        // or not.
+        ((true, true, false, true), Some(true)),
+        ((true, false, false, true), Some(false)),
+        // Any other discovered key is the one the compile runs under.
+        ((true, true, false, false), None),
+        ((true, false, false, false), None),
+    ];
+    for ((deferral, stop, owes, keyed_first), expected) in cases {
+        assert_eq!(
+            compile_before_key_after_miss(deferral, stop, owes, keyed_first),
+            expected,
+            "deferral {deferral}, stop on hit {stop}, owes {owes}, keyed first {keyed_first}"
+        );
+        assert_eq!(
+            compile_before_key_after_miss(false, stop, owes, keyed_first),
+            None,
+            "nothing compiles before its key where deferral is off"
+        );
+    }
+}
+
 #[test]
 fn only_a_fresh_closure_is_worth_recording() {
     assert!(
@@ -201,7 +237,7 @@ fn a_registry_unit_reading_its_out_dir_records_a_relocated_row() {
 
     let key = |dep_info, tree: &str| crate::cache_key::KeyOutputs {
         dep_info: Some(dep_info),
-        tree_digest: Some(tree.to_string()),
+        tree_guard: Some(crate::cache_key::TreeGuard::stamping(tree, &out)),
         ..Default::default()
     };
     record_input_prediction(
@@ -231,6 +267,147 @@ fn a_registry_unit_reading_its_out_dir_records_a_relocated_row() {
         hasher.input_prediction(&shared).unwrap().sources,
         package_only.source_files
     );
+}
+
+/// A workspace unit's rows in this checkout, the local one and the shared
+/// one, carry the workspace guard only while it covers the closure: a macro
+/// could list the directory of a file the guard does not see.
+#[test]
+fn a_workspace_units_rows_carry_the_guard_only_while_it_covers_the_closure() {
+    if std::process::Command::new("rustc")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("skipped: no rustc");
+        return;
+    }
+    let mut lock = crate::test_support::process_state_test_lock();
+    let base = lock.enter();
+    let mut config = test_config(base.join("cache"));
+    config.input_predictions = true;
+    let store = Store::open(&config).unwrap();
+    let root = base.join("w");
+    std::fs::create_dir_all(root.join("kt/src")).unwrap();
+    std::fs::create_dir_all(root.join("target/debug/deps")).unwrap();
+    std::fs::write(root.join("Cargo.toml"), "[workspace]\n").unwrap();
+    std::fs::write(root.join("kt/src/lib.rs"), "").unwrap();
+    std::fs::write(base.join("outside.txt"), "").unwrap();
+    std::env::set_current_dir(&root).unwrap();
+    let manifest_dir = root.join("kt");
+    let _manifest = crate::config::tests::set_env_for_test(
+        "CARGO_MANIFEST_DIR",
+        Some(manifest_dir.as_os_str()),
+    );
+    let _out = crate::config::tests::set_env_for_test("OUT_DIR", None);
+    let deps = root.join("target/debug/deps");
+    let args = rustc_args(&[
+        "rustc",
+        "--crate-name",
+        "kt",
+        "kt/src/lib.rs",
+        "--out-dir",
+        deps.to_str().unwrap(),
+    ]);
+    let local = crate::cache_key::rustc_prediction_identity(&args).unwrap();
+    let shared = crate::cache_key::rustc_shared_prediction_identity(&args).unwrap();
+    let key = |sources: Vec<PathBuf>| crate::cache_key::KeyOutputs {
+        dep_info: Some(crate::cache_key::DepInfo {
+            source_files: sources,
+            env_deps: Vec::new(),
+        }),
+        tree_guard: Some(crate::cache_key::TreeGuard::stamping("tree", &root)),
+        ..Default::default()
+    };
+    let trees = || {
+        let hasher = store.file_hasher();
+        let tree = |identity: &str| hasher.input_prediction(identity).unwrap().tree;
+        (tree(&local), tree(&shared))
+    };
+    let lib = PathBuf::from("kt/src/lib.rs");
+    record_input_prediction(&config, Some(&store), &args, true, &key(vec![lib.clone()]));
+    let guarded = Some("tree".to_string());
+    assert_eq!(trees(), (guarded.clone(), guarded));
+    record_input_prediction(
+        &config,
+        Some(&store),
+        &args,
+        true,
+        &key(vec![lib, base.join("outside.txt")]),
+    );
+    assert_eq!(trees(), (None, None), "a file outside the workspace");
+}
+
+/// A guard is recorded only while the trees it read have not moved since it
+/// was taken: rustc reports what it saw later, and a listed file removed in
+/// between would be missing from the closure while the digest matches again
+/// once the file is back.
+#[test]
+fn a_record_keeps_no_guard_once_its_tree_moved() {
+    if std::process::Command::new("rustc")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("skipped: no rustc");
+        return;
+    }
+    let mut lock = crate::test_support::process_state_test_lock();
+    let base = lock.enter();
+    let mut config = test_config(base.join("cache"));
+    config.input_predictions = true;
+    let store = Store::open(&config).unwrap();
+    let root = base.join("w");
+    std::fs::create_dir_all(root.join("kt/src")).unwrap();
+    std::fs::create_dir_all(root.join("target/debug/deps")).unwrap();
+    std::fs::write(root.join("Cargo.toml"), "[workspace]\n").unwrap();
+    std::fs::write(root.join("kt/src/lib.rs"), "").unwrap();
+    std::fs::write(root.join("kt/a.txt"), "a").unwrap();
+    std::env::set_current_dir(&root).unwrap();
+    let manifest_dir = root.join("kt");
+    let _manifest = crate::config::tests::set_env_for_test(
+        "CARGO_MANIFEST_DIR",
+        Some(manifest_dir.as_os_str()),
+    );
+    let _out = crate::config::tests::set_env_for_test("OUT_DIR", None);
+    let deps = root.join("target/debug/deps");
+    let args = rustc_args(&[
+        "rustc",
+        "--crate-name",
+        "kt",
+        "kt/src/lib.rs",
+        "--out-dir",
+        deps.to_str().unwrap(),
+    ]);
+    let dep_info = crate::cache_key::DepInfo {
+        source_files: vec![PathBuf::from("kt/src/lib.rs")],
+        env_deps: Vec::new(),
+    };
+    let local = crate::cache_key::rustc_prediction_identity(&args).unwrap();
+    let shared = crate::cache_key::rustc_shared_prediction_identity(&args).unwrap();
+    let (portable, _) = crate::cache_key::workspace_record(&args, &dep_info, Some("tree")).unwrap();
+    let record = |guard: crate::cache_key::TreeGuard| {
+        let key = crate::cache_key::KeyOutputs {
+            dep_info: Some(dep_info.clone()),
+            tree_guard: Some(guard),
+            ..Default::default()
+        };
+        record_input_prediction(&config, Some(&store), &args, true, &key);
+        let hasher = store.file_hasher();
+        let tree = |identity: &str| hasher.input_prediction(identity).unwrap().tree;
+        (
+            tree(&local),
+            tree(&shared),
+            hasher.portable_prediction(&portable).map(|row| row.tree),
+        )
+    };
+
+    let taken = crate::cache_key::TreeGuard::stamping("before", &root);
+    std::fs::remove_file(root.join("kt/a.txt")).unwrap();
+    assert_eq!(record(taken), (None, None, None), "a file removed since");
+    let taken = crate::cache_key::TreeGuard::stamping("after", &root);
+    let after = Some("after".to_string());
+    assert_eq!(record(taken), (after.clone(), after.clone(), after));
 }
 
 fn eligible_incremental_args(temp: &tempfile::TempDir, crate_name: &str) -> RustcArgs {
@@ -338,6 +515,64 @@ fn store_unavailable_warning_dedups_within_session() {
     );
 
     let _ = std::fs::remove_file(&marker);
+}
+
+/// A package keyed without its files says so once a session, in the log,
+/// with the package and the reason.
+#[test]
+fn a_package_keyed_without_its_files_is_reported_once_a_session() {
+    struct Capture(Arc<std::sync::Mutex<Vec<u8>>>);
+    impl Write for Capture {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path().join("cache"));
+    let profile = dir.path().join("target/debug");
+    let out_dir = profile.join("build/app-0123456789abcdef/out");
+    let manifest_dir = dir.path().join("app");
+    let var = |name: &str| match name {
+        "OUT_DIR" => Some(out_dir.clone().into_os_string()),
+        "CARGO_MANIFEST_DIR" => Some(manifest_dir.clone().into_os_string()),
+        "CARGO_PKG_NAME" => Some(OsString::from("app")),
+        _ => None,
+    };
+    let deps = profile.join("deps").to_string_lossy().into_owned();
+    let args = rustc_args(&["rustc", "--out-dir", &deps, "src/lib.rs"]);
+    let located = crate::build_script_inputs::locate(&args, &var, None, false)
+        .expect("the package's own run");
+    let package = blake3::hash(located.manifest_dir.as_os_str().as_encoded_bytes()).to_hex();
+    let marker = warn_marker_path(
+        &format!("build-script-package-{}", &package[..16]),
+        &config.cache_dir,
+    );
+    let output = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let writer = Arc::clone(&output);
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_writer(move || Capture(Arc::clone(&writer)))
+        .finish();
+    tracing::subscriber::with_default(subscriber, || {
+        for _ in 0..2 {
+            warn_build_script_package_unkeyed(&config, &located, "it holds too many entries");
+        }
+    });
+    let marked = marker_is_fresh(&marker, 300);
+    let _ = std::fs::remove_file(&marker);
+    let log = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+    assert_eq!(
+        log.matches("app: its build script declares no inputs and it holds too many entries")
+            .count(),
+        1,
+        "{log}"
+    );
+    assert!(marked);
 }
 
 #[test]
@@ -1188,6 +1423,168 @@ fn auto_gc_check_does_nothing_under_the_trigger() {
     assert_eq!(called.load(Ordering::SeqCst), 0);
 }
 
+/// A volume too full to rewrite the throttle stamp still gets its sweep
+/// once a free-space floor is set. Without a floor the check gives up, as
+/// it always has.
+#[test]
+fn an_unwritable_stamp_drops_the_check_only_without_a_floor() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = test_config(dir.path().to_path_buf());
+    cfg.max_size = 1024;
+    let store = Store::open(&cfg).unwrap();
+    put_test_entry(&store, dir.path(), "over-budget");
+    // A directory in the stamp's place refuses the write, as a full volume
+    // would, but still takes a new mtime.
+    let stamp = auto_gc_stamp_path(&cfg.cache_dir);
+    std::fs::create_dir(&stamp).unwrap();
+    let expired = std::time::SystemTime::now() - AUTO_GC_CHECK_INTERVAL * 2;
+    filetime::set_file_mtime(&stamp, filetime::FileTime::from_system_time(expired)).unwrap();
+    assert!(
+        !auto_gc_wanted(&cfg, &store),
+        "no floor: dropped, as before"
+    );
+
+    cfg.auto_recover_min_free_bytes = 1;
+    assert!(auto_gc_wanted(&cfg, &store));
+    assert!(
+        !auto_gc_wanted(&cfg, &store),
+        "the touched stamp keeps the interval"
+    );
+
+    // Neither written nor touched: an empty stamp takes its place, and that
+    // keeps the interval.
+    #[cfg(unix)]
+    {
+        std::fs::remove_dir(&stamp).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("missing/stamp"), &stamp).unwrap();
+        assert!(auto_gc_wanted(&cfg, &store));
+        assert!(
+            !auto_gc_wanted(&cfg, &store),
+            "the new stamp keeps the interval"
+        );
+    }
+}
+
+/// A stamp that can be neither written, touched nor replaced drops the
+/// check even with a floor: one that claimed nothing would go ahead after
+/// every put.
+#[cfg(unix)]
+#[test]
+fn a_stamp_that_cannot_be_claimed_drops_the_check() {
+    use std::os::unix::fs::PermissionsExt;
+    // SAFETY: plain libc call with no arguments.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = test_config(dir.path().join("cache"));
+    cfg.auto_recover_min_free_bytes = 1;
+    let sealed = dir.path().join("sealed");
+    std::fs::create_dir(&sealed).unwrap();
+    let mode = |mode| std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(mode));
+    mode(0o555).unwrap();
+    let claimed = claim_auto_gc_check(&cfg, &sealed.join("auto-gc-check.stamp"));
+    mode(0o755).unwrap();
+    assert!(!claimed);
+}
+
+/// Run [`after_store_with`] after `failure`, with a daemon that takes the
+/// hint when `daemon` is set. Returns the hints sent and the workers spawned.
+fn follow_up(
+    cfg: &Config,
+    store: &Store,
+    failure: Option<&anyhow::Error>,
+    daemon: bool,
+) -> (usize, usize) {
+    let hints = AtomicUsize::new(0);
+    let spawned = AtomicUsize::new(0);
+    after_store_with(
+        cfg,
+        store,
+        failure,
+        |_: &Config| {
+            hints.fetch_add(1, Ordering::SeqCst);
+            daemon
+        },
+        |_: &Config| {
+            spawned.fetch_add(1, Ordering::SeqCst);
+        },
+    );
+    (hints.into_inner(), spawned.into_inner())
+}
+
+#[test]
+fn a_stored_entry_gets_the_size_check() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = test_config(dir.path().to_path_buf());
+    cfg.max_size = 1024;
+    let store = Store::open(&cfg).unwrap();
+    put_test_entry(&store, dir.path(), "over-budget");
+    assert_eq!(follow_up(&cfg, &store, None, true), (1, 0));
+    assert_eq!(follow_up(&cfg, &store, None, true), (0, 0), "fresh stamp");
+}
+
+/// Staging or a put that the volume refused for lack of space stored
+/// nothing, so no size check follows it. It asks for recovery instead: only
+/// with a free-space floor set, once per check interval, and spawning
+/// nothing when the daemon takes the hint.
+#[test]
+#[cfg(unix)]
+fn a_store_refused_for_lack_of_space_asks_for_recovery() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = test_config(dir.path().to_path_buf());
+    let store = Store::open(&cfg).unwrap();
+    let full = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::StorageFull))
+        .context("copying out.o into store staging");
+    let denied = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+    assert_eq!(
+        follow_up(&cfg, &store, Some(&full), true),
+        (0, 0),
+        "no floor"
+    );
+
+    cfg.auto_recover_min_free_bytes = kache_fs::volume_usage(dir.path()).unwrap().total;
+    assert_eq!(
+        follow_up(&cfg, &store, Some(&denied), true),
+        (0, 0),
+        "not a full volume"
+    );
+    assert_eq!(follow_up(&cfg, &store, Some(&full), true), (1, 0));
+    assert_eq!(
+        follow_up(&cfg, &store, Some(&full), true),
+        (0, 0),
+        "one request per check interval"
+    );
+    expire_auto_gc_stamp(&cfg);
+    assert_eq!(
+        follow_up(&cfg, &store, Some(&full), false),
+        (1, 1),
+        "no daemon: the worker"
+    );
+}
+
+#[test]
+fn only_a_volume_out_of_space_counts_as_full() {
+    let io = |kind| anyhow::Error::new(std::io::Error::from(kind));
+    assert!(is_storage_full(
+        &io(std::io::ErrorKind::StorageFull).context("copying out.o into store staging")
+    ));
+    assert!(!is_storage_full(&io(std::io::ErrorKind::PermissionDenied)));
+    let sqlite = |code| {
+        anyhow::Error::new(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(code),
+            None,
+        ))
+    };
+    assert!(is_storage_full(
+        &sqlite(rusqlite::ffi::SQLITE_FULL).context("registering the entry")
+    ));
+    assert!(!is_storage_full(&sqlite(rusqlite::ffi::SQLITE_BUSY)));
+    assert!(!is_storage_full(&anyhow::anyhow!(
+        "refusing to cache zero-byte artifact"
+    )));
+}
+
 /// Another driver's fruitless sweep holds the worker back as well.
 #[test]
 fn auto_gc_worker_waits_out_a_backoff_another_driver_left() {
@@ -1730,7 +2127,7 @@ fn compile_before_key_needs_a_local_store() {
     config.deferred_discovery = true;
     assert!(
         !deferral_allowed(&config, &cargo_like, true, None),
-        "adaptive unit"
+        "a managed unit that must key first"
     );
     config.fallback = Some("sccache".to_string());
     assert!(
@@ -1860,14 +2257,14 @@ fn input_race_store_suppression_truth_table() {
 
 #[test]
 fn key_inputs_changed_excuses_skewed_clocks_but_not_real_changes() {
-    use crate::cache_key::FileFingerprint;
+    use crate::cache_key::ObservedFingerprint;
 
     // No tripped flag: nothing to excuse, whatever was recorded.
     assert!(!key_inputs_changed_during_compile(false, &[]));
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("input.rs");
     std::fs::write(&file, b"pub fn x() {}").unwrap();
-    let recorded = FileFingerprint::from_path(&file).unwrap();
+    let recorded = ObservedFingerprint::from_path(&file).unwrap();
     assert!(!key_inputs_changed_during_compile(
         false,
         std::slice::from_ref(&recorded)
@@ -1890,14 +2287,56 @@ fn key_inputs_changed_excuses_skewed_clocks_but_not_real_changes() {
     }
 }
 
+/// A save that lands after a key taken before the compile, and before rustc
+/// reads the file, trips no wall-clock flag: the stamp was old when the key
+/// read it. With the guard on, the moved fingerprint refuses the store by
+/// itself. A link to the file moves only its change time and does not.
+#[test]
+fn a_keyed_input_moved_since_the_key_refuses_without_a_tripped_flag() {
+    use crate::cache_key::ObservedFingerprint;
+
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("input.rs");
+    std::fs::write(&file, b"pub fn x() {}").unwrap();
+    // Old, so the save below gets another write time on any clock.
+    filetime::set_file_mtime(&file, filetime::FileTime::from_unix_time(1_000_000, 0)).unwrap();
+    let recorded = ObservedFingerprint::from_path(&file).unwrap();
+    let changed = || key_inputs_changed_during_compile(false, std::slice::from_ref(&recorded));
+    assert!(!changed(), "nothing moved");
+    #[cfg(unix)]
+    {
+        std::fs::hard_link(&file, dir.path().join("linked.rs")).unwrap();
+        assert!(!changed(), "a new link changes no byte");
+        // Same size and write time, another inode.
+        let replacement = dir.path().join("replacement.rs");
+        std::fs::write(&replacement, b"pub fn z() {}").unwrap();
+        filetime::set_file_mtime(
+            &replacement,
+            filetime::FileTime::from_unix_time(1_000_000, 0),
+        )
+        .unwrap();
+        std::fs::rename(&replacement, &file).unwrap();
+        assert!(changed(), "a replacement with the same size and write time");
+        std::fs::remove_file(&file).unwrap();
+        std::fs::rename(dir.path().join("linked.rs"), &file).unwrap();
+        assert!(!changed(), "the original file is back");
+    }
+    std::fs::write(&file, b"pub fn y() {}").unwrap();
+    assert!(changed(), "a save of the same length moved the write time");
+    std::fs::remove_file(&file).unwrap();
+    assert!(changed(), "a file gone since the key read it");
+}
+
 /// A key derived after the compile hashed its inputs after rustc read them.
 /// A dep-info source written since the invocation began refuses its store
 /// with the modified-input guard off, unless a fingerprint of that file taken
-/// before the compile still matches it. An extern whose ctime moved, as store
-/// ingest moves it on a filesystem without reflinks, does not.
+/// before the compile still matches it and had settled when it was taken. An
+/// extern whose ctime moved, as store ingest moves it on a filesystem without
+/// reflinks, does not. A write can carry a stamp a clock tick below the
+/// start.
 #[test]
 fn a_source_written_during_the_compile_refuses_a_key_derived_after_it() {
-    use crate::cache_key::FileFingerprint;
+    use crate::cache_key::{FileFingerprint, ObservedFingerprint};
 
     let dir = tempfile::tempdir().unwrap();
     let source = dir.path().join("lib.rs");
@@ -1912,48 +2351,92 @@ fn a_source_written_during_the_compile_refuses_a_key_derived_after_it() {
         .map(|path| fingerprint(path).path)
         .collect();
     let before_writes = [fingerprint(&source), fingerprint(&module)];
-    let start = before_writes
+    let last_write = before_writes
         .iter()
         .map(|input| input.mtime_ns.max(input.ctime_ns))
         .max()
-        .unwrap()
-        + 1;
+        .unwrap();
+    // Past every stamp window, and off any 10 ms boundary, so the stamps
+    // below get the fine window.
+    let start = (last_write / 1_000_000_000 + 3) * 1_000_000_000 + 500_000_007;
     let at = |input: &FileFingerprint, ns: i64| FileFingerprint {
         mtime_ns: ns,
         ctime_ns: ns,
         ..input.clone()
     };
+    // What the key hashed after the compile.
+    let hashed_after = |fingerprint: FileFingerprint| ObservedFingerprint {
+        fingerprint,
+        observed_ns: start + 10,
+    };
 
     // Only the extern moved: nothing the compile read was written.
     let hashed = [
-        fingerprint(&source),
-        fingerprint(&module),
-        at(&fingerprint(&rmeta), start + 5),
+        hashed_after(fingerprint(&source)),
+        hashed_after(fingerprint(&module)),
+        hashed_after(at(&fingerprint(&rmeta), start + 5)),
     ];
     assert!(sources_written_since(&hashed, &sources, start).is_empty());
 
     // A written source with no fingerprint from before the compile refuses,
     // although its own fingerprint matches the file.
-    let hashed = [fingerprint(&source), at(&fingerprint(&module), start + 5)];
+    let hashed = [
+        hashed_after(fingerprint(&source)),
+        hashed_after(at(&fingerprint(&module), start + 5)),
+    ];
     let written = sources_written_since(&hashed, &sources, start);
     assert_eq!(written.len(), 1, "{written:?}");
     assert!(emitted_sources_changed_during_compile(&written, &[]));
     assert!(sources_written_since(&hashed, &sources, 0).is_empty());
 
     // A source the hasher recorded nothing for counts as written.
-    let unrecorded = sources_written_since(&[fingerprint(&source)], &sources, start);
+    let unrecorded = sources_written_since(&[hashed_after(fingerprint(&source))], &sources, start);
     assert_eq!(unrecorded.len(), 1, "{unrecorded:?}");
     assert_eq!(unrecorded[0].path, fingerprint(&module).path);
 
+    let edge = at(
+        &fingerprint(&module),
+        start - crate::cache_key::FINE_STAMP_WINDOW_NS,
+    );
+    let edge_hashed = [
+        hashed_after(fingerprint(&source)),
+        hashed_after(edge.clone()),
+    ];
+    assert_eq!(sources_written_since(&edge_hashed, &sources, start), [edge]);
+    let below = at(
+        &fingerprint(&module),
+        start - crate::cache_key::FINE_STAMP_WINDOW_NS - 1,
+    );
+    let below_hashed = [hashed_after(fingerprint(&source)), hashed_after(below)];
+    assert!(sources_written_since(&below_hashed, &sources, start).is_empty());
+
     #[cfg(unix)]
     {
-        // A fingerprint from before the compile that still matches excuses
-        // it: a skewed clock, not a race.
-        let earlier = [fingerprint(&module)];
+        // Taken before the compile, `late` nanoseconds after the stamp
+        // settled.
+        let taken = |path: &Path, late: i64| {
+            let fingerprint = fingerprint(path);
+            let changed = fingerprint.mtime_ns.max(fingerprint.ctime_ns);
+            ObservedFingerprint {
+                fingerprint,
+                observed_ns: changed + crate::cache_key::HASH_SETTLE_NS + late,
+            }
+        };
+        // A settled fingerprint that still matches excuses it: a skewed
+        // clock, not a race.
+        let earlier = [taken(&module, 0)];
         assert!(!emitted_sources_changed_during_compile(&written, &earlier));
+        // One taken inside the window does not: a write in the same tick
+        // would have kept it matching.
+        assert!(emitted_sources_changed_during_compile(
+            &written,
+            &[taken(&module, -1)]
+        ));
         // One of another file does not.
-        let other = [fingerprint(&source)];
-        assert!(emitted_sources_changed_during_compile(&written, &other));
+        assert!(emitted_sources_changed_during_compile(
+            &written,
+            &[taken(&source, 0)]
+        ));
         // A file rewritten since its earlier fingerprint refuses.
         std::fs::write(&module, b"pub fn g() { 1 }").unwrap();
         assert!(emitted_sources_changed_during_compile(&written, &earlier));
@@ -2044,7 +2527,7 @@ fn incremental_force_list_requires_incremental_and_managed_layout() {
     let no_incremental = rustc_args(&["rustc", "--crate-name", "tap_lib", "src/lib.rs"]);
     assert!(!force_incremental_requested(&config, &no_incremental));
     assert!(
-        managed_incremental_unit(&config, &no_incremental, true, || {
+        managed_incremental_unit(&config, &no_incremental, || {
             panic!("hidden-input discovery must not run for an ineligible invocation")
         })
         .is_none()
@@ -2053,7 +2536,7 @@ fn incremental_force_list_requires_incremental_and_managed_layout() {
     let temp = tempfile::tempdir().unwrap();
     let args = eligible_incremental_args(&temp, "tap_lib");
     assert!(force_incremental_requested(&config, &args));
-    let unit = managed_incremental_unit(&config, &args, true, || false).unwrap();
+    let unit = managed_incremental_unit(&config, &args, || false).unwrap();
     let lease = unit.try_immediate().unwrap();
     let compiler_args = lease.compiler_args(&args);
     let original = args.incremental.as_ref().unwrap().display().to_string();
@@ -2067,7 +2550,7 @@ fn incremental_force_list_requires_incremental_and_managed_layout() {
         !compiler_args.iter().any(|arg| arg.ends_with(&original)),
         "the original Cargo incremental path must never reach rustc"
     );
-    assert!(!lease.finish(false));
+    assert!(!lease.finish(CompileOutcome::Abnormal));
 }
 
 #[test]
@@ -2097,6 +2580,38 @@ fn force_list_never_retries_through_adaptive_seed_policy() {
 }
 
 #[test]
+fn only_a_unit_that_can_take_an_incremental_lane_keys_first() {
+    for (managed, force_listed, policy_state, expected) in [
+        (false, true, true, false),
+        (true, false, false, false),
+        (true, true, false, true),
+        (true, false, true, true),
+    ] {
+        assert_eq!(
+            managed_unit_keys_first(managed, force_listed, policy_state),
+            expected,
+            "managed={managed} force_listed={force_listed} policy_state={policy_state}"
+        );
+    }
+}
+
+#[test]
+fn both_deferred_compile_reentries_are_recognized() {
+    for (precompiled, emitted_closure_waiting, expected) in [
+        (false, false, false),
+        (true, false, true),
+        (false, true, true),
+        (true, true, true),
+    ] {
+        assert_eq!(
+            reentered_after_deferred_compile(precompiled, emitted_closure_waiting),
+            expected,
+            "precompiled={precompiled} emitted_closure_waiting={emitted_closure_waiting}"
+        );
+    }
+}
+
+#[test]
 fn force_list_hidden_inputs_and_cache_exclusions_fail_closed() {
     let temp = tempfile::tempdir().unwrap();
     let mut config = test_config(temp.path().join("cache"));
@@ -2104,11 +2619,15 @@ fn force_list_hidden_inputs_and_cache_exclusions_fail_closed() {
     config.incremental_crates = vec!["tap_lib".to_string()];
     let args = eligible_incremental_args(&temp, "tap_lib");
 
-    assert!(managed_incremental_unit(&config, &args, true, || true).is_none());
-    assert!(incremental_fast_path_allowed(false, false, false));
-    assert!(!incremental_fast_path_allowed(false, true, false));
-    assert!(!incremental_fast_path_allowed(false, false, true));
-    assert!(!incremental_fast_path_allowed(true, false, false));
+    assert!(managed_incremental_unit(&config, &args, || true).is_none());
+    assert!(incremental_fast_path_allowed(false, false, false, false));
+    assert!(!incremental_fast_path_allowed(false, true, false, false));
+    assert!(!incremental_fast_path_allowed(false, false, true, false));
+    assert!(!incremental_fast_path_allowed(true, false, false, false));
+    assert!(
+        !incremental_fast_path_allowed(false, false, false, true),
+        "a re-entry after a deferred compile must not start a second compile"
+    );
     // Either refusal alone keeps a unit off the fast path.
     assert!(!unit_refuses_caching(false, false));
     assert!(unit_refuses_caching(true, false));
@@ -4697,7 +5216,7 @@ exit 0
     let mut config = test_config(dir.path().join("cache"));
     config.base_dirs = vec![dir.path().display().to_string()];
     let guard = adaptive_policy_guard(&config);
-    let unit = AdaptiveUnit::eligible(&args, true, &guard).unwrap();
+    let unit = AdaptiveUnit::eligible(&args, &guard).unwrap();
     let lease = unit.try_immediate().unwrap();
 
     let mut key_record = KeyEventRecord::default();
@@ -4763,6 +5282,246 @@ exit 0
             .any(|arg| arg.starts_with("--remap-path-prefix")),
         "an immediate passthrough unexpectedly injected remap arguments: {argv:?}"
     );
+}
+
+/// The lease sees how rustc really ended on both execute paths: a compile
+/// error keeps the private state, and anything abnormal resets it.
+#[cfg(unix)]
+#[test]
+fn adaptive_compile_resets_rustc_state_only_after_an_abnormal_exit() {
+    use std::os::unix::fs::PermissionsExt;
+    const TYPE_ERROR: &str = r"printf 'error[E0308]: mismatched types\n' >&2; exit 1";
+
+    let dir = tempfile::tempdir().unwrap();
+    let profile = dir.path().join("target/debug");
+    let deps = profile.join("deps");
+    let incremental = profile.join("incremental");
+    std::fs::create_dir_all(&deps).unwrap();
+    std::fs::create_dir(&incremental).unwrap();
+    let source = dir.path().join("lib.rs");
+    let rustc = dir.path().join("rustc");
+    let ending = dir.path().join("rustc.ending");
+    std::fs::write(&source, "pub fn answer() -> u8 { 42 }\n").unwrap();
+    // The unit key includes the compiler's size and mtime, so the script stays
+    // fixed: it writes into its private directory, then runs a case's ending.
+    kache_fs::testutil::write_executable(
+        &rustc,
+        r#"#!/bin/sh
+for arg in "$@"; do
+    case "$arg" in
+        -Cincremental=*) incremental=${arg#-Cincremental=} ;;
+    esac
+done
+printf 'state' > "$incremental/state.bin"
+. "$0.ending"
+"#,
+    );
+    let mut args = RustcArgs::parse(&[
+        rustc.display().to_string(),
+        "--crate-name".to_string(),
+        "adaptive_fixture".to_string(),
+        "--crate-type".to_string(),
+        "lib".to_string(),
+        source.display().to_string(),
+        "--out-dir".to_string(),
+        deps.display().to_string(),
+        "--emit=metadata".to_string(),
+        "-Cextra-filename=-1234abcd".to_string(),
+        format!("-Cincremental={}", incremental.display()),
+    ])
+    .unwrap();
+    args.is_primary = true;
+    let config = test_config(dir.path().join("cache"));
+    let unit = AdaptiveUnit::eligible(&args, &adaptive_policy_guard(&config)).unwrap();
+    let root = dir.path().display().to_string();
+
+    let end_with = |script: &str| std::fs::write(&ending, script).unwrap();
+    let compile = |lease: Lease| {
+        adaptive_incremental_with_event(
+            &config,
+            &args,
+            "adaptive_fixture",
+            &root,
+            std::time::Instant::now(),
+            lease,
+            "adaptive passthrough",
+            None,
+            KeyEventRecord::default(),
+        )
+    };
+    let last_exit_code = || {
+        crate::events::read_events(&config.event_log_path())
+            .unwrap()
+            .last()
+            .and_then(|event| event.exit_code)
+    };
+    // A reset removes rustc/ and state.json but leaves the unit directory.
+    let state_kept = || {
+        let units = profile.join("incremental.kache-auto/v1");
+        let unit_dir = std::fs::read_dir(units).unwrap().next().unwrap().unwrap();
+        unit_dir.path().join("rustc/state.bin").is_file()
+    };
+
+    for (script, exit, kept) in [
+        ("exit 0", 0, true),
+        (TYPE_ERROR, 1, true),
+        (
+            r"printf 'warning: hard linking files in the incremental compilation cache failed\n' >&2; printf 'error[E0308]: mismatched types\n' >&2; exit 1",
+            1,
+            true,
+        ),
+        ("exit 101", 101, false),
+        // Cargo still sees 1 for a signal.
+        ("kill -KILL $$", 1, false),
+        (
+            r"printf 'error: incremental compilation: could not create session directory lock file\n' >&2; exit 1",
+            1,
+            false,
+        ),
+    ] {
+        end_with(script);
+        assert_eq!(
+            compile(unit.try_immediate().unwrap()).unwrap(),
+            exit,
+            "{script}"
+        );
+        assert_eq!(last_exit_code(), Some(exit), "{script}");
+        assert_eq!(state_kept(), kept, "{script}");
+    }
+
+    end_with("exit 0");
+    assert_eq!(compile(unit.try_immediate().unwrap()).unwrap(), 0);
+    assert!(state_kept());
+    // A mode change leaves the size and mtime, and so the unit, alone.
+    std::fs::set_permissions(&rustc, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(
+        compile(unit.try_immediate().unwrap()).is_err(),
+        "the passthrough retry cannot spawn the compiler either"
+    );
+    assert!(!state_kept(), "a spawn failure must reset the unit");
+    std::fs::set_permissions(&rustc, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    // The seed and active lanes run rustc through the other execute path.
+    let key = |label: &str| blake3::hash(label.as_bytes()).to_hex().to_string();
+    let fields = |sources: &str| {
+        std::collections::BTreeMap::from(
+            [
+                ("args", "stable"),
+                ("compiler", "compiler"),
+                ("externs", "extern-a"),
+                ("sources", sources),
+            ]
+            .map(|(name, value)| (name.to_string(), value.to_string())),
+        )
+    };
+    assert!(unit.observe_build(&key("first"), &fields("source-a")));
+    end_with("exit 0");
+    let seed = unit.try_seed(&key("second"), &fields("source-b")).unwrap();
+    assert_eq!(compile(seed).unwrap(), 0);
+    end_with(TYPE_ERROR);
+    assert_eq!(compile(unit.try_active().unwrap()).unwrap(), 1);
+    assert!(state_kept());
+    end_with("kill -KILL $$");
+    let active = unit
+        .try_active()
+        .expect("a compile error keeps the unit active");
+    assert_eq!(compile(active).unwrap(), 1);
+    assert!(!state_kept());
+    assert!(unit.try_active().is_none());
+}
+
+/// A seed runs after both lookups missed, so it takes a scheduler slot and
+/// records the crate's weight like any miss. The immediate and active lanes
+/// run before any key work and take no slot.
+#[cfg(unix)]
+#[test]
+fn only_an_adaptive_seed_takes_a_scheduler_slot() {
+    use crate::incremental_policy::LeaseKind;
+    assert!(adaptive_lane_takes_permit(LeaseKind::Seed));
+    assert!(!adaptive_lane_takes_permit(LeaseKind::Active));
+    assert!(!adaptive_lane_takes_permit(LeaseKind::Immediate));
+
+    let dir = tempfile::tempdir().unwrap();
+    let deps = dir.path().join("target/debug/deps");
+    let incremental = dir.path().join("target/debug/incremental");
+    std::fs::create_dir_all(&deps).unwrap();
+    std::fs::create_dir(&incremental).unwrap();
+    let source = dir.path().join("lib.rs");
+    let rustc = dir.path().join("rustc");
+    std::fs::write(&source, "pub fn answer() -> u8 { 42 }\n").unwrap();
+    kache_fs::testutil::write_executable(
+        &rustc,
+        r#"#!/bin/sh
+for arg in "$@"; do
+    case "$arg" in
+        -Cincremental=*) printf 'state' > "${arg#-Cincremental=}/state.bin" ;;
+    esac
+done
+"#,
+    );
+    let mut args = RustcArgs::parse(&[
+        rustc.display().to_string(),
+        "--crate-name".to_string(),
+        "adaptive_fixture".to_string(),
+        "--crate-type".to_string(),
+        "lib".to_string(),
+        source.display().to_string(),
+        "--out-dir".to_string(),
+        deps.display().to_string(),
+        "--emit=metadata".to_string(),
+        "-Cextra-filename=-1234abcd".to_string(),
+        format!("-Cincremental={}", incremental.display()),
+    ])
+    .unwrap();
+    args.is_primary = true;
+    let config = test_config(dir.path().join("cache"));
+    assert!(config.scheduler);
+    let unit = AdaptiveUnit::eligible(&args, &adaptive_policy_guard(&config)).unwrap();
+    let root = dir.path().display().to_string();
+    let compile = |lease: Lease| {
+        adaptive_incremental_with_event(
+            &config,
+            &args,
+            "adaptive_fixture",
+            &root,
+            std::time::Instant::now(),
+            lease,
+            "adaptive",
+            None,
+            KeyEventRecord::default(),
+        )
+        .unwrap()
+    };
+    let weights = crate::scheduler::scheduler_root(&config.cache_dir).join("weights");
+    let recorded_weights = || {
+        std::fs::read_dir(&weights)
+            .map(|entries| entries.count())
+            .unwrap_or(0)
+    };
+    let key = |label: &str| blake3::hash(label.as_bytes()).to_hex().to_string();
+    let fields = |sources: &str| {
+        std::collections::BTreeMap::from(
+            [
+                ("args", "stable"),
+                ("compiler", "compiler"),
+                ("externs", "extern-a"),
+                ("sources", sources),
+            ]
+            .map(|(name, value)| (name.to_string(), value.to_string())),
+        )
+    };
+
+    assert_eq!(compile(unit.try_immediate().unwrap()), 0);
+    assert_eq!(recorded_weights(), 0, "the immediate lane took a slot");
+
+    assert!(unit.observe_build(&key("first"), &fields("source-a")));
+    let seed = unit.try_seed(&key("second"), &fields("source-b")).unwrap();
+    assert_eq!(compile(seed), 0);
+    assert_eq!(recorded_weights(), 1, "the seed took no slot");
+
+    std::fs::remove_dir_all(&weights).unwrap();
+    assert_eq!(compile(unit.try_active().unwrap()), 0);
+    assert_eq!(recorded_weights(), 0, "the active lane took a slot");
 }
 
 #[test]
@@ -6031,6 +6790,9 @@ fn setup_nvcc_case(
         m_exit_code,
     );
     let argv = nvcc_compile_argv(&nvcc, &work, &[]);
+    // A key-first nvcc store is refused for an input stamped within a stamp
+    // window of the start, a coarse clock tick on Linux.
+    crate::test_support::settle_writes(&[&work]);
     (work, nvcc, count, argv)
 }
 
@@ -6132,6 +6894,114 @@ fn nvcc_miss_then_hit_round_trips_object_and_depinfo() {
     assert_eq!(spool_intent_count(&config), 0);
 }
 
+/// The key hashes every input before nvcc runs. A header saved in between
+/// may not be what the object was built from, so the compile is not
+/// stored: with the old header back, the next run compiles again.
+#[cfg(unix)]
+#[test]
+fn nvcc_does_not_store_a_compile_whose_input_changed_after_keying() {
+    let _lock = crate::test_support::process_state_test_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let (work, nvcc, count, _) = setup_nvcc_case(&dir, None, None, 0, 0);
+    let header = work.join("inc").join("h.h");
+    let original = std::fs::read(&header).unwrap();
+    // A driver that saves the header on its way into the compile.
+    let driver = dir.path().join("driver");
+    std::fs::create_dir_all(&driver).unwrap();
+    let saving = driver.join("nvcc");
+    let shell =
+        crate::compiler::resolve_program_on_path("sh").expect("sh must be available on PATH");
+    kache_fs::testutil::write_executable(
+        &saving,
+        format!(
+            "#!{sh}\n\
+             case \"$1\" in --version|--dryrun|-M) ;; *) printf '#define LATE 1\\n' > \"{header}\" ;; esac\n\
+             exec \"{nvcc}\" \"$@\"\n",
+            sh = shell.display(),
+            header = header.display(),
+            nvcc = nvcc.display(),
+        ),
+    );
+    let config = test_config(dir.path().join("cache"));
+    let _daemon = RemoteCheckReplyDaemon::spawn(config.socket_path(), false);
+    let argv = nvcc_compile_argv(&saving, &work, &[]);
+
+    assert_eq!(run_nvcc(&config, &argv).unwrap(), 0);
+    std::fs::write(&header, &original).unwrap();
+    assert_eq!(run_nvcc(&config, &argv).unwrap(), 0);
+    assert_eq!(
+        std::fs::read_to_string(&count).unwrap(),
+        "run\nrun\n",
+        "the first compile was stored under the old header's key"
+    );
+}
+
+/// A header saved between `nvcc -M` and the key's read of it matches the
+/// key's fingerprint through the compile; only its stamp, from after the
+/// build started, shows the save. Neither run is stored, though both save
+/// the same bytes.
+#[cfg(unix)]
+#[test]
+fn nvcc_does_not_store_a_compile_whose_header_was_saved_while_keyed() {
+    let _lock = crate::test_support::process_state_test_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let (work, nvcc, count, _) = setup_nvcc_case(&dir, None, None, 0, 0);
+    let header = work.join("inc").join("h.h");
+    let driver = dir.path().join("driver");
+    std::fs::create_dir_all(&driver).unwrap();
+    let saving = driver.join("nvcc");
+    let shell =
+        crate::compiler::resolve_program_on_path("sh").expect("sh must be available on PATH");
+    kache_fs::testutil::write_executable(
+        &saving,
+        format!(
+            "#!{sh}\n\
+             if [ \"$1\" = -M ]; then\n\
+             \"{nvcc}\" \"$@\"; status=$?\n\
+             printf '#define LATE 1\\n' > \"{header}\"\n\
+             exit \"$status\"\n\
+             fi\n\
+             exec \"{nvcc}\" \"$@\"\n",
+            sh = shell.display(),
+            header = header.display(),
+            nvcc = nvcc.display(),
+        ),
+    );
+    let config = test_config(dir.path().join("cache"));
+    let _daemon = RemoteCheckReplyDaemon::spawn(config.socket_path(), false);
+    let argv = nvcc_compile_argv(&saving, &work, &[]);
+
+    assert_eq!(run_nvcc(&config, &argv).unwrap(), 0);
+    assert_eq!(run_nvcc(&config, &argv).unwrap(), 0);
+    assert_eq!(std::fs::read_to_string(&count).unwrap(), "run\nrun\n");
+}
+
+/// A header stamped an hour ahead, as a skewed file server leaves it, was
+/// not written during the build: the compile is stored and the next run
+/// hits.
+#[cfg(unix)]
+#[test]
+fn nvcc_stores_a_compile_whose_header_is_stamped_ahead_of_the_clock() {
+    let _lock = crate::test_support::process_state_test_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let (work, _nvcc, count, argv) = setup_nvcc_case(&dir, None, None, 0, 0);
+    let ahead = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+    filetime::set_file_mtime(
+        work.join("inc").join("h.h"),
+        filetime::FileTime::from_system_time(ahead),
+    )
+    .unwrap();
+    // Only the future mtime may stand out: the writes and the ctime the
+    // mtime change left are from before the build.
+    crate::test_support::settle_writes(&[&work]);
+    let config = test_config(dir.path().join("cache"));
+    let _daemon = RemoteCheckReplyDaemon::spawn(config.socket_path(), false);
+
+    assert_eq!(run_nvcc(&config, &argv).unwrap(), 0);
+    assert_eq!(run_nvcc(&config, &argv).unwrap(), 0);
+    assert_eq!(std::fs::read_to_string(&count).unwrap(), "run\n");
+}
+
 /// A dep-info the entry lacks evicts and recompiles: an object-only
 /// entry cannot satisfy `-MF`, and the recompiled entry (object +
 /// dep-info) hits afterwards.
@@ -6200,6 +7070,7 @@ fn nvcc_remote_absent_daemon_falls_through_to_compile() {
         0,
         0,
     );
+    crate::test_support::settle_writes(&[&work]);
 
     let _isolated = isolate_daemon_autostart(dir.path());
     let mut config = test_config(dir.path().join("cache"));
@@ -6244,6 +7115,7 @@ fn seed_nvcc_entry(
         key_salt: config.key_salt.as_deref(),
         key_env_vars: &config.key_env_vars,
         extra_inputs_digest: None,
+        build_script_inputs_digest: None,
     };
     let key = compiler.cache_key(&parsed, &ctx).unwrap();
     (store, parsed, key)
@@ -6410,6 +7282,7 @@ fn nvcc_try_remote_hit_restores_on_found() {
         0,
         0,
     );
+    crate::test_support::settle_writes(&[&work]);
 
     let mut config = test_config(dir.path().join("cache"));
     config.remote = Some(crate::config::RemoteConfig::test_s3("bucket", "artifacts"));
@@ -6525,6 +7398,7 @@ fn nvcc_header_and_flag_edits_bust_the_key() {
         0,
         0,
     );
+    crate::test_support::settle_writes(&[&work]);
 
     let config = test_config(dir.path().join("cache"));
     let _daemon = RemoteCheckReplyDaemon::spawn(config.socket_path(), false);
@@ -6540,6 +7414,7 @@ fn nvcc_header_and_flag_edits_bust_the_key() {
     assert_eq!(std::fs::read_to_string(&count).unwrap(), "run\n");
 
     std::fs::write(work.join("inc").join("h.h"), "#pragma once\n// edit\n").unwrap();
+    crate::test_support::settle_writes(&[&work]);
     assert_eq!(run_nvcc(&config, &argv).unwrap(), 0);
     assert_eq!(
         std::fs::read_to_string(&count).unwrap(),
@@ -6636,6 +7511,7 @@ fn nvcc_admission_skipped_when_too_cheap() {
         0,
         0,
     );
+    crate::test_support::settle_writes(&[&work]);
 
     let mut config = test_config(dir.path().join("cache"));
     config.min_store_compile_ms = u64::MAX;
@@ -6763,6 +7639,7 @@ fn nvcc_restore_fails_closed_on_missing_blob() {
         0,
         0,
     );
+    crate::test_support::settle_writes(&[&work]);
 
     let config = test_config(dir.path().join("cache"));
     let _daemon = RemoteCheckReplyDaemon::spawn(config.socket_path(), false);
@@ -9762,7 +10639,9 @@ fn a_key_from_emitted_dep_info_always_arms_the_too_new_guard() {
     assert!(keyed.guard_inputs.is_empty(), "{:?}", keyed.guard_inputs);
     let hashed = keyed.hashed_after_compile.expect("a key after the compile");
     assert!(
-        hashed.iter().any(|input| Path::new(&input.path) == lib),
+        hashed
+            .iter()
+            .any(|input| Path::new(&input.fingerprint.path) == lib),
         "{hashed:?}"
     );
     assert!(
@@ -9876,6 +10755,7 @@ fn a_rederived_key_holds_no_discovery_flight() {
         Some(&store),
         &KeyEnv::default(),
         None,
+        None,
         &mut key_record,
     )
     .unwrap();
@@ -9897,6 +10777,7 @@ fn a_rederived_key_holds_no_discovery_flight() {
         Some(&store),
         &KeyEnv::default(),
         Some("extra-inputs-digest"),
+        None,
         &mut KeyEventRecord::default(),
     )
     .unwrap();
@@ -9904,6 +10785,175 @@ fn a_rederived_key_holds_no_discovery_flight() {
         with_extra_inputs.cache_key, keyed.cache_key,
         "the re-derived key keeps the extra inputs"
     );
+}
+
+/// A predicted key that missed is re-derived, or keyed from the closure a
+/// running compile emits and stopped on a hit. Both keys fold the build
+/// script's declared inputs, and fold them the same way, so the probe can
+/// never match an entry stored without them.
+#[test]
+fn the_stop_on_hit_probe_and_the_rederived_key_fold_the_declared_inputs() {
+    if std::process::Command::new("rustc")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("skipped: no rustc");
+        return;
+    }
+    let _lock = crate::test_support::process_state_test_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path().join("cache"));
+    config.input_predictions = true;
+    let store = Store::open(&config).unwrap();
+    let lib = dir.path().join("src/lib.rs");
+    std::fs::create_dir_all(lib.parent().unwrap()).unwrap();
+    std::fs::write(&lib, "pub fn v() {}\n").unwrap();
+    let out = dir.path().join("target/debug/deps");
+    std::fs::create_dir_all(&out).unwrap();
+    let args = RustcCompiler::new()
+        .parse(&s(&[
+            "rustc",
+            "--crate-name",
+            "kt",
+            lib.to_str().unwrap(),
+            "--crate-type",
+            "lib",
+            "--emit=dep-info,metadata",
+            "--out-dir",
+            out.to_str().unwrap(),
+        ]))
+        .unwrap();
+    let compiler = RustcCompiler::new();
+    let key_env = KeyEnv::default();
+    let declared = BuildScriptInputs {
+        snapshot: Some(crate::build_script_inputs::Snapshot::with_digest(
+            "declared",
+        )),
+        ..BuildScriptInputs::default()
+    };
+    let undeclared = BuildScriptInputs::default();
+    let probe = |inputs: &BuildScriptInputs| {
+        let ctx = CompileFirst {
+            config: &config,
+            compiler: &compiler,
+            args: &args,
+            start: std::time::Instant::now(),
+            invocation_start_ns: 0,
+            extra_inputs: None,
+            extra_inputs_hash_stats: FileHashStats::default(),
+            extra_inputs_too_new: false,
+            extra_inputs_key_ms: 0,
+            build_script_inputs: inputs,
+            workspace_root: None,
+            store: &store,
+            key_env: &key_env,
+            crate_name: "kt",
+            event_root: "root",
+        };
+        let closure = crate::cache_key::DepInfo {
+            source_files: vec![lib.clone()],
+            env_deps: Vec::new(),
+        };
+        stop_on_hit_key(&ctx, closure, None).unwrap().cache_key
+    };
+    let rederive = |digest: Option<&str>| {
+        recompute_key_without_prediction(
+            &config,
+            &compiler,
+            &args,
+            None,
+            0,
+            Some(&store),
+            &key_env,
+            None,
+            digest,
+            &mut KeyEventRecord::default(),
+        )
+        .unwrap()
+        .cache_key
+    };
+    let probed = probe(&declared);
+    assert_ne!(probed, probe(&undeclared));
+    assert_eq!(probe(&undeclared), rederive(None));
+    assert_eq!(probed, rederive(Some("declared")));
+}
+
+/// The key folded a build script's declared inputs before the compile. When
+/// they read differently afterwards, the result is not stored.
+#[test]
+fn declared_inputs_that_moved_during_the_compile_are_caught() {
+    let _lock = crate::test_support::process_state_test_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let config = test_config(root.join("cache"));
+    let store = Store::open(&config).unwrap();
+    let package = root.join("app");
+    std::fs::create_dir_all(package.join("data")).unwrap();
+    std::fs::write(package.join("data/value.txt"), "v1").unwrap();
+    let out_dir = root.join("target/debug/build/app-0123456789abcdef/out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let stdout = out_dir.with_file_name("output");
+    std::fs::write(&stdout, "cargo:rerun-if-changed=data/value.txt\n").unwrap();
+    let deps = root.join("target/debug/deps");
+    let args = RustcCompiler::new()
+        .parse(&s(&[
+            "rustc",
+            "--crate-name",
+            "app",
+            "src/lib.rs",
+            "--out-dir",
+            deps.to_str().unwrap(),
+        ]))
+        .unwrap();
+    let vars: std::collections::HashMap<&str, OsString> = [
+        ("OUT_DIR", out_dir.clone().into_os_string()),
+        ("CARGO_MANIFEST_DIR", package.clone().into_os_string()),
+        ("CARGO_PKG_NAME", OsString::from("app")),
+    ]
+    .into_iter()
+    .collect();
+    let located =
+        crate::build_script_inputs::locate(&args, &|name| vars.get(name).cloned(), None, false)
+            .expect("the unit's own build script");
+    let before = |located: crate::build_script_inputs::Located| {
+        let mut hasher = store.file_hasher();
+        hasher.arm_too_new_guard(1, 0);
+        let crate::build_script_inputs::Resolved::Folded(snapshot) =
+            resolve_located_build_script_inputs(&config, &args, &store, &located, &hasher, None)
+                .unwrap()
+        else {
+            panic!("the declared inputs fold");
+        };
+        BuildScriptInputs {
+            located: Some(located),
+            snapshot: Some(snapshot),
+            ..BuildScriptInputs::default()
+        }
+    };
+    let moved = |inputs: &BuildScriptInputs| {
+        build_script_inputs_moved(&config, &args, &store, inputs, None)
+    };
+    assert!(
+        !moved(&BuildScriptInputs::default()),
+        "nothing folded, nothing to check"
+    );
+    let snapshot = before(located.clone());
+    assert!(!moved(&snapshot), "nothing changed");
+    std::fs::write(package.join("data/value.txt"), "v2").unwrap();
+    assert!(moved(&snapshot), "a declared file changed");
+
+    let snapshot = before(located.clone());
+    std::fs::remove_file(&stdout).unwrap();
+    assert!(moved(&snapshot), "Cargo's record of the run went away");
+    std::fs::write(&stdout, "cargo:rerun-if-changed=data/value.txt\n").unwrap();
+
+    let snapshot = before(located);
+    std::fs::File::create(&stdout)
+        .unwrap()
+        .set_len(64 << 20)
+        .unwrap();
+    assert!(moved(&snapshot), "the record can no longer be read");
 }
 
 /// A hit restores a unit without its incremental state, so it counts as the
@@ -9927,7 +10977,7 @@ fn a_hit_counts_as_the_build_an_edit_seeds_from() {
         "-Cextra-filename=-1234abcd".to_string(),
     ])
     .unwrap();
-    let unit = AdaptiveUnit::eligible(&args, true, b"").unwrap();
+    let unit = AdaptiveUnit::eligible(&args, b"").unwrap();
     let fields = |sources: &str| {
         std::collections::BTreeMap::from(
             [
@@ -10441,6 +11491,8 @@ fn cc_successful_compile_and_handoff_preserve_actual_rebuilt_outputs() {
     let source = dir.path().join("observed.c");
     let object = dir.path().join("observed.o");
     std::fs::write(&source, "int observed(void) { return 7; }\n").unwrap();
+    // A key-first store refuses a source written just before it started.
+    crate::test_support::settle_writes(&[&source]);
     let cc = crate::compiler::resolve_program_on_path("cc")
         .expect("the test runner requires a C compiler");
     let mut config = test_config(dir.path().join("cache"));

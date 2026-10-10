@@ -8,7 +8,8 @@ use std::path::{Path, PathBuf};
 
 pub const MIN_PERSISTED_HASH_BYTES: i64 = 64 * 1024;
 
-/// How long a file must have been left alone before its hash may be memoised.
+/// How long a file must have been left alone, when it was read, before its
+/// hash may be memoised.
 ///
 /// A memo row is trusted whenever the stamp matches. A file written, hashed and
 /// then written again inside one timestamp tick keeps the same stamp with
@@ -16,15 +17,150 @@ pub const MIN_PERSISTED_HASH_BYTES: i64 = 64 * 1024;
 /// old hash to every later lookup. Filesystems tick coarsely: HFS+ in whole
 /// seconds, FAT in two, ext4 at the kernel's coarse clock. Two seconds after
 /// the last change, a further write lands on a later tick and changes the
-/// stamp, so a row recorded then cannot be stale this way.
+/// stamp, so bytes read after a stat taken then belong to that stamp.
 pub const HASH_SETTLE_NS: i64 = 2_000_000_000;
 
 /// Whether `fingerprint`'s file last changed at least [`HASH_SETTLE_NS`]
-/// before `now_ns`. The ctime counts as well as the mtime: tools that restore
-/// an old mtime after writing cannot hold the ctime back.
-pub fn stamp_is_settled(fingerprint: &FileFingerprint, now_ns: i64) -> bool {
+/// before `observed_ns`, the wall clock read before the stat that produced
+/// it. A later time, such as when a row is written, says nothing about the
+/// bytes already read. The ctime counts as well as the mtime: tools that
+/// restore an old mtime after writing cannot hold the ctime back.
+pub fn stamp_is_settled(fingerprint: &FileFingerprint, observed_ns: i64) -> bool {
     let changed = fingerprint.mtime_ns.max(fingerprint.ctime_ns);
-    now_ns.saturating_sub(changed) >= HASH_SETTLE_NS
+    observed_ns.saturating_sub(changed) >= HASH_SETTLE_NS
+}
+
+/// How far below [`stamp_clock_ns`], read just before a write, the write's
+/// stamp can fall where stamps keep a fraction of a second. Linux stamps
+/// files from the coarse clock that function reads there, Windows from the
+/// system time it reads there, and macOS from the wall clock, so the margin
+/// only covers stamps kept in microseconds. Elsewhere stamps can trail the
+/// wall clock by a timer tick.
+pub const FINE_STAMP_WINDOW_NS: i64 = if cfg!(any(
+    target_os = "linux",
+    target_os = "android",
+    target_vendor = "apple",
+    windows
+)) {
+    1_000_000
+} else {
+    20_000_000
+};
+
+/// Added to that for a stamp on a 10 ms boundary: exFAT keeps its times in
+/// 10 ms steps, and FAT its creation time, which Windows reports as ctime.
+pub const CENTISECOND_STAMP_GRAIN_NS: i64 = 10_000_000;
+
+/// Added for a stamp on a whole second: HFS+, ext3 and ext4 with 128-byte
+/// inodes truncate to the second, FAT its write time to two.
+pub const WHOLE_SECOND_STAMP_GRAIN_NS: i64 = 2_000_000_000;
+
+/// Whether `fingerprint` shows a write at or after `since_ns`, a time read
+/// from [`stamp_clock_ns`]. A write made after `since_ns` can carry a stamp
+/// below it, so each of mtime and ctime counts from its own window earlier
+/// ([`stamp_window_ns`]); FAT keeps a two-second write time beside a 10 ms
+/// creation time. A stamp set by another machine's clock, over a network
+/// filesystem or a VM share, is only as close as the two clocks are.
+pub fn stamp_written_since(fingerprint: &FileFingerprint, since_ns: i64) -> bool {
+    [fingerprint.mtime_ns, fingerprint.ctime_ns]
+        .into_iter()
+        .any(|stamp| stamp >= since_ns.saturating_sub(stamp_window_ns(stamp)))
+}
+
+/// The window for one stamp: [`FINE_STAMP_WINDOW_NS`], plus the grain its
+/// value shows it was truncated to.
+pub fn stamp_window_ns(stamp_ns: i64) -> i64 {
+    let grain = if stamp_ns.rem_euclid(1_000_000_000) == 0 {
+        WHOLE_SECOND_STAMP_GRAIN_NS
+    } else if stamp_ns.rem_euclid(CENTISECOND_STAMP_GRAIN_NS) == 0 {
+        CENTISECOND_STAMP_GRAIN_NS
+    } else {
+        0
+    };
+    grain + FINE_STAMP_WINDOW_NS
+}
+
+/// Now, on the clock file stamps are taken from: the kernel's coarse
+/// realtime clock on Linux and the system time on Windows, which both trail
+/// the wall clock by up to a timer tick, and the wall clock elsewhere. A
+/// start that stamps are later checked against with [`stamp_written_since`]
+/// is read from it.
+#[cfg_attr(windows, allow(unreachable_code))]
+pub fn stamp_clock_ns() -> i64 {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        // SAFETY: an all-zero timespec is valid, and the call only fills it.
+        let mut now: libc::timespec = unsafe { std::mem::zeroed() };
+        if unsafe { libc::clock_gettime(libc::CLOCK_REALTIME_COARSE, &mut now) } == 0 {
+            let elapsed = std::time::Duration::new(now.tv_sec as u64, now.tv_nsec as u32);
+            return i64::try_from(elapsed.as_nanos()).unwrap_or(i64::MAX);
+        }
+    }
+    #[cfg(windows)]
+    {
+        return windows_system_time_ns();
+    }
+    wall_clock_ns()
+}
+
+/// The system time NTFS stamps files with. `SystemTime::now` reads the
+/// precise clock, which runs up to a timer tick ahead of it, so a file
+/// written just after that read could carry a stamp below it.
+#[cfg(windows)]
+fn windows_system_time_ns() -> i64 {
+    let mut now = windows_sys::Win32::Foundation::FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    // SAFETY: the call only fills the FILETIME it is given.
+    unsafe { windows_sys::Win32::System::SystemInformation::GetSystemTimeAsFileTime(&mut now) };
+    filetime_to_unix_ns(now.dwHighDateTime, now.dwLowDateTime)
+}
+
+/// A Windows FILETIME, 100 ns intervals since 1601, in nanoseconds since the
+/// Unix epoch, 0 before it.
+#[cfg(any(windows, test))]
+fn filetime_to_unix_ns(high: u32, low: u32) -> i64 {
+    const UNIX_EPOCH_INTERVALS: u64 = 116_444_736_000_000_000;
+    let intervals = (u64::from(high) << 32) + u64::from(low);
+    intervals
+        .checked_sub(UNIX_EPOCH_INTERVALS)
+        .map_or(0, |since| {
+            i64::try_from(u128::from(since) * 100).unwrap_or(i64::MAX)
+        })
+}
+
+/// The wall clock in nanoseconds since the Unix epoch, 0 before it.
+pub fn wall_clock_ns() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            i64::try_from(elapsed.as_nanos()).unwrap_or(i64::MAX)
+        })
+}
+
+/// A fingerprint and the wall clock read before the file was stat'ed and
+/// read, so a later check can ask whether its stamp had settled by then.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservedFingerprint {
+    pub fingerprint: FileFingerprint,
+    pub observed_ns: i64,
+}
+
+impl ObservedFingerprint {
+    /// Read the clock, then stat `path`.
+    pub fn from_path(path: &Path) -> Result<Self> {
+        let observed_ns = wall_clock_ns();
+        Ok(Self {
+            fingerprint: FileFingerprint::from_path(path)?,
+            observed_ns,
+        })
+    }
+
+    /// [`stamp_is_settled`] at the time this fingerprint was observed.
+    pub fn settled(&self) -> bool {
+        stamp_is_settled(&self.fingerprint, self.observed_ns)
+    }
 }
 
 /// Paths per lookup statement, well under SQLite's bound-parameter limit.
@@ -81,17 +217,21 @@ impl<'db> FileHashCache<'db> {
         }
     }
 
+    /// The memoised hash for `fingerprint`: a row whose whole stamp matches,
+    /// recorded under [`FILE_HASH_RULE`] or a later rule.
     pub fn get(&self, fingerprint: &FileFingerprint) -> rusqlite::Result<Option<String>> {
         self.db()
             .query_row(
                 "SELECT hash FROM file_hashes
-                 WHERE path = ?1 AND size = ?2 AND mtime_ns = ?3 AND ctime_ns = ?4 AND inode = ?5",
+                 WHERE path = ?1 AND size = ?2 AND mtime_ns = ?3 AND ctime_ns = ?4 AND inode = ?5
+                   AND rule >= ?6",
                 params![
                     fingerprint.path,
                     fingerprint.size,
                     fingerprint.mtime_ns,
                     fingerprint.ctime_ns,
-                    fingerprint.inode
+                    fingerprint.inode,
+                    FILE_HASH_RULE
                 ],
                 |row| row.get(0),
             )
@@ -114,7 +254,7 @@ impl<'db> FileHashCache<'db> {
             let placeholders = vec!["?"; chunk.len()].join(",");
             let mut stmt = self.db().prepare_cached(&format!(
                 "SELECT path, size, mtime_ns, ctime_ns, inode, hash FROM file_hashes
-                 WHERE path IN ({placeholders})"
+                 WHERE path IN ({placeholders}) AND rule >= {FILE_HASH_RULE}"
             ))?;
             let rows = stmt.query_map(
                 rusqlite::params_from_iter(chunk.iter().map(|f| f.path.as_str())),
@@ -144,15 +284,16 @@ impl<'db> FileHashCache<'db> {
     pub fn put(&self, fingerprint: &FileFingerprint, hash: &str) -> rusqlite::Result<()> {
         self.db().execute(
             "INSERT OR REPLACE INTO file_hashes
-             (path, size, mtime_ns, ctime_ns, inode, hash, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'))",
+             (path, size, mtime_ns, ctime_ns, inode, hash, updated_at, rule)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'), ?7)",
             params![
                 fingerprint.path,
                 fingerprint.size,
                 fingerprint.mtime_ns,
                 fingerprint.ctime_ns,
                 fingerprint.inode,
-                hash
+                hash,
+                FILE_HASH_RULE
             ],
         )?;
         Ok(())
@@ -296,17 +437,24 @@ impl<'db> FileHashCache<'db> {
     /// primary key index: 27% smaller on a real 1.3-million-row table
     /// (kunobi-ninja/kache#1206). Copying takes the write lock for about a
     /// second per million rows, so it runs from the GC sweep after the prune,
-    /// never when a build opens the index. Returns whether it rebuilt.
+    /// never when a build opens the index. Returns whether it rebuilt. A
+    /// table without a `rule` column copies its rows at rule 0, which no
+    /// lookup serves.
     pub fn rebuild_file_hashes_without_rowid(&self) -> rusqlite::Result<bool> {
         let tx = Transaction::new_unchecked(self.db(), TransactionBehavior::Immediate)?;
         if !file_hashes_has_rowid(&tx)? {
             return Ok(false);
         }
+        let rule = if file_hashes_have_rule(&tx)? {
+            "rule"
+        } else {
+            "0"
+        };
         tx.execute_batch(&format!(
             "CREATE TABLE file_hashes_rebuilt ({FILE_HASHES_COLUMNS}) WITHOUT ROWID;
              INSERT INTO file_hashes_rebuilt
-                 (path, size, mtime_ns, ctime_ns, inode, hash, updated_at)
-                 SELECT path, size, mtime_ns, ctime_ns, inode, hash, updated_at
+                 (path, size, mtime_ns, ctime_ns, inode, hash, updated_at, rule)
+                 SELECT path, size, mtime_ns, ctime_ns, inode, hash, updated_at, {rule}
                  FROM file_hashes;
              DROP TABLE file_hashes;
              ALTER TABLE file_hashes_rebuilt RENAME TO file_hashes;
@@ -406,7 +554,8 @@ fn ensure_input_predictions_last_used(db: &Connection, now: i64) -> rusqlite::Re
 }
 
 /// The columns of `file_hashes`, for the table a new store creates and for
-/// the rebuild of an older one.
+/// the rebuild of an older one. `rule` is the [`FILE_HASH_RULE`] the writer
+/// followed; a release from before the column leaves it at 0.
 const FILE_HASHES_COLUMNS: &str = "
     path       TEXT PRIMARY KEY,
     size       INTEGER NOT NULL,
@@ -414,7 +563,48 @@ const FILE_HASHES_COLUMNS: &str = "
     ctime_ns   INTEGER NOT NULL DEFAULT 0,
     inode      INTEGER NOT NULL DEFAULT 0,
     hash       TEXT NOT NULL,
-    updated_at TEXT NOT NULL DEFAULT (datetime('now'))";
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    rule       INTEGER NOT NULL DEFAULT 0";
+
+/// The rule a `file_hashes` row was recorded under. Lookups serve only rows
+/// at this rule or a later one, which may only add conditions. Rows from a
+/// release that predates the `rule` column, written before an upgrade or by
+/// that release afterwards, read as 0 and are never served.
+///
+/// 1: a hash read from a file is memoised only if the file's stamp had
+///    settled when it was read ([`stamp_is_settled`]).
+pub const FILE_HASH_RULE: i64 = 1;
+
+fn file_hashes_have_rule(db: &Connection) -> rusqlite::Result<bool> {
+    db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('file_hashes') WHERE name = 'rule')",
+        [],
+        |row| row.get(0),
+    )
+}
+
+/// Add `rule` to a `file_hashes` table from before it, emptying the table:
+/// its rows were recorded under no known rule, and some without checking
+/// that the file had settled. Checked again under the write lock, so the
+/// rows go once however many processes open the index together. Gated on
+/// the column rather than the index generation, which an older release
+/// stamps back over a newer one each time it opens the index. An older
+/// release's GC can drop the column again ([`has_rule_columns`]). The rows
+/// it copies then no longer say which rule recorded them, so adding the
+/// column back empties the table again.
+fn ensure_file_hashes_rule(db: &Connection) -> rusqlite::Result<()> {
+    if file_hashes_have_rule(db)? {
+        return Ok(());
+    }
+    let tx = Transaction::new_unchecked(db, TransactionBehavior::Immediate)?;
+    if !file_hashes_have_rule(&tx)? {
+        tx.execute_batch(
+            "ALTER TABLE file_hashes ADD COLUMN rule INTEGER NOT NULL DEFAULT 0;
+             DELETE FROM file_hashes;",
+        )?;
+    }
+    tx.commit()
+}
 
 /// Whether `file_hashes` is still the rowid table older stores created. A
 /// rowid table keys its rows by a hidden integer, so `path` sits in the table
@@ -428,6 +618,18 @@ fn file_hashes_has_rowid(db: &Connection) -> rusqlite::Result<bool> {
         )
         .optional()?;
     Ok(sql.is_some_and(|sql| !sql.to_ascii_uppercase().contains("WITHOUT ROWID")))
+}
+
+/// Whether every rule column [`ensure_file_hash_cache_schema`] adds is
+/// present: `file_hashes.rule` and the C/C++ memo's. The index generation
+/// cannot vouch for them. GC in releases 0.27 to 1.0 rebuilds a rowid
+/// `file_hashes` table without `rule` and leaves the generation alone, so
+/// an index this release stamped while that GC ran keeps the stamp and
+/// loses the column. Builds made while this release was in development
+/// also stamped generation 9 before the columns existed. A memo without
+/// its column fails every read and write.
+pub(crate) fn has_rule_columns(db: &Connection) -> rusqlite::Result<bool> {
+    Ok(file_hashes_have_rule(db)? && crate::cc_memo::has_rule_columns(db)?)
 }
 
 pub fn ensure_file_hash_cache_schema(db: &Connection) -> rusqlite::Result<()> {
@@ -469,6 +671,8 @@ pub fn ensure_file_hash_cache_schema(db: &Connection) -> rusqlite::Result<()> {
             return Err(e);
         }
     }
+    ensure_file_hashes_rule(db)?;
+    crate::cc_memo::ensure_rule(db)?;
     ensure_input_predictions_last_used(db, unix_now())
 }
 
@@ -805,6 +1009,119 @@ mod tests {
     }
 
     #[test]
+    fn a_write_counts_from_one_stamp_window_before_the_start() {
+        let fine = if cfg!(any(
+            target_os = "linux",
+            target_os = "android",
+            target_vendor = "apple",
+            windows
+        )) {
+            1_000_000
+        } else {
+            20_000_000
+        };
+        assert_eq!(FINE_STAMP_WINDOW_NS, fine);
+        let both = |ns| stamp("/s.rs", ns, ns);
+        let whole = 1_700_000_000_000_000_000;
+        let whole_window = 2_000_000_000 + fine;
+        assert!(stamp_written_since(&both(whole), whole + whole_window));
+        assert!(!stamp_written_since(&both(whole), whole + whole_window + 1));
+        let centi = whole + 120_000_000;
+        let centi_window = 10_000_000 + fine;
+        assert!(stamp_written_since(&both(centi), centi + centi_window));
+        assert!(!stamp_written_since(&both(centi), centi + centi_window + 1));
+        let precise = whole + 123_456_789;
+        assert!(stamp_written_since(&both(precise), precise + fine));
+        assert!(!stamp_written_since(&both(precise), precise + fine + 1));
+        // Each time keeps its own window: a two-second FAT write time beside
+        // an old 10 ms creation time, and an old whole-second mtime restored
+        // over a fresh ctime.
+        let long_ago = whole - 60_000_000_000;
+        let fat = stamp("/s.rs", whole, long_ago + 30_000_000);
+        assert!(stamp_written_since(&fat, whole + whole_window));
+        assert!(!stamp_written_since(&fat, whole + whole_window + 1));
+        let restored = stamp("/s.rs", long_ago, precise);
+        assert!(stamp_written_since(&restored, precise + fine));
+        assert!(!stamp_written_since(&restored, precise + fine + 1));
+    }
+
+    #[test]
+    fn a_filetime_counts_from_the_unix_epoch_in_nanoseconds() {
+        let split = |intervals: u64| ((intervals >> 32) as u32, intervals as u32);
+        let epoch = 116_444_736_000_000_000_u64;
+        let at = |intervals: u64| {
+            let (high, low) = split(intervals);
+            filetime_to_unix_ns(high, low)
+        };
+        assert_eq!(at(epoch), 0);
+        assert_eq!(at(epoch + 1), 100);
+        assert_eq!(at(epoch - 1), 0);
+        // 2026-10-10T00:00:00Z: both halves carry bits.
+        assert_eq!(
+            at(epoch + 1_791_590_400 * 10_000_000),
+            1_791_590_400_000_000_000
+        );
+        assert_eq!(filetime_to_unix_ns(u32::MAX, u32::MAX), i64::MAX);
+    }
+
+    /// The start a build reads must not run ahead of the stamp a file written
+    /// after it gets: with the precise clock, NTFS stamps trailed it by up to
+    /// a timer tick, past the 1 ms window.
+    #[cfg(windows)]
+    #[test]
+    fn a_file_written_after_the_stamp_clock_counts_as_written_since() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("written.rs");
+        for round in 0..200 {
+            let start = stamp_clock_ns();
+            std::fs::write(&path, round.to_string()).unwrap();
+            let written = FileFingerprint::from_path(&path).unwrap();
+            assert!(
+                stamp_written_since(&written, start),
+                "round {round}: {written:?} before {start}"
+            );
+        }
+    }
+
+    /// The window covers how far this platform's stamps trail
+    /// [`stamp_clock_ns`]: a write made right after reading it counts as
+    /// written since then.
+    #[test]
+    fn a_write_right_after_the_stamp_clock_counts_as_written_since() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("f");
+        for round in 0..500 {
+            let since = stamp_clock_ns();
+            std::fs::write(&file, round.to_string()).unwrap();
+            let written = FileFingerprint::from_path(&file).unwrap();
+            assert!(
+                stamp_written_since(&written, since),
+                "round {round}: {written:?} since {since}"
+            );
+        }
+    }
+
+    /// Once the stamp clock has moved a window past a write, the write no
+    /// longer counts as one made since.
+    #[test]
+    fn a_write_stops_counting_once_the_stamp_clock_passes_its_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("f");
+        std::fs::write(&file, "x").unwrap();
+        let written = FileFingerprint::from_path(&file).unwrap();
+        // The widest window, for a whole-second stamp, is about two seconds.
+        let give_up = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while stamp_written_since(&written, stamp_clock_ns()) {
+            assert!(
+                std::time::Instant::now() < give_up,
+                "the stamp clock never passed {written:?}: {}",
+                stamp_clock_ns()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    #[test]
     fn a_recent_ctime_holds_back_a_file_whose_mtime_was_restored() {
         // `touch -r`, `cp -p` and rsync write new bytes, then put an old mtime
         // back. Only the ctime shows the write.
@@ -812,6 +1129,45 @@ mod tests {
         let old = now - 10 * HASH_SETTLE_NS;
         assert!(!stamp_is_settled(&stamp("/h.h", old, now - 1), now));
         assert!(stamp_is_settled(&stamp("/h.h", old, old), now));
+    }
+
+    /// An observation carries the wall clock read while it was taken, in
+    /// the nanoseconds since the epoch that stamps are kept in.
+    #[test]
+    fn an_observation_carries_the_wall_clock_it_was_taken_at() {
+        let since_epoch = || {
+            let elapsed = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap();
+            i64::try_from(elapsed.as_nanos()).unwrap()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("f");
+        std::fs::write(&file, "x").unwrap();
+        let before = since_epoch();
+        let observed = ObservedFingerprint::from_path(&file).unwrap();
+        let after = since_epoch();
+        assert!(
+            (before..=after).contains(&observed.observed_ns),
+            "{observed:?} outside {before}..={after}"
+        );
+        assert_eq!(
+            observed.fingerprint,
+            FileFingerprint::from_path(&file).unwrap()
+        );
+    }
+
+    /// Settled when observed, not when asked: a stamp observed a moment
+    /// before its window closed stays unsettled however long ago that was.
+    #[test]
+    fn an_observation_is_settled_by_the_time_it_was_taken() {
+        let changed = 1_000_000_000_000;
+        let observed_at = |observed_ns| ObservedFingerprint {
+            fingerprint: stamp("/h.h", changed, changed),
+            observed_ns,
+        };
+        assert!(!observed_at(changed + HASH_SETTLE_NS - 1).settled());
+        assert!(observed_at(changed + HASH_SETTLE_NS).settled());
     }
 
     #[test]
@@ -834,6 +1190,85 @@ mod tests {
             !found.contains_key("/moved.h"),
             "a changed stamp reads as absent"
         );
+    }
+
+    /// How 1.0.0 records a row: it names no `rule`.
+    fn record_as_older_release(db: &Connection, fingerprint: &FileFingerprint, hash: &str) {
+        db.execute(
+            "INSERT OR REPLACE INTO file_hashes
+             (path, size, mtime_ns, ctime_ns, inode, hash, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'))",
+            params![
+                fingerprint.path,
+                fingerprint.size,
+                fingerprint.mtime_ns,
+                fingerprint.ctime_ns,
+                fingerprint.inode,
+                hash
+            ],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_row_an_older_release_records_is_never_served() {
+        let db = Connection::open_in_memory().unwrap();
+        ensure_file_hash_cache_schema(&db).unwrap();
+        let cache = FileHashCache::Borrowed(&db);
+        let current = stamp("/current.h", 1, 1);
+        let older = stamp("/older.h", 1, 1);
+        cache.put(&current, "h-current").unwrap();
+        record_as_older_release(&db, &older, "h-older");
+
+        assert_eq!(cache.get(&current).unwrap().as_deref(), Some("h-current"));
+        assert_eq!(cache.get(&older).unwrap(), None);
+        let found = cache.get_many(&[&current, &older]).unwrap();
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found["/current.h"], "h-current");
+
+        // Rewritten by the older release, the current row is gone too.
+        record_as_older_release(&db, &current, "h-older");
+        assert_eq!(cache.get(&current).unwrap(), None);
+    }
+
+    #[test]
+    fn the_rule_column_arrives_once_and_takes_the_older_rows_with_it() {
+        for table in [
+            ROWID_FILE_HASHES.to_string(),
+            format!("{ROWID_FILE_HASHES} WITHOUT ROWID"),
+        ] {
+            let db = Connection::open_in_memory().unwrap();
+            db.execute_batch(&table).unwrap();
+            record_as_older_release(&db, &stamp("/older.h", 1, 1), "h-older");
+            ensure_file_hash_cache_schema(&db).unwrap();
+            assert!(file_hashes_have_rule(&db).unwrap(), "{table}");
+            let rows = || -> i64 {
+                db.query_row("SELECT count(*) FROM file_hashes", [], |row| row.get(0))
+                    .unwrap()
+            };
+            assert_eq!(rows(), 0, "{table}");
+
+            let cache = FileHashCache::Borrowed(&db);
+            cache.put(&stamp("/current.h", 1, 1), "h-current").unwrap();
+            ensure_file_hash_cache_schema(&db).unwrap();
+            assert_eq!(rows(), 1, "{table}: once");
+        }
+    }
+
+    #[test]
+    fn rebuilding_without_rowid_keeps_each_rows_rule() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(ROWID_FILE_HASHES).unwrap();
+        ensure_file_hash_cache_schema(&db).unwrap();
+        let cache = FileHashCache::Borrowed(&db);
+        let current = stamp("/current.h", 1, 1);
+        let older = stamp("/older.h", 1, 1);
+        cache.put(&current, "h-current").unwrap();
+        record_as_older_release(&db, &older, "h-older");
+
+        assert!(cache.rebuild_file_hashes_without_rowid().unwrap());
+        assert_eq!(cache.get(&current).unwrap().as_deref(), Some("h-current"));
+        assert_eq!(cache.get(&older).unwrap(), None);
     }
 
     #[test]

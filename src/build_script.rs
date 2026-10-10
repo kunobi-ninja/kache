@@ -48,8 +48,15 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+pub(crate) mod declarations;
 mod hermetic;
+pub(crate) mod inputs;
 mod outside;
+
+use declarations::parse_declarations;
+use inputs::{TREE_MEMO_DIR, input_state, input_state_as};
+#[cfg(all(test, unix))]
+use inputs::{tree_digest_memo, tree_stamp};
 
 /// Set by the launcher to the path Cargo invoked, which is where the preserved
 /// binary lives beside.
@@ -73,6 +80,10 @@ const SHIM_DIR: &str = ".kache-build-script-shims";
 const LAUNCHER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/build-script-launcher"));
 const PREDICTION_SCHEMA: u32 = 1;
 const PREDICTION_PREFIX: &str = "build-script:";
+/// Folded first into every action key. A v1 key also matched runs recorded
+/// before kache stored the files a script names outside `OUT_DIR`, and
+/// restoring one replayed a link search into an empty directory.
+const ACTION_KIND: &[u8] = b"kache-build-script-action-v2";
 /// Marks a script binary that writes into its inputs on every run.
 const UNSETTLED_PREFIX: &str = "unsettled:";
 const MANIFEST_NAME: &str = "kache-build-script.json";
@@ -1089,50 +1100,6 @@ pub(crate) fn replace_all(haystack: &[u8], needle: &[u8], replacement: &[u8]) ->
     out
 }
 
-/// The `rerun-if-*` declarations in a script's stdout. `None` when the script
-/// asked to run every time, which no finite key can honour.
-fn parse_declarations(
-    stdout: &str,
-    environment: &Environment,
-) -> Option<(Vec<String>, Vec<String>, bool)> {
-    let mut inputs = std::collections::BTreeSet::new();
-    let mut env = std::collections::BTreeSet::new();
-    for line in stdout.lines() {
-        let Some(directive) = line
-            .strip_prefix("cargo::")
-            .or_else(|| line.strip_prefix("cargo:"))
-        else {
-            continue;
-        };
-        if let Some(path) = directive.strip_prefix("rerun-if-changed=") {
-            // Cargo treats an empty path as "always rerun".
-            if path.is_empty() {
-                return None;
-            }
-            let resolved = environment.manifest_dir.join(path);
-            // An input under OUT_DIR is one this run produced; scripts use
-            // that shape to force a rerun every time.
-            if resolved.starts_with(&environment.out_dir) {
-                return None;
-            }
-            inputs.insert(environment.normalize_str(&resolved.to_string_lossy()));
-        } else if let Some(name) = directive.strip_prefix("rerun-if-env-changed=")
-            && !name.is_empty()
-        {
-            env.insert(name.to_string());
-        }
-    }
-    let default_package = inputs.is_empty() && env.is_empty();
-    if default_package {
-        inputs.insert("${KACHE_MANIFEST_DIR}".to_string());
-    }
-    Some((
-        inputs.into_iter().collect(),
-        env.into_iter().collect(),
-        default_package,
-    ))
-}
-
 /// Cargo-provided environment that shapes a run and is not otherwise keyed.
 /// `NUM_JOBS` and the jobserver variables describe the machine, not the run.
 fn cargo_environment(environment: &Environment) -> BTreeMap<String, Option<String>> {
@@ -1222,7 +1189,7 @@ fn cargo_environment_names() -> std::collections::BTreeSet<String> {
     names
 }
 
-fn fold(hasher: &mut blake3::Hasher, label: &str, value: &[u8]) {
+pub(crate) fn fold(hasher: &mut blake3::Hasher, label: &str, value: &[u8]) {
     hasher.update(&(label.len() as u64).to_le_bytes());
     hasher.update(label.as_bytes());
     hasher.update(&(value.len() as u64).to_le_bytes());
@@ -1280,8 +1247,19 @@ impl Run {
         inherited_zero_ar_date: Option<std::ffi::OsString>,
         tools: &ToolSnapshot,
     ) -> Result<String> {
+        self.action_key_as(ACTION_KIND, prediction, inherited_zero_ar_date, tools)
+    }
+
+    /// [`Self::action_key_with`] under `kind` in place of [`ACTION_KIND`].
+    fn action_key_as(
+        &self,
+        kind: &[u8],
+        prediction: &Prediction,
+        inherited_zero_ar_date: Option<std::ffi::OsString>,
+        tools: &ToolSnapshot,
+    ) -> Result<String> {
         let mut hasher = blake3::Hasher::new();
-        fold(&mut hasher, "kind", b"kache-build-script-action-v1");
+        fold(&mut hasher, "kind", kind);
         fold(
             &mut hasher,
             "key_version",
@@ -2045,278 +2023,6 @@ fn package_exclusions(package: &Path, environment: &Environment) -> Vec<PathBuf>
         }
     }
     excluded
-}
-
-/// A digest of what is at `path`: content for a file, the recursive listing
-/// for a directory, the target and referent for a symlink, a marker for
-/// nothing. Cargo's own freshness compares the same things.
-fn input_state(
-    path: &Path,
-    excluded: &[PathBuf],
-    file_hasher: &crate::cache_key::FileHasher<'_>,
-    budget: &mut usize,
-    symlink_depth: usize,
-) -> Result<String> {
-    input_state_as(path, excluded, file_hasher, budget, symlink_depth, None)
-}
-
-/// [`input_state`], reading text files that spell one of `text`'s roots with
-/// the roots as placeholders. A `links` dependency's `OUT_DIR` sits under
-/// the same target directory as the dependent's, and a pkg-config file in it
-/// names that directory: read raw, every checkout would key the dependent
-/// differently. What the dependent writes from such a file is caught by its
-/// own outputs' roots.
-fn input_state_as(
-    path: &Path,
-    excluded: &[PathBuf],
-    file_hasher: &crate::cache_key::FileHasher<'_>,
-    budget: &mut usize,
-    symlink_depth: usize,
-    text: Option<&Environment>,
-) -> Result<String> {
-    anyhow::ensure!(
-        *budget > 0,
-        "declared build-script inputs are too many to digest"
-    );
-    *budget -= 1;
-    let metadata = match std::fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok("missing".to_string());
-        }
-        Err(error) => return Err(error.into()),
-    };
-    if metadata.file_type().is_symlink() {
-        anyhow::ensure!(
-            symlink_depth < 64,
-            "declared build-script input is a symlink cycle"
-        );
-        let target = std::fs::read_link(path)?;
-        let resolved = if target.is_absolute() {
-            target.clone()
-        } else {
-            path.parent().unwrap_or(Path::new("")).join(&target)
-        };
-        let referent = input_state_as(
-            &resolved,
-            excluded,
-            file_hasher,
-            budget,
-            symlink_depth + 1,
-            text,
-        )?;
-        return Ok(format!("symlink:{}:{referent}", target.to_string_lossy()));
-    }
-    if metadata.is_file() {
-        if let Some(environment) = text
-            && let Some(normalized) = read_text(path)?
-                .as_deref()
-                .and_then(|contents| environment.rewrite_text(contents))
-        {
-            return Ok(format!("text:{}", blake3::hash(&normalized).to_hex()));
-        }
-        return Ok(format!("file:{}", file_hasher.hash(path)?));
-    }
-    if metadata.is_dir() {
-        // A declared directory (a vendored C library, the package itself) can
-        // hold thousands of files; hashing each through the per-file memo
-        // costs a database read per file. One stat walk yields a stamp of
-        // every entry's identity, size and times, and the digest of a tree
-        // whose stamp is unchanged is the memoised one.
-        let stamp = if symlink_depth == 0 {
-            tree_stamp(path, excluded, *budget)
-        } else {
-            None
-        };
-        if let Some(stamp) = &stamp
-            && let Some(digest) = tree_digest_memo(path, text, &stamp.digest)
-        {
-            return Ok(digest);
-        }
-        let digest = hash_directory(path, excluded, file_hasher, budget, symlink_depth, text)?;
-        // Filesystem timestamps are coarse (a kernel tick on Linux), so a
-        // same-size rewrite within the tick of the last write would keep the
-        // stamp. A tree touched in the last seconds is hashed again next time
-        // rather than memoised; the following run finds it settled.
-        if let Some(stamp) = &stamp
-            && stamp.settled_at(std::time::SystemTime::now())
-        {
-            record_tree_digest_memo(path, text, &stamp.digest, &digest);
-        }
-        return Ok(digest);
-    }
-    anyhow::bail!(
-        "declared build-script input is neither a file nor a directory: {}",
-        path.display()
-    )
-}
-
-fn hash_directory(
-    path: &Path,
-    excluded: &[PathBuf],
-    file_hasher: &crate::cache_key::FileHasher<'_>,
-    budget: &mut usize,
-    symlink_depth: usize,
-    text: Option<&Environment>,
-) -> Result<String> {
-    let mut entries: Vec<_> = std::fs::read_dir(path)?.collect::<std::io::Result<_>>()?;
-    entries.sort_by_key(std::fs::DirEntry::file_name);
-    let mut hasher = blake3::Hasher::new();
-    for entry in entries {
-        let child = entry.path();
-        if excluded.contains(&child) {
-            continue;
-        }
-        fold(&mut hasher, "name", entry.file_name().as_encoded_bytes());
-        fold(
-            &mut hasher,
-            "state",
-            input_state_as(&child, excluded, file_hasher, budget, symlink_depth, text)?.as_bytes(),
-        );
-    }
-    Ok(format!("dir:{}", hasher.finalize().to_hex()))
-}
-
-/// A digest of every entry under `path` by name, kind, size, modification
-/// and change time, from one stat walk. Symlinks contribute their link text
-/// only, so a tree with a symlink to something outside it is not memoised.
-/// `None` when the tree is larger than the budget or holds a symlink.
-struct TreeStamp {
-    digest: String,
-    /// The newest modification time seen in the walk.
-    newest: std::time::SystemTime,
-}
-
-impl TreeStamp {
-    /// Coarse filesystem clocks make a stamp taken within this window of its
-    /// newest write ambiguous.
-    const SETTLE: std::time::Duration = std::time::Duration::from_secs(2);
-
-    fn settled_at(&self, now: std::time::SystemTime) -> bool {
-        now.duration_since(self.newest)
-            .is_ok_and(|age| age >= Self::SETTLE)
-    }
-}
-
-fn tree_stamp(path: &Path, excluded: &[PathBuf], budget: usize) -> Option<TreeStamp> {
-    let mut hasher = blake3::Hasher::new();
-    let mut newest = std::time::SystemTime::UNIX_EPOCH;
-    let mut remaining = budget;
-    let mut pending = vec![path.to_path_buf()];
-    while let Some(directory) = pending.pop() {
-        let mut entries: Vec<_> = std::fs::read_dir(&directory)
-            .ok()?
-            .collect::<std::io::Result<_>>()
-            .ok()?;
-        entries.sort_by_key(std::fs::DirEntry::file_name);
-        for entry in entries {
-            let child = entry.path();
-            if excluded.contains(&child) {
-                continue;
-            }
-            remaining = remaining.checked_sub(1)?;
-            let metadata = std::fs::symlink_metadata(&child).ok()?;
-            if metadata.file_type().is_symlink() {
-                return None;
-            }
-            fold(
-                &mut hasher,
-                "entry",
-                child
-                    .strip_prefix(path)
-                    .ok()?
-                    .as_os_str()
-                    .as_encoded_bytes(),
-            );
-            hasher.update(if metadata.is_dir() { b"dir" } else { b"fil" });
-            fold_metadata_stamp(&mut hasher, &metadata);
-            if let Ok(modified) = metadata.modified()
-                && modified > newest
-            {
-                newest = modified;
-            }
-            if metadata.is_dir() {
-                pending.push(child);
-            }
-        }
-    }
-    Some(TreeStamp {
-        digest: hasher.finalize().to_hex().to_string(),
-        newest,
-    })
-}
-
-/// Where tree digests are memoised: under the configured cache directory
-/// once a run has loaded its configuration, else the environment's or the
-/// default one.
-static TREE_MEMO_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-
-/// Size and times of one entry, plus the inode where the platform has one.
-fn fold_metadata_stamp(hasher: &mut blake3::Hasher, metadata: &std::fs::Metadata) {
-    hasher.update(&metadata.len().to_le_bytes());
-    for time in [metadata.modified().ok(), metadata.created().ok()] {
-        let nanos = time
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map_or(0, |d| d.as_nanos());
-        hasher.update(&nanos.to_le_bytes());
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        for value in [
-            metadata.ctime() as u64,
-            metadata.ctime_nsec() as u64,
-            metadata.ino(),
-        ] {
-            hasher.update(&value.to_le_bytes());
-        }
-    }
-}
-
-/// A file's bytes when it may be text: `None` once its first block holds a
-/// NUL, so object files and archives are not read in full.
-fn read_text(path: &Path) -> Result<Option<Vec<u8>>> {
-    use std::io::Read as _;
-    let mut file = std::fs::File::open(path)?;
-    let mut contents = Vec::new();
-    (&mut file).take(8192).read_to_end(&mut contents)?;
-    if contents.contains(&0) {
-        return Ok(None);
-    }
-    file.read_to_end(&mut contents)?;
-    Ok(Some(contents))
-}
-
-/// A digest read with roots as placeholders depends on the roots, so it is
-/// memoised apart from the raw one and per set of roots.
-fn tree_memo_path(path: &Path, text: Option<&Environment>) -> PathBuf {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(path.as_os_str().as_encoded_bytes());
-    if let Some(environment) = text {
-        for (root, placeholder) in environment.roots() {
-            fold(
-                &mut hasher,
-                placeholder,
-                root.as_os_str().as_encoded_bytes(),
-            );
-        }
-    }
-    let name = hasher.finalize().to_hex();
-    TREE_MEMO_DIR
-        .get()
-        .map(|cache_dir| cache_dir.join("probes"))
-        .unwrap_or_else(crate::config::probe_memo_dir)
-        .join(format!("tree-{}.txt", &name[..24]))
-}
-
-fn tree_digest_memo(path: &Path, text: Option<&Environment>, stamp: &str) -> Option<String> {
-    let memo = std::fs::read_to_string(tree_memo_path(path, text)).ok()?;
-    let (recorded_stamp, digest) = memo.trim_end().split_once('\n')?;
-    (recorded_stamp == stamp && digest.starts_with("dir:")).then(|| digest.to_string())
-}
-
-fn record_tree_digest_memo(path: &Path, text: Option<&Environment>, stamp: &str, digest: &str) {
-    crate::probe_memo::write_atomic(&tree_memo_path(path, text), &format!("{stamp}\n{digest}"));
 }
 
 #[cfg(test)]
@@ -4197,8 +3903,44 @@ mod tests {
         run.store.get(key).unwrap().unwrap()
     }
 
+    /// Before 1.0, kache stored a script's link search into a directory
+    /// beside `OUT_DIR` but not the files there (manifest versions 1 to 3).
+    /// After `cargo clean` or in a new worktree, restoring that run made
+    /// rustc search an empty directory. Today's key does not find such a
+    /// run, so the script runs and is recorded with its files.
     #[test]
-    fn an_old_manifest_restores_without_outside_fields_or_a_target_directory() {
+    fn a_run_recorded_without_its_outside_files_is_not_found() {
+        let mut lock = crate::test_support::process_state_test_lock();
+        let dir = lock.enter();
+        let (a, b) = two_targets(dir.as_path());
+        let prediction = recorded_prediction(
+            vec!["${KACHE_MANIFEST_DIR}/build.rs".to_string()],
+            Vec::new(),
+            false,
+            Vec::new(),
+            false,
+        );
+        let tools = a.tool_snapshot().unwrap();
+        let before = a
+            .action_key_as(b"kache-build-script-action-v1", &prediction, None, &tools)
+            .unwrap();
+        put_manifest(
+            &a,
+            &before,
+            r#"{"version":1,"directories":[],"empty_files":[],"stdout":"cargo:rustc-link-search=native=${KACHE_TARGET_DIR}/debug/gn_out/obj\n","stderr":""}"#,
+        );
+        assert!(
+            b.store.get(&before).unwrap().is_some(),
+            "the old run is stored"
+        );
+        let key = b.action_key_with(&prediction, None, &tools).unwrap();
+        assert!(b.store.get(&key).unwrap().is_none());
+    }
+
+    /// A run with nothing outside `OUT_DIR`, no symlink and no rewritten text
+    /// still records version 1, without the fields later versions added.
+    #[test]
+    fn a_version_one_manifest_restores_without_outside_fields_or_a_target_directory() {
         let mut lock = crate::test_support::process_state_test_lock();
         let dir = lock.enter();
         let out = dir.as_path().join("out");
@@ -4773,6 +4515,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_tree_digest_is_memoised_by_its_stamp_and_forgets_on_change() {
+        use crate::tree_stamp::TreeStamp;
         let _lock = crate::test_support::process_state_test_lock();
         let dir = tempfile::tempdir().unwrap();
         let cache = dir.path().join("cache");
@@ -4826,6 +4569,49 @@ mod tests {
         // A symlink inside the tree disables the memo.
         std::os::unix::fs::symlink("a.c", root.join("src/link.c")).unwrap();
         assert!(tree_stamp(&root, &[], 100).is_none());
+        unsafe { std::env::remove_var("KACHE_CACHE_DIR") };
+    }
+
+    /// The memo is recorded under the stamp of what the walk reads, without
+    /// what it excludes: a write there keeps the stamp, and so the memo.
+    #[cfg(unix)]
+    #[test]
+    fn a_tree_digest_memo_is_stamped_without_what_the_walk_excludes() {
+        let _lock = crate::test_support::process_state_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        // SAFETY: the process-state lock serialises environment edits.
+        unsafe { std::env::set_var("KACHE_CACHE_DIR", dir.path().join("cache")) };
+        let root = dir.path().join("lib");
+        let out = root.join("out");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(root.join("src/a.c"), "int a;").unwrap();
+        std::fs::write(out.join("a.o"), "a").unwrap();
+        let old = filetime::FileTime::from_unix_time(1_000_000_000, 0);
+        for entry in [root.join("src/a.c"), root.join("src"), root.clone()] {
+            filetime::set_file_mtime(&entry, old).unwrap();
+        }
+        let excluded = [out.clone()];
+        let hasher = crate::cache_key::FileHasher::new();
+        let mut budget = 100;
+
+        let digest = input_state(&root, &excluded, &hasher, &mut budget, 0).unwrap();
+        let stamp = tree_stamp(&root, &excluded, 100).unwrap();
+        assert_eq!(
+            tree_digest_memo(&root, None, &stamp.digest).as_deref(),
+            Some(digest.as_str())
+        );
+        std::fs::write(out.join("b.o"), "b").unwrap();
+        // Armed, a fresh hasher reads each file through the hook.
+        let mut fresh = crate::cache_key::FileHasher::new();
+        fresh.arm_too_new_guard(1, 0);
+        let reads = std::rc::Rc::new(std::cell::Cell::new(0));
+        let counted = reads.clone();
+        crate::cache_key::set_before_read(Some(Box::new(move |_| counted.set(counted.get() + 1))));
+        let again = input_state(&root, &excluded, &fresh, &mut budget, 0);
+        crate::cache_key::set_before_read(None);
+        assert_eq!(again.unwrap(), digest);
+        assert_eq!(reads.get(), 0, "the memo answers without a read");
         unsafe { std::env::remove_var("KACHE_CACHE_DIR") };
     }
 

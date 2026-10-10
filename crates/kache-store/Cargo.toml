@@ -45,6 +45,9 @@ windows-sys = { version = "0.61", features = [
     # FILE_SUPPORTS_BLOCK_REFCOUNTING — ask the volume whether it block-clones
     # instead of inferring "no CoW" from one failed clone (#508).
     "Win32_System_SystemServices",
+    # GetSystemTimeAsFileTime: the system time NTFS stamps files with, which
+    # a build start is read from (file_hash::stamp_clock_ns).
+    "Win32_System_SystemInformation",
 ] }
 blake3 = { version = "1", features = ["pure"] }
 

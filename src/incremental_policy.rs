@@ -7,6 +7,12 @@
 //! of early passthroughs before Kache probes the cache again. An explicit crate force-list can request the same managed
 //! directory without the learning step. Every decision is target-local and
 //! protected by a cross-process lock held for the complete compiler invocation.
+//!
+//! A compile error keeps the private state. rustc compiles in a copy of its
+//! newest finalized session, finalizes the copy only after codegen succeeds,
+//! and never changes a finalized session. A crash, a signal, an unknown exit
+//! or an error about rustc's incremental files resets the unit (see
+//! [`compile_outcome`]).
 
 use crate::args::RustcArgs;
 use serde::{Deserialize, Serialize};
@@ -15,6 +21,8 @@ use std::fs::{self, File, OpenOptions};
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Sibling of Cargo's `<profile>/incremental` that holds every managed unit.
+const AUTO_ROOT: &str = "incremental.kache-auto";
 const POLICY_VERSION: &str = "v1";
 const STATE_SCHEMA: u32 = 1;
 /// How long an active unit may sit idle and still skip the cache: a person
@@ -49,9 +57,9 @@ pub(crate) enum LeaseKind {
 /// Exclusive ownership of one unit's private incremental state.
 ///
 /// The lock is deliberately retained until [`Lease::finish`]. Dropping a
-/// lease without finishing leaves an `in_flight` marker; the next process
-/// discards the possibly partial rustc state and falls back to the normal
-/// cache path.
+/// lease without finishing leaves an `in_flight` marker. Kache cannot tell
+/// how an abandoned compile ended, so the next process discards the possibly
+/// partial rustc state and falls back to the normal cache path.
 #[must_use = "the lease must be finished after the compiler exits"]
 pub(crate) struct Lease {
     unit: AdaptiveUnit,
@@ -72,9 +80,73 @@ impl Drop for UnitLock {
 
 #[derive(Debug)]
 enum Completion {
-    Seed { observation: Observation },
-    Active { state: DiskState },
-    Immediate { restore: Option<DiskState> },
+    /// `previous` is the state the seed found, restored if it fails.
+    Seed {
+        observation: Observation,
+        previous: DiskState,
+    },
+    Active {
+        state: DiskState,
+    },
+    Immediate {
+        restore: Option<DiskState>,
+    },
+}
+
+/// How a compile under a lease ended, for its private rustc state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CompileOutcome {
+    /// rustc exited 0.
+    Success,
+    /// rustc exited 1 without blaming its incremental files: compile or lint
+    /// errors, a linker error, its own Ctrl-C exit, or a Windows forced
+    /// termination. rustc finalizes a session only after codegen succeeds, and
+    /// nothing later in the process changes it. The newest finalized session
+    /// is then the previous one or, after a linker error or a late exit, a new
+    /// and complete one.
+    CompileError,
+    /// An internal compiler error (101), a signal, any other status, a spawn
+    /// or pipe failure, or an error about the incremental files.
+    Abnormal,
+}
+
+/// `signaled`: a Unix signal ended the compiler; `exit_code` then reads 1.
+pub(crate) fn compile_outcome(exit_code: i32, signaled: bool, stderr: &str) -> CompileOutcome {
+    match (signaled, exit_code) {
+        (false, 0) => CompileOutcome::Success,
+        (false, 1) if !reports_incremental_failure(stderr) => CompileOutcome::CompileError,
+        _ => CompileOutcome::Abnormal,
+    }
+}
+
+/// Whether rustc reported that its incremental files failed.
+fn reports_incremental_failure(stderr: &str) -> bool {
+    stderr.lines().any(blames_incremental_state)
+}
+
+/// Cargo asks for JSON, so a diagnostic is judged by its own level and
+/// message: quoted source and `--explain` text do not count, and warnings (no
+/// hard links here, a session rustc could not delete) do not stop the
+/// compile. Any other line counts unless it is a warning.
+fn blames_incremental_state(line: &str) -> bool {
+    // Most lines name neither marker; only the rest are parsed.
+    if !names_incremental_state(line) {
+        return false;
+    }
+    match serde_json::from_str::<serde_json::Value>(line) {
+        Ok(json) => {
+            let field = |name: &str| json.get(name).and_then(serde_json::Value::as_str);
+            field("level") != Some("warning")
+                && field("message").is_some_and(names_incremental_state)
+        }
+        Err(_) => !line.starts_with("warning"),
+    }
+}
+
+/// rustc's session, lock and file errors say "incremental compilation" or
+/// name a path under the policy root.
+fn names_incremental_state(text: &str) -> bool {
+    text.contains("incremental compilation") || text.contains(AUTO_ROOT)
 }
 
 /// Stable and mutation-varying portions of one computed Kache key.
@@ -134,18 +206,16 @@ impl AdaptiveUnit {
     /// Recognize the deliberately narrow layout supported by managed
     /// incremental modes.
     ///
-    /// `cargo_primary` should be a snapshot of Cargo's primary-package marker;
-    /// passing it in keeps policy tests independent of process-global env.
+    /// Cargo passes `-C incremental` only to path packages (workspace members
+    /// and path dependencies) in profiles with incremental on, whether or not
+    /// the command selects them. That argument, not `CARGO_PRIMARY_PACKAGE`,
+    /// marks a unit someone may be editing.
     /// Eligible invocations must have a stable Cargo unit id and exactly:
     /// `<profile>/deps` (or the unit's own `out` in Cargo's per-unit layout)
     /// plus `<profile>/incremental`, both absolute. A build script is not:
     /// Cargo gives it no extra filename, so it has no unit id.
-    pub(crate) fn eligible(
-        args: &RustcArgs,
-        cargo_primary: bool,
-        policy_guard: &[u8],
-    ) -> Option<Self> {
-        if !cargo_primary || !args.is_primary {
+    pub(crate) fn eligible(args: &RustcArgs, policy_guard: &[u8]) -> Option<Self> {
+        if !args.is_primary {
             return None;
         }
         let unit_id = args.unit_id()?;
@@ -172,10 +242,7 @@ impl AdaptiveUnit {
         }
 
         let unit_key = unit_key(args, original_incremental, policy_guard);
-        let unit_dir = profile
-            .join("incremental.kache-auto")
-            .join(POLICY_VERSION)
-            .join(&unit_key);
+        let unit_dir = profile.join(AUTO_ROOT).join(POLICY_VERSION).join(&unit_key);
         Some(Self {
             original_incremental: original_incremental.clone(),
             policy_guard: policy_guard.to_vec(),
@@ -210,6 +277,13 @@ impl AdaptiveUnit {
     /// through the normal path, or a cache hit.
     pub(crate) fn observe_build(&self, cache_key: &str, fields: &BTreeMap<String, String>) -> bool {
         self.observe_build_at(cache_key, fields, now_secs())
+    }
+
+    /// Whether policy state exists that a seed on this invocation could use.
+    /// Only a state file that is definitely missing reads as none, so an
+    /// unreadable one keeps the unit keying first.
+    pub(crate) fn has_policy_state(&self) -> bool {
+        !definitely_missing(&self.state_path)
     }
 
     /// A cache hit disproves the need for automatic passthrough. Remove both
@@ -249,7 +323,7 @@ impl AdaptiveUnit {
         let mut busy = state;
         busy.active_leases += 1;
         busy.in_flight = true;
-        if !self.store_state(&busy) {
+        if !self.store_state(&busy, true) {
             reset_locked(self);
             return None;
         }
@@ -289,7 +363,7 @@ impl AdaptiveUnit {
             in_flight: false,
         });
         busy.in_flight = true;
-        if !self.store_state(&busy) {
+        if !self.store_state(&busy, true) {
             reset_locked(self);
             return None;
         }
@@ -339,14 +413,17 @@ impl AdaptiveUnit {
             last_used_secs: now,
             in_flight: true,
         };
-        if !self.store_state(&busy) {
+        if !self.store_state(&busy, true) {
             reset_locked(self);
             return None;
         }
         Some(Lease {
             unit: self.clone(),
             kind: LeaseKind::Seed,
-            completion: Completion::Seed { observation },
+            completion: Completion::Seed {
+                observation,
+                previous,
+            },
             _lock: lock,
         })
     }
@@ -379,7 +456,7 @@ impl AdaptiveUnit {
             last_used_secs: now,
             in_flight: false,
         };
-        let stored = self.store_state(&learning);
+        let stored = self.store_state(&learning, false);
         drop(lock);
         stored
     }
@@ -423,7 +500,7 @@ impl AdaptiveUnit {
         {
             return false;
         }
-        let auto_root = profile.join("incremental.kache-auto");
+        let auto_root = profile.join(AUTO_ROOT);
         let version_root = auto_root.join(POLICY_VERSION);
         ensure_real_directory(&auto_root)
             && ensure_real_directory(&version_root)
@@ -460,14 +537,31 @@ impl AdaptiveUnit {
         LoadedState::Valid(state)
     }
 
-    fn store_state(&self, state: &DiskState) -> bool {
+    /// Write `state`. Lease writes and the reset marker are `durable`; an
+    /// observation is not, since it is written only after [`reset_locked`]
+    /// removed the private rustc state.
+    fn store_state(&self, state: &DiskState, durable: bool) -> bool {
         if !valid_state(state, &self.unit_key) || unsafe_file(&self.state_path) {
             return false;
         }
         let Ok(bytes) = serde_json::to_vec(state) else {
             return false;
         };
-        crate::atomic::atomic_replace(&self.state_path, &bytes).is_ok()
+        crate::atomic::atomic_replace_deferrable(&self.state_path, &bytes, durable).is_ok()
+    }
+
+    /// The state every lease resets, written before private rustc state is
+    /// removed (see [`reset_locked`]).
+    fn in_flight_marker(&self) -> DiskState {
+        DiskState {
+            schema: STATE_SCHEMA,
+            unit_key: self.unit_key.clone(),
+            phase: Phase::Learning,
+            observation: None,
+            active_leases: 0,
+            last_used_secs: 0,
+            in_flight: true,
+        }
     }
 }
 
@@ -495,19 +589,28 @@ impl Lease {
     }
 
     /// Finish a compiler lease and atomically publish the next policy state.
-    /// Returns whether reusable incremental state remains active/available.
-    pub(crate) fn finish(self, success: bool) -> bool {
-        self.finish_at(success, now_secs())
+    /// Returns whether the unit kept its private rustc state.
+    pub(crate) fn finish(self, outcome: CompileOutcome) -> bool {
+        self.finish_at(outcome, now_secs())
     }
 
-    fn finish_at(self, success: bool, now: u64) -> bool {
-        if !success || !nonempty_real_directory(&self.unit.rustc_dir) {
+    fn finish_at(self, outcome: CompileOutcome, now: u64) -> bool {
+        let keep = match outcome {
+            // A success that wrote no incremental files proves nothing reusable.
+            CompileOutcome::Success => nonempty_real_directory(&self.unit.rustc_dir),
+            // The newest finalized session is complete whenever rustc exits 1
+            // (see `CompileOutcome::CompileError`). An empty directory is kept
+            // too: an active lease still requires files.
+            CompileOutcome::CompileError => true,
+            CompileOutcome::Abnormal => false,
+        };
+        if !keep {
             let _ = reset_locked(&self.unit);
             return false;
         }
 
-        let next = match self.completion {
-            Completion::Seed { observation } => Some(DiskState {
+        let next = match (self.completion, outcome) {
+            (Completion::Seed { observation, .. }, CompileOutcome::Success) => Some(DiskState {
                 schema: STATE_SCHEMA,
                 unit_key: self.unit.unit_key.clone(),
                 phase: Phase::Active,
@@ -516,16 +619,18 @@ impl Lease {
                 last_used_secs: now,
                 in_flight: false,
             }),
-            Completion::Active { mut state } => {
+            // A failed seed leaves the unit as it found it; the next miss seeds again.
+            (Completion::Seed { previous, .. }, _) => Some(previous),
+            (Completion::Active { mut state }, _) => {
                 state.in_flight = false;
                 state.last_used_secs = now;
                 Some(state)
             }
-            Completion::Immediate { restore } => restore,
+            (Completion::Immediate { restore }, _) => restore,
         };
 
         match next {
-            Some(state) if self.unit.store_state(&state) => true,
+            Some(state) if self.unit.store_state(&state, true) => true,
             None => remove_path_safely(&self.unit.state_path),
             Some(_) => {
                 reset_locked(&self.unit);
@@ -733,9 +838,19 @@ fn strip_incremental_refs(args: &[String]) -> Vec<&String> {
 }
 
 fn reset_locked(unit: &AdaptiveUnit) -> bool {
-    // Keep the in-flight/corrupt state marker when private rustc state could
-    // not be removed. Deleting the marker first would make a later immediate
-    // lease treat that possibly partial directory as reusable.
+    // Removing private rustc state can fail or stop part-way, for example on
+    // Ctrl-C. Mark the unit in flight first, durably, so what survives is a
+    // state every lease resets, never an old active one beside a partial
+    // directory. The marker stays when the removal fails. Without the marker
+    // nothing is removed: a whole directory beside its own state is safe to
+    // lease. A state path that is not a regular file needs no marker, because
+    // every lease already treats it as corrupt.
+    if !definitely_missing(&unit.rustc_dir)
+        && !unsafe_file(&unit.state_path)
+        && !unit.store_state(&unit.in_flight_marker(), true)
+    {
+        return false;
+    }
     if !remove_path_safely(&unit.rustc_dir) {
         return false;
     }
@@ -759,17 +874,12 @@ fn remove_path_safely(path: &Path) -> bool {
     }
 }
 
+/// Create `path` unless it exists. A directory another process created first
+/// counts, so concurrent first builds do not lose the unit's lock. A symlink
+/// never counts. Whatever the creation returned, only the path decides.
 fn ensure_real_directory(path: &Path) -> bool {
-    match fs::symlink_metadata(path) {
-        Ok(meta) => meta.is_dir(),
-        Err(error) => match error.kind() {
-            std::io::ErrorKind::NotFound => match fs::create_dir(path) {
-                Ok(()) => real_directory(path),
-                Err(_) => false,
-            },
-            _ => false,
-        },
-    }
+    let _ = fs::create_dir(path);
+    real_directory(path)
 }
 
 fn real_directory(path: &Path) -> bool {
@@ -853,7 +963,7 @@ mod tests {
             "-Cextra-filename=-1234abcd".into(),
         ])
         .unwrap();
-        let unit = AdaptiveUnit::eligible(&args, true, b"").unwrap();
+        let unit = AdaptiveUnit::eligible(&args, b"").unwrap();
         (temp, args, unit)
     }
 
@@ -883,7 +993,7 @@ mod tests {
             )
             .unwrap();
         fs::write(lease.unit.rustc_dir.join("dep-graph.bin"), b"seed").unwrap();
-        assert!(lease.finish_at(true, at + 2));
+        assert!(lease.finish_at(CompileOutcome::Success, at + 2));
     }
 
     #[test]
@@ -911,7 +1021,7 @@ mod tests {
             assert!(unit.lock().is_none(), "a live lease remains exclusive");
             if finish {
                 fs::write(unit.rustc_dir.join("dep-graph.bin"), b"compiled").unwrap();
-                assert!(lease.finish_at(true, 101));
+                assert!(lease.finish_at(CompileOutcome::Success, 101));
             } else {
                 drop(lease);
             }
@@ -944,8 +1054,7 @@ mod tests {
             RustcArgs::parse(&argv).unwrap()
         };
         let unit =
-            AdaptiveUnit::eligible(&argv("sample", &["-Cextra-filename=-1234abcd"]), true, b"")
-                .unwrap();
+            AdaptiveUnit::eligible(&argv("sample", &["-Cextra-filename=-1234abcd"]), b"").unwrap();
         assert!(
             unit.unit_dir
                 .starts_with(profile.join("incremental.kache-auto")),
@@ -953,26 +1062,32 @@ mod tests {
             unit.unit_dir.display()
         );
         assert!(
-            AdaptiveUnit::eligible(&argv("build_script_build", &[]), true, b"").is_none(),
+            AdaptiveUnit::eligible(&argv("build_script_build", &[]), b"").is_none(),
             "Cargo 1.100 compiles a build script with no extra filename"
         );
     }
 
     #[test]
-    fn eligibility_is_narrow_and_cargo_primary() {
+    fn eligibility_is_narrow() {
         let (_temp, mut args, unit) = fixture();
         assert!(unit.unit_dir.ends_with(&unit.unit_key));
-        assert!(AdaptiveUnit::eligible(&args, false, b"").is_none());
+
+        let mut registry_like = args.clone();
+        registry_like.incremental = None;
+        assert!(
+            AdaptiveUnit::eligible(&registry_like, b"").is_none(),
+            "a unit Cargo compiles without -C incremental (registry, git) is never managed"
+        );
 
         args.extra_filename = Some("-unstable".into());
-        assert!(AdaptiveUnit::eligible(&args, true, b"").is_none());
+        assert!(AdaptiveUnit::eligible(&args, b"").is_none());
 
         args.extra_filename = Some("-1234abcd".into());
         args.out_dir = args
             .out_dir
             .as_ref()
             .map(|path| path.with_file_name("build"));
-        assert!(AdaptiveUnit::eligible(&args, true, b"").is_none());
+        assert!(AdaptiveUnit::eligible(&args, b"").is_none());
 
         let (_temp, mut args, _unit) = fixture();
         args.incremental = args
@@ -981,13 +1096,13 @@ mod tests {
             .and_then(|out_dir| out_dir.parent())
             .map(|profile| profile.join("incremental/unit"));
         assert!(
-            AdaptiveUnit::eligible(&args, true, b"").is_none(),
+            AdaptiveUnit::eligible(&args, b"").is_none(),
             "only the profile's exact incremental sibling is eligible"
         );
 
         args.incremental = Some(PathBuf::from("relative/incremental"));
         assert!(
-            AdaptiveUnit::eligible(&args, true, b"").is_none(),
+            AdaptiveUnit::eligible(&args, b"").is_none(),
             "relative incremental state must fail closed"
         );
     }
@@ -1000,14 +1115,14 @@ mod tests {
             unit.try_immediate_at(10).is_none(),
             "a concurrent compiler must not share the private rustc directory"
         );
-        assert!(!first.finish_at(false, 11));
+        assert!(!first.finish_at(CompileOutcome::Abnormal, 11));
     }
 
     #[test]
     fn policy_guard_changes_the_private_state_identity() {
         let (_temp, args, _) = fixture();
-        let first = AdaptiveUnit::eligible(&args, true, b"env-a").unwrap();
-        let second = AdaptiveUnit::eligible(&args, true, b"env-b").unwrap();
+        let first = AdaptiveUnit::eligible(&args, b"env-a").unwrap();
+        let second = AdaptiveUnit::eligible(&args, b"env-b").unwrap();
         assert_ne!(first.unit_key, second.unit_key);
         assert_ne!(first.rustc_dir, second.rustc_dir);
     }
@@ -1026,7 +1141,7 @@ mod tests {
             "--test".into(),
             "-Cextra-filename=-1234abcd".into(),
         ];
-        let unit = AdaptiveUnit::eligible(&args, true, b"").unwrap();
+        let unit = AdaptiveUnit::eligible(&args, b"").unwrap();
         let lease = unit.try_immediate_at(10).unwrap();
         let destination = lease.unit.rustc_dir.display().to_string();
         let rewritten = lease.compiler_args(&args);
@@ -1045,7 +1160,7 @@ mod tests {
                 .all(|arg| arg.ends_with(&destination))
         );
         fs::write(lease.unit.rustc_dir.join("state"), b"ok").unwrap();
-        assert!(lease.finish_at(true, 11));
+        assert!(lease.finish_at(CompileOutcome::Success, 11));
     }
 
     #[test]
@@ -1061,14 +1176,14 @@ mod tests {
             .unwrap();
         assert_eq!(lease.kind(), LeaseKind::Seed);
         fs::write(lease.unit.rustc_dir.join("query-cache.bin"), b"seed").unwrap();
-        assert!(lease.finish_at(true, 121));
+        assert!(lease.finish_at(CompileOutcome::Success, 121));
 
         let active = unit.try_active_at(122).unwrap();
         assert_eq!(active.kind(), LeaseKind::Active);
         let busy = read_state(&unit);
         assert_eq!(busy.active_leases, 1);
         assert!(busy.in_flight);
-        assert!(active.finish_at(true, 123));
+        assert!(active.finish_at(CompileOutcome::Success, 123));
     }
 
     #[test]
@@ -1153,7 +1268,7 @@ mod tests {
             .try_active_at(104)
             .expect("learned state survived the transient refusal");
         assert_eq!(lease.kind(), LeaseKind::Active);
-        assert!(lease.finish_at(true, 105));
+        assert!(lease.finish_at(CompileOutcome::Success, 105));
     }
 
     #[test]
@@ -1162,7 +1277,7 @@ mod tests {
         let out_dir = args.out_dir.as_ref().unwrap();
         fs::remove_dir(out_dir).unwrap();
         fs::write(out_dir, b"not a directory").unwrap();
-        assert!(AdaptiveUnit::eligible(&args, true, b"").is_none());
+        assert!(AdaptiveUnit::eligible(&args, b"").is_none());
 
         let (_temp, _args, unit) = fixture();
         fs::remove_dir(&unit.original_incremental).unwrap();
@@ -1207,7 +1322,7 @@ mod tests {
 
         let lease = unit.try_immediate_at(11).unwrap();
         fs::write(lease.unit.rustc_dir.join("state"), b"ok").unwrap();
-        assert!(lease.finish_at(true, 12));
+        assert!(lease.finish_at(CompileOutcome::Success, 12));
 
         assert_eq!(fs::read(&unit.state_path).unwrap(), original);
     }
@@ -1289,9 +1404,178 @@ mod tests {
                 11,
             )
             .unwrap();
-        assert!(!lease.finish_at(true, 12));
+        assert!(!lease.finish_at(CompileOutcome::Success, 12));
         assert!(unit.try_active_at(13).is_none());
         assert!(!unit.state_path.exists());
+    }
+
+    #[test]
+    fn compile_outcome_trusts_only_an_ordinary_error() {
+        use CompileOutcome::{Abnormal, CompileError, Success};
+        // rustc 1.99 `--error-format=json` lines, shortened. The type error
+        // quotes the phrase outside its message: in source and explanation.
+        const TYPE_ERROR: &str = r#"{"$message_type":"diagnostic","message":"mismatched types","code":{"code":"E0308","explanation":"Expected type did not match the received type, with or without incremental compilation.\n"},"level":"error","spans":[],"children":[],"rendered":"error[E0308]: mismatched types\n --> src/lib.rs:1:26\n  |\n1 | pub fn answer() -> u64 { \"incremental compilation\" }\n"}"#;
+        const LOCK_FAILED: &str = r#"{"$message_type":"diagnostic","message":"incremental compilation: could not create session directory lock file: Permission denied (os error 13)","code":null,"level":"error","spans":[],"children":[],"rendered":"error: incremental compilation: could not create session directory lock file: Permission denied (os error 13)\n\n"}"#;
+        const LOCK_FAILED_WITH_WARNING_CHILD: &str = r#"{"$message_type":"diagnostic","message":"incremental compilation: could not create session directory lock file: Permission denied (os error 13)","code":null,"level":"error","spans":[],"children":[{"message":"the filesystem for the incremental path at /t/debug/incremental.kache-auto/v1/u/rustc/c does not appear to support locking","code":null,"level":"warning","spans":[],"children":[],"rendered":null}],"rendered":"error: incremental compilation: could not create session directory lock file: Permission denied (os error 13)\n\n"}"#;
+        const DEP_GRAPH_MOVE_FAILED: &str = r#"{"$message_type":"diagnostic","message":"failed to move dependency graph from `/t/debug/incremental.kache-auto/v1/u/rustc/c/s-a-working/dep-graph.part.bin` to `/t/debug/incremental.kache-auto/v1/u/rustc/c/s-a-working/dep-graph.bin`: No space left on device (os error 28)","code":null,"level":"error","spans":[],"children":[],"rendered":"error: failed to move dependency graph\n\n"}"#;
+        // Printed for every session on FAT32, where every type error follows it.
+        const NO_HARD_LINKS: &str = r#"{"$message_type":"diagnostic","message":"hard linking files in the incremental compilation cache failed. copying files instead. consider moving the cache directory to a file system which supports hard linking in session dir `/t/debug/incremental.kache-auto/v1/u/rustc/c/s-a-working`","code":null,"level":"warning","spans":[],"children":[],"rendered":"warning: hard linking files in the incremental compilation cache failed\n\n"}"#;
+        let no_hard_links_then_type_error = format!("{NO_HARD_LINKS}\n{TYPE_ERROR}\n");
+
+        for (exit_code, signaled, stderr, expected) in [
+            (0, false, "", Success),
+            (1, false, TYPE_ERROR, CompileError),
+            // rustc's own Ctrl-C exit, or a Windows forced termination.
+            (1, false, "", CompileError),
+            (1, true, "", Abnormal),
+            // An internal compiler error.
+            (101, false, "", Abnormal),
+            (2, false, "", Abnormal),
+            // STATUS_ACCESS_VIOLATION.
+            (0xC000_0005_u32 as i32, false, "", Abnormal),
+            (1, false, LOCK_FAILED, Abnormal),
+            (1, false, LOCK_FAILED_WITH_WARNING_CHILD, Abnormal),
+            (1, false, DEP_GRAPH_MOVE_FAILED, Abnormal),
+            (
+                1,
+                false,
+                no_hard_links_then_type_error.as_str(),
+                CompileError,
+            ),
+            (
+                1,
+                false,
+                "error: incremental compilation: could not create session directory lock file",
+                Abnormal,
+            ),
+            (
+                1,
+                false,
+                "warning: hard linking files in the incremental compilation cache failed\n\
+                 error[E0308]: mismatched types",
+                CompileError,
+            ),
+        ] {
+            assert_eq!(
+                compile_outcome(exit_code, signaled, stderr),
+                expected,
+                "exit {exit_code}, signaled {signaled}, stderr {stderr:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn active_compile_error_keeps_the_lease_and_rustc_state() {
+        let (_temp, _args, unit) = fixture();
+        activate(&unit, 10);
+        let lease = unit.try_active_at(12).unwrap();
+        fs::create_dir(unit.rustc_dir.join("s-working")).unwrap();
+
+        assert!(lease.finish_at(CompileOutcome::CompileError, 13));
+        let state = read_state(&unit);
+        assert_eq!(state.phase, Phase::Active);
+        assert!(!state.in_flight);
+        assert_eq!(
+            state.active_leases, 1,
+            "a failed compile still uses a lease"
+        );
+        assert_eq!(state.last_used_secs, 13);
+        assert!(unit.rustc_dir.join("dep-graph.bin").is_file());
+        assert!(unit.try_active_at(14).is_some());
+    }
+
+    #[test]
+    fn failed_seed_restores_the_state_it_found() {
+        for session_started in [false, true] {
+            let (_temp, _args, unit) = fixture();
+            teach(&unit, 100);
+            let learned = fs::read(&unit.state_path).unwrap();
+            let lease = unit
+                .try_seed_at(
+                    &cache_key("broken"),
+                    &fields("stable", "source-b", "extern-a"),
+                    120,
+                )
+                .unwrap();
+            if session_started {
+                fs::create_dir(unit.rustc_dir.join("s-working")).unwrap();
+            }
+
+            assert!(lease.finish_at(CompileOutcome::CompileError, 121));
+            assert_eq!(fs::read(&unit.state_path).unwrap(), learned);
+            assert!(unit.rustc_dir.is_dir());
+            assert!(unit.try_active_at(122).is_none());
+            let fixed = unit
+                .try_seed_at(
+                    &cache_key("fixed"),
+                    &fields("stable", "source-c", "extern-a"),
+                    123,
+                )
+                .expect("the fix seeds");
+            assert_eq!(fixed.kind(), LeaseKind::Seed);
+        }
+    }
+
+    #[test]
+    fn failed_reseed_keeps_the_active_rustc_state() {
+        let (_temp, _args, unit) = fixture();
+        activate(&unit, 10);
+        let mut exhausted = read_state(&unit);
+        exhausted.active_leases = MAX_ACTIVE_LEASES;
+        write_state(&unit, &exhausted);
+        let saved = fs::read(&unit.state_path).unwrap();
+        assert!(unit.try_active_at(11).is_none());
+
+        let lease = unit
+            .try_seed_at(
+                &cache_key("third"),
+                &fields("stable", "source-c", "extern-a"),
+                20,
+            )
+            .unwrap();
+        assert!(lease.finish_at(CompileOutcome::CompileError, 21));
+        assert_eq!(fs::read(&unit.state_path).unwrap(), saved);
+        assert!(unit.rustc_dir.join("dep-graph.bin").is_file());
+    }
+
+    #[test]
+    fn immediate_compile_error_restores_metadata_and_keeps_rustc_state() {
+        for learned in [false, true] {
+            let (_temp, _args, unit) = fixture();
+            if learned {
+                teach(&unit, 10);
+            }
+            let before = fs::read(&unit.state_path).ok();
+            let lease = unit.try_immediate_at(11).unwrap();
+            fs::write(unit.rustc_dir.join("dep-graph.bin"), b"compiled").unwrap();
+
+            assert!(lease.finish(CompileOutcome::CompileError));
+            assert_eq!(fs::read(&unit.state_path).ok(), before);
+            assert!(unit.rustc_dir.join("dep-graph.bin").is_file());
+        }
+    }
+
+    #[test]
+    fn abnormal_exit_resets_every_lane() {
+        for kind in [LeaseKind::Active, LeaseKind::Seed, LeaseKind::Immediate] {
+            let (_temp, _args, unit) = fixture();
+            activate(&unit, 10);
+            let lease = match kind {
+                LeaseKind::Active => unit.try_active_at(12),
+                LeaseKind::Seed => unit.try_seed_at(
+                    &cache_key("third"),
+                    &fields("stable", "source-c", "extern-a"),
+                    12,
+                ),
+                LeaseKind::Immediate => unit.try_immediate_at(12),
+            }
+            .unwrap();
+            assert_eq!(lease.kind(), kind);
+
+            assert!(!lease.finish_at(CompileOutcome::Abnormal, 13));
+            assert!(!unit.state_path.exists(), "{kind:?}");
+            assert!(!unit.rustc_dir.exists(), "{kind:?}");
+        }
     }
 
     #[test]
@@ -1317,6 +1601,25 @@ mod tests {
     }
 
     #[test]
+    fn only_recorded_policy_state_can_seed() {
+        let (_temp, _args, unit) = fixture();
+        assert!(!unit.has_policy_state());
+        assert!(
+            unit.try_seed_at(
+                &cache_key("second"),
+                &fields("stable", "source-b", "extern-a"),
+                101,
+            )
+            .is_none(),
+            "without state no seed can run, so the compile need not wait for its key"
+        );
+        teach(&unit, 100);
+        assert!(unit.has_policy_state());
+        assert!(unit.reset());
+        assert!(!unit.has_policy_state());
+    }
+
+    #[test]
     fn invalid_state_is_not_stored() {
         let (_temp, _args, unit) = fixture();
         teach(&unit, 10);
@@ -1324,7 +1627,7 @@ mod tests {
         let mut invalid = read_state(&unit);
         invalid.schema += 1;
 
-        assert!(!unit.store_state(&invalid));
+        assert!(!unit.store_state(&invalid, true));
         assert_eq!(fs::read(&unit.state_path).unwrap(), original);
     }
 
@@ -1451,6 +1754,99 @@ mod tests {
         assert!(unit.try_immediate_at(11).is_none());
     }
 
+    /// An active unit leaves its edit loop through an observation, which
+    /// removes its rustc state first. A removal that fails part-way, or that
+    /// Ctrl-C cuts short, must not leave the old active state beside what
+    /// remains: the next build would lease a partial session.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_rustc_removal_never_leaves_a_leasable_state() {
+        use std::os::unix::fs::PermissionsExt;
+        // Root unlinks through mode 0500, which would void the simulation.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipping: running as root, chmod 0500 does not deny unlinks");
+            return;
+        }
+        let (_temp, _args, unit) = fixture();
+        activate(&unit, 10);
+        let stuck = unit.rustc_dir.join("s-stuck");
+        fs::create_dir(&stuck).unwrap();
+        fs::write(stuck.join("work-product.o"), b"object").unwrap();
+        fs::set_permissions(&stuck, fs::Permissions::from_mode(0o500)).unwrap();
+
+        let observed = unit.observe_build_at(
+            &cache_key("hit"),
+            &fields("stable", "source-c", "extern-a"),
+            12,
+        );
+        let leased = unit.try_active_at(13);
+        fs::set_permissions(&stuck, fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(!observed, "the removal failed, so nothing was observed");
+        assert!(
+            nonempty_real_directory(&unit.rustc_dir),
+            "the simulation must leave part of the rustc state behind"
+        );
+        assert!(
+            leased.is_none(),
+            "a partial rustc directory must not be leased"
+        );
+    }
+
+    /// Without its in-flight marker a reset removes nothing, so a removal cut
+    /// short can never leave part of the rustc state beside an active state.
+    #[cfg(unix)]
+    #[test]
+    fn a_reset_that_cannot_mark_the_unit_removes_nothing() {
+        use std::os::unix::fs::PermissionsExt;
+        // Root writes through mode 0500, which would void the simulation.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipping: running as root, chmod 0500 does not deny writes");
+            return;
+        }
+        let (_temp, _args, unit) = fixture();
+        activate(&unit, 10);
+        let active = fs::read(&unit.state_path).unwrap();
+        // The marker is written through a temporary file beside state.json.
+        // rustc/ itself stays writable.
+        fs::set_permissions(&unit.unit_dir, fs::Permissions::from_mode(0o500)).unwrap();
+        let observed = unit.observe_build_at(
+            &cache_key("hit"),
+            &fields("stable", "source-c", "extern-a"),
+            12,
+        );
+        fs::set_permissions(&unit.unit_dir, fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(!observed, "the marker failed, so nothing was observed");
+        assert_eq!(fs::read(&unit.state_path).unwrap(), active);
+        assert!(
+            unit.rustc_dir.join("dep-graph.bin").is_file(),
+            "rustc/ must stay whole beside the state it belongs to"
+        );
+        let lease = unit
+            .try_active_at(13)
+            .expect("a whole rustc directory may still be leased");
+        assert!(lease.finish_at(CompileOutcome::Success, 14));
+    }
+
+    /// Every lease treats a state path that is not a regular file as corrupt,
+    /// so a reset removes it, and any rustc state, without a marker.
+    #[test]
+    fn a_reset_removes_a_state_path_that_is_not_a_file() {
+        for rustc_state in [false, true] {
+            let (_temp, _args, unit) = fixture();
+            assert!(unit.ensure_layout());
+            fs::create_dir(&unit.state_path).unwrap();
+            if rustc_state {
+                fs::create_dir(&unit.rustc_dir).unwrap();
+                fs::write(unit.rustc_dir.join("dep-graph.bin"), b"old").unwrap();
+            }
+            assert!(unit.reset(), "rustc state: {rustc_state}");
+            assert!(!path_exists(&unit.state_path), "rustc state: {rustc_state}");
+            assert!(!path_exists(&unit.rustc_dir), "rustc state: {rustc_state}");
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn symlinked_managed_paths_fail_closed() {
@@ -1460,7 +1856,7 @@ mod tests {
         let incremental = args.incremental.as_ref().unwrap();
         fs::remove_dir(incremental).unwrap();
         symlink("elsewhere", incremental).unwrap();
-        assert!(AdaptiveUnit::eligible(&args, true, b"").is_none());
+        assert!(AdaptiveUnit::eligible(&args, b"").is_none());
 
         fs::remove_file(incremental).unwrap();
         fs::create_dir(incremental).unwrap();
@@ -1546,6 +1942,10 @@ mod tests {
         assert!(ensure_real_directory(&missing));
         assert!(real_directory(&missing));
         assert!(!definitely_missing(&missing));
+        assert!(
+            ensure_real_directory(&missing),
+            "a directory that already exists, as when another build created it first, counts"
+        );
         assert!(!ensure_real_directory(&regular));
 
         assert!(safe_absolute_path(&regular));

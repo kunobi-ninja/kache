@@ -3,13 +3,14 @@ use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
 mod common;
-use common::{build_kache, hermetic_command, isolated_config_path, kache_binary};
+use common::{build_kache, hermetic_command, isolated_config_path, kache_binary, settle_writes};
 
 fn run_kache_cc(project: &Path, cache_dir: &Path, args: &[&str]) {
     run_kache_cc_from(project, cache_dir, args);
 }
 
 fn run_kache_cc_from(cwd: &Path, cache_dir: &Path, args: &[&str]) {
+    settle_writes(&[cwd]);
     let output = hermetic_command(
         kache_binary(),
         cache_dir,
@@ -934,6 +935,7 @@ fn kache_caches_probe_keyed_flags(work: &Path) -> bool {
     let source = work.join("gate.c");
     std::fs::create_dir_all(&cache_dir).unwrap();
     std::fs::write(&source, "int gate(void) { return 0; }\n").unwrap();
+    settle_writes(&[work]);
 
     let ok = hermetic_command(
         kache_binary(),
@@ -1833,6 +1835,7 @@ fn test_cc_relative_depinfo_stays_writable_across_repeated_hits() {
     use std::os::unix::process::CommandExt;
 
     fn run_with_umask(project: &Path, cache_dir: &Path, args: &[&str], mask: u32) {
+        settle_writes(&[project]);
         let mut command = hermetic_command(
             kache_binary(),
             cache_dir,
@@ -3214,7 +3217,7 @@ cache_executables = true
     )
     .unwrap();
 
-    // Second build creates a second entry and triggers put() -> maybe_spawn_auto_gc
+    // Second build creates a second entry and triggers put() -> after_store
     let output = hermetic_command("cargo", cache_dir.path(), Some(&config_path))
         .args(["build"])
         .current_dir(test_project.path())

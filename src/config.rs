@@ -291,9 +291,9 @@ pub struct Config {
     /// For build-script runs, plain RUSTC_LINKER/RUSTC/RUSTDOC entries also
     /// normalize tool paths under KACHE_BASE_DIR and key their file contents.
     pub path_only_env_vars: Vec<String>,
-    /// Crate names whose eligible Cargo-primary compiles bypass the artifact
-    /// cache with policy-owned rustc incremental state, regardless of the
-    /// adaptive heuristic's state.
+    /// Crate names whose eligible compiles bypass the artifact cache with
+    /// policy-owned rustc incremental state, regardless of the adaptive
+    /// heuristic's state and of whether the Cargo command selects the package.
     ///
     /// Eligible listed crates use the adaptive policy's narrow Cargo layout,
     /// isolated directory, exclusive lease, hidden-input checks, and cache
@@ -397,7 +397,11 @@ pub struct Config {
     /// compiler reads). Off by default. A key derived after the compile, from
     /// the dep-info it emitted, always refuses a source modified since the
     /// build started; this option extends the check to the other keyed inputs
-    /// and to keys taken before the compile. Set via
+    /// and to keys taken before the compile, and refuses an input whose size,
+    /// write time or inode moved after the key read it. It applies to rustc:
+    /// C/C++ and CUDA compiles always check the files their key hashes, and a
+    /// key taken before such a compile does not count a stamp ahead of the
+    /// clock when it read the file as a write. Set via
     /// `KACHE_MODIFIED_INPUT_GUARD=1`/`=true` or `[cache] modified_input_guard`;
     /// env wins over the file.
     pub modified_input_guard: bool,

@@ -68,6 +68,162 @@ fn index_ddl_runs_once_per_schema_generation() {
     );
 }
 
+/// An index from before the C/C++ memo's rule columns holds memos an older
+/// release recorded under the old rules. The first open adds the columns
+/// and drops every memo, mapped hash and assembler verdict. An older
+/// release that opens the index later stamps its own generation back and
+/// records rows the old way: the next open drops nothing, keeps serving
+/// what this release recorded, and serves nothing the older release wrote.
+#[test]
+fn the_cc_memo_rule_columns_arrive_once_and_older_rows_are_never_served() {
+    const MEMO_TABLES: [&str; 5] = [
+        "cc_preprocess_memos",
+        "cc_memo_inputs",
+        "cc_memo_input_refs",
+        "cc_mapped_hashes",
+        "cc_asm_scans",
+    ];
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("index.db");
+    let stamp = |mtime_ns| crate::file_hash::FileFingerprint {
+        path: "/checkout/a.h".into(),
+        size: 1,
+        mtime_ns,
+        ctime_ns: mtime_ns,
+        inode: 1,
+    };
+    // The statements 1.0.0 records a memo, a mapped hash and a verdict with.
+    let record_as_older_release = |db: &Connection, memo_key: &str, mtime_ns: i64| {
+        let memo: i64 = db
+            .query_row(
+                "INSERT INTO cc_preprocess_memos(memo_key, preprocessed_hash, input_count)
+                 VALUES (?1, 'older', 0) ON CONFLICT(memo_key) DO UPDATE SET
+                 preprocessed_hash = excluded.preprocessed_hash, last_used = unixepoch()
+                 RETURNING id",
+                params![memo_key],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let input: i64 = db
+            .query_row(
+                "INSERT INTO cc_memo_inputs(name, content, mapped, local_path, size, mtime_ns, ctime_ns, inode)
+                 VALUES ('a.h', 'c', 'm', '/checkout/a.h', 1, ?1, ?1, 1)
+                 ON CONFLICT(name, content, mapped) DO UPDATE SET
+                 local_path = excluded.local_path, size = excluded.size,
+                 mtime_ns = excluded.mtime_ns, ctime_ns = excluded.ctime_ns, inode = excluded.inode
+                 RETURNING id",
+                params![mtime_ns],
+                |row| row.get(0),
+            )
+            .unwrap();
+        db.execute(
+            "INSERT OR IGNORE INTO cc_memo_input_refs(memo_id, input_id) VALUES (?1, ?2)",
+            params![memo, input],
+        )
+        .unwrap();
+        db.execute(
+            "UPDATE cc_preprocess_memos SET input_count =
+             (SELECT count(*) FROM cc_memo_input_refs WHERE memo_id = ?1) WHERE id = ?1",
+            params![memo],
+        )
+        .unwrap();
+        db.execute_batch(
+            "INSERT OR IGNORE INTO cc_mapped_hashes(content, maps, mapped)
+                 VALUES ('c', 'maps', 'older'), ('c2', 'maps', 'older');
+             INSERT OR IGNORE INTO cc_asm_scans(content, construct)
+                 VALUES ('c', 'older'), ('c2', 'older');",
+        )
+        .unwrap();
+    };
+    let rows = |db: &Connection| {
+        MEMO_TABLES.map(|table| {
+            db.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap()
+        })
+    };
+    let generation = |db: &Connection| -> i64 {
+        db.query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap()
+    };
+
+    let db = open_index_db(&path).unwrap();
+    db.execute_batch(
+        "ALTER TABLE cc_memo_inputs DROP COLUMN proof;
+         ALTER TABLE cc_mapped_hashes DROP COLUMN rule;
+         ALTER TABLE cc_asm_scans DROP COLUMN rule;",
+    )
+    .unwrap();
+    record_as_older_release(&db, "memo", 1);
+    db.pragma_update(None, "user_version", 8_i64).unwrap();
+    assert_eq!(rows(&db), [1, 1, 1, 2, 2]);
+    drop(db);
+
+    let db = open_index_db(&path).unwrap();
+    assert_eq!(generation(&db), INDEX_SCHEMA_GENERATION);
+    assert_eq!(
+        rows(&db),
+        [0; 5],
+        "rows from before the columns are dropped"
+    );
+    let cache = crate::file_hash::FileHashCache::Borrowed(&db);
+    let input = crate::file_hash::CcPreprocessMemoInput {
+        name: "a.h".into(),
+        fingerprint: stamp(1),
+        content: "c".into(),
+        mapped: "m".into(),
+        observed_ns: 10 * crate::file_hash::HASH_SETTLE_NS,
+    };
+    cache
+        .put_cc_preprocess_memo_inputs("memo", "current", std::slice::from_ref(&input))
+        .unwrap();
+    cache
+        .put_cc_mapped_hashes("maps", &[("c".into(), "current".into())])
+        .unwrap();
+    cache
+        .put_cc_asm_scans(&[("c".into(), String::new())])
+        .unwrap();
+    db.pragma_update(None, "user_version", 8_i64).unwrap();
+    record_as_older_release(&db, "older-memo", 1);
+    drop(db);
+
+    let db = open_index_db(&path).unwrap();
+    assert_eq!(
+        generation(&db),
+        INDEX_SCHEMA_GENERATION,
+        "the schema ran again"
+    );
+    assert_eq!(
+        rows(&db),
+        [2, 1, 2, 2, 2],
+        "nothing was dropped the second time"
+    );
+    let cache = crate::file_hash::FileHashCache::Borrowed(&db);
+    let memo = cache.get_cc_preprocess_memo("memo").unwrap().unwrap();
+    assert_eq!(memo.preprocessed_hash, "current");
+    assert_eq!(
+        memo.inputs[0].fingerprint,
+        stamp(1),
+        "rewritten unchanged, the stamp still proves the input"
+    );
+    let found = cache.get_cc_mapped_hashes("maps", &["c", "c2"]).unwrap();
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found["c"], "current");
+    let verdicts = cache.get_cc_asm_scans(&["c", "c2"]).unwrap();
+    assert_eq!(verdicts.len(), 1, "{verdicts:?}");
+    assert_eq!(verdicts["c"], "");
+
+    // The older release saw the shared input again with a later stamp.
+    record_as_older_release(&db, "older-memo", 7);
+    let memo = cache.get_cc_preprocess_memo("memo").unwrap().unwrap();
+    assert_eq!(
+        memo.inputs[0].fingerprint.size,
+        crate::cc_memo::UNPROVEN_SIZE
+    );
+    assert_eq!(memo.inputs[0].fingerprint.path, "/checkout/a.h");
+}
+
 /// An index stamped at generation 3 predates the crate-name index, and
 /// the stamp alone must not keep it from gaining one.
 #[test]
@@ -130,6 +286,178 @@ fn index_from_generation_four_gains_the_unit_column() {
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
     assert_eq!(generation, INDEX_SCHEMA_GENERATION);
+}
+
+/// An index from before `file_hashes.rule` loses its file hash rows once,
+/// when the column arrives. An older release that opens the index later
+/// stamps its own generation back and records rows without a rule: the next
+/// open keeps the rows this release memoised and never serves the older
+/// release's.
+#[test]
+fn an_older_release_reopening_the_index_does_not_empty_the_file_hash_memo() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("index.db");
+    let stamp = |file: &str| crate::file_hash::FileFingerprint {
+        path: file.to_string(),
+        size: 1,
+        mtime_ns: 1,
+        ctime_ns: 1,
+        inode: 1,
+    };
+    // The statement 1.0.0 records a row with.
+    let record_as_older_release = |db: &Connection, file: &str| {
+        db.execute(
+            "INSERT OR REPLACE INTO file_hashes
+             (path, size, mtime_ns, ctime_ns, inode, hash, updated_at)
+             VALUES (?1, 1, 1, 1, 1, 'older', datetime('now'))",
+            params![file],
+        )
+        .unwrap();
+    };
+    let rows = |db: &Connection| -> i64 {
+        db.query_row("SELECT count(*) FROM file_hashes", [], |row| row.get(0))
+            .unwrap()
+    };
+    let served = |db: &Connection, file: &str| {
+        crate::file_hash::FileHashCache::Borrowed(db)
+            .get(&stamp(file))
+            .unwrap()
+    };
+
+    let db = open_index_db(&path).unwrap();
+    db.execute_batch(
+        "DROP TABLE file_hashes;
+         CREATE TABLE file_hashes (
+             path TEXT PRIMARY KEY, size INTEGER NOT NULL, mtime_ns INTEGER NOT NULL,
+             ctime_ns INTEGER NOT NULL DEFAULT 0, inode INTEGER NOT NULL DEFAULT 0,
+             hash TEXT NOT NULL, updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+         ) WITHOUT ROWID;",
+    )
+    .unwrap();
+    record_as_older_release(&db, "/before-upgrade");
+    db.pragma_update(None, "user_version", 8_i64).unwrap();
+    drop(db);
+
+    let db = open_index_db(&path).unwrap();
+    assert_eq!(rows(&db), 0, "rows from before the column are dropped");
+    crate::file_hash::FileHashCache::Borrowed(&db)
+        .put(&stamp("/memoised"), "current")
+        .unwrap();
+    db.pragma_update(None, "user_version", 8_i64).unwrap();
+    record_as_older_release(&db, "/older-release");
+    drop(db);
+
+    let db = open_index_db(&path).unwrap();
+    let generation: i64 = db
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(generation, INDEX_SCHEMA_GENERATION, "the schema ran again");
+    assert_eq!(rows(&db), 2, "nothing was dropped the second time");
+    assert_eq!(served(&db, "/memoised").as_deref(), Some("current"));
+    assert_eq!(served(&db, "/older-release"), None);
+}
+
+/// GC in releases 0.27 to 1.0 opens the index when it starts and rebuilds
+/// a rowid `file_hashes` table, without `rule`, when it ends. If this
+/// release opened the index in between, the rebuild leaves generation 9 in
+/// place. The next open must add the column back, or every file hash
+/// lookup and write fails from then on.
+#[test]
+fn file_hashes_rebuilt_by_an_older_gc_after_the_upgrade_get_their_rule_back() {
+    // The columns 1.0.0 knows, for its rowid table and for the rebuild.
+    const OLDER_COLUMNS: &str = "path TEXT PRIMARY KEY, size INTEGER NOT NULL,
+        mtime_ns INTEGER NOT NULL, ctime_ns INTEGER NOT NULL DEFAULT 0,
+        inode INTEGER NOT NULL DEFAULT 0, hash TEXT NOT NULL,
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))";
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("index.db");
+    let stamp = crate::file_hash::FileFingerprint {
+        path: "/memoised".into(),
+        size: 1,
+        mtime_ns: 1,
+        ctime_ns: 1,
+        inode: 1,
+    };
+
+    // A store from before 0.27, just opened by the older GC.
+    let db = open_index_db(&path).unwrap();
+    db.execute_batch(&format!(
+        "DROP TABLE file_hashes; CREATE TABLE file_hashes ({OLDER_COLUMNS});"
+    ))
+    .unwrap();
+    db.pragma_update(None, "user_version", 8_i64).unwrap();
+    drop(db);
+
+    // This release adds `rule` to the rowid table and stamps 9.
+    let db = open_index_db(&path).unwrap();
+    let cache = crate::file_hash::FileHashCache::Borrowed(&db);
+    cache.put(&stamp, "current").unwrap();
+    // The rebuild 1.0.0 runs as the GC ends.
+    db.execute_batch(&format!(
+        "CREATE TABLE file_hashes_rebuilt ({OLDER_COLUMNS}) WITHOUT ROWID;
+         INSERT INTO file_hashes_rebuilt
+             (path, size, mtime_ns, ctime_ns, inode, hash, updated_at)
+             SELECT path, size, mtime_ns, ctime_ns, inode, hash, updated_at
+             FROM file_hashes;
+         DROP TABLE file_hashes;
+         ALTER TABLE file_hashes_rebuilt RENAME TO file_hashes;"
+    ))
+    .unwrap();
+    assert!(cache.get(&stamp).is_err(), "the rebuild dropped the column");
+    let generation: i64 = db
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(generation, INDEX_SCHEMA_GENERATION);
+    drop(db);
+
+    let db = open_index_db(&path).unwrap();
+    let cache = crate::file_hash::FileHashCache::Borrowed(&db);
+    assert_eq!(cache.get(&stamp).unwrap(), None, "copied rows name no rule");
+    cache.put(&stamp, "current").unwrap();
+    assert_eq!(cache.get(&stamp).unwrap().as_deref(), Some("current"));
+}
+
+/// Builds made while this release was in development stamped generation 9
+/// before the rule columns existed. The stamp must not keep any of them
+/// away.
+#[test]
+fn an_index_stamped_current_without_a_rule_column_gains_it() {
+    for (table, column) in [
+        ("file_hashes", "rule"),
+        ("cc_memo_inputs", "proof"),
+        ("cc_mapped_hashes", "rule"),
+        ("cc_asm_scans", "rule"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let db = open_index_db(&path).unwrap();
+        db.execute_batch(&format!("ALTER TABLE {table} DROP COLUMN {column}"))
+            .unwrap();
+        drop(db);
+
+        let db = open_index_db(&path).unwrap();
+        let present: bool = db
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2)",
+                params![table, column],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(present, "{table}.{column}");
+    }
+}
+
+/// Opening a current index only reads, so it succeeds while a build holds
+/// the write lock. Each schema statement would wait for that lock until
+/// the open gave up.
+#[test]
+fn opening_a_current_index_does_not_need_the_write_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("index.db");
+    drop(open_index_db(&path).unwrap());
+    let writer = Connection::open(&path).unwrap();
+    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+    open_index_db(&path).unwrap();
 }
 
 /// A put never learns its unit; the wrapper records it afterwards, and
@@ -4319,6 +4647,51 @@ fn target_root_registry_is_local_bounded_provenance_with_identity() {
     );
 
     store.forget_target_root(&target).unwrap();
+    assert!(store.tracked_target_roots(0).unwrap().is_empty());
+}
+
+#[test]
+fn forgetting_by_identity_keeps_a_row_recorded_for_a_new_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let store = Store::open(&config).unwrap();
+    let workspace = dir.path().join("workspace");
+    let target = workspace.join("target");
+    let tagged = |target: &Path| {
+        std::fs::create_dir_all(target.join("debug")).unwrap();
+        std::fs::write(
+            target.join("CACHEDIR.TAG"),
+            "Signature: 8a477f597d28d172789f06886806bc55",
+        )
+        .unwrap();
+    };
+    tagged(&target);
+    store.remember_target_root(&target, &workspace).unwrap();
+    let removed = store.tracked_target_roots(0).unwrap().remove(0).identity;
+    // Moved aside, the old directory keeps its inode while a build records
+    // a new one at the same path.
+    std::fs::rename(&target, workspace.join("aside")).unwrap();
+    tagged(&target);
+    store.remember_target_root(&target, &workspace).unwrap();
+    let current = store.tracked_target_roots(0).unwrap().remove(0).identity;
+    assert_ne!(current, removed);
+    let elsewhere = crate::filesystem::PathIdentity {
+        device: current.device.wrapping_add(1),
+        inode: current.inode,
+    };
+    for stale in [removed, elsewhere] {
+        store
+            .forget_target_root_with_identity(&target, stale)
+            .unwrap();
+        assert_eq!(
+            store.tracked_target_roots(0).unwrap().len(),
+            1,
+            "{stale:?} forgot the row for {current:?}"
+        );
+    }
+    store
+        .forget_target_root_with_identity(&target, current)
+        .unwrap();
     assert!(store.tracked_target_roots(0).unwrap().is_empty());
 }
 
@@ -12347,6 +12720,20 @@ fn read_only_store_serves_hits_and_writes_nothing() {
     assert!(
         ro.forget_target_root(src.path()).is_err(),
         "forget_target_root must be refused on a read-only store"
+    );
+    let identity = crate::filesystem::PathIdentity {
+        device: 1,
+        inode: 2,
+    };
+    // SQLite refuses the write too; the store must refuse it first.
+    let refused = ro
+        .forget_target_root_with_identity(src.path(), identity)
+        .unwrap_err();
+    assert!(
+        refused
+            .to_string()
+            .contains("refusing to forget a target root"),
+        "forget_target_root_with_identity must be refused on a read-only store: {refused:#}"
     );
     assert!(
         ro.clean_registered_incremental_dirs().is_err(),

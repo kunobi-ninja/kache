@@ -17,7 +17,7 @@ use tempfile::TempDir;
 // so the bootstrap helpers in `common` stay unused here.
 #[allow(dead_code)]
 mod common;
-use common::{hermetic_command, stop_daemon};
+use common::{hermetic_command, settle_writes, stop_daemon};
 
 /// Path to the binary under test. Cargo sets `CARGO_BIN_EXE_kache` to the
 /// artifact it built for this integration test — under `cargo llvm-cov` that
@@ -3149,6 +3149,7 @@ fn cc_compile_roundtrips_through_cache() {
         "int add(int a, int b){return a + b;}\n",
     )
     .unwrap();
+    settle_writes(&[project.path()]);
 
     // First compile: cache miss -> compile -> store.
     e.cmd()
@@ -3213,6 +3214,7 @@ fn cc_compile_with_depinfo_roundtrips() {
     let e = env();
     let project = TempDir::new().unwrap();
     std::fs::write(project.path().join("dep.c"), "int dep(void){return 7;}\n").unwrap();
+    settle_writes(&[project.path()]);
 
     let args = ["cc", "-c", "dep.c", "-MMD", "-MF", "dep.d", "-o", "dep.o"];
 
@@ -3259,6 +3261,7 @@ fn cc_entry_lacking_depfile_is_evicted_then_recached() {
     let e = env();
     let project = TempDir::new().unwrap();
     std::fs::write(project.path().join("ev.c"), "int ev(void){return 9;}\n").unwrap();
+    settle_writes(&[project.path()]);
 
     // Run 1: no depfile -> caches object only.
     e.cmd()

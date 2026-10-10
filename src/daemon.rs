@@ -3820,6 +3820,11 @@ impl Daemon {
     }
 
     pub fn handle_hash_files(&self, req: &HashFilesRequest) -> Response {
+        self.handle_hash_files_at(req, crate::cache_key::wall_clock_ns)
+    }
+
+    /// [`Self::handle_hash_files`] with the wall clock supplied.
+    fn handle_hash_files_at(&self, req: &HashFilesRequest, clock: impl Fn() -> i64) -> Response {
         let mut results = Vec::with_capacity(req.files.len());
 
         for file in &req.files {
@@ -3848,6 +3853,9 @@ impl Daemon {
                 continue;
             }
 
+            // Read before the stats below, so it is no later than the moment
+            // either of them saw the stamp.
+            let observed_ns = clock();
             match std::fs::metadata(&file.path) {
                 Ok(metadata)
                     if i64::try_from(metadata.len()).unwrap_or(i64::MAX) == file.size
@@ -3884,6 +3892,20 @@ impl Daemon {
                 }
             }
 
+            // A stamp that had changed within the settle window when it was
+            // observed can be kept by a second write in the same tick, so
+            // its hash goes back to this caller and is remembered nowhere.
+            let settled = crate::cache_key::stamp_is_settled(
+                &crate::cache_key::FileFingerprint {
+                    path: file.path.clone(),
+                    size: file.size,
+                    mtime_ns: file.mtime_ns,
+                    ctime_ns: file.ctime_ns,
+                    inode: file.inode,
+                },
+                observed_ns,
+            );
+
             // #281: hold the store mutex only for the cheap cache lookup and
             // record; run the blake3 read of the whole file OUTSIDE the lock so
             // it can't stall a concurrent RemoteCheck's `import_restored_entry`.
@@ -3893,11 +3915,14 @@ impl Daemon {
                     Ok(crate::cache_key::FileHashLookup::Hit(hash)) => Ok((hash, true, 0)),
                     Ok(crate::cache_key::FileHashLookup::NeedsHash(fp)) => {
                         crate::cache_key::hash_file(path).map(|hash| {
-                            // Brief re-lock just to persist the result.
-                            let _ = self.with_store(|store| {
-                                store.file_hash_record(&fp, &hash);
-                                Ok(())
-                            });
+                            // The lookup took its own stamp, after `observed_ns`.
+                            if crate::cache_key::stamp_is_settled(&fp, observed_ns) {
+                                // Brief re-lock just to persist the result.
+                                let _ = self.with_store(|store| {
+                                    store.file_hash_record(&fp, &hash);
+                                    Ok(())
+                                });
+                            }
                             (hash, false, file.size.max(0) as u64)
                         })
                     }
@@ -3910,7 +3935,7 @@ impl Daemon {
 
             match computed {
                 Ok((hash, cache_hit, bytes_hashed)) => {
-                    if let Ok(mut cache) = self.file_hash_cache.lock() {
+                    if settled && let Ok(mut cache) = self.file_hash_cache.lock() {
                         if cache.len() >= FILE_HASH_MEMORY_CACHE_CAP {
                             cache.clear();
                         }

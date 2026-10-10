@@ -7226,6 +7226,7 @@ fn remote_access_check(remote: &crate::config::RemoteConfig, pool_idle_secs: u64
         | crate::config::RemoteBackendConfig::Gcs(_) => None,
     };
     let key = crate::config::join_remote_key(&remote.prefix, "kache-doctor-probe");
+    let mut credentials = None;
     let result = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -7233,10 +7234,12 @@ fn remote_access_check(remote: &crate::config::RemoteConfig, pool_idle_secs: u64
         .and_then(|runtime| {
             runtime.block_on(async {
                 let backend = crate::remote_backend::create_backend(remote, pool_idle_secs).await?;
-                probe_remote(backend.as_ref(), &key, REMOTE_PROBE_TIMEOUT).await
+                let probe = probe_remote(backend.as_ref(), &key, REMOTE_PROBE_TIMEOUT).await;
+                credentials = backend.credential_source();
+                probe
             })
         });
-    remote_access_from(result, region.as_deref())
+    remote_access_from(result, region.as_deref(), credentials.as_deref())
 }
 
 async fn probe_remote(
@@ -7250,16 +7253,30 @@ async fn probe_remote(
         .map(drop)
 }
 
-fn remote_access_from(result: Result<()>, region: Option<&str>) -> RemoteAccess {
+/// `credentials` names where the probe's credentials came from, when the
+/// backend knows.
+fn remote_access_from(
+    result: Result<()>,
+    region: Option<&str>,
+    credentials: Option<&str>,
+) -> RemoteAccess {
     match result {
         Ok(()) => RemoteAccess {
             pass: true,
-            detail: "reachable; credentials accepted".to_string(),
+            detail: match credentials {
+                Some(source) => format!("reachable; credentials from {source} accepted"),
+                None => "reachable; credentials accepted".to_string(),
+            },
             fix: None,
         },
         Err(error) => RemoteAccess {
             pass: false,
-            detail: format!("{error:#}"),
+            // The chain stopped before the probe was sent, so the transport's
+            // part of the error adds nothing.
+            detail: match error.downcast_ref::<crate::remote_backend::CredentialFailure>() {
+                Some(failure) => failure.to_string(),
+                None => format!("{error:#}"),
+            },
             fix: Some(
                 crate::remote_backend::explain_remote_failure(&error, region).unwrap_or_else(
                     || "check the endpoint, bucket, region and credentials".to_string(),

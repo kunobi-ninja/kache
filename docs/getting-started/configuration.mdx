@@ -263,9 +263,9 @@ Builds through Kache record the target directories they use; `kache clean --dry-
 - target directories whose workspace was deleted and that no build has used for a day, such as the target of a removed worktree built with its own `CARGO_TARGET_DIR`. The day keeps a worktree that is moved or recreated from losing its target. Set `cache.auto_clean_orphaned_targets = false` or `KACHE_AUTO_CLEAN_ORPHANED_TARGETS=0` to keep them.
 - with `cache.auto_clean_idle_targets_days` set, target directories no build has used for that many days, whether or not their workspace still exists.
 
-It applies the same checks as `kache clean --yes`. A directory is removed only while it is still the Cargo target directory that was recorded, never when it holds a `Cargo.toml` or `.git`, and never while a running Cargo command or test holds it. The daemon renames it aside and checks once more before deleting it, so a build that starts at that moment gets a new directory. A workspace counts as deleted only when looking it up finds nothing; a permission or network error does not count. The daemon log names each directory it removes and why.
+It applies the same checks as `kache clean --yes`. A directory is removed only while it is still the Cargo target directory that was recorded, never when it holds a `Cargo.toml` or `.git`, and never while a running Cargo command or test holds it. The daemon renames it aside and checks once more before deleting it, so a build that starts at that moment gets a new directory and does not wait for the deletion. A workspace counts as deleted only when looking it up finds nothing; a permission or network error does not count. The daemon log names each directory it removes and why.
 
-Put Kache's `cargo` shim before the real Cargo on `PATH` to keep targets through `cargo test`, `cargo nextest`, and `cargo run`. The shim runs the real Cargo with the original arguments. The test runner also protects the target while a test binary runs. Cleanup skips targets while any such command is active.
+Put Kache's `cargo` shim before the real Cargo on `PATH` to keep targets through `cargo test`, `cargo nextest`, and `cargo run`. The shim runs the real Cargo with the original arguments. The test runner also protects the target while a test binary runs. Cleanup skips targets while any such command is active. A command that starts while `kache clean` or the daemon's unit pruning is deleting files waits until that finishes, and says so on stderr.
 
 The daemon also asks Git for the other worktrees of repositories it has seen in a build. It records default Cargo targets found there, including sibling worktrees outside the original directory. A custom target path is known only after Kache sees a build use it. By default the daemon neither watches nor removes a Git-discovered target, and `kache targets` shows its idle time as unknown.
 
@@ -304,7 +304,7 @@ Kache follows `build.target-dir`, `build.build-dir`, `CARGO_TARGET_DIR`, `CARGO_
 
 The Cargo shim and `kache cargo -- …` also pass `--target-dir` to the wrapper. They skip seeding for invocations with `--config`, `--manifest-path`, `-C`, or `-Z`. A compiler wrapper used without the Cargo shim cannot see those command-line options; use Cargo's configuration or environment variables to select a seedable directory.
 
-A unit whose build script or output files name the donor checkout, other than its own `OUT_DIR`, is not copied. Nothing is copied while a build holds either profile's lock or when no daemon is running. Config includes, unknown build-directory templates, and unreadable or invalid configuration are left unseeded. Set `cache.seed_new_targets = false` or `KACHE_SEED_NEW_TARGETS=0` to turn seeding off.
+A unit whose build script or output files name the donor checkout, other than its own `OUT_DIR`, is not copied. A Windows path also counts when written with forward slashes, as CMake writes it in `CMakeCache.txt`, or with doubled backslashes, as JSON and string literals write it, and its drive letter matches in either case. A build script whose output files add up to more than 256 MiB, or are not all read before the deadline, is not copied either. Nothing is copied while a build holds either profile's lock or when no daemon is running. Config includes, unknown build-directory templates, and unreadable or invalid configuration are left unseeded. Set `cache.seed_new_targets = false` or `KACHE_SEED_NEW_TARGETS=0` to turn seeding off.
 
 When the cache already holds a checkout's dependencies, seeding copies the same units it would otherwise restore one compiler call at a time.
 
@@ -351,10 +351,10 @@ Missing, changed or incomplete evidence keeps the units. Unsupported layouts, sy
 | `KACHE_CACHE_CC_LINKS` | `cache.cache_cc_links` | `false` | Cache C/C++ whole-program links and their sidecars. Off until path and reproducibility gates pass. |
 | `KACHE_TRUST_CODEGEN_BACKENDS` | `cache.trust_codegen_backends` | `false` | Cache rustc compiles that load a codegen backend dylib (`-Zcodegen-backend=<path>`), keyed by the dylib's contents. The backend must be passed as a path, and libraries it loads at run time are not part of the key. Off because a backend can write files rustc does not report, and a cache hit would not restore them. |
 | `KACHE_CLEAN_INCREMENTAL` | `cache.clean_incremental` | `true` | Remove tracked incremental directories during cleanup |
-| `KACHE_ADAPTIVE_INCREMENTAL` | `cache.adaptive_incremental` | `true` | Learn rapidly changing Cargo units and give them isolated incremental state |
+| `KACHE_ADAPTIVE_INCREMENTAL` | `cache.adaptive_incremental` | `true` | Give isolated incremental state to a workspace member or path dependency whose sources or dependencies changed since its last build in the same target, whether or not the command selects it. A pull or a branch switch counts. Kache skips the cache for up to eight builds of such a unit, each within 15 minutes of the last, and neither stores nor uploads them. A compile error keeps the state. See [Executables and incremental builds](/docs/getting-started/quick-start#executables-and-incremental-builds). |
 | `KACHE_PRESERVE_INCREMENTAL` | `cache.preserve_incremental` | `false` | Force eligible Cargo units onto isolated incremental state |
-| `KACHE_INCREMENTAL_CRATES` | `cache.incremental_crates` | `[]` | Force listed rustc crate names onto that incremental path |
-| `KACHE_MODIFIED_INPUT_GUARD` | `cache.modified_input_guard` | `false` | Do not store a result when a keyed input changed at or after build start. A compile that ran before its key, as in [misses without a record](/docs/how-it-works/cache-key#misses-without-a-record), is not stored when a source it read was modified at or after build start; this option extends the check to the other inputs a key hashes and to keys taken before the compile. |
+| `KACHE_INCREMENTAL_CRATES` | `cache.incremental_crates` | `[]` | Force listed rustc crate names onto that incremental path, whether or not the command selects them |
+| `KACHE_MODIFIED_INPUT_GUARD` | `cache.modified_input_guard` | `false` | Do not store a Rust result when a keyed input changed at or after build start, or just before it by the margin file times can trail the clock. A compile that ran before its key, as in [misses without a record](/docs/how-it-works/cache-key#misses-without-a-record), is not stored when a source it read changed then; this option extends the check to the other inputs a key hashes and to keys taken before the compile. A keyed input whose size, write time or inode differs after the compile from what the key read also leaves the result unstored, which catches a save between the key and the compiler's read. A rewrite that keeps all three is missed: a second save within one tick of a coarse file clock, or on Windows, which has no inode, a replacement with the same size and write time. C/C++ and CUDA compiles always apply this check to the files their key hashes. When the key comes before such a compile, a timestamp that is in the future when Kache reads the file counts as clock skew, not a change. |
 | `KACHE_INPUT_PREDICTIONS` | `cache.input_predictions` | `true` | Remember each crate's source closure and derive the next key from it, skipping the dep-info pre-pass when every recorded input still checks out |
 | `KACHE_VERIFY_INPUT_PREDICTIONS` | none | off | `sampled` or `always`: also run the dep-info pre-pass for a validated prediction and count disagreements in the report. The pre-pass result is the one used |
 | `KACHE_BUILD_SCRIPT_HERMETIC` | `cache.build_script_hermetic` | `false` | On Unix, run cached build scripts with `OUT_DIR` in a shared directory named by their inputs, so a run is shared across target directories. See [Build scripts](/docs/how-it-works/build-scripts). |
@@ -471,7 +471,7 @@ Values are hashed exactly and are not written to event logs. A value that change
 
 ## Hidden compile-time inputs
 
-Some macros read files that rustc does not report. Put `kache.toml` without a leading dot next to the crate manifest:
+Some macros read files that rustc does not report. If the package's build script already declares them with `cargo:rerun-if-changed`, Kache keys them without a declaration of its own (see [Build scripts](/docs/how-it-works/build-scripts#declared-inputs-in-the-rust-key)). Otherwise put `kache.toml` without a leading dot next to the crate manifest:
 
 ```toml title="crates/db/kache.toml"
 extra_inputs = [
@@ -512,7 +512,7 @@ Workspace rules are accepted only from the `.kache.toml` beside the active Cargo
 | `KACHE_REMOTE_RESTORE_TIMEOUT_SECS` | `cache.remote_restore_timeout_secs` | `300` | Daemon operation deadline; wrapper demand remains capped at three seconds |
 | `KACHE_REMOTE_NEGATIVE_TTL_SECS` | `cache.remote_negative_ttl_secs` | `60` | Cache definitive remote 404 results |
 
-Credentials resolve from explicit `KACHE_S3_ACCESS_KEY` and `KACHE_S3_SECRET_KEY`, standard AWS variables, the selected AWS profile, web identity, container credentials, then instance credentials.
+Credentials resolve from explicit `KACHE_S3_ACCESS_KEY` and `KACHE_S3_SECRET_KEY`, standard AWS variables, then the AWS profile. Web identity, container credentials and instance credentials follow only when no profile is selected. A selected profile that cannot supply credentials makes S3 requests fail; see [Selected profile](/docs/remote-cache/s3-setup#selected-profile).
 
 The `KACHE_S3_*` connection settings apply to S3. GCS and OCI require an explicit
 `cache.remote.type` and take their connection settings from TOML:

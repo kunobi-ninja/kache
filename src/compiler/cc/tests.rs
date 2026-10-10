@@ -276,6 +276,7 @@ fn terminal_formatting_shares_cc_keys_with_cold_and_warm_probes() {
                     key_salt: None,
                     key_env_vars: &[],
                     extra_inputs_digest: None,
+                    build_script_inputs_digest: None,
                 },
             )
             .unwrap()
@@ -298,6 +299,55 @@ fn terminal_formatting_shares_cc_keys_with_cold_and_warm_probes() {
         assert_eq!(key(&[flag], &warm), baseline);
     }
     assert_ne!(key(&["-ffp-contract=off"], &warm), baseline);
+}
+
+/// Entries stored before the input race fixes can hold an object built from
+/// other bytes than their key names, so no key of this release may be the
+/// one those builds computed under artifact schema 2. Unix only: the key
+/// runs the stand-in compiler, a shell script.
+#[cfg(unix)]
+#[test]
+fn a_key_from_before_the_input_race_fixes_is_never_todays() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("unit.c");
+    fs::write(&source, "int x;\n").unwrap();
+    let fake_cc =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mock_cc_diagnostics.sh");
+    let compiler = CcCompiler::new();
+    let file_hasher = crate::cache_key::FileHasher::new();
+    let path_normalizer = crate::path_normalizer::PathNormalizer::empty();
+    let parsed = compiler
+        .parse(&[
+            fake_cc.to_string_lossy().into_owned(),
+            "-c".into(),
+            source.to_string_lossy().into_owned(),
+        ])
+        .unwrap();
+    let ctx = KeyCtx {
+        file_hasher: &file_hasher,
+        path_normalizer: &path_normalizer,
+        cache_dir: &dir.path().join("cache"),
+        key_salt: None,
+        key_env_vars: &[],
+        extra_inputs_digest: None,
+        build_script_inputs_digest: None,
+    };
+    let key = |outcome: Result<CcKeyOutcome>| match outcome.unwrap() {
+        CcKeyOutcome::Key(key) => key,
+        CcKeyOutcome::Deferred(_) => panic!("an expansion key is never deferred"),
+    };
+    let today = key(compiler.cache_key_with(&parsed, &ctx, CcKeyDiscovery::Expansion));
+    assert_eq!(
+        today,
+        key(compiler.cache_key_with(&parsed, &ctx, CcKeyDiscovery::Expansion))
+    );
+    let before = key(compiler.cache_key_under(
+        b"cc_artifact_schema:2\n",
+        &parsed,
+        &ctx,
+        CcKeyDiscovery::Expansion,
+    ));
+    assert_ne!(today, before);
 }
 
 #[test]
@@ -2653,6 +2703,7 @@ fn cache_key_for_link_changes_when_an_object_changes() {
         key_salt: None,
         key_env_vars: &[],
         extra_inputs_digest: None,
+        build_script_inputs_digest: None,
     };
     let first = compiler.cache_key(&parsed, &ctx).unwrap();
     fs::write(&a, b"obj-a-v2").unwrap();
@@ -3141,6 +3192,7 @@ fn wa_debug_prefix_map_changes_cache_key_issue_644() {
         key_salt: None,
         key_env_vars: &[],
         extra_inputs_digest: None,
+        build_script_inputs_digest: None,
     };
 
     let key_a = compiler.cache_key(&parse("/mapped-a"), &ctx).unwrap();
@@ -3729,6 +3781,7 @@ fn cache_key_refuses_probe_captured_flags_without_resolved_invocation() {
             key_salt: None,
             key_env_vars: &[],
             extra_inputs_digest: None,
+            build_script_inputs_digest: None,
         };
 
         let err = compiler.cache_key(&parsed, &ctx).unwrap_err().to_string();
@@ -4111,6 +4164,35 @@ fn fold_cc_memo_field_changes_and_separates_hashes() {
     assert_ne!(first.finalize(), second.finalize());
 }
 
+/// A release that records v5 memos rewrites a memo row in place when it
+/// records the same key, and the row does not say which release wrote it.
+/// Rows recorded before the settle and single-read rules must never answer
+/// a lookup of this release, so its keys are never the v5 ones.
+#[test]
+fn a_memo_key_from_before_the_settle_rules_is_never_todays() {
+    // The key folds the working directory and keyed variables, which other
+    // tests change under this lock.
+    let _lock = crate::test_support::process_state_test_lock();
+    let compiler = std::env::current_exe()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let parsed = CcArgs::parse(&[compiler, "-c".to_string(), "memo-source.c".to_string()]).unwrap();
+    let today = cc_preprocess_memo_key(&parsed, &[], "test compiler version").unwrap();
+    assert_eq!(
+        today,
+        cc_preprocess_memo_key(&parsed, &[], "test compiler version").unwrap()
+    );
+    let before = cc_preprocess_memo_key_as(
+        b"cc-preprocess-memo-v5",
+        &parsed,
+        &[],
+        "test compiler version",
+    )
+    .unwrap();
+    assert_ne!(today, before);
+}
+
 #[test]
 fn cc_preprocess_memo_key_is_blake3_digest() {
     let compiler = std::env::current_exe()
@@ -4153,21 +4235,27 @@ fn cc_mapped_content_hash_digests_the_mapped_bytes() {
     ];
     let hash_a = cc_mapped_content_hash(&a, &maps).unwrap();
     let hash_b = cc_mapped_content_hash(&b, &maps).unwrap();
-    assert_eq!(hash_a.len(), 64, "a blake3 digest, not a placeholder");
     assert_eq!(
-        hash_a, hash_b,
+        hash_a.mapped.len(),
+        64,
+        "a blake3 digest, not a placeholder"
+    );
+    assert_eq!(
+        hash_a.mapped, hash_b.mapped,
         "contents the maps make equal must hash equal"
     );
+    // The raw digest names the bytes the mapped one was taken from.
+    assert_eq!(hash_a.raw, crate::cache_key::hash_file(&a).unwrap());
+    assert_eq!(hash_b.raw, crate::cache_key::hash_file(&b).unwrap());
     // The digest is of the MAPPED bytes, so it is not the raw digest.
     assert_ne!(
-        hash_a,
-        crate::cache_key::hash_file(&a).unwrap(),
+        hash_a.mapped, hash_a.raw,
         "mapping must actually change what is hashed"
     );
     // And two files the maps do not reconcile stay apart.
     assert_ne!(
-        hash_a,
-        cc_mapped_content_hash(&b, &[]).unwrap(),
+        hash_a.mapped,
+        cc_mapped_content_hash(&b, &[]).unwrap().mapped,
         "without the maps the two contents differ"
     );
     assert_eq!(
@@ -7068,6 +7156,7 @@ fn shadowing_header_changes_cc_cache_key() {
         key_salt: None,
         key_env_vars: &[],
         extra_inputs_digest: None,
+        build_script_inputs_digest: None,
     };
     let before = compiler.cache_key(&parse(), &ctx).unwrap();
     fs::write(first.join("header.h"), "#define A 2\n").unwrap();
@@ -7383,6 +7472,7 @@ fn direct_inputs_digest_follows_names_and_content_only() {
             ctime_ns: 3,
             inode: 4,
         },
+        observed_ns: 0,
     };
     let base = cc_direct_inputs_digest(&[input("a.c", "1"), input("b.h", "2")]);
     assert_eq!(base.len(), 64);
@@ -7461,6 +7551,57 @@ fn a_read_set_with_an_assembler_include_is_not_keyable() {
         cc_inputs_hide_assembler_input(&[dir.path().join("absent.h")]),
         None,
         "an unreadable input is the fingerprinting step's problem"
+    );
+}
+
+/// A captured read set that hides a file from the assembler is not keyed,
+/// and the debug log names the construct that hides it.
+#[test]
+fn a_captured_read_set_that_hides_an_assembler_input_names_the_construct() {
+    struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Capture {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("unit.c");
+    let header = dir.path().join("embed.h");
+    std::fs::write(&source, "#include \"embed.h\"\n").unwrap();
+    std::fs::write(&header, "__asm__(\".incbin \\\"blob.bin\\\"\");\n").unwrap();
+    let depfile = dir.path().join("unit.d");
+    let make = |path: &Path| path.to_string_lossy().replace(' ', "\\ ");
+    std::fs::write(
+        &depfile,
+        format!("unit.o: {} {}\n", make(&source), make(&header)),
+    )
+    .unwrap();
+    let source = source.to_string_lossy().into_owned();
+    let parsed = CcArgs::parse(&s(&["cc", "-c", &source])).unwrap();
+    let file_hasher = crate::cache_key::FileHasher::new();
+    let output = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let writer = std::sync::Arc::clone(&output);
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .without_time()
+        .with_ansi(false)
+        .with_writer(move || Capture(std::sync::Arc::clone(&writer)))
+        .finish();
+    let inputs = tracing::subscriber::with_default(subscriber, || {
+        CcCompiler::new().captured_inputs(&parsed, &depfile, &file_hasher)
+    });
+    assert!(inputs.is_none());
+    let log = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+    assert!(
+        log.contains(
+            "unit.c not keyed from its read set: \
+             the assembler may read a file the key cannot see (`.incbin`)"
+        ),
+        "{log}"
     );
 }
 
@@ -7956,7 +8097,8 @@ fn remembered_prefix_maps_follow_the_configured_base_dirs() {
 }
 
 /// Only a memo captured from the compile's own read set goes to the
-/// daemon; one from a preceding expansion stays on the revalidating path.
+/// daemon; one from a preceding expansion stays on the revalidating path,
+/// and so does one with a stamp observed before it settled.
 #[test]
 fn only_a_captured_memo_is_handed_to_the_daemon_and_discarding_forgets_it() {
     let input = crate::cache_key::CcPreprocessMemoInput {
@@ -7970,6 +8112,7 @@ fn only_a_captured_memo_is_handed_to_the_daemon_and_discarding_forgets_it() {
             ctime_ns: 3,
             inode: 4,
         },
+        observed_ns: 3 + crate::cache_key::HASH_SETTLE_NS,
     };
     let pending = |captured| PendingCcPreprocessMemo {
         memo_key: "k".repeat(64),
@@ -7995,6 +8138,22 @@ fn only_a_captured_memo_is_handed_to_the_daemon_and_discarding_forgets_it() {
     assert_eq!(memo.inputs, vec![input.clone()]);
     // Handing it over leaves it pending until the daemon has taken it.
     assert!(compiler.pending_preprocess_memo.borrow().is_some());
+
+    // A daemon from an older release would record any stamp it is given.
+    let mut unsettled = input.clone();
+    unsettled.name = "b.h".to_string();
+    unsettled.observed_ns -= 1;
+    compiler
+        .pending_preprocess_memo
+        .replace(Some(PendingCcPreprocessMemo {
+            fingerprints: vec![input.clone(), unsettled],
+            ..pending(true)
+        }));
+    assert!(compiler.captured_preprocess_memo().is_none());
+    assert!(
+        compiler.pending_preprocess_memo.borrow().is_some(),
+        "the wrapper records it itself"
+    );
 
     compiler.discard_preprocess_memo();
     assert!(compiler.pending_preprocess_memo.borrow().is_none());

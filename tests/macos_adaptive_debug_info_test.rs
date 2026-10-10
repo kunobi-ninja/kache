@@ -12,7 +12,7 @@ use tempfile::TempDir;
 
 #[allow(dead_code)]
 mod common;
-use common::{hermetic_command, kache_binary, stop_daemon};
+use common::{hermetic_command, kache_binary, settle_writes, stop_daemon};
 
 /// A package whose integration test, `it`, fails with a backtrace through a library function.
 /// It builds through Kache with its own target directory and cache.
@@ -24,7 +24,7 @@ struct Fixture {
     /// so a non-canonical target directory would leave the library's records outside the injected prefix.
     target: PathBuf,
     cache: TempDir,
-    /// Future, increasing source mtimes make Cargo rebuild every variant without sleeping.
+    /// Future, increasing source mtimes from the second build on make Cargo rebuild every variant without sleeping.
     first_mtime: i64,
     _dirs: [TempDir; 2],
 }
@@ -91,11 +91,17 @@ impl Fixture {
             ),
         )
         .unwrap();
-        filetime::set_file_mtime(
-            &source,
-            FileTime::from_unix_time(self.first_mtime + i64::from(salt), 0),
-        )
-        .unwrap();
+        // The first build keeps the real mtime. A unit without policy state compiles before its key,
+        // and a source stamped after the build started would keep it from being stored and from learning.
+        if salt > 1 {
+            filetime::set_file_mtime(
+                &source,
+                FileTime::from_unix_time(self.first_mtime + i64::from(salt), 0),
+            )
+            .unwrap();
+        }
+        // A source written just before the build started counts as written during it, too.
+        settle_writes(&[&self.package]);
 
         let before = self.events().len();
         let output = hermetic_command(env!("CARGO"), self.cache.path(), Some(&self.config()))
@@ -147,11 +153,29 @@ impl Fixture {
 
     /// Kache's events for `it`, the integration test's crate.
     fn events(&self) -> Vec<Value> {
+        self.crate_events("it")
+    }
+
+    /// Kache's events for the library's rlib, which `it` links. The library's unit-test harness has the same crate name.
+    fn library_events(&self) -> Vec<Value> {
+        self.crate_events("adaptive_debug_fixture")
+            .into_iter()
+            .filter(|event| {
+                event["rebuilt_paths"].as_array().is_some_and(|paths| {
+                    paths
+                        .iter()
+                        .any(|path| path.as_str().is_some_and(|path| path.ends_with(".rlib")))
+                })
+            })
+            .collect()
+    }
+
+    fn crate_events(&self, crate_name: &str) -> Vec<Value> {
         fs::read_to_string(self.cache.path().join("events.jsonl"))
             .unwrap_or_default()
             .lines()
             .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-            .filter(|event| event["crate_name"] == "it")
+            .filter(|event| event["crate_name"] == crate_name)
             .collect()
     }
 
@@ -224,6 +248,13 @@ fn adaptive_test_binaries_keep_a_readable_debug_map() {
     // Each build replaces the previous test binary, so run it before the next build.
     let seed = fixture.build(2);
     assert_passthrough(&seed.event, "adaptive seed");
+    let library = fixture.library_events();
+    assert!(
+        library
+            .last()
+            .is_some_and(|event| event["passthrough_reason"] == "adaptive seed"),
+        "the library must seed too, or its frames never come from an adaptive lane: {library:#?}",
+    );
     let seed_backtrace = fixture.backtrace(&seed);
 
     let active = fixture.build(3);

@@ -17,7 +17,7 @@ use crate::compiler::{
 };
 use crate::config::Config;
 use crate::events::{self, BuildEvent, EventResult};
-use crate::incremental_policy::{AdaptiveUnit, Lease};
+use crate::incremental_policy::{AdaptiveUnit, CompileOutcome, Lease, compile_outcome};
 use crate::key_env::KeyEnv;
 use crate::link;
 use crate::maintenance::unix_now_secs;
@@ -177,6 +177,15 @@ fn adaptive_seed_allowed(config: &Config, args: &RustcArgs) -> bool {
     adaptive_mode_enabled(config) && !force_incremental_requested(config, args)
 }
 
+/// Whether a managed unit must key before it compiles. Without recorded
+/// policy state no seed can run, so a unit that is not force-listed may
+/// compile first; a force-listed unit keeps keying first. A managed unit that
+/// is not force-listed implies adaptive mode is on, so the seed policy adds
+/// nothing here.
+fn managed_unit_keys_first(managed: bool, force_listed: bool, policy_state: bool) -> bool {
+    managed && (force_listed || policy_state)
+}
+
 /// Build the one safety-checked unit used by both adaptive and force-list
 /// incremental compiles. Declared inputs are checked only after the narrow
 /// Cargo layout is known to be eligible; rejecting them also clears any old
@@ -184,7 +193,6 @@ fn adaptive_seed_allowed(config: &Config, args: &RustcArgs) -> bool {
 fn managed_incremental_unit<F>(
     config: &Config,
     args: &RustcArgs,
-    cargo_primary: bool,
     extra_inputs_declared: F,
 ) -> Option<AdaptiveUnit>
 where
@@ -194,7 +202,7 @@ where
         return None;
     }
     let guard = adaptive_policy_guard(config);
-    let unit = AdaptiveUnit::eligible(args, cargo_primary, &guard)?;
+    let unit = AdaptiveUnit::eligible(args, &guard)?;
     if extra_inputs_declared() {
         let _ = unit.reset();
         return None;
@@ -202,12 +210,31 @@ where
     Some(unit)
 }
 
+/// Whether the pre-key incremental lanes may run. Never on a re-entry after a
+/// deferred compile: that compile already ran, and with a result it already
+/// reached Cargo, so no lane may start a second one.
 fn incremental_fast_path_allowed(
     has_refuse_reasons: bool,
     source_excluded: bool,
     skip_user_facing: bool,
+    reentered: bool,
 ) -> bool {
-    !has_refuse_reasons && !source_excluded && !skip_user_facing
+    !has_refuse_reasons && !source_excluded && !skip_user_facing && !reentered
+}
+
+/// Whether this is the keyed flow [`compile_before_key`] re-entered: with the
+/// compile's result after a miss, or with its emitted closure after it
+/// stopped the compile on a hit.
+fn reentered_after_deferred_compile(precompiled: bool, emitted_closure_waiting: bool) -> bool {
+    precompiled || emitted_closure_waiting
+}
+
+/// Whether an adaptive compile takes a slot in the scheduler's pool. A seed
+/// runs after a local and a remote miss, often as a full compile, so it waits
+/// for a slot like any other miss. The active and immediate lanes run before
+/// any key work, as passthroughs do.
+fn adaptive_lane_takes_permit(kind: crate::incremental_policy::LeaseKind) -> bool {
+    kind == crate::incremental_policy::LeaseKind::Seed
 }
 
 /// Whether this unit is refused caching outright: the compiler's own refusal
@@ -503,21 +530,15 @@ fn auto_gc_stamp_path(cache_dir: &Path) -> PathBuf {
 /// Decide whether a background GC should be spawned: auto-GC enabled, the
 /// throttle interval elapsed, and the store over `max_size` plus slack.
 /// Touches the stamp *before* the size query so concurrent wrappers don't
-/// stampede on the SQLite `SUM`. Split from [`maybe_spawn_auto_gc`] so the
-/// decision is unit-testable without spawning processes.
+/// stampede on the SQLite `SUM`. Split from [`after_store`] so the decision
+/// is unit-testable without spawning processes.
 fn auto_gc_wanted(config: &Config, store: &Store) -> bool {
     if !config.auto_gc {
         return false;
     }
     let stamp = auto_gc_stamp_path(&config.cache_dir);
-    if let Ok(meta) = std::fs::metadata(&stamp) {
-        match meta.modified().ok().and_then(|m| m.elapsed().ok()) {
-            Some(age) if age < AUTO_GC_CHECK_INTERVAL => return false,
-            // `elapsed()` errs when the mtime is in the future (clock skew /
-            // another process just touched it) — treat as fresh and skip.
-            None => return false,
-            _ => {}
-        }
+    if !auto_gc_check_due(&stamp) {
+        return false;
     }
 
     // Physical on-disk bytes, not the logical per-entry sum: the logical
@@ -542,11 +563,7 @@ fn auto_gc_wanted(config: &Config, store: &Store) -> bool {
     }
 
     // Exceeded threshold — claim this check slot before spawning GC
-    let now_str = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs().to_string())
-        .unwrap_or_default();
-    if std::fs::write(&stamp, now_str).is_err() {
+    if !claim_auto_gc_check(config, &stamp) {
         return false;
     }
 
@@ -559,16 +576,115 @@ fn auto_gc_wanted(config: &Config, store: &Store) -> bool {
     true
 }
 
-/// After a store: if [`auto_gc_wanted`] says so, get a sweep started without
-/// waiting for it.
-pub(crate) fn maybe_spawn_auto_gc(config: &Config, store: &Store) {
-    let _trace = crate::phase_trace::phase("auto_gc_check");
-    run_auto_gc_check(
+/// Whether the check interval has passed since a check last claimed `stamp`.
+fn auto_gc_check_due(stamp: &Path) -> bool {
+    if let Ok(meta) = std::fs::metadata(stamp) {
+        match meta.modified().ok().and_then(|m| m.elapsed().ok()) {
+            Some(age) if age < AUTO_GC_CHECK_INTERVAL => return false,
+            // `elapsed()` errs when the mtime is in the future (clock skew /
+            // another process just touched it) — treat as fresh and skip.
+            None => return false,
+            _ => {}
+        }
+    }
+    true
+}
+
+/// Claim the check slot by rewriting `stamp`. Without a free-space floor, a
+/// stamp that cannot be written drops the check, as it always has. With one,
+/// the volume is likely full, which is what recovery is for. Only the
+/// stamp's mtime is ever read, so moving it to now claims the slot too, and
+/// so does an empty stamp put in its place, which needs no data block. When
+/// none of that works the check is dropped, since one that claims nothing
+/// would go ahead after every put.
+fn claim_auto_gc_check(config: &Config, stamp: &Path) -> bool {
+    let now_str = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs().to_string())
+        .unwrap_or_default();
+    if std::fs::write(stamp, now_str).is_ok() {
+        return true;
+    }
+    if config.auto_recover_min_free_bytes == 0 {
+        return false;
+    }
+    if filetime::set_file_mtime(stamp, filetime::FileTime::now()).is_ok() {
+        return true;
+    }
+    let _ = std::fs::remove_file(stamp);
+    match std::fs::File::create_new(stamp) {
+        Ok(_) => true,
+        Err(e) => {
+            tracing::debug!("auto-gc: could not claim {}: {e}", stamp.display());
+            false
+        }
+    }
+}
+
+/// Follow up an attempt to store an entry, without blocking the compile.
+/// `failure` is why staging or the put failed, `None` once the entry is
+/// stored. A stored entry grew the store, so [`auto_gc_wanted`] decides
+/// whether to start a sweep. One the volume refused for lack of space stored
+/// nothing, so with a free-space floor set it asks for recovery itself, once
+/// per check interval and without the store size query.
+pub(crate) fn after_store(config: &Config, store: &Store, failure: Option<&anyhow::Error>) {
+    after_store_with(
         config,
         store,
+        failure,
         crate::daemon::send_gc_hint,
         spawn_auto_gc_worker,
     );
+}
+
+/// [`after_store`], hinting the daemon with `hint_daemon` and starting the
+/// worker with `spawn_worker` (see [`run_auto_gc_check`]).
+fn after_store_with(
+    config: &Config,
+    store: &Store,
+    failure: Option<&anyhow::Error>,
+    hint_daemon: impl FnOnce(&Config) -> bool,
+    spawn_worker: impl FnOnce(&Config),
+) {
+    let _trace = crate::phase_trace::phase("auto_gc_check");
+    let Some(error) = failure else {
+        run_auto_gc_check(config, store, hint_daemon, spawn_worker);
+        return;
+    };
+    if !is_storage_full(error) || !space_recovery_wanted(config, store) {
+        return;
+    }
+    tracing::info!(
+        "auto-gc: the volume of {} is full, requesting recovery",
+        store.cache_dir().display()
+    );
+    request_auto_gc(config, hint_daemon, spawn_worker);
+}
+
+/// Whether `error` says the volume ran out of space, at any depth of its
+/// context chain: `ENOSPC` from a file, or `SQLITE_FULL` from the index.
+fn is_storage_full(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::StorageFull)
+            || cause
+                .downcast_ref::<rusqlite::Error>()
+                .and_then(rusqlite::Error::sqlite_error_code)
+                == Some(rusqlite::ErrorCode::DiskFull)
+    })
+}
+
+/// Whether the store whose volume refused a write should be recovered now:
+/// recovery is on and due for it, and no check has claimed this interval.
+/// Claims it.
+fn space_recovery_wanted(config: &Config, store: &Store) -> bool {
+    let swept = config.for_store_dir(store.cache_dir(), crate::volume_gc::filesystem_bytes);
+    let stamp = auto_gc_stamp_path(&config.cache_dir);
+    if !crate::disk_recovery::wanted(&swept) || !auto_gc_check_due(&stamp) {
+        return false;
+    }
+    claim_auto_gc_check(config, &stamp)
 }
 
 /// A running daemon owns automatic eviction, so it gets a hint and nothing is
@@ -584,6 +700,15 @@ fn run_auto_gc_check(
     if !auto_gc_wanted(config, store) {
         return;
     }
+    request_auto_gc(config, hint_daemon, spawn_worker);
+}
+
+/// Hint a running daemon, or spawn the worker when no daemon takes the hint.
+fn request_auto_gc(
+    config: &Config,
+    hint_daemon: impl FnOnce(&Config) -> bool,
+    spawn_worker: impl FnOnce(&Config),
+) {
     if hint_daemon(config) {
         tracing::info!("auto-gc: handed the sweep to the daemon");
         return;
@@ -1066,10 +1191,7 @@ pub fn run_nvcc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     let rebuilt_package = KeyEnv::capture().var("CARGO_PKG_NAME");
     let _trace = crate::phase_trace::start("nvcc", wrapper_args);
     let start = wrapper_entry();
-    let invocation_start_ns = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_nanos() as i64)
-        .unwrap_or(0);
+    let invocation_start_ns = crate::cache_key::stamp_clock_ns();
     crate::link::set_windows_hardlink_restore(config.windows_hardlink);
     crate::link::set_shared_hardlink_restores(config.shared_hardlink_restores);
     crate::link::set_storage_layout_advice(config.storage_layout_advice);
@@ -1172,6 +1294,8 @@ pub fn run_nvcc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     // the real diagnostic.
     let key_start = std::time::Instant::now();
     let mut file_hasher = store.file_hasher();
+    // Checked after the compile: an input written since this invocation
+    // began keeps the object from being stored.
     file_hasher.arm_too_new_guard(invocation_start_ns, 0);
     let path_normalizer = crate::path_normalizer::PathNormalizer::empty();
     let key_ctx = KeyCtx {
@@ -1181,6 +1305,7 @@ pub fn run_nvcc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         key_salt: config.key_salt.as_deref(),
         key_env_vars: &config.key_env_vars,
         extra_inputs_digest: None,
+        build_script_inputs_digest: None,
     };
     let cache_key = match compiler.cache_key(&parsed, &key_ctx) {
         Ok(k) => k,
@@ -1355,13 +1480,26 @@ pub fn run_nvcc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         std::io::stdout(),
         std::io::stderr(),
     );
+    // The key hashed every input before nvcc ran; one written since may not
+    // be what the object was built from.
+    let inputs_changed = file_hasher.inputs_changed_since_keyed();
+    if inputs_changed {
+        tracing::debug!(
+            "nvcc: {crate_name} read an input modified during the build; not storing it"
+        );
+    }
 
-    // Only store a clean compile that produced its object. Anything
-    // else returns the exit code and lets the build see the failure.
+    // Only store a clean compile that produced its object from inputs that
+    // held still. A failed compile returns its exit code and lets the build
+    // see the failure.
     let store_start = std::time::Instant::now();
     let mut store_put = StorePutResult::default();
     let mut store_error = String::new();
-    let store_candidate = should_store_cc_result(result.exit_code, !result.artifacts.is_empty());
+    let store_candidate = cc_store_candidate(
+        should_store_cc_result(result.exit_code, !result.artifacts.is_empty()),
+        inputs_changed,
+        false,
+    );
     // nvcc entries are portable by construction (prefix-mapped objects,
     // pinned epoch, rewritten dep-info), so every stored entry may
     // publish to a writable remote.
@@ -1379,38 +1517,43 @@ pub fn run_nvcc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         let depinfo_anchor = nvcc_depinfo_rewrite_root(&parsed);
         let target = crate::compiler::nvcc::nvcc_target_label(&parsed.deferred_flags);
         match prepare_cc_store_files(&result.artifacts, depinfo_anchor.as_deref()) {
-            Ok(prepared) => match store.put_with_compile_time_independent(
-                &cache_key,
-                &crate_name,
-                &[], // crate_types: n/a for nvcc objects
-                &[], // features: n/a
-                &target,
-                "", // profile: n/a (opt level is in the key)
-                &prepared.files,
-                &result.stdout,
-                &result.stderr,
-                compile_time_ms,
-            ) {
-                Ok(put) => {
-                    store_put = put;
-                    // Store grew — throttled size check + detached background GC if over
-                    // budget (kunobi-ninja/kache#497). Never blocks the compile path.
-                    maybe_spawn_auto_gc(config, &store);
-                    flush_or_hand_off_durability(config, &store, &cache_key);
-                    maybe_enqueue_upload(config, &store, &cache_key, &crate_name, true);
+            Ok(prepared) => {
+                let put = store.put_with_compile_time_independent(
+                    &cache_key,
+                    &crate_name,
+                    &[], // crate_types: n/a for nvcc objects
+                    &[], // features: n/a
+                    &target,
+                    "", // profile: n/a (opt level is in the key)
+                    &prepared.files,
+                    &result.stdout,
+                    &result.stderr,
+                    compile_time_ms,
+                );
+                // A stored entry grew the store: throttled size check and a detached
+                // background GC if over budget (kunobi-ninja/kache#497). A put refused
+                // for lack of space asks for recovery. Neither blocks the compile.
+                after_store(config, &store, put.as_ref().err());
+                match put {
+                    Ok(put) => {
+                        store_put = put;
+                        flush_or_hand_off_durability(config, &store, &cache_key);
+                        maybe_enqueue_upload(config, &store, &cache_key, &crate_name, true);
+                    }
+                    Err(e) => {
+                        store_error = store_error_for_event(&e);
+                        tracing::warn!(
+                            "failed to store nvcc cache entry for {crate_name}: {store_error}"
+                        );
+                    }
                 }
-                Err(e) => {
-                    store_error = store_error_for_event(&e);
-                    tracing::warn!(
-                        "failed to store nvcc cache entry for {crate_name}: {store_error}"
-                    );
-                }
-            },
+            }
             Err(e) => {
                 store_error = store_error_for_event(&e);
                 tracing::warn!(
                     "failed to prepare nvcc cache entry for {crate_name}: {store_error}"
                 );
+                after_store(config, &store, Some(&e));
             }
         }
     }
@@ -1713,10 +1856,7 @@ fn nvcc_try_remote_hit(
 pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     let _trace = crate::phase_trace::start("cc", wrapper_args);
     let start = wrapper_entry();
-    let invocation_start_ns = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_nanos() as i64)
-        .unwrap_or(0);
+    let invocation_start_ns = crate::cache_key::stamp_clock_ns();
     run_cc_inner(config, wrapper_args, start, invocation_start_ns)
 }
 
@@ -1911,8 +2051,10 @@ fn run_cc_with_store(
     // surfaces the real diagnostic.
     let key_start = std::time::Instant::now();
     let mut file_hasher = store.file_hasher();
-    // Memo publication always uses the too-new guard: a header modified while
-    // preprocessing cannot safely describe the captured expansion.
+    // Flag inputs written since this invocation began. A deferred compile
+    // fingerprints what it read afterwards and stores neither an entry nor
+    // a memo once one is flagged. A key taken first is checked again once
+    // the compile has run (`FileHasher::inputs_changed_since_keyed`).
     file_hasher.arm_too_new_guard(invocation_start_ns, 0);
     let path_normalizer = crate::path_normalizer::PathNormalizer::empty();
     let key_ctx = KeyCtx {
@@ -1922,6 +2064,7 @@ fn run_cc_with_store(
         key_salt: config.key_salt.as_deref(),
         key_env_vars: &config.key_env_vars,
         extra_inputs_digest: None,
+        build_script_inputs_digest: None,
     };
     let mut captured_inputs_changed = false;
     let discovery = match precompiled.as_mut().and_then(|pre| pre.inputs.take()) {
@@ -2210,12 +2353,6 @@ fn run_cc_with_store(
             // capture ran on the outer hasher; this one saw only what the
             // key hashed afterwards, so both verdicts count.
             let changed = captured_inputs_changed || file_hasher.too_new();
-            if changed {
-                tracing::debug!(
-                    "cc: {} read an input modified during the build; not storing it",
-                    crate_name
-                );
-            }
             (pre.result, pre.compile_time_ms, changed)
         }
         None => {
@@ -2246,9 +2383,18 @@ fn run_cc_with_store(
                 std::io::stdout(),
                 std::io::stderr(),
             );
-            (result, compile_time_ms, false)
+            // The key hashed the read set before the compile ran; an input
+            // written since may not hold the bytes the compiler read.
+            let changed = file_hasher.inputs_changed_since_keyed();
+            (result, compile_time_ms, changed)
         }
     };
+    if inputs_changed {
+        tracing::debug!(
+            "cc: {} read an input modified during the build; not storing it",
+            crate_name
+        );
+    }
 
     // Only store on a clean compile that actually produced its
     // object file. A failed compile (exit != 0) or one whose output
@@ -2358,7 +2504,7 @@ fn run_cc_with_store(
                         }
                     }
                 }
-                match store.put_with_compile_time_independent(
+                let put = store.put_with_compile_time_independent(
                     &cache_key,
                     crate_name,
                     &[], // crate_types: n/a for cc objects
@@ -2369,12 +2515,14 @@ fn run_cc_with_store(
                     stdout,
                     &result.stderr,
                     compile_time_ms,
-                ) {
+                );
+                // A stored entry grew the store: throttled size check and a detached
+                // background GC if over budget (kunobi-ninja/kache#497). A put refused
+                // for lack of space asks for recovery. Neither blocks the compile.
+                after_store(config, store, put.as_ref().err());
+                match put {
                     Ok(result) => {
                         store_put = result;
-                        // Store grew — throttled size check + detached background GC if over
-                        // budget (kunobi-ninja/kache#497). Never blocks the compile path.
-                        maybe_spawn_auto_gc(config, store);
                         flush_or_hand_off_durability(config, store, &cache_key);
                         maybe_enqueue_upload(
                             config,
@@ -2401,6 +2549,9 @@ fn run_cc_with_store(
                     crate_name,
                     store_error
                 );
+                // Staging copies whole objects onto the cache volume when the
+                // daemon publishes, so this is where a full one shows first.
+                after_store(config, store, Some(&e));
             }
         }
     }
@@ -2698,13 +2849,9 @@ fn cc_event_root_in(
 /// The tag's text is checked, because other tools also write `CACHEDIR.TAG`.
 fn cargo_workspace_of(dir: &Path) -> Option<PathBuf> {
     dir.ancestors()
-        .find(|ancestor| is_cargo_cachedir_tag(&ancestor.join("CACHEDIR.TAG")))
+        .find(|ancestor| crate::tree_stamp::is_cargo_build_tag(&ancestor.join("CACHEDIR.TAG")))
         .and_then(Path::parent)
         .map(Path::to_path_buf)
-}
-
-fn is_cargo_cachedir_tag(path: &Path) -> bool {
-    std::fs::read_to_string(path).is_ok_and(|tag| tag.contains("created by cargo"))
 }
 
 /// The workspace of the build script a compiler runs under, from the
@@ -3166,12 +3313,9 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     crate::link::set_layout_advice_to_log(true);
     crate::link::set_cow_warn_marker(warn_marker_path("cow", &config.cache_dir));
     warn_nonlocal_cache_fs_once(config);
-    // Wall-clock build-start (ns since epoch) for the too-new-input guard;
-    // compared against keyed inputs' mtime/ctime (kunobi-ninja/kache#324).
-    let invocation_start_ns = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as i64)
-        .unwrap_or(0);
+    // Build start (ns since epoch) for the too-new-input guard, on the clock
+    // keyed inputs' mtime/ctime come from (kunobi-ninja/kache#324).
+    let invocation_start_ns = crate::cache_key::stamp_clock_ns();
 
     // Parse the rustc arguments (wrapper_args[0] is the rustc path).
     // Routed through the Compiler trait — see src/compiler/mod.rs. RustcArgs
@@ -3203,17 +3347,24 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     let extra_inputs_too_new = extra_inputs_hasher.too_new();
     let extra_inputs_guard_inputs = extra_inputs_hasher.take_guarded_inputs();
     let extra_inputs_key_ms = extra_inputs_key_start.elapsed().as_millis() as u64;
-    // A fallback cache does not know Kache's extra-input digest. If Kache
-    // declines an invocation, delegating it could restore the exact stale
-    // artifact this declaration is meant to prevent. Keep the fallback for
-    // ordinary crates, but use a plain compiler passthrough for this one.
+    // A fallback cache does not know Kache's extra-input digest, nor the
+    // inputs the unit's own build script declared. If Kache declines an
+    // invocation, delegating it could restore the exact stale artifact those
+    // inputs are keyed to prevent. Keep the fallback for ordinary crates, but
+    // use a plain compiler passthrough for these.
+    let drop_fallback = config.fallback.is_some()
+        && (extra_inputs.is_some() || build_script_declares_inputs(&args));
+    let drop_incremental = extra_inputs.is_some() && config.preserve_incremental;
     let mut safe_extra_inputs_config = None;
-    if extra_inputs.is_some() && (config.fallback.is_some() || config.preserve_incremental) {
+    if drop_fallback || drop_incremental {
         let mut safe = config.clone();
-        if safe.fallback.take().is_some() {
-            tracing::debug!("disabling fallback cache for active extra_inputs crate {crate_name}");
+        if drop_fallback {
+            tracing::debug!(
+                "disabling fallback cache for {crate_name}: its key holds inputs the fallback does not know"
+            );
+            safe.fallback = None;
         }
-        if safe.preserve_incremental {
+        if drop_incremental {
             tracing::debug!(
                 "disabling preserved incremental state for active extra_inputs crate {crate_name}"
             );
@@ -3234,6 +3385,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         extra_inputs_key_ms,
         extra_inputs_guard_inputs,
         None,
+        None,
     )?;
 
     if exit == 0 {
@@ -3247,6 +3399,20 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         crate::build_script::install_shim(&args);
     }
     Ok(exit)
+}
+
+/// Whether the unit's own build script declared inputs its key folds (see
+/// [`crate::build_script_inputs`]), judged before any route that can hand
+/// the compile to a fallback cache.
+fn build_script_declares_inputs(args: &RustcArgs) -> bool {
+    let cwd = std::env::current_dir().ok();
+    crate::build_script_inputs::locate(
+        args,
+        &|name: &str| std::env::var_os(name),
+        cwd.as_deref(),
+        crate::out_dir_alias::active_alias().is_some(),
+    )
+    .is_some_and(|located| crate::build_script_inputs::declares_inputs(&located))
 }
 
 /// Event root for a build-script run: the workspace whose target holds its
@@ -3322,6 +3488,186 @@ pub(crate) fn complete_extra_inputs_dep_info(
         })
 }
 
+/// What the key folds from the inputs the unit's own build script declared
+/// (see [`crate::build_script_inputs`]). Resolved before the compile and
+/// carried into the keyed flow a deferred compile re-enters.
+#[derive(Default)]
+struct BuildScriptInputs {
+    located: Option<crate::build_script_inputs::Located>,
+    snapshot: Option<crate::build_script_inputs::Snapshot>,
+    key_ms: u64,
+    hash_stats: FileHashStats,
+}
+
+impl BuildScriptInputs {
+    fn digest(&self) -> Option<&str> {
+        self.snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.digest.as_str())
+    }
+}
+
+/// Resolve the inputs the unit's own build script declared. The store's
+/// hasher memoises their content, and its guard keeps each file's
+/// fingerprint for the check after the compile (see
+/// [`build_script_inputs_moved`]). An error means the unit cannot be keyed
+/// without risking a stale hit.
+fn resolve_build_script_inputs(
+    config: &Config,
+    args: &RustcArgs,
+    store: &Store,
+    invocation_start_ns: i64,
+    workspace_root: Option<&Path>,
+    cwd: Option<&Path>,
+) -> Result<BuildScriptInputs> {
+    let _trace = crate::phase_trace::phase("build_script_inputs");
+    let start = std::time::Instant::now();
+    let Some(located) = crate::build_script_inputs::locate(
+        args,
+        &|name: &str| std::env::var_os(name),
+        cwd,
+        crate::out_dir_alias::active_alias().is_some(),
+    ) else {
+        return Ok(BuildScriptInputs::default());
+    };
+    let mut file_hasher = store.file_hasher_with_daemon(config.socket_path());
+    file_hasher.arm_too_new_guard(invocation_start_ns, 0);
+    let resolved = resolve_located_build_script_inputs(
+        config,
+        args,
+        store,
+        &located,
+        &file_hasher,
+        workspace_root,
+    )?;
+    let crate_name = args.crate_name.as_deref().unwrap_or("unknown");
+    let snapshot = match resolved {
+        crate::build_script_inputs::Resolved::Folded(snapshot) => {
+            // Counts only: a declared variable may hold a secret.
+            tracing::trace!(
+                "[key:{crate_name}] build_script_inputs package_mode={} paths={} vars={} -> {}",
+                snapshot.package_mode,
+                snapshot.paths,
+                snapshot.vars,
+                &snapshot.digest[..16],
+            );
+            Some(snapshot)
+        }
+        crate::build_script_inputs::Resolved::Unrecorded => None,
+        crate::build_script_inputs::Resolved::PackageUnkeyed(why) => {
+            warn_build_script_package_unkeyed(config, &located, &why);
+            None
+        }
+    };
+    Ok(BuildScriptInputs {
+        located: Some(located),
+        snapshot,
+        key_ms: start.elapsed().as_millis() as u64,
+        hash_stats: file_hasher.stats(),
+    })
+}
+
+/// [`crate::build_script_inputs::resolve`] with the roots this invocation
+/// leaves out of walked trees, spelling outside paths as the key does.
+fn resolve_located_build_script_inputs(
+    config: &Config,
+    args: &RustcArgs,
+    store: &Store,
+    located: &crate::build_script_inputs::Located,
+    file_hasher: &FileHasher<'_>,
+    workspace_root: Option<&Path>,
+) -> Result<crate::build_script_inputs::Resolved> {
+    let mut excluded = crate::build_script_inputs::excluded_roots(args.target_dir(), []);
+    excluded.extend(written_while_building(config, Some(store)));
+    let normalizer = std::cell::OnceCell::new();
+    let outside = |path: &Path| {
+        let normalizer = normalizer.get_or_init(|| {
+            crate::path_normalizer::PathNormalizer::from_env(workspace_root)
+                .with_target_dir(args.target_dir().as_deref())
+                .with_base_dirs(&config.base_dirs)
+        });
+        crate::cache_key::source_path_identity(path, normalizer)
+    };
+    crate::build_script_inputs::resolve(
+        located,
+        &crate::build_script_inputs::Resolver {
+            file_hasher,
+            var: &|name: &str| std::env::var_os(name),
+            cache_dir: &config.cache_dir,
+            excluded: &excluded,
+            outside: &outside,
+            max_entries: crate::build_script_inputs::MAX_ENTRIES,
+        },
+    )
+}
+
+/// Whether the inputs the key folded moved while the unit compiled: a
+/// resolve after the compile must give the same snapshot, and one that
+/// cannot counts as moved.
+fn build_script_inputs_moved(
+    config: &Config,
+    args: &RustcArgs,
+    store: &Store,
+    before: &BuildScriptInputs,
+    workspace_root: Option<&Path>,
+) -> bool {
+    let (Some(located), Some(snapshot)) = (&before.located, &before.snapshot) else {
+        return false;
+    };
+    let _trace = crate::phase_trace::phase("build_script_inputs_verify");
+    let crate_name = args.crate_name.as_deref().unwrap_or("unknown");
+    let file_hasher = store.file_hasher_with_daemon(config.socket_path());
+    match resolve_located_build_script_inputs(
+        config,
+        args,
+        store,
+        located,
+        &file_hasher,
+        workspace_root,
+    ) {
+        Ok(crate::build_script_inputs::Resolved::Folded(now)) if !snapshot.moved_since(&now) => {
+            false
+        }
+        Ok(_) => {
+            tracing::warn!(
+                "not caching {crate_name}: inputs its build script declared changed while it compiled"
+            );
+            true
+        }
+        Err(error) => {
+            tracing::warn!(
+                "not caching {crate_name}: inputs its build script declared could not be read after the compile: {error:#}"
+            );
+            true
+        }
+    }
+}
+
+/// Say, once per session and package, that the package's units are keyed
+/// without its files, and `why`.
+fn warn_build_script_package_unkeyed(
+    config: &Config,
+    located: &crate::build_script_inputs::Located,
+    why: &str,
+) {
+    let package = blake3::hash(located.manifest_dir.as_os_str().as_encoded_bytes()).to_hex();
+    let marker = warn_marker_path(
+        &format!("build-script-package-{}", &package[..16]),
+        &config.cache_dir,
+    );
+    warn_once_per_session_to(
+        &marker,
+        WARN_SESSION_SECS,
+        &format!(
+            "[kache] {}: its build script declares no inputs and {why}, so its units are keyed \
+             without the package's files. Print cargo:rerun-if-changed for the files its macros \
+             read.",
+            located.package,
+        ),
+        WarnSink::Log,
+    );
+}
+
 fn extra_inputs_changed_during_compile(
     config: &Config,
     args: &RustcArgs,
@@ -3365,7 +3711,8 @@ fn run_parsed_rustc(
     extra_inputs_hash_stats: FileHashStats,
     extra_inputs_too_new: bool,
     extra_inputs_key_ms: u64,
-    extra_inputs_guard_inputs: Vec<crate::cache_key::FileFingerprint>,
+    extra_inputs_guard_inputs: Vec<crate::cache_key::ObservedFingerprint>,
+    build_script_inputs: Option<&BuildScriptInputs>,
     mut precompiled: Option<Precompiled>,
 ) -> Result<i32> {
     let crate_name = args.crate_name.as_deref().unwrap_or("unknown");
@@ -3420,12 +3767,7 @@ fn run_parsed_rustc(
     let force_incremental = force_incremental_requested(config, args);
     let adaptive_policy_for_invocation = adaptive_seed_allowed(config, args);
     let trace_adaptive = crate::phase_trace::phase("adaptive_unit");
-    let adaptive_unit = managed_incremental_unit(
-        config,
-        args,
-        std::env::var_os("CARGO_PRIMARY_PACKAGE").is_some(),
-        || extra_inputs.is_some(),
-    );
+    let adaptive_unit = managed_incremental_unit(config, args, || extra_inputs.is_some());
     drop(trace_adaptive);
 
     // Evaluate every cheap cache-eligibility gate before the learned fast
@@ -3458,11 +3800,17 @@ fn run_parsed_rustc(
         .project_rules
         .user_bypass_reason(crate_name, &args.all_args);
     let skip_user_facing = args.is_user_facing_executable() && !config.cache_executables;
+    // Read before the key takes the closure a stopped compile left.
+    let reentered = reentered_after_deferred_compile(
+        precompiled.is_some(),
+        crate::cache_key::dep_info_provided(),
+    );
 
     if incremental_fast_path_allowed(
         unit_refuses_caching(!refuse.is_empty(), untrusted_codegen_backend.is_some()),
         excluded_source.is_some() || user_bypass.is_some(),
         skip_user_facing,
+        reentered,
     ) {
         if force_incremental {
             if let Some(lease) = adaptive_unit.as_ref().and_then(AdaptiveUnit::try_immediate) {
@@ -3621,6 +3969,58 @@ fn run_parsed_rustc(
         );
     };
 
+    // Resolved once, before anything compiles. A deferred compile re-enters
+    // with this snapshot instead of reading inputs it may have changed.
+    let resolved_build_script_inputs;
+    let build_script_inputs = match build_script_inputs {
+        Some(carried) => carried,
+        None => {
+            resolved_build_script_inputs = match resolve_build_script_inputs(
+                config,
+                args,
+                &store,
+                invocation_start_ns,
+                workspace_root.as_deref(),
+                current_dir.as_deref(),
+            ) {
+                Ok(resolved) => resolved,
+                Err(e) => {
+                    tracing::warn!("not caching {crate_name}: {e:#}");
+                    return rustc_direct_passthrough_with_event(
+                        config,
+                        args,
+                        crate_name,
+                        &event_root,
+                        start,
+                        &format!("{UNCACHEABLE_REASON}build-script inputs: {e:#}"),
+                        key_record,
+                    );
+                }
+            };
+            &resolved_build_script_inputs
+        }
+    };
+    // The declared inputs have their own check after the compile (see
+    // `build_script_inputs_moved`), so only their cost joins the key's.
+    let (inputs_key_ms, inputs_hash_stats, inputs_too_new) = combine_key_measurements(
+        extra_inputs_key_ms,
+        build_script_inputs.key_ms,
+        extra_inputs_hash_stats,
+        build_script_inputs.hash_stats,
+        extra_inputs_too_new,
+        false,
+    );
+    // Taken after the fast path, which resets corrupt or interrupted state:
+    // a unit left without state has no lane its key could open. When no lane
+    // takes its miss, such a unit compiles before keying again after all
+    // ([`compile_before_key_after_miss`]).
+    let keys_first = managed_unit_keys_first(
+        adaptive_unit.is_some(),
+        force_incremental,
+        adaptive_unit
+            .as_ref()
+            .is_some_and(AdaptiveUnit::has_policy_state),
+    );
     let keyed = match compute_rustc_cache_key(
         config,
         compiler,
@@ -3631,17 +4031,18 @@ fn run_parsed_rustc(
         &key_env,
         ExtraInputsKey {
             digest: extra_inputs.and_then(crate::extra_inputs::ExtraInputsSnapshot::digest),
-            hash_stats: extra_inputs_hash_stats,
-            too_new: extra_inputs_too_new,
-            key_ms: extra_inputs_key_ms,
+            build_script_inputs: build_script_inputs.digest(),
+            hash_stats: inputs_hash_stats,
+            too_new: inputs_too_new,
+            key_ms: inputs_key_ms,
             guard_inputs: extra_inputs_guard_inputs,
         },
         match precompiled
             .as_mut()
-            .and_then(|pre| Some((pre.dep_info.take()?, pre.tree_digest.take())))
+            .and_then(|pre| Some((pre.dep_info.take()?, pre.tree_guard.take())))
         {
             Some((dep_info, tree)) => KeyDiscovery::Emitted(dep_info, tree),
-            None if deferral_allowed(config, args, adaptive_unit.is_some(), extra_inputs) => {
+            None if deferral_allowed(config, args, keys_first, extra_inputs) => {
                 KeyDiscovery::Deferrable {
                     stop_on_hit: stop_on_hit_allowed(args),
                 }
@@ -3669,7 +4070,7 @@ fn run_parsed_rustc(
         mut cache_key,
         deferred,
         stop_on_hit,
-        discovery_flight: _discovery_flight,
+        discovery_flight,
         predicted,
         outputs: mut key_outputs,
         mut key_ms,
@@ -3689,6 +4090,7 @@ fn run_parsed_rustc(
         extra_inputs_hash_stats,
         extra_inputs_too_new,
         extra_inputs_key_ms,
+        build_script_inputs,
         workspace_root: workspace_root.as_deref(),
         store: &store,
         key_env: &key_env,
@@ -3697,13 +4099,13 @@ fn run_parsed_rustc(
     };
     if deferred {
         // No record and nowhere else the entry could be: compile now, then
-        // key from what rustc emitted. `_discovery_flight` stays held across
+        // key from what rustc emitted. `discovery_flight` stays held across
         // the recursion so peers wait for this compile.
         tracing::debug!("no closure record for {crate_name}; compiling before keying");
         return compile_before_key(
             &compile_first,
             stop_on_hit,
-            key_outputs.tree_digest,
+            key_outputs.tree_guard,
             guard_inputs,
             key_record,
             key_ms,
@@ -3778,6 +4180,13 @@ fn run_parsed_rustc(
     let mut lookup_ms = 0_u64;
     let mut record_closure = should_record_closure(predicted, false);
     let mut rederived = false;
+    // A unit that keyed first only so that its miss could take an
+    // incremental lane. A re-entry keys from the closure of a compile it
+    // stopped, and never compiles before its key again.
+    let keyed_first = keys_first && !reentered;
+    let may_defer = deferral_allowed(config, args, false, extra_inputs);
+    // `Some(stop_on_hit)` once the miss is to compile before its key.
+    let mut compile_then_key = None;
     while precompiled.is_none() {
         // 1. Check local store (volume shard, then main)
         let lookup_start = std::time::Instant::now();
@@ -3892,6 +4301,10 @@ fn run_parsed_rustc(
         if let (Some(unit), Some(fields)) = (adaptive_unit.as_ref(), adaptive_key_fields.as_ref())
             && let Some(lease) = unit.try_seed(&cache_key, fields)
         {
+            // A seed stores no entry and records no closure, so a peer
+            // waiting on this unit's discovery flight would wait for nothing.
+            // Release it before the seed waits for a permit and compiles.
+            drop(discovery_flight);
             return adaptive_incremental_with_event(
                 config,
                 args,
@@ -3905,25 +4318,12 @@ fn run_parsed_rustc(
             );
         }
 
-        if !owes_rederivation(predicted, rederived) {
+        // Every incremental lane has declined by now.
+        let owes = owes_rederivation(predicted, rederived);
+        compile_then_key =
+            compile_before_key_after_miss(may_defer, stop_on_hit_allowed(args), owes, keyed_first);
+        if compile_then_key.is_some() || !owes {
             break;
-        }
-        // A predicted key missed and must be re-derived before anything is
-        // stored. The compile writes the same closure the pre-pass would, at
-        // the same point, so start it and key from that instead.
-        if deferral_allowed(config, args, adaptive_unit.is_some(), extra_inputs)
-            && stop_on_hit_allowed(args)
-        {
-            tracing::debug!("{crate_name}: predicted key missed; compiling while re-deriving");
-            return compile_before_key(
-                &compile_first,
-                true,
-                key_outputs.tree_digest,
-                guard_inputs,
-                key_record,
-                key_ms,
-                key_hash_stats,
-            );
         }
         rederived = true;
         record_closure = should_record_closure(predicted, rederived);
@@ -3937,11 +4337,17 @@ fn run_parsed_rustc(
             Some(&store),
             &key_env,
             extra_inputs.and_then(crate::extra_inputs::ExtraInputsSnapshot::digest),
+            build_script_inputs.digest(),
             &mut key_record,
         ) {
             Ok(recomputed) => {
                 cache_key = recomputed.cache_key;
+                // The re-derivation runs with predictions off and takes no
+                // tree guard. The one the first computation took, before
+                // anything ran, is the one the record carries.
+                let first_guard = key_outputs.tree_guard.take();
                 key_outputs = recomputed.outputs;
+                key_outputs.tree_guard = key_outputs.tree_guard.take().or(first_guard);
                 // Accumulate rather than replace: the first computation's
                 // measurements already include the extra-inputs resolve, and
                 // this second pass is real time this invocation spent.
@@ -3971,8 +4377,26 @@ fn run_parsed_rustc(
         if cache_key == previous_key {
             // The prediction was right. Both lookups already answered for
             // this key; asking again would be the same two misses.
+            compile_then_key = compile_before_key_after_miss(
+                may_defer,
+                stop_on_hit_allowed(args),
+                false,
+                keyed_first,
+            );
             break;
         }
+    }
+    if let Some(stop_on_hit) = compile_then_key {
+        tracing::debug!("{crate_name}: no lane took the miss; compiling before keying again");
+        return compile_before_key(
+            &compile_first,
+            stop_on_hit,
+            key_outputs.tree_guard,
+            guard_inputs,
+            key_record,
+            key_ms,
+            key_hash_stats,
+        );
     }
 
     // 3. Cache miss — join the machine-wide flight, take a permit, then
@@ -4120,7 +4544,8 @@ fn run_parsed_rustc(
     // is in place; we just don't cache it). The lookup above still ran, so a
     // sound prior entry can still be served. A key derived after the compile
     // always refuses a written dep-info source; any keyed input refuses only
-    // with `modified_input_guard`. A tripped wall-clock flag is excused when
+    // with `modified_input_guard`, which also refuses an input that moved
+    // after the key read it. A tripped wall-clock flag is excused when
     // fingerprints prove no input changed: the flag also fires across clock
     // domains where nothing is actually racy.
     let extra_inputs_racy = args.is_primary
@@ -4146,6 +4571,31 @@ fn run_parsed_rustc(
             EventInputs::new(&event_root, crate_name, EventResult::Skipped, elapsed)
                 .rebuilt_observed(rebuilt.clone())
                 .skip_reason("inputs-changed")
+                .keyed(&cache_key, key_ms, key_hash_stats)
+                .lookup_ms(lookup_ms)
+                .key_record(key_record),
+        );
+        print_progress(crate_name, EventResult::Skipped, elapsed, 0);
+        drop(lock);
+        return Ok(result.exit_code);
+    }
+
+    // The key folded the build script's declared inputs as they were before
+    // the compile. A macro may have read them after they moved.
+    if build_script_inputs_moved(
+        config,
+        args,
+        &store,
+        build_script_inputs,
+        workspace_root.as_deref(),
+    ) {
+        let elapsed = start.elapsed().as_millis() as u64;
+        log_event(
+            config,
+            EventInputs::new(&event_root, crate_name, EventResult::Skipped, elapsed)
+                .rebuilt_observed(rebuilt.clone())
+                .skip_reason("build-script-inputs-changed")
+                .compile_time_ms(compile_time_ms)
                 .keyed(&cache_key, key_ms, key_hash_stats)
                 .lookup_ms(lookup_ms)
                 .key_record(key_record),
@@ -4362,6 +4812,7 @@ fn run_parsed_rustc(
                 "not caching {}: dep-info could not be staged safely: {error:#}",
                 crate_name
             );
+            after_store(config, &store, Some(&error));
             let elapsed = start.elapsed().as_millis() as u64;
             log_event(
                 config,
@@ -4411,7 +4862,7 @@ fn run_parsed_rustc(
     let trace_store = crate::phase_trace::phase("store");
     let mut store_put = StorePutResult::default();
     let mut store_error = String::new();
-    match store.put_with_compile_time(
+    let put = store.put_with_compile_time(
         &cache_key,
         crate_name,
         &args.crate_types,
@@ -4422,7 +4873,12 @@ fn run_parsed_rustc(
         &result.stdout,
         &result.stderr,
         compile_time_ms,
-    ) {
+    );
+    // A stored entry grew the store: throttled size check and a detached
+    // background GC if over budget (kunobi-ninja/kache#497). A put refused for
+    // lack of space asks for recovery. Neither blocks the compile.
+    after_store(config, &store, put.as_ref().err());
+    match put {
         Ok(result) => {
             store_put = result;
             if let Some(unit) = args.get_codegen_opt("metadata")
@@ -4439,9 +4895,6 @@ fn run_parsed_rustc(
                     shared_inode_loadable(args, platform::current().may_share_restored_loadables());
                 remember_prestaged_executables(config, compiler, args, &output_dir, shared, &meta);
             }
-            // Store grew — throttled size check + detached background GC if over
-            // budget (kunobi-ninja/kache#497). Never blocks the compile path.
-            maybe_spawn_auto_gc(config, &store);
             flush_or_hand_off_durability(config, &store, &cache_key);
         }
         // Name the crate, as the cc path already does: a failed store leaves that
@@ -4466,7 +4919,7 @@ fn run_parsed_rustc(
 
     record_input_prediction(config, Some(&store), args, record_closure, &key_outputs);
 
-    // 7. Clean incremental dir, as with kache's caching, incremental compilation is redundant
+    // 7. Remove Cargo's own incremental directory; see `clean_incremental_dir`.
     clean_incremental_dir(config, args);
 
     let elapsed = start.elapsed().as_millis() as u64;
@@ -5484,6 +5937,10 @@ struct ComputedKey {
     /// With `deferred`: an entry could exist, so the compile keys from its
     /// dep-info as soon as rustc writes it and stops on a hit.
     stop_on_hit: bool,
+    /// The unit's discovery flight, when this computation joined one. The
+    /// invocation holds it until it has stored its entry and recorded its
+    /// closure, which peers discovering the same unit wait for. A seed
+    /// leaves neither, so it releases the flight before it compiles.
     discovery_flight: Option<crate::store::StoreLock>,
     /// Did this key come from a recorded closure rather than the pre-pass?
     /// The caller owes it a re-derivation before the key may reach anything
@@ -5498,11 +5955,11 @@ struct ComputedKey {
     /// Fingerprints taken before the compile while the too-new guard was
     /// armed: the extra-inputs resolve, and the key's own when the key came
     /// first. Carried past the compile for clock-independent verification.
-    guard_inputs: Vec<crate::cache_key::FileFingerprint>,
+    guard_inputs: Vec<crate::cache_key::ObservedFingerprint>,
     /// `Some` for a key derived from the dep-info a compile emitted: the
     /// fingerprints its inputs had when hashed, after rustc read them. They
     /// say nothing about what the compile saw.
-    hashed_after_compile: Option<Vec<crate::cache_key::FileFingerprint>>,
+    hashed_after_compile: Option<Vec<crate::cache_key::ObservedFingerprint>>,
     /// The emitted dep-info's files that `hashed_after_compile` shows written
     /// since the invocation began (see [`sources_written_since`]).
     written_sources: Vec<crate::cache_key::FileFingerprint>,
@@ -5515,9 +5972,9 @@ struct Precompiled {
     compile_time_ms: u64,
     /// Taken by the key computation; `None` afterwards.
     dep_info: Option<crate::cache_key::DepInfo>,
-    /// The tree digest the deferred key took before the compile, handed to
+    /// The tree guard the deferred key took before the compile, handed to
     /// the key with `dep_info`.
-    tree_digest: Option<String>,
+    tree_guard: Option<crate::cache_key::TreeGuard>,
     /// What the deferred key recorded for the event. The keyed flow the
     /// compile re-enters continues this record.
     key_record: KeyEventRecord,
@@ -5534,6 +5991,9 @@ struct CompileFirst<'a> {
     extra_inputs_hash_stats: FileHashStats,
     extra_inputs_too_new: bool,
     extra_inputs_key_ms: u64,
+    /// Resolved before the compile; every key the compile re-enters with
+    /// folds it.
+    build_script_inputs: &'a BuildScriptInputs,
     workspace_root: Option<&'a Path>,
     store: &'a Store,
     key_env: &'a KeyEnv,
@@ -5541,16 +6001,41 @@ struct CompileFirst<'a> {
     event_root: &'a str,
 }
 
+/// The key a compile stopped on a hit is looked up under: the closure the
+/// compile emitted, with the build script's declared inputs. Extra inputs
+/// never reach a deferred compile (see [`deferral_allowed`]).
+fn stop_on_hit_key(
+    ctx: &CompileFirst<'_>,
+    dep_info: crate::cache_key::DepInfo,
+    tree: Option<crate::cache_key::TreeGuard>,
+) -> Result<ComputedKey> {
+    compute_rustc_cache_key(
+        ctx.config,
+        ctx.compiler,
+        ctx.args,
+        ctx.workspace_root,
+        ctx.invocation_start_ns,
+        Some(ctx.store),
+        ctx.key_env,
+        ExtraInputsKey {
+            build_script_inputs: ctx.build_script_inputs.digest(),
+            ..ExtraInputsKey::default()
+        },
+        KeyDiscovery::Emitted(dep_info, tree),
+        &mut KeyEventRecord::default(),
+    )
+}
+
 /// Compile before the key is known, then key from the dep-info the compile
 /// wrote and store as usual (re-entering [`run_parsed_rustc`] with the
 /// result). With `stop_on_hit`, key as soon as rustc reports that dep-info
-/// and stop the compile if the key is stored. `tree_digest` is the digest
+/// and stop the compile if the key is stored. `tree_guard` is the guard
 /// taken before the compile.
 fn compile_before_key(
     ctx: &CompileFirst<'_>,
     stop_on_hit: bool,
-    tree_digest: Option<String>,
-    guard_inputs: Vec<crate::cache_key::FileFingerprint>,
+    tree_guard: Option<crate::cache_key::TreeGuard>,
+    guard_inputs: Vec<crate::cache_key::ObservedFingerprint>,
     key_record: KeyEventRecord,
     key_ms: u64,
     key_hash_stats: FileHashStats,
@@ -5586,24 +6071,12 @@ fn compile_before_key(
     // in time, without a second rustc.
     let mut hit_closure = None;
     let executed = if stop_on_hit {
-        let tree = tree_digest.clone();
+        let tree = tree_guard.clone();
         let mut on_dep_info = || {
             let Some(dep_info) = emitted_dep_info(args) else {
                 return true;
             };
-            let mut record = KeyEventRecord::default();
-            let keyed = compute_rustc_cache_key(
-                config,
-                compiler,
-                args,
-                ctx.workspace_root,
-                invocation_start_ns,
-                Some(ctx.store),
-                ctx.key_env,
-                ExtraInputsKey::default(),
-                KeyDiscovery::Emitted(dep_info.clone(), tree.clone()),
-                &mut record,
-            );
+            let keyed = stop_on_hit_key(ctx, dep_info.clone(), tree.clone());
             let stored = keyed
                 .ok()
                 .is_some_and(|keyed| ctx.store.get(&keyed.cache_key).ok().flatten().is_some());
@@ -5636,6 +6109,7 @@ fn compile_before_key(
             extra_inputs_too_new,
             extra_inputs_key_ms,
             guard_inputs,
+            Some(ctx.build_script_inputs),
             None,
         );
     }
@@ -5715,11 +6189,12 @@ fn compile_before_key(
         extra_inputs_too_new,
         extra_inputs_key_ms,
         guard_inputs,
+        Some(ctx.build_script_inputs),
         Some(Precompiled {
             result,
             compile_time_ms,
             dep_info: Some(dep_info),
-            tree_digest,
+            tree_guard,
             key_record,
         }),
     );
@@ -5745,15 +6220,15 @@ fn emitted_dep_info(args: &RustcArgs) -> Option<crate::cache_key::DepInfo> {
     crate::cache_key::dep_info_from_emitted(&path, args.source_file.as_deref()?).ok()
 }
 
-/// Compile-before-key is only sound where the miss is certain from the local
-/// store alone: no remote to consult, no fallback store, no adaptive
-/// incremental unit and no extra-inputs declaration, the last two keying more
-/// than the closure. The key computation then defers only when it can prove
-/// the miss: no closure record for the unit, or no entry for the crate.
+/// Compile-before-key needs a miss the local store can prove, or a compile it
+/// can stop on a hit. That rules out a remote, a fallback store, a read-only
+/// host store, an extra-inputs declaration (whose key covers more than the
+/// closure), and a managed unit that must key first
+/// ([`managed_unit_keys_first`]) so a miss can take its incremental lane.
 fn deferral_allowed(
     config: &Config,
     args: &RustcArgs,
-    adaptive: bool,
+    keys_first: bool,
     extra_inputs: Option<&crate::extra_inputs::ExtraInputsSnapshot>,
 ) -> bool {
     // The compile must emit the dep-info the key is derived from afterwards
@@ -5763,7 +6238,7 @@ fn deferral_allowed(
         && config.remote.is_none()
         && config.fallback.is_none()
         && config.readonly_store.is_none()
-        && !adaptive
+        && !keys_first
         && extra_inputs.is_none()
 }
 
@@ -5820,21 +6295,28 @@ fn record_input_prediction(
         return;
     };
     // Present exactly when the key was computed under the tree guard; the
-    // record must carry it or the guard will never accept the record.
-    let tree = key.tree_digest.clone();
+    // record must carry it or the guard will never accept the record. Only
+    // while the trees it read have not moved since: rustc reported what it
+    // saw after the digest was taken, and a listed file removed meanwhile
+    // and put back since would leave a closure without it under a digest
+    // that matches again. Without the guard, a guarded unit's rows are not
+    // used, and its rows for other checkouts are not written.
+    let tree = key
+        .tree_guard
+        .as_ref()
+        .filter(|guard| guard.held())
+        .map(|guard| guard.digest.clone());
     let registry = crate::cache_key::registry_src_of(&std::env::vars_os().collect::<Vec<_>>());
     // A workspace or path unit gets a row another checkout of the workspace
     // can use, when the guard was taken before rustc ran (kunobi-ninja/kache#1005).
     let workspace = crate::cache_key::workspace_record(args, dep_info, tree.as_deref());
+    // This checkout's rows, local and shared, carry the same guard.
+    let guard = crate::cache_key::same_checkout_guard(args, dep_info, tree.clone());
     file_hasher.record_input_prediction(
         &identity,
         args.crate_name.as_deref(),
         dep_info,
-        crate::cache_key::same_tree_guard(
-            tree.clone(),
-            crate::cache_key::is_workspace_unit(args),
-            workspace.is_some(),
-        ),
+        guard.clone(),
     );
     if let Some((identity, record)) = workspace {
         file_hasher.record_portable_prediction(&identity, args.crate_name.as_deref(), &record);
@@ -5852,12 +6334,12 @@ fn record_input_prediction(
                 &identity,
                 args.crate_name.as_deref(),
                 dep_info,
-                tree.clone(),
+                guard.clone(),
             );
             // A registry unit's row serves any machine whose Cargo home has
             // the same path.
             if let Some(registry) = &registry {
-                let row = crate::cache_key::InputPrediction::from_dep_info(dep_info, tree);
+                let row = crate::cache_key::InputPrediction::from_dep_info(dep_info, guard);
                 publish_prediction(
                     config,
                     &identity,
@@ -5901,14 +6383,15 @@ fn should_skip_cache_store_for_input_race(
 }
 
 /// The emitted dep-info's files whose fingerprint, taken after the compile,
-/// shows a write at or after the invocation began. Only a write to one of
+/// shows a write at or after the invocation began, allowing for coarse file
+/// clocks ([`crate::cache_key::stamp_written_since`]). Only a write to one of
 /// these can make a key derived after the compile disagree with what rustc
 /// read. A source the hasher left no fingerprint for counts as written, since
 /// nothing shows otherwise. Externs and native libraries stay out: Cargo does
 /// not rewrite them while it builds a dependent, and store ingest links and
 /// chmods them, which moves their ctime without changing a byte.
 fn sources_written_since(
-    hashed: &[crate::cache_key::FileFingerprint],
+    hashed: &[crate::cache_key::ObservedFingerprint],
     sources: &std::collections::HashSet<String>,
     invocation_start_ns: i64,
 ) -> Vec<crate::cache_key::FileFingerprint> {
@@ -5917,14 +6400,17 @@ fn sources_written_since(
     }
     let mut written: Vec<_> = hashed
         .iter()
+        .map(|input| &input.fingerprint)
         .filter(|input| {
             sources.contains(&input.path)
-                && (input.mtime_ns >= invocation_start_ns || input.ctime_ns >= invocation_start_ns)
+                && crate::cache_key::stamp_written_since(input, invocation_start_ns)
         })
         .cloned()
         .collect();
-    let recorded: std::collections::HashSet<&str> =
-        hashed.iter().map(|input| input.path.as_str()).collect();
+    let recorded: std::collections::HashSet<&str> = hashed
+        .iter()
+        .map(|input| input.fingerprint.path.as_str())
+        .collect();
     written.extend(
         sources
             .iter()
@@ -5942,30 +6428,46 @@ fn sources_written_since(
 
 /// Whether a source written during the compile may not be what rustc read.
 /// Each one is excused only by a fingerprint of the same file taken before
-/// the compile (`before`) that still matches it.
+/// the compile (`before`) that still matches it and whose stamp had settled
+/// when it was taken. A write in the same tick as an unsettled stamp keeps
+/// the stamp, so a match would prove nothing.
 fn emitted_sources_changed_during_compile(
     written: &[crate::cache_key::FileFingerprint],
-    before: &[crate::cache_key::FileFingerprint],
+    before: &[crate::cache_key::ObservedFingerprint],
 ) -> bool {
     written.iter().any(|input| {
         !before.iter().any(|earlier| {
-            earlier.path == input.path
+            earlier.fingerprint.path == input.path
+                && earlier.settled()
                 && FileHasher::guarded_inputs_unchanged_since_hash(std::slice::from_ref(earlier))
         })
     })
 }
 
-/// Whether keyed inputs actually changed during the compile. A tripped
-/// wall-clock flag alone is not proof: it also fires when the filesystem
-/// clock runs ahead of the host (NFS skew, future-stamped checkouts). When
-/// every guarded input still matches its hash-time fingerprint with a strong
-/// identity, nothing changed and the store refusal is excused. Anything else
-/// (a mismatch, a missing file, a weak identity) keeps the refusal.
+/// Whether keyed inputs actually changed during the compile. An input whose
+/// size, write time or inode moved since the key read it changed, whatever
+/// the clocks say: a save that lands after the key and before rustc reads
+/// the file trips no wall-clock flag, since the stamp was old when the key
+/// read it ([`FileHasher::guarded_inputs_moved_since_hash`]).
+///
+/// A tripped wall-clock flag alone is not proof: it also fires when the
+/// filesystem clock runs ahead of the host (NFS skew, future-stamped
+/// checkouts). When every guarded input still matches its hash-time
+/// fingerprint with a strong identity, nothing changed and the store refusal
+/// is excused. Anything else (a mismatch, a missing file, a weak identity)
+/// keeps the refusal.
+///
+/// Unlike the compile-first excuse, a fingerprint here need not have settled
+/// when it was taken: requiring that would refuse every input stamped ahead
+/// of the host clock again, the case this excuse exists for. The cost is
+/// that a second write of the same size inside the stamp's tick, between the
+/// hash and the compiler's read, keeps the fingerprint and is excused.
 fn key_inputs_changed_during_compile(
     key_too_new: bool,
-    guard_inputs: &[crate::cache_key::FileFingerprint],
+    guard_inputs: &[crate::cache_key::ObservedFingerprint],
 ) -> bool {
-    key_too_new && !FileHasher::guarded_inputs_unchanged_since_hash(guard_inputs)
+    FileHasher::guarded_inputs_moved_since_hash(guard_inputs)
+        || (key_too_new && !FileHasher::guarded_inputs_unchanged_since_hash(guard_inputs))
 }
 
 fn combine_key_measurements(
@@ -5999,9 +6501,12 @@ enum KeyDiscovery {
     /// The compile already ran; this is its emitted closure. A source written
     /// since the invocation began refuses the store regardless of
     /// configuration: it must not be keyed as if the compiler had read it.
-    /// The tree digest is the one the deferred computation took before the
+    /// The tree guard is the one the deferred computation took before the
     /// compile.
-    Emitted(crate::cache_key::DepInfo, Option<String>),
+    Emitted(
+        crate::cache_key::DepInfo,
+        Option<crate::cache_key::TreeGuard>,
+    ),
     /// Run the pre-pass again for a predicted key that missed. The caller
     /// may hold this unit's discovery flight, and that lock is not
     /// re-entrant, so this computation joins no flight.
@@ -6016,14 +6521,46 @@ fn discovery_flight_dir(config: &Config, discovery: &KeyDiscovery) -> Option<Pat
         .then(|| config.cache_dir.clone())
 }
 
-/// What resolving the invocation's extra inputs contributes to its key.
+/// What Kache and Cargo write as a project builds, which the tree guard and
+/// the walks of declared build-script inputs leave out wherever it lies
+/// inside a tree, each as spelled and as resolved: Kache's cache, runtime and
+/// probe directories, the store the unit's outputs route to, and what Cargo
+/// itself writes in its home ([`crate::build_script_inputs::cargo_home_writes`]).
+/// GitLab CI caches only paths inside the project, so a job keeps Kache's
+/// cache and Cargo's home there, and Cargo records in its home when builds
+/// use downloaded crates. The rest of Cargo's home still counts: with the
+/// home in the project's `.cargo`, its `config.toml` is the project's. Under
+/// a trust domain the probe directory, which holds the tree memos, stays in
+/// the base cache directory, outside the domain's own cache.
+fn written_while_building(config: &Config, store: Option<&Store>) -> Vec<PathBuf> {
+    let probe_dir = crate::config::probe_memo_dir();
+    let mut written = crate::build_script_inputs::excluded_roots(
+        None,
+        [
+            config.cache_dir.as_path(),
+            config.runtime_dir.as_path(),
+            probe_dir.as_path(),
+        ]
+        .into_iter()
+        .chain(store.map(Store::cache_dir)),
+    );
+    if let Some(home) = crate::build_script_inputs::cargo_home(&|name| std::env::var_os(name)) {
+        written.extend(crate::build_script_inputs::cargo_home_writes(&home));
+    }
+    written
+}
+
+/// What resolving the invocation's extra inputs, and its build script's
+/// declared inputs, contributes to its key.
 #[derive(Default)]
 struct ExtraInputsKey<'a> {
     digest: Option<&'a str>,
+    /// See [`crate::build_script_inputs`].
+    build_script_inputs: Option<&'a str>,
     hash_stats: FileHashStats,
     too_new: bool,
     key_ms: u64,
-    guard_inputs: Vec<crate::cache_key::FileFingerprint>,
+    guard_inputs: Vec<crate::cache_key::ObservedFingerprint>,
 }
 
 /// Compute the rustc cache key. With `store` present the hasher is backed by
@@ -6046,6 +6583,7 @@ fn compute_rustc_cache_key(
 ) -> Result<ComputedKey> {
     let ExtraInputsKey {
         digest: extra_inputs_digest,
+        build_script_inputs: build_script_inputs_digest,
         hash_stats: extra_inputs_hash_stats,
         too_new: extra_inputs_too_new,
         key_ms: extra_inputs_key_ms,
@@ -6069,7 +6607,8 @@ fn compute_rustc_cache_key(
         None => crate::cache_key::FileHasher::new().with_daemon(config.socket_path()),
     }
     .with_input_predictions(config.input_predictions)
-    .with_prediction_flights(flight_dir);
+    .with_prediction_flights(flight_dir)
+    .with_own_dirs(written_while_building(config, store));
     if config.modified_input_guard || emitted {
         // Flag keyed inputs touched at/after this invocation started — their
         // content at hash time may differ from what rustc reads, so we'll look
@@ -6099,6 +6638,7 @@ fn compute_rustc_cache_key(
         key_salt: config.key_salt.as_deref(),
         key_env_vars: &config.key_env_vars,
         extra_inputs_digest,
+        build_script_inputs_digest,
     };
     let (cache_key, outputs) = compiler.cache_key_in(args, &key_ctx, key_env);
     key_record.absorb(&outputs);
@@ -6185,6 +6725,36 @@ fn owes_rederivation(predicted: bool, already_rederived: bool) -> bool {
     predicted && !already_rederived
 }
 
+/// Does a miss that no incremental lane took compile before its key after
+/// all, and may that compile stop on a hit? `Some(stop_on_hit)` if so.
+/// `deferral_allowed` is [`deferral_allowed`] for a unit that need not key
+/// first.
+///
+/// A predicted key must be re-derived before anything is stored, and the
+/// running compile writes the closure the pre-pass would. A compile that
+/// links cannot stop on a hit, so a guess is re-derived through the pre-pass
+/// first, where a lookup can still find the entry under the real key.
+///
+/// A unit that keyed first did so only so that its miss could take an
+/// incremental lane, and none did. Its key was taken before the compile, and
+/// by default only a key from the compile's own closure is checked for a
+/// source written while the compile runs, so once the key is no longer a
+/// guess this unit compiles first as well, whether or not it links.
+fn compile_before_key_after_miss(
+    deferral_allowed: bool,
+    stop_on_hit_allowed: bool,
+    owes_rederivation: bool,
+    keyed_first: bool,
+) -> Option<bool> {
+    if !deferral_allowed {
+        return None;
+    }
+    if owes_rederivation {
+        return stop_on_hit_allowed.then_some(true);
+    }
+    keyed_first.then_some(stop_on_hit_allowed)
+}
+
 /// Should this invocation write what it discovered back to the record?
 ///
 /// A closure that came from a record is already recorded, and rewriting it on
@@ -6210,6 +6780,7 @@ fn recompute_key_without_prediction(
     store: Option<&Store>,
     key_env: &KeyEnv,
     extra_inputs_digest: Option<&str>,
+    build_script_inputs_digest: Option<&str>,
     key_record: &mut KeyEventRecord,
 ) -> Result<ComputedKey> {
     let mut without = config.clone();
@@ -6224,6 +6795,7 @@ fn recompute_key_without_prediction(
         key_env,
         ExtraInputsKey {
             digest: extra_inputs_digest,
+            build_script_inputs: build_script_inputs_digest,
             ..ExtraInputsKey::default()
         },
         KeyDiscovery::Rederived,
@@ -7000,9 +7572,9 @@ fn reset_adaptive_unit(unit: Option<&AdaptiveUnit>) {
 }
 
 /// Run a user-facing executable that artifact caching already excludes.
-/// Eligible Cargo-primary units preserve isolated incremental state immediately
-/// when no configured fallback owns declined compilations. Other rejection
-/// classes keep the configured fallback contract and do not call this helper.
+/// Eligible units preserve isolated incremental state immediately when no
+/// configured fallback owns declined compilations. Other rejection classes
+/// keep the configured fallback contract and do not call this helper.
 #[allow(clippy::too_many_arguments)]
 fn intentional_passthrough_with_event<R: Into<String>>(
     config: &Config,
@@ -7052,6 +7624,15 @@ fn adaptive_incremental_with_event<R: Into<String>>(
     let reason = reason.into();
     let kind = lease.kind();
     let compiler_args = lease.compiler_args(args);
+    let permit = adaptive_lane_takes_permit(kind).then(|| {
+        scheduler::begin_keyless_compile(
+            &config.cache_dir,
+            config.scheduler,
+            crate_name,
+            args.invokes_linker(),
+            config.test_lease.as_deref(),
+        )
+    });
     let compile_start = std::time::Instant::now();
     let compiler = RustcCompiler::new().with_base_dirs(config.base_dirs.clone());
     let rebuilt_package = KeyEnv::capture().var("CARGO_PKG_NAME");
@@ -7060,10 +7641,15 @@ fn adaptive_incremental_with_event<R: Into<String>>(
     } else {
         compiler.execute_preserving_incremental(args, &compiler_args)
     };
+    if let (Some(permit), Ok(_)) = (&permit, &compile) {
+        permit.record_compile_rss(crate_name);
+    }
+    drop(permit);
     let result = match compile {
         Ok(result) => result,
         Err(error) => {
-            let _ = lease.finish(false);
+            // rustc never ran, or a pipe failure made kache kill it mid-session.
+            let _ = lease.finish(CompileOutcome::Abnormal);
             tracing::warn!("adaptive incremental compiler spawn failed for {crate_name}: {error}");
             return passthrough_with_event(
                 config,
@@ -7084,10 +7670,12 @@ fn adaptive_incremental_with_event<R: Into<String>>(
         std::io::stderr(),
     );
     after_rustc_exit(result.exit_code, &result.stderr, &args.externs);
-    let reusable = lease.finish(result.exit_code == 0);
+    let outcome = compile_outcome(result.exit_code, result.signaled, &result.stderr);
+    let kept = lease.finish(outcome);
     tracing::debug!(
         ?kind,
-        reusable,
+        ?outcome,
+        kept,
         "adaptive incremental compiler lease finished"
     );
 
@@ -8460,8 +9048,11 @@ pub(crate) fn prune_session_markers(
 /// The build-session inactivity window (shared by trigger + attribution).
 pub(crate) const BUILD_SESSION_SECS: u64 = 300;
 
-/// Remove the incremental compilation directory for this crate.
-/// With kache caching, incremental compilation is redundant and the dirs waste disk space.
+/// Remove the directory passed as `-C incremental`. Cargo passes
+/// `<profile>/incremental`, which every unit of the profile shares. Normal
+/// compiles strip the flag, so what is there comes from builds without Kache
+/// and only takes disk space. Adaptive and preserved state live in sibling
+/// directories and stay.
 fn clean_incremental_dir(config: &Config, args: &RustcArgs) {
     if incremental_cleanup_enabled(config)
         && let Some(incr_dir) = &args.incremental

@@ -33,7 +33,9 @@
 use crate::config::Config;
 use crate::maintenance::{Trigger, is_quiet, unix_now_secs};
 use crate::store::{Store, TrackedTargetRoot};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime};
 
 /// How often a quiet machine is checked.
@@ -56,6 +58,21 @@ fn last_check(cache_dir: &Path) -> u64 {
         .ok()
         .and_then(|text| text.trim().parse().ok())
         .unwrap_or(0)
+}
+
+/// When this process last checked each cache dir whose record it could not
+/// write. On a full volume every write of the record fails; this keeps the
+/// process to the same hourly pace.
+static UNRECORDED: Mutex<BTreeMap<PathBuf, u64>> = Mutex::new(BTreeMap::new());
+
+fn unrecorded() -> MutexGuard<'static, BTreeMap<PathBuf, u64>> {
+    UNRECORDED.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// This process's last check of `cache_dir` without a record, `0` when
+/// there is none.
+fn last_unrecorded(cache_dir: &Path) -> u64 {
+    unrecorded().get(cache_dir).copied().unwrap_or(0)
 }
 
 /// Why a target directory was removed.
@@ -125,12 +142,16 @@ pub(crate) fn due(
         || config.auto_clean_idle_targets_days > 0
         || config.auto_clean_unused_units_days > 0
         || config.auto_recover_min_free_bytes > 0;
-    // A clock set back behind the record does not stop the checks.
-    let waited = last == 0 || now < last || now - last >= INTERVAL.as_secs();
     enabled
         && matches!(trigger, Trigger::Periodic(_))
-        && waited
+        && waited(last, now)
         && is_quiet(permits, trigger.idle_for())
+}
+
+/// Whether an hour has passed since a check at `last`, `0` for none. A clock
+/// set back behind it does not stop the checks.
+fn waited(last: u64, now: u64) -> bool {
+    last == 0 || now < last || now - last >= INTERVAL.as_secs()
 }
 
 /// The maintenance step. Logs what it removed.
@@ -140,14 +161,19 @@ pub(crate) fn due(
 pub(crate) fn run(config: &Config, trigger: Trigger<'_>) -> bool {
     let now = unix_now_secs();
     let permits = crate::scheduler::permits_in_use(&config.cache_dir);
-    if !due(config, trigger, permits, last_check(&config.cache_dir), now) {
+    if !due(config, trigger, permits, last_check(&config.cache_dir), now)
+        || !waited(last_unrecorded(&config.cache_dir), now)
+    {
         return false;
     }
     let record = config.cache_dir.join(LAST_CHECK_FILE);
-    // The record is what keeps the checks hourly.
+    // A full volume refuses the record just when cleanup is needed most:
+    // clean anyway, and keep this process hourly from memory instead.
     if let Err(error) = crate::atomic::atomic_replace(&record, now.to_string().as_bytes()) {
-        tracing::warn!("skipping target directory cleanup: cannot record the time: {error:#}");
-        return false;
+        tracing::warn!(
+            "cannot record the target directory cleanup time, cleaning anyway: {error:#}"
+        );
+        unrecorded().insert(config.cache_dir.clone(), now);
     }
     match sweep(config, now) {
         Ok(swept) => {
@@ -202,10 +228,16 @@ pub(crate) fn unit_window(days: u64) -> Option<Duration> {
 /// Remove every tracked target directory `config` selects at `now`, and the
 /// unused units of those that stay. A registry row whose directory is gone,
 /// moved or no longer a derived target directory is forgotten; a directory a
-/// running build holds is kept for the next check.
+/// running build holds is kept for the next check. A row is forgotten only
+/// while it records the directory it was judged by: one a build wrote during
+/// the sweep stays.
 pub(crate) fn sweep(config: &Config, now: u64) -> anyhow::Result<Swept> {
     let store = Store::open(config)?;
-    crate::worktree_discovery::discover(&store)?;
+    // A full volume refuses the registry's writes, which is no reason to
+    // skip the cleanup that frees space.
+    if let Err(error) = crate::worktree_discovery::discover(&store) {
+        tracing::warn!("could not record targets in sibling worktrees: {error:#}");
+    }
     let window = unit_window(config.auto_clean_unused_units_days);
     let at = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(now);
     let now = i64::try_from(now).unwrap_or(i64::MAX);
@@ -217,7 +249,7 @@ pub(crate) fn sweep(config: &Config, now: u64) -> anyhow::Result<Swept> {
             let replaced = crate::machine::directory_identity(&tracked.path)
                 .is_some_and(|identity| identity != tracked.identity);
             if missing_with_parent || replaced {
-                store.forget_target_root(&tracked.path)?;
+                forget(&store, &tracked.path, tracked.identity);
                 continue;
             }
             // No rule could remove it: leave its fingerprints and Cargo
@@ -248,7 +280,7 @@ pub(crate) fn sweep(config: &Config, now: u64) -> anyhow::Result<Swept> {
             continue;
         };
         if !intact {
-            store.forget_target_root(&tracked.path)?;
+            forget(&store, &tracked.path, tracked.identity);
             continue;
         }
         if crate::cli::target_in_use(&tracked.path) {
@@ -256,7 +288,7 @@ pub(crate) fn sweep(config: &Config, now: u64) -> anyhow::Result<Swept> {
         }
         match remove(&tracked.path, tracked.identity, now, &config.cache_dir) {
             Ok(true) => {
-                store.forget_target_root(&tracked.path)?;
+                forget(&store, &tracked.path, tracked.identity);
                 swept.removed.push((tracked.path, reason));
             }
             Ok(false) => {}
@@ -279,6 +311,19 @@ pub(crate) fn sweep(config: &Config, now: u64) -> anyhow::Result<Swept> {
     let used = prune_under_pressure(config, &store, at, &mut swept)?;
     recover_under_pressure(config, &store, now, &unused, &used, &mut swept)?;
     Ok(swept)
+}
+
+/// Drop `path` from the target registry while its row still records
+/// `identity`, so a directory a build recorded since the sweep read the row
+/// stays tracked. A full volume can refuse the write; the stale row that
+/// leaves is no reason to end the pass.
+fn forget(store: &Store, path: &Path, identity: crate::machine::PathIdentity) {
+    if let Err(error) = store.forget_target_root_with_identity(path, identity) {
+        tracing::warn!(
+            "could not forget target directory {}: {error:#}",
+            path.display()
+        );
+    }
 }
 
 /// Still the recorded, derived target directory, and not a source tree.
@@ -637,7 +682,7 @@ fn recover_under_pressure(
         }
         match remove(&candidate.path, candidate.identity, now, &config.cache_dir) {
             Ok(true) => {
-                store.forget_target_root(&candidate.path)?;
+                forget(store, &candidate.path, candidate.identity);
                 let freed = kache_fs::volume_usage(parent)
                     .map_or(0, |after| after.free.saturating_sub(before.free));
                 record_stalled_volume(&mut stalled_volumes, candidate.identity.device, freed);
@@ -670,7 +715,9 @@ fn looks_like_a_source_root(path: &Path) -> bool {
 
 /// Rename `target` aside, check no build holds it, then delete it. A build
 /// that took its lock before the rename is found, and the directory is
-/// renamed back; one that starts after the rename creates a new directory.
+/// renamed back; one that starts after the rename creates a new directory
+/// and may record it before the deletion ends, so callers forget the row
+/// only while it still records `expected`.
 /// `Ok(false)` when a build holds it, before or after the rename.
 fn remove(
     target: &Path,
@@ -678,7 +725,18 @@ fn remove(
     now: i64,
     cache_dir: &Path,
 ) -> std::io::Result<bool> {
-    remove_after_rename(target, expected, now, cache_dir, |_| {})
+    remove_after_rename(
+        target,
+        expected,
+        now,
+        cache_dir,
+        |_| {},
+        |aside| {
+            #[cfg(test)]
+            tests::while_deleting();
+            std::fs::remove_dir_all(aside)
+        },
+    )
 }
 
 fn remove_after_rename(
@@ -687,8 +745,9 @@ fn remove_after_rename(
     now: i64,
     cache_dir: &Path,
     after_rename: impl FnOnce(&Path),
+    delete: impl FnOnce(&Path) -> std::io::Result<()>,
 ) -> std::io::Result<bool> {
-    let Some(_reservation) = crate::target_use::try_exclusive(cache_dir)? else {
+    let Some(reservation) = crate::target_use::try_exclusive(cache_dir)? else {
         return Ok(false);
     };
     if crate::machine::directory_identity(target) != Some(expected) {
@@ -712,7 +771,10 @@ fn remove_after_rename(
         }
         return Ok(false);
     }
-    std::fs::remove_dir_all(&aside)?;
+    // A build that starts now gets a new directory and never sees this one,
+    // so it need not wait for the deletion.
+    drop(reservation);
+    delete(&aside)?;
     Ok(true)
 }
 
@@ -733,6 +795,19 @@ mod tests {
         config.auto_clean_orphaned_targets = orphans;
         config.auto_clean_idle_targets_days = days;
         config
+    }
+
+    thread_local! {
+        /// What runs on this thread while [`remove`] deletes a renamed
+        /// target, after it has let builds through.
+        static WHILE_DELETING: std::cell::Cell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::Cell::new(None) };
+    }
+
+    pub(super) fn while_deleting() {
+        if let Some(run) = WHILE_DELETING.take() {
+            run();
+        }
     }
 
     #[test]
@@ -797,6 +872,23 @@ mod tests {
         store.remember_target_root(&target, &workspace).unwrap();
         std::fs::remove_dir(&workspace).unwrap();
         target
+    }
+
+    /// A build in `workspace` that creates `target` and records it, as Cargo
+    /// and the wrapper do.
+    fn rebuild(config: &Config, workspace: &Path, target: &Path) -> Box<dyn FnOnce()> {
+        let config = config.clone();
+        let (workspace, target) = (workspace.to_path_buf(), target.to_path_buf());
+        Box::new(move || {
+            std::fs::create_dir_all(target.join("debug")).unwrap();
+            std::fs::write(
+                target.join("CACHEDIR.TAG"),
+                "Signature: 8a477f597d28d172789f06886806bc55\n",
+            )
+            .unwrap();
+            let store = Store::open(&config).unwrap();
+            store.remember_target_root(&target, &workspace).unwrap();
+        })
     }
 
     fn tracked(store: &Store) -> Vec<PathBuf> {
@@ -938,7 +1030,6 @@ mod tests {
         dir
     }
 
-    #[cfg(unix)]
     fn root_of(store: &Store, path: &Path) -> TrackedTargetRoot {
         store
             .tracked_target_roots(0)
@@ -1572,6 +1663,128 @@ mod tests {
         assert!(!target.exists());
     }
 
+    /// Make every insert into and delete from the target registry fail, as a
+    /// full volume refuses them.
+    #[cfg(unix)]
+    fn refuse_registry_writes(store: &Store) {
+        store
+            .file_hash_cache()
+            .db()
+            .execute_batch(
+                "CREATE TRIGGER full_insert BEFORE INSERT ON target_roots
+                 BEGIN SELECT RAISE(ABORT, 'database or disk is full'); END;
+                 CREATE TRIGGER full_delete BEFORE DELETE ON target_roots
+                 BEGIN SELECT RAISE(ABORT, 'database or disk is full'); END;",
+            )
+            .unwrap();
+    }
+
+    /// A workspace in a Git repository whose target a build recorded, and a
+    /// sibling worktree holding a target for discovery to record. `false`
+    /// without Git.
+    #[cfg(unix)]
+    fn sibling_worktree_target(store: &Store, root: &Path) -> bool {
+        let repo = root.join("repo");
+        let sibling = root.join("sibling");
+        std::fs::create_dir_all(&repo).unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .output()
+        };
+        let Ok(init) = git(&["init", "-q"]) else {
+            return false;
+        };
+        let commit = [
+            "-c",
+            "user.name=Kache Test",
+            "-c",
+            "user.email=kache@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "base",
+        ];
+        let add = [
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            sibling.to_str().unwrap(),
+        ];
+        for output in [init, git(&commit).unwrap(), git(&add).unwrap()] {
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        for workspace in [&repo, &sibling] {
+            std::fs::write(workspace.join("Cargo.toml"), "[workspace]\n").unwrap();
+            std::fs::create_dir_all(workspace.join("target/debug")).unwrap();
+            std::fs::write(
+                workspace.join("target/CACHEDIR.TAG"),
+                "Signature: 8a477f597d28d172789f06886806bc55\n",
+            )
+            .unwrap();
+        }
+        store
+            .remember_target_root(&repo.join("target"), &repo)
+            .unwrap();
+        true
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_registry_that_refuses_writes_does_not_end_the_pass() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let orphans = config(cache.path(), true, 0);
+        let store = Store::open(&orphans).unwrap();
+        // Discovery fails to record the sibling's target.
+        sibling_worktree_target(&store, root.path());
+        // Each of these rows is forgotten: a discovered target gone with its
+        // parent left, a target that is no longer one, and the removed ones.
+        let gone = discovered_with_unit(&store, root.path(), "gone");
+        std::fs::remove_dir_all(&gone).unwrap();
+        let untagged = orphan(&store, root.path(), "untagged");
+        std::fs::remove_file(untagged.join("CACHEDIR.TAG")).unwrap();
+        let first = orphan(&store, root.path(), "first");
+        let second = orphan(&store, root.path(), "second");
+        age(&store, DAY_SECS);
+        let rows = tracked(&store);
+        refuse_registry_writes(&store);
+
+        let swept = sweep(&orphans, unix_now_secs()).unwrap();
+        let mut removed: Vec<_> = swept.removed.into_iter().map(|(path, _)| path).collect();
+        removed.sort();
+        assert_eq!(removed, vec![first.clone(), second.clone()]);
+        assert!(!first.exists() && !second.exists());
+        assert_eq!(tracked(&store), rows, "no row was written");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pressure_recovery_goes_on_when_the_registry_refuses_writes() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let mut pressure = config(cache.path(), false, 0);
+        let store = Store::open(&pressure).unwrap();
+        let (_, target) = tracked_target(&store, root.path(), "idle");
+        std::fs::write(target.join("debug/artifact"), vec![7; 64 * 1024]).unwrap();
+        pressure.auto_recover_min_free_bytes = kache_fs::volume_usage(&target).unwrap().total - 1;
+        refuse_registry_writes(&store);
+        let swept = sweep(&pressure, unix_now_secs() + 2 * DAY_SECS).unwrap();
+        assert_eq!(swept.removed, vec![(target.clone(), Reason::Pressure)]);
+        assert!(!target.exists());
+        assert_eq!(tracked(&store), vec![target], "the row stays");
+    }
+
     #[test]
     fn pressure_stops_at_the_free_space_floor() {
         assert!(volume_below_floor(99, 100));
@@ -1609,14 +1822,120 @@ mod tests {
         std::fs::write(target.join("artifact"), b"original").unwrap();
         let identity = crate::machine::directory_identity(&target).unwrap();
         let cache = tempfile::tempdir().unwrap();
-        let removed = remove_after_rename(&target, identity, 7, cache.path(), |aside| {
-            std::fs::rename(aside, &saved).unwrap();
-            std::fs::create_dir(aside).unwrap();
-        })
+        let removed = remove_after_rename(
+            &target,
+            identity,
+            7,
+            cache.path(),
+            |aside| {
+                std::fs::rename(aside, &saved).unwrap();
+                std::fs::create_dir(aside).unwrap();
+            },
+            |aside| std::fs::remove_dir_all(aside),
+        )
         .unwrap();
         assert!(!removed);
         assert_eq!(std::fs::read(saved.join("artifact")).unwrap(), b"original");
         assert!(target.is_dir());
+    }
+
+    #[test]
+    fn builds_need_not_wait_while_a_renamed_target_is_deleted() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("target");
+        std::fs::create_dir_all(target.join("debug")).unwrap();
+        let identity = crate::machine::directory_identity(&target).unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let mut deleted_unlocked = false;
+        let removed = remove_after_rename(
+            &target,
+            identity,
+            7,
+            cache.path(),
+            |_| {},
+            |aside| {
+                deleted_unlocked = crate::target_use::try_exclusive(cache.path())?.is_some();
+                std::fs::remove_dir_all(aside)
+            },
+        )
+        .unwrap();
+        assert!(removed);
+        assert!(deleted_unlocked, "the deletion held builds back");
+        assert!(!target.exists());
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+    }
+
+    /// Each tracked target's row records the directory now at its path.
+    fn assert_tracked_as_on_disk(store: &Store, targets: &[&Path]) {
+        let mut expected: Vec<PathBuf> =
+            targets.iter().map(|target| target.to_path_buf()).collect();
+        expected.sort();
+        assert_eq!(tracked(store), expected);
+        for target in targets {
+            assert_eq!(
+                Some(root_of(store, target).identity),
+                crate::machine::directory_identity(target),
+                "{}",
+                target.display()
+            );
+        }
+    }
+
+    #[test]
+    fn builds_during_a_deletion_keep_the_targets_they_record() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let idle = config(cache.path(), false, 1);
+        let store = Store::open(&idle).unwrap();
+        let (removed_at, removed) = tracked_target(&store, root.path(), "removed");
+        // Judged after that deletion, from rows read before it: a target
+        // deleted by hand, and one found through Git and deleted by hand.
+        let (cleaned_at, cleaned) = tracked_target(&store, root.path(), "cleaned");
+        let (sibling_at, sibling) = tracked_target(&store, root.path(), "sibling");
+        store.forget_target_root(&sibling).unwrap();
+        store
+            .remember_discovered_target_root(&sibling, &sibling_at)
+            .unwrap();
+        std::fs::remove_dir_all(&cleaned).unwrap();
+        std::fs::remove_dir_all(&sibling).unwrap();
+        // The oldest row goes first.
+        store
+            .file_hash_cache()
+            .db()
+            .execute(
+                "UPDATE target_roots SET last_seen = last_seen - 60 WHERE path = ?1",
+                [removed.to_string_lossy().into_owned()],
+            )
+            .unwrap();
+        let builds = [
+            rebuild(&idle, &removed_at, &removed),
+            rebuild(&idle, &cleaned_at, &cleaned),
+            rebuild(&idle, &sibling_at, &sibling),
+        ];
+        WHILE_DELETING.set(Some(Box::new(move || {
+            for build in builds {
+                build();
+            }
+        })));
+        let swept = sweep(&idle, unix_now_secs() + 2 * DAY_SECS).unwrap();
+        assert_eq!(swept.removed, vec![(removed.clone(), Reason::Idle)]);
+        assert_tracked_as_on_disk(&store, &[&removed, &cleaned, &sibling]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_build_during_a_pressure_deletion_keeps_the_target_it_records() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let mut pressure = config(cache.path(), false, 0);
+        let store = Store::open(&pressure).unwrap();
+        let (workspace, target) = tracked_target(&store, root.path(), "pressed");
+        std::fs::write(target.join("debug/artifact"), vec![7; 64 * 1024]).unwrap();
+        pressure.auto_recover_min_free_bytes = kache_fs::volume_usage(&target).unwrap().total - 1;
+        WHILE_DELETING.set(Some(rebuild(&pressure, &workspace, &target)));
+        let swept = sweep(&pressure, unix_now_secs() + 2 * DAY_SECS).unwrap();
+        assert_eq!(swept.removed, vec![(target.clone(), Reason::Pressure)]);
+        assert_tracked_as_on_disk(&store, &[&target]);
     }
 
     #[cfg(unix)]
@@ -1720,7 +2039,7 @@ mod tests {
         let target = root.path().join("target");
         std::fs::create_dir_all(target.join("debug")).unwrap();
         let identity = crate::machine::directory_identity(&target).unwrap();
-        let command = crate::target_use::shared(root.path()).unwrap();
+        let command = crate::target_use::shared(root.path(), &mut std::io::sink()).unwrap();
         assert!(!remove(&target, identity, 7, root.path()).unwrap());
         assert!(target.exists());
         drop(command);
@@ -1759,22 +2078,34 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn skips_the_check_when_the_time_cannot_be_recorded() {
+    fn cleans_hourly_when_the_time_cannot_be_recorded() {
         use std::os::unix::fs::PermissionsExt;
         let root = tempfile::tempdir().unwrap();
         let cache = tempfile::tempdir().unwrap();
         let orphans = config(cache.path(), true, 0);
         let store = Store::open(&orphans).unwrap();
+        let quiet = RequestClock::idle();
         let gone = orphan(&store, root.path(), "gone");
         age(&store, DAY_SECS);
-        // The record's path is taken by a directory.
+        // The record's path is taken by a directory, so every write of the
+        // record fails, as on a full volume.
         std::fs::create_dir(cache.path().join(LAST_CHECK_FILE)).unwrap();
         std::fs::set_permissions(
             cache.path().join(LAST_CHECK_FILE),
             std::fs::Permissions::from_mode(0o755),
         )
         .unwrap();
-        run(&orphans, Trigger::Periodic(&RequestClock::idle()));
-        assert!(gone.exists());
+        assert!(run(&orphans, Trigger::Periodic(&quiet)));
+        assert!(!gone.exists(), "cleaned without a record");
+
+        // This process keeps the hour without the record.
+        let next = orphan(&store, root.path(), "next");
+        age(&store, DAY_SECS);
+        assert!(!run(&orphans, Trigger::Periodic(&quiet)));
+        assert!(next.exists());
+        let hour_ago = unix_now_secs() - INTERVAL.as_secs();
+        unrecorded().insert(orphans.cache_dir.clone(), hour_ago);
+        assert!(run(&orphans, Trigger::Periodic(&quiet)));
+        assert!(!next.exists(), "the next hour cleans");
     }
 }

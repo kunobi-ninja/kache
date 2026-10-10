@@ -80,7 +80,9 @@ mk_add_options "export RUSTC_WRAPPER={kache}"
 # path-baking as a divergence/miss rather than a silent wrong-artifact restore.
 mk_add_options "export KACHE_CACHE_EXECUTABLES=1"
 
-# Incremental compilation is redundant once a compile cache is in play.
+# Every phase builds from scratch, so incremental state would only add
+# disk writes and measurement noise. With it off, Cargo passes no
+# -C incremental and no unit takes Kache's adaptive incremental lanes.
 mk_add_options "export CARGO_INCREMENTAL=0"
 
 # Per-clone objdir so the two worktrees never collide.

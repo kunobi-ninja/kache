@@ -6,7 +6,7 @@ use filetime::FileTime;
 use serde_json::Value;
 use std::fs;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -30,20 +30,42 @@ fn fixture_events(cache_dir: &Path) -> Vec<Value> {
         .collect()
 }
 
-fn build_variant(
-    project: &Path,
-    cache_dir: &Path,
-    target_dir: &Path,
-    fallback: &Path,
-    source_mtime: i64,
-    answer: u64,
-) -> Value {
-    let source = project.join("src/lib.rs");
-    fs::write(&source, format!("pub fn answer() -> u64 {{ {answer} }}\n")).unwrap();
-    filetime::set_file_mtime(&source, FileTime::from_unix_time(source_mtime, 0)).unwrap();
+/// Create the fixture package and a fallback wrapper that leaves a marker
+/// when it compiles the fixture. Returns the fallback's path.
+fn create_fixture(project: &Path) -> PathBuf {
+    let fallback = project.join("fallback");
+    fs::create_dir(project.join("src")).unwrap();
+    kache_fs::testutil::write_executable(
+        &fallback,
+        "#!/bin/sh\ncase \" $* \" in *\" --crate-name adaptive_fixture \"*) : > \"$FALLBACK_MARKER\";; esac\nexec \"$@\"\n",
+    );
+    fs::write(
+        project.join("Cargo.toml"),
+        "[package]\nname = \"adaptive-fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[workspace]\n",
+    )
+    .unwrap();
+    fallback
+}
 
-    let event_count = fixture_events(cache_dir).len();
-    let output = hermetic_command(
+/// A source mtime an hour ahead. Future, monotonically increasing mtimes
+/// force Cargo to revisit every variant without sleeps or deleting either
+/// incremental-state directory.
+fn future_mtime() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+        + 3_600
+}
+
+fn write_source(project: &Path, source_mtime: i64, body: &str) {
+    let source = project.join("src/lib.rs");
+    fs::write(&source, format!("pub fn answer() -> u64 {{ {body} }}\n")).unwrap();
+    filetime::set_file_mtime(&source, FileTime::from_unix_time(source_mtime, 0)).unwrap();
+}
+
+fn run_cargo(project: &Path, cache_dir: &Path, target_dir: &Path, fallback: &Path) -> Output {
+    hermetic_command(
         "cargo",
         cache_dir,
         Some(&project.join("missing-kache.toml")),
@@ -62,7 +84,32 @@ fn build_variant(
     .env_remove("KACHE_DISABLED")
     .env_remove("KACHE_PRESERVE_INCREMENTAL")
     .output()
-    .expect("failed to build adaptive fixture");
+    .expect("failed to build adaptive fixture")
+}
+
+/// The one fixture event logged after the first `before` events.
+fn only_new_event(cache_dir: &Path, before: usize) -> Value {
+    let events = fixture_events(cache_dir);
+    assert_eq!(
+        events.len(),
+        before + 1,
+        "each source edit should compile the fixture exactly once; events:\n{}",
+        fs::read_to_string(cache_dir.join("events.jsonl")).unwrap_or_default(),
+    );
+    events.into_iter().nth(before).unwrap()
+}
+
+fn build_variant(
+    project: &Path,
+    cache_dir: &Path,
+    target_dir: &Path,
+    fallback: &Path,
+    source_mtime: i64,
+    answer: u64,
+) -> Value {
+    write_source(project, source_mtime, &answer.to_string());
+    let event_count = fixture_events(cache_dir).len();
+    let output = run_cargo(project, cache_dir, target_dir, fallback);
     assert!(
         output.status.success(),
         "fixture build failed for variant {answer}\nstdout:\n{}\nstderr:\n{}",
@@ -116,15 +163,46 @@ fn build_variant(
         String::from_utf8_lossy(&consumer.stdout),
         answer.to_string()
     );
+    only_new_event(cache_dir, event_count)
+}
 
-    let events = fixture_events(cache_dir);
-    assert_eq!(
-        events.len(),
-        event_count + 1,
-        "each source edit should compile the fixture exactly once; events:\n{}",
-        fs::read_to_string(cache_dir.join("events.jsonl")).unwrap_or_default(),
+/// Build a variant that fails to type-check and return its one event.
+fn build_failing(
+    project: &Path,
+    cache_dir: &Path,
+    target_dir: &Path,
+    fallback: &Path,
+    source_mtime: i64,
+) -> Value {
+    write_source(project, source_mtime, &format!("\"{source_mtime}\""));
+    let event_count = fixture_events(cache_dir).len();
+    let output = run_cargo(project, cache_dir, target_dir, fallback);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success() && stderr.contains("E0308"),
+        "the fixture should fail with a type error\nstdout:\n{}\nstderr:\n{stderr}",
+        String::from_utf8_lossy(&output.stdout),
     );
-    events.into_iter().nth(event_count).unwrap()
+    only_new_event(cache_dir, event_count)
+}
+
+/// rustc's newest published session in the private state: the greatest
+/// `s-*` directory name that is not still `-working`.
+fn newest_finalized_session(policy_root: &Path) -> Option<PathBuf> {
+    let children = |dir: &Path| -> Vec<PathBuf> {
+        fs::read_dir(dir)
+            .map(|entries| entries.filter_map(Result::ok).map(|e| e.path()).collect())
+            .unwrap_or_default()
+    };
+    children(&policy_root.join("v1"))
+        .iter()
+        .flat_map(|unit| children(&unit.join("rustc")))
+        .flat_map(|crate_dir| children(&crate_dir))
+        .filter(|session| {
+            let name = session.file_name().unwrap().to_string_lossy();
+            name.starts_with("s-") && !name.ends_with("-working") && session.is_dir()
+        })
+        .max_by(|left, right| left.file_name().cmp(&right.file_name()))
 }
 
 fn assert_passthrough(event: &Value, reason: &str) {
@@ -179,27 +257,11 @@ fn source_churn_adapts_then_returns_to_exact_cache_hits() {
     let project = tempfile::tempdir().unwrap();
     let cache = tempfile::tempdir().unwrap();
     let target = project.path().join("target");
-    let fallback = project.path().join("fallback");
+    let fallback = create_fixture(project.path());
     let fallback_marker = project.path().join("fallback-used");
     let config_path = project.path().join("missing-kache.toml");
-    fs::create_dir(project.path().join("src")).unwrap();
-    kache_fs::testutil::write_executable(
-        &fallback,
-        "#!/bin/sh\ncase \" $* \" in *\" --crate-name adaptive_fixture \"*) : > \"$FALLBACK_MARKER\";; esac\nexec \"$@\"\n",
-    );
-    fs::write(
-        project.path().join("Cargo.toml"),
-        "[package]\nname = \"adaptive-fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[workspace]\n",
-    )
-    .unwrap();
 
-    // Future, monotonically increasing mtimes force Cargo to revisit every
-    // variant without sleeps or deleting either incremental-state directory.
-    let first_mtime = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64
-        + 3_600;
+    let first_mtime = future_mtime();
     let mut tick = 0;
     let mut build = |answer| {
         let event = build_variant(
@@ -218,12 +280,15 @@ fn source_churn_adapts_then_returns_to_exact_cache_hits() {
     assert_eq!(first["result"], "miss", "event: {first:#}");
     assert_eq!(first["compiler_runs"], 1);
 
+    // The edit changes the package's tree, so the record no longer applies
+    // and the seed discovers its closure once. It must not run a second
+    // pass to re-derive a key.
     let seed = build(2);
     assert_passthrough(&seed, "adaptive seed");
     assert_eq!(seed["compiler_runs"], 1);
     assert_eq!(
-        seed["dep_info_runs"], 0,
-        "a seed must not re-derive a missed prediction: {seed:#}"
+        seed["dep_info_runs"], 1,
+        "a seed discovers its closure once: {seed:#}"
     );
     assert!(!seed["fallback"].as_bool().unwrap_or(false));
 
@@ -282,8 +347,8 @@ fn source_churn_adapts_then_returns_to_exact_cache_hits() {
     assert_passthrough(&after_hit, "adaptive seed");
     assert_eq!(after_hit["compiler_runs"], 1);
     assert_eq!(
-        after_hit["dep_info_runs"], 0,
-        "the first edit after a hit must skip re-derivation: {after_hit:#}"
+        after_hit["dep_info_runs"], 1,
+        "the first edit after a hit discovers its closure once: {after_hit:#}"
     );
 
     // The predicted key may select incremental compilation, but must not
@@ -291,6 +356,88 @@ fn source_churn_adapts_then_returns_to_exact_cache_hits() {
     fs::remove_dir_all(&policy_root).unwrap();
     let unseeded = build(15);
     assert_eq!(unseeded["result"], "miss", "event: {unseeded:#}");
+}
+
+/// A type error keeps the private rustc state, as plain Cargo keeps its own
+/// incremental directory, so the fix compiles on the same adaptive lane
+/// instead of in full on the normal path.
+#[test]
+fn compile_errors_keep_adaptive_state_through_the_fix() {
+    let project = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let target = project.path().join("target");
+    let policy_root = target.join("debug/incremental.kache-auto");
+    let fallback = create_fixture(project.path());
+
+    let mtime = std::cell::Cell::new(future_mtime());
+    let next_mtime = || {
+        let current = mtime.get();
+        mtime.set(current + 1);
+        current
+    };
+    let build = |answer| {
+        build_variant(
+            project.path(),
+            cache.path(),
+            &target,
+            &fallback,
+            next_mtime(),
+            answer,
+        )
+    };
+    let break_build = || {
+        build_failing(
+            project.path(),
+            cache.path(),
+            &target,
+            &fallback,
+            next_mtime(),
+        )
+    };
+
+    let first = build(1);
+    assert_eq!(first["result"], "miss", "event: {first:#}");
+
+    // A failed seed leaves the unit as it found it, so the fix seeds.
+    let failed_seed = break_build();
+    assert_passthrough(&failed_seed, "adaptive seed");
+    assert_eq!(failed_seed["exit_code"], 1, "event: {failed_seed:#}");
+    assert_passthrough(&build(2), "adaptive seed");
+
+    assert_passthrough(&build(3), "adaptive active");
+    let kept = newest_finalized_session(&policy_root).expect("no finalized rustc session");
+
+    let failed_active = break_build();
+    assert_passthrough(&failed_active, "adaptive active");
+    assert_eq!(failed_active["exit_code"], 1, "event: {failed_active:#}");
+    assert!(
+        kept.is_dir(),
+        "the failed compile removed {}",
+        kept.display()
+    );
+    assert_eq!(
+        newest_finalized_session(&policy_root).as_ref(),
+        Some(&kept),
+        "a failed compile must not publish a session"
+    );
+
+    // The consumer check in `build_variant` proves the fix's output is current.
+    let fixed = build(4);
+    assert_passthrough(&fixed, "adaptive active");
+    assert_eq!(fixed["key_ms"], 0, "event: {fixed:#}");
+    assert_passthrough(&build(5), "adaptive active");
+
+    let events = fixture_events(cache.path());
+    assert!(
+        events[1..]
+            .iter()
+            .all(|event| event["result"] == "passthrough"),
+        "a compile after the first went through the normal path: {events:#?}"
+    );
+    assert!(
+        !project.path().join("fallback-used").exists(),
+        "an adaptive compile used the fallback"
+    );
 }
 
 #[test]
@@ -502,7 +649,7 @@ exit 0
             .env("READY_FILE", &ready)
             .env("RELEASE_FILE", &release)
             .env("CONTENDER_FILE", &contender)
-            .env("CARGO_PRIMARY_PACKAGE", "1")
+            .env_remove("CARGO_PRIMARY_PACKAGE")
             .env("CARGO_INCREMENTAL", "1")
             .env("KACHE_CACHE_EXECUTABLES", "0")
             .env("KACHE_LOG", "kache=warn")

@@ -99,7 +99,8 @@ pub(crate) struct PublishCcRequest {
 
 /// A preprocess memo as the wrapper captured it: the fingerprints and
 /// content hashes of everything the compile read, under the key of its
-/// arguments.
+/// arguments. Each input carries the time it was observed, and the store
+/// records its stamp only if the stamp had settled by then.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) struct CcMemoHandoff {
     pub memo_key: String,
@@ -421,6 +422,9 @@ fn publish_one(daemon: &Arc<Daemon>, config: &Config, store: &Store, job: Publis
         &request.stderr,
         request.compile_time_ms,
     );
+    // As after a wrapper's put: a size check after a stored entry, recovery
+    // after one refused for lack of space.
+    crate::wrapper::after_store(config, store, put.as_ref().err());
     match put {
         Ok(put) => {
             event.result = if put.is_full_dup() {
@@ -441,7 +445,6 @@ fn publish_one(daemon: &Arc<Daemon>, config: &Config, store: &Store, job: Publis
             {
                 tracing::debug!("daemon could not record the cc memo: {error}");
             }
-            crate::wrapper::maybe_spawn_auto_gc(config, store);
             if request.publishes_to_remote && config.remote.is_some() {
                 enqueue_upload(daemon, config, &request);
             }
@@ -1089,15 +1092,25 @@ mod tests {
         let _request_receipt = HandoffReceipt::new(&request).unwrap();
         let header = dir.path().join("a.h");
         std::fs::write(&header, b"#define A 1\n").unwrap();
+        let fingerprint = crate::cache_key::FileFingerprint::from_path(&header).unwrap();
+        let settled = crate::cache_key::CcPreprocessMemoInput {
+            name: "a.h".to_string(),
+            observed_ns: fingerprint.mtime_ns.max(fingerprint.ctime_ns)
+                + crate::cache_key::HASH_SETTLE_NS,
+            fingerprint,
+            content: "c".repeat(64),
+            mapped: "d".repeat(64),
+        };
+        // From a wrapper that sends no observation time.
+        let unobserved = crate::cache_key::CcPreprocessMemoInput {
+            name: "b.h".to_string(),
+            observed_ns: 0,
+            ..settled.clone()
+        };
         let memo = CcMemoHandoff {
             memo_key: "m".repeat(64),
             preprocessed_hash: "p".repeat(64),
-            inputs: vec![crate::cache_key::CcPreprocessMemoInput {
-                name: "a.h".to_string(),
-                fingerprint: crate::cache_key::FileFingerprint::from_path(&header).unwrap(),
-                content: "c".repeat(64),
-                mapped: "d".repeat(64),
-            }],
+            inputs: vec![settled.clone(), unobserved.clone()],
         };
         request.memo = Some(memo.clone());
         request.event.schema = 26;
@@ -1129,7 +1142,19 @@ mod tests {
             .unwrap()
             .expect("the memo is recorded with the entry");
         assert_eq!(recorded.preprocessed_hash, memo.preprocessed_hash);
-        assert_eq!(recorded.inputs, memo.inputs);
+        assert_eq!(recorded.inputs.len(), 2);
+        assert_eq!(
+            recorded.inputs[0],
+            crate::cache_key::CcPreprocessMemoInput {
+                observed_ns: 0,
+                ..settled
+            }
+        );
+        assert_eq!(recorded.inputs[1].content, unobserved.content);
+        assert_ne!(
+            recorded.inputs[1].fingerprint, unobserved.fingerprint,
+            "a stamp with no observation time is not recorded"
+        );
         assert!(
             !snapshot.exists(),
             "the daemon removes the snapshot after the put"

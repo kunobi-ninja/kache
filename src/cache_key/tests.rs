@@ -1512,7 +1512,9 @@ fn prediction_verification_reads_the_snapshot() {
     if get_rustc_version(Path::new("rustc")).is_err() {
         return;
     }
-    // Cargo and nextest set kache's own OUT_DIR on the test process.
+    // Cargo and nextest set kache's own package and OUT_DIR on the test
+    // process; this is a bare rustc unit.
+    let _manifest = crate::config::tests::set_env_for_test("CARGO_MANIFEST_DIR", None);
     let _out = crate::config::tests::set_env_for_test("OUT_DIR", None);
     let dir = tempfile::tempdir().unwrap();
     let source = dir.path().join("lib.rs");
@@ -1955,6 +1957,9 @@ fn a_unit_the_store_never_held_defers_even_when_its_name_is_taken() {
 #[test]
 fn a_record_is_only_consulted_for_an_eligible_invocation() {
     let _lock = key_test_lock();
+    // Cargo sets the test process's own package and OUT_DIR.
+    let _manifest = crate::config::tests::set_env_for_test("CARGO_MANIFEST_DIR", None);
+    let _out = crate::config::tests::set_env_for_test("OUT_DIR", None);
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("index.db");
     let parse = |args: &[&str]| {
@@ -1981,23 +1986,35 @@ fn a_record_is_only_consulted_for_an_eligible_invocation() {
     assert_eq!(
         predicted_key_inputs(&with_macro, &on, &mut None),
         Err(Rejection::NotEligible),
-        "a proc-macro dependency outside a registry package is refused before any lookup"
+        "a proc-macro dependency with no package to digest is refused before any lookup"
     );
     if get_rustc_version(Path::new("rustc")).is_ok() {
+        let mut tree = Some(TreeGuard {
+            digest: "earlier".to_string(),
+            walks: Vec::new(),
+        });
         assert_eq!(
-            predicted_key_inputs(&plain, &on, &mut None),
+            predicted_key_inputs(&plain, &on, &mut tree),
             Err(Rejection::NoRecord),
             "an eligible invocation with nothing recorded falls back"
         );
+        assert!(tree.is_none(), "only a guard this lookup took comes back");
     }
+    let elsewhere = dir.path().join("elsewhere");
+    let _path_unit =
+        crate::config::tests::set_env_for_test("CARGO_MANIFEST_DIR", Some(elsewhere.as_os_str()));
+    assert_eq!(
+        predicted_key_inputs(&plain, &on, &mut None),
+        Err(Rejection::NotEligible),
+        "a path package with no workspace to digest is refused before any lookup"
+    );
 }
 
-/// A proc macro can scan a directory and emit `include_str!` per entry, so
-/// a file can join the closure with nothing already in it changing. The
-/// pre-pass sees it; a prediction would not. Cargo hands rustc a proc
-/// macro as a dynamic library, and that is the test.
+/// Cargo hands rustc each proc-macro dependency as a dynamic library. That
+/// finds a unit's own macros, not one an rlib re-exports, so it decides only
+/// whether a registry unit needs the tree guard ([`needs_tree_guard`]).
 #[test]
-fn predictions_do_not_apply_to_units_with_a_dynamic_library_dependency() {
+fn a_dynamic_library_extern_is_how_cargo_hands_over_a_proc_macro() {
     let dep = |path: &str| crate::args::ExternDep {
         name: "dep".to_string(),
         path: Some(PathBuf::from(path)),
@@ -2006,14 +2023,8 @@ fn predictions_do_not_apply_to_units_with_a_dynamic_library_dependency() {
         dep("/t/debug/deps/libserde-1.rlib"),
         dep("/t/debug/deps/libcore-2.rmeta"),
     ];
-    assert!(
-        prediction_applies(&plain),
-        "rlib and rmeta dependencies cannot scan the filesystem"
-    );
-    assert!(
-        prediction_applies(&[]),
-        "a unit with no dependencies is eligible"
-    );
+    assert!(!has_dylib_extern(&plain), "rlib and rmeta dependencies");
+    assert!(!has_dylib_extern(&[]), "no dependencies");
 
     for macro_lib in [
         "/t/debug/deps/libmy_macro-3.so",
@@ -2022,18 +2033,61 @@ fn predictions_do_not_apply_to_units_with_a_dynamic_library_dependency() {
     ] {
         let mut with_macro = plain.clone();
         with_macro.push(dep(macro_lib));
-        assert!(
-            !prediction_applies(&with_macro),
-            "{macro_lib} may generate includes the record cannot know about"
-        );
+        assert!(has_dylib_extern(&with_macro), "{macro_lib}");
     }
 
     // A dependency cargo passed without a path tells us nothing either way
     // and must not be read as a proc macro.
-    assert!(prediction_applies(&[crate::args::ExternDep {
+    assert!(!has_dylib_extern(&[crate::args::ExternDep {
         name: "std".to_string(),
         path: None,
     }]));
+}
+
+/// A macro an rlib re-exports (`sqlx::migrate!`, `include_dir!`) reaches
+/// rustc through the rlib alone, so every workspace or path unit takes the
+/// guard. A registry package is the same files wherever it is built.
+#[test]
+fn every_workspace_or_path_unit_takes_the_tree_guard() {
+    let dep = |path: &str| crate::args::ExternDep {
+        name: "dep".to_string(),
+        path: Some(PathBuf::from(path)),
+    };
+    let rlib = [dep("/t/debug/deps/libfacade-1.rlib")];
+    let proc_macro = [dep("/t/debug/deps/libscan-2.so")];
+    let member = Path::new("/w/kt");
+    let registry = Path::new("/h/registry/src/index-1/kt-1.0.0");
+    for (externs, manifest_dir, guarded, why) in [
+        (&rlib[..], Some(member), true, "a member that links an rlib"),
+        (&[][..], Some(member), true, "a member with no dependency"),
+        (
+            &proc_macro[..],
+            Some(member),
+            true,
+            "a member with a proc macro",
+        ),
+        (
+            &rlib[..],
+            Some(registry),
+            false,
+            "a registry unit that links an rlib",
+        ),
+        (
+            &proc_macro[..],
+            Some(registry),
+            true,
+            "a registry unit with a proc macro",
+        ),
+        (
+            &rlib[..],
+            None,
+            false,
+            "no package: the dynamic-library rule",
+        ),
+        (&proc_macro[..], None, true, "no package, with a proc macro"),
+    ] {
+        assert_eq!(needs_tree_guard(externs, manifest_dir), guarded, "{why}");
+    }
 }
 
 /// `src/foo.rs` and `src/foo/mod.rs` both answer `mod foo;`, and rustc
@@ -3351,7 +3405,7 @@ fn workspace_test_roots() -> WorkspaceRoots {
 }
 
 #[test]
-fn a_workspace_row_keeps_its_guard_only_while_the_closure_stays_inside() {
+fn a_workspace_row_keeps_its_guard_only_while_the_guard_covers_the_closure() {
     let tree = || Some("tree".to_string());
     assert_eq!(same_tree_guard(tree(), true, true), tree());
     assert_eq!(same_tree_guard(tree(), true, false), None);
@@ -3396,6 +3450,228 @@ fn manifest_vars(manifest_dir: &Path) -> Vec<(std::ffi::OsString, std::ffi::OsSt
         "CARGO_MANIFEST_DIR".into(),
         manifest_dir.as_os_str().to_owned(),
     )]
+}
+
+/// The member `kt` of a workspace at `base/w`, linking only an rlib that may
+/// re-export a proc macro, as Cargo runs it from the workspace root.
+fn rlib_only_member(base: &Path) -> (PathBuf, RustcArgs) {
+    let (root, args) = workspace_invocation(base, "w", "kt");
+    let deps = root.join("target/debug/deps");
+    let mut argv = args.all_args.clone();
+    argv.insert(0, "rustc".to_string());
+    argv.extend([
+        "--extern".to_string(),
+        format!(
+            "facade={}",
+            deps.join("libfacade-0123456789abcdef.rlib").display()
+        ),
+    ]);
+    (root, RustcArgs::parse(&argv).unwrap())
+}
+
+/// A member that links only an rlib, which may re-export a macro that lists
+/// a directory, is predicted only under the workspace guard. A row without
+/// the digest or with another one is refused, and so is a row whose closure
+/// the guard does not cover: this checkout's, the shared one, or one made in
+/// another checkout.
+#[test]
+fn an_rlib_only_member_is_predicted_only_under_the_workspace_guard() {
+    let mut lock = key_test_lock();
+    if get_rustc_version(Path::new("rustc")).is_err() {
+        return;
+    }
+    let base = lock.enter();
+    let (root, args) = rlib_only_member(&base);
+    std::env::set_current_dir(&root).unwrap();
+    write_file(&root.join("kt/src/lib.rs"), "facade::scan!();\n");
+    write_file(&root.join("kt/assets/a.txt"), "a");
+    write_file(&root.join("stale/x.txt"), "x");
+    write_file(&root.join("stale/CACHEDIR.TAG"), CARGO_BUILD_TAG);
+    write_file(&base.join("outside.txt"), "o");
+    let manifest_dir = root.join("kt");
+    let _manifest = crate::config::tests::set_env_for_test(
+        "CARGO_MANIFEST_DIR",
+        Some(manifest_dir.as_os_str()),
+    );
+    let _out = crate::config::tests::set_env_for_test("OUT_DIR", None);
+    let hasher = |name: &str| FileHasher::persistent(&base.join(name)).with_input_predictions(true);
+    let closure = |sources: &[PathBuf]| DepInfo {
+        source_files: sources.to_vec(),
+        env_deps: Vec::new(),
+    };
+    let lib = PathBuf::from("kt/src/lib.rs");
+    let inside = closure(&[lib.clone(), root.join("kt/assets/a.txt")]);
+
+    let local = hasher("local.db");
+    let mut tree = None;
+    assert_eq!(
+        predicted_key_inputs(&args, &local, &mut tree),
+        Err(Rejection::NoRecord)
+    );
+    let guard = tree.expect("an rlib-only member is digested").digest;
+    let identity = rustc_prediction_identity(&args).unwrap();
+    local.record_input_prediction(&identity, Some("kt"), &inside, None);
+    assert_eq!(
+        predicted_key_inputs(&args, &local, &mut None),
+        Err(Rejection::NoRecord),
+        "a row without the digest"
+    );
+    local.record_input_prediction(&identity, Some("kt"), &inside, Some("other".into()));
+    assert_eq!(
+        predicted_key_inputs(&args, &local, &mut None),
+        Err(Rejection::TreeChanged)
+    );
+    local.record_input_prediction(&identity, Some("kt"), &inside, Some(guard.clone()));
+    assert_eq!(
+        predicted_key_inputs(&args, &local, &mut None),
+        Ok(inside.clone())
+    );
+    write_file(&root.join("kt/assets/b.txt"), "b");
+    assert_eq!(
+        predicted_key_inputs(&args, &local, &mut None),
+        Err(Rejection::TreeChanged),
+        "a file joins the directory a macro lists"
+    );
+    std::fs::remove_file(root.join("kt/assets/b.txt")).unwrap();
+    for uncovered in [base.join("outside.txt"), root.join("stale/x.txt")] {
+        let leaves = closure(&[lib.clone(), uncovered.clone()]);
+        local.record_input_prediction(&identity, Some("kt"), &leaves, Some(guard.clone()));
+        assert_eq!(
+            predicted_key_inputs(&args, &local, &mut None),
+            Err(Rejection::NoRecord),
+            "{}",
+            uncovered.display()
+        );
+    }
+
+    // A shared row written before the coverage rule carries the digest
+    // whatever its closure names.
+    let shared_rows = hasher("shared.db");
+    let shared = rustc_shared_prediction_identity(&args).unwrap();
+    let leaves = closure(&[lib.clone(), base.join("outside.txt")]);
+    shared_rows.record_input_prediction(&shared, Some("kt"), &leaves, Some(guard.clone()));
+    assert_eq!(
+        predicted_key_inputs(&args, &shared_rows, &mut None),
+        Err(Rejection::NoRecord)
+    );
+    shared_rows.record_input_prediction(&shared, Some("kt"), &inside, Some(guard.clone()));
+    assert_eq!(
+        predicted_key_inputs(&args, &shared_rows, &mut None),
+        Ok(inside.clone())
+    );
+
+    let portable_rows = hasher("portable.db");
+    let vars: Vec<_> = std::env::vars_os().collect();
+    let roots = workspace_roots(&args, &vars).unwrap();
+    let portable = workspace_prediction_identity(&args, vars, &roots).unwrap();
+    let record = |below: &str| PortablePrediction {
+        schema: PORTABLE_PREDICTION_SCHEMA,
+        sources: vec![
+            Portable::Literal("kt/src/lib.rs".to_string()),
+            Portable::Workspace(below.to_string()),
+        ],
+        env_deps: Vec::new(),
+        tree: guard.clone(),
+    };
+    portable_rows.record_portable_prediction(&portable, Some("kt"), &record("/stale/x.txt"));
+    assert_eq!(
+        predicted_key_inputs(&args, &portable_rows, &mut None),
+        Err(Rejection::NoRecord),
+        "a row from another checkout naming a file in a Cargo build directory"
+    );
+    portable_rows.record_portable_prediction(&portable, Some("kt"), &record("/kt/assets/a.txt"));
+    assert_eq!(
+        predicted_key_inputs(&args, &portable_rows, &mut None),
+        Ok(inside)
+    );
+}
+
+/// A process that waited on a discovery flight digests the tree again. The
+/// owner's record carries the digest from before its compile, and the tree
+/// may have changed while the owner compiled.
+#[test]
+fn a_flight_waiter_digests_the_tree_again() {
+    let mut lock = key_test_lock();
+    if get_rustc_version(Path::new("rustc")).is_err() {
+        return;
+    }
+    let base = lock.enter();
+    let (root, args) = rlib_only_member(&base);
+    std::env::set_current_dir(&root).unwrap();
+    write_file(&root.join("kt/src/lib.rs"), "");
+    let manifest_dir = root.join("kt");
+    let _manifest = crate::config::tests::set_env_for_test(
+        "CARGO_MANIFEST_DIR",
+        Some(manifest_dir.as_os_str()),
+    );
+    let _out = crate::config::tests::set_env_for_test("OUT_DIR", None);
+    let hasher = FileHasher::persistent(&base.join("index.db")).with_input_predictions(true);
+    let closure = DepInfo {
+        source_files: vec![PathBuf::from("kt/src/lib.rs")],
+        env_deps: Vec::new(),
+    };
+    let identity = rustc_prediction_identity(&args).unwrap();
+    hasher.record_input_prediction(&identity, Some("kt"), &closure, Some("before".into()));
+    let mut tree = Some(TreeGuard {
+        digest: "before".to_string(),
+        walks: Vec::new(),
+    });
+    assert_eq!(
+        predicted_key_inputs(&args, &hasher, &mut tree),
+        Err(Rejection::TreeChanged),
+        "the guard from before the wait is not used again"
+    );
+    let now = tree.expect("the guard is taken again").digest;
+    hasher.record_input_prediction(&identity, Some("kt"), &closure, Some(now.clone()));
+    let mut tree = None;
+    assert_eq!(predicted_key_inputs(&args, &hasher, &mut tree), Ok(closure));
+    assert_eq!(tree.map(|guard| guard.digest), Some(now));
+}
+
+/// This checkout's rows keep the guard while it covers the closure. They are
+/// never relocated, so a generated file naming the checkout costs nothing
+/// here, though it keeps the row for other checkouts out.
+#[test]
+fn this_checkouts_rows_keep_the_guard_while_it_covers_the_closure() {
+    let mut lock = key_test_lock();
+    if get_rustc_version(Path::new("rustc")).is_err() {
+        return;
+    }
+    let base = lock.enter();
+    let (root, args) = rlib_only_member(&base);
+    std::env::set_current_dir(&root).unwrap();
+    write_file(&root.join("kt/src/lib.rs"), "");
+    let out = root.join("target/debug/build/kt-1/out");
+    write_file(
+        &out.join("gen.rs"),
+        &format!("// generated in {}\n", root.display()),
+    );
+    write_file(&base.join("outside.txt"), "o");
+    let manifest_dir = root.join("kt");
+    let _manifest = crate::config::tests::set_env_for_test(
+        "CARGO_MANIFEST_DIR",
+        Some(manifest_dir.as_os_str()),
+    );
+    let _out = crate::config::tests::set_env_for_test("OUT_DIR", Some(out.as_os_str()));
+    let tree = || Some("tree".to_string());
+    let closure = |extra: PathBuf| DepInfo {
+        source_files: vec![PathBuf::from("kt/src/lib.rs"), extra],
+        env_deps: Vec::new(),
+    };
+    let generated = closure(out.join("gen.rs"));
+    assert_eq!(same_checkout_guard(&args, &generated, tree()), tree());
+    assert!(workspace_record(&args, &generated, Some("tree")).is_none());
+    let outside = closure(base.join("outside.txt"));
+    assert_eq!(same_checkout_guard(&args, &outside, tree()), None);
+
+    let registry = base.join("home/registry/src/index-1/kt-1.0.0");
+    let _registry =
+        crate::config::tests::set_env_for_test("CARGO_MANIFEST_DIR", Some(registry.as_os_str()));
+    assert_eq!(
+        same_checkout_guard(&args, &outside, tree()),
+        tree(),
+        "a registry unit keeps its own guard"
+    );
 }
 
 #[test]
@@ -3756,6 +4032,126 @@ fn a_workspace_record_needs_the_guard_and_every_source_inside() {
     );
 }
 
+/// What Cargo writes into a target directory it creates.
+const CARGO_BUILD_TAG: &str = "Signature: 8a477f597d28d172789f06886806bc55\n\
+     # This file is a cache directory tag created by cargo.\n";
+
+fn write_file(path: &Path, content: &str) {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, content).unwrap();
+}
+
+/// The guard sees a file only where its walk goes: not through a symlinked
+/// directory, nor into a directory Cargo tagged as its build directory,
+/// except below `OUT_DIR`, which the walk reads whole.
+#[test]
+fn the_guard_sees_only_the_files_its_walk_reaches() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("w");
+    let out = dir.path().join("out");
+    for file in ["kt/src/lib.rs", "assets/a.txt", "stale/x.rs"] {
+        write_file(&root.join(file), "");
+    }
+    write_file(&root.join("stale/CACHEDIR.TAG"), CARGO_BUILD_TAG);
+    write_file(&out.join("gen.rs"), "");
+    write_file(&out.join("nested/y.rs"), "");
+    write_file(&out.join("nested/CACHEDIR.TAG"), CARGO_BUILD_TAG);
+    write_file(&dir.path().join("outside/o.txt"), "");
+    let canonical_root = root.canonicalize().unwrap();
+    let roots = WorkspaceRoots {
+        root: root.clone(),
+        cwd: String::new(),
+        canonical_target: canonical_root.join("target"),
+        canonical_root: canonical_root.clone(),
+        target: root.join("target"),
+        out_dir: Some(out.clone()),
+        vendored_package: None,
+    };
+    let covers = |sources: &[PathBuf]| guard_covers(sources, &roots);
+    let relative = PathBuf::from;
+    assert!(covers(&[
+        relative("kt/src/lib.rs"),
+        relative("kt/src/../../assets/a.txt"),
+        root.join("assets/a.txt"),
+        canonical_root.join("assets/a.txt"),
+        out.join("gen.rs"),
+        out.join("nested/y.rs"),
+    ]));
+    for (source, why) in [
+        (relative("../outside/o.txt"), "relative, leaving the root"),
+        (dir.path().join("outside/o.txt"), "outside the workspace"),
+        (
+            root.join("target/debug/deps/libx.rlib"),
+            "the target directory",
+        ),
+        (root.join("stale/x.rs"), "a Cargo build directory"),
+        (
+            relative("stale/x.rs"),
+            "relative, into a Cargo build directory",
+        ),
+        (root.join("kt/missing/x.rs"), "no such directory"),
+    ] {
+        assert!(!covers(&[relative("kt/src/lib.rs"), source]), "{why}");
+    }
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(dir.path().join("outside"), root.join("linked")).unwrap();
+        assert!(
+            !covers(&[root.join("linked/o.txt")]),
+            "through a symlinked directory"
+        );
+    }
+    let mut entered = HashMap::new();
+    assert!(walk_reaches(&root, "/top.txt", true, &mut entered));
+    assert!(walk_reaches(
+        &root,
+        "/kt/src/../src/lib.rs",
+        true,
+        &mut entered
+    ));
+    assert!(!walk_reaches(
+        &root,
+        "/../w/kt/src/lib.rs",
+        true,
+        &mut entered
+    ));
+}
+
+/// A record for another checkout is only made when the guard sees every file
+/// the closure names.
+#[test]
+fn a_workspace_record_needs_every_source_where_the_guard_walks() {
+    let mut lock = key_test_lock();
+    if get_rustc_version(Path::new("rustc")).is_err() {
+        return;
+    }
+    let base = lock.enter();
+    let (root, args) = workspace_invocation(&base, "w", "kt");
+    std::env::set_current_dir(&root).unwrap();
+    write_file(&root.join("kt/src/lib.rs"), "");
+    write_file(&root.join("stale/x.rs"), "");
+    write_file(&root.join("stale/CACHEDIR.TAG"), CARGO_BUILD_TAG);
+    let manifest_dir = root.join("kt");
+    let _manifest = crate::config::tests::set_env_for_test(
+        "CARGO_MANIFEST_DIR",
+        Some(manifest_dir.as_os_str()),
+    );
+    let _out = crate::config::tests::set_env_for_test("OUT_DIR", None);
+    let closure = |sources: &[&str]| DepInfo {
+        source_files: sources.iter().map(PathBuf::from).collect(),
+        env_deps: Vec::new(),
+    };
+    assert!(workspace_record(&args, &closure(&["kt/src/lib.rs"]), Some("tree")).is_some());
+    assert!(
+        workspace_record(
+            &args,
+            &closure(&["kt/src/lib.rs", "stale/x.rs"]),
+            Some("tree")
+        )
+        .is_none()
+    );
+}
+
 #[test]
 fn a_workspace_entry_resolves_only_where_this_invocation_has_a_workspace() {
     let record = PortablePrediction {
@@ -3830,6 +4226,56 @@ fn the_workspace_guard_covers_everything_but_target_and_git() {
     assert_ne!(digest(), baseline, "OUT_DIR, though it lies under target");
 }
 
+/// A directory Cargo tagged as its build directory, such as a stale `target`
+/// left in the tree while the build writes elsewhere, counts by its tag
+/// alone: its output neither changes the guard nor fills the budget.
+/// `OUT_DIR` and a registry package are read whole.
+#[test]
+fn a_cargo_build_dir_in_the_workspace_counts_by_its_tag() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("w");
+    let out = dir.path().join("out");
+    for file in [
+        "Cargo.toml",
+        "kt/src/lib.rs",
+        "stale/debug/a",
+        "stale/debug/b",
+    ] {
+        write_file(&root.join(file), "");
+    }
+    write_file(&root.join("stale/CACHEDIR.TAG"), CARGO_BUILD_TAG);
+    write_file(&out.join("gen.rs"), "");
+    write_file(&out.join("nested/CACHEDIR.TAG"), CARGO_BUILD_TAG);
+    let roots = WorkspaceRoots {
+        root: root.clone(),
+        cwd: String::new(),
+        canonical_root: root.clone(),
+        target: dir.path().join("target"),
+        canonical_target: dir.path().join("target"),
+        out_dir: Some(out.clone()),
+        vendored_package: None,
+    };
+    let hasher = FileHasher::new();
+    let digest = |budget| workspace_tree_digest_within(&roots, &hasher, budget);
+    // `Cargo.toml`, `kt`, `kt/src`, `kt/src/lib.rs`, `stale` and its tag,
+    // then `gen.rs`, `nested` and its tag.
+    let baseline = digest(9).unwrap();
+    assert_eq!(digest(8), None);
+    write_file(&root.join("stale/debug/c"), "");
+    assert_eq!(digest(9).as_ref(), Some(&baseline), "build output");
+    write_file(&out.join("nested/x"), "");
+    assert_eq!(digest(9), None, "OUT_DIR is read whole");
+    assert!(digest(10).is_some_and(|changed| changed != baseline));
+
+    let package = dir.path().join("registry/src/index-1/kt-1.0.0");
+    write_file(&package.join("src/lib.rs"), "");
+    write_file(&package.join("stale/CACHEDIR.TAG"), CARGO_BUILD_TAG);
+    let registry = || crate_tree_digest_in(package.clone(), None, &hasher).unwrap();
+    let before = registry();
+    write_file(&package.join("stale/debug/a"), "");
+    assert_ne!(registry(), before, "a registry package is read whole");
+}
+
 #[test]
 fn a_vendored_package_is_guarded_by_itself_not_the_workspace() {
     let dir = tempfile::tempdir().unwrap();
@@ -3899,6 +4345,205 @@ fn a_vendored_package_is_guarded_by_itself_not_the_workspace() {
     let vendored = digest(&roots);
     roots.vendored_package = None;
     assert_ne!(digest(&roots), vendored, "not the workspace digest");
+}
+
+/// A vendored unit's guard walks the files at the top of each directory
+/// between the package and the workspace root, which its digest reads, and
+/// each such directory's own times, but not what the directories beside the
+/// package hold.
+#[test]
+fn a_vendored_guard_moves_with_a_file_at_the_top_of_an_ancestor() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("w");
+    write_file(&root.join("Cargo.toml"), "[workspace]\n");
+    write_file(&root.join(".env"), "A=1");
+    write_file(&root.join("docs/a.md"), "");
+    write_file(
+        &root.join("third_party/rust/foo/.cargo-checksum.json"),
+        "{}",
+    );
+    write_file(&root.join("third_party/rust/foo/src/lib.rs"), "");
+    write_file(&root.join("third_party/rust/bar/src/lib.rs"), "");
+    let roots = WorkspaceRoots {
+        root: root.clone(),
+        cwd: String::new(),
+        canonical_root: root.canonicalize().unwrap(),
+        target: root.join("target"),
+        canonical_target: root.join("target"),
+        out_dir: None,
+        vendored_package: Some(root.join("third_party/rust/foo")),
+    };
+    // Old times, so a name added beside the package moves them on any clock.
+    let old = filetime::FileTime::from_unix_time(1_000_000_000, 0);
+    for directory in [
+        root.clone(),
+        root.join("third_party"),
+        root.join("third_party/rust"),
+    ] {
+        filetime::set_file_mtime(directory, old).unwrap();
+    }
+    let hasher = FileHasher::new();
+    let taken = tree_guard_of(&hasher, || workspace_tree_digest(&roots, &hasher)).unwrap();
+    assert!(taken.held());
+    write_file(&root.join("docs/b.md"), "");
+    write_file(&root.join("third_party/rust/bar/src/more.rs"), "");
+    assert!(taken.held(), "the rest of the tree");
+    write_file(&root.join(".env"), "A=12");
+    assert!(!taken.held(), "a file at the top of the workspace");
+    let taken = tree_guard_of(&hasher, || workspace_tree_digest(&roots, &hasher)).unwrap();
+    write_file(&root.join("third_party/rust/baz/src/lib.rs"), "");
+    assert!(
+        !taken.held(),
+        "a directory added beside the package while the unit compiles"
+    );
+}
+
+/// A workspace at `root` with `third_party/rust/foo` vendored into it, and
+/// the roots of a unit of that package.
+fn vendored_workspace(root: &Path) -> WorkspaceRoots {
+    write_file(&root.join("Cargo.toml"), "[workspace]\n");
+    write_file(
+        &root.join("third_party/rust/foo/.cargo-checksum.json"),
+        "{}",
+    );
+    write_file(&root.join("third_party/rust/foo/src/lib.rs"), "");
+    WorkspaceRoots {
+        root: root.to_path_buf(),
+        cwd: String::new(),
+        canonical_root: root.canonicalize().unwrap(),
+        target: root.join("target"),
+        canonical_target: root.join("target"),
+        out_dir: None,
+        vendored_package: Some(root.join("third_party/rust/foo")),
+    }
+}
+
+/// A vendored unit's guard reads the dot-directories at the top of each
+/// ancestor, but not Kache's own cache there: it changes while units build.
+#[test]
+fn a_vendored_guard_leaves_out_kaches_cache_at_an_ancestor() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("w");
+    let roots = vendored_workspace(&root);
+    let cache = root.join(".kache");
+    write_file(&cache.join("index.db"), "a");
+    let hasher = FileHasher::new().with_own_dirs([cache.clone()]);
+    let taken = tree_guard_of(&hasher, || workspace_tree_digest(&roots, &hasher)).unwrap();
+    write_file(&cache.join("index.db"), "ab");
+    assert!(taken.held(), "the store moved");
+    let again = tree_guard_of(&hasher, || workspace_tree_digest(&roots, &hasher)).unwrap();
+    assert_eq!(again.digest, taken.digest);
+    let counted = FileHasher::new();
+    let before = workspace_tree_digest(&roots, &counted).unwrap();
+    write_file(&cache.join("index.db"), "abc");
+    assert_ne!(
+        workspace_tree_digest(&roots, &counted).unwrap(),
+        before,
+        "another dot-directory there counts"
+    );
+}
+
+/// A file or dot-directory that came and went at the top of an ancestor
+/// while the unit compiled leaves the digest as it was, so a record could
+/// pair that digest with output a macro made from it. The ancestor's own
+/// times show it.
+#[test]
+fn a_vendored_guard_moves_with_a_name_that_came_and_went_at_an_ancestor() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("w");
+    let roots = vendored_workspace(&root);
+    let hasher = FileHasher::new();
+    let old = filetime::FileTime::from_unix_time(1_000_000_000, 0);
+    for (name, directory) in [(".env", None), (".sqlx/query.json", Some(".sqlx"))] {
+        filetime::set_file_mtime(&root, old).unwrap();
+        let taken = tree_guard_of(&hasher, || workspace_tree_digest(&roots, &hasher)).unwrap();
+        write_file(&root.join(name), "x");
+        std::fs::remove_file(root.join(name)).unwrap();
+        if let Some(directory) = directory {
+            std::fs::remove_dir(root.join(directory)).unwrap();
+        }
+        assert_eq!(
+            workspace_tree_digest(&roots, &hasher).as_deref(),
+            Some(taken.digest.as_str()),
+            "{name} left nothing to digest"
+        );
+        assert!(!taken.held(), "{name} came and went");
+    }
+}
+
+/// A vendored guard lists the top of an ancestor after stamping it. Listed
+/// before, a name that appeared between the two would be in the stamp and
+/// not in the digest, and once it was gone the digest would match again.
+#[test]
+fn a_vendored_guard_digests_what_its_ancestor_stamp_saw() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("w");
+    let roots = vendored_workspace(&root);
+    let hasher = FileHasher::new();
+    let ancestor = root.clone();
+    let mut pending = true;
+    set_before_stamp(Some(Box::new(move |path: &Path| {
+        if pending && path == ancestor {
+            pending = false;
+            std::fs::write(ancestor.join(".env"), "A=1").unwrap();
+        }
+    })));
+    let taken = tree_guard_of(&hasher, || workspace_tree_digest(&roots, &hasher));
+    set_before_stamp(None);
+    let taken = taken.unwrap();
+    assert!(
+        root.join(".env").exists(),
+        "the name appeared before the stamp"
+    );
+    assert!(taken.held());
+    assert_eq!(
+        workspace_tree_digest(&roots, &hasher).as_deref(),
+        Some(taken.digest.as_str()),
+        "the digest holds the name its stamp saw"
+    );
+}
+
+/// A file at the top of an ancestor that the build cannot read counts as
+/// unreadable in a vendored unit's guard, as it does in the workspace guard.
+#[cfg(unix)]
+#[test]
+fn a_vendored_guard_counts_an_unreadable_ancestor_file_as_unreadable() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("w");
+    write_file(&root.join("Cargo.toml"), "[workspace]\n");
+    write_file(&root.join(".env"), "A=1");
+    write_file(
+        &root.join("third_party/rust/foo/.cargo-checksum.json"),
+        "{}",
+    );
+    write_file(&root.join("third_party/rust/foo/src/lib.rs"), "");
+    let roots = WorkspaceRoots {
+        root: root.clone(),
+        cwd: String::new(),
+        canonical_root: root.canonicalize().unwrap(),
+        target: root.join("target"),
+        canonical_target: root.join("target"),
+        out_dir: None,
+        vendored_package: Some(root.join("third_party/rust/foo")),
+    };
+    let hasher = FileHasher::new();
+    let readable = workspace_tree_digest(&roots, &hasher).unwrap();
+    let env = root.join(".env");
+    struct Readable(PathBuf);
+    impl Drop for Readable {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o644));
+        }
+    }
+    let _env = Readable(env.clone());
+    std::fs::set_permissions(&env, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::read(&env).is_ok() {
+        eprintln!("skipped: this user reads past permissions");
+        return;
+    }
+    let unreadable = workspace_tree_digest(&roots, &hasher).expect("a file it cannot read");
+    assert_ne!(unreadable, readable);
 }
 
 #[test]
@@ -4486,6 +5131,9 @@ fn a_workspace_unit_never_reads_a_relocated_record() {
     let package = dir.path().join("w/kt");
     std::fs::create_dir_all(package.join("src")).unwrap();
     std::fs::write(package.join("src/lib.rs"), "include!(\"x\");\n").unwrap();
+    // A path package built from its own directory, as Cargo builds one.
+    std::fs::write(package.join("Cargo.toml"), "[package]\n").unwrap();
+    std::env::set_current_dir(&package).unwrap();
     let target = dir.path().join("b/target");
     let out = target.join("debug/build/kt-1/out");
     std::fs::create_dir_all(&out).unwrap();
@@ -4543,7 +5191,7 @@ fn a_registry_unit_reads_a_relocated_record_under_its_out_dir_guard() {
         Err(Rejection::NoRecord)
     );
     assert_eq!(
-        tree.as_deref(),
+        tree.map(|guard| guard.digest).as_deref(),
         Some(guard.as_str()),
         "a cold build records the guard it saw before compiling"
     );
@@ -4569,7 +5217,7 @@ fn a_registry_unit_reads_a_relocated_record_under_its_out_dir_guard() {
         dep_info.env_deps,
         vec![("OUT_DIR".to_string(), out.display().to_string())]
     );
-    assert_eq!(tree, Some(guard));
+    assert_eq!(tree.map(|guard| guard.digest), Some(guard));
 
     std::fs::write(out.join("extra.rs"), "").unwrap();
     assert_eq!(
@@ -4625,7 +5273,7 @@ fn an_aliased_out_dir_takes_the_shared_row(macro_dep: bool) {
     };
     let args_a = args_in(&target_a);
     let args_b = args_in(&target_b);
-    assert_eq!(prediction_applies(&args_a.externs), !macro_dep);
+    assert_eq!(has_dylib_extern(&args_a.externs), macro_dep);
     let shared = |args: &RustcArgs, out_dir: &Path| {
         rustc_shared_prediction_identity_in(args, vars(out_dir)).unwrap()
     };
@@ -4865,7 +5513,7 @@ fn emitted_closure_keeps_the_precompile_tree_guard() {
     // A macro input changed during compilation. Recording the newer tree
     // would make the old emitted closure appear valid for those new files.
     std::fs::write(package.join("macro-input.txt"), "changed").unwrap();
-    provide_dep_info(closure.clone(), deferred_outputs.tree_digest);
+    provide_dep_info(closure.clone(), deferred_outputs.tree_guard);
     let (key, outputs) = compute_cache_key_with_outputs(
         &args,
         &hasher,
@@ -4873,7 +5521,7 @@ fn emitted_closure_keeps_the_precompile_tree_guard() {
         &KeyEnv::default(),
     );
     key.unwrap();
-    let tree = outputs.tree_digest;
+    let tree = outputs.tree_guard.map(|guard| guard.digest);
     assert_eq!(tree.as_deref(), Some(original_tree.as_str()));
     let identity = rustc_prediction_identity(&args).unwrap();
     hasher.record_input_prediction(&identity, Some("guarded"), &closure, tree);
@@ -4896,7 +5544,7 @@ fn emitted_closure_keeps_the_precompile_tree_guard() {
         &KeyEnv::default(),
     );
     key.unwrap();
-    assert!(outputs.tree_digest.is_none());
+    assert!(outputs.tree_guard.is_none());
 }
 
 /// A row this build cannot vouch for reads as absent. The cost of that is
@@ -10669,14 +11317,13 @@ fn mapped_hashes_are_memoised_by_content_and_map_set() {
     std::fs::write(&copy, &body).unwrap();
     std::fs::write(&other, format!("{body}#define OTHER 2\n")).unwrap();
     let reads = std::cell::Cell::new(0usize);
-    let counting = |path: &Path| -> Option<String> {
+    let counting = |path: &Path| -> Option<CcContentHashes> {
         reads.set(reads.get() + 1);
         let bytes = std::fs::read(path).ok()?;
-        Some(
-            blake3::hash(&[b"mapped:".as_slice(), &bytes].concat())
-                .to_hex()
-                .to_string(),
-        )
+        Some(content_hashes(
+            &bytes,
+            &[b"mapped:".as_slice(), &bytes].concat(),
+        ))
     };
     let name = |path: &Path| (path.to_string_lossy().into_owned(), path.to_path_buf());
 
@@ -10743,21 +11390,24 @@ fn assembler_scans_are_memoised_by_content() {
     )
     .unwrap();
     let scans = std::cell::Cell::new(0usize);
-    let scan = |path: &Path| -> Option<Option<&'static str>> {
+    let scan = |path: &Path| -> Option<(String, Option<&'static str>)> {
         scans.set(scans.get() + 1);
         let text = std::fs::read_to_string(path).ok()?;
-        Some(text.contains(".incbin").then_some(".incbin"))
+        Some((
+            blake3::hash(text.as_bytes()).to_hex().to_string(),
+            text.contains(".incbin").then_some(".incbin"),
+        ))
     };
     let name = |path: &Path| (path.to_string_lossy().into_owned(), path.to_path_buf());
     let hasher = FileHasher::persistent(&db);
     let inputs = hasher
-        .cc_preprocess_fingerprints(&[name(&clean), name(&twin)], "", &|_| Some(String::new()))
+        .cc_preprocess_fingerprints(&[name(&clean), name(&twin)], "", &no_mapping)
         .unwrap();
     assert_eq!(hasher.cc_inputs_hide_assembler_input(&inputs, &scan), None);
     assert_eq!(scans.get(), 1, "twins share one scan");
     let later = FileHasher::persistent(&db);
     let inputs = later
-        .cc_preprocess_fingerprints(&[name(&clean), name(&pasted)], "", &|_| Some(String::new()))
+        .cc_preprocess_fingerprints(&[name(&clean), name(&pasted)], "", &no_mapping)
         .unwrap();
     assert_eq!(
         later
@@ -10890,8 +11540,18 @@ fn cc_preprocess_memo_requires_every_input_fingerprint_to_match() {
 }
 
 /// Tests that do not exercise prefix maps hash contents as they are.
-fn no_mapping(path: &Path) -> Option<String> {
-    hash_file(path).ok()
+fn no_mapping(path: &Path) -> Option<CcContentHashes> {
+    let bytes = std::fs::read(path).ok()?;
+    Some(content_hashes(&bytes, &bytes))
+}
+
+/// What `mapped_content` returns for one read of `bytes` that the maps
+/// rewrote to `mapped`.
+fn content_hashes(bytes: &[u8], mapped: &[u8]) -> CcContentHashes {
+    CcContentHashes {
+        raw: blake3::hash(bytes).to_hex().to_string(),
+        mapped: blake3::hash(mapped).to_hex().to_string(),
+    }
 }
 
 /// A resolver for tests that record and read in one place: the recorded
@@ -10922,13 +11582,12 @@ fn cc_preprocess_memo_compares_contents_as_the_expansion_sees_them() {
     // The maps each tree would use: its own root onto one shared sentinel.
     let map_under = |root: &std::path::Path| {
         let root = root.to_string_lossy().into_owned();
-        move |path: &Path| -> Option<String> {
+        move |path: &Path| -> Option<CcContentHashes> {
             let text = std::fs::read_to_string(path).ok()?;
-            Some(
-                blake3::hash(text.replace(&root, "<root>").as_bytes())
-                    .to_hex()
-                    .to_string(),
-            )
+            Some(content_hashes(
+                text.as_bytes(),
+                text.replace(&root, "<root>").as_bytes(),
+            ))
         }
     };
 
@@ -11098,6 +11757,309 @@ fn cc_preprocess_memo_survives_new_metadata_for_unchanged_bytes() {
     );
 }
 
+/// A stamp taken less than the settle window after its file changed can
+/// survive a second write in the same timestamp tick. The memo does not
+/// record it, so a lookup reads that input instead of trusting metadata;
+/// the same stamp observed once settled is trusted.
+#[test]
+fn a_stamp_observed_before_it_settled_never_answers_a_lookup() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("idx.sqlite");
+    let digest = "e".repeat(64);
+    let record = |file: &str, observed_later_ns: i64| {
+        let path = dir.path().join(file);
+        std::fs::write(&path, "#define H 1\n").unwrap();
+        let hasher = FileHasher::persistent(&db);
+        let mut inputs = hasher
+            .cc_preprocess_fingerprints(
+                &[(path.to_string_lossy().into_owned(), path.clone())],
+                "",
+                &no_mapping,
+            )
+            .unwrap();
+        inputs[0].observed_ns += observed_later_ns;
+        hasher.cc_preprocess_memo_record_if_unchanged(file, &digest, &inputs, &no_mapping);
+        let recorded = hasher
+            .cache
+            .as_ref()
+            .unwrap()
+            .get_cc_preprocess_memo(file)
+            .unwrap()
+            .expect("the memo is recorded either way");
+        (inputs.remove(0), recorded.inputs[0].fingerprint.clone())
+    };
+    let reads_on_lookup = |file: &str| {
+        let hasher = FileHasher::persistent(&db);
+        let hit = hasher
+            .cc_preprocess_memo_lookup(file, no_remap, &no_mapping)
+            .map(|(hash, _)| hash);
+        assert_eq!(hit.as_deref(), Some(digest.as_str()), "{file}");
+        hasher.stats().cache_misses
+    };
+
+    let (fresh, stored) = record("fresh.h", 0);
+    assert!(!fresh.stamp_settled(), "the file was just written");
+    assert_ne!(stored, fresh.fingerprint, "the stamp is not recorded");
+    assert_eq!(reads_on_lookup("fresh.h"), 1, "the content is compared");
+
+    let (settled, stored) = record("settled.h", HASH_SETTLE_NS);
+    assert!(settled.stamp_settled());
+    assert_eq!(stored, settled.fingerprint);
+    assert_eq!(
+        reads_on_lookup("settled.h"),
+        0,
+        "matching metadata needs no read"
+    );
+}
+
+/// A memo hit proves an input by its settled stamp without hashing it. A
+/// key-first compile's check still covers that input: it reads it again
+/// when the invocation started before the stamp settled, and flags it once
+/// it is rewritten.
+#[test]
+fn an_input_a_memo_hit_proved_by_stamp_is_rechecked() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("idx.sqlite");
+    let header = dir.path().join("h.h");
+    std::fs::write(&header, "#define H 1\n").unwrap();
+    let names = [(header.to_string_lossy().into_owned(), header.clone())];
+    let recorder = FileHasher::persistent(&db);
+    let mut inputs = recorder
+        .cc_preprocess_fingerprints(&names, "", &no_mapping)
+        .unwrap();
+    inputs[0].observed_ns += HASH_SETTLE_NS;
+    recorder.cc_preprocess_memo_record_if_unchanged(
+        "memo-key",
+        &"f".repeat(64),
+        &inputs,
+        &no_mapping,
+    );
+    let mut hasher = FileHasher::persistent(&db);
+    // After the write, past the window that counts it as one made during
+    // the build, but before its stamp settled: a peer recorded the memo
+    // while this invocation was still keying.
+    hasher.arm_too_new_guard(past_the_write(&inputs[0].fingerprint), 0);
+    assert!(
+        hasher
+            .cc_preprocess_memo_lookup("memo-key", no_remap, &no_mapping)
+            .is_some()
+    );
+    assert_eq!(hasher.stats().cache_misses, 0, "proved by its stamp");
+    assert!(
+        !hasher.inputs_changed_since_keyed(),
+        "read again, it holds the bytes the memo proved"
+    );
+    std::fs::write(&header, "#define H 22\n").unwrap();
+    assert!(hasher.inputs_changed_since_keyed());
+}
+
+/// A stamp that had not settled when the invocation started can survive a
+/// second write in the same timestamp tick, so a key-first check reads
+/// that input again instead of trusting its stat. A row memoised for the
+/// stamp with other bytes' hash stands in for such a write here. A settled
+/// stamp is trusted without a read.
+///
+/// The modification time is an hour ahead of the clock, so neither start
+/// counts the file as written during the build, whatever grain the
+/// filesystem keeps its times in. A file written just before the start
+/// would not do where times are whole seconds: its write window there is
+/// longer than the settle window, so no start leaves it outside the one and
+/// inside the other.
+#[test]
+fn a_key_first_check_reads_again_only_an_input_fresh_at_the_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = rusqlite::Connection::open_in_memory().unwrap();
+    ensure_file_hash_cache_schema(&db).unwrap();
+    let header = dir.path().join("big.h");
+    std::fs::write(&header, "x".repeat(MIN_PERSISTED_HASH_BYTES as usize)).unwrap();
+    let ahead = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+    filetime::set_file_mtime(&header, filetime::FileTime::from_system_time(ahead)).unwrap();
+    let stamp = FileFingerprint::from_path(&header).unwrap();
+    let stale = "0".repeat(64);
+    FileHashCache::Borrowed(&db).put(&stamp, &stale).unwrap();
+    let checked = |start_ns: i64| {
+        let mut hasher = FileHasher::from_cache(FileHashCache::Borrowed(&db));
+        hasher.arm_too_new_guard(start_ns, 0);
+        assert_eq!(hasher.hash(&header).unwrap(), stale, "the key's hash");
+        assert!(
+            !hasher.too_new.saw_write_since_start.get(),
+            "not written during the build"
+        );
+        hasher.inputs_changed_since_keyed()
+    };
+
+    // Past the change time's own window: only the modification time is
+    // fresh at this start.
+    let fresh = stamp.ctime_ns + stamp_window_ns(stamp.ctime_ns) + 1;
+    assert!(checked(fresh), "a fresh input is read again");
+    assert!(
+        !checked(stamp.mtime_ns + HASH_SETTLE_NS),
+        "a settled stamp is trusted without a read"
+    );
+}
+
+/// A write between the preprocessor's read and the key's own leaves a
+/// stat after the compile matching what the key saw; only its stamp, from
+/// after the invocation started, shows it. A stamp ahead of the clock when
+/// the key read the file was not made during the build by this host's
+/// clock, so it refuses nothing while the file holds the bytes the key
+/// hashed.
+#[test]
+fn a_key_first_check_refuses_a_stamp_from_the_build_but_not_one_ahead_of_the_clock() {
+    let dir = tempfile::tempdir().unwrap();
+    let header = dir.path().join("h.h");
+    std::fs::write(&header, "#define H 1\n").unwrap();
+    let checked = |start_ns: i64| {
+        let mut hasher = FileHasher::new();
+        hasher.arm_too_new_guard(start_ns, 0);
+        hasher.hash(&header).unwrap();
+        (hasher.too_new(), hasher.inputs_changed_since_keyed())
+    };
+
+    let written = FileFingerprint::from_path(&header).unwrap();
+    assert_eq!(
+        checked(written.mtime_ns.min(written.ctime_ns)),
+        (true, true),
+        "written after the invocation started"
+    );
+    // File clocks can trail the start, so a stamp just below it may be
+    // from a write made after it.
+    assert_eq!(
+        checked(written.mtime_ns.max(written.ctime_ns) + 1),
+        (true, true),
+        "stamped just before the invocation started"
+    );
+
+    let ahead = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+    filetime::set_file_mtime(&header, filetime::FileTime::from_system_time(ahead)).unwrap();
+    let skewed = FileFingerprint::from_path(&header).unwrap();
+    // Changed before the invocation started, modified an hour from now.
+    let start = skewed.ctime_ns + stamp_window_ns(skewed.ctime_ns) + 1;
+    assert_eq!(checked(start), (true, false));
+}
+
+/// The earliest start a write with `stamp` counts as made before
+/// ([`stamp_written_since`]).
+fn past_the_write(stamp: &FileFingerprint) -> i64 {
+    [stamp.mtime_ns, stamp.ctime_ns]
+        .into_iter()
+        .map(|stamp| stamp + stamp_window_ns(stamp))
+        .max()
+        .unwrap()
+        + 1
+}
+
+/// The mapped hash comes from a second read of the file. A save landing
+/// between the content hash and that read must not pair the old content
+/// with the new bytes' mapping: the capture fails and nothing is learned.
+#[test]
+fn a_mapped_hash_of_other_bytes_is_never_learned() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("idx.sqlite");
+    let header = dir.path().join("h.h");
+    std::fs::write(&header, "#define H 1\n").unwrap();
+    let names = [(header.to_string_lossy().into_owned(), header.clone())];
+    let old = blake3::hash(b"#define H 1\n").to_hex().to_string();
+    let new = blake3::hash(b"#define H 22\n").to_hex().to_string();
+    let saved_in_between = |path: &Path| {
+        std::fs::write(path, "#define H 22\n").unwrap();
+        no_mapping(path)
+    };
+
+    let hasher = FileHasher::persistent(&db);
+    assert_eq!(
+        hasher.cc_preprocess_fingerprints(&names, "maps", &saved_in_between),
+        None
+    );
+    let learned = |hasher: &FileHasher<'_>| {
+        hasher
+            .cache
+            .as_ref()
+            .unwrap()
+            .get_cc_mapped_hashes("maps", &[&old, &new])
+            .unwrap()
+    };
+    assert!(learned(&hasher).is_empty(), "{:?}", learned(&hasher));
+
+    // One read that matches the content hash is learned.
+    let later = FileHasher::persistent(&db);
+    let inputs = later
+        .cc_preprocess_fingerprints(&names, "maps", &no_mapping)
+        .unwrap();
+    assert_eq!(inputs[0].content, new);
+    assert_eq!(
+        learned(&later),
+        HashMap::from([(new.clone(), inputs[0].mapped.clone())])
+    );
+}
+
+/// The assembler scan reads the file again too. A verdict on bytes saved
+/// since the fingerprint is not recorded, and it does not clear the inputs.
+#[test]
+fn an_assembler_verdict_on_other_bytes_is_never_learned() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("idx.sqlite");
+    let header = dir.path().join("h.h");
+    std::fs::write(&header, "#define H 1\n").unwrap();
+    let names = [(header.to_string_lossy().into_owned(), header.clone())];
+    let hasher = FileHasher::persistent(&db);
+    let inputs = hasher
+        .cc_preprocess_fingerprints(&names, "", &no_mapping)
+        .unwrap();
+    let scanned_after_a_save = |path: &Path| {
+        std::fs::write(path, "#define H 22\n").unwrap();
+        let bytes = std::fs::read(path).ok()?;
+        Some((blake3::hash(&bytes).to_hex().to_string(), None))
+    };
+
+    assert_eq!(
+        hasher
+            .cc_inputs_hide_assembler_input(&inputs, &scanned_after_a_save)
+            .as_deref(),
+        Some(CC_INPUT_CHANGED_WHILE_SCANNED)
+    );
+    assert!(
+        hasher
+            .cache
+            .as_ref()
+            .unwrap()
+            .get_cc_asm_scans(&[&inputs[0].content])
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// A key taken before the compile hashed its inputs. One rewritten or
+/// removed before the check is flagged; untouched ones are not.
+#[test]
+fn a_key_first_check_flags_an_input_written_since_it_was_hashed() {
+    let dir = tempfile::tempdir().unwrap();
+    let kept = dir.path().join("kept.h");
+    let rewritten = dir.path().join("rewritten.h");
+    let removed = dir.path().join("removed.h");
+    for path in [&kept, &rewritten, &removed] {
+        std::fs::write(path, "#define H 1\n").unwrap();
+    }
+    let checked = |paths: &[&PathBuf], after_hashing: &dyn Fn()| {
+        let mut hasher = FileHasher::new();
+        // Armed, but no stamp is new enough to trip it by the clock.
+        hasher.arm_too_new_guard(i64::MAX, 0);
+        for path in paths {
+            hasher.hash(path).unwrap();
+        }
+        after_hashing();
+        hasher.inputs_changed_since_keyed()
+    };
+
+    assert!(!checked(&[&kept, &rewritten], &|| {}));
+    assert!(checked(&[&kept, &rewritten], &|| {
+        std::fs::write(&rewritten, "#define H 22\n").unwrap();
+    }));
+    assert!(checked(&[&kept, &removed], &|| {
+        std::fs::remove_file(&removed).unwrap();
+    }));
+}
+
 #[test]
 fn too_new_guard_flags_inputs_modified_after_build_start() {
     // kunobi-ninja/kache#324: when armed, the guard flags any hashed input
@@ -11148,6 +12110,37 @@ fn too_new_guard_flags_inputs_modified_after_build_start() {
     );
 }
 
+/// A write after the start can carry a stamp below it, so the guard counts
+/// from one stamp window early, and the margin moves that start earlier
+/// still.
+#[test]
+fn the_too_new_guard_allows_for_coarse_file_clocks_and_keeps_its_margin() {
+    // Off any 10 ms boundary, so every stamp below gets the fine window.
+    let start = 1_700_000_000_250_000_007_i64;
+    let flagged = |margin_ns: i64, stamp_ns: i64| {
+        let mut hasher = FileHasher::new();
+        hasher.arm_too_new_guard(start, margin_ns);
+        hasher.note_too_new(&FileFingerprint {
+            path: "/src/lib.rs".to_string(),
+            size: 1,
+            mtime_ns: stamp_ns,
+            ctime_ns: stamp_ns,
+            inode: 1,
+        });
+        hasher.too_new()
+    };
+    let edge = start - FINE_STAMP_WINDOW_NS;
+    assert!(flagged(0, edge));
+    assert!(!flagged(0, edge - 1));
+    assert!(
+        flagged(0, 1_699_999_999_000_000_000),
+        "a whole-second stamp 1.25 s before the start"
+    );
+    let margin = 5_000_000_000;
+    assert!(flagged(margin, edge - margin));
+    assert!(!flagged(margin, edge - margin - 1));
+}
+
 #[test]
 fn guarded_inputs_record_only_while_armed() {
     let dir = tempfile::tempdir().unwrap();
@@ -11189,7 +12182,7 @@ fn guarded_inputs_reject_changed_or_missing_files() {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("input.rs");
     std::fs::write(&file, b"pub fn x() {}").unwrap();
-    let recorded = FileFingerprint::from_path(&file).unwrap();
+    let recorded = ObservedFingerprint::from_path(&file).unwrap();
 
     std::fs::write(&file, b"pub fn x() { 1 }").unwrap();
     assert!(
@@ -11209,12 +12202,178 @@ fn guarded_inputs_reject_weak_identity() {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("input.rs");
     std::fs::write(&file, b"pub fn x() {}").unwrap();
-    let mut recorded = FileFingerprint::from_path(&file).unwrap();
-    recorded.inode = 0;
+    let mut recorded = ObservedFingerprint::from_path(&file).unwrap();
+    recorded.fingerprint.inode = 0;
     assert!(
         !FileHasher::guarded_inputs_unchanged_since_hash(std::slice::from_ref(&recorded)),
         "without an inode a replace-by-rename is invisible, so verification must fail closed"
     );
+}
+
+/// A file rewritten after the hasher's stat and before its read may have
+/// been read as either version. With the guard armed, every read path stats
+/// the file again: the input counts as too new, the later fingerprint is the
+/// one reported, so a barrier sees the write, and the earlier one stays among
+/// the guarded inputs, so no excuse accepts the input. Nothing is memoised.
+#[test]
+fn a_file_rewritten_between_the_stat_and_the_read_counts_as_written() {
+    let small = 16;
+    let large = usize::try_from(MIN_PERSISTED_HASH_BYTES).unwrap() + 16;
+    // (store-backed, header capture, size)
+    for (store_backed, header, size) in [
+        (false, false, small),
+        (true, false, small),
+        (true, false, large),
+        (true, true, small),
+    ] {
+        let case = format!("store_backed={store_backed} header={header} size={size}");
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("input.h");
+        std::fs::write(&file, vec![b'a'; size]).unwrap();
+        let first = FileFingerprint::from_path(&file).unwrap();
+        // Past every window of the first write's stamps.
+        let start = [first.mtime_ns, first.ctime_ns]
+            .into_iter()
+            .map(|stamp| stamp + stamp_window_ns(stamp))
+            .max()
+            .unwrap()
+            + 1;
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        ensure_file_hash_cache_schema(&db).unwrap();
+        let mut hasher = if store_backed {
+            FileHasher::from_cache(FileHashCache::Borrowed(&db))
+        } else {
+            FileHasher::new()
+        };
+        hasher.arm_too_new_guard(start, 0);
+        set_before_read(Some(Box::new(move |path: &Path| {
+            while wall_clock_ns() <= start + 30_000_000 {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            std::fs::write(path, vec![b'b'; size + 1]).unwrap();
+        })));
+        let hash = if header {
+            let headers = vec![("input.h".to_string(), file.clone())];
+            hasher
+                .cc_preprocess_fingerprints(&headers, "maps", &no_mapping)
+                .map(|inputs| inputs[0].content.clone())
+        } else {
+            hasher.hash(&file).ok()
+        };
+        set_before_read(None);
+
+        let second = FileFingerprint::from_path(&file).unwrap();
+        assert_eq!(hash, Some(hash_file(&file).unwrap()), "{case}");
+        assert!(hasher.too_new(), "{case}");
+        assert!(!stamp_written_since(&first, start), "{case}");
+        assert!(stamp_written_since(&second, start), "{case}");
+        let guarded = hasher.take_guarded_inputs();
+        let kept: Vec<_> = guarded.iter().map(|input| &input.fingerprint).collect();
+        assert!(kept.contains(&&second), "{case}: {guarded:?}");
+        assert!(kept.contains(&&first), "{case}: {guarded:?}");
+        assert!(
+            !FileHasher::guarded_inputs_unchanged_since_hash(&guarded),
+            "{case}"
+        );
+        assert!(hasher.pending_memo.borrow().is_empty(), "{case}");
+        hasher.flush_memo_as_if_settled();
+        let memo = FileHashCache::Borrowed(&db);
+        assert_eq!(memo.get(&first).unwrap(), None, "{case}");
+        assert_eq!(memo.get(&second).unwrap(), None, "{case}");
+    }
+}
+
+/// A file gone by the second stat counts as too new; the stamp from before
+/// the read is reported and fails any later check.
+#[test]
+fn a_file_removed_after_its_read_counts_as_too_new() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("input.rs");
+    std::fs::write(&file, b"pub fn x() {}").unwrap();
+    let mut hasher = FileHasher::new();
+    hasher.arm_too_new_guard(1, 0);
+    let before = ObservedFingerprint::from_path(&file).unwrap();
+    assert!(!hasher.too_new());
+    std::fs::remove_file(&file).unwrap();
+    let (reported, unchanged) = hasher.restat_after_read(&file, before.clone(), true);
+    assert!(!unchanged);
+    assert!(hasher.too_new());
+    assert_eq!(reported, before);
+    assert!(!FileHasher::guarded_inputs_unchanged_since_hash(
+        std::slice::from_ref(&reported)
+    ));
+}
+
+/// A file that is no key input, such as one a tree guard reads, is stat'ed
+/// again after its read like a key input, but a write or removal between the
+/// two stats only costs its memo row: the too-new guard stays quiet and no
+/// guarded input is kept.
+#[test]
+fn an_unkeyed_file_moved_while_it_is_read_trips_nothing_and_leaves_no_row() {
+    let small = 16;
+    let large = usize::try_from(MIN_PERSISTED_HASH_BYTES).unwrap() + 16;
+    for size in [small, large] {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("asset.txt");
+        std::fs::write(&file, vec![b'a'; size]).unwrap();
+        let first = FileFingerprint::from_path(&file).unwrap();
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        ensure_file_hash_cache_schema(&db).unwrap();
+        let mut hasher = FileHasher::from_cache(FileHashCache::Borrowed(&db));
+        hasher.arm_too_new_guard(1, 0);
+        set_before_read(Some(Box::new(move |path: &Path| {
+            std::fs::write(path, vec![b'b'; size + 1]).unwrap();
+        })));
+        let hash = hasher.hash_unkeyed(&file).unwrap();
+        set_before_read(None);
+
+        assert_eq!(hash, hash_file(&file).unwrap(), "size={size}");
+        assert!(!hasher.too_new(), "size={size}");
+        assert!(hasher.take_guarded_inputs().is_empty(), "size={size}");
+        assert!(hasher.pending_memo.borrow().is_empty(), "size={size}");
+        hasher.flush_memo_as_if_settled();
+        let second = FileFingerprint::from_path(&file).unwrap();
+        let memo = FileHashCache::Borrowed(&db);
+        assert_eq!(memo.get(&first).unwrap(), None, "size={size}");
+        assert_eq!(memo.get(&second).unwrap(), None, "size={size}");
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("asset.txt");
+    std::fs::write(&file, b"a").unwrap();
+    let mut hasher = FileHasher::new();
+    hasher.arm_too_new_guard(1, 0);
+    let before = ObservedFingerprint::from_path(&file).unwrap();
+    std::fs::remove_file(&file).unwrap();
+    assert_eq!(
+        hasher.restat_after_read(&file, before.clone(), false),
+        (before, false)
+    );
+    assert!(!hasher.too_new());
+    assert!(hasher.take_guarded_inputs().is_empty());
+}
+
+/// Each guarded input keeps the wall clock read before its stat, so a later
+/// check can ask whether its stamp had settled by then.
+#[test]
+fn guarded_inputs_keep_when_they_were_observed() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("input.rs");
+    std::fs::write(&file, b"pub fn x() {}").unwrap();
+    let db = dir.path().join("index.db");
+    for mut hasher in [FileHasher::new(), FileHasher::persistent(&db)] {
+        hasher.arm_too_new_guard(1, 0);
+        let before = wall_clock_ns();
+        hasher.hash(&file).unwrap();
+        let after = wall_clock_ns();
+        let [input] = hasher.take_guarded_inputs().try_into().unwrap();
+        assert!((before..=after).contains(&input.observed_ns), "{input:?}");
+        assert_eq!(
+            input.fingerprint,
+            FileFingerprint::from_path(&file).unwrap()
+        );
+        assert!(!input.settled(), "written a moment ago");
+    }
 }
 
 #[cfg(unix)]
@@ -11259,7 +12418,7 @@ fn an_oversized_tree_is_counted_not_hashed_and_remembered() {
         std::fs::write(tree.join("sub").join(format!("f{i}")), b"x").unwrap();
     }
     // Five entries: `sub` and its four files.
-    let roots = || vec![(tree.clone(), &b"workspace"[..], &[][..])];
+    let roots = || vec![TreeRoot::new(tree.clone(), b"workspace", &[])];
     let now = std::time::SystemTime::now();
     let hasher = FileHasher::new();
 
@@ -11297,7 +12456,8 @@ fn an_oversized_tree_is_counted_not_hashed_and_remembered() {
 }
 
 /// Roots that each fit but together run past the budget withhold the digest
-/// without marking either, and an excluded directory does not count.
+/// without marking either, and are remembered together, so the next unit
+/// does not walk them again. An excluded directory does not count.
 #[test]
 fn tree_budgets_add_up_across_roots_and_skip_exclusions() {
     let dir = tempfile::tempdir().unwrap();
@@ -11318,14 +12478,334 @@ fn tree_budgets_add_up_across_roots_and_skip_exclusions() {
     let skipped: &[&str] = &["target"];
     let roots = || {
         vec![
-            (first.clone(), &b"workspace"[..], skipped),
-            (second.clone(), &b"out_dir"[..], &[][..]),
+            TreeRoot::new(first.clone(), b"workspace", skipped),
+            TreeRoot::new(second.clone(), b"out_dir", &[]),
         ]
     };
     assert!(tree_digest_memoised(roots(), &hasher, 5, &memo, now).is_none());
     assert!(!oversized_tree_marker(&memo, &first, 5).exists());
     assert!(!oversized_tree_marker(&memo, &second, 5).exists());
     assert!(tree_digest_memoised(roots(), &hasher, 6, &memo, now).is_some());
+
+    std::fs::remove_file(second.join("f2")).unwrap();
+    assert!(
+        tree_digest_memoised(roots(), &hasher, 5, &memo, now).is_none(),
+        "remembered together while fresh"
+    );
+    let first_alone = vec![TreeRoot::new(first.clone(), b"workspace", skipped)];
+    assert!(
+        tree_digest_memoised(first_alone, &hasher, 5, &memo, now).is_some(),
+        "the first root alone is not remembered"
+    );
+    let later = now + OVERSIZED_TREE_TTL + std::time::Duration::from_secs(1);
+    assert!(
+        tree_digest_memoised(roots(), &hasher, 5, &memo, later).is_some(),
+        "a stale marker counts the roots again"
+    );
+}
+
+/// Kache's cache and runtime directories inside a guarded tree, as GitLab CI
+/// requires of cached paths, are left out: the build writes to them while a
+/// unit compiles, and a large store would run the walk past its budget. A
+/// directory given through another spelling is found by its resolved path.
+#[test]
+fn kaches_own_directories_are_left_out_of_a_guarded_tree() {
+    let dir = tempfile::tempdir().unwrap();
+    let memo = dir.path().join("memo");
+    let root = dir.path().join("w");
+    let cache = root.join(".cache/kache");
+    let runtime = root.join("run");
+    write_file(&root.join("kt/src/lib.rs"), "");
+    write_file(&cache.join("index.db"), "a");
+    write_file(&runtime.join("events.jsonl"), "");
+    let roots = || vec![TreeRoot::new(root.clone(), b"workspace", &[])];
+    let now = std::time::SystemTime::now();
+    let guard_with = |hasher: &FileHasher<'_>| {
+        tree_guard_of(hasher, || {
+            // `kt`, `kt/src`, `kt/src/lib.rs` and `.cache`.
+            tree_digest_memoised(roots(), hasher, 4, &memo, now)
+        })
+    };
+    let hasher = FileHasher::new().with_own_dirs([cache.clone(), runtime.clone()]);
+    let taken = guard_with(&hasher).expect("the cache does not count toward the budget");
+    write_file(&cache.join("index.db"), "ab");
+    write_file(&cache.join("blobs/x"), "x");
+    write_file(&runtime.join("events.jsonl"), "{}\n");
+    assert!(taken.held(), "the store and the event log moved");
+    assert_eq!(
+        guard_with(&hasher).map(|guard| guard.digest),
+        Some(taken.digest.clone())
+    );
+    #[cfg(unix)]
+    {
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&root, &link).unwrap();
+        let linked = FileHasher::new().with_own_dirs(crate::build_script_inputs::excluded_roots(
+            None,
+            [
+                link.join(".cache/kache").as_path(),
+                link.join("run").as_path(),
+            ],
+        ));
+        assert_eq!(
+            guard_with(&linked).map(|guard| guard.digest),
+            Some(taken.digest.clone()),
+            "the directories given through a link"
+        );
+    }
+    write_file(&root.join("kt/src/lib.rs"), "pub fn a() {}\n");
+    assert!(!taken.held(), "the workspace itself still counts");
+    assert!(
+        guard_with(&FileHasher::new()).is_none(),
+        "counted, the cache runs the walk past its budget"
+    );
+}
+
+/// A settled tree's digest is memoised under its stamp, and the next unit
+/// reads no file. A tree written just now is not memoised, a changed tree is
+/// read again, and a memo that does not hold a digest is ignored.
+#[test]
+fn a_settled_tree_digest_is_memoised_under_its_stamp() {
+    let dir = tempfile::tempdir().unwrap();
+    let memo = dir.path().join("memo");
+    let tree = dir.path().join("tree");
+    write_file(&tree.join("src/lib.rs"), "pub fn a() {}\n");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("src/lib.rs", tree.join("lib.rs")).unwrap();
+    let roots = || vec![TreeRoot::new(tree.clone(), b"workspace", &[])];
+    let db = rusqlite::Connection::open_in_memory().unwrap();
+    ensure_file_hash_cache_schema(&db).unwrap();
+    // The digest, and how many files were read for it.
+    let digest_at = |now: std::time::SystemTime| {
+        let hasher = FileHasher::from_cache(FileHashCache::Borrowed(&db));
+        let digest = tree_digest_memoised(roots(), &hasher, 10, &memo, now);
+        (digest, hasher.stats().cache_misses)
+    };
+    let now = std::time::SystemTime::now();
+    let settled = now + crate::tree_stamp::TreeStamp::SETTLE;
+
+    let (fresh, read) = digest_at(now);
+    let fresh = fresh.expect("a symlink counts by its text");
+    assert_eq!(read, 1);
+    let file = tree_digest_memo(&memo, &roots());
+    assert!(!file.exists(), "a tree written just now is not memoised");
+    assert_eq!(digest_at(settled), (Some(fresh.clone()), 1));
+    assert_eq!(
+        digest_at(settled),
+        (Some(fresh.clone()), 0),
+        "the memo answers"
+    );
+
+    let recorded = std::fs::read_to_string(&file).unwrap();
+    let (stamp, _) = recorded.split_once('\n').unwrap();
+    for (digest, why) in [("g".repeat(64), "not hex"), ("a".repeat(63), "too short")] {
+        std::fs::write(&file, format!("{stamp}\n{digest}")).unwrap();
+        assert_eq!(digest_at(settled), (Some(fresh.clone()), 1), "{why}");
+    }
+    let trusted = "a".repeat(64);
+    std::fs::write(&file, format!("{stamp}\n{trusted}")).unwrap();
+    assert_eq!(
+        digest_at(settled),
+        (Some(trusted), 0),
+        "trusted under its stamp"
+    );
+
+    write_file(&tree.join("src/new.rs"), "");
+    let (changed, read) = digest_at(settled + crate::tree_stamp::TreeStamp::SETTLE);
+    assert!(changed.is_some_and(|changed| changed != fresh));
+    assert_eq!(read, 2);
+}
+
+/// What the tree guard cannot read counts as unreadable instead of
+/// withholding the digest: a proc macro the build starts cannot read it
+/// either. A file it cannot read keeps the digest out of the memo, since only
+/// a change time would show the file becoming readable.
+#[cfg(unix)]
+#[test]
+fn what_the_tree_guard_cannot_read_counts_as_unreadable() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let memo = dir.path().join("memo");
+    let tree = dir.path().join("tree");
+    write_file(&tree.join("src/lib.rs"), "");
+    write_file(&tree.join("pgdata/PG_VERSION"), "16");
+    write_file(&tree.join("secret.env"), "A=1");
+    struct Mode(PathBuf, u32);
+    impl Drop for Mode {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(self.1));
+        }
+    }
+    let _pgdata = Mode(tree.join("pgdata"), 0o755);
+    let _secret = Mode(tree.join("secret.env"), 0o644);
+    let mode = |path: &str, mode| {
+        std::fs::set_permissions(tree.join(path), std::fs::Permissions::from_mode(mode)).unwrap();
+    };
+    let roots = || vec![TreeRoot::new(tree.clone(), b"workspace", &[])];
+    let hasher = FileHasher::new();
+    let settled = || std::time::SystemTime::now() + crate::tree_stamp::TreeStamp::SETTLE * 2;
+    let digest = || tree_digest_memoised(roots(), &hasher, 10, &memo, settled());
+    let readable = digest().unwrap();
+
+    mode("pgdata", 0o000);
+    if std::fs::read_dir(tree.join("pgdata")).is_ok() {
+        eprintln!("skipped: this user reads past permissions");
+        return;
+    }
+    let unlisted = digest().expect("a directory it cannot list");
+    assert_ne!(unlisted, readable);
+    mode("pgdata", 0o755);
+    assert_eq!(digest().as_ref(), Some(&readable));
+
+    mode("secret.env", 0o000);
+    let file = tree_digest_memo(&memo, &roots());
+    let _ = std::fs::remove_file(&file);
+    let unread = digest().expect("a file it cannot read");
+    assert_ne!(unread, readable);
+    assert!(!file.exists(), "not memoised");
+    mode("secret.env", 0o644);
+    assert_eq!(digest(), Some(readable));
+}
+
+/// Below the root, a directory the fold cannot list counts as unreadable.
+/// A root it cannot list gives no digest: nothing of the tree was read. The
+/// stamp walk refuses such a root first, so the fold meets one only when
+/// the root goes away between the two.
+#[test]
+fn a_root_the_tree_fold_cannot_list_gives_no_digest() {
+    let dir = tempfile::tempdir().unwrap();
+    let gone = dir.path().join("gone");
+    let hasher = FileHasher::new();
+    let fold = |root: &Path| {
+        let mut budget = 10;
+        let mut digest = blake3::Hasher::new();
+        crate_tree_fold(root, &gone, &[], false, &hasher, &mut digest, &mut budget)
+    };
+    assert_eq!(fold(dir.path()), Some(true), "a directory below the root");
+    assert_eq!(fold(&gone), None, "the root");
+}
+
+/// A digest is memoised only while the tree still has the stamp it had
+/// before its files were read. A name that came and went directly under the
+/// root meanwhile leaves every entry as it was, and moves the root's times.
+#[test]
+fn a_tree_that_moved_while_it_was_read_is_not_memoised() {
+    let dir = tempfile::tempdir().unwrap();
+    let memo = dir.path().join("memo");
+    let tree = dir.path().join("tree");
+    write_file(&tree.join("a.txt"), "a");
+    let old = filetime::FileTime::from_unix_time(1_000_000_000, 0);
+    filetime::set_file_mtime(tree.join("a.txt"), old).unwrap();
+    filetime::set_file_mtime(&tree, old).unwrap();
+    let roots = vec![TreeRoot::new(tree.clone(), b"workspace", &[])];
+    let file = tree_digest_memo(&memo, &roots);
+    let walked = |roots: &[TreeRoot<'_>]| {
+        let walked: Vec<WalkedRoot> = roots.iter().map(TreeRoot::walked).collect();
+        let stamp = stamp_roots(&walked, 10).unwrap();
+        let walk = GuardWalk {
+            roots: walked,
+            max_entries: 10,
+            stamp: stamp.digest.clone(),
+        };
+        (walk, stamp)
+    };
+    let digest = "d".repeat(64);
+    let now = std::time::SystemTime::now();
+
+    let (walk, stamp) = walked(&roots);
+    write_file(&tree.join("transient.txt"), "t");
+    std::fs::remove_file(tree.join("transient.txt")).unwrap();
+    memoise_tree_digest(&file, &walk, &stamp, &digest, now);
+    assert!(
+        !file.exists(),
+        "a name came and went while the files were read"
+    );
+
+    let (walk, stamp) = walked(&roots);
+    let settled = std::time::SystemTime::now() + crate::tree_stamp::TreeStamp::SETTLE;
+    memoise_tree_digest(&file, &walk, &stamp, &digest, settled);
+    assert_eq!(
+        crate::tree_stamp::memoised_digest(&file, &stamp.digest),
+        Some(digest)
+    );
+}
+
+/// A guard holds while the trees it read keep their stamps. A file removed
+/// and put back with the same bytes and times leaves the digest as it was,
+/// not the stamp: the file has a new inode and change time.
+#[test]
+fn a_tree_guard_holds_until_its_tree_moves() {
+    let dir = tempfile::tempdir().unwrap();
+    let memo = dir.path().join("memo");
+    let tree = dir.path().join("tree");
+    let file = tree.join("a.txt");
+    write_file(&file, "a");
+    let old = filetime::FileTime::from_unix_time(1_000_000_000, 0);
+    filetime::set_file_mtime(&file, old).unwrap();
+    // Past any timestamp tick, so the file put back below gets a new one.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let hasher = FileHasher::new();
+    let guard = || {
+        tree_guard_of(&hasher, || {
+            let roots = vec![TreeRoot::new(tree.clone(), b"workspace", &[])];
+            tree_digest_memoised(roots, &hasher, 10, &memo, std::time::SystemTime::now())
+        })
+        .unwrap()
+    };
+    let taken = guard();
+    assert!(taken.held());
+    write_file(&dir.path().join("elsewhere.txt"), "");
+    assert!(taken.held(), "outside the tree");
+
+    std::fs::remove_file(&file).unwrap();
+    assert!(!taken.held(), "a file removed");
+    write_file(&file, "a");
+    filetime::set_file_mtime(&file, old).unwrap();
+    assert_eq!(guard().digest, taken.digest, "the same bytes");
+    #[cfg(unix)]
+    assert!(!taken.held(), "put back with the same bytes and times");
+    assert!(guard().held());
+    let unwalked = TreeGuard {
+        digest: taken.digest,
+        walks: Vec::new(),
+    };
+    assert!(!unwalked.held(), "nothing to walk again");
+}
+
+/// A file a tree guard reads is not a key input: a save anywhere in the
+/// workspace while a unit builds must not keep that unit out of the store.
+#[test]
+fn a_tree_file_never_trips_the_too_new_guard() {
+    let dir = tempfile::tempdir().unwrap();
+    let tree = dir.path().join("tree");
+    let file = tree.join("f");
+    write_file(&file, "x");
+    filetime::set_file_mtime(&file, filetime::FileTime::from_unix_time(2_000_000_000, 0)).unwrap();
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as i64;
+    let db = rusqlite::Connection::open_in_memory().unwrap();
+    ensure_file_hash_cache_schema(&db).unwrap();
+    for cached in [false, true] {
+        let mut hasher = if cached {
+            FileHasher::from_cache(FileHashCache::Borrowed(&db))
+        } else {
+            FileHasher::new()
+        };
+        hasher.arm_too_new_guard(now_ns, 0);
+        let roots = vec![TreeRoot::new(tree.clone(), b"workspace", &[])];
+        let memo = dir.path().join("memo");
+        let now = std::time::SystemTime::now();
+        assert!(tree_digest_memoised(roots, &hasher, 10, &memo, now).is_some());
+        assert!(!hasher.too_new(), "cached={cached}");
+        assert!(hasher.take_guarded_inputs().is_empty(), "cached={cached}");
+        hasher.hash(&file).unwrap();
+        assert!(
+            hasher.too_new(),
+            "a key input still trips it, cached={cached}"
+        );
+    }
 }
 
 #[test]
@@ -11341,7 +12821,7 @@ fn a_units_headers_come_from_one_memo_lookup_once_settled() {
         .collect();
     let db = rusqlite::Connection::open_in_memory().unwrap();
     ensure_file_hash_cache_schema(&db).unwrap();
-    let mapped = |path: &Path| std::fs::read_to_string(path).ok();
+    let mapped = no_mapping;
 
     let mut first = FileHasher::from_cache(FileHashCache::Borrowed(&db));
     first.arm_too_new_guard(1, 0);
@@ -11391,7 +12871,7 @@ fn an_unarmed_guard_keeps_no_headers_for_revalidation() {
     let path = dir.path().join("h.h");
     std::fs::write(&path, "#define H 1\n").unwrap();
     let headers = vec![("h.h".to_string(), path)];
-    let mapped = |path: &Path| std::fs::read_to_string(path).ok();
+    let mapped = no_mapping;
 
     let hasher = FileHasher::new();
     hasher
@@ -11400,28 +12880,46 @@ fn an_unarmed_guard_keeps_no_headers_for_revalidation() {
     assert!(hasher.take_guarded_inputs().is_empty());
 }
 
+/// A row's fate is fixed when its file is observed. Both rows here are
+/// flushed decades after their stamp from the epoch; only the one observed
+/// a full settle window after it is written.
 #[test]
-fn flushing_on_the_real_clock_keeps_a_long_settled_stamp() {
+fn a_row_observed_inside_the_settle_window_is_never_memoised_however_late_the_flush() {
     let db = rusqlite::Connection::open_in_memory().unwrap();
     ensure_file_hash_cache_schema(&db).unwrap();
-    // Last changed at the epoch: settled by any clock this runs under.
-    let stamp = FileFingerprint {
-        path: "/old/header.h".to_string(),
+    let stamp = |path: &str| FileFingerprint {
+        path: path.to_string(),
         size: 12,
         mtime_ns: 1,
         ctime_ns: 1,
         inode: 7,
     };
     let hasher = FileHasher::from_cache(FileHashCache::Borrowed(&db));
-    hasher
-        .pending_memo
-        .borrow_mut()
-        .push((stamp.clone(), "hash".to_string()));
+    for (path, observed_ns) in [
+        ("/early.h", HASH_SETTLE_NS),
+        ("/settled.h", 1 + HASH_SETTLE_NS),
+    ] {
+        hasher.pending_memo.borrow_mut().push((
+            ObservedFingerprint {
+                fingerprint: stamp(path),
+                observed_ns,
+            },
+            format!("hash of {path}"),
+        ));
+    }
     hasher.flush_memo();
 
     let reader = FileHasher::from_cache(FileHashCache::Borrowed(&db));
-    let memo = reader.memoised_hashes(std::iter::once(&stamp));
-    assert_eq!(memo.get("/old/header.h").map(String::as_str), Some("hash"));
+    let memo = reader.memoised_hashes([stamp("/early.h"), stamp("/settled.h")].iter());
+    assert_eq!(
+        memo.get("/early.h"),
+        None,
+        "observed one nanosecond inside the window"
+    );
+    assert_eq!(
+        memo.get("/settled.h").map(String::as_str),
+        Some("hash of /settled.h")
+    );
 }
 
 #[test]
@@ -11432,22 +12930,14 @@ fn a_file_changed_within_the_settle_window_is_hashed_but_not_memoised() {
     let db = rusqlite::Connection::open_in_memory().unwrap();
     ensure_file_hash_cache_schema(&db).unwrap();
     let hasher = FileHasher::from_cache(FileHashCache::Borrowed(&db));
-    let hash = hasher.hash(&file).unwrap();
+    assert_eq!(hasher.hash(&file).unwrap(), hash_file(&file).unwrap());
     hasher.flush_memo();
     let stamp = FileFingerprint::from_path(&file).unwrap();
-    let cache = FileHashCache::Borrowed(&db);
     assert_eq!(
-        cache.get(&stamp).unwrap(),
+        FileHashCache::Borrowed(&db).get(&stamp).unwrap(),
         None,
         "a second write in this timestamp tick could reuse this stamp"
     );
-    // Once settled, the same flush records it.
-    hasher
-        .pending_memo
-        .borrow_mut()
-        .push((stamp.clone(), hash.clone()));
-    hasher.flush_memo_as_if_settled();
-    assert_eq!(cache.get(&stamp).unwrap(), Some(hash));
 }
 
 #[test]
@@ -13641,7 +15131,7 @@ fn a_guarded_record_is_refused_when_the_tree_changed() {
     let current = predicted_key_inputs(&with_macro, &on, &mut current_tree);
     assert_ne!(current, Err(Rejection::TreeChanged), "{current:?}");
     assert_ne!(current, Err(Rejection::NoRecord), "{current:?}");
-    assert_eq!(current_tree, Some(tree));
+    assert_eq!(current_tree.map(|guard| guard.digest), Some(tree));
 
     std::fs::write(package.join("extra.txt"), "read by the macro").unwrap();
     assert_eq!(

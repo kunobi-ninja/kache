@@ -259,8 +259,10 @@ fn walked_state(
         // costs a database read per file. One stat walk yields a stamp of
         // every entry's identity, size and times, and the digest of a tree
         // whose stamp is unchanged is the memoised one.
+        let started = std::time::SystemTime::now();
+        let stamp_budget = *budget;
         let stamp = if symlink_depth == 0 {
-            match tree_stamp_in(path, walk, *budget) {
+            match tree_stamp_in(path, walk, stamp_budget) {
                 Err(Unstamped::TooLarge) if walk.stop_when_too_large => {
                     return Err(TooManyInputs.into());
                 }
@@ -298,7 +300,7 @@ fn walked_state(
         // stamp. A tree touched in the last seconds is hashed again next time
         // rather than memoised; the following run finds it settled.
         if let Some(stamp) = &stamp
-            && stamp.settled_at(std::time::SystemTime::now())
+            && memoisable(path, walk, stamp, stamp_budget, started)
         {
             record_tree_digest_memo(path, walk.memo, text, &stamp.digest, &digest);
         }
@@ -311,6 +313,30 @@ fn walked_state(
         "declared build-script input is neither a file nor a directory: {}",
         path.display()
     )
+}
+
+/// Whether the digest of the tree at `path`, read after `stamp` was taken
+/// with `budget` to spend, may be memoised under that stamp.
+///
+/// A walk with its own memo needs the tree to have settled before the walk
+/// began (`started`) and to give the same stamp once read, as the tree
+/// guard's memo does. A tree that settled only while a long read ran could
+/// have been rewritten after the read within the tick of its newest write,
+/// keeping its stamp. The run cache keeps its 1.0 rule, settled once read:
+/// a 1.0 binary sharing the cache directory writes the same memo files by
+/// it.
+fn memoisable(
+    path: &Path,
+    walk: &Walk<'_>,
+    stamp: &TreeStamp,
+    budget: usize,
+    started: std::time::SystemTime,
+) -> bool {
+    if walk.memo.is_none() {
+        return stamp.settled_at(std::time::SystemTime::now());
+    }
+    stamp.settled_at(started)
+        && tree_stamp_in(path, walk, budget).is_ok_and(|again| again.digest == stamp.digest)
 }
 
 fn hash_directory(
@@ -677,6 +703,73 @@ mod tests {
             Some(digest),
             "a settled tree is memoised in its namespace"
         );
+    }
+
+    /// A walk with its own memo records a digest only for a tree that had
+    /// settled before the walk began and still has its stamp once read. A
+    /// read that ends past the settle window cannot vouch for a same-size
+    /// rewrite within the tick of the newest write, which keeps the stamp.
+    #[test]
+    fn a_walk_with_its_own_memo_records_only_a_tree_that_held_still() {
+        use std::time::{Duration, SystemTime};
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        let root = dir.path().join("tree");
+        let file = root.join("a.txt");
+        write(&file, "a");
+        let walk = Walk {
+            memo: Some((&cache, "a")),
+            ..Walk::default()
+        };
+        let mut hasher = crate::cache_key::FileHasher::new();
+        // Armed, the hasher reads each file through the hook.
+        hasher.arm_too_new_guard(1, 0);
+        let memoised =
+            |stamp: &TreeStamp| tree_digest_memo_in(&root, walk.memo, None, &stamp.digest);
+        let read = |hook: crate::cache_key::BeforeRead| {
+            crate::cache_key::set_before_read(Some(hook));
+            let digest = state_in(&root, &walk, &hasher, &mut 10);
+            crate::cache_key::set_before_read(None);
+            digest.unwrap()
+        };
+
+        // Written a little inside the settle window, and held up in the read
+        // until the window has passed.
+        let written = SystemTime::now() - TreeStamp::SETTLE + Duration::from_millis(400);
+        filetime::set_file_mtime(&file, filetime::FileTime::from_system_time(written)).unwrap();
+        let newest = std::fs::metadata(&file).unwrap().modified().unwrap();
+        let began_inside = std::rc::Rc::new(std::cell::Cell::new(false));
+        let seen = began_inside.clone();
+        read(Box::new(move |_| {
+            let age = SystemTime::now().duration_since(newest).unwrap_or_default();
+            seen.set(age < TreeStamp::SETTLE);
+            std::thread::sleep(
+                (TreeStamp::SETTLE + Duration::from_millis(100)).saturating_sub(age),
+            );
+        }));
+        let stamp = tree_stamp_in(&root, &walk, 10).unwrap();
+        if began_inside.get() {
+            assert_eq!(memoised(&stamp), None, "it settled only while it was read");
+        } else {
+            eprintln!("skipped a check: the read began past the settle window");
+        }
+
+        // Settled long before, and rewritten while it was read.
+        let old = filetime::FileTime::from_unix_time(1_000_000_000, 0);
+        filetime::set_file_mtime(&file, old).unwrap();
+        let stamp = tree_stamp_in(&root, &walk, 10).unwrap();
+        let mut rewrite = true;
+        read(Box::new(move |path| {
+            if std::mem::take(&mut rewrite) {
+                std::fs::write(path, "bb").unwrap();
+            }
+        }));
+        assert_eq!(memoised(&stamp), None, "it moved while it was read");
+
+        filetime::set_file_mtime(&file, old).unwrap();
+        let digest = read(Box::new(|_| {}));
+        let stamp = tree_stamp_in(&root, &walk, 10).unwrap();
+        assert_eq!(memoised(&stamp), Some(digest), "a tree that held still");
     }
 
     /// Sets the mode of `path` and restores it when dropped, so the scratch

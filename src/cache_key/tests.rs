@@ -3698,6 +3698,33 @@ fn only_a_package_inside_the_workspace_is_a_workspace_unit() {
     );
 }
 
+/// Cargo's legacy layout compiles a build script one level below where a
+/// library goes. Its guard leaves out the same target directory as every
+/// other unit's, and so shares their memo.
+#[test]
+fn a_build_script_compile_leaves_out_the_whole_target_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let (root, mut args) = workspace_invocation(dir.path(), "a", "build_script_build");
+    let vars = manifest_vars(&root.join("kt"));
+    let target_of =
+        |args: &RustcArgs| workspace_roots_in(args, &vars, &root).map(|roots| roots.target);
+    for out_dir in [
+        "target/debug/build/kt-0123456789abcdef",
+        "target/debug/build/kt/0123456789abcdef/out",
+    ] {
+        args.out_dir = Some(root.join(out_dir));
+        assert_eq!(target_of(&args), Some(root.join("target")), "{out_dir}");
+    }
+    args.target = Some("x86_64-unknown-linux-gnu".to_string());
+    args.out_dir =
+        Some(root.join("target/x86_64-unknown-linux-gnu/debug/build/kt/0123456789abcdef/out"));
+    assert_eq!(
+        target_of(&args),
+        Some(root.join("target")),
+        "a cross-compiled library in the per-unit layout"
+    );
+}
+
 #[test]
 fn a_linker_or_search_path_in_the_checkout_does_not_split_the_identity() {
     let dir = tempfile::tempdir().unwrap();
@@ -12587,7 +12614,7 @@ fn a_settled_tree_digest_is_memoised_under_its_stamp() {
     let (fresh, read) = digest_at(now);
     let fresh = fresh.expect("a symlink counts by its text");
     assert_eq!(read, 1);
-    let file = tree_digest_memo(&memo, &roots());
+    let file = tree_digest_memo(&memo, &roots()[0]);
     assert!(!file.exists(), "a tree written just now is not memoised");
     assert_eq!(digest_at(settled), (Some(fresh.clone()), 1));
     assert_eq!(
@@ -12614,6 +12641,166 @@ fn a_settled_tree_digest_is_memoised_under_its_stamp() {
     let (changed, read) = digest_at(settled + crate::tree_stamp::TreeStamp::SETTLE);
     assert!(changed.is_some_and(|changed| changed != fresh));
     assert_eq!(read, 2);
+}
+
+/// Each root is memoised alone. Once the workspace is, a unit with an
+/// `OUT_DIR` reads only that `OUT_DIR`, and an `OUT_DIR` written again in a new
+/// target directory is read again alone. The guard walks both roots.
+#[test]
+fn each_root_of_a_tree_digest_is_memoised_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let memo = dir.path().join("memo");
+    let (workspace, out) = (dir.path().join("w"), dir.path().join("out"));
+    write_file(&workspace.join("Cargo.toml"), "[workspace]\n");
+    write_file(&workspace.join("kt/src/lib.rs"), "pub fn a() {}\n");
+    write_file(&out.join("gen.rs"), "// gen\n");
+    let roots = |with_out: bool| {
+        let mut roots = vec![TreeRoot::new(workspace.clone(), b"workspace", &[])];
+        if with_out {
+            roots.push(TreeRoot::new(out.clone(), b"out_dir", &[]));
+        }
+        roots
+    };
+    let db = rusqlite::Connection::open_in_memory().unwrap();
+    ensure_file_hash_cache_schema(&db).unwrap();
+    // The guard, and how many files were read for it.
+    let guard = |with_out| {
+        let hasher = FileHasher::from_cache(FileHashCache::Borrowed(&db));
+        let settled = std::time::SystemTime::now() + crate::tree_stamp::TreeStamp::SETTLE;
+        let guard = tree_guard_of(&hasher, || {
+            tree_digest_memoised(roots(with_out), &hasher, 10, &memo, settled)
+        })
+        .unwrap();
+        (guard, hasher.stats().cache_misses)
+    };
+    let (alone, read) = guard(false);
+    assert_eq!(read, 2);
+    let (taken, read) = guard(true);
+    assert_eq!(read, 1, "the OUT_DIR alone");
+    assert_ne!(taken.digest, alone.digest);
+
+    std::fs::remove_dir_all(&out).unwrap();
+    write_file(&out.join("gen.rs"), "// gen\n");
+    let (again, read) = guard(true);
+    assert_eq!((again.digest.as_str(), read), (taken.digest.as_str(), 1));
+    assert_eq!(guard(true).1, 0);
+    assert!(!taken.held(), "the OUT_DIR moved");
+    assert!(again.held());
+    write_file(&workspace.join("kt/src/lib.rs"), "pub fn b() {}\n");
+    assert!(!again.held(), "the workspace moved");
+}
+
+/// A memo answers while every entry has the stamp it was recorded under. A
+/// new target directory moves only the root's own times, and changes nothing
+/// the digest reads; a guard taken before still sees it.
+#[test]
+fn a_tree_memo_outlives_a_new_target_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let memo = dir.path().join("memo");
+    let root = dir.path().join("w");
+    write_file(&root.join("kt/src/lib.rs"), "");
+    write_file(&root.join("target/debug/a"), "");
+    filetime::set_file_mtime(&root, filetime::FileTime::from_unix_time(1_000_000_000, 0)).unwrap();
+    let skipped: &[&str] = &["target"];
+    let db = rusqlite::Connection::open_in_memory().unwrap();
+    ensure_file_hash_cache_schema(&db).unwrap();
+    // The guard, and how many files were read for it.
+    let guard = || {
+        let hasher = FileHasher::from_cache(FileHashCache::Borrowed(&db));
+        let settled = std::time::SystemTime::now() + crate::tree_stamp::TreeStamp::SETTLE;
+        let roots = vec![TreeRoot::new(root.clone(), b"workspace", skipped)];
+        let guard = tree_guard_of(&hasher, || {
+            tree_digest_memoised(roots, &hasher, 10, &memo, settled)
+        })
+        .unwrap();
+        (guard, hasher.stats().cache_misses)
+    };
+    let (taken, read) = guard();
+    assert_eq!(read, 1);
+    std::fs::remove_dir_all(root.join("target")).unwrap();
+    write_file(&root.join("target/debug/b"), "");
+    let (again, read) = guard();
+    assert_eq!((again.digest.as_str(), read), (taken.digest.as_str(), 0));
+    assert!(!taken.held(), "the root's own times moved");
+    assert!(again.held());
+}
+
+/// One root's digest is the one 1.0 records, so 1.0 records of such units
+/// still match. The digest of several roots folds the digest of each, so that
+/// each root can be memoised alone.
+#[test]
+fn a_tree_digest_of_several_roots_folds_the_digest_of_each() {
+    let dir = tempfile::tempdir().unwrap();
+    let memo = dir.path().join("memo");
+    let (package, out) = (dir.path().join("p"), dir.path().join("out"));
+    write_file(&package.join("lib.rs"), "pub fn a() {}\n");
+    write_file(&out.join("gen.rs"), "");
+    let hasher = FileHasher::new();
+    let now = std::time::SystemTime::now();
+    let digest = |roots| tree_digest_memoised(roots, &hasher, 10, &memo, now).unwrap();
+    let fold = |version: &[u8], fields: &[(&[u8], &[u8])]| {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(version);
+        for (label, value) in fields {
+            fold_field(&mut hasher, label, value);
+        }
+        hasher.finalize().to_hex().to_string()
+    };
+    let package_root = || TreeRoot::new(package.clone(), b"manifest_dir", &[]);
+    let out_root = || TreeRoot::new(out.clone(), b"out_dir", &[]);
+
+    let package_digest = digest(vec![package_root()]);
+    let content = blake3::hash(b"pub fn a() {}\n").to_hex();
+    let fields: [(&[u8], &[u8]); 3] = [
+        (b"root:", b"manifest_dir"),
+        (b"path:", b"lib.rs"),
+        (b"file:", content.as_bytes()),
+    ];
+    assert_eq!(package_digest, fold(b"kache-crate-tree-v1\n", &fields));
+    let out_digest = digest(vec![out_root()]);
+    let fields: [(&[u8], &[u8]); 2] = [
+        (b"digest:", package_digest.as_bytes()),
+        (b"digest:", out_digest.as_bytes()),
+    ];
+    assert_eq!(
+        digest(vec![package_root(), out_root()]),
+        fold(b"kache-crate-tree-roots-v1\n", &fields)
+    );
+}
+
+/// A root read after the stamps may spend only what the other roots leave of
+/// the budget, so one that grew in the meantime gives no digest.
+#[test]
+fn a_root_read_after_the_stamps_spends_what_the_others_leave() {
+    let dir = tempfile::tempdir().unwrap();
+    let memo = dir.path().join("memo");
+    let (first, second) = (dir.path().join("a"), dir.path().join("b"));
+    write_file(&first.join("f"), "");
+    write_file(&second.join("g"), "");
+    let roots = || {
+        vec![
+            TreeRoot::new(first.clone(), b"workspace", &[]),
+            TreeRoot::new(second.clone(), b"out_dir", &[]),
+        ]
+    };
+    let hasher = FileHasher::new();
+    let settled = std::time::SystemTime::now() + crate::tree_stamp::TreeStamp::SETTLE;
+    // `first` is walked again before its digest is memoised, after both
+    // stamps and before `second` is read: `second` grows then.
+    let (watched, grown) = (first.clone(), second.join("h"));
+    let mut walks = 0;
+    set_before_stamp(Some(Box::new(move |path: &Path| {
+        if path == watched {
+            walks += 1;
+            if walks == 2 {
+                std::fs::write(&grown, "").unwrap();
+            }
+        }
+    })));
+    let digest = tree_digest_memoised(roots(), &hasher, 2, &memo, settled);
+    set_before_stamp(None);
+    assert_eq!(digest, None);
+    assert!(tree_digest_memoised(roots(), &hasher, 3, &memo, settled).is_some());
 }
 
 /// What the tree guard cannot read counts as unreadable instead of
@@ -12658,7 +12845,7 @@ fn what_the_tree_guard_cannot_read_counts_as_unreadable() {
     assert_eq!(digest().as_ref(), Some(&readable));
 
     mode("secret.env", 0o000);
-    let file = tree_digest_memo(&memo, &roots());
+    let file = tree_digest_memo(&memo, &roots()[0]);
     let _ = std::fs::remove_file(&file);
     let unread = digest().expect("a file it cannot read");
     assert_ne!(unread, readable);
@@ -12697,13 +12884,13 @@ fn a_tree_that_moved_while_it_was_read_is_not_memoised() {
     let old = filetime::FileTime::from_unix_time(1_000_000_000, 0);
     filetime::set_file_mtime(tree.join("a.txt"), old).unwrap();
     filetime::set_file_mtime(&tree, old).unwrap();
-    let roots = vec![TreeRoot::new(tree.clone(), b"workspace", &[])];
-    let file = tree_digest_memo(&memo, &roots);
-    let walked = |roots: &[TreeRoot<'_>]| {
-        let walked: Vec<WalkedRoot> = roots.iter().map(TreeRoot::walked).collect();
-        let stamp = stamp_roots(&walked, 10).unwrap();
+    let root = TreeRoot::new(tree.clone(), b"workspace", &[]);
+    let file = tree_digest_memo(&memo, &root);
+    let walked = |root: &TreeRoot<'_>| {
+        let walked = root.walked();
+        let stamp = stamp_root(&walked, 10).unwrap();
         let walk = GuardWalk {
-            roots: walked,
+            root: walked,
             max_entries: 10,
             stamp: stamp.digest.clone(),
         };
@@ -12712,7 +12899,7 @@ fn a_tree_that_moved_while_it_was_read_is_not_memoised() {
     let digest = "d".repeat(64);
     let now = std::time::SystemTime::now();
 
-    let (walk, stamp) = walked(&roots);
+    let (walk, stamp) = walked(&root);
     write_file(&tree.join("transient.txt"), "t");
     std::fs::remove_file(tree.join("transient.txt")).unwrap();
     memoise_tree_digest(&file, &walk, &stamp, &digest, now);
@@ -12721,11 +12908,11 @@ fn a_tree_that_moved_while_it_was_read_is_not_memoised() {
         "a name came and went while the files were read"
     );
 
-    let (walk, stamp) = walked(&roots);
+    let (walk, stamp) = walked(&root);
     let settled = std::time::SystemTime::now() + crate::tree_stamp::TreeStamp::SETTLE;
     memoise_tree_digest(&file, &walk, &stamp, &digest, settled);
     assert_eq!(
-        crate::tree_stamp::memoised_digest(&file, &stamp.digest),
+        crate::tree_stamp::memoised_digest(&file, &stamp.entries),
         Some(digest)
     );
 }

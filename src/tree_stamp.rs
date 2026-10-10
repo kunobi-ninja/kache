@@ -11,6 +11,9 @@ use std::path::{Path, PathBuf};
 /// modification and change time, and the link text of a symlink.
 pub(crate) struct TreeStamp {
     pub(crate) digest: String,
+    /// [`Self::digest`] without the roots' own metadata
+    /// ([`StampRules::root_metadata`]): the same where none was stamped.
+    pub(crate) entries: String,
     /// The newest modification time seen in the walk.
     newest: std::time::SystemTime,
 }
@@ -69,6 +72,8 @@ pub(crate) enum WalkOutcome {
 /// One stat walk over one or more roots, folded into one [`TreeStamp`].
 pub(crate) struct Stamper {
     hasher: blake3::Hasher,
+    /// The roots' own metadata, kept apart from the entries.
+    roots: Option<blake3::Hasher>,
     newest: std::time::SystemTime,
 }
 
@@ -76,6 +81,7 @@ impl Stamper {
     pub(crate) fn new() -> Self {
         Self {
             hasher: blake3::Hasher::new(),
+            roots: None,
             newest: std::time::SystemTime::UNIX_EPOCH,
         }
     }
@@ -97,7 +103,11 @@ impl Stamper {
     ) -> WalkOutcome {
         self.walk_skipping(
             root,
-            &|child, _| excluded.iter().any(|path| path == child),
+            &|child, _| {
+                excluded
+                    .iter()
+                    .any(|path| path.file_name() == child.file_name() && path == child)
+            },
             rules,
             budget,
         )
@@ -116,8 +126,9 @@ impl Stamper {
             let Ok(metadata) = std::fs::metadata(root) else {
                 return WalkOutcome::Unreadable;
             };
-            self.hasher.update(b"top");
-            fold_metadata_stamp(&mut self.hasher, &metadata);
+            let roots = self.roots.get_or_insert_with(blake3::Hasher::new);
+            roots.update(b"top");
+            fold_metadata_stamp(roots, &metadata);
             self.saw(&metadata);
         }
         let mut pending = vec![root.to_path_buf()];
@@ -147,7 +158,7 @@ impl Stamper {
                 }
                 Err(_) => return WalkOutcome::Unreadable,
             };
-            entries.sort_by_key(std::fs::DirEntry::file_name);
+            entries.sort_by_cached_key(std::fs::DirEntry::file_name);
             if rules.skip_build_dirs && directory != root {
                 keep_only_build_tag(&mut entries);
             }
@@ -165,7 +176,7 @@ impl Stamper {
                 let Ok(relative) = child.strip_prefix(root) else {
                     return WalkOutcome::Unreadable;
                 };
-                let read = std::fs::symlink_metadata(&child).and_then(|metadata| {
+                let read = entry_metadata(&entry, &child).and_then(|metadata| {
                     let link = metadata
                         .file_type()
                         .is_symlink()
@@ -225,10 +236,34 @@ impl Stamper {
     }
 
     pub(crate) fn finish(self) -> TreeStamp {
+        let entries = self.hasher.finalize();
+        let digest = match self.roots {
+            Some(roots) => {
+                let mut hasher = blake3::Hasher::new();
+                hasher.update(entries.as_bytes());
+                hasher.update(roots.finalize().as_bytes());
+                hasher.finalize()
+            }
+            None => entries,
+        };
         TreeStamp {
-            digest: self.hasher.finalize().to_hex().to_string(),
+            digest: digest.to_hex().to_string(),
+            entries: entries.to_hex().to_string(),
             newest: self.newest,
         }
+    }
+}
+
+/// What [`std::fs::symlink_metadata`] gives for `child`, the path of
+/// `entry`. On Unix the name is stat'ed in the directory that listed it
+/// (`fstatat`), without resolving the whole path again: walks of one tree
+/// in parallel builds otherwise queue on those lookups. Windows answers it
+/// from the listing, which can lag behind a file being written.
+fn entry_metadata(entry: &std::fs::DirEntry, child: &Path) -> std::io::Result<std::fs::Metadata> {
+    if cfg!(unix) {
+        entry.metadata()
+    } else {
+        std::fs::symlink_metadata(child)
     }
 }
 
@@ -346,6 +381,7 @@ mod tests {
         let newest = UNIX_EPOCH + Duration::from_secs(1_000);
         let stamp = TreeStamp {
             digest: String::new(),
+            entries: String::new(),
             newest,
         };
         assert!(stamp.settled_at(newest + TreeStamp::SETTLE));
@@ -446,7 +482,8 @@ mod tests {
     }
 
     /// A name created and removed again directly under the root leaves every
-    /// entry as it was, and only the root's own times show it.
+    /// entry as it was, and only the root's own times show it. The entries'
+    /// stamp leaves them out: it is the stamp of a walk without them.
     #[test]
     fn a_name_that_came_and_went_under_the_root_moves_its_metadata() {
         let dir = tempfile::tempdir().unwrap();
@@ -470,7 +507,10 @@ mod tests {
             stamper.finish()
         };
         let entries = stamp(StampRules::default()).digest;
-        let with_root = stamp(root_too).digest;
+        let with_root = stamp(root_too);
+        assert_eq!(with_root.entries, entries);
+        assert_ne!(with_root.digest, entries);
+        let with_root = with_root.digest;
 
         write(&dir.path().join("transient"), "");
         std::fs::remove_file(dir.path().join("transient")).unwrap();
@@ -480,6 +520,7 @@ mod tests {
         assert!(after.settled_at(now));
         let after = stamp(root_too);
         assert_ne!(after.digest, with_root);
+        assert_eq!(after.entries, entries);
         assert!(!after.settled_at(now), "the root's write is the newest");
     }
 
@@ -539,6 +580,24 @@ mod tests {
             walk(dir.path(), StampRules::default(), 10).0,
             WalkOutcome::Fits
         );
+    }
+
+    /// An excluded path leaves out that entry alone: an entry of the same
+    /// name elsewhere in the tree still counts.
+    #[test]
+    fn an_excluded_path_leaves_out_only_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir.path().join("target/a"), "");
+        write(&dir.path().join("target/b"), "");
+        write(&dir.path().join("kt/target/c"), "");
+        let mut stamper = Stamper::new();
+        let mut left = 10;
+        let excluded = [dir.path().join("target")];
+        assert_eq!(
+            stamper.walk(dir.path(), &excluded, StampRules::default(), &mut left),
+            WalkOutcome::Fits
+        );
+        assert_eq!(10 - left, 3, "`kt`, `kt/target` and `kt/target/c`");
     }
 
     /// Only the files and links directly under the root count, and a

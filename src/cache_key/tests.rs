@@ -4349,7 +4349,8 @@ fn a_vendored_package_is_guarded_by_itself_not_the_workspace() {
 
 /// A vendored unit's guard walks the files at the top of each directory
 /// between the package and the workspace root, which its digest reads, and
-/// not the directories beside the package.
+/// each such directory's own times, but not what the directories beside the
+/// package hold.
 #[test]
 fn a_vendored_guard_moves_with_a_file_at_the_top_of_an_ancestor() {
     let dir = tempfile::tempdir().unwrap();
@@ -4372,15 +4373,109 @@ fn a_vendored_guard_moves_with_a_file_at_the_top_of_an_ancestor() {
         out_dir: None,
         vendored_package: Some(root.join("third_party/rust/foo")),
     };
+    // Old times, so a name added beside the package moves them on any clock.
+    let old = filetime::FileTime::from_unix_time(1_000_000_000, 0);
+    for directory in [
+        root.clone(),
+        root.join("third_party"),
+        root.join("third_party/rust"),
+    ] {
+        filetime::set_file_mtime(directory, old).unwrap();
+    }
     let hasher = FileHasher::new();
     let taken = tree_guard_of(&hasher, || workspace_tree_digest(&roots, &hasher)).unwrap();
     assert!(taken.held());
     write_file(&root.join("docs/b.md"), "");
     write_file(&root.join("third_party/rust/bar/src/more.rs"), "");
-    write_file(&root.join("third_party/rust/baz/src/lib.rs"), "");
     assert!(taken.held(), "the rest of the tree");
-    std::fs::remove_file(root.join(".env")).unwrap();
+    write_file(&root.join(".env"), "A=12");
     assert!(!taken.held(), "a file at the top of the workspace");
+    let taken = tree_guard_of(&hasher, || workspace_tree_digest(&roots, &hasher)).unwrap();
+    write_file(&root.join("third_party/rust/baz/src/lib.rs"), "");
+    assert!(
+        !taken.held(),
+        "a directory added beside the package while the unit compiles"
+    );
+}
+
+/// A workspace at `root` with `third_party/rust/foo` vendored into it, and
+/// the roots of a unit of that package.
+fn vendored_workspace(root: &Path) -> WorkspaceRoots {
+    write_file(&root.join("Cargo.toml"), "[workspace]\n");
+    write_file(
+        &root.join("third_party/rust/foo/.cargo-checksum.json"),
+        "{}",
+    );
+    write_file(&root.join("third_party/rust/foo/src/lib.rs"), "");
+    WorkspaceRoots {
+        root: root.to_path_buf(),
+        cwd: String::new(),
+        canonical_root: root.canonicalize().unwrap(),
+        target: root.join("target"),
+        canonical_target: root.join("target"),
+        out_dir: None,
+        vendored_package: Some(root.join("third_party/rust/foo")),
+    }
+}
+
+/// A file or dot-directory that came and went at the top of an ancestor
+/// while the unit compiled leaves the digest as it was, so a record could
+/// pair that digest with output a macro made from it. The ancestor's own
+/// times show it.
+#[test]
+fn a_vendored_guard_moves_with_a_name_that_came_and_went_at_an_ancestor() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("w");
+    let roots = vendored_workspace(&root);
+    let hasher = FileHasher::new();
+    let old = filetime::FileTime::from_unix_time(1_000_000_000, 0);
+    for (name, directory) in [(".env", None), (".sqlx/query.json", Some(".sqlx"))] {
+        filetime::set_file_mtime(&root, old).unwrap();
+        let taken = tree_guard_of(&hasher, || workspace_tree_digest(&roots, &hasher)).unwrap();
+        write_file(&root.join(name), "x");
+        std::fs::remove_file(root.join(name)).unwrap();
+        if let Some(directory) = directory {
+            std::fs::remove_dir(root.join(directory)).unwrap();
+        }
+        assert_eq!(
+            workspace_tree_digest(&roots, &hasher).as_deref(),
+            Some(taken.digest.as_str()),
+            "{name} left nothing to digest"
+        );
+        assert!(!taken.held(), "{name} came and went");
+    }
+}
+
+/// A vendored guard lists the top of an ancestor after stamping it. Listed
+/// before, a name that appeared between the two would be in the stamp and
+/// not in the digest, and once it was gone the digest would match again.
+#[test]
+fn a_vendored_guard_digests_what_its_ancestor_stamp_saw() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("w");
+    let roots = vendored_workspace(&root);
+    let hasher = FileHasher::new();
+    let ancestor = root.clone();
+    let mut pending = true;
+    set_before_stamp(Some(Box::new(move |path: &Path| {
+        if pending && path == ancestor {
+            pending = false;
+            std::fs::write(ancestor.join(".env"), "A=1").unwrap();
+        }
+    })));
+    let taken = tree_guard_of(&hasher, || workspace_tree_digest(&roots, &hasher));
+    set_before_stamp(None);
+    let taken = taken.unwrap();
+    assert!(
+        root.join(".env").exists(),
+        "the name appeared before the stamp"
+    );
+    assert!(taken.held());
+    assert_eq!(
+        workspace_tree_digest(&roots, &hasher).as_deref(),
+        Some(taken.digest.as_str()),
+        "the digest holds the name its stamp saw"
+    );
 }
 
 /// A file at the top of an ancestor that the build cannot read counts as

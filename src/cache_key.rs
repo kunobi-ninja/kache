@@ -883,6 +883,14 @@ fn stamp_roots(
     roots: &[WalkedRoot],
     max_entries: usize,
 ) -> std::result::Result<crate::tree_stamp::TreeStamp, StampRefusal> {
+    #[cfg(test)]
+    BEFORE_STAMP.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            for root in roots {
+                hook(&root.path);
+            }
+        }
+    });
     let mut stamper = crate::tree_stamp::Stamper::new();
     let mut total = 0usize;
     for (index, root) in roots.iter().enumerate() {
@@ -898,6 +906,22 @@ fn stamp_roots(
         return Err(StampRefusal::Refused);
     }
     Ok(stamper.finish())
+}
+
+/// Run by [`stamp_roots`] with each root before it walks, so a test can
+/// change a tree just before it is stamped.
+#[cfg(test)]
+type BeforeStamp = Box<dyn FnMut(&Path)>;
+
+#[cfg(test)]
+thread_local! {
+    static BEFORE_STAMP: std::cell::RefCell<Option<BeforeStamp>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn set_before_stamp(hook: Option<BeforeStamp>) {
+    BEFORE_STAMP.with(|slot| *slot.borrow_mut() = hook);
 }
 
 /// `digest`, a tree digest computed with `file_hasher`, as a guard with the
@@ -2468,13 +2492,10 @@ fn vendored_package_digest(
 /// `directory`, by name and content. A symlink to a file counts by its
 /// target and by the content read through it.
 fn ancestor_top_digest(directory: &Path, file_hasher: &FileHasher<'_>) -> Option<String> {
-    let mut entries: Vec<_> = std::fs::read_dir(directory)
-        .ok()?
-        .collect::<std::io::Result<_>>()
-        .ok()?;
-    entries.sort_by_key(std::fs::DirEntry::file_name);
-    // The guard's walk of the files and symlinks read here. A dot-directory's
-    // own digest walks that directory.
+    // The guard's walk of the files and symlinks read here, and of the
+    // directory's own times, taken before the listing: a name that appears
+    // after the stamp, or comes and goes before the record is written, moves
+    // those times. A dot-directory's own digest walks that directory.
     let top = vec![WalkedRoot {
         path: directory.to_path_buf(),
         role: b"ancestor".to_vec(),
@@ -2482,13 +2503,18 @@ fn ancestor_top_digest(directory: &Path, file_hasher: &FileHasher<'_>) -> Option
         rules: crate::tree_stamp::StampRules {
             link_text: true,
             skip_build_dirs: false,
-            root_metadata: false,
+            root_metadata: true,
             unreadable_entries: true,
             top_files_only: true,
             unsearchable_dirs: false,
         },
     }];
     let stamp = stamp_roots(&top, CRATE_TREE_MAX_ENTRIES).ok()?;
+    let mut entries: Vec<_> = std::fs::read_dir(directory)
+        .ok()?
+        .collect::<std::io::Result<_>>()
+        .ok()?;
+    entries.sort_by_key(std::fs::DirEntry::file_name);
     file_hasher.note_tree_walk(GuardWalk {
         roots: top,
         max_entries: CRATE_TREE_MAX_ENTRIES,

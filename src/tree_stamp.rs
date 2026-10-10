@@ -103,7 +103,11 @@ impl Stamper {
     ) -> WalkOutcome {
         self.walk_skipping(
             root,
-            &|child, _| excluded.iter().any(|path| path == child),
+            &|child, _| {
+                excluded
+                    .iter()
+                    .any(|path| path.file_name() == child.file_name() && path == child)
+            },
             rules,
             budget,
         )
@@ -154,7 +158,7 @@ impl Stamper {
                 }
                 Err(_) => return WalkOutcome::Unreadable,
             };
-            entries.sort_by_key(std::fs::DirEntry::file_name);
+            entries.sort_by_cached_key(std::fs::DirEntry::file_name);
             if rules.skip_build_dirs && directory != root {
                 keep_only_build_tag(&mut entries);
             }
@@ -172,7 +176,7 @@ impl Stamper {
                 let Ok(relative) = child.strip_prefix(root) else {
                     return WalkOutcome::Unreadable;
                 };
-                let read = std::fs::symlink_metadata(&child).and_then(|metadata| {
+                let read = entry_metadata(&entry, &child).and_then(|metadata| {
                     let link = metadata
                         .file_type()
                         .is_symlink()
@@ -247,6 +251,19 @@ impl Stamper {
             entries: entries.to_hex().to_string(),
             newest: self.newest,
         }
+    }
+}
+
+/// What [`std::fs::symlink_metadata`] gives for `child`, the path of
+/// `entry`. On Unix the name is stat'ed in the directory that listed it
+/// (`fstatat`), without resolving the whole path again: walks of one tree
+/// in parallel builds otherwise queue on those lookups. Windows answers it
+/// from the listing, which can lag behind a file being written.
+fn entry_metadata(entry: &std::fs::DirEntry, child: &Path) -> std::io::Result<std::fs::Metadata> {
+    if cfg!(unix) {
+        entry.metadata()
+    } else {
+        std::fs::symlink_metadata(child)
     }
 }
 
@@ -563,6 +580,24 @@ mod tests {
             walk(dir.path(), StampRules::default(), 10).0,
             WalkOutcome::Fits
         );
+    }
+
+    /// An excluded path leaves out that entry alone: an entry of the same
+    /// name elsewhere in the tree still counts.
+    #[test]
+    fn an_excluded_path_leaves_out_only_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir.path().join("target/a"), "");
+        write(&dir.path().join("target/b"), "");
+        write(&dir.path().join("kt/target/c"), "");
+        let mut stamper = Stamper::new();
+        let mut left = 10;
+        let excluded = [dir.path().join("target")];
+        assert_eq!(
+            stamper.walk(dir.path(), &excluded, StampRules::default(), &mut left),
+            WalkOutcome::Fits
+        );
+        assert_eq!(10 - left, 3, "`kt`, `kt/target` and `kt/target/c`");
     }
 
     /// Only the files and links directly under the root count, and a

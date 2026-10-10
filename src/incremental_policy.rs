@@ -48,7 +48,7 @@ pub(crate) struct AdaptiveUnit {
 pub(crate) enum LeaseKind {
     /// A proven-active unit skipped cache-key work.
     Active,
-    /// A second qualifying miss is seeding incremental state.
+    /// A seed lease, including a cold attempt awaiting key qualification.
     Seed,
     /// The wrapper chose an intentional or force-listed passthrough.
     Immediate,
@@ -80,6 +80,10 @@ impl Drop for UnitLock {
 
 #[derive(Debug)]
 enum Completion {
+    /// A cold compile whose emitted-dep-info key has not qualified as a seed.
+    DeferredSeed {
+        previous: DiskState,
+    },
     /// `previous` is the state the seed found, restored if it fails.
     Seed {
         observation: Observation,
@@ -271,6 +275,47 @@ impl AdaptiveUnit {
         fields: &BTreeMap<String, String>,
     ) -> Option<Lease> {
         self.try_seed_at(cache_key, fields, now_secs())
+    }
+
+    /// Start a cold compile while retaining a learning observation. The
+    /// wrapper must qualify its exact emitted-dep-info key after a local miss.
+    pub(crate) fn try_deferred_seed(&self) -> Option<Lease> {
+        if definitely_missing(&self.state_path) {
+            return None;
+        }
+        let lock = self.lock()?;
+        let previous = match self.load_state() {
+            LoadedState::Valid(state) if !state.in_flight => state,
+            LoadedState::Missing | LoadedState::Unavailable => return None,
+            LoadedState::Valid(_) | LoadedState::Corrupt => {
+                reset_locked(self);
+                return None;
+            }
+        };
+        if previous.phase != Phase::Learning {
+            return None;
+        }
+
+        let mut busy = previous.clone();
+        busy.in_flight = true;
+        // The old graph must remain whole if publishing the marker fails.
+        if !self.store_state(&busy, true) {
+            return None;
+        }
+        if !remove_path_safely(&self.rustc_dir) {
+            // Leave the marker beside any partial removal so a later caller
+            // resets it rather than borrowing an incomplete graph.
+            return None;
+        }
+        if !ensure_real_directory(&self.rustc_dir) {
+            return None;
+        }
+        Some(Lease {
+            unit: self.clone(),
+            kind: LeaseKind::Seed,
+            completion: Completion::DeferredSeed { previous },
+            _lock: lock,
+        })
     }
 
     /// Record a build that did not use incremental state: a miss compiled
@@ -570,6 +615,55 @@ impl Lease {
         self.kind
     }
 
+    /// Qualify a cold compile using its exact emitted-dep-info key, after the
+    /// wrapper has proven a local cache miss. Other leases cannot qualify.
+    pub(crate) fn qualify_deferred_seed(
+        &mut self,
+        cache_key: &str,
+        fields: &BTreeMap<String, String>,
+    ) -> bool {
+        self.qualify_deferred_seed_at(cache_key, fields, now_secs())
+    }
+
+    fn qualify_deferred_seed_at(
+        &mut self,
+        cache_key: &str,
+        fields: &BTreeMap<String, String>,
+        now: u64,
+    ) -> bool {
+        let Completion::DeferredSeed { previous } = &self.completion else {
+            return false;
+        };
+        let Some(fingerprint) = key_fingerprint(cache_key, fields) else {
+            return false;
+        };
+        let Some(prior_observation) = previous.observation.as_ref() else {
+            return false;
+        };
+        if !qualifying_pair(prior_observation, &fingerprint) {
+            return false;
+        }
+
+        let observation = fingerprint.at(now);
+        let busy = DiskState {
+            schema: STATE_SCHEMA,
+            unit_key: self.unit.unit_key.clone(),
+            phase: Phase::Seed,
+            observation: Some(observation.clone()),
+            active_leases: 0,
+            last_used_secs: now,
+            in_flight: true,
+        };
+        if !self.unit.store_state(&busy, true) {
+            return false;
+        }
+        self.completion = Completion::Seed {
+            observation,
+            previous: previous.clone(),
+        };
+        true
+    }
+
     /// Rewrite every accepted rustc incremental spelling to this lease's
     /// private directory. If a caller accidentally supplies different args,
     /// fail closed by stripping incremental flags instead of borrowing state
@@ -604,12 +698,23 @@ impl Lease {
             CompileOutcome::CompileError => true,
             CompileOutcome::Abnormal => false,
         };
-        if !keep {
-            let _ = reset_locked(&self.unit);
-            return false;
-        }
-
         let next = match (self.completion, outcome) {
+            (Completion::DeferredSeed { previous }, _) => {
+                // Unqualified success stored no artifact. Clear learning while
+                // still holding the lock so the next build can store normally.
+                // A cancelled hit or failed compile retains the observation.
+                if reset_locked(&self.unit)
+                    && outcome != CompileOutcome::Success
+                    && !self.unit.store_state(&previous, true)
+                {
+                    reset_locked(&self.unit);
+                }
+                return false;
+            }
+            _ if !keep => {
+                let _ = reset_locked(&self.unit);
+                return false;
+            }
             (Completion::Seed { observation, .. }, CompileOutcome::Success) => Some(DiskState {
                 schema: STATE_SCHEMA,
                 unit_key: self.unit.unit_key.clone(),
@@ -994,6 +1099,439 @@ mod tests {
             .unwrap();
         fs::write(lease.unit.rustc_dir.join("dep-graph.bin"), b"seed").unwrap();
         assert!(lease.finish_at(CompileOutcome::Success, at + 2));
+    }
+
+    #[test]
+    fn deferred_seed_starts_cold_and_rewrites_only_its_own_unit() {
+        let (_temp, args, unit) = fixture();
+        teach(&unit, 100);
+        fs::create_dir(&unit.rustc_dir).unwrap();
+        fs::create_dir(unit.rustc_dir.join("old-session")).unwrap();
+        fs::write(unit.rustc_dir.join("old-session/dep-graph.bin"), b"old").unwrap();
+        fs::write(unit.original_incremental.join("cargo-graph.bin"), b"cargo").unwrap();
+
+        let lease = unit.try_deferred_seed().unwrap();
+        assert_eq!(lease.kind(), LeaseKind::Seed);
+        assert!(matches!(lease.completion, Completion::DeferredSeed { .. }));
+        assert!(real_directory(&unit.rustc_dir));
+        assert_eq!(fs::read_dir(&unit.rustc_dir).unwrap().count(), 0);
+        let busy = read_state(&unit);
+        assert_eq!(busy.phase, Phase::Learning);
+        assert!(busy.in_flight);
+        assert_eq!(busy.observation.unwrap().cache_key, cache_key("first"));
+        let rewritten = lease.compiler_args(&args);
+        assert!(rewritten.contains(&format!("incremental={}", unit.rustc_dir.display())));
+        assert_eq!(
+            fs::read(unit.original_incremental.join("cargo-graph.bin")).unwrap(),
+            b"cargo"
+        );
+
+        let mut other = args.clone();
+        other.extra_filename = Some("-abcdef12".into());
+        other
+            .all_args
+            .retain(|arg| !arg.starts_with("-Cextra-filename="));
+        other.all_args.push("-Cextra-filename=-abcdef12".into());
+        assert!(
+            !lease
+                .compiler_args(&other)
+                .iter()
+                .any(|arg| arg.contains("incremental="))
+        );
+        assert!(!lease.finish_at(CompileOutcome::Success, 101));
+    }
+
+    #[test]
+    fn deferred_seed_declines_missing_and_active_state() {
+        let (_temp, _args, unit) = fixture();
+        assert!(unit.try_deferred_seed().is_none());
+        assert!(
+            !path_exists(&unit.unit_dir),
+            "a missing observation creates no layout"
+        );
+
+        activate(&unit, 100);
+        let active = fs::read(&unit.state_path).unwrap();
+        assert!(unit.try_deferred_seed().is_none());
+        assert_eq!(fs::read(&unit.state_path).unwrap(), active);
+        assert_eq!(
+            fs::read(unit.rustc_dir.join("dep-graph.bin")).unwrap(),
+            b"seed"
+        );
+    }
+
+    #[test]
+    fn deferred_seed_resets_corrupt_and_in_flight_state() {
+        for mode in ["corrupt", "learning", "seed", "active"] {
+            let (_temp, _args, unit) = fixture();
+            teach(&unit, 100);
+            fs::create_dir(&unit.rustc_dir).unwrap();
+            fs::write(unit.rustc_dir.join("partial"), b"partial").unwrap();
+            if mode == "corrupt" {
+                fs::write(&unit.state_path, b"invalid json").unwrap();
+            } else {
+                let mut state = read_state(&unit);
+                state.phase = match mode {
+                    "learning" => Phase::Learning,
+                    "seed" => Phase::Seed,
+                    "active" => Phase::Active,
+                    _ => unreachable!(),
+                };
+                state.in_flight = true;
+                write_state(&unit, &state);
+            }
+            assert!(unit.try_deferred_seed().is_none(), "{mode}");
+            assert!(!path_exists(&unit.rustc_dir), "{mode}");
+            assert!(!path_exists(&unit.state_path), "{mode}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deferred_seed_preserves_unavailable_state() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let (_temp, _args, unit) = fixture();
+        teach(&unit, 100);
+        let before = fs::read(&unit.state_path).unwrap();
+        fs::create_dir(&unit.rustc_dir).unwrap();
+        fs::write(unit.rustc_dir.join("old"), b"whole").unwrap();
+        let permissions = fs::metadata(&unit.state_path).unwrap().permissions();
+        fs::set_permissions(&unit.state_path, fs::Permissions::from_mode(0o000)).unwrap();
+        let unavailable = matches!(unit.load_state(), LoadedState::Unavailable);
+        let refused = unit.try_deferred_seed().is_none();
+        fs::set_permissions(&unit.state_path, permissions).unwrap();
+
+        assert!(unavailable);
+        assert!(refused);
+        assert_eq!(fs::read(&unit.state_path).unwrap(), before);
+        assert_eq!(fs::read(unit.rustc_dir.join("old")).unwrap(), b"whole");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deferred_seed_marker_failure_preserves_the_old_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let (_temp, _args, unit) = fixture();
+        teach(&unit, 100);
+        let before = fs::read(&unit.state_path).unwrap();
+        fs::create_dir(&unit.rustc_dir).unwrap();
+        fs::write(unit.rustc_dir.join("old"), b"whole").unwrap();
+        fs::set_permissions(&unit.unit_dir, fs::Permissions::from_mode(0o500)).unwrap();
+        let refused = unit.try_deferred_seed().is_none();
+        fs::set_permissions(&unit.unit_dir, fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(refused);
+        assert_eq!(fs::read(&unit.state_path).unwrap(), before);
+        assert_eq!(fs::read(unit.rustc_dir.join("old")).unwrap(), b"whole");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deferred_seed_failed_cleanup_keeps_the_in_flight_marker() {
+        use std::os::unix::net::UnixListener;
+        let (temp, _args, mut unit) = fixture();
+        unit.rustc_dir = temp.path().join("blocked-deferred-rustc");
+        teach(&unit, 100);
+        let _socket = UnixListener::bind(&unit.rustc_dir).unwrap();
+
+        assert!(unit.try_deferred_seed().is_none());
+        let marker = read_state(&unit);
+        assert_eq!(marker.phase, Phase::Learning);
+        assert!(marker.in_flight);
+        assert!(path_exists(&unit.rustc_dir));
+        assert!(unit.try_deferred_seed().is_none());
+    }
+
+    #[test]
+    fn deferred_seed_requires_a_qualifying_exact_key() {
+        let (_temp, _args, unit) = fixture();
+        teach(&unit, 100);
+        let mut lease = unit.try_deferred_seed().unwrap();
+        let marker = fs::read(&unit.state_path).unwrap();
+        for (key, grouped) in [
+            ("invalid".into(), fields("stable", "source-b", "extern-a")),
+            (cache_key("second"), BTreeMap::new()),
+            (
+                cache_key("second"),
+                BTreeMap::from([("sources".into(), "source-b".into())]),
+            ),
+            (
+                cache_key("second"),
+                BTreeMap::from([("args".into(), "stable".into())]),
+            ),
+            (cache_key("first"), fields("stable", "source-b", "extern-a")),
+            (
+                cache_key("second"),
+                fields("changed", "source-b", "extern-a"),
+            ),
+            (
+                cache_key("second"),
+                fields("stable", "source-a", "extern-a"),
+            ),
+        ] {
+            assert!(!lease.qualify_deferred_seed_at(&key, &grouped, 101));
+            assert!(matches!(lease.completion, Completion::DeferredSeed { .. }));
+            assert_eq!(fs::read(&unit.state_path).unwrap(), marker);
+        }
+        assert!(lease.qualify_deferred_seed_at(
+            &cache_key("second"),
+            &fields("stable", "source-b", "extern-a"),
+            102,
+        ));
+        let seed = read_state(&unit);
+        assert_eq!(seed.phase, Phase::Seed);
+        assert!(seed.in_flight);
+        assert_eq!(seed.active_leases, 0);
+        assert_eq!(seed.last_used_secs, 102);
+        let observation = seed.observation.unwrap();
+        assert_eq!(observation.cache_key, cache_key("second"));
+        assert_eq!(observation.at_secs, 102);
+        assert!(matches!(lease.completion, Completion::Seed { .. }));
+        assert!(!lease.qualify_deferred_seed_at(
+            &cache_key("third"),
+            &fields("stable", "source-c", "extern-a"),
+            103,
+        ));
+        assert!(!lease.finish_at(CompileOutcome::Abnormal, 104));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deferred_seed_qualification_write_failure_stays_unqualified() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let (_temp, _args, unit) = fixture();
+        teach(&unit, 100);
+        let mut lease = unit.try_deferred_seed().unwrap();
+        let marker = fs::read(&unit.state_path).unwrap();
+        fs::write(unit.rustc_dir.join("dep-graph.bin"), b"new").unwrap();
+        fs::set_permissions(&unit.unit_dir, fs::Permissions::from_mode(0o500)).unwrap();
+        let qualified = lease.qualify_deferred_seed_at(
+            &cache_key("second"),
+            &fields("stable", "source-b", "extern-a"),
+            101,
+        );
+        fs::set_permissions(&unit.unit_dir, fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(!qualified);
+        assert!(matches!(lease.completion, Completion::DeferredSeed { .. }));
+        assert_eq!(fs::read(&unit.state_path).unwrap(), marker);
+        assert!(!lease.finish_at(CompileOutcome::Success, 102));
+        assert!(!path_exists(&unit.rustc_dir));
+        assert!(!path_exists(&unit.state_path));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unqualified_deferred_cleanup_failure_never_restores_learning_over_partial_state() {
+        use std::os::unix::net::UnixListener;
+        let (temp, _args, mut unit) = fixture();
+        unit.rustc_dir = temp.path().join("blocked-deferred-finish");
+        teach(&unit, 100);
+        let lease = unit.try_deferred_seed().unwrap();
+        fs::remove_dir(&unit.rustc_dir).unwrap();
+        let _socket = UnixListener::bind(&unit.rustc_dir).unwrap();
+
+        assert!(!lease.finish_at(CompileOutcome::Success, 101));
+        assert!(read_state(&unit).in_flight);
+        assert!(path_exists(&unit.rustc_dir));
+        assert!(unit.try_deferred_seed().is_none());
+        assert!(unit.try_active_at(102).is_none());
+    }
+
+    #[test]
+    fn ordinary_leases_cannot_be_qualified_as_deferred_seeds() {
+        for kind in [LeaseKind::Seed, LeaseKind::Active, LeaseKind::Immediate] {
+            let (_temp, _args, unit) = fixture();
+            teach(&unit, 100);
+            let mut lease = match kind {
+                LeaseKind::Seed => unit
+                    .try_seed_at(
+                        &cache_key("second"),
+                        &fields("stable", "source-b", "extern-a"),
+                        101,
+                    )
+                    .unwrap(),
+                LeaseKind::Active => {
+                    activate(&unit, 100);
+                    unit.try_active_at(103).unwrap()
+                }
+                LeaseKind::Immediate => unit.try_immediate_at(101).unwrap(),
+            };
+            let before = fs::read(&unit.state_path).unwrap();
+            assert!(!lease.qualify_deferred_seed(
+                &cache_key("third"),
+                &fields("stable", "source-c", "extern-a"),
+            ));
+            assert_eq!(lease.kind(), kind);
+            assert_eq!(fs::read(&unit.state_path).unwrap(), before);
+            assert!(!lease.finish_at(CompileOutcome::Abnormal, 104));
+        }
+    }
+
+    #[test]
+    fn unqualified_deferred_seed_clears_success_and_restores_learning_on_failure() {
+        for outcome in [
+            CompileOutcome::Success,
+            CompileOutcome::CompileError,
+            CompileOutcome::Abnormal,
+        ] {
+            for wrote_graph in [false, true] {
+                let (_temp, _args, unit) = fixture();
+                teach(&unit, 100);
+                let before = fs::read(&unit.state_path).unwrap();
+                let lease = unit.try_deferred_seed().unwrap();
+                if wrote_graph {
+                    fs::write(unit.rustc_dir.join("dep-graph.bin"), b"new").unwrap();
+                }
+                assert!(
+                    !lease.finish_at(outcome, 101),
+                    "{outcome:?}, graph {wrote_graph}"
+                );
+                assert!(!path_exists(&unit.rustc_dir));
+                assert!(unit.try_active_at(102).is_none());
+                if outcome == CompileOutcome::Success {
+                    assert!(!path_exists(&unit.state_path));
+                    assert!(unit.try_deferred_seed().is_none());
+                    assert!(!unit.has_policy_state());
+                } else {
+                    assert_eq!(fs::read(&unit.state_path).unwrap(), before);
+                    assert!(unit.try_deferred_seed().is_some(), "learning must survive");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn qualified_deferred_seed_uses_normal_seed_completion() {
+        for outcome in [
+            CompileOutcome::Success,
+            CompileOutcome::CompileError,
+            CompileOutcome::Abnormal,
+        ] {
+            for wrote_graph in [false, true] {
+                let (_temp, _args, unit) = fixture();
+                teach(&unit, 100);
+                let before = fs::read(&unit.state_path).unwrap();
+                let mut lease = unit.try_deferred_seed().unwrap();
+                if wrote_graph {
+                    fs::write(unit.rustc_dir.join("dep-graph.bin"), b"new").unwrap();
+                }
+                assert!(lease.qualify_deferred_seed(
+                    &cache_key("second"),
+                    &fields("stable", "source-b", "extern-a"),
+                ));
+                let kept = lease.finish_at(outcome, 101);
+                match outcome {
+                    CompileOutcome::Success if wrote_graph => {
+                        assert!(kept);
+                        let active = read_state(&unit);
+                        assert_eq!(active.phase, Phase::Active);
+                        assert!(!active.in_flight);
+                        assert_eq!(active.observation.unwrap().cache_key, cache_key("second"));
+                        assert!(unit.try_active_at(102).is_some());
+                    }
+                    CompileOutcome::CompileError => {
+                        assert!(kept);
+                        assert_eq!(fs::read(&unit.state_path).unwrap(), before);
+                        assert!(real_directory(&unit.rustc_dir));
+                        assert!(unit.try_active_at(102).is_none());
+                    }
+                    _ => {
+                        assert!(!kept);
+                        assert!(!path_exists(&unit.state_path));
+                        assert!(!path_exists(&unit.rustc_dir));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn abandoned_deferred_attempts_leave_markers_that_decline_and_reset() {
+        for qualify in [false, true] {
+            let (_temp, _args, unit) = fixture();
+            teach(&unit, 100);
+            let mut lease = unit.try_deferred_seed().unwrap();
+            fs::write(unit.rustc_dir.join("partial"), b"partial").unwrap();
+            if qualify {
+                assert!(lease.qualify_deferred_seed_at(
+                    &cache_key("second"),
+                    &fields("stable", "source-b", "extern-a"),
+                    101,
+                ));
+            }
+            drop(lease);
+            assert!(read_state(&unit).in_flight);
+            assert!(unit.try_deferred_seed().is_none());
+            assert!(!path_exists(&unit.state_path));
+            assert!(!path_exists(&unit.rustc_dir));
+            assert!(unit.try_active_at(102).is_none());
+        }
+    }
+
+    #[test]
+    fn deferred_seed_holds_and_releases_its_lock_across_processes() {
+        let probe = |unit: &AdaptiveUnit, available: bool| {
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "incremental_policy::tests::deferred_seed_lock_probe",
+                    "--ignored",
+                ])
+                .env("KACHE_DEFERRED_TEST_LOCK", &unit.lock_path)
+                .env("KACHE_DEFERRED_TEST_AVAILABLE", available.to_string())
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        };
+        for finish in [false, true] {
+            let (_temp, _args, unit) = fixture();
+            teach(&unit, 100);
+            let lease = unit.try_deferred_seed().unwrap();
+            let inherited = lease._lock.0.try_clone().unwrap();
+            probe(&unit, false);
+            assert!(unit.try_deferred_seed().is_none());
+            assert!(unit.try_immediate_at(101).is_none());
+            if finish {
+                assert!(!lease.finish_at(CompileOutcome::Success, 102));
+            } else {
+                drop(lease);
+            }
+            probe(&unit, true);
+            drop(inherited);
+        }
+    }
+
+    #[test]
+    #[ignore = "spawned by deferred_seed_holds_and_releases_its_lock_across_processes"]
+    fn deferred_seed_lock_probe() {
+        let path = std::env::var_os("KACHE_DEFERRED_TEST_LOCK").unwrap();
+        let available = std::env::var("KACHE_DEFERRED_TEST_AVAILABLE").unwrap() == "true";
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        let acquired = match file.try_lock() {
+            Ok(()) => true,
+            Err(std::fs::TryLockError::WouldBlock) => false,
+            Err(error) => panic!("lock probe failed: {error:?}"),
+        };
+        assert_eq!(acquired, available);
     }
 
     #[test]

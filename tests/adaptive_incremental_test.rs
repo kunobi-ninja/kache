@@ -58,33 +58,71 @@ fn future_mtime() -> i64 {
         + 3_600
 }
 
+// Cold discovery rejects inputs dated after compilation starts. These tests
+// force Cargo to revisit old source timestamps by clearing its fingerprint.
+fn past_mtime() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+        - 3_600
+}
+
+fn reset_fixture_fingerprint(target_dir: &Path) {
+    let fingerprints = target_dir.join("debug/.fingerprint");
+    if fingerprints.is_dir() {
+        for entry in fs::read_dir(&fingerprints).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_dir()
+                && entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with("adaptive-fixture-"))
+            {
+                fs::remove_dir_all(entry.path()).unwrap();
+            }
+        }
+    }
+}
+
 fn write_source(project: &Path, source_mtime: i64, body: &str) {
     let source = project.join("src/lib.rs");
     fs::write(&source, format!("pub fn answer() -> u64 {{ {body} }}\n")).unwrap();
     filetime::set_file_mtime(&source, FileTime::from_unix_time(source_mtime, 0)).unwrap();
 }
 
-fn run_cargo(project: &Path, cache_dir: &Path, target_dir: &Path, fallback: &Path) -> Output {
-    hermetic_command(
+fn run_cargo(
+    project: &Path,
+    cache_dir: &Path,
+    target_dir: &Path,
+    fallback: Option<&Path>,
+) -> Output {
+    let mut command = hermetic_command(
         "cargo",
         cache_dir,
         Some(&project.join("missing-kache.toml")),
-    )
-    .args(["build", "--offline", "--quiet", "--lib"])
-    .current_dir(project)
-    .env("RUSTC_WRAPPER", kache_binary())
-    .env("CARGO_TARGET_DIR", target_dir)
-    .env("CARGO_INCREMENTAL", "1")
-    .env("KACHE_ADAPTIVE_INCREMENTAL", "1")
-    .env("KACHE_FALLBACK", fallback)
-    .env("FALLBACK_MARKER", project.join("fallback-used"))
-    .env("KACHE_LOG", "kache=debug")
-    .env_remove("RUSTC_WORKSPACE_WRAPPER")
-    .env_remove("KACHE_CLEAN_INCREMENTAL")
-    .env_remove("KACHE_DISABLED")
-    .env_remove("KACHE_PRESERVE_INCREMENTAL")
-    .output()
-    .expect("failed to build adaptive fixture")
+    );
+    command
+        .args(["build", "--offline", "--quiet", "--lib"])
+        .current_dir(project)
+        .env("RUSTC_WRAPPER", kache_binary())
+        .env("CARGO_TARGET_DIR", target_dir)
+        .env("CARGO_INCREMENTAL", "1")
+        .env("KACHE_ADAPTIVE_INCREMENTAL", "1")
+        .env("KACHE_SCHEDULER", "1")
+        .env("FALLBACK_MARKER", project.join("fallback-used"))
+        .env("KACHE_LOG", "kache=debug")
+        .env_remove("RUSTC_WORKSPACE_WRAPPER")
+        .env_remove("KACHE_CLEAN_INCREMENTAL")
+        .env_remove("KACHE_DISABLED")
+        .env_remove("KACHE_PRESERVE_INCREMENTAL");
+    if let Some(fallback) = fallback {
+        command.env("KACHE_FALLBACK", fallback);
+    } else {
+        reset_fixture_fingerprint(target_dir);
+        command.env_remove("KACHE_FALLBACK");
+    }
+    command.output().expect("failed to build adaptive fixture")
 }
 
 /// The one fixture event logged after the first `before` events.
@@ -104,6 +142,24 @@ fn build_variant(
     cache_dir: &Path,
     target_dir: &Path,
     fallback: &Path,
+    source_mtime: i64,
+    answer: u64,
+) -> Value {
+    build_variant_impl(
+        project,
+        cache_dir,
+        target_dir,
+        Some(fallback),
+        source_mtime,
+        answer,
+    )
+}
+
+fn build_variant_impl(
+    project: &Path,
+    cache_dir: &Path,
+    target_dir: &Path,
+    fallback: Option<&Path>,
     source_mtime: i64,
     answer: u64,
 ) -> Value {
@@ -174,6 +230,16 @@ fn build_failing(
     fallback: &Path,
     source_mtime: i64,
 ) -> Value {
+    build_failing_impl(project, cache_dir, target_dir, Some(fallback), source_mtime)
+}
+
+fn build_failing_impl(
+    project: &Path,
+    cache_dir: &Path,
+    target_dir: &Path,
+    fallback: Option<&Path>,
+    source_mtime: i64,
+) -> Value {
     write_source(project, source_mtime, &format!("\"{source_mtime}\""));
     let event_count = fixture_events(cache_dir).len();
     let output = run_cargo(project, cache_dir, target_dir, fallback);
@@ -213,6 +279,19 @@ fn assert_passthrough(event: &Value, reason: &str) {
             .is_some_and(|value| value.contains(reason)),
         "expected passthrough reason containing {reason:?}; event: {event:#}",
     );
+}
+
+fn assert_no_private_graph(policy_root: &Path) {
+    for unit in fs::read_dir(policy_root.join("v1")).unwrap() {
+        let rustc = unit.unwrap().path().join("rustc");
+        if rustc.exists() {
+            assert!(
+                fs::read_dir(&rustc).unwrap().next().is_none(),
+                "a cache hit retained a provisional graph in {}",
+                rustc.display(),
+            );
+        }
+    }
 }
 
 fn finished_output(mut child: Child, status: ExitStatus) -> Output {
@@ -438,6 +517,259 @@ fn compile_errors_keep_adaptive_state_through_the_fix() {
         !project.path().join("fallback-used").exists(),
         "an adaptive compile used the fallback"
     );
+}
+
+#[test]
+fn local_source_churn_seeds_from_emitted_dep_info_without_a_pre_pass() {
+    let project = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let target = project.path().join("target");
+    let policy_root = target.join("debug/incremental.kache-auto");
+    create_fixture(project.path());
+
+    let first_mtime = past_mtime();
+    let mut tick = 0;
+    let mut build = |answer| {
+        let event = build_variant_impl(
+            project.path(),
+            cache.path(),
+            &target,
+            None,
+            first_mtime + tick,
+            answer,
+        );
+        tick += 1;
+        event
+    };
+
+    let first = build(1);
+    assert_eq!(first["result"], "miss", "event: {first:#}");
+    assert_eq!(first["compiler_runs"], 1, "event: {first:#}");
+
+    let seed = build(2);
+    assert_passthrough(&seed, "adaptive seed");
+    assert_eq!(seed["compiler_runs"], 1, "event: {seed:#}");
+    assert_eq!(seed["dep_info_runs"], 0, "event: {seed:#}");
+    assert_eq!(
+        seed["rebuilt_package"], "adaptive-fixture",
+        "event: {seed:#}"
+    );
+    assert!(!seed["rebuilt_paths"].as_array().unwrap().is_empty());
+    assert!(
+        newest_finalized_session(&policy_root).is_some(),
+        "the cold seed did not publish a private rustc session",
+    );
+
+    let active = build(3);
+    assert_passthrough(&active, "adaptive active");
+    assert_eq!(active["compiler_runs"], 1, "event: {active:#}");
+    assert_eq!(active["dep_info_runs"], 0, "event: {active:#}");
+    assert_eq!(active["key_ms"], 0, "event: {active:#}");
+
+    // Removing policy state exposes any accidental artifact publication from
+    // either the active compile or its seed. Each consumer checks the answer.
+    fs::remove_dir_all(&policy_root).unwrap();
+    let active_output = build(3);
+    assert_eq!(active_output["result"], "miss", "event: {active_output:#}");
+    assert_eq!(active_output["compiler_runs"], 1);
+    fs::remove_dir_all(&policy_root).unwrap();
+    let seed_output = build(2);
+    assert_eq!(seed_output["result"], "miss", "event: {seed_output:#}");
+    assert_eq!(seed_output["compiler_runs"], 1);
+}
+
+#[test]
+fn local_learning_cache_hit_discards_the_provisional_graph() {
+    let project = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let target = project.path().join("target");
+    let policy_root = target.join("debug/incremental.kache-auto");
+    create_fixture(project.path());
+
+    let first_mtime = past_mtime();
+    let mut tick = 0;
+    let mut build = |answer| {
+        let event = build_variant_impl(
+            project.path(),
+            cache.path(),
+            &target,
+            None,
+            first_mtime + tick,
+            answer,
+        );
+        tick += 1;
+        event
+    };
+
+    let first = build(1);
+    assert_eq!(first["result"], "miss", "event: {first:#}");
+    assert_eq!(first["compiler_runs"], 1, "event: {first:#}");
+    assert_no_private_graph(&policy_root);
+    let weight = cache
+        .path()
+        .join("scheduler/weights")
+        .join(blake3::hash(b"adaptive_fixture").to_hex().as_str());
+    let initial_rss: u64 = fs::read_to_string(&weight).unwrap().parse().unwrap();
+    assert!(initial_rss > 1024, "the first compile did not record RSS");
+    fs::remove_file(&weight).unwrap();
+
+    // The changed mtime invalidates the learned closure; the cleared Cargo
+    // fingerprint forces a build. The compiler must stop at the exact hit.
+    let restored = build(1);
+    assert_eq!(restored["result"], "local_hit", "event: {restored:#}");
+    assert_eq!(restored["dep_info_runs"], 1, "event: {restored:#}");
+    assert_eq!(restored["compiler_runs"], 0, "event: {restored:#}");
+    assert_no_private_graph(&policy_root);
+    assert!(
+        !weight.exists(),
+        "an interrupted cache-hit compile recorded an incomplete RSS sample",
+    );
+
+    let seed = build(2);
+    assert_passthrough(&seed, "adaptive seed");
+    assert_eq!(seed["compiler_runs"], 1, "event: {seed:#}");
+    assert_eq!(seed["dep_info_runs"], 0, "event: {seed:#}");
+    assert!(
+        newest_finalized_session(&policy_root).is_some(),
+        "a cache hit prevented the next edit from seeding private state",
+    );
+}
+
+#[test]
+fn local_empty_cache_entry_does_not_stop_the_cold_compile() {
+    let project = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let target = project.path().join("target");
+    let policy_root = target.join("debug/incremental.kache-auto");
+    create_fixture(project.path());
+
+    let first_mtime = past_mtime();
+    let first = build_variant_impl(project.path(), cache.path(), &target, None, first_mtime, 1);
+    assert_eq!(first["result"], "miss", "event: {first:#}");
+    let metadata_path = cache
+        .path()
+        .join("store")
+        .join(first["cache_key"].as_str().unwrap())
+        .join("meta.json");
+    let mut metadata: Value = serde_json::from_slice(&fs::read(&metadata_path).unwrap()).unwrap();
+    assert!(!metadata["files"].as_array().unwrap().is_empty());
+    metadata["files"] = serde_json::json!([]);
+    fs::write(&metadata_path, serde_json::to_vec(&metadata).unwrap()).unwrap();
+
+    // The store can read this metadata, but it has no artifact to restore.
+    // Cold discovery must finish compilation and discard unqualified state.
+    let compiled = build_variant_impl(
+        project.path(),
+        cache.path(),
+        &target,
+        None,
+        first_mtime + 1,
+        1,
+    );
+    assert_passthrough(&compiled, "adaptive seed");
+    assert_eq!(compiled["compiler_runs"], 1, "event: {compiled:#}");
+    assert_eq!(compiled["dep_info_runs"], 0, "event: {compiled:#}");
+    assert_no_private_graph(&policy_root);
+}
+
+#[test]
+fn local_unqualified_cold_seed_resets_learning_so_the_next_build_can_store() {
+    let project = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let target = project.path().join("target");
+    let policy_root = target.join("debug/incremental.kache-auto");
+    create_fixture(project.path());
+
+    let first_mtime = past_mtime();
+    let mut tick = 0;
+    let mut build = || {
+        let event = build_variant_impl(
+            project.path(),
+            cache.path(),
+            &target,
+            None,
+            first_mtime + tick,
+            1,
+        );
+        tick += 1;
+        event
+    };
+
+    let first = build();
+    assert_eq!(first["result"], "miss", "event: {first:#}");
+    assert_eq!(first["compiler_runs"], 1, "event: {first:#}");
+    let policy_state = fs::read_dir(policy_root.join("v1"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path().join("state.json"))
+        .find(|path| path.is_file())
+        .expect("the first miss did not leave Learning state");
+
+    // Eviction removes the exact artifact while preserving its learned key.
+    // Unchanged inputs cannot qualify this cold compile as an adaptive seed.
+    fs::remove_dir_all(cache.path().join("store")).unwrap();
+    let unqualified = build();
+    assert_passthrough(&unqualified, "adaptive seed");
+    assert_eq!(unqualified["compiler_runs"], 1, "event: {unqualified:#}");
+    assert_eq!(unqualified["dep_info_runs"], 0, "event: {unqualified:#}");
+    assert_no_private_graph(&policy_root);
+    assert!(
+        !policy_state.exists(),
+        "an unqualified cold seed retained Learning state in {}",
+        policy_state.display(),
+    );
+
+    let stored = build();
+    assert_eq!(stored["result"], "miss", "event: {stored:#}");
+    assert_eq!(stored["compiler_runs"], 1, "event: {stored:#}");
+    let restored = build();
+    assert_eq!(restored["result"], "local_hit", "event: {restored:#}");
+    assert_eq!(restored["compiler_runs"], 0, "event: {restored:#}");
+}
+
+#[test]
+fn local_failed_cold_seed_keeps_the_next_fix_on_the_seed_lane() {
+    let project = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let target = project.path().join("target");
+    create_fixture(project.path());
+
+    let mtime = std::cell::Cell::new(past_mtime());
+    let next_mtime = || {
+        let current = mtime.get();
+        mtime.set(current + 1);
+        current
+    };
+    let build = |answer| {
+        build_variant_impl(
+            project.path(),
+            cache.path(),
+            &target,
+            None,
+            next_mtime(),
+            answer,
+        )
+    };
+
+    let first = build(1);
+    assert_eq!(first["result"], "miss", "event: {first:#}");
+    let failed_seed = build_failing_impl(project.path(), cache.path(), &target, None, next_mtime());
+    assert_passthrough(&failed_seed, "adaptive seed");
+    assert_eq!(failed_seed["exit_code"], 1, "event: {failed_seed:#}");
+    assert_eq!(failed_seed["compiler_runs"], 1, "event: {failed_seed:#}");
+    assert_eq!(failed_seed["dep_info_runs"], 0, "event: {failed_seed:#}");
+    assert!(
+        failed_seed.get("rebuilt_paths").is_none(),
+        "event: {failed_seed:#}"
+    );
+
+    let fixed = build(2);
+    assert_passthrough(&fixed, "adaptive seed");
+    assert_eq!(fixed["compiler_runs"], 1, "event: {fixed:#}");
+    assert_eq!(fixed["dep_info_runs"], 0, "event: {fixed:#}");
+    let active = build(3);
+    assert_passthrough(&active, "adaptive active");
+    assert_eq!(active["compiler_runs"], 1, "event: {active:#}");
+    assert_eq!(active["dep_info_runs"], 0, "event: {active:#}");
 }
 
 #[test]

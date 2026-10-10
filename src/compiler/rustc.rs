@@ -188,6 +188,25 @@ impl RustcCompiler {
         )
     }
 
+    /// Start a cold private incremental compile and pause after dep-info so
+    /// the caller can check for a stored artifact before rustc reaches Cargo.
+    pub(crate) fn execute_preserving_incremental_until_dep_info(
+        &self,
+        parsed: &RustcArgs,
+        isolated_args: &[String],
+        on_dep_info: &mut dyn FnMut() -> bool,
+    ) -> Result<CompileResult> {
+        self.execute_with_args(
+            parsed,
+            isolated_args,
+            compile::IncrementalMode::PreserveIsolated,
+            None,
+            LinkLane::Adaptive,
+            Some(&mut std::io::stderr()),
+            Some(on_dep_info),
+        )
+    }
+
     /// Preserve ordinary passthrough path semantics for an executable Kache
     /// had already excluded from artifact caching, while retaining compiler
     /// accounting and heartbeat monitoring.

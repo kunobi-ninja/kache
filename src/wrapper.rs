@@ -4014,13 +4014,27 @@ fn run_parsed_rustc(
     // a unit left without state has no lane its key could open. When no lane
     // takes its miss, such a unit compiles before keying again after all
     // ([`compile_before_key_after_miss`]).
-    let keys_first = managed_unit_keys_first(
-        adaptive_unit.is_some(),
-        force_incremental,
+    // A learning unit has no graph to reuse. Reserve a cold private compile
+    // before discovery, then qualify its seed from rustc's emitted closure.
+    let mut deferred_seed = if adaptive_policy_for_invocation
+        && precompiled.is_none()
+        && stop_on_hit_allowed(args)
+        && deferral_allowed(config, args, false, extra_inputs)
+    {
         adaptive_unit
             .as_ref()
-            .is_some_and(AdaptiveUnit::has_policy_state),
-    );
+            .and_then(AdaptiveUnit::try_deferred_seed)
+    } else {
+        None
+    };
+    let keys_first = deferred_seed.is_none()
+        && managed_unit_keys_first(
+            adaptive_unit.is_some(),
+            force_incremental,
+            adaptive_unit
+                .as_ref()
+                .is_some_and(AdaptiveUnit::has_policy_state),
+        );
     let keyed = match compute_rustc_cache_key(
         config,
         compiler,
@@ -4053,6 +4067,9 @@ fn run_parsed_rustc(
     ) {
         Ok(keyed) => keyed,
         Err(e) => {
+            if let Some(lease) = deferred_seed.take() {
+                let _ = lease.finish(CompileOutcome::Abnormal);
+            }
             // `{:#}` walks the cause chain; see `uncacheable_reason`.
             tracing::warn!("failed to compute cache key for {}: {:#}", crate_name, e);
             return passthrough_with_event(
@@ -4098,6 +4115,20 @@ fn run_parsed_rustc(
         event_root: &event_root,
     };
     if deferred {
+        if let Some(lease) = deferred_seed.take() {
+            // Private incremental output is never published. Peers cannot
+            // wait on this compile to record an artifact or closure.
+            drop(discovery_flight);
+            return adaptive_compile_before_key(
+                &compile_first,
+                lease,
+                key_outputs.tree_guard,
+                guard_inputs,
+                key_record,
+                key_ms,
+                key_hash_stats,
+            );
+        }
         // No record and nowhere else the entry could be: compile now, then
         // key from what rustc emitted. `discovery_flight` stays held across
         // the recursion so peers wait for this compile.
@@ -4111,6 +4142,9 @@ fn run_parsed_rustc(
             key_ms,
             key_hash_stats,
         );
+    }
+    if let Some(lease) = deferred_seed.take() {
+        let _ = lease.finish(CompileOutcome::Abnormal);
     }
     crate::out_dir_alias::register_after_key(key_outputs.bakes_out_dir);
     // A force-list request that could not obtain its immediate lease must not
@@ -6013,6 +6047,15 @@ fn stop_on_hit_key(
     dep_info: crate::cache_key::DepInfo,
     tree: Option<crate::cache_key::TreeGuard>,
 ) -> Result<ComputedKey> {
+    emitted_compile_key(ctx, dep_info, tree, &mut KeyEventRecord::default())
+}
+
+fn emitted_compile_key(
+    ctx: &CompileFirst<'_>,
+    dep_info: crate::cache_key::DepInfo,
+    tree: Option<crate::cache_key::TreeGuard>,
+    key_record: &mut KeyEventRecord,
+) -> Result<ComputedKey> {
     compute_rustc_cache_key(
         ctx.config,
         ctx.compiler,
@@ -6026,8 +6069,145 @@ fn stop_on_hit_key(
             ..ExtraInputsKey::default()
         },
         KeyDiscovery::Emitted(dep_info, tree),
-        &mut KeyEventRecord::default(),
+        key_record,
     )
+}
+
+/// Discover the exact key during a cold incremental compile. A local hit
+/// stops rustc before Cargo sees outputs; a qualifying miss activates only
+/// private state and never enters the artifact-store path.
+#[allow(clippy::too_many_arguments)]
+fn adaptive_compile_before_key(
+    ctx: &CompileFirst<'_>,
+    mut lease: Lease,
+    tree_guard: Option<crate::cache_key::TreeGuard>,
+    guard_inputs: Vec<crate::cache_key::ObservedFingerprint>,
+    mut key_record: KeyEventRecord,
+    mut key_ms: u64,
+    mut key_hash_stats: FileHashStats,
+) -> Result<i32> {
+    crate::out_dir_alias::register_before_compile();
+    let permit = scheduler::begin_keyless_compile(
+        &ctx.config.cache_dir,
+        ctx.config.scheduler,
+        ctx.crate_name,
+        ctx.args.invokes_linker(),
+        ctx.config.test_lease.as_deref(),
+    );
+    let compiler_args = lease.compiler_args(ctx.args);
+    let mut hit_closure = None;
+    let mut observed = None;
+    let mut lookup_ms = 0_u64;
+    let compile_start = std::time::Instant::now();
+    let mut on_dep_info = || {
+        let Some(dep_info) = emitted_dep_info(ctx.args) else {
+            return true;
+        };
+        let Ok(keyed) =
+            emitted_compile_key(ctx, dep_info.clone(), tree_guard.clone(), &mut key_record)
+        else {
+            return true;
+        };
+        let lookup_start = std::time::Instant::now();
+        let stored = ctx.store.get(&keyed.cache_key);
+        lookup_ms = lookup_ms.saturating_add(lookup_start.elapsed().as_millis() as u64);
+        (key_ms, key_hash_stats, _) = combine_key_measurements(
+            key_ms,
+            keyed.key_ms,
+            key_hash_stats,
+            keyed.key_hash_stats,
+            false,
+            false,
+        );
+        match stored {
+            Ok(Some(meta)) if cache_entry_has_files(&meta) => {
+                hit_closure = Some((dep_info, tree_guard.clone()));
+                false
+            }
+            Ok(_) => {
+                if let Some(fields) = &keyed.outputs.fields {
+                    let _ = lease.qualify_deferred_seed(&keyed.cache_key, fields);
+                    observed = Some((keyed.cache_key, fields.clone()));
+                }
+                true
+            }
+            Err(_) => true,
+        }
+    };
+    let executed = ctx.compiler.execute_preserving_incremental_until_dep_info(
+        ctx.args,
+        &compiler_args,
+        &mut on_dep_info,
+    );
+    if hit_closure.is_none() && executed.is_ok() {
+        permit.record_compile_rss(ctx.crate_name);
+    }
+    drop(permit);
+    if let Some((dep_info, tree)) = hit_closure {
+        let _ = lease.finish(CompileOutcome::Abnormal);
+        crate::cache_key::provide_dep_info(dep_info, tree);
+        return run_parsed_rustc(
+            ctx.config,
+            ctx.compiler,
+            ctx.args,
+            ctx.start,
+            ctx.invocation_start_ns,
+            ctx.extra_inputs,
+            ctx.extra_inputs_hash_stats,
+            ctx.extra_inputs_too_new,
+            ctx.extra_inputs_key_ms,
+            guard_inputs,
+            Some(ctx.build_script_inputs),
+            None,
+        );
+    }
+    let result = match executed {
+        Ok(result) => result,
+        Err(error) => {
+            let _ = lease.finish(CompileOutcome::Abnormal);
+            return passthrough_with_event(
+                ctx.config,
+                ctx.args,
+                ctx.crate_name,
+                ctx.event_root,
+                ctx.start,
+                format!("adaptive compiler spawn failed: {error}"),
+                key_record,
+            );
+        }
+    };
+    let compile_time_ms = compile_start.elapsed().as_millis() as u64;
+    replay_diagnostics(
+        &result.stdout,
+        result.pending_stderr(),
+        std::io::stdout(),
+        std::io::stderr(),
+    );
+    after_rustc_exit(result.exit_code, &result.stderr, &ctx.args.externs);
+    let outcome = compile_outcome(result.exit_code, result.signaled, &result.stderr);
+    let _ = lease.finish(outcome);
+    let cache_key = observed.as_ref().map_or("", |(key, _)| key.as_str());
+    log_event(
+        ctx.config,
+        EventInputs::new(
+            ctx.event_root,
+            ctx.crate_name,
+            EventResult::Passthrough,
+            ctx.start.elapsed().as_millis() as u64,
+        )
+        .rebuilt(
+            result.exit_code == 0,
+            &result.artifacts,
+            ctx.key_env.var("CARGO_PKG_NAME"),
+        )
+        .compile_time_ms(compile_time_ms)
+        .keyed(cache_key, key_ms, key_hash_stats)
+        .lookup_ms(lookup_ms)
+        .passthrough_reason("adaptive seed".to_owned())
+        .exit_code(result.exit_code)
+        .key_record(key_record),
+    );
+    Ok(result.exit_code)
 }
 
 /// Compile before the key is known, then key from the dep-info the compile

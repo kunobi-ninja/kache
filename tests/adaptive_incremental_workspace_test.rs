@@ -438,14 +438,9 @@ fn assert_unstored_after_a_save(event: &Value) {
     assert_eq!(event["skip_reason"], "inputs-changed", "event: {event:#}");
 }
 
-/// A library with policy state keys first so that a miss can seed. When no
-/// seed can start, it compiles before keying again: a save that lands after
-/// its first key leaves the result unstored, so reverting the save cannot
-/// restore what rustc built from the saved source.
-///
-/// In the second build the flag changes the key outside the sources, so no
-/// seed can start, and the README edit leaves no record that applies, so the
-/// key comes from the pre-pass.
+/// A learning library starts cold when its workspace guard changes. A changed
+/// environment prevents seed qualification, and a save during that compile
+/// must leave no stored artifact or reusable private state.
 #[cfg(unix)]
 #[test]
 fn a_save_while_a_library_with_policy_state_compiles_is_not_stored() {
@@ -468,7 +463,9 @@ fn a_save_while_a_library_with_policy_state_compiles_is_not_stored() {
     fs::write(fixture.project.join("README.md"), "race, edited\n").unwrap();
     let (printed, lib_event) = build("b", Some(&lib(2)));
     assert_eq!(printed, "2", "rustc read the saved source");
-    assert_unstored_after_a_save(&lib_event);
+    assert_passthrough(&lib_event, "adaptive seed");
+    assert_eq!(lib_event["compiler_runs"], 1, "event: {lib_event:#}");
+    assert_eq!(lib_event["dep_info_runs"], 0, "event: {lib_event:#}");
 
     fs::write(fixture.project.join("lib/src/lib.rs"), lib(1)).unwrap();
     let (printed, lib_event) = build("b", None);
@@ -690,11 +687,11 @@ fn a_seed_releases_the_discovery_flight_before_it_compiles() {
     assert_eq!(lib["dep_info_runs"], 0, "event: {lib:#}");
     assert_eq!(held, "1", "a compile before the key holds the flight");
 
-    // The edit voids the record, so the key comes from the pre-pass under
-    // the flight, and then the library seeds.
+    // The edit voids the record. The seed releases the flight, then derives
+    // its key from the compile's emitted dep-info.
     let (lib, held) = build(Some(future), 2, &[]);
     assert_passthrough(&lib, "adaptive seed");
-    assert_eq!(lib["dep_info_runs"], 1, "event: {lib:#}");
+    assert_eq!(lib["dep_info_runs"], 0, "event: {lib:#}");
     assert_eq!(held, "0", "the seed released the flight");
 
     // With no lane to seed and no compile before the key, the library

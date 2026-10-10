@@ -843,7 +843,11 @@ mod tests {
                 assert_eq!(state(&path, &walk).unwrap(), "unreadable", "{why}");
             }
             assert_ne!(state(&root, &walk).unwrap(), readable);
-            for path in [root.join("locked"), root.join("sealed.txt")] {
+            for path in [
+                root.join("locked"),
+                root.join("locked/inner.txt"),
+                root.join("sealed.txt"),
+            ] {
                 assert!(
                     state(&path, &run_cache).is_err(),
                     "the run cache refuses {}",

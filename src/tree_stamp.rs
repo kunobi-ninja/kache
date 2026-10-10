@@ -400,6 +400,28 @@ mod tests {
         assert!(tree_stamp(&dir.path().join("missing"), &[], 2).is_none());
     }
 
+    /// Each root's label goes into the stamp, so entries that move from one
+    /// root to the next change it even with every entry as it was.
+    #[test]
+    fn a_stamp_tells_which_root_an_entry_is_under() {
+        let dir = tempfile::tempdir().unwrap();
+        let (full, empty) = (dir.path().join("full"), dir.path().join("empty"));
+        write(&full.join("a"), "a");
+        std::fs::create_dir(&empty).unwrap();
+        let stamp = |first: &Path, second: &Path| {
+            let mut stamper = Stamper::new();
+            let mut left = 10;
+            for (label, root) in [("first", first), ("second", second)] {
+                stamper.label(label.as_bytes());
+                let outcome = stamper.walk(root, &[], StampRules::default(), &mut left);
+                assert_eq!(outcome, WalkOutcome::Fits);
+            }
+            stamper.finish().digest
+        };
+        assert_eq!(stamp(&full, &empty), stamp(&full, &empty));
+        assert_ne!(stamp(&full, &empty), stamp(&empty, &full));
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_symlink_is_stamped_by_its_text_or_refuses_the_tree() {

@@ -12667,6 +12667,24 @@ fn what_the_tree_guard_cannot_read_counts_as_unreadable() {
     assert_eq!(digest(), Some(readable));
 }
 
+/// Below the root, a directory the fold cannot list counts as unreadable.
+/// A root it cannot list gives no digest: nothing of the tree was read. The
+/// stamp walk refuses such a root first, so the fold meets one only when
+/// the root goes away between the two.
+#[test]
+fn a_root_the_tree_fold_cannot_list_gives_no_digest() {
+    let dir = tempfile::tempdir().unwrap();
+    let gone = dir.path().join("gone");
+    let hasher = FileHasher::new();
+    let fold = |root: &Path| {
+        let mut budget = 10;
+        let mut digest = blake3::Hasher::new();
+        crate_tree_fold(root, &gone, &[], false, &hasher, &mut digest, &mut budget)
+    };
+    assert_eq!(fold(dir.path()), Some(true), "a directory below the root");
+    assert_eq!(fold(&gone), None, "the root");
+}
+
 /// A digest is memoised only while the tree still has the stamp it had
 /// before its files were read. A name that came and went directly under the
 /// root meanwhile leaves every entry as it was, and moves the root's times.

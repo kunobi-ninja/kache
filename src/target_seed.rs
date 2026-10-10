@@ -1770,6 +1770,16 @@ source = "git+https://example.com/gitdep#abc"
         }
     }
 
+    /// Only a drive letter, a letter followed by `:`, matches in either
+    /// case. A path that starts with any other letter matches as spelled.
+    #[test]
+    fn only_a_drive_letter_matches_in_either_case() {
+        assert!(contains_path(b"at c:/ws-a/x", "C:/ws-a"));
+        assert!(!contains_path(b"at C:/WS-A/x", "C:/ws-a"));
+        assert!(contains_path(b"at ws-a/x", "ws-a"));
+        assert!(!contains_path(b"at Ws-a/x", "ws-a"));
+    }
+
     /// A reader of `data`, at most `step` bytes a read, that returns nothing
     /// before `until`.
     struct Reads<'a> {

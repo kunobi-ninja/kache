@@ -7554,6 +7554,57 @@ fn a_read_set_with_an_assembler_include_is_not_keyable() {
     );
 }
 
+/// A captured read set that hides a file from the assembler is not keyed,
+/// and the debug log names the construct that hides it.
+#[test]
+fn a_captured_read_set_that_hides_an_assembler_input_names_the_construct() {
+    struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Capture {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("unit.c");
+    let header = dir.path().join("embed.h");
+    std::fs::write(&source, "#include \"embed.h\"\n").unwrap();
+    std::fs::write(&header, "__asm__(\".incbin \\\"blob.bin\\\"\");\n").unwrap();
+    let depfile = dir.path().join("unit.d");
+    let make = |path: &Path| path.to_string_lossy().replace(' ', "\\ ");
+    std::fs::write(
+        &depfile,
+        format!("unit.o: {} {}\n", make(&source), make(&header)),
+    )
+    .unwrap();
+    let source = source.to_string_lossy().into_owned();
+    let parsed = CcArgs::parse(&s(&["cc", "-c", &source])).unwrap();
+    let file_hasher = crate::cache_key::FileHasher::new();
+    let output = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let writer = std::sync::Arc::clone(&output);
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .without_time()
+        .with_ansi(false)
+        .with_writer(move || Capture(std::sync::Arc::clone(&writer)))
+        .finish();
+    let inputs = tracing::subscriber::with_default(subscriber, || {
+        CcCompiler::new().captured_inputs(&parsed, &depfile, &file_hasher)
+    });
+    assert!(inputs.is_none());
+    let log = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+    assert!(
+        log.contains(
+            "unit.c not keyed from its read set: \
+             the assembler may read a file the key cannot see (`.incbin`)"
+        ),
+        "{log}"
+    );
+}
+
 /// Two build directories spell `OUT_DIR` differently; after the map they
 /// agree on the generated-header include, so their read-set memos meet.
 #[test]

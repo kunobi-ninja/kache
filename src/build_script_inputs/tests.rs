@@ -776,6 +776,39 @@ fn a_declared_directory_keeps_rust_sources_but_not_vcs_or_target_directories() {
     );
 }
 
+/// A declared directory that holds the target directory or the cache leaves
+/// both out, tag or no tag: the build writes to them while units compile.
+#[test]
+fn a_declared_directory_leaves_out_the_target_directory_and_the_cache() {
+    let fixture = Fixture::new();
+    fixture.declare(&format!(
+        "cargo:rerun-if-changed={}\n",
+        fixture.root.display()
+    ));
+    let base = fixture.digest(&[]);
+    for dir in [fixture.root.join("target/debug"), fixture.cache.clone()] {
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("new.txt"), "new").unwrap();
+    }
+    assert_eq!(fixture.digest(&[]), base);
+    fixture.write("data.txt", "d");
+    assert_ne!(fixture.digest(&[]), base, "the rest of it counts");
+}
+
+/// A socket in a declared directory counts as a special file, so the unit
+/// is still keyed and adding one changes the digest.
+#[cfg(unix)]
+#[test]
+fn a_socket_in_a_declared_directory_counts_as_a_special_file() {
+    let fixture = Fixture::new();
+    fixture.write("assets/a.txt", "a");
+    fixture.declare("cargo:rerun-if-changed=assets\n");
+    let base = fixture.digest(&[]);
+    let _socket =
+        std::os::unix::net::UnixListener::bind(fixture.package.join("assets/sock")).unwrap();
+    assert_ne!(fixture.digest(&[]), base);
+}
+
 #[test]
 fn paths_in_the_cargo_home_sources_are_immutable() {
     let fixture = Fixture::new();
@@ -843,6 +876,34 @@ fn declared_paths_past_the_budget_fail_but_a_large_package_degrades() {
     assert!(matches!(fixture.resolve(&[], 4), Ok(Resolved::Folded(_))));
 }
 
+/// `run`'s result, with the number of files the key's hasher read for it.
+fn counting_reads<T>(run: impl FnOnce() -> T) -> (T, usize) {
+    let reads = std::rc::Rc::new(std::cell::Cell::new(0));
+    let counted = reads.clone();
+    crate::cache_key::set_before_read(Some(Box::new(move |_| counted.set(counted.get() + 1))));
+    let result = run();
+    crate::cache_key::set_before_read(None);
+    (result, reads.get())
+}
+
+/// Declared paths past the budget are refused on their stamp walk, before
+/// any file in them is read.
+#[test]
+fn declared_paths_past_the_budget_are_refused_before_a_file_is_read() {
+    let fixture = Fixture::new();
+    for index in 0..5 {
+        fixture.write(&format!("assets/{index}.txt"), "x");
+    }
+    fixture.declare("cargo:rerun-if-changed=assets\n");
+    let (refused, read) = counting_reads(|| fixture.resolve(&[], 3));
+    let error = refused.unwrap_err();
+    assert!(error.downcast_ref::<TooManyInputs>().is_some(), "{error:#}");
+    assert_eq!(read, 0);
+    let (folded, read) = counting_reads(|| fixture.resolve(&[], 100));
+    assert!(matches!(folded, Ok(Resolved::Folded(_))));
+    assert_eq!(read, 5, "within the budget, every file is read");
+}
+
 #[test]
 fn a_run_without_a_recorded_stdout_folds_nothing() {
     let fixture = Fixture::new();
@@ -857,6 +918,19 @@ fn an_oversized_record_is_refused() {
     assert!(fixture.resolve(&[], 100).is_err());
     stdout.set_len(MAX_STDOUT_BYTES).unwrap();
     assert!(fixture.resolve(&[], 100).is_ok());
+}
+
+/// Only a record that is not there means a run without one. One that cannot
+/// be stat'ed, here because its directory is a file, is refused.
+#[cfg(unix)]
+#[test]
+fn only_a_missing_record_means_a_run_without_one() {
+    let fixture = Fixture::new();
+    let unit = fixture.out_dir.parent().unwrap();
+    std::fs::remove_dir_all(unit).unwrap();
+    std::fs::write(unit, "").unwrap();
+    assert!(fixture.resolve(&[], 100).is_err());
+    assert!(declares_inputs(&fixture.located()));
 }
 
 #[test]
@@ -1037,6 +1111,52 @@ fn only_the_top_of_each_walk_reports_its_tree() {
         .map(|(path, _)| path)
         .collect();
     assert_eq!(trees, [fixture.package.join("assets")]);
+}
+
+/// The digest of a settled declared directory is memoised in the cache
+/// directory the resolver names, and the next resolve reads no file.
+#[test]
+fn a_settled_declared_directory_is_memoised_in_the_cache_directory() {
+    let fixture = Fixture::new();
+    let file = fixture.write("assets/a.txt", "a");
+    let old = filetime::FileTime::from_unix_time(1_000_000_000, 0);
+    filetime::set_file_mtime(&file, old).unwrap();
+    fixture.declare("cargo:rerun-if-changed=assets\n");
+    let (base, read) = counting_reads(|| fixture.digest(&[]));
+    assert_eq!(read, 1);
+    let memos: Vec<OsString> = std::fs::read_dir(fixture.cache.join("probes"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .filter(|name| name.to_string_lossy().starts_with("tree-"))
+        .collect();
+    assert_eq!(memos.len(), 1, "{memos:?}");
+    assert_eq!(counting_reads(|| fixture.digest(&[])), (base, 0));
+}
+
+/// The package digest leaves out what a declared directory keeps, here an
+/// empty directory, so the two are memoised apart even when the package is
+/// declared too and both walks give it one stamp.
+#[test]
+fn the_package_and_a_declared_directory_are_memoised_apart() {
+    let fixture = Fixture::new();
+    // With no Rust source left, both walks stamp the same entries.
+    std::fs::remove_file(fixture.package.join("src/lib.rs")).unwrap();
+    fixture.declare(&format!(
+        "cargo:rerun-if-changed=\ncargo:rerun-if-changed={}\n",
+        fixture.package.display()
+    ));
+    let written = |time: std::time::SystemTime| {
+        for entry in ["Cargo.toml", "src"] {
+            let time = filetime::FileTime::from_system_time(time);
+            filetime::set_file_mtime(fixture.package.join(entry), time).unwrap();
+        }
+    };
+    // Written ahead of the clock, the tree has not settled: no memo.
+    written(std::time::SystemTime::now() + std::time::Duration::from_secs(3600));
+    let unsettled = fixture.digest(&[]);
+    written(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000));
+    assert_eq!(fixture.digest(&[]), unsettled, "memoised");
+    assert_eq!(fixture.digest(&[]), unsettled, "read from the memos");
 }
 
 #[test]

@@ -517,6 +517,64 @@ fn store_unavailable_warning_dedups_within_session() {
     let _ = std::fs::remove_file(&marker);
 }
 
+/// A package keyed without its files says so once a session, in the log,
+/// with the package and the reason.
+#[test]
+fn a_package_keyed_without_its_files_is_reported_once_a_session() {
+    struct Capture(Arc<std::sync::Mutex<Vec<u8>>>);
+    impl Write for Capture {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path().join("cache"));
+    let profile = dir.path().join("target/debug");
+    let out_dir = profile.join("build/app-0123456789abcdef/out");
+    let manifest_dir = dir.path().join("app");
+    let var = |name: &str| match name {
+        "OUT_DIR" => Some(out_dir.clone().into_os_string()),
+        "CARGO_MANIFEST_DIR" => Some(manifest_dir.clone().into_os_string()),
+        "CARGO_PKG_NAME" => Some(OsString::from("app")),
+        _ => None,
+    };
+    let deps = profile.join("deps").to_string_lossy().into_owned();
+    let args = rustc_args(&["rustc", "--out-dir", &deps, "src/lib.rs"]);
+    let located = crate::build_script_inputs::locate(&args, &var, None, false)
+        .expect("the package's own run");
+    let package = blake3::hash(located.manifest_dir.as_os_str().as_encoded_bytes()).to_hex();
+    let marker = warn_marker_path(
+        &format!("build-script-package-{}", &package[..16]),
+        &config.cache_dir,
+    );
+    let output = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let writer = Arc::clone(&output);
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_writer(move || Capture(Arc::clone(&writer)))
+        .finish();
+    tracing::subscriber::with_default(subscriber, || {
+        for _ in 0..2 {
+            warn_build_script_package_unkeyed(&config, &located, "it holds too many entries");
+        }
+    });
+    let marked = marker_is_fresh(&marker, 300);
+    let _ = std::fs::remove_file(&marker);
+    let log = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+    assert_eq!(
+        log.matches("app: its build script declares no inputs and it holds too many entries")
+            .count(),
+        1,
+        "{log}"
+    );
+    assert!(marked);
+}
+
 #[test]
 #[cfg(unix)]
 fn maybe_trigger_prefetch_refuses_symlinked_build_session() {

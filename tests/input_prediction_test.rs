@@ -43,16 +43,31 @@ fn toml_path(path: &Path) -> String {
 /// Hermetic config for exactly one flag setting. The flag travels in the
 /// file because `ignore_env` neutralizes `KACHE_*` overrides by design.
 fn write_test_config(cache_dir: &Path, predictions: bool) -> PathBuf {
+    write_test_config_with(cache_dir, cache_dir, None, predictions)
+}
+
+/// [`write_test_config`] with Kache's runtime directory at `runtime_dir`
+/// and, with `shard`, a `[cache.volumes]` store for the outputs below a root.
+fn write_test_config_with(
+    cache_dir: &Path,
+    runtime_dir: &Path,
+    shard: Option<(&Path, &Path)>,
+    predictions: bool,
+) -> PathBuf {
     let config_path = isolated_config_path(cache_dir);
-    std::fs::write(
-        &config_path,
-        format!(
-            "[cache]\nlocal_only = true\nignore_env = true\ninput_predictions = {predictions}\nlocal_store = {}\nruntime_dir = {}\n",
-            toml_path(cache_dir),
-            toml_path(cache_dir)
-        ),
-    )
-    .unwrap();
+    let mut config = format!(
+        "[cache]\nlocal_only = true\nignore_env = true\ninput_predictions = {predictions}\nlocal_store = {}\nruntime_dir = {}\n",
+        toml_path(cache_dir),
+        toml_path(runtime_dir)
+    );
+    if let Some((root, store)) = shard {
+        config.push_str(&format!(
+            "[cache.volumes]\n{} = {}\n",
+            toml_path(root),
+            toml_path(store)
+        ));
+    }
+    std::fs::write(&config_path, config).unwrap();
     config_path
 }
 fn run_kache_rustc_predict(
@@ -1044,6 +1059,10 @@ struct WorkspaceUnit {
     external_targets: bool,
     /// Set for every build and report, after the rest.
     env: Vec<(&'static str, std::ffi::OsString)>,
+    /// Kache's runtime directory, when it is not the cache directory.
+    runtime: Option<PathBuf>,
+    /// A `[cache.volumes]` store for each target, apart from the cache.
+    shard: Option<PathBuf>,
 }
 
 impl WorkspaceUnit {
@@ -1067,6 +1086,8 @@ impl WorkspaceUnit {
             facade: Vec::new(),
             external_targets: false,
             env: Vec::new(),
+            runtime: None,
+            shard: None,
         }
     }
 
@@ -1214,7 +1235,12 @@ impl WorkspaceUnit {
             args.push(format!("facade={}", deps.join("libfacade.rlib").display()));
         }
         args.extend(extra.iter().map(|arg| arg.to_string()));
-        let config_path = write_test_config(&self.cache, predictions);
+        let config_path = write_test_config_with(
+            &self.cache,
+            self.runtime.as_deref().unwrap_or(&self.cache),
+            self.shard.as_deref().map(|shard| (target, shard)),
+            predictions,
+        );
         settle_writes(&[checkout, target]);
         let mut command = std::process::Command::new(kache_binary());
         command
@@ -1380,6 +1406,38 @@ fn a_cache_inside_the_workspace_keeps_the_record_guarded() {
     unit.cache = a.join(".cache/kache");
     std::fs::create_dir_all(&unit.cache).unwrap();
     assert_eq!(unit.build(&a, true, None).result, "miss");
+    let warm = unit.build(&a, true, None);
+    assert_eq!(warm.result, "local_hit");
+    assert_eq!(warm.dep_info_runs, 0, "the record kept its guard");
+}
+
+/// Kache's cache, its runtime directory and the store a volume routes the
+/// targets to, each inside the workspace and apart from the others. A build
+/// writes to all three while units compile, and the workspace guard leaves
+/// each of them out on its own.
+#[test]
+fn kaches_own_directories_apart_inside_the_workspace_keep_the_record_guarded() {
+    build_kache();
+    let mut unit = WorkspaceUnit::new(false);
+    let a = unit.checkout("a");
+    let own = a.join(".cache");
+    unit.cache = own.join("kache");
+    let runtime = own.join("runtime");
+    let shard = own.join("shard");
+    for dir in [&unit.cache, &runtime, &shard] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    unit.runtime = Some(runtime.clone());
+    unit.shard = Some(shard.clone());
+    assert_eq!(unit.build(&a, true, None).result, "miss");
+    assert!(
+        shard.join("index.db").is_file(),
+        "the shard holds the store"
+    );
+    // What another build writes to each meanwhile.
+    for dir in [&unit.cache, &runtime, &shard] {
+        std::fs::write(dir.join("written-by-another-build"), "x").unwrap();
+    }
     let warm = unit.build(&a, true, None);
     assert_eq!(warm.result, "local_hit");
     assert_eq!(warm.dep_info_runs, 0, "the record kept its guard");

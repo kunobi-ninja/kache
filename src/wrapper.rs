@@ -229,6 +229,14 @@ fn reentered_after_deferred_compile(precompiled: bool, emitted_closure_waiting: 
     precompiled || emitted_closure_waiting
 }
 
+/// Whether an adaptive compile takes a slot in the scheduler's pool. A seed
+/// runs after a local and a remote miss, often as a full compile, so it waits
+/// for a slot like any other miss. The active and immediate lanes run before
+/// any key work, as passthroughs do.
+fn adaptive_lane_takes_permit(kind: crate::incremental_policy::LeaseKind) -> bool {
+    kind == crate::incremental_policy::LeaseKind::Seed
+}
+
 /// Whether this unit is refused caching outright: the compiler's own refusal
 /// list, or a codegen backend dylib kache will not replay. Either one also
 /// keeps the unit off the managed-incremental fast path.
@@ -7555,6 +7563,15 @@ fn adaptive_incremental_with_event<R: Into<String>>(
     let reason = reason.into();
     let kind = lease.kind();
     let compiler_args = lease.compiler_args(args);
+    let permit = adaptive_lane_takes_permit(kind).then(|| {
+        scheduler::begin_keyless_compile(
+            &config.cache_dir,
+            config.scheduler,
+            crate_name,
+            args.invokes_linker(),
+            config.test_lease.as_deref(),
+        )
+    });
     let compile_start = std::time::Instant::now();
     let compiler = RustcCompiler::new().with_base_dirs(config.base_dirs.clone());
     let rebuilt_package = KeyEnv::capture().var("CARGO_PKG_NAME");
@@ -7563,6 +7580,10 @@ fn adaptive_incremental_with_event<R: Into<String>>(
     } else {
         compiler.execute_preserving_incremental(args, &compiler_args)
     };
+    if let (Some(permit), Ok(_)) = (&permit, &compile) {
+        permit.record_compile_rss(crate_name);
+    }
+    drop(permit);
     let result = match compile {
         Ok(result) => result,
         Err(error) => {

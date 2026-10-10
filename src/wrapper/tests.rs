@@ -5332,6 +5332,100 @@ printf 'state' > "$incremental/state.bin"
     assert!(unit.try_active().is_none());
 }
 
+/// A seed runs after both lookups missed, so it takes a scheduler slot and
+/// records the crate's weight like any miss. The immediate and active lanes
+/// run before any key work and take no slot.
+#[cfg(unix)]
+#[test]
+fn only_an_adaptive_seed_takes_a_scheduler_slot() {
+    use crate::incremental_policy::LeaseKind;
+    assert!(adaptive_lane_takes_permit(LeaseKind::Seed));
+    assert!(!adaptive_lane_takes_permit(LeaseKind::Active));
+    assert!(!adaptive_lane_takes_permit(LeaseKind::Immediate));
+
+    let dir = tempfile::tempdir().unwrap();
+    let deps = dir.path().join("target/debug/deps");
+    let incremental = dir.path().join("target/debug/incremental");
+    std::fs::create_dir_all(&deps).unwrap();
+    std::fs::create_dir(&incremental).unwrap();
+    let source = dir.path().join("lib.rs");
+    let rustc = dir.path().join("rustc");
+    std::fs::write(&source, "pub fn answer() -> u8 { 42 }\n").unwrap();
+    kache_fs::testutil::write_executable(
+        &rustc,
+        r#"#!/bin/sh
+for arg in "$@"; do
+    case "$arg" in
+        -Cincremental=*) printf 'state' > "${arg#-Cincremental=}/state.bin" ;;
+    esac
+done
+"#,
+    );
+    let mut args = RustcArgs::parse(&[
+        rustc.display().to_string(),
+        "--crate-name".to_string(),
+        "adaptive_fixture".to_string(),
+        "--crate-type".to_string(),
+        "lib".to_string(),
+        source.display().to_string(),
+        "--out-dir".to_string(),
+        deps.display().to_string(),
+        "--emit=metadata".to_string(),
+        "-Cextra-filename=-1234abcd".to_string(),
+        format!("-Cincremental={}", incremental.display()),
+    ])
+    .unwrap();
+    args.is_primary = true;
+    let config = test_config(dir.path().join("cache"));
+    assert!(config.scheduler);
+    let unit = AdaptiveUnit::eligible(&args, &adaptive_policy_guard(&config)).unwrap();
+    let root = dir.path().display().to_string();
+    let compile = |lease: Lease| {
+        adaptive_incremental_with_event(
+            &config,
+            &args,
+            "adaptive_fixture",
+            &root,
+            std::time::Instant::now(),
+            lease,
+            "adaptive",
+            None,
+            KeyEventRecord::default(),
+        )
+        .unwrap()
+    };
+    let weights = crate::scheduler::scheduler_root(&config.cache_dir).join("weights");
+    let recorded_weights = || {
+        std::fs::read_dir(&weights)
+            .map(|entries| entries.count())
+            .unwrap_or(0)
+    };
+    let key = |label: &str| blake3::hash(label.as_bytes()).to_hex().to_string();
+    let fields = |sources: &str| {
+        std::collections::BTreeMap::from(
+            [
+                ("args", "stable"),
+                ("compiler", "compiler"),
+                ("externs", "extern-a"),
+                ("sources", sources),
+            ]
+            .map(|(name, value)| (name.to_string(), value.to_string())),
+        )
+    };
+
+    assert_eq!(compile(unit.try_immediate().unwrap()), 0);
+    assert_eq!(recorded_weights(), 0, "the immediate lane took a slot");
+
+    assert!(unit.observe_build(&key("first"), &fields("source-a")));
+    let seed = unit.try_seed(&key("second"), &fields("source-b")).unwrap();
+    assert_eq!(compile(seed), 0);
+    assert_eq!(recorded_weights(), 1, "the seed took no slot");
+
+    std::fs::remove_dir_all(&weights).unwrap();
+    assert_eq!(compile(unit.try_active().unwrap()), 0);
+    assert_eq!(recorded_weights(), 0, "the active lane took a slot");
+}
+
 #[test]
 fn clean_path_collapses_dot_and_dotdot() {
     assert_eq!(clean_path(Path::new("a/./b")), PathBuf::from("a/b"));

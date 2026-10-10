@@ -267,11 +267,14 @@ impl Stamper {
     }
 }
 
-/// What [`std::fs::symlink_metadata`] gives for `child`, the path of
-/// `entry`. On Unix the name is stat'ed in the directory that listed it
-/// (`fstatat`), without resolving the whole path again: walks of one tree
-/// in parallel builds otherwise queue on those lookups. Windows answers it
-/// from the listing, which can lag behind a file being written.
+/// The metadata of `entry`, whose path is `child`, not following a link. On
+/// Unix std stats the name in the directory that listed it where it can
+/// (Linux with glibc, macOS), since parallel walks of one tree queue on
+/// whole-path lookups. A directory renamed or replaced after it was listed
+/// then gives the old one's entries, as a path stat does when the swap lands
+/// just after it; the walks that check a memo or a guard list it by path
+/// again. Windows answers it from the listing, which can lag behind a file
+/// being written.
 fn entry_metadata(entry: &std::fs::DirEntry, child: &Path) -> std::io::Result<std::fs::Metadata> {
     if cfg!(unix) {
         entry.metadata()

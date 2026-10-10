@@ -154,12 +154,7 @@ pub fn install_shim(args: &RustcArgs) {
         return;
     };
     if let Err(error) = install(&executable) {
-        // The script then runs without kache: uncached, and with no event, so
-        // nothing else says it happened.
-        tracing::warn!(
-            "build-script launcher not installed for {}: {error:#}",
-            executable.display()
-        );
+        log_bypass(&error.context("installing the build-script launcher"));
     }
 }
 
@@ -250,7 +245,11 @@ fn relative_to_ancestor(directory: &Path, ancestor: &Path) -> Option<String> {
 fn pin_kache(kache: &Path, profile: &Path) -> Result<PathBuf> {
     use std::os::unix::fs::PermissionsExt;
 
-    let metadata = std::fs::metadata(kache)?;
+    // macOS current_exe can name a relative symlink. Hard-link its target.
+    let kache = kache
+        .canonicalize()
+        .context("resolving the kache executable")?;
+    let metadata = std::fs::metadata(&kache)?;
     let modified = metadata
         .modified()
         .ok()
@@ -264,22 +263,18 @@ fn pin_kache(kache: &Path, profile: &Path) -> Result<PathBuf> {
         .join(SHIM_DIR)
         .join(&identity.finalize().to_hex()[..32]);
     let pinned = directory.join("kache");
-    if pinned.is_file() {
+    if std::fs::symlink_metadata(&pinned).is_ok_and(|metadata| metadata.is_file()) {
         return Ok(pinned);
     }
     std::fs::create_dir_all(&directory)?;
-    if std::fs::hard_link(kache, &pinned).is_ok() {
-        return Ok(pinned);
+    let temporary = tempfile::TempDir::new_in(&directory)?;
+    let staged = temporary.path().join("kache");
+    if std::fs::hard_link(&kache, &staged).is_err() {
+        std::fs::copy(&kache, &staged)?;
+        std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755))?;
     }
-    let temporary = tempfile::NamedTempFile::new_in(&directory)?;
-    std::fs::copy(kache, temporary.path())?;
-    std::fs::set_permissions(temporary.path(), std::fs::Permissions::from_mode(0o755))?;
-    match temporary.persist_noclobber(&pinned) {
-        Ok(_) => {}
-        // A concurrent installer won the race with identical bytes.
-        Err(error) if pinned.is_file() => drop(error),
-        Err(error) => return Err(error.error.into()),
-    }
+    // Replace old symlink pins atomically. Concurrent installers pin the same bytes.
+    std::fs::rename(&staged, &pinned)?;
     Ok(pinned)
 }
 
@@ -3175,6 +3170,72 @@ mod tests {
             0o644
         );
         assert!(set_executable(&dir.path().join("absent"), true).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pinned_kache_resolves_a_relative_executable_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let cell = dir.path().join("Cellar/kache/1/bin");
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&cell).unwrap();
+        std::fs::create_dir(&bin).unwrap();
+        let executable = cell.join("kache");
+        kache_fs::testutil::write_executable(&executable, "#!/bin/sh\necho pinned\n");
+        let symlink = bin.join("kache");
+        std::os::unix::fs::symlink("../Cellar/kache/1/bin/kache", &symlink).unwrap();
+        let profile = dir.path().join("target/debug");
+        let pinned = pin_kache(&symlink, &profile).unwrap();
+        assert!(std::fs::symlink_metadata(&pinned).unwrap().is_file());
+        let output = Command::new(&pinned).output().unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"pinned\n");
+        assert_eq!(pin_kache(&executable, &profile).unwrap(), pinned);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pinned_kache_replaces_live_and_dangling_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let executable = dir.path().join("kache");
+        kache_fs::testutil::write_executable(&executable, "#!/bin/sh\necho pinned\n");
+        let profile = dir.path().join("target/debug");
+        let pinned = pin_kache(&executable, &profile).unwrap();
+        for target in [&dir.path().join("missing"), &executable] {
+            std::fs::remove_file(&pinned).unwrap();
+            std::os::unix::fs::symlink(target, &pinned).unwrap();
+            assert_eq!(pin_kache(&executable, &profile).unwrap(), pinned);
+            assert!(std::fs::symlink_metadata(&pinned).unwrap().is_file());
+            let output = Command::new(&pinned).output().unwrap();
+            assert!(output.status.success());
+            assert_eq!(output.stdout, b"pinned\n");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pinned_kache_copies_an_executable_from_another_filesystem() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let Ok(source) = tempfile::tempdir_in("/dev/shm") else {
+            return;
+        };
+        let target = tempfile::tempdir().unwrap();
+        if std::fs::metadata(source.path()).unwrap().dev()
+            == std::fs::metadata(target.path()).unwrap().dev()
+        {
+            return;
+        }
+        let executable = source.path().join("kache");
+        std::fs::write(&executable, "#!/bin/sh\necho pinned\n").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let pinned = pin_kache(&executable, &target.path().join("debug")).unwrap();
+        let metadata = std::fs::symlink_metadata(&pinned).unwrap();
+        assert!(metadata.is_file());
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o755);
+        let output = Command::new(&pinned).output().unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"pinned\n");
     }
 
     #[cfg(unix)]

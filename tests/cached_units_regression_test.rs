@@ -1374,6 +1374,131 @@ fn rlib_bundling_unkeyed_archive_is_not_stored() {
     assert_eq!(printed, "bundled value 2", "{rebuilt:?}");
 }
 
+fn write_overlapping_native_archive(native: &Path, name: &str, value: u32) {
+    let source_dir = native.join(name);
+    std::fs::create_dir_all(&source_dir).unwrap();
+    let source = source_dir.join("util.c");
+    let object = source_dir.join("util.o");
+    std::fs::write(
+        &source,
+        format!("unsigned {name}_value(void) {{ return {value}; }}\n"),
+    )
+    .unwrap();
+    run(Command::new("cc")
+        .args(["-c", "-o"])
+        .arg(&object)
+        .arg(&source));
+    run(Command::new("ar")
+        .arg("crs")
+        .arg(native.join(format!("lib{name}.a")))
+        .arg(&object));
+}
+
+fn repeated_link_specs_cannot_hide_an_unkeyed_archive(specs: &[&str]) {
+    let fx = fixture_from(|_| {});
+    let native = fx.workspace.join("native");
+    write_overlapping_native_archive(&native, "foo", 10);
+    write_overlapping_native_archive(&native, "bar", 1);
+    let source = fx.workspace.join("lib.rs");
+    std::fs::write(
+        &source,
+        "#[link(name = \"bar\", kind = \"static\")]\nextern \"C\" {\n\
+         fn bar_value() -> u32;\nfn foo_value() -> u32;\n}\n\
+         pub fn value() -> u32 { unsafe { foo_value() + bar_value() } }\n",
+    )
+    .unwrap();
+    let app_source = fx.workspace.join("app.rs");
+    std::fs::write(
+        &app_source,
+        "fn main() { println!(\"{}\", overlap::value()); }\n",
+    )
+    .unwrap();
+    let config = write_config(&fx.cache);
+    let text = std::fs::read_to_string(&config).unwrap();
+    std::fs::write(
+        &config,
+        text.replace("scheduler = true", "scheduler = false"),
+    )
+    .unwrap();
+
+    let build = |name: &str| {
+        let target = target(&fx, name);
+        std::fs::create_dir_all(&target).unwrap();
+        let mark = event_count(&fx.cache);
+        let mut compile = hermetic_command(kache_binary(), &fx.cache, Some(&config));
+        compile
+            .arg("rustc")
+            .arg(&source)
+            .args([
+                "--crate-name=overlap",
+                "--crate-type=rlib",
+                "--edition=2021",
+            ])
+            .arg("--out-dir")
+            .arg(&target)
+            .arg("-L")
+            .arg(format!("native={}", native.display()))
+            .current_dir(&fx.workspace)
+            .env("HOME", &fx.home)
+            .env("CARGO_TARGET_DIR", &target);
+        for spec in specs {
+            compile.args(["-l", spec]);
+        }
+        run(&mut compile);
+        let events = events_since(&fx.cache, mark);
+        let app = target.join("app");
+        run(Command::new("rustc")
+            .arg(&app_source)
+            .arg("--extern")
+            .arg(format!(
+                "overlap={}",
+                target.join("liboverlap.rlib").display()
+            ))
+            .arg("-L")
+            .arg(format!("native={}", native.display()))
+            .arg("-o")
+            .arg(&app));
+        let output = run(&mut Command::new(app));
+        (
+            results_for(&events, "overlap")
+                .into_iter()
+                .map(String::from)
+                .collect::<Vec<_>>(),
+            String::from_utf8(output.stdout).unwrap().trim().to_string(),
+        )
+    };
+
+    let (cold, printed) = build("cold");
+    assert_eq!(printed, "11");
+    write_overlapping_native_archive(&native, "bar", 2);
+    let (rebuilt, printed) = build("rebuilt");
+    assert_eq!(
+        printed, "12",
+        "the changed attribute archive must reach the binary"
+    );
+    assert_eq!(cold, ["skipped"], "the first rlib must not be stored");
+    assert_eq!(
+        rebuilt,
+        ["skipped"],
+        "a fresh target must recompile the rlib"
+    );
+}
+
+#[test]
+fn repeated_static_specs_do_not_hide_an_unkeyed_bundle() {
+    repeated_link_specs_cannot_hide_an_unkeyed_archive(&["static=foo", "static=foo"]);
+}
+
+#[test]
+fn overridden_static_spec_does_not_hide_an_unkeyed_bundle() {
+    repeated_link_specs_cannot_hide_an_unkeyed_archive(&["static=foo", "dylib=foo"]);
+}
+
+#[test]
+fn single_static_spec_does_not_hide_an_unkeyed_bundle() {
+    repeated_link_specs_cannot_hide_an_unkeyed_archive(&["static=foo"]);
+}
+
 /// `stamped`'s build script reports the `ZERO_AR_DATE` it runs with.
 #[cfg(target_os = "macos")]
 fn write_stamped_workspace(root: &Path) {

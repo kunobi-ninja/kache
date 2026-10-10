@@ -5835,7 +5835,11 @@ fn unaudited_native_bundle(
 /// so a same-named member of an unkeyed archive stays unaccounted for.
 fn bundle_credits(bundled: &[crate::cache_key::BundledArchive]) -> Result<Vec<String>> {
     let mut credits = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     for archive in bundled {
+        if !seen.insert(std::fs::canonicalize(&archive.path)?) {
+            continue;
+        }
         if archive.packed {
             credits.extend(
                 archive

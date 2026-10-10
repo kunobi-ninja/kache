@@ -11,6 +11,8 @@ use std::path::{Path, PathBuf};
 
 use crate::key_env::KeyEnv;
 
+mod apple_install_name;
+
 /// Bump this when cache key logic changes in a way that could have produced
 /// incorrect entries. All entries from previous versions become unreachable.
 ///
@@ -3504,7 +3506,7 @@ fn compute_key_into(
     // without that audit must not serve this one.
     if needs_native_bundle_audit(args, &native_archives.dirs) {
         hasher.set_group("native_bundle_audit");
-        fold_field(&mut hasher, b"native_bundle_audit.v1", b"");
+        fold_field(&mut hasher, b"native_bundle_audit.v2", b"");
         tracing::trace!("[key:{}] native_bundle_audit", crate_name);
     }
     out.native_archives = Some(native_archives);
@@ -4687,6 +4689,28 @@ struct NativeLinkContext<'a> {
 }
 
 impl NativeLinkContext<'_> {
+    /// Apple dylibs can reach the linker through dependency metadata, so
+    /// inspect custom search dirs even when this unit has no `-l`.
+    fn apple_dynamic_dirs(&self, dirs: &[PathBuf]) -> Vec<PathBuf> {
+        let build_tree = std::cell::OnceCell::new();
+        unique_dirs(dirs)
+            .into_iter()
+            .filter(|dir| {
+                let resolved = resolved_path(dir);
+                !is_under_any(&resolved, &self.system_dirs)
+                    || is_under_any(
+                        &resolved,
+                        build_tree.get_or_init(|| {
+                            self.build_tree
+                                .iter()
+                                .map(|root| resolved_path(root))
+                                .collect::<Vec<_>>()
+                        }),
+                    )
+            })
+            .collect()
+    }
+
     /// The dirs among `dirs` whose every archive can key the unit, without
     /// repeats: those outside Cargo's packages and outside the system library
     /// dirs, or inside the build tree. Each dir is compared resolved, and the
@@ -4753,6 +4777,8 @@ fn native_scan_dirs(
 ///   spec, and the files and `-l` libraries its link arguments name, looked
 ///   up in the `-L` dirs and then the linker's default dirs;
 /// - on a linking unit, the static framework a `framework` spec names;
+/// - on Apple links, raw install names from custom native and framework
+///   search dirs, including libraries named only by dependency metadata;
 /// - every archive in the `-L` dirs [`native_scan_dirs`] picks, and on a
 ///   linking unit every static framework in the `framework=` dirs
 ///   [`NativeLinkContext::scanned_dirs`] keeps. Cargo hands a build script's
@@ -4821,13 +4847,86 @@ fn fold_native_link_inputs<H: KeyFold>(
     let shared_extensions = shared_library_extensions(context.target);
     let packs_all = packs_bundled_libs(&args.unstable_flags);
 
+    if unix_link && context.target.contains("-apple-") {
+        // Older entries did not inspect install names, even when a native
+        // library is now missing from its search directory.
+        fold_field(hasher, b"apple_install_names.v1:", b"");
+        // ld64 embeds LC_ID_DYLIB (or a stub's install-name) verbatim. A
+        // normalized -L path cannot identify an absolute build-tree name.
+        for (index, dir) in context.apple_dynamic_dirs(&library_dirs).iter().enumerate() {
+            for path in native_dir_entries(dir)? {
+                if path.is_file()
+                    && path
+                        .extension()
+                        .is_some_and(|ext| matches!(ext.to_str(), Some("tbd" | "dylib" | "so")))
+                {
+                    fold_apple_install_name(hasher, &path, dir, index)?;
+                }
+            }
+        }
+        for (index, dir) in context
+            .apple_dynamic_dirs(search.framework)
+            .iter()
+            .enumerate()
+        {
+            for path in native_dir_entries(dir)? {
+                let Some(name) = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .and_then(|name| name.strip_suffix(".framework"))
+                else {
+                    continue;
+                };
+                for binary in [path.join(format!("{name}.tbd")), path.join(name)] {
+                    if binary.is_file() && !crate::native_archive::has_archive_magic(&binary)? {
+                        fold_apple_install_name(hasher, &binary, dir, index)?;
+                    }
+                }
+            }
+        }
+        // +verbatim and linker -l:file can name an extensionless dylib,
+        // which the directory scan above cannot recognize.
+        let requests = args
+            .link_libs
+            .iter()
+            .filter_map(|spec| unix_library_request(spec))
+            .chain(
+                link_arguments
+                    .libs
+                    .iter()
+                    .map(|(name, verbatim)| (name.as_str(), *verbatim)),
+            );
+        for (index, (name, verbatim)) in requests.enumerate() {
+            if !verbatim {
+                continue;
+            }
+            for dir in &library_dirs {
+                let path = dir.join(name);
+                if path.is_file() {
+                    if !context
+                        .apple_dynamic_dirs(std::slice::from_ref(dir))
+                        .is_empty()
+                        && !crate::native_archive::has_archive_magic(&path)?
+                    {
+                        fold_apple_install_name(hasher, &path, dir, index)?;
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
     let mut archives = Vec::new();
     let mut bundled = Vec::new();
-    for lib in &args.link_libs {
+    let effective_libs = effective_native_libraries(&args.link_libs);
+    for (index, lib) in args.link_libs.iter().enumerate() {
         hasher.update(b"link_lib:");
         hasher.update(lib.as_bytes());
         hasher.update(b"\n");
         tracing::trace!("[key:{}] link_lib:{}", crate_name, lib);
+        let Some(&lib) = effective_libs.get(&index) else {
+            continue;
+        };
         if links && is_link_arg_spec(lib) {
             anyhow::bail!(
                 "native library spec {lib:?} hands the linker a raw argument the key does not \
@@ -4963,6 +5062,40 @@ fn fold_native_link_inputs<H: KeyFold>(
     })
 }
 
+/// rustc merges libraries by name at their last mention. An explicit kind
+/// replaces the previous kind and its modifiers; a kindless spec keeps it.
+fn effective_native_libraries(libraries: &[String]) -> BTreeMap<usize, &str> {
+    let mut by_name: BTreeMap<&str, (usize, &str)> = BTreeMap::new();
+    for (index, library) in libraries.iter().enumerate() {
+        let (kind, name) = library.split_once('=').unwrap_or(("", library));
+        let spec = if kind.is_empty() {
+            by_name
+                .get(name)
+                .map_or(library.as_str(), |(_, spec)| *spec)
+        } else {
+            library.as_str()
+        };
+        by_name.insert(name, (index, spec));
+    }
+    by_name.into_values().collect()
+}
+
+fn fold_apple_install_name<H: KeyFold>(
+    hasher: &mut H,
+    path: &Path,
+    dir: &Path,
+    index: usize,
+) -> Result<()> {
+    let name = apple_install_name::read(path)?;
+    let file = path.strip_prefix(dir).unwrap_or(path).to_string_lossy();
+    fold_field(
+        hasher,
+        b"apple_install_name.v1:",
+        format!("{index}/{file}={name}").as_bytes(),
+    );
+    Ok(())
+}
+
 /// Auxiliary linker files are not yet captured/restored as cache artifacts.
 /// Refuse the native-static-lib invocation rather than guess at their content.
 fn native_linker_side_files_are_unmodeled(args: &RustcArgs) -> bool {
@@ -5048,8 +5181,8 @@ fn ascii_prefix_eq_ignore_case(value: &str, prefix: &str) -> bool {
 /// How a `-l` spec maps to an archive the cache key must hash.
 #[derive(Debug, PartialEq, Eq)]
 enum StaticLibSpec<'a> {
-    /// Not a `static` kind (`dylib=`, `framework=`, bare `-l name`): referenced
-    /// rather than bundled, so the name alone keys it.
+    /// Not a `static` kind (`dylib=`, `framework=`, bare `-l name`). Archive
+    /// fallback and Apple dynamic install names are handled separately.
     NotStatic,
     /// A `static` archive rustc looks up under these file names in the `-L`
     /// dirs. `+whole-archive` and `+as-needed` change how the archive is

@@ -2393,7 +2393,7 @@ fn incremental_force_list_requires_incremental_and_managed_layout() {
     let no_incremental = rustc_args(&["rustc", "--crate-name", "tap_lib", "src/lib.rs"]);
     assert!(!force_incremental_requested(&config, &no_incremental));
     assert!(
-        managed_incremental_unit(&config, &no_incremental, true, || {
+        managed_incremental_unit(&config, &no_incremental, || {
             panic!("hidden-input discovery must not run for an ineligible invocation")
         })
         .is_none()
@@ -2402,7 +2402,7 @@ fn incremental_force_list_requires_incremental_and_managed_layout() {
     let temp = tempfile::tempdir().unwrap();
     let args = eligible_incremental_args(&temp, "tap_lib");
     assert!(force_incremental_requested(&config, &args));
-    let unit = managed_incremental_unit(&config, &args, true, || false).unwrap();
+    let unit = managed_incremental_unit(&config, &args, || false).unwrap();
     let lease = unit.try_immediate().unwrap();
     let compiler_args = lease.compiler_args(&args);
     let original = args.incremental.as_ref().unwrap().display().to_string();
@@ -2485,7 +2485,7 @@ fn force_list_hidden_inputs_and_cache_exclusions_fail_closed() {
     config.incremental_crates = vec!["tap_lib".to_string()];
     let args = eligible_incremental_args(&temp, "tap_lib");
 
-    assert!(managed_incremental_unit(&config, &args, true, || true).is_none());
+    assert!(managed_incremental_unit(&config, &args, || true).is_none());
     assert!(incremental_fast_path_allowed(false, false, false, false));
     assert!(!incremental_fast_path_allowed(false, true, false, false));
     assert!(!incremental_fast_path_allowed(false, false, true, false));
@@ -5082,7 +5082,7 @@ exit 0
     let mut config = test_config(dir.path().join("cache"));
     config.base_dirs = vec![dir.path().display().to_string()];
     let guard = adaptive_policy_guard(&config);
-    let unit = AdaptiveUnit::eligible(&args, true, &guard).unwrap();
+    let unit = AdaptiveUnit::eligible(&args, &guard).unwrap();
     let lease = unit.try_immediate().unwrap();
 
     let mut key_record = KeyEventRecord::default();
@@ -5198,7 +5198,7 @@ printf 'state' > "$incremental/state.bin"
     .unwrap();
     args.is_primary = true;
     let config = test_config(dir.path().join("cache"));
-    let unit = AdaptiveUnit::eligible(&args, true, &adaptive_policy_guard(&config)).unwrap();
+    let unit = AdaptiveUnit::eligible(&args, &adaptive_policy_guard(&config)).unwrap();
     let root = dir.path().display().to_string();
 
     let end_with = |script: &str| std::fs::write(&ending, script).unwrap();
@@ -10748,7 +10748,7 @@ fn a_hit_counts_as_the_build_an_edit_seeds_from() {
         "-Cextra-filename=-1234abcd".to_string(),
     ])
     .unwrap();
-    let unit = AdaptiveUnit::eligible(&args, true, b"").unwrap();
+    let unit = AdaptiveUnit::eligible(&args, b"").unwrap();
     let fields = |sources: &str| {
         std::collections::BTreeMap::from(
             [

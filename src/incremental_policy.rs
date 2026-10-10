@@ -202,18 +202,16 @@ impl AdaptiveUnit {
     /// Recognize the deliberately narrow layout supported by managed
     /// incremental modes.
     ///
-    /// `cargo_primary` should be a snapshot of Cargo's primary-package marker;
-    /// passing it in keeps policy tests independent of process-global env.
+    /// Cargo passes `-C incremental` only to path packages (workspace members
+    /// and path dependencies) in profiles with incremental on, whether or not
+    /// the command selects them. That argument, not `CARGO_PRIMARY_PACKAGE`,
+    /// marks a unit someone may be editing.
     /// Eligible invocations must have a stable Cargo unit id and exactly:
     /// `<profile>/deps` (or the unit's own `out` in Cargo's per-unit layout)
     /// plus `<profile>/incremental`, both absolute. A build script is not:
     /// Cargo gives it no extra filename, so it has no unit id.
-    pub(crate) fn eligible(
-        args: &RustcArgs,
-        cargo_primary: bool,
-        policy_guard: &[u8],
-    ) -> Option<Self> {
-        if !cargo_primary || !args.is_primary {
+    pub(crate) fn eligible(args: &RustcArgs, policy_guard: &[u8]) -> Option<Self> {
+        if !args.is_primary {
             return None;
         }
         let unit_id = args.unit_id()?;
@@ -958,7 +956,7 @@ mod tests {
             "-Cextra-filename=-1234abcd".into(),
         ])
         .unwrap();
-        let unit = AdaptiveUnit::eligible(&args, true, b"").unwrap();
+        let unit = AdaptiveUnit::eligible(&args, b"").unwrap();
         (temp, args, unit)
     }
 
@@ -1049,8 +1047,7 @@ mod tests {
             RustcArgs::parse(&argv).unwrap()
         };
         let unit =
-            AdaptiveUnit::eligible(&argv("sample", &["-Cextra-filename=-1234abcd"]), true, b"")
-                .unwrap();
+            AdaptiveUnit::eligible(&argv("sample", &["-Cextra-filename=-1234abcd"]), b"").unwrap();
         assert!(
             unit.unit_dir
                 .starts_with(profile.join("incremental.kache-auto")),
@@ -1058,26 +1055,32 @@ mod tests {
             unit.unit_dir.display()
         );
         assert!(
-            AdaptiveUnit::eligible(&argv("build_script_build", &[]), true, b"").is_none(),
+            AdaptiveUnit::eligible(&argv("build_script_build", &[]), b"").is_none(),
             "Cargo 1.100 compiles a build script with no extra filename"
         );
     }
 
     #[test]
-    fn eligibility_is_narrow_and_cargo_primary() {
+    fn eligibility_is_narrow() {
         let (_temp, mut args, unit) = fixture();
         assert!(unit.unit_dir.ends_with(&unit.unit_key));
-        assert!(AdaptiveUnit::eligible(&args, false, b"").is_none());
+
+        let mut registry_like = args.clone();
+        registry_like.incremental = None;
+        assert!(
+            AdaptiveUnit::eligible(&registry_like, b"").is_none(),
+            "a unit Cargo compiles without -C incremental (registry, git) is never managed"
+        );
 
         args.extra_filename = Some("-unstable".into());
-        assert!(AdaptiveUnit::eligible(&args, true, b"").is_none());
+        assert!(AdaptiveUnit::eligible(&args, b"").is_none());
 
         args.extra_filename = Some("-1234abcd".into());
         args.out_dir = args
             .out_dir
             .as_ref()
             .map(|path| path.with_file_name("build"));
-        assert!(AdaptiveUnit::eligible(&args, true, b"").is_none());
+        assert!(AdaptiveUnit::eligible(&args, b"").is_none());
 
         let (_temp, mut args, _unit) = fixture();
         args.incremental = args
@@ -1086,13 +1089,13 @@ mod tests {
             .and_then(|out_dir| out_dir.parent())
             .map(|profile| profile.join("incremental/unit"));
         assert!(
-            AdaptiveUnit::eligible(&args, true, b"").is_none(),
+            AdaptiveUnit::eligible(&args, b"").is_none(),
             "only the profile's exact incremental sibling is eligible"
         );
 
         args.incremental = Some(PathBuf::from("relative/incremental"));
         assert!(
-            AdaptiveUnit::eligible(&args, true, b"").is_none(),
+            AdaptiveUnit::eligible(&args, b"").is_none(),
             "relative incremental state must fail closed"
         );
     }
@@ -1111,8 +1114,8 @@ mod tests {
     #[test]
     fn policy_guard_changes_the_private_state_identity() {
         let (_temp, args, _) = fixture();
-        let first = AdaptiveUnit::eligible(&args, true, b"env-a").unwrap();
-        let second = AdaptiveUnit::eligible(&args, true, b"env-b").unwrap();
+        let first = AdaptiveUnit::eligible(&args, b"env-a").unwrap();
+        let second = AdaptiveUnit::eligible(&args, b"env-b").unwrap();
         assert_ne!(first.unit_key, second.unit_key);
         assert_ne!(first.rustc_dir, second.rustc_dir);
     }
@@ -1131,7 +1134,7 @@ mod tests {
             "--test".into(),
             "-Cextra-filename=-1234abcd".into(),
         ];
-        let unit = AdaptiveUnit::eligible(&args, true, b"").unwrap();
+        let unit = AdaptiveUnit::eligible(&args, b"").unwrap();
         let lease = unit.try_immediate_at(10).unwrap();
         let destination = lease.unit.rustc_dir.display().to_string();
         let rewritten = lease.compiler_args(&args);
@@ -1267,7 +1270,7 @@ mod tests {
         let out_dir = args.out_dir.as_ref().unwrap();
         fs::remove_dir(out_dir).unwrap();
         fs::write(out_dir, b"not a directory").unwrap();
-        assert!(AdaptiveUnit::eligible(&args, true, b"").is_none());
+        assert!(AdaptiveUnit::eligible(&args, b"").is_none());
 
         let (_temp, _args, unit) = fixture();
         fs::remove_dir(&unit.original_incremental).unwrap();
@@ -1792,7 +1795,7 @@ mod tests {
         let incremental = args.incremental.as_ref().unwrap();
         fs::remove_dir(incremental).unwrap();
         symlink("elsewhere", incremental).unwrap();
-        assert!(AdaptiveUnit::eligible(&args, true, b"").is_none());
+        assert!(AdaptiveUnit::eligible(&args, b"").is_none());
 
         fs::remove_file(incremental).unwrap();
         fs::create_dir(incremental).unwrap();

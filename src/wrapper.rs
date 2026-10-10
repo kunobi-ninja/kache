@@ -193,7 +193,6 @@ fn managed_unit_keys_first(managed: bool, force_listed: bool, policy_state: bool
 fn managed_incremental_unit<F>(
     config: &Config,
     args: &RustcArgs,
-    cargo_primary: bool,
     extra_inputs_declared: F,
 ) -> Option<AdaptiveUnit>
 where
@@ -203,7 +202,7 @@ where
         return None;
     }
     let guard = adaptive_policy_guard(config);
-    let unit = AdaptiveUnit::eligible(args, cargo_primary, &guard)?;
+    let unit = AdaptiveUnit::eligible(args, &guard)?;
     if extra_inputs_declared() {
         let _ = unit.reset();
         return None;
@@ -3745,12 +3744,7 @@ fn run_parsed_rustc(
     let force_incremental = force_incremental_requested(config, args);
     let adaptive_policy_for_invocation = adaptive_seed_allowed(config, args);
     let trace_adaptive = crate::phase_trace::phase("adaptive_unit");
-    let adaptive_unit = managed_incremental_unit(
-        config,
-        args,
-        std::env::var_os("CARGO_PRIMARY_PACKAGE").is_some(),
-        || extra_inputs.is_some(),
-    );
+    let adaptive_unit = managed_incremental_unit(config, args, || extra_inputs.is_some());
     drop(trace_adaptive);
 
     // Evaluate every cheap cache-eligibility gate before the learned fast
@@ -7461,9 +7455,9 @@ fn reset_adaptive_unit(unit: Option<&AdaptiveUnit>) {
 }
 
 /// Run a user-facing executable that artifact caching already excludes.
-/// Eligible Cargo-primary units preserve isolated incremental state immediately
-/// when no configured fallback owns declined compilations. Other rejection
-/// classes keep the configured fallback contract and do not call this helper.
+/// Eligible units preserve isolated incremental state immediately when no
+/// configured fallback owns declined compilations. Other rejection classes
+/// keep the configured fallback contract and do not call this helper.
 #[allow(clippy::too_many_arguments)]
 fn intentional_passthrough_with_event<R: Into<String>>(
     config: &Config,

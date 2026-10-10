@@ -12663,6 +12663,41 @@ fn each_root_of_a_tree_digest_is_memoised_alone() {
     assert!(!again.held(), "the workspace moved");
 }
 
+/// A memo answers while every entry has the stamp it was recorded under. A
+/// new target directory moves only the root's own times, and changes nothing
+/// the digest reads; a guard taken before still sees it.
+#[test]
+fn a_tree_memo_outlives_a_new_target_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let memo = dir.path().join("memo");
+    let root = dir.path().join("w");
+    write_file(&root.join("kt/src/lib.rs"), "");
+    write_file(&root.join("target/debug/a"), "");
+    filetime::set_file_mtime(&root, filetime::FileTime::from_unix_time(1_000_000_000, 0)).unwrap();
+    let skipped: &[&str] = &["target"];
+    let db = rusqlite::Connection::open_in_memory().unwrap();
+    ensure_file_hash_cache_schema(&db).unwrap();
+    // The guard, and how many files were read for it.
+    let guard = || {
+        let hasher = FileHasher::from_cache(FileHashCache::Borrowed(&db));
+        let settled = std::time::SystemTime::now() + crate::tree_stamp::TreeStamp::SETTLE;
+        let roots = vec![TreeRoot::new(root.clone(), b"workspace", skipped)];
+        let guard = tree_guard_of(&hasher, || {
+            tree_digest_memoised(roots, &hasher, 10, &memo, settled)
+        })
+        .unwrap();
+        (guard, hasher.stats().cache_misses)
+    };
+    let (taken, read) = guard();
+    assert_eq!(read, 1);
+    std::fs::remove_dir_all(root.join("target")).unwrap();
+    write_file(&root.join("target/debug/b"), "");
+    let (again, read) = guard();
+    assert_eq!((again.digest.as_str(), read), (taken.digest.as_str(), 0));
+    assert!(!taken.held(), "the root's own times moved");
+    assert!(again.held());
+}
+
 /// One root's digest is the one 1.0 records, so 1.0 records of such units
 /// still match. The digest of several roots folds the digest of each, so that
 /// each root can be memoised alone.
@@ -12850,7 +12885,7 @@ fn a_tree_that_moved_while_it_was_read_is_not_memoised() {
     let settled = std::time::SystemTime::now() + crate::tree_stamp::TreeStamp::SETTLE;
     memoise_tree_digest(&file, &walk, &stamp, &digest, settled);
     assert_eq!(
-        crate::tree_stamp::memoised_digest(&file, &stamp.digest),
+        crate::tree_stamp::memoised_digest(&file, &stamp.entries),
         Some(digest)
     );
 }

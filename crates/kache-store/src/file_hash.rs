@@ -554,7 +554,10 @@ fn file_hashes_have_rule(db: &Connection) -> rusqlite::Result<bool> {
 /// that the file had settled. Checked again under the write lock, so the
 /// rows go once however many processes open the index together. Gated on
 /// the column rather than the index generation, which an older release
-/// stamps back over a newer one each time it opens the index.
+/// stamps back over a newer one each time it opens the index. An older
+/// release's GC can drop the column again ([`has_rule_columns`]). The rows
+/// it copies then no longer say which rule recorded them, so adding the
+/// column back empties the table again.
 fn ensure_file_hashes_rule(db: &Connection) -> rusqlite::Result<()> {
     if file_hashes_have_rule(db)? {
         return Ok(());
@@ -581,6 +584,18 @@ fn file_hashes_has_rowid(db: &Connection) -> rusqlite::Result<bool> {
         )
         .optional()?;
     Ok(sql.is_some_and(|sql| !sql.to_ascii_uppercase().contains("WITHOUT ROWID")))
+}
+
+/// Whether every rule column [`ensure_file_hash_cache_schema`] adds is
+/// present: `file_hashes.rule` and the C/C++ memo's. The index generation
+/// cannot vouch for them. GC in releases 0.27 to 1.0 rebuilds a rowid
+/// `file_hashes` table without `rule` and leaves the generation alone, so
+/// an index this release stamped while that GC ran keeps the stamp and
+/// loses the column. Builds made while this release was in development
+/// also stamped generation 9 before the columns existed. A memo without
+/// its column fails every read and write.
+pub(crate) fn has_rule_columns(db: &Connection) -> rusqlite::Result<bool> {
+    Ok(file_hashes_have_rule(db)? && crate::cc_memo::has_rule_columns(db)?)
 }
 
 pub fn ensure_file_hash_cache_schema(db: &Connection) -> rusqlite::Result<()> {

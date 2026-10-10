@@ -6368,10 +6368,7 @@ impl<'db> FileHasher<'db> {
         })();
         let _ = db.busy_timeout(std::time::Duration::from_millis(5000));
         if let Err(error) = written {
-            tracing::debug!(
-                rows = pending.len(),
-                "file hash memo not written (index busy): {error}"
-            );
+            tracing::debug!(rows = pending.len(), "file hash memo not written: {error}");
         }
     }
 

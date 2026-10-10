@@ -357,6 +357,109 @@ fn an_older_release_reopening_the_index_does_not_empty_the_file_hash_memo() {
     assert_eq!(served(&db, "/older-release"), None);
 }
 
+/// GC in releases 0.27 to 1.0 opens the index when it starts and rebuilds
+/// a rowid `file_hashes` table, without `rule`, when it ends. If this
+/// release opened the index in between, the rebuild leaves generation 9 in
+/// place. The next open must add the column back, or every file hash
+/// lookup and write fails from then on.
+#[test]
+fn file_hashes_rebuilt_by_an_older_gc_after_the_upgrade_get_their_rule_back() {
+    // The columns 1.0.0 knows, for its rowid table and for the rebuild.
+    const OLDER_COLUMNS: &str = "path TEXT PRIMARY KEY, size INTEGER NOT NULL,
+        mtime_ns INTEGER NOT NULL, ctime_ns INTEGER NOT NULL DEFAULT 0,
+        inode INTEGER NOT NULL DEFAULT 0, hash TEXT NOT NULL,
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))";
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("index.db");
+    let stamp = crate::file_hash::FileFingerprint {
+        path: "/memoised".into(),
+        size: 1,
+        mtime_ns: 1,
+        ctime_ns: 1,
+        inode: 1,
+    };
+
+    // A store from before 0.27, just opened by the older GC.
+    let db = open_index_db(&path).unwrap();
+    db.execute_batch(&format!(
+        "DROP TABLE file_hashes; CREATE TABLE file_hashes ({OLDER_COLUMNS});"
+    ))
+    .unwrap();
+    db.pragma_update(None, "user_version", 8_i64).unwrap();
+    drop(db);
+
+    // This release adds `rule` to the rowid table and stamps 9.
+    let db = open_index_db(&path).unwrap();
+    let cache = crate::file_hash::FileHashCache::Borrowed(&db);
+    cache.put(&stamp, "current").unwrap();
+    // The rebuild 1.0.0 runs as the GC ends.
+    db.execute_batch(&format!(
+        "CREATE TABLE file_hashes_rebuilt ({OLDER_COLUMNS}) WITHOUT ROWID;
+         INSERT INTO file_hashes_rebuilt
+             (path, size, mtime_ns, ctime_ns, inode, hash, updated_at)
+             SELECT path, size, mtime_ns, ctime_ns, inode, hash, updated_at
+             FROM file_hashes;
+         DROP TABLE file_hashes;
+         ALTER TABLE file_hashes_rebuilt RENAME TO file_hashes;"
+    ))
+    .unwrap();
+    assert!(cache.get(&stamp).is_err(), "the rebuild dropped the column");
+    let generation: i64 = db
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(generation, INDEX_SCHEMA_GENERATION);
+    drop(db);
+
+    let db = open_index_db(&path).unwrap();
+    let cache = crate::file_hash::FileHashCache::Borrowed(&db);
+    assert_eq!(cache.get(&stamp).unwrap(), None, "copied rows name no rule");
+    cache.put(&stamp, "current").unwrap();
+    assert_eq!(cache.get(&stamp).unwrap().as_deref(), Some("current"));
+}
+
+/// Builds made while this release was in development stamped generation 9
+/// before the rule columns existed. The stamp must not keep any of them
+/// away.
+#[test]
+fn an_index_stamped_current_without_a_rule_column_gains_it() {
+    for (table, column) in [
+        ("file_hashes", "rule"),
+        ("cc_memo_inputs", "proof"),
+        ("cc_mapped_hashes", "rule"),
+        ("cc_asm_scans", "rule"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let db = open_index_db(&path).unwrap();
+        db.execute_batch(&format!("ALTER TABLE {table} DROP COLUMN {column}"))
+            .unwrap();
+        drop(db);
+
+        let db = open_index_db(&path).unwrap();
+        let present: bool = db
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2)",
+                params![table, column],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(present, "{table}.{column}");
+    }
+}
+
+/// Opening a current index only reads, so it succeeds while a build holds
+/// the write lock. Each schema statement would wait for that lock until
+/// the open gave up.
+#[test]
+fn opening_a_current_index_does_not_need_the_write_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("index.db");
+    drop(open_index_db(&path).unwrap());
+    let writer = Connection::open(&path).unwrap();
+    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+    open_index_db(&path).unwrap();
+}
+
 /// A put never learns its unit; the wrapper records it afterwards, and
 /// an empty unit leaves the row alone.
 #[test]

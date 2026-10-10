@@ -178,7 +178,8 @@ fn has_column(db: &Connection, table: &str, column: &str) -> rusqlite::Result<bo
     )
 }
 
-fn has_rule_columns(db: &Connection) -> rusqlite::Result<bool> {
+/// Whether every column [`CC_MEMO_RULE`] reads is present.
+pub(crate) fn has_rule_columns(db: &Connection) -> rusqlite::Result<bool> {
     for (table, column, _) in RULE_COLUMNS {
         if !has_column(db, table, column)? {
             return Ok(false);

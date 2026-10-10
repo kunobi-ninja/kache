@@ -1612,9 +1612,11 @@ fn initialize_db(db: &Connection) -> rusqlite::Result<()> {
     // whichever miss was storing (hundreds of milliseconds per hit in a
     // contended cell). The generation stamped after the DDL says the schema
     // is current; bump [`INDEX_SCHEMA_GENERATION`] whenever a statement is
-    // added or changed below.
+    // added or changed below. It cannot vouch for the memo rule columns
+    // ([`crate::file_hash::has_rule_columns`]), so those are checked too.
+    // Both checks only read.
     let generation: i64 = db.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if generation == INDEX_SCHEMA_GENERATION {
+    if generation == INDEX_SCHEMA_GENERATION && crate::file_hash::has_rule_columns(db)? {
         return Ok(());
     }
 
@@ -1791,9 +1793,10 @@ fn initialize_db(db: &Connection) -> rusqlite::Result<()> {
 /// 9: `file_hashes.rule` (`file_hash::FILE_HASH_RULE`), and for the C/C++
 ///    memo `cc_memo_inputs.proof`, `cc_mapped_hashes.rule` and
 ///    `cc_asm_scans.rule` (`cc_memo::CC_MEMO_RULE`). Adding them empties
-///    those tables once. The columns decide that, not this number, which an
+///    those tables. The columns decide that, not this number, which an
 ///    older release stamps back each time it opens the index; nothing such
-///    a release records is served.
+///    a release records is served. An index can carry 9 and still lack a
+///    column (`file_hash::has_rule_columns`), so the open checks them too.
 const INDEX_SCHEMA_GENERATION: i64 = 9;
 
 /// Raise the refcount of every blob `cache_key` maps to at least the

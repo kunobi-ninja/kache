@@ -219,10 +219,8 @@ impl Stamper {
 
     /// Keep the newest modification time.
     fn saw(&mut self, metadata: &std::fs::Metadata) {
-        if let Ok(modified) = metadata.modified()
-            && modified > self.newest
-        {
-            self.newest = modified;
+        if let Ok(modified) = metadata.modified() {
+            self.newest = self.newest.max(modified);
         }
     }
 

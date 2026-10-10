@@ -48,8 +48,9 @@ them. A record for a workspace or path crate is therefore used only while the
 workspace and the crate's `OUT_DIR` hold what the recording build saw. This
 applies in the crate's own checkout as well as in another target directory or
 checkout. The check leaves out the target directory, `.git`, the contents of
-any other directory Cargo tagged as a target directory, and Kache's own cache
-and runtime directories, which a CI job may keep inside the project, as GitLab
+any other directory Cargo tagged as a target directory, Kache's own cache and
+runtime directories, and Cargo's home. A build writes to all of them, and a CI
+job may keep Kache's cache and Cargo's home inside the project, as GitLab
 requires for cached paths. An entry Kache cannot read counts by its name,
 since a proc macro cannot read it either.
 Checking an unchanged workspace costs one stat of each entry, and writing a

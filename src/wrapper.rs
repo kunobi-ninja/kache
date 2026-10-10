@@ -6550,6 +6550,13 @@ fn compute_rustc_cache_key(
         crate::cache_key::provide_dep_info(dep_info, tree);
     }
     let emitted_sources = crate::cache_key::provided_dep_info_sources();
+    // Written while units build, so tree guards leave them out. Under a
+    // trust domain the tree memos stay in the base cache's probe directory,
+    // outside the domain's own cache. Cargo records in its home when builds
+    // use downloaded crates, and GitLab CI keeps that home inside the
+    // project as well.
+    let probe_dir = crate::config::probe_memo_dir();
+    let cargo_home = crate::build_script_inputs::cargo_home(&|name| std::env::var_os(name));
     let mut file_hasher = match store {
         Some(store) => store.file_hasher_with_daemon(config.socket_path()),
         None => crate::cache_key::FileHasher::new().with_daemon(config.socket_path()),
@@ -6557,9 +6564,14 @@ fn compute_rustc_cache_key(
     .with_input_predictions(config.input_predictions)
     .with_prediction_flights(flight_dir)
     .with_own_dirs(
-        [config.cache_dir.as_path(), config.runtime_dir.as_path()]
-            .into_iter()
-            .chain(store.map(Store::cache_dir)),
+        [
+            config.cache_dir.as_path(),
+            config.runtime_dir.as_path(),
+            probe_dir.as_path(),
+        ]
+        .into_iter()
+        .chain(store.map(Store::cache_dir))
+        .chain(cargo_home.as_deref()),
     );
     if config.modified_input_guard || emitted {
         // Flag keyed inputs touched at/after this invocation started — their

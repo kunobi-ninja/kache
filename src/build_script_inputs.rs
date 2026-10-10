@@ -122,7 +122,7 @@ pub(crate) fn locate(
 }
 
 /// Cargo's home, found as Cargo finds it.
-fn cargo_home(var: &dyn Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
+pub(crate) fn cargo_home(var: &dyn Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
     let set = |name| var(name).filter(|value| !value.is_empty());
     set("CARGO_HOME")
         .map(PathBuf::from)

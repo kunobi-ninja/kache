@@ -222,6 +222,11 @@ fn summary_local_hits(cache_dir: &Path) -> u64 {
 
 /// The most recent `kt` event from `kache report`.
 fn last_event(cache_dir: &Path) -> LastEvent {
+    last_event_with(cache_dir, &[])
+}
+
+/// [`last_event`], with `env` set for the report as it was for the build.
+fn last_event_with(cache_dir: &Path, env: &[(&str, std::ffi::OsString)]) -> LastEvent {
     let output = std::process::Command::new(kache_binary())
         .args(["report", "--format", "json", "--since", "1h"])
         .env("KACHE_CACHE_DIR", cache_dir)
@@ -232,6 +237,7 @@ fn last_event(cache_dir: &Path) -> LastEvent {
         .env_remove("KACHE_SOCKET_PATH")
         .env_remove("KACHE_ACTIVE")
         .env_remove("KACHE_FAMILY_PROBE_ACTIVE")
+        .envs(env.iter().map(|(name, value)| (name, value)))
         .output()
         .expect("failed to run kache report");
     assert!(output.status.success(), "kache report failed");
@@ -1036,6 +1042,8 @@ struct WorkspaceUnit {
     /// Copied into every target's `deps`; the member then links `facade`.
     facade: Vec<PathBuf>,
     external_targets: bool,
+    /// Set for every build and report, after the rest.
+    env: Vec<(&'static str, std::ffi::OsString)>,
 }
 
 impl WorkspaceUnit {
@@ -1058,6 +1066,7 @@ impl WorkspaceUnit {
             proc_macro,
             facade: Vec::new(),
             external_targets: false,
+            env: Vec::new(),
         }
     }
 
@@ -1227,13 +1236,14 @@ impl WorkspaceUnit {
             Some(mode) => command.env("KACHE_VERIFY_INPUT_PREDICTIONS", mode),
             None => command.env_remove("KACHE_VERIFY_INPUT_PREDICTIONS"),
         };
+        command.envs(self.env.iter().map(|(name, value)| (name, value)));
         let output = command.output().expect("failed to run kache rustc");
         assert!(
             output.status.success(),
             "kache rustc failed.\nargs: {args:?}\nstderr: {}",
             String::from_utf8_lossy(&output.stderr),
         );
-        last_event(&self.cache)
+        last_event_with(&self.cache, &self.env)
     }
 
     /// Build in checkout A, let `prepare` edit checkout B, and return B's
@@ -1370,6 +1380,47 @@ fn a_cache_inside_the_workspace_keeps_the_record_guarded() {
     unit.cache = a.join(".cache/kache");
     std::fs::create_dir_all(&unit.cache).unwrap();
     assert_eq!(unit.build(&a, true, None).result, "miss");
+    let warm = unit.build(&a, true, None);
+    assert_eq!(warm.result, "local_hit");
+    assert_eq!(warm.dep_info_runs, 0, "the record kept its guard");
+}
+
+/// Under a trust domain the store sits in a directory of its own, and the
+/// tree memos stay in the probe directory beside it. With the cache inside
+/// the workspace, neither is part of the workspace guard.
+#[test]
+fn a_cache_inside_the_workspace_keeps_the_record_guarded_under_a_trust_domain() {
+    build_kache();
+    let mut unit = WorkspaceUnit::new(false);
+    let a = unit.checkout("a");
+    unit.cache = a.join(".cache/kache");
+    std::fs::create_dir_all(&unit.cache).unwrap();
+    unit.env.push(("KACHE_TRUST_DOMAIN", "ci".into()));
+    assert_eq!(unit.build(&a, true, None).result, "miss");
+    // A tree memo another unit wrote.
+    let probes = unit.cache.join("probes");
+    std::fs::create_dir_all(&probes).unwrap();
+    std::fs::write(probes.join("another-unit"), "memo").unwrap();
+    let warm = unit.build(&a, true, None);
+    assert_eq!(warm.result, "local_hit");
+    assert_eq!(warm.dep_info_runs, 0, "the record kept its guard");
+}
+
+/// Cargo's home inside the workspace, where GitLab CI keeps it to cache
+/// Cargo's downloads, is not part of the workspace guard: Cargo records
+/// there when builds use downloaded crates, and the record must still
+/// apply.
+#[test]
+fn a_cargo_home_inside_the_workspace_keeps_the_record_guarded() {
+    build_kache();
+    let mut unit = WorkspaceUnit::new(false);
+    let a = unit.checkout("a");
+    let home = a.join(".cargo");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(home.join(".global-cache"), "first run").unwrap();
+    unit.env.push(("CARGO_HOME", home.clone().into()));
+    assert_eq!(unit.build(&a, true, None).result, "miss");
+    std::fs::write(home.join(".global-cache"), "second run").unwrap();
     let warm = unit.build(&a, true, None);
     assert_eq!(warm.result, "local_hit");
     assert_eq!(warm.dep_info_runs, 0, "the record kept its guard");

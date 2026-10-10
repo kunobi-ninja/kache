@@ -820,11 +820,7 @@ impl TreeGuard {
     /// repeat does not hold.
     pub(crate) fn held(&self) -> bool {
         let _trace = crate::phase_trace::phase("tree_recheck");
-        let held = !self.walks.is_empty()
-            && self.walks.iter().all(|walk| {
-                stamp_roots(&walk.roots, walk.max_entries)
-                    .is_ok_and(|stamp| stamp.digest == walk.stamp)
-            });
+        let held = !self.walks.is_empty() && self.walks.iter().all(GuardWalk::holds);
         crate::phase_trace::decision("tree_recheck", if held { "held" } else { "moved" });
         held
     }
@@ -834,14 +830,14 @@ impl TreeGuard {
 impl TreeGuard {
     /// A guard carrying `digest`, with a walk of `root` as it is now.
     pub(crate) fn stamping(digest: &str, root: &Path) -> Self {
-        let roots = vec![TreeRoot::new(root.to_path_buf(), b"root", &[]).walked()];
-        let stamp = stamp_roots(&roots, CRATE_TREE_MAX_ENTRIES)
+        let root = TreeRoot::new(root.to_path_buf(), b"root", &[]).walked();
+        let stamp = stamp_root(&root, CRATE_TREE_MAX_ENTRIES)
             .expect("a tree to stamp")
             .digest;
         Self {
             digest: digest.to_string(),
             walks: vec![GuardWalk {
-                roots,
+                root,
                 max_entries: CRATE_TREE_MAX_ENTRIES,
                 stamp,
             }],
@@ -849,13 +845,20 @@ impl TreeGuard {
     }
 }
 
-/// One stat walk behind a tree guard: the roots it covered, the entry budget
-/// of each, and the stamp it gave.
+/// One stat walk behind a tree guard: the root it covered, its entry budget,
+/// and the stamp it gave.
 #[derive(Debug, Clone)]
 struct GuardWalk {
-    roots: Vec<WalkedRoot>,
+    root: WalkedRoot,
     max_entries: usize,
     stamp: String,
+}
+
+impl GuardWalk {
+    /// Does a walk of the root give the same stamp again?
+    fn holds(&self) -> bool {
+        stamp_root(&self.root, self.max_entries).is_some_and(|stamp| stamp.digest == self.stamp)
+    }
 }
 
 /// One root of a [`GuardWalk`], as [`crate::tree_stamp::Stamper::walk`]
@@ -868,7 +871,7 @@ struct WalkedRoot {
     rules: crate::tree_stamp::StampRules,
 }
 
-/// Why [`stamp_roots`] gave no stamp.
+/// Why [`stamp_roots`] gave no stamps.
 #[derive(Debug)]
 enum StampRefusal {
     /// The root at this index alone holds more entries than the budget.
@@ -879,35 +882,43 @@ enum StampRefusal {
     Unwalkable,
 }
 
-/// One stat walk over `roots`, each of them and all of them together within
-/// `max_entries`.
+/// One stat walk per root, each of them and all of them together within
+/// `max_entries`: the stamp of each, with the entries it holds.
 fn stamp_roots(
     roots: &[WalkedRoot],
     max_entries: usize,
-) -> std::result::Result<crate::tree_stamp::TreeStamp, StampRefusal> {
-    #[cfg(test)]
-    BEFORE_STAMP.with(|hook| {
-        if let Some(hook) = hook.borrow_mut().as_mut() {
-            for root in roots {
+) -> std::result::Result<Vec<(crate::tree_stamp::TreeStamp, usize)>, StampRefusal> {
+    let mut stamps = Vec::with_capacity(roots.len());
+    for (index, root) in roots.iter().enumerate() {
+        #[cfg(test)]
+        BEFORE_STAMP.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().as_mut() {
                 hook(&root.path);
             }
-        }
-    });
-    let mut stamper = crate::tree_stamp::Stamper::new();
-    let mut total = 0usize;
-    for (index, root) in roots.iter().enumerate() {
+        });
+        let mut stamper = crate::tree_stamp::Stamper::new();
         let mut budget = max_entries;
         stamper.label(&root.role);
         match stamper.walk(&root.path, &root.excluded, root.rules, &mut budget) {
-            crate::tree_stamp::WalkOutcome::Fits => total += max_entries - budget,
+            crate::tree_stamp::WalkOutcome::Fits => {
+                stamps.push((stamper.finish(), max_entries - budget));
+            }
             crate::tree_stamp::WalkOutcome::TooLarge => return Err(StampRefusal::TooLarge(index)),
             crate::tree_stamp::WalkOutcome::Unreadable => return Err(StampRefusal::Unwalkable),
         }
     }
-    if total > max_entries {
+    if stamps.iter().map(|(_, entries)| entries).sum::<usize>() > max_entries {
         return Err(StampRefusal::TooLargeTogether);
     }
-    Ok(stamper.finish())
+    Ok(stamps)
+}
+
+/// [`stamp_roots`] for one root.
+fn stamp_root(root: &WalkedRoot, max_entries: usize) -> Option<crate::tree_stamp::TreeStamp> {
+    let (stamp, _) = stamp_roots(std::slice::from_ref(root), max_entries)
+        .ok()?
+        .pop()?;
+    Some(stamp)
 }
 
 /// Run by [`stamp_roots`] with each root before it walks, so a test can
@@ -1174,16 +1185,24 @@ fn write_marker(marker: &Path) {
 /// recorded for.
 const TREE_DIGEST_VERSION: &[u8] = b"kache-crate-tree-v1\n";
 
+/// The version of the digest of several roots, folded from the digest of
+/// each.
+const TREE_ROOTS_VERSION: &[u8] = b"kache-crate-tree-roots-v1\n";
+
 /// [`tree_digest`] with its memos in `memo_dir`.
 ///
-/// One stat walk stamps every root and enforces the budget without reading a
-/// file. A root that alone runs past the budget is remembered for
+/// One stat walk per root stamps it and enforces the budget without reading
+/// a file. A root that alone runs past the budget is remembered for
 /// [`OVERSIZED_TREE_TTL`]: a workspace root can be a whole monorepo. So are
-/// roots that only together run past it, without marking either one. When the
-/// roots have the stamp a digest was recorded under, that digest is the
-/// answer; otherwise every file is read, and the digest is recorded once the
-/// tree has settled ([`crate::tree_stamp::TreeStamp::settled_at`]). The walk
-/// goes to `file_hasher` for the guard ([`tree_guard_of`]).
+/// roots that only together run past it, without marking either one.
+///
+/// Each root is memoised alone: a new target directory gives every `OUT_DIR`
+/// a new stamp, and the workspace beside it keeps its memo. While a root has
+/// the stamp its digest was recorded under, that digest is the answer;
+/// otherwise every file in it is read, and the digest is recorded once the
+/// root has settled ([`crate::tree_stamp::TreeStamp::settled_at`]). Several
+/// roots' digests fold into one. The walks go to `file_hasher` for the guard
+/// ([`tree_guard_of`]).
 fn tree_digest_memoised(
     mut roots: Vec<TreeRoot<'_>>,
     file_hasher: &FileHasher<'_>,
@@ -1207,8 +1226,8 @@ fn tree_digest_memoised(
     if marked_recently(&together, now) {
         return None;
     }
-    let stamp = match stamp_roots(&walked, max_entries) {
-        Ok(stamp) => stamp,
+    let stamps = match stamp_roots(&walked, max_entries) {
+        Ok(stamps) => stamps,
         Err(StampRefusal::TooLarge(index)) => {
             write_marker(&oversized_tree_marker(
                 memo_dir,
@@ -1223,43 +1242,80 @@ fn tree_digest_memoised(
         }
         Err(StampRefusal::Unwalkable) => return None,
     };
-    let walk = GuardWalk {
-        roots: walked,
-        max_entries,
-        stamp: stamp.digest.clone(),
-    };
-    let memo = tree_digest_memo(memo_dir, &roots);
+    let total: usize = stamps.iter().map(|(_, entries)| entries).sum();
+    let mut digests = Vec::with_capacity(roots.len());
+    let mut walks = Vec::with_capacity(roots.len());
+    for ((root, walked), (stamp, entries)) in roots.iter().zip(walked).zip(stamps) {
+        let walk = GuardWalk {
+            root: walked,
+            max_entries,
+            stamp: stamp.digest.clone(),
+        };
+        // A read may spend what the other roots leave of the budget.
+        let budget = max_entries - (total - entries);
+        digests.push(root_digest(
+            root,
+            &walk,
+            &stamp,
+            budget,
+            file_hasher,
+            memo_dir,
+            now,
+        )?);
+        walks.push(walk);
+    }
+    for walk in walks {
+        file_hasher.note_tree_walk(walk);
+    }
+    if let [digest] = digests.as_slice() {
+        return Some(digest.clone());
+    }
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(TREE_ROOTS_VERSION);
+    for digest in &digests {
+        fold_field(&mut hasher, b"digest:", digest.as_bytes());
+    }
+    Some(hasher.finalize().to_hex().to_string())
+}
+
+/// The digest of `root`, which `walk` stamped as `stamp`: the memoised one
+/// while the root has the stamp it was recorded under, otherwise a read of
+/// every file in it within `budget` entries.
+fn root_digest(
+    root: &TreeRoot<'_>,
+    walk: &GuardWalk,
+    stamp: &crate::tree_stamp::TreeStamp,
+    mut budget: usize,
+    file_hasher: &FileHasher<'_>,
+    memo_dir: &Path,
+    now: std::time::SystemTime,
+) -> Option<String> {
+    let memo = tree_digest_memo(memo_dir, root);
     if let Some(digest) = crate::tree_stamp::memoised_digest(&memo, &stamp.digest)
         .filter(|digest| digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit()))
     {
         crate::phase_trace::decision("tree_memo", "hit");
-        file_hasher.note_tree_walk(walk);
         return Some(digest);
     }
     crate::phase_trace::decision("tree_memo", "miss");
     let mut hasher = blake3::Hasher::new();
     hasher.update(TREE_DIGEST_VERSION);
-    let mut budget = max_entries;
-    let mut read_every_file = true;
-    for root in &roots {
-        fold_field(&mut hasher, b"root:", root.role);
-        read_every_file &= crate_tree_fold(
-            &root.path,
-            &root.path,
-            &root.excluded(),
-            root.skips_build_dirs,
-            file_hasher,
-            &mut hasher,
-            &mut budget,
-        )?;
-    }
+    fold_field(&mut hasher, b"root:", root.role);
+    let read_every_file = crate_tree_fold(
+        &root.path,
+        &root.path,
+        &root.excluded(),
+        root.skips_build_dirs,
+        file_hasher,
+        &mut hasher,
+        &mut budget,
+    )?;
     let digest = hasher.finalize().to_hex().to_string();
     // The stamp shows a directory becoming listable, but not a file becoming
     // readable where there is no change time.
     if read_every_file {
-        memoise_tree_digest(&memo, &walk, &stamp, &digest, now);
+        memoise_tree_digest(&memo, walk, stamp, &digest, now);
     }
-    file_hasher.note_tree_walk(walk);
     Some(digest)
 }
 
@@ -1276,35 +1332,30 @@ fn memoise_tree_digest(
     digest: &str,
     now: std::time::SystemTime,
 ) {
-    if stamp.settled_at(now)
-        && stamp_roots(&walk.roots, walk.max_entries)
-            .is_ok_and(|again| again.digest == stamp.digest)
-    {
+    if stamp.settled_at(now) && walk.holds() {
         crate::tree_stamp::record_digest(memo, &stamp.digest, digest);
     }
 }
 
-/// Where the digest of `roots` is memoised: one file per set of roots, so
-/// every unit without an `OUT_DIR` in a workspace shares one.
-fn tree_digest_memo(memo_dir: &Path, roots: &[TreeRoot<'_>]) -> PathBuf {
+/// Where the digest of `root` is memoised: one file per root, so every unit
+/// of a workspace shares one for the workspace.
+fn tree_digest_memo(memo_dir: &Path, root: &TreeRoot<'_>) -> PathBuf {
     let mut hasher = blake3::Hasher::new();
     hasher.update(TREE_DIGEST_VERSION);
-    for root in roots {
-        fold_field(
-            &mut hasher,
-            b"path:",
-            root.path.as_os_str().as_encoded_bytes(),
-        );
-        fold_field(&mut hasher, b"role:", root.role);
-        for name in root.skipped {
-            fold_field(&mut hasher, b"skipped:", name.as_bytes());
-        }
-        fold_field(
-            &mut hasher,
-            b"build_dirs:",
-            if root.skips_build_dirs { b"1" } else { b"0" },
-        );
+    fold_field(
+        &mut hasher,
+        b"path:",
+        root.path.as_os_str().as_encoded_bytes(),
+    );
+    fold_field(&mut hasher, b"role:", root.role);
+    for name in root.skipped {
+        fold_field(&mut hasher, b"skipped:", name.as_bytes());
     }
+    fold_field(
+        &mut hasher,
+        b"build_dirs:",
+        if root.skips_build_dirs { b"1" } else { b"0" },
+    );
     memo_dir
         .join("tree-digests")
         .join(&hasher.finalize().to_hex()[..32])
@@ -2571,7 +2622,7 @@ fn ancestor_top_digest(directory: &Path, file_hasher: &FileHasher<'_>) -> Option
     // directory's own times, taken before the listing: a name that appears
     // after the stamp, or comes and goes before the record is written, moves
     // those times. A dot-directory's own digest walks that directory.
-    let top = vec![WalkedRoot {
+    let top = WalkedRoot {
         path: directory.to_path_buf(),
         role: b"ancestor".to_vec(),
         excluded: vec![directory.join(".git")],
@@ -2583,15 +2634,15 @@ fn ancestor_top_digest(directory: &Path, file_hasher: &FileHasher<'_>) -> Option
             top_files_only: true,
             unsearchable_dirs: false,
         },
-    }];
-    let stamp = stamp_roots(&top, CRATE_TREE_MAX_ENTRIES).ok()?;
+    };
+    let stamp = stamp_root(&top, CRATE_TREE_MAX_ENTRIES)?;
     let mut entries: Vec<_> = std::fs::read_dir(directory)
         .ok()?
         .collect::<std::io::Result<_>>()
         .ok()?;
     entries.sort_by_key(std::fs::DirEntry::file_name);
     file_hasher.note_tree_walk(GuardWalk {
-        roots: top,
+        root: top,
         max_entries: CRATE_TREE_MAX_ENTRIES,
         stamp: stamp.digest,
     });

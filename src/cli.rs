@@ -7904,14 +7904,11 @@ async fn sync_with_client(
 
     let local_entries = store.list_entries("name")?;
 
-    // to_pull: remote keys not present on disk locally — (cache_key, crate_name).
+    // to_pull: remote keys not committed locally — (cache_key, crate_name).
     let to_pull: Vec<(String, String)> = if !push_only {
         s3_keys
             .iter()
-            .filter(|(k, _)| {
-                let entry_dir = config.store_dir().join(k.as_str());
-                !entry_dir.exists()
-            })
+            .filter(|(k, _)| !store.contains(k))
             .map(|(k, cn)| (k.clone(), cn.clone()))
             .collect()
     } else {
@@ -7995,13 +7992,13 @@ async fn sync_with_client(
             // We do NOT tokio::spawn — FuturesUnordered polls futures cooperatively
             // on the current thread. This avoids Send requirements for Store.
             in_flight.push(async move {
-                // Re-check: daemon (or a parallel sync) may have downloaded it
-                let entry_dir = cfg.store_dir().join(&key);
-                if entry_dir.exists() {
+                // Extraction alone does not commit an entry for local consumers.
+                if store.contains(&key) {
                     ok_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     return;
                 }
 
+                let entry_dir = cfg.store_dir().join(&key);
                 let blobs_dir = cfg.store_dir().join("blobs");
                 let result = remote_cache
                     .download_entry(&key, &crate_name, &entry_dir, &blobs_dir, None)

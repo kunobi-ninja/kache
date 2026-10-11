@@ -4783,9 +4783,9 @@ impl Daemon {
             .await
         {
             Ok(permit) => permit,
-            Err(error) => {
-                let class = classify_remote_error(&error);
-                breaker_permit.failure(class, &format!("{error:#}"));
+            Err(_) => {
+                // No backend request was made while waiting for local capacity.
+                // Drop the unfinished permit without recording a remote failure.
                 return Response::found(false);
             }
         };

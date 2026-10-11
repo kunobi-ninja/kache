@@ -5343,6 +5343,13 @@ impl Daemon {
             })
             .buffer_unordered(prefetch_concurrency_cap(self.config.s3_concurrency));
 
+        // Reserve entries for admitted candidates, including their v3 fallback.
+        // Opportunistic siblings may only spend the remaining plan allowance.
+        let mut sibling_budget = (self.config.prefetch_max_keys != 0).then(|| {
+            self.config
+                .prefetch_max_keys
+                .saturating_sub(wanted.len() as u64)
+        });
         let mut verified = Vec::new();
         let mut receipts = Vec::new();
         // Consume each body as it arrives. Retaining completed bodies while
@@ -5390,11 +5397,20 @@ impl Daemon {
                     outcome: "cancelled".to_owned(),
                     ..Default::default()
                 });
+                let requested = wanted.contains(key);
+                if !requested && sibling_budget == Some(0) {
+                    receipt.accounting().entries[entry_index].outcome =
+                        "over_key_budget".to_owned();
+                    continue;
+                }
                 let entry_dir = self.entry_dir_for(key);
                 if !try_claim_packed_download(&self.downloading, key, &entry_dir).await {
                     receipt.accounting().entries[entry_index].outcome =
                         "already_present_or_inflight".to_owned();
                     continue;
+                }
+                if !requested && let Some(budget) = &mut sibling_budget {
+                    *budget -= 1;
                 }
                 let guard = DownloadingGuard::new(self.downloading.clone(), key.clone());
                 match crate::remote_layout::extract_verified_prefetch_entry(

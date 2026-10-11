@@ -821,12 +821,9 @@ pub fn read_events_and<T>(
     let reader = BufReader::new(&file);
     let mut events = Vec::new();
 
-    for line in reader.lines() {
+    for line in reader.split(b'\n') {
         let line = line?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        match serde_json::from_str::<BuildEvent>(&line) {
+        match serde_json::from_slice::<BuildEvent>(&line) {
             Ok(event) => events.push(event),
             Err(e) => {
                 tracing::debug!("skipping invalid event line: {}", e);

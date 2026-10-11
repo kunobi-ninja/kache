@@ -13401,7 +13401,7 @@ fn guard_files_without_a_cache_do_not_queue_memo_rows() {
     assert!(hasher.pending_memo.borrow().is_empty());
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
 fn guard_file_memos_do_not_merge_lossy_path_spellings() {
     use std::os::unix::ffi::OsStringExt;

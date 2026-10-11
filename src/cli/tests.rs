@@ -6981,6 +6981,65 @@ async fn sync_with_client_pull_downloads_and_imports_entry() {
     );
 }
 
+#[tokio::test]
+async fn sync_with_client_pull_recovers_uncommitted_extracted_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = save_manifest_config(dir.path().to_path_buf(), Some(test_remote_cfg()));
+    let store = Store::open(&config).unwrap();
+    let remote = test_remote_cfg();
+    let key = sync_test_cache_key("uncommitted-extracted-pull");
+    let pack_path = format!("prefix/v3/packs/serde/{key}.tar.zst");
+    let backend = TestBackend::memory();
+    backend
+        .seed(
+            &format!("prefix/v3/manifests/serde/{key}.json"),
+            b"{}".to_vec(),
+        )
+        .await;
+    backend
+        .seed(&pack_path, build_entry_pack(&key, "serde"))
+        .await;
+    let client = as_cache_remote(as_remote_backend(&backend), &remote);
+    crate::cache_remote::CacheRemote::download_entry(
+        &client,
+        &key,
+        "serde",
+        &store.entry_dir(&key),
+        &store.blobs_dir(),
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(store.entry_dir(&key).join("libfoo.rlib").is_file());
+    assert!(!store.contains(&key));
+
+    sync_with_client(
+        &client, &config, &store, None, true, false, false, true, None, false, false,
+    )
+    .await
+    .expect("sync should recover extraction interrupted before index import");
+    let meta = store
+        .get(&key)
+        .unwrap()
+        .expect("successful sync must make the extracted entry available to local consumers");
+    assert_eq!(
+        fs::read(store.blob_path(&meta.files[0].hash)).unwrap(),
+        b"real artifact bytes"
+    );
+    assert_eq!(backend.get_calls(), vec![pack_path.clone(), pack_path]);
+
+    sync_with_client(
+        &client, &config, &store, None, true, false, false, true, None, false, false,
+    )
+    .await
+    .expect("syncing a committed entry should remain successful");
+    assert_eq!(
+        backend.get_calls().len(),
+        2,
+        "committed entries need no pull"
+    );
+}
+
 struct DisappearingBackend {
     inner: Arc<TestBackend>,
     on_put_delete: std::path::PathBuf,

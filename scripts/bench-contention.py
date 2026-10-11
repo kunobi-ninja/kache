@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import platform
+import secrets
 import shutil
 import signal
 import stat
@@ -19,6 +20,8 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import tomllib
+
+from bench.design import ordered, plan
 
 JOBS = (
     ("check", ["check", "--locked"]),
@@ -1123,8 +1126,9 @@ def run_batches(args, arms, mirror, work, data):
     workload = getattr(args, "workload", JOBS)
     context_samples = getattr(args, "context_samples", None) or args.samples
     for sample in range(args.samples):
-        for arm, binary, scheduler, backend in (
-            arms if (sample + args.order_seed) % 2 == 0 else list(reversed(arms))
+        for position, (arm, binary, scheduler, backend) in enumerate(
+            ordered(sample, arms, data["randomization"]) if data.get("randomization") is not None
+            else (arms if (sample + args.order_seed) % 2 == 0 else list(reversed(arms)))
         ):
             if backend != "kache" and sample >= context_samples:
                 continue
@@ -1160,6 +1164,7 @@ def run_batches(args, arms, mirror, work, data):
                     f"{args.project} sample {sample + 1}/{args.samples}: {arm} {phase}",
                     flush=True,
                 )
+                began = time.monotonic()
                 result = run_phase(
                     args,
                     binary,
@@ -1178,6 +1183,9 @@ def run_batches(args, arms, mirror, work, data):
                         "sample": sample,
                         "cold_seed": sample // args.cold_every,
                         "arm": arm,
+                        "position": position,
+                        "started_monotonic_s": began,
+                        "ended_monotonic_s": time.monotonic(),
                         **result,
                     }
                 )
@@ -1233,7 +1241,8 @@ def main():
     )
     parser.add_argument("--sccache")
     parser.add_argument("--mbx")
-    parser.add_argument("--order-seed", type=int, default=0)
+    parser.add_argument("--order-seed", type=int, help="recorded order seed; defaults to a fresh seed")
+    parser.add_argument("--comparison-family-size", type=int, choices=range(3, 1001), default=3)
     parser.add_argument("--timeout", type=int, default=1200)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--keep-work", action="store_true")
@@ -1278,8 +1287,12 @@ def main():
     source = profile["source"]
     args.scenario_files = profile.get("file", [])
     args.toolchain = args.toolchain or {"hk": "1.97.1", "eza": "1.90.0", "aube": "1.97.1"}[args.project]
+    if args.order_seed is None:
+        args.order_seed = secrets.randbits(64)
+    randomization = plan(args.samples, args.cold_every, args.order_seed, args.comparison_family_size) if {"base", "head"} <= {arm[0] for arm in arms} else None
     data = {
         "schema_version": 1,
+        "randomization": randomization,
         "project": args.project,
         "workload": "contention",
         "diagnostic_phase_tracing": args.trace_phases,
@@ -1312,6 +1325,7 @@ def main():
         "records": [],
     }
     args.output.mkdir(parents=True, exist_ok=False)
+    (args.output / "samples.json").write_text(json.dumps(data, indent=2) + "\n")
     work = args.output / "work"
     work.mkdir()
     # A six-job cold+warm batch can exceed the normal 10 MiB event log cap.

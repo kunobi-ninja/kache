@@ -137,20 +137,39 @@ it. With more than one sample, each time shows its range.
 source/tool versions, arm order, and the head/base/instrument identities.
 Build logs and engine reports are retained for each sample.
 
-Only Kache head versus base decides the PR verdict. Increased misses or
-passthroughs fail independently of elapsed time. A timing regression needs at
-least five paired samples, a paired-median bootstrap 95% interval entirely
-above +5%, and a median increase above 250 ms. A corresponding reduction is
-reported as an improvement. Other timing results are **inconclusive**. On every
-PR, head and base each take six samples of both warm phases, so both get a
-timing verdict. Their two cold samples are reported without one. sccache and
-mbx run once, since they never decide the verdict. With the `bench` label,
-every tool takes six samples.
+Only Kache head versus base decides the PR verdict. Increased warm misses or
+passthroughs fail independently of elapsed time. Timing tests compare against
+zero change; there is no automatic percentage or duration allowance.
 
-Intervals describe these samples on this runner. Shared-host load and samples
-reusing a cold seed can remain correlated. Confirm a candidate improvement in
-another run before treating a small difference as repeatable. The nightly
-checks whether improvements carry over to larger subjects.
+Before measuring, the harness records a randomized base/head order for each
+cold-cache seed. Even numbers of seeds use balanced AB/BA assignments; odd
+numbers use independent assignments. The same order holds for that seed's warm
+repeats. Those repeats form one statistical block. The report shows geometric
+paired changes, exact two-sided randomization probabilities and simultaneous
+95% family intervals. Intervals assume a constant proportional effect and
+condition on this run's measurement slots. They do not describe variation
+across machines or nights.
+
+Declare the timing and cold-count family before running with
+`--comparison-family-size`. The three-subject PR suite declares 18 comparisons
+and uses Bonferroni correction, which allows dependence between phases.
+A detected positive change fails; a detected negative change is an improvement.
+Other results are **inconclusive**, including legacy data without a recorded
+randomization. Nonsignificance does not establish parity.
+
+The default six isolated samples reuse two cold seeds. They provide only two
+randomized blocks, so timing remains inconclusive. Six fresh contention seeds
+also cannot resolve a two-sided test at this suite's corrected level. Sample
+counts and runtime remain unchanged. For a focused comparison, use
+`--samples 12 --cold-every 1 --skip-contention`; predeclare a larger family when
+combining workloads. Repeat on another lease before generalizing the result.
+Other tools provide context and never decide the verdict.
+
+The method follows [randomized blocks](https://www.itl.nist.gov/div898/handbook/pri/section3/pri332.htm),
+[exact paired permutation tests](https://docs.scipy.org/doc/scipy/reference/generated/scipy.stats.permutation_test.html)
+and [Bonferroni intervals](https://www.itl.nist.gov/div898/handbook/prc/section4/prc463.htm).
+A successful measurement job means its validity and regression checks passed;
+an **INCONCLUSIVE** report is not a performance approval.
 
 Missing phases, zero restores, cache errors, or invalid Kache verdicts produce
 **INVALID MEASUREMENT**. A fast build that did not exercise the cache is not a
@@ -260,22 +279,13 @@ results under `contention/` and includes the statistics in `summary.json`.
 Missing backend reports or failed builds invalidate the suite.
 
 PRs measure six fresh cold contention seeds and six warm batches per Kache
-arm. mbx runs once normally and six cold/warm pairs with the `bench` label. Cold
-samples alternate arm order. Cold duplicate compilation counts vary with
-overlap: a one-sided paired sign test must fall below 0.05 / 3, sharing the
-false-positive budget across hk, eza and aube. Tied counts carry no directional
-evidence. With six pairs, every pair must grow to fail this check; one tie or
-one decrease leaves it inconclusive. The report shows the number of pairs,
-the probability and the decision.
+arm. Cold duplicate counts use the recorded order randomization and the same
+predeclared family as timings. Warm increases in duplicate compilations,
+misses or passthroughs fail immediately. Nightly runs without a base arm report
+descriptive counts and timings.
 
-Warm increases in duplicate compilations, misses or passthroughs still fail
-immediately. Both cold and warm contention timing use the paired timing gate.
-Nightly runs have no base arm and report counts without a regression verdict.
-Local runs keep a fresh cold seed every third sample by default; fewer than
-six non-tied cold pairs cannot establish duplicate growth.
-
-Use `--contention-samples 6 --contention-cold-every 1` with `bench-short`
-for six fresh cold pairs in a local comparison,
+Use `--contention-samples 12 --contention-cold-every 1` with `bench-short`
+for twelve fresh paired seeds in a focused comparison,
 or `--skip-contention` to focus on isolated builds. To run only contention
 with all three tools, add `--sccache /path/to/sccache --mbx /path/to/mbx` to the
 standalone command. Compiler invocation and internal wait counters come from

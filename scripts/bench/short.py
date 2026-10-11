@@ -6,6 +6,7 @@ import json
 import math
 import os
 import platform
+import secrets
 import shutil
 import subprocess
 import sys
@@ -13,6 +14,7 @@ import time
 from pathlib import Path
 
 from bench import report as perf_gate_report
+from bench.design import ordered, plan
 from bench.engine import MEASUREMENT_TIMEOUT, installed, run_measurement, tool_path
 from bench.stats import contention_comparison, summarize, validate
 
@@ -117,7 +119,9 @@ def run_contention(args, arms, timeout=None):
         "--context-samples",
         str(context_samples),
         "--order-seed",
-        str(args.order_seed),
+        str(args.order_seed + 1),
+        "--comparison-family-size",
+        str(getattr(args, "comparison_family_size", None) or 6),
         "--output",
         str(output),
     ]
@@ -159,7 +163,11 @@ def run_contention(args, arms, timeout=None):
     actual = [(r["sample"], r["arm"], r["phase"]) for r in data["records"]]
     if data.get("error") or set(actual) != expected or len(actual) != len(expected):
         raise ValueError("incomplete contention measurements")
-    comparisons, failures = contention_comparison(data["records"])
+    expected_design = plan(samples, cold_every, args.order_seed + 1,
+                           getattr(args, "comparison_family_size", None) or 6)
+    if {"base", "head"} <= {arm[0] for arm in arms} and data.get("randomization") != expected_design:
+        raise ValueError("contention randomization differs from the requested plan")
+    comparisons, failures = contention_comparison(data["records"], data.get("randomization"))
     return {
         "statistics": json.loads((output / "summary.json").read_text()),
         "comparisons": comparisons,
@@ -194,7 +202,10 @@ VERDICT_ARMS = ("head", "base", "kache")
 
 def sample_arms(sample, arms, args):
     """The arms a sample measures, in the order it measures them."""
-    order = arms if (sample + args.order_seed) % 2 == 0 else list(reversed(arms))
+    design = getattr(args, "randomization", None)
+    order = ordered(sample, arms, design) if design is not None else (
+        arms if (sample + args.order_seed) % 2 == 0 else list(reversed(arms))
+    )
     if sample >= (getattr(args, "context_samples", None) or args.samples):
         order = [a for a in order if a[0] in VERDICT_ARMS]
     return order
@@ -340,6 +351,16 @@ def run(args):
         arms.insert(0, ("base", "kache", args.base))
     arms = [arm for arm in arms if wanted_arm(arm, args)]
     arms = [(name, backend, tool_path(binary)) for name, backend, binary in arms]
+    has_pair = {"base", "head"} <= {arm[0] for arm in arms}
+    planned_contention = args.project in CONTENTION_PROJECTS and not getattr(args, "skip_contention", False)
+    minimum_family = 6 if planned_contention else 3
+    family = getattr(args, "comparison_family_size", None) or minimum_family
+    if family < minimum_family:
+        raise ValueError(f"comparison family must include at least {minimum_family} tests")
+    args.comparison_family_size = family
+    if getattr(args, "order_seed", None) is None:
+        args.order_seed = secrets.randbits(64)
+    args.randomization = plan(args.samples, args.cold_every, args.order_seed, family) if has_pair else None
     records = []
     started = time.monotonic()
     # Wall-clock seconds since the epoch, so a workflow can set it when its
@@ -355,6 +376,7 @@ def run(args):
         "platform": f"{platform.system()} {platform.release()} {platform.machine()}",
         "samples_requested": args.samples,
         "cold_every": args.cold_every,
+        "randomization": args.randomization,
         "identity": {
             key: os.environ.get(key, "")
             for key in (
@@ -374,6 +396,7 @@ def run(args):
         payload["elapsed_s"] = time.monotonic() - started
         (root / "samples.json").write_text(json.dumps(payload, indent=2) + "\n")
 
+    save()  # Persist the complete assignment before the first measurement.
     contention = False
     try:
         try:
@@ -469,6 +492,8 @@ def run(args):
                             "position": position,
                             "arm": arm,
                             "backend": backend,
+                            "started_monotonic_s": began,
+                            "ended_monotonic_s": time.monotonic(),
                             "cold_reused": reused,
                             "result": result,
                         }
@@ -482,7 +507,7 @@ def run(args):
                 raise ValueError(
                     f"the time budget ran out before one full sample: {reason}"
                 ) from None
-        summary = summarize(measured)
+        summary = summarize(measured, args.randomization, allow_incomplete="truncated" in payload)
         # Release isolated-build scratch before allocating six contention targets.
         shutil.rmtree(root / "scratch", ignore_errors=True)
         if (
@@ -559,8 +584,12 @@ def main():
     parser.add_argument(
         "--order-seed",
         type=int,
-        default=int(os.environ.get("BENCH_ORDER_SEED") or 0),
-        help="which tool goes first in the first sample (default: $BENCH_ORDER_SEED, else 0). The nightly passes its run number, so the tool that measures cold first changes from night to night",
+        default=int(os.environ["BENCH_ORDER_SEED"]) if os.environ.get("BENCH_ORDER_SEED") else None,
+        help="seed for recorded base/head order randomization (default: $BENCH_ORDER_SEED, else a fresh seed)",
+    )
+    parser.add_argument(
+        "--comparison-family-size", type=int, choices=range(1, 1001),
+        help="predeclared number of timing/count tests across all workloads (default: 3 isolated, 6 with contention)",
     )
     parser.add_argument(
         "--contention-samples",

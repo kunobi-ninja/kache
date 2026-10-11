@@ -140,9 +140,9 @@ jobs:
           base_ref="$(jq -r '.base.ref // empty' <<<"$pr_json")"
           state="$(jq -r '.state // empty' <<<"$pr_json")"
           expanded="$(jq -r '((.title | contains("[bench]")) or any(.labels[]; .name == "bench"))' <<<"$pr_json")"
-          # Six paired runs of this PR against its base give the paired test
-          # enough to rule on warm builds. Contention also needs six fresh
-          # cold pairs to test duplicate growth. mbx is context and runs once
+          # Six isolated runs provide two seed blocks and descriptive timings.
+          # Six fresh contention seeds retain counters, but cannot resolve the
+          # corrected timing test. mbx is context and runs once
           # unless the bench label requests repeated reference measurements.
           samples=6
           context_samples=1
@@ -406,7 +406,7 @@ jobs:
           python3 "$RUNNER_TEMP/instrument/bench-short.py" \
             --project "$BENCH_PROJECT" --samples "$BENCH_SAMPLES" --order-seed "$ORDER_SEED" \
             --context-samples "$BENCH_CONTEXT_SAMPLES" --contention-samples "$BENCH_CONTENTION_SAMPLES" \
-            --contention-cold-every 1 \
+            --contention-cold-every 1 --comparison-family-size 18 \
             --engine "$RUNNER_TEMP/instrument/kache-scenario" \
             --scenarios "$RUNNER_TEMP/instrument/scenarios" \
             --kache "$RUNNER_TEMP/head/kache" --base "$RUNNER_TEMP/base/kache" \
@@ -540,6 +540,9 @@ jobs:
             # description at 140 characters.
             headline="$(head -n 1 perf-gate/report/perf-gate.md | sed -e 's/^#\{1,\} *//' -e 's/^Perf gate: *//')"
             description="$(printf '%.140s' "$headline")"
+            case "$headline" in
+              INCONCLUSIVE*) description='INCONCLUSIVE: valid measurements; no timing or parity verdict' ;;
+            esac
             if [ "$MEASURE_RESULT" = "success" ]; then
               state=success
             elif [ "$verdict" = 'INVALID MEASUREMENT' ]; then

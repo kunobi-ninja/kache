@@ -94,6 +94,7 @@ class StagingTests(unittest.TestCase):
 class MeasureTests(unittest.TestCase):
     def command_for(self, **overrides):
         args = argparse.Namespace(
+            projects=["hk", "eza", "aube"],
             samples=3,
             cold_every=1,
             skip_contention=True,

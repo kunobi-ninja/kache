@@ -8,12 +8,12 @@ flags, then the renderer. Skipping a step is easy and the usual casualty is a
 phase the change was not aimed at.
 
     scripts/perf-gate-local.py                       # HEAD against origin/main
-    scripts/perf-gate-local.py --projects eza --samples 5 --cold-every 1
+    scripts/perf-gate-local.py --projects eza --samples 12 --cold-every 1
 
 Same shape as the gate: two kache binaries under test, one measuring
 instrument built from the default branch so neither side supplies its own
-ruler, and `perf-gate-report.py` deciding the verdict. Exit status is the
-gate's: non-zero when a phase regressed.
+ruler, and `perf-gate-report.py` deciding the verdict. Exit status is non-zero for invalid measurements or detected regressions.
+An inconclusive report does not approve performance.
 
 The working tree is never switched. Each build happens in its own temporary
 worktree, so this is safe to run with uncommitted changes -- though what gets
@@ -37,9 +37,7 @@ REPO = SCRIPTS.parent
 def renderer_from(staging):
     """Load the staged `perf-gate-report.py`, not the checkout's copy.
 
-    The threshold lives in that file. Importing the working tree's version
-    would let a change to the threshold pass judgement on itself, which is the
-    one thing staging the instrument exists to prevent.
+    Load report policy from the same staged instrument as the measurements.
     """
     spec = importlib.util.spec_from_file_location(
         "perf_gate_report", staging / "bench" / "report.py"
@@ -162,6 +160,8 @@ def measure(project, args, staging, head, base, output):
         str(args.samples),
         "--cold-every",
         str(args.cold_every),
+        "--comparison-family-size",
+        str(len(args.projects) * (3 if args.skip_contention else 6)),
         "--engine",
         str(staging / "kache-scenario"),
         "--scenarios",

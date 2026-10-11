@@ -687,7 +687,7 @@ else:
             )
             self.assertEqual(export.call_args.args[0][:3], ["/mbx", "cache", "trace"])
 
-    def test_repeated_warm_batches_restore_cold_snapshots_and_alternate_arms(self):
+    def test_repeated_warm_batches_restore_cold_snapshots_and_follow_randomized_blocks(self):
         for cold_every, samples, context in (
             (1, 3, None), (3, 6, None), (1, 6, 1), (3, 6, 1)
         ):
@@ -714,7 +714,7 @@ else:
                 ]
                 if context is not None:
                     arms.append(("mbx", Path("/mbx"), 1, "mbx"))
-                data = {"records": []}
+                data = {"records": [], "randomization": bench.plan(samples, cold_every, 0, 3)}
 
                 def clone(command, **kwargs):
                     Path(command[-1]).mkdir()
@@ -769,7 +769,7 @@ else:
                         list(range(samples)),
                     )
                 for sample in range(samples):
-                    order = arms if sample % 2 == 0 else list(reversed(arms))
+                    order = bench.ordered(sample, arms, data["randomization"])
                     expected = [
                         arm for arm, _, _, backend in order
                         if backend == "kache" or sample < context

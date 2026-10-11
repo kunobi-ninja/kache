@@ -11,8 +11,6 @@ import json
 import sys
 from pathlib import Path
 
-from bench.stats import COUNT_GROWTH_ALPHA
-
 PHASES = (
     ("cold", "Cold"),
     ("warm_same_tree", "Warm, same path"),
@@ -24,7 +22,6 @@ COMPARISONS = PHASES + tuple(
     for phase, label in CONTENTION_PHASES
 )
 ARM_ORDER = ("head", "kache", "base", "mbx", "sccache")
-MIN_PAIRS = 5
 
 
 def number(ms):
@@ -56,7 +53,7 @@ def timing(row):
 def change(comparison):
     if comparison is None:
         return "—"
-    text = f"{comparison['median_pct']:+.1f}%"
+    text = f"{comparison.get('geometric_pct', comparison['median_pct']):+.1f}%"
     if comparison["outcome"] != "inconclusive":
         text = f"**{text} {comparison['outcome']}**"
     return text
@@ -94,6 +91,16 @@ def load(directory):
         )
         return project
     project["summary"] = json.loads(summary.read_text())
+    for comparison in project["summary"].get("comparisons", []):
+        if comparison.get("method") != "exact_order_randomization":
+            comparison.update(outcome="inconclusive", interval_pct=None,
+                              p_value=None, p_adjusted=None, blocks=None)
+            growth = comparison.get("duplicate_key_compiles")
+            if growth is not None:
+                growth.update(outcome="inconclusive", p_value=None, p_adjusted=None)
+            # Retain recorded legacy failures as history, without treating
+            # their bootstrap/sign-test output as new randomization evidence.
+            project["legacy_statistics"] = True
     contention = directory / "contention" / "samples.json"
     if "contention" in project["summary"] and contention.exists():
         project["contention"] = json.loads(contention.read_text())
@@ -168,17 +175,7 @@ def head_vs_base(projects):
                 verdict,
             ]
         lines.append("| " + " | ".join(cells) + " |")
-    pairs = [c["n"] for p in compared for c in p["summary"]["comparisons"]]
-    lines.append("")
-    if max(pairs) < MIN_PAIRS:
-        noun = "pair" if max(pairs) == 1 else "pairs"
-        lines.append(
-            f"Times are medians. With {max(pairs)} {noun} per build and {MIN_PAIRS} needed for a timing verdict, every change is inconclusive."
-        )
-    else:
-        lines.append(
-            f"Times are medians; positive changes are slower. A change is marked only when it clears the paired test below, so builds with fewer than {MIN_PAIRS} pairs stay inconclusive."
-        )
+    lines += ["", "Times are medians; paired changes use geometric means across cold-seed blocks. Positive changes are slower. Inconclusive evidence does not establish parity."]
     return lines
 
 
@@ -350,15 +347,17 @@ def comparison_detail(projects):
             if c is None:
                 cells.append("—")
                 continue
-            interval = c["interval_95_pct"]
+            interval = c.get("interval_pct")
             bounds = (
                 ""
                 if interval is None
-                else f" ({interval[0]:+.1f}% to {interval[1]:+.1f}%)"
+                else " (" + " to ".join("unbounded" if x is None else f"{x:+.1f}%" for x in interval) + ")"
             )
             noun = "pair" if c["n"] == 1 else "pairs"
             cells.append(
-                f"{c['median_pct']:+.1f}%{bounds}, {c['n']} {noun}, {c['outcome']}"
+                f"{c.get('geometric_pct', c['median_pct']):+.1f}%{bounds}, {c['n']} {noun}, "
+                + (f"{c['blocks']} seed blocks, adjusted p={c['p_adjusted']:.4f}, " if c.get("blocks") is not None else "descriptive, ")
+                + c["outcome"]
             )
         body.append(f"| {label} | " + " | ".join(cells) + " |")
     cells = []
@@ -372,13 +371,15 @@ def comparison_detail(projects):
             "—"
             if growth is None
             else f"{growth['positive_pairs']}/{growth['nonzero_pairs']} non-tied pairs grew "
-            f"({growth['n']} measured), p={growth['p_value']:.4f}, {growth['outcome']}"
+            f"({growth['n']} measured), "
+            + (f"adjusted p={growth['p_adjusted']:.4f}, " if growth.get("p_adjusted") is not None else "descriptive, ")
+            + growth["outcome"]
         )
     if any(c != "—" for c in cells):
         body.append("| Cold contention duplicate compiles | " + " | ".join(cells) + " |")
     body += [
         "",
-        f"Head and base run as paired samples; positive changes are slower. Parentheses hold the 95% bootstrap interval. A timing regression needs at least {MIN_PAIRS} pairs, an interval entirely above +5% and a median change above 250 ms; an improvement is the mirror image. Cold duplicate compiles vary with overlap: growth needs a one-sided paired sign test below {COUNT_GROWTH_ALPHA:.4f} (0.05 across three subjects). With six cold pairs, all six must grow; a tie or decrease leaves the count result inconclusive. Warm increases in duplicate compiles, misses or passthroughs fail immediately. `samples.json` in the run artifacts has source and tool versions, run order and raw reports.",
+        "Base/head order is randomized per cold seed. Warm repeats from one seed form one block. Exact two-sided assignment tests compare against zero change; Bonferroni correction covers the predeclared timing/count family. Parentheses show simultaneous family intervals under a constant proportional effect model, conditional on this run. Unbounded intervals and legacy runs stay inconclusive. Nonsignificance does not establish parity. Warm increases in duplicate compiles, misses or passthroughs fail immediately. `samples.json` retains the schedule and raw reports.",
     ]
     return details("Paired comparison", body)
 
@@ -388,8 +389,11 @@ def render(directories, verdict=None):
     valid = [p for p in projects if "summary" in p]
     invalid = [p for p in projects if "error" in p]
     failures = [(p["name"], f) for p in valid for f in p["summary"]["failures"]]
-    if verdict is None:
-        verdict = "INVALID MEASUREMENT" if invalid else "FAIL" if failures else "pass"
+    comparisons = [c for p in valid for c in p["summary"]["comparisons"]]
+    if verdict is None or verdict == "pass":
+        verdict = ("INVALID MEASUREMENT" if invalid else "FAIL" if failures
+                   else "INCONCLUSIVE" if any(c["outcome"] == "inconclusive" for c in comparisons)
+                   else "NO DETECTED REGRESSION" if comparisons else "DESCRIPTIVE")
     names = ", ".join(p["name"] for p in projects)
     lines = [f"## Perf gate: {verdict} ({names})", ""]
     for p in invalid:
@@ -400,6 +404,8 @@ def render(directories, verdict=None):
         lines.append("")
     elif valid and any(p["summary"]["comparisons"] for p in valid):
         lines += ["Kache misses and passthroughs did not rise against base.", ""]
+    if any(p.get("legacy_statistics") for p in valid):
+        lines += ["Descriptive comparisons carry no statistical verdict. Recorded failures remain visible.", ""]
     if valid:
         table = head_vs_base(valid)
         lines += table + ([""] if table else [])

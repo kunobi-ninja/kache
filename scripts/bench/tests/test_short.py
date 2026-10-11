@@ -13,7 +13,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from bench import engine, report, short, stats
+from bench import design, engine, report, short, stats
 
 
 def result(backend="kache", ms=10000):
@@ -158,23 +158,12 @@ class BenchTests(unittest.TestCase):
         summary = stats.summarize([record("kache", i) for i in range(6)])
         self.assertEqual([s["n"] for s in summary["statistics"]], [2, 6, 6])
 
-    def test_paired_regression_and_noise(self):
-        self.assertEqual(
-            stats.paired_change([10000] * 6, [12000] * 6)["outcome"], "regression"
-        )
-        self.assertEqual(
-            stats.paired_change([10000] * 6, [8000] * 6)["outcome"], "improvement"
-        )
-        self.assertEqual(
-            stats.paired_change([10000] * 6, [9000, 12000] * 3)["outcome"],
-            "inconclusive",
-        )
-        self.assertEqual(
-            stats.paired_change([10000], [15000])["outcome"], "inconclusive"
-        )
-        self.assertEqual(
-            stats.paired_change([1000] * 6, [1100] * 6)["outcome"], "inconclusive"
-        )
+    def test_legacy_pairs_are_descriptive_even_with_large_changes(self):
+        for value in (8000, 12000, 15000):
+            change = stats.paired_change([10000] * 6, [value] * 6)
+            self.assertEqual(change["outcome"], "inconclusive")
+            self.assertIsNone(change["p_value"])
+            self.assertIsNone(change["interval_pct"])
 
     def test_pair_and_identity_validation(self):
         with self.assertRaises(ValueError):
@@ -239,7 +228,7 @@ class BenchTests(unittest.TestCase):
                     "a missing tool keeps its name so the failure names it",
                 )
 
-    def test_driver_alternates_arms_and_saves_samples(self):
+    def test_driver_randomizes_seed_blocks_and_saves_samples(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             args = argparse.Namespace(
@@ -258,7 +247,12 @@ class BenchTests(unittest.TestCase):
             )
             calls = []
 
-            invoke = fake_engine(calls)
+            measure = fake_engine(calls)
+
+            def invoke(command, **kwargs):
+                payload = json.loads((args.output / "samples.json").read_text())
+                self.assertEqual(payload["randomization"], design.plan(6, 3, 0, 6))
+                measure(command, **kwargs)
 
             def contention(args, arms, timeout=None):
                 self.assertIsNone(timeout)
@@ -284,16 +278,20 @@ class BenchTests(unittest.TestCase):
                 self.assertEqual(short.run(args), 0)
             self.assertEqual(len(calls), 24)
             self.assertTrue(calls[0][calls[0].index("--kache") + 1].endswith("/base"))
-            self.assertEqual(calls[4][calls[4].index("--cache-backend") + 1], "mbx")
+            self.assertTrue(calls[4][calls[4].index("--kache") + 1].endswith("/base"))
             self.assertNotIn("--retry", calls[0])
             self.assertIn("--retry", calls[4])
             self.assertNotIn("--retry", calls[12])
             self.assertIn("--skip-clone", calls[12])
             payload = json.loads((args.output / "samples.json").read_text())
             self.assertEqual(len(payload["records"]), 24)
+            for sample in range(6):
+                pair = [r for r in payload["records"] if r["sample"] == sample and r["arm"] in ("base", "head")]
+                self.assertEqual([r["arm"] for r in pair], payload["randomization"]["blocks"][sample // 3]["order"])
+                self.assertEqual([r["position"] for r in pair], [0, 1])
             self.assertEqual(payload["contention_samples"], "contention/samples.json")
             text = (args.output / "perf-gate.md").read_text()
-            self.assertTrue(text.startswith("## Perf gate: pass (hk)\n"))
+            self.assertTrue(text.startswith("## Perf gate: INCONCLUSIVE (hk)\n"))
             self.assertIn("| Build | hk base | hk head | hk change |", text)
             self.assertIn("<summary>All tools, isolated builds</summary>", text)
             self.assertFalse((args.output / "scratch").exists())
@@ -349,7 +347,7 @@ class BenchTests(unittest.TestCase):
                     )
         comparisons, failures = stats.contention_comparison(records)
         self.assertEqual(len(comparisons), 2)
-        self.assertEqual(len(failures), 2)
+        self.assertEqual(failures, [])
         for row in records:
             row["wall_ms"] = 10000
         records[-1]["events"]["results"]["miss"] = 1
@@ -646,15 +644,15 @@ class DeadlineTests(unittest.TestCase):
         status, output, payload, calls = self.run_with(budget=415)
         self.assertEqual(status, 1)
         self.assertEqual(
-            [(r["sample"], r["arm"]) for r in payload["records"]][-1], (1, "head")
+            [(r["sample"], r["arm"]) for r in payload["records"]][-1], (1, "base")
         )
-        self.assertIn("sample 2 of 6 (base) was still running", payload["truncated"])
+        self.assertIn("sample 2 of 6 (head) was still running", payload["truncated"])
         summary = json.loads((output / "summary.json").read_text())
         warm = next(c for c in summary["comparisons"] if c["phase"] == "warm")
         self.assertEqual(warm["n"], 1)
         self.assertEqual(run_marker_values(output), ["0"])
         # Every finished build is exported, the unpaired one included.
-        self.assertTrue((output / "logs" / "01-head" / "metrics.otlp.json").exists())
+        self.assertTrue((output / "logs" / "01-base" / "metrics.otlp.json").exists())
 
     def test_no_time_left_skips_contention(self):
         status, output, payload, _ = self.run_with(budget=400, samples=1)
@@ -855,9 +853,9 @@ class ReportTests(unittest.TestCase):
             )
             (hk / "summary.json").write_text(json.dumps(summary))
             eza = subject(root, "eza", paired(1869, 2885))
-            text = self.render([hk, eza])
+            text = self.render([hk, eza], verdict="pass")
 
-        self.assertTrue(text.startswith("## Perf gate: pass (hk, eza)\n"))
+        self.assertTrue(text.startswith("## Perf gate: INCONCLUSIVE (hk, eza)\n"))
         self.assertIn("did not rise against base", text)
         self.assertIn(
             "| Build | hk base | hk head | hk change | eza base | eza head | eza change |",
@@ -865,7 +863,7 @@ class ReportTests(unittest.TestCase):
         )
         self.assertIn("| Cold | 84.6 s | 97.3 s | +15.0% | 1.87 s | 2.88 s | +54.4% |", text)
         self.assertIn("| Contention, warm | 9.00 s | 9.00 s | -10.2% | — | — | — |", text)
-        self.assertIn("every change is inconclusive", text)
+        self.assertIn("Inconclusive evidence does not establish parity", text)
         self.assertEqual(text.count("<details>"), 3)
         self.assertEqual(text.count("<details>"), text.count("</details>"))
         self.assertIn("| head, warm | 3 | 0 | 0.00 s | — |", text)
@@ -902,10 +900,10 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(headline, "## Perf gate: FAIL (hk)")
         self.assertEqual(failed, "**Failed checks**")
         self.assertIn("misses rose 0 → 2", first)
-        self.assertIn("**+20.0% regression**", text)
-        self.assertIn("fewer than 5 pairs stay inconclusive", text)
+        self.assertIn("+20.0%, 6 pairs, descriptive, inconclusive", text)
+        self.assertIn("Nonsignificance does not establish parity", text)
         self.assertIn("<sub>10.0–10.0</sub>", text)
-        self.assertIn("(+20.0% to +20.0%), 6 pairs, regression", text)
+        self.assertNotIn("bootstrap", text)
 
     def test_invalid_subject_is_named_and_the_valid_one_still_reports(self):
         with tempfile.TemporaryDirectory() as tmp:

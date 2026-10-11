@@ -892,14 +892,16 @@ struct StampedRoot {
 
 // A weak identity can survive replacement while the containing tree changes.
 // In particular NTFS can preserve creation time and has no inode here.
-#[cfg(unix)]
 fn guard_file_memo_eligible(size: i64, inode: i64) -> bool {
-    size < MIN_PERSISTED_HASH_BYTES && inode != 0
-}
-
-#[cfg(not(unix))]
-fn guard_file_memo_eligible(_size: i64, _inode: i64) -> bool {
-    false
+    #[cfg(unix)]
+    {
+        size < MIN_PERSISTED_HASH_BYTES && inode != 0
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (size, inode);
+        false
+    }
 }
 
 /// One stat walk per root, each of them and all of them together within
@@ -1522,6 +1524,9 @@ fn crate_tree_fold(
         *budget = budget.checked_sub(1)?;
         let relative = path.strip_prefix(root).ok()?;
         fold_field(hasher, b"path:", relative.as_os_str().as_encoded_bytes());
+        // A memo row settles against the clock before this content walk's
+        // fresh stat, never against metadata from the earlier stamp walk.
+        let observed_ns = wall_clock_ns();
         let Ok(metadata) = std::fs::symlink_metadata(&path) else {
             fold_field(hasher, b"unreadable:", b"");
             continue;
@@ -1545,7 +1550,12 @@ fn crate_tree_fold(
                 budget,
             )?;
         } else if metadata.is_file() {
-            match files.hasher.guard_file_hash(&path, &files.memoised) {
+            match files.hasher.guard_file_hash_from_metadata(
+                &path,
+                &metadata,
+                observed_ns,
+                &files.memoised,
+            ) {
                 Ok(hash) => fold_field(hasher, b"file:", hash.as_bytes()),
                 Err(_) => {
                     fold_field(hasher, b"unreadable:", b"");
@@ -7962,31 +7972,48 @@ impl<'db> FileHasher<'db> {
     }
 
     /// Small tree-guard files share one memo lookup per root. The row must
-    /// still match a fresh stat; misses keep the usual settle and read checks,
-    /// without making a workspace file a key input.
-    #[cfg(unix)]
+    /// still match the content walk's fresh stat; misses keep the usual settle
+    /// and read checks, without making a workspace file a key input.
+    fn guard_file_hash_from_metadata(
+        &self,
+        path: &Path,
+        metadata: &std::fs::Metadata,
+        observed_ns: i64,
+        memoised: &HashMap<FileFingerprint, String>,
+    ) -> Result<String> {
+        #[cfg(unix)]
+        {
+            if self.cache.is_none() || absolute_path(path).to_str().is_none() {
+                return self.hash_unkeyed(path);
+            }
+            let observed = ObservedFingerprint {
+                fingerprint: FileFingerprint {
+                    path: absolute_path(path).to_string_lossy().into_owned(),
+                    size: i64::try_from(metadata.len()).unwrap_or(i64::MAX),
+                    mtime_ns: metadata_mtime_ns(metadata),
+                    ctime_ns: metadata_ctime_ns(metadata),
+                    inode: metadata_inode(metadata),
+                },
+                observed_ns,
+            };
+            self.guard_file_hash_observed(path, observed, memoised)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (metadata, observed_ns, memoised);
+            self.hash_unkeyed(path)
+        }
+    }
+
+    #[cfg(test)]
     fn guard_file_hash(
         &self,
         path: &Path,
         memoised: &HashMap<FileFingerprint, String>,
     ) -> Result<String> {
-        if self.cache.is_none() || absolute_path(path).to_str().is_none() {
-            return self.hash_unkeyed(path);
-        }
-        let observed = match ObservedFingerprint::from_path(path) {
-            Ok(observed) => observed,
-            _ => return self.hash_unkeyed(path),
-        };
-        self.guard_file_hash_observed(path, observed, memoised)
-    }
-
-    #[cfg(not(unix))]
-    fn guard_file_hash(
-        &self,
-        path: &Path,
-        _memoised: &HashMap<FileFingerprint, String>,
-    ) -> Result<String> {
-        self.hash_unkeyed(path)
+        let observed_ns = wall_clock_ns();
+        let metadata = std::fs::symlink_metadata(path)?;
+        self.guard_file_hash_from_metadata(path, &metadata, observed_ns, memoised)
     }
 
     #[cfg(any(unix, test))]

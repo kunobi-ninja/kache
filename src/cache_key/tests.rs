@@ -13468,6 +13468,75 @@ fn small_guard_file_memos_reuse_absolute_rows_from_relative_roots() {
 
 #[cfg(unix)]
 #[test]
+fn a_guard_leaf_changed_after_its_metadata_leaves_no_memo_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("input.txt");
+    write_file(&path, "before");
+    filetime::set_file_mtime(&path, filetime::FileTime::from_unix_time(1_000_000_000, 0)).unwrap();
+    let metadata = std::fs::symlink_metadata(&path).unwrap();
+    let before = FileFingerprint::from_path(&path).unwrap();
+    // Model a same-size save after the content walk's stat and before its
+    // read. Even a settled observation must not publish that read's bytes
+    // under the earlier fingerprint.
+    write_file(&path, "after!");
+    filetime::set_file_mtime(&path, filetime::FileTime::from_unix_time(2_000_000_000, 0)).unwrap();
+    let db = rusqlite::Connection::open_in_memory().unwrap();
+    ensure_file_hash_cache_schema(&db).unwrap();
+    let hasher = FileHasher::from_cache(FileHashCache::Borrowed(&db));
+    let hash = hasher
+        .guard_file_hash_from_metadata(&path, &metadata, i64::MAX, &HashMap::new())
+        .unwrap();
+    assert_eq!(hash, hash_file(&path).unwrap());
+    assert_eq!(hasher.stats().cache_hits, 0);
+    assert_eq!(hasher.stats().cache_misses, 1);
+    assert!(hasher.pending_memo.borrow().is_empty());
+    hasher.flush_memo();
+    let cache = FileHashCache::Borrowed(&db);
+    assert_eq!(cache.get(&before).unwrap(), None);
+    assert_eq!(
+        cache
+            .get(&FileFingerprint::from_path(&path).unwrap())
+            .unwrap(),
+        None
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_guard_leaf_settles_against_the_content_walk_observation() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("input.txt");
+    write_file(&path, "input");
+    filetime::set_file_mtime(&path, filetime::FileTime::from_unix_time(4_000_000_000, 0)).unwrap();
+    let metadata = std::fs::symlink_metadata(&path).unwrap();
+    let fingerprint = FileFingerprint::from_path(&path).unwrap();
+    let changed_ns = fingerprint.mtime_ns.max(fingerprint.ctime_ns);
+    let hash = hash_file(&path).unwrap();
+    // A supplied clock models the two sides of the settle boundary without
+    // waiting. Reading a later clock inside the hash must not replace it.
+    for (observed_ns, settled) in [
+        (changed_ns + HASH_SETTLE_NS - 1, false),
+        (changed_ns + HASH_SETTLE_NS, true),
+    ] {
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        ensure_file_hash_cache_schema(&db).unwrap();
+        let hasher = FileHasher::from_cache(FileHashCache::Borrowed(&db));
+        assert_eq!(
+            hasher
+                .guard_file_hash_from_metadata(&path, &metadata, observed_ns, &HashMap::new())
+                .unwrap(),
+            hash
+        );
+        hasher.flush_memo();
+        assert_eq!(
+            FileHashCache::Borrowed(&db).get(&fingerprint).unwrap(),
+            settled.then(|| hash.clone())
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn small_guard_files_reuse_hashes_when_the_tree_memo_cannot_settle() {
     let dir = tempfile::tempdir().unwrap();
     let tree = dir.path().join("tree");

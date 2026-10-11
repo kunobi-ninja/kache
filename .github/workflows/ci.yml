@@ -642,6 +642,8 @@ jobs:
           NPM_CONFIG_CACHE: ${{ runner.temp }}/workflow-tests-npm-cache
       - name: Test version consistency gate
         run: python3 scripts/test-version-consistency.py
+      - name: Test APT publication ordering
+        run: python3 scripts/test-apt-publish.py
       - name: Test crates.io publish discovery
         run: python3 scripts/test-crates-io.py
       - name: Manifests agree (and match the tag on a v* tag)

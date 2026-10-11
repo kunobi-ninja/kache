@@ -7573,6 +7573,88 @@ fn only_a_refused_listing_marks_the_daemon() {
 }
 
 #[tokio::test]
+async fn packed_prefetch_limits_cold_siblings_without_displacing_requested_entries() {
+    for (limit, warm_sibling, expected_present) in
+        [(1, false, 1), (2, false, 2), (0, false, 3), (2, true, 3)]
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.remote_key_listing = true;
+        config.remote = Some(test_remote_config());
+        config.prefetch_max_bytes = 0;
+        config.prefetch_max_keys = limit;
+        let mut keys = ["budget-first", "budget-second", "budget-requested"].map(test_cache_key);
+        keys.sort();
+        // Catalog order puts both siblings before the requested key.
+        let requested = keys[2].clone();
+        if warm_sibling {
+            seed_store_entry(&config, &keys[0], "serde", dir.path());
+        }
+        let backend = test_remote_backend();
+        let context = PackPrefetchContext::from_deps(
+            crate::identity::host_target_triple(),
+            "linux/toolchain/release",
+            &[("serde".into(), "1.0.0".into())],
+        )
+        .unwrap();
+        let entries = keys
+            .iter()
+            .map(|key| {
+                let (payload, meta_digest) = build_entry_pack_with_meta(key, "serde");
+                crate::remote_pack::PackInputEntry {
+                    cache_key: key.clone(),
+                    crate_name: "serde".into(),
+                    meta_digest,
+                    payload,
+                }
+            })
+            .collect();
+        seed_packed_catalog(&backend, &context, entries, None).await;
+        let daemon = Arc::new(Daemon::new(config));
+        assert!(daemon.remote_backend.set(backend).is_ok());
+        let response = daemon
+            .handle_prefetch_with_context(
+                &PrefetchRequest {
+                    keys: vec![(requested.clone(), "serde".into())],
+                    warm_all: false,
+                    origin: None,
+                    candidate_sources: HashMap::new(),
+                },
+                Some(context),
+                Instant::now(),
+            )
+            .await;
+        assert!(response.ok);
+        let mut tasks = std::mem::take(&mut *daemon.prefetch_tasks.lock().unwrap());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(result) = tasks.join_next().await {
+                result.unwrap();
+            }
+        })
+        .await
+        .expect("packed fixture completes");
+        let (requested_present, present) = daemon
+            .with_store(|store| {
+                Ok((
+                    store.get(&requested)?.is_some(),
+                    keys.iter()
+                        .filter(|key| store.get(key).unwrap().is_some())
+                        .count(),
+                ))
+            })
+            .unwrap();
+        assert!(
+            requested_present,
+            "siblings must not displace the exact requested entry"
+        );
+        assert_eq!(
+            present, expected_present,
+            "packed cold imports must honor limit {limit}, skipping warm siblings without spending it"
+        );
+    }
+}
+
+#[tokio::test]
 async fn packed_prefetch_discovers_one_pack_and_batch_imports_all_entries() {
     let dir = tempfile::tempdir().unwrap();
     let mut config = test_config(dir.path());

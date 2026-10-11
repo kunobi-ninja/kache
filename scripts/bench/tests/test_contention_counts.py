@@ -118,8 +118,8 @@ class ContentionCountTests(unittest.TestCase):
                 project="aube",
                 scenarios=root,
                 samples=6,
-                order_seed=0,
-                comparison_family_size=18,
+                order_seed=int(os.environ.get("PERF_TEST_ORDER_SEED", 314159)),
+                comparison_family_size=int(os.environ.get("PERF_TEST_FAMILY_SIZE", 18)),
                 contention_samples=int(os.environ.get("PERF_TEST_CONTENTION_SAMPLES", 6)),
                 contention_cold_every=int(os.environ.get("PERF_TEST_COLD_EVERY", 1)),
                 context_samples=int(os.environ.get("PERF_TEST_CONTEXT_SAMPLES", 1)),
@@ -134,7 +134,11 @@ class ContentionCountTests(unittest.TestCase):
                 samples = int(command[command.index("--samples") + 1])
                 cold_every = int(command[command.index("--cold-every") + 1])
                 context = int(command[command.index("--context-samples") + 1])
-                schedule = design.plan(samples, cold_every, int(command[command.index("--order-seed") + 1]), int(command[command.index("--comparison-family-size") + 1]))
+                order_seed = int(command[command.index("--order-seed") + 1])
+                family_size = int(command[command.index("--comparison-family-size") + 1])
+                self.assertEqual(order_seed, args.order_seed + 1)
+                self.assertEqual(family_size, args.comparison_family_size)
+                schedule = design.plan(samples, cold_every, order_seed, family_size)
                 rows = records([0] * samples, [40] * samples, schedule)
                 rows = [r for r in rows if r["phase"] == "warm" or r["sample"] % cold_every == 0]
                 rows += [
@@ -151,6 +155,11 @@ class ContentionCountTests(unittest.TestCase):
             self.assertEqual(result["failures"], [])
             growth = result["comparisons"][0]["duplicate_key_compiles"]
             self.assertEqual(growth["n"], 6)
+            self.assertEqual(growth["blocks"], 6)
+            self.assertEqual(growth["assignments"], 20)
+            self.assertEqual(growth["family_size"], 18)
+            self.assertAlmostEqual(growth["p_value"], 0.1)
+            self.assertEqual(growth["p_adjusted"], 1.0)
             self.assertEqual(growth["outcome"], "inconclusive")
 
     def test_missing_contention_records_are_invalid(self):

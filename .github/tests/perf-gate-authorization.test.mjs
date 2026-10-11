@@ -156,17 +156,24 @@ for (const [name, overrides] of [
   ["ordinary", {}],
   ["expanded", { labels: [{ name: "bench" }] }],
 ]) {
-  test(`${name} CI can reject sustained cold duplicate growth`, () => {
+  test(`${name} CI keeps six-seed statistical evidence inconclusive`, () => {
     const outputs = authorization(pullRequest(overrides)).outputs;
     const measure = workflow.jobs.measure.steps.find(
       (step) => step.name === "Measure repeated samples",
     );
     const coldEvery = measure.run.match(/--contention-cold-every (\d+)/)?.[1];
-    assert.ok(coldEvery, "measurement must pass a cold contention cadence");
+    const familySize = measure.run.match(/--comparison-family-size (\d+)/)?.[1];
+    assert.equal(outputs.samples, "6");
+    assert.equal(outputs.contention_samples, "6");
+    assert.equal(outputs.context_samples, name === "ordinary" ? "1" : "6");
+    assert.equal(coldEvery, "1", "contention must use six fresh seed blocks");
+    assert.equal(familySize, "18", "all workloads and phases share one declared family");
+    assert.equal(measure.env.ORDER_SEED, "${{ github.run_number }}");
+    assert.match(measure.run, /--order-seed "\$ORDER_SEED"/);
     assert.equal(measure.env.BENCH_CONTENTION_SAMPLES, "${{ needs.authorize.outputs.contention_samples }}");
     assert.match(measure.run, /--contention-samples "\$BENCH_CONTENTION_SAMPLES"/);
     const result = spawnSync("python3", [
-      "-m", "unittest", "bench.tests.test_contention_counts.ContentionCountTests.test_ci_sampling_rejects_sustained_cold_growth",
+      "-m", "unittest", "bench.tests.test_contention_counts.ContentionCountTests.test_ci_sampling_keeps_low_resolution_evidence_inconclusive",
     ], {
       encoding: "utf8", timeout: 10_000,
       env: {
@@ -175,6 +182,8 @@ for (const [name, overrides] of [
         PERF_TEST_CONTENTION_SAMPLES: outputs.contention_samples,
         PERF_TEST_COLD_EVERY: coldEvery,
         PERF_TEST_CONTEXT_SAMPLES: outputs.context_samples,
+        PERF_TEST_FAMILY_SIZE: familySize,
+        PERF_TEST_ORDER_SEED: "314159",
       },
     });
     assert.ifError(result.error);

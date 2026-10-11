@@ -863,7 +863,7 @@ impl GuardWalk {
     }
 }
 
-/// One root of a [`GuardWalk`], as [`crate::tree_stamp::Stamper::walk`]
+/// One root of a [`GuardWalk`], as [`crate::tree_stamp::Stamper::walk_observing`]
 /// takes it.
 #[derive(Debug, Clone)]
 struct WalkedRoot {
@@ -884,12 +884,31 @@ enum StampRefusal {
     Unwalkable,
 }
 
+struct StampedRoot {
+    stamp: crate::tree_stamp::TreeStamp,
+    entries: usize,
+    small_files: Vec<FileFingerprint>,
+}
+
+// A weak identity can survive replacement while the containing tree changes.
+// In particular NTFS can preserve creation time and has no inode here.
+#[cfg(unix)]
+fn guard_file_memo_eligible(size: i64, inode: i64) -> bool {
+    size < MIN_PERSISTED_HASH_BYTES && inode != 0
+}
+
+#[cfg(not(unix))]
+fn guard_file_memo_eligible(_size: i64, _inode: i64) -> bool {
+    false
+}
+
 /// One stat walk per root, each of them and all of them together within
 /// `max_entries`: the stamp of each, with the entries it holds.
 fn stamp_roots(
     roots: &[WalkedRoot],
     max_entries: usize,
-) -> std::result::Result<Vec<(crate::tree_stamp::TreeStamp, usize)>, StampRefusal> {
+    collect_small_files: bool,
+) -> std::result::Result<Vec<StampedRoot>, StampRefusal> {
     let mut stamps = Vec::with_capacity(roots.len());
     for (index, root) in roots.iter().enumerate() {
         #[cfg(test)]
@@ -901,15 +920,49 @@ fn stamp_roots(
         let mut stamper = crate::tree_stamp::Stamper::new();
         let mut budget = max_entries;
         stamper.label(&root.role);
-        match stamper.walk(&root.path, &root.excluded, root.rules, &mut budget) {
+        let mut small_files = Vec::new();
+        let mut observe = |path: PathBuf, metadata: &std::fs::Metadata| {
+            let size = i64::try_from(metadata.len()).unwrap_or(i64::MAX);
+            let inode = metadata_inode(metadata);
+            if collect_small_files && metadata.is_file() && guard_file_memo_eligible(size, inode) {
+                // The memo stores UTF-8 paths. Lossy spellings could merge
+                // distinct names in the path-keyed batch result.
+                let absolute = if path.is_absolute() {
+                    path
+                } else {
+                    absolute_path(&path)
+                };
+                let Ok(path) = absolute.into_os_string().into_string() else {
+                    return;
+                };
+                small_files.push(FileFingerprint {
+                    path,
+                    size,
+                    mtime_ns: metadata_mtime_ns(metadata),
+                    ctime_ns: metadata_ctime_ns(metadata),
+                    inode,
+                });
+            }
+        };
+        match stamper.walk_observing(
+            &root.path,
+            &root.excluded,
+            root.rules,
+            &mut budget,
+            &mut observe,
+        ) {
             crate::tree_stamp::WalkOutcome::Fits => {
-                stamps.push((stamper.finish(), max_entries - budget));
+                stamps.push(StampedRoot {
+                    stamp: stamper.finish(),
+                    entries: max_entries - budget,
+                    small_files,
+                });
             }
             crate::tree_stamp::WalkOutcome::TooLarge => return Err(StampRefusal::TooLarge(index)),
             crate::tree_stamp::WalkOutcome::Unreadable => return Err(StampRefusal::Unwalkable),
         }
     }
-    if stamps.iter().map(|(_, entries)| entries).sum::<usize>() > max_entries {
+    if stamps.iter().map(|root| root.entries).sum::<usize>() > max_entries {
         return Err(StampRefusal::TooLargeTogether);
     }
     Ok(stamps)
@@ -917,10 +970,10 @@ fn stamp_roots(
 
 /// [`stamp_roots`] for one root.
 fn stamp_root(root: &WalkedRoot, max_entries: usize) -> Option<crate::tree_stamp::TreeStamp> {
-    let (stamp, _) = stamp_roots(std::slice::from_ref(root), max_entries)
+    let stamped = stamp_roots(std::slice::from_ref(root), max_entries, false)
         .ok()?
         .pop()?;
-    Some(stamp)
+    Some(stamped.stamp)
 }
 
 /// Run by [`stamp_roots`] with each root before it walks, so a test can
@@ -1202,7 +1255,7 @@ const TREE_ROOTS_VERSION: &[u8] = b"kache-crate-tree-roots-v1\n";
 /// a new stamp, and the workspace beside it keeps its memo. While a root has
 /// the stamp its digest was recorded under
 /// ([`crate::tree_stamp::TreeStamp::memo_key`]), that digest is the answer;
-/// otherwise every file in it is read, and the digest is recorded
+/// otherwise every file in it is hashed, and the digest is recorded
 /// once the root has settled ([`crate::tree_stamp::TreeStamp::settled_at`]).
 /// Several roots' digests fold into one. The walks go to `file_hasher` for
 /// the guard ([`tree_guard_of`]).
@@ -1229,7 +1282,7 @@ fn tree_digest_memoised(
     if marked_recently(&together, now) {
         return None;
     }
-    let stamps = match stamp_roots(&walked, max_entries) {
+    let stamps = match stamp_roots(&walked, max_entries, file_hasher.cache.is_some()) {
         Ok(stamps) => stamps,
         Err(StampRefusal::TooLarge(index)) => {
             write_marker(&oversized_tree_marker(
@@ -1245,21 +1298,21 @@ fn tree_digest_memoised(
         }
         Err(StampRefusal::Unwalkable) => return None,
     };
-    let total: usize = stamps.iter().map(|(_, entries)| entries).sum();
+    let total: usize = stamps.iter().map(|root| root.entries).sum();
     let mut digests = Vec::with_capacity(roots.len());
     let mut walks = Vec::with_capacity(roots.len());
-    for ((root, walked), (stamp, entries)) in roots.iter().zip(walked).zip(stamps) {
+    for ((root, walked), stamped) in roots.iter().zip(walked).zip(stamps) {
         let walk = GuardWalk {
             root: walked,
             max_entries,
-            stamp: stamp.digest.clone(),
+            stamp: stamped.stamp.digest.clone(),
         };
         // A read may spend what the other roots leave of the budget.
-        let budget = max_entries - (total - entries);
+        let budget = max_entries - (total - stamped.entries);
         digests.push(root_digest(
             root,
             &walk,
-            &stamp,
+            &stamped,
             budget,
             file_hasher,
             memo_dir,
@@ -1281,18 +1334,18 @@ fn tree_digest_memoised(
     Some(hasher.finalize().to_hex().to_string())
 }
 
-/// The digest of `root`, which `walk` stamped as `stamp`: the memoised one
-/// while the root has the stamp it was recorded under, otherwise a read of
-/// every file in it within `budget` entries.
+/// The digest of `root`, which `walk` stamped: the memoised one while the
+/// stamp holds, otherwise a hash of every file within `budget` entries.
 fn root_digest(
     root: &TreeRoot<'_>,
     walk: &GuardWalk,
-    stamp: &crate::tree_stamp::TreeStamp,
+    stamped: &StampedRoot,
     mut budget: usize,
     file_hasher: &FileHasher<'_>,
     memo_dir: &Path,
     now: std::time::SystemTime,
 ) -> Option<String> {
+    let stamp = &stamped.stamp;
     let memo = tree_digest_memo(memo_dir, root);
     if let Some(digest) = crate::tree_stamp::memoised_digest(&memo, stamp.memo_key())
         .filter(|digest| digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit()))
@@ -1301,6 +1354,14 @@ fn root_digest(
         return Some(digest);
     }
     crate::phase_trace::decision("tree_memo", "miss");
+    // A batch result is keyed by path; retain the exact queried fingerprint
+    // as well, so the later content walk cannot use a row for another stamp.
+    let mut hashes = file_hasher.memoised_hashes(stamped.small_files.iter());
+    let memoised: HashMap<FileFingerprint, String> = stamped
+        .small_files
+        .iter()
+        .filter_map(|stamp| hashes.remove(&stamp.path).map(|hash| (stamp.clone(), hash)))
+        .collect();
     let mut hasher = blake3::Hasher::new();
     hasher.update(TREE_DIGEST_VERSION);
     fold_field(&mut hasher, b"root:", root.role);
@@ -1309,7 +1370,10 @@ fn root_digest(
         &root.path,
         &root.excluded(),
         root.skips_build_dirs,
-        file_hasher,
+        &GuardFileHashes {
+            hasher: file_hasher,
+            memoised,
+        },
         &mut hasher,
         &mut budget,
     )?;
@@ -1414,6 +1478,11 @@ fn registry_src_root(manifest_dir: &Path) -> Option<&Path> {
     manifest_dir.parent()?.parent()
 }
 
+struct GuardFileHashes<'a, 'db> {
+    hasher: &'a FileHasher<'db>,
+    memoised: HashMap<FileFingerprint, String>,
+}
+
 /// Fold the entries under `directory` by path, kind and content. A symlink
 /// counts by its text and is not followed. With `skips_build_dirs`, a
 /// directory below `root` that Cargo tagged as its build directory counts by
@@ -1426,7 +1495,7 @@ fn crate_tree_fold(
     directory: &Path,
     excluded: &[PathBuf],
     skips_build_dirs: bool,
-    file_hasher: &FileHasher<'_>,
+    files: &GuardFileHashes<'_, '_>,
     hasher: &mut blake3::Hasher,
     budget: &mut usize,
 ) -> Option<bool> {
@@ -1471,12 +1540,12 @@ fn crate_tree_fold(
                 &path,
                 excluded,
                 skips_build_dirs,
-                file_hasher,
+                files,
                 hasher,
                 budget,
             )?;
         } else if metadata.is_file() {
-            match file_hasher.hash_unkeyed(&path) {
+            match files.hasher.guard_file_hash(&path, &files.memoised) {
                 Ok(hash) => fold_field(hasher, b"file:", hash.as_bytes()),
                 Err(_) => {
                     fold_field(hasher, b"unreadable:", b"");
@@ -7890,6 +7959,61 @@ impl<'db> FileHasher<'db> {
     pub(crate) fn hash_unkeyed(&self, path: &Path) -> Result<String> {
         let _trace = crate::phase_trace::phase("input_hash");
         self.hash_inner(path, false).map(|(hash, _)| hash)
+    }
+
+    /// Small tree-guard files share one memo lookup per root. The row must
+    /// still match a fresh stat; misses keep the usual settle and read checks,
+    /// without making a workspace file a key input.
+    #[cfg(unix)]
+    fn guard_file_hash(
+        &self,
+        path: &Path,
+        memoised: &HashMap<FileFingerprint, String>,
+    ) -> Result<String> {
+        if self.cache.is_none() || absolute_path(path).to_str().is_none() {
+            return self.hash_unkeyed(path);
+        }
+        let observed = match ObservedFingerprint::from_path(path) {
+            Ok(observed) => observed,
+            _ => return self.hash_unkeyed(path),
+        };
+        self.guard_file_hash_observed(path, observed, memoised)
+    }
+
+    #[cfg(not(unix))]
+    fn guard_file_hash(
+        &self,
+        path: &Path,
+        _memoised: &HashMap<FileFingerprint, String>,
+    ) -> Result<String> {
+        self.hash_unkeyed(path)
+    }
+
+    #[cfg(any(unix, test))]
+    fn guard_file_hash_observed(
+        &self,
+        path: &Path,
+        observed: ObservedFingerprint,
+        memoised: &HashMap<FileFingerprint, String>,
+    ) -> Result<String> {
+        if !guard_file_memo_eligible(observed.fingerprint.size, observed.fingerprint.inode) {
+            return self.hash_unkeyed(path);
+        }
+        let _trace = crate::phase_trace::phase("input_hash");
+        if let Some(hash) = memoised.get(&observed.fingerprint) {
+            self.record_hit();
+            return Ok(hash.clone());
+        }
+        let hash = read_file_hash(path)?;
+        self.record_miss(observed.fingerprint.size);
+        // These rows also need a post-read check when key-input guarding is
+        // unarmed; no workspace file joins that guard's bookkeeping.
+        if FileFingerprint::from_path(path).is_ok_and(|after| after == observed.fingerprint) {
+            self.pending_memo
+                .borrow_mut()
+                .push((observed, hash.clone()));
+        }
+        Ok(hash)
     }
 
     /// With `keyed`, the file is a key input and the too-new guard sees it.

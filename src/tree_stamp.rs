@@ -107,6 +107,7 @@ impl Stamper {
 
     /// Fold every entry under `root` but `excluded`, spending one of
     /// `budget` per entry. A symlink is not followed.
+    #[cfg(test)]
     pub(crate) fn walk(
         &mut self,
         root: &Path,
@@ -114,7 +115,22 @@ impl Stamper {
         rules: StampRules,
         budget: &mut usize,
     ) -> WalkOutcome {
-        self.walk_skipping(
+        self.walk_observing(root, excluded, rules, budget, &mut |_, _| {})
+    }
+
+    /// Fold the entries under `root` but `excluded`, spending one of `budget`
+    /// per entry. After folding a non-directory entry, give its owned path
+    /// and the metadata already read to the observer. Directories are queued
+    /// for traversal instead; exclusions and the budget precede either use.
+    pub(crate) fn walk_observing(
+        &mut self,
+        root: &Path,
+        excluded: &[PathBuf],
+        rules: StampRules,
+        budget: &mut usize,
+        observe: &mut dyn FnMut(PathBuf, &std::fs::Metadata),
+    ) -> WalkOutcome {
+        self.walk_skipping_observing(
             root,
             &|child, _| {
                 excluded
@@ -123,17 +139,29 @@ impl Stamper {
             },
             rules,
             budget,
+            observe,
         )
     }
 
-    /// [`Self::walk`], leaving out every entry `skips` names by its path and
-    /// its listing entry, wherever it appears below `root`.
+    /// Walk without an observer, leaving out every entry `skips` names by
+    /// its path and listing entry, wherever it appears below `root`.
     pub(crate) fn walk_skipping(
         &mut self,
         root: &Path,
         skips: &dyn Fn(&Path, &std::fs::DirEntry) -> bool,
         rules: StampRules,
         budget: &mut usize,
+    ) -> WalkOutcome {
+        self.walk_skipping_observing(root, skips, rules, budget, &mut |_, _| {})
+    }
+
+    fn walk_skipping_observing(
+        &mut self,
+        root: &Path,
+        skips: &dyn Fn(&Path, &std::fs::DirEntry) -> bool,
+        rules: StampRules,
+        budget: &mut usize,
+        observe: &mut dyn FnMut(PathBuf, &std::fs::Metadata),
     ) -> WalkOutcome {
         if rules.root_metadata {
             let Ok(metadata) = std::fs::metadata(root) else {
@@ -233,8 +261,12 @@ impl Stamper {
                 }
                 fold_metadata_stamp(&mut self.hasher, &metadata);
                 self.saw(&metadata);
-                if metadata.is_dir() && !rules.top_files_only {
-                    pending.push(child);
+                if metadata.is_dir() {
+                    if !rules.top_files_only {
+                        pending.push(child);
+                    }
+                } else {
+                    observe(child, &metadata);
                 }
             }
         }
@@ -390,6 +422,95 @@ mod tests {
     fn write(path: &Path, content: &str) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, content).unwrap();
+    }
+
+    #[test]
+    fn a_walk_observer_sees_only_entries_within_exclusions_and_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir.path().join("a.txt"), "a");
+        write(&dir.path().join("excluded/hidden.txt"), "hidden");
+        write(&dir.path().join("z.txt"), "z");
+        let excluded = [dir.path().join("excluded")];
+        let mut observed = Vec::new();
+        let mut stamper = Stamper::new();
+        let mut budget = 1;
+        assert_eq!(
+            stamper.walk_observing(
+                dir.path(),
+                &excluded,
+                StampRules::default(),
+                &mut budget,
+                &mut |path, _| observed.push(path)
+            ),
+            WalkOutcome::TooLarge
+        );
+        assert_eq!(budget, 0);
+        assert_eq!(observed, [dir.path().join("a.txt")]);
+        observed.clear();
+        let mut stamper = Stamper::new();
+        let mut budget = 2;
+        assert_eq!(
+            stamper.walk_observing(
+                dir.path(),
+                &excluded,
+                StampRules::default(),
+                &mut budget,
+                &mut |path, _| observed.push(path)
+            ),
+            WalkOutcome::Fits
+        );
+        assert_eq!(
+            observed,
+            [dir.path().join("a.txt"), dir.path().join("z.txt")]
+        );
+        assert_eq!(
+            stamper.finish().digest,
+            tree_stamp(dir.path(), &excluded, 2).unwrap().digest
+        );
+    }
+
+    #[test]
+    fn a_walk_observer_gets_leaves_while_directories_still_spend_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir.path().join("a.txt"), "a");
+        write(&dir.path().join("sub/z.txt"), "z");
+        #[cfg(unix)]
+        let outside = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            write(&outside.path().join("unfollowed.txt"), "outside");
+            std::os::unix::fs::symlink(outside.path(), dir.path().join("link")).unwrap();
+        }
+        let rules = StampRules {
+            link_text: true,
+            ..StampRules::default()
+        };
+        let mut observed = Vec::new();
+        let mut stamper = Stamper::new();
+        let mut budget = 4;
+        assert_eq!(
+            stamper.walk_observing(
+                dir.path(),
+                &[],
+                rules,
+                &mut budget,
+                &mut |path, metadata| {
+                    observed.push((path, metadata.is_file(), metadata.file_type().is_symlink()));
+                }
+            ),
+            WalkOutcome::Fits
+        );
+        let mut expected = vec![
+            (dir.path().join("a.txt"), true, false),
+            (dir.path().join("sub/z.txt"), true, false),
+        ];
+        #[cfg(unix)]
+        expected.push((dir.path().join("link"), false, true));
+        observed.sort();
+        expected.sort();
+        assert_eq!(observed, expected);
+        assert_eq!(budget, if cfg!(unix) { 0 } else { 1 });
+        assert_eq!(stamper.finish().digest, walk(dir.path(), rules, 4).1);
     }
 
     #[test]

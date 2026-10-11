@@ -12919,6 +12919,13 @@ fn each_root_of_a_tree_digest_is_memoised_alone() {
     write_file(&workspace.join("Cargo.toml"), "[workspace]\n");
     write_file(&workspace.join("kt/src/lib.rs"), "pub fn a() {}\n");
     write_file(&out.join("gen.rs"), "// gen\n");
+    // Recreating a file can reuse its inode and coarse times. Give the two
+    // identical files distinct mtimes so the OUT_DIR entry stamp must move.
+    filetime::set_file_mtime(
+        out.join("gen.rs"),
+        filetime::FileTime::from_unix_time(1_000_000_000, 0),
+    )
+    .unwrap();
     let roots = |with_out: bool| {
         let mut roots = vec![TreeRoot::new(workspace.clone(), b"workspace", &[])];
         if with_out {
@@ -12946,6 +12953,11 @@ fn each_root_of_a_tree_digest_is_memoised_alone() {
 
     std::fs::remove_dir_all(&out).unwrap();
     write_file(&out.join("gen.rs"), "// gen\n");
+    filetime::set_file_mtime(
+        out.join("gen.rs"),
+        filetime::FileTime::from_unix_time(1_000_000_010, 0),
+    )
+    .unwrap();
     let (again, read) = guard(true);
     assert_eq!((again.digest.as_str(), read), (taken.digest.as_str(), 1));
     assert_eq!(guard(true).1, 0);
@@ -13180,7 +13192,18 @@ fn a_root_the_tree_fold_cannot_list_gives_no_digest() {
     let fold = |root: &Path| {
         let mut budget = 10;
         let mut digest = blake3::Hasher::new();
-        crate_tree_fold(root, &gone, &[], false, &hasher, &mut digest, &mut budget)
+        crate_tree_fold(
+            root,
+            &gone,
+            &[],
+            false,
+            &GuardFileHashes {
+                hasher: &hasher,
+                memoised: HashMap::new(),
+            },
+            &mut digest,
+            &mut budget,
+        )
     };
     assert_eq!(fold(dir.path()), Some(true), "a directory below the root");
     assert_eq!(fold(&gone), None, "the root");
@@ -13307,6 +13330,348 @@ fn a_tree_file_never_trips_the_too_new_guard() {
             "a key input still trips it, cached={cached}"
         );
     }
+}
+
+#[test]
+fn guard_stamp_collection_respects_kinds_exclusions_and_build_tags() {
+    let dir = tempfile::tempdir().unwrap();
+    write_file(&dir.path().join("small.txt"), "kept");
+    write_file(&dir.path().join("excluded/hidden.txt"), "excluded");
+    write_file(&dir.path().join("build/hidden.txt"), "build output");
+    write_file(
+        &dir.path().join("build/CACHEDIR.TAG"),
+        "Signature: 8a477f597d28d172789f06886806bc55\n# This file is a cache directory tag created by cargo.\n",
+    );
+    std::fs::write(dir.path().join("large.txt"), vec![0; 64 << 10]).unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("small.txt", dir.path().join("link.txt")).unwrap();
+    let root = TreeRoot::new(dir.path().to_path_buf(), b"workspace", &["excluded"])
+        .skipping_build_dirs()
+        .walked();
+    let stamped = stamp_roots(std::slice::from_ref(&root), 20, true)
+        .unwrap()
+        .pop()
+        .unwrap();
+    let mut collected: Vec<_> = stamped
+        .small_files
+        .iter()
+        .map(|fp| {
+            Path::new(&fp.path)
+                .strip_prefix(dir.path())
+                .unwrap()
+                .to_path_buf()
+        })
+        .collect();
+    collected.sort();
+    if cfg!(unix) {
+        assert_eq!(
+            collected,
+            [
+                PathBuf::from("build/CACHEDIR.TAG"),
+                PathBuf::from("small.txt")
+            ]
+        );
+    } else {
+        assert!(collected.is_empty());
+    }
+    let default = stamp_roots(std::slice::from_ref(&root), 20, false)
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert!(default.small_files.is_empty());
+    assert_eq!(stamped.stamp.digest, default.stamp.digest);
+    assert_eq!(stamped.entries, default.entries);
+    assert!(matches!(
+        stamp_roots(&[root], 1, true),
+        Err(StampRefusal::TooLarge(0))
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn guard_files_without_a_cache_do_not_queue_memo_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("input.txt");
+    write_file(&path, "input");
+    let hasher = FileHasher::new();
+    assert_eq!(
+        hasher.guard_file_hash(&path, &HashMap::new()).unwrap(),
+        hash_file(&path).unwrap()
+    );
+    assert!(hasher.pending_memo.borrow().is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn guard_file_memos_do_not_merge_lossy_path_spellings() {
+    use std::os::unix::ffi::OsStringExt;
+    let dir = tempfile::tempdir().unwrap();
+    let paths: Vec<_> = [0xfe, 0xff]
+        .into_iter()
+        .map(|byte| dir.path().join(std::ffi::OsString::from_vec(vec![byte])))
+        .collect();
+    write_file(&paths[0], "first");
+    write_file(&paths[1], "other");
+    let roots = [TreeRoot::new(dir.path().to_path_buf(), b"workspace", &[]).walked()];
+    assert!(
+        stamp_roots(&roots, 10, true).unwrap()[0]
+            .small_files
+            .is_empty()
+    );
+    let db = rusqlite::Connection::open_in_memory().unwrap();
+    ensure_file_hash_cache_schema(&db).unwrap();
+    let hasher = FileHasher::from_cache(FileHashCache::Borrowed(&db));
+    for path in &paths {
+        let poisoned = HashMap::from([(
+            FileFingerprint::from_path(path).unwrap(),
+            "wrong hash".to_string(),
+        )]);
+        assert_eq!(
+            hasher.guard_file_hash(path, &poisoned).unwrap(),
+            hash_file(path).unwrap()
+        );
+    }
+    assert!(hasher.pending_memo.borrow().is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn small_guard_file_memos_reuse_absolute_rows_from_relative_roots() {
+    let _lock = key_test_lock();
+    let dir = tempfile::tempdir_in(".").unwrap();
+    let tree = PathBuf::from(dir.path().file_name().unwrap());
+    write_file(&tree.join("input.txt"), "input");
+    let memo_dir = tempfile::tempdir().unwrap();
+    let memo = memo_dir.path().join("memo");
+    let db = rusqlite::Connection::open_in_memory().unwrap();
+    ensure_file_hash_cache_schema(&db).unwrap();
+    let digest = |root, hasher: &FileHasher<'_>| {
+        tree_digest_memoised(
+            vec![TreeRoot::new(root, b"workspace", &[])],
+            hasher,
+            10,
+            &memo,
+            std::time::UNIX_EPOCH,
+        )
+        .unwrap()
+    };
+    let first = FileHasher::from_cache(FileHashCache::Borrowed(&db));
+    let cold = digest(absolute_path(&tree), &first);
+    assert_eq!(first.stats().cache_misses, 1);
+    first.flush_memo_as_if_settled();
+    let second = FileHasher::from_cache(FileHashCache::Borrowed(&db));
+    assert_eq!(digest(tree, &second), cold);
+    assert_eq!(second.stats().cache_hits, 1);
+    assert_eq!(second.stats().cache_misses, 0);
+    assert_eq!(second.stats().bytes_hashed, 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn small_guard_files_reuse_hashes_when_the_tree_memo_cannot_settle() {
+    let dir = tempfile::tempdir().unwrap();
+    let tree = dir.path().join("tree");
+    let files: Vec<PathBuf> = (0..300)
+        .map(|i| {
+            let path = tree.join(format!("part{}/f{i}.txt", i % 3));
+            write_file(&path, &format!("value {i}\n"));
+            path
+        })
+        .collect();
+    let roots = || vec![TreeRoot::new(tree.clone(), b"workspace", &[])];
+    let memo = dir.path().join("memo");
+    let db = rusqlite::Connection::open_in_memory().unwrap();
+    ensure_file_hash_cache_schema(&db).unwrap();
+    // Force a content walk on every pass, even though individual files can
+    // settle. Three hundred files also span more than one SQL lookup chunk.
+    let digest = |hasher: &FileHasher<'_>| {
+        tree_digest_memoised(roots(), hasher, 500, &memo, std::time::UNIX_EPOCH).unwrap()
+    };
+    let mut first = FileHasher::from_cache(FileHashCache::Borrowed(&db));
+    first.arm_too_new_guard(1, 0);
+    let cold = digest(&first);
+    assert_eq!(first.stats().cache_misses, 300);
+    assert_eq!(first.stats().cache_hits, 0);
+    first.flush_memo_as_if_settled();
+    assert!(!tree_digest_memo(&memo, &roots()[0]).exists());
+
+    let mut second = FileHasher::from_cache(FileHashCache::Borrowed(&db));
+    second.arm_too_new_guard(1, 0);
+    assert_eq!(digest(&second), cold);
+    assert_eq!(second.stats().cache_hits, 300);
+    assert_eq!(second.stats().cache_misses, 0);
+    assert_eq!(second.stats().bytes_hashed, 0);
+    assert!(!second.too_new());
+    assert!(second.take_guarded_inputs().is_empty());
+    assert!(second.recent_hashes.borrow().is_empty());
+
+    write_file(&files[0], "changed content\n");
+    let third = FileHasher::from_cache(FileHashCache::Borrowed(&db));
+    let changed = digest(&third);
+    assert_ne!(changed, cold);
+    assert_eq!(third.stats().cache_hits, 299);
+    assert_eq!(third.stats().cache_misses, 1);
+    assert_eq!(
+        changed,
+        digest(&FileHasher::new()),
+        "same digest without memo"
+    );
+}
+
+#[test]
+fn a_weak_guard_identity_cannot_reuse_a_row_from_before_replacement() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("input.txt");
+    write_file(&path, "before");
+    let mtime = filetime::FileTime::from_last_modification_time(&std::fs::metadata(&path).unwrap());
+    let mut observed = ObservedFingerprint::from_path(&path).unwrap();
+    observed.fingerprint.inode = 0;
+    assert!(!guard_file_memo_eligible(observed.fingerprint.size, 0));
+    assert!(!guard_file_memo_eligible(64 << 10, 1));
+    let old_hash = hash_file(&path).unwrap();
+    let db = rusqlite::Connection::open_in_memory().unwrap();
+    ensure_file_hash_cache_schema(&db).unwrap();
+    let hasher = FileHasher::from_cache(FileHashCache::Borrowed(&db));
+    // Model a row left by an earlier memo user on a platform whose identity
+    // can survive a same-size replacement with the old modification time.
+    hasher
+        .pending_memo
+        .borrow_mut()
+        .push((observed.clone(), old_hash.clone()));
+    hasher.flush_memo_as_if_settled();
+    let rows = hasher.memoised_hashes(std::iter::once(&observed.fingerprint));
+    assert_eq!(rows.get(&observed.fingerprint.path), Some(&old_hash));
+    let memoised = HashMap::from([(observed.fingerprint.clone(), old_hash.clone())]);
+    std::fs::remove_file(&path).unwrap();
+    write_file(&path, "after!");
+    filetime::set_file_mtime(&path, mtime).unwrap();
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), 6);
+    assert_eq!(
+        filetime::FileTime::from_last_modification_time(&std::fs::metadata(&path).unwrap()),
+        mtime
+    );
+    // Keep the old weak fingerprint to model the aliased creation time too.
+    let hash = hasher
+        .guard_file_hash_observed(&path, observed, &memoised)
+        .unwrap();
+    assert_eq!(hash, hash_file(&path).unwrap());
+    assert_ne!(hash, old_hash);
+    assert_eq!(hasher.stats().cache_hits, 0);
+    assert_eq!(hasher.stats().cache_misses, 1);
+    assert!(hasher.pending_memo.borrow().is_empty());
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_guard_files_stay_fresh_reads_without_queued_memo_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("input.txt");
+    write_file(&path, "before");
+    let metadata = std::fs::metadata(&path).unwrap();
+    let mtime = filetime::FileTime::from_last_modification_time(&metadata);
+    let db = rusqlite::Connection::open_in_memory().unwrap();
+    ensure_file_hash_cache_schema(&db).unwrap();
+    let hasher = FileHasher::from_cache(FileHashCache::Borrowed(&db));
+    let old_hash = hasher.guard_file_hash(&path, &HashMap::new()).unwrap();
+    assert!(hasher.pending_memo.borrow().is_empty());
+    hasher.flush_memo_as_if_settled();
+    write_file(&path, "after!");
+    filetime::set_file_mtime(&path, mtime).unwrap();
+    let hash = hasher.guard_file_hash(&path, &HashMap::new()).unwrap();
+    assert_eq!(hash, hash_file(&path).unwrap());
+    assert_ne!(hash, old_hash);
+    assert_eq!(hasher.stats().cache_misses, 2);
+    assert!(hasher.pending_memo.borrow().is_empty());
+    assert_eq!(
+        FileHashCache::Borrowed(&db)
+            .get(&FileFingerprint::from_path(&path).unwrap())
+            .unwrap(),
+        None
+    );
+}
+
+#[test]
+fn a_guard_batch_row_must_match_the_fresh_leaf_fingerprint() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("input.txt");
+    write_file(&path, "before");
+    let queried = FileFingerprint::from_path(&path).unwrap();
+    let memoised = HashMap::from([(queried, hash_file(&path).unwrap())]);
+    write_file(&path, "after!");
+    // Keep size equal but make the timestamp change visible on coarse clocks.
+    filetime::set_file_mtime(&path, filetime::FileTime::from_unix_time(2_000_000_000, 0)).unwrap();
+    let db = rusqlite::Connection::open_in_memory().unwrap();
+    ensure_file_hash_cache_schema(&db).unwrap();
+    let mut hasher = FileHasher::from_cache(FileHashCache::Borrowed(&db));
+    hasher.arm_too_new_guard(1, 0);
+    assert_eq!(
+        hasher.guard_file_hash(&path, &memoised).unwrap(),
+        hash_file(&path).unwrap()
+    );
+    assert_eq!(hasher.stats().cache_hits, 0);
+    assert_eq!(hasher.stats().cache_misses, 1);
+    assert!(!hasher.too_new());
+    assert!(hasher.take_guarded_inputs().is_empty());
+}
+
+#[test]
+fn a_guard_file_changed_during_its_read_leaves_no_memo_row() {
+    for armed in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("input.txt");
+        write_file(&path, "before");
+        let before = FileFingerprint::from_path(&path).unwrap();
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        ensure_file_hash_cache_schema(&db).unwrap();
+        let mut hasher = FileHasher::from_cache(FileHashCache::Borrowed(&db));
+        if armed {
+            hasher.arm_too_new_guard(1, 0);
+        }
+        set_before_read(Some(Box::new(|path| {
+            write_file(path, "changed while read")
+        })));
+        let hash = hasher.guard_file_hash(&path, &HashMap::new()).unwrap();
+        set_before_read(None);
+        assert_eq!(hash, hash_file(&path).unwrap());
+        assert!(!hasher.too_new());
+        assert!(hasher.take_guarded_inputs().is_empty());
+        assert!(hasher.recent_hashes.borrow().is_empty());
+        assert!(hasher.pending_memo.borrow().is_empty());
+        hasher.flush_memo_as_if_settled();
+        let cache = FileHashCache::Borrowed(&db);
+        assert_eq!(cache.get(&before).unwrap(), None);
+        assert_eq!(
+            cache
+                .get(&FileFingerprint::from_path(&path).unwrap())
+                .unwrap(),
+            None
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_guard_file_observed_before_settling_is_not_memoised() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("input.txt");
+    write_file(&path, "fresh");
+    filetime::set_file_mtime(&path, filetime::FileTime::from_unix_time(4_000_000_000, 0)).unwrap();
+    let db = rusqlite::Connection::open_in_memory().unwrap();
+    ensure_file_hash_cache_schema(&db).unwrap();
+    let hasher = FileHasher::from_cache(FileHashCache::Borrowed(&db));
+    assert_eq!(
+        hasher.guard_file_hash(&path, &HashMap::new()).unwrap(),
+        hash_file(&path).unwrap()
+    );
+    assert_eq!(hasher.pending_memo.borrow().len(), 1);
+    assert!(!hasher.pending_memo.borrow()[0].0.settled());
+    hasher.flush_memo();
+    assert_eq!(
+        FileHashCache::Borrowed(&db)
+            .get(&FileFingerprint::from_path(&path).unwrap())
+            .unwrap(),
+        None
+    );
 }
 
 #[test]

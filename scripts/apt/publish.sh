@@ -38,6 +38,17 @@ else
   exit 1
 fi
 
+# Upload payloads before indexes advertise them; a failed upload must leave
+# live metadata untouched. Copy is additive so old releases stay available.
+if [ -d "${APT_REPO_DIR}/pool" ]; then
+  echo "Copying pool/ to R2 (additive)..."
+  rclone copy \
+    "${APT_REPO_DIR}/pool/" \
+    "r2:${R2_BUCKET}/kache/apt/pool/" \
+    --progress \
+    --checksum
+fi
+
 # Upload dists/ per suite (sync replaces metadata for that codename only).
 for dist in "${DISTS[@]}"; do
   if [ -d "${APT_REPO_DIR}/dists/${dist}" ]; then
@@ -49,16 +60,6 @@ for dist in "${DISTS[@]}"; do
       --checksum
   fi
 done
-
-# Upload pool (additive — never deletes old .debs from other releases).
-if [ -d "${APT_REPO_DIR}/pool" ]; then
-  echo "Copying pool/ to R2 (additive)..."
-  rclone copy \
-    "${APT_REPO_DIR}/pool/" \
-    "r2:${R2_BUCKET}/kache/apt/pool/" \
-    --progress \
-    --checksum
-fi
 
 # Upload GPG public key.
 if [ -f "${APT_REPO_DIR}/gpg.key" ]; then

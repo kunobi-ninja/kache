@@ -1997,28 +1997,55 @@ pub(crate) mod shim {
         resolve: &dyn Fn(&Path) -> Option<PathBuf>,
         is_marked: &dyn Fn(&Path) -> bool,
     ) -> Option<PathBuf> {
+        resolve_real_compiler_with_extensions(
+            name,
+            path_dirs,
+            self_exe,
+            executable_extensions(),
+            is_candidate,
+            resolve,
+            is_marked,
+        )
+    }
+
+    /// Supply the suffix policy so Windows resolution is tested on every OS.
+    pub(crate) fn resolve_real_compiler_with_extensions(
+        name: &str,
+        path_dirs: &[PathBuf],
+        self_exe: Option<&Path>,
+        extensions: &[&str],
+        is_candidate: &dyn Fn(&Path) -> bool,
+        resolve: &dyn Fn(&Path) -> Option<PathBuf>,
+        is_marked: &dyn Fn(&Path) -> bool,
+    ) -> Option<PathBuf> {
         let self_real = self_exe.and_then(resolve);
-        let extensions = executable_extensions();
+        let names = candidate_names(Path::new(""), name, extensions);
         for dir in path_dirs {
-            for candidate in candidate_names(dir, name, extensions) {
-                if !is_candidate(&candidate) {
-                    continue;
-                }
-                if is_marked(dir) {
-                    continue;
-                }
-                if farm::resolves_to_kache(&candidate, self_real.as_deref(), resolve) {
-                    continue;
-                }
-                return Some(candidate);
+            // Rust tries an appended .exe before a bare path on Windows.
+            // Check the file it will launch. If that file is a shim, skip
+            // this directory: its bare sibling would launch that .exe again.
+            let Some(candidate) = names
+                .iter()
+                .rev()
+                .map(|name| dir.join(name))
+                .find(|candidate| is_candidate(candidate))
+            else {
+                continue;
+            };
+            if is_marked(dir) {
+                continue;
             }
+            if farm::resolves_to_kache(&candidate, self_real.as_deref(), resolve) {
+                continue;
+            }
+            return Some(candidate);
         }
         None
     }
 
-    /// Executable suffixes to try after the bare name. Windows toolchains
+    /// Executable suffixes to try before the bare name. Windows toolchains
     /// ship `cargo.exe`, not `cargo`; elsewhere the bare name is the only
-    /// candidate. Deliberately just `.exe`: a `.bat`/`.cmd` must never be
+    /// candidate. Use only `.exe`: a `.bat`/`.cmd` must never be
     /// selected as the real compiler behind a shim.
     pub(crate) fn executable_extensions() -> &'static [&'static str] {
         if cfg!(windows) { &[".exe"] } else { &[] }
@@ -2029,11 +2056,11 @@ pub(crate) mod shim {
     /// carries is not appended twice, case-insensitively for `FOO.EXE`.
     pub(crate) fn candidate_names(dir: &Path, name: &str, extensions: &[&str]) -> Vec<PathBuf> {
         let mut out = vec![dir.join(name)];
-        let lower = name.to_lowercase();
+        let lower = name.to_ascii_lowercase();
         for ext in extensions {
             // An empty extension matches everything via `ends_with("")`,
             // so it is skipped the same way as a duplicate.
-            if lower.ends_with(&ext.to_lowercase()) {
+            if lower.ends_with(&ext.to_ascii_lowercase()) {
                 continue;
             }
             out.push(dir.join(format!("{name}{ext}")));
@@ -2241,7 +2268,7 @@ mod shim_tests {
                 Some(path.to_path_buf())
             }
         };
-        let exists = |_: &Path| true;
+        let exists = |candidate: &Path| candidate.extension().is_none();
 
         let found = resolve_real_compiler(
             "cc",
@@ -2261,7 +2288,7 @@ mod shim_tests {
             "cc",
             &[PathBuf::from("/shims")],
             Some(&kache),
-            &|_| true,
+            &|candidate| candidate.extension().is_none(),
             &|_| Some(kache.clone()),
             &|_| false,
         );
@@ -2278,7 +2305,7 @@ mod shim_tests {
             "cc",
             &[PathBuf::from("/not-exec"), PathBuf::from("/usr/bin")],
             Some(&kache),
-            &|path: &Path| path.starts_with("/usr/bin"),
+            &|path: &Path| path.starts_with("/usr/bin") && path.extension().is_none(),
             &|path: &Path| Some(path.to_path_buf()),
             &|_| false,
         );
@@ -2301,7 +2328,7 @@ mod shim_tests {
             "cc",
             &[PathBuf::from("/shims"), PathBuf::from("/usr/bin")],
             Some(&me),
-            &|_| true,
+            &|candidate| candidate.extension().is_none(),
             &resolve,
             &|_| false,
         );
@@ -2326,7 +2353,7 @@ mod shim_tests {
                 "cc",
                 &[PathBuf::from("/usr/lib/kache"), PathBuf::from("/usr/bin")],
                 Some(&me),
-                &|_| true,
+                &|candidate| candidate.extension().is_none(),
                 &resolve,
                 &|_| false,
             );
@@ -2348,7 +2375,7 @@ mod shim_tests {
             "cc",
             &[PathBuf::from("/usr/lib/kache"), PathBuf::from("/usr/bin")],
             None,
-            &|_| true,
+            &|candidate| candidate.extension().is_none(),
             &resolve,
             &|_| false,
         );
@@ -2365,11 +2392,24 @@ mod shim_tests {
         let identity = |path: &Path| Some(path.to_path_buf());
         let marked = |dir: &Path| dir == Path::new("/copies");
 
-        let found = resolve_real_compiler("cc", &dirs, Some(&me), &|_| true, &identity, &marked);
+        let found = resolve_real_compiler(
+            "cc",
+            &dirs,
+            Some(&me),
+            &|candidate| candidate.extension().is_none(),
+            &identity,
+            &marked,
+        );
         assert_eq!(found, Some(PathBuf::from("/usr/bin/cc")));
 
-        let unmarked =
-            resolve_real_compiler("cc", &dirs, Some(&me), &|_| true, &identity, &|_| false);
+        let unmarked = resolve_real_compiler(
+            "cc",
+            &dirs,
+            Some(&me),
+            &|candidate| candidate.extension().is_none(),
+            &identity,
+            &|_| false,
+        );
         assert_eq!(
             unmarked,
             Some(PathBuf::from("/copies/cc")),
@@ -2424,8 +2464,136 @@ mod shim_tests {
         );
     }
 
+    #[test]
+    fn windows_resolution_checks_the_exe_before_its_bare_sibling() {
+        let dirs = [PathBuf::from("first"), PathBuf::from("later")];
+        let found = resolve_real_compiler_with_extensions(
+            "cargo",
+            &dirs,
+            None,
+            &[".exe"],
+            &|_| true,
+            &|path| Some(path.to_path_buf()),
+            &|_| false,
+        );
+        assert_eq!(found, Some(PathBuf::from("first/cargo.exe")));
+    }
+
+    #[test]
+    fn windows_resolution_keeps_directory_order_and_bare_fallback() {
+        let dirs = [PathBuf::from("first"), PathBuf::from("later")];
+        let exists =
+            |path: &Path| path == Path::new("first/cargo") || path == Path::new("later/cargo.exe");
+        let found = resolve_real_compiler_with_extensions(
+            "cargo",
+            &dirs,
+            None,
+            &[".exe"],
+            &exists,
+            &|path| Some(path.to_path_buf()),
+            &|_| false,
+        );
+        assert_eq!(found, Some(PathBuf::from("first/cargo")));
+    }
+
+    #[test]
+    fn windows_resolution_never_returns_the_bare_sibling_of_a_rejected_exe() {
+        let me = PathBuf::from("install/kache-dev.exe");
+        let dirs = [PathBuf::from("shim"), PathBuf::from("real")];
+        for other in [
+            me.as_path(),
+            Path::new("other/kache.exe"),
+            Path::new("other/KACHE.EXE"),
+        ] {
+            let resolve = |path: &Path| {
+                Some(if path == Path::new("shim/cargo.exe") {
+                    other.to_path_buf()
+                } else {
+                    path.to_path_buf()
+                })
+            };
+            let found = resolve_real_compiler_with_extensions(
+                "cargo",
+                &dirs,
+                Some(&me),
+                &[".exe"],
+                &|_| true,
+                &resolve,
+                &|_| false,
+            );
+            assert_eq!(found, Some(PathBuf::from("real/cargo.exe")), "{other:?}");
+        }
+    }
+
+    #[test]
+    fn windows_resolution_skips_marked_copies_and_reports_no_real_compiler() {
+        let dirs = [PathBuf::from("copies"), PathBuf::from("real")];
+        let marked = |dir: &Path| dir == Path::new("copies");
+        let identity = |path: &Path| Some(path.to_path_buf());
+        let found = resolve_real_compiler_with_extensions(
+            "cargo",
+            &dirs,
+            None,
+            &[".exe"],
+            &|_| true,
+            &identity,
+            &marked,
+        );
+        assert_eq!(found, Some(PathBuf::from("real/cargo.exe")));
+        let none = resolve_real_compiler_with_extensions(
+            "cargo",
+            &dirs[..1],
+            None,
+            &[".exe"],
+            &|_| true,
+            &identity,
+            &marked,
+        );
+        assert_eq!(none, None);
+    }
+
+    #[test]
+    fn windows_resolution_does_not_try_batch_scripts_or_double_exe_suffixes() {
+        let dirs = [PathBuf::from("tools")];
+        let none = resolve_real_compiler_with_extensions(
+            "cargo",
+            &dirs,
+            None,
+            &[".exe"],
+            &|path| path == Path::new("tools/cargo.bat") || path == Path::new("tools/cargo.cmd"),
+            &|path| Some(path.to_path_buf()),
+            &|_| false,
+        );
+        assert_eq!(none, None);
+        let found = resolve_real_compiler_with_extensions(
+            "cargo.EXE",
+            &dirs,
+            None,
+            &[".exe"],
+            &|path| path == Path::new("tools/cargo.EXE"),
+            &|path| Some(path.to_path_buf()),
+            &|_| false,
+        );
+        assert_eq!(found, Some(PathBuf::from("tools/cargo.EXE")));
+    }
+
+    #[test]
+    fn unix_resolution_does_not_use_a_windows_exe_candidate() {
+        let dirs = [PathBuf::from("tools")];
+        let none = resolve_real_compiler_with_extensions(
+            "cargo",
+            &dirs,
+            None,
+            &[],
+            &|path| path == Path::new("tools/cargo.exe"),
+            &|path| Some(path.to_path_buf()),
+            &|_| false,
+        );
+        assert_eq!(none, None);
+    }
+
     /// Live wiring tries no suffix outside Windows, so Unix resolution is
-    /// exactly the old bare-name scan. Windows-only (mutants run on Linux).
+    /// exactly the old bare-name scan.
     #[cfg(not(windows))]
     #[test]
     fn live_wiring_uses_no_extensions_off_windows() {

@@ -1138,9 +1138,43 @@ fn the_gc_summary_has_a_line_per_shard_it_swept() {
         vec![format!(
             "Volume shard {}: {} / {} (2 entries)",
             shard_config.cache_dir.display(),
-            ByteSize(shard.total_size().unwrap()),
+            ByteSize(shard.physical_size().unwrap()),
             ByteSize(1000),
         )]
+    );
+}
+
+#[test]
+fn gc_summary_compares_deduplicated_blob_bytes_with_the_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = save_manifest_config(dir.path().join("cache"), None);
+    let store = Store::open(&config).unwrap();
+    let artifact = dir.path().join("shared.o");
+    fs::write(&artifact, [42; 60]).unwrap();
+    for key in ["first", "second"] {
+        store
+            .put(
+                key,
+                key,
+                &[],
+                &[],
+                "",
+                "",
+                &[(artifact.clone(), "shared.o".into())],
+                "",
+                "",
+            )
+            .unwrap();
+    }
+    assert_eq!(store.total_size().unwrap(), 120);
+    assert_eq!(store.physical_size().unwrap(), 60);
+    assert_eq!(
+        gc_store_usage(&store, 90, None).unwrap(),
+        "60 B / 90 B (2 entries)"
+    );
+    assert_eq!(
+        gc_store_usage(&store, 0, None).unwrap(),
+        "60 B / 0 B (2 entries)"
     );
 }
 

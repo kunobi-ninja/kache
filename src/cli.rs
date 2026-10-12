@@ -3914,14 +3914,13 @@ fn shard_store_lines(config: &Config) -> Vec<String> {
     crate::volume_gc::run_on_volume_shards(config, |shard| {
         let store = Store::open(shard)?;
         Ok(format!(
-            "Volume shard {}: {} / {} ({} entries)",
+            "Volume shard {}: {}",
             shard.cache_dir.display(),
-            ByteSize(store.total_size()?),
-            crate::config::describe_max_size(
+            gc_store_usage(
+                &store,
                 shard.max_size,
                 crate::volume_gc::filesystem_bytes(&shard.cache_dir),
-            ),
-            store.entry_count()?
+            )?
         ))
     })
     .into_iter()
@@ -4041,6 +4040,15 @@ fn human_gc_output(json: bool) -> bool {
     !json
 }
 
+fn gc_store_usage(store: &Store, max_size: u64, filesystem_bytes: Option<u64>) -> Result<String> {
+    Ok(format!(
+        "{} / {} ({} entries)",
+        ByteSize(store.physical_size()?),
+        crate::config::describe_max_size(max_size, filesystem_bytes),
+        store.entry_count()?
+    ))
+}
+
 fn emit_gc_json(config: &Config, skipped: bool, stats: &crate::store::GcStats) -> Result<()> {
     let store = Store::open(config)?;
     let store_bytes = store.physical_size().unwrap_or(0);
@@ -4138,7 +4146,7 @@ pub fn gc(
             describe_eviction(&stats, false),
             crate::cache_key::CACHE_KEY_VERSION,
         );
-        let total_size = store.total_size()?;
+        let total_size = store.physical_size()?;
         let entry_count = store.entry_count()?;
         println!("Store: {} ({} entries)", ByteSize(total_size), entry_count);
         return Ok(());
@@ -4250,16 +4258,13 @@ pub fn gc(
     }
 
     let store = Store::open(config)?;
-    let total_size = store.total_size()?;
-    let entry_count = store.entry_count()?;
     println!(
-        "Store: {} / {} ({} entries)",
-        ByteSize(total_size),
-        crate::config::describe_max_size(
+        "Store: {}",
+        gc_store_usage(
+            &store,
             config.max_size,
             crate::cache_fs::probe(&config.cache_dir).total_bytes,
-        ),
-        entry_count
+        )?
     );
     for line in shard_store_lines(config) {
         println!("{line}");

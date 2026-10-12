@@ -4845,7 +4845,8 @@ fn cc_memo_env_is_keyed(name: &OsStr) -> bool {
 /// 3: older entries can hold an object built from other bytes than their
 ///    key names: keyed from a memo stamp or a mapped hash taken from a racy
 ///    read, or from an input saved before a key-first compile read it.
-const CC_ARTIFACT_SCHEMA: &[u8] = b"cc_artifact_schema:3\n";
+/// 4: older entries replay compiler diagnostics with the producer's paths.
+const CC_ARTIFACT_SCHEMA: &[u8] = b"cc_artifact_schema:4\n";
 
 /// The schema of [`cc_preprocess_memo_key`].
 ///
@@ -6414,6 +6415,7 @@ impl CcCompiler {
     fn cache_key_for_link(&self, parsed: &CcArgs, ctx: &KeyCtx<'_, '_>) -> Result<String> {
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"cc_link_key_version:2\n");
+        hasher.update(CC_ARTIFACT_SCHEMA);
         let program_name = Path::new(&parsed.program)
             .file_name()
             .and_then(|n| n.to_str())

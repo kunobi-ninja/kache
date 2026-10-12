@@ -33,6 +33,8 @@ use remote::{
 mod hit;
 use hit::HitCompletion;
 
+mod cc_diagnostics;
+
 mod rustc_hit;
 use rustc_hit::RustcHitContext;
 
@@ -2173,11 +2175,11 @@ fn run_cc_with_store(
         } else {
             let restore_start = std::time::Instant::now();
             let trace_restore = crate::phase_trace::phase("restore");
-            let restored = restore_cc_from_cache(hit_store, parsed, &meta);
+            let restored = restore_cc_hit(hit_store, parsed, meta);
             drop(trace_restore);
             if let Err(e) = &restored {
                 if e.downcast_ref::<PartialCcRestore>().is_some() {
-                    return restored.map(|()| 0);
+                    return restored.map(|_| 0);
                 }
                 tracing::warn!(
                     "restoring cc cache hit for {} failed: {} — recompiling",
@@ -2196,7 +2198,7 @@ fn run_cc_with_store(
                 }
                 lookup_rejection = format!("read-only restore failed: {e}");
             }
-            if restored.is_ok() {
+            if let Ok(meta) = restored {
                 let restore_ms = restore_start.elapsed().as_millis() as u64;
                 tracing::debug!(
                     "cc local cache hit for {} ({})",
@@ -2307,7 +2309,8 @@ fn run_cc_with_store(
         cc_restore_committed(precompiled.is_some(), cc_scheduled_hit_ok(parsed, meta))
     }) {
         let restore_start = std::time::Instant::now();
-        if let Err(e) = restore_cc_from_cache(store, parsed, &meta) {
+        let restored = restore_cc_hit(store, parsed, meta);
+        if let Err(e) = restored {
             if e.downcast_ref::<PartialCcRestore>().is_some() {
                 return Err(e);
             }
@@ -2325,6 +2328,7 @@ fn run_cc_with_store(
                 format!("restore failed: {e}"),
             );
         }
+        let meta = restored?;
         let restore_ms = restore_start.elapsed().as_millis() as u64;
         HitCompletion {
             event_root,
@@ -2461,6 +2465,8 @@ fn run_cc_with_store(
                 } else {
                     &result.stdout
                 };
+                let stdout = cc_diagnostics::store(stdout, &parsed.depinfo_roots);
+                let stderr = cc_diagnostics::store(&result.stderr, &parsed.depinfo_roots);
                 // The put and everything after it are wall-clock time on a
                 // build script's serial C compiles. Hand them to the daemon
                 // when it will take them; it holds the key from then on.
@@ -2470,8 +2476,8 @@ fn run_cc_with_store(
                         crate_name,
                         target: &target,
                         files: &prepared.files,
-                        stdout,
-                        stderr: &result.stderr,
+                        stdout: &stdout,
+                        stderr: &stderr,
                         compile_time_ms,
                         publishes_to_remote,
                         event_root,
@@ -2512,8 +2518,8 @@ fn run_cc_with_store(
                     &target,
                     "", // profile: n/a (opt level is in the key)
                     &prepared.files,
-                    stdout,
-                    &result.stderr,
+                    &stdout,
+                    &stderr,
                     compile_time_ms,
                 );
                 // A stored entry grew the store: throttled size check and a detached
@@ -3129,6 +3135,26 @@ fn restore_cc_stdout_from_cache(
     Ok(())
 }
 
+/// Decode and validate diagnostic locations before publishing any hit output.
+fn restore_cc_hit(
+    store: &Store,
+    parsed: &crate::compiler::cc::CcArgs,
+    mut meta: EntryMeta,
+) -> Result<EntryMeta> {
+    if let std::borrow::Cow::Owned(stdout) =
+        cc_diagnostics::restore(&meta.stdout, &parsed.depinfo_roots)?
+    {
+        meta.stdout = stdout;
+    }
+    if let std::borrow::Cow::Owned(stderr) =
+        cc_diagnostics::restore(&meta.stderr, &parsed.depinfo_roots)?
+    {
+        meta.stderr = stderr;
+    }
+    restore_cc_from_cache(store, parsed, &meta)?;
+    Ok(meta)
+}
+
 /// Restore cached cc artifacts to this invocation's output paths.
 ///
 /// Every artifact is staged first. Absent paths use no-clobber publication;
@@ -3263,7 +3289,8 @@ fn cc_try_remote_hit(
         return Ok(None);
     };
     let restore_start = std::time::Instant::now();
-    if let Err(e) = restore_cc_from_cache(store, parsed, &meta) {
+    let restored = restore_cc_hit(store, parsed, meta);
+    if let Err(e) = restored {
         if e.downcast_ref::<PartialCcRestore>().is_some() {
             return Err(e);
         }
@@ -3281,6 +3308,7 @@ fn cc_try_remote_hit(
             format!("restore failed: {e}"),
         )?));
     }
+    let meta = restored?;
     let restore_ms = restore_start.elapsed().as_millis() as u64;
     HitCompletion {
         event_root,

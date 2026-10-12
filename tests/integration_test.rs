@@ -30,6 +30,73 @@ fn run_kache_cc_from(cwd: &Path, cache_dir: &Path, args: &[&str]) {
     );
 }
 
+#[test]
+fn test_cc_cache_hit_replays_warning_locations_in_the_receiving_checkout() {
+    build_kache();
+    let project = TempDir::new().unwrap();
+    let cache = TempDir::new().unwrap();
+    let producer = project.path().join("producer");
+    let consumer = project.path().join("consumer");
+    for root in [&producer, &consumer] {
+        std::fs::create_dir_all(root.join("include")).unwrap();
+        std::fs::write(
+            root.join("include/warning.h"),
+            "int header_compare(unsigned a, int b) { return a < b; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("unit.c"),
+            "#include \"warning.h\"\nint compare(unsigned a, int b) { return a < b; }\n",
+        )
+        .unwrap();
+    }
+    settle_writes(&[project.path()]);
+    let compile = |root: &Path| {
+        let output = hermetic_command(
+            kache_binary(),
+            cache.path(),
+            Some(&isolated_config_path(cache.path())),
+        )
+        .arg("cc")
+        .args(["-Wsign-compare", "-c"])
+        .arg(root.join("unit.c"))
+        .arg("-I")
+        .arg(root.join("include"))
+        .arg("-o")
+        .arg(root.join("unit.o"))
+        .env("KACHE_BASE_DIR", root)
+        .current_dir(root)
+        .output()
+        .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stderr).unwrap()
+    };
+    let cold = compile(&producer);
+    assert!(
+        cold.contains(&producer.join("unit.c").display().to_string()),
+        "{cold}"
+    );
+    assert!(
+        cold.contains(&producer.join("include/warning.h").display().to_string()),
+        "{cold}"
+    );
+    let warm = compile(&consumer);
+    assert!(!warm.contains(&producer.display().to_string()), "{warm}");
+    assert_eq!(
+        warm,
+        cold.replace(producer.to_str().unwrap(), consumer.to_str().unwrap())
+    );
+    assert_eq!(
+        std::fs::read(producer.join("unit.o")).unwrap(),
+        std::fs::read(consumer.join("unit.o")).unwrap()
+    );
+    assert_cc_report_counts(&kache_report(cache.path()), 1, 1);
+}
+
 fn run_cargo_build_with_kache(project: &Path, cache_dir: &Path, target_dir: &Path) {
     let output = hermetic_command("cargo", cache_dir, Some(&isolated_config_path(cache_dir)))
         .args(["build", "--lib"])

@@ -2741,6 +2741,70 @@ fn replay_cached_diagnostics_writes_nonempty_and_skips_empty() {
 }
 
 #[test]
+fn cc_hit_validates_both_diagnostic_streams_before_restoring_outputs() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&test_config(dir.path().join("cache"))).unwrap();
+    let producer = dir.path().join("producer");
+    let consumer = dir.path().join("consumer");
+    std::fs::create_dir_all(&producer).unwrap();
+    std::fs::create_dir_all(&consumer).unwrap();
+    let input = producer.join("unit.o");
+    let output = consumer.join("unit.o");
+    std::fs::write(&input, b"cached object").unwrap();
+    std::fs::write(&output, b"original output").unwrap();
+    let roots = vec![(producer.clone(), "checkout".into(), 5)];
+    let stdout = format!("{}/unit.c:1: warning: stdout\n", producer.display());
+    let stderr = format!("{}/unit.c:2: warning: stderr\n", producer.display());
+    store
+        .put(
+            "diagnostic-hit",
+            "unit",
+            &[],
+            &[],
+            "",
+            "",
+            &[(input, "__kache_cc_object.o".into())],
+            &cc_diagnostics::store(&stdout, &roots),
+            &cc_diagnostics::store(&stderr, &roots),
+        )
+        .unwrap();
+    let meta = store.get("diagnostic-hit").unwrap().unwrap();
+    let mut parsed = crate::compiler::cc::CcArgs::parse(&s(&[
+        "cc",
+        "-c",
+        consumer.join("unit.c").to_str().unwrap(),
+        "-o",
+        output.to_str().unwrap(),
+    ]))
+    .unwrap();
+    parsed.depinfo_roots = vec![(consumer.clone(), "checkout".into(), 5)];
+    for stream in ["stdout", "stderr"] {
+        let mut invalid = meta.clone();
+        let malformed = "\u{1e}kache-cc-diagnostics-v1:not json".to_string();
+        if stream == "stdout" {
+            invalid.stdout = malformed;
+        } else {
+            invalid.stderr = malformed;
+        }
+        assert!(restore_cc_hit(&store, &parsed, invalid).is_err());
+        assert_eq!(std::fs::read(&output).unwrap(), b"original output");
+    }
+    let mut missing_roots = parsed.clone();
+    missing_roots.depinfo_roots.clear();
+    assert!(restore_cc_hit(&store, &missing_roots, meta.clone()).is_err());
+    assert_eq!(std::fs::read(&output).unwrap(), b"original output");
+
+    let restored = restore_cc_hit(&store, &parsed, meta).unwrap();
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    replay_cached_diagnostics(&restored, &mut out, &mut err);
+    let rebase = |text: &str| text.replace(producer.to_str().unwrap(), consumer.to_str().unwrap());
+    assert_eq!(String::from_utf8(out).unwrap(), rebase(&stdout));
+    assert_eq!(String::from_utf8(err).unwrap(), rebase(&stderr));
+    assert_eq!(std::fs::read(&output).unwrap(), b"cached object");
+}
+
+#[test]
 fn replay_diagnostics_forwards_both_compiler_streams() {
     let mut out = Vec::new();
     let mut err = Vec::new();

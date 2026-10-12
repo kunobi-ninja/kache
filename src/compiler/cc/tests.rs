@@ -341,13 +341,11 @@ fn a_key_from_before_the_input_race_fixes_is_never_todays() {
         today,
         key(compiler.cache_key_with(&parsed, &ctx, CcKeyDiscovery::Expansion))
     );
-    let before = key(compiler.cache_key_under(
-        b"cc_artifact_schema:2\n",
-        &parsed,
-        &ctx,
-        CcKeyDiscovery::Expansion,
-    ));
-    assert_ne!(today, before);
+    for old_schema in [b"cc_artifact_schema:2\n", b"cc_artifact_schema:3\n"] {
+        let before =
+            key(compiler.cache_key_under(old_schema, &parsed, &ctx, CcKeyDiscovery::Expansion));
+        assert_ne!(today, before);
+    }
 }
 
 #[test]

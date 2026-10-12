@@ -2001,7 +2001,7 @@ pub(crate) mod shim {
             name,
             path_dirs,
             self_exe,
-            executable_extensions(),
+            executable_extensions(cfg!(windows)),
             is_candidate,
             resolve,
             is_marked,
@@ -2047,8 +2047,8 @@ pub(crate) mod shim {
     /// ship `cargo.exe`, not `cargo`; elsewhere the bare name is the only
     /// candidate. Use only `.exe`: a `.bat`/`.cmd` must never be
     /// selected as the real compiler behind a shim.
-    pub(crate) fn executable_extensions() -> &'static [&'static str] {
-        if cfg!(windows) { &[".exe"] } else { &[] }
+    pub(crate) fn executable_extensions(windows: bool) -> &'static [&'static str] {
+        if windows { &[".exe"] } else { &[] }
     }
 
     /// File names to try for `name` in one directory: the bare name first,
@@ -2592,12 +2592,11 @@ mod shim_tests {
         assert_eq!(none, None);
     }
 
-    /// Live wiring tries no suffix outside Windows, so Unix resolution is
-    /// exactly the old bare-name scan.
-    #[cfg(not(windows))]
+    /// Both policies run on every platform, including Linux mutation CI.
     #[test]
-    fn live_wiring_uses_no_extensions_off_windows() {
-        assert!(executable_extensions().is_empty());
+    fn executable_suffix_policy_uses_only_exe_on_windows() {
+        assert_eq!(executable_extensions(true), &[".exe"]);
+        assert!(executable_extensions(false).is_empty());
     }
 
     #[cfg(unix)]

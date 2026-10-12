@@ -30,6 +30,46 @@ fn locations_and_include_stacks_move_without_rewriting_source_or_message_text() 
 }
 
 #[test]
+fn unnumbered_source_excerpts_that_start_with_a_path_remain_literal() {
+    let text = concat!(
+        "/A/unit.c:2:4: warning: a multiline source excerpt\n",
+        "    /A/raw-string-contents\n",
+        "    from /A/more-raw-string-contents\n",
+        "    /A/filename:nondiagnostic-text\n"
+    );
+    let stored = store(text, &roots("/A"));
+    assert_eq!(
+        restore(&stored, &roots("/B")).unwrap(),
+        text.replacen("/A/unit.c", "/B/unit.c", 1)
+    );
+}
+
+#[test]
+fn location_suffixes_require_compiler_location_syntax() {
+    for suffix in [
+        "/unit.c:2:4: warning: comparison",
+        "/unit.c: In function 'f':",
+        "/unit.c: At global scope:",
+        "/header.h:4,",
+        "/odd:name.h:3: note: here",
+        "/unit.c(2,4): warning C4018: comparison",
+        "/unit.c(2): warning C4018: comparison",
+    ] {
+        assert!(location_suffix(suffix), "{suffix}");
+    }
+    for suffix in [
+        "/raw-string-contents",
+        "/filename:nondiagnostic-text",
+        "/unit.c(foo): text",
+        "/unit.c(2,4) text",
+        "/unit.c(): text",
+        "/unit.c(2,a): text",
+    ] {
+        assert!(!location_suffix(suffix), "{suffix}");
+    }
+}
+
+#[test]
 fn root_priority_then_specificity_and_designated_consumer_spelling_are_preserved() {
     let producer = vec![
         ("/work/A".into(), "checkout".into(), 5),

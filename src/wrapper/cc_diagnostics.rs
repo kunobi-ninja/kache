@@ -56,6 +56,7 @@ pub(super) fn store<'a>(text: &'a str, roots: &Roots) -> Cow<'a, str> {
                 let line_prefix = prefix.rsplit('\n').next().unwrap_or_default();
                 let plain = strip_sgr(line_prefix);
                 matches!(plain.trim(), "" | "In file included from" | "from")
+                    && location_suffix(text[end..].split('\n').next().unwrap_or_default())
             };
             if location {
                 // Every eligible location starts at the path's first byte.
@@ -136,6 +137,26 @@ fn json_file_prefix(prefix: &str) -> bool {
         .and_then(|prefix| prefix.strip_suffix(':'))
         .map(str::trim_end)
         .is_some_and(|prefix| prefix.ends_with("\"file\""))
+}
+
+fn location_suffix(suffix: &str) -> bool {
+    let suffix = strip_sgr(suffix);
+    let gnu = suffix.split(':').skip(1).any(|part| {
+        let part = part.trim_start();
+        part.starts_with(|c: char| c.is_ascii_digit())
+            || ["In ", "At ", "warning", "note", "error"]
+                .iter()
+                .any(|label| part.starts_with(label))
+    });
+    let msvc = suffix.rsplit_once('(').is_some_and(|(_, rest)| {
+        rest.split_once("):").is_some_and(|(position, _)| {
+            !position.is_empty()
+                && position
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || byte == b',')
+        })
+    });
+    gnu || msvc
 }
 
 fn strip_sgr(text: &str) -> String {

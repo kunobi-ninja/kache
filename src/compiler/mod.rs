@@ -1998,20 +1998,47 @@ pub(crate) mod shim {
         is_marked: &dyn Fn(&Path) -> bool,
     ) -> Option<PathBuf> {
         let self_real = self_exe.and_then(resolve);
+        let extensions = executable_extensions();
         for dir in path_dirs {
-            let candidate = dir.join(name);
-            if !is_candidate(&candidate) {
-                continue;
+            for candidate in candidate_names(dir, name, extensions) {
+                if !is_candidate(&candidate) {
+                    continue;
+                }
+                if is_marked(dir) {
+                    continue;
+                }
+                if farm::resolves_to_kache(&candidate, self_real.as_deref(), resolve) {
+                    continue;
+                }
+                return Some(candidate);
             }
-            if is_marked(dir) {
-                continue;
-            }
-            if farm::resolves_to_kache(&candidate, self_real.as_deref(), resolve) {
-                continue;
-            }
-            return Some(candidate);
         }
         None
+    }
+
+    /// Executable suffixes to try after the bare name. Windows toolchains
+    /// ship `cargo.exe`, not `cargo`; elsewhere the bare name is the only
+    /// candidate. Deliberately just `.exe`: a `.bat`/`.cmd` must never be
+    /// selected as the real compiler behind a shim.
+    pub(crate) fn executable_extensions() -> &'static [&'static str] {
+        if cfg!(windows) { &[".exe"] } else { &[] }
+    }
+
+    /// File names to try for `name` in one directory: the bare name first,
+    /// then with each extension appended. An extension `name` already
+    /// carries is not appended twice, case-insensitively for `FOO.EXE`.
+    pub(crate) fn candidate_names(dir: &Path, name: &str, extensions: &[&str]) -> Vec<PathBuf> {
+        let mut out = vec![dir.join(name)];
+        let lower = name.to_lowercase();
+        for ext in extensions {
+            // An empty extension matches everything via `ends_with("")`,
+            // so it is skipped the same way as a duplicate.
+            if lower.ends_with(&ext.to_lowercase()) {
+                continue;
+            }
+            out.push(dir.join(format!("{name}{ext}")));
+        }
+        out
     }
 
     /// [`resolve_real_compiler`] against the real filesystem.
@@ -2348,6 +2375,61 @@ mod shim_tests {
             Some(PathBuf::from("/copies/cc")),
             "without the marker the copy is indistinguishable from a compiler"
         );
+    }
+
+    /// Candidate file names: the bare name first, then one per extension.
+    /// This is the `.exe` fallback a Windows PATH scan needs, where
+    /// toolchains ship `cargo.exe` instead of `cargo`.
+    #[test]
+    fn candidate_names_try_bare_first_then_suffixed() {
+        let dir = Path::new("/tools");
+        assert_eq!(
+            candidate_names(dir, "cargo", &[".exe"]),
+            vec![
+                PathBuf::from("/tools/cargo"),
+                PathBuf::from("/tools/cargo.exe")
+            ]
+        );
+        assert_eq!(
+            candidate_names(dir, "cargo", &[]),
+            vec![PathBuf::from("/tools/cargo")]
+        );
+    }
+
+    /// An empty extension and an extension the name already carries add no
+    /// candidate: no second `cargo` probe, no `cargo.exe.exe`.
+    #[test]
+    fn candidate_names_skip_empty_and_duplicate_extensions() {
+        let dir = Path::new("/tools");
+        assert_eq!(
+            candidate_names(dir, "cargo", &["", ".exe"]),
+            vec![
+                PathBuf::from("/tools/cargo"),
+                PathBuf::from("/tools/cargo.exe")
+            ]
+        );
+        assert_eq!(
+            candidate_names(dir, "cargo.exe", &["", ".exe"]),
+            vec![PathBuf::from("/tools/cargo.exe")]
+        );
+    }
+
+    /// The duplicate-extension check is case-insensitive: `GO.EXE` with
+    /// `.EXE` configured adds no `GO.EXE.exe`.
+    #[test]
+    fn candidate_names_suffix_match_is_case_insensitive() {
+        assert_eq!(
+            candidate_names(Path::new("/tools"), "GO.EXE", &[".EXE"]),
+            vec![PathBuf::from("/tools/GO.EXE")]
+        );
+    }
+
+    /// Live wiring tries no suffix outside Windows, so Unix resolution is
+    /// exactly the old bare-name scan. Windows-only (mutants run on Linux).
+    #[cfg(not(windows))]
+    #[test]
+    fn live_wiring_uses_no_extensions_off_windows() {
+        assert!(executable_extensions().is_empty());
     }
 
     #[cfg(unix)]

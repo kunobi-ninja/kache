@@ -795,7 +795,9 @@ jobs:
     runs-on: ${{ matrix.runner }}
     needs: changes
     if: github.event_name != 'pull_request' || needs.changes.outputs.nix == 'true'
-    timeout-minutes: 40
+    # A cold macOS build compiles the optimized binary and tests separately;
+    # allow time for the full test suite after both compilations finish.
+    timeout-minutes: ${{ matrix.os == 'macOS' && 60 || 40 }}
     strategy:
       fail-fast: false
       matrix:

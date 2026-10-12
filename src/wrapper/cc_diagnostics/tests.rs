@@ -48,12 +48,15 @@ fn unnumbered_source_excerpts_that_start_with_a_path_remain_literal() {
 fn location_suffixes_require_compiler_location_syntax() {
     for suffix in [
         "/unit.c:2:4: warning: comparison",
+        "/unit.c: 2: comparison",
         "/unit.c: In function 'f':",
         "/unit.c: At global scope:",
         "/header.h:4,",
         "/odd:name.h:3: note: here",
         "/unit.c(2,4): warning C4018: comparison",
         "/unit.c(2): warning C4018: comparison",
+        "/unit.c(2,4): comparison",
+        "/unit.c(2): comparison",
     ] {
         assert!(location_suffix(suffix), "{suffix}");
     }
@@ -63,6 +66,7 @@ fn location_suffixes_require_compiler_location_syntax() {
         "/unit.c(foo): text",
         "/unit.c(2,4) text",
         "/unit.c(): text",
+        "/unit.c(,): text",
         "/unit.c(2,a): text",
     ] {
         assert!(!location_suffix(suffix), "{suffix}");

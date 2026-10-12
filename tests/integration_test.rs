@@ -65,6 +65,7 @@ fn test_cc_cache_hit_replays_warning_locations_in_the_receiving_checkout() {
         .arg("-o")
         .arg(root.join("unit.o"))
         .env("KACHE_BASE_DIR", root)
+        .env("KACHE_LOG", "off")
         .current_dir(root)
         .output()
         .unwrap();

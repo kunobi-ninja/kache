@@ -150,7 +150,7 @@ fn location_suffix(suffix: &str) -> bool {
     });
     let msvc = suffix.rsplit_once('(').is_some_and(|(_, rest)| {
         rest.split_once("):").is_some_and(|(position, _)| {
-            !position.is_empty()
+            position.starts_with(|c: char| c.is_ascii_digit())
                 && position
                     .bytes()
                     .all(|byte| byte.is_ascii_digit() || byte == b',')

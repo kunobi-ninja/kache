@@ -107,20 +107,24 @@ pub(crate) fn run(config: &Config, trigger: Trigger<'_>) {
     let compact = crate::index_compact::run(config, trigger);
     let discovered = crate::worktree_discovery::run(config, trigger);
     let cleaned = crate::target_cleanup::run(config, trigger);
-    if gap_still_free(heal.as_ref(), compact.as_ref(), discovered || cleaned) {
+    if gap_still_free(heal.as_ref(), compact.as_ref(), discovered, cleaned) {
         crate::target_dedup::idle_slice(config, trigger);
     }
 }
 
-/// The clone slice waits for a check that did not already rewrite the index
-/// or walk targets. A skipped or busy index still counts as free: those
-/// returns are a few queries. An error does not.
+/// The clone slice waits for a check that did not already rewrite the index,
+/// discover targets or clean them. A skipped or busy index still counts as
+/// free: those returns are a few queries. An error does not.
 fn gap_still_free(
     heal: Option<&crate::blob_heal::Outcome>,
     compact: Option<&crate::index_compact::Outcome>,
+    discovered: bool,
     cleaned: bool,
 ) -> bool {
-    !cleaned && heal.is_some_and(heal_left_the_gap) && compact.is_some_and(compact_left_the_gap)
+    !discovered
+        && !cleaned
+        && heal.is_some_and(heal_left_the_gap)
+        && compact.is_some_and(compact_left_the_gap)
 }
 
 fn heal_left_the_gap(outcome: &crate::blob_heal::Outcome) -> bool {
@@ -252,10 +256,26 @@ mod tests {
     fn dedup_waits_for_a_check_that_did_not_already_work() {
         let idle_heal = crate::blob_heal::Outcome::NotNeeded;
         let idle_compact = crate::index_compact::Outcome::NotNeeded;
-        assert!(gap_still_free(Some(&idle_heal), Some(&idle_compact), false));
-        assert!(!gap_still_free(None, Some(&idle_compact), false));
-        assert!(!gap_still_free(Some(&idle_heal), None, false));
-        assert!(!gap_still_free(Some(&idle_heal), Some(&idle_compact), true));
+        assert!(gap_still_free(
+            Some(&idle_heal),
+            Some(&idle_compact),
+            false,
+            false
+        ));
+        assert!(!gap_still_free(None, Some(&idle_compact), false, false));
+        assert!(!gap_still_free(Some(&idle_heal), None, false, false));
+        assert!(!gap_still_free(
+            Some(&idle_heal),
+            Some(&idle_compact),
+            false,
+            true
+        ));
+        assert!(!gap_still_free(
+            Some(&idle_heal),
+            Some(&idle_compact),
+            true,
+            false
+        ));
 
         let healed = crate::blob_heal::Outcome::Healed {
             probe: crate::store::BlobRefcountDrift::default(),
@@ -264,17 +284,32 @@ mod tests {
             swept: None,
             elapsed: Duration::ZERO,
         };
-        assert!(!gap_still_free(Some(&healed), Some(&idle_compact), false));
+        assert!(!gap_still_free(
+            Some(&healed),
+            Some(&idle_compact),
+            false,
+            false
+        ));
         let failed = crate::blob_heal::Outcome::Failed {
             reason: "unreadable".to_string(),
         };
-        assert!(!gap_still_free(Some(&failed), Some(&idle_compact), false));
+        assert!(!gap_still_free(
+            Some(&failed),
+            Some(&idle_compact),
+            false,
+            false
+        ));
         let compacted = crate::index_compact::Outcome::Attempted {
             mode: crate::index_compact::Mode::Quiet,
             result: crate::cache_key::IndexCompaction::NotNeeded,
             elapsed: Duration::ZERO,
         };
-        assert!(!gap_still_free(Some(&idle_heal), Some(&compacted), false));
+        assert!(!gap_still_free(
+            Some(&idle_heal),
+            Some(&compacted),
+            false,
+            false
+        ));
 
         let skipped_heal = crate::blob_heal::Outcome::Skipped(crate::blob_heal::SkipReason::Busy);
         let skipped_compact =
@@ -282,11 +317,13 @@ mod tests {
         assert!(gap_still_free(
             Some(&skipped_heal),
             Some(&skipped_compact),
+            false,
             false
         ));
         assert!(gap_still_free(
             Some(&crate::blob_heal::Outcome::IndexBusy),
             Some(&idle_compact),
+            false,
             false
         ));
     }

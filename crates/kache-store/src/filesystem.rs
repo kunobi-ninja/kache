@@ -48,9 +48,8 @@ pub fn cargo_tagged(target: &Path) -> bool {
         use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(OPEN_TAG_FLAGS);
     }
-    // Without those flags, refuse a symlink or special file before opening.
     #[cfg(not(unix))]
-    if !std::fs::symlink_metadata(&tag).is_ok_and(|meta| meta.file_type().is_file()) {
+    if special_tag_without_open_flags(&tag) {
         return false;
     }
     let Ok(file) = options.open(&tag) else {
@@ -65,6 +64,13 @@ pub fn cargo_tagged(target: &Path) -> bool {
         && start
             .windows(CARGO_TAG.len())
             .any(|window| window == CARGO_TAG)
+}
+
+/// Without Unix's open flags, refuse a symlink or special file before
+/// opening it.
+#[cfg(not(unix))]
+fn special_tag_without_open_flags(tag: &Path) -> bool {
+    !std::fs::symlink_metadata(tag).is_ok_and(|meta| meta.file_type().is_file())
 }
 
 /// A tracked cleanup target must be a derived directory, never a source root

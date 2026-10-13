@@ -7911,6 +7911,29 @@ fn test_cache_line() -> CacheLine {
 }
 
 #[test]
+fn a_tracked_clean_reads_every_target_only_when_it_shows_them() {
+    assert!(builds_plan(true, 3), "a preview shows what it keeps");
+    assert!(
+        builds_plan(false, 0),
+        "so does a clean that selected nothing"
+    );
+    assert!(
+        !builds_plan(false, 3),
+        "a clean that removes something skips it"
+    );
+    assert!(prints_plan(false, true, 3), "a dry run prints it");
+    assert!(
+        prints_plan(false, false, 0),
+        "so does a clean with nothing to remove"
+    );
+    assert!(
+        !prints_plan(false, false, 3),
+        "a clean with work opens the selector"
+    );
+    assert!(!prints_plan(true, true, 0), "JSON never prints text");
+}
+
+#[test]
 fn a_clean_that_removes_nothing_shows_targets_found_through_git_and_counts_gone_entries() {
     let mut found = row("/wt/agent", TargetState::Live, 4 << 30);
     found.discovered = true;
@@ -7929,7 +7952,23 @@ fn a_clean_that_removes_nothing_shows_targets_found_through_git_and_counts_gone_
     };
     let skipped = [gone("/wt/old-a/target"), gone("/wt/old-b/target")];
     let default = TrackedSelection::StaleOrOrphaned(DEFAULT_TRACKED_STALE_HOURS);
-    let rows = vec![built, small, found, elsewhere];
+    // Found through Git with nothing to free: neither counted nor suggested.
+    let mut empty = row("/wt/empty", TargetState::Live, 0);
+    empty.discovered = true;
+    let only_empty = clean_next_actions(
+        default,
+        false,
+        0,
+        std::slice::from_ref(&empty),
+        &beside_its_worktree,
+    );
+    assert!(
+        !only_empty
+            .iter()
+            .any(|action| action.argv.contains(&"/wt/empty".to_string())),
+        "{only_empty:?}"
+    );
+    let rows = vec![built, small, found, elsewhere, empty];
     let plan = TrackedPlan::from_parts(
         default,
         rows,
@@ -7959,7 +7998,7 @@ fn a_clean_that_removes_nothing_shows_targets_found_through_git_and_counts_gone_
         "{:?}",
         plan.next[1]
     );
-    assert_eq!(plan.kept.len(), 4);
+    assert_eq!(plan.kept.len(), 5);
 
     let lines = plan_lines(&plan, &skipped, PlanEnd::NothingRemoved);
     assert!(

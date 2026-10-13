@@ -4579,6 +4579,19 @@ enum PlanEnd {
     NothingRemoved,
 }
 
+/// Whether a tracked clean reads every target kache knows. A preview, or a
+/// clean that selected nothing, shows what it keeps, so it answers "what is
+/// using my disk" too; a clean that removes something does not need it.
+fn builds_plan(preview: bool, selected: usize) -> bool {
+    preview || selected == 0
+}
+
+/// Whether that view is printed as text: `--dry-run`, or a clean with
+/// nothing to remove. JSON prints the same plan; otherwise the selector runs.
+fn prints_plan(json: bool, dry_run: bool, selected: usize) -> bool {
+    !json && (dry_run || selected == 0)
+}
+
 /// What `kache clean --cache` or `--crate` removes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CacheClean {
@@ -4975,11 +4988,8 @@ pub fn clean(
     // Sort by size descending
     targets.sort_by_key(|entry| std::cmp::Reverse(entry.size));
 
-    // A tracked preview, or a tracked clean that removes nothing, lists every
-    // target kache knows with what it keeps, so it answers "what is using my
-    // disk" too. Text and JSON show the same rows and the same next steps.
     let plan = match selection {
-        Some(selection) if preview || targets.is_empty() => {
+        Some(selection) if builds_plan(preview, targets.len()) => {
             let now = kache_store::markers::now_epoch_secs() as i64;
             Some(TrackedPlan::new(config, selection, &targets, preview, now)?)
         }
@@ -4987,7 +4997,7 @@ pub fn clean(
     };
     if let Some(plan) = plan
         .as_ref()
-        .filter(|_| !json && (dry_run || targets.is_empty()))
+        .filter(|_| prints_plan(json, dry_run, targets.len()))
     {
         let end = if dry_run {
             PlanEnd::DryRun

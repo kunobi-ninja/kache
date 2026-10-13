@@ -8712,6 +8712,15 @@ fn init_offers_recovery_with_the_floor_its_file_and_environment_set() {
     let overridden = RecoverySettings::of(file, &env, false);
     assert_eq!(overridden.floor, 5 << 30, "the environment wins");
     assert_eq!(overridden.targets_from_env, Some(false));
+    for (value, on) in [("1", true), ("TRUE", true), ("yes", false)] {
+        let env =
+            move |name: &str| (name == "KACHE_AUTO_RECOVER_TARGETS").then(|| value.to_string());
+        assert_eq!(
+            RecoverySettings::of("", &env, false).targets_from_env,
+            Some(on),
+            "{value}"
+        );
+    }
     let ignored = RecoverySettings::of(&format!("{file}ignore_env = true\n"), &env, false);
     assert_eq!(ignored.floor, 100 << 30, "unless the file ignores it");
     assert_eq!(ignored.targets_from_env, None);

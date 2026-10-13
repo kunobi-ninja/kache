@@ -853,9 +853,12 @@ mod tests {
             return;
         }
         let dir = tempfile::tempdir().unwrap();
-        let home = dir.path().join("home").canonicalize().ok();
-        std::fs::create_dir_all(dir.path().join("home")).unwrap();
-        let home = home.unwrap_or_else(|| dir.path().join("home").canonicalize().unwrap());
+        // Git gets the home as spelled; the shield gets it both ways, as
+        // `discover` passes it (`/var` is `/private/var` on macOS, and Windows
+        // resolves to a `\\?\` path Git cannot create a worktree under).
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let homes = [home.clone(), home.canonicalize().unwrap()];
         // A dotfiles repository at home, with a worktree in Documents.
         commit_and_add_worktree(&home, &home.join("Documents/notes"));
         let built = cargo_target(&home.join("tools/rust"));
@@ -867,8 +870,7 @@ mod tests {
             .remember_target_root(&built, &home.join("tools/rust"))
             .unwrap();
 
-        let pass =
-            |deadline| discover_within(&store, deadline, std::slice::from_ref(&home), 0).unwrap();
+        let pass = |deadline| discover_within(&store, deadline, &homes, 0).unwrap();
         assert_eq!(pass(Instant::now() + DISCOVERY_TIME), 0);
         assert_eq!(store.tracked_target_roots(0).unwrap().len(), 1);
     }

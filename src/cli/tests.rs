@@ -8736,3 +8736,81 @@ fn stats_shows_the_recovery_the_daemon_runs() {
     daemon.auto_recover_targets = None;
     assert_eq!(recovery_in_effect(&config, Some(&daemon)), (1, false));
 }
+
+#[test]
+fn init_asks_only_when_nothing_else_decides() {
+    let settings = |floor, env, file| RecoverySettings {
+        floor,
+        targets_from_env: env,
+        file_decides_targets: file,
+    };
+    let gib = 1u64 << 30;
+    assert_eq!(
+        recovery_offer(&settings(gib, None, false), false),
+        RecoveryOffer::Ask(gib)
+    );
+    assert_eq!(
+        recovery_offer(&settings(gib, None, false), true),
+        RecoveryOffer::Explain(gib)
+    );
+    assert_eq!(
+        recovery_offer(&settings(gib, None, true), false),
+        RecoveryOffer::Nothing
+    );
+    assert_eq!(
+        recovery_offer(&settings(0, None, false), false),
+        RecoveryOffer::Nothing
+    );
+    assert_eq!(
+        recovery_offer(&settings(gib, Some(true), true), false),
+        RecoveryOffer::FromEnv(true),
+        "the environment overrides the file"
+    );
+    assert_eq!(
+        recovery_offer(&settings(0, Some(false), false), true),
+        RecoveryOffer::FromEnv(false)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn init_saves_target_recovery_safely() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("kache/config.toml");
+    assert_eq!(read_config_text(&path).unwrap(), "", "no file yet");
+    assert!(save_target_recovery(&path, "").unwrap());
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "[cache]\nauto_recover_targets = true\n"
+    );
+
+    // A file holding credentials keeps its permissions.
+    let text = "[cache]\nlocal_max_size = \"5G\"\n";
+    std::fs::write(&path, text).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(save_target_recovery(&path, text).unwrap());
+    assert!(
+        std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("auto_recover_targets = true")
+    );
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+
+    // Edited while the question waited: nothing is written.
+    std::fs::write(&path, "[cache]\nlocal_max_size = \"9G\"\n").unwrap();
+    assert!(!save_target_recovery(&path, text).unwrap());
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "[cache]\nlocal_max_size = \"9G\"\n"
+    );
+    // A table it cannot edit blind: nothing is written.
+    std::fs::write(&path, "cache.local_max_size = \"5G\"\n").unwrap();
+    assert!(!save_target_recovery(&path, "cache.local_max_size = \"5G\"\n").unwrap());
+
+    // An unreadable path is an error, not an empty file.
+    assert!(read_config_text(dir.path()).is_err());
+}

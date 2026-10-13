@@ -5401,3 +5401,15 @@ fn oci_pull_request_jobs_stay_readonly_even_with_a_separate_tag_prefix() {
     assert!(!trusted.remote_readonly);
     assert_eq!(trusted.pull_request_prefix, None);
 }
+
+#[test]
+fn the_default_floor_is_ten_gib_and_the_user_file_never_a_project_one() {
+    assert_eq!(DEFAULT_RECOVERY_FLOOR, 10 * 1024 * 1024 * 1024);
+    let _lock = config_path_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let chosen = dir.path().join("chosen.toml");
+    let _set = set_env_for_test("KACHE_CONFIG", Some(chosen.as_os_str()));
+    assert_eq!(user_config_path(), chosen);
+    let _unset = set_env_for_test("KACHE_CONFIG", None);
+    assert_eq!(user_config_path(), config_file_path());
+}

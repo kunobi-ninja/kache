@@ -437,4 +437,10 @@ exclude_re = [
     # in for them elsewhere is `#[cfg(not(unix))]`, never built in this lane.
     "crates/kache-store/src/filesystem.rs:\\d+:\\d+: replace \\| with \\^$",
     "special_tag_without_open_flags",
+    # `init`'s target-recovery offer reads this process's environment and
+    # stdin and prints; its decision (`recovery_offer`), settings
+    # (`RecoverySettings::of`) and write (`save_target_recovery`) are pure or
+    # take a path, and are tested directly.
+    "replace offer_target_recovery -> Result<\\(\\)> with Ok\\(\\(\\)\\)",
+    " in offer_target_recovery$",
 ]

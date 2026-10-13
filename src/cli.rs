@@ -9592,65 +9592,107 @@ fn setup_steps(
 
 /// `init`'s offer to let free-space recovery remove idle target directories
 /// too, not only cache entries. It concerns the user's own config file (see
-/// [`crate::config::user_config_path`]): the one a login daemon reads. Only a
-/// person at a terminal is asked; `--yes`, `--check` and a script leave the
-/// default, cache only. A file that already decides, or an environment
-/// variable that overrides it, is left as it is.
+/// [`crate::config::user_config_path`]): the one a login daemon reads. The
+/// decision is [`recovery_offer`] and the write [`save_target_recovery`];
+/// this only reads the process's environment and stdin, and prints.
 fn offer_target_recovery(yes: bool, check: bool) -> Result<()> {
     let path = crate::config::user_config_path();
-    let existing = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(error) => return Err(error).context("read Kache configuration"),
-    };
+    let existing = read_config_text(&path)?;
     let env = |name: &str| std::env::var(name).ok();
     let settings = RecoverySettings::of(&existing, &env, crate::policy::running_in_ci_with(env));
-    if let Some(on) = settings.targets_from_env {
-        println!(
+    let unattended = yes || check || !std::io::stdin().is_terminal();
+    match recovery_offer(&settings, unattended) {
+        RecoveryOffer::Nothing => {}
+        RecoveryOffer::FromEnv(on) => println!(
             "  • Free-space recovery: KACHE_AUTO_RECOVER_TARGETS {} idle targets",
             if on { "includes" } else { "leaves out" }
-        );
-        return Ok(());
+        ),
+        RecoveryOffer::Explain(floor) => println!(
+            "  • Free-space recovery: cache entries below {} free; `auto_recover_targets = true` adds idle targets",
+            term::bytes(floor)
+        ),
+        RecoveryOffer::Ask(floor) => {
+            let question = format!(
+                "Below {} free, also remove target directories no build used for a day?",
+                term::bytes(floor)
+            );
+            if !prompt_yes_no(&question, false, false)? {
+                println!("  • Free-space recovery: cache entries only");
+            } else if save_target_recovery(&path, &existing)? {
+                println!(
+                    "  ✓ Free-space recovery: cache entries and idle targets ({})",
+                    term::home_path(&path)
+                );
+            } else {
+                println!(
+                    "  → Free-space recovery: add `auto_recover_targets = true` under [cache] in {}",
+                    term::home_path(&path)
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// What `init` does about target recovery.
+#[derive(Debug, PartialEq, Eq)]
+enum RecoveryOffer {
+    /// The file already decides, or recovery is off.
+    Nothing,
+    /// `KACHE_AUTO_RECOVER_TARGETS` decides, on or off.
+    FromEnv(bool),
+    /// Nobody to ask: say what the default does below this floor.
+    Explain(u64),
+    /// Ask whether idle targets go too below this floor.
+    Ask(u64),
+}
+
+/// The offer for `settings`; `unattended` when `--yes`, `--check` or a
+/// script runs `init`, which keep the default rather than turn it on.
+fn recovery_offer(settings: &RecoverySettings, unattended: bool) -> RecoveryOffer {
+    if let Some(on) = settings.targets_from_env {
+        return RecoveryOffer::FromEnv(on);
     }
     if settings.file_decides_targets || settings.floor == 0 {
-        return Ok(());
+        return RecoveryOffer::Nothing;
     }
-    let floor = term::bytes(settings.floor);
-    if yes || check || !std::io::stdin().is_terminal() {
-        println!(
-            "  • Free-space recovery: cache entries below {floor} free; `auto_recover_targets = true` adds idle targets"
-        );
-        return Ok(());
+    if unattended {
+        RecoveryOffer::Explain(settings.floor)
+    } else {
+        RecoveryOffer::Ask(settings.floor)
     }
-    let question =
-        format!("Below {floor} free, also remove target directories no build used for a day?");
-    if !prompt_yes_no(&question, false, false)? {
-        println!("  • Free-space recovery: cache entries only");
-        return Ok(());
+}
+
+/// A config file's text, empty when there is none yet.
+fn read_config_text(path: &std::path::Path) -> Result<String> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(text),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(error) => Err(error).context("read Kache configuration"),
     }
-    // The file may have been edited while the question waited.
-    let current = std::fs::read_to_string(&path).unwrap_or_default();
-    let Some(updated) = enable_target_recovery(&existing).filter(|_| current == existing) else {
-        println!(
-            "  → Free-space recovery: add `auto_recover_targets = true` under [cache] in {}",
-            term::home_path(&path)
-        );
-        return Ok(());
+}
+
+/// Turn target recovery on in the file at `path`, which read as `existing`
+/// before the question. `false`, writing nothing, when the file changed
+/// meanwhile or its `[cache]` table cannot be edited safely. The file is
+/// replaced atomically and keeps its permissions.
+fn save_target_recovery(path: &std::path::Path, existing: &str) -> Result<bool> {
+    let Some(updated) = enable_target_recovery(existing) else {
+        return Ok(false);
     };
+    if read_config_text(path)? != existing {
+        return Ok(false);
+    }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let permissions = std::fs::metadata(&path).ok().map(|meta| meta.permissions());
-    crate::atomic::atomic_replace(&path, updated.as_bytes()).context("save Kache configuration")?;
+    let permissions = std::fs::metadata(path).ok().map(|meta| meta.permissions());
+    crate::atomic::atomic_replace(path, updated.as_bytes()).context("save Kache configuration")?;
     if let Some(permissions) = permissions {
-        std::fs::set_permissions(&path, permissions)
+        std::fs::set_permissions(path, permissions)
             .context("keep the configuration's permissions")?;
     }
-    println!(
-        "  ✓ Free-space recovery: cache entries and idle targets ({})",
-        term::home_path(&path)
-    );
-    Ok(())
+    Ok(true)
 }
 
 /// What a user config file, with the environment, says about recovery.

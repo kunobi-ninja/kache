@@ -8653,3 +8653,16 @@ fn unit_cleanup_confirmation_requires_candidates_and_nonpreview_mode() {
         );
     }
 }
+
+#[test]
+fn targets_discover_says_how_many_it_found() {
+    assert!(discovered_line(0).starts_with("No new target directories"));
+    assert_eq!(
+        discovered_line(1),
+        "Found 1 new target directory in Git worktrees. `kache targets` lists it."
+    );
+    assert_eq!(
+        discovered_line(3),
+        "Found 3 new target directories in Git worktrees. `kache targets` lists them."
+    );
+}

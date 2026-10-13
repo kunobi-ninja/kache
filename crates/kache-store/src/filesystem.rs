@@ -26,6 +26,42 @@ pub fn directory_identity(path: &Path) -> Option<PathIdentity> {
         })
 }
 
+/// What Cargo writes in `CACHEDIR.TAG` at the top of a target directory.
+const CARGO_TAG: &[u8] = b"Signature: 8a477f597d28d172789f06886806bc55";
+/// How much of `CACHEDIR.TAG` is read: the signature is in its first line.
+const TAG_READ_BYTES: u64 = 512;
+
+/// Whether Cargo tagged `target` as its build directory. Only a regular
+/// `CACHEDIR.TAG` counts, opened without following a symlink or waiting on
+/// a FIFO, and only its start is read, so a planted marker in a directory
+/// discovery never built in cannot hang or exhaust the reader.
+pub fn cargo_tagged(target: &Path) -> bool {
+    use std::io::Read;
+    let tag = target.join("CACHEDIR.TAG");
+    if !std::fs::symlink_metadata(&tag).is_ok_and(|meta| meta.file_type().is_file()) {
+        return false;
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let Ok(file) = options.open(&tag) else {
+        return false;
+    };
+    // Replaced between the check and the open: look at what was opened.
+    if !file.metadata().is_ok_and(|meta| meta.is_file()) {
+        return false;
+    }
+    let mut start = Vec::new();
+    file.take(TAG_READ_BYTES).read_to_end(&mut start).is_ok()
+        && start
+            .windows(CARGO_TAG.len())
+            .any(|window| window == CARGO_TAG)
+}
+
 /// A tracked cleanup target must be a derived directory, never a source root
 /// or an ancestor of one.
 pub fn target_root_is_safe(target: &Path, workspace_root: &Path) -> bool {
@@ -35,8 +71,7 @@ pub fn target_root_is_safe(target: &Path, workspace_root: &Path) -> bool {
     let Ok(workspace) = std::path::absolute(workspace_root) else {
         return false;
     };
-    let cargo_markers = std::fs::read_to_string(target.join("CACHEDIR.TAG"))
-        .is_ok_and(|tag| tag.contains("Signature: 8a477f597d28d172789f06886806bc55"))
+    let cargo_markers = cargo_tagged(&target)
         && (target.join(".rustc_info.json").is_file()
             || target.join("debug").is_dir()
             || target.join("release").is_dir());
@@ -147,6 +182,45 @@ mod tests {
             !renumbered(id(1, 7), id(2, 8)),
             "replaced on another volume"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_a_regular_tag_marks_a_cargo_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = |name: &str| {
+            let target = dir.path().join(name);
+            std::fs::create_dir_all(&target).unwrap();
+            target
+        };
+        let signature = "Signature: 8a477f597d28d172789f06886806bc55";
+
+        let tagged = target("tagged");
+        std::fs::write(tagged.join("CACHEDIR.TAG"), format!("{signature}\n# Cargo")).unwrap();
+        assert!(cargo_tagged(&tagged));
+
+        let late = target("late");
+        let padding = " ".repeat(TAG_READ_BYTES as usize);
+        std::fs::write(late.join("CACHEDIR.TAG"), format!("{padding}{signature}")).unwrap();
+        assert!(!cargo_tagged(&late), "only the start is read");
+
+        // A symlink to a tag, or to something endless, is not followed.
+        let linked = target("linked");
+        std::os::unix::fs::symlink(tagged.join("CACHEDIR.TAG"), linked.join("CACHEDIR.TAG"))
+            .unwrap();
+        assert!(!cargo_tagged(&linked));
+        let endless = target("endless");
+        std::os::unix::fs::symlink("/dev/zero", endless.join("CACHEDIR.TAG")).unwrap();
+        assert!(!cargo_tagged(&endless));
+
+        // A FIFO with no writer would block a read forever.
+        let fifo = target("fifo");
+        let path = std::ffi::CString::new(fifo.join("CACHEDIR.TAG").as_os_str().as_encoded_bytes())
+            .unwrap();
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        assert!(!cargo_tagged(&fifo));
+
+        assert!(!cargo_tagged(&target("untagged")));
     }
 
     #[cfg(unix)]

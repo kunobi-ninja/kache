@@ -5997,6 +5997,40 @@ fn targets_next_actions(rows: &[TargetRow]) -> Vec<crate::machine::NextAction> {
     }]
 }
 
+/// `kache targets discover`: the daemon's Git discovery and worktree crawl,
+/// run now. Reports how many target directories it newly recorded.
+pub fn discover_targets(config: &Config, json: bool) -> Result<()> {
+    let store = Store::open(config)?;
+    let found = crate::worktree_discovery::discover(
+        &store,
+        crate::worktree_discovery::COMMAND_DISCOVERY_TIME,
+    )?;
+    if json {
+        #[derive(serde::Serialize)]
+        struct Body {
+            found: usize,
+        }
+        let next = vec![crate::machine::NextAction {
+            argv: ["kache", "targets"].map(String::from).to_vec(),
+            why: "lists every tracked target, with what it would free".to_string(),
+        }];
+        return crate::machine::emit("targets-discover", Body { found }, next);
+    }
+    println!("{}", discovered_line(found));
+    Ok(())
+}
+
+/// What `kache targets discover` says it found.
+fn discovered_line(found: usize) -> String {
+    match found {
+        0 => "No new target directories in the Git worktrees of known repositories.".to_string(),
+        1 => "Found 1 new target directory in Git worktrees. `kache targets` lists it.".to_string(),
+        n => format!(
+            "Found {n} new target directories in Git worktrees. `kache targets` lists them."
+        ),
+    }
+}
+
 /// Show every tracked target directory with what deleting it would free
 /// and whether its worktree still exists.
 pub fn targets(config: &Config, json: bool) -> Result<()> {

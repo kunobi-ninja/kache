@@ -1,13 +1,16 @@
-//! Find Cargo targets in sibling Git worktrees of workspaces kache has built.
+//! Find Cargo targets in the Git worktrees of repositories kache knows.
 //!
-//! This runs during quiet daemon maintenance, never in a compiler wrapper.
-//! Git supplies candidate worktrees; Cargo markers and a manifest still have
-//! to identify a target before it is recorded. Discovery does not claim a
-//! build used the target or make it eligible for automatic cleanup.
+//! This runs during quiet daemon maintenance and on `kache targets
+//! discover`, never in a compiler wrapper. Every tracked target's workspace
+//! leads to its repository, and from there to the other repositories in the
+//! same folders. Git lists each repository's worktrees and, in each, the
+//! directories it ignores; every ignored `target/` Cargo has tagged is
+//! recorded. Discovery does not claim a build used the target or make it
+//! eligible for automatic cleanup.
 
 use crate::store::Store;
 use anyhow::Result;
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -15,6 +18,15 @@ use std::time::{Duration, Instant};
 
 const GIT_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_INVENTORY_BYTES: u64 = 1 << 20;
+/// How long Git may take to list one worktree's ignored directories.
+const LISTING_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_LISTING_BYTES: u64 = 4 << 20;
+/// Repositories one discovery pass may ask Git about.
+const DISCOVERY_STEPS: usize = 2_000;
+/// How long the daemon's quiet pass may spend on discovery.
+pub(crate) const DAEMON_DISCOVERY_TIME: Duration = Duration::from_secs(20);
+/// How long a command someone waits on may spend on discovery.
+pub(crate) const COMMAND_DISCOVERY_TIME: Duration = Duration::from_secs(120);
 
 #[derive(Debug, PartialEq, Eq)]
 struct Worktree {
@@ -65,11 +77,22 @@ fn parse_worktrees(bytes: &[u8]) -> Vec<Worktree> {
     trees
 }
 
-fn inventory(workspace: &Path) -> Option<Vec<Worktree>> {
+/// `git -C dir <args>`'s output, or `None` if Git fails, outruns `timeout`
+/// or `deadline`, or writes `max_bytes` or more. The repository's own
+/// filesystem monitor is switched off: discovery reads repositories no build
+/// ran in, and a configured `core.fsmonitor` is a program Git would run.
+fn git_output(
+    dir: &Path,
+    args: &[&str],
+    timeout: Duration,
+    deadline: Instant,
+    max_bytes: u64,
+) -> Option<Vec<u8>> {
+    let timeout = timeout.min(deadline.checked_duration_since(Instant::now())?);
     let mut child = Command::new("git")
-        .arg("-C")
-        .arg(workspace)
-        .args(["worktree", "list", "--porcelain", "-z"])
+        .args(["-c", "core.fsmonitor=false", "-C"])
+        .arg(dir)
+        .args(args)
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
@@ -81,13 +104,10 @@ fn inventory(workspace: &Path) -> Option<Vec<Worktree>> {
         .ok()?;
     let stdout = child.stdout.take()?;
     let reader = match std::thread::Builder::new()
-        .name("kache-git-worktrees".into())
+        .name("kache-git-discovery".into())
         .spawn(move || {
             let mut bytes = Vec::new();
-            stdout
-                .take(MAX_INVENTORY_BYTES)
-                .read_to_end(&mut bytes)
-                .ok()?;
+            stdout.take(max_bytes).read_to_end(&mut bytes).ok()?;
             Some(bytes)
         }) {
         Ok(reader) => reader,
@@ -97,7 +117,7 @@ fn inventory(workspace: &Path) -> Option<Vec<Worktree>> {
             return None;
         }
     };
-    let deadline = Instant::now() + GIT_TIMEOUT;
+    let deadline = Instant::now() + timeout;
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break Some(status),
@@ -115,12 +135,20 @@ fn inventory(workspace: &Path) -> Option<Vec<Worktree>> {
         let _ = child.wait();
     }
     let bytes = reader.join().ok().flatten()?;
-    if !status?.success() {
+    if !status?.success() || bytes.len() as u64 == max_bytes {
         return None;
     }
-    if bytes.len() as u64 == MAX_INVENTORY_BYTES {
-        return None;
-    }
+    Some(bytes)
+}
+
+fn inventory(workspace: &Path, deadline: Instant) -> Option<Vec<Worktree>> {
+    let bytes = git_output(
+        workspace,
+        &["worktree", "list", "--porcelain", "-z"],
+        GIT_TIMEOUT,
+        deadline,
+        MAX_INVENTORY_BYTES,
+    )?;
     Some(
         parse_worktrees(&bytes)
             .into_iter()
@@ -132,55 +160,375 @@ fn inventory(workspace: &Path) -> Option<Vec<Worktree>> {
     )
 }
 
-/// Map the source workspace's path relative to its Git worktree into each
-/// sibling. A repository may contain more than one Cargo workspace.
-fn sibling_workspaces(seed: &Path, trees: &[Worktree]) -> Vec<PathBuf> {
-    let Some(source) = trees
-        .iter()
-        .filter(|tree| seed.starts_with(&tree.path))
-        .max_by_key(|tree| tree.path.components().count())
-    else {
-        return Vec::new();
-    };
-    let Ok(suffix) = seed.strip_prefix(&source.path) else {
-        return Vec::new();
-    };
+/// Where `seed` sits in its own worktree, relative to that worktree's root:
+/// the nearest of its ancestors among `roots`.
+fn seed_suffix(seed: &Path, roots: &HashSet<&Path>) -> Option<PathBuf> {
+    let root = seed.ancestors().find(|dir| roots.contains(dir))?;
+    seed.strip_prefix(root).ok().map(Path::to_path_buf)
+}
+
+/// The roots of `trees`, for [`seed_suffix`].
+fn roots_of(trees: &[Worktree]) -> HashSet<&Path> {
+    trees.iter().map(|tree| tree.path.as_path()).collect()
+}
+
+/// The workspaces at `suffix` in each of `trees` that has one.
+fn workspaces_at<'a>(
+    suffix: &'a Path,
+    trees: &'a [&'a Worktree],
+) -> impl Iterator<Item = PathBuf> + 'a {
     trees
         .iter()
-        .filter(|tree| !tree.bare && !tree.locked && !tree.prunable)
-        .map(|tree| tree.path.join(suffix))
+        .map(move |tree| tree.path.join(suffix))
         .filter(|workspace| {
             std::fs::symlink_metadata(workspace).is_ok_and(|meta| meta.file_type().is_dir())
                 && workspace.join("Cargo.toml").is_file()
         })
+}
+
+/// Whether discovery may read `tree`: available to Git, and not shielded.
+fn readable(tree: &Worktree, homes: &[PathBuf]) -> bool {
+    !tree.bare && !tree.locked && !tree.prunable && !shielded(&tree.path, homes)
+}
+
+/// Map the source workspace's path relative to its Git worktree into each
+/// sibling. A repository may contain more than one Cargo workspace.
+#[cfg(test)]
+fn sibling_workspaces(seed: &Path, trees: &[Worktree]) -> Vec<PathBuf> {
+    let available: Vec<_> = trees.iter().filter(|tree| readable(tree, &[])).collect();
+    seed_suffix(seed, &roots_of(trees))
+        .map(|suffix| workspaces_at(&suffix, &available).collect())
+        .unwrap_or_default()
+}
+
+/// The `target/` directories among a worktree's ignored ones, as Git lists
+/// them with `ls-files --others --ignored --directory`: paths relative to
+/// the worktree, NUL-separated, a directory with a trailing slash. Git does
+/// not descend into an ignored directory, so a target inside another one
+/// (`node_modules/…/target`, `target/package/…/target`) is not listed.
+fn ignored_target_dirs(worktree: &Path, listing: &[u8]) -> Vec<PathBuf> {
+    listing
+        .split(|byte| *byte == 0)
+        .filter_map(|entry| entry.strip_suffix(b"/"))
+        .filter(|dir| *dir == b"target" || dir.ends_with(b"/target"))
+        .filter_map(|dir| std::str::from_utf8(dir).ok())
+        .map(|dir| worktree.join(dir))
         .collect()
 }
 
-/// Discover default targets in sibling worktrees. Custom target paths are
-/// known only when a wrapper has already recorded them in the target registry.
-pub(crate) fn discover(store: &Store) -> Result<usize> {
+/// Cargo's targets in `worktree`, as (target, workspace): each ignored
+/// `target/` Cargo tagged. The workspace is the directory holding it, even
+/// once its Cargo.toml is gone: a removed crate leaves its output behind.
+fn targets_in_worktree(worktree: &Path, deadline: Instant) -> Vec<(PathBuf, PathBuf)> {
+    let Some(listing) = git_output(
+        worktree,
+        &[
+            "ls-files",
+            "-z",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "--directory",
+        ],
+        LISTING_TIMEOUT,
+        deadline,
+        MAX_LISTING_BYTES,
+    ) else {
+        return Vec::new();
+    };
+    ignored_target_dirs(worktree, &listing)
+        .into_iter()
+        .filter(|target| crate::machine::cargo_tagged(target))
+        .filter_map(|target| Some((target.clone(), target.parent()?.to_path_buf())))
+        .collect()
+}
+
+/// Places discovery never reads: the filesystem root, the home folder
+/// itself (a dotfiles repository there would be listed whole), and folders
+/// macOS asks the user about before an app reads them. Discovery neither
+/// lists them, nor asks Git about them, nor crawls them. `homes` is the home
+/// folder as spelled and as resolved, so a symlinked home is still matched.
+fn shielded(dir: &Path, homes: &[PathBuf]) -> bool {
+    const PROTECTED: [&str; 9] = [
+        "Desktop",
+        "Documents",
+        "Downloads",
+        "Library",
+        "Pictures",
+        "Music",
+        "Movies",
+        "Applications",
+        "Public",
+    ];
+    dir.parent().is_none()
+        || homes.iter().any(|home| {
+            dir == home
+                || PROTECTED
+                    .iter()
+                    .any(|name| dir.starts_with(home.join(name)))
+        })
+}
+
+/// Git repositories directly in `dir`: children holding a `.git` directory
+/// or worktree file, read one entry at a time until `deadline`.
+fn repositories_in(dir: PathBuf, deadline: Instant) -> impl Iterator<Item = PathBuf> {
+    std::fs::read_dir(&dir)
+        .into_iter()
+        .flatten()
+        .take_while(move |_| Instant::now() < deadline)
+        .flatten()
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .map(|entry| entry.path())
+        .filter(|child| std::fs::symlink_metadata(child.join(".git")).is_ok())
+}
+
+/// The Git directory every worktree of the repository holding `path`
+/// shares, read from the filesystem without running Git: the nearest
+/// `.git` directory, or the one a worktree's `.git` file points to through
+/// its `commondir`. Two paths in one repository give the same answer.
+fn repository_of(path: &Path) -> Option<PathBuf> {
+    let dot_git = path
+        .ancestors()
+        .map(|dir| dir.join(".git"))
+        .find(|dot_git| std::fs::symlink_metadata(dot_git).is_ok())?;
+    if dot_git.is_dir() {
+        return dot_git.canonicalize().ok();
+    }
+    let text = std::fs::read_to_string(&dot_git).ok()?;
+    let git_dir = Path::new(text.strip_prefix("gitdir:")?.trim());
+    let git_dir = dot_git.parent()?.join(git_dir);
+    let common = std::fs::read_to_string(git_dir.join("commondir"))
+        .map_or_else(|_| git_dir.clone(), |common| git_dir.join(common.trim()));
+    common.canonicalize().ok()
+}
+
+/// `items` turned by `turn` places: each pass starts at a different one, so
+/// a pass that runs out of time does not leave the same ones out every time.
+fn rotated<T>(mut items: Vec<T>, turn: u64) -> Vec<T> {
+    if !items.is_empty() {
+        let by = (turn % items.len() as u64) as usize;
+        items.rotate_left(by);
+    }
+    items
+}
+
+/// This pass's turn for [`rotated`]: the hour, as the daemon checks hourly.
+fn this_turn() -> u64 {
+    crate::maintenance::unix_now_secs() / 3600
+}
+
+/// What Git says about one repository: its worktrees, and the targets in
+/// them, as (target, workspace).
+struct Survey {
+    trees: Vec<Worktree>,
+    targets: Vec<(PathBuf, PathBuf)>,
+}
+
+/// Run `task` on each item, several at once (each mostly waits on Git and
+/// the filesystem), and return the results in the items' order.
+fn in_parallel<T: Sync, R: Send>(items: &[T], task: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    let workers = std::thread::available_parallelism()
+        .map_or(4, std::num::NonZeroUsize::get)
+        .clamp(1, 8);
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let done = std::sync::Mutex::new(Vec::with_capacity(items.len()));
+    std::thread::scope(|scope| {
+        for _ in 0..workers.min(items.len()) {
+            scope.spawn(|| {
+                loop {
+                    let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(item) = items.get(index) else {
+                        break;
+                    };
+                    let result = task(item);
+                    if let Ok(mut done) = done.lock() {
+                        done.push((index, result));
+                    }
+                }
+            });
+        }
+    });
+    let mut done = done
+        .into_inner()
+        .unwrap_or_else(|poison| poison.into_inner());
+    done.sort_by_key(|(index, _)| *index);
+    done.into_iter().map(|(_, result)| result).collect()
+}
+
+/// Survey each repository, given as a start inside it and the seed
+/// workspaces in it: list its worktrees, then, across every readable
+/// worktree at once, the tagged targets Git ignores. Each seed's place in
+/// its worktree is also looked at in every sibling, once per place, which
+/// finds a target there that Git does not ignore. Starts no Git after
+/// `deadline`.
+fn survey_all(
+    repositories: &[(PathBuf, Vec<PathBuf>)],
+    deadline: Instant,
+    homes: &[PathBuf],
+    turn: u64,
+) -> Vec<Survey> {
+    // Asked in a turned order, so a pass that runs out of time leaves out
+    // different repositories each time; answers go back in the given order.
+    let order = rotated((0..repositories.len()).collect(), turn);
+    let mut inventories: Vec<Option<Vec<Worktree>>> = std::iter::repeat_with(|| None)
+        .take(repositories.len())
+        .collect();
+    let asked = in_parallel(&order, |index| inventory(&repositories[*index].0, deadline));
+    for (index, trees) in order.into_iter().zip(asked) {
+        inventories[index] = trees;
+    }
+    let worktrees: Vec<PathBuf> = inventories
+        .iter()
+        .flatten()
+        .flatten()
+        .filter(|tree| readable(tree, homes))
+        .map(|tree| tree.path.clone())
+        .collect();
+    let worktrees = rotated(worktrees, turn);
+    let listed = in_parallel(&worktrees, |worktree| {
+        targets_in_worktree(worktree, deadline)
+    });
+    let mut listed: HashMap<_, _> = worktrees.into_iter().zip(listed).collect();
+    // In the order given, so builds' workspaces are recorded first.
+    repositories
+        .iter()
+        .zip(inventories)
+        .filter_map(|((_, seeds), trees)| {
+            let trees = trees?;
+            let available: Vec<_> = trees.iter().filter(|tree| readable(tree, homes)).collect();
+            let roots = roots_of(&trees);
+            let suffixes: BTreeSet<_> = seeds
+                .iter()
+                .filter_map(|seed| seed_suffix(seed, &roots))
+                .collect();
+            let mut targets: Vec<_> = suffixes
+                .iter()
+                .flat_map(|suffix| workspaces_at(suffix, &available))
+                .map(|workspace| (workspace.join("target"), workspace))
+                .collect();
+            for tree in &trees {
+                targets.extend(listed.remove(&tree.path).unwrap_or_default());
+            }
+            Some(Survey { trees, targets })
+        })
+        .collect()
+}
+
+/// Group `starts` by the repository each is in, keeping the first start of
+/// each and every seed, leaving out repositories in `seen` and starts that
+/// are shielded. Stops taking new repositories at `limit` or `deadline`.
+fn by_repository(
+    starts: impl IntoIterator<Item = (PathBuf, Option<PathBuf>)>,
+    seen: &mut HashSet<PathBuf>,
+    limit: usize,
+    deadline: Instant,
+    homes: &[PathBuf],
+) -> Vec<(PathBuf, Vec<PathBuf>)> {
+    let mut order = Vec::new();
+    let mut grouped: HashMap<PathBuf, (PathBuf, Vec<PathBuf>)> = HashMap::new();
+    for (start, seed) in starts {
+        if Instant::now() >= deadline {
+            break;
+        }
+        if shielded(&start, homes) {
+            continue;
+        }
+        let Some(repository) = repository_of(&start) else {
+            continue;
+        };
+        if seen.contains(&repository) {
+            continue;
+        }
+        if !grouped.contains_key(&repository) {
+            if order.len() >= limit {
+                break;
+            }
+            order.push(repository.clone());
+            grouped.insert(repository.clone(), (start, Vec::new()));
+        }
+        if let Some(entry) = grouped.get_mut(&repository) {
+            entry.1.extend(seed);
+        }
+    }
+    order
+        .into_iter()
+        .filter_map(|repository| {
+            seen.insert(repository.clone());
+            grouped.remove(&repository)
+        })
+        .collect()
+}
+
+/// Discover targets in the Git worktrees of every repository a tracked
+/// target belongs to, then of the other repositories in the folders those
+/// worktrees sit in: the same workspace in each sibling worktree, and every
+/// tagged `target/` Git ignores in each worktree, within `time`. A custom
+/// target path outside its worktree is known only when a wrapper recorded it.
+pub(crate) fn discover(store: &Store, time: Duration) -> Result<usize> {
+    let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from);
+    let mut homes: Vec<_> = home.iter().cloned().collect();
+    homes.extend(home.and_then(|home| home.canonicalize().ok()));
+    homes.dedup();
+    discover_within(store, Instant::now() + time, &homes, this_turn())
+}
+
+fn discover_within(
+    store: &Store,
+    deadline: Instant,
+    homes: &[PathBuf],
+    turn: u64,
+) -> Result<usize> {
     let tracked = store.tracked_target_roots(0)?;
-    let known: HashSet<_> = tracked.iter().map(|root| root.identity).collect();
+    let mut known: HashSet<_> = tracked.iter().map(|root| root.identity).collect();
+    // Builds first: they say which workspaces Cargo works in. Targets found
+    // through Git keep a repository reachable after its builds' rows go.
+    // Each group is turned, so a limit leaves out different ones each pass.
+    // A seed is checked against the shield before it is resolved, since
+    // resolving reads the path.
+    let (built, found_by_git): (Vec<_>, Vec<_>) = tracked
+        .iter()
+        .filter(|root| !shielded(&root.workspace_root, homes))
+        .partition(|root| !root.discovered);
+    let seeds = rotated(built, turn)
+        .into_iter()
+        .chain(rotated(found_by_git, turn))
+        .filter_map(|root| root.workspace_root.canonicalize().ok())
+        .map(|seed| (seed.clone(), Some(seed)));
+    let mut seen = HashSet::new();
+    let known_repositories = by_repository(seeds, &mut seen, DISCOVERY_STEPS, deadline, homes);
+    let mut surveys = survey_all(&known_repositories, deadline, homes, turn);
+    // One hop out: the repositories beside the worktrees of the known ones.
+    let limit = DISCOVERY_STEPS.saturating_sub(seen.len());
+    if limit > 0 {
+        let neighbourhood: BTreeSet<_> = surveys
+            .iter()
+            .flat_map(|survey| &survey.trees)
+            .filter_map(|tree| tree.path.parent().map(Path::to_path_buf))
+            .filter(|dir| !shielded(dir, homes))
+            .collect();
+        let beside = rotated(neighbourhood.into_iter().collect(), turn)
+            .into_iter()
+            .flat_map(|dir| repositories_in(dir, deadline))
+            .map(|repository| (repository, None));
+        let neighbours = by_repository(beside, &mut seen, limit, deadline, homes);
+        surveys.extend(survey_all(&neighbours, deadline, homes, turn));
+    }
+
     let mut covered = HashSet::new();
     let mut found = 0;
-    for root in tracked.iter().filter(|root| !root.discovered) {
-        let Ok(seed) = root.workspace_root.canonicalize() else {
-            continue;
-        };
-        if covered.contains(&seed) {
+    // What the surveys found is recorded whatever the time: a few inserts.
+    for (target, workspace) in surveys.into_iter().flat_map(|survey| survey.targets) {
+        if !covered.insert(workspace.clone()) {
             continue;
         }
-        let Some(trees) = inventory(&seed) else {
+        if let Some(id) = crate::machine::directory_identity(&target)
+            && !known.insert(id)
+        {
             continue;
-        };
-        for workspace in sibling_workspaces(&seed, &trees) {
-            covered.insert(workspace.clone());
-            let target = workspace.join("target");
-            if crate::machine::directory_identity(&target).is_some_and(|id| known.contains(&id)) {
-                continue;
-            }
-            found += usize::from(store.remember_discovered_target_root(&target, &workspace)?);
         }
+        found += usize::from(store.remember_discovered_target_root(&target, &workspace)?);
     }
     Ok(found)
 }
@@ -214,6 +562,42 @@ mod tests {
         )
         .unwrap();
         target
+    }
+
+    #[test]
+    fn only_target_directories_count_among_ignored_ones() {
+        let root = Path::new("/w");
+        let listing = b"target/\0extensions/kgw/target/\0node_modules/\0.env\0crates/removed/target/\0dist/targets/\0build/my-target/\0";
+        assert_eq!(
+            ignored_target_dirs(root, listing),
+            vec![
+                root.join("target"),
+                root.join("extensions/kgw/target"),
+                root.join("crates/removed/target"),
+            ]
+        );
+    }
+
+    #[test]
+    fn discovery_never_reads_home_or_protected_folders() {
+        let home = PathBuf::from("/Users/dev");
+        let homes = std::slice::from_ref(&home);
+        assert!(shielded(Path::new("/"), homes));
+        assert!(shielded(&home, homes));
+        assert!(shielded(&home.join("Documents"), homes));
+        assert!(shielded(&home.join("Desktop/projects"), homes));
+        assert!(!shielded(&home.join("code"), homes));
+        assert!(!shielded(Path::new("/private/tmp"), homes));
+        assert!(!shielded(&home.join("code"), &[]));
+        // A home reached through a symlink is matched as spelled and as
+        // resolved.
+        let both = [home.clone(), PathBuf::from("/Volumes/Homes/dev")];
+        assert!(shielded(Path::new("/Volumes/Homes/dev/Documents/x"), &both));
+        assert!(shielded(Path::new("/Volumes/Homes/dev"), &both));
+        assert!(!shielded(
+            Path::new("/Volumes/Homes/dev/Documents/x"),
+            homes
+        ));
     }
 
     #[test]
@@ -273,6 +657,234 @@ mod tests {
         );
     }
 
+    fn commit_and_add_worktree(repo: &Path, worktree: &Path) {
+        git(repo, &["init", "-q"]);
+        std::fs::write(repo.join(".gitignore"), "target/\n").unwrap();
+        git(repo, &["add", ".gitignore"]);
+        git(
+            repo,
+            &[
+                "-c",
+                "user.name=Kache Test",
+                "-c",
+                "user.email=kache@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "base",
+            ],
+        );
+        git(
+            repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--detach",
+                worktree.to_str().unwrap(),
+            ],
+        );
+    }
+
+    #[test]
+    fn a_repository_and_its_worktrees_share_one_key() {
+        if Command::new("git")
+            .arg("--version")
+            .output()
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let worktree = dir.path().join("worktree");
+        std::fs::create_dir_all(repo.join("deep/inside")).unwrap();
+        commit_and_add_worktree(&repo, &worktree);
+        let key = repository_of(&repo).unwrap();
+        assert_eq!(key, repo.join(".git").canonicalize().unwrap());
+        assert_eq!(repository_of(&repo.join("deep/inside")), Some(key.clone()));
+        assert_eq!(repository_of(&worktree), Some(key));
+        assert_eq!(repository_of(Path::new("/")), None);
+    }
+
+    #[test]
+    fn each_pass_starts_at_a_different_place() {
+        assert_eq!(rotated(vec![0, 1, 2], 0), vec![0, 1, 2]);
+        assert_eq!(rotated(vec![0, 1, 2], 1), vec![1, 2, 0]);
+        assert_eq!(rotated(vec![0, 1, 2], 5), vec![2, 0, 1]);
+        assert!(rotated(Vec::<u8>::new(), 7).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn listing_a_worktree_never_runs_its_filesystem_monitor() {
+        if Command::new("git")
+            .arg("--version")
+            .output()
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        commit_and_add_worktree(&repo, &dir.path().join("worktree"));
+        let target = cargo_target(&repo.join("app"));
+        let ran = dir.path().join("monitor-ran");
+        let hook = dir.path().join("monitor");
+        std::fs::write(&hook, format!("#!/bin/sh\ntouch '{}'\n", ran.display())).unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        git(&repo, &["config", "core.fsmonitor", hook.to_str().unwrap()]);
+        // Git would run it for a listing like discovery's.
+        let _ = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args([
+                "ls-files",
+                "--others",
+                "--ignored",
+                "--exclude-standard",
+                "--directory",
+            ])
+            .output();
+        if !ran.exists() {
+            return;
+        }
+        std::fs::remove_file(&ran).unwrap();
+
+        let found = targets_in_worktree(
+            &repo.canonicalize().unwrap(),
+            Instant::now() + LISTING_TIMEOUT,
+        );
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].0, target.canonicalize().unwrap());
+        assert!(!ran.exists(), "discovery ran the repository's monitor");
+    }
+
+    #[test]
+    fn discovery_leaves_home_and_protected_folders_alone() {
+        if Command::new("git")
+            .arg("--version")
+            .output()
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home").canonicalize().ok();
+        std::fs::create_dir_all(dir.path().join("home")).unwrap();
+        let home = home.unwrap_or_else(|| dir.path().join("home").canonicalize().unwrap());
+        // A dotfiles repository at home, with a worktree in Documents.
+        commit_and_add_worktree(&home, &home.join("Documents/notes"));
+        let built = cargo_target(&home.join("tools/rust"));
+        cargo_target(&home.join("tools/other"));
+        cargo_target(&home.join("Documents/notes/app"));
+        let config = crate::test_support::test_config(dir.path().join("cache"));
+        let store = Store::open(&config).unwrap();
+        store
+            .remember_target_root(&built, &home.join("tools/rust"))
+            .unwrap();
+
+        let pass =
+            |deadline| discover_within(&store, deadline, std::slice::from_ref(&home), 0).unwrap();
+        assert_eq!(pass(Instant::now() + COMMAND_DISCOVERY_TIME), 0);
+        assert_eq!(store.tracked_target_roots(0).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_spent_pass_starts_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let mut seen = HashSet::new();
+        let starts = || vec![(repo.clone(), None)];
+        assert!(
+            by_repository(
+                starts(),
+                &mut seen,
+                0,
+                Instant::now() + LISTING_TIMEOUT,
+                &[]
+            )
+            .is_empty()
+        );
+        assert!(by_repository(starts(), &mut seen, 5, Instant::now(), &[]).is_empty());
+        assert!(seen.is_empty());
+        assert_eq!(
+            by_repository(
+                starts(),
+                &mut seen,
+                5,
+                Instant::now() + LISTING_TIMEOUT,
+                &[]
+            )
+            .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn discovery_crawls_every_worktree_of_a_known_repository() {
+        if Command::new("git")
+            .arg("--version")
+            .output()
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let sibling = dir.path().join("sibling");
+        std::fs::create_dir_all(&repo).unwrap();
+        commit_and_add_worktree(&repo, &sibling);
+        let built = cargo_target(&repo.join("rust"));
+        // Workspaces no build through kache used, at other paths than the
+        // one it built: in the same worktree and in a sibling.
+        let tool = cargo_target(&repo.join("tools/gen"));
+        let extension = cargo_target(&sibling.join("extensions/kgw"));
+        // A repository beside a known worktree is crawled too, one hop out.
+        let neighbour = dir.path().join("neighbour");
+        std::fs::create_dir_all(&neighbour).unwrap();
+        commit_and_add_worktree(&neighbour, &dir.path().join("elsewhere/neighbour-wt"));
+        let beside = cargo_target(&neighbour.join("app"));
+        // One further away is not.
+        let unrelated = dir.path().join("elsewhere/deeper/unrelated");
+        std::fs::create_dir_all(&unrelated).unwrap();
+        commit_and_add_worktree(
+            &unrelated,
+            &dir.path().join("elsewhere/deeper/unrelated-wt"),
+        );
+        cargo_target(&unrelated.join("rust"));
+
+        let config = crate::test_support::test_config(dir.path().join("cache"));
+        let store = Store::open(&config).unwrap();
+        store
+            .remember_target_root(&built, &repo.join("rust"))
+            .unwrap();
+        let pass = || discover_within(&store, Instant::now() + COMMAND_DISCOVERY_TIME, &[], 0);
+        assert_eq!(pass().unwrap(), 3);
+        assert_eq!(pass().unwrap(), 0, "already known");
+        let mut discovered: Vec<_> = store
+            .tracked_target_roots(0)
+            .unwrap()
+            .into_iter()
+            .filter(|root| root.discovered)
+            .map(|root| root.path)
+            .collect();
+        discovered.sort();
+        let mut expected = vec![
+            tool.canonicalize().unwrap(),
+            extension.canonicalize().unwrap(),
+            beside.canonicalize().unwrap(),
+        ];
+        expected.sort();
+        assert_eq!(discovered, expected);
+    }
+
     #[test]
     fn daemon_finds_a_sibling_target_without_claiming_a_build_used_it() {
         if Command::new("git")
@@ -322,8 +934,8 @@ mod tests {
             .remember_target_root(&original, &repo.join("rust"))
             .unwrap();
 
-        assert_eq!(discover(&store).unwrap(), 1);
-        assert_eq!(discover(&store).unwrap(), 0);
+        assert_eq!(discover(&store, COMMAND_DISCOVERY_TIME).unwrap(), 1);
+        assert_eq!(discover(&store, COMMAND_DISCOVERY_TIME).unwrap(), 0);
         let roots = store.tracked_target_roots(0).unwrap();
         assert_eq!(roots.len(), 2);
         let sibling_row = roots
@@ -340,7 +952,7 @@ mod tests {
         let old_identity = sibling_row.identity;
         std::fs::rename(&found, sibling.join("old-target")).unwrap();
         cargo_target(&sibling.join("rust"));
-        assert_eq!(discover(&store).unwrap(), 1);
+        assert_eq!(discover(&store, COMMAND_DISCOVERY_TIME).unwrap(), 1);
         let replaced = store
             .tracked_target_roots(0)
             .unwrap()
@@ -368,7 +980,7 @@ mod tests {
         store.forget_target_root(&found).unwrap();
         std::fs::remove_dir_all(&found).unwrap();
         std::fs::create_dir_all(found.join("debug")).unwrap();
-        assert_eq!(discover(&store).unwrap(), 0);
+        assert_eq!(discover(&store, COMMAND_DISCOVERY_TIME).unwrap(), 0);
         assert_eq!(store.tracked_target_roots(0).unwrap().len(), 1);
     }
 }

@@ -570,6 +570,9 @@ enum TargetCommands {
         #[arg(value_name = "TARGET")]
         paths: Vec<PathBuf>,
     },
+    /// Find target directories in the Git worktrees of repositories kache
+    /// knows, now rather than on the daemon's next quiet pass
+    Discover,
 }
 
 #[derive(Subcommand)]
@@ -1130,6 +1133,9 @@ fn run_cli(cli: Cli, readiness: Option<kunobi_daemon::readiness::channel::Notifi
         Some(Commands::Targets {
             command: Some(TargetCommands::Share { apply, paths }),
         }) => target_dedup::run(&config, &paths, apply, json),
+        Some(Commands::Targets {
+            command: Some(TargetCommands::Discover),
+        }) => cli::discover_targets(&config, json),
         #[cfg(unix)]
         Some(Commands::Init {
             shims: Some(dir),
@@ -2052,6 +2058,14 @@ mod tests {
             Some(Commands::Targets {
                 command: Some(TargetCommands::Share { apply: true, ref paths })
             }) if paths == &vec![PathBuf::from("target")]
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["kache", "targets", "discover"])
+                .unwrap()
+                .command,
+            Some(Commands::Targets {
+                command: Some(TargetCommands::Discover)
+            })
         ));
         assert!(Cli::try_parse_from(["kache", "targets-dedup"]).is_err());
     }

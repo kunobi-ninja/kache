@@ -5624,7 +5624,7 @@ fn render_targets(rows: &[TargetRow]) -> Vec<String> {
         ByteSize(reclaimable)
     )];
     lines.push(format!(
-        "  {:>10}  {:>10}  {:>5}  WORKSPACE",
+        "  {:>10}  {:>10}  {:>5}  TARGET",
         "FREEABLE", "ON DISK", "IDLE"
     ));
     for row in rows {
@@ -5634,7 +5634,7 @@ fn render_targets(rows: &[TargetRow]) -> Vec<String> {
             ""
         };
         let discovered = if row.discovered {
-            "  (Git discovery)"
+            "  (found through Git)"
         } else {
             ""
         };
@@ -5647,7 +5647,8 @@ fn render_targets(rows: &[TargetRow]) -> Vec<String> {
             row.idle_seconds
                 .map(format_idle)
                 .unwrap_or_else(|| "?".into()),
-            row.workspace
+            // The target, not its workspace: one workspace can hold several.
+            term::home_path(std::path::Path::new(&row.path))
         ));
     }
     let orphans = rows

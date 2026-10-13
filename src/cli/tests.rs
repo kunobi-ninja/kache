@@ -7250,7 +7250,7 @@ fn a_target_says_what_the_next_pass_does_to_it() {
     planned.next_pass = idle;
     let rendered = render_targets(&[planned]).join("\n");
     assert!(
-        rendered.contains("/wt/a  (next pass removes it: no build used it"),
+        rendered.contains("/wt/a/target  (next pass removes it: no build used it"),
         "{rendered}"
     );
 }
@@ -7277,7 +7277,17 @@ fn the_targets_table_totals_and_points_at_deleted_worktrees() {
         one.starts_with("1 tracked target directory: 2.0 KiB on disk, 1.0 KiB freeable"),
         "{one}"
     );
-    assert!(one.contains("3d  /wt/a"), "{one}");
+    assert!(one.contains("3d  /wt/a/target"), "{one}");
+    // Targets of one workspace stay apart.
+    let mut beside = row("/wt/a", TargetState::Live, 1024);
+    beside.path = "/wt/a/target-b".into();
+    beside.discovered = true;
+    let both = render_targets(&[row("/wt/a", TargetState::Live, 1024), beside]).join("\n");
+    assert!(both.contains("/wt/a/target\n"), "{both}");
+    assert!(
+        both.contains("/wt/a/target-b  (found through Git)"),
+        "{both}"
+    );
     assert!(!one.contains("deleted"), "{one}");
     assert!(!one.contains("next pass"), "{one}");
 

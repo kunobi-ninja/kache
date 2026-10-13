@@ -234,7 +234,14 @@ fn workspaces_at<'a>(
 ) -> impl Iterator<Item = PathBuf> + 'a {
     trees
         .iter()
-        .map(move |tree| tree.path.join(suffix))
+        // `join("")` would add a trailing separator to the worktree's root.
+        .map(move |tree| {
+            if suffix.as_os_str().is_empty() {
+                tree.path.clone()
+            } else {
+                tree.path.join(suffix)
+            }
+        })
         .filter(|workspace| {
             std::fs::symlink_metadata(workspace).is_ok_and(|meta| meta.file_type().is_dir())
                 && workspace.join("Cargo.toml").is_file()
@@ -672,6 +679,30 @@ mod tests {
         assert!(trees[1].locked);
         assert!(trees[2].prunable);
         assert!(trees[3].bare);
+    }
+
+    #[test]
+    fn a_workspace_at_a_worktree_root_maps_without_a_trailing_separator() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first");
+        let second = dir.path().join("second");
+        for path in [&first, &second] {
+            std::fs::create_dir_all(path).unwrap();
+            std::fs::write(path.join("Cargo.toml"), "").unwrap();
+        }
+        let tree = |path: &Path| Worktree {
+            path: path.to_path_buf(),
+            bare: false,
+            locked: false,
+            prunable: false,
+        };
+        let mapped = sibling_workspaces(&first, &[tree(&first), tree(&second)]);
+        assert_eq!(mapped, vec![first.clone(), second.clone()]);
+        assert!(
+            mapped
+                .iter()
+                .all(|path| !path.to_string_lossy().ends_with(std::path::MAIN_SEPARATOR))
+        );
     }
 
     #[test]

@@ -903,7 +903,7 @@ fn windows_tool_from_name(path: &Path) -> Option<WindowsTool> {
 
 /// Whether `path` is rustc's LLD. It serves every LLD flavor and acts as
 /// lld-link only when its arguments start with `-flavor link`.
-fn is_rust_lld(path: &Path) -> bool {
+pub(crate) fn is_rust_lld(path: &Path) -> bool {
     windows_tool_stem(path).is_some_and(|stem| stem == "rust-lld")
 }
 
@@ -1898,6 +1898,14 @@ fn unwrap_windows_linker_wrapper(
         {
             bail!(
                 "wrapper {} resolved {ld_var} to {}, which is neither link.exe nor lld-link.exe",
+                wrapper.display(),
+                effective.display()
+            );
+        }
+        // The wrapper runs it without `-flavor link`, which rust-lld refuses.
+        if is_rust_lld(&effective) {
+            bail!(
+                "wrapper {} runs {} without -flavor link",
                 wrapper.display(),
                 effective.display()
             );
@@ -3589,6 +3597,23 @@ mod tests {
             wrapped_identity.encode(),
             changed_flags.encode(),
             "wrapper extra flags must change the identity"
+        );
+        placed(directory.path(), "rust-lld.exe");
+        let mut to_rust_lld = wrapped.clone();
+        to_rust_lld
+            .variables
+            .insert("MOZ_CARGO_WRAP_HOST_LD".into(), "rust-lld.exe".into());
+        let error = probe_windows_msvc_identity_with(
+            Some(&wrapper),
+            "x64",
+            &[],
+            &to_rust_lld,
+            |_, _| unreachable!(),
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("without -flavor link"),
+            "{error:#}"
         );
         for variable in ["LINK", "_LINK_"] {
             let mut with_options = environment.clone();

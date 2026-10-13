@@ -637,6 +637,56 @@ fn native_windows_msvc_probe_gets_linker_architecture_and_host() {
 }
 
 #[test]
+fn rust_lld_keys_only_with_a_flavor_that_runs_it_as_lld_link() {
+    let fold = |flags: &[&str]| {
+        let mut argv: Vec<String> = ["rustc", "--crate-type=bin", "src/main.rs"]
+            .map(String::from)
+            .to_vec();
+        argv.extend(flags.iter().map(|flag| flag.to_string()));
+        let args = RustcArgs::parse(&argv).unwrap();
+        let mut probed = false;
+        let result = fold_native_windows_msvc_identity(
+            &mut blake3::Hasher::new(),
+            &args,
+            WINDOWS_RUSTC_VERSION,
+            true,
+            |_, _, _| {
+                probed = true;
+                Ok("identity".into())
+            },
+        );
+        (result, probed)
+    };
+    for flags in [
+        &["-Clinker=rust-lld.exe"][..],
+        &["-Clinker=rust-lld"],
+        &["-Clinker=rust-lld.exe", "-Clinker-flavor=lld-link"],
+        &["-Clinker=rust-lld.exe", "-Clinker-flavor=msvc-lld"],
+        &["-Clinker=RUST-LLD.EXE", "-Clinker-flavor=lld-link"],
+        &["-Clinker-flavor=msvc"],
+    ] {
+        let (result, probed) = fold(flags);
+        assert!(result.is_ok() && probed, "{flags:?}");
+    }
+    for flags in [
+        &["-Clinker=rust-lld.exe", "-Clinker-flavor=msvc"][..],
+        &["-Clinker=rust-lld.exe", "-Clinker-flavor=gcc"],
+        // rustc infers the flavor from the stem case-sensitively.
+        &["-Clinker=RUST-LLD.EXE"],
+        &[
+            "-Clinker=rust-lld.exe",
+            "-Clinker-flavor=lld-link",
+            "-Clinker-features=-lld",
+        ],
+    ] {
+        let (result, probed) = fold(flags);
+        let error = format!("{:#}", result.unwrap_err());
+        assert!(error.contains("as lld-link"), "{flags:?}: {error}");
+        assert!(!probed, "{flags:?}");
+    }
+}
+
+#[test]
 fn native_windows_msvc_identity_probe_failure_is_cache_failure() {
     let bin = parsed_crate_type("bin", None);
     let mut hasher = blake3::Hasher::new();
@@ -6755,23 +6805,42 @@ fn resolve_native_static_lib_accepts_copies_with_the_same_bytes() {
     std::fs::write(&gnu, b"archive bytes").unwrap();
     let single = resolve(&[dir.path()]).unwrap().unwrap();
     assert_eq!(single.0, gnu);
+    assert!(
+        !single.1.contains("copies="),
+        "one candidate keys as before"
+    );
 
+    // `cc` links or copies `libfoo.a` to `foo.lib` for an MSVC target: the
+    // same bytes, so not ambiguous. Which name rustc takes is target-specific
+    // and lands in a bundling output, so the copies are part of the key.
     let msvc = dir.path().join("foo.lib");
     std::fs::hard_link(&gnu, &msvc).unwrap();
-    assert_eq!(resolve(&[dir.path()]).unwrap().unwrap(), single);
+    let linked = resolve(&[dir.path()]).unwrap().unwrap();
+    assert_eq!(linked.0, gnu, "the first one found is hashed");
+    assert_ne!(linked.1, single.1, "a new copy changes the key");
+    assert!(linked.1.starts_with(&single.1), "{linked:?}");
     std::fs::remove_file(&msvc).unwrap();
     std::fs::write(&msvc, b"archive bytes").unwrap();
     assert_eq!(
         resolve(&[dir.path()]).unwrap().unwrap(),
-        single,
-        "a copy is the same archive; the first one found is hashed"
+        linked,
+        "a hard link and a copy are the same candidates"
     );
 
     let copy = tempfile::tempdir().unwrap();
     std::fs::write(copy.path().join("libfoo.a"), b"archive bytes").unwrap();
+    let both = resolve(&[dir.path(), copy.path()]).unwrap().unwrap();
+    assert_eq!(both.0, gnu);
+    assert_ne!(
+        both.1, linked.1,
+        "a copy in another dir is another candidate"
+    );
+    // A dir listed twice is the same candidates.
     assert_eq!(
-        resolve(&[dir.path(), copy.path()]).unwrap().unwrap(),
-        single
+        resolve(&[dir.path(), copy.path(), dir.path()])
+            .unwrap()
+            .unwrap(),
+        both
     );
     assert_eq!(
         resolve(&[copy.path(), dir.path()]).unwrap().unwrap().0,
@@ -9898,16 +9967,27 @@ fn rustc_tool_dirs_follow_rustcs_sysroot_order() {
     let args = |extra: &[&str]| RustcArgs::parse(&flag_base(&source, extra)).unwrap();
     let own = get_rustc_sysroot(&args(&[])).unwrap();
 
-    assert_eq!(rustc_tool_dirs(&args(&[]), host), [tools(&own)]);
+    assert_eq!(rustc_tool_dirs(&args(&[]), host).unwrap(), [tools(&own)]);
     assert_eq!(
-        rustc_tool_dirs(&args(&["--sysroot", &explicit.to_string_lossy()]), host),
+        rustc_tool_dirs(&args(&["--sysroot", &explicit.to_string_lossy()]), host).unwrap(),
         [tools(&explicit), tools(&own)]
     );
 
     let mut wrapped = args(&[]);
     wrapped.inner_rustc = Some(wrapped.rustc.clone());
     wrapped.rustc = dir.path().join("workspace-wrapper");
-    assert_eq!(rustc_tool_dirs(&wrapped, host), [tools(&own)]);
+    assert_eq!(rustc_tool_dirs(&wrapped, host).unwrap(), [tools(&own)]);
+
+    // Without rustc's own sysroot the lookup could find another linker.
+    wrapped.inner_rustc = Some(dir.path().join("missing-rustc"));
+    let explicit_only = format!("--sysroot={}", explicit.display());
+    let mut with_explicit =
+        RustcArgs::parse(&flag_base(&source, &[explicit_only.as_str()])).unwrap();
+    with_explicit.inner_rustc = wrapped.inner_rustc.clone();
+    for args in [&wrapped, &with_explicit] {
+        let error = rustc_tool_dirs(args, host).unwrap_err();
+        assert!(error.to_string().contains("sysroot"), "{error:#}");
+    }
 }
 
 /// H2: `--sysroot` selects which std rustc links against; with the

@@ -3815,7 +3815,7 @@ fn compute_key_into(
             crate::native_link_key::probe_windows_msvc_identity_with_library_dirs(
                 linker,
                 architecture,
-                &rustc_tool_dirs(args, host),
+                &rustc_tool_dirs(args, host)?,
                 &search_dirs.rustc,
                 &search_dirs.linker,
                 &args.link_libs,
@@ -4189,25 +4189,29 @@ fn resolve_native_static_lib(
     // ambiguous. Nor are distinct candidates with the same bytes: for an MSVC
     // target `cc` hard-links or copies each `lib<name>.a` it builds to
     // `<name>.lib`, and whichever one rustc or the linker takes, it reads the
-    // same contents. The first one found is hashed. If candidates differ —
+    // same contents. The first one found is hashed. Which copy rustc takes is
+    // target-specific, and a bundling output records that file's name, so
+    // where the copies are is part of the key. If candidates differ —
     // `lib<name>.a` and `<name>.lib`, or hits in two dirs — the choice is
     // target-specific, so fail the cache key rather than risk hashing the
     // wrong file.
     let mut found: Option<PathBuf> = None;
-    for dir in search_dirs {
+    // Each distinct candidate, with its search-dir index and file name.
+    let mut copies: Vec<(PathBuf, String)> = Vec::new();
+    for (index, dir) in search_dirs.iter().enumerate() {
         for filename in &file_names {
             let candidate = dir.join(filename);
             if candidate.is_file() {
-                if found.as_ref().is_some_and(|path| path == &candidate) {
+                if copies.iter().any(|(path, _)| path == &candidate) {
                     continue;
                 }
-                if let Some(first) = &found {
-                    if file_hasher.hash(first)? != file_hasher.hash(&candidate)? {
-                        anyhow::bail!("ambiguous native static library {spec:?}");
-                    }
-                    continue;
+                if let Some(first) = &found
+                    && file_hasher.hash(first)? != file_hasher.hash(&candidate)?
+                {
+                    anyhow::bail!("ambiguous native static library {spec:?}");
                 }
-                found = Some(candidate);
+                copies.push((candidate.clone(), format!("{index}:{filename}")));
+                found.get_or_insert(candidate);
             }
         }
     }
@@ -4216,7 +4220,12 @@ fn resolve_native_static_lib(
     };
     // Every parse/read failure is uncacheable, never name-only: this archive is
     // bundled into the output, so omitting an existing file would be a false hit.
-    let hash = file_hasher.hash_static_lib_for(&path, usage(&path))?;
+    let mut hash = file_hasher.hash_static_lib_for(&path, usage(&path))?;
+    // One candidate keys as before; identical copies add where they are.
+    if copies.len() > 1 {
+        let places: Vec<&str> = copies.iter().map(|(_, place)| place.as_str()).collect();
+        hash = format!("{hash};copies={}", places.join(","));
+    }
     Ok(Some((path, hash)))
 }
 
@@ -8992,15 +9001,18 @@ fn default_rustc_sysroot(rustc: &Path) -> Option<PathBuf> {
 /// `-C linker=rust-lld.exe`: the tool directory of an explicit `--sysroot`,
 /// then that of the toolchain's own sysroot. rustc puts these before `PATH`
 /// for the linker it runs. In a double-wrapper invocation the sysroot is
-/// the inner rustc's, like the host triple.
-fn rustc_tool_dirs(args: &RustcArgs, host: &str) -> Vec<PathBuf> {
+/// the inner rustc's, like the host triple. Without the toolchain's sysroot
+/// the lookup could find a different linker than rustc, so that is an error.
+fn rustc_tool_dirs(args: &RustcArgs, host: &str) -> Result<Vec<PathBuf>> {
     let rustc = args.inner_rustc.as_deref().unwrap_or(&args.rustc);
-    args.sysroot
+    let sysroot = default_rustc_sysroot(rustc).context("rustc --print sysroot failed")?;
+    Ok(args
+        .sysroot
         .iter()
         .cloned()
-        .chain(default_rustc_sysroot(rustc))
+        .chain([sysroot])
         .map(|sysroot| crate::native_link_key::rustc_tool_dir(&sysroot, host))
-        .collect()
+        .collect())
 }
 
 /// The libraries rustc may load for the codegen backend `name`, with their
@@ -9616,6 +9628,26 @@ where
     let architecture = crate::native_link_key::windows_msvc_architecture(host)
         .context("native Windows MSVC host has an unsupported architecture")?;
     let linker = args.get_codegen_opt("linker").map(Path::new);
+    // rustc runs `rust-lld` as lld-link only for an lld-link flavor: one
+    // given with `-C linker-flavor`, or inferred from the file stem, which
+    // rustc compares case-sensitively. Otherwise it runs it without
+    // `-flavor` and the link fails. The identity is the banner, the same as
+    // a real lld-link's, so such a unit must not borrow that key.
+    // `-C linker-features` can turn LLD off and is not modeled.
+    if let Some(linker) = linker
+        && crate::native_link_key::is_rust_lld(linker)
+    {
+        let as_lld_link = match args.get_codegen_opt("linker-flavor") {
+            Some(flavor) => matches!(flavor, "lld-link" | "msvc-lld"),
+            None => linker.file_stem().is_some_and(|stem| stem == "rust-lld"),
+        };
+        if !as_lld_link || args.get_codegen_opt("linker-features").is_some() {
+            anyhow::bail!(
+                "rustc may not run {} as lld-link; passing through",
+                linker.display()
+            );
+        }
+    }
     let identity = probe(linker, architecture, host)
         .context("determining native Windows MSVC link identity")?;
     fold_field(&mut *hasher, b"host_windows_msvc.v1:", identity.as_bytes());

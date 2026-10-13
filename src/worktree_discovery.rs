@@ -63,11 +63,10 @@ pub(crate) fn run(config: &Config, trigger: Trigger<'_>) -> bool {
         .unwrap_or(0);
     let remembered = LAST_RUN.load(std::sync::atomic::Ordering::Relaxed);
     let periodic = matches!(trigger, Trigger::Periodic(_));
-    let quiet = periodic
-        && is_quiet(
-            crate::scheduler::permits_in_use(&config.cache_dir),
-            trigger.idle_for(),
-        );
+    let quiet = is_quiet(
+        crate::scheduler::permits_in_use(&config.cache_dir),
+        trigger.idle_for(),
+    );
     if !due(periodic, quiet, recorded, remembered, now) {
         return false;
     }
@@ -76,7 +75,7 @@ pub(crate) fn run(config: &Config, trigger: Trigger<'_>) -> bool {
     if let Err(error) = crate::atomic::atomic_replace(&record, now.to_string().as_bytes()) {
         tracing::warn!("cannot record the target discovery time: {error:#}");
     }
-    match Store::open(config).and_then(|store| discover(&store, DISCOVERY_TIME)) {
+    match Store::open(config).and_then(|store| discover(&store, DISCOVERY_TIME, now)) {
         Ok(0) => {}
         Ok(found) => tracing::info!("found {found} target directories in Git worktrees"),
         Err(error) => tracing::warn!("target discovery failed: {error:#}"),
@@ -331,7 +330,7 @@ fn repositories_in(dir: PathBuf, deadline: Instant) -> impl Iterator<Item = Path
     std::fs::read_dir(&dir)
         .into_iter()
         .flatten()
-        .take_while(move |_| Instant::now() < deadline)
+        .take_while(move |_| deadline.checked_duration_since(Instant::now()).is_some())
         .flatten()
         .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
         .map(|entry| entry.path())
@@ -368,9 +367,22 @@ fn rotated<T>(mut items: Vec<T>, turn: u64) -> Vec<T> {
     items
 }
 
-/// This pass's turn for [`rotated`]: the hour, as the daemon checks hourly.
-fn this_turn() -> u64 {
-    crate::maintenance::unix_now_secs() / 3600
+/// The turn for [`rotated`] at `now` (Unix seconds): the hour, as discovery
+/// runs at most hourly.
+fn turn_at(now: u64) -> u64 {
+    now / FRESH_FOR.as_secs()
+}
+
+/// The home folder from its variable, as spelled and as resolved; none when
+/// it is unset or empty.
+fn homes_from(home: Option<std::ffi::OsString>) -> Vec<PathBuf> {
+    let Some(home) = home.filter(|home| !home.is_empty()).map(PathBuf::from) else {
+        return Vec::new();
+    };
+    let resolved = home.canonicalize().ok();
+    let mut homes = vec![home];
+    homes.extend(resolved.filter(|resolved| *resolved != homes[0]));
+    homes
 }
 
 /// What Git says about one repository: its worktrees, and the targets in
@@ -520,14 +532,13 @@ fn by_repository(
 /// worktrees sit in: the same workspace in each sibling worktree, and every
 /// tagged `target/` Git ignores in each worktree, within `time`. A custom
 /// target path outside its worktree is known only when a wrapper recorded it.
-pub(crate) fn discover(store: &Store, time: Duration) -> Result<usize> {
-    let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
-        .filter(|home| !home.is_empty())
-        .map(PathBuf::from);
-    let mut homes: Vec<_> = home.iter().cloned().collect();
-    homes.extend(home.and_then(|home| home.canonicalize().ok()));
-    homes.dedup();
-    discover_within(store, Instant::now() + time, &homes, this_turn())
+pub(crate) fn discover(store: &Store, time: Duration, now: u64) -> Result<usize> {
+    let homes = homes_from(std::env::var_os(if cfg!(windows) {
+        "USERPROFILE"
+    } else {
+        "HOME"
+    }));
+    discover_within(store, Instant::now() + time, &homes, turn_at(now))
 }
 
 fn discover_within(
@@ -538,39 +549,33 @@ fn discover_within(
 ) -> Result<usize> {
     let tracked = store.tracked_target_roots(0)?;
     let mut known: HashSet<_> = tracked.iter().map(|root| root.identity).collect();
-    // Builds first: they say which workspaces Cargo works in. Targets found
-    // through Git keep a repository reachable after its builds' rows go.
-    // Each group is turned, so a limit leaves out different ones each pass.
-    // A seed is checked against the shield before it is resolved, since
-    // resolving reads the path.
-    let (built, found_by_git): (Vec<_>, Vec<_>) = tracked
-        .iter()
-        .filter(|root| !shielded(&root.workspace_root, homes))
-        .partition(|root| !root.discovered);
-    let seeds = rotated(built, turn)
+    // Every tracked target leads to its repository, a target found through
+    // Git too, so a repository stays reachable after its builds' rows go.
+    // Turned, so a limit leaves out different ones each pass. A seed is
+    // checked against the shield before it is resolved: resolving reads it.
+    let seeds = rotated(tracked.iter().collect(), turn)
         .into_iter()
-        .chain(rotated(found_by_git, turn))
+        .filter(|root| !shielded(&root.workspace_root, homes))
         .filter_map(|root| root.workspace_root.canonicalize().ok())
         .map(|seed| (seed.clone(), Some(seed)));
     let mut seen = HashSet::new();
     let known_repositories = by_repository(seeds, &mut seen, DISCOVERY_STEPS, deadline, homes);
     let mut surveys = survey_all(&known_repositories, deadline, homes, turn);
     // One hop out: the repositories beside the worktrees of the known ones.
+    // The listing is lazy, so a spent limit stops it at once.
+    let neighbourhood: BTreeSet<_> = surveys
+        .iter()
+        .flat_map(|survey| &survey.trees)
+        .filter_map(|tree| tree.path.parent().map(Path::to_path_buf))
+        .filter(|dir| !shielded(dir, homes))
+        .collect();
+    let beside = rotated(neighbourhood.into_iter().collect(), turn)
+        .into_iter()
+        .flat_map(|dir| repositories_in(dir, deadline))
+        .map(|repository| (repository, None));
     let limit = DISCOVERY_STEPS.saturating_sub(seen.len());
-    if limit > 0 {
-        let neighbourhood: BTreeSet<_> = surveys
-            .iter()
-            .flat_map(|survey| &survey.trees)
-            .filter_map(|tree| tree.path.parent().map(Path::to_path_buf))
-            .filter(|dir| !shielded(dir, homes))
-            .collect();
-        let beside = rotated(neighbourhood.into_iter().collect(), turn)
-            .into_iter()
-            .flat_map(|dir| repositories_in(dir, deadline))
-            .map(|repository| (repository, None));
-        let neighbours = by_repository(beside, &mut seen, limit, deadline, homes);
-        surveys.extend(survey_all(&neighbours, deadline, homes, turn));
-    }
+    let neighbours = by_repository(beside, &mut seen, limit, deadline, homes);
+    surveys.extend(survey_all(&neighbours, deadline, homes, turn));
 
     let mut covered = HashSet::new();
     let mut found = 0;
@@ -786,6 +791,87 @@ mod tests {
         assert!(!due(true, false, 0, 0, now), "a build is running");
         assert!(!due(false, true, 0, 0, now), "the shutdown pass");
         assert!(stale(now + 60, now), "a clock set back does not stop it");
+        assert!(!stale(now, now), "it just ran");
+    }
+
+    #[test]
+    fn the_daemon_step_runs_when_due_and_records_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::test_support::test_config(dir.path().join("cache"));
+        std::fs::create_dir_all(&config.cache_dir).unwrap();
+        let record = config.cache_dir.join(LAST_RUN_FILE);
+        let idle = crate::maintenance::RequestClock::idle();
+        let busy = crate::maintenance::RequestClock::new();
+
+        assert!(!run(&config, Trigger::Shutdown), "never at shutdown");
+        assert!(
+            !run(&config, Trigger::Periodic(&busy)),
+            "not during a build"
+        );
+        assert!(!record.exists());
+        LAST_RUN.store(0, std::sync::atomic::Ordering::Relaxed);
+        assert!(run(&config, Trigger::Periodic(&idle)));
+        let when: u64 = std::fs::read_to_string(&record)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(!stale(when, unix_now_secs()));
+        assert!(
+            !run(&config, Trigger::Periodic(&idle)),
+            "ran within the hour"
+        );
+    }
+
+    #[test]
+    fn turns_follow_the_hour_and_home_is_read_both_ways() {
+        let hour = FRESH_FOR.as_secs();
+        assert_eq!(turn_at(0), 0);
+        assert_eq!(turn_at(hour - 1), 0);
+        assert_eq!(turn_at(5 * hour + 7), 5);
+        assert!(homes_from(None).is_empty());
+        assert!(homes_from(Some("".into())).is_empty());
+        let dir = tempfile::tempdir().unwrap();
+        let homes = homes_from(Some(dir.path().as_os_str().to_owned()));
+        assert_eq!(homes[0], dir.path());
+        let resolved = dir.path().canonicalize().unwrap();
+        assert!(homes.contains(&resolved));
+        assert_eq!(homes.len(), if resolved == dir.path() { 1 } else { 2 });
+    }
+
+    #[test]
+    fn git_output_refuses_a_failure_and_output_at_its_cap() {
+        if Command::new("git")
+            .arg("--version")
+            .output()
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let later = Instant::now() + GIT_TIMEOUT;
+        // Not a repository: Git fails, whatever it printed.
+        assert_eq!(
+            git_output(dir.path(), &["ls-files"], GIT_TIMEOUT, later, 1 << 20),
+            None
+        );
+        let version = git_output(dir.path(), &["--version"], GIT_TIMEOUT, later, 1 << 20).unwrap();
+        assert!(version.starts_with(b"git version"));
+        let cap = version.len() as u64;
+        assert_eq!(
+            git_output(dir.path(), &["--version"], GIT_TIMEOUT, later, cap),
+            None
+        );
+        assert_eq!(
+            git_output(
+                dir.path(),
+                &["--version"],
+                GIT_TIMEOUT,
+                Instant::now(),
+                1 << 20
+            ),
+            None
+        );
     }
 
     #[test]
@@ -1014,8 +1100,8 @@ mod tests {
             .remember_target_root(&original, &repo.join("rust"))
             .unwrap();
 
-        assert_eq!(discover(&store, DISCOVERY_TIME).unwrap(), 1);
-        assert_eq!(discover(&store, DISCOVERY_TIME).unwrap(), 0);
+        assert_eq!(discover(&store, DISCOVERY_TIME, 0).unwrap(), 1);
+        assert_eq!(discover(&store, DISCOVERY_TIME, 0).unwrap(), 0);
         let roots = store.tracked_target_roots(0).unwrap();
         assert_eq!(roots.len(), 2);
         let sibling_row = roots
@@ -1032,7 +1118,7 @@ mod tests {
         let old_identity = sibling_row.identity;
         std::fs::rename(&found, sibling.join("old-target")).unwrap();
         cargo_target(&sibling.join("rust"));
-        assert_eq!(discover(&store, DISCOVERY_TIME).unwrap(), 1);
+        assert_eq!(discover(&store, DISCOVERY_TIME, 0).unwrap(), 1);
         let replaced = store
             .tracked_target_roots(0)
             .unwrap()
@@ -1060,7 +1146,7 @@ mod tests {
         store.forget_target_root(&found).unwrap();
         std::fs::remove_dir_all(&found).unwrap();
         std::fs::create_dir_all(found.join("debug")).unwrap();
-        assert_eq!(discover(&store, DISCOVERY_TIME).unwrap(), 0);
+        assert_eq!(discover(&store, DISCOVERY_TIME, 0).unwrap(), 0);
         assert_eq!(store.tracked_target_roots(0).unwrap().len(), 1);
     }
 }

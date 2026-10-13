@@ -30,6 +30,9 @@ pub fn directory_identity(path: &Path) -> Option<PathIdentity> {
 const CARGO_TAG: &[u8] = b"Signature: 8a477f597d28d172789f06886806bc55";
 /// How much of `CACHEDIR.TAG` is read: the signature is in its first line.
 const TAG_READ_BYTES: u64 = 512;
+/// Open a tag without following a symlink or waiting on a FIFO.
+#[cfg(unix)]
+const OPEN_TAG_FLAGS: i32 = libc::O_NOFOLLOW | libc::O_NONBLOCK;
 
 /// Whether Cargo tagged `target` as its build directory. Only a regular
 /// `CACHEDIR.TAG` counts, opened without following a symlink or waiting on
@@ -38,20 +41,22 @@ const TAG_READ_BYTES: u64 = 512;
 pub fn cargo_tagged(target: &Path) -> bool {
     use std::io::Read;
     let tag = target.join("CACHEDIR.TAG");
-    if !std::fs::symlink_metadata(&tag).is_ok_and(|meta| meta.file_type().is_file()) {
-        return false;
-    }
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        options.custom_flags(OPEN_TAG_FLAGS);
+    }
+    // Without those flags, refuse a symlink or special file before opening.
+    #[cfg(not(unix))]
+    if !std::fs::symlink_metadata(&tag).is_ok_and(|meta| meta.file_type().is_file()) {
+        return false;
     }
     let Ok(file) = options.open(&tag) else {
         return false;
     };
-    // Replaced between the check and the open: look at what was opened.
+    // A FIFO opens at once without a writer; it is not a tag.
     if !file.metadata().is_ok_and(|meta| meta.is_file()) {
         return false;
     }

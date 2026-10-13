@@ -244,11 +244,13 @@ pub(crate) fn sweep(config: &Config, now: u64) -> anyhow::Result<Swept> {
     let mut swept = Swept::default();
     for tracked in store.tracked_target_roots(0)? {
         if tracked.discovered {
-            let missing_with_parent =
-                !tracked.path.exists() && tracked.path.parent().is_some_and(Path::is_dir);
+            // Git found it and finds it again if it comes back, so a missing
+            // one is forgotten, also when its worktree went with it.
+            let missing = std::fs::symlink_metadata(&tracked.path)
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
             let replaced = crate::machine::directory_identity(&tracked.path)
                 .is_some_and(|identity| identity != tracked.identity);
-            if missing_with_parent || replaced {
+            if missing || replaced {
                 forget(&store, &tracked.path, tracked.identity);
                 continue;
             }
@@ -1242,6 +1244,28 @@ mod tests {
             .map(|entry| entry.unwrap().file_name())
             .collect();
         assert_eq!(left, vec![std::ffi::OsString::from("fresh")]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_discovered_target_is_forgotten_once_its_worktree_is_deleted() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        // The defaults: no rule watches discovered targets.
+        let defaults = config(cache.path(), true, 0);
+        let store = Store::open(&defaults).unwrap();
+        let (workspace, target) = tracked_target(&store, root.path(), "agent");
+        store.forget_target_root(&target).unwrap();
+        store
+            .remember_discovered_target_root(&target, &workspace)
+            .unwrap();
+        sweep(&defaults, unix_now_secs()).unwrap();
+        assert_eq!(store.tracked_target_roots(0).unwrap().len(), 1);
+
+        // `rm -rf` of the worktree takes the target's parent with it.
+        std::fs::remove_dir_all(&workspace).unwrap();
+        sweep(&defaults, unix_now_secs()).unwrap();
+        assert!(store.tracked_target_roots(0).unwrap().is_empty());
     }
 
     #[cfg(unix)]

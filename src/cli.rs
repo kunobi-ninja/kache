@@ -4534,6 +4534,9 @@ fn draw_clean(
 struct CleanSkipped {
     path: String,
     reason: String,
+    /// The directory no longer exists, so there is nothing to measure; its
+    /// registry entry is forgotten.
+    missing: bool,
 }
 
 pub(crate) const DEFAULT_TRACKED_STALE_HOURS: u64 = 336;
@@ -4556,18 +4559,24 @@ fn window_label(hours: u64) -> String {
     }
 }
 
-/// Why a tracked clean found nothing to remove, and how to widen it.
-fn nothing_to_clean(selection: TrackedSelection) -> String {
+/// The window a tracked clean can widen to, when it selects less than that.
+const WIDER_STALE_HOURS: u64 = 7 * 24;
+
+/// Whether `--stale 7d` would select more than `selection` does.
+fn can_widen(selection: TrackedSelection) -> bool {
     match selection {
-        TrackedSelection::Orphaned => {
-            "Nothing to remove: every tracked target's worktree is still there.".to_string()
-        }
-        TrackedSelection::StaleOrOrphaned(hours) => format!(
-            "Nothing to remove: no tracked target's worktree is gone, and every one was built within {}.\n\
-             `kache clean --dry-run` lists them all; `--stale 7d` widens the window.",
-            window_label(hours)
-        ),
+        TrackedSelection::Orphaned => true,
+        TrackedSelection::StaleOrOrphaned(hours) => hours > WIDER_STALE_HOURS,
     }
+}
+
+/// How a tracked clean preview ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlanEnd {
+    /// `--dry-run`: names the command that removes what it selected.
+    DryRun,
+    /// A clean that found nothing to remove.
+    NothingRemoved,
 }
 
 /// What `kache clean --cache` or `--crate` removes.
@@ -4963,51 +4972,37 @@ pub fn clean(
         (targets, Vec::new(), std::collections::HashSet::new())
     };
     let tracked = selection.is_some();
+    // Sort by size descending
+    targets.sort_by_key(|entry| std::cmp::Reverse(entry.size));
 
-    // A tracked preview lists every target kache knows, not only the ones it
-    // would remove, so it answers "what is using my disk" too.
-    if let Some(selection) = selection.filter(|_| dry_run && !json) {
-        let now = kache_store::markers::now_epoch_secs() as i64;
-        for line in render_tracked_plan(config, selection, &targets, &skipped, now)? {
+    // A tracked preview, or a tracked clean that removes nothing, lists every
+    // target kache knows with what it keeps, so it answers "what is using my
+    // disk" too. Text and JSON show the same rows and the same next steps.
+    let plan = match selection {
+        Some(selection) if preview || targets.is_empty() => {
+            let now = kache_store::markers::now_epoch_secs() as i64;
+            Some(TrackedPlan::new(config, selection, &targets, preview, now)?)
+        }
+        _ => None,
+    };
+    if let Some(plan) = plan
+        .as_ref()
+        .filter(|_| !json && (dry_run || targets.is_empty()))
+    {
+        let end = if dry_run {
+            PlanEnd::DryRun
+        } else {
+            PlanEnd::NothingRemoved
+        };
+        for line in plan_lines(plan, &skipped, end) {
             println!("{line}");
         }
         return Ok(());
     }
-
-    if targets.is_empty() {
-        if json {
-            #[derive(serde::Serialize)]
-            struct Body {
-                targets: [(); 0],
-                skipped: Vec<CleanSkipped>,
-                removed_paths: Vec<String>,
-                changed: bool,
-                estimated_reclaimed_bytes: u64,
-            }
-            return crate::machine::emit(
-                "clean",
-                Body {
-                    targets: [],
-                    skipped,
-                    removed_paths: Vec::new(),
-                    changed: false,
-                    estimated_reclaimed_bytes: 0,
-                },
-                Vec::new(),
-            );
-        }
-        for item in &skipped {
-            println!("Skipped {}: {}", item.path, item.reason);
-        }
-        match selection {
-            Some(selection) => println!("{}", nothing_to_clean(selection)),
-            None => println!("No target/ directories under {}.", root.display()),
-        }
+    if targets.is_empty() && !json {
+        println!("No target/ directories under {}.", root.display());
         return Ok(());
     }
-
-    // Sort by size descending
-    targets.sort_by_key(|entry| std::cmp::Reverse(entry.size));
 
     let emit_clean_json = |targets: &[TargetEntry],
                            skipped: &[CleanSkipped],
@@ -5023,14 +5018,19 @@ pub fn clean(
             orphaned: bool,
         }
         #[derive(serde::Serialize)]
-        struct Body {
+        struct Body<'a> {
             targets: Vec<TargetBody>,
+            /// Tracked targets this clean leaves, in a preview or when it
+            /// removes nothing: the rows the text shows under Keep.
+            #[serde(skip_serializing_if = "Option::is_none")]
+            kept: Option<&'a [TargetRow]>,
             skipped: Vec<CleanSkipped>,
             removed_paths: Vec<String>,
             changed: bool,
             estimated_reclaimed_bytes: u64,
         }
         let body = Body {
+            kept: plan.as_ref().map(|plan| plan.kept.as_slice()),
             targets: targets
                 .iter()
                 .map(|t| TargetBody {
@@ -5046,11 +5046,16 @@ pub fn clean(
             removed_paths,
             estimated_reclaimed_bytes: reclaimed,
         };
-        crate::machine::emit("clean", body, Vec::new())
+        let next = plan
+            .as_ref()
+            .map(|plan| plan.next.clone())
+            .unwrap_or_default();
+        crate::machine::emit("clean", body, next)
     };
 
-    // `--json` without `--yes` is a dry-run. Agents should not enter the TUI.
-    if json && !yes {
+    // `--json` without `--yes`, or with `--dry-run`, is a preview. Agents
+    // should not enter the TUI.
+    if json && preview {
         return emit_clean_json(&targets, &skipped, Vec::new(), 0);
     }
 
@@ -5221,6 +5226,7 @@ fn remove_targets(
             skipped.push(CleanSkipped {
                 path: target.path.display().to_string(),
                 reason: TARGET_IN_USE.to_string(),
+                missing: false,
             });
             continue;
         }
@@ -5567,28 +5573,150 @@ fn render_targets(rows: &[TargetRow]) -> Vec<String> {
     lines
 }
 
-/// `kache clean --dry-run` on tracked targets: the ones this clean would
-/// remove, the ones it keeps with what the daemon will do to them, and the
-/// cache. Reads the registry and the store; removes nothing.
-fn render_tracked_plan(
-    config: &Config,
+/// A tracked clean's view of every target kache knows: the ones it removes,
+/// the ones it keeps with what the daemon will do to them, the cache, and
+/// what to run next. The text preview and the JSON report both read it, so
+/// they show the same facts.
+struct TrackedPlan {
     selection: TrackedSelection,
-    remove: &[TargetEntry],
-    skipped: &[CleanSkipped],
-    now: i64,
-) -> Result<Vec<String>> {
-    let rows = target_rows(config, now)?;
-    let store = Store::open(config)?;
-    let cache = CacheLine {
-        bytes: store.physical_size()?,
-        limit: config.max_size,
-        entries: store.entry_count()? as u64,
-    };
-    let remove: std::collections::HashSet<String> = remove
+    /// Tracked targets this clean removes.
+    removed: Vec<TargetRow>,
+    /// Tracked targets it leaves.
+    kept: Vec<TargetRow>,
+    cache: CacheLine,
+    /// The commands it suggests, in the order the text shows them.
+    next: Vec<crate::machine::NextAction>,
+}
+
+impl TrackedPlan {
+    /// Reads the registry and the store; removes nothing.
+    fn new(
+        config: &Config,
+        selection: TrackedSelection,
+        remove: &[TargetEntry],
+        preview: bool,
+        now: i64,
+    ) -> Result<Self> {
+        let rows = target_rows(config, now)?;
+        let store = Store::open(config)?;
+        let cache = CacheLine {
+            bytes: store.physical_size()?,
+            limit: config.max_size,
+            entries: store.entry_count()? as u64,
+        };
+        let remove: std::collections::HashSet<String> = remove
+            .iter()
+            .map(|entry| entry.path.display().to_string())
+            .collect();
+        Ok(Self::from_parts(
+            selection,
+            rows,
+            &remove,
+            preview,
+            cache,
+            &names_its_target,
+        ))
+    }
+
+    /// The plan from its parts. Pure apart from `nameable`, which says
+    /// whether naming a row's workspace reaches its target.
+    fn from_parts(
+        selection: TrackedSelection,
+        rows: Vec<TargetRow>,
+        remove: &std::collections::HashSet<String>,
+        preview: bool,
+        cache: CacheLine,
+        nameable: &dyn Fn(&TargetRow) -> bool,
+    ) -> Self {
+        let (removed, kept): (Vec<TargetRow>, Vec<TargetRow>) =
+            rows.into_iter().partition(|row| remove.contains(&row.path));
+        let next = clean_next_actions(selection, preview, removed.len(), &kept, nameable);
+        Self {
+            selection,
+            removed,
+            kept,
+            cache,
+            next,
+        }
+    }
+}
+
+/// What a tracked clean suggests next: the command that removes what a
+/// preview selected, a wider window when nothing matched, and, for targets
+/// found through Git, which no rule removes, a preview of the largest one.
+fn clean_next_actions(
+    selection: TrackedSelection,
+    preview: bool,
+    removable: usize,
+    kept: &[TargetRow],
+    nameable: &dyn Fn(&TargetRow) -> bool,
+) -> Vec<crate::machine::NextAction> {
+    let argv = |args: &[&str]| args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
+    let mut next = Vec::new();
+    if preview && removable > 0 {
+        next.push(crate::machine::NextAction {
+            argv: clean_argv(selection),
+            why: format!("removes the {} above", target_count(removable)),
+        });
+    }
+    if removable == 0 && can_widen(selection) {
+        next.push(crate::machine::NextAction {
+            argv: argv(&["kache", "clean", "--stale", "7d", "--dry-run"]),
+            why: "also selects targets no build used for 7 days".to_string(),
+        });
+    }
+    let found: Vec<&TargetRow> = kept
         .iter()
-        .map(|entry| entry.path.display().to_string())
+        .filter(|row| row.discovered && row.reclaimable_bytes > 0)
         .collect();
-    Ok(plan_lines(&rows, &remove, skipped, selection, &cache))
+    if let Some(largest) = found
+        .iter()
+        .filter(|row| nameable(row))
+        .max_by_key(|row| row.reclaimable_bytes)
+    {
+        next.push(crate::machine::NextAction {
+            argv: argv(&["kache", "clean", &largest.workspace, "--dry-run"]),
+            why: format!(
+                "previews the largest of {} found through Git ({} freeable). kache never saw a build use them, so it removes one only when you name it",
+                target_count(found.len()),
+                term::bytes(found.iter().map(|row| row.reclaimable_bytes).sum())
+            ),
+        });
+    }
+    next
+}
+
+/// Whether `kache clean <workspace>` reaches `row`'s target: naming a
+/// directory finds the `target/` beside a Cargo.toml, nothing else.
+fn names_its_target(row: &TargetRow) -> bool {
+    let workspace = std::path::Path::new(&row.workspace);
+    std::path::Path::new(&row.path) == workspace.join("target")
+        && workspace.join("Cargo.toml").is_file()
+}
+
+/// `argv` as one line a POSIX shell reads back as the same words.
+fn shell_line(argv: &[String]) -> String {
+    let plain = |word: &str| {
+        !word.is_empty()
+            && word
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "-_./:=@%+,".contains(c))
+    };
+    argv.iter()
+        .map(|word| {
+            if plain(word) {
+                word.clone()
+            } else {
+                format!("'{}'", word.replace('\'', r"'\''"))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// `1 target`, `2 targets`.
+fn target_count(n: usize) -> String {
+    format!("{n} target{}", if n == 1 { "" } else { "s" })
 }
 
 /// The cache's size for the last line of a clean preview.
@@ -5609,30 +5737,27 @@ fn selection_words(selection: TrackedSelection) -> String {
 }
 
 /// The command that removes what a tracked preview selected.
-fn clean_command(selection: TrackedSelection) -> String {
+fn clean_argv(selection: TrackedSelection) -> Vec<String> {
+    let mut argv = vec!["kache".to_string(), "clean".to_string()];
     match selection {
-        TrackedSelection::Orphaned => "kache clean --orphans --yes".to_string(),
-        TrackedSelection::StaleOrOrphaned(DEFAULT_TRACKED_STALE_HOURS) => {
-            "kache clean --yes".to_string()
-        }
+        TrackedSelection::Orphaned => argv.push("--orphans".to_string()),
+        TrackedSelection::StaleOrOrphaned(DEFAULT_TRACKED_STALE_HOURS) => {}
         TrackedSelection::StaleOrOrphaned(hours) => {
-            format!("kache clean --stale {} --yes", window_label(hours))
+            argv.extend(["--stale".to_string(), window_label(hours)]);
         }
     }
+    argv.push("--yes".to_string());
+    argv
 }
 
-/// The tracked clean preview, from its parts. Pure.
-fn plan_lines(
-    rows: &[TargetRow],
-    remove: &std::collections::HashSet<String>,
-    skipped: &[CleanSkipped],
-    selection: TrackedSelection,
-    cache: &CacheLine,
-) -> Vec<String> {
-    let (removed, kept): (Vec<&TargetRow>, Vec<&TargetRow>) =
-        rows.iter().partition(|row| remove.contains(&row.path));
+/// The tracked clean view, from its plan. Pure.
+fn plan_lines(plan: &TrackedPlan, skipped: &[CleanSkipped], end: PlanEnd) -> Vec<String> {
+    let selection = plan.selection;
+    let removed: Vec<&TargetRow> = plan.removed.iter().collect();
+    let kept: Vec<&TargetRow> = plan.kept.iter().collect();
+    let cache = &plan.cache;
     let freeable = |rows: &[&TargetRow]| rows.iter().map(|row| row.reclaimable_bytes).sum::<u64>();
-    let count = |n: usize| format!("{n} target{}", if n == 1 { "" } else { "s" });
+    let count = target_count;
     let mut lines = Vec::new();
     if removed.is_empty() {
         lines.push(format!(
@@ -5664,16 +5789,32 @@ fn plan_lines(
             lines.push(format!("  + {} more with nothing to free", empty.len()));
         }
     }
-    if !skipped.is_empty() {
+    // A directory that no longer exists has nothing to show but its path:
+    // count those, and list the skips that say something.
+    let (missing, other): (Vec<&CleanSkipped>, Vec<&CleanSkipped>) =
+        skipped.iter().partition(|item| item.missing);
+    if !other.is_empty() {
         lines.push(String::new());
         lines.push("Skipped".to_string());
-        for item in skipped {
+        for item in other {
             lines.push(format!(
                 "  {}   {}",
                 term::home_path(std::path::Path::new(&item.path)),
                 item.reason
             ));
         }
+    }
+    if !missing.is_empty() {
+        let entries = format!(
+            "{} registry entr{} for directories that no longer exist",
+            missing.len(),
+            if missing.len() == 1 { "y" } else { "ies" }
+        );
+        lines.push(String::new());
+        lines.push(match end {
+            PlanEnd::DryRun => format!("Forget   {entries} (`kache clean` forgets them)"),
+            PlanEnd::NothingRemoved => format!("Forgot   {entries}"),
+        });
     }
     lines.push(String::new());
     lines.push(format!(
@@ -5683,15 +5824,13 @@ fn plan_lines(
         term::count(cache.entries)
     ));
     lines.push(String::new());
-    lines.push(if removed.is_empty() {
-        "Dry run, nothing removed. `--stale 7d` widens the window.".to_string()
-    } else {
-        format!(
-            "Dry run, nothing removed. `{}` removes the {} above.",
-            clean_command(selection),
-            count(removed.len())
-        )
+    lines.push(match end {
+        PlanEnd::DryRun => "Dry run, nothing removed.".to_string(),
+        PlanEnd::NothingRemoved => "Nothing removed.".to_string(),
     });
+    for action in &plan.next {
+        lines.push(format!("`{}` {}.", shell_line(&action.argv), action.why));
+    }
     lines
 }
 
@@ -5864,24 +6003,39 @@ fn tracked_target_entries(
     let mut orphans = std::collections::HashSet::new();
 
     for tracked in tracked {
-        let orphaned = workspace_is_gone(&tracked.workspace_root);
-        if !selection.includes(orphaned, now.saturating_sub(tracked.last_seen)) {
-            continue;
-        }
         let display = tracked.path.display().to_string();
         let skip = |reason: &str| CleanSkipped {
             path: display.clone(),
             reason: reason.to_string(),
+            missing: false,
         };
-        if tracked.discovered {
-            skipped.push(skip("Git discovery has no observed build time"));
+        // A directory that is gone has nothing left to remove, whatever the
+        // selection; a build, or Git discovery, records it again if it
+        // comes back.
+        if std::fs::symlink_metadata(&tracked.path)
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        {
+            skipped.push(CleanSkipped {
+                missing: true,
+                ..skip(&format!(
+                    "path no longer exists; registry entry {registry_action}"
+                ))
+            });
+            // A build that recreated it since the registry was read keeps its
+            // new row, which records another directory.
+            if !preview {
+                store.forget_target_root_with_identity(&tracked.path, tracked.identity)?;
+            }
             continue;
         }
-        if !tracked.path.exists() {
-            skipped.push(skip(&format!(
-                "path no longer exists; registry entry {registry_action}"
-            )));
-            forget(&tracked.path)?;
+        let orphaned = workspace_is_gone(&tracked.workspace_root);
+        if !selection.includes(orphaned, now.saturating_sub(tracked.last_seen)) {
+            continue;
+        }
+        if tracked.discovered {
+            skipped.push(skip(
+                "found through Git: kache never saw a build use it, so it removes it only when you name it",
+            ));
             continue;
         }
         if cwd.starts_with(&tracked.workspace_root) {

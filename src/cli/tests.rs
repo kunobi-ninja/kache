@@ -7759,13 +7759,13 @@ fn clean_names_its_window_and_the_command_that_repeats_it() {
     assert_eq!(window_label(36), "36h");
     assert_eq!(window_label(0), "0h");
     let default = TrackedSelection::StaleOrOrphaned(DEFAULT_TRACKED_STALE_HOURS);
-    assert_eq!(clean_command(default), "kache clean --yes");
+    assert_eq!(clean_argv(default).join(" "), "kache clean --yes");
     assert_eq!(
-        clean_command(TrackedSelection::StaleOrOrphaned(48)),
+        clean_argv(TrackedSelection::StaleOrOrphaned(48)).join(" "),
         "kache clean --stale 2d --yes"
     );
     assert_eq!(
-        clean_command(TrackedSelection::Orphaned),
+        clean_argv(TrackedSelection::Orphaned).join(" "),
         "kache clean --orphans --yes"
     );
     assert_eq!(selection_words(TrackedSelection::Orphaned), "worktree gone");
@@ -7773,9 +7773,11 @@ fn clean_names_its_window_and_the_command_that_repeats_it() {
         selection_words(default),
         "worktree gone, or no build in 14d"
     );
-    assert!(nothing_to_clean(default).contains("built within 14d"));
-    assert!(nothing_to_clean(default).contains("--stale 7d"));
-    assert!(nothing_to_clean(TrackedSelection::Orphaned).contains("still there"));
+    // `--stale 7d` is offered only when it selects more.
+    assert!(can_widen(default));
+    assert!(can_widen(TrackedSelection::Orphaned));
+    assert!(!can_widen(TrackedSelection::StaleOrOrphaned(7 * 24)));
+    assert!(!can_widen(TrackedSelection::StaleOrOrphaned(48)));
 }
 
 #[test]
@@ -7800,14 +7802,18 @@ fn the_clean_preview_splits_what_goes_from_what_stays() {
     let skipped = vec![CleanSkipped {
         path: "/wt/here/target".into(),
         reason: "belongs to the current workspace".into(),
+        missing: false,
     }];
-    let cache = CacheLine {
-        bytes: 3 << 20,
-        limit: 5 << 30,
-        entries: 1_234,
-    };
     let default = TrackedSelection::StaleOrOrphaned(DEFAULT_TRACKED_STALE_HOURS);
-    let lines = plan_lines(&rows, &remove, &skipped, default, &cache);
+    let plan = TrackedPlan::from_parts(
+        default,
+        rows.clone(),
+        &remove,
+        true,
+        test_cache_line(),
+        &beside_its_worktree,
+    );
+    let lines = plan_lines(&plan, &skipped, PlanEnd::DryRun);
     assert_eq!(
         lines[0],
         "Remove   1 target · 1.0 KiB freeable · worktree gone, or no build in 14d"
@@ -7826,26 +7832,196 @@ fn the_clean_preview_splits_what_goes_from_what_stays() {
     assert!(lines.contains(&"  /wt/here/target   belongs to the current workspace".to_string()));
     assert!(lines.contains(&"Cache    3.0 MiB of 5.0 GiB · 1,234 entries · kept under its limit automatically; `kache clean --cache` empties it".to_string()));
     assert_eq!(
-        lines.last().unwrap(),
-        "Dry run, nothing removed. `kache clean --yes` removes the 1 target above."
+        lines[lines.len() - 2..],
+        [
+            "Dry run, nothing removed.",
+            "`kache clean --yes` removes the 1 target above."
+        ]
     );
 
-    let none = plan_lines(
-        &rows,
+    let orphans = TrackedSelection::Orphaned;
+    let plan = TrackedPlan::from_parts(
+        orphans,
+        rows,
         &Default::default(),
-        &[],
-        TrackedSelection::Orphaned,
-        &cache,
+        true,
+        test_cache_line(),
+        &beside_its_worktree,
     );
+    let none = plan_lines(&plan, &[], PlanEnd::DryRun);
     assert_eq!(
         none[0],
         "Remove   nothing: no target matches (worktree gone)"
     );
     assert!(!none.iter().any(|line| line == "Skipped"));
     assert_eq!(
-        none.last().unwrap(),
-        "Dry run, nothing removed. `--stale 7d` widens the window."
+        none[none.len() - 2..],
+        [
+            "Dry run, nothing removed.",
+            "`kache clean --stale 7d --dry-run` also selects targets no build used for 7 days."
+        ]
     );
+}
+
+/// What [`names_its_target`] checks without the Cargo.toml: rows here are
+/// not on disk.
+fn beside_its_worktree(row: &TargetRow) -> bool {
+    row.path == format!("{}/target", row.workspace)
+}
+
+#[test]
+fn naming_a_worktree_reaches_only_the_target_beside_its_manifest() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path().join("agent");
+    std::fs::create_dir_all(workspace.join("target")).unwrap();
+    let mut found = row(&workspace.display().to_string(), TargetState::Live, 1);
+    assert!(
+        !names_its_target(&found),
+        "no Cargo.toml: the scan finds nothing"
+    );
+    std::fs::write(workspace.join("Cargo.toml"), "[package]").unwrap();
+    assert!(names_its_target(&found));
+    found.path = dir.path().join("shared/target").display().to_string();
+    assert!(!names_its_target(&found), "a target elsewhere is not found");
+}
+
+#[test]
+fn suggested_commands_read_back_as_the_same_words() {
+    let argv = |words: &[&str]| words.iter().map(|w| w.to_string()).collect::<Vec<_>>();
+    assert_eq!(
+        shell_line(&argv(&["kache", "clean", "/wt/agent", "--dry-run"])),
+        "kache clean /wt/agent --dry-run"
+    );
+    assert_eq!(
+        shell_line(&argv(&["kache", "clean", "/wt/agent work", "--dry-run"])),
+        "kache clean '/wt/agent work' --dry-run"
+    );
+    assert_eq!(
+        shell_line(&argv(&["it's", "~/x", ""])),
+        r"'it'\''s' '~/x' ''"
+    );
+}
+
+fn test_cache_line() -> CacheLine {
+    CacheLine {
+        bytes: 3 << 20,
+        limit: 5 << 30,
+        entries: 1_234,
+    }
+}
+
+#[test]
+fn a_clean_that_removes_nothing_shows_targets_found_through_git_and_counts_gone_entries() {
+    let mut found = row("/wt/agent", TargetState::Live, 4 << 30);
+    found.discovered = true;
+    found.idle_seconds = None;
+    let mut small = row("/wt/spike", TargetState::Live, 1 << 30);
+    small.discovered = true;
+    // A target outside its worktree is not found by naming the worktree.
+    let mut elsewhere = row("/wt/shared", TargetState::Live, 8 << 30);
+    elsewhere.discovered = true;
+    elsewhere.path = "/targets/shared".into();
+    let built = row("/wt/main", TargetState::Live, 2 << 30);
+    let gone = |path: &str| CleanSkipped {
+        path: path.into(),
+        reason: "path no longer exists; registry entry removed".into(),
+        missing: true,
+    };
+    let skipped = [gone("/wt/old-a/target"), gone("/wt/old-b/target")];
+    let default = TrackedSelection::StaleOrOrphaned(DEFAULT_TRACKED_STALE_HOURS);
+    let rows = vec![built, small, found, elsewhere];
+    let plan = TrackedPlan::from_parts(
+        default,
+        rows,
+        &Default::default(),
+        false,
+        test_cache_line(),
+        &beside_its_worktree,
+    );
+
+    // The text and the JSON suggest the same commands, in the same order.
+    let argv: Vec<String> = plan
+        .next
+        .iter()
+        .map(|action| action.argv.join(" "))
+        .collect();
+    assert_eq!(
+        argv,
+        [
+            "kache clean --stale 7d --dry-run",
+            "kache clean /wt/agent --dry-run"
+        ]
+    );
+    assert!(
+        plan.next[1]
+            .why
+            .contains("largest of 3 targets found through Git (13.0 GiB freeable)"),
+        "{:?}",
+        plan.next[1]
+    );
+    assert_eq!(plan.kept.len(), 4);
+
+    let lines = plan_lines(&plan, &skipped, PlanEnd::NothingRemoved);
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.ends_with("/wt/agent/target  (found through Git)")),
+        "{lines:#?}"
+    );
+    assert!(
+        !lines.iter().any(|line| line.contains("old-a")),
+        "gone entries are counted, not listed: {lines:#?}"
+    );
+    assert!(
+        lines.contains(
+            &"Forgot   2 registry entries for directories that no longer exist".to_string()
+        )
+    );
+    assert!(!lines.iter().any(|line| line == "Skipped"));
+    let end = lines
+        .iter()
+        .position(|line| line == "Nothing removed.")
+        .unwrap();
+    assert_eq!(lines.len() - end - 1, plan.next.len());
+    for (line, action) in lines[end + 1..].iter().zip(&plan.next) {
+        assert_eq!(
+            *line,
+            format!("`{}` {}.", shell_line(&action.argv), action.why)
+        );
+    }
+}
+
+#[test]
+fn a_tracked_clean_forgets_a_target_found_through_git_once_its_worktree_is_deleted() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = crate::test_support::test_config(dir.path().join("cache"));
+    let store = Store::open(&config).unwrap();
+    let workspace = dir.path().join("worktrees/agent");
+    let target = workspace.join("target");
+    std::fs::create_dir_all(target.join("debug")).unwrap();
+    std::fs::write(target.join("CACHEDIR.TAG"), CARGO_CACHEDIR_TAG).unwrap();
+    store
+        .remember_discovered_target_root(&target, &workspace)
+        .unwrap();
+    let default = TrackedSelection::StaleOrOrphaned(DEFAULT_TRACKED_STALE_HOURS);
+
+    let (targets, skipped, _) = tracked_target_entries(&config, default, false).unwrap();
+    assert!(targets.is_empty() && skipped.is_empty(), "{skipped:?}");
+
+    // `rm -rf` of the worktree takes the target with it.
+    std::fs::remove_dir_all(&workspace).unwrap();
+    let (targets, skipped, _) = tracked_target_entries(&config, default, true).unwrap();
+    assert!(targets.is_empty());
+    assert_eq!(skipped.len(), 1);
+    assert!(skipped[0].missing, "{skipped:?}");
+    assert_eq!(
+        store.tracked_target_roots(0).unwrap().len(),
+        1,
+        "a preview keeps the entry"
+    );
+    let (_, skipped, _) = tracked_target_entries(&config, default, false).unwrap();
+    assert!(skipped[0].missing);
+    assert!(store.tracked_target_roots(0).unwrap().is_empty());
 }
 
 #[test]

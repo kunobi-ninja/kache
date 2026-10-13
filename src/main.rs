@@ -622,26 +622,50 @@ enum TelemetryCommands {
     },
 }
 
+/// Whether `command` has a JSON form. Every command is named, with no
+/// catch-all, so a new one does not compile until it says whether `--json`
+/// works for it.
 fn command_supports_json(command: &Option<Commands>) -> bool {
-    matches!(
-        command,
-        Some(
-            Commands::List { .. }
-                | Commands::Gc { .. }
-                | Commands::Clean { .. }
-                | Commands::Targets { .. }
-                | Commands::Doctor { .. }
-                | Commands::Stats { .. }
-                | Commands::Explain { .. }
-                | Commands::Diff { .. }
-                | Commands::Init { shims: None, .. }
-                | Commands::Report { .. }
-                | Commands::Daemon { command: None }
-                | Commands::Daemon {
-                    command: Some(DaemonCommands::Status),
-                }
-        )
-    )
+    let Some(command) = command else {
+        return false;
+    };
+    match command {
+        Commands::List { .. }
+        | Commands::Gc { .. }
+        | Commands::Clean { .. }
+        | Commands::Targets { .. }
+        | Commands::Doctor { .. }
+        | Commands::Stats { .. }
+        | Commands::Explain { .. }
+        | Commands::Diff { .. }
+        | Commands::Report { .. } => true,
+        Commands::Init { shims, .. } => shims.is_none(),
+        Commands::Daemon { command } => match command {
+            None | Some(DaemonCommands::Status) => true,
+            Some(
+                DaemonCommands::Run
+                | DaemonCommands::Start
+                | DaemonCommands::Stop
+                | DaemonCommands::Restart
+                | DaemonCommands::Install
+                | DaemonCommands::Uninstall
+                | DaemonCommands::Log,
+            ) => false,
+        },
+        // Interactive, or Cargo's own output.
+        Commands::Cargo { .. }
+        | Commands::Config
+        | Commands::Monitor { .. }
+        | Commands::Login { .. }
+        | Commands::Completions { .. } => false,
+        // No JSON form yet.
+        Commands::Purge { .. }
+        | Commands::Sync { .. }
+        | Commands::SaveManifest { .. }
+        | Commands::Telemetry { .. }
+        | Commands::Logout
+        | Commands::InstallShims { .. } => false,
+    }
 }
 
 fn doctor_json_is_read_only(

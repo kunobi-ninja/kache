@@ -732,7 +732,12 @@ fn cloned_targets_row(disk: &crate::machine::DiskView) -> Option<StatsRow> {
     }
     let mut notes = vec!["private".to_string()];
     if cloned > 0 {
-        notes.push(format!("{} cloned into target/", term::bytes(cloned)));
+        // Evicting a blob a target still holds frees nothing, so a size
+        // sweep leaves these out, and the Cache size can stay above Limit.
+        notes.push(format!(
+            "{} cloned into target/, which the limit leaves out",
+            term::bytes(cloned)
+        ));
     }
     if snapshot > 0 {
         notes.push(format!(
@@ -745,6 +750,65 @@ fn cloned_targets_row(disk: &crate::machine::DiskView) -> Option<StatsRow> {
         term::bytes(disk.disk_private_bytes),
         notes.join(", "),
     ))
+}
+
+/// The volume holding the cache: its size, what is free, and the free-space
+/// floor below which kache recovers space.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct VolumeView {
+    total_bytes: u64,
+    free_bytes: u64,
+    /// `cache.auto_recover_min_free_bytes`; `0` means recovery is off.
+    recovery_floor_bytes: u64,
+    /// Free space is below a recovery floor that is set.
+    below_floor: bool,
+}
+
+impl VolumeView {
+    fn new(usage: kache_fs::VolumeUsage, floor: u64) -> Self {
+        Self {
+            total_bytes: usage.total,
+            free_bytes: usage.free,
+            recovery_floor_bytes: floor,
+            below_floor: floor > 0 && usage.free < floor,
+        }
+    }
+}
+
+/// The cache volume, `None` where its usage cannot be read (not Unix).
+fn volume_view(config: &Config) -> Option<VolumeView> {
+    kache_fs::volume_usage(&config.cache_dir)
+        .map(|usage| VolumeView::new(usage, config.auto_recover_min_free_bytes))
+}
+
+fn volume_row(volume: &VolumeView) -> StatsRow {
+    let used = volume.total_bytes.saturating_sub(volume.free_bytes);
+    let percent = if volume.total_bytes == 0 {
+        0
+    } else {
+        (used as u128 * 100 / volume.total_bytes as u128) as u64
+    };
+    let recovery = if volume.recovery_floor_bytes == 0 {
+        "free-space recovery off".to_string()
+    } else if volume.below_floor {
+        format!(
+            "below the {} recovery floor",
+            term::bytes(volume.recovery_floor_bytes)
+        )
+    } else {
+        format!(
+            "recovery keeps {} free",
+            term::bytes(volume.recovery_floor_bytes)
+        )
+    };
+    (
+        "Volume",
+        format!("{} free", term::bytes(volume.free_bytes)),
+        format!(
+            "of {} · {percent}% used · {recovery}",
+            term::bytes(volume.total_bytes)
+        ),
+    )
 }
 
 /// Print a one-shot stats summary to stdout.
@@ -777,6 +841,7 @@ pub fn stats(
         store_bytes,
         main_store.map_or(snap.max_size, |s| s.max_size),
     );
+    let volume = volume_view(config);
     let host_config = host_config_in_effect(&crate::config::host_config_status());
     let machine = machine_snapshot(config);
     let lifetime = crate::savings::lifetime(config);
@@ -785,6 +850,10 @@ pub fn stats(
         #[derive(serde::Serialize)]
         struct Body<'a> {
             disk: crate::machine::DiskView,
+            /// The volume holding the cache. Absent where its usage cannot
+            /// be read.
+            #[serde(skip_serializing_if = "Option::is_none")]
+            volume: Option<VolumeView>,
             stores: &'a [crate::store_view::StoreSummary],
             /// This machine's shared index (`index.db` plus `-wal`) and each
             /// table's largest rowid, as `kache telemetry write` reports them.
@@ -842,6 +911,7 @@ pub fn stats(
             "stats",
             Body {
                 disk: disk.clone(),
+                volume,
                 stores: &snap.stores,
                 index_bytes: machine.index_bytes,
                 index_wal_bytes: machine.wal_bytes,
@@ -882,6 +952,7 @@ pub fn stats(
         ..Default::default()
     };
     extras.cache.extend(cloned_targets_row(&disk));
+    extras.cache.extend(volume.as_ref().map(volume_row));
     let mut compact_machine = machine.clone();
     compact_machine.rowid_high_water.clear();
     extras.cache.extend(machine_rows(&compact_machine));

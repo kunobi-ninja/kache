@@ -673,6 +673,33 @@ fn gc_stats(evicted: usize, pinned: usize, bytes: u64) -> crate::store::GcStats 
 }
 
 #[test]
+fn the_volume_row_says_what_is_free_and_whether_recovery_is_on() {
+    let gib = 1u64 << 30;
+    let usage = |free: u64| kache_fs::VolumeUsage {
+        total: 100 * gib,
+        free: free * gib,
+    };
+    assert_eq!(
+        row_text(volume_row(&VolumeView::new(usage(2), 0))),
+        "Volume | 2.0 GiB free | of 100.0 GiB · 98% used · free-space recovery off"
+    );
+    let below = VolumeView::new(usage(2), 10 * gib);
+    assert!(below.below_floor);
+    assert_eq!(
+        row_text(volume_row(&below)),
+        "Volume | 2.0 GiB free | of 100.0 GiB · 98% used · below the 10.0 GiB recovery floor"
+    );
+    let above = VolumeView::new(usage(40), 10 * gib);
+    assert!(!above.below_floor);
+    assert!(
+        row_text(volume_row(&above)).ends_with("60% used · recovery keeps 10.0 GiB free"),
+        "{above:?}"
+    );
+    // An unset floor is never "below".
+    assert!(!VolumeView::new(usage(0), 0).below_floor);
+}
+
+#[test]
 fn cloned_targets_summary_only_appears_for_retained_blocks() {
     let dir = tempfile::tempdir().unwrap();
     let mut disk = crate::machine::disk_view(dir.path(), 0, 1024);
@@ -684,7 +711,10 @@ fn cloned_targets_summary_only_appears_for_retained_blocks() {
         .map(row_text)
         .expect("cloned blocks need a summary");
     assert!(line.contains("3 B"), "{line}");
-    assert!(line.contains("7 B cloned"), "{line}");
+    assert!(
+        line.contains("7 B cloned into target/, which the limit leaves out"),
+        "{line}"
+    );
     assert!(!line.contains("snapshots"), "{line}");
 
     disk.snapshot_retained_bytes = 5;

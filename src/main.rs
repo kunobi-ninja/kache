@@ -394,7 +394,7 @@ enum Commands {
     },
 
     /// Hit rate, time saved and cache size; --full for the whole report
-    #[command(display_order = 10)]
+    #[command(display_order = 10, visible_alias = "status")]
     Stats {
         /// Event window (e.g. 15m, 2h, 7d; a bare number is hours)
         #[arg(long, default_value = "24h")]
@@ -1996,6 +1996,22 @@ mod tests {
         assert_eq!(parse_duration_hours("48"), Some(48));
         assert_eq!(parse_duration_hours("invalid"), None);
         assert_eq!(parse_duration_hours("18446744073709551615d"), None);
+    }
+
+    #[test]
+    fn status_runs_stats_and_daemon_status_stays_the_daemons() {
+        let status = Cli::try_parse_from(["kache", "status", "--since", "2h"]).unwrap();
+        assert!(matches!(
+            status.command,
+            Some(Commands::Stats { ref since, .. }) if since == "2h"
+        ));
+        let daemon = Cli::try_parse_from(["kache", "daemon", "status"]).unwrap();
+        assert!(matches!(
+            daemon.command,
+            Some(Commands::Daemon {
+                command: Some(DaemonCommands::Status)
+            })
+        ));
     }
 
     #[test]

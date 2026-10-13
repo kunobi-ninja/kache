@@ -252,6 +252,8 @@ fn tui_uses_the_daemon_remote_status() {
             remote_key_cache_refresh_secs: 60,
             socket_path: "/shared/daemon.sock".to_string(),
             started_at_ms: 1,
+            auto_recover_min_free_bytes: None,
+            auto_recover_targets: None,
         }),
         ..StatsSnapshot::default()
     };
@@ -1548,6 +1550,8 @@ fn store_names_the_daemon_and_now_leaves_the_version_off() {
         remote_key_cache_refresh_secs: 60,
         socket_path: "/daemon.sock".to_string(),
         started_at_ms: 1,
+        auto_recover_min_free_bytes: None,
+        auto_recover_targets: None,
     });
 
     let now = rendered_tab(&mut state, Tab::Now);

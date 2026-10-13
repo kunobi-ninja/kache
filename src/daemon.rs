@@ -1454,6 +1454,14 @@ pub struct EffectiveConfig {
     /// so a mismatch warning can say how old the in-effect config is.
     #[serde(default)]
     pub started_at_ms: u64,
+    /// The free-space floor the daemon recovers to. `None` from daemons that
+    /// predate the field.
+    #[serde(default)]
+    pub auto_recover_min_free_bytes: Option<u64>,
+    /// Whether the daemon's recovery also removes idle targets. `None` from
+    /// daemons that predate the field.
+    #[serde(default)]
+    pub auto_recover_targets: Option<bool>,
 }
 
 /// Daemons from before `remote_key_listing` listed whenever prefetch was on.
@@ -1489,6 +1497,8 @@ impl EffectiveConfig {
             remote_key_cache_refresh_secs: config.remote_key_cache_refresh_secs,
             socket_path: config.socket_path().display().to_string(),
             started_at_ms: unix_time_ms(),
+            auto_recover_min_free_bytes: Some(config.auto_recover_min_free_bytes),
+            auto_recover_targets: Some(config.auto_recover_targets),
         }
     }
 }

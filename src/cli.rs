@@ -780,14 +780,25 @@ impl VolumeView {
 }
 
 /// The cache volume, `None` where its usage cannot be read (not Unix).
-fn volume_view(config: &Config) -> Option<VolumeView> {
-    kache_fs::volume_usage(&config.cache_dir).map(|usage| {
-        VolumeView::new(
-            usage,
+fn volume_view(config: &Config, daemon: Option<&daemon::EffectiveConfig>) -> Option<VolumeView> {
+    let (floor, targets) = recovery_in_effect(config, daemon);
+    kache_fs::volume_usage(&config.cache_dir).map(|usage| VolumeView::new(usage, floor, targets))
+}
+
+/// The recovery floor and target switch in effect: the daemon's, which is
+/// what evicts and removes, when it reports them; otherwise this process's.
+fn recovery_in_effect(config: &Config, daemon: Option<&daemon::EffectiveConfig>) -> (u64, bool) {
+    daemon
+        .and_then(|daemon| {
+            Some((
+                daemon.auto_recover_min_free_bytes?,
+                daemon.auto_recover_targets?,
+            ))
+        })
+        .unwrap_or((
             config.auto_recover_min_free_bytes,
             config.auto_recover_targets,
-        )
-    })
+        ))
 }
 
 fn volume_row(volume: &VolumeView) -> StatsRow {
@@ -855,7 +866,7 @@ pub fn stats(
         store_bytes,
         main_store.map_or(snap.max_size, |s| s.max_size),
     );
-    let volume = volume_view(config);
+    let volume = volume_view(config, snap.daemon_effective_config.as_ref());
     let host_config = host_config_in_effect(&crate::config::host_config_status());
     let machine = machine_snapshot(config);
     let lifetime = crate::savings::lifetime(config);
@@ -9580,27 +9591,31 @@ fn setup_steps(
 }
 
 /// `init`'s offer to let free-space recovery remove idle target directories
-/// too, not only cache entries. Only a person at a terminal is asked;
-/// `--yes`, `--check` and a script leave the default, cache only. A config
-/// file that already sets `auto_recover_targets` is left as it is.
+/// too, not only cache entries. It concerns the user's own config file (see
+/// [`crate::config::user_config_path`]): the one a login daemon reads. Only a
+/// person at a terminal is asked; `--yes`, `--check` and a script leave the
+/// default, cache only. A file that already decides, or an environment
+/// variable that overrides it, is left as it is.
 fn offer_target_recovery(yes: bool, check: bool) -> Result<()> {
-    let floor = crate::config::Config::load()
-        .map_or(crate::config::DEFAULT_RECOVERY_FLOOR, |config| {
-            config.auto_recover_min_free_bytes
-        });
-    if floor == 0 {
-        return Ok(());
-    }
     let path = crate::config::user_config_path();
     let existing = match std::fs::read_to_string(&path) {
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(error) => return Err(error).context("read Kache configuration"),
     };
-    if sets_target_recovery(&existing) {
+    let env = |name: &str| std::env::var(name).ok();
+    let settings = RecoverySettings::of(&existing, &env, crate::policy::running_in_ci_with(env));
+    if let Some(on) = settings.targets_from_env {
+        println!(
+            "  • Free-space recovery: KACHE_AUTO_RECOVER_TARGETS {} idle targets",
+            if on { "includes" } else { "leaves out" }
+        );
         return Ok(());
     }
-    let floor = term::bytes(floor);
+    if settings.file_decides_targets || settings.floor == 0 {
+        return Ok(());
+    }
+    let floor = term::bytes(settings.floor);
     if yes || check || !std::io::stdin().is_terminal() {
         println!(
             "  • Free-space recovery: cache entries below {floor} free; `auto_recover_targets = true` adds idle targets"
@@ -9613,23 +9628,66 @@ fn offer_target_recovery(yes: bool, check: bool) -> Result<()> {
         println!("  • Free-space recovery: cache entries only");
         return Ok(());
     }
-    match enable_target_recovery(&existing) {
-        Some(updated) => {
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::write(&path, updated).context("save Kache configuration")?;
-            println!(
-                "  ✓ Free-space recovery: cache entries and idle targets ({})",
-                term::home_path(&path)
-            );
-        }
-        None => println!(
+    // The file may have been edited while the question waited.
+    let current = std::fs::read_to_string(&path).unwrap_or_default();
+    let Some(updated) = enable_target_recovery(&existing).filter(|_| current == existing) else {
+        println!(
             "  → Free-space recovery: add `auto_recover_targets = true` under [cache] in {}",
             term::home_path(&path)
-        ),
+        );
+        return Ok(());
+    };
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
     }
+    let permissions = std::fs::metadata(&path).ok().map(|meta| meta.permissions());
+    crate::atomic::atomic_replace(&path, updated.as_bytes()).context("save Kache configuration")?;
+    if let Some(permissions) = permissions {
+        std::fs::set_permissions(&path, permissions)
+            .context("keep the configuration's permissions")?;
+    }
+    println!(
+        "  ✓ Free-space recovery: cache entries and idle targets ({})",
+        term::home_path(&path)
+    );
     Ok(())
+}
+
+/// What a user config file, with the environment, says about recovery.
+#[derive(Debug, PartialEq, Eq)]
+struct RecoverySettings {
+    /// The floor in effect: the environment's, the file's, or the default.
+    floor: u64,
+    /// `KACHE_AUTO_RECOVER_TARGETS`, when it overrides the file.
+    targets_from_env: Option<bool>,
+    /// The file sets `auto_recover_targets` either way.
+    file_decides_targets: bool,
+}
+
+impl RecoverySettings {
+    fn of(text: &str, env: &dyn Fn(&str) -> Option<String>, in_ci: bool) -> Self {
+        let cache = toml::from_str::<toml::Value>(text)
+            .ok()
+            .and_then(|value| value.get("cache").cloned());
+        let file = |key: &str| cache.as_ref().and_then(|cache| cache.get(key).cloned());
+        let ignore_env = file("ignore_env").and_then(|value| value.as_bool()) == Some(true);
+        let env = |name: &str| if ignore_env { None } else { env(name) };
+        let floor = env("KACHE_AUTO_RECOVER_MIN_FREE_BYTES")
+            .and_then(|value| value.parse().ok())
+            .or_else(|| {
+                file("auto_recover_min_free_bytes")?
+                    .as_integer()?
+                    .try_into()
+                    .ok()
+            })
+            .unwrap_or_else(|| crate::config::default_recovery_floor(in_ci));
+        Self {
+            floor,
+            targets_from_env: env("KACHE_AUTO_RECOVER_TARGETS")
+                .map(|value| value == "1" || value.eq_ignore_ascii_case("true")),
+            file_decides_targets: sets_target_recovery(text),
+        }
+    }
 }
 
 /// Whether `text` sets `auto_recover_targets` in its `[cache]` table, either

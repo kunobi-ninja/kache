@@ -931,6 +931,8 @@ fn compile_started_wire_tags_and_stats_default() {
             remote_key_cache_refresh_secs: 60,
             socket_path: "/c/daemon.sock".into(),
             started_at_ms: 1,
+            auto_recover_min_free_bytes: None,
+            auto_recover_targets: None,
         }),
     })
     .unwrap();

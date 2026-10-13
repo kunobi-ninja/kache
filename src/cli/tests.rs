@@ -679,7 +679,7 @@ fn stats_reads_the_volume_holding_the_cache() {
     let mut config = crate::test_support::test_config(dir.path().join("cache"));
     std::fs::create_dir_all(&config.cache_dir).unwrap();
     config.auto_recover_min_free_bytes = 1;
-    let volume = volume_view(&config).expect("Unix reads volume usage");
+    let volume = volume_view(&config, None).expect("Unix reads volume usage");
     assert!(volume.total_bytes > 0, "{volume:?}");
     assert!(volume.free_bytes <= volume.total_bytes, "{volume:?}");
     assert_eq!(volume.recovery_floor_bytes, 1);
@@ -4675,6 +4675,8 @@ fn effective_config_like(config: &Config) -> crate::daemon::EffectiveConfig {
         remote_key_cache_refresh_secs: config.remote_key_cache_refresh_secs,
         socket_path: config.socket_path().display().to_string(),
         started_at_ms: 1_700_000_000_000,
+        auto_recover_min_free_bytes: None,
+        auto_recover_targets: None,
     }
 }
 
@@ -8689,4 +8691,48 @@ fn init_adds_target_recovery_without_rewriting_the_config() {
         "[cache]\nauto_recover_targets = false\n"
     ));
     assert!(sets_target_recovery("cache.auto_recover_targets = true\n"));
+}
+
+#[test]
+fn init_offers_recovery_with_the_floor_its_file_and_environment_set() {
+    let none = |_: &str| None;
+    let defaults = RecoverySettings::of("", &none, false);
+    assert_eq!(defaults.floor, crate::config::DEFAULT_RECOVERY_FLOOR);
+    assert_eq!(defaults.targets_from_env, None);
+    assert!(!defaults.file_decides_targets);
+    assert_eq!(RecoverySettings::of("", &none, true).floor, 0, "CI default");
+
+    let file = "[cache]\nauto_recover_min_free_bytes = 107374182400\n";
+    assert_eq!(RecoverySettings::of(file, &none, false).floor, 100 << 30);
+    let env = |name: &str| match name {
+        "KACHE_AUTO_RECOVER_MIN_FREE_BYTES" => Some("5368709120".to_string()),
+        "KACHE_AUTO_RECOVER_TARGETS" => Some("0".to_string()),
+        _ => None,
+    };
+    let overridden = RecoverySettings::of(file, &env, false);
+    assert_eq!(overridden.floor, 5 << 30, "the environment wins");
+    assert_eq!(overridden.targets_from_env, Some(false));
+    let ignored = RecoverySettings::of(&format!("{file}ignore_env = true\n"), &env, false);
+    assert_eq!(ignored.floor, 100 << 30, "unless the file ignores it");
+    assert_eq!(ignored.targets_from_env, None);
+    assert!(
+        RecoverySettings::of("[cache]\nauto_recover_targets = false\n", &none, false)
+            .file_decides_targets
+    );
+}
+
+#[test]
+fn stats_shows_the_recovery_the_daemon_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = crate::test_support::test_config(dir.path().to_path_buf());
+    config.auto_recover_min_free_bytes = 1;
+    config.auto_recover_targets = false;
+    assert_eq!(recovery_in_effect(&config, None), (1, false));
+    let mut daemon = effective_config_like(&config);
+    daemon.auto_recover_min_free_bytes = Some(7);
+    daemon.auto_recover_targets = Some(true);
+    assert_eq!(recovery_in_effect(&config, Some(&daemon)), (7, true));
+    // A daemon from before the fields: this process's settings.
+    daemon.auto_recover_targets = None;
+    assert_eq!(recovery_in_effect(&config, Some(&daemon)), (1, false));
 }

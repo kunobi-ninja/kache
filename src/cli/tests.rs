@@ -672,6 +672,19 @@ fn gc_stats(evicted: usize, pinned: usize, bytes: u64) -> crate::store::GcStats 
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn stats_reads_the_volume_holding_the_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = crate::test_support::test_config(dir.path().join("cache"));
+    std::fs::create_dir_all(&config.cache_dir).unwrap();
+    config.auto_recover_min_free_bytes = 1;
+    let volume = volume_view(&config).expect("Unix reads volume usage");
+    assert!(volume.total_bytes > 0, "{volume:?}");
+    assert!(volume.free_bytes <= volume.total_bytes, "{volume:?}");
+    assert_eq!(volume.recovery_floor_bytes, 1);
+}
+
 #[test]
 fn the_volume_row_says_what_is_free_and_whether_recovery_is_on() {
     let gib = 1u64 << 30;

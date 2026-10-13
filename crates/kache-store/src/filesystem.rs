@@ -10,6 +10,12 @@ pub struct PathIdentity {
     pub inode: u64,
 }
 
+/// Whether a directory recorded as `recorded` and found as `now` at the same
+/// path is the same one on a renumbered volume: same inode, new device.
+pub fn renumbered(recorded: PathIdentity, now: PathIdentity) -> bool {
+    recorded.inode == now.inode && recorded.device != now.device
+}
+
 /// Stable directory identity used to reject moved or replaced tracked targets.
 pub fn directory_identity(path: &Path) -> Option<PathIdentity> {
     kache_fs::directory_identity(path)
@@ -127,6 +133,21 @@ pub fn is_executable(metadata: &std::fs::Metadata) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_new_device_with_the_same_inode_is_a_renumbered_volume() {
+        let id = |device, inode| PathIdentity { device, inode };
+        assert!(renumbered(id(16_777_235, 7), id(16_777_232, 7)));
+        assert!(!renumbered(id(1, 7), id(1, 7)), "unchanged");
+        assert!(
+            !renumbered(id(1, 7), id(1, 8)),
+            "replaced on the same volume"
+        );
+        assert!(
+            !renumbered(id(1, 7), id(2, 8)),
+            "replaced on another volume"
+        );
+    }
 
     #[cfg(unix)]
     #[test]

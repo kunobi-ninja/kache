@@ -2046,6 +2046,23 @@ fn artifact_target_path_keeps_the_exact_output_path() {
 /// for a build script compiled into `<profile>/build/<unit>`, where
 /// `RustcArgs::target_dir` answers the profile directory.
 #[test]
+fn only_a_workspace_records_the_target_it_builds_into() {
+    let home = Path::new("/home/dev/.cargo");
+    assert!(owns_its_target(Path::new("/src/app"), Some(home)));
+    assert!(owns_its_target(Path::new("/src/app"), None));
+    // `cargo build -p rand_chacha`: a registry package is primary too.
+    let registry = home.join("registry/src/index.crates.io-1949cf8c6b5b557f/rand_chacha-0.9.0");
+    assert!(!owns_its_target(&registry, Some(home)));
+    assert!(
+        !owns_its_target(&registry, None),
+        "known by its layout alone"
+    );
+    // A Git dependency's checkout, possibly a member below the repository.
+    let git = home.join("git/checkouts/serde-1a2b3c/4d5e6f7/serde_derive");
+    assert!(!owns_its_target(&git, Some(home)));
+}
+
+#[test]
 fn prestage_target_dir_is_the_target_root_for_every_unit() {
     let parse = |out_dir: &str, target: Option<&str>| {
         let mut argv = vec![

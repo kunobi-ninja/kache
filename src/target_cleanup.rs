@@ -243,14 +243,18 @@ pub(crate) fn sweep(config: &Config, now: u64) -> anyhow::Result<Swept> {
     let now = i64::try_from(now).unwrap_or(i64::MAX);
     let mut swept = Swept::default();
     for tracked in store.tracked_target_roots(0)? {
+        // A directory that is gone has nothing left to clean. A build, or Git
+        // discovery, records it again if it comes back.
+        if std::fs::symlink_metadata(&tracked.path)
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        {
+            forget(&store, &tracked.path, tracked.identity);
+            continue;
+        }
         if tracked.discovered {
-            // Git found it and finds it again if it comes back, so a missing
-            // one is forgotten, also when its worktree went with it.
-            let missing = std::fs::symlink_metadata(&tracked.path)
-                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
             let replaced = crate::machine::directory_identity(&tracked.path)
                 .is_some_and(|identity| identity != tracked.identity);
-            if missing || replaced {
+            if replaced {
                 forget(&store, &tracked.path, tracked.identity);
                 continue;
             }
@@ -1244,6 +1248,24 @@ mod tests {
             .map(|entry| entry.unwrap().file_name())
             .collect();
         assert_eq!(left, vec![std::ffi::OsString::from("fresh")]);
+    }
+
+    #[test]
+    fn a_deleted_target_is_forgotten_while_its_worktree_stays() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        // The defaults: no idle or free-space rule, only orphans.
+        let defaults = config(cache.path(), true, 0);
+        let store = Store::open(&defaults).unwrap();
+        let (workspace, target) = tracked_target(&store, root.path(), "main");
+        sweep(&defaults, unix_now_secs()).unwrap();
+        assert_eq!(store.tracked_target_roots(0).unwrap().len(), 1);
+
+        // `rm -rf target` (or `cargo clean`) in a worktree that stays.
+        std::fs::remove_dir_all(&target).unwrap();
+        assert!(workspace.is_dir());
+        sweep(&defaults, unix_now_secs()).unwrap();
+        assert!(store.tracked_target_roots(0).unwrap().is_empty());
     }
 
     #[cfg(unix)]

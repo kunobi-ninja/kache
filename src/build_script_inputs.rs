@@ -138,7 +138,7 @@ const HOME: &str = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
 
 /// Whether `path` is under the registry or the Git sources in `home`, which
 /// Cargo takes to be immutable.
-fn under_cargo_home(home: &Path, path: &Path) -> bool {
+pub(crate) fn under_cargo_home(home: &Path, path: &Path) -> bool {
     path.starts_with(home.join("registry")) || path.starts_with(home.join("git"))
 }
 

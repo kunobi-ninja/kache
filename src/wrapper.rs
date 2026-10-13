@@ -4206,6 +4206,10 @@ fn run_parsed_rustc(
     if args.is_primary
         && let Some(target_dir) = args.target_dir()
         && let Some(workspace_root) = workspace_root.as_deref()
+        && owns_its_target(
+            workspace_root,
+            crate::build_script_inputs::cargo_home(&|name| std::env::var_os(name)).as_deref(),
+        )
         && let Err(e) = store.remember_target_root_built_by(
             &target_dir,
             workspace_root,
@@ -5435,6 +5439,17 @@ fn take_prestaged(
     strategy == link::LinkStrategy::Copy
         && cached_file.size >= crate::prestage::MIN_BYTES
         && crate::prestage::take(target_path, &cached_file.hash)
+}
+
+/// Whether a primary unit rooted at `workspace_root` owns the target it
+/// builds into. A dependency built on its own (`cargo build -p serde`) is
+/// primary too, but its root is its source in Cargo's registry or Git
+/// checkouts; recording that as the target's workspace would hide the real
+/// one from orphan checks and Git discovery.
+fn owns_its_target(workspace_root: &Path, cargo_home: Option<&Path>) -> bool {
+    !crate::cache_key::is_registry_package(workspace_root)
+        && !cargo_home
+            .is_some_and(|home| crate::build_script_inputs::under_cargo_home(home, workspace_root))
 }
 
 /// The target directory a compile writes under, for [`crate::prestage`].

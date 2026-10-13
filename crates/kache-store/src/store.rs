@@ -4634,17 +4634,57 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             let (Ok(device), Ok(inode)) = (device.parse::<u64>(), inode.parse::<u64>()) else {
                 continue;
             };
+            let path = PathBuf::from(path);
+            let recorded = crate::filesystem::PathIdentity { device, inode };
+            let identity = self.renumbered_device(&path, recorded);
             targets.push(TrackedTargetRoot {
-                path: PathBuf::from(path),
+                path,
                 workspace_root: PathBuf::from(workspace_root),
                 first_seen,
                 last_seen,
-                identity: crate::filesystem::PathIdentity { device, inode },
+                identity,
                 rustc,
                 discovered,
             });
         }
         Ok(targets)
+    }
+
+    /// `recorded`, with the device number `path` has now when only that
+    /// changed. macOS can number an APFS volume differently after a restart,
+    /// so the same directory, at the same path with the same inode, would
+    /// otherwise read as replaced: hidden from `kache targets` and forgotten
+    /// by cleanup. A replaced directory gets a new inode and stays replaced.
+    /// The row is updated too, unless the store is read-only.
+    fn renumbered_device(
+        &self,
+        path: &Path,
+        recorded: crate::filesystem::PathIdentity,
+    ) -> crate::filesystem::PathIdentity {
+        let Some(now) = crate::filesystem::directory_identity(path) else {
+            return recorded;
+        };
+        if !crate::filesystem::renumbered(recorded, now) {
+            return recorded;
+        }
+        if !self.read_only
+            && let Err(error) = self.db.execute(
+                "UPDATE target_roots SET device = ?1
+                 WHERE path = ?2 AND device = ?3 AND inode = ?4",
+                params![
+                    now.device.to_string(),
+                    path.to_string_lossy(),
+                    recorded.device.to_string(),
+                    recorded.inode.to_string(),
+                ],
+            )
+        {
+            tracing::debug!(
+                "could not record the new device of target root {}: {error:#}",
+                path.display()
+            );
+        }
+        now
     }
 
     pub fn forget_target_root(&self, path: &Path) -> Result<()> {

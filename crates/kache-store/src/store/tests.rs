@@ -4742,6 +4742,65 @@ fn discovered_target_remains_unbuilt_until_a_real_build_uses_it() {
 }
 
 #[test]
+fn a_target_root_keeps_its_row_when_its_volume_is_renumbered() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let store = Store::open(&config).unwrap();
+    let workspace = dir.path().join("workspace");
+    let target = workspace.join("target");
+    std::fs::create_dir_all(target.join("debug")).unwrap();
+    std::fs::write(
+        target.join("CACHEDIR.TAG"),
+        "Signature: 8a477f597d28d172789f06886806bc55",
+    )
+    .unwrap();
+    store.remember_target_root(&target, &workspace).unwrap();
+    let now = crate::filesystem::directory_identity(&target).unwrap();
+    let path = std::path::absolute(&target).unwrap();
+    let set_device = |device: u64| {
+        store
+            .db
+            .execute(
+                "UPDATE target_roots SET device = ?1 WHERE path = ?2",
+                rusqlite::params![device.to_string(), path.to_string_lossy()],
+            )
+            .unwrap();
+    };
+    let stored_device = || -> String {
+        store
+            .db
+            .query_row(
+                "SELECT device FROM target_roots WHERE path = ?1",
+                rusqlite::params![path.to_string_lossy()],
+                |row| row.get(0),
+            )
+            .unwrap()
+    };
+
+    // After a restart the volume has another device number; the inode is the
+    // directory's own and stays.
+    set_device(now.device + 3);
+    assert_eq!(store.tracked_target_roots(0).unwrap()[0].identity, now);
+    assert_eq!(stored_device(), now.device.to_string(), "the row is healed");
+
+    // A replaced directory has a new inode and still reads as replaced.
+    store
+        .db
+        .execute(
+            "UPDATE target_roots SET device = ?1, inode = ?2 WHERE path = ?3",
+            rusqlite::params![
+                (now.device + 3).to_string(),
+                (now.inode + 1).to_string(),
+                path.to_string_lossy()
+            ],
+        )
+        .unwrap();
+    let read = store.tracked_target_roots(0).unwrap()[0].identity;
+    assert_ne!(read, now);
+    assert_eq!(read.inode, now.inode + 1);
+}
+
+#[test]
 fn a_target_root_records_the_compiler_that_built_into_it() {
     let dir = tempfile::tempdir().unwrap();
     let config = test_config(dir.path());

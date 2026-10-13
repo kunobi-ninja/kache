@@ -4586,6 +4586,16 @@ fn builds_plan(preview: bool, selected: usize) -> bool {
     preview || selected == 0
 }
 
+/// The tracked selection a clean builds its plan for, if it builds one: a
+/// scan of a named directory has none.
+fn plan_selection(
+    selection: Option<TrackedSelection>,
+    preview: bool,
+    selected: usize,
+) -> Option<TrackedSelection> {
+    selection.filter(|_| builds_plan(preview, selected))
+}
+
 /// Whether that view is printed as text: `--dry-run`, or a clean with
 /// nothing to remove. JSON prints the same plan; otherwise the selector runs.
 fn prints_plan(json: bool, dry_run: bool, selected: usize) -> bool {
@@ -4988,13 +4998,12 @@ pub fn clean(
     // Sort by size descending
     targets.sort_by_key(|entry| std::cmp::Reverse(entry.size));
 
-    let plan = match selection {
-        Some(selection) if builds_plan(preview, targets.len()) => {
+    let plan = plan_selection(selection, preview, targets.len())
+        .map(|selection| {
             let now = kache_store::markers::now_epoch_secs() as i64;
-            Some(TrackedPlan::new(config, selection, &targets, preview, now)?)
-        }
-        _ => None,
-    };
+            TrackedPlan::new(config, selection, &targets, preview, now)
+        })
+        .transpose()?;
     if let Some(plan) = plan
         .as_ref()
         .filter(|_| prints_plan(json, dry_run, targets.len()))

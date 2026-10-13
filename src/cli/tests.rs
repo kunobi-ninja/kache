@@ -7931,6 +7931,19 @@ fn a_tracked_clean_reads_every_target_only_when_it_shows_them() {
         "a clean with work opens the selector"
     );
     assert!(!prints_plan(true, true, 0), "JSON never prints text");
+    let stale = TrackedSelection::StaleOrOrphaned(DEFAULT_TRACKED_STALE_HOURS);
+    assert_eq!(plan_selection(Some(stale), false, 0), Some(stale));
+    assert_eq!(plan_selection(Some(stale), true, 3), Some(stale));
+    assert_eq!(
+        plan_selection(Some(stale), false, 3),
+        None,
+        "`--yes` with work reports what it removed, not every target"
+    );
+    assert_eq!(
+        plan_selection(None, true, 0),
+        None,
+        "a named directory has no plan"
+    );
 }
 
 #[test]

@@ -126,6 +126,7 @@ fn test_config() -> Config {
         auto_share_target_files: false,
         auto_clean_idle_targets_days: 0,
         auto_recover_min_free_bytes: 0,
+        auto_recover_targets: false,
         scheduler_memory_pressure: true,
         auto_clean_unused_units_days: 0,
         target_liveness: false,

@@ -413,15 +413,48 @@ fn target_cleanup_defaults_and_env_precedence() {
     let _orphans = NamedEnvGuard::remove("KACHE_AUTO_CLEAN_ORPHANED_TARGETS");
     let _idle = NamedEnvGuard::remove("KACHE_AUTO_CLEAN_IDLE_TARGETS_DAYS");
     let _floor = NamedEnvGuard::remove("KACHE_AUTO_RECOVER_MIN_FREE_BYTES");
+    let _recover_targets = NamedEnvGuard::remove("KACHE_AUTO_RECOVER_TARGETS");
     let _units = NamedEnvGuard::remove("KACHE_AUTO_CLEAN_UNUSED_UNITS_DAYS");
+    // The default differs in CI, which this suite may itself run in.
+    let _ci = NamedEnvGuard::remove("CI");
+    let _gha = NamedEnvGuard::remove("GITHUB_ACTIONS");
+    let _gitlab = NamedEnvGuard::remove("GITLAB_CI");
 
     let config = Config::load().unwrap();
     assert!(config.auto_clean_orphaned_targets);
     assert_eq!(config.auto_clean_idle_targets_days, 0);
     assert_eq!(
-        config.auto_recover_min_free_bytes, 0,
-        "free-space recovery is opt-in"
+        config.auto_recover_min_free_bytes, DEFAULT_RECOVERY_FLOOR,
+        "builds evict cache entries below 10 GiB free"
     );
+    assert!(
+        !config.auto_recover_targets,
+        "removing targets to recover space is opt-in"
+    );
+    {
+        let _in_ci = NamedEnvGuard::set("GITHUB_ACTIONS", "true");
+        assert_eq!(
+            Config::load().unwrap().auto_recover_min_free_bytes,
+            0,
+            "a CI runner's disk lasts one job"
+        );
+    }
+
+    std::fs::write(
+        &config_path,
+        "[cache]\nauto_recover_min_free_bytes = 0\nauto_recover_targets = true\n",
+    )
+    .unwrap();
+    let config = Config::load().unwrap();
+    assert_eq!(
+        config.auto_recover_min_free_bytes, 0,
+        "0 turns recovery off"
+    );
+    assert!(config.auto_recover_targets);
+    for (value, on) in [("1", true), ("TRUE", true), ("0", false), ("yes", false)] {
+        let _env = NamedEnvGuard::set("KACHE_AUTO_RECOVER_TARGETS", value);
+        assert_eq!(Config::load().unwrap().auto_recover_targets, on, "{value}");
+    }
 
     std::fs::write(
         &config_path,
@@ -2415,6 +2448,7 @@ fn test_file_config_roundtrip() {
             auto_share_target_files: None,
             auto_clean_idle_targets_days: None,
             auto_recover_min_free_bytes: None,
+            auto_recover_targets: None,
             scheduler_memory_pressure: None,
             auto_clean_unused_units_days: None,
             seed_new_targets: None,
@@ -2960,6 +2994,7 @@ fn test_config_store_dir() {
         auto_share_target_files: true,
         auto_clean_idle_targets_days: 0,
         auto_recover_min_free_bytes: 0,
+        auto_recover_targets: false,
         scheduler_memory_pressure: true,
         auto_clean_unused_units_days: 0,
         seed_new_targets: false,
@@ -3039,6 +3074,7 @@ fn test_config_index_db_path() {
         auto_share_target_files: true,
         auto_clean_idle_targets_days: 0,
         auto_recover_min_free_bytes: 0,
+        auto_recover_targets: false,
         scheduler_memory_pressure: true,
         auto_clean_unused_units_days: 0,
         seed_new_targets: false,
@@ -3114,6 +3150,7 @@ fn test_config_event_log_path() {
         auto_share_target_files: true,
         auto_clean_idle_targets_days: 0,
         auto_recover_min_free_bytes: 0,
+        auto_recover_targets: false,
         scheduler_memory_pressure: true,
         auto_clean_unused_units_days: 0,
         seed_new_targets: false,
@@ -3208,6 +3245,7 @@ fn test_config_socket_path() {
         auto_share_target_files: true,
         auto_clean_idle_targets_days: 0,
         auto_recover_min_free_bytes: 0,
+        auto_recover_targets: false,
         scheduler_memory_pressure: true,
         auto_clean_unused_units_days: 0,
         seed_new_targets: false,
@@ -3938,6 +3976,7 @@ fn test_save_and_load_file_config() {
             auto_share_target_files: None,
             auto_clean_idle_targets_days: None,
             auto_recover_min_free_bytes: None,
+            auto_recover_targets: None,
             scheduler_memory_pressure: None,
             auto_clean_unused_units_days: None,
             seed_new_targets: None,

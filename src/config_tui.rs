@@ -2139,6 +2139,7 @@ mod tests {
                 auto_share_target_files: None,
                 auto_clean_idle_targets_days: None,
                 auto_recover_min_free_bytes: None,
+                auto_recover_targets: None,
                 scheduler_memory_pressure: None,
                 auto_clean_unused_units_days: None,
                 target_liveness: None,

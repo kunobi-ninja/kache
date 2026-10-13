@@ -693,23 +693,26 @@ fn the_volume_row_says_what_is_free_and_whether_recovery_is_on() {
         free: free * gib,
     };
     assert_eq!(
-        row_text(volume_row(&VolumeView::new(usage(2), 0))),
+        row_text(volume_row(&VolumeView::new(usage(2), 0, true))),
         "Volume | 2.0 GiB free | of 100.0 GiB · 98% used · free-space recovery off"
     );
-    let below = VolumeView::new(usage(2), 10 * gib);
+    let below = VolumeView::new(usage(2), 10 * gib, false);
     assert!(below.below_floor);
     assert_eq!(
         row_text(volume_row(&below)),
-        "Volume | 2.0 GiB free | of 100.0 GiB · 98% used · below the 10.0 GiB recovery floor"
+        "Volume | 2.0 GiB free | of 100.0 GiB · 98% used · below the 10.0 GiB recovery floor · cache only"
     );
-    let above = VolumeView::new(usage(40), 10 * gib);
+    let above = VolumeView::new(usage(40), 10 * gib, true);
     assert!(!above.below_floor);
     assert!(
-        row_text(volume_row(&above)).ends_with("60% used · recovery keeps 10.0 GiB free"),
+        row_text(volume_row(&above))
+            .ends_with("60% used · recovery keeps 10.0 GiB free · cache and idle targets"),
         "{above:?}"
     );
-    // An unset floor is never "below".
-    assert!(!VolumeView::new(usage(0), 0).below_floor);
+    // An unset floor is never "below", and recovers nothing.
+    let off = VolumeView::new(usage(0), 0, true);
+    assert!(!off.below_floor);
+    assert!(!off.recovers_targets);
 }
 
 #[test]
@@ -3642,6 +3645,7 @@ fn save_manifest_config(
         auto_share_target_files: false,
         auto_clean_idle_targets_days: 0,
         auto_recover_min_free_bytes: 0,
+        auto_recover_targets: false,
         scheduler_memory_pressure: true,
         auto_clean_unused_units_days: 0,
         target_liveness: false,
@@ -7385,6 +7389,7 @@ fn target_rows_report_each_worktree_and_sort_by_what_frees_most() {
         let mut pressure = config.clone();
         pressure.auto_recover_min_free_bytes =
             kache_fs::volume_usage(&targets[0].1).unwrap().total - 1;
+        pressure.auto_recover_targets = true;
         let empty_workspace = dir.path().join("wt/empty");
         let empty_target = dir.path().join("targets/empty");
         std::fs::create_dir_all(&empty_workspace).unwrap();
@@ -8652,4 +8657,36 @@ fn unit_cleanup_confirmation_requires_candidates_and_nonpreview_mode() {
             "preview={preview} units={units}"
         );
     }
+}
+
+#[test]
+fn init_adds_target_recovery_without_rewriting_the_config() {
+    assert_eq!(
+        enable_target_recovery("").as_deref(),
+        Some("[cache]\nauto_recover_targets = true\n")
+    );
+    let commented = "# my settings\n[cache]\nlocal_max_size = \"50G\" # keep\n";
+    assert_eq!(
+        enable_target_recovery(commented).as_deref(),
+        Some(
+            "# my settings\n[cache]\nauto_recover_targets = true\nlocal_max_size = \"50G\" # keep\n"
+        )
+    );
+    assert_eq!(
+        enable_target_recovery("[remote]\nbucket = \"b\"").as_deref(),
+        Some("[remote]\nbucket = \"b\"\n\n[cache]\nauto_recover_targets = true\n")
+    );
+    // A table spelled another way is not edited blind.
+    assert_eq!(
+        enable_target_recovery("cache.local_max_size = \"5G\"\n"),
+        None
+    );
+    assert_eq!(enable_target_recovery("[cache] # mine\n"), None);
+
+    assert!(!sets_target_recovery(""));
+    assert!(!sets_target_recovery("[cache]\nlocal_max_size = \"5G\"\n"));
+    assert!(sets_target_recovery(
+        "[cache]\nauto_recover_targets = false\n"
+    ));
+    assert!(sets_target_recovery("cache.auto_recover_targets = true\n"));
 }

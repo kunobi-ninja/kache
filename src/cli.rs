@@ -762,23 +762,32 @@ pub(crate) struct VolumeView {
     recovery_floor_bytes: u64,
     /// Free space is below a recovery floor that is set.
     below_floor: bool,
+    /// Recovery also removes idle target directories
+    /// (`cache.auto_recover_targets`), not only cache entries.
+    recovers_targets: bool,
 }
 
 impl VolumeView {
-    fn new(usage: kache_fs::VolumeUsage, floor: u64) -> Self {
+    fn new(usage: kache_fs::VolumeUsage, floor: u64, targets: bool) -> Self {
         Self {
             total_bytes: usage.total,
             free_bytes: usage.free,
             recovery_floor_bytes: floor,
             below_floor: floor > 0 && usage.free < floor,
+            recovers_targets: floor > 0 && targets,
         }
     }
 }
 
 /// The cache volume, `None` where its usage cannot be read (not Unix).
 fn volume_view(config: &Config) -> Option<VolumeView> {
-    kache_fs::volume_usage(&config.cache_dir)
-        .map(|usage| VolumeView::new(usage, config.auto_recover_min_free_bytes))
+    kache_fs::volume_usage(&config.cache_dir).map(|usage| {
+        VolumeView::new(
+            usage,
+            config.auto_recover_min_free_bytes,
+            config.auto_recover_targets,
+        )
+    })
 }
 
 fn volume_row(volume: &VolumeView) -> StatsRow {
@@ -788,16 +797,21 @@ fn volume_row(volume: &VolumeView) -> StatsRow {
     } else {
         (used as u128 * 100 / volume.total_bytes as u128) as u64
     };
+    let scope = if volume.recovers_targets {
+        "cache and idle targets"
+    } else {
+        "cache only"
+    };
     let recovery = if volume.recovery_floor_bytes == 0 {
         "free-space recovery off".to_string()
     } else if volume.below_floor {
         format!(
-            "below the {} recovery floor",
+            "below the {} recovery floor · {scope}",
             term::bytes(volume.recovery_floor_bytes)
         )
     } else {
         format!(
-            "recovery keeps {} free",
+            "recovery keeps {} free · {scope}",
             term::bytes(volume.recovery_floor_bytes)
         )
     };
@@ -9565,6 +9579,102 @@ fn setup_steps(
     Ok(steps)
 }
 
+/// `init`'s offer to let free-space recovery remove idle target directories
+/// too, not only cache entries. Only a person at a terminal is asked;
+/// `--yes`, `--check` and a script leave the default, cache only. A config
+/// file that already sets `auto_recover_targets` is left as it is.
+fn offer_target_recovery(yes: bool, check: bool) -> Result<()> {
+    let floor = crate::config::Config::load()
+        .map_or(crate::config::DEFAULT_RECOVERY_FLOOR, |config| {
+            config.auto_recover_min_free_bytes
+        });
+    if floor == 0 {
+        return Ok(());
+    }
+    let path = crate::config::user_config_path();
+    let existing = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error).context("read Kache configuration"),
+    };
+    if sets_target_recovery(&existing) {
+        return Ok(());
+    }
+    let floor = term::bytes(floor);
+    if yes || check || !std::io::stdin().is_terminal() {
+        println!(
+            "  • Free-space recovery: cache entries below {floor} free; `auto_recover_targets = true` adds idle targets"
+        );
+        return Ok(());
+    }
+    let question =
+        format!("Below {floor} free, also remove target directories no build used for a day?");
+    if !prompt_yes_no(&question, false, false)? {
+        println!("  • Free-space recovery: cache entries only");
+        return Ok(());
+    }
+    match enable_target_recovery(&existing) {
+        Some(updated) => {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&path, updated).context("save Kache configuration")?;
+            println!(
+                "  ✓ Free-space recovery: cache entries and idle targets ({})",
+                term::home_path(&path)
+            );
+        }
+        None => println!(
+            "  → Free-space recovery: add `auto_recover_targets = true` under [cache] in {}",
+            term::home_path(&path)
+        ),
+    }
+    Ok(())
+}
+
+/// Whether `text` sets `auto_recover_targets` in its `[cache]` table, either
+/// way: then the choice is already made.
+fn sets_target_recovery(text: &str) -> bool {
+    toml::from_str::<toml::Value>(text).is_ok_and(|value| {
+        value
+            .get("cache")
+            .and_then(|cache| cache.get("auto_recover_targets"))
+            .is_some()
+    })
+}
+
+/// `text` with `[cache] auto_recover_targets = true` added and everything
+/// else kept as written: under an existing `[cache]` header, or in a new
+/// table at the end. `None` when the result would not parse to exactly that,
+/// as when the table is spelled some other way.
+fn enable_target_recovery(text: &str) -> Option<String> {
+    const LINE: &str = "auto_recover_targets = true";
+    let updated = match text.lines().position(|line| line.trim() == "[cache]") {
+        Some(header) => {
+            let mut lines: Vec<&str> = text.lines().collect();
+            lines.insert(header + 1, LINE);
+            let mut updated = lines.join("\n");
+            if text.ends_with('\n') {
+                updated.push('\n');
+            }
+            updated
+        }
+        None => {
+            let mut updated = text.to_string();
+            if !updated.is_empty() {
+                if !updated.ends_with('\n') {
+                    updated.push('\n');
+                }
+                updated.push('\n');
+            }
+            updated.push_str(&format!("[cache]\n{LINE}\n"));
+            updated
+        }
+    };
+    let parsed: toml::Value = toml::from_str(&updated).ok()?;
+    (parsed.get("cache")?.get("auto_recover_targets")?.as_bool() == Some(true)).then_some(updated)
+}
+
 pub fn init(yes: bool, no_service: bool, no_shell: bool, check: bool) -> Result<()> {
     println!("{}\n", term::heading("kache · setup"));
     if check {
@@ -9697,6 +9807,8 @@ pub fn init(yes: bool, no_service: bool, no_shell: bool, check: bool) -> Result<
         let _ = no_shell;
         (false, false)
     };
+
+    offer_target_recovery(yes, check)?;
 
     // ── Step 2: daemon service ───────────────────────────────────
     let service_path = crate::service::service_file_path();

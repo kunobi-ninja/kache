@@ -24,7 +24,8 @@
 //! and its idle time is unknown. Target-file sharing
 //! ([`crate::target_dedup`]) still replaces copies of stored blobs in it.
 //!
-//! With `[cache] auto_recover_min_free_bytes` set, a volume below that floor
+//! With `[cache] auto_recover_targets` on, a volume below the free-space floor
+//! (`auto_recover_min_free_bytes`)
 //! first loses the units no build used for a day, from every target on it;
 //! only then do whole targets idle for a day go, largest first, until the
 //! volume is back above the floor. [`plan`] reports what the next pass would
@@ -141,7 +142,7 @@ pub(crate) fn due(
     let enabled = config.auto_clean_orphaned_targets
         || config.auto_clean_idle_targets_days > 0
         || config.auto_clean_unused_units_days > 0
-        || config.auto_recover_min_free_bytes > 0;
+        || recovers_free_space(config);
     enabled
         && matches!(trigger, Trigger::Periodic(_))
         && waited(last, now)
@@ -450,10 +451,10 @@ fn unit_plan_window(
 /// Whether `tracked` is a recorded target on a local volume below the
 /// configured free-space floor.
 fn under_pressure(config: &Config, tracked: &TrackedTargetRoot) -> bool {
-    let floor = config.auto_recover_min_free_bytes;
-    if floor == 0 {
+    if !recovers_free_space(config) {
         return false;
     }
+    let floor = config.auto_recover_min_free_bytes;
     let Some(true) = crate::cache_fs::probe(&tracked.path).is_local else {
         return false;
     };
@@ -563,15 +564,16 @@ fn watch_counts(is_local: Option<bool>) -> bool {
     is_local == Some(true)
 }
 
-/// Whether discovered targets are watched at all: only the idle rule and the
-/// free-space floor read the watch, and both are off by default.
+/// Whether discovered targets are watched at all: only the idle rule and
+/// target recovery read the watch, and both are off by default.
 fn watches_discovered(config: &Config) -> bool {
     config.auto_clean_idle_targets_days > 0 || recovers_free_space(config)
 }
 
-/// Whether a free-space floor is set.
+/// Whether free-space recovery may remove targets: a floor is set and
+/// `auto_recover_targets` is on. The floor alone only evicts cache entries.
 fn recovers_free_space(config: &Config) -> bool {
-    config.auto_recover_min_free_bytes > 0
+    config.auto_recover_targets && config.auto_recover_min_free_bytes > 0
 }
 
 /// Whether to watch a discovered target: it is still the recorded target
@@ -629,10 +631,10 @@ fn recover_under_pressure(
     used: &std::collections::HashSet<PathBuf>,
     swept: &mut Swept,
 ) -> anyhow::Result<()> {
-    let floor = config.auto_recover_min_free_bytes;
-    if floor == 0 {
+    if !recovers_free_space(config) {
         return Ok(());
     }
+    let floor = config.auto_recover_min_free_bytes;
     let mut candidates = Vec::new();
     for tracked in store.tracked_target_roots(0)? {
         let since = unused.get(&tracked.path).copied().flatten();
@@ -1052,6 +1054,7 @@ mod tests {
         let current = old_unit(&live, "fedcba9876543210");
         let now = unix_now_secs();
         pressure.auto_recover_min_free_bytes = kache_fs::volume_usage(&live).unwrap().total - 1;
+        pressure.auto_recover_targets = true;
         // The first pass arms the target and prunes nothing.
         assert_eq!(
             sweep(&pressure, now - 2 * DAY_SECS).unwrap(),
@@ -1084,6 +1087,7 @@ mod tests {
         // Above the floor, nothing is pruned.
         let stale = old_unit(&live, "0123456789abcdef");
         pressure.auto_recover_min_free_bytes = 1;
+        pressure.auto_recover_targets = true;
         assert_eq!(
             sweep(&pressure, now + 2 * DAY_SECS).unwrap(),
             Swept::default()
@@ -1091,6 +1095,7 @@ mod tests {
         assert!(stale.exists());
         // Nor from a directory that is no longer the recorded target.
         pressure.auto_recover_min_free_bytes = kache_fs::volume_usage(&live).unwrap().total - 1;
+        pressure.auto_recover_targets = true;
         let tracked = root_of(&store, &live);
         // `current` was armed again by the last prune and not read since.
         assert_eq!(plan(&pressure, &tracked, now + 2 * DAY_SECS).units.units, 2);
@@ -1133,6 +1138,7 @@ mod tests {
 
         policy.auto_clean_idle_targets_days = 0;
         policy.auto_recover_min_free_bytes = kache_fs::volume_usage(&live).unwrap().total - 1;
+        policy.auto_recover_targets = true;
         assert_eq!(plan(&policy, &tracked, now).remove, None, "used today");
         assert_eq!(
             plan(&policy, &tracked, now + 2 * DAY_SECS).remove,
@@ -1195,6 +1201,7 @@ mod tests {
         assert!(due(&idle_only, periodic, Some(0), 0, now));
         let mut pressure_only = off.clone();
         pressure_only.auto_recover_min_free_bytes = 1;
+        pressure_only.auto_recover_targets = true;
         assert!(due(&pressure_only, periodic, Some(0), 0, now));
         assert!(!due(&off, periodic, Some(0), 0, now));
         assert!(!due(&on, Trigger::Shutdown, Some(0), 0, now));
@@ -1300,6 +1307,7 @@ mod tests {
             .unwrap();
         let later = unix_now_secs() + 2 * DAY_SECS;
         idle.auto_recover_min_free_bytes = kache_fs::volume_usage(&target).unwrap().total - 1;
+        idle.auto_recover_targets = true;
         assert!(sweep(&idle, later).unwrap().removed.is_empty());
         assert!(target.exists());
         assert!(store.tracked_target_roots(0).unwrap()[0].discovered);
@@ -1359,6 +1367,13 @@ mod tests {
         policy.auto_clean_unused_units_days = 30;
         assert!(!watches_discovered(&policy), "off by default");
         assert!(!recovers_free_space(&policy));
+        // The default floor only evicts cache entries: no watch, no removal.
+        policy.auto_recover_min_free_bytes = crate::config::DEFAULT_RECOVERY_FLOOR;
+        assert!(!watches_discovered(&policy), "the floor alone");
+        assert!(!recovers_free_space(&policy));
+        policy.auto_recover_min_free_bytes = 0;
+        policy.auto_recover_targets = true;
+        assert!(!recovers_free_space(&policy), "targets on, no floor");
         policy.auto_recover_min_free_bytes = 1;
         assert!(watches_discovered(&policy), "the free-space floor");
         assert!(recovers_free_space(&policy));
@@ -1499,6 +1514,7 @@ mod tests {
             return;
         }
         policy.auto_recover_min_free_bytes = 1;
+        policy.auto_recover_targets = true;
         assert!(sweep(&policy, now).unwrap().removed.is_empty());
         assert!(profile.join(".cargo-lock").exists());
         assert_eq!(idle_secs(&policy, &tracked, now as i64), Some(0));
@@ -1565,6 +1581,7 @@ mod tests {
         let target = discovered_with_unit(&store, root.path(), "pressed");
         std::fs::write(target.join("debug/artifact"), vec![7; 64 * 1024]).unwrap();
         policy.auto_recover_min_free_bytes = kache_fs::volume_usage(&target).unwrap().total - 1;
+        policy.auto_recover_targets = true;
         let now = unix_now_secs();
 
         // Watched first; its units are never pruned on their own.
@@ -1606,6 +1623,7 @@ mod tests {
         let [unused, used] = [&targets[0], &targets[1]];
         age(&store, 2 * DAY_SECS);
         policy.auto_recover_min_free_bytes = kache_fs::volume_usage(unused).unwrap().total - 1;
+        policy.auto_recover_targets = true;
         let now = unix_now_secs();
 
         // Never armed: `last_seen` alone does not show the target went unused.
@@ -1666,6 +1684,7 @@ mod tests {
         std::fs::write(target.join("debug/artifact"), vec![7; 64 * 1024]).unwrap();
         assert!(crate::cli::target_reclaimable_bytes(&target) > 0);
         pressure.auto_recover_min_free_bytes = kache_fs::volume_usage(&target).unwrap().total - 1;
+        pressure.auto_recover_targets = true;
         let later = unix_now_secs() + 2 * DAY_SECS;
         let lock = std::fs::File::create(target.join("debug/.cargo-lock")).unwrap();
         lock.lock().unwrap();
@@ -1688,10 +1707,13 @@ mod tests {
         assert!(pressure_eligible(&pressure, &tracked, exact_day));
         let total = kache_fs::volume_usage(&target).unwrap().total;
         pressure.auto_recover_min_free_bytes = total + 1;
+        pressure.auto_recover_targets = true;
         assert!(!pressure_eligible(&pressure, &tracked, later as i64));
         pressure.auto_recover_min_free_bytes = total;
+        pressure.auto_recover_targets = true;
         assert!(pressure_eligible(&pressure, &tracked, later as i64));
         pressure.auto_recover_min_free_bytes = total - 1;
+        pressure.auto_recover_targets = true;
         let mut swept = Swept::default();
         for _ in 0..200 {
             swept = sweep(&pressure, later).unwrap();
@@ -1819,6 +1841,7 @@ mod tests {
         let (_, target) = tracked_target(&store, root.path(), "idle");
         std::fs::write(target.join("debug/artifact"), vec![7; 64 * 1024]).unwrap();
         pressure.auto_recover_min_free_bytes = kache_fs::volume_usage(&target).unwrap().total - 1;
+        pressure.auto_recover_targets = true;
         refuse_registry_writes(&store);
         let swept = sweep(&pressure, unix_now_secs() + 2 * DAY_SECS).unwrap();
         assert_eq!(swept.removed, vec![(target.clone(), Reason::Pressure)]);
@@ -1973,6 +1996,7 @@ mod tests {
         let (workspace, target) = tracked_target(&store, root.path(), "pressed");
         std::fs::write(target.join("debug/artifact"), vec![7; 64 * 1024]).unwrap();
         pressure.auto_recover_min_free_bytes = kache_fs::volume_usage(&target).unwrap().total - 1;
+        pressure.auto_recover_targets = true;
         WHILE_DELETING.set(Some(rebuild(&pressure, &workspace, &target)));
         let swept = sweep(&pressure, unix_now_secs() + 2 * DAY_SECS).unwrap();
         assert_eq!(swept.removed, vec![(target.clone(), Reason::Pressure)]);

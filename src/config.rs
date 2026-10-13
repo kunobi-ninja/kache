@@ -124,6 +124,18 @@ pub(crate) const DEFAULT_EVENT_LOG_MAX_SIZE: u64 = 64 * 1024 * 1024;
 /// Default for [`Config::auto_clean_unused_units_days`].
 pub(crate) const DEFAULT_UNUSED_UNITS_DAYS: u64 = 30;
 
+/// The free-space floor below which builds evict cache entries, unless
+/// `cache.auto_recover_min_free_bytes` says otherwise.
+pub(crate) const DEFAULT_RECOVERY_FLOOR: u64 = 10 << 30;
+
+/// The floor when none is configured: [`DEFAULT_RECOVERY_FLOOR`], or none in
+/// CI. A runner's disk lasts one job, and a CI cache keeps entries this job
+/// did not use for the next one, so evicting them would cost later jobs hits
+/// to free space the runner is about to discard.
+pub(crate) fn default_recovery_floor(in_ci: bool) -> u64 {
+    if in_ci { 0 } else { DEFAULT_RECOVERY_FLOOR }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub cache_dir: PathBuf,
@@ -512,12 +524,20 @@ pub struct Config {
     /// `KACHE_AUTO_CLEAN_IDLE_TARGETS_DAYS` or `[cache]
     /// auto_clean_idle_targets_days`.
     pub auto_clean_idle_targets_days: u64,
-    /// Minimum free bytes on a store or target volume. During builds, auto-GC
-    /// reclaims eligible store entries; quiet target cleanup removes units
-    /// unused for a day, then targets idle for a day. Default `0`, disabled.
-    /// Set via `KACHE_AUTO_RECOVER_MIN_FREE_BYTES` or `[cache]
+    /// Minimum free bytes on the store's volume. Below it, builds have
+    /// auto-GC evict eligible store entries. With
+    /// [`Config::auto_recover_targets`] on, quiet target cleanup also removes
+    /// units unused for a day, then targets idle for a day, on a volume below
+    /// it. Default 10 GiB; `0` disables. Set via
+    /// `KACHE_AUTO_RECOVER_MIN_FREE_BYTES` or `[cache]
     /// auto_recover_min_free_bytes`.
     pub auto_recover_min_free_bytes: u64,
+    /// Let free-space recovery also remove idle target directories, not only
+    /// cache entries. Off by default: it deletes build output in worktrees,
+    /// some of which no build through Kache has used. Set via
+    /// `KACHE_AUTO_RECOVER_TARGETS=1`/`=true` or `[cache]
+    /// auto_recover_targets = true`; `kache init` offers it.
+    pub auto_recover_targets: bool,
     /// Under memory pressure, admit a compile only when no other compile
     /// holds a scheduler slot. On by default. Set via
     /// `KACHE_SCHEDULER_MEMORY_PRESSURE=0`/`=false` or `[cache]
@@ -898,6 +918,8 @@ pub(crate) struct CacheFileConfig {
     pub(crate) auto_clean_idle_targets_days: Option<u64>,
     /// See [`Config::auto_recover_min_free_bytes`].
     pub(crate) auto_recover_min_free_bytes: Option<u64>,
+    /// See [`Config::auto_recover_targets`].
+    pub(crate) auto_recover_targets: Option<bool>,
     /// See [`Config::scheduler_memory_pressure`].
     pub(crate) scheduler_memory_pressure: Option<bool>,
     /// See [`Config::auto_clean_unused_units_days`].
@@ -1325,6 +1347,7 @@ const IGNORE_ENV_GATED_VARS: &[&str] = &[
     "KACHE_AUTO_SHARE_TARGET_FILES",
     "KACHE_AUTO_CLEAN_IDLE_TARGETS_DAYS",
     "KACHE_AUTO_RECOVER_MIN_FREE_BYTES",
+    "KACHE_AUTO_RECOVER_TARGETS",
     "KACHE_SCHEDULER_MEMORY_PRESSURE",
     "KACHE_AUTO_CLEAN_UNUSED_UNITS_DAYS",
     "KACHE_SEED_NEW_TARGETS",
@@ -1439,6 +1462,7 @@ const ENV_FILE_KEYS: &[(&str, &str)] = &[
         "KACHE_AUTO_RECOVER_MIN_FREE_BYTES",
         "cache.auto_recover_min_free_bytes",
     ),
+    ("KACHE_AUTO_RECOVER_TARGETS", "cache.auto_recover_targets"),
     (
         "KACHE_SCHEDULER_MEMORY_PRESSURE",
         "cache.scheduler_memory_pressure",
@@ -2026,6 +2050,7 @@ impl Config {
         let auto_share_target_files = Self::auto_share_target_files_enabled(&file_config);
         let auto_clean_idle_targets_days = Self::auto_clean_idle_targets_days(&file_config);
         let auto_recover_min_free_bytes = Self::auto_recover_min_free_bytes(&file_config);
+        let auto_recover_targets = Self::auto_recover_targets_enabled(&file_config);
         let scheduler_memory_pressure = Self::scheduler_memory_pressure_enabled(&file_config);
         let auto_clean_unused_units_days = Self::auto_clean_unused_units_days(&file_config);
         let seed_new_targets = Self::seed_new_targets_enabled(&file_config);
@@ -2134,6 +2159,7 @@ impl Config {
             auto_share_target_files,
             auto_clean_idle_targets_days,
             auto_recover_min_free_bytes,
+            auto_recover_targets,
             scheduler_memory_pressure,
             auto_clean_unused_units_days,
             seed_new_targets,
@@ -2887,7 +2913,27 @@ impl Config {
                     .and_then(|c| c.cache.as_ref())
                     .and_then(|c| c.auto_recover_min_free_bytes)
             })
-            .unwrap_or(0)
+            .unwrap_or_else(|| {
+                default_recovery_floor(crate::policy::running_in_ci_with(|name| {
+                    std::env::var(name).ok()
+                }))
+            })
+    }
+
+    /// Target removal under the free-space floor, off by default.
+    /// `KACHE_AUTO_RECOVER_TARGETS=1`/`=true` (env wins), else `[cache]
+    /// auto_recover_targets`, else off.
+    fn auto_recover_targets_enabled(file_config: &Result<FileConfig>) -> bool {
+        let ignore_env = Self::ignore_env_enabled(file_config);
+        if let Ok(v) = env_or_ignored("KACHE_AUTO_RECOVER_TARGETS", ignore_env) {
+            return v == "1" || v.eq_ignore_ascii_case("true");
+        }
+        file_config
+            .as_ref()
+            .ok()
+            .and_then(|c| c.cache.as_ref())
+            .and_then(|c| c.auto_recover_targets)
+            .unwrap_or(false)
     }
 
     /// Preserve externally retained entries by default. The opt-in restores
@@ -3933,6 +3979,15 @@ pub(crate) fn resolve_config_path() -> PathBuf {
 #[cfg(test)]
 pub(crate) fn config_file_fingerprint() -> String {
     ConfigFileProvenance::current().fingerprint
+}
+
+/// The user's own config file: `KACHE_CONFIG`, else the user config. Never a
+/// project's `.kache.toml`, for settings that belong to the machine.
+pub(crate) fn user_config_path() -> PathBuf {
+    resolve_config_path_from(
+        std::env::var("KACHE_CONFIG").ok().map(|s| shellexpand(&s)),
+        None,
+    )
 }
 
 fn resolve_config_path_from(

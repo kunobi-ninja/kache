@@ -42,7 +42,6 @@ These are for CI, scripts and integrations, and are not listed by `kache --help`
 | `report` | Same report as `kache stats --full`, kept for scripts |
 | `gc`, `purge`, `targets` | What `kache clean` does now (`targets` lists what `kache clean --dry-run` shows), kept for scripts |
 | `targets share` | Find target files that duplicate stored blobs; `--apply` replaces them with clones. See [Sharing target files](#sharing-target-files) |
-| `targets discover` | Find target directories in the Git worktrees of known repositories now, rather than on the daemon's next quiet pass. See [Target directory cleanup](/docs/getting-started/configuration#target-directory-cleanup) |
 | `install-shims` | What `kache init --shims` does, kept for scripts |
 | `diff` | Misses and the share of unexplained misses in the latest build against the one before; exits 1 when either grew. Kept for scripts |
 | `why-miss` | The earlier name of `kache explain` |

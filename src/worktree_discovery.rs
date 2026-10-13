@@ -1,13 +1,15 @@
 //! Find Cargo targets in the Git worktrees of repositories kache knows.
 //!
-//! This runs during quiet daemon maintenance and on `kache targets
-//! discover`, never in a compiler wrapper. Every tracked target's workspace
+//! This runs during quiet daemon maintenance, at most hourly, never in a
+//! compiler wrapper or a command. Every tracked target's workspace
 //! leads to its repository, and from there to the other repositories in the
 //! same folders. Git lists each repository's worktrees and, in each, the
 //! directories it ignores; every ignored `target/` Cargo has tagged is
 //! recorded. Discovery does not claim a build used the target or make it
 //! eligible for automatic cleanup.
 
+use crate::config::Config;
+use crate::maintenance::{Trigger, is_quiet, unix_now_secs};
 use crate::store::Store;
 use anyhow::Result;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -23,10 +25,64 @@ const LISTING_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_LISTING_BYTES: u64 = 4 << 20;
 /// Repositories one discovery pass may ask Git about.
 const DISCOVERY_STEPS: usize = 2_000;
-/// How long the daemon's quiet pass may spend on discovery.
-pub(crate) const DAEMON_DISCOVERY_TIME: Duration = Duration::from_secs(20);
-/// How long a command someone waits on may spend on discovery.
-pub(crate) const COMMAND_DISCOVERY_TIME: Duration = Duration::from_secs(120);
+/// How long one discovery pass may spend.
+const DISCOVERY_TIME: Duration = Duration::from_secs(20);
+/// How long what a pass found counts as current.
+const FRESH_FOR: Duration = Duration::from_secs(3600);
+/// Holds the Unix time discovery last ran, so a restarted daemon keeps the
+/// hourly pace. A new install or an upgrade has none, and discovers at its
+/// first quiet check.
+const LAST_RUN_FILE: &str = "target-discovery.last";
+
+/// When this process last ran discovery, for a volume too full to keep
+/// [`LAST_RUN_FILE`]: `0` before the first run.
+static LAST_RUN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether a run last at `last` (Unix seconds, `0` for never) is stale at
+/// `now`. A clock set back behind it does not stop discovery.
+fn stale(last: u64, now: u64) -> bool {
+    last == 0 || now < last || now - last >= FRESH_FOR.as_secs()
+}
+
+/// Whether to discover now: a periodic check (never the shutdown pass) on a
+/// quiet machine, when both the recorded and the remembered last run are
+/// stale.
+fn due(periodic: bool, quiet: bool, recorded: u64, remembered: u64, now: u64) -> bool {
+    periodic && quiet && stale(recorded, now) && stale(remembered, now)
+}
+
+/// The maintenance step: on a quiet machine, discover when the last run is
+/// an hour old or there is none, and record when. `true` when it ran, so the
+/// pass leaves its other walks for the next check.
+pub(crate) fn run(config: &Config, trigger: Trigger<'_>) -> bool {
+    let now = unix_now_secs();
+    let record = config.cache_dir.join(LAST_RUN_FILE);
+    let recorded = std::fs::read_to_string(&record)
+        .ok()
+        .and_then(|text| text.trim().parse().ok())
+        .unwrap_or(0);
+    let remembered = LAST_RUN.load(std::sync::atomic::Ordering::Relaxed);
+    let periodic = matches!(trigger, Trigger::Periodic(_));
+    let quiet = periodic
+        && is_quiet(
+            crate::scheduler::permits_in_use(&config.cache_dir),
+            trigger.idle_for(),
+        );
+    if !due(periodic, quiet, recorded, remembered, now) {
+        return false;
+    }
+    // Recorded before the pass, so a pass that fails waits an hour too.
+    LAST_RUN.store(now, std::sync::atomic::Ordering::Relaxed);
+    if let Err(error) = crate::atomic::atomic_replace(&record, now.to_string().as_bytes()) {
+        tracing::warn!("cannot record the target discovery time: {error:#}");
+    }
+    match Store::open(config).and_then(|store| discover(&store, DISCOVERY_TIME)) {
+        Ok(0) => {}
+        Ok(found) => tracing::info!("found {found} target directories in Git worktrees"),
+        Err(error) => tracing::warn!("target discovery failed: {error:#}"),
+    }
+    true
+}
 
 #[derive(Debug, PartialEq, Eq)]
 struct Worktree {
@@ -711,6 +767,28 @@ mod tests {
     }
 
     #[test]
+    fn discovery_runs_hourly_on_a_quiet_machine_and_at_first_after_start() {
+        let hour = FRESH_FOR.as_secs();
+        let now = 10 * hour;
+        assert!(
+            due(true, true, 0, 0, now),
+            "never ran: an install or upgrade"
+        );
+        assert!(due(true, true, now - hour, 0, now));
+        assert!(
+            !due(true, true, now - hour + 1, 0, now),
+            "ran within the hour"
+        );
+        assert!(
+            !due(true, true, 0, now - 60, now),
+            "this process ran it, unrecorded"
+        );
+        assert!(!due(true, false, 0, 0, now), "a build is running");
+        assert!(!due(false, true, 0, 0, now), "the shutdown pass");
+        assert!(stale(now + 60, now), "a clock set back does not stop it");
+    }
+
+    #[test]
     fn each_pass_starts_at_a_different_place() {
         assert_eq!(rotated(vec![0, 1, 2], 0), vec![0, 1, 2]);
         assert_eq!(rotated(vec![0, 1, 2], 1), vec![1, 2, 0]);
@@ -791,7 +869,7 @@ mod tests {
 
         let pass =
             |deadline| discover_within(&store, deadline, std::slice::from_ref(&home), 0).unwrap();
-        assert_eq!(pass(Instant::now() + COMMAND_DISCOVERY_TIME), 0);
+        assert_eq!(pass(Instant::now() + DISCOVERY_TIME), 0);
         assert_eq!(store.tracked_target_roots(0).unwrap().len(), 1);
     }
 
@@ -865,7 +943,7 @@ mod tests {
         store
             .remember_target_root(&built, &repo.join("rust"))
             .unwrap();
-        let pass = || discover_within(&store, Instant::now() + COMMAND_DISCOVERY_TIME, &[], 0);
+        let pass = || discover_within(&store, Instant::now() + DISCOVERY_TIME, &[], 0);
         assert_eq!(pass().unwrap(), 3);
         assert_eq!(pass().unwrap(), 0, "already known");
         let mut discovered: Vec<_> = store
@@ -934,8 +1012,8 @@ mod tests {
             .remember_target_root(&original, &repo.join("rust"))
             .unwrap();
 
-        assert_eq!(discover(&store, COMMAND_DISCOVERY_TIME).unwrap(), 1);
-        assert_eq!(discover(&store, COMMAND_DISCOVERY_TIME).unwrap(), 0);
+        assert_eq!(discover(&store, DISCOVERY_TIME).unwrap(), 1);
+        assert_eq!(discover(&store, DISCOVERY_TIME).unwrap(), 0);
         let roots = store.tracked_target_roots(0).unwrap();
         assert_eq!(roots.len(), 2);
         let sibling_row = roots
@@ -952,7 +1030,7 @@ mod tests {
         let old_identity = sibling_row.identity;
         std::fs::rename(&found, sibling.join("old-target")).unwrap();
         cargo_target(&sibling.join("rust"));
-        assert_eq!(discover(&store, COMMAND_DISCOVERY_TIME).unwrap(), 1);
+        assert_eq!(discover(&store, DISCOVERY_TIME).unwrap(), 1);
         let replaced = store
             .tracked_target_roots(0)
             .unwrap()
@@ -980,7 +1058,7 @@ mod tests {
         store.forget_target_root(&found).unwrap();
         std::fs::remove_dir_all(&found).unwrap();
         std::fs::create_dir_all(found.join("debug")).unwrap();
-        assert_eq!(discover(&store, COMMAND_DISCOVERY_TIME).unwrap(), 0);
+        assert_eq!(discover(&store, DISCOVERY_TIME).unwrap(), 0);
         assert_eq!(store.tracked_target_roots(0).unwrap().len(), 1);
     }
 }

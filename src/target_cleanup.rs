@@ -233,14 +233,6 @@ pub(crate) fn unit_window(days: u64) -> Option<Duration> {
 /// the sweep stays.
 pub(crate) fn sweep(config: &Config, now: u64) -> anyhow::Result<Swept> {
     let store = Store::open(config)?;
-    // A full volume refuses the registry's writes, which is no reason to
-    // skip the cleanup that frees space.
-    if let Err(error) = crate::worktree_discovery::discover(
-        &store,
-        crate::worktree_discovery::DAEMON_DISCOVERY_TIME,
-    ) {
-        tracing::warn!("could not record targets in sibling worktrees: {error:#}");
-    }
     let window = unit_window(config.auto_clean_unused_units_days);
     let at = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(now);
     let now = i64::try_from(now).unwrap_or(i64::MAX);

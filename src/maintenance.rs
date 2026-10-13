@@ -4,10 +4,12 @@
 //! then compacts `index.db` ([`crate::index_compact`]): a heal frees rows, and
 //! the compaction after it returns their pages to the disk. Both hold the
 //! index write lock while they work, so both wait for a moment with no build.
-//! Last, [`crate::target_cleanup`] removes target directories the
-//! configuration no longer wants kept. When that sweep did not run, and the
-//! index was not repaired or compacted, [`crate::target_dedup`] may clone a
-//! stored blob over an old target file that holds a full copy of it.
+//! Then, at most hourly, [`crate::worktree_discovery`] records the targets in
+//! the Git worktrees of known repositories, and [`crate::target_cleanup`]
+//! removes target directories the configuration no longer wants kept. When
+//! neither walked targets, and the index was not repaired or compacted,
+//! [`crate::target_dedup`] may clone a stored blob over an old target file
+//! that holds a full copy of it.
 
 use crate::config::Config;
 use std::sync::Arc;
@@ -103,8 +105,9 @@ pub(crate) fn unix_now_secs() -> u64 {
 pub(crate) fn run(config: &Config, trigger: Trigger<'_>) {
     let heal = crate::blob_heal::run(config, trigger);
     let compact = crate::index_compact::run(config, trigger);
+    let discovered = crate::worktree_discovery::run(config, trigger);
     let cleaned = crate::target_cleanup::run(config, trigger);
-    if gap_still_free(heal.as_ref(), compact.as_ref(), cleaned) {
+    if gap_still_free(heal.as_ref(), compact.as_ref(), discovered || cleaned) {
         crate::target_dedup::idle_slice(config, trigger);
     }
 }

@@ -4883,6 +4883,30 @@ fn a_relocated_record_is_checked_against_this_out_dir_and_guard() {
 }
 
 #[test]
+fn portable_predictions_preserve_absent_and_empty_env_values() {
+    let roots = portable_roots_for_test();
+    let dep_info = DepInfo {
+        source_files: vec![roots.out_dir.join("gen.rs")],
+        env_deps: parse_env_dep_info("# env-dep:ABSENT\n# env-dep:EMPTY=\n# env-dep:VALUE=hello\n"),
+    };
+    let portable = portable_prediction(&dep_info, &roots, Some("tree")).unwrap();
+    let serialized = serde_json::to_string(&portable).unwrap();
+    let decoded: PortablePrediction = serde_json::from_str(&serialized).unwrap();
+    let resolved = decoded
+        .resolve(&Places {
+            out_dir: Some("/elsewhere/out"),
+            workspace: None,
+            registry: None,
+        })
+        .unwrap();
+    assert_ne!(
+        resolved.env_deps[0].1, resolved.env_deps[1].1,
+        "a relocated record keeps ABSENT apart from EMPTY"
+    );
+    assert_eq!(resolved.env_deps, dep_info.env_deps);
+}
+
+#[test]
 fn mentions_root_finds_raw_canonical_and_escaped_spellings() {
     let raw = Path::new("/t/target");
     let canonical = Path::new("/private/t/target");

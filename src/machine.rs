@@ -96,6 +96,16 @@ pub fn emit_outcome<T: Serialize>(
     body: T,
     next: Vec<NextAction>,
 ) -> Result<()> {
+    write_outcome(&mut std::io::stdout().lock(), command, failure, body, next)
+}
+
+fn write_outcome<T: Serialize>(
+    out: &mut impl std::io::Write,
+    command: &str,
+    failure: Option<&str>,
+    body: T,
+    next: Vec<NextAction>,
+) -> Result<()> {
     let doc = JsonDoc {
         schema_version: SCHEMA_VERSION,
         command,
@@ -108,7 +118,19 @@ pub fn emit_outcome<T: Serialize>(
         body,
         next,
     };
-    write_document(&mut std::io::stdout().lock(), &doc)
+    still_failed(write_document(out, &doc), failure)
+}
+
+/// The result of writing a command's document, when `failure` says the
+/// command failed. A closed stdout ends a command quietly only when it
+/// succeeded; a failed one still fails, with its own message.
+pub(crate) fn still_failed(written: Result<()>, failure: Option<&str>) -> Result<()> {
+    match (written, failure) {
+        (Err(error), Some(message)) if failure_exit(&error).is_none() => {
+            Err(Reported(message.to_string()).into())
+        }
+        (written, _) => written,
+    }
 }
 
 /// Failures use the same stdout document contract as successful commands.
@@ -477,6 +499,58 @@ mod tests {
         let mut out = Vec::new();
         write_document(&mut out, &serde_json::json!({ "a": 1 })).unwrap();
         assert_eq!(String::from_utf8(out).unwrap(), "{\n  \"a\": 1\n}\n");
+    }
+
+    /// `kache clean --json --yes | head` with a failed removal still exits 1.
+    #[test]
+    fn a_closed_stdout_does_not_hide_a_failed_command() {
+        let closed = || Err(stdout_error(std::io::ErrorKind::BrokenPipe.into()));
+        let failed =
+            still_failed(closed(), Some("could not remove 1 target directory")).unwrap_err();
+        assert!(failed.is::<Reported>(), "{failed:#}");
+        assert_eq!(failed.to_string(), "could not remove 1 target directory");
+        assert_eq!(failure_exit(&failed), Some(("command_failed", 1)));
+
+        assert_eq!(
+            failure_exit(&still_failed(closed(), None).unwrap_err()),
+            None
+        );
+
+        let pipe = || Failing(std::io::ErrorKind::BrokenPipe);
+        let failed = write_outcome(
+            &mut pipe(),
+            "clean",
+            Some("could not remove"),
+            serde_json::json!({}),
+            Vec::new(),
+        )
+        .unwrap_err();
+        assert!(failed.is::<Reported>(), "{failed:#}");
+        let succeeded = write_outcome(
+            &mut pipe(),
+            "clean",
+            None,
+            serde_json::json!({}),
+            Vec::new(),
+        )
+        .unwrap_err();
+        assert_eq!(failure_exit(&succeeded), None);
+        let mut out = Vec::new();
+        write_outcome(
+            &mut out,
+            "clean",
+            Some("could not remove"),
+            serde_json::json!({}),
+            Vec::new(),
+        )
+        .unwrap();
+        let doc: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(doc["success"], false);
+        assert_eq!(doc["error"]["code"], "command_failed");
+        assert!(still_failed(Ok(()), Some("failed")).is_ok());
+        let full = Err(stdout_error(std::io::ErrorKind::StorageFull.into()));
+        let full = still_failed(full, Some("failed")).unwrap_err();
+        assert!(!full.is::<Reported>(), "{full:#}");
     }
 
     #[test]

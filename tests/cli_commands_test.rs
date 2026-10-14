@@ -4371,6 +4371,24 @@ fn diff_exits_when_the_later_session_misses_more() {
         .stdout(predicates::str::contains("EXCESS later misses 2 earlier 1"));
 }
 
+/// A reader that stops early does not turn a regression into success.
+#[test]
+fn diff_still_fails_when_stdout_is_closed() {
+    let e = env();
+    for (later, code) in [(&["b", "c"][..], 1), (&["b"][..], 0)] {
+        write_diff_sessions(&e, &[("s1", &["a"]), ("s2", later)]);
+        let mut command = kache_process_as(Path::new(KACHE_BIN), &e.home, &e.cache);
+        command
+            .args(["--json", "diff"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let mut child = command.spawn().unwrap();
+        drop(child.stdout.take());
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(output.status.code(), Some(code), "{later:?}: {output:?}");
+    }
+}
+
 #[test]
 fn diff_is_quiet_when_the_sessions_match() {
     let e = env();

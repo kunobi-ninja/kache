@@ -2270,7 +2270,20 @@ mod tests {
         assert_eq!(parse_age_hours("--stale", "60m").unwrap(), 1);
         assert_eq!(parse_age_hours("--stale", "61m").unwrap(), 2);
         assert_eq!(parse_age_hours("--max-age", "0h").unwrap(), 0);
-        for bad in ["invalid", "18446744073709551615d", "1.5h"] {
+        // Accepted before the flags shared the grammar: a leading `+`, and
+        // hour counts too large to hold in seconds, which now saturate.
+        assert_eq!(parse_age_hours("--stale", "+24h").unwrap(), 24);
+        assert_eq!(parse_age_hours("--stale", "+48").unwrap(), 48);
+        for huge in ["18446744073709551615h", "18446744073709551615d"] {
+            assert_eq!(
+                parse_age_hours("--max-age", huge).unwrap(),
+                u64::MAX.div_ceil(3600),
+                "{huge}"
+            );
+        }
+        assert_eq!(parse_since_window("+2h").unwrap().secs(), 7200);
+        assert!(is_invalid_arguments(&parse_since_window("+0").unwrap_err()));
+        for bad in ["invalid", "+", "1.5h"] {
             let err = parse_age_hours("--max-age", bad).unwrap_err();
             assert!(is_invalid_arguments(&err), "{err:#}");
             assert!(err.to_string().contains("invalid --max-age"), "{err}");

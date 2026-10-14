@@ -26,6 +26,22 @@ impl Ensured {
     }
 }
 
+/// What a finished replacement transaction means for the caller. Another
+/// process can start the daemon between the first probe and taking the
+/// coordinator lock; the locked recheck then changes nothing, and that
+/// daemon was already running. `version` asks it which release it is.
+fn ensured_after_replacement(
+    outcome: replacement::Outcome,
+    version: impl FnOnce() -> Option<String>,
+) -> Ensured {
+    match outcome {
+        replacement::Outcome::Unchanged => {
+            Ensured::AlreadyRunning(version().filter(|version| !version.is_empty()))
+        }
+        _ => Ensured::Started,
+    }
+}
+
 pub(super) fn ensure_outcome(config: &Config, force: bool) -> Result<Ensured> {
     // Fail before starting a daemon that could never bind its sockets. The
     // control endpoint's path is derived from the socket's, so check both.
@@ -69,7 +85,12 @@ pub(super) fn ensure_outcome(config: &Config, force: bool) -> Result<Ensured> {
         },
         &mut driver,
     ) {
-        Ok(_) => Ok(Ensured::Started),
+        Ok(outcome) => Ok(ensured_after_replacement(outcome, || {
+            current(config, Instant::now() + Duration::from_secs(2))
+                .ok()
+                .flatten()
+                .map(|health| health.version)
+        })),
         Err(error) if matches!(error.reason, replacement::Reason::Deadline) => {
             Ok(Ensured::TimedOut)
         }
@@ -400,6 +421,31 @@ fn written_since(path: &Path, start: u64) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A daemon another process started while this one waited for the
+    /// coordinator lock was already running; this call started nothing.
+    #[test]
+    fn an_unchanged_replacement_reports_the_running_daemon() {
+        use replacement::Outcome;
+        assert_eq!(
+            ensured_after_replacement(Outcome::Unchanged, || Some("1.2.3".into())),
+            Ensured::AlreadyRunning(Some("1.2.3".into()))
+        );
+        assert_eq!(
+            ensured_after_replacement(Outcome::Unchanged, || Some(String::new())),
+            Ensured::AlreadyRunning(None)
+        );
+        assert_eq!(
+            ensured_after_replacement(Outcome::Unchanged, || None),
+            Ensured::AlreadyRunning(None)
+        );
+        for started in [Outcome::Complete, Outcome::RetirementPending] {
+            assert_eq!(
+                ensured_after_replacement(started, || panic!("not asked")),
+                Ensured::Started
+            );
+        }
+    }
 
     #[test]
     fn control_failures_keep_the_shared_clients_retry_decision() {

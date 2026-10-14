@@ -4189,6 +4189,17 @@ fn a_memo_key_from_before_the_settle_rules_is_never_todays() {
     )
     .unwrap();
     assert_ne!(today, before);
+    let content_only = cc_preprocess_memo_key_as(
+        b"cc-preprocess-memo-v6",
+        &parsed,
+        &[],
+        "test compiler version",
+    )
+    .unwrap();
+    assert_ne!(
+        today, content_only,
+        "a memo storing a content-only digest must not answer the current read-set key"
+    );
 }
 
 #[test]

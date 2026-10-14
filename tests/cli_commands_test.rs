@@ -2697,6 +2697,33 @@ fn init_adds_native_caching_to_an_existing_rust_setup() {
 
 #[cfg(unix)]
 #[test]
+fn init_preserves_a_commented_cargo_build_table() {
+    let e = env();
+    let cargo = e.home.join(".cargo/config.toml");
+    std::fs::create_dir_all(cargo.parent().unwrap()).unwrap();
+    let original = "[build] # compiler settings\nrustc-wrapper = \"kache\"\n\
+                    [env]\nHOST_CC = \"clang\"\nHOST_CXX = \"clang++\"\n\
+                    CC_KNOWN_WRAPPER_CUSTOM = \"kache\"\n";
+    toml::from_str::<toml::Value>(original).expect("valid original Cargo config");
+    std::fs::write(&cargo, original).unwrap();
+    e.cmd()
+        .args(["init", "--yes", "--no-service"])
+        .assert()
+        .success();
+    let edited = std::fs::read_to_string(&cargo).unwrap();
+    let parsed: toml::Value = toml::from_str(&edited).expect("init preserves valid Cargo config");
+    assert_eq!(parsed["build"]["rustc-wrapper"].as_str(), Some("kache"));
+    let rustdoc = parsed["build"]["rustdoc"].as_str().unwrap();
+    let rustdoc = Path::new(rustdoc);
+    assert!(rustdoc.is_absolute());
+    assert_eq!(rustdoc.file_name().unwrap(), "rustdoc");
+    assert!(rustdoc.is_file());
+    assert!(edited.contains("[build] # compiler settings"));
+    assert_eq!(parsed["env"]["HOST_CC"].as_str(), Some("clang"));
+}
+
+#[cfg(unix)]
+#[test]
 fn init_check_does_not_write_build_rustdoc() {
     let e = env();
     let cargo = e.home.join(".cargo/config.toml");

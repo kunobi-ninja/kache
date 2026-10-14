@@ -4565,20 +4565,19 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                 ],
             )?;
         }
-        if changed > 0 {
-            self.db.execute(
-                "DELETE FROM target_roots WHERE last_seen < unixepoch() - 15552000",
-                [],
-            )?;
-            self.db.execute(
-                "DELETE FROM target_roots WHERE path IN (
-                    SELECT path FROM target_roots
-                    ORDER BY discovered ASC, last_seen DESC, path ASC
-                    LIMIT -1 OFFSET 2048
-                )",
-                [],
-            )?;
-        }
+        // A registration that got here wrote its row; prune the registry.
+        self.db.execute(
+            "DELETE FROM target_roots WHERE last_seen < unixepoch() - 15552000",
+            [],
+        )?;
+        self.db.execute(
+            "DELETE FROM target_roots WHERE path IN (
+                SELECT path FROM target_roots
+                ORDER BY discovered ASC, last_seen DESC, path ASC
+                LIMIT -1 OFFSET 2048
+            )",
+            [],
+        )?;
         Ok(())
     }
 

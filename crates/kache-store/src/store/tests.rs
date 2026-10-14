@@ -5393,6 +5393,23 @@ fn a_build_replaces_an_older_spelling_of_the_same_target() {
     assert_eq!(rows[0].path, shared);
 }
 
+/// A registration inside a caller's transaction joins it rather than
+/// starting its own, so the caller's rollback undoes it.
+#[test]
+fn a_registration_joins_the_callers_transaction() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(test_config(dir.path())).unwrap();
+    let workspace = dir.path().join("workspace");
+    let target = workspace.join("target");
+    tagged_target(&target);
+    store.db.execute_batch("BEGIN IMMEDIATE").unwrap();
+    store.remember_target_root(&target, &workspace).unwrap();
+    store.db.execute_batch("ROLLBACK").unwrap();
+    assert!(store.tracked_target_roots(0).unwrap().is_empty());
+    store.remember_target_root(&target, &workspace).unwrap();
+    assert_eq!(store.tracked_target_roots(0).unwrap().len(), 1);
+}
+
 /// A registration whose directory moved after its identity was read leaves
 /// other rows alone: that identity may belong to the directory's new path.
 #[test]

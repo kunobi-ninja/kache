@@ -461,9 +461,13 @@ mod tests {
         std::fs::create_dir_all(root.join("worktree")).unwrap();
         let through_worktree = root.join("worktree/../shared/./debug/..");
         assert_eq!(registry_path(&through_worktree).unwrap(), shared);
-        // Nothing on disk to compare: the path stays as spelled.
+        // Nothing on disk to compare: the path stays as `absolute` spells it,
+        // which on Windows has already resolved the `..`.
         let missing = root.join("gone/../shared");
-        assert_eq!(registry_path(&missing).unwrap(), missing);
+        assert_eq!(
+            registry_path(&missing).unwrap(),
+            std::path::absolute(&missing).unwrap()
+        );
 
         #[cfg(unix)]
         {

@@ -1341,6 +1341,41 @@ fn duplicate_shared_publication_keeps_blob_readonly() {
     assert_eq!(fs::read_dir(store.staging_dir()).unwrap().count(), 0);
 }
 
+#[test]
+fn losing_shared_publication_preserves_blob_readonly() {
+    for winner_already_exists in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let staged = dir.path().join("staged");
+        let blob = dir.path().join("blob");
+        let bytes = b"existing shared blob";
+        fs::write(&staged, bytes).unwrap();
+        set_blob_readonly(&staged);
+        if winner_already_exists {
+            fs::hard_link(&staged, &blob).unwrap();
+        }
+        let outcome = Store::publish_staged_blob_with(
+            &staged,
+            &blob,
+            || {
+                fs::hard_link(&staged, &blob)?;
+                Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+            },
+            |_| false,
+        )
+        .unwrap();
+        assert_eq!(outcome, PublishRename::LostRace);
+        assert!(
+            !staged.exists(),
+            "discarded shared staging alias must be removed"
+        );
+        assert!(
+            fs::metadata(&blob).unwrap().permissions().readonly(),
+            "losing shared publication cleared the winner's read-only protection: winner_already_exists={winner_already_exists}"
+        );
+        assert_eq!(fs::read(&blob).unwrap(), bytes);
+    }
+}
+
 /// Crash-orphaned staging files are reclaimed only once older than the
 /// grace period — a concurrent put's fresh snapshot is never touched.
 #[test]

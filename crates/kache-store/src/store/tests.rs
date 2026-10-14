@@ -5839,6 +5839,33 @@ fn reput_of_one_key_leaves_a_shared_blob_at_two() {
     assert_eq!(blob_table_count(&store), 0);
 }
 
+#[test]
+fn successful_stranded_republication_preserves_shared_peer() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(test_config(dir.path())).unwrap();
+    let replaced_key = put_entry(&store, dir.path(), 201, "replaced", b"old artifact");
+    let peer_key = put_entry(&store, dir.path(), 202, "peer", b"peer artifact");
+    fs::remove_file(store.entry_dir(&replaced_key).join("meta.json")).unwrap();
+    let _lock = match store.claim_build(&replaced_key).unwrap() {
+        BuildClaim::Acquired(lock) => lock,
+        _ => panic!("a stranded entry must reach the normal publication path"),
+    };
+    put_outputs(
+        &store,
+        dir.path(),
+        &replaced_key,
+        "replacement",
+        &[("libreplaced.rlib", b"peer artifact")],
+    );
+    let replacement = store.get(&replaced_key).unwrap().unwrap();
+    let peer = store.get(&peer_key).unwrap().unwrap();
+    assert_eq!(replacement.files[0].hash, peer.files[0].hash);
+    assert_blob_refs_match_mappings(&store);
+    store.remove_entry(&replaced_key).unwrap();
+    assert!(store.get(&peer_key).unwrap().is_some());
+    assert_blob_refs_match_mappings(&store);
+}
+
 /// A second download of a key that is already committed (two daemons, a
 /// retried prefetch) must not add a second set of references.
 #[test]

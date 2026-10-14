@@ -2920,6 +2920,29 @@ fn daemon_status_subcommand_succeeds() {
     );
 }
 
+/// kache-action looks for `<KACHE_RUNTIME_DIR>/daemon.sock`, spelled out in
+/// full, in `kache daemon status` to tell whether a release honors the
+/// runtime directory. On GitHub runners that directory is under $HOME, so the
+/// socket must not be shortened to `~`.
+#[test]
+fn daemon_status_spells_out_the_socket_path_under_home() {
+    let e = env();
+    let runtime = e.home.join("work/_temp/kache");
+    std::fs::create_dir_all(&runtime).unwrap();
+    let out = e
+        .cmd()
+        .args(["daemon", "status"])
+        .env("KACHE_RUNTIME_DIR", &runtime)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let socket = runtime.join("daemon.sock");
+    assert!(
+        stdout.contains(&socket.display().to_string()),
+        "{socket:?} not in {stdout}"
+    );
+}
+
 // ── populated-cache behavior ────────────────────────────────────────────────
 
 /// Build a trivial library crate through the kache rustc wrapper so the cache

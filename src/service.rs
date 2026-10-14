@@ -1061,7 +1061,15 @@ pub fn status(json: bool) -> Result<()> {
 
     let mut runtime_rows = Vec::new();
     if let Some(ref cfg) = config {
-        runtime_rows.push(("Socket", term::home_path(&cfg.socket_path()), String::new()));
+        // Spelled out in full, never with `~`: kache-action finds
+        // `<KACHE_RUNTIME_DIR>/daemon.sock` in this output to tell whether the
+        // release honors the runtime directory, and GitHub runners keep that
+        // directory under $HOME.
+        runtime_rows.push((
+            "Socket",
+            cfg.socket_path().display().to_string(),
+            String::new(),
+        ));
     }
     let diag = crate::diagnostic_log_path();
     if diag.exists() {

@@ -6809,9 +6809,8 @@ impl Compiler for CcCompiler {
         let mut reasons = parsed.refuse_reasons(&self.extra_allowlist_flags);
         if self.cache_cc_links && parsed.mode == CompileMode::Link {
             // Link mode short-circuits CcArgs::refuse_reasons before
-            // feature checks such as `@file`, so only the link-mode
-            // reason is present to strip. expand_cc_response_files
-            // still folds `@file` contents into the key.
+            // feature checks such as `@file`; opt-in admission below must
+            // validate those independently after stripping this reason.
             reasons.retain(|reason| match reason {
                 RefuseReason::Unsupported(detail) => !detail.contains("cc link mode"),
                 _ => true,
@@ -6819,6 +6818,25 @@ impl Compiler for CcCompiler {
             if parsed.output.is_none() {
                 reasons.push(RefuseReason::Unsupported(
                     "cc link mode without -o — not cacheable",
+                ));
+            }
+            // The link key hashes explicit file inputs; named selections
+            // depend on linker search state it cannot validate. Response
+            // quoting also exceeds the key's whitespace-only parser.
+            let mut linker_args = parsed.rest.iter().flat_map(|arg| {
+                std::iter::once(arg.as_str()).chain(
+                    arg.strip_prefix("-Wl,")
+                        .into_iter()
+                        .flat_map(|flags| flags.split(',')),
+                )
+            });
+            if linker_args.clone().any(|arg| arg.starts_with('@')) {
+                reasons.push(RefuseReason::Unsupported(
+                    "cc link response files have untracked library selections",
+                ));
+            } else if linker_args.any(|arg| arg.starts_with("-l") || arg.starts_with("--library")) {
+                reasons.push(RefuseReason::Unsupported(
+                    "cc link libraries selected by name have untracked dependencies",
                 ));
             }
         }

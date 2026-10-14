@@ -156,6 +156,8 @@ class BenchTests(unittest.TestCase):
                     "failed measurement left its child alive holding the pipe",
                 )
                 self.assertEqual(reader.read(1), b"", "child pipe was not released")
+                # EOF proves the worker exited; its PID may already be reused.
+                child_pid = None
             finally:
                 if write_fd is not None:
                     os.close(write_fd)

@@ -3450,6 +3450,47 @@ mod tests {
     }
 
     #[test]
+    fn rustc_depinfo_rewrite_preserves_literal_marker_dependencies() {
+        let input = concat!(
+            "/donor/target/demo.d: __kache_root__/root.rs __kache_cwd__/main.rs ",
+            "__kache_workspace__/shared.rs __kache_target_rule__/generated.rs ",
+            "__kache_base_dir_0__/external.h normal.rs /donor/src/lib.rs /external/real.h\n",
+            "# env-dep:ASSET=__kache_cwd__/literal.txt\n",
+        );
+        let stored = rewrite_rustc_depinfo_content_with_configured_roots(
+            input,
+            Path::new("/donor/target"),
+            Path::new("/donor"),
+            Some(Path::new("/donor")),
+            &[(
+                PathBuf::from("/external"),
+                "__kache_base_dir_0__/".into(),
+                8,
+            )],
+            DepInfoMode::Relativize,
+        );
+        let restored = rewrite_rustc_depinfo_content_with_configured_roots(
+            &stored,
+            Path::new("/consumer/target"),
+            Path::new("/consumer"),
+            Some(Path::new("/consumer")),
+            &[(
+                PathBuf::from("/new-external"),
+                "__kache_base_dir_0__/".into(),
+                8,
+            )],
+            DepInfoMode::Expand,
+        );
+        assert_eq!(
+            restored,
+            input
+                .replace("/donor/", "/consumer/")
+                .replace("/external/", "/new-external/"),
+            "literal source names and environment values must survive cache relocation"
+        );
+    }
+
+    #[test]
     fn rustc_depinfo_rewrite_rebases_target_and_worktree_separately() {
         let producer_target = Path::new("/build/worktree-a/target");
         let producer_cwd = Path::new("/build/worktree-a");

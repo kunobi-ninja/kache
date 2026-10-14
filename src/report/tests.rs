@@ -3941,6 +3941,86 @@ fn redact_replaces_keys_and_paths_and_leaves_empty_fields_empty() {
     assert_eq!(report.timed_transfers[1].object_key, "");
 }
 
+/// A redacted report names no build root, store or cache directory in any
+/// field, including ones `redact_report` does not list and their canonical
+/// spellings.
+#[test]
+fn redacted_json_names_no_root_store_or_cache_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = write_test_events(dir.path());
+    let mut report = generate_report(&config, SinceWindow::DEFAULT, 10).unwrap();
+    let root = dir.path().join("work/app");
+    std::fs::create_dir_all(&root).unwrap();
+    let root = root.to_string_lossy().into_owned();
+    let mut slow: BypassDetail = serde_json::from_value(serde_json::json!({
+        "crate_name": "probe",
+        "result": "passthrough",
+        "route": "direct",
+        "reason": "unsupported",
+        "elapsed_ms": 1,
+        "exit_code": 0,
+        "timestamp": "t",
+    }))
+    .unwrap();
+    slow.root = root.clone();
+    report.bypass.slowest.push(slow);
+    report.all_events[0].root = root.clone();
+    report.all_events[0].store_error = format!("disk full writing {root}/target");
+    report
+        .suggestions
+        .push(format!("Run kache clean in {root}"));
+    report.storage.stores.push(crate::store_view::StoreSummary {
+        path: config.cache_dir.join("store"),
+        bytes: 1,
+        max_size: 1,
+        entries: 1,
+        blob_stats: None,
+        error: None,
+    });
+
+    let terms = redaction_terms(&report, &[&config.cache_dir]);
+    redact_report(&mut report);
+    let mut json = serde_json::to_value(&report).unwrap();
+    scrub_json(&mut json, &terms);
+    let text = json.to_string();
+    let canonical = std::fs::canonicalize(dir.path()).unwrap();
+    for leaked in [dir.path().to_string_lossy(), canonical.to_string_lossy()] {
+        assert!(!text.contains(leaked.as_ref()), "{leaked} in {text}");
+    }
+    assert_eq!(report.bypass.slowest.last().unwrap().root, "redacted");
+    assert_eq!(
+        report.storage.stores.last().unwrap().path,
+        std::path::PathBuf::from("redacted")
+    );
+    assert_eq!(
+        scrub(&format!("Run kache clean in {root}"), &terms),
+        "Run kache clean in redacted"
+    );
+}
+
+#[test]
+fn redaction_terms_skip_roots_that_would_erase_every_path() {
+    let mut report = blank_report();
+    report.meta.root_filter = Some("/".to_string());
+    let terms = redaction_terms(
+        &report,
+        &[
+            std::path::Path::new("/a"),
+            std::path::Path::new("/srv/a"),
+            std::path::Path::new("/srv/a/b"),
+        ],
+    );
+    assert!(
+        !terms.iter().any(|term| term == "/" || term == "/a"),
+        "{terms:?}"
+    );
+    let srv: Vec<&String> = terms
+        .iter()
+        .filter(|term| term.starts_with("/srv"))
+        .collect();
+    assert_eq!(srv, ["/srv/a/b", "/srv/a"], "longest first");
+}
+
 fn blank_report() -> BuildReport {
     let dir = tempfile::tempdir().unwrap();
     let config = crate::test_support::test_config(dir.path().to_path_buf());

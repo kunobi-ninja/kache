@@ -2785,6 +2785,77 @@ fn redact_trace_args(args: &mut TraceArgs) {
 /// Replace cache keys, roots, object keys, and object paths before a report
 /// is written out. Empty fields stay empty. Free-form store errors are left
 /// as recorded.
+/// Every path a shared report must not show, before [`redact_report`] runs:
+/// the build roots and store paths in `report`, plus `extra` (the cache
+/// directory, the home directory), each also in its canonical spelling.
+/// Longest first, so a path is replaced before a prefix of it.
+pub fn redaction_terms(report: &BuildReport, extra: &[&std::path::Path]) -> Vec<String> {
+    let mut paths: Vec<std::path::PathBuf> = extra.iter().map(|path| path.to_path_buf()).collect();
+    let mut add = |value: &str| {
+        if !value.is_empty() {
+            paths.push(std::path::PathBuf::from(value));
+        }
+    };
+    if let Some(root) = &report.meta.root_filter {
+        add(root);
+    }
+    if let Some(session) = &report.meta.session {
+        add(&session.root);
+    }
+    for detail in report
+        .top_misses
+        .iter()
+        .chain(&report.top_hits)
+        .chain(&report.all_events)
+    {
+        add(&detail.root);
+    }
+    for detail in &report.bypass.slowest {
+        add(&detail.root);
+    }
+    for event in &report.trace_events {
+        add(&event.args.root);
+    }
+    for store in &report.storage.stores {
+        paths.push(store.path.clone());
+    }
+    let mut terms: Vec<String> = Vec::new();
+    for path in paths {
+        let canonical = std::fs::canonicalize(&path).ok();
+        for spelling in std::iter::once(path).chain(canonical) {
+            let text = spelling.to_string_lossy().trim_end_matches('/').to_string();
+            // A bare `/` or a one-letter root would erase every path's start.
+            if text.len() > 3 && !terms.contains(&text) {
+                terms.push(text);
+            }
+        }
+    }
+    terms.sort_by_key(|term| std::cmp::Reverse(term.len()));
+    terms
+}
+
+/// `text` with every term replaced by `redacted`: the safety net for paths
+/// inside messages and fields that [`redact_report`] does not name.
+pub fn scrub(text: &str, terms: &[String]) -> String {
+    terms.iter().fold(text.to_string(), |text, term| {
+        text.replace(term.as_str(), "redacted")
+    })
+}
+
+/// [`scrub`] over every string in a JSON document.
+pub fn scrub_json(value: &mut serde_json::Value, terms: &[String]) {
+    match value {
+        serde_json::Value::String(text) => *text = scrub(text, terms),
+        serde_json::Value::Array(items) => {
+            items.iter_mut().for_each(|item| scrub_json(item, terms))
+        }
+        serde_json::Value::Object(fields) => fields
+            .values_mut()
+            .for_each(|field| scrub_json(field, terms)),
+        _ => {}
+    }
+}
+
 pub fn redact_report(report: &mut BuildReport) {
     if let Some(root) = report.meta.root_filter.as_mut() {
         redact_owned(root);
@@ -2807,6 +2878,12 @@ pub fn redact_report(report: &mut BuildReport) {
     }
     for error in &mut report.errors_detail {
         redact_owned(&mut error.cache_key);
+    }
+    for detail in &mut report.bypass.slowest {
+        redact_owned(&mut detail.root);
+    }
+    for store in &mut report.storage.stores {
+        store.path = std::path::PathBuf::from("redacted");
     }
     if let Some(network) = report.network.as_mut() {
         for download in &mut network.slowest_downloads {

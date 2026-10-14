@@ -1831,9 +1831,14 @@ pub fn report(
     } else {
         Ok(())
     };
-    if redact {
+    let terms = if redact {
+        let home = dirs::home_dir().unwrap_or_default();
+        let terms = crate::report::redaction_terms(&report, &[&config.cache_dir, &home]);
         crate::report::redact_report(&mut report);
-    }
+        terms
+    } else {
+        Vec::new()
+    };
 
     let text = match format {
         "json" => crate::report::format_json(&report)?,
@@ -1853,6 +1858,7 @@ pub fn report(
             text
         }
     };
+    let text = crate::report::scrub(&text, &terms);
 
     if let Some(path) = output {
         std::fs::write(&path, term::strip_sgr(&text))
@@ -1880,6 +1886,7 @@ pub fn report(
         body.as_object_mut()
             .context("report is not an object")?
             .remove("schema_version");
+        crate::report::scrub_json(&mut body, &terms);
         crate::machine::emit(crate::machine::command(), body, Vec::new())?;
     } else {
         println!("{text}");

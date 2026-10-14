@@ -2439,6 +2439,41 @@ mod tests {
     }
 
     #[test]
+    fn non_mod_rs_modules_resolve_children_below_their_stem() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("foo/child")).unwrap();
+        std::fs::write(root.join("entry.rs"), "mod foo;\n").unwrap();
+        std::fs::write(
+            root.join("foo.rs"),
+            "mod child;\ninclude_str!(\"note.txt\");\n#[path = \"renamed.rs\"] mod alias;\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("foo/child.rs"), "mod grand;\n").unwrap();
+        std::fs::write(root.join("foo/child/grand.rs"), "pub fn grand() {}\n").unwrap();
+        for file in ["child.rs", "note.txt", "renamed.rs"] {
+            std::fs::write(root.join(file), "pub fn decoy() {}\n").unwrap();
+        }
+        let records = source_records(&[root.join("entry.rs")]).unwrap();
+        let names: Vec<_> = records
+            .iter()
+            .map(|record| record.relative.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                ".",
+                "entry.rs",
+                "foo.rs",
+                "foo/child.rs",
+                "foo/child/grand.rs",
+                "note.txt",
+                "renamed.rs"
+            ]
+        );
+    }
+
+    #[test]
     fn modules_and_includes_enter_the_key_and_dep_info_does_not() {
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("src");

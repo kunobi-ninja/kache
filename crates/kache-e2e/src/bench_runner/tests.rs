@@ -3314,3 +3314,30 @@ fn timed_build_refuses_dependency_fetches_on_either_stream() {
         );
     }
 }
+
+#[test]
+fn timed_build_accepts_clean_non_utf8_output() {
+    let dir = tempfile::tempdir().unwrap();
+    let work = dir.path();
+    let mut profile = prepare_fixture(work, None);
+    profile.build = "printf '\\377\\n'; printf '    Compiling a v1.0.0\\n' >&2".into();
+    build(
+        &profile,
+        work,
+        "cold",
+        &work.join("cache"),
+        &work.join("config"),
+        &work.join("unused-kache"),
+        work,
+        CacheBackend::Kache,
+        false,
+        &posix_sh().unwrap(),
+    )
+    .unwrap();
+    assert!(
+        std::fs::read(work.join("build-cold.log"))
+            .unwrap()
+            .contains(&0xff),
+        "timed build did not preserve its non-UTF-8 output"
+    );
+}

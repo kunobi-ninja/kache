@@ -3055,7 +3055,8 @@ fn test_build_bypass_analysis_counts_groups_and_sorts() {
     fallback.fallback = true;
 
     let mut skipped = test_event("c", EventResult::Skipped, 5, 0, 0, "k");
-    skipped.passthrough_reason = "disabled".to_string();
+    skipped.skip_reason = "admission-threshold".to_string();
+    skipped.exit_code = Some(0);
 
     // A non-bypass event must be ignored entirely.
     let miss = test_event("d", EventResult::Miss, 999, 0, 0, "k");
@@ -3067,8 +3068,24 @@ fn test_build_bypass_analysis_counts_groups_and_sorts() {
     assert_eq!(analysis.fallbacks, 1);
     assert_eq!(analysis.direct_passthroughs, 1);
     // "linker" appears under two different routes (direct + fallback), so it
-    // groups into two reason rows; "disabled" is a third.
+    // groups into two reason rows; "admission-threshold" is a third.
     assert_eq!(analysis.reasons.len(), 3);
+    let skipped_row = analysis
+        .slowest
+        .iter()
+        .find(|row| row.crate_name == "c")
+        .unwrap();
+    assert_eq!(skipped_row.reason, "admission-threshold");
+    assert_eq!(skipped_row.result, "skipped");
+    assert_eq!(skipped_row.route, "skipped");
+    assert_eq!(skipped_row.exit_code, Some(0));
+    let skipped_reason = analysis
+        .reasons
+        .iter()
+        .find(|row| row.route == "skipped")
+        .unwrap();
+    assert_eq!(skipped_reason.reason, "admission-threshold");
+    assert_eq!(skipped_reason.count, 1);
     // Slowest-first ordering: the 50ms fallback leads.
     assert_eq!(analysis.slowest.first().unwrap().elapsed_ms, 50);
     assert!(analysis.slowest.iter().all(|d| d.crate_name != "d"));

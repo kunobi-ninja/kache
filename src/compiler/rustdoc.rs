@@ -2187,6 +2187,34 @@ mod tests {
     }
 
     #[test]
+    fn environment_macros_require_compiler_dependency_tracking() {
+        for source in [
+            r#"#![doc = env!("DOC_TEXT")]"#,
+            r#"#[doc = env!("DOC_TEXT")] pub fn thing() {}"#,
+            r#"const TEXT: Option<&str> = option_env!("DOC_TEXT");"#,
+            r#"env!["DOC_TEXT"]"#,
+            r#"env!{"DOC_TEXT"}"#,
+            r#"env!(concat!("DOC", "_TEXT"))"#,
+        ] {
+            let error = scan_rust(source.as_bytes())
+                .err()
+                .expect("env macro is uncacheable");
+            assert_eq!(
+                error.to_string(),
+                "rustdoc environment macros require compiler dependency tracking"
+            );
+        }
+        for source in [
+            "// env!(\"DOC_TEXT\")\nmod real;",
+            r#"const TEXT: &str = "env!(DOC_TEXT)"; mod real;"#,
+            "fn env() {} mod real;",
+            "fn test(env: u8) { if env != 0 {} } mod real;",
+        ] {
+            assert_eq!(module_names(source), ["real"]);
+        }
+    }
+
+    #[test]
     fn attributes_keep_only_an_outer_path() {
         assert_eq!(
             module_path("#[path = \"renamed.rs\"]\nmod child;"),

@@ -360,7 +360,7 @@ fn test_runner_explains_itself() {
     e.cmd()
         .arg("test-runner")
         .assert()
-        .code(2)
+        .code(101)
         .stderr(predicates::str::starts_with(
             "error: expected a test binary to run",
         ));

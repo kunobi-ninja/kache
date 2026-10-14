@@ -38,9 +38,6 @@ const NEXTEST_WAIT: Duration = Duration::from_secs(120);
 /// gives Cargo.
 const RUN_FAILED: i32 = 101;
 
-/// Exit code for a command line the runner cannot use, as for other
-/// argument errors.
-const USAGE_ERROR: i32 = 2;
 
 const HELP: &str =
     "Run a test binary as Cargo's target runner, paced by the machine-wide scheduler";
@@ -112,7 +109,8 @@ pub fn run(args: &[OsString]) -> i32 {
                 "{} expected a test binary to run\n\n{USAGE}",
                 crate::term::paint("error:", crate::term::Style::Error)
             );
-            return USAGE_ERROR;
+            // Cargo's exit code for a test binary that failed, like a missing one.
+            return RUN_FAILED;
         }
         Some(first) if is_help_flag(first) => {
             println!("{HELP}\n\n{USAGE}");

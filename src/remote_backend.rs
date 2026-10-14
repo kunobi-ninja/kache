@@ -2767,6 +2767,106 @@ mod tests {
         assert_eq!(requests.await.unwrap().len(), 2);
     }
 
+    #[test]
+    #[ignore = "subprocess fixture for credential_process_releases_owned_resources"]
+    fn credential_process_held_lock_fixture() {
+        let root = std::path::PathBuf::from(std::env::var_os("AWS_PROFILE").unwrap());
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(root.join("held-lock"))
+            .unwrap();
+        lock.lock().unwrap();
+        std::fs::write(root.join("started"), b"locked").unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !root.join("release").exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "fixture release was not signalled"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    async fn credential_helper_lock_released(lock: &std::fs::File) -> bool {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match lock.try_lock() {
+                    Ok(()) => return,
+                    Err(std::fs::TryLockError::WouldBlock) => {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                    Err(std::fs::TryLockError::Error(error)) => {
+                        panic!("lock probe failed: {error}")
+                    }
+                }
+            }
+        })
+        .await
+        .is_ok()
+    }
+
+    #[tokio::test]
+    async fn credential_process_releases_owned_resources() {
+        for cancel in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let probe = std::fs::File::create(root.path().join("held-lock")).unwrap();
+            let executor = KacheCommandExecute {
+                profile: Some(root.path().to_string_lossy().into_owned()),
+            };
+            let program = format!("\"{}\"", std::env::current_exe().unwrap().display());
+            let operation = tokio::spawn(async move {
+                executor
+                    .command_execute(
+                        &program,
+                        &[
+                            "--ignored",
+                            "--exact",
+                            "remote_backend::tests::credential_process_held_lock_fixture",
+                            "--nocapture",
+                        ],
+                    )
+                    .await
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while !root.path().join("started").exists() {
+                    assert!(
+                        !operation.is_finished(),
+                        "helper exited before acquiring its lock"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("helper must acquire its lock before executor cancellation");
+            assert!(matches!(
+                probe.try_lock(),
+                Err(std::fs::TryLockError::WouldBlock)
+            ));
+
+            if cancel {
+                operation.abort();
+                assert!(operation.await.unwrap_err().is_cancelled());
+            } else {
+                std::fs::write(root.path().join("release"), b"release").unwrap();
+                assert!(operation.await.unwrap().unwrap().success());
+            }
+            let released = credential_helper_lock_released(&probe).await;
+            if !released {
+                std::fs::write(root.path().join("release"), b"release").unwrap();
+                assert!(
+                    credential_helper_lock_released(&probe).await,
+                    "fixture cleanup must release the helper lock"
+                );
+            }
+            probe.unlock().unwrap();
+            assert!(
+                released,
+                "cancelled credential executor left its helper resource locked"
+            );
+        }
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn credential_process_executor_preserves_quoted_arguments() {

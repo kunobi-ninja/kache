@@ -5324,6 +5324,73 @@ fn test_store_clear() {
     assert!(!store.contains("k1"));
 }
 
+/// A tagged Cargo target directory at `target`.
+fn tagged_target(target: &Path) {
+    std::fs::create_dir_all(target.join("debug")).unwrap();
+    std::fs::write(
+        target.join("CACHEDIR.TAG"),
+        "Signature: 8a477f597d28d172789f06886806bc55",
+    )
+    .unwrap();
+}
+
+#[test]
+fn clearing_the_store_keeps_tracked_target_directories() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(test_config(dir.path())).unwrap();
+    let workspace = dir.path().join("workspace");
+    tagged_target(&workspace.join("target"));
+    store
+        .remember_target_root(&workspace.join("target"), &workspace)
+        .unwrap();
+    store.clear().unwrap();
+    assert_eq!(store.tracked_target_roots(0).unwrap().len(), 1);
+}
+
+#[test]
+fn a_target_named_through_a_deleted_worktree_stays_tracked() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(test_config(dir.path())).unwrap();
+    let root = std::path::absolute(dir.path()).unwrap();
+    let worktree = root.join("worktree");
+    let shared = root.join("shared");
+    std::fs::create_dir_all(&worktree).unwrap();
+    tagged_target(&shared);
+    store
+        .remember_target_root(&worktree.join("../shared"), &worktree)
+        .unwrap();
+    std::fs::remove_dir_all(&worktree).unwrap();
+    let rows = store.tracked_target_roots(0).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].path, shared);
+}
+
+#[test]
+fn forgetting_a_removed_target_matches_its_identity_not_its_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(test_config(dir.path())).unwrap();
+    let workspace = dir.path().join("workspace");
+    let target = workspace.join("target");
+    tagged_target(&target);
+    store.remember_target_root(&target, &workspace).unwrap();
+    let removed = crate::filesystem::directory_identity(&target).unwrap();
+    store
+        .db
+        .execute("UPDATE target_roots SET path = 'another spelling'", [])
+        .unwrap();
+    // A build recorded a new directory at the removed path since.
+    let rebuilt = workspace.join("rebuilt");
+    tagged_target(&rebuilt);
+    std::fs::remove_dir_all(&target).unwrap();
+    std::fs::rename(&rebuilt, &target).unwrap();
+    store.remember_target_root(&target, &workspace).unwrap();
+
+    store.forget_target_roots_with_identity(removed).unwrap();
+    let rows = store.tracked_target_roots(0).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].path, std::path::absolute(&target).unwrap());
+}
+
 #[test]
 fn test_store_entry_dir() {
     let dir = tempfile::tempdir().unwrap();

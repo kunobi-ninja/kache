@@ -4470,8 +4470,8 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         if !crate::filesystem::target_root_is_safe(target, workspace_root) {
             return Ok(());
         }
-        let target = std::path::absolute(target)?;
-        let workspace_root = std::path::absolute(workspace_root)?;
+        let target = crate::filesystem::registry_path(target)?;
+        let workspace_root = crate::filesystem::registry_path(workspace_root)?;
         let Some(identity) = crate::filesystem::directory_identity(&target) else {
             return Ok(());
         };
@@ -4564,8 +4564,8 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         if !crate::filesystem::target_root_is_safe(target, workspace_root) {
             return Ok(false);
         }
-        let target = std::path::absolute(target)?;
-        let workspace_root = std::path::absolute(workspace_root)?;
+        let target = crate::filesystem::registry_path(target)?;
+        let workspace_root = crate::filesystem::registry_path(workspace_root)?;
         let Some(identity) = crate::filesystem::directory_identity(&target) else {
             return Ok(false);
         };
@@ -4704,6 +4704,20 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         self.db.execute(
             "DELETE FROM target_roots WHERE path = ?1",
             params![path.to_string_lossy()],
+        )?;
+        Ok(())
+    }
+
+    /// Forget every row that records the directory `identity` names, under
+    /// any spelling of its path: a clean removed that directory.
+    pub fn forget_target_roots_with_identity(
+        &self,
+        identity: crate::filesystem::PathIdentity,
+    ) -> Result<()> {
+        self.refuse_write("forget a target root")?;
+        self.db.execute(
+            "DELETE FROM target_roots WHERE device = ?1 AND inode = ?2",
+            params![identity.device.to_string(), identity.inode.to_string()],
         )?;
         Ok(())
     }
@@ -6326,6 +6340,8 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     }
 
     /// Clear the entire store, including retained corrupt index copies.
+    /// Tracked target directories stay registered: they live outside the
+    /// store, and `kache clean` finds them through the registry.
     ///
     /// Index rows drop first, in one transaction: once it commits no
     /// reader can begin a restore from a purged entry, and the
@@ -6349,7 +6365,6 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             tx.execute("DELETE FROM entry_blobs", [])?;
             tx.execute("DELETE FROM blobs", [])?;
             tx.execute("DELETE FROM incremental_dirs", [])?;
-            tx.execute("DELETE FROM target_roots", [])?;
             tx.commit()?;
             Ok(())
         };

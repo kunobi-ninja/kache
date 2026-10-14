@@ -2,7 +2,7 @@
 
 use crate::sharing::Sharing;
 use serde::Serialize;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, Hash)]
 pub struct PathIdentity {
@@ -71,6 +71,45 @@ pub fn cargo_tagged(target: &Path) -> bool {
 #[cfg(not(unix))]
 fn special_tag_without_open_flags(tag: &Path) -> bool {
     !std::fs::symlink_metadata(tag).is_ok_and(|meta| meta.file_type().is_file())
+}
+
+/// `path` with `.` dropped and each `..` cancelling the name before it, by
+/// name alone. A `..` with no name before it stays, unless it is at the
+/// root.
+pub fn lexically_normal(path: &Path) -> PathBuf {
+    let mut normal = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => match normal.components().next_back() {
+                Some(Component::Normal(_)) => {
+                    normal.pop();
+                }
+                Some(Component::RootDir) => {}
+                _ => normal.push(component),
+            },
+            _ => normal.push(component),
+        }
+    }
+    if normal.as_os_str().is_empty() && !path.as_os_str().is_empty() {
+        normal.push(Component::CurDir);
+    }
+    normal
+}
+
+/// How the target registry spells `path`: absolute, with `.` and `..`
+/// resolved when that names the same directory, so a target named through
+/// a directory deleted later (`<worktree>/../shared`) is still found. A
+/// symlink before a `..` can make the resolved name another directory; then
+/// the path stays as `std::path::absolute` spells it.
+pub fn registry_path(path: &Path) -> std::io::Result<PathBuf> {
+    let absolute = std::path::absolute(path)?;
+    let lexical = lexically_normal(&absolute);
+    let identity = directory_identity(&lexical);
+    if identity.is_some() && identity == directory_identity(&absolute) {
+        return Ok(lexical);
+    }
+    Ok(absolute)
 }
 
 /// A tracked cleanup target must be a derived directory, never a source root
@@ -411,5 +450,57 @@ mod tests {
         assert_eq!(directory_identity(&file), None);
         assert_eq!(directory_identity(&workspace.join("missing")), None);
         assert!(directory_identity(&workspace).is_some());
+    }
+
+    #[test]
+    fn the_registry_resolves_dot_dot_by_name_unless_a_symlink_says_otherwise() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::path::absolute(dir.path()).unwrap();
+        let shared = root.join("shared");
+        std::fs::create_dir_all(shared.join("debug")).unwrap();
+        std::fs::create_dir_all(root.join("worktree")).unwrap();
+        let through_worktree = root.join("worktree/../shared/./debug/..");
+        assert_eq!(registry_path(&through_worktree).unwrap(), shared);
+        // Nothing on disk to compare: the path stays as spelled.
+        let missing = root.join("gone/../shared");
+        assert_eq!(registry_path(&missing).unwrap(), missing);
+
+        #[cfg(unix)]
+        {
+            let inner = root.join("elsewhere/inner");
+            std::fs::create_dir_all(root.join("elsewhere/shared")).unwrap();
+            std::fs::create_dir_all(&inner).unwrap();
+            std::os::unix::fs::symlink(&inner, root.join("link")).unwrap();
+            // `..` after a symlink leaves the link's target, so the name
+            // `root/shared` would be another directory.
+            let through_link = root.join("link/../shared");
+            assert_eq!(registry_path(&through_link).unwrap(), through_link);
+            std::os::unix::fs::symlink(root.join("elsewhere"), root.join("alias")).unwrap();
+            assert_eq!(
+                registry_path(&root.join("alias/inner/../shared")).unwrap(),
+                root.join("alias/shared")
+            );
+        }
+    }
+
+    #[test]
+    fn a_dot_dot_cancels_only_a_name_before_it() {
+        for (path, normal) in [
+            ("/../a/../b", "/b"),
+            ("/a/./b/../c", "/a/c"),
+            ("../a/./b/..", "../a"),
+            ("../..", "../.."),
+            ("../../target", "../../target"),
+            ("./../target", "../target"),
+            ("a/../../b", "../b"),
+            ("a/..", "."),
+            ("", ""),
+        ] {
+            assert_eq!(
+                lexically_normal(Path::new(path)),
+                Path::new(normal),
+                "{path}"
+            );
+        }
     }
 }

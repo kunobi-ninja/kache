@@ -2788,14 +2788,14 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             let staged_meta = match fs::metadata(&staged) {
                 Ok(meta) => meta,
                 Err(e) => {
-                    Self::discard_staged_blob(&staged);
+                    Self::discard_staged_blob(&staged, None);
                     return Err(anyhow::Error::new(e)
                         .context(format!("stating staged blob for {store_name}")));
                 }
             };
             let size = staged_meta.len();
             if size == 0 && !zero_byte_is_valid_output::<P>(store_name, crate_types) {
-                Self::discard_staged_blob(&staged);
+                Self::discard_staged_blob(&staged, None);
                 anyhow::bail!("refusing to cache zero-byte artifact: {}", store_name);
             }
             total_size += size;
@@ -4063,7 +4063,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         is_transient: impl Fn(&std::io::Error) -> bool,
     ) -> Result<PublishRename> {
         if blob.is_file() {
-            Self::discard_staged_blob(staged);
+            Self::discard_staged_blob(staged, Some(blob));
             return Ok(PublishRename::LostRace);
         }
         fs::create_dir_all(blob.parent().unwrap()).context("creating blob shard directory")?;
@@ -4074,15 +4074,27 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         let outcome = publish_rename(rename, || publish_dest_state(blob), is_transient);
         if !matches!(outcome, Ok(PublishRename::Published)) {
             tracing::debug!("{} not published by this put: {outcome:?}", blob.display());
-            Self::discard_staged_blob(staged);
+            Self::discard_staged_blob(staged, Some(blob));
         }
         outcome
     }
 
     /// Discard a staging snapshot (best effort; the staging sweep reclaims any
     /// file this fails on).
-    fn discard_staged_blob(staged: &Path) {
+    fn discard_staged_blob(staged: &Path, blob: Option<&Path>) {
+        let shared_blob = blob.filter(|blob| paths_share_inode(staged, blob));
+        #[cfg(not(windows))]
+        if shared_blob.is_some() {
+            // Unlink needs directory permission; chmod would expose every alias.
+            let _ = fs::remove_file(staged);
+            return;
+        }
         unlink_blob(staged);
+        #[cfg(windows)]
+        if let Some(blob) = shared_blob {
+            // Windows needs writable attributes to unlink the staging name.
+            set_blob_readonly(blob);
+        }
     }
 
     /// Phase-2 race recovery: if a concurrent remove unlinked this blob after

@@ -9479,14 +9479,14 @@ fn init_steps_list_each_edit_with_the_backup_before_it() {
     let rc = PathBuf::from("/home/me/.bashrc");
     let facts = |cargo_ready: bool, cargo_exists: bool, rc_exists: bool| SetupFacts {
         cargo_path: cargo.clone(),
-        cargo_ready,
+        cargo: if cargo_ready { "keep" } else { "configure" },
         cargo_exists,
         shell: Some(SetupStep::new("shell", "configure", vec![rc.clone()])),
         shell_changes: vec![(rc.clone(), rc_exists)],
         rustdoc: Some("configure"),
         test_runner: Some(SetupStep::new("test_runner", "configure", vec![rc.clone()])),
         test_changes: vec![(rc.clone(), rc_exists)],
-        recovery_asks: false,
+        recovery: "keep",
         recovery_path: PathBuf::from("/home/me/.config/kache/config.toml"),
         service: Some("keep"),
         service_path: Some(PathBuf::from("/svc")),
@@ -9506,7 +9506,7 @@ fn init_steps_list_each_edit_with_the_backup_before_it() {
     };
     // A fresh machine: init creates every file it edits, so no backups.
     assert_eq!(
-        summary(setup_steps(facts(false, false, false))),
+        summary(setup_steps(&facts(false, false, false))),
         [
             "cargo configure /home/me/.cargo/config.toml",
             "shell configure /home/me/.bashrc",
@@ -9519,7 +9519,7 @@ fn init_steps_list_each_edit_with_the_backup_before_it() {
     );
     // Existing files are backed up before each edit.
     assert_eq!(
-        summary(setup_steps(facts(false, true, true))),
+        summary(setup_steps(&facts(false, true, true))),
         [
             "cargo configure /home/me/.cargo/config.toml",
             "backup create /home/me/.cargo/config.toml",
@@ -9541,12 +9541,12 @@ fn init_steps_list_each_edit_with_the_backup_before_it() {
         rustdoc: Some("keep"),
         test_runner: None,
         test_changes: Vec::new(),
-        recovery_asks: true,
+        recovery: "ask",
         service: None,
         ..facts(true, true, true)
     };
     assert_eq!(
-        summary(setup_steps(kept)),
+        summary(setup_steps(&kept)),
         [
             "cargo keep /home/me/.cargo/config.toml",
             "rustdoc keep /home/me/.cargo/config.toml",
@@ -9554,4 +9554,125 @@ fn init_steps_list_each_edit_with_the_backup_before_it() {
             "daemon ensure_running ",
         ]
     );
+}
+
+#[test]
+fn a_run_reports_declined_and_failed_steps_as_not_done() {
+    use std::path::PathBuf;
+    let cargo = PathBuf::from("/home/me/.cargo/config.toml");
+    let plan = SetupFacts {
+        cargo_path: cargo.clone(),
+        cargo: "configure",
+        cargo_exists: true,
+        shell: None,
+        shell_changes: Vec::new(),
+        rustdoc: Some("configure"),
+        test_runner: None,
+        test_changes: Vec::new(),
+        recovery: "ask",
+        recovery_path: PathBuf::from("/home/me/.config/kache/config.toml"),
+        service: Some("configure"),
+        service_path: Some(PathBuf::from("/svc")),
+    };
+    let components = |facts: &SetupFacts| {
+        setup_steps(facts)
+            .into_iter()
+            .map(|step| format!("{} {}", step.component, step.action))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        components(&plan),
+        [
+            "cargo configure",
+            "backup create",
+            "rustdoc configure",
+            "backup create",
+            "free_space_recovery ask",
+            "login_service configure",
+            "daemon ensure_running",
+        ]
+    );
+    // The replacement was declined, so rustdoc found no kache wrapper, the
+    // question was answered no and the service did not install.
+    let declined = run_facts(
+        &plan,
+        RunOutcome {
+            cargo_applied: false,
+            rustdoc: None,
+            test_runner: None,
+            test_changes: Vec::new(),
+            recovery: "keep",
+            service_installed_now: false,
+        },
+    );
+    assert_eq!(
+        components(&declined),
+        [
+            "cargo skip",
+            "free_space_recovery keep",
+            "login_service failed",
+            "daemon ensure_running",
+        ]
+    );
+    let done = run_facts(
+        &plan,
+        RunOutcome {
+            cargo_applied: true,
+            rustdoc: Some("configure"),
+            test_runner: None,
+            test_changes: Vec::new(),
+            recovery: "configure",
+            service_installed_now: true,
+        },
+    );
+    assert_eq!(
+        components(&done),
+        [
+            "cargo configure",
+            "backup create",
+            "rustdoc configure",
+            "backup create",
+            "free_space_recovery configure",
+            "login_service configure",
+            "daemon ensure_running",
+        ]
+    );
+    // A kept Cargo config stays kept; a failed rustdoc write lists its backup.
+    let kept = run_facts(
+        &SetupFacts {
+            cargo: "keep",
+            service: Some("keep"),
+            ..plan.clone()
+        },
+        RunOutcome {
+            cargo_applied: false,
+            rustdoc: Some("failed"),
+            test_runner: None,
+            test_changes: Vec::new(),
+            recovery: "keep",
+            service_installed_now: false,
+        },
+    );
+    assert_eq!(
+        components(&kept)[..4],
+        [
+            "cargo keep",
+            "rustdoc failed",
+            "backup create",
+            "free_space_recovery keep"
+        ]
+    );
+    assert_eq!(components(&kept)[4], "login_service keep");
+}
+
+#[test]
+fn recovery_steps_say_when_init_asks() {
+    assert_eq!(recovery_action(&RecoveryOffer::Ask(1)), "ask");
+    for offer in [
+        RecoveryOffer::Nothing,
+        RecoveryOffer::FromEnv(true),
+        RecoveryOffer::Explain(1),
+    ] {
+        assert_eq!(recovery_action(&offer), "keep", "{offer:?}");
+    }
 }

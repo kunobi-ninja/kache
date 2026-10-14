@@ -9971,28 +9971,29 @@ fn plan_cargo_rustdoc(
 /// Point `build.rustdoc` at the rustdoc shim with a backup,
 /// like the `rustc-wrapper` edit. Only a config whose wrapper is already
 /// `kache`, or is about to be in a preview, is edited. A config in
-/// `created`, which this run made itself, gets no backup.
+/// `created`, which this run made itself, gets no backup. Returns the
+/// `rustdoc` step's action: what a preview would do, or what a run did.
 #[cfg(unix)]
 fn configure_cargo_rustdoc(
     check: bool,
     shim_coming: bool,
     wrapper_coming: bool,
     created: &mut Vec<std::path::PathBuf>,
-) -> Result<()> {
+) -> Result<Option<&'static str>> {
     let Some((edit, shim)) = plan_cargo_rustdoc(shim_coming, wrapper_coming) else {
-        return Ok(());
+        return Ok(None);
     };
     match edit {
         RustdocEdit::Write => {}
         RustdocEdit::Leave => {
             println!("  • cargo doc: build.rustdoc is already set");
-            return Ok(());
+            return Ok(rustdoc_action(edit));
         }
-        RustdocEdit::Skip | RustdocEdit::Already => return Ok(()),
+        RustdocEdit::Skip | RustdocEdit::Already => return Ok(rustdoc_action(edit)),
     }
     if check {
         println!("    Would set build.rustdoc to {}", shim.display());
-        return Ok(());
+        return Ok(rustdoc_action(edit));
     }
     let cargo_path = cargo_config_target_path();
     let existing = std::fs::read_to_string(&cargo_path).unwrap_or_default();
@@ -10002,13 +10003,13 @@ fn configure_cargo_rustdoc(
     let updated = apply_rustdoc_edit(&existing, &shim.to_string_lossy());
     if let Err(error) = std::fs::write(&cargo_path, updated) {
         println!("  • cargo doc: could not set build.rustdoc ({error})");
-        return Ok(());
+        return Ok(Some("failed"));
     }
     println!("  ✓ cargo doc: build.rustdoc set");
-    Ok(())
+    Ok(rustdoc_action(edit))
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize)]
 struct SetupStep {
     component: &'static str,
     action: &'static str,
@@ -10036,10 +10037,13 @@ struct SetupResult {
     daemon_running: Option<bool>,
 }
 
-/// What `kache init` found before it changes anything, for [`setup_steps`].
+/// What `kache init` found before it changes anything, or what a run did,
+/// for [`setup_steps`].
+#[derive(Clone)]
 struct SetupFacts {
     cargo_path: std::path::PathBuf,
-    cargo_ready: bool,
+    /// `keep`, `configure`, or `skip` when the replacement was declined.
+    cargo: &'static str,
     cargo_exists: bool,
     /// The `shell` step, and the startup files it changes with whether each
     /// exists now.
@@ -10049,7 +10053,8 @@ struct SetupFacts {
     rustdoc: Option<&'static str>,
     test_runner: Option<SetupStep>,
     test_changes: Vec<(std::path::PathBuf, bool)>,
-    recovery_asks: bool,
+    /// The `free_space_recovery` step's action.
+    recovery: &'static str,
     recovery_path: std::path::PathBuf,
     /// The `login_service` step's action; `None` with `--no-service`.
     service: Option<&'static str>,
@@ -10058,18 +10063,15 @@ struct SetupFacts {
 
 /// The JSON `steps` of `kache init`, in the order init takes them, each
 /// edit of an existing file after its backup step. Pure.
-fn setup_steps(facts: SetupFacts) -> Vec<SetupStep> {
+fn setup_steps(facts: &SetupFacts) -> Vec<SetupStep> {
+    let facts = facts.clone();
     let mut created = Vec::new();
     let mut steps = vec![SetupStep::new(
         "cargo",
-        if facts.cargo_ready {
-            "keep"
-        } else {
-            "configure"
-        },
+        facts.cargo,
         vec![facts.cargo_path.clone()],
     )];
-    if !facts.cargo_ready {
+    if step_changes(facts.cargo) {
         steps.extend(backup_step(
             &mut created,
             &facts.cargo_path,
@@ -10086,7 +10088,8 @@ fn setup_steps(facts: SetupFacts) -> Vec<SetupStep> {
             action,
             vec![facts.cargo_path.clone()],
         ));
-        if step_changes(action) {
+        // A failed write still made its backup first.
+        if step_changes(action) || action == "failed" {
             steps.extend(backup_step(&mut created, &facts.cargo_path, true));
         }
     }
@@ -10096,7 +10099,7 @@ fn setup_steps(facts: SetupFacts) -> Vec<SetupStep> {
     }
     steps.push(SetupStep::new(
         "free_space_recovery",
-        if facts.recovery_asks { "ask" } else { "keep" },
+        facts.recovery,
         vec![facts.recovery_path],
     ));
     if let Some(action) = facts.service {
@@ -10108,6 +10111,42 @@ fn setup_steps(facts: SetupFacts) -> Vec<SetupStep> {
     }
     steps.push(SetupStep::new("daemon", "ensure_running", Vec::new()));
     steps
+}
+
+/// What a run did, against the plan it started from.
+struct RunOutcome {
+    /// Whether the Cargo edit was made; false when it was declined.
+    cargo_applied: bool,
+    rustdoc: Option<&'static str>,
+    /// The test-runner step as planned after the compiler setup, which may
+    /// have written the same startup files.
+    test_runner: Option<SetupStep>,
+    test_changes: Vec<(std::path::PathBuf, bool)>,
+    recovery: &'static str,
+    /// Whether the login service was installed or updated now.
+    service_installed_now: bool,
+}
+
+/// [`SetupFacts`] for what a run did: a declined or failed step is not
+/// reported as done. Pure.
+fn run_facts(plan: &SetupFacts, outcome: RunOutcome) -> SetupFacts {
+    let cargo = match plan.cargo {
+        "configure" if !outcome.cargo_applied => "skip",
+        planned => planned,
+    };
+    let service = match plan.service {
+        Some("configure" | "update") if !outcome.service_installed_now => Some("failed"),
+        planned => planned,
+    };
+    SetupFacts {
+        cargo,
+        rustdoc: outcome.rustdoc,
+        test_runner: outcome.test_runner,
+        test_changes: outcome.test_changes,
+        recovery: outcome.recovery,
+        service,
+        ..plan.clone()
+    }
 }
 
 /// Whether a step with this action changes files or services.
@@ -10166,9 +10205,12 @@ fn service_action(
 /// too, not only cache entries. It concerns the user's own config file (see
 /// [`crate::config::user_config_path`]): the one a login daemon reads. The
 /// decision is [`recovery_offer`] and the write [`save_target_recovery`];
-/// this only reads the process's environment and stdin, and prints.
-fn offer_target_recovery(yes: bool, check: bool) -> Result<()> {
-    let (offer, path, existing) = target_recovery_offer(yes, check)?;
+/// this only reads the process's environment and stdin, and prints. A
+/// preview says it would ask instead of asking. Returns the
+/// `free_space_recovery` step's action.
+fn offer_target_recovery(yes: bool, check: bool) -> Result<&'static str> {
+    let (offer, path, existing) = target_recovery_offer(yes)?;
+    let mut action = recovery_action(&offer);
     match offer {
         RecoveryOffer::Nothing => {}
         RecoveryOffer::FromEnv(on) => println!(
@@ -10179,7 +10221,12 @@ fn offer_target_recovery(yes: bool, check: bool) -> Result<()> {
             "  • Free-space recovery: cache entries below {} free; `auto_recover_targets = true` adds idle targets",
             term::bytes(floor)
         ),
+        RecoveryOffer::Ask(floor) if check => println!(
+            "  → Free-space recovery: would ask whether targets no build used for a day go too below {} free",
+            term::bytes(floor)
+        ),
         RecoveryOffer::Ask(floor) => {
+            action = "keep";
             let question = format!(
                 "Below {} free, also remove target directories no build used for a day?",
                 term::bytes(floor)
@@ -10187,6 +10234,7 @@ fn offer_target_recovery(yes: bool, check: bool) -> Result<()> {
             if !prompt_yes_no(&question, false, false)? {
                 println!("  • Free-space recovery: cache entries only");
             } else if save_target_recovery(&path, &existing)? {
+                action = "configure";
                 println!(
                     "  ✓ Free-space recovery: cache entries and idle targets ({})",
                     term::home_path(&path)
@@ -10199,20 +10247,26 @@ fn offer_target_recovery(yes: bool, check: bool) -> Result<()> {
             }
         }
     }
-    Ok(())
+    Ok(action)
+}
+
+/// The `free_space_recovery` step for an offer: `ask` when init asks.
+fn recovery_action(offer: &RecoveryOffer) -> &'static str {
+    match offer {
+        RecoveryOffer::Ask(_) => "ask",
+        _ => "keep",
+    }
 }
 
 /// [`recovery_offer`] for this process, with the user config file it is
-/// about and that file's text.
-fn target_recovery_offer(
-    yes: bool,
-    check: bool,
-) -> Result<(RecoveryOffer, std::path::PathBuf, String)> {
+/// about and that file's text. `--check` does not count as unattended: a
+/// preview reports the question an interactive run would ask.
+fn target_recovery_offer(yes: bool) -> Result<(RecoveryOffer, std::path::PathBuf, String)> {
     let path = crate::config::user_config_path();
     let existing = read_config_text(&path)?;
     let env = |name: &str| std::env::var(name).ok();
     let settings = RecoverySettings::of(&existing, &env, crate::policy::running_in_ci_with(env));
-    let unattended = yes || check || !std::io::stdin().is_terminal();
+    let unattended = yes || !std::io::stdin().is_terminal();
     Ok((recovery_offer(&settings, unattended), path, existing))
 }
 
@@ -10229,8 +10283,8 @@ enum RecoveryOffer {
     Ask(u64),
 }
 
-/// The offer for `settings`; `unattended` when `--yes`, `--check` or a
-/// script runs `init`, which keep the default rather than turn it on.
+/// The offer for `settings`; `unattended` when `--yes` or a script runs
+/// `init`, which keep the default rather than turn it on.
 fn recovery_offer(settings: &RecoverySettings, unattended: bool) -> RecoveryOffer {
     if let Some(on) = settings.targets_from_env {
         return RecoveryOffer::FromEnv(on);
@@ -10403,15 +10457,15 @@ pub fn init(yes: bool, no_service: bool, no_shell: bool, check: bool) -> Result<
         (None, Vec::new(), None, None, Vec::new())
     };
     let (shell, shell_changes, rustdoc, test_runner, test_changes) = shell_facts;
-    let (recovery, recovery_path, _) = target_recovery_offer(yes, check)?;
+    let (recovery, recovery_path, _) = target_recovery_offer(yes)?;
     let service_path = crate::service::service_file_path();
     let service_installed = service_path.as_ref().is_some_and(|p| p.exists());
     let service_problem = service_path
         .as_deref()
         .filter(|p| p.exists())
         .and_then(crate::service::service_exe_problem);
-    let steps = setup_steps(SetupFacts {
-        cargo_ready,
+    let plan_facts = SetupFacts {
+        cargo: if cargo_ready { "keep" } else { "configure" },
         cargo_exists: cargo_path.exists(),
         cargo_path: cargo_path.clone(),
         shell,
@@ -10419,7 +10473,7 @@ pub fn init(yes: bool, no_service: bool, no_shell: bool, check: bool) -> Result<
         rustdoc,
         test_runner,
         test_changes,
-        recovery_asks: matches!(recovery, RecoveryOffer::Ask(_)),
+        recovery: recovery_action(&recovery),
         recovery_path,
         service: service_action(
             no_service,
@@ -10428,7 +10482,8 @@ pub fn init(yes: bool, no_service: bool, no_shell: bool, check: bool) -> Result<
             service_problem.is_some(),
         ),
         service_path: service_path.clone(),
-    });
+    };
+    let steps = setup_steps(&plan_facts);
     #[cfg(unix)]
     let (shell_supported, shell_activation, test_activation) = (
         compiler.supported(),
@@ -10504,6 +10559,7 @@ pub fn init(yes: bool, no_service: bool, no_shell: bool, check: bool) -> Result<
     );
     // Files this run created: no backup of those.
     let mut created = Vec::new();
+    let mut cargo_applied = false;
     if cargo_ready {
         println!("  ✓ Cargo caching: configured");
     } else {
@@ -10536,6 +10592,7 @@ pub fn init(yes: bool, no_service: bool, no_shell: bool, check: bool) -> Result<
             }
             std::fs::write(&cargo_path, updated).context("save Cargo configuration")?;
             cargo_ready = true;
+            cargo_applied = true;
             println!("  ✓ Cargo caching: configured");
         } else {
             println!("  • Cargo caching: skipped");
@@ -10543,29 +10600,34 @@ pub fn init(yes: bool, no_service: bool, no_shell: bool, check: bool) -> Result<
     }
 
     #[cfg(unix)]
-    let shell_pending = {
+    let (shell_pending, rustdoc_done) = {
         // A preview has made neither the shim nor the wrapper edit yet.
         let shims_coming = check && compiler.installs_shims();
         let pending = init_compiler_setup(compiler, check, &mut created)?;
-        if !no_shell {
-            configure_cargo_rustdoc(check, shims_coming, check && wrapper_coming, &mut created)?;
-        }
-        pending
+        let rustdoc = if no_shell {
+            None
+        } else {
+            configure_cargo_rustdoc(check, shims_coming, check && wrapper_coming, &mut created)?
+        };
+        (pending, rustdoc)
     };
     #[cfg(unix)]
-    let tests_pending = {
+    let (tests_pending, tests_done, tests_changes) = {
         // The compiler setup may have just written the same startup files.
         let tests = if check {
             tests
         } else {
             plan_test_runner(no_shell)?
         };
-        init_test_runner(tests, check, &mut created)?
+        let step = tests.step();
+        let changes = existing_paths(tests.changed_paths());
+        (init_test_runner(tests, check, &mut created)?, step, changes)
     };
     #[cfg(not(unix))]
-    let (shell_pending, tests_pending) = (false, false);
+    let (shell_pending, tests_pending, rustdoc_done, tests_done, tests_changes) =
+        (false, false, None, None, Vec::new());
 
-    offer_target_recovery(yes, check)?;
+    let recovery_done = offer_target_recovery(yes, check)?;
 
     // ── Step 2: daemon service ───────────────────────────────────
     let mut service_action_taken = false;
@@ -10682,7 +10744,17 @@ pub fn init(yes: bool, no_service: bool, no_shell: bool, check: bool) -> Result<
             "init",
             SetupResult {
                 preview: false,
-                steps,
+                steps: setup_steps(&run_facts(
+                    &plan_facts,
+                    RunOutcome {
+                        cargo_applied,
+                        rustdoc: rustdoc_done,
+                        test_runner: tests_done,
+                        test_changes: tests_changes,
+                        recovery: recovery_done,
+                        service_installed_now: service_action_taken,
+                    },
+                )),
                 cargo_configured: cargo_ready,
                 shell_activation_required: shell_pending,
                 test_activation_required: tests_pending,

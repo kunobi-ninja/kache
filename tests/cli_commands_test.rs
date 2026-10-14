@@ -822,9 +822,21 @@ fn terminal_output(command: std::process::Command, columns: u16) -> String {
 /// [`terminal_output`] for a command that may fail.
 #[cfg(unix)]
 fn terminal_run(
-    mut command: std::process::Command,
+    command: std::process::Command,
     columns: u16,
 ) -> (String, std::process::ExitStatus) {
+    let (text, _, status) = terminal_session(command, columns, false);
+    (text, status)
+}
+
+/// Run `command` with its stdout on a terminal `columns` wide, and its stdin
+/// too when `stdin_terminal`. Returns the terminal's text, stderr and status.
+#[cfg(unix)]
+fn terminal_session(
+    mut command: std::process::Command,
+    columns: u16,
+    stdin_terminal: bool,
+) -> (String, String, std::process::ExitStatus) {
     use std::io::Read;
     use std::os::fd::FromRawFd;
     use std::os::unix::process::CommandExt;
@@ -875,8 +887,13 @@ fn terminal_run(
             Ok(())
         });
     }
+    let stdin = if stdin_terminal {
+        Stdio::from(slave.try_clone().unwrap())
+    } else {
+        Stdio::null()
+    };
     let child = command
-        .stdin(Stdio::null())
+        .stdin(stdin)
         .stdout(slave.try_clone().unwrap())
         .stderr(Stdio::piped())
         .spawn()
@@ -896,8 +913,53 @@ fn terminal_run(
     let output = child.wait_with_output().unwrap();
     (
         String::from_utf8(bytes).unwrap().replace("\r\n", "\n"),
+        String::from_utf8(output.stderr).unwrap(),
         output.status,
     )
+}
+
+/// A preview reports the free-space question an interactive run would ask;
+/// `--yes` and a run without a terminal keep the default.
+#[cfg(unix)]
+#[test]
+fn init_preview_reports_the_recovery_question_a_terminal_run_asks() {
+    let e = env();
+    let recovery = |args: &[&str], stdin_terminal: bool| {
+        let mut command = kache_process_as(Path::new(KACHE_BIN), &e.home, &e.cache);
+        command
+            .args(["init", "--check", "--no-service", "--no-shell", "--json"])
+            .args(args)
+            .env("KACHE_AUTO_RECOVER_MIN_FREE_BYTES", "1000000000")
+            .env_remove("KACHE_AUTO_RECOVER_TARGETS")
+            .env("NO_COLOR", "1");
+        let (text, stderr, status) = terminal_session(command, 200, stdin_terminal);
+        assert!(status.success(), "{text}{stderr}");
+        let start = text.find('{').unwrap();
+        let body: serde_json::Value = serde_json::from_str(&text[start..]).unwrap();
+        let step = body["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|step| step["component"] == "free_space_recovery")
+            .unwrap()
+            .clone();
+        (step["action"].as_str().unwrap().to_string(), stderr)
+    };
+    let (action, stderr) = recovery(&[], true);
+    assert_eq!(action, "ask", "{stderr}");
+    assert!(
+        stderr.contains("Free-space recovery: would ask"),
+        "{stderr}"
+    );
+    assert_eq!(recovery(&["--yes"], true).0, "keep");
+    assert_eq!(recovery(&[], false).0, "keep");
+    // A file that already decides leaves nothing to ask.
+    std::fs::write(
+        e.cache.join("config.toml"),
+        "[cache]\nauto_recover_targets = false\n",
+    )
+    .unwrap();
+    assert_eq!(recovery(&[], true).0, "keep");
 }
 
 #[cfg(unix)]
@@ -1342,6 +1404,14 @@ fn json_init_previews_without_writes_and_applies_without_prompts() {
     let body: serde_json::Value = serde_json::from_slice(&applied.stdout).unwrap();
     assert_eq!(body["success"], true);
     assert_eq!(body["preview"], false);
+    // The run reports what it did: Cargo configured in a file it created.
+    let steps = body["steps"].as_array().unwrap();
+    assert_eq!(steps[0]["component"], "cargo");
+    assert_eq!(steps[0]["action"], "configure");
+    assert!(
+        !steps.iter().any(|step| step["component"] == "backup"),
+        "{steps:?}"
+    );
     assert_eq!(body["cargo_configured"], true);
     assert_eq!(body["daemon_running"], true);
     assert_eq!(body["service_installed"], false);

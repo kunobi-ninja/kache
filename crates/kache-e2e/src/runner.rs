@@ -1745,6 +1745,29 @@ esac
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn verify_deadline_tolerates_an_already_empty_process_group() {
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = verify_fixture(None);
+        let mut spec = fixture.verify.clone().unwrap();
+        // The shell exits and is reaped while a holder in its own process
+        // group keeps stdout open, so the deadline kills an empty group.
+        spec.run = r#"printf started; perl -e 'setpgrp(0, 0); exec "sleep", "3"' &"#.into();
+        spec.expected_stdout_contains = vec!["started".into()];
+        spec.forbidden_substrings.clear();
+        spec.timeout_s = 1;
+
+        let result = super::run_verify(&spec, &fixture, temp.path(), temp.path());
+
+        assert!(!result.passed, "{result:?}");
+        assert_eq!(result.stdout, "started");
+        assert_eq!(
+            result.failure_reason.as_deref(),
+            Some("timed out after 1 seconds")
+        );
+    }
+
     #[test]
     fn unmodified_phases_verify_the_fixture_contract() {
         let fixture = verify_fixture(Some(&["v2"]));

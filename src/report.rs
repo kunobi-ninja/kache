@@ -2030,7 +2030,11 @@ fn bypass_route(e: &BuildEvent) -> &'static str {
 }
 
 fn bypass_reason(e: &BuildEvent) -> String {
-    let reason = e.passthrough_reason.trim();
+    let reason = if e.result == EventResult::Skipped && !e.skip_reason.trim().is_empty() {
+        e.skip_reason.trim()
+    } else {
+        e.passthrough_reason.trim()
+    };
     if reason.is_empty() {
         "unknown".to_string()
     } else {

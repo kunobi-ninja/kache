@@ -9521,34 +9521,33 @@ fn residual_args_are_order_independent() {
     assert_eq!(a, b, "residual argv order must not change the key");
 }
 
-/// kunobi-ninja/kache#324: diagnostics / lint / query / already-keyed path
-/// flags are stripped during parsing, so they must NOT reach the residual
-/// fold and over-key the result. Guards the same invariant as the
-/// `key_matrix_*_does_not_change_key` tests for flags cargo passes routinely.
-///
-/// Outcome-affecting lint configuration is deliberately NOT in this list:
-/// every lint level and `--check-cfg` must change the key —
-/// see `key_matrix_outcome_lint_configuration_changes_key`.
 #[test]
-fn residual_strips_diagnostic_and_query_flags() {
+fn diagnostic_flags_change_the_key_and_verbose_remains_unkeyed() {
     let _lock = key_test_lock();
     let dir = tempfile::tempdir().unwrap();
     let source = dir.path().join("lib.rs");
     std::fs::write(&source, b"pub fn hello() {}").unwrap();
-
     let base = key_of_flags(&flag_base(&source, &[]));
-    for extra in [
-        vec!["--diagnostic-width=80"],
-        vec!["--json=artifacts"],
-        vec!["--color", "always"],
-        vec!["--verbose"],
+    for (flag, value, other) in [
+        ("--error-format", "json", "human"),
+        ("--json", "artifacts", "diagnostic-rendered-ansi"),
+        ("--color", "always", "never"),
+        ("--diagnostic-width", "80", "120"),
     ] {
-        assert_eq!(
-            base,
-            key_of_flags(&flag_base(&source, &extra)),
-            "diagnostics/query flag {extra:?} must not change the key"
+        let attached = format!("{flag}={value}");
+        let first = key_of_flags(&flag_base(&source, &[&attached]));
+        let separated = key_of_flags(&flag_base(&source, &[flag, value]));
+        let different = key_of_flags(&flag_base(&source, &[flag, other]));
+        assert_ne!(base, first, "{flag} changes cached diagnostics");
+        assert_eq!(first, separated, "both spellings of {flag} agree");
+        assert_ne!(first, different, "{flag} values must not collide");
+        assert_ne!(
+            key_of_flags(&flag_base(&source, &[flag, value, flag, other])),
+            key_of_flags(&flag_base(&source, &[flag, other, flag, value])),
+            "{flag} occurrence order must be preserved"
         );
     }
+    assert_eq!(base, key_of_flags(&flag_base(&source, &["--verbose"])));
 }
 
 /// kunobi-ninja/kache#399: lexical `.`/`..` collapse + separator unification.

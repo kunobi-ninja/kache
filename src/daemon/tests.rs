@@ -10813,7 +10813,16 @@ async fn direct_restore_coalesces_simultaneous_unknown_key_hits() {
         .unwrap()
         .unwrap()
         .forget();
-    let follower = daemon.handle_remote_check(&req);
+    let mut follower_req = req.clone();
+    follower_req.shard_dir = Some(dir.path().to_string_lossy().into_owned());
+    follower_req.entry_dir = dir
+        .path()
+        .join("store")
+        .join(".")
+        .join(&req.key)
+        .to_string_lossy()
+        .into_owned();
+    let follower = daemon.handle_remote_check(&follower_req);
     tokio::pin!(follower);
     // RemoteCheck's singleflight is claimed before its first await, so one
     // poll parks this follower behind the blocked leader.

@@ -5365,6 +5365,63 @@ fn a_target_named_through_a_deleted_worktree_stays_tracked() {
     assert_eq!(rows[0].path, shared);
 }
 
+/// A row recorded before paths were normalized names the same directory
+/// through `..`; the next build's row replaces it, so cleanup never judges the
+/// directory by the stale one.
+#[test]
+fn a_build_replaces_an_older_spelling_of_the_same_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(test_config(dir.path())).unwrap();
+    let root = std::path::absolute(dir.path()).unwrap();
+    let shared = root.join("shared");
+    let worktree = root.join("wt");
+    tagged_target(&shared);
+    std::fs::create_dir_all(&worktree).unwrap();
+    store.remember_target_root(&shared, &worktree).unwrap();
+    let old = worktree.join("../shared");
+    store
+        .db
+        .execute(
+            "UPDATE target_roots SET path = ?1, last_seen = last_seen - 86400",
+            [old.to_string_lossy()],
+        )
+        .unwrap();
+
+    store.remember_target_root(&shared, &worktree).unwrap();
+    let rows = store.tracked_target_roots(0).unwrap();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].path, shared);
+}
+
+/// Forgetting a removed directory keeps a row whose path still exists: the
+/// filesystem may give a new directory the old inode.
+#[test]
+fn forgetting_by_identity_keeps_rows_whose_path_still_exists() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(test_config(dir.path())).unwrap();
+    let workspace = dir.path().join("workspace");
+    let target = workspace.join("target");
+    tagged_target(&target);
+    store.remember_target_root(&target, &workspace).unwrap();
+    let identity = crate::filesystem::directory_identity(&target).unwrap();
+    let gone = std::path::absolute(dir.path()).unwrap().join("gone/target");
+    store
+        .db
+        .execute(
+            "INSERT INTO target_roots
+                (path, workspace_root, first_seen, last_seen, device, inode, rustc, discovered)
+             SELECT ?1, workspace_root, first_seen, last_seen, device, inode, rustc, discovered
+             FROM target_roots",
+            [gone.to_string_lossy()],
+        )
+        .unwrap();
+
+    store.forget_target_roots_with_identity(identity).unwrap();
+    let rows = store.tracked_target_roots(0).unwrap();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].path, std::path::absolute(&target).unwrap());
+}
+
 #[test]
 fn forgetting_a_removed_target_matches_its_identity_not_its_path() {
     let dir = tempfile::tempdir().unwrap();

@@ -4525,12 +4525,13 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             ],
         )?;
         if changed > 0 {
-            // Git may report a canonical /private path while Cargo used a
-            // /var or /tmp spelling of the same directory. The build row is
-            // authoritative; discard its discovered alias by inode.
+            // One row per directory. Git may report a canonical /private path
+            // while Cargo used a /var or /tmp spelling, and rows recorded
+            // before paths were normalized may spell it through `..`. The
+            // build row is authoritative; discard every alias by inode.
             self.db.execute(
                 "DELETE FROM target_roots
-                 WHERE path != ?1 AND device = ?2 AND inode = ?3 AND discovered != 0",
+                 WHERE path != ?1 AND device = ?2 AND inode = ?3",
                 params![
                     target.to_string_lossy(),
                     identity.device.to_string(),
@@ -4708,17 +4709,32 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         Ok(())
     }
 
-    /// Forget every row that records the directory `identity` names, under
-    /// any spelling of its path: a clean removed that directory.
+    /// Forget the rows that record the directory `identity` names, under any
+    /// spelling of its path, once a clean removed it. A row whose path still
+    /// exists stays: that is another directory, such as one a build created
+    /// since, that the filesystem gave the same inode.
     pub fn forget_target_roots_with_identity(
         &self,
         identity: crate::filesystem::PathIdentity,
     ) -> Result<()> {
         self.refuse_write("forget a target root")?;
-        self.db.execute(
-            "DELETE FROM target_roots WHERE device = ?1 AND inode = ?2",
-            params![identity.device.to_string(), identity.inode.to_string()],
-        )?;
+        let paths: Vec<String> = {
+            let mut stmt = self
+                .db
+                .prepare("SELECT path FROM target_roots WHERE device = ?1 AND inode = ?2")?;
+            stmt.query_map(
+                params![identity.device.to_string(), identity.inode.to_string()],
+                |row| row.get(0),
+            )?
+            .collect::<std::result::Result<_, _>>()?
+        };
+        for path in paths {
+            let gone = std::fs::symlink_metadata(&path)
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
+            if gone {
+                self.forget_target_root_with_identity(Path::new(&path), identity)?;
+            }
+        }
         Ok(())
     }
 

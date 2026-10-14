@@ -7284,6 +7284,42 @@ fn removing_a_target_never_follows_a_link_out_of_it() {
     assert_eq!(std::fs::read(outside.join("keep.txt")).unwrap(), b"keep");
 }
 
+/// Only a target this clean deleted counts as removed. One that failed or was
+/// skipped but is gone now was moved by someone else.
+#[test]
+fn only_targets_this_clean_deleted_count_as_removed() {
+    let root = tempfile::tempdir().unwrap();
+    let gone = root.path().join("moved/target");
+    let target = |path: &std::path::Path| RemovalTarget {
+        path: path.to_path_buf(),
+        scanned_identity: None,
+        estimated_reclaimable: 0,
+        apparent_gap: 0,
+    };
+    let to_remove = [target(&gone), target(root.path())];
+    let deleted = |failed: &[CleanFailed], skipped: &[CleanSkipped]| {
+        deleted_targets(&to_remove, failed, skipped)
+            .map(|target| target.path.clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        deleted(&[], &[]),
+        std::slice::from_ref(&gone),
+        "an existing path is not removed"
+    );
+    let failed = CleanFailed {
+        path: gone.display().to_string(),
+        reason: "denied".to_owned(),
+    };
+    assert!(deleted(std::slice::from_ref(&failed), &[]).is_empty());
+    let skipped = CleanSkipped {
+        path: gone.display().to_string(),
+        reason: TARGET_IN_USE.to_owned(),
+        missing: false,
+    };
+    assert!(deleted(&[], std::slice::from_ref(&skipped)).is_empty());
+}
+
 #[test]
 fn held_reason_names_each_command_and_how_long_it_ran() {
     use crate::target_use::Holder;

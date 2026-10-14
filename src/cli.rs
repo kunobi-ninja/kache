@@ -5333,12 +5333,10 @@ fn clean_with_terminal(
             &mut waiting,
             &mut failed,
         );
-        let removed_paths: Vec<String> = to_remove
-            .iter()
-            .filter(|target| path_was_removed(&target.path))
+        let removed_paths: Vec<String> = deleted_targets(&to_remove, &failed, &skipped)
             .map(|target| target.path.display().to_string())
             .collect();
-        forget_removed_targets(config, &to_remove)?;
+        forget_removed_targets(config, &to_remove, &failed, &skipped)?;
         if json {
             emit_clean_json(
                 &targets,
@@ -5399,17 +5397,18 @@ fn clean_with_terminal(
             println!("Nothing selected.");
         }
         Some(to_remove) => {
+            let mut skipped = Vec::new();
             let mut failed = Vec::new();
             let (removed, estimated_reclaimed, apparent_gap) = remove_targets(
                 &to_remove,
                 &root,
                 &config.cache_dir,
                 false,
-                &mut Vec::new(),
+                &mut skipped,
                 &mut Vec::new(),
                 &mut failed,
             );
-            forget_removed_targets(config, &to_remove)?;
+            forget_removed_targets(config, &to_remove, &failed, &skipped)?;
             println!(
                 "\n{}",
                 removal_summary(removed, estimated_reclaimed, apparent_gap)
@@ -5425,10 +5424,28 @@ fn clean_with_terminal(
 /// clean found them through the registry or under a directory. A row goes
 /// only while it records the directory this clean removed: a build may
 /// have recorded a new one at the same path since.
-fn forget_removed_targets(config: &Config, to_remove: &[RemovalTarget]) -> Result<()> {
-    let mut removed = to_remove
-        .iter()
-        .filter(|target| path_was_removed(&target.path))
+/// The targets this clean deleted: gone now, and neither skipped nor failed.
+/// A target that failed or was skipped but is gone was moved by someone else.
+fn deleted_targets<'a>(
+    to_remove: &'a [RemovalTarget],
+    failed: &'a [CleanFailed],
+    skipped: &'a [CleanSkipped],
+) -> impl Iterator<Item = &'a RemovalTarget> {
+    to_remove.iter().filter(move |target| {
+        let path = target.path.display().to_string();
+        path_was_removed(&target.path)
+            && !failed.iter().any(|item| item.path == path)
+            && !skipped.iter().any(|item| item.path == path)
+    })
+}
+
+fn forget_removed_targets(
+    config: &Config,
+    to_remove: &[RemovalTarget],
+    failed: &[CleanFailed],
+    skipped: &[CleanSkipped],
+) -> Result<()> {
+    let mut removed = deleted_targets(to_remove, failed, skipped)
         .filter_map(|target| target.scanned_identity)
         .peekable();
     if removed.peek().is_none() {

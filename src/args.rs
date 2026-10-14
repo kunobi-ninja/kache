@@ -752,7 +752,8 @@ impl RustcArgs {
     /// `--extern` them get unstable cache keys (the e422e55 relocate
     /// failure mode).
     pub fn is_user_facing_executable(&self) -> bool {
-        self.is_test || self.crate_types.iter().any(|t| t == "bin")
+        // An omitted crate type can produce rustc's default binary.
+        self.is_test || self.crate_types.is_empty() || self.crate_types.iter().any(|t| t == "bin")
     }
 
     /// The codegen backend dylib this compile loads, when `-Zcodegen-backend`

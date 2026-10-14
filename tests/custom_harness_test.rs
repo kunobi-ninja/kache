@@ -1,11 +1,14 @@
 //! End-to-end guard for restoring `[[test]] harness = false` binaries.
 //!
 //! A custom-harness test target supplies its own `main`, so cargo compiles it
-//! with neither `--test` nor `--crate-type`. Its extensionless output therefore
-//! classifies as `Other("rustc:unknown")`, whose link strategy is `Hardlink` —
-//! and the restore path used to derive the output's permissions from that
-//! strategy alone. The restored binary came back without its executable bit and
-//! cargo failed the run with "Permission denied (os error 13)".
+//! with neither `--test` nor `--crate-type`. That makes the compile a
+//! user-facing executable, cached only with `cache_executables` on (off by
+//! default on Windows), so the test turns it on explicitly. Its extensionless
+//! output classifies as `Other("rustc:unknown")`, whose link strategy is
+//! `Hardlink` — and the restore path used to derive the output's permissions
+//! from that strategy alone. The restored binary came back without its
+//! executable bit and cargo failed the run with
+//! "Permission denied (os error 13)".
 //!
 //! The build here is a real one through the real wrapper: warm the cache, throw
 //! the target directory away so every artifact has to come back from the cache,
@@ -64,6 +67,7 @@ fn cargo_test(project: &Path, cache_dir: &Path, target_dir: &Path) -> std::proce
         .env("RUSTC_WRAPPER", kache_binary())
         .env("CARGO_TARGET_DIR", target_dir)
         .env("CARGO_INCREMENTAL", "0")
+        .env("KACHE_CACHE_EXECUTABLES", "1")
         .output()
         .expect("failed to run cargo test")
 }

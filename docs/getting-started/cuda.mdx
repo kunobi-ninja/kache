@@ -45,7 +45,7 @@ nvcc -dlink build/kernel.o build/helper.o -o build/device-link.o
 `nvcc -E` is not a safe cache key: it always defines `__CUDA_ARCH__`, so host-only code guarded by `#ifndef __CUDA_ARCH__` is invisible in its output. Kache does not hash preprocessed output. The key is built from:
 
 - `nvcc`'s version and the host compiler's version (a host upgrade changes the object, probed via `nvcc --dryrun`);
-- the modeled flags verbatim: `-dc` / `-rdc` mode, GPU `-arch` / `-gencode` / `-code`, `-std`, `-O`, defines, and the `-Xcompiler` / `-Xptxas` forwarding flags;
+- the modeled flags verbatim: `-dc` / `-rdc` mode, GPU `-arch` / `-gencode` / `--generate-code` / `-code`, the host compiler (`-ccbin` / `--compiler-bindir`), `-std`, `-O`, defines, and the `-Xcompiler` / `-Xptxas` / `-forward-unknown-to-host-compiler` forwarding flags;
 - the dependency closure: the raw content of the source plus every header `nvcc -M` reports. Hashing raw contents (not preprocessed output) captures host-only code, so any source or header edit invalidates the entry.
 - the driver environment: `NVCC_PREPEND_FLAGS` / `NVCC_APPEND_FLAGS` are folded in verbatim, so the same checkout with different driver flags keys apart.
 
@@ -68,10 +68,10 @@ Anything Kache does not model runs the real `nvcc` uncached, including:
 - dependency generation without an explicit output (`-M`, `-MM`, `--generate-dependencies`), the `-MP` and `-MG` modifiers, and `-MD`/`-MMD` without `-MF`. Combine `-MD`/`-MMD` with `-MF <file>` and leave out `-MP` and `-MG`;
 - compiles without `-o`;
 - `-keep` / `--save-temps`, profiling (`--time`), response files (`@file`);
-- any flag outside the built-in table (see below). Common examples are `--generate-code=…` (the long spelling of `-gencode`), `-ccbin` and `--compiler-bindir`, `-lineinfo`, `--use_fast_math`, `-Xcudafe`, and `--extended-lambda`. Run the build with `KACHE_LOG=kache=debug` to see which flag blocked caching.
+- any flag outside the built-in table (see below). Common examples are `-lineinfo`, `--use_fast_math`, `-Xcudafe`, and `--extended-lambda`. Run the build with `KACHE_LOG=kache=debug` to see which flag blocked caching.
 
 To cache a flag that Kache does not model but you know is safe, add it to the extra allow-list (`[cc] extra_allowlist_flags` or `KACHE_CC_EXTRA_ALLOWLIST_FLAGS`), which the `nvcc` adapter also honors. Flags that hide preprocessor inputs (`-Xcompiler -I…`, `-Xcompiler -D…`) stay refused: they would escape dependency tracking.
 
-For `nvcc`, an allow-list entry matches the flag itself or the flag followed by `=value`, so `-ccbin` covers `-ccbin=/usr/bin/g++-12`. A value passed as a separate argument (`-ccbin g++-12`) counts as another unknown argument, so use the `=` form.
+For `nvcc`, an allow-list entry matches the flag itself or the flag followed by `=value`, so `--maxrregcount` covers `--maxrregcount=64`. A value passed as a separate argument (`--maxrregcount 64`) counts as another unknown argument, so use the `=` form.
 
 `NVCC_PREPEND_FLAGS` / `NVCC_APPEND_FLAGS` codegen tuning (`-O2`, `-gencode …`) is cached normally. Values that would change what is built or hide inputs (`-G`, `-I…`, `-march=native`) pass through uncached instead.

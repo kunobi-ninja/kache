@@ -125,6 +125,7 @@ const VALUE_FLAGS: &[&str] = &[
     "-Xptxas",
     "-Xnvlink",
     "-gencode",
+    "--generate-code",
     "-arch",
     "-code",
     "--gpu-architecture",
@@ -132,6 +133,10 @@ const VALUE_FLAGS: &[&str] = &[
     "-march",
     "-mcpu",
     "-mtune",
+    // The host compiler. The probe reads the one nvcc dispatches to from
+    // `--dryrun` with the same flags, and `nvcc -M` gets it too.
+    "-ccbin",
+    "--compiler-bindir",
 ];
 
 /// Joined prefixes (`-O2`, `-DFOO`, `-arch=sm_80`, `-Werror`). Checked
@@ -154,6 +159,9 @@ const JOINED_PREFIXES: &[&str] = &[
     "-Xptxas",
     "-Xnvlink",
     "-gencode",
+    "--generate-code=",
+    "-ccbin=",
+    "--compiler-bindir=",
     "-arch=",
     "-code=",
     "--gpu-architecture=",
@@ -174,6 +182,10 @@ const BARE_DEFERRED_FLAGS: &[&str] = &[
     "-w",
     "-Wall",
     "-W",
+    // CMake puts it on every CUDA compile. kache refuses unknown flags
+    // itself, so none reach the host compiler through it.
+    "-forward-unknown-to-host-compiler",
+    "--forward-unknown-to-host-compiler",
 ];
 
 /// Source extensions `nvcc` accepts on a compile line. `.cu` is the CUDA
@@ -673,7 +685,20 @@ fn nvcc_driver_env_flags() -> Result<Vec<(String, String)>> {
 /// change which headers resolve, and `-M` accepts or rejects it
 /// (a rejection is a passthrough, never a miskey).
 const NVCC_DEP_FORWARD_FLAGS: &[&str] = &[
-    "-I", "-isystem", "-iquote", "-D", "-U", "-std", "--std", "-x", "-include", "-m", "-O",
+    "-I",
+    "-isystem",
+    "-iquote",
+    "-D",
+    "-U",
+    "-std",
+    "--std",
+    "-x",
+    "-include",
+    "-m",
+    "-O",
+    // The host compiler's own include paths decide which headers resolve.
+    "-ccbin",
+    "--compiler-bindir",
 ];
 
 /// Split deferred entries back into `nvcc -M` arguments: separate form
@@ -1030,6 +1055,7 @@ pub(crate) fn nvcc_target_label(deferred: &[String]) -> String {
         .filter(|f| {
             f.starts_with("-arch")
                 || f.starts_with("-gencode")
+                || f.starts_with("--generate-code")
                 || f.starts_with("--gpu-architecture")
                 || f.starts_with("-code")
                 || f.starts_with("--gpu-code")
@@ -2441,6 +2467,101 @@ mod tests {
         }];
         assert!(!nvcc_object_embeds_mapped_root(&object, &empty_maps).unwrap());
         assert!(nvcc_object_embeds_mapped_root(&dir.path().join("missing.o"), &maps).is_err());
+    }
+
+    /// CMake puts these on every CUDA compile (#1556). The line is the
+    /// one CMake generates on Windows, cut to what kache reads.
+    #[test]
+    fn cmake_compile_lines_are_modeled() {
+        let cmake = parse_ok(&[
+            "nvcc",
+            "-forward-unknown-to-host-compiler",
+            "-ccbin=C:/VS/bin/cl.exe",
+            "-D_WINDOWS",
+            "-Xcompiler= /EHsc",
+            "-DNDEBUG",
+            "--generate-code=arch=compute_120,code=[compute_120,sm_120]",
+            "-Xcompiler=-MD",
+            "-MD",
+            "-MT",
+            "k.cu.obj",
+            "-MF",
+            "k.cu.obj.d",
+            "-x",
+            "cu",
+            "-c",
+            "k.cu",
+            "-o",
+            "k.cu.obj",
+        ]);
+        assert!(cmake.unknown_flags.is_empty(), "{:?}", cmake.unknown_flags);
+        assert!(cmake.refuse_reasons(&[]).is_empty());
+        for flag in [
+            "-forward-unknown-to-host-compiler",
+            "-ccbin=C:/VS/bin/cl.exe",
+            "--generate-code=arch=compute_120,code=[compute_120,sm_120]",
+        ] {
+            assert!(cmake.deferred_flags.iter().any(|f| f == flag), "{flag}");
+        }
+        assert_eq!(
+            nvcc_target_label(&cmake.deferred_flags),
+            "--generate-code=arch=compute_120,code=[compute_120,sm_120]"
+        );
+
+        // Every spelling, with the value joined or separate.
+        for spelling in [
+            &["--forward-unknown-to-host-compiler"][..],
+            &["-ccbin", "g++-12"],
+            &["--compiler-bindir", "/usr/bin"],
+            &["--compiler-bindir=/usr/bin"],
+            &["--generate-code", "arch=compute_90,code=sm_90"],
+        ] {
+            let mut args = vec!["nvcc", "-c", "k.cu", "-o", "k.o"];
+            args.extend(spelling);
+            let parsed = parse_ok(&args);
+            assert!(parsed.refuse_reasons(&[]).is_empty(), "{spelling:?}");
+            assert_eq!(parsed.deferred_flags, [spelling.join(" ")], "{spelling:?}");
+        }
+        assert!(NvccArgs::parse(&s(&["nvcc", "-c", "k.cu", "-ccbin"])).is_err());
+
+        // The host compiler decides which headers `nvcc -M` resolves.
+        let forwarded = nvcc_dep_forward_args(
+            &[
+                "-ccbin=C:/VS/bin/cl.exe",
+                "-ccbin g++-12",
+                "--compiler-bindir /usr/bin",
+                "--compiler-bindir=/usr/bin",
+                "-forward-unknown-to-host-compiler",
+                "--generate-code=arch=compute_90,code=sm_90",
+            ]
+            .map(String::from),
+        );
+        assert_eq!(
+            forwarded,
+            [
+                "-ccbin=C:/VS/bin/cl.exe",
+                "-ccbin",
+                "g++-12",
+                "--compiler-bindir",
+                "/usr/bin",
+                "--compiler-bindir=/usr/bin",
+            ]
+        );
+
+        let native = parse_ok(&[
+            "nvcc",
+            "-c",
+            "k.cu",
+            "-o",
+            "k.o",
+            "--generate-code=arch=native,code=sm_90",
+        ]);
+        assert!(
+            native
+                .refuse_reasons(&[])
+                .iter()
+                .any(|r| matches!(r, RefuseReason::Unsupported(d) if d.contains("native")))
+        );
     }
 
     #[test]

@@ -104,3 +104,100 @@ fn miss_and_verified_hit_emit_metadata_once_and_preserve_large_diagnostics() {
         assert_eq!(hit_diagnostics, diagnostics);
     }
 }
+
+#[test]
+fn changing_diagnostic_format_preserves_requested_output_and_reuse() {
+    build_kache();
+    let fixture = tempfile::tempdir_in(common::scratch_dir()).unwrap();
+    let project = fixture.path();
+    let cache = project.join("cache");
+    let home = project.join("home");
+    let out = project.join("out");
+    fs::create_dir(&cache).unwrap();
+    fs::create_dir(&home).unwrap();
+    fs::create_dir(&out).unwrap();
+    let config = isolated_config_path(&cache);
+    fs::write(
+        &config,
+        "[cache]\nlocal_only = true\nscheduler = false\ndeferred_discovery = false\nauto_gc = false\ndaemon_publish = false\n",
+    )
+    .unwrap();
+    fs::write(
+        project.join("lib.rs"),
+        "pub fn answer() -> u32 { let unused = 1; 42 }\n",
+    )
+    .unwrap();
+    let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+    let rustup_home = std::env::var_os("RUSTUP_HOME")
+        .unwrap_or_else(|| dirs::home_dir().unwrap().join(".rustup").into_os_string());
+    let run = |wrapped: bool, format: &str| {
+        let mut command = if wrapped {
+            let mut command = hermetic_command(kache_binary(), &cache, Some(&config));
+            command.arg(&rustc);
+            command
+        } else {
+            hermetic_command(&rustc, &cache, Some(&config))
+        };
+        let output = command
+            .args([
+                "--crate-name",
+                "format_fixture",
+                "--crate-type=rlib",
+                "--emit=dep-info,metadata,link",
+                "--out-dir",
+            ])
+            .arg(&out)
+            .arg(project.join("lib.rs"))
+            .arg(format!("--error-format={format}"))
+            .env("HOME", &home)
+            .env("RUSTUP_HOME", &rustup_home)
+            .env("KACHE_LOG", "off")
+            .current_dir(project)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(output.status.success(), "{stderr}");
+        stderr
+    };
+    let human = run(true, "human");
+    assert!(human.starts_with("warning: unused variable:"), "{human}");
+    for _ in 0..2 {
+        fs::remove_dir_all(&out).unwrap();
+        fs::create_dir(&out).unwrap();
+        let json = run(true, "json");
+        let messages: Vec<Value> = json
+            .lines()
+            .map(|line| {
+                serde_json::from_str(line).expect("JSON request replayed human diagnostics")
+            })
+            .collect();
+        assert!(
+            messages
+                .iter()
+                .any(|message| message["code"]["code"] == "unused_variables")
+        );
+    }
+    fs::remove_dir_all(&out).unwrap();
+    fs::create_dir(&out).unwrap();
+    let direct = run(false, "json");
+    let direct_messages: Vec<Value> = direct
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("direct rustc emits JSON"))
+        .collect();
+    assert!(
+        direct_messages
+            .iter()
+            .any(|message| message["code"]["code"] == "unused_variables")
+    );
+    let events: Vec<Value> = fs::read_to_string(cache.join("events.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(events.len(), 3);
+    assert_eq!(events[0]["result"], "miss");
+    assert!(matches!(events[1]["result"].as_str(), Some("miss" | "dup")));
+    assert_eq!(events[2]["result"], "local_hit");
+    assert_ne!(events[0]["cache_key"], events[1]["cache_key"]);
+    assert_eq!(events[1]["cache_key"], events[2]["cache_key"]);
+}

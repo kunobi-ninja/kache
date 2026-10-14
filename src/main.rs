@@ -200,7 +200,7 @@ enum Commands {
     Clean {
         /// Look for target/ directories under this directory instead of using
         /// the ones kache tracks
-        #[arg(value_name = "DIR", conflicts_with_all = ["cache", "crate_name"])]
+        #[arg(value_name = "DIR", conflicts_with_all = ["cache", "crate_name", "stale", "orphans"])]
         path: Option<PathBuf>,
 
         /// Remove obsolete units in live targets using a recorded Cargo command
@@ -1009,7 +1009,7 @@ fn main() -> Result<()> {
     };
     machine::configure(json, command.clone());
     if let Err(error) = run_cli(cli, readiness) {
-        if json {
+        if json && error.downcast_ref::<machine::Reported>().is_none() {
             machine::emit_error(&command, "command_failed", &error)?;
         }
         eprintln!("{} {error:#}", term::paint("error:", term::Style::Error));
@@ -2074,6 +2074,13 @@ mod tests {
             "--stale-schema needs --cache"
         );
         assert!(parse(&["some/dir", "--cache"]).is_err());
+        for selection in [&["--stale", "30d"][..], &["--orphans"]] {
+            let parsed = parse(&[&["some/dir", "--dry-run"][..], selection].concat());
+            assert_eq!(
+                parsed.err().map(|error| error.kind()),
+                Some(clap::error::ErrorKind::ArgumentConflict)
+            );
+        }
         assert!(parse(&["--orphans", "--stale", "7d"]).is_err());
         assert!(parse(&["--crate", "serde", "--cache"]).is_err());
         assert!(parse(&["--cache", "--all", "--stale", "7d"]).is_err());

@@ -7034,6 +7034,7 @@ fn remove_targets_deletes_all_and_reports_estimates() {
         false,
         &mut Vec::new(),
         &mut Vec::new(),
+        &mut Vec::new(),
     );
 
     assert_eq!(removed, 2, "both target/ dirs removed");
@@ -7065,6 +7066,7 @@ fn remove_targets_skips_failures_without_aborting() {
             apparent_gap: 50,
         },
     ];
+    let mut failed = Vec::new();
     let (removed, estimated_reclaimed, apparent_gap) = remove_targets(
         &to_remove,
         root.path(),
@@ -7072,9 +7074,16 @@ fn remove_targets_skips_failures_without_aborting() {
         false,
         &mut Vec::new(),
         &mut Vec::new(),
+        &mut failed,
     );
 
     assert_eq!(removed, 1, "only the existing dir counts as removed");
+    assert_eq!(failed.len(), 1);
+    assert_eq!(failed[0].path, to_remove[0].path.display().to_string());
+    assert_eq!(
+        failed[0].reason,
+        "directory changed since scan; refusing to remove"
+    );
     assert_eq!(
         estimated_reclaimed, 150,
         "failed dir's estimate is not counted"
@@ -7156,6 +7165,7 @@ fn remove_targets_leaves_a_target_a_build_is_writing() {
         true,
         &mut skipped,
         &mut Vec::new(),
+        &mut Vec::new(),
     );
     assert_eq!((removed, reclaimed), (1, 10));
     assert!(busy.exists() && !idle.exists());
@@ -7186,7 +7196,8 @@ fn remove_targets_keeps_a_target_while_cargo_is_running() {
             root.path(),
             true,
             &mut skipped,
-            &mut waiting
+            &mut waiting,
+            &mut Vec::new()
         )
         .0,
         0
@@ -7223,12 +7234,54 @@ fn remove_targets_keeps_a_target_while_cargo_is_running() {
             root.path(),
             true,
             &mut Vec::new(),
+            &mut Vec::new(),
             &mut Vec::new()
         )
         .0,
         1
     );
     assert!(!target.exists());
+}
+
+/// A link inside a target goes as a link: what it points to stays.
+#[cfg(unix)]
+#[test]
+fn removing_a_target_never_follows_a_link_out_of_it() {
+    let root = tempfile::tempdir().unwrap();
+    let outside = root.path().join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("keep.txt"), b"keep").unwrap();
+    let target = root.path().join("app/target");
+    std::fs::create_dir_all(target.join("debug")).unwrap();
+    std::fs::write(target.join("CACHEDIR.TAG"), CARGO_CACHEDIR_TAG).unwrap();
+    std::os::unix::fs::symlink(&outside, target.join("debug/linked-dir")).unwrap();
+    std::os::unix::fs::symlink(outside.join("keep.txt"), target.join("linked-file")).unwrap();
+    // A target that is itself a link is refused, not followed.
+    let alias = root.path().join("alias");
+    std::os::unix::fs::symlink(&outside, &alias).unwrap();
+    let to_remove = [&target, &alias].map(|path| RemovalTarget {
+        path: path.clone(),
+        scanned_identity: directory_identity(path),
+        estimated_reclaimable: 0,
+        apparent_gap: 0,
+    });
+
+    let mut failed = Vec::new();
+    let (removed, _, _) = remove_targets(
+        &to_remove,
+        root.path(),
+        root.path(),
+        true,
+        &mut Vec::new(),
+        &mut Vec::new(),
+        &mut failed,
+    );
+
+    assert_eq!(removed, 1);
+    assert!(!target.exists());
+    assert_eq!(failed.len(), 1);
+    assert_eq!(failed[0].path, alias.display().to_string());
+    assert_eq!(std::fs::read(outside.join("keep.txt")).unwrap(), b"keep");
 }
 
 #[test]
@@ -7645,7 +7698,8 @@ fn tracked_clean_json_previews_keep_missing_targets_registered() {
             (true, true, false, 1),
             (false, true, true, 0),
             (false, true, false, 0),
-            (false, false, false, 0),
+            // The selector without a terminal is refused before it forgets.
+            (false, false, false, 1),
         ] {
             let dir = tempfile::tempdir().unwrap();
             let config = crate::test_support::test_config(dir.path().join("cache"));
@@ -7659,7 +7713,10 @@ fn tracked_clean_json_previews_keep_missing_targets_registered() {
             std::fs::remove_dir_all(&workspace).unwrap();
             std::fs::remove_dir_all(&target).unwrap();
 
-            clean(&config, dry_run, yes, json, CleanScope::Tracked(selection)).unwrap();
+            let scope = CleanScope::Tracked(selection);
+            let outcome = clean_with_terminal(&config, dry_run, yes, json, scope, false);
+            let selector = !dry_run && !yes && !json;
+            assert_eq!(outcome.is_err(), selector);
 
             assert_eq!(
                 store.tracked_target_roots(0).unwrap().len(),
@@ -7734,6 +7791,7 @@ fn remove_targets_refuses_a_directory_replaced_after_scan() {
         root.path(),
         root.path(),
         false,
+        &mut Vec::new(),
         &mut Vec::new(),
         &mut Vec::new(),
     );
@@ -8364,6 +8422,101 @@ fn clean_yes_removes_a_selected_tracked_target() {
     assert!(target.exists(), "a dry run removes nothing");
     clean(&config, false, true, false, every).unwrap();
     assert!(!target.exists(), "--yes removes what was selected");
+}
+
+#[test]
+fn removing_a_scanned_target_forgets_its_registry_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = crate::test_support::test_config(dir.path().join("cache"));
+    let workspace = dir.path().join("ws");
+    let target = workspace.join("target");
+    std::fs::create_dir_all(target.join("debug/deps")).unwrap();
+    std::fs::write(workspace.join("Cargo.toml"), "[package]\nname = \"p\"\n").unwrap();
+    std::fs::write(target.join("CACHEDIR.TAG"), CARGO_CACHEDIR_TAG).unwrap();
+    std::fs::write(target.join("debug/deps/libp.rlib"), vec![1; 4096]).unwrap();
+    let store = Store::open(&config).unwrap();
+    store.remember_target_root(&target, &workspace).unwrap();
+
+    clean_with_terminal(
+        &config,
+        false,
+        true,
+        true,
+        CleanScope::Scan(workspace),
+        false,
+    )
+    .unwrap();
+    assert!(!target.exists());
+    assert!(store.tracked_target_roots(0).unwrap().is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_failed_removal_fails_the_clean() {
+    use std::os::unix::fs::PermissionsExt;
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipping: running as root, mode 0555 does not deny removal");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let config = crate::test_support::test_config(dir.path().join("cache"));
+    let workspace = dir.path().join("worktrees/feature");
+    let target = dir.path().join("targets/feature");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::create_dir_all(target.join("debug")).unwrap();
+    std::fs::write(target.join("CACHEDIR.TAG"), CARGO_CACHEDIR_TAG).unwrap();
+    let locked = target.join("debug/build");
+    std::fs::create_dir_all(&locked).unwrap();
+    std::fs::write(locked.join("out.rlib"), b"rlib").unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let store = Store::open(&config).unwrap();
+    store.remember_target_root(&target, &workspace).unwrap();
+    std::fs::remove_dir_all(&workspace).unwrap();
+
+    let orphans = CleanScope::Tracked(TrackedSelection::Orphaned);
+    let error = clean_with_terminal(&config, false, true, true, orphans, false).unwrap_err();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(error.downcast_ref::<crate::machine::Reported>().is_some());
+    assert_eq!(error.to_string(), "could not remove 1 target directory");
+    assert_eq!(
+        store.tracked_target_roots(0).unwrap().len(),
+        1,
+        "what is left on disk stays registered"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn only_a_missing_path_counts_as_removed() {
+    use std::os::unix::fs::PermissionsExt;
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipping: running as root, mode 0000 does not deny lookups");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let sealed = dir.path().join("sealed");
+    std::fs::create_dir_all(sealed.join("target")).unwrap();
+    assert!(!path_was_removed(&sealed.join("target")));
+    assert!(path_was_removed(&sealed.join("gone")));
+    std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let unreadable = path_was_removed(&sealed.join("target"));
+    std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(!unreadable, "a permission error is not a removal");
+}
+
+#[test]
+fn a_declined_unit_clean_says_nothing_was_removed() {
+    assert_eq!(unit_clean_summary(true, None, 0, 0), None);
+    assert_eq!(
+        unit_clean_summary(false, Some(false), 0, 0).as_deref(),
+        Some("Nothing removed.")
+    );
+    for answer in [Some(true), None] {
+        assert_eq!(
+            unit_clean_summary(false, answer, 3, 2048).as_deref(),
+            Some("Removed 3 obsolete units (2.0 KiB).")
+        );
+    }
 }
 
 #[test]

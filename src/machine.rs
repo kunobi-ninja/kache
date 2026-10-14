@@ -67,18 +67,44 @@ struct JsonDoc<'a, T: Serialize> {
     schema_version: u32,
     command: &'a str,
     success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<Failure<'a>>,
     #[serde(flatten)]
     body: T,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     next: Vec<NextAction>,
 }
 
+#[derive(Debug, Serialize)]
+struct Failure<'a> {
+    code: &'a str,
+    message: String,
+    causes: Vec<String>,
+}
+
 /// Write one JSON document to stdout.
 pub fn emit<T: Serialize>(command: &str, body: T, next: Vec<NextAction>) -> Result<()> {
+    emit_outcome(command, None, body, next)
+}
+
+/// [`emit`] for a command that may have done only part of its work. With
+/// `failure`, `success` is false and `error` carries it as `command_failed`;
+/// the body says what was done.
+pub fn emit_outcome<T: Serialize>(
+    command: &str,
+    failure: Option<&str>,
+    body: T,
+    next: Vec<NextAction>,
+) -> Result<()> {
     let doc = JsonDoc {
         schema_version: SCHEMA_VERSION,
         command,
-        success: true,
+        success: failure.is_none(),
+        error: failure.map(|message| Failure {
+            code: "command_failed",
+            message: message.to_string(),
+            causes: Vec::new(),
+        }),
         body,
         next,
     };
@@ -90,26 +116,17 @@ pub fn emit<T: Serialize>(command: &str, body: T, next: Vec<NextAction>) -> Resu
 /// Failures use the same stdout document contract as successful commands.
 pub(crate) fn emit_error(command: &str, code: &str, error: &anyhow::Error) -> Result<()> {
     #[derive(Serialize)]
-    struct Failure<'a> {
-        code: &'a str,
-        message: String,
-        causes: Vec<String>,
-    }
-    #[derive(Serialize)]
-    struct Body<'a> {
-        error: Failure<'a>,
-    }
+    struct NoBody {}
     let doc = JsonDoc {
         schema_version: SCHEMA_VERSION,
         command,
         success: false,
-        body: Body {
-            error: Failure {
-                code,
-                message: error.to_string(),
-                causes: error.chain().skip(1).map(ToString::to_string).collect(),
-            },
-        },
+        error: Some(Failure {
+            code,
+            message: error.to_string(),
+            causes: error.chain().skip(1).map(ToString::to_string).collect(),
+        }),
+        body: NoBody {},
         next: Vec::new(),
     };
     serde_json::to_writer_pretty(std::io::stdout(), &doc)?;
@@ -182,6 +199,19 @@ pub(crate) fn emit_help(command: clap::Command) -> Result<()> {
         Vec::new(),
     )
 }
+
+/// A failure the command already described in its JSON document. The
+/// process still exits non-zero, without printing a second document.
+#[derive(Debug)]
+pub(crate) struct Reported(pub String);
+
+impl std::fmt::Display for Reported {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Reported {}
 
 pub fn require_tty(is_tty: bool, command: &str, alternative: &str) -> Result<()> {
     if is_tty {

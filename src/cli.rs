@@ -4174,8 +4174,9 @@ fn emit_gc_json(config: &Config, skipped: bool, stats: &crate::store::GcStats) -
         stats.disk_bytes_reclaimed,
         stats.bytes_freed,
     );
+    // `kache clean --cache --stale` runs this too, and says `clean`.
     crate::machine::emit(
-        "gc",
+        crate::machine::command(),
         Body {
             skipped,
             disk,
@@ -4646,6 +4647,21 @@ struct CleanSkipped {
     missing: bool,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+struct CleanFailed {
+    path: String,
+    reason: String,
+}
+
+impl CleanFailed {
+    fn new(path: &std::path::Path, reason: &str) -> Self {
+        Self {
+            path: path.display().to_string(),
+            reason: reason.to_string(),
+        }
+    }
+}
+
 pub(crate) const DEFAULT_TRACKED_STALE_HOURS: u64 = 336;
 
 /// Which target directories `kache clean` looks at.
@@ -4735,10 +4751,32 @@ pub fn clean_cache(
     let (entries, bytes) = cache_counts(&Store::open(config)?, &what)?;
     let quarantine_notice = cache_quarantine_notice(config, &what)?;
     let action = cache_action(what, entries, bytes, dry_run, json)?;
-    if let Some(notice) = quarantine_notice {
+    if let Some(notice) = quarantine_notice.as_ref().filter(|_| !json) {
         println!("{notice}");
     }
     match action {
+        CacheAction::Say(message) if json => {
+            #[derive(serde::Serialize)]
+            struct Body {
+                preview: bool,
+                entries: usize,
+                bytes: u64,
+                message: String,
+                #[serde(skip_serializing_if = "Option::is_none")]
+                notice: Option<String>,
+            }
+            crate::machine::emit(
+                "clean",
+                Body {
+                    preview: dry_run,
+                    entries,
+                    bytes,
+                    message,
+                    notice: quarantine_notice,
+                },
+                Vec::new(),
+            )
+        }
         CacheAction::Say(text) => {
             println!("{text}");
             Ok(())
@@ -4910,8 +4948,10 @@ fn confirm_removal_with(
     prompt(question)
 }
 
+/// Whether nothing is at `path` any more. A lookup that fails another way,
+/// such as a permission error, does not say the directory is gone.
 fn path_was_removed(path: &std::path::Path) -> bool {
-    !path.exists()
+    std::fs::symlink_metadata(path).is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
 }
 
 #[derive(serde::Serialize)]
@@ -5025,14 +5065,17 @@ fn clean_units_with_output(
             human_output(render_unit_plan(&row.path, &row.plan));
         }
     }
-    if unit_cleanup_needs_confirmation(preview, units)
-        && confirm_removal_with(
+    let answer = if unit_cleanup_needs_confirmation(preview, units) {
+        Some(confirm_removal_with(
             &format!("Remove {units} obsolete build units?"),
             yes,
             std::io::stdin().is_terminal(),
             |question| prompt_yes_no(question, false, false),
-        )?
-    {
+        )?)
+    } else {
+        None
+    };
+    if answer == Some(true) {
         for (root, row) in roots.iter().zip(&mut rows) {
             if unit_cleanup_ready(root, &row.plan) {
                 row.removed = crate::target_liveness::prune(
@@ -5060,15 +5103,32 @@ fn clean_units_with_output(
             Vec::new(),
         );
     }
-    if !preview {
-        let removed: usize = rows.iter().map(|row| row.removed.units).sum();
-        let bytes: u64 = rows.iter().map(|row| row.removed.bytes).sum();
-        human_output(format!(
-            "Removed {removed} obsolete units ({}).",
-            ByteSize(bytes)
-        ));
+    let removed: usize = rows.iter().map(|row| row.removed.units).sum();
+    let bytes: u64 = rows.iter().map(|row| row.removed.bytes).sum();
+    if let Some(line) = unit_clean_summary(preview, answer, removed, bytes) {
+        human_output(line);
     }
     Ok(())
+}
+
+/// The last line of a unit clean, after the answer to its question if it
+/// asked one: none for a preview.
+fn unit_clean_summary(
+    preview: bool,
+    answer: Option<bool>,
+    removed: usize,
+    bytes: u64,
+) -> Option<String> {
+    if preview {
+        return None;
+    }
+    if answer == Some(false) {
+        return Some("Nothing removed.".into());
+    }
+    Some(format!(
+        "Removed {removed} obsolete units ({}).",
+        ByteSize(bytes)
+    ))
 }
 
 /// Find and remove target directories, either below cwd or from the bounded
@@ -5080,10 +5140,31 @@ pub fn clean(
     json: bool,
     scope: CleanScope,
 ) -> Result<()> {
+    let terminal = std::io::stdout().is_terminal();
+    clean_with_terminal(config, dry_run, yes, json, scope, terminal)
+}
+
+fn clean_with_terminal(
+    config: &Config,
+    dry_run: bool,
+    yes: bool,
+    json: bool,
+    scope: CleanScope,
+    terminal: bool,
+) -> Result<()> {
     use crossterm::event;
     use ratatui::prelude::*;
     use std::io::stdout;
 
+    // The selector needs a terminal: refuse before scanning or forgetting
+    // anything.
+    if !dry_run && !yes && !json {
+        crate::machine::require_tty(
+            terminal,
+            "clean",
+            "`kache clean --dry-run` or `kache clean --json`",
+        )?;
+    }
     let (root, selection) = match &scope {
         CleanScope::Scan(dir) => {
             if !dir.is_dir() {
@@ -5104,7 +5185,6 @@ pub fn clean(
             (targets, Vec::new(), std::collections::HashSet::new())
         }
     };
-    let tracked = selection.is_some();
     // Sort by size descending
     targets.sort_by_key(|entry| std::cmp::Reverse(entry.size));
 
@@ -5146,6 +5226,7 @@ pub fn clean(
     let emit_clean_json = |targets: &[TargetEntry],
                            skipped: &[CleanSkipped],
                            waiting: &[crate::target_use::Holder],
+                           failed: &[CleanFailed],
                            removed_paths: Vec<String>,
                            reclaimed: u64| {
         #[derive(serde::Serialize)]
@@ -5168,6 +5249,8 @@ pub fn clean(
             /// Running commands that keep clean from deleting now.
             #[serde(skip_serializing_if = "Vec::is_empty")]
             waiting_for: Vec<WaitingFor>,
+            /// Targets this clean tried and failed to remove.
+            failed: Vec<CleanFailed>,
             removed_paths: Vec<String>,
             changed: bool,
             estimated_reclaimed_bytes: u64,
@@ -5200,6 +5283,7 @@ pub fn clean(
                     running_seconds: now.saturating_sub(holder.since),
                 })
                 .collect(),
+            failed: failed.to_vec(),
             changed: !removed_paths.is_empty(),
             removed_paths,
             estimated_reclaimed_bytes: reclaimed,
@@ -5208,14 +5292,14 @@ pub fn clean(
             .as_ref()
             .map(|plan| plan.next.clone())
             .unwrap_or_default();
-        crate::machine::emit("clean", body, next)
+        crate::machine::emit_outcome("clean", removal_failure(failed).as_deref(), body, next)
     };
 
     // `--json` without `--yes`, or with `--dry-run`, is a preview. Agents
     // should not enter the TUI.
     if json && preview {
         let waiting = crate::target_use::blockers(&config.cache_dir).unwrap_or_default();
-        return emit_clean_json(&targets, &skipped, &waiting, Vec::new(), 0);
+        return emit_clean_json(&targets, &skipped, &waiting, &[], Vec::new(), 0);
     }
 
     // `--dry-run` takes precedence over `--yes`: preview only, never delete.
@@ -5239,6 +5323,7 @@ pub fn clean(
         let to_remove: Vec<_> = targets.iter().map(RemovalTarget::from_entry).collect();
         let mut skipped = skipped.clone();
         let mut waiting = Vec::new();
+        let mut failed = Vec::new();
         let (removed, estimated_reclaimed, apparent_gap) = remove_targets(
             &to_remove,
             &root,
@@ -5246,41 +5331,31 @@ pub fn clean(
             json,
             &mut skipped,
             &mut waiting,
+            &mut failed,
         );
         let removed_paths: Vec<String> = to_remove
             .iter()
             .filter(|target| path_was_removed(&target.path))
             .map(|target| target.path.display().to_string())
             .collect();
-        if tracked {
-            let store = Store::open(config)?;
-            for target in &to_remove {
-                if path_was_removed(&target.path) {
-                    store.forget_target_root(&target.path)?;
-                }
-            }
-        }
+        forget_removed_targets(config, &to_remove)?;
         if json {
-            return emit_clean_json(
+            emit_clean_json(
                 &targets,
                 &skipped,
                 &waiting,
+                &failed,
                 removed_paths,
                 estimated_reclaimed,
-            );
+            )?;
+            return removal_outcome(&failed);
         }
         println!(
             "\n{}",
             removal_summary(removed, estimated_reclaimed, apparent_gap)
         );
-        return Ok(());
+        return removal_outcome(&failed);
     }
-
-    crate::machine::require_tty(
-        std::io::stdout().is_terminal(),
-        "clean",
-        "`kache clean --dry-run` or `kache clean --json`",
-    )?;
 
     // TUI mode — interactive selection
     let mut selected: Vec<bool> = vec![false; targets.len()];
@@ -5324,6 +5399,7 @@ pub fn clean(
             println!("Nothing selected.");
         }
         Some(to_remove) => {
+            let mut failed = Vec::new();
             let (removed, estimated_reclaimed, apparent_gap) = remove_targets(
                 &to_remove,
                 &root,
@@ -5331,23 +5407,57 @@ pub fn clean(
                 false,
                 &mut Vec::new(),
                 &mut Vec::new(),
+                &mut failed,
             );
-            if tracked {
-                let store = Store::open(config)?;
-                for target in &to_remove {
-                    if path_was_removed(&target.path) {
-                        store.forget_target_root(&target.path)?;
-                    }
-                }
-            }
+            forget_removed_targets(config, &to_remove)?;
             println!(
                 "\n{}",
                 removal_summary(removed, estimated_reclaimed, apparent_gap)
             );
+            return removal_outcome(&failed);
         }
     }
 
     Ok(())
+}
+
+/// Forget the registry rows of the targets that are gone, whether this
+/// clean found them through the registry or under a directory. A row goes
+/// only while it records the directory this clean removed: a build may
+/// have recorded a new one at the same path since.
+fn forget_removed_targets(config: &Config, to_remove: &[RemovalTarget]) -> Result<()> {
+    let mut removed = to_remove
+        .iter()
+        .filter(|target| path_was_removed(&target.path))
+        .filter_map(|target| target.scanned_identity)
+        .peekable();
+    if removed.peek().is_none() {
+        return Ok(());
+    }
+    let store = Store::open(config)?;
+    for identity in removed {
+        store.forget_target_roots_with_identity(identity)?;
+    }
+    Ok(())
+}
+
+/// `could not remove 2 target directories`, when any removal failed.
+fn removal_failure(failed: &[CleanFailed]) -> Option<String> {
+    (!failed.is_empty()).then(|| {
+        format!(
+            "could not remove {} target director{}",
+            failed.len(),
+            if failed.len() == 1 { "y" } else { "ies" }
+        )
+    })
+}
+
+/// A clean that failed to remove a target fails, after saying what it did.
+fn removal_outcome(failed: &[CleanFailed]) -> Result<()> {
+    match removal_failure(failed) {
+        Some(message) => Err(crate::machine::Reported(message).into()),
+        None => Ok(()),
+    }
 }
 
 #[derive(Debug)]
@@ -5382,6 +5492,7 @@ fn remove_targets(
     quiet: bool,
     skipped: &mut Vec<CleanSkipped>,
     waiting: &mut Vec<crate::target_use::Holder>,
+    failed: &mut Vec<CleanFailed>,
 ) -> (usize, u64, u64) {
     let mut estimated_reclaimed = 0u64;
     let mut apparent_gap = 0u64;
@@ -5400,12 +5511,11 @@ fn remove_targets(
         let rel = target.path.strip_prefix(root).unwrap_or(&target.path);
         let current_identity = directory_identity(&target.path);
         if target.scanned_identity.is_none() || current_identity != target.scanned_identity {
+            const CHANGED: &str = "directory changed since scan; refusing to remove";
             if human_clean_output(quiet) {
-                println!(
-                    "  failed  {} — directory changed since scan; refusing to remove",
-                    rel.display()
-                );
+                println!("  failed  {} — {CHANGED}", rel.display());
             }
+            failed.push(CleanFailed::new(&target.path, CHANGED));
             continue;
         }
         if let Some(reason) = &held {
@@ -5446,6 +5556,7 @@ fn remove_targets(
                 if human_clean_output(quiet) {
                     println!("  failed  {} — {e}", rel.display());
                 }
+                failed.push(CleanFailed::new(&target.path, &e.to_string()));
             }
         }
     }

@@ -1092,6 +1092,29 @@ fn machine_readable_commands_emit_one_json_document() {
 }
 
 #[test]
+fn cache_clean_json_forms_emit_a_clean_document() {
+    let e = env();
+    for args in [
+        &["--json", "clean", "--cache", "--dry-run"][..],
+        &["--json", "clean", "--crate", "serde", "--dry-run"],
+        &["--json", "clean", "--cache", "--stale-schema", "--dry-run"],
+        &["--json", "clean", "--cache", "--stale", "7d", "--dry-run"],
+        &["--json", "clean", "--cache", "--stale", "7d"],
+    ] {
+        let output = e.cmd().args(args).output().unwrap();
+        assert!(output.status.success(), "{args:?}");
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .unwrap_or_else(|error| panic!("{args:?} did not emit JSON: {error}"));
+        assert_eq!(value["command"], "clean", "{args:?}");
+    }
+    e.cmd()
+        .args(["clean", "--cache", "--dry-run"])
+        .assert()
+        .success()
+        .stdout(predicates::str::starts_with("Would remove all"));
+}
+
+#[test]
 fn gc_json_has_an_entries_failed_field() {
     let e = env();
     let output = e.cmd().args(["--json", "gc"]).output().unwrap();
@@ -1405,6 +1428,60 @@ fn clean_dry_run_reports_a_populated_target_dir() {
             " · 10.0 KiB on disk · 10.0 KiB freeable",
         ))
         .stdout(predicates::str::contains("target  [debug, release]"));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_clean_that_cannot_remove_a_target_says_so_and_fails() {
+    use std::os::unix::fs::PermissionsExt;
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipping: running as root, mode 0555 does not deny removal");
+        return;
+    }
+    let e = env();
+    let project = TempDir::new().unwrap();
+    let root = project.path();
+    std::fs::write(root.join("Cargo.toml"), "[package]\nname=\"p\"\n").unwrap();
+    let locked = root.join("target/debug/build");
+    std::fs::create_dir_all(&locked).unwrap();
+    std::fs::write(locked.join("out.rlib"), vec![0u8; 4096]).unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+    let output = e
+        .cmd()
+        .args(["--json", "clean"])
+        .arg(root)
+        .arg("--yes")
+        .output()
+        .unwrap();
+    let human = e
+        .cmd()
+        .arg("clean")
+        .arg(root)
+        .arg("--yes")
+        .output()
+        .unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["success"], false);
+    // cli.schema.json: a failed document carries `error`.
+    assert_eq!(
+        value["error"],
+        serde_json::json!({
+            "code": "command_failed",
+            "message": "could not remove 1 target directory",
+            "causes": [],
+        })
+    );
+    assert_eq!(
+        value["failed"][0]["path"],
+        root.join("target").display().to_string()
+    );
+    assert!(value["removed_paths"].as_array().unwrap().is_empty());
+    assert_eq!(human.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&human.stdout).contains("  failed  "));
 }
 
 #[cfg(unix)]

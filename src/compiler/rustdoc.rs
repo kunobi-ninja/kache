@@ -2272,6 +2272,23 @@ mod tests {
     }
 
     #[test]
+    fn explicit_path_modules_resolve_children_beside_the_module_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir(root.join("renamed")).unwrap();
+        std::fs::write(root.join("lib.rs"), "#[path = \"renamed.rs\"] mod foo;\n").unwrap();
+        std::fs::write(root.join("renamed.rs"), "mod child;\n").unwrap();
+        std::fs::write(root.join("child.rs"), "pub fn thing() {}\n").unwrap();
+        std::fs::write(root.join("renamed/child.rs"), "pub fn decoy() {}\n").unwrap();
+        let records = source_records(&[root.join("lib.rs")]).unwrap();
+        let names: Vec<_> = records
+            .iter()
+            .map(|record| record.relative.as_str())
+            .collect();
+        assert_eq!(names, [".", "child.rs", "lib.rs", "renamed.rs"]);
+    }
+
+    #[test]
     fn non_mod_rs_modules_resolve_children_below_their_stem() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();

@@ -11541,6 +11541,35 @@ fn env_dep_use_memo_rescans_rows_from_other_scanner_versions() {
 }
 
 #[test]
+fn shadowed_include_names_rescan_version_three_memos() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("lib.rs");
+    std::fs::write(
+        &source,
+        br#"macro_rules! include { ($path:expr) => { $path }; } include!(env!("OUT_DIR"));"#,
+    )
+    .unwrap();
+    let db = dir.path().join("idx.sqlite");
+    let hash = hash_file(&source).unwrap();
+    let cache = FileHashCache::open(&db).unwrap();
+    cache
+        .put_source_env_dep_use(
+            &hash,
+            "OUT_DIR",
+            3,
+            SourceEnvDepUse::IncludeLocator.memo_code(),
+        )
+        .unwrap();
+    drop(cache);
+    assert_eq!(
+        FileHasher::persistent(&db)
+            .env_dep_use(&source, "OUT_DIR")
+            .unwrap(),
+        SourceEnvDepUse::RuntimeValue
+    );
+}
+
+#[test]
 fn env_dep_use_memo_codes_round_trip() {
     for answer in [
         SourceEnvDepUse::Unused,

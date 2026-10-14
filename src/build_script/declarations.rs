@@ -64,7 +64,7 @@ pub(super) fn parse_declarations(
     let mut inputs = std::collections::BTreeSet::new();
     let mut env = std::collections::BTreeSet::new();
     for line in stdout.lines() {
-        match rerun_directive(line) {
+        match rerun_directive(line.trim()) {
             Some(Rerun::Changed(path)) => {
                 // Cargo treats an empty path as "always rerun".
                 if path.is_empty() {

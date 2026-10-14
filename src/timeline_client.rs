@@ -227,6 +227,11 @@ mod tests {
         run_deadline_fixture("exhausted").await;
     }
 
+    #[tokio::test]
+    async fn auth_and_timeline_share_one_timeout() {
+        run_deadline_fixture("delayed").await;
+    }
+
     #[tokio::test(start_paused = true)]
     #[ignore = "isolated subprocess fixture for timeline authentication deadlines"]
     async fn timeline_deadline_child_fixture() {
@@ -245,15 +250,18 @@ mod tests {
             }
         });
         let token_started = Arc::new(Notify::new());
+        let release_token = Arc::new(Notify::new());
         let post_started = Arc::new(Notify::new());
         let started = token_started.clone();
+        let release = release_token.clone();
         let posted = post_started.clone();
         let app = Router::new()
             .route("/token", get(move || {
                 let started = started.clone();
+                let release = release.clone();
                 async move {
                     started.notify_one();
-                    std::future::pending::<()>().await;
+                    release.notified().await;
                     Json(serde_json::json!({"value": "eyJhbGciOiJSUzI1NiJ9.eyJleHAiOjQxMDI0NDQ4MDB9.fixture-signature"}))
                 }
             }))
@@ -284,19 +292,38 @@ mod tests {
             () = token_started.notified() => {}
         }
         let mode = std::env::var("TIMELINE_DEADLINE_CASE").unwrap();
-        assert_eq!(mode, "exhausted");
-        tokio::time::advance(Duration::from_secs(31)).await;
+        if mode == "delayed" {
+            tokio::time::advance(Duration::from_secs(8)).await;
+            release_token.notify_one();
+            tokio::select! {
+                answer = &mut push => panic!("upload ended before POST: {answer:?}"),
+                () = post_started.notified() => {}
+            }
+            tokio::time::advance(Duration::from_secs(23)).await;
+        } else {
+            assert_eq!(mode, "exhausted");
+            tokio::time::advance(Duration::from_secs(31)).await;
+        }
         let error = match futures::poll!(push.as_mut()) {
             std::task::Poll::Ready(Err(error)) => error,
             answer => panic!("auth and upload must end within one 30-second budget: {answer:?}"),
         };
-        assert_eq!(
-            error.to_string(),
-            "timeline timeout spent before the request could be sent"
-        );
-        let posted = post_started.notified();
-        tokio::pin!(posted);
-        assert!(futures::poll!(posted.as_mut()).is_pending());
+        if mode == "exhausted" {
+            assert_eq!(
+                error.to_string(),
+                "timeline timeout spent before the request could be sent"
+            );
+            let posted = post_started.notified();
+            tokio::pin!(posted);
+            assert!(futures::poll!(posted.as_mut()).is_pending());
+        } else {
+            assert!(
+                error.chain().any(|cause| cause
+                    .downcast_ref::<reqwest::Error>()
+                    .is_some_and(reqwest::Error::is_timeout)),
+                "{error:#}"
+            );
+        }
         server.abort();
         awake.abort();
     }

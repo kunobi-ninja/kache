@@ -9340,6 +9340,71 @@ fn init_saves_target_recovery_safely() {
 }
 
 #[test]
+fn doctor_checks_the_cargo_wrapper_once_and_names_init() {
+    use crate::wrapper_config::WrapperSetting;
+    let config = std::path::Path::new("/home/me/.cargo/config.toml");
+    let (pass, detail, fix) = wrapper_check(None, Some(false), config);
+    assert!(!pass);
+    assert_eq!(detail, "not set");
+    let fix = fix.unwrap();
+    assert!(fix.contains("kache init"), "{fix}");
+    assert!(fix.contains("config.toml"), "{fix}");
+
+    let env = |value: &str| WrapperSetting::Environment {
+        value: value.into(),
+    };
+    assert_eq!(
+        wrapper_check(Some(&env("/bin/kache")), None, config),
+        (true, "kache via env".to_string(), None)
+    );
+    let (pass, detail, fix) = wrapper_check(Some(&env("sccache")), None, config);
+    assert!(!pass);
+    assert_eq!(detail, "sccache (sccache)");
+    assert!(fix.unwrap().contains("export RUSTC_WRAPPER=kache"));
+    let (_, detail, _) = wrapper_check(Some(&env("other")), None, config);
+    assert_eq!(detail, "other (not kache)");
+
+    let file = |value: &str| WrapperSetting::CargoConfig {
+        value: value.into(),
+        path: config.to_path_buf(),
+    };
+    let (pass, detail, fix) = wrapper_check(Some(&file("kache")), Some(false), config);
+    assert!(pass, "{detail}");
+    assert!(detail.starts_with("kache via "), "{detail}");
+    assert!(fix.is_none());
+    let fix_for = |repair| {
+        wrapper_check(Some(&file("sccache")), repair, config)
+            .2
+            .unwrap()
+    };
+    assert!(fix_for(Some(true)).contains("kache doctor --fix"));
+    assert!(fix_for(Some(true)).contains("kache init"));
+    assert!(!fix_for(Some(false)).contains("--fix"));
+    assert!(fix_for(Some(false)).contains("kache init"));
+    assert!(fix_for(None).starts_with("replace `rustc-wrapper = \"sccache\"`"));
+}
+
+#[test]
+fn doctor_suggests_the_running_binary_directory_for_path() {
+    let dir = std::path::Path::new("/opt/kache/bin");
+    assert_eq!(binary_fix(true, Some(dir)), None);
+    assert_eq!(
+        binary_fix(false, Some(dir)).as_deref(),
+        Some("add /opt/kache/bin to PATH")
+    );
+    let fallback = binary_fix(false, None).unwrap();
+    assert!(!fallback.contains("cargo install"), "{fallback}");
+}
+
+#[test]
+fn doctor_lists_volume_stores_under_storage_and_only_live_daemon_labels() {
+    assert_eq!(doctor_section("Volume store"), "Storage");
+    for label in DAEMON_CHECK_LABELS {
+        assert_eq!(doctor_section(label), "Services", "{label}");
+    }
+}
+
+#[test]
 fn init_preview_ends_with_the_flags_given_or_nothing_to_change() {
     assert_eq!(
         preview_end(true, false, false, false),

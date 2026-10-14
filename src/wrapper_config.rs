@@ -34,14 +34,6 @@ pub(crate) fn resolve_wrapper_setting() -> Option<WrapperSetting> {
     )
 }
 
-pub(crate) fn cargo_wrapper_setting() -> Option<(String, PathBuf)> {
-    cargo_wrapper_setting_from(
-        std::env::current_dir().ok().as_deref(),
-        std::env::var_os("CARGO_HOME").map(PathBuf::from),
-        dirs::home_dir(),
-    )
-}
-
 pub(crate) fn cargo_rustdoc_setting() -> Option<(String, PathBuf)> {
     cargo_rustdoc_setting_from(
         std::env::current_dir().ok().as_deref(),

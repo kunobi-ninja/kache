@@ -66,7 +66,7 @@ pub fn probe_link_layout(build_dir: &Path, staging_dir: &Path) -> LinkLayoutRepo
         uid: current_uid(),
         source_owner: None,
         dest_owner: None,
-        ficlone_supported: ficlone_supported_in(staging_dir),
+        ficlone_supported: None,
     };
 
     // The build dir may not exist in a fresh doctor run (e.g. cwd deleted);
@@ -79,6 +79,8 @@ pub fn probe_link_layout(build_dir: &Path, staging_dir: &Path) -> LinkLayoutRepo
         ));
         return report;
     }
+    // Probed once staging exists: a first doctor run creates it above.
+    report.ficlone_supported = ficlone_supported_in(staging_dir);
     if let Err(e) = std::fs::write(&source_tmp, b"kache-link-probe") {
         report.error_kind = Some(io_kind_name(&e));
         report.error_message = Some(format!("creating probe file {}: {e}", source_tmp.display()));
@@ -106,6 +108,16 @@ pub fn probe_link_layout(build_dir: &Path, staging_dir: &Path) -> LinkLayoutRepo
         }
     }
     report
+}
+
+/// `path` as doctor shows it: resolved, so one directory reached through
+/// a symlink such as macOS's `/var` is named one way. Unresolvable paths
+/// are shown as given.
+pub(crate) fn shown_path(path: &Path) -> String {
+    std::fs::canonicalize(path)
+        .unwrap_or_else(|_| path.to_owned())
+        .display()
+        .to_string()
 }
 
 fn io_kind_name(e: &std::io::Error) -> String {
@@ -157,9 +169,9 @@ pub(crate) fn format_eperm_detail(
 pub(crate) fn format_probe_detail(report: &LinkLayoutReport) -> String {
     if report.hardlink_supported {
         let ficlone = match report.ficlone_supported {
-            Some(true) => "FICLONE supported",
-            Some(false) => "FICLONE unsupported (expected on ext4)",
-            None => "FICLONE unknown",
+            Some(true) => "reflinks supported",
+            Some(false) => "reflinks unsupported on this filesystem",
+            None => "reflink support unknown",
         };
         return format!("hardlink build-tree → <store>/staging works ({ficlone})");
     }
@@ -575,7 +587,8 @@ mod tests {
         report.ficlone_supported = Some(true);
         let got = format_probe_detail(&report);
         assert!(got.contains("works"));
-        assert!(got.contains("FICLONE supported"));
+        assert!(got.contains("reflinks supported"), "{got}");
+        assert!(!got.contains("FICLONE"), "{got}");
     }
 
     #[test]
@@ -584,7 +597,8 @@ mod tests {
         report.hardlink_supported = true;
         report.ficlone_supported = Some(false);
         let got = format_probe_detail(&report);
-        assert!(got.contains("FICLONE unsupported"));
+        assert!(got.contains("reflinks unsupported"), "{got}");
+        assert!(!got.contains("ext4"), "{got}");
     }
 
     #[test]
@@ -593,7 +607,7 @@ mod tests {
         report.hardlink_supported = true;
         report.ficlone_supported = None;
         let got = format_probe_detail(&report);
-        assert!(got.contains("FICLONE unknown"));
+        assert!(got.contains("reflink support unknown"), "{got}");
     }
 
     #[test]
@@ -664,6 +678,31 @@ mod tests {
         // dir yields None. Do not assert true/false: that varies by
         // filesystem (APFS vs ext4) and would flake.
         assert!(ficlone_supported_in(dir.path()).is_some());
+    }
+
+    #[test]
+    fn probe_reports_reflinks_for_a_staging_dir_it_creates() {
+        let dir = tempfile::tempdir().unwrap();
+        let staging_dir = dir.path().join("store").join("staging");
+        let report = probe_link_layout(dir.path(), &staging_dir);
+        assert!(report.ficlone_supported.is_some(), "{report:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shown_paths_name_one_directory_one_way() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let alias = dir.path().join("alias");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        assert_eq!(shown_path(&alias), shown_path(&real));
+        assert_eq!(
+            shown_path(&real),
+            std::fs::canonicalize(&real).unwrap().display().to_string()
+        );
+        let missing = dir.path().join("missing");
+        assert_eq!(shown_path(&missing), missing.display().to_string());
     }
 
     #[test]

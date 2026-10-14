@@ -6772,6 +6772,68 @@ fn wrapper_setting_repair(
     }
 }
 
+/// Doctor's one check of the wrapper Cargo uses, as `(pass, detail, fix)`.
+/// `repair` is [`wrapper_setting_repair`]'s answer; `cargo_config` is the
+/// file `kache init` would edit.
+fn wrapper_check(
+    setting: Option<&crate::wrapper_config::WrapperSetting>,
+    repair: Option<bool>,
+    cargo_config: &std::path::Path,
+) -> (bool, String, Option<String>) {
+    use crate::wrapper_config::{WrapperSetting, display_path};
+    match setting {
+        Some(WrapperSetting::Environment { value }) if value.contains("kache") => {
+            (true, "kache via env".into(), None)
+        }
+        Some(WrapperSetting::Environment { value }) => (
+            false,
+            if value.contains("sccache") {
+                format!("sccache ({value})")
+            } else {
+                format!("{value} (not kache)")
+            },
+            Some("export RUSTC_WRAPPER=kache, or unset it and run `kache init`".into()),
+        ),
+        Some(WrapperSetting::CargoConfig { value, path }) if value.contains("kache") => {
+            (true, format!("kache via {}", display_path(path)), None)
+        }
+        Some(WrapperSetting::CargoConfig { value, path }) => (
+            false,
+            format!("{value} in {}", display_path(path)),
+            Some(match repair {
+                Some(true) => {
+                    "run `kache doctor --fix` or `kache init` to replace it with kache".to_string()
+                }
+                Some(false) => "run `kache init` to replace it with kache".to_string(),
+                None => format!(
+                    "replace `rustc-wrapper = \"{value}\"` with `rustc-wrapper = \"kache\"` in {}",
+                    path.display()
+                ),
+            }),
+        ),
+        None => (
+            false,
+            "not set".into(),
+            Some(format!(
+                "run `kache init` to set it in {}, or export RUSTC_WRAPPER=kache",
+                display_path(cargo_config)
+            )),
+        ),
+    }
+}
+
+/// Doctor's fix when `kache` is not on PATH: add the directory of the
+/// binary that is running.
+fn binary_fix(on_path: bool, running_dir: Option<&std::path::Path>) -> Option<String> {
+    if on_path {
+        return None;
+    }
+    Some(match running_dir {
+        Some(dir) => format!("add {} to PATH", dir.display()),
+        None => "add the directory that holds kache to PATH".to_string(),
+    })
+}
+
 /// File `label` under the command that repairs it, if any.
 fn note_repair(
     label: &'static str,
@@ -6839,13 +6901,7 @@ fn doctor_config_file_check(
 /// Labels of the daemon-related checks that become informational when the
 /// daemon is optional. Kept in sync with the check constructions in
 /// [`doctor`]; module-level so the disposition logic below is unit-testable.
-const DAEMON_CHECK_LABELS: [&str; 5] = [
-    "Daemon version",
-    "Daemon service",
-    "Daemon processes",
-    "Stale locks",
-    "Service exe",
-];
+const DAEMON_CHECK_LABELS: [&str; 3] = ["Daemon version", "Daemon service", "Service exe"];
 
 /// The host config path `kache stats` names, only when the host file is
 /// actually merged in: absent, disabled or unusable files are not in effect.
@@ -7171,7 +7227,7 @@ fn doctor_link_layout(config: &Config, build_dir: &std::path::Path) -> Check {
     let probe = crate::link_probe::probe_link_layout(build_dir, &staging);
     Check {
         label: "Link layout", pass: probe.hardlink_supported,
-        detail: format!("{} (build: {}, staging: {})", crate::link_probe::format_probe_detail(&probe), build_dir.display(), staging.display()),
+        detail: format!("{} (build: {}, staging: {})", crate::link_probe::format_probe_detail(&probe), crate::link_probe::shown_path(build_dir), crate::link_probe::shown_path(&staging)),
         fix: (!probe.hardlink_supported).then(|| "put the cache and build tree on the SAME mount for zero-copy sharing; if this layout is intentional, expect copies (see `kache report` copy reasons)".into()),
     }
 }
@@ -7211,6 +7267,7 @@ fn doctor_section(label: &str) -> &'static str {
         || label.starts_with("Store")
         || label.starts_with("Shard")
         || label.starts_with("Link")
+        || label.starts_with("Volume")
     {
         "Storage"
     } else {
@@ -7268,18 +7325,15 @@ pub fn doctor(
     } else {
         (false, "not found".into())
     };
+    let running = std::env::current_exe().ok();
     checks.push(Check {
         label: "Binary",
         pass: bin_pass,
         detail: bin_detail,
-        fix: if bin_pass {
-            None
-        } else {
-            Some(format!(
-                "cargo install --path . or add {} to PATH",
-                cargo_home_dir().join("bin").display()
-            ))
-        },
+        fix: binary_fix(
+            bin_pass,
+            running.as_deref().and_then(std::path::Path::parent),
+        ),
     });
 
     // Checks `doctor --fix` and `kache init` repair when they fail, for the
@@ -7296,90 +7350,16 @@ pub fn doctor(
         &mut fix_repairs,
         &mut init_repairs,
     );
-    let (wrapper_pass, wrapper_detail, wrapper_fix) = match wrapper_setting {
-        Some(crate::wrapper_config::WrapperSetting::Environment { value })
-            if value.contains("kache") =>
-        {
-            (true, "kache via env".into(), None)
-        }
-        Some(crate::wrapper_config::WrapperSetting::Environment { value })
-            if value.contains("sccache") =>
-        {
-            (
-                false,
-                format!("sccache ({value})"),
-                Some("export RUSTC_WRAPPER=kache".into()),
-            )
-        }
-        Some(crate::wrapper_config::WrapperSetting::Environment { value }) => (
-            false,
-            format!("{value} (not kache)"),
-            Some("export RUSTC_WRAPPER=kache".into()),
-        ),
-        Some(crate::wrapper_config::WrapperSetting::CargoConfig { value, path })
-            if value.contains("kache") =>
-        {
-            (
-                true,
-                format!("kache via {}", crate::wrapper_config::display_path(&path)),
-                None,
-            )
-        }
-        Some(crate::wrapper_config::WrapperSetting::CargoConfig { value, path }) => (
-            false,
-            format!("{value} in {}", crate::wrapper_config::display_path(&path)),
-            Some(format!(
-                "replace `rustc-wrapper = \"{value}\"` with `rustc-wrapper = \"kache\"` in {}",
-                path.display()
-            )),
-        ),
-        None => (
-            false,
-            "not set".into(),
-            Some(format!(
-                "set `build.rustc-wrapper = \"kache\"` in {} or export RUSTC_WRAPPER=kache",
-                cargo_config_target_path().display()
-            )),
-        ),
-    };
+    let (wrapper_pass, wrapper_detail, wrapper_fix) = wrapper_check(
+        wrapper_setting.as_ref(),
+        wrapper_setting_repair(wrapper_setting.as_ref(), &cargo_home),
+        &cargo_config_target_path(),
+    );
     checks.push(Check {
         label: "RUSTC_WRAPPER",
         pass: wrapper_pass,
         detail: wrapper_detail,
         fix: wrapper_fix,
-    });
-
-    // 3. Cargo config
-    let cargo_setting = crate::wrapper_config::cargo_wrapper_setting();
-    if let Some((value, path)) = &cargo_setting {
-        note_repair(
-            "Cargo config",
-            cargo_wrapper_repair(value, path, &cargo_home),
-            &mut fix_repairs,
-            &mut init_repairs,
-        );
-    }
-    let (cargo_pass, cargo_detail, cargo_fix) = match cargo_setting {
-        Some((value, path)) if value.contains("kache") => (
-            true,
-            format!("kache in {}", crate::wrapper_config::display_path(&path)),
-            None,
-        ),
-        Some((value, path)) => (
-            false,
-            format!("{value} in {}", crate::wrapper_config::display_path(&path)),
-            Some(format!(
-                "replace `rustc-wrapper = \"{value}\"` with `rustc-wrapper = \"kache\"` in {}",
-                path.display()
-            )),
-        ),
-        None => (true, "not set".to_string(), None),
-    };
-    checks.push(Check {
-        label: "Cargo config",
-        pass: cargo_pass,
-        detail: cargo_detail,
-        fix: cargo_fix,
     });
 
     let rustdoc_setting = crate::wrapper_config::cargo_rustdoc_setting();

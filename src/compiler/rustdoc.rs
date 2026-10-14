@@ -9,7 +9,8 @@
 //! key, so a second checkout restores into its own directories. The key hashes
 //! the crate source, every `mod` and string `include!` it names, and each flag
 //! with its name. Dep-info is not an input: the first `cargo doc` has none,
-//! and hashing it would miss on the next identical run.
+//! and hashing it would miss on the next identical run. Source environment
+//! macros pass through until compiler environment dependencies are tracked.
 
 use anyhow::{Context, Result};
 use std::collections::{BTreeMap, BTreeSet};
@@ -464,6 +465,9 @@ enum Tok {
 
 fn scan_rust(bytes: &[u8]) -> Result<Vec<Found>> {
     let tokens = rust_tokens(bytes);
+    if has_environment_macro(&tokens) {
+        anyhow::bail!("rustdoc environment macros require compiler dependency tracking");
+    }
     let mut found = Vec::new();
     let mut pending_path: Option<String> = None;
     // Inline `mod name { ... }` bodies. A child `mod` is `name/child.rs`,
@@ -558,6 +562,14 @@ fn scan_rust(bytes: &[u8]) -> Result<Vec<Found>> {
         index += 1;
     }
     Ok(found)
+}
+
+fn has_environment_macro(tokens: &[Tok]) -> bool {
+    tokens.windows(3).any(|macro_tokens| {
+        matches!(&macro_tokens[0], Tok::Ident(name) if matches!(name.as_str(), "env" | "option_env"))
+            && punct_at(macro_tokens, 1, b'!')
+            && matches!(macro_tokens[2], Tok::Punct(b'(' | b'[' | b'{'))
+    })
 }
 
 fn is_include(name: &str) -> bool {

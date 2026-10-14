@@ -908,21 +908,54 @@ mod tests {
     }
 
     #[test]
-    fn refuse_reasons_refuses_explicit_dep_info_output_path() {
-        let parsed = RustcCompiler::new()
+    fn refuse_reasons_refuses_explicit_emit_destinations_but_allows_defaults() {
+        let compiler = RustcCompiler::new();
+        for kind in ["metadata", "link", "obj", "dep-info"] {
+            for separated in [false, true] {
+                let mut args = s(&["rustc", "src/lib.rs", "--crate-name", "foo"]);
+                let emit = format!("metadata,{kind}=custom/artifact");
+                if separated {
+                    args.extend(s(&["--emit", &emit]));
+                } else {
+                    args.push(format!("--emit={emit}"));
+                }
+                let parsed = compiler.parse(&args).unwrap();
+                let reasons = compiler.refuse_reasons(&parsed);
+                assert!(
+                    reasons.iter().any(|reason| matches!(reason,
+                        RefuseReason::Unsupported(detail) if detail.contains("explicit --emit")
+                    )),
+                    "{kind} {separated}: {reasons:?}"
+                );
+            }
+        }
+        let empty = compiler
             .parse(&s(&[
                 "rustc",
                 "src/lib.rs",
                 "--crate-name",
                 "foo",
-                "--emit=metadata,dep-info=custom/deps.mk",
+                "--emit=metadata=",
             ]))
             .unwrap();
-        let reasons = RustcCompiler::new().refuse_reasons(&parsed);
-        assert!(reasons.iter().any(|reason| matches!(
-            reason,
-            RefuseReason::Unsupported(detail) if detail.contains("explicit --emit=dep-info")
-        )));
+        assert!(
+            compiler
+                .refuse_reasons(&empty)
+                .iter()
+                .any(|reason| matches!(reason,
+                    RefuseReason::Unsupported(detail) if detail.contains("explicit --emit")
+                ))
+        );
+        let parsed = compiler
+            .parse(&s(&[
+                "rustc",
+                "src/lib.rs",
+                "--crate-name",
+                "foo",
+                "--emit=metadata,link",
+            ]))
+            .unwrap();
+        assert!(compiler.refuse_reasons(&parsed).is_empty());
     }
 
     #[test]

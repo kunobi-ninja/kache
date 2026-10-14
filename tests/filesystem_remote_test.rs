@@ -942,6 +942,99 @@ fn a_fresh_client_can_seed_itself_from_the_shared_folder() {
     assert!(out_b.path().join("libfsremote.rlib").is_file());
 }
 
+#[test]
+fn concurrent_bulk_sync_clients_hydrate_shared_store_without_errors() {
+    build_kache();
+    let shared = TempDir::new().unwrap();
+    let sources = TempDir::new().unwrap();
+    let src = sources.path().join("lib.rs");
+    let mut state = 0x1234_5678_u32;
+    let payload: Vec<u8> = (0..256 * 1024)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state as u8
+        })
+        .collect();
+    std::fs::write(sources.path().join("data.bin"), payload).unwrap();
+    let alpha = Client::new(shared.path());
+    let output = TempDir::new().unwrap();
+    for n in 0..24 {
+        std::fs::write(
+            &src,
+            format!(
+                "pub static DATA: &[u8] = include_bytes!(\"data.bin\");\n\
+                 pub fn value() -> u32 {{ {n} }}\n"
+            ),
+        )
+        .unwrap();
+        alpha.compile(&src, output.path());
+    }
+    alpha.stop_daemon_and_wait();
+    let committed = |cache: &Path| -> i64 {
+        rusqlite::Connection::open(cache.join("index.db"))
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM entries WHERE committed = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+    };
+    assert_eq!(committed(&alpha.cache_dir), 24, "seed all fixture entries");
+    let clean = Client::new(shared.path());
+    clean.sync(&["--pull", "--all"]);
+    assert_eq!(
+        committed(&clean.cache_dir),
+        24,
+        "valid packs hydrate cleanly"
+    );
+    clean.sync(&["--pull", "--all"]);
+    assert_eq!(
+        committed(&clean.cache_dir),
+        24,
+        "committed sync stays complete"
+    );
+
+    for _ in 0..3 {
+        let node = TempDir::new().unwrap();
+        let clients: Vec<_> = (0..4)
+            .map(|_| Client::for_shared_store(shared.path(), node.path()))
+            .collect();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
+        let results = std::thread::scope(|scope| {
+            let handles: Vec<_> = clients
+                .iter()
+                .map(|client| {
+                    let barrier = barrier.clone();
+                    scope.spawn(move || {
+                        barrier.wait();
+                        client.run(&["sync", "--pull", "--all"])
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(
+            committed(node.path()),
+            24,
+            "hydrate every shared-store entry"
+        );
+        for result in results {
+            assert!(
+                result.status.success(),
+                "concurrent bulk sync must not race extraction against import:\nstdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr),
+            );
+        }
+    }
+}
+
 /// kunobi-ninja/kache#774: a remote object that vanished mid-run is a miss,
 /// never an error.
 ///

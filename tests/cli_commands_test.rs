@@ -2901,7 +2901,7 @@ fn daemon_without_subcommand_succeeds() {
 
 #[test]
 fn daemon_status_subcommand_succeeds() {
-    // `kache daemon status` is the explicit alias for bare `kache daemon`.
+    // `kache daemon status` does the same as bare `kache daemon`.
     // Pin the equivalence: both forms must exit identically and produce
     // byte-identical stdout in the same environment.
     let e = env();
@@ -2911,8 +2911,13 @@ fn daemon_status_subcommand_succeeds() {
     assert_eq!(explicit.status, bare.status);
     assert_eq!(explicit.stdout, bare.stdout);
     let stdout = String::from_utf8_lossy(&bare.stdout);
-    assert!(stdout.contains("kache:"), "status body missing: {stdout}");
-    assert!(stdout.contains("Daemon:"), "daemon state missing: {stdout}");
+    assert!(stdout.contains("  CLI "), "status body missing: {stdout}");
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.starts_with("  Daemon ") && line.contains("not running")),
+        "daemon state missing: {stdout}"
+    );
 }
 
 // ── populated-cache behavior ────────────────────────────────────────────────

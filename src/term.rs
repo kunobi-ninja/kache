@@ -147,6 +147,9 @@ pub(crate) fn named_sections(sections: &[NamedSection<'_>]) -> Vec<String> {
     lines
 }
 
+/// Rows without a section heading. Commands print through
+/// [`named_sections`]; tests render single rows with this.
+#[cfg(test)]
 pub(crate) fn rows(rows: &[Row<'_>]) -> Vec<String> {
     rows_with(rows, Output::current())
 }

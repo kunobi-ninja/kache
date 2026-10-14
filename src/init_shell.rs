@@ -241,9 +241,21 @@ impl Edit {
         self.original.as_deref() != Some(&self.updated)
     }
 
+    /// Whether the file does not exist yet, so applying creates it.
+    pub fn creates(&self) -> bool {
+        self.original.is_none()
+    }
+
     /// Preserve the old file in a unique sibling before atomic replacement.
     /// Do not replace a config that changed after the confirmation prompt.
+    #[cfg(test)]
     pub fn apply(&self) -> Result<Option<PathBuf>> {
+        self.apply_keeping(true)
+    }
+
+    /// [`Self::apply`], keeping a backup of an existing file only when
+    /// `keep_backup` is set: not for a file this run already created or backed up.
+    pub fn apply_keeping(&self, keep_backup: bool) -> Result<Option<PathBuf>> {
         use std::io::Write;
         ensure!(
             read_regular(&self.path)? == self.original,
@@ -263,7 +275,7 @@ impl Edit {
         }
         replacement.write_all(self.updated.as_bytes())?;
         replacement.as_file().sync_all()?;
-        let backup = if let Some(original) = &self.original {
+        let backup = if let Some(original) = self.original.as_ref().filter(|_| keep_backup) {
             let mut backup = tempfile::Builder::new()
                 .prefix(".kache-shell-backup-")
                 .tempfile_in(parent)?;
@@ -343,6 +355,31 @@ mod tests {
                 .unwrap(),
             [PathBuf::from("/xdg/fish/config.fish")]
         );
+    }
+
+    #[test]
+    fn a_file_init_already_covered_is_changed_without_another_backup() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join(".bashrc");
+        let activation = Shell::Bash.activation(Path::new("/shims")).unwrap();
+        let edit = Edit::plan(path.clone(), &activation).unwrap();
+        assert!(edit.creates());
+        assert!(edit.apply_keeping(true).unwrap().is_none());
+        let edit = Edit::plan_block(path.clone(), TEST_RUNNER_BLOCK, "export X=1").unwrap();
+        assert!(!edit.creates() && edit.changed());
+        assert!(edit.apply_keeping(false).unwrap().is_none());
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("export X=1")
+        );
+        let backups = std::fs::read_dir(home.path())
+            .unwrap()
+            .filter(|entry| entry.as_ref().unwrap().file_name() != ".bashrc")
+            .count();
+        assert_eq!(backups, 0);
+        let edit = Edit::plan_block(path.clone(), TEST_RUNNER_BLOCK, "export X=2").unwrap();
+        assert!(edit.apply_keeping(true).unwrap().is_some());
     }
 
     #[test]

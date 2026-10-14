@@ -727,13 +727,19 @@ fn init_plan_matches_the_requested_components_and_keeps_prompt_lines_separate() 
             .any(|step| step["component"] == "login_service")
     );
     let text = String::from_utf8(output.stderr).unwrap();
-    assert!(text.contains("  Service "), "{text}");
-    assert!(!text.contains("  Shell "), "{text}");
+    assert!(!text.contains("Login service: skipped"), "{text}");
+    assert!(
+        text.contains("C/C++ caching: skipped (--no-shell)"),
+        "{text}"
+    );
+    // A preview lists the changes once, with no plan table before them.
+    assert!(!text.contains("Setup plan"), "{text}");
+    assert_eq!(text.matches("Preview only").count(), 1, "{text}");
 }
 
 #[cfg(unix)]
 #[test]
-fn init_shell_plan_lists_only_the_shell_paths() {
+fn init_check_steps_follow_the_plans() {
     let e = env();
     let output = e
         .cmd()
@@ -743,34 +749,67 @@ fn init_shell_plan_lists_only_the_shell_paths() {
     assert!(output.status.success());
     let plan: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     let steps = plan["steps"].as_array().unwrap();
-    assert!(
-        !steps
+    let step = |component: &str| {
+        steps
             .iter()
-            .any(|step| step["component"] == "login_service")
-    );
-    let shell = steps
-        .iter()
-        .find(|step| step["component"] == "shell")
-        .unwrap();
+            .find(|step| step["component"] == component)
+            .cloned()
+    };
+    assert!(step("login_service").is_none());
+    let shell = step("shell").unwrap();
+    assert_eq!(shell["action"], "configure");
+    // The preview shows the build.rustdoc edit the real run makes.
+    assert_eq!(step("rustdoc").unwrap()["action"], "configure");
+    assert!(step("free_space_recovery").is_some());
+    // Nothing exists yet, so nothing needs a backup.
+    assert!(step("backup").is_none(), "{steps:?}");
+    assert_eq!(plan["shell_activation_required"], true);
     let text = String::from_utf8(output.stderr).unwrap();
-    assert!(text.contains("  Shell "), "{text}");
-    assert!(!text.contains("  Service "), "{text}");
-    let shell_files = text
-        .lines()
-        .filter(|line| line.starts_with("  Shell file "))
-        .collect::<Vec<_>>();
+    assert!(text.contains("Would set build.rustdoc to "), "{text}");
+    assert!(
+        text.contains("Login service: skipped (--no-service)"),
+        "{text}"
+    );
+    assert!(
+        text.contains("Preview only. Run kache init --no-service to apply."),
+        "{text}"
+    );
     let paths = shell["paths"].as_array().unwrap();
-    assert_eq!(shell_files.len(), paths.len(), "{text}");
+    assert!(!paths.is_empty());
     for path in paths {
         let path = std::path::Path::new(path.as_str().unwrap());
-        assert!(
-            shell_files
-                .iter()
-                .any(|line| line.contains(path.file_name().unwrap().to_str().unwrap())),
-            "{text}"
-        );
+        let name = path.file_name().unwrap().to_str().unwrap();
+        assert!(text.contains(&format!("Shell config: ~/{name}")), "{text}");
     }
     assert!(!e.home.join(".bashrc").exists());
+}
+
+/// With a login shell init cannot set up, the plan leaves out the shell rows.
+#[cfg(unix)]
+#[test]
+fn init_plan_lists_shell_rows_only_for_a_supported_shell() {
+    let e = env();
+    let output = e
+        .cmd()
+        .args(["init", "--no-service"])
+        .env("SHELL", "/bin/tcsh")
+        .write_stdin("n\n")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.contains("Setup plan"), "{text}");
+    assert!(!text.contains("  Shell "), "{text}");
+    assert!(!text.contains("  Docs "), "{text}");
+    let output = e
+        .cmd()
+        .args(["init", "--no-service"])
+        .write_stdin("n\n")
+        .output()
+        .unwrap();
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.contains("  Shell "), "{text}");
+    assert!(text.contains("  Docs "), "{text}");
 }
 
 #[cfg(unix)]
@@ -885,7 +924,7 @@ fn terminal_color_policy_and_wrapping_match_the_actual_command() {
             colored,
             "{no_color:?}, {term}: {text:?}"
         );
-        assert!(text.contains("Setup plan"), "{text}");
+        assert!(text.contains("Proposed changes"), "{text}");
     }
     // The plan table comes before the question, which nobody answers here.
     let plan = |columns: u16, env_columns: Option<&str>| {
@@ -1923,11 +1962,19 @@ fn init_check_is_a_dry_run() {
 fn init_eof_does_not_accept_changes() {
     // With nobody to answer, init must not look like it succeeded (#1080).
     let e = env();
-    e.cmd()
-        .args(["init", "--no-service"])
-        .assert()
-        .failure()
-        .stderr(predicates::str::contains("rerun with --yes"));
+    let output = e.cmd().args(["init", "--no-service"]).output().unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("Run `kache init --no-service --yes`"),
+        "{stderr}"
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(
+        stdout.matches("--yes").count() + stderr.matches("--yes").count(),
+        1,
+        "{stdout}{stderr}"
+    );
     assert!(!e.home.join(".cargo/config.toml").exists());
     assert!(!e.home.join(".bashrc").exists());
     assert!(!e.home.join(".local/lib/kache/shims").exists());
@@ -2320,6 +2367,46 @@ fn init_exports_the_test_runner_for_the_host() {
     assert!(saved.contains("kache compiler cache"), "{saved}");
     let profile = std::fs::read_to_string(e.home.join(".bash_profile")).unwrap();
     assert!(profile.contains(&export), "{profile}");
+    // The startup files this run created get no backup before the test
+    // pacing edit; on a fresh machine nothing does.
+    assert!(!out.contains("Backup: ~/.bash"), "{out}");
+    let fresh = env();
+    let fresh_out = init(&fresh, &["--no-service"], None, "y\n");
+    assert!(!fresh_out.contains("Backup:"), "{fresh_out}");
+    for dir in [fresh.home.clone(), fresh.home.join(".cargo")] {
+        let backups: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name.to_string_lossy().starts_with(".kache-"))
+            .collect();
+        assert!(backups.is_empty(), "{backups:?}");
+    }
+    // On a configured machine the preview keeps every step.
+    let plan: serde_json::Value = serde_json::from_str(&init(
+        &e,
+        &["--no-service", "--check", "--json"],
+        Some("kache test-runner"),
+        "",
+    ))
+    .unwrap();
+    for component in ["cargo", "shell", "rustdoc", "test_runner"] {
+        let step = plan["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|step| step["component"] == component)
+            .unwrap_or_else(|| panic!("{component}: {plan}"));
+        assert_eq!(step["action"], "keep", "{component}: {plan}");
+    }
+    assert_eq!(plan["test_activation_required"], false, "{plan}");
+    let out = init(
+        &e,
+        &["--no-service", "--check"],
+        Some("kache test-runner"),
+        "",
+    );
+    assert!(out.contains("Nothing to change."), "{out}");
+    assert!(!out.contains("Proposed changes"), "{out}");
 
     // Nothing to change on a rerun; the terminal decides what init reports.
     let out = init(&e, &["--no-service"], Some("kache test-runner"), "y\n");

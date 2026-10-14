@@ -585,12 +585,12 @@ fn status_wording_names_the_fix() {
         (
             broken(FARM, &["cc", "gcc"], "/gone/kache"),
             "broken: cc, gcc in /home/me/.local/lib/kache/shims point at /gone/kache, which is missing or not executable",
-            Some("kache install-shims"),
+            Some("kache init --shims"),
         ),
         (
             broken("/usr/lib/kache", &["cc"], "/gone/kache"),
             "broken: cc in /usr/lib/kache point at /gone/kache, which is missing or not executable",
-            Some("kache install-shims /usr/lib/kache"),
+            Some("kache init --shims /usr/lib/kache"),
         ),
         (
             Status::NotFirst { dir: FARM.into() },
@@ -600,7 +600,7 @@ fn status_wording_names_the_fix() {
         (
             Status::NotInstalled,
             "not installed",
-            Some("kache install-shims && export PATH=\"/home/me/.local/lib/kache/shims:$PATH\""),
+            Some("kache init --shims && export PATH=\"/home/me/.local/lib/kache/shims:$PATH\""),
         ),
     ];
     for (status, detail, fix) in rows {
@@ -610,7 +610,7 @@ fn status_wording_names_the_fix() {
     // Without a home directory there is no default farm to name.
     assert_eq!(
         broken(FARM, &["cc"], "/gone/kache").fix(None).as_deref(),
-        Some("kache install-shims /home/me/.local/lib/kache/shims")
+        Some("kache init --shims /home/me/.local/lib/kache/shims")
     );
     let homeless = Status::NotInstalled.fix(None).unwrap();
     assert!(homeless.starts_with("no home directory"), "{homeless}");

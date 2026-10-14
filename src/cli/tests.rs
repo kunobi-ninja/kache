@@ -9338,3 +9338,155 @@ fn init_saves_target_recovery_safely() {
     // An unreadable path is an error, not an empty file.
     assert!(read_config_text(dir.path()).is_err());
 }
+
+#[test]
+fn init_preview_ends_with_the_flags_given_or_nothing_to_change() {
+    assert_eq!(
+        preview_end(true, false, false, false),
+        "Preview only. Run kache init to apply."
+    );
+    assert_eq!(
+        preview_end(true, true, true, true),
+        "Preview only. Run kache init --no-service --no-shell --yes to apply."
+    );
+    assert_eq!(
+        preview_end(true, false, true, false),
+        "Preview only. Run kache init --no-shell to apply."
+    );
+    assert_eq!(preview_end(false, true, false, false), "Nothing to change.");
+}
+
+#[test]
+fn init_steps_follow_the_plans() {
+    assert_eq!(edit_action(false, false), "keep");
+    assert_eq!(edit_action(true, false), "configure");
+    assert_eq!(edit_action(false, true), "configure");
+    for action in ["configure", "update"] {
+        assert!(step_changes(action), "{action}");
+    }
+    for action in [
+        "keep",
+        "unsupported",
+        "unavailable",
+        "manual",
+        "ensure_running",
+        "create",
+    ] {
+        assert!(!step_changes(action), "{action}");
+    }
+    assert_eq!(rustdoc_action(RustdocEdit::Write), Some("configure"));
+    assert_eq!(rustdoc_action(RustdocEdit::Already), Some("keep"));
+    assert_eq!(rustdoc_action(RustdocEdit::Leave), Some("keep"));
+    assert_eq!(rustdoc_action(RustdocEdit::Skip), None);
+    assert_eq!(service_action(true, true, true, true), None);
+    assert_eq!(
+        service_action(false, false, true, true),
+        Some("unavailable")
+    );
+    assert_eq!(service_action(false, true, true, true), Some("update"));
+    assert_eq!(service_action(false, true, true, false), Some("keep"));
+    assert_eq!(service_action(false, true, false, false), Some("configure"));
+}
+
+#[test]
+fn init_never_backs_up_a_file_it_created() {
+    let mut created = Vec::new();
+    let config = std::path::Path::new("/home/me/.cargo/config.toml");
+    let rc = std::path::Path::new("/home/me/.bashrc");
+    // The run creates the Cargo config, then edits it again for rustdoc.
+    assert!(backup_step(&mut created, config, false).is_none());
+    assert!(backup_step(&mut created, config, true).is_none());
+    assert!(backup_step(&mut created, config, false).is_none());
+    assert_eq!(created, [config]);
+    // An existing startup file is backed up before each edit.
+    for _ in 0..2 {
+        let step = backup_step(&mut created, rc, true).unwrap();
+        assert_eq!((step.component, step.action), ("backup", "create"));
+        assert_eq!(step.paths, [rc]);
+    }
+    assert_eq!(created, [config]);
+}
+
+#[test]
+fn init_steps_list_each_edit_with_the_backup_before_it() {
+    use std::path::PathBuf;
+    let cargo = PathBuf::from("/home/me/.cargo/config.toml");
+    let rc = PathBuf::from("/home/me/.bashrc");
+    let facts = |cargo_ready: bool, cargo_exists: bool, rc_exists: bool| SetupFacts {
+        cargo_path: cargo.clone(),
+        cargo_ready,
+        cargo_exists,
+        shell: Some(SetupStep::new("shell", "configure", vec![rc.clone()])),
+        shell_changes: vec![(rc.clone(), rc_exists)],
+        rustdoc: Some("configure"),
+        test_runner: Some(SetupStep::new("test_runner", "configure", vec![rc.clone()])),
+        test_changes: vec![(rc.clone(), rc_exists)],
+        recovery_asks: false,
+        recovery_path: PathBuf::from("/home/me/.config/kache/config.toml"),
+        service: Some("keep"),
+        service_path: Some(PathBuf::from("/svc")),
+    };
+    let summary = |steps: Vec<SetupStep>| {
+        steps
+            .into_iter()
+            .map(|step| {
+                let path = step
+                    .paths
+                    .first()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_default();
+                format!("{} {} {path}", step.component, step.action)
+            })
+            .collect::<Vec<_>>()
+    };
+    // A fresh machine: init creates every file it edits, so no backups.
+    assert_eq!(
+        summary(setup_steps(facts(false, false, false))),
+        [
+            "cargo configure /home/me/.cargo/config.toml",
+            "shell configure /home/me/.bashrc",
+            "rustdoc configure /home/me/.cargo/config.toml",
+            "test_runner configure /home/me/.bashrc",
+            "free_space_recovery keep /home/me/.config/kache/config.toml",
+            "login_service keep /svc",
+            "daemon ensure_running ",
+        ]
+    );
+    // Existing files are backed up before each edit.
+    assert_eq!(
+        summary(setup_steps(facts(false, true, true))),
+        [
+            "cargo configure /home/me/.cargo/config.toml",
+            "backup create /home/me/.cargo/config.toml",
+            "shell configure /home/me/.bashrc",
+            "backup create /home/me/.bashrc",
+            "rustdoc configure /home/me/.cargo/config.toml",
+            "backup create /home/me/.cargo/config.toml",
+            "test_runner configure /home/me/.bashrc",
+            "backup create /home/me/.bashrc",
+            "free_space_recovery keep /home/me/.config/kache/config.toml",
+            "login_service keep /svc",
+            "daemon ensure_running ",
+        ]
+    );
+    // A configured machine keeps Cargo; nothing else is listed when skipped.
+    let kept = SetupFacts {
+        shell: None,
+        shell_changes: Vec::new(),
+        rustdoc: Some("keep"),
+        test_runner: None,
+        test_changes: Vec::new(),
+        recovery_asks: true,
+        service: None,
+        ..facts(true, true, true)
+    };
+    assert_eq!(
+        summary(setup_steps(kept)),
+        [
+            "cargo keep /home/me/.cargo/config.toml",
+            "rustdoc keep /home/me/.cargo/config.toml",
+            "free_space_recovery ask /home/me/.config/kache/config.toml",
+            "daemon ensure_running ",
+        ]
+    );
+}

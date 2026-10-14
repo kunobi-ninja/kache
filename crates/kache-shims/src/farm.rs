@@ -456,17 +456,18 @@ impl Status {
         match self {
             Status::Active { .. } => None,
             Status::Broken { dir, .. } if Some(dir.as_path()) == default_dir => {
-                Some("kache install-shims".into())
+                Some("kache init --shims".into())
             }
-            Status::Broken { dir, .. } => Some(format!("kache install-shims {}", dir.display())),
+            Status::Broken { dir, .. } => Some(format!("kache init --shims {}", dir.display())),
             Status::NotFirst { dir } => Some(format!("export PATH=\"{}:$PATH\"", dir.display())),
             Status::NotInstalled => Some(match default_dir {
                 Some(dir) => format!(
-                    "kache install-shims && export PATH=\"{}:$PATH\"",
+                    "kache init --shims && export PATH=\"{}:$PATH\"",
                     dir.display()
                 ),
-                None => "no home directory: run kache install-shims DIR and put DIR first on PATH"
-                    .into(),
+                None => {
+                    "no home directory: run kache init --shims DIR and put DIR first on PATH".into()
+                }
             }),
         }
     }

@@ -4993,6 +4993,7 @@ impl Daemon {
         &self,
         v3: &crate::cache_remote::V3Remote,
         prefix: &str,
+        plan_deadline: RemoteDeadline,
         receipt: &mut PrefetchReceipt,
     ) -> Result<Vec<String>> {
         let breaker = self
@@ -5000,7 +5001,8 @@ impl Daemon {
             .try_acquire(RemoteOperation::PrefetchGet)
             .ok_or_else(|| anyhow::anyhow!("remote read breaker open"))?;
         let deadline = RemoteDeadline::from_secs(self.config.remote_restore_timeout_secs);
-        let gate = deadline
+        let queue_deadline = deadline.min(plan_deadline);
+        let gate = queue_deadline
             .run("pack catalog gate", async {
                 self.prefetch_gate
                     .clone()
@@ -5009,7 +5011,7 @@ impl Daemon {
                     .map_err(|_| anyhow::anyhow!("prefetch gate closed"))
             })
             .await?;
-        let semaphore = deadline
+        let semaphore = queue_deadline
             .run("pack catalog LIST queue", async {
                 self.s3_semaphore
                     .acquire()
@@ -5021,6 +5023,7 @@ impl Daemon {
             !self.prefetch_stopping.load(Ordering::Acquire),
             "daemon stopping before packed prefetch request"
         );
+        plan_deadline.check("packed-prefetch request admission")?;
         receipt.event.semaphore_wait_ms = receipt.started.elapsed().as_millis() as u64;
         let network_start = Instant::now();
         self.prefetch_stats
@@ -5057,6 +5060,7 @@ impl Daemon {
         key: &str,
         max_bytes: u64,
         stage: &'static str,
+        plan_deadline: RemoteDeadline,
         receipt: &mut PrefetchReceipt,
     ) -> Result<Option<crate::remote_backend::GetObject>> {
         let breaker = self
@@ -5064,7 +5068,8 @@ impl Daemon {
             .try_acquire(RemoteOperation::PrefetchGet)
             .ok_or_else(|| anyhow::anyhow!("remote read breaker open"))?;
         let deadline = RemoteDeadline::from_secs(self.config.remote_restore_timeout_secs);
-        let gate = deadline
+        let queue_deadline = deadline.min(plan_deadline);
+        let gate = queue_deadline
             .run("packed-prefetch gate", async {
                 self.prefetch_gate
                     .clone()
@@ -5073,7 +5078,7 @@ impl Daemon {
                     .map_err(|_| anyhow::anyhow!("prefetch gate closed"))
             })
             .await?;
-        let semaphore = deadline
+        let semaphore = queue_deadline
             .run("packed-prefetch GET queue", async {
                 self.s3_semaphore
                     .acquire()
@@ -5085,6 +5090,7 @@ impl Daemon {
             !self.prefetch_stopping.load(Ordering::Acquire),
             "daemon stopping before packed prefetch request"
         );
+        plan_deadline.check("packed-prefetch request admission")?;
         receipt.event.semaphore_wait_ms = receipt.started.elapsed().as_millis() as u64;
         let network_start = Instant::now();
         self.prefetch_stats
@@ -5133,9 +5139,10 @@ impl Daemon {
         v3: &Arc<crate::cache_remote::V3Remote>,
         remote: &crate::config::RemoteConfig,
         candidates: &[(String, String, PathBuf)],
-        bytes_at_plan_start: u64,
+        plan_budget: (u64, RemoteDeadline),
         attribution: &PackedAttribution<'_>,
     ) -> HashSet<String> {
+        let (bytes_at_plan_start, plan_deadline) = plan_budget;
         let wanted = candidates
             .iter()
             .map(|(key, _, _)| key.clone())
@@ -5162,7 +5169,12 @@ impl Daemon {
             PrefetchOperation::List,
         );
         let objects = match self
-            .packed_prefetch_list(v3.as_ref(), &catalog_prefix, &mut list_receipt)
+            .packed_prefetch_list(
+                v3.as_ref(),
+                &catalog_prefix,
+                plan_deadline,
+                &mut list_receipt,
+            )
             .await
         {
             Ok(objects) => objects,
@@ -5212,6 +5224,7 @@ impl Daemon {
                 &catalog_ref.object_key,
                 crate::remote_pack::MAX_CATALOG_BYTES as u64,
                 "packed-prefetch catalog GET",
+                plan_deadline,
                 &mut catalog_receipt,
             )
             .await
@@ -5328,6 +5341,7 @@ impl Daemon {
                         &key,
                         pack_ref.pack_bytes,
                         "packed-prefetch pack GET",
+                        plan_deadline,
                         &mut receipt,
                     )
                     .await
@@ -5816,6 +5830,8 @@ impl Daemon {
                     .fetch_add(keys_to_fetch.len() as u64, Ordering::Relaxed);
                 return;
             }
+            let plan_deadline =
+                RemoteDeadline::from_secs_at(plan_started_at, daemon.config.prefetch_deadline_secs);
             if let Some(context) = pack_context.as_ref() {
                 let packed = daemon
                     .try_packed_prefetch(
@@ -5823,7 +5839,7 @@ impl Daemon {
                         &v3_remote,
                         &remote_config,
                         &keys_to_fetch,
-                        bytes_at_plan_start,
+                        (bytes_at_plan_start, plan_deadline),
                         &PackedAttribution {
                             origin: &origin,
                             ranks: &ranks,
@@ -5855,10 +5871,7 @@ impl Daemon {
             // A hard cap needs counted, cancellable reads in the backend.
             let byte_budget = daemon.config.prefetch_max_bytes;
             let bytes_at_start = bytes_at_plan_start;
-            let deadline = match daemon.config.prefetch_deadline_secs {
-                0 => None,
-                secs => Some(Instant::now() + Duration::from_secs(secs)),
-            };
+            let deadline = plan_deadline.at();
 
             let mut keys_iter = keys_to_fetch.into_iter().peekable();
             while let Some((key, crate_name, entry_dir)) = keys_iter.next() {

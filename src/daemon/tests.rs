@@ -7406,7 +7406,14 @@ async fn packed_receipt_distinguishes_queued_and_inflight_cancellation() {
             );
             ready.send(()).unwrap();
             let _ = worker
-                .packed_prefetch_get(&v3, key, 1024, "test GET", &mut receipt)
+                .packed_prefetch_get(
+                    &v3,
+                    key,
+                    1024,
+                    "test GET",
+                    RemoteDeadline::from_secs(0),
+                    &mut receipt,
+                )
                 .await;
         });
         entered.await.unwrap();
@@ -7535,7 +7542,7 @@ async fn packed_imports_with_listing(listing: bool, refused: bool) -> usize {
             v3,
             &remote,
             &candidates,
-            0,
+            (0, RemoteDeadline::from_secs(0)),
             &PackedAttribution {
                 origin: &PrefetchOrigin::default(),
                 ranks: &HashMap::new(),
@@ -8049,7 +8056,7 @@ async fn packed_prefetch_drains_bodies_with_room_for_only_one_object() {
             v3,
             &remote,
             &candidates,
-            0,
+            (0, RemoteDeadline::from_secs(0)),
             &PackedAttribution {
                 origin: &PrefetchOrigin::default(),
                 ranks: &HashMap::new(),
@@ -8600,7 +8607,7 @@ async fn packed_receipt_keeps_cancelled_entries_when_claim_is_blocked() {
                 &v3,
                 &remote,
                 &candidates,
-                0,
+                (0, RemoteDeadline::from_secs(0)),
                 &PackedAttribution {
                     origin: &origin,
                     ranks: &ranks,

@@ -5460,7 +5460,7 @@ fn cc_trace_name(parsed: &CcArgs) -> String {
 /// Both halves of the shadowing digest, as the key computes them.
 #[cfg(test)]
 fn digest_cc_include_shadowing(parsed: &CcArgs, read_inputs: &[PathBuf]) -> Result<String> {
-    digest_cc_shadowing_names(parsed, &cc_shadowing_names(parsed, read_inputs))
+    digest_cc_shadowing_names(parsed, &cc_shadowing_names(parsed, read_inputs)?)
 }
 
 /// Digest the shadowing risk for the headers a preprocess actually read.
@@ -5488,10 +5488,15 @@ fn digest_cc_include_shadowing(parsed: &CcArgs, read_inputs: &[PathBuf]) -> Resu
 /// under, in the order the digest folds them. It depends on the read set
 /// and the include directories alone, so the post-compile recheck reuses it
 /// and only lists the directories again ([`digest_cc_shadowing_names`]).
+///
+/// A header that `__has_include` found absent was never read, yet its later
+/// appearance changes the compile. Every name a read input probes joins the
+/// set, so its resolution is keyed like a header that was read: absent now,
+/// and moved when a user directory gains it.
 fn cc_shadowing_names(
     parsed: &CcArgs,
     read_inputs: &[PathBuf],
-) -> std::collections::BTreeSet<PathBuf> {
+) -> Result<std::collections::BTreeSet<PathBuf>> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let dirs = cc_user_include_dirs(parsed, &cwd);
 
@@ -5510,19 +5515,127 @@ fn cc_shadowing_names(
         // directory. Folding both over-detects rather than under-detects:
         // an extra resolution can only cost a miss.
         let mut candidates: Vec<PathBuf> = Vec::new();
-        if let Some(relative) = dirs
+        let relative = dirs
             .iter()
             .filter_map(|dir| absolute.strip_prefix(dir).ok())
-            .min_by_key(|relative| relative.components().count())
-        {
+            .min_by_key(|relative| relative.components().count());
+        if let Some(relative) = relative {
             candidates.push(relative.to_path_buf());
         }
         if let Some(file_name) = absolute.file_name() {
             candidates.push(PathBuf::from(file_name));
         }
         names.extend(candidates);
+        names.extend(cc_probed_header_names(
+            &absolute,
+            relative.and_then(Path::parent),
+        )?);
     }
-    names
+    Ok(names)
+}
+
+/// The header names `path` tests with `__has_include` or
+/// `__has_include_next`, as [`cc_shadowing_names`] resolves them.
+///
+/// A quoted probe searches the directory of the file holding it first, so
+/// it is also spelled relative to the user directory that file sits in:
+/// `"opt.h"` in `inc/sub/a.h` under `-Iinc` resolves as `sub/opt.h` too.
+/// `parent` is that file's directory relative to its user directory, `None`
+/// when it is in none (a system header, whose directories stay unkeyed).
+fn cc_probed_header_names(path: &Path, parent: Option<&Path>) -> Result<Vec<PathBuf>> {
+    let bytes = fs::read(path)
+        .with_context(|| format!("reading header availability input {}", path.display()))?;
+    let Some(probes) = cc_header_probes(&cc_splice_lines(&bytes)) else {
+        anyhow::bail!(
+            "cc: a header availability probe (__has_include) in {} names its header \
+             through a macro, which the key cannot track",
+            path.display()
+        );
+    };
+    let mut names = Vec::new();
+    for probe in probes {
+        if probe.quoted
+            && let Some(parent) = parent
+        {
+            names.push(parent.join(&probe.name));
+        }
+        names.push(probe.name);
+    }
+    Ok(names)
+}
+
+/// A header name an availability probe tests for.
+#[derive(Debug, PartialEq, Eq)]
+struct CcHeaderProbe {
+    name: PathBuf,
+    /// `"name"`, searched from the probing file's directory first; else
+    /// `<name>`.
+    quoted: bool,
+}
+
+/// `bytes` with every backslash-newline removed, the line splice the
+/// preprocessor applies before it sees tokens. CRLF line ends included.
+fn cc_splice_lines(bytes: &[u8]) -> Vec<u8> {
+    let mut spliced = Vec::with_capacity(bytes.len());
+    let mut rest = bytes;
+    while let Some(at) = memchr::memchr(b'\\', rest) {
+        let (before, backslash) = rest.split_at(at);
+        spliced.extend_from_slice(before);
+        let after = &backslash[1..];
+        let line_end = after.strip_prefix(b"\r").unwrap_or(after);
+        match line_end.strip_prefix(b"\n") {
+            Some(next) => rest = next,
+            None => {
+                spliced.push(b'\\');
+                rest = after;
+            }
+        }
+    }
+    spliced.extend_from_slice(rest);
+    spliced
+}
+
+/// Every `__has_include(...)` and `__has_include_next(...)` probe in
+/// spliced source `text`, or `None` when one names its header through a
+/// macro: the name it tests then depends on a definition this scan does not
+/// evaluate.
+///
+/// An occurrence not followed by `(` is no probe (`defined(__has_include)`,
+/// `#ifdef __has_include`), nor is the name a `#define` gives a fallback for
+/// compilers without the operator (`#define __has_include(x) 0`, which the
+/// macOS SDK carries).
+fn cc_header_probes(text: &[u8]) -> Option<Vec<CcHeaderProbe>> {
+    const OPERATOR: &[u8] = b"__has_include";
+    let mut probes = Vec::new();
+    for at in memchr::memmem::find_iter(text, OPERATOR) {
+        let line = text[..at].rsplit(|&byte| byte == b'\n').next();
+        let defined_here = line
+            .unwrap_or_default()
+            .trim_ascii()
+            .strip_prefix(b"#")
+            .is_some_and(|directive| directive.trim_ascii_start() == b"define");
+        let rest = &text[at + OPERATOR.len()..];
+        let rest = rest.strip_prefix(b"_next").unwrap_or(rest);
+        let Some(argument) = rest.trim_ascii_start().strip_prefix(b"(") else {
+            continue;
+        };
+        if defined_here {
+            continue;
+        }
+        let argument = argument.trim_ascii_start();
+        let (close, quoted) = match argument.first() {
+            Some(b'<') => (b'>', false),
+            Some(b'"') => (b'"', true),
+            _ => return None,
+        };
+        let name = &argument[1..];
+        let end = memchr::memchr(close, name)?;
+        probes.push(CcHeaderProbe {
+            name: PathBuf::from(String::from_utf8_lossy(&name[..end]).into_owned()),
+            quoted,
+        });
+    }
+    Some(probes)
 }
 
 /// Digest where each of `names` is first provided in the include search
@@ -7398,7 +7511,8 @@ impl CcCompiler {
         let trace_shadowing = crate::phase_trace::phase("cc_shadowing");
         let names = read_inputs
             .as_deref()
-            .map(|inputs| cc_shadowing_names(parsed, inputs));
+            .map(|inputs| cc_shadowing_names(parsed, inputs))
+            .transpose()?;
         let (include_dir_digest, stamps, include_dir_mode) = match &names {
             Some(names) => {
                 let (digest, stamps) = digest_cc_shadowing_names_stamped(parsed, names)?;

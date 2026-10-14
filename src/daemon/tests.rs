@@ -7733,6 +7733,56 @@ async fn packed_prefetch_honors_dispatch_deadline_without_cancelling_started_tra
 }
 
 #[tokio::test]
+async fn queued_packed_prefetch_stops_waiting_at_the_plan_deadline() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path());
+    config.remote_key_listing = true;
+    config.remote = Some(test_remote_config());
+    config.prefetch_deadline_secs = 1;
+    // No restore timeout: only the plan deadline can end the queued wait.
+    config.remote_restore_timeout_secs = 0;
+    let daemon = Arc::new(Daemon::new(config));
+    assert!(daemon.remote_backend.set(test_remote_backend()).is_ok());
+    let occupied = daemon
+        .prefetch_gate
+        .acquire_many(daemon.prefetch_gate.available_permits() as u32)
+        .await
+        .unwrap();
+    let context = PackPrefetchContext::from_deps(
+        crate::identity::host_target_triple(),
+        "linux/toolchain/release",
+        &[("serde".into(), "1.0.0".into())],
+    )
+    .unwrap();
+    let response = daemon
+        .handle_prefetch_with_context(
+            &PrefetchRequest {
+                keys: vec![(test_cache_key("queued-plan-deadline"), "serde".into())],
+                warm_all: false,
+                origin: None,
+                candidate_sources: HashMap::new(),
+            },
+            Some(context),
+            Instant::now(),
+        )
+        .await;
+    assert!(response.ok);
+    let mut tasks = std::mem::take(&mut *daemon.prefetch_tasks.lock().unwrap());
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while let Some(result) = tasks.join_next().await {
+            result.unwrap();
+        }
+    })
+    .await
+    .expect("a plan queued behind a full prefetch gate must end at its plan deadline");
+    let stats = &daemon.prefetch_stats;
+    assert_eq!(stats.pack_requests_total.load(Ordering::Relaxed), 0);
+    assert_eq!(stats.pack_fallback_entries.load(Ordering::Relaxed), 1);
+    assert_eq!(stats.keys_over_budget.load(Ordering::Relaxed), 1);
+    drop(occupied);
+}
+
+#[tokio::test]
 async fn packed_prefetch_discovers_one_pack_and_batch_imports_all_entries() {
     let dir = tempfile::tempdir().unwrap();
     let mut config = test_config(dir.path());

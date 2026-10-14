@@ -9704,3 +9704,60 @@ fn recovery_steps_say_when_init_asks() {
         assert_eq!(recovery_action(&offer), "keep", "{offer:?}");
     }
 }
+
+#[test]
+fn only_a_preview_assumes_the_shims_and_wrapper_it_describes() {
+    assert_eq!(rustdoc_assumes(true, true, true), (true, true));
+    assert_eq!(rustdoc_assumes(true, false, true), (false, true));
+    assert_eq!(rustdoc_assumes(true, true, false), (true, false));
+    // A run looks at the disk: a declined replacement leaves no kache
+    // wrapper for build.rustdoc to follow.
+    assert_eq!(rustdoc_assumes(false, true, true), (false, false));
+}
+
+#[test]
+fn a_run_reports_the_test_runner_it_planned_after_the_shell_edits() {
+    use std::path::PathBuf;
+    let rc = PathBuf::from("/home/me/.bashrc");
+    let plan = SetupFacts {
+        cargo_path: PathBuf::from("/home/me/.cargo/config.toml"),
+        cargo: "keep",
+        cargo_exists: true,
+        shell: Some(SetupStep::new("shell", "configure", vec![rc.clone()])),
+        shell_changes: vec![(rc.clone(), true)],
+        rustdoc: None,
+        test_runner: Some(SetupStep::new("test_runner", "unsupported", Vec::new())),
+        test_changes: Vec::new(),
+        recovery: "keep",
+        recovery_path: PathBuf::from("/home/me/.config/kache/config.toml"),
+        service: None,
+        service_path: None,
+    };
+    let run = run_facts(
+        &plan,
+        RunOutcome {
+            cargo_applied: false,
+            rustdoc: None,
+            test_runner: Some(SetupStep::new("test_runner", "configure", vec![rc.clone()])),
+            test_changes: vec![(rc.clone(), true)],
+            recovery: "keep",
+            service_installed_now: false,
+        },
+    );
+    let steps: Vec<_> = setup_steps(&run)
+        .into_iter()
+        .map(|step| format!("{} {}", step.component, step.action))
+        .collect();
+    assert_eq!(
+        steps,
+        [
+            "cargo keep",
+            "shell configure",
+            "backup create",
+            "test_runner configure",
+            "backup create",
+            "free_space_recovery keep",
+            "daemon ensure_running",
+        ]
+    );
+}

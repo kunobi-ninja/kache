@@ -786,6 +786,117 @@ fn init_check_steps_follow_the_plans() {
     assert!(!e.home.join(".bashrc").exists());
 }
 
+/// The rustc on PATH, outside the test HOME that hides rustup's toolchains.
+#[cfg(unix)]
+fn real_rustc() -> std::path::PathBuf {
+    let sysroot = std::process::Command::new("rustc")
+        .args(["--print", "sysroot"])
+        .output()
+        .unwrap();
+    Path::new(String::from_utf8(sysroot.stdout).unwrap().trim()).join("bin/rustc")
+}
+
+/// `component action [file name]` for each step.
+#[cfg(unix)]
+fn step_summary(plan: &serde_json::Value) -> Vec<String> {
+    plan["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|step| {
+            let name = step["paths"][0]
+                .as_str()
+                .and_then(|path| Path::new(path).file_name())
+                .map(|name| format!(" {}", name.to_string_lossy()))
+                .unwrap_or_default();
+            format!(
+                "{} {}{name}",
+                step["component"].as_str().unwrap(),
+                step["action"].as_str().unwrap()
+            )
+        })
+        .collect()
+}
+
+/// A startup file that exists is backed up before each edit init plans for
+/// it, and a terminal without the runner needs replacing.
+#[cfg(unix)]
+#[test]
+fn init_preview_backs_up_existing_startup_files_before_each_edit() {
+    let e = env();
+    std::fs::write(e.home.join(".bashrc"), "# user rc\n").unwrap();
+    let rustc = real_rustc();
+    let version = std::process::Command::new(&rustc)
+        .arg("-vV")
+        .output()
+        .unwrap();
+    let version = String::from_utf8(version.stdout).unwrap();
+    let host = version
+        .lines()
+        .find_map(|line| line.strip_prefix("host: "))
+        .unwrap();
+    let var = format!(
+        "CARGO_TARGET_{}_RUNNER",
+        host.to_ascii_uppercase().replace(['-', '.'], "_")
+    );
+    let mut command = e.cmd();
+    command
+        .args(["init", "--check", "--no-service", "--json"])
+        .env("RUSTC", &rustc)
+        .env_remove(&var);
+    let output = command.output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let plan: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let steps = step_summary(&plan);
+    let shell = steps
+        .iter()
+        .position(|step| step.starts_with("shell "))
+        .unwrap();
+    let tests = steps
+        .iter()
+        .position(|step| step.starts_with("test_runner "))
+        .unwrap();
+    assert_eq!(steps[shell + 1], "backup create .bashrc", "{steps:?}");
+    assert_eq!(steps[tests + 1], "backup create .bashrc", "{steps:?}");
+    assert_eq!(
+        steps
+            .iter()
+            .filter(|step| step.starts_with("backup "))
+            .count(),
+        2,
+        "{steps:?}"
+    );
+    assert_eq!(plan["test_activation_required"], true, "{plan}");
+}
+
+/// With a login shell init cannot set up, it installs no shims, so there is
+/// no rustdoc shim to point Cargo at and no terminal to replace.
+#[cfg(unix)]
+#[test]
+fn init_preview_for_an_unsupported_shell_plans_no_rustdoc_edit() {
+    let e = env();
+    let output = e
+        .cmd()
+        .args(["init", "--check", "--no-service", "--json"])
+        .env("SHELL", "/bin/tcsh")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let plan: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let steps = step_summary(&plan);
+    assert!(
+        steps.contains(&"shell unsupported".to_string()),
+        "{steps:?}"
+    );
+    assert!(
+        !steps.iter().any(|step| step.starts_with("rustdoc ")),
+        "{steps:?}"
+    );
+    assert_eq!(plan["shell_activation_required"], false, "{plan}");
+    let text = String::from_utf8(output.stderr).unwrap();
+    assert!(!text.contains("build.rustdoc"), "{text}");
+}
+
 /// With a login shell init cannot set up, the plan leaves out the shell rows.
 #[cfg(unix)]
 #[test]
@@ -902,6 +1013,20 @@ fn terminal_session(
         .unwrap();
     drop(command);
     drop(slave);
+    // Nobody types at this terminal: a command that waits for input is
+    // killed instead of hanging the test.
+    let (done, finished) = std::sync::mpsc::channel::<()>();
+    let pid = child.id() as libc::pid_t;
+    let watchdog = std::thread::spawn(move || {
+        if finished
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .is_err()
+        {
+            // SAFETY: the child has not been waited on yet, so the pid is
+            // still the child's.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+    });
     let mut bytes = Vec::new();
     let mut buffer = [0; 4096];
     loop {
@@ -913,6 +1038,8 @@ fn terminal_session(
         }
     }
     let output = child.wait_with_output().unwrap();
+    drop(done);
+    watchdog.join().unwrap();
     (
         String::from_utf8(bytes).unwrap().replace("\r\n", "\n"),
         String::from_utf8(output.stderr).unwrap(),
@@ -2556,6 +2683,24 @@ fn init_saves_shell_setup_preserves_cargo_choices_and_is_idempotent() {
         .stdout
         .clone();
     let output = String::from_utf8(output).unwrap();
+    // The existing startup file was copied before init edited it.
+    let shell_backups: Vec<String> = std::fs::read_dir(&e.home)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(".kache-shell-backup-")
+        })
+        .map(|path| std::fs::read_to_string(path).unwrap())
+        .collect();
+    assert!(
+        shell_backups
+            .iter()
+            .any(|backup| backup == "# user rc\nprintf 'user shell startup\\n'\n"),
+        "{shell_backups:?}"
+    );
     assert!(output.contains("Replace sccache with Kache for Cargo builds?"));
     assert_eq!(output.matches("[Y/n]").count(), 2, "{output}");
     assert!(!output.contains("Cache cargo doc as well?"));

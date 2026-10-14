@@ -10137,6 +10137,15 @@ fn setup_steps(facts: &SetupFacts) -> Vec<SetupStep> {
     steps
 }
 
+/// What the `build.rustdoc` planner may take as done, as (shims, wrapper):
+/// a preview has made neither the shims nor the `rustc-wrapper` edit it
+/// describes, so it stands in for them; a run reads what is on disk, which
+/// leaves out a declined wrapper replacement. Pure.
+#[cfg(any(test, unix))]
+fn rustdoc_assumes(check: bool, installs_shims: bool, wrapper_coming: bool) -> (bool, bool) {
+    (check && installs_shims, check && wrapper_coming)
+}
+
 /// What a run did, against the plan it started from.
 struct RunOutcome {
     /// Whether the Cargo edit was made; false when it was declined.
@@ -10627,13 +10636,13 @@ pub fn init(yes: bool, no_service: bool, no_shell: bool, check: bool) -> Result<
 
     #[cfg(unix)]
     let (shell_pending, rustdoc_done) = {
-        // A preview has made neither the shim nor the wrapper edit yet.
-        let shims_coming = check && compiler.installs_shims();
+        let (shims_coming, wrapper_coming) =
+            rustdoc_assumes(check, compiler.installs_shims(), wrapper_coming);
         let pending = init_compiler_setup(compiler, check, &mut created)?;
         let rustdoc = if no_shell {
             None
         } else {
-            configure_cargo_rustdoc(check, shims_coming, check && wrapper_coming, &mut created)?
+            configure_cargo_rustdoc(check, shims_coming, wrapper_coming, &mut created)?
         };
         (pending, rustdoc)
     };

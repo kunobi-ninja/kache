@@ -5728,13 +5728,15 @@ fn path_is_only_used_for_includes(value_probe: &Path, source_probes: &[PathBuf])
 /// codegen template or a UI-test fixture) still counts. Every file, whatever
 /// its extension, still counts AGAINST the var.
 ///
+/// Visible declarations, imports and qualified uses of include-family names
+/// veto the proof. Glob imports also veto it because they can import a macro
+/// with one of those names. This is conservative: other identifiers with the
+/// same spelling and qualified builtin invocations also keep values absolute.
+///
 /// Residual gaps, where the text looks like a locator but the compiled crate
 /// can still bake the value:
 /// - another crate's macro, invoked alongside a visible include use, that
 ///   expands to a value use of the same var;
-/// - a macro named `include`, `include_str` or `include_bytes` that is not the
-///   builtin (a local `macro_rules!`, an import, or a path like
-///   `mycrate::include!`);
 /// - an include inside another macro's arguments, or on an item under an
 ///   attribute macro, which can move the tokens out of the include;
 /// - a `.rs` file rustc only read as text, whose quoted include reads as proof.
@@ -5787,7 +5789,10 @@ fn env_dep_source_decision(
 ///
 /// 3: number suffixes, non-ASCII identifier bytes, and the non-ASCII
 /// whitespace and byte-order mark rustc accepts between tokens.
-const SOURCE_ENV_DEP_SCANNER_VERSION: u32 = 3;
+///
+/// 4: include-family declarations, imports and qualified invocations cannot
+/// prove builtin locator semantics; glob imports can shadow those builtins.
+const SOURCE_ENV_DEP_SCANNER_VERSION: u32 = 4;
 
 /// How one source file's text uses an env var.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5801,7 +5806,8 @@ enum SourceEnvDepUse {
     /// `env!(var)` / `option_env!(var)` outside an include argument, or an env
     /// macro outside one whose name is not a plain string literal
     /// (`env!(concat!(..))`, `env!($name)` in a forwarding macro). Such a
-    /// macro may read any var, so it counts against every var.
+    /// macro may read any var, so it counts against every var. Ambiguous
+    /// include-family names also count against every var across source files.
     RuntimeValue,
 }
 
@@ -5834,6 +5840,8 @@ fn source_env_dep_use(source: &str, var: &str) -> SourceEnvDepUse {
     let mut groups: Vec<bool> = Vec::new();
     let mut include_depth = 0usize;
     let mut include_locator = false;
+    let mut previous_token = None;
+    let mut in_use = false;
 
     // Every pass consumes at least one byte, so a scan needs no more passes
     // than the source has bytes. Each loop in the scanner carries that bound:
@@ -5847,8 +5855,18 @@ fn source_env_dep_use(source: &str, var: &str) -> SourceEnvDepUse {
             i += whitespace;
             continue;
         }
+        if comment_starts_at(bytes, i) {
+            i = skip_comment(bytes, i);
+            continue;
+        }
+        let qualified = matches!(previous_token, Some(b':' | b'#'));
+        previous_token = Some(byte);
         match byte {
-            b'/' if comment_starts_at(bytes, i) => i = skip_comment(bytes, i),
+            b';' => {
+                in_use = false;
+                i += 1;
+            }
+            b'*' if in_use => return SourceEnvDepUse::RuntimeValue,
             b'"' => i = skip_quoted_string(bytes, i + 1),
             b'\'' => i = skip_char_literal_or_lifetime(source, i),
             b'b' | b'c' | b'r' if raw_string_starts_at(bytes, i).is_some() => {
@@ -5871,9 +5889,13 @@ fn source_env_dep_use(source: &str, var: &str) -> SourceEnvDepUse {
                 let ident_start = i;
                 i = skip_ident_bytes(bytes, i);
                 let ident = &bytes[ident_start..i];
-                let Some(open) = parse_macro_open(bytes, i) else {
-                    continue;
-                };
+                in_use |= ident == b"use";
+                let include = is_include_macro(ident);
+                let open = parse_macro_open(bytes, i);
+                if include && (qualified || open.is_none()) {
+                    return SourceEnvDepUse::RuntimeValue;
+                }
+                let Some(open) = open else { continue };
 
                 if matches!(ident, b"env" | b"option_env") {
                     match parse_env_macro_name(source, open + 1) {
@@ -5883,7 +5905,6 @@ fn source_env_dep_use(source: &str, var: &str) -> SourceEnvDepUse {
                         _ => return SourceEnvDepUse::RuntimeValue,
                     }
                 }
-                let include = is_include_macro(ident);
                 groups.push(include);
                 include_depth += usize::from(include);
                 i = open + 1;

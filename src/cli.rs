@@ -9312,7 +9312,7 @@ pub(crate) fn is_rustdoc_assignment(line: &str) -> bool {
 
 #[cfg(any(test, unix))]
 fn closes_toml_table(trimmed: &str) -> bool {
-    trimmed.starts_with('[') && trimmed.ends_with(']')
+    trimmed.starts_with('[') && toml::from_str::<toml::Table>(trimmed).is_ok()
 }
 
 #[cfg(any(test, unix))]
@@ -9354,7 +9354,7 @@ pub(crate) fn apply_rustdoc_edit(existing: &str, shim_path: &str) -> String {
     let mut in_build = false;
     for (index, line) in lines.iter().enumerate() {
         let trimmed = line.trim();
-        if trimmed == "[build]" {
+        if trimmed.starts_with("[build]") {
             in_build = true;
             if build_header.is_none() {
                 build_header = Some(index);

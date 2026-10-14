@@ -3438,6 +3438,18 @@ mod tests {
     }
 
     #[test]
+    fn depinfo_rewrite_preserves_literal_marker_dependencies() {
+        let input = "/donor/demo.o: __kache_root__/value.h normal.h /donor/generated.h\n";
+        let stored = rewrite_depinfo_content(input, Path::new("/donor"), DepInfoMode::Relativize);
+        let restored =
+            rewrite_depinfo_content(&stored, Path::new("/consumer"), DepInfoMode::Expand);
+        assert_eq!(
+            restored, "/consumer/demo.o: __kache_root__/value.h normal.h /consumer/generated.h\n",
+            "literal dependency names must survive cache relocation"
+        );
+    }
+
+    #[test]
     fn rustc_depinfo_rewrite_rebases_target_and_worktree_separately() {
         let producer_target = Path::new("/build/worktree-a/target");
         let producer_cwd = Path::new("/build/worktree-a");

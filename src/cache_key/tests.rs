@@ -2777,6 +2777,42 @@ fn an_unset_variable_matches_an_empty_record() {
     );
 }
 
+#[test]
+fn predictions_reject_changes_in_environment_presence() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("lib.rs");
+    std::fs::write(&source, "pub fn f() {}\n").unwrap();
+    let states = [
+        ("# env-dep:MODE\n", None),
+        ("# env-dep:MODE=\n", Some("")),
+        ("# env-dep:MODE=value\n", Some("value")),
+    ];
+    for (recorded, (_, current)) in states.iter().enumerate() {
+        let dep_info = DepInfo {
+            source_files: vec![source.clone()],
+            env_deps: parse_env_dep_info(states[recorded].0),
+        };
+        let prediction = InputPrediction::from_dep_info(&dep_info, None);
+        for (index, (_, value)) in states.iter().enumerate() {
+            let result = validate_prediction(
+                &prediction,
+                |path| std::fs::metadata(path).ok(),
+                |path| path.exists(),
+                |_| value.map(str::to_string),
+            );
+            if recorded == index {
+                assert_eq!(result, Ok(dep_info.clone()));
+            } else {
+                assert_eq!(
+                    result,
+                    Err(Rejection::EnvChanged),
+                    "{current:?} -> {value:?} must invalidate the prediction"
+                );
+            }
+        }
+    }
+}
+
 /// A prediction is only reusable by an invocation that would discover the
 /// same files. Every part of the identity is one such "would discover the
 /// same files" claim, so perturbing any of them has to produce a different

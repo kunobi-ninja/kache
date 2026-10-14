@@ -2729,6 +2729,30 @@ fn opt_in_named_library_links_are_refused_until_selections_are_tracked() {
 }
 
 #[test]
+fn opt_in_link_response_files_are_refused_without_compiler_parsing() {
+    let compiler = CcCompiler::new().with_cache_cc_links(true);
+    for flags in [
+        s(&["@link.rsp"]),
+        s(&["-Wl,@link.rsp"]),
+        s(&["-Wl,--start-group,@link.rsp,--end-group"]),
+        s(&["-Xlinker", "@link.rsp"]),
+    ] {
+        let mut args = s(&["cc", "main.o", "-o", "app"]);
+        args.extend(flags);
+        let parsed = compiler.parse(&args).unwrap();
+        assert!(
+            matches!(
+                compiler.refuse_reasons(&parsed).as_slice(),
+                [RefuseReason::Unsupported(
+                    "cc link response files have untracked library selections"
+                )]
+            ),
+            "{args:?}: response files can hide quoted library options from the whitespace key parser"
+        );
+    }
+}
+
+#[test]
 fn cache_key_for_link_changes_when_an_object_changes() {
     let _lock = crate::test_support::process_state_test_lock();
     let dir = tempfile::tempdir().unwrap();

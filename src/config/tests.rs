@@ -3831,7 +3831,7 @@ fn test_load_and_save_raw_file_config_use_resolved_path() {
     Config::save_file_config_to(&config, &resolve_config_path()).unwrap();
     assert!(config_path.exists());
 
-    let (loaded, existed) = Config::load_raw_file_config();
+    let (loaded, existed) = Config::load_raw_file_config_from(&resolve_config_path()).unwrap();
     assert!(existed);
     assert_eq!(
         loaded.cache.as_ref().and_then(|c| c.local_store.as_deref()),
@@ -4027,7 +4027,7 @@ fn test_save_and_load_file_config() {
     Config::save_file_config_to(&config, &config_path).unwrap();
     assert!(config_path.exists());
 
-    let (loaded, existed) = Config::load_raw_file_config_from(&config_path);
+    let (loaded, existed) = Config::load_raw_file_config_from(&config_path).unwrap();
     assert!(existed);
     assert_eq!(
         loaded.cache.as_ref().unwrap().local_store.as_deref(),
@@ -4045,7 +4045,7 @@ fn test_load_raw_file_config_nonexistent() {
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("nonexistent/config.toml");
 
-    let (config, existed) = Config::load_raw_file_config_from(&config_path);
+    let (config, existed) = Config::load_raw_file_config_from(&config_path).unwrap();
     assert!(!existed);
     assert!(config.cache.is_none());
 }
@@ -4061,7 +4061,7 @@ fn raw_config_roundtrip_preserves_workspace_table() {
         )
         .unwrap();
 
-    let (config, existed) = Config::load_raw_file_config_from(&source);
+    let (config, existed) = Config::load_raw_file_config_from(&source).unwrap();
     assert!(existed);
     Config::save_file_config_to(&config, &saved).unwrap();
 
@@ -4069,6 +4069,93 @@ fn raw_config_roundtrip_preserves_workspace_table() {
     let roundtripped: toml::Value =
         toml::from_str(&std::fs::read_to_string(saved).unwrap()).unwrap();
     assert_eq!(roundtripped.get("workspace"), original.get("workspace"));
+}
+
+#[test]
+fn raw_config_load_rejects_a_file_that_does_not_parse() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    std::fs::write(&path, "[cache]\nlocal_max_size = = \"1GiB\"\n").unwrap();
+
+    let error = Config::load_raw_file_config_from(&path)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains(&path.display().to_string()), "{error}");
+    assert!(error.contains("line 2"), "{error}");
+    assert!(!error.contains('\n'), "one line: {error}");
+}
+
+#[test]
+fn update_file_config_keeps_comments_and_unknown_keys() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let source = r#"# my kache settings
+[cache]
+local_max_size = "40GiB" # keep it small
+retired_setting = true
+exclude = ["vendor/**"]
+
+[cache.remote]
+# legacy spelling
+user-agent = "old/1.0"
+bucket = "b"
+"#;
+    std::fs::write(&path, source).unwrap();
+    let (before, _) = Config::load_raw_file_config_from(&path).unwrap();
+    let mut after = before.clone();
+    let cache = after.cache.as_mut().unwrap();
+    cache.local_max_size = Some("55GiB".into());
+    cache.exclude = None;
+    cache.fallback = Some("custom".into());
+    cache.remote.as_mut().unwrap().user_agent = Some("new/2.0".into());
+
+    Config::update_file_config_at(&path, &before, &after).unwrap();
+
+    let expected = r#"# my kache settings
+[cache]
+local_max_size = "55GiB" # keep it small
+retired_setting = true
+fallback = "custom"
+
+[cache.remote]
+# legacy spelling
+user-agent = "new/2.0"
+bucket = "b"
+"#;
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+}
+
+#[test]
+fn update_file_config_leaves_an_unchanged_file_byte_for_byte() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let source = "# note\n[cache]\nlocal_store = '~/store'  # mine\n";
+    std::fs::write(&path, source).unwrap();
+    let (before, _) = Config::load_raw_file_config_from(&path).unwrap();
+    let mut after = before.clone();
+    after.cc = Some(CcFileConfig::default());
+
+    Config::update_file_config_at(&path, &before, &after).unwrap();
+
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+}
+
+#[test]
+fn unusable_config_file_names_the_file_and_the_error() {
+    let _guard = config_path_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let _env_guard = set_kache_config_for_test(&path);
+    let _host = set_env_for_test("KACHE_HOST_CONFIG", Some(std::ffi::OsStr::new("")));
+
+    assert!(unusable_config_file().is_none(), "a missing file is fine");
+    std::fs::write(&path, "[cache]\nlocal_max_size = \"1GiB\"\n").unwrap();
+    assert!(unusable_config_file().is_none());
+
+    std::fs::write(&path, "[cache\n").unwrap();
+    let (reported, reason) = unusable_config_file().expect("a broken file is reported");
+    assert_eq!(reported, path);
+    assert!(reason.contains("line 1"), "{reason}");
 }
 
 /// #221: `[cache] local_only` must suppress BOTH the remote and the

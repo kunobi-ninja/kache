@@ -845,17 +845,23 @@ fn fields_to_file_config(fields: &[FormField], original: &FileConfig) -> FileCon
 // ── Public entry point ────────────────────────────────────────────────────
 
 pub fn run_config_editor() -> Result<()> {
-    let (file_config, file_existed) = Config::load_raw_file_config();
-    let env = EnvOverrides::detect();
-    let mut state = initial_editor_state(&file_config, file_existed, &env);
-
-    // Run initial validation
-    run_all_validation(&mut state.fields);
+    let mut state = load_editor_state(&resolve_config_path(), &EnvOverrides::detect())?;
 
     let _terminal_mode = crate::tui::TerminalModeGuard::enter()?;
     let mut terminal = ratatui::Terminal::new(CrosstermBackend::new(stdout()))?;
 
     run_event_loop(&mut terminal, &mut state)
+}
+
+/// Load `path` into a validated editor state. A file that does not parse is
+/// an error: starting from defaults would let a save replace it.
+fn load_editor_state(path: &std::path::Path, env: &EnvOverrides) -> Result<EditorState> {
+    let (file_config, file_existed) = Config::load_raw_file_config_from(path).map_err(|error| {
+        anyhow::anyhow!("{error:#}\nFix the file or move it aside, then run `kache config` again.")
+    })?;
+    let mut state = initial_editor_state(&file_config, file_existed, env);
+    run_all_validation(&mut state.fields);
+    Ok(state)
 }
 
 /// Build the editor's starting state from a loaded config.
@@ -1036,7 +1042,9 @@ fn try_save(state: &mut EditorState) {
     }
     if state.file_had_content && !state.has_saved_once {
         state.mode = Mode::ConfirmSave;
-        state.status = Some("Existing file will be overwritten. Proceed? (y/n)".to_string());
+        state.status = Some(
+            "Update the existing file? Comments and other settings are kept. (y/n)".to_string(),
+        );
     } else {
         do_save(state);
     }
@@ -1046,13 +1054,15 @@ fn do_save(state: &mut EditorState) {
     do_save_to(state, &resolve_config_path());
 }
 
-/// Collect the form fields into a `FileConfig` and write it to `path`, updating
-/// the editor status. Split out from [`do_save`] (which targets the env-resolved
-/// config path) so the save + status logic is unit-testable against a temp path.
+/// Collect the form fields into a `FileConfig` and write the changed keys to
+/// `path`, updating the editor status. Split out from [`do_save`] (which
+/// targets the env-resolved config path) so the save + status logic is
+/// unit-testable against a temp path.
 fn do_save_to(state: &mut EditorState, path: &std::path::Path) {
     let config = fields_to_file_config(&state.fields, &state.file_config);
-    match Config::save_file_config_to(&config, path) {
+    match Config::update_file_config_at(path, &state.file_config, &config) {
         Ok(()) => {
+            state.file_config = config;
             state.dirty = false;
             state.has_saved_once = true;
             state.status = Some("Saved!".to_string());
@@ -1338,7 +1348,7 @@ fn draw_footer(f: &mut ratatui::Frame, path_area: Rect, keys_area: Rect, state: 
         } else if status.contains("failed")
             || status.contains("Fix")
             || status.contains("Unsaved")
-            || status.contains("overwritten")
+            || status.contains("existing file")
         {
             Color::Yellow
         } else {
@@ -1358,7 +1368,7 @@ fn draw_footer(f: &mut ratatui::Frame, path_area: Rect, keys_area: Rect, state: 
         }
         Mode::Editing => " Type to edit  Enter: commit  Esc: discard",
         Mode::ConfirmQuit => " y: quit without saving  n/Esc: cancel",
-        Mode::ConfirmSave => " y: overwrite file  n/Esc: cancel",
+        Mode::ConfirmSave => " y: save  n/Esc: cancel",
     };
     f.render_widget(
         Paragraph::new(Span::styled(keys, Style::default().fg(Color::DarkGray))),
@@ -1980,7 +1990,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         std::fs::write(&path, source).unwrap();
-        let (loaded, existed) = Config::load_raw_file_config_from(&path);
+        let (loaded, existed) = Config::load_raw_file_config_from(&path).unwrap();
         assert!(existed);
         let mut state = initial_editor_state(&loaded, existed, &empty_env());
         for (key, value) in [
@@ -2028,18 +2038,38 @@ mod tests {
         .unwrap();
         let cache = expected["cache"].as_table_mut().unwrap();
         cache.extend(updates);
-        // A save writes the settings kache knows, so a removed key goes.
-        cache.remove("local_hit_daemon");
+        // Keys kache no longer reads, and the old `user-agent` spelling, stay.
         let remote = cache["remote"].as_table_mut().unwrap();
         remote.insert("type".into(), "s3".into());
         remote.insert("bucket".into(), "new-bucket".into());
-        let user_agent = remote.remove("user-agent").unwrap();
-        remote.insert("user_agent".into(), user_agent);
-        let saved: toml::Value = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let written = std::fs::read_to_string(&path).unwrap();
+        let saved: toml::Value = toml::from_str(&written).unwrap();
         assert_eq!(
             saved, expected,
             "unedited settings must survive a real file save"
         );
+        for comment in [
+            "# Removed before 1.0 (#565).",
+            "# Older S3 configs infer the backend",
+        ] {
+            assert!(written.contains(comment), "comment lost: {comment}");
+        }
+    }
+
+    #[test]
+    fn editor_refuses_to_open_a_config_that_does_not_parse() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let source = "# tuned by hand\n[cache]\nlocal_max_size = \"40GiB\"\nbroken = \n";
+        std::fs::write(&path, source).unwrap();
+
+        let Err(error) = load_editor_state(&path, &empty_env()) else {
+            panic!("the editor must not open a file it cannot parse");
+        };
+        let error = format!("{error:#}");
+        assert!(error.contains(&path.display().to_string()), "{error}");
+        assert!(error.contains("line 4"), "{error}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
     }
 
     #[test]
@@ -2618,17 +2648,17 @@ mod tests {
     }
 
     #[test]
-    fn try_save_prompts_confirm_when_overwriting_existing_file() {
+    fn try_save_prompts_confirm_when_updating_existing_file() {
         let mut s = editor();
         // Valid fields (defaults) + an existing on-disk file not yet saved this
-        // session -> save asks for overwrite confirmation rather than writing.
+        // session -> save asks for confirmation rather than writing.
         s.file_had_content = true;
         s.has_saved_once = false;
         key(&mut s, KeyCode::Char('s'));
         assert_eq!(s.mode, Mode::ConfirmSave);
         assert!(
-            s.status.as_deref().unwrap().contains("overwritten"),
-            "should prompt before overwriting: {:?}",
+            s.status.as_deref().unwrap().contains("existing file"),
+            "should prompt before updating: {:?}",
             s.status
         );
     }
@@ -2730,14 +2760,16 @@ mod tests {
 
     #[test]
     fn handle_confirm_save_cancel_returns_to_navigate() {
-        // n / Esc / any non-y key cancels the overwrite confirmation without
+        // n / Esc / any non-y key cancels the save confirmation without
         // saving, clearing the prompt and returning to navigate mode. (The 'y'
         // arm calls do_save, which writes to the resolved config path and is
         // covered at the config layer.)
         for code in [KeyCode::Char('n'), KeyCode::Esc, KeyCode::Char('x')] {
             let mut s = editor();
             s.mode = Mode::ConfirmSave;
-            s.status = Some("Existing file will be overwritten. Proceed? (y/n)".to_string());
+            s.status = Some(
+                "Update the existing file? Comments and other settings are kept. (y/n)".to_string(),
+            );
             let action = handle_confirm_save(&mut s, code);
             assert!(matches!(action, Action::Continue));
             assert_eq!(

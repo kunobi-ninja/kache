@@ -2204,26 +2204,30 @@ impl Config {
         })
     }
 
-    /// Load the raw file config without applying env overrides or defaults.
-    /// The config path still honors `KACHE_CONFIG`.
-    /// Returns `(config, file_existed)`.
-    pub(crate) fn load_raw_file_config() -> (FileConfig, bool) {
-        Self::load_raw_file_config_from(&resolve_config_path())
-    }
-
-    /// Load a raw FileConfig from an explicit path.
-    pub(crate) fn load_raw_file_config_from(config_path: &std::path::Path) -> (FileConfig, bool) {
-        let existed = config_path.exists();
-        if !existed {
-            return (FileConfig::default(), false);
-        }
-        match std::fs::read_to_string(config_path) {
-            Ok(content) => match toml::from_str(&content) {
-                Ok(cfg) => (cfg, true),
-                Err(_) => (FileConfig::default(), true),
-            },
-            Err(_) => (FileConfig::default(), true),
-        }
+    /// Load a raw FileConfig, without env overrides or defaults, from an
+    /// explicit path. Returns `(config, file_existed)`. A file that exists but
+    /// does not read or parse is an error, so the editor never starts from
+    /// defaults and saves them over the user's file.
+    pub(crate) fn load_raw_file_config_from(
+        config_path: &std::path::Path,
+    ) -> Result<(FileConfig, bool)> {
+        let content = match std::fs::read_to_string(config_path) {
+            Ok(content) => content,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok((FileConfig::default(), false));
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("reading {}", config_path.display()));
+            }
+        };
+        let config = toml::from_str(&content).map_err(|error| {
+            anyhow::anyhow!(
+                "{} is not a valid kache config: {}",
+                config_path.display(),
+                describe_toml_error(&error)
+            )
+        })?;
+        Ok((config, true))
     }
 
     /// Serialize and write a FileConfig to an explicit path.
@@ -2233,6 +2237,31 @@ impl Config {
         }
         let content = toml::to_string_pretty(config).context("serializing config")?;
         std::fs::write(path, content).context("writing config file")?;
+        Ok(())
+    }
+
+    /// Write the keys that differ between `before` and `after` into the file
+    /// at `path`. Comments, formatting and keys kache does not know stay as
+    /// they are. A missing file is written in full.
+    pub(crate) fn update_file_config_at(
+        path: &std::path::Path,
+        before: &FileConfig,
+        after: &FileConfig,
+    ) -> Result<()> {
+        let existing = match std::fs::read_to_string(path) {
+            Ok(existing) => existing,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Self::save_file_config_to(after, path);
+            }
+            Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
+        };
+        let mut document: toml_edit::DocumentMut = existing
+            .parse()
+            .with_context(|| format!("{} is not valid TOML", path.display()))?;
+        let before = toml::Table::try_from(before).context("serializing config")?;
+        let after = toml::Table::try_from(after).context("serializing config")?;
+        apply_table_changes(document.as_table_mut(), &before, &after)?;
+        std::fs::write(path, document.to_string()).context("writing config file")?;
         Ok(())
     }
 
@@ -3724,6 +3753,108 @@ fn merge_config_tables_at(base: &mut toml::Table, over: toml::Table, path: &mut 
 
 /// Parse the chosen file's content, laid over the host layer when there is
 /// one. With no host layer this is exactly the single-file parse.
+/// Spellings serde accepts for the same key. An edit updates the spelling the
+/// file already uses, so the file never ends up with both.
+const FILE_CONFIG_KEY_ALIASES: [(&str, &str); 1] = [("user_agent", "user-agent")];
+
+fn existing_key_spelling<'a>(table: &dyn toml_edit::TableLike, key: &'a str) -> &'a str {
+    FILE_CONFIG_KEY_ALIASES
+        .iter()
+        .find_map(|&(canonical, alias)| {
+            (key == canonical && !table.contains_key(canonical) && table.contains_key(alias))
+                .then_some(alias)
+        })
+        .unwrap_or(key)
+}
+
+/// Apply the difference between two serialized configs to a parsed document.
+fn apply_table_changes(
+    table: &mut dyn toml_edit::TableLike,
+    before: &toml::Table,
+    after: &toml::Table,
+) -> Result<()> {
+    for key in before.keys().filter(|key| !after.contains_key(*key)) {
+        let key = existing_key_spelling(table, key);
+        table.remove(key);
+    }
+    for (key, new) in after {
+        let old = before.get(key);
+        if old == Some(new) {
+            continue;
+        }
+        let key = existing_key_spelling(table, key);
+        if let toml::Value::Table(new_table) = new {
+            let empty = toml::Table::new();
+            let old_table = old.and_then(toml::Value::as_table).unwrap_or(&empty);
+            if let Some(existing) = table
+                .get_mut(key)
+                .and_then(toml_edit::Item::as_table_like_mut)
+            {
+                apply_table_changes(existing, old_table, new_table)?;
+            } else {
+                let mut created = toml_edit::Table::new();
+                created.set_implicit(true);
+                apply_table_changes(&mut created, &empty, new_table)?;
+                if !created.is_empty() {
+                    table.insert(key, toml_edit::Item::Table(created));
+                }
+            }
+            continue;
+        }
+        let mut value: toml_edit::Value = new
+            .to_string()
+            .parse()
+            .with_context(|| format!("encoding config value for {key}"))?;
+        // Replace in place: inserting would drop the comments kept on the key.
+        match table.get_mut(key) {
+            Some(item) => {
+                if let Some(previous) = item.as_value() {
+                    *value.decor_mut() = previous.decor().clone();
+                }
+                *item = toml_edit::Item::Value(value);
+            }
+            None => {
+                table.insert(key, toml_edit::Item::Value(value));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// One line for a TOML error: its position and message, without the source
+/// snippet of the multi-line form.
+pub(crate) fn describe_toml_error(error: &toml::de::Error) -> String {
+    let full = error.to_string();
+    let position = full.lines().next().unwrap_or_default().trim();
+    let message = error
+        .message()
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("; ");
+    if position.is_empty() || position == message {
+        message
+    } else {
+        format!("{position}: {message}")
+    }
+}
+
+/// The chosen config file and why kache cannot use it, when it exists but
+/// does not read or parse. Commands then run on defaults, so callers say so.
+pub(crate) fn unusable_config_file() -> Option<(PathBuf, String)> {
+    let path = normalize_config_path(resolve_config_path());
+    let error = Config::load_file_config_with_provenance(path.clone())
+        .0
+        .err()?;
+    let reason = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<toml::de::Error>())
+        .map(describe_toml_error)
+        .unwrap_or_else(|| format!("{error:#}"));
+    Some((path, reason))
+}
+
 fn parse_layered_file_config(content: &str, host: Option<toml::Table>) -> Result<FileConfig> {
     let Some(mut merged) = host else {
         return toml::from_str(content).context("parsing kache config file");

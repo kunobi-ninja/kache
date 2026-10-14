@@ -5393,6 +5393,34 @@ fn a_build_replaces_an_older_spelling_of_the_same_target() {
     assert_eq!(rows[0].path, shared);
 }
 
+/// A registration whose directory moved after its identity was read leaves
+/// other rows alone: that identity may belong to the directory's new path.
+#[test]
+fn a_moved_directory_does_not_drop_the_rows_of_its_new_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(test_config(dir.path())).unwrap();
+    let root = std::path::absolute(dir.path()).unwrap();
+    let workspace = root.join("ws");
+    let old = workspace.join("target");
+    let new = root.join("moved/target");
+    tagged_target(&old);
+    let identity = crate::filesystem::directory_identity(&old).unwrap();
+    std::fs::create_dir_all(new.parent().unwrap()).unwrap();
+    std::fs::rename(&old, &new).unwrap();
+    store.remember_target_root(&new, &workspace).unwrap();
+
+    store
+        .record_target_root(&old, &workspace, identity, None)
+        .unwrap();
+    let paths: Vec<_> = store
+        .tracked_target_roots(0)
+        .unwrap()
+        .into_iter()
+        .map(|row| row.path)
+        .collect();
+    assert!(paths.contains(&new), "{paths:?}");
+}
+
 /// Forgetting a removed directory keeps a row whose path still exists: the
 /// filesystem may give a new directory the old inode.
 #[test]

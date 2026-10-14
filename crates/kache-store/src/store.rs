@@ -4499,6 +4499,32 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         if fresh == Some(true) {
             return Ok(());
         }
+        // The row and the removal of its aliases commit together, so another
+        // registration cannot slip between them and lose its row to ours.
+        let in_transaction = !self.db.is_autocommit();
+        if !in_transaction {
+            self.db.execute_batch("BEGIN IMMEDIATE")?;
+        }
+        let written = self.record_target_root(&target, &workspace_root, identity, rustc);
+        if !in_transaction {
+            match &written {
+                Ok(()) => self.db.execute_batch("COMMIT")?,
+                Err(_) => {
+                    let _ = self.db.execute_batch("ROLLBACK");
+                }
+            }
+        }
+        written
+    }
+
+    /// The upsert and alias cleanup of [`Self::remember_target_root_built_by`].
+    fn record_target_root(
+        &self,
+        target: &Path,
+        workspace_root: &Path,
+        identity: crate::filesystem::PathIdentity,
+        rustc: Option<&str>,
+    ) -> Result<()> {
         let changed = self.db.execute(
             "INSERT INTO target_roots
                 (path, workspace_root, first_seen, last_seen, device, inode, rustc, discovered)
@@ -4524,11 +4550,13 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                 rustc,
             ],
         )?;
-        if changed > 0 {
-            // One row per directory. Git may report a canonical /private path
-            // while Cargo used a /var or /tmp spelling, and rows recorded
-            // before paths were normalized may spell it through `..`. The
-            // build row is authoritative; discard every alias by inode.
+        // One row per directory. Git may report a canonical /private path
+        // while Cargo used a /var or /tmp spelling, and rows recorded before
+        // paths were normalized may spell it through `..`. The build row is
+        // authoritative; discard every alias by inode, unless the directory
+        // moved since its identity was read.
+        let still_here = crate::filesystem::directory_identity(target) == Some(identity);
+        if changed > 0 && still_here {
             self.db.execute(
                 "DELETE FROM target_roots
                  WHERE path != ?1 AND device = ?2 AND inode = ?3",
@@ -4538,6 +4566,8 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                     identity.inode.to_string(),
                 ],
             )?;
+        }
+        if changed > 0 {
             self.db.execute(
                 "DELETE FROM target_roots WHERE last_seen < unixepoch() - 15552000",
                 [],
@@ -4718,6 +4748,29 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         identity: crate::filesystem::PathIdentity,
     ) -> Result<()> {
         self.refuse_write("forget a target root")?;
+        // Check and delete in one write transaction: a build that recreates
+        // the path either registered first, so the path exists and its row
+        // stays, or waits and records a fresh row after this one is gone.
+        let in_transaction = !self.db.is_autocommit();
+        if !in_transaction {
+            self.db.execute_batch("BEGIN IMMEDIATE")?;
+        }
+        let forgotten = self.forget_gone_rows_with_identity(identity);
+        if !in_transaction {
+            match &forgotten {
+                Ok(()) => self.db.execute_batch("COMMIT")?,
+                Err(_) => {
+                    let _ = self.db.execute_batch("ROLLBACK");
+                }
+            }
+        }
+        forgotten
+    }
+
+    fn forget_gone_rows_with_identity(
+        &self,
+        identity: crate::filesystem::PathIdentity,
+    ) -> Result<()> {
         let paths: Vec<String> = {
             let mut stmt = self
                 .db

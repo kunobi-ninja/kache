@@ -7563,7 +7563,7 @@ fn a_stamped_recheck_notices_a_header_added_after_the_key() {
         second.to_str().unwrap(),
     ]))
     .unwrap();
-    let names = cc_shadowing_names(&parsed, &[source.clone(), read]);
+    let names = cc_shadowing_names(&parsed, &[source.clone(), read]).unwrap();
     let compiler = CcCompiler::new();
     let key = |compiler: &CcCompiler| {
         let (digest, stamps) = digest_cc_shadowing_names_stamped(&parsed, &names).unwrap();

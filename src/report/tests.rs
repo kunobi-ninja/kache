@@ -4006,14 +4006,20 @@ fn redaction_terms_skip_roots_that_would_erase_every_path() {
         &report,
         &[
             std::path::Path::new("/a"),
+            std::path::Path::new("/ab"),
+            std::path::Path::new("/abc"),
             std::path::Path::new("/srv/a"),
             std::path::Path::new("/srv/a/b"),
         ],
     );
+    // Three characters or fewer would erase the start of too many paths.
     assert!(
-        !terms.iter().any(|term| term == "/" || term == "/a"),
+        !terms
+            .iter()
+            .any(|term| ["/", "/a", "/ab"].contains(&term.as_str())),
         "{terms:?}"
     );
+    assert!(terms.iter().any(|term| term == "/abc"), "{terms:?}");
     let srv: Vec<&String> = terms
         .iter()
         .filter(|term| term.starts_with("/srv"))

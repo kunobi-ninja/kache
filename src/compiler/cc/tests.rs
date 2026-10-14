@@ -6795,6 +6795,33 @@ fn include_shadowing_keys_a_quoted_probe_beside_its_header() {
     ));
 }
 
+/// Feature tests on the operator and a fallback definition of it, as the
+/// macOS SDK's `sys/cdefs.h` carries, are no probes. A header with them
+/// still keys the probe it makes, and is not refused.
+#[test]
+fn include_shadowing_keys_a_probe_beside_fallback_definitions() {
+    let temp = tempfile::tempdir().unwrap();
+    let (parsed, source, include) = probing_unit(
+        temp.path(),
+        "#ifndef __has_include\n\
+         #  define __has_include(x) 0\n\
+         #define __has_include_next(__x) 0\n\
+         #endif\n\
+         #ifdef __has_include\n\
+         #error \"the __has_include check should move\"\n\
+         #endif\n\
+         #define HAVE_OPTIONAL __has_include(<optional.h>)\n\
+         #if defined(__has_include) && HAVE_OPTIONAL\n\
+         #endif\n\
+         int x;\n",
+    );
+    assert!(probed_header_moves_the_key(
+        &parsed,
+        &[source],
+        &include.join("optional.h")
+    ));
+}
+
 #[test]
 fn include_dir_digest_changes_when_an_earlier_dir_gains_a_header() {
     let temp = tempfile::tempdir().unwrap();

@@ -449,6 +449,13 @@ pub struct ReportSummary {
     pub cache_efficiency_pct: f64,
 }
 
+impl ReportSummary {
+    /// Hits of every kind: local, prefetched and remote.
+    pub fn total_hits(&self) -> usize {
+        self.local_hits + self.prefetch_hits + self.remote_hits
+    }
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct ReportTimeline {
     #[serde(default)]
@@ -3099,7 +3106,7 @@ pub fn format_markdown(report: &BuildReport) -> String {
     let s = &report.summary;
     let t = &report.timing;
 
-    let total_hits = s.local_hits + s.prefetch_hits + s.remote_hits;
+    let total_hits = s.total_hits();
     let compiled = compiled_note(s, &report.bypass);
     lines.push("### kache build report".to_string());
     lines.push(String::new());
@@ -3456,7 +3463,7 @@ pub fn format_github(report: &BuildReport) -> String {
     let mut lines = Vec::new();
     let s = &report.summary;
     let t = &report.timing;
-    let total_hits = s.local_hits + s.prefetch_hits + s.remote_hits;
+    let total_hits = s.total_hits();
     let total_compiled = s.dups + s.misses;
     let compiled = compiled_note(s, &report.bypass);
 
@@ -3966,7 +3973,7 @@ pub fn format_text(report: &BuildReport) -> String {
 
     let s = &report.summary;
     let t = &report.timing;
-    let total_hits = s.local_hits + s.prefetch_hits + s.remote_hits;
+    let total_hits = s.total_hits();
 
     let mut lines = vec![term::heading(format!(
         "kache · last {} · full report",

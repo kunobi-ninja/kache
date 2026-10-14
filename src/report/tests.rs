@@ -4039,6 +4039,15 @@ fn redaction_terms_skip_roots_that_would_erase_every_path() {
     assert_eq!(srv, ["/srv/a/b", "/srv/a"], "longest first");
 }
 
+#[test]
+fn total_hits_counts_every_kind_of_hit() {
+    let mut report = blank_report();
+    report.summary.local_hits = 1;
+    report.summary.prefetch_hits = 3;
+    report.summary.remote_hits = 7;
+    assert_eq!(report.summary.total_hits(), 11);
+}
+
 fn blank_report() -> BuildReport {
     let dir = tempfile::tempdir().unwrap();
     let config = crate::test_support::test_config(dir.path().to_path_buf());

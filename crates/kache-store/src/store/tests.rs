@@ -1297,6 +1297,50 @@ fn publish_staged_blob_is_idempotent_when_blob_exists() {
     assert_eq!(staging_leftovers, 0, "discarded stage must not linger");
 }
 
+#[cfg(unix)]
+#[test]
+fn duplicate_shared_publication_keeps_blob_readonly() {
+    use std::os::unix::fs::MetadataExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(test_config(dir.path())).unwrap();
+    let source = dir.path().join("out.rlib");
+    let bytes = b"shared immutable artifact";
+    fs::write(&source, bytes).unwrap();
+    let files = [(source.clone(), "out.rlib".to_string())];
+    let _hardlink = ForceStoreHardlink::enable();
+    for key in ["first-shared-put", "duplicate-shared-put"] {
+        store
+            .put(
+                key,
+                "fixture",
+                &["lib".into()],
+                &[],
+                "",
+                "debug",
+                &files,
+                "",
+                "",
+            )
+            .unwrap();
+        let meta = store.get(key).unwrap().unwrap();
+        let blob = store.blob_path(&meta.files[0].hash);
+        let source_meta = fs::metadata(&source).unwrap();
+        let blob_meta = fs::metadata(&blob).unwrap();
+        assert_eq!(
+            (source_meta.dev(), source_meta.ino()),
+            (blob_meta.dev(), blob_meta.ino()),
+            "the fixture must exercise publication of an already-shared inode"
+        );
+        assert!(
+            blob_meta.permissions().readonly(),
+            "{key} cleared read-only protection on the published shared blob"
+        );
+        assert_eq!(fs::read(&blob).unwrap(), bytes);
+    }
+    assert_eq!(fs::read_dir(store.staging_dir()).unwrap().count(), 0);
+}
+
 /// Crash-orphaned staging files are reclaimed only once older than the
 /// grace period — a concurrent put's fresh snapshot is never touched.
 #[test]

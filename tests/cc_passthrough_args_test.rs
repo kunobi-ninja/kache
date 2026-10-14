@@ -189,6 +189,77 @@ fn deferred_cc_reuses_setup_and_still_invalidates_changed_headers() {
     }
 }
 
+#[test]
+fn exchanged_header_contents_compile_current_output_and_keep_checkout_hits() {
+    for discovery in ["0", "1"] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let cache = root.join("cache");
+        fs::create_dir(root.join("home")).unwrap();
+        let header = |value| format!("#undef VALUE\n#define VALUE {value}\n");
+        for copy in ["a", "b"] {
+            let clone = root.join(copy);
+            fs::create_dir(&clone).unwrap();
+            fs::write(clone.join("kache.toml"), "").unwrap();
+            fs::write(clone.join("a.h"), header(11)).unwrap();
+            fs::write(clone.join("b.h"), header(23)).unwrap();
+            fs::write(
+                clone.join("unit.c"),
+                "#include \"a.h\"\n#include \"b.h\"\nint main(void) { return VALUE; }\n",
+            )
+            .unwrap();
+        }
+        for (phase, copy, expected, result) in [
+            ("cold", "a", 23, "miss"),
+            ("warm", "a", 23, "local_hit"),
+            ("relocated", "b", 23, "local_hit"),
+            ("exchanged", "a", 11, "miss"),
+            ("exchanged-warm", "a", 11, "local_hit"),
+            ("restored", "a", 23, "local_hit"),
+        ] {
+            let clone = root.join(copy);
+            if phase == "exchanged" || phase == "restored" {
+                let first = if phase == "exchanged" { 23 } else { 11 };
+                fs::write(clone.join("a.h"), header(first)).unwrap();
+                fs::write(clone.join("b.h"), header(expected)).unwrap();
+            }
+            let _ = fs::remove_file(clone.join("unit.o"));
+            let compiled = cacheable_cc_command(&clone)
+                .args(["cc", "-c", "unit.c", "-o", "unit.o"])
+                .env("HOME", root.join("home"))
+                .env("KACHE_CACHE_DIR", &cache)
+                .env("KACHE_RUNTIME_DIR", &cache)
+                .env("KACHE_DEFERRED_DISCOVERY", discovery)
+                .env("KACHE_DAEMON_PUBLISH", "0")
+                .env("KACHE_MIN_STORE_COMPILE_MS", "0")
+                .env_remove("RUSTC_WRAPPER")
+                .output()
+                .unwrap();
+            assert!(compiled.status.success(), "{phase}: {compiled:?}");
+            let linked = common::hermetic_command("cc", &cache, None)
+                .current_dir(&clone)
+                .env("HOME", root.join("home"))
+                .args(["unit.o", "-o", "check-value"])
+                .output()
+                .unwrap();
+            assert!(linked.status.success(), "{phase}: {linked:?}");
+            assert_eq!(
+                Command::new(clone.join("check-value"))
+                    .status()
+                    .unwrap()
+                    .code(),
+                Some(expected),
+                "{phase}: exchanging header contents must compile their current meaning \
+                 (discovery={discovery})"
+            );
+            let events = fs::read_to_string(cache.join("events.jsonl")).unwrap();
+            let event: serde_json::Value =
+                serde_json::from_str(events.lines().last().unwrap()).unwrap();
+            assert_eq!(event["result"], result, "{phase}: {event}");
+        }
+    }
+}
+
 fn cacheable_cc_command(root: &std::path::Path) -> Command {
     common::settle_writes(&[root]);
     let mut command = Command::new(kache_binary());

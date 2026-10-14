@@ -2187,6 +2187,32 @@ mod tests {
     }
 
     #[test]
+    fn documentation_attributes_track_literal_includes_and_skip_fake_items() {
+        for attribute in [
+            r#"#[doc = include_str!("README.md")] pub fn thing() {}"#,
+            r#"#![doc = include_str!("README.md")] pub fn thing() {}"#,
+            r#"#[doc = concat!(include_str!("README.md"), "suffix")] pub fn thing() {}"#,
+        ] {
+            assert_eq!(includes(attribute), ["README.md"]);
+        }
+        assert_eq!(
+            includes(r#"#[doc = include_bytes!("bytes.txt")]"#),
+            ["bytes.txt"]
+        );
+        assert_eq!(includes(r#"#[doc = include!("code.rs")]"#), ["code.rs"]);
+        assert!(includes(r#"#[doc = "include_str!(secret.txt)"]"#).is_empty());
+        assert!(includes(r#"#[doc = fake!("secret.txt")]"#).is_empty());
+        assert_eq!(
+            module_names(r#"#[fake(mod imaginary;)] mod real;"#),
+            ["real"]
+        );
+        let error = scan_rust(br#"#[doc = include_str!(concat!("README", ".md"))]"#)
+            .err()
+            .expect("nonliteral include must be refused");
+        assert_eq!(error.to_string(), "rustdoc include is not a string literal");
+    }
+
+    #[test]
     fn attributes_keep_only_an_outer_path() {
         assert_eq!(
             module_path("#[path = \"renamed.rs\"]\nmod child;"),

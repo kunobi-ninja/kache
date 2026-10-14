@@ -4507,12 +4507,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         }
         let written = self.record_target_root(&target, &workspace_root, identity, rustc);
         if !in_transaction {
-            match &written {
-                Ok(()) => self.db.execute_batch("COMMIT")?,
-                Err(_) => {
-                    let _ = self.db.execute_batch("ROLLBACK");
-                }
-            }
+            finish_transaction(&self.db, written.is_ok())?;
         }
         written
     }
@@ -4525,6 +4520,11 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         identity: crate::filesystem::PathIdentity,
         rustc: Option<&str>,
     ) -> Result<()> {
+        // The directory may have been replaced or moved since its identity
+        // was read; a newer registration of it then wins.
+        if crate::filesystem::directory_identity(target) != Some(identity) {
+            return Ok(());
+        }
         let changed = self.db.execute(
             "INSERT INTO target_roots
                 (path, workspace_root, first_seen, last_seen, device, inode, rustc, discovered)
@@ -4553,10 +4553,8 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         // One row per directory. Git may report a canonical /private path
         // while Cargo used a /var or /tmp spelling, and rows recorded before
         // paths were normalized may spell it through `..`. The build row is
-        // authoritative; discard every alias by inode, unless the directory
-        // moved since its identity was read.
-        let still_here = crate::filesystem::directory_identity(target) == Some(identity);
-        if changed > 0 && still_here {
+        // authoritative; discard every alias by inode.
+        if changed > 0 {
             self.db.execute(
                 "DELETE FROM target_roots
                  WHERE path != ?1 AND device = ?2 AND inode = ?3",
@@ -4757,12 +4755,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         }
         let forgotten = self.forget_gone_rows_with_identity(identity);
         if !in_transaction {
-            match &forgotten {
-                Ok(()) => self.db.execute_batch("COMMIT")?,
-                Err(_) => {
-                    let _ = self.db.execute_batch("ROLLBACK");
-                }
-            }
+            finish_transaction(&self.db, forgotten.is_ok())?;
         }
         forgotten
     }
@@ -6700,5 +6693,18 @@ pub struct EntryInfo {
     pub content_hash: Option<String>,
 }
 
+/// Commit a transaction this code began, or roll it back. A failed `COMMIT`
+/// can leave it open, so that is rolled back too.
+fn finish_transaction(db: &rusqlite::Connection, succeeded: bool) -> Result<()> {
+    if !succeeded {
+        let _ = db.execute_batch("ROLLBACK");
+        return Ok(());
+    }
+    if let Err(error) = db.execute_batch("COMMIT") {
+        let _ = db.execute_batch("ROLLBACK");
+        return Err(error.into());
+    }
+    Ok(())
+}
 #[cfg(test)]
 mod tests;

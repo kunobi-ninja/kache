@@ -367,9 +367,9 @@ fn rustc_refuse_reasons(
             "rustc response file could not be safely expanded — not yet supported",
         ));
     }
-    if parsed.dep_info_output.is_some() {
+    if parsed.explicit_emit_output {
         reasons.push(RefuseReason::Unsupported(
-            "rustc explicit --emit=dep-info=<path> output — not cacheable",
+            "rustc explicit --emit output path — not cacheable",
         ));
     }
     // `--pretty`/`--unpretty` (and the `-Z unpretty=…` form) make rustc dump

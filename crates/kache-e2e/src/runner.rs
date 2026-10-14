@@ -1789,6 +1789,26 @@ esac
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn verify_reports_a_signal_death_as_exit_code_minus_one() {
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = verify_fixture(None);
+        let mut spec = fixture.verify.clone().unwrap();
+        spec.run = "kill -KILL $$".into();
+        spec.expected_stdout_contains.clear();
+        spec.forbidden_substrings.clear();
+        spec.timeout_s = 5;
+
+        let result = super::run_verify(&spec, &fixture, temp.path(), temp.path());
+
+        assert_eq!(result.exit_code, -1);
+        assert_eq!(
+            result.failure_reason.as_deref(),
+            Some("exit code -1 != expected 0")
+        );
+    }
+
     #[test]
     fn unmodified_phases_verify_the_fixture_contract() {
         let fixture = verify_fixture(Some(&["v2"]));

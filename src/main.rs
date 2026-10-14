@@ -1059,9 +1059,11 @@ fn run_cli(cli: Cli, readiness: Option<kunobi_daemon::readiness::channel::Notifi
     }
 
     let (config, config_provenance) = config::Config::load_with_provenance()?;
-    // Doctor reports this as a failing check instead.
-    if !matches!(cli.command, Some(Commands::Doctor { .. }))
-        && let Some((path, reason)) = config::unusable_config_file()
+    // Doctor reports this as a failing check, and the editor refuses to open.
+    if !matches!(
+        cli.command,
+        Some(Commands::Doctor { .. } | Commands::Config)
+    ) && let Some((path, reason)) = config::unusable_config_file()
     {
         eprintln!(
             "{} ignoring {}: {reason}. Using the defaults.",

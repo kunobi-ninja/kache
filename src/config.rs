@@ -3751,8 +3751,6 @@ fn merge_config_tables_at(base: &mut toml::Table, over: toml::Table, path: &mut 
     }
 }
 
-/// Parse the chosen file's content, laid over the host layer when there is
-/// one. With no host layer this is exactly the single-file parse.
 /// Spellings serde accepts for the same key. An edit updates the spelling the
 /// file already uses, so the file never ends up with both.
 const FILE_CONFIG_KEY_ALIASES: [(&str, &str); 1] = [("user_agent", "user-agent")];
@@ -3855,6 +3853,8 @@ pub(crate) fn unusable_config_file() -> Option<(PathBuf, String)> {
     Some((path, reason))
 }
 
+/// Parse the chosen file's content, laid over the host layer when there is
+/// one. With no host layer this is exactly the single-file parse.
 fn parse_layered_file_config(content: &str, host: Option<toml::Table>) -> Result<FileConfig> {
     let Some(mut merged) = host else {
         return toml::from_str(content).context("parsing kache config file");

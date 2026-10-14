@@ -1652,6 +1652,33 @@ mod tests {
     }
 
     #[test]
+    fn verify_deadline_stops_a_stdout_holder_after_its_parent_exits() {
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = verify_fixture(None);
+        let mut spec = fixture.verify.clone().unwrap();
+        spec.run = "printf started; (sleep 2; touch late) &".into();
+        spec.expected_stdout_contains = vec!["started".into()];
+        spec.forbidden_substrings.clear();
+        spec.timeout_s = 1;
+
+        let started = std::time::Instant::now();
+        let result = super::run_verify(&spec, &fixture, temp.path(), temp.path());
+        std::thread::sleep(std::time::Duration::from_secs(3).saturating_sub(started.elapsed()));
+
+        assert!(!result.passed, "exited shell hid a live stdout holder");
+        assert_eq!(result.exit_code, -1);
+        assert_eq!(result.stdout, "started");
+        assert_eq!(
+            result.failure_reason.as_deref(),
+            Some("timed out after 1 seconds")
+        );
+        assert!(
+            !temp.path().join("late").exists(),
+            "the stdout holder ran past the deadline"
+        );
+    }
+
+    #[test]
     fn unmodified_phases_verify_the_fixture_contract() {
         let fixture = verify_fixture(Some(&["v2"]));
         for phase in [Phase::Cold, Phase::Warm, Phase::Noop, Phase::Relocate] {

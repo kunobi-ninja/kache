@@ -1947,8 +1947,8 @@ fn store_failure_banner(miss: &crate::events::BuildEvent) -> Option<String> {
         return None;
     }
     Some(format!(
-        "  NOT CACHED: this compile ran and its outputs failed to store,\n  \
-         so the crate misses on every build until the cause is fixed.\n    \
+        "  NOT CACHED: this compile ran and its outputs failed to store, so the crate\n  \
+         misses on every build until the cause is fixed.\n    \
          reason: {}",
         miss.store_error
     ))
@@ -1973,7 +1973,7 @@ fn lookup_rejection_banner(
         "not currently present in the local store"
     };
     Some(format!(
-        "  Diagnosis: matching key was found but rejected before restore\n    \
+        "  matching key was found but rejected before restore\n    \
          reason: {}\n    \
          replacement: {replacement}",
         miss.lookup_rejection
@@ -1992,7 +1992,7 @@ fn legacy_repeated_same_key_banner(
         return None;
     }
     Some(
-        "  Diagnosis: repeated miss for the same cache key\n    \
+        "  repeated miss for the same cache key\n    \
          this older event did not record whether the entry was absent, evicted, invalid, or rejected\n    \
          the miss was not caused by a cache-key change",
     )
@@ -2029,9 +2029,7 @@ pub fn why_miss(config: &Config, crate_name: &str, json: bool) -> Result<()> {
                 }],
             );
         }
-        println!("No events found for `{crate_name}`.");
-        println!("\nTip: Build the crate first, then re-run this command:");
-        println!("  cargo build -p {crate_name}");
+        println!("No events for `{crate_name}` yet. Build it first: `cargo build -p {crate_name}`");
         return Ok(());
     }
 
@@ -2075,23 +2073,19 @@ pub fn why_miss(config: &Config, crate_name: &str, json: bool) -> Result<()> {
                 Vec::new(),
             );
         }
-        println!("No misses or dups found for `{crate_name}` -- all events are hits!");
-        for entry in &stored {
-            println!(
-                "  key: {} stores: {}",
-                key_short(&entry.cache_key),
-                entry.store_locations()
-            );
-        }
-        println!("\nRecent events:");
-        for event in crate_events.iter().rev().take(5).rev() {
-            let time = event.ts.format("%Y-%m-%dT%H:%M:%S");
-            println!(
-                "  [{time}] {:<14} key: {}  {}",
-                event.result.to_string(),
-                key_short(&event.cache_key),
-                ByteSize(event.size),
-            );
+        warn_unavailable_stores(&inventory.stores);
+        let mut lines = vec![
+            term::heading(format!("kache · explain · {crate_name}")),
+            String::new(),
+            format!("No misses for `{crate_name}`: every recorded build hit the cache."),
+        ];
+        lines.extend(section(
+            &format!("Stored entries ({})", term::count(stored.len() as u64)),
+            stored_entry_lines(None, &stored),
+        ));
+        lines.extend(section("Recent events", recent_event_lines(&crate_events)));
+        for line in lines {
+            println!("{line}");
         }
         return Ok(());
     }
@@ -2132,139 +2126,8 @@ pub fn why_miss(config: &Config, crate_name: &str, json: bool) -> Result<()> {
         return why_miss_json(crate_name, miss, &stored, &inventory.stores, &diagnosis);
     }
 
-    for store in &inventory.stores {
-        if let Some(error) = &store.error {
-            println!("Store {}: unavailable ({error})", store.path.display());
-        }
-    }
+    warn_unavailable_stores(&inventory.stores);
 
-    // ── Header ─────────────────────────────────────────────────────────
-    println!("Why `{crate_name}` missed:\n");
-
-    let miss_time = miss.ts.format("%Y-%m-%dT%H:%M:%S");
-    let miss_key_display = key_short(&miss.cache_key);
-    println!(
-        "  Last {}: {miss_time} (key: {miss_key_display})",
-        miss.result
-    );
-
-    // A compile that ran and could not be stored answers the question outright,
-    // and it outranks the key-diff analysis below: the key never got the chance
-    // to matter, because nothing was written for a later build to match against
-    // (kunobi-ninja/kache#629).
-    if let Some(banner) = store_failure_banner(miss) {
-        println!();
-        println!("{banner}");
-    }
-
-    // Show miss metadata if it was subsequently stored
-    if !miss.cache_key.is_empty() {
-        let meta_path = stored
-            .iter()
-            .find(|e| e.cache_key == miss.cache_key)
-            .map(|e| e.meta_path());
-        if let Some(meta_path) = meta_path
-            && let Ok(content) = std::fs::read_to_string(&meta_path)
-            && let Ok(meta) = serde_json::from_str::<crate::store::EntryMeta>(&content)
-        {
-            if !meta.target.is_empty() {
-                println!("    target:   {}", meta.target);
-            }
-            if !meta.profile.is_empty() {
-                println!("    profile:  {}", meta.profile);
-            }
-            if !meta.features.is_empty() {
-                println!("    features: {}", meta.features.join(", "));
-            }
-        }
-    }
-
-    println!();
-
-    if stored.is_empty() {
-        println!("  Stored entries for `{crate_name}`: (none)");
-        println!();
-    } else {
-        // Show stored entries (cap at 10 most recent)
-        println!(
-            "  Stored entries for `{crate_name}` ({} total):",
-            stored.len()
-        );
-        let show_count = stored.len().min(10);
-        let hidden = stored.len().saturating_sub(10);
-        for entry in stored.iter().rev().take(show_count) {
-            let ek = key_short(&entry.cache_key);
-            let accessed = format_relative_time(&entry.last_accessed);
-            let size = ByteSize(entry.size);
-            let stores = entry.store_locations();
-            let hits = entry.hit_count;
-            let profile_tag = if entry.profile.is_empty() {
-                String::new()
-            } else {
-                format!(", profile: {}", entry.profile)
-            };
-            let crate_type_tag = if entry.crate_type.is_empty() {
-                String::new()
-            } else {
-                format!(", type: {}", entry.crate_type)
-            };
-            let match_indicator = if entry.cache_key == miss.cache_key {
-                " <-- entry-miss key (stored after compile)"
-            } else {
-                ""
-            };
-
-            // Read meta.json for richer diff info
-            let mut features_tag = String::new();
-            let mut target_tag = String::new();
-            let meta_path = entry.meta_path();
-            if let Ok(content) = std::fs::read_to_string(&meta_path)
-                && let Ok(meta) = serde_json::from_str::<crate::store::EntryMeta>(&content)
-            {
-                if !meta.features.is_empty() {
-                    features_tag = format!(", features: [{}]", meta.features.join(", "));
-                }
-                if !meta.target.is_empty() {
-                    target_tag = format!(", target: {}", meta.target);
-                }
-            }
-
-            println!(
-                "    - key: {ek} (last accessed: {accessed}, size: {size}, hits: {hits}, stores: {stores}{profile_tag}{crate_type_tag}{target_tag}{features_tag}){match_indicator}"
-            );
-        }
-        if hidden > 0 {
-            println!("    ... and {hidden} older entries");
-        }
-    }
-    print_miss_diagnosis(miss, &stored, &diagnosis);
-
-    // Render the dependency analysis shared with JSON output.
-    print_checkout_comparison(&diagnosis);
-    print_extern_chain(&diagnosis);
-    for hint in &diagnosis.hints {
-        println!("  hint: {hint}");
-    }
-
-    // ── Recent event history ──────────────────────────────────────────
-    println!("\n  Recent events:");
-    let recent: Vec<_> = crate_events.iter().rev().take(5).collect();
-    for event in recent.iter().rev() {
-        let time = event.ts.format("%H:%M:%S");
-        let ek = key_short(&event.cache_key);
-        let elapsed = if event.elapsed_ms > 1000 {
-            format!("{:.1}s", event.elapsed_ms as f64 / 1000.0)
-        } else {
-            format!("{}ms", event.elapsed_ms)
-        };
-        println!(
-            "    [{time}] {:<14} key: {ek}  {elapsed}  {}",
-            event.result.to_string(),
-            ByteSize(event.size),
-        );
-    }
-
-    // ── Key changed hint ──────────────────────────────────────────────
     let last_hit = crate_events.iter().rev().find(|e| {
         matches!(
             e.result,
@@ -2273,60 +2136,255 @@ pub fn why_miss(config: &Config, crate_name: &str, json: bool) -> Result<()> {
                 | events::EventResult::PrefetchHit
         )
     });
+    // Metadata of the missed key, when the compile was stored after it.
+    let miss_meta = stored
+        .iter()
+        .find(|e| !miss.cache_key.is_empty() && e.cache_key == miss.cache_key)
+        .and_then(|entry| read_entry_meta(entry));
 
-    if let (Some(hit), Some(miss_ev)) = (last_hit, last_miss)
-        && hit.cache_key != miss_ev.cache_key
-        && miss_ev.ts > hit.ts
-    {
-        println!(
-            "\n  Key changed: {} (last hit) -> {} ({})",
-            key_short(&hit.cache_key),
-            key_short(&miss_ev.cache_key),
-            miss_ev.result,
-        );
+    let mut lines = vec![
+        term::heading(format!("kache · explain · {crate_name}")),
+        String::new(),
+    ];
+    lines.extend(term::named_sections(&[(
+        "Last miss",
+        last_miss_rows(
+            miss,
+            miss_meta.as_ref(),
+            last_hit.copied(),
+            config.key_salt.as_deref(),
+        ),
+    )]));
+    lines.extend(section(
+        "Diagnosis",
+        miss_diagnosis_lines(miss, miss_meta.as_ref(), &stored, &diagnosis),
+    ));
+    lines.extend(section("Other build tree", checkout_lines(&diagnosis)));
+    lines.extend(section(
+        "Dependency cascade",
+        extern_chain_lines(&diagnosis),
+    ));
+    lines.extend(section(
+        "Hints",
+        diagnosis
+            .hints
+            .iter()
+            .map(|hint| format!("  {hint}"))
+            .collect(),
+    ));
+    lines.extend(section(
+        &format!("Stored entries ({})", term::count(stored.len() as u64)),
+        stored_entry_lines(Some(&miss.cache_key), &stored),
+    ));
+    lines.extend(section("Recent events", recent_event_lines(&crate_events)));
+    lines.push(String::new());
+    lines.push(format!(
+        "Every key input: `KACHE_LOG=trace cargo build -p {crate_name} 2>&1 | grep '\\[key:{crate_name}\\]'`"
+    ));
+    for line in lines {
+        println!("{line}");
     }
-
-    // ── Active key salt ───────────────────────────────────────────────
-    // The salt is folded into every key but isn't recorded per entry, so a
-    // salt change can't be diffed against a stored entry — it shifts the key
-    // wholesale and looks like a clean miss. Surfacing the active salt makes
-    // that cause visible: a stray machine-global `KACHE_KEY_SALT`, or a
-    // rotated salt, alone explains every miss here.
-    if let Some(salt) = config.key_salt.as_deref().filter(|s| !s.is_empty()) {
-        println!("\n  Active key_salt: {salt:?}");
-        println!(
-            "    (folded into every key; if it changed or was set unexpectedly since the \
-             last hit, that alone shifts the key and explains the miss)"
-        );
-    }
-
-    println!("\n  For full key component details, run:");
-    println!(
-        "    KACHE_LOG=trace cargo build -p {crate_name} 2>&1 | grep '\\[key:{crate_name}\\]'"
-    );
-
     Ok(())
 }
 
-/// Render the comparison with another checkout, when the miss's own build tree
-/// had no earlier build of the crate to compare with.
-fn print_checkout_comparison(diagnosis: &MissDiagnosis) {
+/// A heading and its lines after a blank line, or nothing when `body` is
+/// empty: the sections of `kache explain <crate>` after the first.
+fn section(name: &str, body: Vec<String>) -> Vec<String> {
+    if body.is_empty() {
+        return body;
+    }
+    let mut lines = vec![String::new(), term::heading(name)];
+    lines.extend(body);
+    lines
+}
+
+/// Stores that could not be read, on stderr, so the report still prints.
+fn warn_unavailable_stores(stores: &[crate::store_view::StoreSummary]) {
+    for store in stores {
+        if let Some(error) = &store.error {
+            eprintln!(
+                "warning: store {} is unavailable ({error})",
+                term::home_path(&store.path)
+            );
+        }
+    }
+}
+
+fn read_entry_meta(entry: &daemon::StatsEntry) -> Option<crate::store::EntryMeta> {
+    let content = std::fs::read_to_string(entry.meta_path()).ok()?;
+    serde_json::from_str(&content).ok()
+}
+
+/// The "Last miss" rows of `kache explain <crate>`: the miss, its key and
+/// configuration, and the two things that change a key wholesale (a last
+/// hit under another key, the key salt).
+fn last_miss_rows(
+    miss: &events::BuildEvent,
+    meta: Option<&crate::store::EntryMeta>,
+    last_hit: Option<&events::BuildEvent>,
+    key_salt: Option<&str>,
+) -> Vec<term::Row<'static>> {
+    let mut rows = vec![
+        (
+            "Result",
+            miss.result.to_string(),
+            miss.ts.format("%Y-%m-%dT%H:%M:%S").to_string(),
+        ),
+        (
+            "Key",
+            if miss.cache_key.is_empty() {
+                "none".to_string()
+            } else {
+                key_short(&miss.cache_key).to_string()
+            },
+            String::new(),
+        ),
+    ];
+    if let Some(meta) = meta {
+        for (label, value) in [
+            ("Target", meta.target.clone()),
+            ("Profile", meta.profile.clone()),
+            ("Features", meta.features.join(", ")),
+        ] {
+            if !value.is_empty() {
+                rows.push((label, value, String::new()));
+            }
+        }
+    }
+    if let Some(hit) = last_hit.filter(|hit| hit.cache_key != miss.cache_key && miss.ts > hit.ts) {
+        rows.push((
+            "Last hit",
+            key_short(&hit.cache_key).to_string(),
+            "under a different key".to_string(),
+        ));
+    }
+    // The salt is folded into every key but isn't recorded per entry, so a
+    // salt change can't be diffed against a stored entry: it shifts the key
+    // wholesale and looks like a clean miss. A stray machine-global
+    // `KACHE_KEY_SALT`, or a rotated salt, alone explains every miss here.
+    if let Some(salt) = key_salt.filter(|salt| !salt.is_empty()) {
+        rows.push((
+            "Key salt",
+            format!("{salt:?}"),
+            "folded into every key; a change since the last hit alone explains the miss"
+                .to_string(),
+        ));
+    }
+    rows
+}
+
+/// The stored entries of the crate, newest first and at most ten. `missed`
+/// marks the entry stored under the missed key.
+fn stored_entry_lines(missed: Option<&str>, stored: &[&daemon::StatsEntry]) -> Vec<String> {
+    if stored.is_empty() {
+        return vec!["  none".to_string()];
+    }
+    let body: Vec<Vec<String>> = stored
+        .iter()
+        .rev()
+        .take(10)
+        .map(|entry| {
+            let mut details = Vec::new();
+            if !entry.profile.is_empty() {
+                details.push(format!("profile {}", entry.profile));
+            }
+            if !entry.crate_type.is_empty() {
+                details.push(format!("type {}", entry.crate_type));
+            }
+            if let Some(meta) = read_entry_meta(entry) {
+                if !meta.target.is_empty() {
+                    details.push(format!("target {}", meta.target));
+                }
+                if !meta.features.is_empty() {
+                    details.push(format!("features [{}]", meta.features.join(", ")));
+                }
+            }
+            if missed == Some(entry.cache_key.as_str()) {
+                details.push("the missed key, stored after the compile".to_string());
+            }
+            vec![
+                key_short(&entry.cache_key).to_string(),
+                format_relative_time(&entry.last_accessed),
+                term::bytes(entry.size),
+                term::count(entry.hit_count),
+                entry.store_locations(),
+                details.join(", "),
+            ]
+        })
+        .collect();
+    let mut lines = term::table(
+        &["KEY", "ACCESSED", "SIZE", "HITS", "STORE", "DETAILS"],
+        &[
+            term::Align::Left,
+            term::Align::Left,
+            term::Align::Right,
+            term::Align::Right,
+            term::Align::Left,
+            term::Align::Left,
+        ],
+        &body,
+    );
+    let hidden = stored.len().saturating_sub(10);
+    if hidden > 0 {
+        lines.push(format!(
+            "  and {} older",
+            term::counted(hidden as u64, "entry", "entries")
+        ));
+    }
+    lines
+}
+
+/// The crate's last five events, oldest first.
+fn recent_event_lines(crate_events: &[&events::BuildEvent]) -> Vec<String> {
+    let body: Vec<Vec<String>> = crate_events
+        .iter()
+        .rev()
+        .take(5)
+        .rev()
+        .map(|event| {
+            vec![
+                event.ts.format("%Y-%m-%dT%H:%M:%S").to_string(),
+                event.result.to_string(),
+                key_short(&event.cache_key).to_string(),
+                term::duration_ms(event.elapsed_ms),
+                term::bytes(event.size),
+            ]
+        })
+        .collect();
+    term::table(
+        &["TIME", "RESULT", "KEY", "ELAPSED", "SIZE"],
+        &[
+            term::Align::Left,
+            term::Align::Left,
+            term::Align::Left,
+            term::Align::Right,
+            term::Align::Right,
+        ],
+        &body,
+    )
+}
+
+/// The comparison with another checkout, when the miss's own build tree had
+/// no earlier build of the crate to compare with.
+fn checkout_lines(diagnosis: &MissDiagnosis) -> Vec<String> {
     let Some(checkout) = &diagnosis.checkout else {
-        return;
+        return Vec::new();
     };
     // "Build tree", not "checkout": a registry crate built with the same
     // features and profile has one unit id in unrelated projects too.
-    println!(
-        "\n  Other build tree: no earlier build of this crate in {}",
-        checkout.root
+    let mut lines = vec![
+        format!("  no earlier build of this crate in {}", checkout.root),
+        format!(
+            "  compared with the same unit built in: {}",
+            checkout.baseline_root
+        ),
+    ];
+    lines.extend(
+        checkout_comparison_lines(checkout)
+            .into_iter()
+            .map(|line| format!("  {line}")),
     );
-    println!(
-        "    compared with the same unit built in: {}",
-        checkout.baseline_root
-    );
-    for line in checkout_comparison_lines(checkout) {
-        println!("    {line}");
-    }
+    lines
 }
 
 fn checkout_comparison_lines(checkout: &crate::miss_chain::CheckoutComparison) -> Vec<String> {
@@ -2377,33 +2435,32 @@ fn checkout_comparison_lines(checkout: &crate::miss_chain::CheckoutComparison) -
     lines
 }
 
-/// Render the `extern:` cascade for a miss, when one is recorded (#609).
+/// The `extern:` cascade for a miss, when one is recorded (#609).
 ///
-/// Prints nothing when the miss is not downstream of a dependency change, so
-/// the ordinary single-crate case reads exactly as before. When the digests
-/// were never recorded, says how to turn them on rather than staying silent
-/// about a diagnosis it could have given.
-fn print_extern_chain(diagnosis: &MissDiagnosis) {
+/// Empty when the miss is not downstream of a dependency change. When the
+/// digests were never recorded, says how to turn them on rather than staying
+/// silent about a diagnosis it could have given.
+fn extern_chain_lines(diagnosis: &MissDiagnosis) -> Vec<String> {
     let Some(chain) = &diagnosis.dependency_chain else {
         if diagnosis.dependency_recording_missing {
-            println!(
-                "\n  Dependency cascade: not analyzed (no per-dependency digests recorded).\n    \
-                 Enable [cache] explain_miss to record them, then rebuild."
-            );
+            return vec![
+                "  not analyzed: no per-dependency digests recorded".to_string(),
+                "  set explain_miss = true under [cache], then rebuild".to_string(),
+            ];
         }
-        return;
+        return Vec::new();
     };
 
     let direct: Vec<&str> = chain.direct.iter().map(|d| d.name.as_str()).collect();
-    println!(
-        "\n  Dependency cascade: this miss is downstream of {} that changed ({})",
+    let mut lines = vec![format!(
+        "  this miss is downstream of {} that changed ({})",
         if direct.len() == 1 {
             "a dependency".to_string()
         } else {
             format!("{} dependencies", direct.len())
         },
         direct.join(", ")
-    );
+    )];
 
     for root in &chain.roots {
         let via = if root.branches > 1 {
@@ -2411,107 +2468,123 @@ fn print_extern_chain(diagnosis: &MissDiagnosis) {
         } else {
             String::new()
         };
-        match &root.kind {
-            crate::miss_chain::RootKind::Groups(groups) => println!(
-                "    root: {}{via} -- own inputs changed: {}",
-                root.crate_name,
+        let name = &root.crate_name;
+        lines.push(match &root.kind {
+            crate::miss_chain::RootKind::Groups(groups) => format!(
+                "  root: {name}{via}, its own inputs changed: {}",
                 groups.join(", ")
             ),
-            crate::miss_chain::RootKind::PathOnly => println!(
-                "    root: {}{via} -- same key in both build trees, but its artifact differs \
-                 (its output is not reproducible across build trees)",
-                root.crate_name
+            crate::miss_chain::RootKind::PathOnly => format!(
+                "  root: {name}{via}, same key in both build trees but its artifact differs \
+                 (its output is not reproducible across build trees)"
             ),
-            crate::miss_chain::RootKind::NothingRecorded => println!(
-                "    root: {}{via} -- dependencies stable and no traced input group changed \
-                 (key salt or extra inputs?)",
-                root.crate_name
+            crate::miss_chain::RootKind::NothingRecorded => format!(
+                "  root: {name}{via}, dependencies stable and no traced input group changed \
+                 (key salt or extra inputs?)"
             ),
             // Everything below is an unresolved endpoint, not a cause. Worded
             // so it can't be read as "this crate is why you missed".
-            crate::miss_chain::RootKind::NoMissRecorded => println!(
-                "    unresolved: {}{via} -- artifact differs, but it has no compile recorded in \
-                 this event window",
-                root.crate_name
+            crate::miss_chain::RootKind::NoMissRecorded => format!(
+                "  unresolved: {name}{via}, artifact differs but it has no compile recorded in \
+                 this event window"
             ),
-            crate::miss_chain::RootKind::NoBaseline => println!(
-                "    unresolved: {}{via} -- nothing earlier to compare it against",
-                root.crate_name
+            crate::miss_chain::RootKind::NoBaseline => {
+                format!("  unresolved: {name}{via}, nothing earlier to compare it against")
+            }
+            crate::miss_chain::RootKind::NoDiffableHistory => format!(
+                "  unresolved: {name}{via}, its own dependency history is not comparable, so the \
+                 cascade may continue below it"
             ),
-            crate::miss_chain::RootKind::NoDiffableHistory => println!(
-                "    unresolved: {}{via} -- its own dependency history is not comparable, so the \
-                 cascade may continue below it",
-                root.crate_name
+            crate::miss_chain::RootKind::LimitReached => format!(
+                "  unresolved: {name}{via}, still descending when the walk limit was reached"
             ),
-            crate::miss_chain::RootKind::LimitReached => println!(
-                "    unresolved: {}{via} -- still descending when the walk limit was reached",
-                root.crate_name
-            ),
-        }
+        });
         if root.path.len() > 1 {
             let mut path: Vec<&str> = root.path.iter().map(|h| h.crate_name.as_str()).collect();
-            path.push(root.crate_name.as_str());
-            println!("      via: {}", path.join(" <- "));
+            path.push(name.as_str());
+            lines.push(format!("    via: {}", path.join(" <- ")));
         }
         for group in &root.passthroughs {
-            println!(
-                "      {}x uncached compile in {}: {}",
-                group.count, root.crate_name, group.reason
-            );
+            lines.push(format!(
+                "    {}x uncached compile in {name}: {}",
+                group.count, group.reason
+            ));
         }
         if !root.passthroughs.is_empty() {
-            println!(
-                "      (uncached compiles make the artifact vary per checkout; attributed by \
+            lines.push(
+                "    (uncached compiles make the artifact vary per checkout; attributed by \
                  package directory)"
+                    .to_string(),
             );
         }
     }
 
     if !chain.has_resolved_root() {
-        println!(
-            "    note: no endpoint could be resolved -- the recorded history does not explain \
+        lines.push(
+            "  note: no endpoint could be resolved; the recorded history does not explain \
              this miss"
+                .to_string(),
         );
     }
     if let Some(reason) = chain.truncated {
-        println!("    note: walk stopped early -- {reason}");
+        lines.push(format!("  note: the walk stopped early: {reason}"));
     }
+    lines
 }
 
-fn print_miss_diagnosis(
+/// The "Diagnosis" lines of `kache explain <crate>`. A failed store leads:
+/// nothing was written for a later build to match, so it outranks any key
+/// comparison (kunobi-ninja/kache#629).
+fn miss_diagnosis_lines(
     miss: &events::BuildEvent,
+    miss_meta: Option<&crate::store::EntryMeta>,
     stored: &[&daemon::StatsEntry],
     diagnosis: &MissDiagnosis,
-) {
+) -> Vec<String> {
+    let mut lines: Vec<String> = store_failure_banner(miss).into_iter().collect();
     match diagnosis.cause {
-        Cause::NotCached => {} // The store-failure banner already leads the report.
+        Cause::NotCached => {}
         Cause::LookupRejected => {
-            if let Some(banner) = lookup_rejection_banner(miss, diagnosis.same_key_present) {
-                println!("{banner}");
-            }
+            lines.extend(lookup_rejection_banner(miss, diagnosis.same_key_present));
         }
         Cause::RepeatedSameKey => {
-            if let Some(banner) = legacy_repeated_same_key_banner(miss, true) {
-                println!("{banner}");
-            }
+            lines.extend(legacy_repeated_same_key_banner(miss, true).map(str::to_string));
         }
-        Cause::NeverCached => println!("  Diagnosis: never cached -- first build of this crate"),
+        Cause::NeverCached => lines.push("  never cached: first build of this crate".to_string()),
         Cause::FirstBuildNowCached => {
-            println!("  Diagnosis: first build with these inputs -- entry is now cached");
+            lines.push("  first build with these inputs: the entry is now cached".to_string());
         }
         Cause::KeyMismatch => {
-            println!(
-                "  Diagnosis: key mismatch -- {} other stored entries differ from key {}",
-                diagnosis.other_entries,
+            lines.push(format!(
+                "  key mismatch: key {} differs from {}",
                 key_short(&miss.cache_key),
-            );
-            let other_entries: Vec<_> = stored
-                .iter()
-                .filter(|e| e.cache_key != miss.cache_key)
-                .collect();
-            why_miss_diff_entries(miss, stored, &other_entries);
+                term::counted(
+                    diagnosis.other_entries as u64,
+                    "other stored entry",
+                    "other stored entries"
+                ),
+            ));
+            if let Some(miss_meta) = miss_meta {
+                let others: Vec<(String, crate::store::EntryMeta)> = stored
+                    .iter()
+                    .filter(|e| e.cache_key != miss.cache_key)
+                    .filter_map(|e| {
+                        Some((key_short(&e.cache_key).to_string(), read_entry_meta(e)?))
+                    })
+                    .collect();
+                let (diffs, extra) = why_miss_diff_messages(
+                    miss_meta,
+                    others.iter().map(|(key, meta)| (key.as_str(), meta)),
+                    5,
+                );
+                lines.extend(diffs.iter().map(|diff| format!("    - {diff}")));
+                if extra > 0 {
+                    lines.push(format!("    and {extra} more"));
+                }
+            }
         }
     }
+    lines
 }
 
 fn why_miss_json(
@@ -2563,55 +2636,9 @@ fn why_miss_json(
     )
 }
 
-/// Compare the miss event's stored metadata against other stored entries
-/// to surface what likely differs (target, profile, features).
-fn why_miss_diff_entries(
-    miss: &events::BuildEvent,
-    stored: &[&daemon::StatsEntry],
-    other_entries: &[&&daemon::StatsEntry],
-) {
-    // Load metadata for the miss key (if stored)
-    let miss_meta = stored
-        .iter()
-        .find(|e| e.cache_key == miss.cache_key)
-        .and_then(|entry| std::fs::read_to_string(entry.meta_path()).ok())
-        .and_then(|content| serde_json::from_str::<crate::store::EntryMeta>(&content).ok());
-
-    let Some(miss_meta) = miss_meta else {
-        return;
-    };
-
-    let mut other_metas = Vec::new();
-
-    for entry in other_entries {
-        let meta_path = entry.meta_path();
-        let other_meta = std::fs::read_to_string(&meta_path)
-            .ok()
-            .and_then(|c| serde_json::from_str::<crate::store::EntryMeta>(&c).ok());
-
-        let Some(other) = other_meta else {
-            continue;
-        };
-
-        other_metas.push((key_short(&entry.cache_key).to_string(), other));
-    }
-
-    let (diffs, extra) = why_miss_diff_messages(
-        &miss_meta,
-        other_metas.iter().map(|(ek, meta)| (ek.as_str(), meta)),
-        5,
-    );
-    if !diffs.is_empty() {
-        println!("  Differences detected:");
-        for diff in &diffs {
-            println!("    - {diff}");
-        }
-        if extra > 0 {
-            println!("    ... and {extra} more");
-        }
-    }
-}
-
+/// What differs between the missed key's configuration and each other
+/// stored entry's (target, profile, features, crate types), at most `limit`
+/// lines and how many more there were.
 fn why_miss_diff_messages<'a, I>(
     miss_meta: &crate::store::EntryMeta,
     other_entries: I,
@@ -2620,19 +2647,29 @@ fn why_miss_diff_messages<'a, I>(
 where
     I: IntoIterator<Item = (&'a str, &'a crate::store::EntryMeta)>,
 {
-    let mut diffs: Vec<String> = Vec::new();
+    // Every same-config entry says the same thing, so they share one line.
+    let mut diffs: Vec<(Option<&'static str>, String)> = Vec::new();
+    let mut push = |same_config: Option<&'static str>, message: String| {
+        diffs.push((same_config, message));
+    };
     for (ek, other) in other_entries {
         if miss_meta.target != other.target {
-            diffs.push(format!(
-                "different target vs {ek}: \"{}\" vs \"{}\"",
-                miss_meta.target, other.target
-            ));
+            push(
+                None,
+                format!(
+                    "different target vs {ek}: \"{}\" vs \"{}\"",
+                    miss_meta.target, other.target
+                ),
+            );
         }
         if miss_meta.profile != other.profile {
-            diffs.push(format!(
-                "different profile vs {ek}: \"{}\" vs \"{}\"",
-                miss_meta.profile, other.profile
-            ));
+            push(
+                None,
+                format!(
+                    "different profile vs {ek}: \"{}\" vs \"{}\"",
+                    miss_meta.profile, other.profile
+                ),
+            );
         }
         if miss_meta.features != other.features {
             let miss_feats = if miss_meta.features.is_empty() {
@@ -2645,15 +2682,19 @@ where
             } else {
                 other.features.join(", ")
             };
-            diffs.push(format!(
-                "different features vs {ek}: [{miss_feats}] vs [{other_feats}]"
-            ));
+            push(
+                None,
+                format!("different features vs {ek}: [{miss_feats}] vs [{other_feats}]"),
+            );
         }
         if miss_meta.crate_types != other.crate_types {
-            diffs.push(format!(
-                "different crate types vs {ek}: {:?} vs {:?}",
-                miss_meta.crate_types, other.crate_types
-            ));
+            push(
+                None,
+                format!(
+                    "different crate types vs {ek}: {:?} vs {:?}",
+                    miss_meta.crate_types, other.crate_types
+                ),
+            );
         }
 
         if miss_meta.target == other.target
@@ -2661,23 +2702,18 @@ where
             && miss_meta.features == other.features
             && miss_meta.crate_types == other.crate_types
         {
-            diffs.push(format!(
-                "same config as {ek} -- likely source code, dependency, or rustc version change"
-            ));
+            push(
+                Some("same config"),
+                format!("same config as {ek}: likely a source, dependency or rustc version change"),
+            );
         }
     }
 
     let mut unique_diffs: Vec<String> = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    for diff in &diffs {
-        // Normalize: strip the key prefix to group identical diagnoses.
-        let normalized = if let Some(pos) = diff.find(" -- ") {
-            diff[pos..].to_string()
-        } else {
-            diff.clone()
-        };
-        if seen.insert(normalized) {
-            unique_diffs.push(diff.clone());
+    for (same_config, diff) in diffs {
+        if seen.insert(same_config.map_or_else(|| diff.clone(), str::to_string)) {
+            unique_diffs.push(diff);
         }
     }
 

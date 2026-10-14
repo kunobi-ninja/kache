@@ -3003,7 +3003,7 @@ fn commands_operate_on_a_populated_cache() {
         .success()
         .stdout(predicates::str::contains("kachetestlib"))
         .stdout(predicates::str::contains(
-            "Diagnosis: first build with these inputs -- entry is now cached",
+            "\nDiagnosis\n  first build with these inputs: the entry is now cached\n",
         ));
 
     // Listing the specific crate reaches the same populated non-TTY renderer.
@@ -3024,8 +3024,8 @@ fn commands_operate_on_a_populated_cache() {
 
 /// A source edit between builds changes the cache key, so the second build is a
 /// fresh miss with a *different* key than the first entry. `why-miss` should
-/// then take its key-mismatch diagnosis path (why_miss_diff_entries) and the
-/// "Key changed" hint — the richest part of the command.
+/// then take its key-mismatch diagnosis path and list what differs between
+/// the stored entries, the richest part of the command.
 #[test]
 fn why_miss_reports_key_mismatch_after_source_edit() {
     let e = env();
@@ -3069,10 +3069,10 @@ fn why_miss_reports_key_mismatch_after_source_edit() {
         .args(["why-miss", "kachediff"])
         .assert()
         .success()
-        .stdout(predicates::str::contains("Why `kachediff` missed"))
-        .stdout(predicates::str::contains("Diagnosis: key mismatch"))
+        .stdout(predicates::str::contains("kache · explain · kachediff"))
+        .stdout(predicates::str::contains("\nDiagnosis\n  key mismatch: "))
         .stdout(predicates::str::contains(format!(
-            "same config as {} -- likely source code, dependency, or rustc version change",
+            "same config as {}: likely a source, dependency or rustc version change",
             &first_key[..12],
         )));
 
@@ -3125,7 +3125,7 @@ fn why_miss_compares_features_from_a_volume_shard() {
         .assert()
         .success()
         .stdout(predicates::str::contains("different features vs"))
-        .stdout(predicates::str::contains("    features: default, new"))
+        .stdout(predicates::str::contains("  Features   default, new"))
         .stdout(predicates::str::contains(shard.display().to_string()));
     let output = e
         .cmd()
@@ -3151,17 +3151,14 @@ fn why_miss_legacy_repeated_same_key_does_not_claim_key_mismatch() {
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("Diagnosis: repeated miss for the same cache key"),
+        stdout.contains("\nDiagnosis\n  repeated miss for the same cache key\n"),
         "stdout: {stdout}"
     );
     assert!(
         stdout.contains("the miss was not caused by a cache-key change"),
         "stdout: {stdout}"
     );
-    assert!(
-        !stdout.contains("Diagnosis: key mismatch"),
-        "stdout: {stdout}"
-    );
+    assert!(!stdout.contains("key mismatch"), "stdout: {stdout}");
 }
 
 #[test]
@@ -3177,7 +3174,7 @@ fn why_miss_legacy_different_keys_remain_a_cold_miss() {
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("Diagnosis: never cached -- first build of this crate"),
+        stdout.contains("\nDiagnosis\n  never cached: first build of this crate\n"),
         "stdout: {stdout}"
     );
     assert!(
@@ -3696,8 +3693,8 @@ fn why_miss_both_formats_prioritize_store_failure_over_lookup_and_cold_history()
         .success()
         .stdout(predicates::str::contains("NOT CACHED"))
         .stdout(predicates::str::contains("disk full"))
-        .stdout(predicates::str::contains("Diagnosis: never cached").not())
-        .stdout(predicates::str::contains("Diagnosis: matching key").not());
+        .stdout(predicates::str::contains("never cached").not())
+        .stdout(predicates::str::contains("matching key").not());
     let output = e
         .cmd()
         .args(["--json", "why-miss", "example"])
@@ -3735,8 +3732,8 @@ fn why_miss_both_formats_include_unresolved_dependency_cascade() {
         .args(["why-miss", "example"])
         .assert()
         .success()
-        .stdout(predicates::str::contains("Dependency cascade:"))
-        .stdout(predicates::str::contains("unresolved: dep"));
+        .stdout(predicates::str::contains("\nDependency cascade\n"))
+        .stdout(predicates::str::contains("  unresolved: dep, "));
     let output = e
         .cmd()
         .args(["--json", "why-miss", "example"])
@@ -3830,14 +3827,14 @@ fn why_miss_compares_a_second_checkout_with_the_first() {
         .assert()
         .success()
         .stdout(predicates::str::contains(
-            "Other build tree: no earlier build of this crate in /checkouts/b",
+            "\nOther build tree\n  no earlier build of this crate in /checkouts/b\n",
         ))
         .stdout(predicates::str::contains(
             "compared with the same unit built in: /checkouts/a",
         ))
         .stdout(predicates::str::contains("dependencies differ: mid"))
         .stdout(predicates::str::contains(
-            "root: leaf -- own inputs changed: env_deps",
+            "root: leaf, its own inputs changed: env_deps",
         ))
         .stdout(predicates::str::contains("via: app <- mid <- leaf"));
 
@@ -3892,7 +3889,7 @@ fn why_miss_reports_a_path_only_root_across_checkouts() {
         .assert()
         .success()
         .stdout(predicates::str::contains(
-            "root: leaf -- same key in both build trees, but its artifact differs",
+            "root: leaf, same key in both build trees but its artifact differs",
         ));
     e.cmd()
         .args(["why-miss", "leaf"])

@@ -1870,7 +1870,7 @@ fn evicting_nothing_because_everything_is_pinned_explains_itself() {
         "must say how many were held back: {msg}"
     );
     assert!(
-        msg.contains("120s"),
+        msg.contains("within the last ~2 min"),
         "must name the grace period so the wait is bounded and knowable: {msg}"
     );
     assert!(
@@ -1889,7 +1889,7 @@ fn evicting_nothing_while_over_limit_still_explains_the_grace() {
     // needs to know the idle rule exists, or "0" reads as a broken GC.
     let msg = describe_eviction(&gc_stats(0, 0, 0), true);
     assert!(msg.contains("over its limit"), "{msg}");
-    assert!(msg.contains("120s"), "{msg}");
+    assert!(msg.contains("within the last ~2 min"), "{msg}");
 }
 
 #[test]
@@ -4122,9 +4122,107 @@ fn why_miss_diff_messages_dedupes_same_config_and_empty_other_features() {
     assert_eq!(
         messages
             .iter()
-            .filter(|m| m.contains("likely source code"))
+            .filter(|m| m.contains("likely a source"))
             .count(),
         1
+    );
+}
+
+#[test]
+fn explain_crate_last_miss_rows_name_the_key_its_config_and_what_shifts_it() {
+    use crate::events::EventResult;
+    let miss = build_event("dep", EventResult::Miss, 10, 20, 30, "abcdef0123456789");
+    let mut hit = build_event("dep", EventResult::LocalHit, 0, 1, 30, "fedcba9876543210");
+    hit.ts = miss.ts - chrono::Duration::seconds(5);
+    let meta = diff_meta("x86_64", "", &["a", "b"], &["lib"]);
+    let rows = last_miss_rows(&miss, Some(&meta), Some(&hit), Some("salt"));
+    let labels: Vec<&str> = rows.iter().map(|row| row.0).collect();
+    assert_eq!(
+        labels,
+        [
+            "Result", "Key", "Target", "Features", "Last hit", "Key salt"
+        ]
+    );
+    assert_eq!(rows[0].1, "miss");
+    assert_eq!(rows[1].1, "abcdef012345");
+    assert_eq!(rows[3].1, "a, b");
+    assert_eq!(rows[4].1, "fedcba987654");
+    assert_eq!(rows[5].1, "\"salt\"");
+
+    // A hit under the same key, or one after the miss, explains nothing.
+    let mut same = hit.clone();
+    same.cache_key = miss.cache_key.clone();
+    let mut later = hit.clone();
+    later.ts = miss.ts + chrono::Duration::seconds(5);
+    for hit in [&same, &later] {
+        let rows = last_miss_rows(&miss, None, Some(hit), Some(""));
+        let labels: Vec<&str> = rows.iter().map(|row| row.0).collect();
+        assert_eq!(labels, ["Result", "Key"]);
+    }
+    let mut keyless = miss.clone();
+    keyless.cache_key.clear();
+    assert_eq!(last_miss_rows(&keyless, None, None, None)[1].1, "none");
+}
+
+#[test]
+fn explain_crate_diagnosis_lines_lead_with_the_cause() {
+    use crate::events::EventResult;
+    let miss = build_event("dep", EventResult::Miss, 10, 20, 30, "abcdef0123456789");
+    let never = MissDiagnosis::new(&miss, false, 0, false, None, false);
+    assert_eq!(
+        miss_diagnosis_lines(&miss, None, &[], &never),
+        ["  never cached: first build of this crate"]
+    );
+    assert_eq!(
+        extern_chain_lines(&never),
+        [
+            "  not analyzed: no per-dependency digests recorded",
+            "  set explain_miss = true under [cache], then rebuild",
+        ]
+    );
+    let recorded = MissDiagnosis::new(&miss, false, 0, false, None, true);
+    assert!(extern_chain_lines(&recorded).is_empty());
+
+    let now_cached = MissDiagnosis::new(&miss, false, 1, true, None, false);
+    assert_eq!(
+        miss_diagnosis_lines(&miss, None, &[], &now_cached),
+        ["  first build with these inputs: the entry is now cached"]
+    );
+    for (stored, others) in [(2, "1 other stored entry"), (3, "2 other stored entries")] {
+        let mismatch = MissDiagnosis::new(&miss, false, stored, true, None, false);
+        assert_eq!(
+            miss_diagnosis_lines(&miss, None, &[], &mismatch),
+            [format!(
+                "  key mismatch: key abcdef012345 differs from {others}"
+            )]
+        );
+    }
+
+    let mut failed = miss.clone();
+    failed.store_error = "disk full".into();
+    let not_cached = MissDiagnosis::new(&failed, false, 0, false, None, false);
+    let lines = miss_diagnosis_lines(&failed, None, &[], &not_cached);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].starts_with("  NOT CACHED: "), "{lines:?}");
+    assert!(lines[0].ends_with("reason: disk full"), "{lines:?}");
+}
+
+#[test]
+fn explain_crate_sections_skip_empty_bodies_and_tabulate_events() {
+    use crate::events::EventResult;
+    assert!(section("Hints", Vec::new()).is_empty());
+    assert_eq!(
+        section("Hints", vec!["  a".to_string()]),
+        ["", "Hints", "  a"]
+    );
+    assert_eq!(stored_entry_lines(None, &[]), ["  none"]);
+    let miss = build_event("dep", EventResult::Miss, 10, 20, 2048, "abcdef0123456789");
+    let lines = recent_event_lines(&[&miss]);
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert!(lines[0].starts_with("  TIME"), "{lines:?}");
+    assert!(
+        lines[1].ends_with("miss     abcdef012345     20 ms   2.0 KiB"),
+        "{lines:?}"
     );
 }
 
@@ -9040,6 +9138,15 @@ fn unit_cleanup_rendering_explains_missing_evidence_and_ready_counts() {
     assert!(summary.contains("2 obsolete units"));
     assert!(summary.contains("3 live and 4 unknown units kept"));
     assert!(unit_cleanup_note(&ready).contains("2 obsolete units"));
+    let one = crate::target_liveness::Plan {
+        units: 1,
+        ..ready.clone()
+    };
+    assert!(render_unit_plan("target", &one).contains("1 obsolete unit ("));
+    assert_eq!(
+        unit_cleanup_note(&one),
+        "  (1 obsolete unit: `kache clean --units --dry-run`)"
+    );
     let empty = crate::target_liveness::Plan { units: 0, ..ready };
     assert!(unit_cleanup_note(&empty).is_empty());
     let missing = crate::target_liveness::Plan {

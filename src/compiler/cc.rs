@@ -4859,7 +4859,9 @@ const CC_ARTIFACT_SCHEMA: &[u8] = b"cc_artifact_schema:4\n";
 /// single-read rules. A release that records v5 memos rewrites a memo row
 /// in place when it records the same key again, and nothing in the row says
 /// which release wrote it, so the two never share a key.
-const CC_PREPROCESS_MEMO_SCHEMA: &[u8] = b"cc-preprocess-memo-v6";
+/// v7: read-set digests pair mapped input names with content hashes; a v6
+/// memo stores a content-only digest that can alias exchanged headers.
+const CC_PREPROCESS_MEMO_SCHEMA: &[u8] = b"cc-preprocess-memo-v7";
 
 /// Local identity for a preprocessor invocation. The environment is included
 /// as selected by [`cc_memo_env_is_keyed`].
@@ -6094,35 +6096,33 @@ fn cc_system_path(path: &str) -> bool {
         .any(|root| path.starts_with(root))
 }
 
-/// One digest standing for the read set: what the memo would otherwise hold
-/// as the expansion hash. Hashed over the mapped content of every file read
-/// and nothing else, as the expansion was with `-P`: where a file sits, and
-/// whether its directory could be mapped, does not enter, so two checkouts of
-/// the same tree agree even under an unmappable root. The source is one of
-/// the files, so include order and every textual choice are in it.
+/// Hash each mapped input name with its content, preserving their association
+/// when headers exchange bytes. Mapped names and project content retain reuse
+/// across equivalent checkouts; physical paths and timestamps stay out.
 fn cc_direct_inputs_digest(fingerprints: &[crate::cache_key::CcPreprocessMemoInput]) -> String {
     // A toolchain file is the same bytes on every checkout and can spell a
     // directory a checkout happens to be under (glibc's `P_tmpdir`); its raw
     // hash is the portable one. A project file may spell its own checkout
     // root, which the maps make portable.
-    let mut contents: Vec<&str> = fingerprints
+    let mut contents: Vec<(&str, &str)> = fingerprints
         .iter()
         .map(|input| {
-            if cc_system_path(input.local_path()) {
+            let content = if cc_system_path(input.local_path()) {
                 input.content.as_str()
             } else {
                 input.mapped.as_str()
-            }
+            };
+            (input.name.as_str(), content)
         })
         .collect();
     contents.sort_unstable();
     contents.dedup();
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"kache.cc.direct-inputs.v2\0");
+    hasher.update(b"kache.cc.direct-inputs.v3\0");
     hasher.update(&(contents.len() as u64).to_le_bytes());
-    for content in contents {
-        hasher.update(content.as_bytes());
-        hasher.update(b"\n");
+    for (name, content) in contents {
+        fold_cc_memo_field(&mut hasher, b"name", name.as_bytes());
+        fold_cc_memo_field(&mut hasher, b"content", content.as_bytes());
     }
     hasher.finalize().to_hex().to_string()
 }

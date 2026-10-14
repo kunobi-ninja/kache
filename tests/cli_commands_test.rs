@@ -3043,6 +3043,26 @@ fn init_preserves_a_commented_cargo_build_table() {
 
 #[cfg(unix)]
 #[test]
+fn init_preserves_cargo_config_when_the_rustdoc_text_edit_is_unsafe() {
+    let e = env();
+    let cargo = e.home.join(".cargo/config.toml");
+    std::fs::create_dir_all(cargo.parent().unwrap()).unwrap();
+    let original = "[ build ]\nrustc-wrapper = \"kache\"\n\
+                    [env]\nHOST_CC = \"clang\"\nHOST_CXX = \"clang++\"\n\
+                    CC_KNOWN_WRAPPER_CUSTOM = \"kache\"\n";
+    toml::from_str::<toml::Value>(original).expect("valid original Cargo config");
+    std::fs::write(&cargo, original).unwrap();
+
+    e.cmd()
+        .args(["init", "--yes", "--no-service"])
+        .assert()
+        .failure();
+
+    assert_eq!(std::fs::read_to_string(cargo).unwrap(), original);
+}
+
+#[cfg(unix)]
+#[test]
 fn init_check_does_not_write_build_rustdoc() {
     let e = env();
     let cargo = e.home.join(".cargo/config.toml");

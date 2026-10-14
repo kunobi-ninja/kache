@@ -3008,7 +3008,7 @@ fn apply_rustdoc_edit_preserves_commented_table_boundaries() {
     let original = "[build] # compiler settings\nrustc-wrapper = \"kache\"\n\
                     [env] # retained environment\nrustdoc = \"keep\"\n";
     toml::from_str::<toml::Value>(original).expect("valid original Cargo config");
-    let edited = apply_rustdoc_edit(original, "/shim/rustdoc");
+    let edited = checked_rustdoc_edit(original, "/shim/rustdoc").unwrap();
     let parsed: toml::Value =
         toml::from_str(&edited).expect("valid Cargo config after rustdoc edit");
     assert_eq!(parsed["build"]["rustc-wrapper"].as_str(), Some("kache"));
@@ -3016,7 +3016,28 @@ fn apply_rustdoc_edit_preserves_commented_table_boundaries() {
     assert_eq!(parsed["env"]["rustdoc"].as_str(), Some("keep"));
     assert!(edited.contains("[build] # compiler settings"));
     assert!(edited.contains("[env] # retained environment"));
-    assert_eq!(apply_rustdoc_edit(&edited, "/shim/rustdoc"), edited);
+    assert_eq!(checked_rustdoc_edit(&edited, "/shim/rustdoc").unwrap(), edited);
+}
+
+#[test]
+fn checked_rustdoc_edit_refuses_unsupported_layouts_and_changes_to_other_values() {
+    for original in [
+        "[ build ]\nrustc-wrapper = 'kache'\n",
+        "[\"build\"]\nrustc-wrapper = 'kache'\n",
+        "build.rustc-wrapper = 'kache'\n",
+        "build = { rustc-wrapper = 'kache' }\n",
+        "[metadata]\nexample = '''\n[build] # an example, inside a string\n'''\n\
+         [build]\nrustc-wrapper = 'kache'\n",
+    ] {
+        toml::from_str::<toml::Value>(original).expect("valid original Cargo config");
+        assert!(
+            checked_rustdoc_edit(original, "/shim/rustdoc").is_err(),
+            "an unsafe text edit must be rejected: {original}"
+        );
+    }
+    for original in ["not TOML", "[env]\nCC = 'cc'\n", "build = 'other'\n"] {
+        assert!(checked_rustdoc_edit(original, "/shim/rustdoc").is_err());
+    }
 }
 
 #[test]

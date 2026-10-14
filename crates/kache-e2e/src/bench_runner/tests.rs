@@ -3268,3 +3268,49 @@ fn a_timed_build_that_fetched_is_refused() {
     clean.observe(b"   Compiling a v1.0.0\n");
     clean.refuse("warm", Path::new("build-warm.log")).unwrap();
 }
+
+#[test]
+fn timed_build_refuses_dependency_fetches_on_either_stream() {
+    let dir = tempfile::tempdir().unwrap();
+    let work = dir.path();
+    let mut profile = prepare_fixture(work, None);
+    let sh = posix_sh().unwrap();
+    for (stream, command, count) in [
+        ("stdout", "printf '  Downloaded a v1.0.0\\n'", 1),
+        ("stderr", "printf '  Downloaded a v1.0.0\\n' >&2", 1),
+        (
+            "both",
+            "printf '  Downloaded a v1.0.0\\n'; printf '    Updating crates.io index\\n' >&2",
+            2,
+        ),
+    ] {
+        profile.build = command.into();
+        let error = build(
+            &profile,
+            work,
+            "cold",
+            &work.join("cache"),
+            &work.join("config"),
+            &work.join("unused-kache"),
+            work,
+            CacheBackend::Kache,
+            false,
+            &sh,
+        )
+        .err()
+        .unwrap_or_else(|| panic!("timed build accepted a dependency fetch on {stream}"))
+        .to_string();
+        assert!(
+            error.contains(&format!(
+                "[cold] the timed build fetched dependencies ({count} Cargo download or index lines)"
+            )),
+            "wrong refusal for {stream}: {error}"
+        );
+        assert!(
+            std::fs::read_to_string(work.join("build-cold.log"))
+                .unwrap()
+                .contains("Downloaded a v1.0.0"),
+            "{stream} message did not reach the actual timed build log"
+        );
+    }
+}

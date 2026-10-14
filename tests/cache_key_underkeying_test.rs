@@ -33,7 +33,7 @@ use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
 mod common;
-use common::{build_kache, isolated_config_path, kache_binary};
+use common::{build_kache, hermetic_command, isolated_config_path, kache_binary};
 
 fn rustc_path() -> String {
     // cargo sets RUSTC to the absolute path when running tests; fall back
@@ -955,4 +955,142 @@ fn unicode_distinct_source_names_remain_distinct() {
         (2, 1),
         "filesystem-distinct Unicode source names must remain distinct key identities"
     );
+}
+
+#[test]
+fn option_env_presence_changes_cached_behavior() {
+    build_kache();
+    let root = TempDir::new().unwrap();
+    let home = root.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let rustup_home = std::env::var_os("RUSTUP_HOME").unwrap_or_else(|| {
+        PathBuf::from(
+            std::env::var_os("HOME")
+                .or_else(|| std::env::var_os("USERPROFILE"))
+                .expect("home for rustup"),
+        )
+        .join(".rustup")
+        .into_os_string()
+    });
+    let source = root.path().join("lib.rs");
+    std::fs::write(
+        &source,
+        r#"pub fn mode() -> &'static str { match option_env!("KACHE_TEST_PRESENCE") {
+    None => "unset",
+    Some("") => "empty",
+    Some(_) => "value",
+} }
+"#,
+    )
+    .unwrap();
+    let consumer = root.path().join("consumer.rs");
+    std::fs::write(
+        &consumer,
+        "fn main() { print!(\"{}\", presence::mode()); }\n",
+    )
+    .unwrap();
+
+    for predictions in [true, false] {
+        let cache = TempDir::new().unwrap();
+        let config = isolated_config_path(cache.path());
+        std::fs::write(
+            &config,
+            format!(
+                "[cache]\nlocal_only = true\nignore_env = true\ninput_predictions = {predictions}\nlocal_store = {}\nruntime_dir = {}\n",
+                toml_path(cache.path()),
+                toml_path(cache.path())
+            ),
+        )
+        .unwrap();
+        let direct_out = TempDir::new().unwrap();
+        let cached_out = TempDir::new().unwrap();
+        let compile_and_observe = |value: Option<&str>, cached: bool| {
+            let out = if cached {
+                cached_out.path()
+            } else {
+                direct_out.path()
+            };
+            let program = if cached {
+                kache_binary()
+            } else {
+                PathBuf::from(rustc_path())
+            };
+            let mut command = hermetic_command(program, cache.path(), Some(&config));
+            if cached {
+                command.arg(rustc_path());
+            }
+            command
+                .args([
+                    "--crate-name",
+                    "presence",
+                    "--crate-type",
+                    "rlib",
+                    "--edition=2021",
+                    "--emit=link",
+                    "--out-dir",
+                ])
+                .arg(out)
+                .arg(&source)
+                .current_dir(root.path())
+                .env("HOME", &home)
+                .env("RUSTUP_HOME", &rustup_home)
+                .env_remove("CARGO_MANIFEST_DIR")
+                .env_remove("KACHE_INPUT_PREDICTIONS")
+                .env_remove("RUSTFLAGS")
+                .env_remove("CARGO_ENCODED_RUSTFLAGS");
+            if let Some(value) = value {
+                command.env("KACHE_TEST_PRESENCE", value);
+            } else {
+                command.env_remove("KACHE_TEST_PRESENCE");
+            }
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let binary = out.join(if cfg!(windows) {
+                "consumer.exe"
+            } else {
+                "consumer"
+            });
+            let output = hermetic_command(rustc_path(), cache.path(), Some(&config))
+                .arg(&consumer)
+                .args(["--edition=2021", "--extern"])
+                .arg(format!(
+                    "presence={}",
+                    out.join("libpresence.rlib").display()
+                ))
+                .arg("-o")
+                .arg(&binary)
+                .env("HOME", &home)
+                .env("RUSTUP_HOME", &rustup_home)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let output = std::process::Command::new(binary).output().unwrap();
+            assert!(output.status.success());
+            String::from_utf8(output.stdout).unwrap()
+        };
+        for value in [None, Some(""), Some("set"), None] {
+            let direct = compile_and_observe(value, false);
+            let cached = compile_and_observe(value, true);
+            assert_eq!(
+                cached, direct,
+                "cached option_env! must distinguish absent and empty values (predictions={predictions}, value={value:?})"
+            );
+            assert_eq!(compile_and_observe(value, true), direct);
+            let events = std::fs::read_to_string(cache.path().join("events.jsonl")).unwrap();
+            let last: serde_json::Value =
+                serde_json::from_str(events.lines().last().unwrap()).unwrap();
+            assert_eq!(
+                last["result"], "local_hit",
+                "unchanged value must actually hit"
+            );
+        }
+    }
 }

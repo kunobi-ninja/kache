@@ -1376,6 +1376,36 @@ fn losing_shared_publication_preserves_blob_readonly() {
     }
 }
 
+#[test]
+fn losing_unshared_publication_keeps_source_writable() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source");
+    let staged = dir.path().join("staged");
+    let blob = dir.path().join("winner");
+    let bytes = b"identical independent artifacts";
+    fs::write(&source, bytes).unwrap();
+    fs::hard_link(&source, &staged).unwrap();
+    fs::write(&blob, bytes).unwrap();
+    set_blob_readonly(&staged);
+    set_blob_readonly(&blob);
+    let outcome = Store::publish_staged_blob_with(
+        &staged,
+        &blob,
+        || unreachable!("an existing winner needs no rename"),
+        |_| false,
+    )
+    .unwrap();
+    assert_eq!(outcome, PublishRename::LostRace);
+    assert!(!staged.exists());
+    assert!(fs::metadata(&blob).unwrap().permissions().readonly());
+    assert!(
+        !fs::metadata(&source).unwrap().permissions().readonly(),
+        "an independently staged source must remain writable after losing publication"
+    );
+    fs::write(&source, b"next compiler output").unwrap();
+    assert_eq!(fs::read(&blob).unwrap(), bytes);
+}
+
 /// Crash-orphaned staging files are reclaimed only once older than the
 /// grace period — a concurrent put's fresh snapshot is never touched.
 #[test]

@@ -2808,6 +2808,113 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "subprocess fixture for exited_test_lease_owner_restores_admission"]
+    fn test_lease_owner_child_fixture() {
+        let cache = PathBuf::from(std::env::var_os("KACHE_TEST_SCHEDULER_ROOT").unwrap());
+        let scheduler = test_scheduler(&cache, 4);
+        let lease = scheduler.acquire_test_lease(TestWant::Fixed(2)).unwrap();
+        fs::write(
+            cache.join("lease-marker.json"),
+            serde_json::to_vec(lease.marker_path()).unwrap(),
+        )
+        .unwrap();
+        fs::write(cache.join("lock-ready"), b"ready").unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !cache.join("go").exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "lease fixture was not released"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn exited_test_lease_owner_restores_admission() {
+        let dir = temp_cache();
+        let scheduler = test_scheduler(dir.path(), 4);
+        let _calm = PinnedPressure::new(false);
+        let mut child = spawn_fixture(
+            dir.path(),
+            "scheduler::tests::test_lease_owner_child_fixture",
+        );
+        wait_ready(dir.path(), &mut child);
+        let marker: PathBuf =
+            serde_json::from_slice(&fs::read(dir.path().join("lease-marker.json")).unwrap())
+                .unwrap();
+        let probe = fs::File::open(&marker).unwrap();
+        assert!(matches!(
+            probe.try_lock_shared(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+        assert_eq!(permits_in_use(dir.path()), Some(2));
+        let args = vec![std::ffi::OsString::from("probe-0123456789abcdef")];
+        let env = crate::test_runner::TestEnv {
+            lease: Some(marker.clone()),
+            nextest_mode: None,
+            rust_test_threads: Some("1".into()),
+            pkg_name: Some("lease_fixture".into()),
+        };
+        let live_plan = crate::test_runner::plan(&args, &env, Some(dir.path()));
+        let identity = FlightIdentity::rustc("nested", &["lib".into()], false).with_key("lease");
+        let live_keyless = scheduler.keyless_compile("nested", false, Some(&marker));
+        let live_keyless_slots = permits_in_use(dir.path());
+        drop(live_keyless);
+        let BeginMiss::Compile(live_miss) =
+            scheduler.begin_miss(&identity, "nested", false, Some(&marker))
+        else {
+            panic!("a fresh keyed compile must own its flight");
+        };
+        let live_miss_slots = permits_in_use(dir.path());
+        drop(live_miss);
+        fs::write(dir.path().join("go"), b"release").unwrap();
+        assert!(child.wait().unwrap().success());
+        probe
+            .try_lock_shared()
+            .expect("exited owner must release its marker");
+        probe.unlock().unwrap();
+        assert_eq!(permits_in_use(dir.path()), Some(0));
+        assert_eq!(live_plan, crate::test_runner::Plan::Exec);
+        assert_eq!(
+            live_keyless_slots,
+            Some(2),
+            "live lease must cover keyless compiles"
+        );
+        assert_eq!(
+            live_miss_slots,
+            Some(2),
+            "live lease must cover keyed compiles"
+        );
+
+        let keyless = scheduler.keyless_compile("nested", false, Some(&marker));
+        assert_eq!(
+            permits_in_use(dir.path()),
+            Some(1),
+            "stale inherited lease must restore keyless compile admission after owner exit"
+        );
+        drop(keyless);
+        let BeginMiss::Compile(miss) =
+            scheduler.begin_miss(&identity, "nested", false, Some(&marker))
+        else {
+            panic!("the previous covered compile released its flight");
+        };
+        assert_eq!(
+            permits_in_use(dir.path()),
+            Some(1),
+            "stale lease must admit keyed compiles"
+        );
+        drop(miss);
+        assert_eq!(
+            crate::test_runner::plan(&args, &env, Some(dir.path())),
+            crate::test_runner::Plan::Schedule {
+                key: "test:lease_fixture:probe".into(),
+                want: TestWant::Fixed(1),
+            },
+            "stale lease must schedule the next test runner"
+        );
+    }
+
+    #[test]
     fn tests_held_counts_held_markers() {
         let dir = temp_cache();
         let root = scheduler_root(dir.path());

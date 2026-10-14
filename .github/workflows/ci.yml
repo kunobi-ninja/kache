@@ -1719,10 +1719,14 @@ jobs:
   # with a manifest list, and `helm show` started failing with "could not load
   # config with mediatype ...helm.config.v1+json". kobe never hit this because
   # its chart (kobe) and images (kobe-operator, kobe-sync) already differ.
+  #
+  # It waits for `release`, like `stable-branch`: a tag that fails CI publishes
+  # no chart, so a tag moved to a fixed commit never leaves one built from the
+  # old commit in the registry.
   publish-chart:
     name: Publish Helm chart (OCI)
     if: github.repository == 'kunobi-ninja/kache' && startsWith(github.ref, 'refs/tags/v')
-    needs: [version-consistency]
+    needs: [release]
     runs-on: ${{ fromJSON(!github.event.repository.private && '"ubuntu-latest"' || vars.CI_RUNNER_LINUX) }}
     timeout-minutes: 15
     steps:

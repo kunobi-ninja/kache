@@ -11,6 +11,15 @@ fn nested_module_edits_refresh_cached_rustdoc_and_keep_warm_reuse() {
     assert_doc_edit_refreshes("pub mod foo;\n", "foo.rs", "foo/child.rs");
 }
 
+#[test]
+fn explicit_path_module_child_edits_refresh_docs_and_keep_warm_reuse() {
+    assert_doc_edit_refreshes(
+        "#[path = \"renamed.rs\"] pub mod foo;\n",
+        "renamed.rs",
+        "child.rs",
+    );
+}
+
 fn assert_doc_edit_refreshes(root_source: &str, module_file: &str, child_file: &str) {
     build_kache();
     let temp_root = if cfg!(target_os = "macos") {

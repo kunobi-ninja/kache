@@ -7485,13 +7485,14 @@ fn direct_inputs_digest_follows_names_and_content_only() {
     };
     let base = cc_direct_inputs_digest(&[input("a.c", "1"), input("b.h", "2")]);
     assert_eq!(base.len(), 64);
-    let mut moved = input("/elsewhere/a.c", "1");
+    let mut moved = input("a.c", "1");
+    moved.fingerprint.path = "/elsewhere/a.c".to_string();
     moved.fingerprint.mtime_ns = 99;
     moved.content = "raw bytes that spell this checkout's root".to_string();
     assert_eq!(
         cc_direct_inputs_digest(&[moved, input("b.h", "2")]),
         base,
-        "where and when a file sits, its name, and its unmapped bytes do not change the digest"
+        "local paths, timestamps and unmapped project bytes do not change the digest"
     );
     assert_eq!(
         cc_direct_inputs_digest(&[input("b.h", "2"), input("a.c", "1")]),
@@ -7502,7 +7503,22 @@ fn direct_inputs_digest_follows_names_and_content_only() {
         cc_direct_inputs_digest(&[input("a.c", "1"), input("b.h", "3")]),
         base
     );
+    assert_eq!(
+        cc_direct_inputs_digest(&[input("a.c", "1"), input("b.h", "2"), input("a.c", "1")]),
+        base,
+        "repeated identical dependencies do not change the read set"
+    );
     assert_ne!(cc_direct_inputs_digest(&[input("a.c", "1")]), base);
+    assert_ne!(
+        cc_direct_inputs_digest(&[input("a.c", "2"), input("b.h", "1")]),
+        base,
+        "exchanging contents between mapped names changes the read set"
+    );
+    assert_ne!(
+        cc_direct_inputs_digest(&[input("renamed.c", "1"), input("b.h", "2")]),
+        base,
+        "a changed mapped name is a different input"
+    );
     // A toolchain header counts by its raw bytes: a checkout root that
     // happens to appear in its text is not this checkout's business.
     let mut system = input("/usr/include/stdio.h", "mapped-under-tmp-root");

@@ -1737,7 +1737,7 @@ fn discovery_defers_to_the_compile_and_takes_the_emitted_closure() {
     );
     assert_eq!(
         closure.env_deps,
-        vec![("CARGO_PKG_NAME".to_string(), "lib".to_string())]
+        vec![("CARGO_PKG_NAME".to_string(), Some("lib".to_string()))]
     );
     provide_dep_info(closure.clone(), None);
     let used = resolve_key_inputs(
@@ -2646,7 +2646,7 @@ fn closures_agree_on_content_not_order() {
         source_files: sources.iter().map(PathBuf::from).collect(),
         env_deps: env
             .iter()
-            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .map(|(k, v)| ((*k).to_string(), Some((*v).to_string())))
             .collect(),
     };
     let a = dep(&["src/lib.rs", "src/helper.rs"], &[("OUT_DIR", "/t")]);
@@ -2689,12 +2689,12 @@ fn a_prediction_is_validated_against_the_tree_as_it_is_now() {
     let record = InputPrediction {
         schema: PREDICTION_SCHEMA,
         sources: vec![lib.clone(), helper.clone()],
-        env_deps: vec![("OUT_DIR".to_string(), "/t/build/out".to_string())],
+        env_deps: vec![("OUT_DIR".to_string(), Some("/t/build/out".to_string()))],
         tree: None,
     };
     let stat = |path: &Path| std::fs::metadata(path).ok();
     let exists = |path: &Path| path.exists();
-    let env = |var: &str| (var == "OUT_DIR").then(|| "/t/build/out".to_string());
+    let env = |var: &str| (var == "OUT_DIR").then(|| std::ffi::OsString::from("/t/build/out"));
 
     let accepted = validate_prediction(&record, stat, exists, env)
         .expect("an unchanged tree must reuse the recorded closure");
@@ -2706,7 +2706,7 @@ fn a_prediction_is_validated_against_the_tree_as_it_is_now() {
     // without any recorded file changing.
     assert_eq!(
         validate_prediction(&record, stat, exists, |var| (var == "OUT_DIR")
-            .then(|| "/t/build/other".to_string())),
+            .then(|| std::ffi::OsString::from("/t/build/other"))),
         Err(Rejection::EnvChanged)
     );
     assert_eq!(
@@ -2753,18 +2753,18 @@ fn a_present_empty_record_rejects_an_unset_variable() {
     let empty = InputPrediction {
         schema: PREDICTION_SCHEMA,
         sources: vec![lib.clone()],
-        env_deps: vec![("KACHE_PROBE_UNSET".to_string(), String::new())],
+        env_deps: vec![("KACHE_PROBE_UNSET".to_string(), Some(String::new()))],
         tree: None,
     };
     assert_eq!(
         validate_prediction(&empty, stat, exists, |_| None),
         Err(Rejection::EnvChanged)
     );
-    assert!(validate_prediction(&empty, stat, exists, |_| Some(String::new())).is_ok());
+    assert!(validate_prediction(&empty, stat, exists, |_| Some(std::ffi::OsString::new())).is_ok());
     let valued = InputPrediction {
         schema: PREDICTION_SCHEMA,
         sources: vec![lib],
-        env_deps: vec![("KACHE_PROBE_UNSET".to_string(), "1".to_string())],
+        env_deps: vec![("KACHE_PROBE_UNSET".to_string(), Some("1".to_string()))],
         tree: None,
     };
     assert_eq!(
@@ -2794,7 +2794,7 @@ fn predictions_reject_changes_in_environment_presence() {
                 &prediction,
                 |path| std::fs::metadata(path).ok(),
                 |path| path.exists(),
-                |_| value.map(str::to_string),
+                |_| value.map(std::ffi::OsString::from),
             );
             if recorded == index {
                 assert_eq!(result, Ok(dep_info.clone()));
@@ -3503,10 +3503,10 @@ fn portable_test_record() -> PortablePrediction {
             Portable::OutDir("/gen.rs".to_string()),
         ],
         env_deps: vec![
-            ("OUT_DIR".to_string(), Portable::OutDir(String::new())),
+            ("OUT_DIR".to_string(), Some(Portable::OutDir(String::new()))),
             (
                 "CARGO_PKG_NAME".to_string(),
-                Portable::Literal("kt".to_string()),
+                Some(Portable::Literal("kt".to_string())),
             ),
         ],
         tree: "tree-1".to_string(),
@@ -4147,7 +4147,7 @@ fn a_workspace_record_needs_the_guard_and_every_source_inside() {
     let roots = workspace_test_roots();
     let dep_info = |sources: &[&str]| DepInfo {
         source_files: sources.iter().map(PathBuf::from).collect(),
-        env_deps: vec![("CARGO_MANIFEST_DIR".to_string(), "/w/kt".to_string())],
+        env_deps: vec![("CARGO_MANIFEST_DIR".to_string(), Some("/w/kt".to_string()))],
     };
     let inside = dep_info(&["kt/src/lib.rs", "/w/target/debug/build/kt-1/out/gen.rs"]);
     assert_eq!(
@@ -4160,7 +4160,7 @@ fn a_workspace_record_needs_the_guard_and_every_source_inside() {
             ],
             env_deps: vec![(
                 "CARGO_MANIFEST_DIR".to_string(),
-                Portable::Workspace("/kt".to_string())
+                Some(Portable::Workspace("/kt".to_string()))
             )],
             tree: "tree-1".to_string(),
         })
@@ -4175,7 +4175,7 @@ fn a_workspace_record_needs_the_guard_and_every_source_inside() {
         );
     }
     let mut env_in_target = dep_info(&["kt/src/lib.rs"]);
-    env_in_target.env_deps = vec![("X".to_string(), "/w/target/debug/x".to_string())];
+    env_in_target.env_deps = vec![("X".to_string(), Some("/w/target/debug/x".to_string()))];
     assert_eq!(
         workspace_portable_prediction(&env_in_target, &roots, Some("t")),
         None
@@ -4800,8 +4800,11 @@ fn a_portable_record_relocates_out_dir_and_keeps_registry_paths() {
             PathBuf::from("/t/debug/build/kt-1/out/gen.rs"),
         ],
         env_deps: vec![
-            ("OUT_DIR".to_string(), "/t/debug/build/kt-1/out".to_string()),
-            ("CARGO_PKG_NAME".to_string(), "kt".to_string()),
+            (
+                "OUT_DIR".to_string(),
+                Some("/t/debug/build/kt-1/out".to_string()),
+            ),
+            ("CARGO_PKG_NAME".to_string(), Some("kt".to_string())),
         ],
     };
     assert_eq!(
@@ -4820,7 +4823,7 @@ fn a_portable_record_refuses_anything_that_could_name_another_file() {
             source_files: sources.iter().map(PathBuf::from).collect(),
             env_deps: env
                 .iter()
-                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .map(|(name, value)| (name.to_string(), Some(value.to_string())))
                 .collect(),
         };
         portable_prediction(&dep_info, &roots, tree)
@@ -4929,8 +4932,11 @@ fn a_portable_record_resolves_to_this_out_dir_byte_for_byte() {
                 PathBuf::from("/u/debug/build/kt-1/out/gen.rs"),
             ],
             env_deps: vec![
-                ("OUT_DIR".to_string(), "/u/debug/build/kt-1/out".to_string()),
-                ("CARGO_PKG_NAME".to_string(), "kt".to_string()),
+                (
+                    "OUT_DIR".to_string(),
+                    Some("/u/debug/build/kt-1/out".to_string())
+                ),
+                ("CARGO_PKG_NAME".to_string(), Some("kt".to_string())),
             ],
             tree: Some("tree-1".to_string()),
         })
@@ -4945,7 +4951,7 @@ fn a_relocated_record_is_checked_against_this_out_dir_and_guard() {
     let record = PortablePrediction {
         schema: PORTABLE_PREDICTION_SCHEMA,
         sources: vec![Portable::OutDir("/gen.rs".to_string())],
-        env_deps: vec![("OUT_DIR".to_string(), Portable::OutDir(String::new()))],
+        env_deps: vec![("OUT_DIR".to_string(), Some(Portable::OutDir(String::new())))],
         tree: "tree-1".to_string(),
     };
     let check = |guard: &str, env_out_dir: &str| {
@@ -4959,14 +4965,14 @@ fn a_relocated_record_is_checked_against_this_out_dir_and_guard() {
             },
             |_| std::fs::metadata(file.path()).ok(),
             |_| false,
-            |var| (var == "OUT_DIR").then(|| env_out_dir.to_string()),
+            |var| (var == "OUT_DIR").then(|| std::ffi::OsString::from(env_out_dir)),
         )
     };
     assert_eq!(
         check("tree-1", "/u/out"),
         Ok(DepInfo {
             source_files: vec![PathBuf::from("/u/out/gen.rs")],
-            env_deps: vec![("OUT_DIR".to_string(), "/u/out".to_string())],
+            env_deps: vec![("OUT_DIR".to_string(), Some("/u/out".to_string()))],
         })
     );
     assert_eq!(check("tree-1", "/v/out"), Err(Rejection::EnvChanged));
@@ -5328,7 +5334,7 @@ fn a_workspace_unit_never_reads_a_relocated_record() {
             Portable::Literal(package.join("src/lib.rs").display().to_string()),
             Portable::OutDir("/gen.rs".to_string()),
         ],
-        env_deps: vec![("OUT_DIR".to_string(), Portable::OutDir(String::new()))],
+        env_deps: vec![("OUT_DIR".to_string(), Some(Portable::OutDir(String::new())))],
         tree: out_dir_tree_digest(&out, &hasher).unwrap(),
     };
     hasher.record_portable_prediction(&would_be, Some("kt"), &record);
@@ -5377,7 +5383,7 @@ fn a_registry_unit_reads_a_relocated_record_under_its_out_dir_guard() {
             Portable::Literal(package.join("src/lib.rs").display().to_string()),
             Portable::OutDir("/gen.rs".to_string()),
         ],
-        env_deps: vec![("OUT_DIR".to_string(), Portable::OutDir(String::new()))],
+        env_deps: vec![("OUT_DIR".to_string(), Some(Portable::OutDir(String::new())))],
         tree: guard.clone(),
     };
     hasher.record_portable_prediction(&identity, Some("kt"), &record);
@@ -5389,7 +5395,7 @@ fn a_registry_unit_reads_a_relocated_record_under_its_out_dir_guard() {
     );
     assert_eq!(
         dep_info.env_deps,
-        vec![("OUT_DIR".to_string(), out.display().to_string())]
+        vec![("OUT_DIR".to_string(), Some(out.display().to_string()))]
     );
     assert_eq!(tree.map(|guard| guard.digest), Some(guard));
 
@@ -5458,10 +5464,10 @@ fn an_aliased_out_dir_takes_the_shared_row(macro_dep: bool) {
     let dep_info = DepInfo {
         source_files: vec![package.join("src/lib.rs")],
         env_deps: vec![
-            ("OUT_DIR".to_string(), alias.display().to_string()),
+            ("OUT_DIR".to_string(), Some(alias.display().to_string())),
             (
                 "DEBUG_OUTPUT_DIR".to_string(),
-                debug_dir.display().to_string(),
+                Some(debug_dir.display().to_string()),
             ),
         ],
     };
@@ -5526,7 +5532,7 @@ fn input_prediction_round_trips_through_the_database() {
             PathBuf::from("/w/src/lib.rs"),
             PathBuf::from("/w/src/generated.rs"),
         ],
-        env_deps: vec![("OUT_DIR".to_string(), "/target/build/out".to_string())],
+        env_deps: vec![("OUT_DIR".to_string(), Some("/target/build/out".to_string()))],
     };
 
     let hasher = FileHasher::persistent(&db);
@@ -6547,7 +6553,10 @@ fn parse_env_dep_info_unescapes_windows_paths() {
     let deps = parse_env_dep_info(dep);
     assert_eq!(
         deps,
-        vec![("OUT_DIR".to_string(), r"C:\proj\build\out".to_string())]
+        vec![(
+            "OUT_DIR".to_string(),
+            Some(r"C:\proj\build\out".to_string())
+        )]
     );
 }
 
@@ -10591,7 +10600,10 @@ fn key_computation_reports_whether_it_bakes_out_dir() {
         provide_dep_info(
             DepInfo {
                 source_files: vec![source.clone()],
-                env_deps,
+                env_deps: env_deps
+                    .into_iter()
+                    .map(|(name, value)| (name, Some(value)))
+                    .collect(),
             },
             None,
         );
@@ -10636,7 +10648,7 @@ fn key_reads_out_dir_from_the_snapshot() {
         provide_dep_info(
             DepInfo {
                 source_files: vec![source.clone()],
-                env_deps: vec![("GEN".into(), generated.clone())],
+                env_deps: vec![("GEN".into(), Some(generated.clone()))],
             },
             None,
         );
@@ -11656,7 +11668,7 @@ fn test_parse_env_deps_basic() {
     assert!(
         env_deps
             .iter()
-            .any(|(k, v)| k == "CARGO_PKG_VERSION" && v == "1.0.0")
+            .any(|(k, v)| k == "CARGO_PKG_VERSION" && v.as_deref() == Some("1.0.0"))
     );
     assert!(env_deps.iter().any(|(k, _)| k == "OUT_DIR"));
 }
@@ -11672,7 +11684,10 @@ fn test_parse_env_deps_returns_raw_values() {
     let env_deps = parse_env_dep_info(input);
     assert_eq!(env_deps.len(), 1);
     assert_eq!(env_deps[0].0, "OUT_DIR");
-    assert_eq!(env_deps[0].1, "/some/abs/path/target/debug/build/foo");
+    assert_eq!(
+        env_deps[0].1.as_deref(),
+        Some("/some/abs/path/target/debug/build/foo")
+    );
 }
 
 #[test]
@@ -16700,12 +16715,12 @@ mod properties {
         shuffle(&mut vars, seed);
         let env = KeyEnv::from_parts(vars, Some(root.to_path_buf()));
 
-        let mut env_deps = vec![("OUT_DIR".to_string(), out_dir)];
+        let mut env_deps = vec![("OUT_DIR".to_string(), Some(out_dir))];
         env_deps.extend(
             ENV_DEPS
                 .iter()
                 .zip(&unit.env_deps)
-                .map(|(name, value)| ((*name).to_string(), value.clone())),
+                .map(|(name, value)| ((*name).to_string(), Some(value.clone()))),
         );
         let normalizer = PathNormalizer::from_env(Some(root)).with_target_dir(Some(&target));
         provide_dep_info(
@@ -16784,7 +16799,10 @@ fn environment_detail_hashes_follow_the_normalized_key_inputs() {
         provide_dep_info(
             DepInfo {
                 source_files: vec![source.clone()],
-                env_deps: pairs,
+                env_deps: pairs
+                    .into_iter()
+                    .map(|(name, value)| (name, Some(value)))
+                    .collect(),
             },
             None,
         );

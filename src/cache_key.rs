@@ -2215,7 +2215,7 @@ fn predicted_key_inputs(
         &record,
         |path| std::fs::metadata(path).ok(),
         |path| path.exists(),
-        |var| std::env::var(var).ok(),
+        |var| std::env::var_os(var),
     );
     if let Some(shared) = from_remote {
         keep_remote_plain_row(file_hasher, shared, args, &record, &validated);
@@ -2306,7 +2306,7 @@ fn portable_key_inputs(
             places,
             |path| std::fs::metadata(path).ok(),
             |path| path.exists(),
-            |var| std::env::var(var).ok(),
+            |var| std::env::var_os(var),
         )
     };
     if let Some(record) = file_hasher.portable_prediction(identity) {
@@ -3288,6 +3288,21 @@ fn compute_key_into(
         let mut bakes_out_dir = false;
         let mut env_fields = BTreeMap::new();
         for (var, val) in &dep_info.env_deps {
+            fold_field(&mut hasher, b"env_dep_var:", var.as_bytes());
+            fold_field(
+                &mut hasher,
+                b"env_dep_presence.v1:",
+                &[u8::from(val.is_some())],
+            );
+            let Some(val) = val else {
+                // NUL cannot occur in an environment value.
+                env_fields.insert(
+                    var.clone(),
+                    blake3::hash(b"\0").to_hex()[..KEY_FIELD_HEX].to_string(),
+                );
+                tracing::trace!("[key:{}] env_dep:{} (unset)", crate_name, var);
+                continue;
+            };
             let value = EnvDepValue::new(val);
             let normalized_env_dep = normalize_env_dep_value_with_hasher(
                 crate_name,
@@ -3306,7 +3321,6 @@ fn compute_key_into(
                 blake3::hash(normalized_env_dep.value.as_bytes()).to_hex()[..KEY_FIELD_HEX]
                     .to_string(),
             );
-            fold_field(&mut hasher, b"env_dep_var:", var.as_bytes());
             fold_field(
                 &mut hasher,
                 b"env_dep_val:",
@@ -6170,13 +6184,14 @@ pub struct DepInfo {
     /// Includes the crate root, module files, `include!()` targets, etc.
     pub source_files: Vec<std::path::PathBuf>,
     /// Environment variables tracked by rustc (`env!()` / `option_env!()`).
+    /// `None` means unset; `Some("")` means present with an empty value.
     /// Values are RAW — `compute_cache_key` decides whether to
     /// path-normalize each one based on per-var safety (see
     /// `env_dep_path_only_decision`). Storing raw values keeps that
     /// decision available to the consumer; pre-normalizing here
     /// would erase the absolute-path information the discriminator
     /// needs to read.
-    pub env_deps: Vec<(String, String)>,
+    pub env_deps: Vec<(String, Option<String>)>,
 }
 
 /// Version of the prediction record's own logic and encoding.
@@ -6186,7 +6201,7 @@ pub struct DepInfo {
 /// [`CACHE_KEY_VERSION`] and therefore without invalidating a single cache
 /// entry. Precedent: `STATE_SCHEMA` / `POLICY_VERSION` in
 /// `incremental_policy.rs`.
-pub(crate) const PREDICTION_SCHEMA: u32 = 1;
+pub(crate) const PREDICTION_SCHEMA: u32 = 2;
 
 /// The input closure a previous build of one unit discovered, remembered so a
 /// later build of the same unit can skip re-discovering it.
@@ -6206,7 +6221,7 @@ pub(crate) struct InputPrediction {
     /// `# env-dep:` pairs as raw values. The key normalises some of them
     /// (OUT_DIR-like values collapse to a sentinel), so the raw value is the
     /// only signal that an included file moved.
-    pub(crate) env_deps: Vec<(String, String)>,
+    pub(crate) env_deps: Vec<(String, Option<String>)>,
     /// The tree digest of a unit under the tree guard ([`needs_tree_guard`]):
     /// the workspace for a workspace or path unit, the package for a registry
     /// unit with a proc-macro dependency. A macro can read any file there
@@ -6233,7 +6248,7 @@ impl InputPrediction {
 
 /// Version of [`PortablePrediction`]. Far from [`PREDICTION_SCHEMA`] so the
 /// two decoders can never accept each other's rows.
-pub(crate) const PORTABLE_PREDICTION_SCHEMA: u32 = 101;
+pub(crate) const PORTABLE_PREDICTION_SCHEMA: u32 = 102;
 
 /// A registry unit's closure with its own `OUT_DIR` written as a placeholder,
 /// so another target directory can use it.
@@ -6246,7 +6261,7 @@ pub(crate) const PORTABLE_PREDICTION_SCHEMA: u32 = 101;
 pub(crate) struct PortablePrediction {
     pub(crate) schema: u32,
     pub(crate) sources: Vec<Portable>,
-    pub(crate) env_deps: Vec<(String, Portable)>,
+    pub(crate) env_deps: Vec<(String, Option<Portable>)>,
     pub(crate) tree: String,
 }
 
@@ -6311,7 +6326,13 @@ pub(crate) fn portable_prediction(
     let env_deps = dep_info
         .env_deps
         .iter()
-        .map(|(name, value)| Some((name.clone(), portable_env_value(value, roots)?)))
+        .map(|(name, value)| {
+            let value = match value {
+                Some(value) => Some(portable_env_value(value, roots)?),
+                None => None,
+            };
+            Some((name.clone(), value))
+        })
         .collect::<Option<Vec<_>>>()?;
     Some(PortablePrediction {
         schema: PORTABLE_PREDICTION_SCHEMA,
@@ -6368,7 +6389,13 @@ impl PortablePrediction {
             env_deps: self
                 .env_deps
                 .iter()
-                .map(|(name, value)| Some((name.clone(), place(value)?)))
+                .map(|(name, value)| {
+                    let value = match value {
+                        Some(value) => Some(place(value)?),
+                        None => None,
+                    };
+                    Some((name.clone(), value))
+                })
                 .collect::<Option<_>>()?,
             tree: Some(self.tree.clone()),
         })
@@ -6383,7 +6410,7 @@ fn validate_portable_prediction(
     places: &Places<'_>,
     stat: impl Fn(&Path) -> Option<std::fs::Metadata>,
     exists: impl Fn(&Path) -> bool,
-    env_value: impl Fn(&str) -> Option<String>,
+    env_value: impl Fn(&str) -> Option<std::ffi::OsString>,
 ) -> std::result::Result<DepInfo, Rejection> {
     if record.tree != guard {
         return Err(Rejection::TreeChanged);
@@ -6629,7 +6656,13 @@ fn workspace_portable_prediction(
         .env_deps
         .iter()
         .map(|(name, value)| {
-            let value = workspace_portable_value(std::ffi::OsStr::new(value), workspace)?;
+            let value = match value {
+                Some(value) => Some(workspace_portable_value(
+                    std::ffi::OsStr::new(value),
+                    workspace,
+                )?),
+                None => None,
+            };
             Some((name.clone(), value))
         })
         .collect::<Option<Vec<_>>>()?;
@@ -6819,7 +6852,7 @@ pub(crate) fn validate_prediction(
     record: &InputPrediction,
     stat: impl Fn(&Path) -> Option<std::fs::Metadata>,
     exists: impl Fn(&Path) -> bool,
-    env_value: impl Fn(&str) -> Option<String>,
+    env_value: impl Fn(&str) -> Option<std::ffi::OsString>,
 ) -> std::result::Result<DepInfo, Rejection> {
     for file in &record.sources {
         let Some(metadata) = stat(file) else {
@@ -6837,15 +6870,7 @@ pub(crate) fn validate_prediction(
         // sentinel: the raw value is the only signal that an included file
         // moved. A value that is no longer valid UTF-8 reads as changed,
         // which is the safe direction.
-        //
-        // The parser conflates an unset variable with an empty one (both
-        // arrive as `""`), so validation must too: otherwise any crate
-        // reading an unset `option_env!` would reject every record and pay
-        // a pre-pass on every warm build.
-        let matches = match env_value(var) {
-            Some(value) => value == *recorded,
-            None => recorded.is_empty(),
-        };
+        let matches = env_value(var).as_deref() == recorded.as_deref().map(std::ffi::OsStr::new);
         if !matches {
             return Err(Rejection::EnvChanged);
         }
@@ -8772,14 +8797,14 @@ pub(crate) fn parse_dep_info(dep_info: &str) -> Vec<std::path::PathBuf> {
 /// (env!()-as-value pattern; see `path_is_only_used_for_includes`). Doing the
 /// substitution here would erase the information `compute_cache_key`
 /// needs to make that distinction.
-fn parse_env_dep_info(dep_info: &str) -> Vec<(String, String)> {
+fn parse_env_dep_info(dep_info: &str) -> Vec<(String, Option<String>)> {
     let mut env_deps = Vec::new();
     for line in dep_info.lines() {
         if let Some(env_dep) = line.strip_prefix("# env-dep:") {
             if let Some((var, val)) = env_dep.split_once('=') {
-                env_deps.push((var.to_string(), unescape_env_dep_value(val)));
+                env_deps.push((var.to_string(), Some(unescape_env_dep_value(val))));
             } else {
-                env_deps.push((env_dep.to_string(), String::new()));
+                env_deps.push((env_dep.to_string(), None));
             }
         }
     }

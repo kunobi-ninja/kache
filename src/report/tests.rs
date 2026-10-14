@@ -4032,6 +4032,21 @@ fn redaction_terms_skip_roots_that_would_erase_every_path() {
     assert_eq!(srv, ["/srv/a/b", "/srv/a"], "longest first");
 }
 
+#[test]
+fn cache_overhead_names_the_total_and_the_average_per_hit() {
+    let mut report = blank_report();
+    assert_eq!(cache_overhead_summary(&report), None);
+    report.summary.local_hits = 1;
+    report.summary.remote_hits = 1;
+    assert_eq!(cache_overhead_summary(&report), None, "no time recorded");
+    report.timing.hit_time_ms = 1_500;
+    report.timing.avg_hit_ms = 750.0;
+    assert_eq!(
+        cache_overhead_summary(&report).as_deref(),
+        Some("1 s aggregate, avg 750 ms/hit")
+    );
+}
+
 fn blank_report() -> BuildReport {
     let dir = tempfile::tempdir().unwrap();
     let config = crate::test_support::test_config(dir.path().to_path_buf());

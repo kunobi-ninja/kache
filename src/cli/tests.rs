@@ -4154,7 +4154,9 @@ fn explain_crate_last_miss_rows_name_the_key_its_config_and_what_shifts_it() {
     same.cache_key = miss.cache_key.clone();
     let mut later = hit.clone();
     later.ts = miss.ts + chrono::Duration::seconds(5);
-    for hit in [&same, &later] {
+    let mut simultaneous = hit.clone();
+    simultaneous.ts = miss.ts;
+    for hit in [&same, &later, &simultaneous] {
         let rows = last_miss_rows(&miss, None, Some(hit), Some(""));
         let labels: Vec<&str> = rows.iter().map(|row| row.0).collect();
         assert_eq!(labels, ["Result", "Key"]);
@@ -4205,6 +4207,180 @@ fn explain_crate_diagnosis_lines_lead_with_the_cause() {
     assert_eq!(lines.len(), 1, "{lines:?}");
     assert!(lines[0].starts_with("  NOT CACHED: "), "{lines:?}");
     assert!(lines[0].ends_with("reason: disk full"), "{lines:?}");
+}
+
+fn stats_entry(key: &str, profile: &str, crate_type: &str) -> crate::daemon::StatsEntry {
+    crate::daemon::StatsEntry {
+        store_dirs: vec!["/nonexistent-store".into()],
+        cache_key: key.to_string(),
+        crate_name: "dep".to_string(),
+        crate_type: crate_type.to_string(),
+        profile: profile.to_string(),
+        size: 1024,
+        hit_count: 3,
+        created_at: String::new(),
+        last_accessed: "not a date".to_string(),
+        content_hash: None,
+    }
+}
+
+#[test]
+fn explain_crate_finds_the_missed_entry_only_by_its_own_key() {
+    let other = stats_entry("other-key", "", "");
+    let keyless = stats_entry("", "", "");
+    let missed = stats_entry("missed-key", "", "");
+    let stored = [&other, &keyless, &missed];
+    assert_eq!(
+        missed_entry(&stored, "missed-key").map(|e| e.cache_key.as_str()),
+        Some("missed-key")
+    );
+    assert!(
+        missed_entry(&stored, "").is_none(),
+        "a keyless miss matches nothing"
+    );
+    assert!(missed_entry(&stored, "absent").is_none());
+}
+
+#[test]
+fn explain_crate_warns_once_per_unreadable_store() {
+    let stores = [
+        crate::store_view::StoreSummary {
+            path: "/fine".into(),
+            ..Default::default()
+        },
+        crate::store_view::StoreSummary {
+            path: "/broken".into(),
+            error: Some("index locked".into()),
+            ..Default::default()
+        },
+    ];
+    assert_eq!(
+        unavailable_store_warnings(&stores),
+        ["warning: store /broken is unavailable (index locked)"]
+    );
+}
+
+#[test]
+fn explain_crate_entry_rows_name_what_sets_each_entry_apart() {
+    let entry = stats_entry("abcdef0123456789", "debug", "lib");
+    let meta = diff_meta("x86_64", "debug", &["a", "b"], &["lib"]);
+    let row = stored_entry_row(&entry, Some(&meta), Some("abcdef0123456789"));
+    assert_eq!(
+        row,
+        [
+            "abcdef012345",
+            "not a date",
+            "1.0 KiB",
+            "3",
+            "/nonexistent-store",
+            "profile debug, type lib, target x86_64, features [a, b], the missed key, stored \
+             after the compile",
+        ]
+    );
+    let bare = stats_entry("abcdef0123456789", "", "");
+    let empty = diff_meta("", "", &[], &[]);
+    assert_eq!(stored_entry_row(&bare, Some(&empty), Some("other"))[5], "");
+    assert_eq!(stored_entry_row(&bare, None, None)[5], "");
+
+    let entries: Vec<_> = (0..11)
+        .map(|i| stats_entry(&format!("key{i:02}"), "", ""))
+        .collect();
+    let refs: Vec<_> = entries.iter().collect();
+    let ten = stored_entry_lines(None, &refs[..10]);
+    assert_eq!(ten.len(), 11, "a header and ten rows: {ten:?}");
+    let eleven = stored_entry_lines(None, &refs);
+    assert_eq!(eleven.len(), 12, "{eleven:?}");
+    assert_eq!(eleven[11], "  and 1 older entry");
+}
+
+#[test]
+fn explain_crate_differences_stop_at_five_and_count_the_rest() {
+    let miss = diff_meta("wasm32", "debug", &[], &["lib"]);
+    let others = |n: usize| -> Vec<(String, crate::store::EntryMeta)> {
+        (0..n)
+            .map(|i| {
+                (
+                    format!("k{i}"),
+                    diff_meta(&format!("t{i}"), "debug", &[], &["lib"]),
+                )
+            })
+            .collect()
+    };
+    let five = difference_lines(&miss, &others(5));
+    assert_eq!(five.len(), 5, "{five:?}");
+    assert!(
+        five[0].starts_with("    - different target vs k0"),
+        "{five:?}"
+    );
+    let seven = difference_lines(&miss, &others(7));
+    assert_eq!(seven.len(), 6, "{seven:?}");
+    assert_eq!(seven[5], "    and 2 more");
+}
+
+#[test]
+fn explain_crate_cascade_notes_uncached_compiles_and_unresolved_endpoints() {
+    use crate::events::EventResult;
+    use crate::miss_chain::{Chain, ChangedDep, PassthroughGroup, Root, RootKind};
+    let miss = build_event("app", EventResult::Miss, 10, 20, 30, "abcdef0123456789");
+    let chain = |kind: RootKind, passthroughs: Vec<PassthroughGroup>| Chain {
+        roots: vec![Root {
+            crate_name: "leaf".to_string(),
+            unit: None,
+            kind,
+            passthroughs,
+            branches: 1,
+            path: Vec::new(),
+        }],
+        direct: vec![ChangedDep {
+            name: "leaf".to_string(),
+            from: Some("a".to_string()),
+            to: Some("b".to_string()),
+            unit: None,
+        }],
+        truncated: None,
+        baseline_root: None,
+    };
+    let resolved = MissDiagnosis::new(
+        &miss,
+        false,
+        0,
+        false,
+        Some(chain(
+            RootKind::Groups(vec!["sources".to_string()]),
+            vec![PassthroughGroup {
+                reason: "unsupported flag".to_string(),
+                count: 2,
+            }],
+        )),
+        true,
+    );
+    assert_eq!(
+        extern_chain_lines(&resolved),
+        [
+            "  this miss is downstream of a dependency that changed (leaf)",
+            "  root: leaf, its own inputs changed: sources",
+            "    2x uncached compile in leaf: unsupported flag",
+            "    (uncached compiles make the artifact vary per checkout; attributed by package \
+             directory)",
+        ]
+    );
+    let unresolved = MissDiagnosis::new(
+        &miss,
+        false,
+        0,
+        false,
+        Some(chain(RootKind::NoBaseline, Vec::new())),
+        true,
+    );
+    assert_eq!(
+        extern_chain_lines(&unresolved),
+        [
+            "  this miss is downstream of a dependency that changed (leaf)",
+            "  unresolved: leaf, nothing earlier to compare it against",
+            "  note: no endpoint could be resolved; the recorded history does not explain this \
+             miss",
+        ]
+    );
 }
 
 #[test]

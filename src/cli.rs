@@ -2073,7 +2073,9 @@ pub fn why_miss(config: &Config, crate_name: &str, json: bool) -> Result<()> {
                 Vec::new(),
             );
         }
-        warn_unavailable_stores(&inventory.stores);
+        for warning in unavailable_store_warnings(&inventory.stores) {
+            eprintln!("{warning}");
+        }
         let mut lines = vec![
             term::heading(format!("kache · explain · {crate_name}")),
             String::new(),
@@ -2126,7 +2128,9 @@ pub fn why_miss(config: &Config, crate_name: &str, json: bool) -> Result<()> {
         return why_miss_json(crate_name, miss, &stored, &inventory.stores, &diagnosis);
     }
 
-    warn_unavailable_stores(&inventory.stores);
+    for warning in unavailable_store_warnings(&inventory.stores) {
+        eprintln!("{warning}");
+    }
 
     let last_hit = crate_events.iter().rev().find(|e| {
         matches!(
@@ -2137,10 +2141,7 @@ pub fn why_miss(config: &Config, crate_name: &str, json: bool) -> Result<()> {
         )
     });
     // Metadata of the missed key, when the compile was stored after it.
-    let miss_meta = stored
-        .iter()
-        .find(|e| !miss.cache_key.is_empty() && e.cache_key == miss.cache_key)
-        .and_then(|entry| read_entry_meta(entry));
+    let miss_meta = missed_entry(&stored, &miss.cache_key).and_then(read_entry_meta);
 
     let mut lines = vec![
         term::heading(format!("kache · explain · {crate_name}")),
@@ -2198,16 +2199,30 @@ fn section(name: &str, body: Vec<String>) -> Vec<String> {
     lines
 }
 
-/// Stores that could not be read, on stderr, so the report still prints.
-fn warn_unavailable_stores(stores: &[crate::store_view::StoreSummary]) {
-    for store in stores {
-        if let Some(error) = &store.error {
-            eprintln!(
+/// One warning per store that could not be read, for stderr, so the report
+/// still prints.
+fn unavailable_store_warnings(stores: &[crate::store_view::StoreSummary]) -> Vec<String> {
+    stores
+        .iter()
+        .filter_map(|store| {
+            let error = store.error.as_ref()?;
+            Some(format!(
                 "warning: store {} is unavailable ({error})",
                 term::home_path(&store.path)
-            );
-        }
-    }
+            ))
+        })
+        .collect()
+}
+
+/// The stored entry under the missed key. A miss without a key matches none.
+fn missed_entry<'a>(
+    stored: &[&'a daemon::StatsEntry],
+    key: &str,
+) -> Option<&'a daemon::StatsEntry> {
+    stored
+        .iter()
+        .copied()
+        .find(|entry| !key.is_empty() && entry.cache_key == key)
 }
 
 fn read_entry_meta(entry: &daemon::StatsEntry) -> Option<crate::store::EntryMeta> {
@@ -2283,34 +2298,7 @@ fn stored_entry_lines(missed: Option<&str>, stored: &[&daemon::StatsEntry]) -> V
         .iter()
         .rev()
         .take(10)
-        .map(|entry| {
-            let mut details = Vec::new();
-            if !entry.profile.is_empty() {
-                details.push(format!("profile {}", entry.profile));
-            }
-            if !entry.crate_type.is_empty() {
-                details.push(format!("type {}", entry.crate_type));
-            }
-            if let Some(meta) = read_entry_meta(entry) {
-                if !meta.target.is_empty() {
-                    details.push(format!("target {}", meta.target));
-                }
-                if !meta.features.is_empty() {
-                    details.push(format!("features [{}]", meta.features.join(", ")));
-                }
-            }
-            if missed == Some(entry.cache_key.as_str()) {
-                details.push("the missed key, stored after the compile".to_string());
-            }
-            vec![
-                key_short(&entry.cache_key).to_string(),
-                format_relative_time(&entry.last_accessed),
-                term::bytes(entry.size),
-                term::count(entry.hit_count),
-                entry.store_locations(),
-                details.join(", "),
-            ]
-        })
+        .map(|entry| stored_entry_row(entry, read_entry_meta(entry).as_ref(), missed))
         .collect();
     let mut lines = term::table(
         &["KEY", "ACCESSED", "SIZE", "HITS", "STORE", "DETAILS"],
@@ -2327,11 +2315,46 @@ fn stored_entry_lines(missed: Option<&str>, stored: &[&daemon::StatsEntry]) -> V
     let hidden = stored.len().saturating_sub(10);
     if hidden > 0 {
         lines.push(format!(
-            "  and {} older",
-            term::counted(hidden as u64, "entry", "entries")
+            "  and {}",
+            term::counted(hidden as u64, "older entry", "older entries")
         ));
     }
     lines
+}
+
+/// One row of [`stored_entry_lines`]: key, last access, size, hits, store and
+/// what sets the entry apart. Pure; `meta` is the entry's `meta.json`.
+fn stored_entry_row(
+    entry: &daemon::StatsEntry,
+    meta: Option<&crate::store::EntryMeta>,
+    missed: Option<&str>,
+) -> Vec<String> {
+    let mut details = Vec::new();
+    if !entry.profile.is_empty() {
+        details.push(format!("profile {}", entry.profile));
+    }
+    if !entry.crate_type.is_empty() {
+        details.push(format!("type {}", entry.crate_type));
+    }
+    if let Some(meta) = meta {
+        if !meta.target.is_empty() {
+            details.push(format!("target {}", meta.target));
+        }
+        if !meta.features.is_empty() {
+            details.push(format!("features [{}]", meta.features.join(", ")));
+        }
+    }
+    if missed == Some(entry.cache_key.as_str()) {
+        details.push("the missed key, stored after the compile".to_string());
+    }
+    vec![
+        key_short(&entry.cache_key).to_string(),
+        format_relative_time(&entry.last_accessed),
+        term::bytes(entry.size),
+        term::count(entry.hit_count),
+        entry.store_locations(),
+        details.join(", "),
+    ]
 }
 
 /// The crate's last five events, oldest first.
@@ -2572,17 +2595,27 @@ fn miss_diagnosis_lines(
                         Some((key_short(&e.cache_key).to_string(), read_entry_meta(e)?))
                     })
                     .collect();
-                let (diffs, extra) = why_miss_diff_messages(
-                    miss_meta,
-                    others.iter().map(|(key, meta)| (key.as_str(), meta)),
-                    5,
-                );
-                lines.extend(diffs.iter().map(|diff| format!("    - {diff}")));
-                if extra > 0 {
-                    lines.push(format!("    and {extra} more"));
-                }
+                lines.extend(difference_lines(miss_meta, &others));
             }
         }
+    }
+    lines
+}
+
+/// What differs between the missed key's configuration and the other stored
+/// entries': at most five lines, then how many more there were. Pure.
+fn difference_lines(
+    miss_meta: &crate::store::EntryMeta,
+    others: &[(String, crate::store::EntryMeta)],
+) -> Vec<String> {
+    let (diffs, extra) = why_miss_diff_messages(
+        miss_meta,
+        others.iter().map(|(key, meta)| (key.as_str(), meta)),
+        5,
+    );
+    let mut lines: Vec<String> = diffs.iter().map(|diff| format!("    - {diff}")).collect();
+    if extra > 0 {
+        lines.push(format!("    and {extra} more"));
     }
     lines
 }

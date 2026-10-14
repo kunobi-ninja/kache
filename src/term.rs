@@ -631,6 +631,15 @@ mod tests {
     }
 
     #[test]
+    fn the_shell_path_uses_this_users_home() {
+        let outside = Path::new("/kache-test-outside-home/x");
+        assert_eq!(shell_home_path(outside), "/kache-test-outside-home/x");
+        if let Some(home) = dirs::home_dir() {
+            assert_eq!(shell_home_path(&home.join("shims")), "$HOME/shims");
+        }
+    }
+
+    #[test]
     fn a_shell_path_under_home_starts_with_the_home_variable() {
         let home = Path::new("/home/me");
         assert_eq!(

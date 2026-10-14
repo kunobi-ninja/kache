@@ -24,7 +24,8 @@ fn doctor_link_layout_uses_the_mapped_store_and_leaves_missing_shards_absent() {
     Store::open(&config.for_volume_store(&mapping, |_| None)).unwrap();
     let mapped = doctor_link_layout(&config, &build);
     assert!(mapped.pass, "{}", mapped.detail);
-    assert!(mapped.detail.contains(&mapping.store.display().to_string()));
+    let store = crate::link_probe::shown_path(&mapping.store);
+    assert!(mapped.detail.contains(&store), "{}", mapped.detail);
     assert!(mapped.fix.is_none());
 
     config.volume_stores.clear();
@@ -33,7 +34,7 @@ fn doctor_link_layout_uses_the_mapped_store_and_leaves_missing_shards_absent() {
     assert!(
         unmapped
             .detail
-            .contains(&config.cache_dir.display().to_string())
+            .contains(&crate::link_probe::shown_path(&config.cache_dir))
     );
     let failed = doctor_link_layout(&config, &dir.path().join("absent-build"));
     assert!(!failed.pass);
@@ -8729,12 +8730,39 @@ fn a_declined_unit_clean_says_nothing_was_removed() {
 }
 
 #[test]
+fn command_lines_quote_for_the_platform_shell() {
+    let argv = |words: &[&str]| words.iter().map(|w| w.to_string()).collect::<Vec<_>>();
+    let windows_path = argv(&["kache", "clean", r"C:\Users\RUNNER~1\Temp\.tmp1", "--yes"]);
+    assert_eq!(
+        command_line(&windows_path, true),
+        r"kache clean C:\Users\RUNNER~1\Temp\.tmp1 --yes"
+    );
+    let spaced = argv(&["kache", "clean", r"C:\My Dir", r#"say "hi""#]);
+    assert_eq!(
+        command_line(&spaced, true),
+        r#"kache clean "C:\My Dir" "say \"hi\"""#
+    );
+    assert_eq!(command_line(&argv(&["kache", ""]), true), r#"kache """#);
+    assert_eq!(
+        command_line(&argv(&["kache", "clean", "/tmp/my dir"]), false),
+        "kache clean '/tmp/my dir'"
+    );
+}
+
+#[test]
 fn no_terminal_names_the_same_command_with_yes() {
     let args = ["clean".to_string(), "/tmp/my dir".to_string()];
+    let quoted = if cfg!(windows) {
+        "\"/tmp/my dir\""
+    } else {
+        "'/tmp/my dir'"
+    };
     assert_eq!(
         no_terminal("nothing removed", &args, true).to_string(),
-        "nothing removed: there is no terminal to ask. Run `kache clean '/tmp/my dir' --yes` \
-         to go ahead without asking, or --dry-run to preview."
+        format!(
+            "nothing removed: there is no terminal to ask. Run `kache clean {quoted} --yes` \
+             to go ahead without asking, or --dry-run to preview."
+        )
     );
     assert_eq!(
         no_terminal("init changed nothing", &["init".to_string()], false).to_string(),

@@ -4948,6 +4948,30 @@ fn confirm_removal_with(
     prompt(question)
 }
 
+/// `argv` as one line the platform's shell reads back as the same words:
+/// [`shell_line`] for a POSIX shell, double quotes for cmd and PowerShell.
+fn command_line(argv: &[String], windows: bool) -> String {
+    if !windows {
+        return shell_line(argv);
+    }
+    let plain = |word: &str| {
+        !word.is_empty()
+            && word
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "-_./:=@+,\\~".contains(c))
+    };
+    argv.iter()
+        .map(|word| {
+            if plain(word) {
+                word.clone()
+            } else {
+                format!("\"{}\"", word.replace('"', "\\\""))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// The arguments this process was started with, after the program name.
 pub(crate) fn command_args() -> Vec<String> {
     std::env::args().skip(1).collect()
@@ -4972,7 +4996,7 @@ fn retry_with_yes(outcome: &str, why: &str, args: &[String], preview: bool) -> a
     };
     anyhow::anyhow!(
         "{outcome}: {why}. Run `{}` to go ahead without asking{preview}.",
-        shell_line(&argv)
+        command_line(&argv, cfg!(windows))
     )
 }
 
@@ -10458,6 +10482,8 @@ pub fn init(yes: bool, no_service: bool, no_shell: bool, check: bool) -> Result<
     };
     let (shell, shell_changes, rustdoc, test_runner, test_changes) = shell_facts;
     let (recovery, recovery_path, _) = target_recovery_offer(yes)?;
+    // Asking runs the service manager, which --no-service must not touch.
+    let service_available = !no_service && crate::service::login_service_available();
     let service_path = crate::service::service_file_path();
     let service_installed = service_path.as_ref().is_some_and(|p| p.exists());
     let service_problem = service_path
@@ -10477,7 +10503,7 @@ pub fn init(yes: bool, no_service: bool, no_shell: bool, check: bool) -> Result<
         recovery_path,
         service: service_action(
             no_service,
-            crate::service::login_service_available(),
+            service_available,
             service_installed,
             service_problem.is_some(),
         ),
@@ -10634,7 +10660,7 @@ pub fn init(yes: bool, no_service: bool, no_shell: bool, check: bool) -> Result<
 
     if no_service {
         println!("  \x1b[33m→\x1b[0m Login service: skipped (--no-service)");
-    } else if !crate::service::login_service_available() {
+    } else if !service_available {
         // Containers and CI runners have no systemd user manager. Installing
         // the unit would fail, so start the daemon directly below (#1080).
         println!("  • Login service: unavailable (no systemd user session)");

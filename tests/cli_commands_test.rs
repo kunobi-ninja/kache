@@ -728,8 +728,10 @@ fn init_plan_matches_the_requested_components_and_keeps_prompt_lines_separate() 
     );
     let text = String::from_utf8(output.stderr).unwrap();
     assert!(!text.contains("Login service: skipped"), "{text}");
-    assert!(
+    // Windows has no shell step to skip.
+    assert_eq!(
         text.contains("C/C++ caching: skipped (--no-shell)"),
+        cfg!(unix),
         "{text}"
     );
     // A preview lists the changes once, with no plan table before them.

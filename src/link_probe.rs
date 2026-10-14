@@ -110,14 +110,18 @@ pub fn probe_link_layout(build_dir: &Path, staging_dir: &Path) -> LinkLayoutRepo
     report
 }
 
-/// `path` as doctor shows it: resolved, so one directory reached through
-/// a symlink such as macOS's `/var` is named one way. Unresolvable paths
-/// are shown as given.
+/// `path` as doctor shows it. On Unix it is resolved, so one directory
+/// reached through a symlink such as macOS's `/var` is named one way;
+/// unresolvable paths are shown as given. Windows shows it as given:
+/// resolving would replace a `subst` drive or short name with another
+/// spelling and add the `\\?\` prefix.
 pub(crate) fn shown_path(path: &Path) -> String {
-    std::fs::canonicalize(path)
-        .unwrap_or_else(|_| path.to_owned())
-        .display()
-        .to_string()
+    if cfg!(unix)
+        && let Ok(real) = std::fs::canonicalize(path)
+    {
+        return real.display().to_string();
+    }
+    path.display().to_string()
 }
 
 fn io_kind_name(e: &std::io::Error) -> String {

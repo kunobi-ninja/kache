@@ -189,6 +189,74 @@ fn deferred_cc_reuses_setup_and_still_invalidates_changed_headers() {
     }
 }
 
+#[test]
+fn cc_header_availability_creation_uses_current_compiler_output() {
+    for discovery in ["0", "1"] {
+        for in_header in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().canonicalize().unwrap();
+            fs::write(root.join("kache.toml"), "").unwrap();
+            fs::create_dir(root.join("home")).unwrap();
+            let availability = "#if __has_include(\"optional.h\")\n\
+                                #include \"optional.h\"\n\
+                                #else\n#define VALUE 11\n#endif\n";
+            let prefix = if in_header {
+                fs::write(
+                    root.join("availability.h"),
+                    availability.replace("__has_include", "__has_inc\\\r\nlude"),
+                )
+                .unwrap();
+                "#include \"availability.h\"\n"
+            } else {
+                availability
+            };
+            fs::write(
+                root.join("unit.c"),
+                format!("{prefix}int main(void) {{ return VALUE; }}\n"),
+            )
+            .unwrap();
+            for (phase, expected) in [("cold", 11), ("warm", 11), ("created", 23)] {
+                if phase == "created" {
+                    fs::write(root.join("optional.h"), "#define VALUE 23\n").unwrap();
+                }
+                let _ = fs::remove_file(root.join("unit.o"));
+                let compiled = cacheable_cc_command(&root)
+                    .args(["/usr/bin/cc", "-c", "unit.c", "-o", "unit.o"])
+                    .env("HOME", root.join("home"))
+                    .env("KACHE_DEFERRED_DISCOVERY", discovery)
+                    .env("KACHE_DAEMON_PUBLISH", "0")
+                    .env("KACHE_MIN_STORE_COMPILE_MS", "0")
+                    .output()
+                    .unwrap();
+                assert!(
+                    compiled.status.success(),
+                    "{phase}: {}",
+                    String::from_utf8_lossy(&compiled.stderr)
+                );
+                let linked = common::hermetic_command(
+                    "/usr/bin/cc",
+                    &root.join("cache"),
+                    Some(&root.join("kache.toml")),
+                )
+                .current_dir(&root)
+                .args(["unit.o", "-o", "check-value"])
+                .output()
+                .unwrap();
+                assert!(linked.status.success(), "{phase}: {linked:?}");
+                assert_eq!(
+                    Command::new(root.join("check-value"))
+                        .status()
+                        .unwrap()
+                        .code(),
+                    Some(expected),
+                    "{phase}: __has_include must observe newly created headers \
+                     (discovery={discovery}, in_header={in_header})"
+                );
+            }
+        }
+    }
+}
+
 fn cacheable_cc_command(root: &std::path::Path) -> Command {
     common::settle_writes(&[root]);
     let mut command = Command::new(kache_binary());

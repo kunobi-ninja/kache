@@ -180,12 +180,7 @@ pub(crate) fn render(
     lines.extend(term::named_sections(&[("Builds", rows)]));
 
     let mut causes = analysis.causes.clone();
-    causes.sort_by(|a, b| {
-        b.compile_ms
-            .cmp(&a.compile_ms)
-            .then_with(|| b.count.cmp(&a.count))
-            .then_with(|| a.cause.cmp(&b.cause))
-    });
+    tui_sessions::sort_costliest_first(&mut causes);
     if !causes.is_empty() {
         let body: Vec<Vec<String>> = causes
             .iter()
@@ -251,7 +246,7 @@ pub(crate) fn render(
                 vec![
                     term::count(group.count as u64),
                     if group.kind.is_empty() {
-                        group.reason.clone()
+                        crate::report::uncached_reason_words(&group.reason)
                     } else {
                         format!("{}: {}", group.kind, group.reason)
                     },
@@ -275,9 +270,9 @@ pub(crate) fn render(
     }
 
     lines.push(String::new());
-    let costliest = causes
-        .first()
-        .and_then(|group| group.examples.first())
+    let costliest = analysis
+        .costliest
+        .as_ref()
         .map(|name| format!("`kache explain {name}` for the costliest miss; "))
         .unwrap_or_default();
     lines.push(format!(
@@ -581,6 +576,39 @@ mod tests {
         assert_eq!(
             lines.last().unwrap(),
             "`kache explain costly` for the costliest miss; the build's timeline: `kache stats --format trace -o trace.json`"
+        );
+    }
+
+    #[test]
+    fn the_footer_names_the_costliest_miss_not_the_first() {
+        let costed = |name: &str, secs, ms| {
+            let mut miss = ev(name, EventResult::Miss, "s1", secs, name);
+            miss.compile_time_ms = ms;
+            miss.key_diff = vec!["sources".to_string()];
+            miss
+        };
+        let mut edit = ev("edit", EventResult::Passthrough, "s1", 4, "");
+        edit.passthrough_reason = "adaptive active".to_string();
+        let events = vec![
+            costed("early", 1, 100),
+            costed("heavy", 2, 9_000),
+            costed("late", 3, 200),
+            edit,
+        ];
+        let (lines, _) = report(&events);
+        let text = lines.join("\n");
+        assert!(text.contains("Why it missed, costliest first"), "{text}");
+        assert!(text.contains("heavy, late, early"), "{text}");
+        assert!(
+            text.contains("edit rebuild: rustc rebuilt a crate still being edited incrementally"),
+            "{text}"
+        );
+        assert!(
+            lines
+                .last()
+                .unwrap()
+                .starts_with("`kache explain heavy` for the costliest miss; "),
+            "{text}"
         );
     }
 

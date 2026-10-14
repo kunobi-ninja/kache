@@ -772,6 +772,14 @@ pub struct BypassAnalysis {
     /// [`ReportSummary::probes`]).
     #[serde(default)]
     pub probes: usize,
+    /// Passthroughs the adaptive incremental policy chose for a crate under
+    /// edit (`adaptive seed`, `adaptive active`). Included in `passthroughs`.
+    #[serde(default)]
+    pub edit_rebuilds: usize,
+    /// Wrapper time of the compiles in `passthroughs`: work the compiler did
+    /// that the cache will not serve. Probes are excluded.
+    #[serde(default)]
+    pub passthrough_time_ms: u64,
     pub skipped: usize,
     pub fallbacks: usize,
     pub direct_passthroughs: usize,
@@ -1200,6 +1208,7 @@ pub fn generate_report_with_filter(
         &prefetch,
         &network,
         root_filter.is_some(),
+        config.remote.is_some(),
         &misses,
         total_cacheable,
         total_hits,
@@ -1826,6 +1835,7 @@ fn build_bypass_analysis(events: &[BuildEvent], top: usize) -> BypassAnalysis {
                 && passthrough_category(&detail.reason) != "not-a-compile"
         })
         .count();
+    let (edit_rebuilds, passthrough_time_ms) = passthrough_compile_totals(&details);
     let skipped = details
         .iter()
         .filter(|detail| detail.result == "skipped")
@@ -1877,12 +1887,58 @@ fn build_bypass_analysis(events: &[BuildEvent], top: usize) -> BypassAnalysis {
     BypassAnalysis {
         passthroughs,
         probes,
+        edit_rebuilds,
+        passthrough_time_ms,
         skipped,
         fallbacks,
         direct_passthroughs,
         reasons,
         slowest: details,
     }
+}
+
+/// Edit rebuilds among the passthrough compiles, and the wrapper time of
+/// every passthrough compile. Probes and skips are not compiles.
+fn passthrough_compile_totals(details: &[BypassDetail]) -> (usize, u64) {
+    let compiles = details.iter().filter(|detail| {
+        detail.result == "passthrough" && passthrough_category(&detail.reason) != "not-a-compile"
+    });
+    let mut edit_rebuilds = 0;
+    let mut elapsed_ms = 0u64;
+    for detail in compiles {
+        if is_edit_rebuild(&detail.reason) {
+            edit_rebuilds += 1;
+        }
+        elapsed_ms = elapsed_ms.saturating_add(detail.elapsed_ms);
+    }
+    (edit_rebuilds, elapsed_ms)
+}
+
+/// A passthrough the adaptive incremental policy chose for a crate under edit.
+pub(crate) fn is_edit_rebuild(reason: &str) -> bool {
+    uncached_reason_label(reason).is_some()
+}
+
+/// Plain words for the passthrough reasons a reader would not recognize, the
+/// way probes read as compiler queries. `None` for a reason that already says
+/// what happened.
+pub(crate) fn uncached_reason_label(reason: &str) -> Option<&'static str> {
+    match reason.trim() {
+        "adaptive seed" => {
+            Some("edit rebuild: rustc rebuilt the edited crate incrementally (adaptive seed)")
+        }
+        "adaptive active" => Some(
+            "edit rebuild: rustc rebuilt a crate still being edited incrementally (adaptive active)",
+        ),
+        _ => None,
+    }
+}
+
+/// A passthrough reason as a report row shows it.
+pub(crate) fn uncached_reason_words(reason: &str) -> String {
+    uncached_reason_label(reason)
+        .map(str::to_string)
+        .unwrap_or_else(|| reason.to_string())
 }
 
 fn to_bypass_detail(e: &BuildEvent) -> BypassDetail {
@@ -1981,7 +2037,7 @@ fn passthrough_category(reason: &str) -> &str {
 /// kache failed to cache. Probes get their own count so `passthroughs`
 /// stays the actionable "compiles we couldn't cache" signal — a probe is
 /// not a compilation at all (see [`crate::compiler::RefuseReason::NotPrimary`]).
-fn is_probe_passthrough(e: &BuildEvent) -> bool {
+pub(crate) fn is_probe_passthrough(e: &BuildEvent) -> bool {
     matches!(e.result, EventResult::Passthrough)
         && passthrough_category(&e.passthrough_reason) == "not-a-compile"
 }
@@ -2305,6 +2361,7 @@ fn generate_suggestions(
     prefetch: &PrefetchAnalysis,
     network: &Option<NetworkAnalysis>,
     root_filtered: bool,
+    remote_configured: bool,
     top_misses: &[CrateDetail],
     total_cacheable: usize,
     total_hits: usize,
@@ -2438,12 +2495,13 @@ fn generate_suggestions(
         }
     }
 
-    if root_filtered {
+    // Without a remote there is no transfer data to miss.
+    if remote_configured && root_filtered {
         suggestions.push(
             "Remote transfer data omitted because transfer events are not root-scoped yet"
                 .to_string(),
         );
-    } else if network.is_none() {
+    } else if remote_configured && network.is_none() {
         suggestions.push("No remote transfer data available for this session".to_string());
     }
 
@@ -2460,9 +2518,17 @@ fn bypass_total(bypass: &BypassAnalysis) -> usize {
 
 fn format_bypass_summary(bypass: &BypassAnalysis) -> String {
     let mut parts = Vec::new();
-    if bypass.passthroughs > 0 {
-        let mut part = format!("{} passthrough", bypass.passthroughs);
-        if bypass.passthroughs != 1 {
+    if bypass.edit_rebuilds > 0 {
+        parts.push(format!(
+            "{} edit rebuild{}",
+            bypass.edit_rebuilds,
+            plural(bypass.edit_rebuilds)
+        ));
+    }
+    let passthroughs = bypass.passthroughs.saturating_sub(bypass.edit_rebuilds);
+    if passthroughs > 0 {
+        let mut part = format!("{passthroughs} passthrough");
+        if passthroughs != 1 {
             part.push('s');
         }
         if bypass.fallbacks > 0 {
@@ -2640,11 +2706,7 @@ fn push_error_table(lines: &mut Vec<String>, errors: &[ErrorDetail]) {
     lines.push("| Crate | Time | Key |".to_string());
     lines.push("|---|---|---|".to_string());
     for err in errors.iter().take(10) {
-        let key_short = if err.cache_key.len() > 12 {
-            &err.cache_key[..12]
-        } else {
-            &err.cache_key
-        };
+        let key_short = crate::term::short_key(&err.cache_key);
         lines.push(format!(
             "| `{}` | {} | `{}` |",
             markdown_cell(&err.crate_name),
@@ -3012,15 +3074,14 @@ pub fn format_markdown(report: &BuildReport) -> String {
     let t = &report.timing;
 
     let total_hits = s.local_hits + s.prefetch_hits + s.remote_hits;
-    let total_compiled = s.dups + s.misses;
+    let compiled = compiled_note(s);
     lines.push("### kache build report".to_string());
     lines.push(String::new());
     lines.push(format!(
-        "**{:.1}% hit rate** — {}/{} cacheable crates from cache, {} compiled | **{} compile work avoided**",
+        "**{:.1}% hit rate** — {}/{} cacheable crates from cache, {compiled} | **{} compile work avoided**",
         s.hit_rate_pct,
         total_hits,
         s.total_crates,
-        total_compiled,
         format_duration_ms(s.time_saved_ms),
     ));
     lines.push(String::new());
@@ -3137,7 +3198,7 @@ pub fn format_markdown(report: &BuildReport) -> String {
         lines.push(format!("| P95 download time | {}ms |", net.p95_download_ms));
         if net.observed_span_ms > 0 {
             lines.push(format!(
-                "| Observed wall-span throughput | {:.1} MB/s over {} ({} timed downloads, peak {} concurrent) |",
+                "| Observed wall-span throughput | {:.1} MiB/s over {} ({} timed downloads, peak {} concurrent) |",
                 net.observed_throughput_mbps,
                 format_duration_ms(net.observed_span_ms),
                 net.observed_downloads,
@@ -3150,7 +3211,7 @@ pub fn format_markdown(report: &BuildReport) -> String {
             );
         }
         lines.push(format!(
-            "| Cumulative service-time rates | read {:.1} MB/s, open+read {:.1} MB/s, end-to-end {:.1} MB/s |",
+            "| Cumulative service-time rates | read {:.1} MiB/s, open+read {:.1} MiB/s, end-to-end {:.1} MiB/s |",
             net.body_throughput_mbps, net.network_throughput_mbps, net.throughput_mbps
         ));
         if !net.dominant_download_phase.is_empty() && net.dominant_download_phase_ms > 0 {
@@ -3292,11 +3353,7 @@ pub fn format_markdown(report: &BuildReport) -> String {
         lines.push("| Crate | Compile time | Size | Key |".to_string());
         lines.push("|---|---|---|---|".to_string());
         for c in &report.top_misses {
-            let key_short = if c.cache_key.len() > 12 {
-                &c.cache_key[..12]
-            } else {
-                &c.cache_key
-            };
+            let key_short = crate::term::short_key(&c.cache_key);
             lines.push(format!(
                 "| `{}` | {} | {} | `{}` |",
                 c.crate_name,
@@ -3314,11 +3371,7 @@ pub fn format_markdown(report: &BuildReport) -> String {
         lines.push("| Crate | Compile cost | Size | Key |".to_string());
         lines.push("|---|---|---|---|".to_string());
         for c in &report.top_hits {
-            let key_short = if c.cache_key.len() > 12 {
-                &c.cache_key[..12]
-            } else {
-                &c.cache_key
-            };
+            let key_short = crate::term::short_key(&c.cache_key);
             lines.push(format!(
                 "| `{}` | {} | {} | `{}` |",
                 c.crate_name,
@@ -3379,16 +3432,16 @@ pub fn format_github(report: &BuildReport) -> String {
     let t = &report.timing;
     let total_hits = s.local_hits + s.prefetch_hits + s.remote_hits;
     let total_compiled = s.dups + s.misses;
+    let compiled = compiled_note(s);
 
     // Header
     lines.push("### kache build cache".to_string());
     lines.push(String::new());
     lines.push(format!(
-        "**{:.1}%** hit rate — {}/{} cacheable crates from cache, {} compiled | **{} compile work avoided**",
+        "**{:.1}%** hit rate — {}/{} cacheable crates from cache, {compiled} | **{} compile work avoided**",
         s.hit_rate_pct,
         total_hits,
         s.total_crates,
-        total_compiled,
         format_duration_ms(s.time_saved_ms),
     ));
     lines.push(String::new());
@@ -3563,7 +3616,7 @@ pub fn format_github(report: &BuildReport) -> String {
                 String::new()
             };
         lines.push(format!(
-            "<summary><strong>Remote transfer</strong> — {} downloaded, {:.0} MB/s {}{}</summary>",
+            "<summary><strong>Remote transfer</strong> — {} downloaded, {:.0} MiB/s {}{}</summary>",
             format_bytes(net.bytes_down),
             summary_rate,
             summary_rate_label,
@@ -3613,7 +3666,7 @@ pub fn format_github(report: &BuildReport) -> String {
         }
         if net.observed_span_ms > 0 {
             lines.push(format!(
-                "| Observed wall-span throughput | {:.1} MB/s over {} · {} timed downloads · peak {} concurrent |",
+                "| Observed wall-span throughput | {:.1} MiB/s over {} · {} timed downloads · peak {} concurrent |",
                 net.observed_throughput_mbps,
                 format_duration_ms(net.observed_span_ms),
                 net.observed_downloads,
@@ -3626,7 +3679,7 @@ pub fn format_github(report: &BuildReport) -> String {
             );
         }
         lines.push(format!(
-            "| Cumulative service-time rates | {:.1} MB/s read · {:.1} MB/s open+read · {:.1} MB/s end-to-end |",
+            "| Cumulative service-time rates | {:.1} MiB/s read · {:.1} MiB/s open+read · {:.1} MiB/s end-to-end |",
             net.body_throughput_mbps, net.network_throughput_mbps, net.throughput_mbps
         ));
         if !net.dominant_download_phase.is_empty() && net.dominant_download_phase_ms > 0 {
@@ -3888,7 +3941,6 @@ pub fn format_text(report: &BuildReport) -> String {
     let s = &report.summary;
     let t = &report.timing;
     let total_hits = s.local_hits + s.prefetch_hits + s.remote_hits;
-    let total_compiled = s.dups + s.misses;
 
     let mut lines = vec![term::heading(format!(
         "kache · last {} · full report",
@@ -3903,11 +3955,11 @@ pub fn format_text(report: &BuildReport) -> String {
     let mut summary = vec![(
         "Hit rate",
         term::percent(s.hit_rate_pct),
-        format!(
-            "{} of {} crates from cache, {} compiled",
-            term::count(total_hits as u64),
-            term::count(s.total_crates as u64),
-            term::count(total_compiled as u64)
+        hit_rate_detail(
+            total_hits,
+            s.total_crates,
+            s.dups + s.misses,
+            s.passthroughs,
         ),
     )];
     if let Some(w) = s.weighted_hit_rate_pct {
@@ -3990,7 +4042,7 @@ pub fn format_text(report: &BuildReport) -> String {
         if net.observed_span_ms > 0 {
             network.push((
                 "Throughput",
-                format!("{:.1} MB/s", net.observed_throughput_mbps),
+                format!("{:.1} MiB/s", net.observed_throughput_mbps),
                 format!(
                     "over {}, {} timed downloads, up to {} at once",
                     term::duration_ms(net.observed_span_ms),
@@ -4007,9 +4059,9 @@ pub fn format_text(report: &BuildReport) -> String {
         }
         network.push((
             "Read rate",
-            format!("{:.1} MB/s", net.body_throughput_mbps),
+            format!("{:.1} MiB/s", net.body_throughput_mbps),
             format!(
-                "{:.1} MB/s with open, {:.1} MB/s end to end",
+                "{:.1} MiB/s with open, {:.1} MiB/s end to end",
                 net.network_throughput_mbps, net.throughput_mbps
             ),
         ));
@@ -4123,7 +4175,7 @@ pub fn format_text(report: &BuildReport) -> String {
     // Where wrapper time went.
     let mut timing = vec![
         timing_row("Cache hits", t.hit_time_ms, t.avg_hit_ms, "per hit"),
-        timing_row("Compiles", t.miss_time_ms, t.avg_miss_ms, "per crate"),
+        compiles_timing_row(s, t, report.bypass.passthrough_time_ms),
     ];
     let steps = [
         ("  cache key", t.total_key_ms, t.avg_key_ms),
@@ -4209,7 +4261,7 @@ pub fn format_text(report: &BuildReport) -> String {
                     term::count(reason.failures as u64),
                     term::duration_ms(reason.max_elapsed_ms),
                     format!("{}, {}", reason.result, reason.route),
-                    reason.reason.clone(),
+                    uncached_reason_words(&reason.reason),
                 ]
             })
             .collect();
@@ -4236,7 +4288,7 @@ pub fn format_text(report: &BuildReport) -> String {
                         detail.crate_name.clone(),
                         term::duration_ms(detail.elapsed_ms),
                         format_exit_code(detail.exit_code),
-                        bypass_detail_reason(detail),
+                        uncached_reason_words(&bypass_detail_reason(detail)),
                     ]
                 })
                 .collect();
@@ -4279,17 +4331,7 @@ pub fn format_text(report: &BuildReport) -> String {
     }
 
     if !report.top_hits.is_empty() {
-        let body: Vec<Vec<String>> = report
-            .top_hits
-            .iter()
-            .map(|c| {
-                vec![
-                    c.crate_name.clone(),
-                    term::duration_ms(c.compile_time_ms),
-                    term::bytes(c.size),
-                ]
-            })
-            .collect();
+        let body = valuable_hit_rows(&report.top_hits);
         lines.push(String::new());
         lines.push(term::heading("Most valuable hits"));
         lines.extend(term::table(
@@ -4326,6 +4368,72 @@ pub fn format_text(report: &BuildReport) -> String {
     lines.join("\n")
 }
 
+/// The `Hit rate` detail: hits over cacheable crates, and every crate the
+/// compiler ran for. A passthrough compile is compiled and not cached, so an
+/// edit rebuild does not read as `0 compiled`.
+fn hit_rate_detail(hits: usize, cacheable: usize, cache_misses: usize, uncached: usize) -> String {
+    use crate::term::count;
+    let compiled = cache_misses + uncached;
+    let mut detail = if cacheable == 0 && uncached > 0 {
+        format!("{} compiled", count(compiled as u64))
+    } else {
+        format!(
+            "{} of {} crates from cache, {} compiled",
+            count(hits as u64),
+            count(cacheable as u64),
+            count(compiled as u64)
+        )
+    };
+    if uncached > 0 {
+        detail.push_str(&format!(", {} not cached", count(uncached as u64)));
+    }
+    detail
+}
+
+/// `5 compiled`, with how many of them were not cached: the markdown and
+/// GitHub headlines.
+fn compiled_note(summary: &ReportSummary) -> String {
+    let compiled = summary.dups + summary.misses + summary.passthroughs;
+    if summary.passthroughs > 0 {
+        format!("{compiled} compiled, {} not cached", summary.passthroughs)
+    } else {
+        format!("{compiled} compiled")
+    }
+}
+
+/// The `Compiles` timing row: cache misses and passthrough compiles, both
+/// of which ran the compiler.
+fn compiles_timing_row(
+    summary: &ReportSummary,
+    timing: &TimingBreakdown,
+    passthrough_time_ms: u64,
+) -> Vec<String> {
+    let total_ms = timing.miss_time_ms.saturating_add(passthrough_time_ms);
+    let compiled = summary.dups + summary.misses + summary.passthroughs;
+    let average = if compiled == 0 {
+        0.0
+    } else {
+        total_ms as f64 / compiled as f64
+    };
+    timing_row("Compiles", total_ms, average, "per crate")
+}
+
+/// `Most valuable hits` rows. A crate served twice from one entry is one row.
+fn valuable_hit_rows(hits: &[CrateDetail]) -> Vec<Vec<String>> {
+    let mut rows: Vec<Vec<String>> = Vec::new();
+    for hit in hits {
+        let row = vec![
+            hit.crate_name.clone(),
+            crate::term::duration_ms(hit.compile_time_ms),
+            crate::term::bytes(hit.size),
+        ];
+        if !rows.contains(&row) {
+            rows.push(row);
+        }
+    }
+    rows
+}
+
 /// A compile that went uncached and took this long is listed by name.
 const SLOW_NOT_CACHED_MS: u64 = 1_000;
 
@@ -4339,12 +4447,16 @@ fn timing_row(label: &str, total_ms: u64, average: f64, per: &str) -> Vec<String
     ]
 }
 
-/// An average in milliseconds: a decimal below 10 ms, whole above.
+/// An average: a decimal below 10 ms, whole milliseconds below a second, and
+/// the shared duration form from a second up, so it reads like the total
+/// beside it.
 fn average_ms(ms: f64) -> String {
     if ms < 10.0 {
         format!("{ms:.1} ms")
-    } else {
+    } else if ms < 999.5 {
         format!("{ms:.0} ms")
+    } else {
+        crate::term::duration_ms(ms.round() as u64)
     }
 }
 
@@ -4360,17 +4472,9 @@ fn local_time(rfc3339: &str) -> String {
         .unwrap_or_else(|_| rfc3339.to_string())
 }
 
+/// Binary units, `1.5 MiB`: the form the text report prints.
 pub fn format_bytes(bytes: u64) -> String {
-    let b = bytes as f64;
-    if b >= 1024.0 * 1024.0 * 1024.0 {
-        format!("{:.1} GB", b / (1024.0 * 1024.0 * 1024.0))
-    } else if b >= 1024.0 * 1024.0 {
-        format!("{:.1} MB", b / (1024.0 * 1024.0))
-    } else if b >= 1024.0 {
-        format!("{:.1} KB", b / 1024.0)
-    } else {
-        format!("{bytes} B")
-    }
+    crate::term::bytes(bytes)
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────

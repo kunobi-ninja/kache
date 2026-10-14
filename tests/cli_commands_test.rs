@@ -1044,11 +1044,75 @@ fn why_miss_json_reports_the_last_recorded_miss() {
         .expect("run why-miss JSON");
     assert!(output.status.success());
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(value["command"], "why-miss");
+    assert_eq!(value["command"], "explain");
     assert_eq!(value["crate_name"], "serde");
     assert_eq!(value["cache_key"], "miss-key");
     assert_eq!(value["diagnosis"], "never_cached");
     assert_eq!(value["stored_entries"], 0);
+}
+
+/// A compile kache passed through after the last miss is what `explain`
+/// reports: the crate was compiled and is not cached.
+#[test]
+fn explain_reports_a_later_uncached_compile() {
+    let e = env();
+    let event = |second: u32, result: &str, reason: &str| {
+        serde_json::json!({
+            "ts": format!("2026-01-01T00:00:{second:02}Z"),
+            "crate_name": "serde",
+            "result": result,
+            "elapsed_ms": 1,
+            "size": 1,
+            "cache_key": format!("{result}-key-0123456789"),
+            "passthrough_reason": reason,
+            "schema": 14
+        })
+        .to_string()
+    };
+    std::fs::write(
+        e.cache.join("events.jsonl"),
+        format!(
+            "{}\n{}\n",
+            event(0, "miss", ""),
+            event(1, "passthrough", "adaptive seed")
+        ),
+    )
+    .unwrap();
+    let output = e
+        .cmd()
+        .args(["--json", "explain", "serde"])
+        .output()
+        .expect("run explain JSON");
+    assert!(output.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["command"], "explain");
+    assert_eq!(value["last_result"], "miss");
+    assert_eq!(value["latest_uncached_compile"]["reason"], "adaptive seed");
+    assert!(
+        value["latest_uncached_compile"]["why"]
+            .as_str()
+            .unwrap()
+            .starts_with("edit rebuild:")
+    );
+
+    let output = e.cmd().args(["explain", "serde"]).output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("`serde` was compiled, not cached:"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("entry is now cached"), "{stdout}");
+
+    // A crate that only ever passed through is not reported as all hits.
+    std::fs::write(
+        e.cache.join("events.jsonl"),
+        format!("{}\n", event(0, "passthrough", "adaptive active")),
+    )
+    .unwrap();
+    let output = e.cmd().args(["explain", "serde"]).output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.contains("all events are hits"), "{stdout}");
+    assert!(stdout.contains("adaptive active"), "{stdout}");
 }
 
 /// `kache stats` adds lifetime totals from `savings.json` and the event log,

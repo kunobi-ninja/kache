@@ -2125,11 +2125,7 @@ fn draw_store_table(frame: &mut Frame, state: &mut AppState, area: Rect) {
         .skip(range.start)
         .take(range.len())
         .map(|entry| {
-            let key_short = if entry.cache_key.len() > 12 {
-                &entry.cache_key[..12]
-            } else {
-                &entry.cache_key
-            };
+            let key_short = crate::term::short_key(&entry.cache_key);
             let crate_type = if entry.crate_type.is_empty() {
                 "-"
             } else {

@@ -277,19 +277,68 @@ pub(crate) fn bytes(n: u64) -> String {
     bytesize::ByteSize(n).to_string()
 }
 
-/// `~9 min`, `12 s`, `45 ms`: the largest unit that keeps the number short.
-/// Minutes and hours are rounded, so they carry a `~`.
+/// `~9 min`, `2.0 s`, `45 ms`: the largest unit that keeps the number short.
+/// Seconds carry one decimal, so 1,989 ms reads `2.0 s`, not `1 s`. Minutes
+/// and hours are rounded, so they carry a `~`.
 pub(crate) fn duration_ms(ms: u64) -> String {
     let secs = ms / 1000;
+    let tenths = ms.saturating_add(50) / 100;
     if secs >= 3600 {
         format!("~{:.1} h", secs as f64 / 3600.0)
-    } else if secs >= 60 {
+    } else if tenths >= 600 {
         format!("~{} min", (secs + 30) / 60)
-    } else if secs > 0 {
-        format!("{secs} s")
+    } else if ms >= 1000 {
+        format!("{:.1} s", tenths as f64 / 10.0)
     } else {
         format!("{ms} ms")
     }
+}
+
+/// The first 12 characters of a cache key: the one short form every human
+/// report prints. A shorter key is printed whole.
+pub(crate) fn short_key(key: &str) -> &str {
+    key.get(..12).unwrap_or(key)
+}
+
+/// `2026-10-14 17:18:56` in this machine's zone.
+pub(crate) fn local_datetime(at: chrono::DateTime<chrono::Utc>) -> String {
+    datetime_in(at, &chrono::Local)
+}
+
+/// `17:18:56` in this machine's zone.
+pub(crate) fn local_clock(at: chrono::DateTime<chrono::Utc>) -> String {
+    clock_in(at, &chrono::Local)
+}
+
+/// A store timestamp (`2026-10-14 15:18:56`, UTC as SQLite writes it) in this
+/// machine's zone; the input unchanged when it does not parse.
+pub(crate) fn local_store_time(utc: &str) -> String {
+    store_time_in(utc, &chrono::Local)
+}
+
+fn datetime_in<Tz: chrono::TimeZone>(at: chrono::DateTime<chrono::Utc>, zone: &Tz) -> String
+where
+    Tz::Offset: std::fmt::Display,
+{
+    at.with_timezone(zone)
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string()
+}
+
+fn clock_in<Tz: chrono::TimeZone>(at: chrono::DateTime<chrono::Utc>, zone: &Tz) -> String
+where
+    Tz::Offset: std::fmt::Display,
+{
+    at.with_timezone(zone).format("%H:%M:%S").to_string()
+}
+
+fn store_time_in<Tz: chrono::TimeZone>(utc: &str, zone: &Tz) -> String
+where
+    Tz::Offset: std::fmt::Display,
+{
+    chrono::NaiveDateTime::parse_from_str(utc, "%Y-%m-%d %H:%M:%S")
+        .map(|naive| datetime_in(naive.and_utc(), zone))
+        .unwrap_or_else(|_| utc.to_string())
 }
 
 /// `12.5%`.
@@ -565,14 +614,47 @@ mod tests {
     fn durations_pick_the_largest_short_unit() {
         assert_eq!(duration_ms(0), "0 ms");
         assert_eq!(duration_ms(999), "999 ms");
-        assert_eq!(duration_ms(1_000), "1 s");
-        assert_eq!(duration_ms(59_999), "59 s");
+        assert_eq!(duration_ms(1_000), "1.0 s");
+        assert_eq!(duration_ms(1_989), "2.0 s");
+        assert_eq!(duration_ms(1_949), "1.9 s");
+        assert_eq!(duration_ms(12_340), "12.3 s");
+        assert_eq!(duration_ms(59_949), "59.9 s");
+        assert_eq!(duration_ms(59_950), "~1 min");
         assert_eq!(duration_ms(60_000), "~1 min");
         assert_eq!(duration_ms(89_000), "~1 min");
         assert_eq!(duration_ms(90_000), "~2 min");
         assert_eq!(duration_ms(3_599_000), "~60 min");
         assert_eq!(duration_ms(3_600_000), "~1.0 h");
         assert_eq!(duration_ms(5_400_000), "~1.5 h");
+    }
+
+    #[test]
+    fn cache_keys_have_one_short_form() {
+        assert_eq!(short_key("96b68103bea22193ffee"), "96b68103bea2");
+        assert_eq!(short_key("96b68103bea2"), "96b68103bea2");
+        assert_eq!(short_key("abc"), "abc");
+        assert_eq!(short_key(""), "");
+    }
+
+    #[test]
+    fn times_render_in_the_given_zone() {
+        let zone = chrono::FixedOffset::east_opt(2 * 3600).unwrap();
+        let at = chrono::DateTime::parse_from_rfc3339("2026-10-14T15:18:56Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert_eq!(datetime_in(at, &zone), "2026-10-14 17:18:56");
+        assert_eq!(clock_in(at, &zone), "17:18:56");
+        assert_eq!(
+            store_time_in("2026-10-14 15:18:56", &zone),
+            "2026-10-14 17:18:56"
+        );
+        assert_eq!(store_time_in("not a time", &zone), "not a time");
+        assert_eq!(local_datetime(at), datetime_in(at, &chrono::Local));
+        assert_eq!(local_clock(at), clock_in(at, &chrono::Local));
+        assert_eq!(
+            local_store_time("2026-10-14 15:18:56"),
+            datetime_in(at, &chrono::Local)
+        );
     }
 
     #[test]

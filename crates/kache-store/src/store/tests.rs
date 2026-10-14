@@ -4884,6 +4884,37 @@ fn target_root_registry_filters_by_last_seen() {
     assert_eq!(store.tracked_target_roots(24).unwrap().len(), 1);
 }
 
+/// The cleanup sweep re-reads one row's `last_seen` before it deletes.
+#[test]
+fn target_root_last_seen_reads_one_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let store = Store::open(&config).unwrap();
+    let workspace = dir.path().join("workspace");
+    let target = workspace.join("target");
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::write(
+        target.join("CACHEDIR.TAG"),
+        "Signature: 8a477f597d28d172789f06886806bc55",
+    )
+    .unwrap();
+    std::fs::write(target.join(".rustc_info.json"), "{}").unwrap();
+    assert_eq!(store.target_root_last_seen(&target).unwrap(), None);
+
+    store.remember_target_root(&target, &workspace).unwrap();
+    store
+        .db
+        .execute("UPDATE target_roots SET last_seen = 1234", [])
+        .unwrap();
+    assert_eq!(store.target_root_last_seen(&target).unwrap(), Some(1234));
+    assert_eq!(
+        store
+            .target_root_last_seen(&workspace.join("other"))
+            .unwrap(),
+        None
+    );
+}
+
 #[test]
 fn target_registry_prunes_only_after_a_real_upsert() {
     let dir = tempfile::tempdir().unwrap();

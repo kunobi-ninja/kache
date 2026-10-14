@@ -2743,13 +2743,8 @@ fn a_prediction_is_validated_against_the_tree_as_it_is_now() {
     );
 }
 
-/// The dep-info parser emits `VAR=` both when the variable is unset and
-/// when it is empty, so validation must accept both for an empty record:
-/// otherwise any crate reading an unset `option_env!` would reject every
-/// record and pay a pre-pass on every warm build. A recorded value still
-/// rejects an unset variable.
 #[test]
-fn an_unset_variable_matches_an_empty_record() {
+fn a_present_empty_record_rejects_an_unset_variable() {
     let dir = tempfile::tempdir().unwrap();
     let lib = dir.path().join("lib.rs");
     std::fs::write(&lib, "pub fn f() {}\n").unwrap();
@@ -2761,10 +2756,11 @@ fn an_unset_variable_matches_an_empty_record() {
         env_deps: vec![("KACHE_PROBE_UNSET".to_string(), String::new())],
         tree: None,
     };
-    assert!(
-        validate_prediction(&empty, stat, exists, |_| None).is_ok(),
-        "unset matches empty, exactly as the parser would fold it"
+    assert_eq!(
+        validate_prediction(&empty, stat, exists, |_| None),
+        Err(Rejection::EnvChanged)
     );
+    assert!(validate_prediction(&empty, stat, exists, |_| Some(String::new())).is_ok());
     let valued = InputPrediction {
         schema: PREDICTION_SCHEMA,
         sources: vec![lib],

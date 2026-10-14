@@ -1697,6 +1697,54 @@ mod tests {
         assert_eq!(result.failure_reason, None);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn verify_deadline_fails_and_short_circuits_the_fixture_with_cache_cleanup() {
+        let temp = tempfile::tempdir().unwrap();
+        let kache = temp.path().join("kache");
+        kache_fs::testutil::write_executable(
+            &kache,
+            r#"#!/bin/sh
+case "$1" in
+  report) printf '%s\n' '{"schema_version":1,"summary":{"hit_rate_pct":0,"total_crates":0,"local_hits":0,"prefetch_hits":0,"remote_hits":0,"misses":0}}' ;;
+  daemon) printf '%s\n' "$KACHE_CACHE_DIR" > "$(dirname "$0")/cache-location" ;;
+esac
+"#,
+        );
+        let mut fixture = verify_fixture(None);
+        fixture.dir = temp.path().to_path_buf();
+        let spec = fixture.verify.as_mut().unwrap();
+        spec.run = "sleep 3; printf ok".into();
+        spec.expected_stdout_contains = vec!["ok".into()];
+        spec.forbidden_substrings.clear();
+        spec.timeout_s = 1;
+
+        let result = super::run_fixture(&fixture, &kache).unwrap();
+
+        assert_eq!(
+            result.status, "fail",
+            "late verification passed the fixture"
+        );
+        assert_eq!(
+            result.phases.len(),
+            1,
+            "failed cold verify must stop later phases"
+        );
+        assert_eq!(result.phases[0].phase, "cold");
+        assert_eq!(result.phases[0].status, "fail");
+        let verify = result.phases[0].verify.as_ref().unwrap();
+        assert!(!verify.passed);
+        assert_eq!(
+            verify.failure_reason.as_deref(),
+            Some("timed out after 1 seconds")
+        );
+        let cache = std::fs::read_to_string(temp.path().join("cache-location")).unwrap();
+        assert!(
+            !Path::new(cache.trim()).exists(),
+            "fixture cache was not cleaned"
+        );
+    }
+
     #[test]
     fn unmodified_phases_verify_the_fixture_contract() {
         let fixture = verify_fixture(Some(&["v2"]));

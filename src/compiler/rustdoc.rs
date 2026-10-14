@@ -371,7 +371,7 @@ fn source_records(sources: &[PathBuf], env: &InvocationEnv) -> Result<Vec<Source
     let mut seen = BTreeSet::new();
     let mut files = Vec::new();
     for source in sources {
-        collect_source_for(source, &crate_dir, true, &mut seen, &mut files, env)?;
+        collect_source_for(source, &crate_dir, true, false, &mut seen, &mut files, env)?;
     }
     files.sort_by(|left, right| left.relative.cmp(&right.relative));
     let mut records = Vec::with_capacity(files.len() + 1);
@@ -388,6 +388,7 @@ fn collect_source(
     path: &Path,
     crate_dir: &Path,
     required: bool,
+    module_file: bool,
     seen: &mut BTreeSet<PathBuf>,
     out: &mut Vec<SourceRecord>,
 ) -> Result<()> {
@@ -395,6 +396,7 @@ fn collect_source(
         path,
         crate_dir,
         required,
+        module_file,
         seen,
         out,
         &InvocationEnv::capture(),
@@ -405,6 +407,7 @@ fn collect_source_for(
     path: &Path,
     crate_dir: &Path,
     required: bool,
+    module_file: bool,
     seen: &mut BTreeSet<PathBuf>,
     out: &mut Vec<SourceRecord>,
     env: &InvocationEnv,
@@ -439,14 +442,22 @@ fn collect_source_for(
         paths: vec![absolute.to_string_lossy().into_owned()],
     });
     let parent = absolute.parent().unwrap_or(Path::new(""));
+    // An implicit foo.rs module owns foo/ for children; explicit paths keep the parent.
+    let module_dir = if module_file && absolute.file_name() != Some(std::ffi::OsStr::new("mod.rs"))
+    {
+        absolute.with_extension("")
+    } else {
+        parent.to_path_buf()
+    };
     for found in scan_rust(&bytes)? {
         match found {
             Found::Include(rel) => {
-                collect_source_for(&parent.join(rel), crate_dir, false, seen, out, env)?;
+                collect_source_for(&parent.join(rel), crate_dir, false, false, seen, out, env)?;
             }
             Found::Module { path, name } => {
-                if let Some(next) = resolve_module_for(parent, path.as_deref(), &name, env)? {
-                    collect_source_for(&next, crate_dir, false, seen, out, env)?;
+                let dir = if path.is_some() { parent } else { &module_dir };
+                if let Some(next) = resolve_module_for(dir, path.as_deref(), &name, env)? {
+                    collect_source_for(&next, crate_dir, false, path.is_none(), seen, out, env)?;
                 }
             }
         }
@@ -3708,7 +3719,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut seen = BTreeSet::new();
         let mut out = Vec::new();
-        collect_source(dir.path(), dir.path(), true, &mut seen, &mut out).unwrap();
+        collect_source(dir.path(), dir.path(), true, false, &mut seen, &mut out).unwrap();
         assert!(out.is_empty());
     }
 
@@ -3720,6 +3731,7 @@ mod tests {
         collect_source(
             &dir.path().join("missing.rs"),
             dir.path(),
+            false,
             false,
             &mut seen,
             &mut out,
@@ -3743,7 +3755,7 @@ mod tests {
         std::os::unix::fs::symlink(&link, &link).unwrap();
         let mut seen = BTreeSet::new();
         let mut out = Vec::new();
-        assert!(collect_source(&link, dir.path(), false, &mut seen, &mut out).is_err());
+        assert!(collect_source(&link, dir.path(), false, false, &mut seen, &mut out).is_err());
         assert!(resolve_module(dir.path(), None, "loop").is_err());
     }
 

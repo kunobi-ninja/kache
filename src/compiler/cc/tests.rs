@@ -6863,6 +6863,22 @@ fn include_shadowing_keys_every_literal_probe_form() {
     }
 }
 
+/// The preprocessor joins a backslash-newline before it reads the probe, so
+/// a probe split across lines still tests its header.
+#[test]
+fn include_shadowing_keys_a_probe_split_by_line_continuations() {
+    let temp = tempfile::tempdir().unwrap();
+    let (parsed, source, include) = probing_unit(
+        temp.path(),
+        "#if __has_inc\\\r\nlude(\\\n<optional.h>)\n#endif\nint x;\n",
+    );
+    assert!(probed_header_moves_the_key(
+        &parsed,
+        &[source],
+        &include.join("optional.h")
+    ));
+}
+
 #[test]
 fn include_dir_digest_changes_when_an_earlier_dir_gains_a_header() {
     let temp = tempfile::tempdir().unwrap();

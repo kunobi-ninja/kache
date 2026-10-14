@@ -1681,6 +1681,62 @@ fn doctor_fix_migrates_sccache_cargo_config_to_kache() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn doctor_fix_migrates_an_absolute_sccache_wrapper_to_a_working_kache() {
+    let e = env();
+    let cargo_home = e.home.join(".cargo");
+    let tools = e.home.join("bin");
+    let old_tools = e.home.join("old-wrapper");
+    for dir in [&cargo_home, &tools, &old_tools] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    let old_wrapper = create_wrapper_script(&old_tools, "sccache");
+    std::os::unix::fs::symlink(KACHE_BIN, tools.join("kache")).unwrap();
+    // Only process discovery is stubbed; Cargo executes both wrapper choices.
+    kache_fs::testutil::write_executable(&tools.join("pgrep"), "#!/bin/sh\nexit 1\n");
+    let previous_path = std::env::var_os("PATH").unwrap_or_default();
+    let path =
+        std::env::join_paths(std::iter::once(tools).chain(std::env::split_paths(&previous_path)))
+            .unwrap();
+    let config = cargo_home.join("config.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "[build]\nrustc-wrapper = {:?}\n",
+            old_wrapper.to_str().unwrap()
+        ),
+    )
+    .unwrap();
+    let project = scaffold_lib("migration_wrapper", "pub fn value() -> u32 { 42 }\n");
+    for phase in ["before", "after"] {
+        if phase == "after" {
+            e.cmd()
+                .env("PATH", &path)
+                .args(["doctor", "--fix"])
+                .assert()
+                .success();
+        }
+        let result = hermetic_command(env!("CARGO"), &e.cache, Some(&e.cache.join("config.toml")))
+            .args(["check", "--offline"])
+            .current_dir(project.path())
+            .env("HOME", &e.home)
+            .env("CARGO_HOME", &cargo_home)
+            .env("PATH", &path)
+            .env("CARGO_TARGET_DIR", project.path().join(phase))
+            .env("KACHE_DAEMON_IDLE_TIMEOUT", DAEMON_IDLE_BACKSTOP_SECS)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "Cargo must execute its configured wrapper {phase} migration: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+    let edited: toml::Value = toml::from_str(&std::fs::read_to_string(config).unwrap()).unwrap();
+    assert_eq!(edited["build"]["rustc-wrapper"].as_str(), Some("kache"));
+}
+
 #[test]
 fn doctor_fix_migrates_sccache_config_in_custom_cargo_home() {
     // When $CARGO_HOME is set, migrate must rewrite the cargo config under it,

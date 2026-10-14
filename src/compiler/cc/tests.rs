@@ -6713,6 +6713,55 @@ fn include_shadowing_covers_headers_read_from_outside_the_user_dirs() {
     );
 }
 
+/// A unit in `root` that includes `source_text`, parsed with `-I root/inc`.
+fn probing_unit(root: &Path, source_text: &str) -> (CcArgs, PathBuf, PathBuf) {
+    let include = root.join("inc");
+    fs::create_dir_all(&include).unwrap();
+    let source = root.join("unit.c");
+    fs::write(&source, source_text).unwrap();
+    let parsed = CcArgs::parse(&s(&[
+        "cc",
+        "-c",
+        source.to_str().unwrap(),
+        "-I",
+        include.to_str().unwrap(),
+    ]))
+    .unwrap();
+    (parsed, source, include)
+}
+
+/// Whether `header` appearing in `include` changes the shadowing digest of
+/// `inputs`. The header is removed again afterwards.
+fn probed_header_moves_the_key(parsed: &CcArgs, inputs: &[PathBuf], header: &Path) -> bool {
+    let before = digest_cc_include_shadowing(parsed, inputs).unwrap();
+    fs::write(header, "#define VALUE 23\n").unwrap();
+    let after = digest_cc_include_shadowing(parsed, inputs).unwrap();
+    fs::remove_file(header).unwrap();
+    before != after
+}
+
+/// The bug: a header that `__has_include` found absent was never read, so
+/// its later appearance in a user directory left the key unchanged. Every
+/// literal form of the probe must key the header it names.
+#[test]
+fn include_shadowing_keys_every_literal_probe_form() {
+    for probe in [
+        "__has_include(<optional.h>)",
+        "__has_include(\"optional.h\")",
+        "__has_include_next(<optional.h>)",
+        "__has_include_next\t( \"optional.h\" )",
+        "__has_include ( <optional.h> )",
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let (parsed, source, include) =
+            probing_unit(temp.path(), &format!("#if {probe}\n#endif\nint x;\n"));
+        assert!(
+            probed_header_moves_the_key(&parsed, &[source], &include.join("optional.h")),
+            "{probe}: the probed header appearing must change the key"
+        );
+    }
+}
+
 #[test]
 fn include_dir_digest_changes_when_an_earlier_dir_gains_a_header() {
     let temp = tempfile::tempdir().unwrap();

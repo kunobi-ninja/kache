@@ -11417,6 +11417,15 @@ fn test_parse_env_deps_returns_raw_values() {
 }
 
 #[test]
+fn parse_env_dep_info_distinguishes_absent_and_empty_variables() {
+    assert_ne!(
+        parse_env_dep_info("# env-dep:MODE\n"),
+        parse_env_dep_info("# env-dep:MODE=\n"),
+        "option_env! distinguishes an absent variable from a present empty value"
+    );
+}
+
+#[test]
 fn test_parse_env_deps_empty() {
     let input = "deps.d: src/lib.rs\n";
     let env_deps = parse_env_dep_info(input);

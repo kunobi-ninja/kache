@@ -20,6 +20,8 @@ use std::process::{Command, Stdio};
 use std::time::Instant;
 use tempfile::TempDir;
 
+mod verify_process;
+
 use crate::assertions::{
     AssertionCheck, all_passed, apply_metric_assertions, apply_noop_assertions,
     count_misses_by_crate, relocate_diff_artifact_check,
@@ -1053,15 +1055,15 @@ fn phase_verify_spec(phase: Phase, fixture: &Fixture) -> Option<Cow<'_, Verify>>
 }
 
 fn run_verify(spec: &Verify, fixture: &Fixture, cwd: &Path, cache_dir: &Path) -> VerifyResult {
-    let output = match Command::new("sh")
+    let mut command = Command::new("sh");
+    command
         .arg("-c")
         .arg(&spec.run)
         .current_dir(cwd)
         .env("KACHE_CACHE_DIR", cache_dir)
         .envs(&fixture.env)
-        .stderr(Stdio::inherit())
-        .output()
-    {
+        .stderr(Stdio::inherit());
+    let output = match verify_process::run(command, spec.timeout_s) {
         Ok(o) => o,
         Err(e) => {
             return VerifyResult {
@@ -1074,7 +1076,15 @@ fn run_verify(spec: &Verify, fixture: &Fixture, cwd: &Path, cache_dir: &Path) ->
     };
 
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let exit_code = output.status.code().unwrap_or(-1);
+    let exit_code = output.exit_code;
+    if let Some(reason) = output.failure_reason {
+        return VerifyResult {
+            exit_code,
+            stdout,
+            passed: false,
+            failure_reason: Some(reason),
+        };
+    }
 
     if exit_code != spec.expected_exit_code {
         return VerifyResult {
@@ -1807,6 +1817,49 @@ esac
             result.failure_reason.as_deref(),
             Some("exit code -1 != expected 0")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verify_make_nonblocking_keeps_nonblocking_when_already_set() {
+        use std::os::fd::AsRawFd;
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "exit 0"])
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pipe = child.stdout.take().unwrap();
+
+        super::verify_process::make_nonblocking(pipe.as_raw_fd()).unwrap();
+        super::verify_process::make_nonblocking(pipe.as_raw_fd()).unwrap();
+
+        let flags = unsafe { libc::fcntl(pipe.as_raw_fd(), libc::F_GETFL) };
+        child.wait().unwrap();
+        assert_ne!(
+            flags & libc::O_NONBLOCK,
+            0,
+            "a second call cleared O_NONBLOCK"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verify_make_nonblocking_reports_a_failed_call() {
+        let error = super::verify_process::make_nonblocking(-1).unwrap_err();
+
+        assert_eq!(error.raw_os_error(), Some(libc::EBADF));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verify_read_available_propagates_errors_other_than_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = std::fs::File::open(dir.path()).unwrap();
+        let mut pipe = std::process::ChildStdout::from(std::os::fd::OwnedFd::from(file));
+
+        let error = super::verify_process::read_available(&mut pipe, &mut [0; 16]).unwrap_err();
+
+        assert_eq!(error.raw_os_error(), Some(libc::EISDIR));
     }
 
     #[test]

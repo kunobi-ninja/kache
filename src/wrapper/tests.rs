@@ -4261,7 +4261,7 @@ fn materialize_cached_artifact_expands_depinfo_blob_without_rewriting_store_blob
     let config = test_config(dir.path().join("cache"));
     let store = Store::open(&config).unwrap();
     let hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    let stored = "__kache_root__/debug/deps/libfoo.rlib: __kache_cwd__/src/lib.rs\n";
+    let stored = "\0__kache_root__/debug/deps/libfoo.rlib: \0__kache_cwd__/src/lib.rs\n";
     create_blob(&store, hash, stored.as_bytes());
     let cached = cached_file("foo.d", hash);
     let target = dir
@@ -4648,7 +4648,7 @@ fn materialize_reports_a_rewritten_depinfo_restore_as_not_exact() {
     create_blob(
         &store,
         hash,
-        b"__kache_root__/debug/deps/libfoo.rlib: __kache_cwd__/src/lib.rs\n",
+        b"\0__kache_root__/debug/deps/libfoo.rlib: \0__kache_cwd__/src/lib.rs\n",
     );
     let cached = cached_file("foo.d", hash);
     let target = dir.path().join("target").join("foo.d");
@@ -9305,7 +9305,7 @@ fn restore_does_not_memoize_rewritten_dep_info() {
     // Padded past the memo's size floor so the assertion below can only
     // fail because seeding was skipped, not because the file was too small.
     let stored = format!(
-        "__kache_root__/debug/deps/libfoo.rlib: {}\n#{}\n",
+        "\0__kache_root__/debug/deps/libfoo.rlib: {}\n#{}\n",
         source.display(),
         "p".repeat(128 * 1024)
     );
@@ -11309,7 +11309,7 @@ fn readonly_restore_keeps_executable_and_transformed_file_modes() {
         ),
         (
             "foo.d",
-            b"foo: __kache_cwd__/src/lib.rs\n".as_slice(),
+            b"foo: \0__kache_cwd__/src/lib.rs\n".as_slice(),
             ArtifactKind::DepInfo,
             None,
             false,

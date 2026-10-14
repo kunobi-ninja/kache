@@ -1997,6 +1997,10 @@ fn rewrite_depinfo_content_with_prefixes_and_sentinel(
     sentinel: &str,
     mode: DepInfoMode,
 ) -> String {
+    // Filenames cannot contain NUL, so generated markers cannot collide with
+    // literal relative paths. This byte exists only in private cached dep-info.
+    let encoded_sentinel = format!("\0{sentinel}");
+    let sentinel = encoded_sentinel.as_str();
     content
         .split_inclusive('\n')
         .map(|line| {
@@ -3542,7 +3546,7 @@ mod tests {
         assert!(stored.contains("__kache_root__/debug/deps/libdemo.rlib"));
         assert!(stored.contains("__kache_cwd__/src/lib.rs"));
         assert!(stored.contains("__kache_workspace__/shared/schema.txt"));
-        assert!(stored.contains("# env-dep:SCHEMA_ROOT=__kache_workspace__/shared"));
+        assert!(stored.contains("# env-dep:SCHEMA_ROOT=\0__kache_workspace__/shared"));
         assert!(!stored.contains("work tree-a"));
         assert!(!stored.contains("work\\ tree-a"));
 
@@ -3618,7 +3622,7 @@ mod tests {
             &[(configured, "__kache_base_dir_0__/".to_string(), 8)],
             DepInfoMode::Relativize,
         );
-        assert!(stored.starts_with("__kache_root__/demo.d:"), "{stored}");
+        assert!(stored.starts_with("\0__kache_root__/demo.d:"), "{stored}");
         assert!(stored.contains("__kache_base_dir_0__/worktree-a/crate/generated.rs"));
         assert!(!stored.contains(DEPINFO_CWD_SENTINEL));
         assert!(!stored.contains(DEPINFO_WORKSPACE_SENTINEL));
@@ -3637,7 +3641,7 @@ mod tests {
 
         assert_eq!(
             stored,
-            "__kache_root__/demo.d: __kache_target_rule__/generated.rs\n"
+            "\0__kache_root__/demo.d: \0__kache_target_rule__/generated.rs\n"
         );
     }
 
@@ -3659,8 +3663,8 @@ mod tests {
         );
         assert_eq!(
             stored,
-            "__kache_root__/debug/deps/demo.d: \
-__kache_target_rule__/debug/build/demo/out/generated.rs\n"
+            "\0__kache_root__/debug/deps/demo.d: \
+\0__kache_target_rule__/debug/build/demo/out/generated.rs\n"
         );
 
         let restored = rewrite_rustc_depinfo_content_with_configured_roots(
@@ -3707,9 +3711,9 @@ __kache_target_rule__/debug/build/demo/out/generated.rs\n"
         );
         assert_eq!(
             stored,
-            "__kache_root__/debug/deps/serde_core.d: \
-__kache_workspace__/src/lib.rs \
-__kache_target_rule__/debug/build/serde_core-fe75/out/private.rs\n"
+            "\0__kache_root__/debug/deps/serde_core.d: \
+\0__kache_workspace__/src/lib.rs \
+\0__kache_target_rule__/debug/build/serde_core-fe75/out/private.rs\n"
         );
 
         let restored = rewrite_rustc_depinfo_content_with_configured_roots(
@@ -3911,7 +3915,7 @@ __kache_target_rule__/debug/build/serde_core-fe75/out/private.rs\n"
         assert_eq!(with_trailing_separator(r"C:\work\", '/'), "C:\\work/");
 
         let native = rewrite_depinfo_content_with_sentinel_for_platform(
-            "__kache_root__/debug/deps/demo.d\n",
+            "\0__kache_root__/debug/deps/demo.d\n",
             Path::new(r"C:\work\target"),
             DEPINFO_ROOT_SENTINEL,
             DepInfoMode::Expand,
@@ -3920,7 +3924,7 @@ __kache_target_rule__/debug/build/serde_core-fe75/out/private.rs\n"
         assert_eq!(native, "C:\\work\\target\\debug/deps/demo.d\n");
 
         let slash = rewrite_depinfo_content_with_sentinel_for_platform(
-            "__kache_root__/debug/deps/demo.d\n",
+            "\0__kache_root__/debug/deps/demo.d\n",
             Path::new("/external/target"),
             DEPINFO_ROOT_SENTINEL,
             DepInfoMode::Expand,
@@ -3935,7 +3939,7 @@ __kache_target_rule__/debug/build/serde_core-fe75/out/private.rs\n"
             DepInfoMode::Relativize,
             true,
         );
-        assert_eq!(mixed, "__kache_root__/debug/deps/demo.d\n");
+        assert_eq!(mixed, "\0__kache_root__/debug/deps/demo.d\n");
     }
 
     #[test]
@@ -4069,7 +4073,7 @@ D:\\WORK TREE\\crate\\src\\lib.rs\n\
         );
         assert!(stored.contains("__kache_root__/debug\\deps\\demo.d"));
         assert!(stored.contains("__kache_cwd__/src\\lib.rs"));
-        assert!(stored.contains("# env-dep:ASSET=__kache_cwd__/asset.txt"));
+        assert!(stored.contains("# env-dep:ASSET=\0__kache_cwd__/asset.txt"));
         assert!(!stored.to_ascii_lowercase().contains(r"d:\work tree"));
     }
 
@@ -4179,7 +4183,7 @@ S:\\proj\\target\\debug\\build\\demo-8a22\\out/generated.rs\n";
             .find(|l| l.starts_with(DEPINFO_ENV_DEP_PREFIX))
             .unwrap();
         assert!(
-            env_line.contains("# env-dep:OUT_DIR=__kache_root__/obj\\\\x86_64"),
+            env_line.contains("# env-dep:OUT_DIR=\0__kache_root__/obj\\\\x86_64"),
             "escaped anchor must relativize whole, not split an escape pair: {rewritten}"
         );
         assert!(
@@ -4198,7 +4202,7 @@ S:\\proj\\target\\debug\\build\\demo-8a22\\out/generated.rs\n";
     #[test]
     fn test_depinfo_env_dep_never_rewrites_keys() {
         let input = "# env-dep:__kache_root__/WEIRD_KEY\n\
-                     # env-dep:__kache_root__/ALSO_WEIRD=__kache_root__/value\n";
+                     # env-dep:__kache_root__/ALSO_WEIRD=\0__kache_root__/value\n";
         let prefixes = ["C:\\proj/".to_string(), "C:\\proj\\".to_string()];
 
         let expanded = rewrite_depinfo_content_with_prefixes(input, &prefixes, DepInfoMode::Expand);
@@ -4218,8 +4222,8 @@ S:\\proj\\target\\debug\\build\\demo-8a22\\out/generated.rs\n";
     /// `# env-dep:` lines or cargo rejects the restored `.d` outright.
     #[test]
     fn test_depinfo_env_dep_expand_inserts_escaped_prefix() {
-        let stored = "target/debug/deps/demo.d: __kache_root__/src/lib.rs\n\
-                      # env-dep:OUT_DIR=__kache_root__/obj-kache-bench\\\\x86_64-pc-windows-msvc\\\\out\n";
+        let stored = "target/debug/deps/demo.d: \0__kache_root__/src/lib.rs\n\
+                      # env-dep:OUT_DIR=\0__kache_root__/obj-kache-bench\\\\x86_64-pc-windows-msvc\\\\out\n";
         let prefixes = [
             "C:\\other\\clone-b/".to_string(),
             "C:\\other\\clone-b\\".to_string(),
@@ -4255,7 +4259,7 @@ S:\\proj\\target\\debug\\build\\demo-8a22\\out/generated.rs\n";
     #[test]
     fn test_depinfo_expand_preserves_parent_relative_paths() {
         let input = "\
-foo.o: ../../src/foo.cc ../include/foo.h __kache_root__/generated.h foo/./bar.h
+foo.o: ../../src/foo.cc ../include/foo.h \0__kache_root__/generated.h foo/./bar.h
 ";
 
         let rewritten =
@@ -4285,7 +4289,7 @@ foo.o: ../../src/foo.cc ../include/foo.h __kache_root__/generated.h foo/./bar.h
 Unified_mm_ettings-WrongChannel0.o: Unified_mm_ettings-WrongChannel0.mm \\
   ../../../../../../../toolkit/mozapps/update/updater/macos-frameworks/UpdateSettings/UpdateSettings.mm \\
   ../../../../../../../toolkit/mozapps/update/updater/macos-frameworks/UpdateSettings/UpdateSettings.h \\
-  __kache_root__/mozilla-config.h
+  \0__kache_root__/mozilla-config.h
 ";
         let anchor = Path::new(
             "/Users/lenij/work/kache/tmp/bench/clone-a/obj-kache-bench\

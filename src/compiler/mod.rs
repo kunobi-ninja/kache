@@ -1410,7 +1410,7 @@ mod tests {
         // mode produces; Expand (the restore-side transform) reverses it.
         // The anchor is the restoring build's target dir — NOT the
         // process cwd.
-        let blob = b"__kache_root__/target/debug/foo: __kache_root__/src/lib.rs".to_vec();
+        let blob = b"\0__kache_root__/target/debug/foo: \0__kache_root__/src/lib.rs".to_vec();
         let anchor = std::path::Path::new("/restored/worktree");
 
         let out = PostRestoreAction::ExpandDepInfoPaths.transform(blob, anchor);
@@ -1432,8 +1432,8 @@ mod tests {
 
     #[test]
     fn transform_expand_dep_info_paths_preserves_parent_relative_deps() {
-        let blob =
-            b"foo.o: ../../src/foo.cc ../include/foo.h __kache_root__/generated/header.h".to_vec();
+        let blob = b"foo.o: ../../src/foo.cc ../include/foo.h \0__kache_root__/generated/header.h"
+            .to_vec();
         let anchor = std::path::Path::new("/restored/worktree/obj");
 
         let out = PostRestoreAction::ExpandDepInfoPaths.transform(blob, anchor);

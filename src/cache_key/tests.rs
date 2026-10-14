@@ -16269,10 +16269,8 @@ fn key_matrix_outcome_lint_gates_key_by_pairing_not_multiset() {
 }
 
 #[test]
-fn key_matrix_error_format_does_not_change_key() {
-    // `--error-format=json` changes how diagnostics are rendered
-    // (cargo always passes it) — never the artifact. The key must
-    // not move.
+fn key_matrix_error_format_changes_key() {
+    // Hits replay diagnostics as well as artifact bytes.
     if !rustc_available() {
         return;
     }
@@ -16285,11 +16283,10 @@ fn key_matrix_error_format_does_not_change_key() {
     let mut with_fmt = base_args(&source);
     with_fmt.push("--error-format=json".to_string());
 
-    assert_eq!(
+    assert_ne!(
         key_for(&base),
         key_for(&with_fmt),
-        "`--error-format` is diagnostics-only and must NOT change \
-             the key — a change here is over-keying"
+        "`--error-format` must key the diagnostics a hit replays"
     );
 }
 

@@ -230,6 +230,39 @@ mod tests {
     }
 
     #[test]
+    fn shared_plain_rows_preserve_absent_and_empty_env_values() {
+        let registry = Path::new("/home/me/.cargo/registry/src");
+        let mut local = InputPrediction {
+            schema: PREDICTION_SCHEMA,
+            sources: vec![registry.join("i/kt-1.0.0/src/lib.rs")],
+            env_deps: vec![],
+            tree: None,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let dep_info = dir.path().join("deps.d");
+        std::fs::write(
+            &dep_info,
+            "target: lib.rs\n# env-dep:ABSENT\n# env-dep:EMPTY=\n# env-dep:VALUE=hello\n",
+        )
+        .unwrap();
+        local.env_deps = crate::cache_key::dep_info_from_emitted(&dep_info, Path::new("lib.rs"))
+            .unwrap()
+            .env_deps;
+        let shared = for_remote_plain(&local, registry).unwrap();
+        let identity = "shared-target-v2:presence";
+        let bytes = encode(identity, &shared).unwrap();
+        let SharedPrediction::Plain(decoded) = decode(&bytes, identity).unwrap() else {
+            panic!("expected plain prediction");
+        };
+        let resolved = plain_from_remote(&decoded, Path::new("/ci/.cargo/registry/src")).unwrap();
+        assert_ne!(
+            resolved.env_deps[0].1, resolved.env_deps[1].1,
+            "a shared row keeps ABSENT apart from EMPTY"
+        );
+        assert_eq!(resolved.env_deps, local.env_deps);
+    }
+
+    #[test]
     fn a_published_row_carries_no_local_path() {
         let registry = Path::new("/home/me/.cargo/registry/src");
         let local = InputPrediction {

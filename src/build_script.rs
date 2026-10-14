@@ -78,7 +78,8 @@ const SHIM_DIR: &str = ".kache-build-script-shims";
 /// The launcher binary for this target, built from `launcher/build_script.rs`.
 #[cfg(unix)]
 const LAUNCHER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/build-script-launcher"));
-const PREDICTION_SCHEMA: u32 = 1;
+// Version 1 could omit whitespace-padded Cargo declarations.
+const PREDICTION_SCHEMA: u32 = 2;
 const PREDICTION_PREFIX: &str = "build-script:";
 /// Folded first into every action key. A v1 key also matched runs recorded
 /// before kache stored the files a script names outside `OUT_DIR`, and

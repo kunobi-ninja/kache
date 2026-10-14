@@ -6778,6 +6778,23 @@ fn include_shadowing_keys_a_probe_split_by_line_continuations() {
     ));
 }
 
+/// A quoted probe in a header searches that header's own directory first,
+/// and that directory need not be a user directory itself.
+#[test]
+fn include_shadowing_keys_a_quoted_probe_beside_its_header() {
+    let temp = tempfile::tempdir().unwrap();
+    let (parsed, source, include) = probing_unit(temp.path(), "#include \"sub/avail.h\"\nint x;\n");
+    let sub = include.join("sub");
+    fs::create_dir(&sub).unwrap();
+    let header = sub.join("avail.h");
+    fs::write(&header, "#if __has_include(\"optional.h\")\n#endif\n").unwrap();
+    assert!(probed_header_moves_the_key(
+        &parsed,
+        &[source, header],
+        &sub.join("optional.h")
+    ));
+}
+
 #[test]
 fn include_dir_digest_changes_when_an_earlier_dir_gains_a_header() {
     let temp = tempfile::tempdir().unwrap();

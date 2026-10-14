@@ -288,7 +288,14 @@ pub(crate) fn sweep(config: &Config, now: u64) -> anyhow::Result<Swept> {
         if crate::cli::target_in_use(&tracked.path) {
             continue;
         }
-        match remove(&tracked.path, tracked.identity, now, &config.cache_dir) {
+        let recorded = || recorded_since(&store, &tracked.path, tracked.last_seen);
+        match remove_unless(
+            &tracked.path,
+            tracked.identity,
+            now,
+            &config.cache_dir,
+            recorded,
+        ) {
             Ok(true) => {
                 forget(&store, &tracked.path, tracked.identity);
                 swept.removed.push((tracked.path, reason));
@@ -313,6 +320,15 @@ pub(crate) fn sweep(config: &Config, now: u64) -> anyhow::Result<Swept> {
     let used = prune_under_pressure(config, &store, at, &mut swept)?;
     recover_under_pressure(config, &store, now, &unused, &used, &mut swept)?;
     Ok(swept)
+}
+
+/// Whether a build or Git discovery recorded `path` after the sweep read its
+/// row. The sweep reads its rows once, so a build that ran while it deleted
+/// an earlier target can leave one stale, and a directory that build
+/// recreated can get the old inode back. A row that cannot be read counts as
+/// recorded.
+fn recorded_since(store: &Store, path: &Path, last_seen: i64) -> bool {
+    !matches!(store.target_root_last_seen(path), Ok(Some(seen)) if seen <= last_seen)
 }
 
 /// Drop `path` from the target registry while its row still records
@@ -501,6 +517,7 @@ struct PressureCandidate {
     path: PathBuf,
     workspace_root: PathBuf,
     identity: crate::machine::PathIdentity,
+    last_seen: i64,
     reclaimable: u64,
     idle: i64,
 }
@@ -650,6 +667,7 @@ fn recover_under_pressure(
             path: tracked.path,
             workspace_root: tracked.workspace_root,
             identity: tracked.identity,
+            last_seen: tracked.last_seen,
             reclaimable,
             idle,
         });
@@ -683,7 +701,14 @@ fn recover_under_pressure(
         if crate::cli::target_in_use(&candidate.path) {
             continue;
         }
-        match remove(&candidate.path, candidate.identity, now, &config.cache_dir) {
+        let recorded = || recorded_since(store, &candidate.path, candidate.last_seen);
+        match remove_unless(
+            &candidate.path,
+            candidate.identity,
+            now,
+            &config.cache_dir,
+            recorded,
+        ) {
             Ok(true) => {
                 forget(store, &candidate.path, candidate.identity);
                 let freed = kache_fs::volume_usage(parent)
@@ -716,23 +741,38 @@ fn looks_like_a_source_root(path: &Path) -> bool {
         .any(|name| std::fs::symlink_metadata(path.join(name)).is_ok())
 }
 
-/// Rename `target` aside, check no build holds it, then delete it. A build
-/// that took its lock before the rename is found, and the directory is
-/// renamed back; one that starts after the rename creates a new directory
-/// and may record it before the deletion ends, so callers forget the row
-/// only while it still records `expected`.
-/// `Ok(false)` when a build holds it, before or after the rename.
+/// [`remove_unless`] for a row no build records again.
+#[cfg(test)]
 fn remove(
     target: &Path,
     expected: crate::machine::PathIdentity,
     now: i64,
     cache_dir: &Path,
 ) -> std::io::Result<bool> {
+    remove_unless(target, expected, now, cache_dir, || false)
+}
+
+/// Rename `target` aside, check no build holds it, then delete it. A build
+/// that took its lock before the rename is found, and the directory is
+/// renamed back; one that starts after the rename creates a new directory
+/// and may record it before the deletion ends, so callers forget the row
+/// only while it still records `expected`. Nothing is removed when
+/// `recorded` says a build recorded `target` since the caller read its row;
+/// it is asked once builds are held off.
+/// `Ok(false)` when a build holds it, before or after the rename.
+fn remove_unless(
+    target: &Path,
+    expected: crate::machine::PathIdentity,
+    now: i64,
+    cache_dir: &Path,
+    recorded: impl FnOnce() -> bool,
+) -> std::io::Result<bool> {
     remove_after_rename(
         target,
         expected,
         now,
         cache_dir,
+        recorded,
         |_| {},
         |aside| {
             #[cfg(test)]
@@ -747,13 +787,14 @@ fn remove_after_rename(
     expected: crate::machine::PathIdentity,
     now: i64,
     cache_dir: &Path,
+    recorded: impl FnOnce() -> bool,
     after_rename: impl FnOnce(&Path),
     delete: impl FnOnce(&Path) -> std::io::Result<()>,
 ) -> std::io::Result<bool> {
     let Some(reservation) = crate::target_use::try_exclusive(cache_dir)? else {
         return Ok(false);
     };
-    if crate::machine::directory_identity(target) != Some(expected) {
+    if crate::machine::directory_identity(target) != Some(expected) || recorded() {
         return Ok(false);
     }
     let name = target.file_name().unwrap_or_default().to_string_lossy();
@@ -1891,6 +1932,7 @@ mod tests {
             identity,
             7,
             cache.path(),
+            || false,
             |aside| {
                 std::fs::rename(aside, &saved).unwrap();
                 std::fs::create_dir(aside).unwrap();
@@ -1916,6 +1958,7 @@ mod tests {
             identity,
             7,
             cache.path(),
+            || false,
             |_| {},
             |aside| {
                 deleted_unlocked = crate::target_use::try_exclusive(cache.path())?.is_some();
@@ -1962,15 +2005,10 @@ mod tests {
             .unwrap();
         std::fs::remove_dir_all(&cleaned).unwrap();
         std::fs::remove_dir_all(&sibling).unwrap();
-        // The oldest row goes first.
-        store
-            .file_hash_cache()
-            .db()
-            .execute(
-                "UPDATE target_roots SET last_seen = last_seen - 60 WHERE path = ?1",
-                [removed.to_string_lossy().into_owned()],
-            )
-            .unwrap();
+        // Old enough that a build records each again; the oldest goes first.
+        age_target(&store, &removed, 600);
+        age_target(&store, &cleaned, 400);
+        age_target(&store, &sibling, 400);
         let builds = [
             rebuild(&idle, &removed_at, &removed),
             rebuild(&idle, &cleaned_at, &cleaned),
@@ -1984,6 +2022,38 @@ mod tests {
         let swept = sweep(&idle, unix_now_secs() + 2 * DAY_SECS).unwrap();
         assert_eq!(swept.removed, vec![(removed.clone(), Reason::Idle)]);
         assert_tracked_as_on_disk(&store, &[&removed, &cleaned, &sibling]);
+    }
+
+    /// Make `target`'s row `secs` older. A build refreshes a row only once it
+    /// is five minutes old.
+    fn age_target(store: &Store, target: &Path, secs: i64) {
+        store
+            .file_hash_cache()
+            .db()
+            .execute(
+                "UPDATE target_roots SET last_seen = last_seen - ?2 WHERE path = ?1",
+                rusqlite::params![target.to_string_lossy().into_owned(), secs],
+            )
+            .unwrap();
+    }
+
+    /// The sweep reads its rows once. A build that records an idle target
+    /// while an earlier one is deleted keeps it, even though the directory,
+    /// and so its identity, did not change.
+    #[test]
+    fn a_build_during_a_sweep_keeps_an_idle_target_it_records() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let idle = config(cache.path(), false, 1);
+        let store = Store::open(&idle).unwrap();
+        let (_, removed) = tracked_target(&store, root.path(), "removed");
+        let (kept_at, kept) = tracked_target(&store, root.path(), "kept");
+        age_target(&store, &removed, 600);
+        age_target(&store, &kept, 400);
+        WHILE_DELETING.set(Some(rebuild(&idle, &kept_at, &kept)));
+        let swept = sweep(&idle, unix_now_secs() + 2 * DAY_SECS).unwrap();
+        assert_eq!(swept.removed, vec![(removed, Reason::Idle)]);
+        assert_tracked_as_on_disk(&store, &[&kept]);
     }
 
     #[cfg(unix)]

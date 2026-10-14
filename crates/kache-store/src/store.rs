@@ -4687,6 +4687,18 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         now
     }
 
+    /// When a build or Git discovery last recorded `path`, if it is tracked.
+    pub fn target_root_last_seen(&self, path: &Path) -> Result<Option<i64>> {
+        Ok(self
+            .db
+            .query_row(
+                "SELECT last_seen FROM target_roots WHERE path = ?1",
+                params![path.to_string_lossy()],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
     pub fn forget_target_root(&self, path: &Path) -> Result<()> {
         self.refuse_write("forget a target root")?;
         self.db.execute(

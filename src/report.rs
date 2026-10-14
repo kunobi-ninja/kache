@@ -776,10 +776,15 @@ pub struct BypassAnalysis {
     /// edit (`adaptive seed`, `adaptive active`). Included in `passthroughs`.
     #[serde(default)]
     pub edit_rebuilds: usize,
-    /// Wrapper time of the compiles in `passthroughs`: work the compiler did
-    /// that the cache will not serve. Probes are excluded.
+    /// Compiles kache ran itself and did not store: passthroughs it ran
+    /// directly, and compiles whose store it declined (`skipped` with a
+    /// reason). Probes and fallback-wrapper runs are excluded; the event
+    /// cannot say whether a fallback compiled or served its own hit.
     #[serde(default)]
-    pub passthrough_time_ms: u64,
+    pub uncached_compiles: usize,
+    /// Wrapper time of `uncached_compiles`.
+    #[serde(default)]
+    pub uncached_compile_time_ms: u64,
     pub skipped: usize,
     pub fallbacks: usize,
     pub direct_passthroughs: usize,
@@ -1835,7 +1840,8 @@ fn build_bypass_analysis(events: &[BuildEvent], top: usize) -> BypassAnalysis {
                 && passthrough_category(&detail.reason) != "not-a-compile"
         })
         .count();
-    let (edit_rebuilds, passthrough_time_ms) = passthrough_compile_totals(&details);
+    let (uncached_compiles, edit_rebuilds, uncached_compile_time_ms) =
+        uncached_compile_totals(events);
     let skipped = details
         .iter()
         .filter(|detail| detail.result == "skipped")
@@ -1888,7 +1894,8 @@ fn build_bypass_analysis(events: &[BuildEvent], top: usize) -> BypassAnalysis {
         passthroughs,
         probes,
         edit_rebuilds,
-        passthrough_time_ms,
+        uncached_compiles,
+        uncached_compile_time_ms,
         skipped,
         fallbacks,
         direct_passthroughs,
@@ -1897,21 +1904,40 @@ fn build_bypass_analysis(events: &[BuildEvent], top: usize) -> BypassAnalysis {
     }
 }
 
-/// Edit rebuilds among the passthrough compiles, and the wrapper time of
-/// every passthrough compile. Probes and skips are not compiles.
-fn passthrough_compile_totals(details: &[BypassDetail]) -> (usize, u64) {
-    let compiles = details.iter().filter(|detail| {
-        detail.result == "passthrough" && passthrough_category(&detail.reason) != "not-a-compile"
-    });
+/// Uncached compiles, the edit rebuilds among them, and their wrapper time.
+fn uncached_compile_totals(events: &[BuildEvent]) -> (usize, usize, u64) {
+    let mut compiles = 0;
     let mut edit_rebuilds = 0;
     let mut elapsed_ms = 0u64;
-    for detail in compiles {
-        if is_edit_rebuild(&detail.reason) {
+    for event in events.iter().filter(|event| ran_compiler_uncached(event)) {
+        compiles += 1;
+        if is_edit_rebuild(&event.passthrough_reason) {
             edit_rebuilds += 1;
         }
-        elapsed_ms = elapsed_ms.saturating_add(detail.elapsed_ms);
+        elapsed_ms = elapsed_ms.saturating_add(event.elapsed_ms);
     }
-    (edit_rebuilds, elapsed_ms)
+    (compiles, edit_rebuilds, elapsed_ms)
+}
+
+/// A compile kache ran and did not store: a passthrough it ran directly, or
+/// a compile whose store it declined. A probe compiles nothing, and a
+/// fallback wrapper may have served its own hit without compiling.
+pub(crate) fn ran_compiler_uncached(event: &BuildEvent) -> bool {
+    match event.result {
+        EventResult::Passthrough => !event.fallback && !is_probe_passthrough(event),
+        EventResult::Skipped => !event.skip_reason.is_empty(),
+        _ => false,
+    }
+}
+
+/// Why a compile was not cached, in words: the passthrough reason, or the
+/// reason kache declined to store it.
+pub(crate) fn uncached_compile_words(event: &BuildEvent) -> String {
+    if matches!(event.result, EventResult::Skipped) {
+        format!("compiled, not stored: {}", event.skip_reason)
+    } else {
+        crate::tui_sessions::passthrough_words(&event.passthrough_reason)
+    }
 }
 
 /// A passthrough the adaptive incremental policy chose for a crate under edit.
@@ -3074,7 +3100,7 @@ pub fn format_markdown(report: &BuildReport) -> String {
     let t = &report.timing;
 
     let total_hits = s.local_hits + s.prefetch_hits + s.remote_hits;
-    let compiled = compiled_note(s);
+    let compiled = compiled_note(s, &report.bypass);
     lines.push("### kache build report".to_string());
     lines.push(String::new());
     lines.push(format!(
@@ -3432,7 +3458,7 @@ pub fn format_github(report: &BuildReport) -> String {
     let t = &report.timing;
     let total_hits = s.local_hits + s.prefetch_hits + s.remote_hits;
     let total_compiled = s.dups + s.misses;
-    let compiled = compiled_note(s);
+    let compiled = compiled_note(s, &report.bypass);
 
     // Header
     lines.push("### kache build cache".to_string());
@@ -3959,7 +3985,8 @@ pub fn format_text(report: &BuildReport) -> String {
             total_hits,
             s.total_crates,
             s.dups + s.misses,
-            s.passthroughs,
+            report.bypass.uncached_compiles,
+            report.bypass.uncached_compiles + s.store_failures,
         ),
     )];
     if let Some(w) = s.weighted_hit_rate_pct {
@@ -4175,7 +4202,7 @@ pub fn format_text(report: &BuildReport) -> String {
     // Where wrapper time went.
     let mut timing = vec![
         timing_row("Cache hits", t.hit_time_ms, t.avg_hit_ms, "per hit"),
-        compiles_timing_row(s, t, report.bypass.passthrough_time_ms),
+        compiles_timing_row(s, t, &report.bypass),
     ];
     let steps = [
         ("  cache key", t.total_key_ms, t.avg_key_ms),
@@ -4369,12 +4396,19 @@ pub fn format_text(report: &BuildReport) -> String {
 }
 
 /// The `Hit rate` detail: hits over cacheable crates, and every crate the
-/// compiler ran for. A passthrough compile is compiled and not cached, so an
-/// edit rebuild does not read as `0 compiled`.
-fn hit_rate_detail(hits: usize, cacheable: usize, cache_misses: usize, uncached: usize) -> String {
+/// compiler ran for. `uncached_compiles` ran outside a lookup (an edit
+/// rebuild, a declined store), so an edit rebuild does not read as
+/// `0 compiled`. `not_cached` adds the misses whose store failed.
+fn hit_rate_detail(
+    hits: usize,
+    cacheable: usize,
+    cache_misses: usize,
+    uncached_compiles: usize,
+    not_cached: usize,
+) -> String {
     use crate::term::count;
-    let compiled = cache_misses + uncached;
-    let mut detail = if cacheable == 0 && uncached > 0 {
+    let compiled = cache_misses + uncached_compiles;
+    let mut detail = if cacheable == 0 && uncached_compiles > 0 {
         format!("{} compiled", count(compiled as u64))
     } else {
         format!(
@@ -4384,32 +4418,35 @@ fn hit_rate_detail(hits: usize, cacheable: usize, cache_misses: usize, uncached:
             count(compiled as u64)
         )
     };
-    if uncached > 0 {
-        detail.push_str(&format!(", {} not cached", count(uncached as u64)));
+    if not_cached > 0 {
+        detail.push_str(&format!(", {} not cached", count(not_cached as u64)));
     }
     detail
 }
 
 /// `5 compiled`, with how many of them were not cached: the markdown and
 /// GitHub headlines.
-fn compiled_note(summary: &ReportSummary) -> String {
-    let compiled = summary.dups + summary.misses + summary.passthroughs;
-    if summary.passthroughs > 0 {
-        format!("{compiled} compiled, {} not cached", summary.passthroughs)
+fn compiled_note(summary: &ReportSummary, bypass: &BypassAnalysis) -> String {
+    let compiled = summary.dups + summary.misses + bypass.uncached_compiles;
+    let not_cached = bypass.uncached_compiles + summary.store_failures;
+    if not_cached > 0 {
+        format!("{compiled} compiled, {not_cached} not cached")
     } else {
         format!("{compiled} compiled")
     }
 }
 
-/// The `Compiles` timing row: cache misses and passthrough compiles, both
-/// of which ran the compiler.
+/// The `Compiles` timing row: cache misses and uncached compiles, both of
+/// which ran the compiler.
 fn compiles_timing_row(
     summary: &ReportSummary,
     timing: &TimingBreakdown,
-    passthrough_time_ms: u64,
+    bypass: &BypassAnalysis,
 ) -> Vec<String> {
-    let total_ms = timing.miss_time_ms.saturating_add(passthrough_time_ms);
-    let compiled = summary.dups + summary.misses + summary.passthroughs;
+    let total_ms = timing
+        .miss_time_ms
+        .saturating_add(bypass.uncached_compile_time_ms);
+    let compiled = summary.dups + summary.misses + bypass.uncached_compiles;
     let average = if compiled == 0 {
         0.0
     } else {

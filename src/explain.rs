@@ -189,7 +189,7 @@ pub(crate) fn render(
                     term::duration_ms(group.compile_ms),
                     term::count(group.count as u64),
                     group.cause.describe(),
-                    group.examples.join(", "),
+                    group.costliest_examples.join(", "),
                 ]
             })
             .collect();
@@ -330,7 +330,10 @@ pub(crate) struct CauseBody {
     pub failure: bool,
     pub count: usize,
     pub compile_ms: u64,
+    /// Up to three crates, in log order.
     pub crates: Vec<String>,
+    /// Up to three crates, costliest first.
+    pub costliest_crates: Vec<String>,
 }
 
 /// One reason a compilation was not cached.
@@ -391,6 +394,7 @@ pub(crate) fn json_body(
                 count: group.count,
                 compile_ms: group.compile_ms,
                 crates: group.examples.clone(),
+                costliest_crates: group.costliest_examples.clone(),
             })
             .collect(),
         not_cached: analysis
@@ -595,7 +599,10 @@ mod tests {
             costed("late", 3, 200),
             edit,
         ];
-        let (lines, _) = report(&events);
+        let (lines, body) = report(&events);
+        // JSON keeps the crates in log order and adds the costliest apart.
+        assert_eq!(body.causes[0].crates, ["early", "heavy", "late"]);
+        assert_eq!(body.causes[0].costliest_crates, ["heavy", "late", "early"]);
         let text = lines.join("\n");
         assert!(text.contains("Why it missed, costliest first"), "{text}");
         assert!(text.contains("heavy, late, early"), "{text}");
@@ -657,6 +664,7 @@ mod tests {
         assert_eq!(body.misses, 2);
         assert_eq!(body.earlier_misses, Some(1));
         assert_eq!(body.causes[0].crates, ["costly"], "costliest first");
+        assert_eq!(body.causes[0].costliest_crates, ["costly"]);
         assert!(body.causes[0].failure);
         assert!(body.causes[0].fix.contains("1.0 GiB"));
         assert_eq!(body.causes[1].compile_ms, 1_000);

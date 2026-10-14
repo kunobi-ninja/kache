@@ -4358,15 +4358,34 @@ fn an_edit_rebuild_counts_as_compiled_and_not_cached() {
     refused.passthrough_reason = "unsupported|assembly".into();
     let mut probe = test_event("probe", EventResult::Passthrough, 9_000, 0, 0, "");
     probe.passthrough_reason = "not-a-compile|--print cfg".into();
-    let skipped = test_event("skip", EventResult::Skipped, 7_000, 0, 0, "");
+    // A skip with no recorded reason is an older event, not a known compile.
+    let legacy_skip = test_event("skip", EventResult::Skipped, 7_000, 0, 0, "");
+    let mut declined = test_event("tiny", EventResult::Skipped, 300, 200, 0, "k2");
+    declined.skip_reason = "admission-threshold".into();
+    // A fallback wrapper may have served its own hit without compiling.
+    let mut fallback = test_event("fb", EventResult::Passthrough, 4_000, 0, 0, "");
+    fallback.passthrough_reason = "unsupported|assembly".into();
+    fallback.fallback = true;
     let slow_seed = to_bypass_detail(&seed);
-    let bypass = build_bypass_analysis(&[seed, active, refused, probe, skipped], 10);
-    assert_eq!(bypass.passthroughs, 3);
+    let bypass = build_bypass_analysis(
+        &[
+            seed,
+            active,
+            refused,
+            probe,
+            legacy_skip,
+            declined,
+            fallback,
+        ],
+        10,
+    );
+    assert_eq!(bypass.passthroughs, 4);
     assert_eq!(bypass.edit_rebuilds, 2);
-    assert_eq!(bypass.passthrough_time_ms, 5_000);
+    assert_eq!(bypass.uncached_compiles, 4);
+    assert_eq!(bypass.uncached_compile_time_ms, 5_300);
     assert_eq!(
         format_bypass_summary(&bypass),
-        "2 edit rebuilds / 1 passthrough / 1 skipped / 1 probe"
+        "2 edit rebuilds / 2 passthroughs (1 via fallback) / 2 skipped / 1 probe"
     );
 
     let mut report = blank_report();
@@ -4374,7 +4393,8 @@ fn an_edit_rebuild_counts_as_compiled_and_not_cached() {
     report.bypass = BypassAnalysis {
         passthroughs: 2,
         edit_rebuilds: 2,
-        passthrough_time_ms: 4_000,
+        uncached_compiles: 2,
+        uncached_compile_time_ms: 4_000,
         reasons: vec![BypassReason {
             result: "passthrough".into(),
             route: "direct".into(),
@@ -4413,41 +4433,99 @@ fn an_edit_rebuild_counts_as_compiled_and_not_cached() {
 #[test]
 fn the_hit_rate_detail_counts_every_compile() {
     assert_eq!(
-        hit_rate_detail(8, 10, 2, 0),
+        hit_rate_detail(8, 10, 2, 0, 0),
         "8 of 10 crates from cache, 2 compiled"
     );
     assert_eq!(
-        hit_rate_detail(8, 10, 2, 3),
+        hit_rate_detail(8, 10, 2, 3, 3),
         "8 of 10 crates from cache, 5 compiled, 3 not cached"
     );
-    assert_eq!(hit_rate_detail(0, 0, 0, 2), "2 compiled, 2 not cached");
+    assert_eq!(hit_rate_detail(0, 0, 0, 2, 2), "2 compiled, 2 not cached");
     assert_eq!(
-        hit_rate_detail(0, 0, 0, 0),
+        hit_rate_detail(0, 0, 0, 0, 0),
         "0 of 0 crates from cache, 0 compiled"
     );
     assert_eq!(
-        hit_rate_detail(1, 1, 0, 1),
+        hit_rate_detail(1, 1, 0, 1, 1),
         "1 of 1 crates from cache, 1 compiled, 1 not cached"
+    );
+    // A miss whose store failed is compiled already and not cached.
+    assert_eq!(
+        hit_rate_detail(0, 1, 1, 1, 2),
+        "0 of 1 crates from cache, 2 compiled, 2 not cached"
     );
 }
 
 #[test]
-fn the_compiles_row_adds_passthrough_time() {
+fn a_failed_store_and_a_passthrough_are_both_not_cached() {
+    let mut report = blank_report();
+    report.summary.misses = 1;
+    report.summary.store_failures = 1;
+    report.summary.total_crates = 1;
+    report.summary.passthroughs = 1;
+    report.bypass.passthroughs = 1;
+    report.bypass.uncached_compiles = 1;
+    assert_eq!(
+        text_row(&format_text(&report), "Hit rate").as_deref(),
+        Some("Hit rate | 0.0% | 0 of 1 crates from cache, 2 compiled, 2 not cached")
+    );
+    assert_eq!(
+        compiled_note(&report.summary, &report.bypass),
+        "2 compiled, 2 not cached"
+    );
+}
+
+#[test]
+fn the_compiles_row_adds_uncached_compile_time() {
     let mut report = blank_report();
     report.summary.misses = 1;
     report.summary.dups = 1;
-    report.summary.passthroughs = 2;
+    report.summary.passthroughs = 3;
+    report.bypass.uncached_compiles = 2;
+    report.bypass.uncached_compile_time_ms = 6_000;
     report.timing.miss_time_ms = 2_000;
     assert_eq!(
-        compiles_timing_row(&report.summary, &report.timing, 6_000),
+        compiles_timing_row(&report.summary, &report.timing, &report.bypass),
         ["Compiles", "8.0 s", "2.0 s", "per crate"]
     );
-    report.summary = blank_report().summary;
-    report.timing.miss_time_ms = 0;
+    let blank = blank_report();
     assert_eq!(
-        compiles_timing_row(&report.summary, &report.timing, 0),
+        compiles_timing_row(&blank.summary, &blank.timing, &blank.bypass),
         ["Compiles", "0 ms", "0.0 ms", "per crate"]
     );
+}
+
+#[test]
+fn only_compiles_kache_ran_and_did_not_store_are_uncached_compiles() {
+    let passthrough = |reason: &str, fallback| {
+        let mut event = test_event("c", EventResult::Passthrough, 1, 0, 0, "");
+        event.passthrough_reason = reason.into();
+        event.fallback = fallback;
+        event
+    };
+    assert!(ran_compiler_uncached(&passthrough("adaptive seed", false)));
+    assert!(!ran_compiler_uncached(&passthrough("adaptive seed", true)));
+    assert!(!ran_compiler_uncached(&passthrough(
+        "not-a-compile|--print cfg",
+        false
+    )));
+    let mut skipped = test_event("c", EventResult::Skipped, 1, 0, 0, "");
+    assert!(!ran_compiler_uncached(&skipped));
+    skipped.skip_reason = "inputs-changed".into();
+    assert!(ran_compiler_uncached(&skipped));
+    assert_eq!(
+        uncached_compile_words(&skipped),
+        "compiled, not stored: inputs-changed"
+    );
+    assert_eq!(
+        uncached_compile_words(&passthrough("unsupported|assembly", false)),
+        "unsupported: assembly"
+    );
+    for result in [EventResult::Miss, EventResult::LocalHit, EventResult::Error] {
+        let mut event = test_event("c", result, 1, 0, 0, "");
+        event.skip_reason = "x".into();
+        assert!(!ran_compiler_uncached(&event));
+    }
 }
 
 #[test]
@@ -4519,9 +4597,13 @@ fn markdown_headlines_count_passthrough_compiles() {
     let mut report = blank_report();
     report.summary.misses = 2;
     report.summary.dups = 1;
-    assert_eq!(compiled_note(&report.summary), "3 compiled");
+    assert_eq!(compiled_note(&report.summary, &report.bypass), "3 compiled");
     report.summary.passthroughs = 2;
-    assert_eq!(compiled_note(&report.summary), "5 compiled, 2 not cached");
+    report.bypass.uncached_compiles = 2;
+    assert_eq!(
+        compiled_note(&report.summary, &report.bypass),
+        "5 compiled, 2 not cached"
+    );
     for rendered in [format_markdown(&report), format_github(&report)] {
         assert!(
             rendered.contains("cacheable crates from cache, 5 compiled, 2 not cached |"),

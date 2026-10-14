@@ -2578,6 +2578,8 @@ fn why_miss_json(
 #[derive(Debug, serde::Serialize)]
 struct UncachedCompile<'a> {
     ts: String,
+    /// `passthrough`, or `skipped` for a compile whose store kache declined.
+    result: String,
     cache_key: &'a str,
     reason: &'a str,
     why: String,
@@ -2585,18 +2587,24 @@ struct UncachedCompile<'a> {
 
 impl<'a> UncachedCompile<'a> {
     fn of(event: &'a events::BuildEvent) -> Self {
+        let reason = if matches!(event.result, events::EventResult::Skipped) {
+            &event.skip_reason
+        } else {
+            &event.passthrough_reason
+        };
         Self {
             ts: event.ts.to_rfc3339(),
+            result: event.result.to_string(),
             cache_key: &event.cache_key,
-            reason: &event.passthrough_reason,
-            why: crate::tui_sessions::passthrough_words(&event.passthrough_reason),
+            reason,
+            why: crate::report::uncached_compile_words(event),
         }
     }
 }
 
-/// The crate's newest compile when kache passed it through uncached and no
-/// lookup came after it. Probes, skips and errors are not compiles, so they
-/// never decide.
+/// The crate's newest compile when kache ran it without storing it and no
+/// lookup came after it. Probes, errors, fallback-wrapper runs and skips
+/// without a recorded compile are not known compiles, so they never decide.
 fn latest_uncached_compile<'a>(
     crate_events: &[&'a events::BuildEvent],
 ) -> Option<&'a events::BuildEvent> {
@@ -2605,12 +2613,18 @@ fn latest_uncached_compile<'a>(
         .iter()
         .rev()
         .copied()
-        .find(|event| match event.result {
-            EventResult::Passthrough => !crate::report::is_probe_passthrough(event),
-            EventResult::Error | EventResult::Skipped => false,
-            _ => true,
+        .find(|event| {
+            crate::report::ran_compiler_uncached(event)
+                || matches!(
+                    event.result,
+                    EventResult::LocalHit
+                        | EventResult::PrefetchHit
+                        | EventResult::RemoteHit
+                        | EventResult::Miss
+                        | EventResult::Dup
+                )
         })
-        .filter(|event| matches!(event.result, EventResult::Passthrough))
+        .filter(|event| crate::report::ran_compiler_uncached(event))
 }
 
 /// The first line of `kache explain <crate>` for a crate with no miss and no
@@ -2648,10 +2662,7 @@ fn uncached_compile_lines(
             term::local_datetime(latest.ts),
             term::short_key(&latest.cache_key)
         ),
-        format!(
-            "    why: {}",
-            crate::tui_sessions::passthrough_words(&latest.passthrough_reason)
-        ),
+        format!("    why: {}", crate::report::uncached_compile_words(latest)),
     ];
     if let Some(miss) = earlier_miss {
         lines.push(format!(

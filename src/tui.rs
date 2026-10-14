@@ -2869,13 +2869,13 @@ fn why_lines(state: &mut AppState, width: u16) -> Vec<Line<'static>> {
         } else {
             Color::Yellow
         };
-        let examples = if group.examples.is_empty() {
+        let examples = if group.costliest_examples.is_empty() {
             String::new()
         } else {
-            let more = group.count.saturating_sub(group.examples.len());
+            let more = group.count.saturating_sub(group.costliest_examples.len());
             format!(
                 "{}{}",
-                group.examples.join(", "),
+                group.costliest_examples.join(", "),
                 if more > 0 {
                     format!(" +{more}")
                 } else {

@@ -9478,3 +9478,32 @@ fn the_sync_plan_prints_short_keys() {
         ["  pull  96b68103bea2 (serde)", "  push  abc (tiny)"]
     );
 }
+
+#[test]
+fn a_declined_store_is_the_latest_compile_and_a_fallback_run_is_not() {
+    use events::EventResult;
+    let miss = explain_event(EventResult::Miss, 1, "missmissmissmiss");
+    let mut seed = explain_event(EventResult::Passthrough, 2, "seedseedseedseed");
+    seed.passthrough_reason = "adaptive seed".to_string();
+    let mut declined = explain_event(EventResult::Skipped, 3, "skipskipskipskip");
+    declined.skip_reason = "admission-threshold".to_string();
+    let mut fallback = explain_event(EventResult::Passthrough, 4, "fbfbfbfbfbfbfbfb");
+    fallback.passthrough_reason = "unsupported|assembly".to_string();
+    fallback.fallback = true;
+    let legacy_skip = explain_event(EventResult::Skipped, 5, "oldskipoldskip00");
+
+    let latest = |events: &[&events::BuildEvent]| {
+        latest_uncached_compile(events).map(|event| event.cache_key.clone())
+    };
+    assert_eq!(
+        latest(&[&miss, &seed, &declined, &fallback, &legacy_skip]).as_deref(),
+        Some("skipskipskipskip")
+    );
+    assert_eq!(latest(&[&miss, &fallback]), None);
+
+    let lines = uncached_compile_lines("app", &declined, Some(&miss), &[&miss, &declined]);
+    assert!(
+        lines.contains(&"    why: compiled, not stored: admission-threshold".to_string()),
+        "{lines:?}"
+    );
+}

@@ -460,9 +460,12 @@ pub(crate) struct CauseGroup {
     pub count: usize,
     /// Compile time these misses cost.
     pub compile_ms: u64,
-    /// Up to three crate names, costliest first (log order on a tie), so
-    /// the group is recognizable.
+    /// Up to three crate names, in log order, so the group is recognizable.
+    /// `kache --json explain` reports these as `crates`.
     pub examples: Vec<String>,
+    /// Up to three crate names, costliest first (log order on a tie), for
+    /// the human reports.
+    pub costliest_examples: Vec<String>,
 }
 
 /// Passthroughs sharing one reason.
@@ -540,6 +543,7 @@ pub(crate) fn analyze_session(
                     count: 0,
                     compile_ms: 0,
                     examples: Vec::new(),
+                    costliest_examples: Vec::new(),
                 },
                 Vec::new(),
             )
@@ -551,7 +555,12 @@ pub(crate) fn analyze_session(
     let mut causes: Vec<CauseGroup> = groups
         .into_values()
         .map(|(mut group, crates)| {
-            group.examples = costliest_names(crates, 3);
+            group.examples = crates
+                .iter()
+                .take(3)
+                .map(|(name, _)| name.clone())
+                .collect();
+            group.costliest_examples = costliest_names(crates, 3);
             group
         })
         .collect();
@@ -1213,10 +1222,19 @@ mod tests {
             "the costlier cause leads though it has fewer crates"
         );
         assert_eq!(analysis.causes[0].count, 5);
-        assert_eq!(analysis.causes[0].examples, vec!["big", "first", "mid"]);
+        assert_eq!(
+            analysis.causes[0].costliest_examples,
+            vec!["big", "first", "mid"]
+        );
+        assert_eq!(
+            analysis.causes[1].costliest_examples,
+            vec!["cheap3", "cheap2", "cheap1"]
+        );
+        // The JSON `crates` keep their log order.
+        assert_eq!(analysis.causes[0].examples, vec!["first", "big", "tiny"]);
         assert_eq!(
             analysis.causes[1].examples,
-            vec!["cheap3", "cheap2", "cheap1"]
+            vec!["cheap1", "cheap2", "cheap3"]
         );
         assert_eq!(analysis.costliest.as_deref(), Some("big"));
         assert_eq!(costliest_miss(std::iter::empty()), None);
@@ -1262,6 +1280,7 @@ mod tests {
             count,
             compile_ms,
             examples: Vec::new(),
+            costliest_examples: Vec::new(),
         };
         let mut causes = vec![
             group(9, 10, Cause::NoHistory),

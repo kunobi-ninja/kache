@@ -2289,6 +2289,22 @@ mod tests {
     }
 
     #[test]
+    fn mod_rs_children_remain_in_the_parent_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir(root.join("foo")).unwrap();
+        std::fs::write(root.join("lib.rs"), "mod foo;\n").unwrap();
+        std::fs::write(root.join("foo/mod.rs"), "mod child;\n").unwrap();
+        std::fs::write(root.join("foo/child.rs"), "pub fn thing() {}\n").unwrap();
+        let records = source_records(&[root.join("lib.rs")]).unwrap();
+        let names: Vec<_> = records
+            .iter()
+            .map(|record| record.relative.as_str())
+            .collect();
+        assert_eq!(names, [".", "foo/child.rs", "foo/mod.rs", "lib.rs"]);
+    }
+
+    #[test]
     fn non_mod_rs_modules_resolve_children_below_their_stem() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();

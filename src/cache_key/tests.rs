@@ -16538,3 +16538,50 @@ fn environment_detail_hashes_follow_the_normalized_key_inputs() {
     assert_ne!(first["BUILD_MODE"], second["BUILD_MODE"]);
     assert!(hashed(Vec::new()).is_empty());
 }
+
+#[test]
+fn source_env_dep_use_rejects_ambiguous_include_names() {
+    for name in ["include", "include_str", "include_bytes"] {
+        for source in [
+            format!(
+                "macro_rules! {name} {{ ($path:expr) => {{ $path }}; }} {name}!(env!(\"OUT_DIR\"));"
+            ),
+            format!("use other::{name}; {name}!(env!(\"OUT_DIR\"));"),
+            format!("use other::{{exported as {name}}}; {name}!(env!(\"OUT_DIR\"));"),
+            format!("other::{name}!(env!(\"OUT_DIR\"));"),
+            format!("other::r#{name}!(env!(\"OUT_DIR\"));"),
+            format!("use other::*; {name}!(env!(\"OUT_DIR\"));"),
+            format!("other:: /* path trivia */ {name}!(env!(\"OUT_DIR\"));"),
+            format!(
+                "{name}!(env!(\"OUT_DIR\")); macro_rules! {name} {{ ($path:expr) => {{ $path }}; }}"
+            ),
+        ] {
+            assert_eq!(
+                source_env_dep_use(&source, "OUT_DIR"),
+                SourceEnvDepUse::RuntimeValue,
+                "{source}"
+            );
+        }
+        let builtin = format!(
+            "// macro_rules! {name} {{}}\nuse other::Thing; let _ = *ptr; const S: &str = \"use other::*;\"; {name} /* trivia */ ! (env!(\"OUT_DIR\"));"
+        );
+        assert_eq!(
+            source_env_dep_use(&builtin, "OUT_DIR"),
+            SourceEnvDepUse::IncludeLocator,
+            "ordinary imports, multiplication, strings and comments must preserve builtin proof"
+        );
+        let declarations = format!("macro_rules! {name} {{ ($path:expr) => {{ $path }}; }}");
+        let include = format!("{name}!(env!(\"OUT_DIR\"));");
+        assert_eq!(
+            out_dir_decision_for_files(
+                &[
+                    ("src/macros.rs", Some(&declarations)),
+                    ("src/lib.rs", Some(&include))
+                ],
+                &FileHasher::new()
+            ),
+            EnvDepNormalizationDecision::KeptAbsoluteRuntimeUse,
+            "declarations in another source must veto locator proof"
+        );
+    }
+}

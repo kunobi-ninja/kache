@@ -1583,12 +1583,8 @@ fn build(
         .spawn()
         .with_context(|| format!("spawning build command in {}", clone.display()))?;
 
-    // Tee the build tool's stdout to the console (live progress) AND the
-    // log file. The tool writes its build output — and the kache wrapper
-    // diagnostics relayed through it — to stdout, so the log must capture
-    // stdout, not just stderr. Byte-oriented so non-UTF-8 build output
-    // can't break it.
-    let mut fetches = FetchCount::default();
+    // Tee stdout to the console and the log; stderr writes directly to
+    // the same log. Keep the tee byte-oriented for non-UTF-8 build output.
     if let Some(stdout) = child.stdout.take() {
         let mut reader = std::io::BufReader::new(stdout);
         let mut buf = Vec::new();
@@ -1596,7 +1592,6 @@ fn build(
             let _ = std::io::stdout().write_all(&buf);
             log.write_all(&buf)
                 .with_context(|| format!("writing {}", log_path.display()))?;
-            fetches.observe(&buf);
             buf.clear();
         }
     }
@@ -1610,7 +1605,7 @@ fn build(
             log_path.display()
         );
     }
-    fetches.refuse(phase, &log_path)?;
+    FetchCount::from_log(&log_path)?.refuse(phase, &log_path)?;
     Ok(BuildRun { wall_ms, load })
 }
 
@@ -1619,6 +1614,18 @@ fn build(
 struct FetchCount(usize);
 
 impl FetchCount {
+    fn from_log(log_path: &Path) -> Result<Self> {
+        let file = File::open(log_path)
+            .with_context(|| format!("opening timed build log {}", log_path.display()))?;
+        let mut count = Self::default();
+        for line in std::io::BufReader::new(file).split(b'\n') {
+            let line =
+                line.with_context(|| format!("reading timed build log {}", log_path.display()))?;
+            count.observe(&line);
+        }
+        Ok(count)
+    }
+
     fn observe(&mut self, line: &[u8]) {
         self.0 += usize::from(is_dependency_fetch(line));
     }

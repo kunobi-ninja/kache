@@ -1679,6 +1679,25 @@ mod tests {
     }
 
     #[test]
+    fn verify_deadline_preserves_timely_exit_and_stdout_contract() {
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = verify_fixture(None);
+        let mut spec = fixture.verify.clone().unwrap();
+        spec.run = "sleep 0.05; printf ok; exit 7".into();
+        spec.expected_exit_code = 7;
+        spec.expected_stdout_contains = vec!["ok".into()];
+        spec.forbidden_substrings.clear();
+        spec.timeout_s = 1;
+
+        let result = super::run_verify(&spec, &fixture, temp.path(), temp.path());
+
+        assert!(result.passed, "{result:?}");
+        assert_eq!(result.exit_code, 7);
+        assert_eq!(result.stdout, "ok");
+        assert_eq!(result.failure_reason, None);
+    }
+
+    #[test]
     fn unmodified_phases_verify_the_fixture_contract() {
         let fixture = verify_fixture(Some(&["v2"]));
         for phase in [Phase::Cold, Phase::Warm, Phase::Noop, Phase::Relocate] {

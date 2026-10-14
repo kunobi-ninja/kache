@@ -5407,7 +5407,19 @@ fn a_registration_joins_the_callers_transaction() {
     store.db.execute_batch("ROLLBACK").unwrap();
     assert!(store.tracked_target_roots(0).unwrap().is_empty());
     store.remember_target_root(&target, &workspace).unwrap();
+    assert!(store.db.is_autocommit(), "no transaction left open");
     assert_eq!(store.tracked_target_roots(0).unwrap().len(), 1);
+
+    // Forgetting a removed directory joins a caller's transaction the same way.
+    let identity = crate::filesystem::directory_identity(&target).unwrap();
+    std::fs::remove_dir_all(&target).unwrap();
+    store.db.execute_batch("BEGIN IMMEDIATE").unwrap();
+    store.forget_target_roots_with_identity(identity).unwrap();
+    store.db.execute_batch("ROLLBACK").unwrap();
+    assert_eq!(store.tracked_target_roots(0).unwrap().len(), 1);
+    store.forget_target_roots_with_identity(identity).unwrap();
+    assert!(store.db.is_autocommit(), "no transaction left open");
+    assert!(store.tracked_target_roots(0).unwrap().is_empty());
 }
 
 /// A registration whose directory moved after its identity was read leaves

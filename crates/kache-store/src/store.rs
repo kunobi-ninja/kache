@@ -4525,7 +4525,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         if crate::filesystem::directory_identity(target) != Some(identity) {
             return Ok(());
         }
-        let changed = self.db.execute(
+        self.db.execute(
             "INSERT INTO target_roots
                 (path, workspace_root, first_seen, last_seen, device, inode, rustc, discovered)
              VALUES (?1, ?2, unixepoch(), unixepoch(), ?3, ?4, ?5, 0)
@@ -4554,17 +4554,15 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         // while Cargo used a /var or /tmp spelling, and rows recorded before
         // paths were normalized may spell it through `..`. The build row is
         // authoritative; discard every alias by inode.
-        if changed > 0 {
-            self.db.execute(
-                "DELETE FROM target_roots
-                 WHERE path != ?1 AND device = ?2 AND inode = ?3",
-                params![
-                    target.to_string_lossy(),
-                    identity.device.to_string(),
-                    identity.inode.to_string(),
-                ],
-            )?;
-        }
+        self.db.execute(
+            "DELETE FROM target_roots
+             WHERE path != ?1 AND device = ?2 AND inode = ?3",
+            params![
+                target.to_string_lossy(),
+                identity.device.to_string(),
+                identity.inode.to_string(),
+            ],
+        )?;
         // A registration that got here wrote its row; prune the registry.
         self.db.execute(
             "DELETE FROM target_roots WHERE last_seen < unixepoch() - 15552000",

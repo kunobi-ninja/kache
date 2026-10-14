@@ -754,6 +754,12 @@ fn line_has_rule_target(line: &str) -> bool {
 }
 
 fn parse_nvcc_make_deps(text: &str) -> Result<Vec<PathBuf>> {
+    // Windows `nvcc -M` writes CRLF. A continuation is a backslash
+    // immediately before the newline (`\` + LF, or `\` + CR + LF).
+    // Fold CRLF to LF once, before the rule scan and the loop below,
+    // so both newlines join the same way. A CR that is not part of
+    // CRLF stays literal.
+    let normalized = text.replace("\r\n", "\n");
     // Skip leading non-rule lines. Driver prologues (`nvcc warning :
     // ...` on stdout) contain a colon but cannot start a make rule: a
     // rule target has no unescaped whitespace before its colon (see
@@ -761,13 +767,14 @@ fn parse_nvcc_make_deps(text: &str) -> Result<Vec<PathBuf>> {
     // land inside the prologue and every word of it would become a
     // (missing, bailing) dependency — correct but permanently uncached
     // on toolkits that warn.
-    let text = &text[leading_rule_offset(text)..];
+    let text = &normalized[leading_rule_offset(&normalized)..];
     // Escaped spaces must survive the whitespace split below, so they
     // become a private-use placeholder first (restored after splitting).
     // Only two backslash sequences are escapes: a line continuation
-    // (`\` + newline) and an escaped space. Anything else — notably
-    // Windows separators (`C:\temp\x.h`) — is a literal backslash:
-    // misreading those as escapes would corrupt every Windows depfile.
+    // (`\` + LF, including a CRLF normalized above) and an escaped
+    // space. Anything else — notably Windows separators
+    // (`C:\temp\x.h`) — is a literal backslash: misreading those as
+    // escapes would corrupt every Windows depfile.
     const ESCAPED_SPACE: char = '\u{E000}';
     // Join backslash-newline continuations first.
     let mut joined = String::with_capacity(text.len());
@@ -2181,6 +2188,44 @@ mod tests {
             parsed,
             vec![PathBuf::from("C:\\s\\k.cu"), PathBuf::from("C:\\s\\k.h")]
         );
+    }
+
+    #[test]
+    fn make_deps_parse_handles_crlf_continuations() {
+        // `\` + CR + LF is the same continuation as `\` + LF: the
+        // backslash is not a dependency, and an escaped space still
+        // joins into one path.
+        let parsed = parse_nvcc_make_deps("k.obj : k.cu \\\r\n    C:/a\\ b/x.h\r\n").unwrap();
+        assert_eq!(
+            parsed,
+            vec![PathBuf::from("k.cu"), PathBuf::from("C:/a b/x.h")]
+        );
+        assert!(parsed.iter().all(|path| path != Path::new("\\")));
+        // Drive-letter target plus literal Windows separators. The
+        // drive colon is the skipped separator; neither `C:\s\…`
+        // backslash is eaten.
+        let parsed =
+            parse_nvcc_make_deps("C:\\b\\k.obj: C:\\s\\k.cu \\\r\n C:\\s\\k.h\r\n").unwrap();
+        assert_eq!(
+            parsed,
+            vec![PathBuf::from("C:\\s\\k.cu"), PathBuf::from("C:\\s\\k.h")]
+        );
+        // A CRLF warning prologue is still skipped. Two continued
+        // lines produce one path per real file and zero `\` tokens.
+        let parsed = parse_nvcc_make_deps(
+            "nvcc warning : Support for offline compilation for architectures prior to '<compute/sm/lto>_75' will be removed\r\nkernel.o : kernel.cu \\\r\n inc/k.h \\\r\n /usr/include/stdc-predef.h\r\n",
+        )
+        .unwrap();
+        assert_eq!(
+            parsed,
+            vec![
+                PathBuf::from("kernel.cu"),
+                PathBuf::from("inc/k.h"),
+                PathBuf::from("/usr/include/stdc-predef.h"),
+            ]
+        );
+        assert!(parsed.iter().all(|path| path != Path::new("\\")));
+        assert!(parse_nvcc_make_deps("no separator here\r\n").is_err());
     }
 
     #[test]

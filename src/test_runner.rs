@@ -459,6 +459,12 @@ mod tests {
         );
         // Not a 16-digit hex hash: the name stays whole.
         assert_eq!(label("target/debug/foo-bar"), "foo-bar");
+        // Both conditions: sixteen characters, all of them hex.
+        assert_eq!(
+            label("target/debug/tool-zzzzzzzzzzzzzzzz"),
+            "tool-zzzzzzzzzzzzzzzz"
+        );
+        assert_eq!(label("target/debug/app-abc123"), "app-abc123");
     }
 
     fn os(args: &[&str]) -> Vec<OsString> {

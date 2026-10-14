@@ -4261,7 +4261,7 @@ pub fn gc(
 
     let mut combined = crate::store::GcStats::default();
     let request = {
-        let _ticker = human_gc_output(json).then(|| term::Ticker::start("Running GC"));
+        let _ticker = term::Ticker::start("Running GC");
         crate::daemon::send_gc_request(config, max_age_hours)
     };
     match request {
@@ -5088,7 +5088,7 @@ pub fn clean(
     };
     let preview = dry_run || (json && !yes);
     let (mut targets, skipped, orphans) = {
-        let _ticker = (!json).then(|| term::Ticker::start("Measuring target directories"));
+        let _ticker = term::Ticker::start("Measuring target directories");
         if let Some(selection) = selection {
             tracked_target_entries(config, selection, preview)?
         } else {
@@ -5389,7 +5389,6 @@ fn remove_targets(
         *waiting = crate::target_use::holders(cache_dir);
         held_reason(waiting, kache_store::markers::now_epoch_secs())
     });
-    let mut held_back = 0usize;
     for target in to_remove {
         let rel = target.path.strip_prefix(root).unwrap_or(&target.path);
         let current_identity = directory_identity(&target.path);
@@ -5403,7 +5402,6 @@ fn remove_targets(
             continue;
         }
         if let Some(reason) = &held {
-            held_back += 1;
             skipped.push(CleanSkipped {
                 path: target.path.display().to_string(),
                 reason: reason.clone(),
@@ -5444,10 +5442,19 @@ fn remove_targets(
             }
         }
     }
-    if let Some(reason) = held.filter(|_| held_back > 0 && human_clean_output(quiet)) {
-        println!("  skipped {} — {reason}", target_count(held_back));
+    if let Some(line) = held_summary(held.as_deref(), skipped).filter(|_| human_clean_output(quiet))
+    {
+        println!("{line}");
     }
     (removed, estimated_reclaimed, apparent_gap)
+}
+
+/// The one line `--yes` prints for the targets it skipped because a running
+/// command held the lock: those in `skipped` with `held` as their reason.
+fn held_summary(held: Option<&str>, skipped: &[CleanSkipped]) -> Option<String> {
+    let held = held?;
+    let count = skipped.iter().filter(|item| item.reason == held).count();
+    (count > 0).then(|| format!("  skipped {} — {held}", target_count(count)))
 }
 
 /// Why clean skips every target now: the commands holding Kache's target

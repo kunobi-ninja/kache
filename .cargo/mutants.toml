@@ -257,6 +257,9 @@ exclude_globs = ["crates/kache-fs/src/apfs.rs", "src/fallback/macos.rs"]
 # `notice::deliver`, which picks terminal, stderr or log, stays in scope and
 # is tested with in-memory writers, refused writes and no terminal.
 exclude_re = [
+    # The progress ticker draws to an interactive stderr only, which tests do
+    # not have: its frames, elapsed text and terminal check are unobservable.
+    "src/term.rs:.*in Ticker::start(_if)?$",
     "src/notice.rs:.*replace show(_requested)? with \\(\\)",
     "src/notice.rs:.*replace terminal -> ",
     # `session_lock` and `advertised_login` compare an elapsed time against a

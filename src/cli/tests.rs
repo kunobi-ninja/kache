@@ -7261,6 +7261,23 @@ fn held_reason_names_each_command_and_how_long_it_ran() {
 }
 
 #[test]
+fn held_summary_counts_only_the_targets_the_lock_held_back() {
+    let skip = |reason: &str| CleanSkipped {
+        path: "/t".to_owned(),
+        reason: reason.to_owned(),
+        missing: false,
+    };
+    let held = "waiting for `cargo run` (pid 7, running 12 s) to exit";
+    let skipped = [skip(held), skip(TARGET_IN_USE), skip(held)];
+    assert_eq!(
+        held_summary(Some(held), &skipped).as_deref(),
+        Some(format!("  skipped 2 targets — {held}").as_str())
+    );
+    assert_eq!(held_summary(Some(held), &[skip(TARGET_IN_USE)]), None);
+    assert_eq!(held_summary(None, &skipped), None);
+}
+
+#[test]
 fn a_dry_run_names_targets_a_build_holds() {
     let root = tempfile::tempdir().unwrap();
     let busy = root.path().join("busy/target");

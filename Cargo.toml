@@ -134,6 +134,7 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
 kache-store = { version = "1.2.1", path = "crates/kache-store", features = ["test-support"] }
 kache-fs = { version = "1.2.1", path = "crates/kache-fs", features = ["testing"] }
 assert_cmd = "2"

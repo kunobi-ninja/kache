@@ -58,12 +58,19 @@ pub(crate) async fn push_timeline(
         .build()
         .context("building the timeline client")?;
 
+    let deadline = tokio::time::Instant::now() + push_timeout(config);
+    let bearer = crate::planner_auth::bearer(config, deadline).await;
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    if remaining.is_zero() {
+        anyhow::bail!("timeline timeout spent before the request could be sent");
+    }
     let mut request = client
         .post(build_timelines_url(&config.endpoint))
+        .timeout(remaining)
         .header(reqwest::header::CONTENT_TYPE, "application/json")
         .header(reqwest::header::CONTENT_ENCODING, "zstd")
         .body(encode_record(record)?);
-    if let Some(token) = config.token.as_deref() {
+    if let Some(token) = bearer {
         request = request.bearer_auth(token);
     }
 
@@ -181,6 +188,153 @@ mod tests {
         assert_eq!(service_error("  ", &status), "Payload Too Large");
     }
 
+    /// The variables a child needs to reach the network after `env_clear`:
+    /// Winsock fails without `SystemRoot`, and the Nix sandbox's only trust
+    /// store is `SSL_CERT_FILE`.
+    fn platform_env() -> impl Iterator<Item = (&'static str, std::ffi::OsString)> {
+        ["SystemRoot", "windir", "SSL_CERT_FILE", "SSL_CERT_DIR"]
+            .into_iter()
+            .filter_map(|key| std::env::var_os(key).map(|value| (key, value)))
+    }
+
+    async fn run_deadline_fixture(mode: &str) {
+        let root = tempfile::tempdir().unwrap();
+        let output = tokio::time::timeout(
+            Duration::from_secs(10),
+            tokio::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "timeline_client::tests::timeline_deadline_child_fixture",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env_clear()
+                .envs(platform_env())
+                .env("HOME", root.path())
+                .env("USERPROFILE", root.path())
+                .env("XDG_CONFIG_HOME", root.path())
+                .env("KUNOBI_CONFIG_DIR", root.path())
+                .env("TIMELINE_DEADLINE_CASE", mode)
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            output.status.success(),
+            "{mode}: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[tokio::test]
+    async fn exhausted_auth_does_not_dispatch_a_timeline() {
+        run_deadline_fixture("exhausted").await;
+    }
+
+    #[tokio::test]
+    async fn auth_and_timeline_share_one_timeout() {
+        run_deadline_fixture("delayed").await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[ignore = "isolated subprocess fixture for timeline authentication deadlines"]
+    async fn timeline_deadline_child_fixture() {
+        use axum::{
+            Json, Router,
+            routing::{get, post},
+        };
+        use std::sync::Arc;
+        use tokio::sync::Notify;
+
+        // Keep a runnable task while real loopback IO progresses: paused
+        // Tokio time must advance only at the explicit budget boundaries.
+        let awake = tokio::spawn(async {
+            loop {
+                tokio::task::yield_now().await;
+            }
+        });
+        let token_started = Arc::new(Notify::new());
+        let release_token = Arc::new(Notify::new());
+        let post_started = Arc::new(Notify::new());
+        let started = token_started.clone();
+        let release = release_token.clone();
+        let posted = post_started.clone();
+        let app = Router::new()
+            .route("/token", get(move || {
+                let started = started.clone();
+                let release = release.clone();
+                async move {
+                    started.notify_one();
+                    release.notified().await;
+                    Json(serde_json::json!({"value": "eyJhbGciOiJSUzI1NiJ9.eyJleHAiOjQxMDI0NDQ4MDB9.fixture-signature"}))
+                }
+            }))
+            .route("/v1/build-timelines", post(move || {
+                let posted = posted.clone();
+                async move {
+                    posted.notify_one();
+                    std::future::pending::<()>().await;
+                    Json(serde_json::json!({"stored": "inserted"}))
+                }
+            }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        // Only this exact ignored fixture runs in the child process. Neither
+        // its synthetic credentials nor its paused clock are shared with tests.
+        unsafe {
+            std::env::set_var("ACTIONS_ID_TOKEN_REQUEST_URL", format!("{base}/token"));
+            std::env::set_var("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "fixture-runtime");
+        }
+        let config = planner_config(&base, 750);
+        let value = record();
+        let push = push_timeline(&config, &value);
+        tokio::pin!(push);
+        tokio::select! {
+            answer = &mut push => panic!("upload ended before auth started: {answer:?}"),
+            () = post_started.notified() => panic!("the timeline was posted before auth started"),
+            () = token_started.notified() => {}
+        }
+        let mode = std::env::var("TIMELINE_DEADLINE_CASE").unwrap();
+        if mode == "delayed" {
+            tokio::time::advance(Duration::from_secs(8)).await;
+            release_token.notify_one();
+            tokio::select! {
+                answer = &mut push => panic!("upload ended before POST: {answer:?}"),
+                () = post_started.notified() => {}
+            }
+            tokio::time::advance(Duration::from_secs(23)).await;
+        } else {
+            assert_eq!(mode, "exhausted");
+            tokio::time::advance(Duration::from_secs(31)).await;
+        }
+        let error = match futures::poll!(push.as_mut()) {
+            std::task::Poll::Ready(Err(error)) => error,
+            answer => panic!("auth and upload must end within one 30-second budget: {answer:?}"),
+        };
+        if mode == "exhausted" {
+            assert_eq!(
+                error.to_string(),
+                "timeline timeout spent before the request could be sent"
+            );
+            let posted = post_started.notified();
+            tokio::pin!(posted);
+            assert!(futures::poll!(posted.as_mut()).is_pending());
+        } else {
+            assert!(
+                error.chain().any(|cause| cause
+                    .downcast_ref::<reqwest::Error>()
+                    .is_some_and(reqwest::Error::is_timeout)),
+                "{error:#}"
+            );
+        }
+        server.abort();
+        awake.abort();
+    }
+
     #[tokio::test]
     async fn a_record_is_posted_compressed_with_the_bearer_token() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -238,9 +392,10 @@ mod tests {
             socket.flush().await.unwrap();
         });
 
-        let error = push_timeline(&planner_config(&format!("http://{addr}"), 750), &record())
-            .await
-            .unwrap_err();
+        // This fixture isolates the service's refusal, without discovery traffic.
+        let mut config = planner_config(&format!("http://{addr}"), 750);
+        config.token = Some("fixture-explicit".to_string());
+        let error = push_timeline(&config, &record()).await.unwrap_err();
         let message = format!("{error:#}");
         assert!(message.contains("413"), "{message}");
         assert!(

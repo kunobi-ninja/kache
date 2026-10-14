@@ -4128,6 +4128,23 @@ fn diff_is_quiet_when_the_sessions_match() {
         .stdout(predicates::str::contains("misses 1 -> 1"));
 }
 
+/// A copy of the kache binary at `path`. On Unix a child process writes it,
+/// so no fork on another test thread holds a writable descriptor to it when
+/// it runs (ETXTBSY).
+fn copy_kache_binary(path: &Path) {
+    #[cfg(unix)]
+    {
+        let status = std::process::Command::new("/bin/cp")
+            .arg(KACHE_BIN)
+            .arg(path)
+            .status()
+            .unwrap();
+        assert!(status.success(), "copying {KACHE_BIN} failed: {status}");
+    }
+    #[cfg(not(unix))]
+    std::fs::copy(KACHE_BIN, path).unwrap();
+}
+
 /// Copying a release changes its mtime, not the daemon release it requires.
 #[test]
 fn same_release_copy_keeps_the_running_daemon() {
@@ -4154,7 +4171,7 @@ fn same_release_copy_keeps_the_running_daemon() {
     } else {
         "kache-copy"
     });
-    std::fs::copy(KACHE_BIN, &copied).unwrap();
+    copy_kache_binary(&copied);
     filetime::set_file_mtime(
         &copied,
         filetime::FileTime::from_unix_time(2_000_000_000, 0),

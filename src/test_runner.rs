@@ -38,7 +38,6 @@ const NEXTEST_WAIT: Duration = Duration::from_secs(120);
 /// gives Cargo.
 const RUN_FAILED: i32 = 101;
 
-
 const HELP: &str =
     "Run a test binary as Cargo's target runner, paced by the machine-wide scheduler";
 

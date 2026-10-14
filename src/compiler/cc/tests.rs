@@ -6923,6 +6923,24 @@ fn include_shadowing_keys_a_probe_beside_fallback_definitions() {
     ));
 }
 
+/// A probe that names its header through a macro tests a name only that
+/// macro's definition decides. The key cannot follow it, so the unit is
+/// refused.
+#[test]
+fn include_shadowing_refuses_a_probe_through_a_macro() {
+    for text in [
+        "#if __has_include(HEADER)\n#endif\n",
+        "#define HAS(h) __has_include_next(h)\n",
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let (parsed, source, _) = probing_unit(temp.path(), text);
+        assert!(
+            digest_cc_include_shadowing(&parsed, &[source]).is_err(),
+            "{text}: a probe through a macro must refuse the key"
+        );
+    }
+}
+
 #[test]
 fn include_dir_digest_changes_when_an_earlier_dir_gains_a_header() {
     let temp = tempfile::tempdir().unwrap();

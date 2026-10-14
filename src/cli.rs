@@ -6435,6 +6435,74 @@ fn is_doctor_issue(pass: bool, optional: bool) -> bool {
     !pass && !optional
 }
 
+/// Who repairs a Cargo `rustc-wrapper` that is not kache: `Some(true)` for
+/// `doctor --fix` (an sccache wrapper in $CARGO_HOME), `Some(false)` for
+/// `kache init` (unset or another wrapper there), `None` for a project
+/// config, which neither edits.
+fn cargo_wrapper_repair(
+    value: &str,
+    path: &std::path::Path,
+    cargo_home: &std::path::Path,
+) -> Option<bool> {
+    let dir = path.parent()?;
+    let same = dir == cargo_home
+        || matches!(
+            (dir.canonicalize(), cargo_home.canonicalize()),
+            (Ok(dir), Ok(home)) if dir == home
+        );
+    same.then(|| is_sccache_program(value))
+}
+
+/// The JSON `next` for doctor: `doctor --fix` only when it repairs one of the
+/// failing checks, `kache init` when init does.
+fn doctor_next_actions(
+    failed: &[&str],
+    fix_repairs: &[&str],
+    init_repairs: &[&str],
+) -> Vec<crate::machine::NextAction> {
+    let repaired_by = |repairs: &[&str]| {
+        failed
+            .iter()
+            .copied()
+            .filter(|label| repairs.contains(label))
+            .collect::<Vec<_>>()
+    };
+    let mut next = Vec::new();
+    let by_fix = repaired_by(fix_repairs);
+    if !by_fix.is_empty() {
+        next.push(crate::machine::NextAction {
+            argv: vec!["kache".into(), "doctor".into(), "--fix".into()],
+            why: format!("repairs: {}", by_fix.join(", ")),
+        });
+    }
+    let by_init = repaired_by(init_repairs);
+    if !by_init.is_empty() {
+        next.push(crate::machine::NextAction {
+            argv: vec!["kache".into(), "init".into()],
+            why: format!("sets up: {}", by_init.join(", ")),
+        });
+    }
+    next
+}
+
+/// Wording for the "Config file" check, as `(pass, detail, fix hint)`.
+fn doctor_config_file_check(
+    path: &std::path::Path,
+    exists: bool,
+    problem: Option<&str>,
+) -> (bool, String, Option<String>) {
+    let shown = crate::wrapper_config::display_path(path);
+    match problem {
+        Some(reason) => (
+            false,
+            format!("{shown} is ignored: {reason}"),
+            Some("fix the file; until then every kache command uses the defaults".into()),
+        ),
+        None if exists => (true, shown, None),
+        None => (true, format!("{shown} (not created; defaults apply)"), None),
+    }
+}
+
 /// Labels of the daemon-related checks that become informational when the
 /// daemon is optional. Kept in sync with the check constructions in
 /// [`doctor`]; module-level so the disposition logic below is unit-testable.
@@ -6881,54 +6949,77 @@ pub fn doctor(
         },
     });
 
+    // Failing checks `doctor --fix` and `kache init` can repair, for the JSON
+    // `next` suggestion.
+    let mut fix_repairs: Vec<&'static str> = Vec::new();
+    let mut init_repairs: Vec<&'static str> = Vec::new();
+    let mut note_wrapper_repair = |label: &'static str, value: &str, path: &std::path::Path| {
+        if let Some(by_fix) = cargo_wrapper_repair(value, path, &cargo_home_dir()) {
+            if by_fix {
+                fix_repairs.push(label);
+            } else {
+                init_repairs.push(label);
+            }
+        }
+    };
+
     // 2. RUSTC_WRAPPER
-    let (wrapper_pass, wrapper_detail, wrapper_fix) =
-        match crate::wrapper_config::resolve_wrapper_setting() {
-            Some(crate::wrapper_config::WrapperSetting::Environment { value })
-                if value.contains("kache") =>
-            {
-                (true, "kache via env".into(), None)
-            }
-            Some(crate::wrapper_config::WrapperSetting::Environment { value })
-                if value.contains("sccache") =>
-            {
-                (
-                    false,
-                    format!("sccache ({value})"),
-                    Some("export RUSTC_WRAPPER=kache".into()),
-                )
-            }
-            Some(crate::wrapper_config::WrapperSetting::Environment { value }) => (
+    let wrapper_setting = crate::wrapper_config::resolve_wrapper_setting();
+    match &wrapper_setting {
+        Some(crate::wrapper_config::WrapperSetting::CargoConfig { value, path })
+            if !value.contains("kache") =>
+        {
+            note_wrapper_repair("RUSTC_WRAPPER", value, path)
+        }
+        None => note_wrapper_repair("RUSTC_WRAPPER", "", &cargo_config_target_path()),
+        _ => {}
+    }
+    let (wrapper_pass, wrapper_detail, wrapper_fix) = match wrapper_setting {
+        Some(crate::wrapper_config::WrapperSetting::Environment { value })
+            if value.contains("kache") =>
+        {
+            (true, "kache via env".into(), None)
+        }
+        Some(crate::wrapper_config::WrapperSetting::Environment { value })
+            if value.contains("sccache") =>
+        {
+            (
                 false,
-                format!("{value} (not kache)"),
+                format!("sccache ({value})"),
                 Some("export RUSTC_WRAPPER=kache".into()),
-            ),
-            Some(crate::wrapper_config::WrapperSetting::CargoConfig { value, path })
-                if value.contains("kache") =>
-            {
-                (
-                    true,
-                    format!("kache via {}", crate::wrapper_config::display_path(&path)),
-                    None,
-                )
-            }
-            Some(crate::wrapper_config::WrapperSetting::CargoConfig { value, path }) => (
-                false,
-                format!("{value} in {}", crate::wrapper_config::display_path(&path)),
-                Some(format!(
-                    "replace `rustc-wrapper = \"{value}\"` with `rustc-wrapper = \"kache\"` in {}",
-                    path.display()
-                )),
-            ),
-            None => (
-                false,
-                "not set".into(),
-                Some(format!(
-                    "set `build.rustc-wrapper = \"kache\"` in {} or export RUSTC_WRAPPER=kache",
-                    cargo_config_target_path().display()
-                )),
-            ),
-        };
+            )
+        }
+        Some(crate::wrapper_config::WrapperSetting::Environment { value }) => (
+            false,
+            format!("{value} (not kache)"),
+            Some("export RUSTC_WRAPPER=kache".into()),
+        ),
+        Some(crate::wrapper_config::WrapperSetting::CargoConfig { value, path })
+            if value.contains("kache") =>
+        {
+            (
+                true,
+                format!("kache via {}", crate::wrapper_config::display_path(&path)),
+                None,
+            )
+        }
+        Some(crate::wrapper_config::WrapperSetting::CargoConfig { value, path }) => (
+            false,
+            format!("{value} in {}", crate::wrapper_config::display_path(&path)),
+            Some(format!(
+                "replace `rustc-wrapper = \"{value}\"` with `rustc-wrapper = \"kache\"` in {}",
+                path.display()
+            )),
+        ),
+        None => (
+            false,
+            "not set".into(),
+            Some(format!(
+                "set `build.rustc-wrapper = \"kache\"` in {} or export RUSTC_WRAPPER=kache",
+                cargo_config_target_path().display()
+            )),
+        ),
+    };
     checks.push(Check {
         label: "RUSTC_WRAPPER",
         pass: wrapper_pass,
@@ -6937,8 +7028,13 @@ pub fn doctor(
     });
 
     // 3. Cargo config
-    let (cargo_pass, cargo_detail, cargo_fix) = match crate::wrapper_config::cargo_wrapper_setting()
+    let cargo_setting = crate::wrapper_config::cargo_wrapper_setting();
+    if let Some((value, path)) = &cargo_setting
+        && !value.contains("kache")
     {
+        note_wrapper_repair("Cargo config", value, path);
+    }
+    let (cargo_pass, cargo_detail, cargo_fix) = match cargo_setting {
         Some((value, path)) if value.contains("kache") => (
             true,
             format!("kache in {}", crate::wrapper_config::display_path(&path)),
@@ -6968,11 +7064,31 @@ pub fn doctor(
     #[cfg(not(unix))]
     let rustdoc_path_ok = false;
     let (doc_pass, doc_class) = rustdoc_doctor_fields(cfg!(unix), rustdoc_value, rustdoc_path_ok);
+    if !doc_pass {
+        init_repairs.push("cargo doc");
+    }
     checks.push(Check {
         label: "cargo doc",
         pass: doc_pass,
         detail: doc_class.to_string(),
         fix: rustdoc_doctor_fix(doc_pass),
+    });
+
+    // 3a. The kache config file. One that does not parse is ignored
+    // everywhere, so every command runs on defaults.
+    let config_path = crate::config::resolve_config_path();
+    let (config_pass, config_detail, config_fix) = doctor_config_file_check(
+        &config_path,
+        config_path.exists(),
+        crate::config::unusable_config_file()
+            .map(|(_, reason)| reason)
+            .as_deref(),
+    );
+    checks.push(Check {
+        label: "Config file",
+        pass: config_pass,
+        detail: config_detail,
+        fix: config_fix,
     });
 
     // 3b. Host config layer
@@ -7138,7 +7254,7 @@ pub fn doctor(
             label: "Shell config",
             pass: false,
             detail: format!("sccache references in {}", rc_issues.join(", ")),
-            fix: Some("run `kache doctor --fix` to clean up".into()),
+            fix: Some("update or remove those lines; `kache doctor --fix` lists them".into()),
         });
     }
 
@@ -7156,6 +7272,7 @@ pub fn doctor(
                 fix: None,
             });
         } else {
+            fix_repairs.push("sccache");
             checks.push(Check {
                 label: "sccache",
                 pass: false,
@@ -7204,6 +7321,9 @@ pub fn doctor(
             my_version,
             &crate::service::startup_log(cfg).to_string(),
         );
+        if !pass && is_stale(&stats) {
+            fix_repairs.push("Daemon version");
+        }
         checks.push(Check {
             label: "Daemon version",
             pass,
@@ -7353,14 +7473,12 @@ pub fn doctor(
             issues: usize,
             checks: Vec<CheckBody>,
         }
-        let next = if doctor_has_issues(issues) {
-            vec![crate::machine::NextAction {
-                argv: vec!["kache".into(), "doctor".into(), "--fix".into()],
-                why: "one or more required checks failed".into(),
-            }]
-        } else {
-            Vec::new()
-        };
+        let failed: Vec<&str> = checks
+            .iter()
+            .filter(|c| is_doctor_issue(c.pass, check_is_optional(c.label)))
+            .map(|c| c.label)
+            .collect();
+        let next = doctor_next_actions(&failed, &fix_repairs, &init_repairs);
         crate::machine::emit(
             "doctor",
             Body {
@@ -7565,6 +7683,28 @@ fn doctor_has_issues(issues: usize) -> bool {
     issues > 0
 }
 
+/// Replace an sccache `build.rustc-wrapper` in the Cargo config at `path`
+/// with kache, as `kache init` writes it, after backing the file up. Nothing
+/// else in the file changes. Returns the wrapper it replaced.
+fn migrate_cargo_wrapper(path: &std::path::Path) -> Result<Option<String>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let plan = plan_cargo_wrapper_edit(path)?;
+    let CargoWrapperPlan::Replace(old) = &plan else {
+        return Ok(None);
+    };
+    if !is_sccache_program(old) {
+        return Ok(None);
+    }
+    let existing = std::fs::read_to_string(path)?;
+    let updated = apply_cargo_wrapper_edit(&existing, &plan);
+    ensure_cargo_wrapper_is_kache(&updated, path)?;
+    back_up_cargo_config(path, &existing)?;
+    std::fs::write(path, updated).with_context(|| format!("writing {}", path.display()))?;
+    Ok(Some(old.clone()))
+}
+
 /// Migrate from sccache to kache (called by `doctor --fix`).
 fn migrate(purge_sccache: bool) -> Result<()> {
     let home = dirs::home_dir().unwrap_or_default();
@@ -7583,19 +7723,17 @@ fn migrate(purge_sccache: bool) -> Result<()> {
         actions.push("Stopped sccache daemon".into());
     }
 
-    // 2. Replace sccache in $CARGO_HOME/config.toml (fallback to ~/.cargo)
+    // 2. Point an sccache `build.rustc-wrapper` in $CARGO_HOME at kache.
     let cargo_dir = cargo_home_dir();
     for name in ["config.toml", "config"] {
         let cargo_config = cargo_dir.join(name);
-        if let Ok(content) = std::fs::read_to_string(&cargo_config)
-            && content.contains("sccache")
-        {
-            let new_content = content.replace("sccache", "kache");
-            std::fs::write(&cargo_config, new_content)?;
-            actions.push(format!(
-                "Replaced sccache with kache in {}",
+        match migrate_cargo_wrapper(&cargo_config) {
+            Ok(Some(old)) => actions.push(format!(
+                "Replaced rustc-wrapper {old} with kache in {}",
                 cargo_config.display()
-            ));
+            )),
+            Ok(None) => {}
+            Err(error) => println!("  Could not update {}: {error:#}", cargo_config.display()),
         }
     }
 
@@ -7664,52 +7802,61 @@ fn migrate(purge_sccache: bool) -> Result<()> {
         }
     }
 
-    // Print summary
-    println!("\nMigration summary:");
+    print!(
+        "{}",
+        migration_summary(&actions, &rc_changes, purge_sccache)
+    );
+    Ok(())
+}
+
+/// What `doctor --fix` did and what is left for the user, as printed text.
+fn migration_summary(
+    actions: &[String],
+    rc_changes: &[(String, Vec<(usize, String)>)],
+    purge_sccache: bool,
+) -> String {
+    use std::fmt::Write;
+    let mut out = String::from("\nMigration summary:\n");
     if actions.is_empty() && rc_changes.is_empty() {
-        println!("  No sccache configuration found. Nothing to migrate.");
-        println!("\n  If RUSTC_WRAPPER isn't set yet, add to ~/.zshrc:");
-        println!("    export RUSTC_WRAPPER=kache");
-        return Ok(());
+        out.push_str("  No sccache configuration found. Nothing to migrate.\n");
+        out.push_str("\n  If Cargo is not using kache yet, run: kache init\n");
+        return out;
     }
 
-    for action in &actions {
-        println!("  ✓ {action}");
+    for action in actions {
+        let _ = writeln!(out, "  ✓ {action}");
     }
 
     if !rc_changes.is_empty() {
-        println!("\n  Manual changes needed in shell rc files:");
-        for (rc, lines) in &rc_changes {
-            println!("\n  ~/{rc}:");
+        out.push_str("\n  Manual changes needed in shell rc files:\n");
+        for (rc, lines) in rc_changes {
+            let _ = writeln!(out, "\n  ~/{rc}:");
             for (line_num, line) in lines {
                 let trimmed = line.trim();
                 if trimmed.starts_with("export RUSTC_WRAPPER") {
                     // RUSTC_WRAPPER line → replace with kache
-                    println!("    line {line_num}:");
-                    println!("      - {line}");
-                    println!("      + export RUSTC_WRAPPER=kache");
+                    let _ = writeln!(out, "    line {line_num}:\n      - {line}");
+                    out.push_str("      + export RUSTC_WRAPPER=kache\n");
                 } else if trimmed.starts_with("export SCCACHE_") {
                     // SCCACHE_* env vars → remove (not relevant to kache)
-                    println!("    line {line_num}: (remove)");
-                    println!("      - {line}");
+                    let _ = writeln!(out, "    line {line_num}: (remove)\n      - {line}");
                 } else {
                     // Other sccache references → flag for manual review
-                    println!("    line {line_num}: (review)");
-                    println!("      {line}");
+                    let _ = writeln!(out, "    line {line_num}: (review)\n      {line}");
                 }
             }
         }
-        println!("\n  After editing, run: source ~/.zshrc");
+        out.push_str("\n  After editing, open a new terminal so the changes apply.\n");
     }
 
     if !purge_sccache {
-        println!(
-            "\n  Tip: run `kache doctor --fix --purge-sccache` to also remove sccache cache and binary"
+        out.push_str(
+            "\n  Tip: run `kache doctor --fix --purge-sccache` to also remove sccache cache and binary\n",
         );
     }
 
-    println!("\n  Then verify with: kache doctor");
-    Ok(())
+    out.push_str("\n  Then verify with: kache doctor\n");
+    out
 }
 
 /// Synchronize the local cache with its remote: pull missing artifacts, push new ones.
@@ -9459,6 +9606,23 @@ pub(crate) fn rustdoc_doctor_fields(
     }
 }
 
+/// Refuse an edit that did not leave `build.rustc-wrapper = "kache"`: the
+/// formatting-preserving editor cannot replace every way of writing the old
+/// value.
+fn ensure_cargo_wrapper_is_kache(updated: &str, cargo_path: &std::path::Path) -> Result<()> {
+    let parsed: toml::Value = toml::from_str(updated)?;
+    anyhow::ensure!(
+        parsed
+            .get("build")
+            .and_then(|v| v.get("rustc-wrapper"))
+            .and_then(toml::Value::as_str)
+            == Some("kache"),
+        "could not update Cargo's existing wrapper; edit {} manually",
+        cargo_path.display()
+    );
+    Ok(())
+}
+
 /// Keep a copy of the Cargo config beside it before init edits it.
 fn back_up_cargo_config(cargo_path: &std::path::Path, existing: &str) -> Result<()> {
     use std::io::Write;
@@ -9869,18 +10033,7 @@ pub fn init(yes: bool, no_service: bool, no_shell: bool, check: bool) -> Result<
         } {
             let wrapped = apply_cargo_wrapper_edit(&existing, &plan);
             let updated = crate::cargo_env::apply_cargo_env_edit(&wrapped, &env_missing);
-            // Do not report success if a nonstandard existing wrapper could
-            // not be replaced by the formatting-preserving editor.
-            let parsed: toml::Value = toml::from_str(&updated)?;
-            anyhow::ensure!(
-                parsed
-                    .get("build")
-                    .and_then(|v| v.get("rustc-wrapper"))
-                    .and_then(toml::Value::as_str)
-                    == Some("kache"),
-                "could not update Cargo's existing wrapper; edit {} manually",
-                cargo_path.display()
-            );
+            ensure_cargo_wrapper_is_kache(&updated, &cargo_path)?;
             if let Some(parent) = cargo_path.parent() {
                 std::fs::create_dir_all(parent)?;
             }

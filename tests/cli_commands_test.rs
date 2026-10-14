@@ -392,6 +392,47 @@ fn completions_work_with_broken_config() {
         .stdout(predicates::str::contains("#compdef"));
 }
 
+#[test]
+fn broken_config_warns_once_on_stderr_and_keeps_json_clean() {
+    let e = env();
+    let config = e.cache.join("config.toml");
+    std::fs::write(&config, "[cache]\nlocal_max_size = = \"1GiB\"\n").unwrap();
+    let output = e.cmd().args(["--json", "stats"]).output().unwrap();
+    assert!(output.status.success());
+    let _: serde_json::Value = serde_json::from_slice(&output.stdout).expect("clean JSON");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert_eq!(stderr.matches("warning:").count(), 1, "{stderr}");
+    assert!(stderr.contains(&config.display().to_string()), "{stderr}");
+    assert!(stderr.contains("line 2"), "{stderr}");
+}
+
+#[test]
+fn doctor_fails_on_a_config_that_does_not_parse() {
+    let e = env();
+    let config = e.cache.join("config.toml");
+    std::fs::write(&config, "[cache\n").unwrap();
+    let output = e.cmd().args(["--json", "doctor"]).output().unwrap();
+    assert!(output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("ignoring"),
+        "doctor reports it as a check: {stderr}"
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let check = value["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["label"] == "Config file")
+        .expect("a Config file check");
+    assert_eq!(check["pass"], false, "{check}");
+    assert!(
+        check["detail"].as_str().unwrap().contains("config.toml"),
+        "{check}"
+    );
+    assert!(value["issues"].as_u64().unwrap() >= 1, "{value}");
+}
+
 // ── empty-cache behavior ────────────────────────────────────────────────────
 
 #[test]

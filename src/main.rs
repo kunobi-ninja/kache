@@ -304,7 +304,7 @@ enum Commands {
     /// Diagnose setup issues and verify cache integrity
     #[command(display_order = 2)]
     Doctor {
-        /// Auto-fix issues (migrate from sccache, repair config)
+        /// Migrate from sccache (Cargo wrapper, running server) and restart a daemon older than this binary
         #[arg(long)]
         fix: bool,
 
@@ -1059,6 +1059,16 @@ fn run_cli(cli: Cli, readiness: Option<kunobi_daemon::readiness::channel::Notifi
     }
 
     let (config, config_provenance) = config::Config::load_with_provenance()?;
+    // Doctor reports this as a failing check instead.
+    if !matches!(cli.command, Some(Commands::Doctor { .. }))
+        && let Some((path, reason)) = config::unusable_config_file()
+    {
+        eprintln!(
+            "{} ignoring {}: {reason}. Using the defaults.",
+            term::paint("warning:", term::Style::Warning),
+            path.display()
+        );
+    }
 
     match cli.command {
         Some(Commands::List {
@@ -2197,6 +2207,21 @@ mod tests {
         for hidden in ["install-shims", "diff"] {
             assert!(Cli::try_parse_from(["kache", hidden]).is_ok(), "{hidden}");
         }
+    }
+
+    #[test]
+    fn doctor_fix_help_names_only_what_fix_does() {
+        use clap::CommandFactory;
+        let mut command = Cli::command();
+        let doctor = command.find_subcommand_mut("doctor").unwrap();
+        let fix = doctor
+            .get_arguments()
+            .find(|arg| arg.get_id() == "fix")
+            .and_then(|arg| arg.get_help())
+            .unwrap()
+            .to_string();
+        assert!(fix.contains("sccache") && fix.contains("daemon"), "{fix}");
+        assert!(!fix.contains("repair config"), "{fix}");
     }
 
     #[test]

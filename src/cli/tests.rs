@@ -3115,6 +3115,124 @@ fn test_cargo_wrapper_edit_replace_quote_styles_and_miss() {
 }
 
 #[test]
+fn doctor_fix_changes_only_an_sccache_wrapper_and_keeps_a_backup() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let source = "# sccache since 2023\n[build]\nrustc-wrapper = \"/opt/homebrew/bin/sccache\" # mine\njobs = 4\n\n[env]\nSCCACHE_DIR = \"/data/sccache\"\n";
+    fs::write(&path, source).unwrap();
+
+    let replaced = migrate_cargo_wrapper(&path).unwrap();
+
+    assert_eq!(replaced.as_deref(), Some("/opt/homebrew/bin/sccache"));
+    assert_eq!(
+        fs::read_to_string(&path).unwrap(),
+        source.replace("\"/opt/homebrew/bin/sccache\"", "\"kache\"")
+    );
+    let backups: Vec<String> = fs::read_dir(dir.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|backup| backup != &path)
+        .map(|backup| fs::read_to_string(backup).unwrap())
+        .collect();
+    assert_eq!(backups, [source]);
+}
+
+#[test]
+fn doctor_fix_leaves_other_cargo_configs_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    for source in [
+        "[build]\nrustc-wrapper = \"other-wrapper\"\n# sccache was here\n",
+        "[build]\njobs = 2\n[env]\nSCCACHE_DIR = \"/data/sccache\"\n",
+        "[build\nrustc-wrapper = \"sccache\"\n",
+    ] {
+        fs::write(&path, source).unwrap();
+        assert!(matches!(migrate_cargo_wrapper(&path), Ok(None) | Err(_)));
+        assert_eq!(fs::read_to_string(&path).unwrap(), source);
+    }
+    assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1, "no backups");
+}
+
+#[test]
+fn migrate_with_nothing_to_do_points_at_init() {
+    let summary = migration_summary(&[], &[], false);
+    assert!(summary.contains("kache init"), "{summary}");
+    assert!(!summary.contains(".zshrc"), "{summary}");
+
+    let rc = vec![(
+        ".bashrc".to_string(),
+        vec![(3, "export RUSTC_WRAPPER=sccache".to_string())],
+    )];
+    let summary = migration_summary(&[], &rc, true);
+    assert!(
+        summary.contains("+ export RUSTC_WRAPPER=kache"),
+        "{summary}"
+    );
+    assert!(!summary.contains("source ~/.zshrc"), "{summary}");
+}
+
+#[test]
+fn doctor_suggests_fix_only_for_failures_fix_repairs() {
+    let argv = |next: &[crate::machine::NextAction]| {
+        next.iter()
+            .map(|action| action.argv.join(" "))
+            .collect::<Vec<_>>()
+    };
+    assert!(doctor_next_actions(&["Remote access", "Config file"], &[], &[]).is_empty());
+    assert_eq!(
+        argv(&doctor_next_actions(
+            &["Cargo config", "Daemon version"],
+            &["Cargo config", "Daemon version"],
+            &[],
+        )),
+        ["kache doctor --fix"]
+    );
+    assert_eq!(
+        argv(&doctor_next_actions(
+            &["RUSTC_WRAPPER", "cargo doc"],
+            &[],
+            &["RUSTC_WRAPPER", "cargo doc"]
+        )),
+        ["kache init"]
+    );
+    // A repair for a check that passed is not a reason to run anything.
+    assert!(doctor_next_actions(&["Remote access"], &["sccache"], &["cargo doc"]).is_empty());
+}
+
+#[test]
+fn cargo_wrapper_repair_names_fix_for_sccache_and_init_otherwise() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("cargo-home");
+    let project = dir.path().join("project/.cargo");
+    let in_home = home.join("config.toml");
+    assert_eq!(cargo_wrapper_repair("sccache", &in_home, &home), Some(true));
+    assert_eq!(
+        cargo_wrapper_repair("/usr/local/bin/sccache", &in_home, &home),
+        Some(true)
+    );
+    assert_eq!(cargo_wrapper_repair("other", &in_home, &home), Some(false));
+    assert_eq!(cargo_wrapper_repair("", &in_home, &home), Some(false));
+    assert_eq!(
+        cargo_wrapper_repair("sccache", &project.join("config.toml"), &home),
+        None
+    );
+}
+
+#[test]
+fn doctor_config_file_check_fails_on_a_file_that_does_not_parse() {
+    let path = std::path::Path::new("/etc/elsewhere/kache.toml");
+    let (pass, detail, fix) =
+        doctor_config_file_check(path, true, Some("TOML parse error at line 2, column 3: x"));
+    assert!(!pass);
+    assert!(detail.contains("/etc/elsewhere/kache.toml"), "{detail}");
+    assert!(detail.contains("line 2"), "{detail}");
+    assert!(fix.unwrap().contains("defaults"));
+
+    assert!(doctor_config_file_check(path, true, None).0);
+    assert!(doctor_config_file_check(path, false, None).0);
+}
+
+#[test]
 fn test_cargo_wrapper_edit_add_under_build() {
     let existing = "[build]\njobs = 4\n";
     let plan = CargoWrapperPlan::AddUnderBuild;

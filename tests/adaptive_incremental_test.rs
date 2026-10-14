@@ -909,6 +909,41 @@ fn user_facing_executable_preserves_configured_fallback_contract() {
         event["fallback"].as_bool().unwrap_or(false),
         "event: {event:#}"
     );
+
+    // Direct rustc callers may omit --crate-type; rustc still defaults to bin.
+    fs::remove_file(&fallback_marker).unwrap();
+    let output = hermetic_command(
+        kache_binary(),
+        cache.path(),
+        Some(&project.path().join("missing-kache.toml")),
+    )
+    .args([
+        "rustc",
+        "--crate-name",
+        "adaptive_fixture",
+        "src/main.rs",
+        "--out-dir",
+        "target",
+    ])
+    .current_dir(project.path())
+    .env("KACHE_CACHE_EXECUTABLES", "0")
+    .env("KACHE_ADAPTIVE_INCREMENTAL", "0")
+    .env("KACHE_FALLBACK", &fallback)
+    .env("FALLBACK_MARKER", &fallback_marker)
+    .output()
+    .expect("failed to build default-bin executable fixture");
+    assert!(
+        output.status.success(),
+        "default-bin build failed: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        fallback_marker.exists(),
+        "default-bin invocation bypassed the configured fallback"
+    );
+    let event = only_new_event(cache.path(), 1);
+    assert_passthrough(&event, "user-facing executable");
+    assert_eq!(event["fallback"], true, "event: {event:#}");
 }
 
 #[test]

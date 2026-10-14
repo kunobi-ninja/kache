@@ -10043,7 +10043,10 @@ fn checked_rustdoc_edit(existing: &str, shim_path: &str) -> Result<String> {
         .get_mut("build")
         .and_then(toml::Value::as_table_mut)
         .context("Cargo config has no build table")?;
-    build.insert("rustdoc".to_string(), toml::Value::String(shim_path.to_string()));
+    build.insert(
+        "rustdoc".to_string(),
+        toml::Value::String(shim_path.to_string()),
+    );
     let actual: toml::Value = toml::from_str(&updated)?;
     anyhow::ensure!(
         actual == expected,

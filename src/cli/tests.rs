@@ -3016,7 +3016,10 @@ fn apply_rustdoc_edit_preserves_commented_table_boundaries() {
     assert_eq!(parsed["env"]["rustdoc"].as_str(), Some("keep"));
     assert!(edited.contains("[build] # compiler settings"));
     assert!(edited.contains("[env] # retained environment"));
-    assert_eq!(checked_rustdoc_edit(&edited, "/shim/rustdoc").unwrap(), edited);
+    assert_eq!(
+        checked_rustdoc_edit(&edited, "/shim/rustdoc").unwrap(),
+        edited
+    );
 }
 
 #[test]

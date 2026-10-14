@@ -21,6 +21,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::num::NonZeroU64;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -690,7 +691,7 @@ struct FlightOutcome<T> {
 }
 
 struct FlightsState<T> {
-    flights: HashMap<String, Arc<Flight<T>>>,
+    flights: HashMap<PathBuf, Arc<Flight<T>>>,
 }
 
 /// Bounded keyed singleflight used around the complete first-miss path. The
@@ -709,7 +710,7 @@ pub(crate) enum SingleflightClaim<T> {
 
 pub(crate) struct SingleflightLeader<T> {
     state: Arc<Mutex<FlightsState<T>>>,
-    key: String,
+    key: PathBuf,
     flight: Arc<Flight<T>>,
     completed: bool,
 }
@@ -728,7 +729,7 @@ impl<T> KeyedSingleflight<T> {
         }
     }
 
-    pub(crate) fn claim(&self, key: &str) -> SingleflightClaim<T> {
+    pub(crate) fn claim(&self, key: &Path) -> SingleflightClaim<T> {
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(flight) = state.flights.get(key) {
             return SingleflightClaim::Follower(SingleflightFollower {
@@ -745,10 +746,10 @@ impl<T> KeyedSingleflight<T> {
             }),
             notify: tokio::sync::Notify::new(),
         });
-        state.flights.insert(key.to_string(), Arc::clone(&flight));
+        state.flights.insert(key.to_path_buf(), Arc::clone(&flight));
         SingleflightClaim::Leader(SingleflightLeader {
             state: Arc::clone(&self.state),
-            key: key.to_string(),
+            key: key.to_path_buf(),
             flight,
             completed: false,
         })
@@ -1761,16 +1762,16 @@ mod tests {
     #[tokio::test]
     async fn bounded_singleflight_publishes_one_leader_result() {
         let flights = KeyedSingleflight::new(1);
-        let leader = match flights.claim(&key('a')) {
+        let leader = match flights.claim(Path::new(&key('a'))) {
             SingleflightClaim::Leader(leader) => leader,
             _ => panic!("first claimant must lead"),
         };
-        let follower = match flights.claim(&key('a')) {
+        let follower = match flights.claim(Path::new(&key('a'))) {
             SingleflightClaim::Follower(follower) => follower,
             _ => panic!("same key must follow"),
         };
         assert!(matches!(
-            flights.claim(&key('b')),
+            flights.claim(Path::new(&key('b'))),
             SingleflightClaim::AtCapacity
         ));
         leader.complete(7_u32);
@@ -1781,11 +1782,11 @@ mod tests {
     #[tokio::test]
     async fn singleflight_leader_drop_before_wait_never_loses_the_wakeup() {
         let flights = KeyedSingleflight::<u32>::new(1);
-        let leader = match flights.claim(&key('a')) {
+        let leader = match flights.claim(Path::new(&key('a'))) {
             SingleflightClaim::Leader(leader) => leader,
             _ => panic!("first claimant must lead"),
         };
-        let follower = match flights.claim(&key('a')) {
+        let follower = match flights.claim(Path::new(&key('a'))) {
             SingleflightClaim::Follower(follower) => follower,
             _ => panic!("same key must follow"),
         };

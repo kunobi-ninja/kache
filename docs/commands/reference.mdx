@@ -85,7 +85,7 @@ kache clean --orphans --yes
 kache clean ~/src --dry-run
 ```
 
-`clean` frees disk space. Without a directory it works from the target directories that builds through Kache used. It selects targets whose worktree or workspace has been deleted, and targets no build has used for 14 days. `--stale` changes that window; `--orphans` selects only deleted worktrees, however recently they were built. A workspace counts as deleted only while the directory that held it still exists, so an unmounted volume does not.
+`clean` frees disk space. Without a directory it works from the target directories that builds through Kache used. It selects targets whose worktree or workspace has been deleted, and targets no build has used for 14 days. `--stale` changes that window and takes the same forms as `kache stats --since`; a value under an hour counts as one hour. `--orphans` selects only deleted worktrees, however recently they were built. A workspace counts as deleted only while the directory that held it still exists, so an unmounted volume does not.
 
 `--dry-run` lists what the clean would remove and every target it keeps: what deleting each frees, what it holds on disk, how long since a build used it, and what the daemon's next quiet pass would do to it. It ends with the cache's size and the command that removes the selection. The freeable estimate leaves out blocks a target shares with the store or with other hardlinks, so it is what the clean gives back. `--dry-run` also lists the default targets of sibling Git worktrees, marked "found through Git", but `kache clean` skips them because Kache has not seen a build use them.
 
@@ -309,7 +309,7 @@ kache stats --last-build --root "$PWD"
 
 Below the window's rows, a section starting with `Since` shows totals since kache began counting: compile time avoided and the number of hits, bytes restored by reflink or hardlink against bytes copied, and store bytes GC removed, split into automatic runs (the daemon and the auto-GC worker) and `kache gc` runs you started. The event log rotates by size, so each rotation adds the events it drops to `savings.json` in the cache dir, and each GC run that frees bytes adds them there too. The totals are that file plus the events the log still holds, and volume shards add their own GC totals. The section is left out until something is counted. A crash between a rotation and its update of `savings.json` loses those events from the totals; nothing is ever counted twice. A corrupt `savings.json` is moved to `savings.json.corrupt` and counting starts over; one written by a newer kache is left alone. `kache stats --json` carries the same figures in a `lifetime` object (`since`, `hits`, `hit_compile_time_ms`, `zero_copy_bytes`, `copied_bytes`, `pruned_automatic_bytes`, `pruned_requested_bytes`).
 
-`--since` accepts `s`, `m`, `h`, and `d` units (`90s`, `15m`, `2h`, `7d`). A bare number is hours. The default is `24h`. The counters and the `last ...` label both describe the requested window; a value that does not parse is an error.
+`--since` accepts `s`, `m`, `h`, and `d` units (`90s`, `15m`, `2h`, `7d`). A bare number is hours. The default is `24h`. The counters and the `last ...` label both describe the requested window. A value that does not parse, or 0, is an argument error.
 
 `--last-build` shows the detailed report for the latest recorded activity session. Add `--root` to choose a build tree; without it, the latest event across all roots chooses the session. It cannot be combined with `--since`. With `--json`, the stats envelope contains a `report` object using the build report schema below.
 
@@ -328,7 +328,7 @@ kache stats --format trace --output trace.json
 | Flag | Default | Values or purpose |
 | --- | --- | --- |
 | `--full` | off | The full report instead of the summary. `--format`, `--output`, `--top`, `--record`, and `--redact` imply it |
-| `--format` | `text` | `json`, `trace` (also `perfetto`, `chrome-trace`), `markdown` (`md`), `github` (`gh`), `text`. An unknown value prints text. `--json` gives `json`, and combining it with a format other than `json` or `text` is an error |
+| `--format` | `text` | `json`, `trace` (also `perfetto`, `chrome-trace`), `markdown` (`md`), `github` (`gh`), `text`. Any other value is an argument error. `--json` gives `json`, and combining it with a format other than `json` or `text` is an error |
 | `--since` | `24h` | Event window; same forms as `kache stats` (`15m`, `2h`, `7d`, bare hours) |
 | `--last-build` | off | Latest recorded activity session; conflicts with `--since` |
 | `--root` | all roots | Only events from that build tree and the trees below it. Remote transfers are left out because the transfer log records no root. On `stats` it needs `--full` or `--last-build` |
@@ -361,7 +361,7 @@ kache telemetry write ./cache-otlp
 kache telemetry write ./cache-otlp --scenario bench-firefox --phase warm
 ```
 
-Writes `metrics.otlp.json` and `schema_version` for Kartero. Metric names are `kache.cache.*` / `kache.prefetch.*` (scope `kache.cache`), never `kache.bench.*`. `--scenario` must match `kache.bench.project`. `--phase` is `cold`, `warm`, or `pull` so dumps from the same scenario do not collide. The rustc wrapper does not write these files.
+Writes `metrics.otlp.json` and `schema_version` for Kartero. Metric names are `kache.cache.*` / `kache.prefetch.*` (scope `kache.cache`), never `kache.bench.*`. `--scenario` must match `kache.bench.project`. `--phase` is `cold`, `warm-same-tree`, `warm`, or `pull` so dumps from the same scenario do not collide. The rustc wrapper does not write these files.
 
 The payload also carries this host's shared cache: registered blob bytes (`kache.cache.store.physical_size`), index and WAL size, and a rowid high-water mark per table (`kache.cache.index.*`; it is not a row count). `kache.cache.store.size` counts logical entry bytes; GC compares the physical blob figure with `kache.cache.store.max`. Last-run GC gauges include duration, pinned and unreclaimable entries, bytes held by target directories, failed evictions, stale WAL snapshot failures, and recently accessed entries skipped before reading their metadata. The read-only index probe has a 25 ms lock timeout; unavailable figures are omitted.
 

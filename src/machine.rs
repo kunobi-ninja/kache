@@ -108,9 +108,7 @@ pub fn emit_outcome<T: Serialize>(
         body,
         next,
     };
-    serde_json::to_writer_pretty(std::io::stdout(), &doc)?;
-    println!();
-    Ok(())
+    write_document(&mut std::io::stdout().lock(), &doc)
 }
 
 /// Failures use the same stdout document contract as successful commands.
@@ -129,9 +127,68 @@ pub(crate) fn emit_error(command: &str, code: &str, error: &anyhow::Error) -> Re
         body: NoBody {},
         next: Vec::new(),
     };
-    serde_json::to_writer_pretty(std::io::stdout(), &doc)?;
-    println!();
-    Ok(())
+    write_document(&mut std::io::stdout().lock(), &doc)
+}
+
+/// Pretty JSON and a newline, as one stdout document.
+fn write_document(out: &mut impl std::io::Write, doc: &impl Serialize) -> Result<()> {
+    serde_json::to_writer_pretty(&mut *out, doc)
+        .map_err(std::io::Error::from)
+        .and_then(|()| writeln!(out))
+        .and_then(|()| out.flush())
+        .map_err(stdout_error)
+}
+
+/// The reader of stdout went away, as with `kache --json --help | head`.
+/// Nothing more can be shown, and the reader already has what it wanted.
+#[derive(Debug)]
+pub(crate) struct StdoutClosed;
+
+impl std::fmt::Display for StdoutClosed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("stdout was closed")
+    }
+}
+
+impl std::error::Error for StdoutClosed {}
+
+/// A failed write to stdout, with a closed pipe told apart from other errors.
+pub(crate) fn stdout_error(error: std::io::Error) -> anyhow::Error {
+    if error.kind() == std::io::ErrorKind::BrokenPipe {
+        anyhow::Error::new(StdoutClosed)
+    } else {
+        anyhow::Error::new(error).context("writing to stdout")
+    }
+}
+
+/// An argument error found after clap parsed the command line: a value clap
+/// cannot check, or a combination of flags. It exits 2 with
+/// `invalid_arguments`, like the errors clap reports itself.
+#[derive(Debug)]
+pub(crate) struct InvalidArguments(pub String);
+
+impl std::fmt::Display for InvalidArguments {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for InvalidArguments {}
+
+pub(crate) fn invalid_arguments(message: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(InvalidArguments(message.into()))
+}
+
+/// How a failed command ends: its JSON error code and exit status. `None`
+/// when stdout was closed, which ends the command quietly with status 0.
+pub(crate) fn failure_exit(error: &anyhow::Error) -> Option<(&'static str, i32)> {
+    if error.chain().any(|cause| cause.is::<StdoutClosed>()) {
+        return None;
+    }
+    if error.chain().any(|cause| cause.is::<InvalidArguments>()) {
+        return Some(("invalid_arguments", 2));
+    }
+    Some(("command_failed", 1))
 }
 
 /// The command tree lets scripts discover syntax without parsing help prose.
@@ -401,6 +458,63 @@ mod tests {
 
         let totals = probe_store_blobs(dir.path());
         assert_eq!(totals.apparent_bytes, 7);
+    }
+
+    /// A writer that fails every write with one error kind.
+    struct Failing(std::io::ErrorKind);
+
+    impl std::io::Write for Failing {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(self.0.into())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(self.0.into())
+        }
+    }
+
+    #[test]
+    fn a_document_is_pretty_json_and_one_newline() {
+        let mut out = Vec::new();
+        write_document(&mut out, &serde_json::json!({ "a": 1 })).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "{\n  \"a\": 1\n}\n");
+    }
+
+    #[test]
+    fn a_closed_stdout_ends_quietly_and_other_write_errors_fail() {
+        let closed = write_document(
+            &mut Failing(std::io::ErrorKind::BrokenPipe),
+            &serde_json::json!({}),
+        )
+        .unwrap_err();
+        assert_eq!(failure_exit(&closed), None);
+        assert_eq!(failure_exit(&closed.context("emitting")), None);
+
+        let full = write_document(
+            &mut Failing(std::io::ErrorKind::StorageFull),
+            &serde_json::json!({}),
+        )
+        .unwrap_err();
+        assert_eq!(failure_exit(&full), Some(("command_failed", 1)));
+        assert!(
+            format!("{full:#}").contains("writing to stdout"),
+            "{full:#}"
+        );
+    }
+
+    #[test]
+    fn argument_errors_exit_two_and_others_one() {
+        let invalid = invalid_arguments("bad flag");
+        assert_eq!(invalid.to_string(), "bad flag");
+        assert_eq!(failure_exit(&invalid), Some(("invalid_arguments", 2)));
+        assert_eq!(
+            failure_exit(&invalid.context("parsing")),
+            Some(("invalid_arguments", 2))
+        );
+        assert_eq!(
+            failure_exit(&anyhow::anyhow!("disk on fire")),
+            Some(("command_failed", 1))
+        );
+        assert_eq!(StdoutClosed.to_string(), "stdout was closed");
     }
 
     #[test]

@@ -270,13 +270,123 @@ fn json_rejects_interactive_or_mutating_commands() {
     e.cmd()
         .args(["--json", "monitor"])
         .assert()
-        .failure()
-        .stderr(predicates::str::contains("is supported on"));
+        .code(2)
+        .stderr(predicates::str::contains("monitor` is interactive"));
+    e.cmd()
+        .args(["--json", "config"])
+        .assert()
+        .code(2)
+        .stderr(predicates::str::contains("config` is interactive"));
+    e.cmd()
+        .args(["--json", "purge"])
+        .assert()
+        .code(2)
+        .stderr(predicates::str::contains("kache purge"));
+    e.cmd()
+        .args(["--json", "sync"])
+        .assert()
+        .code(2)
+        .stderr(predicates::str::contains("is supported on"))
+        .stderr(predicates::str::contains("report").not())
+        .stderr(predicates::str::contains("targets").not());
     e.cmd()
         .args(["--json", "doctor", "--fix"])
         .assert()
-        .failure()
+        .code(2)
         .stderr(predicates::str::contains("reports diagnostics only"));
+}
+
+/// Argument errors kache finds after parsing exit 2 like clap's own, in
+/// human mode too.
+#[test]
+fn argument_errors_exit_two() {
+    let e = env();
+    for args in [
+        vec!["sync", "--pull", "--push"],
+        vec!["stats", "--format", "jsno"],
+        vec!["report", "--format", "html"],
+        vec!["list", "--sort", "sise"],
+        vec!["telemetry", "write", "out", "--phase", "hot"],
+        vec!["stats", "--since", "0"],
+        vec!["stats", "--root", "."],
+        vec!["clean", "--stale", "soon"],
+        vec!["gc", "--max-age", "soon"],
+    ] {
+        let output = e.cmd().args(&args).output().unwrap();
+        assert_eq!(output.status.code(), Some(2), "{args:?}: {output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.starts_with("error:"), "{args:?}: {stderr}");
+    }
+}
+
+#[test]
+fn stale_takes_the_since_forms() {
+    let e = env();
+    e.cmd()
+        .args(["clean", "--stale", "30m", "--dry-run"])
+        .assert()
+        .success();
+}
+
+/// `kache --json --help | head -c 10`: a reader that stops early is not an
+/// error.
+#[test]
+fn a_closed_stdout_ends_quietly() {
+    let e = env();
+    for args in [["--json", "--help"], ["--json", "list"]] {
+        let mut command = kache_process_as(Path::new(KACHE_BIN), &e.home, &e.cache);
+        command
+            .args(args)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let mut child = command.spawn().unwrap();
+        drop(child.stdout.take());
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(output.status.code(), Some(0), "{args:?}: {output:?}");
+        assert!(output.stderr.is_empty(), "{args:?}: {output:?}");
+    }
+}
+
+#[test]
+fn test_runner_explains_itself() {
+    let e = env();
+    for help in ["--help", "-h"] {
+        e.cmd()
+            .args(["test-runner", help])
+            .assert()
+            .success()
+            .stdout(predicates::str::contains("Usage: kache test-runner"));
+    }
+    e.cmd()
+        .arg("test-runner")
+        .assert()
+        .code(2)
+        .stderr(predicates::str::starts_with(
+            "error: expected a test binary to run",
+        ));
+}
+
+/// Each lifecycle command says what it found or did, and stopping a daemon
+/// that is not running is not an error.
+#[test]
+fn daemon_lifecycle_commands_say_what_happened() {
+    let e = env();
+    let run = |command: &str| {
+        let output = e.cmd().args(["daemon", command]).output().unwrap();
+        assert!(output.status.success(), "daemon {command}: {output:?}");
+        String::from_utf8_lossy(&output.stderr).into_owned()
+    };
+    assert!(run("stop").contains("daemon is not running"));
+    assert!(run("restart").contains("daemon started"));
+    let again = run("start");
+    assert!(
+        again.contains("daemon already running (version "),
+        "{again}"
+    );
+    assert!(!again.contains("daemon started"), "{again}");
+    assert!(run("restart").contains("daemon restarted"));
+    assert!(run("stop").contains("daemon stopped"));
+    assert!(run("stop").contains("daemon is not running"));
 }
 
 #[cfg(unix)]
@@ -1176,15 +1286,42 @@ fn json_failures_emit_one_document_and_nonzero_exit() {
         ),
         (
             vec!["stats", "--json", "--since", "soon"],
-            1,
-            "command_failed",
+            2,
+            "invalid_arguments",
         ),
-        (vec!["init", "--json"], 1, "command_failed"),
-        (vec!["monitor", "--json"], 1, "command_failed"),
+        (
+            vec!["stats", "--json", "--since", "0"],
+            2,
+            "invalid_arguments",
+        ),
+        (
+            vec!["clean", "--json", "--stale", "soon"],
+            2,
+            "invalid_arguments",
+        ),
+        (
+            vec!["gc", "--json", "--max-age", "x"],
+            2,
+            "invalid_arguments",
+        ),
+        (
+            vec!["stats", "--json", "--root", "."],
+            2,
+            "invalid_arguments",
+        ),
+        (vec!["init", "--json"], 2, "invalid_arguments"),
+        (vec!["monitor", "--json"], 2, "invalid_arguments"),
+        (vec!["config", "--json"], 2, "invalid_arguments"),
+        (vec!["sync", "--json"], 2, "invalid_arguments"),
         (
             vec!["stats", "--json", "--format", "github"],
-            1,
-            "command_failed",
+            2,
+            "invalid_arguments",
+        ),
+        (
+            vec!["stats", "--json", "--format", "jsno"],
+            2,
+            "invalid_arguments",
         ),
     ] {
         let output = e.cmd().args(&args).output().unwrap();

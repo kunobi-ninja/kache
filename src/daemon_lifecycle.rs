@@ -6,6 +6,27 @@ use kunobi_daemon::{
 };
 
 pub(super) fn ensure(config: &Config, force: bool) -> Result<bool> {
+    Ok(ensure_outcome(config, force)?.is_ready())
+}
+
+/// What [`ensure_outcome`] found or did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Ensured {
+    /// A ready daemon was already running; its version when it said.
+    AlreadyRunning(Option<String>),
+    /// This call started or replaced the daemon, and it is ready.
+    Started,
+    /// No daemon became ready in time.
+    TimedOut,
+}
+
+impl Ensured {
+    pub fn is_ready(&self) -> bool {
+        !matches!(self, Ensured::TimedOut)
+    }
+}
+
+pub(super) fn ensure_outcome(config: &Config, force: bool) -> Result<Ensured> {
     // Fail before starting a daemon that could never bind its sockets. The
     // control endpoint's path is derived from the socket's, so check both.
     for socket in [
@@ -17,8 +38,10 @@ pub(super) fn ensure(config: &Config, force: bool) -> Result<bool> {
         }
     }
     let deadline = Instant::now() + DAEMON_START_TIMEOUT;
-    if !force && current(config, deadline)?.is_some() {
-        return Ok(true);
+    if !force && let Some(health) = current(config, deadline)? {
+        return Ok(Ensured::AlreadyRunning(
+            (!health.version.is_empty()).then_some(health.version),
+        ));
     }
     let socket = config.socket_path();
     std::fs::create_dir_all(socket.parent().context("socket has no parent")?)?;
@@ -26,7 +49,7 @@ pub(super) fn ensure(config: &Config, force: bool) -> Result<bool> {
         ProcessLock::try_acquire(socket.with_extension("lock"))
     })?
     else {
-        return Ok(false);
+        return Ok(Ensured::TimedOut);
     };
     let mut driver = KacheReplacement {
         config,
@@ -46,8 +69,10 @@ pub(super) fn ensure(config: &Config, force: bool) -> Result<bool> {
         },
         &mut driver,
     ) {
-        Ok(_) => Ok(true),
-        Err(error) if matches!(error.reason, replacement::Reason::Deadline) => Ok(false),
+        Ok(_) => Ok(Ensured::Started),
+        Err(error) if matches!(error.reason, replacement::Reason::Deadline) => {
+            Ok(Ensured::TimedOut)
+        }
         Err(error) => Err(anyhow::anyhow!(error.to_string())),
     }
 }
@@ -306,7 +331,7 @@ fn replacement_executable() -> Result<PathBuf> {
     std::env::current_exe().context("locating replacement executable")
 }
 
-fn transient(error: &anyhow::Error) -> bool {
+pub(super) fn transient(error: &anyhow::Error) -> bool {
     if let Some(control) = error.downcast_ref::<kunobi_daemon::client::RequestError>() {
         return control.is_transient();
     }

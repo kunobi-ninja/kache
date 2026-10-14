@@ -3053,12 +3053,19 @@ fn init_preserves_cargo_config_when_the_rustdoc_text_edit_is_unsafe() {
     toml::from_str::<toml::Value>(original).expect("valid original Cargo config");
     std::fs::write(&cargo, original).unwrap();
 
-    e.cmd()
-        .args(["init", "--yes", "--no-service"])
-        .assert()
-        .failure();
+    for mode in ["--yes", "--check"] {
+        e.cmd()
+            .args(["init", mode, "--no-service"])
+            .assert()
+            .success()
+            .stdout(
+                predicates::str::contains("could not safely set build.rustdoc")
+                    .and(predicates::str::contains(cargo.display().to_string()))
+                    .and(predicates::str::contains("set it to")),
+            );
 
-    assert_eq!(std::fs::read_to_string(cargo).unwrap(), original);
+        assert_eq!(std::fs::read_to_string(&cargo).unwrap(), original);
+    }
 }
 
 #[cfg(unix)]

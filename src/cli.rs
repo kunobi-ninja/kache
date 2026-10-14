@@ -10176,11 +10176,21 @@ fn configure_cargo_rustdoc(check: bool) -> Result<()> {
         }
         RustdocEdit::Skip | RustdocEdit::Already => return Ok(()),
     }
+    let updated = match checked_rustdoc_edit(&existing, shim_path) {
+        Ok(updated) => updated,
+        Err(error) => {
+            println!(
+                "  • cargo doc: could not safely set build.rustdoc in {} ({error}); set it to {} manually",
+                cargo_path.display(),
+                shim.display()
+            );
+            return Ok(());
+        }
+    };
     if check {
         println!("    Would set build.rustdoc to {}", shim.display());
         return Ok(());
     }
-    let updated = checked_rustdoc_edit(&existing, shim_path)?;
     back_up_cargo_config(&cargo_path, &existing)?;
     if let Err(error) = std::fs::write(&cargo_path, updated) {
         println!("  • cargo doc: could not set build.rustdoc ({error})");

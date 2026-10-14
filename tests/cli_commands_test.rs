@@ -1737,6 +1737,33 @@ fn doctor_fix_migrates_an_absolute_sccache_wrapper_to_a_working_kache() {
     assert_eq!(edited["build"]["rustc-wrapper"].as_str(), Some("kache"));
 }
 
+#[cfg(unix)]
+#[test]
+fn doctor_fix_preserves_cargo_config_without_an_sccache_wrapper() {
+    let e = env();
+    let tools = e.home.join("bin");
+    std::fs::create_dir_all(&tools).unwrap();
+    kache_fs::testutil::write_executable(&tools.join("pgrep"), "#!/bin/sh\nexit 1\n");
+    let previous_path = std::env::var_os("PATH").unwrap_or_default();
+    let path =
+        std::env::join_paths(std::iter::once(tools).chain(std::env::split_paths(&previous_path)))
+            .unwrap();
+    let config = e.home.join(".cargo/config.toml");
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    for original in [
+        "[build]\nrustc-wrapper = \"custom-wrapper\"\n[env]\nLABEL = \"sccache\"\n",
+        "[env]\nLABEL = \"sccache\"\n",
+    ] {
+        std::fs::write(&config, original).unwrap();
+        e.cmd()
+            .env("PATH", &path)
+            .args(["doctor", "--fix"])
+            .assert()
+            .success();
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), original);
+    }
+}
+
 #[test]
 fn doctor_fix_migrates_sccache_config_in_custom_cargo_home() {
     // When $CARGO_HOME is set, migrate must rewrite the cargo config under it,

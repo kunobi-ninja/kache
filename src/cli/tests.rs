@@ -3169,6 +3169,9 @@ fn migrate_with_nothing_to_do_points_at_init() {
         "{summary}"
     );
     assert!(!summary.contains("source ~/.zshrc"), "{summary}");
+    assert!(!summary.contains("--purge-sccache"), "{summary}");
+    let summary = migration_summary(&[], &rc, false);
+    assert!(summary.contains("--purge-sccache"), "{summary}");
 }
 
 #[test]
@@ -3228,8 +3231,60 @@ fn doctor_config_file_check_fails_on_a_file_that_does_not_parse() {
     assert!(detail.contains("line 2"), "{detail}");
     assert!(fix.unwrap().contains("defaults"));
 
-    assert!(doctor_config_file_check(path, true, None).0);
-    assert!(doctor_config_file_check(path, false, None).0);
+    let shown = crate::wrapper_config::display_path(path);
+    assert_eq!(
+        doctor_config_file_check(path, true, None),
+        (true, shown.clone(), None)
+    );
+    assert_eq!(
+        doctor_config_file_check(path, false, None),
+        (true, format!("{shown} (not created; defaults apply)"), None)
+    );
+}
+
+#[test]
+fn doctor_files_each_wrapper_repair_under_the_right_command() {
+    use crate::wrapper_config::WrapperSetting;
+    let home = std::path::Path::new("/home/me/.cargo");
+    let in_home = |value: &str| WrapperSetting::CargoConfig {
+        value: value.into(),
+        path: home.join("config.toml"),
+    };
+    assert_eq!(wrapper_setting_repair(None, home), Some(false));
+    assert_eq!(
+        wrapper_setting_repair(Some(&in_home("sccache")), home),
+        Some(true)
+    );
+    assert_eq!(
+        wrapper_setting_repair(Some(&in_home("other")), home),
+        Some(false)
+    );
+    let env = WrapperSetting::Environment {
+        value: "sccache".into(),
+    };
+    assert_eq!(wrapper_setting_repair(Some(&env), home), None);
+
+    let (mut fix, mut init) = (Vec::new(), Vec::new());
+    note_repair("a", Some(true), &mut fix, &mut init);
+    note_repair("b", Some(false), &mut fix, &mut init);
+    note_repair("c", None, &mut fix, &mut init);
+    assert_eq!((fix, init), (vec!["a"], vec!["b"]));
+}
+
+#[test]
+fn doctor_fix_refuses_a_wrapper_it_cannot_rewrite() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let source = "[build]\nrustc-wrapper  =  \"sccache\"\n";
+    fs::write(&path, source).unwrap();
+
+    let error = migrate_cargo_wrapper(&path).unwrap_err().to_string();
+
+    assert!(error.contains("edit"), "{error}");
+    assert_eq!(fs::read_to_string(&path).unwrap(), source);
+    assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1, "no backup");
+    assert!(ensure_cargo_wrapper_is_kache("[build]\nrustc-wrapper = \"kache\"\n", &path).is_ok());
+    assert!(ensure_cargo_wrapper_is_kache(source, &path).is_err());
 }
 
 #[test]

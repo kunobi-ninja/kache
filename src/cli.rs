@@ -6453,6 +6453,35 @@ fn cargo_wrapper_repair(
     same.then(|| is_sccache_program(value))
 }
 
+/// [`cargo_wrapper_repair`] for the resolved wrapper: `kache init` sets an
+/// unset one, and neither command edits `RUSTC_WRAPPER` in the environment.
+fn wrapper_setting_repair(
+    setting: Option<&crate::wrapper_config::WrapperSetting>,
+    cargo_home: &std::path::Path,
+) -> Option<bool> {
+    match setting {
+        Some(crate::wrapper_config::WrapperSetting::Environment { .. }) => None,
+        Some(crate::wrapper_config::WrapperSetting::CargoConfig { value, path }) => {
+            cargo_wrapper_repair(value, path, cargo_home)
+        }
+        None => Some(false),
+    }
+}
+
+/// File `label` under the command that repairs it, if any.
+fn note_repair(
+    label: &'static str,
+    by_fix: Option<bool>,
+    fix_repairs: &mut Vec<&'static str>,
+    init_repairs: &mut Vec<&'static str>,
+) {
+    match by_fix {
+        Some(true) => fix_repairs.push(label),
+        Some(false) => init_repairs.push(label),
+        None => {}
+    }
+}
+
 /// The JSON `next` for doctor: `doctor --fix` only when it repairs one of the
 /// failing checks, `kache init` when init does.
 fn doctor_next_actions(
@@ -6949,31 +6978,20 @@ pub fn doctor(
         },
     });
 
-    // Failing checks `doctor --fix` and `kache init` can repair, for the JSON
-    // `next` suggestion.
+    // Checks `doctor --fix` and `kache init` repair when they fail, for the
+    // JSON `next` suggestion. A passing check listed here suggests nothing.
     let mut fix_repairs: Vec<&'static str> = Vec::new();
-    let mut init_repairs: Vec<&'static str> = Vec::new();
-    let mut note_wrapper_repair = |label: &'static str, value: &str, path: &std::path::Path| {
-        if let Some(by_fix) = cargo_wrapper_repair(value, path, &cargo_home_dir()) {
-            if by_fix {
-                fix_repairs.push(label);
-            } else {
-                init_repairs.push(label);
-            }
-        }
-    };
+    let mut init_repairs: Vec<&'static str> = vec!["cargo doc"];
+    let cargo_home = cargo_home_dir();
 
     // 2. RUSTC_WRAPPER
     let wrapper_setting = crate::wrapper_config::resolve_wrapper_setting();
-    match &wrapper_setting {
-        Some(crate::wrapper_config::WrapperSetting::CargoConfig { value, path })
-            if !value.contains("kache") =>
-        {
-            note_wrapper_repair("RUSTC_WRAPPER", value, path)
-        }
-        None => note_wrapper_repair("RUSTC_WRAPPER", "", &cargo_config_target_path()),
-        _ => {}
-    }
+    note_repair(
+        "RUSTC_WRAPPER",
+        wrapper_setting_repair(wrapper_setting.as_ref(), &cargo_home),
+        &mut fix_repairs,
+        &mut init_repairs,
+    );
     let (wrapper_pass, wrapper_detail, wrapper_fix) = match wrapper_setting {
         Some(crate::wrapper_config::WrapperSetting::Environment { value })
             if value.contains("kache") =>
@@ -7029,10 +7047,13 @@ pub fn doctor(
 
     // 3. Cargo config
     let cargo_setting = crate::wrapper_config::cargo_wrapper_setting();
-    if let Some((value, path)) = &cargo_setting
-        && !value.contains("kache")
-    {
-        note_wrapper_repair("Cargo config", value, path);
+    if let Some((value, path)) = &cargo_setting {
+        note_repair(
+            "Cargo config",
+            cargo_wrapper_repair(value, path, &cargo_home),
+            &mut fix_repairs,
+            &mut init_repairs,
+        );
     }
     let (cargo_pass, cargo_detail, cargo_fix) = match cargo_setting {
         Some((value, path)) if value.contains("kache") => (
@@ -7064,9 +7085,6 @@ pub fn doctor(
     #[cfg(not(unix))]
     let rustdoc_path_ok = false;
     let (doc_pass, doc_class) = rustdoc_doctor_fields(cfg!(unix), rustdoc_value, rustdoc_path_ok);
-    if !doc_pass {
-        init_repairs.push("cargo doc");
-    }
     checks.push(Check {
         label: "cargo doc",
         pass: doc_pass,
@@ -7321,7 +7339,7 @@ pub fn doctor(
             my_version,
             &crate::service::startup_log(cfg).to_string(),
         );
-        if !pass && is_stale(&stats) {
+        if is_stale(&stats) {
             fix_repairs.push("Daemon version");
         }
         checks.push(Check {

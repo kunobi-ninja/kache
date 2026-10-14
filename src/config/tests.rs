@@ -4126,6 +4126,56 @@ bucket = "b"
 }
 
 #[test]
+fn config_file_read_errors_other_than_missing_are_reported() {
+    // A directory exists but cannot be read as a file.
+    let dir = tempfile::tempdir().unwrap();
+    let error = Config::load_raw_file_config_from(dir.path()).unwrap_err();
+    assert!(error.to_string().starts_with("reading "), "{error:#}");
+
+    let config = FileConfig::default();
+    let error = Config::update_file_config_at(dir.path(), &config, &config).unwrap_err();
+    assert!(error.to_string().starts_with("reading "), "{error:#}");
+}
+
+#[test]
+fn update_file_config_adds_a_table_the_file_lacks() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    std::fs::write(&path, "# mine\n[cache]\nlocal_store = \"~/s\"\n").unwrap();
+    let (before, _) = Config::load_raw_file_config_from(&path).unwrap();
+    let mut after = before.clone();
+    after.paths = Some(PathsFileConfig {
+        base_dirs: Some(vec!["/src".into()]),
+    });
+
+    Config::update_file_config_at(&path, &before, &after).unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "# mine\n[cache]\nlocal_store = \"~/s\"\n\n[paths]\nbase_dirs = [\"/src\"]\n"
+    );
+}
+
+#[test]
+fn describe_toml_error_is_one_line_with_position_and_message() {
+    let parse = toml::from_str::<toml::Table>("a = = 1").unwrap_err();
+    assert_eq!(
+        describe_toml_error(&parse),
+        format!(
+            "TOML parse error at line 1, column 5: {}",
+            parse.message().trim()
+        )
+    );
+    // A schema error carries no position, so the message stands alone.
+    let mut table = toml::Table::new();
+    table.insert("cache".into(), toml::Value::Integer(1));
+    let schema = toml::Value::Table(table)
+        .try_into::<FileConfig>()
+        .unwrap_err();
+    assert_eq!(describe_toml_error(&schema), schema.message().trim());
+}
+
+#[test]
 fn update_file_config_leaves_an_unchanged_file_byte_for_byte() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("config.toml");

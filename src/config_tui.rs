@@ -1333,6 +1333,21 @@ fn draw_form(f: &mut ratatui::Frame, area: Rect, state: &mut EditorState) {
     f.render_widget(paragraph, area);
 }
 
+/// Green for a save, yellow for anything that needs the user's attention.
+fn status_color(status: &str) -> Color {
+    if status.contains("Saved") {
+        Color::Green
+    } else if status.contains("failed")
+        || status.contains("Fix")
+        || status.contains("Unsaved")
+        || status.contains("existing file")
+    {
+        Color::Yellow
+    } else {
+        Color::White
+    }
+}
+
 fn draw_footer(f: &mut ratatui::Frame, path_area: Rect, keys_area: Rect, state: &EditorState) {
     let path = resolve_config_path();
     let path_str = path.to_string_lossy();
@@ -1343,20 +1358,9 @@ fn draw_footer(f: &mut ratatui::Frame, path_area: Rect, keys_area: Rect, state: 
     )];
 
     if let Some(ref status) = state.status {
-        let color = if status.contains("Saved") {
-            Color::Green
-        } else if status.contains("failed")
-            || status.contains("Fix")
-            || status.contains("Unsaved")
-            || status.contains("existing file")
-        {
-            Color::Yellow
-        } else {
-            Color::White
-        };
         path_spans.push(Span::styled(
             format!("  {status}"),
-            Style::default().fg(color).bold(),
+            Style::default().fg(status_color(status)).bold(),
         ));
     }
 
@@ -2779,6 +2783,41 @@ mod tests {
             );
             assert!(s.status.is_none(), "cancel clears the prompt for {code:?}");
         }
+    }
+
+    #[test]
+    fn status_color_flags_each_status_that_needs_attention() {
+        assert_eq!(status_color("Saved!"), Color::Green);
+        for status in [
+            "Save failed: disk full",
+            "Fix validation errors before saving",
+            "Unsaved changes. Quit? (y/n)",
+            "Update the existing file? Comments and other settings are kept. (y/n)",
+        ] {
+            assert_eq!(status_color(status), Color::Yellow, "{status}");
+        }
+        assert_eq!(status_color("Editing"), Color::White);
+    }
+
+    #[test]
+    fn draw_footer_shows_the_status_and_the_keys_for_the_mode() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut state = editor();
+        state.mode = Mode::ConfirmSave;
+        state.status = Some("status-under-test".to_string());
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(rendered.contains("status-under-test"), "{rendered}");
+        assert!(rendered.contains("y: save  n/Esc: cancel"), "{rendered}");
     }
 
     #[test]

@@ -130,9 +130,10 @@ fn labels_are_key_value_pairs() {
 fn an_unstamped_log_says_the_wrapper_is_too_old() {
     let versions = std::collections::BTreeSet::from(["0.23.1".to_string()]);
     let message = nothing_to_send(12, &versions);
-    assert!(message.contains("12 compile(s)"), "{message}");
+    assert!(message.contains("12 compiles in the log"), "{message}");
     assert!(message.contains("0.23.1"), "{message}");
     assert!(message.contains("Upgrade kache"), "{message}");
+    assert!(nothing_to_send(1, &versions).starts_with("1 compile in the log"));
 
     assert_eq!(
         nothing_to_send(0, &Default::default()),
@@ -1182,7 +1183,7 @@ fn the_gc_summary_has_a_line_per_shard_it_swept() {
     assert_eq!(
         shard_store_lines(&config),
         vec![format!(
-            "Volume shard {}: {} / {} (2 entries)",
+            "Volume shard {}: {} / {} · 2 entries",
             shard_config.cache_dir.display(),
             ByteSize(shard.physical_size().unwrap()),
             ByteSize(1000),
@@ -1216,11 +1217,11 @@ fn gc_summary_compares_deduplicated_blob_bytes_with_the_limit() {
     assert_eq!(store.physical_size().unwrap(), 60);
     assert_eq!(
         gc_store_usage(&store, 90, None).unwrap(),
-        "60 B / 90 B (2 entries)"
+        "60 B / 90 B · 2 entries"
     );
     assert_eq!(
         gc_store_usage(&store, 0, None).unwrap(),
-        "60 B / 0 B (2 entries)"
+        "60 B / 0 B · 2 entries"
     );
 }
 
@@ -4525,7 +4526,7 @@ fn render_stats_cache_shards_use_blob_bytes_and_label_missing_metadata() {
             (
                 "Store",
                 "2.0 KiB".into(),
-                "logical (blob size unavailable) · of 4.0 KiB · 1 entries · /cache-two".into()
+                "logical (blob size unavailable) · of 4.0 KiB · 1 entry · /cache-two".into()
             ),
         ]
     );
@@ -5226,7 +5227,10 @@ fn render_stats_offline_and_not_configured() {
 #[test]
 fn cache_limit_note_names_the_disk_share_budget() {
     const GIB: u64 = 1 << 30;
-    let share = format!(" (5% of {}, floor 5GiB, cap 100GiB)", ByteSize(200 * GIB));
+    let share = format!(
+        " (5% of {}, floor 5.0 GiB, cap 100.0 GiB)",
+        ByteSize(200 * GIB)
+    );
     // 5% of 200 GiB is 10 GiB, inside the floor and the cap.
     assert_eq!(cache_limit_note(0, 10 * GIB, Some(200 * GIB)), share);
     assert_eq!(cache_limit_note(1, 10 * GIB, Some(200 * GIB)), share);
@@ -5235,12 +5239,12 @@ fn cache_limit_note_names_the_disk_share_budget() {
     // 5% of 1 GiB rounds to 0, then the floor raises the budget to 5 GiB.
     let floor = cache_limit_note(0, 5 * GIB, Some(GIB));
     assert!(floor.contains("floor"), "{floor}");
-    assert!(floor.contains("5GiB"), "{floor}");
+    assert!(floor.contains("floor 5.0 GiB"), "{floor}");
     assert!(floor.contains(&ByteSize(GIB).to_string()), "{floor}");
     // 5% of 4000 GiB is 200 GiB, then the cap lowers the budget to 100 GiB.
     let cap = cache_limit_note(0, 100 * GIB, Some(4000 * GIB));
     assert!(cap.contains("cap"), "{cap}");
-    assert!(cap.contains("100GiB"), "{cap}");
+    assert!(cap.contains("cap 100.0 GiB"), "{cap}");
     assert_eq!(
         cache_limit_note(0, 50 * GIB, None),
         " (default; disk size unknown)"
@@ -5434,7 +5438,7 @@ fn sync_without_remote_errors() {
     let err = sync(&config, None, false, false, false, false, false, false)
         .expect_err("sync without a remote must error");
     assert!(
-        err.to_string().contains("No remote configured"),
+        err.to_string().contains("no remote configured"),
         "got: {err}"
     );
 }
@@ -5743,7 +5747,7 @@ fn save_manifest_without_remote_errors() {
     let config = save_manifest_config(dir.path().to_path_buf(), None);
     let err = save_manifest(&config, None, None).expect_err("no remote -> error");
     assert!(
-        err.to_string().contains("No remote configured"),
+        err.to_string().contains("no remote configured"),
         "got {err}"
     );
 }
@@ -5755,7 +5759,7 @@ fn automatic_manifest_save_without_remote_errors() {
     let err =
         save_manifest_auto_for_session(&config, "key", "session").expect_err("no remote -> error");
     assert!(
-        err.to_string().contains("No remote configured"),
+        err.to_string().contains("no remote configured"),
         "got {err}"
     );
 }
@@ -7503,7 +7507,7 @@ fn held_reason_names_each_command_and_how_long_it_ran() {
     };
     assert_eq!(
         held_reason(&[], 100),
-        "another Kache cleanup or a running Cargo command holds Kache's target lock"
+        "another kache cleanup or a running Cargo command holds kache's target lock"
     );
     assert_eq!(
         held_reason(&[holder(7, "cargo run", 100 - 12)], 100),
@@ -8726,6 +8730,10 @@ fn a_declined_unit_clean_says_nothing_was_removed() {
             Some("Removed 3 obsolete units (2.0 KiB).")
         );
     }
+    assert_eq!(
+        unit_clean_summary(false, Some(true), 1, 1024).as_deref(),
+        Some("Removed 1 obsolete unit (1.0 KiB).")
+    );
 }
 
 #[test]
@@ -8878,7 +8886,7 @@ fn doctor_and_full_clean_report_quarantined_indexes_without_deleting_them() {
         format!(
             "2 files ({}) retained in {} after index corruption",
             ByteSize(3000),
-            config.cache_dir.display()
+            term::home_path(&config.cache_dir)
         )
     );
     assert!(check.fix.unwrap().contains("`kache clean --cache`"));

@@ -1007,8 +1007,10 @@ fn describe_max_size_names_the_disk_share_when_derived() {
     let disk = Some(200 * GIB);
     let derived = disk_share_budget(disk);
     let text = describe_max_size(derived, disk);
-    assert!(text.contains("5%"), "{text}");
-    assert!(text.contains(&ByteSize(200 * GIB).to_string()), "{text}");
+    assert_eq!(
+        text,
+        "10.0 GiB (5% of 200.0 GiB, floor 5.0 GiB, cap 100.0 GiB)"
+    );
     assert_eq!(
         describe_max_size(2 * GIB, disk),
         ByteSize(2 * GIB).to_string()

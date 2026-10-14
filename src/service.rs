@@ -196,7 +196,11 @@ fn systemd_user_manager_reachable() -> bool {
 pub fn install() -> Result<()> {
     let selection = kache_shims::detect().context("locating the kache binary")?;
     for line in selection_lines(&selection) {
-        println!("{line}");
+        if line.starts_with("warning:") {
+            eprintln!("{line}");
+        } else {
+            println!("{line}");
+        }
     }
     let exe = selection.path;
 
@@ -221,11 +225,11 @@ fn selection_lines(selection: &kache_shims::Selection) -> Vec<String> {
     )];
     match selection.stability {
         kache_shims::Stability::Versioned => lines.push(format!(
-            "  Note: {}. Rerun `kache daemon install` after upgrading kache.",
+            "note: {}. Rerun `kache daemon install` after upgrading kache.",
             selection.reason
         )),
         kache_shims::Stability::Unverified => lines.push(format!(
-            "  Warning: {}. The service may run as a user who cannot reach this path.",
+            "warning: {}. The service may run as a user who cannot reach this path.",
             selection.reason
         )),
         _ => {}
@@ -1744,7 +1748,7 @@ WantedBy=default.target
         selection.stability = kache_shims::Stability::Unverified;
         let lines = selection_lines(&selection);
         assert_eq!(lines.len(), 2);
-        assert!(lines[1].starts_with("  Warning: "), "{lines:?}");
+        assert!(lines[1].starts_with("warning: "), "{lines:?}");
         assert!(
             lines[1].contains("may run as a user who cannot reach"),
             "{lines:?}"

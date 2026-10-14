@@ -965,7 +965,7 @@ fn last_build_requires_recorded_events_and_conflicts_with_since() {
             .args([command, "--last-build"])
             .assert()
             .failure()
-            .stderr(predicates::str::contains("No recorded compiler events"));
+            .stderr(predicates::str::contains("no recorded compiler events"));
         e.cmd()
             .args([command, "--last-build", "--since", "24h"])
             .assert()
@@ -2329,7 +2329,7 @@ fn init_saves_shell_setup_preserves_cargo_choices_and_is_idempotent() {
         .stdout
         .clone();
     let output = String::from_utf8(output).unwrap();
-    assert!(output.contains("Replace sccache with Kache for Cargo builds?"));
+    assert!(output.contains("Replace sccache with kache for Cargo builds?"));
     assert_eq!(output.matches("[Y/n]").count(), 2, "{output}");
     assert!(!output.contains("Cache cargo doc as well?"));
     assert!(output.contains("Open a new terminal"));
@@ -3500,8 +3500,9 @@ fn doctor_repair_drops_entries_with_unparseable_metadata() {
         .assert()
         .success()
         .stdout(predicates::str::contains(format!(
-            "Repairing: removed {} entries that failed verification.",
-            metas.len()
+            "Repairing: removed {} {} that failed verification.",
+            metas.len(),
+            if metas.len() == 1 { "entry" } else { "entries" }
         )));
     e.cmd()
         .arg("list")

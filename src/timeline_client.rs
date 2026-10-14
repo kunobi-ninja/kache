@@ -72,12 +72,12 @@ pub(crate) async fn push_timeline(
     let body = response.text().await.unwrap_or_default();
     if !status.is_success() {
         anyhow::bail!(
-            "service answered {status}: {}",
+            "planner answered {status}: {}",
             service_error(&body, &status)
         );
     }
     serde_json::from_str::<PushResponse>(&body)
-        .with_context(|| format!("decoding the service answer: {body}"))
+        .with_context(|| format!("decoding the planner answer: {body}"))
 }
 
 /// The service explains a refusal in an `error` field, and a size refusal

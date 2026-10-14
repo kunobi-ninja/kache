@@ -1285,7 +1285,7 @@ fn last_build_does_not_fall_back_to_an_older_known_root() {
         select_last_build(&mut Vec::new())
             .unwrap_err()
             .to_string()
-            .contains("No recorded")
+            .contains("no recorded compiler events")
     );
     let mut events = vec![
         session_event("/repo", "known", 0, 0),
@@ -1370,7 +1370,12 @@ fn last_build_report_uses_retained_history_and_omits_unscoped_data() {
             last_build: true,
         },
     );
-    assert!(absent.unwrap_err().to_string().contains("No recorded"));
+    assert!(
+        absent
+            .unwrap_err()
+            .to_string()
+            .contains("no recorded compiler events")
+    );
 }
 
 #[test]
@@ -1790,24 +1795,24 @@ fn text_markdown_and_github_reports_show_the_wrapper_phases() {
     // Percentages are of tracked wrapper time: 40 + 500 = 540 ms.
     let md = format_markdown(&report);
     for row in [
-        "| Startup | ~7ms | 1.3% |",
-        "| Key computation | ~30ms | 5.6% |",
-        "| &nbsp;&nbsp;of which dep-info pre-pass (2 runs) | ~15ms | 2.8% |",
-        "| Lookup | ~3ms | 0.6% |",
-        "| Scheduler wait (flight ~7ms, permit ~11ms) | ~18ms | 3.3% |",
-        "| Restore | ~5ms | 0.9% |",
-        "| Store | ~30ms | 5.6% |",
-        "| Unattributed | ~47ms | 8.7% |",
+        "| Startup | 7 ms | 1.3% |",
+        "| Key computation | 30 ms | 5.6% |",
+        "| &nbsp;&nbsp;of which dep-info pre-pass (2 runs) | 15 ms | 2.8% |",
+        "| Lookup | 3 ms | 0.6% |",
+        "| Scheduler wait (flight 7 ms, permit 11 ms) | 18 ms | 3.3% |",
+        "| Restore | 5 ms | 0.9% |",
+        "| Store | 30 ms | 5.6% |",
+        "| Unattributed | 47 ms | 8.7% |",
     ] {
         assert!(md.contains(row), "markdown is missing {row:?}:\n{md}");
     }
 
     let gh = format_github(&report);
     for row in [
-        "| Startup | ~7ms aggregate (avg 3.5ms/crate) |",
-        "| Dep-info pre-pass | 2 runs, ~15ms aggregate (avg 7.5ms/run) |",
-        "| Scheduler wait | ~18ms aggregate (flight ~7ms, permit ~11ms) |",
-        "| Unattributed | ~47ms aggregate (avg 23.5ms/crate) |",
+        "| Startup | 7 ms aggregate (avg 3.5 ms/crate) |",
+        "| Dep-info pre-pass | 2 runs, 15 ms aggregate (avg 7.5 ms/run) |",
+        "| Scheduler wait | 18 ms aggregate (flight 7 ms, permit 11 ms) |",
+        "| Unattributed | 47 ms aggregate (avg 23.5 ms/crate) |",
     ] {
         assert!(gh.contains(row), "github is missing {row:?}:\n{gh}");
     }
@@ -2789,7 +2794,7 @@ fn render_network_and_error_sections_with_all_optional_fields() {
             "zero observed span must render the legacy-event fallback: {rendered}"
         );
         assert!(
-            lower.contains("import lock wait 35ms"),
+            lower.contains("import lock wait 35 ms"),
             "isolated import-lock timing must render the phase row: {rendered}"
         );
     }

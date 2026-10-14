@@ -3,7 +3,6 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-use crate::cli::format_duration_ms;
 use crate::config::Config;
 use crate::daemon::{TransferDirection, TransferEvent};
 use crate::events::{self, BuildEvent, EventResult};
@@ -1388,7 +1387,7 @@ fn select_last_build(events: &mut Vec<BuildEvent>) -> Result<ReportSession> {
     let latest = events
         .iter()
         .max_by_key(|event| event.ts)
-        .ok_or_else(|| anyhow::anyhow!("No recorded compiler events for the selected root(s)."))?;
+        .ok_or_else(|| anyhow::anyhow!("no recorded compiler events match the selection"))?;
     anyhow::ensure!(
         !latest.root.is_empty(),
         "The latest compiler event has no recorded root; use --root to select a known build tree."
@@ -2385,7 +2384,7 @@ fn generate_suggestions(
         let avg_overhead = stats.hit_elapsed_ms as f64 / total_hits as f64;
         if avg_overhead > 50.0 {
             suggestions.push(format!(
-                "Average cache hit overhead is {:.0}ms — check disk I/O or consider faster storage",
+                "Average cache hit overhead is {:.0} ms: check disk I/O or consider faster storage",
                 avg_overhead
             ));
         }
@@ -2419,21 +2418,21 @@ fn generate_suggestions(
         if net.total_semaphore_wait_ms > 10_000 {
             suggestions.push(format!(
                 "Aggregate remote semaphore wait totaled {} — tune concurrency only if the remote can absorb it",
-                format_duration_ms(net.total_semaphore_wait_ms)
+                crate::term::duration_ms(net.total_semaphore_wait_ms)
             ));
         }
         if net.total_request_ms > 30_000 && net.total_request_ms > net.total_body_ms {
             suggestions.push(format!(
                 "Aggregate remote open/setup latency ({}) exceeds read/transfer time ({}) — check the remote path, storage latency, or read fan-out",
-                format_duration_ms(net.total_request_ms),
-                format_duration_ms(net.total_body_ms)
+                crate::term::duration_ms(net.total_request_ms),
+                crate::term::duration_ms(net.total_body_ms)
             ));
         }
         if net.total_extract_ms > 30_000 && net.total_extract_ms > net.total_body_ms {
             suggestions.push(format!(
                 "Aggregate archive extract time ({}) exceeds read/transfer time ({}) — profile zstd/tar extraction and SQLite import separately",
-                format_duration_ms(net.total_extract_ms),
-                format_duration_ms(net.total_body_ms)
+                crate::term::duration_ms(net.total_extract_ms),
+                crate::term::duration_ms(net.total_body_ms)
             ));
         }
     }
@@ -2520,8 +2519,8 @@ fn cache_overhead_summary(report: &BuildReport) -> Option<String> {
         return None;
     }
     Some(format!(
-        "{} aggregate, avg {:.0}ms/hit",
-        format_duration_ms(report.timing.hit_time_ms),
+        "{} aggregate, avg {:.0} ms/hit",
+        crate::term::duration_ms(report.timing.hit_time_ms),
         report.timing.avg_hit_ms
     ))
 }
@@ -2669,7 +2668,7 @@ fn push_bypass_tables(lines: &mut Vec<String>, bypass: &BypassAnalysis) {
                 markdown_cell(&reason.reason),
                 reason.count,
                 reason.failures,
-                format_duration_ms(reason.max_elapsed_ms),
+                crate::term::duration_ms(reason.max_elapsed_ms),
             ));
         }
     }
@@ -2686,7 +2685,7 @@ fn push_bypass_tables(lines: &mut Vec<String>, bypass: &BypassAnalysis) {
                 markdown_cell(&detail.crate_name),
                 detail.result,
                 detail.route,
-                format_duration_ms(detail.elapsed_ms),
+                crate::term::duration_ms(detail.elapsed_ms),
                 format_exit_code(detail.exit_code),
                 markdown_cell(&bypass_detail_reason(detail)),
             ));
@@ -2972,12 +2971,10 @@ fn human_download_phase(phase: &str) -> &str {
 /// (tracked wrapper time). Dep-info is indented under key because it is
 /// inside it; unattributed is what the phases leave of the overhead.
 fn push_phase_rows(lines: &mut Vec<String>, t: &TimingBreakdown, total_ms: u64) {
-    use crate::cli::format_duration_ms;
-
     let mut row = |label: String, ms: u64| {
         lines.push(format!(
             "| {label} | {} | {:.1}% |",
-            format_duration_ms(ms),
+            crate::term::duration_ms(ms),
             pct_of(ms, total_ms)
         ));
     };
@@ -2994,8 +2991,8 @@ fn push_phase_rows(lines: &mut Vec<String>, t: &TimingBreakdown, total_ms: u64) 
     row(
         format!(
             "Scheduler wait (flight {}, permit {})",
-            format_duration_ms(t.total_flight_wait_ms),
-            format_duration_ms(t.total_permit_wait_ms)
+            crate::term::duration_ms(t.total_flight_wait_ms),
+            crate::term::duration_ms(t.total_permit_wait_ms)
         ),
         t.total_wait_ms,
     );
@@ -3005,8 +3002,6 @@ fn push_phase_rows(lines: &mut Vec<String>, t: &TimingBreakdown, total_ms: u64) 
 }
 
 pub fn format_markdown(report: &BuildReport) -> String {
-    use crate::cli::format_duration_ms;
-
     let mut lines = Vec::new();
     let s = &report.summary;
     let t = &report.timing;
@@ -3021,7 +3016,7 @@ pub fn format_markdown(report: &BuildReport) -> String {
         total_hits,
         s.total_crates,
         total_compiled,
-        format_duration_ms(s.time_saved_ms),
+        crate::term::duration_ms(s.time_saved_ms),
     ));
     lines.push(String::new());
 
@@ -3042,7 +3037,7 @@ pub fn format_markdown(report: &BuildReport) -> String {
     }
     lines.push(format!(
         "| Compile work avoided | {} aggregate |",
-        format_duration_ms(s.time_saved_ms)
+        crate::term::duration_ms(s.time_saved_ms)
     ));
     if let Some(overhead) = cache_overhead_summary(report) {
         lines.push(format!("| Cache hit overhead | {} |", overhead));
@@ -3056,7 +3051,7 @@ pub fn format_markdown(report: &BuildReport) -> String {
     if t.miss_compile_time_ms > 0 {
         lines.push(format!(
             "| Miss compile work | {} aggregate |",
-            format_duration_ms(t.miss_compile_time_ms)
+            crate::term::duration_ms(t.miss_compile_time_ms)
         ));
     }
     lines.push(format!("| Total crates | {} |", s.total_crates));
@@ -3102,12 +3097,12 @@ pub fn format_markdown(report: &BuildReport) -> String {
     };
     lines.push(format!(
         "| Cache hits (wrapper overhead) | {} | {:.1}% |",
-        format_duration_ms(t.hit_time_ms),
+        crate::term::duration_ms(t.hit_time_ms),
         hit_pct
     ));
     lines.push(format!(
         "| Compiles (wrapper total) | {} | {:.1}% |",
-        format_duration_ms(t.miss_time_ms),
+        crate::term::duration_ms(t.miss_time_ms),
         miss_pct
     ));
     if s.total_crates > 0 {
@@ -3131,15 +3126,18 @@ pub fn format_markdown(report: &BuildReport) -> String {
             net.uploads_ok
         ));
         lines.push(format!(
-            "| Avg download time | {:.0}ms |",
+            "| Avg download time | {:.0} ms |",
             net.avg_download_ms
         ));
-        lines.push(format!("| P95 download time | {}ms |", net.p95_download_ms));
+        lines.push(format!(
+            "| P95 download time | {} ms |",
+            net.p95_download_ms
+        ));
         if net.observed_span_ms > 0 {
             lines.push(format!(
                 "| Observed wall-span throughput | {:.1} MB/s over {} ({} timed downloads, peak {} concurrent) |",
                 net.observed_throughput_mbps,
-                format_duration_ms(net.observed_span_ms),
+                crate::term::duration_ms(net.observed_span_ms),
                 net.observed_downloads,
                 net.max_concurrent_downloads
             ));
@@ -3157,7 +3155,7 @@ pub fn format_markdown(report: &BuildReport) -> String {
             lines.push(format!(
                 "| Dominant cumulative download phase | {} — {} ({:.1}%) |",
                 human_download_phase(&net.dominant_download_phase),
-                format_duration_ms(net.dominant_download_phase_ms),
+                crate::term::duration_ms(net.dominant_download_phase_ms),
                 net.dominant_download_phase_pct
             ));
         }
@@ -3178,7 +3176,7 @@ pub fn format_markdown(report: &BuildReport) -> String {
             || net.total_disk_io_ms > 0
         {
             lines.push(format!(
-                "| Cumulative download phase time | queue wait {}ms, existence check {}ms, open/setup {}ms, read/transfer {}ms, decompress {}ms, extract {}ms, import lock wait {}ms, import execution {}ms, local disk I/O {}ms |",
+                "| Cumulative download phase time | queue wait {} ms, existence check {} ms, open/setup {} ms, read/transfer {} ms, decompress {} ms, extract {} ms, import lock wait {} ms, import execution {} ms, local disk I/O {} ms |",
                 net.total_semaphore_wait_ms,
                 net.total_head_ms,
                 net.total_request_ms,
@@ -3225,7 +3223,7 @@ pub fn format_markdown(report: &BuildReport) -> String {
                     &d.cache_key[..d.cache_key.len().min(12)]
                 };
                 lines.push(format!(
-                    "| `{}` | {} | {}ms | `{}` | {}/{}ms | {}/{}ms | {}/{}/{}ms |",
+                    "| `{}` | {} | {} ms | `{}` | {}/{} ms | {}/{} ms | {}/{}/{} ms |",
                     d.crate_name,
                     format_bytes(d.compressed_bytes),
                     d.elapsed_ms,
@@ -3300,7 +3298,7 @@ pub fn format_markdown(report: &BuildReport) -> String {
             lines.push(format!(
                 "| `{}` | {} | {} | `{}` |",
                 c.crate_name,
-                format_duration_ms(c.compile_time_ms),
+                crate::term::duration_ms(c.compile_time_ms),
                 format_bytes(c.size),
                 key_short,
             ));
@@ -3322,7 +3320,7 @@ pub fn format_markdown(report: &BuildReport) -> String {
             lines.push(format!(
                 "| `{}` | {} | {} | `{}` |",
                 c.crate_name,
-                format_duration_ms(c.compile_time_ms),
+                crate::term::duration_ms(c.compile_time_ms),
                 format_bytes(c.size),
                 key_short,
             ));
@@ -3372,8 +3370,6 @@ pub fn format_markdown(report: &BuildReport) -> String {
 /// GitHub-optimized markdown: compact key metrics always visible, details in collapsible sections.
 /// Designed to be posted directly as a PR comment by kache-action.
 pub fn format_github(report: &BuildReport) -> String {
-    use crate::cli::format_duration_ms;
-
     let mut lines = Vec::new();
     let s = &report.summary;
     let t = &report.timing;
@@ -3389,7 +3385,7 @@ pub fn format_github(report: &BuildReport) -> String {
         total_hits,
         s.total_crates,
         total_compiled,
-        format_duration_ms(s.time_saved_ms),
+        crate::term::duration_ms(s.time_saved_ms),
     ));
     lines.push(String::new());
 
@@ -3425,7 +3421,7 @@ pub fn format_github(report: &BuildReport) -> String {
     ));
     lines.push(format!(
         "| **Compile work avoided** | {} aggregate |",
-        format_duration_ms(s.time_saved_ms)
+        crate::term::duration_ms(s.time_saved_ms)
     ));
     if let Some(overhead) = cache_overhead_summary(report) {
         lines.push(format!("| **Cache hit overhead** | {} |", overhead));
@@ -3439,7 +3435,7 @@ pub fn format_github(report: &BuildReport) -> String {
     if t.miss_compile_time_ms > 0 {
         lines.push(format!(
             "| **Miss compile work** | {} aggregate |",
-            format_duration_ms(t.miss_compile_time_ms)
+            crate::term::duration_ms(t.miss_compile_time_ms)
         ));
     }
     if s.store_failures > 0 {
@@ -3481,7 +3477,7 @@ pub fn format_github(report: &BuildReport) -> String {
             lines.push(format!(
                 "| `{}` | {} | {} |",
                 c.crate_name,
-                format_duration_ms(c.compile_time_ms),
+                crate::term::duration_ms(c.compile_time_ms),
                 format_bytes(c.size),
             ));
         }
@@ -3507,7 +3503,7 @@ pub fn format_github(report: &BuildReport) -> String {
             lines.push(format!(
                 "| `{}` | {} | {} |",
                 markdown_cell(&c.crate_name),
-                format_duration_ms(c.compile_time_ms),
+                crate::term::duration_ms(c.compile_time_ms),
                 format_bytes(c.size),
             ));
         }
@@ -3585,13 +3581,13 @@ pub fn format_github(report: &BuildReport) -> String {
             ));
             if net.total_compression_ms > 0 || net.total_head_checks_ms > 0 {
                 lines.push(format!(
-                    "| Upload time split | compress {}ms + existence checks {}ms |",
+                    "| Upload time split | compress {} ms + existence checks {} ms |",
                     net.total_compression_ms, net.total_head_checks_ms,
                 ));
             }
         }
         lines.push(format!(
-            "| Download time | avg {:.0}ms · p95 {}ms |",
+            "| Download time | avg {:.0} ms · p95 {} ms |",
             net.avg_download_ms, net.p95_download_ms
         ));
         if net.v1_downloads > 0
@@ -3615,7 +3611,7 @@ pub fn format_github(report: &BuildReport) -> String {
             lines.push(format!(
                 "| Observed wall-span throughput | {:.1} MB/s over {} · {} timed downloads · peak {} concurrent |",
                 net.observed_throughput_mbps,
-                format_duration_ms(net.observed_span_ms),
+                crate::term::duration_ms(net.observed_span_ms),
                 net.observed_downloads,
                 net.max_concurrent_downloads
             ));
@@ -3633,7 +3629,7 @@ pub fn format_github(report: &BuildReport) -> String {
             lines.push(format!(
                 "| Dominant cumulative download phase | {} — {} ({:.1}%) |",
                 human_download_phase(&net.dominant_download_phase),
-                format_duration_ms(net.dominant_download_phase_ms),
+                crate::term::duration_ms(net.dominant_download_phase_ms),
                 net.dominant_download_phase_pct
             ));
         }
@@ -3654,7 +3650,7 @@ pub fn format_github(report: &BuildReport) -> String {
             || net.total_disk_io_ms > 0
         {
             lines.push(format!(
-                "| Cumulative download phase time | queue wait {}ms · existence check {}ms · open/setup {}ms · read/transfer {}ms · decompress {}ms · extract {}ms · import lock wait {}ms · import execution {}ms · local disk {}ms |",
+                "| Cumulative download phase time | queue wait {} ms · existence check {} ms · open/setup {} ms · read/transfer {} ms · decompress {} ms · extract {} ms · import lock wait {} ms · import execution {} ms · local disk {} ms |",
                 net.total_semaphore_wait_ms,
                 net.total_head_ms,
                 net.total_request_ms,
@@ -3704,7 +3700,7 @@ pub fn format_github(report: &BuildReport) -> String {
                     &d.cache_key[..d.cache_key.len().min(12)]
                 };
                 lines.push(format!(
-                    "| `{}` | {} | {} | {}ms | {} | `{}` | {}/{}ms | {}/{}ms | {}/{}/{}ms |",
+                    "| `{}` | {} | {} | {} ms | {} | `{}` | {}/{} ms | {}/{} ms | {}/{}/{} ms |",
                     d.crate_name,
                     if d.format.is_empty() { "?" } else { &d.format },
                     format_bytes(d.compressed_bytes),
@@ -3786,48 +3782,48 @@ pub fn format_github(report: &BuildReport) -> String {
             lines.push("|-------|------|---|".to_string());
             lines.push(format!(
                 "| Cache hits (wrapper overhead) | {} | {:.1}% |",
-                format_duration_ms(t.hit_time_ms),
+                crate::term::duration_ms(t.hit_time_ms),
                 hit_pct
             ));
             lines.push(format!(
                 "| Compiles (wrapper total) | {} | {:.1}% |",
-                format_duration_ms(t.miss_time_ms),
+                crate::term::duration_ms(t.miss_time_ms),
                 miss_pct
             ));
         }
         // Per-crate timing breakdown
         if t.total_key_ms > 0 || t.total_lookup_ms > 0 || t.total_restore_ms > 0 {
             lines.push(format!(
-                "| Hit overhead | avg {:.0}ms key + {:.0}ms lookup + {:.0}ms restore |",
+                "| Hit overhead | avg {:.0} ms key + {:.0} ms lookup + {:.0} ms restore |",
                 t.avg_key_ms, t.avg_lookup_ms, t.avg_restore_ms
             ));
         }
         if t.total_store_ms > 0 {
             lines.push(format!(
-                "| Miss overhead | avg {:.0}ms key + {:.0}ms lookup + {:.0}ms store |",
+                "| Miss overhead | avg {:.0} ms key + {:.0} ms lookup + {:.0} ms store |",
                 t.avg_key_ms, t.avg_lookup_ms, t.avg_store_ms
             ));
         }
         lines.push(format!(
-            "| Startup | {} aggregate (avg {:.1}ms/crate) |",
-            format_duration_ms(t.total_startup_ms),
+            "| Startup | {} aggregate (avg {:.1} ms/crate) |",
+            crate::term::duration_ms(t.total_startup_ms),
             t.avg_startup_ms
         ));
         lines.push(format!(
-            "| Dep-info pre-pass | {} runs, {} aggregate (avg {:.1}ms/run) |",
+            "| Dep-info pre-pass | {} runs, {} aggregate (avg {:.1} ms/run) |",
             t.dep_info_runs,
-            format_duration_ms(t.total_dep_info_ms),
+            crate::term::duration_ms(t.total_dep_info_ms),
             t.avg_dep_info_ms
         ));
         lines.push(format!(
             "| Scheduler wait | {} aggregate (flight {}, permit {}) |",
-            format_duration_ms(t.total_wait_ms),
-            format_duration_ms(t.total_flight_wait_ms),
-            format_duration_ms(t.total_permit_wait_ms)
+            crate::term::duration_ms(t.total_wait_ms),
+            crate::term::duration_ms(t.total_flight_wait_ms),
+            crate::term::duration_ms(t.total_permit_wait_ms)
         ));
         lines.push(format!(
-            "| Unattributed | {} aggregate (avg {:.1}ms/crate) |",
-            format_duration_ms(t.total_unattributed_ms),
+            "| Unattributed | {} aggregate (avg {:.1} ms/crate) |",
+            crate::term::duration_ms(t.total_unattributed_ms),
             t.avg_unattributed_ms
         ));
         if p.total_hits > 0 {
@@ -3846,8 +3842,8 @@ pub fn format_github(report: &BuildReport) -> String {
         lines.push(String::new());
         lines.push("<details>".to_string());
         lines.push(format!(
-            "<summary><strong>GC</strong> — {} entries evicted, {} removed from the store</summary>",
-            gc.entries_evicted,
+            "<summary><strong>GC</strong> — {} evicted, {} removed from the store</summary>",
+            crate::term::counted(gc.entries_evicted as u64, "entry", "entries"),
             format_bytes(gc.bytes_freed),
         ));
         lines.push(String::new());
@@ -4105,12 +4101,12 @@ pub fn format_text(report: &BuildReport) -> String {
             "Last GC",
             local_time(&gc.last_run),
             format!(
-                "{} entries evicted, {} removed, {} reclaimed on disk, {} still shared, {} blobs removed",
-                term::count(gc.entries_evicted as u64),
+                "{} evicted, {} removed, {} reclaimed on disk, {} still shared, {} removed",
+                term::counted(gc.entries_evicted as u64, "entry", "entries"),
                 term::bytes(gc.bytes_freed),
                 term::bytes(gc.disk_bytes_reclaimed),
                 term::bytes(gc.shared_bytes_retained),
-                term::count(gc.blobs_removed as u64)
+                term::counted(gc.blobs_removed as u64, "blob", "blobs")
             ),
         ));
     }

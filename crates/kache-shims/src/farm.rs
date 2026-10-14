@@ -432,39 +432,41 @@ impl Status {
         matches!(self, Status::Active { .. })
     }
 
-    pub fn detail(&self) -> String {
+    /// This state in words, with each path written by `show`.
+    pub fn detail(&self, show: &dyn Fn(&Path) -> String) -> String {
         match self {
             Status::Active { name, dir } => {
-                format!("{name} on PATH is a kache shim ({})", dir.display())
+                format!("{name} on PATH is a kache shim ({})", show(dir))
             }
             Status::Broken { dir, names, target } => format!(
                 "broken: {} in {} point at {}, which is missing or not executable",
                 names.join(", "),
-                dir.display(),
-                target.display()
+                show(dir),
+                show(target)
             ),
             Status::NotFirst { dir } => {
-                format!("installed at {}, not first on PATH", dir.display())
+                format!("installed at {}, not first on PATH", show(dir))
             }
             Status::NotInstalled => "not installed".into(),
         }
     }
 
-    /// The command that fixes this state. `default_dir` is `None` without a
-    /// home directory.
-    pub fn fix(&self, default_dir: Option<&Path>) -> Option<String> {
+    /// The command that fixes this state, with each path written by `show`.
+    /// `default_dir` is `None` without a home directory.
+    pub fn fix(
+        &self,
+        default_dir: Option<&Path>,
+        show: &dyn Fn(&Path) -> String,
+    ) -> Option<String> {
         match self {
             Status::Active { .. } => None,
             Status::Broken { dir, .. } if Some(dir.as_path()) == default_dir => {
                 Some("kache install-shims".into())
             }
-            Status::Broken { dir, .. } => Some(format!("kache install-shims {}", dir.display())),
-            Status::NotFirst { dir } => Some(format!("export PATH=\"{}:$PATH\"", dir.display())),
+            Status::Broken { dir, .. } => Some(format!("kache install-shims {}", show(dir))),
+            Status::NotFirst { dir } => Some(format!("export PATH=\"{}:$PATH\"", show(dir))),
             Status::NotInstalled => Some(match default_dir {
-                Some(dir) => format!(
-                    "kache install-shims && export PATH=\"{}:$PATH\"",
-                    dir.display()
-                ),
+                Some(dir) => format!("kache install-shims && export PATH=\"{}:$PATH\"", show(dir)),
                 None => "no home directory: run kache install-shims DIR and put DIR first on PATH"
                     .into(),
             }),

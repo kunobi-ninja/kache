@@ -266,8 +266,8 @@ parse_job_log() {
 
     # Manifest entries
     local me
-    me=$(grep -oE 'Saved manifest: [0-9]+ entries' "$logfile" 2>/dev/null \
-      | head -1 | grep -oE '[0-9]+') || true
+    me=$(grep -oE 'Saved manifest: [0-9,]+ entr(y|ies)' "$logfile" 2>/dev/null \
+      | head -1 | grep -oE '[0-9,]+' | tr -d ',') || true
     me=${me:-0}
     if (( me > manifest_entries )); then
       manifest_entries=$me

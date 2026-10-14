@@ -477,7 +477,7 @@ pub enum TimelineSelection {
     Session(String),
 }
 
-/// Send build timeline records to the configured service.
+/// Send build timeline records to the configured planner.
 ///
 /// Records are advisory, so this reports problems and returns `Ok`: a CI
 /// post-step must not fail a green job because a record did not land.
@@ -501,8 +501,8 @@ pub fn telemetry_push(
 
     let Some(planner) = crate::config::Config::load_planner_config() else {
         println!(
-            "no service configured; set KACHE_PLANNER_ENDPOINT to send {} record(s)",
-            records.len()
+            "no planner configured; set KACHE_PLANNER_ENDPOINT to send {}",
+            term::counted(records.len() as u64, "record", "records")
         );
         return Ok(());
     };
@@ -514,9 +514,9 @@ pub fn telemetry_push(
     for record in &records {
         match rt.block_on(crate::timeline_client::push_timeline(&planner, record)) {
             Ok(answer) => println!(
-                "sent session {} ({} units): {}",
+                "sent session {} ({}): {}",
                 record.session_id,
-                record.units.len(),
+                term::counted(record.units.len() as u64, "unit", "units"),
                 answer.stored
             ),
             Err(error) => eprintln!("warning: session {} not sent: {error:#}", record.session_id),
@@ -536,8 +536,9 @@ fn nothing_to_send(events_seen: usize, versions: &std::collections::BTreeSet<Str
     }
     let versions: Vec<&str> = versions.iter().map(String::as_str).collect();
     format!(
-        "{events_seen} compile(s) in the log, none stamped with a build session: \
+        "{} in the log, none stamped with a build session: \
          the wrapper that wrote them ({}) predates session ids. Upgrade kache on the builder.",
+        term::counted(events_seen as u64, "compile", "compiles"),
         if versions.is_empty() {
             "unknown version".to_string()
         } else {
@@ -998,7 +999,7 @@ pub fn stats(
         println!("{line}");
     }
     println!();
-    println!("Details: kache stats --full");
+    println!("Details: `kache stats --full`");
     Ok(())
 }
 
@@ -1227,9 +1228,9 @@ fn build_rows(snap: &StatsSnapshot) -> Vec<StatsRow> {
         "no builds in this window".to_string()
     } else {
         format!(
-            "{} of {} crates from cache",
+            "{} of {} from cache",
             term::count(hits as u64),
-            term::count(total as u64)
+            term::counted(total as u64, "crate", "crates")
         )
     };
     if es.remote_hits + es.prefetch_hits > 0 {
@@ -1271,8 +1272,8 @@ fn build_rows(snap: &StatsSnapshot) -> Vec<StatsRow> {
 /// Parenthetical for a cap that is the disk-share budget, matching
 /// [`crate::config::describe_max_size`].
 ///
-/// One store whose cap equals that budget says `5% of <disk>, floor 5GiB,
-/// cap 100GiB`, or `default; disk size unknown` when the probe failed. Any
+/// One store whose cap equals that budget says `5% of <disk>, floor 5.0 GiB,
+/// cap 100.0 GiB`, or `default; disk size unknown` when the probe failed. Any
 /// other cap, and a summary that covers more than one store, stays unlabeled.
 fn cache_limit_note(store_count: usize, max_size: u64, filesystem_bytes: Option<u64>) -> String {
     if store_count > 1 {
@@ -1283,7 +1284,7 @@ fn cache_limit_note(store_count: usize, max_size: u64, filesystem_bytes: Option<
         return String::new();
     }
     match filesystem_bytes.filter(|&bytes| bytes > 0) {
-        Some(total) => format!(" (5% of {}, floor 5GiB, cap 100GiB)", ByteSize(total)),
+        Some(total) => format!(" ({})", crate::config::disk_share_note(total)),
         None => " (default; disk size unknown)".to_string(),
     }
 }
@@ -1304,13 +1305,13 @@ fn cache_rows(snap: &StatsSnapshot, config: &Config) -> Vec<StatsRow> {
                     .map_or(snap.total_size, |stats| stats.total_blob_size),
             ),
             format!(
-                "{} · {} entries",
+                "{} · {}",
                 if snap.blob_stats.is_some() {
                     "blob bytes"
                 } else {
                     "logical (blob size unavailable)"
                 },
-                term::count(snap.entry_count as u64)
+                term::counted(snap.entry_count as u64, "entry", "entries")
             ),
         ),
         (
@@ -1336,14 +1337,14 @@ fn cache_rows(snap: &StatsSnapshot, config: &Config) -> Vec<StatsRow> {
                         .map_or(store.bytes, |stats| stats.total_blob_size),
                 ),
                 format!(
-                    "{} · of {} · {} entries · {}",
+                    "{} · of {} · {} · {}",
                     if store.blob_stats.is_some() {
                         "blob bytes"
                     } else {
                         "logical (blob size unavailable)"
                     },
                     term::bytes(store.max_size),
-                    term::count(store.entries as u64),
+                    term::counted(store.entries as u64, "entry", "entries"),
                     term::home_path(&store.path)
                 ),
             ));
@@ -1361,7 +1362,7 @@ fn cache_rows(snap: &StatsSnapshot, config: &Config) -> Vec<StatsRow> {
         };
         rows.push((
             "Dedup",
-            format!("{} blobs", term::count(blob_stats.total_blobs as u64)),
+            term::counted(blob_stats.total_blobs as u64, "blob", "blobs"),
             format!(
                 "{} logical, {savings_pct:.1}% saved",
                 term::bytes(blob_stats.total_logical_size)
@@ -1580,7 +1581,7 @@ fn service_rows(snap: &StatsSnapshot, config: &Config) -> Vec<StatsRow> {
             };
             rows.push((
                 "Key LIST",
-                format!("{} keys", term::count(pf.last_list_key_count)),
+                term::counted(pf.last_list_key_count, "key", "keys"),
                 format!(
                     "in {} ms ({refresh}{refresh_source})",
                     pf.last_list_duration_ms
@@ -1592,12 +1593,12 @@ fn service_rows(snap: &StatsSnapshot, config: &Config) -> Vec<StatsRow> {
         if pf.list_requests_total > 0 {
             rows.push((
                 "LIST total",
-                format!("{} requests", term::count(pf.list_requests_total)),
+                term::counted(pf.list_requests_total, "request", "requests"),
                 format!(
-                    "{} failed, {} ms, {} keys returned",
+                    "{} failed, {} ms, {} returned",
                     term::count(pf.list_failures_total),
                     pf.list_duration_ms_total,
-                    term::count(pf.list_keys_total),
+                    term::counted(pf.list_keys_total, "key", "keys"),
                 ),
             ));
         }
@@ -2717,11 +2718,11 @@ fn held_bytes_note(bytes_held: u64) -> String {
 ///
 /// Pure so the phrasing is unit-testable without running a sweep.
 pub(crate) fn describe_eviction(stats: &crate::store::GcStats, over_limit: bool) -> String {
-    let grace_secs = crate::store::EVICTION_IDLE_GRACE.as_secs();
+    let grace = term::duration_ms(crate::store::EVICTION_IDLE_GRACE.as_millis() as u64);
     let plural = |n: usize| if n == 1 { "entry" } else { "entries" };
     let pinned_note = |n: usize| {
         format!(
-            "\n  {n} more {} accessed within the last {grace_secs}s or awaiting a durable \
+            "\n  {n} more {} accessed within the last {grace} or awaiting a durable \
              remote upload and left in place; run it again once builds and uploads \
              are idle.",
             plural(n),
@@ -2730,7 +2731,7 @@ pub(crate) fn describe_eviction(stats: &crate::store::GcStats, over_limit: bool)
 
     if stats.entries_evicted > 0 {
         let mut msg = format!(
-            " dropped {} {} from the store ({}).",
+            "dropped {} {} from the store ({}).",
             stats.entries_evicted,
             plural(stats.entries_evicted),
             ByteSize(stats.bytes_freed)
@@ -2763,7 +2764,7 @@ pub(crate) fn describe_eviction(stats: &crate::store::GcStats, over_limit: bool)
 
     if stats.entries_unreclaimable > 0 {
         let mut msg = format!(
-            " nothing reclaimable on disk.\n  {} {}{} cloned into build outputs \
+            "nothing reclaimable on disk.\n  {} {}{} cloned into build outputs \
              (same bytes as target/, not extra).\n  Remove stale outputs with \
              `kache clean --stale 14d --dry-run`, then run it again.",
             stats.entries_unreclaimable,
@@ -2779,8 +2780,8 @@ pub(crate) fn describe_eviction(stats: &crate::store::GcStats, over_limit: bool)
     // Nothing evicted. Say why, because this is the case that reads as a bug.
     if stats.entries_pinned > 0 {
         return format!(
-            " evicted 0 entries.\n  {} {} were selected but accessed within the last \
-             {grace_secs}s or are awaiting a durable remote upload, so they were left in \
+            "evicted 0 entries.\n  {} {} were selected but accessed within the last \
+             {grace} or are awaiting a durable remote upload, so they were left in \
              place. Run it again once builds and uploads are idle.",
             stats.entries_pinned,
             plural(stats.entries_pinned),
@@ -2788,13 +2789,13 @@ pub(crate) fn describe_eviction(stats: &crate::store::GcStats, over_limit: bool)
     }
     if over_limit {
         return format!(
-            " evicted 0 entries.\n  The store is still over its limit but nothing was \
-             eligible. Entries accessed within the last {grace_secs}s are never evicted; \
+            "evicted 0 entries.\n  The store is still over its limit but nothing was \
+             eligible. Entries accessed within the last {grace} are never evicted; \
              if this persists with no builds running, `kache doctor --verify` will \
              report entries that cannot be removed."
         );
     }
-    " evicted 0 entries (nothing to evict).".to_string()
+    "evicted 0 entries (nothing to evict).".to_string()
 }
 
 /// Is the store over its configured budget after a sweep?
@@ -3615,7 +3616,7 @@ pub fn list(
         ));
         lines.push(String::new());
         lines.push(term::paint(
-            format!("{} entries", term::count(entries.len() as u64)),
+            term::counted(entries.len() as u64, "entry", "entries"),
             term::Style::Muted,
         ));
         write_paged(&lines, no_pager);
@@ -3837,7 +3838,10 @@ pub fn run_gc_local(config: &Config, mode: GcMode) -> Result<crate::store::GcSta
     let backfilled = store.backfill_content_hashes().unwrap_or(0);
     if verbose {
         if backfilled > 0 {
-            println!(" {backfilled} entries updated.");
+            println!(
+                " {} updated.",
+                term::counted(backfilled as u64, "entry", "entries")
+            );
         } else {
             println!(" up to date.");
         }
@@ -3851,7 +3855,10 @@ pub fn run_gc_local(config: &Config, mode: GcMode) -> Result<crate::store::GcSta
     let costs = store.backfill_compile_times().unwrap_or(0);
     if verbose {
         if costs > 0 {
-            println!(" {costs} entries updated.");
+            println!(
+                " {} updated.",
+                term::counted(costs as u64, "entry", "entries")
+            );
         } else {
             println!(" up to date.");
         }
@@ -3865,7 +3872,10 @@ pub fn run_gc_local(config: &Config, mode: GcMode) -> Result<crate::store::GcSta
     let mapped = store.backfill_entry_blobs().unwrap_or(0);
     if verbose {
         if mapped > 0 {
-            println!(" {mapped} entries updated.");
+            println!(
+                " {} updated.",
+                term::counted(mapped as u64, "entry", "entries")
+            );
         } else {
             println!(" up to date.");
         }
@@ -3886,8 +3896,8 @@ pub fn run_gc_local(config: &Config, mode: GcMode) -> Result<crate::store::GcSta
         if verbose {
             if age_stats.entries_evicted > 0 {
                 println!(
-                    " dropped {} entries from the store ({}); {} became free on disk.",
-                    age_stats.entries_evicted,
+                    " dropped {} from the store ({}); {} became free on disk.",
+                    term::counted(age_stats.entries_evicted as u64, "entry", "entries"),
                     crate::report::format_bytes(age_stats.bytes_freed),
                     crate::report::format_bytes(age_stats.disk_bytes_reclaimed),
                 );
@@ -3907,7 +3917,14 @@ pub fn run_gc_local(config: &Config, mode: GcMode) -> Result<crate::store::GcSta
     add_gc_stats(&mut combined, &dedup_stats);
     if verbose {
         if dedup_stats.entries_evicted > 0 {
-            println!(" removed {} duplicates.", dedup_stats.entries_evicted);
+            println!(
+                " removed {}.",
+                term::counted(
+                    dedup_stats.entries_evicted as u64,
+                    "duplicate",
+                    "duplicates"
+                )
+            );
         } else {
             println!(" no duplicates found.");
         }
@@ -3927,7 +3944,7 @@ pub fn run_gc_local(config: &Config, mode: GcMode) -> Result<crate::store::GcSta
                 .map(|size| size.saturating_sub(evict_stats.bytes_held)),
             config.max_size,
         );
-        println!("{}", describe_eviction(&evict_stats, over_limit));
+        println!(" {}", describe_eviction(&evict_stats, over_limit));
     }
 
     // Key lock files and input predictions grow with every distinct key and
@@ -3936,12 +3953,23 @@ pub fn run_gc_local(config: &Config, mode: GcMode) -> Result<crate::store::GcSta
     combined.housekeeping = Some(housekeeping);
     if verbose {
         println!(
-            "Housekeeping: removed {} stale key locks ({} remain), {} unused input predictions, \
-             {} old file hashes.",
-            housekeeping.key_locks_removed,
+            "Housekeeping: removed {} ({} remain), {}, {}.",
+            term::counted(
+                housekeeping.key_locks_removed as u64,
+                "stale key lock",
+                "stale key locks"
+            ),
             housekeeping.key_locks_remaining,
-            housekeeping.predictions_pruned,
-            housekeeping.file_hashes_pruned,
+            term::counted(
+                housekeeping.predictions_pruned as u64,
+                "unused input prediction",
+                "unused input predictions"
+            ),
+            term::counted(
+                housekeeping.file_hashes_pruned as u64,
+                "old file hash",
+                "old file hashes"
+            ),
         );
     }
 
@@ -4145,10 +4173,10 @@ fn human_gc_output(json: bool) -> bool {
 
 fn gc_store_usage(store: &Store, max_size: u64, filesystem_bytes: Option<u64>) -> Result<String> {
     Ok(format!(
-        "{} / {} ({} entries)",
+        "{} / {} · {}",
         ByteSize(store.physical_size()?),
         crate::config::describe_max_size(max_size, filesystem_bytes),
-        store.entry_count()?
+        term::counted(store.entry_count()? as u64, "entry", "entries")
     ))
 }
 
@@ -4246,13 +4274,17 @@ pub fn gc(
             return emit_gc_json(config, false, &stats);
         }
         println!(
-            "Stale-schema GC:{}\nCurrent key schema: {}.",
+            "Stale-schema GC: {}\nCurrent key schema: {}.",
             describe_eviction(&stats, false),
             crate::cache_key::CACHE_KEY_VERSION,
         );
         let total_size = store.physical_size()?;
         let entry_count = store.entry_count()?;
-        println!("Store: {} ({} entries)", ByteSize(total_size), entry_count);
+        println!(
+            "Store: {} · {}",
+            ByteSize(total_size),
+            term::counted(entry_count as u64, "entry", "entries")
+        );
         return Ok(());
     }
 
@@ -4301,18 +4333,18 @@ pub fn gc(
                             .map(|size| size.saturating_sub(combined.bytes_held)),
                         config.max_size,
                     );
-                    println!("{}", describe_eviction(&combined, over_limit));
+                    println!("Eviction: {}", describe_eviction(&combined, over_limit));
                 }
             } else if human_gc_output(json) {
                 if let Some(hours) = max_age_hours {
                     println!(
-                        "Evicted {} entries older than {hours}h.",
-                        outcome.evicted.unwrap_or(0)
+                        "Evicted {} older than {hours}h.",
+                        term::counted(outcome.evicted.unwrap_or(0) as u64, "entry", "entries")
                     );
                 } else {
                     println!(
-                        "Evicted {} entries (daemon returned no per-policy breakdown).",
-                        outcome.evicted.unwrap_or(0)
+                        "Evicted {} (daemon returned no per-policy breakdown).",
+                        term::counted(outcome.evicted.unwrap_or(0) as u64, "entry", "entries")
                     );
                 }
                 combined.entries_evicted = outcome.evicted.unwrap_or(0);
@@ -4350,7 +4382,7 @@ pub fn gc(
                             .map(|size| size.saturating_sub(evict_stats.bytes_held)),
                         config.max_size,
                     );
-                    println!("{}", describe_eviction(&evict_stats, over_limit));
+                    println!(" {}", describe_eviction(&evict_stats, over_limit));
                 }
             } else {
                 combined = run_gc_local_with_shards(
@@ -4408,7 +4440,10 @@ pub fn purge(config: &Config, crate_filter: Option<&str>) -> Result<()> {
                 removed += 1;
             }
         }
-        println!("Removed {removed} entries for '{name}'.");
+        println!(
+            "Removed {} for '{name}'.",
+            term::counted(removed as u64, "entry", "entries")
+        );
         if skipped > 0 {
             println!(
                 "Skipped {skipped} corrupt entr{} (see warnings above).",
@@ -4916,9 +4951,9 @@ fn removal_words(what: &CacheClean, entries: usize, bytes: u64) -> String {
 fn cache_preview(what: &CacheClean, entries: usize, bytes: u64) -> String {
     match what {
         CacheClean::OlderThan(hours) => format!(
-            "Cache is {} in {} entries. This would evict the entries older than {}.",
+            "Cache is {} in {}. This would evict the entries older than {}.",
             term::bytes(bytes),
-            term::count(entries as u64),
+            term::counted(entries as u64, "entry", "entries"),
             window_label(*hours)
         ),
         CacheClean::StaleSchema => format!(
@@ -5003,8 +5038,8 @@ fn unit_cleanup_needs_confirmation(preview: bool, units: usize) -> bool {
 fn render_unit_plan(path: &str, plan: &crate::target_liveness::Plan) -> String {
     if plan.status == "ready" {
         format!(
-            "{path}: {} obsolete units ({}), {} live and {} unknown units kept",
-            plan.units,
+            "{path}: {} ({}), {} live and {} unknown units kept",
+            term::counted(plan.units as u64, "obsolete unit", "obsolete units"),
             ByteSize(plan.bytes),
             plan.protected,
             plan.unknown
@@ -5126,7 +5161,8 @@ fn unit_clean_summary(
         return Some("Nothing removed.".into());
     }
     Some(format!(
-        "Removed {removed} obsolete units ({}).",
+        "Removed {} ({}).",
+        term::counted(removed as u64, "obsolete unit", "obsolete units"),
         ByteSize(bytes)
     ))
 }
@@ -5610,7 +5646,7 @@ fn held_reason(holders: &[crate::target_use::Holder], now: u64) -> String {
         .collect();
     match named.as_slice() {
         [] => {
-            "another Kache cleanup or a running Cargo command holds Kache's target lock".to_owned()
+            "another kache cleanup or a running Cargo command holds kache's target lock".to_owned()
         }
         [one] => format!("waiting for {one} to exit"),
         [rest @ .., last] => format!("waiting for {} and {last} to exit", rest.join(", ")),
@@ -5904,8 +5940,8 @@ fn unit_cleanup_note(plan: &crate::target_liveness::Plan) -> String {
     match plan.status.as_str() {
         "" | "off" => String::new(),
         "ready" if plan.units > 0 => format!(
-            "  ({} obsolete units: kache clean --units --dry-run)",
-            plan.units
+            "  ({}: `kache clean --units --dry-run`)",
+            term::counted(plan.units as u64, "obsolete unit", "obsolete units")
         ),
         "ready" => String::new(),
         status => format!("  (unit cleanup: {status})"),
@@ -6214,10 +6250,10 @@ fn plan_lines(
     }
     lines.push(String::new());
     lines.push(format!(
-        "Cache    {} of {} · {} entries · kept under its limit automatically; `kache clean --cache` empties it",
+        "Cache    {} of {} · {} · kept under its limit automatically; `kache clean --cache` empties it",
         term::bytes(cache.bytes),
         term::bytes(cache.limit),
-        term::count(cache.entries)
+        term::counted(cache.entries, "entry", "entries")
     ));
     lines.push(String::new());
     lines.push(match end {
@@ -7104,7 +7140,8 @@ pub(crate) fn doctor_shards(config: &Config) -> Vec<Check> {
                         label: "Volume store",
                         pass: fs.is_none() && !drift,
                         detail: format!(
-                            "{path}: {entries} entries, {} / {}{}",
+                            "{path}: {}, {} / {}{}",
+                            term::counted(entries as u64, "entry", "entries"),
                             ByteSize(bytes),
                             ByteSize(shard.max_size),
                             if drift {
@@ -7164,10 +7201,10 @@ fn doctor_index_quarantines(config: &Config) -> Check {
             label: "Store quarantine",
             pass: false,
             detail: format!(
-                "{} files ({}) retained in {} after index corruption",
-                files.len(),
+                "{} ({}) retained in {} after index corruption",
+                term::counted(files.len() as u64, "file", "files"),
                 ByteSize(files.iter().map(|file| file.bytes).sum::<u64>()),
-                config.cache_dir.display()
+                term::home_path(&config.cache_dir)
             ),
             fix: Some("save the index.db.corrupt-* files if needed for investigation; `kache clean --cache` removes them along with all cached artifacts".to_string()),
         },
@@ -7475,10 +7512,14 @@ pub fn doctor(
                 label: "Store totals",
                 pass: view.stores.iter().all(|s| s.error.is_none()),
                 detail: format!(
-                    "{} unique entries, {} stored across {} configured stores",
-                    view.entry_count,
+                    "{}, {} stored across {}",
+                    term::counted(view.entry_count as u64, "unique entry", "unique entries"),
                     ByteSize(view.total_size),
-                    view.stores.len()
+                    term::counted(
+                        view.stores.len() as u64,
+                        "configured store",
+                        "configured stores"
+                    )
                 ),
                 fix: None,
             });
@@ -7638,7 +7679,7 @@ pub fn doctor(
             label: "Daemon service",
             pass,
             detail: if installed {
-                service_path.display().to_string()
+                term::home_path(&service_path)
             } else if healthy_daemon_reachable {
                 "not installed; healthy on-demand daemon is reachable".into()
             } else {
@@ -7684,8 +7725,11 @@ pub fn doctor(
     checks.push(Check {
         label: "C/C++ shims",
         pass: shim_status.is_active(),
-        detail: shim_status.detail(),
-        fix: shim_status.fix(crate::compiler::shim::default_shim_dir().as_deref()),
+        detail: shim_status.detail(&|path| term::home_path(path)),
+        fix: shim_status.fix(
+            crate::compiler::shim::default_shim_dir().as_deref(),
+            &|path| term::shell_home_path(path),
+        ),
     });
     #[cfg(unix)]
     if let Some(dir) = crate::compiler::shim::default_shim_dir()
@@ -7847,7 +7891,10 @@ pub fn doctor(
     if issues == 0 {
         println!("  \x1b[32mAll checks passed.\x1b[0m");
     } else {
-        println!("  \x1b[31m{issues} issue(s) found.\x1b[0m");
+        println!(
+            "  \x1b[31m{} found.\x1b[0m",
+            term::counted(issues as u64, "issue", "issues")
+        );
     }
     if downgraded_daemon {
         println!(
@@ -8117,7 +8164,7 @@ fn migration_summary(
     let mut out = String::from("\nMigration summary:\n");
     if actions.is_empty() && rc_changes.is_empty() {
         out.push_str("  No sccache configuration found. Nothing to migrate.\n");
-        out.push_str("\n  If Cargo is not using kache yet, run: kache init\n");
+        out.push_str("\n  If Cargo is not using kache yet, run `kache init`.\n");
         return out;
     }
 
@@ -8149,11 +8196,11 @@ fn migration_summary(
 
     if !purge_sccache {
         out.push_str(
-            "\n  Tip: run `kache doctor --fix --purge-sccache` to also remove sccache cache and binary\n",
+            "\n  To also remove the sccache cache and binary, run `kache doctor --fix --purge-sccache`.\n",
         );
     }
 
-    out.push_str("\n  Then verify with: kache doctor\n");
+    out.push_str("\n  Then verify with `kache doctor`.\n");
     out
 }
 
@@ -8225,7 +8272,8 @@ async fn sync_inner(
     // time and can leave an interactive prompt hanging.
     if pull_workspace && workspace_crates.is_none_or(|crates| crates.is_empty()) {
         anyhow::bail!(
-            "--workspace: no workspace members resolved (cargo metadata failed or this is not              a Cargo workspace); refusing to fall back to a full remote scan"
+            "--workspace: no workspace members resolved (cargo metadata failed or this is not a \
+             Cargo workspace); refusing to fall back to a full remote scan"
         );
     }
 
@@ -8305,27 +8353,31 @@ async fn sync_with_client(
             // can't catch it either).
             let crates = workspace_crates.filter(|c| !c.is_empty()).ok_or_else(|| {
                 anyhow::anyhow!(
-                    "--workspace: no workspace members resolved (cargo metadata                      failed or this is not a Cargo workspace); refusing to fall                      back to a full remote scan"
+                    "--workspace: no workspace members resolved (cargo metadata failed or this is not a \
+             Cargo workspace); refusing to fall back to a full remote scan"
                 )
             })?;
             eprint!(
-                "Listing remote keys for {} workspace crates...",
-                crates.len()
+                "Listing remote keys for {}...",
+                term::counted(crates.len() as u64, "workspace crate", "workspace crates")
             );
             let keys = list_remote_crates(remote_cache, crates, config.s3_concurrency)
                 .await
                 .context("listing remote keys for workspace crates")?;
-            eprintln!(" {} keys", keys.len());
+            eprintln!(" {}", term::counted(keys.len() as u64, "key", "keys"));
             keys
         } else if !pull_all
             && let Some(crates) = lock_crates
             && !crates.is_empty()
         {
-            eprint!("Listing remote keys for {} crates...", crates.len());
+            eprint!(
+                "Listing remote keys for {}...",
+                term::counted(crates.len() as u64, "crate", "crates")
+            );
             let keys = list_remote_crates(remote_cache, crates, config.s3_concurrency)
                 .await
                 .context("listing remote keys for dependency crates")?;
-            eprintln!(" {} keys", keys.len());
+            eprintln!(" {}", term::counted(keys.len() as u64, "key", "keys"));
             keys
         } else {
             eprint!("Listing remote keys...");
@@ -8333,7 +8385,7 @@ async fn sync_with_client(
                 .list_keys()
                 .await
                 .context("listing remote keys")?;
-            eprintln!(" {} keys", keys.len());
+            eprintln!(" {}", term::counted(keys.len() as u64, "key", "keys"));
             keys
         }
     } else {
@@ -8343,7 +8395,7 @@ async fn sync_with_client(
             .list_keys()
             .await
             .context("listing remote keys")?;
-        eprintln!(" {} keys", keys.len());
+        eprintln!(" {}", term::counted(keys.len() as u64, "key", "keys"));
         keys
     };
 
@@ -8683,7 +8735,7 @@ fn save_manifest_impl(
     let remote = config
         .remote
         .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("No remote configured"))?;
+        .ok_or_else(|| anyhow::anyhow!("no remote configured"))?;
 
     let events = crate::events::read_events(&config.event_log_path())?;
     let entries = manifest_entries_from_events(&events, session_id);
@@ -8751,7 +8803,8 @@ fn save_manifest_impl(
 
     if announce {
         eprintln!(
-            "Saved manifest: {entry_count} entries for '{}'",
+            "Saved manifest: {} for '{}'",
+            term::counted(entry_count as u64, "entry", "entries"),
             published.join("', '")
         );
     }
@@ -8953,7 +9006,7 @@ fn workspace_filter(manifest_path: Option<&str>) -> Option<std::collections::Has
         .map(|mp| match get_workspace_crate_names(mp) {
             Ok(names) => names.into_iter().collect(),
             Err(e) => {
-                eprintln!("Warning: cargo metadata failed for {mp}: {e}");
+                eprintln!("warning: cargo metadata failed for {mp}: {e}");
                 std::collections::HashSet::new()
             }
         })
@@ -8962,7 +9015,7 @@ fn workspace_filter(manifest_path: Option<&str>) -> Option<std::collections::Has
                 match get_workspace_crate_names("Cargo.toml") {
                     Ok(names) => Some(names.into_iter().collect()),
                     Err(e) => {
-                        eprintln!("Warning: cargo metadata failed: {e}");
+                        eprintln!("warning: cargo metadata failed: {e}");
                         None
                     }
                 }
@@ -9235,7 +9288,7 @@ fn verify_store(config: &Config, checksums: bool, repair: bool) -> Result<Verify
                 stats.blobs_registered,
             ),
             Ok(_) => {}
-            Err(e) => println!("Warning: could not rebuild index rows from the store: {e:#}"),
+            Err(e) => eprintln!("warning: could not rebuild index rows from the store: {e:#}"),
         }
     }
 
@@ -9443,8 +9496,8 @@ fn verify_store(config: &Config, checksums: bool, repair: bool) -> Result<Verify
                     .count();
                 if !dropped.is_empty() {
                     println!(
-                        "Repairing: removed {} entries that failed verification.",
-                        dropped.len()
+                        "Repairing: removed {} that failed verification.",
+                        term::counted(dropped.len() as u64, "entry", "entries")
                     );
                 }
                 if let Some(message) = reconciled_index_message(drift) {
@@ -9514,15 +9567,15 @@ fn verify_store(config: &Config, checksums: bool, repair: bool) -> Result<Verify
                 "Repairing: removed {removed} stale C/C++ memos and {inputs} unreferenced inputs"
             ),
             Ok(_) => {}
-            Err(error) => println!("Warning: could not prune C/C++ memos: {error}"),
+            Err(error) => eprintln!("warning: could not prune C/C++ memos: {error}"),
         }
         match memos.prune_input_predictions() {
             Ok(removed) => println!("Repairing: removed {removed} unused input predictions"),
-            Err(error) => println!("Warning: could not prune input predictions: {error}"),
+            Err(error) => eprintln!("warning: could not prune input predictions: {error}"),
         }
         match memos.prune_file_hashes() {
             Ok(removed) => println!("Repairing: removed {removed} old file hashes"),
-            Err(error) => println!("Warning: could not prune file hashes: {error}"),
+            Err(error) => eprintln!("warning: could not prune file hashes: {error}"),
         }
         match memos.compact_sparse_index() {
             Ok(Some((before, after))) => println!(
@@ -9531,7 +9584,7 @@ fn verify_store(config: &Config, checksums: bool, repair: bool) -> Result<Verify
                 ByteSize(after)
             ),
             Ok(None) => {}
-            Err(error) => println!("Warning: index compaction deferred: {error:#}"),
+            Err(error) => eprintln!("warning: index compaction deferred: {error:#}"),
         }
     }
 
@@ -9554,7 +9607,7 @@ fn verify_store(config: &Config, checksums: bool, repair: bool) -> Result<Verify
     if should_print_repair_tip(corrupted_entries, orphaned_blobs, index_drift, repair) {
         println!();
         println!(
-            "Tip: run `kache doctor --repair` to remove corrupted entries, reconcile the blob index, and reclaim orphaned blobs."
+            "Run `kache doctor --repair` to remove corrupted entries, reconcile the blob index, and reclaim orphaned blobs."
         );
     }
 
@@ -10131,7 +10184,7 @@ fn read_config_text(path: &std::path::Path) -> Result<String> {
     match std::fs::read_to_string(path) {
         Ok(text) => Ok(text),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
-        Err(error) => Err(error).context("read Kache configuration"),
+        Err(error) => Err(error).context("read kache configuration"),
     }
 }
 
@@ -10150,7 +10203,7 @@ fn save_target_recovery(path: &std::path::Path, existing: &str) -> Result<bool> 
         std::fs::create_dir_all(parent)?;
     }
     let permissions = std::fs::metadata(path).ok().map(|meta| meta.permissions());
-    crate::atomic::atomic_replace(path, updated.as_bytes()).context("save Kache configuration")?;
+    crate::atomic::atomic_replace(path, updated.as_bytes()).context("save kache configuration")?;
     if let Some(permissions) = permissions {
         std::fs::set_permissions(path, permissions)
             .context("keep the configuration's permissions")?;
@@ -10283,7 +10336,7 @@ pub fn init(yes: bool, no_service: bool, no_shell: bool, check: bool) -> Result<
         plan_rows.push((
             "Service",
             "login".into(),
-            "start Kache at login when a login service is available".into(),
+            "start kache at login when a login service is available".into(),
         ));
     }
     plan_rows.push((
@@ -10319,11 +10372,11 @@ pub fn init(yes: bool, no_service: bool, no_shell: bool, check: bool) -> Result<
         if check {
             println!("    Would configure Cargo. Existing compiler choices are preserved.");
             if let CargoWrapperPlan::Replace(old) = &plan {
-                println!("    Would replace {old} with Kache for Cargo builds.");
+                println!("    Would replace {old} with kache for Cargo builds.");
             }
         } else if match &plan {
             CargoWrapperPlan::Replace(old) => prompt_yes_no(
-                &format!("Replace {old} with Kache for Cargo builds?"),
+                &format!("Replace {old} with kache for Cargo builds?"),
                 true,
                 yes,
             )?,
@@ -10378,7 +10431,7 @@ pub fn init(yes: bool, no_service: bool, no_shell: bool, check: bool) -> Result<
         // the unit would fail, so start the daemon directly below (#1080).
         println!("  • Login service: unavailable (no systemd user session)");
     } else if let Some(problem) = service_problem {
-        println!("  \x1b[33m→\x1b[0m Background service: update to this Kache binary");
+        println!("  \x1b[33m→\x1b[0m Background service: update to this kache binary");
         println!("    {}", problem.detail());
         if !check {
             service_action_taken = install_login_service();
@@ -10389,7 +10442,7 @@ pub fn init(yes: bool, no_service: bool, no_shell: bool, check: bool) -> Result<
             service_path.as_ref().unwrap().display()
         );
     } else {
-        println!("  \x1b[33m→\x1b[0m Background service: start Kache when you log in");
+        println!("  \x1b[33m→\x1b[0m Background service: start kache when you log in");
         if !check {
             service_action_taken = install_login_service();
         }
@@ -10400,7 +10453,7 @@ pub fn init(yes: bool, no_service: bool, no_shell: bool, check: bool) -> Result<
     // manual start if we just installed it.
     if check {
         println!("  Background cache: would check and start if needed.");
-        println!("\n  Preview only. Run kache init to apply.\n");
+        println!("\n  Preview only. Run `kache init` to apply.\n");
         if crate::machine::is_json() {
             crate::machine::emit(
                 "init",
@@ -10763,7 +10816,7 @@ fn stale_shims_check(dir: &std::path::Path, path: &std::ffi::OsStr) -> Option<Ch
         detail: format!(
             "no real compiler on PATH behind {} in {}",
             stale.join(", "),
-            dir.display()
+            term::home_path(dir)
         ),
         fix: Some("kache install-shims".into()),
     })
@@ -10842,8 +10895,8 @@ fn install_report_lines(
     report: &kache_shims::Installed,
 ) -> Vec<String> {
     let mut lines = vec![format!(
-        "Created {} shim(s) in {} -> {}",
-        report.created.len(),
+        "Created {} in {} -> {}",
+        term::counted(report.created.len() as u64, "shim", "shims"),
         dir.display(),
         target.path.display()
     )];
@@ -10851,34 +10904,54 @@ fn install_report_lines(
         lines.push(format!("  {}", report.created.join(", ")));
     }
     let groups = [
-        (&report.repaired, "Repaired", "broken shim(s)"),
-        (&report.refreshed, "Moved", "shim(s) off a versioned path"),
-        (&report.replaced, "Replaced", "existing entr(ies)"),
+        (
+            &report.repaired,
+            "Repaired",
+            ("broken shim", "broken shims"),
+            "",
+        ),
+        (
+            &report.refreshed,
+            "Moved",
+            ("shim", "shims"),
+            " off a versioned path",
+        ),
+        (
+            &report.replaced,
+            "Replaced",
+            ("existing entry", "existing entries"),
+            "",
+        ),
         (
             &report.pruned,
             "Removed",
-            "shim(s) with no compiler behind them",
+            ("shim", "shims"),
+            " with no compiler",
         ),
     ];
-    for (names, verb, what) in groups {
+    for (names, verb, (one, many), tail) in groups {
         if !names.is_empty() {
             lines.push(format!(
-                "{verb} {} {what}: {}",
-                names.len(),
+                "{verb} {}{tail}: {}",
+                term::counted(names.len() as u64, one, many),
                 names.join(", ")
             ));
         }
     }
     if !report.skipped.is_empty() {
         lines.push(format!(
-            "Skipped {} existing entr(ies): {} (use --force to replace)",
-            report.skipped.len(),
+            "Skipped {}: {} (use --force to replace)",
+            term::counted(
+                report.skipped.len() as u64,
+                "existing entry",
+                "existing entries"
+            ),
             report.skipped.join(", ")
         ));
     }
     if !target.stability.survives_upgrade() {
         lines.push(format!(
-            "Note: {}. Rerun kache install-shims after upgrading kache.",
+            "note: {}. Rerun `kache install-shims` after upgrading kache.",
             target.reason
         ));
     }
@@ -11170,13 +11243,13 @@ mod shim_install_tests {
             &report,
         );
         let expected = [
-            "Created 1 shim(s) in /home/me/shims -> /opt/homebrew/opt/kache/bin/kache",
+            "Created 1 shim in /home/me/shims -> /opt/homebrew/opt/kache/bin/kache",
             "  cc",
-            "Repaired 2 broken shim(s): gcc, g++",
-            "Moved 1 shim(s) off a versioned path: clang",
-            "Replaced 1 existing entr(ies): c++",
-            "Removed 1 shim(s) with no compiler behind them: gcc-14",
-            "Skipped 1 existing entr(ies): gcc-13 (use --force to replace)",
+            "Repaired 2 broken shims: gcc, g++",
+            "Moved 1 shim off a versioned path: clang",
+            "Replaced 1 existing entry: c++",
+            "Removed 1 shim with no compiler: gcc-14",
+            "Skipped 1 existing entry: gcc-13 (use --force to replace)",
             "",
             "Add it to PATH ahead of your toolchain:",
             "  export PATH=\"/home/me/shims:$PATH\"",
@@ -11197,8 +11270,8 @@ mod shim_install_tests {
         assert_eq!(
             &lines[..3],
             [
-                "Created 0 shim(s) in /home/me/shims -> /opt/homebrew/opt/kache/bin/kache",
-                "Note: Homebrew's opt link does not reach this binary. Rerun kache install-shims after upgrading kache.",
+                "Created 0 shims in /home/me/shims -> /opt/homebrew/opt/kache/bin/kache",
+                "note: Homebrew's opt link does not reach this binary. Rerun `kache install-shims` after upgrading kache.",
                 "Left /home/me/shims without a .kache-shims marker: it holds files that are not kache links.",
             ]
         );

@@ -696,7 +696,7 @@ impl Config {
         if self.local_only {
             anyhow::bail!("local-only mode is enabled, so no remote cache is available");
         }
-        anyhow::bail!("No remote configured. Run `kache config` to set one up.")
+        anyhow::bail!("no remote configured; run `kache config` to set one up")
     }
 
     /// Whether `crate_name` is on the incremental force-list.
@@ -4398,13 +4398,20 @@ pub(crate) fn describe_max_size(max_size: u64, filesystem_bytes: Option<u64>) ->
         return ByteSize(max_size).to_string();
     }
     match filesystem_bytes.filter(|&n| n > 0) {
-        Some(total) => format!(
-            "{} (5% of {}, floor 5GiB, cap 100GiB)",
-            ByteSize(max_size),
-            ByteSize(total)
-        ),
+        Some(total) => format!("{} ({})", ByteSize(max_size), disk_share_note(total)),
         None => format!("{} (default; disk size unknown)", ByteSize(max_size)),
     }
+}
+
+/// `5% of 1.8 TiB, floor 5.0 GiB, cap 100.0 GiB`: how the disk-share default
+/// was derived for a volume of `total` bytes.
+pub(crate) fn disk_share_note(total: u64) -> String {
+    format!(
+        "{DISK_SHARE_PERCENT}% of {}, floor {}, cap {}",
+        ByteSize(total),
+        ByteSize(DISK_SHARE_FLOOR),
+        ByteSize(DISK_SHARE_CAP)
+    )
 }
 
 /// Like [`parse_size_checked`], but `"none"` is not a size: unbounded stores

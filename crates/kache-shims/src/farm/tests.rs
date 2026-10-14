@@ -603,16 +603,39 @@ fn status_wording_names_the_fix() {
             Some("kache install-shims && export PATH=\"/home/me/.local/lib/kache/shims:$PATH\""),
         ),
     ];
+    let plain = |path: &Path| path.display().to_string();
     for (status, detail, fix) in rows {
-        assert_eq!(status.detail(), detail);
-        assert_eq!(status.fix(Some(default)).as_deref(), fix, "{detail}");
+        assert_eq!(status.detail(&plain), detail);
+        assert_eq!(
+            status.fix(Some(default), &plain).as_deref(),
+            fix,
+            "{detail}"
+        );
     }
+    // Paths go through the caller's form, in the words and in the command.
+    let home = |path: &Path| {
+        path.strip_prefix("/home/me").map_or_else(
+            |_| path.display().to_string(),
+            |rest| format!("$HOME/{}", rest.display()),
+        )
+    };
+    let not_first = Status::NotFirst { dir: FARM.into() };
+    assert_eq!(
+        not_first.detail(&home),
+        "installed at $HOME/.local/lib/kache/shims, not first on PATH"
+    );
+    assert_eq!(
+        not_first.fix(Some(default), &home).as_deref(),
+        Some("export PATH=\"$HOME/.local/lib/kache/shims:$PATH\"")
+    );
     // Without a home directory there is no default farm to name.
     assert_eq!(
-        broken(FARM, &["cc"], "/gone/kache").fix(None).as_deref(),
+        broken(FARM, &["cc"], "/gone/kache")
+            .fix(None, &plain)
+            .as_deref(),
         Some("kache install-shims /home/me/.local/lib/kache/shims")
     );
-    let homeless = Status::NotInstalled.fix(None).unwrap();
+    let homeless = Status::NotInstalled.fix(None, &plain).unwrap();
     assert!(homeless.starts_with("no home directory"), "{homeless}");
 }
 

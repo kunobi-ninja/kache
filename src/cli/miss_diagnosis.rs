@@ -71,7 +71,7 @@ impl MissDiagnosis {
 /// recommending path normalization for variables that affect compiled output.
 pub(super) fn env_hints(names: &[String]) -> Vec<String> {
     names.iter().map(|name| match name.as_str() {
-        "CARGO_MANIFEST_DIR" => "CARGO_MANIFEST_DIR differs: this crate embeds its checkout path; Kache keeps those builds separate".to_string(),
+        "CARGO_MANIFEST_DIR" => "CARGO_MANIFEST_DIR differs: this crate embeds its checkout path; kache keeps those builds separate".to_string(),
         "OUT_DIR" => "OUT_DIR differs: this crate reads its build-script output path; compare the generated files and their paths before changing cache-key settings".to_string(),
         _ => format!("{name} differs: use the same value in both builds if they should produce the same output"),
     }).collect()
@@ -100,7 +100,7 @@ mod tests {
         assert_eq!(
             hints,
             [
-                "CARGO_MANIFEST_DIR differs: this crate embeds its checkout path; Kache keeps those builds separate",
+                "CARGO_MANIFEST_DIR differs: this crate embeds its checkout path; kache keeps those builds separate",
                 "OUT_DIR differs: this crate reads its build-script output path; compare the generated files and their paths before changing cache-key settings",
                 "BUILD_MODE differs: use the same value in both builds if they should produce the same output",
             ]

@@ -111,3 +111,15 @@ fn environment_documentation_refreshes_without_replaying_cached_output() {
         );
     }
 }
+
+#[test]
+fn documentation_without_env_macros_keeps_warm_reuse_across_env_changes() {
+    let fixture = DocFixture::new("//! STATIC_MARKER\npub fn thing() {}\n");
+    assert!(fixture.run(true, "OLD_MARKER").contains("STATIC_MARKER"));
+    assert!(fixture.run(true, "NEW_MARKER").contains("STATIC_MARKER"));
+    let events = fixture.events();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0]["result"], "miss");
+    assert_eq!(events[1]["result"], "local_hit");
+    assert_eq!(events[0]["cache_key"], events[1]["cache_key"]);
+}

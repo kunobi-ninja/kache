@@ -73,7 +73,7 @@ semver = "1"
 base64 = "0.23"
 toml = "1"
 toml_edit = "0.25"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "string"] }
 clap_complete = "4"
 rusqlite = { version = "0.40", features = ["bundled"] }
 ratatui = "0.30"

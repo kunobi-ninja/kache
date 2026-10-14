@@ -73,9 +73,10 @@ impl Output {
             ),
             columns: terminal
                 .then(|| {
-                    crossterm::terminal::size()
-                        .ok()
-                        .map(|(w, _)| usize::from(w))
+                    usable_columns(
+                        crossterm::terminal::size().ok().map(|(w, _)| w),
+                        std::env::var("COLUMNS").ok().as_deref(),
+                    )
                 })
                 .flatten(),
         }
@@ -105,6 +106,20 @@ impl Output {
         };
         format!("\x1b[{code}m{text}\x1b[0m")
     }
+}
+
+/// Narrower than this, a reported width is not a real terminal's: some
+/// multiplexers and `script` report 0 columns without an error.
+const MIN_COLUMNS: usize = 20;
+
+/// The width to wrap at: the terminal's, then `$COLUMNS`, each only when it
+/// is at least [`MIN_COLUMNS`]. `None` means no wrapping.
+fn usable_columns(reported: Option<u16>, env_columns: Option<&str>) -> Option<usize> {
+    let usable = |columns: usize| (columns >= MIN_COLUMNS).then_some(columns);
+    reported
+        .map(usize::from)
+        .and_then(usable)
+        .or_else(|| env_columns?.trim().parse().ok().and_then(usable))
 }
 
 fn use_color(terminal: bool, no_color: bool, term: Option<&str>) -> bool {
@@ -401,6 +416,19 @@ mod tests {
             styles.get_usage().get_fg_color(),
             Some(Color::Ansi(AnsiColor::Cyan))
         );
+    }
+
+    #[test]
+    fn a_zero_or_tiny_width_falls_back_to_columns_then_no_wrapping() {
+        assert_eq!(usable_columns(Some(80), Some("120")), Some(80));
+        assert_eq!(usable_columns(Some(20), None), Some(20));
+        assert_eq!(usable_columns(Some(0), Some("100")), Some(100));
+        assert_eq!(usable_columns(Some(19), Some(" 90 ")), Some(90));
+        assert_eq!(usable_columns(None, Some("100")), Some(100));
+        assert_eq!(usable_columns(Some(0), Some("0")), None);
+        assert_eq!(usable_columns(Some(0), Some("19")), None);
+        assert_eq!(usable_columns(Some(0), Some("wide")), None);
+        assert_eq!(usable_columns(Some(0), None), None);
     }
 
     #[test]

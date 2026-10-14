@@ -4931,7 +4931,8 @@ fn cache_preview(what: &CacheClean, entries: usize, bytes: u64) -> String {
 }
 
 /// `--yes`, or a yes at `prompt` when `terminal`. Without a terminal and
-/// without `--yes` nothing is removed.
+/// without `--yes` nothing is removed and the command fails with
+/// [`no_terminal`].
 fn confirm_removal_with(
     question: &str,
     yes: bool,
@@ -4942,10 +4943,37 @@ fn confirm_removal_with(
         return Ok(true);
     }
     if !terminal {
-        println!("{question} Pass --yes to remove without asking.");
-        return Ok(false);
+        return Err(no_terminal("nothing removed", &command_args(), true));
     }
     prompt(question)
+}
+
+/// The arguments this process was started with, after the program name.
+pub(crate) fn command_args() -> Vec<String> {
+    std::env::args().skip(1).collect()
+}
+
+/// The error a command that asks first gives when there is no terminal and
+/// no `--yes`: `outcome`, then the same command line with `--yes`, and
+/// `--dry-run` when `preview` says the command has one.
+pub(crate) fn no_terminal(outcome: &str, args: &[String], preview: bool) -> anyhow::Error {
+    retry_with_yes(outcome, "there is no terminal to ask", args, preview)
+}
+
+/// [`no_terminal`] with another reason nobody answered.
+fn retry_with_yes(outcome: &str, why: &str, args: &[String], preview: bool) -> anyhow::Error {
+    let mut argv = vec!["kache".to_string()];
+    argv.extend(args.iter().cloned());
+    argv.push("--yes".to_string());
+    let preview = if preview {
+        ", or --dry-run to preview"
+    } else {
+        ""
+    };
+    anyhow::anyhow!(
+        "{outcome}: {why}. Run `{}` to go ahead without asking{preview}.",
+        shell_line(&argv)
+    )
 }
 
 /// Whether nothing is at `path` any more. A lookup that fails another way,
@@ -5158,12 +5186,8 @@ fn clean_with_terminal(
 
     // The selector needs a terminal: refuse before scanning or forgetting
     // anything.
-    if !dry_run && !yes && !json {
-        crate::machine::require_tty(
-            terminal,
-            "clean",
-            "`kache clean --dry-run` or `kache clean --json`",
-        )?;
+    if !dry_run && !yes && !json && !terminal {
+        return Err(no_terminal("nothing removed", &command_args(), true));
     }
     let (root, selection) = match &scope {
         CleanScope::Scan(dir) => {
@@ -9706,7 +9730,7 @@ fn prompt_yes_no(question: &str, default_yes: bool, auto_yes: bool) -> Result<bo
     let stdin = std::io::stdin();
     let mut line = String::new();
     if stdin.lock().read_line(&mut line)? == 0 {
-        println!("skipped (no input; use --yes to accept defaults)");
+        println!("no answer");
         PROMPT_HAD_NO_INPUT.store(true, std::sync::atomic::Ordering::Relaxed);
         return Ok(false);
     }

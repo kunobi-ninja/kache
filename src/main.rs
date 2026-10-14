@@ -273,7 +273,7 @@ enum Commands {
         no_shell: bool,
 
         /// Print what would change without modifying anything
-        #[arg(long)]
+        #[arg(long, visible_alias = "dry-run", short = 'n')]
         check: bool,
 
         /// Only create the compiler-name links to kache (Unix), in DIR or
@@ -338,7 +338,7 @@ enum Commands {
         #[arg(long)]
         push: bool,
         /// Show what would be synced without transferring
-        #[arg(long)]
+        #[arg(long, short = 'n')]
         dry_run: bool,
         /// Pull all remote artifacts (ignore workspace filtering)
         #[arg(long)]
@@ -617,7 +617,7 @@ enum TelemetryCommands {
         #[arg(long = "label", value_name = "KEY=VALUE")]
         labels: Vec<String>,
         /// Print the records instead of sending them
-        #[arg(long)]
+        #[arg(long, short = 'n')]
         dry_run: bool,
     },
 }
@@ -666,6 +666,40 @@ fn command_supports_json(command: &Option<Commands>) -> bool {
         | Commands::Logout
         | Commands::InstallShims { .. } => false,
     }
+}
+
+/// Why `kache config` stops when there is no terminal for its editor, and
+/// what to use instead.
+fn config_without_terminal(path: &std::path::Path) -> String {
+    format!(
+        "`kache config` needs a terminal. Edit {} directly, or set KACHE_* environment variables.",
+        path.display()
+    )
+}
+
+/// `command` with its hidden subcommands and flags left out, for shell
+/// completions. Relations between flags are dropped too: some name hidden
+/// flags, and completions do not need them.
+fn without_hidden(command: &clap::Command) -> clap::Command {
+    let mut out = clap::Command::new(command.get_name().to_string())
+        .visible_aliases(command.get_visible_aliases().map(str::to_string));
+    if let Some(version) = command.get_version() {
+        out = out.version(version.to_string());
+    }
+    if let Some(about) = command.get_about() {
+        out = out.about(about.clone());
+    }
+    for arg in command.get_arguments().filter(|arg| !arg.is_hide_set()) {
+        out = out.arg(
+            arg.clone()
+                .conflicts_with(clap::builder::Resettable::Reset)
+                .requires(clap::builder::Resettable::Reset),
+        );
+    }
+    for sub in command.get_subcommands().filter(|sub| !sub.is_hide_set()) {
+        out = out.subcommand(without_hidden(sub));
+    }
+    out
 }
 
 fn doctor_json_is_read_only(
@@ -1032,11 +1066,9 @@ fn run_cli(cli: Cli, readiness: Option<kunobi_daemon::readiness::channel::Notifi
             if json {
                 anyhow::bail!("`kache config` is interactive and has no JSON form.");
             }
-            crate::machine::require_tty(
-                std::io::stdout().is_terminal(),
-                "config",
-                "`kache config` in a terminal",
-            )?;
+            if !std::io::stdout().is_terminal() {
+                anyhow::bail!(config_without_terminal(&config::resolve_config_path()));
+            }
             return config_tui::run_config_editor();
         }
         Some(Commands::Login { device, retrust }) => {
@@ -1048,9 +1080,8 @@ fn run_cli(cli: Cli, readiness: Option<kunobi_daemon::readiness::channel::Notifi
         Some(Commands::Logout) => return cli::login::logout(),
         Some(Commands::Cargo { args }) => return cargo_proxy::run(args.clone()),
         Some(Commands::Completions { shell }) => {
-            use clap::CommandFactory;
             use clap_complete::generate;
-            let mut cmd = Cli::command();
+            let mut cmd = without_hidden(&Cli::command());
             let name = cmd.get_name().to_string();
             generate(*shell, &mut cmd, name, &mut std::io::stdout());
             return Ok(());
@@ -2216,6 +2247,87 @@ mod tests {
         for hidden in ["install-shims", "diff"] {
             assert!(Cli::try_parse_from(["kache", hidden]).is_ok(), "{hidden}");
         }
+    }
+
+    #[test]
+    fn dry_run_spellings_reach_every_preview() {
+        for spelling in ["--check", "--dry-run", "-n"] {
+            let parsed = Cli::try_parse_from(["kache", "init", spelling, "--no-service"]).unwrap();
+            assert!(
+                matches!(
+                    parsed.command,
+                    Some(Commands::Init {
+                        check: true,
+                        no_service: true,
+                        ..
+                    })
+                ),
+                "{spelling}"
+            );
+        }
+        let parsed = Cli::try_parse_from(["kache", "init", "--no-service"]).unwrap();
+        assert!(matches!(
+            parsed.command,
+            Some(Commands::Init { check: false, .. })
+        ));
+        for spelling in ["--dry-run", "-n"] {
+            let parsed = Cli::try_parse_from(["kache", "sync", spelling]).unwrap();
+            assert!(
+                matches!(parsed.command, Some(Commands::Sync { dry_run: true, .. })),
+                "{spelling}"
+            );
+            let parsed = Cli::try_parse_from(["kache", "telemetry", "push", spelling]).unwrap();
+            assert!(
+                matches!(
+                    parsed.command,
+                    Some(Commands::Telemetry {
+                        command: TelemetryCommands::Push { dry_run: true, .. }
+                    })
+                ),
+                "{spelling}"
+            );
+        }
+        assert!(Cli::try_parse_from(["kache", "init", "--shims", "-n"]).is_err());
+    }
+
+    #[test]
+    fn completions_leave_out_hidden_commands_and_flags() {
+        let mut command = without_hidden(&Cli::command());
+        let mut script = Vec::new();
+        clap_complete::generate(
+            clap_complete::Shell::Bash,
+            &mut command,
+            "kache",
+            &mut script,
+        );
+        let script = String::from_utf8(script).unwrap();
+        for visible in ["clean", "init", "--dry-run", "--json", "--no-service"] {
+            assert!(script.contains(visible), "{visible}");
+        }
+        for hidden in [
+            "install-shims",
+            "save-manifest",
+            "--orphans",
+            "--tracked",
+            "--stale-schema",
+        ] {
+            assert!(!script.contains(hidden), "{hidden}");
+        }
+        assert!(command.find_subcommand("stats").is_some());
+        assert!(command.find_subcommand("diff").is_none());
+    }
+
+    #[test]
+    fn config_without_a_terminal_points_at_the_file_and_environment() {
+        let hint =
+            config_without_terminal(std::path::Path::new("/home/me/.config/kache/config.toml"));
+        assert!(
+            hint.contains("/home/me/.config/kache/config.toml"),
+            "{hint}"
+        );
+        assert!(hint.contains("KACHE_"), "{hint}");
+        assert!(hint.contains("needs a terminal"), "{hint}");
+        assert!(!hint.contains("`kache config` in a terminal"), "{hint}");
     }
 
     #[test]

@@ -8729,10 +8729,26 @@ fn a_declined_unit_clean_says_nothing_was_removed() {
 }
 
 #[test]
+fn no_terminal_names_the_same_command_with_yes() {
+    let args = ["clean".to_string(), "/tmp/my dir".to_string()];
+    assert_eq!(
+        no_terminal("nothing removed", &args, true).to_string(),
+        "nothing removed: there is no terminal to ask. Run `kache clean '/tmp/my dir' --yes` \
+         to go ahead without asking, or --dry-run to preview."
+    );
+    assert_eq!(
+        no_terminal("init changed nothing", &["init".to_string()], false).to_string(),
+        "init changed nothing: there is no terminal to ask. Run `kache init --yes` to go ahead \
+         without asking."
+    );
+}
+
+#[test]
 fn removal_asks_only_at_a_terminal() {
     let never = |_: &str| -> Result<bool> { panic!("asked without a terminal") };
     assert!(confirm_removal_with("Remove?", true, false, never).unwrap());
-    assert!(!confirm_removal_with("Remove?", false, false, never).unwrap());
+    let refused = confirm_removal_with("Remove?", false, false, never).unwrap_err();
+    assert!(refused.to_string().contains("--yes"), "{refused}");
     assert!(confirm_removal_with("Remove?", false, true, |_| Ok(true)).unwrap());
     assert!(!confirm_removal_with("Remove?", false, true, |_| Ok(false)).unwrap());
 }

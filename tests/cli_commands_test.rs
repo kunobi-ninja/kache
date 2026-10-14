@@ -249,6 +249,38 @@ fn test_runner_passes_the_exit_code_through() {
     }
 }
 
+/// Without a terminal and without `--yes`, a clean that would ask fails once
+/// with the same command line plus `--yes`, and removes nothing.
+#[test]
+fn removal_without_a_terminal_names_yes_once() {
+    let e = env();
+    let dir = TempDir::new().unwrap();
+    let dir_arg = dir.path().to_str().unwrap();
+    for (args, retry) in [
+        (
+            vec!["clean", "--cache"],
+            "kache clean --cache --yes".to_string(),
+        ),
+        (vec!["clean"], "kache clean --yes".to_string()),
+        (
+            vec!["clean", dir_arg],
+            format!("kache clean {dir_arg} --yes"),
+        ),
+    ] {
+        let output = e.cmd().args(&args).output().unwrap();
+        assert_eq!(output.status.code(), Some(1), "{args:?}: {output:?}");
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stderr.contains(&format!("Run `{retry}`")), "{stderr}");
+        assert_eq!(
+            stdout.matches("--yes").count() + stderr.matches("--yes").count(),
+            1,
+            "{stdout}{stderr}"
+        );
+        assert!(!stdout.contains("Nothing removed."), "{stdout}");
+    }
+}
+
 #[test]
 fn interactive_commands_refuse_captured_non_tty_output() {
     let e = env();
@@ -256,7 +288,11 @@ fn interactive_commands_refuse_captured_non_tty_output() {
         .arg("config")
         .assert()
         .failure()
-        .stderr(predicates::str::contains("needs a terminal"));
+        .stderr(predicates::str::contains("needs a terminal"))
+        .stderr(predicates::str::contains(
+            e.cache.join("config.toml").display().to_string(),
+        ))
+        .stderr(predicates::str::contains("KACHE_"));
     e.cmd()
         .arg("monitor")
         .assert()
@@ -738,7 +774,18 @@ fn init_shell_plan_lists_only_the_shell_paths() {
 }
 
 #[cfg(unix)]
-fn terminal_output(mut command: std::process::Command, columns: u16) -> String {
+fn terminal_output(command: std::process::Command, columns: u16) -> String {
+    let (text, status) = terminal_run(command, columns);
+    assert!(status.success(), "{status:?}: {text}");
+    text
+}
+
+/// [`terminal_output`] for a command that may fail.
+#[cfg(unix)]
+fn terminal_run(
+    mut command: std::process::Command,
+    columns: u16,
+) -> (String, std::process::ExitStatus) {
     use std::io::Read;
     use std::os::fd::FromRawFd;
     use std::os::unix::process::CommandExt;
@@ -808,8 +855,10 @@ fn terminal_output(mut command: std::process::Command, columns: u16) -> String {
         }
     }
     let output = child.wait_with_output().unwrap();
-    assert!(output.status.success(), "{output:?}");
-    String::from_utf8(bytes).unwrap().replace("\r\n", "\n")
+    (
+        String::from_utf8(bytes).unwrap().replace("\r\n", "\n"),
+        output.status,
+    )
 }
 
 #[cfg(unix)]
@@ -838,14 +887,33 @@ fn terminal_color_policy_and_wrapping_match_the_actual_command() {
         );
         assert!(text.contains("Setup plan"), "{text}");
     }
-    let mut command = kache_process_as(Path::new(KACHE_BIN), &e.home, &e.cache);
-    command
-        .args(["init", "--check", "--no-service", "--no-shell"])
-        .env("NO_COLOR", "1")
-        .env("TERM", "xterm");
-    let text = terminal_output(command, 35);
+    // The plan table comes before the question, which nobody answers here.
+    let plan = |columns: u16, env_columns: Option<&str>| {
+        let mut command = kache_process_as(Path::new(KACHE_BIN), &e.home, &e.cache);
+        command
+            .args(["init", "--no-service", "--no-shell"])
+            .env("NO_COLOR", "1")
+            .env("TERM", "xterm")
+            .env_remove("COLUMNS");
+        if let Some(env_columns) = env_columns {
+            command.env("COLUMNS", env_columns);
+        }
+        let (text, status) = terminal_run(command, columns);
+        assert!(!status.success(), "{text}");
+        text
+    };
+    let text = plan(35, None);
     assert!(text.contains("start or restart the\n"), "{text}");
     assert!(text.contains("cache if needed"), "{text}");
+    // A terminal that reports no width falls back to $COLUMNS, then to no
+    // wrapping, never one word per line.
+    let text = plan(0, Some("35"));
+    assert!(text.contains("start or restart the\n"), "{text}");
+    let text = plan(0, None);
+    assert!(
+        text.contains("start or restart the cache if needed"),
+        "{text}"
+    );
 }
 
 #[test]
@@ -4344,12 +4412,13 @@ fn quarantine_backups_are_reported_and_only_removed_by_confirmed_full_clean() {
             .unwrap()
             .contains("`kache clean --cache`")
     );
-    for args in [
-        vec!["clean", "--cache", "--dry-run"],
-        vec!["clean", "--cache"],
-        vec!["clean", "--crate", "missing", "--yes"],
+    for (args, asks) in [
+        (vec!["clean", "--cache", "--dry-run"], false),
+        (vec!["clean", "--cache"], true),
+        (vec!["clean", "--crate", "missing", "--yes"], false),
     ] {
-        e.cmd().args(args).assert().success();
+        let output = e.cmd().args(&args).output().unwrap();
+        assert_eq!(output.status.success(), !asks, "{args:?}: {output:?}");
         for name in names {
             assert_eq!(
                 std::fs::read(e.cache.join(name)).unwrap(),

@@ -89,7 +89,7 @@ kache clean ~/src --dry-run
 
 `--dry-run` lists what the clean would remove and every target it keeps: what deleting each frees, what it holds on disk, how long since a build used it, and what the daemon's next quiet pass would do to it. It ends with the cache's size and the command that removes the selection. The freeable estimate leaves out blocks a target shares with the store or with other hardlinks, so it is what the clean gives back. `--dry-run` also lists the default targets of sibling Git worktrees, marked "found through Git", but `kache clean` skips them because Kache has not seen a build use them.
 
-Without `--dry-run` or `--yes`, a selector opens in a terminal. Without a terminal the command fails and suggests `--dry-run` or `--json`. `--json` describes the selection and removes nothing unless `--yes` is also set.
+Without `--dry-run` or `--yes`, a selector opens in a terminal. Without a terminal the command removes nothing, exits 1 and prints the same command with `--yes`. `--cache`, `--crate` and `--units` ask the same way before removing. `--json` describes the selection and removes nothing unless `--yes` is also set.
 
 Given a directory, `clean` looks under it for `target/` directories that sit next to a `Cargo.toml`, including worktrees under `.worktrees/` and `.claude/`. Other hidden directories and `node_modules` are skipped. Sizes cover every profile, custom profiles and `<triple>/<profile>` directories included. A directory selects every target under it, so it cannot be combined with `--stale` or `--orphans`.
 
@@ -216,7 +216,7 @@ Options:
 | `--manifest-path <PATH>` | Cargo manifest whose workspace members filter what is pushed and, with `--workspace`, what is pulled. Defaults to `./Cargo.toml` when it exists; without one, pushes are not filtered and `--workspace` fails |
 | `--pull` | Skip uploads |
 | `--push` | Skip downloads |
-| `--dry-run` | Plan without transfer |
+| `--dry-run`, `-n` | Plan without transfer |
 | `--all` | Ignore normal pull filtering |
 | `--workspace` | Scope pull discovery to workspace members; conflicts with `--all` |
 | `--allow-partial` | Exit successfully despite reported transfer/import failures |

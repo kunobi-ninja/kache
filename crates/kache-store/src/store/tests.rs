@@ -4224,6 +4224,14 @@ fn backfill_compile_times_reaches_expensive_entry_past_a_zero_cost_batch() {
     assert_eq!(unknown, 10_000, "zero-cost entries must remain unknown");
 }
 
+#[test]
+fn backfill_compile_times_recovers_cost_inside_the_first_batch() {
+    let (passes, cost, unknown) = recover_legacy_compile_cost(9_999);
+    assert_eq!(cost, 60_000);
+    assert_eq!(passes, [1, 0, 0]);
+    assert_eq!(unknown, 9_999);
+}
+
 /// #595 equivalence guard: the Rust `SizePressurePolicy` ranking must match
 /// the SQL `ORDER BY` it replaced, entry for entry. This is the property
 /// that makes the refactor a no-op — if someone later changes the scoring

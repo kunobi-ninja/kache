@@ -3019,6 +3019,18 @@ fn test_bypass_reason_defaults_to_unknown() {
     assert_eq!(bypass_reason(&e), "unknown");
     e.passthrough_reason = "  linker invocation  ".to_string();
     assert_eq!(bypass_reason(&e), "linker invocation");
+    e.skip_reason = "  admission-threshold  ".to_string();
+    assert_eq!(bypass_reason(&e), "linker invocation");
+    e.result = EventResult::Skipped;
+    assert_eq!(
+        bypass_reason(&e),
+        "admission-threshold",
+        "skipped events must preserve their dedicated admission reason"
+    );
+    e.skip_reason = "  ".to_string();
+    assert_eq!(bypass_reason(&e), "linker invocation");
+    e.passthrough_reason.clear();
+    assert_eq!(bypass_reason(&e), "unknown");
 }
 
 #[test]

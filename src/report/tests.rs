@@ -3911,6 +3911,16 @@ fn redact_replaces_keys_and_paths_and_leaves_empty_fields_empty() {
         started_at_unix_ms: 5,
         finished_at_unix_ms: 9,
     });
+    let bypass_start = report.bypass.slowest.len();
+    for (result, root) in [
+        (EventResult::Skipped, "/secret/skipped-workspace"),
+        (EventResult::Passthrough, "/secret/passthrough-workspace"),
+        (EventResult::Passthrough, ""),
+    ] {
+        let mut bypass = test_event("bypassed", result, 42, 0, 0, "");
+        bypass.root = root.to_string();
+        report.bypass.slowest.push(to_bypass_detail(&bypass));
+    }
     let kept_error = report.all_events[0].store_error.clone();
 
     redact_report(&mut report);
@@ -3923,6 +3933,24 @@ fn redact_replaces_keys_and_paths_and_leaves_empty_fields_empty() {
     assert_eq!(report.trace_events[0].args.cache_key, "redacted");
     assert_eq!(report.trace_events[0].args.root, "redacted");
     assert_eq!(report.trace_events[0].args.object_output, "redacted");
+    assert_eq!(
+        report.bypass.slowest[bypass_start..]
+            .iter()
+            .map(|row| row.root.as_str())
+            .collect::<Vec<_>>(),
+        vec!["redacted", "redacted", ""],
+        "redacted reports must hide every nonempty bypass workspace root"
+    );
+    assert_eq!(report.bypass.slowest[bypass_start].result, "skipped");
+    assert_eq!(
+        report.bypass.slowest[bypass_start + 1].result,
+        "passthrough"
+    );
+    assert!(
+        report.bypass.slowest[bypass_start..]
+            .iter()
+            .all(|row| row.crate_name == "bypassed" && row.elapsed_ms == 42)
+    );
     let empty_error = report
         .errors_detail
         .iter()

@@ -337,6 +337,33 @@ fn cc_header_probe_keys_a_header_appearing_in_a_user_include_dir() {
     assert_probe_follows_optional_header(&root, &["-Iinc"], 11);
 }
 
+/// A header outside every user directory, as a system header is, probes
+/// for a header and carries the macOS SDK's fallback definition of the
+/// operator. The unit keeps a key, and the key follows the probe when the
+/// header appears in a user `-I` directory.
+#[test]
+fn cc_header_probe_outside_user_include_dirs_keys_the_unit() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    fs::write(root.join("kache.toml"), "").unwrap();
+    fs::create_dir(root.join("home")).unwrap();
+    fs::create_dir(root.join("inc")).unwrap();
+    fs::create_dir(root.join("system")).unwrap();
+    fs::write(
+        root.join("system/probing.h"),
+        "#ifndef __has_include\n#define __has_include(x) 0\n#endif\n\
+         #if defined(__has_include) && __has_include(<optional.h>)\n\
+         #include <optional.h>\n#else\n#define VALUE 5\n#endif\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("unit.c"),
+        "#include <probing.h>\nint main(void) { return VALUE; }\n",
+    )
+    .unwrap();
+    assert_probe_follows_optional_header(&root, &["-isystem", "system", "-Iinc"], 5);
+}
+
 fn cacheable_cc_command(root: &std::path::Path) -> Command {
     common::settle_writes(&[root]);
     let mut command = Command::new(kache_binary());

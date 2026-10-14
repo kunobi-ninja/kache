@@ -72,6 +72,21 @@ pub(crate) enum Plan {
     Schedule { key: String, want: TestWant },
 }
 
+/// The binary's file name without Cargo's hash suffix: `kunobi`, or `tests`
+/// for `tests-0123456789abcdef`.
+fn binary_label(binary: &OsStr) -> String {
+    let name = Path::new(binary)
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    match name.rsplit_once('-') {
+        Some((head, hash)) if hash.len() == 16 && hash.bytes().all(|b| b.is_ascii_hexdigit()) => {
+            head.to_owned()
+        }
+        _ => name,
+    }
+}
+
 /// Run `args` (the test binary, then its arguments) and return the exit code
 /// for the runner. Returns only when the binary could not be run or has
 /// exited; a binary killed by a signal kills the runner with it.
@@ -85,7 +100,7 @@ pub fn run(args: &[OsString]) -> i32 {
     let cache_dir = config.as_ref().map(|config| config.cache_dir.as_path());
     let test_args = args[1..].iter().map(OsString::as_os_str);
     let target_use = match cache_dir
-        .map(|dir| crate::target_use::shared_for(dir, test_args))
+        .map(|dir| crate::target_use::shared_for(dir, &binary_label(&args[0]), test_args))
         .transpose()
     {
         Ok(lease) => lease,
@@ -432,6 +447,19 @@ pub(crate) mod windows_signals {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn binary_label_drops_cargos_hash() {
+        let label = |path: &str| binary_label(OsStr::new(path));
+        assert_eq!(label("target/debug/kunobi"), "kunobi");
+        assert_eq!(label("target/debug/deps/tests-0123456789abcdef"), "tests");
+        assert_eq!(
+            label("target/debug/deps/my_app-0123456789abcdef.exe"),
+            "my_app"
+        );
+        // Not a 16-digit hex hash: the name stays whole.
+        assert_eq!(label("target/debug/foo-bar"), "foo-bar");
+    }
 
     fn os(args: &[&str]) -> Vec<OsString> {
         args.iter().map(OsString::from).collect()

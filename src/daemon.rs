@@ -410,7 +410,7 @@ pub(crate) fn client_version_is_newer(client: &str, daemon: &str) -> bool {
 }
 
 /// Whether `pid` may still be running (see [`alive_from_state`]).
-fn process_is_alive(pid: u32) -> bool {
+pub(crate) fn process_is_alive(pid: u32) -> bool {
     alive_from_state(pid, || {
         kunobi_daemon::local::process_state(
             kunobi_daemon::ProcessId::new(pid).expect("alive_from_state rejects PID zero"),

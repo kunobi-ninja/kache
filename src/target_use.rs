@@ -6,13 +6,36 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 /// Unlock explicitly before closing: a concurrent fork can briefly inherit
-/// the descriptor, even though it closes on exec.
-pub(crate) struct Lease(File);
+/// the descriptor, even though it closes on exec. A shared lease also leaves
+/// a record naming its command, so cleanup can say what it waits for.
+pub(crate) struct Lease {
+    file: File,
+    record: Option<PathBuf>,
+}
+
+impl Lease {
+    fn new(file: File) -> Self {
+        Self { file, record: None }
+    }
+}
 
 impl Drop for Lease {
     fn drop(&mut self) {
-        let _ = self.0.unlock();
+        if let Some(record) = &self.record {
+            let _ = std::fs::remove_file(record);
+        }
+        let _ = self.file.unlock();
     }
+}
+
+/// A running command that holds a shared lease, from its record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Holder {
+    pub(crate) pid: u32,
+    /// What the command is, such as `cargo run` or a test binary's name.
+    pub(crate) what: String,
+    /// When it took the lease, in seconds since the epoch.
+    pub(crate) since: u64,
 }
 
 /// The exclusive lease cleanup holds. While it is held, a file in the cache
@@ -43,20 +66,91 @@ fn holder_record(cache_dir: &Path) -> PathBuf {
     cache_dir.join("target-use.holder")
 }
 
+/// One file per shared lease, named by its process and the time it was taken.
+fn holders_dir(cache_dir: &Path) -> PathBuf {
+    cache_dir.join("target-use.holders")
+}
+
+fn record_holder(cache_dir: &Path, what: &str) -> Option<PathBuf> {
+    let dir = holders_dir(cache_dir);
+    std::fs::create_dir_all(&dir).ok()?;
+    let since = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let pid = std::process::id();
+    let record = dir.join(format!("{pid}-{}", since.as_nanos()));
+    // A tab cannot appear in the time, so `what` keeps any characters.
+    std::fs::write(&record, format!("{}\t{what}", since.as_secs())).ok()?;
+    Some(record)
+}
+
+fn parse_holder(name: &str, text: &str) -> Option<Holder> {
+    let pid = name.split('-').next()?.parse().ok()?;
+    let (since, what) = text.split_once('\t')?;
+    Some(Holder {
+        pid,
+        what: what.trim().to_owned(),
+        since: since.parse().ok()?,
+    })
+}
+
+/// The commands holding shared leases now, oldest first. A record left by a
+/// process that is gone is removed.
+pub(crate) fn holders(cache_dir: &Path) -> Vec<Holder> {
+    let Ok(entries) = std::fs::read_dir(holders_dir(cache_dir)) else {
+        return Vec::new();
+    };
+    let mut holders = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(holder) = std::fs::read_to_string(entry.path())
+            .ok()
+            .and_then(|text| parse_holder(&name, &text))
+        else {
+            continue;
+        };
+        if crate::daemon::process_is_alive(holder.pid) {
+            holders.push(holder);
+        } else {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+    holders.sort_by_key(|holder| (holder.since, holder.pid));
+    holders
+}
+
+/// Who keeps cleanup from deleting now: `None` when nothing does, otherwise
+/// the commands holding shared leases (empty when none left a record, such
+/// as another cleanup or an older Kache). The probe takes the lock for an
+/// instant and records nothing.
+pub(crate) fn blockers(cache_dir: &Path) -> Option<Vec<Holder>> {
+    let file = open(cache_dir).ok()?;
+    match file.try_lock() {
+        Ok(()) => {
+            let _ = file.unlock();
+            None
+        }
+        Err(_) => Some(holders(cache_dir)),
+    }
+}
+
 /// Hold while Cargo or a target runner may still use build output. While
 /// cleanup holds the lock, `notice` gets one line saying so before the wait.
-pub(crate) fn shared(cache_dir: &Path, notice: &mut dyn Write) -> io::Result<Lease> {
+/// `what` names the command to a cleanup that has to skip targets for it.
+pub(crate) fn shared(cache_dir: &Path, what: &str, notice: &mut dyn Write) -> io::Result<Lease> {
     let file = open(cache_dir)?;
     match file.try_lock_shared() {
-        Ok(()) => return Ok(Lease(file)),
+        Ok(()) => {}
         // One write, so the line stays whole beside other processes' output.
         Err(TryLockError::WouldBlock) => {
             let _ = notice.write_all(waiting(cache_dir).as_bytes());
+            file.lock_shared()?;
         }
         Err(TryLockError::Error(error)) => return Err(error),
     }
-    file.lock_shared()?;
-    Ok(Lease(file))
+    let mut lease = Lease::new(file);
+    lease.record = record_holder(cache_dir, what);
+    Ok(lease)
 }
 
 /// [`shared`] for a command started with `args`. The line goes to stderr
@@ -64,12 +158,13 @@ pub(crate) fn shared(cache_dir: &Path, notice: &mut dyn Write) -> io::Result<Lea
 /// then hides its own lock waits, and passes a test binary `--quiet`.
 pub(crate) fn shared_for<'a>(
     cache_dir: &Path,
+    what: &str,
     args: impl IntoIterator<Item = &'a OsStr>,
 ) -> io::Result<Lease> {
     if quiet(args) {
-        shared(cache_dir, &mut io::sink())
+        shared(cache_dir, what, &mut io::sink())
     } else {
-        shared(cache_dir, &mut io::stderr())
+        shared(cache_dir, what, &mut io::stderr())
     }
 }
 
@@ -96,7 +191,7 @@ pub(crate) fn try_exclusive(cache_dir: &Path) -> io::Result<Option<Reservation>>
     let file = open(cache_dir)?;
     match file.try_lock() {
         Ok(()) => {
-            let lease = Lease(file);
+            let lease = Lease::new(file);
             let holder = holder_record(cache_dir);
             let _ = std::fs::write(&holder, std::process::id().to_string());
             Ok(Some(Reservation {
@@ -133,10 +228,50 @@ mod tests {
     }
 
     #[test]
+    fn a_shared_lease_names_its_command_until_it_ends() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(blockers(dir.path()), None);
+        let run = shared(dir.path(), "cargo run", &mut io::sink()).unwrap();
+        let named = holders(dir.path());
+        assert_eq!(named.len(), 1);
+        assert_eq!(
+            (named[0].pid, named[0].what.as_str()),
+            (std::process::id(), "cargo run")
+        );
+        assert_eq!(blockers(dir.path()), Some(named));
+        drop(run);
+        assert!(holders(dir.path()).is_empty());
+        assert_eq!(blockers(dir.path()), None);
+        // The probe leaves no record of its own behind.
+        assert!(try_exclusive(dir.path()).unwrap().is_some());
+    }
+
+    #[test]
+    fn a_record_left_by_a_gone_process_is_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let records = holders_dir(dir.path());
+        std::fs::create_dir_all(&records).unwrap();
+        // PID 1 never names a lease holder, and garbage parses as nothing.
+        std::fs::write(records.join("1-5"), "5\tcargo run").unwrap();
+        std::fs::write(records.join("garbage"), "no tab").unwrap();
+        assert!(holders(dir.path()).is_empty());
+        assert!(!records.join("1-5").exists());
+        assert_eq!(
+            parse_holder("42-9", "17\tcargo test --all"),
+            Some(Holder {
+                pid: 42,
+                what: "cargo test --all".to_owned(),
+                since: 17
+            })
+        );
+        assert_eq!(parse_holder("x-9", "17\tcargo"), None);
+    }
+
+    #[test]
     fn a_running_command_blocks_cleanup_until_it_exits() {
         let dir = tempfile::tempdir().unwrap();
-        let first = shared(dir.path(), &mut io::sink()).unwrap();
-        let second = shared(dir.path(), &mut io::sink()).unwrap();
+        let first = shared(dir.path(), "cargo build", &mut io::sink()).unwrap();
+        let second = shared(dir.path(), "cargo build", &mut io::sink()).unwrap();
         assert!(try_exclusive(dir.path()).unwrap().is_none());
         drop(first);
         assert!(try_exclusive(dir.path()).unwrap().is_none());
@@ -150,7 +285,8 @@ mod tests {
         let cleanup = try_exclusive(dir.path()).unwrap().unwrap();
         let (said, heard) = std::sync::mpsc::channel();
         let cache = dir.path().to_path_buf();
-        let command = std::thread::spawn(move || shared(&cache, &mut Said(said)).unwrap());
+        let command =
+            std::thread::spawn(move || shared(&cache, "cargo build", &mut Said(said)).unwrap());
         let line = heard
             .recv_timeout(Duration::from_secs(10))
             .expect("the command never said it was waiting");
@@ -174,8 +310,8 @@ mod tests {
     fn a_command_takes_a_free_lock_without_a_word() {
         let dir = tempfile::tempdir().unwrap();
         let mut said = Vec::new();
-        let first = shared(dir.path(), &mut said).unwrap();
-        let second = shared(dir.path(), &mut said).unwrap();
+        let first = shared(dir.path(), "cargo build", &mut said).unwrap();
+        let second = shared(dir.path(), "cargo build", &mut said).unwrap();
         assert!(said.is_empty(), "{}", String::from_utf8_lossy(&said));
         drop((first, second));
     }
@@ -207,8 +343,8 @@ mod tests {
     #[test]
     fn closing_a_lease_releases_an_inherited_descriptor() {
         let dir = tempfile::tempdir().unwrap();
-        let lease = shared(dir.path(), &mut io::sink()).unwrap();
-        let inherited = lease.0.try_clone().unwrap();
+        let lease = shared(dir.path(), "cargo build", &mut io::sink()).unwrap();
+        let inherited = lease.file.try_clone().unwrap();
         drop(lease);
         assert!(try_exclusive(dir.path()).unwrap().is_some());
         drop(inherited);

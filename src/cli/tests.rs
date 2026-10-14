@@ -7027,8 +7027,14 @@ fn remove_targets_deletes_all_and_reports_estimates() {
             apparent_gap: 0,
         },
     ];
-    let (removed, estimated_reclaimed, apparent_gap) =
-        remove_targets(&to_remove, root.path(), root.path(), false, &mut Vec::new());
+    let (removed, estimated_reclaimed, apparent_gap) = remove_targets(
+        &to_remove,
+        root.path(),
+        root.path(),
+        false,
+        &mut Vec::new(),
+        &mut Vec::new(),
+    );
 
     assert_eq!(removed, 2, "both target/ dirs removed");
     assert_eq!(estimated_reclaimed, 260);
@@ -7059,8 +7065,14 @@ fn remove_targets_skips_failures_without_aborting() {
             apparent_gap: 50,
         },
     ];
-    let (removed, estimated_reclaimed, apparent_gap) =
-        remove_targets(&to_remove, root.path(), root.path(), false, &mut Vec::new());
+    let (removed, estimated_reclaimed, apparent_gap) = remove_targets(
+        &to_remove,
+        root.path(),
+        root.path(),
+        false,
+        &mut Vec::new(),
+        &mut Vec::new(),
+    );
 
     assert_eq!(removed, 1, "only the existing dir counts as removed");
     assert_eq!(
@@ -7137,8 +7149,14 @@ fn remove_targets_leaves_a_target_a_build_is_writing() {
         apparent_gap: 0,
     });
     let mut skipped = Vec::new();
-    let (removed, reclaimed, _) =
-        remove_targets(&to_remove, root.path(), root.path(), true, &mut skipped);
+    let (removed, reclaimed, _) = remove_targets(
+        &to_remove,
+        root.path(),
+        root.path(),
+        true,
+        &mut skipped,
+        &mut Vec::new(),
+    );
     assert_eq!((removed, reclaimed), (1, 10));
     assert!(busy.exists() && !idle.exists());
     assert_eq!(skipped.len(), 1);
@@ -7157,20 +7175,106 @@ fn remove_targets_keeps_a_target_while_cargo_is_running() {
         estimated_reclaimable: 10,
         apparent_gap: 0,
     }];
-    let command = crate::target_use::shared(root.path(), &mut std::io::sink()).unwrap();
+    let command =
+        crate::target_use::shared(root.path(), "cargo build", &mut std::io::sink()).unwrap();
     let mut skipped = Vec::new();
+    let mut waiting = Vec::new();
     assert_eq!(
-        remove_targets(&to_remove, root.path(), root.path(), true, &mut skipped).0,
+        remove_targets(
+            &to_remove,
+            root.path(),
+            root.path(),
+            true,
+            &mut skipped,
+            &mut waiting
+        )
+        .0,
         0
     );
     assert!(target.exists());
-    assert_eq!(skipped[0].reason, TARGET_IN_USE);
-    drop(command);
+    // The skip names the command it waits for, not the target.
+    let pid = std::process::id();
+    assert_eq!(waiting.len(), 1);
     assert_eq!(
-        remove_targets(&to_remove, root.path(), root.path(), true, &mut Vec::new()).0,
+        (waiting[0].pid, waiting[0].what.as_str()),
+        (pid, "cargo build")
+    );
+    assert!(
+        skipped[0]
+            .reason
+            .starts_with(&format!("waiting for `cargo build` (pid {pid}, running ")),
+        "{}",
+        skipped[0].reason
+    );
+    let paths = [target.as_path()];
+    let notes = removal_notes(root.path(), &paths);
+    assert_eq!(notes.len(), 1);
+    assert!(
+        notes[0].starts_with("Not now: waiting for `cargo build`"),
+        "{notes:?}"
+    );
+    drop(command);
+    assert!(crate::target_use::holders(root.path()).is_empty());
+    assert!(removal_notes(root.path(), &paths).is_empty());
+    assert_eq!(
+        remove_targets(
+            &to_remove,
+            root.path(),
+            root.path(),
+            true,
+            &mut Vec::new(),
+            &mut Vec::new()
+        )
+        .0,
         1
     );
     assert!(!target.exists());
+}
+
+#[test]
+fn held_reason_names_each_command_and_how_long_it_ran() {
+    use crate::target_use::Holder;
+    let holder = |pid, what: &str, since| Holder {
+        pid,
+        what: what.to_owned(),
+        since,
+    };
+    assert_eq!(
+        held_reason(&[], 100),
+        "another Kache cleanup or a running Cargo command holds Kache's target lock"
+    );
+    assert_eq!(
+        held_reason(&[holder(7, "cargo run", 100 - 12)], 100),
+        "waiting for `cargo run` (pid 7, running 12 s) to exit"
+    );
+    assert_eq!(
+        held_reason(
+            &[
+                holder(7, "cargo run", 0),
+                holder(8, "kunobi", 0),
+                holder(9, "cargo test", 0)
+            ],
+            7_200
+        ),
+        "waiting for `cargo run` (pid 7, running ~2.0 h), `kunobi` (pid 8, running ~2.0 h) and `cargo test` (pid 9, running ~2.0 h) to exit"
+    );
+}
+
+#[test]
+fn a_dry_run_names_targets_a_build_holds() {
+    let root = tempfile::tempdir().unwrap();
+    let busy = root.path().join("busy/target");
+    std::fs::create_dir_all(busy.join("debug")).unwrap();
+    std::fs::write(busy.join("debug/.cargo-lock"), b"").unwrap();
+    let paths = [busy.as_path()];
+    assert!(removal_notes(root.path(), &paths).is_empty());
+    assert!(removal_notes(root.path(), &[]).is_empty());
+    let held = std::fs::File::open(busy.join("debug/.cargo-lock")).unwrap();
+    held.lock().unwrap();
+    assert_eq!(
+        removal_notes(root.path(), &paths),
+        [format!("Not now: 1 target {TARGET_IN_USE}.")]
+    );
 }
 
 #[test]
@@ -7608,8 +7712,14 @@ fn remove_targets_refuses_a_directory_replaced_after_scan() {
         estimated_reclaimable: 100,
         apparent_gap: 0,
     }];
-    let (removed, estimated_reclaimed, apparent_gap) =
-        remove_targets(&to_remove, root.path(), root.path(), false, &mut Vec::new());
+    let (removed, estimated_reclaimed, apparent_gap) = remove_targets(
+        &to_remove,
+        root.path(),
+        root.path(),
+        false,
+        &mut Vec::new(),
+        &mut Vec::new(),
+    );
 
     assert_eq!((removed, estimated_reclaimed, apparent_gap), (0, 0, 0));
     assert!(
@@ -7873,7 +7983,7 @@ fn the_clean_preview_splits_what_goes_from_what_stays() {
         test_cache_line(),
         &beside_its_worktree,
     );
-    let lines = plan_lines(&plan, &skipped, PlanEnd::DryRun);
+    let lines = plan_lines(&plan, &skipped, &[], PlanEnd::DryRun);
     assert_eq!(
         lines[0],
         "Remove   1 target · 1.0 KiB freeable · worktree gone, or no build in 14d"
@@ -7908,7 +8018,7 @@ fn the_clean_preview_splits_what_goes_from_what_stays() {
         test_cache_line(),
         &beside_its_worktree,
     );
-    let none = plan_lines(&plan, &[], PlanEnd::DryRun);
+    let none = plan_lines(&plan, &[], &[], PlanEnd::DryRun);
     assert_eq!(
         none[0],
         "Remove   nothing: no target matches (worktree gone)"
@@ -8073,7 +8183,7 @@ fn a_clean_that_removes_nothing_shows_targets_found_through_git_and_counts_gone_
     );
     assert_eq!(plan.kept.len(), 5);
 
-    let lines = plan_lines(&plan, &skipped, PlanEnd::NothingRemoved);
+    let lines = plan_lines(&plan, &skipped, &[], PlanEnd::NothingRemoved);
     assert!(
         lines
             .iter()

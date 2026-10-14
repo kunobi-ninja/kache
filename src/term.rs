@@ -322,9 +322,72 @@ fn pad_left(text: &str, to: usize) -> String {
     format!("{}{text}", " ".repeat(to.saturating_sub(width(text))))
 }
 
+/// A spinner and the time so far on stderr while a slow step runs, so a
+/// command that is working does not look hung. It draws only on an
+/// interactive stderr and outside JSON mode, and clears its line when
+/// dropped, before the step prints its result.
+pub(crate) struct Ticker {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Ticker {
+    pub(crate) fn start(label: impl Into<String>) -> Self {
+        #[cfg(not(test))]
+        let draws = std::io::stderr().is_terminal() && !crate::machine::is_json();
+        #[cfg(test)]
+        let draws = false;
+        Self::start_if(draws, label.into())
+    }
+
+    fn start_if(draws: bool, label: String) -> Self {
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let thread = draws.then(|| {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                use std::io::Write;
+                const FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+                let started = std::time::Instant::now();
+                let mut frame = 0;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let elapsed = duration_ms(started.elapsed().as_millis() as u64);
+                    let mut err = std::io::stderr().lock();
+                    let _ = write!(err, "\r\x1b[2K{} {label} {elapsed}", FRAMES[frame]);
+                    let _ = err.flush();
+                    drop(err);
+                    frame = (frame + 1) % FRAMES.len();
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                let _ = write!(std::io::stderr(), "\r\x1b[2K");
+            })
+        });
+        Self { stop, thread }
+    }
+}
+
+impl Drop for Ticker {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_ticker_stops_and_clears_when_dropped() {
+        let quiet = Ticker::start_if(false, "Running GC".into());
+        assert!(quiet.thread.is_none());
+        let drawing = Ticker::start_if(true, "Running GC".into());
+        assert!(drawing.thread.is_some());
+        let stop = drawing.stop.clone();
+        drop(drawing);
+        assert!(stop.load(std::sync::atomic::Ordering::Relaxed));
+    }
 
     #[test]
     fn help_styles_use_the_shared_heading_color() {

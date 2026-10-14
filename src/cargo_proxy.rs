@@ -193,9 +193,29 @@ fn run_with_source(cargo_args: Vec<OsString>) -> Result<()> {
 
 fn run_cargo_with_target_protection(command: Command, cargo: &Path) -> Result<()> {
     let config = crate::config::Config::load().context("loading the cache configuration")?;
-    let target_use = crate::target_use::shared_for(&config.cache_dir, command.get_args())
+    let what = cargo_command_label(command.get_args());
+    let target_use = crate::target_use::shared_for(&config.cache_dir, &what, command.get_args())
         .context("protecting target directories while Cargo runs")?;
     run_cargo_guarded(command, cargo, target_use, &config)
+}
+
+/// `cargo <subcommand>`, for a cleanup that has to wait for this command.
+fn cargo_command_label<'a>(args: impl IntoIterator<Item = &'a OsStr>) -> String {
+    let mut args = args.into_iter().map(OsStr::to_string_lossy);
+    let mut subcommand = None;
+    while let Some(arg) = args.next() {
+        // Cargo's global options that take a separate value.
+        if matches!(&*arg, "--config" | "-Z" | "-C" | "--color" | "--explain") {
+            args.next();
+        } else if !arg.starts_with('-') && !arg.starts_with('+') {
+            subcommand = Some(arg);
+            break;
+        }
+    }
+    match subcommand {
+        Some(subcommand) => format!("cargo {subcommand}"),
+        None => "cargo".to_owned(),
+    }
 }
 
 fn real_cargo_program(shimmed: bool) -> Result<PathBuf> {
@@ -1034,6 +1054,25 @@ mod tests {
                     Some("compiler-artifact" | "build-finished" | "compiler-message")
                 )
             })
+    }
+
+    #[test]
+    fn cargo_command_label_names_the_subcommand() {
+        let label = |args: &[&str]| cargo_command_label(args.iter().map(OsStr::new));
+        assert_eq!(label(&["run", "--features", "x"]), "cargo run");
+        assert_eq!(
+            label(&["+nightly", "-q", "test", "--", "--nocapture"]),
+            "cargo test"
+        );
+        assert_eq!(label(&["--version"]), "cargo");
+        assert_eq!(
+            label(&[
+                "--config",
+                "build.build-dir=\"{workspace-root}/target\"",
+                "build"
+            ]),
+            "cargo build"
+        );
     }
 
     #[test]

@@ -4260,7 +4260,11 @@ pub fn gc(
     }
 
     let mut combined = crate::store::GcStats::default();
-    match crate::daemon::send_gc_request(config, max_age_hours) {
+    let request = {
+        let _ticker = human_gc_output(json).then(|| term::Ticker::start("Running GC"));
+        crate::daemon::send_gc_request(config, max_age_hours)
+    };
+    match request {
         Ok(outcome) if outcome.skipped => {
             if json {
                 return emit_gc_json(config, true, &combined);
@@ -5083,12 +5087,15 @@ pub fn clean(
         CleanScope::Tracked(selection) => (std::env::current_dir()?, Some(*selection)),
     };
     let preview = dry_run || (json && !yes);
-    let (mut targets, skipped, orphans) = if let Some(selection) = selection {
-        tracked_target_entries(config, selection, preview)?
-    } else {
-        let mut targets = Vec::new();
-        find_target_dirs_in(&root, &mut targets);
-        (targets, Vec::new(), std::collections::HashSet::new())
+    let (mut targets, skipped, orphans) = {
+        let _ticker = (!json).then(|| term::Ticker::start("Measuring target directories"));
+        if let Some(selection) = selection {
+            tracked_target_entries(config, selection, preview)?
+        } else {
+            let mut targets = Vec::new();
+            find_target_dirs_in(&root, &mut targets);
+            (targets, Vec::new(), std::collections::HashSet::new())
+        }
     };
     let tracked = selection.is_some();
     // Sort by size descending
@@ -5109,7 +5116,17 @@ pub fn clean(
         } else {
             PlanEnd::NothingRemoved
         };
-        for line in plan_lines(plan, &skipped, end) {
+        let notes = if dry_run {
+            let paths: Vec<&std::path::Path> = plan
+                .removed
+                .iter()
+                .map(|row| std::path::Path::new(&row.path))
+                .collect();
+            removal_notes(&config.cache_dir, &paths)
+        } else {
+            Vec::new()
+        };
+        for line in plan_lines(plan, &skipped, &notes, end) {
             println!("{line}");
         }
         return Ok(());
@@ -5121,6 +5138,7 @@ pub fn clean(
 
     let emit_clean_json = |targets: &[TargetEntry],
                            skipped: &[CleanSkipped],
+                           waiting: &[crate::target_use::Holder],
                            removed_paths: Vec<String>,
                            reclaimed: u64| {
         #[derive(serde::Serialize)]
@@ -5140,10 +5158,20 @@ pub fn clean(
             #[serde(skip_serializing_if = "Option::is_none")]
             kept: Option<&'a [TargetRow]>,
             skipped: Vec<CleanSkipped>,
+            /// Running commands that keep clean from deleting now.
+            #[serde(skip_serializing_if = "Vec::is_empty")]
+            waiting_for: Vec<WaitingFor>,
             removed_paths: Vec<String>,
             changed: bool,
             estimated_reclaimed_bytes: u64,
         }
+        #[derive(serde::Serialize)]
+        struct WaitingFor {
+            pid: u32,
+            command: String,
+            running_seconds: u64,
+        }
+        let now = kache_store::markers::now_epoch_secs();
         let body = Body {
             kept: plan.as_ref().map(|plan| plan.kept.as_slice()),
             targets: targets
@@ -5157,6 +5185,14 @@ pub fn clean(
                 })
                 .collect(),
             skipped: skipped.to_vec(),
+            waiting_for: waiting
+                .iter()
+                .map(|holder| WaitingFor {
+                    pid: holder.pid,
+                    command: holder.what.clone(),
+                    running_seconds: now.saturating_sub(holder.since),
+                })
+                .collect(),
             changed: !removed_paths.is_empty(),
             removed_paths,
             estimated_reclaimed_bytes: reclaimed,
@@ -5171,13 +5207,18 @@ pub fn clean(
     // `--json` without `--yes`, or with `--dry-run`, is a preview. Agents
     // should not enter the TUI.
     if json && preview {
-        return emit_clean_json(&targets, &skipped, Vec::new(), 0);
+        let waiting = crate::target_use::blockers(&config.cache_dir).unwrap_or_default();
+        return emit_clean_json(&targets, &skipped, &waiting, Vec::new(), 0);
     }
 
     // `--dry-run` takes precedence over `--yes`: preview only, never delete.
     if dry_run {
         for line in render_clean_dry_run(&targets, &root, &orphans) {
             println!("{line}");
+        }
+        let paths: Vec<&std::path::Path> = targets.iter().map(|t| t.path.as_path()).collect();
+        for note in removal_notes(&config.cache_dir, &paths) {
+            println!("{note}");
         }
         for item in &skipped {
             println!("Skipped {}: {}", item.path, item.reason);
@@ -5190,8 +5231,15 @@ pub fn clean(
     if yes {
         let to_remove: Vec<_> = targets.iter().map(RemovalTarget::from_entry).collect();
         let mut skipped = skipped.clone();
-        let (removed, estimated_reclaimed, apparent_gap) =
-            remove_targets(&to_remove, &root, &config.cache_dir, json, &mut skipped);
+        let mut waiting = Vec::new();
+        let (removed, estimated_reclaimed, apparent_gap) = remove_targets(
+            &to_remove,
+            &root,
+            &config.cache_dir,
+            json,
+            &mut skipped,
+            &mut waiting,
+        );
         let removed_paths: Vec<String> = to_remove
             .iter()
             .filter(|target| path_was_removed(&target.path))
@@ -5206,7 +5254,13 @@ pub fn clean(
             }
         }
         if json {
-            return emit_clean_json(&targets, &skipped, removed_paths, estimated_reclaimed);
+            return emit_clean_json(
+                &targets,
+                &skipped,
+                &waiting,
+                removed_paths,
+                estimated_reclaimed,
+            );
         }
         println!(
             "\n{}",
@@ -5263,8 +5317,14 @@ pub fn clean(
             println!("Nothing selected.");
         }
         Some(to_remove) => {
-            let (removed, estimated_reclaimed, apparent_gap) =
-                remove_targets(&to_remove, &root, &config.cache_dir, false, &mut Vec::new());
+            let (removed, estimated_reclaimed, apparent_gap) = remove_targets(
+                &to_remove,
+                &root,
+                &config.cache_dir,
+                false,
+                &mut Vec::new(),
+                &mut Vec::new(),
+            );
             if tracked {
                 let store = Store::open(config)?;
                 for target in &to_remove {
@@ -5314,6 +5374,7 @@ fn remove_targets(
     cache_dir: &std::path::Path,
     quiet: bool,
     skipped: &mut Vec<CleanSkipped>,
+    waiting: &mut Vec<crate::target_use::Holder>,
 ) -> (usize, u64, u64) {
     let mut estimated_reclaimed = 0u64;
     let mut apparent_gap = 0u64;
@@ -5322,6 +5383,13 @@ fn remove_targets(
         tracing::warn!("cannot check running Cargo commands before clean: {error}");
         None
     });
+    // Without the reservation nothing can go, whatever each target's state:
+    // say once what clean waits for, rather than blame every target.
+    let held = reservation.is_none().then(|| {
+        *waiting = crate::target_use::holders(cache_dir);
+        held_reason(waiting, kache_store::markers::now_epoch_secs())
+    });
+    let mut held_back = 0usize;
     for target in to_remove {
         let rel = target.path.strip_prefix(root).unwrap_or(&target.path);
         let current_identity = directory_identity(&target.path);
@@ -5334,7 +5402,16 @@ fn remove_targets(
             }
             continue;
         }
-        if reservation.is_none() || target_in_use(&target.path) {
+        if let Some(reason) = &held {
+            held_back += 1;
+            skipped.push(CleanSkipped {
+                path: target.path.display().to_string(),
+                reason: reason.clone(),
+                missing: false,
+            });
+            continue;
+        }
+        if target_in_use(&target.path) {
             if human_clean_output(quiet) {
                 println!("  skipped {} — {TARGET_IN_USE}", rel.display());
             }
@@ -5345,7 +5422,12 @@ fn remove_targets(
             });
             continue;
         }
-        match std::fs::remove_dir_all(&target.path) {
+        let removal = {
+            let _ticker = human_clean_output(quiet)
+                .then(|| term::Ticker::start(format!("Removing {}", rel.display())));
+            std::fs::remove_dir_all(&target.path)
+        };
+        match removal {
             Ok(()) => {
                 estimated_reclaimed =
                     estimated_reclaimed.saturating_add(target.estimated_reclaimable);
@@ -5362,7 +5444,57 @@ fn remove_targets(
             }
         }
     }
+    if let Some(reason) = held.filter(|_| held_back > 0 && human_clean_output(quiet)) {
+        println!("  skipped {} — {reason}", target_count(held_back));
+    }
     (removed, estimated_reclaimed, apparent_gap)
+}
+
+/// Why clean skips every target now: the commands holding Kache's target
+/// lock, by name and how long they have run, or a plain reason when none
+/// left a record.
+fn held_reason(holders: &[crate::target_use::Holder], now: u64) -> String {
+    let named: Vec<String> = holders
+        .iter()
+        .map(|holder| {
+            let running = now.saturating_sub(holder.since).saturating_mul(1000);
+            format!(
+                "`{}` (pid {}, running {})",
+                holder.what,
+                holder.pid,
+                term::duration_ms(running)
+            )
+        })
+        .collect();
+    match named.as_slice() {
+        [] => {
+            "another Kache cleanup or a running Cargo command holds Kache's target lock".to_owned()
+        }
+        [one] => format!("waiting for {one} to exit"),
+        [rest @ .., last] => format!("waiting for {} and {last} to exit", rest.join(", ")),
+    }
+}
+
+/// What a dry run adds under the targets it would remove when `--yes` could
+/// not remove them right now, so the preview matches the real run.
+fn removal_notes(cache_dir: &std::path::Path, paths: &[&std::path::Path]) -> Vec<String> {
+    if paths.is_empty() {
+        return Vec::new();
+    }
+    if let Some(holders) = crate::target_use::blockers(cache_dir) {
+        let reason = held_reason(&holders, kache_store::markers::now_epoch_secs());
+        return vec![format!(
+            "Not now: {reason}; until then `kache clean --yes` skips them."
+        )];
+    }
+    let in_use = paths.iter().filter(|path| target_in_use(path)).count();
+    if in_use == 0 {
+        return Vec::new();
+    }
+    vec![format!(
+        "Not now: {} {TARGET_IN_USE}.",
+        target_count(in_use)
+    )]
 }
 
 fn human_clean_output(quiet: bool) -> bool {
@@ -5867,7 +5999,12 @@ fn clean_argv(selection: TrackedSelection) -> Vec<String> {
 }
 
 /// The tracked clean view, from its plan. Pure.
-fn plan_lines(plan: &TrackedPlan, skipped: &[CleanSkipped], end: PlanEnd) -> Vec<String> {
+fn plan_lines(
+    plan: &TrackedPlan,
+    skipped: &[CleanSkipped],
+    notes: &[String],
+    end: PlanEnd,
+) -> Vec<String> {
     let selection = plan.selection;
     let removed: Vec<&TargetRow> = plan.removed.iter().collect();
     let kept: Vec<&TargetRow> = plan.kept.iter().collect();
@@ -5888,6 +6025,7 @@ fn plan_lines(plan: &TrackedPlan, skipped: &[CleanSkipped], end: PlanEnd) -> Vec
             selection_words(selection)
         ));
         lines.extend(target_table(&removed));
+        lines.extend(notes.iter().map(|note| format!("  {note}")));
     }
     if !kept.is_empty() {
         let (listed, empty): (Vec<&TargetRow>, Vec<&TargetRow>) =

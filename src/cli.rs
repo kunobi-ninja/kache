@@ -7588,9 +7588,11 @@ fn migrate(purge_sccache: bool) -> Result<()> {
     for name in ["config.toml", "config"] {
         let cargo_config = cargo_dir.join(name);
         if let Ok(content) = std::fs::read_to_string(&cargo_config)
-            && content.contains("sccache")
+            && let CargoWrapperPlan::Replace(wrapper) = plan_cargo_wrapper_edit(&cargo_config)?
+            && is_sccache_program(&wrapper)
         {
-            let new_content = content.replace("sccache", "kache");
+            let new_content =
+                apply_cargo_wrapper_edit(&content, &CargoWrapperPlan::Replace(wrapper));
             std::fs::write(&cargo_config, new_content)?;
             actions.push(format!(
                 "Replaced sccache with kache in {}",

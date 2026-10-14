@@ -5444,8 +5444,9 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     ///
     /// Only rows still at the `0` default are touched, so this converges: once
     /// an entry is backfilled it is never re-read. A genuinely zero-cost
-    /// compile is indistinguishable from "not yet backfilled" here, which is
-    /// harmless — it just gets re-read on the next sweep and stays 0.
+    /// compile stays 0 and may be re-read. Randomized selection prevents a
+    /// full batch of zero-cost or unreadable entries from monopolizing every
+    /// later sweep.
     ///
     /// Bounded to 10,000 entries per call. Measured on
     /// a real 52k-entry store, an unbounded pass is ~6 s of `meta.json` reads —
@@ -5529,6 +5530,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         let keys: Vec<String> = {
             let mut stmt = self.db.prepare(
                 "SELECT cache_key FROM entries WHERE compile_time_ms = 0 AND committed = 1
+                 ORDER BY RANDOM()
                  LIMIT ?1",
             )?;
             stmt.query_map(params![limit], |row| row.get(0))?

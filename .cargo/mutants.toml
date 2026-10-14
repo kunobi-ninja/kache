@@ -257,6 +257,10 @@ exclude_globs = ["crates/kache-fs/src/apfs.rs", "src/fallback/macos.rs"]
 # `notice::deliver`, which picks terminal, stderr or log, stays in scope and
 # is tested with in-memory writers, refused writes and no terminal.
 exclude_re = [
+    # When another start wins the race, `daemon start` asks the running daemon
+    # for its version with a short deadline. A past deadline only drops the
+    # version from "already running"; the race is not reproducible in tests.
+    "src/daemon_lifecycle.rs:.*replace \\+ with - in ensure_outcome",
     # The progress ticker draws to an interactive stderr only, which tests do
     # not have: its frames, elapsed text and terminal check are unobservable.
     "src/term.rs:.*in Ticker::start(_if)?$",

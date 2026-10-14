@@ -3140,14 +3140,14 @@ fn test_upload_triggered_eviction_respects_gc_lock() {
 
     let gc_lock = store.try_gc_lock().unwrap().expect("gc lock");
     let daemon = Daemon::new(config);
-    daemon.maybe_evict_after_upload();
+    daemon.sweep_under_size_pressure().unwrap();
     assert!(
         store.contains("upload_evict_key"),
         "upload-triggered eviction must skip while gc.lock is held"
     );
 
     drop(gc_lock);
-    daemon.maybe_evict_after_upload();
+    daemon.sweep_under_size_pressure().unwrap();
     assert!(
         !store.contains("upload_evict_key"),
         "eviction should run once gc.lock is available"
@@ -3181,7 +3181,7 @@ fn upload_triggered_eviction_records_its_run() {
     store.remove_clone_for_test(&src_file);
     store.set_last_accessed_for_test("upload_evict_key", "-1 hour");
 
-    Daemon::new(config).maybe_evict_after_upload();
+    Daemon::new(config).sweep_under_size_pressure().unwrap();
 
     let recorded = crate::report::read_gc_stats(dir.path()).expect("gc_stats.json written");
     assert_eq!(recorded.source, "daemon");
@@ -3233,7 +3233,7 @@ fn disk_pressure_reaches_main_and_shards_below_budget_and_respects_locks_and_bac
     put_upload_evict_entry(&shard, dir.path(), "shard_old", 200, false);
     let held = shard.try_gc_lock().unwrap().unwrap();
     let daemon = Daemon::new(config.clone());
-    daemon.maybe_evict_after_upload();
+    daemon.sweep_under_size_pressure().unwrap();
     assert!(!main.contains("main_old"));
     assert!(main.contains("main_recent"));
     assert!(shard.contains("shard_old"));
@@ -3243,10 +3243,10 @@ fn disk_pressure_reaches_main_and_shards_below_budget_and_respects_locks_and_bac
     assert_eq!(report.entries_evicted, 1);
     assert_eq!(report.entries_pinned, 1);
     drop(held);
-    daemon.maybe_evict_after_upload();
+    daemon.sweep_under_size_pressure().unwrap();
     assert!(!shard.contains("shard_old"));
     put_upload_evict_entry(&main, dir.path(), "later", 200, false);
-    daemon.maybe_evict_after_upload();
+    daemon.sweep_under_size_pressure().unwrap();
     assert!(
         main.contains("later"),
         "the persistent recovery interval holds"
@@ -3311,7 +3311,7 @@ fn upload_triggered_eviction_waits_out_the_auto_gc_backoff() {
     put_upload_evict_entry(&store, dir.path(), "evictable", 50, false);
 
     let daemon = Daemon::new(config.clone());
-    daemon.maybe_evict_after_upload();
+    daemon.sweep_under_size_pressure().unwrap();
     assert!(!store.contains("evictable"));
     assert!(store.contains("retained_0"));
     assert!(
@@ -3321,7 +3321,7 @@ fn upload_triggered_eviction_waits_out_the_auto_gc_backoff() {
 
     // Growth inside the slack: nothing a sweep could not already free.
     put_upload_evict_entry(&store, dir.path(), "next", 50, false);
-    daemon.maybe_evict_after_upload();
+    daemon.sweep_under_size_pressure().unwrap();
     assert!(
         store.contains("next"),
         "the next upload must not sweep again during the backoff"
@@ -3341,14 +3341,14 @@ fn upload_triggered_eviction_starts_one_byte_above_the_shared_trigger() {
     assert!(!crate::wrapper::auto_gc_sweep_due(&config, 1100));
 
     let daemon = Daemon::new(config.clone());
-    daemon.maybe_evict_after_upload();
+    daemon.sweep_under_size_pressure().unwrap();
     assert!(store.contains("at_the_trigger"));
     assert!(crate::report::read_gc_stats(dir.path()).is_none());
 
     put_upload_evict_entry(&store, dir.path(), "x", 1, false);
     assert_eq!(store.physical_size().unwrap(), 1101);
     assert!(crate::wrapper::auto_gc_sweep_due(&config, 1101));
-    daemon.maybe_evict_after_upload();
+    daemon.sweep_under_size_pressure().unwrap();
     assert!(!store.contains("at_the_trigger"));
     assert!(crate::report::read_gc_stats(dir.path()).is_some());
 }
@@ -3469,7 +3469,7 @@ fn gc_skips_a_missing_shard_and_still_sweeps_the_main_store() {
     assert_eq!(report.total.entries_evicted, 1);
 
     put_upload_evict_entry(&main, dir.path(), "main_c", 600, false);
-    daemon.maybe_evict_after_upload();
+    daemon.sweep_under_size_pressure().unwrap();
     assert_eq!(main.physical_size().unwrap(), 600);
     assert!(!missing.exists(), "GC must not create a shard it skips");
 }
@@ -3495,7 +3495,7 @@ fn size_pressure_sweeps_each_shard_with_its_own_budget_and_backoff() {
     put_upload_evict_entry(&held, dir.path(), "evictable", 50, false);
     let daemon = Daemon::new(config.clone());
 
-    daemon.maybe_evict_after_upload();
+    daemon.sweep_under_size_pressure().unwrap();
     assert_eq!(over.physical_size().unwrap(), 600);
     assert!(main.contains("main_entry"));
     assert!(held.contains("evictable") && held.contains("held_0"));
@@ -3523,10 +3523,10 @@ fn size_pressure_leaves_a_shard_whose_gc_lock_is_held() {
     let held = shard.try_gc_lock().unwrap().expect("gc lock");
 
     let daemon = Daemon::new(config);
-    daemon.maybe_evict_after_upload();
+    daemon.sweep_under_size_pressure().unwrap();
     assert!(shard.contains("shard_entry"));
     drop(held);
-    daemon.maybe_evict_after_upload();
+    daemon.sweep_under_size_pressure().unwrap();
     assert!(!shard.contains("shard_entry"));
 }
 
@@ -3540,7 +3540,7 @@ fn upload_triggered_eviction_clears_the_backoff_once_the_store_fits() {
     crate::wrapper::record_auto_gc_outcome(&config, 1200, 0);
     crate::wrapper::expire_auto_gc_backoff_for_test(dir.path());
 
-    Daemon::new(config).maybe_evict_after_upload();
+    Daemon::new(config).sweep_under_size_pressure().unwrap();
     assert!(!store.contains("evictable"));
     assert_eq!(
         crate::wrapper::auto_gc_backoff_interval_for_test(dir.path()),
@@ -3871,7 +3871,7 @@ fn test_handle_request_sync_rejects_remote_check() {
 async fn test_handle_upload_no_remote() {
     let dir = tempfile::tempdir().unwrap();
     let config = test_config(dir.path()); // remote = None
-    let daemon = Daemon::new(config);
+    let daemon = Arc::new(Daemon::new(config));
 
     let job = UploadJob {
         key: test_cache_key("no-remote-upload"),
@@ -3912,7 +3912,7 @@ async fn test_handle_upload_remote_readonly() {
     let dir = tempfile::tempdir().unwrap();
     let mut config = test_config(dir.path());
     config.remote_readonly = true;
-    let daemon = Daemon::new(config);
+    let daemon = Arc::new(Daemon::new(config));
 
     let job = UploadJob {
         key: test_cache_key("readonly-upload"),
@@ -3968,7 +3968,7 @@ async fn a_read_only_daemon_warns_once_about_skipped_uploads() {
 
     // A live request, then startup replay of queued intents.
     for replay in [false, true] {
-        let daemon = Daemon::new(config.clone());
+        let daemon = Arc::new(Daemon::new(config.clone()));
         let mut first_warning = None;
         for job in &jobs {
             let response = if replay {
@@ -11165,7 +11165,10 @@ async fn expired_remote_check_queued_by_handler_limiter_never_reaches_backend() 
 #[tokio::test]
 async fn test_do_upload_suppressed_while_degraded() {
     let dir = tempfile::tempdir().unwrap();
-    let daemon = resilience_test_daemon(dir.path(), Arc::new(PanicOnGetBackend));
+    let daemon = Arc::new(resilience_test_daemon(
+        dir.path(),
+        Arc::new(PanicOnGetBackend),
+    ));
 
     daemon.remote_breaker.note_failure("PUT", "boom-1");
     daemon.remote_breaker.note_failure("PUT", "boom-2");
@@ -11657,7 +11660,7 @@ async fn test_demand_does_not_wait_behind_unstarted_prefetch_candidates() {
 
 // ── Upload queue tests ────────────────────────────────────────
 
-async fn queued_upload_response(daemon: &Daemon, job: &UploadJob) -> Response {
+async fn queued_upload_response(daemon: &Arc<Daemon>, job: &UploadJob) -> Response {
     // These fixtures have no competing GC. A persisted intent must not keep
     // publication retrying instead of acknowledging the queued upload.
     tokio::time::timeout(Duration::from_secs(5), daemon.handle_upload(job))
@@ -11672,7 +11675,7 @@ async fn test_handle_upload_with_queue_returns_immediately() {
     config.remote = Some(crate::config::RemoteConfig::test_s3("test", "artifacts"));
 
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<UploadJob>();
-    let daemon = Daemon::new(config);
+    let daemon = Arc::new(Daemon::new(config));
     daemon.set_upload_tx(tx);
 
     let job = UploadJob {
@@ -11701,7 +11704,7 @@ async fn test_handle_upload_queue_closed() {
     config.remote = Some(crate::config::RemoteConfig::test_s3("test", "artifacts"));
 
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<UploadJob>();
-    let daemon = Daemon::new(config);
+    let daemon = Arc::new(Daemon::new(config));
     daemon.set_upload_tx(tx);
 
     // Drop receiver to close the channel
@@ -11727,7 +11730,7 @@ async fn test_handle_upload_dedup() {
     config.remote = Some(crate::config::RemoteConfig::test_s3("test", "artifacts"));
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<UploadJob>();
-    let daemon = Daemon::new(config);
+    let daemon = Arc::new(Daemon::new(config));
     daemon.set_upload_tx(tx);
 
     let job = UploadJob {
@@ -11795,7 +11798,7 @@ async fn test_handle_upload_after_queue_close_rejects_without_direct_upload() {
     config.remote = Some(crate::config::RemoteConfig::test_s3("test", "artifacts"));
 
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<UploadJob>();
-    let daemon = Daemon::new(config);
+    let daemon = Arc::new(Daemon::new(config));
     daemon.set_upload_tx(tx);
     daemon.close_upload_queue();
 
@@ -14061,7 +14064,7 @@ async fn a_permanently_failed_upload_retires_its_intent_so_gc_holds_the_size_lim
     )
     .unwrap();
 
-    let daemon = Daemon::new(config.clone());
+    let daemon = Arc::new(Daemon::new(config.clone()));
     assert!(
         daemon.remote_backend.set(Arc::new(PutFailBackend)).is_ok(),
         "inject mock backend"

@@ -4021,7 +4021,7 @@ impl Daemon {
 
     /// Handle an upload job. If the upload queue is available, pushes to it (non-blocking).
     /// Otherwise falls back to direct upload (used in tests).
-    pub async fn handle_upload(&self, job: &UploadJob) -> Response {
+    pub async fn handle_upload(self: &Arc<Self>, job: &UploadJob) -> Response {
         if !crate::cache_key::is_valid_cache_key(&job.key) {
             return Response::err("invalid cache key");
         }
@@ -4131,7 +4131,7 @@ impl Daemon {
     }
 
     /// Execute an upload directly (used by upload queue workers).
-    pub async fn do_upload(&self, job: &UploadJob) -> Response {
+    pub async fn do_upload(self: &Arc<Self>, job: &UploadJob) -> Response {
         let key_short = key_prefix(&job.key);
         if !crate::cache_key::is_valid_cache_key(&job.key) {
             return Response::err("invalid cache key");
@@ -4351,7 +4351,7 @@ impl Daemon {
                 if let Err(error) = remove_upload_job(&self.config, &job.key) {
                     tracing::warn!("failed to retire completed upload intent: {error:#}");
                 }
-                self.maybe_evict_after_upload();
+                self.handle_gc_hint();
                 Response::ok()
             }
             Err(e) => {
@@ -6695,11 +6695,6 @@ impl Daemon {
             .await
     }
 
-    /// After a successful upload: sweep if the store is under size pressure.
-    fn maybe_evict_after_upload(&self) {
-        let _ = self.sweep_under_size_pressure();
-    }
-
     /// Claim the hinted sweep. False while one is queued or running: that
     /// sweep measures the store when it starts, so it covers this hint too.
     fn claim_gc_hint(&self) -> bool {
@@ -7280,7 +7275,7 @@ fn start_manifest_warming(daemon: &Arc<Daemon>) -> Option<tokio::task::JoinHandl
 /// policy, and nothing retries it until the daemon restarts, where a permanent
 /// error fails it again. Kept, such intents hold the store above its size
 /// limit for as long as the remote refuses.
-async fn run_upload_job(daemon: &Daemon, job: &UploadJob) -> Response {
+async fn run_upload_job(daemon: &Arc<Daemon>, job: &UploadJob) -> Response {
     let resp = loop {
         let response = daemon.do_upload(job).await;
         if upload_result_is_terminal(response.error.as_deref()) {

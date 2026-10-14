@@ -1768,6 +1768,27 @@ esac
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn verify_kills_background_descendants_after_a_timely_exit() {
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = verify_fixture(None);
+        let mut spec = fixture.verify.clone().unwrap();
+        spec.run = "(sleep 1; touch survived) >/dev/null 2>&1 & printf ok".into();
+        spec.expected_stdout_contains = vec!["ok".into()];
+        spec.forbidden_substrings.clear();
+        spec.timeout_s = 5;
+
+        let result = super::run_verify(&spec, &fixture, temp.path(), temp.path());
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+
+        assert!(result.passed, "{result:?}");
+        assert!(
+            !temp.path().join("survived").exists(),
+            "a background descendant outlived the verifier"
+        );
+    }
+
     #[test]
     fn unmodified_phases_verify_the_fixture_contract() {
         let fixture = verify_fixture(Some(&["v2"]));

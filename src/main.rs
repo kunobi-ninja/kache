@@ -226,9 +226,9 @@ enum Commands {
         #[arg(long)]
         cache: bool,
 
-        /// Only targets whose worktree or workspace no longer exists, however
+        /// Only targets whose worktree or workspace was deleted, however
         /// recently they were built
-        #[arg(long, hide = true, conflicts_with_all = ["stale", "cache", "crate_name"])]
+        #[arg(long, conflicts_with_all = ["stale", "cache", "crate_name"])]
         orphans: bool,
 
         /// With --cache: the same, kept for older scripts

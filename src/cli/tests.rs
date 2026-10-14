@@ -7591,15 +7591,48 @@ fn row(workspace: &str, state: TargetState, reclaimable: u64) -> TargetRow {
 #[test]
 fn json_targets_suggest_the_orphan_clean_only_when_a_worktree_is_gone() {
     let live = [row("/wt/a", TargetState::Live, 1)];
-    assert!(targets_next_actions(&live).is_empty());
+    assert!(targets_next_actions(&live, true).is_empty());
     let one = [
         row("/wt/a", TargetState::Live, 1),
         row("/wt/b", TargetState::WorktreeDeleted, 1),
     ];
-    let next = targets_next_actions(&one);
+    let next = targets_next_actions(&one, true);
     assert_eq!(next.len(), 1);
     assert_eq!(next[0].argv, ["kache", "clean", "--orphans", "--yes"]);
-    assert_eq!(next[0].why, "1 target(s) belong to deleted worktrees");
+    assert_eq!(
+        next[0].why,
+        "1 target belongs to a deleted worktree; the daemon removes it a day after its last \
+         build. This removes it now"
+    );
+    let manual = targets_next_actions(&one, false);
+    assert_eq!(
+        manual[0].why,
+        "1 target belongs to a deleted worktree; automatic removal is off"
+    );
+}
+
+#[test]
+fn the_orphan_note_agrees_with_the_count_and_the_setting() {
+    assert_eq!(
+        orphan_note(2, true),
+        "2 targets belong to deleted worktrees; the daemon removes them a day after their \
+         last build"
+    );
+    assert_eq!(
+        orphan_note(2, false),
+        "2 targets belong to deleted worktrees"
+    );
+    assert_eq!(
+        orphan_note(1, false),
+        "1 target belongs to a deleted worktree"
+    );
+    let mut found = row("/wt/b", TargetState::WorktreeDeleted, 1);
+    found.discovered = true;
+    assert_eq!(
+        recorded_orphans(&[found, row("/wt/c", TargetState::WorktreeDeleted, 1)]),
+        1,
+        "a target found through Git is not one a build recorded"
+    );
 }
 
 #[test]
@@ -7641,7 +7674,7 @@ fn a_target_says_what_the_next_pass_does_to_it() {
     assert_eq!(next_pass_note(&Plan::default()), "");
     let mut planned = row("/wt/a", TargetState::Live, 1024);
     planned.next_pass = idle;
-    let rendered = render_targets(&[planned]).join("\n");
+    let rendered = render_targets(&[planned], true).join("\n");
     assert!(
         rendered.contains("/wt/a/target  (next pass removes it: no build used it"),
         "{rendered}"
@@ -7652,11 +7685,12 @@ fn a_target_says_what_the_next_pass_does_to_it() {
 fn the_targets_table_says_nothing_about_unit_cleanup_unless_it_is_on() {
     let mut off = row("/wt/a", TargetState::Live, 1024);
     off.unit_cleanup.status = "off".into();
-    let rendered = render_targets(&[off.clone(), row("/wt/b", TargetState::Live, 1024)]).join("\n");
+    let rendered =
+        render_targets(&[off.clone(), row("/wt/b", TargetState::Live, 1024)], true).join("\n");
     assert!(!rendered.contains("unit cleanup"), "{rendered}");
 
     off.unit_cleanup.status = "unavailable: no receipt yet".into();
-    let rendered = render_targets(&[off]).join("\n");
+    let rendered = render_targets(&[off], true).join("\n");
     assert!(
         rendered.contains("(unit cleanup: unavailable: no receipt yet)"),
         "{rendered}"
@@ -7665,7 +7699,7 @@ fn the_targets_table_says_nothing_about_unit_cleanup_unless_it_is_on() {
 
 #[test]
 fn the_targets_table_totals_and_points_at_deleted_worktrees() {
-    let one = render_targets(&[row("/wt/a", TargetState::Live, 1024)]).join("\n");
+    let one = render_targets(&[row("/wt/a", TargetState::Live, 1024)], true).join("\n");
     assert!(
         one.starts_with("1 tracked target directory: 2.0 KiB on disk, 1.0 KiB freeable"),
         "{one}"
@@ -7675,7 +7709,7 @@ fn the_targets_table_totals_and_points_at_deleted_worktrees() {
     let mut beside = row("/wt/a", TargetState::Live, 1024);
     beside.path = "/wt/a/target-b".into();
     beside.discovered = true;
-    let both = render_targets(&[row("/wt/a", TargetState::Live, 1024), beside]).join("\n");
+    let both = render_targets(&[row("/wt/a", TargetState::Live, 1024), beside], true).join("\n");
     assert!(both.contains("/wt/a/target\n"), "{both}");
     assert!(
         both.contains("/wt/a/target-b  (found through Git)"),
@@ -7688,24 +7722,34 @@ fn the_targets_table_totals_and_points_at_deleted_worktrees() {
         row("/wt/a", TargetState::Live, 1024),
         row("/wt/b", TargetState::WorktreeDeleted, 2048),
     ];
-    let many = render_targets(&rows).join("\n");
+    let many = render_targets(&rows, true).join("\n");
     assert!(
         many.starts_with("2 tracked target directories: 6.0 KiB on disk, 3.0 KiB freeable"),
         "{many}"
     );
     assert_eq!(many.matches("(worktree deleted)").count(), 1, "{many}");
     assert!(
-        many.contains("Remove the 1 deleted worktree's targets: kache clean --orphans --yes"),
+        many.ends_with(
+            "\n1 target belongs to a deleted worktree; the daemon removes it a day after its \
+             last build. To remove it now: `kache clean --orphans --yes`"
+        ),
         "{many}"
     );
-    let two = render_targets(&[
+    let two = [
         row("/wt/b", TargetState::WorktreeDeleted, 1),
         row("/wt/c", TargetState::WorktreeDeleted, 1),
-    ])
-    .join("\n");
+    ];
+    let rendered = render_targets(&two, true).join("\n");
     assert!(
-        two.contains("Remove the 2 deleted worktrees' targets"),
-        "{two}"
+        rendered.contains("removes them a day after their last build. To remove them now:"),
+        "{rendered}"
+    );
+    let manual = render_targets(&two, false).join("\n");
+    assert!(
+        manual.ends_with(
+            "2 targets belong to deleted worktrees. To remove them: `kache clean --orphans --yes`"
+        ),
+        "{manual}"
     );
 }
 

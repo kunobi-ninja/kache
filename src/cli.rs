@@ -5948,7 +5948,7 @@ fn unit_cleanup_note(plan: &crate::target_liveness::Plan) -> String {
     }
 }
 
-fn render_targets(rows: &[TargetRow]) -> Vec<String> {
+fn render_targets(rows: &[TargetRow], auto_orphans: bool) -> Vec<String> {
     let apparent: u64 = rows.iter().map(|row| row.apparent_bytes).sum();
     let reclaimable: u64 = rows.iter().map(|row| row.reclaimable_bytes).sum();
     let mut lines = vec![format!(
@@ -5986,17 +5986,51 @@ fn render_targets(rows: &[TargetRow]) -> Vec<String> {
             term::home_path(std::path::Path::new(&row.path))
         ));
     }
-    let orphans = rows
-        .iter()
-        .filter(|row| !row.discovered && row.state == TargetState::WorktreeDeleted)
-        .count();
+    let orphans = recorded_orphans(rows);
     if orphans > 0 {
+        let them = if orphans == 1 { "it" } else { "them" };
+        let when = if auto_orphans { " now" } else { "" };
         lines.push(format!(
-            "\nRemove the {orphans} deleted worktree{} targets: kache clean --orphans --yes",
-            if orphans == 1 { "'s" } else { "s'" }
+            "\n{}. To remove {them}{when}: `kache clean --orphans --yes`",
+            orphan_note(orphans, auto_orphans)
         ));
     }
     lines
+}
+
+/// Targets a build recorded whose worktree is gone: the ones the daemon's
+/// orphan rule and `kache clean --orphans` act on.
+fn recorded_orphans(rows: &[TargetRow]) -> usize {
+    rows.iter()
+        .filter(|row| !row.discovered && row.state == TargetState::WorktreeDeleted)
+        .count()
+}
+
+/// `2 targets belong to deleted worktrees; the daemon removes them a day
+/// after their last build`, or only the first half when `auto` (the
+/// `auto_clean_orphaned_targets` setting) is off.
+fn orphan_note(orphans: usize, auto: bool) -> String {
+    let (subject, them, their) = if orphans == 1 {
+        (
+            "1 target belongs to a deleted worktree".to_string(),
+            "it",
+            "its",
+        )
+    } else {
+        (
+            format!(
+                "{} targets belong to deleted worktrees",
+                term::count(orphans as u64)
+            ),
+            "them",
+            "their",
+        )
+    };
+    if auto {
+        format!("{subject}; the daemon removes {them} a day after {their} last build")
+    } else {
+        subject
+    }
 }
 
 /// A tracked clean's view of every target kache knows: the ones it removes,
@@ -6323,19 +6357,22 @@ fn next_pass_note(plan: &crate::target_cleanup::Plan) -> String {
 }
 
 /// The clean that removes deleted worktrees' targets, when there are any.
-fn targets_next_actions(rows: &[TargetRow]) -> Vec<crate::machine::NextAction> {
-    let orphans = rows
-        .iter()
-        .filter(|row| !row.discovered && row.state == TargetState::WorktreeDeleted)
-        .count();
+fn targets_next_actions(rows: &[TargetRow], auto_orphans: bool) -> Vec<crate::machine::NextAction> {
+    let orphans = recorded_orphans(rows);
     if orphans == 0 {
         return Vec::new();
     }
+    let note = orphan_note(orphans, auto_orphans);
+    let them = if orphans == 1 { "it" } else { "them" };
     vec![crate::machine::NextAction {
         argv: ["kache", "clean", "--orphans", "--yes"]
             .map(String::from)
             .to_vec(),
-        why: format!("{orphans} target(s) belong to deleted worktrees"),
+        why: if auto_orphans {
+            format!("{note}. This removes {them} now")
+        } else {
+            format!("{note}; automatic removal is off")
+        },
     }]
 }
 
@@ -6350,7 +6387,7 @@ pub fn targets(config: &Config, json: bool) -> Result<()> {
             apparent_bytes: u64,
             reclaimable_bytes: u64,
         }
-        let next = targets_next_actions(&rows);
+        let next = targets_next_actions(&rows, config.auto_clean_orphaned_targets);
         return crate::machine::emit(
             "targets",
             Body {
@@ -6365,7 +6402,7 @@ pub fn targets(config: &Config, json: bool) -> Result<()> {
         println!("No tracked target directories. Builds through kache register theirs.");
         return Ok(());
     }
-    for line in render_targets(&rows) {
+    for line in render_targets(&rows, config.auto_clean_orphaned_targets) {
         println!("{line}");
     }
     Ok(())

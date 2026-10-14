@@ -2805,6 +2805,9 @@ pub fn redact_report(report: &mut BuildReport) {
         redact_owned(&mut detail.cache_key);
         redact_owned(&mut detail.object_output);
     }
+    for detail in &mut report.bypass.slowest {
+        redact_owned(&mut detail.root);
+    }
     for error in &mut report.errors_detail {
         redact_owned(&mut error.cache_key);
     }

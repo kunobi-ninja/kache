@@ -2156,7 +2156,7 @@ mod tests {
         let tools = tempfile::tempdir().unwrap();
         kache_fs::testutil::write_executable(
             &tools.path().join("rust-lld.exe"),
-            &format!(
+            format!(
                 "#!/bin/sh\n\
                  if [ \"$*\" = '-flavor link --version' ]; then\n\
                    echo '{RUST_LLD_BANNER}'\n\

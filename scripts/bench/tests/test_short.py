@@ -6,6 +6,8 @@ import copy
 import importlib.util
 import json
 import os
+import select
+import signal
 import subprocess
 import sys
 import tempfile
@@ -121,6 +123,47 @@ class BenchTests(unittest.TestCase):
                 [(1234, engine.signal.SIGINT), (1234, engine.signal.SIGKILL)],
             )
             self.assertEqual(process.wait.call_args_list[1].kwargs, {"timeout": 5})
+
+    def test_failed_measurement_stops_child_processes(self):
+        read_fd, write_fd = os.pipe()
+        child_pid = None
+        child = (
+            "import os, sys, time; "
+            "os.write(int(sys.argv[1]), (str(os.getpid()) + '\\n').encode()); "
+            "print('ready', flush=True); time.sleep(60)"
+        )
+        parent = (
+            "import subprocess, sys; fd = int(sys.argv[2]); "
+            "worker = subprocess.Popen([sys.executable, '-c', sys.argv[1], str(fd)], "
+            "pass_fds=(fd,), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL); "
+            "assert worker.stdout.readline() == b'ready\\n'; sys.exit(4)"
+        )
+        with os.fdopen(read_fd, "rb", buffering=0) as reader:
+            try:
+                with self.assertRaises(subprocess.CalledProcessError) as failure:
+                    engine.run_measurement(
+                        [sys.executable, "-c", parent, child, str(write_fd)],
+                        pass_fds=(write_fd,),
+                        timeout=5,
+                    )
+                self.assertEqual(failure.exception.returncode, 4)
+                os.close(write_fd)
+                write_fd = None
+                child_pid = int(reader.readline())
+                readable, _, _ = select.select([reader], [], [], 5)
+                self.assertTrue(
+                    readable,
+                    "failed measurement left its child alive holding the pipe",
+                )
+                self.assertEqual(reader.read(1), b"", "child pipe was not released")
+            finally:
+                if write_fd is not None:
+                    os.close(write_fd)
+                if child_pid is not None:
+                    try:
+                        os.kill(child_pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
 
     def test_refuses_invalid_measurements(self):
         for backend in ("kache", "sccache", "mbx"):

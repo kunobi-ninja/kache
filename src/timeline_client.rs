@@ -58,12 +58,19 @@ pub(crate) async fn push_timeline(
         .build()
         .context("building the timeline client")?;
 
+    let deadline = tokio::time::Instant::now() + push_timeout(config);
+    let bearer = crate::planner_auth::bearer(config, deadline).await;
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    if remaining.is_zero() {
+        anyhow::bail!("timeline timeout spent before the request could be sent");
+    }
     let mut request = client
         .post(build_timelines_url(&config.endpoint))
+        .timeout(remaining)
         .header(reqwest::header::CONTENT_TYPE, "application/json")
         .header(reqwest::header::CONTENT_ENCODING, "zstd")
         .body(encode_record(record)?);
-    if let Some(token) = config.token.as_deref() {
+    if let Some(token) = bearer {
         request = request.bearer_auth(token);
     }
 
@@ -385,9 +392,10 @@ mod tests {
             socket.flush().await.unwrap();
         });
 
-        let error = push_timeline(&planner_config(&format!("http://{addr}"), 750), &record())
-            .await
-            .unwrap_err();
+        // This fixture isolates the service's refusal, without discovery traffic.
+        let mut config = planner_config(&format!("http://{addr}"), 750);
+        config.token = Some("fixture-explicit".to_string());
+        let error = push_timeline(&config, &record()).await.unwrap_err();
         let message = format!("{error:#}");
         assert!(message.contains("413"), "{message}");
         assert!(

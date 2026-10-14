@@ -6842,6 +6842,57 @@ fn cc_flag_dir_values_reads_separated_and_equals_forms() {
 }
 
 #[test]
+fn cc_flag_dir_values_reads_the_joined_form() {
+    let rest = [
+        "-isystem/sys/one".to_string(),
+        "-isystem".to_string(),
+        "/sys/two".to_string(),
+        "-iquote/q".to_string(),
+        "-isysroot/sdk".to_string(),
+        "-isystem-after".to_string(),
+        "/after".to_string(),
+    ];
+    assert_eq!(
+        cc_flag_dir_values(&rest, "-isystem"),
+        ["/sys/one", "/sys/two"]
+    );
+    assert_eq!(cc_flag_dir_values(&rest, "-iquote"), ["/q"]);
+    assert_eq!(cc_flag_dir_values(&rest, "-isysroot"), ["/sdk"]);
+}
+
+#[test]
+fn joined_include_dir_flags_are_not_refused() {
+    // Build scripts pass `-isystem<dir>` through `cc::Build::flag`; every
+    // such compile passed through as an unsupported flag.
+    for flag in [
+        "-isystem/opt/libcxx/include",
+        "-isystemrelative/include",
+        "-iquote/opt/q",
+        "-idirafter/opt/after",
+    ] {
+        let descs = refuse_descriptions(&["clang++", "-c", flag, "a.cc"]);
+        assert!(
+            !descs.iter().any(|d| d.contains("unsupported flag")),
+            "{flag} is an include directory, got: {descs:?}"
+        );
+    }
+    // clang's `-isystem-after` is another flag, not `-isystem` joined to
+    // `-after`, and GCC reads `-isystem=<dir>` relative to the sysroot.
+    for args in [
+        ["clang++", "-c", "-isystem-after", "/opt/a", "a.cc"],
+        ["clang++", "-c", "-isystem=/opt/a", "-DX", "a.cc"],
+        ["clang++", "-c", "-iquote=/opt/q", "-DX", "a.cc"],
+        ["clang++", "-c", "-idirafter=/opt/d", "-DX", "a.cc"],
+    ] {
+        let descs = refuse_descriptions(&args);
+        assert!(
+            descs.iter().any(|d| d.contains("unsupported flag")),
+            "{args:?} must still refuse, got: {descs:?}"
+        );
+    }
+}
+
+#[test]
 fn include_dir_digest_isystem_on_source_dir_is_exempt() {
     let temp = tempfile::tempdir().unwrap();
     let srcdir = temp.path().join("src");

@@ -3342,6 +3342,52 @@ mod tests {
         );
     }
 
+    #[test]
+    fn legacy_rerun_predictions_are_rejected_before_reuse() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::test_support::test_config(dir.path().join("cache"));
+        let run = Run {
+            store: Store::open(&config).unwrap(),
+            config,
+            binary_hash: "padded-declarations".to_string(),
+            environment: environment(&dir.path().join("out"), &dir.path().join("pkg")),
+            start: std::time::Instant::now(),
+        };
+        // Version 1 could omit whitespace-padded Cargo declarations.
+        let legacy = Prediction {
+            version: 1,
+            inputs: vec!["${KACHE_MANIFEST_DIR}".to_string()],
+            env: Vec::new(),
+            default_package: true,
+            portable_out_dir: true,
+            embedded_roots: None,
+            rewrites_text: false,
+        };
+        run.store
+            .file_hash_cache()
+            .put_input_prediction(
+                &run.identity(),
+                1,
+                Some(CRATE_NAME),
+                &serde_json::to_string(&legacy).unwrap(),
+            )
+            .unwrap();
+        assert!(
+            run.prediction().unwrap().is_none(),
+            "legacy predictions may have omitted a declared environment input"
+        );
+
+        let current = recorded_prediction(
+            Vec::new(),
+            vec!["APP_MODE".to_string()],
+            false,
+            Vec::new(),
+            false,
+        );
+        run.record_prediction(&current).unwrap();
+        assert_eq!(run.prediction().unwrap(), Some(current));
+    }
+
     /// A `links` dependency hands its outputs down as `DEP_*` paths. What is
     /// at an absolute path is part of the key; a relative or missing value
     /// contributes its spelling only.

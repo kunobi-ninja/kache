@@ -8662,3 +8662,87 @@ fn clang_cl_flag_after_a_separate_value_is_still_classified() {
         assert!(reasons.contains(flag), "{argv:?}: {reasons}");
     }
 }
+
+/// The compile cargo-xwin's `CFLAGS_x86_64_pc_windows_msvc` produces through
+/// the `cc` crate (libwebp-sys, cross-compiled from Linux).
+fn cargo_xwin_clang_cl_argv() -> Vec<String> {
+    s(&[
+        "clang-cl",
+        "-nologo",
+        "-MT",
+        "-O2",
+        "-Brepro",
+        "--target=x86_64-pc-windows-msvc",
+        "-I",
+        "/home/u/.cargo/registry/src/libwebp-sys-0.9.6/vendor",
+        "-D_CRT_SECURE_NO_WARNINGS",
+        "-msse4.1",
+        "-DNDEBUG=1",
+        "--target=x86_64-pc-windows-msvc",
+        "-Wno-unused-command-line-argument",
+        "-fuse-ld=lld-link",
+        "/imsvc",
+        "/home/u/.cache/cargo-xwin/xwin/crt/include",
+        "/imsvc",
+        "/home/u/.cache/cargo-xwin/xwin/sdk/include/ucrt",
+        "-Fo/home/u/target/out/ba9ae331e1c03d63-sharpyuv_cpu.o",
+        "-c",
+        "--",
+        "/home/u/.cargo/registry/src/libwebp-sys-0.9.6/vendor/sharpyuv/sharpyuv_cpu.c",
+    ])
+}
+
+#[test]
+fn cargo_xwin_clang_cl_compile_is_cacheable() {
+    let parsed = CcArgs::parse(&cargo_xwin_clang_cl_argv()).unwrap();
+    let reasons = parsed.refuse_reasons(&[]);
+    assert!(reasons.is_empty(), "{reasons:?}");
+    assert_eq!(parsed.sources.len(), 1);
+}
+
+#[test]
+fn clang_cl_system_include_and_linker_selection_rows() {
+    use crate::compiler::flags::{Dialect, FlagClass};
+    for flag in [
+        "/imsvc",
+        "-imsvc",
+        "/imsvcC:\\sdk\\include",
+        "-imsvc/sdk/include",
+    ] {
+        assert_eq!(
+            classify_cc_flag(flag, Dialect::Cl),
+            Some(FlagClass::PreprocessorCaptured),
+            "{flag}"
+        );
+    }
+    // `-imsvc` is a clang-cl spelling only.
+    assert_eq!(classify_cc_flag("-imsvc", Dialect::Gnu), None);
+    for dialect in [Dialect::Gnu, Dialect::Cl] {
+        assert_eq!(
+            classify_cc_flag("-fuse-ld=lld-link", dialect),
+            Some(FlagClass::NoObjectEffect)
+        );
+    }
+    // The joined spelling is one token; nothing after it is consumed.
+    let parsed = CcArgs::parse(&s(&[
+        "clang-cl",
+        "-c",
+        "/imsvcC:\\sdk",
+        "/kache-unknown",
+        "foo.c",
+    ]))
+    .unwrap();
+    assert!(format!("{:?}", parsed.refuse_reasons(&[])).contains("/kache-unknown"));
+}
+
+#[test]
+fn clang_cl_system_include_dirs_stay_in_the_preprocessor_expansion() {
+    // The SDK headers must reach the key: `/EP` keeps `/imsvc <dir>`.
+    let parsed = CcArgs::parse(&cargo_xwin_clang_cl_argv()).unwrap();
+    let args = build_preprocess_args(&parsed);
+    let at = args
+        .iter()
+        .position(|arg| arg == "/imsvc")
+        .expect("/imsvc kept");
+    assert_eq!(args[at + 1], "/home/u/.cache/cargo-xwin/xwin/crt/include");
+}

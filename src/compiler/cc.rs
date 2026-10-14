@@ -292,6 +292,10 @@ enum CcArgAction {
     DepTarget,
     LanguageOverride,
     Include,
+    /// clang-cl `/imsvc`: a system include directory. Its headers reach the
+    /// key through the preprocessor expansion like `-isystem`'s; the
+    /// parser only has to consume the value.
+    SystemInclude,
     Define,
 }
 
@@ -576,6 +580,24 @@ static CC_ARG_SPECS: &[CcArgSpec] = &[
         bucket: CcArgBucket::Preprocessor,
         source: "include search path",
         dialect: None,
+    },
+    // clang-cl's system include directory, separate or joined. cargo-xwin
+    // passes the CRT and Windows SDK headers this way.
+    CcArgSpec {
+        matcher: Matcher::Prefix("/imsvc"),
+        value_form: CcArgValueForm::CanBeSeparated { prefix: "/imsvc" },
+        action: CcArgAction::SystemInclude,
+        bucket: CcArgBucket::Preprocessor,
+        source: "system include search path",
+        dialect: Some(Dialect::Cl),
+    },
+    CcArgSpec {
+        matcher: Matcher::Prefix("-imsvc"),
+        value_form: CcArgValueForm::CanBeSeparated { prefix: "-imsvc" },
+        action: CcArgAction::SystemInclude,
+        bucket: CcArgBucket::Preprocessor,
+        source: "system include search path",
+        dialect: Some(Dialect::Cl),
     },
     CcArgSpec {
         matcher: Matcher::Prefix("-D"),
@@ -1325,6 +1347,7 @@ fn apply_cc_arg(parsed: &mut CcArgs, depinfo: &mut Option<DepInfoSpec>, arg: &Pa
                 parsed.defines.push(parse_define(value));
             }
         }
+        CcArgAction::SystemInclude => {}
     }
 }
 
@@ -3117,6 +3140,30 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         dialect: None,
     },
     FlagSpec {
+        // clang-cl's `-isystem`: `/imsvc <dir>` or joined. The `/EP`
+        // expansion keeps it, so the headers it finds are in the key.
+        matcher: Matcher::Prefix("/imsvc"),
+        class: FlagClass::PreprocessorCaptured,
+        source: "clang-cl system include directory (cargo-xwin CRT and SDK headers).",
+        dialect: Some(Dialect::Cl),
+    },
+    FlagSpec {
+        matcher: Matcher::Prefix("-imsvc"),
+        class: FlagClass::PreprocessorCaptured,
+        source: "clang-cl system include directory, dash spelling.",
+        dialect: Some(Dialect::Cl),
+    },
+    FlagSpec {
+        // Picks the linker. The classifier only runs for `-c` and `-E`,
+        // where no linker runs (clang reports the flag unused); a cached
+        // link keys its full argv in `cache_key_for_link` instead.
+        // cargo-xwin puts `-fuse-ld=lld-link` in every CFLAGS.
+        matcher: Matcher::Prefix("-fuse-ld="),
+        class: FlagClass::NoObjectEffect,
+        source: "linker selection; no effect on a compile or preprocess.",
+        dialect: None,
+    },
+    FlagSpec {
         matcher: Matcher::Exact("-iquote"),
         class: FlagClass::PreprocessorCaptured,
         source: "PR #94",
@@ -3954,6 +4001,13 @@ fn classify_and_trace_cc_flags<'a>(
                 );
                 rejected.push(arg.as_str());
             }
+        }
+        if dialect == Dialect::Cl && arg == "--" {
+            // clang-cl reads everything after `--` as an input file, which
+            // the `cc` crate relies on for sources with absolute Unix paths
+            // (`/home/...`) that would otherwise spell flags.
+            tracing::trace!("[cc:{subject}] -- ends the options: the rest are inputs");
+            break;
         }
         let value_follows = takes_separate_value(&parsed.rest, idx, dialect);
         idx += 1;

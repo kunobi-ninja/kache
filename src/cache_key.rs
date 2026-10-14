@@ -3672,7 +3672,7 @@ fn compute_key_into(
     // future flag), yet were previously invisible to the key — the `_ => {}`
     // catch-all in `args.rs` dropped them. Fold the NORMALIZED, sorted residual
     // under a versioned tag so an unmodeled codegen-affecting flag changes the
-    // key. Diagnostics / lint / query / already-keyed path flags are stripped
+    // key. Modeled diagnostics / lint / query / path flags are stripped
     // during arg parsing, so they never reach here. Normalize via PathNormalizer
     // (a residual token can embed a machine-local path) and sort so argv order /
     // host paths don't perturb the key. Folded only when non-empty, so the
@@ -3708,6 +3708,14 @@ fn compute_key_into(
             raw.len(),
             raw.join(" "),
         );
+    }
+
+    // Always fold the version tag, including when no format was explicit:
+    // older clients stored arbitrary diagnostic formats under that default key.
+    hasher.set_group("diagnostics");
+    fold_field(&mut hasher, b"diagnostics.v1:", b"");
+    for flag in &args.diagnostic_flags {
+        fold_field(&mut hasher, b"diagnostic_arg:", flag.as_bytes());
     }
 
     // Outcome-affecting lint configuration (-A/-W/-D/-F, their long forms,

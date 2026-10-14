@@ -3955,7 +3955,15 @@ fn classify_and_trace_cc_flags<'a>(
                 rejected.push(arg.as_str());
             }
         }
+        let value_follows = takes_separate_value(&parsed.rest, idx, dialect);
         idx += 1;
+        if value_follows {
+            tracing::trace!(
+                "[cc:{subject}] value {} of {arg} -> consumed by the flag",
+                parsed.rest[idx]
+            );
+            idx += 1;
+        }
     }
 
     if !parsed.rest.is_empty() {
@@ -4038,6 +4046,18 @@ fn normalize_raw_keyed_cc_flag(arg: &str, prefix_maps: &[CcPrefixMap]) -> Vec<u8
     normalized.push(b'=');
     normalized.extend_from_slice(to.as_bytes());
     normalized
+}
+
+/// Whether `rest[idx]` is a flag that [`CcArgs::parse`] reads together with
+/// the next token as its value (`-I <dir>`, `-o <path>`, `-D <name>`).
+///
+/// That token is the flag's value and is never classified as a flag of its
+/// own. Under clang-cl a token starting with `/` is a flag spelling, so an
+/// absolute Unix path in a separate `-I` value (cargo-xwin and other
+/// clang-cl cross builds) would otherwise read as an unknown flag and refuse
+/// the compile.
+fn takes_separate_value(rest: &[String], idx: usize, dialect: Dialect) -> bool {
+    parse_cc_arg_at(rest, idx, dialect).is_some_and(|arg| arg.consumed == 2)
 }
 
 fn analyze_cc_arg(arg: &str, dialect: Dialect) -> CcArgAnalysis<'_> {

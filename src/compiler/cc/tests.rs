@@ -8602,3 +8602,63 @@ mod properties {
         }
     }
 }
+
+#[test]
+fn clang_cl_separate_value_is_not_read_as_a_flag() {
+    // cargo-xwin passes include dirs as `-I <dir>` with absolute Unix paths.
+    // Under clang-cl a leading `/` spells a flag, but the token is `-I`'s
+    // value and the compile is cacheable.
+    for argv in [
+        &[
+            "clang-cl",
+            "-c",
+            "-I",
+            "/abs/include",
+            "/Fofoo.obj",
+            "foo.c",
+        ][..],
+        &["clang-cl", "-c", "foo.c", "-o", "/abs/out/foo.obj"][..],
+        &["gcc", "-c", "-I", "/abs/include", "-o", "foo.o", "foo.c"][..],
+    ] {
+        let parsed = CcArgs::parse(&s(argv)).unwrap();
+        let reasons = parsed.refuse_reasons(&[]);
+        assert!(reasons.is_empty(), "{argv:?}: {reasons:?}");
+    }
+    let parsed = CcArgs::parse(&s(&[
+        "clang-cl",
+        "-c",
+        "-I",
+        "/abs/include",
+        "/Fofoo.obj",
+        "foo.c",
+    ]))
+    .unwrap();
+    assert_eq!(parsed.includes, vec![PathBuf::from("/abs/include")]);
+}
+
+#[test]
+fn clang_cl_flag_after_a_separate_value_is_still_classified() {
+    // Only the one value token is skipped: an unmodeled flag right after it,
+    // or after a flag that takes no value, still refuses the compile.
+    for (argv, flag) in [
+        (
+            &[
+                "clang-cl",
+                "-c",
+                "-I",
+                "/abs/include",
+                "/kache-unknown",
+                "foo.c",
+            ][..],
+            "/kache-unknown",
+        ),
+        (
+            &["clang-cl", "-c", "/kache-unknown", "foo.c"][..],
+            "/kache-unknown",
+        ),
+    ] {
+        let parsed = CcArgs::parse(&s(argv)).unwrap();
+        let reasons = format!("{:?}", parsed.refuse_reasons(&[]));
+        assert!(reasons.contains(flag), "{argv:?}: {reasons}");
+    }
+}

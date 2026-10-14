@@ -598,8 +598,12 @@ mod tests {
         let cache = tempfile::tempdir().unwrap();
         let tests = scheduler::scheduler_root(cache.path()).join("tests");
         std::fs::create_dir_all(&tests).unwrap();
+        let marker = tests.join("1");
+        let _held = crate::store::StoreLock::try_acquire(&marker)
+            .unwrap()
+            .unwrap();
         let covered = TestEnv {
-            lease: Some(tests.join("1")),
+            lease: Some(marker),
             ..env()
         };
         assert_eq!(

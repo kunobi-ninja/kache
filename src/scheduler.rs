@@ -682,14 +682,17 @@ pub(crate) fn write_test_weight(cache_dir: &Path, key: &str, rss: u64) {
     write_weight(&scheduler_root(cache_dir).join("weights"), key, rss).unwrap();
 }
 
-/// Whether `lease` is a marker of this scheduler's test leases, so the
+/// Whether `lease` is a held marker of this scheduler's test leases, so the
 /// caller runs inside a test that already holds slots. Any error is false.
 pub(crate) fn lease_covers(lease: Option<&Path>, root: &Path) -> bool {
-    let Some(parent) = lease.and_then(Path::parent) else {
+    let Some(lease) = lease else {
+        return false;
+    };
+    let Some(parent) = lease.parent() else {
         return false;
     };
     match (parent.canonicalize(), tests_dir(root).canonicalize()) {
-        (Ok(parent), Ok(tests)) => parent == tests,
+        (Ok(parent), Ok(tests)) => parent == tests && slot_is_held(lease) == Some(true),
         _ => false,
     }
 }
@@ -2775,7 +2778,11 @@ mod tests {
         fs::create_dir_all(tests_dir(&other_root)).unwrap();
 
         assert!(!lease_covers(None, &root));
-        assert!(lease_covers(Some(&tests_dir(&root).join("3")), &root));
+        let marker = tests_dir(&root).join("3");
+        let held = StoreLock::try_acquire(&marker).unwrap().unwrap();
+        assert!(lease_covers(Some(&marker), &root));
+        let other_marker = tests_dir(&other_root).join("3");
+        let _other_held = StoreLock::try_acquire(&other_marker).unwrap().unwrap();
         assert!(!lease_covers(
             Some(&tests_dir(&other_root).join("3")),
             &root
@@ -2784,6 +2791,7 @@ mod tests {
             !lease_covers(Some(&root.join("permits/3")), &root),
             "only markers under tests/ cover"
         );
+        drop(held);
         let fresh = temp_cache();
         assert!(
             !lease_covers(
@@ -2804,6 +2812,7 @@ mod tests {
         let alias = links.path().join("alias");
         std::os::unix::fs::symlink(dir.path(), &alias).unwrap();
         let marker = tests_dir(&scheduler_root(&alias)).join("1");
+        let _held = StoreLock::try_acquire(&marker).unwrap().unwrap();
         assert!(lease_covers(Some(&marker), &root));
     }
 
@@ -3087,6 +3096,7 @@ mod tests {
             let _pin = PinnedPressure::new(pressured);
             fs::create_dir_all(tests_dir(&scheduler.root)).unwrap();
             let marker = tests_dir(&scheduler.root).join("1");
+            let _marker_lock = StoreLock::try_acquire(&marker).unwrap().unwrap();
             let identity = FlightIdentity::rustc("nested", &["lib".into()], false).with_key("k");
 
             let BeginMiss::Compile(covered) =
@@ -3139,6 +3149,7 @@ mod tests {
 
             fs::create_dir_all(tests_dir(&scheduler.root)).unwrap();
             let marker = tests_dir(&scheduler.root).join("1");
+            let _marker_lock = StoreLock::try_acquire(&marker).unwrap().unwrap();
             let covered = scheduler.keyless_compile("c_unit", false, Some(&marker));
             assert!(
                 covered._permit.is_none(),

@@ -1066,6 +1066,7 @@ impl CommandExecute for KacheCommandExecute {
         let mut command = tokio::process::Command::new(&program);
         command
             .args(&args)
+            .kill_on_drop(true)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
         if let Some(profile) = &self.profile {

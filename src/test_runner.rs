@@ -38,6 +38,17 @@ const NEXTEST_WAIT: Duration = Duration::from_secs(120);
 /// gives Cargo.
 const RUN_FAILED: i32 = 101;
 
+const HELP: &str =
+    "Run a test binary as Cargo's target runner, paced by the machine-wide scheduler";
+
+const USAGE: &str = "Usage: kache test-runner <TEST-BINARY> [ARGS]...";
+
+/// `--help` or `-h` where Cargo would put the test binary. Cargo never
+/// passes a binary by that name, so a person is asking.
+fn is_help_flag(arg: &OsStr) -> bool {
+    arg == "--help" || arg == "-h"
+}
+
 /// The environment the runner reads, captured once at startup.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TestEnv {
@@ -91,9 +102,20 @@ fn binary_label(binary: &OsStr) -> String {
 /// for the runner. Returns only when the binary could not be run or has
 /// exited; a binary killed by a signal kills the runner with it.
 pub fn run(args: &[OsString]) -> i32 {
-    if args.is_empty() {
-        eprintln!("kache test-runner: expected a test binary to run");
-        return RUN_FAILED;
+    match args.first() {
+        None => {
+            eprintln!(
+                "{} expected a test binary to run\n\n{USAGE}",
+                crate::term::paint("error:", crate::term::Style::Error)
+            );
+            // Cargo's exit code for a test binary that failed, like a missing one.
+            return RUN_FAILED;
+        }
+        Some(first) if is_help_flag(first) => {
+            println!("{HELP}\n\n{USAGE}");
+            return 0;
+        }
+        Some(_) => {}
     }
     let env = TestEnv::capture();
     let config = crate::config::Config::load().ok();
@@ -447,6 +469,20 @@ pub(crate) mod windows_signals {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_help_flags_ask_for_help() {
+        assert!(is_help_flag(OsStr::new("--help")));
+        assert!(is_help_flag(OsStr::new("-h")));
+        for binary in [
+            "target/debug/deps/tests-0123456789abcdef",
+            "--helpx",
+            "-H",
+            "",
+        ] {
+            assert!(!is_help_flag(OsStr::new(binary)), "{binary}");
+        }
+    }
 
     #[test]
     fn binary_label_drops_cargos_hash() {

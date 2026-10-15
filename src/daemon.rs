@@ -8,6 +8,7 @@ use kache_core::{PrefetchDisposition, PrefetchPlan};
 use kunobi_daemon::Lifecycle;
 #[path = "daemon_lifecycle.rs"]
 mod lifecycle_client;
+pub(crate) use lifecycle_client::Ensured;
 #[path = "daemon_control.rs"]
 mod lifecycle_control;
 use serde::{Deserialize, Serialize};
@@ -9543,14 +9544,12 @@ fn fetch_stats(
 /// Wait for ownership release after a verified drain acknowledgement. A timeout
 /// leaves unfinished work running and reports failure.
 pub fn send_shutdown_request(config: &Config) -> Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    if lifecycle_control::request(config, kunobi_daemon::wire::operation::DRAIN, deadline)?
-        .is_none()
-    {
-        let response =
-            lifecycle_control::legacy_request(&config.socket_path(), &Request::Shutdown, deadline)?;
-        let response: Response = serde_json::from_str(&response)?;
-        anyhow::ensure!(response.ok, "daemon rejected shutdown");
+    if let Err(error) = request_shutdown(config) {
+        if daemon_is_absent(&error, daemon_run_lock_is_held(&config.socket_path())?) {
+            eprintln!("daemon is not running");
+            return Ok(());
+        }
+        return Err(error);
     }
     anyhow::ensure!(
         wait_for_run_lock_release(&config.socket_path(), Duration::from_secs(35))?,
@@ -9560,10 +9559,39 @@ pub fn send_shutdown_request(config: &Config) -> Result<()> {
     Ok(())
 }
 
+fn request_shutdown(config: &Config) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    if lifecycle_control::request(config, kunobi_daemon::wire::operation::DRAIN, deadline)?
+        .is_none()
+    {
+        let response =
+            lifecycle_control::legacy_request(&config.socket_path(), &Request::Shutdown, deadline)?;
+        let response: Response = serde_json::from_str(&response)?;
+        anyhow::ensure!(response.ok, "daemon rejected shutdown");
+    }
+    Ok(())
+}
+
+/// Whether a failed shutdown request found no daemon at all: nothing
+/// accepted the connection and no process holds the daemon's run lock.
+fn daemon_is_absent(error: &anyhow::Error, run_lock_held: bool) -> bool {
+    !run_lock_held && lifecycle_client::transient(error)
+}
+
+/// `kache daemon start`: start the daemon unless a ready one is running.
+pub fn start(config: &Config) -> Result<Ensured> {
+    lifecycle_client::ensure_outcome(config, false)
+}
+
 /// Drain and replace this cache's daemon through the shared exclusive coordinator.
 /// Returns true only after the replacement answers a compatible readiness probe.
 pub fn restart(config: &Config) -> Result<bool> {
     lifecycle_client::ensure(config, true)
+}
+
+/// Whether a daemon process owns this cache now, ready or not.
+pub fn is_running(config: &Config) -> Result<bool> {
+    daemon_run_lock_is_held(&config.socket_path())
 }
 
 /// Best-effort restart for stale-daemon detection from stats polling.

@@ -5690,6 +5690,39 @@ async fn test_send_remote_check_error_response_yields_none() {
     );
 }
 
+/// `kache daemon stop` with nothing listening reports that and succeeds.
+#[test]
+fn shutdown_with_no_daemon_succeeds() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    std::fs::create_dir_all(config.socket_path().parent().unwrap()).unwrap();
+    send_shutdown_request(&config).unwrap();
+}
+
+#[test]
+fn a_daemon_is_absent_only_when_unreachable_and_unlocked() {
+    let unreachable = || anyhow::Error::new(kunobi_daemon::local::ConnectError::ConnectTimeout);
+    assert!(daemon_is_absent(&unreachable(), false));
+    assert!(!daemon_is_absent(&unreachable(), true));
+    let rejected = anyhow::anyhow!("daemon rejected shutdown");
+    assert!(!daemon_is_absent(&rejected, false));
+}
+
+/// A daemon that holds its run lock but does not answer is not reported as
+/// stopped: the request fails.
+#[test]
+fn shutdown_fails_while_an_unresponsive_daemon_holds_the_run_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let socket = config.socket_path();
+    std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+    let _held = kunobi_daemon::ProcessLock::try_acquire(daemon_run_lock_path(&socket))
+        .unwrap()
+        .unwrap();
+    assert!(is_running(&config).unwrap());
+    assert!(send_shutdown_request(&config).is_err());
+}
+
 #[tokio::test]
 async fn test_send_shutdown_request_client_roundtrip() {
     let dir = tempfile::tempdir().unwrap();

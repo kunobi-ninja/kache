@@ -149,6 +149,9 @@ fn root_selected(session: &Session, root: Option<&str>) -> bool {
 
 const NEED_TWO: &str = "need two sessions to compare";
 
+/// Why `kache diff` exits 1.
+const ALARMED: &str = "the latest build has more misses, or a larger share of unexplained misses, than the one before";
+
 /// Print the comparison. `Ok(true)` means the later session has more misses
 /// or a larger unexplained share; the caller exits 1. Fewer than two
 /// sessions prints a line and returns `Ok(false)`.
@@ -183,7 +186,7 @@ pub fn run(config: &Config, root: Option<&Path>, json: bool) -> Result<bool> {
                     lines: Vec<String>,
                 }
                 let lines = alarm_lines(&body);
-                crate::machine::emit(
+                let emitted = crate::machine::emit(
                     "diff",
                     Body {
                         root: body.root.clone(),
@@ -196,7 +199,9 @@ pub fn run(config: &Config, root: Option<&Path>, json: bool) -> Result<bool> {
                         lines,
                     },
                     Vec::new(),
-                )?;
+                );
+                // Exit 1 for a regression even when stdout was closed.
+                crate::machine::still_failed(emitted, alarmed.then_some(ALARMED))?;
             } else {
                 println!("{}", body.text());
             }

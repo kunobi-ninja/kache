@@ -80,11 +80,13 @@ impl SinceWindow {
     }
 
     /// Parse `15m`, `2h`, `7d`, `90s`, or a bare integer (hours, kept for
-    /// compatibility with the pre-#897 flag). Whitespace around the value is
-    /// ignored. `None` for anything else, including overflow and an empty
-    /// number.
+    /// compatibility with the pre-#897 flag). Whitespace around the value and
+    /// one leading `+` are ignored, as integer parsing always allowed. A
+    /// value past the largest window saturates to it. `None` for anything
+    /// else, including an empty number.
     pub(crate) fn parse(input: &str) -> Option<Self> {
         let input = input.trim();
+        let input = input.strip_prefix('+').unwrap_or(input);
         let (digits, unit) = match input.chars().last()? {
             's' => (&input[..input.len() - 1], Unit::Secs),
             'm' => (&input[..input.len() - 1], Unit::Mins),
@@ -98,9 +100,10 @@ impl SinceWindow {
         if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
             return None;
         }
-        let count: u64 = digits.parse().ok()?;
+        // All digits, so the only parse failure left is overflow.
+        let count: u64 = digits.parse().unwrap_or(u64::MAX);
         Some(SinceWindow {
-            secs: count.checked_mul(unit.secs())?,
+            secs: count.saturating_mul(unit.secs()),
             unit,
         })
     }
@@ -172,18 +175,40 @@ mod tests {
     #[test]
     fn rejects_invalid_input() {
         for bad in [
-            "", " ", "invalid", "m", "h", "15x", "1.5h", "-2h", "2 h", "15mm", "+3h",
+            "", " ", "invalid", "m", "h", "15x", "1.5h", "-2h", "2 h", "15mm", "+", "+h", "++3h",
+            "+-3h", "3+h",
         ] {
             assert!(SinceWindow::parse(bad).is_none(), "{bad:?} must not parse");
         }
     }
 
+    /// Integer parsing took a leading `+`, so the age flags always did.
     #[test]
-    fn rejects_overflow() {
-        assert!(SinceWindow::parse("18446744073709551615d").is_none());
-        assert!(SinceWindow::parse("18446744073709551615h").is_none());
-        assert!(SinceWindow::parse("18446744073709551615m").is_none());
-        assert!(SinceWindow::parse("18446744073709551616s").is_none());
+    fn accepts_one_leading_plus() {
+        assert_eq!(SinceWindow::parse("+3h").unwrap().secs(), 10_800);
+        assert_eq!(SinceWindow::parse(" +24").unwrap().secs(), 86_400);
+        assert_eq!(SinceWindow::parse("+3h").unwrap().label(), "3h");
+    }
+
+    #[test]
+    fn saturates_past_the_largest_window() {
+        for huge in [
+            "18446744073709551615d",
+            "18446744073709551615h",
+            "18446744073709551615m",
+            "18446744073709551616s",
+            "99999999999999999999999",
+        ] {
+            assert_eq!(SinceWindow::parse(huge).unwrap().secs(), u64::MAX, "{huge}");
+        }
+        assert_eq!(
+            SinceWindow::parse("18446744073709551615s").unwrap().secs(),
+            u64::MAX
+        );
+        assert_eq!(
+            SinceWindow::parse("5124095576030431h").unwrap().secs(),
+            5_124_095_576_030_431 * 3600
+        );
         assert!(SinceWindow::from_hours(u64::MAX).is_none());
     }
 

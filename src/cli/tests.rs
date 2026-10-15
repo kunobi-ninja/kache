@@ -1688,7 +1688,7 @@ fn machine_snapshot_skips_row_figures_on_a_locked_index() {
 fn report_run(config: &Config, out: &std::path::Path, record: bool) {
     report(
         config,
-        "json",
+        ReportFormat::Json,
         SinceWindow::DEFAULT,
         crate::report::ReportFilter {
             root: Some(std::path::PathBuf::from("/ci/runner-3/_work/secret-repo")),
@@ -1843,7 +1843,7 @@ fn report_record_that_cannot_write_still_delivers_the_report() {
 
     let result = report(
         &config,
-        "json",
+        ReportFormat::Json,
         SinceWindow::DEFAULT,
         crate::report::ReportFilter {
             root: None,

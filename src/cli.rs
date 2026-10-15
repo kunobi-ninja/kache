@@ -1811,9 +1811,35 @@ pub fn stats_last_build(
     printed
 }
 
+/// The full build report's output formats.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum ReportFormat {
+    Text,
+    Json,
+    #[value(alias = "md")]
+    Markdown,
+    #[value(alias = "gh")]
+    Github,
+    /// Perfetto / Chrome trace JSON
+    #[value(aliases = ["perfetto", "chrome-trace"])]
+    Trace,
+}
+
+impl ReportFormat {
+    pub fn name(self) -> &'static str {
+        match self {
+            ReportFormat::Text => "text",
+            ReportFormat::Json => "json",
+            ReportFormat::Markdown => "markdown",
+            ReportFormat::Github => "github",
+            ReportFormat::Trace => "trace",
+        }
+    }
+}
+
 pub fn report(
     config: &Config,
-    format: &str,
+    format: ReportFormat,
     window: SinceWindow,
     filter: crate::report::ReportFilter,
     output: Option<std::path::PathBuf>,
@@ -1843,11 +1869,11 @@ pub fn report(
     };
 
     let text = match format {
-        "json" => crate::report::format_json(&report)?,
-        "trace" | "perfetto" | "chrome-trace" => crate::report::format_trace_json(&report)?,
-        "markdown" | "md" => crate::report::format_markdown(&report),
-        "github" | "gh" => crate::report::format_github(&report),
-        _ => {
+        ReportFormat::Json => crate::report::format_json(&report)?,
+        ReportFormat::Trace => crate::report::format_trace_json(&report)?,
+        ReportFormat::Markdown => crate::report::format_markdown(&report),
+        ReportFormat::Github => crate::report::format_github(&report),
+        ReportFormat::Text => {
             let mut text = crate::report::format_text(&report);
             let mut machine = machine_snapshot(config);
             machine.gc = None;
@@ -1876,7 +1902,7 @@ pub fn report(
                 crate::machine::command(),
                 Written {
                     output: path,
-                    format: format.into(),
+                    format: format.name().into(),
                 },
                 Vec::new(),
             )?;

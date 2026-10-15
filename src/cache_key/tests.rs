@@ -17224,7 +17224,6 @@ fn source_env_dep_use_rejects_ambiguous_include_names() {
             format!("use other::{{exported as {name}}}; {name}!(env!(\"OUT_DIR\"));"),
             format!("other::{name}!(env!(\"OUT_DIR\"));"),
             format!("other::r#{name}!(env!(\"OUT_DIR\"));"),
-            format!("use other::*; {name}!(env!(\"OUT_DIR\"));"),
             format!("other:: /* path trivia */ {name}!(env!(\"OUT_DIR\"));"),
             format!(
                 "{name}!(env!(\"OUT_DIR\")); macro_rules! {name} {{ ($path:expr) => {{ $path }}; }}"

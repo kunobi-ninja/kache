@@ -5760,9 +5760,10 @@ fn path_is_only_used_for_includes(value_probe: &Path, source_probes: &[PathBuf])
 /// its extension, still counts AGAINST the var.
 ///
 /// Visible declarations, imports and qualified uses of include-family names
-/// veto the proof. Glob imports also veto it because they can import a macro
-/// with one of those names. This is conservative: other identifiers with the
-/// same spelling and qualified builtin invocations also keep values absolute.
+/// veto the proof. A glob import cannot: rustc rejects a glob-imported
+/// include-family name beside the builtin as ambiguous (E0659). This is
+/// conservative: other identifiers with the same spelling and qualified
+/// builtin invocations also keep values absolute.
 ///
 /// Residual gaps, where the text looks like a locator but the compiled crate
 /// can still bake the value:
@@ -5845,7 +5846,10 @@ fn env_dep_source_decision(
 ///
 /// 6: include-family declarations, imports and qualified invocations cannot
 /// prove builtin locator semantics; glob imports can shadow those builtins.
-const SOURCE_ENV_DEP_SCANNER_VERSION: u32 = 6;
+///
+/// 7: glob imports no longer veto the include proof; rustc rejects them as
+/// ambiguous.
+const SOURCE_ENV_DEP_SCANNER_VERSION: u32 = 7;
 
 /// How one source file's text uses an env var.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5955,7 +5959,10 @@ fn source_env_dep_use(source: &str, var: &str) -> SourceEnvDepUse {
                 use_item = false;
                 i += 1;
             }
-            b'*' if use_item => return SourceEnvDepUse::RuntimeValue,
+            b'*' if use_item => {
+                concat_binding = true;
+                i += 1;
+            }
             b'(' | b'[' | b'{' => {
                 groups.push(false);
                 i += 1;

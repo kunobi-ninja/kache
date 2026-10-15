@@ -248,6 +248,8 @@ fn probe_args_strip_terminal_formatting_and_preserve_operands() {
 #[cfg(unix)]
 #[test]
 fn terminal_formatting_shares_cc_keys_with_cold_and_warm_probes() {
+    // The key reads the current directory and env through the prefix maps.
+    let _lock = crate::test_support::process_state_test_lock();
     let dir = tempfile::tempdir().unwrap();
     let source = dir.path().join("unit.c");
     fs::write(&source, "int x;\n").unwrap();
@@ -308,6 +310,8 @@ fn terminal_formatting_shares_cc_keys_with_cold_and_warm_probes() {
 #[cfg(unix)]
 #[test]
 fn a_key_from_before_the_input_race_fixes_is_never_todays() {
+    // The key reads the current directory and env through the prefix maps.
+    let _lock = crate::test_support::process_state_test_lock();
     let dir = tempfile::tempdir().unwrap();
     let source = dir.path().join("unit.c");
     fs::write(&source, "int x;\n").unwrap();

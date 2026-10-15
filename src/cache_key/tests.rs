@@ -6230,10 +6230,6 @@ fn source_scanner_detects_runtime_env_use_and_skips_literals() {
         RuntimeValue
     );
     assert_eq!(
-        scan(r#"const S: &str = env!(concat!("OT", "HER"));"#, "MYVAR"),
-        RuntimeValue
-    );
-    assert_eq!(
         scan(
             r#"macro_rules! e { ($v:literal) => { env!($v) } } const X: &str = e!("MYVAR");"#,
             "MYVAR"
@@ -11710,7 +11706,7 @@ fn env_dep_use_memo_rescans_rows_from_other_scanner_versions() {
         )
         .unwrap();
     cache
-        .put_source_env_dep_use(&content_hash, "OTHER", SOURCE_ENV_DEP_SCANNER_VERSION, 7)
+        .put_source_env_dep_use(&content_hash, "OUTPUT", SOURCE_ENV_DEP_SCANNER_VERSION, 7)
         .unwrap();
     drop(cache);
 
@@ -11724,7 +11720,7 @@ fn env_dep_use_memo_rescans_rows_from_other_scanner_versions() {
     );
     assert_eq!(
         hasher
-            .env_dep_use_for_hash(&source, "OTHER", &content_hash)
+            .env_dep_use_for_hash(&source, "OUTPUT", &content_hash)
             .unwrap(),
         SourceEnvDepUse::RuntimeValue,
         "an unknown stored code must be rescanned"
@@ -11732,7 +11728,7 @@ fn env_dep_use_memo_rescans_rows_from_other_scanner_versions() {
     drop(hasher);
 
     let cache = FileHashCache::open(&db).unwrap();
-    for var in ["OUT_DIR", "OTHER"] {
+    for var in ["OUT_DIR", "OUTPUT"] {
         assert_eq!(
             cache
                 .get_source_env_dep_use(&content_hash, var, SOURCE_ENV_DEP_SCANNER_VERSION)

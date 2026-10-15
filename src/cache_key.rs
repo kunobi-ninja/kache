@@ -5804,7 +5804,10 @@ fn env_dep_source_decision(
 ///
 /// 3: number suffixes, non-ASCII identifier bytes, and the non-ASCII
 /// whitespace and byte-order mark rustc accepts between tokens.
-const SOURCE_ENV_DEP_SCANNER_VERSION: u32 = 3;
+///
+/// 4: a computed name whose `concat!` starts with a literal the var does not
+/// start with cannot name the var.
+const SOURCE_ENV_DEP_SCANNER_VERSION: u32 = 4;
 
 /// How one source file's text uses an env var.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5897,6 +5900,8 @@ fn source_env_dep_use(source: &str, var: &str) -> SourceEnvDepUse {
                         Some(name) if name != var => {}
                         Some(_) if include_depth > 0 => include_locator = true,
                         None if include_depth > 0 => {}
+                        None if parse_concat_prefix(source, open + 1)
+                            .is_some_and(|prefix| !var.starts_with(prefix)) => {}
                         _ => return SourceEnvDepUse::RuntimeValue,
                     }
                 }
@@ -5934,6 +5939,20 @@ fn parse_env_macro_name(source: &str, after_open: usize) -> Option<&str> {
         .position(|b| matches!(b, b'"' | b'\\'))?;
     let end = start + 1 + len;
     (bytes[end] == b'"').then(|| &source[start + 1..end])
+}
+
+/// The leading literal of an env macro name spelled `concat!("literal", ..)`,
+/// unqualified, with a literal the scanner decodes. Every name that `concat!`
+/// builds starts with it.
+fn parse_concat_prefix(source: &str, after_open: usize) -> Option<&str> {
+    let bytes = source.as_bytes();
+    let start = skip_trivia(bytes, after_open);
+    let end = skip_ident_bytes(bytes, start);
+    if &bytes[start..end] != b"concat" {
+        return None;
+    }
+    let open = parse_macro_open(bytes, end)?;
+    parse_env_macro_name(source, open + 1)
 }
 
 /// Position of the opening delimiter when `after_ident` starts `! (`, `! [`

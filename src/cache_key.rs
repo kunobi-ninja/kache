@@ -5762,8 +5762,9 @@ fn path_is_only_used_for_includes(value_probe: &Path, source_probes: &[PathBuf])
 /// Visible declarations, imports and qualified uses of include-family names
 /// veto the proof. A glob import cannot: rustc rejects a glob-imported
 /// include-family name beside the builtin as ambiguous (E0659). `macro_use`
-/// vetoes it: `#[macro_use] extern crate` puts another crate's exports, which
-/// the scanner cannot see, ahead of the builtins without an error. This is
+/// on anything but a module vetoes it: `#[macro_use] extern crate` puts
+/// another crate's exports, which the scanner cannot see, ahead of the
+/// builtins without an error. This is
 /// conservative: other identifiers with the same spelling and qualified
 /// builtin invocations also keep values absolute.
 ///
@@ -5853,7 +5854,9 @@ fn env_dep_source_decision(
 /// ambiguous.
 ///
 /// 8: `macro_use` vetoes the include proof.
-const SOURCE_ENV_DEP_SCANNER_VERSION: u32 = 8;
+///
+/// 9: except on a module, whose macros are in this crate's sources.
+const SOURCE_ENV_DEP_SCANNER_VERSION: u32 = 9;
 
 /// How one source file's text uses an env var.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5991,7 +5994,9 @@ fn source_env_dep_use(source: &str, var: &str) -> SourceEnvDepUse {
                 // definitions and explicit imports, including renamed ones.
                 // Glob imports and macro_use can hide the name altogether.
                 concat_binding |= ident == b"macro_use" || (ident == b"concat" && open.is_none());
-                if ident == b"macro_use" || (include && (qualified || open.is_none())) {
+                if (ident == b"macro_use" && !macro_use_on_module(bytes, i))
+                    || (include && (qualified || open.is_none()))
+                {
                     return SourceEnvDepUse::RuntimeValue;
                 }
                 let Some(open) = open else { continue };
@@ -6028,6 +6033,68 @@ fn source_env_dep_use(source: &str, var: &str) -> SourceEnvDepUse {
     } else {
         SourceEnvDepUse::Unused
     }
+}
+
+/// Whether the `macro_use` attribute whose name ends at `after_name` is on a
+/// module. A module's macros are `macro_rules!` in this crate's sources,
+/// which the declaration check reads; any other item can bring in another
+/// crate's. Text the skip cannot place reads as not a module.
+fn macro_use_on_module(bytes: &[u8], after_name: usize) -> bool {
+    let mut i = skip_attribute_rest(bytes, after_name);
+    for _ in 0..bytes.len() {
+        i = skip_trivia(bytes, i);
+        if bytes.get(i) != Some(&b'#') {
+            break;
+        }
+        i = skip_attribute_rest(bytes, skip_trivia(bytes, i + 1) + 1);
+    }
+    let (mut item, end) = next_ident(bytes, i);
+    if item == b"pub" {
+        let mut after = skip_trivia(bytes, end);
+        if bytes.get(after) == Some(&b'(') {
+            after = skip_attribute_rest(bytes, after + 1);
+        }
+        item = next_ident(bytes, after).0;
+    }
+    item == b"mod"
+}
+
+/// The identifier at `i` after trivia, empty when there is none, and where
+/// it ends.
+fn next_ident(bytes: &[u8], i: usize) -> (&[u8], usize) {
+    let start = skip_trivia(bytes, i);
+    let end = skip_ident_bytes(bytes, start);
+    (&bytes[start..end], end)
+}
+
+/// The position after the delimiter that closes one already open at `i`,
+/// with strings, raw strings and comments skipped.
+fn skip_attribute_rest(bytes: &[u8], mut i: usize) -> usize {
+    let mut depth = 1usize;
+    for _ in 0..bytes.len() {
+        let Some(&byte) = bytes.get(i) else { break };
+        if comment_starts_at(bytes, i) {
+            i = skip_comment(bytes, i);
+            continue;
+        }
+        match byte {
+            b'"' => i = skip_quoted_string(bytes, i + 1),
+            b'b' | b'c' | b'r' => i = skip_raw_string(bytes, i),
+            b'(' | b'[' | b'{' => {
+                depth += 1;
+                i += 1;
+            }
+            b')' | b']' | b'}' => {
+                depth -= 1;
+                i += 1;
+                if depth == 0 {
+                    return i;
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    bytes.len()
 }
 
 fn is_include_macro(name: &[u8]) -> bool {

@@ -17315,3 +17315,43 @@ fn glob_imports_rescan_version_six_memos() {
         }
     );
 }
+
+/// `#[macro_use] extern crate other;` puts other's exported macros in the
+/// macro_use prelude, which rustc consults before the builtins: an exported
+/// `include` replaces the builtin without an error, and the scanner cannot
+/// see what another crate exports.
+const MACRO_USE_THEN_INCLUDE: &str =
+    "#[macro_use]\nextern crate other;\ninclude!(concat!(env!(\"OUT_DIR\"), \"/private.rs\"));";
+
+#[test]
+fn macro_use_extern_crates_veto_the_include_locator_proof() {
+    assert_eq!(
+        source_env_dep_use(MACRO_USE_THEN_INCLUDE, "OUT_DIR"),
+        SourceEnvDepUse::RuntimeValue
+    );
+}
+
+#[test]
+fn macro_use_extern_crates_rescan_version_seven_memos() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("lib.rs");
+    std::fs::write(&source, MACRO_USE_THEN_INCLUDE).unwrap();
+    let db = dir.path().join("idx.sqlite");
+    let hash = hash_file(&source).unwrap();
+    let cache = FileHashCache::open(&db).unwrap();
+    cache
+        .put_source_env_dep_use(
+            &hash,
+            "OUT_DIR",
+            7,
+            SourceEnvDepUse::IncludeLocator.memo_code(),
+        )
+        .unwrap();
+    drop(cache);
+    assert_eq!(
+        FileHasher::persistent(&db)
+            .env_dep_use(&source, "OUT_DIR")
+            .unwrap(),
+        SourceEnvDepUse::RuntimeValue
+    );
+}

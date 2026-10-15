@@ -165,9 +165,9 @@ enum Commands {
         /// Crate name to show details for (omit to list all)
         crate_name: Option<String>,
 
-        /// Sort by: name, size, hits, age
-        #[arg(long, default_value = "name")]
-        sort: String,
+        /// Sort by name, size, hits or age
+        #[arg(long, value_enum, default_value_t = ListSort::Name)]
+        sort: ListSort,
 
         /// Print directly instead of using a pager
         #[arg(long)]
@@ -333,7 +333,7 @@ enum Commands {
         #[arg(long)]
         manifest_path: Option<String>,
         /// Only download from the remote (skip uploads)
-        #[arg(long)]
+        #[arg(long, conflicts_with = "push")]
         pull: bool,
         /// Only upload to the remote (skip downloads)
         #[arg(long)]
@@ -417,8 +417,8 @@ enum Commands {
 
         /// Write the full report as json, markdown, github, or trace
         /// (Perfetto / Chrome trace). Implies --full
-        #[arg(long, value_name = "FORMAT")]
-        format: Option<String>,
+        #[arg(long, value_name = "FORMAT", value_enum)]
+        format: Option<cli::ReportFormat>,
 
         /// Write the full report to a file instead of stdout. Implies --full
         #[arg(long, short)]
@@ -473,9 +473,10 @@ enum Commands {
     /// same report
     #[command(hide = true)]
     Report {
-        /// Output format: json, trace, perfetto, chrome-trace, markdown, github, text
-        #[arg(long, default_value = "text")]
-        format: String,
+        /// Output format: json, trace (also perfetto, chrome-trace), markdown,
+        /// github, text
+        #[arg(long, value_enum, default_value_t = cli::ReportFormat::Text)]
+        format: cli::ReportFormat,
 
         /// Event window (e.g. 15m, 2h, 7d; a bare number is hours)
         #[arg(long, default_value = "24h")]
@@ -560,6 +561,46 @@ enum Commands {
     },
 }
 
+/// `kache list --sort` keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum ListSort {
+    Name,
+    Size,
+    Hits,
+    Age,
+}
+
+impl ListSort {
+    fn as_str(self) -> &'static str {
+        match self {
+            ListSort::Name => "name",
+            ListSort::Size => "size",
+            ListSort::Hits => "hits",
+            ListSort::Age => "age",
+        }
+    }
+}
+
+/// The bench phases `kache telemetry write --phase` labels a dump with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum BenchPhase {
+    Cold,
+    WarmSameTree,
+    Warm,
+    Pull,
+}
+
+impl BenchPhase {
+    fn as_str(self) -> &'static str {
+        match self {
+            BenchPhase::Cold => "cold",
+            BenchPhase::WarmSameTree => "warm-same-tree",
+            BenchPhase::Warm => "warm",
+            BenchPhase::Pull => "pull",
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum TargetCommands {
     /// Share target files with blobs the store already holds
@@ -604,9 +645,9 @@ enum TelemetryCommands {
         /// Bench scenario this dump belongs to (same string as `kache.bench.project`).
         #[arg(long)]
         scenario: Option<String>,
-        /// Bench phase this dump belongs to (`cold`, `warm`, `pull`).
-        #[arg(long)]
-        phase: Option<String>,
+        /// Bench phase this dump belongs to.
+        #[arg(long, value_enum)]
+        phase: Option<BenchPhase>,
     },
     /// Send build timeline records for finished builds to the planner
     Push {
@@ -669,6 +710,29 @@ fn command_supports_json(command: &Option<Commands>) -> bool {
         | Commands::Logout
         | Commands::InstallShims { .. } => false,
     }
+}
+
+/// Why `--json` cannot run `command`, or `None` when it can. The general
+/// answer lists only commands `kache --help` shows.
+fn json_refusal(command: &Option<Commands>) -> Option<&'static str> {
+    if command_supports_json(command) {
+        return None;
+    }
+    Some(match command {
+        Some(Commands::Config) => "`kache config` is interactive and has no JSON form.",
+        Some(Commands::Login { .. }) => "`kache login` is interactive and has no JSON form.",
+        Some(Commands::Monitor { .. }) => {
+            "`kache monitor` is interactive; use `kache stats --json`."
+        }
+        Some(Commands::Purge { .. }) => {
+            "`kache purge` has no JSON form yet; run it without `--json`."
+        }
+        // The other forms of init have one.
+        Some(Commands::Init { .. }) => "`kache init --shims` has no JSON form.",
+        _ => {
+            "`--json` is supported on init, stats, clean, doctor, explain, list, and daemon status."
+        }
+    })
 }
 
 fn doctor_json_is_read_only(
@@ -863,7 +927,24 @@ fn test_runner_args(raw_args: &[std::ffi::OsString]) -> Option<&[std::ffi::OsStr
     }
 }
 
-fn main() -> Result<()> {
+fn main() -> std::process::ExitCode {
+    match run_main() {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => std::process::ExitCode::from(report_main_error(&error)),
+    }
+}
+
+/// Print an error that reached `main` the way every kache command does, and
+/// return the exit status. A closed stdout ends quietly with 0.
+fn report_main_error(error: &anyhow::Error) -> u8 {
+    if machine::failure_exit(error).is_none() {
+        return 0;
+    }
+    eprintln!("{} {error:#}", term::paint("error:", term::Style::Error));
+    1
+}
+
+fn run_main() -> Result<()> {
     // First, before argv or config: `startup_ms` on every build event is
     // measured from here.
     opcounts::mark_process_start();
@@ -986,11 +1067,12 @@ fn main() -> Result<()> {
                 return Ok(());
             }
             if json && error.use_stderr() {
-                machine::emit_error(
+                // A closed stdout must not turn a usage error into success.
+                let _ = machine::emit_error(
                     "cli",
                     "invalid_arguments",
                     &anyhow::anyhow!(error.to_string()),
-                )?;
+                );
                 eprint!("{error}");
                 std::process::exit(2);
             }
@@ -1012,29 +1094,29 @@ fn main() -> Result<()> {
     };
     machine::configure(json, command.clone());
     if let Err(error) = run_cli(cli, readiness) {
+        let Some((code, exit)) = machine::failure_exit(&error) else {
+            return Ok(());
+        };
         if json && error.downcast_ref::<machine::Reported>().is_none() {
-            machine::emit_error(&command, "command_failed", &error)?;
+            // Still exit with the command's status when the document
+            // cannot be written.
+            let _ = machine::emit_error(&command, code, &error);
         }
         eprintln!("{} {error:#}", term::paint("error:", term::Style::Error));
-        std::process::exit(1);
+        std::process::exit(exit);
     }
     Ok(())
 }
 
 fn run_cli(cli: Cli, readiness: Option<kunobi_daemon::readiness::channel::Notifier>) -> Result<()> {
     let json = cli.json;
-    if json && !command_supports_json(&cli.command) {
-        anyhow::bail!(
-            "`--json` is supported on init, stats, report, clean, gc, doctor, explain, diff, list, targets, and daemon status."
-        );
+    if json && let Some(refusal) = json_refusal(&cli.command) {
+        return Err(machine::invalid_arguments(refusal));
     }
 
     // Config and Completions run before Config::load() (broken/missing config).
     match &cli.command {
         Some(Commands::Config) => {
-            if json {
-                anyhow::bail!("`kache config` is interactive and has no JSON form.");
-            }
             crate::machine::require_tty(
                 std::io::stdout().is_terminal(),
                 "config",
@@ -1043,9 +1125,6 @@ fn run_cli(cli: Cli, readiness: Option<kunobi_daemon::readiness::channel::Notifi
             return config_tui::run_config_editor();
         }
         Some(Commands::Login { device, retrust }) => {
-            if json {
-                anyhow::bail!("`kache login` is interactive and has no JSON form.");
-            }
             return cli::login::login(*device, *retrust);
         }
         Some(Commands::Logout) => return cli::login::logout(),
@@ -1080,29 +1159,24 @@ fn run_cli(cli: Cli, readiness: Option<kunobi_daemon::readiness::channel::Notifi
             crate_name,
             sort,
             no_pager,
-        }) => cli::list(&config, crate_name.as_deref(), &sort, no_pager, json),
+        }) => cli::list(
+            &config,
+            crate_name.as_deref(),
+            sort.as_str(),
+            no_pager,
+            json,
+        ),
         Some(Commands::Gc {
             max_age,
             stale_schema,
         }) => {
             let hours = max_age
                 .as_deref()
-                .map(|value| {
-                    parse_duration_hours(value).ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "invalid --max-age {value:?}; expected hours or a duration like 24h or 7d"
-                        )
-                    })
-                })
+                .map(|value| parse_age_hours("--max-age", value))
                 .transpose()?;
             cli::gc(&config, hours, stale_schema, json)
         }
-        Some(Commands::Purge { crate_name }) => {
-            if json {
-                anyhow::bail!("`kache purge` has no JSON form yet; run it without `--json`.");
-            }
-            cli::purge(&config, crate_name.as_deref())
-        }
+        Some(Commands::Purge { crate_name }) => cli::purge(&config, crate_name.as_deref()),
         Some(Commands::Clean {
             path,
             dry_run,
@@ -1121,13 +1195,7 @@ fn run_cli(cli: Cli, readiness: Option<kunobi_daemon::readiness::channel::Notifi
             }
             let stale_hours = stale
                 .as_deref()
-                .map(|value| {
-                    parse_duration_hours(value).ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "invalid --stale {value:?}; expected hours or a duration like 24h or 7d"
-                        )
-                    })
-                })
+                .map(|value| parse_age_hours("--stale", value))
                 .transpose()?;
             if let Some(name) = crate_name {
                 return cli::clean_cache(&config, cli::CacheClean::Crate(name), dry_run, yes, json);
@@ -1163,9 +1231,9 @@ fn run_cli(cli: Cli, readiness: Option<kunobi_daemon::readiness::channel::Notifi
             ..
         }) => {
             if json && !yes && !check {
-                anyhow::bail!(
-                    "`kache init --json` needs `--check` to preview or `--yes` to apply setup."
-                );
+                return Err(machine::invalid_arguments(
+                    "`kache init --json` needs `--check` to preview or `--yes` to apply setup.",
+                ));
             }
             cli::init(yes, no_service, no_shell, check)
         }
@@ -1177,9 +1245,9 @@ fn run_cli(cli: Cli, readiness: Option<kunobi_daemon::readiness::channel::Notifi
             repair,
         }) => {
             if json && !doctor_json_is_read_only(fix, purge_sccache, verify, checksums, repair) {
-                anyhow::bail!(
-                    "`kache doctor --json` reports diagnostics only; run repair options without `--json`."
-                );
+                return Err(machine::invalid_arguments(
+                    "`kache doctor --json` reports diagnostics only; run repair options without `--json`.",
+                ));
             }
             cli::doctor(
                 fix,
@@ -1221,14 +1289,13 @@ fn run_cli(cli: Cli, readiness: Option<kunobi_daemon::readiness::channel::Notifi
         }) => daemon::run_server(&config, &config_provenance, readiness),
         Some(Commands::Daemon {
             command: Some(DaemonCommands::Start),
-        }) => match daemon::start_daemon_background() {
-            Ok(true) => {
-                eprintln!("daemon started");
+        }) => match daemon::start(&config) {
+            Ok(outcome) => {
+                eprintln!("{}", daemon_start_message(&outcome));
+                if !outcome.is_ready() {
+                    std::process::exit(1);
+                }
                 Ok(())
-            }
-            Ok(false) => {
-                eprintln!("daemon did not start within timeout");
-                std::process::exit(1);
             }
             Err(e) => {
                 eprintln!("failed to start daemon: {e}");
@@ -1240,10 +1307,15 @@ fn run_cli(cli: Cli, readiness: Option<kunobi_daemon::readiness::channel::Notifi
         }) => daemon::send_shutdown_request(&config),
         Some(Commands::Daemon {
             command: Some(DaemonCommands::Restart),
-        }) => match daemon::restart(&config)? {
-            true => Ok(()),
-            false => std::process::exit(1),
-        },
+        }) => {
+            let was_running = daemon::is_running(&config)?;
+            let ready = daemon::restart(&config)?;
+            eprintln!("{}", daemon_restart_message(was_running, ready));
+            if !ready {
+                std::process::exit(1);
+            }
+            Ok(())
+        }
         Some(Commands::Daemon {
             command: Some(DaemonCommands::Install),
         }) => service::install(),
@@ -1266,7 +1338,7 @@ fn run_cli(cli: Cli, readiness: Option<kunobi_daemon::readiness::channel::Notifi
             let window = parse_since_window(&since)?;
             cli::report(
                 &config,
-                &report_format(Some(format), json)?,
+                report_format(Some(format), json)?,
                 window,
                 report::ReportFilter { root, last_build },
                 output,
@@ -1299,7 +1371,7 @@ fn run_cli(cli: Cli, readiness: Option<kunobi_daemon::readiness::channel::Notifi
                 let window = parse_since_window(&since)?;
                 return cli::report(
                     &config,
-                    &format,
+                    format,
                     window,
                     report::ReportFilter { root, last_build },
                     output,
@@ -1312,7 +1384,9 @@ fn run_cli(cli: Cli, readiness: Option<kunobi_daemon::readiness::channel::Notifi
                 return cli::stats_last_build(&config, root, json);
             }
             if root.is_some() {
-                anyhow::bail!("`--root` needs `--last-build` or `--full`");
+                return Err(machine::invalid_arguments(
+                    "`--root` needs `--last-build` or `--full`",
+                ));
             }
             let window = parse_since_window(&since)?;
             cli::stats(&config, &config_provenance, window, json)
@@ -1324,7 +1398,12 @@ fn run_cli(cli: Cli, readiness: Option<kunobi_daemon::readiness::channel::Notifi
                     scenario,
                     phase,
                 },
-        }) => cli::telemetry_write(&config, &dir, scenario.as_deref(), phase.as_deref()),
+        }) => cli::telemetry_write(
+            &config,
+            &dir,
+            scenario.as_deref(),
+            phase.map(BenchPhase::as_str),
+        ),
         Some(Commands::Telemetry {
             command:
                 TelemetryCommands::Push {
@@ -1356,9 +1435,6 @@ fn run_cli(cli: Cli, readiness: Option<kunobi_daemon::readiness::channel::Notifi
             Ok(())
         }
         Some(Commands::Monitor { since }) => {
-            if json {
-                anyhow::bail!("`kache monitor` is interactive; use `kache stats --json`.");
-            }
             crate::machine::require_tty(
                 std::io::stdout().is_terminal(),
                 "monitor",
@@ -1833,41 +1909,69 @@ fn stats_wants_full(
 
 /// The full report's format: the one asked for, else JSON under `--json`,
 /// else text.
-fn report_format(format: Option<String>, json: bool) -> Result<String> {
+fn report_format(format: Option<cli::ReportFormat>, json: bool) -> Result<cli::ReportFormat> {
+    use cli::ReportFormat;
     if json {
-        anyhow::ensure!(
-            format
-                .as_deref()
-                .is_none_or(|format| format == "json" || format == "text"),
-            "`--json` cannot be combined with a different `--format`."
-        );
-        return Ok("json".into());
+        if !matches!(format, None | Some(ReportFormat::Json | ReportFormat::Text)) {
+            return Err(machine::invalid_arguments(
+                "`--json` cannot be combined with a different `--format`.",
+            ));
+        }
+        return Ok(ReportFormat::Json);
     }
-    Ok(format.unwrap_or_else(|| "text".into()))
+    Ok(format.unwrap_or(ReportFormat::Text))
 }
 
 /// Parse a `--since` value, or fail loudly. Falling back to the default on a
 /// value that did not parse is how `--since 15m` came to report a 24h window
-/// labelled as such (kunobi-ninja/kache#897).
+/// labelled as such (kunobi-ninja/kache#897). An empty window is refused.
 fn parse_since_window(value: &str) -> Result<since::SinceWindow> {
+    let window = parse_duration("--since", value)?;
+    if window.secs() == 0 {
+        return Err(machine::invalid_arguments(
+            "--since must be longer than zero",
+        ));
+    }
+    Ok(window)
+}
+
+/// Parse `--stale` or `--max-age` with the `--since` grammar, in whole hours:
+/// the store and the daemon protocol count age in hours. A sub-hour value
+/// rounds up, so `30m` keeps what an hour keeps and never becomes 0. An
+/// explicit 0 still means any age.
+fn parse_age_hours(flag: &str, value: &str) -> Result<u64> {
+    Ok(parse_duration(flag, value)?.secs().div_ceil(3600))
+}
+
+/// The one duration grammar: `90s`, `15m`, `2h`, `7d`, or a bare number of
+/// hours.
+fn parse_duration(flag: &str, value: &str) -> Result<since::SinceWindow> {
     since::SinceWindow::parse(value).ok_or_else(|| {
-        anyhow::anyhow!(
-            "invalid --since {value:?}; expected a duration like 15m, 2h, or 7d (a bare number is hours)"
-        )
+        machine::invalid_arguments(format!(
+            "invalid {flag} {value:?}; expected a duration like 15m, 2h, or 7d (a bare number is hours)"
+        ))
     })
 }
 
-/// Parse a duration string like "7d", "24h", "1h" into hours.
-fn parse_duration_hours(s: &str) -> Option<u64> {
-    let s = s.trim();
-    if let Some(days) = s.strip_suffix('d') {
-        days.parse::<u64>()
-            .ok()
-            .and_then(|days| days.checked_mul(24))
-    } else if let Some(hours) = s.strip_suffix('h') {
-        hours.parse::<u64>().ok()
-    } else {
-        s.parse::<u64>().ok()
+/// What `kache daemon start` says it found or did.
+fn daemon_start_message(outcome: &daemon::Ensured) -> String {
+    match outcome {
+        daemon::Ensured::AlreadyRunning(Some(version)) => {
+            format!("daemon already running (version {version})")
+        }
+        daemon::Ensured::AlreadyRunning(None) => "daemon already running".to_string(),
+        daemon::Ensured::Started => "daemon started".to_string(),
+        daemon::Ensured::TimedOut => "daemon did not start within timeout".to_string(),
+    }
+}
+
+/// What `kache daemon restart` says, from whether a daemon owned the cache
+/// before and whether one is ready now.
+fn daemon_restart_message(was_running: bool, ready: bool) -> &'static str {
+    match (was_running, ready) {
+        (_, false) => "daemon did not start within timeout",
+        (true, true) => "daemon restarted",
+        (false, true) => "daemon was not running; daemon started",
     }
 }
 
@@ -2001,20 +2105,142 @@ mod tests {
         assert!(stats_wants_full(false, false, false, false, false, true));
     }
 
+    fn is_invalid_arguments(error: &anyhow::Error) -> bool {
+        machine::failure_exit(error) == Some(("invalid_arguments", 2))
+    }
+
     #[test]
     fn report_format_prefers_an_explicit_name() {
-        assert_eq!(report_format(None, false).unwrap(), "text");
-        assert_eq!(report_format(None, true).unwrap(), "json");
-        assert_eq!(report_format(Some("md".to_string()), false).unwrap(), "md");
+        use cli::ReportFormat;
+        assert_eq!(report_format(None, false).unwrap(), ReportFormat::Text);
+        assert_eq!(report_format(None, true).unwrap(), ReportFormat::Json);
         assert_eq!(
-            report_format(Some("text".to_string()), true).unwrap(),
-            "json"
+            report_format(Some(ReportFormat::Markdown), false).unwrap(),
+            ReportFormat::Markdown
         );
         assert_eq!(
-            report_format(Some("json".to_string()), true).unwrap(),
-            "json"
+            report_format(Some(ReportFormat::Text), true).unwrap(),
+            ReportFormat::Json
         );
-        assert!(report_format(Some("md".to_string()), true).is_err());
+        assert_eq!(
+            report_format(Some(ReportFormat::Json), true).unwrap(),
+            ReportFormat::Json
+        );
+        for other in [
+            ReportFormat::Markdown,
+            ReportFormat::Github,
+            ReportFormat::Trace,
+        ] {
+            let error = report_format(Some(other), true).unwrap_err();
+            assert!(is_invalid_arguments(&error), "{error:#}");
+        }
+    }
+
+    /// Every spelling the flag took as free text still parses, and a typo
+    /// is a usage error that lists the values.
+    #[test]
+    fn report_formats_keep_every_old_spelling_and_refuse_typos() {
+        use cli::ReportFormat;
+        for (spelling, format) in [
+            ("text", ReportFormat::Text),
+            ("json", ReportFormat::Json),
+            ("markdown", ReportFormat::Markdown),
+            ("md", ReportFormat::Markdown),
+            ("github", ReportFormat::Github),
+            ("gh", ReportFormat::Github),
+            ("trace", ReportFormat::Trace),
+            ("perfetto", ReportFormat::Trace),
+            ("chrome-trace", ReportFormat::Trace),
+        ] {
+            let stats = Cli::try_parse_from(["kache", "stats", "--format", spelling]).unwrap();
+            assert!(
+                matches!(stats.command, Some(Commands::Stats { format: Some(f), .. }) if f == format),
+                "{spelling}"
+            );
+            let report = Cli::try_parse_from(["kache", "report", "--format", spelling]).unwrap();
+            assert!(
+                matches!(report.command, Some(Commands::Report { format: f, .. }) if f == format),
+                "{spelling}"
+            );
+            assert_eq!(
+                <ReportFormat as clap::ValueEnum>::from_str(format.name(), false),
+                Ok(format)
+            );
+        }
+        let report = Cli::try_parse_from(["kache", "report"]).unwrap();
+        assert!(matches!(
+            report.command,
+            Some(Commands::Report {
+                format: ReportFormat::Text,
+                ..
+            })
+        ));
+        for args in [
+            ["kache", "stats", "--format", "jsno"],
+            ["kache", "report", "--format", "html"],
+        ] {
+            let error = Cli::try_parse_from(args).err().unwrap();
+            assert_eq!(error.kind(), clap::error::ErrorKind::InvalidValue);
+            assert!(error.to_string().contains("markdown"), "{error}");
+        }
+    }
+
+    #[test]
+    fn list_sort_and_bench_phase_take_only_known_values() {
+        for (spelling, sort) in [
+            ("name", ListSort::Name),
+            ("size", ListSort::Size),
+            ("hits", ListSort::Hits),
+            ("age", ListSort::Age),
+        ] {
+            let list = Cli::try_parse_from(["kache", "list", "--sort", spelling]).unwrap();
+            assert!(matches!(list.command, Some(Commands::List { sort: s, .. }) if s == sort));
+            assert_eq!(sort.as_str(), spelling);
+        }
+        let list = Cli::try_parse_from(["kache", "list"]).unwrap();
+        assert!(matches!(
+            list.command,
+            Some(Commands::List {
+                sort: ListSort::Name,
+                ..
+            })
+        ));
+        let error = Cli::try_parse_from(["kache", "list", "--sort", "sise"])
+            .err()
+            .unwrap();
+        assert_eq!(error.kind(), clap::error::ErrorKind::InvalidValue);
+
+        for (spelling, phase) in [
+            ("cold", BenchPhase::Cold),
+            ("warm-same-tree", BenchPhase::WarmSameTree),
+            ("warm", BenchPhase::Warm),
+            ("pull", BenchPhase::Pull),
+        ] {
+            let write =
+                Cli::try_parse_from(["kache", "telemetry", "write", "d", "--phase", spelling])
+                    .unwrap();
+            assert!(matches!(
+                write.command,
+                Some(Commands::Telemetry {
+                    command: TelemetryCommands::Write { phase: Some(p), .. }
+                }) if p == phase
+            ));
+            assert_eq!(phase.as_str(), spelling);
+        }
+        let error = Cli::try_parse_from(["kache", "telemetry", "write", "d", "--phase", "hot"])
+            .err()
+            .unwrap();
+        assert_eq!(error.kind(), clap::error::ErrorKind::InvalidValue);
+    }
+
+    #[test]
+    fn sync_pull_and_push_conflict() {
+        let error = Cli::try_parse_from(["kache", "sync", "--pull", "--push"])
+            .err()
+            .unwrap();
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+        assert!(Cli::try_parse_from(["kache", "sync", "--pull"]).is_ok());
+        assert!(Cli::try_parse_from(["kache", "sync", "--push"]).is_ok());
     }
 
     #[test]
@@ -2022,19 +2248,144 @@ mod tests {
         assert_eq!(parse_since_window("15m").unwrap().secs(), 900);
         assert_eq!(parse_since_window("2h").unwrap().secs(), 7200);
         assert_eq!(parse_since_window("24").unwrap().secs(), 86_400);
-        let err = parse_since_window("soon").unwrap_err().to_string();
+        assert_eq!(parse_since_window("1s").unwrap().secs(), 1);
+        let err = parse_since_window("soon").unwrap_err();
+        assert!(is_invalid_arguments(&err), "{err:#}");
+        let err = err.to_string();
         assert!(err.contains("invalid --since \"soon\""), "{err}");
         assert!(err.contains("15m"), "{err}");
+        for empty in ["0", "0h", "0s"] {
+            let err = parse_since_window(empty).unwrap_err();
+            assert!(is_invalid_arguments(&err), "{err:#}");
+            assert!(err.to_string().contains("longer than zero"), "{err}");
+        }
+    }
+
+    /// `--stale` and `--max-age` take the `--since` forms. Sub-hour values
+    /// round up to a whole hour instead of down to 0, which means any age.
+    #[test]
+    fn age_flags_share_the_since_grammar_and_round_up_to_hours() {
+        assert_eq!(parse_age_hours("--stale", "7d").unwrap(), 168);
+        assert_eq!(parse_age_hours("--stale", "24h").unwrap(), 24);
+        assert_eq!(parse_age_hours("--stale", "48").unwrap(), 48);
+        assert_eq!(parse_age_hours("--stale", "30m").unwrap(), 1);
+        assert_eq!(parse_age_hours("--stale", "1s").unwrap(), 1);
+        assert_eq!(parse_age_hours("--stale", "60m").unwrap(), 1);
+        assert_eq!(parse_age_hours("--stale", "61m").unwrap(), 2);
+        assert_eq!(parse_age_hours("--max-age", "0h").unwrap(), 0);
+        // Accepted before the flags shared the grammar: a leading `+`, and
+        // hour counts too large to hold in seconds, which now saturate.
+        assert_eq!(parse_age_hours("--stale", "+24h").unwrap(), 24);
+        assert_eq!(parse_age_hours("--stale", "+48").unwrap(), 48);
+        for huge in ["18446744073709551615h", "18446744073709551615d"] {
+            assert_eq!(
+                parse_age_hours("--max-age", huge).unwrap(),
+                u64::MAX.div_ceil(3600),
+                "{huge}"
+            );
+        }
+        assert_eq!(parse_since_window("+2h").unwrap().secs(), 7200);
+        assert!(is_invalid_arguments(&parse_since_window("+0").unwrap_err()));
+        for bad in ["invalid", "+", "1.5h"] {
+            let err = parse_age_hours("--max-age", bad).unwrap_err();
+            assert!(is_invalid_arguments(&err), "{err:#}");
+            assert!(err.to_string().contains("invalid --max-age"), "{err}");
+        }
     }
 
     #[test]
-    fn test_parse_duration_hours() {
-        assert_eq!(parse_duration_hours("7d"), Some(168));
-        assert_eq!(parse_duration_hours("24h"), Some(24));
-        assert_eq!(parse_duration_hours("1h"), Some(1));
-        assert_eq!(parse_duration_hours("48"), Some(48));
-        assert_eq!(parse_duration_hours("invalid"), None);
-        assert_eq!(parse_duration_hours("18446744073709551615d"), None);
+    fn json_refusals_name_the_command_or_list_visible_ones() {
+        let general = json_refusal(&None).unwrap();
+        assert!(general.contains("is supported on"), "{general}");
+        for hidden in ["report", "gc", "diff", "targets"] {
+            assert!(!general.contains(hidden), "{hidden} is hidden: {general}");
+        }
+        assert_eq!(
+            json_refusal(&Some(Commands::Sync {
+                manifest_path: None,
+                pull: false,
+                push: false,
+                dry_run: false,
+                all: false,
+                workspace: false,
+                allow_partial: false,
+            })),
+            Some(general)
+        );
+        assert!(
+            json_refusal(&Some(Commands::Config))
+                .unwrap()
+                .contains("kache config")
+        );
+        assert!(
+            json_refusal(&Some(Commands::Login {
+                device: false,
+                retrust: false
+            }))
+            .unwrap()
+            .contains("kache login")
+        );
+        assert!(
+            json_refusal(&Some(Commands::Monitor { since: None }))
+                .unwrap()
+                .contains("kache stats --json")
+        );
+        assert!(
+            json_refusal(&Some(Commands::Purge { crate_name: None }))
+                .unwrap()
+                .contains("kache purge")
+        );
+        let shims = Cli::try_parse_from(["kache", "init", "--shims"]).unwrap();
+        assert!(json_refusal(&shims.command).unwrap().contains("--shims"));
+        let init = Cli::try_parse_from(["kache", "init", "--check"]).unwrap();
+        assert_eq!(json_refusal(&init.command), None);
+        assert_eq!(json_refusal(&Some(Commands::Diff { root: None })), None);
+    }
+
+    #[test]
+    fn daemon_lifecycle_messages_say_what_happened() {
+        assert_eq!(
+            daemon_start_message(&daemon::Ensured::AlreadyRunning(Some("1.2.3".into()))),
+            "daemon already running (version 1.2.3)"
+        );
+        assert_eq!(
+            daemon_start_message(&daemon::Ensured::AlreadyRunning(None)),
+            "daemon already running"
+        );
+        assert_eq!(
+            daemon_start_message(&daemon::Ensured::Started),
+            "daemon started"
+        );
+        assert_eq!(
+            daemon_start_message(&daemon::Ensured::TimedOut),
+            "daemon did not start within timeout"
+        );
+        assert!(daemon::Ensured::Started.is_ready());
+        assert!(daemon::Ensured::AlreadyRunning(None).is_ready());
+        assert!(!daemon::Ensured::TimedOut.is_ready());
+
+        assert_eq!(daemon_restart_message(true, true), "daemon restarted");
+        assert_eq!(
+            daemon_restart_message(false, true),
+            "daemon was not running; daemon started"
+        );
+        for was_running in [true, false] {
+            assert_eq!(
+                daemon_restart_message(was_running, false),
+                "daemon did not start within timeout"
+            );
+        }
+    }
+
+    #[test]
+    fn errors_reaching_main_exit_one_and_a_closed_stdout_exits_zero() {
+        assert_eq!(report_main_error(&anyhow::anyhow!("boom")), 1);
+        assert_eq!(
+            report_main_error(&machine::stdout_error(std::io::Error::from(
+                std::io::ErrorKind::BrokenPipe
+            ))),
+            0
+        );
     }
 
     #[test]

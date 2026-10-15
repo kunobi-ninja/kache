@@ -5730,7 +5730,9 @@ fn path_is_only_used_for_includes(value_probe: &Path, source_probes: &[PathBuf])
 ///
 /// Visible declarations, imports and qualified uses of include-family names
 /// veto the proof. A glob import cannot: rustc rejects a glob-imported
-/// include-family name beside the builtin as ambiguous (E0659). This is
+/// include-family name beside the builtin as ambiguous (E0659). `macro_use`
+/// vetoes it: `#[macro_use] extern crate` puts another crate's exports, which
+/// the scanner cannot see, ahead of the builtins without an error. This is
 /// conservative: other identifiers with the same spelling and qualified
 /// builtin invocations also keep values absolute.
 ///
@@ -5795,7 +5797,9 @@ fn env_dep_source_decision(
 /// prove builtin locator semantics; glob imports can shadow those builtins.
 ///
 /// 5: glob imports no longer veto the proof; rustc rejects them as ambiguous.
-const SOURCE_ENV_DEP_SCANNER_VERSION: u32 = 5;
+///
+/// 6: `macro_use` vetoes the proof.
+const SOURCE_ENV_DEP_SCANNER_VERSION: u32 = 6;
 
 /// How one source file's text uses an env var.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5888,7 +5892,7 @@ fn source_env_dep_use(source: &str, var: &str) -> SourceEnvDepUse {
                 let ident = &bytes[ident_start..i];
                 let include = is_include_macro(ident);
                 let open = parse_macro_open(bytes, i);
-                if include && (qualified || open.is_none()) {
+                if ident == b"macro_use" || (include && (qualified || open.is_none())) {
                     return SourceEnvDepUse::RuntimeValue;
                 }
                 let Some(open) = open else { continue };

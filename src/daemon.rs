@@ -4785,8 +4785,9 @@ impl Daemon {
         {
             Ok(permit) => permit,
             Err(_) => {
-                // No backend request was made while waiting for local capacity.
-                // Drop the unfinished permit without recording a remote failure.
+                // No backend request ran while waiting for local capacity.
+                // Dropping preserves earlier failures; an unused half-open
+                // probe reopens for its normal cooldown.
                 return Response::found(false);
             }
         };

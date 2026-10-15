@@ -11113,9 +11113,10 @@ async fn demand_queue_timeouts_do_not_suppress_recovery_after_permits_are_releas
         "queue-timeout-three",
     ] {
         let mut queued = check_request(dir.path(), key);
-        queued.deadline_ms = Some(20);
+        queued.deadline_ms = Some(200);
         assert_eq!(daemon.handle_remote_check(&queued).await.found, Some(false));
     }
+    assert!(!daemon.remote_breaker.is_degraded());
     assert_eq!(
         daemon
             .transfer_counters
@@ -11140,6 +11141,40 @@ async fn demand_queue_timeouts_do_not_suppress_recovery_after_permits_are_releas
             .join(&recovery.key)
             .join("meta.json")
             .exists()
+    );
+}
+
+#[tokio::test]
+async fn demand_queue_errors_preserve_prior_remote_failures() {
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = resilience_test_daemon(dir.path(), Arc::new(PanicOnGetBackend));
+    daemon
+        .remote_breaker
+        .note_failure("GET", "first backend failure");
+    daemon.s3_semaphore.close();
+
+    let req = check_request(dir.path(), "closed-demand-queue");
+    assert_eq!(daemon.handle_remote_check(&req).await.found, Some(false));
+    daemon
+        .remote_breaker
+        .note_failure("GET", "second backend failure");
+    assert!(
+        !daemon.remote_breaker.is_degraded(),
+        "local admission errors must not count as remote failures"
+    );
+    daemon
+        .remote_breaker
+        .note_failure("GET", "third backend failure");
+    assert!(
+        daemon.remote_breaker.is_degraded(),
+        "local admission errors must not erase earlier remote failures"
+    );
+    assert_eq!(
+        daemon
+            .transfer_counters
+            .remote_check_roundtrips
+            .load(Ordering::Relaxed),
+        0
     );
 }
 

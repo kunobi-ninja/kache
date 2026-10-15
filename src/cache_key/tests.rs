@@ -16697,3 +16697,64 @@ fn macro_use_extern_crates_rescan_version_five_memos() {
         SourceEnvDepUse::RuntimeValue
     );
 }
+
+/// serde's and serde_core's shape. A `#[macro_use]` module's macros are
+/// `macro_rules!` in this crate's sources, which the declaration check reads.
+#[test]
+fn macro_use_modules_keep_the_include_locator_proof() {
+    for source in [
+        "#[macro_use]\nmod crate_root;\n#[cfg(docsrs)]\n#[macro_use]\n#[path = \"core/macros.rs\"]\npub mod macros;\ninclude!(concat!(env!(\"OUT_DIR\"), \"/private.rs\"));",
+        "#[macro_use] mod macros; include!(concat!(env!(\"OUT_DIR\"), \"/private.rs\"));",
+        "#[macro_use]\n#[doc = \"]\"]\nmod macros;\ninclude!(concat!(env!(\"OUT_DIR\"), \"/x.rs\"));",
+        "#[macro_use] pub(crate) mod macros; include!(concat!(env!(\"OUT_DIR\"), \"/x.rs\"));",
+        "#[macro_use /* ] */] mod macros; include!(concat!(env!(\"OUT_DIR\"), \"/x.rs\"));",
+        "#[macro_use]\n#[doc = r#\"a\"]\"#]\nmod macros;\ninclude!(concat!(env!(\"OUT_DIR\"), \"/x.rs\"));",
+        "#[macro_use]\n#[cfg(all(a, b))]\nmod macros;\ninclude!(concat!(env!(\"OUT_DIR\"), \"/x.rs\"));",
+    ] {
+        assert_eq!(
+            source_env_dep_use(source, "OUT_DIR"),
+            SourceEnvDepUse::IncludeLocator,
+            "{source}"
+        );
+    }
+    // Anything else under macro_use may bring in another crate's macros.
+    for source in [
+        "#[macro_use(include)] extern crate other; include!(concat!(env!(\"OUT_DIR\"), \"/x.rs\"));",
+        "#[macro_use]\n#[cfg(feature = \"x\")]\npub extern crate other;\ninclude!(concat!(env!(\"OUT_DIR\"), \"/x.rs\"));",
+    ] {
+        assert_eq!(
+            source_env_dep_use(source, "OUT_DIR"),
+            SourceEnvDepUse::RuntimeValue,
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn macro_use_modules_rescan_version_six_memos() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("lib.rs");
+    std::fs::write(
+        &source,
+        "#[macro_use] mod macros; include!(concat!(env!(\"OUT_DIR\"), \"/private.rs\"));",
+    )
+    .unwrap();
+    let db = dir.path().join("idx.sqlite");
+    let hash = hash_file(&source).unwrap();
+    let cache = FileHashCache::open(&db).unwrap();
+    cache
+        .put_source_env_dep_use(
+            &hash,
+            "OUT_DIR",
+            6,
+            SourceEnvDepUse::RuntimeValue.memo_code(),
+        )
+        .unwrap();
+    drop(cache);
+    assert_eq!(
+        FileHasher::persistent(&db)
+            .env_dep_use(&source, "OUT_DIR")
+            .unwrap(),
+        SourceEnvDepUse::IncludeLocator
+    );
+}

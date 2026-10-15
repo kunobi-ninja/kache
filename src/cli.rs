@@ -1016,7 +1016,9 @@ fn prefetch_session_lines(summaries: &[crate::events::BuildSummaryEvent]) -> Vec
         .take(5)
         .map(|s| {
             vec![
-                s.ts.format("%m-%d %H:%M").to_string(),
+                s.ts.with_timezone(&chrono::Local)
+                    .format("%m-%d %H:%M")
+                    .to_string(),
                 if s.session_id.is_empty() {
                     "legacy".to_string()
                 } else {
@@ -1902,11 +1904,6 @@ pub fn report(
 
 // ── kache why-miss ─────────────────────────────────────────────────────────
 
-/// Truncate a cache key to its 12-char hex prefix for display.
-fn key_short(key: &str) -> &str {
-    if key.len() > 12 { &key[..12] } else { key }
-}
-
 /// Format a SQLite datetime string (e.g. "2024-03-12 10:30:00") as a
 /// human-readable relative time like "2h ago", "3d ago", etc.
 fn format_relative_time(sqlite_dt: &str) -> String {
@@ -2013,7 +2010,7 @@ pub fn why_miss(config: &Config, crate_name: &str, json: bool) -> Result<()> {
                 diagnosis: &'static str,
             }
             return crate::machine::emit(
-                "why-miss",
+                "explain",
                 Body {
                     crate_name,
                     diagnosis: "no_events",
@@ -2047,6 +2044,9 @@ pub fn why_miss(config: &Config, crate_name: &str, json: bool) -> Result<()> {
             events::EventResult::Dup | events::EventResult::Miss
         )
     });
+    // The newest event decides: a compile kache passed through after the
+    // last miss means the crate is not cached now, whatever that miss stored.
+    let latest_uncached = latest_uncached_compile(&crate_events);
 
     if last_miss.is_none() {
         if json {
@@ -2057,9 +2057,10 @@ pub fn why_miss(config: &Config, crate_name: &str, json: bool) -> Result<()> {
                 stored_entries: usize,
                 store_dirs: Vec<&'a std::path::Path>,
                 stores: &'a [crate::store_view::StoreSummary],
+                latest_uncached_compile: Option<UncachedCompile<'a>>,
             }
             return crate::machine::emit(
-                "why-miss",
+                "explain",
                 Body {
                     crate_name,
                     diagnosis: "all_hits",
@@ -2069,6 +2070,7 @@ pub fn why_miss(config: &Config, crate_name: &str, json: bool) -> Result<()> {
                         .flat_map(|e| e.store_dirs.iter().map(std::path::PathBuf::as_path))
                         .collect(),
                     stores: &inventory.stores,
+                    latest_uncached_compile: latest_uncached.map(UncachedCompile::of),
                 },
                 Vec::new(),
             );
@@ -2076,16 +2078,10 @@ pub fn why_miss(config: &Config, crate_name: &str, json: bool) -> Result<()> {
         for warning in unavailable_store_warnings(&inventory.stores) {
             eprintln!("{warning}");
         }
-        let mut lines = vec![
-            term::heading(format!("kache · explain · {crate_name}")),
-            String::new(),
-            format!("No misses for `{crate_name}`: every recorded build hit the cache."),
-        ];
-        lines.extend(section(
-            &format!("Stored entries ({})", term::count(stored.len() as u64)),
-            stored_entry_lines(None, &stored),
-        ));
-        lines.extend(section("Recent events", recent_event_lines(&crate_events)));
+        let lines = match latest_uncached {
+            Some(latest) => uncached_compile_lines(crate_name, latest, None, &crate_events),
+            None => no_miss_lines(crate_name, &stored, &crate_events),
+        };
         for line in lines {
             println!("{line}");
         }
@@ -2125,7 +2121,20 @@ pub fn why_miss(config: &Config, crate_name: &str, json: bool) -> Result<()> {
             miss_diagnosis::env_hints(&crate::miss_chain::changed_env_inputs(&all_events, index));
     }
     if json {
-        return why_miss_json(crate_name, miss, &stored, &inventory.stores, &diagnosis);
+        return why_miss_json(
+            crate_name,
+            miss,
+            &stored,
+            &inventory.stores,
+            &diagnosis,
+            latest_uncached,
+        );
+    }
+    if let Some(latest) = latest_uncached {
+        for line in uncached_compile_lines(crate_name, latest, Some(miss), &crate_events) {
+            println!("{line}");
+        }
+        return Ok(());
     }
 
     for warning in unavailable_store_warnings(&inventory.stores) {
@@ -2243,14 +2252,14 @@ fn last_miss_rows(
         (
             "Result",
             miss.result.to_string(),
-            miss.ts.format("%Y-%m-%dT%H:%M:%S").to_string(),
+            term::local_datetime(miss.ts),
         ),
         (
             "Key",
             if miss.cache_key.is_empty() {
                 "none".to_string()
             } else {
-                key_short(&miss.cache_key).to_string()
+                term::short_key(&miss.cache_key).to_string()
             },
             String::new(),
         ),
@@ -2269,7 +2278,7 @@ fn last_miss_rows(
     if let Some(hit) = last_hit.filter(|hit| hit.cache_key != miss.cache_key && miss.ts > hit.ts) {
         rows.push((
             "Last hit",
-            key_short(&hit.cache_key).to_string(),
+            term::short_key(&hit.cache_key).to_string(),
             "under a different key".to_string(),
         ));
     }
@@ -2348,7 +2357,7 @@ fn stored_entry_row(
         details.push("the missed key, stored after the compile".to_string());
     }
     vec![
-        key_short(&entry.cache_key).to_string(),
+        term::short_key(&entry.cache_key).to_string(),
         format_relative_time(&entry.last_accessed),
         term::bytes(entry.size),
         term::count(entry.hit_count),
@@ -2357,7 +2366,7 @@ fn stored_entry_row(
     ]
 }
 
-/// The crate's last five events, oldest first.
+/// The crate's newest five events, oldest first, in local time.
 fn recent_event_lines(crate_events: &[&events::BuildEvent]) -> Vec<String> {
     let body: Vec<Vec<String>> = crate_events
         .iter()
@@ -2366,9 +2375,9 @@ fn recent_event_lines(crate_events: &[&events::BuildEvent]) -> Vec<String> {
         .rev()
         .map(|event| {
             vec![
-                event.ts.format("%Y-%m-%dT%H:%M:%S").to_string(),
+                term::local_clock(event.ts),
                 event.result.to_string(),
-                key_short(&event.cache_key).to_string(),
+                term::short_key(&event.cache_key).to_string(),
                 term::duration_ms(event.elapsed_ms),
                 term::bytes(event.size),
             ]
@@ -2580,7 +2589,7 @@ fn miss_diagnosis_lines(
         Cause::KeyMismatch => {
             lines.push(format!(
                 "  key mismatch: key {} differs from {}",
-                key_short(&miss.cache_key),
+                term::short_key(&miss.cache_key),
                 term::counted(
                     diagnosis.other_entries as u64,
                     "other stored entry",
@@ -2592,7 +2601,10 @@ fn miss_diagnosis_lines(
                     .iter()
                     .filter(|e| e.cache_key != miss.cache_key)
                     .filter_map(|e| {
-                        Some((key_short(&e.cache_key).to_string(), read_entry_meta(e)?))
+                        Some((
+                            term::short_key(&e.cache_key).to_string(),
+                            read_entry_meta(e)?,
+                        ))
                     })
                     .collect();
                 lines.extend(difference_lines(miss_meta, &others));
@@ -2626,6 +2638,7 @@ fn why_miss_json(
     stored: &[&daemon::StatsEntry],
     stores: &[crate::store_view::StoreSummary],
     diagnosis: &MissDiagnosis,
+    latest_uncached: Option<&events::BuildEvent>,
 ) -> Result<()> {
     #[derive(serde::Serialize)]
     struct Body<'a> {
@@ -2642,10 +2655,11 @@ fn why_miss_json(
         dependency_recording_missing: bool,
         checkout_comparison: &'a Option<crate::miss_chain::CheckoutComparison>,
         hints: &'a [String],
+        latest_uncached_compile: Option<UncachedCompile<'a>>,
     }
 
     crate::machine::emit(
-        "why-miss",
+        "explain",
         Body {
             crate_name,
             diagnosis: diagnosis.cause,
@@ -2664,9 +2678,145 @@ fn why_miss_json(
             dependency_recording_missing: diagnosis.dependency_recording_missing,
             checkout_comparison: &diagnosis.checkout,
             hints: &diagnosis.hints,
+            latest_uncached_compile: latest_uncached.map(UncachedCompile::of),
         },
         Vec::new(),
     )
+}
+
+/// A compile kache ran without caching, in `kache --json explain <crate>`.
+#[derive(Debug, serde::Serialize)]
+struct UncachedCompile<'a> {
+    ts: String,
+    /// `passthrough`, or `skipped` for a compile whose store kache declined.
+    result: String,
+    cache_key: &'a str,
+    reason: &'a str,
+    why: String,
+}
+
+impl<'a> UncachedCompile<'a> {
+    fn of(event: &'a events::BuildEvent) -> Self {
+        let reason = if matches!(event.result, events::EventResult::Skipped) {
+            &event.skip_reason
+        } else {
+            &event.passthrough_reason
+        };
+        Self {
+            ts: event.ts.to_rfc3339(),
+            result: event.result.to_string(),
+            cache_key: &event.cache_key,
+            reason,
+            why: crate::report::uncached_compile_words(event),
+        }
+    }
+}
+
+/// The crate's newest compile when kache ran it without storing it and no
+/// lookup came after it. Probes, errors, fallback-wrapper runs and skips
+/// without a recorded compile are not known compiles, so they never decide.
+fn latest_uncached_compile<'a>(
+    crate_events: &[&'a events::BuildEvent],
+) -> Option<&'a events::BuildEvent> {
+    use events::EventResult;
+    crate_events
+        .iter()
+        .rev()
+        .copied()
+        .find(|event| {
+            crate::report::ran_compiler_uncached(event)
+                || matches!(
+                    event.result,
+                    EventResult::LocalHit
+                        | EventResult::PrefetchHit
+                        | EventResult::RemoteHit
+                        | EventResult::Miss
+                        | EventResult::Dup
+                )
+        })
+        .filter(|event| crate::report::ran_compiler_uncached(event))
+}
+
+/// The first line of `kache explain <crate>` for a crate with no miss and no
+/// uncached compile since its last lookup.
+fn no_miss_headline(crate_name: &str, crate_events: &[&events::BuildEvent]) -> String {
+    use events::EventResult;
+    let hit = |event: &&events::BuildEvent| {
+        matches!(
+            event.result,
+            EventResult::LocalHit | EventResult::PrefetchHit | EventResult::RemoteHit
+        )
+    };
+    if crate_events.iter().all(hit) {
+        format!("No misses for `{crate_name}`: all events are hits.")
+    } else if crate_events.iter().any(hit) {
+        format!("No misses for `{crate_name}`: its latest lookup hit the cache.")
+    } else {
+        format!("No misses or hits for `{crate_name}`.")
+    }
+}
+
+/// `kache explain <crate>` for a crate with no miss and no uncached compile
+/// since its last lookup.
+fn no_miss_lines(
+    crate_name: &str,
+    stored: &[&daemon::StatsEntry],
+    crate_events: &[&events::BuildEvent],
+) -> Vec<String> {
+    let mut lines = vec![
+        term::heading(format!("kache · explain · {crate_name}")),
+        String::new(),
+        no_miss_headline(crate_name, crate_events),
+    ];
+    lines.extend(section(
+        &format!("Stored entries ({})", term::count(stored.len() as u64)),
+        stored_entry_lines(None, stored),
+    ));
+    lines.extend(section("Recent events", recent_event_lines(crate_events)));
+    lines
+}
+
+/// `kache explain <crate>` when the crate's newest compile was not cached:
+/// that compile, why it was not cached, and the miss before it if any.
+fn uncached_compile_lines(
+    crate_name: &str,
+    latest: &events::BuildEvent,
+    earlier_miss: Option<&events::BuildEvent>,
+    crate_events: &[&events::BuildEvent],
+) -> Vec<String> {
+    let mut rows = vec![
+        ("When", term::local_datetime(latest.ts), String::new()),
+        (
+            "Key",
+            term::short_key(&latest.cache_key).to_string(),
+            String::new(),
+        ),
+        (
+            "Why",
+            crate::report::uncached_compile_words(latest),
+            String::new(),
+        ),
+    ];
+    if let Some(miss) = earlier_miss {
+        rows.push((
+            "Earlier",
+            miss.result.to_string(),
+            format!(
+                "{}, key {}",
+                term::local_datetime(miss.ts),
+                term::short_key(&miss.cache_key)
+            ),
+        ));
+    }
+    let mut lines = vec![
+        term::heading(format!("kache · explain · {crate_name}")),
+        String::new(),
+        format!("`{crate_name}` was compiled, not cached."),
+        String::new(),
+    ];
+    lines.extend(term::named_sections(&[("Latest compile", rows)]));
+    lines.extend(section("Recent events", recent_event_lines(crate_events)));
+    lines
 }
 
 /// What differs between the missed key's configuration and each other
@@ -3618,15 +3768,7 @@ pub fn list(
 
         let mut lines = Vec::new();
         for entry in &matching {
-            lines.push(format!("Cache key: {}", &entry.cache_key[..16]));
-            lines.push(format!("  Crate:    {}", entry.crate_name));
-            lines.push(format!("  Stores:   {}", entry.store_locations()));
-            push_nonempty_detail(&mut lines, "  Type:     ", &entry.crate_type);
-            push_nonempty_detail(&mut lines, "  Profile:  ", &entry.profile);
-            lines.push(format!("  Size:     {}", ByteSize(entry.size)));
-            lines.push(format!("  Hits:     {}", entry.hit_count));
-            lines.push(format!("  Created:  {}", entry.created_at));
-            lines.push(format!("  Accessed: {}", entry.last_accessed));
+            lines.extend(entry_detail_lines(entry));
 
             let meta_path = entry.meta_path();
             if let Ok(content) = std::fs::read_to_string(&meta_path)
@@ -3670,8 +3812,8 @@ pub fn list(
                 profile.into(),
                 term::bytes(entry.size),
                 term::count(entry.hit_count),
-                entry.created_at.chars().take(10).collect(),
-                entry.last_accessed.chars().take(10).collect(),
+                local_store_date(&entry.created_at),
+                local_store_date(&entry.last_accessed),
                 entry.store_locations(),
             ]);
         }
@@ -3696,6 +3838,44 @@ pub fn list(
 
 fn crate_name_matches(requested: &str, actual: &str) -> bool {
     requested == actual
+}
+
+/// The `kache sync --dry-run` plan, one line per artifact.
+fn sync_plan_lines(to_pull: &[(String, String)], to_push: &[(String, String)]) -> Vec<String> {
+    let pulls = to_pull
+        .iter()
+        .map(|(key, name)| format!("  pull  {} ({name})", term::short_key(key)));
+    let pushes = to_push
+        .iter()
+        .map(|(key, name)| format!("  push  {} ({name})", term::short_key(key)));
+    pulls.chain(pushes).collect()
+}
+
+/// The head of `kache list <crate>` for one entry, times in local time.
+fn entry_detail_lines(entry: &daemon::StatsEntry) -> Vec<String> {
+    let mut lines = vec![
+        format!("Cache key: {}", term::short_key(&entry.cache_key)),
+        format!("  Crate:    {}", entry.crate_name),
+        format!("  Stores:   {}", entry.store_locations()),
+    ];
+    push_nonempty_detail(&mut lines, "  Type:     ", &entry.crate_type);
+    push_nonempty_detail(&mut lines, "  Profile:  ", &entry.profile);
+    lines.push(format!("  Size:     {}", ByteSize(entry.size)));
+    lines.push(format!("  Hits:     {}", entry.hit_count));
+    lines.push(format!(
+        "  Created:  {}",
+        term::local_store_time(&entry.created_at)
+    ));
+    lines.push(format!(
+        "  Accessed: {}",
+        term::local_store_time(&entry.last_accessed)
+    ));
+    lines
+}
+
+/// The local date of a store timestamp, `2026-10-14`.
+fn local_store_date(utc: &str) -> String {
+    term::local_store_time(utc).chars().take(10).collect()
 }
 
 fn push_nonempty_detail(lines: &mut Vec<String>, prefix: &str, value: &str) {
@@ -8559,11 +8739,8 @@ async fn sync_with_client(
     );
 
     if dry_run {
-        for (key, crate_name) in &to_pull {
-            println!("  pull  {}... ({})", &key[..16.min(key.len())], crate_name);
-        }
-        for (key, crate_name) in &to_push {
-            println!("  push  {}... ({})", &key[..16.min(key.len())], crate_name);
+        for line in sync_plan_lines(&to_pull, &to_push) {
+            println!("{line}");
         }
         return Ok(());
     }
@@ -8620,16 +8797,13 @@ async fn sync_with_client(
                                     imported = true;
                                 }
                                 Err(e) => {
-                                    eprintln!(
-                                        "\n  error: import {}...: {e}",
-                                        &key[..16.min(key.len())]
-                                    );
+                                    eprintln!("\n  error: import {}: {e}", term::short_key(&key));
                                 }
                             },
                             Err(e) => {
                                 eprintln!(
-                                    "\n  error: open store for import {}...: {e}",
-                                    &key[..16.min(key.len())]
+                                    "\n  error: open store for import {}: {e}",
+                                    term::short_key(&key)
                                 );
                             }
                         }
@@ -8640,7 +8814,7 @@ async fn sync_with_client(
                         }
                     }
                     Err(e) => {
-                        eprintln!("\n  error: pull {}...: {e}", &key[..16.min(key.len())]);
+                        eprintln!("\n  error: pull {}: {e}", term::short_key(&key));
                         fail_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
@@ -8698,8 +8872,8 @@ async fn sync_with_client(
                 if !entry_dir.exists() {
                     // Entry disappeared (GC or purge) — record failure
                     eprintln!(
-                        "\n  error: push {}...: local entry disappeared before upload",
-                        &key[..16.min(key.len())]
+                        "\n  error: push {}: local entry disappeared before upload",
+                        term::short_key(&key)
                     );
                     fail_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     return;
@@ -8721,7 +8895,7 @@ async fn sync_with_client(
                         ok_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
                     Err(e) => {
-                        eprintln!("\n  error: push {}...: {e}", &key[..16.min(key.len())]);
+                        eprintln!("\n  error: push {}: {e}", term::short_key(&key));
                         fail_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
                 }

@@ -2136,14 +2136,6 @@ fn test_compile_weighted_hit_rate_weights_by_time() {
 }
 
 #[test]
-fn test_key_short_truncates_long_keys() {
-    assert_eq!(key_short("0123456789abcdefghij"), "0123456789ab");
-    assert_eq!(key_short("short"), "short");
-    // Exactly 12 chars: not truncated (len > 12 is the cutoff).
-    assert_eq!(key_short("123456789012"), "123456789012");
-}
-
-#[test]
 fn test_format_duration_ms_buckets() {
     assert_eq!(format_duration_ms(0), "~0ms");
     assert_eq!(format_duration_ms(500), "~500ms");
@@ -4710,7 +4702,10 @@ fn render_stats_rich_snapshot_covers_all_lines() {
         row("Miss time"),
         "Miss time | 300 ms | 30.0% of wrapper time"
     );
-    assert_eq!(row("Time saved"), "Time saved | 5 s | compile work avoided");
+    assert_eq!(
+        row("Time saved"),
+        "Time saved | 5.0 s | compile work avoided"
+    );
     assert!(row("Daemon").starts_with("Daemon | v9.9.9 | "));
     assert!(
         !row("Daemon").contains("restart pending"),
@@ -7785,7 +7780,7 @@ fn held_reason_names_each_command_and_how_long_it_ran() {
     );
     assert_eq!(
         held_reason(&[holder(7, "cargo run", 100 - 12)], 100),
-        "waiting for `cargo run` (pid 7, running 12 s) to exit"
+        "waiting for `cargo run` (pid 7, running 12.0 s) to exit"
     );
     assert_eq!(
         held_reason(
@@ -7807,7 +7802,7 @@ fn held_summary_counts_only_the_targets_the_lock_held_back() {
         reason: reason.to_owned(),
         missing: false,
     };
-    let held = "waiting for `cargo run` (pid 7, running 12 s) to exit";
+    let held = "waiting for `cargo run` (pid 7, running 12.0 s) to exit";
     let skipped = [skip(held), skip(TARGET_IN_USE), skip(held)];
     assert_eq!(
         held_summary(Some(held), &skipped).as_deref(),
@@ -9656,4 +9651,208 @@ fn init_saves_target_recovery_safely() {
 
     // An unreadable path is an error, not an empty file.
     assert!(read_config_text(dir.path()).is_err());
+}
+
+fn explain_event(result: events::EventResult, secs: i64, key: &str) -> events::BuildEvent {
+    let mut event = events::BuildEvent::new_for_test("app", result);
+    event.ts = chrono::DateTime::from_timestamp(1_760_454_000 + secs, 0).unwrap();
+    event.cache_key = key.to_string();
+    event.elapsed_ms = 1_989;
+    event
+}
+
+#[test]
+fn the_newest_compile_decides_whether_a_crate_is_cached() {
+    use events::EventResult;
+    let miss = explain_event(EventResult::Miss, 1, "missmissmissmiss");
+    let mut seed = explain_event(EventResult::Passthrough, 2, "seedseedseedseed");
+    seed.passthrough_reason = "adaptive seed".to_string();
+    let mut probe = explain_event(EventResult::Passthrough, 3, "");
+    probe.passthrough_reason = "not-a-compile|--print cfg".to_string();
+    let error = explain_event(EventResult::Error, 4, "");
+    let skipped = explain_event(EventResult::Skipped, 5, "");
+    let hit = explain_event(EventResult::LocalHit, 6, "hithithithithit");
+
+    let latest = |events: &[&events::BuildEvent]| {
+        latest_uncached_compile(events).map(|event| event.cache_key.clone())
+    };
+    // A probe, an error or a skip after the seed does not hide it.
+    assert_eq!(
+        latest(&[&miss, &seed, &probe, &error, &skipped]).as_deref(),
+        Some("seedseedseedseed")
+    );
+    // A lookup after the seed decides instead.
+    assert_eq!(latest(&[&miss, &seed, &hit]), None);
+    assert_eq!(latest(&[&seed, &miss]), None);
+    assert_eq!(latest(&[&probe]), None);
+    assert_eq!(latest(&[]), None);
+
+    let lines = uncached_compile_lines("app", &seed, Some(&miss), &[&miss, &seed]);
+    assert_eq!(lines[0], "kache · explain · app", "{lines:?}");
+    assert_eq!(lines[2], "`app` was compiled, not cached.", "{lines:?}");
+    assert_eq!(lines[4], "Latest compile", "{lines:?}");
+    assert!(
+        lines.contains(&format!("  When      {}", term::local_datetime(seed.ts))),
+        "{lines:?}"
+    );
+    assert!(
+        lines.contains(&"  Key       seedseedseed".to_string()),
+        "{lines:?}"
+    );
+    assert!(
+        lines.contains(
+            &"  Why       edit rebuild: rustc rebuilt the edited crate incrementally (adaptive seed)"
+                .to_string()
+        ),
+        "{lines:?}"
+    );
+    assert!(
+        lines.contains(&format!(
+            "  Earlier   miss   {}, key missmissmiss",
+            term::local_datetime(miss.ts)
+        )),
+        "{lines:?}"
+    );
+    let joined = lines.join("\n");
+    assert!(!joined.contains("now cached"), "{joined}");
+    let alone = uncached_compile_lines("app", &seed, None, &[&seed]).join("\n");
+    assert!(!alone.contains("Earlier"), "{alone}");
+    assert!(alone.contains("\nRecent events\n"), "{alone}");
+}
+
+#[test]
+fn a_crate_without_misses_is_not_called_all_hits_unless_it_is() {
+    use events::EventResult;
+    let hit = explain_event(EventResult::LocalHit, 1, "k");
+    let remote = explain_event(EventResult::RemoteHit, 2, "k");
+    let mut pass = explain_event(EventResult::Passthrough, 3, "");
+    pass.passthrough_reason = "unsupported|cc link mode".to_string();
+    assert_eq!(
+        no_miss_headline("app", &[&hit, &remote]),
+        "No misses for `app`: all events are hits."
+    );
+    assert_eq!(
+        no_miss_headline("app", &[&pass, &hit]),
+        "No misses for `app`: its latest lookup hit the cache."
+    );
+    assert_eq!(
+        no_miss_headline("app", &[&pass]),
+        "No misses or hits for `app`."
+    );
+    let lines = no_miss_lines("app", &[], &[&hit]);
+    assert_eq!(lines[0], "kache · explain · app");
+    assert_eq!(lines[2], "No misses for `app`: all events are hits.");
+    assert!(
+        lines.contains(&"Stored entries (0)".to_string()),
+        "{lines:?}"
+    );
+    assert!(lines.contains(&"Recent events".to_string()), "{lines:?}");
+}
+
+#[test]
+fn recent_events_are_the_newest_five_in_local_time() {
+    use events::EventResult;
+    let events: Vec<events::BuildEvent> = (0..7)
+        .map(|i| explain_event(EventResult::LocalHit, i, &format!("key{i}-0123456789")))
+        .collect();
+    let refs: Vec<&events::BuildEvent> = events.iter().collect();
+    let lines = recent_event_lines(&refs);
+    assert_eq!(lines.len(), 6, "a header and five events: {lines:?}");
+    assert!(lines[0].starts_with("  TIME"), "{lines:?}");
+    assert!(
+        lines[1].starts_with(&format!(
+            "  {}   local_hit",
+            term::local_clock(events[2].ts)
+        )),
+        "{lines:?}"
+    );
+    assert!(lines[1].contains("key2-0123456"), "{lines:?}");
+    assert!(
+        lines[1].contains(&term::duration_ms(events[2].elapsed_ms)),
+        "{lines:?}"
+    );
+    assert!(lines[5].contains("key6-0123456"), "{lines:?}");
+    assert_eq!(recent_event_lines(&refs[..2]).len(), 3);
+}
+
+#[test]
+fn list_details_use_the_short_key_and_local_time() {
+    let entry = daemon::StatsEntry {
+        store_dirs: vec![std::path::PathBuf::from("/s")],
+        cache_key: "96b68103bea22193ffeeddcc".to_string(),
+        crate_name: "app".to_string(),
+        crate_type: String::new(),
+        profile: "debug".to_string(),
+        size: 1536,
+        hit_count: 3,
+        created_at: "2026-10-14 15:18:56".to_string(),
+        last_accessed: "not a time".to_string(),
+        content_hash: None,
+    };
+    let lines = entry_detail_lines(&entry);
+    assert_eq!(lines[0], "Cache key: 96b68103bea2");
+    assert!(
+        !lines.iter().any(|line| line.contains("Type:")),
+        "{lines:?}"
+    );
+    assert!(
+        lines.contains(&"  Profile:  debug".to_string()),
+        "{lines:?}"
+    );
+    assert!(
+        lines.contains(&format!(
+            "  Created:  {}",
+            term::local_store_time("2026-10-14 15:18:56")
+        )),
+        "{lines:?}"
+    );
+    assert!(
+        lines.contains(&"  Accessed: not a time".to_string()),
+        "{lines:?}"
+    );
+    assert_eq!(
+        local_store_date("2026-10-14 15:18:56"),
+        term::local_store_time("2026-10-14 15:18:56")[..10]
+    );
+}
+
+#[test]
+fn the_sync_plan_prints_short_keys() {
+    let lines = sync_plan_lines(
+        &[("96b68103bea22193ffee".to_string(), "serde".to_string())],
+        &[("abc".to_string(), "tiny".to_string())],
+    );
+    assert_eq!(
+        lines,
+        ["  pull  96b68103bea2 (serde)", "  push  abc (tiny)"]
+    );
+}
+
+#[test]
+fn a_declined_store_is_the_latest_compile_and_a_fallback_run_is_not() {
+    use events::EventResult;
+    let miss = explain_event(EventResult::Miss, 1, "missmissmissmiss");
+    let mut seed = explain_event(EventResult::Passthrough, 2, "seedseedseedseed");
+    seed.passthrough_reason = "adaptive seed".to_string();
+    let mut declined = explain_event(EventResult::Skipped, 3, "skipskipskipskip");
+    declined.skip_reason = "admission-threshold".to_string();
+    let mut fallback = explain_event(EventResult::Passthrough, 4, "fbfbfbfbfbfbfbfb");
+    fallback.passthrough_reason = "unsupported|assembly".to_string();
+    fallback.fallback = true;
+    let legacy_skip = explain_event(EventResult::Skipped, 5, "oldskipoldskip00");
+
+    let latest = |events: &[&events::BuildEvent]| {
+        latest_uncached_compile(events).map(|event| event.cache_key.clone())
+    };
+    assert_eq!(
+        latest(&[&miss, &seed, &declined, &fallback, &legacy_skip]).as_deref(),
+        Some("skipskipskipskip")
+    );
+    assert_eq!(latest(&[&miss, &fallback]), None);
+
+    let lines = uncached_compile_lines("app", &declined, Some(&miss), &[&miss, &declined]);
+    assert!(
+        lines.contains(&"  Why       compiled, not stored: admission-threshold".to_string()),
+        "{lines:?}"
+    );
 }

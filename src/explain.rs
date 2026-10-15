@@ -180,12 +180,7 @@ pub(crate) fn render(
     lines.extend(term::named_sections(&[("Builds", rows)]));
 
     let mut causes = analysis.causes.clone();
-    causes.sort_by(|a, b| {
-        b.compile_ms
-            .cmp(&a.compile_ms)
-            .then_with(|| b.count.cmp(&a.count))
-            .then_with(|| a.cause.cmp(&b.cause))
-    });
+    tui_sessions::sort_costliest_first(&mut causes);
     if !causes.is_empty() {
         let body: Vec<Vec<String>> = causes
             .iter()
@@ -194,7 +189,7 @@ pub(crate) fn render(
                     term::duration_ms(group.compile_ms),
                     term::count(group.count as u64),
                     group.cause.describe(),
-                    group.examples.join(", "),
+                    group.costliest_examples.join(", "),
                 ]
             })
             .collect();
@@ -251,7 +246,7 @@ pub(crate) fn render(
                 vec![
                     term::count(group.count as u64),
                     if group.kind.is_empty() {
-                        group.reason.clone()
+                        crate::report::uncached_reason_words(&group.reason)
                     } else {
                         format!("{}: {}", group.kind, group.reason)
                     },
@@ -275,9 +270,9 @@ pub(crate) fn render(
     }
 
     lines.push(String::new());
-    let costliest = causes
-        .first()
-        .and_then(|group| group.examples.first())
+    let costliest = analysis
+        .costliest
+        .as_ref()
         .map(|name| format!("`kache explain {name}` for the costliest miss; "))
         .unwrap_or_default();
     lines.push(format!(
@@ -335,7 +330,10 @@ pub(crate) struct CauseBody {
     pub failure: bool,
     pub count: usize,
     pub compile_ms: u64,
+    /// Up to three crates, in log order.
     pub crates: Vec<String>,
+    /// Up to three crates, costliest first.
+    pub costliest_crates: Vec<String>,
 }
 
 /// One reason a compilation was not cached.
@@ -396,6 +394,7 @@ pub(crate) fn json_body(
                 count: group.count,
                 compile_ms: group.compile_ms,
                 crates: group.examples.clone(),
+                costliest_crates: group.costliest_examples.clone(),
             })
             .collect(),
         not_cached: analysis
@@ -585,6 +584,42 @@ mod tests {
     }
 
     #[test]
+    fn the_footer_names_the_costliest_miss_not_the_first() {
+        let costed = |name: &str, secs, ms| {
+            let mut miss = ev(name, EventResult::Miss, "s1", secs, name);
+            miss.compile_time_ms = ms;
+            miss.key_diff = vec!["sources".to_string()];
+            miss
+        };
+        let mut edit = ev("edit", EventResult::Passthrough, "s1", 4, "");
+        edit.passthrough_reason = "adaptive active".to_string();
+        let events = vec![
+            costed("early", 1, 100),
+            costed("heavy", 2, 9_000),
+            costed("late", 3, 200),
+            edit,
+        ];
+        let (lines, body) = report(&events);
+        // JSON keeps the crates in log order and adds the costliest apart.
+        assert_eq!(body.causes[0].crates, ["early", "heavy", "late"]);
+        assert_eq!(body.causes[0].costliest_crates, ["heavy", "late", "early"]);
+        let text = lines.join("\n");
+        assert!(text.contains("Why it missed, costliest first"), "{text}");
+        assert!(text.contains("heavy, late, early"), "{text}");
+        assert!(
+            text.contains("edit rebuild: rustc rebuilt a crate still being edited incrementally"),
+            "{text}"
+        );
+        assert!(
+            lines
+                .last()
+                .unwrap()
+                .starts_with("`kache explain heavy` for the costliest miss; "),
+            "{text}"
+        );
+    }
+
+    #[test]
     fn a_build_with_no_misses_and_no_history_says_so() {
         let events = vec![ev("a", EventResult::LocalHit, "s1", 1, "k1")];
         let all = sessions(&events);
@@ -629,6 +664,7 @@ mod tests {
         assert_eq!(body.misses, 2);
         assert_eq!(body.earlier_misses, Some(1));
         assert_eq!(body.causes[0].crates, ["costly"], "costliest first");
+        assert_eq!(body.causes[0].costliest_crates, ["costly"]);
         assert!(body.causes[0].failure);
         assert!(body.causes[0].fix.contains("1.0 GiB"));
         assert_eq!(body.causes[1].compile_ms, 1_000);

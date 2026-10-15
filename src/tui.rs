@@ -2125,11 +2125,7 @@ fn draw_store_table(frame: &mut Frame, state: &mut AppState, area: Rect) {
         .skip(range.start)
         .take(range.len())
         .map(|entry| {
-            let key_short = if entry.cache_key.len() > 12 {
-                &entry.cache_key[..12]
-            } else {
-                &entry.cache_key
-            };
+            let key_short = crate::term::short_key(&entry.cache_key);
             let crate_type = if entry.crate_type.is_empty() {
                 "-"
             } else {
@@ -2873,13 +2869,13 @@ fn why_lines(state: &mut AppState, width: u16) -> Vec<Line<'static>> {
         } else {
             Color::Yellow
         };
-        let examples = if group.examples.is_empty() {
+        let examples = if group.costliest_examples.is_empty() {
             String::new()
         } else {
-            let more = group.count.saturating_sub(group.examples.len());
+            let more = group.count.saturating_sub(group.costliest_examples.len());
             format!(
                 "{}{}",
-                group.examples.join(", "),
+                group.costliest_examples.join(", "),
                 if more > 0 {
                     format!(" +{more}")
                 } else {

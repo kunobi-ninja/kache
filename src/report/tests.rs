@@ -1396,11 +1396,12 @@ fn test_report_filters_by_root() {
     assert_eq!(report.timeline.event_count, 7);
     assert_eq!(report.timeline.error_count, 0);
     assert!(report.network.is_none());
+    // No remote is configured, so there is no transfer data to omit.
     assert!(
-        report
+        !report
             .suggestions
             .iter()
-            .any(|s| s.contains("Remote transfer data omitted"))
+            .any(|s| s.contains("Remote transfer data"))
     );
     assert!(report.all_events.iter().all(|event| event.root == root));
     assert!(
@@ -2001,6 +2002,17 @@ fn test_missing_transfer_data() {
 
     let report = generate_report(&config, SinceWindow::DEFAULT, 10).unwrap();
     assert!(report.network.is_none());
+    assert!(
+        !report
+            .suggestions
+            .iter()
+            .any(|s| s.contains("No remote transfer")),
+        "no remote is configured"
+    );
+
+    let mut config = config;
+    config.remote = Some(crate::config::RemoteConfig::test_s3("bucket", "prefix"));
+    let report = generate_report(&config, SinceWindow::DEFAULT, 10).unwrap();
     assert!(
         report
             .suggestions
@@ -2669,7 +2681,7 @@ fn render_network_and_error_sections_with_all_optional_fields() {
     let positive_github = format_github(&report);
     let text = format_text(&report);
     assert!(
-        positive_github.contains("67 MB/s observed wall span"),
+        positive_github.contains("67 MiB/s observed wall span"),
         "GitHub summary must prefer the observed wall-span rate: {positive_github}"
     );
     // The text report states the same facts as rows and tables.
@@ -2683,11 +2695,11 @@ fn render_network_and_error_sections_with_all_optional_fields() {
         ("boom", "boom | "),
         (
             "Throughput",
-            "Throughput | 66.7 MB/s | over 300 ms, 10 timed downloads, up to 4 at once",
+            "Throughput | 66.7 MiB/s | over 300 ms, 10 timed downloads, up to 4 at once",
         ),
         (
             "Read rate",
-            "Read rate | 70.0 MB/s | 60.0 MB/s with open, 50.0 MB/s end to end",
+            "Read rate | 70.0 MiB/s | 60.0 MiB/s with open, 50.0 MiB/s end to end",
         ),
         (
             "Slowest phase",
@@ -2727,7 +2739,7 @@ fn render_network_and_error_sections_with_all_optional_fields() {
             "missing observed throughput label: {rendered}"
         );
         assert!(
-            lower.contains("66.7 mb/s")
+            lower.contains("66.7 mib/s")
                 && !lower.contains("| observed wall-span throughput | unavailable"),
             "nonzero observed span must render the measured rate: {rendered}"
         );
@@ -2768,7 +2780,7 @@ fn render_network_and_error_sections_with_all_optional_fields() {
     let legacy_github = format_github(&report);
     let text = format_text(&report);
     assert!(
-        legacy_github.contains("70 MB/s cumulative read service"),
+        legacy_github.contains("70 MiB/s cumulative read service"),
         "GitHub summary must label the legacy fallback as cumulative: {legacy_github}"
     );
     assert_eq!(
@@ -2907,9 +2919,9 @@ fn test_empty_report() {
 fn test_format_bytes() {
     assert_eq!(format_bytes(0), "0 B");
     assert_eq!(format_bytes(512), "512 B");
-    assert_eq!(format_bytes(1024), "1.0 KB");
-    assert_eq!(format_bytes(1024 * 1024), "1.0 MB");
-    assert_eq!(format_bytes(1024 * 1024 * 1024), "1.0 GB");
+    assert_eq!(format_bytes(1024), "1.0 KiB");
+    assert_eq!(format_bytes(1536 << 10), "1.5 MiB");
+    assert_eq!(format_bytes(1 << 30), "1.0 GiB");
 }
 
 #[test]
@@ -3574,7 +3586,7 @@ fn storage_render_preserves_zero_boundaries_and_summary_choice() {
     restored.storage.accounting_consistent = true;
     let github = format_github(&restored);
     assert!(github.contains("zero-copy restores"), "{github}");
-    assert!(github.contains("KB restored"), "{github}");
+    assert!(github.contains("KiB restored"), "{github}");
 
     assert!(blob_accounting_consistent(0, 0));
     assert!(blob_accounting_consistent(5, 5));
@@ -4027,6 +4039,15 @@ fn redaction_terms_skip_roots_that_would_erase_every_path() {
     assert_eq!(srv, ["/srv/a/b", "/srv/a"], "longest first");
 }
 
+#[test]
+fn total_hits_counts_every_kind_of_hit() {
+    let mut report = blank_report();
+    report.summary.local_hits = 1;
+    report.summary.prefetch_hits = 3;
+    report.summary.remote_hits = 7;
+    assert_eq!(report.summary.total_hits(), 11);
+}
+
 fn blank_report() -> BuildReport {
     let dir = tempfile::tempdir().unwrap();
     let config = crate::test_support::test_config(dir.path().to_path_buf());
@@ -4278,7 +4299,7 @@ fn suggestions_name_three_distinct_misses_only_above_the_share() {
         stats.dups = dups;
         stats.misses = misses;
         let details: Vec<CrateDetail> = names.iter().copied().map(miss_detail).collect();
-        generate_suggestions(&stats, &prefetch, &None, false, &details, 1, 0).join("\n")
+        generate_suggestions(&stats, &prefetch, &None, false, false, &details, 1, 0).join("\n")
     };
     let phrase = "compile time spent on compiled cache-key misses";
     assert!(!suggest(80, 20, 4, 0, &["a"]).contains(phrase));
@@ -4334,4 +4355,268 @@ fn report_preserves_non_diagnostic_and_invalid_json_reasons() {
         ),
         Some("path/{crate}: failed".to_string())
     );
+}
+
+#[test]
+fn an_edit_rebuild_counts_as_compiled_and_not_cached() {
+    let mut seed = test_event("app", EventResult::Passthrough, 1_500, 1_400, 0, "k1");
+    seed.passthrough_reason = "adaptive seed".into();
+    let mut active = test_event("lib", EventResult::Passthrough, 2_500, 2_400, 0, "");
+    active.passthrough_reason = "adaptive active".into();
+    let mut refused = test_event("asm", EventResult::Passthrough, 1_000, 0, 0, "");
+    refused.passthrough_reason = "unsupported|assembly".into();
+    let mut probe = test_event("probe", EventResult::Passthrough, 9_000, 0, 0, "");
+    probe.passthrough_reason = "not-a-compile|--print cfg".into();
+    // A skip with no recorded reason is an older event, not a known compile.
+    let legacy_skip = test_event("skip", EventResult::Skipped, 7_000, 0, 0, "");
+    let mut declined = test_event("tiny", EventResult::Skipped, 300, 200, 0, "k2");
+    declined.skip_reason = "admission-threshold".into();
+    // A fallback wrapper may have served its own hit without compiling.
+    let mut fallback = test_event("fb", EventResult::Passthrough, 4_000, 0, 0, "");
+    fallback.passthrough_reason = "unsupported|assembly".into();
+    fallback.fallback = true;
+    let slow_seed = to_bypass_detail(&seed);
+    let bypass = build_bypass_analysis(
+        &[
+            seed,
+            active,
+            refused,
+            probe,
+            legacy_skip,
+            declined,
+            fallback,
+        ],
+        10,
+    );
+    assert_eq!(bypass.passthroughs, 4);
+    assert_eq!(bypass.edit_rebuilds, 2);
+    assert_eq!(bypass.uncached_compiles, 4);
+    assert_eq!(bypass.uncached_compile_time_ms, 5_300);
+    assert_eq!(
+        format_bypass_summary(&bypass),
+        "2 edit rebuilds / 2 passthroughs (1 via fallback) / 2 skipped / 1 probe"
+    );
+
+    let mut report = blank_report();
+    report.summary.passthroughs = 2;
+    report.bypass = BypassAnalysis {
+        passthroughs: 2,
+        edit_rebuilds: 2,
+        uncached_compiles: 2,
+        uncached_compile_time_ms: 4_000,
+        reasons: vec![BypassReason {
+            result: "passthrough".into(),
+            route: "direct".into(),
+            reason: "adaptive seed".into(),
+            count: 2,
+            failures: 0,
+            max_elapsed_ms: 2_500,
+        }],
+        slowest: vec![slow_seed],
+        ..Default::default()
+    };
+    let text = format_text(&report);
+    assert!(
+        text_row(&text, "app").is_some_and(|row| row.ends_with(
+            "edit rebuild: rustc rebuilt the edited crate incrementally (adaptive seed)"
+        )),
+        "{text}"
+    );
+    assert_eq!(
+        text_row(&text, "Hit rate").as_deref(),
+        Some("Hit rate | 0.0% | 2 compiled, 2 not cached"),
+        "{text}"
+    );
+    assert_eq!(
+        text_row(&text, "Compiles").as_deref(),
+        Some("Compiles | 4.0 s | 2.0 s | per crate"),
+        "{text}"
+    );
+    assert!(text.contains("2 edit rebuilds"), "{text}");
+    assert!(
+        text.contains("edit rebuild: rustc rebuilt the edited crate incrementally (adaptive seed)"),
+        "{text}"
+    );
+}
+
+#[test]
+fn the_hit_rate_detail_counts_every_compile() {
+    assert_eq!(
+        hit_rate_detail(8, 10, 2, 0, 0),
+        "8 of 10 crates from cache, 2 compiled"
+    );
+    assert_eq!(
+        hit_rate_detail(8, 10, 2, 3, 3),
+        "8 of 10 crates from cache, 5 compiled, 3 not cached"
+    );
+    assert_eq!(hit_rate_detail(0, 0, 0, 2, 2), "2 compiled, 2 not cached");
+    assert_eq!(
+        hit_rate_detail(0, 0, 0, 0, 0),
+        "0 of 0 crates from cache, 0 compiled"
+    );
+    assert_eq!(
+        hit_rate_detail(1, 1, 0, 1, 1),
+        "1 of 1 crates from cache, 1 compiled, 1 not cached"
+    );
+    // A miss whose store failed is compiled already and not cached.
+    assert_eq!(
+        hit_rate_detail(0, 1, 1, 1, 2),
+        "0 of 1 crates from cache, 2 compiled, 2 not cached"
+    );
+}
+
+#[test]
+fn a_failed_store_and_a_passthrough_are_both_not_cached() {
+    let mut report = blank_report();
+    report.summary.misses = 1;
+    report.summary.store_failures = 1;
+    report.summary.total_crates = 1;
+    report.summary.passthroughs = 1;
+    report.bypass.passthroughs = 1;
+    report.bypass.uncached_compiles = 1;
+    assert_eq!(
+        text_row(&format_text(&report), "Hit rate").as_deref(),
+        Some("Hit rate | 0.0% | 0 of 1 crates from cache, 2 compiled, 2 not cached")
+    );
+    assert_eq!(
+        compiled_note(&report.summary, &report.bypass),
+        "2 compiled, 2 not cached"
+    );
+}
+
+#[test]
+fn the_compiles_row_adds_uncached_compile_time() {
+    let mut report = blank_report();
+    report.summary.misses = 1;
+    report.summary.dups = 1;
+    report.summary.passthroughs = 3;
+    report.bypass.uncached_compiles = 2;
+    report.bypass.uncached_compile_time_ms = 6_000;
+    report.timing.miss_time_ms = 2_000;
+    assert_eq!(
+        compiles_timing_row(&report.summary, &report.timing, &report.bypass),
+        ["Compiles", "8.0 s", "2.0 s", "per crate"]
+    );
+    let blank = blank_report();
+    assert_eq!(
+        compiles_timing_row(&blank.summary, &blank.timing, &blank.bypass),
+        ["Compiles", "0 ms", "0.0 ms", "per crate"]
+    );
+}
+
+#[test]
+fn only_compiles_kache_ran_and_did_not_store_are_uncached_compiles() {
+    let passthrough = |reason: &str, fallback| {
+        let mut event = test_event("c", EventResult::Passthrough, 1, 0, 0, "");
+        event.passthrough_reason = reason.into();
+        event.fallback = fallback;
+        event
+    };
+    assert!(ran_compiler_uncached(&passthrough("adaptive seed", false)));
+    assert!(!ran_compiler_uncached(&passthrough("adaptive seed", true)));
+    assert!(!ran_compiler_uncached(&passthrough(
+        "not-a-compile|--print cfg",
+        false
+    )));
+    let mut skipped = test_event("c", EventResult::Skipped, 1, 0, 0, "");
+    assert!(!ran_compiler_uncached(&skipped));
+    skipped.skip_reason = "inputs-changed".into();
+    assert!(ran_compiler_uncached(&skipped));
+    assert_eq!(
+        uncached_compile_words(&skipped),
+        "compiled, not stored: inputs-changed"
+    );
+    assert_eq!(
+        uncached_compile_words(&passthrough("unsupported|assembly", false)),
+        "unsupported: assembly"
+    );
+    for result in [EventResult::Miss, EventResult::LocalHit, EventResult::Error] {
+        let mut event = test_event("c", result, 1, 0, 0, "");
+        event.skip_reason = "x".into();
+        assert!(!ran_compiler_uncached(&event));
+    }
+}
+
+#[test]
+fn a_hit_served_twice_from_one_entry_is_one_row() {
+    let mut twice = miss_detail("serde");
+    twice.compile_time_ms = 4_000;
+    twice.size = 1 << 20;
+    let mut other = twice.clone();
+    other.crate_name = "syn".into();
+    let rows = valuable_hit_rows(&[twice.clone(), twice.clone(), other.clone(), twice]);
+    assert_eq!(
+        rows,
+        [
+            ["serde", "4.0 s", "1.0 MiB"].map(String::from).to_vec(),
+            ["syn", "4.0 s", "1.0 MiB"].map(String::from).to_vec(),
+        ]
+    );
+    let mut report = blank_report();
+    report.top_hits = vec![other.clone(), other];
+    let text = format_text(&report);
+    assert_eq!(text.matches("syn ").count(), 1, "{text}");
+}
+
+#[test]
+fn averages_from_a_second_read_like_the_total() {
+    assert_eq!(average_ms(999.4), "999 ms");
+    assert_eq!(average_ms(999.5), "1.0 s");
+    assert_eq!(average_ms(1_989.0), "2.0 s");
+}
+
+#[test]
+fn adaptive_reasons_have_plain_words() {
+    assert!(is_edit_rebuild("adaptive seed"));
+    assert!(is_edit_rebuild(" adaptive active "));
+    assert!(!is_edit_rebuild("unsupported|assembly"));
+    assert_eq!(
+        uncached_reason_words("adaptive active"),
+        "edit rebuild: rustc rebuilt a crate still being edited incrementally (adaptive active)"
+    );
+    assert_eq!(uncached_reason_words("linker"), "linker");
+}
+
+#[test]
+fn remote_suggestions_need_a_configured_remote() {
+    let prefetch = PrefetchAnalysis {
+        prefetch_hits: 0,
+        total_hits: 0,
+        contribution_pct: 0.0,
+    };
+    let stats = crate::events::compute_stats(&[]);
+    let network = Some(zero_network());
+    let suggest = |network: &Option<NetworkAnalysis>, root_filtered, remote| {
+        generate_suggestions(&stats, &prefetch, network, root_filtered, remote, &[], 0, 0)
+            .join("\n")
+    };
+    let omitted = "Remote transfer data omitted";
+    let missing = "No remote transfer data";
+    assert!(suggest(&None, false, true).contains(missing));
+    assert!(!suggest(&None, false, false).contains(missing));
+    assert!(!suggest(&network, false, true).contains(missing));
+    assert!(suggest(&None, true, true).contains(omitted));
+    assert!(!suggest(&None, true, true).contains(missing));
+    assert!(!suggest(&None, true, false).contains(omitted));
+    assert!(!suggest(&None, true, false).contains(missing));
+}
+
+#[test]
+fn markdown_headlines_count_passthrough_compiles() {
+    let mut report = blank_report();
+    report.summary.misses = 2;
+    report.summary.dups = 1;
+    assert_eq!(compiled_note(&report.summary, &report.bypass), "3 compiled");
+    report.summary.passthroughs = 2;
+    report.bypass.uncached_compiles = 2;
+    assert_eq!(
+        compiled_note(&report.summary, &report.bypass),
+        "5 compiled, 2 not cached"
+    );
+    for rendered in [format_markdown(&report), format_github(&report)] {
+        assert!(
+            rendered.contains("cacheable crates from cache, 5 compiled, 2 not cached |"),
+            "{rendered}"
+        );
+    }
 }

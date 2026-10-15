@@ -461,7 +461,11 @@ pub(crate) struct CauseGroup {
     /// Compile time these misses cost.
     pub compile_ms: u64,
     /// Up to three crate names, in log order, so the group is recognizable.
+    /// `kache --json explain` reports these as `crates`.
     pub examples: Vec<String>,
+    /// Up to three crate names, costliest first (log order on a tie), for
+    /// the human reports.
+    pub costliest_examples: Vec<String>,
 }
 
 /// Passthroughs sharing one reason.
@@ -495,6 +499,9 @@ pub(crate) struct Analysis {
     /// digests, so cascade roots were possible. When false and there were
     /// misses, the reader should be told what recording is missing.
     pub cascade_recorded: bool,
+    /// The crate whose analyzed miss cost the most compile time, the first
+    /// one in log order on a tie.
+    pub costliest: Option<String>,
 }
 
 /// Explain the selected session's misses and passthroughs.
@@ -525,29 +532,40 @@ pub(crate) fn analyze_session(
 
     let history = History::of(events);
 
-    let mut groups: BTreeMap<Cause, CauseGroup> = BTreeMap::new();
+    let mut groups: BTreeMap<Cause, (CauseGroup, Vec<(String, u64)>)> = BTreeMap::new();
     for &index in &analyzed {
         let event = &events[index];
         let cause = cause_of(events, index, &history);
-        let group = groups.entry(cause.clone()).or_insert_with(|| CauseGroup {
-            cause,
-            count: 0,
-            compile_ms: 0,
-            examples: Vec::new(),
+        let (group, crates) = groups.entry(cause.clone()).or_insert_with(|| {
+            (
+                CauseGroup {
+                    cause,
+                    count: 0,
+                    compile_ms: 0,
+                    examples: Vec::new(),
+                    costliest_examples: Vec::new(),
+                },
+                Vec::new(),
+            )
         });
         group.count += 1;
         group.compile_ms = group.compile_ms.saturating_add(event.compile_time_ms);
-        if group.examples.len() < 3 && !group.examples.contains(&event.crate_name) {
-            group.examples.push(event.crate_name.clone());
-        }
+        add_crate_cost(crates, &event.crate_name, event.compile_time_ms);
     }
-    let mut causes: Vec<CauseGroup> = groups.into_values().collect();
-    causes.sort_by(|a, b| {
-        b.count
-            .cmp(&a.count)
-            .then_with(|| b.compile_ms.cmp(&a.compile_ms))
-            .then_with(|| a.cause.cmp(&b.cause))
-    });
+    let mut causes: Vec<CauseGroup> = groups
+        .into_values()
+        .map(|(mut group, crates)| {
+            group.examples = crates
+                .iter()
+                .take(3)
+                .map(|(name, _)| name.clone())
+                .collect();
+            group.costliest_examples = costliest_names(crates, 3);
+            group
+        })
+        .collect();
+    sort_costliest_first(&mut causes);
+    let costliest = costliest_miss(analyzed.iter().map(|&index| &events[index]));
 
     let mut passes: BTreeMap<(String, String), PassthroughGroup> = BTreeMap::new();
     for &index in &session.events {
@@ -583,7 +601,45 @@ pub(crate) fn analyze_session(
         misses_total,
         misses_analyzed: analyzed.len(),
         cascade_recorded,
+        costliest,
     }
+}
+
+/// Add one miss's compile time to its crate's running total, keeping the
+/// crates in the order they first missed.
+fn add_crate_cost(crates: &mut Vec<(String, u64)>, name: &str, compile_ms: u64) {
+    match crates.iter_mut().find(|(crate_name, _)| crate_name == name) {
+        Some((_, total)) => *total = total.saturating_add(compile_ms),
+        None => crates.push((name.to_string(), compile_ms)),
+    }
+}
+
+/// The `n` costliest crate names, keeping log order on a tie.
+fn costliest_names(mut crates: Vec<(String, u64)>, n: usize) -> Vec<String> {
+    crates.sort_by_key(|(_, compile_ms)| std::cmp::Reverse(*compile_ms));
+    crates.into_iter().take(n).map(|(name, _)| name).collect()
+}
+
+/// Cause groups by the compile time they cost, then by count.
+pub(crate) fn sort_costliest_first(causes: &mut [CauseGroup]) {
+    causes.sort_by(|a, b| {
+        b.compile_ms
+            .cmp(&a.compile_ms)
+            .then_with(|| b.count.cmp(&a.count))
+            .then_with(|| a.cause.cmp(&b.cause))
+    });
+}
+
+/// The crate of the miss that cost the most compile time; the first one on
+/// a tie.
+fn costliest_miss<'a>(misses: impl Iterator<Item = &'a BuildEvent>) -> Option<String> {
+    let mut costliest: Option<&BuildEvent> = None;
+    for miss in misses {
+        if costliest.is_none_or(|best| miss.compile_time_ms > best.compile_time_ms) {
+            costliest = Some(miss);
+        }
+    }
+    costliest.map(|miss| miss.crate_name.clone())
 }
 
 /// The `kind|detail` split kache writes into passthrough reasons, with the
@@ -596,6 +652,17 @@ pub(crate) fn passthrough_parts(reason: &str) -> (&str, &str) {
     match reason.split_once('|') {
         Some((kind, detail)) => (kind.trim(), detail.trim()),
         None => ("", reason.strip_prefix("refused: ").unwrap_or(reason)),
+    }
+}
+
+/// A passthrough reason in one line: `kind: detail`, or plain words for a
+/// reason that has no kind.
+pub(crate) fn passthrough_words(reason: &str) -> String {
+    let (kind, detail) = passthrough_parts(reason);
+    if kind.is_empty() {
+        crate::report::uncached_reason_words(detail)
+    } else {
+        format!("{kind}: {detail}")
     }
 }
 
@@ -1126,6 +1193,125 @@ mod tests {
         let sessions = group_sessions(events, ts(1_000_000), &no_live(), gap());
         let selected = sessions.iter().find(|s| s.key == "id:now").unwrap();
         analyze_session(events, selected, &sessions)
+    }
+
+    #[test]
+    fn causes_and_their_crates_rank_by_compile_time() {
+        let costed = |name: &str, ms: u64, diff: &str| {
+            let mut miss = event(name, EventResult::Miss, 100, "/w", "now");
+            miss.compile_time_ms = ms;
+            miss.key_diff = vec![diff.to_string()];
+            miss
+        };
+        let events = vec![
+            // Three cheap misses that changed flags, first in the log.
+            costed("cheap1", 10, "args"),
+            costed("cheap2", 20, "args"),
+            costed("cheap3", 30, "args"),
+            // One costly miss per crate whose sources changed.
+            costed("first", 100, "sources"),
+            costed("big", 5_000, "sources"),
+            costed("tiny", 1, "sources"),
+            costed("mid", 3_000, "sources"),
+            costed("first", 4_000, "sources"),
+        ];
+        let analysis = analyze_one(&events);
+        assert_eq!(
+            analysis.causes[0].cause,
+            Cause::OwnInputs(vec!["sources".into()]),
+            "the costlier cause leads though it has fewer crates"
+        );
+        assert_eq!(analysis.causes[0].count, 5);
+        assert_eq!(
+            analysis.causes[0].costliest_examples,
+            vec!["big", "first", "mid"]
+        );
+        assert_eq!(
+            analysis.causes[1].costliest_examples,
+            vec!["cheap3", "cheap2", "cheap1"]
+        );
+        // The JSON `crates` keep their log order.
+        assert_eq!(analysis.causes[0].examples, vec!["first", "big", "tiny"]);
+        assert_eq!(
+            analysis.causes[1].examples,
+            vec!["cheap1", "cheap2", "cheap3"]
+        );
+        assert_eq!(analysis.costliest.as_deref(), Some("big"));
+        assert_eq!(costliest_miss(std::iter::empty()), None);
+    }
+
+    #[test]
+    fn cost_ties_keep_log_order() {
+        let mut crates = Vec::new();
+        add_crate_cost(&mut crates, "a", 5);
+        add_crate_cost(&mut crates, "b", 7);
+        add_crate_cost(&mut crates, "a", 2);
+        add_crate_cost(&mut crates, "c", 1);
+        assert_eq!(
+            crates,
+            vec![
+                ("a".to_string(), 7),
+                ("b".to_string(), 7),
+                ("c".to_string(), 1)
+            ]
+        );
+        assert_eq!(costliest_names(crates.clone(), 2), vec!["a", "b"]);
+        assert_eq!(costliest_names(crates, 5), vec!["a", "b", "c"]);
+
+        let mut one = event("one", EventResult::Miss, 100, "/w", "now");
+        one.compile_time_ms = 50;
+        let mut two = one.clone();
+        two.crate_name = "two".into();
+        let mut three = one.clone();
+        three.crate_name = "three".into();
+        three.compile_time_ms = 49;
+        assert_eq!(
+            costliest_miss([&one, &two, &three].into_iter()).as_deref(),
+            Some("one")
+        );
+        three.compile_time_ms = 51;
+        assert_eq!(
+            costliest_miss([&one, &two, &three].into_iter()).as_deref(),
+            Some("three")
+        );
+
+        let group = |count, compile_ms, cause| CauseGroup {
+            cause,
+            count,
+            compile_ms,
+            examples: Vec::new(),
+            costliest_examples: Vec::new(),
+        };
+        let mut causes = vec![
+            group(9, 10, Cause::NoHistory),
+            group(1, 20, Cause::Evicted),
+            group(2, 10, Cause::Unexplained),
+            group(2, 10, Cause::LookupRejected("x".into())),
+        ];
+        sort_costliest_first(&mut causes);
+        let order: Vec<&Cause> = causes.iter().map(|group| &group.cause).collect();
+        assert_eq!(
+            order,
+            [
+                &Cause::Evicted,
+                &Cause::NoHistory,
+                &Cause::LookupRejected("x".into()),
+                &Cause::Unexplained,
+            ]
+        );
+    }
+
+    #[test]
+    fn passthrough_reasons_read_as_words() {
+        assert_eq!(
+            passthrough_words("unsupported|cc link mode"),
+            "unsupported: cc link mode"
+        );
+        assert_eq!(
+            passthrough_words("adaptive seed"),
+            "edit rebuild: rustc rebuilt the edited crate incrementally (adaptive seed)"
+        );
+        assert_eq!(passthrough_words("refused: odd flag"), "odd flag");
     }
 
     #[test]

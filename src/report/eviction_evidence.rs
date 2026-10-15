@@ -57,12 +57,17 @@ pub(super) fn collect(
     }
 }
 
+/// The `stats --full` block, or nothing when no store has observed an
+/// eviction yet.
 pub(super) fn lines(report: &EvictionEvidenceReport) -> Vec<String> {
+    if !has_observations(report) {
+        return Vec::new();
+    }
     let mut lines = vec![
         String::new(),
         format!(
-            "Eviction observations · {}s horizon (all stores)",
-            report.horizon_secs
+            "Eviction observations · {} horizon (all stores)",
+            horizon_label(report.horizon_secs)
         ),
     ];
     for store in &report.stores {
@@ -88,6 +93,34 @@ pub(super) fn lines(report: &EvictionEvidenceReport) -> Vec<String> {
     }
     lines.extend(report.limitations.iter().map(|limit| format!("  {limit}")));
     lines
+}
+
+/// Whether any store recorded an observation in any cohort.
+fn has_observations(report: &EvictionEvidenceReport) -> bool {
+    report.stores.iter().any(|store| {
+        store.evidence.as_ref().is_some_and(|evidence| {
+            [
+                &evidence.live_shadow_agreed,
+                &evidence.live_shadow_kept,
+                &evidence.shadow_only,
+            ]
+            .iter()
+            .any(|cohort| cohort.observations > 0)
+        })
+    })
+}
+
+/// `7d`, `12h`, `90s`: the horizon in its largest whole unit.
+fn horizon_label(secs: u64) -> String {
+    const DAY: u64 = 86_400;
+    const HOUR: u64 = 3_600;
+    if secs > 0 && secs.is_multiple_of(DAY) {
+        format!("{}d", secs / DAY)
+    } else if secs > 0 && secs.is_multiple_of(HOUR) {
+        format!("{}h", secs / HOUR)
+    } else {
+        format!("{secs}s")
+    }
 }
 
 #[cfg(test)]

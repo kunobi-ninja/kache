@@ -409,6 +409,8 @@ kache --json explain serde
 
 Explains the latest recorded miss using the event log and stored entries. Store failures and rejected entries take precedence over key comparisons. Repeated misses under the same key in older logs retain an unknown cause when those logs cannot explain what happened.
 
+When the crate's newest compile was not cached, such as an edit rebuild that rustc compiled incrementally or a compile Kache declined to store, `explain` reports that compile and why it was not cached instead of the older miss. JSON carries it in `latest_uncached_compile`, which is `null` otherwise.
+
 Terminal and JSON output share the diagnosis and dependency analysis. For a recorded miss, JSON includes `dependency_chain` with changed dependencies, endpoints, and any traversal limit. An unresolved endpoint is not a confirmed cause. `dependency_recording_missing` indicates when enabling `[cache] explain_miss` and rebuilding can provide the missing dependency evidence.
 
 The first build in a second clone or worktree has no earlier build of the crate in its own tree. In that case `explain` compares the miss with the most recent build of the same compilation unit in another build tree, usually the other checkout. The output names that tree and gives one of these verdicts:

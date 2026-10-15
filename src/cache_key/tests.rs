@@ -17148,6 +17148,8 @@ fn concat_bindings_are_checked_across_sources_and_warm_memos() {
         EnvDepNormalizationDecision::NormalizedPathOnly
     );
     // A binding alone must not invalidate ordinary literal include proof.
+    // (`#[macro_use] extern crate` vetoes any include proof on its own.)
+    std::fs::write(&binding, "use dependency::concat;").unwrap();
     assert_eq!(
         env_dep_source_decision("OUT_DIR", &[binding, include], &FileHasher::persistent(&db),),
         EnvDepNormalizationDecision::NormalizedPathOnly

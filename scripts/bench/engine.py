@@ -14,8 +14,8 @@ MEASUREMENT_TIMEOUT = 1200
 def run_measurement(command, timeout=MEASUREMENT_TIMEOUT, grace=0, **kwargs):
     """Run one measurement in its own process group.
 
-    A timed-out measurement can leave compiler children alive, so the whole
-    group is stopped before its scratch directory is removed. With `grace`,
+    A failed or timed-out measurement can leave compiler children alive, so
+    the whole group is stopped before its scratch directory is removed. With `grace`,
     the group gets SIGINT first and that many seconds to clean up: the
     contention driver starts its builds in groups of their own and only it
     can stop them.
@@ -23,6 +23,8 @@ def run_measurement(command, timeout=MEASUREMENT_TIMEOUT, grace=0, **kwargs):
     with subprocess.Popen(command, start_new_session=True, **kwargs) as process:
         try:
             status = process.wait(timeout=timeout)
+            if status:
+                raise subprocess.CalledProcessError(status, command)
         except BaseException:
             try:
                 if grace:
@@ -37,8 +39,6 @@ def run_measurement(command, timeout=MEASUREMENT_TIMEOUT, grace=0, **kwargs):
                 pass
             process.wait()
             raise
-    if status:
-        raise subprocess.CalledProcessError(status, command)
 
 
 def tool_path(binary):

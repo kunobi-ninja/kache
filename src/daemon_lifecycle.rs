@@ -197,7 +197,7 @@ impl Driver for KacheReplacement<'_> {
     fn perform(&mut self, step: Step, deadline: Option<Instant>) -> Result<Progress> {
         let config = self.config;
         let socket = config.socket_path();
-        let deadline = deadline.context("Kache replacement requires an explicit phase budget")?;
+        let deadline = deadline.context("kache replacement requires an explicit phase budget")?;
         match step {
             Step::Recheck => {
                 if !self.force {

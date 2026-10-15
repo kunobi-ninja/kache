@@ -162,6 +162,9 @@ pub(crate) fn named_sections(sections: &[NamedSection<'_>]) -> Vec<String> {
     lines
 }
 
+/// Rows without a section heading. Commands print through
+/// [`named_sections`]; tests render single rows with this.
+#[cfg(test)]
 pub(crate) fn rows(rows: &[Row<'_>]) -> Vec<String> {
     rows_with(rows, Output::current())
 }
@@ -287,6 +290,12 @@ pub(crate) fn count(n: u64) -> String {
     out
 }
 
+/// `1 entry`, `3,018 entries`: a grouped count and the noun that agrees
+/// with it.
+pub(crate) fn counted(n: u64, one: &str, many: &str) -> String {
+    format!("{} {}", count(n), if n == 1 { one } else { many })
+}
+
 /// `1.2 GiB`: binary units, the same form in every command.
 pub(crate) fn bytes(n: u64) -> String {
     bytesize::ByteSize(n).to_string()
@@ -364,6 +373,20 @@ pub(crate) fn percent(value: f64) -> String {
 /// `path` with the home directory written as `~`.
 pub(crate) fn home_path(path: &Path) -> String {
     home_path_in(path, dirs::home_dir().as_deref())
+}
+
+/// `path` with the home directory written as `$HOME`, for a command people
+/// paste into a shell: unlike `~`, it also expands inside double quotes.
+pub(crate) fn shell_home_path(path: &Path) -> String {
+    shell_home_path_in(path, dirs::home_dir().as_deref())
+}
+
+fn shell_home_path_in(path: &Path, home: Option<&Path>) -> String {
+    match home.and_then(|home| path.strip_prefix(home).ok()) {
+        Some(rest) if rest.as_os_str().is_empty() => "$HOME".to_string(),
+        Some(rest) => format!("$HOME/{}", rest.display()),
+        None => path.display().to_string(),
+    }
 }
 
 fn home_path_in(path: &Path, home: Option<&Path>) -> String {
@@ -639,6 +662,14 @@ mod tests {
     }
 
     #[test]
+    fn counted_nouns_agree_with_the_count() {
+        assert_eq!(counted(0, "entry", "entries"), "0 entries");
+        assert_eq!(counted(1, "entry", "entries"), "1 entry");
+        assert_eq!(counted(2, "entry", "entries"), "2 entries");
+        assert_eq!(counted(1_000, "key", "keys"), "1,000 keys");
+    }
+
+    #[test]
     fn durations_pick_the_largest_short_unit() {
         assert_eq!(duration_ms(0), "0 ms");
         assert_eq!(duration_ms(999), "999 ms");
@@ -707,5 +738,29 @@ mod tests {
             "/Users/meadow/x"
         );
         assert_eq!(home_path_in(Path::new("/tmp/x"), None), "/tmp/x");
+    }
+
+    #[test]
+    fn the_shell_path_uses_this_users_home() {
+        let outside = Path::new("/kache-test-outside-home/x");
+        assert_eq!(shell_home_path(outside), "/kache-test-outside-home/x");
+        if let Some(home) = dirs::home_dir() {
+            assert_eq!(shell_home_path(&home.join("shims")), "$HOME/shims");
+        }
+    }
+
+    #[test]
+    fn a_shell_path_under_home_starts_with_the_home_variable() {
+        let home = Path::new("/home/me");
+        assert_eq!(
+            shell_home_path_in(Path::new("/home/me/.local/shims"), Some(home)),
+            "$HOME/.local/shims"
+        );
+        assert_eq!(shell_home_path_in(home, Some(home)), "$HOME");
+        assert_eq!(
+            shell_home_path_in(Path::new("/home/meadow"), Some(home)),
+            "/home/meadow"
+        );
+        assert_eq!(shell_home_path_in(Path::new("/opt/x"), None), "/opt/x");
     }
 }

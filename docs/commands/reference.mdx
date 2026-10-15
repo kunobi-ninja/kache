@@ -85,7 +85,7 @@ kache clean --orphans --yes
 kache clean ~/src --dry-run
 ```
 
-`clean` frees disk space. Without a directory it works from the target directories that builds through Kache used. It selects targets whose worktree or workspace has been deleted, and targets no build has used for 14 days. `--stale` changes that window and takes the same forms as `kache stats --since`; a value under an hour counts as one hour. `--orphans` selects only deleted worktrees, however recently they were built. A workspace counts as deleted only while the directory that held it still exists, so an unmounted volume does not.
+`clean` frees disk space. Without a directory it works from the target directories that builds through Kache used. It selects targets whose worktree or workspace has been deleted, and targets no build has used for 14 days. `--stale` changes that window and takes the same forms as `kache stats --since`; a value under an hour counts as one hour. `--orphans` selects only deleted worktrees, however recently they were built. The daemon removes those targets on its own a day after their last build, so `--orphans` is for removing them sooner, for example from a hook that runs after `git worktree remove`. A workspace counts as deleted only while the directory that held it still exists, so an unmounted volume does not.
 
 `--dry-run` lists what the clean would remove and every target it keeps: what deleting each frees, what it holds on disk, how long since a build used it, and what the daemon's next quiet pass would do to it. It ends with the cache's size and the command that removes the selection. The freeable estimate leaves out blocks a target shares with the store or with other hardlinks, so it is what the clean gives back. `--dry-run` also lists the default targets of sibling Git worktrees, marked "found through Git", but `kache clean` skips them because Kache has not seen a build use them.
 
@@ -409,9 +409,11 @@ kache --json explain serde
 
 Explains the latest recorded miss using the event log and stored entries. Store failures and rejected entries take precedence over key comparisons. Repeated misses under the same key in older logs retain an unknown cause when those logs cannot explain what happened.
 
-When the crate's newest compile was not cached, such as an edit rebuild that rustc compiled incrementally or a compile Kache declined to store, `explain` reports that compile and why it was not cached instead of the older miss. JSON carries it in `latest_uncached_compile`, which is `null` otherwise.
+The terminal report has the same sections as the report for the latest build: the last miss, the diagnosis, the comparison with another build tree and the dependency cascade when there is one, then the stored entries and recent events.
 
-Terminal and JSON output share the diagnosis and dependency analysis. For a recorded miss, JSON includes `dependency_chain` with changed dependencies, endpoints, and any traversal limit. An unresolved endpoint is not a confirmed cause. `dependency_recording_missing` indicates when enabling `[cache] explain_miss` and rebuilding can provide the missing dependency evidence.
+When the crate's newest compile was not cached, such as an edit rebuild that rustc compiled incrementally or a compile kache declined to store, `explain` reports that compile and why it was not cached instead of the older miss. JSON carries it in `latest_uncached_compile`, which is `null` otherwise.
+
+Terminal and JSON output share the diagnosis and dependency analysis. For a recorded miss, JSON includes `dependency_chain` with changed dependencies, endpoints, and any traversal limit. An unresolved endpoint is not a confirmed cause. `dependency_recording_missing` indicates when setting `explain_miss = true` under `[cache]` and rebuilding can provide the missing dependency evidence.
 
 The first build in a second clone or worktree has no earlier build of the crate in its own tree. In that case `explain` compares the miss with the most recent build of the same compilation unit in another build tree, usually the other checkout. The output names that tree and gives one of these verdicts:
 
@@ -427,7 +429,7 @@ Build trees are matched by Cargo's unit id. It is the same for a workspace membe
 
 ## `kache telemetry push`
 
-After a build, inspect its timeline or send it to the configured service:
+After a build, inspect its timeline or send it to the configured planner:
 
 ```bash
 kache telemetry push --dry-run
@@ -436,10 +438,10 @@ kache telemetry push --session SESSION_ID --label prefetch=off
 ```
 
 The default selects the latest session. `--all` selects every retained session;
-`--session` selects one ID. `--label KEY=VALUE` is repeatable. Set the service
+`--session` selects one ID. `--label KEY=VALUE` is repeatable. Set the planner
 with `KACHE_PLANNER_ENDPOINT` or `[cache.planner] endpoint`, and its
 credentials. A record that fails to upload prints a warning and the command
-still exits 0, so a CI post-step does not fail a finished job. With no service
+still exits 0, so a CI post-step does not fail a finished job. With no planner
 configured, it says how many records it would send.
 
 Timeline schema 7 records the session, plan, candidate source and zero-based

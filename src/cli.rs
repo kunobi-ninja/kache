@@ -477,7 +477,7 @@ pub enum TimelineSelection {
     Session(String),
 }
 
-/// Send build timeline records to the configured service.
+/// Send build timeline records to the configured planner.
 ///
 /// Records are advisory, so this reports problems and returns `Ok`: a CI
 /// post-step must not fail a green job because a record did not land.
@@ -501,8 +501,8 @@ pub fn telemetry_push(
 
     let Some(planner) = crate::config::Config::load_planner_config() else {
         println!(
-            "no service configured; set KACHE_PLANNER_ENDPOINT to send {} record(s)",
-            records.len()
+            "no planner configured; set KACHE_PLANNER_ENDPOINT to send {}",
+            term::counted(records.len() as u64, "record", "records")
         );
         return Ok(());
     };
@@ -514,9 +514,9 @@ pub fn telemetry_push(
     for record in &records {
         match rt.block_on(crate::timeline_client::push_timeline(&planner, record)) {
             Ok(answer) => println!(
-                "sent session {} ({} units): {}",
+                "sent session {} ({}): {}",
                 record.session_id,
-                record.units.len(),
+                term::counted(record.units.len() as u64, "unit", "units"),
                 answer.stored
             ),
             Err(error) => eprintln!("warning: session {} not sent: {error:#}", record.session_id),
@@ -536,8 +536,9 @@ fn nothing_to_send(events_seen: usize, versions: &std::collections::BTreeSet<Str
     }
     let versions: Vec<&str> = versions.iter().map(String::as_str).collect();
     format!(
-        "{events_seen} compile(s) in the log, none stamped with a build session: \
+        "{} in the log, none stamped with a build session: \
          the wrapper that wrote them ({}) predates session ids. Upgrade kache on the builder.",
+        term::counted(events_seen as u64, "compile", "compiles"),
         if versions.is_empty() {
             "unknown version".to_string()
         } else {
@@ -998,7 +999,7 @@ pub fn stats(
         println!("{line}");
     }
     println!();
-    println!("Details: kache stats --full");
+    println!("Details: `kache stats --full`");
     Ok(())
 }
 
@@ -1229,9 +1230,9 @@ fn build_rows(snap: &StatsSnapshot) -> Vec<StatsRow> {
         "no builds in this window".to_string()
     } else {
         format!(
-            "{} of {} crates from cache",
+            "{} of {} from cache",
             term::count(hits as u64),
-            term::count(total as u64)
+            term::counted(total as u64, "crate", "crates")
         )
     };
     if es.remote_hits + es.prefetch_hits > 0 {
@@ -1273,8 +1274,8 @@ fn build_rows(snap: &StatsSnapshot) -> Vec<StatsRow> {
 /// Parenthetical for a cap that is the disk-share budget, matching
 /// [`crate::config::describe_max_size`].
 ///
-/// One store whose cap equals that budget says `5% of <disk>, floor 5GiB,
-/// cap 100GiB`, or `default; disk size unknown` when the probe failed. Any
+/// One store whose cap equals that budget says `5% of <disk>, floor 5.0 GiB,
+/// cap 100.0 GiB`, or `default; disk size unknown` when the probe failed. Any
 /// other cap, and a summary that covers more than one store, stays unlabeled.
 fn cache_limit_note(store_count: usize, max_size: u64, filesystem_bytes: Option<u64>) -> String {
     if store_count > 1 {
@@ -1285,7 +1286,7 @@ fn cache_limit_note(store_count: usize, max_size: u64, filesystem_bytes: Option<
         return String::new();
     }
     match filesystem_bytes.filter(|&bytes| bytes > 0) {
-        Some(total) => format!(" (5% of {}, floor 5GiB, cap 100GiB)", ByteSize(total)),
+        Some(total) => format!(" ({})", crate::config::disk_share_note(total)),
         None => " (default; disk size unknown)".to_string(),
     }
 }
@@ -1306,13 +1307,13 @@ fn cache_rows(snap: &StatsSnapshot, config: &Config) -> Vec<StatsRow> {
                     .map_or(snap.total_size, |stats| stats.total_blob_size),
             ),
             format!(
-                "{} · {} entries",
+                "{} · {}",
                 if snap.blob_stats.is_some() {
                     "blob bytes"
                 } else {
                     "logical (blob size unavailable)"
                 },
-                term::count(snap.entry_count as u64)
+                term::counted(snap.entry_count as u64, "entry", "entries")
             ),
         ),
         (
@@ -1338,14 +1339,14 @@ fn cache_rows(snap: &StatsSnapshot, config: &Config) -> Vec<StatsRow> {
                         .map_or(store.bytes, |stats| stats.total_blob_size),
                 ),
                 format!(
-                    "{} · of {} · {} entries · {}",
+                    "{} · of {} · {} · {}",
                     if store.blob_stats.is_some() {
                         "blob bytes"
                     } else {
                         "logical (blob size unavailable)"
                     },
                     term::bytes(store.max_size),
-                    term::count(store.entries as u64),
+                    term::counted(store.entries as u64, "entry", "entries"),
                     term::home_path(&store.path)
                 ),
             ));
@@ -1363,7 +1364,7 @@ fn cache_rows(snap: &StatsSnapshot, config: &Config) -> Vec<StatsRow> {
         };
         rows.push((
             "Dedup",
-            format!("{} blobs", term::count(blob_stats.total_blobs as u64)),
+            term::counted(blob_stats.total_blobs as u64, "blob", "blobs"),
             format!(
                 "{} logical, {savings_pct:.1}% saved",
                 term::bytes(blob_stats.total_logical_size)
@@ -1582,7 +1583,7 @@ fn service_rows(snap: &StatsSnapshot, config: &Config) -> Vec<StatsRow> {
             };
             rows.push((
                 "Key LIST",
-                format!("{} keys", term::count(pf.last_list_key_count)),
+                term::counted(pf.last_list_key_count, "key", "keys"),
                 format!(
                     "in {} ms ({refresh}{refresh_source})",
                     pf.last_list_duration_ms
@@ -1594,12 +1595,12 @@ fn service_rows(snap: &StatsSnapshot, config: &Config) -> Vec<StatsRow> {
         if pf.list_requests_total > 0 {
             rows.push((
                 "LIST total",
-                format!("{} requests", term::count(pf.list_requests_total)),
+                term::counted(pf.list_requests_total, "request", "requests"),
                 format!(
-                    "{} failed, {} ms, {} keys returned",
+                    "{} failed, {} ms, {} returned",
                     term::count(pf.list_failures_total),
                     pf.list_duration_ms_total,
-                    term::count(pf.list_keys_total),
+                    term::counted(pf.list_keys_total, "key", "keys"),
                 ),
             ));
         }
@@ -1969,8 +1970,8 @@ fn store_failure_banner(miss: &crate::events::BuildEvent) -> Option<String> {
         return None;
     }
     Some(format!(
-        "  NOT CACHED: this compile ran and its outputs failed to store,\n  \
-         so the crate misses on every build until the cause is fixed.\n    \
+        "  NOT CACHED: this compile ran and its outputs failed to store, so the crate\n  \
+         misses on every build until the cause is fixed.\n    \
          reason: {}",
         miss.store_error
     ))
@@ -1995,7 +1996,7 @@ fn lookup_rejection_banner(
         "not currently present in the local store"
     };
     Some(format!(
-        "  Diagnosis: matching key was found but rejected before restore\n    \
+        "  matching key was found but rejected before restore\n    \
          reason: {}\n    \
          replacement: {replacement}",
         miss.lookup_rejection
@@ -2014,7 +2015,7 @@ fn legacy_repeated_same_key_banner(
         return None;
     }
     Some(
-        "  Diagnosis: repeated miss for the same cache key\n    \
+        "  repeated miss for the same cache key\n    \
          this older event did not record whether the entry was absent, evicted, invalid, or rejected\n    \
          the miss was not caused by a cache-key change",
     )
@@ -2051,9 +2052,7 @@ pub fn why_miss(config: &Config, crate_name: &str, json: bool) -> Result<()> {
                 }],
             );
         }
-        println!("No events found for `{crate_name}`.");
-        println!("\nTip: Build the crate first, then re-run this command:");
-        println!("  cargo build -p {crate_name}");
+        println!("No events for `{crate_name}` yet. Build it first: `cargo build -p {crate_name}`");
         return Ok(());
     }
 
@@ -2102,29 +2101,15 @@ pub fn why_miss(config: &Config, crate_name: &str, json: bool) -> Result<()> {
                 Vec::new(),
             );
         }
-        if let Some(latest) = latest_uncached {
-            for line in uncached_compile_lines(crate_name, latest, None, &crate_events) {
-                println!("{line}");
-            }
-            return Ok(());
+        for warning in unavailable_store_warnings(&inventory.stores) {
+            eprintln!("{warning}");
         }
-        println!("{}", no_miss_headline(crate_name, &crate_events));
-        for entry in &stored {
-            println!(
-                "  key: {} stores: {}",
-                term::short_key(&entry.cache_key),
-                entry.store_locations()
-            );
-        }
-        println!("\nRecent events:");
-        for event in crate_events.iter().rev().take(5).rev() {
-            println!(
-                "  [{}] {:<14} key: {}  {}",
-                term::local_datetime(event.ts),
-                event.result.to_string(),
-                term::short_key(&event.cache_key),
-                ByteSize(event.size),
-            );
+        let lines = match latest_uncached {
+            Some(latest) => uncached_compile_lines(crate_name, latest, None, &crate_events),
+            None => no_miss_lines(crate_name, &stored, &crate_events),
+        };
+        for line in lines {
+            println!("{line}");
         }
         return Ok(());
     }
@@ -2178,127 +2163,10 @@ pub fn why_miss(config: &Config, crate_name: &str, json: bool) -> Result<()> {
         return Ok(());
     }
 
-    for store in &inventory.stores {
-        if let Some(error) = &store.error {
-            println!("Store {}: unavailable ({error})", store.path.display());
-        }
+    for warning in unavailable_store_warnings(&inventory.stores) {
+        eprintln!("{warning}");
     }
 
-    // ── Header ─────────────────────────────────────────────────────────
-    println!("Why `{crate_name}` missed:\n");
-
-    let miss_time = term::local_datetime(miss.ts);
-    let miss_key_display = term::short_key(&miss.cache_key);
-    println!(
-        "  Last {}: {miss_time} (key: {miss_key_display})",
-        miss.result
-    );
-
-    // A compile that ran and could not be stored answers the question outright,
-    // and it outranks the key-diff analysis below: the key never got the chance
-    // to matter, because nothing was written for a later build to match against
-    // (kunobi-ninja/kache#629).
-    if let Some(banner) = store_failure_banner(miss) {
-        println!();
-        println!("{banner}");
-    }
-
-    // Show miss metadata if it was subsequently stored
-    if !miss.cache_key.is_empty() {
-        let meta_path = stored
-            .iter()
-            .find(|e| e.cache_key == miss.cache_key)
-            .map(|e| e.meta_path());
-        if let Some(meta_path) = meta_path
-            && let Ok(content) = std::fs::read_to_string(&meta_path)
-            && let Ok(meta) = serde_json::from_str::<crate::store::EntryMeta>(&content)
-        {
-            if !meta.target.is_empty() {
-                println!("    target:   {}", meta.target);
-            }
-            if !meta.profile.is_empty() {
-                println!("    profile:  {}", meta.profile);
-            }
-            if !meta.features.is_empty() {
-                println!("    features: {}", meta.features.join(", "));
-            }
-        }
-    }
-
-    println!();
-
-    if stored.is_empty() {
-        println!("  Stored entries for `{crate_name}`: (none)");
-        println!();
-    } else {
-        // Show stored entries (cap at 10 most recent)
-        println!(
-            "  Stored entries for `{crate_name}` ({} total):",
-            stored.len()
-        );
-        let show_count = stored.len().min(10);
-        let hidden = stored.len().saturating_sub(10);
-        for entry in stored.iter().rev().take(show_count) {
-            let ek = term::short_key(&entry.cache_key);
-            let accessed = format_relative_time(&entry.last_accessed);
-            let size = ByteSize(entry.size);
-            let stores = entry.store_locations();
-            let hits = entry.hit_count;
-            let profile_tag = if entry.profile.is_empty() {
-                String::new()
-            } else {
-                format!(", profile: {}", entry.profile)
-            };
-            let crate_type_tag = if entry.crate_type.is_empty() {
-                String::new()
-            } else {
-                format!(", type: {}", entry.crate_type)
-            };
-            let match_indicator = if entry.cache_key == miss.cache_key {
-                " <-- entry-miss key (stored after compile)"
-            } else {
-                ""
-            };
-
-            // Read meta.json for richer diff info
-            let mut features_tag = String::new();
-            let mut target_tag = String::new();
-            let meta_path = entry.meta_path();
-            if let Ok(content) = std::fs::read_to_string(&meta_path)
-                && let Ok(meta) = serde_json::from_str::<crate::store::EntryMeta>(&content)
-            {
-                if !meta.features.is_empty() {
-                    features_tag = format!(", features: [{}]", meta.features.join(", "));
-                }
-                if !meta.target.is_empty() {
-                    target_tag = format!(", target: {}", meta.target);
-                }
-            }
-
-            println!(
-                "    - key: {ek} (last accessed: {accessed}, size: {size}, hits: {hits}, stores: {stores}{profile_tag}{crate_type_tag}{target_tag}{features_tag}){match_indicator}"
-            );
-        }
-        if hidden > 0 {
-            println!("    ... and {hidden} older entries");
-        }
-    }
-    print_miss_diagnosis(miss, &stored, &diagnosis);
-
-    // Render the dependency analysis shared with JSON output.
-    print_checkout_comparison(&diagnosis);
-    print_extern_chain(&diagnosis);
-    for hint in &diagnosis.hints {
-        println!("  hint: {hint}");
-    }
-
-    // ── Recent event history ──────────────────────────────────────────
-    println!();
-    for line in recent_event_lines(&crate_events) {
-        println!("{line}");
-    }
-
-    // ── Key changed hint ──────────────────────────────────────────────
     let last_hit = crate_events.iter().rev().find(|e| {
         matches!(
             e.result,
@@ -2307,60 +2175,274 @@ pub fn why_miss(config: &Config, crate_name: &str, json: bool) -> Result<()> {
                 | events::EventResult::PrefetchHit
         )
     });
+    // Metadata of the missed key, when the compile was stored after it.
+    let miss_meta = missed_entry(&stored, &miss.cache_key).and_then(read_entry_meta);
 
-    if let (Some(hit), Some(miss_ev)) = (last_hit, last_miss)
-        && hit.cache_key != miss_ev.cache_key
-        && miss_ev.ts > hit.ts
-    {
-        println!(
-            "\n  Key changed: {} (last hit) -> {} ({})",
-            term::short_key(&hit.cache_key),
-            term::short_key(&miss_ev.cache_key),
-            miss_ev.result,
-        );
+    let mut lines = vec![
+        term::heading(format!("kache · explain · {crate_name}")),
+        String::new(),
+    ];
+    lines.extend(term::named_sections(&[(
+        "Last miss",
+        last_miss_rows(
+            miss,
+            miss_meta.as_ref(),
+            last_hit.copied(),
+            config.key_salt.as_deref(),
+        ),
+    )]));
+    lines.extend(section(
+        "Diagnosis",
+        miss_diagnosis_lines(miss, miss_meta.as_ref(), &stored, &diagnosis),
+    ));
+    lines.extend(section("Other build tree", checkout_lines(&diagnosis)));
+    lines.extend(section(
+        "Dependency cascade",
+        extern_chain_lines(&diagnosis),
+    ));
+    lines.extend(section(
+        "Hints",
+        diagnosis
+            .hints
+            .iter()
+            .map(|hint| format!("  {hint}"))
+            .collect(),
+    ));
+    lines.extend(section(
+        &format!("Stored entries ({})", term::count(stored.len() as u64)),
+        stored_entry_lines(Some(&miss.cache_key), &stored),
+    ));
+    lines.extend(section("Recent events", recent_event_lines(&crate_events)));
+    lines.push(String::new());
+    lines.push(format!(
+        "Every key input: `KACHE_LOG=trace cargo build -p {crate_name} 2>&1 | grep '\\[key:{crate_name}\\]'`"
+    ));
+    for line in lines {
+        println!("{line}");
     }
-
-    // ── Active key salt ───────────────────────────────────────────────
-    // The salt is folded into every key but isn't recorded per entry, so a
-    // salt change can't be diffed against a stored entry — it shifts the key
-    // wholesale and looks like a clean miss. Surfacing the active salt makes
-    // that cause visible: a stray machine-global `KACHE_KEY_SALT`, or a
-    // rotated salt, alone explains every miss here.
-    if let Some(salt) = config.key_salt.as_deref().filter(|s| !s.is_empty()) {
-        println!("\n  Active key_salt: {salt:?}");
-        println!(
-            "    (folded into every key; if it changed or was set unexpectedly since the \
-             last hit, that alone shifts the key and explains the miss)"
-        );
-    }
-
-    println!("\n  For full key component details, run:");
-    println!(
-        "    KACHE_LOG=trace cargo build -p {crate_name} 2>&1 | grep '\\[key:{crate_name}\\]'"
-    );
-
     Ok(())
 }
 
-/// Render the comparison with another checkout, when the miss's own build tree
-/// had no earlier build of the crate to compare with.
-fn print_checkout_comparison(diagnosis: &MissDiagnosis) {
+/// A heading and its lines after a blank line, or nothing when `body` is
+/// empty: the sections of `kache explain <crate>` after the first.
+fn section(name: &str, body: Vec<String>) -> Vec<String> {
+    if body.is_empty() {
+        return body;
+    }
+    let mut lines = vec![String::new(), term::heading(name)];
+    lines.extend(body);
+    lines
+}
+
+/// One warning per store that could not be read, for stderr, so the report
+/// still prints.
+fn unavailable_store_warnings(stores: &[crate::store_view::StoreSummary]) -> Vec<String> {
+    stores
+        .iter()
+        .filter_map(|store| {
+            let error = store.error.as_ref()?;
+            Some(format!(
+                "warning: store {} is unavailable ({error})",
+                term::home_path(&store.path)
+            ))
+        })
+        .collect()
+}
+
+/// The stored entry under the missed key. A miss without a key matches none.
+fn missed_entry<'a>(
+    stored: &[&'a daemon::StatsEntry],
+    key: &str,
+) -> Option<&'a daemon::StatsEntry> {
+    stored
+        .iter()
+        .copied()
+        .find(|entry| !key.is_empty() && entry.cache_key == key)
+}
+
+fn read_entry_meta(entry: &daemon::StatsEntry) -> Option<crate::store::EntryMeta> {
+    let content = std::fs::read_to_string(entry.meta_path()).ok()?;
+    serde_json::from_str(&content).ok()
+}
+
+/// The "Last miss" rows of `kache explain <crate>`: the miss, its key and
+/// configuration, and the two things that change a key wholesale (a last
+/// hit under another key, the key salt).
+fn last_miss_rows(
+    miss: &events::BuildEvent,
+    meta: Option<&crate::store::EntryMeta>,
+    last_hit: Option<&events::BuildEvent>,
+    key_salt: Option<&str>,
+) -> Vec<term::Row<'static>> {
+    let mut rows = vec![
+        (
+            "Result",
+            miss.result.to_string(),
+            term::local_datetime(miss.ts),
+        ),
+        (
+            "Key",
+            if miss.cache_key.is_empty() {
+                "none".to_string()
+            } else {
+                term::short_key(&miss.cache_key).to_string()
+            },
+            String::new(),
+        ),
+    ];
+    if let Some(meta) = meta {
+        for (label, value) in [
+            ("Target", meta.target.clone()),
+            ("Profile", meta.profile.clone()),
+            ("Features", meta.features.join(", ")),
+        ] {
+            if !value.is_empty() {
+                rows.push((label, value, String::new()));
+            }
+        }
+    }
+    if let Some(hit) = last_hit.filter(|hit| hit.cache_key != miss.cache_key && miss.ts > hit.ts) {
+        rows.push((
+            "Last hit",
+            term::short_key(&hit.cache_key).to_string(),
+            "under a different key".to_string(),
+        ));
+    }
+    // The salt is folded into every key but isn't recorded per entry, so a
+    // salt change can't be diffed against a stored entry: it shifts the key
+    // wholesale and looks like a clean miss. A stray machine-global
+    // `KACHE_KEY_SALT`, or a rotated salt, alone explains every miss here.
+    if let Some(salt) = key_salt.filter(|salt| !salt.is_empty()) {
+        rows.push((
+            "Key salt",
+            format!("{salt:?}"),
+            "folded into every key; a change since the last hit alone explains the miss"
+                .to_string(),
+        ));
+    }
+    rows
+}
+
+/// The stored entries of the crate, newest first and at most ten. `missed`
+/// marks the entry stored under the missed key.
+fn stored_entry_lines(missed: Option<&str>, stored: &[&daemon::StatsEntry]) -> Vec<String> {
+    if stored.is_empty() {
+        return vec!["  none".to_string()];
+    }
+    let body: Vec<Vec<String>> = stored
+        .iter()
+        .rev()
+        .take(10)
+        .map(|entry| stored_entry_row(entry, read_entry_meta(entry).as_ref(), missed))
+        .collect();
+    let mut lines = term::table(
+        &["KEY", "ACCESSED", "SIZE", "HITS", "STORE", "DETAILS"],
+        &[
+            term::Align::Left,
+            term::Align::Left,
+            term::Align::Right,
+            term::Align::Right,
+            term::Align::Left,
+            term::Align::Left,
+        ],
+        &body,
+    );
+    let hidden = stored.len().saturating_sub(10);
+    if hidden > 0 {
+        lines.push(format!(
+            "  and {}",
+            term::counted(hidden as u64, "older entry", "older entries")
+        ));
+    }
+    lines
+}
+
+/// One row of [`stored_entry_lines`]: key, last access, size, hits, store and
+/// what sets the entry apart. Pure; `meta` is the entry's `meta.json`.
+fn stored_entry_row(
+    entry: &daemon::StatsEntry,
+    meta: Option<&crate::store::EntryMeta>,
+    missed: Option<&str>,
+) -> Vec<String> {
+    let mut details = Vec::new();
+    if !entry.profile.is_empty() {
+        details.push(format!("profile {}", entry.profile));
+    }
+    if !entry.crate_type.is_empty() {
+        details.push(format!("type {}", entry.crate_type));
+    }
+    if let Some(meta) = meta {
+        if !meta.target.is_empty() {
+            details.push(format!("target {}", meta.target));
+        }
+        if !meta.features.is_empty() {
+            details.push(format!("features [{}]", meta.features.join(", ")));
+        }
+    }
+    if missed == Some(entry.cache_key.as_str()) {
+        details.push("the missed key, stored after the compile".to_string());
+    }
+    vec![
+        term::short_key(&entry.cache_key).to_string(),
+        format_relative_time(&entry.last_accessed),
+        term::bytes(entry.size),
+        term::count(entry.hit_count),
+        entry.store_locations(),
+        details.join(", "),
+    ]
+}
+
+/// The crate's newest five events, oldest first, in local time.
+fn recent_event_lines(crate_events: &[&events::BuildEvent]) -> Vec<String> {
+    let body: Vec<Vec<String>> = crate_events
+        .iter()
+        .rev()
+        .take(5)
+        .rev()
+        .map(|event| {
+            vec![
+                term::local_clock(event.ts),
+                event.result.to_string(),
+                term::short_key(&event.cache_key).to_string(),
+                term::duration_ms(event.elapsed_ms),
+                term::bytes(event.size),
+            ]
+        })
+        .collect();
+    term::table(
+        &["TIME", "RESULT", "KEY", "ELAPSED", "SIZE"],
+        &[
+            term::Align::Left,
+            term::Align::Left,
+            term::Align::Left,
+            term::Align::Right,
+            term::Align::Right,
+        ],
+        &body,
+    )
+}
+
+/// The comparison with another checkout, when the miss's own build tree had
+/// no earlier build of the crate to compare with.
+fn checkout_lines(diagnosis: &MissDiagnosis) -> Vec<String> {
     let Some(checkout) = &diagnosis.checkout else {
-        return;
+        return Vec::new();
     };
     // "Build tree", not "checkout": a registry crate built with the same
     // features and profile has one unit id in unrelated projects too.
-    println!(
-        "\n  Other build tree: no earlier build of this crate in {}",
-        checkout.root
+    let mut lines = vec![
+        format!("  no earlier build of this crate in {}", checkout.root),
+        format!(
+            "  compared with the same unit built in: {}",
+            checkout.baseline_root
+        ),
+    ];
+    lines.extend(
+        checkout_comparison_lines(checkout)
+            .into_iter()
+            .map(|line| format!("  {line}")),
     );
-    println!(
-        "    compared with the same unit built in: {}",
-        checkout.baseline_root
-    );
-    for line in checkout_comparison_lines(checkout) {
-        println!("    {line}");
-    }
+    lines
 }
 
 fn checkout_comparison_lines(checkout: &crate::miss_chain::CheckoutComparison) -> Vec<String> {
@@ -2411,33 +2493,32 @@ fn checkout_comparison_lines(checkout: &crate::miss_chain::CheckoutComparison) -
     lines
 }
 
-/// Render the `extern:` cascade for a miss, when one is recorded (#609).
+/// The `extern:` cascade for a miss, when one is recorded (#609).
 ///
-/// Prints nothing when the miss is not downstream of a dependency change, so
-/// the ordinary single-crate case reads exactly as before. When the digests
-/// were never recorded, says how to turn them on rather than staying silent
-/// about a diagnosis it could have given.
-fn print_extern_chain(diagnosis: &MissDiagnosis) {
+/// Empty when the miss is not downstream of a dependency change. When the
+/// digests were never recorded, says how to turn them on rather than staying
+/// silent about a diagnosis it could have given.
+fn extern_chain_lines(diagnosis: &MissDiagnosis) -> Vec<String> {
     let Some(chain) = &diagnosis.dependency_chain else {
         if diagnosis.dependency_recording_missing {
-            println!(
-                "\n  Dependency cascade: not analyzed (no per-dependency digests recorded).\n    \
-                 Enable [cache] explain_miss to record them, then rebuild."
-            );
+            return vec![
+                "  not analyzed: no per-dependency digests recorded".to_string(),
+                "  set explain_miss = true under [cache], then rebuild".to_string(),
+            ];
         }
-        return;
+        return Vec::new();
     };
 
     let direct: Vec<&str> = chain.direct.iter().map(|d| d.name.as_str()).collect();
-    println!(
-        "\n  Dependency cascade: this miss is downstream of {} that changed ({})",
+    let mut lines = vec![format!(
+        "  this miss is downstream of {} that changed ({})",
         if direct.len() == 1 {
             "a dependency".to_string()
         } else {
             format!("{} dependencies", direct.len())
         },
         direct.join(", ")
-    );
+    )];
 
     for root in &chain.roots {
         let via = if root.branches > 1 {
@@ -2445,107 +2526,136 @@ fn print_extern_chain(diagnosis: &MissDiagnosis) {
         } else {
             String::new()
         };
-        match &root.kind {
-            crate::miss_chain::RootKind::Groups(groups) => println!(
-                "    root: {}{via} -- own inputs changed: {}",
-                root.crate_name,
+        let name = &root.crate_name;
+        lines.push(match &root.kind {
+            crate::miss_chain::RootKind::Groups(groups) => format!(
+                "  root: {name}{via}, its own inputs changed: {}",
                 groups.join(", ")
             ),
-            crate::miss_chain::RootKind::PathOnly => println!(
-                "    root: {}{via} -- same key in both build trees, but its artifact differs \
-                 (its output is not reproducible across build trees)",
-                root.crate_name
+            crate::miss_chain::RootKind::PathOnly => format!(
+                "  root: {name}{via}, same key in both build trees but its artifact differs \
+                 (its output is not reproducible across build trees)"
             ),
-            crate::miss_chain::RootKind::NothingRecorded => println!(
-                "    root: {}{via} -- dependencies stable and no traced input group changed \
-                 (key salt or extra inputs?)",
-                root.crate_name
+            crate::miss_chain::RootKind::NothingRecorded => format!(
+                "  root: {name}{via}, dependencies stable and no traced input group changed \
+                 (key salt or extra inputs?)"
             ),
             // Everything below is an unresolved endpoint, not a cause. Worded
             // so it can't be read as "this crate is why you missed".
-            crate::miss_chain::RootKind::NoMissRecorded => println!(
-                "    unresolved: {}{via} -- artifact differs, but it has no compile recorded in \
-                 this event window",
-                root.crate_name
+            crate::miss_chain::RootKind::NoMissRecorded => format!(
+                "  unresolved: {name}{via}, artifact differs but it has no compile recorded in \
+                 this event window"
             ),
-            crate::miss_chain::RootKind::NoBaseline => println!(
-                "    unresolved: {}{via} -- nothing earlier to compare it against",
-                root.crate_name
+            crate::miss_chain::RootKind::NoBaseline => {
+                format!("  unresolved: {name}{via}, nothing earlier to compare it against")
+            }
+            crate::miss_chain::RootKind::NoDiffableHistory => format!(
+                "  unresolved: {name}{via}, its own dependency history is not comparable, so the \
+                 cascade may continue below it"
             ),
-            crate::miss_chain::RootKind::NoDiffableHistory => println!(
-                "    unresolved: {}{via} -- its own dependency history is not comparable, so the \
-                 cascade may continue below it",
-                root.crate_name
+            crate::miss_chain::RootKind::LimitReached => format!(
+                "  unresolved: {name}{via}, still descending when the walk limit was reached"
             ),
-            crate::miss_chain::RootKind::LimitReached => println!(
-                "    unresolved: {}{via} -- still descending when the walk limit was reached",
-                root.crate_name
-            ),
-        }
+        });
         if root.path.len() > 1 {
             let mut path: Vec<&str> = root.path.iter().map(|h| h.crate_name.as_str()).collect();
-            path.push(root.crate_name.as_str());
-            println!("      via: {}", path.join(" <- "));
+            path.push(name.as_str());
+            lines.push(format!("    via: {}", path.join(" <- ")));
         }
         for group in &root.passthroughs {
-            println!(
-                "      {}x uncached compile in {}: {}",
-                group.count, root.crate_name, group.reason
-            );
+            lines.push(format!(
+                "    {}x uncached compile in {name}: {}",
+                group.count, group.reason
+            ));
         }
         if !root.passthroughs.is_empty() {
-            println!(
-                "      (uncached compiles make the artifact vary per checkout; attributed by \
+            lines.push(
+                "    (uncached compiles make the artifact vary per checkout; attributed by \
                  package directory)"
+                    .to_string(),
             );
         }
     }
 
     if !chain.has_resolved_root() {
-        println!(
-            "    note: no endpoint could be resolved -- the recorded history does not explain \
+        lines.push(
+            "  note: no endpoint could be resolved; the recorded history does not explain \
              this miss"
+                .to_string(),
         );
     }
     if let Some(reason) = chain.truncated {
-        println!("    note: walk stopped early -- {reason}");
+        lines.push(format!("  note: the walk stopped early: {reason}"));
     }
+    lines
 }
 
-fn print_miss_diagnosis(
+/// The "Diagnosis" lines of `kache explain <crate>`. A failed store leads:
+/// nothing was written for a later build to match, so it outranks any key
+/// comparison (kunobi-ninja/kache#629).
+fn miss_diagnosis_lines(
     miss: &events::BuildEvent,
+    miss_meta: Option<&crate::store::EntryMeta>,
     stored: &[&daemon::StatsEntry],
     diagnosis: &MissDiagnosis,
-) {
+) -> Vec<String> {
+    let mut lines: Vec<String> = store_failure_banner(miss).into_iter().collect();
     match diagnosis.cause {
-        Cause::NotCached => {} // The store-failure banner already leads the report.
+        Cause::NotCached => {}
         Cause::LookupRejected => {
-            if let Some(banner) = lookup_rejection_banner(miss, diagnosis.same_key_present) {
-                println!("{banner}");
-            }
+            lines.extend(lookup_rejection_banner(miss, diagnosis.same_key_present));
         }
         Cause::RepeatedSameKey => {
-            if let Some(banner) = legacy_repeated_same_key_banner(miss, true) {
-                println!("{banner}");
-            }
+            lines.extend(legacy_repeated_same_key_banner(miss, true).map(str::to_string));
         }
-        Cause::NeverCached => println!("  Diagnosis: never cached -- first build of this crate"),
+        Cause::NeverCached => lines.push("  never cached: first build of this crate".to_string()),
         Cause::FirstBuildNowCached => {
-            println!("  Diagnosis: first build with these inputs -- entry is now cached");
+            lines.push("  first build with these inputs: the entry is now cached".to_string());
         }
         Cause::KeyMismatch => {
-            println!(
-                "  Diagnosis: key mismatch -- {} other stored entries differ from key {}",
-                diagnosis.other_entries,
+            lines.push(format!(
+                "  key mismatch: key {} differs from {}",
                 term::short_key(&miss.cache_key),
-            );
-            let other_entries: Vec<_> = stored
-                .iter()
-                .filter(|e| e.cache_key != miss.cache_key)
-                .collect();
-            why_miss_diff_entries(miss, stored, &other_entries);
+                term::counted(
+                    diagnosis.other_entries as u64,
+                    "other stored entry",
+                    "other stored entries"
+                ),
+            ));
+            if let Some(miss_meta) = miss_meta {
+                let others: Vec<(String, crate::store::EntryMeta)> = stored
+                    .iter()
+                    .filter(|e| e.cache_key != miss.cache_key)
+                    .filter_map(|e| {
+                        Some((
+                            term::short_key(&e.cache_key).to_string(),
+                            read_entry_meta(e)?,
+                        ))
+                    })
+                    .collect();
+                lines.extend(difference_lines(miss_meta, &others));
+            }
         }
     }
+    lines
+}
+
+/// What differs between the missed key's configuration and the other stored
+/// entries': at most five lines, then how many more there were. Pure.
+fn difference_lines(
+    miss_meta: &crate::store::EntryMeta,
+    others: &[(String, crate::store::EntryMeta)],
+) -> Vec<String> {
+    let (diffs, extra) = why_miss_diff_messages(
+        miss_meta,
+        others.iter().map(|(key, meta)| (key.as_str(), meta)),
+        5,
+    );
+    let mut lines: Vec<String> = diffs.iter().map(|diff| format!("    - {diff}")).collect();
+    if extra > 0 {
+        lines.push(format!("    and {extra} more"));
+    }
+    lines
 }
 
 fn why_miss_json(
@@ -2664,12 +2774,32 @@ fn no_miss_headline(crate_name: &str, crate_events: &[&events::BuildEvent]) -> S
         )
     };
     if crate_events.iter().all(hit) {
-        format!("No misses or dups found for `{crate_name}` -- all events are hits!")
+        format!("No misses for `{crate_name}`: all events are hits.")
     } else if crate_events.iter().any(hit) {
-        format!("No misses or dups found for `{crate_name}`; its latest lookup hit the cache.")
+        format!("No misses for `{crate_name}`: its latest lookup hit the cache.")
     } else {
-        format!("No misses, dups or hits found for `{crate_name}`.")
+        format!("No misses or hits for `{crate_name}`.")
     }
+}
+
+/// `kache explain <crate>` for a crate with no miss and no uncached compile
+/// since its last lookup.
+fn no_miss_lines(
+    crate_name: &str,
+    stored: &[&daemon::StatsEntry],
+    crate_events: &[&events::BuildEvent],
+) -> Vec<String> {
+    let mut lines = vec![
+        term::heading(format!("kache · explain · {crate_name}")),
+        String::new(),
+        no_miss_headline(crate_name, crate_events),
+    ];
+    lines.extend(section(
+        &format!("Stored entries ({})", term::count(stored.len() as u64)),
+        stored_entry_lines(None, stored),
+    ));
+    lines.extend(section("Recent events", recent_event_lines(crate_events)));
+    lines
 }
 
 /// `kache explain <crate>` when the crate's newest compile was not cached:
@@ -2680,95 +2810,44 @@ fn uncached_compile_lines(
     earlier_miss: Option<&events::BuildEvent>,
     crate_events: &[&events::BuildEvent],
 ) -> Vec<String> {
-    let mut lines = vec![
-        format!("`{crate_name}` was compiled, not cached:"),
-        String::new(),
-        format!(
-            "  Latest compile: {} (key: {})",
-            term::local_datetime(latest.ts),
-            term::short_key(&latest.cache_key)
+    let mut rows = vec![
+        ("When", term::local_datetime(latest.ts), String::new()),
+        (
+            "Key",
+            term::short_key(&latest.cache_key).to_string(),
+            String::new(),
         ),
-        format!("    why: {}", crate::report::uncached_compile_words(latest)),
+        (
+            "Why",
+            crate::report::uncached_compile_words(latest),
+            String::new(),
+        ),
     ];
     if let Some(miss) = earlier_miss {
-        lines.push(format!(
-            "  Earlier {}: {} (key: {})",
-            miss.result,
-            term::local_datetime(miss.ts),
-            term::short_key(&miss.cache_key)
+        rows.push((
+            "Earlier",
+            miss.result.to_string(),
+            format!(
+                "{}, key {}",
+                term::local_datetime(miss.ts),
+                term::short_key(&miss.cache_key)
+            ),
         ));
     }
-    lines.push(String::new());
-    lines.extend(recent_event_lines(crate_events));
+    let mut lines = vec![
+        term::heading(format!("kache · explain · {crate_name}")),
+        String::new(),
+        format!("`{crate_name}` was compiled, not cached."),
+        String::new(),
+    ];
+    lines.extend(term::named_sections(&[("Latest compile", rows)]));
+    lines.extend(section("Recent events", recent_event_lines(crate_events)));
     lines
 }
 
-/// The newest five events of a crate, oldest first, in local time.
-fn recent_event_lines(crate_events: &[&events::BuildEvent]) -> Vec<String> {
-    let mut lines = vec!["  Recent events:".to_string()];
-    let skip = crate_events.len().saturating_sub(5);
-    for event in &crate_events[skip..] {
-        lines.push(format!(
-            "    [{}] {:<14} key: {}  {}  {}",
-            term::local_clock(event.ts),
-            event.result.to_string(),
-            term::short_key(&event.cache_key),
-            term::duration_ms(event.elapsed_ms),
-            ByteSize(event.size),
-        ));
-    }
-    lines
-}
-
-/// Compare the miss event's stored metadata against other stored entries
-/// to surface what likely differs (target, profile, features).
-fn why_miss_diff_entries(
-    miss: &events::BuildEvent,
-    stored: &[&daemon::StatsEntry],
-    other_entries: &[&&daemon::StatsEntry],
-) {
-    // Load metadata for the miss key (if stored)
-    let miss_meta = stored
-        .iter()
-        .find(|e| e.cache_key == miss.cache_key)
-        .and_then(|entry| std::fs::read_to_string(entry.meta_path()).ok())
-        .and_then(|content| serde_json::from_str::<crate::store::EntryMeta>(&content).ok());
-
-    let Some(miss_meta) = miss_meta else {
-        return;
-    };
-
-    let mut other_metas = Vec::new();
-
-    for entry in other_entries {
-        let meta_path = entry.meta_path();
-        let other_meta = std::fs::read_to_string(&meta_path)
-            .ok()
-            .and_then(|c| serde_json::from_str::<crate::store::EntryMeta>(&c).ok());
-
-        let Some(other) = other_meta else {
-            continue;
-        };
-
-        other_metas.push((term::short_key(&entry.cache_key).to_string(), other));
-    }
-
-    let (diffs, extra) = why_miss_diff_messages(
-        &miss_meta,
-        other_metas.iter().map(|(ek, meta)| (ek.as_str(), meta)),
-        5,
-    );
-    if !diffs.is_empty() {
-        println!("  Differences detected:");
-        for diff in &diffs {
-            println!("    - {diff}");
-        }
-        if extra > 0 {
-            println!("    ... and {extra} more");
-        }
-    }
-}
-
+/// What differs between the missed key's configuration and each other
+/// stored entry's (target, profile, features, crate types), at most `limit`
+/// lines and how many more there were.
 fn why_miss_diff_messages<'a, I>(
     miss_meta: &crate::store::EntryMeta,
     other_entries: I,
@@ -2777,19 +2856,29 @@ fn why_miss_diff_messages<'a, I>(
 where
     I: IntoIterator<Item = (&'a str, &'a crate::store::EntryMeta)>,
 {
-    let mut diffs: Vec<String> = Vec::new();
+    // Every same-config entry says the same thing, so they share one line.
+    let mut diffs: Vec<(Option<&'static str>, String)> = Vec::new();
+    let mut push = |same_config: Option<&'static str>, message: String| {
+        diffs.push((same_config, message));
+    };
     for (ek, other) in other_entries {
         if miss_meta.target != other.target {
-            diffs.push(format!(
-                "different target vs {ek}: \"{}\" vs \"{}\"",
-                miss_meta.target, other.target
-            ));
+            push(
+                None,
+                format!(
+                    "different target vs {ek}: \"{}\" vs \"{}\"",
+                    miss_meta.target, other.target
+                ),
+            );
         }
         if miss_meta.profile != other.profile {
-            diffs.push(format!(
-                "different profile vs {ek}: \"{}\" vs \"{}\"",
-                miss_meta.profile, other.profile
-            ));
+            push(
+                None,
+                format!(
+                    "different profile vs {ek}: \"{}\" vs \"{}\"",
+                    miss_meta.profile, other.profile
+                ),
+            );
         }
         if miss_meta.features != other.features {
             let miss_feats = if miss_meta.features.is_empty() {
@@ -2802,15 +2891,19 @@ where
             } else {
                 other.features.join(", ")
             };
-            diffs.push(format!(
-                "different features vs {ek}: [{miss_feats}] vs [{other_feats}]"
-            ));
+            push(
+                None,
+                format!("different features vs {ek}: [{miss_feats}] vs [{other_feats}]"),
+            );
         }
         if miss_meta.crate_types != other.crate_types {
-            diffs.push(format!(
-                "different crate types vs {ek}: {:?} vs {:?}",
-                miss_meta.crate_types, other.crate_types
-            ));
+            push(
+                None,
+                format!(
+                    "different crate types vs {ek}: {:?} vs {:?}",
+                    miss_meta.crate_types, other.crate_types
+                ),
+            );
         }
 
         if miss_meta.target == other.target
@@ -2818,23 +2911,18 @@ where
             && miss_meta.features == other.features
             && miss_meta.crate_types == other.crate_types
         {
-            diffs.push(format!(
-                "same config as {ek} -- likely source code, dependency, or rustc version change"
-            ));
+            push(
+                Some("same config"),
+                format!("same config as {ek}: likely a source, dependency or rustc version change"),
+            );
         }
     }
 
     let mut unique_diffs: Vec<String> = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    for diff in &diffs {
-        // Normalize: strip the key prefix to group identical diagnoses.
-        let normalized = if let Some(pos) = diff.find(" -- ") {
-            diff[pos..].to_string()
-        } else {
-            diff.clone()
-        };
-        if seen.insert(normalized) {
-            unique_diffs.push(diff.clone());
+    for (same_config, diff) in diffs {
+        if seen.insert(same_config.map_or_else(|| diff.clone(), str::to_string)) {
+            unique_diffs.push(diff);
         }
     }
 
@@ -2875,11 +2963,11 @@ fn held_bytes_note(bytes_held: u64) -> String {
 ///
 /// Pure so the phrasing is unit-testable without running a sweep.
 pub(crate) fn describe_eviction(stats: &crate::store::GcStats, over_limit: bool) -> String {
-    let grace_secs = crate::store::EVICTION_IDLE_GRACE.as_secs();
+    let grace = term::duration_ms(crate::store::EVICTION_IDLE_GRACE.as_millis() as u64);
     let plural = |n: usize| if n == 1 { "entry" } else { "entries" };
     let pinned_note = |n: usize| {
         format!(
-            "\n  {n} more {} accessed within the last {grace_secs}s or awaiting a durable \
+            "\n  {n} more {} accessed within the last {grace} or awaiting a durable \
              remote upload and left in place; run it again once builds and uploads \
              are idle.",
             plural(n),
@@ -2888,7 +2976,7 @@ pub(crate) fn describe_eviction(stats: &crate::store::GcStats, over_limit: bool)
 
     if stats.entries_evicted > 0 {
         let mut msg = format!(
-            " dropped {} {} from the store ({}).",
+            "dropped {} {} from the store ({}).",
             stats.entries_evicted,
             plural(stats.entries_evicted),
             ByteSize(stats.bytes_freed)
@@ -2921,7 +3009,7 @@ pub(crate) fn describe_eviction(stats: &crate::store::GcStats, over_limit: bool)
 
     if stats.entries_unreclaimable > 0 {
         let mut msg = format!(
-            " nothing reclaimable on disk.\n  {} {}{} cloned into build outputs \
+            "nothing reclaimable on disk.\n  {} {}{} cloned into build outputs \
              (same bytes as target/, not extra).\n  Remove stale outputs with \
              `kache clean --stale 14d --dry-run`, then run it again.",
             stats.entries_unreclaimable,
@@ -2937,8 +3025,8 @@ pub(crate) fn describe_eviction(stats: &crate::store::GcStats, over_limit: bool)
     // Nothing evicted. Say why, because this is the case that reads as a bug.
     if stats.entries_pinned > 0 {
         return format!(
-            " evicted 0 entries.\n  {} {} were selected but accessed within the last \
-             {grace_secs}s or are awaiting a durable remote upload, so they were left in \
+            "evicted 0 entries.\n  {} {} were selected but accessed within the last \
+             {grace} or are awaiting a durable remote upload, so they were left in \
              place. Run it again once builds and uploads are idle.",
             stats.entries_pinned,
             plural(stats.entries_pinned),
@@ -2946,13 +3034,13 @@ pub(crate) fn describe_eviction(stats: &crate::store::GcStats, over_limit: bool)
     }
     if over_limit {
         return format!(
-            " evicted 0 entries.\n  The store is still over its limit but nothing was \
-             eligible. Entries accessed within the last {grace_secs}s are never evicted; \
+            "evicted 0 entries.\n  The store is still over its limit but nothing was \
+             eligible. Entries accessed within the last {grace} are never evicted; \
              if this persists with no builds running, `kache doctor --verify` will \
              report entries that cannot be removed."
         );
     }
-    " evicted 0 entries (nothing to evict).".to_string()
+    "evicted 0 entries (nothing to evict).".to_string()
 }
 
 /// Is the store over its configured budget after a sweep?
@@ -3765,7 +3853,7 @@ pub fn list(
         ));
         lines.push(String::new());
         lines.push(term::paint(
-            format!("{} entries", term::count(entries.len() as u64)),
+            term::counted(entries.len() as u64, "entry", "entries"),
             term::Style::Muted,
         ));
         write_paged(&lines, no_pager);
@@ -4025,7 +4113,10 @@ pub fn run_gc_local(config: &Config, mode: GcMode) -> Result<crate::store::GcSta
     let backfilled = store.backfill_content_hashes().unwrap_or(0);
     if verbose {
         if backfilled > 0 {
-            println!(" {backfilled} entries updated.");
+            println!(
+                " {} updated.",
+                term::counted(backfilled as u64, "entry", "entries")
+            );
         } else {
             println!(" up to date.");
         }
@@ -4039,7 +4130,10 @@ pub fn run_gc_local(config: &Config, mode: GcMode) -> Result<crate::store::GcSta
     let costs = store.backfill_compile_times().unwrap_or(0);
     if verbose {
         if costs > 0 {
-            println!(" {costs} entries updated.");
+            println!(
+                " {} updated.",
+                term::counted(costs as u64, "entry", "entries")
+            );
         } else {
             println!(" up to date.");
         }
@@ -4053,7 +4147,10 @@ pub fn run_gc_local(config: &Config, mode: GcMode) -> Result<crate::store::GcSta
     let mapped = store.backfill_entry_blobs().unwrap_or(0);
     if verbose {
         if mapped > 0 {
-            println!(" {mapped} entries updated.");
+            println!(
+                " {} updated.",
+                term::counted(mapped as u64, "entry", "entries")
+            );
         } else {
             println!(" up to date.");
         }
@@ -4074,8 +4171,8 @@ pub fn run_gc_local(config: &Config, mode: GcMode) -> Result<crate::store::GcSta
         if verbose {
             if age_stats.entries_evicted > 0 {
                 println!(
-                    " dropped {} entries from the store ({}); {} became free on disk.",
-                    age_stats.entries_evicted,
+                    " dropped {} from the store ({}); {} became free on disk.",
+                    term::counted(age_stats.entries_evicted as u64, "entry", "entries"),
                     crate::report::format_bytes(age_stats.bytes_freed),
                     crate::report::format_bytes(age_stats.disk_bytes_reclaimed),
                 );
@@ -4095,7 +4192,14 @@ pub fn run_gc_local(config: &Config, mode: GcMode) -> Result<crate::store::GcSta
     add_gc_stats(&mut combined, &dedup_stats);
     if verbose {
         if dedup_stats.entries_evicted > 0 {
-            println!(" removed {} duplicates.", dedup_stats.entries_evicted);
+            println!(
+                " removed {}.",
+                term::counted(
+                    dedup_stats.entries_evicted as u64,
+                    "duplicate",
+                    "duplicates"
+                )
+            );
         } else {
             println!(" no duplicates found.");
         }
@@ -4115,7 +4219,7 @@ pub fn run_gc_local(config: &Config, mode: GcMode) -> Result<crate::store::GcSta
                 .map(|size| size.saturating_sub(evict_stats.bytes_held)),
             config.max_size,
         );
-        println!("{}", describe_eviction(&evict_stats, over_limit));
+        println!(" {}", describe_eviction(&evict_stats, over_limit));
     }
 
     // Key lock files and input predictions grow with every distinct key and
@@ -4124,12 +4228,23 @@ pub fn run_gc_local(config: &Config, mode: GcMode) -> Result<crate::store::GcSta
     combined.housekeeping = Some(housekeeping);
     if verbose {
         println!(
-            "Housekeeping: removed {} stale key locks ({} remain), {} unused input predictions, \
-             {} old file hashes.",
-            housekeeping.key_locks_removed,
+            "Housekeeping: removed {} ({} remain), {}, {}.",
+            term::counted(
+                housekeeping.key_locks_removed as u64,
+                "stale key lock",
+                "stale key locks"
+            ),
             housekeeping.key_locks_remaining,
-            housekeeping.predictions_pruned,
-            housekeeping.file_hashes_pruned,
+            term::counted(
+                housekeeping.predictions_pruned as u64,
+                "unused input prediction",
+                "unused input predictions"
+            ),
+            term::counted(
+                housekeeping.file_hashes_pruned as u64,
+                "old file hash",
+                "old file hashes"
+            ),
         );
     }
 
@@ -4333,10 +4448,10 @@ fn human_gc_output(json: bool) -> bool {
 
 fn gc_store_usage(store: &Store, max_size: u64, filesystem_bytes: Option<u64>) -> Result<String> {
     Ok(format!(
-        "{} / {} ({} entries)",
+        "{} / {} · {}",
         ByteSize(store.physical_size()?),
         crate::config::describe_max_size(max_size, filesystem_bytes),
-        store.entry_count()?
+        term::counted(store.entry_count()? as u64, "entry", "entries")
     ))
 }
 
@@ -4434,13 +4549,17 @@ pub fn gc(
             return emit_gc_json(config, false, &stats);
         }
         println!(
-            "Stale-schema GC:{}\nCurrent key schema: {}.",
+            "Stale-schema GC: {}\nCurrent key schema: {}.",
             describe_eviction(&stats, false),
             crate::cache_key::CACHE_KEY_VERSION,
         );
         let total_size = store.physical_size()?;
         let entry_count = store.entry_count()?;
-        println!("Store: {} ({} entries)", ByteSize(total_size), entry_count);
+        println!(
+            "Store: {} · {}",
+            ByteSize(total_size),
+            term::counted(entry_count as u64, "entry", "entries")
+        );
         return Ok(());
     }
 
@@ -4489,18 +4608,18 @@ pub fn gc(
                             .map(|size| size.saturating_sub(combined.bytes_held)),
                         config.max_size,
                     );
-                    println!("{}", describe_eviction(&combined, over_limit));
+                    println!("Eviction: {}", describe_eviction(&combined, over_limit));
                 }
             } else if human_gc_output(json) {
                 if let Some(hours) = max_age_hours {
                     println!(
-                        "Evicted {} entries older than {hours}h.",
-                        outcome.evicted.unwrap_or(0)
+                        "Evicted {} older than {hours}h.",
+                        term::counted(outcome.evicted.unwrap_or(0) as u64, "entry", "entries")
                     );
                 } else {
                     println!(
-                        "Evicted {} entries (daemon returned no per-policy breakdown).",
-                        outcome.evicted.unwrap_or(0)
+                        "Evicted {} (daemon returned no per-policy breakdown).",
+                        term::counted(outcome.evicted.unwrap_or(0) as u64, "entry", "entries")
                     );
                 }
                 combined.entries_evicted = outcome.evicted.unwrap_or(0);
@@ -4538,7 +4657,7 @@ pub fn gc(
                             .map(|size| size.saturating_sub(evict_stats.bytes_held)),
                         config.max_size,
                     );
-                    println!("{}", describe_eviction(&evict_stats, over_limit));
+                    println!(" {}", describe_eviction(&evict_stats, over_limit));
                 }
             } else {
                 combined = run_gc_local_with_shards(
@@ -4596,7 +4715,10 @@ pub fn purge(config: &Config, crate_filter: Option<&str>) -> Result<()> {
                 removed += 1;
             }
         }
-        println!("Removed {removed} entries for '{name}'.");
+        println!(
+            "Removed {} for '{name}'.",
+            term::counted(removed as u64, "entry", "entries")
+        );
         if skipped > 0 {
             println!(
                 "Skipped {skipped} corrupt entr{} (see warnings above).",
@@ -5104,9 +5226,9 @@ fn removal_words(what: &CacheClean, entries: usize, bytes: u64) -> String {
 fn cache_preview(what: &CacheClean, entries: usize, bytes: u64) -> String {
     match what {
         CacheClean::OlderThan(hours) => format!(
-            "Cache is {} in {} entries. This would evict the entries older than {}.",
+            "Cache is {} in {}. This would evict the entries older than {}.",
             term::bytes(bytes),
-            term::count(entries as u64),
+            term::counted(entries as u64, "entry", "entries"),
             window_label(*hours)
         ),
         CacheClean::StaleSchema => format!(
@@ -5243,8 +5365,8 @@ fn unit_cleanup_needs_confirmation(preview: bool, units: usize) -> bool {
 fn render_unit_plan(path: &str, plan: &crate::target_liveness::Plan) -> String {
     if plan.status == "ready" {
         format!(
-            "{path}: {} obsolete units ({}), {} live and {} unknown units kept",
-            plan.units,
+            "{path}: {} ({}), {} live and {} unknown units kept",
+            term::counted(plan.units as u64, "obsolete unit", "obsolete units"),
             ByteSize(plan.bytes),
             plan.protected,
             plan.unknown
@@ -5366,7 +5488,8 @@ fn unit_clean_summary(
         return Some("Nothing removed.".into());
     }
     Some(format!(
-        "Removed {removed} obsolete units ({}).",
+        "Removed {} ({}).",
+        term::counted(removed as u64, "obsolete unit", "obsolete units"),
         ByteSize(bytes)
     ))
 }
@@ -5846,7 +5969,7 @@ fn held_reason(holders: &[crate::target_use::Holder], now: u64) -> String {
         .collect();
     match named.as_slice() {
         [] => {
-            "another Kache cleanup or a running Cargo command holds Kache's target lock".to_owned()
+            "another kache cleanup or a running Cargo command holds kache's target lock".to_owned()
         }
         [one] => format!("waiting for {one} to exit"),
         [rest @ .., last] => format!("waiting for {} and {last} to exit", rest.join(", ")),
@@ -6140,15 +6263,15 @@ fn unit_cleanup_note(plan: &crate::target_liveness::Plan) -> String {
     match plan.status.as_str() {
         "" | "off" => String::new(),
         "ready" if plan.units > 0 => format!(
-            "  ({} obsolete units: kache clean --units --dry-run)",
-            plan.units
+            "  ({}: `kache clean --units --dry-run`)",
+            term::counted(plan.units as u64, "obsolete unit", "obsolete units")
         ),
         "ready" => String::new(),
         status => format!("  (unit cleanup: {status})"),
     }
 }
 
-fn render_targets(rows: &[TargetRow]) -> Vec<String> {
+fn render_targets(rows: &[TargetRow], auto_orphans: bool) -> Vec<String> {
     let apparent: u64 = rows.iter().map(|row| row.apparent_bytes).sum();
     let reclaimable: u64 = rows.iter().map(|row| row.reclaimable_bytes).sum();
     let mut lines = vec![format!(
@@ -6186,17 +6309,51 @@ fn render_targets(rows: &[TargetRow]) -> Vec<String> {
             term::home_path(std::path::Path::new(&row.path))
         ));
     }
-    let orphans = rows
-        .iter()
-        .filter(|row| !row.discovered && row.state == TargetState::WorktreeDeleted)
-        .count();
+    let orphans = recorded_orphans(rows);
     if orphans > 0 {
+        let them = if orphans == 1 { "it" } else { "them" };
+        let when = if auto_orphans { " now" } else { "" };
         lines.push(format!(
-            "\nRemove the {orphans} deleted worktree{} targets: kache clean --orphans --yes",
-            if orphans == 1 { "'s" } else { "s'" }
+            "\n{}. To remove {them}{when}: `kache clean --orphans --yes`",
+            orphan_note(orphans, auto_orphans)
         ));
     }
     lines
+}
+
+/// Targets a build recorded whose worktree is gone: the ones the daemon's
+/// orphan rule and `kache clean --orphans` act on.
+fn recorded_orphans(rows: &[TargetRow]) -> usize {
+    rows.iter()
+        .filter(|row| !row.discovered && row.state == TargetState::WorktreeDeleted)
+        .count()
+}
+
+/// `2 targets belong to deleted worktrees; the daemon removes them a day
+/// after their last build`, or only the first half when `auto` (the
+/// `auto_clean_orphaned_targets` setting) is off.
+fn orphan_note(orphans: usize, auto: bool) -> String {
+    let (subject, them, their) = if orphans == 1 {
+        (
+            "1 target belongs to a deleted worktree".to_string(),
+            "it",
+            "its",
+        )
+    } else {
+        (
+            format!(
+                "{} targets belong to deleted worktrees",
+                term::count(orphans as u64)
+            ),
+            "them",
+            "their",
+        )
+    };
+    if auto {
+        format!("{subject}; the daemon removes {them} a day after {their} last build")
+    } else {
+        subject
+    }
 }
 
 /// A tracked clean's view of every target kache knows: the ones it removes,
@@ -6450,10 +6607,10 @@ fn plan_lines(
     }
     lines.push(String::new());
     lines.push(format!(
-        "Cache    {} of {} · {} entries · kept under its limit automatically; `kache clean --cache` empties it",
+        "Cache    {} of {} · {} · kept under its limit automatically; `kache clean --cache` empties it",
         term::bytes(cache.bytes),
         term::bytes(cache.limit),
-        term::count(cache.entries)
+        term::counted(cache.entries, "entry", "entries")
     ));
     lines.push(String::new());
     lines.push(match end {
@@ -6523,19 +6680,22 @@ fn next_pass_note(plan: &crate::target_cleanup::Plan) -> String {
 }
 
 /// The clean that removes deleted worktrees' targets, when there are any.
-fn targets_next_actions(rows: &[TargetRow]) -> Vec<crate::machine::NextAction> {
-    let orphans = rows
-        .iter()
-        .filter(|row| !row.discovered && row.state == TargetState::WorktreeDeleted)
-        .count();
+fn targets_next_actions(rows: &[TargetRow], auto_orphans: bool) -> Vec<crate::machine::NextAction> {
+    let orphans = recorded_orphans(rows);
     if orphans == 0 {
         return Vec::new();
     }
+    let note = orphan_note(orphans, auto_orphans);
+    let them = if orphans == 1 { "it" } else { "them" };
     vec![crate::machine::NextAction {
         argv: ["kache", "clean", "--orphans", "--yes"]
             .map(String::from)
             .to_vec(),
-        why: format!("{orphans} target(s) belong to deleted worktrees"),
+        why: if auto_orphans {
+            format!("{note}. This removes {them} now")
+        } else {
+            format!("{note}; automatic removal is off")
+        },
     }]
 }
 
@@ -6550,7 +6710,7 @@ pub fn targets(config: &Config, json: bool) -> Result<()> {
             apparent_bytes: u64,
             reclaimable_bytes: u64,
         }
-        let next = targets_next_actions(&rows);
+        let next = targets_next_actions(&rows, config.auto_clean_orphaned_targets);
         return crate::machine::emit(
             "targets",
             Body {
@@ -6565,7 +6725,7 @@ pub fn targets(config: &Config, json: bool) -> Result<()> {
         println!("No tracked target directories. Builds through kache register theirs.");
         return Ok(());
     }
-    for line in render_targets(&rows) {
+    for line in render_targets(&rows, config.auto_clean_orphaned_targets) {
         println!("{line}");
     }
     Ok(())
@@ -7396,7 +7556,8 @@ pub(crate) fn doctor_shards(config: &Config) -> Vec<Check> {
                         label: "Volume store",
                         pass: fs.is_none() && !drift,
                         detail: format!(
-                            "{path}: {entries} entries, {} / {}{}",
+                            "{path}: {}, {} / {}{}",
+                            term::counted(entries as u64, "entry", "entries"),
                             ByteSize(bytes),
                             ByteSize(shard.max_size),
                             if drift {
@@ -7456,10 +7617,10 @@ fn doctor_index_quarantines(config: &Config) -> Check {
             label: "Store quarantine",
             pass: false,
             detail: format!(
-                "{} files ({}) retained in {} after index corruption",
-                files.len(),
+                "{} ({}) retained in {} after index corruption",
+                term::counted(files.len() as u64, "file", "files"),
                 ByteSize(files.iter().map(|file| file.bytes).sum::<u64>()),
-                config.cache_dir.display()
+                term::home_path(&config.cache_dir)
             ),
             fix: Some("save the index.db.corrupt-* files if needed for investigation; `kache clean --cache` removes them along with all cached artifacts".to_string()),
         },
@@ -7691,10 +7852,14 @@ pub fn doctor(
                 label: "Store totals",
                 pass: view.stores.iter().all(|s| s.error.is_none()),
                 detail: format!(
-                    "{} unique entries, {} stored across {} configured stores",
-                    view.entry_count,
+                    "{}, {} stored across {}",
+                    term::counted(view.entry_count as u64, "unique entry", "unique entries"),
                     ByteSize(view.total_size),
-                    view.stores.len()
+                    term::counted(
+                        view.stores.len() as u64,
+                        "configured store",
+                        "configured stores"
+                    )
                 ),
                 fix: None,
             });
@@ -7854,7 +8019,7 @@ pub fn doctor(
             label: "Daemon service",
             pass,
             detail: if installed {
-                service_path.display().to_string()
+                term::home_path(&service_path)
             } else if healthy_daemon_reachable {
                 "not installed; healthy on-demand daemon is reachable".into()
             } else {
@@ -7900,8 +8065,11 @@ pub fn doctor(
     checks.push(Check {
         label: "C/C++ shims",
         pass: shim_status.is_active(),
-        detail: shim_status.detail(),
-        fix: shim_status.fix(crate::compiler::shim::default_shim_dir().as_deref()),
+        detail: shim_status.detail(&|path| term::home_path(path)),
+        fix: shim_status.fix(
+            crate::compiler::shim::default_shim_dir().as_deref(),
+            &|path| term::shell_home_path(path),
+        ),
     });
     #[cfg(unix)]
     if let Some(dir) = crate::compiler::shim::default_shim_dir()
@@ -8063,7 +8231,10 @@ pub fn doctor(
     if issues == 0 {
         println!("  \x1b[32mAll checks passed.\x1b[0m");
     } else {
-        println!("  \x1b[31m{issues} issue(s) found.\x1b[0m");
+        println!(
+            "  \x1b[31m{} found.\x1b[0m",
+            term::counted(issues as u64, "issue", "issues")
+        );
     }
     if downgraded_daemon {
         println!(
@@ -8333,7 +8504,7 @@ fn migration_summary(
     let mut out = String::from("\nMigration summary:\n");
     if actions.is_empty() && rc_changes.is_empty() {
         out.push_str("  No sccache configuration found. Nothing to migrate.\n");
-        out.push_str("\n  If Cargo is not using kache yet, run: kache init\n");
+        out.push_str("\n  If Cargo is not using kache yet, run `kache init`.\n");
         return out;
     }
 
@@ -8365,11 +8536,11 @@ fn migration_summary(
 
     if !purge_sccache {
         out.push_str(
-            "\n  Tip: run `kache doctor --fix --purge-sccache` to also remove sccache cache and binary\n",
+            "\n  To also remove the sccache cache and binary, run `kache doctor --fix --purge-sccache`.\n",
         );
     }
 
-    out.push_str("\n  Then verify with: kache doctor\n");
+    out.push_str("\n  Then verify with `kache doctor`.\n");
     out
 }
 
@@ -8441,7 +8612,8 @@ async fn sync_inner(
     // time and can leave an interactive prompt hanging.
     if pull_workspace && workspace_crates.is_none_or(|crates| crates.is_empty()) {
         anyhow::bail!(
-            "--workspace: no workspace members resolved (cargo metadata failed or this is not              a Cargo workspace); refusing to fall back to a full remote scan"
+            "--workspace: no workspace members resolved (cargo metadata failed or this is not a \
+             Cargo workspace); refusing to fall back to a full remote scan"
         );
     }
 
@@ -8521,27 +8693,31 @@ async fn sync_with_client(
             // can't catch it either).
             let crates = workspace_crates.filter(|c| !c.is_empty()).ok_or_else(|| {
                 anyhow::anyhow!(
-                    "--workspace: no workspace members resolved (cargo metadata                      failed or this is not a Cargo workspace); refusing to fall                      back to a full remote scan"
+                    "--workspace: no workspace members resolved (cargo metadata failed or this is not a \
+             Cargo workspace); refusing to fall back to a full remote scan"
                 )
             })?;
             eprint!(
-                "Listing remote keys for {} workspace crates...",
-                crates.len()
+                "Listing remote keys for {}...",
+                term::counted(crates.len() as u64, "workspace crate", "workspace crates")
             );
             let keys = list_remote_crates(remote_cache, crates, config.s3_concurrency)
                 .await
                 .context("listing remote keys for workspace crates")?;
-            eprintln!(" {} keys", keys.len());
+            eprintln!(" {}", term::counted(keys.len() as u64, "key", "keys"));
             keys
         } else if !pull_all
             && let Some(crates) = lock_crates
             && !crates.is_empty()
         {
-            eprint!("Listing remote keys for {} crates...", crates.len());
+            eprint!(
+                "Listing remote keys for {}...",
+                term::counted(crates.len() as u64, "crate", "crates")
+            );
             let keys = list_remote_crates(remote_cache, crates, config.s3_concurrency)
                 .await
                 .context("listing remote keys for dependency crates")?;
-            eprintln!(" {} keys", keys.len());
+            eprintln!(" {}", term::counted(keys.len() as u64, "key", "keys"));
             keys
         } else {
             eprint!("Listing remote keys...");
@@ -8549,7 +8725,7 @@ async fn sync_with_client(
                 .list_keys()
                 .await
                 .context("listing remote keys")?;
-            eprintln!(" {} keys", keys.len());
+            eprintln!(" {}", term::counted(keys.len() as u64, "key", "keys"));
             keys
         }
     } else {
@@ -8559,7 +8735,7 @@ async fn sync_with_client(
             .list_keys()
             .await
             .context("listing remote keys")?;
-        eprintln!(" {} keys", keys.len());
+        eprintln!(" {}", term::counted(keys.len() as u64, "key", "keys"));
         keys
     };
 
@@ -8893,7 +9069,7 @@ fn save_manifest_impl(
     let remote = config
         .remote
         .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("No remote configured"))?;
+        .ok_or_else(|| anyhow::anyhow!("no remote configured"))?;
 
     let events = crate::events::read_events(&config.event_log_path())?;
     let entries = manifest_entries_from_events(&events, session_id);
@@ -8961,7 +9137,8 @@ fn save_manifest_impl(
 
     if announce {
         eprintln!(
-            "Saved manifest: {entry_count} entries for '{}'",
+            "Saved manifest: {} for '{}'",
+            term::counted(entry_count as u64, "entry", "entries"),
             published.join("', '")
         );
     }
@@ -9163,7 +9340,7 @@ fn workspace_filter(manifest_path: Option<&str>) -> Option<std::collections::Has
         .map(|mp| match get_workspace_crate_names(mp) {
             Ok(names) => names.into_iter().collect(),
             Err(e) => {
-                eprintln!("Warning: cargo metadata failed for {mp}: {e}");
+                eprintln!("warning: cargo metadata failed for {mp}: {e}");
                 std::collections::HashSet::new()
             }
         })
@@ -9172,7 +9349,7 @@ fn workspace_filter(manifest_path: Option<&str>) -> Option<std::collections::Has
                 match get_workspace_crate_names("Cargo.toml") {
                     Ok(names) => Some(names.into_iter().collect()),
                     Err(e) => {
-                        eprintln!("Warning: cargo metadata failed: {e}");
+                        eprintln!("warning: cargo metadata failed: {e}");
                         None
                     }
                 }
@@ -9445,7 +9622,7 @@ fn verify_store(config: &Config, checksums: bool, repair: bool) -> Result<Verify
                 stats.blobs_registered,
             ),
             Ok(_) => {}
-            Err(e) => println!("Warning: could not rebuild index rows from the store: {e:#}"),
+            Err(e) => eprintln!("warning: could not rebuild index rows from the store: {e:#}"),
         }
     }
 
@@ -9653,8 +9830,8 @@ fn verify_store(config: &Config, checksums: bool, repair: bool) -> Result<Verify
                     .count();
                 if !dropped.is_empty() {
                     println!(
-                        "Repairing: removed {} entries that failed verification.",
-                        dropped.len()
+                        "Repairing: removed {} that failed verification.",
+                        term::counted(dropped.len() as u64, "entry", "entries")
                     );
                 }
                 if let Some(message) = reconciled_index_message(drift) {
@@ -9724,15 +9901,15 @@ fn verify_store(config: &Config, checksums: bool, repair: bool) -> Result<Verify
                 "Repairing: removed {removed} stale C/C++ memos and {inputs} unreferenced inputs"
             ),
             Ok(_) => {}
-            Err(error) => println!("Warning: could not prune C/C++ memos: {error}"),
+            Err(error) => eprintln!("warning: could not prune C/C++ memos: {error}"),
         }
         match memos.prune_input_predictions() {
             Ok(removed) => println!("Repairing: removed {removed} unused input predictions"),
-            Err(error) => println!("Warning: could not prune input predictions: {error}"),
+            Err(error) => eprintln!("warning: could not prune input predictions: {error}"),
         }
         match memos.prune_file_hashes() {
             Ok(removed) => println!("Repairing: removed {removed} old file hashes"),
-            Err(error) => println!("Warning: could not prune file hashes: {error}"),
+            Err(error) => eprintln!("warning: could not prune file hashes: {error}"),
         }
         match memos.compact_sparse_index() {
             Ok(Some((before, after))) => println!(
@@ -9741,7 +9918,7 @@ fn verify_store(config: &Config, checksums: bool, repair: bool) -> Result<Verify
                 ByteSize(after)
             ),
             Ok(None) => {}
-            Err(error) => println!("Warning: index compaction deferred: {error:#}"),
+            Err(error) => eprintln!("warning: index compaction deferred: {error:#}"),
         }
     }
 
@@ -9764,7 +9941,7 @@ fn verify_store(config: &Config, checksums: bool, repair: bool) -> Result<Verify
     if should_print_repair_tip(corrupted_entries, orphaned_blobs, index_drift, repair) {
         println!();
         println!(
-            "Tip: run `kache doctor --repair` to remove corrupted entries, reconcile the blob index, and reclaim orphaned blobs."
+            "Run `kache doctor --repair` to remove corrupted entries, reconcile the blob index, and reclaim orphaned blobs."
         );
     }
 
@@ -9967,7 +10144,7 @@ pub(crate) fn is_rustdoc_assignment(line: &str) -> bool {
 
 #[cfg(any(test, unix))]
 fn closes_toml_table(trimmed: &str) -> bool {
-    trimmed.starts_with('[') && trimmed.ends_with(']')
+    trimmed.starts_with('[') && toml::from_str::<toml::Table>(trimmed).is_ok()
 }
 
 #[cfg(any(test, unix))]
@@ -10009,7 +10186,7 @@ pub(crate) fn apply_rustdoc_edit(existing: &str, shim_path: &str) -> String {
     let mut in_build = false;
     for (index, line) in lines.iter().enumerate() {
         let trimmed = line.trim();
-        if trimmed == "[build]" {
+        if trimmed.starts_with("[build]") {
             in_build = true;
             if build_header.is_none() {
                 build_header = Some(index);
@@ -10060,6 +10237,27 @@ pub(crate) fn apply_rustdoc_edit(existing: &str, shim_path: &str) -> String {
     out.push_str(&assignment);
     out.push('\n');
     out
+}
+
+/// Check that the text edit changed only the intended Cargo setting.
+#[cfg(any(test, unix))]
+fn checked_rustdoc_edit(existing: &str, shim_path: &str) -> Result<String> {
+    let updated = apply_rustdoc_edit(existing, shim_path);
+    let mut expected: toml::Value = toml::from_str(existing)?;
+    let build = expected
+        .get_mut("build")
+        .and_then(toml::Value::as_table_mut)
+        .context("Cargo config has no build table")?;
+    build.insert(
+        "rustdoc".to_string(),
+        toml::Value::String(shim_path.to_string()),
+    );
+    let actual: toml::Value = toml::from_str(&updated)?;
+    anyhow::ensure!(
+        actual == expected,
+        "could not safely set build.rustdoc; edit Cargo config manually"
+    );
+    Ok(updated)
 }
 
 /// Absolute path whose filename is `rustdoc`.
@@ -10197,16 +10395,32 @@ fn configure_cargo_rustdoc(
         }
         RustdocEdit::Skip | RustdocEdit::Already => return Ok(rustdoc_action(edit)),
     }
+    let cargo_path = cargo_config_target_path();
+    let existing = std::fs::read_to_string(&cargo_path).unwrap_or_default();
+    // A preview runs before the wrapper step writes `[build]`, so it can only
+    // check the edit when that step has nothing to add.
+    if check && wrapper_coming {
+        println!("    Would set build.rustdoc to {}", shim.display());
+        return Ok(rustdoc_action(edit));
+    }
+    let updated = match checked_rustdoc_edit(&existing, &shim.to_string_lossy()) {
+        Ok(updated) => updated,
+        Err(error) => {
+            println!(
+                "  • cargo doc: could not safely set build.rustdoc in {} ({error}); set it to {} manually",
+                cargo_path.display(),
+                shim.display()
+            );
+            return Ok(Some("manual"));
+        }
+    };
     if check {
         println!("    Would set build.rustdoc to {}", shim.display());
         return Ok(rustdoc_action(edit));
     }
-    let cargo_path = cargo_config_target_path();
-    let existing = std::fs::read_to_string(&cargo_path).unwrap_or_default();
     if backup_step(created, &cargo_path, true).is_some() {
         back_up_cargo_config(&cargo_path, &existing)?;
     }
-    let updated = apply_rustdoc_edit(&existing, &shim.to_string_lossy());
     if let Err(error) = std::fs::write(&cargo_path, updated) {
         println!("  • cargo doc: could not set build.rustdoc ({error})");
         return Ok(Some("failed"));
@@ -10519,7 +10733,7 @@ fn read_config_text(path: &std::path::Path) -> Result<String> {
     match std::fs::read_to_string(path) {
         Ok(text) => Ok(text),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
-        Err(error) => Err(error).context("read Kache configuration"),
+        Err(error) => Err(error).context("read kache configuration"),
     }
 }
 
@@ -10538,7 +10752,7 @@ fn save_target_recovery(path: &std::path::Path, existing: &str) -> Result<bool> 
         std::fs::create_dir_all(parent)?;
     }
     let permissions = std::fs::metadata(path).ok().map(|meta| meta.permissions());
-    crate::atomic::atomic_replace(path, updated.as_bytes()).context("save Kache configuration")?;
+    crate::atomic::atomic_replace(path, updated.as_bytes()).context("save kache configuration")?;
     if let Some(permissions) = permissions {
         std::fs::set_permissions(path, permissions)
             .context("keep the configuration's permissions")?;
@@ -10741,7 +10955,7 @@ pub fn init(yes: bool, no_service: bool, no_shell: bool, check: bool) -> Result<
             plan_rows.push((
                 "Service",
                 "login".into(),
-                "start Kache at login when a login service is available".into(),
+                "start kache at login when a login service is available".into(),
             ));
         }
         plan_rows.push((
@@ -10788,11 +11002,11 @@ pub fn init(yes: bool, no_service: bool, no_shell: bool, check: bool) -> Result<
         if check {
             println!("    Would configure Cargo. Existing compiler choices are preserved.");
             if let CargoWrapperPlan::Replace(old) = &plan {
-                println!("    Would replace {old} with Kache for Cargo builds.");
+                println!("    Would replace {old} with kache for Cargo builds.");
             }
         } else if match &plan {
             CargoWrapperPlan::Replace(old) => prompt_yes_no(
-                &format!("Replace {old} with Kache for Cargo builds?"),
+                &format!("Replace {old} with kache for Cargo builds?"),
                 true,
                 yes,
             )?,
@@ -10856,7 +11070,7 @@ pub fn init(yes: bool, no_service: bool, no_shell: bool, check: bool) -> Result<
         // the unit would fail, so start the daemon directly below (#1080).
         println!("  • Login service: unavailable (no systemd user session)");
     } else if let Some(problem) = service_problem {
-        println!("  \x1b[33m→\x1b[0m Background service: update to this Kache binary");
+        println!("  \x1b[33m→\x1b[0m Background service: update to this kache binary");
         println!("    {}", problem.detail());
         if !check {
             service_action_taken = install_login_service();
@@ -10867,7 +11081,7 @@ pub fn init(yes: bool, no_service: bool, no_shell: bool, check: bool) -> Result<
             service_path.as_ref().unwrap().display()
         );
     } else {
-        println!("  \x1b[33m→\x1b[0m Background service: start Kache when you log in");
+        println!("  \x1b[33m→\x1b[0m Background service: start kache when you log in");
         if !check {
             service_action_taken = install_login_service();
         }
@@ -11478,7 +11692,7 @@ fn stale_shims_check(dir: &std::path::Path, path: &std::ffi::OsStr) -> Option<Ch
         detail: format!(
             "no real compiler on PATH behind {} in {}",
             stale.join(", "),
-            dir.display()
+            term::home_path(dir)
         ),
         fix: Some("kache init --shims".into()),
     })
@@ -11575,7 +11789,7 @@ fn install_report_lines(
 ) -> Vec<String> {
     let note = (!target.stability.survives_upgrade()).then(|| {
         format!(
-            "Note: {}. Rerun kache init --shims after upgrading kache.",
+            "note: {}. Rerun `kache init --shims` after upgrading kache.",
             target.reason
         )
     });
@@ -11589,8 +11803,8 @@ fn install_report_lines(
         return lines;
     }
     let mut lines = vec![format!(
-        "Created {} shim(s) in {} -> {}",
-        report.created.len(),
+        "Created {} in {} -> {}",
+        term::counted(report.created.len() as u64, "shim", "shims"),
         dir.display(),
         target.path.display()
     )];
@@ -11598,28 +11812,48 @@ fn install_report_lines(
         lines.push(format!("  {}", report.created.join(", ")));
     }
     let groups = [
-        (&report.repaired, "Repaired", "broken shim(s)"),
-        (&report.refreshed, "Moved", "shim(s) off a versioned path"),
-        (&report.replaced, "Replaced", "existing entr(ies)"),
+        (
+            &report.repaired,
+            "Repaired",
+            ("broken shim", "broken shims"),
+            "",
+        ),
+        (
+            &report.refreshed,
+            "Moved",
+            ("shim", "shims"),
+            " off a versioned path",
+        ),
+        (
+            &report.replaced,
+            "Replaced",
+            ("existing entry", "existing entries"),
+            "",
+        ),
         (
             &report.pruned,
             "Removed",
-            "shim(s) with no compiler behind them",
+            ("shim", "shims"),
+            " with no compiler",
         ),
     ];
-    for (names, verb, what) in groups {
+    for (names, verb, (one, many), tail) in groups {
         if !names.is_empty() {
             lines.push(format!(
-                "{verb} {} {what}: {}",
-                names.len(),
+                "{verb} {}{tail}: {}",
+                term::counted(names.len() as u64, one, many),
                 names.join(", ")
             ));
         }
     }
     if !report.skipped.is_empty() {
         lines.push(format!(
-            "Skipped {} existing entr(ies): {} (use --force to replace)",
-            report.skipped.len(),
+            "Skipped {}: {} (use --force to replace)",
+            term::counted(
+                report.skipped.len() as u64,
+                "existing entry",
+                "existing entries"
+            ),
             report.skipped.join(", ")
         ));
     }
@@ -11915,13 +12149,13 @@ mod shim_install_tests {
             true,
         );
         let expected = [
-            "Created 1 shim(s) in /home/me/shims -> /opt/homebrew/opt/kache/bin/kache",
+            "Created 1 shim in /home/me/shims -> /opt/homebrew/opt/kache/bin/kache",
             "  cc",
-            "Repaired 2 broken shim(s): gcc, g++",
-            "Moved 1 shim(s) off a versioned path: clang",
-            "Replaced 1 existing entr(ies): c++",
-            "Removed 1 shim(s) with no compiler behind them: gcc-14",
-            "Skipped 1 existing entr(ies): gcc-13 (use --force to replace)",
+            "Repaired 2 broken shims: gcc, g++",
+            "Moved 1 shim off a versioned path: clang",
+            "Replaced 1 existing entry: c++",
+            "Removed 1 shim with no compiler: gcc-14",
+            "Skipped 1 existing entry: gcc-13 (use --force to replace)",
             "",
             "Add it to PATH ahead of your toolchain:",
             "  export PATH=\"/home/me/shims:$PATH\"",
@@ -11953,7 +12187,7 @@ mod shim_install_tests {
         let versioned = selection(kache_shims::Stability::Versioned);
         assert_eq!(
             super::install_report_lines(dir, &versioned, &current, true)[1],
-            "Note: Homebrew's opt link does not reach this binary. Rerun kache init --shims after upgrading kache."
+            "note: Homebrew's opt link does not reach this binary. Rerun `kache init --shims` after upgrading kache."
         );
         // Any change, or a directory left unmarked, keeps the full report.
         let lists: [fn(&mut kache_shims::Installed) -> &mut Vec<String>; 6] = [
@@ -11975,7 +12209,7 @@ mod shim_install_tests {
         }
         let unmarked = kache_shims::Installed::default();
         let lines = super::install_report_lines(dir, &stable, &unmarked, true);
-        assert!(lines[0].starts_with("Created 0 shim(s)"), "{lines:?}");
+        assert!(lines[0].starts_with("Created 0 shims"), "{lines:?}");
     }
 
     #[test]
@@ -11991,8 +12225,8 @@ mod shim_install_tests {
         assert_eq!(
             &lines[..3],
             [
-                "Created 0 shim(s) in /home/me/shims -> /opt/homebrew/opt/kache/bin/kache",
-                "Note: Homebrew's opt link does not reach this binary. Rerun kache init --shims after upgrading kache.",
+                "Created 0 shims in /home/me/shims -> /opt/homebrew/opt/kache/bin/kache",
+                "note: Homebrew's opt link does not reach this binary. Rerun `kache init --shims` after upgrading kache.",
                 "Left /home/me/shims without a .kache-shims marker: it holds files that are not kache links.",
             ]
         );

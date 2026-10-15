@@ -1373,7 +1373,7 @@ fn last_build_requires_recorded_events_and_conflicts_with_since() {
             .args([command, "--last-build"])
             .assert()
             .failure()
-            .stderr(predicates::str::contains("No recorded compiler events"));
+            .stderr(predicates::str::contains("no recorded compiler events"));
         e.cmd()
             .args([command, "--last-build", "--since", "24h"])
             .assert()
@@ -1506,7 +1506,7 @@ fn explain_reports_a_later_uncached_compile() {
     let output = e.cmd().args(["explain", "serde"]).output().unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("`serde` was compiled, not cached:"),
+        stdout.contains("`serde` was compiled, not cached."),
         "{stdout}"
     );
     assert!(!stdout.contains("entry is now cached"), "{stdout}");
@@ -2902,7 +2902,7 @@ fn init_saves_shell_setup_preserves_cargo_choices_and_is_idempotent() {
             .any(|backup| backup == "# user rc\nprintf 'user shell startup\\n'\n"),
         "{shell_backups:?}"
     );
-    assert!(output.contains("Replace sccache with Kache for Cargo builds?"));
+    assert!(output.contains("Replace sccache with kache for Cargo builds?"));
     assert_eq!(output.matches("[Y/n]").count(), 2, "{output}");
     assert!(!output.contains("Cache cargo doc as well?"));
     assert!(output.contains("Open a new terminal"));
@@ -3388,6 +3388,60 @@ fn init_adds_native_caching_to_an_existing_rust_setup() {
 
 #[cfg(unix)]
 #[test]
+fn init_preserves_a_commented_cargo_build_table() {
+    let e = env();
+    let cargo = e.home.join(".cargo/config.toml");
+    std::fs::create_dir_all(cargo.parent().unwrap()).unwrap();
+    let original = "[build] # compiler settings\nrustc-wrapper = \"kache\"\n\
+                    [env]\nHOST_CC = \"clang\"\nHOST_CXX = \"clang++\"\n\
+                    CC_KNOWN_WRAPPER_CUSTOM = \"kache\"\n";
+    toml::from_str::<toml::Value>(original).expect("valid original Cargo config");
+    std::fs::write(&cargo, original).unwrap();
+    e.cmd()
+        .args(["init", "--yes", "--no-service"])
+        .assert()
+        .success();
+    let edited = std::fs::read_to_string(&cargo).unwrap();
+    let parsed: toml::Value = toml::from_str(&edited).expect("init preserves valid Cargo config");
+    assert_eq!(parsed["build"]["rustc-wrapper"].as_str(), Some("kache"));
+    let rustdoc = parsed["build"]["rustdoc"].as_str().unwrap();
+    let rustdoc = Path::new(rustdoc);
+    assert!(rustdoc.is_absolute());
+    assert_eq!(rustdoc.file_name().unwrap(), "rustdoc");
+    assert!(rustdoc.is_file());
+    assert!(edited.contains("[build] # compiler settings"));
+    assert_eq!(parsed["env"]["HOST_CC"].as_str(), Some("clang"));
+}
+
+#[cfg(unix)]
+#[test]
+fn init_preserves_cargo_config_when_the_rustdoc_text_edit_is_unsafe() {
+    let e = env();
+    let cargo = e.home.join(".cargo/config.toml");
+    std::fs::create_dir_all(cargo.parent().unwrap()).unwrap();
+    let original = "[ build ]\nrustc-wrapper = \"kache\"\n\
+                    [env]\nHOST_CC = \"clang\"\nHOST_CXX = \"clang++\"\n\
+                    CC_KNOWN_WRAPPER_CUSTOM = \"kache\"\n";
+    toml::from_str::<toml::Value>(original).expect("valid original Cargo config");
+    std::fs::write(&cargo, original).unwrap();
+
+    for mode in ["--yes", "--check"] {
+        e.cmd()
+            .args(["init", mode, "--no-service"])
+            .assert()
+            .success()
+            .stdout(
+                predicates::str::contains("could not safely set build.rustdoc")
+                    .and(predicates::str::contains(cargo.display().to_string()))
+                    .and(predicates::str::contains("set it to")),
+            );
+
+        assert_eq!(std::fs::read_to_string(&cargo).unwrap(), original);
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn init_check_does_not_write_build_rustdoc() {
     let e = env();
     let cargo = e.home.join(".cargo/config.toml");
@@ -3474,7 +3528,7 @@ fn daemon_without_subcommand_succeeds() {
 
 #[test]
 fn daemon_status_subcommand_succeeds() {
-    // `kache daemon status` is the explicit alias for bare `kache daemon`.
+    // `kache daemon status` does the same as bare `kache daemon`.
     // Pin the equivalence: both forms must exit identically and produce
     // byte-identical stdout in the same environment.
     let e = env();
@@ -3484,8 +3538,36 @@ fn daemon_status_subcommand_succeeds() {
     assert_eq!(explicit.status, bare.status);
     assert_eq!(explicit.stdout, bare.stdout);
     let stdout = String::from_utf8_lossy(&bare.stdout);
-    assert!(stdout.contains("kache:"), "status body missing: {stdout}");
-    assert!(stdout.contains("Daemon:"), "daemon state missing: {stdout}");
+    assert!(stdout.contains("  CLI "), "status body missing: {stdout}");
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.starts_with("  Daemon ") && line.contains("not running")),
+        "daemon state missing: {stdout}"
+    );
+}
+
+/// kache-action looks for `<KACHE_RUNTIME_DIR>/daemon.sock`, spelled out in
+/// full, in `kache daemon status` to tell whether a release honors the
+/// runtime directory. On GitHub runners that directory is under $HOME, so the
+/// socket must not be shortened to `~`.
+#[test]
+fn daemon_status_spells_out_the_socket_path_under_home() {
+    let e = env();
+    let runtime = e.home.join("work/_temp/kache");
+    std::fs::create_dir_all(&runtime).unwrap();
+    let out = e
+        .cmd()
+        .args(["daemon", "status"])
+        .env("KACHE_RUNTIME_DIR", &runtime)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let socket = runtime.join("daemon.sock");
+    assert!(
+        stdout.contains(&socket.display().to_string()),
+        "{socket:?} not in {stdout}"
+    );
 }
 
 // ── populated-cache behavior ────────────────────────────────────────────────
@@ -3571,7 +3653,7 @@ fn commands_operate_on_a_populated_cache() {
         .success()
         .stdout(predicates::str::contains("kachetestlib"))
         .stdout(predicates::str::contains(
-            "Diagnosis: first build with these inputs -- entry is now cached",
+            "\nDiagnosis\n  first build with these inputs: the entry is now cached\n",
         ));
 
     // Listing the specific crate reaches the same populated non-TTY renderer.
@@ -3592,8 +3674,8 @@ fn commands_operate_on_a_populated_cache() {
 
 /// A source edit between builds changes the cache key, so the second build is a
 /// fresh miss with a *different* key than the first entry. `why-miss` should
-/// then take its key-mismatch diagnosis path (why_miss_diff_entries) and the
-/// "Key changed" hint — the richest part of the command.
+/// then take its key-mismatch diagnosis path and list what differs between
+/// the stored entries, the richest part of the command.
 #[test]
 fn why_miss_reports_key_mismatch_after_source_edit() {
     let e = env();
@@ -3637,10 +3719,10 @@ fn why_miss_reports_key_mismatch_after_source_edit() {
         .args(["why-miss", "kachediff"])
         .assert()
         .success()
-        .stdout(predicates::str::contains("Why `kachediff` missed"))
-        .stdout(predicates::str::contains("Diagnosis: key mismatch"))
+        .stdout(predicates::str::contains("kache · explain · kachediff"))
+        .stdout(predicates::str::contains("\nDiagnosis\n  key mismatch: "))
         .stdout(predicates::str::contains(format!(
-            "same config as {} -- likely source code, dependency, or rustc version change",
+            "same config as {}: likely a source, dependency or rustc version change",
             &first_key[..12],
         )));
 
@@ -3693,7 +3775,7 @@ fn why_miss_compares_features_from_a_volume_shard() {
         .assert()
         .success()
         .stdout(predicates::str::contains("different features vs"))
-        .stdout(predicates::str::contains("    features: default, new"))
+        .stdout(predicates::str::contains("  Features   default, new"))
         .stdout(predicates::str::contains(shard.display().to_string()));
     let output = e
         .cmd()
@@ -3719,17 +3801,14 @@ fn why_miss_legacy_repeated_same_key_does_not_claim_key_mismatch() {
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("Diagnosis: repeated miss for the same cache key"),
+        stdout.contains("\nDiagnosis\n  repeated miss for the same cache key\n"),
         "stdout: {stdout}"
     );
     assert!(
         stdout.contains("the miss was not caused by a cache-key change"),
         "stdout: {stdout}"
     );
-    assert!(
-        !stdout.contains("Diagnosis: key mismatch"),
-        "stdout: {stdout}"
-    );
+    assert!(!stdout.contains("key mismatch"), "stdout: {stdout}");
 }
 
 #[test]
@@ -3745,7 +3824,7 @@ fn why_miss_legacy_different_keys_remain_a_cold_miss() {
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("Diagnosis: never cached -- first build of this crate"),
+        stdout.contains("\nDiagnosis\n  never cached: first build of this crate\n"),
         "stdout: {stdout}"
     );
     assert!(
@@ -4073,8 +4152,9 @@ fn doctor_repair_drops_entries_with_unparseable_metadata() {
         .assert()
         .success()
         .stdout(predicates::str::contains(format!(
-            "Repairing: removed {} entries that failed verification.",
-            metas.len()
+            "Repairing: removed {} {} that failed verification.",
+            metas.len(),
+            if metas.len() == 1 { "entry" } else { "entries" }
         )));
     e.cmd()
         .arg("list")
@@ -4263,8 +4343,8 @@ fn why_miss_both_formats_prioritize_store_failure_over_lookup_and_cold_history()
         .success()
         .stdout(predicates::str::contains("NOT CACHED"))
         .stdout(predicates::str::contains("disk full"))
-        .stdout(predicates::str::contains("Diagnosis: never cached").not())
-        .stdout(predicates::str::contains("Diagnosis: matching key").not());
+        .stdout(predicates::str::contains("never cached").not())
+        .stdout(predicates::str::contains("matching key").not());
     let output = e
         .cmd()
         .args(["--json", "why-miss", "example"])
@@ -4302,8 +4382,8 @@ fn why_miss_both_formats_include_unresolved_dependency_cascade() {
         .args(["why-miss", "example"])
         .assert()
         .success()
-        .stdout(predicates::str::contains("Dependency cascade:"))
-        .stdout(predicates::str::contains("unresolved: dep"));
+        .stdout(predicates::str::contains("\nDependency cascade\n"))
+        .stdout(predicates::str::contains("  unresolved: dep, "));
     let output = e
         .cmd()
         .args(["--json", "why-miss", "example"])
@@ -4397,14 +4477,14 @@ fn why_miss_compares_a_second_checkout_with_the_first() {
         .assert()
         .success()
         .stdout(predicates::str::contains(
-            "Other build tree: no earlier build of this crate in /checkouts/b",
+            "\nOther build tree\n  no earlier build of this crate in /checkouts/b\n",
         ))
         .stdout(predicates::str::contains(
             "compared with the same unit built in: /checkouts/a",
         ))
         .stdout(predicates::str::contains("dependencies differ: mid"))
         .stdout(predicates::str::contains(
-            "root: leaf -- own inputs changed: env_deps",
+            "root: leaf, its own inputs changed: env_deps",
         ))
         .stdout(predicates::str::contains("via: app <- mid <- leaf"));
 
@@ -4459,7 +4539,7 @@ fn why_miss_reports_a_path_only_root_across_checkouts() {
         .assert()
         .success()
         .stdout(predicates::str::contains(
-            "root: leaf -- same key in both build trees, but its artifact differs",
+            "root: leaf, same key in both build trees but its artifact differs",
         ));
     e.cmd()
         .args(["why-miss", "leaf"])

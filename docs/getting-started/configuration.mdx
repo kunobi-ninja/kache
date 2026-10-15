@@ -179,7 +179,7 @@ kache clean --stale 14d --dry-run
 kache clean --stale 14d --yes
 ```
 
-Targets of deleted worktrees are offered at any age. `kache clean --orphans --yes` removes only those, which suits a hook that runs after `git worktree remove`.
+Targets of deleted worktrees are offered at any age. The daemon removes them a day after their last build (`auto_clean_orphaned_targets`). `kache clean --orphans --yes` removes only those, right away, which suits a hook that runs after `git worktree remove`.
 
 If enforcing the store namespace limit matters more than retaining hits, let GC evict shared entries:
 

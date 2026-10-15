@@ -225,7 +225,7 @@ fn real_cargo_program(shimmed: bool) -> Result<PathBuf> {
             crate::compiler::shim::resolve_real_compiler_from_env("cargo")
                 .map(PathBuf::into_os_string)
         })
-        .context("finding Cargo behind the Kache shim")?;
+        .context("finding Cargo behind the kache shim")?;
     let cwd = std::env::current_dir().context("resolving the Cargo working directory")?;
     resolve_cargo_program(&program, &cwd)
 }

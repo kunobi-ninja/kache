@@ -133,12 +133,13 @@ pub const VERSION: &str = {
     }
 };
 
-/// kache: Content-addressed build cache for Rust, C/C++ and more, with S3 and filesystem remotes.
+/// Compiler cache for Rust, C/C++ and CUDA, with S3, GCS, shared-filesystem
+/// and OCI remotes
 ///
-/// When invoked as RUSTC_WRAPPER (arg[1] is a path to rustc), kache acts as a
-/// transparent build cache. Otherwise, it provides CLI commands for cache management.
+/// kache runs in front of rustc and the C/C++ compilers, so builds use the
+/// cache without changing how you run them.
 #[derive(Parser)]
-#[command(name = "kache", version = VERSION, about = "Cache Cargo and C/C++ builds; inspect saved time and disk use", styles = term::clap_styles(), after_help = "Start with kache init. Keep using cargo as usual.\nUse kache stats for a summary or kache monitor for live activity.")]
+#[command(name = "kache", version = VERSION, styles = term::clap_styles(), after_help = "Start with `kache init`. Keep using cargo as usual.\nUse `kache stats` for a summary or `kache monitor` for live activity.")]
 pub(crate) struct Cli {
     /// Machine-readable JSON on stdout, on commands that support it
     #[arg(long, global = true)]
@@ -226,9 +227,9 @@ enum Commands {
         #[arg(long)]
         cache: bool,
 
-        /// Only targets whose worktree or workspace no longer exists, however
+        /// Only targets whose worktree or workspace was deleted, however
         /// recently they were built
-        #[arg(long, hide = true, conflicts_with_all = ["stale", "cache", "crate_name"])]
+        #[arg(long, conflicts_with_all = ["stale", "cache", "crate_name"])]
         orphans: bool,
 
         /// With --cache: the same, kept for older scripts
@@ -384,7 +385,7 @@ enum Commands {
         command: Option<DaemonCommands>,
     },
 
-    /// Live dashboard of builds and the cache
+    /// Watch builds and the cache live
     #[command(display_order = 12)]
     Monitor {
         /// Preload events from this window (e.g. 15m, 2h, 7d; a bare number
@@ -393,7 +394,7 @@ enum Commands {
         since: Option<String>,
     },
 
-    /// Hit rate, time saved and cache size; --full for the whole report
+    /// Show hit rate, time saved and cache size; --full for the whole report
     #[command(display_order = 10, visible_alias = "status")]
     Stats {
         /// Event window (e.g. 15m, 2h, 7d; a bare number is hours)
@@ -439,7 +440,8 @@ enum Commands {
         redact: bool,
     },
 
-    /// Write cache counters as OTLP JSON for Kartero to import later
+    /// Write cache counters as OTLP JSON, or send build timelines to the
+    /// planner
     #[command(hide = true)]
     Telemetry {
         #[command(subcommand)]
@@ -615,17 +617,18 @@ enum TargetCommands {
 
 #[derive(Subcommand)]
 enum DaemonCommands {
-    /// Show daemon status (alias for bare `kache daemon`)
+    /// Show daemon status (also bare `kache daemon`)
     Status,
     /// Run the daemon server in the foreground
     Run,
-    /// Start daemon in background (returns immediately)
+    /// Start the daemon in the background and wait until it is ready
     Start,
     /// Stop a running daemon
     Stop,
-    /// Restart daemon (via launchd/systemd if installed, else manual stop+start)
+    /// Restart the daemon, through its login service when one is installed
     Restart,
-    /// Install daemon as a system service (launchd/systemd)
+    /// Install the daemon as a per-user login service (launchd, systemd user
+    /// unit, Task Scheduler)
     Install,
     /// Remove the daemon service
     Uninstall,
@@ -646,7 +649,7 @@ enum TelemetryCommands {
         #[arg(long, value_enum)]
         phase: Option<BenchPhase>,
     },
-    /// Send build timeline records for finished builds to the service
+    /// Send build timeline records for finished builds to the planner
     Push {
         /// Send every session still in the logs, not just the last build
         #[arg(long, conflicts_with = "session")]
@@ -2658,7 +2661,6 @@ mod tests {
         for hidden in [
             "install-shims",
             "save-manifest",
-            "--orphans",
             "--tracked",
             "--stale-schema",
         ] {

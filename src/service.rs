@@ -196,7 +196,11 @@ fn systemd_user_manager_reachable() -> bool {
 pub fn install() -> Result<()> {
     let selection = kache_shims::detect().context("locating the kache binary")?;
     for line in selection_lines(&selection) {
-        println!("{line}");
+        if line.starts_with("warning:") {
+            eprintln!("{line}");
+        } else {
+            println!("{line}");
+        }
     }
     let exe = selection.path;
 
@@ -221,11 +225,11 @@ fn selection_lines(selection: &kache_shims::Selection) -> Vec<String> {
     )];
     match selection.stability {
         kache_shims::Stability::Versioned => lines.push(format!(
-            "  Note: {}. Rerun `kache daemon install` after upgrading kache.",
+            "note: {}. Rerun `kache daemon install` after upgrading kache.",
             selection.reason
         )),
         kache_shims::Stability::Unverified => lines.push(format!(
-            "  Warning: {}. The service may run as a user who cannot reach this path.",
+            "warning: {}. The service may run as a user who cannot reach this path.",
             selection.reason
         )),
         _ => {}
@@ -613,6 +617,16 @@ pub(crate) enum StartupLog {
     Discarded,
 }
 
+impl StartupLog {
+    /// The log for people to read: a file under home starts with `~`.
+    fn human(&self) -> String {
+        match self {
+            Self::File(path) => term::home_path(path),
+            other => other.to_string(),
+        }
+    }
+}
+
 impl std::fmt::Display for StartupLog {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -967,27 +981,7 @@ pub fn status(json: bool) -> Result<()> {
         .and_then(|path| path.file_name().and_then(|name| name.to_str()))
         == Some(LEGACY_PLIST_NAME);
 
-    if !json {
-        println!("{}\n", term::heading("kache · daemon"));
-        println!("{}", term::heading("Status"));
-        // 0. Binary version (always shown)
-        println!(
-            "  kache:    v{} (epoch {})",
-            crate::VERSION,
-            crate::daemon::build_epoch(),
-        );
-
-        // 1. Service file installed?
-        for line in format_service_line(
-            installed_service_path.as_deref(),
-            legacy_service_installed,
-            service_path.is_some(),
-        ) {
-            println!("{line}");
-        }
-    }
-
-    // 2. Daemon running? (check IPC socket / named pipe)
+    // Daemon running? (check IPC socket / named pipe)
     let running = if let Some(ref cfg) = config {
         crate::transport::is_reachable(&cfg.socket_path())
     } else {
@@ -1053,68 +1047,90 @@ pub fn status(json: bool) -> Result<()> {
         );
     }
 
-    if running {
-        println!("  Daemon:   \x1b[32mrunning\x1b[0m");
-    } else {
-        println!("  Daemon:   \x1b[31mnot running\x1b[0m");
-    }
+    let mut status_rows = vec![("CLI", format!("v{}", crate::VERSION), String::new())];
+    status_rows.push(daemon_row(
+        running,
+        daemon_stats.as_ref().map(|stats| stats.version.as_str()),
+        crate::VERSION,
+    ));
+    status_rows.extend(format_service_line(
+        installed_service_path.as_deref(),
+        legacy_service_installed,
+        service_path.is_some(),
+    ));
 
-    // 3. Socket path
-    println!("\n{}", term::heading("Runtime"));
+    let mut runtime_rows = Vec::new();
     if let Some(ref cfg) = config {
-        println!("  Socket:   {}", cfg.socket_path().display());
+        // Spelled out in full, never with `~`: kache-action finds
+        // `<KACHE_RUNTIME_DIR>/daemon.sock` in this output to tell whether the
+        // release honors the runtime directory, and GitHub runners keep that
+        // directory under $HOME.
+        runtime_rows.push((
+            "Socket",
+            cfg.socket_path().display().to_string(),
+            String::new(),
+        ));
     }
-
-    // 4. Log location
     let diag = crate::diagnostic_log_path();
     if diag.exists() {
-        println!("  Logs:     {}", diag.display());
+        runtime_rows.push(("Logs", term::home_path(&diag), String::new()));
     } else if cfg!(target_os = "macos") {
-        println!("  Logs:     {}", log_dir().join("err.log").display());
+        runtime_rows.push((
+            "Logs",
+            term::home_path(&log_dir().join("err.log")),
+            String::new(),
+        ));
     } else if cfg!(target_os = "linux") {
-        println!("  Logs:     journalctl --user -u {UNIT_NAME}");
+        runtime_rows.push((
+            "Logs",
+            format!("journalctl --user -u {UNIT_NAME}"),
+            String::new(),
+        ));
     }
     if let Some(ref cfg) = config {
-        println!(
-            "  Startup:  {} (why a daemon failed to start)",
-            startup_log(cfg)
-        );
+        runtime_rows.push((
+            "Startup",
+            startup_log(cfg).human(),
+            "why a daemon failed to start".into(),
+        ));
+    }
+    // The config file the DAEMON loaded (kunobi-ninja/kache#689), not
+    // necessarily the one this invocation resolves, which is what
+    // `kache stats` warns about when the two disagree on rendered values.
+    runtime_rows.extend(format_config_status(
+        daemon_stats
+            .as_ref()
+            .and_then(|stats| stats.effective_config.as_ref())
+            .map(|effective| effective.config_path.as_str()),
+    ));
+
+    println!("{}\n", term::heading("kache · daemon"));
+    for line in term::named_sections(&[("Status", status_rows), ("Runtime", runtime_rows)]) {
+        println!("{line}");
     }
 
-    // 5. Daemon version check
-    if let Some(stats) = daemon_stats.as_ref() {
-        for line in format_version_status(&stats.version, crate::VERSION) {
-            println!("{line}");
-        }
-        // The config file the DAEMON loaded (kunobi-ninja/kache#689) — not
-        // necessarily the one this invocation resolves, which is what
-        // `kache stats` warns about when the two disagree on rendered values.
-        if let Some(line) = format_config_status(
-            stats
-                .effective_config
-                .as_ref()
-                .map(|effective| effective.config_path.as_str()),
-        ) {
-            println!("{line}");
-        }
-    }
-
-    // 6. Recorded binary warning
     if let Some(problem) = exe_problem {
-        println!();
-        println!("  \x1b[33mWarning: {}\x1b[0m", problem.detail());
-        println!("    run `kache daemon install` to update");
+        eprintln!(
+            "warning: {}; run `kache daemon install` to update",
+            problem.detail()
+        );
     }
 
     println!();
     Ok(())
 }
 
-fn format_config_status(config_path: Option<&str>) -> Option<String> {
-    config_path.map(|path| format!("  Config:   {path} (loaded by the daemon)"))
+fn format_config_status(config_path: Option<&str>) -> Option<term::Row<'static>> {
+    config_path.map(|path| {
+        (
+            "Config",
+            term::home_path(Path::new(path)),
+            "loaded by the daemon".to_string(),
+        )
+    })
 }
 
-/// Format the "Service:" line(s) for `status`: installed (with an optional
+/// The "Service" row(s) for `status`: installed (with an optional
 /// legacy-label migration note), not-installed (with a setup hint), or
 /// unsupported-platform. Pure so the branches are testable without an installed
 /// service file.
@@ -1122,67 +1138,73 @@ fn format_service_line(
     installed_path: Option<&Path>,
     legacy: bool,
     supported: bool,
-) -> Vec<String> {
+) -> Vec<term::Row<'static>> {
     if let Some(path) = installed_path {
-        let mut lines = term::rows(&[(
+        let mut rows = vec![(
             "Service",
             term::paint("installed", term::Style::Success),
             term::home_path(path),
-        )]);
+        )];
         if legacy {
-            lines.push(format!(
-                "            \x1b[33mlegacy label detected — run `kache daemon install` to migrate to {LABEL}\x1b[0m"
+            rows.push((
+                "",
+                term::paint("legacy label", term::Style::Warning),
+                format!("run `kache daemon install` to migrate to {LABEL}"),
             ));
         }
-        lines
+        rows
     } else if supported {
-        term::rows(&[
-            (
-                "Service",
-                term::paint("not installed", term::Style::Warning),
-                String::new(),
-            ),
-            (
-                "",
-                String::new(),
-                "run `kache daemon install` to set up".into(),
-            ),
-        ])
+        vec![(
+            "Service",
+            term::paint("not installed", term::Style::Warning),
+            "run `kache daemon install` to set up".into(),
+        )]
     } else {
-        term::rows(&[(
+        vec![(
             "Service",
             term::paint("unsupported platform", term::Style::Muted),
             String::new(),
-        )])
+        )]
     }
 }
 
-/// Report release differences without inferring an upgrade from file timestamps.
-fn format_version_status(daemon_version: &str, my_version: &str) -> Vec<String> {
-    let (label, style, note) =
-        match crate::daemon::compare_daemon_version(my_version, daemon_version) {
-            Some(std::cmp::Ordering::Equal) => (
-                format!("v{daemon_version}"),
-                term::Style::Success,
-                String::new(),
-            ),
-            Some(std::cmp::Ordering::Greater) => (
-                format!("v{daemon_version}"),
-                term::Style::Warning,
-                format!("binary is v{my_version}; upgrade available"),
-            ),
-            Some(std::cmp::Ordering::Less) => (
-                format!("v{daemon_version}"),
-                term::Style::Success,
-                format!("binary is v{my_version}; newer daemon retained"),
-            ),
-            None => (
-                "unknown".into(),
-                term::Style::Warning,
-                "automatic upgrade disabled".into(),
-            ),
-        };
-    term::rows(&[("Version", term::paint(label, style), note)])
+/// The "Daemon" row for `status`: whether it runs and its release next to
+/// the CLI's, without inferring an upgrade from file timestamps.
+fn daemon_row(
+    running: bool,
+    daemon_version: Option<&str>,
+    cli_version: &str,
+) -> term::Row<'static> {
+    if !running {
+        return (
+            "Daemon",
+            term::paint("not running", term::Style::Error),
+            "start it with `kache daemon start`".into(),
+        );
+    }
+    let Some(daemon_version) = daemon_version else {
+        return (
+            "Daemon",
+            term::paint("running", term::Style::Success),
+            String::new(),
+        );
+    };
+    let (style, note) = match crate::daemon::compare_daemon_version(cli_version, daemon_version) {
+        Some(std::cmp::Ordering::Equal) => (term::Style::Success, format!("v{daemon_version}")),
+        Some(std::cmp::Ordering::Greater) => (
+            term::Style::Warning,
+            format!("v{daemon_version}; upgrade to v{cli_version} available"),
+        ),
+        Some(std::cmp::Ordering::Less) => (
+            term::Style::Success,
+            format!("v{daemon_version}; newer than the CLI, kept"),
+        ),
+        None => (
+            term::Style::Warning,
+            "version unknown; automatic upgrade disabled".into(),
+        ),
+    };
+    ("Daemon", term::paint("running", style), note)
 }
 
 /// Extract the executable path from a service file.
@@ -1744,7 +1766,7 @@ WantedBy=default.target
         selection.stability = kache_shims::Stability::Unverified;
         let lines = selection_lines(&selection);
         assert_eq!(lines.len(), 2);
-        assert!(lines[1].starts_with("  Warning: "), "{lines:?}");
+        assert!(lines[1].starts_with("warning: "), "{lines:?}");
         assert!(
             lines[1].contains("may run as a user who cannot reach"),
             "{lines:?}"
@@ -1804,49 +1826,76 @@ WantedBy=default.target
     #[test]
     fn test_format_service_line_all_states() {
         // Installed, no legacy -> one green line.
-        let installed = format_service_line(Some(Path::new("/x/kache.plist")), false, true);
-        assert_eq!(installed.len(), 1);
-        assert!(installed[0].contains("installed") && installed[0].contains("/x/kache.plist"));
+        let installed = term::rows(&format_service_line(
+            Some(Path::new("/x/kache.plist")),
+            false,
+            true,
+        ));
+        assert_eq!(installed, ["  Service   installed   /x/kache.plist"]);
 
         // Installed + legacy -> adds the migration note.
-        let legacy = format_service_line(Some(Path::new("/x/old.plist")), true, true);
+        let legacy = term::rows(&format_service_line(
+            Some(Path::new("/x/old.plist")),
+            true,
+            true,
+        ));
         assert_eq!(legacy.len(), 2);
-        assert!(legacy[1].contains("legacy label detected"));
+        assert!(legacy[1].contains("legacy label"));
+        assert!(legacy[1].ends_with(&format!("to migrate to {LABEL}")));
 
-        // Not installed but supported -> not-installed + setup hint.
-        let not = format_service_line(None, false, true);
-        assert_eq!(not.len(), 2);
-        assert!(not[0].contains("not installed"));
-        assert!(not[1].contains("kache daemon install"));
+        // Not installed but supported -> not-installed with a setup hint.
+        let not = term::rows(&format_service_line(None, false, true));
+        assert_eq!(
+            not,
+            ["  Service   not installed   run `kache daemon install` to set up"]
+        );
 
         // Unsupported platform -> single line.
-        let unsup = format_service_line(None, false, false);
-        assert_eq!(unsup.len(), 1);
-        assert!(unsup[0].contains("unsupported platform"));
+        let unsup = term::rows(&format_service_line(None, false, false));
+        assert_eq!(unsup, ["  Service   unsupported platform"]);
     }
 
     #[test]
-    fn version_status_reports_releases_without_pending_restart_claims() {
+    fn the_daemon_row_names_its_state_and_release_once() {
         for (daemon, expected) in [
-            ("", "unknown"),
-            ("1.2.3+build.2", "v1.2.3+build.2"),
-            ("1.2.2", "upgrade available"),
-            ("1.3.0", "newer daemon retained"),
+            ("", "running   version unknown; automatic upgrade disabled"),
+            ("1.2.3+build.2", "running   v1.2.3+build.2"),
+            (
+                "1.2.2",
+                "running   v1.2.2; upgrade to v1.2.3+build.1 available",
+            ),
+            ("1.3.0", "running   v1.3.0; newer than the CLI, kept"),
         ] {
-            let lines = format_version_status(daemon, "1.2.3+build.1");
-            assert_eq!(lines.len(), 1);
-            assert!(lines[0].contains(expected), "{lines:?}");
-            assert!(!lines[0].contains("restart is pending"));
+            let lines = term::rows(&[daemon_row(true, Some(daemon), "1.2.3+build.1")]);
+            assert_eq!(lines, [format!("  Daemon   {expected}")]);
         }
+        assert_eq!(
+            term::rows(&[daemon_row(true, None, "1.2.3")]),
+            ["  Daemon   running"]
+        );
+        assert_eq!(
+            term::rows(&[daemon_row(false, Some("1.2.3"), "1.2.3")]),
+            ["  Daemon   not running   start it with `kache daemon start`"]
+        );
     }
 
     #[test]
     fn test_format_config_status_requires_a_daemon_report() {
         assert_eq!(
-            format_config_status(Some("/daemon/config.toml")).as_deref(),
-            Some("  Config:   /daemon/config.toml (loaded by the daemon)")
+            term::rows(&[format_config_status(Some("/daemon/config.toml")).unwrap()]),
+            ["  Config   /daemon/config.toml   loaded by the daemon"]
         );
         assert!(format_config_status(None).is_none());
+    }
+
+    #[test]
+    fn a_startup_log_file_is_shown_like_other_paths() {
+        let path = PathBuf::from("/var/run/kache/daemon.log");
+        assert_eq!(
+            StartupLog::File(path.clone()).human(),
+            term::home_path(&path)
+        );
+        assert_eq!(StartupLog::Journal.human(), StartupLog::Journal.to_string());
     }
 
     #[test]

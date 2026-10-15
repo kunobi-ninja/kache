@@ -1285,7 +1285,7 @@ fn last_build_does_not_fall_back_to_an_older_known_root() {
         select_last_build(&mut Vec::new())
             .unwrap_err()
             .to_string()
-            .contains("No recorded")
+            .contains("no recorded compiler events")
     );
     let mut events = vec![
         session_event("/repo", "known", 0, 0),
@@ -1370,7 +1370,12 @@ fn last_build_report_uses_retained_history_and_omits_unscoped_data() {
             last_build: true,
         },
     );
-    assert!(absent.unwrap_err().to_string().contains("No recorded"));
+    assert!(
+        absent
+            .unwrap_err()
+            .to_string()
+            .contains("no recorded compiler events")
+    );
 }
 
 #[test]
@@ -1791,24 +1796,24 @@ fn text_markdown_and_github_reports_show_the_wrapper_phases() {
     // Percentages are of tracked wrapper time: 40 + 500 = 540 ms.
     let md = format_markdown(&report);
     for row in [
-        "| Startup | ~7ms | 1.3% |",
-        "| Key computation | ~30ms | 5.6% |",
-        "| &nbsp;&nbsp;of which dep-info pre-pass (2 runs) | ~15ms | 2.8% |",
-        "| Lookup | ~3ms | 0.6% |",
-        "| Scheduler wait (flight ~7ms, permit ~11ms) | ~18ms | 3.3% |",
-        "| Restore | ~5ms | 0.9% |",
-        "| Store | ~30ms | 5.6% |",
-        "| Unattributed | ~47ms | 8.7% |",
+        "| Startup | 7 ms | 1.3% |",
+        "| Key computation | 30 ms | 5.6% |",
+        "| &nbsp;&nbsp;of which dep-info pre-pass (2 runs) | 15 ms | 2.8% |",
+        "| Lookup | 3 ms | 0.6% |",
+        "| Scheduler wait (flight 7 ms, permit 11 ms) | 18 ms | 3.3% |",
+        "| Restore | 5 ms | 0.9% |",
+        "| Store | 30 ms | 5.6% |",
+        "| Unattributed | 47 ms | 8.7% |",
     ] {
         assert!(md.contains(row), "markdown is missing {row:?}:\n{md}");
     }
 
     let gh = format_github(&report);
     for row in [
-        "| Startup | ~7ms aggregate (avg 3.5ms/crate) |",
-        "| Dep-info pre-pass | 2 runs, ~15ms aggregate (avg 7.5ms/run) |",
-        "| Scheduler wait | ~18ms aggregate (flight ~7ms, permit ~11ms) |",
-        "| Unattributed | ~47ms aggregate (avg 23.5ms/crate) |",
+        "| Startup | 7 ms aggregate (avg 3.5 ms/crate) |",
+        "| Dep-info pre-pass | 2 runs, 15 ms aggregate (avg 7.5 ms/run) |",
+        "| Scheduler wait | 18 ms aggregate (flight 7 ms, permit 11 ms) |",
+        "| Unattributed | 47 ms aggregate (avg 23.5 ms/crate) |",
     ] {
         assert!(gh.contains(row), "github is missing {row:?}:\n{gh}");
     }
@@ -2801,7 +2806,7 @@ fn render_network_and_error_sections_with_all_optional_fields() {
             "zero observed span must render the legacy-event fallback: {rendered}"
         );
         assert!(
-            lower.contains("import lock wait 35ms"),
+            lower.contains("import lock wait 35 ms"),
             "isolated import-lock timing must render the phase row: {rendered}"
         );
     }
@@ -3031,6 +3036,18 @@ fn test_bypass_reason_defaults_to_unknown() {
     assert_eq!(bypass_reason(&e), "unknown");
     e.passthrough_reason = "  linker invocation  ".to_string();
     assert_eq!(bypass_reason(&e), "linker invocation");
+    e.skip_reason = "  admission-threshold  ".to_string();
+    assert_eq!(bypass_reason(&e), "linker invocation");
+    e.result = EventResult::Skipped;
+    assert_eq!(
+        bypass_reason(&e),
+        "admission-threshold",
+        "skipped events must preserve their dedicated admission reason"
+    );
+    e.skip_reason = "  ".to_string();
+    assert_eq!(bypass_reason(&e), "linker invocation");
+    e.passthrough_reason.clear();
+    assert_eq!(bypass_reason(&e), "unknown");
 }
 
 #[test]
@@ -3043,7 +3060,8 @@ fn test_build_bypass_analysis_counts_groups_and_sorts() {
     fallback.fallback = true;
 
     let mut skipped = test_event("c", EventResult::Skipped, 5, 0, 0, "k");
-    skipped.passthrough_reason = "disabled".to_string();
+    skipped.skip_reason = "admission-threshold".to_string();
+    skipped.exit_code = Some(0);
 
     // A non-bypass event must be ignored entirely.
     let miss = test_event("d", EventResult::Miss, 999, 0, 0, "k");
@@ -3055,8 +3073,24 @@ fn test_build_bypass_analysis_counts_groups_and_sorts() {
     assert_eq!(analysis.fallbacks, 1);
     assert_eq!(analysis.direct_passthroughs, 1);
     // "linker" appears under two different routes (direct + fallback), so it
-    // groups into two reason rows; "disabled" is a third.
+    // groups into two reason rows; "admission-threshold" is a third.
     assert_eq!(analysis.reasons.len(), 3);
+    let skipped_row = analysis
+        .slowest
+        .iter()
+        .find(|row| row.crate_name == "c")
+        .unwrap();
+    assert_eq!(skipped_row.reason, "admission-threshold");
+    assert_eq!(skipped_row.result, "skipped");
+    assert_eq!(skipped_row.route, "skipped");
+    assert_eq!(skipped_row.exit_code, Some(0));
+    let skipped_reason = analysis
+        .reasons
+        .iter()
+        .find(|row| row.route == "skipped")
+        .unwrap();
+    assert_eq!(skipped_reason.reason, "admission-threshold");
+    assert_eq!(skipped_reason.count, 1);
     // Slowest-first ordering: the 50ms fallback leads.
     assert_eq!(analysis.slowest.first().unwrap().elapsed_ms, 50);
     assert!(analysis.slowest.iter().all(|d| d.crate_name != "d"));
@@ -4037,6 +4071,21 @@ fn redaction_terms_skip_roots_that_would_erase_every_path() {
         .filter(|term| term.starts_with("/srv"))
         .collect();
     assert_eq!(srv, ["/srv/a/b", "/srv/a"], "longest first");
+}
+
+#[test]
+fn cache_overhead_names_the_total_and_the_average_per_hit() {
+    let mut report = blank_report();
+    assert_eq!(cache_overhead_summary(&report), None);
+    report.summary.local_hits = 1;
+    report.summary.remote_hits = 1;
+    assert_eq!(cache_overhead_summary(&report), None, "no time recorded");
+    report.timing.hit_time_ms = 1_500;
+    report.timing.avg_hit_ms = 750.0;
+    assert_eq!(
+        cache_overhead_summary(&report).as_deref(),
+        Some("1.5 s aggregate, avg 750 ms/hit")
+    );
 }
 
 #[test]

@@ -821,12 +821,9 @@ pub fn read_events_and<T>(
     let reader = BufReader::new(&file);
     let mut events = Vec::new();
 
-    for line in reader.lines() {
+    for line in reader.split(b'\n') {
         let line = line?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        match serde_json::from_str::<BuildEvent>(&line) {
+        match serde_json::from_slice::<BuildEvent>(&line) {
             Ok(event) => events.push(event),
             Err(e) => {
                 tracing::debug!("skipping invalid event line: {}", e);
@@ -2484,6 +2481,42 @@ mod tests {
         // Only the first valid event should be parsed
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].crate_name, "valid");
+    }
+
+    #[test]
+    fn read_events_preserves_valid_records_around_an_interrupted_utf8_record() {
+        for append_next in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let log_path = dir.path().join("events.jsonl");
+            let mut first = test_event("first", EventResult::Miss, 100, 80, 1024, "first-key");
+            first.root = "/work/日本語".to_string();
+            log_event(&log_path, &first).unwrap();
+
+            let mut abandoned = test_event("abandoned", EventResult::Miss, 90, 70, 512, "lost");
+            abandoned.root = "/work/€".to_string();
+            let serialized = serde_json::to_vec(&abandoned).unwrap();
+            let split_at = serialized.iter().position(|&byte| byte == 0xe2).unwrap();
+            OpenOptions::new()
+                .append(true)
+                .open(&log_path)
+                .unwrap()
+                .write_all(&serialized[..=split_at])
+                .unwrap();
+
+            let next = test_event("next", EventResult::LocalHit, 10, 80, 1024, "next-key");
+            let expected = if append_next {
+                log_event(&log_path, &next).unwrap();
+                vec![first, next]
+            } else {
+                vec![first]
+            };
+            assert_eq!(
+                read_events(&log_path)
+                    .expect("an interrupted UTF-8 record must not poison valid event records"),
+                expected,
+                "valid events before and after the interrupted record must survive"
+            );
+        }
     }
 
     #[test]

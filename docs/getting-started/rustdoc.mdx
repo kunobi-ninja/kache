@@ -22,6 +22,8 @@ Run `kache init` on Unix. It installs compiler shims and points Cargo's
 `build.rustdoc` at the `rustdoc` shim in `~/.local/lib/kache/shims`. It does
 this only when Cargo's `rustc-wrapper` is Kache and `build.rustdoc` is not set.
 An existing value stays, and `kache init --no-shell` skips the step.
+If Kache cannot safely edit the Cargo configuration, it leaves the file unchanged
+and prints the path and `build.rustdoc` setting to add manually. Setup continues.
 `kache doctor` reports the setting under "cargo doc". For Nix-managed shims or
 manual setup, point `build.rustdoc` at the `rustdoc` shim yourself; see
 [Installation](/docs/getting-started/installation#nix).

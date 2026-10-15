@@ -1258,6 +1258,75 @@ source = "git+https://example.com/gitdep#abc"
         }
     }
 
+    /// A cache at `cache` whose store holds each of `contents` as a blob, as
+    /// kache stores what it compiles.
+    fn cache_storing(cache: &Path, contents: &[&str]) -> PathBuf {
+        for content in contents {
+            let hash = blake3::hash(content.as_bytes()).to_hex().to_string();
+            write(
+                &kache_store::blob_path_in_store_dir(&cache.join("store"), &hash),
+                content,
+            );
+        }
+        cache.to_path_buf()
+    }
+
+    /// A dependent's key hashes the bytes of what it links. A unit another
+    /// kache, or a build without kache, compiled has other bytes than the
+    /// cache restores for the same Cargo unit, so copying it would re-key
+    /// every crate built on it.
+    #[test]
+    fn only_units_whose_artifacts_are_stored_blobs_are_seeded() {
+        for layout in [Layout::PerUnit, Layout::Shared] {
+            let dir = tempfile::tempdir().unwrap();
+            let donor = donor(dir.path(), "a", layout);
+            let donors = std::slice::from_ref(&donor);
+            let unstored = cache_storing(&dir.path().join("unstored"), &[]);
+            assert_eq!(
+                seed(
+                    &checkout(dir.path(), "b"),
+                    VERSION,
+                    donors,
+                    &unstored,
+                    later()
+                ),
+                Seeded::default(),
+                "{layout:?}"
+            );
+            let stored = cache_storing(&dir.path().join("stored"), &["rlib"]);
+            assert_eq!(
+                seed(
+                    &checkout(dir.path(), "c"),
+                    VERSION,
+                    donors,
+                    &stored,
+                    later()
+                )
+                .units,
+                1,
+                "{layout:?}"
+            );
+            // One artifact kache did not produce keeps the whole unit out.
+            let profile = donor.target_dir.join(PROFILE);
+            let rmeta = match layout {
+                Layout::PerUnit => profile.join("build/dep").join(HASH).join("out/lib.rmeta"),
+                Layout::Shared => profile.join("deps").join(format!("libdep-{HASH}.rmeta")),
+            };
+            write(&rmeta, "rmeta");
+            assert_eq!(
+                seed(
+                    &checkout(dir.path(), "d"),
+                    VERSION,
+                    donors,
+                    &stored,
+                    later()
+                ),
+                Seeded::default(),
+                "{layout:?}"
+            );
+        }
+    }
+
     fn unit(package: &str, hash: &str) -> Unit {
         Unit {
             package: package.into(),

@@ -16614,3 +16614,47 @@ fn source_env_dep_use_rejects_ambiguous_include_names() {
         );
     }
 }
+
+/// thiserror's and serde_core's shapes. rustc rejects a glob-imported
+/// `include`, `concat` or `env` beside the builtin (E0659), so a crate that
+/// compiles with a glob calls the builtin.
+const GLOB_THEN_INCLUDE: [&str; 2] = [
+    "pub use thiserror_impl::*;\ninclude!(concat!(env!(\"OUT_DIR\"), \"/private.rs\"));",
+    "pub use core::*;\ninclude!(concat!(env!(\"OUT_DIR\"), \"/private.rs\"));",
+];
+
+#[test]
+fn glob_imports_keep_the_include_locator_proof() {
+    for source in GLOB_THEN_INCLUDE {
+        assert_eq!(
+            source_env_dep_use(source, "OUT_DIR"),
+            SourceEnvDepUse::IncludeLocator,
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn glob_imports_rescan_version_four_memos() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("lib.rs");
+    std::fs::write(&source, GLOB_THEN_INCLUDE[0]).unwrap();
+    let db = dir.path().join("idx.sqlite");
+    let hash = hash_file(&source).unwrap();
+    let cache = FileHashCache::open(&db).unwrap();
+    cache
+        .put_source_env_dep_use(
+            &hash,
+            "OUT_DIR",
+            4,
+            SourceEnvDepUse::RuntimeValue.memo_code(),
+        )
+        .unwrap();
+    drop(cache);
+    assert_eq!(
+        FileHasher::persistent(&db)
+            .env_dep_use(&source, "OUT_DIR")
+            .unwrap(),
+        SourceEnvDepUse::IncludeLocator
+    );
+}

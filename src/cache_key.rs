@@ -5729,9 +5729,10 @@ fn path_is_only_used_for_includes(value_probe: &Path, source_probes: &[PathBuf])
 /// its extension, still counts AGAINST the var.
 ///
 /// Visible declarations, imports and qualified uses of include-family names
-/// veto the proof. Glob imports also veto it because they can import a macro
-/// with one of those names. This is conservative: other identifiers with the
-/// same spelling and qualified builtin invocations also keep values absolute.
+/// veto the proof. A glob import cannot: rustc rejects a glob-imported
+/// include-family name beside the builtin as ambiguous (E0659). This is
+/// conservative: other identifiers with the same spelling and qualified
+/// builtin invocations also keep values absolute.
 ///
 /// Residual gaps, where the text looks like a locator but the compiled crate
 /// can still bake the value:
@@ -5792,7 +5793,9 @@ fn env_dep_source_decision(
 ///
 /// 4: include-family declarations, imports and qualified invocations cannot
 /// prove builtin locator semantics; glob imports can shadow those builtins.
-const SOURCE_ENV_DEP_SCANNER_VERSION: u32 = 4;
+///
+/// 5: glob imports no longer veto the proof; rustc rejects them as ambiguous.
+const SOURCE_ENV_DEP_SCANNER_VERSION: u32 = 5;
 
 /// How one source file's text uses an env var.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5841,7 +5844,6 @@ fn source_env_dep_use(source: &str, var: &str) -> SourceEnvDepUse {
     let mut include_depth = 0usize;
     let mut include_locator = false;
     let mut previous_token = None;
-    let mut in_use = false;
 
     // Every pass consumes at least one byte, so a scan needs no more passes
     // than the source has bytes. Each loop in the scanner carries that bound:
@@ -5862,11 +5864,6 @@ fn source_env_dep_use(source: &str, var: &str) -> SourceEnvDepUse {
         let qualified = matches!(previous_token, Some(b':' | b'#'));
         previous_token = Some(byte);
         match byte {
-            b';' => {
-                in_use = false;
-                i += 1;
-            }
-            b'*' if in_use => return SourceEnvDepUse::RuntimeValue,
             b'"' => i = skip_quoted_string(bytes, i + 1),
             b'\'' => i = skip_char_literal_or_lifetime(source, i),
             b'b' | b'c' | b'r' if raw_string_starts_at(bytes, i).is_some() => {
@@ -5889,7 +5886,6 @@ fn source_env_dep_use(source: &str, var: &str) -> SourceEnvDepUse {
                 let ident_start = i;
                 i = skip_ident_bytes(bytes, i);
                 let ident = &bytes[ident_start..i];
-                in_use |= ident == b"use";
                 let include = is_include_macro(ident);
                 let open = parse_macro_open(bytes, i);
                 if include && (qualified || open.is_none()) {

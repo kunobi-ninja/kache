@@ -91,7 +91,8 @@ unit refuses the run unless an absolute `DEP_*` variable handed that path,
 or an ancestor inside the same unit, to the script. This also applies when
 restoring older entries. For example, `DEP_Z_ROOT` can supply libz-sys's
 output; a scratch directory owned by a different build unit cannot be
-reconstructed by replaying this script. Then Kache replays the recorded
+reconstructed by replaying this script. Naming the Cargo `build` directory
+itself also refuses the run, because that directory has no single owner. Then Kache replays the recorded
 stdout and stderr with the current paths substituted.
 
 On Unix, links in `OUT_DIR` can point into the package directory, Cargo's

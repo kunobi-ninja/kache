@@ -3756,6 +3756,8 @@ mod tests {
         let out_dir = target.join("debug/build/x-1/out");
         let manifest_dir = cargo_home.join("registry/src/x-1.0.0");
         std::fs::create_dir_all(&out_dir).unwrap();
+        // Cargo creates source roots before the run captures their aliases.
+        std::fs::create_dir_all(&manifest_dir).unwrap();
         let mut mappings = vec![
             (out_dir.clone(), "${KACHE_OUT_DIR}"),
             (manifest_dir.clone(), "${KACHE_MANIFEST_DIR}"),

@@ -97,12 +97,16 @@ pub(super) fn file_bytes(files: &[(PathBuf, String)]) -> Result<u64> {
 }
 
 /// Bytes and entries `OUT_DIR` already takes from the shared cap: its regular
-/// files, and one entry per symlink.
+/// files, and one entry per relative or rooted symlink.
 pub(super) fn out_dir_share(
     files: &[(PathBuf, String)],
     symlinks: &[Symlink],
+    rooted_symlinks: usize,
 ) -> Result<(u64, usize)> {
-    Ok((file_bytes(files)?, files.len() + symlinks.len()))
+    Ok((
+        file_bytes(files)?,
+        files.len() + symlinks.len() + rooted_symlinks,
+    ))
 }
 
 struct Budget {
@@ -925,8 +929,16 @@ mod tests {
             name: "lib.so".into(),
             target: "lib.so.1".into(),
         }];
-        assert_eq!(out_dir_share(&files, &symlinks).unwrap(), (6, 3));
-        assert_eq!(out_dir_share(&files, &[]).unwrap(), (6, 2));
+        assert_eq!(out_dir_share(&files, &symlinks, 0).unwrap(), (6, 3));
+        assert_eq!(out_dir_share(&files, &[], 0).unwrap(), (6, 2));
+        assert_eq!(out_dir_share(&files, &symlinks, 2).unwrap(), (6, 5));
+        let (bytes, entries) = out_dir_share(&files, &symlinks, 49_997).unwrap();
+        assert_eq!(budget(bytes, entries).unwrap(), ((1 << 30) - 6, 0));
+        let (bytes, entries) = out_dir_share(&files, &symlinks, 49_998).unwrap();
+        assert!(
+            budget(bytes, entries).is_err(),
+            "rooted links share the cap"
+        );
     }
 
     #[test]
@@ -1331,6 +1343,33 @@ mod tests {
         ] {
             assert_eq!(build_unit(Path::new(path), None), None, "{path}");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_dependencies_distinguish_missing_paths_from_non_directory_errors() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("regular-file");
+        std::fs::write(&file, "not a directory").unwrap();
+        let blocked = file.join("child");
+        assert_eq!(
+            blocked.canonicalize().unwrap_err().kind(),
+            std::io::ErrorKind::NotADirectory
+        );
+        assert!(
+            canonical_with_missing_suffix(&blocked).is_none(),
+            "a regular file cannot become a missing directory prefix"
+        );
+        assert_eq!(
+            canonical_with_missing_suffix(&directory.path().join("missing/child")),
+            Some(
+                directory
+                    .path()
+                    .canonicalize()
+                    .unwrap()
+                    .join("missing/child")
+            )
+        );
     }
 
     #[test]

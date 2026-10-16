@@ -1688,13 +1688,10 @@ impl Run {
             symlinks,
             rooted_symlinks,
         } = collect_out_dir_with_environment(&self.environment, MAX_OUT_DIR_FILES)?;
-        let (used_bytes, used_entries) = outside::out_dir_share(&files, &symlinks)?;
-        let mut outside_outputs = outside::collect(
-            stdout_text,
-            &self.environment,
-            used_bytes,
-            used_entries + rooted_symlinks.len(),
-        )?;
+        let (used_bytes, used_entries) =
+            outside::out_dir_share(&files, &symlinks, rooted_symlinks.len())?;
+        let mut outside_outputs =
+            outside::collect(stdout_text, &self.environment, used_bytes, used_entries)?;
         let has_outside = !outside_outputs.is_empty();
         let mut files = files;
         files.extend(std::mem::take(&mut outside_outputs.files));

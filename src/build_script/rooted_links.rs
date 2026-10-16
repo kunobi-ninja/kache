@@ -455,6 +455,18 @@ mod tests {
     }
 
     #[test]
+    fn relative_targets_through_regular_files_are_not_dangling_internal_links() {
+        let directory = tempfile::tempdir().unwrap();
+        let env = environment(directory.path());
+        std::fs::write(env.out_dir.join("regular-file"), "not a directory").unwrap();
+        let path = env.out_dir.join("blocked");
+        let target = Path::new("regular-file/child");
+        symlink(target, &path).unwrap();
+        assert!(relative_target_is_internal(&env, &path, target).is_err());
+        assert!(super::super::collect_out_dir_with_environment(&env, 2).is_err());
+    }
+
+    #[test]
     fn schema_rejects_unknown_roots_and_older_manifest_versions_with_rooted_links() {
         let unknown = r#"{"name":"h","root":"arbitrary","suffix":"h"}"#;
         assert!(serde_json::from_str::<RootedSymlink>(unknown).is_err());

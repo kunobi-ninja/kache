@@ -1270,6 +1270,30 @@ pub(crate) fn fold(hasher: &mut blake3::Hasher, label: &str, value: &[u8]) {
     hasher.update(value);
 }
 
+/// Key the same captured dependency inputs that the ownership guard permits.
+/// Regular runs map checkout roots; hermetic runs retain the paths they read.
+fn fold_dependency_inputs(
+    hasher: &mut blake3::Hasher,
+    environment: &Environment,
+    file_hasher: &crate::cache_key::FileHasher<'_>,
+    budget: &mut usize,
+    normalize: bool,
+) -> Result<()> {
+    for path in outside::dependency_inputs(&environment.dependency_roots) {
+        let identity = path.as_os_str().as_encoded_bytes();
+        let identity = if normalize {
+            environment.normalize(identity)
+        } else {
+            identity.to_vec()
+        };
+        fold(hasher, "cargo_env_path", &identity);
+        let text = (normalize && environment.within_target_dir(&path)).then_some(environment);
+        let state = input_state_as(&path, &[], file_hasher, budget, 0, text)?;
+        fold(hasher, "cargo_env_path_state", state.as_bytes());
+    }
+    Ok(())
+}
+
 impl Run {
     fn identity(&self) -> String {
         let mut hasher = blake3::Hasher::new();
@@ -1356,16 +1380,13 @@ impl Run {
                 None => fold(&mut hasher, "cargo_env_absent", b""),
             }
         }
-        // Capture these paths once, before execution. The refusal guard and
-        // key must describe the same dependency outputs, including absence.
-        for path in &self.environment.dependency_roots {
-            let text = self
-                .environment
-                .within_target_dir(path)
-                .then_some(&self.environment);
-            let state = input_state_as(path, &[], &file_hasher, &mut budget, 0, text)?;
-            fold(&mut hasher, "cargo_env_path_state", state.as_bytes());
-        }
+        fold_dependency_inputs(
+            &mut hasher,
+            &self.environment,
+            &file_hasher,
+            &mut budget,
+            true,
+        )?;
         for name in &prediction.env {
             fold(&mut hasher, "env_name", name.as_bytes());
             match std::env::var_os(name) {
@@ -3554,27 +3575,96 @@ mod tests {
             start: std::time::Instant::now(),
         };
         let prediction = prediction_with(Some(Vec::new()), true);
-        let absent = run
-            .action_key_with(&prediction, None, &ToolSnapshot::new())
-            .unwrap();
+        let keys = || {
+            [
+                run.action_key_with(&prediction, None, &ToolSnapshot::new())
+                    .unwrap(),
+                hermetic::key(&run, &prediction, Path::new("debug/build/x-1/out")).unwrap(),
+            ]
+        };
+        let absent = keys();
         std::fs::write(&absolute, "one").unwrap();
-        let before = run
-            .action_key_with(&prediction, None, &ToolSnapshot::new())
-            .unwrap();
-        assert_ne!(absent, before, "an absent dependency path becomes present");
+        let before = keys();
+        for (absent, before) in absent.iter().zip(&before) {
+            assert_ne!(absent, before, "an absent dependency path becomes present");
+        }
         std::fs::write(&absolute, "two").unwrap();
-        let after = run
-            .action_key_with(&prediction, None, &ToolSnapshot::new())
-            .unwrap();
-        assert_ne!(
-            before, after,
-            "the file behind an absolute DEP_ path is keyed"
-        );
+        let after = keys();
+        for (before, after) in before.iter().zip(&after) {
+            assert_ne!(
+                before, after,
+                "the file behind an absolute DEP_ path is keyed"
+            );
+        }
         std::fs::write(dir.path().join("relative.h"), "unrelated").unwrap();
+        assert_eq!(after, keys());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dependency_aliases_share_one_digest_and_budget_but_retargeting_changes_it() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let config = crate::test_support::test_config(directory.path().join("cache"));
+        let store = Store::open(&config).unwrap();
+        let mut env = checkout_environment(
+            &directory.path().join("target"),
+            &directory.path().join("cargo"),
+        );
+        let provider = directory.path().join("target/debug/build/z-1/out");
+        std::fs::create_dir_all(&provider).unwrap();
+        std::fs::write(provider.join("header.h"), "header").unwrap();
+        let alias = directory.path().join("alias");
+        symlink(&provider, &alias).unwrap();
+        env.dependency_roots =
+            outside::dependency_roots([("DEP_Z_ROOT".into(), alias.clone().into_os_string())]);
         assert_eq!(
-            after,
-            run.action_key_with(&prediction, None, &ToolSnapshot::new())
-                .unwrap()
+            env.dependency_roots.len(),
+            2,
+            "keep aliases for ownership checks"
+        );
+        let digest = |env: &Environment, normalize, mut budget| {
+            let mut hasher = blake3::Hasher::new();
+            fold_dependency_inputs(
+                &mut hasher,
+                env,
+                &store.file_hasher(),
+                &mut budget,
+                normalize,
+            )?;
+            Ok::<_, anyhow::Error>((hasher.finalize(), budget))
+        };
+        let mut canonical = env.clone();
+        canonical.dependency_roots = vec![provider.canonicalize().unwrap()];
+        for normalize in [true, false] {
+            let (with_alias, remaining) = digest(&env, normalize, 2).unwrap();
+            assert_eq!(remaining, 0, "one directory and one file");
+            assert_eq!(with_alias, digest(&canonical, normalize, 2).unwrap().0);
+            assert!(
+                digest(&env, normalize, 1).is_err(),
+                "the input still uses its budget"
+            );
+            let other = directory.path().join(format!("other-{normalize}"));
+            std::fs::create_dir(&other).unwrap();
+            std::fs::write(other.join("header.h"), "header").unwrap();
+            let mut moved = env.clone();
+            moved.dependency_roots = vec![other.clone()];
+            assert_ne!(
+                with_alias,
+                digest(&moved, normalize, 2).unwrap().0,
+                "equal bytes at a different input root can change realpath outputs"
+            );
+            std::fs::remove_file(&alias).unwrap();
+            symlink(&other, &alias).unwrap();
+            assert_ne!(with_alias, digest(&env, normalize, 4).unwrap().0);
+            std::fs::remove_file(&alias).unwrap();
+            symlink(&provider, &alias).unwrap();
+        }
+        assert_ne!(
+            digest(&env, true, 2).unwrap().0,
+            digest(&env, false, 2).unwrap().0,
+            "hermetic runs retain the input root they see"
         );
     }
 
@@ -3792,9 +3882,16 @@ mod tests {
         std::fs::create_dir(&dep).unwrap();
         std::fs::write(dep.join("z.h"), b"1").unwrap();
         unsafe { std::env::set_var("DEP_Y_ROOT", &dep) };
-        let with_dep = declared_key();
+        let mut dependent = run("a/target", "cargo");
+        dependent.environment.dependency_roots =
+            outside::dependency_roots([("DEP_Y_ROOT".into(), dep.clone().into_os_string())]);
+        let with_dep = hermetic::key(&dependent, &declared, below).unwrap();
         std::fs::write(dep.join("z.h"), b"2").unwrap();
-        assert_ne!(declared_key(), with_dep, "what a DEP_ path holds");
+        assert_ne!(
+            hermetic::key(&dependent, &declared, below).unwrap(),
+            with_dep,
+            "what a captured DEP_ path holds"
+        );
         unsafe {
             std::env::remove_var("DEP_Y_ROOT");
             std::env::remove_var("KACHE_TEST_HERMETIC_VAR");

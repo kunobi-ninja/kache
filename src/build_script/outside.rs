@@ -416,6 +416,18 @@ pub(super) fn dependency_roots(
     roots
 }
 
+/// Ownership checks need every captured spelling, but hashing those aliases
+/// separately walks and budgets the same dependency more than once.
+pub(super) fn dependency_inputs(roots: &[PathBuf]) -> Vec<PathBuf> {
+    let mut inputs: Vec<_> = roots
+        .iter()
+        .map(|path| canonical_with_missing_suffix(path).unwrap_or_else(|| path.clone()))
+        .collect();
+    inputs.sort();
+    inputs.dedup();
+    inputs
+}
+
 fn path_aliases(path: &Path) -> Vec<PathBuf> {
     let mut aliases: Vec<_> = normalize_lexical(path).into_iter().collect();
     if let Some(canonical) = canonical_with_missing_suffix(path)

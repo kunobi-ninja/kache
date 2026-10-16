@@ -36,7 +36,7 @@
 //! build_script_hermetic = true` (see [`crate::config::Config::build_script_hermetic`]).
 
 use super::{
-    MAX_INPUT_FILES, Prediction, Run, ZERO_AR_DATE_ENV, fold, input_state, input_state_as,
+    MAX_INPUT_FILES, Prediction, Run, ZERO_AR_DATE_ENV, fold, fold_dependency_inputs, input_state,
     modified_since, package_exclusions, parse_declarations, real_command, replay, target_dir_for,
     zero_ar_date,
 };
@@ -363,7 +363,7 @@ fn fold_declared_env(
 /// the sandbox repeats it.
 pub(super) fn key(run: &Run, prediction: &Prediction, below_target: &Path) -> Result<String> {
     let mut hasher = blake3::Hasher::new();
-    fold(&mut hasher, "kind", b"kache-build-script-hermetic-v1");
+    fold(&mut hasher, "kind", b"kache-build-script-hermetic-v2");
     fold(
         &mut hasher,
         "key_version",
@@ -386,15 +386,14 @@ pub(super) fn key(run: &Run, prediction: &Prediction, below_target: &Path) -> Re
             Some(value) => fold(&mut hasher, "cargo_env_value", value.as_encoded_bytes()),
             None => fold(&mut hasher, "cargo_env_absent", b""),
         }
-        if name.starts_with("DEP_")
-            && let Some(path) = value.map(PathBuf::from)
-            && path.is_absolute()
-            && path.exists()
-        {
-            let state = input_state_as(&path, &[], &file_hasher, &mut budget, 0, None)?;
-            fold(&mut hasher, "cargo_env_path_state", state.as_bytes());
-        }
     }
+    fold_dependency_inputs(
+        &mut hasher,
+        &run.environment,
+        &file_hasher,
+        &mut budget,
+        false,
+    )?;
     fold_declared_env(&mut hasher, &prediction.env, |name| std::env::var_os(name));
     for declared in &prediction.inputs {
         let path = PathBuf::from(run.environment.denormalize_str(declared));

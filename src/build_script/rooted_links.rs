@@ -35,6 +35,9 @@ fn roots(environment: &Environment) -> Vec<(PathBuf, Option<Root>)> {
     let mut roots = vec![
         (environment.out_dir.clone(), Some(Root::OutDir)),
         (environment.manifest_dir.clone(), Some(Root::Package)),
+        // The package walk excludes this directory even when this run uses
+        // another target directory or an unrecognized Cargo layout.
+        (environment.manifest_dir.join("target"), None),
     ];
     for (path, placeholder) in &environment.spellings {
         match *placeholder {
@@ -297,6 +300,44 @@ mod tests {
             classify(&spelled, &alias).unwrap(),
             (Root::Package, String::new())
         );
+    }
+
+    #[test]
+    fn the_default_package_target_stays_denied_with_another_or_unknown_layout() {
+        let directory = tempfile::tempdir().unwrap();
+        for known_layout in [true, false] {
+            let mut env = environment(directory.path());
+            let active = directory.path().join("active-target");
+            env.out_dir = active.join("debug/build/demo-1/out");
+            std::fs::create_dir_all(&env.out_dir).unwrap();
+            env.spellings
+                .retain(|(_, placeholder)| *placeholder != TARGET_DIR_PLACEHOLDER);
+            env.mappings
+                .retain(|(_, placeholder)| *placeholder != TARGET_DIR_PLACEHOLDER);
+            if known_layout {
+                env.spellings.push((active.clone(), TARGET_DIR_PLACEHOLDER));
+                env.mappings.push((active, TARGET_DIR_PLACEHOLDER));
+            }
+            let stale = env.manifest_dir.join("target/stale.h");
+            std::fs::write(&stale, "stale").unwrap();
+            assert!(classify(&env, &stale).is_err());
+            assert!(
+                restore(
+                    &env,
+                    &RootedSymlink {
+                        name: "stale".into(),
+                        root: Root::Package,
+                        suffix: "target/stale.h".into(),
+                    },
+                )
+                .is_err()
+            );
+            std::fs::write(env.out_dir.join("own.h"), "generated").unwrap();
+            assert_eq!(
+                classify(&env, &env.out_dir.join("own.h")).unwrap(),
+                (Root::OutDir, "own.h".into())
+            );
+        }
     }
 
     #[test]

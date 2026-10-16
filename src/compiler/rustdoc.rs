@@ -290,6 +290,7 @@ fn source_records(sources: &[PathBuf]) -> Result<Vec<SourceRecord>> {
             &lexical_absolute(source),
             &crate_dir,
             true,
+            false,
             &mut seen,
             &mut files,
         )?;
@@ -308,6 +309,7 @@ fn collect_source(
     path: &Path,
     crate_dir: &Path,
     required: bool,
+    module_file: bool,
     seen: &mut BTreeSet<PathBuf>,
     out: &mut Vec<SourceRecord>,
 ) -> Result<()> {
@@ -341,14 +343,22 @@ fn collect_source(
         paths: vec![absolute.to_string_lossy().into_owned()],
     });
     let parent = absolute.parent().unwrap_or(Path::new(""));
+    // An implicit foo.rs module owns foo/ for children; explicit paths keep the parent.
+    let module_dir = if module_file && absolute.file_name() != Some(std::ffi::OsStr::new("mod.rs"))
+    {
+        absolute.with_extension("")
+    } else {
+        parent.to_path_buf()
+    };
     for found in scan_rust(&bytes)? {
         match found {
             Found::Include(rel) => {
-                collect_source(&parent.join(rel), crate_dir, false, seen, out)?;
+                collect_source(&parent.join(rel), crate_dir, false, false, seen, out)?;
             }
             Found::Module { path, name } => {
-                if let Some(next) = resolve_module(parent, path.as_deref(), &name)? {
-                    collect_source(&next, crate_dir, false, seen, out)?;
+                let dir = if path.is_some() { parent } else { &module_dir };
+                if let Some(next) = resolve_module(dir, path.as_deref(), &name)? {
+                    collect_source(&next, crate_dir, false, path.is_none(), seen, out)?;
                 }
             }
         }
@@ -2272,6 +2282,74 @@ mod tests {
     }
 
     #[test]
+    fn explicit_path_modules_resolve_children_beside_the_module_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir(root.join("renamed")).unwrap();
+        std::fs::write(root.join("lib.rs"), "#[path = \"renamed.rs\"] mod foo;\n").unwrap();
+        std::fs::write(root.join("renamed.rs"), "mod child;\n").unwrap();
+        std::fs::write(root.join("child.rs"), "pub fn thing() {}\n").unwrap();
+        std::fs::write(root.join("renamed/child.rs"), "pub fn decoy() {}\n").unwrap();
+        let records = source_records(&[root.join("lib.rs")]).unwrap();
+        let names: Vec<_> = records
+            .iter()
+            .map(|record| record.relative.as_str())
+            .collect();
+        assert_eq!(names, [".", "child.rs", "lib.rs", "renamed.rs"]);
+    }
+
+    #[test]
+    fn mod_rs_children_remain_in_the_parent_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir(root.join("foo")).unwrap();
+        std::fs::write(root.join("lib.rs"), "mod foo;\n").unwrap();
+        std::fs::write(root.join("foo/mod.rs"), "mod child;\n").unwrap();
+        std::fs::write(root.join("foo/child.rs"), "pub fn thing() {}\n").unwrap();
+        let records = source_records(&[root.join("lib.rs")]).unwrap();
+        let names: Vec<_> = records
+            .iter()
+            .map(|record| record.relative.as_str())
+            .collect();
+        assert_eq!(names, [".", "foo/child.rs", "foo/mod.rs", "lib.rs"]);
+    }
+
+    #[test]
+    fn non_mod_rs_modules_resolve_children_below_their_stem() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("foo/child")).unwrap();
+        std::fs::write(root.join("entry.rs"), "mod foo;\n").unwrap();
+        std::fs::write(
+            root.join("foo.rs"),
+            "mod child;\ninclude_str!(\"note.txt\");\n#[path = \"renamed.rs\"] mod alias;\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("foo/child.rs"), "mod grand;\n").unwrap();
+        std::fs::write(root.join("foo/child/grand.rs"), "pub fn grand() {}\n").unwrap();
+        for file in ["child.rs", "note.txt", "renamed.rs"] {
+            std::fs::write(root.join(file), "pub fn decoy() {}\n").unwrap();
+        }
+        let records = source_records(&[root.join("entry.rs")]).unwrap();
+        let names: Vec<_> = records
+            .iter()
+            .map(|record| record.relative.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                ".",
+                "entry.rs",
+                "foo.rs",
+                "foo/child.rs",
+                "foo/child/grand.rs",
+                "note.txt",
+                "renamed.rs"
+            ]
+        );
+    }
+
+    #[test]
     fn modules_and_includes_enter_the_key_and_dep_info_does_not() {
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("src");
@@ -3297,7 +3375,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut seen = BTreeSet::new();
         let mut out = Vec::new();
-        collect_source(dir.path(), dir.path(), true, &mut seen, &mut out).unwrap();
+        collect_source(dir.path(), dir.path(), true, false, &mut seen, &mut out).unwrap();
         assert!(out.is_empty());
     }
 
@@ -3309,6 +3387,7 @@ mod tests {
         collect_source(
             &dir.path().join("missing.rs"),
             dir.path(),
+            false,
             false,
             &mut seen,
             &mut out,
@@ -3332,7 +3411,7 @@ mod tests {
         std::os::unix::fs::symlink(&link, &link).unwrap();
         let mut seen = BTreeSet::new();
         let mut out = Vec::new();
-        assert!(collect_source(&link, dir.path(), false, &mut seen, &mut out).is_err());
+        assert!(collect_source(&link, dir.path(), false, false, &mut seen, &mut out).is_err());
         assert!(resolve_module(dir.path(), None, "loop").is_err());
     }
 

@@ -296,6 +296,7 @@ pub(super) fn run(
 
 fn restore(run: &Run, sandbox: &Sandbox, record: &Record, key: &str, key_ms: u64) -> Result<()> {
     let restore_start = std::time::Instant::now();
+    validate_link_paths(&run.environment, sandbox, &record.stdout)?;
     link_out_dir(&run.environment.out_dir, &sandbox.out_dir)?;
     record_referrer(sandbox, &run.environment.out_dir)?;
     replay(
@@ -314,6 +315,25 @@ fn restore(run: &Run, sandbox: &Sandbox, record: &Record, key: &str, key_ms: u64
         0,
     );
     Ok(())
+}
+
+/// The script sees the sandbox as its target directory, while dependency
+/// paths can still name the original target. Guard both before publishing a
+/// sealed run or linking one left by an earlier version.
+fn validate_link_paths(
+    environment: &super::Environment,
+    sandbox: &Sandbox,
+    stdout: &str,
+) -> Result<()> {
+    let mut seen = environment.clone();
+    seen.out_dir = sandbox.out_dir.clone();
+    seen.mappings
+        .retain(|(_, placeholder)| *placeholder != "${KACHE_OUT_DIR}");
+    seen.mappings
+        .push((sandbox.out_dir.clone(), "${KACHE_OUT_DIR}"));
+    seen.mappings
+        .push((sandbox.root.clone(), super::TARGET_DIR_PLACEHOLDER));
+    super::outside::validate_named_paths(stdout, &seen)
 }
 
 /// Folds the variables the script declared with `rerun-if-env-changed`.
@@ -535,6 +555,10 @@ fn attempt(
         return Ok(None);
     };
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    if let Err(error) = validate_link_paths(&run.environment, sandbox, &stdout) {
+        tracing::debug!("hermetic build script has an unowned link path: {error}");
+        return Ok(None);
+    }
     // The key was computed before the run, maybe before waiting for the
     // lock; an input edited meanwhile is older than `started`.
     if key(run, prediction, below_target)? != expected_key {
@@ -796,6 +820,59 @@ pub(crate) mod test_support {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hermetic_records_refuse_sibling_units_before_linking_output() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("target");
+        let out_dir = target.join("debug/build/pkg-1/out");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        std::fs::write(out_dir.join("untouched"), "keep").unwrap();
+        let environment = super::super::Environment {
+            out_dir: out_dir.clone(),
+            manifest_dir: directory.path().join("package"),
+            mappings: vec![
+                (out_dir.clone(), "${KACHE_OUT_DIR}"),
+                (target.clone(), super::super::TARGET_DIR_PLACEHOLDER),
+            ],
+            spellings: Vec::new(),
+            base_dirs: Vec::new(),
+            dependency_roots: Vec::new(),
+        };
+        let config = crate::test_support::test_config(directory.path().join("cache"));
+        let mut run = Run {
+            store: crate::store::Store::open(&config).unwrap(),
+            config,
+            binary_hash: "script".into(),
+            environment,
+            start: std::time::Instant::now(),
+        };
+        let key = "ab".repeat(32);
+        let sandbox = Sandbox::new(
+            &run.config.cache_dir,
+            &key,
+            Path::new("debug/build/pkg-1/out"),
+        );
+        std::fs::create_dir_all(&sandbox.out_dir).unwrap();
+        let own = format!("cargo:rustc-link-search={}\n", sandbox.out_dir.display());
+        validate_link_paths(&run.environment, &sandbox, &own).unwrap();
+        for root in [&target, &sandbox.root] {
+            let sibling = root.join("debug/build/scratch-1/out/lib");
+            let stdout = format!("cargo:rustc-link-search={}\n", sibling.display());
+            assert!(validate_link_paths(&run.environment, &sandbox, &stdout).is_err());
+            let record = Record {
+                version: RECORD_VERSION,
+                stdout: stdout.clone(),
+                stderr: String::new(),
+            };
+            assert!(restore(&run, &sandbox, &record, &key, 0).is_err());
+            assert!(std::fs::symlink_metadata(&out_dir).unwrap().is_dir());
+            assert_eq!(std::fs::read(out_dir.join("untouched")).unwrap(), b"keep");
+            run.environment.dependency_roots = vec![sibling.parent().unwrap().to_path_buf()];
+            validate_link_paths(&run.environment, &sandbox, &stdout).unwrap();
+            run.environment.dependency_roots.clear();
+        }
+    }
 
     /// A declared `OUT_DIR` keys by its name, never by the per-target value
     /// Cargo set; any other declared value still keys.

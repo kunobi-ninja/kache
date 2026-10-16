@@ -86,8 +86,26 @@ the target directory, outside `OUT_DIR`, as a link search path or linker input
 `rustc-link-arg` or `rustc-flags`, or an absolute file in `rustc-link-arg`), so
 the replayed line finds its library. Directories Cargo fills itself (`deps`,
 `incremental`, `build`, `.fingerprint`, `examples`) and paths outside the
-target directory are not recorded. Then it replays the recorded stdout and
-stderr with the current paths substituted.
+target directory are not recorded. A link path inside another Cargo build
+unit refuses the run unless an absolute `DEP_*` variable handed that path,
+or an ancestor inside the same unit, to the script. This also applies when
+restoring older entries. For example, `DEP_Z_ROOT` can supply libz-sys's
+output; a scratch directory owned by a different build unit cannot be
+reconstructed by replaying this script. Then Kache replays the recorded
+stdout and stderr with the current paths substituted.
+
+On Unix, links in `OUT_DIR` can point into the package directory, Cargo's
+`registry/src` or `git/checkouts` directories, or back into `OUT_DIR` by an
+absolute path. Kache records each resolved target as a root and a checked
+relative suffix, and rebuilds the link using the current run's roots. This
+supports cxx-build's package and registry-header links across checkouts.
+Targets must exist and remain in an allowed root; links into the target
+directory, unknown roots, and dangling external targets refuse the run.
+The most specific root decides, so a target directory inside the package is
+still excluded. Relative links confined to `OUT_DIR` keep their original
+text, including ordinary dangling links. These rules apply to the regular
+build-script cache. Hermetic runs still refuse links that leave `OUT_DIR`
+and fall back to the regular path.
 Entries stay in the local store: `kache sync` never uploads them.
 
 Runs appear in build reports (`kache stats --full`) as `build_script_run`, with
@@ -108,10 +126,11 @@ a `passthrough` whose reason says `build-script cache bypassed` or
   is not run twice after that.
 - An `OUT_DIR` and named target files that together pass 1 GiB or 50,000
   non-empty files and symlinks, a named target path that is itself a symlink,
-  or a symlink in `OUT_DIR` or a named directory whose target is absolute or
-  does not follow this rule: climb no higher than that directory with leading
-  `..`, then only descend. A link that follows it, such as
-  `libfoo.so -> libfoo.so.1`, is recorded and restored as a link, on Unix.
+  or an `OUT_DIR` link whose resolved target is outside the roots listed
+  above. A relative link confined to `OUT_DIR`, or a link in a named target
+  directory, must climb no higher than that directory with leading `..`,
+  then only descend. A link such as `libfoo.so -> libfoo.so.1` is recorded
+  and restored as a link, on Unix.
 - A run whose stdout is not UTF-8, or whose `OUT_DIR` holds a name that is not
   UTF-8 or an entry other than a file, directory or symlink.
 - A script whose declared inputs add up to more than 100,000 files and

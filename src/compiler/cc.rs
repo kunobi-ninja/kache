@@ -3154,13 +3154,13 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         dialect: Some(Dialect::Cl),
     },
     FlagSpec {
-        // Picks the linker. The classifier only runs for `-c` and `-E`,
-        // where no linker runs (clang reports the flag unused); a cached
-        // link keys its full argv in `cache_key_for_link` instead.
-        // cargo-xwin puts `-fuse-ld=lld-link` in every CFLAGS.
+        // No linker runs for `-c` or `-E`, but an unused-argument warning
+        // can fail under `-Werror`. Key the spelling so a successful entry
+        // without it cannot hide that failure. cargo-xwin puts
+        // `-fuse-ld=lld-link` in every CFLAGS.
         matcher: Matcher::Prefix("-fuse-ld="),
-        class: FlagClass::NoObjectEffect,
-        source: "linker selection; no effect on a compile or preprocess.",
+        class: FlagClass::RawKeyed,
+        source: "linker selection; unused-argument diagnostics can change compile success.",
         dialect: None,
     },
     FlagSpec {
@@ -3940,10 +3940,8 @@ fn classify_and_trace_cc_flags<'a>(
     let mut rejected = Vec::new();
 
     let dialect = parsed.family.dialect();
-    let mut idx = 0;
-    while idx < parsed.rest.len() {
-        let arg = &parsed.rest[idx];
-
+    let mut args = parsed.rest.iter().enumerate();
+    while let Some((idx, arg)) = args.next() {
         // `-Xclang <tok>` forwards `<tok>` straight to the cc1 front end,
         // so the driver-level table can't classify it — `<tok>` means
         // whatever cc1 makes of it (cc1 `-MP` is dep-info phony targets,
@@ -3954,10 +3952,9 @@ fn classify_and_trace_cc_flags<'a>(
         if arg == "-Xclang" {
             // The marker only forwards; it has no object effect itself.
             summary.record(Some(FlagClass::NoObjectEffect));
-            let Some(inner) = parsed.rest.get(idx + 1) else {
+            let Some((_, inner)) = args.next() else {
                 // Trailing `-Xclang` with no operand: nothing to forward.
                 tracing::trace!("[cc:{subject}] flag -Xclang (no operand) -> NoObjectEffect");
-                idx += 1;
                 continue;
             };
             let class = classify_xclang_forwarded(inner, dialect);
@@ -3977,7 +3974,6 @@ fn classify_and_trace_cc_flags<'a>(
                     rejected.push(inner.as_str());
                 }
             }
-            idx += 2;
             continue;
         }
 
@@ -4006,17 +4002,25 @@ fn classify_and_trace_cc_flags<'a>(
             // clang-cl reads everything after `--` as an input file, which
             // the `cc` crate relies on for sources with absolute Unix paths
             // (`/home/...`) that would otherwise spell flags.
-            tracing::trace!("[cc:{subject}] -- ends the options: the rest are inputs");
+            // Only the parsed sources are tracked by the compile key.
+            // An extra input such as LLVM IR must not bypass the gate.
+            for (_, input) in args.by_ref() {
+                if !parsed
+                    .sources
+                    .iter()
+                    .any(|source| source.as_os_str() == OsStr::new(input))
+                {
+                    summary.record(None);
+                    tracing::trace!("[cc:{subject}] untracked input after --: {input}");
+                    rejected.push(input.as_str());
+                }
+            }
             break;
         }
-        let value_follows = takes_separate_value(&parsed.rest, idx, dialect);
-        idx += 1;
-        if value_follows {
-            tracing::trace!(
-                "[cc:{subject}] value {} of {arg} -> consumed by the flag",
-                parsed.rest[idx]
-            );
-            idx += 1;
+        if takes_separate_value(&parsed.rest, idx, dialect)
+            && let Some((_, value)) = args.next()
+        {
+            tracing::trace!("[cc:{subject}] value {value} of {arg} -> consumed by the flag");
         }
     }
 

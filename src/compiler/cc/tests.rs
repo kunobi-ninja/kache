@@ -8720,7 +8720,7 @@ fn clang_cl_system_include_and_linker_selection_rows() {
     for dialect in [Dialect::Gnu, Dialect::Cl] {
         assert_eq!(
             classify_cc_flag("-fuse-ld=lld-link", dialect),
-            Some(FlagClass::NoObjectEffect)
+            Some(FlagClass::RawKeyed)
         );
     }
     // The joined spelling is one token; nothing after it is consumed.
@@ -8780,4 +8780,59 @@ fn clang_cl_double_dash_as_a_flag_value_does_not_end_classification() {
             .any(|reason| reason.contains("/kache-unknown")),
         "a consumed value cannot hide the following unsupported flag: {reasons:?}"
     );
+}
+
+#[test]
+fn clang_cl_double_dash_does_not_hide_untracked_inputs() {
+    for input in ["/abs/extra.ll", "/kache-unknown", "-kache-unknown"] {
+        let parsed = CcArgs::parse(&s(&["clang-cl", "-c", "a.c", "--", input])).unwrap();
+        assert_eq!(parsed.sources, vec![PathBuf::from("a.c")]);
+        assert!(
+            classify_and_trace_cc_flags(&parsed, &[]).contains(&input),
+            "an untracked input after -- must refuse: {input}"
+        );
+    }
+}
+
+#[test]
+fn clang_cl_double_dash_keeps_the_single_source_contract() {
+    let reasons = refuse_descriptions(&["clang-cl", "-c", "a.c", "--", "/abs/extra.c"]);
+    assert!(
+        reasons.iter().any(|reason| reason.contains("multi-source")),
+        "tracked sources after -- still count toward the single-source limit: {reasons:?}"
+    );
+}
+
+#[test]
+fn gnu_double_dash_does_not_skip_unsupported_flags() {
+    let reasons = refuse_descriptions(&["gcc", "-c", "a.c", "--", "-kache-unknown"]);
+    assert!(
+        reasons
+            .iter()
+            .any(|reason| reason.contains("-kache-unknown")),
+        "GNU classification must keep its existing refusal after --: {reasons:?}"
+    );
+}
+
+#[test]
+fn linker_selection_is_keyed_with_warning_outcome_gates() {
+    for compiler in ["gcc", "clang-cl"] {
+        let raw_flags = |linker: Option<&str>| {
+            let mut argv = s(&[compiler, "-c", "a.c", "-Werror"]);
+            if let Some(flag) = linker {
+                argv.push(flag.to_string());
+            }
+            let parsed = CcArgs::parse(&argv).unwrap();
+            assert!(parsed.refuse_reasons(&[]).is_empty());
+            cc_raw_flags_for_key(&parsed, &[])
+        };
+        let without_linker = raw_flags(None);
+        let lld_link = raw_flags(Some("-fuse-ld=lld-link"));
+        assert_eq!(
+            lld_link,
+            vec![b"-Werror".to_vec(), b"-fuse-ld=lld-link".to_vec()]
+        );
+        assert_ne!(without_linker, lld_link);
+        assert_ne!(lld_link, raw_flags(Some("-fuse-ld=lld")));
+    }
 }

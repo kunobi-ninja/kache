@@ -1176,13 +1176,12 @@ pub(crate) fn replace_all(haystack: &[u8], needle: &[u8], replacement: &[u8]) ->
 
 /// Cargo-provided environment that shapes a run and is not otherwise keyed.
 /// `NUM_JOBS` and the jobserver variables describe the machine, not the run.
-fn cargo_environment(environment: &Environment) -> BTreeMap<String, Option<String>> {
+fn cargo_environment(environment: &Environment) -> BTreeMap<String, Option<Vec<u8>>> {
     cargo_environment_names()
         .into_iter()
         .map(|name| {
-            let value = std::env::var(&name).ok().map(|value| {
-                String::from_utf8_lossy(&environment.normalize_value(value.as_bytes())).into_owned()
-            });
+            let value = std::env::var_os(&name)
+                .map(|value| environment.normalize_value(value.as_encoded_bytes()));
             (name, value)
         })
         .collect()
@@ -1279,6 +1278,24 @@ fn fold_dependency_inputs(
     budget: &mut usize,
     normalize: bool,
 ) -> Result<()> {
+    // The input's own symlink text is observable even when two link chains
+    // resolve to the same physical tree. Key it without walking that tree twice.
+    for path in &environment.dependency_roots {
+        if let Ok(target) = std::fs::read_link(path) {
+            for (label, value) in [
+                ("cargo_env_path_link", path),
+                ("cargo_env_link_target", &target),
+            ] {
+                let value = value.as_os_str().as_encoded_bytes();
+                let value = if normalize {
+                    environment.normalize(value)
+                } else {
+                    value.to_vec()
+                };
+                fold(hasher, label, &value);
+            }
+        }
+    }
     for path in outside::dependency_inputs(&environment.dependency_roots) {
         let identity = path.as_os_str().as_encoded_bytes();
         let identity = if normalize {
@@ -1376,7 +1393,7 @@ impl Run {
                 continue;
             }
             match value {
-                Some(value) => fold(&mut hasher, "cargo_env_value", value.as_bytes()),
+                Some(value) => fold(&mut hasher, "cargo_env_value", &value),
                 None => fold(&mut hasher, "cargo_env_absent", b""),
             }
         }
@@ -2341,13 +2358,13 @@ mod tests {
                 }
             }
         }
-        assert_eq!(vars["CARGO_PKG_NAME"].as_deref(), Some("kt"));
+        assert_eq!(vars["CARGO_PKG_NAME"].as_deref(), Some(b"kt".as_slice()));
         assert_eq!(
             vars["DEP_Z_INCLUDE"].as_deref(),
-            Some("/t/debug/build/z-1/out/include"),
+            Some(b"/t/debug/build/z-1/out/include".as_slice()),
             "values outside a mapped root stay verbatim"
         );
-        assert_eq!(vars["CARGO_CFG_UNIX"].as_deref(), Some(""));
+        assert_eq!(vars["CARGO_CFG_UNIX"].as_deref(), Some(b"".as_slice()));
         assert!(
             vars.contains_key("TARGET"),
             "fixed names are listed even when unset"
@@ -3602,6 +3619,56 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn non_utf8_dependency_values_are_distinct_in_both_action_keys() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let _lock = crate::test_support::process_state_test_lock();
+        let directory = tempfile::tempdir().unwrap();
+        let config = crate::test_support::test_config(directory.path().join("cache"));
+        let run = Run {
+            store: Store::open(&config).unwrap(),
+            config,
+            binary_hash: "script".into(),
+            environment: environment(
+                &directory.path().join("out"),
+                &directory.path().join("package"),
+            ),
+            start: std::time::Instant::now(),
+        };
+        let prediction = prediction_with(Some(Vec::new()), true);
+        let saved = std::env::var_os("DEP_KT_BINARY_METADATA");
+        let keys = [0xfe, 0xff].map(|byte| {
+            let mut value = b"metadata-".to_vec();
+            value.push(byte);
+            // SAFETY: the process-state lock serialises environment edits.
+            unsafe {
+                std::env::set_var(
+                    "DEP_KT_BINARY_METADATA",
+                    std::ffi::OsString::from_vec(value),
+                );
+            }
+            [
+                run.action_key_with(&prediction, None, &ToolSnapshot::new())
+                    .unwrap(),
+                hermetic::key(&run, &prediction, Path::new("debug/build/x-1/out")).unwrap(),
+            ]
+        });
+        unsafe {
+            match saved {
+                Some(value) => std::env::set_var("DEP_KT_BINARY_METADATA", value),
+                None => std::env::remove_var("DEP_KT_BINARY_METADATA"),
+            }
+        }
+        for (a, b) in keys[0].iter().zip(&keys[1]) {
+            assert_ne!(
+                a, b,
+                "non-UTF-8 dependency metadata is an environment input"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn dependency_aliases_share_one_digest_and_budget_but_retargeting_changes_it() {
         use std::os::unix::fs::symlink;
 
@@ -3640,7 +3707,22 @@ mod tests {
         for normalize in [true, false] {
             let (with_alias, remaining) = digest(&env, normalize, 2).unwrap();
             assert_eq!(remaining, 0, "one directory and one file");
-            assert_eq!(with_alias, digest(&canonical, normalize, 2).unwrap().0);
+            assert_ne!(
+                with_alias,
+                digest(&canonical, normalize, 2).unwrap().0,
+                "a dependency symlink's own text is an input"
+            );
+            let bridge = directory.path().join(format!("bridge-{normalize}"));
+            symlink(&provider, &bridge).unwrap();
+            std::fs::remove_file(&alias).unwrap();
+            symlink(&bridge, &alias).unwrap();
+            assert_ne!(
+                with_alias,
+                digest(&env, normalize, 2).unwrap().0,
+                "another link chain to the same bytes can change readlink outputs"
+            );
+            std::fs::remove_file(&alias).unwrap();
+            symlink(&provider, &alias).unwrap();
             assert!(
                 digest(&env, normalize, 1).is_err(),
                 "the input still uses its budget"

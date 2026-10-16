@@ -189,6 +189,107 @@ fn deferred_cc_reuses_setup_and_still_invalidates_changed_headers() {
     }
 }
 
+#[test]
+fn changed_link_archives_use_current_code_and_explicit_files_keep_cache_hits() {
+    for style in [
+        "wl-rsp",
+        "named",
+        "forwarded",
+        "xlinker",
+        "response",
+        "xl-rsp",
+        "explicit",
+        "default",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        fs::create_dir(root.join("home")).unwrap();
+        fs::write(root.join("kache.toml"), "").unwrap();
+        let main = "int value(void); int main(void) { return value(); }\n";
+        fs::write(root.join("main.c"), main).unwrap();
+        let direct_cc = |args: &[&str]| {
+            common::hermetic_command("cc", &root.join("cache"), None)
+                .env("HOME", root.join("home"))
+                .current_dir(&root)
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        let compile = direct_cc(&["-c", "main.c", "-o", "main.o"]);
+        assert!(compile.status.success(), "{compile:?}");
+        fs::write(root.join("link.rsp"), "main.o -L. \"-lvalue\" -o app\n").unwrap();
+        fs::write(root.join("l.rsp"), "-lvalue\n").unwrap();
+        let options: &[&str] = match style {
+            "wl-rsp" => &["main.o", "-L.", "-Wl,@l.rsp", "-o", "app"],
+            "xl-rsp" => &["main.o", "-L.", "-Xlinker", "@l.rsp", "-o", "app"],
+            "forwarded" => &["main.o", "-L.", "-Wl,-lvalue", "-o", "app"],
+            "xlinker" => &["main.o", "-L.", "-Xlinker", "-lvalue", "-o", "app"],
+            "response" => &["@link.rsp", "-o", "app"],
+            "explicit" => &["main.o", "libvalue.a", "-o", "app"],
+            _ => &["main.o", "-L.", "-lvalue", "-o", "app"],
+        };
+        let mut results = Vec::new();
+        for (phase, expected) in [
+            ("cold", 11),
+            ("warm", 11),
+            ("changed", 23),
+            ("changed-warm", 23),
+        ] {
+            if phase == "cold" || phase == "changed" {
+                let code = format!("int value(void) {{ return {expected}; }}\n");
+                fs::write(root.join("value.c"), code).unwrap();
+                let compile = direct_cc(&["-c", "value.c", "-o", "value.o"]);
+                assert!(compile.status.success(), "{compile:?}");
+                let _ = fs::remove_file(root.join("libvalue.a"));
+                let archive = common::hermetic_command("ar", &root.join("cache"), None)
+                    .env("HOME", root.join("home"))
+                    .current_dir(&root)
+                    .args(["rcs", "libvalue.a", "value.o"])
+                    .output()
+                    .unwrap();
+                assert!(archive.status.success(), "{archive:?}");
+            }
+            let _ = fs::remove_file(root.join("app"));
+            let linked = cacheable_cc_command(&root)
+                .arg("cc")
+                .args(options)
+                .env("HOME", root.join("home"))
+                .env(
+                    "KACHE_CACHE_CC_LINKS",
+                    if style == "default" { "0" } else { "1" },
+                )
+                .env("KACHE_DAEMON_PUBLISH", "0")
+                .env("KACHE_MIN_STORE_COMPILE_MS", "0")
+                .env_remove("RUSTC_WRAPPER")
+                .output()
+                .unwrap();
+            assert!(linked.status.success(), "{style}/{phase}: {linked:?}");
+            assert_eq!(
+                Command::new(root.join("app")).status().unwrap().code(),
+                Some(expected),
+                "{style}/{phase}: a changed archive must run its current code"
+            );
+            results.push(last_cc_event(&root)["result"].clone());
+        }
+        let expected_results = if style == "explicit" {
+            vec!["miss", "local_hit", "miss", "local_hit"]
+        } else {
+            vec!["passthrough"; 4]
+        };
+        assert_eq!(
+            results, expected_results,
+            "{style}: explicit archives retain reuse and untracked selections pass through"
+        );
+        if style != "explicit" && root.join("cache/index.db").is_file() {
+            assert_eq!(
+                index_rows(&root, "entries"),
+                0,
+                "{style}: untracked or default links must not publish cache entries"
+            );
+        }
+    }
+}
+
 fn cacheable_cc_command(root: &std::path::Path) -> Command {
     common::settle_writes(&[root]);
     let mut command = Command::new(kache_binary());

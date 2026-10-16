@@ -2673,6 +2673,86 @@ fn closed_set_m_flags_are_raw_keyed_issue_826() {
 }
 
 #[test]
+fn opt_in_named_library_links_are_refused_until_selections_are_tracked() {
+    let compiler = CcCompiler::new().with_cache_cc_links(true);
+    for flags in [
+        s(&["-lvalue"]),
+        s(&["-l", "value"]),
+        s(&["-Wl,-lvalue"]),
+        s(&["-Wl,-l,value"]),
+        s(&["-Wl,--library=value"]),
+        s(&["-Wl,--library,value"]),
+        s(&["-Xlinker", "-lvalue"]),
+        s(&["-Xlinker", "-l", "-Xlinker", "value"]),
+    ] {
+        let mut args = s(&["cc", "main.o", "-o", "app"]);
+        args.extend(flags);
+        let parsed = compiler.parse(&args).unwrap();
+        assert!(
+            matches!(
+                compiler.refuse_reasons(&parsed).as_slice(),
+                [RefuseReason::Unsupported(
+                    "cc link libraries selected by name have untracked dependencies"
+                )]
+            ),
+            "{args:?}: named-library selection must reach the exact untracked-input refusal"
+        );
+    }
+    for flags in [
+        s(&["libvalue.a"]),
+        s(&["objects,-lvalue.o"]),
+        s(&["-Llibrary-path"]),
+        s(&["-Wl,-rpath,libdir"]),
+    ] {
+        let mut args = s(&["cc", "main.o", "-o", "app"]);
+        args.extend(flags);
+        assert!(
+            compiler
+                .refuse_reasons(&compiler.parse(&args).unwrap())
+                .is_empty(),
+            "{args:?}: explicit inputs and non-library flags retain opt-in caching"
+        );
+    }
+    let default = CcCompiler::new();
+    let named = default
+        .parse(&s(&["cc", "main.o", "-lvalue", "-o", "app"]))
+        .unwrap();
+    assert!(
+        matches!(
+            default.refuse_reasons(&named).as_slice(),
+            [RefuseReason::Unsupported(
+                "cc link mode (whole-program caching) — not yet"
+            )]
+        ),
+        "default links retain the ordinary link-mode refusal"
+    );
+}
+
+#[test]
+fn opt_in_link_response_files_are_refused_without_compiler_parsing() {
+    let compiler = CcCompiler::new().with_cache_cc_links(true);
+    for flags in [
+        s(&["@link.rsp"]),
+        s(&["-Wl,@link.rsp"]),
+        s(&["-Wl,--start-group,@link.rsp,--end-group"]),
+        s(&["-Xlinker", "@link.rsp"]),
+    ] {
+        let mut args = s(&["cc", "main.o", "-o", "app"]);
+        args.extend(flags);
+        let parsed = compiler.parse(&args).unwrap();
+        assert!(
+            matches!(
+                compiler.refuse_reasons(&parsed).as_slice(),
+                [RefuseReason::Unsupported(
+                    "cc link response files have untracked library selections"
+                )]
+            ),
+            "{args:?}: response files can hide quoted library options from the whitespace key parser"
+        );
+    }
+}
+
+#[test]
 fn cache_key_for_link_changes_when_an_object_changes() {
     let _lock = crate::test_support::process_state_test_lock();
     let dir = tempfile::tempdir().unwrap();

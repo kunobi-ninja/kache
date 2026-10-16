@@ -1186,6 +1186,11 @@ mod tests {
             "cargo:rustc-link-search={}/other/../lib\n",
             sibling.display()
         );
+        assert!(
+            validate_named_paths(&lexical, &env).is_err(),
+            "a parent traversal through a missing directory cannot resolve"
+        );
+        std::fs::create_dir(sibling.join("other")).unwrap();
         validate_named_paths(&lexical, &env).unwrap();
     }
 

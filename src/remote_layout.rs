@@ -1296,6 +1296,46 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn v3_extract_rejects_ambiguous_v32_depinfo() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&min_config(dir.path().join("cache"))).unwrap();
+        let source = dir.path().join("fixture.d");
+        std::fs::write(&source, b"fixture.o: __kache_cwd__/main.rs\n").unwrap();
+        store
+            .put(
+                "legacy-marker-entry",
+                "fixture",
+                &["lib".into()],
+                &[],
+                "",
+                "debug",
+                &[(source, "fixture.d".into())],
+                "",
+                "",
+            )
+            .unwrap();
+        let entry = store.entry_dir("legacy-marker-entry");
+        let meta_path = entry.join("meta.json");
+        let mut meta: EntryMeta =
+            serde_json::from_slice(&std::fs::read(&meta_path).unwrap()).unwrap();
+        meta.key_schema = 32;
+        std::fs::write(&meta_path, serde_json::to_vec(&meta).unwrap()).unwrap();
+        let pack = create_entry_pack_zstd(&entry, &store.blobs_dir(), &meta, 3).unwrap();
+        let decoder = zstd::stream::Decoder::new(std::io::Cursor::new(pack)).unwrap();
+        let target = dir.path().join("restored");
+        let error = extract_entry_pack(decoder, &target)
+            .expect_err("ambiguous v32 dep-info must not become a restored cache entry");
+        assert_eq!(
+            error.to_string(),
+            "downloaded entry uses incompatible key schema 32"
+        );
+        assert!(
+            !target.exists(),
+            "rejected legacy dep-info must not be published"
+        );
+    }
+
+    #[test]
     fn v3_extract_rejects_content_hash_mismatch() {
         let tmp = tempfile::tempdir().unwrap();
         let config = Config {

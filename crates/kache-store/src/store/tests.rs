@@ -1297,6 +1297,115 @@ fn publish_staged_blob_is_idempotent_when_blob_exists() {
     assert_eq!(staging_leftovers, 0, "discarded stage must not linger");
 }
 
+#[cfg(unix)]
+#[test]
+fn duplicate_shared_publication_keeps_blob_readonly() {
+    use std::os::unix::fs::MetadataExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(test_config(dir.path())).unwrap();
+    let source = dir.path().join("out.rlib");
+    let bytes = b"shared immutable artifact";
+    fs::write(&source, bytes).unwrap();
+    let files = [(source.clone(), "out.rlib".to_string())];
+    let _hardlink = ForceStoreHardlink::enable();
+    for key in ["first-shared-put", "duplicate-shared-put"] {
+        store
+            .put(
+                key,
+                "fixture",
+                &["lib".into()],
+                &[],
+                "",
+                "debug",
+                &files,
+                "",
+                "",
+            )
+            .unwrap();
+        let meta = store.get(key).unwrap().unwrap();
+        let blob = store.blob_path(&meta.files[0].hash);
+        let source_meta = fs::metadata(&source).unwrap();
+        let blob_meta = fs::metadata(&blob).unwrap();
+        assert_eq!(
+            (source_meta.dev(), source_meta.ino()),
+            (blob_meta.dev(), blob_meta.ino()),
+            "the fixture must exercise publication of an already-shared inode"
+        );
+        assert!(
+            blob_meta.permissions().readonly(),
+            "{key} cleared read-only protection on the published shared blob"
+        );
+        assert_eq!(fs::read(&blob).unwrap(), bytes);
+    }
+    assert_eq!(fs::read_dir(store.staging_dir()).unwrap().count(), 0);
+}
+
+#[test]
+fn losing_shared_publication_preserves_blob_readonly() {
+    for winner_already_exists in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let staged = dir.path().join("staged");
+        let blob = dir.path().join("blob");
+        let bytes = b"existing shared blob";
+        fs::write(&staged, bytes).unwrap();
+        set_blob_readonly(&staged);
+        if winner_already_exists {
+            fs::hard_link(&staged, &blob).unwrap();
+        }
+        let outcome = Store::publish_staged_blob_with(
+            &staged,
+            &blob,
+            || {
+                fs::hard_link(&staged, &blob)?;
+                Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+            },
+            |_| false,
+        )
+        .unwrap();
+        assert_eq!(outcome, PublishRename::LostRace);
+        assert!(
+            !staged.exists(),
+            "discarded shared staging alias must be removed"
+        );
+        assert!(
+            fs::metadata(&blob).unwrap().permissions().readonly(),
+            "losing shared publication cleared the winner's read-only protection: winner_already_exists={winner_already_exists}"
+        );
+        assert_eq!(fs::read(&blob).unwrap(), bytes);
+    }
+}
+
+#[test]
+fn losing_unshared_publication_keeps_source_writable() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source");
+    let staged = dir.path().join("staged");
+    let blob = dir.path().join("winner");
+    let bytes = b"identical independent artifacts";
+    fs::write(&source, bytes).unwrap();
+    fs::hard_link(&source, &staged).unwrap();
+    fs::write(&blob, bytes).unwrap();
+    set_blob_readonly(&staged);
+    set_blob_readonly(&blob);
+    let outcome = Store::publish_staged_blob_with(
+        &staged,
+        &blob,
+        || unreachable!("an existing winner needs no rename"),
+        |_| false,
+    )
+    .unwrap();
+    assert_eq!(outcome, PublishRename::LostRace);
+    assert!(!staged.exists());
+    assert!(fs::metadata(&blob).unwrap().permissions().readonly());
+    assert!(
+        !fs::metadata(&source).unwrap().permissions().readonly(),
+        "an independently staged source must remain writable after losing publication"
+    );
+    fs::write(&source, b"next compiler output").unwrap();
+    assert_eq!(fs::read(&blob).unwrap(), bytes);
+}
+
 /// Crash-orphaned staging files are reclaimed only once older than the
 /// grace period — a concurrent put's fresh snapshot is never touched.
 #[test]

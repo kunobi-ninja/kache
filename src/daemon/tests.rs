@@ -10846,7 +10846,16 @@ async fn direct_restore_coalesces_simultaneous_unknown_key_hits() {
         .unwrap()
         .unwrap()
         .forget();
-    let follower = daemon.handle_remote_check(&req);
+    let mut follower_req = req.clone();
+    follower_req.shard_dir = Some(dir.path().to_string_lossy().into_owned());
+    follower_req.entry_dir = dir
+        .path()
+        .join("store")
+        .join(".")
+        .join(&req.key)
+        .to_string_lossy()
+        .into_owned();
+    let follower = daemon.handle_remote_check(&follower_req);
     tokio::pin!(follower);
     // RemoteCheck's singleflight is claimed before its first await, so one
     // poll parks this follower behind the blocked leader.
@@ -10860,6 +10869,90 @@ async fn direct_restore_coalesces_simultaneous_unknown_key_hits() {
     assert_eq!(response.found, Some(true));
     assert_eq!(backend.gets.load(Ordering::Relaxed), 1);
     assert!(daemon.downloading.read().await.is_empty());
+}
+
+#[tokio::test]
+async fn direct_restore_same_key_commits_to_each_requested_store() {
+    for shard_leads in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("main");
+        let shard = dir.path().join("shard");
+        let main_req = check_request(&main, "two-store-same-key");
+        let mut shard_req = main_req.clone();
+        shard_req.entry_dir = shard
+            .join("store")
+            .join(&main_req.key)
+            .to_string_lossy()
+            .into_owned();
+        shard_req.shard_dir = Some(shard.to_string_lossy().into_owned());
+        let inner = test_remote_backend();
+        put_test_object(
+            &inner,
+            &test_pack_object_key(&main_req.key, "serde"),
+            &build_entry_pack(&main_req.key, "serde"),
+        )
+        .await;
+        let backend = Arc::new(DirectRestoreBackend {
+            inner,
+            gets: 0.into(),
+            started: tokio::sync::Semaphore::new(0),
+            release: Some(tokio::sync::Semaphore::new(0)),
+        });
+        let mut config = test_config(&main);
+        config.remote = Some(test_remote_config());
+        config.prefetch_enabled = false;
+        config.volume_stores = vec![crate::config::VolumeStore {
+            volume: dir.path().join("volume").to_string_lossy().into_owned(),
+            store: shard.clone(),
+            max_size: None,
+        }];
+        let daemon = Arc::new(Daemon::new(config));
+        daemon.signal_warming_complete();
+        assert!(daemon.remote_backend.set(backend.clone()).is_ok());
+        let (leader_req, follower_req) = if shard_leads {
+            (shard_req, main_req)
+        } else {
+            (main_req, shard_req)
+        };
+        let leader_daemon = daemon.clone();
+        let leader =
+            tokio::spawn(async move { leader_daemon.handle_remote_check(&leader_req).await });
+        tokio::time::timeout(Duration::from_secs(2), backend.started.acquire())
+            .await
+            .expect("leader must reach the gated GET")
+            .unwrap()
+            .forget();
+        let follower = daemon.handle_remote_check(&follower_req);
+        tokio::pin!(follower);
+        assert!(futures::poll!(&mut follower).is_pending());
+        backend.release.as_ref().unwrap().add_permits(2);
+        let leader_response = leader.await.unwrap();
+        let follower_response = tokio::time::timeout(Duration::from_secs(2), follower)
+            .await
+            .expect("the second requested store must finish restoring");
+        assert_eq!(leader_response.found, Some(true));
+        assert_eq!(follower_response.found, Some(true));
+        for store_dir in [&main, &shard] {
+            let artifact = daemon
+                .with_import_store(store_dir, |store| {
+                    let Some(meta) = store.get(&follower_req.key)? else {
+                        return Ok(None);
+                    };
+                    assert_eq!(meta.files.len(), 1);
+                    assert_eq!(meta.files[0].name, "libfoo.rlib");
+                    Ok(Some(std::fs::read(store.blob_path(&meta.files[0].hash))?))
+                })
+                .unwrap();
+            assert_eq!(
+                artifact.as_deref(),
+                Some(b"real artifact bytes".as_slice()),
+                "same-key remote hit must commit to every requested store: {} (shard_leads={shard_leads})",
+                store_dir.display()
+            );
+        }
+        assert_eq!(backend.gets.load(Ordering::Relaxed), 2);
+        assert!(daemon.downloading.read().await.is_empty());
+    }
 }
 
 // ── Remote resilience tests (#327, #564) ──────────────────────

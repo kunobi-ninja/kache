@@ -4522,7 +4522,9 @@ impl Daemon {
             request_started_at,
             remote_check_budget_ms(self.config.remote_restore_timeout_secs, req.deadline_ms).get(),
         );
-        match self.remote_checks.claim(&req.key) {
+        // Singleflight shares a completed local import, so its identity must
+        // include the validated store destination.
+        match self.remote_checks.claim(&expected_entry_dir) {
             SingleflightClaim::Follower(follower) => follower
                 .wait(deadline)
                 .await

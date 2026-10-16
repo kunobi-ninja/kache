@@ -234,6 +234,8 @@ pub struct RustcArgs {
     /// Cargo normally leaves this implicit; direct-rustc layouts are retained
     /// so cache admission can force a safe passthrough.
     pub dep_info_output: Option<PathBuf>,
+    /// Any explicit per-kind emit destination needs compiler-owned placement.
+    pub explicit_emit_output: bool,
     /// Source file (positional argument, typically the .rs file)
     pub source_file: Option<PathBuf>,
     /// Extern dependencies (--extern name=path)
@@ -321,10 +323,17 @@ pub struct ExternDep {
     pub path: Option<PathBuf>,
 }
 
-fn parse_emit_value(value: &str, kinds: &mut Vec<String>, dep_info_output: &mut Option<PathBuf>) {
+fn parse_emit_value(
+    value: &str,
+    kinds: &mut Vec<String>,
+    dep_info_output: &mut Option<PathBuf>,
+    explicit_emit_output: &mut bool,
+) {
     for part in value.split(',') {
-        let (kind, output) = part.split_once('=').unwrap_or((part, ""));
+        let destination = part.split_once('=');
+        let (kind, output) = destination.unwrap_or((part, ""));
         kinds.push(kind.to_string());
+        *explicit_emit_output |= destination.is_some();
         if kind == "dep-info" && !output.is_empty() {
             *dep_info_output = Some(PathBuf::from(output));
         }
@@ -419,6 +428,7 @@ impl RustcArgs {
             out_dir: None,
             emit: Vec::new(),
             dep_info_output: None,
+            explicit_emit_output: false,
             source_file: None,
             externs: Vec::new(),
             target: None,
@@ -478,7 +488,12 @@ impl RustcArgs {
                 "--emit" => {
                     i += 1;
                     if let Some(val) = rustc_args.get(i) {
-                        parse_emit_value(val, &mut parsed.emit, &mut parsed.dep_info_output);
+                        parse_emit_value(
+                            val,
+                            &mut parsed.emit,
+                            &mut parsed.dep_info_output,
+                            &mut parsed.explicit_emit_output,
+                        );
                     }
                 }
                 "--target" => {
@@ -509,7 +524,12 @@ impl RustcArgs {
                 }
                 _ if arg.starts_with("--emit=") => {
                     let val = &arg["--emit=".len()..];
-                    parse_emit_value(val, &mut parsed.emit, &mut parsed.dep_info_output);
+                    parse_emit_value(
+                        val,
+                        &mut parsed.emit,
+                        &mut parsed.dep_info_output,
+                        &mut parsed.explicit_emit_output,
+                    );
                 }
                 "--test" => {
                     parsed.is_test = true;

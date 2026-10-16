@@ -3053,6 +3053,9 @@ fn compute_key_into(
     hasher.update(b"\n");
     tracing::trace!("[key:{}] key_version={}", crate_name, CACHE_KEY_VERSION);
 
+    // Older entries can carry arbitrary explicit-emit filenames under a default key.
+    fold_field(&mut hasher, b"emit_placement.v1:", b"compiler-owned");
+
     // Distinguish configured from unconfigured clients of this same release.
     // Only the stable sentinel/target SET (represented by its deterministic
     // count) is folded — never the machine-local prefix spellings — so two

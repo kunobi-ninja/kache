@@ -104,3 +104,98 @@ fn miss_and_verified_hit_emit_metadata_once_and_preserve_large_diagnostics() {
         assert_eq!(hit_diagnostics, diagnostics);
     }
 }
+
+#[test]
+fn explicit_metadata_destinations_are_materialized_without_cache_replay() {
+    build_kache();
+    let temp_root = if cfg!(target_os = "macos") {
+        "/private/tmp".into()
+    } else {
+        std::env::temp_dir()
+    };
+    let fixture = tempfile::tempdir_in(temp_root).unwrap();
+    let project = fixture.path();
+    let cache = project.join("cache");
+    let home = project.join("home");
+    let out = project.join("out");
+    fs::create_dir(&cache).unwrap();
+    fs::create_dir(&home).unwrap();
+    fs::create_dir(&out).unwrap();
+    let config = isolated_config_path(&cache);
+    fs::write(&config, "[cache]\nlocal_only = true\nscheduler = false\ndeferred_discovery = false\nauto_gc = false\ndaemon_publish = false\n").unwrap();
+    fs::write(project.join("lib.rs"), "pub fn answer() -> u32 { 42 }\n").unwrap();
+    let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+    let rustup_home = std::env::var_os("RUSTUP_HOME")
+        .unwrap_or_else(|| dirs::home_dir().unwrap().join(".rustup").into_os_string());
+    let run = |wrapped: bool, emit: &str, separated: bool| {
+        let mut command = if wrapped {
+            let mut command = hermetic_command(kache_binary(), &cache, Some(&config));
+            command.arg(&rustc);
+            command
+        } else {
+            hermetic_command(&rustc, &cache, Some(&config))
+        };
+        command
+            .args([
+                "--crate-name",
+                "emit_fixture",
+                "--crate-type=rlib",
+                "--error-format=json",
+                "--json=artifacts",
+                "--out-dir",
+            ])
+            .arg(&out)
+            .arg(project.join("lib.rs"));
+        if separated {
+            command.args(["--emit", emit]);
+        } else {
+            command.arg(format!("--emit={emit}"));
+        }
+        let output = command
+            .env("HOME", &home)
+            .env("RUSTUP_HOME", &rustup_home)
+            .env("KACHE_LOG", "off")
+            .current_dir(project)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    run(true, "metadata=out/first.rmeta", false);
+    assert!(out.join("first.rmeta").is_file());
+    fs::remove_dir_all(&out).unwrap();
+    fs::create_dir(&out).unwrap();
+    run(true, "metadata=out/second.rmeta", true);
+    assert!(
+        out.join("second.rmeta").is_file(),
+        "cached emit omitted requested destination"
+    );
+    assert!(!out.join("first.rmeta").exists());
+    run(false, "metadata=out/direct.rmeta", false);
+    assert!(out.join("direct.rmeta").is_file());
+    run(true, "metadata=outside.rmeta", false);
+    assert!(project.join("outside.rmeta").is_file());
+    fs::remove_dir_all(&out).unwrap();
+    fs::create_dir(&out).unwrap();
+    run(true, "metadata", false);
+    assert!(out.join("libemit_fixture.rmeta").is_file());
+    fs::remove_dir_all(&out).unwrap();
+    fs::create_dir(&out).unwrap();
+    run(true, "metadata", true);
+    assert!(out.join("libemit_fixture.rmeta").is_file());
+    let events: Vec<Value> = fs::read_to_string(cache.join("events.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(events.len(), 5);
+    for event in &events[..3] {
+        assert_eq!(event["result"], "passthrough");
+    }
+    assert_eq!(events[3]["result"], "miss");
+    assert_eq!(events[4]["result"], "local_hit");
+    assert_eq!(events[3]["cache_key"], events[4]["cache_key"]);
+}

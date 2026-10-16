@@ -20,6 +20,8 @@ use std::process::{Command, Stdio};
 use std::time::Instant;
 use tempfile::TempDir;
 
+mod verify_process;
+
 use crate::assertions::{
     AssertionCheck, all_passed, apply_metric_assertions, apply_noop_assertions,
     count_misses_by_crate, relocate_diff_artifact_check,
@@ -1053,15 +1055,15 @@ fn phase_verify_spec(phase: Phase, fixture: &Fixture) -> Option<Cow<'_, Verify>>
 }
 
 fn run_verify(spec: &Verify, fixture: &Fixture, cwd: &Path, cache_dir: &Path) -> VerifyResult {
-    let output = match Command::new("sh")
+    let mut command = Command::new("sh");
+    command
         .arg("-c")
         .arg(&spec.run)
         .current_dir(cwd)
         .env("KACHE_CACHE_DIR", cache_dir)
         .envs(&fixture.env)
-        .stderr(Stdio::inherit())
-        .output()
-    {
+        .stderr(Stdio::inherit());
+    let output = match verify_process::run(command, spec.timeout_s) {
         Ok(o) => o,
         Err(e) => {
             return VerifyResult {
@@ -1074,7 +1076,15 @@ fn run_verify(spec: &Verify, fixture: &Fixture, cwd: &Path, cache_dir: &Path) ->
     };
 
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let exit_code = output.status.code().unwrap_or(-1);
+    let exit_code = output.exit_code;
+    if let Some(reason) = output.failure_reason {
+        return VerifyResult {
+            exit_code,
+            stdout,
+            passed: false,
+            failure_reason: Some(reason),
+        };
+    }
 
     if exit_code != spec.expected_exit_code {
         return VerifyResult {
@@ -1619,6 +1629,237 @@ mod tests {
             expected_stdout_contains: stdout.iter().map(|s| s.to_string()).collect(),
         });
         fixture
+    }
+
+    #[test]
+    fn verify_deadline_rejects_late_output_and_reaps_descendants() {
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = verify_fixture(None);
+        let mut spec = fixture.verify.clone().unwrap();
+        spec.run = "printf started; sh -c 'sleep 2; touch late'; printf ok".into();
+        spec.expected_stdout_contains = vec!["ok".into()];
+        spec.forbidden_substrings.clear();
+        spec.timeout_s = 1;
+
+        let started = std::time::Instant::now();
+        let result = super::run_verify(&spec, &fixture, temp.path(), temp.path());
+        std::thread::sleep(std::time::Duration::from_secs(3).saturating_sub(started.elapsed()));
+
+        assert!(
+            !result.passed,
+            "verification exceeded its declared deadline"
+        );
+        assert_eq!(result.exit_code, -1);
+        assert_eq!(result.stdout, "started");
+        assert_eq!(
+            result.failure_reason.as_deref(),
+            Some("timed out after 1 seconds")
+        );
+        assert!(
+            !temp.path().join("late").exists(),
+            "the child shell ran past the deadline"
+        );
+    }
+
+    #[test]
+    fn verify_deadline_stops_a_stdout_holder_after_its_parent_exits() {
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = verify_fixture(None);
+        let mut spec = fixture.verify.clone().unwrap();
+        spec.run = "printf started; (sleep 2; touch late) &".into();
+        spec.expected_stdout_contains = vec!["started".into()];
+        spec.forbidden_substrings.clear();
+        spec.timeout_s = 1;
+
+        let started = std::time::Instant::now();
+        let result = super::run_verify(&spec, &fixture, temp.path(), temp.path());
+        std::thread::sleep(std::time::Duration::from_secs(3).saturating_sub(started.elapsed()));
+
+        assert!(!result.passed, "exited shell hid a live stdout holder");
+        assert_eq!(result.exit_code, -1);
+        assert_eq!(result.stdout, "started");
+        assert_eq!(
+            result.failure_reason.as_deref(),
+            Some("timed out after 1 seconds")
+        );
+        assert!(
+            !temp.path().join("late").exists(),
+            "the stdout holder ran past the deadline"
+        );
+    }
+
+    #[test]
+    fn verify_deadline_preserves_timely_exit_and_stdout_contract() {
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = verify_fixture(None);
+        let mut spec = fixture.verify.clone().unwrap();
+        spec.run = "sleep 0.05; printf ok; exit 7".into();
+        spec.expected_exit_code = 7;
+        spec.expected_stdout_contains = vec!["ok".into()];
+        spec.forbidden_substrings.clear();
+        spec.timeout_s = 1;
+
+        let result = super::run_verify(&spec, &fixture, temp.path(), temp.path());
+
+        assert!(result.passed, "{result:?}");
+        assert_eq!(result.exit_code, 7);
+        assert_eq!(result.stdout, "ok");
+        assert_eq!(result.failure_reason, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verify_deadline_fails_and_short_circuits_the_fixture_with_cache_cleanup() {
+        let temp = tempfile::tempdir().unwrap();
+        let kache = temp.path().join("kache");
+        kache_fs::testutil::write_executable(
+            &kache,
+            r#"#!/bin/sh
+case "$1" in
+  report) printf '%s\n' '{"schema_version":1,"summary":{"hit_rate_pct":0,"total_crates":0,"local_hits":0,"prefetch_hits":0,"remote_hits":0,"misses":0}}' ;;
+  daemon) printf '%s\n' "$KACHE_CACHE_DIR" > "$(dirname "$0")/cache-location" ;;
+esac
+"#,
+        );
+        let mut fixture = verify_fixture(None);
+        fixture.dir = temp.path().to_path_buf();
+        let spec = fixture.verify.as_mut().unwrap();
+        spec.run = "sleep 3; printf ok".into();
+        spec.expected_stdout_contains = vec!["ok".into()];
+        spec.forbidden_substrings.clear();
+        spec.timeout_s = 1;
+
+        let result = super::run_fixture(&fixture, &kache).unwrap();
+
+        assert_eq!(
+            result.status, "fail",
+            "late verification passed the fixture"
+        );
+        assert_eq!(
+            result.phases.len(),
+            1,
+            "failed cold verify must stop later phases"
+        );
+        assert_eq!(result.phases[0].phase, "cold");
+        assert_eq!(result.phases[0].status, "fail");
+        let verify = result.phases[0].verify.as_ref().unwrap();
+        assert!(!verify.passed);
+        assert_eq!(
+            verify.failure_reason.as_deref(),
+            Some("timed out after 1 seconds")
+        );
+        let cache = std::fs::read_to_string(temp.path().join("cache-location")).unwrap();
+        assert!(
+            !Path::new(cache.trim()).exists(),
+            "fixture cache was not cleaned"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verify_deadline_tolerates_an_already_empty_process_group() {
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = verify_fixture(None);
+        let mut spec = fixture.verify.clone().unwrap();
+        // The shell exits and is reaped while a holder in its own process
+        // group keeps stdout open, so the deadline kills an empty group.
+        spec.run = r#"printf started; perl -e 'setpgrp(0, 0); exec "sleep", "3"' &"#.into();
+        spec.expected_stdout_contains = vec!["started".into()];
+        spec.forbidden_substrings.clear();
+        spec.timeout_s = 1;
+
+        let result = super::run_verify(&spec, &fixture, temp.path(), temp.path());
+
+        assert!(!result.passed, "{result:?}");
+        assert_eq!(result.stdout, "started");
+        assert_eq!(
+            result.failure_reason.as_deref(),
+            Some("timed out after 1 seconds")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verify_kills_background_descendants_after_a_timely_exit() {
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = verify_fixture(None);
+        let mut spec = fixture.verify.clone().unwrap();
+        spec.run = "(sleep 1; touch survived) >/dev/null 2>&1 & printf ok".into();
+        spec.expected_stdout_contains = vec!["ok".into()];
+        spec.forbidden_substrings.clear();
+        spec.timeout_s = 5;
+
+        let result = super::run_verify(&spec, &fixture, temp.path(), temp.path());
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+
+        assert!(result.passed, "{result:?}");
+        assert!(
+            !temp.path().join("survived").exists(),
+            "a background descendant outlived the verifier"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verify_reports_a_signal_death_as_exit_code_minus_one() {
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = verify_fixture(None);
+        let mut spec = fixture.verify.clone().unwrap();
+        spec.run = "kill -KILL $$".into();
+        spec.expected_stdout_contains.clear();
+        spec.forbidden_substrings.clear();
+        spec.timeout_s = 5;
+
+        let result = super::run_verify(&spec, &fixture, temp.path(), temp.path());
+
+        assert_eq!(result.exit_code, -1);
+        assert_eq!(
+            result.failure_reason.as_deref(),
+            Some("exit code -1 != expected 0")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verify_make_nonblocking_keeps_nonblocking_when_already_set() {
+        use std::os::fd::AsRawFd;
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "exit 0"])
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pipe = child.stdout.take().unwrap();
+
+        super::verify_process::make_nonblocking(pipe.as_raw_fd()).unwrap();
+        super::verify_process::make_nonblocking(pipe.as_raw_fd()).unwrap();
+
+        let flags = unsafe { libc::fcntl(pipe.as_raw_fd(), libc::F_GETFL) };
+        child.wait().unwrap();
+        assert_ne!(
+            flags & libc::O_NONBLOCK,
+            0,
+            "a second call cleared O_NONBLOCK"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verify_make_nonblocking_reports_a_failed_call() {
+        let error = super::verify_process::make_nonblocking(-1).unwrap_err();
+
+        assert_eq!(error.raw_os_error(), Some(libc::EBADF));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verify_read_available_propagates_errors_other_than_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = std::fs::File::open(dir.path()).unwrap();
+        let mut pipe = std::process::ChildStdout::from(std::os::fd::OwnedFd::from(file));
+
+        let error = super::verify_process::read_available(&mut pipe, &mut [0; 16]).unwrap_err();
+
+        assert_eq!(error.raw_os_error(), Some(libc::EISDIR));
     }
 
     #[test]

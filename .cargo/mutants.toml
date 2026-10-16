@@ -379,6 +379,12 @@ exclude_re = [
     # shape: the ubuntu lane never compiles it. The Unix `signals` module
     # stays in scope, and the runner's integration tests kill its mutants.
     "src/test_runner.rs:.*windows_signals::",
+    # The e2e verifier's Windows job-object spawn, termination and pipe
+    # polling, the `windows_signals` shape: the ubuntu lane never compiles
+    # them. The Unix process-group, nonblocking-read and deadline code stays in
+    # scope, and `Test (Windows)` runs the verify_deadline tests against the
+    # real job object.
+    "crates/kache-e2e/src/runner/verify_process.rs:.*windows::",
     "replace run_cold_phase .* with Ok",
     "replace run_mbx_cold_phase .* with Ok",
     "src/cache_fs.rs:.*replace probe_windows",

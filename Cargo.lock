@@ -2339,10 +2339,12 @@ dependencies = [
  "clap",
  "indexmap 2.14.2",
  "kache-fs",
+ "libc",
  "serde",
  "serde_json",
  "tempfile",
  "toml",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

@@ -4,33 +4,12 @@ use std::path::{Path, PathBuf};
 
 use crate::compiler::rustc::RustcCompiler;
 
-/// rustc flags that affect only diagnostics formatting or queries — never
-/// the emitted artifact bytes. Their separated value (`--flag value`) is
-/// skipped during parsing so neither the flag nor its value reaches the
-/// `residual_args` catch-all and over-keys the result (kunobi-ninja/kache#324).
-///
-/// Lint configuration is deliberately NOT listed here even when it cannot
-/// change a successful compile's object bytes: lint levels and `--check-cfg`
-/// can change whether compilation fails, and a cache hit replays success — see
-/// [`OUTCOME_AFFECTING_VALUE_FLAGS`].
-const IGNORED_VALUE_FLAGS: &[&str] = &[
-    "--error-format",
-    "--json",
-    "--color",
-    "--diagnostic-width",
-    "--print",
-    "--explain",
-];
+/// Diagnostic presentation must agree with the text replayed on a cache hit.
+const DIAGNOSTIC_VALUE_FLAGS: &[&str] =
+    &["--error-format", "--json", "--color", "--diagnostic-width"];
 
-/// Attached (`--flag=value`) forms of the diagnostics/query flags above.
-const IGNORED_ATTACHED_PREFIXES: &[&str] = &[
-    "--error-format=",
-    "--json=",
-    "--color=",
-    "--diagnostic-width=",
-    "--print=",
-    "--explain=",
-];
+const IGNORED_VALUE_FLAGS: &[&str] = &["--print", "--explain"];
+const IGNORED_ATTACHED_PREFIXES: &[&str] = &["--print=", "--explain="];
 
 /// rustc flags that can flip the compile's *outcome* between failure and success
 /// without changing the object bytes of the successful compile. A cache hit
@@ -287,7 +266,7 @@ pub struct RustcArgs {
     raw_args: Option<Vec<String>>,
     argfile_state: RustcArgfileState,
     /// Argv tokens not matched by any modeled flag above, excluding the
-    /// diagnostics / lint / query / already-keyed path flags that parsing
+    /// modeled diagnostics / lint / query / path flags that parsing
     /// explicitly drops. These can still affect codegen (e.g. `-O`, `-g`, or a
     /// future rustc flag) yet were previously invisible to the cache key, so
     /// they are folded in under a versioned tag (kunobi-ninja/kache#324).
@@ -299,6 +278,8 @@ pub struct RustcArgs {
     /// compile fails, and hits replay success — so they are folded into the
     /// cache key.
     pub outcome_lint_flags: Vec<String>,
+    /// Diagnostic flags in argv order, with separated values joined by `=`.
+    pub diagnostic_flags: Vec<String>,
     /// Whether this is a `--test` compilation (test harness binary)
     pub is_test: bool,
     /// Whether this looks like a primary compilation (has source file + crate name)
@@ -440,6 +421,7 @@ impl RustcArgs {
             argfile_state,
             residual_args: Vec::new(),
             outcome_lint_flags: Vec::new(),
+            diagnostic_flags: Vec::new(),
             is_test: false,
             is_primary: false,
             path_normalize_disabled: !crate::path_normalizer::rustc_path_normalize_enabled(),
@@ -634,7 +616,7 @@ impl RustcArgs {
                     is_query = true;
                 }
                 // Outcome-affecting lint configuration: capture flag + value for the
-                // cache key before the generic diagnostics drop below. Must
+                // cache key before the generic ignored-flags handling below. Must
                 // precede the IGNORED_* arms — classification is first-match
                 // (review finding #2).
                 _ if OUTCOME_AFFECTING_VALUE_FLAGS.contains(&arg.as_str()) => {
@@ -650,9 +632,20 @@ impl RustcArgs {
                 {
                     parsed.outcome_lint_flags.push(arg.clone());
                 }
-                // Diagnostics / lint / query flags: never change the artifact,
-                // so drop them (and their separated value) before the residual
-                // catch-all (kunobi-ninja/kache#324).
+                _ if DIAGNOSTIC_VALUE_FLAGS.contains(&arg.as_str()) => {
+                    if let Some(value) = rustc_args.get(i + 1) {
+                        parsed.diagnostic_flags.push(format!("{arg}={value}"));
+                        i += 1;
+                    } else {
+                        parsed.diagnostic_flags.push(arg.clone());
+                    }
+                }
+                _ if arg
+                    .split_once('=')
+                    .is_some_and(|(flag, _)| DIAGNOSTIC_VALUE_FLAGS.contains(&flag)) =>
+                {
+                    parsed.diagnostic_flags.push(arg.clone());
+                }
                 _ if IGNORED_VALUE_FLAGS.contains(&arg.as_str()) => {
                     i += 1; // skip the value argument
                 }

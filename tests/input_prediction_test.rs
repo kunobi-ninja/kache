@@ -104,9 +104,8 @@ fn run_kache_rustc_verify(
 enum Invocation {
     /// `--emit=link` only.
     Plain,
-    /// Cargo's emits, without JSON diagnostics: the key is Cargo's, and
-    /// discovery takes the pre-pass.
-    CargoEmits,
+    /// Cargo's argv with deferred discovery disabled to force the pre-pass.
+    CargoPrepass,
     /// Cargo's emits and JSON diagnostics reporting each artifact.
     Cargo,
 }
@@ -169,7 +168,7 @@ fn run_kache_compiler_with(
     } else {
         args.push("--emit=dep-info,metadata,link".into());
     }
-    if invocation == Invocation::Cargo {
+    if invocation != Invocation::Plain {
         args.extend(
             [
                 "--error-format=json",
@@ -179,6 +178,11 @@ fn run_kache_compiler_with(
         );
     }
     let config_path = write_test_config(cache_dir, predictions);
+    if invocation == Invocation::CargoPrepass {
+        let mut config = std::fs::read_to_string(&config_path).unwrap();
+        config.push_str("deferred_discovery = false\n");
+        std::fs::write(&config_path, config).unwrap();
+    }
     settle_writes(&[src.parent().expect("a source in a directory")]);
     let output = std::process::Command::new(kache_binary())
         .args(&args)
@@ -366,8 +370,8 @@ fn a_stale_record_is_re_derived_from_the_running_compile() {
     assert_ne!(grown.cache_key, cold.cache_key);
 
     // The pre-pass, predictions off, in a fresh directory: the same key.
-    // JSON diagnostics are not keyed, so dropping them only changes how
-    // the closure is discovered.
+    // Keep the diagnostic flags identical and disable deferred discovery
+    // through configuration so only the discovery method changes.
     let fresh = TempDir::new().unwrap();
     run_kache_rustc_with(
         cache_dir,
@@ -375,7 +379,7 @@ fn a_stale_record_is_re_derived_from_the_running_compile() {
         &src,
         false,
         None,
-        Invocation::CargoEmits,
+        Invocation::CargoPrepass,
     );
     let checked = last_event(cache_dir);
     assert_eq!(checked.result, "local_hit");
@@ -1057,6 +1061,7 @@ struct WorkspaceUnit {
     /// Copied into every target's `deps`; the member then links `facade`.
     facade: Vec<PathBuf>,
     external_targets: bool,
+    deferred_discovery: bool,
     /// Set for every build and report, after the rest.
     env: Vec<(&'static str, std::ffi::OsString)>,
     /// Kache's runtime directory, when it is not the cache directory.
@@ -1085,6 +1090,7 @@ impl WorkspaceUnit {
             proc_macro,
             facade: Vec::new(),
             external_targets: false,
+            deferred_discovery: true,
             env: Vec::new(),
             runtime: None,
             shard: None,
@@ -1241,6 +1247,11 @@ impl WorkspaceUnit {
             self.shard.as_deref().map(|shard| (target, shard)),
             predictions,
         );
+        if !self.deferred_discovery {
+            let mut config = std::fs::read_to_string(&config_path).unwrap();
+            config.push_str("deferred_discovery = false\n");
+            std::fs::write(&config_path, config).unwrap();
+        }
         settle_writes(&[checkout, target]);
         let mut command = std::process::Command::new(kache_binary());
         command
@@ -1337,7 +1348,7 @@ fn external_target_predictions_reject_changed_generated_inputs() {
 /// missing one lets it finish and stores under the key the pre-pass gives.
 #[test]
 fn a_rejected_record_keys_from_the_running_compile() {
-    let unit = WorkspaceUnit::new(true);
+    let mut unit = WorkspaceUnit::new(true);
     build_kache();
     let a = unit.checkout("a");
     let b = unit.checkout("b");
@@ -1366,7 +1377,16 @@ fn a_rejected_record_keys_from_the_running_compile() {
     if let Some(proc_macro) = &unit.proc_macro {
         std::fs::copy(proc_macro, unit.macro_in(&b.join("target"))).unwrap();
     }
-    let checked = unit.build(&b, false, None);
+    unit.deferred_discovery = false;
+    let checked = unit.build_with(
+        &b,
+        false,
+        None,
+        &[
+            "--error-format=json",
+            "--json=diagnostic-rendered-ansi,artifacts",
+        ],
+    );
     assert_eq!(checked.result, "local_hit");
     assert_eq!(checked.dep_info_runs, 1);
     assert_eq!(checked.cache_key, miss.cache_key);

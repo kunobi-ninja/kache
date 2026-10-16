@@ -2550,9 +2550,9 @@ dependencies = [
 
 [[package]]
 name = "kunobi-daemon"
-version = "0.9.0"
+version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0ff680f4500c44120fa966e89044b9092d718a0ff3a301fe061c0c88c5ebd4e9"
+checksum = "b920424e318a84a0bbe10d6297bc5206b77201bfeb4c3779e7632ab7183b3146"
 dependencies = [
  "buffa",
  "interprocess",
@@ -5051,7 +5051,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",

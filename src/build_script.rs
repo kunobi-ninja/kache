@@ -714,6 +714,11 @@ struct OutputRoots {
 struct Environment {
     out_dir: PathBuf,
     manifest_dir: PathBuf,
+    /// Cargo's target name, captured with the roots before execution.
+    target: Option<std::ffi::OsString>,
+    /// Target views derived from canonical OUT_DIR. These constrain ownership
+    /// without substituting text: symlinked profiles can change prefix shape.
+    ownership_roots: Vec<PathBuf>,
     /// Longest first, so nested roots map before their parents.
     mappings: Vec<(PathBuf, &'static str)>,
     /// Each root as Cargo spelled it, without the canonical spellings
@@ -736,12 +741,14 @@ impl Environment {
             out_dir.is_absolute() && manifest_dir.is_absolute(),
             "build-script roots must be absolute"
         );
+        let target = std::env::var_os("TARGET");
+        let ownership_roots = ownership_target_roots(&out_dir, target.as_deref());
         let mut mappings = vec![
             (out_dir.clone(), "${KACHE_OUT_DIR}"),
             (manifest_dir.clone(), "${KACHE_MANIFEST_DIR}"),
         ];
-        if let Some(target) = target_dir(&out_dir) {
-            mappings.push((target, TARGET_DIR_PLACEHOLDER));
+        if let Some(target_dir) = target_dir_for(&out_dir, target.as_deref()) {
+            mappings.push((target_dir, TARGET_DIR_PLACEHOLDER));
         }
         let cargo_home = std::env::var_os("CARGO_HOME")
             .map(PathBuf::from)
@@ -776,6 +783,8 @@ impl Environment {
         Ok(Self {
             out_dir,
             manifest_dir,
+            target,
+            ownership_roots,
             mappings,
             spellings,
             base_dirs,
@@ -826,6 +835,17 @@ impl Environment {
         self.mappings.iter().any(|(root, placeholder)| {
             *placeholder == TARGET_DIR_PLACEHOLDER && path.starts_with(root)
         })
+    }
+
+    /// All Cargo target views used by ownership guards. Derived canonical
+    /// views need not share the spelling layout used for text substitution.
+    fn target_roots(&self) -> impl Iterator<Item = &Path> {
+        self.mappings
+            .iter()
+            .filter_map(|(root, placeholder)| {
+                (*placeholder == TARGET_DIR_PLACEHOLDER).then_some(root.as_path())
+            })
+            .chain(self.ownership_roots.iter().map(PathBuf::as_path))
     }
 
     /// Every root with its placeholder, `KACHE_BASE_DIR` included.
@@ -996,15 +1016,34 @@ fn remap_flag_base_dirs(text: &[u8], base_dirs: &[PathBuf]) -> Vec<u8> {
 /// `<target>/[<triple>/]<profile>/build/<pkg>-<hash>/out`, or
 /// `.../build/<pkg>/<hash>/out`, back to `<target>`.
 pub(crate) fn target_dir(out_dir: &Path) -> Option<PathBuf> {
+    target_dir_for(out_dir, std::env::var_os("TARGET").as_deref())
+}
+
+/// The target root using the target name captured for this run.
+fn target_dir_for(out_dir: &Path, target_name: Option<&OsStr>) -> Option<PathBuf> {
     let profile = crate::cargo_layout::out_dir_profile(out_dir)?;
     let mut target = profile.parent()?;
-    if let Some(triple) = std::env::var_os("TARGET")
-        && target.file_name() == Some(triple.as_os_str())
+    if target_name.is_some_and(|name| target.file_name() == Some(name))
         && let Some(parent) = target.parent()
     {
         target = parent;
     }
     Some(target.to_path_buf())
+}
+
+/// A symlink below the lexical target root may move the profile or triple
+/// into another tree. Guard canonical siblings there without treating this
+/// possibly different prefix layout as a text-replacement alias.
+fn ownership_target_roots(out_dir: &Path, target_name: Option<&OsStr>) -> Vec<PathBuf> {
+    let mut roots: Vec<_> = target_dir_for(out_dir, target_name).into_iter().collect();
+    if let Ok(canonical) = out_dir.canonicalize()
+        && let Some(root) = target_dir_for(&canonical, target_name)
+    {
+        roots.push(root);
+    }
+    roots.sort();
+    roots.dedup();
+    roots
 }
 
 pub(crate) fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -2125,6 +2164,8 @@ mod tests {
             mappings,
             base_dirs: Vec::new(),
             dependency_roots: Vec::new(),
+            target: None,
+            ownership_roots: Vec::new(),
         }
     }
 
@@ -2172,6 +2213,8 @@ mod tests {
             spellings: Vec::new(),
             base_dirs: Vec::new(),
             dependency_roots: Vec::new(),
+            target: None,
+            ownership_roots: Vec::new(),
         };
         let excluded = package_exclusions(package, &environment);
         assert_eq!(
@@ -2186,36 +2229,48 @@ mod tests {
     }
 
     #[test]
-    fn target_dir_strips_the_unit_profile_and_triple() {
-        let _lock = crate::test_support::process_state_test_lock();
-        // SAFETY: the process-state lock serialises environment edits.
-        unsafe { std::env::remove_var("TARGET") };
+    fn target_dir_strips_the_unit_profile_and_captured_target() {
         assert_eq!(
-            target_dir(Path::new("/t/debug/build/pkg-1/out")),
+            target_dir_for(Path::new("/t/debug/build/pkg-1/out"), None),
+            Some(PathBuf::from("/t"))
+        );
+        for target in [
+            "x86_64-unknown-linux-gnu",
+            "wasm32-wasip1",
+            "wasm32-wasip2",
+            "wasm32v1-none",
+            "board",
+        ] {
+            for unit in ["pkg-0123456789abcdef", "pkg/0123456789abcdef"] {
+                let path = PathBuf::from(format!("/t/{target}/debug/build/{unit}/out"));
+                assert_eq!(
+                    target_dir_for(&path, None),
+                    Some(PathBuf::from(format!("/t/{target}"))),
+                    "without a target name the triple prefix stays"
+                );
+                assert_eq!(
+                    target_dir_for(&path, Some(OsStr::new(target))),
+                    Some(PathBuf::from("/t"))
+                );
+                assert_eq!(
+                    target_dir_for(&path, Some(OsStr::new("another-target"))),
+                    Some(PathBuf::from(format!("/t/{target}"))),
+                    "a different captured target must not strip this prefix"
+                );
+            }
+        }
+        assert_eq!(
+            target_dir_for(
+                Path::new("/t/debug/build/pkg-1/out"),
+                Some(OsStr::new("board"))
+            ),
             Some(PathBuf::from("/t"))
         );
         assert_eq!(
-            target_dir(Path::new(
-                "/t/x86_64-unknown-linux-gnu/debug/build/pkg-1/out"
-            )),
-            Some(PathBuf::from("/t/x86_64-unknown-linux-gnu")),
-            "without TARGET the triple directory is not stripped"
+            target_dir_for(Path::new("/t/debug/other/pkg-1/out"), None),
+            None
         );
-        unsafe { std::env::set_var("TARGET", "x86_64-unknown-linux-gnu") };
-        assert_eq!(
-            target_dir(Path::new(
-                "/t/x86_64-unknown-linux-gnu/debug/build/pkg-1/out"
-            )),
-            Some(PathBuf::from("/t"))
-        );
-        assert_eq!(
-            target_dir(Path::new("/t/debug/build/pkg-1/out")),
-            Some(PathBuf::from("/t")),
-            "a profile directory that is not the triple is kept"
-        );
-        unsafe { std::env::remove_var("TARGET") };
-        assert_eq!(target_dir(Path::new("/t/debug/other/pkg-1/out")), None);
-        assert_eq!(target_dir(Path::new("out")), None);
+        assert_eq!(target_dir_for(Path::new("out"), None), None);
     }
 
     #[test]
@@ -3553,6 +3608,8 @@ mod tests {
             mappings,
             base_dirs: Vec::new(),
             dependency_roots: Vec::new(),
+            target: None,
+            ownership_roots: Vec::new(),
         }
     }
 
@@ -3986,6 +4043,111 @@ mod tests {
             std::fs::read_link(out.join("cxxbridge/include/demo/src/main.rs")).unwrap(),
             Path::new("main.rs.h")
         );
+    }
+
+    #[test]
+    fn captured_targets_refuse_legacy_link_paths_and_owned_artifact_restore() {
+        for target_name in ["wasm32-wasip2", "board"] {
+            for unit in ["dep-0123456789abcdef", "dep/0123456789abcdef"] {
+                let directory = tempfile::tempdir().unwrap();
+                let (mut a, mut b) = two_targets(directory.path());
+                a.environment.target = Some(target_name.into());
+                b.environment.target = Some(target_name.into());
+                let relative = format!("{target_name}/debug/build/{unit}/out/libdemo.a");
+                let json = serde_json::json!({"version":4, "directories":[], "empty_files":[], "stdout":format!("cargo:rustc-link-search=${{KACHE_TARGET_DIR}}/{relative}\n"), "stderr":""});
+                let meta = put_manifest(&a, "target-owned-search", &json.to_string());
+                std::fs::write(b.environment.out_dir.join("untouched"), "keep").unwrap();
+                let error = b.restore(&meta).unwrap_err().to_string();
+                assert!(error.contains("not provided by DEP_*"), "{error}");
+                assert_eq!(
+                    std::fs::read(b.environment.out_dir.join("untouched")).unwrap(),
+                    b"keep",
+                    "link-path refusal must precede output cleanup"
+                );
+
+                // A cached outside artifact must pass the same captured-target
+                // ownership check even if its stdout names no search path.
+                let manifest_path = directory.path().join(MANIFEST_NAME);
+                std::fs::write(
+                    &manifest_path,
+                    r#"{"version":4,"directories":[],"empty_files":[],"stdout":"","stderr":""}"#,
+                )
+                .unwrap();
+                let library = directory.path().join("library.a");
+                std::fs::write(&library, "archive").unwrap();
+                a.store
+                    .put_with_compile_time_independent(
+                        "target-owned-artifact",
+                        CRATE_NAME,
+                        &["build-script".into()],
+                        &[],
+                        "",
+                        "",
+                        &[
+                            (manifest_path, MANIFEST_NAME.into()),
+                            (library, format!("outside/{relative}")),
+                        ],
+                        "",
+                        "",
+                        0,
+                    )
+                    .unwrap();
+                let meta = a.store.get("target-owned-artifact").unwrap().unwrap();
+                let error = b.restore(&meta).unwrap_err().to_string();
+                assert!(error.contains("cargo directory"), "{error}");
+                assert!(
+                    !directory.path().join("b/target").join(relative).exists(),
+                    "a refused artifact must not overwrite a Cargo unit"
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_profile_and_triple_link_paths_are_refused_before_restore_writes() {
+        for alias in ["profile", "triple"] {
+            let directory = tempfile::tempdir().unwrap();
+            let target = directory.path().join("target");
+            let physical = directory.path().join("physical/renamed-target");
+            let physical_profile = physical.join("debug");
+            let lexical_triple = target.join("board");
+            std::fs::create_dir_all(&physical_profile).unwrap();
+            std::fs::create_dir_all(&target).unwrap();
+            if alias == "profile" {
+                std::fs::create_dir(&lexical_triple).unwrap();
+                std::os::unix::fs::symlink(&physical_profile, lexical_triple.join("debug"))
+                    .unwrap();
+            } else {
+                std::os::unix::fs::symlink(&physical, &lexical_triple).unwrap();
+            }
+            let out = lexical_triple.join("debug/build/own-0123456789abcdef/out");
+            std::fs::create_dir_all(&out).unwrap();
+            let mut environment = environment(&out, &directory.path().join("package"));
+            environment.target = Some("board".into());
+            environment.ownership_roots =
+                ownership_target_roots(&out, environment.target.as_deref());
+            environment
+                .mappings
+                .push((target.clone(), TARGET_DIR_PLACEHOLDER));
+            environment.spellings.push((target, TARGET_DIR_PLACEHOLDER));
+            let config = crate::test_support::test_config(directory.path().join("cache"));
+            let run = Run {
+                store: Store::open(&config).unwrap(),
+                config,
+                binary_hash: "script".into(),
+                environment,
+                start: std::time::Instant::now(),
+            };
+            let sibling = physical_profile.join("build/dep/0123456789abcdef/out/lib");
+            std::fs::create_dir_all(&sibling).unwrap();
+            let json = serde_json::json!({"version":4, "directories":[], "empty_files":[], "stdout":format!("cargo:rustc-link-search={}\n", sibling.canonicalize().unwrap().display()), "stderr":""});
+            let meta = put_manifest(&run, "canonical-owned-search", &json.to_string());
+            std::fs::write(out.join("untouched"), "keep").unwrap();
+            let error = run.restore(&meta).unwrap_err().to_string();
+            assert!(error.contains("not provided by DEP_*"), "{alias}: {error}");
+            assert_eq!(std::fs::read(out.join("untouched")).unwrap(), b"keep");
+        }
     }
 
     #[test]

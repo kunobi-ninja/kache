@@ -5745,13 +5745,19 @@ fn path_is_only_used_for_includes(value_probe: &Path, source_probes: &[PathBuf])
 /// codegen template or a UI-test fixture) still counts. Every file, whatever
 /// its extension, still counts AGAINST the var.
 ///
+/// Visible declarations, imports and qualified uses of include-family names
+/// veto the proof. A glob import cannot: rustc rejects a glob-imported
+/// include-family name beside the builtin as ambiguous (E0659). `macro_use`
+/// on anything but a module vetoes it: `#[macro_use] extern crate` puts
+/// another crate's exports, which the scanner cannot see, ahead of the
+/// builtins without an error. This is
+/// conservative: other identifiers with the same spelling and qualified
+/// builtin invocations also keep values absolute.
+///
 /// Residual gaps, where the text looks like a locator but the compiled crate
 /// can still bake the value:
 /// - another crate's macro, invoked alongside a visible include use, that
 ///   expands to a value use of the same var;
-/// - a macro named `include`, `include_str` or `include_bytes` that is not the
-///   builtin (a local `macro_rules!`, an import, or a path like
-///   `mycrate::include!`);
 /// - an include inside another macro's arguments, or on an item under an
 ///   attribute macro, which can move the tokens out of the include;
 /// - a `.rs` file rustc only read as text, whose quoted include reads as proof.
@@ -5804,7 +5810,16 @@ fn env_dep_source_decision(
 ///
 /// 3: number suffixes, non-ASCII identifier bytes, and the non-ASCII
 /// whitespace and byte-order mark rustc accepts between tokens.
-const SOURCE_ENV_DEP_SCANNER_VERSION: u32 = 3;
+///
+/// 4: include-family declarations, imports and qualified invocations cannot
+/// prove builtin locator semantics; glob imports can shadow those builtins.
+///
+/// 5: glob imports no longer veto the proof; rustc rejects them as ambiguous.
+///
+/// 6: `macro_use` vetoes the proof.
+///
+/// 7: except on a module, whose macros are in this crate's sources.
+const SOURCE_ENV_DEP_SCANNER_VERSION: u32 = 7;
 
 /// How one source file's text uses an env var.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5818,7 +5833,8 @@ enum SourceEnvDepUse {
     /// `env!(var)` / `option_env!(var)` outside an include argument, or an env
     /// macro outside one whose name is not a plain string literal
     /// (`env!(concat!(..))`, `env!($name)` in a forwarding macro). Such a
-    /// macro may read any var, so it counts against every var.
+    /// macro may read any var, so it counts against every var. Ambiguous
+    /// include-family names also count against every var across source files.
     RuntimeValue,
 }
 
@@ -5851,6 +5867,7 @@ fn source_env_dep_use(source: &str, var: &str) -> SourceEnvDepUse {
     let mut groups: Vec<bool> = Vec::new();
     let mut include_depth = 0usize;
     let mut include_locator = false;
+    let mut previous_token = None;
 
     // Every pass consumes at least one byte, so a scan needs no more passes
     // than the source has bytes. Each loop in the scanner carries that bound:
@@ -5864,8 +5881,13 @@ fn source_env_dep_use(source: &str, var: &str) -> SourceEnvDepUse {
             i += whitespace;
             continue;
         }
+        if comment_starts_at(bytes, i) {
+            i = skip_comment(bytes, i);
+            continue;
+        }
+        let qualified = matches!(previous_token, Some(b':' | b'#'));
+        previous_token = Some(byte);
         match byte {
-            b'/' if comment_starts_at(bytes, i) => i = skip_comment(bytes, i),
             b'"' => i = skip_quoted_string(bytes, i + 1),
             b'\'' => i = skip_char_literal_or_lifetime(source, i),
             b'b' | b'c' | b'r' if raw_string_starts_at(bytes, i).is_some() => {
@@ -5888,9 +5910,14 @@ fn source_env_dep_use(source: &str, var: &str) -> SourceEnvDepUse {
                 let ident_start = i;
                 i = skip_ident_bytes(bytes, i);
                 let ident = &bytes[ident_start..i];
-                let Some(open) = parse_macro_open(bytes, i) else {
-                    continue;
-                };
+                let include = is_include_macro(ident);
+                let open = parse_macro_open(bytes, i);
+                if (ident == b"macro_use" && !macro_use_on_module(bytes, i))
+                    || (include && (qualified || open.is_none()))
+                {
+                    return SourceEnvDepUse::RuntimeValue;
+                }
+                let Some(open) = open else { continue };
 
                 if matches!(ident, b"env" | b"option_env") {
                     match parse_env_macro_name(source, open + 1) {
@@ -5900,7 +5927,6 @@ fn source_env_dep_use(source: &str, var: &str) -> SourceEnvDepUse {
                         _ => return SourceEnvDepUse::RuntimeValue,
                     }
                 }
-                let include = is_include_macro(ident);
                 groups.push(include);
                 include_depth += usize::from(include);
                 i = open + 1;
@@ -5914,6 +5940,68 @@ fn source_env_dep_use(source: &str, var: &str) -> SourceEnvDepUse {
     } else {
         SourceEnvDepUse::Unused
     }
+}
+
+/// Whether the `macro_use` attribute whose name ends at `after_name` is on a
+/// module. A module's macros are `macro_rules!` in this crate's sources,
+/// which the declaration check reads; any other item can bring in another
+/// crate's. Text the skip cannot place reads as not a module.
+fn macro_use_on_module(bytes: &[u8], after_name: usize) -> bool {
+    let mut i = skip_attribute_rest(bytes, after_name);
+    for _ in 0..bytes.len() {
+        i = skip_trivia(bytes, i);
+        if bytes.get(i) != Some(&b'#') {
+            break;
+        }
+        i = skip_attribute_rest(bytes, skip_trivia(bytes, i + 1) + 1);
+    }
+    let (mut item, end) = next_ident(bytes, i);
+    if item == b"pub" {
+        let mut after = skip_trivia(bytes, end);
+        if bytes.get(after) == Some(&b'(') {
+            after = skip_attribute_rest(bytes, after + 1);
+        }
+        item = next_ident(bytes, after).0;
+    }
+    item == b"mod"
+}
+
+/// The identifier at `i` after trivia, empty when there is none, and where
+/// it ends.
+fn next_ident(bytes: &[u8], i: usize) -> (&[u8], usize) {
+    let start = skip_trivia(bytes, i);
+    let end = skip_ident_bytes(bytes, start);
+    (&bytes[start..end], end)
+}
+
+/// The position after the delimiter that closes one already open at `i`,
+/// with strings, raw strings and comments skipped.
+fn skip_attribute_rest(bytes: &[u8], mut i: usize) -> usize {
+    let mut depth = 1usize;
+    for _ in 0..bytes.len() {
+        let Some(&byte) = bytes.get(i) else { break };
+        if comment_starts_at(bytes, i) {
+            i = skip_comment(bytes, i);
+            continue;
+        }
+        match byte {
+            b'"' => i = skip_quoted_string(bytes, i + 1),
+            b'b' | b'c' | b'r' => i = skip_raw_string(bytes, i),
+            b'(' | b'[' | b'{' => {
+                depth += 1;
+                i += 1;
+            }
+            b')' | b']' | b'}' => {
+                depth -= 1;
+                i += 1;
+                if depth == 0 {
+                    return i;
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    bytes.len()
 }
 
 fn is_include_macro(name: &[u8]) -> bool {

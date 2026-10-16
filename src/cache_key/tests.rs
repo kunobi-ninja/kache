@@ -11744,6 +11744,35 @@ fn env_dep_use_memo_rescans_rows_from_other_scanner_versions() {
 }
 
 #[test]
+fn shadowed_include_names_rescan_version_three_memos() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("lib.rs");
+    std::fs::write(
+        &source,
+        br#"macro_rules! include { ($path:expr) => { $path }; } include!(env!("OUT_DIR"));"#,
+    )
+    .unwrap();
+    let db = dir.path().join("idx.sqlite");
+    let hash = hash_file(&source).unwrap();
+    let cache = FileHashCache::open(&db).unwrap();
+    cache
+        .put_source_env_dep_use(
+            &hash,
+            "OUT_DIR",
+            3,
+            SourceEnvDepUse::IncludeLocator.memo_code(),
+        )
+        .unwrap();
+    drop(cache);
+    assert_eq!(
+        FileHasher::persistent(&db)
+            .env_dep_use(&source, "OUT_DIR")
+            .unwrap(),
+        SourceEnvDepUse::RuntimeValue
+    );
+}
+
+#[test]
 fn env_dep_use_memo_codes_round_trip() {
     for answer in [
         SourceEnvDepUse::Unused,
@@ -16740,4 +16769,195 @@ fn environment_detail_hashes_follow_the_normalized_key_inputs() {
     );
     assert_ne!(first["BUILD_MODE"], second["BUILD_MODE"]);
     assert!(hashed(Vec::new()).is_empty());
+}
+
+#[test]
+fn source_env_dep_use_rejects_ambiguous_include_names() {
+    for name in ["include", "include_str", "include_bytes"] {
+        for source in [
+            format!(
+                "macro_rules! {name} {{ ($path:expr) => {{ $path }}; }} {name}!(env!(\"OUT_DIR\"));"
+            ),
+            format!("use other::{name}; {name}!(env!(\"OUT_DIR\"));"),
+            format!("use other::{{exported as {name}}}; {name}!(env!(\"OUT_DIR\"));"),
+            format!("other::{name}!(env!(\"OUT_DIR\"));"),
+            format!("other::r#{name}!(env!(\"OUT_DIR\"));"),
+            format!("other:: /* path trivia */ {name}!(env!(\"OUT_DIR\"));"),
+            format!(
+                "{name}!(env!(\"OUT_DIR\")); macro_rules! {name} {{ ($path:expr) => {{ $path }}; }}"
+            ),
+        ] {
+            assert_eq!(
+                source_env_dep_use(&source, "OUT_DIR"),
+                SourceEnvDepUse::RuntimeValue,
+                "{source}"
+            );
+        }
+        let builtin = format!(
+            "// macro_rules! {name} {{}}\nuse other::Thing; let _ = *ptr; const S: &str = \"use other::*;\"; {name} /* trivia */ ! (env!(\"OUT_DIR\"));"
+        );
+        assert_eq!(
+            source_env_dep_use(&builtin, "OUT_DIR"),
+            SourceEnvDepUse::IncludeLocator,
+            "ordinary imports, multiplication, strings and comments must preserve builtin proof"
+        );
+        let declarations = format!("macro_rules! {name} {{ ($path:expr) => {{ $path }}; }}");
+        let include = format!("{name}!(env!(\"OUT_DIR\"));");
+        assert_eq!(
+            out_dir_decision_for_files(
+                &[
+                    ("src/macros.rs", Some(&declarations)),
+                    ("src/lib.rs", Some(&include))
+                ],
+                &FileHasher::new()
+            ),
+            EnvDepNormalizationDecision::KeptAbsoluteRuntimeUse,
+            "declarations in another source must veto locator proof"
+        );
+    }
+}
+
+/// thiserror's and serde_core's shapes. rustc rejects a glob-imported
+/// `include`, `concat` or `env` beside the builtin (E0659), so a crate that
+/// compiles with a glob calls the builtin.
+const GLOB_THEN_INCLUDE: [&str; 2] = [
+    "pub use thiserror_impl::*;\ninclude!(concat!(env!(\"OUT_DIR\"), \"/private.rs\"));",
+    "pub use core::*;\ninclude!(concat!(env!(\"OUT_DIR\"), \"/private.rs\"));",
+];
+
+#[test]
+fn glob_imports_keep_the_include_locator_proof() {
+    for source in GLOB_THEN_INCLUDE {
+        assert_eq!(
+            source_env_dep_use(source, "OUT_DIR"),
+            SourceEnvDepUse::IncludeLocator,
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn glob_imports_rescan_version_four_memos() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("lib.rs");
+    std::fs::write(&source, GLOB_THEN_INCLUDE[0]).unwrap();
+    let db = dir.path().join("idx.sqlite");
+    let hash = hash_file(&source).unwrap();
+    let cache = FileHashCache::open(&db).unwrap();
+    cache
+        .put_source_env_dep_use(
+            &hash,
+            "OUT_DIR",
+            4,
+            SourceEnvDepUse::RuntimeValue.memo_code(),
+        )
+        .unwrap();
+    drop(cache);
+    assert_eq!(
+        FileHasher::persistent(&db)
+            .env_dep_use(&source, "OUT_DIR")
+            .unwrap(),
+        SourceEnvDepUse::IncludeLocator
+    );
+}
+
+/// `#[macro_use] extern crate other;` puts other's exported macros in the
+/// macro_use prelude, which rustc consults before the builtins: an exported
+/// `include` replaces the builtin without an error, and the scanner cannot
+/// see what another crate exports.
+const MACRO_USE_THEN_INCLUDE: &str =
+    "#[macro_use]\nextern crate other;\ninclude!(concat!(env!(\"OUT_DIR\"), \"/private.rs\"));";
+
+#[test]
+fn macro_use_extern_crates_veto_the_include_locator_proof() {
+    assert_eq!(
+        source_env_dep_use(MACRO_USE_THEN_INCLUDE, "OUT_DIR"),
+        SourceEnvDepUse::RuntimeValue
+    );
+}
+
+#[test]
+fn macro_use_extern_crates_rescan_version_five_memos() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("lib.rs");
+    std::fs::write(&source, MACRO_USE_THEN_INCLUDE).unwrap();
+    let db = dir.path().join("idx.sqlite");
+    let hash = hash_file(&source).unwrap();
+    let cache = FileHashCache::open(&db).unwrap();
+    cache
+        .put_source_env_dep_use(
+            &hash,
+            "OUT_DIR",
+            5,
+            SourceEnvDepUse::IncludeLocator.memo_code(),
+        )
+        .unwrap();
+    drop(cache);
+    assert_eq!(
+        FileHasher::persistent(&db)
+            .env_dep_use(&source, "OUT_DIR")
+            .unwrap(),
+        SourceEnvDepUse::RuntimeValue
+    );
+}
+
+/// serde's and serde_core's shape. A `#[macro_use]` module's macros are
+/// `macro_rules!` in this crate's sources, which the declaration check reads.
+#[test]
+fn macro_use_modules_keep_the_include_locator_proof() {
+    for source in [
+        "#[macro_use]\nmod crate_root;\n#[cfg(docsrs)]\n#[macro_use]\n#[path = \"core/macros.rs\"]\npub mod macros;\ninclude!(concat!(env!(\"OUT_DIR\"), \"/private.rs\"));",
+        "#[macro_use] mod macros; include!(concat!(env!(\"OUT_DIR\"), \"/private.rs\"));",
+        "#[macro_use]\n#[doc = \"]\"]\nmod macros;\ninclude!(concat!(env!(\"OUT_DIR\"), \"/x.rs\"));",
+        "#[macro_use] pub(crate) mod macros; include!(concat!(env!(\"OUT_DIR\"), \"/x.rs\"));",
+        "#[macro_use /* ] */] mod macros; include!(concat!(env!(\"OUT_DIR\"), \"/x.rs\"));",
+        "#[macro_use]\n#[doc = r#\"a\"]\"#]\nmod macros;\ninclude!(concat!(env!(\"OUT_DIR\"), \"/x.rs\"));",
+        "#[macro_use]\n#[cfg(all(a, b))]\nmod macros;\ninclude!(concat!(env!(\"OUT_DIR\"), \"/x.rs\"));",
+    ] {
+        assert_eq!(
+            source_env_dep_use(source, "OUT_DIR"),
+            SourceEnvDepUse::IncludeLocator,
+            "{source}"
+        );
+    }
+    // Anything else under macro_use may bring in another crate's macros.
+    for source in [
+        "#[macro_use(include)] extern crate other; include!(concat!(env!(\"OUT_DIR\"), \"/x.rs\"));",
+        "#[macro_use]\n#[cfg(feature = \"x\")]\npub extern crate other;\ninclude!(concat!(env!(\"OUT_DIR\"), \"/x.rs\"));",
+    ] {
+        assert_eq!(
+            source_env_dep_use(source, "OUT_DIR"),
+            SourceEnvDepUse::RuntimeValue,
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn macro_use_modules_rescan_version_six_memos() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("lib.rs");
+    std::fs::write(
+        &source,
+        "#[macro_use] mod macros; include!(concat!(env!(\"OUT_DIR\"), \"/private.rs\"));",
+    )
+    .unwrap();
+    let db = dir.path().join("idx.sqlite");
+    let hash = hash_file(&source).unwrap();
+    let cache = FileHashCache::open(&db).unwrap();
+    cache
+        .put_source_env_dep_use(
+            &hash,
+            "OUT_DIR",
+            6,
+            SourceEnvDepUse::RuntimeValue.memo_code(),
+        )
+        .unwrap();
+    drop(cache);
+    assert_eq!(
+        FileHasher::persistent(&db)
+            .env_dep_use(&source, "OUT_DIR")
+            .unwrap(),
+        SourceEnvDepUse::IncludeLocator
+    );
 }

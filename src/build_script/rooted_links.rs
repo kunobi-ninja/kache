@@ -45,12 +45,9 @@ fn roots(environment: &Environment) -> Vec<(PathBuf, Option<Root>)> {
             .map(|path| (path.to_path_buf(), None)),
     );
     for (path, placeholder) in &environment.spellings {
-        match *placeholder {
-            "${KACHE_CARGO_HOME}" => {
-                roots.push((path.join("registry/src"), Some(Root::RegistrySource)));
-                roots.push((path.join("git/checkouts"), Some(Root::GitCheckout)));
-            }
-            _ => {}
+        if *placeholder == "${KACHE_CARGO_HOME}" {
+            roots.push((path.join("registry/src"), Some(Root::RegistrySource)));
+            roots.push((path.join("git/checkouts"), Some(Root::GitCheckout)));
         }
     }
     let mut roots: Vec<_> = roots
@@ -280,7 +277,19 @@ mod tests {
         nested
             .spellings
             .push((target.clone(), TARGET_DIR_PLACEHOLDER));
+        nested
+            .mappings
+            .push((target.clone(), TARGET_DIR_PLACEHOLDER));
         assert!(classify(&nested, &target).is_err());
+        let owned = directory
+            .path()
+            .join("cargo/registry/src/cxx/canonical-target");
+        std::fs::create_dir_all(&owned).unwrap();
+        nested.ownership_roots.push(owned.clone());
+        assert!(
+            classify(&nested, &owned).is_err(),
+            "an ownership-only target view is not a source root"
+        );
         assert!(classify(&env, &directory.path().join("cargo")).is_err());
     }
 

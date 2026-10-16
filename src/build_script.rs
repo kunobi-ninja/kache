@@ -334,13 +334,7 @@ pub fn run_shim() -> i32 {
             Ok(code) => Some(code),
             Err(error) => {
                 log_bypass(&error);
-                // A failed restore must not hand unsafe leftover links to
-                // the real script when its cleanup also failed.
-                if error.is::<RestoreCleanupFailed>() {
-                    Some(1)
-                } else {
-                    None
-                }
+                cache_bypass_exit_code(&error)
             }
         }
     } else {
@@ -487,12 +481,7 @@ fn run_cached(real: &Path, argv: &[std::ffi::OsString]) -> Result<i32> {
                     );
                     return Ok(0);
                 }
-                Err(error) => {
-                    if error.is::<RestoreCleanupFailed>() {
-                        return Err(error);
-                    }
-                    tracing::debug!("build-script result not restored, running it: {error:#}");
-                }
+                Err(error) => continue_after_restore_failure(error)?,
             }
         }
     }
@@ -602,6 +591,29 @@ impl std::fmt::Display for RestoreCleanupFailed {
 }
 
 impl std::error::Error for RestoreCleanupFailed {}
+
+/// Clear a rejected restore before a real script may use OUT_DIR. A successful
+/// restore needs no cleanup; a successful cleanup preserves the restore error.
+fn finish_restore<T>(restored: Result<T>, cleanup: impl FnOnce() -> Result<()>) -> Result<T> {
+    if restored.is_err() {
+        cleanup().context(RestoreCleanupFailed)?;
+    }
+    restored
+}
+
+fn continue_after_restore_failure(error: anyhow::Error) -> Result<()> {
+    if cache_bypass_exit_code(&error).is_some() {
+        return Err(error);
+    }
+    tracing::debug!("build-script result not restored, running it: {error:#}");
+    Ok(())
+}
+
+/// A rejected restore whose outputs could not be removed cannot fall back to
+/// the real script. The marker survives extra context at either caller.
+fn cache_bypass_exit_code(error: &anyhow::Error) -> Option<i32> {
+    error.is::<RestoreCleanupFailed>().then_some(1)
+}
 
 /// File systems stamp writes from a clock that advances in ticks (a jiffy on
 /// Linux, 15.6 ms by default on Windows), so a write just after `now` can
@@ -1416,13 +1428,9 @@ impl Run {
         // The recorded run started from an empty OUT_DIR (see `record`), so
         // the restored state is exact only if this one does too.
         clear_directory(&self.environment.out_dir)?;
-        let restored = self.restore_outputs(meta, &manifest);
-        if restored.is_err() {
-            // Never let a fallback run write through links from a rejected
-            // manifest. Errors before the initial clear preserve prior output.
-            clear_directory(&self.environment.out_dir).context(RestoreCleanupFailed)?;
-        }
-        restored
+        finish_restore(self.restore_outputs(meta, &manifest), || {
+            clear_directory(&self.environment.out_dir)
+        })
     }
 
     fn restore_outputs(&self, meta: &EntryMeta, manifest: &Manifest) -> Result<u64> {
@@ -4016,6 +4024,92 @@ mod tests {
             a.action_key_as(b"kache-build-script-action-v2", &prediction, None, &tools)
                 .unwrap(),
             a.action_key_with(&prediction, None, &tools).unwrap()
+        );
+    }
+
+    #[test]
+    fn completed_restore_keeps_outputs_without_running_cleanup() {
+        let directory = tempfile::tempdir().unwrap();
+        let artifact = directory.path().join("generated.h");
+        std::fs::write(&artifact, "valid output").unwrap();
+        let value = finish_restore(Ok(12_u64), || {
+            std::fs::remove_file(&artifact)?;
+            anyhow::bail!("cleanup must not run after a successful restore")
+        })
+        .unwrap();
+        assert_eq!(value, 12);
+        assert_eq!(std::fs::read(&artifact).unwrap(), b"valid output");
+    }
+
+    #[test]
+    fn rejected_restore_cleans_outputs_and_preserves_its_error_for_fallback() {
+        let directory = tempfile::tempdir().unwrap();
+        let artifact = directory.path().join("rejected-output");
+        std::fs::write(&artifact, "unsafe leftover").unwrap();
+        let calls = std::cell::Cell::new(0);
+        let failed: Result<u64> = Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid cached output",
+        )
+        .into());
+        let error = finish_restore(failed.context("restore rejected"), || {
+            calls.set(calls.get() + 1);
+            clear_directory(directory.path())
+        })
+        .unwrap_err();
+        assert_eq!(calls.get(), 1);
+        assert!(!artifact.exists());
+        assert_eq!(
+            format!("{error:#}"),
+            "restore rejected: invalid cached output"
+        );
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        let mut ran_script = false;
+        let code = cache_bypass_exit_code(&error).unwrap_or_else(|| {
+            ran_script = true;
+            23
+        });
+        assert!(ran_script, "clean output permits the ordinary fallback");
+        assert_eq!(code, 23);
+        continue_after_restore_failure(error).unwrap();
+    }
+
+    #[test]
+    fn failed_restore_cleanup_stays_fatal_through_cache_bypass_context() {
+        let calls = std::cell::Cell::new(0);
+        let failed: Result<u64> = Err(anyhow::anyhow!("restore rejected"));
+        let error = finish_restore(failed, || {
+            calls.set(calls.get() + 1);
+            Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "cleanup denied").into())
+        })
+        .context("restoring cached build script")
+        .unwrap_err();
+        assert_eq!(calls.get(), 1);
+        assert!(error.is::<RestoreCleanupFailed>());
+        assert_eq!(
+            format!("{error:#}"),
+            "restoring cached build script: cannot remove outputs from a rejected build-script restore: cleanup denied"
+        );
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        let error = continue_after_restore_failure(error)
+            .context("cache bypass")
+            .unwrap_err();
+        assert!(error.is::<RestoreCleanupFailed>());
+        let mut ran_script = false;
+        let code = cache_bypass_exit_code(&error).unwrap_or_else(|| {
+            ran_script = true;
+            23
+        });
+        assert_eq!(code, 1);
+        assert!(
+            !ran_script,
+            "the real script must not see rejected leftovers"
         );
     }
 

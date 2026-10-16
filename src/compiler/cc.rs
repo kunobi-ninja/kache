@@ -3137,12 +3137,13 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         // Separated (`-isystem <dir>`) and joined (`-isystem<dir>`) forms:
         // GCC and clang read both, and build scripts pass the joined one
         // through `cc::Build::flag`. Not a plain prefix: clang's
-        // `-isystem-after <dir>` is another flag, and GCC reads a leading
-        // `=` as the sysroot, which `cc_flag_dir_values` does not model.
-        // Both stay unsupported.
-        matcher: Matcher::Regex(r"-isystem(?:[^-=].*)?"),
+        // `-isystem-after <dir>` is another flag. GCC expands leading `=`
+        // and `$SYSROOT` directory values relative to its sysroot; joined
+        // values starting `=` or `$` stay unsupported until that resolution
+        // is modeled by `cc_flag_dir_values`.
+        matcher: Matcher::Regex(r"-isystem(?:[^-=$].*)?"),
         class: FlagClass::PreprocessorCaptured,
-        source: "PR #94; joined form. Regex: not `-isystem-after`, not `-isystem=`.",
+        source: "PR #94; joined form excluding -isystem-* and sysroot-indirect values.",
         dialect: None,
     },
     FlagSpec {
@@ -3171,16 +3172,16 @@ pub static CC_FLAGS: &[FlagSpec] = &[
     },
     FlagSpec {
         // Separated and joined (`-iquote<dir>`) forms, as for `-isystem`.
-        matcher: Matcher::Regex(r"-iquote(?:[^=].*)?"),
+        matcher: Matcher::Regex(r"-iquote(?:[^=$].*)?"),
         class: FlagClass::PreprocessorCaptured,
-        source: "PR #94; joined form. Regex: not `-iquote=` (sysroot).",
+        source: "PR #94; joined form excluding sysroot-indirect values.",
         dialect: None,
     },
     FlagSpec {
         // Separated and joined (`-idirafter<dir>`) forms, as for `-isystem`.
-        matcher: Matcher::Regex(r"-idirafter(?:[^=].*)?"),
+        matcher: Matcher::Regex(r"-idirafter(?:[^=$].*)?"),
         class: FlagClass::PreprocessorCaptured,
-        source: "PR #94; joined form. Regex: not `-idirafter=` (sysroot).",
+        source: "PR #94; joined form excluding sysroot-indirect values.",
         dialect: None,
     },
     FlagSpec {
@@ -6015,8 +6016,9 @@ fn cc_flag_dir_values<'a>(rest: &'a [String], flag: &'a str) -> Vec<&'a str> {
             if !value.is_empty() {
                 values.push(value);
             }
-        } else if !suffix.starts_with('-') {
-            // The joined form, `-isystem<dir>`; `-isystem-after` is another flag.
+        } else if flag != "-isystem" || !suffix.starts_with('-') {
+            // `-isystem-after` is another flag, but `-iquote-headers`
+            // names the ordinary relative directory `-headers`.
             values.push(suffix);
         }
     }

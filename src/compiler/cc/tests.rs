@@ -6861,6 +6861,67 @@ fn cc_flag_dir_values_reads_the_joined_form() {
 }
 
 #[test]
+fn joined_quote_and_after_dirs_can_start_with_a_hyphen() {
+    let rest = s(&["-iquote-headers", "-idirafter-after", "-isystem-after"]);
+    assert_eq!(cc_flag_dir_values(&rest, "-iquote"), ["-headers"]);
+    assert_eq!(cc_flag_dir_values(&rest, "-idirafter"), ["-after"]);
+    assert!(cc_flag_dir_values(&rest, "-isystem").is_empty());
+}
+
+#[test]
+fn joined_quote_dir_with_a_hyphen_tracks_shadowing() {
+    let _lock = crate::test_support::process_state_test_lock();
+    // A relative joined value must begin with `-` to exercise this spelling.
+    // Use a unique directory in the current directory without changing the
+    // process cwd, which would race other tests.
+    let quote = tempfile::Builder::new()
+        .prefix("-headers-")
+        .tempdir_in(".")
+        .unwrap();
+    let quote_name = quote.path().file_name().unwrap().to_str().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let fallback = temp.path().join("fallback");
+    fs::create_dir(&fallback).unwrap();
+    let read = fallback.join("header.h");
+    let source = temp.path().join("unit.c");
+    fs::write(&read, "#define VALUE 1\n").unwrap();
+    fs::write(&source, "#include \"header.h\"\nint x = VALUE;\n").unwrap();
+    let parsed = CcArgs::parse(&s(&[
+        "cc",
+        "-c",
+        source.to_str().unwrap(),
+        &format!("-iquote{quote_name}"),
+        "-I",
+        fallback.to_str().unwrap(),
+    ]))
+    .unwrap();
+    assert!(parsed.refuse_reasons(&[]).is_empty());
+    let inputs = vec![source.clone(), read.clone()];
+    let before = digest_cc_include_shadowing(&parsed, &inputs).unwrap();
+    let walked_before = digest_cc_include_dir_names(&parsed).unwrap();
+
+    let shadow = quote.path().join("header.h");
+    fs::write(&shadow, "#define VALUE 2\n").unwrap();
+    assert_ne!(
+        digest_cc_include_shadowing(&parsed, &inputs).unwrap(),
+        before,
+        "a joined quote directory must invalidate an old header resolution"
+    );
+    assert_ne!(
+        digest_cc_include_dir_names(&parsed).unwrap(),
+        walked_before,
+        "the fallback directory walk must include the joined quote directory"
+    );
+    assert_eq!(fs::read_to_string(&read).unwrap(), "#define VALUE 1\n");
+    fs::remove_file(shadow).unwrap();
+    assert_eq!(
+        digest_cc_include_shadowing(&parsed, &inputs).unwrap(),
+        before
+    );
+    assert_eq!(digest_cc_include_dir_names(&parsed).unwrap(), walked_before);
+}
+
+#[test]
 fn joined_include_dir_flags_are_not_refused() {
     // Build scripts pass `-isystem<dir>` through `cc::Build::flag`; every
     // such compile passed through as an unsupported flag.
@@ -6868,7 +6929,9 @@ fn joined_include_dir_flags_are_not_refused() {
         "-isystem/opt/libcxx/include",
         "-isystemrelative/include",
         "-iquote/opt/q",
+        "-iquote-headers",
         "-idirafter/opt/after",
+        "-idirafter-headers",
     ] {
         let descs = refuse_descriptions(&["clang++", "-c", flag, "a.cc"]);
         assert!(
@@ -6893,27 +6956,50 @@ fn joined_include_dir_flags_are_not_refused() {
 }
 
 #[test]
+fn joined_sysroot_indirect_include_dirs_stay_refused() {
+    // These are literal argv values, not environment-variable substitutions.
+    // GCC resolves `$SYSROOT` relative to its sysroot; kache does not model
+    // that search directory in its shadowing checks.
+    for flag in [
+        "-isystem$SYSROOT/include",
+        "-iquote$SYSROOT/include",
+        "-idirafter$SYSROOT/include",
+    ] {
+        for compiler in ["gcc", "clang"] {
+            let descs = refuse_descriptions(&[compiler, "-c", flag, "a.c"]);
+            assert!(
+                descs.iter().any(|d| d.contains("unsupported flag")),
+                "{compiler} {flag} must refuse, got: {descs:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn include_dir_digest_isystem_on_source_dir_is_exempt() {
+    let _lock = crate::test_support::process_state_test_lock();
     let temp = tempfile::tempdir().unwrap();
     let srcdir = temp.path().join("src");
     fs::create_dir(&srcdir).unwrap();
     let source = srcdir.join("unit.c");
     fs::write(&source, "int x;\n").unwrap();
-    let parsed = CcArgs::parse(&s(&[
-        "cc",
-        "-c",
-        source.to_str().unwrap(),
-        "-isystem",
-        srcdir.to_str().unwrap(),
-    ]))
-    .unwrap();
-    let before = digest_cc_include_dir_names(&parsed).unwrap();
-    fs::write(srcdir.join("next_to_source.h"), "int n;\n").unwrap();
-    let after = digest_cc_include_dir_names(&parsed).unwrap();
-    assert_eq!(
-        before, after,
-        "-isystem on the source directory must exempt names next to the source"
-    );
+    for include_args in [
+        s(&["-isystem", srcdir.to_str().unwrap()]),
+        vec![format!("-isystem{}", srcdir.display())],
+    ] {
+        let mut argv = s(&["cc", "-c", source.to_str().unwrap()]);
+        argv.extend(include_args);
+        let parsed = CcArgs::parse(&argv).unwrap();
+        let before = digest_cc_include_dir_names(&parsed).unwrap();
+        let header = srcdir.join("next_to_source.h");
+        fs::write(&header, "int n;\n").unwrap();
+        let after = digest_cc_include_dir_names(&parsed).unwrap();
+        assert_eq!(
+            before, after,
+            "-isystem on the source directory must exempt names next to the source: {argv:?}"
+        );
+        fs::remove_file(header).unwrap();
+    }
 }
 
 #[test]
@@ -8045,6 +8131,26 @@ fn out_dir_and_sdk_maps_follow_the_environment_and_the_normalize_switch() {
         !has(&maps, CC_SDKROOT_SENTINEL),
         "an empty SDKROOT is unset"
     );
+
+    let dep_include = dir
+        .as_path()
+        .join("target/debug/build/libz-sys-0123456789abcdef/out/include");
+    std::fs::create_dir_all(&dep_include).unwrap();
+    for include_args in [
+        s(&["-isystem", dep_include.to_str().unwrap()]),
+        vec![format!("-isystem{}", dep_include.display())],
+    ] {
+        let mut with_include = parsed.clone();
+        with_include.rest.extend(include_args);
+        let dep_maps = cc_prefix_maps(&with_include, &[]);
+        let joined = format!("-isystem{}", dep_include.display());
+        assert_eq!(
+            apply_cc_prefix_maps_to_bytes(joined.into_bytes(), &dep_maps),
+            format!("-isystem{CC_DEP_OUT_DIR_SENTINEL}/libz-sys/include").into_bytes(),
+            "system include directories must discover the dependency OUT_DIR map"
+        );
+    }
+
     let froms: std::collections::HashSet<&str> = maps.iter().map(|m| m.from.as_str()).collect();
     assert_eq!(froms.len(), maps.len(), "one map per root: {maps:?}");
 

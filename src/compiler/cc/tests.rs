@@ -8746,3 +8746,38 @@ fn clang_cl_system_include_dirs_stay_in_the_preprocessor_expansion() {
         .expect("/imsvc kept");
     assert_eq!(args[at + 1], "/home/u/.cache/cargo-xwin/xwin/crt/include");
 }
+
+#[test]
+fn clang_cl_dash_system_include_consumes_only_its_value() {
+    let parsed = CcArgs::parse(&s(&[
+        "clang-cl",
+        "-c",
+        "-imsvc",
+        "/sdk/include",
+        "/kache-unknown",
+        "foo.c",
+    ]))
+    .unwrap();
+    let unsupported = parsed
+        .refuse_reasons(&[])
+        .iter()
+        .map(|reason| reason.description())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(unsupported.contains("/kache-unknown"), "{unsupported}");
+    assert!(!unsupported.contains("/sdk/include"), "{unsupported}");
+    let args = build_preprocess_args(&parsed);
+    let at = args.iter().position(|arg| arg == "-imsvc").unwrap();
+    assert_eq!(args[at + 1], "/sdk/include");
+}
+
+#[test]
+fn clang_cl_double_dash_as_a_flag_value_does_not_end_classification() {
+    let reasons = refuse_descriptions(&["clang-cl", "-c", "-I", "--", "/kache-unknown", "foo.c"]);
+    assert!(
+        reasons
+            .iter()
+            .any(|reason| reason.contains("/kache-unknown")),
+        "a consumed value cannot hide the following unsupported flag: {reasons:?}"
+    );
+}

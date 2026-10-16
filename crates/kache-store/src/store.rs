@@ -2910,14 +2910,17 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         // no reader — locked or not — can ever observe a truncated or
         // partially written meta.json, and the rename's parent-directory
         // fsync makes the new name durable alongside the contents.
-        fs::create_dir_all(&entry_dir).context("creating entry directory")?;
+        // Finish SQL statements before replacing metadata: a statement
+        // error rolls back the references, but cannot undo the filesystem
+        // rename. Keep the write lock through metadata publication.
         let durable = self.durable_writes();
-        crate::atomic::atomic_replace_deferrable(&meta_path, meta_json.as_bytes(), durable)
-            .context("writing entry metadata")?;
         tx.execute(
             "INSERT OR REPLACE INTO entries (cache_key, crate_name, crate_type, profile, num_features, size, content_hash, compile_time_ms, key_schema, committed, durable) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10)",
             params![cache_key, crate_name, crate_type_str, profile, num_features, total_size as i64, content_hash, compile_time_ms as i64, kache_format::CACHE_KEY_VERSION, durable],
         )?;
+        fs::create_dir_all(&entry_dir).context("creating entry directory")?;
+        crate::atomic::atomic_replace_deferrable(&meta_path, meta_json.as_bytes(), durable)
+            .context("writing entry metadata")?;
         tx.commit()?;
 
         // Both ingest phases may hardlink a compiler output to the immutable

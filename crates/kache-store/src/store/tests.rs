@@ -2949,6 +2949,80 @@ fn is_corruption_error_flags_a_non_sqlite_file() {
     assert!(!is_corruption_error(&err));
 }
 
+#[test]
+fn failed_republication_preserves_metadata_and_peer() {
+    for missing_meta in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(test_config(dir.path())).unwrap();
+        let failed_key = put_entry(&store, dir.path(), 201, "failed", b"old artifact");
+        let peer_key = put_entry(&store, dir.path(), 202, "peer", b"peer artifact");
+        let peer_meta = store.get(&peer_key).unwrap().unwrap();
+        let meta_path = store.entry_dir(&failed_key).join("meta.json");
+        if missing_meta {
+            fs::remove_file(&meta_path).unwrap();
+        }
+        let previous_meta = fs::read(&meta_path).ok();
+        let _lock = if missing_meta {
+            assert!(store.get(&failed_key).unwrap().is_none());
+            match store.claim_build(&failed_key).unwrap() {
+                BuildClaim::Acquired(lock) => lock,
+                _ => panic!("a stranded entry must reach the normal publication path"),
+            }
+        } else {
+            store.try_lock(&failed_key).unwrap().unwrap()
+        };
+        store
+            .db
+            .execute_batch(&format!(
+                "CREATE TRIGGER fail_publication BEFORE INSERT ON entries
+             WHEN NEW.cache_key = '{failed_key}'
+             BEGIN SELECT RAISE(ABORT, 'publication statement failed'); END;"
+            ))
+            .unwrap();
+        let replacement = dir.path().join("replacement.rlib");
+        fs::write(&replacement, b"peer artifact").unwrap();
+        let error = store
+            .put_with_compile_time_independent(
+                &failed_key,
+                "failed",
+                &["rlib".into()],
+                &[],
+                "",
+                "dev",
+                &[(replacement, "libfailed.rlib".into())],
+                "",
+                "",
+                1,
+            )
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("publication statement failed"));
+        let attempted_meta = fs::read(&meta_path).ok();
+        let failed_hit = store.get(&failed_key).unwrap();
+        let removal = store.remove_entry(&failed_key);
+        if missing_meta && let Err(error) = removal {
+            assert!(format!("{error:#}").contains("#276"));
+        } else {
+            removal.unwrap();
+        }
+        assert!(
+            store.blob_path(&peer_meta.files[0].hash).exists(),
+            "failed republication must not let removal reclaim a peer entry's only blob"
+        );
+        assert!(store.get(&peer_key).unwrap().is_some());
+        if missing_meta {
+            assert!(
+                failed_hit.is_none(),
+                "a failed publication must leave the stranded entry a cache miss"
+            );
+        }
+        assert_eq!(
+            attempted_meta, previous_meta,
+            "a failed publication must preserve the previous metadata or its absence"
+        );
+        assert_blob_refs_match_mappings(&store);
+    }
+}
+
 /// A realistic 64-hex cache key, since the rebuild scan only adopts entry
 /// dirs whose name is a well-formed key.
 fn key(seed: u8) -> String {
@@ -5975,6 +6049,33 @@ fn reput_of_one_key_leaves_a_shared_blob_at_two() {
     );
     store.remove_entry("share_two").unwrap();
     assert_eq!(blob_table_count(&store), 0);
+}
+
+#[test]
+fn successful_stranded_republication_preserves_shared_peer() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(test_config(dir.path())).unwrap();
+    let replaced_key = put_entry(&store, dir.path(), 201, "replaced", b"old artifact");
+    let peer_key = put_entry(&store, dir.path(), 202, "peer", b"peer artifact");
+    fs::remove_file(store.entry_dir(&replaced_key).join("meta.json")).unwrap();
+    let _lock = match store.claim_build(&replaced_key).unwrap() {
+        BuildClaim::Acquired(lock) => lock,
+        _ => panic!("a stranded entry must reach the normal publication path"),
+    };
+    put_outputs(
+        &store,
+        dir.path(),
+        &replaced_key,
+        "replacement",
+        &[("libreplaced.rlib", b"peer artifact")],
+    );
+    let replacement = store.get(&replaced_key).unwrap().unwrap();
+    let peer = store.get(&peer_key).unwrap().unwrap();
+    assert_eq!(replacement.files[0].hash, peer.files[0].hash);
+    assert_blob_refs_match_mappings(&store);
+    store.remove_entry(&replaced_key).unwrap();
+    assert!(store.get(&peer_key).unwrap().is_some());
+    assert_blob_refs_match_mappings(&store);
 }
 
 /// A second download of a key that is already committed (two daemons, a

@@ -99,6 +99,8 @@ On Unix, links in `OUT_DIR` can point into the package directory, Cargo's
 absolute path. Kache records each resolved target as a root and a checked
 relative suffix, and rebuilds the link using the current run's roots. This
 supports cxx-build's package and registry-header links across checkouts.
+Cross-checkout reuse also requires the same build-script binary. A binary
+that embeds `OUT_DIR` can differ across target directories.
 Targets must exist and remain in an allowed root; links into the target
 directory, unknown roots, and dangling external targets refuse the run.
 The most specific root decides, so a target directory inside the package is

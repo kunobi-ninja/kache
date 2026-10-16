@@ -487,6 +487,12 @@ fn scan_rust(bytes: &[u8]) -> Result<Vec<Found>> {
             if !inner && let Some(path) = path_attribute(&tokens[start..end]) {
                 pending_path = Some(path);
             }
+            let attribute = &tokens[start..end];
+            for offset in 0..attribute.len() {
+                if let Some(text) = literal_include(attribute, offset)? {
+                    found.push(Found::Include(text));
+                }
+            }
             index = end.saturating_add(1);
             continue;
         }
@@ -531,16 +537,8 @@ fn scan_rust(bytes: &[u8]) -> Result<Vec<Found>> {
                 }
             }
         }
-        if tokens
-            .get(index)
-            .is_some_and(|token| matches!(token, Tok::Ident(name) if is_include(name)))
-            && punct_at(&tokens, index + 1, b'!')
-            && punct_at(&tokens, index + 2, b'(')
-        {
-            match tokens.get(index + 3) {
-                Some(Tok::Str(text)) => found.push(Found::Include(text.clone())),
-                _ => anyhow::bail!("rustdoc include is not a string literal"),
-            }
+        if let Some(text) = literal_include(&tokens, index)? {
+            found.push(Found::Include(text));
             index += 4;
             continue;
         }
@@ -558,6 +556,21 @@ fn scan_rust(bytes: &[u8]) -> Result<Vec<Found>> {
         index += 1;
     }
     Ok(found)
+}
+
+fn literal_include(tokens: &[Tok], index: usize) -> Result<Option<String>> {
+    if tokens
+        .get(index)
+        .is_some_and(|token| matches!(token, Tok::Ident(name) if is_include(name)))
+        && punct_at(tokens, index + 1, b'!')
+        && punct_at(tokens, index + 2, b'(')
+    {
+        return match tokens.get(index + 3) {
+            Some(Tok::Str(text)) => Ok(Some(text.clone())),
+            _ => anyhow::bail!("rustdoc include is not a string literal"),
+        };
+    }
+    Ok(None)
 }
 
 fn is_include(name: &str) -> bool {
@@ -2184,6 +2197,32 @@ mod tests {
         assert_eq!(idents, ["mod".to_string(), "real".to_string()]);
         assert_eq!(skip_byte_literal(b"br", 0), 1);
         assert_eq!(skip_byte_literal(b"bx", 0), 1);
+    }
+
+    #[test]
+    fn documentation_attributes_track_literal_includes_and_skip_fake_items() {
+        for attribute in [
+            r#"#[doc = include_str!("README.md")] pub fn thing() {}"#,
+            r#"#![doc = include_str!("README.md")] pub fn thing() {}"#,
+            r#"#[doc = concat!(include_str!("README.md"), "suffix")] pub fn thing() {}"#,
+        ] {
+            assert_eq!(includes(attribute), ["README.md"]);
+        }
+        assert_eq!(
+            includes(r#"#[doc = include_bytes!("bytes.txt")]"#),
+            ["bytes.txt"]
+        );
+        assert_eq!(includes(r#"#[doc = include!("code.rs")]"#), ["code.rs"]);
+        assert!(includes(r#"#[doc = "include_str!(secret.txt)"]"#).is_empty());
+        assert!(includes(r#"#[doc = fake!("secret.txt")]"#).is_empty());
+        assert_eq!(
+            module_names(r#"#[fake(mod imaginary;)] mod real;"#),
+            ["real"]
+        );
+        let error = scan_rust(br#"#[doc = include_str!(concat!("README", ".md"))]"#)
+            .err()
+            .expect("nonliteral include must be refused");
+        assert_eq!(error.to_string(), "rustdoc include is not a string literal");
     }
 
     #[test]

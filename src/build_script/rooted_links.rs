@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use super::{Environment, Manifest, TARGET_DIR_PLACEHOLDER, checked_relative};
+use super::{Environment, Manifest, checked_relative};
 
 pub(super) const MANIFEST_VERSION: u32 = 5;
 
@@ -39,9 +39,13 @@ fn roots(environment: &Environment) -> Vec<(PathBuf, Option<Root>)> {
         // another target directory or an unrecognized Cargo layout.
         (environment.manifest_dir.join("target"), None),
     ];
+    roots.extend(
+        environment
+            .target_roots()
+            .map(|path| (path.to_path_buf(), None)),
+    );
     for (path, placeholder) in &environment.spellings {
         match *placeholder {
-            TARGET_DIR_PLACEHOLDER => roots.push((path.clone(), None)),
             "${KACHE_CARGO_HOME}" => {
                 roots.push((path.join("registry/src"), Some(Root::RegistrySource)));
                 roots.push((path.join("git/checkouts"), Some(Root::GitCheckout)));
@@ -190,6 +194,7 @@ pub(super) fn restore(environment: &Environment, link: &RootedSymlink) -> Result
 
 #[cfg(all(test, unix))]
 mod tests {
+    use super::super::TARGET_DIR_PLACEHOLDER;
     use super::*;
     use std::os::unix::fs::symlink;
 
@@ -222,6 +227,8 @@ mod tests {
             ],
             base_dirs: Vec::new(),
             dependency_roots: Vec::new(),
+            target: None,
+            ownership_roots: Vec::new(),
         }
     }
 

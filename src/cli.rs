@@ -14,7 +14,7 @@ use crate::daemon;
 use crate::events;
 use crate::machine::{PathIdentity, directory_identity};
 use crate::since::SinceWindow;
-use crate::store::{STAGING_SWEEP_GRACE, Store};
+use crate::store::{STAGING_SWEEP_GRACE, Store, StoreLock};
 
 pub mod login;
 mod miss_diagnosis;
@@ -8560,6 +8560,14 @@ pub fn sync(
 ) -> Result<()> {
     let remote = config.require_remote()?;
 
+    // Another bulk sync must not replace extracted files before this one imports them.
+    let sync_lock_path = config.cache_dir.join("sync.lock");
+    let _sync_lock = loop {
+        if let Some(lock) = StoreLock::try_acquire(&sync_lock_path).context("locking cache sync")? {
+            break lock;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
     let store = Store::open(config)?;
     let workspace_crates = workspace_filter(manifest_path);
 

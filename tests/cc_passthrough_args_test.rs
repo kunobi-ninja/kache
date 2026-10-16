@@ -189,6 +189,181 @@ fn deferred_cc_reuses_setup_and_still_invalidates_changed_headers() {
     }
 }
 
+#[test]
+fn cc_header_availability_creation_uses_current_compiler_output() {
+    for discovery in ["0", "1"] {
+        for in_header in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().canonicalize().unwrap();
+            fs::write(root.join("kache.toml"), "").unwrap();
+            fs::create_dir(root.join("home")).unwrap();
+            let availability = "#if __has_include(\"optional.h\")\n\
+                                #include \"optional.h\"\n\
+                                #else\n#define VALUE 11\n#endif\n";
+            let prefix = if in_header {
+                fs::write(
+                    root.join("availability.h"),
+                    availability.replace("__has_include", "__has_inc\\\r\nlude"),
+                )
+                .unwrap();
+                "#include \"availability.h\"\n"
+            } else {
+                availability
+            };
+            fs::write(
+                root.join("unit.c"),
+                format!("{prefix}int main(void) {{ return VALUE; }}\n"),
+            )
+            .unwrap();
+            for (phase, expected) in [("cold", 11), ("warm", 11), ("created", 23)] {
+                if phase == "created" {
+                    fs::write(root.join("optional.h"), "#define VALUE 23\n").unwrap();
+                }
+                let _ = fs::remove_file(root.join("unit.o"));
+                let compiled = cacheable_cc_command(&root)
+                    .args(["/usr/bin/cc", "-c", "unit.c", "-o", "unit.o"])
+                    .env("HOME", root.join("home"))
+                    .env("KACHE_DEFERRED_DISCOVERY", discovery)
+                    .env("KACHE_DAEMON_PUBLISH", "0")
+                    .env("KACHE_MIN_STORE_COMPILE_MS", "0")
+                    .output()
+                    .unwrap();
+                assert!(
+                    compiled.status.success(),
+                    "{phase}: {}",
+                    String::from_utf8_lossy(&compiled.stderr)
+                );
+                let linked = common::hermetic_command(
+                    "/usr/bin/cc",
+                    &root.join("cache"),
+                    Some(&root.join("kache.toml")),
+                )
+                .current_dir(&root)
+                .args(["unit.o", "-o", "check-value"])
+                .output()
+                .unwrap();
+                assert!(linked.status.success(), "{phase}: {linked:?}");
+                assert_eq!(
+                    Command::new(root.join("check-value"))
+                        .status()
+                        .unwrap()
+                        .code(),
+                    Some(expected),
+                    "{phase}: __has_include must observe newly created headers \
+                     (discovery={discovery}, in_header={in_header})"
+                );
+            }
+        }
+    }
+}
+
+/// Compile `unit.c` in `root` through kache with `args` after the source,
+/// then link and run it. Returns the cache key the compile used and the
+/// program's exit code.
+fn compile_and_run_unit(root: &std::path::Path, discovery: &str, args: &[&str]) -> (String, i32) {
+    let _ = fs::remove_file(root.join("unit.o"));
+    let compiled = cacheable_cc_command(root)
+        .args(["/usr/bin/cc", "-c", "unit.c", "-o", "unit.o"])
+        .args(args)
+        .env("HOME", root.join("home"))
+        .env("KACHE_DEFERRED_DISCOVERY", discovery)
+        .env("KACHE_DAEMON_PUBLISH", "0")
+        .env("KACHE_MIN_STORE_COMPILE_MS", "0")
+        .output()
+        .unwrap();
+    assert!(
+        compiled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    let events = fs::read_to_string(root.join("cache/events.jsonl")).unwrap();
+    let event: serde_json::Value = serde_json::from_str(events.lines().last().unwrap()).unwrap();
+    let linked = Command::new("/usr/bin/cc")
+        .current_dir(root)
+        .args(["unit.o", "-o", "check-value"])
+        .status()
+        .unwrap();
+    assert!(linked.success());
+    let value = Command::new(root.join("check-value"))
+        .status()
+        .unwrap()
+        .code()
+        .unwrap();
+    (event["cache_key"].as_str().unwrap().to_string(), value)
+}
+
+/// Run `unit.c` in `root` before and after `inc/optional.h` appears. The
+/// key must hold while the header is absent and change when it appears,
+/// and the program must return `absent` and then 23.
+fn assert_probe_follows_optional_header(root: &std::path::Path, args: &[&str], absent: i32) {
+    for discovery in ["0", "1"] {
+        let _ = fs::remove_file(root.join("inc/optional.h"));
+        let _ = fs::remove_dir_all(root.join("cache"));
+        let (cold, value) = compile_and_run_unit(root, discovery, args);
+        assert!(
+            !cold.is_empty(),
+            "discovery={discovery}: the unit must have a key"
+        );
+        assert_eq!(value, absent, "discovery={discovery}: cold");
+        let (warm, value) = compile_and_run_unit(root, discovery, args);
+        assert_eq!(warm, cold, "discovery={discovery}: the key must hold");
+        assert_eq!(value, absent, "discovery={discovery}: warm");
+        fs::write(root.join("inc/optional.h"), "#define VALUE 23\n").unwrap();
+        let (created, value) = compile_and_run_unit(root, discovery, args);
+        assert_ne!(
+            created, cold,
+            "discovery={discovery}: the probed header appearing must change the key"
+        );
+        assert_eq!(value, 23, "discovery={discovery}: created");
+    }
+}
+
+/// A unit probes for a header that is absent. The header then appears in a
+/// user `-I` directory. The key must change and the object must use it.
+#[test]
+fn cc_header_probe_keys_a_header_appearing_in_a_user_include_dir() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    fs::write(root.join("kache.toml"), "").unwrap();
+    fs::create_dir(root.join("home")).unwrap();
+    fs::create_dir(root.join("inc")).unwrap();
+    fs::write(
+        root.join("unit.c"),
+        "#if __has_include(<optional.h>)\n#include <optional.h>\n\
+         #else\n#define VALUE 11\n#endif\n\
+         int main(void) { return VALUE; }\n",
+    )
+    .unwrap();
+    assert_probe_follows_optional_header(&root, &["-Iinc"], 11);
+}
+
+/// A header outside every user directory, as a system header is, probes
+/// for a header and carries the macOS SDK's fallback definition of the
+/// operator. The unit keeps a key, and the key follows the probe when the
+/// header appears in a user `-I` directory.
+#[test]
+fn cc_header_probe_outside_user_include_dirs_keys_the_unit() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    fs::write(root.join("kache.toml"), "").unwrap();
+    fs::create_dir(root.join("home")).unwrap();
+    fs::create_dir(root.join("inc")).unwrap();
+    fs::create_dir(root.join("system")).unwrap();
+    fs::write(
+        root.join("system/probing.h"),
+        "#ifndef __has_include\n#define __has_include(x) 0\n#endif\n\
+         #if defined(__has_include) && __has_include(<optional.h>)\n\
+         #include <optional.h>\n#else\n#define VALUE 5\n#endif\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("unit.c"),
+        "#include <probing.h>\nint main(void) { return VALUE; }\n",
+    )
+    .unwrap();
+    assert_probe_follows_optional_header(&root, &["-isystem", "system", "-Iinc"], 5);
+}
+
 fn cacheable_cc_command(root: &std::path::Path) -> Command {
     common::settle_writes(&[root]);
     let mut command = Command::new(kache_binary());

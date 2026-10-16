@@ -6717,6 +6717,133 @@ fn include_shadowing_covers_headers_read_from_outside_the_user_dirs() {
     );
 }
 
+/// A unit in `root` that includes `source_text`, parsed with `-I root/inc`.
+fn probing_unit(root: &Path, source_text: &str) -> (CcArgs, PathBuf, PathBuf) {
+    let include = root.join("inc");
+    fs::create_dir_all(&include).unwrap();
+    let source = root.join("unit.c");
+    fs::write(&source, source_text).unwrap();
+    let parsed = CcArgs::parse(&s(&[
+        "cc",
+        "-c",
+        source.to_str().unwrap(),
+        "-I",
+        include.to_str().unwrap(),
+    ]))
+    .unwrap();
+    (parsed, source, include)
+}
+
+/// Whether `header` appearing in `include` changes the shadowing digest of
+/// `inputs`. The header is removed again afterwards.
+fn probed_header_moves_the_key(parsed: &CcArgs, inputs: &[PathBuf], header: &Path) -> bool {
+    let before = digest_cc_include_shadowing(parsed, inputs).unwrap();
+    fs::write(header, "#define VALUE 23\n").unwrap();
+    let after = digest_cc_include_shadowing(parsed, inputs).unwrap();
+    fs::remove_file(header).unwrap();
+    before != after
+}
+
+/// The bug: a header that `__has_include` found absent was never read, so
+/// its later appearance in a user directory left the key unchanged. Every
+/// literal form of the probe must key the header it names.
+#[test]
+fn include_shadowing_keys_every_literal_probe_form() {
+    for probe in [
+        "__has_include(<optional.h>)",
+        "__has_include(\"optional.h\")",
+        "__has_include_next(<optional.h>)",
+        "__has_include_next\t( \"optional.h\" )",
+        "__has_include ( <optional.h> )",
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let (parsed, source, include) =
+            probing_unit(temp.path(), &format!("#if {probe}\n#endif\nint x;\n"));
+        assert!(
+            probed_header_moves_the_key(&parsed, &[source], &include.join("optional.h")),
+            "{probe}: the probed header appearing must change the key"
+        );
+    }
+}
+
+/// The preprocessor joins a backslash-newline before it reads the probe, so
+/// a probe split across lines still tests its header.
+#[test]
+fn include_shadowing_keys_a_probe_split_by_line_continuations() {
+    let temp = tempfile::tempdir().unwrap();
+    let (parsed, source, include) = probing_unit(
+        temp.path(),
+        "#if __has_inc\\\r\nlude(\\\n<optional.h>)\n#endif\nint x;\n",
+    );
+    assert!(probed_header_moves_the_key(
+        &parsed,
+        &[source],
+        &include.join("optional.h")
+    ));
+}
+
+/// A quoted probe in a header searches that header's own directory first,
+/// and that directory need not be a user directory itself.
+#[test]
+fn include_shadowing_keys_a_quoted_probe_beside_its_header() {
+    let temp = tempfile::tempdir().unwrap();
+    let (parsed, source, include) = probing_unit(temp.path(), "#include \"sub/avail.h\"\nint x;\n");
+    let sub = include.join("sub");
+    fs::create_dir(&sub).unwrap();
+    let header = sub.join("avail.h");
+    fs::write(&header, "#if __has_include(\"optional.h\")\n#endif\n").unwrap();
+    assert!(probed_header_moves_the_key(
+        &parsed,
+        &[source, header],
+        &sub.join("optional.h")
+    ));
+}
+
+/// Feature tests on the operator and a fallback definition of it, as the
+/// macOS SDK's `sys/cdefs.h` carries, are no probes. A header with them
+/// still keys the probe it makes, and is not refused.
+#[test]
+fn include_shadowing_keys_a_probe_beside_fallback_definitions() {
+    let temp = tempfile::tempdir().unwrap();
+    let (parsed, source, include) = probing_unit(
+        temp.path(),
+        "#ifndef __has_include\n\
+         #  define __has_include(x) 0\n\
+         #define __has_include_next(__x) 0\n\
+         #endif\n\
+         #ifdef __has_include\n\
+         #error \"the __has_include check should move\"\n\
+         #endif\n\
+         #define HAVE_OPTIONAL __has_include(<optional.h>)\n\
+         #if defined(__has_include) && HAVE_OPTIONAL\n\
+         #endif\n\
+         int x;\n",
+    );
+    assert!(probed_header_moves_the_key(
+        &parsed,
+        &[source],
+        &include.join("optional.h")
+    ));
+}
+
+/// A probe that names its header through a macro tests a name only that
+/// macro's definition decides. The key cannot follow it, so the unit is
+/// refused.
+#[test]
+fn include_shadowing_refuses_a_probe_through_a_macro() {
+    for text in [
+        "#if __has_include(HEADER)\n#endif\n",
+        "#define HAS(h) __has_include_next(h)\n",
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let (parsed, source, _) = probing_unit(temp.path(), text);
+        assert!(
+            digest_cc_include_shadowing(&parsed, &[source]).is_err(),
+            "{text}: a probe through a macro must refuse the key"
+        );
+    }
+}
+
 #[test]
 fn include_dir_digest_changes_when_an_earlier_dir_gains_a_header() {
     let temp = tempfile::tempdir().unwrap();
@@ -7339,7 +7466,7 @@ fn a_stamped_recheck_notices_a_header_added_after_the_key() {
         second.to_str().unwrap(),
     ]))
     .unwrap();
-    let names = cc_shadowing_names(&parsed, &[source.clone(), read]);
+    let names = cc_shadowing_names(&parsed, &[source.clone(), read]).unwrap();
     let compiler = CcCompiler::new();
     let key = |compiler: &CcCompiler| {
         let (digest, stamps) = digest_cc_shadowing_names_stamped(&parsed, &names).unwrap();

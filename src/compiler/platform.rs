@@ -44,6 +44,7 @@
 //!   know gcc-vs-clang-vs-MSVC.
 
 use anyhow::{Context as _, Result};
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -258,7 +259,10 @@ impl Platform for MacOsPlatform {
         //   2. lldb's adjacent-bundle lookup is by `<binary>.dSYM` sibling
         //      path, which is exactly this location.
         let bundle_dir = binary.with_file_name(format!("{file_name}.dSYM"));
-        let status = match debug_bundle_command(binary, &bundle_dir)?.status() {
+        let Some(mut command) = macho_debug_bundle_command(binary, &bundle_dir)? else {
+            return Ok(None);
+        };
+        let status = match command.status() {
             Ok(status) => status,
             Err(err) => {
                 // Best-effort per the trait contract: no dsymutil (unusual
@@ -288,6 +292,33 @@ impl Platform for MacOsPlatform {
             }
         }
     }
+}
+
+/// Cross-compilation can produce ELF or PE executables on a macOS host.
+/// Inspect only the format marker; dsymutil validates the Mach-O contents.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn macho_debug_bundle_command(binary: &Path, bundle_dir: &Path) -> Result<Option<Command>> {
+    let mut magic = [0; 4];
+    if let Err(err) = std::fs::File::open(binary).and_then(|mut file| file.read_exact(&mut magic)) {
+        tracing::warn!("unable to inspect debug binary {}: {err}", binary.display());
+        return Ok(None);
+    }
+    if !matches!(
+        &magic,
+        // Thin 32/64-bit Mach-O and universal 32/64-bit Mach-O, in both
+        // byte orders. A universal executable can carry multiple slices.
+        b"\xce\xfa\xed\xfe"
+            | b"\xfe\xed\xfa\xce"
+            | b"\xcf\xfa\xed\xfe"
+            | b"\xfe\xed\xfa\xcf"
+            | b"\xca\xfe\xba\xbe"
+            | b"\xbe\xba\xfe\xca"
+            | b"\xca\xfe\xba\xbf"
+            | b"\xbf\xba\xfe\xca"
+    ) {
+        return Ok(None);
+    }
+    debug_bundle_command(binary, bundle_dir).map(Some)
 }
 
 /// Resolve paths before changing the child's cwd: cached macOS debug links
@@ -723,8 +754,8 @@ pub(crate) mod tests {
     #[test]
     fn macos_package_debug_bundle_does_not_propagate_errors() {
         // Off-macOS hosts: the runtime gate short-circuits to Ok(None)
-        // without spawning anything. On a real macOS host: `dsymutil`
-        // fails on the missing file, which the best-effort contract
+        // without spawning anything. On a real macOS host: inspecting
+        // the missing file fails, which the best-effort contract
         // turns into a logged warning + Ok(None) — a failed bundle must
         // never fail the store path.
         let platform = MacOsPlatform;
@@ -734,6 +765,62 @@ pub(crate) mod tests {
                 .package_debug_bundle(Path::new("/no/such/binary"), dir.path())
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn debug_bundle_command_is_prepared_for_every_macho_format() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("demo");
+        let bundle = dir.path().join("demo.dSYM");
+        for magic in [
+            b"\xce\xfa\xed\xfe",
+            b"\xfe\xed\xfa\xce",
+            b"\xcf\xfa\xed\xfe",
+            b"\xfe\xed\xfa\xcf",
+            b"\xca\xfe\xba\xbe",
+            b"\xbe\xba\xfe\xca",
+            b"\xca\xfe\xba\xbf",
+            b"\xbf\xba\xfe\xca",
+        ] {
+            std::fs::write(&binary, magic).unwrap();
+            let command = macho_debug_bundle_command(&binary, &bundle)
+                .unwrap()
+                .expect("Mach-O outputs need dsymutil");
+            assert_eq!(command.get_program(), "dsymutil");
+        }
+    }
+
+    #[test]
+    fn non_macho_outputs_never_prepare_a_dsymutil_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("demo");
+        let bundle = dir.path().join("demo.dSYM");
+        // Exercise the same command-preparation seam as MacOsPlatform on
+        // every host, without a fake dsymutil or a process-wide PATH edit.
+        for bytes in [
+            b"\x7fELF\x02\x01\x01\0".as_slice(),
+            b"MZ\x90\0PE\0\0",
+            b"\0asm\x01\0\0\0",
+            b"#!/bin/sh\n",
+            b"",
+            b"\xcf\xfa\xed",
+        ] {
+            std::fs::write(&binary, bytes).unwrap();
+            assert!(
+                macho_debug_bundle_command(&binary, &bundle)
+                    .unwrap()
+                    .is_none(),
+                "non-Mach-O output must not invoke dsymutil: {bytes:?}"
+            );
+        }
+        assert!(!bundle.exists());
+        std::fs::remove_file(&binary).unwrap();
+        assert!(
+            macho_debug_bundle_command(&binary, &bundle)
+                .unwrap()
+                .is_none(),
+            "a missing output must keep debug packaging best-effort"
         );
     }
 

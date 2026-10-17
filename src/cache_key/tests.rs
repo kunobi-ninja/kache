@@ -2809,6 +2809,34 @@ fn predictions_reject_changes_in_environment_presence() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn predictions_reject_non_unicode_environment_values() {
+    use std::os::unix::ffi::OsStringExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("lib.rs");
+    std::fs::write(&source, "pub fn f() {}\n").unwrap();
+    for recorded in [None, Some(""), Some("value")] {
+        let prediction = InputPrediction {
+            schema: PREDICTION_SCHEMA,
+            sources: vec![source.clone()],
+            env_deps: vec![("MODE".to_string(), recorded.map(str::to_string))],
+            tree: None,
+        };
+        assert_eq!(
+            validate_prediction(
+                &prediction,
+                |path| std::fs::metadata(path).ok(),
+                |path| path.exists(),
+                |_| Some(std::ffi::OsString::from_vec(vec![0xff])),
+            ),
+            Err(Rejection::EnvChanged),
+            "a non-Unicode value must invalidate the recorded {recorded:?} state"
+        );
+    }
+}
+
 /// A prediction is only reusable by an invocation that would discover the
 /// same files. Every part of the identity is one such "would discover the
 /// same files" claim, so perturbing any of them has to produce a different

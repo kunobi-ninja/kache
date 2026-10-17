@@ -75,9 +75,9 @@ const ACTION_SUFFIX: &str = ".kache-real.action";
 /// per-unit layout), each NUL-terminated. The launcher reads it instead of
 /// listing the directory.
 #[cfg_attr(not(unix), allow(dead_code))]
-const LAUNCH_RECORD: &str = ".kache-launch";
+pub(crate) const LAUNCH_RECORD: &str = ".kache-launch";
 #[cfg_attr(not(unix), allow(dead_code))]
-const SHIM_DIR: &str = ".kache-build-script-shims";
+pub(crate) const SHIM_DIR: &str = ".kache-build-script-shims";
 /// The launcher binary for this target, built from `launcher/build_script.rs`.
 #[cfg(unix)]
 const LAUNCHER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/build-script-launcher"));
@@ -163,7 +163,7 @@ pub fn install_shim(args: &RustcArgs) {
 }
 
 #[cfg(unix)]
-fn install(executable: &Path) -> Result<()> {
+pub(crate) fn install(executable: &Path) -> Result<()> {
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::PermissionsExt;
 

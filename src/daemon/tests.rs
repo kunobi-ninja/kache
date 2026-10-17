@@ -7439,7 +7439,14 @@ async fn packed_receipt_distinguishes_queued_and_inflight_cancellation() {
             );
             ready.send(()).unwrap();
             let _ = worker
-                .packed_prefetch_get(&v3, key, 1024, "test GET", &mut receipt)
+                .packed_prefetch_get(
+                    &v3,
+                    key,
+                    1024,
+                    "test GET",
+                    RemoteDeadline::from_secs(0),
+                    &mut receipt,
+                )
                 .await;
         });
         entered.await.unwrap();
@@ -7568,7 +7575,7 @@ async fn packed_imports_with_listing(listing: bool, refused: bool) -> usize {
             v3,
             &remote,
             &candidates,
-            0,
+            (0, RemoteDeadline::from_secs(0)),
             &PackedAttribution {
                 origin: &PrefetchOrigin::default(),
                 ranks: &HashMap::new(),
@@ -7603,6 +7610,216 @@ fn only_a_refused_listing_marks_the_daemon() {
     assert!(!daemon.listing_refused.load(Ordering::Relaxed));
     daemon.record_refresher_exit(RefresherExit::ListingRefused);
     assert!(daemon.listing_refused.load(Ordering::Relaxed));
+}
+
+/// Records each remote request. A GET whose key contains `hold` returns only
+/// once `release_at` has passed, so a deadline can expire while it is in flight.
+struct HeldRequestBackend {
+    inner: Arc<dyn crate::remote_backend::RemoteBackend>,
+    hold: Option<&'static str>,
+    release_at: Instant,
+    requests: Arc<Mutex<Vec<String>>>,
+}
+
+impl HeldRequestBackend {
+    fn record(&self, method: &str, key: &str) {
+        let request = if key.contains("/v4/prefetch/catalogs/") {
+            format!("catalog {method}")
+        } else if key.contains("/v4/prefetch/packs/") {
+            format!("pack {method}")
+        } else {
+            format!("{method} {key}")
+        };
+        self.requests.lock().unwrap().push(request);
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::remote_backend::RemoteBackend for HeldRequestBackend {
+    async fn head(&self, key: &str) -> Result<bool> {
+        self.record("HEAD", key);
+        self.inner.head(key).await
+    }
+    async fn get(
+        &self,
+        key: &str,
+        max_bytes: Option<u64>,
+    ) -> Result<Option<crate::remote_backend::GetObject>> {
+        self.record("GET", key);
+        if self.hold.is_some_and(|hold| key.contains(hold)) {
+            while Instant::now() < self.release_at {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+        self.inner.get(key, max_bytes).await
+    }
+    async fn put(&self, key: &str, body: Vec<u8>, content_type: Option<&str>) -> Result<()> {
+        self.inner.put(key, body, content_type).await
+    }
+    async fn list(&self, prefix: &str) -> Result<Vec<String>> {
+        self.record("LIST", prefix);
+        self.inner.list(prefix).await
+    }
+    fn describe(&self, key: &str) -> String {
+        self.inner.describe(key)
+    }
+}
+
+#[tokio::test]
+async fn packed_prefetch_honors_dispatch_deadline_without_cancelling_started_transfers() {
+    const CATALOG: &str = "/v4/prefetch/catalogs/";
+    const PACK: &str = "/v4/prefetch/packs/";
+    let packed: &[&str] = &["catalog LIST", "catalog GET", "pack GET"];
+    // (held GET, deadline secs, dispatch age secs, requests, imported, keys dropped)
+    for (hold, budget_secs, dispatch_age_secs, expected_requests, expect_hit, expect_dropped) in [
+        // The deadline passes during the catalog GET: no pack GET, no fallback.
+        (
+            Some(CATALOG),
+            1,
+            0,
+            &["catalog LIST", "catalog GET"][..],
+            false,
+            1,
+        ),
+        // The deadline passed before the plan started: no request at all.
+        (None, 1, 2, &[][..], false, 1),
+        // A plan that finishes in time imports the entry.
+        (None, 1, 0, packed, true, 0),
+        // A pack GET in flight at the deadline still finishes.
+        (Some(PACK), 1, 0, packed, true, 0),
+        // A zero deadline never expires.
+        (Some(CATALOG), 0, 0, packed, true, 0),
+    ] {
+        let case = format!("hold {hold:?}, deadline {budget_secs}s, age {dispatch_age_secs}s");
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.remote_key_listing = true;
+        config.remote = Some(test_remote_config());
+        config.prefetch_deadline_secs = budget_secs;
+        config.remote_restore_timeout_secs = 10;
+        let inner = test_remote_backend();
+        let context = PackPrefetchContext::from_deps(
+            crate::identity::host_target_triple(),
+            "linux/toolchain/release",
+            &[("serde".into(), "1.0.0".into())],
+        )
+        .unwrap();
+        let key = test_cache_key("packed-dispatch-deadline");
+        let (payload, meta_digest) = build_entry_pack_with_meta(&key, "serde");
+        seed_packed_catalog(
+            &inner,
+            &context,
+            vec![crate::remote_pack::PackInputEntry {
+                cache_key: key.clone(),
+                crate_name: "serde".into(),
+                meta_digest,
+                payload,
+            }],
+            None,
+        )
+        .await;
+        let dispatch = Instant::now() - Duration::from_secs(dispatch_age_secs);
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let backend = Arc::new(HeldRequestBackend {
+            inner,
+            hold,
+            release_at: dispatch + Duration::from_secs(1),
+            requests: requests.clone(),
+        });
+        let daemon = Arc::new(Daemon::new(config));
+        assert!(daemon.remote_backend.set(backend).is_ok());
+        let response = daemon
+            .handle_prefetch_with_context(
+                &PrefetchRequest {
+                    keys: vec![(key.clone(), "serde".into())],
+                    warm_all: false,
+                    origin: None,
+                    candidate_sources: HashMap::new(),
+                },
+                Some(context),
+                dispatch,
+            )
+            .await;
+        assert!(response.ok, "{case}");
+        let mut tasks = std::mem::take(&mut *daemon.prefetch_tasks.lock().unwrap());
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while let Some(result) = tasks.join_next().await {
+                result.unwrap();
+            }
+        })
+        .await
+        .expect("prefetch plan finishes");
+        assert_eq!(
+            *requests.lock().unwrap(),
+            expected_requests,
+            "{case}: requests the plan started"
+        );
+        assert_eq!(
+            daemon
+                .with_store(|store| Ok(store.get(&key)?.is_some()))
+                .unwrap(),
+            expect_hit,
+            "{case}: entry imported"
+        );
+        assert_eq!(
+            daemon
+                .prefetch_stats
+                .keys_over_budget
+                .load(Ordering::Relaxed),
+            expect_dropped,
+            "{case}: keys the fallback dropped at the deadline"
+        );
+    }
+}
+
+#[tokio::test]
+async fn queued_packed_prefetch_stops_waiting_at_the_plan_deadline() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path());
+    config.remote_key_listing = true;
+    config.remote = Some(test_remote_config());
+    config.prefetch_deadline_secs = 1;
+    // No restore timeout: only the plan deadline can end the queued wait.
+    config.remote_restore_timeout_secs = 0;
+    let daemon = Arc::new(Daemon::new(config));
+    assert!(daemon.remote_backend.set(test_remote_backend()).is_ok());
+    let occupied = daemon
+        .prefetch_gate
+        .acquire_many(daemon.prefetch_gate.available_permits() as u32)
+        .await
+        .unwrap();
+    let context = PackPrefetchContext::from_deps(
+        crate::identity::host_target_triple(),
+        "linux/toolchain/release",
+        &[("serde".into(), "1.0.0".into())],
+    )
+    .unwrap();
+    let response = daemon
+        .handle_prefetch_with_context(
+            &PrefetchRequest {
+                keys: vec![(test_cache_key("queued-plan-deadline"), "serde".into())],
+                warm_all: false,
+                origin: None,
+                candidate_sources: HashMap::new(),
+            },
+            Some(context),
+            Instant::now(),
+        )
+        .await;
+    assert!(response.ok);
+    let mut tasks = std::mem::take(&mut *daemon.prefetch_tasks.lock().unwrap());
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while let Some(result) = tasks.join_next().await {
+            result.unwrap();
+        }
+    })
+    .await
+    .expect("a plan queued behind a full prefetch gate must end at its plan deadline");
+    let stats = &daemon.prefetch_stats;
+    assert_eq!(stats.pack_requests_total.load(Ordering::Relaxed), 0);
+    assert_eq!(stats.pack_fallback_entries.load(Ordering::Relaxed), 1);
+    assert_eq!(stats.keys_over_budget.load(Ordering::Relaxed), 1);
+    drop(occupied);
 }
 
 #[tokio::test]
@@ -7872,7 +8089,7 @@ async fn packed_prefetch_drains_bodies_with_room_for_only_one_object() {
             v3,
             &remote,
             &candidates,
-            0,
+            (0, RemoteDeadline::from_secs(0)),
             &PackedAttribution {
                 origin: &PrefetchOrigin::default(),
                 ranks: &HashMap::new(),
@@ -8423,7 +8640,7 @@ async fn packed_receipt_keeps_cancelled_entries_when_claim_is_blocked() {
                 &v3,
                 &remote,
                 &candidates,
-                0,
+                (0, RemoteDeadline::from_secs(0)),
                 &PackedAttribution {
                     origin: &origin,
                     ranks: &ranks,

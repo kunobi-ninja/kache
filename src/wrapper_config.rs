@@ -335,7 +335,12 @@ mod tests {
         let _cargo =
             crate::config::tests::set_env_for_test("CARGO_HOME", Some(cargo_home.as_os_str()));
         let _home = crate::config::tests::set_env_for_test("HOME", Some(dir.path().as_os_str()));
-        let (value, path) = cargo_rustdoc_setting().expect("configured rustdoc");
+        let (value, path) = cargo_rustdoc_setting_from(
+            None,
+            std::env::var_os("CARGO_HOME").map(PathBuf::from),
+            dirs::home_dir(),
+        )
+        .expect("configured rustdoc");
         assert_eq!(value, "/shim/rustdoc");
         assert_eq!(path, cargo_home.join("config.toml"));
     }

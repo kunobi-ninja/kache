@@ -22,8 +22,10 @@ script printed them, so Tauri's `cargo:core:window__...` arrives as
 `DEP_TAURI_CORE:WINDOW__...`.
 
 The launcher runs a copy of Kache pinned in the profile directory under
-`.kache-build-script-shims/`, a hardlink where the filesystem allows one. After
-an upgrade, existing launchers keep running the copy they were installed with
+`.kache-build-script-shims/`, cloned where the filesystem supports it and copied
+otherwise. Each profile has its own executable inode; installation replaces
+existing pins that still share an inode. After an upgrade, existing launchers
+keep running the copy they were installed with
 until their script is rebuilt or the target directory is cleaned. If that copy
 is gone, the launcher runs the script directly, uncached.
 

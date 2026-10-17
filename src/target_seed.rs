@@ -754,6 +754,7 @@ pub(crate) fn seed(
         });
         let copied = copied.into_inner();
         if copied > 0 {
+            pin_launchers(&from, &to);
             return Seeded {
                 units: copied,
                 donor: Some(donor.workspace_root.clone()),
@@ -761,6 +762,34 @@ pub(crate) fn seed(
         }
     }
     Seeded::default()
+}
+
+/// Give the new profile `to` each kache the donor profile `from` pinned for
+/// its build-script launchers, by hard link where it can. A seeded build
+/// script is kache's launcher, and a launcher whose pinned kache is missing
+/// runs the script itself, uncached; Cargo runs a seeded script before it
+/// compiles any build script here, so nothing else pins kache in time.
+fn pin_launchers(from: &Path, to: &Path) {
+    let shims = crate::build_script::SHIM_DIR;
+    for pin in subdirectories(&from.join(shims)) {
+        let kache = pin.join("kache");
+        let into = to.join(shims).join(file_name(&pin));
+        if !kache.is_file() || into.join("kache").is_file() {
+            continue;
+        }
+        let placed = (|| -> std::io::Result<()> {
+            std::fs::create_dir_all(&into)?;
+            let staged = into.join(format!("{STAGING}kache-{}", std::process::id()));
+            let _ = std::fs::remove_file(&staged);
+            if std::fs::hard_link(&kache, &staged).is_err() {
+                copy_file(&kache, &staged, &std::fs::metadata(&kache)?)?;
+            }
+            std::fs::rename(&staged, into.join("kache"))
+        })();
+        if let Err(error) = placed {
+            tracing::debug!("did not pin {}: {error}", into.display());
+        }
+    }
 }
 
 /// What Cargo writes to `CACHEDIR.TAG` in a target directory it creates.
@@ -1188,6 +1217,81 @@ source = "git+https://example.com/gitdep#abc"
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_seed_brings_the_kache_its_launchers_run() {
+        for layout in [Layout::PerUnit, Layout::Shared] {
+            let dir = tempfile::tempdir().unwrap();
+            let donor = donor(dir.path(), "a", layout);
+            let shims = crate::build_script::SHIM_DIR;
+            let pinned = donor.target_dir.join(PROFILE).join(shims).join("pin");
+            write(&pinned.join("kache"), "kache");
+            let new = checkout(dir.path(), "b");
+            let seeded = seed(
+                &new,
+                VERSION,
+                std::slice::from_ref(&donor),
+                Path::new(NO_CACHE),
+                later(),
+            );
+            assert_eq!(seeded.units, 1, "{layout:?}");
+            let shim = new.target_dir.join(PROFILE).join(shims);
+            assert_eq!(
+                std::fs::read_to_string(shim.join("pin/kache")).unwrap(),
+                "kache",
+                "{layout:?}"
+            );
+            assert_eq!(entries(&shim.join("pin")).len(), 1, "{layout:?}");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                let inode = |path: &Path| std::fs::metadata(path).unwrap().ino();
+                assert_eq!(
+                    inode(&shim.join("pin/kache")),
+                    inode(&pinned.join("kache")),
+                    "{layout:?}: pinned by hard link"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_seed_that_copies_nothing_pins_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let donor = donor(dir.path(), "a", Layout::PerUnit);
+        let shims = crate::build_script::SHIM_DIR;
+        write(
+            &donor.target_dir.join(PROFILE).join(shims).join("pin/kache"),
+            "kache",
+        );
+        let new = checkout(dir.path(), "b");
+        let seeded = seed(
+            &new,
+            "rustc 2.0.0 (other)\n",
+            std::slice::from_ref(&donor),
+            Path::new(NO_CACHE),
+            later(),
+        );
+        assert_eq!(seeded, Seeded::default());
+        assert!(!new.target_dir.join(PROFILE).join(shims).exists());
+    }
+
+    #[test]
+    fn a_pin_already_in_place_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let from = dir.path().join("from");
+        let to = dir.path().join("to");
+        let shims = crate::build_script::SHIM_DIR;
+        write(&from.join(shims).join("pin/kache"), "donor");
+        write(&from.join(shims).join("empty/other"), "not a pin");
+        write(&to.join(shims).join("pin/kache"), "ours");
+        pin_launchers(&from, &to);
+        assert_eq!(
+            std::fs::read_to_string(to.join(shims).join("pin/kache")).unwrap(),
+            "ours"
+        );
+        assert!(!to.join(shims).join("empty").exists());
     }
 
     #[test]

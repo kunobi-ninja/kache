@@ -27,6 +27,11 @@ an upgrade, existing launchers keep running the copy they were installed with
 until their script is rebuilt or the target directory is cleaned. If that copy
 is gone, the launcher runs the script directly, uncached.
 
+When Kache seeds a new target from another checkout, it copies each seeded
+launcher's pinned executable before copying the unit. The pin uses a filesystem
+clone or byte copy, so the new profile owns its executable inode and continues
+working after the donor target is removed. Unreferenced pins are left behind.
+
 On macOS, Kache runs the script with `ZERO_AR_DATE=1` unless the variable is
 already set, so archives the script builds with `ar` or `libtool` come out the
 same on every run.

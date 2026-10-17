@@ -505,6 +505,50 @@ fn unit_hashes(name: &str) -> impl Iterator<Item = &str> {
     })
 }
 
+/// Whether every artifact of the unit, what a dependent's `--extern` reads,
+/// is byte for byte a blob in this cache. A dependent's key hashes those
+/// bytes, and another kache or a build without kache writes different ones
+/// for the same Cargo unit; such a unit is left for Cargo to build through
+/// the cache.
+fn artifacts_stored(
+    from: &Path,
+    layout: Layout,
+    unit: &Unit,
+    deps: &HashMap<String, Vec<PathBuf>>,
+    cache_dir: &Path,
+) -> bool {
+    let files = match layout {
+        Layout::PerUnit => tree_files(&from.join("build").join(&unit.package).join(&unit.hash)),
+        Layout::Shared => deps.get(&unit.hash).cloned().unwrap_or_default(),
+    };
+    let store = cache_dir.join("store");
+    files
+        .iter()
+        .filter(|file| {
+            file.extension().is_some_and(|ext| {
+                ["rlib", "rmeta", "dylib", "so", "dll"].contains(&&*ext.to_string_lossy())
+            })
+        })
+        .all(|file| {
+            kache_store::file_hash::hash_file(file)
+                .is_ok_and(|hash| kache_store::blob_path_in_store_dir(&store, &hash).is_file())
+        })
+}
+
+/// The files under `dir`, without following links.
+fn tree_files(dir: &Path) -> Vec<PathBuf> {
+    entries(dir)
+        .into_iter()
+        .flat_map(|entry| {
+            if std::fs::symlink_metadata(&entry).is_ok_and(|meta| meta.is_dir()) {
+                tree_files(&entry)
+            } else {
+                vec![entry]
+            }
+        })
+        .collect()
+}
+
 /// Copy one unit from the donor profile `from` to `to`. The unit's marker
 /// goes last, by rename. `deps` is [`deps_by_hash`] of the donor's `deps/`
 /// for the shared layout.
@@ -733,6 +777,7 @@ pub(crate) fn seed(
                         if marker(&to, layout, unit).exists()
                             || names_the_donor(&from, layout, unit, donor)
                             || out_dir_names_the_donor(&from, layout, unit, donor, deadline)
+                            || !artifacts_stored(&from, layout, unit, &deps, cache_dir)
                         {
                             continue;
                         }
@@ -925,8 +970,18 @@ mod tests {
     const HASH: &str = "0123456789abcdef";
     const OTHER: &str = "fedcba9876543210";
     const VERSION: &str = "rustc 1.0.0 (test)\nhost: test\n";
-    /// A cache directory seeding tests without hermetic runs pass.
-    const NO_CACHE: &str = "/nonexistent/kache-cache";
+    /// A cache directory seeding tests without hermetic runs pass. Its store
+    /// holds the fixtures' `rlib`, as kache stores what it compiles.
+    fn no_runs() -> &'static Path {
+        static CACHE: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+        CACHE
+            .get_or_init(|| {
+                let cache = tempfile::tempdir().unwrap();
+                cache_storing(cache.path(), &["rlib"]);
+                cache
+            })
+            .path()
+    }
 
     fn args(line: &str) -> Vec<String> {
         line.split_whitespace().map(str::to_owned).collect()
@@ -1164,7 +1219,7 @@ source = "git+https://example.com/gitdep#abc"
                     &target,
                     VERSION,
                     &[wrong, matching.clone()],
-                    Path::new(NO_CACHE),
+                    no_runs(),
                     later(),
                 );
                 assert_eq!(result.donor, Some(matching.workspace_root.clone()));
@@ -1183,7 +1238,7 @@ source = "git+https://example.com/gitdep#abc"
                 assert!(!target.workspace_root.join("target/debug").exists());
                 let regular = checkout(dir.path(), &format!("regular-{label}"));
                 assert_eq!(
-                    seed(&regular, VERSION, &[matching], Path::new(NO_CACHE), later()),
+                    seed(&regular, VERSION, &[matching], no_runs(), later()),
                     Seeded::default()
                 );
             }
@@ -1206,7 +1261,7 @@ source = "git+https://example.com/gitdep#abc"
                 &new,
                 VERSION,
                 std::slice::from_ref(&donor),
-                Path::new(NO_CACHE),
+                no_runs(),
                 later(),
             );
             assert_eq!(
@@ -1250,10 +1305,79 @@ source = "git+https://example.com/gitdep#abc"
                     &new,
                     VERSION,
                     std::slice::from_ref(&donor),
-                    Path::new(NO_CACHE),
+                    no_runs(),
                     later()
                 ),
                 Seeded::default()
+            );
+        }
+    }
+
+    /// A cache at `cache` whose store holds each of `contents` as a blob, as
+    /// kache stores what it compiles.
+    fn cache_storing(cache: &Path, contents: &[&str]) -> PathBuf {
+        for content in contents {
+            let hash = blake3::hash(content.as_bytes()).to_hex().to_string();
+            write(
+                &kache_store::blob_path_in_store_dir(&cache.join("store"), &hash),
+                content,
+            );
+        }
+        cache.to_path_buf()
+    }
+
+    /// A dependent's key hashes the bytes of what it links. A unit another
+    /// kache, or a build without kache, compiled has other bytes than the
+    /// cache restores for the same Cargo unit, so copying it would re-key
+    /// every crate built on it.
+    #[test]
+    fn only_units_whose_artifacts_are_stored_blobs_are_seeded() {
+        for layout in [Layout::PerUnit, Layout::Shared] {
+            let dir = tempfile::tempdir().unwrap();
+            let donor = donor(dir.path(), "a", layout);
+            let donors = std::slice::from_ref(&donor);
+            let unstored = cache_storing(&dir.path().join("unstored"), &[]);
+            assert_eq!(
+                seed(
+                    &checkout(dir.path(), "b"),
+                    VERSION,
+                    donors,
+                    &unstored,
+                    later()
+                ),
+                Seeded::default(),
+                "{layout:?}"
+            );
+            let stored = cache_storing(&dir.path().join("stored"), &["rlib"]);
+            assert_eq!(
+                seed(
+                    &checkout(dir.path(), "c"),
+                    VERSION,
+                    donors,
+                    &stored,
+                    later()
+                )
+                .units,
+                1,
+                "{layout:?}"
+            );
+            // One artifact kache did not produce keeps the whole unit out.
+            let profile = donor.target_dir.join(PROFILE);
+            let rmeta = match layout {
+                Layout::PerUnit => profile.join("build/dep").join(HASH).join("out/lib.rmeta"),
+                Layout::Shared => profile.join("deps").join(format!("libdep-{HASH}.rmeta")),
+            };
+            write(&rmeta, "rmeta");
+            assert_eq!(
+                seed(
+                    &checkout(dir.path(), "d"),
+                    VERSION,
+                    donors,
+                    &stored,
+                    later()
+                ),
+                Seeded::default(),
+                "{layout:?}"
             );
         }
     }
@@ -1288,7 +1412,7 @@ source = "git+https://example.com/gitdep#abc"
                 &new,
                 "rustc 9.9.9\n",
                 std::slice::from_ref(&wrong_rustc),
-                Path::new(NO_CACHE),
+                no_runs(),
                 later()
             ),
             Seeded::default()
@@ -1298,7 +1422,7 @@ source = "git+https://example.com/gitdep#abc"
                 &new,
                 "  ",
                 std::slice::from_ref(&wrong_rustc),
-                Path::new(NO_CACHE),
+                no_runs(),
                 later()
             ),
             Seeded::default()
@@ -1311,13 +1435,7 @@ source = "git+https://example.com/gitdep#abc"
             &info.to_string(),
         );
         assert_eq!(
-            seed(
-                &new,
-                "  ",
-                std::slice::from_ref(&blank),
-                Path::new(NO_CACHE),
-                later()
-            ),
+            seed(&new, "  ", std::slice::from_ref(&blank), no_runs(), later()),
             Seeded::default()
         );
         // A build holds the donor's lock: the next donor gives the units.
@@ -1328,7 +1446,7 @@ source = "git+https://example.com/gitdep#abc"
             &new,
             VERSION,
             &[busy.clone(), free.clone()],
-            Path::new(NO_CACHE),
+            no_runs(),
             later(),
         );
         assert_eq!(seeded.donor, Some(free.workspace_root.clone()));
@@ -1344,7 +1462,7 @@ source = "git+https://example.com/gitdep#abc"
         std::fs::remove_dir_all(empty.target_dir.join(PROFILE)).unwrap();
         std::fs::create_dir_all(empty.target_dir.join(PROFILE)).unwrap();
         assert_eq!(
-            seed(&other, VERSION, &[own, empty], Path::new(NO_CACHE), later()),
+            seed(&other, VERSION, &[own, empty], no_runs(), later()),
             Seeded::default()
         );
         // Past the deadline nothing is copied.
@@ -1354,7 +1472,7 @@ source = "git+https://example.com/gitdep#abc"
                 &late,
                 VERSION,
                 std::slice::from_ref(&free),
-                Path::new(NO_CACHE),
+                no_runs(),
                 Instant::now()
             ),
             Seeded::default()
@@ -1368,7 +1486,7 @@ source = "git+https://example.com/gitdep#abc"
                 &locked,
                 VERSION,
                 std::slice::from_ref(&free),
-                Path::new(NO_CACHE),
+                no_runs(),
                 later()
             ),
             Seeded::default()
@@ -1382,7 +1500,7 @@ source = "git+https://example.com/gitdep#abc"
                 &bare,
                 VERSION,
                 std::slice::from_ref(&free),
-                Path::new(NO_CACHE),
+                no_runs(),
                 later()
             ),
             Seeded::default()
@@ -1392,7 +1510,7 @@ source = "git+https://example.com/gitdep#abc"
             "[[package]]\nname = \"app\"\n",
         );
         assert_eq!(
-            seed(&bare, VERSION, &[free], Path::new(NO_CACHE), later()),
+            seed(&bare, VERSION, &[free], no_runs(), later()),
             Seeded::default()
         );
     }
@@ -1482,7 +1600,7 @@ source = "git+https://example.com/gitdep#abc"
                     &new,
                     VERSION,
                     std::slice::from_ref(&donor),
-                    Path::new(NO_CACHE),
+                    no_runs(),
                     later()
                 ),
                 Seeded::default()
@@ -1518,7 +1636,7 @@ source = "git+https://example.com/gitdep#abc"
                     &new,
                     VERSION,
                     std::slice::from_ref(&donor),
-                    Path::new(NO_CACHE),
+                    no_runs(),
                     later()
                 ),
                 Seeded::default(),
@@ -1551,7 +1669,7 @@ source = "git+https://example.com/gitdep#abc"
                     &new,
                     VERSION,
                     std::slice::from_ref(&donor),
-                    Path::new(NO_CACHE),
+                    no_runs(),
                     later()
                 ),
                 Seeded {
@@ -1973,7 +2091,7 @@ source = "git+https://example.com/gitdep#abc"
             &new,
             VERSION,
             std::slice::from_ref(&donor),
-            Path::new(NO_CACHE),
+            no_runs(),
             later(),
         );
         #[cfg(unix)]
@@ -1999,7 +2117,7 @@ source = "git+https://example.com/gitdep#abc"
         write(&from.join("out/include/rdkafka.h"), "h");
         std::os::unix::fs::symlink("../include", from.join("out/src/include")).unwrap();
         let to = dir.path().join("copy");
-        place_tree(&from, &to, Path::new(NO_CACHE), later()).unwrap();
+        place_tree(&from, &to, no_runs(), later()).unwrap();
         let link = to.join("out/src/librdkafka.so");
         assert_eq!(
             std::fs::read_link(&link).unwrap(),
@@ -2012,28 +2130,12 @@ source = "git+https://example.com/gitdep#abc"
         );
 
         std::os::unix::fs::symlink("../../../elsewhere", from.join("out/src/up")).unwrap();
-        assert!(
-            place_tree(
-                &from,
-                &dir.path().join("escaped"),
-                Path::new(NO_CACHE),
-                later()
-            )
-            .is_err()
-        );
+        assert!(place_tree(&from, &dir.path().join("escaped"), no_runs(), later()).is_err());
         assert!(!dir.path().join("escaped").exists());
 
         let linked_unit = dir.path().join("linked-unit");
         std::os::unix::fs::symlink("unit", &linked_unit).unwrap();
-        assert!(
-            place_tree(
-                &linked_unit,
-                &dir.path().join("whole"),
-                Path::new(NO_CACHE),
-                later()
-            )
-            .is_err()
-        );
+        assert!(place_tree(&linked_unit, &dir.path().join("whole"), no_runs(), later()).is_err());
     }
 
     /// A hermetic run leaves `OUT_DIR` as an absolute link to its sealed,
@@ -2066,10 +2168,10 @@ source = "git+https://example.com/gitdep#abc"
             };
             let below = run.join("out");
             let below = below.strip_prefix(&donor.target_dir).unwrap();
-            let cache = dir.path().join("cache");
+            let cache = cache_storing(&dir.path().join("cache"), &["rlib"]);
             let shared = sealed_run(&cache, &"ab".repeat(32), below);
             std::os::unix::fs::symlink(&shared, run.join("out")).unwrap();
-            let elsewhere = dir.path().join("other-cache");
+            let elsewhere = cache_storing(&dir.path().join("other-cache"), &["rlib"]);
             let new = checkout(dir.path(), "b");
             let seeded = seed(
                 &new,
@@ -2144,10 +2246,10 @@ source = "git+https://example.com/gitdep#abc"
         let from = dir.path().join("unit");
         write(&from.join("a/file"), "x");
         let to = dir.path().join("copy");
-        let error = place_tree(&from, &to, Path::new(NO_CACHE), Instant::now()).unwrap_err();
+        let error = place_tree(&from, &to, no_runs(), Instant::now()).unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
         assert_eq!(entries(dir.path()), vec![from.clone()]);
-        place_tree(&from, &to, Path::new(NO_CACHE), later()).unwrap();
+        place_tree(&from, &to, no_runs(), later()).unwrap();
         assert_eq!(std::fs::read_to_string(to.join("a/file")).unwrap(), "x");
     }
 
@@ -2158,7 +2260,7 @@ source = "git+https://example.com/gitdep#abc"
         let dir = tempfile::tempdir().unwrap();
         let new = checkout(dir.path(), "b");
         assert_eq!(
-            seed(&new, VERSION, &[], Path::new(NO_CACHE), later()),
+            seed(&new, VERSION, &[], no_runs(), later()),
             Seeded::default()
         );
         let tag = std::fs::read_to_string(new.target_dir.join("CACHEDIR.TAG")).unwrap();
@@ -2176,7 +2278,7 @@ source = "git+https://example.com/gitdep#abc"
         let dir = tempfile::tempdir().unwrap();
         let new = checkout(dir.path(), "b");
         std::fs::create_dir_all(&new.target_dir).unwrap();
-        seed(&new, VERSION, &[], Path::new(NO_CACHE), later());
+        seed(&new, VERSION, &[], no_runs(), later());
         assert!(new.target_dir.join(PROFILE).is_dir());
         assert!(!new.target_dir.join("CACHEDIR.TAG").exists());
     }
@@ -2227,7 +2329,7 @@ source = "git+https://example.com/gitdep#abc"
                 &new,
                 VERSION,
                 std::slice::from_ref(&donor),
-                Path::new(NO_CACHE),
+                no_runs(),
                 later()
             ),
             Seeded::default()

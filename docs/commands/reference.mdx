@@ -130,6 +130,8 @@ Eviction flushes any entries still pending durability before it judges them (see
 
 `kache gc` (evict by the size and age limits now, as the daemon does), `kache purge` and `kache targets` still work as they did, for scripts written before `clean` took them over. They are hidden from `--help`.
 
+GC also recovers rebuild costs for older cache entries over successive runs. A pass that recovers no positive costs may still leave pending work. Metadata that cannot be read is retried later.
+
 ### Sharing target files
 
 ```bash

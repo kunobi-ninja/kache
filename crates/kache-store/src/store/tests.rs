@@ -1,3 +1,5 @@
+mod cost_backfill_tests;
+
 #[test]
 fn lock_polls_back_off_from_a_millisecond_to_the_interval() {
     let naps: Vec<u64> = (0..10)
@@ -4065,7 +4067,10 @@ fn backfill_compile_times_recovers_pre_index_entries() {
     // has the real value — that is what makes recovery possible.
     store
         .db
-        .execute("UPDATE entries SET compile_time_ms = 0", [])
+        .execute(
+            "UPDATE entries SET compile_time_ms = 0, compile_time_backfilled = 0",
+            [],
+        )
         .unwrap();
 
     assert_eq!(store.backfill_compile_times().unwrap(), 1);
@@ -4084,8 +4089,7 @@ fn backfill_compile_times_recovers_pre_index_entries() {
 }
 
 /// The backfill is bounded per sweep so a first GC after upgrade on a large
-/// store cannot stall the daemon while it holds the store mutex; successive
-/// sweeps converge.
+/// store can make bounded progress over successive sweeps.
 #[test]
 fn backfill_compile_times_is_bounded_per_sweep_and_converges() {
     let dir = tempfile::tempdir().unwrap();
@@ -4117,7 +4121,10 @@ fn backfill_compile_times_is_bounded_per_sweep_and_converges() {
     }
     store
         .db
-        .execute("UPDATE entries SET compile_time_ms = 0", [])
+        .execute(
+            "UPDATE entries SET compile_time_ms = 0, compile_time_backfilled = 0",
+            [],
+        )
         .unwrap();
 
     let first = store.backfill_compile_times_limited(LIMIT).unwrap();
@@ -4191,7 +4198,7 @@ fn recover_legacy_compile_cost(blocking_rows: usize) -> (Vec<usize>, i64, i64) {
     }
     tx.commit().unwrap();
     let passes = (0..3)
-        .map(|_| store.backfill_compile_times().unwrap())
+        .map(|_| store.backfill_compile_times_limited(3).unwrap())
         .collect();
     let cost = store
         .db
@@ -4201,7 +4208,6 @@ fn recover_legacy_compile_cost(blocking_rows: usize) -> (Vec<usize>, i64, i64) {
             |r| r.get(0),
         )
         .unwrap();
-    println!("blocking_rows={blocking_rows} passes={passes:?} recovered_cost_ms={cost}");
     let unknown = store
         .db
         .query_row(
@@ -4215,21 +4221,24 @@ fn recover_legacy_compile_cost(blocking_rows: usize) -> (Vec<usize>, i64, i64) {
 
 #[test]
 fn backfill_compile_times_reaches_expensive_entry_past_a_zero_cost_batch() {
-    let (passes, cost, unknown) = recover_legacy_compile_cost(10_000);
+    let (passes, cost, unknown) = recover_legacy_compile_cost(3);
     assert_eq!(
         cost, 60_000,
         "successive bounded backfills must reach the expensive entry past a full zero-cost batch"
     );
     assert_eq!(passes.iter().sum::<usize>(), 1);
-    assert_eq!(unknown, 10_000, "zero-cost entries must remain unknown");
+    assert_eq!(
+        unknown, 3,
+        "processed zeros remain unknown costs to eviction"
+    );
 }
 
 #[test]
 fn backfill_compile_times_recovers_cost_inside_the_first_batch() {
-    let (passes, cost, unknown) = recover_legacy_compile_cost(9_999);
+    let (passes, cost, unknown) = recover_legacy_compile_cost(2);
     assert_eq!(cost, 60_000);
     assert_eq!(passes, [1, 0, 0]);
-    assert_eq!(unknown, 9_999);
+    assert_eq!(unknown, 2);
 }
 
 /// #595 equivalence guard: the Rust `SizePressurePolicy` ranking must match

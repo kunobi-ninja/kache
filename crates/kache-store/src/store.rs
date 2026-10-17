@@ -1,3 +1,5 @@
+mod compile_time_backfill;
+
 use crate::ArtifactPolicy;
 use crate::blob_validation::validate_blob_metadata;
 use anyhow::{Context, Result};
@@ -1648,6 +1650,7 @@ fn initialize_db(db: &Connection) -> rusqlite::Result<()> {
     // this column the cache has no way to weigh what it is about to destroy.
     let _ = db
         .execute_batch("ALTER TABLE entries ADD COLUMN compile_time_ms INTEGER NOT NULL DEFAULT 0");
+    compile_time_backfill::ensure_schema(db)?;
     // Cache-key recipe version for targeted reclamation after a key bump
     // (kunobi-ninja/kache#750). Legacy rows are `0` = unknown and remain usable
     // until the user explicitly requests a stale-schema sweep.
@@ -1797,7 +1800,8 @@ fn initialize_db(db: &Connection) -> rusqlite::Result<()> {
 ///    older release stamps back each time it opens the index; nothing such
 ///    a release records is served. An index can carry 9 and still lack a
 ///    column (`file_hash::has_rule_columns`), so the open checks them too.
-const INDEX_SCHEMA_GENERATION: i64 = 9;
+/// 10: persistent compile-cost backfill state and its pending-work index.
+const INDEX_SCHEMA_GENERATION: i64 = 10;
 
 /// Raise the refcount of every blob `cache_key` maps to at least the
 /// references all mappings hold on it. Run before giving this key's
@@ -2915,7 +2919,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         crate::atomic::atomic_replace_deferrable(&meta_path, meta_json.as_bytes(), durable)
             .context("writing entry metadata")?;
         tx.execute(
-            "INSERT OR REPLACE INTO entries (cache_key, crate_name, crate_type, profile, num_features, size, content_hash, compile_time_ms, key_schema, committed, durable) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10)",
+            "INSERT OR REPLACE INTO entries (cache_key, crate_name, crate_type, profile, num_features, size, content_hash, compile_time_ms, key_schema, committed, durable, compile_time_backfilled) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10, 1)",
             params![cache_key, crate_name, crate_type_str, profile, num_features, total_size as i64, content_hash, compile_time_ms as i64, kache_format::CACHE_KEY_VERSION, durable],
         )?;
         tx.commit()?;
@@ -3087,7 +3091,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         }
         record_entry_blobs(&tx, cache_key, &meta.files)?;
         tx.execute(
-            "INSERT OR REPLACE INTO entries (cache_key, crate_name, crate_type, profile, num_features, size, content_hash, compile_time_ms, key_schema, committed, imported_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, unixepoch())",
+            "INSERT OR REPLACE INTO entries (cache_key, crate_name, crate_type, profile, num_features, size, content_hash, compile_time_ms, key_schema, committed, imported_at, compile_time_backfilled) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, unixepoch(), 1)",
             params![cache_key, meta.crate_name, crate_type_str, meta.profile, num_features, total_size as i64, content_hash, meta.compile_time_ms as i64, meta.key_schema],
         )?;
         tx.commit()?;
@@ -3326,7 +3330,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             )?;
             tx.execute("DELETE FROM blobs WHERE refcount <= 0", [])?;
             let inserted = tx.execute(
-                "INSERT OR IGNORE INTO entries (cache_key, crate_name, crate_type, profile, num_features, size, content_hash, compile_time_ms, key_schema, committed, imported_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, unixepoch())",
+                "INSERT OR IGNORE INTO entries (cache_key, crate_name, crate_type, profile, num_features, size, content_hash, compile_time_ms, key_schema, committed, imported_at, compile_time_backfilled) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, unixepoch(), 1)",
                 params![
                     entry.cache_key,
                     meta.crate_name,
@@ -3732,7 +3736,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         // Claim the entry row first. If it is already there, a concurrent or
         // earlier rebuild owns this entry's refcounts and we must not add more.
         let inserted = tx.execute(
-            "INSERT OR IGNORE INTO entries (cache_key, crate_name, crate_type, profile, num_features, size, content_hash, compile_time_ms, key_schema, committed) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1)",
+            "INSERT OR IGNORE INTO entries (cache_key, crate_name, crate_type, profile, num_features, size, content_hash, compile_time_ms, key_schema, committed, compile_time_backfilled) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, 1)",
             params![
                 cache_key,
                 meta.crate_name,
@@ -5522,25 +5526,20 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         Ok(updated)
     }
 
-    /// Backfill `compile_time_ms` for entries written before it was indexed
-    /// (kunobi-ninja/kache#594), reading each entry's `meta.json` — the same
-    /// shape as [`Self::backfill_content_hashes`], and run from the same GC
-    /// sweep.
+    /// Recover positive rebuild costs from legacy entry metadata.
     ///
-    /// Only rows still at the `0` default are touched, so this converges: once
-    /// an entry is backfilled it is never re-read. A genuinely zero-cost
-    /// compile stays 0 and may be re-read. Randomized selection prevents a
-    /// full batch of zero-cost or unreadable entries from monopolizing every
-    /// later sweep.
+    /// A separate marker records successful metadata reads, including zero
+    /// costs, so processed rows leave the pending index. Zero retains its
+    /// existing meaning of unknown cost to eviction ranking. Unreadable or
+    /// invalid metadata is retried after one minute, doubling to one hour.
     ///
-    /// Bounded to 10,000 entries per call. Measured on
-    /// a real 52k-entry store, an unbounded pass is ~6 s of `meta.json` reads —
-    /// and this runs inside the daemon's GC sweep while the store mutex is
-    /// held, so a first-GC-after-upgrade stall of that size is worth avoiding.
-    /// Spreading it over successive sweeps costs nothing: eviction ranking
-    /// treats a not-yet-backfilled entry exactly as it does today.
+    /// Each pass selects at most 10,000 entries and checks a 50 ms soft budget
+    /// between reads. At least one selected entry is attempted. Filesystem
+    /// reads and SQLite lock waits may exceed that budget. Metadata is read
+    /// outside write transactions; updates commit in groups of at most 128.
+    /// Returns the number of positive costs recovered, not processed zeros.
     pub fn backfill_compile_times(&self) -> Result<usize> {
-        self.backfill_compile_times_limited(COMPILE_TIME_BACKFILL_BATCH)
+        self.backfill_compile_times_bounded()
     }
 
     /// Backfill `entry_blobs` rows for entries written before the table
@@ -5602,38 +5601,6 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                     updated += 1;
                 }
                 tx.commit()?;
-            }
-        }
-        Ok(updated)
-    }
-
-    /// [`Self::backfill_compile_times`] with an explicit per-call bound, so the
-    /// batching behavior can be tested without materializing a batch-sized
-    /// store.
-    fn backfill_compile_times_limited(&self, limit: i64) -> Result<usize> {
-        self.refuse_write("backfill compile times")?;
-        let keys: Vec<String> = {
-            let mut stmt = self.db.prepare(
-                "SELECT cache_key FROM entries WHERE compile_time_ms = 0 AND committed = 1
-                 ORDER BY RANDOM()
-                 LIMIT ?1",
-            )?;
-            stmt.query_map(params![limit], |row| row.get(0))?
-                .collect::<Result<Vec<_>, _>>()?
-        };
-
-        let mut updated = 0;
-        for key in &keys {
-            let meta_path = self.entry_dir(key).join("meta.json");
-            if let Ok(content) = fs::read_to_string(&meta_path)
-                && let Ok(meta) = serde_json::from_str::<EntryMeta>(&content)
-                && meta.compile_time_ms > 0
-            {
-                self.db.execute(
-                    "UPDATE entries SET compile_time_ms = ?1 WHERE cache_key = ?2",
-                    params![meta.compile_time_ms as i64, key],
-                )?;
-                updated += 1;
             }
         }
         Ok(updated)

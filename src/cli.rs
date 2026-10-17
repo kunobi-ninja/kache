@@ -4127,16 +4127,9 @@ pub fn run_gc_local(config: &Config, mode: GcMode) -> Result<crate::store::GcSta
         print!("Backfilling compile times...");
         std::io::Write::flush(&mut std::io::stdout()).ok();
     }
-    let costs = store.backfill_compile_times().unwrap_or(0);
+    let costs = store.backfill_compile_times();
     if verbose {
-        if costs > 0 {
-            println!(
-                " {} updated.",
-                term::counted(costs as u64, "entry", "entries")
-            );
-        } else {
-            println!(" up to date.");
-        }
+        println!("{}", compile_time_backfill_message(costs));
     }
 
     // Entry→blob rows for pre-#608 entries; same sweep, same convergence.
@@ -4420,6 +4413,17 @@ fn add_gc_stats(total: &mut crate::store::GcStats, part: &crate::store::GcStats)
     // held bytes must not add up to twice as many.
     total.bytes_held = total.bytes_held.max(part.bytes_held);
     total.skipped |= part.skipped;
+}
+
+fn compile_time_backfill_message(result: Result<usize>) -> String {
+    match result {
+        Ok(0) => " no positive costs recovered this pass.".to_owned(),
+        Ok(count) => format!(
+            " {} updated.",
+            term::counted(count as u64, "entry", "entries")
+        ),
+        Err(error) => format!(" deferred: {error}"),
+    }
 }
 
 fn gc_stats_from_breakdown(report: &crate::daemon::GcBreakdown) -> crate::store::GcStats {

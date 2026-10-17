@@ -10394,3 +10394,17 @@ fn a_declined_store_is_the_latest_compile_and_a_fallback_run_is_not() {
         "{lines:?}"
     );
 }
+
+#[test]
+fn compile_time_backfill_message_does_not_claim_completion_or_hide_errors() {
+    assert_eq!(
+        compile_time_backfill_message(Ok(0)),
+        " no positive costs recovered this pass."
+    );
+    assert_eq!(compile_time_backfill_message(Ok(1)), " 1 entry updated.");
+    assert_eq!(compile_time_backfill_message(Ok(2)), " 2 entries updated.");
+    assert_eq!(
+        compile_time_backfill_message(Err(anyhow::anyhow!("index busy"))),
+        " deferred: index busy"
+    );
+}

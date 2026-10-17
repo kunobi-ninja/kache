@@ -247,6 +247,8 @@ fn relative_to_ancestor(directory: &Path, ancestor: &Path) -> Option<String> {
 /// working until the target directory is cleaned.
 #[cfg(unix)]
 fn pin_kache(kache: &Path, profile: &Path) -> Result<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+
     // macOS current_exe can name a relative symlink. Copy its target.
     let kache = kache
         .canonicalize()
@@ -265,8 +267,8 @@ fn pin_kache(kache: &Path, profile: &Path) -> Result<PathBuf> {
         .join(SHIM_DIR)
         .join(&identity.finalize().to_hex()[..32]);
     let pinned = directory.join("kache");
-    if std::fs::symlink_metadata(&pinned).is_ok_and(|metadata| metadata.is_file())
-        && kache_fs::file_identity(&pinned)? != kache_fs::file_identity(&kache)?
+    if std::fs::symlink_metadata(&pinned)
+        .is_ok_and(|metadata| metadata.is_file() && metadata.nlink() == 1)
     {
         return Ok(pinned);
     }
@@ -3429,6 +3431,36 @@ mod tests {
         let output = Command::new(&pinned).output().unwrap();
         assert!(output.status.success());
         assert_eq!(output.stdout, b"pinned\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pinned_kache_detaches_a_pin_shared_with_another_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let executable = dir.path().join("kache");
+        kache_fs::testutil::write_executable(&executable, "#!/bin/sh\necho pinned\n");
+        let first_profile = dir.path().join("first/debug");
+        let second_profile = dir.path().join("second/debug");
+        let first = pin_kache(&executable, &first_profile).unwrap();
+        let second = pin_kache(&executable, &second_profile).unwrap();
+        std::fs::remove_file(&second).unwrap();
+        std::fs::hard_link(&first, &second).unwrap();
+        let shared = kache_fs::file_identity(&first).unwrap();
+        let source = kache_fs::file_identity(&executable).unwrap();
+        assert_ne!(shared, source);
+
+        assert_eq!(pin_kache(&executable, &first_profile).unwrap(), first);
+        let detached = kache_fs::file_identity(&first).unwrap();
+        assert_ne!(detached, shared);
+        assert_ne!(detached, source);
+        assert_eq!(kache_fs::file_identity(&second).unwrap(), shared);
+        assert_eq!(kache_fs::file_identity(&executable).unwrap(), source);
+        assert_eq!(
+            std::fs::read(&first).unwrap(),
+            std::fs::read(&second).unwrap()
+        );
+        assert_eq!(pin_kache(&executable, &first_profile).unwrap(), first);
+        assert_eq!(kache_fs::file_identity(&first).unwrap(), detached);
     }
 
     #[cfg(unix)]

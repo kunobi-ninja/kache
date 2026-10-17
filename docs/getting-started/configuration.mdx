@@ -299,6 +299,7 @@ Cargo's first call through `RUSTC_WRAPPER` for a target directory it has never b
 What is copied:
 
 - Units of registry and git packages in the new checkout's `Cargo.lock`. Workspace members and path dependencies are never copied: Cargo trusts their sources' modification times, so a copy from a checkout with different sources could pass as fresh.
+- A unit's library and metadata artifacts must match blobs already in the local cache. Kache leaves other units for Cargo to build through the wrapper, so seeded dependencies do not change the cache keys of their dependents.
 - The host `debug` profile, the one `cargo build`, `check`, `test` and `clippy` use. Both Cargo layouts are handled, the per-unit directories of Cargo 1.100 and later and the shared `deps/` layout before it.
 - Files are cloned where the filesystem supports it and copied otherwise, with their modification times. Each unit's fingerprint is put in place last.
 - A relative symlink inside a unit's directory (`build/<pkg>/<hash>/`, or `build/<pkg>-<hash>/` and `.fingerprint/<pkg>-<hash>/` in the shared layout) is copied as a link when its target climbs no higher than that directory with leading `..` and then only descends. Files in the shared `deps/` directory are copied one at a time, and a symlink that is itself the copied file is not kept, so a link there such as `libfoo.so -> libfoo.so.1` keeps its unit from being copied.

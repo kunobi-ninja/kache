@@ -40,7 +40,7 @@ pub(super) fn ensure_schema(db: &Connection) -> rusqlite::Result<()> {
 }
 
 fn budget_expired(elapsed: Duration) -> bool {
-    elapsed >= Duration::from_millis(50)
+    elapsed >= Duration::from_secs(1)
 }
 
 fn retry_after(now: i64, failures: i64) -> (i64, i64) {
@@ -183,25 +183,32 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         if limit <= 0 {
             return Ok(0);
         }
-        let candidates = self.compile_time_candidates(limit, now)?;
-        let mut outcomes = Vec::with_capacity(WRITE_BATCH);
-        let mut attempted = 0;
+        let mut attempted = 0_i64;
         let mut recovered = 0;
-        for candidate in candidates {
-            // Always attempt one row: a slow initial SELECT must not turn a
-            // soft time budget into permanent starvation.
-            if attempted > 0 && exhausted() {
+        while attempted < limit {
+            let page_size = (limit - attempted).min(WRITE_BATCH as i64);
+            let candidates = self.compile_time_candidates(page_size, now)?;
+            if candidates.is_empty() {
                 break;
             }
-            outcomes.push(self.compile_time_outcome(candidate));
-            attempted += 1;
-            if outcomes.len() == WRITE_BATCH {
-                recovered += self.apply_compile_time_outcomes(&outcomes, now)?;
-                outcomes.clear();
+            let mut outcomes = Vec::with_capacity(candidates.len());
+            let mut stopped = false;
+            for candidate in candidates {
+                // Always attempt one row: a slow initial SELECT must not turn
+                // the soft time budget into permanent starvation.
+                if attempted > 0 && exhausted() {
+                    stopped = true;
+                    break;
+                }
+                outcomes.push(self.compile_time_outcome(candidate));
+                attempted += 1;
             }
-        }
-        if !outcomes.is_empty() {
-            recovered += self.apply_compile_time_outcomes(&outcomes, now)?;
+            if !outcomes.is_empty() {
+                recovered += self.apply_compile_time_outcomes(&outcomes, now)?;
+            }
+            if stopped {
+                break;
+            }
         }
         tracing::debug!(attempted, recovered, "compile-cost backfill pass");
         Ok(recovered)
@@ -214,9 +221,9 @@ mod tests {
 
     #[test]
     fn soft_budget_has_an_independent_boundary() {
-        assert!(!budget_expired(Duration::from_millis(49)));
-        assert!(budget_expired(Duration::from_millis(50)));
-        assert!(budget_expired(Duration::from_millis(51)));
+        assert!(!budget_expired(Duration::from_millis(999)));
+        assert!(budget_expired(Duration::from_millis(1000)));
+        assert!(budget_expired(Duration::from_millis(1001)));
     }
 
     #[test]

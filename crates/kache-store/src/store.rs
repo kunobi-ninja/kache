@@ -1249,15 +1249,10 @@ impl EvictionWritePacer {
     }
 }
 
-/// Entries backfilled with their rebuild cost per GC sweep
-/// (kunobi-ninja/kache#594).
-///
-/// The backfill runs while the daemon holds the store mutex, so an unbounded
-/// pass is the thing to avoid: measured on a real 52k-entry store, reading
-/// every `meta.json` is ~6 s (~0.11 ms per entry). At this batch size one
-/// sweep adds roughly a second — negligible against a sweep that already scans
-/// the whole store — and a 50k-entry store converges in a handful of sweeps
-/// rather than dozens.
+/// Maximum entries visited by one legacy metadata backfill pass.
+/// Compile costs also have a one-second soft budget and are fetched in small
+/// pages. Blob-reference recovery shares the entry limit. The daemon runs GC
+/// on a separate connection, so metadata reads do not hold its Store mutex.
 const COMPILE_TIME_BACKFILL_BATCH: i64 = 10_000;
 
 /// How long a post-eviction demand record is kept (kunobi-ninja/kache#594).
@@ -5533,7 +5528,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     /// existing meaning of unknown cost to eviction ranking. Unreadable or
     /// invalid metadata is retried after one minute, doubling to one hour.
     ///
-    /// Each pass selects at most 10,000 entries and checks a 50 ms soft budget
+    /// Each pass selects at most 10,000 entries and checks a one-second soft budget
     /// between reads. At least one selected entry is attempted. Filesystem
     /// reads and SQLite lock waits may exceed that budget. Metadata is read
     /// outside write transactions; updates commit in groups of at most 128.

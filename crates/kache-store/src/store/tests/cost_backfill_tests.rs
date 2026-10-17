@@ -386,6 +386,41 @@ fn legacy_schema_upgrades_and_reopens_without_resetting_progress() {
 }
 
 #[test]
+fn concurrent_schema_upgrades_serialize_column_creation() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let store = Store::open(&config).unwrap();
+    legacy(&store, "legacy", 0);
+    store
+        .db
+        .execute_batch(
+            "DROP INDEX idx_entries_compile_time_pending;
+         ALTER TABLE entries DROP COLUMN compile_time_backfilled;
+         ALTER TABLE entries DROP COLUMN compile_time_retry_at;
+         ALTER TABLE entries DROP COLUMN compile_time_retry_count;
+         PRAGMA user_version = 9;",
+        )
+        .unwrap();
+    drop(store);
+
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+    let threads: Vec<_> = (0..3)
+        .map(|_| {
+            let cache = dir.path().to_owned();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                let store = Store::open(test_config(&cache)).unwrap();
+                assert_eq!(state(&store, "legacy"), (0, 0, 0, 0));
+            })
+        })
+        .collect();
+    for thread in threads {
+        thread.join().unwrap();
+    }
+}
+
+#[test]
 fn due_work_uses_the_partial_index_without_a_temporary_sort() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(test_config(dir.path())).unwrap();

@@ -518,13 +518,14 @@ fn copy_unit(
     deadline: Instant,
 ) -> std::io::Result<()> {
     #[cfg(unix)]
-    pin_launcher(
-        from,
-        to,
-        &build_script_out_dir(from, layout, unit)
-            .with_file_name(crate::build_script::LAUNCH_RECORD),
-        deadline,
-    )?;
+    {
+        let out = build_script_out_dir(from, layout, unit);
+        let record = match layout {
+            Layout::PerUnit => out.join(crate::build_script::LAUNCH_RECORD),
+            Layout::Shared => out.with_file_name(crate::build_script::LAUNCH_RECORD),
+        };
+        pin_launcher(from, to, &record, deadline)?;
+    }
     match layout {
         Layout::PerUnit => {
             let package = to.join("build").join(&unit.package);
@@ -1248,10 +1249,12 @@ source = "git+https://example.com/gitdep#abc"
 
     #[cfg(unix)]
     fn launcher_record(profile: &Path, layout: Layout, relative: &str) -> PathBuf {
-        let record = build_script_out_dir(profile, layout, &unit("dep", HASH))
-            .with_file_name(crate::build_script::LAUNCH_RECORD);
+        let record = match layout {
+            Layout::PerUnit => profile.join("build/dep/0123456789abcdef/out/.kache-launch"),
+            Layout::Shared => profile.join("build/dep-0123456789abcdef/.kache-launch"),
+        };
         let to_profile = match layout {
-            Layout::PerUnit => "../../../",
+            Layout::PerUnit => "../../../../",
             Layout::Shared => "../../",
         };
         write(
@@ -1264,6 +1267,7 @@ source = "git+https://example.com/gitdep#abc"
     #[cfg(unix)]
     #[test]
     fn a_seed_brings_the_kache_its_launchers_run() {
+        use std::os::unix::ffi::OsStrExt;
         use std::os::unix::fs::PermissionsExt;
         use std::process::Command;
 
@@ -1272,24 +1276,28 @@ source = "git+https://example.com/gitdep#abc"
             let donor = donor(dir.path(), "a", layout);
             let shims = crate::build_script::SHIM_DIR;
             let profile = donor.target_dir.join(PROFILE);
-            let pinned = profile.join(shims).join("pin/kache");
-            std::fs::create_dir_all(pinned.parent().unwrap()).unwrap();
+            let script_directory = match layout {
+                Layout::PerUnit => profile.join("build/dep/0123456789abcdef/out"),
+                Layout::Shared => profile.join("build/dep-0123456789abcdef"),
+            };
+            std::fs::create_dir_all(&script_directory).unwrap();
+            let script = script_directory.join("build_script_build");
+            kache_fs::testutil::write_executable(
+                &script,
+                "#!/bin/sh\nprintf 'uncached fallback\\n'\n",
+            );
+            crate::build_script::install(&script).unwrap();
+            let record = std::fs::read(script_directory.join(".kache-launch")).unwrap();
+            let relative =
+                std::ffi::OsStr::from_bytes(record.split(|&byte| byte == 0).nth(1).unwrap());
+            let relative = Path::new(relative).to_path_buf();
+            let pinned = profile.join(&relative);
+            // Replace the installer's pin without writing through its inode.
+            std::fs::remove_file(&pinned).unwrap();
             let global = dir.path().join("kache");
             kache_fs::testutil::write_executable(&global, "#!/bin/sh\nprintf 'seeded pin\\n'\n");
             std::fs::set_permissions(&global, std::fs::Permissions::from_mode(0o700)).unwrap();
             std::fs::hard_link(&global, &pinned).unwrap();
-            let record = launcher_record(&profile, layout, &format!("{shims}/pin/kache"));
-            let script = record.with_file_name("build-script-build");
-            std::fs::write(
-                &script,
-                include_bytes!(concat!(env!("OUT_DIR"), "/build-script-launcher")),
-            )
-            .unwrap();
-            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-            kache_fs::testutil::write_executable(
-                &record.with_file_name("build-script-build.kache-real"),
-                "#!/bin/sh\nprintf 'uncached fallback\\n'\n",
-            );
             write(&profile.join(shims).join("unused/kache"), "unused version");
             let cache = dir.path().join("cache");
             let hash = blake3::hash(b"rlib").to_hex().to_string();
@@ -1301,12 +1309,12 @@ source = "git+https://example.com/gitdep#abc"
             let seeded = seed(&new, VERSION, std::slice::from_ref(&donor), &cache, later());
             assert_eq!(seeded.units, 1, "{layout:?}");
             let shim = new.target_dir.join(PROFILE).join(shims);
-            let copied = shim.join("pin/kache");
+            let copied = new.target_dir.join(PROFILE).join(&relative);
             assert_eq!(
                 std::fs::read(&copied).unwrap(),
                 std::fs::read(&global).unwrap()
             );
-            assert_eq!(entries(&shim.join("pin")).len(), 1, "{layout:?}");
+            assert_eq!(entries(copied.parent().unwrap()).len(), 1, "{layout:?}");
             assert!(!shim.join("unused").exists());
             assert_eq!(
                 std::fs::metadata(&copied).unwrap().permissions().mode() & 0o777,

@@ -163,7 +163,7 @@ pub fn install_shim(args: &RustcArgs) {
 }
 
 #[cfg(unix)]
-fn install(executable: &Path) -> Result<()> {
+pub(crate) fn install(executable: &Path) -> Result<()> {
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::PermissionsExt;
 

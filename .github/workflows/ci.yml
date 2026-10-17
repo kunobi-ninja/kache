@@ -1018,7 +1018,7 @@ jobs:
           cargo test -p kache --test integration_test test_rust_restored_outputs_allow_build_without_wrapper
           cargo test -p kache-fs --all-features
           cargo test -p kache-store --lib
-          cargo test -p kache --bins -- store:: wrapper::tests::materialize_cached_artifact
+          cargo test -p kache --bins -- store:: wrapper::tests::materialize_cached_artifact build_script::tests::pinned_kache
       - name: Report mount usage
         if: always()
         run: df -h /mnt/cow || true

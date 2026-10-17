@@ -516,37 +516,28 @@ fn artifacts_stored(
     unit: &Unit,
     deps: &HashMap<String, Vec<PathBuf>>,
     cache_dir: &Path,
+    deadline: Instant,
 ) -> bool {
-    let files = match layout {
-        Layout::PerUnit => tree_files(&from.join("build").join(&unit.package).join(&unit.hash)),
+    let mut files = match layout {
+        Layout::PerUnit => vec![from.join("build").join(&unit.package).join(&unit.hash)],
         Layout::Shared => deps.get(&unit.hash).cloned().unwrap_or_default(),
     };
     let store = cache_dir.join("store");
-    files
-        .iter()
-        .filter(|file| {
-            file.extension().is_some_and(|ext| {
-                ["rlib", "rmeta", "dylib", "so", "dll"].contains(&&*ext.to_string_lossy())
-            })
-        })
-        .all(|file| {
-            kache_store::file_hash::hash_file(file)
-                .is_ok_and(|hash| kache_store::blob_path_in_store_dir(&store, &hash).is_file())
-        })
-}
-
-/// The files under `dir`, without following links.
-fn tree_files(dir: &Path) -> Vec<PathBuf> {
-    entries(dir)
-        .into_iter()
-        .flat_map(|entry| {
-            if std::fs::symlink_metadata(&entry).is_ok_and(|meta| meta.is_dir()) {
-                tree_files(&entry)
-            } else {
-                vec![entry]
-            }
-        })
-        .collect()
+    while let Some(file) = files.pop() {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        if std::fs::symlink_metadata(&file).is_ok_and(|metadata| metadata.is_dir()) {
+            files.extend(entries(&file));
+        } else if file.extension().is_some_and(|ext| {
+            ["rlib", "rmeta", "dylib", "so", "dll"].contains(&&*ext.to_string_lossy())
+        }) && !kache_store::file_hash::hash_file(&file)
+            .is_ok_and(|hash| kache_store::blob_path_in_store_dir(&store, &hash).is_file())
+        {
+            return false;
+        }
+    }
+    true
 }
 
 /// Copy one unit from the donor profile `from` to `to`. The unit's marker
@@ -777,7 +768,7 @@ pub(crate) fn seed(
                         if marker(&to, layout, unit).exists()
                             || names_the_donor(&from, layout, unit, donor)
                             || out_dir_names_the_donor(&from, layout, unit, donor, deadline)
-                            || !artifacts_stored(&from, layout, unit, &deps, cache_dir)
+                            || !artifacts_stored(&from, layout, unit, &deps, cache_dir, deadline)
                         {
                             continue;
                         }
@@ -1379,6 +1370,34 @@ source = "git+https://example.com/gitdep#abc"
                 Seeded::default(),
                 "{layout:?}"
             );
+        }
+    }
+
+    #[test]
+    fn stored_artifact_validation_stops_at_the_seed_deadline() {
+        for layout in [Layout::PerUnit, Layout::Shared] {
+            let dir = tempfile::tempdir().unwrap();
+            let donor = donor(dir.path(), "a", layout);
+            let profile = donor.target_dir.join(PROFILE);
+            let deps = deps_by_hash(&profile.join("deps"));
+            let cache = cache_storing(&dir.path().join("cache"), &["rlib"]);
+            let unit = unit("dep", HASH);
+            assert!(artifacts_stored(
+                &profile,
+                layout,
+                &unit,
+                &deps,
+                &cache,
+                later()
+            ));
+            assert!(!artifacts_stored(
+                &profile,
+                layout,
+                &unit,
+                &deps,
+                &cache,
+                Instant::now(),
+            ));
         }
     }
 

@@ -517,6 +517,14 @@ fn copy_unit(
     cache_dir: &Path,
     deadline: Instant,
 ) -> std::io::Result<()> {
+    #[cfg(unix)]
+    pin_launcher(
+        from,
+        to,
+        &build_script_out_dir(from, layout, unit)
+            .with_file_name(crate::build_script::LAUNCH_RECORD),
+        deadline,
+    )?;
     match layout {
         Layout::PerUnit => {
             let package = to.join("build").join(&unit.package);
@@ -754,7 +762,6 @@ pub(crate) fn seed(
         });
         let copied = copied.into_inner();
         if copied > 0 {
-            pin_launchers(&from, &to);
             return Seeded {
                 units: copied,
                 donor: Some(donor.workspace_root.clone()),
@@ -764,32 +771,52 @@ pub(crate) fn seed(
     Seeded::default()
 }
 
-/// Give the new profile `to` each kache the donor profile `from` pinned for
-/// its build-script launchers, by hard link where it can. A seeded build
-/// script is kache's launcher, and a launcher whose pinned kache is missing
-/// runs the script itself, uncached; Cargo runs a seeded script before it
-/// compiles any build script here, so nothing else pins kache in time.
-fn pin_launchers(from: &Path, to: &Path) {
-    let shims = crate::build_script::SHIM_DIR;
-    for pin in subdirectories(&from.join(shims)) {
-        let kache = pin.join("kache");
-        let into = to.join(shims).join(file_name(&pin));
-        if !kache.is_file() || into.join("kache").is_file() {
-            continue;
-        }
-        let placed = (|| -> std::io::Result<()> {
-            std::fs::create_dir_all(&into)?;
-            let staged = into.join(format!("{STAGING}kache-{}", std::process::id()));
-            let _ = std::fs::remove_file(&staged);
-            if std::fs::hard_link(&kache, &staged).is_err() {
-                copy_file(&kache, &staged, &std::fs::metadata(&kache)?)?;
-            }
-            std::fs::rename(&staged, into.join("kache"))
-        })();
-        if let Err(error) = placed {
-            tracing::debug!("did not pin {}: {error}", into.display());
-        }
+/// Copy the executable this unit's launcher needs before publishing the unit.
+/// Each profile owns its inode, including pins inherited from older donors.
+#[cfg(unix)]
+fn pin_launcher(from: &Path, to: &Path, record: &Path, deadline: Instant) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+    use std::path::Component;
+
+    let record = match std::fs::read(record) {
+        Ok(record) => record,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if Instant::now() >= deadline {
+        return Err(std::io::ErrorKind::TimedOut.into());
     }
+    let invalid =
+        || std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid launcher pin path");
+    let relative = record.split(|&byte| byte == 0).nth(1).ok_or_else(invalid)?;
+    let relative = Path::new(OsStr::from_bytes(relative));
+    let mut parts = relative.components();
+    match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (
+            Some(Component::Normal(shims)),
+            Some(Component::Normal(_)),
+            Some(Component::Normal(name)),
+            None,
+        ) if shims == crate::build_script::SHIM_DIR && name == "kache" => {}
+        _ => return Err(invalid()),
+    }
+    let pinned = to.join(relative);
+    if std::fs::symlink_metadata(&pinned)
+        .is_ok_and(|metadata| metadata.is_file() && metadata.nlink() == 1)
+    {
+        return Ok(());
+    }
+    let source = from.join(relative).canonicalize()?;
+    let directory = pinned.parent().ok_or_else(invalid)?;
+    std::fs::create_dir_all(directory)?;
+    let temporary = tempfile::TempDir::new_in(directory)?;
+    let staged = temporary.path().join("kache");
+    if kache_fs::try_reflink(&source, &staged).is_err() {
+        kache_fs::copy_writable(&source, &staged, true)?;
+    }
+    kache_fs::set_writable_permissions(&staged, true)?;
+    std::fs::rename(staged, pinned)
 }
 
 /// What Cargo writes to `CACHEDIR.TAG` in a target directory it creates.
@@ -1219,40 +1246,90 @@ source = "git+https://example.com/gitdep#abc"
         }
     }
 
+    #[cfg(unix)]
+    fn launcher_record(profile: &Path, layout: Layout, relative: &str) -> PathBuf {
+        let record = build_script_out_dir(profile, layout, &unit("dep", HASH))
+            .with_file_name(crate::build_script::LAUNCH_RECORD);
+        let to_profile = match layout {
+            Layout::PerUnit => "../../../",
+            Layout::Shared => "../../",
+        };
+        write(
+            &record,
+            &format!("build-script-build.kache-real\0{relative}\0{to_profile}\0"),
+        );
+        record
+    }
+
+    #[cfg(unix)]
     #[test]
     fn a_seed_brings_the_kache_its_launchers_run() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
         for layout in [Layout::PerUnit, Layout::Shared] {
             let dir = tempfile::tempdir().unwrap();
             let donor = donor(dir.path(), "a", layout);
             let shims = crate::build_script::SHIM_DIR;
-            let pinned = donor.target_dir.join(PROFILE).join(shims).join("pin");
-            write(&pinned.join("kache"), "kache");
-            let new = checkout(dir.path(), "b");
-            let seeded = seed(
-                &new,
-                VERSION,
-                std::slice::from_ref(&donor),
-                Path::new(NO_CACHE),
-                later(),
+            let profile = donor.target_dir.join(PROFILE);
+            let pinned = profile.join(shims).join("pin/kache");
+            std::fs::create_dir_all(pinned.parent().unwrap()).unwrap();
+            let global = dir.path().join("kache");
+            kache_fs::testutil::write_executable(&global, "#!/bin/sh\nprintf 'seeded pin\\n'\n");
+            std::fs::set_permissions(&global, std::fs::Permissions::from_mode(0o700)).unwrap();
+            std::fs::hard_link(&global, &pinned).unwrap();
+            let record = launcher_record(&profile, layout, &format!("{shims}/pin/kache"));
+            let script = record.with_file_name("build-script-build");
+            std::fs::write(
+                &script,
+                include_bytes!(concat!(env!("OUT_DIR"), "/build-script-launcher")),
+            )
+            .unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            kache_fs::testutil::write_executable(
+                &record.with_file_name("build-script-build.kache-real"),
+                "#!/bin/sh\nprintf 'uncached fallback\\n'\n",
             );
+            write(&profile.join(shims).join("unused/kache"), "unused version");
+            let cache = dir.path().join("cache");
+            let hash = blake3::hash(b"rlib").to_hex().to_string();
+            write(
+                &kache_store::blob_path_in_store_dir(&cache.join("store"), &hash),
+                "rlib",
+            );
+            let new = checkout(dir.path(), "b");
+            let seeded = seed(&new, VERSION, std::slice::from_ref(&donor), &cache, later());
             assert_eq!(seeded.units, 1, "{layout:?}");
             let shim = new.target_dir.join(PROFILE).join(shims);
+            let copied = shim.join("pin/kache");
             assert_eq!(
-                std::fs::read_to_string(shim.join("pin/kache")).unwrap(),
-                "kache",
-                "{layout:?}"
+                std::fs::read(&copied).unwrap(),
+                std::fs::read(&global).unwrap()
             );
             assert_eq!(entries(&shim.join("pin")).len(), 1, "{layout:?}");
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::MetadataExt;
-                let inode = |path: &Path| std::fs::metadata(path).unwrap().ino();
-                assert_eq!(
-                    inode(&shim.join("pin/kache")),
-                    inode(&pinned.join("kache")),
-                    "{layout:?}: pinned by hard link"
-                );
-            }
+            assert!(!shim.join("unused").exists());
+            assert_eq!(
+                std::fs::metadata(&copied).unwrap().permissions().mode() & 0o777,
+                0o755
+            );
+            assert_eq!(
+                std::fs::metadata(&global).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            assert_ne!(
+                kache_fs::file_identity(&copied).unwrap(),
+                kache_fs::file_identity(&pinned).unwrap(),
+                "{layout:?}: target profiles own distinct executable inodes"
+            );
+            let seeded_script = new
+                .target_dir
+                .join(PROFILE)
+                .join(script.strip_prefix(&profile).unwrap());
+            std::fs::remove_dir_all(&donor.target_dir).unwrap();
+            std::fs::remove_file(global).unwrap();
+            let output = Command::new(seeded_script).output().unwrap();
+            assert!(output.status.success(), "{layout:?}");
+            assert_eq!(output.stdout, b"seeded pin\n", "{layout:?}");
         }
     }
 
@@ -1270,13 +1347,14 @@ source = "git+https://example.com/gitdep#abc"
             &new,
             "rustc 2.0.0 (other)\n",
             std::slice::from_ref(&donor),
-            Path::new(NO_CACHE),
+            Path::new("/nonexistent/kache-cache"),
             later(),
         );
         assert_eq!(seeded, Seeded::default());
         assert!(!new.target_dir.join(PROFILE).join(shims).exists());
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_pin_already_in_place_is_kept() {
         let dir = tempfile::tempdir().unwrap();
@@ -1284,14 +1362,94 @@ source = "git+https://example.com/gitdep#abc"
         let to = dir.path().join("to");
         let shims = crate::build_script::SHIM_DIR;
         write(&from.join(shims).join("pin/kache"), "donor");
-        write(&from.join(shims).join("empty/other"), "not a pin");
         write(&to.join(shims).join("pin/kache"), "ours");
-        pin_launchers(&from, &to);
+        let record = launcher_record(&from, Layout::Shared, &format!("{shims}/pin/kache"));
+        let original = kache_fs::file_identity(&to.join(shims).join("pin/kache")).unwrap();
+        pin_launcher(&from, &to, &record, later()).unwrap();
         assert_eq!(
             std::fs::read_to_string(to.join(shims).join("pin/kache")).unwrap(),
             "ours"
         );
-        assert!(!to.join(shims).join("empty").exists());
+        assert_eq!(
+            kache_fs::file_identity(&to.join(shims).join("pin/kache")).unwrap(),
+            original
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_seeded_shared_pin_is_detached_and_a_symlink_donor_is_resolved() {
+        let dir = tempfile::tempdir().unwrap();
+        let from = dir.path().join("from");
+        let to = dir.path().join("to");
+        let relative = format!("{}/pin/kache", crate::build_script::SHIM_DIR);
+        let source = from.join(&relative);
+        let copied = to.join(&relative);
+        write(&source, "donor executable");
+        std::fs::create_dir_all(copied.parent().unwrap()).unwrap();
+        std::fs::hard_link(&source, &copied).unwrap();
+        let record = launcher_record(&from, Layout::Shared, &relative);
+        pin_launcher(&from, &to, &record, later()).unwrap();
+        assert_ne!(
+            kache_fs::file_identity(&source).unwrap(),
+            kache_fs::file_identity(&copied).unwrap()
+        );
+        assert_eq!(std::fs::read(&copied).unwrap(), b"donor executable");
+        std::fs::remove_file(&source).unwrap();
+        write(&source.with_file_name("real"), "symlink executable");
+        std::os::unix::fs::symlink("real", &source).unwrap();
+        std::fs::remove_file(&copied).unwrap();
+        pin_launcher(&from, &to, &record, later()).unwrap();
+        assert!(std::fs::symlink_metadata(&copied).unwrap().is_file());
+        assert_eq!(std::fs::read(copied).unwrap(), b"symlink executable");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pin_copy_obeys_the_deadline_and_rejects_invalid_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let from = dir.path().join("from");
+        let to = dir.path().join("to");
+        let relative = format!("{}/pin/kache", crate::build_script::SHIM_DIR);
+        write(&from.join(&relative), "kache");
+        let record = launcher_record(&from, Layout::Shared, &relative);
+        assert_eq!(
+            pin_launcher(&from, &to, &record, Instant::now())
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::TimedOut
+        );
+        assert!(!to.exists());
+        for relative in [
+            "",
+            "../outside/kache",
+            "/tmp/pin/kache",
+            ".kache-build-script-shims/pin/other",
+            ".kache-build-script-shims/pin/kache/extra",
+            "other/pin/kache",
+        ] {
+            let record = launcher_record(&from, Layout::Shared, relative);
+            assert_eq!(
+                pin_launcher(&from, &to, &record, later())
+                    .unwrap_err()
+                    .kind(),
+                std::io::ErrorKind::InvalidData,
+                "{relative}"
+            );
+            assert!(!to.exists());
+        }
+        std::fs::write(&record, "no fields").unwrap();
+        assert_eq!(
+            pin_launcher(&from, &to, &record, later())
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        std::fs::remove_file(&record).unwrap();
+        pin_launcher(&from, &to, &record, later()).unwrap();
+        assert!(!to.exists());
+        std::fs::create_dir(&record).unwrap();
+        assert!(pin_launcher(&from, &to, &record, later()).is_err());
     }
 
     #[test]

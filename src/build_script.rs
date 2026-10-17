@@ -75,7 +75,8 @@ const ACTION_SUFFIX: &str = ".kache-real.action";
 /// per-unit layout), each NUL-terminated. The launcher reads it instead of
 /// listing the directory.
 #[cfg_attr(not(unix), allow(dead_code))]
-const LAUNCH_RECORD: &str = ".kache-launch";
+pub(crate) const LAUNCH_RECORD: &str = ".kache-launch";
+#[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) const SHIM_DIR: &str = ".kache-build-script-shims";
 /// The launcher binary for this target, built from `launcher/build_script.rs`.
 #[cfg(unix)]

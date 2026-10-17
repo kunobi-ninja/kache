@@ -6230,10 +6230,6 @@ fn source_scanner_detects_runtime_env_use_and_skips_literals() {
         RuntimeValue
     );
     assert_eq!(
-        scan(r#"const S: &str = env!(concat!("OT", "HER"));"#, "MYVAR"),
-        RuntimeValue
-    );
-    assert_eq!(
         scan(
             r#"macro_rules! e { ($v:literal) => { env!($v) } } const X: &str = e!("MYVAR");"#,
             "MYVAR"
@@ -11710,7 +11706,7 @@ fn env_dep_use_memo_rescans_rows_from_other_scanner_versions() {
         )
         .unwrap();
     cache
-        .put_source_env_dep_use(&content_hash, "OTHER", SOURCE_ENV_DEP_SCANNER_VERSION, 7)
+        .put_source_env_dep_use(&content_hash, "OUTPUT", SOURCE_ENV_DEP_SCANNER_VERSION, 7)
         .unwrap();
     drop(cache);
 
@@ -11724,7 +11720,7 @@ fn env_dep_use_memo_rescans_rows_from_other_scanner_versions() {
     );
     assert_eq!(
         hasher
-            .env_dep_use_for_hash(&source, "OTHER", &content_hash)
+            .env_dep_use_for_hash(&source, "OUTPUT", &content_hash)
             .unwrap(),
         SourceEnvDepUse::RuntimeValue,
         "an unknown stored code must be rescanned"
@@ -11732,7 +11728,7 @@ fn env_dep_use_memo_rescans_rows_from_other_scanner_versions() {
     drop(hasher);
 
     let cache = FileHashCache::open(&db).unwrap();
-    for var in ["OUT_DIR", "OTHER"] {
+    for var in ["OUT_DIR", "OUTPUT"] {
         assert_eq!(
             cache
                 .get_source_env_dep_use(&content_hash, var, SOURCE_ENV_DEP_SCANNER_VERSION)
@@ -16740,4 +16736,74 @@ fn environment_detail_hashes_follow_the_normalized_key_inputs() {
     );
     assert_ne!(first["BUILD_MODE"], second["BUILD_MODE"]);
     assert!(hashed(Vec::new()).is_empty());
+}
+
+/// assert_cmd's shape: an exported macro reads `CARGO_BIN_EXE_<bin>`, and the
+/// crate includes `$OUT_DIR/current_target.txt`. A computed name whose
+/// `concat!` starts with a literal the var does not start with cannot be the
+/// var.
+const ASSERT_CMD_SOURCE: &str = concat!(
+    "macro_rules! cargo_bin { ($bin_target_name:expr) => {\n",
+    "    ::std::path::Path::new(env!(concat!(\"CARGO_BIN_EXE_\", $bin_target_name)))\n",
+    "} }\n",
+    "const CURRENT_TARGET: &str = include_str!(concat!(env!(\"OUT_DIR\"), \"/current_target.txt\"));",
+);
+
+#[test]
+fn a_computed_name_with_another_literal_prefix_cannot_be_the_var() {
+    assert_eq!(
+        source_env_dep_use(ASSERT_CMD_SOURCE, "OUT_DIR"),
+        SourceEnvDepUse::IncludeLocator
+    );
+    for (source, var) in [
+        (r#"const S: &str = env!(concat!("OT", "HER"));"#, "MYVAR"),
+        (r#"const S: &str = env!(concat!("X_", $name));"#, "OUT_DIR"),
+    ] {
+        assert_eq!(
+            source_env_dep_use(source, var),
+            SourceEnvDepUse::Unused,
+            "{source}"
+        );
+    }
+    // A prefix of the var, an escape, or no leading literal can still name it.
+    for source in [
+        r#"const S: &str = env!(concat!("OUT", "_DIR"));"#,
+        r#"const S: &str = env!(concat!("", "OUT_DIR"));"#,
+        r#"const S: &str = env!(concat!("O\x55T", "_DIR"));"#,
+        r#"const S: &str = env!(concat!($prefix, "_DIR"));"#,
+        r#"const S: &str = env!(concat!(r"X", "OUT_DIR"));"#,
+        r#"const S: &str = env!(other!("X_", "OUT_DIR"));"#,
+        r#"const S: &str = env!(core::concat!("X_"));"#,
+    ] {
+        assert_eq!(
+            source_env_dep_use(source, "OUT_DIR"),
+            SourceEnvDepUse::RuntimeValue,
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn a_computed_name_rescans_version_three_memos() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("lib.rs");
+    std::fs::write(&source, ASSERT_CMD_SOURCE).unwrap();
+    let db = dir.path().join("idx.sqlite");
+    let hash = hash_file(&source).unwrap();
+    let cache = FileHashCache::open(&db).unwrap();
+    cache
+        .put_source_env_dep_use(
+            &hash,
+            "OUT_DIR",
+            3,
+            SourceEnvDepUse::RuntimeValue.memo_code(),
+        )
+        .unwrap();
+    drop(cache);
+    assert_eq!(
+        FileHasher::persistent(&db)
+            .env_dep_use(&source, "OUT_DIR")
+            .unwrap(),
+        SourceEnvDepUse::IncludeLocator
+    );
 }

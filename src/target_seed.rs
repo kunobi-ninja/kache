@@ -963,15 +963,10 @@ mod tests {
     const VERSION: &str = "rustc 1.0.0 (test)\nhost: test\n";
     /// A cache directory seeding tests without hermetic runs pass. Its store
     /// holds the fixtures' `rlib`, as kache stores what it compiles.
-    fn no_runs() -> &'static Path {
-        static CACHE: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
-        CACHE
-            .get_or_init(|| {
-                let cache = tempfile::tempdir().unwrap();
-                cache_storing(cache.path(), &["rlib"]);
-                cache
-            })
-            .path()
+    fn no_runs() -> tempfile::TempDir {
+        let cache = tempfile::tempdir().unwrap();
+        cache_storing(cache.path(), &["rlib"]);
+        cache
     }
 
     fn args(line: &str) -> Vec<String> {
@@ -1210,7 +1205,7 @@ source = "git+https://example.com/gitdep#abc"
                     &target,
                     VERSION,
                     &[wrong, matching.clone()],
-                    no_runs(),
+                    no_runs().path(),
                     later(),
                 );
                 assert_eq!(result.donor, Some(matching.workspace_root.clone()));
@@ -1229,7 +1224,7 @@ source = "git+https://example.com/gitdep#abc"
                 assert!(!target.workspace_root.join("target/debug").exists());
                 let regular = checkout(dir.path(), &format!("regular-{label}"));
                 assert_eq!(
-                    seed(&regular, VERSION, &[matching], no_runs(), later()),
+                    seed(&regular, VERSION, &[matching], no_runs().path(), later()),
                     Seeded::default()
                 );
             }
@@ -1252,7 +1247,7 @@ source = "git+https://example.com/gitdep#abc"
                 &new,
                 VERSION,
                 std::slice::from_ref(&donor),
-                no_runs(),
+                no_runs().path(),
                 later(),
             );
             assert_eq!(
@@ -1296,7 +1291,7 @@ source = "git+https://example.com/gitdep#abc"
                     &new,
                     VERSION,
                     std::slice::from_ref(&donor),
-                    no_runs(),
+                    no_runs().path(),
                     later()
                 ),
                 Seeded::default()
@@ -1431,7 +1426,7 @@ source = "git+https://example.com/gitdep#abc"
                 &new,
                 "rustc 9.9.9\n",
                 std::slice::from_ref(&wrong_rustc),
-                no_runs(),
+                no_runs().path(),
                 later()
             ),
             Seeded::default()
@@ -1441,7 +1436,7 @@ source = "git+https://example.com/gitdep#abc"
                 &new,
                 "  ",
                 std::slice::from_ref(&wrong_rustc),
-                no_runs(),
+                no_runs().path(),
                 later()
             ),
             Seeded::default()
@@ -1454,7 +1449,13 @@ source = "git+https://example.com/gitdep#abc"
             &info.to_string(),
         );
         assert_eq!(
-            seed(&new, "  ", std::slice::from_ref(&blank), no_runs(), later()),
+            seed(
+                &new,
+                "  ",
+                std::slice::from_ref(&blank),
+                no_runs().path(),
+                later()
+            ),
             Seeded::default()
         );
         // A build holds the donor's lock: the next donor gives the units.
@@ -1465,7 +1466,7 @@ source = "git+https://example.com/gitdep#abc"
             &new,
             VERSION,
             &[busy.clone(), free.clone()],
-            no_runs(),
+            no_runs().path(),
             later(),
         );
         assert_eq!(seeded.donor, Some(free.workspace_root.clone()));
@@ -1481,7 +1482,7 @@ source = "git+https://example.com/gitdep#abc"
         std::fs::remove_dir_all(empty.target_dir.join(PROFILE)).unwrap();
         std::fs::create_dir_all(empty.target_dir.join(PROFILE)).unwrap();
         assert_eq!(
-            seed(&other, VERSION, &[own, empty], no_runs(), later()),
+            seed(&other, VERSION, &[own, empty], no_runs().path(), later()),
             Seeded::default()
         );
         // Past the deadline nothing is copied.
@@ -1491,7 +1492,7 @@ source = "git+https://example.com/gitdep#abc"
                 &late,
                 VERSION,
                 std::slice::from_ref(&free),
-                no_runs(),
+                no_runs().path(),
                 Instant::now()
             ),
             Seeded::default()
@@ -1505,7 +1506,7 @@ source = "git+https://example.com/gitdep#abc"
                 &locked,
                 VERSION,
                 std::slice::from_ref(&free),
-                no_runs(),
+                no_runs().path(),
                 later()
             ),
             Seeded::default()
@@ -1519,7 +1520,7 @@ source = "git+https://example.com/gitdep#abc"
                 &bare,
                 VERSION,
                 std::slice::from_ref(&free),
-                no_runs(),
+                no_runs().path(),
                 later()
             ),
             Seeded::default()
@@ -1529,7 +1530,7 @@ source = "git+https://example.com/gitdep#abc"
             "[[package]]\nname = \"app\"\n",
         );
         assert_eq!(
-            seed(&bare, VERSION, &[free], no_runs(), later()),
+            seed(&bare, VERSION, &[free], no_runs().path(), later()),
             Seeded::default()
         );
     }
@@ -1619,7 +1620,7 @@ source = "git+https://example.com/gitdep#abc"
                     &new,
                     VERSION,
                     std::slice::from_ref(&donor),
-                    no_runs(),
+                    no_runs().path(),
                     later()
                 ),
                 Seeded::default()
@@ -1655,7 +1656,7 @@ source = "git+https://example.com/gitdep#abc"
                     &new,
                     VERSION,
                     std::slice::from_ref(&donor),
-                    no_runs(),
+                    no_runs().path(),
                     later()
                 ),
                 Seeded::default(),
@@ -1688,7 +1689,7 @@ source = "git+https://example.com/gitdep#abc"
                     &new,
                     VERSION,
                     std::slice::from_ref(&donor),
-                    no_runs(),
+                    no_runs().path(),
                     later()
                 ),
                 Seeded {
@@ -2110,7 +2111,7 @@ source = "git+https://example.com/gitdep#abc"
             &new,
             VERSION,
             std::slice::from_ref(&donor),
-            no_runs(),
+            no_runs().path(),
             later(),
         );
         #[cfg(unix)]
@@ -2136,7 +2137,7 @@ source = "git+https://example.com/gitdep#abc"
         write(&from.join("out/include/rdkafka.h"), "h");
         std::os::unix::fs::symlink("../include", from.join("out/src/include")).unwrap();
         let to = dir.path().join("copy");
-        place_tree(&from, &to, no_runs(), later()).unwrap();
+        place_tree(&from, &to, no_runs().path(), later()).unwrap();
         let link = to.join("out/src/librdkafka.so");
         assert_eq!(
             std::fs::read_link(&link).unwrap(),
@@ -2149,12 +2150,28 @@ source = "git+https://example.com/gitdep#abc"
         );
 
         std::os::unix::fs::symlink("../../../elsewhere", from.join("out/src/up")).unwrap();
-        assert!(place_tree(&from, &dir.path().join("escaped"), no_runs(), later()).is_err());
+        assert!(
+            place_tree(
+                &from,
+                &dir.path().join("escaped"),
+                no_runs().path(),
+                later()
+            )
+            .is_err()
+        );
         assert!(!dir.path().join("escaped").exists());
 
         let linked_unit = dir.path().join("linked-unit");
         std::os::unix::fs::symlink("unit", &linked_unit).unwrap();
-        assert!(place_tree(&linked_unit, &dir.path().join("whole"), no_runs(), later()).is_err());
+        assert!(
+            place_tree(
+                &linked_unit,
+                &dir.path().join("whole"),
+                no_runs().path(),
+                later()
+            )
+            .is_err()
+        );
     }
 
     /// A hermetic run leaves `OUT_DIR` as an absolute link to its sealed,
@@ -2265,10 +2282,10 @@ source = "git+https://example.com/gitdep#abc"
         let from = dir.path().join("unit");
         write(&from.join("a/file"), "x");
         let to = dir.path().join("copy");
-        let error = place_tree(&from, &to, no_runs(), Instant::now()).unwrap_err();
+        let error = place_tree(&from, &to, no_runs().path(), Instant::now()).unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
         assert_eq!(entries(dir.path()), vec![from.clone()]);
-        place_tree(&from, &to, no_runs(), later()).unwrap();
+        place_tree(&from, &to, no_runs().path(), later()).unwrap();
         assert_eq!(std::fs::read_to_string(to.join("a/file")).unwrap(), "x");
     }
 
@@ -2279,7 +2296,7 @@ source = "git+https://example.com/gitdep#abc"
         let dir = tempfile::tempdir().unwrap();
         let new = checkout(dir.path(), "b");
         assert_eq!(
-            seed(&new, VERSION, &[], no_runs(), later()),
+            seed(&new, VERSION, &[], no_runs().path(), later()),
             Seeded::default()
         );
         let tag = std::fs::read_to_string(new.target_dir.join("CACHEDIR.TAG")).unwrap();
@@ -2297,7 +2314,7 @@ source = "git+https://example.com/gitdep#abc"
         let dir = tempfile::tempdir().unwrap();
         let new = checkout(dir.path(), "b");
         std::fs::create_dir_all(&new.target_dir).unwrap();
-        seed(&new, VERSION, &[], no_runs(), later());
+        seed(&new, VERSION, &[], no_runs().path(), later());
         assert!(new.target_dir.join(PROFILE).is_dir());
         assert!(!new.target_dir.join("CACHEDIR.TAG").exists());
     }
@@ -2348,7 +2365,7 @@ source = "git+https://example.com/gitdep#abc"
                 &new,
                 VERSION,
                 std::slice::from_ref(&donor),
-                no_runs(),
+                no_runs().path(),
                 later()
             ),
             Seeded::default()

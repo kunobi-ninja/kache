@@ -215,9 +215,7 @@ pub fn run_rustc(
     );
     drop(compiler_trace);
     drop(response_file);
-    if let Some(monitor) = monitor {
-        monitor.finish();
-    }
+    drop(monitor);
 
     let (status, stdout, captured_stderr) =
         captured.with_context(|| format!("executing {}", rustc.display()))?;

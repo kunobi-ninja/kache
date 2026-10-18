@@ -78,16 +78,14 @@ pub fn set_heartbeat_ctx(
     });
 }
 
-/// Handle to a running monitor thread. Dropping it without calling
-/// [`CompileMonitor::finish`] also stops the thread (abnormal exits must not
-/// leave a ticker printing about a dead compile). Shutdown waits at most 50 ms
-/// for the ticker: a stalled diagnostic must not hold up compiler exit.
-/// No completion line
-/// is printed on finish: the wrapper's normal event logging covers it, and a
+/// Handle to a running monitor thread. Dropping it stops the ticker, including
+/// on abnormal exits. Shutdown waits at most 50 ms for the ticker: a stalled
+/// diagnostic must not hold up compiler exit. No completion line is printed
+/// on shutdown: the wrapper's normal event logging covers it, and a
 /// "finished" line after rustc's own output would read as noise.
 pub struct CompileMonitor {
     stop: std::sync::Arc<AtomicBool>,
-    // Wakes the ticker immediately on finish so process exit never waits out
+    // Wakes the ticker immediately on drop so process exit never waits out
     // a sleep. `recv_timeout` doubles as the tick sleep.
     wake_tx: mpsc::Sender<()>,
     done: Option<mpsc::Receiver<()>>,
@@ -116,24 +114,13 @@ pub fn start_monitor(crate_name: &str, pid: u32) -> Option<CompileMonitor> {
     })
 }
 
-impl CompileMonitor {
-    /// Stop the ticker without waiting indefinitely for diagnostic I/O.
-    pub fn finish(mut self) {
-        self.stop_and_wait();
-    }
-
-    fn stop_and_wait(&mut self) {
+impl Drop for CompileMonitor {
+    fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         let _ = self.wake_tx.send(());
         if let Some(done) = self.done.take() {
             let _ = done.recv_timeout(Duration::from_millis(50));
         }
-    }
-}
-
-impl Drop for CompileMonitor {
-    fn drop(&mut self) {
-        self.stop_and_wait();
     }
 }
 
@@ -186,7 +173,7 @@ fn run_ticks(
 
     loop {
         match wake_rx.recv_timeout(cadence) {
-            // finish() poked us, or the sender vanished with the parent.
+            // The monitor stopped us, or the sender vanished with the parent.
             Ok(()) => return,
             Err(mpsc::RecvTimeoutError::Disconnected) => return,
             Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -434,7 +421,7 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(20));
         };
-        monitor.finish();
+        drop(monitor);
 
         let event: HeartbeatEvent = serde_json::from_str(
             heartbeat
@@ -463,35 +450,29 @@ mod shutdown_tests {
     use super::*;
 
     #[test]
-    fn finish_and_drop_do_not_wait_for_a_stalled_ticker() {
-        for finish in [false, true] {
-            let stop = std::sync::Arc::new(AtomicBool::new(false));
-            let (wake_tx, wake_rx) = mpsc::channel();
-            // Keeping this sender alive models a ticker stuck before completion.
-            let (done_tx, done_rx) = mpsc::channel();
-            let monitor = CompileMonitor {
-                stop: stop.clone(),
-                wake_tx,
-                done: Some(done_rx),
-            };
-            let (returned_tx, returned_rx) = mpsc::channel();
-            let worker = std::thread::spawn(move || {
-                if finish {
-                    monitor.finish();
-                } else {
-                    drop(monitor);
-                }
-                returned_tx.send(()).unwrap();
-            });
-            let returned = returned_rx.recv_timeout(Duration::from_secs(3));
-            drop(done_tx);
-            worker.join().unwrap();
-            assert!(
-                returned.is_ok(),
-                "compiler exit waited for diagnostic completion"
-            );
-            assert!(stop.load(Ordering::Relaxed));
-            assert!(wake_rx.try_recv().is_ok());
-        }
+    fn drop_does_not_wait_for_a_stalled_ticker() {
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let (wake_tx, wake_rx) = mpsc::channel();
+        // Keeping this sender alive models a ticker stuck before completion.
+        let (done_tx, done_rx) = mpsc::channel();
+        let monitor = CompileMonitor {
+            stop: stop.clone(),
+            wake_tx,
+            done: Some(done_rx),
+        };
+        let (returned_tx, returned_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            drop(monitor);
+            returned_tx.send(()).unwrap();
+        });
+        let returned = returned_rx.recv_timeout(Duration::from_secs(3));
+        drop(done_tx);
+        worker.join().unwrap();
+        assert!(
+            returned.is_ok(),
+            "compiler exit waited for diagnostic completion"
+        );
+        assert!(stop.load(Ordering::Relaxed));
+        assert!(wake_rx.try_recv().is_ok());
     }
 }

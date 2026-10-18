@@ -102,6 +102,17 @@ mod tests {
         })
         .unwrap();
         assert_eq!(attempts, 1);
+        let mut attempts = 0;
+        lock_for_build(|| {
+            attempts += 1;
+            if attempts == 1 {
+                Err(TryLockError::WouldBlock)
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap();
+        assert_eq!(attempts, 2);
         let error = lock_for_build(|| {
             Err(TryLockError::Error(std::io::Error::from(
                 std::io::ErrorKind::PermissionDenied,
@@ -112,7 +123,15 @@ mod tests {
             error.downcast_ref::<std::io::Error>().unwrap().kind(),
             std::io::ErrorKind::PermissionDenied
         );
-        let error = lock_for_build(|| Err(TryLockError::WouldBlock)).unwrap_err();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let error = lock_for_build(|| {
+            assert!(
+                Instant::now() < deadline,
+                "lock retries exceeded the budget"
+            );
+            Err(TryLockError::WouldBlock)
+        })
+        .unwrap_err();
         assert_eq!(
             error.downcast_ref::<std::io::Error>().unwrap().kind(),
             std::io::ErrorKind::WouldBlock
@@ -166,12 +185,19 @@ mod tests {
         fs::write(&path, line("original")).unwrap();
         let reader = open_log_lock(&path).unwrap();
         reader.lock_shared().unwrap();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            // Release even if a broken retry loop never returns to the test.
+            let _ = release_rx.recv_timeout(Duration::from_secs(3));
+            reader.unlock().unwrap();
+        });
         let event = BuildEvent::new_for_test("next", EventResult::Miss);
         assert!(log_event_for_build(&path, &event).is_err());
         assert!(rotate_events_if_needed(&path, 1, 1, dir.path()).is_err());
         assert!(rotate_transfers_if_needed(&path, 1, 1).is_err());
         assert_eq!(fs::read(&path).unwrap(), line("original"));
-        reader.unlock().unwrap();
+        drop(release_tx);
+        holder.join().unwrap();
         log_event_for_build(&path, &event).unwrap();
         assert_eq!(read_events(&path).unwrap().len(), 2);
     }

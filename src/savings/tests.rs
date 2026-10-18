@@ -11,13 +11,19 @@ fn rotation_keeps_events_when_the_ledger_is_busy_then_retries() {
     let before = fs::read(&path).unwrap();
     let lock = open_ledger_lock(dir.path()).unwrap();
     lock.lock().unwrap();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let holder = std::thread::spawn(move || {
+        let _ = release_rx.recv_timeout(std::time::Duration::from_secs(3));
+        lock.unlock().unwrap();
+    });
     let size = before.len() as u64;
     assert!(rotate_events_if_needed(&path, size, 1, dir.path()).is_ok());
     assert!(rotate_events_if_needed(&path, size + 1, 1, dir.path()).is_ok());
     assert!(rotate_events_if_needed(&path, 1, 1, dir.path()).is_err());
     assert_eq!(fs::read(&path).unwrap(), before);
     assert!(read(dir.path()).is_none());
-    drop(lock);
+    drop(release_tx);
+    holder.join().unwrap();
     rotate_events_if_needed(&path, 1, 1, dir.path()).unwrap();
     let retained = read_events(&path).unwrap();
     assert_eq!(retained.len(), 1);

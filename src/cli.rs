@@ -273,8 +273,7 @@ pub(crate) fn snapshot_from_direct_reads(
     let inventory = crate::store_view::read(config, include_entries, sort_by).unwrap_or_default();
 
     let since = window.cutoff(chrono::Utc::now());
-    let event_list = events::read_events_since(&config.event_log_path(), since).unwrap_or_default();
-    let es = events::compute_stats(&event_list);
+    let es = events::event_stats_since(&config.event_log_path(), since).unwrap_or_default();
 
     let recent_summaries = if include_summaries {
         let mut summaries =

@@ -3120,9 +3120,8 @@ impl Daemon {
         };
 
         let since = stats_window(req).cutoff(chrono::Utc::now());
-        let event_list =
-            events::read_events_since(&self.config.event_log_path(), since).unwrap_or_default();
-        let es = events::compute_stats(&event_list);
+        let es =
+            events::event_stats_since(&self.config.event_log_path(), since).unwrap_or_default();
         let recent_summaries = if req.include_summaries {
             let mut summaries =
                 events::read_summaries(&self.config.summary_log_path()).unwrap_or_default();

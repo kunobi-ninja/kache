@@ -11853,6 +11853,18 @@ fn env_dep_use_memo_codes_round_trip() {
         SourceEnvDepUse::Unused,
         SourceEnvDepUse::IncludeLocator,
         SourceEnvDepUse::RuntimeValue,
+        SourceEnvDepUse::ConcatPrefix {
+            include_locator: false,
+        },
+        SourceEnvDepUse::ConcatPrefix {
+            include_locator: true,
+        },
+        SourceEnvDepUse::ConcatBinding {
+            include_locator: false,
+        },
+        SourceEnvDepUse::ConcatBinding {
+            include_locator: true,
+        },
     ] {
         assert_eq!(
             SourceEnvDepUse::from_memo_code(answer.memo_code()),
@@ -11864,10 +11876,26 @@ fn env_dep_use_memo_codes_round_trip() {
             SourceEnvDepUse::Unused.memo_code(),
             SourceEnvDepUse::IncludeLocator.memo_code(),
             SourceEnvDepUse::RuntimeValue.memo_code(),
+            SourceEnvDepUse::ConcatPrefix {
+                include_locator: false
+            }
+            .memo_code(),
+            SourceEnvDepUse::ConcatPrefix {
+                include_locator: true
+            }
+            .memo_code(),
+            SourceEnvDepUse::ConcatBinding {
+                include_locator: false
+            }
+            .memo_code(),
+            SourceEnvDepUse::ConcatBinding {
+                include_locator: true
+            }
+            .memo_code(),
         ],
-        [0, 1, 2]
+        [0, 1, 2, 3, 4, 5, 6]
     );
-    assert_eq!(SourceEnvDepUse::from_memo_code(3), None);
+    assert_eq!(SourceEnvDepUse::from_memo_code(7), None);
     assert_eq!(SourceEnvDepUse::from_memo_code(-1), None);
 }
 
@@ -16850,9 +16878,8 @@ fn environment_detail_hashes_follow_the_normalized_key_inputs() {
 }
 
 /// assert_cmd's shape: an exported macro reads `CARGO_BIN_EXE_<bin>`, and the
-/// crate includes `$OUT_DIR/current_target.txt`. A computed name whose
-/// `concat!` starts with a literal the var does not start with cannot be the
-/// var.
+/// crate includes `$OUT_DIR/current_target.txt`. Prefix exclusions remain
+/// conditional until the whole crate's visible concat! bindings are checked.
 const ASSERT_CMD_SOURCE: &str = concat!(
     "macro_rules! cargo_bin { ($bin_target_name:expr) => {\n",
     "    ::std::path::Path::new(env!(concat!(\"CARGO_BIN_EXE_\", $bin_target_name)))\n",
@@ -16864,7 +16891,9 @@ const ASSERT_CMD_SOURCE: &str = concat!(
 fn a_computed_name_with_another_literal_prefix_cannot_be_the_var() {
     assert_eq!(
         source_env_dep_use(ASSERT_CMD_SOURCE, "OUT_DIR"),
-        SourceEnvDepUse::IncludeLocator
+        SourceEnvDepUse::ConcatPrefix {
+            include_locator: true
+        }
     );
     for (source, var) in [
         (r#"const S: &str = env!(concat!("OT", "HER"));"#, "MYVAR"),
@@ -16872,7 +16901,9 @@ fn a_computed_name_with_another_literal_prefix_cannot_be_the_var() {
     ] {
         assert_eq!(
             source_env_dep_use(source, var),
-            SourceEnvDepUse::Unused,
+            SourceEnvDepUse::ConcatPrefix {
+                include_locator: false
+            },
             "{source}"
         );
     }
@@ -16915,6 +16946,161 @@ fn a_computed_name_rescans_version_three_memos() {
         FileHasher::persistent(&db)
             .env_dep_use(&source, "OUT_DIR")
             .unwrap(),
-        SourceEnvDepUse::IncludeLocator
+        SourceEnvDepUse::ConcatPrefix {
+            include_locator: true
+        }
     );
+}
+
+#[test]
+fn a_shadowed_concat_cannot_supply_an_env_name_prefix() {
+    for binding in [
+        r#"macro_rules! concat { ($($t:tt)*) => { "OUT_DIR" }; }"#,
+        r#"macro_rules! r#concat { ($($t:tt)*) => { "OUT_DIR" }; }"#,
+        "use custom::concat;",
+        "use custom::different as concat;",
+        "use custom::{different as concat};",
+        "use custom::*;",
+        "use custom::{named, *};",
+        "#[macro_use] extern crate custom;",
+        "#[macro_use(concat)] mod custom;",
+        "macro concat($($t:tt)*) { \"OUT_DIR\" }",
+    ] {
+        for source in [
+            format!("{binding}\n{ASSERT_CMD_SOURCE}"),
+            format!("{ASSERT_CMD_SOURCE}\n{binding}"),
+        ] {
+            assert_eq!(
+                source_env_dep_use(&source, "OUT_DIR"),
+                SourceEnvDepUse::RuntimeValue,
+                "{source}"
+            );
+        }
+    }
+}
+
+#[test]
+fn comments_and_strings_do_not_bind_concat() {
+    let source = format!(
+        r###"
+        // use custom::concat;
+        /* #[macro_use] extern crate custom; */
+        const TEXT: &str = "use custom::*;";
+        const RAW: &str = r#"macro_rules! concat {{ }}"#;
+        use std::path::Path;
+        const PRODUCT: u8 = 2 * 3;
+        {ASSERT_CMD_SOURCE}
+        "###
+    );
+    assert_eq!(
+        source_env_dep_use(&source, "OUT_DIR"),
+        SourceEnvDepUse::ConcatPrefix {
+            include_locator: true
+        }
+    );
+}
+
+#[test]
+fn concat_bindings_are_checked_across_sources_and_warm_memos() {
+    let dir = tempfile::tempdir().unwrap();
+    let prefix = dir.path().join("macros.rs");
+    let binding = dir.path().join("lib.rs");
+    let include = dir.path().join("include.rs");
+    std::fs::write(&prefix, r#"env!(concat!("CARGO_BIN_EXE_", "demo"));"#).unwrap();
+    std::fs::write(&include, r#"include_str!(env!("OUT_DIR"));"#).unwrap();
+    let db = dir.path().join("index.sqlite");
+
+    for declaration in [
+        "use dependency::concat;",
+        "use dependency::*;",
+        "#[macro_use] extern crate dependency;",
+    ] {
+        std::fs::write(&binding, declaration).unwrap();
+        for sources in [
+            vec![prefix.clone(), binding.clone(), include.clone()],
+            vec![binding.clone(), include.clone(), prefix.clone()],
+        ] {
+            for _ in 0..2 {
+                assert_eq!(
+                    env_dep_source_decision("OUT_DIR", &sources, &FileHasher::persistent(&db)),
+                    EnvDepNormalizationDecision::KeptAbsoluteRuntimeUse,
+                    "{declaration}"
+                );
+            }
+        }
+    }
+
+    // The same cached prefix answer is usable in a crate without a binding.
+    assert_eq!(
+        env_dep_source_decision(
+            "OUT_DIR",
+            &[prefix.clone(), include.clone()],
+            &FileHasher::persistent(&db),
+        ),
+        EnvDepNormalizationDecision::NormalizedPathOnly
+    );
+    // A binding alone must not invalidate ordinary literal include proof.
+    assert_eq!(
+        env_dep_source_decision("OUT_DIR", &[binding, include], &FileHasher::persistent(&db),),
+        EnvDepNormalizationDecision::NormalizedPathOnly
+    );
+    assert_eq!(
+        env_dep_source_decision("OUT_DIR", &[prefix], &FileHasher::persistent(&db)),
+        EnvDepNormalizationDecision::KeptAbsoluteNoIncludeProof
+    );
+}
+
+#[test]
+fn a_version_four_prefix_memo_is_rescanned_for_bindings() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("lib.rs");
+    std::fs::write(&source, format!("use custom::*;\n{ASSERT_CMD_SOURCE}")).unwrap();
+    let db = dir.path().join("idx.sqlite");
+    let hash = hash_file(&source).unwrap();
+    let cache = FileHashCache::open(&db).unwrap();
+    cache
+        .put_source_env_dep_use(&hash, "OUT_DIR", 4, 1)
+        .unwrap();
+    drop(cache);
+    assert_eq!(
+        FileHasher::persistent(&db)
+            .env_dep_use(&source, "OUT_DIR")
+            .unwrap(),
+        SourceEnvDepUse::RuntimeValue
+    );
+}
+
+#[test]
+fn conditional_include_proof_still_requires_a_rust_source() {
+    let dir = tempfile::tempdir().unwrap();
+    for (name, source, expected) in [
+        (
+            "prefix.rs",
+            ASSERT_CMD_SOURCE,
+            EnvDepNormalizationDecision::NormalizedPathOnly,
+        ),
+        (
+            "prefix.txt",
+            ASSERT_CMD_SOURCE,
+            EnvDepNormalizationDecision::KeptAbsoluteNoIncludeProof,
+        ),
+        (
+            "binding.rs",
+            r#"use custom::*; include_str!(env!("OUT_DIR"));"#,
+            EnvDepNormalizationDecision::NormalizedPathOnly,
+        ),
+        (
+            "binding.txt",
+            r#"use custom::*; include_str!(env!("OUT_DIR"));"#,
+            EnvDepNormalizationDecision::KeptAbsoluteNoIncludeProof,
+        ),
+    ] {
+        let path = dir.path().join(name);
+        std::fs::write(&path, source).unwrap();
+        assert_eq!(
+            env_dep_source_decision("OUT_DIR", &[path], &FileHasher::new()),
+            expected,
+            "{name}"
+        );
+    }
 }

@@ -185,7 +185,8 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         }
         let mut attempted = 0_i64;
         let mut recovered = 0;
-        while attempted < limit {
+        // Each query is capped to the remaining count, so this cannot overshoot.
+        while attempted != limit {
             let page_size = (limit - attempted).min(WRITE_BATCH as i64);
             let candidates = self.compile_time_candidates(page_size, now)?;
             if candidates.is_empty() {

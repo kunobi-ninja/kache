@@ -8556,7 +8556,9 @@ pub(crate) fn store_error_for_event(error: &anyhow::Error) -> String {
 /// here may fail a build.
 pub(crate) fn write_event(config: &Config, event: &BuildEvent) {
     let _trace = crate::phase_trace::phase("event_log");
-    let _ = events::log_event(&config.event_log_path(), event);
+    if events::log_event_for_build(&config.event_log_path(), event).is_err() {
+        return;
+    }
     let _ = events::rotate_events_if_needed(
         &config.event_log_path(),
         config.event_log_max_size,
@@ -8791,7 +8793,7 @@ fn explain_miss_diff(
     {
         return Vec::new();
     }
-    let events = match events::read_events(&config.event_log_path()) {
+    let events = match events::recent_events_for_build(&config.event_log_path()) {
         Ok(events) => events,
         Err(_) => return Vec::new(),
     };

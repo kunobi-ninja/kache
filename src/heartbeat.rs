@@ -80,7 +80,9 @@ pub fn set_heartbeat_ctx(
 
 /// Handle to a running monitor thread. Dropping it without calling
 /// [`CompileMonitor::finish`] also stops the thread (abnormal exits must not
-/// leave a detached ticker printing about a dead compile). No completion line
+/// leave a ticker printing about a dead compile). Shutdown waits at most 50 ms
+/// for the ticker: a stalled diagnostic must not hold up compiler exit.
+/// No completion line
 /// is printed on finish: the wrapper's normal event logging covers it, and a
 /// "finished" line after rustc's own output would read as noise.
 pub struct CompileMonitor {
@@ -88,7 +90,7 @@ pub struct CompileMonitor {
     // Wakes the ticker immediately on finish so process exit never waits out
     // a sleep. `recv_timeout` doubles as the tick sleep.
     wake_tx: mpsc::Sender<()>,
-    handle: Option<std::thread::JoinHandle<()>>,
+    done: Option<mpsc::Receiver<()>>,
 }
 
 /// Start monitoring a spawned compiler child. Returns `None` (a no-op) when
@@ -97,38 +99,41 @@ pub fn start_monitor(crate_name: &str, pid: u32) -> Option<CompileMonitor> {
     let ctx = CTX.get()?;
     let stop = std::sync::Arc::new(AtomicBool::new(false));
     let (wake_tx, wake_rx) = mpsc::channel::<()>();
+    let (done_tx, done_rx) = mpsc::channel::<()>();
     let thread_stop = stop.clone();
     let crate_name = crate_name.to_string();
-    let handle = std::thread::Builder::new()
+    let _ = std::thread::Builder::new()
         .name("kache-heartbeat".into())
-        .spawn(move || monitor_loop(ctx, &crate_name, pid, &thread_stop, &wake_rx))
+        .spawn(move || {
+            monitor_loop(ctx, &crate_name, pid, &thread_stop, &wake_rx);
+            let _ = done_tx.send(());
+        })
         .ok()?;
     Some(CompileMonitor {
         stop,
         wake_tx,
-        handle: Some(handle),
+        done: Some(done_rx),
     })
 }
 
 impl CompileMonitor {
-    /// Stop the ticker and join it. Prints a completion line only if at least
-    /// one heartbeat was emitted — quiet compiles stay quiet.
+    /// Stop the ticker without waiting indefinitely for diagnostic I/O.
     pub fn finish(mut self) {
-        self.stop_and_join();
+        self.stop_and_wait();
     }
 
-    fn stop_and_join(&mut self) {
+    fn stop_and_wait(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         let _ = self.wake_tx.send(());
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
+        if let Some(done) = self.done.take() {
+            let _ = done.recv_timeout(Duration::from_millis(50));
         }
     }
 }
 
 impl Drop for CompileMonitor {
     fn drop(&mut self) {
-        self.stop_and_join();
+        self.stop_and_wait();
     }
 }
 
@@ -196,6 +201,9 @@ fn run_ticks(
             crate::events::typical_compile_ms(&ctx.event_log, crate_name, &ctx.root)
                 .map(|ms| ms.div_ceil(1000))
         });
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
         if first_tick && typical.is_some() {
             // Refresh the registry entry now that the typical time is known
             // (upsert by pid — idempotent on the daemon side).
@@ -233,6 +241,9 @@ fn run_ticks(
         };
         if let Err(e) = crate::events::log_heartbeat(&ctx.event_log, &hb) {
             tracing::debug!("heartbeat event write failed: {e:#}");
+        }
+        if stop.load(Ordering::Relaxed) {
+            return;
         }
 
         // Stuck detection piggybacks on the same tick. A sampling failure
@@ -444,5 +455,43 @@ mod tests {
     fn child_cpu_time_reads_a_live_process() {
         let cpu = child_cpu_time(std::process::id());
         assert!(cpu.is_some(), "self-sample must succeed");
+    }
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use super::*;
+
+    #[test]
+    fn finish_and_drop_do_not_wait_for_a_stalled_ticker() {
+        for finish in [false, true] {
+            let stop = std::sync::Arc::new(AtomicBool::new(false));
+            let (wake_tx, wake_rx) = mpsc::channel();
+            // Keeping this sender alive models a ticker stuck before completion.
+            let (done_tx, done_rx) = mpsc::channel();
+            let monitor = CompileMonitor {
+                stop: stop.clone(),
+                wake_tx,
+                done: Some(done_rx),
+            };
+            let (returned_tx, returned_rx) = mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                if finish {
+                    monitor.finish();
+                } else {
+                    drop(monitor);
+                }
+                returned_tx.send(()).unwrap();
+            });
+            let returned = returned_rx.recv_timeout(Duration::from_secs(3));
+            drop(done_tx);
+            worker.join().unwrap();
+            assert!(
+                returned.is_ok(),
+                "compiler exit waited for diagnostic completion"
+            );
+            assert!(stop.load(Ordering::Relaxed));
+            assert!(wake_rx.try_recv().is_ok());
+        }
     }
 }

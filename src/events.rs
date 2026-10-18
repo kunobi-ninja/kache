@@ -5,6 +5,10 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
+mod build_path;
+use build_path::LogLock;
+pub(crate) use build_path::{lock_for_build, recent_events_for_build};
+
 /// Coarse class of a free-form passthrough reason.
 ///
 /// Old logs omit the field. `None` is the same absence: a hit, a miss, or a
@@ -636,7 +640,11 @@ impl CleanupEvent {
 
 /// Append maintenance evidence with the same lock as compiler events.
 pub fn log_cleanup(event_log_path: &Path, event: &CleanupEvent) -> Result<()> {
-    append_json_line(event_log_path, event)
+    append_log_line(
+        event_log_path,
+        serde_json::to_string(event).context("serializing cleanup event")?,
+        LogLock::Build,
+    )
 }
 
 /// One parsed line of the event log, for consumers that want the full mixed
@@ -667,15 +675,15 @@ fn parse_event_line(line: &str) -> Option<EventRecord> {
 }
 
 /// Append one serialized JSON line under the exclusive sidecar lock — the
-/// shared tail of [`log_event`] and [`log_heartbeat`], so every writer has the
+/// shared tail of [`log_event_for_build`] and [`log_heartbeat`], so every writer has the
 /// same interleaving guarantee across concurrent wrapper processes.
-fn append_log_line(event_log_path: &Path, line: String) -> Result<()> {
+fn append_log_line(event_log_path: &Path, line: String, lock_mode: LogLock) -> Result<()> {
     if let Some(parent) = event_log_path.parent() {
         fs::create_dir_all(parent)?;
     }
 
     let lock = open_log_lock(event_log_path).context("opening event log lock")?;
-    lock.lock().context("locking event log")?;
+    lock_mode.exclusive(&lock).context("locking event log")?;
 
     let mut file = OpenOptions::new()
         .create(true)
@@ -715,16 +723,27 @@ fn append_log_line(event_log_path: &Path, line: String) -> Result<()> {
 /// as the machine-level session records in the cache dir.
 pub fn append_json_line<T: Serialize>(log_path: &Path, record: &T) -> Result<()> {
     let line = serde_json::to_string(record).context("serializing log record")?;
-    append_log_line(log_path, line)
+    append_log_line(log_path, line, LogLock::Wait)
 }
 
 /// Append a build event to the event log file.
 /// Uses an exclusive sidecar file lock so concurrent wrapper processes cannot
 /// interleave JSON lines.
+#[cfg(test)]
 pub fn log_event(event_log_path: &Path, event: &BuildEvent) -> Result<()> {
     append_log_line(
         event_log_path,
         serde_json::to_string(event).context("serializing event")?,
+        LogLock::Wait,
+    )
+}
+
+/// Append optional build telemetry with a bounded wait for the sidecar lock.
+pub(crate) fn log_event_for_build(event_log_path: &Path, event: &BuildEvent) -> Result<()> {
+    append_log_line(
+        event_log_path,
+        serde_json::to_string(event).context("serializing event")?,
+        LogLock::Build,
     )
 }
 
@@ -733,6 +752,7 @@ pub fn log_heartbeat(event_log_path: &Path, event: &HeartbeatEvent) -> Result<()
     append_log_line(
         event_log_path,
         serde_json::to_string(event).context("serializing heartbeat")?,
+        LogLock::Build,
     )
 }
 
@@ -742,7 +762,8 @@ const TYPICAL_WINDOW: usize = 20;
 /// Median compile cost (ms) for `crate_name` from the recent event log — the
 /// "typical: 7m51s" / ETA input for heartbeats (kunobi-ninja/kache#131).
 ///
-/// One full log read under a shared lock. Callers invoke this lazily on the
+/// Reads at most 256 KiB of recent complete records, parsing outside the lock.
+/// Callers invoke this lazily on the
 /// FIRST heartbeat tick, never at spawn: only compiles already running longer
 /// than one cadence (default 30 s) pay the read, so a cold build with hundreds
 /// of fast misses performs no scans at all. Uses the last [`TYPICAL_WINDOW`]
@@ -750,7 +771,7 @@ const TYPICAL_WINDOW: usize = 20;
 /// than 3σ from the window median (a one-off `-j1` or thermally-throttled
 /// build must not wreck the estimate).
 pub fn typical_compile_ms(event_log_path: &Path, crate_name: &str, root: &str) -> Option<u64> {
-    let events = read_events(event_log_path).ok()?;
+    let events = recent_events_for_build(event_log_path).ok()?;
     let samples: Vec<u64> = events
         .iter()
         // Only real compiles in the SAME build tree: hits merely repeat the
@@ -1193,6 +1214,7 @@ fn rotate_log_impl(
     max_size: u64,
     keep_lines: usize,
     log_label: &str,
+    lock_mode: LogLock,
     fold: impl FnOnce(&[&str]) -> Result<()>,
 ) -> Result<()> {
     if !log_path.exists() {
@@ -1208,7 +1230,9 @@ fn rotate_log_impl(
 
     // 1. Acquire the lock before querying metadata or reading
     let lock = open_log_lock(log_path).context("opening log lock")?;
-    lock.lock().context("locking log for rotation")?;
+    lock_mode
+        .exclusive(&lock)
+        .context("locking log for rotation")?;
 
     // The dropped lines, for the fold after the lock is released.
     let res = (|| -> Result<Option<String>> {
@@ -1295,6 +1319,7 @@ pub fn rotate_if_needed(event_log_path: &Path, max_size: u64, keep_lines: usize)
         max_size,
         keep_lines,
         "event log",
+        LogLock::Wait,
         |_| Ok(()),
     )
 }
@@ -1308,12 +1333,19 @@ pub fn rotate_events_if_needed(
     keep_lines: usize,
     cache_dir: &Path,
 ) -> Result<()> {
+    if !matches!(fs::metadata(event_log_path), Ok(meta) if meta.len() > max_size) {
+        return Ok(());
+    }
+    // Acquire the ledger before removing any events. If bookkeeping is busy,
+    // leave the log intact and let a later wrapper retry the rotation.
+    let fold = crate::savings::prepare_rotation_fold(cache_dir)?;
     rotate_log_impl(
         event_log_path,
         max_size,
         keep_lines,
         "event log",
-        |dropped| crate::savings::fold_dropped_lines(cache_dir, dropped),
+        LogLock::Build,
+        fold,
     )
 }
 
@@ -1480,6 +1512,7 @@ pub fn rotate_transfers_if_needed(
         max_size,
         keep_lines,
         "transfer log",
+        LogLock::Build,
         |_| Ok(()),
     )
 }

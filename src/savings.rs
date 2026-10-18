@@ -169,15 +169,23 @@ pub fn read(cache_dir: &Path) -> Option<Totals> {
 /// ledger starts from `delta`; a corrupt one is moved to `savings.json.corrupt`
 /// first; a newer one is left alone, and `delta` is not recorded.
 fn add(cache_dir: &Path, delta: &Totals) -> Result<()> {
+    let lock = open_ledger_lock(cache_dir)?;
+    lock.lock().context("locking savings ledger")?;
+    add_locked(cache_dir, delta, lock)
+}
+
+fn open_ledger_lock(cache_dir: &Path) -> Result<std::fs::File> {
     fs::create_dir_all(cache_dir).context("creating cache dir for the savings ledger")?;
-    let lock = OpenOptions::new()
+    OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
         .open(lock_path(cache_dir))
-        .context("opening savings ledger lock")?;
-    lock.lock().context("locking savings ledger")?;
+        .context("opening savings ledger lock")
+}
+
+fn add_locked(cache_dir: &Path, delta: &Totals, lock: std::fs::File) -> Result<()> {
     let path = ledger_path(cache_dir);
     let res = (|| -> Result<()> {
         let mut totals = delta.clone();
@@ -200,20 +208,27 @@ fn add(cache_dir: &Path, delta: &Totals) -> Result<()> {
     res
 }
 
-/// Fold the event-log lines a rotation drops into the ledger. Called after
-/// the log has been replaced and its lock released, so a reader sees each
+/// Reserve the ledger before rotating, without waiting indefinitely. The
+/// returned fold runs after the log has been replaced and its lock released,
+/// so a reader sees each
 /// event in the log or in the ledger, never both; between the replace and
 /// this fold it briefly sees it in neither. Lines that are not build events
 /// (heartbeats, torn writes) count for nothing.
-pub(crate) fn fold_dropped_lines(cache_dir: &Path, lines: &[&str]) -> Result<()> {
-    let events: Vec<BuildEvent> = lines
-        .iter()
-        .filter_map(|line| serde_json::from_str(line).ok())
-        .collect();
-    match Totals::from_events(&events) {
-        Some(delta) => add(cache_dir, &delta),
-        None => Ok(()),
-    }
+pub(crate) fn prepare_rotation_fold(
+    cache_dir: &Path,
+) -> Result<impl FnOnce(&[&str]) -> Result<()> + '_> {
+    let lock = open_ledger_lock(cache_dir)?;
+    crate::events::lock_for_build(|| lock.try_lock())?;
+    Ok(move |lines: &[&str]| {
+        let events: Vec<BuildEvent> = lines
+            .iter()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+        match Totals::from_events(&events) {
+            Some(delta) => add_locked(cache_dir, &delta, lock),
+            None => Ok(()),
+        }
+    })
 }
 
 /// Add a GC run's freed store bytes, split by who started it. A run that

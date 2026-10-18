@@ -2,6 +2,31 @@ use super::*;
 use crate::events::{EventResult, log_event, read_events, rotate_events_if_needed};
 use chrono::TimeZone;
 
+#[test]
+fn rotation_keeps_events_when_the_ledger_is_busy_then_retries() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("events.jsonl");
+    log_event(&path, &hit(1, "")).unwrap();
+    log_event(&path, &hit(2, "")).unwrap();
+    let before = fs::read(&path).unwrap();
+    let lock = open_ledger_lock(dir.path()).unwrap();
+    lock.lock().unwrap();
+    let size = before.len() as u64;
+    assert!(rotate_events_if_needed(&path, size, 1, dir.path()).is_ok());
+    assert!(rotate_events_if_needed(&path, size + 1, 1, dir.path()).is_ok());
+    assert!(rotate_events_if_needed(&path, 1, 1, dir.path()).is_err());
+    assert_eq!(fs::read(&path).unwrap(), before);
+    assert!(read(dir.path()).is_none());
+    drop(lock);
+    rotate_events_if_needed(&path, 1, 1, dir.path()).unwrap();
+    let retained = read_events(&path).unwrap();
+    assert_eq!(retained.len(), 1);
+    assert_eq!(retained[0].compile_time_ms, 2);
+    let ledger = read(dir.path()).unwrap();
+    assert_eq!(ledger.hits, 1);
+    assert_eq!(ledger.hit_compile_time_ms, 1);
+}
+
 fn at(day: u32) -> DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 9, day, 12, 0, 0).unwrap()
 }
@@ -183,11 +208,11 @@ fn plain_rotation_leaves_the_ledger_alone() {
 fn lines_without_build_events_fold_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let heartbeat = r#"{"event":"heartbeat","ts":"2026-09-01T12:00:00Z","crate_name":"a","pid":1,"elapsed_s":30}"#;
-    fold_dropped_lines(dir.path(), &[heartbeat, "{\"torn\n", "\n"]).unwrap();
+    prepare_rotation_fold(dir.path()).unwrap()(&[heartbeat, "{\"torn\n", "\n"]).unwrap();
     assert!(!ledger_path(dir.path()).exists());
 
     let line = format!("{}\n", serde_json::to_string(&hit(7, "")).unwrap());
-    fold_dropped_lines(dir.path(), &[heartbeat, &line]).unwrap();
+    prepare_rotation_fold(dir.path()).unwrap()(&[heartbeat, &line]).unwrap();
     assert_eq!(read(dir.path()).unwrap().hits, 1);
 }
 

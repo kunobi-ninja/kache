@@ -628,6 +628,17 @@ Every GC driver (the daemon's sweep and its eviction after an upload, the auto-G
 | `KACHE_PAGER` | none | platform pager | Pager command for `kache list` |
 | `KACHE_MAX_DIAGNOSTICS_BYTES` | none | unset | Cap, in bytes, on the compiler diagnostics stored with an entry. Unset stores them in full, so a hit replays exactly what the compile printed. Above the cap they are truncated with a marker |
 
+Compiler event writes wait up to 5 ms to acquire the log lock, then omit the
+record if it is still busy. This affects diagnostics, not compiler output or
+cache validation. Rotation is deferred when the log or savings ledger is busy.
+The lock budget does not bound filesystem I/O after acquisition.
+
+Heartbeat ETA and miss explanations inspect at most 256 KiB of recent complete
+event records and parse them after releasing the lock. An unavailable log or
+missing recent history leaves the estimate or explanation empty. Compiler exit
+allows 50 ms for the heartbeat to stop, then continues without joining a stalled
+diagnostic thread.
+
 ## Pin file-backed settings
 
 Set `cache.ignore_env` in a controlled project config to ignore environment overrides for settings that also exist in TOML:

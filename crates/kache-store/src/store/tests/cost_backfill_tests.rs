@@ -221,6 +221,23 @@ fn count_and_soft_time_bounds_leave_deterministic_progress() {
 }
 
 #[test]
+fn count_limit_caps_the_last_page_and_preserves_the_remainder() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(test_config(dir.path())).unwrap();
+    for index in 0..200 {
+        legacy(&store, &format!("key-{index:03}"), 100);
+    }
+
+    assert_eq!(store.backfill_compile_times_limited(130).unwrap(), 130);
+    assert_eq!(store.compile_time_candidates(200, 1000).unwrap().len(), 70);
+    assert_eq!(state(&store, "key-129"), (100, 1, 0, 0));
+    assert_eq!(state(&store, "key-130"), (0, 0, 0, 0));
+
+    assert_eq!(store.backfill_compile_times_limited(130).unwrap(), 70);
+    assert!(store.compile_time_candidates(200, 1000).unwrap().is_empty());
+}
+
+#[test]
 fn writes_commit_in_small_groups_between_metadata_reads() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(test_config(dir.path())).unwrap();

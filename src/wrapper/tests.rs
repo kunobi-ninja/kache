@@ -5050,6 +5050,81 @@ fn wants_debug_bundle_requires_user_facing_and_debuginfo() {
     assert!(!wants_debug_bundle(&lib_g));
 }
 
+#[test]
+fn debug_bundle_policy_honors_split_debuginfo_and_override_order() {
+    let base = ["rustc", "src/main.rs", "--crate-type", "bin", "-g"];
+    for (flags, expected) in [
+        (vec!["-C", "split-debuginfo=off"], false),
+        (vec!["-Csplit-debuginfo=off"], false),
+        (vec!["--codegen", "split-debuginfo=off"], false),
+        (vec!["--codegen=split-debuginfo=off"], false),
+        (vec!["-Csplit-debuginfo=unpacked"], true),
+        (vec!["-Csplit-debuginfo=packed"], true),
+        (
+            vec!["-Csplit-debuginfo=off", "-Csplit-debuginfo=packed"],
+            true,
+        ),
+        (
+            vec!["-Csplit-debuginfo=packed", "-Csplit-debuginfo=off"],
+            false,
+        ),
+        (vec!["-Cdebuginfo=0"], false),
+        (vec!["-Cdebuginfo=none"], false),
+    ] {
+        let mut argv = base.to_vec();
+        argv.extend(&flags);
+        assert_eq!(
+            wants_debug_bundle(&rustc_args(&argv)),
+            expected,
+            "{flags:?}"
+        );
+    }
+}
+
+#[test]
+fn debug_bundle_restore_honors_the_current_policy_for_legacy_entries() {
+    for (flags, expected) in [
+        (vec!["-g"], true),
+        (vec!["-g", "-Csplit-debuginfo=off"], false),
+        (vec!["-Cdebuginfo=0"], false),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path().join("cache"));
+        let store = Store::open(&config).unwrap();
+        let out_dir = dir.path().join("target/debug/deps");
+        let bundle = debug_bundle_tar("foo", b"dwarf");
+        let hash = blake3::hash(&bundle).to_hex().to_string();
+        create_blob(&store, &hash, &bundle);
+        let output = out_dir.to_str().unwrap();
+        let mut argv = vec![
+            "rustc",
+            "src/main.rs",
+            "--crate-name",
+            "foo",
+            "--crate-type",
+            "bin",
+            "--out-dir",
+            output,
+        ];
+        argv.extend(&flags);
+        let args = rustc_args(&argv);
+        let meta = entry_meta(
+            "legacy-debug-bundle",
+            vec![cached_file("foo.dsym.tar", &hash)],
+            &[],
+        );
+        restore_from_cache(&config, &RustcCompiler::new(), &store, &args, &meta, None).unwrap();
+        assert_eq!(out_dir.join("foo.dsym.tar").exists(), expected, "{flags:?}");
+        assert_eq!(
+            out_dir
+                .join("foo.dSYM/Contents/Resources/DWARF/foo")
+                .exists(),
+            expected,
+            "{flags:?}"
+        );
+    }
+}
+
 /// Tar bytes shaped like a store-time debug bundle: entries relative to
 /// the bundle root, the layout `unpack_debug_bundle` re-creates.
 fn debug_bundle_tar(dwarf_name: &str, dwarf: &[u8]) -> Vec<u8> {

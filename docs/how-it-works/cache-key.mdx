@@ -31,6 +31,8 @@ Host-loaded Linux and macOS links, and native Windows MSVC links, pass through i
 
 On macOS, every cached executable link gets ld64 `-oso_prefix` set to Cargo's profile directory, so `N_OSO` object paths in the binary are not checkout-local. A cached proc-macro link gets `-install_name @rpath/lib<crate>.dylib`. A cached executable or test binary built with debug info also stores a `.dSYM` bundle, made with `dsymutil` while its object files still exist. A restore unpacks it beside the binary, where lldb looks first. Without `dsymutil`, the binary is cached without one.
 
+`-C split-debuginfo=off` skips Kache's `.dSYM` generation and restoration, including bundles in older cache entries. `-C debuginfo=0` and `-C debuginfo=none` also skip bundling. Without a bundle, source-level debugging of a cached binary can depend on the producing build's object files.
+
 Incremental directory names and harmless local path spellings are excluded or normalized.
 
 Use `kache explain` and trace logging to see the components for a particular build.

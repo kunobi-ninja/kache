@@ -5396,12 +5396,6 @@ fn rustc_debuginfo_enabled(args: &RustcArgs) -> bool {
     args.debuginfo_enabled()
 }
 
-/// Store-time gate for [`crate::compiler::Platform::package_debug_bundle`]:
-/// only user-facing executables (`bin` / `--test`) reach the executable cache
-/// path, and only debug-carrying ones have anything for a `.dSYM` to hold.
-/// No `cache_executables` check here — a non-user-facing invocation never
-/// stores an executable, and a user-facing one only reaches the store when
-/// `cache_executables` already let it past the passthrough gate.
 /// The executable artifact of this invocation, if any — the binary the
 /// store-time debug bundle is baked FROM. Classification is contextual
 /// (extensionless bins need the crate-type), so this rides classify_output
@@ -5418,8 +5412,13 @@ fn find_executable_output(
         .map(|a| (a.path.clone(), a.store_name.clone()))
 }
 
+/// Bundle debug info for cached user binaries unless the invocation opts out
+/// of dsymutil. `get_codegen_opt` follows rustc's last-value-wins rule.
+/// Executable-cache admission has already happened before this gate.
 fn wants_debug_bundle(args: &RustcArgs) -> bool {
-    args.is_user_facing_executable() && rustc_debuginfo_enabled(args)
+    args.is_user_facing_executable()
+        && rustc_debuginfo_enabled(args)
+        && args.get_codegen_opt("split-debuginfo") != Some("off")
 }
 
 /// Whether a store's outputs include a file large enough to prestage.
@@ -7550,6 +7549,10 @@ fn restore_from_cache_with_memo_store(
         // the kind, `plan_post_restore` the actions — no ad-hoc filename
         // matching at the call site.
         let kind = compiler.classify_output(args, &cached_file.name);
+        // Older entries may carry a bundle despite an explicit opt-out.
+        if kind == ArtifactKind::DebugBundle && !wants_debug_bundle(args) {
+            continue;
+        }
         let restored = materialize_cached_artifact(
             store,
             cached_file,

@@ -10434,3 +10434,165 @@ fn compile_time_backfill_message_does_not_claim_completion_or_hide_errors() {
         " deferred: index busy"
     );
 }
+
+/// Write a Cargo config naming `target_dir`, creating the `.cargo` directory
+/// Cargo resolves a relative value against and the target dir itself. Creating
+/// the target dir keeps a test asserting *which* config won, rather than how far
+/// [`closest_existing`] had to walk back up; one test below covers that walk.
+fn cargo_config(root: &std::path::Path, target_dir: &std::path::Path) {
+    let cargo = root.join(".cargo");
+    fs::create_dir_all(&cargo).unwrap();
+    fs::create_dir_all(if target_dir.is_absolute() {
+        target_dir.to_path_buf()
+    } else {
+        root.join(target_dir)
+    })
+    .unwrap();
+    fs::write(
+        cargo.join("config.toml"),
+        format!("[build]\ntarget-dir = \"{}\"\n", target_dir.display()),
+    )
+    .unwrap();
+}
+
+fn os(path: &std::path::Path) -> Option<std::ffi::OsString> {
+    Some(path.as_os_str().to_owned())
+}
+
+#[test]
+fn the_target_dir_environment_beats_every_config_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path().join("project");
+    fs::create_dir_all(&project).unwrap();
+    let from_config = dir.path().join("from-config");
+    let from_env = dir.path().join("from-env");
+    cargo_config(&project, &from_config);
+    fs::create_dir_all(&from_env).unwrap();
+    assert_eq!(
+        cargo_target_dir_from(&project, os(&from_env), None, None),
+        from_env,
+        "Cargo gives the environment precedence over every config file"
+    );
+}
+
+#[test]
+fn an_empty_target_dir_environment_is_ignored() {
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path().join("project");
+    fs::create_dir_all(&project).unwrap();
+    let target = dir.path().join("shared-target");
+    cargo_config(&project, &target);
+    assert_eq!(
+        cargo_target_dir_from(&project, os(std::path::Path::new("")), None, None),
+        target,
+        "an empty CARGO_TARGET_DIR is no setting at all"
+    );
+}
+
+#[test]
+fn the_nearest_config_wins_over_an_outer_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let outer = dir.path().join("outer");
+    let project = outer.join("crates/inner");
+    fs::create_dir_all(&project).unwrap();
+    let outer_target = dir.path().join("outer-target");
+    let nearest_target = dir.path().join("nearest-target");
+    cargo_config(&outer, &outer_target);
+    cargo_config(&outer.join("crates"), &nearest_target);
+    assert_eq!(
+        cargo_target_dir_from(&project, None, None, None),
+        nearest_target,
+        "Cargo merges ancestor configs nearest first"
+    );
+}
+
+#[test]
+fn the_cargo_home_config_is_read_when_no_ancestor_names_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path().join("project");
+    let home = dir.path().join("cargo-home");
+    let target = dir.path().join("cargo-home-target");
+    fs::create_dir_all(&project).unwrap();
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&target).unwrap();
+    fs::write(
+        home.join("config.toml"),
+        format!("[build]\ntarget-dir = \"{}\"\n", target.display()),
+    )
+    .unwrap();
+    assert_eq!(
+        cargo_target_dir_from(&project, None, os(&home), None),
+        target,
+        "Cargo reads $CARGO_HOME/config.toml after the per-directory ones"
+    );
+}
+
+#[test]
+fn cargo_home_defaults_to_the_home_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path().join("project");
+    let home = dir.path().join("home");
+    let target = dir.path().join("home-target");
+    fs::create_dir_all(project.join(".cargo")).unwrap();
+    fs::create_dir_all(home.join(".cargo")).unwrap();
+    fs::create_dir_all(&target).unwrap();
+    // The project's own config names no target dir, so the search has to reach
+    // the one under $HOME, which is where Cargo looks when CARGO_HOME is unset.
+    fs::write(project.join(".cargo/config.toml"), "[build]\njobs = 2\n").unwrap();
+    fs::write(
+        home.join(".cargo/config.toml"),
+        format!("[build]\ntarget-dir = \"{}\"\n", target.display()),
+    )
+    .unwrap();
+    assert_eq!(
+        cargo_target_dir_from(&project, None, None, os(&home)),
+        target
+    );
+}
+
+#[test]
+fn a_relative_target_dir_resolves_against_the_config_that_names_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path().join("project");
+    fs::create_dir_all(&project).unwrap();
+    cargo_config(&project, std::path::Path::new("build/output"));
+    assert_eq!(
+        cargo_target_dir_from(&project, None, None, None),
+        project.join("build/output"),
+        "Cargo resolves a relative target-dir against the parent of .cargo"
+    );
+}
+
+#[test]
+fn a_target_dir_no_build_has_created_yet_probes_its_nearest_existing_ancestor() {
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path().join("project");
+    fs::create_dir_all(project.join(".cargo")).unwrap();
+    // Named but not created, which is how a target dir looks before the first
+    // build, so this writes the config rather than going through `cargo_config`.
+    fs::write(
+        project.join(".cargo/config.toml"),
+        format!(
+            "[build]\ntarget-dir = \"{}\"\n",
+            project.join("target/debug").display()
+        ),
+    )
+    .unwrap();
+    assert_eq!(
+        cargo_target_dir_from(&project, None, None, None),
+        project,
+        "the probe needs a directory it can write a temp file into"
+    );
+}
+
+#[test]
+fn a_project_with_nothing_configured_probes_its_working_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path().join("project");
+    fs::create_dir_all(project.join("target")).unwrap();
+    assert_eq!(
+        cargo_target_dir_from(&project, None, None, None),
+        project.join("target"),
+        "without a setting Cargo uses target below the working directory"
+    );
+}

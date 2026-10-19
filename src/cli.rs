@@ -7593,6 +7593,82 @@ pub(crate) fn doctor_shards(config: &Config) -> Vec<Check> {
         .collect()
 }
 
+/// The directory a build of the current working directory writes its artifacts
+/// to: the target dir Cargo would choose for it.
+///
+/// `kache doctor` probes this rather than the working directory. What the store
+/// hardlinks into is the target dir, never the source tree, so probing the
+/// working directory reports EXDEV for a project whose `build.target-dir` sits
+/// on the store's mount, and a pass for one whose artifacts get copied.
+fn cargo_target_dir() -> std::path::PathBuf {
+    cargo_target_dir_from(
+        &std::env::current_dir().unwrap_or_default(),
+        std::env::var_os("CARGO_TARGET_DIR"),
+        std::env::var_os("CARGO_HOME"),
+        std::env::var_os("HOME"),
+    )
+}
+
+/// [`cargo_target_dir`] with the environment passed in, so the search can be
+/// tested without mutating the one the suite shares.
+fn cargo_target_dir_from(
+    cwd: &std::path::Path,
+    target_dir: Option<std::ffi::OsString>,
+    cargo_home: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> std::path::PathBuf {
+    use std::path::PathBuf;
+    // Cargo gives the environment its own precedence, above every config file.
+    if let Some(dir) = target_dir.filter(|dir| !dir.is_empty()) {
+        return closest_existing(PathBuf::from(dir));
+    }
+    // Cargo reads the config of every ancestor of the working directory,
+    // nearest first, and $CARGO_HOME/config.toml last, so the first config
+    // naming a target dir wins.
+    let mut configs: Vec<PathBuf> = cwd
+        .ancestors()
+        .map(|dir| dir.join(".cargo").join("config.toml"))
+        .collect();
+    // $CARGO_HOME defaults to ~/.cargo, so leaving it unset still has a file.
+    let cargo_home = cargo_home
+        .map(PathBuf::from)
+        .or_else(|| home.map(|home| PathBuf::from(home).join(".cargo")));
+    if let Some(cargo_home) = cargo_home {
+        configs.push(cargo_home.join("config.toml"));
+    }
+    for config in configs {
+        if let Some(target) = configured_target_dir(&config) {
+            return closest_existing(target);
+        }
+    }
+    closest_existing(cwd.join("target"))
+}
+
+/// `[build] target-dir` from a Cargo config, resolved the way Cargo resolves it:
+/// a relative value is relative to the parent of the `.cargo` directory holding
+/// the file, not to the working directory.
+fn configured_target_dir(config: &std::path::Path) -> Option<std::path::PathBuf> {
+    let settings: toml::Value = toml::from_str(&std::fs::read_to_string(config).ok()?).ok()?;
+    let target = std::path::PathBuf::from(settings.get("build")?.get("target-dir")?.as_str()?);
+    let relative_to = config.parent()?.parent()?;
+    Some(if target.is_absolute() {
+        target
+    } else {
+        relative_to.join(target)
+    })
+}
+
+/// The probe writes a temp file, so it needs a directory that exists. A target
+/// dir no build has created yet has none of its own, and its nearest existing
+/// ancestor is on the filesystem the artifacts will land on.
+fn closest_existing(path: std::path::PathBuf) -> std::path::PathBuf {
+    let mut current = path.as_path();
+    while !current.exists() {
+        current = current.parent().unwrap_or(std::path::Path::new("/"));
+    }
+    current.to_path_buf()
+}
+
 fn doctor_link_layout(config: &Config, build_dir: &std::path::Path) -> Check {
     let routed = config.routed_for_path(build_dir);
     let staging = routed.store_dir().join("staging");
@@ -7876,7 +7952,7 @@ pub fn doctor(
             });
         }
         checks.extend(doctor_shards(cfg));
-        let build_dir = std::env::current_dir().unwrap_or_else(|_| cfg.cache_dir.clone());
+        let build_dir = cargo_target_dir();
         checks.push(doctor_link_layout(cfg, &build_dir));
     }
 

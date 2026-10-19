@@ -790,6 +790,11 @@ fn links_metadata_reaches_dependent_build_scripts_whatever_its_spelling() {
     write(
         "linked/build.rs",
         r#"fn main() {
+    use std::io::Write;
+    let runs = std::path::PathBuf::from(std::env::var_os("LINKS_TEST_RUNS").unwrap());
+    let mut runs = std::fs::OpenOptions::new()
+        .create(true).append(true).open(runs.join("linked")).unwrap();
+    writeln!(runs, "run").unwrap();
     println!("cargo:rerun-if-changed=build.rs");
     let out = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap());
     let files = out.join("core-window-permission-files");
@@ -808,6 +813,11 @@ fn links_metadata_reaches_dependent_build_scripts_whatever_its_spelling() {
     write(
         "consumer/build.rs",
         r#"fn main() {
+    use std::io::Write;
+    let runs = std::path::PathBuf::from(std::env::var_os("LINKS_TEST_RUNS").unwrap());
+    let mut runs = std::fs::OpenOptions::new()
+        .create(true).append(true).open(runs.join("consumer")).unwrap();
+    writeln!(runs, "run").unwrap();
     println!("cargo:rerun-if-changed=build.rs");
     for name in [
         "DEP_LINKED_CORE:WINDOW__CORE_PLUGIN___PERMISSION_FILES_PATH",
@@ -841,26 +851,36 @@ fn links_metadata_reaches_dependent_build_scripts_whatever_its_spelling() {
         _dirs: vec![workspace, home, cache],
     };
 
-    for (name, expected) in [("cold", "miss"), ("warm", "local_hit")] {
-        let mark = event_count(&fx.cache);
+    let runs = fx.home.join("script-runs");
+    std::fs::create_dir(&runs).unwrap();
+    for (name, enabled, expected_runs) in [("cold", "1", 1), ("warm", "1", 1), ("uncached", "0", 2)]
+    {
         let output = run(&mut cargo(
             "check",
             &fx.workspace,
             &fx.home,
             &fx.cache,
             &target(&fx, name),
-            &[],
+            &[
+                ("LINKS_TEST_RUNS", runs.to_str().unwrap()),
+                ("KACHE_BUILD_SCRIPT_CACHE", enabled),
+            ],
         ));
         assert!(
             String::from_utf8_lossy(&output.stderr).contains("consumer saw every linked key"),
             "{name}: {}",
             String::from_utf8_lossy(&output.stderr)
         );
-        assert_eq!(
-            results_for(&events_since(&fx.cache, mark), "build_script_run"),
-            vec![expected, expected],
-            "{name}: both scripts go through the launcher"
-        );
+        for script in ["linked", "consumer"] {
+            assert_eq!(
+                std::fs::read_to_string(runs.join(script))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                expected_runs,
+                "{name}: {script} execution count"
+            );
+        }
     }
 }
 

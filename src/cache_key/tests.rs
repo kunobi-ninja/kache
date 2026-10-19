@@ -5903,11 +5903,38 @@ fn tool_version_cache_write_is_read_back() {
 #[cfg(unix)]
 #[test]
 fn cwd_remap_probe_kills_timeouts_and_retries_without_a_cached_rejection() {
-    let _lock = key_test_lock();
     let dir = tempfile::tempdir().unwrap();
-    let _cache =
-        crate::config::tests::set_env_for_test("KACHE_CACHE_DIR", Some(dir.path().as_os_str()));
-    let rustc = dir.path().join("rustc-probe");
+    // Tool-version memos use the platform cache directory. Isolate it in a
+    // child so Nix's unwritable home and other tests cannot affect the memo.
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--ignored",
+            "--exact",
+            "cache_key::tests::cwd_remap_probe_timeout_fixture",
+            "--nocapture",
+        ])
+        .env("HOME", dir.path())
+        .env("XDG_CACHE_HOME", dir.path())
+        .env("KACHE_TEST_CWD_REMAP_ROOT", dir.path())
+        .output()
+        .expect("spawn isolated cwd-remap probe fixture");
+    assert!(
+        output.status.success(),
+        "isolated cwd-remap probe failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "spawned by the cwd-remap probe timeout regression"]
+fn cwd_remap_probe_timeout_fixture() {
+    let root = std::env::var_os("KACHE_TEST_CWD_REMAP_ROOT")
+        .map(PathBuf::from)
+        .expect("fixture requires its isolated cache root");
+    assert!(crate::config::default_cache_dir().starts_with(&root));
+    let rustc = root.join("rustc-probe");
     kache_fs::testutil::write_executable(
         &rustc,
         "#!/bin/sh\nif [ -f \"$0.ready\" ]; then printf x >> \"$0.calls\"; exit 0; fi\nprintf '%s\\n' \"$$\" > \"$0.pid\"\nexec sleep 8\n",

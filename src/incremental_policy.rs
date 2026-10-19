@@ -21,6 +21,8 @@ use std::fs::{self, File, OpenOptions};
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+mod worktree_seed;
+
 /// Sibling of Cargo's `<profile>/incremental` that holds every managed unit.
 const AUTO_ROOT: &str = "incremental.kache-auto";
 const POLICY_VERSION: &str = "v1";
@@ -65,6 +67,8 @@ pub(crate) struct Lease {
     unit: AdaptiveUnit,
     kind: LeaseKind,
     completion: Completion,
+    worktree_seed_key: Option<String>,
+    worktree_bootstrap: bool,
     _lock: UnitLock,
 }
 
@@ -314,6 +318,8 @@ impl AdaptiveUnit {
             unit: self.clone(),
             kind: LeaseKind::Seed,
             completion: Completion::DeferredSeed { previous },
+            worktree_seed_key: None,
+            worktree_bootstrap: false,
             _lock: lock,
         })
     }
@@ -378,6 +384,8 @@ impl AdaptiveUnit {
             completion: Completion::Active {
                 state: busy.clone(),
             },
+            worktree_seed_key: None,
+            worktree_bootstrap: false,
             _lock: lock,
         })
     }
@@ -416,6 +424,8 @@ impl AdaptiveUnit {
             unit: self.clone(),
             kind: LeaseKind::Immediate,
             completion: Completion::Immediate { restore },
+            worktree_seed_key: None,
+            worktree_bootstrap: false,
             _lock: lock,
         })
     }
@@ -469,6 +479,8 @@ impl AdaptiveUnit {
                 observation,
                 previous,
             },
+            worktree_seed_key: None,
+            worktree_bootstrap: false,
             _lock: lock,
         })
     }
@@ -669,6 +681,11 @@ impl Lease {
     /// fail closed by stripping incremental flags instead of borrowing state
     /// belonging to another unit.
     pub(crate) fn compiler_args(&self, args: &RustcArgs) -> Vec<String> {
+        // A later compile may use different path handling. Only a successful
+        // experimental compile may publish another donor marker.
+        if !remove_path_safely(&self.unit.unit_dir.join(worktree_seed::MARKER)) {
+            return strip_incremental(&args.all_args);
+        }
         if args.incremental.as_ref() == Some(&self.unit.original_incremental)
             && unit_key(
                 args,
@@ -734,14 +751,18 @@ impl Lease {
             (Completion::Immediate { restore }, _) => restore,
         };
 
-        match next {
+        let kept = match next {
             Some(state) if self.unit.store_state(&state, true) => true,
             None => remove_path_safely(&self.unit.state_path),
             Some(_) => {
                 reset_locked(&self.unit);
                 false
             }
+        };
+        if kept && outcome == CompileOutcome::Success {
+            worktree_seed::publish(&self.unit, self.worktree_seed_key.as_deref());
         }
+        kept
     }
 }
 
@@ -943,6 +964,9 @@ fn strip_incremental_refs(args: &[String]) -> Vec<&String> {
 }
 
 fn reset_locked(unit: &AdaptiveUnit) -> bool {
+    if !remove_path_safely(&unit.unit_dir.join(worktree_seed::MARKER)) {
+        return false;
+    }
     // Removing private rustc state can fail or stop part-way, for example on
     // Ctrl-C. Mark the unit in flight first, durably, so what survives is a
     // state every lease resets, never an old active one beside a partial

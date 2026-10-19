@@ -2203,6 +2203,8 @@ mod tests {
                 clean_incremental: Some(false),
                 preserve_incremental: Some(true),
                 adaptive_incremental: Some(false),
+                incremental_seed_from: None,
+                unstable: Default::default(),
                 exclude: Some(vec![
                     "src/generated/**".to_string(),
                     "vendor/**".to_string(),

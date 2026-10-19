@@ -38,6 +38,78 @@ KACHE_INCREMENTAL_CRATES=my_crate cargo mutants
 
 A mutant that fails to compile keeps the crate's incremental state, so the next mutant still compiles incrementally.
 
+## Experimental incremental seeds between worktrees
+
+Set `[cache] unstable = true` or `KACHE_UNSTABLE=1` to enable the experimental
+behavior. This one switch includes future experiments as Kache adds them.
+Kache prepares portable incremental state for crates selected by
+`KACHE_INCREMENTAL_CRATES`, with `KACHE_PRESERVE_INCREMENTAL` off. An optional
+donor Cargo profile, such as `/work/previous/target/debug`, seeds the first
+incremental compile in another checkout. Adaptive builds still learn within
+their own target.
+
+```bash
+# Run in the donor checkout first.
+export KACHE_UNSTABLE=1
+export KACHE_PRESERVE_INCREMENTAL=0
+export KACHE_INCREMENTAL_CRATES=my_crate
+cargo build
+
+# In the new checkout, point at the donor's absolute, canonical profile path.
+cd /work/new-checkout
+KACHE_INCREMENTAL_SEED_FROM=/work/previous/target/debug cargo build
+```
+
+The file equivalent for the receiver is:
+
+```toml
+[cache]
+unstable = true
+preserve_incremental = false
+incremental_crates = ["my_crate"]
+incremental_seed_from = "/work/previous/target/debug"
+```
+
+Kache probes the selected compiler for `-Zremap-cwd-prefix`, with the current
+crate name and bootstrap environment. The probe compiles no source, is bounded
+to two seconds, and is memoized per compiler and environment. Probe faults leave
+the compile without an imported seed. Kache adds `-Zremap-cwd-prefix=/src` when
+it is absent and the compiler accepts it. An explicit absolute prefix is kept;
+both checkouts must use the same value.
+
+Unstable mode also permits Kache to try bootstrap when a stable compiler needs
+it for these managed compiles. Bootstrap is set only in the selected rustc
+child. Cargo, unselected dependency compiles and build scripts keep their
+original environment. Kache never replaces an existing nonempty
+`RUSTC_BOOTSTRAP`, including `-1` and crate selectors. Its own override adds
+`-Zallow-features=` so source `#![feature(...)]` attributes remain forbidden.
+Other user-supplied unstable compiler flags prevent Kache from adding bootstrap,
+except `incremental-info`. A user-supplied bootstrap setting retains its existing
+behavior. The compiler must support the required flags; bootstrap cannot add
+missing compiler features. The prototype was tested on Linux with rustc 1.99.0.
+
+Unstable mode is off by default. `[cache] ignore_env` also gates `KACHE_UNSTABLE`.
+These experimental compiler behaviors lack Rust's stable compatibility
+guarantees.
+
+On stable, let Kache insert the remapping flag. Putting `-Z` options in
+`RUSTFLAGS` can make Cargo's compiler queries fail before this managed compile
+path runs; Kache's bootstrap permission does not apply to those queries.
+
+The receiver copies compatible private state while holding donor and receiver
+locks. rustc checks changed inputs. Kache copies no Cargo fingerprints or cached
+artifacts and publishes no normal artifact-cache entry from this path. Compiler
+identity, effective bootstrap, flags and cache policy must match. A busy donor,
+incompatible flags, an unsupported argument or incomplete state leaves the
+receiver without an imported seed. Copying is limited to 1 GiB and 65,536
+entries, and scanning to 256 donor units.
+
+Use the same relative package layout in both checkouts. Targets outside the
+compiler's working directory usually retain different absolute paths and cannot
+share a seed. Absolute source operands keep target-local state because
+rewriting them changes `file!()` output. Builds with unstable mode off
+keep their existing behavior.
+
 ## What to expect
 
 - The baseline build in each copy can reuse entries your ordinary `cargo test` runs stored, as long as the flags match.

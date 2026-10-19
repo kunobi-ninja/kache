@@ -218,6 +218,8 @@ pub(crate) fn test_config(cache_dir: PathBuf) -> crate::config::Config {
         clean_incremental: true,
         preserve_incremental: false,
         adaptive_incremental: true,
+        incremental_seed_from: None,
+        unstable: Default::default(),
         event_log_max_size: 10 * 1024 * 1024,
         event_log_keep_lines: 1000,
         compression_level: 3,

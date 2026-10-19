@@ -11,7 +11,10 @@ pub enum IncrementalMode {
     /// Remove incremental state from normal artifact-cache compiles.
     Strip,
     /// Keep an already-isolated incremental path owned by Kache.
-    PreserveIsolated,
+    PreserveIsolated {
+        /// Set bootstrap only in this compiler child, after an explicit opt-in.
+        bootstrap: bool,
+    },
 }
 
 /// Result of running rustc.
@@ -122,6 +125,12 @@ pub fn run_rustc(
     let spawned = std::time::Instant::now();
     let mut cmd = Command::new(rustc);
     crate::toolchain_dylib::apply(&mut cmd, rustc);
+    if matches!(
+        incremental_mode,
+        IncrementalMode::PreserveIsolated { bootstrap: true }
+    ) {
+        cmd.env("RUSTC_BOOTSTRAP", "1");
+    }
 
     // Double-wrapper (RUSTC_WRAPPER + RUSTC_WORKSPACE_WRAPPER): the workspace
     // wrapper (e.g. clippy-driver) expects the actual rustc path as its first arg.
@@ -161,7 +170,7 @@ pub fn run_rustc(
     // put the codegen flag in argv before the wrapper runs.
     let compiler_args = match incremental_mode {
         IncrementalMode::Strip => strip_incremental_flags(args),
-        IncrementalMode::PreserveIsolated => args.iter().collect(),
+        IncrementalMode::PreserveIsolated { .. } => args.iter().collect(),
     };
     let response_file = if use_response_file {
         let response = RustcResponseFile::new(compiler_args.iter().map(|arg| arg.as_str()))?;

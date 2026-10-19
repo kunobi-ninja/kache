@@ -8951,6 +8951,87 @@ pub(crate) fn rustc_version_text(rustc: &Path) -> Option<String> {
     get_rustc_version(rustc).ok()
 }
 
+/// Whether this compiler accepts cwd remapping for this crate and bootstrap
+/// environment. No source is compiled. Transient faults are not memoized.
+pub(crate) fn rustc_accepts_cwd_remap(
+    rustc: &Path,
+    crate_name: &str,
+    prefix: &str,
+    bootstrap: Option<&OsStr>,
+    restrict_features: bool,
+) -> Option<bool> {
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+    let mut material = crate::probe_memo::Material::new("rustc-cwd-remap-v1");
+    if let Some(path) = program_path(rustc, std::env::var_os("PATH").as_deref())
+        && let Ok(meta) = std::fs::metadata(path)
+    {
+        material.push(&meta.len().to_le_bytes());
+        if let Ok(time) = meta.modified()
+            && let Ok(time) = time.duration_since(std::time::UNIX_EPOCH)
+        {
+            material.push(&time.as_nanos().to_le_bytes());
+        }
+    }
+    material.push(crate_name.as_bytes()).push(prefix.as_bytes());
+    material.push(if restrict_features {
+        b"restrict"
+    } else {
+        b"unchanged"
+    });
+    match bootstrap {
+        Some(value) => {
+            material.push(b"set").push(value.as_encoded_bytes());
+        }
+        None => {
+            material.push(b"unset");
+        }
+    }
+    let memo = format!("rustc-cwd-{}", material.digest());
+    match read_tool_version_cache(rustc, &memo).as_deref() {
+        Some("yes") => return Some(true),
+        Some("no") => return Some(false),
+        _ => {}
+    }
+    let mut command = Command::new(rustc);
+    crate::toolchain_dylib::apply(&mut command, rustc);
+    command
+        .args(["--crate-name", crate_name, "--print", "cfg"])
+        .arg(format!("-Zremap-cwd-prefix={prefix}"))
+        .env_remove("RUSTC_BOOTSTRAP")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if let Some(value) = bootstrap {
+        command.env("RUSTC_BOOTSTRAP", value);
+    }
+    if restrict_features {
+        command.arg("-Zallow-features=");
+    }
+    crate::platform::configure_process_group(&mut command);
+    let mut child = command.spawn().ok()?;
+    let start = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                status.code()?;
+                let accepted = status.success();
+                write_tool_version_cache(rustc, &memo, if accepted { "yes" } else { "no" });
+                return Some(accepted);
+            }
+            Ok(None) if start.elapsed() < Duration::from_secs(2) => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            _ => {
+                crate::platform::kill_process_group(child.id());
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+}
+
 fn get_rustc_version(rustc: &Path) -> Result<String> {
     let _trace = crate::phase_trace::phase("compiler_identity");
     if let Some(cached) = read_tool_version_cache(rustc, "rustc-ver") {

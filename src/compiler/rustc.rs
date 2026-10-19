@@ -64,6 +64,7 @@ pub fn crate_type_produces_metadata(crate_type: &str) -> bool {
 #[derive(Default)]
 pub struct RustcCompiler {
     base_dirs: Vec<String>,
+    incremental_bootstrap: bool,
 }
 
 impl RustcCompiler {
@@ -73,6 +74,11 @@ impl RustcCompiler {
 
     pub fn with_base_dirs(mut self, base_dirs: Vec<String>) -> Self {
         self.base_dirs = base_dirs;
+        self
+    }
+
+    pub(crate) fn with_incremental_bootstrap(mut self, enabled: bool) -> Self {
+        self.incremental_bootstrap = enabled;
         self
     }
 
@@ -180,7 +186,9 @@ impl RustcCompiler {
         self.execute_with_args(
             parsed,
             isolated_args,
-            compile::IncrementalMode::PreserveIsolated,
+            compile::IncrementalMode::PreserveIsolated {
+                bootstrap: self.incremental_bootstrap,
+            },
             None,
             LinkLane::Adaptive,
             Some(&mut std::io::stderr()),
@@ -199,7 +207,9 @@ impl RustcCompiler {
         self.execute_with_args(
             parsed,
             isolated_args,
-            compile::IncrementalMode::PreserveIsolated,
+            compile::IncrementalMode::PreserveIsolated {
+                bootstrap: self.incremental_bootstrap,
+            },
             None,
             LinkLane::Adaptive,
             Some(&mut std::io::stderr()),
@@ -218,7 +228,9 @@ impl RustcCompiler {
         self.execute_with_args(
             parsed,
             isolated_args,
-            compile::IncrementalMode::PreserveIsolated,
+            compile::IncrementalMode::PreserveIsolated {
+                bootstrap: self.incremental_bootstrap,
+            },
             Some(true),
             LinkLane::Passthrough,
             Some(&mut std::io::stderr()),

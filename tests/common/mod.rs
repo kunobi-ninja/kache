@@ -168,6 +168,8 @@ pub fn hermetic_command(
         .env_remove("KACHE_SOCKET_PATH")
         .env_remove("KACHE_EVENT_ROOT")
         .env_remove("KACHE_ACTIVE")
+        .env_remove("KACHE_UNSTABLE")
+        .env_remove("KACHE_INCREMENTAL_SEED_FROM")
         .env_remove("RUSTC_WRAPPER")
         .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
         // Cargo sets kache's own OUT_DIR on the test process (kache has a

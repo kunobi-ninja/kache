@@ -7843,14 +7843,18 @@ fn adaptive_incremental_with_event<R: Into<String>>(
     crate_name: &str,
     root: &str,
     start: std::time::Instant,
-    lease: Lease,
+    mut lease: Lease,
     reason: R,
     keyed: Option<(&str, u64, FileHashStats, u64)>,
     key_record: KeyEventRecord,
 ) -> Result<i32> {
     let reason = reason.into();
     let kind = lease.kind();
-    let compiler_args = lease.compiler_args(args);
+    let compiler_args = lease.worktree_compiler_args(
+        args,
+        config.incremental_seed_from.as_deref(),
+        config.unstable,
+    );
     let permit = adaptive_lane_takes_permit(kind).then(|| {
         scheduler::begin_keyless_compile(
             &config.cache_dir,
@@ -7861,7 +7865,9 @@ fn adaptive_incremental_with_event<R: Into<String>>(
         )
     });
     let compile_start = std::time::Instant::now();
-    let compiler = RustcCompiler::new().with_base_dirs(config.base_dirs.clone());
+    let compiler = RustcCompiler::new()
+        .with_base_dirs(config.base_dirs.clone())
+        .with_incremental_bootstrap(lease.worktree_bootstrap());
     let rebuilt_package = KeyEnv::capture().var("CARGO_PKG_NAME");
     let compile = if kind == crate::incremental_policy::LeaseKind::Immediate {
         compiler.execute_passthrough_preserving_incremental(args, &compiler_args)

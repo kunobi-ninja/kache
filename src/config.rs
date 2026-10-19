@@ -185,6 +185,11 @@ pub struct Config {
     /// artifact caching. Enabled by default; `preserve_incremental` remains the
     /// explicit force mode.
     pub adaptive_incremental: bool,
+    /// Optional donor profile for worktree incremental seeds in unstable mode.
+    pub incremental_seed_from: Option<PathBuf>,
+    /// Enable all current and future experiments before they become defaults.
+    /// `KACHE_UNSTABLE=1` / `[cache] unstable = true`. Off by default.
+    pub unstable: bool,
     pub event_log_max_size: u64,
     pub event_log_keep_lines: usize,
     /// Zstd compression level (1-19, default 3). Lower = faster, higher = smaller.
@@ -946,6 +951,8 @@ pub(crate) struct CacheFileConfig {
     pub(crate) clean_incremental: Option<bool>,
     pub(crate) preserve_incremental: Option<bool>,
     pub(crate) adaptive_incremental: Option<bool>,
+    pub(crate) incremental_seed_from: Option<String>,
+    pub(crate) unstable: Option<bool>,
     pub(crate) exclude: Option<Vec<String>>,
     /// Declarative bypass rules (kunobi-ninja/kache#222). Siblings of
     /// `exclude`, which already covers the source-path case; each entry means
@@ -1306,6 +1313,8 @@ const IGNORE_ENV_GATED_VARS: &[&str] = &[
     "KACHE_CLEAN_INCREMENTAL",
     "KACHE_PRESERVE_INCREMENTAL",
     "KACHE_ADAPTIVE_INCREMENTAL",
+    "KACHE_INCREMENTAL_SEED_FROM",
+    "KACHE_UNSTABLE",
     "KACHE_COMPRESSION_LEVEL",
     "KACHE_S3_CONCURRENCY",
     "KACHE_PREFETCH_ENABLED",
@@ -1384,6 +1393,8 @@ const ENV_FILE_KEYS: &[(&str, &str)] = &[
     ("KACHE_CLEAN_INCREMENTAL", "cache.clean_incremental"),
     ("KACHE_PRESERVE_INCREMENTAL", "cache.preserve_incremental"),
     ("KACHE_ADAPTIVE_INCREMENTAL", "cache.adaptive_incremental"),
+    ("KACHE_INCREMENTAL_SEED_FROM", "cache.incremental_seed_from"),
+    ("KACHE_UNSTABLE", "cache.unstable"),
     ("KACHE_COMPRESSION_LEVEL", "cache.compression_level"),
     ("KACHE_S3_CONCURRENCY", "cache.s3_concurrency"),
     ("KACHE_PREFETCH_ENABLED", "cache.prefetch_enabled"),
@@ -2131,6 +2142,17 @@ impl Config {
             remote_readonly = false;
         }
 
+        let unstable = env_or_ignored("KACHE_UNSTABLE", ignore_env)
+            .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+            .unwrap_or_else(|_| {
+                file_config
+                    .as_ref()
+                    .ok()
+                    .and_then(|config| config.cache.as_ref())
+                    .and_then(|cache| cache.unstable)
+                    .unwrap_or(false)
+            });
+
         Ok(Config {
             cache_dir,
             runtime_dir,
@@ -2178,6 +2200,20 @@ impl Config {
             clean_incremental,
             preserve_incremental,
             adaptive_incremental,
+            unstable,
+            incremental_seed_from: env_or_ignored("KACHE_INCREMENTAL_SEED_FROM", ignore_env)
+                .ok()
+                .or_else(|| {
+                    file_config
+                        .as_ref()
+                        .ok()?
+                        .cache
+                        .as_ref()?
+                        .incremental_seed_from
+                        .clone()
+                })
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from),
             event_log_max_size,
             event_log_keep_lines,
             compression_level,

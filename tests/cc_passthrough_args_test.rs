@@ -270,6 +270,8 @@ fn changed_link_archives_use_current_code_and_explicit_files_keep_cache_hits() {
         "response",
         "xl-rsp",
         "explicit",
+        #[cfg(target_os = "linux")]
+        "explicit-search-path",
         "default",
     ] {
         let dir = tempfile::tempdir().unwrap();
@@ -297,6 +299,9 @@ fn changed_link_archives_use_current_code_and_explicit_files_keep_cache_hits() {
             "xlinker" => &["main.o", "-L.", "-Xlinker", "-lvalue", "-o", "app"],
             "response" => &["@link.rsp", "-o", "app"],
             "explicit" => &["main.o", "libvalue.a", "-o", "app"],
+            "explicit-search-path" => {
+                &["main.o", "-Wl,--library-path=.", "libvalue.a", "-o", "app"]
+            }
             _ => &["main.o", "-L.", "-lvalue", "-o", "app"],
         };
         let mut results = Vec::new();
@@ -342,7 +347,8 @@ fn changed_link_archives_use_current_code_and_explicit_files_keep_cache_hits() {
             );
             results.push(last_cc_event(&root)["result"].clone());
         }
-        let expected_results = if style == "explicit" {
+        let cacheable = matches!(style, "explicit" | "explicit-search-path");
+        let expected_results = if cacheable {
             vec!["miss", "local_hit", "miss", "local_hit"]
         } else {
             vec!["passthrough"; 4]
@@ -351,7 +357,7 @@ fn changed_link_archives_use_current_code_and_explicit_files_keep_cache_hits() {
             results, expected_results,
             "{style}: explicit archives retain reuse and untracked selections pass through"
         );
-        if style != "explicit" && root.join("cache/index.db").is_file() {
+        if !cacheable && root.join("cache/index.db").is_file() {
             assert_eq!(
                 index_rows(&root, "entries"),
                 0,

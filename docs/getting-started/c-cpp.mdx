@@ -166,6 +166,8 @@ Kache currently passes through:
 - inline `asm` whose text is a computed expression rather than a string literal
 - flags it has not classified
 
+With link caching enabled, explicit archive inputs such as `libvalue.a` remain eligible for caching. Links that select libraries by name (`-l`, `--library`) or read response files pass through because the link key cannot track their selected library inputs. Search-directory options such as `-L` and GNU ld's `--library-path` alone do not select a named library.
+
 The assembler reads `.incbin` and `.include` files after preprocessing, so the key cannot see them, and a computed `asm` string could name one. The three assembly cases run the compiler directly and skip a configured `KACHE_FALLBACK` wrapper, because a wrapper that keys on preprocessor output cannot see those files either.
 
 Inspect passthrough reasons in the monitor or logs:

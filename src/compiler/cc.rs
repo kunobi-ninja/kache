@@ -6925,7 +6925,9 @@ impl Compiler for CcCompiler {
                 reasons.push(RefuseReason::Unsupported(
                     "cc link response files have untracked library selections",
                 ));
-            } else if linker_args.any(|arg| arg.starts_with("-l") || arg.starts_with("--library")) {
+            } else if linker_args.any(|arg| {
+                arg.starts_with("-l") || arg == "--library" || arg.starts_with("--library=")
+            }) {
                 reasons.push(RefuseReason::Unsupported(
                     "cc link libraries selected by name have untracked dependencies",
                 ));

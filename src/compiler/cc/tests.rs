@@ -2684,6 +2684,8 @@ fn opt_in_named_library_links_are_refused_until_selections_are_tracked() {
         s(&["-Wl,--library,value"]),
         s(&["-Xlinker", "-lvalue"]),
         s(&["-Xlinker", "-l", "-Xlinker", "value"]),
+        s(&["-Xlinker", "--library=value"]),
+        s(&["-Xlinker", "--library", "-Xlinker", "value"]),
     ] {
         let mut args = s(&["cc", "main.o", "-o", "app"]);
         args.extend(flags);
@@ -2702,6 +2704,10 @@ fn opt_in_named_library_links_are_refused_until_selections_are_tracked() {
         s(&["libvalue.a"]),
         s(&["objects,-lvalue.o"]),
         s(&["-Llibrary-path"]),
+        s(&["-Wl,--library-path=."]),
+        s(&["-Wl,--library-path,."]),
+        s(&["-Xlinker", "--library-path=."]),
+        s(&["-Xlinker", "--library-path", "-Xlinker", "."]),
         s(&["-Wl,-rpath,libdir"]),
     ] {
         let mut args = s(&["cc", "main.o", "-o", "app"]);

@@ -393,6 +393,8 @@ fn copy_tree(source: &Path, dest: &Path, budget: &mut CopyBudget, depth: usize) 
 mod tests {
     use super::*;
 
+    const VIRTUAL_PREFIX: &str = if cfg!(windows) { r"C:\src" } else { "/src" };
+
     fn fixture(root: &Path) -> (RustcArgs, AdaptiveUnit) {
         let profile = root.join("target/debug");
         fs::create_dir_all(profile.join("deps")).unwrap();
@@ -405,7 +407,7 @@ mod tests {
             profile.join("deps").display().to_string(),
             "-Cincremental=".to_owned() + profile.join("incremental").to_str().unwrap(),
             "-Cextra-filename=-1234abcd".into(),
-            "-Zremap-cwd-prefix=/src".into(),
+            format!("-Zremap-cwd-prefix={VIRTUAL_PREFIX}"),
         ])
         .unwrap();
         let unit = AdaptiveUnit::eligible(&args, b"guard").unwrap();
@@ -414,60 +416,57 @@ mod tests {
 
     #[test]
     fn path_operands_are_portable_but_cfg_and_linker_literals_are_unchanged() {
-        let args = [
-            "--crate-name",
-            "sample",
-            "src/lib.rs",
-            "--out-dir=/one/target/debug/deps",
-            "--extern",
-            "dep=/one/target/debug/deps/libdep.rlib",
-            "-Ldependency=/one/target/debug/deps",
-            "--cfg",
-            "/one/src/lib.rs",
-            "-Clink-arg=-Wl,-rpath,/one/lib",
-            "-Zremap-cwd-prefix=/src",
-        ]
-        .map(String::from);
-        let normalized =
-            portable_args(&args, Some(Path::new("src/lib.rs")), Path::new("/one")).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("one");
+        let deps = cwd.join("target").join("debug").join("deps");
+        let literal = cwd.join("src").join("lib.rs").display().to_string();
+        let linker = format!("-Clink-arg=-Wl,-rpath,{}", cwd.join("lib").display());
+        let remap = format!("-Zremap-cwd-prefix={VIRTUAL_PREFIX}");
+        let args = vec![
+            "--crate-name".into(),
+            "sample".into(),
+            "src/lib.rs".into(),
+            format!("--out-dir={}", deps.display()),
+            "--extern".into(),
+            format!("dep={}", deps.join("libdep.rlib").display()),
+            format!("-Ldependency={}", deps.display()),
+            "--cfg".into(),
+            literal.clone(),
+            linker.clone(),
+            remap.clone(),
+        ];
+        let normalized = portable_args(&args, Some(Path::new("src/lib.rs")), &cwd).unwrap();
+        let relative = PathBuf::from("target").join("debug").join("deps");
         assert_eq!(
             normalized,
-            [
-                "--crate-name",
-                "sample",
-                "src/lib.rs",
-                "--out-dir=target/debug/deps",
-                "--extern",
-                "dep=target/debug/deps/libdep.rlib",
-                "-Ldependency=target/debug/deps",
-                "--cfg",
-                "/one/src/lib.rs",
-                "-Clink-arg=-Wl,-rpath,/one/lib",
-                "-Zremap-cwd-prefix=/src"
+            vec![
+                "--crate-name".into(),
+                "sample".into(),
+                "src/lib.rs".into(),
+                format!("--out-dir={}", relative.display()),
+                "--extern".into(),
+                format!("dep={}", relative.join("libdep.rlib").display()),
+                format!("-Ldependency={}", relative.display()),
+                "--cfg".into(),
+                literal,
+                linker,
+                remap,
             ]
         );
         let mut unsupported = args.to_vec();
-        unsupported.push("--future-path-option=/one/input".into());
-        assert!(
-            portable_args(
-                &unsupported,
-                Some(Path::new("src/lib.rs")),
-                Path::new("/one")
-            )
-            .is_none()
-        );
+        unsupported.push(format!(
+            "--future-path-option={}",
+            cwd.join("input").display()
+        ));
+        assert!(portable_args(&unsupported, Some(Path::new("src/lib.rs")), &cwd).is_none());
         let without_remap = &args[..args.len() - 1];
-        assert!(
-            portable_args(
-                without_remap,
-                Some(Path::new("src/lib.rs")),
-                Path::new("/one")
-            )
-            .is_none()
-        );
+        assert!(portable_args(without_remap, Some(Path::new("src/lib.rs")), &cwd).is_none());
         let mut twice = args.to_vec();
-        twice.extend(["-Z".into(), "remap-cwd-prefix=/other".into()]);
-        assert!(portable_args(&twice, Some(Path::new("src/lib.rs")), Path::new("/one")).is_none());
+        twice.extend([
+            "-Z".into(),
+            format!("remap-cwd-prefix={}", cwd.join("other").display()),
+        ]);
+        assert!(portable_args(&twice, Some(Path::new("src/lib.rs")), &cwd).is_none());
     }
 
     #[test]

@@ -6249,8 +6249,12 @@ fn target_rows(config: &Config, now: i64) -> Result<Vec<TargetRow>> {
             cached_bytes: stats.cached_bytes,
         });
     }
-    rows.sort_by_key(|row| std::cmp::Reverse(row.reclaimable_bytes));
+    sort_target_rows(&mut rows);
     Ok(rows)
+}
+
+fn sort_target_rows(rows: &mut [TargetRow]) {
+    rows.sort_by_key(|row| std::cmp::Reverse(row.reclaimable_bytes));
 }
 
 /// `3d`, `5h`, `12m`, `40s`: the largest whole unit.

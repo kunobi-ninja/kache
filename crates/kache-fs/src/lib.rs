@@ -436,6 +436,10 @@ impl VolumeUsage {
 
 /// Volume usage for the filesystem holding `path`.
 pub fn volume_usage(path: &Path) -> Option<VolumeUsage> {
+    #[cfg(any(test, feature = "testing"))]
+    if let Some(usage) = testutil::mock_volume_usage(path) {
+        return usage;
+    }
     #[cfg(unix)]
     {
         volume_usage_unix(path)
@@ -516,17 +520,57 @@ pub fn measure_file(path: &Path) -> io::Result<FileSizing> {
     }
 }
 
-/// A scratch directory for tests.
+/// Filesystem fixtures for tests.
 ///
 /// Behind a feature rather than `#[cfg(test)]` because `consumer`'s own tests
 /// need it, and a dependency's test code is not compiled for its dependents.
 #[cfg(any(test, feature = "testing"))]
 pub mod testutil {
+    use super::VolumeUsage;
+    use std::collections::BTreeMap;
     use std::io::Write;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU32, Ordering};
 
     static SEQ: AtomicU32 = AtomicU32::new(0);
+
+    static VOLUMES: std::sync::Mutex<BTreeMap<PathBuf, Option<VolumeUsage>>> =
+        std::sync::Mutex::new(BTreeMap::new());
+
+    /// Simulate volume readings beneath one test's unique scratch directory.
+    /// Worker threads see the same readings; other test directories use their
+    /// own readings. Dropping the guard restores filesystem measurements.
+    pub struct VolumeUsageGuard(PathBuf);
+
+    impl VolumeUsageGuard {
+        pub fn new(root: &Path, usage: Option<VolumeUsage>) -> Self {
+            assert!(root.is_absolute(), "volume fixture needs an absolute path");
+            let mut volumes = VOLUMES.lock().unwrap();
+            let overlaps = volumes
+                .keys()
+                .any(|path| root.starts_with(path) || path.starts_with(root));
+            if overlaps {
+                drop(volumes);
+                panic!("volume fixtures must have separate roots: {root:?}");
+            }
+            volumes.insert(root.to_path_buf(), usage);
+            Self(root.to_path_buf())
+        }
+    }
+
+    impl Drop for VolumeUsageGuard {
+        fn drop(&mut self) {
+            VOLUMES.lock().unwrap().remove(&self.0);
+        }
+    }
+
+    pub(super) fn mock_volume_usage(path: &Path) -> Option<Option<VolumeUsage>> {
+        VOLUMES
+            .lock()
+            .unwrap()
+            .iter()
+            .find_map(|(root, usage)| path.starts_with(root).then_some(*usage))
+    }
 
     /// A scratch directory removed on drop. Avoids a dev-dependency for a
     /// handful of tests.
@@ -658,6 +702,66 @@ mod tests {
     use super::*;
 
     const BLOCK: usize = 64 * 1024;
+
+    #[test]
+    fn volume_fixtures_are_scoped_across_threads_and_restore_on_drop() {
+        use testutil::VolumeUsageGuard;
+
+        let dir = TempDir::new("volume-fixtures");
+        let first = dir.path().join("first");
+        let second = dir.path().join("second");
+        let pressure = Some(VolumeUsage {
+            total: 1000,
+            free: 10,
+        });
+        let healthy = Some(VolumeUsage {
+            total: 2000,
+            free: 1500,
+        });
+        let first_guard = VolumeUsageGuard::new(&first, pressure);
+        let second_guard = VolumeUsageGuard::new(&second, healthy);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                assert_eq!(volume_usage(&first), pressure);
+                assert_eq!(volume_usage(&first.join("cache")), pressure);
+            });
+            scope.spawn(|| assert_eq!(volume_usage(&second), healthy));
+        });
+        // A string prefix is not a descendant directory.
+        assert_eq!(volume_usage(&dir.path().join("first-other")), None);
+        drop(first_guard);
+        assert_eq!(volume_usage(&first), None);
+        assert_eq!(volume_usage(&second), healthy);
+        drop(second_guard);
+        assert_eq!(volume_usage(&second), None);
+
+        // An unreadable reading is distinct from no override, including for
+        // an existing directory the real filesystem could measure.
+        let unreadable = VolumeUsageGuard::new(dir.path(), None);
+        assert_eq!(volume_usage(dir.path()), None);
+        drop(unreadable);
+        #[cfg(unix)]
+        assert!(volume_usage(dir.path()).is_some());
+    }
+
+    #[test]
+    fn overlapping_volume_fixtures_are_rejected_without_losing_the_owner() {
+        use testutil::VolumeUsageGuard;
+
+        let dir = TempDir::new("overlapping-volumes");
+        let child = dir.path().join("child");
+        let usage = Some(VolumeUsage {
+            total: 100,
+            free: 10,
+        });
+        let guard = VolumeUsageGuard::new(&child, usage);
+        for root in [dir.path(), child.as_path(), &child.join("nested")] {
+            assert!(std::panic::catch_unwind(|| VolumeUsageGuard::new(root, None)).is_err());
+            assert_eq!(volume_usage(&child), usage);
+        }
+        drop(guard);
+        let _guard = VolumeUsageGuard::new(dir.path(), None);
+    }
 
     #[cfg(unix)]
     #[test]

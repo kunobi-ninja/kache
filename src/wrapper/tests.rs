@@ -955,7 +955,14 @@ fn disk_pressure_hints_even_below_cache_budget_and_the_detached_worker_recovers(
         .unwrap();
     store.remove_clone_for_test(&source);
     store.set_last_accessed_for_test("old", "-1 hour");
-    config.auto_recover_min_free_bytes = kache_fs::volume_usage(dir.path()).unwrap().total;
+    let _volume = kache_fs::testutil::VolumeUsageGuard::new(
+        dir.path(),
+        Some(kache_fs::VolumeUsage {
+            total: 1000,
+            free: 10,
+        }),
+    );
+    config.auto_recover_min_free_bytes = 100;
     config.auto_gc = false;
     assert!(!auto_gc_wanted(&config, &store));
     crate::disk_recovery::run(&config);

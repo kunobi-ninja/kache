@@ -227,8 +227,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut config = crate::test_support::test_config(dir.path().join("cache"));
         let store = Store::open(&config).unwrap();
-        config.auto_recover_min_free_bytes =
-            kache_fs::volume_usage(&config.cache_dir).unwrap().total;
+        let _volume = kache_fs::testutil::VolumeUsageGuard::new(
+            dir.path(),
+            Some(VolumeUsage {
+                total: 1000,
+                free: 10,
+            }),
+        );
+        config.auto_recover_min_free_bytes = 100;
         let full = |_: &Path, _: u64| -> Result<()> {
             Err(std::io::Error::from(std::io::ErrorKind::StorageFull).into())
         };

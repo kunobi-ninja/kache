@@ -3225,7 +3225,14 @@ fn disk_pressure_reaches_main_and_shards_below_budget_and_respects_locks_and_bac
     let mut config = test_config(&dir.path().join("main"));
     config.max_size = u64::MAX;
     let main = Store::open(&config).unwrap();
-    config.auto_recover_min_free_bytes = kache_fs::volume_usage(&config.cache_dir).unwrap().total;
+    let _volume = kache_fs::testutil::VolumeUsageGuard::new(
+        dir.path(),
+        Some(kache_fs::VolumeUsage {
+            total: 1000,
+            free: 10,
+        }),
+    );
+    config.auto_recover_min_free_bytes = 100;
     let (shard_config, shard) = add_budgeted_shard(&mut config, dir.path(), "shard", u64::MAX);
     put_upload_evict_entry(&main, dir.path(), "main_old", 200, false);
     put_upload_evict_entry(&main, dir.path(), "main_recent", 200, true);

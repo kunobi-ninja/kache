@@ -78,13 +78,13 @@ fn volume_inventory_counts_keys_once_and_every_stored_copy_in_bytes() {
     let entry = &view.entries[0];
     assert_eq!(
         crate::store_view::entry_meta_path(entry),
-        shard.entry_dir(&entry.cache_key).join("meta.json")
+        Some(shard.entry_dir(&entry.cache_key).join("meta.json"))
     );
     assert_eq!(
         crate::store_view::entry_store_locations(entry),
         shard_config.cache_dir.display().to_string()
     );
-    assert!(crate::store_view::entry_meta_path(entry).is_file());
+    assert!(crate::store_view::entry_meta_path(entry).unwrap().is_file());
     assert!(!main.entry_dir(&entry.cache_key).exists());
 }
 
@@ -390,4 +390,17 @@ fn volume_inventory_deduplicates_symlinked_stores() {
     assert_eq!(view.total_size, 5);
     assert_eq!(view.stores.len(), 2);
     assert_eq!(view.entries[0].store_dirs, [shard_config.cache_dir]);
+}
+
+#[test]
+fn legacy_stats_without_store_locations_have_no_metadata_path() {
+    let entry: StatsEntry = serde_json::from_value(serde_json::json!({
+        "cache_key": "old-key", "crate_name": "old-crate", "crate_type": "lib",
+        "profile": "release", "size": 10, "hit_count": 1,
+        "created_at": "2026-01-01", "last_accessed": "2026-01-01",
+        "content_hash": null
+    }))
+    .unwrap();
+    assert!(entry.store_dirs.is_empty());
+    assert_eq!(entry_meta_path(&entry), None);
 }

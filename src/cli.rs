@@ -2261,7 +2261,7 @@ fn missed_entry<'a>(
 }
 
 fn read_entry_meta(entry: &daemon::StatsEntry) -> Option<crate::store::EntryMeta> {
-    let content = std::fs::read_to_string(crate::store_view::entry_meta_path(entry)).ok()?;
+    let content = std::fs::read_to_string(crate::store_view::entry_meta_path(entry)?).ok()?;
     serde_json::from_str(&content).ok()
 }
 
@@ -3796,8 +3796,8 @@ pub fn list(
         for entry in &matching {
             lines.extend(entry_detail_lines(entry));
 
-            let meta_path = crate::store_view::entry_meta_path(entry);
-            if let Ok(content) = std::fs::read_to_string(&meta_path)
+            if let Some(meta_path) = crate::store_view::entry_meta_path(entry)
+                && let Ok(content) = std::fs::read_to_string(&meta_path)
                 && let Ok(meta) = serde_json::from_str::<crate::store::EntryMeta>(&content)
             {
                 push_nonempty_detail(&mut lines, "  Features: ", &meta.features.join(", "));

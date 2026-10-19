@@ -13,4 +13,3 @@ prediction, and aggregate statistics payloads depend on types that have not yet
 been extracted. This crate does not introduce a new protocol version.
 
 Released with Kache under the same version number.
-

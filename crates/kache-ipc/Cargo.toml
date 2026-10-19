@@ -30,4 +30,3 @@ tokio = { version = "1", features = ["rt", "macros"] }
 
 [lints.rust]
 warnings = "deny"
-

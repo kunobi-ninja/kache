@@ -5900,6 +5900,58 @@ fn tool_version_cache_write_is_read_back() {
     let _ = std::fs::remove_file(&cache_file);
 }
 
+#[cfg(unix)]
+#[test]
+fn cwd_remap_probe_kills_timeouts_and_retries_without_a_cached_rejection() {
+    let _lock = key_test_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let _cache =
+        crate::config::tests::set_env_for_test("KACHE_CACHE_DIR", Some(dir.path().as_os_str()));
+    let rustc = dir.path().join("rustc-probe");
+    kache_fs::testutil::write_executable(
+        &rustc,
+        "#!/bin/sh\nif [ -f \"$0.ready\" ]; then printf x >> \"$0.calls\"; exit 0; fi\nprintf '%s\\n' \"$$\" > \"$0.pid\"\nexec sleep 8\n",
+    );
+    assert_eq!(
+        rustc_accepts_cwd_remap(&rustc, "fixture", "/src", None, false),
+        None
+    );
+    let pid: u32 = std::fs::read_to_string(rustc.with_extension("pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(
+        !crate::daemon::process_is_alive(pid),
+        "timed-out probe survived"
+    );
+    std::fs::write(rustc.with_extension("ready"), b"ready").unwrap();
+    assert_eq!(
+        rustc_accepts_cwd_remap(&rustc, "fixture", "/src", None, false),
+        Some(true)
+    );
+    assert_eq!(
+        rustc_accepts_cwd_remap(&rustc, "fixture", "/src", None, false),
+        Some(true)
+    );
+    assert_eq!(std::fs::read(rustc.with_extension("calls")).unwrap(), b"x");
+}
+
+#[test]
+fn cwd_remap_probe_stops_at_the_deadline() {
+    use std::time::Duration;
+    assert!(cwd_remap_probe_within_deadline(Duration::ZERO));
+    assert!(cwd_remap_probe_within_deadline(Duration::from_nanos(
+        1_999_999_999
+    )));
+    assert!(!cwd_remap_probe_within_deadline(Duration::from_nanos(
+        2_000_000_000
+    )));
+    assert!(!cwd_remap_probe_within_deadline(Duration::from_nanos(
+        2_000_000_001
+    )));
+}
+
 /// The compiler a target is recorded as built by is what `rustc -vV` says,
 /// and nothing when the compiler cannot be run.
 #[cfg(unix)]

@@ -61,11 +61,10 @@ impl Lease {
         let inject_bootstrap = match probe(current_bootstrap.as_deref(), false) {
             Some(true) => false,
             Some(false)
-                if bootstrap_override_allowed(current_bootstrap.as_deref())
-                    && args.unstable_flags.iter().all(|flag| {
-                        flag.starts_with("remap-cwd-prefix=") || flag == "incremental-info"
-                    })
-                    && probe(Some(std::ffi::OsStr::new("1")), true) == Some(true) =>
+                if bootstrap_override_allowed(
+                    current_bootstrap.as_deref(),
+                    &args.unstable_flags,
+                ) && probe(Some(std::ffi::OsStr::new("1")), true) == Some(true) =>
             {
                 true
             }
@@ -108,8 +107,11 @@ impl Lease {
     }
 }
 
-fn bootstrap_override_allowed(current: Option<&std::ffi::OsStr>) -> bool {
+fn bootstrap_override_allowed(current: Option<&std::ffi::OsStr>, flags: &[String]) -> bool {
     current.is_none_or(|value| value.is_empty())
+        && flags
+            .iter()
+            .all(|flag| flag.starts_with("remap-cwd-prefix=") || flag == "incremental-info")
 }
 
 pub(super) fn publish(unit: &AdaptiveUnit, key: Option<&str>) {
@@ -470,6 +472,58 @@ mod tests {
     }
 
     #[test]
+    fn source_operand_must_occur_once_and_match_the_declared_input() {
+        let cwd = tempfile::tempdir().unwrap();
+        let remap = format!("-Zremap-cwd-prefix={VIRTUAL_PREFIX}");
+        let args = vec!["src/lib.rs".into(), remap.clone()];
+        assert_eq!(
+            portable_args(&args, Some(Path::new("src/lib.rs")), cwd.path()),
+            Some(args.clone())
+        );
+        for invalid in [
+            vec!["src/lib.rs".into(), "src/lib.rs".into(), remap.clone()],
+            vec!["other.rs".into(), remap.clone()],
+            vec![remap.clone()],
+        ] {
+            assert!(
+                portable_args(&invalid, Some(Path::new("src/lib.rs")), cwd.path()).is_none(),
+                "{invalid:?}"
+            );
+        }
+        assert!(
+            portable_args(
+                &["-source.rs".into(), remap],
+                Some(Path::new("-source.rs")),
+                cwd.path()
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn split_remap_flags_and_bare_search_paths_keep_their_meaning() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path();
+        let args = vec![
+            "src/lib.rs".into(),
+            "-L".into(),
+            cwd.display().to_string(),
+            "--extern".into(),
+            "dep".into(),
+            "-Z".into(),
+            format!("remap-cwd-prefix={VIRTUAL_PREFIX}"),
+            "-Z".into(),
+            "incremental-info".into(),
+        ];
+        let mut expected = args.clone();
+        expected[2] = ".".into();
+        assert_eq!(
+            portable_args(&args, Some(Path::new("src/lib.rs")), cwd),
+            Some(expected)
+        );
+    }
+
+    #[test]
     fn portable_identity_changes_with_compiler_flags_and_policy() {
         let temp = tempfile::tempdir().unwrap();
         let (args_a, _) = fixture(&temp.path().join("one"));
@@ -548,6 +602,10 @@ mod tests {
             "busy donor must not be copied"
         );
         assert!(donor_lease.finish(CompileOutcome::Success));
+        let alias = root.join("donor-profile-alias");
+        std::os::unix::fs::symlink(&profile, &alias).unwrap();
+        assert!(!import(&receiver, &alias, &key));
+        assert!(empty_directory(&receiver.rustc_dir));
         assert!(!import(&receiver, &profile, &"b".repeat(64)));
         fs::create_dir(donor.rustc_dir.join("s-123-working")).unwrap();
         assert!(!import(&receiver, &profile, &key));
@@ -562,13 +620,102 @@ mod tests {
         assert_eq!(fs::read(graph.join("dep-graph.bin")).unwrap(), b"complete");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn donor_import_rejects_linked_or_invalid_metadata_and_abandoned_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let (_, donor) = fixture(&root.join("donor"));
+        let (_, receiver) = fixture(&root.join("receiver"));
+        let lease = donor.try_immediate().unwrap();
+        let _receiver_lease = receiver.try_immediate().unwrap();
+        fs::write(donor.rustc_dir.join("graph"), b"complete").unwrap();
+        let key = "a".repeat(64);
+        publish(&donor, Some(&key));
+        assert!(lease.finish(CompileOutcome::Success));
+        let profile = root.join("donor/target/debug");
+
+        let linked_profile = root.join("linked-profile");
+        fs::create_dir(&linked_profile).unwrap();
+        std::os::unix::fs::symlink(profile.join(AUTO_ROOT), linked_profile.join(AUTO_ROOT))
+            .unwrap();
+        assert!(!import(&receiver, &linked_profile, &key));
+
+        let invalid = donor.unit_dir.with_file_name("not-a-unit-digest");
+        fs::rename(&donor.unit_dir, &invalid).unwrap();
+        assert!(!import(&receiver, &profile, &key));
+        fs::rename(&invalid, &donor.unit_dir).unwrap();
+
+        let saved_unit = root.join("saved-unit");
+        fs::rename(&donor.unit_dir, &saved_unit).unwrap();
+        std::os::unix::fs::symlink(&saved_unit, &donor.unit_dir).unwrap();
+        assert!(!import(&receiver, &profile, &key));
+        fs::remove_file(&donor.unit_dir).unwrap();
+        fs::rename(&saved_unit, &donor.unit_dir).unwrap();
+
+        let marker = donor.unit_dir.join(MARKER);
+        let target_name = "x".repeat(64);
+        let saved_marker = donor.unit_dir.join(&target_name);
+        fs::rename(&marker, &saved_marker).unwrap();
+        std::os::unix::fs::symlink(&target_name, &marker).unwrap();
+        assert_eq!(fs::symlink_metadata(&marker).unwrap().len(), 64);
+        assert!(!import(&receiver, &profile, &key));
+        fs::remove_file(&marker).unwrap();
+        fs::rename(&saved_marker, &marker).unwrap();
+
+        let abandoned = donor.try_immediate().unwrap();
+        publish(&donor, Some(&key));
+        drop(abandoned);
+        assert!(!import(&receiver, &profile, &key));
+        fs::write(&donor.state_path, b"invalid state").unwrap();
+        assert!(!import(&receiver, &profile, &key));
+        fs::remove_file(&donor.state_path).unwrap();
+
+        let saved_graph = donor.unit_dir.join("saved-graph");
+        fs::rename(&donor.rustc_dir, &saved_graph).unwrap();
+        std::os::unix::fs::symlink(&saved_graph, &donor.rustc_dir).unwrap();
+        assert!(!import(&receiver, &profile, &key));
+        fs::remove_file(&donor.rustc_dir).unwrap();
+        fs::rename(&saved_graph, &donor.rustc_dir).unwrap();
+
+        let broken = donor.rustc_dir.join("broken-session");
+        fs::create_dir(&broken).unwrap();
+        std::os::unix::fs::symlink(donor.rustc_dir.join("graph"), broken.join("linked-graph"))
+            .unwrap();
+        assert!(!import(&receiver, &profile, &key));
+        assert!(empty_directory(&receiver.rustc_dir));
+        fs::remove_dir_all(&broken).unwrap();
+
+        let saved_file = donor.unit_dir.join("saved-file");
+        fs::rename(donor.rustc_dir.join("graph"), &saved_file).unwrap();
+        assert!(!import(&receiver, &profile, &key));
+        fs::rename(&saved_file, donor.rustc_dir.join("graph")).unwrap();
+
+        assert!(empty_directory(&receiver.rustc_dir));
+        assert!(import(&receiver, &profile, &key));
+        assert_eq!(
+            fs::read(receiver.rustc_dir.join("graph")).unwrap(),
+            b"complete"
+        );
+    }
+
     #[test]
     fn bootstrap_opt_in_never_overrides_an_existing_selection() {
         use std::ffi::OsStr;
-        assert!(bootstrap_override_allowed(None));
-        assert!(bootstrap_override_allowed(Some(OsStr::new(""))));
+        assert!(bootstrap_override_allowed(None, &[]));
+        assert!(bootstrap_override_allowed(Some(OsStr::new("")), &[]));
         for value in ["-1", "0", "other_crate", "1"] {
-            assert!(!bootstrap_override_allowed(Some(OsStr::new(value))));
+            assert!(!bootstrap_override_allowed(Some(OsStr::new(value)), &[]));
+        }
+        for flag in ["remap-cwd-prefix=/src", "incremental-info"] {
+            assert!(bootstrap_override_allowed(None, &[flag.into()]));
+        }
+        for flag in ["allow-features=test", "unstable-options", "future-option"] {
+            assert!(!bootstrap_override_allowed(None, &[flag.into()]));
+            assert!(!bootstrap_override_allowed(
+                None,
+                &["incremental-info".into(), flag.into()]
+            ));
         }
     }
 
@@ -598,6 +745,69 @@ mod tests {
         assert_eq!(rewritten, strip_incremental(&args.all_args));
         assert!(lease.worktree_seed_key.is_none());
         assert!(!lease.worktree_bootstrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inner_wrappers_and_adaptive_leases_cannot_prepare_worktree_seeds() {
+        let _lock = crate::test_support::process_state_test_lock();
+        let temp = tempfile::tempdir().unwrap();
+        let _cache = crate::config::tests::set_env_for_test(
+            "KACHE_CACHE_DIR",
+            Some(temp.path().as_os_str()),
+        );
+        let compiler = temp.path().join("rustc-mock");
+        kache_fs::testutil::write_executable(
+            &compiler,
+            "#!/bin/sh\nprintf 'rustc test compiler\\n'\n",
+        );
+        for (index, kind) in [LeaseKind::Immediate, LeaseKind::Active, LeaseKind::Seed]
+            .into_iter()
+            .enumerate()
+        {
+            let (mut args, _) = fixture(&temp.path().join(index.to_string()));
+            args.rustc = compiler.clone();
+            if kind == LeaseKind::Immediate {
+                args.inner_rustc = Some(compiler.clone());
+            }
+            let unit = AdaptiveUnit::eligible(&args, b"guard").unwrap();
+            let mut lease = unit.try_immediate().unwrap();
+            lease.kind = kind;
+            let isolated = lease.compiler_args(&args);
+            assert_eq!(lease.worktree_compiler_args(&args, None, true), isolated);
+            assert!(lease.worktree_seed_key.is_none());
+            assert!(!lease.worktree_bootstrap());
+        }
+    }
+
+    #[test]
+    fn copy_tree_accepts_eight_directory_levels_and_rejects_a_ninth() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let dest = temp.path().join("dest");
+        let mut leaf = source.clone();
+        let mut copied = dest.clone();
+        for _ in 0..8 {
+            leaf.push("level");
+            copied.push("level");
+        }
+        fs::create_dir_all(&leaf).unwrap();
+        fs::create_dir(&dest).unwrap();
+        fs::write(leaf.join("graph"), b"complete").unwrap();
+        let mut budget = CopyBudget { files: 9, bytes: 8 };
+        copy_tree(&source, &dest, &mut budget, 0).unwrap();
+        assert_eq!(fs::read(copied.join("graph")).unwrap(), b"complete");
+        assert_eq!(budget.files, 0);
+        assert_eq!(budget.bytes, 0);
+
+        fs::create_dir(leaf.join("ninth")).unwrap();
+        let refused = temp.path().join("refused");
+        fs::create_dir(&refused).unwrap();
+        let mut budget = CopyBudget {
+            files: 32,
+            bytes: 32,
+        };
+        assert!(copy_tree(&source, &refused, &mut budget, 0).is_err());
     }
 
     #[cfg(unix)]

@@ -9019,7 +9019,7 @@ pub(crate) fn rustc_accepts_cwd_remap(
                 write_tool_version_cache(rustc, &memo, if accepted { "yes" } else { "no" });
                 return Some(accepted);
             }
-            Ok(None) if start.elapsed() < Duration::from_secs(2) => {
+            Ok(None) if cwd_remap_probe_within_deadline(start.elapsed()) => {
                 std::thread::sleep(Duration::from_millis(10));
             }
             _ => {
@@ -9030,6 +9030,10 @@ pub(crate) fn rustc_accepts_cwd_remap(
             }
         }
     }
+}
+
+fn cwd_remap_probe_within_deadline(elapsed: std::time::Duration) -> bool {
+    elapsed < std::time::Duration::from_secs(2)
 }
 
 fn get_rustc_version(rustc: &Path) -> Result<String> {

@@ -4011,10 +4011,10 @@ fn stats_carry_the_daemon_write_mode() {
     let mut config = test_config(dir.path());
     for readonly in [true, false] {
         config.remote_readonly = readonly;
-        let captured = EffectiveConfig::capture(&config, &provenance);
+        let captured = effective_config(&config, &provenance);
         assert_eq!(captured.remote_readonly, Some(readonly));
     }
-    let mut older = serde_json::to_value(EffectiveConfig::capture(&config, &provenance)).unwrap();
+    let mut older = serde_json::to_value(effective_config(&config, &provenance)).unwrap();
     older.as_object_mut().unwrap().remove("remote_readonly");
     let older: EffectiveConfig = serde_json::from_value(older).unwrap();
     assert_eq!(older.remote_readonly, None);
@@ -4564,11 +4564,11 @@ fn stats_request_window_prefers_secs_then_hours_then_default() {
         client_epoch: 0,
         client_version: None,
     };
-    assert_eq!(request(Some(24), Some(900)).window().secs(), 900);
-    assert_eq!(request(Some(2), None).window().secs(), 7200);
-    assert_eq!(request(None, None).window(), SinceWindow::DEFAULT);
+    assert_eq!(stats_window(&request(Some(24), Some(900))).secs(), 900);
+    assert_eq!(stats_window(&request(Some(2), None)).secs(), 7200);
+    assert_eq!(stats_window(&request(None, None)), SinceWindow::DEFAULT);
     assert_eq!(
-        request(Some(u64::MAX), None).window(),
+        stats_window(&request(Some(u64::MAX), None)),
         SinceWindow::DEFAULT,
         "an overflowing hour count falls back rather than wrapping"
     );
@@ -10482,7 +10482,7 @@ fn prefetch_candidate_source_uses_the_first_valid_candidate() {
     first.source = kache_core::CandidateSource::Manifest;
     let mut duplicate = first.clone();
     duplicate.source = kache_core::CandidateSource::History;
-    let request = PrefetchRequest::from_plan(PrefetchPlan {
+    let request = prefetch_from_plan(PrefetchPlan {
         plan_id: None,
         planner: None,
         disposition: PrefetchDisposition::Execute,
@@ -10544,7 +10544,7 @@ fn test_prefetch_request_from_plan() {
         ],
     };
 
-    let req = PrefetchRequest::from_plan(plan);
+    let req = prefetch_from_plan(plan);
     assert_eq!(req.keys, vec![(valid_key, "serde".into())]);
 }
 

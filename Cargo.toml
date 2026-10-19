@@ -13,6 +13,8 @@ rust-version = "1.95"
 [workspace]
 members = [
     "crates/kache-core",
+    "crates/kache-protocol",
+    "crates/kache-ipc",
     "crates/kache-format",
     "crates/kache-fs",
     "crates/kache-shims",
@@ -36,6 +38,8 @@ exclude = ["tmp"]
 resolver = "3"
 
 [dependencies]
+kache-protocol = { version = "1.2.2", path = "crates/kache-protocol" }
+kache-ipc = { version = "1.2.2", path = "crates/kache-ipc", features = ["async"] }
 foldhash = "0.2"
 kunobi-daemon = { version = "0.10.0", features = ["wire-async", "local-async", "launch"] }
 kache-format = { version = "1.2.2", path = "crates/kache-format" }

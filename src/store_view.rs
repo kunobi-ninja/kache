@@ -197,21 +197,20 @@ fn add_store(
     Ok(())
 }
 
-impl StatsEntry {
-    pub(crate) fn meta_path(&self) -> PathBuf {
-        self.store_dirs[0]
-            .join("store")
-            .join(&self.cache_key)
-            .join("meta.json")
-    }
+pub(crate) fn entry_meta_path(entry: &StatsEntry) -> PathBuf {
+    entry.store_dirs[0]
+        .join("store")
+        .join(&entry.cache_key)
+        .join("meta.json")
+}
 
-    pub(crate) fn store_locations(&self) -> String {
-        self.store_dirs
-            .iter()
-            .map(|p| p.display().to_string())
-            .collect::<Vec<_>>()
-            .join(", ")
-    }
+pub(crate) fn entry_store_locations(entry: &StatsEntry) -> String {
+    entry
+        .store_dirs
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 #[cfg(test)]

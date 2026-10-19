@@ -15,17 +15,19 @@
 use anyhow::{Context, Result};
 use std::path::Path;
 
-#[cfg(test)]
 pub use interprocess::local_socket::ListenerOptions;
+#[cfg(feature = "async")]
 pub use interprocess::local_socket::tokio::Stream as TokioStream;
 pub use interprocess::local_socket::{Name, Stream as SyncStream};
 // TokioListener is the type produced by `ListenerOptions::new().create_tokio()`.
 // Re-exported so the daemon's `accept_loop` and its tests can name it explicitly.
+#[cfg(feature = "async")]
 pub use interprocess::local_socket::tokio::Listener as TokioListener;
 
 /// Trait imports needed to call methods on the listener / stream types.
-/// Most users want `use crate::transport::prelude::*;`.
+/// Most users want `use crate::prelude::*;`.
 pub mod prelude {
+    #[cfg(feature = "async")]
     pub use interprocess::local_socket::traits::tokio::{Listener as _, Stream as _};
     pub use interprocess::local_socket::traits::{Listener as _, Stream as _};
 }
@@ -50,6 +52,7 @@ pub fn socket_path_problem(path: &Path) -> Option<String> {
 }
 
 /// Bind through shared ownership and disable the transport's unchecked unlink.
+#[cfg(feature = "async")]
 pub async fn bind_daemon_listener(path: &Path) -> Result<Option<TokioListener>> {
     use interprocess::local_socket::traits::tokio::Listener as _;
     if let Some(problem) = socket_path_problem(path) {
@@ -159,7 +162,7 @@ pub fn require_self_peer(peer_euid: Option<u32>) -> std::io::Result<()> {
 /// The peer's effective UID, where the platform exposes it: `SO_PEERCRED` on
 /// Linux, `getpeereid` on macOS and the BSDs. `None` means we could not
 /// authenticate the peer, which [`require_self_peer`] treats as a refusal.
-#[cfg(unix)]
+#[cfg(all(unix, feature = "async"))]
 pub fn peer_euid(stream: &TokioStream) -> Option<u32> {
     use interprocess::local_socket::traits::StreamCommon as _;
     stream.peer_creds().ok().and_then(|creds| creds.euid())
@@ -208,7 +211,7 @@ mod tests {
         assert!(problem.contains("runtime_dir"), "{problem}");
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "async"))]
     #[test]
     fn binding_an_overlong_path_names_the_limit() {
         let path = format!(
@@ -281,10 +284,10 @@ mod tests {
         assert!(!peer_uid_is_self(mine.wrapping_add(0xdead_beef)));
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "async"))]
     #[tokio::test]
     async fn same_user_peer_check_accepts_own_connections() {
-        use crate::transport::prelude::*;
+        use crate::prelude::*;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("creds.sock");
         let name = socket_name(&path).unwrap();

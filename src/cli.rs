@@ -2261,7 +2261,7 @@ fn missed_entry<'a>(
 }
 
 fn read_entry_meta(entry: &daemon::StatsEntry) -> Option<crate::store::EntryMeta> {
-    let content = std::fs::read_to_string(entry.meta_path()).ok()?;
+    let content = std::fs::read_to_string(crate::store_view::entry_meta_path(entry)).ok()?;
     serde_json::from_str(&content).ok()
 }
 
@@ -2387,7 +2387,7 @@ fn stored_entry_row(
         format_relative_time(&entry.last_accessed),
         term::bytes(entry.size),
         term::count(entry.hit_count),
-        entry.store_locations(),
+        crate::store_view::entry_store_locations(entry),
         details.join(", "),
     ]
 }
@@ -3796,7 +3796,7 @@ pub fn list(
         for entry in &matching {
             lines.extend(entry_detail_lines(entry));
 
-            let meta_path = entry.meta_path();
+            let meta_path = crate::store_view::entry_meta_path(entry);
             if let Ok(content) = std::fs::read_to_string(&meta_path)
                 && let Ok(meta) = serde_json::from_str::<crate::store::EntryMeta>(&content)
             {
@@ -3840,7 +3840,7 @@ pub fn list(
                 term::count(entry.hit_count),
                 local_store_date(&entry.created_at),
                 local_store_date(&entry.last_accessed),
-                entry.store_locations(),
+                crate::store_view::entry_store_locations(entry),
             ]);
         }
         use term::Align::{Left, Right};
@@ -3882,7 +3882,10 @@ fn entry_detail_lines(entry: &daemon::StatsEntry) -> Vec<String> {
     let mut lines = vec![
         format!("Cache key: {}", term::short_key(&entry.cache_key)),
         format!("  Crate:    {}", entry.crate_name),
-        format!("  Stores:   {}", entry.store_locations()),
+        format!(
+            "  Stores:   {}",
+            crate::store_view::entry_store_locations(entry)
+        ),
     ];
     push_nonempty_detail(&mut lines, "  Type:     ", &entry.crate_type);
     push_nonempty_detail(&mut lines, "  Profile:  ", &entry.profile);

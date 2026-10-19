@@ -435,7 +435,7 @@ where
     }
 
     // Stamp demand position so the daemon can rank without the intent: it only
-    // receives the plan, and `PrefetchRequest::from_plan` drops everything else.
+    // receives the plan, and the daemon's prefetch-plan adapter drops everything else.
     // Identity manifests already carry last-compile order; leave those alone.
     for candidate in &mut candidates {
         if candidate.demand_index.is_none() {

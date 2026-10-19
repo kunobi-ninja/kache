@@ -88,7 +88,7 @@ mod test_support;
 mod timeline;
 mod timeline_client;
 mod toolchain_dylib;
-mod transport;
+use kache_ipc as transport;
 mod tree_stamp;
 mod tui;
 mod tui_sessions;

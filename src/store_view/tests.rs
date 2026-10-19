@@ -77,14 +77,14 @@ fn volume_inventory_counts_keys_once_and_every_stored_copy_in_bytes() {
     );
     let entry = &view.entries[0];
     assert_eq!(
-        entry.meta_path(),
+        crate::store_view::entry_meta_path(entry),
         shard.entry_dir(&entry.cache_key).join("meta.json")
     );
     assert_eq!(
-        entry.store_locations(),
+        crate::store_view::entry_store_locations(entry),
         shard_config.cache_dir.display().to_string()
     );
-    assert!(entry.meta_path().is_file());
+    assert!(crate::store_view::entry_meta_path(entry).is_file());
     assert!(!main.entry_dir(&entry.cache_key).exists());
 }
 
@@ -228,7 +228,7 @@ fn volume_inventory_combines_hits_dates_and_per_store_dedup_savings() {
     assert_eq!(entry.created_at, "2026-01-01");
     assert_eq!(entry.last_accessed, "2026-04-01");
     assert_eq!(
-        entry.store_locations(),
+        crate::store_view::entry_store_locations(entry),
         format!(
             "{}, {}",
             config.cache_dir.display(),

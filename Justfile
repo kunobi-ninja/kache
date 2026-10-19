@@ -18,7 +18,7 @@ default:
 
 # Run all local quality checks.
 [group('dev')]
-check: fmt-check lint test-resource-guard-check test
+check: fmt-check lint client-crates-check test-resource-guard-check test
 
 # What a PR must survive before `gh pr create`: `just check`, then the
 # same changed-line mutants job CI runs. Docs-only diffs skip mutants.
@@ -37,7 +37,14 @@ pr BASE="origin/main": check
 
 # Mirror the repo CI verification flow.
 [group('dev')]
-ci: fmt-check lint image-service-print helm-lint test-resource-guard-check coverage
+ci: fmt-check lint client-crates-check image-service-print helm-lint test-resource-guard-check coverage
+
+# Workspace builds enable the daemon's async feature. Check the client-only
+# dependency graph separately so feature unification cannot hide a dependency.
+[group('dev')]
+client-crates-check:
+  cargo check --locked -p kache-protocol -p kache-ipc --no-default-features
+  cargo test --locked -p kache-ipc --no-default-features
 
 # Auto-fix formatting and clippy warnings.
 [group('dev')]

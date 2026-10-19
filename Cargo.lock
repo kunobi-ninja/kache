@@ -2278,6 +2278,8 @@ dependencies = [
  "kache-core",
  "kache-format",
  "kache-fs",
+ "kache-ipc",
+ "kache-protocol",
  "kache-shims",
  "kache-store",
  "kunobi-auth",
@@ -2365,8 +2367,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "kache-ipc"
+version = "1.2.2"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "interprocess",
+ "kunobi-daemon",
+ "libc",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "kache-proofs"
 version = "1.2.2"
+
+[[package]]
+name = "kache-protocol"
+version = "1.2.2"
+dependencies = [
+ "kache-core",
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "kache-service"

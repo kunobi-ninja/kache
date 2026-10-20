@@ -1729,11 +1729,12 @@ fn run_compiler_process_directly(args: &[String], preserve_incremental: bool) ->
 }
 
 fn rustc_args_for_direct_preclean(args: &[String]) -> Option<&[String]> {
-    match compiler::detect_compiler(args) {
-        Some(adapter) if adapter.id() == compiler::rustc::RUSTC_ID => Some(args),
-        Some(_) => None,
-        None if compiler::is_workspace_wrapper_chain(args) => Some(&args[1..]),
-        None => None,
+    if compiler::rustc::RustcCompiler::recognizes(args) {
+        Some(args)
+    } else if compiler::is_workspace_wrapper_chain(args) {
+        Some(&args[1..])
+    } else {
+        None
     }
 }
 
@@ -2838,8 +2839,10 @@ mod tests {
             Some(rustc.as_slice())
         );
 
-        let cc = vec!["cc".to_string()];
-        assert_eq!(rustc_args_for_direct_preclean(&cc), None);
+        for program in ["cc", "cl.exe", "CL.EXE", "nvcc", "unrecognized-driver"] {
+            let cc = vec![program.to_string()];
+            assert_eq!(rustc_args_for_direct_preclean(&cc), None, "{program}");
+        }
 
         let chained = vec![
             "/tmp/outer-wrapper".to_string(),

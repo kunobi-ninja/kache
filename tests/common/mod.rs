@@ -147,6 +147,7 @@ pub fn isolated_config_path(cache_dir: &Path) -> PathBuf {
 /// developer dogfooding Kache has `RUSTC_WRAPPER` configured. All of those
 /// are pinned or cleared here, before the caller adds its own wrapper and
 /// overrides; a later `env` call on the same key wins.
+/// Remote selectors are cleared so a cold daemon cannot inherit runner settings.
 ///
 /// `config` pins `KACHE_CONFIG`. `None` unsets it so the child discovers its
 /// configuration the way a real build would.
@@ -172,6 +173,13 @@ pub fn hermetic_command(
         .env_remove("KACHE_ACTIVE")
         .env_remove("KACHE_UNSTABLE")
         .env_remove("KACHE_INCREMENTAL_SEED_FROM")
+        .env_remove("KACHE_S3_BUCKET")
+        .env_remove("KACHE_S3_ENDPOINT")
+        .env_remove("KACHE_S3_REGION")
+        .env_remove("KACHE_S3_PREFIX")
+        .env_remove("KACHE_S3_PROFILE")
+        .env_remove("KACHE_S3_USER_AGENT")
+        .env_remove("KACHE_LOCAL_ONLY")
         .env_remove("RUSTC_WRAPPER")
         .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
         // Cargo sets kache's own OUT_DIR on the test process (kache has a

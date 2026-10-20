@@ -10863,6 +10863,47 @@ fn an_unknown_build_dir_template_is_ignored() {
 }
 
 #[test]
+fn an_empty_build_dir_is_ignored() {
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path().join("project");
+    fs::create_dir_all(project.join(".cargo")).unwrap();
+    fs::create_dir_all(project.join("target")).unwrap();
+    fs::write(
+        project.join(".cargo/config.toml"),
+        cargo_build_config(&[("build-dir", std::path::Path::new(""))]),
+    )
+    .unwrap();
+    assert_eq!(
+        cargo_output_dir_from(&project, &environment()),
+        project.join("target"),
+        "an empty build dir names no directory at all"
+    );
+}
+
+#[test]
+fn an_empty_build_dir_environment_leaves_the_configured_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path().join("project");
+    fs::create_dir_all(project.join(".cargo")).unwrap();
+    let build = dir.path().join("intermediate");
+    fs::create_dir_all(&build).unwrap();
+    fs::write(
+        project.join(".cargo/config.toml"),
+        cargo_build_config(&[("build-dir", &build)]),
+    )
+    .unwrap();
+    let env = CargoEnvironment {
+        build_dir: os(std::path::Path::new("")),
+        ..environment()
+    };
+    assert_eq!(
+        cargo_output_dir_from(&project, &env),
+        build,
+        "an empty CARGO_BUILD_BUILD_DIR is no setting at all"
+    );
+}
+
+#[test]
 fn an_empty_target_dir_in_a_config_is_ignored() {
     let dir = tempfile::tempdir().unwrap();
     let project = dir.path().join("project");

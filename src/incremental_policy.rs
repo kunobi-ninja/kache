@@ -1802,6 +1802,7 @@ mod tests {
             "unit-lock",
             "cargo-lock",
             "cargo-command",
+            "missing-lock",
             "corrupt",
         ] {
             let (temp, _args, unit) = fixture();
@@ -1846,6 +1847,23 @@ mod tests {
                         .unwrap(),
                     );
                 }
+                "missing-lock" => {
+                    fs::remove_file(&unit.lock_path).unwrap();
+                    filetime::set_file_mtime(
+                        &unit.unit_dir,
+                        filetime::FileTime::from_unix_time(100, 0),
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        preview_stale(
+                            &target,
+                            std::time::Duration::from_secs(10),
+                            UNIX_EPOCH + std::time::Duration::from_secs(110)
+                        )
+                        .units,
+                        0
+                    );
+                }
                 "corrupt" => fs::write(&unit.state_path, b"unknown schema").unwrap(),
                 _ => unreachable!(),
             }
@@ -1863,6 +1881,12 @@ mod tests {
                 "{protected}"
             );
             assert_eq!(fs::read(&unit.state_path).unwrap(), before, "{protected}");
+            if protected == "missing-lock" {
+                assert!(
+                    !unit.lock_path.exists(),
+                    "cleanup must not invent a missing lock"
+                );
+            }
             drop((held, cargo, command));
         }
     }

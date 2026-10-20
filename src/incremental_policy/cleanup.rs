@@ -87,6 +87,9 @@ fn sweep(
                 rustc_dir: unit_dir.join("rustc"),
                 unit_dir,
             };
+            if !fs::symlink_metadata(&unit.lock_path).is_ok_and(|metadata| metadata.is_file()) {
+                continue;
+            }
             let _unit_lock = if remove {
                 let Some(lock) = unit.lock() else {
                     continue;
@@ -146,6 +149,7 @@ mod tests {
             let graph = unit.join("rustc");
             fs::create_dir_all(&graph).unwrap();
             fs::write(graph.join("graph.bin"), b"payload").unwrap();
+            fs::write(unit.join("unit.lock"), b"").unwrap();
             filetime::set_file_mtime(&unit, filetime::FileTime::from_unix_time(100, 0)).unwrap();
             let window = Duration::from_secs(10);
             let at = UNIX_EPOCH + Duration::from_secs(110);

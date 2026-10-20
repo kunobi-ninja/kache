@@ -346,7 +346,7 @@ Cargo reads the fingerprint of every unit a build uses, even when nothing needs 
 
 Cargo units are kept on a filesystem where reads never change an access time (`noatime`), or on a network filesystem, where Cargo does not lock its build directories. A profile a running build holds is skipped, and all of Cargo's locks in it are held while its units are removed. Each unit's fingerprint goes before its outputs, so a removal cut short leaves outputs Cargo rebuilds. A unit that is needed after all is restored from the cache or compiled again. The daemon log reports how many units and bytes each target directory lost.
 
-The same pass reclaims idle graphs under `incremental.kache-auto`, including graphs left after Cargo removed their fingerprints. Managed graphs use their recorded use and directory modification time rather than access times. A running compiler's unit lock protects its graph. Cleanup retains the small lock files so future compilers keep using the same locks.
+The same pass reclaims idle graphs under `incremental.kache-auto`, including graphs left after Cargo removed their fingerprints. On local filesystems, managed graphs use their recorded use and directory modification time rather than access times. A running compiler's unit lock protects its graph. Cleanup retains the small lock files so future compilers keep using the same locks.
 
 Terminal width, color and diagnostic format share one incremental directory. Cached diagnostics still use separate cache keys.
 

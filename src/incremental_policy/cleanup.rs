@@ -13,16 +13,34 @@ pub(crate) fn prune_stale(
     let Ok(Some(_reservation)) = crate::target_use::try_exclusive(cache_dir) else {
         return Pruned::default();
     };
-    sweep(target, window, at, true)
+    sweep(
+        target,
+        window,
+        at,
+        true,
+        crate::cache_fs::probe(target).is_local,
+    )
 }
 
 pub(crate) fn preview_stale(target: &Path, window: Duration, at: SystemTime) -> Pruned {
-    sweep(target, window, at, false)
+    sweep(
+        target,
+        window,
+        at,
+        false,
+        crate::cache_fs::probe(target).is_local,
+    )
 }
 
-fn sweep(target: &Path, window: Duration, at: SystemTime, remove: bool) -> Pruned {
+fn sweep(
+    target: &Path,
+    window: Duration,
+    at: SystemTime,
+    remove: bool,
+    local: Option<bool>,
+) -> Pruned {
     let mut pruned = Pruned::default();
-    if !real_directory(target) {
+    if !real_directory(target) || local != Some(true) {
         return pruned;
     }
     // Profiles can outlive their last Cargo fingerprint. Look at both the
@@ -110,4 +128,32 @@ fn stale_bytes(unit: &AdaptiveUnit, window: Duration, at: SystemTime) -> Option<
         return None;
     }
     Some(crate::unit_prune::size(&unit.rustc_dir) + crate::unit_prune::size(&unit.state_path))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_unverified_filesystem_keeps_graphs_and_creates_no_cargo_locks() {
+        for local in [None, Some(false)] {
+            let dir = tempfile::tempdir().unwrap();
+            let profile = dir.path().join("debug");
+            let unit = profile
+                .join(AUTO_ROOT)
+                .join(POLICY_VERSION)
+                .join("a".repeat(64));
+            let graph = unit.join("rustc");
+            fs::create_dir_all(&graph).unwrap();
+            fs::write(graph.join("graph.bin"), b"payload").unwrap();
+            filetime::set_file_mtime(&unit, filetime::FileTime::from_unix_time(100, 0)).unwrap();
+            let window = Duration::from_secs(10);
+            let at = UNIX_EPOCH + Duration::from_secs(110);
+            assert_eq!(sweep(dir.path(), window, at, true, local).units, 0);
+            assert_eq!(fs::read(graph.join("graph.bin")).unwrap(), b"payload");
+            assert!(!profile.join(".cargo-lock").exists());
+            assert_eq!(sweep(dir.path(), window, at, true, Some(true)).units, 1);
+            assert!(!graph.exists());
+        }
+    }
 }

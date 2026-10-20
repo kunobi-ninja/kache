@@ -12,4 +12,9 @@ admission checks.
 This crate does not load Kache configuration, open its cache, or start a daemon.
 Lifecycle control remains backed by `kunobi-daemon` in the application.
 
+Unix descriptor helpers use one-use datagram tickets. On platforms without
+atomic close-on-exec reception, callers hold `descriptors::spawn_guard()` through
+child creation. The jobserver scope retains each request's handles and enables
+inheritance in the child without changing parent descriptor flags.
+
 Released with Kache under the same version number.

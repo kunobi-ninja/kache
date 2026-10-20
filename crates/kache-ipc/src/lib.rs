@@ -310,3 +310,11 @@ mod tests {
         require_self_peer(peer_euid(&stream)).expect("same-user peer accepted");
     }
 }
+
+/// Unix descriptor transfer and its close-on-exec admission boundary.
+#[cfg(unix)]
+pub mod descriptors;
+
+/// Request-owned Unix jobserver inheritance.
+#[cfg(unix)]
+pub mod jobserver;

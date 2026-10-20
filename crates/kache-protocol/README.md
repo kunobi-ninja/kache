@@ -10,7 +10,10 @@ policy, and conversion from runtime state stay with their callers.
 
 The complete request and response envelopes also live here, including publication,
 prediction and aggregate statistics records. Runtime-to-record conversions and
-validation stay in the application. This crate does not introduce a new protocol
-version.
+validation stay in the application. Existing envelopes retain their JSON format.
+
+Compiler execution has separate versioned messages. Native strings preserve Unix
+bytes or Windows UTF-16, and the handoff separates preparation from commitment.
+Descriptor transfer and execution remain with the IPC and application layers.
 
 Released with Kache under the same version number.

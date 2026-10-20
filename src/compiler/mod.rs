@@ -905,6 +905,8 @@ fn is_program_on_path(program: &str) -> bool {
 
 /// Detect a real compiler invocation that must run uncached.
 ///
+/// MSVC `cl.exe` has no cache adapter and runs through this path when cc-rs
+/// selects it through `RUSTC_WRAPPER`.
 /// Cargo preserves `RUSTC` when it invokes `RUSTC_WRAPPER`, which identifies
 /// custom drivers such as Kani's `kani-compiler` without maintaining a list of
 /// tool names. (`nvcc` used to live here; since kunobi-ninja/kache#1024 it has
@@ -925,7 +927,10 @@ pub(crate) fn is_passthrough_compiler_invocation_with(
     if is_kache_subcommand_or_flag(program) {
         return false;
     }
-    configured_rustc.is_some_and(|rustc| rustc == std::ffi::OsStr::new(program.as_str()))
+    command_basename(program)
+        .map(strip_windows_exe_suffix)
+        .is_some_and(|name| name.eq_ignore_ascii_case("cl"))
+        || configured_rustc.is_some_and(|rustc| rustc == std::ffi::OsStr::new(program.as_str()))
 }
 
 /// A workspace-wrapper chain Kache knows how to key: Clippy. `clippy-driver`
@@ -1233,6 +1238,34 @@ mod tests {
             &s(&["nvcc", "-c", "kernel.cu"]),
             None,
         ));
+    }
+
+    #[test]
+    fn msvc_runs_uncached_without_a_configured_rustc() {
+        for program in [
+            "cl",
+            "cl.exe",
+            "CL.EXE",
+            "/toolchain/bin/cl.exe",
+            r"C:\Program Files\Microsoft Visual Studio\VC\bin\cl.exe",
+        ] {
+            assert!(
+                is_passthrough_compiler_invocation_with(&s(&[program, "-c", "file.c"]), None),
+                "{program}"
+            );
+        }
+        for program in [
+            "clang-cl",
+            "clang-cl.exe",
+            "link.exe",
+            "my-cl.exe",
+            "cl.exe.bak",
+        ] {
+            assert!(
+                !is_passthrough_compiler_invocation_with(&s(&[program]), None),
+                "{program}"
+            );
+        }
     }
 
     #[test]

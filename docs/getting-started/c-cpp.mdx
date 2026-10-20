@@ -5,6 +5,8 @@ description: Cache supported GCC, Clang, and clang-cl object compilations
 
 Kache caches conservative, single-source C and C++ object compilations. If it cannot prove that an invocation is safe to cache, it runs the real compiler unchanged, or hands the invocation to a configured [fallback wrapper](/docs/getting-started/comparison#use-sccache-as-a-fallback).
 
+MSVC `cl.exe` runs directly without caching, including when the `cc` crate selects it through `RUSTC_WRAPPER`.
+
 ## Cargo build scripts
 
 `kache init` covers both rustc and the objects a build script compiles through the `cc` crate. Without it, put a shim on `PATH`.

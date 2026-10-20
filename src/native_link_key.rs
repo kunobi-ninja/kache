@@ -25,6 +25,7 @@
 //! `/MANIFESTFILE:` and `/PDBSTRIPPED:` are only text in the key, so a file
 //! rebuilt under an unchanged name would otherwise restore a stale executable.
 
+use crate::invocation::process::CommandExt as _;
 use anyhow::{Context, Result, bail};
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -260,7 +261,7 @@ fn driver_library_search_dirs_for(driver: &Path, env: &InvocationEnv) -> Vec<Pat
         .arg("-print-search-dirs")
         .env("LC_ALL", "C")
         .env("LANG", "C")
-        .output()
+        .invocation_output()
     {
         Ok(output) => output,
         Err(error) => {
@@ -345,7 +346,7 @@ fn print_file_name_for(driver: &Path, name: &str, env: &InvocationEnv) -> Option
         .arg(format!("-print-file-name={name}"))
         .env("LC_ALL", "C")
         .env("LANG", "C")
-        .output()
+        .invocation_output()
         .ok()?;
     if !output.status.success() {
         return None;
@@ -458,7 +459,12 @@ pub(crate) fn sdk_identity_for_invocation(
 
 #[cfg(target_os = "macos")]
 fn xcrun(arguments: &[&str], env: &InvocationEnv) -> Option<String> {
-    let output = env.command("xcrun").ok()?.args(arguments).output().ok()?;
+    let output = env
+        .command("xcrun")
+        .ok()?
+        .args(arguments)
+        .invocation_output()
+        .ok()?;
     output
         .status
         .success()
@@ -1331,7 +1337,7 @@ fn run_windows_tool_in_for(
         return Ok(banner);
     }
     let output = windows_tool_command_for(tool, path, environment, env)?
-        .output()
+        .invocation_output()
         .with_context(|| format!("running {} at {}", tool.name(), path.display()))?;
     let text = format!(
         "{}\n{}",
@@ -2610,7 +2616,7 @@ esac
             .env("_CL_", "FILE2.C")
             .env_remove("LINK")
             .env_remove("_LINK_")
-            .output()
+            .invocation_output()
             .unwrap();
         assert!(
             output.status.success(),
@@ -2670,7 +2676,10 @@ esac
     fn windows_installed_msvc_probe_finds_the_toolchains_rust_lld() {
         let _lock = process_state_test_lock();
         let rustc = |arguments: &[&str]| {
-            let output = Command::new("rustc").args(arguments).output().unwrap();
+            let output = Command::new("rustc")
+                .args(arguments)
+                .invocation_output()
+                .unwrap();
             assert!(output.status.success(), "rustc {arguments:?}");
             String::from_utf8(output.stdout).unwrap()
         };

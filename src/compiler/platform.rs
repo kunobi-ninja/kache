@@ -43,6 +43,7 @@
 //! - `probe_compiler(path) -> CompilerInfo` — for cc cache keys to
 //!   know gcc-vs-clang-vs-MSVC.
 
+use crate::invocation::InvocationEnv;
 use anyhow::{Context as _, Result};
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
@@ -130,10 +131,17 @@ pub trait Platform: Send + Sync {
 /// `Platform` parameter through every type. The dispatch cost is
 /// negligible relative to the work each method does (codesign shells
 /// out; the vtable lookup is in the noise).
+#[cfg(test)]
 pub fn current() -> Box<dyn Platform> {
+    current_for(&InvocationEnv::capture())
+}
+
+pub fn current_for(env: &InvocationEnv) -> Box<dyn Platform> {
+    #[cfg(not(target_os = "macos"))]
+    let _ = env;
     #[cfg(target_os = "macos")]
     {
-        Box::new(MacOsPlatform)
+        Box::new(MacOsPlatform { env: env.clone() })
     }
     #[cfg(target_os = "linux")]
     {
@@ -152,7 +160,24 @@ pub fn current() -> Box<dyn Platform> {
 /// Off macOS, `current()` doesn't construct it but cross-platform unit
 /// tests do, so any host can pin the macOS dispatch shape.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-pub struct MacOsPlatform;
+pub struct MacOsPlatform {
+    env: InvocationEnv,
+}
+
+#[cfg(test)]
+impl Default for MacOsPlatform {
+    fn default() -> Self {
+        Self {
+            env: InvocationEnv::capture(),
+        }
+    }
+}
+
+impl MacOsPlatform {
+    fn codesign(&self, flags: &[&str], path: &Path) -> std::io::Result<std::process::ExitStatus> {
+        crate::invocation::io::status(self.env.command("codesign")?.args(flags).arg(path))
+    }
+}
 
 impl Platform for MacOsPlatform {
     fn name(&self) -> &'static str {
@@ -172,11 +197,7 @@ impl Platform for MacOsPlatform {
         // verify-then-sign: skip mutation when ld64's signature is
         // still valid. `codesign --verify --strict` exits 0 iff a
         // structurally-valid signature is already present.
-        let verify = match Command::new("codesign")
-            .args(["--verify", "--strict"])
-            .arg(path)
-            .status()
-        {
+        let verify = match self.codesign(&["--verify", "--strict"], path) {
             Ok(status) => status,
             Err(err) => {
                 tracing::warn!(
@@ -199,11 +220,7 @@ impl Platform for MacOsPlatform {
             "ad-hoc signature missing or invalid for {}, re-applying",
             path.display()
         );
-        let status = match Command::new("codesign")
-            .args(["--sign", "-", "--force"])
-            .arg(path)
-            .status()
-        {
+        let status = match self.codesign(&["--sign", "-", "--force"], path) {
             Ok(status) => status,
             Err(err) => {
                 tracing::warn!(
@@ -231,7 +248,7 @@ impl Platform for MacOsPlatform {
             std::env::consts::ARCH,
             std::env::consts::OS,
             release,
-            &crate::config::probe_memo_dir(),
+            &crate::config::probe_memo_dir_for(&self.env).ok()?,
         )
     }
 
@@ -242,6 +259,16 @@ impl Platform for MacOsPlatform {
         if std::env::consts::OS != "macos" {
             return Ok(None);
         }
+        let binary_path = self
+            .env
+            .resolve(binary)
+            .context("debug binary requires the invocation directory")?;
+        let staging_path = self
+            .env
+            .resolve(staging_dir)
+            .context("debug staging requires the invocation directory")?;
+        let binary = binary_path.as_path();
+        let staging_dir = staging_path.as_path();
         let Some(file_name) = binary.file_name().and_then(|n| n.to_str()) else {
             tracing::warn!(
                 "not packaging a debug bundle: binary has no usable file name: {}",
@@ -259,10 +286,11 @@ impl Platform for MacOsPlatform {
         //   2. lldb's adjacent-bundle lookup is by `<binary>.dSYM` sibling
         //      path, which is exactly this location.
         let bundle_dir = binary.with_file_name(format!("{file_name}.dSYM"));
-        let Some(mut command) = macho_debug_bundle_command(binary, &bundle_dir)? else {
+        let Some(mut command) = macho_debug_bundle_command_for(binary, &bundle_dir, &self.env)?
+        else {
             return Ok(None);
         };
-        let status = match command.status() {
+        let status = match crate::invocation::io::status(&mut command) {
             Ok(status) => status,
             Err(err) => {
                 // Best-effort per the trait contract: no dsymutil (unusual
@@ -297,9 +325,17 @@ impl Platform for MacOsPlatform {
 /// Cross-compilation can produce ELF or PE executables on a macOS host.
 /// Inspect only the format marker; dsymutil validates the Mach-O contents.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-fn macho_debug_bundle_command(binary: &Path, bundle_dir: &Path) -> Result<Option<Command>> {
+fn macho_debug_bundle_command_for(
+    binary: &Path,
+    bundle_dir: &Path,
+    env: &InvocationEnv,
+) -> Result<Option<Command>> {
+    let binary = env
+        .resolve(binary)
+        .context("debug binary requires the invocation directory")?;
     let mut magic = [0; 4];
-    if let Err(err) = std::fs::File::open(binary).and_then(|mut file| file.read_exact(&mut magic)) {
+    if let Err(err) = std::fs::File::open(&binary).and_then(|mut file| file.read_exact(&mut magic))
+    {
         tracing::warn!("unable to inspect debug binary {}: {err}", binary.display());
         return Ok(None);
     }
@@ -318,7 +354,7 @@ fn macho_debug_bundle_command(binary: &Path, bundle_dir: &Path) -> Result<Option
     ) {
         return Ok(None);
     }
-    debug_bundle_command(binary, bundle_dir).map(Some)
+    debug_bundle_command_for(&binary, bundle_dir, env).map(Some)
 }
 
 /// Resolve paths before changing the child's cwd: cached macOS debug links
@@ -327,14 +363,22 @@ fn macho_debug_bundle_command(binary: &Path, bundle_dir: &Path) -> Result<Option
 /// same root. A test binary in `<profile>/deps` records `deps/<obj>.o`,
 /// which only resolves from `<profile>` (kunobi-ninja/kache#1161).
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-pub(crate) fn debug_bundle_command(binary: &Path, bundle_dir: &Path) -> Result<Command> {
-    let binary = std::path::absolute(binary)?;
-    let bundle_dir = std::path::absolute(bundle_dir)?;
+pub(crate) fn debug_bundle_command_for(
+    binary: &Path,
+    bundle_dir: &Path,
+    env: &InvocationEnv,
+) -> Result<Command> {
+    let binary = env
+        .resolve(binary)
+        .context("debug binary requires the invocation directory")?;
+    let bundle_dir = env
+        .resolve(bundle_dir)
+        .context("debug bundle requires the invocation directory")?;
     let output_dir = binary
         .parent()
         .context("debug binary has no parent directory")?;
     let oso_root = cargo_profile_dir(output_dir).unwrap_or_else(|| output_dir.to_path_buf());
-    let mut command = Command::new("dsymutil");
+    let mut command = env.command("dsymutil")?;
     command
         .current_dir(oso_root)
         .arg(&binary)
@@ -596,6 +640,71 @@ pub(crate) mod tests {
         }
     }
 
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn codesign_requests_use_client_tools_environment_and_streams() {
+        use crate::invocation::io::{InvocationIo, InvocationIoScope};
+        use std::os::unix::fs::PermissionsExt;
+
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|threads| {
+            for (directory, name) in [(first.path(), "first"), (second.path(), "second")] {
+                let barrier = &barrier;
+                threads.spawn(move || {
+                    barrier.wait();
+                    let root = directory.canonicalize().unwrap();
+                    let bin = root.join("tools");
+                    std::fs::create_dir_all(&bin).unwrap();
+                    let codesign = bin.join("codesign");
+                    std::fs::write(&codesign, b"#!/bin/sh\nprintf '%s:%s\\n' \"$CLIENT\" \"$*\" >> calls\nprintf '%s\\n' \"$CLIENT\" >&2\n[ \"$1\" != --verify ] || [ \"$CLIENT\" = first ]\n").unwrap();
+                    std::fs::set_permissions(&codesign, std::fs::Permissions::from_mode(0o755)).unwrap();
+                    let env = InvocationEnv::from_parts([
+                        ("PATH", bin.into_os_string()), ("CLIENT", name.into()),
+                        ("KACHE_CACHE_DIR", root.join("cache").into_os_string()),
+                    ], Some(root.clone()), None, root.clone());
+                    let _io = InvocationIoScope::enter(InvocationIo::from_files(
+                        tempfile::tempfile_in(&root).unwrap(),
+                        std::fs::File::create(root.join("stdout")).unwrap(),
+                        std::fs::File::create(root.join("stderr")).unwrap(), None,
+                    ));
+                    let platform = current_for(&env);
+                    let result = platform.ensure_binary_loadable(Path::new("artifact")).unwrap();
+                    let expected = if name == "first" { Loadability::Verified } else { Loadability::Unverified };
+                    assert_eq!(result, expected);
+                    let calls = std::fs::read_to_string(root.join("calls")).unwrap();
+                    let extra = if name == "second" { "second:--sign - --force artifact\n" } else { "" };
+                    assert_eq!(calls, format!("{name}:--verify --strict artifact\n{extra}"));
+                    assert_eq!(std::fs::read_to_string(root.join("stderr")).unwrap(), if name == "first" { "first\n" } else { "second\nsecond\n" });
+                    assert!(platform.verified_loadable_dir().unwrap().starts_with(root.join("cache/probes")));
+                });
+            }
+        });
+    }
+
+    fn debug_env(root: &Path) -> InvocationEnv {
+        let bin = root.join("tools");
+        std::fs::create_dir_all(&bin).unwrap();
+        let program = bin.join(if cfg!(windows) {
+            "dsymutil.exe"
+        } else {
+            "dsymutil"
+        });
+        std::fs::write(&program, b"command fixture").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        InvocationEnv::from_parts(
+            [("PATH", bin.into_os_string()), ("PATHEXT", ".EXE".into())],
+            Some(root.to_owned()),
+            None,
+            root.to_owned(),
+        )
+    }
+
     #[test]
     fn current_returns_a_platform_named_after_the_host() {
         // Sanity: detection picks the right impl for this build target.
@@ -618,7 +727,7 @@ pub(crate) mod tests {
     fn only_macos_on_arm64_keeps_a_verified_loadable_memo() {
         assert_eq!(LinuxPlatform.verified_loadable_dir(), None);
         assert_eq!(WindowsPlatform.verified_loadable_dir(), None);
-        let dir = MacOsPlatform.verified_loadable_dir();
+        let dir = MacOsPlatform::default().verified_loadable_dir();
         if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
             let dir = dir.expect("arm64 macOS checks signatures, so it keeps the memo");
             let scope = dir.file_name().unwrap().to_str().unwrap();
@@ -698,7 +807,7 @@ pub(crate) mod tests {
         //   (which also fails); the contract is that both failures get
         //   logged and the function still returns Ok, so a single
         //   malformed input doesn't tank the wrapper's restore loop.
-        let platform = MacOsPlatform;
+        let platform = MacOsPlatform::default();
         platform
             .ensure_binary_loadable(Path::new("/no/such/file"))
             .unwrap();
@@ -719,7 +828,7 @@ pub(crate) mod tests {
     fn only_linux_lets_restored_loadables_share_the_blob_inode() {
         assert!(LinuxPlatform.may_share_restored_loadables());
         // codesign may rewrite a restored file in place.
-        assert!(!MacOsPlatform.may_share_restored_loadables());
+        assert!(!MacOsPlatform::default().may_share_restored_loadables());
         // An NTFS link shares the blob's read-only attribute (#429).
         assert!(!WindowsPlatform.may_share_restored_loadables());
     }
@@ -758,7 +867,7 @@ pub(crate) mod tests {
         // the missing file fails, which the best-effort contract
         // turns into a logged warning + Ok(None) — a failed bundle must
         // never fail the store path.
-        let platform = MacOsPlatform;
+        let platform = MacOsPlatform::default();
         let dir = tempfile::tempdir().unwrap();
         assert!(
             platform
@@ -784,10 +893,13 @@ pub(crate) mod tests {
             b"\xbf\xba\xfe\xca",
         ] {
             std::fs::write(&binary, magic).unwrap();
-            let command = macho_debug_bundle_command(&binary, &bundle)
+            let command = macho_debug_bundle_command_for(&binary, &bundle, &debug_env(dir.path()))
                 .unwrap()
                 .expect("Mach-O outputs need dsymutil");
-            assert_eq!(command.get_program(), "dsymutil");
+            assert_eq!(
+                Path::new(command.get_program()).file_stem().unwrap(),
+                "dsymutil"
+            );
         }
     }
 
@@ -808,7 +920,7 @@ pub(crate) mod tests {
         ] {
             std::fs::write(&binary, bytes).unwrap();
             assert!(
-                macho_debug_bundle_command(&binary, &bundle)
+                macho_debug_bundle_command_for(&binary, &bundle, &debug_env(dir.path()))
                     .unwrap()
                     .is_none(),
                 "non-Mach-O output must not invoke dsymutil: {bytes:?}"
@@ -817,7 +929,7 @@ pub(crate) mod tests {
         assert!(!bundle.exists());
         std::fs::remove_file(&binary).unwrap();
         assert!(
-            macho_debug_bundle_command(&binary, &bundle)
+            macho_debug_bundle_command_for(&binary, &bundle, &debug_env(dir.path()))
                 .unwrap()
                 .is_none(),
             "a missing output must keep debug packaging best-effort"
@@ -881,13 +993,12 @@ pub(crate) mod tests {
 
     #[test]
     fn debug_bundle_command_resolves_relative_arguments_before_changing_directory() {
-        // Both the command and this test resolve against the current
-        // directory, which other tests move while holding this lock.
-        let _lock = crate::test_support::process_state_test_lock();
+        let root = tempfile::tempdir().unwrap();
+        let env = debug_env(root.path());
         let binary = Path::new("target/debug/deps/demo");
         let bundle = Path::new("target/debug/deps/demo.dSYM");
-        let command = debug_bundle_command(binary, bundle).unwrap();
-        let cwd = std::env::current_dir().unwrap();
+        let command = debug_bundle_command_for(binary, bundle, &env).unwrap();
+        let cwd = root.path();
         assert_eq!(
             command.get_current_dir(),
             Some(cwd.join("target/debug").as_path()),
@@ -917,7 +1028,7 @@ pub(crate) mod tests {
             return;
         }
         let staging = tempfile::tempdir().unwrap();
-        MacOsPlatform
+        MacOsPlatform::default()
             .package_debug_bundle(&binary, staging.path())
             .unwrap()
             .unwrap();
@@ -941,12 +1052,12 @@ pub(crate) mod tests {
 
     #[test]
     fn debug_bundle_command_runs_outside_cargo_layout_from_the_output_dir() {
-        // Both the command and this test resolve against the current
-        // directory, which other tests move while holding this lock.
-        let _lock = crate::test_support::process_state_test_lock();
+        let root = tempfile::tempdir().unwrap();
+        let env = debug_env(root.path());
         let command =
-            debug_bundle_command(Path::new("out/demo"), Path::new("out/demo.dSYM")).unwrap();
-        let cwd = std::env::current_dir().unwrap();
+            debug_bundle_command_for(Path::new("out/demo"), Path::new("out/demo.dSYM"), &env)
+                .unwrap();
+        let cwd = root.path();
         assert_eq!(command.get_current_dir(), Some(cwd.join("out").as_path()));
     }
 
@@ -970,7 +1081,7 @@ pub(crate) mod tests {
             return;
         }
         let bundle = deps.join("hello-bin.dSYM");
-        let output = debug_bundle_command(&binary, &bundle)
+        let output = debug_bundle_command_for(&binary, &bundle, &InvocationEnv::capture())
             .unwrap()
             .output()
             .unwrap();
@@ -1146,7 +1257,7 @@ pub(crate) mod tests {
         };
         let staging = tempfile::tempdir().unwrap();
 
-        let tar_path = MacOsPlatform
+        let tar_path = MacOsPlatform::default()
             .package_debug_bundle(&binary, staging.path())
             .unwrap()
             .expect("macOS host with dsymutil must produce a bundle tar");
@@ -1190,11 +1301,11 @@ pub(crate) mod tests {
         let staging_a = tempfile::tempdir().unwrap();
         let staging_b = tempfile::tempdir().unwrap();
 
-        let tar_a = MacOsPlatform
+        let tar_a = MacOsPlatform::default()
             .package_debug_bundle(&binary, staging_a.path())
             .unwrap()
             .expect("first packaging must succeed");
-        let tar_b = MacOsPlatform
+        let tar_b = MacOsPlatform::default()
             .package_debug_bundle(&binary, staging_b.path())
             .unwrap()
             .expect("second packaging must succeed");

@@ -19,6 +19,7 @@
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 
+use crate::invocation::InvocationEnv;
 use crate::link::LinkStrategy;
 
 pub mod cc;
@@ -62,14 +63,14 @@ impl std::fmt::Display for CompilerId {
 pub struct CompilerAdapter {
     id: CompilerId,
     display_name: &'static str,
-    recognizes: fn(&[String]) -> bool,
+    recognizes: fn(&[String], &InvocationEnv) -> bool,
 }
 
 impl CompilerAdapter {
-    pub const fn new(
+    pub(crate) const fn new(
         id: CompilerId,
         display_name: &'static str,
-        recognizes: fn(&[String]) -> bool,
+        recognizes: fn(&[String], &InvocationEnv) -> bool,
     ) -> Self {
         Self {
             id,
@@ -86,8 +87,13 @@ impl CompilerAdapter {
         self.display_name
     }
 
+    #[cfg(test)]
     pub fn recognizes(self, args: &[String]) -> bool {
-        (self.recognizes)(args)
+        self.recognizes_for(args, &InvocationEnv::capture())
+    }
+
+    pub(crate) fn recognizes_for(self, args: &[String], env: &InvocationEnv) -> bool {
+        (self.recognizes)(args, env)
     }
 }
 
@@ -786,9 +792,16 @@ pub const COMPILER_ADAPTERS: &[CompilerAdapter] =
 /// handling via [`cc::CcCompiler::recognizes_family_probe`], which is its own
 /// concern, not an adapter).
 pub fn detect_compiler(args: &[String]) -> Option<&'static CompilerAdapter> {
+    detect_compiler_for(args, &InvocationEnv::capture())
+}
+
+pub(crate) fn detect_compiler_for(
+    args: &[String],
+    env: &InvocationEnv,
+) -> Option<&'static CompilerAdapter> {
     COMPILER_ADAPTERS
         .iter()
-        .find(|adapter| adapter.recognizes(args))
+        .find(|adapter| adapter.recognizes_for(args, env))
 }
 
 /// Detect a `RUSTC_WRAPPER` + `RUSTC_WORKSPACE_WRAPPER` chain with an
@@ -901,10 +914,6 @@ pub(crate) fn resolve_program_on_path_with(
     None
 }
 
-fn is_program_on_path(program: &str) -> bool {
-    resolve_program_on_path(program).is_some()
-}
-
 /// Detect a real compiler invocation that must run uncached.
 ///
 /// MSVC `cl.exe` has no cache adapter and runs through this path when cc-rs
@@ -914,8 +923,13 @@ fn is_program_on_path(program: &str) -> bool {
 /// tool names. (`nvcc` used to live here; since kunobi-ninja/kache#1024 it has
 /// its own adapter and dispatches to `run_nvcc`, which passes through with a
 /// recorded reason until the cache path lands.)
+#[cfg(test)]
 pub(crate) fn is_passthrough_compiler_invocation(args: &[String]) -> bool {
-    let rustc = std::env::var_os("RUSTC");
+    is_passthrough_compiler_invocation_for(args, &InvocationEnv::capture())
+}
+
+pub(crate) fn is_passthrough_compiler_invocation_for(args: &[String], env: &InvocationEnv) -> bool {
+    let rustc = env.var_os("RUSTC");
     is_passthrough_compiler_invocation_with(args, rustc.as_deref())
 }
 
@@ -939,8 +953,16 @@ pub(crate) fn is_passthrough_compiler_invocation_with(
 /// is rustc plus lints, so its outputs are keyed like rustc's with the Clippy
 /// version, configuration and lint arguments folded in (see
 /// `cache_key::clippy_identity`). Every other driver stays uncached.
+#[cfg(test)]
 pub fn is_cacheable_workspace_wrapper_chain(args: &[String]) -> bool {
-    is_workspace_wrapper_chain(args)
+    is_cacheable_workspace_wrapper_chain_for(args, &InvocationEnv::capture())
+}
+
+pub(crate) fn is_cacheable_workspace_wrapper_chain_for(
+    args: &[String],
+    env: &InvocationEnv,
+) -> bool {
+    is_workspace_wrapper_chain_for(args, env)
         && args
             .first()
             .is_some_and(|program| is_clippy_driver(program))
@@ -953,8 +975,14 @@ pub(crate) fn is_clippy_driver(program: &str) -> bool {
 }
 
 pub fn is_workspace_wrapper_chain(args: &[String]) -> bool {
-    let workspace_wrapper = std::env::var_os("RUSTC_WORKSPACE_WRAPPER");
-    is_workspace_wrapper_chain_with(args, workspace_wrapper.as_deref(), is_program_on_path)
+    is_workspace_wrapper_chain_for(args, &InvocationEnv::capture())
+}
+
+pub(crate) fn is_workspace_wrapper_chain_for(args: &[String], env: &InvocationEnv) -> bool {
+    let workspace_wrapper = env.var_os("RUSTC_WORKSPACE_WRAPPER");
+    is_workspace_wrapper_chain_with(args, workspace_wrapper.as_deref(), |program| {
+        env.resolve_program(Path::new(program)).is_some()
+    })
 }
 
 fn is_workspace_wrapper_chain_with(
@@ -1003,6 +1031,83 @@ pub(crate) fn strip_windows_exe_suffix(name: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_dispatch_uses_each_clients_compiler_and_wrapper_selection() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|threads| {
+            for (root, marker, expected) in [
+                (first.path(), "KACHE_PROBE_GNU", Some(cc::CC_ID)),
+                (second.path(), "not-a-compiler", None),
+            ] {
+                std::fs::create_dir(root.join("bin")).unwrap();
+                kache_fs::testutil::write_executable(
+                    &root.join("bin/local-driver"),
+                    format!("#!/bin/sh\nprintf x >> driver-runs\nprintf '%s\\n' '{marker}'\n"),
+                );
+                let barrier = &barrier;
+                threads.spawn(move || {
+                    let mut env = InvocationEnv::from_parts(
+                        [
+                            ("PATH", "bin"),
+                            ("RUSTC", "custom-rustc"),
+                            ("RUSTC_WORKSPACE_WRAPPER", "declared-wrapper"),
+                        ],
+                        Some(root.to_owned()),
+                        None,
+                        root.to_owned(),
+                    );
+                    env.set("KACHE_CACHE_DIR", root.join("cache"));
+                    let args = [
+                        "local-driver".to_string(),
+                        "-c".to_string(),
+                        "unit.c".to_string(),
+                    ];
+                    barrier.wait();
+                    assert_eq!(
+                        detect_compiler_for(&args, &env).map(|adapter| adapter.id()),
+                        expected
+                    );
+                    assert_eq!(
+                        detect_compiler_for(&args, &env).map(|adapter| adapter.id()),
+                        expected
+                    );
+                    assert_eq!(
+                        std::fs::read(root.join("driver-runs")).unwrap(),
+                        b"x",
+                        "both positive and negative family results are memoized"
+                    );
+                    let chain = ["local-driver".into(), "rustc".into(), "unit.rs".into()];
+                    assert!(is_workspace_wrapper_chain_for(&chain, &env));
+                    assert!(detect_compiler_for(&chain, &env).is_none());
+                    let declared = ["declared-wrapper".into(), "rustc".into(), "unit.rs".into()];
+                    assert!(is_workspace_wrapper_chain_for(&declared, &env));
+                    let mut other = env.clone();
+                    other.set("PATH", "missing-bin");
+                    other.set("RUSTC_WORKSPACE_WRAPPER", "other-wrapper");
+                    other.set("RUSTC", "other-rustc");
+                    assert!(!is_workspace_wrapper_chain_for(&chain, &other));
+                    assert!(!is_workspace_wrapper_chain_for(&declared, &other));
+                    assert!(detect_compiler_for(&args, &other).is_none());
+                    let custom = ["custom-rustc".into(), "--version".into()];
+                    assert!(is_passthrough_compiler_invocation_for(&custom, &env));
+                    assert!(!is_passthrough_compiler_invocation_for(&custom, &other));
+                    assert!(
+                        detect_compiler_for(&["local-driver".into(), "--version".into()], &env)
+                            .is_none()
+                    );
+                    assert_eq!(
+                        std::fs::read(root.join("driver-runs")).unwrap(),
+                        b"x",
+                        "wrapper chains and info queries must not run detection probes"
+                    );
+                });
+            }
+        });
+    }
 
     #[test]
     fn version_or_info_query_needs_every_arg_to_be_a_query_flag() {

@@ -1,7 +1,8 @@
+use crate::invocation::process::{Child, CommandExt as _};
 use anyhow::{Context, Result, bail};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ExitStatus};
+use std::process::ExitStatus;
 
 use crate::compiler::{ArtifactSet, classify_by_filename};
 
@@ -55,6 +56,7 @@ pub(crate) struct RustcResponseFile {
 }
 
 impl RustcResponseFile {
+    #[cfg(test)]
     pub(crate) fn new<'a>(args: impl IntoIterator<Item = &'a str>) -> Result<Self> {
         Self::new_in(&std::env::temp_dir(), args)
     }
@@ -237,7 +239,7 @@ pub(crate) fn run_rustc(
         .stderr(std::process::Stdio::piped());
     let compiler_trace = crate::phase_trace::phase("compiler");
     let mut child = cmd
-        .spawn()
+        .invocation_spawn()
         .with_context(|| format!("executing {}", rustc.display()))?;
     let monitor = crate::heartbeat::start_monitor(crate_name.unwrap_or("unknown"), child.id());
     let child_stdout = child.stdout.take().context("capturing rustc stdout")?;
@@ -1002,7 +1004,7 @@ fi
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
-            .spawn()
+            .invocation_spawn()
             .unwrap();
         let stdout = child.stdout.take().unwrap();
         let stderr = child.stderr.take().unwrap();
@@ -1033,7 +1035,7 @@ fi
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
-                .spawn()
+                .invocation_spawn()
                 .unwrap();
             let stdout = child.stdout.take().unwrap();
             let stderr = child.stderr.take().unwrap();

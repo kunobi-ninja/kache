@@ -26,6 +26,7 @@ const DYLD_DEFAULT_FALLBACK: &str = "/usr/local/lib:/usr/lib";
 /// Point `cmd`'s dyld fallback at the toolchain `rustc` belongs to, unless the
 /// inherited value already covers it or `rustc` is not a toolchain binary
 /// (a rustup proxy sets the variable itself).
+#[cfg(test)]
 pub(crate) fn apply(cmd: &mut Command, rustc: &Path) {
     apply_for(cmd, rustc, &crate::invocation::InvocationEnv::capture());
 }

@@ -1,5 +1,6 @@
 use crate::args::RustcArgs;
 use crate::invocation::InvocationEnv;
+use crate::invocation::process::CommandExt as _;
 use crate::path_normalizer::{PathNormalizer, check_for_path_leak};
 use anyhow::{Context, Result};
 pub(crate) use kache_format::{is_valid_cache_key, is_valid_crate_name};
@@ -7467,6 +7468,10 @@ impl FileHasher<'static> {
 }
 
 impl<'db> FileHasher<'db> {
+    pub(crate) fn invocation_env(&self) -> &InvocationEnv {
+        &self.invocation_env
+    }
+
     /// Write every memo row hashed so far in one transaction.
     ///
     /// A file that had changed within [`HASH_SETTLE_NS`] of when it was
@@ -9122,9 +9127,10 @@ pub(crate) fn run_dep_info_pass_for(
 
     let spawned = std::time::Instant::now();
     let output = cmd
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
-        .output()
+        .invocation_capture()
         .context("running rustc --emit=dep-info")?;
     // One extra rustc start per invocation, hit or miss. Counted and timed so
     // the event log can show what removing it would buy (`dep_info_runs`,
@@ -9648,8 +9654,7 @@ pub(crate) fn rustc_accepts_cwd_remap_for(
     if restrict_features {
         command.arg("-Zallow-features=");
     }
-    crate::platform::configure_process_group(&mut command);
-    let mut child = command.spawn().ok()?;
+    let mut child = command.invocation_spawn_in_group().ok()?;
     let start = Instant::now();
     loop {
         match child.try_wait() {
@@ -9668,7 +9673,6 @@ pub(crate) fn rustc_accepts_cwd_remap_for(
                 std::thread::sleep(Duration::from_millis(10));
             }
             _ => {
-                crate::platform::kill_process_group(child.id());
                 let _ = child.kill();
                 let _ = child.wait();
                 return None;
@@ -9696,7 +9700,7 @@ pub(crate) fn get_rustc_version_for(rustc: &Path, env: &InvocationEnv) -> Result
         .command(rustc)?
         .arg("--version")
         .arg("--verbose")
-        .output()
+        .invocation_output()
         .context("running rustc --version --verbose")?;
 
     let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -9718,7 +9722,7 @@ fn get_clippy_version_for(driver: &Path, env: &InvocationEnv) -> Result<String> 
     let output = env
         .command(driver)?
         .arg("--version")
-        .output()
+        .invocation_output()
         .context("running clippy-driver --version")?;
     let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
     anyhow::ensure!(
@@ -9884,7 +9888,7 @@ fn default_rustc_sysroot_for(rustc: &Path, env: &InvocationEnv) -> Option<PathBu
         .ok()?
         .arg("--print")
         .arg("sysroot")
-        .output()
+        .invocation_output()
         .ok()?;
     if !output.status.success() {
         return None;
@@ -10762,7 +10766,7 @@ fn probe_linux_libc_signature_for(
             .arg("GNU_LIBC_VERSION")
             .env("LC_ALL", "C")
             .env("LANG", "C")
-            .output()
+            .invocation_output()
         && output.status.success()
         && let Some(version) = parse_getconf_gnu_libc(&String::from_utf8_lossy(&output.stdout))
     {
@@ -10774,7 +10778,7 @@ fn probe_linux_libc_signature_for(
             .arg("--version")
             .env("LC_ALL", "C")
             .env("LANG", "C")
-            .output()
+            .invocation_output()
     {
         // musl commonly writes its banner to stderr (and may return non-zero),
         // so parse both streams before considering the exit status.
@@ -10815,7 +10819,7 @@ pub(crate) fn get_linker_identity_for(args: &RustcArgs, env: &InvocationEnv) -> 
         .command(&resolved)
         .ok()?
         .arg("--version")
-        .output()
+        .invocation_output()
         .ok()?;
 
     let version = String::from_utf8_lossy(&output.stdout);

@@ -1,10 +1,28 @@
 //! Optional compiler wrappers must not turn a working direct compile into a failure.
+use std::io::Write as _;
 use std::path::Path;
 use std::process::{Command, ExitStatus};
 
 pub use kache_protocol::fallback::{Attempt, Outcome};
 
-pub fn run(mut command: Command, name: &str, outputs: &[&Path], args: &[String]) -> Attempt {
+#[cfg(test)]
+pub fn run(command: Command, name: &str, outputs: &[&Path], args: &[String]) -> Attempt {
+    run_for(
+        Ok(command),
+        name,
+        outputs,
+        args,
+        &crate::invocation::InvocationEnv::capture(),
+    )
+}
+
+pub(crate) fn run_for(
+    command: std::io::Result<Command>,
+    name: &str,
+    outputs: &[&Path],
+    args: &[String],
+    env: &crate::invocation::InvocationEnv,
+) -> Attempt {
     let denied = if requires_direct(args) {
         Some((
             Outcome::DirectRequired,
@@ -13,11 +31,11 @@ pub fn run(mut command: Command, name: &str, outputs: &[&Path], args: &[String])
     } else {
         #[cfg(target_os = "macos")]
         {
-            macos::denial(name, outputs).map(|detail| (Outcome::SandboxDenied, detail))
+            macos::denial(name, outputs, env).map(|detail| (Outcome::SandboxDenied, detail))
         }
         #[cfg(not(target_os = "macos"))]
         {
-            let _ = outputs;
+            let _ = (outputs, env);
             None
         }
     };
@@ -28,7 +46,7 @@ pub fn run(mut command: Command, name: &str, outputs: &[&Path], args: &[String])
             exit_code: None,
             detail,
         },
-        None => match command.status() {
+        None => match command.and_then(|mut command| crate::invocation::io::status(&mut command)) {
             Ok(status) => status_attempt(name, status),
             Err(error) => Attempt {
                 wrapper: name.to_owned(),
@@ -41,9 +59,11 @@ pub fn run(mut command: Command, name: &str, outputs: &[&Path], args: &[String])
     if attempt.terminal_code().is_none() {
         // stderr remains inherited for streaming compiler diagnostics (including JSON).
         // Name the failed attempt after its output and before the direct compiler runs.
-        eprintln!(
+        let _ = writeln!(
+            crate::invocation::io::stderr(),
             "kache: warning: fallback `{}`: {}; compiling directly without fallback",
-            name, attempt.detail
+            name,
+            attempt.detail
         );
     }
     attempt
@@ -176,6 +196,23 @@ mod tests {
             assert_eq!(attempt.terminal_code(), terminal, "{script}");
             assert!(!attempt.detail.is_empty());
         }
+    }
+
+    #[test]
+    fn an_unresolvable_client_wrapper_still_requests_direct_compilation() {
+        let attempt = run_for(
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "client wrapper absent",
+            )),
+            "client-wrapper",
+            &[],
+            &[],
+            &crate::invocation::InvocationEnv::default(),
+        );
+        assert_eq!(attempt.outcome, Outcome::SpawnFailed);
+        assert_eq!(attempt.terminal_code(), None);
+        assert!(attempt.detail.contains("client wrapper absent"));
     }
 
     #[cfg(unix)]

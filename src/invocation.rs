@@ -8,6 +8,27 @@ use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+pub(crate) mod io;
+pub(crate) mod process;
+
+/// Inputs and timing transferred to one synchronous compiler request.
+pub(crate) struct InvocationContext {
+    pub(crate) env: InvocationEnv,
+    pub(crate) started_at: std::time::Instant,
+    pub(crate) shim_stem: String,
+    pub(crate) io: io::InvocationIo,
+    pub(crate) cancellation: Option<process::Cancellation>,
+}
+
+/// Keep a store-key waiter inside the caller's cancellation lifetime.
+pub(crate) fn wait_for_committed(
+    store: &crate::store::Store,
+    key: &str,
+    timeout: Option<std::time::Duration>,
+) -> anyhow::Result<bool> {
+    store.wait_for_committed_with(key, timeout, || Ok(process::check()?))
+}
+
 #[derive(Clone, Default)]
 pub(crate) struct InvocationEnv {
     vars: std::sync::Arc<Vec<(OsString, OsString)>>,
@@ -56,6 +77,9 @@ impl InvocationEnv {
             temp,
             cache: None,
         };
+        if let Some(temp) = invocation.resolve(&invocation.temp) {
+            invocation.temp = temp;
+        }
         #[cfg(target_os = "macos")]
         {
             invocation.cache = invocation
@@ -79,6 +103,16 @@ impl InvocationEnv {
                 .or_else(|| invocation.home_dir().map(|home| home.join(".cache")));
         }
         invocation
+    }
+
+    pub(crate) fn validate(&self) -> std::io::Result<()> {
+        if self.cwd().is_none_or(|cwd| !cwd.is_absolute()) || !self.temp.is_absolute() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "compiler invocation requires absolute working and temporary directories",
+            ));
+        }
+        Ok(())
     }
 
     pub(crate) fn var_os(&self, name: &str) -> Option<OsString> {
@@ -185,6 +219,7 @@ impl InvocationEnv {
     }
 
     pub(crate) fn command(&self, program: impl AsRef<OsStr>) -> std::io::Result<Command> {
+        process::check()?;
         let program_path = Path::new(program.as_ref());
         let resolved = self.resolve_program(program_path);
         if resolved.is_none() && (cfg!(windows) || program_path.components().count() > 1) {
@@ -226,6 +261,29 @@ fn name_matches_os(key: &OsStr, name: &OsStr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn temporary_paths_are_rooted_in_the_client_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let env = InvocationEnv::from_parts(
+            Vec::<(OsString, OsString)>::new(),
+            Some(root.path().to_owned()),
+            None,
+            "client-temp".into(),
+        );
+        assert_eq!(env.temp_dir(), root.path().join("client-temp"));
+        env.validate().unwrap();
+        let missing = InvocationEnv::from_parts(
+            Vec::<(OsString, OsString)>::new(),
+            None,
+            None,
+            "client-temp".into(),
+        );
+        assert_eq!(
+            missing.validate().unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+    }
 
     #[test]
     fn separate_invocations_keep_environment_and_paths_separate() {

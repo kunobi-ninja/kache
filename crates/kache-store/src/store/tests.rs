@@ -5306,6 +5306,51 @@ fn claim_build_evicts_empty_committed_entry() {
 }
 
 #[test]
+fn committed_wait_can_be_cancelled_without_releasing_another_owners_lock() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let directory = tempfile::tempdir().unwrap();
+    let config = test_config(directory.path());
+    let owner = Store::open(&config).unwrap();
+    let key = "cancelled-wait";
+    let held = owner.try_lock(key).unwrap().unwrap();
+    let cancelled = AtomicBool::new(false);
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    std::thread::scope(|threads| {
+        let worker = threads.spawn(|| {
+            let waiter = Store::open(&config).unwrap();
+            waiter.wait_for_committed_with(key, Some(Duration::from_secs(2)), || {
+                let _ = started_tx.send(());
+                if cancelled.load(Ordering::Acquire) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "request cancelled",
+                    )
+                    .into());
+                }
+                Ok(())
+            })
+        });
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let started = std::time::Instant::now();
+        cancelled.store(true, Ordering::Release);
+        let error = worker.join().unwrap().unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::Interrupted
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+    });
+    assert!(owner.try_lock(key).unwrap().is_none());
+    drop(held);
+    assert!(
+        !owner
+            .wait_for_committed_with(key, Some(Duration::ZERO), || Ok(()))
+            .unwrap()
+    );
+    assert!(owner.try_lock(key).unwrap().is_some());
+}
+
+#[test]
 fn unlocked_pid_marker_does_not_claim_the_key() {
     // Regression for #821: PID contents are diagnostic only. A PID from a
     // different namespace must not decide whether the key is available.

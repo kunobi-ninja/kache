@@ -135,6 +135,9 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_SystemServices",
     # `kache test-runner` leaves Ctrl-C to the test it runs.
     "Win32_System_Console",
+    "Win32_System_JobObjects",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_Security",
 ] }
 
 [dev-dependencies]

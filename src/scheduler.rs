@@ -111,6 +111,7 @@ fn acquire_within(path: &Path, timeout: Duration, poll: Duration) -> Result<Opti
     let start = std::time::Instant::now();
     let mut attempt = 0;
     loop {
+        crate::invocation::process::check()?;
         if let Some(lock) = StoreLock::try_acquire(path)? {
             return Ok(Some(lock));
         }
@@ -486,6 +487,7 @@ impl Scheduler {
         let mut attempt = 0;
         let mut waited = false;
         loop {
+            crate::invocation::process::check().ok()?;
             // A need of zero would never be met.
             match try_collect_slots(self, range.clone(), need(waited).max(1) as usize) {
                 Ok(Some(slots)) => return Some(slots),
@@ -802,6 +804,7 @@ fn wait_for_lock(path: &Path, timeout: Duration, poll: Duration) -> Result<bool>
     let start = std::time::Instant::now();
     let mut attempt = 0;
     loop {
+        crate::invocation::process::check()?;
         if let Some(lock) = StoreLock::try_acquire(path)? {
             drop(lock);
             return Ok(true);
@@ -1474,6 +1477,42 @@ mod tests {
     impl Drop for PinnedPressure {
         fn drop(&mut self) {
             pressure::force(None);
+        }
+    }
+
+    #[test]
+    fn request_cancellation_releases_scheduler_waiters() {
+        let dir = temp_cache();
+        let scheduler = test_scheduler(dir.path(), 1);
+        let path = dir.path().join("blocked");
+        let _owner = StoreLock::try_acquire(&path).unwrap().unwrap();
+        let _slot = StoreLock::try_acquire(&scheduler.permit_path(0))
+            .unwrap()
+            .unwrap();
+        for kind in 0..3 {
+            let token = crate::invocation::process::Cancellation::default();
+            std::thread::scope(|threads| {
+                let worker = threads.spawn(|| {
+                    let _scope =
+                        crate::invocation::process::CancellationScope::enter(Some(token.clone()));
+                    match kind {
+                        0 => assert!(
+                            acquire_within(&path, Duration::from_secs(5), Duration::from_millis(5))
+                                .is_err()
+                        ),
+                        1 => assert!(
+                            wait_for_lock(&path, Duration::from_secs(5), Duration::from_millis(5))
+                                .is_err()
+                        ),
+                        _ => assert!(scheduler.wait_for_permit(0..1, |_| 1).is_none()),
+                    }
+                });
+                std::thread::sleep(Duration::from_millis(30));
+                let cancelled = std::time::Instant::now();
+                token.cancel();
+                worker.join().unwrap();
+                assert!(cancelled.elapsed() < Duration::from_secs(1));
+            });
         }
     }
 

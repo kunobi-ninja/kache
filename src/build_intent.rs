@@ -4,6 +4,8 @@ use std::time::{Duration, Instant};
 
 use crate::args::RustcArgs;
 use crate::identity;
+use crate::invocation::InvocationEnv;
+use crate::invocation::process::CommandExt as _;
 use kache_core::BuildIntent;
 
 struct WorkspaceDiscovery {
@@ -42,22 +44,37 @@ enum DiscoveryFailure {
 }
 
 pub fn discover(args: Option<&RustcArgs>) -> Option<BuildIntent> {
-    let manifest_dir = std::env::var_os("CARGO_MANIFEST_DIR").map(PathBuf::from);
-    let cwd = std::env::current_dir().ok();
-    discover_with_context(args, manifest_dir.as_deref(), cwd.as_deref())
+    let env = args
+        .map(|args| args.invocation_env().clone())
+        .unwrap_or_else(InvocationEnv::capture);
+    let manifest_dir = env
+        .var_os("CARGO_MANIFEST_DIR")
+        .and_then(|dir| env.resolve(Path::new(&dir)));
+    discover_with_context_for(args, manifest_dir.as_deref(), env.cwd(), &env)
 }
 
+#[cfg(test)]
 fn discover_with_context(
     args: Option<&RustcArgs>,
     manifest_dir: Option<&Path>,
     cwd: Option<&Path>,
 ) -> Option<BuildIntent> {
-    let discovery = match discover_workspace(
+    discover_with_context_for(args, manifest_dir, cwd, &InvocationEnv::capture())
+}
+
+fn discover_with_context_for(
+    args: Option<&RustcArgs>,
+    manifest_dir: Option<&Path>,
+    cwd: Option<&Path>,
+    env: &InvocationEnv,
+) -> Option<BuildIntent> {
+    let discovery = match discover_workspace_for(
         OsStr::new("cargo"),
         Instant::now() + METADATA_BUDGET,
         args,
         manifest_dir,
         cwd,
+        env,
     ) {
         Ok(discovery) => discovery,
         Err(failure) => {
@@ -70,7 +87,8 @@ fn discover_with_context(
         return None;
     }
 
-    let namespace = std::env::var("KACHE_NAMESPACE")
+    let namespace = env
+        .var("KACHE_NAMESPACE")
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
@@ -135,12 +153,31 @@ fn load_cargo_lock_deps(lock_path: &Path) -> Option<Vec<(String, String)>> {
 /// The workspace this compile belongs to: from `Cargo.lock` when one is
 /// found, else from `cargo` (the program named by `cargo`) run against each
 /// candidate manifest in turn, all before `deadline`.
+#[cfg(test)]
 fn discover_workspace(
     cargo: &OsStr,
     deadline: Instant,
     args: Option<&RustcArgs>,
     manifest_dir: Option<&Path>,
     cwd: Option<&Path>,
+) -> Result<WorkspaceDiscovery, DiscoveryFailure> {
+    discover_workspace_for(
+        cargo,
+        deadline,
+        args,
+        manifest_dir,
+        cwd,
+        &InvocationEnv::capture(),
+    )
+}
+
+fn discover_workspace_for(
+    cargo: &OsStr,
+    deadline: Instant,
+    args: Option<&RustcArgs>,
+    manifest_dir: Option<&Path>,
+    cwd: Option<&Path>,
+    env: &InvocationEnv,
 ) -> Result<WorkspaceDiscovery, DiscoveryFailure> {
     let lock_path = find_lock_path(args, manifest_dir, cwd);
     if let Some(lock_path) = lock_path.as_ref() {
@@ -154,7 +191,7 @@ fn discover_workspace(
     }
 
     for manifest_path in candidate_manifest_paths(args, manifest_dir, cwd) {
-        match run_cargo_metadata(cargo, Some(&manifest_path), deadline) {
+        match run_cargo_metadata_for(cargo, Some(&manifest_path), deadline, env) {
             Ok(discovery) => return Ok(discovery),
             // The budget is shared: nothing is left for the next candidate.
             Err(DiscoveryFailure::Timeout) => return Err(DiscoveryFailure::Timeout),
@@ -166,7 +203,7 @@ fn discover_workspace(
     if args.is_some_and(|args| compiles_outside_workspace(args, cwd)) {
         return Err(DiscoveryFailure::NoWorkspace);
     }
-    run_cargo_metadata(cargo, None, deadline)
+    run_cargo_metadata_for(cargo, None, deadline, env)
 }
 
 /// Cargo runs registry, git and outside path packages from their own directory,
@@ -287,12 +324,22 @@ fn candidate_manifest_paths(
     candidates
 }
 
+#[cfg(test)]
 fn run_cargo_metadata(
     cargo: &OsStr,
     manifest_path: Option<&Path>,
     deadline: Instant,
 ) -> Result<WorkspaceDiscovery, DiscoveryFailure> {
-    let mut command = std::process::Command::new(cargo);
+    run_cargo_metadata_for(cargo, manifest_path, deadline, &InvocationEnv::capture())
+}
+
+fn run_cargo_metadata_for(
+    cargo: &OsStr,
+    manifest_path: Option<&Path>,
+    deadline: Instant,
+    env: &InvocationEnv,
+) -> Result<WorkspaceDiscovery, DiscoveryFailure> {
+    let mut command = env.command(cargo).map_err(|_| DiscoveryFailure::Spawn)?;
     command
         .args(["metadata", "--format-version", "1", "--no-deps"])
         .env_remove("RUSTC_WRAPPER")
@@ -307,13 +354,6 @@ fn run_cargo_metadata(
 
     let stdout = run_bounded(command, deadline, METADATA_OUTPUT_CAP)?;
     parse_metadata_packages(&stdout).ok_or(DiscoveryFailure::Parse)
-}
-
-/// What the two watcher threads of [`run_bounded`] report.
-enum ChildEvent {
-    /// All of stdout, and whether it passed the cap.
-    Output(Vec<u8>, bool),
-    Exit(Option<std::process::ExitStatus>),
 }
 
 /// Whether `more` bytes still fit after `kept` under `cap`.
@@ -332,55 +372,49 @@ fn run_bounded(
 ) -> Result<Vec<u8>, DiscoveryFailure> {
     use std::io::Read;
 
-    crate::platform::configure_process_group(&mut command);
-    let mut child = command.spawn().map_err(|_| DiscoveryFailure::Spawn)?;
-    let pid = child.id();
+    let mut child = command
+        .invocation_spawn_in_group()
+        .map_err(|_| DiscoveryFailure::Spawn)?;
     let Some(mut stdout) = child.stdout.take() else {
-        crate::platform::kill_process_group(pid);
-        let _ = child.wait();
         return Err(DiscoveryFailure::Spawn);
     };
-
     let (tx, rx) = std::sync::mpsc::channel();
-    let tx_output = tx.clone();
-    std::thread::spawn(move || {
+    let reader = std::thread::spawn(move || {
         let mut kept = Vec::new();
         let mut overflowed = false;
         let mut chunk = [0u8; 8192];
         loop {
             match stdout.read(&mut chunk) {
                 Ok(0) | Err(_) => break,
-                Ok(n) if fits_output_cap(kept.len(), n, cap) => {
-                    kept.extend_from_slice(&chunk[..n]);
-                }
+                Ok(n) if fits_output_cap(kept.len(), n, cap) => kept.extend_from_slice(&chunk[..n]),
                 Ok(_) => overflowed = true,
             }
         }
-        let _ = tx_output.send(ChildEvent::Output(kept, overflowed));
+        let _ = tx.send((kept, overflowed));
     });
-    std::thread::spawn(move || {
-        let _ = tx.send(ChildEvent::Exit(child.wait().ok()));
-    });
-
-    let mut output = None;
-    let mut exit = None;
-    while output.is_none() || exit.is_none() {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        match rx.recv_timeout(remaining) {
-            Ok(ChildEvent::Output(kept, overflowed)) => output = Some((kept, overflowed)),
-            Ok(ChildEvent::Exit(status)) => exit = Some(status),
-            Err(_) => break,
-        }
+    let received = rx.recv_timeout(deadline.saturating_duration_since(Instant::now()));
+    if received.is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = reader.join();
+        return Err(DiscoveryFailure::Timeout);
     }
-
-    match (output, exit) {
-        (Some((_, true)), Some(_)) => Err(DiscoveryFailure::TooLarge),
-        (Some((kept, false)), Some(Some(status))) if status.success() => Ok(kept),
-        (Some(_), Some(_)) => Err(DiscoveryFailure::Exit),
-        _ => {
-            crate::platform::kill_process_group(pid);
-            Err(DiscoveryFailure::Timeout)
+    let _ = reader.join();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(DiscoveryFailure::Timeout);
+            }
         }
+    };
+    match received {
+        Ok((_, true)) => Err(DiscoveryFailure::TooLarge),
+        Ok((kept, false)) if status.success() => Ok(kept),
+        _ => Err(DiscoveryFailure::Exit),
     }
 }
 
@@ -897,6 +931,77 @@ mod tests {
             }
         }
         panic!("fake cargo stayed busy");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_discovery_uses_each_compilers_cargo_and_environment() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|threads| {
+            for (directory, name) in [(first.path(), "first"), (second.path(), "second")] {
+                let barrier = &barrier;
+                threads.spawn(move || {
+                    barrier.wait();
+                    let root = directory.canonicalize().unwrap();
+                    let bin = root.join("bin");
+                    std::fs::create_dir_all(&bin).unwrap();
+                    std::fs::create_dir_all(root.join("project/src")).unwrap();
+                    std::fs::write(
+                        root.join("project/Cargo.toml"),
+                        "[package]\nname='fixture'\nversion='0.0.0'\n",
+                    )
+                    .unwrap();
+                    std::fs::write(root.join("project/src/lib.rs"), "").unwrap();
+                    let cargo = fake_cargo(
+                        &bin,
+                        r#"
+[ "$PWD" = "$CLIENT_ROOT" ] || exit 21
+[ -z "$RUSTC_WRAPPER$RUSTC_WORKSPACE_WRAPPER" ] || exit 22
+printf '%s' "$CLIENT" > metadata-owner
+printf '{"workspace_root":"%s/project","packages":[{"name":"%s"}]}' "$CLIENT_ROOT" "$CLIENT"
+"#,
+                    );
+                    std::fs::rename(cargo, bin.join("cargo")).unwrap();
+                    let env = InvocationEnv::from_parts(
+                        [
+                            ("PATH", bin.into_os_string()),
+                            ("CARGO_MANIFEST_DIR", "project".into()),
+                            ("KACHE_NAMESPACE", name.into()),
+                            ("PROFILE", name.into()),
+                            ("CLIENT", name.into()),
+                            ("CLIENT_ROOT", root.clone().into_os_string()),
+                            ("RUSTC_WRAPPER", "must-not-run".into()),
+                            ("RUSTC_WORKSPACE_WRAPPER", "must-not-run".into()),
+                        ],
+                        Some(root.clone()),
+                        None,
+                        root.clone(),
+                    );
+                    let args = RustcArgs::parse_for(
+                        &[
+                            "rustc".into(),
+                            "--crate-name".into(),
+                            name.into(),
+                            "project/src/lib.rs".into(),
+                            "--crate-type".into(),
+                            "lib".into(),
+                        ],
+                        &env,
+                    )
+                    .unwrap();
+                    let discovered = discover(Some(&args)).unwrap();
+                    assert_eq!(discovered.crate_names, [name]);
+                    assert_eq!(discovered.namespace.as_deref(), Some(name));
+                    assert_eq!(identity::profile_from_rustc_args(&args), name);
+                    assert_eq!(
+                        std::fs::read_to_string(root.join("metadata-owner")).unwrap(),
+                        name
+                    );
+                });
+            }
+        });
     }
 
     #[cfg(unix)]

@@ -49,6 +49,7 @@ pub(crate) struct KeyEnv {
 
 impl KeyEnv {
     /// Read the snapshot from this process.
+    #[cfg(test)]
     pub(crate) fn capture() -> Self {
         Self::from_invocation(&crate::invocation::InvocationEnv::capture())
     }

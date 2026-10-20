@@ -366,6 +366,7 @@ impl RustcArgs {
 
     /// Parse RUSTC_WRAPPER-style arguments.
     /// In RUSTC_WRAPPER mode, argv[0] = kache, argv[1] = rustc path, argv[2..] = rustc args.
+    #[cfg(test)]
     pub fn parse(args: &[String]) -> Result<Self> {
         Self::parse_for(args, &crate::invocation::InvocationEnv::capture())
     }

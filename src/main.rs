@@ -1552,27 +1552,34 @@ fn check_wrapper_depth(above: u32, compiler: Option<&str>) -> Result<()> {
 /// args) to prevent APFS-related corruption in git worktrees on macOS. The
 /// explicit preservation mode isolates the incremental directory instead.
 /// Returns the child's exit code.
-fn run_compiler_directly(
+fn run_compiler_directly_for(
     config: &config::Config,
     args: &[String],
     preserve_incremental: bool,
+    env: &invocation::InvocationEnv,
 ) -> Result<i32> {
-    if is_cc_compiler_invocation(args) {
-        let parsed = compiler::cc::CcArgs::parse(args)?;
+    if is_cc_compiler_invocation_for(args, env) {
+        let parsed = compiler::cc::CcArgs::parse_for(args, env)?;
         wrapper::refuse_legacy_cc_blob_outputs(config, &parsed)?;
     }
 
-    run_compiler_process_directly(args, preserve_incremental)
+    run_compiler_process_directly_for(args, preserve_incremental, env)
 }
 
+#[cfg(test)]
 fn is_cc_compiler_invocation(args: &[String]) -> bool {
-    if compiler::is_passthrough_compiler_invocation(args) {
+    is_cc_compiler_invocation_for(args, &invocation::InvocationEnv::capture())
+}
+
+fn is_cc_compiler_invocation_for(args: &[String], env: &invocation::InvocationEnv) -> bool {
+    if compiler::is_passthrough_compiler_invocation_for(args, env) {
         return false;
     }
-    if compiler::is_workspace_wrapper_chain(args) {
+    if compiler::is_workspace_wrapper_chain_for(args, env) {
         return false;
     }
-    compiler::detect_compiler(args).is_some_and(|adapter| adapter.id() == compiler::cc::CC_ID)
+    compiler::detect_compiler_for(args, env)
+        .is_some_and(|adapter| adapter.id() == compiler::cc::CC_ID)
 }
 
 /// Run a Cargo `RUSTC_WRAPPER + RUSTC_WORKSPACE_WRAPPER` chain uncached while
@@ -1584,12 +1591,17 @@ fn preserve_workspace_wrapper_incremental(
     preserve_requested && !extra_inputs_active
 }
 
-fn run_workspace_wrapper_chain(config: &config::Config, args: &[String]) -> Result<i32> {
-    let parsed = args::RustcArgs::parse(args).context("parsing workspace-wrapper rustc chain")?;
+fn run_workspace_wrapper_chain_for(
+    config: &config::Config,
+    args: &[String],
+    env: &invocation::InvocationEnv,
+) -> Result<i32> {
+    let parsed =
+        args::RustcArgs::parse_for(args, env).context("parsing workspace-wrapper rustc chain")?;
     let extra_inputs = wrapper::resolve_extra_inputs_for_passthrough(config, &parsed)?;
     let preserve_incremental =
         preserve_workspace_wrapper_incremental(config.preserve_incremental, extra_inputs.is_some());
-    let exit = run_compiler_directly(config, args, preserve_incremental)?;
+    let exit = run_compiler_directly_for(config, args, preserve_incremental, env)?;
     if exit == 0 {
         wrapper::complete_current_extra_inputs_after_success(
             config,
@@ -1600,7 +1612,20 @@ fn run_workspace_wrapper_chain(config: &config::Config, args: &[String]) -> Resu
     Ok(exit)
 }
 
+#[cfg(test)]
 fn run_compiler_process_directly(args: &[String], preserve_incremental: bool) -> Result<i32> {
+    run_compiler_process_directly_for(
+        args,
+        preserve_incremental,
+        &invocation::InvocationEnv::capture(),
+    )
+}
+
+fn run_compiler_process_directly_for(
+    args: &[String],
+    preserve_incremental: bool,
+    env: &invocation::InvocationEnv,
+) -> Result<i32> {
     // A previous cache-on build may have restored this crate's outputs
     // as read-only hardlinks into the store (0o444, shared inode).
     // Running the real compiler over them in place would fail with
@@ -1615,7 +1640,7 @@ fn run_compiler_process_directly(args: &[String], preserve_incremental: bool) ->
     // not rustc's one-argument-per-line format. Their direct passthrough must
     // therefore remain byte-for-byte argv transport.
     let configured_rustc = args.first().is_some_and(|program| {
-        std::env::var_os("RUSTC")
+        env.var_os("RUSTC")
             .is_some_and(|rustc| rustc == std::ffi::OsStr::new(program.as_str()))
     });
     let is_nvcc = args
@@ -1624,24 +1649,36 @@ fn run_compiler_process_directly(args: &[String], preserve_incremental: bool) ->
         .map(compiler::strip_windows_exe_suffix)
         .is_some_and(|name| name.eq_ignore_ascii_case("nvcc"));
     let rustc_invocation =
-        !is_nvcc && (configured_rustc || rustc_args_for_direct_preclean(args).is_some());
+        !is_nvcc && (configured_rustc || rustc_args_for_direct_preclean_for(args, env).is_some());
     if !rustc_invocation {
-        let program = compiler::resolve_program_on_path(&args[0])
-            .unwrap_or_else(|| std::path::PathBuf::from(&args[0]));
-        let status = std::process::Command::new(program)
-            .args(&args[1..])
-            .status()?;
+        let status = invocation::io::status(env.command(&args[0])?.args(&args[1..]))?;
         return Ok(status.code().unwrap_or(1));
     }
 
     // C/C++ output paths have compiler-specific symlink, hardlink, device,
     // and read-only behavior (#645). Only rustc-shaped invocations may remove
     // previous read-only cache restores before compiling.
-    let parsed = args::RustcArgs::parse(args).ok();
+    let parsed = args::RustcArgs::parse_for(args, env).ok();
     if let Some(parsed) = &parsed {
+        let output = parsed
+            .output
+            .as_deref()
+            .map(|path| {
+                env.resolve(path)
+                    .context("resolving direct rustc output path")
+            })
+            .transpose()?;
+        let out_dir = parsed
+            .out_dir
+            .as_deref()
+            .map(|path| {
+                env.resolve(path)
+                    .context("resolving direct rustc output directory")
+            })
+            .transpose()?;
         compile::pre_clean_outputs(
-            parsed.output.as_deref(),
-            parsed.out_dir.as_deref(),
+            output.as_deref(),
+            out_dir.as_deref(),
             parsed.crate_name.as_deref(),
             parsed.extra_filename.as_deref(),
             &parsed.emit,
@@ -1684,7 +1721,10 @@ fn run_compiler_process_directly(args: &[String], preserve_incremental: bool) ->
         .as_ref()
         .is_some_and(args::RustcArgs::has_expanded_argfiles)
     {
-        match compile::RustcResponseFile::new(compiler_args.iter().map(|arg| arg.as_str())) {
+        match compile::RustcResponseFile::new_in(
+            env.temp_dir(),
+            compiler_args.iter().map(|arg| arg.as_str()),
+        ) {
             Ok(response) => Some(response),
             Err(error) => {
                 if compiler_args_changed {
@@ -1701,9 +1741,10 @@ fn run_compiler_process_directly(args: &[String], preserve_incremental: bool) ->
     } else {
         None
     };
-    let program = compiler::resolve_program_on_path(&args[0])
+    let program = env
+        .resolve_program(std::path::Path::new(&args[0]))
         .unwrap_or_else(|| std::path::PathBuf::from(&args[0]));
-    let mut invocation_env = invocation::InvocationEnv::capture();
+    let mut invocation_env = env.clone();
     if !incremental_preserved {
         invocation_env.set("CARGO_INCREMENTAL", "0");
     }
@@ -1726,14 +1767,22 @@ fn run_compiler_process_directly(args: &[String], preserve_incremental: bool) ->
     } else {
         command.args(&compiler_args);
     }
-    let status = command.status()?;
+    let status = invocation::io::status(&mut command)?;
     Ok(status.code().unwrap_or(1))
 }
 
+#[cfg(test)]
 fn rustc_args_for_direct_preclean(args: &[String]) -> Option<&[String]> {
+    rustc_args_for_direct_preclean_for(args, &invocation::InvocationEnv::capture())
+}
+
+fn rustc_args_for_direct_preclean_for<'a>(
+    args: &'a [String],
+    env: &invocation::InvocationEnv,
+) -> Option<&'a [String]> {
     if compiler::rustc::RustcCompiler::recognizes(args) {
         Some(args)
-    } else if compiler::is_workspace_wrapper_chain(args) {
+    } else if compiler::is_workspace_wrapper_chain_for(args, env) {
         Some(&args[1..])
     } else {
         None
@@ -1768,14 +1817,50 @@ enum WrapperTarget {
 }
 
 fn run_wrapper_mode(args: &[String]) -> Result<()> {
+    let context = invocation::InvocationContext {
+        env: invocation::InvocationEnv::capture(),
+        io: invocation::io::InvocationIo::capture(),
+        cancellation: None,
+        started_at: opcounts::process_start().unwrap_or_else(std::time::Instant::now),
+        shim_stem: std::env::current_exe()
+            .ok()
+            .and_then(|path| {
+                path.file_stem()
+                    .map(|stem| stem.to_string_lossy().into_owned())
+            })
+            .unwrap_or_else(|| "kache".to_owned()),
+    };
+    let exit = run_compiler_invocation(args, context)?;
+    std::process::exit(exit);
+}
+
+fn run_compiler_invocation(args: &[String], context: invocation::InvocationContext) -> Result<i32> {
+    let _cancellation = invocation::process::CancellationScope::enter(context.cancellation.clone());
+    invocation::process::check()?;
+    context.env.validate()?;
+    let result = run_compiler_invocation_inner(args, context);
+    invocation::process::check()?;
+    result
+}
+
+fn run_compiler_invocation_inner(
+    args: &[String],
+    context: invocation::InvocationContext,
+) -> Result<i32> {
+    let invocation::InvocationContext {
+        mut env,
+        started_at,
+        shim_stem,
+        io,
+        cancellation: _,
+    } = context;
+    let _io = invocation::io::InvocationIoScope::enter(io);
     let _alias_state = out_dir_alias::InvocationAliasScope::enter();
     let _key_state = cache_key::InvocationKeyScope::enter();
-    let _wrapper_state = wrapper::InvocationWrapperScope::enter();
+    let _wrapper_state = wrapper::InvocationWrapperScope::enter_for(&env);
     let _heartbeat = heartbeat::InvocationHeartbeatScope::enter();
     let _restore_policy = link::InvocationLinkScope::enter();
-    let _accounting = opcounts::InvocationScope::enter(
-        opcounts::process_start().unwrap_or_else(std::time::Instant::now),
-    );
+    let _accounting = opcounts::InvocationScope::enter(started_at);
     // Re-entrancy guard. If a child compiler kache spawns is itself a
     // kache wrapper — e.g. `cc` on PATH shadowed by `kache cc` — the
     // nested invocation must run the real compiler directly instead of
@@ -1783,30 +1868,22 @@ fn run_wrapper_mode(args: &[String]) -> Result<()> {
     // spawning any child, so a wrapper that already sees it set knows
     // it is nested. This runs before the `disabled` check below, so
     // the loop is broken even when caching is turned off.
-    if let Some(above) = wrappers_above(std::env::var_os(KACHE_ACTIVE_ENV).as_deref()) {
+    if let Some(above) = wrappers_above(env.var_os(KACHE_ACTIVE_ENV).as_deref()) {
         // The compiler run here can itself be a kache shim that nothing
         // identified. Counting the depth ends that loop at a fixed bound.
         check_wrapper_depth(above, args.first().map(String::as_str))?;
-        // SAFETY: as below, no thread has been spawned yet.
-        unsafe {
-            std::env::set_var(KACHE_ACTIVE_ENV, next_wrapper_depth(above).to_string());
-        }
-        let config = config::Config::load()?;
+        env.set(KACHE_ACTIVE_ENV, next_wrapper_depth(above).to_string());
+        let config = config::Config::load_for(&env)?;
         // No preservation here: the outer kache already applied the
         // incremental policy, and `isolate_incremental_flags` is
         // not idempotent — a second rewrite would relocate the state to a
         // `.kache-preserved.kache-preserved` sibling nothing else reuses.
-        std::process::exit(run_compiler_directly(&config, args, false)?);
+        return run_compiler_directly_for(&config, args, false, &env);
     }
-    // SAFETY: wrapper startup is single-threaded — no threads are
-    // spawned before this point — so mutating the process environment
-    // here is free of data races. Children inherit KACHE_ACTIVE, and a
-    // nested kache hits the guard above.
-    unsafe {
-        std::env::set_var(KACHE_ACTIVE_ENV, "1");
-    }
+    // Every compiler child gets this request's re-entrancy depth.
+    env.set(KACHE_ACTIVE_ENV, "1");
 
-    let config = config::Config::load()?;
+    let config = config::Config::load_for(&env)?;
     let _pressure =
         scheduler::pressure::InvocationPressureScope::enter(config.scheduler_memory_pressure);
 
@@ -1814,11 +1891,7 @@ fn run_wrapper_mode(args: &[String]) -> Result<()> {
         // Caching off — pass straight through to the real compiler. The
         // per-crate force list is a managed-cache policy and is inactive here;
         // only the explicit global preservation mode may retain incremental.
-        std::process::exit(run_compiler_directly(
-            &config,
-            args,
-            config.preserve_incremental,
-        )?);
+        return run_compiler_directly_for(&config, args, config.preserve_incremental, &env);
     }
 
     // Compiler-family probe (`kache -E <file>` from the `cc` Rust
@@ -1827,34 +1900,30 @@ fn run_wrapper_mode(args: &[String]) -> Result<()> {
     // `cc` so the cc crate sees the real underlying compiler's
     // preprocessor output.
     if compiler::cc::CcCompiler::recognizes_family_probe(args) {
-        std::process::exit(wrapper::run_cc_probe(args)?);
+        return wrapper::run_cc_probe_for(args, &env, &shim_stem);
     }
 
-    if compiler::is_workspace_wrapper_chain(args)
-        && !compiler::is_cacheable_workspace_wrapper_chain(args)
+    if compiler::is_workspace_wrapper_chain_for(args, &env)
+        && !compiler::is_cacheable_workspace_wrapper_chain_for(args, &env)
     {
         tracing::debug!(
             program = ?args.first(),
             "workspace-wrapper chain is uncached; retaining extra-input Cargo freshness"
         );
-        std::process::exit(run_workspace_wrapper_chain(&config, args)?);
+        return run_workspace_wrapper_chain_for(&config, args, &env);
     }
 
-    let direct_passthrough = compiler::is_passthrough_compiler_invocation(args)
+    let direct_passthrough = compiler::is_passthrough_compiler_invocation_for(args, &env)
         && !compiler::rustc::RustcCompiler::recognizes(args);
     if direct_passthrough {
         tracing::debug!(
             program = ?args.first(),
             "compiler has no cache adapter; passing through uncached"
         );
-        std::process::exit(run_compiler_directly(
-            &config,
-            args,
-            config.preserve_incremental,
-        )?);
+        return run_compiler_directly_for(&config, args, config.preserve_incremental, &env);
     }
 
-    let Some(adapter) = compiler::detect_compiler(args) else {
+    let Some(adapter) = compiler::detect_compiler_for(args, &env) else {
         anyhow::bail!(
             "wrapper-mode dispatched but no compiler adapter matched argv[0] = {:?}",
             args.first()
@@ -1864,28 +1933,26 @@ fn run_wrapper_mode(args: &[String]) -> Result<()> {
         Some(WrapperTarget::Rustc) => {
             // Cargo's first call for a target directory it has not built:
             // let the daemon copy registry units in before Cargo looks.
-            target_seed::before_probe(&config, args);
+            target_seed::before_probe_for(&config, args, &env);
             // Started here so the trace also covers the OUT_DIR alias check.
-            let trace = phase_trace::start("rustc", args);
-            // Still single-threaded, like the KACHE_ACTIVE write above:
-            // `apply` may change OUT_DIR and the vars under it.
-            let exit = match out_dir_alias::apply(&config, args) {
+            let trace = phase_trace::start_for("rustc", args, &env);
+            let exit = match out_dir_alias::apply_for(&config, args, &mut env) {
                 Some(exit) => exit,
-                None => wrapper::run(&config, args)?,
+                None => wrapper::run_for(&config, args, &env)?,
             };
             drop(trace);
             exit
         }
-        Some(WrapperTarget::Rustdoc) => compiler::rustdoc::run(&config, args)?,
-        Some(WrapperTarget::Cc) => wrapper::run_cc(&config, args)?,
-        Some(WrapperTarget::Nvcc) => wrapper::run_nvcc(&config, args)?,
+        Some(WrapperTarget::Rustdoc) => compiler::rustdoc::run_for(&config, args, &env)?,
+        Some(WrapperTarget::Cc) => wrapper::run_cc_for(&config, args, &env)?,
+        Some(WrapperTarget::Nvcc) => wrapper::run_nvcc_for(&config, args, &env)?,
         None => anyhow::bail!(
             "detected compiler adapter {} ({}) has no wrapper dispatch",
             adapter.id(),
             adapter.display_name()
         ),
     };
-    std::process::exit(exit_code);
+    Ok(exit_code)
 }
 
 /// What `kache clean --cache` removes, from its hidden flags.
@@ -2020,7 +2087,156 @@ fn daemon_restart_message(was_running: bool, ready: bool) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cancelled_invocation_stops_before_dispatch() {
+        let cancellation = invocation::process::Cancellation::default();
+        cancellation.cancel();
+        let error = run_compiler_invocation(
+            &["missing-compiler".into()],
+            invocation::InvocationContext {
+                env: invocation::InvocationEnv::default(),
+                io: invocation::io::InvocationIo::process(),
+                cancellation: Some(cancellation),
+                started_at: std::time::Instant::now(),
+                shim_stem: "kache".into(),
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::Interrupted
+        );
+        invocation::process::check().unwrap();
+    }
+
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn compiler_entry_returns_each_clients_status_and_restores_request_state() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|threads| {
+            for (root, client, nested, code) in [
+                (first.path(), "first", true, 17),
+                (second.path(), "second", false, 31),
+            ] {
+                std::fs::create_dir(root.join("bin")).unwrap();
+                std::fs::write(root.join(".kache.toml"), "").unwrap();
+                std::fs::write(root.join("lib.rs"), "pub fn value() {}\n").unwrap();
+                for name in ["rustc", "cc-probe"] {
+                    kache_fs::testutil::write_executable(
+                        &root.join("bin").join(name),
+                        "#!/bin/sh\nif [ \"$1\" != -E ]; then [ ! -e unit.rlib ] || exit 91; printf '%s' \"$CLIENT\" > unit.rlib; fi\nprintf '%s|%s|%s|%s' \"$CLIENT\" \"$KACHE_ACTIVE\" \"$CARGO_INCREMENTAL\" \"$PWD\" > observed-env\nexit \"$CLIENT_EXIT\"\n",
+                    );
+                }
+                let barrier = &barrier;
+                threads.spawn(move || {
+                    let physical_root = std::fs::canonicalize(root).unwrap();
+                    let _parent = wrapper::InvocationWrapperScope::enter();
+                    demand::record(client);
+                    verify_compare::record_report(client.to_owned());
+                    let make_env = |disabled: bool| {
+                        let mut env = invocation::InvocationEnv::from_parts(
+                            [
+                                ("PATH", "bin"),
+                                ("CLIENT", client),
+                                ("CARGO_INCREMENTAL", "1"),
+                                ("KACHE_PRESERVE_INCREMENTAL", "0"),
+                            ],
+                            Some(root.to_owned()),
+                            Some(root.to_owned()),
+                            root.to_owned(),
+                        );
+                        env.set("KACHE_DISABLED", if disabled { "1" } else { "0" });
+                        env.set("KACHE_CONFIG", root.join(".kache.toml"));
+                        env.set("KACHE_CACHE_DIR", root.join("cache"));
+                        env.set("KACHE_RUNTIME_DIR", root.join("runtime"));
+                        env
+                    };
+                    barrier.wait();
+                    for iteration in 0..2 {
+                        let mut env = make_env(true);
+                        if nested {
+                            env.set(KACHE_ACTIVE_ENV, "2");
+                        }
+                        env.set("CLIENT_EXIT", (code + iteration).to_string());
+                        std::fs::write(root.join("unit.rlib"), "old restore").unwrap();
+                        std::fs::set_permissions(
+                            root.join("unit.rlib"),
+                            std::fs::Permissions::from_mode(0o444),
+                        )
+                        .unwrap();
+                        let result = run_compiler_invocation(
+                            &argv(&[
+                                "rustc",
+                                "--crate-name",
+                                "demo",
+                                "--crate-type",
+                                "lib",
+                                "lib.rs",
+                                "-o",
+                                "unit.rlib",
+                            ]),
+                            invocation::InvocationContext {
+                                env: env.clone(),
+                                io: invocation::io::InvocationIo::capture(),
+                                cancellation: None,
+                                started_at: std::time::Instant::now(),
+                                shim_stem: "client-kache".into(),
+                            },
+                        )
+                        .unwrap();
+                        assert_eq!(result, code + iteration);
+                        assert_eq!(
+                            std::fs::read_to_string(root.join("observed-env")).unwrap(),
+                            format!(
+                                "{client}|{}|0|{}",
+                                if nested { "3" } else { "1" },
+                                physical_root.display()
+                            )
+                        );
+                        assert_eq!(
+                            std::fs::read_to_string(root.join("unit.rlib")).unwrap(),
+                            client
+                        );
+                        assert_eq!(
+                            env.var_os(KACHE_ACTIVE_ENV),
+                            nested.then(|| std::ffi::OsString::from("2"))
+                        );
+                    }
+                    let mut env = make_env(false);
+                    env.set("CC", "client-kache cc-probe");
+                    env.set("CLIENT_EXIT", "43");
+                    assert_eq!(
+                        run_compiler_invocation(
+                            &argv(&["-E", "input.c"]),
+                            invocation::InvocationContext {
+                                env,
+                                io: invocation::io::InvocationIo::capture(),
+                                cancellation: None,
+                                started_at: std::time::Instant::now(),
+                                shim_stem: "client-kache".into(),
+                            }
+                        )
+                        .unwrap(),
+                        43
+                    );
+                    assert_eq!(
+                        std::fs::read_to_string(root.join("observed-env")).unwrap(),
+                        format!("{client}|1|1|{}", physical_root.display())
+                    );
+                    let demands = demand::take();
+                    assert_eq!(demands.len(), 1);
+                    assert_eq!(demands[0].cache_key, client);
+                    assert_eq!(verify_compare::take_last_report(), client);
+                });
+            }
+        });
+    }
 
     #[cfg(unix)]
     fn write_success_program(path: &std::path::Path) {
@@ -2908,10 +3124,11 @@ mod tests {
             wrapper_target(adapter_for(&["nvcc", "-c", "kernel.cu"])),
             Some(WrapperTarget::Nvcc)
         );
-        let unknown =
-            compiler::CompilerAdapter::new(compiler::CompilerId::new("unwired"), "unwired", |_| {
-                false
-            });
+        let unknown = compiler::CompilerAdapter::new(
+            compiler::CompilerId::new("unwired"),
+            "unwired",
+            |_, _| false,
+        );
         assert_eq!(wrapper_target(&unknown), None);
     }
 

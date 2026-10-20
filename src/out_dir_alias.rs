@@ -897,33 +897,10 @@ fn replace_plan(plan: Option<Plan>) {
     });
 }
 
-/// Record evidence, run the tripwire, decide, and point `OUT_DIR` and every
-/// value under it at the alias. Must run while the wrapper is still single
-/// threaded: it changes the process environment. `Some(exit code)` means the
-/// compile must not run.
-///
-/// With the alias off, only the decision is skipped. Libs built while it was
-/// on keep their alias until they rebuild, so the tripwire, the stale marker
-/// and the failure hint still apply to them.
-pub(crate) fn apply(config: &Config, wrapper_args: &[String]) -> Option<i32> {
-    let mut env = InvocationEnv::capture();
-    let before: Vec<_> = env.vars_os().collect();
-    let exit = apply_for(config, wrapper_args, &mut env);
-    for (name, value) in env.vars_os() {
-        if before
-            .iter()
-            .any(|(key, previous)| key == &name && previous == &value)
-        {
-            continue;
-        }
-        // SAFETY: this adapter runs at wrapper startup before threads exist.
-        unsafe { std::env::set_var(name, value) };
-    }
-    exit
-}
-
 /// Apply alias decisions and raw environment rewrites to one invocation.
 /// A daemon worker must hold an InvocationAliasScope through compile/store.
+/// Existing aliases still get tripwire and stale-marker checks when aliasing
+/// is disabled. `Some(exit code)` means the compile must not run.
 pub(crate) fn apply_for(
     config: &Config,
     wrapper_args: &[String],
@@ -948,7 +925,7 @@ fn apply_after_host_check(
     let args = compiler.parse(wrapper_args).ok()?;
     let cache_dir = invocation.resolve(&config.cache_dir)?;
     let root = alias_root(&cache_dir)?;
-    if let Some(code) = checks_before_decision(&args, &root, &mut std::io::stderr()) {
+    if let Some(code) = checks_before_decision(&args, &root, &mut crate::invocation::io::stderr()) {
         return Some(code);
     }
     if !config.out_dir_alias {
@@ -1098,7 +1075,7 @@ pub(crate) fn after_failed_compile(stderr: &str, externs: &[ExternDep]) {
     let own = plan.alias.as_ref().map(|(_, unit_dir)| unit_dir.as_str());
     let externs = rooted_externs(externs, &plan.invocation_env);
     if let Some(hint) = failure_hint(stderr, &externs, &plan.root, own) {
-        eprintln!("{hint}");
+        let _ = writeln!(crate::invocation::io::stderr(), "{hint}");
     }
 }
 

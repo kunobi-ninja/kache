@@ -47,6 +47,7 @@
 //!   never collapses to the unconfigured key).
 
 use crate::cache_key::FileHasher;
+use crate::invocation::InvocationEnv;
 use anyhow::{Context, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
@@ -150,7 +151,7 @@ struct ColocatedConfig {
 /// One invocation's fully-resolved extra-input declaration.
 ///
 /// The wrapper resolves this once, passes [`Self::digest`] into key
-/// computation, then uses [`Self::merge_into_dep_info`] on the consumer-facing
+/// computation, then uses [`Self::merge_into_dep_info_for`] on the consumer-facing
 /// dep-info after either compilation or restore. Paths are those of the
 /// current consumer worktree; nothing in this value comes from a cached
 /// producer.
@@ -244,22 +245,30 @@ impl ExtraInputsSnapshot {
         self.digest.as_deref()
     }
 
-    /// Merge config, matched files, and narrow directory watches into the
-    /// first dependency rule of a rustc/Cargo dep-info file.
-    ///
-    /// Only consumer-facing dep-info should be passed here (after a cache
-    /// store/restore boundary), so a restored file never retains a producer's
-    /// absolute worktree paths. Current-consumer paths are emitted absolute so
-    /// Cargo resolves them correctly even when rustc runs from a workspace root.
+    #[cfg(test)]
     pub(crate) fn merge_into_dep_info(&self, dep_info_path: &Path) -> Result<()> {
-        merge_snapshot_into_dep_info(self, dep_info_path)
+        self.merge_into_dep_info_for(dep_info_path, &InvocationEnv::capture())
     }
 
-    /// Pure form used by cache restore: complete and validate the expanded
-    /// consumer bytes before any cached artifact is materialized or reported
-    /// as a hit.
-    pub(crate) fn merge_dep_info_content(&self, content: &str) -> Result<String> {
-        merge_snapshot_dep_info_content(self, content)
+    /// Complete the consumer's Cargo dependency rule using its working directory.
+    /// Added paths are absolute; cached producer dep-info stays untouched.
+    pub(crate) fn merge_into_dep_info_for(
+        &self,
+        dep_info_path: &Path,
+        env: &InvocationEnv,
+    ) -> Result<()> {
+        let path = env
+            .resolve(dep_info_path)
+            .context("resolving consumer dep-info path")?;
+        let cwd = env
+            .cwd()
+            .context("resolving compiler working directory for extra_inputs dep-info")?;
+        merge_snapshot_into_dep_info(self, &path, cwd)
+    }
+
+    /// Validate and complete consumer bytes before materializing a cache hit.
+    pub(crate) fn merge_dep_info_content_for(&self, content: &str, cwd: &Path) -> Result<String> {
+        merge_snapshot_dep_info_content(self, content, cwd)
     }
 }
 
@@ -398,7 +407,8 @@ fn resolve_workspace_snapshot(
         return Ok(None);
     };
 
-    let active_config = crate::config::resolve_config_path();
+    let env = args.invocation_env();
+    let active_config = crate::config::resolve_config_path_for(env)?;
     if active_config.file_name().and_then(|name| name.to_str()) != Some(".kache.toml") {
         return Ok(None);
     }
@@ -442,12 +452,6 @@ fn resolve_workspace_snapshot(
         );
     }
 
-    let active_config = std::path::absolute(&active_config).with_context(|| {
-        format!(
-            "resolving workspace extra_inputs config path {}",
-            active_config.display()
-        )
-    })?;
     let Some(workspace_root) = active_config.parent().map(lexical_normalize) else {
         anyhow::bail!(
             "workspace extra_inputs config {} has no workspace-root parent",
@@ -463,10 +467,11 @@ fn resolve_workspace_snapshot(
         );
     }
 
-    let source_file = absolute_source_file(source_file)?;
-    let manifest_dir = std::env::var_os("CARGO_MANIFEST_DIR")
+    let source_file = absolute_source_file(source_file, env)?;
+    let manifest_dir = env
+        .var_os("CARGO_MANIFEST_DIR")
         .map(PathBuf::from)
-        .and_then(|path| std::path::absolute(path).ok())
+        .and_then(|path| env.resolve(&path))
         .map(|path| lexical_normalize(&path));
     if !workspace_invocation_in_scope(&source_file, manifest_dir.as_deref(), &workspace_root) {
         // A user/global `KACHE_CONFIG` may contain the schema, but it must
@@ -588,7 +593,15 @@ fn resolve_workspace_snapshot(
     }
 
     for external in &args.externs {
-        let Some(identity) = external.path.as_deref().and_then(cargo_artifact_identity) else {
+        let path = external
+            .path
+            .as_deref()
+            .map(|path| {
+                env.resolve(path)
+                    .context("resolving workspace extra_inputs extern artifact")
+            })
+            .transpose()?;
+        let Some(identity) = path.as_deref().and_then(cargo_artifact_identity) else {
             if providers_by_crate.contains_key(&normalize_crate_name(&external.name)) {
                 anyhow::bail!(
                     "workspace.extra_inputs cannot attribute --extern {} without a parseable Cargo artifact path; rebuild the selected provider once and retry",
@@ -600,7 +613,8 @@ fn resolve_workspace_snapshot(
         let Some(candidates) = providers_by_crate.get(&identity.crate_name) else {
             continue;
         };
-        let Some((provider, observation)) = resolve_artifact_provider(&identity, candidates)?
+        let Some((provider, observation)) =
+            resolve_artifact_provider_for(&identity, candidates, env)?
         else {
             continue;
         };
@@ -837,9 +851,18 @@ fn cargo_artifact_identity(path: &Path) -> Option<CargoArtifactIdentity> {
     })
 }
 
+#[cfg(test)]
 fn resolve_artifact_provider<'a>(
     identity: &CargoArtifactIdentity,
     candidates: &[&'a WorkspaceProviderSpec],
+) -> Result<Option<(&'a WorkspaceProviderSpec, InputObservation)>> {
+    resolve_artifact_provider_for(identity, candidates, &InvocationEnv::capture())
+}
+
+fn resolve_artifact_provider_for<'a>(
+    identity: &CargoArtifactIdentity,
+    candidates: &[&'a WorkspaceProviderSpec],
+    env: &InvocationEnv,
 ) -> Result<Option<(&'a WorkspaceProviderSpec, InputObservation)>> {
     let observation_before = observe_dependency(&identity.dep_info_path).with_context(|| {
         format!(
@@ -869,17 +892,14 @@ fn resolve_artifact_provider<'a>(
             identity.crate_name
         )
     })?;
-    let cwd = std::env::current_dir().context("resolving producer dep-info dependencies")?;
     let dependencies: BTreeSet<PathBuf> = dependencies
         .into_iter()
         .map(|path| {
-            if path.is_absolute() {
-                lexical_normalize(&path)
-            } else {
-                anchor_input_path(&cwd, &path)
-            }
+            env.resolve(&path)
+                .map(|path| lexical_normalize(&path))
+                .context("resolving producer dep-info dependencies")
         })
-        .collect();
+        .collect::<Result<_>>()?;
     let source_matches: Vec<_> = candidates
         .iter()
         .copied()
@@ -995,14 +1015,10 @@ fn load_workspace_packages(
     Ok(packages)
 }
 
-fn absolute_source_file(source_file: &Path) -> Result<PathBuf> {
-    let absolute = if source_file.is_absolute() {
-        source_file.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .context("resolving rustc source file from current directory")?
-            .join(source_file)
-    };
+fn absolute_source_file(source_file: &Path, env: &InvocationEnv) -> Result<PathBuf> {
+    let absolute = env
+        .resolve(source_file)
+        .context("resolving rustc source file from invocation directory")?;
     Ok(lexical_normalize(&absolute))
 }
 
@@ -1139,13 +1155,13 @@ pub(crate) fn apply_extra_inputs(
 /// relative source path is anchored there. Returns `None` outside cargo's
 /// layout (bare `rustc`/`cc` with no enclosing crate) — the feature is then a
 /// no-op.
+#[cfg(test)]
 fn crate_dir_from_source(source_file: &Path) -> Option<PathBuf> {
-    let cwd = std::env::current_dir().ok();
-    let absolute = if source_file.is_absolute() {
-        source_file.to_path_buf()
-    } else {
-        cwd?.join(source_file)
-    };
+    crate_dir_from_source_for(source_file, &InvocationEnv::capture())
+}
+
+fn crate_dir_from_source_for(source_file: &Path, env: &InvocationEnv) -> Option<PathBuf> {
+    let absolute = env.resolve(source_file)?;
 
     let mut dir = absolute.parent();
     while let Some(d) = dir {
@@ -1214,7 +1230,8 @@ fn resolve_snapshot(
     let Some(source_file) = source_file else {
         return Ok(None);
     };
-    let Some(crate_dir) = crate_dir_from_source(source_file) else {
+    let Some(crate_dir) = crate_dir_from_source_for(source_file, file_hasher.invocation_env())
+    else {
         return Ok(None);
     };
     let crate_dir = lexical_normalize(&crate_dir);
@@ -1394,7 +1411,12 @@ fn resolve_declared_inputs(
                  Cargo cannot derive a bounded watch root that sees new matches"
             );
         }
-        if let Some(normalized) = normalize_pattern_info(crate_name, &crate_dir, pattern) {
+        if let Some(normalized) = normalize_pattern_info(
+            crate_name,
+            &crate_dir,
+            pattern,
+            file_hasher.invocation_env(),
+        ) {
             by_glob.entry(normalized.glob.clone()).or_insert(normalized);
         } else {
             rejected_patterns.push(pattern);
@@ -1716,15 +1738,18 @@ fn crate_relative_path(crate_dir: &Path, path: &Path) -> String {
 /// choice, but it makes the key host-/layout-specific.
 #[cfg(test)]
 fn normalize_pattern(crate_name: &str, crate_dir: &Path, pattern: &str) -> Option<String> {
-    normalize_pattern_info(crate_name, crate_dir, pattern).map(|pattern| pattern.glob)
+    normalize_pattern_info(crate_name, crate_dir, pattern, &InvocationEnv::capture())
+        .map(|pattern| pattern.glob)
 }
 
 fn normalize_pattern_info(
     crate_name: &str,
     crate_dir: &Path,
     pattern: &str,
+    env: &InvocationEnv,
 ) -> Option<NormalizedInputPattern> {
-    let (normalized, unset_vars) = crate::config::expand_exclude_pattern_collecting(pattern);
+    let (normalized, unset_vars) =
+        crate::config::expand_exclude_pattern_collecting_for(pattern, env);
 
     // An unset `$VAR` in a pattern is the one failure mode the rest of this
     // module handles loudly but this path used to swallow: the reference stays a
@@ -2122,6 +2147,7 @@ struct FirstMakeRule {
 fn merge_snapshot_into_dep_info(
     snapshot: &ExtraInputsSnapshot,
     dep_info_path: &Path,
+    compiler_cwd: &Path,
 ) -> Result<()> {
     let metadata = std::fs::metadata(dep_info_path).with_context(|| {
         format!(
@@ -2142,12 +2168,13 @@ fn merge_snapshot_into_dep_info(
             dep_info_path.display()
         )
     })?;
-    let updated = merge_snapshot_dep_info_content(snapshot, &original).with_context(|| {
-        format!(
-            "malformed consumer dep-info {} for active extra_inputs declaration",
-            dep_info_path.display()
-        )
-    })?;
+    let updated =
+        merge_snapshot_dep_info_content(snapshot, &original, compiler_cwd).with_context(|| {
+            format!(
+                "malformed consumer dep-info {} for active extra_inputs declaration",
+                dep_info_path.display()
+            )
+        })?;
     if updated == original {
         return Ok(());
     }
@@ -2162,6 +2189,7 @@ fn merge_snapshot_into_dep_info(
 fn merge_snapshot_dep_info_content(
     snapshot: &ExtraInputsSnapshot,
     original: &str,
+    compiler_cwd: &Path,
 ) -> Result<String> {
     tracing::trace!(
         "merging extra_inputs dep-info: {} normalized pattern(s), {} matched file(s), {} watch path(s)",
@@ -2175,11 +2203,13 @@ fn merge_snapshot_dep_info_content(
         .strip_prefix(':')
         .expect("first_make_dependency_rule points at a colon");
     let existing_words = parse_make_words(dependencies).context("parsing Cargo dependency rule")?;
-    let compiler_cwd = std::env::current_dir()
-        .context("resolving compiler working directory for extra_inputs dep-info")?;
+    anyhow::ensure!(
+        compiler_cwd.is_absolute(),
+        "extra_inputs dep-info requires an absolute invocation directory"
+    );
     let existing: BTreeSet<PathBuf> = existing_words
         .iter()
-        .map(|word| anchor_input_path(&compiler_cwd, Path::new(word)))
+        .map(|word| anchor_input_path(compiler_cwd, Path::new(word)))
         .collect();
 
     let mut dependency_paths = BTreeSet::new();
@@ -2802,6 +2832,111 @@ edition = "2021"
 "#,
         );
         (dir, provider, consumer, unlisted)
+    }
+
+    #[test]
+    fn concurrent_clients_resolve_workspace_inputs_and_dep_info_in_their_own_directory() {
+        let (first, _, _, _) = workspace_fixture(false);
+        let (second, _, _, _) = workspace_fixture(false);
+        std::fs::write(second.path().join("shared/value.txt"), "different bytes").unwrap();
+        let barrier = std::sync::Barrier::new(2);
+        let digests = std::thread::scope(|threads| {
+            let workers: Vec<_> = [first.path(), second.path()]
+                .into_iter()
+                .map(|root| {
+                    let barrier = &barrier;
+                    threads.spawn(move || {
+                        let env = InvocationEnv::from_parts(
+                            [
+                                ("KACHE_CONFIG", ".kache.toml"),
+                                ("CARGO_MANIFEST_DIR", "macro-provider"),
+                            ],
+                            Some(root.to_owned()),
+                            Some(root.to_owned()),
+                            root.to_owned(),
+                        );
+                        let args = crate::args::RustcArgs::parse_for(
+                            &[
+                                "rustc".into(),
+                                "--crate-name".into(),
+                                "macro_provider".into(),
+                                "--crate-type".into(),
+                                "lib".into(),
+                                "macro-provider/src/lib.rs".into(),
+                            ],
+                            &env,
+                        )
+                        .unwrap();
+                        barrier.wait();
+                        let snapshot = ExtraInputsSnapshot::resolve_for_rustc(
+                            &args,
+                            &FileHasher::new_for(&env),
+                        )
+                        .unwrap()
+                        .unwrap();
+                        assert_eq!(snapshot.matched_files, [root.join("shared/value.txt")]);
+                        let raw = "lib: shared/value.txt\n";
+                        let merged = snapshot.merge_dep_info_content_for(raw, root).unwrap();
+                        assert_eq!(
+                            merged.matches("shared/value.txt").count(),
+                            1,
+                            "the client's relative dependency is already present: {merged}"
+                        );
+                        assert!(merged.contains(
+                            &make_escape_word(&root.join(".kache.toml").to_string_lossy()).unwrap()
+                        ));
+                        std::fs::write(root.join("output.d"), raw).unwrap();
+                        snapshot
+                            .merge_into_dep_info_for(Path::new("output.d"), &env)
+                            .unwrap();
+                        assert_eq!(
+                            std::fs::read_to_string(root.join("output.d")).unwrap(),
+                            merged
+                        );
+                        snapshot.digest.unwrap()
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .map(|worker| worker.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_ne!(digests[0], digests[1]);
+    }
+
+    #[test]
+    fn legacy_pattern_expansion_uses_the_hashers_environment_snapshot() {
+        let (dir, _) = crate_fixture(&[
+            ("kache.toml", "extra_inputs = [\"$EXTRA_DIR/value.txt\"]"),
+            ("one/value.txt", "one"),
+            ("two/value.txt", "two"),
+        ]);
+        let make_env = |selection: &str| {
+            InvocationEnv::from_parts(
+                [("EXTRA_DIR", selection)],
+                Some(dir.path().to_owned()),
+                None,
+                dir.path().to_owned(),
+            )
+        };
+        let first = make_env("one");
+        let second = make_env("two");
+        let key = |env: &InvocationEnv| {
+            digest(
+                Some(Path::new("src/lib.rs")),
+                "x",
+                true,
+                &FileHasher::new_for(env),
+            )
+            .unwrap()
+        };
+        let before_first = key(&first);
+        let before_second = key(&second);
+        assert_ne!(before_first, before_second);
+        std::fs::write(dir.path().join("one/value.txt"), "changed").unwrap();
+        assert_ne!(before_first, key(&first));
+        assert_eq!(before_second, key(&second));
     }
 
     fn rustc_args(

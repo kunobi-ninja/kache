@@ -3,10 +3,8 @@
 //! While a cache-miss compile runs, the wrapper is otherwise silent until the
 //! compiler exits — for a long crate (Firefox's gkrust runs ~8 minutes) that
 //! reads as "kache hung" to users, TTY-throttling build drivers, and stderr
-//! parsers alike. This module makes the wait observable from the only process
-//! that can: the wrapper is the compiler child's parent AND the owner of the
-//! build's stderr (the daemon's stderr goes to its own log file, so it cannot
-//! speak to the user mid-build). A monitor thread ticks while the child runs
+//! parsers alike. The monitor borrows the compiler request's output channels;
+//! the daemon's own stderr remains separate. A monitor thread ticks while the child runs
 //! and, once per cadence:
 //!
 //! - with `KACHE_PROGRESS=verbose`, prints `[kache] still compiling <crate> —
@@ -146,10 +144,12 @@ pub fn start_monitor(crate_name: &str, pid: u32) -> Option<CompileMonitor> {
     let (wake_tx, wake_rx) = mpsc::channel::<()>();
     let (done_tx, done_rx) = mpsc::channel::<()>();
     let thread_stop = stop.clone();
+    let io = crate::invocation::io::current().borrow_for_monitor();
     let crate_name = crate_name.to_string();
     let _ = std::thread::Builder::new()
         .name("kache-heartbeat".into())
         .spawn(move || {
+            let _io = crate::invocation::io::InvocationIoScope::enter(io);
             monitor_loop(&ctx, &crate_name, pid, &thread_stop, &wake_rx);
             let _ = done_tx.send(());
         })

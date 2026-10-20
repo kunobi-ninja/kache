@@ -156,12 +156,16 @@ pub fn profile_from_rustc_args(args: &RustcArgs) -> String {
     {
         return profile;
     }
-    profile_from_env().unwrap_or_else(|| "unknown".to_string())
+    profile_from_invocation(args.invocation_env()).unwrap_or_else(|| "unknown".to_string())
 }
 
 pub fn profile_from_env() -> Option<String> {
+    profile_from_invocation(&crate::invocation::InvocationEnv::capture())
+}
+
+fn profile_from_invocation(env: &crate::invocation::InvocationEnv) -> Option<String> {
     for var in ["KACHE_PROFILE", "PROFILE"] {
-        if let Ok(value) = std::env::var(var) {
+        if let Ok(value) = env.var(var) {
             let trimmed = value.trim();
             if !trimmed.is_empty() {
                 return Some(trimmed.to_string());

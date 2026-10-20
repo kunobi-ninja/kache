@@ -44,6 +44,7 @@
 //!   SDKROOT half of #78 is handled: the Apple SDK path is mapped to the
 //!   `/kache/sdkroot` prefix-map target ([`CC_SDKROOT_SENTINEL`]).
 
+use crate::invocation::process::CommandExt as _;
 use anyhow::{Context, Result};
 use regex::Regex;
 use std::cell::{Cell, RefCell};
@@ -127,7 +128,7 @@ impl ToolFamily {
 
 pub const CC_ID: CompilerId = CompilerId::new("cc");
 pub const ADAPTER: CompilerAdapter =
-    CompilerAdapter::new(CC_ID, "C-family compiler", CcCompiler::recognizes);
+    CompilerAdapter::new(CC_ID, "C-family compiler", CcCompiler::recognizes_for);
 
 /// What stage the compiler is being asked to produce.
 ///
@@ -663,6 +664,7 @@ static CC_ARG_SPECS: &[CcArgSpec] = &[
 ];
 
 impl CcArgs {
+    #[cfg(test)]
     pub fn parse(args: &[String]) -> Result<Self> {
         Self::parse_for(args, &InvocationEnv::capture())
     }
@@ -2235,7 +2237,7 @@ fn preprocess_hash(
             command.env("SOURCE_DATE_EPOCH", epoch);
         }
         command
-            .output()
+            .invocation_output()
             .with_context(|| format!("running preprocessor `{}`", parsed.program))
     };
     let mut output = run(&pp_args)?;
@@ -6669,7 +6671,7 @@ fn cc_direct_probe(program: &str, env: &InvocationEnv) -> bool {
         .current_dir(root)
         // A kache shim standing in for the compiler must run it, not key it.
         .env("KACHE_CC_KEY_PROBE", "1")
-        .output();
+        .invocation_output();
     let Ok(output) = output else {
         return false;
     };
@@ -6802,14 +6804,14 @@ fn named_tool_family(name: &str) -> Option<ToolFamily> {
     })
 }
 
-fn is_unresolvable_bare_program(program: &str) -> bool {
+fn is_unresolvable_bare_program(program: &str, env: &InvocationEnv) -> bool {
     if program.contains('/') {
         return false;
     }
     if program.contains('\\') {
         return false;
     }
-    super::resolve_program_on_path(program).is_none()
+    env.resolve_program(Path::new(program)).is_none()
 }
 
 impl Default for CcCompiler {
@@ -6827,8 +6829,12 @@ impl CcCompiler {
     /// Construct with a user-declared cc flag allow-list (issue #95),
     /// typically `config.cc_extra_allowlist_flags`.
     pub fn with_extra_allowlist_flags(extra_allowlist_flags: Vec<String>) -> Self {
+        Self::for_invocation(extra_allowlist_flags, &InvocationEnv::capture())
+    }
+
+    pub(crate) fn for_invocation(extra_allowlist_flags: Vec<String>, env: &InvocationEnv) -> Self {
         Self {
-            invocation_env: InvocationEnv::capture(),
+            invocation_env: env.clone(),
             extra_allowlist_flags,
             cache_cc_links: false,
             base_dirs: Vec::new(),
@@ -6838,6 +6844,7 @@ impl CcCompiler {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn with_invocation_env(mut self, env: &InvocationEnv) -> Self {
         self.invocation_env = env.clone();
         self
@@ -7023,7 +7030,11 @@ impl CcCompiler {
     /// Owns its own detection rule; `super::detect_compiler` reaches it
     /// through this module's [`ADAPTER`] descriptor.
     pub fn recognizes(args: &[String]) -> bool {
-        if super::is_workspace_wrapper_chain(args) {
+        Self::recognizes_for(args, &InvocationEnv::capture())
+    }
+
+    pub(crate) fn recognizes_for(args: &[String], env: &InvocationEnv) -> bool {
+        if super::is_workspace_wrapper_chain_for(args, env) {
             return false;
         }
         let Some(arg0) = args.first() else {
@@ -7061,7 +7072,7 @@ impl CcCompiler {
         if super::is_kache_subcommand_or_flag(&name) {
             return false;
         }
-        if is_unresolvable_bare_program(arg0) {
+        if is_unresolvable_bare_program(arg0, env) {
             return false;
         }
         // A version/info query (e.g. Kani's `kani-compiler -vV`, #656) compiles
@@ -7072,7 +7083,7 @@ impl CcCompiler {
             return false;
         }
 
-        crate::probe::probe_compiler_family(arg0).is_some()
+        crate::probe::probe_compiler_family_for(arg0, env).is_some()
     }
 
     /// Does this argv match the `cc` Rust crate's compiler-family
@@ -8145,7 +8156,7 @@ impl CcCompiler {
             command.env("SOURCE_DATE_EPOCH", epoch);
         }
         let output = command
-            .output()
+            .invocation_output()
             .with_context(|| format!("executing {}", parsed.program))?;
         let exit_code = output.status.code().unwrap_or(1);
 

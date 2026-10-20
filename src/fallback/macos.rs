@@ -2,6 +2,7 @@
 // The Linux mutation lane cannot execute Darwin process APIs. The policy
 // decisions live in sandbox.rs and run under Linux mutations; macOS unit and
 // subprocess tests exercise this native adapter against an actual sandbox.
+use crate::invocation::process::CommandExt as _;
 use std::ffi::{CStr, CString};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -9,13 +10,17 @@ use std::time::{Duration, Instant};
 
 use super::sandbox::{self, Probe};
 
-pub(super) fn denial(name: &str, outputs: &[&Path]) -> Option<String> {
+pub(super) fn denial(
+    name: &str,
+    outputs: &[&Path],
+    env: &crate::invocation::InvocationEnv,
+) -> Option<String> {
     let policy = Policy::load()?;
     sandbox::check(
         name,
         outputs,
-        std::env::var_os("SCCACHE_SERVER_PORT").as_deref(),
-        std::env::var_os("SCCACHE_SERVER_UDS").is_some(),
+        env.var_os("SCCACHE_SERVER_PORT").as_deref(),
+        env.var_os("SCCACHE_SERVER_UDS").is_some(),
         &policy,
     )
 }
@@ -52,7 +57,7 @@ fn server_pid(port: u16) -> Option<i32> {
         .stdin(Stdio::null())
         .stdout(output.try_clone().ok()?)
         .stderr(Stdio::null())
-        .spawn()
+        .invocation_spawn()
         .ok()?;
     let deadline = Instant::now() + Duration::from_millis(200);
     let success = loop {

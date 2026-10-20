@@ -39,6 +39,10 @@ impl HitCompletion<'_> {
                 .object_output(&self.object_output),
         );
         print_progress(self.crate_name, self.result, elapsed, size);
-        replay_cached_diagnostics(meta, std::io::stdout(), std::io::stderr());
+        replay_cached_diagnostics(
+            meta,
+            crate::invocation::io::stdout(),
+            crate::invocation::io::stderr(),
+        );
     }
 }

@@ -3265,17 +3265,21 @@ fn rustc_store_staging_round_trips_depinfo_without_mutating_outputs() {
         },
     ]);
 
-    let prepared = prepare_rustc_store_files(
+    let client_temp = producing_working_dir.join("client-temp");
+    std::fs::create_dir_all(&client_temp).unwrap();
+    let prepared = prepare_rustc_store_files_for(
         &outputs,
         Some(&producing_target),
         &producing_working_dir,
         Some(&producing_workspace),
         &[],
+        &client_temp,
     )
     .unwrap();
     assert_eq!(std::fs::read_to_string(&depfile).unwrap(), original);
     assert_eq!(std::fs::read(&rlib).unwrap(), b"rlib bytes");
     assert_ne!(prepared.files[0].0, depfile);
+    assert_eq!(prepared.files[0].0.parent(), Some(client_temp.as_path()));
     assert_eq!(prepared.files[1].0, rlib);
     assert_eq!(std::fs::read(&prepared.files[1].0).unwrap(), b"rlib bytes");
 
@@ -3946,10 +3950,13 @@ fn cc_post_publish_stamps_old_outputs_as_fresh_writes() {
     std::fs::write(&source, b"int x;\n").unwrap();
     let source_mtime = std::fs::metadata(&source).unwrap().modified().unwrap();
 
-    apply_cc_post_publish_actions(&[
-        (object.clone(), ArtifactKind::Object),
-        (depinfo.clone(), ArtifactKind::DepInfo),
-    ])
+    apply_cc_post_publish_actions(
+        &[
+            (object.clone(), ArtifactKind::Object),
+            (depinfo.clone(), ArtifactKind::DepInfo),
+        ],
+        &crate::invocation::InvocationEnv::capture(),
+    )
     .unwrap();
     for path in [&object, &depinfo] {
         assert!(std::fs::metadata(path).unwrap().modified().unwrap() >= source_mtime);
@@ -3957,8 +3964,11 @@ fn cc_post_publish_stamps_old_outputs_as_fresh_writes() {
     assert_eq!(std::fs::read(&object).unwrap(), b"object");
     assert_eq!(std::fs::read(&depinfo).unwrap(), b"unit.o: unit.c\n");
     assert!(
-        apply_cc_post_publish_actions(&[(dir.path().join("missing.o"), ArtifactKind::Object)])
-            .is_err()
+        apply_cc_post_publish_actions(
+            &[(dir.path().join("missing.o"), ArtifactKind::Object)],
+            &crate::invocation::InvocationEnv::capture()
+        )
+        .is_err()
     );
 }
 
@@ -4092,8 +4102,14 @@ fn cc_generated_source_depinfo_rebases_headers_outside_the_build_directory() {
     // distinct ownership sentinels. No live process environment is needed.
     for sentinel in ["__kache_base_dir__/", "__kache_base_dir_0__/"] {
         let roots = vec![(producer.clone(), sentinel.to_string(), 5)];
-        let prepared =
-            prepare_cc_store_files_in(&artifacts, Some(&producer_build), None, &roots).unwrap();
+        let prepared = prepare_cc_store_files_in(
+            &artifacts,
+            Some(&producer_build),
+            None,
+            &roots,
+            producer.as_path(),
+        )
+        .unwrap();
         let stored = std::fs::read_to_string(&prepared.files[1].0).unwrap();
         assert!(stored.contains(sentinel));
         assert!(!stored.contains(producer.to_str().unwrap()));
@@ -5319,7 +5335,7 @@ fn debug_bundle_round_trip_preserves_dwarf_uuid_on_macos() {
     // Store side: bake + tar the bundle while the `.o` exists.
     use crate::compiler::platform::Platform as _;
     let staging = tempfile::tempdir().unwrap();
-    let tar_path = crate::compiler::platform::MacOsPlatform
+    let tar_path = crate::compiler::platform::MacOsPlatform::default()
         .package_debug_bundle(&binary, staging.path())
         .unwrap()
         .expect("macOS host must package a bundle for a -g binary");
@@ -9906,21 +9922,26 @@ fn only_a_cargo_compile_outside_every_layout_is_unrecognized() {
 
 #[test]
 fn the_unknown_layout_notice_shows_once_per_session() {
-    let _lock = crate::test_support::process_state_test_lock();
     let dir = tempfile::TempDir::new().unwrap();
     let config = test_config(dir.path().to_path_buf());
     let root = "/some/workspace";
     let target = tagged_target(&dir.path().join("w"));
-    let mut unknown = RustcArgs::default();
-    unknown.crate_name = Some("demo".into());
+    let env = crate::invocation::InvocationEnv::from_parts(
+        [("CARGO_CRATE_NAME", "demo")],
+        Some(dir.path().to_owned()),
+        None,
+        dir.path().to_owned(),
+    );
+    let mut unknown = RustcArgs::parse_for(
+        &["rustc".into(), "--crate-name".into(), "demo".into()],
+        &env,
+    )
+    .unwrap();
     unknown.out_dir = Some(target.join("debug/units/demo/out"));
     let mut known = unknown.clone();
     known.out_dir = Some(target.join("debug/deps"));
     let mut untagged = unknown.clone();
     untagged.out_dir = Some(dir.path().join("bazel-out/units/demo/out"));
-    let previous = std::env::var_os("CARGO_CRATE_NAME");
-    // SAFETY: the process-state lock serialises environment edits.
-    unsafe { std::env::set_var("CARGO_CRATE_NAME", "demo") };
     // A minted session records the real clock, so the test runs on it.
     let now = now_epoch_secs();
     let shown = [
@@ -9937,10 +9958,6 @@ fn the_unknown_layout_notice_shows_once_per_session() {
     held.lock().unwrap();
     let while_held = maybe_notice_unknown_layout(&config, &unknown, root, later);
     drop(held);
-    match previous {
-        Some(value) => unsafe { std::env::set_var("CARGO_CRATE_NAME", value) },
-        None => unsafe { std::env::remove_var("CARGO_CRATE_NAME") },
-    }
     assert_eq!(shown, [false, false, true, false, true]);
     assert!(!while_held);
 }
@@ -11920,6 +11937,129 @@ fn reused_workers_discard_unfinished_compile_and_event_state() {
                     // Leave all provisional compiler state populated. The next
                     // iteration must still begin as a fresh request.
                 }
+            });
+        }
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn concurrent_passthroughs_and_fallbacks_use_each_clients_environment_and_directory() {
+    let first = tempfile::tempdir().unwrap();
+    let second = tempfile::tempdir().unwrap();
+    let barrier = std::sync::Barrier::new(2);
+    std::thread::scope(|threads| {
+        for (root, client, fail_fallback) in
+            [(first.path(), "first", "0"), (second.path(), "second", "1")]
+        {
+            std::fs::create_dir(root.join("bin")).unwrap();
+            for compiler in ["cc", "rustc"] {
+                kache_fs::testutil::write_executable(
+                    &root.join("bin").join(compiler),
+                    "#!/bin/sh\nout=\nwhile [ $# -gt 0 ]; do if [ \"$1\" = -o ]; then out=$2; shift 2; else shift; fi; done\nprintf '%s:%s' \"$CLIENT\" \"$CARGO_INCREMENTAL\" > \"$out\"\n",
+                );
+            }
+            kache_fs::testutil::write_executable(
+                &root.join("bin/fallback"),
+                "#!/bin/sh\nprintf '%s' \"$CLIENT\" > fallback-seen\nif [ \"$FAIL_FALLBACK\" = 1 ]; then exit 42; fi\nexec \"$@\"\n",
+            );
+            std::fs::write(root.join("input.c"), "int value;\n").unwrap();
+            std::fs::write(root.join("input.rs"), "pub fn value() {}\n").unwrap();
+            let barrier = &barrier;
+            threads.spawn(move || {
+                let env = crate::invocation::InvocationEnv::from_parts(
+                    [
+                        ("PATH", "bin"),
+                        ("CLIENT", client),
+                        ("FAIL_FALLBACK", fail_fallback),
+                        ("CARGO_INCREMENTAL", "1"),
+                    ],
+                    Some(root.to_owned()),
+                    None,
+                    root.to_owned(),
+                );
+                let mut config = test_config(root.join("cache"));
+                config.fallback = Some("fallback".into());
+                let cc = crate::compiler::cc::CcArgs::parse_for(
+                    &[
+                        "cc".into(),
+                        "-c".into(),
+                        "input.c".into(),
+                        "-o".into(),
+                        "output.o".into(),
+                    ],
+                    &env,
+                )
+                .unwrap();
+                let rustc = RustcArgs::parse_for(
+                    &[
+                        "rustc".into(),
+                        "--crate-name".into(),
+                        "demo".into(),
+                        "--crate-type".into(),
+                        "lib".into(),
+                        "input.rs".into(),
+                        "-o".into(),
+                        "output.rlib".into(),
+                    ],
+                    &env,
+                )
+                .unwrap();
+                barrier.wait();
+                let cc_result = cc_passthrough(&config, &cc).unwrap();
+                assert_eq!(cc_result.exit_code, 0);
+                assert_eq!(cc_result.fallback, fail_fallback == "0");
+                assert_eq!(
+                    std::fs::read_to_string(root.join("output.o")).unwrap(),
+                    format!("{client}:1")
+                );
+                let rust_result = passthrough(&rustc, config.fallback.as_deref(), false).unwrap();
+                assert_eq!(rust_result.exit_code, 0);
+                assert_eq!(rust_result.fallback, fail_fallback == "0");
+                assert_eq!(
+                    std::fs::read_to_string(root.join("output.rlib")).unwrap(),
+                    format!("{client}:0")
+                );
+                assert_eq!(
+                    std::fs::read_to_string(root.join("fallback-seen")).unwrap(),
+                    client
+                );
+            });
+        }
+    });
+}
+
+#[test]
+fn concurrent_requests_keep_progress_and_warning_markers_with_the_client() {
+    let first = tempfile::tempdir().unwrap();
+    let second = tempfile::tempdir().unwrap();
+    let barrier = std::sync::Barrier::new(2);
+    std::thread::scope(|threads| {
+        for (root, selector, level) in [(first.path(), "hits", 1), (second.path(), "verbose", 2)] {
+            let barrier = &barrier;
+            threads.spawn(move || {
+                let env = crate::invocation::InvocationEnv::from_parts(
+                    [("KACHE_PROGRESS", selector)],
+                    Some(root.to_owned()),
+                    None,
+                    root.to_owned(),
+                );
+                barrier.wait();
+                for _ in 0..2 {
+                    let _request = InvocationWrapperScope::enter_for(&env);
+                    assert_eq!(progress_level(), level);
+                    assert!(warn_marker_path("fault", Path::new("cache")).starts_with(root));
+                    let mut child = env.clone();
+                    child.set("KACHE_PROGRESS", "off");
+                    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let _child = InvocationWrapperScope::enter_for(&child);
+                        assert_eq!(progress_level(), 0);
+                        panic!("nested request failed");
+                    }));
+                    assert!(failed.is_err());
+                    assert_eq!(progress_level(), level);
+                }
+                assert!(INVOCATION_SETTINGS.with(|slot| slot.borrow().is_none()));
             });
         }
     });

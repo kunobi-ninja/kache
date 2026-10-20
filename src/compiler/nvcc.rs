@@ -21,6 +21,7 @@
 //! raw source + header *contents* via the `nvcc -M` dependency closure,
 //! never preprocessed output.
 
+use crate::invocation::process::CommandExt as _;
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
@@ -28,7 +29,7 @@ use super::{Compiler, CompilerAdapter, CompilerId, RefuseReason};
 
 pub const NVCC_ID: CompilerId = CompilerId::new("nvcc");
 pub const ADAPTER: CompilerAdapter =
-    CompilerAdapter::new(NVCC_ID, "nvcc", NvccCompiler::recognizes);
+    CompilerAdapter::new(NVCC_ID, "nvcc", |args, _| NvccCompiler::recognizes(args));
 
 /// What an `nvcc` invocation does. Only [`NvccMode::Compile`] is cacheable;
 /// every other mode refuses in [`NvccArgs::refuse_reasons`].
@@ -56,6 +57,7 @@ pub enum NvccMode {
 /// Parsed `nvcc` invocation.
 #[derive(Debug, Clone)]
 pub struct NvccArgs {
+    pub(crate) invocation_env: crate::invocation::InvocationEnv,
     /// `argv[0]` as given (bare `nvcc`, path, `nvcc.exe`).
     pub program: String,
     /// `argv[1..]` verbatim, for byte-for-byte passthrough execution.
@@ -211,12 +213,21 @@ fn parse_rdc_value(value: &str) -> Result<bool> {
 }
 
 impl NvccArgs {
+    #[cfg(test)]
     pub fn parse(args: &[String]) -> Result<Self> {
+        Self::parse_for(args, &crate::invocation::InvocationEnv::capture())
+    }
+
+    pub(crate) fn parse_for(
+        args: &[String],
+        env: &crate::invocation::InvocationEnv,
+    ) -> Result<Self> {
         let Some(program) = args.first().cloned() else {
             anyhow::bail!("nvcc: empty argv");
         };
         let rest = args[1..].to_vec();
         let mut parsed = NvccArgs {
+            invocation_env: env.clone(),
             program,
             rest,
             mode: NvccMode::Link,
@@ -527,6 +538,12 @@ impl NvccArgs {
     pub fn depinfo_output_path(&self) -> Option<PathBuf> {
         self.depfile.clone()
     }
+
+    pub(crate) fn resolve_path(&self, path: &Path) -> Result<PathBuf> {
+        self.invocation_env
+            .resolve(path)
+            .context("nvcc path requires the invocation working directory")
+    }
 }
 
 /// Allow-list entry matching: the flag verbatim (`-DFOO` covers the
@@ -660,10 +677,10 @@ fn nvcc_check_env_value(var: &str, value: &str) -> Result<()> {
 /// Empty/unset vars contribute nothing (byte-identical key).
 /// Non-UTF-8 values bail: lossy matching could alias two different
 /// environments under one key.
-fn nvcc_driver_env_flags() -> Result<Vec<(String, String)>> {
+fn nvcc_driver_env_flags(env: &crate::invocation::InvocationEnv) -> Result<Vec<(String, String)>> {
     let mut out = Vec::new();
     for var in ["NVCC_PREPEND_FLAGS", "NVCC_APPEND_FLAGS"] {
-        let Some(os) = std::env::var_os(var) else {
+        let Some(os) = env.var_os(var) else {
             continue;
         };
         let value = os
@@ -847,26 +864,21 @@ fn parse_nvcc_make_deps(text: &str) -> Result<Vec<PathBuf>> {
 /// output) bails: the compile then runs uncached via passthrough.
 pub(crate) fn nvcc_dependency_closure(parsed: &NvccArgs) -> Result<Vec<PathBuf>> {
     let cmd_args = nvcc_dependency_query_args(parsed)?;
-    let output = std::process::Command::new(&parsed.program)
+    let output = parsed
+        .invocation_env
+        .command(&parsed.program)?
         .env("LC_ALL", "C")
         .args(&cmd_args)
-        .output()
+        .invocation_output()
         .with_context(|| format!("running `{} -M`", parsed.program))?;
     if !output.status.success() {
         anyhow::bail!("`{} -M` exited {}", parsed.program, output.status);
     }
     let text = String::from_utf8_lossy(&output.stdout);
-    let cwd = std::env::current_dir().context("nvcc -M: no current directory")?;
     let mut deps: Vec<PathBuf> = parse_nvcc_make_deps(&text)?
         .into_iter()
-        .map(|dep| {
-            if dep.is_absolute() {
-                dep
-            } else {
-                cwd.join(dep)
-            }
-        })
-        .collect();
+        .map(|dep| parsed.resolve_path(&dep))
+        .collect::<Result<_>>()?;
     deps.sort();
     deps.dedup();
     Ok(deps)
@@ -902,22 +914,14 @@ pub(crate) const NVCC_ROOT_SENTINEL: &str = "/kache/nvcc-root";
 /// entirely: no maps → path-literal keys (no cross-machine sharing,
 /// zero normalization miscache risk) and no `-ffile-prefix-map`
 /// injection. Default on.
-fn nvcc_path_normalize_enabled() -> bool {
-    parse_nvcc_normalize_toggle(std::env::var("KACHE_NVCC_PATH_NORMALIZE").ok().as_deref())
+fn nvcc_path_normalize_enabled(env: &crate::invocation::InvocationEnv) -> bool {
+    parse_nvcc_normalize_toggle(env.var("KACHE_NVCC_PATH_NORMALIZE").ok().as_deref())
 }
 
 /// Pure toggle behind [`nvcc_path_normalize_enabled`] — unit-testable
 /// without touching the process environment.
 fn parse_nvcc_normalize_toggle(value: Option<&str>) -> bool {
     value.map(|v| v != "0").unwrap_or(true)
-}
-
-fn nvcc_absolutize(path: &Path, cwd: &Path) -> PathBuf {
-    if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        cwd.join(path)
-    }
 }
 
 fn nvcc_canonicalize_or_self(path: &Path) -> PathBuf {
@@ -928,30 +932,48 @@ fn nvcc_canonicalize_or_self(path: &Path) -> PathBuf {
 /// roots (explicit wins ties) plus derived roots (cwd, source and
 /// output parents, absolute and canonicalized), longest first so the
 /// first prefix hit wins in [`nvcc_normalize_path`].
+#[cfg(test)]
 pub(crate) fn nvcc_prefix_maps(
     source: &Path,
     output: Option<&Path>,
     configured_base_dirs: &[String],
 ) -> Vec<NvccPrefixMap> {
+    nvcc_prefix_maps_for(
+        source,
+        output,
+        configured_base_dirs,
+        &crate::invocation::InvocationEnv::capture(),
+    )
+    .unwrap_or_default()
+}
+
+fn nvcc_prefix_maps_for(
+    source: &Path,
+    output: Option<&Path>,
+    configured_base_dirs: &[String],
+    env: &crate::invocation::InvocationEnv,
+) -> Result<Vec<NvccPrefixMap>> {
     let mut maps: Vec<NvccPrefixMap> = Vec::new();
-    if !nvcc_path_normalize_enabled() {
-        return maps;
+    if !nvcc_path_normalize_enabled(env) {
+        return Ok(maps);
     }
-    let Ok(cwd) = std::env::current_dir() else {
-        return maps;
-    };
+    let cwd = env
+        .cwd()
+        .context("nvcc prefix maps require the invocation working directory")?;
     for (from, to) in crate::path_normalizer::configured_base_dir_prefix_maps(configured_base_dirs)
     {
         nvcc_push_unique_map(&mut maps, from, to);
     }
-    let mut roots = vec![cwd.clone()];
-    if let Some(parent) = nvcc_absolutize(source, &cwd).parent() {
+    let mut roots = vec![cwd.to_owned()];
+    let source = env.resolve(source).context("resolving nvcc source path")?;
+    if let Some(parent) = source.parent() {
         roots.push(parent.to_path_buf());
     }
-    if let Some(output) = output
-        && let Some(parent) = nvcc_absolutize(output, &cwd).parent()
-    {
-        roots.push(parent.to_path_buf());
+    if let Some(output) = output {
+        let output = env.resolve(output).context("resolving nvcc output path")?;
+        if let Some(parent) = output.parent() {
+            roots.push(parent.to_path_buf());
+        }
     }
     for root in roots {
         for candidate in [root.clone(), nvcc_canonicalize_or_self(&root)] {
@@ -968,7 +990,7 @@ pub(crate) fn nvcc_prefix_maps(
             .cmp(&a.from.len())
             .then_with(|| a.from.cmp(&b.from))
     });
-    maps
+    Ok(maps)
 }
 
 fn nvcc_push_unique_map(maps: &mut Vec<NvccPrefixMap>, from: String, to: String) {
@@ -1015,15 +1037,22 @@ pub(crate) fn nvcc_prefix_map_args(maps: &[NvccPrefixMap]) -> Result<Vec<String>
 /// build's own value honored verbatim, else kache's `0` pin (stable
 /// `__DATE__`/`__TIME__` across rebuilds), unless opted out via
 /// `KACHE_NVCC_SOURCE_DATE_EPOCH=passthrough|wallclock|off`.
+#[cfg(test)]
 fn nvcc_effective_source_date_epoch() -> Option<std::ffi::OsString> {
+    nvcc_effective_source_date_epoch_for(&crate::invocation::InvocationEnv::capture())
+}
+
+fn nvcc_effective_source_date_epoch_for(
+    env: &crate::invocation::InvocationEnv,
+) -> Option<std::ffi::OsString> {
     super::cc::resolve_source_date_epoch(
-        std::env::var_os("SOURCE_DATE_EPOCH"),
-        nvcc_source_date_epoch_passthrough(),
+        env.var_os("SOURCE_DATE_EPOCH"),
+        nvcc_source_date_epoch_passthrough(env),
     )
 }
 
-fn nvcc_source_date_epoch_passthrough() -> bool {
-    std::env::var("KACHE_NVCC_SOURCE_DATE_EPOCH")
+fn nvcc_source_date_epoch_passthrough(env: &crate::invocation::InvocationEnv) -> bool {
+    env.var("KACHE_NVCC_SOURCE_DATE_EPOCH")
         .ok()
         .map(|v| nvcc_epoch_opt_out(&v))
         .unwrap_or(false)
@@ -1080,6 +1109,7 @@ pub(crate) fn nvcc_target_label(deferred: &[String]) -> String {
 
 /// The `nvcc` compiler.
 pub struct NvccCompiler {
+    invocation_env: crate::invocation::InvocationEnv,
     /// User-declared flags the built-in table doesn't model but the user
     /// opted into caching. Shared with the cc knob for now
     /// (`KACHE_CC_EXTRA_ALLOWLIST_FLAGS`); a dedicated `[nvcc]` knob is a
@@ -1091,8 +1121,20 @@ pub struct NvccCompiler {
 }
 
 impl NvccCompiler {
+    #[cfg(test)]
     pub fn with_extra_allowlist_flags(extra_allowlist_flags: Vec<String>) -> Self {
+        Self::for_invocation(
+            extra_allowlist_flags,
+            &crate::invocation::InvocationEnv::capture(),
+        )
+    }
+
+    pub(crate) fn for_invocation(
+        extra_allowlist_flags: Vec<String>,
+        env: &crate::invocation::InvocationEnv,
+    ) -> Self {
         Self {
+            invocation_env: env.clone(),
             extra_allowlist_flags,
             base_dirs: Vec::new(),
         }
@@ -1126,7 +1168,7 @@ impl Compiler for NvccCompiler {
     }
 
     fn parse(&self, args: &[String]) -> Result<NvccArgs> {
-        NvccArgs::parse(args)
+        NvccArgs::parse_for(args, &self.invocation_env)
     }
 
     fn refuse_reasons(&self, parsed: &NvccArgs) -> Vec<RefuseReason> {
@@ -1148,7 +1190,12 @@ impl Compiler for NvccCompiler {
         // Prefix-map sentinels (the TO set only — the FROM paths are
         // machine-local). Same checkout at another path normalizes
         // identically; a different map set keys apart.
-        let maps = nvcc_prefix_maps(source, parsed.output.as_deref(), &self.base_dirs);
+        let maps = nvcc_prefix_maps_for(
+            source,
+            parsed.output.as_deref(),
+            &self.base_dirs,
+            &parsed.invocation_env,
+        )?;
         // Validated here (not just at execute): an unforwardable map
         // means unportable objects, which must never be keyed shared.
         nvcc_prefix_map_args(&maps)?;
@@ -1178,13 +1225,13 @@ impl Compiler for NvccCompiler {
         // smuggled through the environment changes the discovered host,
         // so environments must not share probe records. Validated here
         // (mode-altering or native values bail into passthrough below).
-        let env_flags = nvcc_driver_env_flags()?;
+        let env_flags = nvcc_driver_env_flags(&parsed.invocation_env)?;
         config_args.extend(
             env_flags
                 .iter()
                 .map(|(var, value)| format!("{var}={value}")),
         );
-        let resolved = crate::probe::probe(
+        let resolved = crate::probe::probe_for(
             ctx.cache_dir,
             &crate::probe::NvccProber,
             &crate::probe::ProbeRequest {
@@ -1199,6 +1246,7 @@ impl Compiler for NvccCompiler {
                 // never sentinel Windows paths in shared records.
                 windows_aware: false,
             },
+            &parsed.invocation_env,
         )?;
         hasher.update(b"prober:nvcc\n");
         hasher.update(b"compiler_version:");
@@ -1281,18 +1329,23 @@ impl Compiler for NvccCompiler {
             .sources
             .first()
             .context("nvcc execute with no source file")?;
-        let maps = nvcc_prefix_maps(source, parsed.output.as_deref(), &self.base_dirs);
+        let maps = nvcc_prefix_maps_for(
+            source,
+            parsed.output.as_deref(),
+            &self.base_dirs,
+            &parsed.invocation_env,
+        )?;
         let injection = nvcc_prefix_map_args(&maps)?;
-        let mut command = std::process::Command::new(&parsed.program);
+        let mut command = parsed.invocation_env.command(&parsed.program)?;
         command.args(&parsed.rest);
         command.args(&injection);
         // Pin the effective SOURCE_DATE_EPOCH so `__DATE__`/`__TIME__`
         // bake stably (mirrors the cc stance; opt out per knob docs).
-        if let Some(epoch) = nvcc_effective_source_date_epoch() {
+        if let Some(epoch) = nvcc_effective_source_date_epoch_for(&parsed.invocation_env) {
             command.env("SOURCE_DATE_EPOCH", epoch);
         }
         let output = command
-            .output()
+            .invocation_output()
             .with_context(|| format!("executing {}", parsed.program))?;
         let exit_code = output.status.code().unwrap_or(1);
 
@@ -1304,7 +1357,11 @@ impl Compiler for NvccCompiler {
             // The named object gates everything: a successful compile
             // that left no object behind is not a cacheable state (and
             // a dep-info without its object is useless).
-            let object = parsed.object_output_path().filter(|p| p.is_file());
+            let object = parsed
+                .object_output_path()
+                .map(|path| parsed.resolve_path(&path))
+                .transpose()?
+                .filter(|p| p.is_file());
             if let Some(object) = object {
                 let store_name = object
                     .file_name()
@@ -1317,7 +1374,10 @@ impl Compiler for NvccCompiler {
                     kind: super::ArtifactKind::Object,
                     required: true,
                 }];
-                if let Some(depfile) = parsed.depinfo_output_path()
+                if let Some(depfile) = parsed
+                    .depinfo_output_path()
+                    .map(|path| parsed.resolve_path(&path))
+                    .transpose()?
                     && depfile.is_file()
                 {
                     // `-MF` permits arbitrary suffixes; restore takes the
@@ -1341,7 +1401,10 @@ impl Compiler for NvccCompiler {
             // object raw must not be stored under a shared key. Keep the
             // object for this build, store nothing.
             if !artifacts.is_empty()
-                && let Some(object) = parsed.object_output_path()
+                && let Some(object) = parsed
+                    .object_output_path()
+                    .map(|path| parsed.resolve_path(&path))
+                    .transpose()?
                 && nvcc_object_embeds_mapped_root(&object, &maps).unwrap_or(true)
             {
                 tracing::warn!("nvcc: object embeds a raw mapped root; not caching it");
@@ -1412,6 +1475,87 @@ mod tests {
         );
         assert!(!parsed.separate_device_code);
         assert!(!parsed.device_debug);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_clients_use_their_own_nvcc_path_environment_and_outputs() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|threads| {
+            for (root, client, epoch) in [
+                (first.path(), "first", "10"),
+                (second.path(), "second", "20"),
+            ] {
+                std::fs::create_dir(root.join("bin")).unwrap();
+                kache_fs::testutil::write_executable(
+                    &root.join("bin/nvcc"),
+                    "#!/bin/sh\nif [ \"$1\" = -M ]; then printf 'out.o: kernel.cu header.h\\n'; exit 0; fi\nprintf '%s:%s' \"$CLIENT\" \"$SOURCE_DATE_EPOCH\" > out.o\nprintf 'out.o: kernel.cu header.h\\n' > out.d\nprintf '%s' \"$CLIENT\"\n",
+                );
+                std::fs::write(root.join("kernel.cu"), client).unwrap();
+                std::fs::write(root.join("header.h"), client).unwrap();
+                let barrier = &barrier;
+                threads.spawn(move || {
+                    let env = crate::invocation::InvocationEnv::from_parts(
+                        [
+                            ("PATH", "bin"),
+                            ("CLIENT", client),
+                            ("SOURCE_DATE_EPOCH", epoch),
+                            ("NVCC_APPEND_FLAGS", "-O2"),
+                        ],
+                        Some(root.to_owned()),
+                        None,
+                        root.to_owned(),
+                    );
+                    let compiler = NvccCompiler::for_invocation(Vec::new(), &env);
+                    let parsed = compiler
+                        .parse(&s(&[
+                            "nvcc",
+                            "-c",
+                            "kernel.cu",
+                            "-o",
+                            "out.o",
+                            "-MD",
+                            "-MF",
+                            "out.d",
+                        ]))
+                        .unwrap();
+                    barrier.wait();
+                    assert_eq!(
+                        nvcc_dependency_closure(&parsed).unwrap(),
+                        [root.join("header.h"), root.join("kernel.cu")]
+                    );
+                    let maps = nvcc_prefix_maps_for(
+                        Path::new("kernel.cu"),
+                        Some(Path::new("out.o")),
+                        &[],
+                        &env,
+                    )
+                    .unwrap();
+                    assert!(maps.iter().any(|map| Path::new(&map.from) == root));
+                    assert_eq!(
+                        nvcc_driver_env_flags(&env).unwrap(),
+                        [("NVCC_APPEND_FLAGS".to_string(), "-O2".to_string())]
+                    );
+                    let result = compiler.execute(&parsed).unwrap();
+                    assert_eq!(result.exit_code, 0, "{}", result.stderr);
+                    assert_eq!(result.stdout, client);
+                    assert_eq!(
+                        std::fs::read(root.join("out.o")).unwrap(),
+                        format!("{client}:{epoch}").as_bytes()
+                    );
+                    let paths: Vec<_> = result
+                        .artifacts
+                        .outputs()
+                        .iter()
+                        .map(|artifact| artifact.path.clone())
+                        .collect();
+                    assert!(paths.contains(&root.join("out.o")));
+                    assert!(paths.contains(&root.join("out.d")));
+                });
+            }
+        });
     }
 
     #[test]
@@ -1708,7 +1852,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn dependency_closure_lists_and_bails() {
-        let _lock = crate::test_support::process_state_test_lock();
         let dir = tempfile::tempdir().unwrap();
         let shell =
             crate::compiler::resolve_program_on_path("sh").expect("sh must be available on PATH");
@@ -1720,14 +1863,10 @@ mod tests {
                 shell.display()
             ),
         );
-        let previous_out = std::env::var_os("NVCC_FAKE_M_OUT");
-        let previous_exit = std::env::var_os("NVCC_FAKE_M_EXIT");
-        unsafe {
-            std::env::set_var("NVCC_FAKE_M_OUT", "k.o: /a/k.cu /a/h.h /a/k.cu\n");
-            std::env::remove_var("NVCC_FAKE_M_EXIT");
-        }
-
-        let parsed = NvccCompiler::with_extra_allowlist_flags(Vec::new())
+        let mut env = crate::invocation::InvocationEnv::capture();
+        env.set("NVCC_FAKE_M_OUT", "k.o: /a/k.cu /a/h.h /a/k.cu\n");
+        env.set("NVCC_FAKE_M_EXIT", "0");
+        let mut parsed = NvccCompiler::for_invocation(Vec::new(), &env)
             .parse(&[
                 fake.to_string_lossy().into_owned(),
                 "-c".to_string(),
@@ -1743,32 +1882,13 @@ mod tests {
             vec![PathBuf::from("/a/h.h"), PathBuf::from("/a/k.cu")]
         );
 
-        unsafe {
-            std::env::set_var("NVCC_FAKE_M_EXIT", "1");
-        }
+        parsed.invocation_env.set("NVCC_FAKE_M_EXIT", "1");
         assert!(nvcc_dependency_closure(&parsed).is_err());
-        unsafe {
-            std::env::set_var("NVCC_FAKE_M_OUT", "garbage without separator");
-            std::env::remove_var("NVCC_FAKE_M_EXIT");
-        }
+        parsed
+            .invocation_env
+            .set("NVCC_FAKE_M_OUT", "garbage without separator");
+        parsed.invocation_env.set("NVCC_FAKE_M_EXIT", "0");
         assert!(nvcc_dependency_closure(&parsed).is_err());
-
-        match previous_out {
-            Some(value) => unsafe {
-                std::env::set_var("NVCC_FAKE_M_OUT", value);
-            },
-            None => unsafe {
-                std::env::remove_var("NVCC_FAKE_M_OUT");
-            },
-        }
-        match previous_exit {
-            Some(value) => unsafe {
-                std::env::set_var("NVCC_FAKE_M_EXIT", value);
-            },
-            None => unsafe {
-                std::env::remove_var("NVCC_FAKE_M_EXIT");
-            },
-        }
     }
 
     #[test]
@@ -2256,16 +2376,23 @@ mod tests {
     }
 
     #[test]
-    fn absolutize_joins_relative_and_passes_absolute() {
-        let cwd = Path::new("/work/tree");
-        assert_eq!(
-            nvcc_absolutize(Path::new("src/k.cu"), cwd),
-            PathBuf::from("/work/tree/src/k.cu")
+    fn paths_resolve_with_the_nvcc_invocation_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path();
+        let env = crate::invocation::InvocationEnv::from_parts(
+            std::iter::empty::<(&str, &str)>(),
+            Some(cwd.to_owned()),
+            None,
+            cwd.to_owned(),
         );
+        let parsed =
+            NvccArgs::parse_for(&s(&["nvcc", "-c", "src/k.cu", "-o", "out.o"]), &env).unwrap();
         assert_eq!(
-            nvcc_absolutize(Path::new("/elsewhere/k.cu"), cwd),
-            PathBuf::from("/elsewhere/k.cu")
+            parsed.resolve_path(Path::new("src/k.cu")).unwrap(),
+            cwd.join("src/k.cu")
         );
+        let absolute = cwd.join("elsewhere/k.cu");
+        assert_eq!(parsed.resolve_path(&absolute).unwrap(), absolute);
     }
 
     #[test]

@@ -43,10 +43,6 @@ impl Recorder {
 pub(crate) struct Invocation(bool);
 pub(crate) struct Phase(Option<(&'static str, u64)>);
 
-pub(crate) fn start(adapter: &'static str, args: &[String]) -> Invocation {
-    start_for(adapter, args, &crate::invocation::InvocationEnv::capture())
-}
-
 pub(crate) fn start_for(
     adapter: &'static str,
     args: &[String],

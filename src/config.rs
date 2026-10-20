@@ -4451,7 +4451,7 @@ pub(crate) fn resolve_config_path() -> PathBuf {
     )
 }
 
-fn resolve_config_path_for(invocation: &InvocationEnv) -> Result<PathBuf> {
+pub(crate) fn resolve_config_path_for(invocation: &InvocationEnv) -> Result<PathBuf> {
     let path = invocation
         .var("KACHE_CONFIG")
         .ok()
@@ -4621,6 +4621,7 @@ pub(crate) fn shellexpand_for(invocation: &InvocationEnv, s: &str) -> PathBuf {
 /// text that matches nothing, so they fold a replayable pattern-set-only key
 /// while believing the intended files are tracked. Reporting the unset names
 /// lets those callers warn instead of degrading silently.
+#[cfg(test)]
 fn expand_env_vars_collecting<F>(s: &str, lookup: F) -> (String, Vec<String>)
 where
     F: Fn(&str) -> Option<String>,
@@ -4689,6 +4690,7 @@ fn expand_env_vars_collecting_with_default(
     (out, unset)
 }
 
+#[cfg(test)]
 fn default_env_var_value(key: &str) -> Option<String> {
     match key {
         "CARGO_HOME" => {
@@ -4708,6 +4710,7 @@ pub(crate) fn expand_exclude_pattern(pattern: &str) -> String {
 /// in the returned pattern and match nothing, so a caller folding the pattern
 /// into a cache key warns rather than silently keying on a matches-nothing
 /// pattern. See [`expand_env_vars_collecting`].
+#[cfg(test)]
 pub(crate) fn expand_exclude_pattern_collecting(pattern: &str) -> (String, Vec<String>) {
     let (expanded, unset) = expand_env_vars_collecting(pattern, |key| std::env::var(key).ok());
     let s = shellexpand(&expanded).to_string_lossy().into_owned();

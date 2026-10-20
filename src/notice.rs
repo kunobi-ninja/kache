@@ -25,12 +25,20 @@ pub(crate) enum Shown {
 
 /// Show a line nobody asked for: to the terminal, else to the log.
 pub(crate) fn show(line: &str) {
-    deliver(terminal(), None::<std::io::Stderr>, line);
+    deliver(
+        crate::invocation::io::terminal(),
+        None::<crate::invocation::io::InvocationWriter>,
+        line,
+    );
 }
 
 /// Show a line the person asked for: to the terminal, else to stderr.
 pub(crate) fn show_requested(line: &str) {
-    deliver(terminal(), Some(std::io::stderr()), line);
+    deliver(
+        crate::invocation::io::terminal(),
+        Some(crate::invocation::io::stderr()),
+        line,
+    );
 }
 
 /// Write `line` to `terminal` when there is one and it takes the write,
@@ -48,20 +56,6 @@ fn deliver(terminal: Option<impl Write>, stderr: Option<impl Write>, line: &str)
     }
     tracing::info!(target: "kache::notice", "{line}");
     Shown::Log
-}
-
-/// The controlling terminal, if this process has one.
-#[cfg(unix)]
-fn terminal() -> Option<std::fs::File> {
-    std::fs::OpenOptions::new()
-        .write(true)
-        .open("/dev/tty")
-        .ok()
-}
-
-#[cfg(not(unix))]
-fn terminal() -> Option<std::fs::File> {
-    None
 }
 
 #[cfg(test)]

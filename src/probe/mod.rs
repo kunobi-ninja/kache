@@ -45,6 +45,7 @@ mod cache;
 mod resolve;
 
 use crate::invocation::InvocationEnv;
+use crate::invocation::process::CommandExt as _;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -149,7 +150,7 @@ impl Prober for CcProber {
             .command(req.compiler)?
             .env("LC_ALL", "C")
             .arg("--version")
-            .output()
+            .invocation_output()
             .with_context(|| format!("running `{} --version`", req.compiler))?;
         if !output.status.success() {
             anyhow::bail!("`{} --version` exited {}", req.compiler, output.status);
@@ -231,7 +232,7 @@ impl Prober for NvccProber {
             .command(req.compiler)?
             .env("LC_ALL", "C")
             .args(&dryrun_args)
-            .output()
+            .invocation_output()
             .with_context(|| format!("running `{} --dryrun`", req.compiler))?;
         if !dryrun.status.success() {
             anyhow::bail!("`{} --dryrun` exited {}", req.compiler, dryrun.status);
@@ -288,7 +289,7 @@ fn nvcc_version_line_for(nvcc: &str, env: &InvocationEnv) -> Result<String> {
         .command(nvcc)?
         .env("LC_ALL", "C")
         .arg("--version")
-        .output()
+        .invocation_output()
         .with_context(|| format!("running `{nvcc} --version`"))?;
     if !output.status.success() {
         anyhow::bail!("`{nvcc} --version` exited {}", output.status);
@@ -374,7 +375,7 @@ fn host_version_line_for(host: &str, env: &InvocationEnv) -> Result<String> {
         .command(host)?
         .env("LC_ALL", "C")
         .arg("--version")
-        .output()
+        .invocation_output()
         .with_context(|| format!("running `{host} --version`"))?;
     let combined = format!(
         "{}\n{}",
@@ -432,6 +433,7 @@ fn family_probe_cache_dir_for(env: &InvocationEnv) -> Option<std::path::PathBuf>
 }
 
 /// Returns `None` if the binary isn't a recognized C compiler.
+#[cfg(test)]
 pub fn probe_compiler_family(program: &str) -> Option<ProbedFamily> {
     probe_compiler_family_for(program, &InvocationEnv::capture())
 }
@@ -534,21 +536,10 @@ fn run_family_probe_for(program: &str, env: &InvocationEnv) -> Result<Option<Pro
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
 
-    crate::platform::configure_process_group(&mut child_cmd);
-    let mut child = match child_cmd.spawn() {
-        Ok(c) => c,
-        Err(_) => return Err(()),
-    };
-    let pid = child.id();
-
-    let mut stdout_handle = match child.stdout.take() {
-        Some(s) => s,
-        None => return Err(()),
-    };
+    let mut child = child_cmd.invocation_spawn_in_group().map_err(|_| ())?;
+    let mut stdout_handle = child.stdout.take().ok_or(())?;
     let (tx, rx) = std::sync::mpsc::channel();
-
-    let tx_read = tx.clone();
-    std::thread::spawn(move || {
+    let reader = std::thread::spawn(move || {
         // Drain the child's stdout to EOF, keeping up to MAX_PROBE_OUTPUT for
         // marker scanning. Draining (rather than stopping at a fixed prefix)
         // matters twofold: the family marker can appear anywhere in the output —
@@ -574,48 +565,36 @@ fn run_family_probe_for(program: &str, env: &InvocationEnv) -> Result<Option<Pro
                 Err(_) => break,
             }
         }
-        let _ = tx_read.send(Ok(buf));
+        let _ = tx.send(buf);
     });
-
-    let tx_wait = tx.clone();
-    std::thread::spawn(move || {
-        let status = child.wait().ok();
-        let _ = tx_wait.send(Err(status));
-    });
-
-    let mut output = None;
-    let mut exit_status = None;
-    let start = Instant::now();
-    let timeout = Duration::from_secs(5);
-
-    loop {
-        if matches!((output.is_some(), exit_status.is_some()), (true, true)) {
-            break;
-        }
-        if start.elapsed() >= timeout {
-            break;
-        }
-        let remaining = timeout.saturating_sub(start.elapsed());
-        match rx.recv_timeout(remaining) {
-            Ok(Ok(buf)) => output = Some(buf),
-            Ok(Err(status)) => exit_status = Some(status),
-            Err(_) => break,
-        }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let output = rx.recv_timeout(deadline.saturating_duration_since(Instant::now()));
+    if output.is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = reader.join();
+        return Err(());
     }
-
-    let Some(output_buf) = output.as_ref() else {
-        crate::platform::kill_process_group(pid);
-        return Err(());
+    let _ = reader.join();
+    // Keep the leader unreaped until stdout reaches EOF. A timed-out probe
+    // can then terminate descendants that still hold its output pipe.
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(());
+            }
+        }
     };
-    let Some(Some(status)) = exit_status.as_ref() else {
-        crate::platform::kill_process_group(pid);
-        return Err(());
-    };
+    let output_buf = output.map_err(|_| ())?;
     if !status.success() {
         return Ok(None);
     }
 
-    let stdout_str = String::from_utf8_lossy(output_buf);
+    let stdout_str = String::from_utf8_lossy(&output_buf);
     let clang = stdout_str.contains("KACHE_PROBE_CLANG");
     let gnu = stdout_str.contains("KACHE_PROBE_GNU");
     match (clang, gnu) {
@@ -646,7 +625,7 @@ fn resolve_invocation_for(
         .env("LC_ALL", "C")
         .arg("-###")
         .args(args)
-        .output()
+        .invocation_output()
         .ok()?;
     let stderr = String::from_utf8_lossy(&output.stderr);
     let resolved = resolve::resolved_semantic_tokens(&stderr, windows_aware, per_tu_paths);
@@ -743,7 +722,7 @@ fn live_probe_diagnostic_for(compiler: &str) -> LiveProbeDiagnostic {
     match Command::new(compiler)
         .env("LC_ALL", "C")
         .arg("--version")
-        .output()
+        .invocation_output()
     {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return LiveProbeDiagnostic::NoCompiler;
@@ -805,7 +784,7 @@ fn live_probe_diagnostic_for(compiler: &str) -> LiveProbeDiagnostic {
         .env("LC_ALL", "C")
         .arg("-###")
         .args(&args)
-        .output()
+        .invocation_output()
         .map(|o| probe_stderr_head(&String::from_utf8_lossy(&o.stderr)))
         .unwrap_or_default();
     LiveProbeDiagnostic::Unresolved {
@@ -822,6 +801,7 @@ fn live_probe_diagnostic_for(compiler: &str) -> LiveProbeDiagnostic {
 /// other — read the record. Resilient: if the cache cannot be keyed or
 /// read the probe simply runs directly. A probe-cache fault never
 /// fails a compile.
+#[cfg(test)]
 pub fn probe(
     cache_dir: &Path,
     prober: &dyn Prober,
@@ -1278,7 +1258,7 @@ printf 'host %s %s %s\n' "$CLIENT_VALUE" "$flavor" "$PWD"
             ])
             .env("PATH", std::env::join_paths(dirs).unwrap())
             .env("KACHE_DOCTOR_SHIM_TEST_CHILD", version_line)
-            .output()
+            .invocation_output()
             .unwrap();
         assert!(
             output.status.success(),
@@ -1366,7 +1346,7 @@ printf 'host %s %s %s\n' "$CLIENT_VALUE" "$flavor" "$PWD"
                 .env("LC_ALL", "C")
                 .arg("-###")
                 .args(&args)
-                .output()
+                .invocation_output()
                 .map(|o| probe_stderr_head(&String::from_utf8_lossy(&o.stderr)))
                 .unwrap_or_else(|e| format!("(could not re-run cc -###: {e})"));
             panic!(

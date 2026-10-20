@@ -1407,10 +1407,15 @@ impl StoreLock {
         Self::acquire_current(path, Self::try_lock_file, || {})
     }
 
-    fn wait_until_available(path: &Path, timeout: Duration) -> Result<bool> {
+    fn wait_until_available(
+        path: &Path,
+        timeout: Duration,
+        mut check: impl FnMut() -> Result<()>,
+    ) -> Result<bool> {
         let start = std::time::Instant::now();
         let mut attempt = 0;
         loop {
+            check()?;
             if let Some(lock) = Self::try_acquire(path)? {
                 drop(lock);
                 return Ok(true);
@@ -2639,10 +2644,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
 
     /// Wait for a cache key to become committed (another process is building it).
     pub fn wait_for_committed(&self, cache_key: &str) -> Result<bool> {
-        if self.contains(cache_key) {
-            return Ok(true);
-        }
-        self.wait_for_committed_with_timeout(cache_key, BUILD_LOCK_TIMEOUT)
+        self.wait_for_committed_with(cache_key, None, || Ok(()))
     }
 
     /// [`Store::wait_for_committed`] with a caller-chosen bound. `false` when
@@ -2652,8 +2654,28 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         cache_key: &str,
         timeout: Duration,
     ) -> Result<bool> {
+        self.wait_for_committed_with(cache_key, Some(timeout), || Ok(()))
+    }
+
+    /// Check request cancellation before waiting and on each lock poll.
+    /// `None` keeps the normal bound and serves an already committed entry
+    /// immediately. An explicit timeout waits for the key lock to be released.
+    pub fn wait_for_committed_with(
+        &self,
+        cache_key: &str,
+        timeout: Option<Duration>,
+        mut check: impl FnMut() -> Result<()>,
+    ) -> Result<bool> {
+        check()?;
+        if timeout.is_none() && self.contains(cache_key) {
+            return Ok(true);
+        }
         let lock_path = self.entry_dir(cache_key).with_extension("lock");
-        let _ = StoreLock::wait_until_available(&lock_path, timeout)?;
+        let _ = StoreLock::wait_until_available(
+            &lock_path,
+            timeout.unwrap_or(BUILD_LOCK_TIMEOUT),
+            check,
+        )?;
         Ok(self.contains(cache_key))
     }
 

@@ -49,6 +49,7 @@
 
 mod placement;
 
+use crate::invocation::process::CommandExt as _;
 use std::collections::{BTreeSet, HashMap};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -779,21 +780,29 @@ pub(crate) fn seed(
         let units = units(&from, layout, &packages);
         let next = AtomicUsize::new(0);
         let copied = AtomicUsize::new(0);
+        let cancellation = crate::invocation::process::current();
         std::thread::scope(|scope| {
             for _ in 0..COPY_THREADS {
-                scope.spawn(|| {
+                let cancellation = cancellation.clone();
+                let (units, next, copied, from, to, deps) =
+                    (&units, &next, &copied, &from, &to, &deps);
+                scope.spawn(move || {
+                    let _cancellation =
+                        crate::invocation::process::CancellationScope::borrow(cancellation);
                     while let Some(unit) = units.get(next.fetch_add(1, Ordering::Relaxed)) {
-                        if Instant::now() >= deadline {
+                        if Instant::now() >= deadline
+                            || crate::invocation::process::check().is_err()
+                        {
                             break;
                         }
-                        if marker(&to, layout, unit).exists()
-                            || names_the_donor(&from, layout, unit, donor)
-                            || out_dir_names_the_donor(&from, layout, unit, donor, deadline)
-                            || !artifacts_stored(&from, layout, unit, &deps, cache_dir, deadline)
+                        if marker(to, layout, unit).exists()
+                            || names_the_donor(from, layout, unit, donor)
+                            || out_dir_names_the_donor(from, layout, unit, donor, deadline)
+                            || !artifacts_stored(from, layout, unit, deps, cache_dir, deadline)
                         {
                             continue;
                         }
-                        match copy_unit(&from, &to, layout, unit, &deps, cache_dir, deadline) {
+                        match copy_unit(from, to, layout, unit, deps, cache_dir, deadline) {
                             Ok(()) => {
                                 copied.fetch_add(1, Ordering::Relaxed);
                             }
@@ -976,46 +985,68 @@ fn asks_for_seed(enabled: bool, args: &[String]) -> bool {
 /// has not built, ask the daemon to seed it and wait for the answer.
 ///
 /// See [`asks_for_seed`] for which invocations qualify.
-pub(crate) fn before_probe(config: &crate::config::Config, args: &[String]) {
+pub(crate) fn before_probe_for(
+    config: &crate::config::Config,
+    args: &[String],
+    env: &crate::invocation::InvocationEnv,
+) {
     if !asks_for_seed(config.seed_new_targets, args) {
         return;
     }
-    let Ok(cwd) = std::env::current_dir() else {
+    let Some(cwd) = env.cwd() else {
         return;
     };
-    let Some(workspace) = workspace_root(&cwd) else {
+    let Some(workspace) = workspace_root(cwd) else {
         return;
     };
-    let target_env = placement::override_target()
-        .or_else(|| std::env::var_os("CARGO_TARGET_DIR"))
-        .or_else(|| std::env::var_os("CARGO_BUILD_TARGET_DIR"));
-    let build_env =
-        placement::override_build().or_else(|| std::env::var_os("CARGO_BUILD_BUILD_DIR"));
+    let target_env = placement::override_target(env)
+        .or_else(|| env.var_os("CARGO_TARGET_DIR"))
+        .or_else(|| env.var_os("CARGO_BUILD_TARGET_DIR"));
+    let build_env = placement::override_build(env).or_else(|| env.var_os("CARGO_BUILD_BUILD_DIR"));
+    let Some(cargo_home) = env
+        .var_os("CARGO_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| env.home_dir().map(|home| home.join(".cargo")))
+        .and_then(|path| env.resolve(&path))
+    else {
+        return;
+    };
     let Some(directory) = placement::resolve(
-        &cwd,
+        cwd,
         workspace,
-        &crate::cli::cargo_home_dir(),
+        &cargo_home,
         target_env.as_deref(),
         build_env.as_deref(),
     ) else {
         return;
     };
-    let Some(target) = new_target(&cwd, Some(directory.as_os_str()), false) else {
+    let Some(target) = new_target(cwd, Some(directory.as_os_str()), false) else {
         return;
     };
-    let Some(version) = rustc_version(args.first().map(String::as_str)) else {
+    let Some(version) = rustc_version_for(args.first().map(String::as_str), env) else {
         return;
     };
     crate::daemon::send_seed_target(config, &target, &version);
 }
 
 /// `rustc -vV` from the compiler Cargo is probing.
+#[cfg(test)]
 fn rustc_version(rustc: Option<&str>) -> Option<String> {
-    let output = std::process::Command::new(rustc?)
+    rustc_version_for(rustc, &crate::invocation::InvocationEnv::capture())
+}
+
+fn rustc_version_for(
+    rustc: Option<&str>,
+    env: &crate::invocation::InvocationEnv,
+) -> Option<String> {
+    let output = env
+        .command(rustc?)
+        .ok()?
         .arg("-vV")
         .stdin(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .output()
+        .invocation_output()
         .ok()?;
     output
         .status
@@ -1388,7 +1419,7 @@ source = "git+https://example.com/gitdep#abc"
                 .join(script.strip_prefix(&profile).unwrap());
             std::fs::remove_dir_all(&donor.target_dir).unwrap();
             std::fs::remove_file(global).unwrap();
-            let output = Command::new(seeded_script).output().unwrap();
+            let output = Command::new(seeded_script).invocation_output().unwrap();
             assert!(output.status.success(), "{layout:?}");
             assert_eq!(output.stdout, b"seeded pin\n", "{layout:?}");
         }

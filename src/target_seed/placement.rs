@@ -58,12 +58,12 @@ fn cli_target(args: &[OsString]) -> Result<Option<&OsStr>, ()> {
     Ok(target)
 }
 
-pub(super) fn override_target() -> Option<OsString> {
-    std::env::var_os(OVERRIDE)
+pub(super) fn override_target(env: &crate::invocation::InvocationEnv) -> Option<OsString> {
+    env.var_os(OVERRIDE)
 }
 
-pub(super) fn override_build() -> Option<OsString> {
-    std::env::var_os(BUILD_OVERRIDE)
+pub(super) fn override_build(env: &crate::invocation::InvocationEnv) -> Option<OsString> {
+    env.var_os(BUILD_OVERRIDE)
 }
 
 /// Environment paths are relative to cwd; file paths are relative to the

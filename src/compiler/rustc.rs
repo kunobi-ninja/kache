@@ -20,8 +20,9 @@ use super::{
 };
 
 pub const RUSTC_ID: CompilerId = CompilerId::new("rustc");
-pub const ADAPTER: CompilerAdapter =
-    CompilerAdapter::new(RUSTC_ID, "Rust compiler", RustcCompiler::recognizes);
+pub const ADAPTER: CompilerAdapter = CompilerAdapter::new(RUSTC_ID, "Rust compiler", |args, _| {
+    RustcCompiler::recognizes(args)
+});
 
 /// Map a rustc `--crate-type` to the [`ArtifactKind`] of the artifact it
 /// produces.
@@ -149,7 +150,7 @@ impl RustcCompiler {
 
     /// Execute a caller-visible compile, forwarding metadata readiness to Cargo.
     pub(crate) fn execute_streaming(&self, parsed: &RustcArgs) -> Result<CompileResult> {
-        self.execute_with_metadata_sink(parsed, Some(&mut std::io::stderr()))
+        self.execute_with_metadata_sink(parsed, Some(&mut crate::invocation::io::stderr()))
     }
 
     fn execute_with_metadata_sink(
@@ -183,7 +184,7 @@ impl RustcCompiler {
             compile::IncrementalMode::Strip,
             None,
             LinkLane::Cache,
-            Some(&mut std::io::stderr()),
+            Some(&mut crate::invocation::io::stderr()),
             Some(on_dep_info),
         )
     }
@@ -205,7 +206,7 @@ impl RustcCompiler {
             },
             None,
             LinkLane::Adaptive,
-            Some(&mut std::io::stderr()),
+            Some(&mut crate::invocation::io::stderr()),
             None,
         )
     }
@@ -226,7 +227,7 @@ impl RustcCompiler {
             },
             None,
             LinkLane::Adaptive,
-            Some(&mut std::io::stderr()),
+            Some(&mut crate::invocation::io::stderr()),
             Some(on_dep_info),
         )
     }
@@ -248,7 +249,7 @@ impl RustcCompiler {
         isolated_args: &[String],
         on_dep_info: Option<&mut dyn FnMut() -> bool>,
     ) -> Result<CompileResult> {
-        let mut stderr = std::io::stderr();
+        let mut stderr = crate::invocation::io::stderr();
         self.execute_with_args(
             parsed,
             isolated_args,
@@ -1438,10 +1439,14 @@ mod tests {
             ]);
 
             let bundle = out_dir.join("foo.dSYM");
-            let output = super::super::platform::debug_bundle_command(&binary, &bundle)
-                .unwrap()
-                .output()
-                .unwrap();
+            let output = super::super::platform::debug_bundle_command_for(
+                &binary,
+                &bundle,
+                &crate::invocation::InvocationEnv::capture(),
+            )
+            .unwrap()
+            .output()
+            .unwrap();
             let stderr = String::from_utf8_lossy(&output.stderr);
             assert!(output.status.success(), "{layout}: {stderr}");
             assert!(

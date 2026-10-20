@@ -1,6 +1,34 @@
 //! Cross-process advisory and activity markers.
 
+use std::cell::RefCell;
 use std::path::Path;
+use std::rc::Rc;
+
+type WarningWriter = Rc<dyn Fn(&str)>;
+
+thread_local! {
+    static INVOCATION_WRITER: RefCell<Option<WarningWriter>> = const { RefCell::new(None) };
+}
+
+/// Route stderr advisories through one synchronous request's output owner.
+/// The guard remains on its worker thread; nested scopes restore the caller.
+pub struct InvocationWarningScope {
+    previous: Option<WarningWriter>,
+}
+
+impl InvocationWarningScope {
+    pub fn enter(write: impl Fn(&str) + 'static) -> Self {
+        Self {
+            previous: INVOCATION_WRITER.with(|slot| slot.replace(Some(Rc::new(write)))),
+        }
+    }
+}
+
+impl Drop for InvocationWarningScope {
+    fn drop(&mut self) {
+        INVOCATION_WRITER.with(|slot| slot.replace(self.previous.take()));
+    }
+}
 
 pub const WARN_SESSION_SECS: u64 = 300;
 
@@ -37,7 +65,14 @@ impl WarnSink {
         #[cfg(test)]
         EMITTED.with(|emitted| emitted.borrow_mut().push((self, message.to_string())));
         match self {
-            WarnSink::Stderr => eprintln!("{message}"),
+            WarnSink::Stderr => {
+                let writer = INVOCATION_WRITER.with(|slot| slot.borrow().clone());
+                if let Some(writer) = writer {
+                    writer(message);
+                } else {
+                    eprintln!("{message}");
+                }
+            }
             WarnSink::Log => tracing::warn!("{message}"),
         }
     }
@@ -264,6 +299,42 @@ pub fn timestamp_is_fresh_at(ts: u64, timeout_secs: u64, now: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn request_warning_writers_restore_after_nested_failures_and_worker_reuse() {
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|threads| {
+            for name in ["first", "second"] {
+                let barrier = &barrier;
+                threads.spawn(move || {
+                    barrier.wait();
+                    for _ in 0..2 {
+                        let parent = Rc::new(RefCell::new(Vec::new()));
+                        let received = Rc::clone(&parent);
+                        let _scope = InvocationWarningScope::enter(move |message| {
+                            received.borrow_mut().push(message.to_owned())
+                        });
+                        WarnSink::Stderr.emit(name);
+                        let child = Rc::new(RefCell::new(Vec::new()));
+                        let child_received = Rc::clone(&child);
+                        let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            let _child = InvocationWarningScope::enter(move |message| {
+                                child_received.borrow_mut().push(message.to_owned())
+                            });
+                            WarnSink::Stderr.emit("nested");
+                            panic!("nested invocation failed");
+                        }));
+                        assert!(failed.is_err());
+                        WarnSink::Log.emit("log stays in tracing");
+                        WarnSink::Stderr.emit(name);
+                        assert_eq!(*parent.borrow(), [name, name]);
+                        assert_eq!(*child.borrow(), ["nested"]);
+                    }
+                    assert!(INVOCATION_WRITER.with(|slot| slot.borrow().is_none()));
+                });
+            }
+        });
+    }
 
     #[test]
     fn marker_handle_reads_freshness_from_the_start() {

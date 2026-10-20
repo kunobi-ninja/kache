@@ -1390,7 +1390,9 @@ impl StoreLock {
         }
     }
 
-    fn acquire(path: &Path) -> Result<Self> {
+    /// Wait for the OS lock and verify that its file still occupies `path`.
+    /// Dropping the guard releases the lock; the marker file stays in place.
+    pub fn acquire(path: &Path) -> Result<Self> {
         let lock = Self::acquire_current(
             path,
             |file| {

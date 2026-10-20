@@ -5,6 +5,8 @@ description: Pull and push cache entries without the daemon
 
 `kache sync` talks directly to the configured remote. It is useful for explicit CI warm and publish steps. It lists the remote to compare it with the local store, so on S3 its credentials need `s3:ListBucket`.
 
+Commands sharing the same local cache directory run one at a time. A second `sync` waits for the first to finish, including transfers and imports. Commands using different cache directories can run concurrently.
+
 ```bash
 kache sync                 # pull, then push
 kache sync --pull          # download only

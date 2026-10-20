@@ -874,17 +874,7 @@ fn unit_key(args: &RustcArgs, original_incremental: &Path, policy_guard: &[u8]) 
         }
         None => fold(&mut hasher, b"no-inner"),
     }
-    let mut arguments = strip_incremental_refs(&args.all_args).into_iter();
-    while let Some(argument) = arguments.next() {
-        let (flag, attached) = argument
-            .split_once('=')
-            .map_or((argument.as_str(), false), |(flag, _)| (flag, true));
-        if crate::args::DIAGNOSTIC_VALUE_FLAGS.contains(&flag) {
-            if !attached {
-                let _value = arguments.next();
-            }
-            continue;
-        }
+    for argument in strip_incremental_refs(args.args_without_diagnostic_presentation()) {
         fold(&mut hasher, argument.as_bytes());
     }
     fold(
@@ -954,9 +944,9 @@ fn strip_incremental(args: &[String]) -> Vec<String> {
     strip_incremental_refs(args).into_iter().cloned().collect()
 }
 
-fn strip_incremental_refs(args: &[String]) -> Vec<&String> {
-    let mut stripped = Vec::with_capacity(args.len());
-    let mut arguments = args.iter().peekable();
+fn strip_incremental_refs<'a>(args: impl IntoIterator<Item = &'a String>) -> Vec<&'a String> {
+    let mut arguments = args.into_iter().peekable();
+    let mut stripped = Vec::with_capacity(arguments.size_hint().1.unwrap_or_default());
     while let Some(argument) = arguments.next() {
         if argument.starts_with("-Cincremental=") || argument.starts_with("--codegen=incremental=")
         {
@@ -1718,7 +1708,8 @@ mod tests {
                 let mut argv = vec![args.rustc.to_string_lossy().into_owned()];
                 argv.extend(args.all_args.clone());
                 argv.extend(presentation.clone());
-                let changed = RustcArgs::parse(&argv).unwrap();
+                let mut changed = RustcArgs::parse(&argv).unwrap();
+                changed.path_normalize_disabled = args.path_normalize_disabled;
                 let same = AdaptiveUnit::eligible(&changed, b"").unwrap();
                 assert_eq!(same.unit_dir, unit.unit_dir, "{presentation:?}");
                 assert_eq!(changed.diagnostic_flags, [format!("{flag}={value}")]);
@@ -1743,6 +1734,27 @@ mod tests {
                 AdaptiveUnit::eligible(&changed, b"").unwrap().unit_dir,
                 unit.unit_dir
             );
+        }
+    }
+
+    #[test]
+    fn formatting_spellings_inside_other_option_values_still_distinguish_units() {
+        let (_temp, args, _) = fixture();
+        for (flag, first, second) in [
+            ("--remap-path-prefix", "--color=/first", "--color=/second"),
+            ("--remap-path-prefix", "--json=/first", "--json=/second"),
+        ] {
+            let parse = |value: &str| {
+                let mut argv = vec![args.rustc.to_string_lossy().into_owned()];
+                argv.extend(args.all_args.clone());
+                argv.extend([flag.to_string(), value.to_string()]);
+                let mut parsed = RustcArgs::parse(&argv).unwrap();
+                parsed.path_normalize_disabled = args.path_normalize_disabled;
+                parsed
+            };
+            let first = AdaptiveUnit::eligible(&parse(first), b"").unwrap();
+            let second = AdaptiveUnit::eligible(&parse(second), b"").unwrap();
+            assert_ne!(first.unit_key, second.unit_key, "{flag}");
         }
     }
 

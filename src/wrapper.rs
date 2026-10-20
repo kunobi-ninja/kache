@@ -1019,10 +1019,11 @@ fn open_primary_and_fallback_for(
 ) -> Result<(Store, Vec<Store>)> {
     crate::link::set_mapped_target(config.volume_store_for_invocation(route, env).is_some());
     let routed = config.routed_for_path_for(route, env);
-    let primary = Store::open(&routed)?;
+    let options = crate::store::StoreOptions::from_env(|name| env.var(name).ok());
+    let primary = Store::open_with_options(&routed, options.clone())?;
     let mut fallbacks = Vec::new();
     if !volume_cache_dirs_match(&routed.cache_dir, &config.cache_dir) {
-        match Store::open(config) {
+        match Store::open_with_options(config, options.clone()) {
             Ok(store) => fallbacks.push(store),
             Err(e) => tracing::warn!(
                 "main store unavailable for volume-shard fallback ({}): {e:#}",
@@ -1030,7 +1031,7 @@ fn open_primary_and_fallback_for(
             ),
         }
     }
-    fallbacks.extend(open_readonly_store(config));
+    fallbacks.extend(open_readonly_store(config, options));
     Ok((primary, fallbacks))
 }
 
@@ -1105,14 +1106,14 @@ fn lookup_or_miss_with_clock<T>(
 /// The store named by [`Config::readonly_store`], opened read-only, or `None`
 /// when none is set, when it is this process's own store, or when it cannot be
 /// opened that way (said at warn level).
-fn open_readonly_store(config: &Config) -> Option<Store> {
+fn open_readonly_store(config: &Config, options: crate::store::StoreOptions) -> Option<Store> {
     let dir = config.readonly_store.as_ref()?;
     if *dir == config.cache_dir {
         return None;
     }
     let mut readonly = config.clone();
     readonly.cache_dir = dir.clone();
-    match Store::open_read_only(&readonly) {
+    match Store::open_read_only_with_options(&readonly, options) {
         Ok(store) => Some(store),
         Err(e) => {
             tracing::warn!("read-only store {} unavailable: {e:#}", dir.display());
@@ -2088,9 +2089,7 @@ fn run_cc_with_store(
     // fall back to passthrough, which runs the real compiler and
     // surfaces the real diagnostic.
     let key_start = std::time::Instant::now();
-    let mut file_hasher = store
-        .file_hasher()
-        .with_invocation_env(&parsed.invocation_env);
+    let mut file_hasher = store.file_hasher_for(&parsed.invocation_env);
     // Flag inputs written since this invocation began. A deferred compile
     // fingerprints what it read afterwards and stores neither an entry nor
     // a memo once one is flagged. A key taken first is checked again once
@@ -3421,9 +3420,8 @@ pub(crate) fn run_for(
     // drives the key and the final Cargo-facing dep-info, so a concurrent
     // config/glob change cannot make those two views disagree.
     let extra_inputs_key_start = std::time::Instant::now();
-    let mut extra_inputs_hasher = crate::cache_key::FileHasher::new()
-        .with_invocation_env(env)
-        .with_daemon(config.socket_path());
+    let mut extra_inputs_hasher =
+        crate::cache_key::FileHasher::new_for(env).with_daemon(config.socket_path());
     if config.modified_input_guard {
         extra_inputs_hasher.arm_too_new_guard(invocation_start_ns, 0);
     }
@@ -3524,8 +3522,7 @@ pub(crate) fn resolve_extra_inputs_for_passthrough(
     args: &RustcArgs,
 ) -> Result<Option<crate::extra_inputs::ExtraInputsSnapshot>> {
     let crate_name = args.crate_name.as_deref().unwrap_or("unknown");
-    let hasher = crate::cache_key::FileHasher::new()
-        .with_invocation_env(args.invocation_env())
+    let hasher = crate::cache_key::FileHasher::new_for(args.invocation_env())
         .with_daemon(config.socket_path());
     let snapshot = crate::extra_inputs::ExtraInputsSnapshot::resolve_for_rustc(args, &hasher)
         .with_context(|| format!("resolving extra_inputs for {crate_name}"))?;
@@ -3626,8 +3623,8 @@ fn resolve_build_script_inputs(
         return Ok(BuildScriptInputs::default());
     };
     let mut file_hasher = store
-        .file_hasher_with_daemon(config.socket_path())
-        .with_invocation_env(args.invocation_env());
+        .file_hasher_for(args.invocation_env())
+        .with_daemon(config.socket_path());
     file_hasher.arm_too_new_guard(invocation_start_ns, 0);
     let resolved = resolve_located_build_script_inputs(
         config,
@@ -3717,8 +3714,8 @@ fn build_script_inputs_moved(
     let _trace = crate::phase_trace::phase("build_script_inputs_verify");
     let crate_name = args.crate_name.as_deref().unwrap_or("unknown");
     let file_hasher = store
-        .file_hasher_with_daemon(config.socket_path())
-        .with_invocation_env(args.invocation_env());
+        .file_hasher_for(args.invocation_env())
+        .with_daemon(config.socket_path());
     match resolve_located_build_script_inputs(
         config,
         args,
@@ -3777,8 +3774,7 @@ fn extra_inputs_changed_during_compile(
     invocation_start_ns: i64,
 ) -> bool {
     let crate_name = args.crate_name.as_deref().unwrap_or("unknown");
-    let mut hasher = crate::cache_key::FileHasher::new()
-        .with_invocation_env(args.invocation_env())
+    let mut hasher = crate::cache_key::FileHasher::new_for(args.invocation_env())
         .with_daemon(config.socket_path());
     hasher.arm_too_new_guard(invocation_start_ns, 0);
     let after = match crate::extra_inputs::ExtraInputsSnapshot::resolve_for_rustc(args, &hasher) {
@@ -6679,9 +6675,7 @@ fn record_input_prediction(
     let Some(store) = store else {
         return;
     };
-    let file_hasher = store
-        .file_hasher()
-        .with_invocation_env(args.invocation_env());
+    let file_hasher = store.file_hasher_for(args.invocation_env());
     if !file_hasher.supports_input_predictions() {
         return;
     }
@@ -6999,10 +6993,9 @@ fn compute_rustc_cache_key(
     let emitted_sources = crate::cache_key::provided_dep_info_sources_for(args.invocation_env());
     let mut file_hasher = match store {
         Some(store) => store
-            .file_hasher_with_daemon(config.socket_path())
-            .with_invocation_env(args.invocation_env()),
-        None => crate::cache_key::FileHasher::new()
-            .with_invocation_env(args.invocation_env())
+            .file_hasher_for(args.invocation_env())
+            .with_daemon(config.socket_path()),
+        None => crate::cache_key::FileHasher::new_for(args.invocation_env())
             .with_daemon(config.socket_path()),
     }
     .with_input_predictions(config.input_predictions)
@@ -7312,7 +7305,7 @@ fn maybe_verify_restored_hit(
     args: &RustcArgs,
     restored: &[(String, PathBuf)],
 ) {
-    if !crate::verify_compare::enabled() {
+    if !crate::verify_compare::enabled_for(args.invocation_env()) {
         return;
     }
     let crate_name = args.crate_name.as_deref().unwrap_or("unknown");
@@ -8267,6 +8260,43 @@ thread_local! {
     /// notifications Cargo pipelines on), so no branch may run it again.
     static PRECOMPILED_EXIT: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
     static PRECOMPILED_REBUILT: std::cell::RefCell<RebuiltArtifacts> = std::cell::RefCell::new(RebuiltArtifacts::default());
+}
+
+/// Work left by a compile-before-key path belongs only to that invocation.
+/// Discard unfinished work on error or panic before reusing the worker thread.
+pub(crate) struct InvocationWrapperScope {
+    rust_exit: Option<i32>,
+    rust_outputs: RebuiltArtifacts,
+    cc_exit: Option<i32>,
+    cc_outputs: RebuiltArtifacts,
+    _demand: crate::demand::InvocationDemandScope,
+    _report: crate::verify_compare::InvocationReportScope,
+    _thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+impl InvocationWrapperScope {
+    pub(crate) fn enter() -> Self {
+        Self {
+            rust_exit: PRECOMPILED_EXIT.with(|slot| slot.replace(None)),
+            rust_outputs: PRECOMPILED_REBUILT
+                .with(|slot| slot.replace(RebuiltArtifacts::default())),
+            cc_exit: CC_PRECOMPILED_EXIT.with(|slot| slot.replace(None)),
+            cc_outputs: CC_PRECOMPILED_REBUILT
+                .with(|slot| slot.replace(RebuiltArtifacts::default())),
+            _demand: crate::demand::InvocationDemandScope::enter(),
+            _report: crate::verify_compare::InvocationReportScope::enter(),
+            _thread: std::marker::PhantomData,
+        }
+    }
+}
+
+impl Drop for InvocationWrapperScope {
+    fn drop(&mut self) {
+        PRECOMPILED_EXIT.with(|slot| slot.set(self.rust_exit));
+        PRECOMPILED_REBUILT.with(|slot| slot.replace(std::mem::take(&mut self.rust_outputs)));
+        CC_PRECOMPILED_EXIT.with(|slot| slot.set(self.cc_exit));
+        CC_PRECOMPILED_REBUILT.with(|slot| slot.replace(std::mem::take(&mut self.cc_outputs)));
+    }
 }
 
 /// Category of the passthrough reason for a rustc compile kache could not

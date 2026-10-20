@@ -23,16 +23,20 @@
 //! alone, since an old artifact could otherwise recreate a deleted alias as a
 //! writable directory.
 
+use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
 use std::io::Write;
+use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::OnceLock;
 
 use crate::args::{ExternDep, RustcArgs};
 use crate::compiler::Compiler;
 use crate::compiler::rustc::RustcCompiler;
 use crate::config::Config;
+use crate::invocation::InvocationEnv;
 
 /// Directory under the cache dir holding aliases, evidence and deny markers.
 const ROOT_NAME: &str = "out-dirs";
@@ -452,8 +456,7 @@ fn failure_hint(
 fn sidecar_path(args: &RustcArgs) -> Option<PathBuf> {
     let stem = args.output_stem()?;
     Some(
-        args.out_dir
-            .as_ref()?
+        args.resolve_invocation_path(args.out_dir.as_ref()?)?
             .join(format!("lib{stem}.{SIDECAR_EXTENSION}")),
     )
 }
@@ -538,6 +541,7 @@ fn checkout_dirs(args: &RustcArgs) -> Vec<PathBuf> {
         .into_iter()
         .chain(args.target_dir())
         .chain(workspace)
+        .filter_map(|dir| args.resolve_invocation_path(&dir))
         .map(|dir| std::fs::canonicalize(&dir).unwrap_or(dir))
         .collect()
 }
@@ -679,13 +683,24 @@ pub(crate) fn consumer_checks(
     Some(1)
 }
 
+fn rooted_externs(externs: &[ExternDep], env: &InvocationEnv) -> Vec<ExternDep> {
+    externs
+        .iter()
+        .map(|dep| ExternDep {
+            name: dep.name.clone(),
+            path: dep.path.as_deref().and_then(|path| env.resolve(path)),
+        })
+        .collect()
+}
+
 /// What every rustc run does before the decision, with the alias on or off:
 /// record evidence, run the tripwire, and drop this unit's marker, which an
 /// aliased build of it left and only a new aliased decision may write again.
 /// `Some(exit code)` when the compile must not run.
 fn checks_before_decision(args: &RustcArgs, root: &Path, stderr: &mut dyn Write) -> Option<i32> {
     let kind = consumer_kind(&args.crate_types, args.is_test);
-    if let Some(code) = consumer_checks(root, &args.externs, kind, stderr) {
+    let externs = rooted_externs(&args.externs, args.invocation_env());
+    if let Some(code) = consumer_checks(root, &externs, kind, stderr) {
         return Some(code);
     }
     if let Some(path) = sidecar_path(args) {
@@ -765,8 +780,12 @@ impl UnitFacts {
                 .map(|(_, value)| value.as_os_str())
         };
         let registry = var("CARGO_MANIFEST_DIR")
-            .is_some_and(|dir| crate::cache_key::is_registry_package(Path::new(dir)));
-        let out_dir = var("OUT_DIR").map(Path::new);
+            .filter(|dir| !dir.is_empty())
+            .and_then(|dir| args.resolve_invocation_path(Path::new(dir)))
+            .is_some_and(|dir| crate::cache_key::is_registry_package(&dir));
+        let raw_out_dir = var("OUT_DIR").filter(|dir| !dir.is_empty()).map(Path::new);
+        let resolved_out_dir = raw_out_dir.and_then(|dir| args.resolve_invocation_path(dir));
+        let out_dir = resolved_out_dir.as_deref();
         let unit_dir = out_dir
             .zip(var("CARGO_PKG_NAME").and_then(OsStr::to_str))
             .and_then(|(dir, pkg)| unit_dir_name(dir, pkg));
@@ -774,7 +793,11 @@ impl UnitFacts {
         let checked = unit_dir.as_deref().zip(out_dir).filter(|_| registry);
         let canonical = checked.and_then(|(_, dir)| std::fs::canonicalize(dir).ok());
         let rewrites = checked.and_then(|(name, dir)| {
-            let spellings: Vec<&Path> = std::iter::once(dir).chain(canonical.as_deref()).collect();
+            let spellings: Vec<&Path> = raw_out_dir
+                .into_iter()
+                .chain(std::iter::once(dir))
+                .chain(canonical.as_deref())
+                .collect();
             env_rewrites(env, &args.all_args, &spellings, &alias_dir(root, name))
         });
         let facts = UnitFacts {
@@ -811,10 +834,11 @@ impl UnitFacts {
     }
 }
 
-/// The alias this process compiles with, decided once at wrapper start.
-#[derive(Debug)]
+/// The alias and evidence owned by one compilation.
+#[derive(Debug, Clone)]
 struct Plan {
     root: PathBuf,
+    invocation_env: InvocationEnv,
     /// The alias directory and its `<pkg>-<hash>`, when this unit is aliased.
     alias: Option<(PathBuf, String)>,
     /// The unit id to register once the key shows the lib bakes `OUT_DIR`.
@@ -822,6 +846,56 @@ struct Plan {
 }
 
 static PLAN: OnceLock<Plan> = OnceLock::new();
+
+thread_local! {
+    // None uses the startup-only adapter. Some(None) is a scoped request
+    // with no alias, and must never inherit a prior request or global plan.
+    static INVOCATION_PLAN: RefCell<Option<Option<Plan>>> = const { RefCell::new(None) };
+}
+
+/// Keep an invocation's alias/evidence on its worker, restoring any enclosing
+/// invocation when the scope exits, including during unwinding.
+pub(crate) struct InvocationAliasScope {
+    previous: Option<Option<Plan>>,
+    _worker: PhantomData<Rc<()>>,
+}
+
+impl InvocationAliasScope {
+    pub(crate) fn enter() -> Self {
+        let previous = INVOCATION_PLAN.with(|slot| slot.replace(Some(None)));
+        Self {
+            previous,
+            _worker: PhantomData,
+        }
+    }
+}
+
+impl Drop for InvocationAliasScope {
+    fn drop(&mut self) {
+        let _ = INVOCATION_PLAN.with(|slot| slot.replace(self.previous.take()));
+    }
+}
+
+fn current_plan() -> Option<Plan> {
+    INVOCATION_PLAN.with(|slot| match &*slot.borrow() {
+        Some(plan) => plan.clone(),
+        None => PLAN.get().cloned(),
+    })
+}
+
+fn replace_plan(plan: Option<Plan>) {
+    INVOCATION_PLAN.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        match &mut *slot {
+            Some(current) => *current = plan,
+            None => {
+                if let Some(plan) = plan {
+                    let _ = PLAN.set(plan);
+                }
+            }
+        }
+    });
+}
 
 /// Record evidence, run the tripwire, decide, and point `OUT_DIR` and every
 /// value under it at the alias. Must run while the wrapper is still single
@@ -832,27 +906,62 @@ static PLAN: OnceLock<Plan> = OnceLock::new();
 /// on keep their alias until they rebuild, so the tripwire, the stale marker
 /// and the failure hint still apply to them.
 pub(crate) fn apply(config: &Config, wrapper_args: &[String]) -> Option<i32> {
-    let _trace = crate::phase_trace::phase("out_dir_alias");
+    let mut env = InvocationEnv::capture();
+    let before: Vec<_> = env.vars_os().collect();
+    let exit = apply_for(config, wrapper_args, &mut env);
+    for (name, value) in env.vars_os() {
+        if before
+            .iter()
+            .any(|(key, previous)| key == &name && previous == &value)
+        {
+            continue;
+        }
+        // SAFETY: this adapter runs at wrapper startup before threads exist.
+        unsafe { std::env::set_var(name, value) };
+    }
+    exit
+}
+
+/// Apply alias decisions and raw environment rewrites to one invocation.
+/// A daemon worker must hold an InvocationAliasScope through compile/store.
+pub(crate) fn apply_for(
+    config: &Config,
+    wrapper_args: &[String],
+    invocation: &mut InvocationEnv,
+) -> Option<i32> {
+    replace_plan(None);
     let euid = effective_uid();
     if !host_allows(cfg!(unix), euid) {
         return None;
     }
-    let compiler = RustcCompiler::new().with_base_dirs(config.base_dirs.clone());
+    apply_after_host_check(config, wrapper_args, invocation, euid)
+}
+
+fn apply_after_host_check(
+    config: &Config,
+    wrapper_args: &[String],
+    invocation: &mut InvocationEnv,
+    euid: u32,
+) -> Option<i32> {
+    let _trace = crate::phase_trace::phase("out_dir_alias");
+    let compiler = RustcCompiler::new_for(invocation).with_base_dirs(config.base_dirs.clone());
     let args = compiler.parse(wrapper_args).ok()?;
-    let root = alias_root(&config.cache_dir)?;
+    let cache_dir = invocation.resolve(&config.cache_dir)?;
+    let root = alias_root(&cache_dir)?;
     if let Some(code) = checks_before_decision(&args, &root, &mut std::io::stderr()) {
         return Some(code);
     }
     if !config.out_dir_alias {
-        let _ = PLAN.set(Plan {
+        replace_plan(Some(Plan {
             root,
+            invocation_env: invocation.clone(),
             alias: None,
             candidate: None,
-        });
+        }));
         return None;
     }
 
-    let env: Vec<(OsString, OsString)> = std::env::vars_os().collect();
+    let env: Vec<(OsString, OsString)> = invocation.vars_os().collect();
     let refused = !compiler.refuse_reasons(&args).is_empty();
     let detected = UnitFacts::gather(
         &args,
@@ -885,8 +994,7 @@ pub(crate) fn apply(config: &Config, wrapper_args: &[String]) -> Option<i32> {
                 dir.display()
             );
             for (name, value) in &detected.rewrites {
-                // SAFETY: the wrapper has spawned no thread yet (see the caller).
-                unsafe { std::env::set_var(name, value) };
+                invocation.set_os(name, value.clone());
             }
         }
         Err(reason) => {
@@ -897,17 +1005,18 @@ pub(crate) fn apply(config: &Config, wrapper_args: &[String]) -> Option<i32> {
             );
         }
     }
-    let _ = PLAN.set(Plan {
+    replace_plan(Some(Plan {
+        invocation_env: invocation.clone(),
         candidate: args.unit_id().filter(|_| is_candidate(decision)),
         alias: aliased.ok().map(|dir| (dir, unit_dir)),
         root,
-    });
+    }));
     None
 }
 
-/// The alias this process's `OUT_DIR` points at, if any.
-pub(crate) fn active_alias() -> Option<&'static Path> {
-    PLAN.get()?.alias.as_ref().map(|(dir, _)| dir.as_path())
+/// The alias this invocation's `OUT_DIR` points at, if any.
+pub(crate) fn active_alias() -> Option<PathBuf> {
+    current_plan()?.alias.map(|(dir, _)| dir)
 }
 
 /// Before a compile whose key is not known yet: register a candidate lib now.
@@ -915,7 +1024,7 @@ pub(crate) fn active_alias() -> Option<&'static Path> {
 /// and they have to be recorded too. The key drops the lib again if it turns
 /// out not to bake `OUT_DIR`.
 pub(crate) fn register_before_compile() {
-    let Some(plan) = PLAN.get() else {
+    let Some(plan) = current_plan() else {
         return;
     };
     if let Some(unit_id) = plan.candidate.as_deref() {
@@ -926,7 +1035,7 @@ pub(crate) fn register_before_compile() {
 /// After the key: keep a candidate lib whose key keeps an `OUT_DIR` value
 /// registered, so later compiles record who links it, and drop any other.
 pub(crate) fn register_after_key(bakes_out_dir: bool) {
-    let Some(plan) = PLAN.get() else {
+    let Some(plan) = current_plan() else {
         return;
     };
     if let Some(unit_id) = plan.candidate.as_deref() {
@@ -938,7 +1047,7 @@ pub(crate) fn register_after_key(bakes_out_dir: bool) {
 /// unit's alias is no longer empty and read-only or its dep-info lists a file
 /// under the root.
 pub(crate) fn store_gate(args: &RustcArgs) -> bool {
-    let Some(plan) = PLAN.get() else {
+    let Some(plan) = current_plan() else {
         return true;
     };
     let dirty = plan
@@ -949,9 +1058,18 @@ pub(crate) fn store_gate(args: &RustcArgs) -> bool {
     let sources = args
         .dep_info_path()
         .zip(args.source_file.as_deref())
-        .and_then(|(path, source)| crate::cache_key::dep_info_from_emitted(&path, source).ok())
+        .and_then(|(path, source)| {
+            crate::cache_key::dep_info_from_emitted_for(&path, source, args.invocation_env()).ok()
+        })
         .map(|dep_info| dep_info.source_files)
         .unwrap_or_default();
+    let Some(sources): Option<Vec<PathBuf>> = sources
+        .into_iter()
+        .map(|source| args.resolve_invocation_path(&source))
+        .collect()
+    else {
+        return false;
+    };
     let under_root: Vec<&PathBuf> = sources
         .iter()
         .filter(|source| source.starts_with(&plan.root))
@@ -974,11 +1092,12 @@ pub(crate) fn store_gate(args: &RustcArgs) -> bool {
 /// After a failed compile: the hint, and deny markers for the aliases known
 /// to be involved (see `failure_hint`).
 pub(crate) fn after_failed_compile(stderr: &str, externs: &[ExternDep]) {
-    let Some(plan) = PLAN.get() else {
+    let Some(plan) = current_plan() else {
         return;
     };
     let own = plan.alias.as_ref().map(|(_, unit_dir)| unit_dir.as_str());
-    if let Some(hint) = failure_hint(stderr, externs, &plan.root, own) {
+    let externs = rooted_externs(externs, &plan.invocation_env);
+    if let Some(hint) = failure_hint(stderr, &externs, &plan.root, own) {
         eprintln!("{hint}");
     }
 }
@@ -1020,6 +1139,54 @@ mod tests {
             name: name.into(),
             path: path.map(Path::to_path_buf),
         }
+    }
+
+    fn test_plan(name: &str) -> Plan {
+        Plan {
+            root: PathBuf::from(format!("/{name}/out-dirs")),
+            invocation_env: InvocationEnv::from_parts(
+                std::iter::empty::<(String, String)>(),
+                Some(PathBuf::from(format!("/{name}"))),
+                None,
+                PathBuf::from("/tmp"),
+            ),
+            alias: Some((PathBuf::from(format!("/{name}/alias")), name.to_string())),
+            candidate: None,
+        }
+    }
+
+    #[test]
+    fn request_plan_scopes_restore_nesting_unwinding_and_worker_reuse() {
+        let _outer = InvocationAliasScope::enter();
+        assert!(active_alias().is_none());
+        replace_plan(Some(test_plan("outer")));
+        {
+            let _inner = InvocationAliasScope::enter();
+            assert!(active_alias().is_none(), "a request starts empty");
+            replace_plan(Some(test_plan("inner")));
+            assert_eq!(active_alias(), Some(PathBuf::from("/inner/alias")));
+        }
+        assert_eq!(active_alias(), Some(PathBuf::from("/outer/alias")));
+        let failed = std::panic::catch_unwind(|| {
+            let _inner = InvocationAliasScope::enter();
+            replace_plan(Some(test_plan("panicking")));
+            panic!("request failed");
+        });
+        assert!(failed.is_err());
+        assert_eq!(active_alias(), Some(PathBuf::from("/outer/alias")));
+        for client in ["first", "second"] {
+            let _request = InvocationAliasScope::enter();
+            assert!(
+                active_alias().is_none(),
+                "a reused worker keeps no previous request plan"
+            );
+            replace_plan(Some(test_plan(client)));
+            assert_eq!(
+                active_alias(),
+                Some(PathBuf::from(format!("/{client}/alias")))
+            );
+        }
+        assert_eq!(active_alias(), Some(PathBuf::from("/outer/alias")));
     }
 
     #[test]
@@ -2041,6 +2208,233 @@ mod tests {
                 &layout.root,
                 effective_uid(),
             )
+        }
+
+        fn invocation_for_layout(layout: &Layout) -> InvocationEnv {
+            let cwd = PathBuf::from(
+                layout
+                    .env
+                    .iter()
+                    .find(|(name, _)| name == "CARGO_MANIFEST_DIR")
+                    .unwrap()
+                    .1
+                    .clone(),
+            );
+            InvocationEnv::from_parts(
+                layout.env.clone(),
+                Some(cwd),
+                None,
+                layout._tmp.path().to_path_buf(),
+            )
+        }
+
+        fn invocation_argv(layout: &Layout) -> Vec<String> {
+            std::iter::once("rustc".to_string())
+                .chain(layout.args.all_args.iter().cloned())
+                .collect()
+        }
+
+        #[test]
+        fn alias_decisions_rewrite_only_each_clients_raw_snapshot() {
+            use std::os::unix::ffi::OsStringExt;
+            let first = layout("proc-macro");
+            let second = layout("proc-macro");
+            let apply = |layout: &Layout| {
+                let _request = InvocationAliasScope::enter();
+                let mut invocation = invocation_for_layout(layout);
+                let raw_name = OsString::from_vec(vec![0xff, b'X']);
+                invocation.set_os(&raw_name, layout.out_dir.join("debug").into_os_string());
+                let before = invocation.vars_os().collect::<Vec<_>>();
+                let mut config = Config::load_for(&invocation).unwrap();
+                config.cache_dir = layout.root.parent().unwrap().to_path_buf();
+                config.out_dir_alias = true;
+                // The host gate is separately tested. Exercise the filesystem
+                // decision core as well on CI runners whose uid is zero.
+                assert_eq!(
+                    apply_after_host_check(
+                        &config,
+                        &invocation_argv(layout),
+                        &mut invocation,
+                        effective_uid()
+                    ),
+                    None
+                );
+                let alias = active_alias().expect("the independent proc-macro request qualifies");
+                assert_eq!(
+                    invocation.var_os("OUT_DIR"),
+                    Some(alias.clone().into_os_string())
+                );
+                assert_eq!(
+                    invocation.var_os("DEBUG_OUTPUT_DIR"),
+                    Some(alias.clone().into_os_string())
+                );
+                assert!(invocation.vars_os().any(|(name, value)| name == raw_name
+                    && value == alias.join("debug").into_os_string()));
+                assert_eq!(
+                    before.iter().find(|(name, _)| name == "OUT_DIR").unwrap().1,
+                    layout.out_dir.as_os_str()
+                );
+                assert_eq!(current_plan().unwrap().root, layout.root);
+                alias
+            };
+            let (left, right) = std::thread::scope(|scope| {
+                let left = scope.spawn(|| apply(&first));
+                let right = scope.spawn(|| apply(&second));
+                (left.join().unwrap(), right.join().unwrap())
+            });
+            assert_ne!(left, right);
+            assert!(left.starts_with(&first.root));
+            assert!(right.starts_with(&second.root));
+            assert_eq!(
+                first
+                    .env
+                    .iter()
+                    .find(|(name, _)| name == "OUT_DIR")
+                    .unwrap()
+                    .1,
+                first.out_dir.as_os_str()
+            );
+            assert_eq!(
+                second
+                    .env
+                    .iter()
+                    .find(|(name, _)| name == "OUT_DIR")
+                    .unwrap()
+                    .1,
+                second.out_dir.as_os_str()
+            );
+        }
+
+        #[test]
+        fn disabled_and_invalid_requests_do_not_reuse_a_workers_alias_plan() {
+            let layout = layout("proc-macro");
+            let mut invocation = invocation_for_layout(&layout);
+            let mut config = Config::load_for(&invocation).unwrap();
+            config.cache_dir = layout.root.parent().unwrap().to_path_buf();
+            config.out_dir_alias = false;
+            let _request = InvocationAliasScope::enter();
+            replace_plan(Some(test_plan("previous")));
+            assert_eq!(
+                apply_for(&config, &invocation_argv(&layout), &mut invocation),
+                None
+            );
+            assert!(active_alias().is_none());
+            assert_eq!(
+                invocation.var_os("OUT_DIR"),
+                Some(layout.out_dir.clone().into_os_string())
+            );
+            replace_plan(Some(test_plan("previous")));
+            assert_eq!(apply_for(&config, &[], &mut invocation), None);
+            assert!(active_alias().is_none());
+            assert!(current_plan().is_none());
+        }
+
+        #[test]
+        fn empty_environment_roots_keep_their_original_ineligible_shape() {
+            let layout = layout("proc-macro");
+            let mut invocation = InvocationEnv::from_parts(
+                layout.env.clone(),
+                Some(layout.out_dir.clone()),
+                None,
+                layout._tmp.path().to_path_buf(),
+            );
+            invocation.set("OUT_DIR", "");
+            let args = RustcArgs::parse_for(&invocation_argv(&layout), &invocation).unwrap();
+            let env = invocation.vars_os().collect::<Vec<_>>();
+            let detected =
+                UnitFacts::gather(&args, &env, false, &[], &layout.root, effective_uid());
+            assert!(detected.facts.unit_dir.is_none());
+            assert!(detected.rewrites.is_empty());
+
+            let mut invocation = invocation_for_layout(&layout);
+            invocation.set("CARGO_MANIFEST_DIR", "");
+            let args = RustcArgs::parse_for(&invocation_argv(&layout), &invocation).unwrap();
+            let env = invocation.vars_os().collect::<Vec<_>>();
+            let detected =
+                UnitFacts::gather(&args, &env, false, &[], &layout.root, effective_uid());
+            assert!(!detected.facts.registry);
+            assert!(detected.rewrites.is_empty());
+        }
+
+        #[test]
+        fn store_gate_resolves_relative_depinfo_sources_in_the_client_directory() {
+            let directory = tempfile::tempdir().unwrap();
+            let cwd = directory.path().canonicalize().unwrap();
+            std::fs::create_dir(cwd.join("deps")).unwrap();
+            let env = InvocationEnv::from_parts(
+                std::iter::empty::<(String, String)>(),
+                Some(cwd.clone()),
+                None,
+                cwd.clone(),
+            );
+            let args = RustcArgs::parse_for(
+                &strings(&[
+                    "rustc",
+                    "--crate-name",
+                    "helper",
+                    "--crate-type",
+                    "lib",
+                    "src/lib.rs",
+                    "--out-dir",
+                    "deps",
+                    "--emit=link,dep-info",
+                    "-C",
+                    "extra-filename=-0123456789abcdef",
+                ]),
+                &env,
+            )
+            .unwrap();
+            let root = cwd.join("out-dirs");
+            let _request = InvocationAliasScope::enter();
+            replace_plan(Some(Plan {
+                root: root.clone(),
+                invocation_env: env,
+                alias: None,
+                candidate: None,
+            }));
+            let depinfo = args.dep_info_path().unwrap();
+            std::fs::write(&depinfo, "deps/libhelper.rlib: src/lib.rs\n").unwrap();
+            assert!(store_gate(&args));
+            std::fs::write(&depinfo, "deps/libhelper.rlib: src/lib.rs out-dirs/v1/d/dmac-0123456789abcdef/out/generated.rs\n").unwrap();
+            assert!(!store_gate(&args));
+            assert!(deny_path(&root, "dmac-0123456789abcdef").exists());
+        }
+
+        #[test]
+        fn relative_sidecars_and_externs_resolve_against_the_client_directory() {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path().canonicalize().unwrap();
+            let env = InvocationEnv::from_parts(
+                std::iter::empty::<(String, String)>(),
+                Some(root.clone()),
+                None,
+                root.clone(),
+            );
+            let args = RustcCompiler::new_for(&env)
+                .parse(&strings(&[
+                    "rustc",
+                    "--crate-name",
+                    "helper",
+                    "--crate-type",
+                    "lib",
+                    "src/lib.rs",
+                    "--out-dir",
+                    "target/debug/deps",
+                    "-C",
+                    "extra-filename=-0123456789abcdef",
+                    "--extern",
+                    "loaded=target/debug/deps/libloaded-1111111111111111.rlib",
+                ]))
+                .unwrap();
+            assert_eq!(
+                sidecar_path(&args),
+                Some(root.join("target/debug/deps/libhelper-0123456789abcdef.kache-alias"))
+            );
+            let externs = rooted_externs(&args.externs, args.invocation_env());
+            assert_eq!(
+                externs[0].path,
+                Some(root.join("target/debug/deps/libloaded-1111111111111111.rlib"))
+            );
         }
 
         #[test]

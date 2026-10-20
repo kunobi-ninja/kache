@@ -11861,3 +11861,66 @@ fn cc_failed_compile_does_not_claim_rebuilt_outputs_or_publish_handoff() {
     assert!(events[0].rebuilt_package.is_none());
     assert!(!object.exists());
 }
+
+#[test]
+fn reused_workers_discard_unfinished_compile_and_event_state() {
+    let barrier = std::sync::Barrier::new(2);
+    std::thread::scope(|threads| {
+        for exit in [17, 31] {
+            let barrier = &barrier;
+            threads.spawn(move || {
+                for _ in 0..2 {
+                    let _request = InvocationWrapperScope::enter();
+                    assert_eq!(PRECOMPILED_EXIT.with(std::cell::Cell::get), None);
+                    assert_eq!(CC_PRECOMPILED_EXIT.with(std::cell::Cell::get), None);
+                    assert!(crate::demand::take().is_empty());
+                    assert!(crate::verify_compare::take_last_report().is_empty());
+                    PRECOMPILED_EXIT.with(|slot| slot.set(Some(exit)));
+                    CC_PRECOMPILED_EXIT.with(|slot| slot.set(Some(exit + 1)));
+                    PRECOMPILED_REBUILT
+                        .with(|slot| slot.borrow_mut().paths.push("rust-parent".into()));
+                    CC_PRECOMPILED_REBUILT
+                        .with(|slot| slot.borrow_mut().paths.push("cc-parent".into()));
+                    crate::demand::record(&format!("parent-{exit}"));
+                    crate::verify_compare::record_report(format!("parent-{exit}"));
+                    barrier.wait();
+                    let result = std::panic::catch_unwind(|| {
+                        let _nested = InvocationWrapperScope::enter();
+                        assert_eq!(PRECOMPILED_EXIT.with(std::cell::Cell::get), None);
+                        assert_eq!(CC_PRECOMPILED_EXIT.with(std::cell::Cell::get), None);
+                        assert!(PRECOMPILED_REBUILT.with(|slot| slot.borrow().paths.is_empty()));
+                        assert!(CC_PRECOMPILED_REBUILT.with(|slot| slot.borrow().paths.is_empty()));
+                        crate::demand::record("unfinished-child");
+                        crate::verify_compare::record_report("unfinished-child".into());
+                        PRECOMPILED_EXIT.with(|slot| slot.set(Some(99)));
+                        CC_PRECOMPILED_EXIT.with(|slot| slot.set(Some(98)));
+                        panic!("request failed before logging its event");
+                    });
+                    assert!(result.is_err());
+                    assert_eq!(PRECOMPILED_EXIT.with(std::cell::Cell::get), Some(exit));
+                    assert_eq!(
+                        CC_PRECOMPILED_EXIT.with(std::cell::Cell::get),
+                        Some(exit + 1)
+                    );
+                    assert_eq!(
+                        PRECOMPILED_REBUILT.with(|slot| slot.borrow().paths.clone()),
+                        ["rust-parent"]
+                    );
+                    assert_eq!(
+                        CC_PRECOMPILED_REBUILT.with(|slot| slot.borrow().paths.clone()),
+                        ["cc-parent"]
+                    );
+                    let demands = crate::demand::take();
+                    assert_eq!(demands.len(), 1);
+                    assert_eq!(demands[0].cache_key, format!("parent-{exit}"));
+                    assert_eq!(
+                        crate::verify_compare::take_last_report(),
+                        format!("parent-{exit}")
+                    );
+                    // Leave all provisional compiler state populated. The next
+                    // iteration must still begin as a fresh request.
+                }
+            });
+        }
+    });
+}

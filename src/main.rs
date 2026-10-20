@@ -1768,6 +1768,9 @@ enum WrapperTarget {
 }
 
 fn run_wrapper_mode(args: &[String]) -> Result<()> {
+    let _alias_state = out_dir_alias::InvocationAliasScope::enter();
+    let _key_state = cache_key::InvocationKeyScope::enter();
+    let _wrapper_state = wrapper::InvocationWrapperScope::enter();
     let _heartbeat = heartbeat::InvocationHeartbeatScope::enter();
     let _restore_policy = link::InvocationLinkScope::enter();
     let _accounting = opcounts::InvocationScope::enter(
@@ -1804,7 +1807,8 @@ fn run_wrapper_mode(args: &[String]) -> Result<()> {
     }
 
     let config = config::Config::load()?;
-    scheduler::pressure::set_enabled(config.scheduler_memory_pressure);
+    let _pressure =
+        scheduler::pressure::InvocationPressureScope::enter(config.scheduler_memory_pressure);
 
     if config.disabled {
         // Caching off — pass straight through to the real compiler. The

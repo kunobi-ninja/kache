@@ -32,8 +32,35 @@ pub(crate) const PSI_SOME_AVG10: f64 = 10.0;
 /// `[cache] scheduler_memory_pressure`, set once at wrapper startup.
 static ENABLED: AtomicBool = AtomicBool::new(true);
 
+#[cfg(test)]
 pub(crate) fn set_enabled(enabled: bool) {
     ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+thread_local! {
+    static INVOCATION_ENABLED: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Scheduler policy for one synchronous request. Machine pressure samples may
+/// be reused; a client's opt-out must remain local to its invocation.
+pub(crate) struct InvocationPressureScope {
+    previous: Option<bool>,
+    _thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+impl InvocationPressureScope {
+    pub(crate) fn enter(enabled: bool) -> Self {
+        Self {
+            previous: INVOCATION_ENABLED.with(|slot| slot.replace(Some(enabled))),
+            _thread: std::marker::PhantomData,
+        }
+    }
+}
+
+impl Drop for InvocationPressureScope {
+    fn drop(&mut self) {
+        INVOCATION_ENABLED.with(|slot| slot.set(self.previous));
+    }
 }
 
 // A pressure answer a test sets for its own thread, so other tests running
@@ -50,7 +77,10 @@ pub(crate) fn force(pressured: Option<bool>) {
 
 /// Whether admission should hold back now.
 pub(crate) fn now() -> bool {
-    if !ENABLED.load(Ordering::Relaxed) {
+    if !INVOCATION_ENABLED.with(|slot| {
+        slot.get()
+            .unwrap_or_else(|| ENABLED.load(Ordering::Relaxed))
+    }) {
         return false;
     }
     #[cfg(test)]
@@ -159,6 +189,33 @@ fn under_pressure() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn concurrent_clients_keep_their_pressure_policy_on_reused_workers() {
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|threads| {
+            for enabled in [false, true] {
+                let barrier = &barrier;
+                threads.spawn(move || {
+                    force(Some(true));
+                    for _ in 0..2 {
+                        let _scope = InvocationPressureScope::enter(enabled);
+                        barrier.wait();
+                        assert_eq!(now(), enabled);
+                        let failed = std::panic::catch_unwind(|| {
+                            let _child = InvocationPressureScope::enter(!enabled);
+                            assert_eq!(now(), !enabled);
+                            panic!("nested request failed");
+                        });
+                        assert!(failed.is_err());
+                        assert_eq!(now(), enabled);
+                    }
+                    assert!(INVOCATION_ENABLED.with(|slot| slot.get().is_none()));
+                    force(None);
+                });
+            }
+        });
+    }
 
     #[test]
     fn pressure_takes_the_whole_pool() {

@@ -36,17 +36,6 @@ impl StorePutResult {
     }
 }
 
-thread_local! {
-    /// `[cache] deferred_durability` of the store last opened on this thread;
-    /// see [`Store::open`].
-    static DEFERRED_DURABILITY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// Whether a blob written now must be fsynced before it is published.
-fn durable_writes_now() -> bool {
-    !DEFERRED_DURABILITY.with(|deferred| deferred.get())
-}
-
 /// Mark a blob read-only so accidental writes can't corrupt the shared,
 /// content-addressed copy. Best-effort.
 fn set_blob_readonly(blob: &Path) {
@@ -376,11 +365,20 @@ fn record_store_copy_reason(reason: StoreCopyReason, bytes: u64) {
 /// rematerialize after a reclaim may count the same logical ingest again.
 /// Returns `Ok(true)` when this call published the blob (the caller may then
 /// want to verify its digest), `Ok(false)` when it was already present.
+#[cfg(test)]
 fn materialize_blob(source: &Path, blob: &Path, allow_hardlink: bool) -> Result<bool> {
+    materialize_blob_with_durability(source, blob, allow_hardlink, true)
+}
+
+fn materialize_blob_with_durability(
+    source: &Path,
+    blob: &Path,
+    allow_hardlink: bool,
+    durable: bool,
+) -> Result<bool> {
     if blob.is_file() {
         return Ok(false);
     }
-    let durable = durable_writes_now();
     fs::create_dir_all(blob.parent().unwrap()).context("creating blob shard directory")?;
     let bytes = fs::metadata(source).map(|m| m.len()).unwrap_or(0);
     let ingest = std::cell::Cell::new(StoreIngest::Copy(StoreCopyReason::Other));
@@ -467,7 +465,7 @@ fn materialize_blob(source: &Path, blob: &Path, allow_hardlink: bool) -> Result<
         Ok(published) => published,
         Err(_e) if ro_failed.get() => {
             // Temp already cleaned by atomic_write_and_replace_with.
-            return materialize_blob(source, blob, false);
+            return materialize_blob_with_durability(source, blob, false, durable);
         }
         Err(e) => {
             // Hardlink path may have marked the source RO via the shared temp
@@ -1146,6 +1144,7 @@ struct AuthoritativeBlobIndex {
 pub struct ArtifactStore<P: ArtifactPolicy> {
     policy: std::marker::PhantomData<P>,
     config: Config,
+    options: StoreOptions,
     db: Connection,
     /// Write slice and pause for eviction sweeps: [`EVICTION_WRITE_SLICE`]
     /// and [`EVICTION_WRITE_PAUSE`] outside tests.
@@ -1459,6 +1458,25 @@ pub enum VerifyRestores {
     Always,
 }
 
+/// Policy owned by a store handle, independent of later process changes.
+#[derive(Clone, Debug)]
+pub struct StoreOptions {
+    pub verify_restores: VerifyRestores,
+    pub max_diagnostics_bytes: Option<usize>,
+}
+
+impl StoreOptions {
+    /// Parse the invoking client's selectors without reading process state.
+    pub fn from_env(var: impl Fn(&str) -> Option<String>) -> Self {
+        Self {
+            verify_restores: parse_verify_restores(var("KACHE_VERIFY_RESTORES").as_deref()),
+            max_diagnostics_bytes: parse_max_diagnostics_bytes(
+                var("KACHE_MAX_DIAGNOSTICS_BYTES").as_deref(),
+            ),
+        }
+    }
+}
+
 /// One in this many hits is verified under [`VerifyRestores::Sampled`] (~6%).
 const VERIFY_SAMPLE_RATE: u64 = 16;
 
@@ -1467,9 +1485,9 @@ const VERIFY_SAMPLE_RATE: u64 = 16;
 /// same entries.
 static VERIFY_SAMPLE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// Parse the restore-verification mode from `KACHE_VERIFY_RESTORES`. Read per
-/// call (cheap, off the hot path) so tests can toggle it. Back-compatible: the
-/// old boolean `1`/`true` maps to `Always`, unset/`0`/`false`/`off` to `Off`.
+/// Legacy process selector for `KACHE_VERIFY_RESTORES`. Store handles capture
+/// their verification policy at open. The old boolean `1`/`true` maps to
+/// `Always`, unset/`0`/`false`/`off` to `Off`.
 pub fn verify_restores_mode() -> VerifyRestores {
     parse_verify_restores(std::env::var("KACHE_VERIFY_RESTORES").ok().as_deref())
 }
@@ -1507,9 +1525,8 @@ fn should_verify_this_restore(mode: VerifyRestores) -> bool {
 /// identically on a hit vs a miss (kunobi-ninja/kache#336). The cap is an opt-in
 /// safety valve against a pathological stream (e.g. a noisy proc-macro) bloating
 /// `meta.json`, accepting reduced fidelity only above the chosen size.
-fn max_diagnostics_bytes() -> Option<usize> {
-    std::env::var("KACHE_MAX_DIAGNOSTICS_BYTES")
-        .ok()
+fn parse_max_diagnostics_bytes(value: Option<&str>) -> Option<usize> {
+    value
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|&n| n > 0)
 }
@@ -2176,6 +2193,13 @@ fn positive_or_none(value: i64) -> Option<u64> {
 
 impl<P: ArtifactPolicy> ArtifactStore<P> {
     pub fn open(config: impl Into<Config>) -> Result<Self> {
+        Self::open_with_options(
+            config,
+            StoreOptions::from_env(|name| std::env::var(name).ok()),
+        )
+    }
+
+    pub fn open_with_options(config: impl Into<Config>, options: StoreOptions) -> Result<Self> {
         let config = config.into();
         fs::create_dir_all(&config.cache_dir)
             .with_context(|| format!("creating cache directory {}", config.cache_dir.display()))?;
@@ -2187,13 +2211,10 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         let (db, recovered) = open_index_db_reporting_recovery(&db_path)
             .with_context(|| format!("opening index database {}", db_path.display()))?;
 
-        // The blob ingest helpers are free functions; they read the flush
-        // policy of the store last opened on this thread. A thread that never
-        // opened a store flushes inline.
-        DEFERRED_DURABILITY.with(|deferred| deferred.set(config.deferred_durability));
         let store = Self {
             policy: std::marker::PhantomData,
             config: config.clone(),
+            options,
             db,
             eviction_pacing: (EVICTION_WRITE_SLICE, EVICTION_WRITE_PAUSE),
             read_only: false,
@@ -2239,9 +2260,18 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     ///
     /// [`Self::get`] stamps no hit and evicts or migrates nothing. A damaged
     /// or legacy entry is a miss. Mutators return an error, or do nothing for
-    /// best-effort maintenance and memo writes. The thread's durability policy,
-    /// which [`Self::open`] sets, is left alone.
+    /// best-effort maintenance and memo writes.
     pub fn open_read_only(config: impl Into<Config>) -> Result<Self> {
+        Self::open_read_only_with_options(
+            config,
+            StoreOptions::from_env(|name| std::env::var(name).ok()),
+        )
+    }
+
+    pub fn open_read_only_with_options(
+        config: impl Into<Config>,
+        options: StoreOptions,
+    ) -> Result<Self> {
         let config = config.into();
         let db_path = config.index_db_path();
         let mut header = [0u8; 20];
@@ -2281,6 +2311,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         Ok(Self {
             policy: std::marker::PhantomData,
             config,
+            options,
             db,
             eviction_pacing: (EVICTION_WRITE_SLICE, EVICTION_WRITE_PAUSE),
             read_only: true,
@@ -2320,8 +2351,8 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         if meta.files.iter().any(|f| entry_dir.join(&f.name).exists()) {
             return Ok(None);
         }
-        let verify_content =
-            !self.entry_is_durable(cache_key) || should_verify_this_restore(verify_restores_mode());
+        let verify_content = !self.entry_is_durable(cache_key)
+            || should_verify_this_restore(self.options.verify_restores);
         for cached_file in &meta.files {
             let blob = self.blob_path(&cached_file.hash);
             if validate_blob_metadata(&blob, cached_file.size).is_err() {
@@ -2478,7 +2509,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         // have left a blob whose size is right and whose bytes are not.
         let pending_durability = !self.entry_is_durable(cache_key);
         let verify_content =
-            pending_durability || should_verify_this_restore(verify_restores_mode());
+            pending_durability || should_verify_this_restore(self.options.verify_restores);
 
         // Verify all cached blobs still exist on disk and match expected size
         for cached_file in &meta.files {
@@ -2833,7 +2864,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         // verbatim — warning gates / `-D warnings` then behave identically on a
         // hit vs a miss (kunobi-ninja/kache#336). Optionally capped against
         // pathological streams; uncapped by default for full fidelity.
-        let diag_cap = max_diagnostics_bytes();
+        let diag_cap = self.options.max_diagnostics_bytes;
 
         // Write metadata (only meta.json in the entry directory)
         let meta = EntryMeta {
@@ -3876,7 +3907,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     /// The snapshot — not the live build output — is what gets hashed and
     /// published, which is what upholds the content-address invariant: a file
     /// that changes after this point cannot end up stored under another file's
-    /// digest (review finding #3). Ingest order mirrors [`materialize_blob`]:
+    /// digest (review finding #3). Ingest order mirrors [`materialize_blob_with_durability`]:
     /// reflink first, then hardlink where the kind allows inode sharing, then a
     /// real copy. The returned path must be consumed by
     /// [`Self::publish_staged_blob`] or removed by [`discard_staged_blob`].
@@ -4099,8 +4130,25 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         store_name: &str,
         allow_hardlink: bool,
     ) -> Result<()> {
+        self.rematerialize_and_verify_via(
+            source,
+            hash,
+            store_name,
+            allow_hardlink,
+            materialize_blob_with_durability,
+        )
+    }
+
+    fn rematerialize_and_verify_via(
+        &self,
+        source: &Path,
+        hash: &str,
+        store_name: &str,
+        allow_hardlink: bool,
+        materialize: impl FnOnce(&Path, &Path, bool, bool) -> Result<bool>,
+    ) -> Result<()> {
         let blob_path = self.blob_path(hash);
-        if materialize_blob(source, &blob_path, allow_hardlink)? {
+        if materialize(source, &blob_path, allow_hardlink, self.durable_writes())? {
             let actual = crate::file_hash::hash_file(&blob_path)?;
             if actual != hash {
                 anyhow::bail!(

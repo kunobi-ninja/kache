@@ -1609,6 +1609,42 @@ thread_local! {
     static PROVIDED_DEP_INFO: std::cell::RefCell<Option<(DepInfo, Option<TreeGuard>)>> = const { std::cell::RefCell::new(None) };
 }
 
+/// Own discovery state for one synchronous compiler invocation on this thread.
+/// Nested scopes restore their parent on drop, including during unwinding.
+/// Keep the scope on its thread and outside async suspension points.
+pub(crate) struct InvocationKeyScope {
+    defer_discovery: bool,
+    compile_while_keying: bool,
+    provided_dep_info: Option<(DepInfo, Option<TreeGuard>)>,
+    remote_rows: Option<RemoteRows>,
+    _thread_bound: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+impl InvocationKeyScope {
+    pub(crate) fn enter() -> Self {
+        Self {
+            defer_discovery: DEFER_DISCOVERY.with(|cell| cell.replace(false)),
+            compile_while_keying: COMPILE_WHILE_KEYING.with(|cell| cell.replace(false)),
+            provided_dep_info: PROVIDED_DEP_INFO.with(|cell| cell.replace(None)),
+            remote_rows: REMOTE_ROWS.with(|cell| cell.replace(None)),
+            _thread_bound: std::marker::PhantomData,
+        }
+    }
+}
+
+impl Drop for InvocationKeyScope {
+    fn drop(&mut self) {
+        DEFER_DISCOVERY.with(|cell| cell.set(self.defer_discovery));
+        COMPILE_WHILE_KEYING.with(|cell| cell.set(self.compile_while_keying));
+        let discarded_dep_info =
+            PROVIDED_DEP_INFO.with(|cell| cell.replace(self.provided_dep_info.take()));
+        let discarded_remote = REMOTE_ROWS.with(|cell| cell.replace(self.remote_rows.take()));
+        // Release callback captures after every slot has been restored and
+        // outside the RefCell borrow, so their destructors can observe it.
+        drop((discarded_dep_info, discarded_remote));
+    }
+}
+
 /// The key stopped before discovering the closure, and the wrapper compiles
 /// first (see [`set_defer_discovery`]). With `miss_certain`, no entry for the
 /// unit can exist; without it, the wrapper keys from the dep-info the compile
@@ -1678,6 +1714,7 @@ pub(crate) fn provided_dep_info_sources_for(
 
 /// The closure rustc wrote to `path` during the compile whose crate root is
 /// `source_file`: the same content the pre-pass reads from its own output.
+#[cfg(test)]
 pub fn dep_info_from_emitted(path: &Path, source_file: &Path) -> Result<DepInfo> {
     dep_info_from_emitted_for(path, source_file, &InvocationEnv::capture())
 }
@@ -3383,7 +3420,7 @@ fn compute_key_into(
                 &env_dep_paths,
                 file_hasher,
                 path_normalizer,
-                aliased_out_dir,
+                aliased_out_dir.as_deref(),
             );
             bakes_out_dir |= env_dep_bakes_out_dir(var, normalized_env_dep.decision, || {
                 env_dep_paths.value_is_under_out_dir(&value)
@@ -7373,9 +7410,14 @@ pub(crate) struct CcContentHashes {
 pub(crate) const CC_INPUT_CHANGED_WHILE_SCANNED: &str = "an input changed while it was scanned";
 
 impl FileHasher<'static> {
+    #[cfg(test)]
     pub fn new() -> Self {
+        Self::new_for(&InvocationEnv::capture())
+    }
+
+    pub(crate) fn new_for(env: &InvocationEnv) -> Self {
         FileHasher {
-            invocation_env: InvocationEnv::capture(),
+            invocation_env: env.clone(),
             cache: None,
             daemon_socket: None,
             use_input_predictions: false,
@@ -7474,8 +7516,12 @@ impl<'db> FileHasher<'db> {
     }
 
     pub(crate) fn from_cache(cache: FileHashCache<'db>) -> Self {
+        Self::from_cache_for(cache, &InvocationEnv::capture())
+    }
+
+    pub(crate) fn from_cache_for(cache: FileHashCache<'db>, env: &InvocationEnv) -> Self {
         FileHasher {
-            invocation_env: InvocationEnv::capture(),
+            invocation_env: env.clone(),
             cache: Some(cache),
             daemon_socket: None,
             use_input_predictions: false,
@@ -7498,6 +7544,7 @@ impl<'db> FileHasher<'db> {
         self
     }
 
+    #[cfg(test)]
     pub(crate) fn with_invocation_env(mut self, env: &InvocationEnv) -> Self {
         self.invocation_env = env.clone();
         self
@@ -9236,6 +9283,154 @@ fn unescape_env_dep_value(s: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod invocation_key_scope_tests {
+    use super::*;
+
+    fn fresh() -> bool {
+        !DEFER_DISCOVERY.with(Cell::get)
+            && !COMPILE_WHILE_KEYING.with(Cell::get)
+            && !dep_info_provided()
+            && remote_row("fixture").is_none()
+    }
+
+    fn install(name: &str, defer: bool, while_keying: bool) {
+        set_defer_discovery(defer);
+        set_compile_while_keying(while_keying);
+        provide_dep_info(
+            DepInfo {
+                source_files: vec![PathBuf::from(format!("{name}.rs"))],
+                env_deps: vec![("CLIENT".to_string(), Some(name.to_string()))],
+            },
+            Some(TreeGuard {
+                digest: name.to_string(),
+                walks: Vec::new(),
+            }),
+        );
+        let name = name.to_string();
+        set_remote_rows(Some(Box::new(move |identity| {
+            (identity == "fixture").then(|| {
+                crate::prediction_share::SharedPrediction::Portable(PortablePrediction {
+                    schema: PORTABLE_PREDICTION_SCHEMA,
+                    sources: vec![Portable::Literal(format!("{name}.rs"))],
+                    env_deps: Vec::new(),
+                    tree: name.clone(),
+                })
+            })
+        })));
+    }
+
+    fn consume(name: &str, defer: bool, while_keying: bool) {
+        assert_eq!(DEFER_DISCOVERY.with(Cell::get), defer);
+        assert_eq!(COMPILE_WHILE_KEYING.with(Cell::get), while_keying);
+        assert_eq!(remote_portable_row("fixture").unwrap().tree, name);
+        let mut outputs = KeyOutputs::default();
+        let dep_info = resolve_key_inputs(
+            &RustcArgs::default(),
+            &FileHasher::new_for(&InvocationEnv::default()),
+            "fixture",
+            &KeyEnv::default(),
+            &mut outputs,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(dep_info.source_files, [PathBuf::from(format!("{name}.rs"))]);
+        assert_eq!(
+            dep_info.env_deps,
+            [("CLIENT".to_string(), Some(name.to_string()))]
+        );
+        assert_eq!(outputs.tree_guard.unwrap().digest, name);
+        assert!(
+            !dep_info_provided(),
+            "the current closure was consumed once"
+        );
+    }
+
+    #[test]
+    fn nested_key_scopes_restore_the_parent_closure_flags_and_remote() {
+        let _parent = InvocationKeyScope::enter();
+        install("parent", true, false);
+        {
+            let _child = InvocationKeyScope::enter();
+            assert!(fresh());
+            install("child", false, true);
+            consume("child", false, true);
+            install("unconsumed-child", true, true);
+        }
+        consume("parent", true, false);
+    }
+
+    #[test]
+    fn a_panicking_request_restores_the_parent_key_state() {
+        let _parent = InvocationKeyScope::enter();
+        install("parent", true, true);
+        let result = std::panic::catch_unwind(|| -> () {
+            let _request = InvocationKeyScope::enter();
+            assert!(fresh());
+            install("panicking-client", false, false);
+            panic!("fixture request failed");
+        });
+        let panic = result.expect_err("the fixture must unwind through its request scope");
+        assert_eq!(
+            panic.downcast_ref::<&str>(),
+            Some(&"fixture request failed")
+        );
+        consume("parent", true, true);
+    }
+
+    #[test]
+    fn concurrent_reused_workers_discard_each_requests_pending_key_state() {
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let workers: Vec<_> = ["first", "second"]
+            .into_iter()
+            .map(|worker| {
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let _worker = InvocationKeyScope::enter();
+                    for request in 0..3 {
+                        let scope = InvocationKeyScope::enter();
+                        let starts_fresh = fresh();
+                        let name = format!("{worker}-{request}");
+                        install(&name, request != 1, request == 1);
+                        if request == 0 {
+                            barrier.wait();
+                        }
+                        assert!(starts_fresh);
+                        consume(&name, request != 1, request == 1);
+                        install(&format!("leftover-{name}"), true, true);
+                        drop(scope);
+                        assert!(fresh());
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn explicit_hashers_keep_the_supplied_client_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = InvocationEnv::from_parts(
+            [("CLIENT", "fixture")],
+            Some(dir.path().to_path_buf()),
+            None,
+            dir.path().to_path_buf(),
+        );
+        std::fs::write(dir.path().join("input.rs"), "client bytes").unwrap();
+        let hash = blake3::hash(b"client bytes").to_hex().to_string();
+        let local = FileHasher::new_for(&env);
+        assert_eq!(local.invocation_env.var("CLIENT").unwrap(), "fixture");
+        assert_eq!(local.hash(Path::new("input.rs")).unwrap(), hash);
+        let cache = FileHashCache::open(&dir.path().join("index.db")).unwrap();
+        let persistent = FileHasher::from_cache_for(cache, &env);
+        assert_eq!(persistent.invocation_env.cwd(), Some(dir.path()));
+        assert_eq!(persistent.invocation_env.var("CLIENT").unwrap(), "fixture");
+        assert_eq!(persistent.hash(Path::new("input.rs")).unwrap(), hash);
+    }
 }
 
 #[cfg(all(test, unix))]

@@ -34,9 +34,9 @@ impl ArtifactPolicy for CompilerArtifactPolicy {
 
 pub trait StoreHashExt {
     fn file_hasher(&self) -> crate::cache_key::FileHasher<'_>;
-    fn file_hasher_with_daemon(
+    fn file_hasher_for(
         &self,
-        socket_path: std::path::PathBuf,
+        env: &crate::invocation::InvocationEnv,
     ) -> crate::cache_key::FileHasher<'_>;
 }
 
@@ -44,11 +44,11 @@ impl StoreHashExt for Store {
     fn file_hasher(&self) -> crate::cache_key::FileHasher<'_> {
         crate::cache_key::FileHasher::from_cache(self.file_hash_cache())
     }
-    fn file_hasher_with_daemon(
+    fn file_hasher_for(
         &self,
-        socket_path: std::path::PathBuf,
+        env: &crate::invocation::InvocationEnv,
     ) -> crate::cache_key::FileHasher<'_> {
-        self.file_hasher().with_daemon(socket_path)
+        crate::cache_key::FileHasher::from_cache_for(self.file_hash_cache(), env)
     }
 }
 

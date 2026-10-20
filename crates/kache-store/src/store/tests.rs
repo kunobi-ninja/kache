@@ -1935,23 +1935,81 @@ fn a_read_only_blob_flushes_and_a_missing_one_reports_not_found() {
     );
 }
 
-/// The ingest helpers follow the flush policy of the store last opened
-/// on this thread: deferred stores skip the inline fsync, others keep it.
+/// Opening another handle must not change the first store's flush policy.
 #[test]
-fn blob_ingest_follows_the_last_opened_store_policy() {
+fn blob_ingest_keeps_each_stores_durability_policy() {
     let dir = tempfile::tempdir().unwrap();
-    let mut config = test_config(dir.path());
-    config.deferred_durability = true;
-    let _deferred = Store::open(&config).unwrap();
+    let mut deferred_config = test_config(&dir.path().join("deferred"));
+    deferred_config.deferred_durability = true;
+    let deferred =
+        Store::open_with_options(&deferred_config, StoreOptions::from_env(|_| None)).unwrap();
+    let strict_config = test_config(&dir.path().join("strict"));
+    let strict =
+        Store::open_with_options(&strict_config, StoreOptions::from_env(|_| None)).unwrap();
     assert!(
-        !durable_writes_now(),
-        "a deferred store skips the inline fsync"
+        !deferred.durable_writes(),
+        "the first store still defers its flushes"
     );
-    config.deferred_durability = false;
-    let _strict = Store::open(&config).unwrap();
+    assert!(strict.durable_writes(), "the second store flushes inline");
+
+    for (store, key, bytes, durable) in [
+        (
+            &deferred,
+            "deferred-entry",
+            b"deferred bytes".as_slice(),
+            false,
+        ),
+        (&strict, "strict-entry", b"strict bytes".as_slice(), true),
+    ] {
+        let source = dir.path().join(format!("{key}.rlib"));
+        fs::write(&source, bytes).unwrap();
+        let hash = crate::file_hash::hash_file(&source).unwrap();
+        store
+            .rematerialize_and_verify_via(
+                &source,
+                &hash,
+                "libout.rlib",
+                false,
+                |source, blob, allow_hardlink, observed_durable| {
+                    assert_eq!(
+                        observed_durable, durable,
+                        "phase-2 recovery uses its owning store's durability"
+                    );
+                    materialize_blob_with_durability(source, blob, allow_hardlink, observed_durable)
+                },
+            )
+            .unwrap();
+        assert_eq!(fs::read(store.blob_path(&hash)).unwrap(), bytes);
+        assert!(
+            fs::metadata(store.blob_path(&hash))
+                .unwrap()
+                .permissions()
+                .readonly()
+        );
+        store
+            .put(
+                key,
+                "crate",
+                &["lib".into()],
+                &[],
+                "target",
+                "dev",
+                &[(source, "libout.rlib".into())],
+                "",
+                "",
+            )
+            .unwrap();
+        assert_eq!(store.entry_is_durable(key), durable);
+        assert_eq!(store.pending_durability().unwrap(), u64::from(!durable));
+    }
+    assert_eq!(deferred.flush_durability(10).unwrap(), 1);
+    assert_eq!(strict.flush_durability(10).unwrap(), 0);
+    let reopened_deferred =
+        Store::open_with_options(&deferred_config, StoreOptions::from_env(|_| None)).unwrap();
+    assert!(!reopened_deferred.durable_writes());
     assert!(
-        durable_writes_now(),
-        "a durable store keeps the inline fsync"
+        strict.durable_writes(),
+        "opening a deferred store leaves the strict store unchanged"
     );
 }
 
@@ -7309,7 +7367,14 @@ fn get_evicts_when_verified_blob_is_unreadable() {
 
     let dir = tempfile::tempdir().unwrap();
     let config = test_config(dir.path());
-    let store = Store::open(&config).unwrap();
+    let store = Store::open_with_options(
+        &config,
+        StoreOptions {
+            verify_restores: VerifyRestores::Always,
+            max_diagnostics_bytes: None,
+        },
+    )
+    .unwrap();
 
     let output = dir.path().join("lib.rlib");
     fs::write(&output, b"readable before chmod").unwrap();
@@ -7331,8 +7396,6 @@ fn get_evicts_when_verified_blob_is_unreadable() {
     let blob = store.blob_path(&meta.files[0].hash);
     fs::set_permissions(&blob, fs::Permissions::from_mode(0o000)).unwrap();
 
-    let _env_lock = crate::test_support::process_state_test_lock();
-    let _verify = EnvVarGuard::set("KACHE_VERIFY_RESTORES", "always");
     let result = store.get("unreadable_key").unwrap();
 
     assert!(result.is_none(), "unreadable verified blob is evicted");
@@ -10627,7 +10690,7 @@ fn verify_restores_evicts_a_corrupted_blob() {
     // path and evicted → miss → recompile, instead of poisoning the build.
     let dir = tempfile::tempdir().unwrap();
     let config = test_config(dir.path());
-    let store = Store::open(&config).unwrap();
+    let store = Store::open_with_options(&config, StoreOptions::from_env(|_| None)).unwrap();
 
     let f = write_temp_file(dir.path(), "lib.rlib", b"the real artifact bytes");
     store
@@ -10662,25 +10725,91 @@ fn verify_restores_evicts_a_corrupted_blob() {
     }
     std::fs::write(&blob, vec![b'X'; meta.files[0].size as usize]).unwrap();
 
-    let _env_lock = crate::test_support::process_state_test_lock();
-
-    // Guard OFF (default): size matches, content not checked -> still a hit.
-    {
-        let _verify_off = EnvVarGuard::remove("KACHE_VERIFY_RESTORES");
-        assert!(
-            store.get("vkey").unwrap().is_some(),
-            "without the guard a same-size corrupt blob is not caught"
-        );
-    }
-
-    // Guard ON: content mismatch -> entry evicted -> miss.
-    let result = {
-        let _verify_on = EnvVarGuard::set("KACHE_VERIFY_RESTORES", "1");
-        store.get("vkey").unwrap()
-    };
+    assert!(
+        store.get("vkey").unwrap().is_some(),
+        "without verification a same-size corrupt blob is still a hit"
+    );
+    let verified = Store::open_with_options(
+        &config,
+        StoreOptions {
+            verify_restores: VerifyRestores::Always,
+            max_diagnostics_bytes: None,
+        },
+    )
+    .unwrap();
+    let result = verified.get("vkey").unwrap();
     assert!(
         result.is_none(),
         "the guard must evict a blob whose content != its address"
+    );
+}
+
+#[test]
+fn store_options_parse_only_the_supplied_selectors() {
+    let defaults = StoreOptions::from_env(|_| None);
+    assert_eq!(defaults.verify_restores, VerifyRestores::Off);
+    assert_eq!(defaults.max_diagnostics_bytes, None);
+    let selected = StoreOptions::from_env(|name| match name {
+        "KACHE_VERIFY_RESTORES" => Some("SAMPLED".to_string()),
+        "KACHE_MAX_DIAGNOSTICS_BYTES" => Some("42".to_string()),
+        other => panic!("unexpected selector: {other}"),
+    });
+    assert_eq!(selected.verify_restores, VerifyRestores::Sampled);
+    assert_eq!(selected.max_diagnostics_bytes, Some(42));
+    for value in ["0", "-1", "invalid", ""] {
+        let options = StoreOptions::from_env(|name| {
+            (name == "KACHE_MAX_DIAGNOSTICS_BYTES").then(|| value.to_string())
+        });
+        assert_eq!(options.max_diagnostics_bytes, None);
+    }
+}
+
+#[test]
+fn stores_keep_opposite_diagnostics_caps_after_other_handles_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let full = Store::open_with_options(&config, StoreOptions::from_env(|_| None)).unwrap();
+    let capped = Store::open_with_options(
+        &config,
+        StoreOptions {
+            verify_restores: VerifyRestores::Always,
+            max_diagnostics_bytes: Some(4),
+        },
+    )
+    .unwrap();
+    let source = write_temp_file(dir.path(), "output.rmeta", b"artifact bytes");
+    for (store, key) in [
+        (&full, "full-first"),
+        (&capped, "capped"),
+        (&full, "full-again"),
+    ] {
+        store
+            .put(
+                key,
+                "crate",
+                &["lib".into()],
+                &[],
+                "target",
+                "dev",
+                &[(source.clone(), "output.rmeta".into())],
+                "abcdefghij",
+                "éééé",
+            )
+            .unwrap();
+    }
+    for key in ["full-first", "full-again"] {
+        let meta = full.get(key).unwrap().unwrap();
+        assert_eq!(meta.stdout, "abcdefghij");
+        assert_eq!(meta.stderr, "éééé");
+    }
+    let meta = capped.get("capped").unwrap().unwrap();
+    assert_eq!(
+        meta.stdout,
+        "abcd\n[kache: diagnostics truncated, 6 bytes omitted (#336)]\n"
+    );
+    assert_eq!(
+        meta.stderr,
+        "éé\n[kache: diagnostics truncated, 4 bytes omitted (#336)]\n"
     );
 }
 
@@ -13210,7 +13339,6 @@ fn read_only_store_treats_a_truncated_blob_as_a_miss_and_evicts_nothing() {
 #[test]
 fn read_only_store_verifies_content_as_configured() {
     use std::os::unix::fs::PermissionsExt;
-    let _env_lock = crate::test_support::process_state_test_lock();
     let dir = tempfile::tempdir().unwrap();
     let src = tempfile::tempdir().unwrap();
     let config = test_config(dir.path());
@@ -13220,17 +13348,22 @@ fn read_only_store_verifies_content_as_configured() {
     let blob = owner.blob_path(&meta.files[0].hash);
     fs::set_permissions(&blob, fs::Permissions::from_mode(0o644)).unwrap();
     fs::write(&blob, b"ARTIFACT-BYTES").unwrap();
-    let ro = Store::open_read_only(&config).unwrap();
-    {
-        let _verify = EnvVarGuard::set("KACHE_VERIFY_RESTORES", "always");
-        assert!(
-            ro.get("flip").unwrap().is_none(),
-            "verified: other bytes are a miss"
-        );
-    }
-    let _verify = EnvVarGuard::set("KACHE_VERIFY_RESTORES", "off");
+    let verified = Store::open_read_only_with_options(
+        &config,
+        StoreOptions {
+            verify_restores: VerifyRestores::Always,
+            max_diagnostics_bytes: None,
+        },
+    )
+    .unwrap();
+    let unverified =
+        Store::open_read_only_with_options(&config, StoreOptions::from_env(|_| None)).unwrap();
     assert!(
-        ro.get("flip").unwrap().is_some(),
+        verified.get("flip").unwrap().is_none(),
+        "verified: other bytes are a miss"
+    );
+    assert!(
+        unverified.get("flip").unwrap().is_some(),
         "unverified: the size check passes"
     );
 }

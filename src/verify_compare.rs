@@ -122,6 +122,26 @@ thread_local! {
     static LAST_REPORT: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
+pub(crate) struct InvocationReportScope {
+    previous: Option<String>,
+    _thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+impl InvocationReportScope {
+    pub(crate) fn enter() -> Self {
+        Self {
+            previous: LAST_REPORT.with(|stash| stash.replace(None)),
+            _thread: std::marker::PhantomData,
+        }
+    }
+}
+
+impl Drop for InvocationReportScope {
+    fn drop(&mut self) {
+        LAST_REPORT.with(|stash| stash.replace(self.previous.take()));
+    }
+}
+
 /// Stash a verify summary for the hit event that the wrapper is about to log.
 pub(crate) fn record_report(summary: String) {
     let _ = LAST_REPORT.try_with(|stash| *stash.borrow_mut() = Some(summary));
@@ -136,8 +156,13 @@ pub(crate) fn take_last_report() -> String {
 
 /// `KACHE_VERIFY=1` / `true` enables compile-and-compare. Unset, `0`, `false`,
 /// and any other spelling leave it off. Read per call so tests can toggle it.
-pub(crate) fn enabled() -> bool {
-    parse_enabled(std::env::var("KACHE_VERIFY").ok().as_deref())
+#[cfg(test)]
+fn enabled() -> bool {
+    enabled_for(&crate::invocation::InvocationEnv::capture())
+}
+
+pub(crate) fn enabled_for(env: &crate::invocation::InvocationEnv) -> bool {
+    parse_enabled(env.var("KACHE_VERIFY").ok().as_deref())
 }
 
 pub(crate) fn parse_enabled(value: Option<&str>) -> bool {

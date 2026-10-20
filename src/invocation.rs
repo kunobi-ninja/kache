@@ -160,9 +160,13 @@ impl InvocationEnv {
 
     /// Apply an invocation-local rewrite, such as an OUT_DIR alias.
     pub(crate) fn set(&mut self, name: &str, value: impl Into<OsString>) {
+        self.set_os(OsStr::new(name), value.into());
+    }
+
+    pub(crate) fn set_os(&mut self, name: &OsStr, value: OsString) {
         let vars = std::sync::Arc::make_mut(&mut self.vars);
-        vars.retain(|(key, _)| !name_matches(key, name));
-        vars.push((name.into(), value.into()));
+        vars.retain(|(key, _)| !name_matches_os(key, name));
+        vars.push((name.to_owned(), value));
     }
 
     /// Search the client's PATH after rooting relative entries in its cwd.
@@ -206,9 +210,14 @@ impl InvocationEnv {
 }
 
 fn name_matches(key: &OsStr, name: &str) -> bool {
+    name_matches_os(key, OsStr::new(name))
+}
+
+fn name_matches_os(key: &OsStr, name: &OsStr) -> bool {
     if cfg!(windows) {
         key.to_str()
-            .is_some_and(|key| key.eq_ignore_ascii_case(name))
+            .zip(name.to_str())
+            .is_some_and(|(key, name)| key.eq_ignore_ascii_case(name))
     } else {
         key == name
     }

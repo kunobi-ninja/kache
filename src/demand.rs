@@ -46,6 +46,28 @@ thread_local! {
     static DEMANDS: RefCell<DemandLog> = RefCell::new(DemandLog::default());
 }
 
+/// Demand recorded by one synchronous invocation, including paths that exit
+/// before writing a build event. Nested scopes restore their caller's log.
+pub(crate) struct InvocationDemandScope {
+    previous: DemandLog,
+    _thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+impl InvocationDemandScope {
+    pub(crate) fn enter() -> Self {
+        Self {
+            previous: DEMANDS.with(|log| log.replace(DemandLog::default())),
+            _thread: std::marker::PhantomData,
+        }
+    }
+}
+
+impl Drop for InvocationDemandScope {
+    fn drop(&mut self) {
+        DEMANDS.with(|log| log.replace(std::mem::take(&mut self.previous)));
+    }
+}
+
 /// First lookup for this key, including a local hit. A stale prediction and
 /// its rederived key stay separate. One wrapper handles one compiler invocation.
 pub(crate) fn record(key: &str) {

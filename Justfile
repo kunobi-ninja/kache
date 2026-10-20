@@ -43,7 +43,7 @@ ci: fmt-check lint client-crates-check image-service-print helm-lint test-resour
 # dependency graph separately so feature unification cannot hide a dependency.
 [group('dev')]
 client-crates-check:
-  cargo check --locked -p kache-protocol -p kache-ipc --no-default-features
+  cargo check --locked -p kache-client -p kache-config -p kache-protocol -p kache-ipc --no-default-features
   cargo test --locked -p kache-ipc --no-default-features
 
 # Auto-fix formatting and clippy warnings.
@@ -111,14 +111,14 @@ fuzz-check:
 # Replay every committed minimized fuzz failure under ordinary stable tests.
 [group('dev')]
 fuzz-replay:
-  cargo test --locked --bin kache native_archive::tests::fuzz_regression_corpus_is_total_and_deterministic -- --exact
+  cargo test --locked --lib native_archive::tests::fuzz_regression_corpus_is_total_and_deterministic -- --exact
 
 # Generate deep valid seeds, then fuzz with explicit resource bounds.
 [group('dev')]
 fuzz-native-archive SECONDS="600":
   cargo metadata --manifest-path fuzz/Cargo.toml --locked --no-deps --format-version 1 >/dev/null
   mkdir -p {{justfile_directory()}}/tmp/fuzz/native-archive-seeds
-  KACHE_FUZZ_SEED_DIR="{{justfile_directory()}}/tmp/fuzz/native-archive-seeds" cargo test --locked --bin kache native_archive::tests::emit_fuzz_seed_corpus -- --ignored --exact
+  KACHE_FUZZ_SEED_DIR="{{justfile_directory()}}/tmp/fuzz/native-archive-seeds" cargo test --locked --lib native_archive::tests::emit_fuzz_seed_corpus -- --ignored --exact
   cargo +nightly-2026-05-16 fuzz run native_archive "{{justfile_directory()}}/tmp/fuzz/native-archive-seeds" -- -max_total_time={{SECONDS}} -max_len=1048576 -rss_limit_mb=2048 -timeout=5
 
 # Mutation-test the complete hermetic planner crate. Install the pinned local
@@ -332,7 +332,7 @@ trace-phases DIR *ARGS:
 # Add `--mbx mbx` or `--sccache sccache` to measure those tools as well.
 [group('bench')]
 bench-short PROJECT SAMPLES="6" *ARGS:
-  cargo build --release -p kache -p kache-e2e --bin kache --bin kache-scenario
+  cargo build --release -p kache -p kache-e2e --bin kache --bin kache-engine --bin kache-scenario
   python3 scripts/bench-short.py --project "{{PROJECT}}" --samples "{{SAMPLES}}" \
     --engine target/release/kache-scenario --kache target/release/kache \
     --output "tmp/bench/bench-{{PROJECT}}" {{ARGS}}
@@ -383,12 +383,14 @@ lint:
 [group('dev')]
 fmt:
   cargo fmt --all
+  rustfmt crates/kache-client/src/commands.rs
   cargo fmt --manifest-path fuzz/Cargo.toml
 
 # Check formatting without changing files.
 [group('dev')]
 fmt-check:
   cargo fmt --all -- --check
+  rustfmt --check crates/kache-client/src/commands.rs
   cargo fmt --manifest-path fuzz/Cargo.toml -- --check
 
 # Format flake.nix and packaging/nix/ with nixfmt. Deliberately not part of `check`

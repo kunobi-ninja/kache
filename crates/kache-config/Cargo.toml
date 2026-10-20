@@ -1,0 +1,35 @@
+[package]
+name = "kache-config"
+version = "1.2.2"
+edition = "2024"
+rust-version = "1.95"
+description = "Invocation inputs and shared configuration for Kache."
+license = "Apache-2.0"
+repository = "https://github.com/kunobi-ninja/kache"
+homepage = "https://kunobi.ninja/docs/kache"
+readme = "README.md"
+
+[features]
+test-support = ["kache-fs/testing"]
+
+[dependencies]
+kache-core = { version = "1.2.2", path = "../kache-core", default-features = false }
+kache-fs = { version = "1.2.2", path = "../kache-fs" }
+kache-shims = { version = "1.2.2", path = "../kache-shims" }
+anyhow = "1"
+blake3 = "1"
+bytesize = "2"
+dirs = "7"
+glob = "0.3"
+oci-spec = { version = "0.10", default-features = false, features = ["distribution"] }
+serde = { version = "1", features = ["derive"] }
+toml = "1"
+toml_edit = "0.25"
+tracing = "0.1"
+
+[dev-dependencies]
+kache-fs = { version = "1.2.2", path = "../kache-fs", features = ["testing"] }
+tempfile = "3"
+
+[target.'cfg(windows)'.dependencies]
+blake3 = { version = "1", features = ["pure"] }

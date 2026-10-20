@@ -3572,6 +3572,28 @@ fn gc_hints_coalesce_while_a_sweep_is_pending() {
 }
 
 #[test]
+fn delegated_gc_uses_the_invocation_budget_without_changing_daemon_policy() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut startup = test_config(dir.path());
+    startup.auto_gc = false;
+    startup.max_size = 10_000;
+    let mut invocation = startup.clone();
+    invocation.auto_gc = true;
+    invocation.max_size = 1_000;
+    let store = Store::open(&invocation).unwrap();
+    put_upload_evict_entry(&store, dir.path(), "evictable", 1_200, false);
+
+    let daemon = Daemon::new(startup);
+    daemon
+        .sweep_invocation_under_size_pressure(&invocation)
+        .unwrap();
+    assert!(!store.contains("evictable"));
+    assert!(store.physical_size().unwrap() <= 1_000);
+    assert!(!daemon.config.auto_gc);
+    assert_eq!(daemon.config.max_size, 10_000);
+}
+
+#[test]
 fn a_gc_hint_sweeps_under_size_pressure_and_honours_the_backoff() {
     let dir = tempfile::tempdir().unwrap();
     let mut config = test_config(dir.path());

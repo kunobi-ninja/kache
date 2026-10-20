@@ -417,6 +417,33 @@ pub fn detect() -> Result<Selection, Error> {
     select(&env, &RealFs)
 }
 
+/// Select the frontend installed beside the running engine. Validate the
+/// running image before using its companion's identity for alias selection.
+pub fn detect_frontend() -> Result<Selection, Error> {
+    let env = Env::from_process().map_err(Error::CurrentExe)?;
+    select_frontend(&env, None, &RealFs)
+}
+
+/// Select a captured frontend while validating the running engine's image.
+pub fn select_frontend(
+    env: &Env,
+    frontend: Option<&crate::FrontendImage>,
+    fs: &dyn Fs,
+) -> Result<Selection, Error> {
+    let mut env = env.clone();
+    let path = frontend
+        .map(|image| image.path.clone())
+        .unwrap_or_else(|| crate::frontend_for(&env.exe));
+    if path != env.exe {
+        own_identity(&env, fs)?;
+        env.exe = path;
+        env.exe_identity = frontend
+            .and_then(|image| image.identity)
+            .or_else(|| fs.identity(&env.exe));
+    }
+    select(&env, fs)
+}
+
 /// The path must still name the running image; otherwise it was replaced.
 fn own_identity(env: &Env, fs: &dyn Fs) -> Result<InodeId, Error> {
     let at_path = fs.identity(&env.exe).ok_or_else(|| missing_exe(&env.exe))?;

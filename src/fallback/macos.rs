@@ -1,4 +1,4 @@
-//! Best-effort preflight for a local sccache server. Unknown policy means retry on failure.
+//! macOS sandbox inspection for fallback servers and compiler handoff.
 // The Linux mutation lane cannot execute Darwin process APIs. The policy
 // decisions live in sandbox.rs and run under Linux mutations; macOS unit and
 // subprocess tests exercise this native adapter against an actual sandbox.
@@ -98,6 +98,29 @@ fn process_path(pid: i32) -> Option<PathBuf> {
 // never prevents compilation or startup of Kache itself.
 type SandboxCheck =
     unsafe extern "C" fn(libc::pid_t, *const libc::c_char, libc::c_int, ...) -> libc::c_int;
+
+/// A compiler task cannot inherit another process's Seatbelt policy. Unknown
+/// policy and sandboxed peers stay on the client's local execution path.
+pub(super) fn compiler_peer_unrestricted(token: kache_ipc::PeerAuditToken) -> bool {
+    type CheckToken = unsafe extern "C" fn(
+        kache_ipc::PeerAuditToken,
+        *const libc::c_char,
+        libc::c_int,
+        ...
+    ) -> libc::c_int;
+    let Some(policy) = Policy::load() else {
+        return false;
+    };
+    let check = unsafe { libc::dlsym(policy.library, c"sandbox_check_by_audit_token".as_ptr()) };
+    if check.is_null() {
+        return false;
+    }
+    let check: CheckToken = unsafe { std::mem::transmute(check) };
+    unsafe {
+        check(token, std::ptr::null(), 0) == 0
+            && (policy.check)(libc::getpid(), std::ptr::null(), 0) == 0
+    }
+}
 struct Policy {
     library: *mut libc::c_void,
     check: SandboxCheck,

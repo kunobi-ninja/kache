@@ -1583,7 +1583,7 @@ fn write_file(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub fn run(config: &crate::config::Config, args: &[String]) -> Result<i32> {
     run_for(config, args, &InvocationEnv::capture())
 }

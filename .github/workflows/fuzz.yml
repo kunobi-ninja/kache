@@ -64,7 +64,7 @@ jobs:
         run: |
           seed_dir="$RUNNER_TEMP/native-archive-seeds"
           mkdir -p "$seed_dir"
-          KACHE_FUZZ_SEED_DIR="$seed_dir" cargo test --locked --bin kache \
+          KACHE_FUZZ_SEED_DIR="$seed_dir" cargo test --locked --lib \
             native_archive::tests::emit_fuzz_seed_corpus -- --ignored --exact
           echo "KACHE_FUZZ_SEED_DIR=$seed_dir" >> "$GITHUB_ENV"
 

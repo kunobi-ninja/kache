@@ -29,6 +29,7 @@ const CHECK_INTERVAL: Duration = Duration::from_secs(300);
 pub(crate) struct RequestClock {
     origin: Instant,
     last_ms: AtomicU64,
+    active: AtomicU64,
 }
 
 impl RequestClock {
@@ -37,6 +38,7 @@ impl RequestClock {
         Self {
             origin: Instant::now(),
             last_ms: AtomicU64::new(0),
+            active: AtomicU64::new(0),
         }
     }
 
@@ -46,6 +48,7 @@ impl RequestClock {
         Self {
             origin: Instant::now() - 2 * QUIET_AFTER,
             last_ms: AtomicU64::new(0),
+            active: AtomicU64::new(0),
         }
     }
 
@@ -63,7 +66,29 @@ impl RequestClock {
     }
 
     pub(crate) fn idle_for(&self) -> Duration {
+        if self.active.load(Ordering::Acquire) != 0 {
+            return Duration::ZERO;
+        }
         self.idle_at(Instant::now())
+    }
+
+    #[cfg(any(unix, test))]
+    pub(crate) fn begin_activity(self: &Arc<Self>) -> BuildActivity {
+        self.active.fetch_add(1, Ordering::AcqRel);
+        self.touch(Instant::now());
+        BuildActivity(self.clone())
+    }
+}
+
+/// Keeps maintenance busy for accepted work, including queued or silent work.
+#[cfg(any(unix, test))]
+pub(crate) struct BuildActivity(Arc<RequestClock>);
+
+#[cfg(any(unix, test))]
+impl Drop for BuildActivity {
+    fn drop(&mut self) {
+        self.0.touch(Instant::now());
+        self.0.active.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -180,6 +205,23 @@ mod tests {
     use super::*;
 
     const SEC: Duration = Duration::from_secs(1);
+
+    #[test]
+    fn active_invocations_keep_maintenance_busy_until_every_owner_finishes() {
+        let clock = Arc::new(RequestClock::idle());
+        let first = clock.begin_activity();
+        let second = clock.begin_activity();
+        // Simulate a long compile without heartbeats, then another quiet window.
+        clock.last_ms.store(0, Ordering::Relaxed);
+        assert_eq!(clock.idle_for(), Duration::ZERO);
+        std::thread::spawn(move || drop(first)).join().unwrap();
+        clock.last_ms.store(0, Ordering::Relaxed);
+        assert_eq!(clock.idle_for(), Duration::ZERO);
+        drop(second);
+        assert!(clock.idle_for() < Duration::from_secs(1));
+        clock.last_ms.store(0, Ordering::Relaxed);
+        assert!(clock.idle_for() >= QUIET_AFTER);
+    }
 
     #[test]
     fn schedule_is_the_documented_one() {

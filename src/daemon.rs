@@ -20,6 +20,9 @@ use kunobi_daemon::Lifecycle;
 #[path = "daemon_lifecycle.rs"]
 mod lifecycle_client;
 pub(crate) use lifecycle_client::Ensured;
+#[cfg(unix)]
+#[path = "daemon_execution.rs"]
+mod execution;
 #[path = "daemon_control.rs"]
 mod lifecycle_control;
 use serde::{Deserialize, Serialize};
@@ -1835,6 +1838,10 @@ pub(crate) struct Daemon {
     /// When this read-only daemon last warned that it skipped a writable
     /// build's upload.
     readonly_skip_warned: Mutex<Option<Instant>>,
+    /// Keep compile workers below the connection cap, leaving RPC capacity
+    /// for their own remote checks and publication requests.
+    #[cfg(unix)]
+    execution_workers: Arc<tokio::sync::Semaphore>,
 }
 
 /// Whether a rate-limited warning may fire at `now`. Records `now` when it may.
@@ -1974,6 +1981,12 @@ impl Daemon {
             request_clock: Arc::new(crate::maintenance::RequestClock::new()),
             gc_hint_pending: AtomicBool::new(false),
             readonly_skip_warned: Mutex::new(None),
+            #[cfg(unix)]
+            execution_workers: Arc::new(tokio::sync::Semaphore::new(
+                std::thread::available_parallelism()
+                    .map_or(1, usize::from)
+                    .min(32),
+            )),
             config,
         }
     }
@@ -2650,6 +2663,7 @@ impl Daemon {
             Request::CompileStarted(req) => self.handle_compile_started(req.clone()),
             Request::CompileFinished(req) => self.handle_compile_finished(req),
             Request::Upload(_)
+            | Request::ExecuteV1(_)
             | Request::RemoteCheck(_)
             | Request::BatchRemoteCheck(_)
             | Request::Prefetch(_)
@@ -5774,6 +5788,26 @@ impl Daemon {
         Response::ok()
     }
 
+    /// A delegated compiler already resolved its cache policy. Keep that
+    /// snapshot when it requests eviction after a put. The wrapper's shared
+    /// throttle limits requests; each sweep also takes the store's gc.lock.
+    pub(crate) fn request_gc_for_invocation(self: &Arc<Self>, config: Config) {
+        let daemon = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            if let Err(error) = daemon.sweep_invocation_under_size_pressure(&config) {
+                tracing::warn!("invocation GC sweep failed: {error:#}");
+            }
+        });
+    }
+
+    fn sweep_invocation_under_size_pressure(&self, config: &Config) -> Result<()> {
+        let main = self.sweep_shard_under_size_pressure(config);
+        crate::volume_gc::run_on_volume_shards(config, |shard| {
+            self.sweep_shard_under_size_pressure(shard)
+        });
+        main
+    }
+
     fn run_hinted_sweep(&self) {
         // Released on unwind too, or one panic would swallow every later hint.
         struct Release<'a>(&'a AtomicBool);
@@ -7050,7 +7084,11 @@ async fn accept_loop(
             break;
         }
 
-        // Check idle timeout
+        // A compiler can be silent for minutes. Accepted work owns activity
+        // independently of optional progress or heartbeat traffic.
+        if lifecycle.snapshot().active != 0 {
+            last_activity = Instant::now();
+        }
         if let Some(timeout) = idle_timeout
             && last_activity.elapsed() > timeout
         {
@@ -7107,13 +7145,14 @@ async fn accept_loop(
             // Shared drain notification also wakes an otherwise idle listener.
             _ = lifecycle.draining() => {}
             // Wake periodically to check idle timeout (select won't fire otherwise)
-            _ = tokio::time::sleep(ACCEPT_LOOP_IDLE_TICK) => {}
+            _ = tokio::time::sleep(idle_timeout.unwrap_or(ACCEPT_LOOP_IDLE_TICK).min(ACCEPT_LOOP_IDLE_TICK)) => {}
             _ = &mut shutdown_signal => {
                 tracing::info!("shutdown signal received, draining...");
                 break;
             }
             Some(result) = handlers.join_next(), if !handlers.is_empty() => {
                 observe_connection_handler(result);
+                last_activity = Instant::now();
             }
         }
     }
@@ -7726,6 +7765,20 @@ async fn handle_connection_started_at(
         }
 
         let resp = match parsed {
+            Ok(Request::ExecuteV1(req)) => {
+                #[cfg(unix)]
+                {
+                    let result =
+                        execution::handle(&stream, &mut reader, *req, daemon, lifecycle).await;
+                    retire_for_newer_client(daemon, lifecycle, client_version.as_deref());
+                    return result;
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = req;
+                    Response::err("compiler execution is unavailable on this platform")
+                }
+            }
             Ok(Request::Upload(ref job)) => {
                 tracing::debug!(
                     crate_name = job.crate_name,
@@ -7787,21 +7840,7 @@ async fn handle_connection_started_at(
         };
         let elapsed = start.elapsed();
 
-        // Accepted work keeps its response and existing drain guarantees.
-        // Legacy epochs are ignored: rebuilding a client is not an upgrade.
-        if client_version
-            .as_deref()
-            .is_some_and(|version| client_version_is_newer(version, &daemon.version))
-            && lifecycle.accepting_calls()
-        {
-            tracing::info!(
-                daemon_version = daemon.version,
-                client_version,
-                "newer client release requested daemon replacement"
-            );
-            lifecycle.start_drain();
-            // Wake the accept loop so the restart starts now (issue #288).
-        }
+        retire_for_newer_client(daemon, lifecycle, client_version.as_deref());
 
         if let Some((error, routine)) = request_failure(&resp) {
             let elapsed_ms = elapsed.as_millis() as u64;
@@ -7822,6 +7861,21 @@ async fn handle_connection_started_at(
     }
 
     Ok(())
+}
+
+fn retire_for_newer_client(daemon: &Daemon, lifecycle: &Lifecycle, client_version: Option<&str>) {
+    // Accepted work keeps its response and existing drain guarantees.
+    // Legacy epochs are ignored: rebuilding a client is not an upgrade.
+    if client_version.is_some_and(|version| client_version_is_newer(version, &daemon.version))
+        && lifecycle.accepting_calls()
+    {
+        tracing::info!(
+            daemon_version = daemon.version,
+            client_version,
+            "newer client release requested daemon replacement"
+        );
+        lifecycle.start_drain();
+    }
 }
 
 /// Returns true for I/O errors that mean the client disconnected, so the

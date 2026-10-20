@@ -1,0 +1,36 @@
+[package]
+name = "kache-client"
+version = "1.2.2"
+edition = "2024"
+rust-version = "1.95"
+description = "Synchronous compiler client for the Kache daemon."
+license = "Apache-2.0"
+repository = "https://github.com/kunobi-ninja/kache"
+homepage = "https://kunobi.ninja/docs/kache"
+readme = "README.md"
+
+[dependencies]
+kache-config = { version = "1.2.2", path = "../kache-config" }
+kache-ipc = { version = "1.2.2", path = "../kache-ipc" }
+kache-protocol = { version = "1.2.2", path = "../kache-protocol" }
+anyhow = "1"
+tracing = "0.1"
+
+kache-shims = { version = "1.2.2", path = "../kache-shims" }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Console",
+    "Win32_System_Threading",
+] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[build-dependencies]
+syn = { version = "2", features = ["full"] }
+heck = "0.5"

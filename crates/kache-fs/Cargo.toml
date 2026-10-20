@@ -24,7 +24,7 @@ serde_json = "1"
 default = []
 serde = ["dep:serde"]
 staging = ["dep:tempfile"]
-testing = []
+testing = ["dep:tempfile"]
 
 [lints.rust]
 warnings = "deny"

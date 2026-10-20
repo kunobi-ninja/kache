@@ -5,14 +5,18 @@
 use serde_json::{Value, json};
 use std::cell::RefCell;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 const MAX_EVENTS: usize = 4096;
+static NEXT_THREAD: AtomicU64 = AtomicU64::new(1);
 thread_local! {
     static ACTIVE: RefCell<Option<Recorder>> = const { RefCell::new(None) };
+    static TRACE_THREAD: u64 = NEXT_THREAD.fetch_add(1, Ordering::Relaxed);
 }
 
 struct Recorder {
+    thread: u64,
     directory: PathBuf,
     start: Instant,
     epoch_us: u64,
@@ -34,7 +38,7 @@ impl Recorder {
     fn interval(&mut self, name: &str, start_us: u64, duration_us: u64) {
         self.push(json!({
             "name": name, "cat": self.adapter, "ph": "X",
-            "pid": std::process::id(), "tid": 0,
+            "pid": std::process::id(), "tid": self.thread,
             "ts": self.epoch_us.saturating_add(start_us), "dur": duration_us,
         }));
     }
@@ -67,6 +71,7 @@ fn start_at(directory: Option<PathBuf>, adapter: &'static str, args: &[String]) 
             return Invocation(false);
         }
         *active = Some(Recorder {
+            thread: TRACE_THREAD.with(|thread| *thread),
             directory,
             start: Instant::now(),
             epoch_us: SystemTime::now()
@@ -101,7 +106,7 @@ pub(crate) fn decision(name: &'static str, outcome: &str) {
                 .saturating_add(micros(recorder.start.elapsed()));
             recorder.push(json!({
                 "name": name, "cat": recorder.adapter, "ph": "i", "s": "t",
-                "pid": std::process::id(), "tid": 0, "ts": ts,
+                "pid": std::process::id(), "tid": recorder.thread, "ts": ts,
                 "args": {"outcome": outcome},
             }));
         }
@@ -135,7 +140,7 @@ impl Drop for Invocation {
             let elapsed = micros(recorder.start.elapsed());
             let root = json!({
                 "name": recorder.unit, "cat": recorder.adapter, "ph": "X",
-                "pid": std::process::id(), "tid": 0, "ts": recorder.epoch_us,
+                "pid": std::process::id(), "tid": recorder.thread, "ts": recorder.epoch_us,
                 "dur": elapsed, "args": {"dropped_events": recorder.dropped},
             });
             recorder.events.insert(0, root);
@@ -164,6 +169,32 @@ impl Drop for Invocation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn concurrent_invocations_have_separate_trace_lanes() {
+        let directory = tempfile::tempdir().unwrap();
+        std::thread::scope(|threads| {
+            for _ in 0..2 {
+                let directory = directory.path();
+                threads.spawn(move || {
+                    let _invocation = start_at(Some(directory.to_owned()), "cc", &[]);
+                    let _phase = phase("compile");
+                });
+            }
+        });
+        let mut lanes = std::collections::BTreeSet::new();
+        for entry in std::fs::read_dir(directory.path()).unwrap() {
+            let data: Value =
+                serde_json::from_slice(&std::fs::read(entry.unwrap().path()).unwrap()).unwrap();
+            for event in data["traceEvents"].as_array().unwrap() {
+                assert_eq!(event["pid"], std::process::id());
+                let thread = event["tid"].as_u64().unwrap();
+                assert_ne!(thread, 0);
+                lanes.insert(thread);
+            }
+        }
+        assert_eq!(lanes.len(), 2);
+    }
 
     #[test]
     fn records_real_nested_intervals_and_decisions() {

@@ -89,7 +89,7 @@ pub(crate) fn probe_linux_crt_objects(
 /// added to or removed from any of them changes that stamp, so a name that
 /// would now place differently is probed again. Content is still hashed
 /// through `hash` on every call, as before.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn probe_linux_crt_objects_memoized(
     memo_dir: &Path,
     driver: &Path,

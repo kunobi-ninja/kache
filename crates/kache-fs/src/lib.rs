@@ -9,6 +9,11 @@
 use std::io;
 use std::path::Path;
 
+pub mod paths;
+#[cfg(feature = "testing")]
+pub mod process_state_test;
+pub mod volume;
+
 mod copy;
 #[cfg(windows)]
 pub use copy::windows_cluster_size;

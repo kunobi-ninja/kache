@@ -5290,7 +5290,16 @@ fn command_line(argv: &[String], windows: bool) -> String {
 
 /// The arguments this process was started with, after the program name.
 pub(crate) fn command_args() -> Vec<String> {
-    std::env::args().skip(1).collect()
+    kache_client::engine_entry(std::env::args_os().collect(), crate::VERSION)
+        .map(|entry| {
+            entry
+                .args
+                .into_iter()
+                .skip(1)
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// The error a command that asks first gives when there is no terminal and
@@ -7831,7 +7840,7 @@ pub fn doctor(
     } else {
         (false, "not found".into())
     };
-    let running = std::env::current_exe().ok();
+    let running = crate::platform::frontend_executable().ok();
     checks.push(Check {
         label: "Binary",
         pass: bin_pass,
@@ -8194,7 +8203,7 @@ pub fn doctor(
 
     // Informational: the path shims and the service record for this binary,
     // and whether it outlives an upgrade.
-    let (pass, detail, hint) = doctor_install_path_check(&kache_shims::detect());
+    let (pass, detail, hint) = doctor_install_path_check(&crate::platform::frontend_selection());
     checks.push(Check {
         label: "Install path",
         pass,
@@ -10425,7 +10434,7 @@ pub(crate) fn rustdoc_shim_path_ok(value: &str) -> bool {
     if path.parent().is_some_and(kache_shims::farm::has_marker) {
         return true;
     }
-    let self_real = std::env::current_exe()
+    let self_real = crate::platform::frontend_executable()
         .ok()
         .and_then(|exe| std::fs::canonicalize(exe).ok());
     kache_shims::farm::resolves_to_kache(path, self_real.as_deref(), &|candidate| {
@@ -11794,7 +11803,7 @@ fn init_test_runner(
 /// an upgrade does not leave the farm dangling.
 #[cfg(unix)]
 fn shim_target() -> Result<kache_shims::Selection> {
-    kache_shims::detect().context("locating the kache binary")
+    crate::platform::frontend_selection().context("locating the kache binary")
 }
 
 /// True when `dir` already links every name an install with `extra_names`

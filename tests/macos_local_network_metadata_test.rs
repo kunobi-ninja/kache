@@ -3,9 +3,18 @@
 use std::process::Command;
 
 #[test]
-fn kache_binary_embeds_local_network_privacy_metadata() {
+fn kache_binaries_embed_local_network_privacy_metadata() {
+    for binary in [
+        env!("CARGO_BIN_EXE_kache"),
+        env!("CARGO_BIN_EXE_kache-engine"),
+    ] {
+        assert_privacy_metadata(binary);
+    }
+}
+
+fn assert_privacy_metadata(binary: &str) {
     let output = Command::new("otool")
-        .args(["-s", "__TEXT", "__info_plist", env!("CARGO_BIN_EXE_kache")])
+        .args(["-s", "__TEXT", "__info_plist", binary])
         .output()
         .expect("run otool against the built kache binary");
     assert!(

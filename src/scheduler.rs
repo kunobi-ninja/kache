@@ -53,7 +53,7 @@ pub const RSS_BYTES_PER_SLOT: u64 = 512 * 1024 * 1024;
 
 /// Environment variable that carries a running test's lease marker to its
 /// children. Its value is the marker's absolute path.
-pub const TEST_LEASE_ENV: &str = "KACHE_TEST_LEASE";
+pub use kache_config::TEST_LEASE_ENV;
 
 pub(crate) const WAIT_TIMEOUT: Duration = Duration::from_secs(1800);
 /// How long a test lease waits for its marker, never longer than its wait

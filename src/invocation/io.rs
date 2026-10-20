@@ -92,73 +92,33 @@ impl InvocationIo {
     }
 
     #[cfg(unix)]
-    pub(crate) fn try_capture() -> io::Result<Self> {
-        use std::os::fd::FromRawFd;
-
-        fn duplicate(fd: libc::c_int) -> io::Result<File> {
-            // fcntl also handles closed standard descriptors without borrowing
-            // an invalid fd. Captured parent descriptors stay close-on-exec.
-            let owned = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
-            if owned < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(unsafe { File::from_raw_fd(owned) })
+    pub(crate) fn transfer_files(&self) -> io::Result<(Vec<File>, bool)> {
+        let streams = self.streams()?.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                "compiler streams are not captured",
+            )
+        })?;
+        let mut files = vec![
+            streams.input.try_clone()?,
+            streams.output.file.try_clone()?,
+            streams.error.file.try_clone()?,
+        ];
+        if let Some(terminal) = &streams.terminal {
+            files.push(terminal.file.try_clone()?);
         }
-        Ok(Self::from_files(
-            duplicate(0)?,
-            duplicate(1)?,
-            duplicate(2)?,
-            process_terminal(),
-        ))
+        Ok((files, streams.terminal.is_some()))
     }
 
-    #[cfg(windows)]
+    #[cfg(any(unix, windows))]
     pub(crate) fn try_capture() -> io::Result<Self> {
-        use std::io::IsTerminal;
-        use std::os::windows::io::FromRawHandle;
-        use windows_sys::Win32::Foundation::{
-            DUPLICATE_SAME_ACCESS, DuplicateHandle, INVALID_HANDLE_VALUE,
-        };
-        use windows_sys::Win32::System::Console::{
-            GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
-        };
-        use windows_sys::Win32::System::Threading::GetCurrentProcess;
-
-        fn duplicate(which: u32) -> io::Result<File> {
-            let handle = unsafe { GetStdHandle(which) };
-            if handle.is_null() || handle == INVALID_HANDLE_VALUE {
-                return Err(io::Error::other("standard handle unavailable"));
-            }
-            let process = unsafe { GetCurrentProcess() };
-            let mut owned = std::ptr::null_mut();
-            if unsafe {
-                DuplicateHandle(
-                    process,
-                    handle,
-                    process,
-                    &mut owned,
-                    0,
-                    0,
-                    DUPLICATE_SAME_ACCESS,
-                )
-            } == 0
-            {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(unsafe { File::from_raw_handle(owned) })
-        }
-        let input = duplicate(STD_INPUT_HANDLE)?;
-        let output = duplicate(STD_OUTPUT_HANDLE)?;
-        let error = duplicate(STD_ERROR_HANDLE)?;
-        // Rust's console writer performs Unicode conversion. Retain the local
-        // path until console handles have an equivalent remote writer.
-        if input.is_terminal() || output.is_terminal() || error.is_terminal() {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "console handles require local execution",
-            ));
-        }
-        Ok(Self::from_files(input, output, error, None))
+        let stdio = kache_client::Stdio::capture()?;
+        Ok(Self::from_files(
+            stdio.input,
+            stdio.output,
+            stdio.error,
+            stdio.terminal,
+        ))
     }
 
     #[cfg(not(any(unix, windows)))]
@@ -307,7 +267,7 @@ pub(crate) fn status(command: &mut Command) -> io::Result<ExitStatus> {
     super::process::status(command)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 

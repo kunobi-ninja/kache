@@ -663,7 +663,19 @@ pub(crate) fn after_store(config: &Config, store: &Store, failure: Option<&anyho
         config,
         store,
         failure,
-        crate::daemon::send_gc_hint,
+        |config| {
+            let daemon = INVOCATION_SETTINGS.with(|slot| {
+                slot.borrow()
+                    .as_ref()
+                    .and_then(|settings| settings.daemon.clone())
+            });
+            if let Some(daemon) = daemon {
+                daemon.request_gc_for_invocation(config.clone());
+                true
+            } else {
+                crate::daemon::send_gc_hint(config)
+            }
+        },
         spawn_auto_gc_worker,
     );
 }
@@ -1243,7 +1255,7 @@ fn wrapper_entry() -> std::time::Instant {
 /// routing or scheduler admission yet); no fallback wrapper; any
 /// restore failure recompiles via passthrough (nvcc always rewrites
 /// `-o` outputs fresh, so no partial-restore abort).
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub fn run_nvcc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     run_nvcc_for(
         config,
@@ -1948,7 +1960,7 @@ fn nvcc_try_remote_hit(
 ///
 /// Local and remote hits share compiler-specific restoration. Miss-path
 /// flights, permits, and per-key build locks match rustc.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     run_cc_for(
         config,
@@ -3197,6 +3209,10 @@ fn finalize_cc_restore(
             && let Some(output) = parsed.object_output_path()
         {
             use std::os::unix::fs::PermissionsExt;
+            let output = parsed
+                .invocation_env
+                .resolve(&output)
+                .context("resolving restored C link output")?;
             let mut permissions = std::fs::metadata(&output)
                 .with_context(|| format!("cc restore: stat {}", output.display()))?
                 .permissions();
@@ -3381,6 +3397,10 @@ fn restore_cc_from_cache(
         // Recheck immediately before the path-based restore. The initial
         // refusal happens before lookup; this catches ordinary path changes
         // during key computation and narrows the window before restore.
+        let target = parsed
+            .invocation_env
+            .resolve(&target)
+            .context("resolving restored C artifact output")?;
         if cc_output_path_requires_passthrough(&target) {
             anyhow::bail!(
                 "cc restore: output path changed and now requires compiler passthrough semantics"
@@ -4992,8 +5012,12 @@ fn run_parsed_rustc(
     let depinfo_anchor = args.target_dir();
     let depinfo_working_dir = current_dir.as_deref().unwrap_or_else(|| Path::new("."));
     let depinfo_workspace_dir = args.path_normalization_root();
-    let depinfo_configured_roots =
-        configured_rustc_depinfo_roots(config, depinfo_workspace_dir, depinfo_anchor.as_deref());
+    let depinfo_configured_roots = configured_rustc_depinfo_roots(
+        config,
+        depinfo_workspace_dir,
+        depinfo_anchor.as_deref(),
+        args.invocation_env(),
+    );
 
     // Validate the compiler's consumer-facing dep-info before Store::put makes
     // an entry observable. The staging transform below cannot alter its input.
@@ -5569,8 +5593,9 @@ fn configured_rustc_depinfo_roots(
     config: &Config,
     workspace_root: Option<&Path>,
     target_dir: Option<&Path>,
+    env: &crate::invocation::InvocationEnv,
 ) -> Vec<(PathBuf, String, u8)> {
-    crate::path_normalizer::PathNormalizer::from_env(workspace_root)
+    crate::path_normalizer::PathNormalizer::from_invocation(workspace_root, env)
         .with_target_dir(target_dir)
         .with_base_dirs(&config.base_dirs)
         .depinfo_source_roots()
@@ -5688,7 +5713,9 @@ fn prestage_target_dir(args: &RustcArgs) -> Option<PathBuf> {
     if let Some(out_dir) = &args.out_dir
         && let Some(profile) = crate::cargo_layout::build_script_dir_profile(out_dir)
     {
-        return profile.parent().map(Path::to_path_buf);
+        return profile
+            .parent()
+            .and_then(|path| args.resolve_invocation_path(path));
     }
     args.target_dir()
 }
@@ -5733,13 +5760,12 @@ fn remember_prestaged_executables(
             && restore_link_strategy(kind, file.executable, shared_loadable)
                 == link::LinkStrategy::Copy
         {
-            crate::prestage::remember(
-                &config.cache_dir,
-                &target_dir,
-                &artifact_target_path(args, output_dir, &file.name),
-                &file.hash,
-                file.size,
-            );
+            let Some(dest) =
+                args.resolve_invocation_path(&artifact_target_path(args, output_dir, &file.name))
+            else {
+                continue;
+            };
+            crate::prestage::remember(&config.cache_dir, &target_dir, &dest, &file.hash, file.size);
         }
     }
 }
@@ -7705,6 +7731,10 @@ fn restore_from_cache_with_memo_store(
     let Some(output_dir) = rustc_output_dir(args) else {
         anyhow::bail!("no output path (-o) or output directory (--out-dir) in args");
     };
+    let output_dir = args
+        .invocation_env()
+        .resolve(&output_dir)
+        .context("resolving restored Rust output directory")?;
 
     // Ensure the output directory exists before restoring any files.
     // This avoids redundant `create_dir_all` syscalls per file (issue #563)
@@ -7729,8 +7759,12 @@ fn restore_from_cache_with_memo_store(
         .context("restoring dep-info requires the invocation working directory")?
         .to_owned();
     let depinfo_workspace_dir = args.path_normalization_root();
-    let depinfo_configured_roots =
-        configured_rustc_depinfo_roots(config, depinfo_workspace_dir, cargo_target_dir.as_deref());
+    let depinfo_configured_roots = configured_rustc_depinfo_roots(
+        config,
+        depinfo_workspace_dir,
+        cargo_target_dir.as_deref(),
+        args.invocation_env(),
+    );
 
     // Dep-info validation gate (kunobi-ninja/kache#330): a restored `.d`
     // whose paths do not resolve for THIS consumer poisons cargo's
@@ -7812,7 +7846,11 @@ fn restore_from_cache_with_memo_store(
             }
         };
         for dep in dependencies {
-            if !dep.exists() {
+            let resolved = args
+                .invocation_env()
+                .resolve(&dep)
+                .context("resolving restored Rust dep-info dependency")?;
+            if !resolved.exists() {
                 let _ = store.remove_entry(&meta.cache_key);
                 anyhow::bail!(
                     "cached dep-info for {} references {} which does not resolve here — \
@@ -7856,7 +7894,10 @@ fn restore_from_cache_with_memo_store(
             );
         }
 
-        let target_path = artifact_target_path(args, &output_dir, &cached_file.name);
+        let target_path = args
+            .invocation_env()
+            .resolve(&artifact_target_path(args, &output_dir, &cached_file.name))
+            .context("resolving restored Rust artifact output")?;
 
         // Per-file dispatch by artifact kind: `classify_output` picks
         // the kind, `plan_post_restore` the actions — no ad-hoc filename
@@ -8428,6 +8469,7 @@ thread_local! {
 struct InvocationWrapperSettings {
     progress_level: u8,
     temp_dir: Option<PathBuf>,
+    daemon: Option<std::sync::Arc<crate::daemon::Daemon>>,
 }
 
 /// Work left by a compile-before-key path belongs only to that invocation.
@@ -8449,10 +8491,14 @@ impl InvocationWrapperScope {
         Self::enter_with_settings(None)
     }
 
-    pub(crate) fn enter_for(env: &crate::invocation::InvocationEnv) -> Self {
+    pub(crate) fn enter_for(
+        env: &crate::invocation::InvocationEnv,
+        daemon: Option<std::sync::Arc<crate::daemon::Daemon>>,
+    ) -> Self {
         Self::enter_with_settings(Some(InvocationWrapperSettings {
             progress_level: parse_progress_level(env.var("KACHE_PROGRESS").ok().as_deref()),
             temp_dir: env.resolve(env.temp_dir()),
+            daemon,
         }))
     }
 

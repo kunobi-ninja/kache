@@ -226,6 +226,7 @@ fn unselected_workspace_crates_seed_then_stay_active() {
     let checkout = tempfile::tempdir().unwrap();
     let project = checkout_path(checkout.path());
     let cache = tempfile::tempdir().unwrap();
+    let _daemon = common::DaemonGuard::new(kache_binary(), cache.path());
     let target = project.join("target");
     create_workspace(&project);
     let future = SystemTime::now()
@@ -321,6 +322,7 @@ fn real_rustc() -> PathBuf {
 /// [`RACE_RUSTC`].
 #[cfg(unix)]
 struct RaceWorkspace {
+    _daemon: common::DaemonGuard,
     _checkout: tempfile::TempDir,
     cache: tempfile::TempDir,
     tools: tempfile::TempDir,
@@ -364,9 +366,11 @@ impl RaceWorkspace {
         let shim = tools.path().join("rustc");
         fs::write(&shim, RACE_RUSTC).unwrap();
         fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).unwrap();
+        let cache = tempfile::tempdir().unwrap();
         Self {
+            _daemon: common::DaemonGuard::new(kache_binary(), cache.path()),
             _checkout: checkout,
-            cache: tempfile::tempdir().unwrap(),
+            cache,
             tools,
             project,
             env: Vec::new(),
@@ -616,6 +620,7 @@ fn a_seed_releases_the_discovery_flight_before_it_compiles() {
     let checkout = tempfile::tempdir().unwrap();
     let project = checkout_path(checkout.path());
     let cache = tempfile::tempdir().unwrap();
+    let _daemon = common::DaemonGuard::new(kache_binary(), cache.path());
     let tools = tempfile::tempdir().unwrap();
     let target = project.join("target");
     create_workspace(&project);

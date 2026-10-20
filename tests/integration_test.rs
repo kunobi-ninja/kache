@@ -35,6 +35,7 @@ fn test_cc_cache_hit_replays_warning_locations_in_the_receiving_checkout() {
     build_kache();
     let project = TempDir::new().unwrap();
     let cache = TempDir::new().unwrap();
+    let _cache_daemon = common::DaemonGuard::new(kache_binary(), cache.path());
     let producer = project.path().join("producer");
     let consumer = project.path().join("consumer");
     for root in [&producer, &consumer] {
@@ -146,6 +147,7 @@ fn test_rust_restored_outputs_allow_build_without_wrapper() {
 
     let project = TempDir::new_in(common::scratch_dir()).unwrap();
     let cache = TempDir::new_in(common::scratch_dir()).unwrap();
+    let _cache_daemon = common::DaemonGuard::new(kache_binary(), cache.path());
     let target = project.path().join("target");
     let source = project.path().join("lib.rs");
     fs::write(&source, "pub fn value() -> u32 { 42 }\n").unwrap();
@@ -234,6 +236,7 @@ fn test_rust_restored_outputs_allow_build_without_wrapper() {
 fn rustc_corrupt_entry_recompiles_with_the_normal_path_remap() {
     let project = TempDir::new_in(common::scratch_dir()).unwrap();
     let cache = TempDir::new_in(common::scratch_dir()).unwrap();
+    let _cache_daemon = common::DaemonGuard::new(kache_binary(), cache.path());
     let source = project.path().join("lib.rs");
     let output_dir = project.path().join("out");
     std::fs::create_dir(&output_dir).unwrap();
@@ -507,6 +510,7 @@ fn test_cli_help() {
 fn test_cli_list_empty() {
     build_kache();
     let cache_dir = TempDir::new().unwrap();
+    let _cache_dir_daemon = common::DaemonGuard::new(kache_binary(), cache_dir.path());
 
     Command::from(hermetic_command(
         kache_binary(),
@@ -523,6 +527,7 @@ fn test_cli_list_empty() {
 fn test_cli_purge_empty() {
     build_kache();
     let cache_dir = TempDir::new().unwrap();
+    let _cache_dir_daemon = common::DaemonGuard::new(kache_binary(), cache_dir.path());
 
     Command::from(hermetic_command(
         kache_binary(),
@@ -541,6 +546,7 @@ fn test_disabled_passthrough() {
 
     let test_project = Path::new(env!("CARGO_MANIFEST_DIR")).join("test-projects/hello-world");
     let cache_dir = TempDir::new().unwrap();
+    let _cache_dir_daemon = common::DaemonGuard::new(kache_binary(), cache_dir.path());
     let target_dir = TempDir::new().unwrap();
 
     // Build with kache disabled — should work just like normal cargo
@@ -569,6 +575,7 @@ fn test_wrapper_hello_world() {
 
     let test_project = Path::new(env!("CARGO_MANIFEST_DIR")).join("test-projects/hello-world");
     let cache_dir = TempDir::new().unwrap();
+    let _cache_dir_daemon = common::DaemonGuard::new(kache_binary(), cache_dir.path());
     let target_dir = TempDir::new().unwrap();
 
     // First build (should be all cache misses)
@@ -704,6 +711,7 @@ fn test_rust_compile_with_failed_strip_is_not_stored() {
 
     let test_project = Path::new(env!("CARGO_MANIFEST_DIR")).join("test-projects/hello-world");
     let cache_dir = TempDir::new().unwrap();
+    let _cache_dir_daemon = common::DaemonGuard::new(kache_binary(), cache_dir.path());
     let target_dir = TempDir::new().unwrap();
     let build = || {
         let _ = std::fs::remove_dir_all(target_dir.path());
@@ -751,6 +759,7 @@ fn test_manifest_dir_env_dep_does_not_restore_stale_rlib_across_worktrees() {
     write_manifest_dir_workspace(&workspace_b);
 
     let cache_dir = TempDir::new().unwrap();
+    let _cache_dir_daemon = common::DaemonGuard::new(kache_binary(), cache_dir.path());
     let target_a = TempDir::new().unwrap();
     let target_b = TempDir::new().unwrap();
 
@@ -819,6 +828,7 @@ fn test_rust_extern_cascade_converges_across_clones() {
     write_ws(&clone_b);
 
     let cache_dir = TempDir::new().unwrap();
+    let _cache_dir_daemon = common::DaemonGuard::new(kache_binary(), cache_dir.path());
     let target_a = TempDir::new().unwrap();
     let target_b = TempDir::new().unwrap();
 
@@ -881,6 +891,7 @@ fn test_rust_out_dir_include_converges_across_clones() {
     write_proj(&clone_b);
 
     let cache_dir = TempDir::new().unwrap();
+    let _cache_dir_daemon = common::DaemonGuard::new(kache_binary(), cache_dir.path());
     let target_a = TempDir::new().unwrap();
     let target_b = TempDir::new().unwrap();
 
@@ -912,6 +923,7 @@ fn test_rust_depinfo_restore_preserves_include_str_parent_relative_path() {
 
     let project = TempDir::new().unwrap();
     let cache_dir = TempDir::new().unwrap();
+    let _cache_dir_daemon = common::DaemonGuard::new(kache_binary(), cache_dir.path());
     let target_dir = TempDir::new().unwrap();
     std::fs::create_dir_all(project.path().join("src")).unwrap();
     std::fs::write(
@@ -1000,6 +1012,7 @@ pub fn value() -> u8 {
 /// leaves behind the output needed to fix it instead of just a skip.
 fn kache_caches_probe_keyed_flags(work: &Path) -> bool {
     let cache_dir = work.join("probe-gate-cache");
+    let _cache_daemon = common::DaemonGuard::new(kache_binary(), &cache_dir);
     let source = work.join("gate.c");
     std::fs::create_dir_all(&cache_dir).unwrap();
     std::fs::write(&source, "int gate(void) { return 0; }\n").unwrap();
@@ -1160,6 +1173,7 @@ fn probe_keyed_flags_cache_and_key_on_value_live() {
 
     build_kache();
     let cache_dir = TempDir::new().unwrap();
+    let _cache_dir_daemon = common::DaemonGuard::new(kache_binary(), cache_dir.path());
     std::fs::write(work.path().join("tu.c"), "int tu(void) { return 7; }\n").unwrap();
 
     // `-fstack-protector-strong` is `CapturedByProbe`; a cold compile that
@@ -1262,6 +1276,7 @@ fn test_cc_existing_symlink_output_matches_selected_compiler() {
     build_kache();
     let project = TempDir::new().unwrap();
     let cache_dir = TempDir::new().unwrap();
+    let _cache_dir_daemon = common::DaemonGuard::new(kache_binary(), cache_dir.path());
     let control = project.path().join("control");
     let seed = project.path().join("seed");
     let wrapped = project.path().join("wrapped");
@@ -1387,6 +1402,7 @@ fn test_cc_existing_readonly_output_matches_selected_compiler() {
     build_kache();
     let project = TempDir::new().unwrap();
     let cache_dir = TempDir::new().unwrap();
+    let _cache_dir_daemon = common::DaemonGuard::new(kache_binary(), cache_dir.path());
     let control_dir = project.path().join("control");
     let seed_dir = project.path().join("seed");
     let wrapped_dir = project.path().join("wrapped");
@@ -1468,6 +1484,7 @@ fn test_cc_passthrough_preserves_non_utf8_streams_and_exit_status() {
     build_kache();
     let project = TempDir::new().unwrap();
     let cache_dir = TempDir::new().unwrap();
+    let _cache_dir_daemon = common::DaemonGuard::new(kache_binary(), cache_dir.path());
     let shell = std::process::Command::new("sh")
         .args(["-c", "command -v sh"])
         .output()
@@ -1540,6 +1557,7 @@ fn test_cc_existing_writable_hardlink_output_matches_selected_compiler() {
     build_kache();
     let project = TempDir::new().unwrap();
     let cache_dir = TempDir::new().unwrap();
+    let _cache_dir_daemon = common::DaemonGuard::new(kache_binary(), cache_dir.path());
     let seed_dir = project.path().join("seed");
     let hardlink_dir = project.path().join("hardlink");
     std::fs::create_dir_all(&seed_dir).unwrap();
@@ -1639,6 +1657,7 @@ fn test_cc_existing_readonly_hardlink_output_matches_selected_compiler() {
     build_kache();
     let project = TempDir::new().unwrap();
     let cache_dir = TempDir::new().unwrap();
+    let _cache_dir_daemon = common::DaemonGuard::new(kache_binary(), cache_dir.path());
     let control_dir = project.path().join("control");
     let seed_dir = project.path().join("seed");
     let wrapped_dir = project.path().join("wrapped");
@@ -1716,6 +1735,7 @@ fn test_cc_dev_null_output_is_passthrough_and_preserved() {
     build_kache();
     let project = TempDir::new().unwrap();
     let cache_dir = TempDir::new().unwrap();
+    let _cache_dir_daemon = common::DaemonGuard::new(kache_binary(), cache_dir.path());
     std::fs::write(project.path().join("foo.c"), "int f(void) { return 42; }\n").unwrap();
 
     run_kache_cc(
@@ -1762,6 +1782,7 @@ fn test_cc_cache_output_stays_writable_across_miss_hit_and_recompile() {
     build_kache();
     let project = TempDir::new().unwrap();
     let cache_dir = TempDir::new().unwrap();
+    let _cache_dir_daemon = common::DaemonGuard::new(kache_binary(), cache_dir.path());
     let source = project.path().join("foo.c");
     let output = project.path().join("foo.o");
     std::fs::write(&source, "int f(void) { return 1; }\n").unwrap();
@@ -1802,6 +1823,7 @@ fn test_cc_existing_plain_output_hits_and_reconfigured_miss_is_stored() {
     build_kache();
     let project = TempDir::new().unwrap();
     let cache_dir = TempDir::new().unwrap();
+    let _cache_dir_daemon = common::DaemonGuard::new(kache_binary(), cache_dir.path());
     let source = project.path().join("foo.c");
     let output = project.path().join("foo.o");
     std::fs::write(&source, "int f(void) { return 42; }\n").unwrap();
@@ -1845,6 +1867,7 @@ fn test_cc_hit_preserves_missing_parent_failure() {
     build_kache();
     let project = TempDir::new().unwrap();
     let cache_dir = TempDir::new().unwrap();
+    let _cache_dir_daemon = common::DaemonGuard::new(kache_binary(), cache_dir.path());
     let source = project.path().join("foo.c");
     let seed_dir = project.path().join("seed");
     std::fs::create_dir(&seed_dir).unwrap();
@@ -1933,6 +1956,7 @@ fn test_cc_relative_depinfo_stays_writable_across_repeated_hits() {
     build_kache();
     let project = TempDir::new().unwrap();
     let cache_dir = TempDir::new().unwrap();
+    let _cache_dir_daemon = common::DaemonGuard::new(kache_binary(), cache_dir.path());
     std::fs::create_dir(project.path().join("build")).unwrap();
     std::fs::write(project.path().join("foo.c"), "int f(void) { return 42; }\n").unwrap();
     let args = [
@@ -2015,6 +2039,7 @@ fn test_cc_forced_include_and_param_converge_across_clones_issue_580() {
     }
 
     let cache_dir = TempDir::new().unwrap();
+    let _cache_dir_daemon = common::DaemonGuard::new(kache_binary(), cache_dir.path());
     // Stands in for `$CARGO_HOME/registry/src/…/generated-include` — one
     // absolute path both clones pass verbatim.
     let shared = TempDir::new().unwrap();
@@ -2165,6 +2190,7 @@ fn test_cc_no_omit_leaf_frame_pointer_keys_on_probe_issue_839() {
 
     let work = TempDir::new().unwrap();
     let cache_dir = TempDir::new().unwrap();
+    let _cache_dir_daemon = common::DaemonGuard::new(kache_binary(), cache_dir.path());
     std::fs::write(work.path().join("tu.c"), "int tu(void) { return 7; }\n").unwrap();
 
     // Cold: compiles and stores. A passthrough records no miss, so this is
@@ -2282,6 +2308,7 @@ fn test_cc_ubsan_strip_path_components_caches_issue_840() {
 
     let work = TempDir::new().unwrap();
     let cache_dir = TempDir::new().unwrap();
+    let _cache_dir_daemon = common::DaemonGuard::new(kache_binary(), cache_dir.path());
     std::fs::write(work.path().join("je.c"), "int je(void) { return 0; }\n").unwrap();
 
     let with_flag = [
@@ -2384,6 +2411,7 @@ fn test_cc_gdwarf2_caches_and_keys_dwarf_version_issue_838() {
         return;
     }
     let cache_dir = TempDir::new().unwrap();
+    let _cache_dir_daemon = common::DaemonGuard::new(kache_binary(), cache_dir.path());
     let work = TempDir::new().unwrap();
     std::fs::write(work.path().join("tu.c"), "int tu(void) { return 7; }\n").unwrap();
     let object = work.path().join("tu.o");
@@ -2505,6 +2533,7 @@ fn test_cc_gfull_caches_and_keys_apart_from_no_debug_issue_857() {
         return;
     }
     let cache_dir = TempDir::new().unwrap();
+    let _cache_dir_daemon = common::DaemonGuard::new(kache_binary(), cache_dir.path());
     let work = TempDir::new().unwrap();
     std::fs::write(work.path().join("tu.c"), "int tu(void) { return 7; }\n").unwrap();
     let object = work.path().join("tu.o");
@@ -2589,6 +2618,7 @@ fn test_cc_trivial_auto_var_init_pattern_caches_issue_849() {
 
     let work = TempDir::new().unwrap();
     let cache_dir = TempDir::new().unwrap();
+    let _cache_dir_daemon = common::DaemonGuard::new(kache_binary(), cache_dir.path());
     std::fs::write(
         work.path().join("tu.c"),
         "int use_auto_var(void) { int value; return value; }\n",
@@ -2667,6 +2697,7 @@ fn test_cc_merge_all_constants_keys_on_probe_issue_856() {
 
     let work = TempDir::new().unwrap();
     let cache_dir = TempDir::new().unwrap();
+    let _cache_dir_daemon = common::DaemonGuard::new(kache_binary(), cache_dir.path());
     std::fs::write(work.path().join("tu.c"), "int tu(void) { return 7; }\n").unwrap();
 
     let enabled = [
@@ -2767,6 +2798,7 @@ fn test_cc_depinfo_sidecar_restores_on_hit_and_new_mf_path() {
 
     let project = TempDir::new().unwrap();
     let cache_dir = TempDir::new().unwrap();
+    let _cache_dir_daemon = common::DaemonGuard::new(kache_binary(), cache_dir.path());
     std::fs::create_dir_all(project.path().join("src")).unwrap();
     std::fs::create_dir_all(project.path().join("build")).unwrap();
     std::fs::write(
@@ -2841,6 +2873,7 @@ fn test_cc_depinfo_sidecar_restores_on_hit_and_new_mf_path() {
     assert_last_cc_event(&report, "local_hit", 0);
 
     let pp_cache_dir = TempDir::new().unwrap();
+    let _pp_cache_dir_daemon = common::DaemonGuard::new(kache_binary(), pp_cache_dir.path());
     let _ = std::fs::remove_dir_all(project.path().join("build"));
     let _ = std::fs::remove_dir_all(project.path().join("deps"));
     std::fs::create_dir_all(project.path().join("build")).unwrap();
@@ -2888,6 +2921,7 @@ fn test_cc_preprocess_memo_skips_warm_probe_and_invalidates_on_header_change() {
 
     let project = TempDir::new().unwrap();
     let cache_dir = TempDir::new().unwrap();
+    let _cache_dir_daemon = common::DaemonGuard::new(kache_binary(), cache_dir.path());
     std::fs::write(project.path().join("value.h"), "#define VALUE 7\n").unwrap();
     std::fs::write(
         project.path().join("foo.c"),
@@ -2934,6 +2968,7 @@ fn test_cc_compound_depinfo_suffix_restores_across_relocated_build_root() {
 
     let root = TempDir::new().unwrap();
     let cache_dir = TempDir::new().unwrap();
+    let _cache_dir_daemon = common::DaemonGuard::new(kache_binary(), cache_dir.path());
     let clone_a = root.path().join("clone-a");
     let clone_b = root.path().join("clone-b");
 
@@ -3012,6 +3047,7 @@ fn test_cc_legacy_compound_depinfo_entry_self_heals_and_why_miss_explains_it() {
 
     let project = TempDir::new().unwrap();
     let cache_dir = TempDir::new().unwrap();
+    let _cache_dir_daemon = common::DaemonGuard::new(kache_binary(), cache_dir.path());
     std::fs::create_dir_all(project.path().join("src")).unwrap();
     std::fs::create_dir_all(project.path().join("build")).unwrap();
     std::fs::write(
@@ -3094,6 +3130,7 @@ fn test_cc_depinfo_restore_preserves_parent_relative_deps() {
 
     let project = TempDir::new().unwrap();
     let cache_dir = TempDir::new().unwrap();
+    let _cache_dir_daemon = common::DaemonGuard::new(kache_binary(), cache_dir.path());
     let source_dir = project.path().join("src");
     let object_dir = project.path().join("obj/a/b/c");
     std::fs::create_dir_all(&source_dir).unwrap();
@@ -3162,6 +3199,7 @@ fn test_auto_gc_bounds_store_size() {
 
     let test_project = TempDir::new().unwrap();
     let cache_dir = TempDir::new().unwrap();
+    let _cache_dir_daemon = common::DaemonGuard::new(kache_binary(), cache_dir.path());
     let target_dir = TempDir::new().unwrap();
     let src_dir = test_project.path().join("src");
     std::fs::create_dir_all(&src_dir).unwrap();
@@ -3304,7 +3342,8 @@ cache_executables = true
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("auto-gc: spawned background `kache gc`"),
+        stderr.contains("auto-gc: spawned background `kache gc`")
+            || stderr.contains("auto-gc: handed the sweep to the daemon"),
         "second build should trigger background auto-GC.\nstderr: {stderr}"
     );
 
@@ -3346,6 +3385,7 @@ cache_executables = true
 fn workspace_wrapper_passthrough_executes_every_time() {
     build_kache();
     let cache_dir = TempDir::new().unwrap();
+    let _cache_dir_daemon = common::DaemonGuard::new(kache_binary(), cache_dir.path());
     let marker = cache_dir.path().join("wrapper-runs.log");
 
     // Fake workspace wrapper: records each execution, then forwards to rustc.
@@ -3413,6 +3453,7 @@ fn test_cc_direct_key_compiles_once_without_a_preprocess() {
 
     let project = TempDir::new().unwrap();
     let cache_dir = TempDir::new().unwrap();
+    let _cache_dir_daemon = common::DaemonGuard::new(kache_binary(), cache_dir.path());
     std::fs::write(project.path().join("value.h"), "#define VALUE 7\n").unwrap();
     // A system header brings the libc's macro-built asm operands into the
     // read set; they must not read as files the assembler opens.
@@ -3466,6 +3507,7 @@ fn test_cc_direct_key_uses_the_callers_depfile() {
 
     let project = TempDir::new().unwrap();
     let cache_dir = TempDir::new().unwrap();
+    let _cache_dir_daemon = common::DaemonGuard::new(kache_binary(), cache_dir.path());
     std::fs::write(project.path().join("value.h"), "#define VALUE 7\n").unwrap();
     std::fs::write(
         project.path().join("foo.c"),
@@ -3503,6 +3545,7 @@ fn test_cc_direct_key_refuses_an_assembler_read_file() {
 
     let project = TempDir::new().unwrap();
     let cache_dir = TempDir::new().unwrap();
+    let _cache_dir_daemon = common::DaemonGuard::new(kache_binary(), cache_dir.path());
     std::fs::write(project.path().join("blob.bin"), b"payload").unwrap();
     std::fs::write(
         project.path().join("foo.c"),
@@ -3544,6 +3587,7 @@ fn test_cc_direct_key_binds_a_root_spelling_object_to_its_checkout() {
 
     let project = TempDir::new().unwrap();
     let cache_dir = TempDir::new().unwrap();
+    let _cache_dir_daemon = common::DaemonGuard::new(kache_binary(), cache_dir.path());
     // The canonical spelling: that is the root the wrapper derives from its
     // working directory, and the one the object must be seen to embed.
     let root = std::fs::canonicalize(project.path()).unwrap();

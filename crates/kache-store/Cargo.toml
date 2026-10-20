@@ -20,6 +20,7 @@ name = "bench-cc-memos"
 required-features = ["test-support"]
 
 [dependencies]
+kache-core = { version = "1.2.2", path = "../kache-core", default-features = false }
 kache-format = { version = "1.2.2", path = "../kache-format" }
 kache-fs = { version = "1.2.2", path = "../kache-fs", features = ["staging"] }
 anyhow = "1"

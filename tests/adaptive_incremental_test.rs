@@ -335,6 +335,7 @@ fn wait_with_timeout(mut child: Child, timeout: Duration) -> Result<Output, Stri
 fn source_churn_adapts_then_returns_to_exact_cache_hits() {
     let project = tempfile::tempdir().unwrap();
     let cache = tempfile::tempdir().unwrap();
+    let _daemon = common::DaemonGuard::new(kache_binary(), cache.path());
     let target = project.path().join("target");
     let fallback = create_fixture(project.path());
     let fallback_marker = project.path().join("fallback-used");
@@ -444,6 +445,7 @@ fn source_churn_adapts_then_returns_to_exact_cache_hits() {
 fn compile_errors_keep_adaptive_state_through_the_fix() {
     let project = tempfile::tempdir().unwrap();
     let cache = tempfile::tempdir().unwrap();
+    let _daemon = common::DaemonGuard::new(kache_binary(), cache.path());
     let target = project.path().join("target");
     let policy_root = target.join("debug/incremental.kache-auto");
     let fallback = create_fixture(project.path());
@@ -523,6 +525,7 @@ fn compile_errors_keep_adaptive_state_through_the_fix() {
 fn local_source_churn_seeds_from_emitted_dep_info_without_a_pre_pass() {
     let project = tempfile::tempdir().unwrap();
     let cache = tempfile::tempdir().unwrap();
+    let _daemon = common::DaemonGuard::new(kache_binary(), cache.path());
     let target = project.path().join("target");
     let policy_root = target.join("debug/incremental.kache-auto");
     create_fixture(project.path());
@@ -582,6 +585,7 @@ fn local_source_churn_seeds_from_emitted_dep_info_without_a_pre_pass() {
 fn local_learning_cache_hit_discards_the_provisional_graph() {
     let project = tempfile::tempdir().unwrap();
     let cache = tempfile::tempdir().unwrap();
+    let _daemon = common::DaemonGuard::new(kache_binary(), cache.path());
     let target = project.path().join("target");
     let policy_root = target.join("debug/incremental.kache-auto");
     create_fixture(project.path());
@@ -639,6 +643,7 @@ fn local_learning_cache_hit_discards_the_provisional_graph() {
 fn local_empty_cache_entry_does_not_stop_the_cold_compile() {
     let project = tempfile::tempdir().unwrap();
     let cache = tempfile::tempdir().unwrap();
+    let _daemon = common::DaemonGuard::new(kache_binary(), cache.path());
     let target = project.path().join("target");
     let policy_root = target.join("debug/incremental.kache-auto");
     create_fixture(project.path());
@@ -676,6 +681,7 @@ fn local_empty_cache_entry_does_not_stop_the_cold_compile() {
 fn local_unqualified_cold_seed_resets_learning_so_the_next_build_can_store() {
     let project = tempfile::tempdir().unwrap();
     let cache = tempfile::tempdir().unwrap();
+    let _daemon = common::DaemonGuard::new(kache_binary(), cache.path());
     let target = project.path().join("target");
     let policy_root = target.join("debug/incremental.kache-auto");
     create_fixture(project.path());
@@ -730,6 +736,7 @@ fn local_unqualified_cold_seed_resets_learning_so_the_next_build_can_store() {
 fn local_failed_cold_seed_keeps_the_next_fix_on_the_seed_lane() {
     let project = tempfile::tempdir().unwrap();
     let cache = tempfile::tempdir().unwrap();
+    let _daemon = common::DaemonGuard::new(kache_binary(), cache.path());
     let target = project.path().join("target");
     create_fixture(project.path());
 
@@ -776,6 +783,7 @@ fn local_failed_cold_seed_keeps_the_next_fix_on_the_seed_lane() {
 fn user_facing_executable_without_fallback_uses_default_immediate_adaptive_lane() {
     let project = tempfile::tempdir().unwrap();
     let cache = tempfile::tempdir().unwrap();
+    let _daemon = common::DaemonGuard::new(kache_binary(), cache.path());
     let target = project.path().join("target");
 
     fs::create_dir(project.path().join("src")).unwrap();
@@ -853,6 +861,7 @@ fn user_facing_executable_without_fallback_uses_default_immediate_adaptive_lane(
 fn user_facing_executable_preserves_configured_fallback_contract() {
     let project = tempfile::tempdir().unwrap();
     let cache = tempfile::tempdir().unwrap();
+    let _daemon = common::DaemonGuard::new(kache_binary(), cache.path());
     let target = project.path().join("target");
     let fallback = project.path().join("fallback");
     let fallback_marker = project.path().join("fallback-used");
@@ -950,6 +959,7 @@ fn user_facing_executable_preserves_configured_fallback_contract() {
 fn contended_immediate_lane_never_shares_incremental_state() {
     let project = tempfile::tempdir().unwrap();
     let cache = tempfile::tempdir().unwrap();
+    let _daemon = common::DaemonGuard::new(kache_binary(), cache.path());
     let profile = project.path().join("target/debug");
     let deps = profile.join("deps");
     let incremental = profile.join("incremental");

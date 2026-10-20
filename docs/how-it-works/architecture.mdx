@@ -3,11 +3,21 @@ title: Architecture
 description: How the compiler wrapper, local store, and daemon divide the work
 ---
 
-Kache has three parts: a compiler wrapper, a local store, and an optional daemon.
+Kache ships a small `kache` client and a `kache-engine` executable containing the
+CLI, cache pipeline and daemon.
+
+On Unix, the client sends compiler arguments, environment, working directory and
+owned streams to the daemon. The daemon runs concurrent pipelines and starts the
+native compilers as child processes. The engine starts a missing daemon on the
+first cache-enabled compile. If preparation fails, the client can run the local
+engine. Once it attempts Commit, it cannot retry the compiler locally.
+
+CLI commands and build-script launchers run in the engine. Windows currently uses
+the local engine for compiler execution.
 
 ## Build path
 
-For an eligible compiler invocation, the wrapper:
+For an eligible compiler invocation, the pipeline:
 
 1. parses the compiler arguments and discovers inputs
 2. computes a BLAKE3 cache key

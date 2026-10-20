@@ -531,7 +531,11 @@ fn resolve_cargo_program(program: &OsStr, cwd: &Path) -> Result<PathBuf> {
     let current = std::env::current_exe()
         .ok()
         .and_then(|path| path.canonicalize().ok());
-    if Some(&resolved_identity) == current.as_ref() {
+    let frontend = crate::platform::frontend_executable()
+        .ok()
+        .and_then(|path| path.canonicalize().ok());
+    if Some(&resolved_identity) == current.as_ref() || Some(&resolved_identity) == frontend.as_ref()
+    {
         bail!(
             "resolved Cargo program {:?} points back to kache; set KACHE_REAL_CARGO to the real Cargo binary",
             program

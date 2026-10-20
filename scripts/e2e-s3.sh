@@ -44,7 +44,7 @@ KACHE_E2E_S3_ENDPOINT=$endpoint \
   KACHE_S3_ACCESS_KEY=$access_key \
   KACHE_S3_SECRET_KEY=$secret_key \
   RUSTC_WRAPPER="" \
-  cargo test -p kache --bin kache -- "$filter" --nocapture 2>&1 | tee "$output"
+  cargo test -p kache --lib -- "$filter" --nocapture 2>&1 | tee "$output"
 
 # The tests return early without the store; make sure they did not.
 ran=$(grep -c "^test .*$filter.* \.\.\. ok$" "$output" || true)

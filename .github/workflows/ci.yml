@@ -586,7 +586,7 @@ jobs:
           cargo install --locked kani-verifier --version 0.67.0
           cargo kani setup
       - name: Build the local Kache wrapper
-        run: cargo build --bin kache
+        run: cargo build --bin kache --bin kache-engine
       - name: Discover and verify Kani harnesses through Kache
         env:
           RUSTC_WRAPPER: ${{ github.workspace }}/target/debug/kache
@@ -900,7 +900,7 @@ jobs:
           install_args: rust
           cache: false
       - name: Build kache
-        run: cargo build --locked -p kache --bin kache
+        run: cargo build --locked -p kache --bin kache --bin kache-engine
         env:
           RUSTC_WRAPPER: ""
       # The action looks in the runner's tool cache before downloading a

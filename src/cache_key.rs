@@ -4405,7 +4405,7 @@ impl StaticLibUse {
 /// resolves to is read-only and has the same path in every target directory
 /// that shares it, so its bytes decide the link as much as a copy under the
 /// profile directory would.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn hermetic_archive_under(archive: &Path, resolved: &Path, spelled_root: &Path) -> bool {
     hermetic_archive_under_for(archive, resolved, spelled_root, &InvocationEnv::capture())
 }
@@ -5774,9 +5774,7 @@ fn env_dep_path_only_decision(
 /// names case-insensitively, so dep-info can carry any spelling of it; on
 /// Unix a differently-cased name is a different variable, and refusing it
 /// costs misses only.
-pub(crate) fn is_manifest_dir_var(var: &str) -> bool {
-    var.eq_ignore_ascii_case("CARGO_MANIFEST_DIR")
-}
+pub(crate) use kache_config::invocation::is_manifest_dir_var;
 
 /// The form a path is compared in: canonical when it resolves, else as given.
 ///
@@ -9569,7 +9567,7 @@ mod invocation_core_tests {
 /// rest read it back in <1 ms.
 /// `rustc -vV` of `rustc`, as the cache key reads it (cached per binary), or
 /// `None` when it cannot be run.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn rustc_version_text(rustc: &Path) -> Option<String> {
     get_rustc_version(rustc).ok()
 }
@@ -9580,7 +9578,7 @@ pub(crate) fn rustc_version_text_for(rustc: &Path, env: &InvocationEnv) -> Optio
 
 /// Whether this compiler accepts cwd remapping for this crate and bootstrap
 /// environment. No source is compiled. Transient faults are not memoized.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn rustc_accepts_cwd_remap(
     rustc: &Path,
     crate_name: &str,
@@ -9710,7 +9708,7 @@ pub(crate) fn get_rustc_version_for(rustc: &Path, env: &InvocationEnv) -> Result
 
 /// `clippy-driver --version` (`clippy 0.1.98 (hash date)`), file-cached like
 /// the rustc version. `-vV` only reports the underlying rustc.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn get_clippy_version(driver: &Path) -> Result<String> {
     get_clippy_version_for(driver, &InvocationEnv::capture())
 }
@@ -9738,7 +9736,7 @@ fn get_clippy_version_for(driver: &Path, env: &InvocationEnv) -> Result<String> 
 /// or `clippy.toml`, searched from `CLIPPY_CONF_DIR`, else the manifest
 /// directory, upwards) and the lint arguments `cargo clippy` passes through
 /// the environment. Content, not location, so two checkouts share keys.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn clippy_identity(driver: &Path, env: &KeyEnv) -> Result<String> {
     clippy_identity_in(
         driver,
@@ -9759,7 +9757,7 @@ pub(crate) fn clippy_identity_for(
     )
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn clippy_identity_in(
     driver: &Path,
     env: impl Fn(&str) -> Option<std::ffi::OsString>,
@@ -10047,7 +10045,7 @@ fn tool_version_cache_path(binary: &Path, prefix: &str) -> Option<std::path::Pat
 }
 
 /// [`tool_version_cache_path`] with `PATH` given.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn tool_version_cache_path_in(
     binary: &Path,
     prefix: &str,
@@ -10801,7 +10799,7 @@ fn probe_linux_libc_signature_for(
 }
 
 /// Get linker identity string for cache key, with file-based caching.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn get_linker_identity(args: &RustcArgs) -> Option<String> {
     get_linker_identity_for(args, &InvocationEnv::capture())
 }
@@ -10860,7 +10858,7 @@ fn runnable_file(path: &Path) -> bool {
 /// the working directory fails. Windows searches the wrapper's own directory
 /// and adds `.exe` first, so a bare name there is not resolved and the
 /// caller runs the tool as before.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn program_path<'a>(binary: &'a Path, path_var: Option<&OsStr>) -> Option<Cow<'a, Path>> {
     let mut components = binary.components();
     match (components.next(), components.next()) {
@@ -10873,7 +10871,7 @@ fn program_path<'a>(binary: &'a Path, path_var: Option<&OsStr>) -> Option<Cow<'a
 
 /// One function with a cfg block per platform, so the Linux mutation lane
 /// mutates the body it compiles and tests.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn bare_program_path(name: &OsStr, path_var: Option<&OsStr>) -> Option<std::path::PathBuf> {
     #[cfg(unix)]
     {

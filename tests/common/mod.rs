@@ -74,6 +74,8 @@ fn bootstrap_kache() -> Result<PathBuf, String> {
             "build",
             "--bin",
             "kache",
+            "--bin",
+            "kache-engine",
             "--target-dir",
             target_dir.to_str().expect("bootstrap target dir is utf-8"),
             "--config",
@@ -303,6 +305,35 @@ pub fn wait_for_daemon_exit(runtime_dir: &Path, timeout: Duration) -> Result<(),
         std::thread::sleep(Duration::from_millis(100));
     }
     Ok(())
+}
+
+/// Stops a fixture's daemon before its runtime directory is removed.
+/// Declare after the TempDir, or before it in a fixture's field list.
+#[allow(dead_code)]
+pub struct DaemonGuard {
+    program: PathBuf,
+    runtime: PathBuf,
+}
+
+#[allow(dead_code)]
+impl DaemonGuard {
+    pub fn new(program: impl AsRef<Path>, runtime: impl AsRef<Path>) -> Self {
+        Self {
+            program: program.as_ref().to_owned(),
+            runtime: runtime.as_ref().to_owned(),
+        }
+    }
+}
+
+impl Drop for DaemonGuard {
+    fn drop(&mut self) {
+        let mut stop = hermetic_command(
+            &self.program,
+            &self.runtime,
+            Some(&self.runtime.join("daemon-guard-no-config.toml")),
+        );
+        stop_daemon(stop.args(["daemon", "stop"]), &self.runtime);
+    }
 }
 
 /// Stops the daemon that owns `runtime_dir`, for a test fixture's `Drop`.

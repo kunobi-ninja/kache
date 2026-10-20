@@ -2050,6 +2050,69 @@ fn artifact_target_path_keeps_the_exact_output_path() {
     assert_eq!(rustc_output_dir(&args), Some(PathBuf::from("out")));
 }
 
+#[test]
+fn prestaging_relative_outputs_keeps_each_invocations_worktree() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path().join("cache"));
+    let mut expected = Vec::new();
+    std::thread::scope(|threads| {
+        for (client, output_dir, name) in [
+            ("ordinary", "target/debug/deps", "app"),
+            (
+                "build-script",
+                "target/debug/build/unit",
+                "build_script_build",
+            ),
+        ] {
+            let root = dir.path().join(client);
+            std::fs::create_dir(&root).unwrap();
+            let output = format!("{output_dir}/{name}");
+            expected.push(root.join(&output));
+            let config = &config;
+            threads.spawn(move || {
+                let env = crate::invocation::InvocationEnv::from_parts(
+                    std::iter::empty::<(String, String)>(),
+                    Some(root.clone()),
+                    None,
+                    root,
+                );
+                let args = RustcArgs::parse_for(
+                    &s(&[
+                        "rustc",
+                        "main.rs",
+                        "--crate-name",
+                        name,
+                        "--crate-type",
+                        "bin",
+                        "--out-dir",
+                        output_dir,
+                        "-o",
+                        &output,
+                    ]),
+                    &env,
+                )
+                .unwrap();
+                let mut file = cached_file(name, &"a".repeat(64));
+                file.size = crate::prestage::MIN_BYTES;
+                file.executable = true;
+                let meta = entry_meta(&"b".repeat(64), vec![file], &["link"]);
+                remember_prestaged_executables(
+                    config,
+                    &RustcCompiler::new(),
+                    &args,
+                    Path::new(output_dir),
+                    None,
+                    &meta,
+                );
+            });
+        }
+    });
+    let mut recorded = crate::prestage::recorded_dests(&config.cache_dir);
+    expected.sort();
+    recorded.sort();
+    assert_eq!(recorded, expected);
+}
+
 /// Prestage records and hints go to the target directory itself, also
 /// for a build script compiled into `<profile>/build/<unit>`, where
 /// `RustcArgs::target_dir` answers the profile directory.
@@ -2207,9 +2270,10 @@ fn configured_rustc_depinfo_roots_cover_every_restorable_anchor() {
     let dir = tempfile::tempdir().unwrap();
     let base = dir.path().canonicalize().unwrap();
     let workspace = base.join("workspace");
+    let cwd = workspace.join("member");
     let target = base.join("shared-target");
     let vendored = base.join("vendored-sources");
-    for path in [&workspace, &target, &vendored] {
+    for path in [&workspace, &cwd, &target, &vendored] {
         std::fs::create_dir_all(path).unwrap();
     }
 
@@ -2217,7 +2281,13 @@ fn configured_rustc_depinfo_roots_cover_every_restorable_anchor() {
         base_dirs: vec![vendored.to_string_lossy().into_owned()],
         ..test_config(base.join("cache"))
     };
-    let roots = configured_rustc_depinfo_roots(&config, Some(&workspace), Some(&target));
+    let env = crate::invocation::InvocationEnv::from_parts(
+        std::iter::empty::<(String, String)>(),
+        Some(cwd.clone()),
+        None,
+        base.clone(),
+    );
+    let roots = configured_rustc_depinfo_roots(&config, Some(&workspace), Some(&target), &env);
 
     let found = |root: &Path, sentinel: &str| {
         roots
@@ -2228,6 +2298,7 @@ fn configured_rustc_depinfo_roots_cover_every_restorable_anchor() {
         found(&workspace, "__kache_workspace__/"),
         "workspace root missing from {roots:?}"
     );
+    assert!(found(&cwd, "__kache_cwd__/"), "cwd missing from {roots:?}");
     assert!(
         found(&target, "__kache_target_rule__/"),
         "external target root missing from {roots:?}"
@@ -4184,6 +4255,51 @@ fn restore_cc_from_cache_replaces_existing_plain_object() {
         std::fs::read(store.blob_path(hash)).unwrap(),
         b"cached object"
     );
+}
+
+#[test]
+fn concurrent_cc_restores_root_objects_and_link_outputs_in_each_client_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path().join("cache"));
+    let bytes = b"cached bytes";
+    let hash = blake3::hash(bytes).to_hex().to_string();
+    create_blob(&Store::open(&config).unwrap(), &hash, bytes);
+    std::thread::scope(|threads| {
+        for (name, args, cached) in [
+            (
+                "compile",
+                s(&["cc", "-c", "unit.c", "-o", "out/unit.o"]),
+                "unit.o",
+            ),
+            ("link", s(&["cc", "unit.o", "-o", "out/app"]), "app"),
+        ] {
+            let root = dir.path().join(name);
+            std::fs::create_dir_all(root.join("out")).unwrap();
+            let config = config.clone();
+            let hash = hash.clone();
+            threads.spawn(move || {
+                let env = crate::invocation::InvocationEnv::from_parts(
+                    std::iter::empty::<(String, String)>(),
+                    Some(root.clone()),
+                    None,
+                    root.clone(),
+                );
+                let parsed = crate::compiler::cc::CcArgs::parse_for(&args, &env).unwrap();
+                let meta = entry_meta("cc-client-path", vec![cached_file(cached, &hash)], &[]);
+                restore_cc_from_cache(&Store::open(&config).unwrap(), &parsed, &meta).unwrap();
+                let output = root.join("out").join(cached);
+                assert_eq!(std::fs::read(&output).unwrap(), bytes);
+                #[cfg(unix)]
+                if name == "link" {
+                    use std::os::unix::fs::PermissionsExt;
+                    assert_ne!(
+                        std::fs::metadata(output).unwrap().permissions().mode() & 0o100,
+                        0
+                    );
+                }
+            });
+        }
+    });
 }
 
 #[test]
@@ -8986,6 +9102,75 @@ fn restore_evicts_entry_whose_depinfo_references_missing_paths() {
 }
 
 #[test]
+fn concurrent_rustc_restores_validate_relative_depinfo_in_each_client_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path().join("cache"));
+    let dep = b"out/libfoo.rlib: src/lib.rs\n";
+    let library = b"rlib bytes";
+    let dep_hash = blake3::hash(dep).to_hex().to_string();
+    let lib_hash = blake3::hash(library).to_hex().to_string();
+    let store = Store::open(&config).unwrap();
+    create_blob(&store, &dep_hash, dep);
+    create_blob(&store, &lib_hash, library);
+    std::thread::scope(|threads| {
+        for name in ["left", "right"] {
+            let root = dir.path().join(name);
+            std::fs::create_dir_all(root.join("src")).unwrap();
+            std::fs::write(root.join("src/lib.rs"), "pub fn foo() {}\n").unwrap();
+            let config = config.clone();
+            let dep_hash = dep_hash.clone();
+            let lib_hash = lib_hash.clone();
+            threads.spawn(move || {
+                let env = crate::invocation::InvocationEnv::from_parts(
+                    std::iter::empty::<(String, String)>(),
+                    Some(root.clone()),
+                    None,
+                    root.clone(),
+                );
+                let args = RustcArgs::parse_for(
+                    &s(&[
+                        "rustc",
+                        "src/lib.rs",
+                        "--crate-name",
+                        "foo",
+                        "--crate-type",
+                        "lib",
+                        "--emit",
+                        "dep-info,link",
+                        "--out-dir",
+                        "out",
+                    ]),
+                    &env,
+                )
+                .unwrap();
+                let meta = entry_meta(
+                    "rustc-client-path",
+                    vec![
+                        cached_file("foo.d", &dep_hash),
+                        cached_file("libfoo.rlib", &lib_hash),
+                    ],
+                    &["dep-info", "link"],
+                );
+                restore_from_cache(
+                    &config,
+                    &RustcCompiler::new(),
+                    &Store::open(&config).unwrap(),
+                    &args,
+                    &meta,
+                    None,
+                )
+                .unwrap();
+                assert!(root.join("out/foo.d").is_file());
+                assert_eq!(
+                    std::fs::read(root.join("out/libfoo.rlib")).unwrap(),
+                    library
+                );
+            });
+        }
+    });
+}
+
+#[test]
 fn restore_evicts_incomplete_extra_inputs_depinfo_entries() {
     let dir = tempfile::tempdir().unwrap();
     let config = test_config(dir.path().join("cache"));
@@ -12046,13 +12231,13 @@ fn concurrent_requests_keep_progress_and_warning_markers_with_the_client() {
                 );
                 barrier.wait();
                 for _ in 0..2 {
-                    let _request = InvocationWrapperScope::enter_for(&env);
+                    let _request = InvocationWrapperScope::enter_for(&env, None);
                     assert_eq!(progress_level(), level);
                     assert!(warn_marker_path("fault", Path::new("cache")).starts_with(root));
                     let mut child = env.clone();
                     child.set("KACHE_PROGRESS", "off");
                     let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        let _child = InvocationWrapperScope::enter_for(&child);
+                        let _child = InvocationWrapperScope::enter_for(&child, None);
                         assert_eq!(progress_level(), 0);
                         panic!("nested request failed");
                     }));

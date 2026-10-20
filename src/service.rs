@@ -194,7 +194,7 @@ fn systemd_user_manager_reachable() -> bool {
 }
 
 pub fn install() -> Result<()> {
-    let selection = kache_shims::detect().context("locating the kache binary")?;
+    let selection = crate::platform::frontend_selection().context("locating the kache binary")?;
     for line in selection_lines(&selection) {
         if line.starts_with("warning:") {
             eprintln!("{line}");
@@ -202,7 +202,7 @@ pub fn install() -> Result<()> {
             println!("{line}");
         }
     }
-    let exe = selection.path;
+    let exe = kache_shims::engine_beside(&selection.path).context("locating the daemon engine")?;
 
     if cfg!(target_os = "macos") {
         install_launchd(&exe)

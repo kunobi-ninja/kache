@@ -808,18 +808,7 @@ pub(crate) fn detect_compiler_for(
 /// unrecognized workspace wrapper. Cargo passes `<wrapper> rustc <args>`;
 /// the wrapper may be an absolute path or a bare name resolved via PATH.
 /// We match the inner rustc, not the wrapper name.
-#[cfg(unix)]
-fn is_executable(path: &std::path::Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(path)
-        .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
-        .unwrap_or(false)
-}
-
-#[cfg(not(unix))]
-fn is_executable(path: &std::path::Path) -> bool {
-    path.is_file()
-}
+use kache_shims::is_executable_file as is_executable;
 
 pub(crate) fn is_kache_subcommand_or_flag(s: &str) -> bool {
     if s.starts_with('-') {
@@ -867,52 +856,7 @@ pub(crate) fn resolve_program_on_path(program: &str) -> Option<std::path::PathBu
     resolve_program_on_path_with(program, path.as_deref(), pathext.as_deref())
 }
 
-pub(crate) fn resolve_program_on_path_with(
-    program: &str,
-    path: Option<&std::ffi::OsStr>,
-    pathext: Option<&std::ffi::OsStr>,
-) -> Option<std::path::PathBuf> {
-    if program.contains('/') || program.contains('\\') {
-        return Some(std::path::PathBuf::from(program));
-    }
-    let dirs: Vec<std::path::PathBuf> = std::env::split_paths(path?).collect();
-
-    let extensions: Vec<String> = if cfg!(windows) {
-        if let Some(pathext) = pathext {
-            std::env::split_paths(pathext)
-                .filter_map(|p| p.to_str().map(|s| s.to_string()))
-                .collect()
-        } else {
-            vec![
-                ".exe".to_string(),
-                ".bat".to_string(),
-                ".cmd".to_string(),
-                ".com".to_string(),
-            ]
-        }
-    } else {
-        vec!["".to_string()]
-    };
-
-    for dir in dirs {
-        let p = dir.join(program);
-        if is_executable(&p) {
-            return Some(p);
-        }
-        for ext in &extensions {
-            if ext.is_empty() {
-                continue;
-            }
-            let mut suffixed = p.clone().into_os_string();
-            suffixed.push(ext);
-            let suffixed_path = std::path::PathBuf::from(suffixed);
-            if is_executable(&suffixed_path) {
-                return Some(suffixed_path);
-            }
-        }
-    }
-    None
-}
+pub(crate) use kache_shims::resolve_program_on_path_with;
 
 /// Detect a real compiler invocation that must run uncached.
 ///
@@ -2104,16 +2048,13 @@ pub(crate) mod shim {
     /// Whether `argv[0]` names a compiler, meaning kache is being invoked
     /// through a shim rather than as itself.
     pub(crate) fn invoked_as_compiler(arg0: &str) -> bool {
-        let argv = [arg0.to_string()];
-        // `rustdoc` is an exact basename. It must not go through the C-family
-        // probe, and a versioned `gcc-13` must still match below.
-        if super::rustdoc::RustdocCompiler::recognizes(&argv) {
-            return true;
-        }
-        // Reuses the full name set (exact, versioned, target-prefixed, MinGW
-        // alternatives), so a hand-made `x86_64-linux-gnu-gcc` shim works
-        // without a second list to keep in sync.
-        super::cc::CcCompiler::recognizes(&argv)
+        invoked_as_compiler_for(arg0, &super::InvocationEnv::capture())
+    }
+
+    fn invoked_as_compiler_for(arg0: &str, env: &super::InvocationEnv) -> bool {
+        let argv = [arg0.to_owned()];
+        super::rustdoc::RustdocCompiler::recognizes(&argv)
+            || super::cc::CcCompiler::recognizes_for(&argv, env)
     }
 
     /// The real compiler behind a shim: the first `name` on `PATH` that is not
@@ -2228,7 +2169,7 @@ pub(crate) mod shim {
     pub(crate) fn resolve_real_compiler_from_env(name: &str) -> Option<PathBuf> {
         let path = std::env::var_os("PATH")?;
         let dirs: Vec<PathBuf> = std::env::split_paths(&path).collect();
-        let self_exe = std::env::current_exe().ok();
+        let self_exe = crate::platform::frontend_executable().ok();
         resolve_real_compiler_on(name, &dirs, self_exe.as_deref())
     }
 
@@ -2236,7 +2177,7 @@ pub(crate) mod shim {
     #[cfg(unix)]
     pub(crate) fn real_compiler_on(path: &std::ffi::OsStr, name: &str) -> bool {
         let dirs: Vec<PathBuf> = std::env::split_paths(path).collect();
-        let self_exe = std::env::current_exe().ok();
+        let self_exe = crate::platform::frontend_executable().ok();
         resolve_real_compiler_on(name, &dirs, self_exe.as_deref()).is_some()
     }
 
@@ -2300,7 +2241,7 @@ pub(crate) mod shim {
     #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) fn names_on_path(path: &std::ffi::OsStr, from_path: bool) -> Vec<String> {
         let dirs: Vec<PathBuf> = std::env::split_paths(path).collect();
-        let self_exe = std::env::current_exe().ok();
+        let self_exe = crate::platform::frontend_executable().ok();
         let wanted: &dyn Fn(&str) -> bool = if from_path {
             &invoked_as_compiler
         } else {
@@ -2321,7 +2262,7 @@ pub(crate) mod shim {
     pub(crate) fn live_shim_status() -> kache_shims::Status {
         let path = std::env::var_os("PATH").unwrap_or_default();
         let dirs: Vec<PathBuf> = std::env::split_paths(&path).collect();
-        let self_exe = std::env::current_exe().ok();
+        let self_exe = crate::platform::frontend_executable().ok();
         let known: Vec<PathBuf> = default_shim_dir()
             .into_iter()
             .chain([farm::system_dir()])
@@ -2333,12 +2274,28 @@ pub(crate) mod shim {
     /// understands: the resolved real compiler followed by the original
     /// arguments. `None` when this is not a shim invocation.
     pub(crate) fn wrapper_args(argv: &[String]) -> Option<Result<Vec<String>, String>> {
+        wrapper_args_for(
+            argv,
+            &super::InvocationEnv::capture(),
+            crate::platform::frontend_executable().ok().as_deref(),
+        )
+    }
+
+    pub(crate) fn wrapper_args_for(
+        argv: &[String],
+        env: &super::InvocationEnv,
+        executable: Option<&Path>,
+    ) -> Option<Result<Vec<String>, String>> {
         let arg0 = argv.first()?;
-        if !invoked_as_compiler(arg0) {
+        if !invoked_as_compiler_for(arg0, env) {
             return None;
         }
         let name = super::command_basename(arg0)?;
-        let Some(real) = resolve_real_compiler_from_env(name) else {
+        let paths = env.var_os("PATH").unwrap_or_default();
+        let paths = std::env::split_paths(&paths)
+            .filter_map(|path| env.resolve(&path))
+            .collect::<Vec<_>>();
+        let Some(real) = resolve_real_compiler_on(name, &paths, executable) else {
             return Some(Err(format!(
                 "kache was invoked through a compiler shim named `{name}`, but no real `{name}` \
                  was found on PATH behind it. Every `{name}` on PATH resolves to kache itself, \

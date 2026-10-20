@@ -219,6 +219,7 @@ impl PathNormalizer {
     /// (`/tmp` on Linux, `/var/folders/.../T` on macOS) — it's
     /// purely for relocate-style scenarios where build artifacts
     /// flow through tempdirs.
+    #[cfg(test)]
     pub fn from_env(workspace_root: Option<&Path>) -> Self {
         Self::from_invocation(workspace_root, &crate::invocation::InvocationEnv::capture())
     }
@@ -1303,39 +1304,7 @@ pub(crate) fn canonical_form(canon: &Path) -> Option<String> {
 /// miss). A `\\?\UNC\server\share` verbatim path is rewritten to its
 /// `\\server\share` form. No-op on any string without the prefix
 /// (always the case on Unix).
-fn strip_verbatim_prefix(s: &str) -> std::borrow::Cow<'_, str> {
-    if let Some(unc) = s.strip_prefix(r"\\?\UNC\") {
-        std::borrow::Cow::Owned(format!(r"\\{unc}"))
-    } else if let Some(drive) = s.strip_prefix(r"\\?\") {
-        std::borrow::Cow::Borrowed(drive)
-    } else {
-        std::borrow::Cow::Borrowed(s)
-    }
-}
-
-pub(crate) fn is_filesystem_root_prefix(value: &str) -> bool {
-    let value = strip_verbatim_prefix(value);
-    if value == "/" {
-        return true;
-    }
-    let bytes = value.as_bytes();
-    if bytes.len() == 3
-        && bytes[0].is_ascii_alphabetic()
-        && bytes[1] == b':'
-        && matches!(bytes[2], b'/' | b'\\')
-    {
-        return true;
-    }
-
-    let normalized = value.replace('\\', "/");
-    let Some(unc) = normalized.strip_prefix("//") else {
-        return false;
-    };
-    let mut components = unc.trim_end_matches('/').split('/');
-    components.next().is_some_and(|part| !part.is_empty())
-        && components.next().is_some_and(|part| !part.is_empty())
-        && components.next().is_none()
-}
+use kache_fs::paths::{is_filesystem_root_prefix, strip_verbatim_prefix};
 
 /// Push a rule + its Windows-shape variants into the rule list.
 ///

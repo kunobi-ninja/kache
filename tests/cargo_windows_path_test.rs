@@ -48,6 +48,11 @@ fn bare_cargo_does_not_hide_an_exe_that_resolves_to_kache() {
     std::fs::create_dir_all(&other).unwrap();
     let kache = other.join("kache.exe");
     std::fs::copy(env!("CARGO_BIN_EXE_kache"), &kache).unwrap();
+    std::fs::copy(
+        env!("CARGO_BIN_EXE_kache-engine"),
+        other.join("kache-engine.exe"),
+    )
+    .unwrap();
     std::fs::write(shims.join("cargo"), "a bare sibling of the shim").unwrap();
     std::os::windows::fs::symlink_file(&kache, shims.join("cargo.exe")).unwrap();
     let cargo_dir = Path::new(env!("CARGO")).parent().unwrap().to_path_buf();

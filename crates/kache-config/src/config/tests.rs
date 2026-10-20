@@ -1,7 +1,7 @@
 use super::*;
 // Config and compiler tests mutate process-wide env, including PATH. Share
 // one lock with cache-key tests that read the same state.
-pub(crate) use crate::test_support::process_state_test_lock as config_path_lock;
+use crate::testing::{TestEnvGuard, config_path_lock, set_env_for_test};
 use std::ffi::OsString;
 
 /// kunobi-ninja/kache#319: executables are cached by default only where a
@@ -93,33 +93,6 @@ fn cache_cc_links_env_one_and_true_enable_zero_does_not() {
             "{off:?} must not enable cache_cc_links"
         );
     }
-}
-
-pub(crate) struct TestEnvGuard {
-    key: &'static str,
-    previous: Option<OsString>,
-}
-
-impl Drop for TestEnvGuard {
-    fn drop(&mut self) {
-        unsafe {
-            match self.previous.as_ref() {
-                Some(value) => std::env::set_var(self.key, value),
-                None => std::env::remove_var(self.key),
-            }
-        }
-    }
-}
-
-pub(crate) fn set_env_for_test(key: &'static str, value: Option<&std::ffi::OsStr>) -> TestEnvGuard {
-    let previous = std::env::var_os(key);
-    unsafe {
-        match value {
-            Some(value) => std::env::set_var(key, value),
-            None => std::env::remove_var(key),
-        }
-    }
-    TestEnvGuard { key, previous }
 }
 
 /// Resolution order for predictions: the environment overrides the
@@ -1039,7 +1012,7 @@ fn load_uses_disk_share_budget_when_max_size_is_unset() {
     let _cache = set_env_for_test("KACHE_CACHE_DIR", Some(cache_dir.as_os_str()));
     let _max = set_env_for_test("KACHE_MAX_SIZE", None);
     let loaded = Config::load().unwrap();
-    let expected = disk_share_budget(crate::cache_fs::probe(&cache_dir).total_bytes);
+    let expected = disk_share_budget(kache_fs::volume::probe(&cache_dir).total_bytes);
     assert_eq!(loaded.max_size, expected);
 }
 
@@ -1079,7 +1052,7 @@ fn load_none_max_size_does_not_unbound_the_store() {
     let _cache = set_env_for_test("KACHE_CACHE_DIR", Some(cache_dir.as_os_str()));
     let _max = set_env_for_test("KACHE_MAX_SIZE", None);
     let loaded = Config::load().unwrap();
-    let expected = disk_share_budget(crate::cache_fs::probe(&cache_dir).total_bytes);
+    let expected = disk_share_budget(kache_fs::volume::probe(&cache_dir).total_bytes);
     assert_eq!(loaded.max_size, expected);
     assert_ne!(loaded.max_size, 0);
 }
@@ -2104,7 +2077,16 @@ fn load_volume_stores_carries_the_explicit_max_size_to_each_shard() {
 fn a_shard_budget_is_the_explicit_max_size_or_its_own_disk_share() {
     const GIB: u64 = 1024 * 1024 * 1024;
     let dir = tempfile::tempdir().unwrap();
-    let mut main = crate::test_support::test_config(dir.path().join("main"));
+    let mut main = Config::load_resolved_for(
+        &InvocationEnv::from_parts(
+            Vec::<(OsString, OsString)>::new(),
+            Some(dir.path().to_owned()),
+            None,
+            dir.path().join("tmp"),
+        ),
+        Ok(FileConfig::default()),
+    )
+    .unwrap();
     main.max_size = 50 * GIB;
     let shard_dir = dir.path().join("shard");
     let mut shard = VolumeStore {
@@ -2135,7 +2117,16 @@ fn a_shard_budget_is_the_explicit_max_size_or_its_own_disk_share() {
 #[test]
 fn for_store_dir_picks_the_shard_budget_only_for_a_shard() {
     let dir = tempfile::tempdir().unwrap();
-    let mut main = crate::test_support::test_config(dir.path().join("main"));
+    let mut main = Config::load_resolved_for(
+        &InvocationEnv::from_parts(
+            Vec::<(OsString, OsString)>::new(),
+            Some(dir.path().to_owned()),
+            None,
+            dir.path().join("tmp"),
+        ),
+        Ok(FileConfig::default()),
+    )
+    .unwrap();
     main.max_size = 5000;
     let shard_dir = dir.path().join("shard");
     main.volume_stores = vec![VolumeStore {

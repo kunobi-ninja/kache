@@ -116,23 +116,8 @@ use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use std::io::IsTerminal;
 use std::path::PathBuf;
 
-/// Build version: CI sets KACHE_VERSION from the git tag, local builds use
-/// Cargo.toml. Only the leading 'v' is stripped, so a prerelease suffix flows
-/// through verbatim (release-candidates publish to crates.io, so the tag — and
-/// thus --version — carries the full version, e.g. "v0.5.0-rc.4" -> "0.5.0-rc.4").
-pub const VERSION: &str = {
-    const RAW: &str = match option_env!("KACHE_VERSION") {
-        Some(v) => v,
-        None => env!("CARGO_PKG_VERSION"),
-    };
-    let b = RAW.as_bytes();
-    if b.len() > 1 && b[0] == b'v' {
-        // SAFETY: removing a leading ASCII 'v' preserves UTF-8 validity
-        unsafe { core::str::from_utf8_unchecked(b.split_at(1).1) }
-    } else {
-        RAW
-    }
-};
+mod version;
+pub use version::VERSION;
 
 /// Compiler cache for Rust, C/C++ and CUDA, with S3, GCS, shared-filesystem
 /// and OCI remotes
@@ -150,417 +135,7 @@ pub(crate) struct Cli {
     pub(crate) command: Option<Commands>,
 }
 
-#[derive(Subcommand)]
-enum Commands {
-    /// Run Cargo with canonical duplicate Cargo-home rustflags collapsed once
-    #[command(hide = true)]
-    Cargo {
-        /// Built-in build/check arguments passed verbatim to Cargo (use `--` first)
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<std::ffi::OsString>,
-    },
-
-    /// List cache entries, or one crate's entries in detail
-    #[command(display_order = 22)]
-    List {
-        /// Crate name to show details for (omit to list all)
-        crate_name: Option<String>,
-
-        /// Sort by name, size, hits or age
-        #[arg(long, value_enum, default_value_t = ListSort::Name)]
-        sort: ListSort,
-
-        /// Print directly instead of using a pager
-        #[arg(long)]
-        no_pager: bool,
-    },
-
-    /// Evict cache entries by the size and age limits, as the daemon does.
-    /// Kept for scripts
-    #[command(hide = true)]
-    Gc {
-        /// Evict entries older than this duration (e.g. 7d, 24h)
-        #[arg(long, conflicts_with = "stale_schema")]
-        max_age: Option<String>,
-
-        /// Remove entries from old or unrecorded cache-key schemas
-        #[arg(long)]
-        stale_schema: bool,
-    },
-
-    /// Remove the whole cache or one crate's entries. Kept for scripts;
-    /// `kache clean --cache` empties the cache too
-    #[command(hide = true)]
-    Purge {
-        /// Only purge entries for this crate
-        #[arg(long)]
-        crate_name: Option<String>,
-    },
-
-    /// Free disk space: remove old target directories, or empty the cache
-    #[command(display_order = 11)]
-    Clean {
-        /// Look for target/ directories under this directory instead of using
-        /// the ones kache tracks
-        #[arg(value_name = "DIR", conflicts_with_all = ["cache", "crate_name", "stale", "orphans"])]
-        path: Option<PathBuf>,
-
-        /// Remove obsolete units in live targets using a recorded Cargo command
-        #[arg(long, visible_alias = "artifacts", conflicts_with_all = ["cache", "crate_name", "stale", "orphans", "stale_schema"])]
-        units: bool,
-
-        /// Show what would be removed and what kache keeps, and remove nothing
-        #[arg(long, short = 'n')]
-        dry_run: bool,
-
-        /// Remove without asking. For scripts and cron; preview first with
-        /// --dry-run
-        #[arg(long, short = 'y')]
-        yes: bool,
-
-        /// Targets no build used for this long, and targets whose worktree
-        /// is gone (default 14d)
-        #[arg(long, value_name = "DURATION")]
-        stale: Option<String>,
-
-        /// Empty the cache instead. Asks first. The daemon already keeps it
-        /// under its size limit
-        #[arg(long)]
-        cache: bool,
-
-        /// Only targets whose worktree or workspace was deleted, however
-        /// recently they were built
-        #[arg(long, conflicts_with_all = ["stale", "cache", "crate_name"])]
-        orphans: bool,
-
-        /// With --cache: the same, kept for older scripts
-        #[arg(long, hide = true, requires = "cache", conflicts_with_all = ["stale", "stale_schema"])]
-        all: bool,
-
-        /// Remove the cache entries of this crate
-        #[arg(long = "crate", hide = true, value_name = "NAME", conflicts_with_all = ["cache", "stale"])]
-        crate_name: Option<String>,
-
-        /// With --cache, remove entries from old or unrecorded cache-key schemas
-        #[arg(long, hide = true, requires = "cache", conflicts_with = "stale")]
-        stale_schema: bool,
-
-        /// Accepted for older scripts: tracked targets are the default now
-        #[arg(long, hide = true)]
-        tracked: bool,
-    },
-
-    /// Show tracked target directories. Kept for scripts; `kache clean
-    /// --dry-run` shows the same targets
-    #[command(hide = true, subcommand_required = false)]
-    Targets {
-        #[command(subcommand)]
-        command: Option<TargetCommands>,
-    },
-
-    /// Set up caching for Cargo and C/C++ builds
-    #[command(display_order = 1)]
-    Init {
-        /// Accept all default answers (non-interactive)
-        #[arg(long, short = 'y')]
-        yes: bool,
-
-        /// Do not install the daemon as a login service
-        #[arg(long)]
-        no_service: bool,
-
-        /// Leave shell startup files alone: no C/C++ shims on PATH and no test
-        /// runner (Cargo native dependencies are still configured)
-        #[arg(long)]
-        no_shell: bool,
-
-        /// Print what would change without modifying anything
-        #[arg(long, visible_alias = "dry-run", short = 'n')]
-        check: bool,
-
-        /// Only create the compiler-name links to kache (Unix), in DIR or
-        /// ~/.local/lib/kache/shims, and change nothing else
-        #[arg(
-            long,
-            value_name = "DIR",
-            num_args = 0..=1,
-            conflicts_with_all = ["check", "no_service", "no_shell"]
-        )]
-        shims: Option<Option<PathBuf>>,
-
-        /// With --shims, also link every other compiler name on PATH (target
-        /// triplets)
-        #[arg(long, requires = "shims")]
-        from_path: bool,
-
-        /// With --shims, link only the unversioned names, not the versioned
-        /// compilers on PATH (clang-19, g++-13)
-        #[arg(long, requires = "shims", conflicts_with = "from_path")]
-        canonical_only: bool,
-
-        /// With --shims, replace existing entries instead of refusing
-        #[arg(long, requires = "shims")]
-        force: bool,
-    },
-
-    /// Diagnose setup issues and verify cache integrity
-    #[command(display_order = 2)]
-    Doctor {
-        /// Migrate from sccache (Cargo wrapper, running server) and restart a daemon older than this binary
-        #[arg(long)]
-        fix: bool,
-
-        /// Also remove sccache cache and binary (requires --fix)
-        #[arg(long, requires = "fix")]
-        purge_sccache: bool,
-
-        /// Verify cache integrity (entries, blobs, metadata)
-        #[arg(long)]
-        verify: bool,
-
-        /// Also verify blob checksums (slower, implies --verify)
-        #[arg(long)]
-        checksums: bool,
-
-        /// Remove corrupted entries (implies --verify)
-        #[arg(long)]
-        repair: bool,
-    },
-
-    /// Pull from and push to the configured remote
-    #[command(display_order = 30)]
-    Sync {
-        /// Path to Cargo.toml (default: current directory)
-        #[arg(long)]
-        manifest_path: Option<String>,
-        /// Only download from the remote (skip uploads)
-        #[arg(long, conflicts_with = "push")]
-        pull: bool,
-        /// Only upload to the remote (skip downloads)
-        #[arg(long)]
-        push: bool,
-        /// Show what would be synced without transferring
-        #[arg(long, short = 'n')]
-        dry_run: bool,
-        /// Pull all remote artifacts (ignore workspace filtering)
-        #[arg(long)]
-        all: bool,
-        /// Scope the pull listing to workspace members (one LIST per member)
-        /// instead of one LIST per Cargo.lock dependency crate.
-        ///
-        /// This only narrows the up-front batch pull. Dependency artifacts are
-        /// still resolved on demand during the build — the rustc wrapper fetches
-        /// any local miss from the remote via the daemon (a remote hit) and the daemon
-        /// prefetches by build intent — so deps are not recompiled. Most useful
-        /// when the dependency artifacts are already present locally (e.g. a
-        /// prebuilt `cargo chef` deps image whose compiled deps sit in target/),
-        /// where they're local hits and never need a remote round-trip; in a plain
-        /// setup deps are fetched lazily during the build rather than pre-warmed.
-        ///
-        /// Errors out if the workspace set can't be resolved (cargo metadata
-        /// failed or this isn't a Cargo workspace) rather than silently falling
-        /// back to a full remote scan.
-        #[arg(long, conflicts_with = "all")]
-        workspace: bool,
-        /// Allow partial synchronization and exit successfully (code 0) even if some transfers or imports fail
-        #[arg(long)]
-        allow_partial: bool,
-    },
-
-    /// Save a build manifest for future prefetch warming
-    #[command(hide = true)]
-    SaveManifest {
-        /// Override manifest key (default: identity key plus host triple)
-        #[arg(long)]
-        manifest_key: Option<String>,
-        /// Shard namespace: target/rustc_hash/profile. If set and Cargo.lock exists,
-        /// uploads content-addressed shards alongside the monolithic build manifest.
-        #[arg(long)]
-        namespace: Option<String>,
-    },
-
-    /// Show the background daemon's status, or start, stop or install it
-    #[command(subcommand_required = false, display_order = 40)]
-    Daemon {
-        #[command(subcommand)]
-        command: Option<DaemonCommands>,
-    },
-
-    /// Watch builds and the cache live
-    #[command(display_order = 12)]
-    Monitor {
-        /// Preload events from this window (e.g. 15m, 2h, 7d; a bare number
-        /// is hours)
-        #[arg(long)]
-        since: Option<String>,
-    },
-
-    /// Show hit rate, time saved and cache size; --full for the whole report
-    #[command(display_order = 10, visible_alias = "status")]
-    Stats {
-        /// Event window (e.g. 15m, 2h, 7d; a bare number is hours)
-        #[arg(long, default_value = "24h")]
-        since: String,
-
-        /// Report the latest recorded activity session. Sessions may span Cargo
-        /// commands; events without IDs use a five-minute idle gap per root.
-        #[arg(long, conflicts_with = "since")]
-        last_build: bool,
-
-        /// Only this build tree/root: the latest session in it with
-        /// `--last-build`, its compiler events with `--full`
-        #[arg(long)]
-        root: Option<PathBuf>,
-
-        /// The full build report instead of the summary
-        #[arg(long)]
-        full: bool,
-
-        /// Write the full report as json, markdown, github, or trace
-        /// (Perfetto / Chrome trace). Implies --full
-        #[arg(long, value_name = "FORMAT", value_enum)]
-        format: Option<cli::ReportFormat>,
-
-        /// Write the full report to a file instead of stdout. Implies --full
-        #[arg(long, short)]
-        output: Option<PathBuf>,
-
-        /// Entries in each top list of the full report. Implies --full
-        #[arg(long)]
-        top: Option<usize>,
-
-        /// Also append the full report's summary and timing, with the host's
-        /// load, to `<cache dir>/telemetry/sessions.jsonl`, which outlives the
-        /// runtime dir a CI job deletes. Implies --full
-        #[arg(long)]
-        record: bool,
-
-        /// Replace cache keys, roots, and object paths in the full report
-        /// with `redacted`. Implies --full
-        #[arg(long)]
-        redact: bool,
-    },
-
-    /// Write cache counters as OTLP JSON, or send build timelines to the
-    /// planner
-    #[command(hide = true)]
-    Telemetry {
-        #[command(subcommand)]
-        command: TelemetryCommands,
-    },
-
-    /// Explain why a crate, or the latest build, missed the cache
-    #[command(display_order = 20, alias = "why-miss")]
-    Explain {
-        /// The crate to explain. Without one, compare the latest build's
-        /// misses with the build before it
-        crate_name: Option<String>,
-
-        /// Without a crate: only builds recorded for this build tree
-        #[arg(long, conflicts_with = "crate_name")]
-        root: Option<PathBuf>,
-    },
-
-    /// Compare misses in the two newest sessions of one build root. Kept
-    /// for scripts; `kache explain` with no crate explains the same build
-    #[command(hide = true)]
-    Diff {
-        /// Only sessions recorded for this build tree
-        #[arg(long)]
-        root: Option<PathBuf>,
-    },
-
-    /// The full build report. Kept for scripts; `kache stats --full` is the
-    /// same report
-    #[command(hide = true)]
-    Report {
-        /// Output format: json, trace (also perfetto, chrome-trace), markdown,
-        /// github, text
-        #[arg(long, value_enum, default_value_t = cli::ReportFormat::Text)]
-        format: cli::ReportFormat,
-
-        /// Event window (e.g. 15m, 2h, 7d; a bare number is hours)
-        #[arg(long, default_value = "24h")]
-        since: String,
-
-        /// Report the latest recorded activity session. Sessions may span Cargo
-        /// commands; events without IDs use a five-minute idle gap per root.
-        #[arg(long, conflicts_with = "since")]
-        last_build: bool,
-
-        /// Only include compiler events from this build tree/root
-        #[arg(long)]
-        root: Option<PathBuf>,
-
-        /// Write output to a file instead of stdout
-        #[arg(long, short)]
-        output: Option<PathBuf>,
-
-        /// Number of top entries to show
-        #[arg(long, default_value = "10")]
-        top: usize,
-
-        /// Also append this report's summary and timing, with the host's load,
-        /// to `<cache dir>/telemetry/sessions.jsonl`, which outlives the
-        /// runtime dir a CI job deletes
-        #[arg(long)]
-        record: bool,
-
-        /// Replace cache keys, roots, and object paths with `redacted`
-        #[arg(long)]
-        redact: bool,
-    },
-
-    /// Open the configuration editor
-    #[command(display_order = 3)]
-    Config,
-
-    /// Log in to the planner with your Kunobi account
-    #[command(display_order = 31)]
-    Login {
-        /// Sign in on another device (prints a URL and a code)
-        #[arg(long)]
-        device: bool,
-        /// Accept and re-pin the planner's current login issuer when it no
-        /// longer matches the one first trusted
-        #[arg(long)]
-        retrust: bool,
-    },
-
-    /// Log out of the planner and revoke the stored Kunobi session
-    #[command(display_order = 32)]
-    Logout,
-
-    /// Create compiler-name links to kache in a directory you put first on
-    /// PATH. Kept for scripts and packages; `kache init --shims` does the
-    /// same in the default directory
-    #[command(hide = true)]
-    InstallShims {
-        /// Directory to populate. Defaults to ~/.local/lib/kache/shims
-        #[arg(value_name = "DIR")]
-        dir: Option<PathBuf>,
-
-        /// Replace existing entries instead of refusing
-        #[arg(long)]
-        force: bool,
-
-        /// Also wrap every other compiler name on PATH (target triplets)
-        #[arg(long)]
-        from_path: bool,
-
-        /// Link only the unversioned names, not the versioned compilers on PATH
-        #[arg(long, conflicts_with = "from_path")]
-        canonical_only: bool,
-    },
-
-    /// Generate shell completion scripts
-    #[command(display_order = 41)]
-    Completions {
-        /// Shell to generate completions for
-        #[arg(value_enum)]
-        shell: clap_complete::Shell,
-    },
-}
+kache_client::define_engine_commands!();
 
 /// `kache list --sort` keys.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -986,7 +561,8 @@ fn test_runner_args(raw_args: &[std::ffi::OsString]) -> Option<&[std::ffi::OsStr
     }
 }
 
-fn main() -> std::process::ExitCode {
+/// Run the engine CLI, compiler pipeline or daemon process.
+pub fn main() -> std::process::ExitCode {
     match run_main() {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(error) => std::process::ExitCode::from(report_main_error(&error)),
@@ -1004,9 +580,12 @@ fn report_main_error(error: &anyhow::Error) -> u8 {
 }
 
 fn run_main() -> Result<()> {
-    // First, before argv or config: `startup_ms` on every build event is
-    // measured from here.
-    opcounts::mark_process_start();
+    // Recover frontend timing before configuration, logging or worker threads.
+    let entry = kache_client::engine_entry(std::env::args_os().collect(), VERSION)?;
+    opcounts::mark_process_start_at(entry.started_at);
+    if let Some(frontend) = entry.frontend {
+        platform::set_frontend_image(frontend)?;
+    }
     // SAFETY: before logging, runtimes, or other threads start. DaemonCommand
     // exclusively passes the channel descriptor to this process.
     let mut readiness = unsafe { kunobi_daemon::readiness::channel::Notifier::from_env() }
@@ -1016,7 +595,7 @@ fn run_main() -> Result<()> {
     }
     // Cargo target runner. Checked before the probe and shim guards, which
     // exit without running anything: a test must always run.
-    let raw_args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    let raw_args = entry.args;
     if raw_args.first().is_some_and(|arg| {
         std::path::Path::new(arg)
             .file_name()
@@ -1636,7 +1215,7 @@ fn run_workspace_wrapper_chain_for(
     Ok(exit)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn run_compiler_process_directly(args: &[String], preserve_incremental: bool) -> Result<i32> {
     run_compiler_process_directly_for(
         args,
@@ -1842,13 +1421,14 @@ enum WrapperTarget {
 
 fn run_wrapper_mode(args: &[String]) -> Result<()> {
     let context = invocation::InvocationContext {
+        daemon: None,
         env: invocation::InvocationEnv::capture(),
         io: invocation::io::InvocationIo::capture(),
         cancellation: None,
         #[cfg(unix)]
         jobserver: kache_ipc::jobserver::Descriptors::default(),
         started_at: opcounts::process_start().unwrap_or_else(std::time::Instant::now),
-        shim_stem: std::env::current_exe()
+        shim_stem: platform::frontend_executable()
             .ok()
             .and_then(|path| {
                 path.file_stem()
@@ -1856,8 +1436,83 @@ fn run_wrapper_mode(args: &[String]) -> Result<()> {
             })
             .unwrap_or_else(|| "kache".to_owned()),
     };
+    #[cfg(unix)]
+    if wrappers_above(context.env.var_os(KACHE_ACTIVE_ENV).as_deref()).is_none() {
+        let config = config::Config::load_for(&context.env)?;
+        if let Some(exit) =
+            invocation::execution::try_execute(&config.socket_path(), args, &context)?
+        {
+            std::process::exit(exit);
+        }
+        if !cfg!(test)
+            && !config.disabled
+            && daemon::is_running(&config).is_ok_and(|running| !running)
+        {
+            match daemon::start(&config) {
+                Ok(_) => {
+                    if let Some(exit) =
+                        invocation::execution::try_execute(&config.socket_path(), args, &context)?
+                    {
+                        std::process::exit(exit);
+                    }
+                }
+                Err(error) => tracing::debug!(%error, "compiler daemon did not start"),
+            }
+        }
+    }
     let exit = run_compiler_invocation(args, context)?;
     std::process::exit(exit);
+}
+
+/// Decide whether raw argv can enter the compiler pipeline without probing a
+/// program. Ambiguous entry points remain available to the local engine.
+#[cfg(unix)]
+fn original_compiler_request(args: &[String], env: &invocation::InvocationEnv) -> bool {
+    if args.is_empty()
+        || env.var_os("KACHE_FAMILY_PROBE_ACTIVE").is_some()
+        || env.var_os(build_script::SHIM_PATH_ENV).is_some()
+        || platform::is_self_spawn(args, env.var_os(platform::SELF_SPAWN_ENV).as_deref())
+        || compiler::command_basename(&args[0]) == Some("cargo")
+    {
+        return false;
+    }
+    if kache_shims::is_compiler_shim_name(&args[0]) {
+        return true;
+    }
+    let after = &args[1..];
+    compiler::rustc::RustcCompiler::recognizes(after)
+        || compiler::rustdoc::RustdocCompiler::recognizes(after)
+        || compiler::nvcc::NvccCompiler::recognizes(after)
+        || after
+            .first()
+            .is_some_and(|program| compiler::cc::CcCompiler::recognizes_name(program))
+        || compiler::is_passthrough_compiler_invocation_for(after, env)
+        || compiler::is_workspace_wrapper_chain_for(after, env)
+        || compiler::cc::CcCompiler::recognizes_family_probe(after)
+}
+
+#[cfg(unix)]
+fn run_original_compiler_invocation(
+    args: &[String],
+    context: invocation::InvocationContext,
+    executable: &std::path::Path,
+) -> Result<i32> {
+    let _cancellation = invocation::process::CancellationScope::enter(context.cancellation.clone());
+    let _io = invocation::io::InvocationIoScope::enter(context.io.clone());
+    let logging = logging_dispatch(LogMode::Wrapper, &context.env);
+    let _logging = tracing::dispatcher::set_default(&logging);
+    invocation::process::check()?;
+    let rewritten = if args
+        .first()
+        .is_some_and(|arg0| kache_shims::is_compiler_shim_name(arg0))
+    {
+        compiler::shim::wrapper_args_for(args, &context.env, Some(executable))
+            .context("missing compiler shim arguments")?
+            .map_err(anyhow::Error::msg)?
+    } else {
+        args[1..].to_vec()
+    };
+    run_compiler_invocation(&rewritten, context)
 }
 
 fn run_compiler_invocation(args: &[String], context: invocation::InvocationContext) -> Result<i32> {
@@ -1874,6 +1529,7 @@ fn run_compiler_invocation_inner(
     context: invocation::InvocationContext,
 ) -> Result<i32> {
     let invocation::InvocationContext {
+        daemon,
         mut env,
         started_at,
         shim_stem,
@@ -1889,7 +1545,7 @@ fn run_compiler_invocation_inner(
     let _logging = tracing::dispatcher::set_default(&logging);
     let _alias_state = out_dir_alias::InvocationAliasScope::enter();
     let _key_state = cache_key::InvocationKeyScope::enter();
-    let _wrapper_state = wrapper::InvocationWrapperScope::enter_for(&env);
+    let _wrapper_state = wrapper::InvocationWrapperScope::enter_for(&env, daemon.clone());
     let _heartbeat = heartbeat::InvocationHeartbeatScope::enter();
     let _restore_policy = link::InvocationLinkScope::enter();
     let _accounting = opcounts::InvocationScope::enter(started_at);
@@ -1915,7 +1571,10 @@ fn run_compiler_invocation_inner(
     // Every compiler child gets this request's re-entrancy depth.
     env.set(KACHE_ACTIVE_ENV, "1");
 
-    let config = config::Config::load_for(&env)?;
+    let mut config = config::Config::load_for(&env)?;
+    if daemon.is_some() {
+        config.daemon_publish = false;
+    }
     let _pressure =
         scheduler::pressure::InvocationPressureScope::enter(config.scheduler_memory_pressure);
 
@@ -2120,6 +1779,18 @@ fn daemon_restart_message(was_running: bool, ready: bool) -> &'static str {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn client_routes_every_engine_command_and_alias_without_loading_config() {
+        for command in Cli::command().get_subcommands() {
+            for name in std::iter::once(command.get_name()).chain(command.get_all_aliases()) {
+                assert!(
+                    kache_client::engine_command_names().contains(&name),
+                    "{name}"
+                );
+            }
+        }
+    }
+
+    #[test]
     #[ignore = "subprocess fixture for invocation_logging_keeps_log_bridge_request_local"]
     fn invocation_logging_bridge_fixture() {
         init_logging(LogMode::Wrapper);
@@ -2279,6 +1950,7 @@ mod tests {
         let error = run_compiler_invocation(
             &["missing-compiler".into()],
             invocation::InvocationContext {
+                daemon: None,
                 env: invocation::InvocationEnv::default(),
                 io: invocation::io::InvocationIo::process(),
                 cancellation: Some(cancellation),
@@ -2369,6 +2041,7 @@ mod tests {
                                 "unit.rlib",
                             ]),
                             invocation::InvocationContext {
+                                daemon: None,
                                 env: env.clone(),
                                 io: invocation::io::InvocationIo::capture(),
                                 cancellation: None,
@@ -2404,6 +2077,7 @@ mod tests {
                         run_compiler_invocation(
                             &argv(&["-E", "input.c"]),
                             invocation::InvocationContext {
+                                daemon: None,
                                 env,
                                 io: invocation::io::InvocationIo::capture(),
                                 cancellation: None,

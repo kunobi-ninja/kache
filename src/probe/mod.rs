@@ -279,7 +279,7 @@ impl Prober for NvccProber {
 
 /// First line of `nvcc --version` (stdout). Mirrors [`CcProber`]: the
 /// command must succeed and name a version.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn nvcc_version_line(nvcc: &str) -> Result<String> {
     nvcc_version_line_for(nvcc, &InvocationEnv::capture())
 }

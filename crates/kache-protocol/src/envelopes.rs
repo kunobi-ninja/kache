@@ -15,6 +15,9 @@ pub struct StoreSummary {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum Request {
+    /// Compilation uses its own prepare/commit/completion exchange. Older
+    /// daemons reject this command before a client sends Commit.
+    ExecuteV1(Box<execution::ExecutionRequest>),
     Upload(UploadJob),
     /// Legacy GC wire command accepted from older clients.
     Gc(GcRequest),
@@ -222,11 +225,13 @@ pub struct Response {
 
 impl Request {
     /// Whether the request comes from a build. Stats pollers, a TUI and GC
-    /// commands do not keep the machine from counting as quiet.
+    /// commands do not keep the machine from counting as quiet. Execution
+    /// proposals count only when the server accepts them.
     pub fn is_build_activity(&self) -> bool {
         !matches!(
             self,
-            Request::Health
+            Request::ExecuteV1(_)
+                | Request::Health
                 | Request::Stats(_)
                 | Request::Gc(_)
                 | Request::GcV2(_)
@@ -237,6 +242,7 @@ impl Request {
     /// Only a declared newer release may request replacement after admission.
     pub fn client_version(&self) -> Option<&str> {
         match self {
+            Request::ExecuteV1(req) => Some(&req.client_version),
             Request::Upload(job) => job.client_version.as_deref(),
             Request::Stats(req) => req.client_version.as_deref(),
             Request::BuildStarted(req) => req.client_version.as_deref(),

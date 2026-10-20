@@ -124,6 +124,11 @@ mod sandbox;
 #[path = "fallback/macos.rs"]
 mod macos;
 
+#[cfg(target_os = "macos")]
+pub(crate) fn compiler_peer_unrestricted(token: kache_ipc::PeerAuditToken) -> bool {
+    macos::compiler_peer_unrestricted(token)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

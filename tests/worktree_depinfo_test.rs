@@ -150,6 +150,7 @@ fn restored_depinfo_tracks_the_consuming_worktree() {
     let target_a = workspace_a.join("target");
     let target_b = workspace_b.join("target");
     let cache = root.path().join("cache");
+    let _daemon = common::DaemonGuard::new(kache_binary(), &cache);
     std::fs::create_dir_all(&workspace_a).unwrap();
     std::fs::create_dir_all(&workspace_b).unwrap();
     write_workspace(&workspace_a);

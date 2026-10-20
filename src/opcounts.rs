@@ -277,8 +277,13 @@ static PERMIT_WAIT_US: AtomicU64 = AtomicU64::new(0);
 /// every later in-process wrapper run measures `elapsed_ms` from that pin.
 /// Tests must not assert an upper bound on legacy `elapsed_ms` or `startup_ms`.
 /// An invocation scope keeps its injected start instead.
+#[cfg(test)]
 pub fn mark_process_start() {
-    let _ = PROCESS_START.set(Instant::now());
+    mark_process_start_at(Instant::now());
+}
+
+pub fn mark_process_start_at(started_at: Instant) {
+    let _ = PROCESS_START.set(started_at);
 }
 
 /// The active invocation's injected start, otherwise the instant `main` pinned.

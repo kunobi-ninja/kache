@@ -222,6 +222,7 @@ fn results_for<'a>(events: &'a [Value], crate_name: &str) -> Vec<&'a str> {
 }
 
 struct Fixture {
+    _daemon: common::DaemonGuard,
     _dirs: Vec<TempDir>,
     workspace: PathBuf,
     home: PathBuf,
@@ -240,6 +241,7 @@ fn fixture_from(write: fn(&Path)) -> Fixture {
     write(workspace.path());
     std::fs::create_dir_all(home.path().join(".cargo")).unwrap();
     Fixture {
+        _daemon: common::DaemonGuard::new(env!("CARGO_BIN_EXE_kache"), cache.path()),
         workspace: workspace.path().to_path_buf(),
         home: home.path().to_path_buf(),
         cache: cache.path().to_path_buf(),
@@ -923,6 +925,7 @@ fn links_metadata_reaches_dependent_build_scripts_whatever_its_spelling() {
     }
     std::fs::create_dir_all(home.path().join(".cargo")).unwrap();
     let fx = Fixture {
+        _daemon: common::DaemonGuard::new(env!("CARGO_BIN_EXE_kache"), cache.path()),
         workspace: root.to_path_buf(),
         home: home.path().to_path_buf(),
         cache: cache.path().to_path_buf(),

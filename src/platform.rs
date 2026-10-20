@@ -9,6 +9,26 @@
 //! On Windows they map to OpenProcess/TerminateProcess and the Windows
 //! console-control events surfaced by tokio::signal::windows.
 
+static FRONTEND_IMAGE: std::sync::OnceLock<kache_shims::FrontendImage> = std::sync::OnceLock::new();
+
+pub(crate) fn set_frontend_image(image: kache_shims::FrontendImage) -> anyhow::Result<()> {
+    FRONTEND_IMAGE
+        .set(image)
+        .map_err(|_| anyhow::anyhow!("frontend image already initialized"))
+}
+
+pub(crate) fn frontend_executable() -> std::io::Result<std::path::PathBuf> {
+    FRONTEND_IMAGE
+        .get()
+        .map(|image| Ok(image.path.clone()))
+        .unwrap_or_else(|| std::env::current_exe().map(|path| kache_shims::frontend_for(&path)))
+}
+
+pub(crate) fn frontend_selection() -> Result<kache_shims::Selection, kache_shims::Error> {
+    let env = kache_shims::Env::from_process().map_err(kache_shims::Error::CurrentExe)?;
+    kache_shims::select_frontend(&env, FRONTEND_IMAGE.get(), &kache_shims::RealFs)
+}
+
 pub(crate) fn host_spawn(
     command: &mut std::process::Command,
 ) -> std::io::Result<std::process::Child> {
@@ -19,7 +39,7 @@ pub(crate) fn host_spawn(
 
 /// Run a host utility independently of compiler cancellation and jobserver
 /// state. Descriptor admission is excluded only while creating the process.
-#[cfg(any(windows, test))]
+#[cfg(all(unix, test))]
 pub(crate) fn host_output(
     command: &mut std::process::Command,
 ) -> std::io::Result<std::process::Output> {
@@ -152,7 +172,8 @@ fn assert_test_owns_process(pid: u32, what: &str) -> bool {
     );
 }
 
-/// Forcefully kill a process and all its descendants (process group on Unix, process tree on Windows).
+/// Kill the Unix process group owned by a compiler invocation.
+#[cfg(unix)]
 pub fn kill_process_group(pid: u32) {
     #[cfg(unix)]
     {
@@ -167,15 +188,6 @@ pub fn kill_process_group(pid: u32) {
         unsafe {
             libc::kill(-(pid as i32), libc::SIGKILL);
         }
-    }
-    #[cfg(windows)]
-    {
-        let _ = host_output(std::process::Command::new("taskkill").args([
-            "/F",
-            "/T",
-            "/PID",
-            &pid.to_string(),
-        ]));
     }
 }
 
@@ -311,25 +323,13 @@ pub fn configure_detached_process(cmd: &mut std::process::Command) {
     }
 }
 
-/// Put a child in its own process group so a timeout kill reaches its whole
-/// tree, WITHOUT detaching it from the console. A .cmd/.bat wrapper runs via
-/// cmd.exe, which needs a console; DETACHED_PROCESS makes it exit 0 with no
-/// output, so the probe must not use it.
+/// Put a Unix compiler child in its own group for invocation cancellation.
+#[cfg(unix)]
 pub fn configure_process_group(cmd: &mut std::process::Command) {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
         cmd.process_group(0);
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        // CREATE_NEW_PROCESS_GROUP = 0x00000200
-        cmd.creation_flags(0x00000200);
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = cmd;
     }
 }
 

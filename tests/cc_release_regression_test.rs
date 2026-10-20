@@ -23,6 +23,8 @@ fn real_cc_regression(issue: &str) {
         }
     }
     let scratch = tempfile::tempdir().unwrap();
+    let _daemon =
+        common::DaemonGuard::new(env!("CARGO_BIN_EXE_kache"), scratch.path().join("cache"));
     let mut command = common::hermetic_command(
         "bash",
         &scratch.path().join("cache"),

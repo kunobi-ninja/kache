@@ -67,7 +67,7 @@ jobs:
           CARGO_TARGET_DIR: ${{ runner.temp }}/kache-producer-target
           RUSTC_WRAPPER: ''
           RUSTC_WORKSPACE_WRAPPER: ''
-        run: cargo build --release --locked --bin kache
+        run: cargo build --release --locked --bin kache --bin kache-engine
       - name: Install pinned workload toolchain
         run: rustup toolchain install 1.90.0 --profile minimal
       - name: Produce isolated immutable remote

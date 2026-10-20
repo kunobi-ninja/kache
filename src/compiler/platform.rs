@@ -174,6 +174,7 @@ impl Default for MacOsPlatform {
 }
 
 impl MacOsPlatform {
+    #[cfg(target_os = "macos")]
     fn codesign(&self, flags: &[&str], path: &Path) -> std::io::Result<std::process::ExitStatus> {
         crate::invocation::io::status(self.env.command("codesign")?.args(flags).arg(path))
     }
@@ -184,12 +185,8 @@ impl Platform for MacOsPlatform {
         "macos"
     }
 
+    #[cfg(target_os = "macos")]
     fn ensure_binary_loadable(&self, path: &Path) -> Result<Loadability> {
-        // Compiled in on every host so unit tests can construct
-        // MacOsPlatform from Linux. The actual `codesign` invocation
-        // is gated below — a Linux test that calls into this method
-        // gets Ok(()) because the host check fails, no `codesign`
-        // process is spawned.
         if !signs_on_load(std::env::consts::ARCH, std::env::consts::OS) {
             return Ok(Loadability::Unverified);
         }
@@ -234,6 +231,11 @@ impl Platform for MacOsPlatform {
         if !status.success() {
             tracing::warn!("ad-hoc codesign failed for {}", path.display());
         }
+        Ok(Loadability::Unverified)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn ensure_binary_loadable(&self, _path: &Path) -> Result<Loadability> {
         Ok(Loadability::Unverified)
     }
 

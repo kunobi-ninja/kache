@@ -143,7 +143,7 @@ fn git_output(
     deadline: Instant,
     max_bytes: u64,
 ) -> Option<Vec<u8>> {
-    let timeout = timeout.min(deadline.checked_duration_since(Instant::now())?);
+    let deadline = git_deadline(Instant::now(), timeout, deadline)?;
     let mut child = crate::platform::host_spawn(
         Command::new("git")
             .args(["-c", "core.fsmonitor=false", "-C"])
@@ -173,14 +173,13 @@ fn git_output(
             return None;
         }
     };
-    let deadline = Instant::now() + timeout;
     let status = loop {
+        if Instant::now() >= deadline {
+            break None;
+        }
         match child.try_wait() {
             Ok(Some(status)) => break Some(status),
             Ok(None) => {
-                if deadline.checked_duration_since(Instant::now()).is_none() {
-                    break None;
-                }
                 std::thread::sleep(Duration::from_millis(10));
             }
             Err(_) => break None,
@@ -195,6 +194,11 @@ fn git_output(
         return None;
     }
     Some(bytes)
+}
+
+fn git_deadline(started: Instant, timeout: Duration, deadline: Instant) -> Option<Instant> {
+    let deadline = deadline.min(started.checked_add(timeout)?);
+    (deadline > started).then_some(deadline)
 }
 
 fn inventory(workspace: &Path, deadline: Instant) -> Option<Vec<Worktree>> {
@@ -872,6 +876,27 @@ mod tests {
     }
 
     #[test]
+    fn git_deadline_requires_time_and_keeps_both_limits() {
+        let started = Instant::now();
+        let one_second = started + Duration::from_secs(1);
+        let two_seconds = started + Duration::from_secs(2);
+        assert_eq!(git_deadline(started, Duration::ZERO, two_seconds), None);
+        assert_eq!(git_deadline(started, Duration::from_secs(1), started), None);
+        assert_eq!(
+            git_deadline(two_seconds, Duration::from_secs(1), one_second),
+            None
+        );
+        assert_eq!(
+            git_deadline(started, Duration::from_secs(1), two_seconds),
+            Some(one_second)
+        );
+        assert_eq!(
+            git_deadline(started, Duration::from_secs(2), one_second),
+            Some(one_second)
+        );
+    }
+
+    #[test]
     fn git_output_refuses_a_failure_and_output_at_its_cap() {
         if Command::new("git")
             .arg("--version")
@@ -895,11 +920,15 @@ mod tests {
             None
         );
         assert_eq!(
+            git_output(dir.path(), &["--version"], Duration::ZERO, later, 1 << 20),
+            None
+        );
+        assert_eq!(
             git_output(
                 dir.path(),
                 &["--version"],
                 GIT_TIMEOUT,
-                Instant::now(),
+                Instant::now().checked_sub(Duration::from_secs(1)).unwrap(),
                 1 << 20
             ),
             None

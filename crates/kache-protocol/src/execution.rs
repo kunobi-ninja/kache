@@ -69,9 +69,14 @@ impl NativeString {
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionRequest {
     pub version: u32,
+    #[serde(default)]
+    pub entry: ExecutionEntry,
     pub client_version: String,
     pub client_pid: u32,
-    /// Complete original argv, including argv[0]. Dispatch stays with the engine.
+    /// Unix file creation policy. Missing values require local execution.
+    #[serde(default)]
+    pub creation_mask: Option<u32>,
+    /// Original includes argv[0]; Compiler starts with the resolved compiler.
     pub argv: Vec<NativeString>,
     pub env: Vec<(NativeString, NativeString)>,
     pub cwd: NativeString,
@@ -81,6 +86,14 @@ pub struct ExecutionRequest {
     pub executable: NativeString,
     pub startup_micros: u64,
     pub channels: ExecutionChannels,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionEntry {
+    #[default]
+    Original,
+    Compiler,
 }
 
 impl std::fmt::Debug for ExecutionRequest {
@@ -163,8 +176,10 @@ mod tests {
         let native = |text: &str| NativeString::capture(OsStr::new(text));
         let request = ExecutionRequest {
             version: EXECUTION_VERSION,
+            entry: ExecutionEntry::Original,
             client_version: "fixture".into(),
             client_pid: 42,
+            creation_mask: Some(0o022),
             argv: vec![native("compiler"), native("private-argument")],
             env: vec![(native("TOKEN"), native("private-value"))],
             cwd: native("private-directory"),

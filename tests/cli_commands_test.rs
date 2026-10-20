@@ -232,8 +232,8 @@ fn test_runner_passes_the_exit_code_through() {
         "probe-0123456789abcdef{}",
         std::env::consts::EXE_SUFFIX
     ));
-    std::fs::hard_link(KACHE_BIN, &probe)
-        .or_else(|_| std::fs::copy(KACHE_BIN, &probe).map(drop))
+    std::fs::hard_link(env!("CARGO_BIN_EXE_kache-engine"), &probe)
+        .or_else(|_| std::fs::copy(env!("CARGO_BIN_EXE_kache-engine"), &probe).map(drop))
         .unwrap();
     for scheduler in ["1", "0"] {
         e.cmd()
@@ -2460,7 +2460,7 @@ fn init_rejects_unavailable_daemon_replacement() {
         std::io::BufReader::new(&stream)
             .read_line(&mut request)
             .unwrap();
-        assert!(request.contains("health"), "{request}");
+        assert!(request.contains("health"), "expected a health request");
         // Remove the listener before replying so restart cannot mistake it
         // for the replacement. No coordinator PID means recovery cannot kill
         // this test process, which owns the old daemon's run lock.
@@ -2510,7 +2510,7 @@ fn init_upgrade_keeps_the_service_manager_in_charge() {
         std::io::BufReader::new(&stream)
             .read_line(&mut request)
             .unwrap();
-        assert!(request.contains("health"), "{request}");
+        assert!(request.contains("health"), "expected a health request");
         drop(listener);
         writeln!(
             stream,
@@ -3215,6 +3215,10 @@ fn second_kache_binary(link: &Path) {
     if std::fs::hard_link(KACHE_BIN, link).is_err() {
         std::fs::copy(KACHE_BIN, link).unwrap();
     }
+    let engine = link.with_file_name("kache-engine");
+    if std::fs::hard_link(env!("CARGO_BIN_EXE_kache-engine"), &engine).is_err() {
+        std::fs::copy(env!("CARGO_BIN_EXE_kache-engine"), &engine).unwrap();
+    }
 }
 
 /// A PATH layout for shim tests: `dirs` in order, then a directory with a
@@ -3272,6 +3276,25 @@ fn run_shim_command(mut cmd: std::process::Command) -> assert_cmd::assert::Asser
         stderr: std::fs::read(&stderr).unwrap(),
     }
     .assert()
+}
+
+#[cfg(unix)]
+#[test]
+fn a_frontend_installed_as_its_own_engine_fails_without_recursing() {
+    let e = env();
+    let install = tempfile::tempdir().unwrap();
+    let frontend = install.path().join("kache");
+    copy_kache_binary(&frontend);
+    let engine = install.path().join("kache-engine");
+    std::fs::remove_file(&engine).unwrap();
+    std::fs::hard_link(&frontend, &engine).unwrap();
+    let mut command = kache_process_as(&frontend, &e.home, &e.cache);
+    command.arg("--version");
+    run_shim_command(command)
+        .failure()
+        .stderr(predicates::str::contains(
+            "kache-engine points to the client",
+        ));
 }
 
 /// Two kache installs, each with a shim farm on PATH, must both reach the
@@ -4975,21 +4998,30 @@ fn diff_is_quiet_when_the_sessions_match() {
         .stdout(predicates::str::contains("misses 1 -> 1"));
 }
 
-/// A copy of the kache binary at `path`. On Unix a child process writes it,
-/// so no fork on another test thread holds a writable descriptor to it when
-/// it runs (ETXTBSY).
+/// Copy both binaries. A child writes executable files on Unix so another
+/// test thread cannot fork with a writable descriptor and cause ETXTBSY.
 fn copy_kache_binary(path: &Path) {
-    #[cfg(unix)]
-    {
-        let status = std::process::Command::new("/bin/cp")
-            .arg(KACHE_BIN)
-            .arg(path)
-            .status()
-            .unwrap();
-        assert!(status.success(), "copying {KACHE_BIN} failed: {status}");
+    let engine = path.with_file_name(if cfg!(windows) {
+        "kache-engine.exe"
+    } else {
+        "kache-engine"
+    });
+    for (source, destination) in [
+        (KACHE_BIN, path),
+        (env!("CARGO_BIN_EXE_kache-engine"), engine.as_path()),
+    ] {
+        #[cfg(unix)]
+        {
+            let status = std::process::Command::new("/bin/cp")
+                .arg(source)
+                .arg(destination)
+                .status()
+                .unwrap();
+            assert!(status.success(), "copying {source} failed: {status}");
+        }
+        #[cfg(not(unix))]
+        std::fs::copy(source, destination).unwrap();
     }
-    #[cfg(not(unix))]
-    std::fs::copy(KACHE_BIN, path).unwrap();
 }
 
 /// Copying a release changes its mtime, not the daemon release it requires.

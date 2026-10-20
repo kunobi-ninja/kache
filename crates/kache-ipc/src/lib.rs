@@ -168,6 +168,62 @@ pub fn peer_euid(stream: &TokioStream) -> Option<u32> {
     stream.peer_creds().ok().and_then(|creds| creds.euid())
 }
 
+#[cfg(all(unix, feature = "async"))]
+pub fn peer_pid(stream: &TokioStream) -> Option<u32> {
+    use interprocess::local_socket::traits::StreamCommon as _;
+    stream
+        .peer_creds()
+        .ok()?
+        .pid()
+        .and_then(|pid| u32::try_from(pid).ok())
+        .filter(|pid| *pid != 0)
+}
+
+/// Kernel audit identity. Keep its representation opaque and use libbsm to
+/// interpret it; sandbox checks consume the complete token, including PID version.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct PeerAuditToken([u32; 8]);
+
+#[cfg(target_os = "macos")]
+impl PeerAuditToken {
+    pub fn pid(self) -> libc::pid_t {
+        #[link(name = "bsm")]
+        unsafe extern "C" {
+            fn audit_token_to_pid(token: PeerAuditToken) -> libc::pid_t;
+        }
+        unsafe { audit_token_to_pid(self) }
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "async"))]
+pub fn peer_audit_token(stream: &TokioStream) -> std::io::Result<PeerAuditToken> {
+    use std::os::fd::AsRawFd;
+    let TokioStream::UdSocket(socket) = stream;
+    let mut token = PeerAuditToken([0; 8]);
+    let mut length = std::mem::size_of::<PeerAuditToken>() as libc::socklen_t;
+    let result = unsafe {
+        libc::getsockopt(
+            socket.inner().as_raw_fd(),
+            libc::SOL_LOCAL,
+            libc::LOCAL_PEERTOKEN,
+            (&mut token as *mut PeerAuditToken).cast(),
+            &mut length,
+        )
+    };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if length as usize != std::mem::size_of::<PeerAuditToken>() || token.pid() <= 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid peer audit identity",
+        ));
+    }
+    Ok(token)
+}
+
 /// The daemon's effective UID (test seam: the comparison lives here so the
 /// accept/reject decision is assertable without a foreign-UID connection).
 #[cfg(unix)]
@@ -315,6 +371,13 @@ mod tests {
 #[cfg(unix)]
 pub mod descriptors;
 
+/// Owned Windows streams duplicated from a connected same-user pipe peer.
+#[cfg(windows)]
+pub mod windows_handles;
+
 /// Request-owned Unix jobserver inheritance.
 #[cfg(unix)]
 pub mod jobserver;
+
+#[cfg(any(unix, windows))]
+pub mod execution;

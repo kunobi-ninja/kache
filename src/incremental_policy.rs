@@ -1800,8 +1800,13 @@ mod tests {
         );
         old_lock.unlock().unwrap();
         let lease = unit.try_immediate_at(111).expect("unit can be used again");
+        fs::write(lease.unit.rustc_dir.join("rebuilt.bin"), b"rebuilt").unwrap();
         assert!(lease.finish_at(CompileOutcome::Success, 112));
         assert_eq!(prune_stale(&cache, &target, window, at).units, 0);
+        assert_eq!(
+            fs::read(unit.rustc_dir.join("rebuilt.bin")).unwrap(),
+            b"rebuilt"
+        );
     }
 
     #[test]

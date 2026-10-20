@@ -15,6 +15,7 @@ The exact set depends on the invocation. It can include:
 - source and included file contents discovered through dep-info
 - code-generation flags, rustflags, and requested emit kinds
 - lint levels and `--check-cfg` values (`-A`, `-W`, `-D`, `-F`, `--force-warn`, `--cap-lints`), in order, because they decide whether a compile succeeds
+- diagnostic presentation flags (`--error-format`, `--json`, `--color`, `--diagnostic-width`), in order, because a hit replays the stored diagnostics
 - `-Z` flags, `RUSTC_BOOTSTRAP` when set, `--sysroot`, and the `CARGO_CFG_*` variables
 - the library of a codegen backend selected by name, or a backend dylib passed as a path when `cache.trust_codegen_backends` allows it, by content
 - other rustc flags Kache does not model, with paths normalized (`KACHE_LOG=warn` names them)
@@ -34,6 +35,8 @@ On macOS, every cached executable link gets ld64 `-oso_prefix` set to Cargo's pr
 `-C split-debuginfo=off` skips Kache's `.dSYM` generation and restoration, including bundles in older cache entries. `-C debuginfo=0` and `-C debuginfo=none` also skip bundling. Without a bundle, source-level debugging of a cached binary can depend on the producing build's object files.
 
 Incremental directory names and harmless local path spellings are excluded or normalized.
+
+Changing diagnostic presentation can cause a miss even when the artifact bytes would match. Builds with the same diagnostic flags still share entries. The diagnostic-key update also causes existing rustc entries to miss once, including invocations without explicit presentation flags.
 
 Use `kache explain` and trace logging to see the components for a particular build.
 

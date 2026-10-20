@@ -130,6 +130,7 @@ fn input_words(group: &str) -> &str {
     match group {
         "sources" => "its source files changed",
         "args" => "compiler flags, profile, features or target changed",
+        "diagnostics" => "the requested diagnostic presentation changed",
         "env_deps" => "an environment variable it reads changed",
         "env_cfg" => "an environment variable in its build configuration changed",
         "externs" => "a dependency it links against changed",
@@ -524,6 +525,7 @@ mod tests {
         assert!(fix(&Cause::Unexplained, max).contains("explain_miss"));
         for (group, words) in [
             ("args", "flags"),
+            ("diagnostics", "diagnostic presentation"),
             ("env_cfg", "build configuration"),
             ("externs", "dependency"),
             ("link", "linker"),

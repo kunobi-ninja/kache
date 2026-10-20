@@ -9528,6 +9528,13 @@ fn diagnostic_flags_change_the_key_and_verbose_remains_unkeyed() {
     let source = dir.path().join("lib.rs");
     std::fs::write(&source, b"pub fn hello() {}").unwrap();
     let base = key_of_flags(&flag_base(&source, &[]));
+    assert!(
+        outputs_of_flags(&flag_base(&source, &[]))
+            .fields
+            .unwrap()
+            .contains_key("diagnostics"),
+        "implicit diagnostics need a namespace distinct from older entries"
+    );
     for (flag, value, other) in [
         ("--error-format", "json", "human"),
         ("--json", "artifacts", "diagnostic-rendered-ansi"),
@@ -16085,16 +16092,8 @@ fn key_matrix_rustflags_whitespace_does_not_change_key() {
     );
 }
 
-// ── "should NOT change" cases — diagnostics-only inputs ──
-//
-// These flags steer only what rustc *prints*, never the emitted
-// artifact bytes. If the key changes for one of them, that is
-// over-keying (a missed hit) — the test will fail and surface it
-// rather than silently weakening the key.
-//
-// All lint configuration is deliberately absent from this section: it
-// cannot change successful artifact bytes, but it can change whether the
-// compile FAILS, and a hit replays success. See the tests below.
+// Diagnostic presentation and lint outcomes are part of the cached result.
+// These tests distinguish them from flags that leave that result unchanged.
 
 #[test]
 fn key_matrix_outcome_lint_configuration_changes_key() {

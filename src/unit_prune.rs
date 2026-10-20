@@ -635,7 +635,7 @@ fn remove(parts: &[PathBuf]) -> std::io::Result<()> {
 }
 
 /// Bytes under `path`, symbolic links not followed.
-fn size(path: &Path) -> u64 {
+pub(crate) fn size(path: &Path) -> u64 {
     match std::fs::symlink_metadata(path) {
         Ok(metadata) if metadata.is_dir() => entries(path).iter().map(|entry| size(entry)).sum(),
         Ok(metadata) => metadata.len(),

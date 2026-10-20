@@ -344,7 +344,11 @@ A target directory in regular use still collects dead weight. A lockfile update,
 
 Cargo reads the fingerprint of every unit a build uses, even when nothing needs compiling, but a filesystem records only some reads. macOS and Linux's default `relatime` both record a read when the file's access time is older than its modification time. So the first check of a target directory sets each fingerprint's access time just below its modification time and notes the moment. Once the configured days have passed, every unit whose fingerprint was neither read nor written since is removed, and the rest are set up again for the next period. Cargo looks only at modification times, so this changes nothing it relies on.
 
-Nothing is removed on a filesystem where reads never change an access time (`noatime`), or on a network filesystem, where Cargo does not lock its build directories. A profile a running build holds is skipped, and all of Cargo's locks in it are held while its units are removed. Each unit's fingerprint goes before its outputs, so a removal cut short leaves outputs Cargo rebuilds. A unit that is needed after all is restored from the cache or compiled again. The daemon log reports how many units and bytes each target directory lost.
+Cargo units are kept on a filesystem where reads never change an access time (`noatime`), or on a network filesystem, where Cargo does not lock its build directories. A profile a running build holds is skipped, and all of Cargo's locks in it are held while its units are removed. Each unit's fingerprint goes before its outputs, so a removal cut short leaves outputs Cargo rebuilds. A unit that is needed after all is restored from the cache or compiled again. The daemon log reports how many units and bytes each target directory lost.
+
+The same pass reclaims idle graphs under `incremental.kache-auto`, including graphs left after Cargo removed their fingerprints. Managed graphs use their recorded use and directory modification time rather than access times. A running compiler's unit lock protects its graph. Cleanup retains the small lock files so future compilers keep using the same locks.
+
+Terminal width, color and diagnostic format share one incremental directory. Cached diagnostics still use separate cache keys.
 
 ### Recorded-command cleanup
 

@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use crate::compiler::rustc::RustcCompiler;
 
 /// Diagnostic presentation must agree with the text replayed on a cache hit.
-const DIAGNOSTIC_VALUE_FLAGS: &[&str] =
+pub(crate) const DIAGNOSTIC_VALUE_FLAGS: &[&str] =
     &["--error-format", "--json", "--color", "--diagnostic-width"];
 
 const IGNORED_VALUE_FLAGS: &[&str] = &["--print", "--explain"];

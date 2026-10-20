@@ -409,7 +409,9 @@ fn prune_units(
     window: Duration,
     at: SystemTime,
 ) -> crate::unit_prune::Pruned {
-    if config.target_liveness {
+    let incremental =
+        crate::incremental_policy::prune_stale(&config.cache_dir, &tracked.path, window, at);
+    let mut pruned = if config.target_liveness {
         crate::target_liveness::prune(
             config,
             &tracked.path,
@@ -420,7 +422,10 @@ fn prune_units(
         .unwrap_or_default()
     } else {
         crate::unit_prune::prune(&config.cache_dir, &tracked.path, window, at)
-    }
+    };
+    pruned.units += incremental.units;
+    pruned.bytes += incremental.bytes;
+    pruned
 }
 
 fn preview_units(
@@ -429,7 +434,8 @@ fn preview_units(
     window: Duration,
     at: SystemTime,
 ) -> crate::unit_prune::Pruned {
-    if config.target_liveness {
+    let incremental = crate::incremental_policy::preview_stale(&tracked.path, window, at);
+    let mut pruned = if config.target_liveness {
         let plan = crate::target_liveness::preview_window(
             config,
             &tracked.path,
@@ -444,7 +450,10 @@ fn preview_units(
         }
     } else {
         crate::unit_prune::preview(&config.cache_dir, &tracked.path, window, at)
-    }
+    };
+    pruned.units += incremental.units;
+    pruned.bytes += incremental.bytes;
+    pruned
 }
 
 /// The unit window a pass judges a staying target by: a day under pressure,
@@ -996,6 +1005,58 @@ mod tests {
         assert_eq!(unit_window(0), None);
         assert_eq!(unit_window(30), Some(Duration::from_secs(30 * 86_400)));
         assert_eq!(unit_window(u64::MAX), None);
+    }
+
+    #[test]
+    fn target_unit_cleanup_includes_idle_managed_incremental_graphs() {
+        for receipts in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let cache = tempfile::tempdir().unwrap();
+            let mut policy = config(cache.path(), false, 0);
+            policy.target_liveness = receipts;
+            let store = Store::open(&policy).unwrap();
+            let (_, target) = tracked_target(&store, root.path(), "live");
+            let profile = target.join("debug");
+            let deps = profile.join("deps");
+            std::fs::create_dir(&deps).unwrap();
+            let argv = vec![
+                "/toolchain/bin/rustc".into(),
+                "--crate-name".into(),
+                "sample".into(),
+                "src/lib.rs".into(),
+                "--out-dir".into(),
+                deps.to_string_lossy().into_owned(),
+                format!("-Cincremental={}", profile.join("incremental").display()),
+                "-Cextra-filename=-1234abcd".into(),
+            ];
+            let args = crate::args::RustcArgs::parse(&argv).unwrap();
+            let unit = crate::incremental_policy::AdaptiveUnit::eligible(&args, b"").unwrap();
+            let lease = unit.try_immediate().unwrap();
+            let mut rewritten = vec![args.rustc.to_string_lossy().into_owned()];
+            rewritten.extend(lease.compiler_args(&args));
+            let graph = crate::args::RustcArgs::parse(&rewritten)
+                .unwrap()
+                .incremental
+                .unwrap();
+            std::fs::write(graph.join("graph.bin"), b"payload").unwrap();
+            assert!(lease.finish(crate::incremental_policy::CompileOutcome::Success));
+            filetime::set_file_mtime(
+                graph.parent().unwrap(),
+                filetime::FileTime::from_unix_time(100, 0),
+            )
+            .unwrap();
+            let tracked = store.tracked_target_roots(0).unwrap().remove(0);
+            let window = Duration::from_secs(10);
+            let at = std::time::UNIX_EPOCH + Duration::from_secs(110);
+            let preview = preview_units(&policy, &tracked, window, at);
+            assert_eq!(preview.units, 1, "receipts={receipts}");
+            assert_eq!(preview.bytes, 7, "receipts={receipts}");
+            assert!(graph.exists(), "preview preserves graph data");
+            let removed = prune_units(&policy, &tracked, window, at);
+            assert_eq!(removed.units, preview.units);
+            assert_eq!(removed.bytes, preview.bytes);
+            assert!(!graph.exists());
+        }
     }
 
     #[test]

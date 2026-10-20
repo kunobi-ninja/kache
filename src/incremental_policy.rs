@@ -21,7 +21,9 @@ use std::fs::{self, File, OpenOptions};
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+mod cleanup;
 mod worktree_seed;
+pub(crate) use cleanup::{preview_stale, prune_stale};
 
 /// Sibling of Cargo's `<profile>/incremental` that holds every managed unit.
 const AUTO_ROOT: &str = "incremental.kache-auto";
@@ -872,7 +874,17 @@ fn unit_key(args: &RustcArgs, original_incremental: &Path, policy_guard: &[u8]) 
         }
         None => fold(&mut hasher, b"no-inner"),
     }
-    for argument in strip_incremental_refs(&args.all_args) {
+    let mut arguments = strip_incremental_refs(&args.all_args).into_iter();
+    while let Some(argument) = arguments.next() {
+        let (flag, attached) = argument
+            .split_once('=')
+            .map_or((argument.as_str(), false), |(flag, _)| (flag, true));
+        if crate::args::DIAGNOSTIC_VALUE_FLAGS.contains(&flag) {
+            if !attached {
+                let _value = arguments.next();
+            }
+            continue;
+        }
         fold(&mut hasher, argument.as_bytes());
     }
     fold(
@@ -1687,6 +1699,294 @@ mod tests {
         let second = AdaptiveUnit::eligible(&args, b"env-b").unwrap();
         assert_ne!(first.unit_key, second.unit_key);
         assert_ne!(first.rustc_dir, second.rustc_dir);
+    }
+
+    #[test]
+    fn diagnostic_presentation_reuses_one_incremental_unit_and_keeps_compiler_argv() {
+        let (_temp, args, unit) = fixture();
+        for (flag, value) in [
+            ("--diagnostic-width", "100"),
+            ("--diagnostic-width", "160"),
+            ("--error-format", "json"),
+            ("--json", "diagnostic-rendered-ansi,artifacts"),
+            ("--color", "always"),
+        ] {
+            for presentation in [
+                vec![format!("{flag}={value}")],
+                vec![flag.into(), value.into()],
+            ] {
+                let mut argv = vec![args.rustc.to_string_lossy().into_owned()];
+                argv.extend(args.all_args.clone());
+                argv.extend(presentation.clone());
+                let changed = RustcArgs::parse(&argv).unwrap();
+                let same = AdaptiveUnit::eligible(&changed, b"").unwrap();
+                assert_eq!(same.unit_dir, unit.unit_dir, "{presentation:?}");
+                assert_eq!(changed.diagnostic_flags, [format!("{flag}={value}")]);
+                let lease = unit.try_immediate_at(100).unwrap();
+                let forwarded = lease.compiler_args(&changed);
+                assert!(forwarded.ends_with(&presentation), "{forwarded:?}");
+                fs::write(lease.unit.rustc_dir.join("graph.bin"), b"graph").unwrap();
+                assert!(lease.finish_at(CompileOutcome::Success, 101));
+            }
+        }
+        for extra in [
+            vec!["--cfg", "feature=\"other\""],
+            vec!["-C", "opt-level=2"],
+            vec!["-D", "warnings"],
+            vec!["--target", "other-target"],
+        ] {
+            let mut changed = args.clone();
+            changed
+                .all_args
+                .extend(extra.iter().map(|arg| arg.to_string()));
+            assert_ne!(
+                AdaptiveUnit::eligible(&changed, b"").unwrap().unit_dir,
+                unit.unit_dir
+            );
+        }
+    }
+
+    fn stale_graph(unit: &AdaptiveUnit, last_used: u64) -> Vec<u8> {
+        teach(unit, last_used);
+        fs::create_dir(&unit.rustc_dir).unwrap();
+        fs::write(unit.rustc_dir.join("graph.bin"), b"payload").unwrap();
+        filetime::set_file_mtime(
+            &unit.unit_dir,
+            filetime::FileTime::from_unix_time(last_used as i64, 0),
+        )
+        .unwrap();
+        fs::read(&unit.state_path).unwrap()
+    }
+
+    #[test]
+    fn stale_graph_cleanup_previews_then_reclaims_data_and_keeps_the_lock_inode() {
+        let (temp, _args, unit) = fixture();
+        let before = stale_graph(&unit, 100);
+        let cache = temp.path().join("cache");
+        let target = temp.path().join("target");
+        let window = std::time::Duration::from_secs(10);
+        let at = UNIX_EPOCH + std::time::Duration::from_secs(110);
+        let preview = preview_stale(&target, window, at);
+        assert_eq!(preview.units, 1);
+        assert_eq!(preview.bytes, before.len() as u64 + 7);
+        assert!(!cache.exists(), "preview must not create a reservation");
+        assert_eq!(fs::read(&unit.state_path).unwrap(), before);
+        assert_eq!(
+            fs::read(unit.rustc_dir.join("graph.bin")).unwrap(),
+            b"payload"
+        );
+        let old_lock = File::open(&unit.lock_path).unwrap();
+        let removed = prune_stale(&cache, &target, window, at);
+        assert_eq!(removed, preview);
+        assert!(!unit.rustc_dir.exists());
+        assert!(!unit.state_path.exists());
+        assert!(unit.lock_path.is_file());
+        old_lock.try_lock().unwrap();
+        assert!(
+            unit.lock().is_none(),
+            "cleanup must preserve the lock inode"
+        );
+        old_lock.unlock().unwrap();
+        let lease = unit.try_immediate_at(111).expect("unit can be used again");
+        assert!(lease.finish_at(CompileOutcome::Success, 112));
+        assert_eq!(prune_stale(&cache, &target, window, at).units, 0);
+    }
+
+    #[test]
+    fn managed_graph_cleanup_protects_recent_future_busy_and_unknown_state() {
+        for protected in [
+            "recent-directory",
+            "recent-clock",
+            "future-directory",
+            "future-clock",
+            "unit-lock",
+            "cargo-lock",
+            "cargo-command",
+            "corrupt",
+        ] {
+            let (temp, _args, unit) = fixture();
+            stale_graph(&unit, 100);
+            let target = temp.path().join("target");
+            let mut held = None;
+            let mut cargo = None;
+            let mut command = None;
+            match protected {
+                "recent-directory" | "future-directory" => {
+                    let seconds = if protected == "recent-directory" {
+                        109
+                    } else {
+                        111
+                    };
+                    filetime::set_file_mtime(
+                        &unit.unit_dir,
+                        filetime::FileTime::from_unix_time(seconds, 0),
+                    )
+                    .unwrap();
+                }
+                "recent-clock" | "future-clock" => {
+                    let mut state = read_state(&unit);
+                    state.last_used_secs = if protected == "recent-clock" {
+                        109
+                    } else {
+                        111
+                    };
+                    write_state(&unit, &state);
+                }
+                "unit-lock" => held = Some(unit.lock().unwrap()),
+                "cargo-lock" => {
+                    cargo = Some(crate::unit_prune::hold(&target.join("debug")).unwrap())
+                }
+                "cargo-command" => {
+                    command = Some(
+                        crate::target_use::shared(
+                            &temp.path().join("cache"),
+                            "test cargo",
+                            &mut Vec::new(),
+                        )
+                        .unwrap(),
+                    );
+                }
+                "corrupt" => fs::write(&unit.state_path, b"unknown schema").unwrap(),
+                _ => unreachable!(),
+            }
+            let before = fs::read(&unit.state_path).unwrap();
+            let result = prune_stale(
+                &temp.path().join("cache"),
+                &target,
+                std::time::Duration::from_secs(10),
+                UNIX_EPOCH + std::time::Duration::from_secs(110),
+            );
+            assert_eq!(result.units, 0, "{protected}");
+            assert_eq!(
+                fs::read(unit.rustc_dir.join("graph.bin")).unwrap(),
+                b"payload",
+                "{protected}"
+            );
+            assert_eq!(fs::read(&unit.state_path).unwrap(), before, "{protected}");
+            drop((held, cargo, command));
+        }
+    }
+
+    #[test]
+    fn idle_immediate_graphs_without_state_or_cargo_fingerprints_are_reclaimed() {
+        let (temp, _args, unit) = fixture();
+        let lease = unit.try_immediate_at(100).unwrap();
+        fs::write(unit.rustc_dir.join("graph.bin"), b"payload").unwrap();
+        assert!(lease.finish_at(CompileOutcome::Success, 101));
+        assert!(!unit.state_path.exists());
+        filetime::set_file_mtime(&unit.unit_dir, filetime::FileTime::from_unix_time(100, 0))
+            .unwrap();
+        let result = prune_stale(
+            &temp.path().join("cache"),
+            &temp.path().join("target"),
+            std::time::Duration::from_secs(10),
+            UNIX_EPOCH + std::time::Duration::from_secs(110),
+        );
+        assert_eq!(result.units, 1);
+        assert_eq!(result.bytes, 7);
+        assert!(!unit.rustc_dir.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_graph_cleanup_does_not_follow_symlinked_roots_units_or_graphs() {
+        use std::os::unix::fs::symlink;
+        for component in ["target", "auto-root", "unit", "graph"] {
+            let (temp, _args, unit) = fixture();
+            stale_graph(&unit, 100);
+            let target = temp.path().join("target");
+            let path = match component {
+                "target" => target.clone(),
+                "auto-root" => target.join("debug").join(AUTO_ROOT),
+                "unit" => unit.unit_dir.clone(),
+                "graph" => unit.rustc_dir.clone(),
+                _ => unreachable!(),
+            };
+            let outside = temp.path().join("outside");
+            fs::rename(&path, &outside).unwrap();
+            symlink(&outside, &path).unwrap();
+            filetime::set_file_mtime(&unit.unit_dir, filetime::FileTime::from_unix_time(100, 0))
+                .unwrap();
+            let window = std::time::Duration::from_secs(10);
+            let at = UNIX_EPOCH + std::time::Duration::from_secs(110);
+            assert_eq!(preview_stale(&target, window, at).units, 0, "{component}");
+            let result = prune_stale(&temp.path().join("cache"), &target, window, at);
+            assert_eq!(result.units, 0, "{component}");
+            assert!(path.symlink_metadata().unwrap().file_type().is_symlink());
+            assert!(outside.is_dir());
+            let payload = if component == "target" {
+                outside
+                    .join("debug")
+                    .join(AUTO_ROOT)
+                    .join(POLICY_VERSION)
+                    .join(&unit.unit_key)
+                    .join("rustc/graph.bin")
+            } else if component == "graph" {
+                outside.join("graph.bin")
+            } else if component == "unit" {
+                outside.join("rustc/graph.bin")
+            } else {
+                outside
+                    .join(POLICY_VERSION)
+                    .join(&unit.unit_key)
+                    .join("rustc/graph.bin")
+            };
+            assert_eq!(fs::read(payload).unwrap(), b"payload");
+        }
+    }
+
+    #[test]
+    fn managed_cleanup_handles_cross_targets_and_ignores_unowned_layouts() {
+        for layout in ["cross-target", "unknown-key", "target-root"] {
+            let (temp, _args, unit) = fixture();
+            stale_graph(&unit, 100);
+            let target = temp.path().join("target");
+            let graph = match layout {
+                "cross-target" => {
+                    let triple = target.join("x86_64-unknown-test");
+                    fs::create_dir(&triple).unwrap();
+                    fs::rename(target.join("debug"), triple.join("debug")).unwrap();
+                    triple
+                        .join("debug")
+                        .join(AUTO_ROOT)
+                        .join(POLICY_VERSION)
+                        .join(&unit.unit_key)
+                        .join("rustc")
+                }
+                "unknown-key" => {
+                    fs::remove_file(&unit.state_path).unwrap();
+                    let unowned = unit.unit_dir.with_file_name("notes");
+                    fs::rename(&unit.unit_dir, &unowned).unwrap();
+                    filetime::set_file_mtime(&unowned, filetime::FileTime::from_unix_time(100, 0))
+                        .unwrap();
+                    unowned.join("rustc")
+                }
+                "target-root" => {
+                    fs::rename(target.join("debug").join(AUTO_ROOT), target.join(AUTO_ROOT))
+                        .unwrap();
+                    target
+                        .join(AUTO_ROOT)
+                        .join(POLICY_VERSION)
+                        .join(&unit.unit_key)
+                        .join("rustc")
+                }
+                _ => unreachable!(),
+            };
+            let window = std::time::Duration::from_secs(10);
+            let at = UNIX_EPOCH + std::time::Duration::from_secs(110);
+            let expected = usize::from(layout == "cross-target");
+            assert_eq!(
+                preview_stale(&target, window, at).units,
+                expected,
+                "{layout}"
+            );
+            assert_eq!(
+                prune_stale(&temp.path().join("cache"), &target, window, at).units,
+                expected,
+                "{layout}"
+            );
+            assert_eq!(!graph.exists(), layout == "cross-target", "{layout}");
+        }
     }
 
     #[test]

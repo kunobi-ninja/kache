@@ -2,13 +2,16 @@
 //! target kache is being built for. `src/build_script.rs` embeds the binary and
 //! installs a copy wherever Cargo expects a build script it caches.
 
-use std::path::PathBuf;
-use std::process::Command;
+use std::path::{Path, PathBuf};
+
+#[path = "launcher/compile.rs"]
+mod launcher;
 
 const SOURCE: &str = "launcher/build_script.rs";
 
 fn main() {
     println!("cargo:rerun-if-changed={SOURCE}");
+    println!("cargo:rerun-if-changed=launcher/compile.rs");
     let out =
         PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR")).join("build-script-launcher");
     // Launchers are installed on Unix only; elsewhere nothing reads the bytes.
@@ -19,48 +22,36 @@ fn main() {
 
     let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
     let target = std::env::var("TARGET").expect("TARGET");
-    let mut command = Command::new(rustc);
-    command
-        .args(["--edition", "2024", "--crate-type", "bin"])
-        .args(["--crate-name", "kache_build_script_launcher"])
-        .args(["--target", &target])
-        .args([
-            "-C",
-            "opt-level=s",
-            "-C",
-            "panic=abort",
-            "-C",
-            "codegen-units=1",
-        ])
-        .args(["-C", "debuginfo=0", "-C", "strip=symbols"])
-        .arg("-o")
-        .arg(&out)
-        .arg(SOURCE);
+    let mut link_options = Vec::new();
     // Link the launcher the way Cargo links kache for this target.
     if let Some(linker) = std::env::var_os("RUSTC_LINKER") {
         let mut flag = std::ffi::OsString::from("linker=");
         flag.push(linker);
-        command.arg("-C").arg(flag);
+        link_options.push("-C".into());
+        link_options.push(flag);
     }
     let encoded = std::env::var("CARGO_ENCODED_RUSTFLAGS").unwrap_or_default();
-    command.args(link_flags(
-        encoded.split('\x1f').filter(|flag| !flag.is_empty()),
-    ));
+    link_options.extend(
+        link_flags(encoded.split('\x1f').filter(|flag| !flag.is_empty()))
+            .into_iter()
+            .map(std::ffi::OsString::from),
+    );
     // The launcher's own `link(name = "c")` puts libc before the standard
     // rlibs on the link line. nixpkgs builds compiler_builtins' C code with a
     // stack protector, and on aarch64 glibc exports `__stack_chk_guard` from
     // ld.so, which the linker then cannot reach (NixOS/nixpkgs#561411). A
     // std binary gets libc again after its rlibs; this one needs it asked for.
     if target_is_glibc() {
-        command.args(["-C", "link-arg=-lc"]);
+        link_options.extend(["-C".into(), "link-arg=-lc".into()]);
     }
 
-    let status = command
-        .status()
+    let result = launcher::build(&rustc, &target, Path::new(SOURCE), &out, &link_options)
         .expect("running rustc for the build-script launcher");
     assert!(
-        status.success(),
-        "compiling {SOURCE} for {target} failed: {status}"
+        result.status.success(),
+        "compiling {SOURCE} for {target} failed: {}\n{}",
+        result.status,
+        String::from_utf8_lossy(&result.stderr)
     );
 }
 

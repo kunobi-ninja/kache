@@ -67,13 +67,11 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
 #[unsafe(no_mangle)]
 extern "C" fn rust_eh_personality() {}
 
-/// The same symbol under the name a newer `core` asks for. Rust moved the
-/// `eh_personality` lang item to the def path `__rustc::rust_eh_personality`,
-/// so a `core` built after that change references the v0-mangled
-/// `_RNvCs6EUDi8WbMwz_7___rustc19rust_eh_personality` instead, and the link
-/// fails on the symbol above going unreferenced. `#[unsafe(no_mangle)]` spells
-/// only the item's own name, so the second spelling needs `export_name`.
-#[unsafe(export_name = "_RNvCs6EUDi8WbMwz_7___rustc19rust_eh_personality")]
+/// Newer compilers mangle the personality with their version. The build
+/// probes that compiler's IR and supplies its export name without guessing
+/// the hash. Older compilers keep the legacy definition above.
+#[cfg(kache_mangled_personality)]
+#[unsafe(export_name = env!("KACHE_LAUNCHER_PERSONALITY"))]
 extern "C" fn rustc_eh_personality() {}
 
 /// # Safety

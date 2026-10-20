@@ -1,67 +1,47 @@
-//! The launcher defines the personality routine under every name a precompiled
-//! `core` may reference.
-//!
-//! The link itself already covers `rust_eh_personality`: the crate's own build
-//! compiles this launcher and the pinned toolchain's `core` references that
-//! name, so dropping it breaks the build. The v0-mangled name has no such
-//! cover on a toolchain whose `core` predates the rename, which is why this
-//! test compiles the launcher and looks for the symbol itself.
+//! Link and run the launcher against the selected toolchain's real core.
 
 #![cfg(unix)]
 
+use std::ffi::OsString;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
 
-/// `__rustc::rust_eh_personality` as the v0 mangling spells it.
-const V0_PERSONALITY: &str = "_RNvCs6EUDi8WbMwz_7___rustc19rust_eh_personality";
-
-/// Compile the launcher the way `build.rs` does, without the flags that would
-/// drop the symbol table this test reads.
-fn compile(source: &Path, out: &Path) -> std::process::Output {
-    let mut command = Command::new(std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()));
-    command
-        .args(["--edition", "2024", "--crate-type", "bin"])
-        .args(["--crate-name", "kache_build_script_launcher"])
-        .args([
-            "-C",
-            "opt-level=s",
-            "-C",
-            "panic=abort",
-            "-C",
-            "debuginfo=0",
-        ])
-        .arg("-o")
-        .arg(out)
-        .arg(source);
-    // The launcher's own `link(name = "c")` puts libc before the rlibs, which
-    // nixpkgs' stack-protectored compiler_builtins needs repeated. See build.rs.
-    if cfg!(all(target_os = "linux", target_env = "gnu")) {
-        command.args(["-C", "link-arg=-lc"]);
-    }
-    command.output().expect("running rustc on the launcher")
-}
+#[path = "../launcher/compile.rs"]
+mod launcher;
 
 #[test]
-fn the_launcher_defines_the_personality_under_the_v0_mangled_name() {
+fn the_launcher_links_with_current_core_and_runs_the_preserved_script() {
     let fixture = tempfile::tempdir().unwrap();
+    let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+    let version = Command::new(&rustc).arg("-vV").output().unwrap();
+    assert!(version.status.success(), "{version:?}");
+    let version = String::from_utf8(version.stdout).unwrap();
+    let host = version
+        .lines()
+        .find_map(|line| line.strip_prefix("host: "))
+        .unwrap();
     let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("launcher/build_script.rs");
     let out = fixture.path().join("launcher");
-    let output = compile(&source, &out);
+    let mut flags: Vec<OsString> = Vec::new();
+    if let Some(linker) = std::env::var_os("RUSTC_LINKER") {
+        let mut flag = OsString::from("linker=");
+        flag.push(linker);
+        flags.extend(["-C".into(), flag]);
+    }
+    if cfg!(all(target_os = "linux", target_env = "gnu")) {
+        flags.extend(["-C".into(), "link-arg=-lc".into()]);
+    }
+    let output = launcher::build(&rustc, host, &source, &out, &flags).unwrap();
     assert!(output.status.success(), "{output:?}");
 
-    // The name reaches the binary as a symbol-table entry. No ELF parser is a
-    // dependency of this crate, and a name this specific appears nowhere else
-    // in the image.
-    let image = std::fs::read(&out).unwrap();
-    assert!(
-        contains(&image, V0_PERSONALITY.as_bytes()),
-        "the launcher defines no `{V0_PERSONALITY}`; a `core` newer than 2026-09-07 \
-         cannot link it"
-    );
-}
-
-fn contains(haystack: &[u8], needle: &[u8]) -> bool {
-    haystack
-        .windows(needle.len())
-        .any(|window| window == needle)
+    // A successful link is the symbol oracle. Executing the fallback also
+    // proves that the generated launcher remains usable, rather than merely
+    // carrying a chosen string somewhere in its image.
+    let preserved = fixture.path().join("preserved");
+    std::fs::write(&preserved, "#!/bin/sh\nexit 23\n").unwrap();
+    std::fs::set_permissions(&preserved, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::write(fixture.path().join(".kache-launch"), b"preserved\0\0./\0").unwrap();
+    let output = Command::new(&out).env_clear().output().unwrap();
+    assert_eq!(output.status.code(), Some(23), "{output:?}");
 }

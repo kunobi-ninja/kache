@@ -786,12 +786,16 @@ fn doctor_json_is_read_only(
 /// macOS: `~/Library/Logs/kache/kache.log` (visible in Console.app).
 /// Linux/other: `<cache_dir>/kache.log`.
 pub(crate) fn diagnostic_log_path() -> PathBuf {
+    diagnostic_log_path_for(&invocation::InvocationEnv::capture())
+}
+
+fn diagnostic_log_path_for(env: &invocation::InvocationEnv) -> PathBuf {
     if cfg!(target_os = "macos") {
-        dirs::home_dir()
-            .unwrap_or_default()
+        env.home_dir()
+            .unwrap_or_else(|| std::path::Path::new(""))
             .join("Library/Logs/kache/kache.log")
     } else {
-        config::default_cache_dir().join("kache.log")
+        config::default_cache_dir_for(env).join("kache.log")
     }
 }
 
@@ -835,6 +839,17 @@ fn detect_log_mode_with_rustc(
 }
 
 fn init_logging(mode: LogMode) {
+    // Keep the bridge open to every level. Each request's dispatcher applies
+    // its own filter, which can be more verbose than the daemon's filter.
+    tracing_log::LogTracer::init().expect("install log compatibility bridge");
+    tracing::dispatcher::set_global_default(logging_dispatch(
+        mode,
+        &invocation::InvocationEnv::capture(),
+    ))
+    .expect("install global logging subscriber");
+}
+
+fn logging_dispatch(mode: LogMode, env: &invocation::InvocationEnv) -> tracing::Dispatch {
     use std::sync::Mutex;
     use tracing_subscriber::prelude::*;
     use tracing_subscriber::{EnvFilter, fmt};
@@ -851,11 +866,15 @@ fn init_logging(mode: LogMode) {
         } else {
             "kache=warn"
         };
-        let stderr_filter = EnvFilter::try_from_env("KACHE_LOG")
-            .unwrap_or_else(|_| default_filter.parse().unwrap());
+        let stderr_filter = env
+            .var("KACHE_LOG")
+            .ok()
+            .and_then(|filter| EnvFilter::try_new(filter).ok())
+            .unwrap_or_else(|| default_filter.parse().unwrap());
         Some(
             fmt::layer()
-                .with_writer(std::io::stderr)
+                .with_writer(invocation::io::stderr)
+                .log_internal_errors(false)
                 .with_filter(stderr_filter),
         )
     };
@@ -872,23 +891,24 @@ fn init_logging(mode: LogMode) {
     // can be overridden via `KACHE_LOG_FILE_PATH` (e.g. the e2e bench writes
     // a per-phase wrapper.log so each cold/warm phase has a clean log).
     let file_layer = {
-        let wrapper_opted_in =
-            mode == LogMode::Wrapper && std::env::var_os("KACHE_LOG_FILE").is_some();
+        let wrapper_opted_in = mode == LogMode::Wrapper && env.var_os("KACHE_LOG_FILE").is_some();
         let enable_file_layer = mode != LogMode::Wrapper || wrapper_opted_in;
 
         if !enable_file_layer {
             None
         } else {
             (|| -> Option<_> {
-                let path = std::env::var_os("KACHE_LOG_FILE_PATH")
+                let path = env
+                    .var_os("KACHE_LOG_FILE_PATH")
                     .map(PathBuf::from)
-                    .unwrap_or_else(diagnostic_log_path);
+                    .unwrap_or_else(|| diagnostic_log_path_for(env));
+                let path = env.resolve(&path)?;
                 std::fs::create_dir_all(path.parent()?).ok()?;
 
                 // Simple rotation: truncate if file exceeds 5 MB.
                 // Skipped when a custom path is provided — the caller owns
                 // the file lifecycle (e.g. the bench wipes it per phase).
-                if std::env::var_os("KACHE_LOG_FILE_PATH").is_none()
+                if env.var_os("KACHE_LOG_FILE_PATH").is_none()
                     && std::fs::metadata(&path).is_ok_and(|m| m.len() > MAX_LOG_BYTES)
                 {
                     let _ = std::fs::write(&path, b"--- log rotated ---\n");
@@ -900,8 +920,11 @@ fn init_logging(mode: LogMode) {
                     .open(&path)
                     .ok()?;
 
-                let file_filter = EnvFilter::try_from_env("KACHE_LOG_FILE")
-                    .unwrap_or_else(|_| "kache=info".parse().unwrap());
+                let file_filter = env
+                    .var("KACHE_LOG_FILE")
+                    .ok()
+                    .and_then(|filter| EnvFilter::try_new(filter).ok())
+                    .unwrap_or_else(|| "kache=info".parse().unwrap());
 
                 Some(
                     fmt::layer()
@@ -913,10 +936,11 @@ fn init_logging(mode: LogMode) {
         }
     };
 
-    tracing_subscriber::registry()
-        .with(stderr_layer)
-        .with(file_layer)
-        .init();
+    tracing::Dispatch::new(
+        tracing_subscriber::registry()
+            .with(stderr_layer)
+            .with(file_layer),
+    )
 }
 
 /// How main reads argv, decided before any of it is parsed.
@@ -1821,6 +1845,8 @@ fn run_wrapper_mode(args: &[String]) -> Result<()> {
         env: invocation::InvocationEnv::capture(),
         io: invocation::io::InvocationIo::capture(),
         cancellation: None,
+        #[cfg(unix)]
+        jobserver: kache_ipc::jobserver::Descriptors::default(),
         started_at: opcounts::process_start().unwrap_or_else(std::time::Instant::now),
         shim_stem: std::env::current_exe()
             .ok()
@@ -1853,8 +1879,14 @@ fn run_compiler_invocation_inner(
         shim_stem,
         io,
         cancellation: _,
+        #[cfg(unix)]
+        jobserver,
     } = context;
+    #[cfg(unix)]
+    let _jobserver = kache_ipc::jobserver::Scope::enter(jobserver);
     let _io = invocation::io::InvocationIoScope::enter(io);
+    let logging = logging_dispatch(LogMode::Wrapper, &env);
+    let _logging = tracing::dispatcher::set_default(&logging);
     let _alias_state = out_dir_alias::InvocationAliasScope::enter();
     let _key_state = cache_key::InvocationKeyScope::enter();
     let _wrapper_state = wrapper::InvocationWrapperScope::enter_for(&env);
@@ -2088,6 +2120,159 @@ fn daemon_restart_message(was_running: bool, ready: bool) -> &'static str {
 #[cfg(test)]
 mod tests {
     #[test]
+    #[ignore = "subprocess fixture for invocation_logging_keeps_log_bridge_request_local"]
+    fn invocation_logging_bridge_fixture() {
+        init_logging(LogMode::Wrapper);
+        let root = PathBuf::from(std::env::var_os("KACHE_TEST_LOG_ROOT").unwrap());
+        let env = invocation::InvocationEnv::from_parts(
+            [("KACHE_LOG", "kache=debug")],
+            Some(root.clone()),
+            None,
+            root.clone(),
+        );
+        let logging = logging_dispatch(LogMode::Wrapper, &env);
+        let _io = invocation::io::InvocationIoScope::enter(logging_test_io(&root, "bridge"));
+        let _logging = tracing::dispatcher::set_default(&logging);
+        tracing_log::log::debug!(target: "kache::request", "request-log-debug");
+        tracing_log::log::trace!(target: "kache::request", "request-log-trace");
+    }
+
+    #[test]
+    fn invocation_logging_keeps_log_bridge_request_local() {
+        let root = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::invocation_logging_bridge_fixture",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("KACHE_TEST_LOG_ROOT", root.path())
+            .env("KACHE_LOG", "off")
+            .env_remove("KACHE_LOG_FILE")
+            .env_remove("KACHE_LOG_FILE_PATH")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(output.stderr.is_empty(), "{output:?}");
+        let logged = std::fs::read_to_string(root.path().join("bridge.err")).unwrap();
+        assert!(logged.contains("request-log-debug"), "{logged}");
+        assert!(!logged.contains("request-log-trace"), "{logged}");
+    }
+
+    fn logging_test_io(root: &std::path::Path, name: &str) -> invocation::io::InvocationIo {
+        let input = root.join(format!("{name}.in"));
+        std::fs::write(&input, b"").unwrap();
+        invocation::io::InvocationIo::from_files(
+            std::fs::File::open(input).unwrap(),
+            std::fs::File::create(root.join(format!("{name}.out"))).unwrap(),
+            std::fs::File::create(root.join(format!("{name}.err"))).unwrap(),
+            None,
+        )
+    }
+
+    #[test]
+    fn concurrent_invocation_logging_uses_client_filters_paths_and_stderr() {
+        let root = tempfile::tempdir().unwrap();
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|threads| {
+            for (name, stderr_filter, file_filter) in [
+                ("first", "kache=trace", "off"),
+                ("second", "kache=error", "kache=warn"),
+            ] {
+                let root = root.path().join(name);
+                std::fs::create_dir(&root).unwrap();
+                let barrier = &barrier;
+                threads.spawn(move || {
+                    let env = invocation::InvocationEnv::from_parts(
+                        [
+                            ("KACHE_LOG", stderr_filter),
+                            ("KACHE_LOG_FILE", file_filter),
+                            ("KACHE_LOG_FILE_PATH", "logs/wrapper.log"),
+                        ],
+                        Some(root.clone()),
+                        Some(root.clone()),
+                        root.clone(),
+                    );
+                    let dispatch = logging_dispatch(LogMode::Wrapper, &env);
+                    let _io =
+                        invocation::io::InvocationIoScope::enter(logging_test_io(&root, name));
+                    let _logging = tracing::dispatcher::set_default(&dispatch);
+                    barrier.wait();
+                    for _ in 0..2 {
+                        tracing::warn!(target: "kache::request", client = name, "own-warning");
+                        tracing::error!(target: "kache::request", client = name, "own-error");
+                        tracing::debug!(target: "kache::request", client = name, "own-debug");
+                    }
+                });
+            }
+        });
+        let first = std::fs::read_to_string(root.path().join("first/first.err")).unwrap();
+        let second = std::fs::read_to_string(root.path().join("second/second.err")).unwrap();
+        assert_eq!(first.matches("own-warning").count(), 2);
+        assert_eq!(first.matches("own-error").count(), 2);
+        assert_eq!(first.matches("own-debug").count(), 2);
+        assert!(!first.contains("second"));
+        assert_eq!(second.matches("own-error").count(), 2);
+        assert!(!second.contains("own-warning"));
+        assert!(!second.contains("own-debug"));
+        assert!(!second.contains("first"));
+        assert_eq!(
+            std::fs::read(root.path().join("first/logs/wrapper.log")).unwrap(),
+            b""
+        );
+        let log = std::fs::read_to_string(root.path().join("second/logs/wrapper.log")).unwrap();
+        assert_eq!(log.matches("own-warning").count(), 2);
+        assert_eq!(log.matches("own-error").count(), 2);
+        assert!(!log.contains("own-debug"));
+        assert!(!log.contains("first"));
+    }
+
+    #[test]
+    fn invocation_logging_restores_parent_and_monitors_do_not_own_client_pipes() {
+        let root = tempfile::tempdir().unwrap();
+        let env = |filter: &str| {
+            invocation::InvocationEnv::from_parts(
+                [("KACHE_LOG", filter)],
+                Some(root.path().to_owned()),
+                None,
+                root.path().to_owned(),
+            )
+        };
+        let parent = logging_dispatch(LogMode::Wrapper, &env("kache=warn"));
+        let monitor = {
+            let _io =
+                invocation::io::InvocationIoScope::enter(logging_test_io(root.path(), "parent"));
+            let _logging = tracing::dispatcher::set_default(&parent);
+            tracing::warn!(target: "kache::request", "parent-before");
+            {
+                let nested = logging_dispatch(LogMode::Wrapper, &env("invalid["));
+                let _logging = tracing::dispatcher::set_default(&nested);
+                tracing::error!(target: "kache::request", "nested-default-off");
+            }
+            tracing::warn!(target: "kache::request", "parent-after");
+            invocation::io::current().borrow_for_monitor()
+        };
+        let log = std::fs::read_to_string(root.path().join("parent.err")).unwrap();
+        assert!(log.contains("parent-before"));
+        assert!(log.contains("parent-after"));
+        assert!(!log.contains("nested-default-off"));
+        assert!(!root.path().join("logs").exists());
+        let _io = invocation::io::InvocationIoScope::enter(monitor);
+        let _logging = tracing::dispatcher::set_default(&parent);
+        use std::io::Write;
+        assert_eq!(
+            invocation::io::stderr().write(b"late").unwrap_err().kind(),
+            std::io::ErrorKind::BrokenPipe
+        );
+        tracing::warn!(target: "kache::request", "late-monitor");
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("parent.err")).unwrap(),
+            log
+        );
+    }
+
+    #[test]
     fn cancelled_invocation_stops_before_dispatch() {
         let cancellation = invocation::process::Cancellation::default();
         cancellation.cancel();
@@ -2097,6 +2282,8 @@ mod tests {
                 env: invocation::InvocationEnv::default(),
                 io: invocation::io::InvocationIo::process(),
                 cancellation: Some(cancellation),
+                #[cfg(unix)]
+                jobserver: kache_ipc::jobserver::Descriptors::default(),
                 started_at: std::time::Instant::now(),
                 shim_stem: "kache".into(),
             },
@@ -2185,6 +2372,8 @@ mod tests {
                                 env: env.clone(),
                                 io: invocation::io::InvocationIo::capture(),
                                 cancellation: None,
+                                #[cfg(unix)]
+                                jobserver: kache_ipc::jobserver::Descriptors::default(),
                                 started_at: std::time::Instant::now(),
                                 shim_stem: "client-kache".into(),
                             },
@@ -2218,6 +2407,8 @@ mod tests {
                                 env,
                                 io: invocation::io::InvocationIo::capture(),
                                 cancellation: None,
+                                #[cfg(unix)]
+                                jobserver: kache_ipc::jobserver::Descriptors::default(),
                                 started_at: std::time::Instant::now(),
                                 shim_stem: "client-kache".into(),
                             }

@@ -103,14 +103,16 @@ pub(crate) fn check() -> io::Result<()> {
 struct Running {
     child: std::process::Child,
     controlled: bool,
-    reaped: bool,
+    status: Option<ExitStatus>,
+    #[cfg(unix)]
+    rss: Option<crate::opcounts::ChildRss>,
     #[cfg(windows)]
     tree: Option<windows::Job>,
 }
 
 impl Running {
     fn kill(&mut self) -> io::Result<()> {
-        if self.reaped {
+        if self.status.is_some() {
             return Ok(());
         }
         if self.controlled {
@@ -123,6 +125,57 @@ impl Running {
         }
         // Also handle a child that changed its own process group.
         self.child.kill()
+    }
+
+    fn wait(&mut self, blocking: bool) -> io::Result<Option<ExitStatus>> {
+        if self.status.is_some() {
+            return Ok(self.status);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            let mut status = 0;
+            let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+            loop {
+                // The child remains owned until this lock records its status.
+                // wait4 samples this PID, unlike process-wide RUSAGE_CHILDREN.
+                let result = unsafe {
+                    libc::wait4(
+                        self.child.id() as libc::pid_t,
+                        &mut status,
+                        if blocking { 0 } else { libc::WNOHANG },
+                        usage.as_mut_ptr(),
+                    )
+                };
+                if result > 0 {
+                    self.status = Some(ExitStatus::from_raw(status));
+                    let usage = unsafe { usage.assume_init() };
+                    if let Some(rss) = &self.rss
+                        && let Some(bytes) =
+                            crate::scheduler::rss_from_getrusage(0, usage.ru_maxrss)
+                    {
+                        rss.record(bytes);
+                    }
+                    return Ok(self.status);
+                }
+                if result == 0 {
+                    return Ok(None);
+                }
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::Interrupted {
+                    return Err(error);
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            self.status = if blocking {
+                Some(self.child.wait()?)
+            } else {
+                self.child.try_wait()?
+            };
+            Ok(self.status)
+        }
     }
 }
 
@@ -153,9 +206,7 @@ impl Child {
             .running
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        let status = running.child.try_wait()?;
-        running.reaped |= status.is_some();
-        Ok(status)
+        running.wait(false)
     }
 
     pub(crate) fn wait(&mut self) -> io::Result<ExitStatus> {
@@ -165,7 +216,7 @@ impl Child {
             .running
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        if !running.controlled || running.reaped {
+        if !running.controlled || running.status.is_some() {
             drop(running);
             return self.reap();
         }
@@ -215,9 +266,9 @@ impl Child {
             .running
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        let status = running.child.wait()?;
-        running.reaped = true;
-        Ok(status)
+        running.wait(true)?.ok_or_else(|| {
+            io::Error::other("blocking compiler wait returned without an exit status")
+        })
     }
 }
 
@@ -227,11 +278,9 @@ impl Drop for Child {
             .running
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        if running.controlled && !running.reaped {
+        if running.controlled && running.status.is_none() {
             let _ = running.kill();
-            if running.child.wait().is_ok() {
-                running.reaped = true;
-            }
+            let _ = running.wait(true);
         }
     }
 }
@@ -255,9 +304,6 @@ impl CommandExt for Command {
     }
 
     fn invocation_output(&mut self) -> io::Result<Output> {
-        if CURRENT.with(|slot| slot.borrow().is_none()) {
-            return self.output();
-        }
         self.stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -311,6 +357,8 @@ pub(crate) fn status(command: &mut Command) -> io::Result<ExitStatus> {
 }
 
 fn spawn(command: &mut Command, force_group: bool) -> io::Result<Child> {
+    #[cfg(unix)]
+    kache_ipc::jobserver::configure(command);
     let cancellation = CURRENT.with(|slot| slot.borrow().clone());
     let mut request = cancellation
         .as_ref()
@@ -323,6 +371,10 @@ fn spawn(command: &mut Command, force_group: bool) -> io::Result<Child> {
     if controlled {
         crate::platform::configure_process_group(command);
     }
+    // Cancellation may run a host utility while holding the request lock.
+    // Keep that lock order: request, then descriptor admission.
+    #[cfg(unix)]
+    let descriptor_admission = kache_ipc::descriptors::spawn_guard();
     #[cfg(windows)]
     let (mut child, tree) = if controlled {
         let (child, job) = windows::spawn(command)?;
@@ -332,6 +384,8 @@ fn spawn(command: &mut Command, force_group: bool) -> io::Result<Child> {
     };
     #[cfg(not(windows))]
     let mut child = command.spawn()?;
+    #[cfg(unix)]
+    drop(descriptor_admission);
     let stdin = child.stdin.take();
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
@@ -339,7 +393,9 @@ fn spawn(command: &mut Command, force_group: bool) -> io::Result<Child> {
     let running = Arc::new(Mutex::new(Running {
         child,
         controlled,
-        reaped: false,
+        status: None,
+        #[cfg(unix)]
+        rss: crate::opcounts::child_rss_recorder(),
         #[cfg(windows)]
         tree,
     }));
@@ -447,13 +503,69 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn child_memory_belongs_to_its_spawning_invocation_when_reaped_elsewhere() {
+        let _parent = crate::opcounts::InvocationScope::enter(std::time::Instant::now());
+        let mut child = shell("exit 7").invocation_spawn().unwrap();
+        assert_eq!(crate::opcounts::invocation_child_rss(), Some(None));
+        {
+            let _nested = crate::opcounts::InvocationScope::enter(std::time::Instant::now());
+            std::thread::scope(|threads| {
+                threads.spawn(|| {
+                    let _other = crate::opcounts::InvocationScope::enter(std::time::Instant::now());
+                    assert_eq!(child.wait().unwrap().code(), Some(7));
+                    assert_eq!(child.try_wait().unwrap().unwrap().code(), Some(7));
+                    assert_eq!(child.wait().unwrap().code(), Some(7));
+                    assert_eq!(crate::opcounts::invocation_child_rss(), Some(None));
+                });
+            });
+            assert_eq!(crate::opcounts::invocation_child_rss(), Some(None));
+        }
+        assert!(crate::opcounts::invocation_child_rss().unwrap().unwrap() > 1024);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn polling_a_running_child_does_not_record_a_memory_sample() {
+        let root = tempfile::tempdir().unwrap();
+        let ready = root.path().join("ready");
+        let release = root.path().join("release");
+        let _counts = crate::opcounts::InvocationScope::enter(std::time::Instant::now());
+        let _cancel = CancellationScope::enter(Some(Cancellation::default()));
+        let mut child = shell(
+            "printf ready > \"$READY\"; while [ ! -e \"$RELEASE\" ]; do /bin/sleep .01; done; exit 6",
+        )
+        .env("READY", &ready)
+        .env("RELEASE", &release)
+        .invocation_spawn()
+        .unwrap();
+        wait_for_file(&ready);
+        assert_eq!(child.try_wait().unwrap(), None);
+        assert_eq!(crate::opcounts::invocation_child_rss(), Some(None));
+        std::fs::write(&release, b"go").unwrap();
+        let started = std::time::Instant::now();
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert_eq!(status.code(), Some(6));
+                break;
+            }
+            assert!(started.elapsed() < std::time::Duration::from_secs(3));
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(crate::opcounts::invocation_child_rss().unwrap().unwrap() > 1024);
+        assert_eq!(child.wait().unwrap().code(), Some(6));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn dropping_a_child_kills_and_reaps_it_without_cancelling_the_request() {
+        let _counts = crate::opcounts::InvocationScope::enter(std::time::Instant::now());
         let token = Cancellation::default();
         let _scope = CancellationScope::enter(Some(token.clone()));
         let started = std::time::Instant::now();
         let child = shell("exec /bin/sleep 4").invocation_spawn().unwrap();
         let pid = child.id();
         drop(child);
+        assert!(crate::opcounts::invocation_child_rss().unwrap().unwrap() > 0);
         assert!(started.elapsed() < std::time::Duration::from_secs(2));
         let mut wait_status = 0;
         assert_eq!(

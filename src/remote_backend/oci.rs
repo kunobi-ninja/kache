@@ -332,6 +332,10 @@ fn load_credentials(directory: &std::path::Path, registry: &str) -> Result<Regis
         }
         Err(error) => return Err(error).context("opening Docker credential config"),
     };
+    // The library can spawn credential helpers but exposes no spawn hook.
+    // Exclude descriptor admission while it owns that blocking operation.
+    #[cfg(unix)]
+    let _admission = kache_ipc::descriptors::spawn_guard();
     credentials(docker_credential::get_credential_from_reader(
         std::io::BufReader::new(file),
         registry,

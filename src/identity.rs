@@ -75,27 +75,31 @@ pub async fn previous_identity_keys(lock_path: &Path, identity_key: &str) -> Vec
             .parent()
             .filter(|dir| !dir.as_os_str().is_empty())?;
         let name = lock_path.file_name()?.to_str()?;
-        let log = tokio::process::Command::new("git")
-            .arg("-C")
-            .arg(dir)
-            .args(["log", "--format=%H"])
-            .arg(format!("-n{}", PREVIOUS_LOCKFILES + 1))
-            .args(["--", name])
-            .output()
+        let log = crate::platform::host_output_async(
+            tokio::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(["log", "--format=%H"])
+                .arg(format!("-n{}", PREVIOUS_LOCKFILES + 1))
+                .args(["--", name])
+                .kill_on_drop(true),
+        )
+        .await
+        .ok()
+        .filter(|output| output.status.success())?;
+        let mut revisions = Vec::new();
+        for commit in String::from_utf8_lossy(&log.stdout).lines() {
+            let show = crate::platform::host_output_async(
+                tokio::process::Command::new("git")
+                    .arg("-C")
+                    .arg(dir)
+                    .arg("show")
+                    .arg(format!("{commit}:./{name}"))
+                    .kill_on_drop(true),
+            )
             .await
             .ok()
             .filter(|output| output.status.success())?;
-        let mut revisions = Vec::new();
-        for commit in String::from_utf8_lossy(&log.stdout).lines() {
-            let show = tokio::process::Command::new("git")
-                .arg("-C")
-                .arg(dir)
-                .arg("show")
-                .arg(format!("{commit}:./{name}"))
-                .output()
-                .await
-                .ok()
-                .filter(|output| output.status.success())?;
             revisions.push(show.stdout);
         }
         Some(identity_keys_for_revisions(

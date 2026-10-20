@@ -3824,7 +3824,7 @@ pub(crate) fn default_cache_dir() -> PathBuf {
         .join("kache")
 }
 
-fn default_cache_dir_for(invocation: &InvocationEnv) -> PathBuf {
+pub(crate) fn default_cache_dir_for(invocation: &InvocationEnv) -> PathBuf {
     invocation
         .cache_dir()
         .map(Path::to_path_buf)

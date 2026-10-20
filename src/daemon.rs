@@ -9000,7 +9000,11 @@ fn spawn_detached_daemon(
     strip_ambient_remote_env(&mut command);
     let mut daemon = detached_command(&command);
     daemon.stderr(stderr_target).readiness_channel();
-    let child = daemon.spawn().context("spawning daemon process")?;
+    let child = {
+        #[cfg(unix)]
+        let _admission = kache_ipc::descriptors::spawn_guard();
+        daemon.spawn().context("spawning daemon process")?
+    };
     if child.in_callers_job() {
         tracing::debug!(
             "the daemon (PID {}) shares the build's job object and stops if the build is \

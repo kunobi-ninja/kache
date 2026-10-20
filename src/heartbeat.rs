@@ -145,11 +145,13 @@ pub fn start_monitor(crate_name: &str, pid: u32) -> Option<CompileMonitor> {
     let (done_tx, done_rx) = mpsc::channel::<()>();
     let thread_stop = stop.clone();
     let io = crate::invocation::io::current().borrow_for_monitor();
+    let logging = tracing::dispatcher::get_default(Clone::clone);
     let crate_name = crate_name.to_string();
     let _ = std::thread::Builder::new()
         .name("kache-heartbeat".into())
         .spawn(move || {
             let _io = crate::invocation::io::InvocationIoScope::enter(io);
+            let _logging = tracing::dispatcher::set_default(&logging);
             monitor_loop(&ctx, &crate_name, pid, &thread_stop, &wake_rx);
             let _ = done_tx.send(());
         })

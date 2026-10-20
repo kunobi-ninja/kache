@@ -1072,10 +1072,12 @@ impl CommandExecute for KacheCommandExecute {
         if let Some(profile) = &self.profile {
             command.env("AWS_PROFILE", profile);
         }
-        let output = command.output().await.map_err(|error| {
-            reqsign_core::Error::unexpected(format!("failed to execute command '{program}'"))
-                .with_source(error)
-        })?;
+        let output = crate::platform::host_output_async(&mut command)
+            .await
+            .map_err(|error| {
+                reqsign_core::Error::unexpected(format!("failed to execute command '{program}'"))
+                    .with_source(error)
+            })?;
 
         Ok(reqsign_core::CommandOutput {
             status: output.status.code().unwrap_or(-1),

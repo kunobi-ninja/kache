@@ -947,7 +947,7 @@ fn write_weight(weights_dir: &Path, crate_name: &str, rss: u64) -> Result<bool> 
 
 /// Interpret `getrusage` output as peak child RSS in bytes.
 #[cfg(unix)]
-fn rss_from_getrusage(rc: i32, ru_maxrss: i64) -> Option<u64> {
+pub(crate) fn rss_from_getrusage(rc: i32, ru_maxrss: i64) -> Option<u64> {
     if rc != 0 {
         return None;
     }
@@ -958,6 +958,9 @@ fn rss_from_getrusage(rc: i32, ru_maxrss: i64) -> Option<u64> {
 }
 
 fn peak_child_rss_bytes() -> Option<u64> {
+    if let Some(peak) = crate::opcounts::invocation_child_rss() {
+        return peak;
+    }
     #[cfg(unix)]
     {
         // SAFETY: `rusage` is a C POD written fully by `getrusage` on success.
@@ -2642,6 +2645,28 @@ mod tests {
             assert_eq!(rss_units_to_bytes(1), 1024);
             assert_eq!(rss_units_to_bytes(2), 2048);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn invocation_memory_does_not_fall_back_to_other_process_children() {
+        assert!(Command::new("true").status().unwrap().success());
+        assert!(peak_child_rss_bytes().unwrap() > 1024);
+        let _scope = crate::opcounts::InvocationScope::enter(std::time::Instant::now());
+        assert_eq!(peak_child_rss_bytes(), None);
+        crate::opcounts::child_rss_recorder()
+            .unwrap()
+            .record(123456);
+        assert_eq!(peak_child_rss_bytes(), Some(123456));
+        {
+            let _nested = crate::opcounts::InvocationScope::enter(std::time::Instant::now());
+            assert_eq!(peak_child_rss_bytes(), None);
+            crate::opcounts::child_rss_recorder()
+                .unwrap()
+                .record(654321);
+            assert_eq!(peak_child_rss_bytes(), Some(654321));
+        }
+        assert_eq!(peak_child_rss_bytes(), Some(123456));
     }
 
     #[cfg(unix)]

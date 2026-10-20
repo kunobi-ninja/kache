@@ -9,6 +9,45 @@
 //! On Windows they map to OpenProcess/TerminateProcess and the Windows
 //! console-control events surfaced by tokio::signal::windows.
 
+pub(crate) fn host_spawn(
+    command: &mut std::process::Command,
+) -> std::io::Result<std::process::Child> {
+    #[cfg(unix)]
+    let _admission = kache_ipc::descriptors::spawn_guard();
+    command.spawn()
+}
+
+/// Run a host utility independently of compiler cancellation and jobserver
+/// state. Descriptor admission is excluded only while creating the process.
+#[cfg(any(windows, test))]
+pub(crate) fn host_output(
+    command: &mut std::process::Command,
+) -> std::io::Result<std::process::Output> {
+    use std::process::Stdio;
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = host_spawn(command)?;
+    child.wait_with_output()
+}
+
+pub(crate) async fn host_output_async(
+    command: &mut tokio::process::Command,
+) -> std::io::Result<std::process::Output> {
+    use std::process::Stdio;
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = {
+        #[cfg(unix)]
+        let _admission = kache_ipc::descriptors::spawn_guard();
+        command.spawn()?
+    };
+    child.wait_with_output().await
+}
+
 /// Is `pid` safe to hand to `kill(2)` as a single-process target?
 ///
 /// `kill(2)` overloads the pid argument with broadcast modes, and a bogus or
@@ -50,10 +89,9 @@ fn refuse_unsafe_pid(pid: u32, what: &str) {
 /// or the process is already gone.
 #[cfg(all(unix, test))]
 fn parent_pid(pid: u32) -> Option<u32> {
-    let out = std::process::Command::new("ps")
-        .args(["-o", "ppid=", "-p", &pid.to_string()])
-        .output()
-        .ok()?;
+    let out =
+        host_output(std::process::Command::new("ps").args(["-o", "ppid=", "-p", &pid.to_string()]))
+            .ok()?;
     if !out.status.success() {
         return None;
     }
@@ -132,9 +170,12 @@ pub fn kill_process_group(pid: u32) {
     }
     #[cfg(windows)]
     {
-        let _ = std::process::Command::new("taskkill")
-            .args(["/F", "/T", "/PID", &pid.to_string()])
-            .output();
+        let _ = host_output(std::process::Command::new("taskkill").args([
+            "/F",
+            "/T",
+            "/PID",
+            &pid.to_string(),
+        ]));
     }
 }
 
@@ -327,6 +368,61 @@ pub fn is_self_spawn(argv: &[String], self_spawn: Option<&std::ffi::OsStr>) -> b
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn host_utilities_capture_bytes_without_request_cancellation() {
+        let script = "read ignored; printf '\\377host-out'; printf '\\376host-err' >&2; exit 7";
+        let check = |output: std::process::Output| {
+            assert_eq!(output.status.code(), Some(7));
+            assert_eq!(output.stdout, b"\xffhost-out");
+            assert_eq!(output.stderr, b"\xfehost-err");
+        };
+        {
+            let token = crate::invocation::process::Cancellation::default();
+            token.cancel();
+            let _scope = crate::invocation::process::CancellationScope::enter(Some(token));
+            check(
+                super::host_output(std::process::Command::new("/bin/sh").args(["-c", script]))
+                    .unwrap(),
+            );
+        }
+        check(
+            super::host_output_async(tokio::process::Command::new("/bin/sh").args(["-c", script]))
+                .await
+                .unwrap(),
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn host_utility_wait_does_not_hold_descriptor_admission() {
+        let root = tempfile::tempdir().unwrap();
+        let ready = root.path().join("ready");
+        let release = root.path().join("release");
+        std::thread::scope(|threads| {
+            let worker = threads.spawn(|| {
+                super::host_output(std::process::Command::new("/bin/sh")
+                    .args(["-c", "printf ready > \"$READY\"; while [ ! -e \"$RELEASE\" ]; do /bin/sleep .01; done"])
+                    .env("READY", &ready).env("RELEASE", &release)).unwrap()
+            });
+            let started = std::time::Instant::now();
+            while !ready.exists() && started.elapsed() < std::time::Duration::from_secs(3) {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            let (tx, rx) = std::sync::mpsc::channel();
+            threads.spawn(move || {
+                let _admission = kache_ipc::descriptors::spawn_guard();
+                let _ = tx.send(());
+            });
+            let admitted = rx.recv_timeout(std::time::Duration::from_secs(1));
+            // Release before asserting so a regression cannot strand the child.
+            std::fs::write(&release, b"go").unwrap();
+            assert!(worker.join().unwrap().status.success());
+            assert!(ready.exists());
+            admitted.expect("host utility held admission while waiting for its child");
+        });
+    }
+
     /// Is a usable `ps` on PATH? Tests that assert on the parent-chain walk
     /// need to know before asserting — the Nix build sandbox has none, and
     /// there the guard deliberately allows instead of judging.

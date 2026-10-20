@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 struct InvocationCounts {
     start: Instant,
+    child_rss: ChildRss,
     suspend_spawn_counts: Cell<u32>,
     compiler_runs: Cell<u32>,
     preprocessor_runs: Cell<u32>,
@@ -42,6 +43,7 @@ impl InvocationScope {
     pub fn enter(start: Instant) -> Self {
         let current = Rc::new(InvocationCounts {
             start,
+            child_rss: ChildRss::default(),
             suspend_spawn_counts: Cell::new(0),
             compiler_runs: Cell::new(0),
             preprocessor_runs: Cell::new(0),
@@ -66,6 +68,40 @@ impl Drop for InvocationScope {
     fn drop(&mut self) {
         INVOCATION_COUNTS.with(|slot| slot.replace(self.previous.take()));
     }
+}
+
+/// Captured at spawn so reaping on another thread or inside a nested scope
+/// still attributes the sample to the invocation that created the child.
+#[derive(Clone, Default)]
+pub(crate) struct ChildRss(std::sync::Arc<AtomicU64>);
+
+impl ChildRss {
+    #[cfg(any(unix, test))]
+    pub(crate) fn record(&self, bytes: u64) {
+        self.0.fetch_max(bytes, Ordering::Relaxed);
+    }
+
+    fn peak(&self) -> Option<u64> {
+        match self.0.load(Ordering::Relaxed) {
+            0 => None,
+            bytes => Some(bytes),
+        }
+    }
+}
+
+#[cfg(any(unix, test))]
+pub(crate) fn child_rss_recorder() -> Option<ChildRss> {
+    INVOCATION_COUNTS.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .map(|counts| counts.child_rss.clone())
+    })
+}
+
+/// Outer None means legacy process accounting; Some(None) means this request
+/// has not reaped a child with a usable memory sample.
+pub(crate) fn invocation_child_rss() -> Option<Option<u64>> {
+    INVOCATION_COUNTS.with(|slot| slot.borrow().as_ref().map(|counts| counts.child_rss.peak()))
 }
 
 fn add_u32(global: &AtomicU32, field: fn(&InvocationCounts) -> &Cell<u32>, value: u32) {
@@ -374,6 +410,35 @@ mod tests {
         assert_eq!(reflinked_bytes(), repetitions * 11);
         assert_eq!(hardlinked_bytes(), repetitions * 13);
         assert_eq!(copied_bytes(), repetitions * 17);
+    }
+
+    #[test]
+    fn child_memory_owners_survive_nested_scopes_and_cross_thread_reaping() {
+        let worker = std::thread::spawn(|| {
+            assert_eq!(invocation_child_rss(), None);
+            assert!(child_rss_recorder().is_none());
+            for _ in 0..2 {
+                let _parent = InvocationScope::enter(Instant::now());
+                assert_eq!(invocation_child_rss(), Some(None));
+                let parent = child_rss_recorder().unwrap();
+                parent.record(8192);
+                parent.record(0);
+                parent.record(4096);
+                assert_eq!(invocation_child_rss(), Some(Some(8192)));
+                {
+                    let _nested = InvocationScope::enter(Instant::now());
+                    let nested = child_rss_recorder().unwrap();
+                    std::thread::scope(|threads| {
+                        threads.spawn(|| parent.record(16384));
+                        threads.spawn(|| nested.record(2048));
+                    });
+                    assert_eq!(invocation_child_rss(), Some(Some(2048)));
+                }
+                assert_eq!(invocation_child_rss(), Some(Some(16384)));
+            }
+            assert_eq!(invocation_child_rss(), None);
+        });
+        worker.join().unwrap();
     }
 
     #[test]

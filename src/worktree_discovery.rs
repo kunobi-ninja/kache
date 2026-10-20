@@ -144,19 +144,20 @@ fn git_output(
     max_bytes: u64,
 ) -> Option<Vec<u8>> {
     let timeout = timeout.min(deadline.checked_duration_since(Instant::now())?);
-    let mut child = Command::new("git")
-        .args(["-c", "core.fsmonitor=false", "-C"])
-        .arg(dir)
-        .args(args)
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_COMMON_DIR")
-        .env_remove("GIT_INDEX_FILE")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
+    let mut child = crate::platform::host_spawn(
+        Command::new("git")
+            .args(["-c", "core.fsmonitor=false", "-C"])
+            .arg(dir)
+            .args(args)
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_COMMON_DIR")
+            .env_remove("GIT_INDEX_FILE")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null()),
+    )
+    .ok()?;
     let stdout = child.stdout.take()?;
     let reader = match std::thread::Builder::new()
         .name("kache-git-discovery".into())

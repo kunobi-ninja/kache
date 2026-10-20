@@ -2314,6 +2314,7 @@ dependencies = [
  "toml",
  "toml_edit",
  "tracing",
+ "tracing-log",
  "tracing-subscriber",
  "unicode-normalization",
  "windows-sys 0.61.2",

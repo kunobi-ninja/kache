@@ -18,6 +18,8 @@ pub(crate) struct InvocationContext {
     pub(crate) shim_stem: String,
     pub(crate) io: io::InvocationIo,
     pub(crate) cancellation: Option<process::Cancellation>,
+    #[cfg(unix)]
+    pub(crate) jobserver: kache_ipc::jobserver::Descriptors,
 }
 
 /// Keep a store-key waiter inside the caller's cancellation lifetime.
